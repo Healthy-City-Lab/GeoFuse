@@ -1,0 +1,30 @@
+# Core scientific libraries
+numpy
+pandas
+scipy
+tqdm
+Pillow
+psutil
+
+# Geospatial libraries
+geopandas
+rasterio
+shapely
+earthengine-api
+geemap
+folium
+streetview
+
+# Machine learning and optimization
+optuna
+scikit-learn
+skrebate
+
+# Streamlit and visualization
+streamlit
+streamlit-folium
+visdom
+dominate
+
+# Parallel and distributed computing
+mpi4py

@@ -1,0 +1,12 @@
+.DS_Store
+__pycache__/
+*.tif 
+data/
+logs/
+.env   # For API keys
+geofuse/model
+tests/output
+.vscode/
+data/samples
+logs/
+geofuse.egg-info/
