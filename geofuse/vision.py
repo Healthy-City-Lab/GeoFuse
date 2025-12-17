@@ -159,7 +159,7 @@ class DeepLabSegmenter:
         terrain_pixels = np.sum(mask_array == 9)
 
         return {
-            "GVI_Tree": veg_pixels / total_pixels,
-            "GVI_Grass": terrain_pixels / total_pixels,
+            "GVI_Vegetation": veg_pixels / total_pixels,
+            "GVI_Terrain": terrain_pixels / total_pixels,
             "GVI_Total": (veg_pixels + terrain_pixels) / total_pixels,
         }

@@ -10,3 +10,4 @@ tests/output
 data/samples
 logs/
 geofuse.egg-info/
+output_results/
