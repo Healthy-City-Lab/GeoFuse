@@ -1,16 +1,51 @@
 import sys
 import platform
 import subprocess
+import shutil
 import os
 
 # ==============================================================================
-# USER CONFIGURATION
+# CONFIGURATION (Strict Versions from environment.yml)
 # ==============================================================================
-# Windows specific command (CUDA 12.8)
-WINDOWS_TORCH_COMMAND = (
-    "pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu128"
-)
-# ==============================================================================
+
+# 1. CONDA PACKAGES (System Binaries & Core Geospatial)
+#    We pin 'gdal' to 3.12.0 to match your 'libgdal-core=3.12.0'
+#    We pin 'geopandas' to 1.1.1 to match 'geopandas-base=1.1.1'
+CONDA_PACKAGES = "gdal=3.12.0 " "geopandas=1.1.1"
+
+# 2. PYTORCH (Exact Match)
+PYTORCH_VERSION = "pytorch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1"
+
+# 3. PIP PACKAGES (Python Libraries)
+#    These are all pinned to the versions found in your pip freeze list.
+PIP_PACKAGES = [
+    # Geospatial (Installed via Pip in your YAML)
+    "rasterio==1.4.4",
+    "shapely==2.1.2",
+    "fiona",  # Let GeoPandas/Rasterio resolve this, or pin if needed
+    # Data Science
+    "matplotlib==3.10.8",
+    "scikit-learn==1.6.0",  # Your YAML implies 1.6.0 based on surrounding packages
+    "scipy==1.16.3",
+    "tqdm==4.67.1",
+    "pillow==12.0.0",
+    "optuna==4.6.0",
+    "skrebate==0.62",
+    # UI / Web
+    "streamlit==1.52.1",
+    "streamlit-folium==0.25.3",
+    "folium==0.20.0",
+    "geemap==0.36.6",
+    "earthengine-api==1.7.4",
+    # Visualization
+    "visdom==0.2.4",
+    "dominate==2.9.1",
+    "mpi4py==4.1.1",
+]
+
+GIT_PACKAGES = [
+    "git+https://github.com/robolyst/streetview.git@b07d69445161bc193a1e1a6aa5e098b6fcd6eef8"
+]
 
 
 def run_cmd(command):
@@ -22,77 +57,53 @@ def run_cmd(command):
         sys.exit(1)
 
 
+def get_solver():
+    return "mamba" if shutil.which("mamba") else "conda"
+
+
 def main():
     system = platform.system()
-    print(f"[INFO] Detected OS: {system}")
+    solver = get_solver()
 
-    # 1. Install Heavy Dependencies
-    if system == "Linux":
-        print("[INFO] Linux detected. Installing PyTorch (HPC/CUDA)...")
-        run_cmd(
-            "conda install -y -c pytorch -c nvidia -c conda-forge pytorch torchvision pytorch-cuda=12.1 rasterio gdal shapely"
-        )
+    print(f"\n[INFO] Starting Setup on {system} using {solver}...")
 
-    elif system == "Windows":
-        print("[INFO] Windows detected.")
-        # A. Conda for Geospatial
-        print("[INFO] Installing GDAL/Rasterio via Conda...")
-        run_cmd("conda install -y -c conda-forge rasterio gdal shapely")
+    # 1. Install Conda Dependencies
+    print(f"\n[1/5] Installing Geospatial Core ({solver})...")
+    # Note: We do NOT use quotes around CONDA_PACKAGES string in the f-string
+    # to allow the solver to parse the spaces correctly.
+    run_cmd(f"{solver} install -y -c conda-forge {CONDA_PACKAGES}")
 
-        # B. Custom PyTorch
-        print(f"[INFO] Installing Custom PyTorch: {WINDOWS_TORCH_COMMAND}")
-        run_cmd(WINDOWS_TORCH_COMMAND)
-
+    # 2. Install PyTorch
+    print(f"\n[2/5] Installing PyTorch Acceleration...")
+    # Matches your YAML 'pytorch-cuda=12.1'
+    if system == "Windows" or system == "Linux":
+        cmd = f"{solver} install -y {PYTORCH_VERSION} pytorch-cuda=12.1 -c pytorch -c nvidia"
     else:
-        run_cmd(
-            "conda install -y -c pytorch -c conda-forge pytorch torchvision rasterio gdal shapely"
-        )
+        cmd = f"{solver} install -y {PYTORCH_VERSION} -c pytorch"
+    run_cmd(cmd)
 
-    # 2. Install Pip Requirements (excluding torch/geo which we just did)
-    print("[INFO] Installing remaining requirements...")
-    req_path = os.path.join(os.path.dirname(__file__), "..", "requirements.txt")
+    # 3. Install Pip Libraries
+    print(f"\n[3/5] Installing Python Libraries...")
+    pip_str = " ".join(PIP_PACKAGES)
+    run_cmd(f'"{sys.executable}" -m pip install {pip_str}')
 
-    excluded = [
-        "numpy",
-        "pandas",
-        "geopandas",
-        "rasterio",
-        "shapely",
-        "torch",
-        "torchvision",
-    ]
-    temp_reqs = "temp_requirements.txt"
+    # 4. Install Git Packages
+    print(f"\n[4/5] Installing Custom Git Packages...")
+    for git_url in GIT_PACKAGES:
+        run_cmd(f'"{sys.executable}" -m pip install {git_url}')
 
-    with open(req_path, "r") as f_in, open(temp_reqs, "w") as f_out:
-        for line in f_in:
-            pkg = line.split("=")[0].split("<")[0].split(">")[0].strip()
-            if pkg.lower() not in excluded:
-                f_out.write(line)
-
-    try:
-        run_cmd(f'"{sys.executable}" -m pip install -r {temp_reqs}')
-    finally:
-        if os.path.exists(temp_reqs):
-            os.remove(temp_reqs)
-
-    # 3. Install Custom Packages
-    print("[INFO] Installing Streetview & GeoFuse...")
-    try:
-        run_cmd(
-            f'"{sys.executable}" -m pip install git+https://github.com/robolyst/streetview'
-        )
-    except Exception as e:
-        print(f"[WARN] Failed to install streetview package: {e}")
-
-    root_dir = os.path.join(os.path.dirname(__file__), "..")
+    # 5. Editable Install
+    print(f"\n[5/5] Performing Editable Install of GeoFuse...")
+    root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     run_cmd(f'"{sys.executable}" -m pip install -e "{root_dir}"')
 
-    print("\n[SUCCESS] Environment setup complete!")
-    print("Verification:")
-
-    # FIXED LINE: We pass the string literal to the subprocess, avoiding local evaluation
-    verify_cmd = f"\"{sys.executable}\" -c \"import torch; print('Torch:', torch.__version__); print('CUDA:', torch.cuda.is_available())\""
-    run_cmd(verify_cmd)
+    # Finish
+    print("\n[SUCCESS] Environment Configured.")
+    verify_script = (
+        "import geofuse; print(f'   [OK] GeoFuse Package: {geofuse.__file__}'); "
+        "import torch; print(f'   [OK] PyTorch: {torch.__version__} (CUDA: {torch.cuda.is_available()})')"
+    )
+    run_cmd(f'"{sys.executable}" -c "{verify_script}"')
 
 
 if __name__ == "__main__":

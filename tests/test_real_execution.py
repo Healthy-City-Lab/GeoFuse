@@ -14,7 +14,7 @@ from geofuse.gvi import GVIEngine
 from geofuse.ndvi import NDVIEngine
 
 
-def test_real_gvi(model_path):
+def test_real_gvi(model_path, output_dir):
     print("\n[TEST] Starting Real GVI Test (Visual Save Enabled)...")
 
     # 1. Setup Engine
@@ -29,14 +29,12 @@ def test_real_gvi(model_path):
 
     # 2. Test Locations (University of Calgary)
     test_points = [
-        (51.0782, -114.1360),  # University Dr NW
-        (51.0745, -114.1206),  # Crowchild Trail
-        (51.0776, -114.1337),  # Previous Test Point
+        (51.0782, -114.1360),
+        (51.0745, -114.1206),
+        (51.0776, -114.1337),
     ]
 
     success = False
-    output_dir = os.path.join("tests", "output")
-    os.makedirs(output_dir, exist_ok=True)
 
     for lat, lon in test_points:
         print(f"   [INFO] Searching for pano at: {lat}, {lon}...")
@@ -59,7 +57,6 @@ def test_real_gvi(model_path):
                 print(f"   [PASS] Metrics: {metrics}")
 
                 # --- SAVE COLORED MASK ---
-                # We use the internal decode_fn to turn ID numbers (0-19) into Colors (RGB)
                 color_mask = engine.segmenter.decode_fn(mask)
                 mask_img = Image.fromarray(color_mask)
 
@@ -78,7 +75,7 @@ def test_real_gvi(model_path):
         print("   [FAIL] Could not find any panoramas in test set.")
 
 
-def test_demanding_ndvi():
+def test_demanding_ndvi(output_dir):
     print("\n[TEST] Starting Demanding NDVI Test (1km x 1km Area)...")
     try:
         engine = NDVIEngine()
@@ -92,11 +89,11 @@ def test_demanding_ndvi():
 
         print(f"   [INFO] Requesting Area: {large_bbox.area:.6f} sq deg (~1 sq km)")
 
-        temp_file = os.path.join("tests", "output", "large_area_test.geojson")
-        os.makedirs(os.path.dirname(temp_file), exist_ok=True)
+        # Save temp file inside the specific test output folder
+        temp_file = os.path.join(output_dir, "large_area_test.geojson")
         gdf.to_file(temp_file, driver="GeoJSON")
 
-        out_file = os.path.join("tests", "output", "large_ndvi.tif")
+        out_file = os.path.join(output_dir, "large_ndvi.tif")
 
         # 2. Export with higher resolution (10m)
         success = engine.export_geotiff(
@@ -117,6 +114,11 @@ def test_demanding_ndvi():
 if __name__ == "__main__":
     # Path Logic
     base_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # 1. Setup Output Directory
+    OUTPUT_DIR = os.path.join(base_dir, "output", "test2_system")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
     MODEL_PATH = os.path.abspath(
         os.path.join(base_dir, "..", "geofuse", "model", "best_model.pth")
     )
@@ -124,5 +126,5 @@ if __name__ == "__main__":
     if not os.path.exists(MODEL_PATH):
         print(f"[ERROR] Model not found at {MODEL_PATH}")
     else:
-        test_real_gvi(MODEL_PATH)
-        test_demanding_ndvi()
+        test_real_gvi(MODEL_PATH, OUTPUT_DIR)
+        test_demanding_ndvi(OUTPUT_DIR)

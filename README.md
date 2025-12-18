@@ -1,0 +1,241 @@
+# GeoFuse: Multimodal Greenspace Profiling Toolbox
+
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+[![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?logo=Streamlit&logoColor=white)](https://streamlit.io)
+[![Code Style: Black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+
+**GeoFuse** is a comprehensive Python toolbox designed for digital health and urban planning research that utilizes greenspace exposure. It automates the sourcing, processing, and fusion of environmental exposure metrics, specifically focusing on **Green View Index (GVI)** from street-level imagery and **Normalized Difference Vegetation Index (NDVI)** from satellite data.
+
+The toolbox features a user-friendly **Streamlit Dashboard** that allows researchers to drag-and-drop study areas and receive high-resolution environmental profiles without writing code.
+
+---
+
+## 🌟 Key Features
+
+### 1. Street View Intelligence (GVI)
+
+* **Automated Sourcing**: Scrapes or downloads Google Street View panoramas for any study area (Shapefile/GeoJSON). It can operate _with_ or _without_ an API Key.
+* **Deep Learning Segmentation**: Uses the **DeepLabV3+** model (PyTorch) trained on the **Cityscapes** dataset to identify Vegetation and Terrain greenery coverage.
+
+* **Robust Processing**:
+
+  * **Async/Multi-threaded** downloading for speed.
+  * **Image pre-processing**: Ensures 360° coverage, corrects panorama artifacts, detects corrupt panoramas, and standardizes image resolution.
+
+* **Outputs**:
+
+  * **Vector**: GeoJSON of sampling points with their respective GVI values (Vegetation and Terrain separated).
+  * **Raster**: Heatmaps (GeoTIFF) aligned to the user's defined sampling grid.
+  * **Raw Panoramas and Masks**: Google Street View panoramas and their segmentation results used to create the outputs.
+
+### 2. Satellite Intelligence (NDVI)
+
+* **Google Earth Engine Integration**: Fetches cloud-free Sentinel-2 or Landsat imagery.
+* **Dynamic Calculation**: Computes NDVI (Vegetation Health) for the exact same timeframe as your street view data.
+
+### 3. Fusion & Visualization
+
+* **Interactive Map**: Visualize results immediately with Folium/Leaflet.
+* **Metric Fusion**: (In Development) Combines top-down (NDVI) and eye-level (GVI) metrics for a holistic "Composite Greenery Index" score, tailored towards a specific spatial outcome variable.
+
+### 4. High-Performance Computing (HPC) Integration
+
+GeoFuse is architected to scale from local laptops to High-Performance Computing (HPC) clusters, enabling city-wide or regional-scale analysis.
+
+* **Headless Batch Processing**: The core logic is decoupled from the UI into standalone engines. This allows for direct Python script execution, enabling automated batch processing pipelines without browser dependencies.
+* **GPU Acceleration & Scaling**: Built on **PyTorch** with native **CUDA** support. The architecture is designed for Multi-GPU inference, allowing massive segmentation workloads to be distributed across available hardware nodes.
+* **Optimized Resource Management**: Implements asynchronous I/O for non-blocking downloads and memory-efficient raster operations (windowed reading/writing) to maximize throughput on shared compute nodes.
+* **Scheduler Compatibility**: Fully compatible with user-space environments (Conda/Miniforge) and designed to integrate with standard job schedulers (e.g., **Slurm**, **PBS**) for distributed, parallelized job submission.
+
+---
+
+## 🚀 Installation
+
+GeoFuse uses a **Hybrid Installer** that manages Conda (for heavy geospatial binaries like GDAL) and Pip (for AI/UI libraries) automatically.
+
+### Prerequisites
+
+* **Windows OS** (Tested on Windows 10/11; Linux and MacOS are supported, but not tested yet).
+* **Miniforge** (recommended) or **Anaconda** installed.
+* (Optional) **Mamba** package manager (Highly recommended)
+
+### One-Click Setup
+
+1. Clone this repository.
+2. Double-click the **`install.bat`** file in the root folder.
+    * _This script will auto-detect your Conda installation, create a dedicated environment, install required packages, and link the toolbox._
+3. Follow the on-screen prompts (enter `Y` if asked to delete/reinstall the environment).
+
+### Alternative Setup (Manual / Mamba)
+
+If you prefer, you can build the environment manually using the provided `environment.yml` file.
+
+1. **Create the Environment:**
+
+     ```bash
+    mamba env create -f environment.yml
+    ```
+
+    _(Note: You can also use `conda env create -f environment.yml` if you don't have Mamba, but it will be slower and likely to have issues solving the environment.)_
+
+2. **Activate & Install Package:**
+  Once the environment is built, you must activate it and install the toolbox in "editable" mode:
+
+    ```bash
+    conda activate geofuse
+    pip install -e .
+    ```
+
+### Segmentation Model
+
+Place your pre-trained segmentation model's `.pth` file inside `geofuse/model` and rename it to `best_model.pth`. The toolbox can automatically differentiate and detect the backbone.
+
+_Note: You can either use your own trained model, or find one from online sources such as [VainF's repo](https://github.com/VainF/DeepLabV3Plus-Pytorch/tree/master)._
+
+---
+
+## ✅ Verifying Installation
+
+We provide a suite of test scripts to validate the installation, logic, and hardware stability. For each test, launch your conda terminal, activate the `geofuse` environment, and execute the provided scripts.
+
+### Logic Test (Fast & Offline)
+
+* **Script:** `tests/test_pipeline.py`
+* **Purpose:** Validates the internal logic of the Fusion Engine and GVI pipeline using "mock" data. It does not require an API key or GPU.
+* **Run:**
+
+```bash
+python tests/test_pipeline.py
+```
+
+* **Expected Output:**
+
+``` bash
+[PASS] GVI GeoTIFF Created at tests/output/test1_logic/gvi_distribution.tif
+[PASS] NDVI Export Logic Verified (File created at tests/output/test1_logic/test_ndvi.tif)
+OK
+```
+
+### Full System Test
+
+* **Script:** `tests/test_real_execution.py`
+* **Purpose:** Connects to Google Street View and Earth Engine to download real data, processes it on the GPU, and saves visual results. Use this to confirm your credentials and model are working.
+* **Run:**
+
+```bash
+python tests/test_real_execution.py
+```
+
+* **Expected Output:**
+
+  * **Console:**
+
+  ```bash
+  [PASS] Image found! Size: (1920, 960)
+  [PASS] Segmentation complete. Mask Shape: (960, 1920)
+  [PASS] Metrics: {'GVI_Vegetation': ...}
+  [PASS] Large NDVI GeoTIFF exported (... KB)
+  ```
+
+  * **Files:** Check `tests/output/test2_system/` for:
+    * `test_pano_rgb.jpg` (Street View)
+    * `test_pano_mask.png` (Segmentation Mask)
+    * `large_ndvi.tif` (NDVI Tile)
+
+### Stability Test
+
+* **Script:** `tests/test_memory_stability.py`
+* **Purpose:** Simulates thousands of processing cycles to ensure there are no memory leaks in the GPU or RAM, which is critical for large city-wide runs.
+* **Run:**
+
+```bash
+# Runs 5000 iterations (reduce iteration if you want faster runtime)
+python tests/test_memory_stability.py --iterations 5000
+```
+
+* **Expected Output:**
+
+  * **Console:**
+
+  ```bash
+  [PASS] Memory usage appears stable.
+  ```
+
+  * **Files:** Check `tests/output/test3_stability/` for `memory_test.png` plot which shows RAM/VRAM usage over time.
+
+---
+
+## 🖥️ Usage
+
+Once the installation is complete, the app typically launches automatically. To launch it manually later:
+
+1. Open your terminal (Anaconda/Miniforge Prompt).
+2. Run the following commands:
+
+```bash
+conda activate geofuse
+streamlit run ui/app.py
+```
+
+---
+
+## 🛠️ Configuration & Troubleshooting
+
+**"No module named geofuse"**
+
+If you see this error, it means the package wasn't linked correctly during setup.
+
+* **Fix:** Rerun `install.bat` and ensure you see the message `[5/5] Performing Editable Install`.
+
+**"DecompressionBombWarning"**
+
+* **Info:** You may see this warning in the terminal if downloading very high-res Street View images.
+* It is Safe to ignore. The toolbox automatically handles large image limits and resizes them for processing.
+
+**"Conda Not Found"**
+
+If `install.bat` closes immediately:
+
+* Ensure Miniforge/Anaconda is installed.
+* If installed in a custom location, paste the path when prompted by the script.
+
+---
+
+## 📄 Outputs
+
+For every analysis run, GeoFuse generates:
+
+* `final_gvi_results.geojson`: Point data containing `gvi_veg` (Vegetation) and `gvi_ter` (Terrain) scores.
+* `gvi_distribution.tif`: A multi-band GeoTIFF raster (Band 1: Vegetation, Band 2: Terrain).
+* (Optional) `output_results/masks/*.png` and `output_results/images/*.jpg`: Panoramas and segmentation masks acquired and used for generating the outputs. Enable "Save Raw Images" in the GVI toolbox to have these images saved.
+
+---
+
+## 🧩 Built With & References
+
+This project relies on several open-source libraries and public datasets. We gratefully acknowledge:
+
+* **Street View Download:** Adapted from the [streetview](https://github.com/robolyst/streetview) library by `@robolyst`.
+* **Semantic Segmentation Model:** [DeepLabV3+](https://github.com/VainF/DeepLabV3Plus-Pytorch/tree/master) architecture implemented via PyTorch.
+* **Segmentation Training Data:** The semantic segmentation model was pre-trained on the [Cityscapes Dataset](https://www.cityscapes-dataset.com/).
+* **Satellite Imagery Analysis:** Powered by [Google Earth Engine](https://earthengine.google.com/) and [geemap](https://geemap.org).
+
+---
+
+## 📚 Citation
+
+If you use GeoFuse in your research, please cite:
+
+> **Sadigh, A. G.** (2025). _GeoFuse: Multimodal Greenspace Profiling Toolbox_. Healthy City Lab, University of Calgary. [https://github.com/Healthy-City-Lab/GeoFuse](https://github.com/Healthy-City-Lab/GeoFuse)
+
+## 🎓 Credits & Acknowledgments
+
+**Primary Developer and Maintainer:** [Armin Ghayur Sadigh](https://github.com/Armin-GS)
+
+* **Academic Context:** This toolbox was developed as part of a Ph.D. research project at the Healthy City Lab, University of Calgary. It is designed to support ongoing research into environmental determinants of health and urban sensing.
+
+* **Lab:** [Healthy City Lab](https://www.healthycitylab.ca/)
+* **Institution:** [University of Calgary](https://ucalgary.ca/)
+
+**License:** GNU General Public License v3.0 (See [LICENSE file](LICENSE))
