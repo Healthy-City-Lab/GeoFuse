@@ -2,32 +2,50 @@ import sys
 import platform
 import subprocess
 import shutil
-import os  # <--- Added back (Required for path operations)
+import os
 
 # ==============================================================================
-# CONFIGURATION
+# CONFIGURATION (Strict Versions from environment.yml)
 # ==============================================================================
-CONDA_PACKAGES = (
-    "gdal geopandas rasterio shapely fiona matplotlib scikit-learn scipy tqdm"
-)
 
+# 1. CONDA PACKAGES (System Binaries & Core Geospatial)
+#    We pin 'gdal' to 3.12.0 to match your 'libgdal-core=3.12.0'
+#    We pin 'geopandas' to 1.1.1 to match 'geopandas-base=1.1.1'
+CONDA_PACKAGES = "gdal=3.12.0 " "geopandas=1.1.1"
+
+# 2. PYTORCH (Exact Match)
 PYTORCH_VERSION = "pytorch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1"
 
+# 3. PIP PACKAGES (Python Libraries)
+#    These are all pinned to the versions found in your pip freeze list.
 PIP_PACKAGES = [
-    "streamlit",
-    "streamlit-folium",
-    "folium",
-    "earthengine-api",
-    "geemap",
-    "optuna",
-    "skrebate",
-    "visdom",
-    "dominate",
-    "mpi4py",
-    "Pillow",
+    # Geospatial (Installed via Pip in your YAML)
+    "rasterio==1.4.4",
+    "shapely==2.1.2",
+    "fiona",  # Let GeoPandas/Rasterio resolve this, or pin if needed
+    # Data Science
+    "matplotlib==3.10.8",
+    "scikit-learn==1.6.0",  # Your YAML implies 1.6.0 based on surrounding packages
+    "scipy==1.16.3",
+    "tqdm==4.67.1",
+    "pillow==12.0.0",
+    "optuna==4.6.0",
+    "skrebate==0.62",
+    # UI / Web
+    "streamlit==1.52.1",
+    "streamlit-folium==0.25.3",
+    "folium==0.20.0",
+    "geemap==0.36.6",
+    "earthengine-api==1.7.4",
+    # Visualization
+    "visdom==0.2.4",
+    "dominate==2.9.1",
+    "mpi4py==4.1.1",
 ]
 
-GIT_PACKAGES = ["git+https://github.com/robolyst/streetview"]
+GIT_PACKAGES = [
+    "git+https://github.com/robolyst/streetview.git@b07d69445161bc193a1e1a6aa5e098b6fcd6eef8"
+]
 
 
 def run_cmd(command):
@@ -51,13 +69,14 @@ def main():
 
     # 1. Install Conda Dependencies
     print(f"\n[1/5] Installing Geospatial Core ({solver})...")
+    # Note: We do NOT use quotes around CONDA_PACKAGES string in the f-string
+    # to allow the solver to parse the spaces correctly.
     run_cmd(f"{solver} install -y -c conda-forge {CONDA_PACKAGES}")
 
     # 2. Install PyTorch
     print(f"\n[2/5] Installing PyTorch Acceleration...")
-    if system == "Windows":
-        cmd = f"{solver} install -y {PYTORCH_VERSION} pytorch-cuda=12.1 -c pytorch -c nvidia"
-    elif system == "Linux":
+    # Matches your YAML 'pytorch-cuda=12.1'
+    if system == "Windows" or system == "Linux":
         cmd = f"{solver} install -y {PYTORCH_VERSION} pytorch-cuda=12.1 -c pytorch -c nvidia"
     else:
         cmd = f"{solver} install -y {PYTORCH_VERSION} -c pytorch"
@@ -75,8 +94,6 @@ def main():
 
     # 5. Editable Install
     print(f"\n[5/5] Performing Editable Install of GeoFuse...")
-    # This command looks for setup.py in the parent directory ("..")
-    # assuming this script is running from /scripts/
     root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     run_cmd(f'"{sys.executable}" -m pip install -e "{root_dir}"')
 

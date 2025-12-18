@@ -3,8 +3,8 @@ setlocal EnableDelayedExpansion
 TITLE GeoFuse Installer
 
 :: --- CONFIGURATION ---
-set ENV_NAME=geofuseTest
-set PYTHON_VER=3.12
+set ENV_NAME=geofuse
+set PYTHON_VER=3.12.12
 
 echo ========================================================
 echo        GeoFuse Installer
@@ -42,7 +42,7 @@ if %errorlevel% equ 0 (
     )
 )
 
-echo [INFO] Creating Base Environment...
+echo [INFO] Creating Base Environment (Python %PYTHON_VER%)...
 call conda create -n %ENV_NAME% python=%PYTHON_VER% -y
 
 :ACTIVATE
@@ -50,7 +50,6 @@ echo [INFO] Activating Environment...
 call conda activate %ENV_NAME%
 
 :: --- STEP 3: RUN PYTHON SETUP SCRIPT ---
-:: This hands over control to setup_env.py for all package installs
 if exist scripts/setup_env.py (
     python scripts/setup_env.py
 ) else (

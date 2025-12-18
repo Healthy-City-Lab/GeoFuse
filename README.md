@@ -67,6 +67,26 @@ GeoFuse uses a **Hybrid Installer** that manages Conda (for heavy geospatial bin
     * _This script will auto-detect your Conda installation, create a dedicated environment, install required packages, and link the toolbox._
 3. Follow the on-screen prompts (enter `Y` if asked to delete/reinstall the environment).
 
+### Alternative Setup (Manual / Mamba)
+
+If you prefer, you can build the environment manually using the provided `environment.yml` file.
+
+1. **Create the Environment:**
+
+     ```bash
+    mamba env create -f environment.yml
+    ```
+
+    _(Note: You can also use `conda env create -f environment.yml` if you don't have Mamba, but it will be slower and likely to have issues solving the environment.)_
+
+2. **Activate & Install Package:**
+  Once the environment is built, you must activate it and install the toolbox in "editable" mode:
+
+    ```bash
+    conda activate geofuse
+    pip install -e .
+    ```
+
 ### Segmentation Model
 
 Place your pre-trained segmentation model's `.pth` file inside `geofuse/model` and rename it to `best_model.pth`. The toolbox can automatically differentiate and detect the backbone.
@@ -92,10 +112,8 @@ python tests/test_pipeline.py
 * **Expected Output:**
 
 ``` bash
-[PASS] Optimization Params: {...}
-[PASS] Weights Applied Successfully
-[PASS] GVI GeoTIFF Created
-[PASS] NDVI Export Logic Verified
+[PASS] GVI GeoTIFF Created at tests/output/test1_logic/gvi_distribution.tif
+[PASS] NDVI Export Logic Verified (File created at tests/output/test1_logic/test_ndvi.tif)
 OK
 ```
 
@@ -114,12 +132,16 @@ python tests/test_real_execution.py
   * **Console:**
 
   ```bash
-  [PASS] Image found!
-  [PASS] Segmentation complete
-  [PASS] Large NDVI GeoTIFF exported.
+  [PASS] Image found! Size: (1920, 960)
+  [PASS] Segmentation complete. Mask Shape: (960, 1920)
+  [PASS] Metrics: {'GVI_Vegetation': ...}
+  [PASS] Large NDVI GeoTIFF exported (... KB)
   ```
 
-  * **Files:** Check `tests/output/` for `test_pano_rgb.jpg` (Street View), `test_pano_mask.png` (Segmentation Mask), and `large_ndvi.tif` (NDVI Tile).
+  * **Files:** Check `tests/output/test2_system/` for:
+    * `test_pano_rgb.jpg` (Street View)
+    * `test_pano_mask.png` (Segmentation Mask)
+    * `large_ndvi.tif` (NDVI Tile)
 
 ### Stability Test
 
@@ -140,7 +162,7 @@ python tests/test_memory_stability.py --iterations 5000
   [PASS] Memory usage appears stable.
   ```
 
-  * **Files:** Check `tests/output/` for `memory_test.png` plot which shows RAM/VRAM usage over time.
+  * **Files:** Check `tests/output/test3_stability/` for `memory_test.png` plot which shows RAM/VRAM usage over time.
 
 ---
 
@@ -205,7 +227,7 @@ This project relies on several open-source libraries and public datasets. We gra
 
 If you use GeoFuse in your research, please cite:
 
-> **Sadigh, A. G.** (2025). _GeoFuse: Multimodal Greenspace Profiling Toolbox_. Healthy City Lab, University of Calgary. [https://github.com/Armin-GS/geofuse](https://github.com/Armin-GS/geofuse)
+> **Sadigh, A. G.** (2025). _GeoFuse: Multimodal Greenspace Profiling Toolbox_. Healthy City Lab, University of Calgary. [https://github.com/Healthy-City-Lab/GeoFuse](https://github.com/Healthy-City-Lab/GeoFuse)
 
 ## 🎓 Credits & Acknowledgments
 

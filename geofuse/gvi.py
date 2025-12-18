@@ -213,7 +213,12 @@ class GVIEngine:
         return pixel_centers, height, width, transform
 
     def run_analysis(
-        self, gdf, step=50, folder="output", save_panos=False, save_masks=False
+        self,
+        gdf,
+        step: float | int = 50,  # <--- Explicitly allow float OR int
+        folder="output",
+        save_panos=False,
+        save_masks=False,
     ):
         print("[GVI] Starting Analysis (ASYNC MODE)...")
         os.makedirs(folder, exist_ok=True)
