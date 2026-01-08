@@ -190,9 +190,10 @@ class GVIEngine:
         save_panos=False,
         save_masks=False,
         external_cache=None,
-        progress_callback=None,  # For UI Progress Bar
-        result_callback=None,  # For Accumulating Results Live
-        start_index=0,  # For Resume Capability
+        progress_callback=None,
+        result_callback=None,
+        cancel_callback=None,
+        start_index=0,
     ):
         print(f"[GVI] Starting Analysis (Resume Index: {start_index})...")
         os.makedirs(folder, exist_ok=True)
@@ -202,7 +203,6 @@ class GVIEngine:
             os.makedirs(os.path.join(folder, "masks"), exist_ok=True)
 
         # 1. PREPARE INPUT POINTS (FULL LIST)
-        # We generate the full list first to ensure indexing is consistent across restarts
         first_geom = gdf.geometry.iloc[0]
         points = []
         rows = 0
@@ -211,7 +211,6 @@ class GVIEngine:
         write_tif = False
 
         if first_geom.geom_type in ["Polygon", "MultiPolygon"]:
-            # Polygon mode: deterministic grid generation
             points_data, rows, cols, transform = self._generate_pixel_aligned_grid(
                 gdf, step
             )
@@ -220,7 +219,6 @@ class GVIEngine:
             points = points_data
             write_tif = True
         else:
-            # Point mode: deterministic from input rows
             has_indices = "row" in gdf.columns and "col" in gdf.columns
             for idx, row in gdf.iterrows():
                 points.append(
@@ -242,7 +240,6 @@ class GVIEngine:
             return gpd.GeoDataFrame()
 
         # 2. SLICE FOR RESUME
-        # If we are resuming, we only process the points AFTER the start_index
         total_points = len(points)
         points_to_process = points[start_index:]
 
@@ -255,12 +252,15 @@ class GVIEngine:
 
         print(f"[GVI] Processing {len(points_to_process)} remaining points...")
 
-        # We iterate only the remaining points
         for i, pt in enumerate(tqdm(points_to_process)):
-            # Actual index relative to the FULL dataset (for progress bar)
+
+            # --- CHECK CANCELLATION ---
+            if cancel_callback and cancel_callback():
+                print("[GVI] Analysis Aborted by User.")
+                break
+
             current_global_idx = start_index + i
 
-            # --- Invoke Progress Callback ---
             if progress_callback:
                 progress_callback(current_global_idx, total_points)
 
@@ -268,7 +268,6 @@ class GVIEngine:
             lat, lon = pt["lat"], pt["lon"]
             orig_idx = pt["orig_index"]
 
-            # Coordinates
             search_lat, search_lon = lat, lon
             if not gdf.crs.is_geographic:
                 p_geo = (
@@ -278,7 +277,6 @@ class GVIEngine:
                 )
                 search_lat, search_lon = p_geo.y, p_geo.x
 
-            # Search & Process
             candidates = search_panoramas(lat=search_lat, lon=search_lon)
             final_panoid = None
             val_veg = np.nan
@@ -342,7 +340,6 @@ class GVIEngine:
                     except Exception:
                         continue
 
-            # Build Result Object
             res_dict = {
                 "orig_index": orig_idx,
                 "geometry": pt["geometry"],
@@ -355,7 +352,6 @@ class GVIEngine:
                 "col": c,
             }
 
-            # --- Invoke Result Callback (Save immediately to Session State) ---
             if result_callback:
                 result_callback(res_dict)
 
