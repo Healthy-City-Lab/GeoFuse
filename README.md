@@ -17,11 +17,18 @@ The toolbox features a user-friendly **Streamlit Dashboard** that allows researc
 
 * **Automated Sourcing**: Scrapes or downloads Google Street View panoramas for any study area (Shapefile/GeoJSON). It can operate _with_ or _without_ an API Key.
 * **Deep Learning Segmentation**: Uses the **DeepLabV3+** model (PyTorch) trained on the **Cityscapes** dataset to identify Vegetation and Terrain greenery coverage.
+* **Batch Processing**: Drag-and-drop multiple study areas (GeoJSON/SHP) to process distinct regions simultaneously.
+* **Smart Caching**: Implements a shared panorama cache across all batch files to prevent redundant downloads of overlapping areas, significantly reducing processing time and API costs.
 
 * **Robust Processing**:
 
   * **Async/Multi-threaded** downloading for speed.
   * **Image pre-processing**: Ensures 360° coverage, corrects panorama artifacts, detects corrupt panoramas, and standardizes image resolution.
+
+* **Batch Processing & Recovery**: The GVI module supports a robust **Stateful Batch Workflow**:
+  * **Multi-threaded Analysis**: Runs deep learning inference in the background while keeping the UI responsive.
+  * **Crash Recovery**: If a job is interrupted (internet loss, crash, or manual cancel), simply re-upload the same input file and click "Start". The engine automatically detects existing progress and **resumes** from the last processed point.
+  * **Job Monitor**: Track progress via the sidebar. Use the **Scan Output Folder** button to load and visualize results from previous sessions without re-running analysis.
 
 * **Outputs**:
 
@@ -37,6 +44,7 @@ The toolbox features a user-friendly **Streamlit Dashboard** that allows researc
 ### 3. Fusion & Visualization
 
 * **Interactive Map**: Visualize results immediately with Folium/Leaflet.
+* **Results Inspector**: Toggle between multiple loaded datasets and visualize specific layers (Points, Vegetation Raster, Terrain Raster) with dynamic opacity controls.
 * **Metric Fusion**: (In Development) Combines top-down (NDVI) and eye-level (GVI) metrics for a holistic "Composite Greenery Index" score, tailored towards a specific spatial outcome variable.
 
 ### 4. High-Performance Computing (HPC) Integration
@@ -206,9 +214,9 @@ If `install.bat` closes immediately:
 
 For every analysis run, GeoFuse generates:
 
-* `final_gvi_results.geojson`: Point data containing `gvi_veg` (Vegetation) and `gvi_ter` (Terrain) scores.
-* `gvi_distribution.tif`: A multi-band GeoTIFF raster (Band 1: Vegetation, Band 2: Terrain).
-* (Optional) `output_results/masks/*.png` and `output_results/images/*.jpg`: Panoramas and segmentation masks acquired and used for generating the outputs. Enable "Save Raw Images" in the GVI toolbox to have these images saved.
+* `[Filename]_gvi.geojson`: Point data containing `gvi_veg` (Vegetation) and `gvi_ter` (Terrain) scores, and the unique `pano_id` for every point.
+* `[Filename]_gvi.tif`: A multi-band GeoTIFF raster (Band 1: Vegetation, Band 2: Terrain) generated for each input region.
+* (Optional) `output_results/masks/{pano_id}.png` and `output_results/images/{pano_id}.jpg`: Raw panoramas and segmentation masks named by their unique Panorama ID.
 
 ---
 
