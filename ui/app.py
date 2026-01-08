@@ -120,7 +120,7 @@ with tab2:
                 folium.GeoJson(gdf).add_to(m)
             except Exception as e:
                 st.error(f"Map Error: {e}")
-        st_folium(m, width=800, height=500)
+        st_folium(m, width=800, height=500, returned_objects=[])
 
 # -----------------------------------------------------------------------------
 # TAB 3: GVI CONFIGURATOR (Batch Processing)
@@ -131,11 +131,11 @@ with tab3:
     m_gvi = folium.Map(location=[51.0447, -114.0719], zoom_start=11)
 
     # --- SESSION STATE INITIALIZATION ---
+    # Structure: "datasets" = { filename: { "raw": gdf, "processed": gdf, "accumulated": list, "results": gdf, ... } }
     if "datasets" not in st.session_state:
         st.session_state.datasets = {}
     if "master_cache" not in st.session_state:
         st.session_state.master_cache = {}
-    # --- NEW: Track processing state to lock UI ---
     if "is_processing" not in st.session_state:
         st.session_state.is_processing = False
 
@@ -165,6 +165,11 @@ with tab3:
         finally:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
+
+    # --- CACHED ENGINE LOADER ---
+    @st.cache_resource
+    def get_gvi_engine(model_path, device, api_key):
+        return GVIEngine(model_path=model_path, device=device, api_key=api_key)
 
     def generate_raster_grid(gdf_4326, spacing_meters):
         from rasterio.transform import from_bounds, xy
@@ -229,7 +234,7 @@ with tab3:
             disabled=st.session_state.is_processing,
         )
 
-        # 1. UNIFIED FILE MANAGER (Disabled during processing)
+        # 1. UNIFIED FILE MANAGER
         uploaded_files = st.file_uploader(
             "Upload Study Areas",
             accept_multiple_files=True,
@@ -254,9 +259,11 @@ with tab3:
                             in ["Polygon", "MultiPolygon"]
                             else "point"
                         )
+                        # Init with 'accumulated' list for partial results
                         st.session_state.datasets[f.name] = {
                             "raw": raw,
                             "processed": None,
+                            "accumulated": [],
                             "results": None,
                             "meta": None,
                             "type": gtype,
@@ -266,11 +273,10 @@ with tab3:
         else:
             st.session_state.datasets = {}
 
-        # 2. GRID GENERATION (Action)
+        # 2. GRID GENERATION
         if st.session_state.datasets:
             st.caption(f"Loaded {len(st.session_state.datasets)} datasets.")
 
-            # --- ACTION: GENERATE BUTTON (Disabled during processing) ---
             if st.button(
                 "Generate Sampling Grids for All",
                 disabled=st.session_state.is_processing,
@@ -284,9 +290,14 @@ with tab3:
                         else:
                             d["processed"] = d["raw"].copy()
                             d["meta"] = None
+
+                        # Reset results on new grid generation
+                        d["accumulated"] = []
+                        d["results"] = None
+
                     st.success("Grids generated!")
 
-            # --- VISUALIZATION: DRAW MAP LAYERS ---
+            # Draw Layers
             all_bounds = [
                 d["raw"].total_bounds for d in st.session_state.datasets.values()
             ]
@@ -300,7 +311,6 @@ with tab3:
                 m_gvi.fit_bounds([[b[1], b[0]], [b[3], b[2]]])
 
                 for fname, d in st.session_state.datasets.items():
-                    # Draw AOI Outline
                     folium.GeoJson(
                         d["raw"],
                         name=f"{fname} (AOI)",
@@ -312,7 +322,6 @@ with tab3:
                     ).add_to(m_gvi)
 
                     if d["processed"] is not None:
-                        # Limit to 1000 points per file for performance
                         preview = d["processed"].iloc[:1000]
                         for _, row in preview.iterrows():
                             folium.CircleMarker(
@@ -330,29 +339,51 @@ with tab3:
         if not st.session_state.datasets:
             st.warning("No datasets loaded.")
         else:
-            # LOCK UI
-            st.session_state.is_processing = True
-            st.rerun()  # Rerun to apply disabled state immediately
+            # RESET for fresh run (only clear if user manually clicked Run)
+            for d in st.session_state.datasets.values():
+                d["results"] = None
+                d["accumulated"] = []  # Clear previous accumulated
 
-    # If processing flag is active, run the logic automatically
+            st.session_state.is_processing = True
+            st.rerun()
+
+    # --- PROCESSING LOOP ---
     if st.session_state.is_processing:
+        if st.button("🛑 Abort Processing"):
+            st.session_state.is_processing = False
+            st.rerun()
+
         try:
             with st.status("Batch Analysis in Progress...", expanded=True) as status:
                 model_path = os.path.join(
                     parent_dir, "geofuse", "model", "best_model.pth"
                 )
-                engine = GVIEngine(
+                engine = get_gvi_engine(
                     model_path=model_path, device="cuda", api_key=api_key
                 )
 
                 for i, (fname, d) in enumerate(st.session_state.datasets.items()):
+                    # Skip if marked as fully done
+                    if d["results"] is not None:
+                        st.info(f"Skipping {fname} (Completed)")
+                        continue
+
                     if d["processed"] is None:
                         st.warning(f"Skipping {fname} (No grid generated)")
                         continue
 
                     st.write(f"Analyzing **{fname}**...")
 
-                    # --- NEW: Live File Progress Bar ---
+                    # --- RESUME LOGIC ---
+                    # 1. Determine where to start based on saved partials
+                    current_count = len(d["accumulated"])
+                    total_points = len(d["processed"])
+
+                    # 2. Callback to save data IMMEDIATELY
+                    def save_point_callback(data_dict):
+                        d["accumulated"].append(data_dict)
+
+                    # 3. UI Progress
                     file_progress = st.progress(0, text="Starting...")
 
                     def update_bar(curr, total):
@@ -361,68 +392,85 @@ with tab3:
                             pct, text=f"Processing Point {curr}/{total}"
                         )
 
-                    results = engine.run_analysis(
+                    # 4. Call Engine with Start Index
+                    # If current_count > 0, engine skips that many
+                    engine.run_analysis(
                         d["processed"],
                         step=gvi_res,
                         folder=output_dir,
                         save_panos=save_debug,
                         save_masks=save_debug,
                         external_cache=st.session_state.master_cache,
-                        progress_callback=update_bar,  # Pass the callback
+                        progress_callback=update_bar,
+                        result_callback=save_point_callback,  # Pass the saver
+                        start_index=current_count,  # Pass the resume index
                     )
 
-                    file_progress.empty()  # Remove bar when file done
+                    file_progress.empty()
 
-                    st.session_state.datasets[fname]["results"] = results
-
-                    # Save Outputs
-                    out_name = os.path.splitext(fname)[0]
-                    results.to_file(
-                        os.path.join(output_dir, f"{out_name}_gvi.geojson"),
-                        driver="GeoJSON",
-                    )
-
-                    if d["meta"]:
-                        import rasterio
-                        from rasterio.transform import rowcol
-
-                        meta = d["meta"]
-                        arr_veg = np.full(
-                            (meta["height"], meta["width"]), np.nan, dtype=np.float32
+                    # 5. Build Final DataFrame from ALL accumulated data
+                    if d["accumulated"]:
+                        results = gpd.GeoDataFrame(
+                            d["accumulated"], crs=d["processed"].crs
                         )
-                        arr_ter = np.full(
-                            (meta["height"], meta["width"]), np.nan, dtype=np.float32
+                        if "orig_index" in results.columns:
+                            results.set_index("orig_index", inplace=True)
+                            results.index.name = None
+
+                        st.session_state.datasets[fname]["results"] = results
+
+                        # Save to Disk
+                        out_name = os.path.splitext(fname)[0]
+                        results.to_file(
+                            os.path.join(output_dir, f"{out_name}_gvi.geojson"),
+                            driver="GeoJSON",
                         )
 
-                        valid = results.dropna(subset=["gvi_veg"])
-                        if not valid.empty:
-                            rows, cols = rowcol(
-                                meta["transform"],
-                                valid.geometry.x.values,
-                                valid.geometry.y.values,
+                        if d["meta"]:
+                            import rasterio
+                            from rasterio.transform import rowcol
+
+                            meta = d["meta"]
+                            arr_veg = np.full(
+                                (meta["height"], meta["width"]),
+                                np.nan,
+                                dtype=np.float32,
                             )
-                            rows = np.clip(rows, 0, meta["height"] - 1)
-                            cols = np.clip(cols, 0, meta["width"] - 1)
-                            arr_veg[rows, cols] = valid["gvi_veg"].values
-                            arr_ter[rows, cols] = valid["gvi_ter"].values
+                            arr_ter = np.full(
+                                (meta["height"], meta["width"]),
+                                np.nan,
+                                dtype=np.float32,
+                            )
 
-                        tif_path = os.path.join(output_dir, f"{out_name}_gvi.tif")
-                        with rasterio.open(
-                            tif_path,
-                            "w",
-                            driver="GTiff",
-                            height=meta["height"],
-                            width=meta["width"],
-                            count=2,
-                            dtype=np.float32,
-                            crs=meta["crs"],
-                            transform=meta["transform"],
-                            nodata=np.nan,
-                        ) as dst:
-                            dst.write(arr_veg, 1)
-                            dst.set_band_description(1, "Veg")
-                            dst.write(arr_ter, 2)
-                            dst.set_band_description(2, "Ter")
+                            valid = results.dropna(subset=["gvi_veg"])
+                            if not valid.empty:
+                                rows, cols = rowcol(
+                                    meta["transform"],
+                                    valid.geometry.x.values,
+                                    valid.geometry.y.values,
+                                )
+                                rows = np.clip(rows, 0, meta["height"] - 1)
+                                cols = np.clip(cols, 0, meta["width"] - 1)
+                                arr_veg[rows, cols] = valid["gvi_veg"].values
+                                arr_ter[rows, cols] = valid["gvi_ter"].values
+
+                            tif_path = os.path.join(output_dir, f"{out_name}_gvi.tif")
+                            with rasterio.open(
+                                tif_path,
+                                "w",
+                                driver="GTiff",
+                                height=meta["height"],
+                                width=meta["width"],
+                                count=2,
+                                dtype=np.float32,
+                                crs=meta["crs"],
+                                transform=meta["transform"],
+                                nodata=np.nan,
+                            ) as dst:
+                                dst.write(arr_veg, 1)
+                                dst.set_band_description(1, "Veg")
+                                dst.write(arr_ter, 2)
+                                dst.set_band_description(2, "Ter")
 
                 status.update(
                     label="Batch Analysis Complete!", state="complete", expanded=False
@@ -432,7 +480,6 @@ with tab3:
         except Exception as e:
             st.error(f"Analysis failed: {e}")
 
-        # UNLOCK UI
         st.session_state.is_processing = False
         st.rerun()
 
@@ -467,7 +514,6 @@ with tab3:
         for ds_name in targets:
             ds = st.session_state.datasets[ds_name]
 
-            # A. POINTS
             if viz_layer == "Points":
                 valid_pts = ds["results"].dropna(subset=["gvi_veg"])
                 if len(targets) == 1:
@@ -485,7 +531,6 @@ with tab3:
                     ),
                 ).add_to(m_gvi)
 
-            # B. RASTER
             elif "Raster" in viz_layer:
                 if not ds["meta"]:
                     if len(targets) == 1:
@@ -549,7 +594,7 @@ with tab3:
                     ).add_to(m_gvi)
 
     with col_b:
-        st_folium(m_gvi, width=800, height=500)
+        st_folium(m_gvi, width=800, height=500, returned_objects=[])
 
 # -----------------------------------------------------------------------------
 # TAB 4: FUSION DEMO

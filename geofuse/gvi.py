@@ -106,7 +106,6 @@ class GVIEngine:
         if img is None:
             return None
 
-        # Ensure input is PIL
         if isinstance(img, np.ndarray):
             try:
                 img = Image.fromarray(img)
@@ -191,16 +190,19 @@ class GVIEngine:
         save_panos=False,
         save_masks=False,
         external_cache=None,
-        progress_callback=None,  # <--- NEW: Callback for live UI updates
+        progress_callback=None,  # For UI Progress Bar
+        result_callback=None,  # For Accumulating Results Live
+        start_index=0,  # For Resume Capability
     ):
-        print("[GVI] Starting Analysis...")
+        print(f"[GVI] Starting Analysis (Resume Index: {start_index})...")
         os.makedirs(folder, exist_ok=True)
         if save_panos:
             os.makedirs(os.path.join(folder, "images"), exist_ok=True)
         if save_masks:
             os.makedirs(os.path.join(folder, "masks"), exist_ok=True)
 
-        # 1. PREPARE INPUT POINTS
+        # 1. PREPARE INPUT POINTS (FULL LIST)
+        # We generate the full list first to ensure indexing is consistent across restarts
         first_geom = gdf.geometry.iloc[0]
         points = []
         rows = 0
@@ -209,9 +211,7 @@ class GVIEngine:
         write_tif = False
 
         if first_geom.geom_type in ["Polygon", "MultiPolygon"]:
-            print(
-                f"[INFO] Input is Polygon. Generating internal grid (Step: {step})..."
-            )
+            # Polygon mode: deterministic grid generation
             points_data, rows, cols, transform = self._generate_pixel_aligned_grid(
                 gdf, step
             )
@@ -220,7 +220,7 @@ class GVIEngine:
             points = points_data
             write_tif = True
         else:
-            print(f"[INFO] Input is Points ({len(gdf)}). Using provided geometry.")
+            # Point mode: deterministic from input rows
             has_indices = "row" in gdf.columns and "col" in gdf.columns
             for idx, row in gdf.iterrows():
                 points.append(
@@ -241,33 +241,34 @@ class GVIEngine:
             print("[FAIL] No points to process.")
             return gpd.GeoDataFrame()
 
-        # 2. RUN ANALYSIS LOOP
-        if rows > 0 and cols > 0:
-            raster_veg = np.full((rows, cols), np.nan, dtype=np.float32)
-            raster_ter = np.full((rows, cols), np.nan, dtype=np.float32)
-        else:
-            raster_veg = None
-            raster_ter = None
-
-        results = []
-        success_count = 0
-
-        pano_cache = external_cache if external_cache is not None else {}
+        # 2. SLICE FOR RESUME
+        # If we are resuming, we only process the points AFTER the start_index
         total_points = len(points)
+        points_to_process = points[start_index:]
 
-        print(f"[GVI] Processing {total_points} points...")
+        if len(points_to_process) == 0:
+            print("[GVI] All points already processed.")
+            return gpd.GeoDataFrame()
 
-        # Enumerate gives us current index for progress bar
-        for i, pt in enumerate(tqdm(points)):
+        # 3. RUN ANALYSIS LOOP
+        pano_cache = external_cache if external_cache is not None else {}
 
-            # --- NEW: Invoke Callback ---
+        print(f"[GVI] Processing {len(points_to_process)} remaining points...")
+
+        # We iterate only the remaining points
+        for i, pt in enumerate(tqdm(points_to_process)):
+            # Actual index relative to the FULL dataset (for progress bar)
+            current_global_idx = start_index + i
+
+            # --- Invoke Progress Callback ---
             if progress_callback:
-                progress_callback(i, total_points)
+                progress_callback(current_global_idx, total_points)
 
             r, c = pt["row"], pt["col"]
             lat, lon = pt["lat"], pt["lon"]
             orig_idx = pt["orig_index"]
 
+            # Coordinates
             search_lat, search_lon = lat, lon
             if not gdf.crs.is_geographic:
                 p_geo = (
@@ -277,6 +278,7 @@ class GVIEngine:
                 )
                 search_lat, search_lon = p_geo.y, p_geo.x
 
+            # Search & Process
             candidates = search_panoramas(lat=search_lat, lon=search_lon)
             final_panoid = None
             val_veg = np.nan
@@ -293,7 +295,6 @@ class GVIEngine:
                         val_veg = cached["veg"]
                         val_ter = cached["ter"]
                         final_panoid = pid
-                        success_count += 1
                         break
 
                     try:
@@ -314,7 +315,6 @@ class GVIEngine:
                                 val_veg = metrics.get("GVI_Total", 0.0)
                                 val_ter = metrics.get("GVI_Terrain", 0.0)
                                 final_panoid = pid
-                                success_count += 1
 
                                 if save_panos:
                                     p_path = os.path.join(
@@ -342,34 +342,21 @@ class GVIEngine:
                     except Exception:
                         continue
 
-            if raster_veg is not None and not np.isnan(val_veg):
-                raster_veg[r, c] = val_veg
-                raster_ter[r, c] = val_ter
+            # Build Result Object
+            res_dict = {
+                "orig_index": orig_idx,
+                "geometry": pt["geometry"],
+                "gvi_veg": float(val_veg) if not np.isnan(val_veg) else None,
+                "gvi_ter": float(val_ter) if not np.isnan(val_ter) else None,
+                "pano_id": final_panoid,
+                "lat": search_lat,
+                "lon": search_lon,
+                "row": r,
+                "col": c,
+            }
 
-            results.append(
-                {
-                    "orig_index": orig_idx,
-                    "geometry": pt["geometry"],
-                    "gvi_veg": float(val_veg) if not np.isnan(val_veg) else None,
-                    "gvi_ter": float(val_ter) if not np.isnan(val_ter) else None,
-                    "pano_id": final_panoid,
-                    "lat": search_lat,
-                    "lon": search_lon,
-                    "row": r,
-                    "col": c,
-                }
-            )
+            # --- Invoke Result Callback (Save immediately to Session State) ---
+            if result_callback:
+                result_callback(res_dict)
 
-        print(
-            f"[GVI] Finished. Successful: {success_count}/{len(points)}. Cache Size: {len(pano_cache)}"
-        )
-
-        if write_tif and transform is not None:
-            pass
-
-        gdf_res = gpd.GeoDataFrame(results, crs=gdf.crs)
-        if "orig_index" in gdf_res.columns:
-            gdf_res.set_index("orig_index", inplace=True)
-            gdf_res.index.name = None
-
-        return gdf_res
+        return gpd.GeoDataFrame()
