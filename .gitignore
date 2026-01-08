@@ -1,13 +1,27 @@
+## OS / editor junk
 .DS_Store
-__pycache__/
-*.tif 
-data/
-logs/
-.env   # For API keys
-geofuse/model
-tests/output
 .vscode/
+
+## Python cache / build artifacts
+__pycache__/
+geofuse.egg-info/
+.pytest_cache/
+
+## Environment / secrets
+.env
+
+## Data, models, and outputs
+data/
 data/samples
 logs/
-geofuse.egg-info/
+geofuse/model
 output_results/
+tests/output
+
+## Generated imagery and GeoJSON exports
+*.tif
+*_gvi.tif
+*_gvi.geojson
+
+## UI / Streamlit
+.streamlit/

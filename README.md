@@ -25,6 +25,11 @@ The toolbox features a user-friendly **Streamlit Dashboard** that allows researc
   * **Async/Multi-threaded** downloading for speed.
   * **Image pre-processing**: Ensures 360° coverage, corrects panorama artifacts, detects corrupt panoramas, and standardizes image resolution.
 
+* **Batch Processing & Recovery**: The GVI module supports a robust **Stateful Batch Workflow**:
+  * **Multi-threaded Analysis**: Runs deep learning inference in the background while keeping the UI responsive.
+  * **Crash Recovery**: If a job is interrupted (internet loss, crash, or manual cancel), simply re-upload the same input file and click "Start". The engine automatically detects existing progress and **resumes** from the last processed point.
+  * **Job Monitor**: Track progress via the sidebar. Use the **Scan Output Folder** button to load and visualize results from previous sessions without re-running analysis.
+
 * **Outputs**:
 
   * **Vector**: GeoJSON of sampling points with their respective GVI values (Vegetation and Terrain separated).

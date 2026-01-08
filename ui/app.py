@@ -11,7 +11,7 @@ import threading
 import uuid
 import glob
 import rasterio
-from rasterio.transform import array_bounds  # Import explicitly for bounds calc
+from rasterio.transform import array_bounds
 from datetime import datetime, date
 import numpy as np
 from shapely.geometry import Point
@@ -667,7 +667,7 @@ with tab3:
 
         viz_layer = st.radio(
             "Visualization Layer",
-            ["Points", "Vegetation Raster", "Terrain Raster"],
+            ["Vegetation Raster", "Terrain Raster"],
             horizontal=True,
         )
         r_opacity = st.slider("Layer Opacity", 0.0, 1.0, 0.7)
@@ -715,7 +715,6 @@ with tab3:
                     arr = np.full((meta["height"], meta["width"]), np.nan)
 
                     # Choose Band based on Radio Button (Defaulting to GVI Total vs Terrain)
-                    # Note: "Points" layer name in radio button just means "Enable Points overlay"
                     # For raster underlay, we need a default. Let's assume Vegetation unless Terrain explicitly picked.
                     col_name = "gvi_ter" if "Terrain" in viz_layer else "gvi_veg"
 
@@ -737,10 +736,15 @@ with tab3:
                             mask_idx
                         ]
 
-                        if "Terrain" in viz_layer:
-                            cmap = plt.cm.get_cmap("OrRd")
-                        else:
-                            cmap = plt.cm.get_cmap("Greens")
+                        # Determine colormap name based on layer selection
+                        cmap_name = "OrRd" if "Terrain" in viz_layer else "Greens"
+
+                        # Retrieve colormap using modern API
+                        try:
+                            cmap = matplotlib.colormaps[cmap_name]
+                        except (AttributeError, KeyError):
+                            # Safe fallback for older versions or edge cases
+                            cmap = plt.get_cmap(cmap_name)
 
                         norm_data = np.clip((arr - 0) / 0.6, 0, 1)
                         colored = cmap(norm_data)
