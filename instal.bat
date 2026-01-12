@@ -7,7 +7,7 @@ set ENV_NAME=geofuse
 set PYTHON_VER=3.12.12
 
 echo ========================================================
-echo        GeoFuse Installer
+echo        GeoFuse Installer (MPI-Enabled)
 echo ========================================================
 
 :: --- STEP 1: AUTO-DETECT CONDA ---
@@ -50,18 +50,18 @@ echo [INFO] Activating Environment...
 call conda activate %ENV_NAME%
 
 :: --- STEP 3: RUN PYTHON SETUP SCRIPT ---
-if exist scripts/setup_env.py (
-    python scripts/setup_env.py
+if exist scripts\setup_env.py (
+    python scripts\setup_env.py
 ) else (
-    echo [ERROR] setup_env.py not found!
+    echo [ERROR] scripts\setup_env.py not found!
     pause
     exit /b
 )
 
 echo.
 echo ========================================================
-echo [READY] To launch the app:
+echo [READY] To launch the CLI (example with 4 MPI processes):
 echo    conda activate %ENV_NAME%
-echo    streamlit run ui/app.py
+echo    mpiexec -n 4 python scripts/cli.py --config config.csv
 echo ========================================================
 pause
