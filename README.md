@@ -1,13 +1,20 @@
 # GeoFuse: Multimodal Greenspace Profiling Toolbox
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+[![OS](https://img.shields.io/badge/OS-Linux%7CWindows%7CmacOS-blue)](#-installation)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-[![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?logo=Streamlit&logoColor=white)](https://streamlit.io)
 [![Code Style: Black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+
+[![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?logo=PyTorch&logoColor=white)](https://pytorch.org/)
+[![MPI](https://img.shields.io/badge/MPI-Parallel-blue)](#4-high-performance-computing-hpc-integration)
+[![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?logo=Streamlit&logoColor=white)](#2-streamlit-web-ui)
+[![GDAL](https://img.shields.io/badge/GDAL-5CAE58?logo=gdal&logoColor=white)](https://gdal.org/)
+[![GeoPandas](https://img.shields.io/badge/GeoPandas-139C5A?logo=geopandas&logoColor=white)](https://geopandas.org/)
+[![Google Earth Engine](https://img.shields.io/badge/Google%20Earth%20Engine-4285F4?logo=google-earth&logoColor=white)](#2-satellite-intelligence-ndvi)
 
 **GeoFuse** is a comprehensive Python toolbox designed for digital health and urban planning research that utilizes greenspace exposure. It automates the sourcing, processing, and fusion of environmental exposure metrics, specifically focusing on **Green View Index (GVI)** from street-level imagery and **Normalized Difference Vegetation Index (NDVI)** from satellite data.
 
-The toolbox features a user-friendly **Streamlit Dashboard** that allows researchers to drag-and-drop study areas and receive high-resolution environmental profiles without writing code.
+The toolbox can be run in two modes: a user-friendly **Streamlit Dashboard** for interactive analysis, or a **Command-Line Interface (CLI)** for scalable, parallel processing on high-performance computing (HPC) systems.
 
 ---
 
@@ -51,55 +58,96 @@ The toolbox features a user-friendly **Streamlit Dashboard** that allows researc
 
 GeoFuse is architected to scale from local laptops to High-Performance Computing (HPC) clusters, enabling city-wide or regional-scale analysis.
 
+* **MPI-Enabled CLI**: The Command-Line Interface supports parallel execution via MPI (`mpiexec`/`mpirun`), allowing workloads to be distributed across multiple CPU cores or compute nodes.
 * **Headless Batch Processing**: The core logic is decoupled from the UI into standalone engines. This allows for direct Python script execution, enabling automated batch processing pipelines without browser dependencies.
 * **GPU Acceleration & Scaling**: Built on **PyTorch** with native **CUDA** support. The architecture is designed for Multi-GPU inference, allowing massive segmentation workloads to be distributed across available hardware nodes.
 * **Optimized Resource Management**: Implements asynchronous I/O for non-blocking downloads and memory-efficient raster operations (windowed reading/writing) to maximize throughput on shared compute nodes.
-* **Scheduler Compatibility**: Fully compatible with user-space environments (Conda/Miniforge) and designed to integrate with standard job schedulers (e.g., **Slurm**, **PBS**) for distributed, parallelized job submission.
 
 ---
 
 ## 🚀 Installation
 
-GeoFuse uses a **Hybrid Installer** that manages Conda (for heavy geospatial binaries like GDAL) and Pip (for AI/UI libraries) automatically.
+GeoFuse uses an automated installer that handles all dependencies, including complex geospatial and deep learning libraries.
 
 ### Prerequisites
 
-* **Windows OS** (Tested on Windows 10/11; Linux and MacOS are supported, but not tested yet).
-* **Miniforge** (recommended) or **Anaconda** installed.
-* (Optional) **Mamba** package manager (Highly recommended)
+* A Conda-based Python distribution. We recommend **Miniforge**.
+* (Optional) For significantly faster installation, make sure `mamba` is installed in your base conda environment: `conda install mamba -n base -c conda-forge`.
 
-### One-Click Setup
+### Automated Installation
 
-1. Clone this repository.
-2. Double-click the **`install.bat`** file in the root folder.
-    * _This script will auto-detect your Conda installation, create a dedicated environment, install required packages, and link the toolbox._
-3. Follow the on-screen prompts (enter `Y` if asked to delete/reinstall the environment).
+The installer script will automatically create a `geofuse` conda environment and install all required packages.
 
-### Alternative Setup (Manual / Mamba)
+#### 1. Windows
 
-If you prefer, you can build the environment manually using the provided `environment.yml` file.
+Simply double-click the `instal.bat` script. It will auto-detect your Conda installation and guide you through the process.
 
-1. **Create the Environment:**
+#### 2. Linux / macOS
 
-     ```bash
-    mamba env create -f environment.yml
-    ```
+First, make the installer script (`install.sh`) executable:
 
-    _(Note: You can also use `conda env create -f environment.yml` if you don't have Mamba, but it will be slower and likely to have issues solving the environment.)_
+```bash
+# Give the script execute permissions
+# (Only needs to be done once)
+chmod +x install.sh
+```
 
-2. **Activate & Install Package:**
-  Once the environment is built, you must activate it and install the toolbox in "editable" mode:
+then run it:
 
-    ```bash
-    conda activate geofuse
-    pip install -e .
-    ```
+```bash
+# Run the installer
+./install.sh
+```
 
 ### Segmentation Model
 
-Place your pre-trained segmentation model's `.pth` file inside `geofuse/model` and rename it to `best_model.pth`. The toolbox can automatically differentiate and detect the backbone.
+Place your pre-trained segmentation model's `.pth` file inside `geofuse/model` and rename it to `best_model.pth`. The toolbox can automatically detect commonly-used backbones.
 
 _Note: You can either use your own trained model, or find one from online sources such as [VainF's repo](https://github.com/VainF/DeepLabV3Plus-Pytorch/tree/master)._
+
+---
+
+## ✅ Usage
+
+After installation, you can run GeoFuse using either the parallel Command-Line Interface or the interactive Streamlit Web UI.
+
+### 1. Command-Line Interface (CLI) for Batch Processing
+
+The CLI is designed for large-scale, automated, and parallel processing. It is the recommended method for running large study areas or multiple files on servers or HPC clusters.
+
+1. **Activate the Environment**
+    Open your Conda terminal and activate the environment:
+
+    ```bash
+    conda activate geofuse
+    ```
+
+2. **Run the CLI**
+    Use `mpiexec` or `mpirun` to execute the main CLI script in parallel. The `-n` flag specifies the number of parallel processes.
+
+    ```bash
+    # Example: Run with 4 parallel processes
+    mpiexec -n 4 python scripts/cli.py --config config.csv
+    ```
+
+    * `--config`: Path to a CSV file that defines your input files and parameters.
+    * A template `config.csv` will be created for you if one is not found.
+
+### 2. Streamlit Web UI
+
+The Web UI is ideal for interactive exploration, visualization of results, and processing smaller study areas.
+
+1. **Activate the Environment**
+
+    ```bash
+    conda activate geofuse
+    ```
+
+2. **Launch the App**
+
+    ```bash
+    streamlit run ui/app.py
+    ```
 
 ---
 
@@ -174,39 +222,25 @@ python tests/test_memory_stability.py --iterations 5000
 
 ---
 
-## 🖥️ Usage
-
-Once the installation is complete, the app typically launches automatically. To launch it manually later:
-
-1. Open your terminal (Anaconda/Miniforge Prompt).
-2. Run the following commands:
-
-```bash
-conda activate geofuse
-streamlit run ui/app.py
-```
-
----
-
 ## 🛠️ Configuration & Troubleshooting
 
-**"No module named geofuse"**
+### **"No module named geofuse"**
 
 If you see this error, it means the package wasn't linked correctly during setup.
 
-* **Fix:** Rerun `install.bat` and ensure you see the message `[5/5] Performing Editable Install`.
+* **Fix:** Rerun the installer script (`instal.bat` / `install.sh`) and ensure you see a success message at the end. Or, if installing manually, make sure you run `pip install -e .` after activating the environment.
 
-**"DecompressionBombWarning"**
+### **"Conda Not Found"**
+
+If the installer script fails immediately:
+
+* Ensure Miniforge/Anaconda is installed and that its 'Scripts' or 'bin' directory is accessible from your terminal.
+* If installed in a custom location, the script will prompt you to paste the correct path.
+
+### **"DecompressionBombWarning"**
 
 * **Info:** You may see this warning in the terminal if downloading very high-res Street View images.
 * It is Safe to ignore. The toolbox automatically handles large image limits and resizes them for processing.
-
-**"Conda Not Found"**
-
-If `install.bat` closes immediately:
-
-* Ensure Miniforge/Anaconda is installed.
-* If installed in a custom location, paste the path when prompted by the script.
 
 ---
 
