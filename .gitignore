@@ -12,9 +12,8 @@ geofuse.egg-info/
 
 ## Data, models, and outputs
 data/
-data/samples
 logs/
-geofuse/model
+geofuse/model/*
 output_results/
 tests/output
 
@@ -22,6 +21,8 @@ tests/output
 *.tif
 *_gvi.tif
 *_gvi.geojson
+*_ndvi.tif
+*_ndvi.geojson
 
 ## UI / Streamlit
 .streamlit/

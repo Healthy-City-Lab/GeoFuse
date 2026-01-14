@@ -12,11 +12,14 @@ import uuid
 import glob
 import rasterio
 from rasterio.transform import array_bounds
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import numpy as np
 from shapely.geometry import Point
 import matplotlib
 import matplotlib.pyplot as plt
+import io
+import base64
+from PIL import Image as PILImage
 
 # --- STREAMLIT RUNTIME CONTEXT ---
 from streamlit.runtime.scriptrunner import add_script_run_ctx
@@ -50,13 +53,8 @@ st.set_page_config(page_title="GeoFuse Toolbox", layout="wide")
 st.markdown(
     """
 <style>
-    .block-container {
-        padding-top: 1rem;
-        padding-bottom: 1rem;
-    }
-    iframe {
-        width: 100% !important;
-    }
+    .block-container { padding-top: 1rem; padding-bottom: 1rem; }
+    iframe { width: 100% !important; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -104,46 +102,418 @@ with tab1:
             else:
                 st.info("Waiting for job...")
 
+
+# --- SHARED HELPERS ---
+@st.cache_data
+def load_clean_gdf(file_obj):
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".geojson") as tmp:
+        tmp.write(file_obj.getvalue())
+        tmp_path = tmp.name
+    try:
+        gdf = gpd.read_file(tmp_path)
+        if gdf.crs is None:
+            gdf.set_crs("EPSG:4326", inplace=True)
+        else:
+            gdf = gdf.to_crs("EPSG:4326")
+        for col in gdf.columns:
+            if (
+                pd.api.types.is_datetime64_any_dtype(gdf[col])
+                or gdf[col].dtype == "object"
+            ):
+                try:
+                    gdf[col] = gdf[col].astype(str)
+                except:
+                    gdf = gdf.drop(columns=[col])
+        return gdf
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def generate_raster_grid(gdf_4326, spacing_meters):
+    from rasterio.transform import from_bounds, xy
+
+    minx, miny, maxx, maxy = gdf_4326.total_bounds
+    center_lat = (miny + maxy) / 2.0
+    lat_rad = np.radians(center_lat)
+    m_per_deg_lat = 111132.92 - 559.82 * np.cos(2 * lat_rad)
+    m_per_deg_lon = 111412.84 * np.cos(lat_rad) - 93.5 * np.cos(3 * lat_rad)
+    res_x = spacing_meters / m_per_deg_lon
+    res_y = spacing_meters / m_per_deg_lat
+    width = int(np.ceil((maxx - minx) / res_x))
+    height = int(np.ceil((maxy - miny) / res_y))
+    transform = from_bounds(
+        minx, miny, minx + (width * res_x), miny + (height * res_y), width, height
+    )
+    rows, cols = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
+    xs, ys = xy(transform, rows.flatten(), cols.flatten(), offset="center")
+    df = pd.DataFrame({"row": rows.flatten(), "col": cols.flatten(), "x": xs, "y": ys})
+    gdf_grid = gpd.GeoDataFrame(
+        df, geometry=gpd.points_from_xy(df.x, df.y), crs="EPSG:4326"
+    )
+    gdf_clipped = gpd.sjoin(gdf_grid, gdf_4326, how="inner", predicate="intersects")
+    return gdf_clipped, {
+        "transform": transform,
+        "width": width,
+        "height": height,
+        "crs": "EPSG:4326",
+    }
+
+
 # -----------------------------------------------------------------------------
 # TAB 2: NDVI CONFIGURATOR
 # -----------------------------------------------------------------------------
 with tab2:
-    st.header("Satellite Data Configuration")
-    col_a, col_b = st.columns([1, 2])
-    with col_a:
-        target_date = st.date_input("Target Date", value=date(2023, 7, 15))
-        tolerance = st.number_input("Cloud Tolerance (Days)", value=15, min_value=1)
-        ndvi_file = st.file_uploader("Upload Catchment Area", key="ndvi_up")
+    st.header("Satellite Data Configuration (NDVI)")
+
+    if "ndvi_datasets" not in st.session_state:
+        st.session_state.ndvi_datasets = {}
+    if "ndvi_inspector_select" not in st.session_state:
+        st.session_state.ndvi_inspector_select = None
+
+    def ndvi_worker(
+        job_id,
+        fname,
+        dataset_data,
+        start_date,
+        end_date,
+        cloud_pct,
+        resolution,
+        job_tracker_dict,
+    ):
+        try:
+            job_tracker_dict[job_id]["status"] = "Initializing GEE..."
+            engine = NDVIEngine()
+            job_tracker_dict[job_id]["status"] = "Downloading & Processing..."
+            result = engine.download_and_process(
+                geometry=dataset_data["raw"],
+                start_date=start_date,
+                end_date=end_date,
+                output_name=fname.replace(".geojson", ""),
+                cloud_max=cloud_pct,
+                resolution=resolution,
+                folder=output_dir,
+            )
+            if result["status"] == "success":
+                job_tracker_dict[job_id]["status"] = "Completed"
+                job_tracker_dict[job_id]["progress"] = 1.0
+            else:
+                job_tracker_dict[job_id]["status"] = f"Error: {result['message']}"
+        except Exception as e:
+            job_tracker_dict[job_id]["status"] = f"Error: {str(e)}"
+
+    col_ndvi_top_left, col_ndvi_top_right = st.columns(2)
+    with col_ndvi_top_left:
+        st.subheader("1. Job Configuration")
+        col_d1, col_d2 = st.columns(2)
+        with col_d1:
+            start_date = st.date_input("Start Date", value=date(2023, 6, 1))
+        with col_d2:
+            end_date = st.date_input("End Date", value=date(2023, 9, 30))
+        cloud_pct = st.slider("Max Cloud Coverage (%)", 0, 100, 10)
+        resolution = st.number_input("Resolution (m)", value=10, min_value=10)
+        ndvi_files = st.file_uploader(
+            "Upload Catchment Area (GeoJSON)", accept_multiple_files=True, key="ndvi_up"
+        )
+
+        if ndvi_files is not None:
+            current_names = [f.name for f in ndvi_files]
+            for k in list(st.session_state.ndvi_datasets.keys()):
+                ds = st.session_state.ndvi_datasets[k]
+                if ds.get("type") == "restored":
+                    continue
+                if k not in current_names:
+                    del st.session_state.ndvi_datasets[k]
+            for f in ndvi_files:
+                if f.name not in st.session_state.ndvi_datasets:
+                    try:
+                        raw = load_clean_gdf(f)
+                        st.session_state.ndvi_datasets[f.name] = {
+                            "raw": raw,
+                            "processed": None,
+                            "results": None,
+                            "meta": None,
+                            "type": "input",
+                        }
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+        if ndvi_files == []:
+            for k in list(st.session_state.ndvi_datasets.keys()):
+                if st.session_state.ndvi_datasets[k].get("type") != "restored":
+                    del st.session_state.ndvi_datasets[k]
+
+        st.divider()
         if st.button("Run NDVI Analysis", type="primary"):
-            if ndvi_file:
-                temp_path = os.path.join(output_dir, "temp_aoi_ndvi.geojson")
-                with open(temp_path, "wb") as f:
-                    f.write(ndvi_file.getbuffer())
-                status = st.empty()
-                status.text("Running Engine...")
-                try:
-                    engine = NDVIEngine()
-                    out = os.path.join(output_dir, f"ndvi_{target_date}.tif")
-                    if engine.export_geotiff(
-                        temp_path, str(target_date), out, tolerance=tolerance
-                    ):
-                        status.success(f"Saved: {out}")
-                    else:
-                        status.error("No images found.")
-                except Exception as e:
-                    st.error(str(e))
-    with col_b:
-        m = folium.Map(location=[51.0447, -114.0719], zoom_start=10)
-        if ndvi_file:
-            try:
-                ndvi_file.seek(0)
-                gdf = gpd.read_file(ndvi_file).to_crs(epsg=4326)
-                minx, miny, maxx, maxy = gdf.total_bounds
-                m.fit_bounds([[miny, minx], [maxy, maxx]])
-                folium.GeoJson(gdf).add_to(m)
-            except Exception as e:
-                st.error(f"Map Error: {e}")
-        st_folium(m, width=800, height=500, returned_objects=[])
+            if not st.session_state.ndvi_datasets:
+                st.warning("No data uploaded.")
+            else:
+                if "jobs" not in st.session_state:
+                    st.session_state.jobs = {}
+                for fname, d in st.session_state.ndvi_datasets.items():
+                    if d.get("type") == "restored":
+                        continue
+                    job_id = str(uuid.uuid4())[:8]
+                    st.session_state.jobs[job_id] = {
+                        "fname": fname,
+                        "task": "NDVI",
+                        "start_time": datetime.now().strftime("%H:%M:%S"),
+                        "progress": 0.0,
+                        "status": "Queued",
+                        "cancel": False,
+                        "handoff_complete": False,
+                    }
+                    t = threading.Thread(
+                        target=ndvi_worker,
+                        args=(
+                            job_id,
+                            fname,
+                            d,
+                            start_date,
+                            end_date,
+                            cloud_pct,
+                            resolution,
+                            st.session_state.jobs,
+                        ),
+                    )
+                    add_script_run_ctx(t)
+                    t.start()
+                st.success("NDVI Jobs started! Check Sidebar.")
+
+    with col_ndvi_top_right:
+        st.subheader("Input Preview")
+        m_ndvi_input = folium.Map(location=[51.0447, -114.0719], zoom_start=10)
+        all_bounds = []
+        for fname, d in st.session_state.ndvi_datasets.items():
+            if d.get("type") == "restored":
+                continue
+            if d.get("raw") is not None:
+                folium.GeoJson(
+                    d["raw"],
+                    name=f"{fname} (AOI)",
+                    style_function=lambda x: {"color": "blue", "fill": False},
+                ).add_to(m_ndvi_input)
+                all_bounds.append(d["raw"].total_bounds)
+        if all_bounds:
+            min_x = min([b[0] for b in all_bounds])
+            min_y = min([b[1] for b in all_bounds])
+            max_x = max([b[2] for b in all_bounds])
+            max_y = max([b[3] for b in all_bounds])
+            m_ndvi_input.fit_bounds([[min_y, min_x], [max_y, max_x]])
+        st_folium(
+            m_ndvi_input,
+            width="100%",
+            height=500,
+            key="map_ndvi_input",
+            returned_objects=[],
+        )
+
+    st.divider()
+
+    col_ndvi_btm_left, col_ndvi_btm_right = st.columns(2)
+    with col_ndvi_btm_left:
+        st.subheader("2. Result Inspector")
+        if st.button("🔄 Scan Output Folder (NDVI)"):
+            found_files = glob.glob(os.path.join(output_dir, "*_ndvi.geojson"))
+            count = 0
+            for p in found_files:
+                base_name = os.path.basename(p).replace("_ndvi.geojson", "")
+                tif_path = os.path.join(output_dir, f"{base_name}_ndvi.tif")
+                if not os.path.exists(tif_path):
+                    continue
+                if base_name not in st.session_state.ndvi_datasets:
+                    try:
+                        gdf = gpd.read_file(p)
+                        with rasterio.open(tif_path) as src:
+                            meta = {
+                                "transform": src.transform,
+                                "width": src.width,
+                                "height": src.height,
+                                "crs": src.crs,
+                            }
+
+                        # Fix AOI geom for map
+                        if gdf.crs.to_epsg() != 4326:
+                            raw_geom = (
+                                gdf.to_crs(epsg=4326).geometry.union_all().envelope
+                            )
+                        else:
+                            raw_geom = gdf.geometry.union_all().envelope
+
+                        raw_gdf = gpd.GeoDataFrame(
+                            {"geometry": [raw_geom]}, crs="EPSG:4326"
+                        )
+                        st.session_state.ndvi_datasets[base_name] = {
+                            "raw": raw_gdf,
+                            "processed": None,
+                            "results": gdf,
+                            "meta": meta,
+                            "type": "restored",
+                        }
+                        count += 1
+                    except Exception as e:
+                        print(f"Error loading {base_name}: {e}")
+            if count > 0:
+                st.success(f"Loaded {count} NDVI results.")
+            else:
+                st.info("No valid NDVI results found.")
+
+        completed_ds = [
+            k
+            for k, v in st.session_state.ndvi_datasets.items()
+            if v.get("type") == "restored"
+        ]
+        options = ["All Regions"] + completed_ds
+        selected_opt = st.selectbox(
+            "Select NDVI Result",
+            options,
+            index=None,
+            placeholder="Select a Result...",
+            key="ndvi_inspector_select",
+        )
+        r_opacity = st.slider("Raster Opacity", 0.0, 1.0, 0.7, key="ndvi_op")
+        show_points = st.checkbox("Show Validation Points (Blue Dots)", value=False)
+        val_container = st.empty()
+
+    with col_ndvi_btm_right:
+        st.subheader("Results Preview")
+        m_ndvi_result = folium.Map(location=[51.0447, -114.0719], zoom_start=10)
+
+        if selected_opt:
+            targets = completed_ds if selected_opt == "All Regions" else [selected_opt]
+            res_bounds = []
+
+            for ds_name in targets:
+                if ds_name not in st.session_state.ndvi_datasets:
+                    continue
+                ds = st.session_state.ndvi_datasets[ds_name]
+
+                tif_path = os.path.join(output_dir, f"{ds_name}_ndvi.tif")
+                if os.path.exists(tif_path):
+                    try:
+                        with rasterio.open(tif_path) as src:
+                            # 1. READ RAW (Standardized EPSG:4326)
+                            arr = src.read(1)
+
+                            # 2. GET BOUNDS
+                            # src.bounds -> (min_lon, min_lat, max_lon, max_lat)
+                            bounds = src.bounds
+                            # Folium -> [[min_lat, min_lon], [max_lat, max_lon]]
+                            folium_bounds = [
+                                [bounds.bottom, bounds.left],
+                                [bounds.top, bounds.right],
+                            ]
+
+                            res_bounds.append(
+                                [bounds.left, bounds.bottom, bounds.right, bounds.top]
+                            )
+
+                            # 3. RENDER
+                            norm_data = np.clip((arr - (-0.2)) / (1.0 - (-0.2)), 0, 1)
+                            cmap = plt.get_cmap("RdYlGn")
+                            colored = cmap(norm_data)
+
+                            mask = (arr == -9999) | np.isnan(arr) | (arr == 0)
+                            colored[..., 3] = np.where(mask, 0, r_opacity)
+
+                            img_bytes = (colored * 255).astype(np.uint8)
+                            im = PILImage.fromarray(img_bytes)
+                            buff = io.BytesIO()
+                            im.save(buff, format="PNG")
+                            img_url = f"data:image/png;base64,{base64.b64encode(buff.getvalue()).decode()}"
+
+                            folium.raster_layers.ImageOverlay(
+                                image=img_url,
+                                bounds=folium_bounds,
+                                opacity=r_opacity,
+                                interactive=True,
+                            ).add_to(m_ndvi_result)
+
+                            # Extent Box
+                            folium.Rectangle(
+                                bounds=folium_bounds, color="red", weight=2, fill=False
+                            ).add_to(m_ndvi_result)
+
+                    except Exception as e:
+                        print(f"Viz Error {ds_name}: {e}")
+
+                # 4. RENDER POINTS (Validation)
+                if show_points:
+                    if ds.get("results") is not None:
+                        try:
+                            gdf_pts = ds["results"]
+                            if len(gdf_pts) > 5000:
+                                st.warning(f"{ds_name}: Showing 5000 sample points.")
+                                gdf_pts = gdf_pts.sample(5000)
+
+                            folium.GeoJson(
+                                gdf_pts,
+                                marker=folium.Circle(
+                                    radius=1, color="blue", fill=True, fill_opacity=1
+                                ),
+                                tooltip=folium.GeoJsonTooltip(
+                                    fields=["NDVI"], aliases=["Val:"]
+                                ),
+                            ).add_to(m_ndvi_result)
+                        except Exception as e:
+                            st.error(f"Error loading points: {e}")
+
+            if res_bounds:
+                min_x = min([b[0] for b in res_bounds])
+                min_y = min([b[1] for b in res_bounds])
+                max_x = max([b[2] for b in res_bounds])
+                max_y = max([b[3] for b in res_bounds])
+                m_ndvi_result.fit_bounds([[min_y, min_x], [max_y, max_x]])
+
+        map_data = st_folium(
+            m_ndvi_result,
+            width="100%",
+            height=500,
+            key="map_ndvi_result",
+            returned_objects=["last_clicked"],
+        )
+
+        # Click Logic
+        if map_data and map_data.get("last_clicked"):
+            lat = map_data["last_clicked"]["lat"]
+            lon = map_data["last_clicked"]["lng"]
+            val_found = False
+            search_targets = (
+                completed_ds
+                if (selected_opt == "All Regions" or selected_opt is None)
+                else [selected_opt]
+            )
+
+            for ds_name in search_targets:
+                if ds_name not in st.session_state.ndvi_datasets:
+                    continue
+                tif_path = os.path.join(output_dir, f"{ds_name}_ndvi.tif")
+                if os.path.exists(tif_path):
+                    with rasterio.open(tif_path) as src:
+                        try:
+                            # 1. Simple lookup (Source is 4326)
+                            r, c = src.index(lon, lat)
+                            window = rasterio.windows.Window(c, r, 1, 1)
+                            val = src.read(1, window=window)
+                            if val.size > 0:
+                                pixel_val = val[0][0]
+                                if (
+                                    pixel_val != -9999
+                                    and not np.isnan(pixel_val)
+                                    and pixel_val != 0
+                                ):
+                                    val_container.info(
+                                        f"**{ds_name}**: NDVI = {pixel_val:.4f} at ({lat:.4f}, {lon:.4f})"
+                                    )
+                                    val_found = True
+                                    break
+                        except:
+                            pass
+            if not val_found:
+                val_container.info(
+                    f"Clicked at ({lat:.4f}, {lon:.4f}) - No valid data."
+                )
 
 # -----------------------------------------------------------------------------
 # TAB 3: GVI CONFIGURATOR (2x2 Grid Layout)
@@ -173,35 +543,8 @@ with tab3:
     if "inspector_select_key" not in st.session_state:
         st.session_state.inspector_select_key = None
 
-    # --- HELPERS ---
-    @st.cache_data
-    def load_clean_gdf(file_obj):
-        import tempfile
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".geojson") as tmp:
-            tmp.write(file_obj.getvalue())
-            tmp_path = tmp.name
-        try:
-            gdf = gpd.read_file(tmp_path)
-            if gdf.crs is None:
-                gdf.set_crs("EPSG:4326", inplace=True)
-            else:
-                gdf = gdf.to_crs("EPSG:4326")
-            for col in gdf.columns:
-                if (
-                    pd.api.types.is_datetime64_any_dtype(gdf[col])
-                    or gdf[col].dtype == "object"
-                ):
-                    try:
-                        gdf[col] = gdf[col].astype(str)
-                    except:
-                        gdf = gdf.drop(columns=[col])
-            return gdf
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-
     def generate_raster_grid(gdf_4326, spacing_meters):
+        # (This function is already defined in global scope above, reusing)
         from rasterio.transform import from_bounds, xy
 
         minx, miny, maxx, maxy = gdf_4326.total_bounds
@@ -381,7 +724,6 @@ with tab3:
                             args=(jid,),
                         )
                     else:
-                        # Only show Dismiss (Trash Icon)
                         st.button(
                             "🗑️",
                             key=f"del_{jid}",
@@ -665,10 +1007,9 @@ with tab3:
             key="inspector_select_key",
         )
 
-        viz_layer = st.radio(
-            "Visualization Layer",
-            ["Vegetation Raster", "Terrain Raster"],
-            horizontal=True,
+        # REMOVED POINTS OPTION, ONLY RASTER SELECTION NOW
+        raster_layer = st.radio(
+            "Background Raster", ["Vegetation", "Terrain"], horizontal=True
         )
         r_opacity = st.slider("Layer Opacity", 0.0, 1.0, 0.7)
 
@@ -690,7 +1031,7 @@ with tab3:
                     continue
                 ds = st.session_state.datasets[ds_name]
 
-                # DRAW RASTER BOX (Uses actual raster extent, not AOI)
+                # DRAW RASTER BOX
                 if ds.get("meta"):
                     meta = ds["meta"]
                     left, bottom, right, top = array_bounds(
@@ -706,7 +1047,7 @@ with tab3:
                     ).add_to(m_result)
                     res_bounds.append([left, bottom, right, top])
 
-                    # 1. RENDER RASTER (Underlay)
+                    # 1. RENDER RASTER
                     from rasterio.transform import rowcol
                     import io, base64
                     from PIL import Image as PILImage
@@ -714,10 +1055,7 @@ with tab3:
                     meta = ds["meta"]
                     arr = np.full((meta["height"], meta["width"]), np.nan)
 
-                    # Choose Band based on Radio Button (Defaulting to GVI Total vs Terrain)
-                    # For raster underlay, we need a default. Let's assume Vegetation unless Terrain explicitly picked.
-                    col_name = "gvi_ter" if "Terrain" in viz_layer else "gvi_veg"
-
+                    col_name = "gvi_ter" if "Terrain" in raster_layer else "gvi_veg"
                     res = ds["results"].dropna(subset=[col_name])
 
                     if not res.empty:
@@ -736,14 +1074,10 @@ with tab3:
                             mask_idx
                         ]
 
-                        # Determine colormap name based on layer selection
-                        cmap_name = "OrRd" if "Terrain" in viz_layer else "Greens"
-
-                        # Retrieve colormap using modern API
+                        cmap_name = "OrRd" if "Terrain" in raster_layer else "Greens"
                         try:
                             cmap = matplotlib.colormaps[cmap_name]
                         except (AttributeError, KeyError):
-                            # Safe fallback for older versions or edge cases
                             cmap = plt.get_cmap(cmap_name)
 
                         norm_data = np.clip((arr - 0) / 0.6, 0, 1)
@@ -755,7 +1089,6 @@ with tab3:
                         im.save(buff, format="PNG")
                         img_url = f"data:image/png;base64,{base64.b64encode(buff.getvalue()).decode()}"
 
-                        # Add Image Overlay
                         folium.raster_layers.ImageOverlay(
                             image=img_url,
                             bounds=[[bottom, left], [top, right]],
@@ -763,8 +1096,7 @@ with tab3:
                             interactive=False,
                         ).add_to(m_result)
 
-                # 2. RENDER POINTS (Overlay)
-                # Prepare Visualization DataFrame (Round values for tooltip)
+                # 2. RENDER POINTS (ALWAYS ON)
                 gdf_viz = ds["results"].copy()
                 if "gvi_veg" in gdf_viz.columns:
                     gdf_viz["gvi_veg"] = gdf_viz["gvi_veg"].round(4)
@@ -783,7 +1115,6 @@ with tab3:
                     ),
                 ).add_to(m_result)
 
-            # Auto-Zoom Result Map using Raster Bounds
             if res_bounds:
                 min_x = min([b[0] for b in res_bounds])
                 min_y = min([b[1] for b in res_bounds])
