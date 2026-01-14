@@ -79,7 +79,7 @@ GeoFuse uses an automated installer that handles all dependencies, including com
 > For a significantly faster installation, make sure `mamba` is installed in your base conda environment:
 >
 > ```bash
-> conda install mamba -n base -c conda-forge`
+> conda install mamba -n base -c conda-forge
 > ```
 
 ### Automated Installation

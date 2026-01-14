@@ -51,7 +51,7 @@ call conda activate %ENV_NAME%
 
 :: --- STEP 3: RUN PYTHON SETUP SCRIPT ---
 if exist scripts\setup_env.py (
-    python scripts\setup_env.py
+    call "%CONDA_ROOT%\envs\%ENV_NAME%\python.exe" scripts\setup_env.py
 ) else (
     echo [ERROR] scripts\setup_env.py not found!
     pause

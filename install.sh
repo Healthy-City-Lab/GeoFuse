@@ -63,7 +63,7 @@ conda activate "$ENV_NAME"
 
 # --- STEP 4: RUN PYTHON SETUP SCRIPT ---
 if [ -f "scripts/setup_env.py" ]; then
-    python scripts/setup_env.py
+    "$CONDA_ROOT/envs/$ENV_NAME/bin/python" scripts/setup_env.py
 else
     echo "[ERROR] scripts/setup_env.py not found!"
     read -p "Press Enter to exit..."

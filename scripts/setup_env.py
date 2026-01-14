@@ -8,6 +8,9 @@ import os
 # CONFIGURATION
 # ==============================================================================
 
+# 0. ENVIRONMENT NAME
+ENV_NAME = "geofuse"
+
 # 1. CONDA PACKAGES (System Binaries & Core Geospatial)
 #    MPI packages are added dynamically below based on OS.
 CONDA_PACKAGES = ["gdal=3.12.0", "geopandas=1.1.1"]
@@ -80,7 +83,7 @@ def get_mpi_packages(system):
         return ["mpi4py=4.1.1", "openmpi"]
 
 
-def main():
+def main(env_name):
     system = platform.system()
     solver = get_solver()
 
@@ -93,15 +96,15 @@ def main():
 
     print(f"\n[1/5] Installing Core & MPI Binaries ({solver})...")
     # Conda handles the binary linking for mpi4py automatically here
-    run_cmd(f"{solver} install -y -c conda-forge {conda_str}")
+    run_cmd(f"{solver} install -n {env_name} -y -c conda-forge {conda_str}")
 
     # 2. Install PyTorch
     print(f"\n[2/5] Installing PyTorch Acceleration...")
     if system == "Windows" or system == "Linux":
-        cmd = f"{solver} install -y {PYTORCH_VERSION} pytorch-cuda=12.1 -c pytorch -c nvidia"
+        cmd = f"{solver} install -n {env_name} -y {PYTORCH_VERSION} pytorch-cuda=12.1 -c pytorch -c nvidia"
     else:
         # macOS uses CPU or MPS (Metal Performance Shaders), no CUDA
-        cmd = f"{solver} install -y {PYTORCH_VERSION} -c pytorch"
+        cmd = f"{solver} install -n {env_name} -y {PYTORCH_VERSION} -c pytorch"
     run_cmd(cmd)
 
     # 3. Install Pip Libraries
@@ -130,4 +133,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main(ENV_NAME)
