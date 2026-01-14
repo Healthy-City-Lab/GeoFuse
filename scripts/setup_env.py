@@ -127,7 +127,7 @@ def main(env_name):
     verify_script = (
         "import geofuse; print(f'   [OK] GeoFuse Package: {geofuse.__file__}'); "
         "import torch; print(f'   [OK] PyTorch: {torch.__version__} (CUDA: {torch.cuda.is_available()})'); "
-        "from mpi4py import MPI; print(f'   [OK] MPI Rank: {MPI.COMM_WORLD.Get_rank()} (Vendor: {MPI.Get_vendor()})')"
+        "from mpi4py import MPI; print(f'   [OK] MPI Rank: {MPI.COMM_WORLD.Get_rank()} (Vendor: {MPI.get_vendor()})')"
     )
     run_cmd(f'"{sys.executable}" -c "{verify_script}"')
 
