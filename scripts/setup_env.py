@@ -104,8 +104,8 @@ def main(env_name):
         cmd = f"{solver} install -n {env_name} -y {PYTORCH_VERSION} pytorch-cuda=12.1 -c pytorch -c nvidia"
     else:
         # macOS uses CPU or MPS (Metal Performance Shaders), no CUDA
-        # Add conda-forge to help with potential dependencies for the default (non-cpu) build.
-        cmd = f"{solver} install -n {env_name} -y {PYTORCH_VERSION} -c pytorch -c conda-forge"
+        # Use the standard command, ensuring the pytorch channel is primary.
+        cmd = f"{solver} install -n {env_name} -y {PYTORCH_VERSION} -c pytorch"
     run_cmd(cmd)
 
     # 3. Install Pip Libraries
@@ -130,13 +130,14 @@ def main(env_name):
     verify_imports = (
         "import geofuse; import torch; import platform; from mpi4py import MPI; "
     )
-    verify_geofuse = 'print(f"   [OK] GeoFuse Package: {geofuse.__file__}"); '
-    verify_mpi = 'print(f"   [OK] MPI Rank: {MPI.COMM_WORLD.Get_rank()} (Vendor: {MPI.get_vendor()})");'
+    # Use single quotes for f-strings and no parentheses in the output text to be shell-safe
+    verify_geofuse = "print(f'   [OK] GeoFuse Package: {geofuse.__file__}'); "
+    verify_mpi = "print(f'   [OK] MPI Rank: {MPI.COMM_WORLD.Get_rank()} - Vendor: {MPI.get_vendor()}');"
 
     if system == "Darwin":
-        verify_torch = 'print(f"   [OK] PyTorch: {torch.__version__} (MPS Available: {torch.backends.mps.is_available()})"); '
+        verify_torch = "print(f'   [OK] PyTorch: {torch.__version__} - MPS Available: {torch.backends.mps.is_available()}'); "
     else:
-        verify_torch = 'print(f"   [OK] PyTorch: {torch.__version__} (CUDA Available: {torch.cuda.is_available()})"); '
+        verify_torch = "print(f'   [OK] PyTorch: {torch.__version__} - CUDA Available: {torch.cuda.is_available()}'); "
 
     verify_script = verify_imports + verify_geofuse + verify_torch + verify_mpi
 
