@@ -104,31 +104,42 @@ def main(env_name):
         cmd = f"{solver} install -n {env_name} -y {PYTORCH_VERSION} pytorch-cuda=12.1 -c pytorch -c nvidia"
     else:
         # macOS uses CPU or MPS (Metal Performance Shaders), no CUDA
-        cmd = f"{solver} install -n {env_name} -y {PYTORCH_VERSION} -c pytorch"
+        # Add conda-forge to help with potential dependencies for the default (non-cpu) build.
+        cmd = f"{solver} install -n {env_name} -y {PYTORCH_VERSION} -c pytorch -c conda-forge"
     run_cmd(cmd)
 
     # 3. Install Pip Libraries
     print(f"\n[3/5] Installing Python Libraries...")
     pip_str = " ".join(PIP_PACKAGES)
-    run_cmd(f'"{sys.executable}" -m pip install {pip_str}')
+    run_cmd(f'"{sys.executable}" -m pip install -q {pip_str}')
 
     # 4. Install Git Packages
     print(f"\n[4/5] Installing Custom Git Packages...")
     for git_url in GIT_PACKAGES:
-        run_cmd(f'"{sys.executable}" -m pip install {git_url}')
+        run_cmd(f'"{sys.executable}" -m pip install -q {git_url}')
 
     # 5. Editable Install
     print(f"\n[5/5] Performing Editable Install of GeoFuse...")
     root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    run_cmd(f'"{sys.executable}" -m pip install -e "{root_dir}"')
+    run_cmd(f'"{sys.executable}" -m pip install -q -e "{root_dir}"')
 
     # Finish & Verify
     print("\n[SUCCESS] Environment Configured.")
-    verify_script = (
-        "import geofuse; print(f'   [OK] GeoFuse Package: {geofuse.__file__}'); "
-        "import torch; print(f'   [OK] PyTorch: {torch.__version__} (CUDA: {torch.cuda.is_available()})'); "
-        "from mpi4py import MPI; print(f'   [OK] MPI Rank: {MPI.COMM_WORLD.Get_rank()} (Vendor: {MPI.get_vendor()})')"
+
+    # Construct a verification script that checks for the correct GPU backend based on OS
+    verify_imports = (
+        "import geofuse; import torch; import platform; from mpi4py import MPI; "
     )
+    verify_geofuse = 'print(f"   [OK] GeoFuse Package: {geofuse.__file__}"); '
+    verify_mpi = 'print(f"   [OK] MPI Rank: {MPI.COMM_WORLD.Get_rank()} (Vendor: {MPI.get_vendor()})");'
+
+    if system == "Darwin":
+        verify_torch = 'print(f"   [OK] PyTorch: {torch.__version__} (MPS Available: {torch.backends.mps.is_available()})"); '
+    else:
+        verify_torch = 'print(f"   [OK] PyTorch: {torch.__version__} (CUDA Available: {torch.cuda.is_available()})"); '
+
+    verify_script = verify_imports + verify_geofuse + verify_torch + verify_mpi
+
     run_cmd(f'"{sys.executable}" -c "{verify_script}"')
 
 
