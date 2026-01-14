@@ -1,16 +1,18 @@
 # GeoFuse: Multimodal Greenspace Profiling Toolbox
 
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
-[![OS](https://img.shields.io/badge/OS-Linux%7CWindows%7CmacOS-blue)](#-installation)
-[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-[![Code Style: Black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
-
+[![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+[![Python Version](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+[![OS](https://img.shields.io/badge/OS-Linux|Windows|macOS-blue)](#installation)
+[![Code Style](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 [![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?logo=PyTorch&logoColor=white)](https://pytorch.org/)
+[![Conda Env](https://img.shields.io/badge/Conda%20Env-geofuse-342B029.svg?logo=anaconda&logoColor=white)](#installation)
 [![MPI](https://img.shields.io/badge/MPI-Parallel-blue)](#4-high-performance-computing-hpc-integration)
 [![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?logo=Streamlit&logoColor=white)](#2-streamlit-web-ui)
+[![Google Earth Engine](https://img.shields.io/badge/Google%20Earth%20Engine-4285F4?logo=google-earth&logoColor=white)](#2-satellite-intelligence-ndvi)
+[![NumPy](https://img.shields.io/badge/NumPy-013243.svg?logo=numpy&logoColor=white)](https://numpy.org/)
+[![Pandas](https://img.shields.io/badge/Pandas-150458.svg?logo=pandas&logoColor=white)](https://pandas.pydata.org/)
 [![GDAL](https://img.shields.io/badge/GDAL-5CAE58?logo=gdal&logoColor=white)](https://gdal.org/)
 [![GeoPandas](https://img.shields.io/badge/GeoPandas-139C5A?logo=geopandas&logoColor=white)](https://geopandas.org/)
-[![Google Earth Engine](https://img.shields.io/badge/Google%20Earth%20Engine-4285F4?logo=google-earth&logoColor=white)](#2-satellite-intelligence-ndvi)
 
 **GeoFuse** is a comprehensive Python toolbox designed for digital health and urban planning research that utilizes greenspace exposure. It automates the sourcing, processing, and fusion of environmental exposure metrics, specifically focusing on **Green View Index (GVI)** from street-level imagery and **Normalized Difference Vegetation Index (NDVI)** from satellite data.
 
@@ -18,7 +20,7 @@ The toolbox can be run in two modes: a user-friendly **Streamlit Dashboard** for
 
 ---
 
-## 🌟 Key Features
+## Key Features
 
 ### 1. Street View Intelligence (GVI)
 
@@ -65,14 +67,20 @@ GeoFuse is architected to scale from local laptops to High-Performance Computing
 
 ---
 
-## 🚀 Installation
+## Installation
 
 GeoFuse uses an automated installer that handles all dependencies, including complex geospatial and deep learning libraries.
 
 ### Prerequisites
 
 * A Conda-based Python distribution. We recommend **Miniforge**.
-* (Optional) For significantly faster installation, make sure `mamba` is installed in your base conda environment: `conda install mamba -n base -c conda-forge`.
+
+> [!TIP]
+> For a significantly faster installation, make sure `mamba` is installed in your base conda environment:
+>
+> ```bash
+> conda install mamba -n base -c conda-forge`
+> ```
 
 ### Automated Installation
 
@@ -84,15 +92,13 @@ Simply double-click the `instal.bat` script. It will auto-detect your Conda inst
 
 #### 2. Linux / macOS
 
-First, make the installer script (`install.sh`) executable:
+First, make the installer script (`install.sh`) executable (This only needs to be done once):
 
 ```bash
-# Give the script execute permissions
-# (Only needs to be done once)
 chmod +x install.sh
 ```
 
-then run it:
+Then run it:
 
 ```bash
 # Run the installer
@@ -101,13 +107,25 @@ then run it:
 
 ### Segmentation Model
 
-Place your pre-trained segmentation model's `.pth` file inside `geofuse/model` and rename it to `best_model.pth`. The toolbox can automatically detect commonly-used backbones.
+Place your pre-trained segmentation model's `.pth` file inside `geofuse/model` and rename it to `best_model.pth`.
+You can either use your own trained model, or find one from online sources such as [VainF's repo](https://github.com/VainF/DeepLabV3Plus-Pytorch/tree/master). The toolbox can automatically detect commonly-used backbones.
 
-_Note: You can either use your own trained model, or find one from online sources such as [VainF's repo](https://github.com/VainF/DeepLabV3Plus-Pytorch/tree/master)._
+> [!IMPORTANT]
+> **Using a Custom Segmentation Model**
+>
+> While you can load your own pre-trained model, it must adhere to specific requirements for the GVI calculation and visualization to work correctly:
+>
+> 1. **Model Architecture**: The model must be compatible with the DeepLabV3+ architecture used in this toolbox.
+> 2. **Number of Classes**: The model must be trained on **19 output classes**, matching the Cityscapes dataset standard.
+> 3. **Class ID Mapping**: For GVI calculation, the model's output classes **must** use the following specific IDs:
+>     * `Vegetation`: Class ID **8**
+>     * `Terrain`: Class ID **9**
+>
+> Models that do not follow this structure will either fail to load or produce incorrect GVI results.
 
 ---
 
-## ✅ Usage
+## Usage
 
 After installation, you can run GeoFuse using either the parallel Command-Line Interface or the interactive Streamlit Web UI.
 
@@ -131,7 +149,9 @@ The CLI is designed for large-scale, automated, and parallel processing. It is t
     ```
 
     * `--config`: Path to a CSV file that defines your input files and parameters.
-    * A template `config.csv` will be created for you if one is not found.
+
+> [!NOTE]
+> A template `config.csv` will be created for you if one is not found.
 
 ### 2. Streamlit Web UI
 
@@ -151,7 +171,7 @@ The Web UI is ideal for interactive exploration, visualization of results, and p
 
 ---
 
-## ✅ Verifying Installation
+## Verifying Installation
 
 We provide a suite of test scripts to validate the installation, logic, and hardware stability. For each test, launch your conda terminal, activate the `geofuse` environment, and execute the provided scripts.
 
@@ -167,7 +187,7 @@ python tests/test_pipeline.py
 
 * **Expected Output:**
 
-``` bash
+``` text
 [PASS] GVI GeoTIFF Created at tests/output/test1_logic/gvi_distribution.tif
 [PASS] NDVI Export Logic Verified (File created at tests/output/test1_logic/test_ndvi.tif)
 OK
@@ -187,7 +207,7 @@ python tests/test_real_execution.py
 
   * **Console:**
 
-  ```bash
+  ```text
   [PASS] Image found! Size: (1920, 960)
   [PASS] Segmentation complete. Mask Shape: (960, 1920)
   [PASS] Metrics: {'GVI_Vegetation': ...}
@@ -214,7 +234,7 @@ python tests/test_memory_stability.py --iterations 5000
 
   * **Console:**
 
-  ```bash
+  ```text
   [PASS] Memory usage appears stable.
   ```
 
@@ -222,29 +242,28 @@ python tests/test_memory_stability.py --iterations 5000
 
 ---
 
-## 🛠️ Configuration & Troubleshooting
+## Configuration & Troubleshooting
 
-### **"No module named geofuse"**
+> 🛑 **"No module named geofuse"**
 
 If you see this error, it means the package wasn't linked correctly during setup.
 
-* **Fix:** Rerun the installer script (`instal.bat` / `install.sh`) and ensure you see a success message at the end. Or, if installing manually, make sure you run `pip install -e .` after activating the environment.
+* **Fix:** Rerun the installer script (`instal.bat` / `install.sh`) and ensure you see a success message at the end.
 
-### **"Conda Not Found"**
+> 🛑 **"Conda Not Found"**
 
 If the installer script fails immediately:
 
 * Ensure Miniforge/Anaconda is installed and that its 'Scripts' or 'bin' directory is accessible from your terminal.
 * If installed in a custom location, the script will prompt you to paste the correct path.
 
-### **"DecompressionBombWarning"**
+> 🛑 **"DecompressionBombWarning"**
 
-* **Info:** You may see this warning in the terminal if downloading very high-res Street View images.
-* It is Safe to ignore. The toolbox automatically handles large image limits and resizes them for processing.
+You may see this warning in the terminal if downloading very high-res Street View images. It is safe to ignore. The toolbox automatically handles large image limits and resizes them for processing.
 
 ---
 
-## 📄 Outputs
+## Outputs
 
 For every analysis run, GeoFuse generates:
 
@@ -254,7 +273,7 @@ For every analysis run, GeoFuse generates:
 
 ---
 
-## 🧩 Built With & References
+## Built With & References
 
 This project relies on several open-source libraries and public datasets. We gratefully acknowledge:
 
@@ -265,13 +284,13 @@ This project relies on several open-source libraries and public datasets. We gra
 
 ---
 
-## 📚 Citation
+## Citation
 
 If you use GeoFuse in your research, please cite:
 
 > **Sadigh, A. G.** (2025). _GeoFuse: Multimodal Greenspace Profiling Toolbox_. Healthy City Lab, University of Calgary. [https://github.com/Healthy-City-Lab/GeoFuse](https://github.com/Healthy-City-Lab/GeoFuse)
 
-## 🎓 Credits & Acknowledgments
+## Credits & Acknowledgments
 
 **Primary Developer and Maintainer:** [Armin Ghayur Sadigh](https://github.com/Armin-GS)
 
