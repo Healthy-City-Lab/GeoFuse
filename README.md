@@ -62,7 +62,7 @@ GeoFuse is architected to scale from local laptops to High-Performance Computing
 
 * **MPI-Enabled CLI**: The Command-Line Interface supports parallel execution via MPI (`mpiexec`/`mpirun`), allowing workloads to be distributed across multiple CPU cores or compute nodes.
 * **Headless Batch Processing**: The core logic is decoupled from the UI into standalone engines. This allows for direct Python script execution, enabling automated batch processing pipelines without browser dependencies.
-* **GPU Acceleration & Scaling**: Built on **PyTorch** with native **CUDA** support. The architecture is designed for Multi-GPU inference, allowing massive segmentation workloads to be distributed across available hardware nodes.
+* **Intelligent GPU Acceleration**: Built on **PyTorch** with automatic device selection (prioritizing **CUDA** → **MPS** → **CPU**). The architecture supports Multi-GPU inference, enabling massive segmentation workloads to be distributed across available hardware nodes on any platform.
 * **Optimized Resource Management**: Implements asynchronous I/O for non-blocking downloads and memory-efficient raster operations (windowed reading/writing) to maximize throughput on shared compute nodes.
 
 ---
@@ -84,7 +84,7 @@ GeoFuse uses an automated installer that handles all dependencies, including com
 
 ### Automated Installation
 
-The installer script will automatically create a `geofuse` conda environment and install all required packages.
+The installer script will automatically create a `geofuse` conda environment and install all required packages. The installation process produces clean console output, with the detailed logs automatically saved to `logs/install.log` for troubleshooting.
 
 #### 1. Windows
 
@@ -178,7 +178,7 @@ We provide a suite of test scripts to validate the installation, logic, and hard
 ### Logic Test (Fast & Offline)
 
 * **Script:** `tests/test_pipeline.py`
-* **Purpose:** Validates the internal logic of the Fusion Engine and GVI pipeline using "mock" data. It does not require an API key or GPU.
+* **Purpose:** Validates the internal logic of the Fusion Engine and GVI pipeline using "mock" data. It does not require an API key or credentials.
 * **Run:**
 
 ```bash
@@ -199,7 +199,7 @@ OK
 ### Full System Test
 
 * **Script:** `tests/test_real_execution.py`
-* **Purpose:** Connects to Google Street View and Earth Engine to download real data, processes it on the GPU, and saves visual results. Use this to confirm your credentials and model are working.
+* **Purpose:** Connects to Google Street View and Earth Engine to download real data, and saves visual results. Use this to confirm your credentials and check if the segmentation model works as expected.
 * **Run:**
 
 ```bash
@@ -226,7 +226,7 @@ python tests/test_real_execution.py
 ### Stability Test
 
 * **Script:** `tests/test_memory_stability.py`
-* **Purpose:** Simulates thousands of processing cycles to ensure there are no memory leaks in the GPU or RAM, which is critical for large city-wide runs.
+* **Purpose:** Simulates thousands of processing cycles to ensure there are no memory leaks on GPU (CUDA/MPS) or RAM, which is critical for large scale runs.
 * **Run:**
 
 ```bash
