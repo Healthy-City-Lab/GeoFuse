@@ -74,7 +74,7 @@ class TestGeoFuse(unittest.TestCase):
         # This prevents hitting the real API or scraping
         mock_search.return_value = [{"panoid": "test_pano_id_123"}]
 
-        # Setup Mock Engine
+        # Setup Mock Engine (auto-selects best device: CUDA > MPS > CPU)
         engine = GVIEngine(download_mode="package")
         engine.segmenter = MagicMock()
 

@@ -18,11 +18,9 @@ from geofuse.ndvi import NDVIEngine
 def test_real_gvi(model_path, output_dir):
     print("\n[TEST] Starting Real GVI Test (Visual Save Enabled)...")
 
-    # 1. Setup Engine
+    # 1. Setup Engine (auto-selects best device: CUDA > MPS > CPU)
     try:
-        engine = GVIEngine(
-            model_path=model_path, download_mode="package", device="cuda"
-        )
+        engine = GVIEngine(model_path=model_path, download_mode="package")
         print("   [INFO] Engine initialized.")
     except Exception as e:
         print(f"   [FAIL] Engine init failed: {e}")

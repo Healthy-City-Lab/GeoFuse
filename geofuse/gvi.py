@@ -77,7 +77,7 @@ CITYSCAPES_PALETTE = [
 ] + [0, 0, 0] * 237
 
 from streetview import search_panoramas, get_streetview, get_panorama_async
-from .vision import DeepLabSegmenter
+from .vision import DeepLabSegmenter, get_best_device
 
 
 class GVIEngine:
@@ -85,11 +85,12 @@ class GVIEngine:
         self, model_path=None, download_mode="package", device="cuda", api_key=None
     ):
         self.download_mode = download_mode
-        self.device = device
+        # Use smart device selection
+        self.device = get_best_device(device)
         self.api_key = api_key
 
-        print(f"[GVI] Initializing DeepLabV3+ Model on {device}...")
-        self.segmenter = DeepLabSegmenter(ckpt_path=model_path, device=device)
+        print(f"[GVI] Initializing DeepLabV3+ Model on {self.device}...")
+        self.segmenter = DeepLabSegmenter(ckpt_path=model_path, device=str(self.device))
         print("[GVI] Model Ready.")
 
     def _extract_panoid(self, pano_obj):
