@@ -1138,6 +1138,10 @@ with tab3:
 # -----------------------------------------------------------------------------
 # TAB 4: FUSION DEMO
 # -----------------------------------------------------------------------------
+# TODO: FUSION_UI_INTEGRATION - Integrate with GVI/NDVI results for seamless workflow
+# TODO: FUSION_AUTO_MERGE - Auto-merge GVI and NDVI outputs by spatial join
+# TODO: FUSION_VISUALIZATION - Add correlation plots and weight sensitivity analysis
+
 with tab4:
     st.header("Composite Metric Fusion")
     st.markdown(

@@ -54,6 +54,7 @@ The toolbox can be run in two modes: a user-friendly **Streamlit Dashboard** for
 
 * **Interactive Map**: Visualize results immediately with Folium/Leaflet.
 * **Results Inspector**: Toggle between multiple loaded datasets and visualize specific layers (Points, Vegetation Raster, Terrain Raster) with dynamic opacity controls.
+<!-- TODO: METRIC_FUSION - Complete implementation of composite greenery index with spatial outcome optimization -->
 * **Metric Fusion**: (In Development) Combines top-down (NDVI) and eye-level (GVI) metrics for a holistic "Composite Greenery Index" score, tailored towards a specific spatial outcome variable.
 
 ### 4. High-Performance Computing (HPC) Integration
@@ -62,6 +63,7 @@ GeoFuse is architected to scale from local laptops to High-Performance Computing
 
 * **MPI-Enabled CLI**: The Command-Line Interface supports parallel execution via MPI (`mpiexec`/`mpirun`), allowing workloads to be distributed across multiple CPU cores or compute nodes.
 * **Headless Batch Processing**: The core logic is decoupled from the UI into standalone engines. This allows for direct Python script execution, enabling automated batch processing pipelines without browser dependencies.
+<!-- TODO: MULTI_GPU_IMPLEMENTATION - Implement DataParallel/DistributedDataParallel for multi-GPU inference workloads -->
 * **Intelligent GPU Acceleration**: Built on **PyTorch** with automatic device selection (prioritizing **CUDA** → **MPS** → **CPU**). The architecture supports Multi-GPU inference, enabling massive segmentation workloads to be distributed across available hardware nodes on any platform.
 * **Optimized Resource Management**: Implements asynchronous I/O for non-blocking downloads and memory-efficient raster operations (windowed reading/writing) to maximize throughput on shared compute nodes.
 
@@ -101,7 +103,6 @@ chmod +x install.sh
 Then run it:
 
 ```bash
-# Run the installer
 ./install.sh
 ```
 
@@ -122,52 +123,6 @@ You can either use your own trained model, or find one from online sources such 
 >     * `Terrain`: Class ID **9**
 >
 > Models that do not follow this structure will either fail to load or produce incorrect GVI results.
-
----
-
-## Usage
-
-After installation, you can run GeoFuse using either the parallel Command-Line Interface or the interactive Streamlit Web UI.
-
-### 1. Command-Line Interface (CLI) for Batch Processing
-
-The CLI is designed for large-scale, automated, and parallel processing. It is the recommended method for running large study areas or multiple files on servers or HPC clusters.
-
-1. **Activate the Environment**
-    Open your Conda terminal and activate the environment:
-
-    ```bash
-    conda activate geofuse
-    ```
-
-2. **Run the CLI**
-    Use `mpiexec` or `mpirun` to execute the main CLI script in parallel. The `-n` flag specifies the number of parallel processes.
-
-    ```bash
-    # Example: Run with 4 parallel processes
-    mpiexec -n 4 python scripts/cli.py --config config.csv
-    ```
-
-    * `--config`: Path to a CSV file that defines your input files and parameters.
-
-> [!NOTE]
-> A template `config.csv` will be created for you if one is not found.
-
-### 2. Streamlit Web UI
-
-The Web UI is ideal for interactive exploration, visualization of results, and processing smaller study areas.
-
-1. **Activate the Environment**
-
-    ```bash
-    conda activate geofuse
-    ```
-
-2. **Launch the App**
-
-    ```bash
-    streamlit run ui/app.py
-    ```
 
 ---
 
@@ -227,10 +182,9 @@ python tests/test_real_execution.py
 
 * **Script:** `tests/test_memory_stability.py`
 * **Purpose:** Simulates thousands of processing cycles to ensure there are no memory leaks on GPU (CUDA/MPS) or RAM, which is critical for large scale runs.
-* **Run:**
+* **Run (reduce iteration if you want faster runtime):**
 
 ```bash
-# Runs 5000 iterations (reduce iteration if you want faster runtime)
 python tests/test_memory_stability.py --iterations 5000
 ```
 
@@ -243,6 +197,91 @@ python tests/test_memory_stability.py --iterations 5000
   ```
 
   * **Files:** Check `tests/output/test3_stability/` for `memory_test.png` plot which shows RAM/VRAM usage over time.
+
+---
+
+## Usage
+
+After installation, you can run GeoFuse using either the parallel Command-Line Interface or the interactive Streamlit Web UI.
+
+### 1. Command-Line Interface (CLI) for Batch Processing
+
+The CLI is designed for large-scale, automated, and parallel processing. It is the recommended method for running large study areas or multiple files on servers or HPC clusters.
+
+1. **Activate the Environment**
+    Open your Conda terminal and activate the environment:
+
+    ```bash
+    conda activate geofuse
+    ```
+
+2. **Run the CLI**
+    Use `mpiexec` or `mpirun` to execute the main CLI script in parallel. The `-n` flag specifies the number of parallel processes.
+
+    ```bash
+    # Example: Run with 4 parallel processes
+    mpiexec -n 4 python scripts/cli.py --config config.csv
+    ```
+
+    * `--config`: Path to a CSV file that defines your input files and parameters.
+
+> [!NOTE]
+> A template `config.csv` will be created for you if one is not found.
+
+### 2. Streamlit Web UI
+
+The Web UI is ideal for interactive exploration, visualization of results, and processing smaller study areas.
+
+1. **Activate the Environment**
+
+    ```bash
+    conda activate geofuse
+    ```
+
+2. **Launch the App**
+
+    ```bash
+    streamlit run ui/app.py
+    ```
+
+---
+
+## Outputs
+
+GeoFuse generates different outputs depending on which engine is used. All files are saved to the `output_results/` directory by default.
+
+### GVI Engine Outputs
+
+For each input file processed through the GVI pipeline:
+
+* **`[Filename]_gvi.geojson`**: Vector point data containing:
+  * `gvi_veg`: Green View Index for Vegetation (%)
+  * `gvi_ter`: Green View Index for Terrain (%)
+  * `pano_id`: Unique Google Street View panorama identifier
+  * `lat`, `lon`: Geographic coordinates
+  * `row`, `col`: Grid position (if raster-aligned)
+
+* **`[Filename]_gvi.tif`**: Multi-band GeoTIFF raster (EPSG:4326):
+  * Band 1: Vegetation GVI heatmap
+  * Band 2: Terrain GVI heatmap
+
+* **Optional Outputs**:
+  * `output_results/images/{pano_id}.jpg`: Original Street View panoramas
+  * `output_results/masks/{pano_id}.png`: Semantic segmentation masks (Cityscapes palette)
+
+### NDVI Engine Outputs
+
+For each input file processed through the NDVI pipeline:
+
+* **`[Filename]_ndvi.geojson`**: Vector point data containing:
+  * `NDVI`: Normalized Difference Vegetation Index values (-1 to 1)
+  * `x`, `y`: Geographic coordinates (EPSG:4326)
+
+* **`[Filename]_ndvi.tif`**: Single-band GeoTIFF raster (EPSG:4326):
+  * Band 1: NDVI values extracted from Sentinel-2 imagery
+  * NoData values represented as -9999
+
+<!-- TODO: FUSION_ENGINE_OUTPUTS - Add Fusion Engine output specifications here when implemented -->
 
 ---
 
@@ -264,16 +303,6 @@ If the installer script fails immediately:
 > 🛑 **"DecompressionBombWarning"**
 
 You may see this warning in the terminal if downloading very high-res Street View images. It is safe to ignore. The toolbox automatically handles large image limits and resizes them for processing.
-
----
-
-## Outputs
-
-For every analysis run, GeoFuse generates:
-
-* `[Filename]_gvi.geojson`: Point data containing `gvi_veg` (Vegetation) and `gvi_ter` (Terrain) scores, and the unique `pano_id` for every point.
-* `[Filename]_gvi.tif`: A multi-band GeoTIFF raster (Band 1: Vegetation, Band 2: Terrain) generated for each input region.
-* (Optional) `output_results/masks/{pano_id}.png` and `output_results/images/{pano_id}.jpg`: Raw panoramas and segmentation masks named by their unique Panorama ID.
 
 ---
 

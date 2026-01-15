@@ -8,6 +8,12 @@ from sklearn.metrics import mutual_info_score
 import logging
 
 
+# TODO: FUSION_CROSS_VALIDATION - Add k-fold cross-validation for robust weight optimization
+# TODO: FUSION_MULTIPLE_OUTCOMES - Support optimization for multiple outcome variables simultaneously
+# TODO: FUSION_SPATIAL_WEIGHTS - Add spatial autocorrelation handling (Moran's I integration)
+# TODO: FUSION_EXPORT - Add methods to export optimized weights and composite indices
+
+
 class FusionOptimizer:
     def __init__(self, df, outcome_col, features):
         """

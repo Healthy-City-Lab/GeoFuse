@@ -121,6 +121,10 @@ class DeepLabSegmenter:
         self.model.to(self.device)
         self.model.eval()
 
+        # TODO: MULTI_GPU_INFERENCE - Add DataParallel wrapper for multi-GPU batch inference
+        # if torch.cuda.device_count() > 1:
+        #     self.model = torch.nn.DataParallel(self.model)
+
         # 6. Setup Transforms & Colors
         self.transform = T.Compose(
             [

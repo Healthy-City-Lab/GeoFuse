@@ -183,6 +183,10 @@ class GVIEngine:
                     )
         return pixel_centers, height, width, transform
 
+    # TODO: ERROR_RECOVERY - Implement automatic retry logic for failed panorama downloads
+    # TODO: PARALLEL_DOWNLOAD - Add concurrent panorama downloading for multiple points
+    # TODO: CHECKPOINT_SAVE - Periodically save progress to disk for crash recovery
+
     def run_analysis(
         self,
         gdf,

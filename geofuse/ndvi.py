@@ -12,6 +12,11 @@ from shapely.geometry import Point
 import json
 
 
+# TODO: NDVI_CACHE - Implement local caching of Earth Engine tiles to reduce API calls
+# TODO: NDVI_LANDSAT - Add Landsat 8/9 support alongside Sentinel-2
+# TODO: NDVI_TEMPORAL - Add time-series analysis for seasonal greenery changes
+
+
 class NDVIEngine:
     def __init__(self, project_id=None):
         try:

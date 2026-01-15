@@ -184,5 +184,8 @@ class TestGeoFuse(unittest.TestCase):
         print(f"   [PASS] NDVI Export Logic Verified")
 
 
+# TODO: NDVI_UNIT_TESTS - Add comprehensive unit tests for NDVIEngine with mocked Earth Engine API
+# TODO: FUSION_TESTS - Add test cases for FusionOptimizer when fully implemented
+
 if __name__ == "__main__":
     unittest.main()
