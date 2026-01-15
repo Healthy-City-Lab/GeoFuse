@@ -48,7 +48,7 @@ GIT_PACKAGES = [
 ]
 
 
-def run_cmd(command):
+def run_cmd(command, log_file=None, echo_to_console=False):
     try:
         process = subprocess.Popen(
             command,
@@ -60,11 +60,22 @@ def run_cmd(command):
             errors="replace",
         )
 
+        output_lines = []
         while True:
             line = process.stdout.readline()
             if not line:
                 break
-            print(line, end="")
+            output_lines.append(line)
+            if log_file:
+                # Write to log file
+                with open(log_file, "a", encoding="utf-8") as f:
+                    f.write(line)
+                # Also print to console if echo_to_console is True
+                if echo_to_console:
+                    print(line, end="")
+            else:
+                # Print to console only if no log file
+                print(line, end="")
 
         process.wait()
 
@@ -105,45 +116,56 @@ def get_mpi_packages(system):
         return ["mpi4py=4.1.1", "openmpi"]
 
 
-def main(env_name):
+def main(env_name, log_file=None):
     system = platform.system()
     solver = get_solver()
 
+    # Create log file automatically if not provided
+    if not log_file:
+        log_dir = os.path.join(os.path.dirname(__file__), "..", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, "install.log")
+
+    # Clear previous log file
+    if os.path.exists(log_file):
+        os.remove(log_file)
+
     print(f"\n[INFO] Starting Setup on {system} using {solver}...")
+    print(f"[INFO] Detailed logs: {log_file}\n")
 
     # 1. Prepare Conda List (Core + OS-Specific MPI)
     mpi_pkgs = get_mpi_packages(system)
     full_conda_list = CONDA_PACKAGES + mpi_pkgs
     conda_str = " ".join(full_conda_list)
 
-    print(f"\n[1/5] Installing Core & MPI Binaries ({solver})...")
+    print(f"[1/5] Installing Core & MPI Binaries ({solver})...")
     # Conda handles the binary linking for mpi4py automatically here
-    run_cmd(f"{solver} install -n {env_name} -y -c conda-forge {conda_str}")
+    run_cmd(f"{solver} install -n {env_name} -y -c conda-forge {conda_str}", log_file)
 
     # 2. Install PyTorch
-    print(f"\n[2/5] Installing PyTorch Acceleration...")
+    print(f"[2/5] Installing PyTorch Acceleration...")
     if system == "Windows" or system == "Linux":
         cmd = f"{solver} install -n {env_name} -y {PYTORCH_VERSION} pytorch-cuda=12.1 -c pytorch -c nvidia"
     else:
         # macOS uses CPU or MPS (Metal Performance Shaders), no CUDA
         # Use the standard command, ensuring the pytorch channel is primary.
         cmd = f"{solver} install -n {env_name} -y {PYTORCH_VERSION} -c pytorch"
-    run_cmd(cmd)
+    run_cmd(cmd, log_file)
 
     # 3. Install Pip Libraries
-    print(f"\n[3/5] Installing Python Libraries...")
+    print(f"[3/5] Installing Python Libraries...")
     pip_str = " ".join(PIP_PACKAGES)
-    run_cmd(f'"{sys.executable}" -m pip install -q {pip_str}')
+    run_cmd(f'"{sys.executable}" -m pip install {pip_str}', log_file)
 
     # 4. Install Git Packages
-    print(f"\n[4/5] Installing Custom Git Packages...")
+    print(f"[4/5] Installing Custom Git Packages...")
     for git_url in GIT_PACKAGES:
-        run_cmd(f'"{sys.executable}" -m pip install -q {git_url}')
+        run_cmd(f'"{sys.executable}" -m pip install {git_url}', log_file)
 
     # 5. Editable Install
-    print(f"\n[5/5] Performing Editable Install of GeoFuse...")
+    print(f"[5/5] Performing Editable Install of GeoFuse...")
     root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    run_cmd(f'"{sys.executable}" -m pip install -q -e "{root_dir}"')
+    run_cmd(f'"{sys.executable}" -m pip install -e "{root_dir}"', log_file)
 
     # Finish & Verify
     print("\n[SUCCESS] Environment Configured.")
@@ -163,8 +185,9 @@ def main(env_name):
 
     verify_script = verify_imports + verify_geofuse + verify_torch + verify_mpi
 
-    run_cmd(f'"{sys.executable}" -c "{verify_script}"')
+    run_cmd(f'"{sys.executable}" -c "{verify_script}"', log_file, echo_to_console=True)
 
 
 if __name__ == "__main__":
-    main(ENV_NAME)
+    log_file_arg = sys.argv[1] if len(sys.argv) > 1 else None
+    main(ENV_NAME, log_file_arg)
