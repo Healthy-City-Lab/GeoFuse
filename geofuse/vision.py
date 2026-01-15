@@ -7,6 +7,39 @@ from torchvision import transforms as T
 from unittest.mock import MagicMock
 import importlib
 
+
+# ---------------------------------------------------------
+# DEVICE SELECTION UTILITY
+# ---------------------------------------------------------
+def get_best_device(preferred_device=None):
+    """
+    Select best available device prioritizing: CUDA > MPS > CPU
+
+    Args:
+        preferred_device (str): Optional override ('cuda', 'mps', 'cpu')
+
+    Returns:
+        torch.device: Best available device
+    """
+    if preferred_device:
+        # User specified device - try to use it
+        if preferred_device == "cuda" and torch.cuda.is_available():
+            return torch.device("cuda")
+        elif preferred_device == "mps" and torch.backends.mps.is_available():
+            return torch.device("mps")
+        elif preferred_device == "cpu":
+            return torch.device("cpu")
+        # Fall through to auto-selection if preferred not available
+
+    # Auto-selection priority: CUDA > MPS > CPU
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        return torch.device("mps")
+    else:
+        return torch.device("cpu")
+
+
 # ---------------------------------------------------------
 # PATH CONFIGURATION
 # ---------------------------------------------------------
@@ -29,9 +62,10 @@ class DeepLabSegmenter:
         Args:
             model_name (str): Optional. If None, it is auto-detected from weights.
             ckpt_path (str): Path to the .pth file.
-            device (str): 'cuda' or 'cpu'.
+            device (str): 'cuda', 'mps', or 'cpu'. Auto-selects best available if not valid.
         """
-        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+        self.device = get_best_device(device)
+        print(f"[INFO] Using device: {self.device}")
 
         # 1. Resolve Model Path
         if ckpt_path is None:
@@ -86,6 +120,10 @@ class DeepLabSegmenter:
 
         self.model.to(self.device)
         self.model.eval()
+
+        # TODO: MULTI_GPU_INFERENCE - Add DataParallel wrapper for multi-GPU batch inference
+        # if torch.cuda.device_count() > 1:
+        #     self.model = torch.nn.DataParallel(self.model)
 
         # 6. Setup Transforms & Colors
         self.transform = T.Compose(

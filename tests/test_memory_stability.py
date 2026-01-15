@@ -25,7 +25,8 @@ def stress_test_pipeline(model_path, iterations, output_dir):
     print(f"\n[TEST] Starting Memory Stress Test ({iterations} iterations)...")
     print(f"[INFO] Initial RAM: {get_memory_usage():.2f} MB")
 
-    engine = GVIEngine(model_path=model_path, download_mode="package", device="cuda")
+    # Auto-selects best device: CUDA > MPS > CPU
+    engine = GVIEngine(model_path=model_path, download_mode="package")
 
     if torch.cuda.is_available():
         print(f"[INFO] Initial VRAM: {torch.cuda.memory_allocated()/1024**2:.2f} MB")

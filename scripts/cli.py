@@ -46,6 +46,10 @@ def resolve_path(base_path, target_path):
     return target_path
 
 
+# TODO: CLI_CONFIG_VALIDATION - Add comprehensive validation for all CSV parameters
+# TODO: CLI_CONFIG_SCHEMA - Create JSON schema for config.csv validation
+
+
 def load_config(csv_path):
     """Loads and validates the configuration CSV."""
     df = pd.read_csv(csv_path)

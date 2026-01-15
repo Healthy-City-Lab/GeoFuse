@@ -4,15 +4,18 @@ import subprocess
 import shutil
 import os
 
-# ==============================================================================
+# =========================================================================
 # CONFIGURATION
-# ==============================================================================
+# =========================================================================
+
+# 0. ENVIRONMENT NAME
+ENV_NAME = "geofuse"
 
 # 1. CONDA PACKAGES (System Binaries & Core Geospatial)
 #    MPI packages are added dynamically below based on OS.
 CONDA_PACKAGES = ["gdal=3.12.0", "geopandas=1.1.1"]
 
-# 2. PYTORCH (Exact Match)
+# 2. PYTORCH
 PYTORCH_VERSION = "pytorch=2.4.1 torchvision=0.19.1 torchaudio=2.4.1"
 
 # 3. PIP PACKAGES
@@ -45,12 +48,45 @@ GIT_PACKAGES = [
 ]
 
 
-def run_cmd(command):
+def run_cmd(command, log_file=None, echo_to_console=False):
     try:
-        print(f"[EXEC] {command}")
-        subprocess.check_call(command, shell=True)
-    except subprocess.CalledProcessError:
-        print(f"[ERROR] Command failed: {command}")
+        process = subprocess.Popen(
+            command,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+
+        output_lines = []
+        while True:
+            line = process.stdout.readline()
+            if not line:
+                break
+            output_lines.append(line)
+            if log_file:
+                # Write to log file
+                with open(log_file, "a", encoding="utf-8") as f:
+                    f.write(line)
+                # Also print to console if echo_to_console is True
+                if echo_to_console:
+                    print(line, end="")
+            else:
+                # Print to console only if no log file
+                print(line, end="")
+
+        process.wait()
+
+        if process.returncode != 0:
+            raise subprocess.CalledProcessError(process.returncode, command)
+
+    except subprocess.CalledProcessError as e:
+        print(f"\n[ERROR] Command failed with exit code {e.returncode}: {command}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n[ERROR] An unexpected error occurred: {e}")
         sys.exit(1)
 
 
@@ -80,54 +116,78 @@ def get_mpi_packages(system):
         return ["mpi4py=4.1.1", "openmpi"]
 
 
-def main():
+def main(env_name, log_file=None):
     system = platform.system()
     solver = get_solver()
 
+    # Create log file automatically if not provided
+    if not log_file:
+        log_dir = os.path.join(os.path.dirname(__file__), "..", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, "install.log")
+
+    # Clear previous log file
+    if os.path.exists(log_file):
+        os.remove(log_file)
+
     print(f"\n[INFO] Starting Setup on {system} using {solver}...")
+    print(f"[INFO] Detailed logs: {log_file}\n")
 
     # 1. Prepare Conda List (Core + OS-Specific MPI)
     mpi_pkgs = get_mpi_packages(system)
     full_conda_list = CONDA_PACKAGES + mpi_pkgs
     conda_str = " ".join(full_conda_list)
 
-    print(f"\n[1/5] Installing Core & MPI Binaries ({solver})...")
+    print(f"[1/5] Installing Core & MPI Binaries ({solver})...")
     # Conda handles the binary linking for mpi4py automatically here
-    run_cmd(f"{solver} install -y -c conda-forge {conda_str}")
+    run_cmd(f"{solver} install -n {env_name} -y -c conda-forge {conda_str}", log_file)
 
     # 2. Install PyTorch
-    print(f"\n[2/5] Installing PyTorch Acceleration...")
+    print(f"[2/5] Installing PyTorch Acceleration...")
     if system == "Windows" or system == "Linux":
-        cmd = f"{solver} install -y {PYTORCH_VERSION} pytorch-cuda=12.1 -c pytorch -c nvidia"
+        cmd = f"{solver} install -n {env_name} -y {PYTORCH_VERSION} pytorch-cuda=12.1 -c pytorch -c nvidia"
     else:
         # macOS uses CPU or MPS (Metal Performance Shaders), no CUDA
-        cmd = f"{solver} install -y {PYTORCH_VERSION} -c pytorch"
-    run_cmd(cmd)
+        # Use the standard command, ensuring the pytorch channel is primary.
+        cmd = f"{solver} install -n {env_name} -y {PYTORCH_VERSION} -c pytorch"
+    run_cmd(cmd, log_file)
 
     # 3. Install Pip Libraries
-    print(f"\n[3/5] Installing Python Libraries...")
+    print(f"[3/5] Installing Python Libraries...")
     pip_str = " ".join(PIP_PACKAGES)
-    run_cmd(f'"{sys.executable}" -m pip install {pip_str}')
+    run_cmd(f'"{sys.executable}" -m pip install {pip_str}', log_file)
 
     # 4. Install Git Packages
-    print(f"\n[4/5] Installing Custom Git Packages...")
+    print(f"[4/5] Installing Custom Git Packages...")
     for git_url in GIT_PACKAGES:
-        run_cmd(f'"{sys.executable}" -m pip install {git_url}')
+        run_cmd(f'"{sys.executable}" -m pip install {git_url}', log_file)
 
     # 5. Editable Install
-    print(f"\n[5/5] Performing Editable Install of GeoFuse...")
+    print(f"[5/5] Performing Editable Install of GeoFuse...")
     root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    run_cmd(f'"{sys.executable}" -m pip install -e "{root_dir}"')
+    run_cmd(f'"{sys.executable}" -m pip install -e "{root_dir}"', log_file)
 
     # Finish & Verify
     print("\n[SUCCESS] Environment Configured.")
-    verify_script = (
-        "import geofuse; print(f'   [OK] GeoFuse Package: {geofuse.__file__}'); "
-        "import torch; print(f'   [OK] PyTorch: {torch.__version__} (CUDA: {torch.cuda.is_available()})'); "
-        "from mpi4py import MPI; print(f'   [OK] MPI Rank: {MPI.COMM_WORLD.Get_rank()} (Vendor: {MPI.Get_vendor()})')"
+
+    # Construct a verification script that checks for the correct GPU backend based on OS
+    verify_imports = (
+        "import geofuse; import torch; import platform; from mpi4py import MPI; "
     )
-    run_cmd(f'"{sys.executable}" -c "{verify_script}"')
+    # Use single quotes for f-strings and no parentheses in the output text to be shell-safe
+    verify_geofuse = "print(f'   [OK] GeoFuse Package: {geofuse.__file__}'); "
+    verify_mpi = "print(f'   [OK] MPI Rank: {MPI.COMM_WORLD.Get_rank()} - Vendor: {MPI.get_vendor()}');"
+
+    if system == "Darwin":
+        verify_torch = "print(f'   [OK] PyTorch: {torch.__version__} - MPS Available: {torch.backends.mps.is_available()}'); "
+    else:
+        verify_torch = "print(f'   [OK] PyTorch: {torch.__version__} - CUDA Available: {torch.cuda.is_available()}'); "
+
+    verify_script = verify_imports + verify_geofuse + verify_torch + verify_mpi
+
+    run_cmd(f'"{sys.executable}" -c "{verify_script}"', log_file, echo_to_console=True)
 
 
 if __name__ == "__main__":
-    main()
+    log_file_arg = sys.argv[1] if len(sys.argv) > 1 else None
+    main(ENV_NAME, log_file_arg)

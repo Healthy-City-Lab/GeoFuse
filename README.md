@@ -54,6 +54,7 @@ The toolbox can be run in two modes: a user-friendly **Streamlit Dashboard** for
 
 * **Interactive Map**: Visualize results immediately with Folium/Leaflet.
 * **Results Inspector**: Toggle between multiple loaded datasets and visualize specific layers (Points, Vegetation Raster, Terrain Raster) with dynamic opacity controls.
+<!-- TODO: METRIC_FUSION - Complete implementation of composite greenery index with spatial outcome optimization -->
 * **Metric Fusion**: (In Development) Combines top-down (NDVI) and eye-level (GVI) metrics for a holistic "Composite Greenery Index" score, tailored towards a specific spatial outcome variable.
 
 ### 4. High-Performance Computing (HPC) Integration
@@ -62,7 +63,8 @@ GeoFuse is architected to scale from local laptops to High-Performance Computing
 
 * **MPI-Enabled CLI**: The Command-Line Interface supports parallel execution via MPI (`mpiexec`/`mpirun`), allowing workloads to be distributed across multiple CPU cores or compute nodes.
 * **Headless Batch Processing**: The core logic is decoupled from the UI into standalone engines. This allows for direct Python script execution, enabling automated batch processing pipelines without browser dependencies.
-* **GPU Acceleration & Scaling**: Built on **PyTorch** with native **CUDA** support. The architecture is designed for Multi-GPU inference, allowing massive segmentation workloads to be distributed across available hardware nodes.
+<!-- TODO: MULTI_GPU_IMPLEMENTATION - Implement DataParallel/DistributedDataParallel for multi-GPU inference workloads -->
+* **Intelligent GPU Acceleration**: Built on **PyTorch** with automatic device selection (prioritizing **CUDA** → **MPS** → **CPU**). The architecture supports Multi-GPU inference, enabling massive segmentation workloads to be distributed across available hardware nodes on any platform.
 * **Optimized Resource Management**: Implements asynchronous I/O for non-blocking downloads and memory-efficient raster operations (windowed reading/writing) to maximize throughput on shared compute nodes.
 
 ---
@@ -79,12 +81,12 @@ GeoFuse uses an automated installer that handles all dependencies, including com
 > For a significantly faster installation, make sure `mamba` is installed in your base conda environment:
 >
 > ```bash
-> conda install mamba -n base -c conda-forge`
+> conda install mamba -n base -c conda-forge
 > ```
 
 ### Automated Installation
 
-The installer script will automatically create a `geofuse` conda environment and install all required packages.
+The installer script will automatically create a `geofuse` conda environment and install all required packages. The installation process produces clean console output, with the detailed logs automatically saved to `logs/install.log` for troubleshooting.
 
 #### 1. Windows
 
@@ -101,7 +103,6 @@ chmod +x install.sh
 Then run it:
 
 ```bash
-# Run the installer
 ./install.sh
 ```
 
@@ -122,6 +123,80 @@ You can either use your own trained model, or find one from online sources such 
 >     * `Terrain`: Class ID **9**
 >
 > Models that do not follow this structure will either fail to load or produce incorrect GVI results.
+
+---
+
+## Verifying Installation
+
+We provide a suite of test scripts to validate the installation, logic, and hardware stability. For each test, launch your conda terminal, activate the `geofuse` environment, and execute the provided scripts.
+
+### Logic Test (Fast & Offline)
+
+* **Script:** `tests/test_pipeline.py`
+* **Purpose:** Validates the internal logic of the Fusion Engine and GVI pipeline using "mock" data. It does not require an API key or credentials.
+* **Run:**
+
+```bash
+python tests/test_pipeline.py
+```
+
+* **Expected Output:**
+
+``` text
+   [PASS] GVI Pipeline processed 100 points
+...
+   [PASS] NDVI Export Logic Verified
+...
+
+OK
+```
+
+### Full System Test
+
+* **Script:** `tests/test_real_execution.py`
+* **Purpose:** Connects to Google Street View and Earth Engine to download real data, and saves visual results. Use this to confirm your credentials and check if the segmentation model works as expected.
+* **Run:**
+
+```bash
+python tests/test_real_execution.py
+```
+
+* **Expected Output:**
+
+  * **Console:**
+
+  ```text
+  [PASS] Image found! Size: (1024, 512)
+  [PASS] Segmentation complete. Mask Shape: (512, 1024)
+  [PASS] Metrics: {'GVI_Vegetation': ..., 'GVI_Terrain': ..., 'GVI_Total': ...}
+  ...
+  [PASS] Large NDVI GeoTIFF exported (50.90 KB)
+  ```
+
+  * **Files:** Check `tests/output/test2_system/` for:
+    * `test_pano_rgb.jpg` (Street View)
+    * `test_pano_mask.png` (Segmentation Mask)
+    * `test_ndvi.tif` (NDVI Tile)
+
+### Stability Test
+
+* **Script:** `tests/test_memory_stability.py`
+* **Purpose:** Simulates thousands of processing cycles to ensure there are no memory leaks on GPU (CUDA/MPS) or RAM, which is critical for large scale runs.
+* **Run (reduce iteration if you want faster runtime):**
+
+```bash
+python tests/test_memory_stability.py --iterations 5000
+```
+
+* **Expected Output:**
+
+  * **Console:**
+
+  ```text
+  [PASS] Memory usage appears stable.
+  ```
+
+  * **Files:** Check `tests/output/test3_stability/` for `memory_test.png` plot which shows RAM/VRAM usage over time.
 
 ---
 
@@ -171,74 +246,42 @@ The Web UI is ideal for interactive exploration, visualization of results, and p
 
 ---
 
-## Verifying Installation
+## Outputs
 
-We provide a suite of test scripts to validate the installation, logic, and hardware stability. For each test, launch your conda terminal, activate the `geofuse` environment, and execute the provided scripts.
+GeoFuse generates different outputs depending on which engine is used. All files are saved to the `output_results/` directory by default.
 
-### Logic Test (Fast & Offline)
+### GVI Engine Outputs
 
-* **Script:** `tests/test_pipeline.py`
-* **Purpose:** Validates the internal logic of the Fusion Engine and GVI pipeline using "mock" data. It does not require an API key or GPU.
-* **Run:**
+For each input file processed through the GVI pipeline:
 
-```bash
-python tests/test_pipeline.py
-```
+* **`[Filename]_gvi.geojson`**: Vector point data containing:
+  * `gvi_veg`: Green View Index for Vegetation (%)
+  * `gvi_ter`: Green View Index for Terrain (%)
+  * `pano_id`: Unique Google Street View panorama identifier
+  * `lat`, `lon`: Geographic coordinates
+  * `row`, `col`: Grid position (if raster-aligned)
 
-* **Expected Output:**
+* **`[Filename]_gvi.tif`**: Multi-band GeoTIFF raster (EPSG:4326):
+  * Band 1: Vegetation GVI heatmap
+  * Band 2: Terrain GVI heatmap
 
-``` text
-[PASS] GVI GeoTIFF Created at tests/output/test1_logic/gvi_distribution.tif
-[PASS] NDVI Export Logic Verified (File created at tests/output/test1_logic/test_ndvi.tif)
-OK
-```
+* **Optional Outputs**:
+  * `output_results/images/{pano_id}.jpg`: Original Street View panoramas
+  * `output_results/masks/{pano_id}.png`: Semantic segmentation masks (Cityscapes palette)
 
-### Full System Test
+### NDVI Engine Outputs
 
-* **Script:** `tests/test_real_execution.py`
-* **Purpose:** Connects to Google Street View and Earth Engine to download real data, processes it on the GPU, and saves visual results. Use this to confirm your credentials and model are working.
-* **Run:**
+For each input file processed through the NDVI pipeline:
 
-```bash
-python tests/test_real_execution.py
-```
+* **`[Filename]_ndvi.geojson`**: Vector point data containing:
+  * `NDVI`: Normalized Difference Vegetation Index values (-1 to 1)
+  * `x`, `y`: Geographic coordinates (EPSG:4326)
 
-* **Expected Output:**
+* **`[Filename]_ndvi.tif`**: Single-band GeoTIFF raster (EPSG:4326):
+  * Band 1: NDVI values extracted from Sentinel-2 imagery
+  * NoData values represented as -9999
 
-  * **Console:**
-
-  ```text
-  [PASS] Image found! Size: (1920, 960)
-  [PASS] Segmentation complete. Mask Shape: (960, 1920)
-  [PASS] Metrics: {'GVI_Vegetation': ...}
-  [PASS] Large NDVI GeoTIFF exported (... KB)
-  ```
-
-  * **Files:** Check `tests/output/test2_system/` for:
-    * `test_pano_rgb.jpg` (Street View)
-    * `test_pano_mask.png` (Segmentation Mask)
-    * `large_ndvi.tif` (NDVI Tile)
-
-### Stability Test
-
-* **Script:** `tests/test_memory_stability.py`
-* **Purpose:** Simulates thousands of processing cycles to ensure there are no memory leaks in the GPU or RAM, which is critical for large city-wide runs.
-* **Run:**
-
-```bash
-# Runs 5000 iterations (reduce iteration if you want faster runtime)
-python tests/test_memory_stability.py --iterations 5000
-```
-
-* **Expected Output:**
-
-  * **Console:**
-
-  ```text
-  [PASS] Memory usage appears stable.
-  ```
-
-  * **Files:** Check `tests/output/test3_stability/` for `memory_test.png` plot which shows RAM/VRAM usage over time.
+<!-- TODO: FUSION_ENGINE_OUTPUTS - Add Fusion Engine output specifications here when implemented -->
 
 ---
 
@@ -260,16 +303,6 @@ If the installer script fails immediately:
 > 🛑 **"DecompressionBombWarning"**
 
 You may see this warning in the terminal if downloading very high-res Street View images. It is safe to ignore. The toolbox automatically handles large image limits and resizes them for processing.
-
----
-
-## Outputs
-
-For every analysis run, GeoFuse generates:
-
-* `[Filename]_gvi.geojson`: Point data containing `gvi_veg` (Vegetation) and `gvi_ter` (Terrain) scores, and the unique `pano_id` for every point.
-* `[Filename]_gvi.tif`: A multi-band GeoTIFF raster (Band 1: Vegetation, Band 2: Terrain) generated for each input region.
-* (Optional) `output_results/masks/{pano_id}.png` and `output_results/images/{pano_id}.jpg`: Raw panoramas and segmentation masks named by their unique Panorama ID.
 
 ---
 

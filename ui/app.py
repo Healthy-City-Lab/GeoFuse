@@ -26,6 +26,7 @@ from streamlit.runtime.scriptrunner import add_script_run_ctx
 
 from geofuse.ndvi import NDVIEngine
 from geofuse.gvi import GVIEngine
+from geofuse.vision import get_best_device
 
 # --- 1. GLOBAL PATH SETUP ---
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -529,8 +530,13 @@ with tab3:
     gpu_lock = get_gpu_lock()
 
     @st.cache_resource
-    def get_gvi_engine(model_path, device, api_key):
-        return GVIEngine(model_path=model_path, device=device, api_key=api_key)
+    def get_gvi_engine(model_path, api_key):
+        # Auto-selects best device: CUDA > MPS > CPU
+        best_device = get_best_device()
+        st.info(f"🚀 Using device: {best_device}")
+        return GVIEngine(
+            model_path=model_path, device=str(best_device), api_key=api_key
+        )
 
     # --- SESSION STATE ---
     if "datasets" not in st.session_state:
@@ -585,7 +591,10 @@ with tab3:
                     return
 
                 job_tracker_dict[job_id]["status"] = "Initializing..."
-                engine = get_gvi_engine(**init_args)
+                # Extract model_path and api_key (device is auto-selected)
+                engine = get_gvi_engine(
+                    init_args["model_path"], init_args.get("api_key")
+                )
 
                 current_accumulated = dataset_data["accumulated"]
                 start_idx = len(current_accumulated)
@@ -858,7 +867,7 @@ with tab3:
 
                     init_args = {
                         "model_path": model_path,
-                        "device": "cuda",
+                        # Device auto-selected by engine (CUDA > MPS > CPU)
                         "api_key": api_key,
                     }
                     run_args = {
@@ -1129,6 +1138,10 @@ with tab3:
 # -----------------------------------------------------------------------------
 # TAB 4: FUSION DEMO
 # -----------------------------------------------------------------------------
+# TODO: FUSION_UI_INTEGRATION - Integrate with GVI/NDVI results for seamless workflow
+# TODO: FUSION_AUTO_MERGE - Auto-merge GVI and NDVI outputs by spatial join
+# TODO: FUSION_VISUALIZATION - Add correlation plots and weight sensitivity analysis
+
 with tab4:
     st.header("Composite Metric Fusion")
     st.markdown(
