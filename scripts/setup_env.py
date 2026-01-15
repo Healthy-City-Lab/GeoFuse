@@ -4,9 +4,9 @@ import subprocess
 import shutil
 import os
 
-# ==============================================================================
+# =========================================================================
 # CONFIGURATION
-# ==============================================================================
+# =========================================================================
 
 # 0. ENVIRONMENT NAME
 ENV_NAME = "geofuse"
@@ -15,7 +15,7 @@ ENV_NAME = "geofuse"
 #    MPI packages are added dynamically below based on OS.
 CONDA_PACKAGES = ["gdal=3.12.0", "geopandas=1.1.1"]
 
-# 2. PYTORCH (Exact Match)
+# 2. PYTORCH
 PYTORCH_VERSION = "pytorch=2.4.1 torchvision=0.19.1 torchaudio=2.4.1"
 
 # 3. PIP PACKAGES
@@ -50,7 +50,6 @@ GIT_PACKAGES = [
 
 def run_cmd(command):
     try:
-        print(f"[EXEC] {command}")
         subprocess.check_call(command, shell=True)
     except subprocess.CalledProcessError:
         print(f"[ERROR] Command failed: {command}")
