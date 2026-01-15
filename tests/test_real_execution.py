@@ -5,6 +5,7 @@ import numpy as np
 from PIL import Image
 import geopandas as gpd
 from shapely.geometry import box
+from geofuse.gvi import search_panoramas
 
 # Add parent path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -38,19 +39,33 @@ def test_real_gvi(model_path, output_dir):
 
     for lat, lon in test_points:
         print(f"   [INFO] Searching for pano at: {lat}, {lon}...")
-        img = engine._get_pano_img(lat, lon)
 
-        if img:
-            print(f"   [PASS] Image found! Size: {img.size}")
+        # Use the engine's current helpers: search_panoramas + _download_async_wrapper
+        pano_img = None
+        candidates = search_panoramas(lat=lat, lon=lon)
+        if candidates:
+            for meta in candidates:
+                pid = engine._extract_panoid(meta)
+                if not pid:
+                    continue
+                try:
+                    pano_img = engine._download_async_wrapper(pid)
+                    if pano_img is not None:
+                        break
+                except Exception as e:
+                    print(f"   [WARN] Failed to download pano {pid}: {e}")
+
+        if pano_img:
+            print(f"   [PASS] Image found! Size: {pano_img.size}")
 
             # --- SAVE ORIGINAL ---
             pano_path = os.path.join(output_dir, "test_pano_rgb.jpg")
-            img.save(pano_path)
+            pano_img.save(pano_path)
             print(f"   [SAVE] Saved panorama to: {pano_path}")
 
             # 3. Test Segmentation
             try:
-                mask = engine.segmenter.predict(img)
+                mask = engine.segmenter.predict(pano_img)
                 print(f"   [PASS] Segmentation complete. Mask Shape: {mask.shape}")
 
                 metrics = engine.segmenter.calculate_gvi_from_mask(mask)
@@ -93,19 +108,25 @@ def test_demanding_ndvi(output_dir):
         temp_file = os.path.join(output_dir, "large_area_test.geojson")
         gdf.to_file(temp_file, driver="GeoJSON")
 
-        out_file = os.path.join(output_dir, "large_ndvi.tif")
-
-        # 2. Export with higher resolution (10m)
-        success = engine.export_geotiff(
-            temp_file, "2023-07-15", out_file, resolution=10
+        # 2. Export with higher resolution (10m) using current API
+        result = engine.download_and_process(
+            geometry=gdf,
+            start_date="2023-07-15",
+            end_date="2023-07-31",
+            output_name="test",
+            folder=output_dir,
+            resolution=10,
         )
 
-        if success:
+        if result.get("status") == "success":
+            out_file = result.get("tif")
             file_size = os.path.getsize(out_file) / 1024  # KB
             print(f"   [PASS] Large NDVI GeoTIFF exported ({file_size:.2f} KB)")
             print(
                 f"   [INFO] You can open '{out_file}' in QGIS/ArcGIS to verify location."
             )
+        else:
+            print(f"   [FAIL] NDVI export failed: {result}")
 
     except Exception as e:
         print(f"   [FAIL] GEE Error: {e}")

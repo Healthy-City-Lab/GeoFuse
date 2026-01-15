@@ -188,8 +188,11 @@ python tests/test_pipeline.py
 * **Expected Output:**
 
 ``` text
-[PASS] GVI GeoTIFF Created at tests/output/test1_logic/gvi_distribution.tif
-[PASS] NDVI Export Logic Verified (File created at tests/output/test1_logic/test_ndvi.tif)
+   [PASS] GVI Pipeline processed 100 points
+...
+   [PASS] NDVI Export Logic Verified
+...
+
 OK
 ```
 
@@ -208,16 +211,17 @@ python tests/test_real_execution.py
   * **Console:**
 
   ```text
-  [PASS] Image found! Size: (1920, 960)
-  [PASS] Segmentation complete. Mask Shape: (960, 1920)
-  [PASS] Metrics: {'GVI_Vegetation': ...}
-  [PASS] Large NDVI GeoTIFF exported (... KB)
+  [PASS] Image found! Size: (1024, 512)
+  [PASS] Segmentation complete. Mask Shape: (512, 1024)
+  [PASS] Metrics: {'GVI_Vegetation': ..., 'GVI_Terrain': ..., 'GVI_Total': ...}
+  ...
+  [PASS] Large NDVI GeoTIFF exported (50.90 KB)
   ```
 
   * **Files:** Check `tests/output/test2_system/` for:
     * `test_pano_rgb.jpg` (Street View)
     * `test_pano_mask.png` (Segmentation Mask)
-    * `large_ndvi.tif` (NDVI Tile)
+    * `test_ndvi.tif` (NDVI Tile)
 
 ### Stability Test
 

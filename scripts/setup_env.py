@@ -50,9 +50,32 @@ GIT_PACKAGES = [
 
 def run_cmd(command):
     try:
-        subprocess.check_call(command, shell=True)
-    except subprocess.CalledProcessError:
-        print(f"[ERROR] Command failed: {command}")
+        process = subprocess.Popen(
+            command,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+
+        while True:
+            line = process.stdout.readline()
+            if not line:
+                break
+            print(line, end="")
+
+        process.wait()
+
+        if process.returncode != 0:
+            raise subprocess.CalledProcessError(process.returncode, command)
+
+    except subprocess.CalledProcessError as e:
+        print(f"\n[ERROR] Command failed with exit code {e.returncode}: {command}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n[ERROR] An unexpected error occurred: {e}")
         sys.exit(1)
 
 
