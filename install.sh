@@ -112,4 +112,10 @@ echo "[READY] To launch the CLI (example with 4 MPI processes):"
 echo "   conda activate $ENV_NAME"
 echo "   mpiexec -n 4 python scripts/cli.py --config config.csv"
 echo "========================================================"
-read -p "Press Enter to exit..."
+
+# Only prompt for input if running interactively
+if [ -t 0 ]; then
+    read -p "Press Enter to exit..."
+fi
+
+exit 0
