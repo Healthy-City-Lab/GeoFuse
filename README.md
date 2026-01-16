@@ -90,7 +90,7 @@ The installer script will automatically create a `geofuse` conda environment and
 
 #### 1. Windows
 
-Simply double-click the `instal.bat` script. It will auto-detect your Conda installation and guide you through the process.
+Simply double-click the `install.bat` script. It will auto-detect your Conda installation and guide you through the process.
 
 #### 2. Linux / macOS
 
@@ -291,7 +291,7 @@ For each input file processed through the NDVI pipeline:
 
 If you see this error, it means the package wasn't linked correctly during setup.
 
-* **Fix:** Rerun the installer script (`instal.bat` / `install.sh`) and ensure you see a success message at the end.
+* **Fix:** Rerun the installer script (`install.bat` / `install.sh`) and ensure you see a success message at the end.
 
 > 🛑 **"Conda Not Found"**
 

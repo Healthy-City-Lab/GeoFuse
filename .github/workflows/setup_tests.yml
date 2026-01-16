@@ -46,7 +46,7 @@ jobs:
       - name: Run installer (Windows)
         if: runner.os == 'Windows'
         shell: cmd /C CALL {0}
-        run: instal.bat
+        run: install.bat
         continue-on-error: false
 
       - name: Verify installation
