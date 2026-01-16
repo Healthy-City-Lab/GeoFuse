@@ -1,5 +1,6 @@
 # GeoFuse: Multimodal Greenspace Profiling Toolbox
 
+[![Installation & Test Suite](https://github.com/Healthy-City-Lab/GeoFuse/actions/workflows/setup_tests.yml/badge.svg)](https://github.com/Healthy-City-Lab/GeoFuse/actions/workflows/setup_tests.yml)
 [![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Python Version](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![OS](https://img.shields.io/badge/OS-Linux|Windows|macOS-blue)](#installation)
