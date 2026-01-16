@@ -112,14 +112,12 @@ jobs:
 
       - name: Run Logic Tests (Offline)
         run: |
-          conda activate geofuse
-          python tests/test_pipeline.py
+          conda run -n geofuse python tests/test_pipeline.py
         continue-on-error: false
 
       - name: Run Memory Stability Test (Short)
         run: |
-          conda activate geofuse
-          python tests/test_memory_stability.py --iterations 100
+          conda run -n geofuse python tests/test_memory_stability.py --iterations 100
         continue-on-error: true
 
       - name: Check installation log
