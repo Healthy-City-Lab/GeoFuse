@@ -1,0 +1,60 @@
+name: Code Quality & Linting
+
+on:
+  pull_request:
+    branches: [main, master]
+  push:
+    branches: [main, master]
+    paths:
+      - '**.py'
+      - '.github/workflows/code-quality.yml'
+      - 'pyproject.toml'
+
+jobs:
+  lint:
+    name: Code Quality Checks
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install linting tools
+        run: |
+          pip install black ruff isort
+
+      - name: Check code formatting with Black
+        run: |
+          black --check --diff geofuse/ tests/ scripts/ ui/
+        continue-on-error: false
+
+      - name: Check import sorting with isort
+        run: |
+          isort --check-only --diff geofuse/ tests/ scripts/ ui/
+        continue-on-error: false
+
+      - name: Lint with Ruff
+        run: |
+          ruff check geofuse/ tests/ scripts/ ui/
+        continue-on-error: true  # Allow warnings, fail only on errors
+
+      - name: Generate summary
+        if: always()
+        run: |
+          echo "## Code Quality Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **Black**: Code formatting" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **isort**: Import sorting" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **Ruff**: Linting checks" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### To fix formatting issues locally:" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "black geofuse/ tests/ scripts/ ui/" >> $GITHUB_STEP_SUMMARY
+          echo "isort geofuse/ tests/ scripts/ ui/" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY

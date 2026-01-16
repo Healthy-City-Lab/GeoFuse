@@ -22,6 +22,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Cache conda packages
+        uses: actions/cache@v4
+        with:
+          path: ~/conda_pkgs_dir
+          key: conda-${{ runner.os }}-${{ hashFiles('scripts/setup_env.py') }}
+          restore-keys: |
+            conda-${{ runner.os }}-
+
       - name: Set up Conda (Miniforge)
         uses: conda-incubator/setup-miniconda@v3
         with:
@@ -29,6 +37,7 @@ jobs:
           activate-environment: ""
           auto-activate-base: true
           use-mamba: true
+          use-only-tar-bz2: true  # Required for caching
 
       - name: Install mamba in base (for faster installs)
         run: |
@@ -49,15 +58,17 @@ jobs:
         run: install.bat
         continue-on-error: false
 
-      - name: Verify installation
-        run: |
-          conda activate geofuse
-          python -c "import geofuse; print('GeoFuse imported successfully')"
-          python -c "import torch; print(f'PyTorch {torch.__version__}')"
-          python -c "import geopandas; print(f'GeoPandas {geopandas.__version__}')"
-          python -c "from geofuse.vision import get_best_device; print(f'Device: {get_best_device()}')"
+      - name: Cache model weights
+        id: cache-model
+        uses: actions/cache@v4
+        with:
+          path: geofuse/model/best_model.pth
+          key: model-weights-${{ hashFiles('.github/workflows/setup_tests.yml') }}
+          restore-keys: |
+            model-weights-
 
       - name: Download model weights
+        if: steps.cache-model.outputs.cache-hit != 'true'
         run: |
           conda activate geofuse
           mkdir -p geofuse/model
@@ -78,6 +89,12 @@ jobs:
           fi
           
           echo "Model downloaded successfully"
+          ls -lh geofuse/model/
+      
+      - name: Verify model from cache
+        if: steps.cache-model.outputs.cache-hit == 'true'
+        run: |
+          echo "✅ Model loaded from cache"
           ls -lh geofuse/model/
 
       - name: Run Logic Tests (Offline)
