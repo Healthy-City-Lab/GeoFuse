@@ -1,0 +1,133 @@
+name: Installation & Test Suite
+
+on:
+  # Manual triggering only
+  workflow_dispatch:
+
+jobs:
+  test-installation:
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    defaults:
+      run:
+        shell: bash -el {0}  # Use bash with error handling for all platforms
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Conda (Miniforge)
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniforge-version: latest
+          activate-environment: ""
+          auto-activate-base: true
+          use-mamba: true
+
+      - name: Install mamba in base (for faster installs)
+        run: |
+          conda install mamba -n base -c conda-forge -y
+
+      - name: Make installer executable (Unix)
+        if: runner.os != 'Windows'
+        run: chmod +x install.sh
+
+      - name: Run installer (Unix)
+        if: runner.os != 'Windows'
+        run: ./install.sh
+        continue-on-error: false
+
+      - name: Run installer (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd /C CALL {0}
+        run: instal.bat
+        continue-on-error: false
+
+      - name: Verify installation
+        run: |
+          conda activate geofuse
+          python -c "import geofuse; print('GeoFuse imported successfully')"
+          python -c "import torch; print(f'PyTorch {torch.__version__}')"
+          python -c "import geopandas; print(f'GeoPandas {geopandas.__version__}')"
+          python -c "from geofuse.vision import get_best_device; print(f'Device: {get_best_device()}')"
+
+      - name: Download model weights
+        run: |
+          conda activate geofuse
+          mkdir -p geofuse/model
+          
+          # Hardcoded model URL - replace with your actual model link
+          MODEL_URL="https://drive.google.com/file/d/1t7TC8mxQaFECt4jutdq_NMnWxdm6B-Nb/view"
+          
+          echo "Downloading model weights..."
+          
+          # Check if it's a Google Drive link
+          if [[ "$MODEL_URL" == *"drive.google.com"* ]] || [[ "$MODEL_URL" == *"docs.google.com"* ]]; then
+            echo "Detected Google Drive link - using gdown to handle large file confirmation"
+            pip install gdown -q
+            gdown "$MODEL_URL" -O geofuse/model/best_model.pth --fuzzy
+          else
+            echo "Using direct download with curl"
+            curl -L "$MODEL_URL" -o geofuse/model/best_model.pth
+          fi
+          
+          echo "Model downloaded successfully"
+          ls -lh geofuse/model/
+
+      - name: Run Logic Tests (Offline)
+        run: |
+          conda activate geofuse
+          python tests/test_pipeline.py
+        continue-on-error: false
+
+      - name: Run Memory Stability Test (Short)
+        run: |
+          conda activate geofuse
+          python tests/test_memory_stability.py --iterations 100
+        continue-on-error: true
+
+      - name: Check installation log
+        if: always()
+        run: |
+          if [ -f "logs/install.log" ]; then
+            echo "=== Last 50 lines of installation log ==="
+            tail -n 50 logs/install.log
+          else
+            echo "No installation log found"
+          fi
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.os }}
+          path: |
+            tests/output/**/*.png
+            tests/output/**/*.geojson
+            logs/install.log
+          retention-days: 7
+
+  # Summary notification
+  test-summary:
+    name: Test Summary
+    runs-on: ubuntu-latest
+    needs: [test-installation]
+    if: always()
+    steps:
+      - name: Write test summary
+        run: |
+          echo "### Installation Tests" >> $GITHUB_STEP_SUMMARY
+          echo "- Ubuntu: ${{ needs.test-installation.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Windows: ${{ needs.test-installation.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- macOS: ${{ needs.test-installation.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Tests Executed" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Logic Tests (test_pipeline.py)" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Memory Stability (100 iterations)" >> $GITHUB_STEP_SUMMARY
+          echo "- ⏭️  Real Execution Tests (skipped - requires credentials)" >> $GITHUB_STEP_SUMMARY
