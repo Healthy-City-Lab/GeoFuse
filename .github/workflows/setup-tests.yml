@@ -45,7 +45,6 @@ jobs:
           activate-environment: ""
           auto-activate-base: true
           use-mamba: true
-          use-only-tar-bz2: true  # Required for caching
           conda-remove-defaults: true  # Suppress defaults channel warning
 
       - name: Install mamba in base (for faster installs)

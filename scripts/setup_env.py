@@ -148,7 +148,11 @@ def main(env_name, log_file=None):
         subprocess.run(f"conda env remove -n {env_name} -y", shell=True, check=True)
 
     print(f"[INFO] Creating environment '{env_name}' with Python 3.12...")
-    subprocess.run(f"conda create -n {env_name} python=3.12 -y", shell=True, check=True)
+    subprocess.run(
+        f"conda create -n {env_name} python=3.12 -y -c conda-forge",
+        shell=True,
+        check=True,
+    )
     print(f"[SUCCESS] Environment created successfully\n")
 
     # 1. Prepare Conda List (Core + OS-Specific MPI)
