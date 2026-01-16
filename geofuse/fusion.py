@@ -1,11 +1,17 @@
-import pandas as pd
+import logging
+
 import numpy as np
 import optuna
+import pandas as pd
 from optuna.samplers import TPESampler
-from skrebate import ReliefF
-from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mutual_info_score
-import logging
+from sklearn.preprocessing import MinMaxScaler
+from skrebate import ReliefF
+
+# TODO: FUSION_CROSS_VALIDATION - Add k-fold cross-validation for robust weight optimization
+# TODO: FUSION_MULTIPLE_OUTCOMES - Support optimization for multiple outcome variables simultaneously
+# TODO: FUSION_SPATIAL_WEIGHTS - Add spatial autocorrelation handling (Moran's I integration)
+# TODO: FUSION_EXPORT - Add methods to export optimized weights and composite indices
 
 
 # TODO: FUSION_CROSS_VALIDATION - Add k-fold cross-validation for robust weight optimization

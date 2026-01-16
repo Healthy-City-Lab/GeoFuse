@@ -65,40 +65,16 @@ fi
 source "$CONDA_ROOT/etc/profile.d/conda.sh" 2>/dev/null || true
 conda activate base >/dev/null 2>&1 || true
 
-# --- STEP 2: CREATE/RESET ENVIRONMENT ---
+# --- STEP 2: CREATE LOGS DIRECTORY ---
 mkdir -p logs
 
-if "$CONDA_EXEC" env list | grep -q -w "^$ENV_NAME "; then
-    echo "[WARN] Environment '$ENV_NAME' already exists."
-    read -p "Delete and clean install? (y/N): " DELETE
-    if [[ "$DELETE" == "y" || "$DELETE" == "Y" ]]; then
-        echo "[INFO] Removing existing environment..."
-        "$CONDA_EXEC" remove -n "$ENV_NAME" --all -y >/dev/null 2>&1
-    else
-        echo "[INFO] Updating existing environment."
-        conda activate "$ENV_NAME" >/dev/null 2>&1
-        "$CONDA_ROOT/envs/$ENV_NAME/bin/python" scripts/setup_env.py
-        echo ""
-        echo "========================================================"
-        echo "[SUCCESS] Installation complete."
-        echo "[READY] To launch the CLI (example with 4 MPI processes):"
-        echo "   conda activate $ENV_NAME"
-        echo "   mpiexec -n 4 python scripts/cli.py --config config.csv"
-        echo "========================================================"
-        read -p "Press Enter to exit..."
-        exit 0
-    fi
-fi
-
-echo "[INFO] Creating Base Environment (Python $PYTHON_VER)..."
-"$CONDA_EXEC" create -n "$ENV_NAME" python="$PYTHON_VER" -y >/dev/null 2>&1
-
-echo "[INFO] Activating Environment..."
-conda activate "$ENV_NAME" >/dev/null 2>&1
-
-# --- STEP 3: RUN PYTHON SETUP SCRIPT ---
+# --- STEP 3: RUN PYTHON SETUP SCRIPT (handles environment creation) ---
 if [ -f "scripts/setup_env.py" ]; then
-    "$CONDA_ROOT/envs/$ENV_NAME/bin/python" scripts/setup_env.py
+    python scripts/setup_env.py
+    if [ $? -ne 0 ]; then
+        echo "[ERROR] Setup script failed!"
+        exit 1
+    fi
 else
     echo "[ERROR] scripts/setup_env.py not found!"
     exit 1
@@ -112,4 +88,10 @@ echo "[READY] To launch the CLI (example with 4 MPI processes):"
 echo "   conda activate $ENV_NAME"
 echo "   mpiexec -n 4 python scripts/cli.py --config config.csv"
 echo "========================================================"
-read -p "Press Enter to exit..."
+
+# Only prompt for input if running interactively
+if [ -t 0 ]; then
+    read -p "Press Enter to exit..."
+fi
+
+exit 0

@@ -1,8 +1,9 @@
+import os
+
 import geopandas as gpd
+import numpy as np
 import pandas as pd
 from shapely.geometry import Polygon
-import numpy as np
-import os
 
 
 def create_sample_data():

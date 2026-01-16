@@ -1,15 +1,16 @@
+import asyncio
 import os
 import time
-import asyncio
+import warnings
+
+import geopandas as gpd
 import numpy as np
 import pandas as pd
-import geopandas as gpd
-from shapely.geometry import Point
 import rasterio
-from rasterio.transform import from_origin
 from PIL import Image
+from rasterio.transform import from_origin
+from shapely.geometry import Point
 from tqdm import tqdm
-import warnings
 
 # --- CONFIGURATION ---
 Image.MAX_IMAGE_PIXELS = None
@@ -76,7 +77,8 @@ CITYSCAPES_PALETTE = [
     32,
 ] + [0, 0, 0] * 237
 
-from streetview import search_panoramas, get_streetview, get_panorama_async
+from streetview import get_panorama_async, get_streetview, search_panoramas
+
 from .vision import DeepLabSegmenter, get_best_device
 
 

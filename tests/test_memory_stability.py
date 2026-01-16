@@ -1,13 +1,14 @@
-import sys
+import argparse
+import gc
 import os
+import sys
+
+import matplotlib.pyplot as plt
+import numpy as np
 import psutil
 import torch
-import gc
-import numpy as np
-import argparse
 from PIL import Image
 from tqdm import tqdm
-import matplotlib.pyplot as plt
 
 # Add parent path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))

@@ -1,5 +1,6 @@
 # GeoFuse: Multimodal Greenspace Profiling Toolbox
 
+[![Installation & Test Suite](https://github.com/Healthy-City-Lab/GeoFuse/actions/workflows/setup-tests.yml/badge.svg)](https://github.com/Healthy-City-Lab/GeoFuse/actions/workflows/setup-tests.yml)
 [![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Python Version](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![OS](https://img.shields.io/badge/OS-Linux|Windows|macOS-blue)](#installation)
@@ -90,7 +91,7 @@ The installer script will automatically create a `geofuse` conda environment and
 
 #### 1. Windows
 
-Simply double-click the `instal.bat` script. It will auto-detect your Conda installation and guide you through the process.
+Simply double-click the `install.bat` script. It will auto-detect your Conda installation and guide you through the process.
 
 #### 2. Linux / macOS
 
@@ -291,7 +292,7 @@ For each input file processed through the NDVI pipeline:
 
 If you see this error, it means the package wasn't linked correctly during setup.
 
-* **Fix:** Rerun the installer script (`instal.bat` / `install.sh`) and ensure you see a success message at the end.
+* **Fix:** Rerun the installer script (`install.bat` / `install.sh`) and ensure you see a success message at the end.
 
 > 🛑 **"Conda Not Found"**
 

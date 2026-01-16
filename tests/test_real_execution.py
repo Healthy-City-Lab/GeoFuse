@@ -1,10 +1,17 @@
-import sys
 import os
-import torch
-import numpy as np
-from PIL import Image
+import sys
+
 import geopandas as gpd
+import numpy as np
+import torch
+from PIL import Image
 from shapely.geometry import box
+from geofuse.gvi import search_panoramas
+
+# TODO: END_TO_END_TEST - Add complete pipeline test: GVI + NDVI + Fusion in one workflow
+# TODO: BENCHMARK_TEST - Add performance benchmarking suite for different hardware configs
+# TODO: CLI_INTEGRATION_TEST - Test MPI parallel execution with config.csv
+
 from geofuse.gvi import search_panoramas
 
 # TODO: END_TO_END_TEST - Add complete pipeline test: GVI + NDVI + Fusion in one workflow
@@ -14,7 +21,6 @@ from geofuse.gvi import search_panoramas
 # Add parent path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import geofuse
-
 from geofuse.gvi import GVIEngine
 from geofuse.ndvi import NDVIEngine
 

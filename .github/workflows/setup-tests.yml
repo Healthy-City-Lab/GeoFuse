@@ -1,0 +1,148 @@
+name: Installation & Test Suite
+
+on:
+  # Manual triggering only
+  workflow_dispatch:
+
+jobs:
+  test-installation:
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    defaults:
+      run:
+        shell: bash -el {0}  # Use bash with error handling for all platforms
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Cache conda packages
+        uses: actions/cache@v4
+        with:
+          path: ~/conda_pkgs_dir
+          key: conda-${{ runner.os }}-${{ hashFiles('scripts/setup_env.py') }}
+          restore-keys: |
+            conda-${{ runner.os }}-
+
+      - name: Cache PyTorch Hub models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/torch/hub
+          key: torch-hub-${{ runner.os }}
+          restore-keys: |
+            torch-hub-
+
+      - name: Set up Conda (Miniforge)
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniforge-version: latest
+          activate-environment: ""
+          auto-activate-base: true
+          use-mamba: true
+          conda-remove-defaults: true  # Suppress defaults channel warning
+
+      - name: Install mamba in base (for faster installs)
+        run: |
+          conda install mamba -n base -c conda-forge -y
+
+      - name: Remove existing environment (if any)
+        run: |
+          conda env remove -n geofuse -y || true
+          echo "Fresh environment will be created"
+
+      - name: Make installer executable (Unix)
+        if: runner.os != 'Windows'
+        run: chmod +x install.sh
+
+      - name: Run installer (Unix)
+        if: runner.os != 'Windows'
+        run: ./install.sh
+        continue-on-error: false
+
+      - name: Run installer (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd /C CALL {0}
+        run: install.bat
+        continue-on-error: false
+
+      - name: Cache model weights
+        id: cache-model
+        uses: actions/cache@v4
+        with:
+          path: geofuse/model/best_model.pth
+          key: model-weights-${{ hashFiles('.github/workflows/setup_tests.yml') }}
+          restore-keys: |
+            model-weights-
+
+      - name: Download model weights
+        if: steps.cache-model.outputs.cache-hit != 'true'
+        run: |
+          conda activate geofuse
+          mkdir -p geofuse/model
+          
+          # Hardcoded model URL - replace with your actual model link
+          MODEL_URL="https://drive.google.com/file/d/1t7TC8mxQaFECt4jutdq_NMnWxdm6B-Nb/view"
+          
+          echo "Downloading model weights..."
+          
+          # Check if it's a Google Drive link
+          if [[ "$MODEL_URL" == *"drive.google.com"* ]] || [[ "$MODEL_URL" == *"docs.google.com"* ]]; then
+            echo "Detected Google Drive link - using gdown to handle large file confirmation"
+            pip install gdown -q
+            gdown "$MODEL_URL" -O geofuse/model/best_model.pth --fuzzy
+          else
+            echo "Using direct download with curl"
+            curl -L "$MODEL_URL" -o geofuse/model/best_model.pth
+          fi
+          
+          echo "Model downloaded successfully"
+          ls -lh geofuse/model/
+      
+      - name: Verify model from cache
+        if: steps.cache-model.outputs.cache-hit == 'true'
+        run: |
+          echo "✅ Model loaded from cache"
+          ls -lh geofuse/model/
+
+      - name: Run Logic Tests (Offline)
+        run: |
+          conda run -n geofuse python tests/test_pipeline.py
+        continue-on-error: false
+
+      - name: Run Memory Stability Test (Short)
+        run: |
+          conda run -n geofuse python tests/test_memory_stability.py --iterations 100
+        continue-on-error: true
+
+      - name: Check installation log
+        if: always()
+        run: |
+          if [ -f "logs/install.log" ]; then
+            echo "=== Last 50 lines of installation log ==="
+            tail -n 50 logs/install.log
+          else
+            echo "No installation log found"
+          fi
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.os }}
+          path: |
+            tests/output/**/*.png
+            tests/output/**/*.geojson
+            logs/install.log
+          retention-days: 7
+
+      - name: Cleanup environment
+        if: always()
+        run: |
+          conda env remove -n geofuse -y || true
+          echo "Environment cleaned up"

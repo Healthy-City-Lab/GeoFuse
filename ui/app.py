@@ -1,31 +1,32 @@
-import streamlit as st
-import pandas as pd
-import geopandas as gpd
-import folium
-from streamlit_folium import st_folium
+import base64
+import glob
+import io
 import json
 import os
 import sys
-import time
 import threading
+import time
 import uuid
-import glob
-import rasterio
-from rasterio.transform import array_bounds
-from datetime import datetime, date, timedelta
-import numpy as np
-from shapely.geometry import Point
+from datetime import date, datetime, timedelta
+
+import folium
+import geopandas as gpd
 import matplotlib
 import matplotlib.pyplot as plt
-import io
-import base64
+import numpy as np
+import pandas as pd
+import rasterio
+import streamlit as st
 from PIL import Image as PILImage
+from rasterio.transform import array_bounds
+from shapely.geometry import Point
 
 # --- STREAMLIT RUNTIME CONTEXT ---
 from streamlit.runtime.scriptrunner import add_script_run_ctx
+from streamlit_folium import st_folium
 
-from geofuse.ndvi import NDVIEngine
 from geofuse.gvi import GVIEngine
+from geofuse.ndvi import NDVIEngine
 from geofuse.vision import get_best_device
 
 # --- 1. GLOBAL PATH SETUP ---
@@ -1057,9 +1058,11 @@ with tab3:
                     res_bounds.append([left, bottom, right, top])
 
                     # 1. RENDER RASTER
-                    from rasterio.transform import rowcol
-                    import io, base64
+                    import base64
+                    import io
+
                     from PIL import Image as PILImage
+                    from rasterio.transform import rowcol
 
                     meta = ds["meta"]
                     arr = np.full((meta["height"], meta["width"]), np.nan)
