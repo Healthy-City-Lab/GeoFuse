@@ -192,18 +192,19 @@ def main(env_name, log_file=None):
 
     # 3. Install Pip Libraries
     print(f"[3/6] Installing Python Libraries...")
+    env_python = get_env_python(env_name)
     pip_str = " ".join(PIP_PACKAGES)
-    run_cmd(f'"{sys.executable}" -m pip install {pip_str}', log_file)
+    run_cmd(f'"{env_python}" -m pip install {pip_str}', log_file)
 
     # 4. Install Git Packages
     print(f"[4/6] Installing Custom Git Packages...")
     for git_url in GIT_PACKAGES:
-        run_cmd(f'"{sys.executable}" -m pip install {git_url}', log_file)
+        run_cmd(f'"{env_python}" -m pip install {git_url}', log_file)
 
     # 5. Editable Install
     print(f"[5/6] Performing Editable Install of GeoFuse...")
     root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    run_cmd(f'"{sys.executable}" -m pip install -e "{root_dir}"', log_file)
+    run_cmd(f'"{env_python}" -m pip install -e "{root_dir}"', log_file)
 
     # 6. Verify Installation
     print(f"[6/6] Verifying Installation...")
