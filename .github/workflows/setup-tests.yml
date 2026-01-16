@@ -52,6 +52,11 @@ jobs:
         run: |
           conda install mamba -n base -c conda-forge -y
 
+      - name: Remove existing environment (if any)
+        run: |
+          conda env remove -n geofuse -y || true
+          echo "Fresh environment will be created"
+
       - name: Make installer executable (Unix)
         if: runner.os != 'Windows'
         run: chmod +x install.sh
@@ -138,3 +143,9 @@ jobs:
             tests/output/**/*.geojson
             logs/install.log
           retention-days: 7
+
+      - name: Cleanup environment
+        if: always()
+        run: |
+          conda env remove -n geofuse -y || true
+          echo "Environment cleaned up"
