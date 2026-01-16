@@ -118,6 +118,22 @@ def get_mpi_packages(system):
         return ["mpi4py=4.1.1", "openmpi"]
 
 
+def get_env_python(env_name):
+    """Get the Python executable path for a conda environment."""
+    system = platform.system()
+
+    # Get conda root
+    conda_info = subprocess.run(
+        "conda info --base", shell=True, capture_output=True, text=True, check=True
+    )
+    conda_root = conda_info.stdout.strip()
+
+    if system == "Windows":
+        return os.path.join(conda_root, "envs", env_name, "python.exe")
+    else:
+        return os.path.join(conda_root, "envs", env_name, "bin", "python")
+
+
 def main(env_name, log_file=None):
     system = platform.system()
     solver = get_solver()
@@ -192,6 +208,9 @@ def main(env_name, log_file=None):
     # 6. Verify Installation
     print(f"[6/6] Verifying Installation...")
 
+    # Get the Python executable from the geofuse environment
+    env_python = get_env_python(env_name)
+
     # Construct a verification script that checks for the correct GPU backend based on OS
     verify_imports = (
         "import geofuse; import torch; import platform; from mpi4py import MPI; "
@@ -207,7 +226,7 @@ def main(env_name, log_file=None):
 
     verify_script = verify_imports + verify_geofuse + verify_torch + verify_mpi
 
-    run_cmd(f'"{sys.executable}" -c "{verify_script}"', log_file, echo_to_console=True)
+    run_cmd(f'"{env_python}" -c "{verify_script}"', log_file, echo_to_console=True)
 
 
 if __name__ == "__main__":
