@@ -135,17 +135,33 @@ def main(env_name, log_file=None):
     print(f"\n[INFO] Starting Setup on {system} using {solver}...")
     print(f"[INFO] Detailed logs: {log_file}\n")
 
+    # 0. Create/Reset Environment (with console output for debugging)
+    print(f"[0/6] Checking environment '{env_name}'...")
+    # Check if environment exists
+    env_check = subprocess.run(
+        f"conda env list", shell=True, capture_output=True, text=True
+    )
+    env_exists = env_name in env_check.stdout
+
+    if env_exists:
+        print(f"[WARN] Environment '{env_name}' already exists. Removing...")
+        subprocess.run(f"conda env remove -n {env_name} -y", shell=True, check=True)
+
+    print(f"[INFO] Creating environment '{env_name}' with Python 3.12...")
+    subprocess.run(f"conda create -n {env_name} python=3.12 -y", shell=True, check=True)
+    print(f"[SUCCESS] Environment created successfully\n")
+
     # 1. Prepare Conda List (Core + OS-Specific MPI)
     mpi_pkgs = get_mpi_packages(system)
     full_conda_list = CONDA_PACKAGES + mpi_pkgs
     conda_str = " ".join(full_conda_list)
 
-    print(f"[1/5] Installing Core & MPI Binaries ({solver})...")
+    print(f"[1/6] Installing Core & MPI Binaries ({solver})...")
     # Conda handles the binary linking for mpi4py automatically here
     run_cmd(f"{solver} install -n {env_name} -y -c conda-forge {conda_str}", log_file)
 
     # 2. Install PyTorch
-    print(f"[2/5] Installing PyTorch Acceleration...")
+    print(f"[2/6] Installing PyTorch Acceleration...")
     if system == "Windows" or system == "Linux":
         cmd = f"{solver} install -n {env_name} -y {PYTORCH_VERSION} pytorch-cuda=12.1 -c pytorch -c nvidia"
     else:
@@ -155,22 +171,22 @@ def main(env_name, log_file=None):
     run_cmd(cmd, log_file)
 
     # 3. Install Pip Libraries
-    print(f"[3/5] Installing Python Libraries...")
+    print(f"[3/6] Installing Python Libraries...")
     pip_str = " ".join(PIP_PACKAGES)
     run_cmd(f'"{sys.executable}" -m pip install {pip_str}', log_file)
 
     # 4. Install Git Packages
-    print(f"[4/5] Installing Custom Git Packages...")
+    print(f"[4/6] Installing Custom Git Packages...")
     for git_url in GIT_PACKAGES:
         run_cmd(f'"{sys.executable}" -m pip install {git_url}', log_file)
 
     # 5. Editable Install
-    print(f"[5/5] Performing Editable Install of GeoFuse...")
+    print(f"[5/6] Performing Editable Install of GeoFuse...")
     root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     run_cmd(f'"{sys.executable}" -m pip install -e "{root_dir}"', log_file)
 
-    # Finish & Verify
-    print("\n[SUCCESS] Environment Configured.")
+    # 6. Verify Installation
+    print(f"[6/6] Verifying Installation...")
 
     # Construct a verification script that checks for the correct GPU backend based on OS
     verify_imports = (

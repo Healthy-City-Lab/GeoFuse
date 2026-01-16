@@ -30,35 +30,21 @@ if not defined CONDA_ROOT set /P "CONDA_ROOT=Paste path to Conda folder: "
 :FOUND_CONDA
 call "%CONDA_ROOT%\Scripts\activate.bat" base >nul 2>&1
 
-:: --- STEP 2: CREATE/RESET ENVIRONMENT ---
+:: --- STEP 2: CREATE LOGS DIRECTORY ---
 if not exist logs mkdir logs
 
-conda env list | findstr /R /C:"^%ENV_NAME% " >nul
-if %errorlevel% equ 0 (
-    echo [WARN] Environment '%ENV_NAME%' already exists.
-    set /P DELETE="Delete and clean install? (Y/N): "
-    if /I "!DELETE!"=="Y" (
-        echo [INFO] Removing existing environment...
-        call conda remove -n %ENV_NAME% --all -y >nul 2>&1
-    ) else (
-        goto ACTIVATE
-    )
-)
-
-echo [INFO] Creating Base Environment (Python %PYTHON_VER%)...
-call conda create -n %ENV_NAME% python=%PYTHON_VER% -y >nul 2>&1
-
-:ACTIVATE
-echo [INFO] Activating Environment...
-call conda activate %ENV_NAME%
-
-:: --- STEP 3: RUN PYTHON SETUP SCRIPT ---
+:: --- STEP 3: RUN PYTHON SETUP SCRIPT (handles environment creation) ---
 if exist scripts\setup_env.py (
-    call "%CONDA_ROOT%\envs\%ENV_NAME%\python.exe" scripts\setup_env.py
+    python scripts\setup_env.py
+    if %errorlevel% neq 0 (
+        echo [ERROR] Setup script failed!
+        pause
+        exit /b 1
+    )
 ) else (
     echo [ERROR] scripts\setup_env.py not found!
     pause
-    exit /b
+    exit /b 1
 )
 
 echo.
