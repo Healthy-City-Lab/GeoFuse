@@ -30,6 +30,14 @@ jobs:
           restore-keys: |
             conda-${{ runner.os }}-
 
+      - name: Cache PyTorch Hub models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/torch/hub
+          key: torch-hub-${{ runner.os }}
+          restore-keys: |
+            torch-hub-
+
       - name: Set up Conda (Miniforge)
         uses: conda-incubator/setup-miniconda@v3
         with:
@@ -38,6 +46,7 @@ jobs:
           auto-activate-base: true
           use-mamba: true
           use-only-tar-bz2: true  # Required for caching
+          conda-remove-defaults: true  # Suppress defaults channel warning
 
       - name: Install mamba in base (for faster installs)
         run: |
@@ -129,22 +138,3 @@ jobs:
             tests/output/**/*.geojson
             logs/install.log
           retention-days: 7
-
-  # Summary notification
-  test-summary:
-    name: Test Summary
-    runs-on: ubuntu-latest
-    needs: [test-installation]
-    if: always()
-    steps:
-      - name: Write test summary
-        run: |
-          echo "### Installation Tests" >> $GITHUB_STEP_SUMMARY
-          echo "- Ubuntu: ${{ needs.test-installation.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Windows: ${{ needs.test-installation.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- macOS: ${{ needs.test-installation.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Tests Executed" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Logic Tests (test_pipeline.py)" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Memory Stability (100 iterations)" >> $GITHUB_STEP_SUMMARY
-          echo "- ⏭️  Real Execution Tests (skipped - requires credentials)" >> $GITHUB_STEP_SUMMARY
