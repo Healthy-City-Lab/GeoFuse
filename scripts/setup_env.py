@@ -1,8 +1,8 @@
-import sys
-import platform
-import subprocess
-import shutil
 import os
+import platform
+import shutil
+import subprocess
+import sys
 
 # =========================================================================
 # CONFIGURATION
@@ -41,6 +41,8 @@ PIP_PACKAGES = [
     # Visualization
     "visdom==0.2.4",
     "dominate==2.9.1",
+    # Utility
+    "isort==7.0.0",
 ]
 
 GIT_PACKAGES = [

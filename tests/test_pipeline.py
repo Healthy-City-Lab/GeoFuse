@@ -1,20 +1,20 @@
-import unittest
-import sys
 import os
 import shutil
+import sys
+import unittest
 import warnings
 
 # -------------------------------------------------------------------------
 # CRITICAL IMPORT ORDER FIX FOR WINDOWS
 # -------------------------------------------------------------------------
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-import geofuse  # Must import before geopandas to load DLLs correctly
-
-import pandas as pd
-import geopandas as gpd
-import numpy as np
 from unittest.mock import MagicMock, patch
 
+import geopandas as gpd
+import numpy as np
+import pandas as pd
+
+import geofuse  # Must import before geopandas to load DLLs correctly
 from geofuse.gvi import GVIEngine
 from geofuse.vision import DeepLabSegmenter
 

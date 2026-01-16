@@ -1,11 +1,12 @@
-import sys
+import importlib
 import os
-import torch
+import sys
+from unittest.mock import MagicMock
+
 import numpy as np
+import torch
 from PIL import Image
 from torchvision import transforms as T
-from unittest.mock import MagicMock
-import importlib
 
 
 # ---------------------------------------------------------
