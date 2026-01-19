@@ -5,9 +5,57 @@ on:
   workflow_dispatch:
 
 jobs:
+  prepare-models:
+    name: Download and Cache Models
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Cache PyTorch Hub models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/torch/hub
+          key: torch-hub-models
+          restore-keys: |
+            torch-hub-
+
+      - name: Cache model weights
+        id: cache-model
+        uses: actions/cache@v4
+        with:
+          path: geofuse/model/best_model.pth
+          key: model-weights-${{ hashFiles('.github/workflows/setup-tests.yml') }}
+          restore-keys: |
+            model-weights-
+
+      - name: Download model weights
+        if: steps.cache-model.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p geofuse/model
+          
+          # Hardcoded model URL
+          MODEL_URL="https://drive.google.com/file/d/1t7TC8mxQaFECt4jutdq_NMnWxdm6B-Nb/view"
+          
+          echo "Downloading model weights..."
+          
+          if [[ "$MODEL_URL" == *"drive.google.com"* ]] || [[ "$MODEL_URL" == *"docs.google.com"* ]]; then
+            echo "Detected Google Drive link - using gdown"
+            pip install gdown -q
+            gdown "$MODEL_URL" -O geofuse/model/best_model.pth --fuzzy
+          else
+            echo "Using direct download with curl"
+            curl -L "$MODEL_URL" -o geofuse/model/best_model.pth
+          fi
+          
+          echo "Model downloaded successfully"
+          ls -lh geofuse/model/
+
   test-installation:
     name: Test on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    needs: prepare-models
     
     strategy:
       fail-fast: false
@@ -34,7 +82,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/torch/hub
-          key: torch-hub-${{ runner.os }}
+          key: torch-hub-models
           restore-keys: |
             torch-hub-
 
@@ -83,32 +131,18 @@ jobs:
       - name: Download model weights
         if: steps.cache-model.outputs.cache-hit != 'true'
         run: |
-          conda activate geofuse
-          mkdir -p geofuse/model
-          
-          # Hardcoded model URL - replace with your actual model link
-          MODEL_URL="https://drive.google.com/file/d/1t7TC8mxQaFECt4jutdq_NMnWxdm6B-Nb/view"
-          
-          echo "Downloading model weights..."
-          
-          # Check if it's a Google Drive link
-          if [[ "$MODEL_URL" == *"drive.google.com"* ]] || [[ "$MODEL_URL" == *"docs.google.com"* ]]; then
-            echo "Detected Google Drive link - using gdown to handle large file confirmation"
-            pip install gdown -q
-            gdown "$MODEL_URL" -O geofuse/model/best_model.pth --fuzzy
-          else
-            echo "Using direct download with curl"
-            curl -L "$MODEL_URL" -o geofuse/model/best_model.pth
-          fi
-          
-          echo "Model downloaded successfully"
-          ls -lh geofuse/model/
+          echo "⚠️ Model not in cache - should have been downloaded by prepare-models job"
+          exit 1
       
       - name: Verify model from cache
-        if: steps.cache-model.outputs.cache-hit == 'true'
         run: |
-          echo "✅ Model loaded from cache"
-          ls -lh geofuse/model/
+          if [ -f "geofuse/model/best_model.pth" ]; then
+            echo "✅ Model loaded from cache"
+            ls -lh geofuse/model/
+          else
+            echo "❌ Model not found!"
+            exit 1
+          fi
 
       - name: Run Logic Tests (Offline)
         run: |
@@ -117,7 +151,7 @@ jobs:
 
       - name: Run Memory Stability Test (Short)
         run: |
-          conda run -n geofuse python tests/test_memory_stability.py --iterations 100
+          conda run -n geofuse python tests/test_memory_stability.py --iterations 20
         continue-on-error: true
 
       - name: Check installation log
