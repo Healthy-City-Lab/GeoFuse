@@ -150,39 +150,89 @@ class GVIEngine:
         target_height = int(target_width / 2)
         return img_cropped.resize((target_width, target_height), Image.BILINEAR)
 
-    def _download_async_wrapper(self, panoid):
+    def _download_async_wrapper(self, panoid, timeout=30):
+        """Download panorama with timeout to prevent hanging."""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            return loop.run_until_complete(get_panorama_async(pano_id=panoid, zoom=1))
+            # Add timeout to prevent indefinite blocking
+            return loop.run_until_complete(
+                asyncio.wait_for(
+                    get_panorama_async(pano_id=panoid, zoom=1), timeout=timeout
+                )
+            )
+        except asyncio.TimeoutError:
+            print(f"[GVI] Timeout downloading panorama {panoid}")
+            return None
         except Exception:
             return None
         finally:
             loop.close()
 
     def _generate_pixel_aligned_grid(self, gdf, resolution):
-        minx, miny, maxx, maxy = gdf.total_bounds
+        """Generate grid with proper CRS handling."""
+        # If input is in geographic coordinates, convert to local UTM for accurate grid spacing
+        if gdf.crs.is_geographic:
+            # Get center point to determine UTM zone
+            centroid = gdf.geometry.iloc[0].centroid
+            lon, lat = centroid.x, centroid.y
+
+            # Calculate UTM zone
+            utm_zone = int((lon + 180) / 6) + 1
+            utm_crs = f"EPSG:326{utm_zone}" if lat >= 0 else f"EPSG:327{utm_zone}"
+
+            print(f"[GVI] Converting from {gdf.crs} to {utm_crs} for grid generation")
+            gdf_metric = gdf.to_crs(utm_crs)
+        else:
+            gdf_metric = gdf
+
+        minx, miny, maxx, maxy = gdf_metric.total_bounds
         width = int(np.ceil((maxx - minx) / resolution))
         height = int(np.ceil((maxy - miny) / resolution))
+
+        print(f"[GVI] Grid dimensions: {width}x{height} = {width*height} points")
+        print(
+            f"[GVI] Area bounds (metric): ({minx:.2f}, {miny:.2f}) to ({maxx:.2f}, {maxy:.2f})"
+        )
+
         transform = from_origin(minx, maxy, resolution, resolution)
         cols = np.arange(width)
         rows = np.arange(height)
         pixel_centers = []
+
         for r in rows:
             y_center = maxy - (r + 0.5) * resolution
             for c in cols:
                 x_center = minx + (c + 0.5) * resolution
                 p = Point(x_center, y_center)
-                if gdf.contains(p).any():
+                if gdf_metric.contains(p).any():
                     pixel_centers.append(
                         {
                             "geometry": p,
                             "row": r,
                             "col": c,
-                            "lat": y_center,
+                            "lat": y_center,  # These will be in metric CRS
                             "lon": x_center,
                         }
                     )
+
+        print(f"[GVI] Generated {len(pixel_centers)} points within polygon")
+
+        # Convert points back to original CRS if we converted
+        if gdf.crs.is_geographic:
+            gdf_points = gpd.GeoDataFrame(
+                pixel_centers,
+                geometry=[p["geometry"] for p in pixel_centers],
+                crs=utm_crs,
+            )
+            gdf_points = gdf_points.to_crs(gdf.crs)
+
+            # Update coordinates in pixel_centers
+            for i, (idx, row) in enumerate(gdf_points.iterrows()):
+                pixel_centers[i]["geometry"] = row.geometry
+                pixel_centers[i]["lon"] = row.geometry.x
+                pixel_centers[i]["lat"] = row.geometry.y
+
         return pixel_centers, height, width, transform
 
     # TODO: ERROR_RECOVERY - Implement automatic retry logic for failed panorama downloads
@@ -192,7 +242,7 @@ class GVIEngine:
     def run_analysis(
         self,
         gdf,
-        step: float | int = 50,
+        step: float | int = 75,
         folder="output",
         save_panos=False,
         save_masks=False,
@@ -277,20 +327,37 @@ class GVIEngine:
 
             search_lat, search_lon = lat, lon
             if not gdf.crs.is_geographic:
-                p_geo = (
-                    gpd.GeoSeries([pt["geometry"]], crs=gdf.crs)
-                    .to_crs(epsg=4326)
-                    .iloc[0]
-                )
-                search_lat, search_lon = p_geo.y, p_geo.x
+                try:
+                    p_geo = (
+                        gpd.GeoSeries([pt["geometry"]], crs=gdf.crs)
+                        .to_crs(epsg=4326)
+                        .iloc[0]
+                    )
+                    search_lat, search_lon = p_geo.y, p_geo.x
+                except Exception as e:
+                    # If CRS transform fails, skip this point
+                    print(f"[GVI] CRS transform failed: {e}")
+                    continue
 
-            candidates = search_panoramas(lat=search_lat, lon=search_lon)
+            # Search for panoramas with timeout protection
+            try:
+                candidates = search_panoramas(lat=search_lat, lon=search_lon)
+            except Exception as e:
+                # If search fails, skip this point
+                candidates = None
             final_panoid = None
             val_veg = np.nan
             val_ter = np.nan
 
             if candidates:
                 for meta in candidates:
+                    # Check for cancellation inside candidate loop
+                    if cancel_callback and cancel_callback():
+                        print(
+                            "[GVI] Analysis Aborted by User (during panorama processing)."
+                        )
+                        break
+
                     pid = self._extract_panoid(meta)
                     if not pid:
                         continue
@@ -312,9 +379,22 @@ class GVIEngine:
                             raw_image = self._download_async_wrapper(pid)
 
                         if raw_image is not None:
+                            # Check cancel before expensive processing
+                            if cancel_callback and cancel_callback():
+                                print(
+                                    "[GVI] Analysis Aborted by User (before image processing)."
+                                )
+                                break
+
                             img = self._preprocess_image(raw_image)
                             if img:
-                                mask = self.segmenter.predict(img)
+                                # GPU inference - could hang on CUDA issues
+                                try:
+                                    mask = self.segmenter.predict(img)
+                                except Exception as e:
+                                    # Skip this image if GPU inference fails
+                                    print(f"[GVI] GPU inference failed for {pid}: {e}")
+                                    continue
                                 metrics = self.segmenter.calculate_gvi_from_mask(mask)
 
                                 val_veg = metrics.get("GVI_Total", 0.0)
@@ -344,8 +424,17 @@ class GVIEngine:
 
                                 pano_cache[pid] = {"veg": val_veg, "ter": val_ter}
                                 break
-                    except Exception:
+                    except KeyboardInterrupt:
+                        # Re-raise keyboard interrupt to stop everything
+                        raise
+                    except Exception as e:
+                        # Log and skip problematic panoramas
+                        # Don't let one bad panorama block the entire process
                         continue
+
+                # Check if we should abort after processing candidates
+                if cancel_callback and cancel_callback():
+                    break
 
             res_dict = {
                 "orig_index": orig_idx,
