@@ -5,6 +5,7 @@ This module implements the optimization logic from CGI.ipynb for tuning
 weighted combinations of NDVI and GVI metrics against target outcomes.
 """
 
+import hashlib
 import logging
 import os
 from typing import Dict, List, Optional, Tuple, Union
@@ -17,14 +18,13 @@ import rasterio
 from optuna.pruners import HyperbandPruner, MedianPruner, SuccessiveHalvingPruner
 from optuna.samplers import TPESampler
 from rasterio.features import geometry_mask
-from rasterio.transform import rowcol, xy, from_origin
+from rasterio.transform import from_origin, rowcol, xy
 from rasterio.warp import Resampling, reproject
 from scipy.stats import pearsonr, spearmanr
 from shapely.geometry import box
 from sklearn.metrics import mean_squared_error, mutual_info_score, r2_score
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import MinMaxScaler
-import hashlib
 
 logger = logging.getLogger(__name__)
 
@@ -2008,6 +2008,7 @@ class MetricFusionEngine:
             # Calculate p-values for correlation metrics
             if metric in ["pearson", "spearman"]:
                 import warnings
+
                 from scipy.stats import ConstantInputWarning
 
                 with warnings.catch_warnings():
@@ -2055,6 +2056,7 @@ class MetricFusionEngine:
     ) -> float:
         """Calculate specified metric between target and composite."""
         import warnings
+
         from scipy.stats import ConstantInputWarning
 
         # Check for constant inputs before computing correlations
