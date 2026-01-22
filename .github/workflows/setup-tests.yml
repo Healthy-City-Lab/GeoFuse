@@ -49,6 +49,9 @@ jobs:
             curl -L "$MODEL_URL" -o geofuse/model/best_model.pth
           fi
           
+          echo "Verifying downloaded file..."
+          ls -lh geofuse/model/best_model.pth
+          
           echo "Model downloaded successfully"
           ls -lh geofuse/model/
 
@@ -74,9 +77,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/conda_pkgs_dir
-          key: conda-${{ runner.os }}-${{ hashFiles('scripts/setup_env.py') }}
+          key: conda-${{ runner.os }}
           restore-keys: |
-            conda-${{ runner.os }}-
+            conda-${{ runner.os }}
 
       - name: Cache PyTorch Hub models
         uses: actions/cache@v4
@@ -128,21 +131,30 @@ jobs:
           restore-keys: |
             model-weights-
 
-      - name: Download model weights
+      - name: Download model weights if not cached
         if: steps.cache-model.outputs.cache-hit != 'true'
+        shell: bash
         run: |
-          echo "⚠️ Model not in cache - should have been downloaded by prepare-models job"
-          exit 1
+          echo "📥 Downloading model weights..."
+          mkdir -p geofuse/model
+          
+          MODEL_URL="https://drive.google.com/file/d/1t7TC8mxQaFECt4jutdq_NMnWxdm6B-Nb/view"
+          
+          pip install gdown -q
+          gdown "$MODEL_URL" -O geofuse/model/best_model.pth --fuzzy
       
-      - name: Verify model from cache
+      - name: Verify model exists
+        shell: python
         run: |
-          if [ -f "geofuse/model/best_model.pth" ]; then
-            echo "✅ Model loaded from cache"
-            ls -lh geofuse/model/
-          else
-            echo "❌ Model not found!"
-            exit 1
-          fi
+          import os
+          import sys
+          model_path = "geofuse/model/best_model.pth"
+          if os.path.exists(model_path):
+            size_mb = os.path.getsize(model_path) / (1024*1024)
+            print(f"✅ Model found: {size_mb:.1f} MB")
+          else:
+            print(f"❌ Model not found at {model_path}")
+            sys.exit(1)
 
       - name: Run Logic Tests (Offline)
         run: |
