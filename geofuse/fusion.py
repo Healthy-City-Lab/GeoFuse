@@ -164,6 +164,7 @@ class MetricFusionEngine:
         ndvi_project_id: Optional[str] = None,
         progress_callback: Optional[callable] = None,
         cancel_callback: Optional[callable] = None,
+        force_download: bool = False,
     ) -> None:
         """
         Load vegetation, terrain, and NDVI metrics from files or auto-download.
@@ -180,6 +181,7 @@ class MetricFusionEngine:
             ndvi_start_date: Start date for NDVI composite (YYYY-MM-DD)
             ndvi_end_date: End date for NDVI composite (YYYY-MM-DD)
             ndvi_project_id: Google Earth Engine project ID for NDVI download
+            force_download: If True, bypass cache and force fresh download of all metrics
         """
         if self.buffered_extent is None:
             self.load_target()
@@ -342,17 +344,21 @@ class MetricFusionEngine:
             logger.info("✓ GVI data loaded successfully")
 
         # Load or Auto-download NDVI
-        if ndvi_file and os.path.exists(ndvi_file):
+        if ndvi_file and os.path.exists(ndvi_file) and not force_download:
             logger.info(f"Loading NDVI from: {ndvi_file}")
             self._validate_metric_bounds(ndvi_file)
             self.ndvi_data = self._load_metric_file(ndvi_file)
         else:
-            logger.info("Auto-downloading NDVI metrics (Sentinel-2)...")
+            if force_download:
+                logger.info("Force download enabled. Skipping cache check for NDVI...")
+            else:
+                logger.info("Auto-downloading NDVI metrics (Sentinel-2)...")
             ndvi_file = self._auto_download_ndvi(
                 start_date=ndvi_start_date,
                 end_date=ndvi_end_date,
                 project_id=ndvi_project_id,
                 cache=cache_metrics,
+                force_download=force_download,
             )
             self.ndvi_data = self._load_metric_file(ndvi_file)
 
@@ -900,6 +906,7 @@ class MetricFusionEngine:
         end_date: str,
         project_id: Optional[str] = None,
         cache: bool = True,
+        force_download: bool = False,
     ) -> str:
         """
         Auto-download NDVI metrics within buffered extent.
@@ -909,18 +916,26 @@ class MetricFusionEngine:
             end_date: End date for temporal composite (YYYY-MM-DD)
             project_id: Google Earth Engine project ID
             cache: Whether to save to cache directory
+            force_download: If True, bypass cache and force fresh download
 
         Returns:
             Path to generated GeoTIFF file
         """
         from .ndvi import NDVIEngine
 
-        # Check cache first using deterministic filename
+        # Check cache first using deterministic filename (unless force_download)
         cache_path = self._get_cache_filename("ndvi", ".tif")
 
-        if os.path.exists(cache_path):
+        if os.path.exists(cache_path) and not force_download:
             logger.info(f"Found cached NDVI at: {cache_path}")
             return cache_path
+        elif force_download and os.path.exists(cache_path):
+            logger.info(f"Force download enabled. Removing old cache: {cache_path}")
+            os.remove(cache_path)
+            # Also remove corresponding geojson if it exists
+            cache_geojson = cache_path.replace(".tif", ".geojson")
+            if os.path.exists(cache_geojson):
+                os.remove(cache_geojson)
 
         # Initialize NDVI engine
         ndvi_engine = NDVIEngine(project_id=project_id)

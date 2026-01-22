@@ -103,10 +103,11 @@ class TestGeoFuse(unittest.TestCase):
             results.append(res)
 
         # Run Analysis
-        # Step 0.005 ensures a ~10x10 grid (100 points) for good visual verification
+        # Step 500 meters ensures a ~10x10 grid (100 points) for a 5km area
+        # The engine now uses metric CRS internally, so step is in meters
         results_gdf = engine.run_analysis(
             gdf,
-            step=0.005,
+            step=500,  # 500 meters spacing
             folder=self.output_dir,
             save_panos=False,
             save_masks=False,

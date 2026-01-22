@@ -195,6 +195,17 @@ class GVIEngine:
             f"[GVI] Area bounds (metric): ({minx:.2f}, {miny:.2f}) to ({maxx:.2f}, {maxy:.2f})"
         )
 
+        # Safety check: prevent absurdly large grids
+        max_points = 1_000_000  # 1 million points max
+        if width * height > max_points:
+            raise ValueError(
+                f"Grid too large: {width}x{height} = {width*height:,} points "
+                f"(max {max_points:,}). "
+                f"This likely indicates step size is too small. "
+                f"For a ~{(maxx-minx)/1000:.1f}x{(maxy-miny)/1000:.1f} km area, "
+                f"try step >= {int(np.sqrt((maxx-minx)*(maxy-miny)/max_points))} meters."
+            )
+
         transform = from_origin(minx, maxy, resolution, resolution)
         cols = np.arange(width)
         rows = np.arange(height)

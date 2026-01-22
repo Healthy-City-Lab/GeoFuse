@@ -124,7 +124,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: geofuse/model/best_model.pth
-          key: model-weights-${{ hashFiles('.github/workflows/setup_tests.yml') }}
+          key: model-weights-${{ hashFiles('.github/workflows/setup-tests.yml') }}
           restore-keys: |
             model-weights-
 
