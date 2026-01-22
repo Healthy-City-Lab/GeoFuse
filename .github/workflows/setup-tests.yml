@@ -18,8 +18,6 @@ jobs:
         with:
           path: ~/.cache/torch/hub
           key: torch-hub-models
-          restore-keys: |
-            torch-hub-
 
       - name: Cache model weights
         id: cache-model
@@ -27,8 +25,6 @@ jobs:
         with:
           path: geofuse/model/best_model.pth
           key: model-weights-resnet101-v1
-          restore-keys: |
-            model-weights-
 
       - name: Download model weights
         if: steps.cache-model.outputs.cache-hit != 'true'
@@ -73,21 +69,73 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Cache model weights
+        id: cache-model
+        uses: actions/cache@v4
+        with:
+          path: geofuse/model/best_model.pth
+          key: model-weights-resnet101-v1
+
+      - name: Download model weights if not cached
+        if: steps.cache-model.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          echo "📥 Downloading model weights..."
+          mkdir -p geofuse/model
+          
+          MODEL_URL="https://drive.google.com/file/d/1t7TC8mxQaFECt4jutdq_NMnWxdm6B-Nb/view"
+          
+          pip install gdown -q
+          gdown "$MODEL_URL" -O geofuse/model/best_model.pth --fuzzy
+      
+      - name: Verify model exists
+        shell: python
+        run: |
+          import os
+          import sys
+          model_path = "geofuse/model/best_model.pth"
+          if os.path.exists(model_path):
+            size_mb = os.path.getsize(model_path) / (1024*1024)
+            print(f"✅ Model found: {size_mb:.1f} MB")
+          else:
+            print(f"❌ Model not found at {model_path}")
+            sys.exit(1)
+
       - name: Cache conda packages
+        id: cache-conda
         uses: actions/cache@v4
         with:
           path: ~/conda_pkgs_dir
-          key: conda-${{ runner.os }}
-          restore-keys: |
-            conda-${{ runner.os }}
+          key: conda-pkgs-${{ runner.os }}-v1
+
+      - name: Verify conda cache
+        shell: python
+        run: |
+          import os
+          cache_dir = os.path.expanduser("~/conda_pkgs_dir")
+          if os.path.exists(cache_dir):
+            file_count = len([f for f in os.listdir(cache_dir)]) if os.path.isdir(cache_dir) else 0
+            print(f"✅ Conda cache (${{ runner.os }}): {file_count} packages")
+          else:
+            print("ℹ️ Conda cache empty - will be populated during install")
 
       - name: Cache PyTorch Hub models
+        id: cache-torch
         uses: actions/cache@v4
         with:
           path: ~/.cache/torch/hub
-          key: torch-hub-models
-          restore-keys: |
-            torch-hub-
+          key: torch-hub-models-v1
+
+      - name: Verify PyTorch Hub cache
+        shell: python
+        run: |
+          import os
+          cache_dir = os.path.expanduser("~/.cache/torch/hub")
+          if os.path.exists(cache_dir):
+            subdirs = [d for d in os.listdir(cache_dir) if os.path.isdir(os.path.join(cache_dir, d))] if os.path.isdir(cache_dir) else []
+            print(f"✅ PyTorch Hub cache: {len(subdirs)} models")
+          else:
+            print("ℹ️ PyTorch Hub cache empty - will download ResNet101 on first use")
 
       - name: Set up Conda (Miniforge)
         uses: conda-incubator/setup-miniconda@v3
@@ -121,40 +169,6 @@ jobs:
         shell: cmd /C CALL {0}
         run: install.bat
         continue-on-error: false
-
-      - name: Cache model weights
-        id: cache-model
-        uses: actions/cache@v4
-        with:
-          path: geofuse/model/best_model.pth
-          key: model-weights-resnet101-v1
-          restore-keys: |
-            model-weights-
-
-      - name: Download model weights if not cached
-        if: steps.cache-model.outputs.cache-hit != 'true'
-        shell: bash
-        run: |
-          echo "📥 Downloading model weights..."
-          mkdir -p geofuse/model
-          
-          MODEL_URL="https://drive.google.com/file/d/1t7TC8mxQaFECt4jutdq_NMnWxdm6B-Nb/view"
-          
-          pip install gdown -q
-          gdown "$MODEL_URL" -O geofuse/model/best_model.pth --fuzzy
-      
-      - name: Verify model exists
-        shell: python
-        run: |
-          import os
-          import sys
-          model_path = "geofuse/model/best_model.pth"
-          if os.path.exists(model_path):
-            size_mb = os.path.getsize(model_path) / (1024*1024)
-            print(f"✅ Model found: {size_mb:.1f} MB")
-          else:
-            print(f"❌ Model not found at {model_path}")
-            sys.exit(1)
 
       - name: Run Logic Tests (Offline)
         run: |
