@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+from rasterio.warp import Resampling  # Needed for mocking
 
 import geofuse  # Must import before geopandas to load DLLs correctly
 from geofuse.gvi import GVIEngine
@@ -116,7 +117,6 @@ class TestGeoFuse(unittest.TestCase):
         self.assertLess(len(results), 100, "Should not exceed 100 points")
         print(f"   [PASS] GVI Pipeline processed {len(results)} points")
 
-    @patch("geofuse.ndvi.transform")
     @patch("geofuse.ndvi.array_bounds", return_value=(0, 0, 10, 10))
     @patch(
         "geofuse.ndvi.calculate_default_transform", return_value=(MagicMock(), 10, 10)
@@ -133,7 +133,6 @@ class TestGeoFuse(unittest.TestCase):
         mock_reproject,
         mock_cdt,
         mock_ab,
-        mock_warp_transform,
     ):
         """Tests that the GEE wrapper constructs the correct calls."""
         print("\n[TEST] Testing NDVI Logic (Mocked GEE)...")
@@ -168,20 +167,39 @@ class TestGeoFuse(unittest.TestCase):
         mock_src.width = 10
         mock_src.height = 10
 
-        # Configure the context manager
+        # Configure the context manager for rasterio.open
         mock_rasterio.open.return_value.__enter__.return_value = mock_src
         mock_rasterio.open.return_value.__exit__.return_value = None
 
         # Allow rasterio.band to be called safely on mocks
         mock_rasterio.band = MagicMock()
 
-        # Mock rasterio.warp.transform for coordinate conversion
-        mock_warp_transform.return_value = ([5.0], [5.0])  # Center coordinates
+        # Mock rasterio.warp module completely
+        mock_rasterio.warp = MagicMock()
+        mock_rasterio.warp.transform = MagicMock(return_value=([5.0], [5.0]))
+        mock_rasterio.warp.Resampling = Resampling  # Use the real Resampling enum
 
-        # Mock rasterio.transform.xy for point extraction
-        mock_rasterio.transform.xy = MagicMock(
-            return_value=(np.array([0, 1, 2]), np.array([0, 1, 2]))
-        )
+        # Mock rasterio.transform module for point extraction
+        # Note: transform.xy receives (transform, rows, cols) where rows/cols are 10x10 meshgrids
+        # It should return coordinate arrays matching the input shape
+        def mock_xy(transform, rows, cols, offset="center"):
+            # Return coordinates matching the shape of input rows/cols
+            # For 10x10 grid, return 10x10 arrays
+            if isinstance(rows, np.ndarray) and isinstance(cols, np.ndarray):
+                shape = rows.shape
+                xs = np.linspace(0, 10, shape[1] if len(shape) > 1 else len(rows))
+                ys = np.linspace(0, 10, shape[0] if len(shape) > 1 else len(rows))
+                if len(shape) > 1:
+                    xs_grid, ys_grid = np.meshgrid(xs, ys)
+                    return (xs_grid, ys_grid)
+                return (xs, ys)
+            return (np.array([0, 1, 2]), np.array([0, 1, 2]))
+
+        mock_rasterio.transform = MagicMock()
+        mock_rasterio.transform.xy = MagicMock(side_effect=mock_xy)
+
+        # Ensure reproject doesn't raise errors (it writes to destination)
+        mock_reproject.return_value = None
 
         engine = NDVIEngine()
 
