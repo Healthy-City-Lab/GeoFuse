@@ -9,10 +9,30 @@ from shapely.geometry import Polygon
 def create_sample_data():
     os.makedirs("data/samples", exist_ok=True)
 
-    # 1. Create a Sample Polygon (University of Calgary Park)
-    # Coordinates are approx WGS84
-    lat_point_list = [51.077, 51.077, 51.079, 51.079]
-    lon_point_list = [-114.135, -114.132, -114.132, -114.135]
+    # 1. Create a Sample Polygon (Rectangular area for predictable grid)
+    # Create a ~4.5km x 4.5km box (avoids NDVI tiling threshold of 5km)
+    # This ensures predictable grid points and single-tile NDVI download
+
+    # Center point: Calgary, AB
+    center_lat = 51.0447
+    center_lon = -114.0719
+
+    # Approximately 0.02 degrees = ~2.2 km at this latitude
+    # So 0.04 degrees = ~4.4 km (stays under 5km threshold)
+    half_size = 0.02
+
+    lat_point_list = [
+        center_lat - half_size,
+        center_lat - half_size,
+        center_lat + half_size,
+        center_lat + half_size,
+    ]
+    lon_point_list = [
+        center_lon - half_size,
+        center_lon + half_size,
+        center_lon + half_size,
+        center_lon - half_size,
+    ]
 
     polygon_geom = Polygon(zip(lon_point_list, lat_point_list))
     gdf = gpd.GeoDataFrame(index=[0], crs="epsg:4326", geometry=[polygon_geom])
@@ -20,7 +40,9 @@ def create_sample_data():
     # Save as GeoJSON (for NDVI) and Shapefile (for GVI)
     gdf.to_file("data/samples/test_area.geojson", driver="GeoJSON")
     gdf.to_file("data/samples/test_area.shp")
-    print("[OK] Created sample geometry: data/samples/test_area.geojson")
+    print(
+        "[OK] Created sample geometry: data/samples/test_area.geojson (~4.4km x 4.4km)"
+    )
 
     # 2. Create Sample Fusion Data (Synthetic)
     # We create a relationship: Outcome = 0.5*NDVI + 0.3*Trees + Noise
