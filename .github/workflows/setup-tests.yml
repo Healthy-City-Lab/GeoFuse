@@ -80,7 +80,7 @@ jobs:
         if: steps.cache-model.outputs.cache-hit != 'true'
         shell: bash
         run: |
-          echo "📥 Downloading model weights..."
+          echo "Downloading model weights..."
           mkdir -p geofuse/model
           
           MODEL_URL="https://drive.google.com/file/d/1t7TC8mxQaFECt4jutdq_NMnWxdm6B-Nb/view"
@@ -96,9 +96,9 @@ jobs:
           model_path = "geofuse/model/best_model.pth"
           if os.path.exists(model_path):
             size_mb = os.path.getsize(model_path) / (1024*1024)
-            print(f"✅ Model found: {size_mb:.1f} MB")
+            print(f"[OK] Model found: {size_mb:.1f} MB")
           else:
-            print(f"❌ Model not found at {model_path}")
+            print(f"[ERROR] Model not found at {model_path}")
             sys.exit(1)
 
       - name: Cache conda packages
@@ -115,9 +115,9 @@ jobs:
           cache_dir = os.path.expanduser("~/conda_pkgs_dir")
           if os.path.exists(cache_dir):
             file_count = len([f for f in os.listdir(cache_dir)]) if os.path.isdir(cache_dir) else 0
-            print(f"✅ Conda cache (${{ runner.os }}): {file_count} packages")
+            print(f"[OK] Conda cache (${{{{ runner.os }}}}): {file_count} packages")
           else:
-            print("ℹ️ Conda cache empty - will be populated during install")
+            print("[INFO] Conda cache empty - will be populated during install")
 
       - name: Cache PyTorch Hub models
         id: cache-torch
@@ -133,9 +133,9 @@ jobs:
           cache_dir = os.path.expanduser("~/.cache/torch/hub")
           if os.path.exists(cache_dir):
             subdirs = [d for d in os.listdir(cache_dir) if os.path.isdir(os.path.join(cache_dir, d))] if os.path.isdir(cache_dir) else []
-            print(f"✅ PyTorch Hub cache: {len(subdirs)} models")
+            print(f"[OK] PyTorch Hub cache: {len(subdirs)} models")
           else:
-            print("ℹ️ PyTorch Hub cache empty - will download ResNet101 on first use")
+            print("[INFO] PyTorch Hub cache empty - will download ResNet101 on first use")
 
       - name: Set up Conda (Miniforge)
         uses: conda-incubator/setup-miniconda@v3
