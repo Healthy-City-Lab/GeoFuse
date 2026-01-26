@@ -17,7 +17,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/torch/hub
-          key: torch-hub-models
+          key: torch-hub-models-v1
 
       - name: Cache model weights
         id: cache-model
@@ -69,9 +69,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Cache model weights
+      - name: Restore model weights from cache
         id: cache-model
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: geofuse/model/best_model.pth
           key: model-weights-resnet101-v1
@@ -89,8 +89,9 @@ jobs:
           gdown "$MODEL_URL" -O geofuse/model/best_model.pth --fuzzy
       
       - name: Verify model exists
-        shell: python
+        shell: bash
         run: |
+          python - <<'EOF'
           import os
           import sys
           model_path = "geofuse/model/best_model.pth"
@@ -100,6 +101,7 @@ jobs:
           else:
             print(f"[ERROR] Model not found at {model_path}")
             sys.exit(1)
+          EOF
 
       - name: Cache conda packages
         id: cache-conda
@@ -109,26 +111,29 @@ jobs:
           key: conda-pkgs-${{ runner.os }}-v1
 
       - name: Verify conda cache
-        shell: python
+        shell: bash
         run: |
+          python - <<'EOF'
           import os
           cache_dir = os.path.expanduser("~/conda_pkgs_dir")
           if os.path.exists(cache_dir):
             file_count = len([f for f in os.listdir(cache_dir)]) if os.path.isdir(cache_dir) else 0
-            print(f"[OK] Conda cache (${{{{ runner.os }}}}): {file_count} packages")
+            print(f"[OK] Conda cache: {file_count} packages")
           else:
             print("[INFO] Conda cache empty - will be populated during install")
+          EOF
 
-      - name: Cache PyTorch Hub models
+      - name: Restore PyTorch Hub models from cache
         id: cache-torch
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ~/.cache/torch/hub
           key: torch-hub-models-v1
 
       - name: Verify PyTorch Hub cache
-        shell: python
+        shell: bash
         run: |
+          python - <<'EOF'
           import os
           cache_dir = os.path.expanduser("~/.cache/torch/hub")
           if os.path.exists(cache_dir):
@@ -136,13 +141,14 @@ jobs:
             print(f"[OK] PyTorch Hub cache: {len(subdirs)} models")
           else:
             print("[INFO] PyTorch Hub cache empty - will download ResNet101 on first use")
+          EOF
 
       - name: Set up Conda (Miniforge)
         uses: conda-incubator/setup-miniconda@v3
         with:
           miniforge-version: latest
-          activate-environment: ""
-          auto-activate-base: true
+          activate-environment: base
+          auto-activate: true
           use-mamba: true
           conda-remove-defaults: true  # Suppress defaults channel warning
 
