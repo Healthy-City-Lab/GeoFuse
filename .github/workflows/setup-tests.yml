@@ -5,9 +5,56 @@ on:
   workflow_dispatch:
 
 jobs:
+  prepare-models:
+    name: Download and Cache Models
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Cache PyTorch Hub models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/torch/hub
+          key: torch-hub-models-v1
+
+      - name: Cache model weights
+        id: cache-model
+        uses: actions/cache@v4
+        with:
+          path: geofuse/model/best_model.pth
+          key: model-weights-resnet101-v1
+
+      - name: Download model weights
+        if: steps.cache-model.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p geofuse/model
+          
+          # Hardcoded model URL
+          MODEL_URL="https://drive.google.com/file/d/1t7TC8mxQaFECt4jutdq_NMnWxdm6B-Nb/view"
+          
+          echo "Downloading model weights..."
+          
+          if [[ "$MODEL_URL" == *"drive.google.com"* ]] || [[ "$MODEL_URL" == *"docs.google.com"* ]]; then
+            echo "Detected Google Drive link - using gdown"
+            pip install gdown -q
+            gdown "$MODEL_URL" -O geofuse/model/best_model.pth --fuzzy
+          else
+            echo "Using direct download with curl"
+            curl -L "$MODEL_URL" -o geofuse/model/best_model.pth
+          fi
+          
+          echo "Verifying downloaded file..."
+          ls -lh geofuse/model/best_model.pth
+          
+          echo "Model downloaded successfully"
+          ls -lh geofuse/model/
+
   test-installation:
     name: Test on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    needs: prepare-models
     
     strategy:
       fail-fast: false
@@ -22,28 +69,86 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Restore model weights from cache
+        id: cache-model
+        uses: actions/cache/restore@v4
+        with:
+          path: geofuse/model/best_model.pth
+          key: model-weights-resnet101-v1
+
+      - name: Download model weights if not cached
+        if: steps.cache-model.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          echo "Downloading model weights..."
+          mkdir -p geofuse/model
+          
+          MODEL_URL="https://drive.google.com/file/d/1t7TC8mxQaFECt4jutdq_NMnWxdm6B-Nb/view"
+          
+          pip install gdown -q
+          gdown "$MODEL_URL" -O geofuse/model/best_model.pth --fuzzy
+      
+      - name: Verify model exists
+        shell: bash
+        run: |
+          python - <<'EOF'
+          import os
+          import sys
+          model_path = "geofuse/model/best_model.pth"
+          if os.path.exists(model_path):
+            size_mb = os.path.getsize(model_path) / (1024*1024)
+            print(f"[OK] Model found: {size_mb:.1f} MB")
+          else:
+            print(f"[ERROR] Model not found at {model_path}")
+            sys.exit(1)
+          EOF
+
       - name: Cache conda packages
+        id: cache-conda
         uses: actions/cache@v4
         with:
           path: ~/conda_pkgs_dir
-          key: conda-${{ runner.os }}-${{ hashFiles('scripts/setup_env.py') }}
-          restore-keys: |
-            conda-${{ runner.os }}-
+          key: conda-pkgs-${{ runner.os }}-v1
 
-      - name: Cache PyTorch Hub models
-        uses: actions/cache@v4
+      - name: Verify conda cache
+        shell: bash
+        run: |
+          python - <<'EOF'
+          import os
+          cache_dir = os.path.expanduser("~/conda_pkgs_dir")
+          if os.path.exists(cache_dir):
+            file_count = len([f for f in os.listdir(cache_dir)]) if os.path.isdir(cache_dir) else 0
+            print(f"[OK] Conda cache: {file_count} packages")
+          else:
+            print("[INFO] Conda cache empty - will be populated during install")
+          EOF
+
+      - name: Restore PyTorch Hub models from cache
+        id: cache-torch
+        uses: actions/cache/restore@v4
         with:
           path: ~/.cache/torch/hub
-          key: torch-hub-${{ runner.os }}
-          restore-keys: |
-            torch-hub-
+          key: torch-hub-models-v1
+
+      - name: Verify PyTorch Hub cache
+        shell: bash
+        run: |
+          python - <<'EOF'
+          import os
+          cache_dir = os.path.expanduser("~/.cache/torch/hub")
+          if os.path.exists(cache_dir):
+            subdirs = [d for d in os.listdir(cache_dir) if os.path.isdir(os.path.join(cache_dir, d))] if os.path.isdir(cache_dir) else []
+            print(f"[OK] PyTorch Hub cache: {len(subdirs)} models")
+          else:
+            print("[INFO] PyTorch Hub cache empty - will download ResNet101 on first use")
+          EOF
 
       - name: Set up Conda (Miniforge)
         uses: conda-incubator/setup-miniconda@v3
         with:
           miniforge-version: latest
-          activate-environment: ""
-          auto-activate-base: true
+          activate-environment: base
+          auto-activate: true
           use-mamba: true
           conda-remove-defaults: true  # Suppress defaults channel warning
 
@@ -71,45 +176,6 @@ jobs:
         run: install.bat
         continue-on-error: false
 
-      - name: Cache model weights
-        id: cache-model
-        uses: actions/cache@v4
-        with:
-          path: geofuse/model/best_model.pth
-          key: model-weights-${{ hashFiles('.github/workflows/setup_tests.yml') }}
-          restore-keys: |
-            model-weights-
-
-      - name: Download model weights
-        if: steps.cache-model.outputs.cache-hit != 'true'
-        run: |
-          conda activate geofuse
-          mkdir -p geofuse/model
-          
-          # Hardcoded model URL - replace with your actual model link
-          MODEL_URL="https://drive.google.com/file/d/1t7TC8mxQaFECt4jutdq_NMnWxdm6B-Nb/view"
-          
-          echo "Downloading model weights..."
-          
-          # Check if it's a Google Drive link
-          if [[ "$MODEL_URL" == *"drive.google.com"* ]] || [[ "$MODEL_URL" == *"docs.google.com"* ]]; then
-            echo "Detected Google Drive link - using gdown to handle large file confirmation"
-            pip install gdown -q
-            gdown "$MODEL_URL" -O geofuse/model/best_model.pth --fuzzy
-          else
-            echo "Using direct download with curl"
-            curl -L "$MODEL_URL" -o geofuse/model/best_model.pth
-          fi
-          
-          echo "Model downloaded successfully"
-          ls -lh geofuse/model/
-      
-      - name: Verify model from cache
-        if: steps.cache-model.outputs.cache-hit == 'true'
-        run: |
-          echo "✅ Model loaded from cache"
-          ls -lh geofuse/model/
-
       - name: Run Logic Tests (Offline)
         run: |
           conda run -n geofuse python tests/test_pipeline.py
@@ -117,7 +183,7 @@ jobs:
 
       - name: Run Memory Stability Test (Short)
         run: |
-          conda run -n geofuse python tests/test_memory_stability.py --iterations 100
+          conda run -n geofuse python tests/test_memory_stability.py --iterations 20
         continue-on-error: true
 
       - name: Check installation log

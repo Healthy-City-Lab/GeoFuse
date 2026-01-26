@@ -55,8 +55,46 @@ The toolbox can be run in two modes: a user-friendly **Streamlit Dashboard** for
 
 * **Interactive Map**: Visualize results immediately with Folium/Leaflet.
 * **Results Inspector**: Toggle between multiple loaded datasets and visualize specific layers (Points, Vegetation Raster, Terrain Raster) with dynamic opacity controls.
-<!-- TODO: METRIC_FUSION - Complete implementation of composite greenery index with spatial outcome optimization -->
-* **Metric Fusion**: (In Development) Combines top-down (NDVI) and eye-level (GVI) metrics for a holistic "Composite Greenery Index" score, tailored towards a specific spatial outcome variable.
+
+* **Metric Fusion Engine**: Combines top-down (NDVI) and eye-level (GVI) metrics for a holistic "Composite Greenery Index" score, optimized towards spatial health/environmental outcomes.
+
+  * **Automated Metric Alignment**: Automatically downloads and spatially aligns GVI (vegetation/terrain) and NDVI metrics within your study area if not provided.
+  * **Dual Input Support**: Works with both **point-based** targets (GeoJSON with health/environmental data) and **raster-based** targets (GeoTIFF continuous surfaces).
+  * **Bayesian Optimization**: Uses **Optuna** with TPE sampling to optimize 9 parameters:
+    * **Weights**: Vegetation, Terrain, NDVI contribution (0-100%, sum=100)
+    * **Spatial Aggregation**: Circular buffer radii (100m to user-defined buffer distance, step=50m)
+    * **Statistical Functions**: Mean, median, or percentile-based aggregation
+    * **Separate Controls**: Independent radius and aggregation settings for each metric component
+  
+  * **Robust Cross-Validation**: 
+    * **Stratified K-Fold CV**: Ensures representative sampling across target value distribution
+    * **Held-Out Test Set**: 20% of data reserved for final validation
+    * **Statistical Validation**: Benjamini-Hochberg FDR correction for correlation-based metrics
+    * **Pruning Support**: Median, Hyperband, or Successive Halving pruners to accelerate optimization
+  
+  * **Multi-Metric Optimization**: Supports multiple objective functions:
+    * **Pearson Correlation**: Linear relationship strength (with p-value validation)
+    * **Spearman Correlation**: Monotonic relationship strength (with p-value validation)
+    * **R² Score**: Coefficient of determination
+    * **RMSE**: Root Mean Squared Error (minimization)
+    * **Mutual Information**: Non-linear dependency measure
+  
+  * **Intelligent Caching**: 
+    * **Deterministic Filenames**: Cache files named based on target area hash
+    * **Resume Support**: Reuses downloaded metrics for identical study areas
+    * **Multi-Band Optimization**: Stores GVI vegetation and terrain in single raster for efficiency
+  
+  * **Comprehensive Reporting**: Automatically generates:
+    * **Optuna Visualizations**: Optimization history, parameter importance, parallel coordinates, contour plots, EDF, slice plots, timeline
+    * **Robust Trial Analysis**: Separate reports for statistically significant trials vs. all trials
+    * **Best Parameters**: JSON export with optimal weights, radii, and aggregation functions
+    * **Test Set Evaluation**: Final performance on held-out data with statistical significance
+  
+  * **Composite Map Generation**: 
+    * **Ensemble Averaging**: Averages parameters from top 20% of robust trials
+    * **Grid-Aligned Output**: Generates composite greenery raster matching target resolution
+    * **Multi-Resolution Support**: 10m satellite resolution or custom grid spacing
+    * **Parameter Tracking**: Saves final averaged parameters alongside composite map
 
 ### 4. High-Performance Computing (HPC) Integration
 
@@ -282,7 +320,42 @@ For each input file processed through the NDVI pipeline:
   * Band 1: NDVI values extracted from Sentinel-2 imagery
   * NoData values represented as -9999
 
-<!-- TODO: FUSION_ENGINE_OUTPUTS - Add Fusion Engine output specifications here when implemented -->
+### Fusion Engine Outputs
+
+For each optimization run through the Metric Fusion pipeline:
+
+* **Composite Greenery Map**:
+  * **`composite_greenery.tif`**: Single-band GeoTIFF containing the optimized composite greenery index
+  * **`composite_greenery_params.json`**: Final averaged parameters used to generate the composite map
+    * Weights for vegetation, terrain, and NDVI components
+    * Optimal buffer radii for each metric
+    * Aggregation statistics (mean/median/percentile) for each component
+
+* **Optimization Study Results** (`output_results/fusion/study_results/`):
+  
+  * **Robust Trials Analysis** (`robust_trials/`):
+    * **`optimization_report.txt`**: Summary of statistically significant trials with performance metrics
+    * **`best_params.json`**: Best performing parameter set from robust trials
+    * **Optuna Visualizations**:
+      * `optimization_history.html`: Trial value progression over time
+      * `param_importances.html`: Feature importance analysis
+      * `parallel_coordinates_all.html` & `parallel_coordinates_weights.html`: Multi-dimensional parameter visualization
+      * `contour_weights.html`: 2D parameter interaction heatmaps
+      * `slice_plot_weights.html`: 1D parameter impact plots
+      * `edf.html`: Empirical Distribution Function of trial values
+      * `rank.html`: Trial ranking visualization
+      * `timeline.html`: Trial execution timeline
+  
+  * **All Trials Analysis** (`all_trials/`):
+    * Contains same visualizations as robust trials for debugging and comparison
+    * Includes all trials regardless of statistical significance
+
+* **Cached Metrics** (`output_results/fusion_cache/`):
+  * **`cache-veg-{hash}.geojson`**: Cached GVI vegetation component
+  * **`cache-terrain-{hash}.geojson`**: Cached GVI terrain component  
+  * **`cache-ndvi-{hash}.tif`**: Cached NDVI raster
+  * **`cache-gvi_combined-{hash}.tif`**: Multi-band raster (Band 1: Vegetation, Band 2: Terrain)
+  * Cache files are automatically reused for identical study areas to avoid redundant downloads
 
 ---
 
