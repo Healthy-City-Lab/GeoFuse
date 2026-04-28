@@ -5,7 +5,7 @@ import tempfile
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
 import folium
 import geopandas as gpd
@@ -331,6 +331,7 @@ def render(output_dir: str) -> None:
 
         gvi_path = None
         ndvi_path = None
+        gvi_api_key_input = ""
 
         if metric_mode == "Use Loaded Results":
             col_gvi_sel, col_ndvi_sel = st.columns(2)
@@ -422,13 +423,33 @@ def render(output_dir: str) -> None:
             st.info(
                 "📥 Metrics will be automatically downloaded when optimization runs"
             )
+            col_ad1, col_ad2 = st.columns(2)
+            with col_ad1:
+                ndvi_auto_start = st.date_input(
+                    "NDVI Start Date",
+                    value=date(2023, 6, 1),
+                    help="Start of the date range for NDVI auto-download",
+                )
+            with col_ad2:
+                ndvi_auto_end = st.date_input(
+                    "NDVI End Date",
+                    value=date(2023, 9, 30),
+                    help="End of the date range for NDVI auto-download",
+                )
             cache_metrics = st.checkbox(
                 "Cache Metrics to Disk",
                 value=True,
                 help="Save processed metrics to output_results/fusion_cache for reuse",
             )
+            gvi_api_key_input = st.text_input(
+                "Street View API Key (optional)",
+                type="password",
+                help="Leave blank to use the package scraper",
+            )
 
         if metric_mode != "Auto-Download":
+            ndvi_auto_start = date(2023, 6, 1)
+            ndvi_auto_end = date(2023, 9, 30)
             cache_metrics = False
 
         st.divider()
@@ -687,7 +708,7 @@ def render(output_dir: str) -> None:
                     "type": "fusion",
                 }
 
-                gvi_api_key = None
+                gvi_api_key = (gvi_api_key_input or None) if metric_mode == "Auto-Download" else None
                 ndvi_project_id = None
 
                 thread = threading.Thread(
@@ -710,8 +731,8 @@ def render(output_dir: str) -> None:
                         objective_metric,
                         pruner_type,
                         gvi_api_key,
-                        "2023-06-01",
-                        "2023-09-30",
+                        ndvi_auto_start.isoformat(),
+                        ndvi_auto_end.isoformat(),
                         ndvi_project_id,
                         output_dir,
                         st.session_state.jobs,

@@ -61,6 +61,62 @@ class NDVIEngine:
             .map(self.prep_ndvi)
         )
 
+    def _reproject_tile_to_4326(self, src_path: str, dst_path: str, resolution: int) -> None:
+        """Reproject a 3857 GeoTIFF to 4326 with per-latitude aspect-ratio correction.
+
+        Downloads from Earth Engine arrive in EPSG:3857 (metres). A naive
+        reprojection produces non-square pixels in geographic space. This method
+        calculates the exact degree-per-metre scale at the tile's centroid
+        latitude and forces an explicit square-metre output resolution.
+        """
+        from rasterio.warp import transform as warp_transform
+
+        with rasterio.open(src_path) as src:
+            left, bottom, right, top = array_bounds(
+                src.height, src.width, src.transform
+            )
+            cx, cy = (left + right) / 2, (bottom + top) / 2
+            lon_c, lat_c = warp_transform(src.crs, "EPSG:4326", [cx], [cy])
+            avg_lat = lat_c[0]
+
+            lat_rad = np.radians(avg_lat)
+            m_per_deg_lat = 111132.954 - 559.822 * np.cos(2 * lat_rad)
+            m_per_deg_lon = 111412.84 * np.cos(lat_rad) - 93.5 * np.cos(3 * lat_rad)
+
+            res_x_deg = resolution / m_per_deg_lon
+            res_y_deg = resolution / m_per_deg_lat
+
+            dst_transform, width, height = calculate_default_transform(
+                src.crs,
+                "EPSG:4326",
+                src.width,
+                src.height,
+                *src.bounds,
+                resolution=(res_x_deg, res_y_deg),
+            )
+
+            kwargs = src.meta.copy()
+            kwargs.update(
+                {
+                    "crs": "EPSG:4326",
+                    "transform": dst_transform,
+                    "width": width,
+                    "height": height,
+                }
+            )
+
+            with rasterio.open(dst_path, "w", **kwargs) as dst:
+                for i in range(1, src.count + 1):
+                    reproject(
+                        source=rasterio.band(src, i),
+                        destination=rasterio.band(dst, i),
+                        src_transform=src.transform,
+                        src_crs=src.crs,
+                        dst_transform=dst_transform,
+                        dst_crs="EPSG:4326",
+                        resampling=Resampling.nearest,
+                    )
+
     def download_and_process(
         self,
         geometry,
@@ -152,60 +208,8 @@ class NDVIEngine:
                 file_per_band=False,
             )
 
-            # 4. Reproject to EPSG:4326 with ASPECT RATIO CORRECTION
-            # This is the step that fixes the "irregular/rectangular" pixels.
-            with rasterio.open(temp_tif) as src:
-                # Calculate centroid latitude to determine degrees-per-meter
-                left, bottom, right, top = array_bounds(
-                    src.height, src.width, src.transform
-                )
-                # Convert 3857 centers to Lat/Lon
-                from rasterio.warp import transform
-
-                cx, cy = (left + right) / 2, (bottom + top) / 2
-                lon_c, lat_c = transform(src.crs, "EPSG:4326", [cx], [cy])
-                avg_lat = lat_c[0]
-
-                # Calculate Metric-to-Degree factors (Same logic as GVI)
-                lat_rad = np.radians(avg_lat)
-                m_per_deg_lat = 111132.954 - 559.822 * np.cos(2 * lat_rad)
-                m_per_deg_lon = 111412.84 * np.cos(lat_rad) - 93.5 * np.cos(3 * lat_rad)
-
-                # Calculate target resolution in Degrees
-                res_x_deg = resolution / m_per_deg_lon
-                res_y_deg = resolution / m_per_deg_lat
-
-                # Create transform with EXPLICIT resolution
-                dst_transform, width, height = calculate_default_transform(
-                    src.crs,
-                    "EPSG:4326",
-                    src.width,
-                    src.height,
-                    *src.bounds,
-                    resolution=(res_x_deg, res_y_deg),  # <--- Force Square Meters
-                )
-
-                kwargs = src.meta.copy()
-                kwargs.update(
-                    {
-                        "crs": "EPSG:4326",
-                        "transform": dst_transform,
-                        "width": width,
-                        "height": height,
-                    }
-                )
-
-                with rasterio.open(final_tif, "w", **kwargs) as dst:
-                    for i in range(1, src.count + 1):
-                        reproject(
-                            source=rasterio.band(src, i),
-                            destination=rasterio.band(dst, i),
-                            src_transform=src.transform,
-                            src_crs=src.crs,
-                            dst_transform=dst_transform,
-                            dst_crs="EPSG:4326",
-                            resampling=Resampling.nearest,
-                        )
+            # 4. Reproject to EPSG:4326 with aspect-ratio correction
+            self._reproject_tile_to_4326(temp_tif, final_tif, resolution)
 
             if os.path.exists(temp_tif):
                 os.remove(temp_tif)
@@ -329,58 +333,7 @@ class NDVIEngine:
                     )
 
                     # Reproject to EPSG:4326 with aspect ratio correction
-                    with rasterio.open(tile_temp) as src:
-                        # Calculate centroid for this tile
-                        from rasterio.transform import array_bounds
-                        from rasterio.warp import transform
-
-                        left, bottom, right, top = array_bounds(
-                            src.height, src.width, src.transform
-                        )
-                        cx, cy = (left + right) / 2, (bottom + top) / 2
-                        lon_c, lat_c = transform(src.crs, "EPSG:4326", [cx], [cy])
-                        avg_lat = lat_c[0]
-
-                        # Calculate metric-to-degree factors
-                        lat_rad = np.radians(avg_lat)
-                        m_per_deg_lat = 111132.954 - 559.822 * np.cos(2 * lat_rad)
-                        m_per_deg_lon = 111412.84 * np.cos(lat_rad) - 93.5 * np.cos(
-                            3 * lat_rad
-                        )
-
-                        res_x_deg = resolution / m_per_deg_lon
-                        res_y_deg = resolution / m_per_deg_lat
-
-                        dst_transform, width, height = calculate_default_transform(
-                            src.crs,
-                            "EPSG:4326",
-                            src.width,
-                            src.height,
-                            *src.bounds,
-                            resolution=(res_x_deg, res_y_deg),
-                        )
-
-                        kwargs = src.meta.copy()
-                        kwargs.update(
-                            {
-                                "crs": "EPSG:4326",
-                                "transform": dst_transform,
-                                "width": width,
-                                "height": height,
-                            }
-                        )
-
-                        with rasterio.open(tile_final, "w", **kwargs) as dst:
-                            for i in range(1, src.count + 1):
-                                reproject(
-                                    source=rasterio.band(src, i),
-                                    destination=rasterio.band(dst, i),
-                                    src_transform=src.transform,
-                                    src_crs=src.crs,
-                                    dst_transform=dst_transform,
-                                    dst_crs="EPSG:4326",
-                                    resampling=Resampling.nearest,
-                                )
+                    self._reproject_tile_to_4326(tile_temp, tile_final, resolution)
 
                     tile_files.append(tile_final)
 

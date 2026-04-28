@@ -26,8 +26,10 @@ if parent_dir not in sys.path:
 
 from streetview import get_streetview, search_panoramas
 
+from geofuse.core import generate_raster_grid
 from geofuse.gvi import GVIEngine
 from geofuse.ndvi import NDVIEngine
+from geofuse.vision import get_best_device
 
 warnings.filterwarnings("ignore")
 
@@ -88,8 +90,6 @@ def generate_gvi_points(config_df, resolution_m):
 
     print(f"[Rank 0] Generating GVI sampling grid for {len(gvi_tasks)} tasks...")
 
-    from rasterio.transform import from_bounds, xy
-
     for _, row in gvi_tasks.iterrows():
         name = row["name"]
         suffix = row["date_suffix"]
@@ -109,38 +109,7 @@ def generate_gvi_points(config_df, resolution_m):
             elif gdf.crs.to_epsg() != 4326:
                 gdf = gdf.to_crs("EPSG:4326")
 
-            minx, miny, maxx, maxy = gdf.total_bounds
-
-            # Metric grid estimation
-            center_lat = (miny + maxy) / 2.0
-            lat_rad = np.radians(center_lat)
-            m_per_deg_lat = 111132.92 - 559.82 * np.cos(2 * lat_rad)
-            m_per_deg_lon = 111412.84 * np.cos(lat_rad) - 93.5 * np.cos(3 * lat_rad)
-
-            res_x = resolution_m / m_per_deg_lon
-            res_y = resolution_m / m_per_deg_lat
-
-            width = int(np.ceil((maxx - minx) / res_x))
-            height = int(np.ceil((maxy - miny) / res_y))
-
-            transform = from_bounds(
-                minx,
-                miny,
-                minx + (width * res_x),
-                miny + (height * res_y),
-                width,
-                height,
-            )
-            cols, rows = np.meshgrid(np.arange(width), np.arange(height))
-            xs, ys = xy(transform, rows.flatten(), cols.flatten(), offset="center")
-
-            df_pts = pd.DataFrame({"x": xs, "y": ys})
-            gdf_pts = gpd.GeoDataFrame(
-                df_pts, geometry=gpd.points_from_xy(df_pts.x, df_pts.y), crs="EPSG:4326"
-            )
-
-            # Clip
-            gdf_clipped = gpd.sjoin(gdf_pts, gdf, how="inner", predicate="intersects")
+            gdf_clipped, _ = generate_raster_grid(gdf, resolution_m)
 
             # Metadata
             gdf_clipped["task_id"] = unique_name  # Unique ID for saving later
@@ -199,6 +168,12 @@ def main():
     )
     parser.add_argument(
         "--api_key", type=str, default=None, help="Street View API Key."
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Compute device override (e.g. 'cuda', 'cpu'). Defaults to auto-select.",
     )
 
     # HPC Tuning
@@ -449,8 +424,9 @@ def main():
     # --------------------------------------------------------------------------
     else:
         try:
+            device = args.device if args.device else str(get_best_device())
             engine = GVIEngine(
-                model_path=args.model_path, device="cuda", api_key=args.api_key
+                model_path=args.model_path, device=device, api_key=args.api_key
             )
         except Exception as e:
             # If init fails, sleep to avoid crashing everything immediately
