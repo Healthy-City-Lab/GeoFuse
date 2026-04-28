@@ -133,10 +133,10 @@ class NDVIEngine:
                 f"[NDVI] Area size: {width_km:.1f}x{height_km:.1f} km. Single download..."
             )
             return self._download_single(
-                ndvi_median, aoi, output_name, resolution, folder
+                ndvi_median, aoi, geometry, output_name, resolution, folder
             )
 
-    def _download_single(self, ndvi_median, aoi, output_name, resolution, folder):
+    def _download_single(self, ndvi_median, aoi, geometry, output_name, resolution, folder):
         """Download NDVI as a single tile (for small areas)."""
         # Export as EPSG:3857 (Meters) first
         temp_tif = os.path.join(folder, f"temp_{output_name}.tif")
