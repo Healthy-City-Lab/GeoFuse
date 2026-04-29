@@ -12,7 +12,6 @@ from tqdm import tqdm
 
 # Add parent path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-import geofuse
 from geofuse.gvi import GVIEngine
 
 

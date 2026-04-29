@@ -39,17 +39,7 @@ PIP_PACKAGES = [
     "geemap==0.36.6",
     "earthengine-api==1.7.4",
     # Utility
-    "dominate==2.9.1",
     "isort==7.0.0",
-]
-
-# 3b. LEGACY PIP PACKAGES (optional — failure is a warning, not an abort)
-# visdom 0.2.4 setup.py calls `import pkg_resources`, which setuptools 80+
-# no longer exposes as a top-level importable module on Python 3.12.
-# It is only used by dl_core for training visualisation; GeoFuse inference
-# and all automated tests work without it.
-PIP_PACKAGES_LEGACY = [
-    "visdom==0.2.4",
 ]
 
 GIT_PACKAGES = [
@@ -180,7 +170,7 @@ def main(env_name, log_file=None):
     print(f"[0/6] Checking environment '{env_name}'...")
     # Check if environment exists
     env_check = subprocess.run(
-        f"conda env list", shell=True, capture_output=True, text=True
+        "conda env list", shell=True, capture_output=True, text=True
     )
     env_exists = env_name in env_check.stdout
 
@@ -194,7 +184,7 @@ def main(env_name, log_file=None):
         shell=True,
         check=True,
     )
-    print(f"[SUCCESS] Environment created successfully\n")
+    print("[SUCCESS] Environment created successfully\n")
 
     # 1. Prepare Conda List (Core + OS-Specific MPI)
     mpi_pkgs = get_mpi_packages(system)
@@ -206,7 +196,7 @@ def main(env_name, log_file=None):
     run_cmd(f"{solver} install -n {env_name} -y -c conda-forge {conda_str}", log_file)
 
     # 2. Install PyTorch
-    print(f"[2/6] Installing PyTorch Acceleration...")
+    print("[2/6] Installing PyTorch Acceleration...")
     if system == "Windows" or system == "Linux":
         cmd = f"{solver} install -n {env_name} -y {PYTORCH_VERSION} pytorch-cuda=12.1 -c pytorch -c nvidia"
     else:
@@ -216,7 +206,7 @@ def main(env_name, log_file=None):
     run_cmd(cmd, log_file)
 
     # 3. Install Pip Libraries
-    print(f"[3/6] Installing Python Libraries...")
+    print("[3/6] Installing Python Libraries...")
     env_python = get_env_python(env_name)
     # Upgrade pip/setuptools first so the build backend has pkg_resources available
     run_cmd(
@@ -226,31 +216,18 @@ def main(env_name, log_file=None):
     pip_str = " ".join(PIP_PACKAGES)
     run_cmd(f'"{env_python}" -m pip install {pip_str}', log_file)
 
-    # 3b. Legacy packages — optional, failure is a warning not an abort.
-    # visdom 0.2.4 cannot be built on Python 3.12 + setuptools 80+ because
-    # its setup.py uses pkg_resources which is no longer importable there.
-    if PIP_PACKAGES_LEGACY:
-        print(f"[3b/6] Installing Legacy Libraries (optional, no build isolation)...")
-        legacy_str = " ".join(PIP_PACKAGES_LEGACY)
-        run_cmd(
-            f'"{env_python}" -m pip install --no-build-isolation {legacy_str}',
-            log_file,
-            optional=True,
-        )
-        print("[INFO] Legacy install complete (failures above are non-fatal).")
-
     # 4. Install Git Packages
-    print(f"[4/6] Installing Custom Git Packages...")
+    print("[4/6] Installing Custom Git Packages...")
     for git_url in GIT_PACKAGES:
         run_cmd(f'"{env_python}" -m pip install {git_url}', log_file)
 
     # 5. Editable Install
-    print(f"[5/6] Performing Editable Install of GeoFuse...")
+    print("[5/6] Performing Editable Install of GeoFuse...")
     root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     run_cmd(f'"{env_python}" -m pip install -e "{root_dir}"', log_file)
 
     # 6. Verify Installation
-    print(f"[6/6] Verifying Installation...")
+    print("[6/6] Verifying Installation...")
 
     env_python = get_env_python(env_name)
 

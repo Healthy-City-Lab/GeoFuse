@@ -11,9 +11,9 @@ import geopandas as gpd
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 import rasterio
 import streamlit as st
+from helpers import apply_buffer_m, generate_raster_grid, load_clean_gdf
 from PIL import Image as PILImage
 from rasterio.transform import array_bounds
 from streamlit.runtime.scriptrunner import add_script_run_ctx
@@ -21,8 +21,6 @@ from streamlit_folium import st_folium
 
 from geofuse.gvi import GVIEngine
 from geofuse.vision import get_best_device
-from helpers import apply_buffer_m, generate_raster_grid, load_clean_gdf
-
 
 # ---------------------------------------------------------------------------
 # Background worker (module-level)
@@ -41,9 +39,7 @@ def _job_worker(
                 return
 
             job_tracker_dict[job_id]["status"] = "Initializing..."
-            engine = _get_gvi_engine(
-                init_args["model_path"], init_args.get("api_key")
-            )
+            engine = _get_gvi_engine(init_args["model_path"], init_args.get("api_key"))
 
             current_accumulated = dataset_data["accumulated"]
             start_idx = len(current_accumulated)
@@ -151,9 +147,7 @@ def _get_gpu_lock():
 def _get_gvi_engine(model_path, api_key):
     best_device = get_best_device()
     st.info(f"🚀 Using device: {best_device}")
-    return GVIEngine(
-        model_path=model_path, device=str(best_device), api_key=api_key
-    )
+    return GVIEngine(model_path=model_path, device=str(best_device), api_key=api_key)
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +281,9 @@ def render(output_dir: str, parent_dir: str) -> None:
             key="gvi_buffer",
             help="Expand the study area boundary outward by this many metres before generating the sampling grid.",
         )
-        save_debug = st.checkbox("Save Raw Images & Masks", value=False, key="gvi_save_debug")
+        save_debug = st.checkbox(
+            "Save Raw Images & Masks", value=False, key="gvi_save_debug"
+        )
 
         uploaded_files = st.file_uploader(
             "Upload Study Areas", accept_multiple_files=True, key="gvi_up"
@@ -434,7 +430,11 @@ def render(output_dir: str, parent_dir: str) -> None:
                 folium.GeoJson(
                     d["raw"],
                     name=f"{fname} (study area)",
-                    style_function=lambda x: {"color": "#1a73e8", "weight": 2, "fill": False},
+                    style_function=lambda x: {
+                        "color": "#1a73e8",
+                        "weight": 2,
+                        "fill": False,
+                    },
                 ).add_to(m_input)
                 all_bounds.append(d["raw"].total_bounds)
                 if gvi_buffer > 0:
@@ -546,10 +546,15 @@ def render(output_dir: str, parent_dir: str) -> None:
         )
 
         raster_layer = st.radio(
-            "Background Raster", ["Vegetation", "Terrain"], horizontal=True, key="gvi_raster_layer"
+            "Background Raster",
+            ["Vegetation", "Terrain"],
+            horizontal=True,
+            key="gvi_raster_layer",
         )
         r_opacity = st.slider("Layer Opacity", 0.0, 1.0, 0.7, key="gvi_layer_opacity")
-        show_points = st.checkbox("Show Sample Points", value=False, key="gvi_show_points")
+        show_points = st.checkbox(
+            "Show Sample Points", value=False, key="gvi_show_points"
+        )
 
     with col_btm_right:
         st.subheader("Results Preview")

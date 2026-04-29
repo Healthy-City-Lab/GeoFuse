@@ -1,6 +1,5 @@
 import json
 import os
-import subprocess
 import tempfile
 
 import ee
@@ -12,7 +11,7 @@ import rasterio
 from rasterio.merge import merge
 from rasterio.transform import array_bounds
 from rasterio.warp import Resampling, calculate_default_transform, reproject
-from shapely.geometry import Point, box
+from shapely.geometry import box
 
 # TODO: NDVI_CACHE - Implement local caching of Earth Engine tiles to reduce API calls
 # TODO: NDVI_LANDSAT - Add Landsat 8/9 support alongside Sentinel-2
@@ -61,7 +60,9 @@ class NDVIEngine:
             .map(self.prep_ndvi)
         )
 
-    def _reproject_tile_to_4326(self, src_path: str, dst_path: str, resolution: int) -> None:
+    def _reproject_tile_to_4326(
+        self, src_path: str, dst_path: str, resolution: int
+    ) -> None:
         """Reproject a 3857 GeoTIFF to 4326 with per-latitude aspect-ratio correction.
 
         Downloads from Earth Engine arrive in EPSG:3857 (metres). A naive
@@ -192,7 +193,9 @@ class NDVIEngine:
                 ndvi_median, aoi, geometry, output_name, resolution, folder
             )
 
-    def _download_single(self, ndvi_median, aoi, geometry, output_name, resolution, folder):
+    def _download_single(
+        self, ndvi_median, aoi, geometry, output_name, resolution, folder
+    ):
         """Download NDVI as a single tile (for small areas)."""
         # Export as EPSG:3857 (Meters) first
         temp_tif = os.path.join(folder, f"temp_{output_name}.tif")

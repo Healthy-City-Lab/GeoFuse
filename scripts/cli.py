@@ -1,9 +1,7 @@
 #!/usr/bin/env python
-# coding: utf-8
 
 import argparse
 import gc
-import json
 import os
 import signal
 import sys
@@ -415,7 +413,7 @@ def main():
             subset.to_file(out_path, driver="GeoJSON")
             print(f"  -> Saved {out_name}")
 
-        print(f"[Done] All tasks completed.")
+        print("[Done] All tasks completed.")
         for w in range(1, size):
             comm.send(([], 0), dest=w, tag=TAG_ASSIGN)
 
@@ -428,7 +426,7 @@ def main():
             engine = GVIEngine(
                 model_path=args.model_path, device=device, api_key=args.api_key
             )
-        except Exception as e:
+        except Exception:
             # If init fails, sleep to avoid crashing everything immediately
             while True:
                 time.sleep(10)

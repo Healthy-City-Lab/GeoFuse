@@ -62,9 +62,9 @@ def _compute_buffered_extent(
         utm_crs = gdf.estimate_utm_crs()
         gdf_utm = gdf.to_crs(utm_crs)
         buffered_geom = gdf_utm.geometry.union_all().buffer(buffer_meters)
-        return gpd.GeoDataFrame(
-            {"geometry": [buffered_geom]}, crs=utm_crs
-        ).to_crs("EPSG:4326")
+        return gpd.GeoDataFrame({"geometry": [buffered_geom]}, crs=utm_crs).to_crs(
+            "EPSG:4326"
+        )
     except Exception:
         return None
 
@@ -317,9 +317,7 @@ def render(output_dir: str) -> None:
                     numeric_cols = preview_gdf.select_dtypes(
                         include=[np.number]
                     ).columns.tolist()
-                    st.info(
-                        f"📍 Detected: **GeoJSON** with {len(preview_gdf)} points"
-                    )
+                    st.info(f"📍 Detected: **GeoJSON** with {len(preview_gdf)} points")
                     target_feature = st.selectbox(
                         "Target Attribute (Outcome Variable)",
                         options=numeric_cols,
@@ -386,11 +384,17 @@ def render(output_dir: str) -> None:
                     return [lbl for lbl, _ in file_list], []
                 covering, non_covering = [], []
                 for lbl, path in file_list:
-                    (covering if _check_coverage(path, bext) else non_covering).append(lbl)
+                    (covering if _check_coverage(path, bext) else non_covering).append(
+                        lbl
+                    )
                 return covering, non_covering
 
-            gvi_covering, gvi_outside = _filter_by_coverage(all_gvi_files, buffered_extent)
-            ndvi_covering, ndvi_outside = _filter_by_coverage(all_ndvi_files, buffered_extent)
+            gvi_covering, gvi_outside = _filter_by_coverage(
+                all_gvi_files, buffered_extent
+            )
+            ndvi_covering, ndvi_outside = _filter_by_coverage(
+                all_ndvi_files, buffered_extent
+            )
 
             if buffered_extent is None:
                 st.info(
@@ -406,21 +410,23 @@ def render(output_dir: str) -> None:
                     if buffered_extent is not None:
                         st.caption(
                             f"🌿 GVI: {len(gvi_covering)} cover target"
-                            + (
-                                f", {len(gvi_outside)} outside"
-                                if gvi_outside
-                                else ""
-                            )
+                            + (f", {len(gvi_outside)} outside" if gvi_outside else "")
                         )
-                    options_gvi = [None] + gvi_covering + (
-                        ["── outside target ──"] + gvi_outside if gvi_outside else []
+                    options_gvi = (
+                        [None]
+                        + gvi_covering
+                        + (
+                            ["── outside target ──"] + gvi_outside
+                            if gvi_outside
+                            else []
+                        )
                     )
                     gvi_selection = st.selectbox(
                         "🌿 Select GVI Result",
                         options=options_gvi,
-                        format_func=lambda x: "(Optional — will auto-download)"
-                        if x is None
-                        else x,
+                        format_func=lambda x: (
+                            "(Optional — will auto-download)" if x is None else x
+                        ),
                         key="fusion_gvi_select",
                     )
                     if gvi_selection and not gvi_selection.startswith("──"):
@@ -428,7 +434,9 @@ def render(output_dir: str) -> None:
                         if not os.path.exists(gvi_path):
                             st.warning("⚠️ File not found on disk.")
                             gvi_path = None
-                        elif buffered_extent is not None and gvi_selection in gvi_outside:
+                        elif (
+                            buffered_extent is not None and gvi_selection in gvi_outside
+                        ):
                             st.warning(
                                 "⚠️ This result does not fully cover the buffered "
                                 "target area — spatial alignment may be incomplete."
@@ -443,21 +451,23 @@ def render(output_dir: str) -> None:
                     if buffered_extent is not None:
                         st.caption(
                             f"🛰️ NDVI: {len(ndvi_covering)} cover target"
-                            + (
-                                f", {len(ndvi_outside)} outside"
-                                if ndvi_outside
-                                else ""
-                            )
+                            + (f", {len(ndvi_outside)} outside" if ndvi_outside else "")
                         )
-                    options_ndvi = [None] + ndvi_covering + (
-                        ["── outside target ──"] + ndvi_outside if ndvi_outside else []
+                    options_ndvi = (
+                        [None]
+                        + ndvi_covering
+                        + (
+                            ["── outside target ──"] + ndvi_outside
+                            if ndvi_outside
+                            else []
+                        )
                     )
                     ndvi_selection = st.selectbox(
                         "🛰️ Select NDVI Result",
                         options=options_ndvi,
-                        format_func=lambda x: "(Optional — will auto-download)"
-                        if x is None
-                        else x,
+                        format_func=lambda x: (
+                            "(Optional — will auto-download)" if x is None else x
+                        ),
                         key="fusion_ndvi_select",
                     )
                     if ndvi_selection and not ndvi_selection.startswith("──"):
@@ -465,7 +475,10 @@ def render(output_dir: str) -> None:
                         if not os.path.exists(ndvi_path):
                             st.warning("⚠️ File not found on disk.")
                             ndvi_path = None
-                        elif buffered_extent is not None and ndvi_selection in ndvi_outside:
+                        elif (
+                            buffered_extent is not None
+                            and ndvi_selection in ndvi_outside
+                        ):
                             st.warning(
                                 "⚠️ This result does not fully cover the buffered "
                                 "target area — spatial alignment may be incomplete."
@@ -619,9 +632,7 @@ def render(output_dir: str) -> None:
         st.subheader("Target Preview")
 
         if target_file and tmp_target_path:
-            m_fusion_preview = folium.Map(
-                location=[51.0447, -114.0719], zoom_start=10
-            )
+            m_fusion_preview = folium.Map(location=[51.0447, -114.0719], zoom_start=10)
 
             try:
                 if is_geojson:
@@ -680,9 +691,7 @@ def render(output_dir: str) -> None:
                         valid_data = arr[(arr != src.nodata) & ~np.isnan(arr)]
                         if len(valid_data) > 0:
                             vmin, vmax = np.percentile(valid_data, [2, 98])
-                            norm_data = np.clip(
-                                (arr - vmin) / (vmax - vmin), 0, 1
-                            )
+                            norm_data = np.clip((arr - vmin) / (vmax - vmin), 0, 1)
                             cmap = plt.get_cmap("RdYlGn")
                             colored = cmap(norm_data)
                             mask = (arr == src.nodata) | np.isnan(arr)
@@ -737,7 +746,9 @@ def render(output_dir: str) -> None:
         )
     with col_run2:
         if st.session_state.fusion_results:
-            if st.button("📊 Export Results", use_container_width=True, key="fusion_export"):
+            if st.button(
+                "📊 Export Results", use_container_width=True, key="fusion_export"
+            ):
                 result_df = st.session_state.fusion_results["composite_df"]
                 export_gdf = gpd.GeoDataFrame(
                     result_df,
@@ -765,11 +776,7 @@ def render(output_dir: str) -> None:
         elif is_geojson and not target_feature:
             st.error("❌ Please select a target attribute for the GeoJSON target")
         else:
-            if (
-                metric_mode == "Use Loaded Results"
-                and not gvi_path
-                and not ndvi_path
-            ):
+            if metric_mode == "Use Loaded Results" and not gvi_path and not ndvi_path:
                 st.error(
                     "❌ No metrics selected. Please select GVI/NDVI results or "
                     "switch to Auto-Download mode."
@@ -808,7 +815,11 @@ def render(output_dir: str) -> None:
                     "type": "fusion",
                 }
 
-                gvi_api_key = (gvi_api_key_input or None) if metric_mode == "Auto-Download" else None
+                gvi_api_key = (
+                    (gvi_api_key_input or None)
+                    if metric_mode == "Auto-Download"
+                    else None
+                )
                 ndvi_project_id = None
 
                 thread = threading.Thread(
@@ -947,18 +958,14 @@ def render(output_dir: str) -> None:
                     f"{best_trial.user_attrs['train_pvalue']:.4e}"
                 )
             if "val_pvalue" in best_trial.user_attrs:
-                info_data["Val p-value"] = (
-                    f"{best_trial.user_attrs['val_pvalue']:.4e}"
-                )
+                info_data["Val p-value"] = f"{best_trial.user_attrs['val_pvalue']:.4e}"
 
             st.json(info_data)
 
         with col_detail2:
             st.markdown("**Optimization History**")
 
-            trial_values = [
-                t.value for t in engine.study.trials if t.value is not None
-            ]
+            trial_values = [t.value for t in engine.study.trials if t.value is not None]
             trial_numbers = [
                 t.number for t in engine.study.trials if t.value is not None
             ]
@@ -969,9 +976,7 @@ def render(output_dir: str) -> None:
 
                 running_best = []
                 current_best = (
-                    -np.inf
-                    if engine.study.direction.name == "MAXIMIZE"
-                    else np.inf
+                    -np.inf if engine.study.direction.name == "MAXIMIZE" else np.inf
                 )
                 for val in trial_values:
                     if engine.study.direction.name == "MAXIMIZE":

@@ -1,12 +1,9 @@
 import asyncio
 import os
-import time
 import warnings
 
 import geopandas as gpd
 import numpy as np
-import pandas as pd
-import rasterio
 from PIL import Image
 from rasterio.transform import from_origin
 from shapely.geometry import Point
@@ -161,7 +158,7 @@ class GVIEngine:
                     get_panorama_async(pano_id=panoid, zoom=1), timeout=timeout
                 )
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             print(f"[GVI] Timeout downloading panorama {panoid}")
             return None
         except Exception:
@@ -353,7 +350,7 @@ class GVIEngine:
             # Search for panoramas with timeout protection
             try:
                 candidates = search_panoramas(lat=search_lat, lon=search_lon)
-            except Exception as e:
+            except Exception:
                 # If search fails, skip this point
                 candidates = None
             final_panoid = None
@@ -438,7 +435,7 @@ class GVIEngine:
                     except KeyboardInterrupt:
                         # Re-raise keyboard interrupt to stop everything
                         raise
-                    except Exception as e:
+                    except Exception:
                         # Log and skip problematic panoramas
                         # Don't let one bad panorama block the entire process
                         continue

@@ -1,3 +1,4 @@
+import base64
 import glob
 import io
 import os
@@ -5,7 +6,6 @@ import threading
 import uuid
 from datetime import date, datetime, timedelta
 
-import base64
 import folium
 import geopandas as gpd
 import matplotlib.pyplot as plt
@@ -13,13 +13,12 @@ import numpy as np
 import pandas as pd
 import rasterio
 import streamlit as st
+from helpers import apply_buffer_m, load_clean_gdf
 from PIL import Image as PILImage
 from streamlit.runtime.scriptrunner import add_script_run_ctx
 from streamlit_folium import st_folium
 
 from geofuse.ndvi import NDVIEngine
-from helpers import apply_buffer_m, load_clean_gdf
-
 
 # ---------------------------------------------------------------------------
 # Background workers (module-level so they can be pickled / called in threads)
@@ -80,9 +79,9 @@ def _ndvi_column_worker(
         gdf["_parsed_date"] = pd.to_datetime(gdf[date_column], errors="coerce")
         gdf = gdf.dropna(subset=["_parsed_date"])
         if gdf.empty:
-            job_tracker_dict[job_id]["status"] = (
-                "Error: No valid dates found in the selected column."
-            )
+            job_tracker_dict[job_id][
+                "status"
+            ] = "Error: No valid dates found in the selected column."
             return
 
         unique_dates = sorted(gdf["_parsed_date"].dt.date.unique())
@@ -105,9 +104,9 @@ def _ndvi_column_worker(
             base_name = fname.replace(".geojson", "")
             tmp_name = f"{base_name}_{date_str}_tmp"
 
-            job_tracker_dict[job_id]["status"] = (
-                f"Processing date {idx + 1}/{n_dates}: {target_date}"
-            )
+            job_tracker_dict[job_id][
+                "status"
+            ] = f"Processing date {idx + 1}/{n_dates}: {target_date}"
             job_tracker_dict[job_id]["progress"] = (idx + 0.5) / n_dates
 
             result = engine.download_and_process(
@@ -151,17 +150,15 @@ def _ndvi_column_worker(
             )
             merged = merged.drop(columns=["_parsed_date"], errors="ignore")
             base_name = fname.replace(".geojson", "")
-            out_path = os.path.join(
-                output_dir, f"{base_name}_temporal_ndvi.geojson"
-            )
+            out_path = os.path.join(output_dir, f"{base_name}_temporal_ndvi.geojson")
             merged.to_file(out_path, driver="GeoJSON")
             dataset_data["results"] = merged
             job_tracker_dict[job_id]["status"] = "Completed"
             job_tracker_dict[job_id]["progress"] = 1.0
         else:
-            job_tracker_dict[job_id]["status"] = (
-                "Completed — no valid NDVI data could be extracted."
-            )
+            job_tracker_dict[job_id][
+                "status"
+            ] = "Completed — no valid NDVI data could be extracted."
             job_tracker_dict[job_id]["progress"] = 1.0
     except Exception as e:
         job_tracker_dict[job_id]["status"] = f"Error: {str(e)}"
@@ -187,8 +184,12 @@ def render(output_dir: str) -> None:
     with col_ndvi_top_left:
         st.subheader("Input Configuration")
 
-        cloud_pct = st.slider("Maximum Cloud Coverage (%)", 0, 100, 10, key="ndvi_cloud")
-        resolution = st.number_input("Resolution (m)", value=10, min_value=10, key="ndvi_res")
+        cloud_pct = st.slider(
+            "Maximum Cloud Coverage (%)", 0, 100, 10, key="ndvi_cloud"
+        )
+        resolution = st.number_input(
+            "Resolution (m)", value=10, min_value=10, key="ndvi_res"
+        )
         buffer_m = st.slider(
             "Download Buffer (m)",
             min_value=0,
@@ -296,12 +297,8 @@ def render(output_dir: str) -> None:
                         st.caption("One output file is produced per range.")
                         remove_idx = None
                         for i, (s, e) in enumerate(cfg["ranges"]):
-                            stored_s = st.session_state.get(
-                                f"ndvi_rs_{fname}_{i}", s
-                            )
-                            stored_e = st.session_state.get(
-                                f"ndvi_re_{fname}_{i}", e
-                            )
+                            stored_s = st.session_state.get(f"ndvi_rs_{fname}_{i}", s)
+                            stored_e = st.session_state.get(f"ndvi_re_{fname}_{i}", e)
                             range_invalid = stored_s >= stored_e
                             s_help = (
                                 "Start date is on or after the end date."
@@ -432,9 +429,7 @@ def render(output_dir: str) -> None:
 
         if st.button("🚀 Run NDVI Analysis", type="primary", key="ndvi_run"):
             if not ndvi_input_datasets:
-                st.warning(
-                    "Upload at least one study area to get started."
-                )
+                st.warning("Upload at least one study area to get started.")
             else:
                 if "jobs" not in st.session_state:
                     st.session_state.jobs = {}
@@ -456,24 +451,18 @@ def render(output_dir: str) -> None:
                     )
 
                     if not any([use_ranges, use_specific, use_column]):
-                        validation_errors.append(
-                            f"{fname}: No date mode is enabled."
-                        )
+                        validation_errors.append(f"{fname}: No date mode is enabled.")
                         continue
 
                     # --- Date Range jobs ---
                     if use_ranges:
                         for i, (s_def, e_def) in enumerate(
-                            cfg.get(
-                                "ranges", [(date(2023, 6, 1), date(2023, 9, 30))]
-                            )
+                            cfg.get("ranges", [(date(2023, 6, 1), date(2023, 9, 30))])
                         ):
                             start_d = st.session_state.get(
                                 f"ndvi_rs_{fname}_{i}", s_def
                             )
-                            end_d = st.session_state.get(
-                                f"ndvi_re_{fname}_{i}", e_def
-                            )
+                            end_d = st.session_state.get(f"ndvi_re_{fname}_{i}", e_def)
                             if start_d >= end_d:
                                 validation_errors.append(
                                     f"{fname}: Date range {i + 1} — "
@@ -631,7 +620,11 @@ def render(output_dir: str) -> None:
                 folium.GeoJson(
                     d["raw"],
                     name=fname,
-                    style_function=lambda x: {"color": "#1a73e8", "weight": 2, "fill": False},
+                    style_function=lambda x: {
+                        "color": "#1a73e8",
+                        "weight": 2,
+                        "fill": False,
+                    },
                 ).add_to(m_ndvi_input)
                 all_bounds.append(d["raw"].total_bounds)
                 if buffer_m > 0:
@@ -723,7 +716,9 @@ def render(output_dir: str) -> None:
             key="ndvi_inspector_select",
         )
         r_opacity = st.slider("Layer Opacity", 0.0, 1.0, 0.7, key="ndvi_op")
-        show_points = st.checkbox("Show Sample Points", value=False, key="ndvi_show_points")
+        show_points = st.checkbox(
+            "Show Sample Points", value=False, key="ndvi_show_points"
+        )
         val_container = st.empty()
 
     with col_ndvi_btm_right:
@@ -881,6 +876,4 @@ def render(output_dir: str) -> None:
                         except Exception:
                             pass
             if not val_found:
-                val_container.info(
-                    f"No valid NDVI data at ({lat:.4f}, {lon:.4f})."
-                )
+                val_container.info(f"No valid NDVI data at ({lat:.4f}, {lon:.4f}).")

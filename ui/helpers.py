@@ -5,7 +5,9 @@ import geopandas as gpd
 import pandas as pd
 import streamlit as st
 
-from geofuse.core import generate_raster_grid  # noqa: F401  (re-exported for UI modules)
+from geofuse.core import (  # noqa: F401  (re-exported for UI modules)
+    generate_raster_grid,
+)
 
 
 def apply_buffer_m(gdf: gpd.GeoDataFrame, buffer_m: float) -> gpd.GeoDataFrame:

@@ -5,13 +5,10 @@ import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import geopandas as gpd
-import numpy as np
-import torch
 from PIL import Image
 from shapely.geometry import box
 
 # search_panoramas is re-exported from geofuse.gvi (imported there from streetview)
-import geofuse  # Windows: load torch DLLs before GDAL-dependent libs
 from geofuse.gvi import GVIEngine, search_panoramas
 from geofuse.ndvi import NDVIEngine
 

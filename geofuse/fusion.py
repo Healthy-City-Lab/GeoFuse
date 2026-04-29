@@ -8,7 +8,6 @@ weighted combinations of NDVI and GVI metrics against target outcomes.
 import hashlib
 import logging
 import os
-from typing import Dict, List, Optional, Tuple, Union
 
 import geopandas as gpd
 import numpy as np
@@ -17,9 +16,7 @@ import pandas as pd
 import rasterio
 from optuna.pruners import HyperbandPruner, MedianPruner, SuccessiveHalvingPruner
 from optuna.samplers import CmaEsSampler, RandomSampler, TPESampler
-from rasterio.features import geometry_mask
 from rasterio.transform import from_origin, rowcol, xy
-from rasterio.warp import Resampling, reproject
 from scipy.stats import pearsonr, spearmanr
 from shapely.geometry import box
 from sklearn.metrics import mean_squared_error, mutual_info_score, r2_score
@@ -48,7 +45,7 @@ class MetricFusionEngine:
     def __init__(
         self,
         target_file: str,
-        target_feature: Optional[str] = None,
+        target_feature: str | None = None,
         target_band: int = 1,
         buffer_meters: float = 1500.0,
         n_bins: int = 5,
@@ -154,16 +151,16 @@ class MetricFusionEngine:
 
     def load_metrics(
         self,
-        veg_file: Optional[str] = None,
-        terrain_file: Optional[str] = None,
-        ndvi_file: Optional[str] = None,
+        veg_file: str | None = None,
+        terrain_file: str | None = None,
+        ndvi_file: str | None = None,
         cache_metrics: bool = True,
-        gvi_api_key: Optional[str] = None,
+        gvi_api_key: str | None = None,
         ndvi_start_date: str = "2023-01-01",
         ndvi_end_date: str = "2023-12-31",
-        ndvi_project_id: Optional[str] = None,
-        progress_callback: Optional[callable] = None,
-        cancel_callback: Optional[callable] = None,
+        ndvi_project_id: str | None = None,
+        progress_callback: callable | None = None,
+        cancel_callback: callable | None = None,
         force_download: bool = False,
     ) -> None:
         """
@@ -385,7 +382,7 @@ class MetricFusionEngine:
             return False
         return True
 
-    def _load_metric_file(self, filepath: str) -> Union[gpd.GeoDataFrame, Dict]:
+    def _load_metric_file(self, filepath: str) -> gpd.GeoDataFrame | dict:
         """Load metric from GeoJSON or GeoTIFF."""
         if filepath.endswith((".tif", ".tiff")):
             with rasterio.open(filepath) as src:
@@ -438,7 +435,6 @@ class MetricFusionEngine:
 
     def _get_cache_filename(self, metric_type: str, extension: str = ".geojson") -> str:
         """Generate deterministic cache filename based on target file and boundary."""
-        import hashlib
 
         # Use target filename as base
         filename = os.path.basename(self.target_file)
@@ -521,7 +517,7 @@ class MetricFusionEngine:
             dst.write(grid_values.astype(rasterio.float32), 1)
 
     def _save_points_as_multiband_raster(
-        self, points_gdf: gpd.GeoDataFrame, value_cols: List[str], output_path: str
+        self, points_gdf: gpd.GeoDataFrame, value_cols: list[str], output_path: str
     ) -> None:
         """
         Convert point GeoDataFrame to multi-band raster matching the target raster grid.
@@ -603,11 +599,11 @@ class MetricFusionEngine:
 
     def _auto_download_gvi_both(
         self,
-        api_key: Optional[str] = None,
+        api_key: str | None = None,
         cache: bool = True,
-        progress_callback: Optional[callable] = None,
-        cancel_callback: Optional[callable] = None,
-    ) -> Tuple[str, str]:
+        progress_callback: callable | None = None,
+        cancel_callback: callable | None = None,
+    ) -> tuple[str, str]:
         """
         Auto-download GVI metrics (both veg and terrain) in a single analysis.
 
@@ -642,7 +638,7 @@ class MetricFusionEngine:
 
         # Run GVI analysis on buffered extent
         logger.info(
-            f"Computing GVI metrics for buffered extent (this may take a while)..."
+            "Computing GVI metrics for buffered extent (this may take a while)..."
         )
 
         # Convert buffered extent to target points or grid
@@ -661,7 +657,7 @@ class MetricFusionEngine:
             logger.info(f"Buffered extent area: ~{area_km2:.2f} km²")
             logger.info(f"Bounds (EPSG:4326): {bounds}")
             logger.info(f"Geometry type: {analysis_gdf.geometry.iloc[0].geom_type}")
-            logger.info(f"GVI will generate grid at 75m spacing within this polygon")
+            logger.info("GVI will generate grid at 75m spacing within this polygon")
 
             # Verify the polygon is valid
             if not analysis_gdf.geometry.iloc[0].is_valid:
@@ -685,7 +681,7 @@ class MetricFusionEngine:
                 # Use "gvi" as component name for combined download
                 progress_callback("gvi", curr, total)
 
-        logger.info(f"Starting GVI analysis...")
+        logger.info("Starting GVI analysis...")
         logger.info(
             f"Input GDF: {len(analysis_gdf)} features, CRS: {analysis_gdf.crs}, Geometry type: {analysis_gdf.geometry.iloc[0].geom_type}"
         )
@@ -705,10 +701,10 @@ class MetricFusionEngine:
         if not accumulated_results:
             # Check if analysis was cancelled
             if cancel_callback and cancel_callback():
-                logger.info(f"GVI analysis cancelled by user")
-                raise InterruptedError(f"GVI analysis cancelled by user")
+                logger.info("GVI analysis cancelled by user")
+                raise InterruptedError("GVI analysis cancelled by user")
             raise ValueError(
-                f"No GVI data collected. Check if Street View is available in this area."
+                "No GVI data collected. Check if Street View is available in this area."
             )
 
         result_gdf = gpd.GeoDataFrame(accumulated_results, crs=analysis_gdf.crs)
@@ -747,7 +743,7 @@ class MetricFusionEngine:
                         f"Cached multi-band GVI GeoTIFF to: {gvi_multiband_path}"
                     )
                     logger.info(
-                        f"  Band 1: Vegetation (gvi_veg), Band 2: Terrain (gvi_ter)"
+                        "  Band 1: Vegetation (gvi_veg), Band 2: Terrain (gvi_ter)"
                     )
                 except Exception as e:
                     logger.warning(f"Could not create multi-band GeoTIFF cache: {e}")
@@ -774,10 +770,10 @@ class MetricFusionEngine:
     def _auto_download_gvi(
         self,
         component: str,
-        api_key: Optional[str] = None,
+        api_key: str | None = None,
         cache: bool = True,
-        progress_callback: Optional[callable] = None,
-        cancel_callback: Optional[callable] = None,
+        progress_callback: callable | None = None,
+        cancel_callback: callable | None = None,
     ) -> str:
         """
         Auto-download GVI metrics within buffered extent.
@@ -829,7 +825,7 @@ class MetricFusionEngine:
             logger.info(f"Buffered extent area: ~{area_km2:.2f} km²")
             logger.info(f"Bounds (EPSG:4326): {bounds}")
             logger.info(f"Geometry type: {analysis_gdf.geometry.iloc[0].geom_type}")
-            logger.info(f"GVI will generate grid at 10m spacing within this polygon")
+            logger.info("GVI will generate grid at 10m spacing within this polygon")
 
             # Verify the polygon is valid
             if not analysis_gdf.geometry.iloc[0].is_valid:
@@ -904,7 +900,7 @@ class MetricFusionEngine:
         self,
         start_date: str,
         end_date: str,
-        project_id: Optional[str] = None,
+        project_id: str | None = None,
         cache: bool = True,
         force_download: bool = False,
     ) -> str:
@@ -976,7 +972,7 @@ class MetricFusionEngine:
     def _apply_circular_buffer_aggregation(
         self,
         points_gdf: gpd.GeoDataFrame,
-        metric_data: Union[gpd.GeoDataFrame, Dict],
+        metric_data: gpd.GeoDataFrame | dict,
         radius_meters: float,
         stat: str,
         percentile: int = 50,
@@ -1198,7 +1194,7 @@ class MetricFusionEngine:
         """
         import sys
 
-        print(f"\n[FUSION DEBUG] ====== PREPARE FUSION DATA ======", flush=True)
+        print("\n[FUSION DEBUG] ====== PREPARE FUSION DATA ======", flush=True)
         print(f"[FUSION DEBUG] is_points = {self.is_points}", flush=True)
         print(
             f"[FUSION DEBUG] Target type: {'POINT' if self.is_points else 'RASTER'}",
@@ -1215,9 +1211,9 @@ class MetricFusionEngine:
         """Sample metrics at point locations."""
         import sys
 
-        print(f"\n[FUSION DEBUG] ====== POINT FUSION ======", flush=True)
+        print("\n[FUSION DEBUG] ====== POINT FUSION ======", flush=True)
         logger.info("Preparing point-based fusion data...")
-        print(f"[FUSION DEBUG] Preparing point-based fusion data...", flush=True)
+        print("[FUSION DEBUG] Preparing point-based fusion data...", flush=True)
         sys.stdout.flush()
 
         # Only use target points as samples, not buffered area
@@ -1246,9 +1242,7 @@ class MetricFusionEngine:
         )
 
         # Log data quality before dropping NaN
-        print(
-            f"\n[FUSION DEBUG] ====== DATA QUALITY SUMMARY (POINT) ======", flush=True
-        )
+        print("\n[FUSION DEBUG] ====== DATA QUALITY SUMMARY (POINT) ======", flush=True)
         print(f"[FUSION DEBUG] Total rows: {len(fusion_df)}", flush=True)
         print(
             f"[FUSION DEBUG] Target NaN: {fusion_df['target'].isna().sum()} ({fusion_df['target'].isna().sum()/len(fusion_df)*100:.1f}%)",
@@ -1266,7 +1260,7 @@ class MetricFusionEngine:
             f"[FUSION DEBUG] NDVI NaN: {fusion_df['ndvi'].isna().sum()} ({fusion_df['ndvi'].isna().sum()/len(fusion_df)*100:.1f}%)",
             flush=True,
         )
-        print(f"[FUSION DEBUG] ================================\n", flush=True)
+        print("[FUSION DEBUG] ================================\n", flush=True)
 
         result = fusion_df.dropna()
         print(f"[FUSION DEBUG] After dropna: {len(result)} valid rows", flush=True)
@@ -1522,8 +1516,8 @@ class MetricFusionEngine:
 
         if len(pixel_points) == 0:
             raise ValueError(
-                f"No valid pixels found in target raster. "
-                f"Target raster may be empty or all NaN."
+                "No valid pixels found in target raster. "
+                "Target raster may be empty or all NaN."
             )
 
         logger.info(f"Created {len(pixel_points):,} point samples from raster pixels")
@@ -1538,7 +1532,7 @@ class MetricFusionEngine:
         # Now sample metrics at these point locations using spatial joins
         # This is the same logic as _prepare_point_fusion()
         print(
-            f"[FUSION DEBUG] Now sampling metrics at pixel center points...", flush=True
+            "[FUSION DEBUG] Now sampling metrics at pixel center points...", flush=True
         )
 
         points_gdf = pixel_points.copy()
@@ -1558,7 +1552,7 @@ class MetricFusionEngine:
 
         # Log data quality before dropping NaN
         print(
-            f"\n[FUSION DEBUG] ====== DATA QUALITY SUMMARY (RASTER) ======", flush=True
+            "\n[FUSION DEBUG] ====== DATA QUALITY SUMMARY (RASTER) ======", flush=True
         )
         print(f"[FUSION DEBUG] Total rows: {len(fusion_df)}", flush=True)
         print(
@@ -1577,7 +1571,7 @@ class MetricFusionEngine:
             f"[FUSION DEBUG] NDVI NaN: {fusion_df['ndvi'].isna().sum()} ({fusion_df['ndvi'].isna().sum()/len(fusion_df)*100:.1f}%)",
             flush=True,
         )
-        print(f"[FUSION DEBUG] ================================\n", flush=True)
+        print("[FUSION DEBUG] ================================\n", flush=True)
 
         result = fusion_df.dropna()
         print(f"[FUSION DEBUG] After dropna: {len(result)} valid rows", flush=True)
@@ -1682,8 +1676,8 @@ class MetricFusionEngine:
         sampler_type: str = "TPE",
         seed: int = 42,
         show_progress: bool = True,
-        progress_callback: Optional[callable] = None,
-    ) -> Dict:
+        progress_callback: callable | None = None,
+    ) -> dict:
         """
         Run Optuna optimization with k-fold cross-validation.
 
@@ -2003,13 +1997,13 @@ class MetricFusionEngine:
             if len(train_valid_vals) == 0 or np.var(train_valid_vals) == 0:
                 # Prune trial early if train composite is constant
                 raise optuna.TrialPruned(
-                    f"Train composite has no variance (constant values)"
+                    "Train composite has no variance (constant values)"
                 )
 
             if len(val_valid_vals) > 0 and np.var(val_valid_vals) == 0:
                 # Prune trial early if validation composite is constant
                 raise optuna.TrialPruned(
-                    f"Validation composite has no variance (constant values)"
+                    "Validation composite has no variance (constant values)"
                 )
 
             # Calculate metrics
@@ -2118,7 +2112,7 @@ class MetricFusionEngine:
         p_threshold: float = 0.05,
         tolerance: float = 0.1,
         min_trials: int = 10,
-    ) -> List[optuna.Trial]:
+    ) -> list[optuna.Trial]:
         """
         Filter trials for robustness based on the optimization metric.
 
@@ -2263,10 +2257,10 @@ class MetricFusionEngine:
 
     def evaluate_on_test(
         self,
-        params: Optional[Dict] = None,
+        params: dict | None = None,
         metric: str = "pearson",
         return_predictions: bool = False,
-    ) -> Dict:
+    ) -> dict:
         """
         Evaluate best parameters on held-out test set.
 
@@ -2414,7 +2408,7 @@ class MetricFusionEngine:
 
         return result
 
-    def apply_fusion(self, weights: Optional[Dict] = None) -> pd.DataFrame:
+    def apply_fusion(self, weights: dict | None = None) -> pd.DataFrame:
         """
         Apply fusion weights to create composite index.
 
@@ -2628,7 +2622,7 @@ class MetricFusionEngine:
         self,
         output_path: str = "output_results/composite_greenery.tif",
         top_percent: float = 0.2,
-        progress_callback: Optional[callable] = None,
+        progress_callback: callable | None = None,
     ) -> str:
         """
         Generate final composite greenery map using averaged parameters from top robust trials.
@@ -2686,7 +2680,6 @@ class MetricFusionEngine:
             progress_callback(20, 100)
 
         # 3. Average parameters
-        from collections import Counter
         from statistics import mode
 
         weights_veg = [t.params.get("veg_weight", 0) for t in top_trials]
@@ -2911,7 +2904,7 @@ class MetricFusionEngine:
         self,
         output_dir: str = "output_results/fusion/study_results",
         include_plots: bool = True,
-        progress_callback: Optional[callable] = None,
+        progress_callback: callable | None = None,
     ) -> None:
         """
         Generate comprehensive optimization results report with visualizations.
@@ -3026,17 +3019,17 @@ class MetricFusionEngine:
 
         report_lines = []
         report_lines.append("=" * 80)
-        report_lines.append(f"FUSION OPTIMIZATION RESULTS - ROBUST TRIALS (PRIMARY)")
+        report_lines.append("FUSION OPTIMIZATION RESULTS - ROBUST TRIALS (PRIMARY)")
         report_lines.append(
             f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
         report_lines.append("=" * 80)
-        report_lines.append(f"")
+        report_lines.append("")
         report_lines.append(
             "⚠ IMPORTANT: This report ONLY includes statistically significant trials"
         )
-        report_lines.append(f"  (FDR-corrected p-value < 0.05)")
-        report_lines.append(f"")
+        report_lines.append("  (FDR-corrected p-value < 0.05)")
+        report_lines.append("")
         report_lines.append(f"Original Study: {len(all_completed_trials)} trials")
         report_lines.append(
             f"Robust Trials (FILTERED): {len(robust_trials)} ({len(robust_trials)/len(all_completed_trials)*100:.1f}%)"
@@ -3044,30 +3037,30 @@ class MetricFusionEngine:
         report_lines.append(
             f"Excluded Trials: {len(all_completed_trials) - len(robust_trials)} (not statistically significant)"
         )
-        report_lines.append(f"")
+        report_lines.append("")
         report_lines.append(
-            f"This report focuses on statistically significant trials (FDR-corrected p<0.05)"
+            "This report focuses on statistically significant trials (FDR-corrected p<0.05)"
         )
-        report_lines.append(f"")
+        report_lines.append("")
         report_lines.append(f"Original Study: {len(all_completed_trials)} trials")
         report_lines.append(
             f"Robust Trials: {len(robust_trials)} ({len(robust_trials)/len(all_completed_trials)*100:.1f}%)"
         )
-        report_lines.append(f"")
+        report_lines.append("")
 
         # Best trial from robust trials
         best_robust = robust_study.best_trial
         report_lines.append(f"BEST ROBUST TRIAL (#{best_robust.number})")
-        report_lines.append(f"-" * 80)
+        report_lines.append("-" * 80)
         report_lines.append(f"Best Value: {best_robust.value:.6f}")
-        report_lines.append(f"")
-        report_lines.append(f"Parameters:")
+        report_lines.append("")
+        report_lines.append("Parameters:")
         for key, val in best_robust.params.items():
             report_lines.append(f"  {key}: {val}")
-        report_lines.append(f"")
+        report_lines.append("")
 
         # CV scores
-        report_lines.append(f"Cross-Validation Performance:")
+        report_lines.append("Cross-Validation Performance:")
         if "train_score_mean" in best_robust.user_attrs:
             report_lines.append(
                 f"  Train Score (mean): {best_robust.user_attrs['train_score_mean']:.6f}"
@@ -3086,12 +3079,12 @@ class MetricFusionEngine:
             report_lines.append(
                 f"  Val P-value (mean): {best_robust.user_attrs['val_pvalue_mean']:.6e}"
             )
-        report_lines.append(f"")
+        report_lines.append("")
 
         # Test set evaluation
         if self.test_data is not None:
-            report_lines.append(f"TEST SET EVALUATION")
-            report_lines.append(f"-" * 80)
+            report_lines.append("TEST SET EVALUATION")
+            report_lines.append("-" * 80)
             try:
                 test_results = self.evaluate_on_test(
                     params=best_robust.params, return_predictions=False
@@ -3104,11 +3097,11 @@ class MetricFusionEngine:
                 report_lines.append(f"Test Samples: {len(self.test_data)}")
             except Exception as e:
                 report_lines.append(f"Test evaluation failed: {e}")
-        report_lines.append(f"")
+        report_lines.append("")
 
         # Top 10 robust trials
-        report_lines.append(f"TOP 10 ROBUST TRIALS")
-        report_lines.append(f"-" * 80)
+        report_lines.append("TOP 10 ROBUST TRIALS")
+        report_lines.append("-" * 80)
         sorted_robust = sorted(
             robust_trials,
             key=lambda t: t.value,
@@ -3117,7 +3110,7 @@ class MetricFusionEngine:
         report_lines.append(
             f"{'Rank':<6} {'Trial':<8} {'Value':<12} {'P-val':<12} {'Veg%':<6} {'Ter%':<6} {'NDVI%':<6}"
         )
-        report_lines.append(f"-" * 80)
+        report_lines.append("-" * 80)
         for rank, trial in enumerate(sorted_robust, 1):
             veg_w = trial.params.get("veg_weight", 0)
             ter_w = trial.params.get("terrain_weight", 0)
@@ -3126,7 +3119,7 @@ class MetricFusionEngine:
             report_lines.append(
                 f"{rank:<6} #{trial.number:<7} {trial.value:<12.6f} {pval:<12.4e} {veg_w:<6} {ter_w:<6} {ndvi_w:<6}"
             )
-        report_lines.append(f"")
+        report_lines.append("")
 
         # Save robust trials report
         robust_report_path = os.path.join(robust_dir, "optimization_report.txt")
@@ -3166,13 +3159,13 @@ class MetricFusionEngine:
 
         debug_lines = []
         debug_lines.append("=" * 80)
-        debug_lines.append(f"FUSION OPTIMIZATION RESULTS - ALL TRIALS (DEBUG)")
+        debug_lines.append("FUSION OPTIMIZATION RESULTS - ALL TRIALS (DEBUG)")
         debug_lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         debug_lines.append("=" * 80)
-        debug_lines.append(f"")
-        debug_lines.append(f"This report includes ALL trials for debugging purposes.")
-        debug_lines.append(f"Use 'robust_trials' folder for primary analysis.")
-        debug_lines.append(f"")
+        debug_lines.append("")
+        debug_lines.append("This report includes ALL trials for debugging purposes.")
+        debug_lines.append("Use 'robust_trials' folder for primary analysis.")
+        debug_lines.append("")
         debug_lines.append(f"Total Trials: {len(self.study.trials)}")
         debug_lines.append(f"Completed: {len(all_completed_trials)}")
         debug_lines.append(
@@ -3181,18 +3174,18 @@ class MetricFusionEngine:
         debug_lines.append(
             f"Failed: {len([t for t in self.study.trials if t.state == optuna.trial.TrialState.FAIL])}"
         )
-        debug_lines.append(f"")
+        debug_lines.append("")
 
         best_all = self.study.best_trial
         debug_lines.append(f"BEST TRIAL (#{best_all.number})")
-        debug_lines.append(f"-" * 80)
+        debug_lines.append("-" * 80)
         debug_lines.append(f"Best Value: {best_all.value:.6f}")
         debug_lines.append(f"Parameters: {best_all.params}")
-        debug_lines.append(f"")
+        debug_lines.append("")
 
         # Top 10 all trials
-        debug_lines.append(f"TOP 10 TRIALS")
-        debug_lines.append(f"-" * 80)
+        debug_lines.append("TOP 10 TRIALS")
+        debug_lines.append("-" * 80)
         sorted_all = sorted(
             all_completed_trials,
             key=lambda t: t.value,
@@ -3201,7 +3194,7 @@ class MetricFusionEngine:
         debug_lines.append(
             f"{'Rank':<6} {'Trial':<8} {'Value':<12} {'Veg%':<6} {'Ter%':<6} {'NDVI%':<6}"
         )
-        debug_lines.append(f"-" * 80)
+        debug_lines.append("-" * 80)
         for rank, trial in enumerate(sorted_all, 1):
             veg_w = trial.params.get("veg_weight", 0)
             ter_w = trial.params.get("terrain_weight", 0)
@@ -3209,7 +3202,7 @@ class MetricFusionEngine:
             debug_lines.append(
                 f"{rank:<6} #{trial.number:<7} {trial.value:<12.6f} {veg_w:<6} {ter_w:<6} {ndvi_w:<6}"
             )
-        debug_lines.append(f"")
+        debug_lines.append("")
 
         all_report_path = os.path.join(all_trials_dir, "optimization_report.txt")
         with open(all_report_path, "w", encoding="utf-8") as f:
@@ -3238,14 +3231,14 @@ class MetricFusionEngine:
         print(
             f"Robust Trials (FDR p<0.05): {len(robust_trials)} ({len(robust_trials)/len(all_completed_trials)*100:.1f}%)"
         )
-        print(f"")
+        print("")
         print(f"BEST ROBUST TRIAL: #{best_robust.number} = {best_robust.value:.6f}")
         print(f"  Parameters: {best_robust.params}")
-        print(f"")
+        print("")
         print(f"Reports saved to: {output_dir}")
         print(f"  ✓ PRIMARY (robust trials): {robust_dir}/")
         print(f"  ✓ DEBUG (all trials):  : {best_robust.params}")
-        print(f"")
+        print("")
         print(f"Reports saved to: {output_dir}")
         print(f"  - PRIMARY: {robust_dir}/")
         print(f"  - DEBUG:   {all_trials_dir}/")
@@ -3271,7 +3264,7 @@ class MetricFusionEngine:
         if progress_callback:
             progress_callback(100, 100)
 
-        logger.info(f"✓ Results report generation complete!")
+        logger.info("✓ Results report generation complete!")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

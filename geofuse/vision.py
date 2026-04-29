@@ -1,7 +1,6 @@
 import importlib
 import os
 import sys
-from unittest.mock import MagicMock
 
 import numpy as np
 import torch
@@ -49,12 +48,6 @@ dl_core_path = os.path.join(current_dir, "dl_core")
 
 if dl_core_path not in sys.path:
     sys.path.append(dl_core_path)
-
-# ---------------------------------------------------------
-# MOCKING VISUALIZATION LIBS
-# ---------------------------------------------------------
-sys.modules["visdom"] = MagicMock()
-sys.modules["dominate"] = MagicMock()
 
 
 class DeepLabSegmenter:
@@ -115,7 +108,7 @@ class DeepLabSegmenter:
             self.model.load_state_dict(state_dict, strict=False)
         except RuntimeError as e:
             print(
-                f"[FATAL] Weight Mismatch. You might need to specify num_classes manually."
+                "[FATAL] Weight Mismatch. You might need to specify num_classes manually."
             )
             raise e
 

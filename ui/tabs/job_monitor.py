@@ -18,7 +18,7 @@ def render(output_dir: str) -> None:
                 placeholder = st.empty()
                 while True:
                     try:
-                        with open(status_file, "r") as f:
+                        with open(status_file) as f:
                             data = json.load(f)
                     except Exception:
                         time.sleep(0.5)
