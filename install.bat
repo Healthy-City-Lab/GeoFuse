@@ -34,15 +34,14 @@ call "%CONDA_ROOT%\Scripts\activate.bat" base >nul 2>&1
 if not exist logs mkdir logs
 
 :: --- STEP 3: RUN PYTHON SETUP SCRIPT (handles environment creation) ---
-if exist scripts\setup_env.py (
-    python scripts\setup_env.py
-    if %errorlevel% neq 0 (
-        echo [ERROR] Setup script failed!
-        pause
-        exit /b 1
-    )
-) else (
+if not exist scripts\setup_env.py (
     echo [ERROR] scripts\setup_env.py not found!
+    pause
+    exit /b 1
+)
+python scripts\setup_env.py
+if !errorlevel! neq 0 (
+    echo [ERROR] Setup script failed!
     pause
     exit /b 1
 )

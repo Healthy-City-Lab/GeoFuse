@@ -23,7 +23,7 @@ PIP_PACKAGES = [
     # Geospatial
     "rasterio==1.4.4",
     "shapely==2.1.2",
-    "fiona",
+    "fiona==1.10.1",
     # Data Science
     "matplotlib==3.10.8",
     "scikit-learn==1.6.0",
@@ -38,11 +38,18 @@ PIP_PACKAGES = [
     "folium==0.20.0",
     "geemap==0.36.6",
     "earthengine-api==1.7.4",
-    # Visualization
-    "visdom==0.2.4",
-    "dominate==2.9.1",
     # Utility
+    "dominate==2.9.1",
     "isort==7.0.0",
+]
+
+# 3b. LEGACY PIP PACKAGES (optional — failure is a warning, not an abort)
+# visdom 0.2.4 setup.py calls `import pkg_resources`, which setuptools 80+
+# no longer exposes as a top-level importable module on Python 3.12.
+# It is only used by dl_core for training visualisation; GeoFuse inference
+# and all automated tests work without it.
+PIP_PACKAGES_LEGACY = [
+    "visdom==0.2.4",
 ]
 
 GIT_PACKAGES = [
@@ -50,7 +57,18 @@ GIT_PACKAGES = [
 ]
 
 
-def run_cmd(command, log_file=None, echo_to_console=False):
+def run_cmd(command, log_file=None, optional=False):
+    """Run a shell command, streaming output to both console and (optionally) a log file.
+
+    Always echoes to the console so CI logs capture errors inline.  On
+    non-zero exit the last 40 lines of output are reprinted before aborting,
+    ensuring the failure reason is visible even when the surrounding log is large.
+
+    If ``optional=True`` the installer prints a warning on failure and
+    continues instead of aborting.  Use this for packages that degrade
+    gracefully when absent (e.g. training-only visualisation tools).
+    """
+    output_lines = []
     try:
         process = subprocess.Popen(
             command,
@@ -62,22 +80,15 @@ def run_cmd(command, log_file=None, echo_to_console=False):
             errors="replace",
         )
 
-        output_lines = []
         while True:
             line = process.stdout.readline()
             if not line:
                 break
             output_lines.append(line)
+            print(line, end="", flush=True)
             if log_file:
-                # Write to log file
                 with open(log_file, "a", encoding="utf-8") as f:
                     f.write(line)
-                # Also print to console if echo_to_console is True
-                if echo_to_console:
-                    print(line, end="")
-            else:
-                # Print to console only if no log file
-                print(line, end="")
 
         process.wait()
 
@@ -85,8 +96,22 @@ def run_cmd(command, log_file=None, echo_to_console=False):
             raise subprocess.CalledProcessError(process.returncode, command)
 
     except subprocess.CalledProcessError as e:
-        print(f"\n[ERROR] Command failed with exit code {e.returncode}: {command}")
-        sys.exit(1)
+        tail = output_lines[-40:] if len(output_lines) > 40 else output_lines
+        if optional:
+            print(f"\n[WARN] Optional command failed (continuing): {command}")
+            if tail:
+                print("\n--- last output ---")
+                for ln in tail:
+                    print(ln, end="")
+                print("--- end ---\n")
+        else:
+            print(f"\nError:  Command failed with exit code {e.returncode}: {command}")
+            if tail:
+                print("\n--- last output ---")
+                for ln in tail:
+                    print(ln, end="")
+                print("--- end ---\n")
+            sys.exit(1)
     except Exception as e:
         print(f"\n[ERROR] An unexpected error occurred: {e}")
         sys.exit(1)
@@ -193,8 +218,26 @@ def main(env_name, log_file=None):
     # 3. Install Pip Libraries
     print(f"[3/6] Installing Python Libraries...")
     env_python = get_env_python(env_name)
+    # Upgrade pip/setuptools first so the build backend has pkg_resources available
+    run_cmd(
+        f'"{env_python}" -m pip install --upgrade pip setuptools wheel',
+        log_file,
+    )
     pip_str = " ".join(PIP_PACKAGES)
     run_cmd(f'"{env_python}" -m pip install {pip_str}', log_file)
+
+    # 3b. Legacy packages — optional, failure is a warning not an abort.
+    # visdom 0.2.4 cannot be built on Python 3.12 + setuptools 80+ because
+    # its setup.py uses pkg_resources which is no longer importable there.
+    if PIP_PACKAGES_LEGACY:
+        print(f"[3b/6] Installing Legacy Libraries (optional, no build isolation)...")
+        legacy_str = " ".join(PIP_PACKAGES_LEGACY)
+        run_cmd(
+            f'"{env_python}" -m pip install --no-build-isolation {legacy_str}',
+            log_file,
+            optional=True,
+        )
+        print("[INFO] Legacy install complete (failures above are non-fatal).")
 
     # 4. Install Git Packages
     print(f"[4/6] Installing Custom Git Packages...")
@@ -209,14 +252,11 @@ def main(env_name, log_file=None):
     # 6. Verify Installation
     print(f"[6/6] Verifying Installation...")
 
-    # Get the Python executable from the geofuse environment
     env_python = get_env_python(env_name)
 
-    # Construct a verification script that checks for the correct GPU backend based on OS
     verify_imports = (
         "import geofuse; import torch; import platform; from mpi4py import MPI; "
     )
-    # Use single quotes for f-strings and no parentheses in the output text to be shell-safe
     verify_geofuse = "print(f'   [OK] GeoFuse Package: {geofuse.__file__}'); "
     verify_mpi = "print(f'   [OK] MPI Rank: {MPI.COMM_WORLD.Get_rank()} - Vendor: {MPI.get_vendor()}');"
 
@@ -227,7 +267,7 @@ def main(env_name, log_file=None):
 
     verify_script = verify_imports + verify_geofuse + verify_torch + verify_mpi
 
-    run_cmd(f'"{env_python}" -c "{verify_script}"', log_file, echo_to_console=True)
+    run_cmd(f'"{env_python}" -c "{verify_script}"', log_file)
 
 
 if __name__ == "__main__":

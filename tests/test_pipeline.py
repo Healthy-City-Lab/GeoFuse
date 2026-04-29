@@ -44,8 +44,6 @@ class TestGeoFuse(unittest.TestCase):
         os.makedirs("data/samples", exist_ok=True)
 
         # Import the shared sample creator to ensure consistency
-        import sys
-
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
         from create_samples import create_sample_data
 
