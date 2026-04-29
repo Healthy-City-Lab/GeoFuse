@@ -18,7 +18,7 @@ from streamlit.runtime.scriptrunner import add_script_run_ctx
 from streamlit_folium import st_folium
 
 from geofuse.ndvi import NDVIEngine
-from helpers import load_clean_gdf
+from helpers import apply_buffer_m, load_clean_gdf
 
 
 # ---------------------------------------------------------------------------
@@ -34,6 +34,7 @@ def _ndvi_worker(
     end_date,
     cloud_pct,
     resolution,
+    buffer_m,
     output_name,
     output_dir,
     job_tracker_dict,
@@ -41,9 +42,10 @@ def _ndvi_worker(
     try:
         job_tracker_dict[job_id]["status"] = "Initializing Earth Engine..."
         engine = NDVIEngine()
+        geometry = apply_buffer_m(dataset_data["raw"], buffer_m)
         job_tracker_dict[job_id]["status"] = "Downloading and processing..."
         result = engine.download_and_process(
-            geometry=dataset_data["raw"],
+            geometry=geometry,
             start_date=start_date,
             end_date=end_date,
             output_name=output_name,
@@ -68,6 +70,7 @@ def _ndvi_column_worker(
     window_days,
     cloud_pct,
     resolution,
+    buffer_m,
     output_dir,
     job_tracker_dict,
 ):
@@ -85,9 +88,10 @@ def _ndvi_column_worker(
         unique_dates = sorted(gdf["_parsed_date"].dt.date.unique())
         n_dates = len(unique_dates)
         engine = NDVIEngine()
-        full_extent = gpd.GeoDataFrame(
+        base_extent = gpd.GeoDataFrame(
             {"geometry": [gdf.geometry.union_all()]}, crs=gdf.crs
         )
+        full_extent = apply_buffer_m(base_extent, buffer_m)
         all_results = []
 
         for idx, target_date in enumerate(unique_dates):
@@ -181,12 +185,21 @@ def render(output_dir: str) -> None:
     # --- LAYOUT ---
     col_ndvi_top_left, col_ndvi_top_right = st.columns(2)
     with col_ndvi_top_left:
-        st.subheader("1. Input & Date Configuration")
+        st.subheader("Input Configuration")
 
-        cloud_pct = st.slider("Maximum Cloud Coverage (%)", 0, 100, 10)
-        resolution = st.number_input("Resolution (m)", value=10, min_value=10)
+        cloud_pct = st.slider("Maximum Cloud Coverage (%)", 0, 100, 10, key="ndvi_cloud")
+        resolution = st.number_input("Resolution (m)", value=10, min_value=10, key="ndvi_res")
+        buffer_m = st.slider(
+            "Download Buffer (m)",
+            min_value=0,
+            max_value=2000,
+            value=0,
+            step=50,
+            key="ndvi_buffer",
+            help="Expand the study area boundary outward by this many metres before downloading.",
+        )
         ndvi_files = st.file_uploader(
-            "Upload Study Areas (GeoJSON)",
+            "Upload Study Areas",
             accept_multiple_files=True,
             key="ndvi_up",
         )
@@ -417,10 +430,10 @@ def render(output_dir: str) -> None:
 
         st.divider()
 
-        if st.button("🚀 Run NDVI Analysis", type="primary"):
+        if st.button("🚀 Run NDVI Analysis", type="primary", key="ndvi_run"):
             if not ndvi_input_datasets:
                 st.warning(
-                    "No input areas loaded. Upload at least one GeoJSON file."
+                    "Upload at least one study area to get started."
                 )
             else:
                 if "jobs" not in st.session_state:
@@ -493,6 +506,7 @@ def render(output_dir: str) -> None:
                                     end_d.isoformat(),
                                     cloud_pct,
                                     resolution,
+                                    buffer_m,
                                     output_name,
                                     output_dir,
                                     st.session_state.jobs,
@@ -543,6 +557,7 @@ def render(output_dir: str) -> None:
                                     end_d.isoformat(),
                                     cloud_pct,
                                     resolution,
+                                    buffer_m,
                                     output_name,
                                     output_dir,
                                     st.session_state.jobs,
@@ -585,6 +600,7 @@ def render(output_dir: str) -> None:
                                     window_days,
                                     cloud_pct,
                                     resolution,
+                                    buffer_m,
                                     output_dir,
                                     st.session_state.jobs,
                                 ),
@@ -599,13 +615,13 @@ def render(output_dir: str) -> None:
                 if jobs_started:
                     st.success(
                         f"{jobs_started} job(s) started. "
-                        "Monitor progress in the sidebar."
+                        "Monitor progress in the Job Monitor tab."
                     )
                 elif not validation_errors:
                     st.info("No new jobs were submitted.")
 
     with col_ndvi_top_right:
-        st.subheader("Area of Interest Preview")
+        st.subheader("Study Area Preview")
         m_ndvi_input = folium.Map(location=[51.0447, -114.0719], zoom_start=10)
         all_bounds = []
         for fname, d in st.session_state.ndvi_datasets.items():
@@ -615,9 +631,22 @@ def render(output_dir: str) -> None:
                 folium.GeoJson(
                     d["raw"],
                     name=fname,
-                    style_function=lambda x: {"color": "blue", "fill": False},
+                    style_function=lambda x: {"color": "#1a73e8", "weight": 2, "fill": False},
                 ).add_to(m_ndvi_input)
                 all_bounds.append(d["raw"].total_bounds)
+                if buffer_m > 0:
+                    buf_gdf = apply_buffer_m(d["raw"], buffer_m)
+                    folium.GeoJson(
+                        buf_gdf,
+                        name=f"{fname} (buffer)",
+                        style_function=lambda x: {
+                            "color": "#f4910c",
+                            "weight": 2,
+                            "fillOpacity": 0.07,
+                            "dashArray": "6 4",
+                        },
+                    ).add_to(m_ndvi_input)
+                    all_bounds.append(buf_gdf.total_bounds)
         if all_bounds:
             min_x = min([b[0] for b in all_bounds])
             min_y = min([b[1] for b in all_bounds])
@@ -636,8 +665,8 @@ def render(output_dir: str) -> None:
 
     col_ndvi_btm_left, col_ndvi_btm_right = st.columns(2)
     with col_ndvi_btm_left:
-        st.subheader("2. Result Inspector")
-        if st.button("Scan Output Folder"):
+        st.subheader("Result Inspector")
+        if st.button("🔄 Scan Output Folder", key="ndvi_scan_folder"):
             found_files = glob.glob(os.path.join(output_dir, "*_ndvi.geojson"))
             count = 0
             for p in found_files:
@@ -687,14 +716,14 @@ def render(output_dir: str) -> None:
         ]
         options = ["All Regions"] + completed_ds
         selected_opt = st.selectbox(
-            "Select result",
+            "Select Result",
             options,
             index=None,
             placeholder="Choose a result...",
             key="ndvi_inspector_select",
         )
-        r_opacity = st.slider("Raster Opacity", 0.0, 1.0, 0.7, key="ndvi_op")
-        show_points = st.checkbox("Show Sample Points", value=False)
+        r_opacity = st.slider("Layer Opacity", 0.0, 1.0, 0.7, key="ndvi_op")
+        show_points = st.checkbox("Show Sample Points", value=False, key="ndvi_show_points")
         val_container = st.empty()
 
     with col_ndvi_btm_right:

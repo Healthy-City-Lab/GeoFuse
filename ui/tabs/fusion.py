@@ -1,4 +1,5 @@
 import base64
+import glob
 import io
 import os
 import tempfile
@@ -15,6 +16,7 @@ import pandas as pd
 import rasterio
 import streamlit as st
 from PIL import Image as PILImage
+from shapely.geometry import box as shapely_box
 from streamlit.runtime.scriptrunner import add_script_run_ctx
 from streamlit_folium import st_folium
 
@@ -22,6 +24,67 @@ try:
     from geofuse.fusion import MetricFusionEngine as _MetricFusionEngine
 except ImportError:
     _MetricFusionEngine = None
+
+
+# ---------------------------------------------------------------------------
+# Metric-file helpers
+# ---------------------------------------------------------------------------
+
+
+def _scan_metric_files(output_dir: str, suffix: str) -> list:
+    """Return sorted list of (label, path) for all *_{suffix}.geojson in output_dir."""
+    pattern = os.path.join(output_dir, f"*_{suffix}.geojson")
+    return [(os.path.basename(p), p) for p in sorted(glob.glob(pattern))]
+
+
+def _compute_buffered_extent(
+    tmp_target_path: str,
+    is_geojson: bool,
+    buffer_meters: float,
+) -> "gpd.GeoDataFrame | None":
+    """Compute the buffered target extent as a GeoDataFrame in EPSG:4326."""
+    try:
+        if is_geojson:
+            gdf = gpd.read_file(tmp_target_path)
+            if gdf.crs is None:
+                gdf = gdf.set_crs("EPSG:4326")
+            else:
+                gdf = gdf.to_crs("EPSG:4326")
+        else:  # GeoTIFF
+            with rasterio.open(tmp_target_path) as src:
+                b = src.bounds
+                src_crs = src.crs
+            gdf = gpd.GeoDataFrame(
+                {"geometry": [shapely_box(b.left, b.bottom, b.right, b.top)]},
+                crs=src_crs,
+            ).to_crs("EPSG:4326")
+
+        utm_crs = gdf.estimate_utm_crs()
+        gdf_utm = gdf.to_crs(utm_crs)
+        buffered_geom = gdf_utm.geometry.union_all().buffer(buffer_meters)
+        return gpd.GeoDataFrame(
+            {"geometry": [buffered_geom]}, crs=utm_crs
+        ).to_crs("EPSG:4326")
+    except Exception:
+        return None
+
+
+def _check_coverage(metric_path: str, buffered_gdf: "gpd.GeoDataFrame") -> bool:
+    """Return True if the metric file's spatial extent fully covers buffered_gdf."""
+    try:
+        if metric_path.lower().endswith((".tif", ".tiff")):
+            with rasterio.open(metric_path) as src:
+                metric_box = shapely_box(*src.bounds)
+                metric_crs = src.crs
+        else:
+            mdf = gpd.read_file(metric_path)
+            metric_box = shapely_box(*mdf.total_bounds)
+            metric_crs = mdf.crs
+
+        target_geom = buffered_gdf.to_crs(metric_crs).geometry.union_all()
+        return metric_box.covers(target_geom)
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +109,7 @@ def _fusion_worker(
     n_startup_trials,
     objective_metric,
     pruner_type,
+    sampler_type,
     gvi_api_key,
     ndvi_start_date,
     ndvi_end_date,
@@ -150,6 +214,7 @@ def _fusion_worker(
             n_startup_trials=n_startup_trials,
             objective_metric=objective_metric,
             pruner_type=pruner_type if pruner_type != "none" else None,
+            sampler_type=sampler_type,
             seed=42,
             show_progress=False,
         )
@@ -202,8 +267,7 @@ def _fusion_worker(
 def render(output_dir: str) -> None:
     st.header("Metric Fusion & Optimization")
     st.markdown(
-        "Optimize weighted fusion of GVI and NDVI metrics against target outcomes "
-        "using CMA-ES."
+        "Optimize weighted fusion of GVI and NDVI metrics against target outcomes."
     )
 
     MetricFusionEngine = _MetricFusionEngine
@@ -229,36 +293,7 @@ def render(output_dir: str) -> None:
     target_band = 1
 
     with col_fusion_left:
-        st.subheader("1. Target Configuration")
-
-        completed_gvi = [
-            k
-            for k, v in st.session_state.get("datasets", {}).items()
-            if v.get("type") == "restored"
-        ]
-        completed_ndvi = [
-            k
-            for k, v in st.session_state.get("ndvi_datasets", {}).items()
-            if v.get("type") == "restored"
-        ]
-
-        if completed_gvi or completed_ndvi:
-            with st.expander("📊 Available Results", expanded=False):
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    st.caption(f"🌿 GVI Results: {len(completed_gvi)}")
-                    if completed_gvi:
-                        for name in completed_gvi[:3]:
-                            st.text(f"  • {name}")
-                        if len(completed_gvi) > 3:
-                            st.text(f"  + {len(completed_gvi)-3} more...")
-                with col_b:
-                    st.caption(f"🛰️ NDVI Results: {len(completed_ndvi)}")
-                    if completed_ndvi:
-                        for name in completed_ndvi[:3]:
-                            st.text(f"  • {name}")
-                        if len(completed_ndvi) > 3:
-                            st.text(f"  + {len(completed_ndvi)-3} more...")
+        st.subheader("Target Configuration")
 
         target_file = st.file_uploader(
             "Upload Target File (GeoJSON or GeoTIFF)",
@@ -286,7 +321,7 @@ def render(output_dir: str) -> None:
                         f"📍 Detected: **GeoJSON** with {len(preview_gdf)} points"
                     )
                     target_feature = st.selectbox(
-                        "Select Target Feature (Outcome Variable)",
+                        "Target Attribute (Outcome Variable)",
                         options=numeric_cols,
                         help="The health or environmental outcome to optimize towards",
                     )
@@ -311,7 +346,7 @@ def render(output_dir: str) -> None:
                     tmp_target_path = None
 
         st.divider()
-        st.subheader("2. Metric Configuration")
+        st.subheader("Metric Configuration")
 
         buffer_meters = st.number_input(
             "Buffer Distance (meters)",
@@ -334,59 +369,109 @@ def render(output_dir: str) -> None:
         gvi_api_key_input = ""
 
         if metric_mode == "Use Loaded Results":
+            # Scan output folder for all pre-computed files
+            all_gvi_files = _scan_metric_files(output_dir, "gvi")
+            all_ndvi_files = _scan_metric_files(output_dir, "ndvi")
+
+            # Compute buffered target extent for spatial filtering (if target loaded)
+            buffered_extent = None
+            if tmp_target_path:
+                buffered_extent = _compute_buffered_extent(
+                    tmp_target_path, is_geojson, buffer_meters
+                )
+
+            def _filter_by_coverage(file_list, bext):
+                """Return (covering, non_covering) label lists."""
+                if bext is None:
+                    return [lbl for lbl, _ in file_list], []
+                covering, non_covering = [], []
+                for lbl, path in file_list:
+                    (covering if _check_coverage(path, bext) else non_covering).append(lbl)
+                return covering, non_covering
+
+            gvi_covering, gvi_outside = _filter_by_coverage(all_gvi_files, buffered_extent)
+            ndvi_covering, ndvi_outside = _filter_by_coverage(all_ndvi_files, buffered_extent)
+
+            if buffered_extent is None:
+                st.info(
+                    "Upload a target file above to automatically filter results by spatial coverage."
+                )
+
             col_gvi_sel, col_ndvi_sel = st.columns(2)
 
             with col_gvi_sel:
-                if completed_gvi:
+                if not all_gvi_files:
+                    st.info("No GVI results found in the output folder.")
+                else:
+                    if buffered_extent is not None:
+                        st.caption(
+                            f"🌿 GVI: {len(gvi_covering)} cover target"
+                            + (
+                                f", {len(gvi_outside)} outside"
+                                if gvi_outside
+                                else ""
+                            )
+                        )
+                    options_gvi = [None] + gvi_covering + (
+                        ["── outside target ──"] + gvi_outside if gvi_outside else []
+                    )
                     gvi_selection = st.selectbox(
                         "🌿 Select GVI Result",
-                        options=[None] + completed_gvi,
-                        format_func=lambda x: "(Optional)" if x is None else x,
-                        help="Select from loaded GVI results",
+                        options=options_gvi,
+                        format_func=lambda x: "(Optional — will auto-download)"
+                        if x is None
+                        else x,
+                        key="fusion_gvi_select",
                     )
-                    if gvi_selection:
-                        gvi_base = gvi_selection.replace(".geojson", "").replace(
-                            "_gvi", ""
-                        )
-                        gvi_path = os.path.join(
-                            output_dir, f"{gvi_base}_gvi.geojson"
-                        )
-                        if os.path.exists(gvi_path):
-                            st.success(f"✓ Using: {gvi_selection}")
-                        else:
-                            st.warning("⚠️ File not found, will auto-download")
+                    if gvi_selection and not gvi_selection.startswith("──"):
+                        gvi_path = os.path.join(output_dir, gvi_selection)
+                        if not os.path.exists(gvi_path):
+                            st.warning("⚠️ File not found on disk.")
                             gvi_path = None
-                else:
-                    st.info(
-                        "No GVI results loaded. Run GVI analysis first or switch "
-                        "to Upload/Auto-Download mode."
-                    )
+                        elif buffered_extent is not None and gvi_selection in gvi_outside:
+                            st.warning(
+                                "⚠️ This result does not fully cover the buffered "
+                                "target area — spatial alignment may be incomplete."
+                            )
+                        else:
+                            st.success(f"✓ {gvi_selection}")
 
             with col_ndvi_sel:
-                if completed_ndvi:
+                if not all_ndvi_files:
+                    st.info("No NDVI results found in the output folder.")
+                else:
+                    if buffered_extent is not None:
+                        st.caption(
+                            f"🛰️ NDVI: {len(ndvi_covering)} cover target"
+                            + (
+                                f", {len(ndvi_outside)} outside"
+                                if ndvi_outside
+                                else ""
+                            )
+                        )
+                    options_ndvi = [None] + ndvi_covering + (
+                        ["── outside target ──"] + ndvi_outside if ndvi_outside else []
+                    )
                     ndvi_selection = st.selectbox(
                         "🛰️ Select NDVI Result",
-                        options=[None] + completed_ndvi,
-                        format_func=lambda x: "(Optional)" if x is None else x,
-                        help="Select from loaded NDVI results",
+                        options=options_ndvi,
+                        format_func=lambda x: "(Optional — will auto-download)"
+                        if x is None
+                        else x,
+                        key="fusion_ndvi_select",
                     )
-                    if ndvi_selection:
-                        ndvi_base = ndvi_selection.replace(".geojson", "").replace(
-                            "_ndvi", ""
-                        )
-                        ndvi_path = os.path.join(
-                            output_dir, f"{ndvi_base}_ndvi.geojson"
-                        )
-                        if os.path.exists(ndvi_path):
-                            st.success(f"✓ Using: {ndvi_selection}")
-                        else:
-                            st.warning("⚠️ File not found, will auto-download")
+                    if ndvi_selection and not ndvi_selection.startswith("──"):
+                        ndvi_path = os.path.join(output_dir, ndvi_selection)
+                        if not os.path.exists(ndvi_path):
+                            st.warning("⚠️ File not found on disk.")
                             ndvi_path = None
-                else:
-                    st.info(
-                        "No NDVI results loaded. Run NDVI analysis first or switch "
-                        "to Upload/Auto-Download mode."
-                    )
+                        elif buffered_extent is not None and ndvi_selection in ndvi_outside:
+                            st.warning(
+                                "⚠️ This result does not fully cover the buffered "
+                                "target area — spatial alignment may be incomplete."
+                            )
+                        else:
+                            st.success(f"✓ {ndvi_selection}")
 
         elif metric_mode == "Upload Files":
             col_gvi_up, col_ndvi_up = st.columns(2)
@@ -453,7 +538,7 @@ def render(output_dir: str) -> None:
             cache_metrics = False
 
         st.divider()
-        st.subheader("3. Optimization Settings")
+        st.subheader("Optimization Settings")
 
         col_opt1, col_opt2 = st.columns(2)
         with col_opt1:
@@ -462,6 +547,7 @@ def render(output_dir: str) -> None:
                 options=["pearson", "spearman", "r2", "rmse", "mutual_info"],
                 index=0,
                 help="Metric to optimize (correlation or regression error)",
+                key="fusion_objective_metric",
             )
             n_trials = st.number_input(
                 "Total Trials",
@@ -470,6 +556,18 @@ def render(output_dir: str) -> None:
                 value=300,
                 step=50,
                 help="Total optimization iterations",
+                key="fusion_n_trials",
+            )
+            optimizer = st.selectbox(
+                "Optimizer",
+                options=["TPE", "CMA-ES", "Random"],
+                index=0,
+                help=(
+                    "TPE: Tree-structured Parzen Estimator — efficient Bayesian search. "
+                    "CMA-ES: evolutionary covariance-matrix adaptation — strong on continuous parameters. "
+                    "Random: unguided random baseline."
+                ),
+                key="fusion_optimizer",
             )
 
         with col_opt2:
@@ -479,13 +577,15 @@ def render(output_dir: str) -> None:
                 max_value=500,
                 value=150,
                 step=10,
-                help="Initial random exploration before CMA-ES",
+                help="Initial random exploration before the optimizer takes over",
+                key="fusion_n_startup",
             )
             pruner_type = st.selectbox(
                 "Pruner",
                 options=["median", "hyperband", "successive_halving", "none"],
                 index=0,
                 help="Early stopping strategy for poor trials",
+                key="fusion_pruner",
             )
 
         col_split1, col_split2, col_split3 = st.columns(3)
@@ -637,7 +737,7 @@ def render(output_dir: str) -> None:
         )
     with col_run2:
         if st.session_state.fusion_results:
-            if st.button("📊 Export Results", use_container_width=True):
+            if st.button("📊 Export Results", use_container_width=True, key="fusion_export"):
                 result_df = st.session_state.fusion_results["composite_df"]
                 export_gdf = gpd.GeoDataFrame(
                     result_df,
@@ -654,7 +754,7 @@ def render(output_dir: str) -> None:
                 st.success(f"Exported to: {export_path}")
     with col_run3:
         if st.session_state.fusion_engine:
-            if st.button("🔄 Reset", use_container_width=True):
+            if st.button("🔄 Reset", use_container_width=True, key="fusion_reset"):
                 st.session_state.fusion_engine = None
                 st.session_state.fusion_results = None
                 st.rerun()
@@ -663,7 +763,7 @@ def render(output_dir: str) -> None:
         if not target_file:
             st.error("❌ Please upload a target file")
         elif is_geojson and not target_feature:
-            st.error("❌ Please select a target feature for GeoJSON")
+            st.error("❌ Please select a target attribute for the GeoJSON target")
         else:
             if (
                 metric_mode == "Use Loaded Results"
@@ -730,6 +830,7 @@ def render(output_dir: str) -> None:
                         n_startup_trials,
                         objective_metric,
                         pruner_type,
+                        optimizer,
                         gvi_api_key,
                         ndvi_auto_start.isoformat(),
                         ndvi_auto_end.isoformat(),

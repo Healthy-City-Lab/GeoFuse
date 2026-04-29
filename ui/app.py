@@ -31,6 +31,7 @@ except ImportError:
 
 # --- 4. UI IMPORTS (after geofuse to preserve DLL order on Windows) ---
 import streamlit as st  # noqa: E402
+import streamlit.components.v1 as components  # noqa: E402
 
 from tabs import fusion, gvi, job_monitor, ndvi  # noqa: E402
 
@@ -42,12 +43,66 @@ st.markdown(
 <style>
     .block-container { padding-top: 1rem; padding-bottom: 1rem; }
     iframe { width: 100% !important; }
+    /* Ensure the brand-injection iframe takes no space */
+    iframe[height="0"] { display: block; height: 0 !important; min-height: 0 !important; }
+
+    /* Styling for the GeoFuse brand span injected by JS below */
+    .gf-brand {
+        font-size: 1.4rem;
+        font-weight: 700;
+        font-family: "Source Sans Pro", "Source Sans 3", sans-serif;
+        letter-spacing: -0.01em;
+        white-space: nowrap;
+        flex-shrink: 0;
+        align-self: center;
+        padding-right: 0.9rem;
+        margin-right: 0.4rem;
+        border-right: 1px solid rgba(49, 51, 63, 0.18);
+    }
+
+    /* Give the tab bar enough vertical room for the taller brand text */
+    div[data-testid="stTabs"] [data-baseweb="tab-list"] {
+        padding-top: 6px;
+        padding-bottom: 4px;
+    }
 </style>
 """,
     unsafe_allow_html=True,
 )
 
-st.title("GeoFuse: Multimodal Environmental Profiling")
+# Inject the "GeoFuse" brand as the first flex item in the tab bar.
+# Placed BEFORE st.tabs() so the zero-height iframe sits above the tab bar
+# in the DOM and cannot clip or squish the tab bar height.
+# CSS ::before cannot be used because BaseWeb already claims it for the
+# sliding active-tab underline indicator.
+# A MutationObserver re-injects the span after every Streamlit re-render.
+components.html(
+    """
+<script>
+(function () {
+    var d = window.parent.document;
+
+    function inject() {
+        var tabList = d.querySelector("[data-baseweb='tab-list']");
+        if (!tabList) { setTimeout(inject, 200); return; }
+        if (tabList.querySelector(".gf-brand")) return;
+        var span = d.createElement("span");
+        span.className = "gf-brand";
+        span.textContent = "GeoFuse";
+        tabList.insertBefore(span, tabList.firstChild);
+    }
+
+    new MutationObserver(function () {
+        if (!d.querySelector("[data-baseweb='tab-list'] .gf-brand")) inject();
+    }).observe(d.body || d.documentElement, { childList: true, subtree: true });
+
+    inject();
+})();
+</script>
+""",
+    height=0,
+    scrolling=False,
+)
 
 tab1, tab2, tab3, tab4 = st.tabs(
     ["Job Monitor", "NDVI Sourcing", "GVI Sourcing", "Fusion & Optimization"]

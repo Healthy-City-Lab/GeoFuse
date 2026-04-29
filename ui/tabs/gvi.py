@@ -21,7 +21,7 @@ from streamlit_folium import st_folium
 
 from geofuse.gvi import GVIEngine
 from geofuse.vision import get_best_device
-from helpers import generate_raster_grid, load_clean_gdf
+from helpers import apply_buffer_m, generate_raster_grid, load_clean_gdf
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +162,7 @@ def _get_gvi_engine(model_path, api_key):
 
 
 def render(output_dir: str, parent_dir: str) -> None:
-    st.header("Street View & Vision Pipeline")
+    st.header("GVI Sourcing")
 
     # --- SESSION STATE ---
     if "datasets" not in st.session_state:
@@ -268,7 +268,7 @@ def render(output_dir: str, parent_dir: str) -> None:
     col_top_left, col_top_right = st.columns(2)
 
     with col_top_left:
-        st.subheader("1. Job Configuration")
+        st.subheader("Input Configuration")
         mode = st.radio(
             "Download Mode", ["Package (Scraper)", "API (Google Key)"], horizontal=True
         )
@@ -277,8 +277,17 @@ def render(output_dir: str, parent_dir: str) -> None:
             if mode == "API (Google Key)"
             else None
         )
-        gvi_res = st.slider("Grid Resolution (meters)", 20, 500, 50)
-        save_debug = st.checkbox("Save Raw Images & Masks?", value=False)
+        gvi_res = st.slider("Grid Resolution (m)", 20, 500, 50, key="gvi_res")
+        gvi_buffer = st.slider(
+            "Download Buffer (m)",
+            min_value=0,
+            max_value=2000,
+            value=0,
+            step=50,
+            key="gvi_buffer",
+            help="Expand the study area boundary outward by this many metres before generating the sampling grid.",
+        )
+        save_debug = st.checkbox("Save Raw Images & Masks", value=False, key="gvi_save_debug")
 
         uploaded_files = st.file_uploader(
             "Upload Study Areas", accept_multiple_files=True, key="gvi_up"
@@ -319,13 +328,15 @@ def render(output_dir: str, parent_dir: str) -> None:
                     del st.session_state.datasets[k]
 
         if st.session_state.datasets:
-            if st.button("Generate Sampling Grids"):
+            if st.button("Generate Sampling Grids", key="gvi_gen_grids"):
                 with st.spinner("Processing..."):
                     for d in st.session_state.datasets.values():
                         if d.get("type") == "restored":
                             continue
                         if d["type"] == "poly":
-                            pts, meta = generate_raster_grid(d["raw"], gvi_res)
+                            pts, meta = generate_raster_grid(
+                                apply_buffer_m(d["raw"], gvi_buffer), gvi_res
+                            )
                             d["processed"] = pts
                             d["meta"] = meta
                         else:
@@ -336,9 +347,9 @@ def render(output_dir: str, parent_dir: str) -> None:
                     st.success("Grids generated!")
 
         st.divider()
-        if st.button("🚀 Start Batch Analysis", type="primary"):
+        if st.button("🚀 Run GVI Analysis", type="primary", key="gvi_run"):
             if not st.session_state.datasets:
-                st.warning("No data.")
+                st.warning("Upload at least one study area to get started.")
             else:
                 model_path = os.path.join(
                     parent_dir, "geofuse", "model", "best_model.pth"
@@ -350,7 +361,9 @@ def render(output_dir: str, parent_dir: str) -> None:
 
                     if d.get("processed") is None:
                         if d["type"] == "poly":
-                            pts, meta = generate_raster_grid(d["raw"], gvi_res)
+                            pts, meta = generate_raster_grid(
+                                apply_buffer_m(d["raw"], gvi_buffer), gvi_res
+                            )
                             d["processed"] = pts
                             d["meta"] = meta
                         else:
@@ -405,12 +418,12 @@ def render(output_dir: str, parent_dir: str) -> None:
                     started = True
 
                 if started:
-                    st.success("Jobs started!")
+                    st.success("Analysis started. Monitor progress in the sidebar.")
                 else:
-                    st.info("No new jobs.")
+                    st.info("All study areas are already running or completed.")
 
     with col_top_right:
-        st.subheader("Input Preview")
+        st.subheader("Study Area Preview")
         m_input = folium.Map(location=[51.0447, -114.0719], zoom_start=11)
 
         all_bounds = []
@@ -420,10 +433,23 @@ def render(output_dir: str, parent_dir: str) -> None:
             if d.get("raw") is not None:
                 folium.GeoJson(
                     d["raw"],
-                    name=f"{fname} (AOI)",
-                    style_function=lambda x: {"color": "blue", "fill": False},
+                    name=f"{fname} (study area)",
+                    style_function=lambda x: {"color": "#1a73e8", "weight": 2, "fill": False},
                 ).add_to(m_input)
                 all_bounds.append(d["raw"].total_bounds)
+                if gvi_buffer > 0:
+                    buf_gdf = apply_buffer_m(d["raw"], gvi_buffer)
+                    folium.GeoJson(
+                        buf_gdf,
+                        name=f"{fname} (buffer)",
+                        style_function=lambda x: {
+                            "color": "#f4910c",
+                            "weight": 2,
+                            "fillOpacity": 0.07,
+                            "dashArray": "6 4",
+                        },
+                    ).add_to(m_input)
+                    all_bounds.append(buf_gdf.total_bounds)
             if d.get("processed") is not None and not d["processed"].empty:
                 preview = d["processed"].iloc[:1000]
                 if preview.geometry.iloc[0].geom_type == "Point":
@@ -460,9 +486,9 @@ def render(output_dir: str, parent_dir: str) -> None:
     col_btm_left, col_btm_right = st.columns(2)
 
     with col_btm_left:
-        st.subheader("2. Result Inspector")
+        st.subheader("Result Inspector")
 
-        if st.button("🔄 Scan Output Folder for Completed Jobs"):
+        if st.button("🔄 Scan Output Folder", key="gvi_scan_folder"):
             found_files = glob.glob(os.path.join(output_dir, "*_gvi.geojson"))
             count = 0
             for p in found_files:
@@ -499,9 +525,9 @@ def render(output_dir: str, parent_dir: str) -> None:
                     except Exception as e:
                         print(f"Error: {e}")
             if count > 0:
-                st.success(f"Loaded {count} results.")
+                st.success(f"Loaded {count} result(s) from the output folder.")
             else:
-                st.info("No valid paired results found.")
+                st.info("No results found in the output folder.")
 
         completed_ds = [
             k
@@ -512,18 +538,18 @@ def render(output_dir: str, parent_dir: str) -> None:
         options = ["All Regions"] + completed_ds
 
         selected_option = st.selectbox(
-            "Select Area to Inspect",
+            "Select Result",
             options,
             index=None,
-            placeholder="Select a Result...",
+            placeholder="Choose a result...",
             key="inspector_select_key",
         )
 
         raster_layer = st.radio(
-            "Background Raster", ["Vegetation", "Terrain"], horizontal=True
+            "Background Raster", ["Vegetation", "Terrain"], horizontal=True, key="gvi_raster_layer"
         )
-        r_opacity = st.slider("Layer Opacity", 0.0, 1.0, 0.7)
-        show_points = st.checkbox("Show Validation Points (Green Dots)", value=False)
+        r_opacity = st.slider("Layer Opacity", 0.0, 1.0, 0.7, key="gvi_layer_opacity")
+        show_points = st.checkbox("Show Sample Points", value=False, key="gvi_show_points")
 
     with col_btm_right:
         st.subheader("Results Preview")

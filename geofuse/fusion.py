@@ -16,7 +16,7 @@ import optuna
 import pandas as pd
 import rasterio
 from optuna.pruners import HyperbandPruner, MedianPruner, SuccessiveHalvingPruner
-from optuna.samplers import TPESampler
+from optuna.samplers import CmaEsSampler, RandomSampler, TPESampler
 from rasterio.features import geometry_mask
 from rasterio.transform import from_origin, rowcol, xy
 from rasterio.warp import Resampling, reproject
@@ -1679,6 +1679,7 @@ class MetricFusionEngine:
         n_startup_trials: int = 150,
         objective_metric: str = "pearson",
         pruner_type: str = "median",
+        sampler_type: str = "TPE",
         seed: int = 42,
         show_progress: bool = True,
         progress_callback: Optional[callable] = None,
@@ -1686,18 +1687,12 @@ class MetricFusionEngine:
         """
         Run Optuna optimization with k-fold cross-validation.
 
-        Matches CGI.ipynb optimization logic:
-        - CMA-ES sampler with startup trials
-        - Separate weights for veg, terrain (and optionally NDVI)
-        - Separate radius and aggregation function parameters
-        - K-fold CV for robust evaluation
-        - Train/validation tracking across folds
-
         Args:
             n_trials: Total optimization trials
-            n_startup_trials: Random exploration trials before CMA-ES
+            n_startup_trials: Random exploration trials before the main optimizer
             objective_metric: 'pearson', 'spearman', 'r2', 'rmse', 'mutual_info'
             pruner_type: 'median', 'hyperband', 'successive_halving', or None
+            sampler_type: 'TPE', 'CMA-ES', or 'Random'
             seed: Random seed for reproducibility
             show_progress: Whether to show progress bar
 
@@ -1707,13 +1702,21 @@ class MetricFusionEngine:
         if self.cv_folds is None:
             raise ValueError("Call split_data() first")
 
-        # Select sampler (TPE with settings for dynamic search space)
-        sampler = TPESampler(
-            n_startup_trials=n_startup_trials,
-            multivariate=False,  # Disable for dynamic search space
-            warn_independent_sampling=False,  # Suppress warnings
-            seed=seed,
-        )
+        # Build sampler
+        if sampler_type == "CMA-ES":
+            sampler = CmaEsSampler(
+                n_startup_trials=n_startup_trials,
+                seed=seed,
+            )
+        elif sampler_type == "Random":
+            sampler = RandomSampler(seed=seed)
+        else:  # default: TPE
+            sampler = TPESampler(
+                n_startup_trials=n_startup_trials,
+                multivariate=False,
+                warn_independent_sampling=False,
+                seed=seed,
+            )
 
         # Select pruner based on objective
         if pruner_type == "median":
