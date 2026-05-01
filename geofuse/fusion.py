@@ -26,6 +26,20 @@ from sklearn.preprocessing import MinMaxScaler
 logger = logging.getLogger(__name__)
 
 
+def _radius_int_bounds(r_min: float, r_max: float, r_step: float) -> tuple[int, int, int]:
+    """Align Optuna integer radius search to user min/max/step (metres)."""
+    lo = max(1, int(round(r_min)))
+    hi = int(round(r_max))
+    step = max(1, int(round(r_step)))
+    if lo > hi:
+        lo, hi = hi, lo
+    span = hi - lo
+    hi_adj = lo + (span // step) * step
+    if hi_adj < lo:
+        hi_adj = lo
+    return lo, hi_adj, step
+
+
 class MetricFusionEngine:
     """
     Engine for fusing vegetation, terrain, and NDVI metrics using optimization.
@@ -36,7 +50,7 @@ class MetricFusionEngine:
     3. Splits data: holdout test set + k-fold CV on training data
     4. Optimizes 9 parameters matching CGI.ipynb:
        - Weights: veg_weight, terrain_weight, ndvi_weight (0-100, sum=100)
-       - Radii: veg_radius, terrain_radius, ndvi_radius (50-1500m)
+       - Radii: veg_radius, terrain_radius, ndvi_radius (GVI / NDVI ladder grids)
        - Streetview agg: streetview_stat, streetview_percentile (shared for veg+terrain)
        - NDVI agg: ndvi_stat, ndvi_percentile (separate for NDVI)
     5. Validates performance using cross-validation and held-out test set
@@ -48,6 +62,12 @@ class MetricFusionEngine:
         target_feature: str | None = None,
         target_band: int = 1,
         buffer_meters: float = 1500.0,
+        gvi_buffer_min_m: float | None = None,
+        gvi_buffer_max_m: float | None = None,
+        gvi_buffer_step_m: float | None = None,
+        ndvi_buffer_min_m: float | None = None,
+        ndvi_buffer_max_m: float | None = None,
+        ndvi_buffer_step_m: float | None = None,
         n_bins: int = 5,
         cache_dir: str = "output_results/fusion_cache",
     ):
@@ -58,17 +78,59 @@ class MetricFusionEngine:
             target_file: Path to GeoJSON (points) or GeoTIFF (raster) target file
             target_feature: For GeoJSON, the column name to optimize towards
             target_band: For GeoTIFF, the band number to optimize towards
-            buffer_meters: Buffer distance around target geometry for metric sampling
+            buffer_meters: Maximum buffer (m) around target for extent padding and downloads;
+                typically max(GVI max, NDVI max). If modality maxima are omitted, they default here.
+            gvi_buffer_min_m / gvi_buffer_max_m / gvi_buffer_step_m: GVI (veg/terrain) radius search grid (m).
+            ndvi_buffer_min_m / ndvi_buffer_max_m / ndvi_buffer_step_m: NDVI radius search grid (m).
             n_bins: Number of bins for stratified splitting
             cache_dir: Directory to cache downloaded metrics
         """
         self.target_file = target_file
         self.target_feature = target_feature
         self.target_band = target_band
-        self.buffer_meters = buffer_meters
+        self.buffer_meters = float(buffer_meters)
+        self.gvi_buffer_max_m = (
+            float(gvi_buffer_max_m)
+            if gvi_buffer_max_m is not None
+            else self.buffer_meters
+        )
+        self.gvi_buffer_min_m = (
+            float(gvi_buffer_min_m)
+            if gvi_buffer_min_m is not None
+            else min(100.0, self.gvi_buffer_max_m)
+        )
+        self.gvi_buffer_step_m = (
+            float(gvi_buffer_step_m) if gvi_buffer_step_m is not None else 50.0
+        )
+        self.ndvi_buffer_max_m = (
+            float(ndvi_buffer_max_m)
+            if ndvi_buffer_max_m is not None
+            else self.buffer_meters
+        )
+        self.ndvi_buffer_min_m = (
+            float(ndvi_buffer_min_m)
+            if ndvi_buffer_min_m is not None
+            else min(100.0, self.ndvi_buffer_max_m)
+        )
+        self.ndvi_buffer_step_m = (
+            float(ndvi_buffer_step_m) if ndvi_buffer_step_m is not None else 50.0
+        )
+        if self.gvi_buffer_min_m > self.gvi_buffer_max_m:
+            self.gvi_buffer_min_m, self.gvi_buffer_max_m = (
+                self.gvi_buffer_max_m,
+                self.gvi_buffer_min_m,
+            )
+        if self.ndvi_buffer_min_m > self.ndvi_buffer_max_m:
+            self.ndvi_buffer_min_m, self.ndvi_buffer_max_m = (
+                self.ndvi_buffer_max_m,
+                self.ndvi_buffer_min_m,
+            )
+
         self.n_bins = n_bins
         self.cache_dir = cache_dir
         os.makedirs(cache_dir, exist_ok=True)
+        self._ndvi_export_resolution_m = 10.0
+        self._gvi_grid_spacing_m = 75.0
 
         # Data containers
         self.target_gdf = None
@@ -110,8 +172,10 @@ class MetricFusionEngine:
                     f"Target feature '{self.target_feature}' not found in columns: {list(self.target_gdf.columns)}"
                 )
 
-            # Create buffered extent for metric download
-            gdf_utm = self.target_gdf.to_crs("EPSG:32612")  # UTM for meter-based buffer
+            # Create buffered extent for metric download (metre-accurate buffer in local UTM)
+            gdf_wgs84 = self.target_gdf.to_crs("EPSG:4326")
+            utm_crs = gdf_wgs84.estimate_utm_crs()
+            gdf_utm = gdf_wgs84.to_crs(utm_crs)
             bounds = gdf_utm.total_bounds
             buffered_box = box(
                 bounds[0] - self.buffer_meters,
@@ -120,7 +184,7 @@ class MetricFusionEngine:
                 bounds[3] + self.buffer_meters,
             )
             self.buffered_extent = gpd.GeoDataFrame(
-                {"geometry": [buffered_box]}, crs="EPSG:32612"
+                {"geometry": [buffered_box]}, crs=utm_crs
             ).to_crs("EPSG:4326")
 
         else:  # Raster
@@ -162,6 +226,8 @@ class MetricFusionEngine:
         progress_callback: callable | None = None,
         cancel_callback: callable | None = None,
         force_download: bool = False,
+        ndvi_resolution_m: float | None = None,
+        gvi_grid_spacing_m: float | None = None,
     ) -> None:
         """
         Load vegetation, terrain, and NDVI metrics from files or auto-download.
@@ -179,10 +245,18 @@ class MetricFusionEngine:
             ndvi_end_date: End date for NDVI composite (YYYY-MM-DD)
             ndvi_project_id: Google Earth Engine project ID for NDVI download
             force_download: If True, bypass cache and force fresh download of all metrics
+            ndvi_resolution_m: GEE export resolution (m) when fetching NDVI; default 10
+            gvi_grid_spacing_m: Street-view sampling grid spacing (m) when fetching GVI; default 75
         """
         if self.buffered_extent is None:
             self.load_target()
 
+        self._ndvi_export_resolution_m = (
+            float(ndvi_resolution_m) if ndvi_resolution_m is not None else 10.0
+        )
+        self._gvi_grid_spacing_m = (
+            float(gvi_grid_spacing_m) if gvi_grid_spacing_m is not None else 75.0
+        )
         # Check for multi-band GVI cache (Band 1=Veg, Band 2=Terrain)
         gvi_multiband_cache = self._get_cache_filename("gvi_combined", ".tif")
 
@@ -641,6 +715,8 @@ class MetricFusionEngine:
             "Computing GVI metrics for buffered extent (this may take a while)..."
         )
 
+        gvi_step = max(1, int(round(self._gvi_grid_spacing_m)))
+
         # Convert buffered extent to target points or grid
         if self.is_points:
             # Use target points directly
@@ -657,7 +733,7 @@ class MetricFusionEngine:
             logger.info(f"Buffered extent area: ~{area_km2:.2f} km²")
             logger.info(f"Bounds (EPSG:4326): {bounds}")
             logger.info(f"Geometry type: {analysis_gdf.geometry.iloc[0].geom_type}")
-            logger.info("GVI will generate grid at 75m spacing within this polygon")
+            logger.info(f"GVI will generate grid at ~{gvi_step} m spacing within this polygon")
 
             # Verify the polygon is valid
             if not analysis_gdf.geometry.iloc[0].is_valid:
@@ -689,7 +765,7 @@ class MetricFusionEngine:
         gvi_engine.run_analysis(
             analysis_gdf,
             folder=self.cache_dir,
-            step=75,  # 75m grid spacing (matches default)
+            step=gvi_step,
             save_panos=False,
             save_masks=False,
             result_callback=collect_result,
@@ -809,6 +885,8 @@ class MetricFusionEngine:
             f"Computing GVI {component} for buffered extent (this may take a while)..."
         )
 
+        gvi_step = max(1, int(round(self._gvi_grid_spacing_m)))
+
         # Convert buffered extent to target points or grid
         if self.is_points:
             # Use target points directly
@@ -825,7 +903,7 @@ class MetricFusionEngine:
             logger.info(f"Buffered extent area: ~{area_km2:.2f} km²")
             logger.info(f"Bounds (EPSG:4326): {bounds}")
             logger.info(f"Geometry type: {analysis_gdf.geometry.iloc[0].geom_type}")
-            logger.info("GVI will generate grid at 10m spacing within this polygon")
+            logger.info(f"GVI will generate grid at ~{gvi_step} m spacing within this polygon")
 
             # Verify the polygon is valid
             if not analysis_gdf.geometry.iloc[0].is_valid:
@@ -858,7 +936,7 @@ class MetricFusionEngine:
         gvi_engine.run_analysis(
             analysis_gdf,
             folder=self.cache_dir,
-            step=75,  # 75m grid spacing (matches default)
+            step=gvi_step,
             save_panos=False,
             save_masks=False,
             result_callback=collect_result,
@@ -938,8 +1016,10 @@ class MetricFusionEngine:
 
         # Download NDVI for buffered extent
         bounds = self.buffered_extent.total_bounds
+        ndvi_res = int(max(5, round(self._ndvi_export_resolution_m)))
         logger.info(f"Downloading NDVI from Sentinel-2 ({start_date} to {end_date})...")
         logger.info(f"Area extent: {bounds}")
+        logger.info(f"NDVI export resolution: {ndvi_res} m")
         logger.info("This may take several minutes depending on area size...")
 
         # Extract base name for output
@@ -952,7 +1032,7 @@ class MetricFusionEngine:
             end_date=end_date,
             output_name=f"{name if cache else 'temp'}",
             folder=self.cache_dir,
-            resolution=10,
+            resolution=ndvi_res,
         )
 
         if result["status"] != "success":
@@ -1332,7 +1412,10 @@ class MetricFusionEngine:
             print(
                 f"[FUSION DEBUG] Points bounds: {points_gdf.total_bounds}", flush=True
             )
-            print(f"[FUSION DEBUG] Buffer distance: {self.buffer_meters}m", flush=True)
+            print(
+                f"[FUSION DEBUG] Nearest-feature max distance (veg): {self.gvi_buffer_max_m}m",
+                flush=True,
+            )
 
             # Ensure CRS match before spatial join
             veg_data_matched = self.veg_data.to_crs(points_gdf.crs)
@@ -1345,7 +1428,7 @@ class MetricFusionEngine:
                 points_gdf,
                 veg_data_matched[["geometry", veg_col]],
                 how="left",
-                max_distance=self.buffer_meters,
+                max_distance=self.gvi_buffer_max_m,
             )
 
             # Extract the metric column (may have been renamed with suffix)
@@ -1403,7 +1486,7 @@ class MetricFusionEngine:
                 points_gdf,
                 terrain_data_matched[["geometry", terrain_col]],
                 how="left",
-                max_distance=self.buffer_meters,
+                max_distance=self.gvi_buffer_max_m,
             )
 
             # Extract the metric column (may have been renamed with suffix)
@@ -1458,7 +1541,7 @@ class MetricFusionEngine:
                 points_gdf,
                 ndvi_data_matched[["geometry", ndvi_col]],
                 how="left",
-                max_distance=self.buffer_meters,
+                max_distance=self.ndvi_buffer_max_m,
             )
 
             # Extract the metric column (may have been renamed with suffix)
@@ -1592,7 +1675,8 @@ class MetricFusionEngine:
         Split data into holdout test set and k-fold CV training/validation sets.
 
         Workflow:
-        1. Sample all metrics at point locations (initial sampling with buffer_meters)
+        1. Sample all metrics at point locations (nearest-feature caps: GVI max
+           ``gvi_buffer_max_m``, NDVI max ``ndvi_buffer_max_m``)
         2. Filter out rows with NaN values in any metric
         3. Bin target values for stratification
         4. Stratified split into train/val/test sets
@@ -1778,23 +1862,50 @@ class MetricFusionEngine:
 
         return self.best_params
 
+    def _suggest_gvi_radius(self, trial: optuna.Trial, name: str) -> int:
+        lo, hi, step = _radius_int_bounds(
+            self.gvi_buffer_min_m, self.gvi_buffer_max_m, self.gvi_buffer_step_m
+        )
+        if lo >= hi:
+            return lo
+        return trial.suggest_int(name, lo, hi, step=step)
+
+    def _suggest_ndvi_radius(self, trial: optuna.Trial) -> int:
+        lo, hi, step = _radius_int_bounds(
+            self.ndvi_buffer_min_m, self.ndvi_buffer_max_m, self.ndvi_buffer_step_m
+        )
+        if lo >= hi:
+            return lo
+        return trial.suggest_int("ndvi_radius", lo, hi, step=step)
+
     def _objective(self, trial: optuna.Trial, metric: str) -> float:
         """
         Optuna objective function with k-fold CV.
 
-        Matches CGI.ipynb parameter structure exactly:
-        - ndvi_weight, veg_weight, terrain_weight (0-100, summing to 100)
-        - veg_radius, terrain_radius, ndvi_radius (100 to buffer_meters, step=50)
-        - streetview_stat, streetview_percentile (SHARED for veg + terrain)
-        - ndvi_stat, ndvi_percentile (separate for NDVI)
-
-        Evaluates across all CV folds and returns average validation score.
+        Weight search matches CGI.ipynb (ndvi / veg / terrain summing to 100).
+        Radii use separate GVI and NDVI buffer ladders (min / max / step metres)
+        on the engine; extent padding remains ``buffer_meters``.
+        Street-view aggregation parameters are shared for veg and terrain; NDVI
+        uses separate stat / percentile choices.
         """
-        # Log buffer_meters to verify it's being used correctly (only for first trial)
+        gvi_cap = int(round(self.gvi_buffer_max_m))
+        ndvi_cap = int(round(self.ndvi_buffer_max_m))
+
         if trial.number == 0:
-            logger.info(f"Buffer distance for optimization: {self.buffer_meters}m")
+            gvi_lo, gvi_hi, gvi_st = _radius_int_bounds(
+                self.gvi_buffer_min_m,
+                self.gvi_buffer_max_m,
+                self.gvi_buffer_step_m,
+            )
+            ndvi_lo, ndvi_hi, ndvi_st = _radius_int_bounds(
+                self.ndvi_buffer_min_m,
+                self.ndvi_buffer_max_m,
+                self.ndvi_buffer_step_m,
+            )
             logger.info(
-                f"Radius range will be: 100 to {int(self.buffer_meters)}m (step=50)"
+                f"Fusion extent buffer: {self.buffer_meters} m; "
+                f"GVI radius search {gvi_lo}–{gvi_hi} m (step {gvi_st}); "
+                f"NDVI radius search {ndvi_lo}–{ndvi_hi} m (step {ndvi_st})"
             )
 
         # ─── Suggest Weights (matching CGI.ipynb logic) ───────────────────────
@@ -1827,33 +1938,25 @@ class MetricFusionEngine:
             else:
                 streetview_percentile = 50
 
-            # Separate radii for veg and terrain (min 100m to avoid spatial join mismatches)
-            # Max radius is user-specified buffer_meters
-            if veg_weight > 0:
-                veg_radius = trial.suggest_int(
-                    "veg_radius", 100, int(self.buffer_meters), step=50
-                )
-            else:
-                veg_radius = self.buffer_meters
-
-            if terrain_weight > 0:
-                terrain_radius = trial.suggest_int(
-                    "terrain_radius", 100, int(self.buffer_meters), step=50
-                )
-            else:
-                terrain_radius = self.buffer_meters
+            veg_radius = (
+                self._suggest_gvi_radius(trial, "veg_radius")
+                if veg_weight > 0
+                else gvi_cap
+            )
+            terrain_radius = (
+                self._suggest_gvi_radius(trial, "terrain_radius")
+                if terrain_weight > 0
+                else gvi_cap
+            )
         else:
             streetview_stat = "mean"
             streetview_percentile = 50
-            veg_radius = self.buffer_meters
-            terrain_radius = self.buffer_meters
+            veg_radius = gvi_cap
+            terrain_radius = gvi_cap
 
         # ─── Suggest NDVI Parameters (separate) ────────────────────────────────
-        # Max radius is user-specified buffer_meters
         if ndvi_weight > 0:
-            ndvi_radius = trial.suggest_int(
-                "ndvi_radius", 100, int(self.buffer_meters), step=50
-            )
+            ndvi_radius = self._suggest_ndvi_radius(trial)
             ndvi_stat = trial.suggest_categorical(
                 "ndvi_stat", ["mean", "median", "percentile"]
             )
@@ -1862,7 +1965,7 @@ class MetricFusionEngine:
             else:
                 ndvi_percentile = 50
         else:
-            ndvi_radius = self.buffer_meters
+            ndvi_radius = ndvi_cap
             ndvi_stat = "mean"
             ndvi_percentile = 50
 
@@ -2304,11 +2407,13 @@ class MetricFusionEngine:
         # Extract aggregation parameters
         streetview_stat = params.get("streetview_stat", "mean")
         streetview_percentile = params.get("streetview_percentile", 50)
-        veg_radius = params.get("veg_radius", self.buffer_meters)
-        terrain_radius = params.get("terrain_radius", self.buffer_meters)
+        veg_radius = params.get("veg_radius", int(round(self.gvi_buffer_max_m)))
+        terrain_radius = params.get(
+            "terrain_radius", int(round(self.gvi_buffer_max_m))
+        )
         ndvi_stat = params.get("ndvi_stat", "mean")
         ndvi_percentile = params.get("ndvi_percentile", 50)
-        ndvi_radius = params.get("ndvi_radius", self.buffer_meters)
+        ndvi_radius = params.get("ndvi_radius", int(round(self.ndvi_buffer_max_m)))
 
         # Apply dynamic circular buffer aggregation
         # Both points and rasters use the same approach (rasters converted to points)
@@ -2438,11 +2543,13 @@ class MetricFusionEngine:
         # Extract aggregation parameters
         streetview_stat = weights.get("streetview_stat", "mean")
         streetview_percentile = weights.get("streetview_percentile", 50)
-        veg_radius = weights.get("veg_radius", self.buffer_meters)
-        terrain_radius = weights.get("terrain_radius", self.buffer_meters)
+        veg_radius = weights.get("veg_radius", int(round(self.gvi_buffer_max_m)))
+        terrain_radius = weights.get(
+            "terrain_radius", int(round(self.gvi_buffer_max_m))
+        )
         ndvi_stat = weights.get("ndvi_stat", "mean")
         ndvi_percentile = weights.get("ndvi_percentile", 50)
-        ndvi_radius = weights.get("ndvi_radius", self.buffer_meters)
+        ndvi_radius = weights.get("ndvi_radius", int(round(self.ndvi_buffer_max_m)))
 
         # Combine all data (train+val+test)
         all_data = pd.concat([self.train_val_data, self.test_data])
@@ -2686,12 +2793,17 @@ class MetricFusionEngine:
         weights_ter = [t.params.get("terrain_weight", 0) for t in top_trials]
         weights_ndvi = [t.params.get("ndvi_weight", 0) for t in top_trials]
 
-        radii_veg = [t.params.get("veg_radius", self.buffer_meters) for t in top_trials]
+        radii_veg = [
+            t.params.get("veg_radius", int(round(self.gvi_buffer_max_m)))
+            for t in top_trials
+        ]
         radii_ter = [
-            t.params.get("terrain_radius", self.buffer_meters) for t in top_trials
+            t.params.get("terrain_radius", int(round(self.gvi_buffer_max_m)))
+            for t in top_trials
         ]
         radii_ndvi = [
-            t.params.get("ndvi_radius", self.buffer_meters) for t in top_trials
+            t.params.get("ndvi_radius", int(round(self.ndvi_buffer_max_m)))
+            for t in top_trials
         ]
 
         streetview_stats = [t.params.get("streetview_stat", "mean") for t in top_trials]

@@ -132,20 +132,26 @@ def _fusion_worker(
 
         print(f"[FUSION] Starting fusion job {job_id}")
         print(
-            "[FUSION] Buffer ladders (UI; engine uses buffer_meters=max until wired): "
+            "[FUSION] Buffer ladders: "
             f"GVI [{gvi_buffer_min_m}, {gvi_buffer_max_m}] step={gvi_buffer_step_m} m, "
             f"NDVI [{ndvi_buffer_min_m}, {ndvi_buffer_max_m}] step={ndvi_buffer_step_m} m"
         )
         if ndvi_resolution_m is not None:
-            print(f"[FUSION] NDVI export resolution (pending engine): {ndvi_resolution_m} m")
+            print(f"[FUSION] NDVI export resolution: {ndvi_resolution_m} m")
         if gvi_grid_spacing_m is not None:
-            print(f"[FUSION] GVI sampling grid spacing (pending engine): {gvi_grid_spacing_m} m")
+            print(f"[FUSION] GVI sampling grid spacing: {gvi_grid_spacing_m} m")
 
         engine = MetricFusionEngine(
             target_file=target_path,
             target_feature=target_feature,
             target_band=target_band,
             buffer_meters=buffer_meters,
+            gvi_buffer_min_m=gvi_buffer_min_m,
+            gvi_buffer_max_m=gvi_buffer_max_m,
+            gvi_buffer_step_m=gvi_buffer_step_m,
+            ndvi_buffer_min_m=ndvi_buffer_min_m,
+            ndvi_buffer_max_m=ndvi_buffer_max_m,
+            ndvi_buffer_step_m=ndvi_buffer_step_m,
             n_bins=n_bins,
             cache_dir=os.path.join(output_dir, "fusion_cache"),
         )
@@ -215,6 +221,8 @@ def _fusion_worker(
             ndvi_project_id=ndvi_project_id,
             progress_callback=gvi_progress_callback,
             cancel_callback=cancel_check,
+            ndvi_resolution_m=ndvi_resolution_m,
+            gvi_grid_spacing_m=gvi_grid_spacing_m,
         )
 
         print("[FUSION] Metrics loaded successfully")
