@@ -98,6 +98,14 @@ def _fusion_worker(
     target_feature,
     target_band,
     buffer_meters,
+    gvi_buffer_min_m,
+    gvi_buffer_max_m,
+    gvi_buffer_step_m,
+    ndvi_buffer_min_m,
+    ndvi_buffer_max_m,
+    ndvi_buffer_step_m,
+    ndvi_resolution_m,
+    gvi_grid_spacing_m,
     n_bins,
     veg_path,
     terrain_path,
@@ -123,6 +131,15 @@ def _fusion_worker(
         job_tracker_dict[job_id]["progress"] = 0.05
 
         print(f"[FUSION] Starting fusion job {job_id}")
+        print(
+            "[FUSION] Buffer ladders (UI; engine uses buffer_meters=max until wired): "
+            f"GVI [{gvi_buffer_min_m}, {gvi_buffer_max_m}] step={gvi_buffer_step_m} m, "
+            f"NDVI [{ndvi_buffer_min_m}, {ndvi_buffer_max_m}] step={ndvi_buffer_step_m} m"
+        )
+        if ndvi_resolution_m is not None:
+            print(f"[FUSION] NDVI export resolution (pending engine): {ndvi_resolution_m} m")
+        if gvi_grid_spacing_m is not None:
+            print(f"[FUSION] GVI sampling grid spacing (pending engine): {gvi_grid_spacing_m} m")
 
         engine = MetricFusionEngine(
             target_file=target_path,
@@ -321,7 +338,8 @@ def render(output_dir: str) -> None:
                     target_feature = st.selectbox(
                         "Target Attribute (Outcome Variable)",
                         options=numeric_cols,
-                        help="The health or environmental outcome to optimize towards",
+                        help="Numeric outcome column.",
+                        key="fusion_target_attribute",
                     )
                 except Exception as e:
                     st.error(f"Error loading GeoJSON: {e}")
@@ -337,7 +355,8 @@ def render(output_dir: str) -> None:
                             min_value=1,
                             max_value=n_bands,
                             value=1,
-                            help="The raster band containing outcome values",
+                            help="Band treated as the outcome surface.",
+                            key="fusion_target_band",
                         )
                 except Exception as e:
                     st.error(f"Error loading GeoTIFF: {e}")
@@ -346,21 +365,85 @@ def render(output_dir: str) -> None:
         st.divider()
         st.subheader("Metric Configuration")
 
-        buffer_meters = st.number_input(
-            "Buffer Distance (meters)",
-            min_value=100,
-            max_value=5000,
-            value=1500,
-            step=100,
-            help="Distance around target geometry for metric sampling",
-        )
+        st.markdown("**GVI buffer exploration (m)**")
+        col_bgvi_a, col_bgvi_b, col_bgvi_c = st.columns(3)
+        with col_bgvi_a:
+            gvi_buffer_min_m = st.number_input(
+                "GVI minimum buffer",
+                min_value=50,
+                max_value=4900,
+                value=100,
+                step=50,
+                help="Smallest GVI radius searched (m).",
+                key="fusion_gvi_buffer_min",
+            )
+        with col_bgvi_b:
+            gvi_buffer_max_m = st.number_input(
+                "GVI maximum buffer",
+                min_value=100,
+                max_value=5000,
+                value=1500,
+                step=50,
+                help="Largest GVI radius (m); extent padding uses max with NDVI.",
+                key="fusion_gvi_buffer_max",
+            )
+        with col_bgvi_c:
+            gvi_buffer_step_m = st.number_input(
+                "GVI buffer step",
+                min_value=10,
+                max_value=500,
+                value=50,
+                step=10,
+                help="Radius discretization (m).",
+                key="fusion_gvi_buffer_step",
+            )
+
+        st.markdown("**NDVI buffer exploration (m)**")
+        col_bndvi_a, col_bndvi_b, col_bndvi_c = st.columns(3)
+        with col_bndvi_a:
+            ndvi_buffer_min_m = st.number_input(
+                "NDVI minimum buffer",
+                min_value=50,
+                max_value=4900,
+                value=100,
+                step=50,
+                help="Smallest NDVI radius searched (m).",
+                key="fusion_ndvi_buffer_min",
+            )
+        with col_bndvi_b:
+            ndvi_buffer_max_m = st.number_input(
+                "NDVI maximum buffer",
+                min_value=100,
+                max_value=5000,
+                value=1500,
+                step=50,
+                help="Largest NDVI radius (m); extent padding uses max with GVI.",
+                key="fusion_ndvi_buffer_max",
+            )
+        with col_bndvi_c:
+            ndvi_buffer_step_m = st.number_input(
+                "NDVI buffer step",
+                min_value=10,
+                max_value=500,
+                value=50,
+                step=10,
+                help="Radius discretization (m).",
+                key="fusion_ndvi_buffer_step",
+            )
+
+        buffer_extent_m = float(max(gvi_buffer_max_m, ndvi_buffer_max_m))
 
         metric_mode = st.radio(
             "Metric Source",
             options=["Use Loaded Results", "Upload Files", "Auto-Download"],
             horizontal=True,
-            help="Choose how to provide GVI/NDVI metrics",
+            help="Use existing outputs, upload rasters/vectors, or fetch metrics at run time.",
+            key="fusion_metric_source",
         )
+
+        ndvi_auto_start = date(2023, 6, 1)
+        ndvi_auto_end = date(2023, 9, 30)
+        cache_metrics = False
 
         gvi_path = None
         ndvi_path = None
@@ -375,7 +458,7 @@ def render(output_dir: str) -> None:
             buffered_extent = None
             if tmp_target_path:
                 buffered_extent = _compute_buffered_extent(
-                    tmp_target_path, is_geojson, buffer_meters
+                    tmp_target_path, is_geojson, buffer_extent_m
                 )
 
             def _filter_by_coverage(file_list, bext):
@@ -395,11 +478,6 @@ def render(output_dir: str) -> None:
             ndvi_covering, ndvi_outside = _filter_by_coverage(
                 all_ndvi_files, buffered_extent
             )
-
-            if buffered_extent is None:
-                st.info(
-                    "Upload a target file above to automatically filter results by spatial coverage."
-                )
 
             col_gvi_sel, col_ndvi_sel = st.columns(2)
 
@@ -518,37 +596,62 @@ def render(output_dir: str) -> None:
                     st.success(f"✓ Uploaded: {ndvi_file.name}")
 
         else:  # Auto-Download
-            st.info(
-                "📥 Metrics will be automatically downloaded when optimization runs"
-            )
             col_ad1, col_ad2 = st.columns(2)
             with col_ad1:
                 ndvi_auto_start = st.date_input(
                     "NDVI Start Date",
                     value=date(2023, 6, 1),
-                    help="Start of the date range for NDVI auto-download",
+                    help="Composite interval start (auto-download NDVI).",
+                    key="fusion_ndvi_start_date",
                 )
             with col_ad2:
                 ndvi_auto_end = st.date_input(
                     "NDVI End Date",
                     value=date(2023, 9, 30),
-                    help="End of the date range for NDVI auto-download",
+                    help="Composite interval end (auto-download NDVI).",
+                    key="fusion_ndvi_end_date",
                 )
             cache_metrics = st.checkbox(
                 "Cache Metrics to Disk",
                 value=True,
-                help="Save processed metrics to output_results/fusion_cache for reuse",
+                help="Persist fetched metrics under the output fusion cache.",
+                key="fusion_cache_metrics",
             )
             gvi_api_key_input = st.text_input(
                 "Street View API Key (optional)",
                 type="password",
-                help="Leave blank to use the package scraper",
+                help="Optional Google Street View key; leave blank for built-in access.",
+                key="fusion_streetview_api_key",
             )
 
         if metric_mode != "Auto-Download":
             ndvi_auto_start = date(2023, 6, 1)
             ndvi_auto_end = date(2023, 9, 30)
             cache_metrics = False
+
+        ndvi_resolution_m = None
+        gvi_grid_spacing_m = None
+
+        if metric_mode == "Auto-Download":
+            st.markdown("**Metric generation settings**")
+            ndvi_resolution_m = st.number_input(
+                "NDVI satellite resolution (m)",
+                min_value=5.0,
+                max_value=100.0,
+                value=10.0,
+                step=5.0,
+                help="Target pixel size for NDVI export (Earth Engine).",
+                key="fusion_ndvi_satellite_resolution",
+            )
+            gvi_grid_spacing_m = st.number_input(
+                "GVI sampling grid spacing (m)",
+                min_value=10.0,
+                max_value=500.0,
+                value=50.0,
+                step=10.0,
+                help="Spacing for street-view sample points on the grid.",
+                key="fusion_gvi_sampling_grid_spacing",
+            )
 
         st.divider()
         st.subheader("Optimization Settings")
@@ -559,7 +662,7 @@ def render(output_dir: str) -> None:
                 "Objective Metric",
                 options=["pearson", "spearman", "r2", "rmse", "mutual_info"],
                 index=0,
-                help="Metric to optimize (correlation or regression error)",
+                help="Quantity maximized or minimized across CV folds.",
                 key="fusion_objective_metric",
             )
             n_trials = st.number_input(
@@ -568,18 +671,14 @@ def render(output_dir: str) -> None:
                 max_value=1000,
                 value=300,
                 step=50,
-                help="Total optimization iterations",
+                help="Number of Optuna trials.",
                 key="fusion_n_trials",
             )
             optimizer = st.selectbox(
                 "Optimizer",
                 options=["TPE", "CMA-ES", "Random"],
                 index=0,
-                help=(
-                    "TPE: Tree-structured Parzen Estimator — efficient Bayesian search. "
-                    "CMA-ES: evolutionary covariance-matrix adaptation — strong on continuous parameters. "
-                    "Random: unguided random baseline."
-                ),
+                help="Hyperparameter search sampler.",
                 key="fusion_optimizer",
             )
 
@@ -590,14 +689,14 @@ def render(output_dir: str) -> None:
                 max_value=500,
                 value=150,
                 step=10,
-                help="Initial random exploration before the optimizer takes over",
+                help="Uniformly random trials before the main sampler.",
                 key="fusion_n_startup",
             )
             pruner_type = st.selectbox(
                 "Pruner",
                 options=["median", "hyperband", "successive_halving", "none"],
                 index=0,
-                help="Early stopping strategy for poor trials",
+                help="Early stopping rule for unpromising trials.",
                 key="fusion_pruner",
             )
 
@@ -609,7 +708,8 @@ def render(output_dir: str) -> None:
                 max_value=0.5,
                 value=0.3,
                 step=0.05,
-                help="Proportion of data for testing",
+                help="Held-out evaluation fraction.",
+                key="fusion_test_size",
             )
         with col_split2:
             k_folds = st.number_input(
@@ -617,7 +717,8 @@ def render(output_dir: str) -> None:
                 min_value=3,
                 max_value=10,
                 value=5,
-                help="Number of cross-validation folds",
+                help="Cross-validation folds on the non-test subset.",
+                key="fusion_k_folds",
             )
         with col_split3:
             n_bins = st.number_input(
@@ -625,7 +726,8 @@ def render(output_dir: str) -> None:
                 min_value=3,
                 max_value=10,
                 value=5,
-                help="Number of quantile bins for stratified split",
+                help="Quantile bins for stratified train/test split.",
+                key="fusion_stratification_bins",
             )
 
     with col_fusion_right:
@@ -775,6 +877,10 @@ def render(output_dir: str) -> None:
             st.error("❌ Please upload a target file")
         elif is_geojson and not target_feature:
             st.error("❌ Please select a target attribute for the GeoJSON target")
+        elif gvi_buffer_min_m > gvi_buffer_max_m or ndvi_buffer_min_m > ndvi_buffer_max_m:
+            st.error(
+                "❌ Each modality's minimum buffer must be less than or equal to its maximum buffer."
+            )
         else:
             if metric_mode == "Use Loaded Results" and not gvi_path and not ndvi_path:
                 st.error(
@@ -782,13 +888,25 @@ def render(output_dir: str) -> None:
                     "switch to Auto-Download mode."
                 )
             else:
-                with st.expander("ℹ️ Configuration Summary", expanded=True):
+                with st.expander("Configuration Summary", expanded=True):
                     st.write(f"**Target:** {target_file.name}")
                     if is_geojson:
                         st.write(f"**Feature:** {target_feature}")
                     else:
                         st.write(f"**Band:** {target_band}")
-                    st.write(f"**Buffer:** {buffer_meters}m")
+                    st.write(
+                        f"**GVI buffers (m):** {gvi_buffer_min_m} – {gvi_buffer_max_m} "
+                        f"(step {gvi_buffer_step_m})"
+                    )
+                    st.write(
+                        f"**NDVI buffers (m):** {ndvi_buffer_min_m} – {ndvi_buffer_max_m} "
+                        f"(step {ndvi_buffer_step_m})"
+                    )
+                    st.write(f"**Extent padding (m):** {buffer_extent_m}")
+                    if ndvi_resolution_m is not None:
+                        st.write(f"**NDVI resolution (m):** {ndvi_resolution_m}")
+                    if gvi_grid_spacing_m is not None:
+                        st.write(f"**GVI grid spacing (m):** {gvi_grid_spacing_m}")
                     st.write(
                         f"**GVI Source:** "
                         f"{'✓ ' + os.path.basename(gvi_path) if gvi_path else '📥 Auto-download'}"
@@ -829,7 +947,15 @@ def render(output_dir: str) -> None:
                         tmp_target_path,
                         target_feature if is_geojson else None,
                         target_band if is_tiff else 1,
-                        buffer_meters,
+                        buffer_extent_m,
+                        gvi_buffer_min_m,
+                        gvi_buffer_max_m,
+                        gvi_buffer_step_m,
+                        ndvi_buffer_min_m,
+                        ndvi_buffer_max_m,
+                        ndvi_buffer_step_m,
+                        ndvi_resolution_m,
+                        gvi_grid_spacing_m,
                         n_bins,
                         gvi_path,
                         None,  # terrain_path — separate from veg in load_metrics
@@ -856,10 +982,6 @@ def render(output_dir: str) -> None:
                 thread.start()
 
                 st.success("✅ Fusion job started! Check sidebar for progress.")
-                st.info(
-                    "Note: If GVI/NDVI metrics are not found, they will be "
-                    "automatically downloaded. This may take a while."
-                )
 
     # Check for completed fusion jobs and load results
     if "jobs" in st.session_state:
