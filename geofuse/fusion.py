@@ -147,6 +147,11 @@ class MetricFusionEngine:
         self.scaler = None
         self.k_folds = 5  # Number of CV folds
 
+        # Donut / ring cache: per-point annulus samples keyed by fold subset + indices
+        self._ring_raster_cache: dict = {}
+        self._ring_vector_cache: dict = {}
+        self._max_points_ring_cache = 8000
+
         # Determine input type
         self.is_points = target_file.lower().endswith((".geojson", ".shp"))
         self.is_raster = target_file.lower().endswith((".tif", ".tiff"))
@@ -257,6 +262,7 @@ class MetricFusionEngine:
         self._gvi_grid_spacing_m = (
             float(gvi_grid_spacing_m) if gvi_grid_spacing_m is not None else 75.0
         )
+        self._clear_ring_caches()
         # Check for multi-band GVI cache (Band 1=Veg, Band 2=Terrain)
         gvi_multiband_cache = self._get_cache_filename("gvi_combined", ".tif")
 
@@ -1261,6 +1267,323 @@ class MetricFusionEngine:
 
         return result
 
+    def _clear_ring_caches(self) -> None:
+        self._ring_raster_cache.clear()
+        self._ring_vector_cache.clear()
+
+    @staticmethod
+    def _polygonal_parts(geom):
+        gt = geom.geom_type
+        if gt == "Polygon":
+            return [geom]
+        if gt == "MultiPolygon":
+            return list(geom.geoms)
+        if gt == "GeometryCollection":
+            parts = []
+            for g in geom.geoms:
+                parts.extend(MetricFusionEngine._polygonal_parts(g))
+            return parts
+        return []
+
+    def _outer_radii_metres(self, *, gvi: bool) -> np.ndarray:
+        if gvi:
+            lo, hi, st = _radius_int_bounds(
+                self.gvi_buffer_min_m,
+                self.gvi_buffer_max_m,
+                self.gvi_buffer_step_m,
+            )
+        else:
+            lo, hi, st = _radius_int_bounds(
+                self.ndvi_buffer_min_m,
+                self.ndvi_buffer_max_m,
+                self.ndvi_buffer_step_m,
+            )
+        return np.arange(lo, hi + 1, st, dtype=np.int64)
+
+    @staticmethod
+    def _ring_end_index(radii: np.ndarray, radius_m: float) -> int:
+        r = int(round(float(radius_m)))
+        hits = np.flatnonzero(radii == r)
+        if hits.size:
+            return int(hits[-1])
+        return int(np.searchsorted(radii, r, side="right") - 1)
+
+    @staticmethod
+    def _aggregate_disk_from_rings(
+        ring_arrays: list[np.ndarray],
+        end_ring_idx: int,
+        stat: str,
+        percentile: int,
+    ) -> float:
+        if end_ring_idx < 0:
+            return np.nan
+        parts = ring_arrays[: end_ring_idx + 1]
+        nonempty = [p for p in parts if p.size > 0]
+        if not nonempty:
+            return np.nan
+        vals = np.concatenate(nonempty)
+        if stat == "mean":
+            return float(np.mean(vals))
+        if stat == "median":
+            return float(np.median(vals))
+        if stat == "percentile":
+            return float(np.percentile(vals, percentile))
+        return np.nan
+
+    def _vector_metric_column(
+        self, metric_data: gpd.GeoDataFrame, channel: str
+    ) -> str:
+        metric_col = metric_data.attrs.get("metric_column")
+        if metric_col and metric_col in metric_data.columns:
+            return metric_col
+        if channel == "veg":
+            for col in ["veg", "gvi_veg", "gvi", "GVI", "value"]:
+                if col in metric_data.columns:
+                    return col
+        elif channel == "terrain":
+            for col in ["terrain", "gvi_ter", "NDVI", "ndvi", "value"]:
+                if col in metric_data.columns:
+                    return col
+        else:
+            for col in ["NDVI", "ndvi", "value"]:
+                if col in metric_data.columns:
+                    return col
+        numeric_cols = metric_data.select_dtypes(include=[np.number]).columns.tolist()
+        numeric_cols = [
+            c for c in numeric_cols if c not in ["index_right", "index_left", "index"]
+        ]
+        if numeric_cols:
+            return numeric_cols[0]
+        raise ValueError(f"No numeric metric column for channel={channel}")
+
+    def _precompute_raster_ring_values(
+        self,
+        metric_dict: dict,
+        points_gdf: gpd.GeoDataFrame,
+        radii_m: np.ndarray,
+    ) -> list[list[np.ndarray]]:
+        n_pts = len(points_gdf)
+        n_rings = len(radii_m)
+        ring_values: list[list[np.ndarray]] = [
+            [np.array([], dtype=np.float64) for _ in range(n_rings)]
+            for _ in range(n_pts)
+        ]
+
+        metric_array = metric_dict["data"]
+        transform = metric_dict["transform"]
+        metric_crs = metric_dict["crs"]
+        points_metric_crs = points_gdf.to_crs(metric_crs)
+
+        pixel_size = abs(transform.a)
+        if metric_crs.is_geographic:
+            pixel_size_meters = pixel_size * 111320
+        else:
+            pixel_size_meters = pixel_size
+
+        max_r_m = float(radii_m[-1])
+        max_r_px = int(max_r_m / pixel_size_meters)
+        max_r_px = max(1, min(max_r_px, 10000))
+
+        idx_to_pos = {idx: pos for pos, idx in enumerate(points_gdf.index)}
+
+        for idx, point in points_metric_crs.iterrows():
+            pos = idx_to_pos[idx]
+            row, col = rowcol(transform, point.geometry.x, point.geometry.y)
+
+            rmin = max(row - max_r_px, 0)
+            rmax = min(row + max_r_px + 1, metric_array.shape[0])
+            cmin = max(col - max_r_px, 0)
+            cmax = min(col + max_r_px + 1, metric_array.shape[1])
+            if rmin >= rmax or cmin >= cmax:
+                continue
+
+            window = metric_array[rmin:rmax, cmin:cmax]
+            rr = np.arange(rmin, rmax, dtype=np.float64)[:, None]
+            cc = np.arange(cmin, cmax, dtype=np.float64)[None, :]
+            dr = rr - float(row)
+            dc = cc - float(col)
+            dist_m = np.sqrt(dr * dr + dc * dc) * pixel_size_meters
+
+            if hasattr(window, "mask"):
+                base_valid = ~window.mask
+                data = window.data
+            else:
+                base_valid = np.ones(window.shape, dtype=bool)
+                data = window
+
+            for k in range(n_rings):
+                inner_m = 0.0 if k == 0 else float(radii_m[k - 1])
+                outer_m = float(radii_m[k])
+                if inner_m <= 0:
+                    ring_mask = dist_m <= outer_m
+                else:
+                    ring_mask = (dist_m <= outer_m) & (dist_m > inner_m)
+                valid = base_valid & ring_mask
+                vals = np.asarray(data[valid], dtype=np.float64).ravel()
+                vals = vals[~np.isnan(vals)]
+                ring_values[pos][k] = vals
+
+        return ring_values
+
+    def _precompute_vector_ring_values(
+        self,
+        metric_data: gpd.GeoDataFrame,
+        points_gdf: gpd.GeoDataFrame,
+        radii_m: np.ndarray,
+        metric_col: str,
+    ) -> list[list[np.ndarray]]:
+        n_pts = len(points_gdf)
+        n_rings = len(radii_m)
+        ring_values: list[list[np.ndarray]] = [
+            [np.array([], dtype=np.float64) for _ in range(n_rings)]
+            for _ in range(n_pts)
+        ]
+
+        points_wgs84 = points_gdf.to_crs("EPSG:4326")
+        centroid = points_wgs84.geometry.union_all().centroid
+        lon, lat = centroid.x, centroid.y
+        utm_zone = int((lon + 180) / 6) + 1
+        utm_crs = (
+            f"EPSG:326{utm_zone:02d}" if lat >= 0 else f"EPSG:327{utm_zone:02d}"
+        )
+
+        points_utm = points_gdf.to_crs(utm_crs)
+        metric_utm = metric_data.to_crs(utm_crs)
+
+        idx_to_pos = {idx: pos for pos, idx in enumerate(points_gdf.index)}
+
+        for idx, prow in points_utm.iterrows():
+            pos = idx_to_pos[idx]
+            pt = prow.geometry
+            for k in range(n_rings):
+                inner_m = 0.0 if k == 0 else float(radii_m[k - 1])
+                outer_m = float(radii_m[k])
+                buf_o = pt.buffer(outer_m)
+                if inner_m <= 0:
+                    ring_poly = buf_o
+                else:
+                    ring_poly = buf_o.difference(pt.buffer(inner_m))
+                vals_list: list[np.ndarray] = []
+                for poly in MetricFusionEngine._polygonal_parts(ring_poly):
+                    if poly.is_empty:
+                        continue
+                    tmp = gpd.GeoDataFrame(geometry=[poly], crs=points_utm.crs)
+                    joined = gpd.sjoin(
+                        metric_utm, tmp, how="inner", predicate="intersects"
+                    )
+                    if metric_col in joined.columns:
+                        v = joined[metric_col].dropna().values.astype(np.float64)
+                        if v.size:
+                            vals_list.append(v)
+                ring_values[pos][k] = (
+                    np.concatenate(vals_list) if vals_list else np.array([])
+                )
+
+        return ring_values
+
+    def _ring_cache_key(
+        self,
+        channel: str,
+        fold_idx: int,
+        subset: str,
+        points_gdf: gpd.GeoDataFrame,
+        radii: np.ndarray,
+    ) -> tuple:
+        return (
+            channel,
+            fold_idx,
+            subset,
+            tuple(points_gdf.index),
+            radii.tobytes(),
+        )
+
+    def _aggregate_from_ring_cache(
+        self,
+        radii: np.ndarray,
+        ring_rows: list[list[np.ndarray]],
+        radius_m: float,
+        stat: str,
+        percentile: int,
+    ) -> np.ndarray:
+        n = len(ring_rows)
+        out = np.full(n, np.nan, dtype=np.float64)
+        end_idx = MetricFusionEngine._ring_end_index(radii, radius_m)
+        if end_idx < 0:
+            return out
+        for pos in range(n):
+            out[pos] = MetricFusionEngine._aggregate_disk_from_rings(
+                ring_rows[pos], end_idx, stat, percentile
+            )
+        return out
+
+    def _aggregate_with_ring_cache(
+        self,
+        points_gdf: gpd.GeoDataFrame,
+        metric_data: gpd.GeoDataFrame | dict,
+        radius_m: float,
+        stat: str,
+        percentile: int,
+        *,
+        channel: str,
+        fold_idx: int | None,
+        subset: str | None,
+    ) -> np.ndarray:
+        """
+        Circular neighbourhood aggregation using precomputed annuli when possible.
+
+        Falls back to _apply_circular_buffer_aggregation for large point sets,
+        unsupported modes, or cache build failures.
+        """
+        if (
+            fold_idx is None
+            or subset is None
+            or len(points_gdf) > self._max_points_ring_cache
+        ):
+            return self._apply_circular_buffer_aggregation(
+                points_gdf, metric_data, radius_m, stat, percentile
+            )
+
+        gvi = channel in ("veg", "terrain")
+        radii = self._outer_radii_metres(gvi=gvi)
+        if radii.size == 0:
+            return self._apply_circular_buffer_aggregation(
+                points_gdf, metric_data, radius_m, stat, percentile
+            )
+
+        cache_store = (
+            self._ring_raster_cache
+            if isinstance(metric_data, dict)
+            else self._ring_vector_cache
+        )
+        key = self._ring_cache_key(channel, fold_idx, subset, points_gdf, radii)
+
+        if key not in cache_store:
+            try:
+                if isinstance(metric_data, dict):
+                    rows = self._precompute_raster_ring_values(
+                        metric_data, points_gdf, radii
+                    )
+                else:
+                    col = self._vector_metric_column(metric_data, channel)
+                    rows = self._precompute_vector_ring_values(
+                        metric_data, points_gdf, radii, col
+                    )
+                cache_store[key] = (radii, rows)
+                logger.info(
+                    f"Ring cache built: channel={channel} subset={subset} fold={fold_idx} "
+                    f"points={len(points_gdf)} rings={len(radii)}"
+                )
+            except Exception as e:
+                logger.warning(f"Ring cache build failed ({channel}): {e}")
+                return self._apply_circular_buffer_aggregation(
+                    points_gdf, metric_data, radius_m, stat, percentile
+                )
+
+        _, rows = cache_store[key]
+        return self._aggregate_from_ring_cache(
+            radii, rows, radius_m, stat, percentile
+        )
+
     def prepare_fusion_data(self) -> pd.DataFrame:
         """
         Align vegetation, terrain, NDVI, and target data into a single DataFrame.
@@ -1780,6 +2103,8 @@ class MetricFusionEngine:
         if self.cv_folds is None:
             raise ValueError("Call split_data() first")
 
+        self._clear_ring_caches()
+
         # Build sampler
         if sampler_type == "CMA-ES":
             sampler = CmaEsSampler(
@@ -1996,19 +2321,25 @@ class MetricFusionEngine:
 
             # Apply circular buffer aggregation for vegetation (with SHARED streetview_stat)
             if veg_weight > 0:
-                train_veg = self._apply_circular_buffer_aggregation(
+                train_veg = self._aggregate_with_ring_cache(
                     train_points,
                     self.veg_data,
                     veg_radius,
-                    streetview_stat,  # SHARED
-                    streetview_percentile,  # SHARED
+                    streetview_stat,
+                    streetview_percentile,
+                    channel="veg",
+                    fold_idx=fold_idx,
+                    subset="train",
                 )
-                val_veg = self._apply_circular_buffer_aggregation(
+                val_veg = self._aggregate_with_ring_cache(
                     val_points,
                     self.veg_data,
                     veg_radius,
-                    streetview_stat,  # SHARED
-                    streetview_percentile,  # SHARED
+                    streetview_stat,
+                    streetview_percentile,
+                    channel="veg",
+                    fold_idx=fold_idx,
+                    subset="val",
                 )
             else:
                 train_veg = np.zeros(len(train_points))
@@ -2016,19 +2347,25 @@ class MetricFusionEngine:
 
             # Apply circular buffer aggregation for terrain (with SHARED streetview_stat)
             if terrain_weight > 0:
-                train_terrain = self._apply_circular_buffer_aggregation(
+                train_terrain = self._aggregate_with_ring_cache(
                     train_points,
                     self.terrain_data,
                     terrain_radius,
-                    streetview_stat,  # SHARED
-                    streetview_percentile,  # SHARED
+                    streetview_stat,
+                    streetview_percentile,
+                    channel="terrain",
+                    fold_idx=fold_idx,
+                    subset="train",
                 )
-                val_terrain = self._apply_circular_buffer_aggregation(
+                val_terrain = self._aggregate_with_ring_cache(
                     val_points,
                     self.terrain_data,
                     terrain_radius,
-                    streetview_stat,  # SHARED
-                    streetview_percentile,  # SHARED
+                    streetview_stat,
+                    streetview_percentile,
+                    channel="terrain",
+                    fold_idx=fold_idx,
+                    subset="val",
                 )
             else:
                 train_terrain = np.zeros(len(train_points))
@@ -2036,19 +2373,25 @@ class MetricFusionEngine:
 
             # Apply circular buffer aggregation for NDVI (separate stat)
             if ndvi_weight > 0:
-                train_ndvi = self._apply_circular_buffer_aggregation(
+                train_ndvi = self._aggregate_with_ring_cache(
                     train_points,
                     self.ndvi_data,
                     ndvi_radius,
-                    ndvi_stat,  # SEPARATE
-                    ndvi_percentile,  # SEPARATE
+                    ndvi_stat,
+                    ndvi_percentile,
+                    channel="ndvi",
+                    fold_idx=fold_idx,
+                    subset="train",
                 )
-                val_ndvi = self._apply_circular_buffer_aggregation(
+                val_ndvi = self._aggregate_with_ring_cache(
                     val_points,
                     self.ndvi_data,
                     ndvi_radius,
-                    ndvi_stat,  # SEPARATE
-                    ndvi_percentile,  # SEPARATE
+                    ndvi_stat,
+                    ndvi_percentile,
+                    channel="ndvi",
+                    fold_idx=fold_idx,
+                    subset="val",
                 )
             else:
                 train_ndvi = np.zeros(len(train_points))
@@ -2421,36 +2764,45 @@ class MetricFusionEngine:
 
         # Sample vegetation with optimized radius/stat
         if veg_weight > 0:
-            test_veg = self._apply_circular_buffer_aggregation(
+            test_veg = self._aggregate_with_ring_cache(
                 test_points,
                 self.veg_data,
                 veg_radius,
                 streetview_stat,
                 streetview_percentile,
+                channel="veg",
+                fold_idx=-1,
+                subset="test",
             )
         else:
             test_veg = np.zeros(len(test_points))
 
         # Sample terrain with optimized radius/stat
         if terrain_weight > 0:
-            test_terrain = self._apply_circular_buffer_aggregation(
+            test_terrain = self._aggregate_with_ring_cache(
                 test_points,
                 self.terrain_data,
                 terrain_radius,
                 streetview_stat,
                 streetview_percentile,
+                channel="terrain",
+                fold_idx=-1,
+                subset="test",
             )
         else:
             test_terrain = np.zeros(len(test_points))
 
         # Sample NDVI with optimized radius/stat
         if ndvi_weight > 0:
-            test_ndvi = self._apply_circular_buffer_aggregation(
+            test_ndvi = self._aggregate_with_ring_cache(
                 test_points,
                 self.ndvi_data,
                 ndvi_radius,
                 ndvi_stat,
                 ndvi_percentile,
+                channel="ndvi",
+                fold_idx=-1,
+                subset="test",
             )
         else:
             test_ndvi = np.zeros(len(test_points))
@@ -2557,34 +2909,43 @@ class MetricFusionEngine:
 
         # Apply circular buffer aggregation with optimized parameters
         if weights["veg_weight"] > 0:
-            all_veg = self._apply_circular_buffer_aggregation(
+            all_veg = self._aggregate_with_ring_cache(
                 all_points,
                 self.veg_data,
                 veg_radius,
                 streetview_stat,
                 streetview_percentile,
+                channel="veg",
+                fold_idx=-1,
+                subset="all",
             )
         else:
             all_veg = np.zeros(len(all_points))
 
         if weights["terrain_weight"] > 0:
-            all_terrain = self._apply_circular_buffer_aggregation(
+            all_terrain = self._aggregate_with_ring_cache(
                 all_points,
                 self.terrain_data,
                 terrain_radius,
                 streetview_stat,
                 streetview_percentile,
+                channel="terrain",
+                fold_idx=-1,
+                subset="all",
             )
         else:
             all_terrain = np.zeros(len(all_points))
 
         if weights["ndvi_weight"] > 0:
-            all_ndvi = self._apply_circular_buffer_aggregation(
+            all_ndvi = self._aggregate_with_ring_cache(
                 all_points,
                 self.ndvi_data,
                 ndvi_radius,
                 ndvi_stat,
                 ndvi_percentile,
+                channel="ndvi",
+                fold_idx=-1,
+                subset="all",
             )
         else:
             all_ndvi = np.zeros(len(all_points))
@@ -2917,36 +3278,45 @@ class MetricFusionEngine:
 
         # 5. Sample metrics at grid points using final parameters
         logger.info("Sampling vegetation at grid points...")
-        veg_values = self._apply_circular_buffer_aggregation(
+        veg_values = self._aggregate_with_ring_cache(
             points_gdf,
             self.veg_data,
             final_params["veg_radius"],
             final_params["streetview_stat"],
             final_params["streetview_percentile"],
+            channel="veg",
+            fold_idx=-1,
+            subset="robust_map",
         )
 
         if progress_callback:
             progress_callback(55, 100)
 
         logger.info("Sampling terrain at grid points...")
-        terrain_values = self._apply_circular_buffer_aggregation(
+        terrain_values = self._aggregate_with_ring_cache(
             points_gdf,
             self.terrain_data,
             final_params["terrain_radius"],
             final_params["streetview_stat"],
             final_params["streetview_percentile"],
+            channel="terrain",
+            fold_idx=-1,
+            subset="robust_map",
         )
 
         if progress_callback:
             progress_callback(70, 100)
 
         logger.info("Sampling NDVI at grid points...")
-        ndvi_values = self._apply_circular_buffer_aggregation(
+        ndvi_values = self._aggregate_with_ring_cache(
             points_gdf,
             self.ndvi_data,
             final_params["ndvi_radius"],
             final_params["ndvi_stat"],
             final_params["ndvi_percentile"],
+            channel="ndvi",
+            fold_idx=-1,
+            subset="robust_map",
         )
 
         if progress_callback:
