@@ -9,8 +9,6 @@ import time
 import uuid
 from datetime import date, datetime
 
-from branca.colormap import LinearColormap
-from branca.element import Element as BrancaHtmlElement
 import folium
 import geopandas as gpd
 import matplotlib.pyplot as plt
@@ -18,6 +16,8 @@ import numpy as np
 import pandas as pd
 import rasterio
 import streamlit as st
+from branca.element import MacroElement
+from jinja2 import Template
 from PIL import Image as PILImage
 from shapely.geometry import box as shapely_box
 from shapely.geometry import mapping as shapely_mapping
@@ -30,6 +30,35 @@ except ImportError:
     _MetricFusionEngine = None
 
 _FUSION_OUTCOME_ADD_PLACEHOLDER = "— Select column —"
+
+
+class _FusionVerticalScaleControl(MacroElement):
+    """Leaflet control: vertical red→yellow→green strip with numeric bounds."""
+
+    _template = Template(
+        """
+{% macro script(this, kwargs) %}
+    var {{ this.get_name() }}_vsc = L.control({position: 'topright'});
+    {{ this.get_name() }}_vsc.onAdd = function (map) {
+        var d = L.DomUtil.create('div', 'gf-fusion-vscale leaflet-bar');
+        d.style.background = 'rgba(255,255,255,0.78)';
+        d.style.padding = '6px 8px';
+        d.style.borderRadius = '4px';
+        d.style.border = '2px solid rgba(0,0,0,0.12)';
+        d.innerHTML = {{ this.inner_html|tojson }};
+        L.DomEvent.disableClickPropagation(d);
+        L.DomEvent.disableScrollPropagation(d);
+        return d;
+    };
+    {{ this.get_name() }}_vsc.addTo({{ this._parent.get_name() }});
+{% endmacro %}
+"""
+    )
+
+    def __init__(self, inner_html: str):
+        super().__init__()
+        self._name = "FusionVScale"
+        self.inner_html = inner_html
 
 
 def _fusion_append_outcome_callback() -> None:
@@ -86,36 +115,66 @@ def _geojson_geometry_summary(gdf: gpd.GeoDataFrame) -> str:
     return f"{n} features (mixed geometry types)"
 
 
+def _fusion_rdygn_hex(t: float) -> str:
+    """Map t in [0, 1] to hex color red → yellow → green."""
+    t = float(np.clip(t, 0.0, 1.0))
+    if t <= 0.5:
+        u = t * 2.0
+        r, g, b = 255, int(255 * u), 0
+    else:
+        u = (t - 0.5) * 2.0
+        r, g = int(255 * (1.0 - u)), 255
+        b = 0
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _fusion_value_to_rdygn_hex(v: float, vmin: float, vmax: float) -> str:
+    """Fill color for outcome preview (uniform green when vmax <= vmin)."""
+    if not np.isfinite(v) or not np.isfinite(vmin) or not np.isfinite(vmax):
+        return "#22aa44"
+    if vmax <= vmin:
+        return "#22aa44"
+    return _fusion_rdygn_hex((v - vmin) / (vmax - vmin))
+
+
+def _fusion_vertical_scale_inner_html(vmin: float, vmax: float) -> str:
+    """HTML fragment for the in-map vertical legend body."""
+    vmin_s = html.escape(f"{vmin:.4g}")
+    vmax_s = html.escape(f"{vmax:.4g}")
+    if vmax > vmin:
+        bar_bg = "linear-gradient(to top, #ff0000 0%, #ffff00 50%, #00ff00 100%)"
+    else:
+        bar_bg = "#22aa44"
+    return (
+        '<div aria-label="Outcome value scale" '
+        'style="display:flex;flex-direction:row;align-items:stretch;gap:6px;'
+        "height:min(200px,36vh);max-height:240px;box-sizing:border-box;\">"
+        '<div style="display:flex;flex-direction:column;justify-content:space-between;'
+        "text-align:right;font-size:11px;line-height:1.15;color:#222;"
+        'min-width:2.2rem;flex-shrink:0;">'
+        f"<span>{vmax_s}</span><span>{vmin_s}</span></div>"
+        '<div title="High (top) to low (bottom)" '
+        'style="width:12px;border-radius:2px;border:1px solid rgba(0,0,0,0.3);'
+        f"background:{bar_bg};flex-shrink:0;\"></div></div>"
+    )
+
+
+def _add_fusion_vertical_scale_to_map(m: folium.Map, vmin: float, vmax: float) -> None:
+    _FusionVerticalScaleControl(_fusion_vertical_scale_inner_html(vmin, vmax)).add_to(m)
+
+
 def _add_outcome_geometry_preview(
     m: folium.Map,
     preview_gdf: gpd.GeoDataFrame,
     preview_feature: str,
-) -> None:
-    """Draw outcome-colored geometries (not centroids) with a map colorbar."""
+) -> bool:
+    """Draw outcome-colored geometries and attach the vertical scale; return False if nothing drawn."""
     vals = preview_gdf[preview_feature].dropna()
     if len(vals) == 0:
-        return
+        return False
     vmin, vmax = float(vals.min()), float(vals.max())
     fill_opacity = 0.7
     line_opacity = 0.7
-    const_hex = "#22aa44"
-
-    if vmax > vmin:
-        colormap = LinearColormap(
-            colors=["#ff0000", "#ffff00", "#00ff00"],
-            vmin=vmin,
-            vmax=vmax,
-            caption="",
-        )
-        # Slightly narrower than default 450px so axis labels (esp. vmax) fit inside the map.
-        colormap.width = 390
-    else:
-        colormap = None
-
-    def color_for_value(v: float) -> str:
-        if colormap is not None:
-            return colormap(float(v))
-        return const_hex
 
     features: list[dict] = []
     for _, row in preview_gdf.iterrows():
@@ -128,7 +187,7 @@ def _add_outcome_geometry_preview(
         geom = row.geometry
         if geom is None or geom.is_empty:
             continue
-        hc = color_for_value(v)
+        hc = _fusion_value_to_rdygn_hex(v, vmin, vmax)
         try:
             geom_d = shapely_mapping(geom)
         except Exception:
@@ -145,7 +204,7 @@ def _add_outcome_geometry_preview(
         )
 
     if not features:
-        return
+        return False
 
     folium.GeoJson(
         {"type": "FeatureCollection", "features": features},
@@ -159,71 +218,13 @@ def _add_outcome_geometry_preview(
         },
         tooltip=folium.GeoJsonTooltip(
             fields=["_v"],
-            aliases=[preview_feature],
+            labels=False,
             sticky=True,
             localize=True,
         ),
     ).add_to(m)
-    if colormap is not None:
-        colormap.add_to(m)
-    else:
-        esc = html.escape(preview_feature)
-        legend_html = (
-            '<div style="position: fixed; bottom: 28px; right: 8px; z-index: 1000; '
-            "background: rgba(255,255,255,0.92); padding: 8px 10px; "
-            'border: 1px solid #999; border-radius: 4px; font-size: 11px; '
-            "max-width: min(85vw, 280px); box-sizing: border-box; "
-            'word-wrap: break-word;">'
-            '<div style="font-weight:600;margin-bottom:4px;">Outcome scale</div>'
-            '<div style="display:flex;align-items:center;gap:8px;">'
-            f'<span style="display:inline-block;width:36px;height:14px;'
-            f"background:{const_hex};opacity:{fill_opacity};"
-            f'border:2px solid {const_hex};"></span>'
-            f"<span>{esc}: {vmin:.4g} (uniform)</span></div></div>"
-        )
-        m.get_root().html.add_child(BrancaHtmlElement(legend_html))  # type: ignore[attr-defined]
-
-
-_FUSION_PREVIEW_RESPONSIVE_LEGEND_CSS = """
-<style>
-/* Branca colorbar SVG defaults to ~450px wide; scale it to the map width. */
-.leaflet-container {
-    container-type: inline-size;
-    container-name: geofuse-folium-map;
-}
-.leaflet-container .legend.leaflet-control {
-    max-width: calc(80cqw - 2rem) !important;
-    box-sizing: border-box !important;
-    margin-right: 18px !important;
-    overflow: visible !important;
-}
-.leaflet-container .legend.leaflet-control svg#legend {
-    display: block;
-    max-width: calc(80cqw - 2.5rem) !important;
-    width: min(390px, calc(80cqw - 2.5rem)) !important;
-    height: auto !important;
-    overflow: visible !important;
-}
-/* Column name is shown in the preview picker; hide Branca caption line. */
-.leaflet-container .legend.leaflet-control svg#legend text.caption {
-    display: none !important;
-}
-.leaflet-container .legend.leaflet-control svg#legend .key,
-.leaflet-container .legend.leaflet-control svg#legend text {
-    font-size: 12px !important;
-}
-/* GeoJSON hover tooltips (folium.GeoJsonTooltip): match colorbar text size. */
-.leaflet-container .leaflet-tooltip {
-    font-size: 12px !important;
-    line-height: 1.25 !important;
-}
-</style>
-"""
-
-
-def _inject_fusion_preview_responsive_legend_css(m: folium.Map) -> None:
-    """Shrink Branca LinearColormap bars when the map iframe/column is narrow."""
-    m.get_root().header.add_child(BrancaHtmlElement(_FUSION_PREVIEW_RESPONSIVE_LEGEND_CSS))  # type: ignore[attr-defined]
+    _add_fusion_vertical_scale_to_map(m, vmin, vmax)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +251,7 @@ def _compute_buffered_extent(
                 gdf = gdf.set_crs("EPSG:4326")
             else:
                 gdf = gdf.to_crs("EPSG:4326")
-        else:  # GeoTIFF
+        else:
             with rasterio.open(tmp_target_path) as src:
                 b = src.bounds
                 src_crs = src.crs
@@ -721,7 +722,6 @@ def render(output_dir: str) -> None:
 
         if target_file and tmp_target_path:
             m_fusion_preview = folium.Map(location=[51.0447, -114.0719], zoom_start=10)
-            _inject_fusion_preview_responsive_legend_css(m_fusion_preview)
 
             try:
                 if is_geojson:
@@ -742,11 +742,12 @@ def render(output_dir: str) -> None:
                     if preview_feature and preview_feature in preview_gdf.columns:
                         vals = preview_gdf[preview_feature].dropna()
                         if len(vals) > 0:
-                            _add_outcome_geometry_preview(
+                            if not _add_outcome_geometry_preview(
                                 m_fusion_preview,
                                 preview_gdf,
                                 preview_feature,
-                            )
+                            ):
+                                folium.GeoJson(preview_gdf).add_to(m_fusion_preview)
                         else:
                             folium.GeoJson(preview_gdf).add_to(m_fusion_preview)
                     else:
@@ -802,12 +803,16 @@ def render(output_dir: str) -> None:
                                     [bounds_4326[3], bounds_4326[2]],
                                 ]
                             )
+                            _add_fusion_vertical_scale_to_map(
+                                m_fusion_preview, float(vmin), float(vmax)
+                            )
 
                 st_folium(
                     m_fusion_preview,
                     width="100%",
                     height=400,
                     key="fusion_preview_map",
+                    returned_objects=[],
                 )
 
             except Exception as e:
@@ -906,11 +911,9 @@ def render(output_dir: str) -> None:
     gvi_api_key_input = ""
 
     if metric_mode == "Use Loaded Results":
-        # Scan output folder for all pre-computed files
         all_gvi_files = _scan_metric_files(output_dir, "gvi")
         all_ndvi_files = _scan_metric_files(output_dir, "ndvi")
 
-        # Compute buffered target extent for spatial filtering (if target loaded)
         buffered_extent = None
         if tmp_target_path:
             buffered_extent = _compute_buffered_extent(
@@ -1051,7 +1054,7 @@ def render(output_dir: str) -> None:
                     ndvi_path = tmp.name
                 st.success(f"✓ Uploaded: {ndvi_file.name}")
 
-    else:  # Auto-Download
+    else:
         col_ad1, col_ad2 = st.columns(2)
         with col_ad1:
             ndvi_auto_start = st.date_input(
@@ -1336,7 +1339,7 @@ def render(output_dir: str) -> None:
                         gvi_grid_spacing_m,
                         n_bins,
                         gvi_path,
-                        None,  # terrain_path — separate from veg in load_metrics
+                        None,
                         ndvi_path,
                         cache_metrics,
                         test_size,
@@ -1362,7 +1365,6 @@ def render(output_dir: str) -> None:
 
                 st.success("✅ Fusion job started! Check sidebar for progress.")
 
-    # Check for completed fusion jobs and load results
     if "jobs" in st.session_state:
         for job_id, job_data in st.session_state.jobs.items():
             if (

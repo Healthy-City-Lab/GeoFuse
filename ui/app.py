@@ -45,6 +45,62 @@ st.markdown(
     /* Ensure the brand-injection iframe takes no space */
     iframe[height="0"] { display: block; height: 0 !important; min-height: 0 !important; }
 
+    /* Sidebar (Job Monitor on GVI, etc.): compact width + smaller type for all content */
+    section[data-testid="stSidebar"] {
+        width: min(13.25rem, 28vw) !important;
+        min-width: 9.25rem !important;
+    }
+    section[data-testid="stSidebar"] [data-testid="stSidebarContent"] {
+        font-size: 0.74rem !important;
+    }
+    section[data-testid="stSidebar"] .block-container {
+        padding: 0.35rem 0.4rem 0.45rem 0.4rem !important;
+        font-size: 0.74rem !important;
+        max-width: 100% !important;
+    }
+    section[data-testid="stSidebar"] h1,
+    section[data-testid="stSidebar"] h2,
+    section[data-testid="stSidebar"] h3 {
+        font-size: 0.92rem !important;
+        line-height: 1.25 !important;
+        margin-top: 0.2rem !important;
+        margin-bottom: 0.3rem !important;
+    }
+    section[data-testid="stSidebar"] .stMarkdown p,
+    section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {
+        font-size: 0.72rem !important;
+        line-height: 1.35 !important;
+    }
+    section[data-testid="stSidebar"] [data-testid="stCaption"],
+    section[data-testid="stSidebar"] .stCaption {
+        font-size: 0.65rem !important;
+    }
+    section[data-testid="stSidebar"] .stButton > button {
+        font-size: 0.7rem !important;
+        padding: 0.12rem 0.32rem !important;
+        min-height: 1.6rem !important;
+    }
+    section[data-testid="stSidebar"] [data-testid="column"] {
+        font-size: 0.72rem !important;
+    }
+    section[data-testid="stSidebar"] [data-testid="stVerticalBlockBorderWrapper"] {
+        padding: 0.3rem !important;
+    }
+    section[data-testid="stSidebar"] .streamlit-expanderHeader {
+        font-size: 0.7rem !important;
+    }
+    section[data-testid="stSidebar"] .stCodeBlock,
+    section[data-testid="stSidebar"] pre {
+        font-size: 0.65rem !important;
+    }
+    section[data-testid="stSidebar"] .stAlert {
+        font-size: 0.68rem !important;
+        padding: 0.3rem 0.4rem !important;
+    }
+    section[data-testid="stSidebar"] [data-testid="stProgress"] > div {
+        font-size: 0.65rem !important;
+    }
+
     /* Styling for the GeoFuse brand span injected by JS below */
     .gf-brand {
         font-size: 1.4rem;
@@ -69,12 +125,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Inject the "GeoFuse" brand as the first flex item in the tab bar.
-# Placed BEFORE st.tabs() so the zero-height iframe sits above the tab bar
-# in the DOM and cannot clip or squish the tab bar height.
-# CSS ::before cannot be used because BaseWeb already claims it for the
-# sliding active-tab underline indicator.
-# A MutationObserver re-injects the span after every Streamlit re-render.
+# Brand label in the tab bar: zero-height iframe + MutationObserver (BaseWeb owns ::before).
 components.html(
     """
 <script>

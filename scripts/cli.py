@@ -32,7 +32,7 @@ from geofuse.vision import get_best_device
 warnings.filterwarnings("ignore")
 
 # ------------------------------------------------------------------------------
-# HELPER FUNCTIONS
+# Helpers
 # ------------------------------------------------------------------------------
 
 
@@ -54,19 +54,15 @@ def resolve_path(base_path, target_path):
 def load_config(csv_path):
     """Loads and validates the configuration CSV."""
     df = pd.read_csv(csv_path)
-    # Added 'metric_type' to requirements
     required_cols = ["name", "geojson", "metric_type", "start_date", "end_date"]
     for col in required_cols:
         if col not in df.columns:
             raise ValueError(f"CSV must contain column: {col}")
 
-    # Standardize metric type (uppercase)
     df["metric_type"] = df["metric_type"].str.upper().str.strip()
 
-    # Fix paths
     df["geojson"] = df["geojson"].apply(lambda x: resolve_path(csv_path, x))
 
-    # Format Dates for Filenames (Remove dashes/slashes)
     df["date_suffix"] = df.apply(
         lambda r: f"{str(r['start_date']).replace('-','').replace('/','')}-{str(r['end_date']).replace('-','').replace('/','')}",
         axis=1,
@@ -80,7 +76,6 @@ def generate_gvi_points(config_df, resolution_m):
     """
     master_list = []
 
-    # Filter for GVI tasks only
     gvi_tasks = config_df[config_df["metric_type"] == "GVI"]
 
     if gvi_tasks.empty:
@@ -91,7 +86,6 @@ def generate_gvi_points(config_df, resolution_m):
     for _, row in gvi_tasks.iterrows():
         name = row["name"]
         suffix = row["date_suffix"]
-        # Construct unique name: Name + Date Range
         unique_name = f"{name}_{suffix}"
 
         geo_path = row["geojson"]
@@ -109,8 +103,7 @@ def generate_gvi_points(config_df, resolution_m):
 
             gdf_clipped, _ = generate_raster_grid(gdf, resolution_m)
 
-            # Metadata
-            gdf_clipped["task_id"] = unique_name  # Unique ID for saving later
+            gdf_clipped["task_id"] = unique_name
             gdf_clipped["aoi_name"] = name
             gdf_clipped["date_range"] = suffix
             gdf_clipped["gvi_veg"] = np.nan

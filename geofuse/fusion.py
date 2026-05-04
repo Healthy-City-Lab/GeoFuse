@@ -8,6 +8,8 @@ weighted combinations of NDVI and GVI metrics against target outcomes.
 import hashlib
 import logging
 import os
+from collections.abc import Callable
+from typing import Any
 
 import geopandas as gpd
 import numpy as np
@@ -228,8 +230,8 @@ class MetricFusionEngine:
         ndvi_start_date: str = "2023-01-01",
         ndvi_end_date: str = "2023-12-31",
         ndvi_project_id: str | None = None,
-        progress_callback: callable | None = None,
-        cancel_callback: callable | None = None,
+        progress_callback: Callable[..., Any] | None = None,
+        cancel_callback: Callable[..., Any] | None = None,
         force_download: bool = False,
         ndvi_resolution_m: float | None = None,
         gvi_grid_spacing_m: float | None = None,
@@ -329,7 +331,6 @@ class MetricFusionEngine:
                 return False
 
         # Load or Auto-download Vegetation and Terrain
-        # Priority: 1) Uploaded multi-band file, 2) Cached multi-band, 3) Separate files, 4) Auto-download
 
         # Check if uploaded veg_file is a multi-band raster
         if (
@@ -338,10 +339,8 @@ class MetricFusionEngine:
             and veg_file.endswith((".tif", ".tiff"))
         ):
             if load_multiband_gvi(veg_file):
-                # Successfully loaded both veg and terrain from uploaded file
-                pass  # veg_data and terrain_data already set
+                pass
             else:
-                # Not multi-band, load normally below
                 self.veg_data = self._load_metric_file(veg_file)
                 if terrain_file and os.path.exists(terrain_file):
                     self.terrain_data = self._load_metric_file(terrain_file)
@@ -359,10 +358,8 @@ class MetricFusionEngine:
         # Check cached multi-band file
         elif os.path.exists(gvi_multiband_cache):
             if load_multiband_gvi(gvi_multiband_cache):
-                # Successfully loaded from cache
                 pass
             else:
-                # Cache corrupted, re-download
                 logger.warning("Cached multi-band file corrupted. Re-downloading...")
                 veg_file, terrain_file = self._auto_download_gvi_both(
                     api_key=gvi_api_key,
@@ -416,7 +413,6 @@ class MetricFusionEngine:
                 f"Please provide valid GVI files or enable auto-download."
             )
 
-        # Continue with NDVI loading (unchanged)
         if self.veg_data is not None and self.terrain_data is not None:
             logger.info("✓ GVI data loaded successfully")
 
@@ -681,8 +677,8 @@ class MetricFusionEngine:
         self,
         api_key: str | None = None,
         cache: bool = True,
-        progress_callback: callable | None = None,
-        cancel_callback: callable | None = None,
+        progress_callback: Callable[..., Any] | None = None,
+        cancel_callback: Callable[..., Any] | None = None,
     ) -> tuple[str, str]:
         """
         Auto-download GVI metrics (both veg and terrain) in a single analysis.
@@ -854,8 +850,8 @@ class MetricFusionEngine:
         component: str,
         api_key: str | None = None,
         cache: bool = True,
-        progress_callback: callable | None = None,
-        cancel_callback: callable | None = None,
+        progress_callback: Callable[..., Any] | None = None,
+        cancel_callback: Callable[..., Any] | None = None,
     ) -> str:
         """
         Auto-download GVI metrics within buffered extent.
@@ -2083,7 +2079,7 @@ class MetricFusionEngine:
         sampler_type: str = "TPE",
         seed: int = 42,
         show_progress: bool = True,
-        progress_callback: callable | None = None,
+        progress_callback: Callable[..., Any] | None = None,
     ) -> dict:
         """
         Run Optuna optimization with k-fold cross-validation.
@@ -3090,7 +3086,7 @@ class MetricFusionEngine:
         self,
         output_path: str = "output_results/composite_greenery.tif",
         top_percent: float = 0.2,
-        progress_callback: callable | None = None,
+        progress_callback: Callable[..., Any] | None = None,
     ) -> str:
         """
         Generate final composite greenery map using averaged parameters from top robust trials.
@@ -3386,7 +3382,7 @@ class MetricFusionEngine:
         self,
         output_dir: str = "output_results/fusion/study_results",
         include_plots: bool = True,
-        progress_callback: callable | None = None,
+        progress_callback: Callable[..., Any] | None = None,
     ) -> None:
         """
         Generate comprehensive optimization results report with visualizations.

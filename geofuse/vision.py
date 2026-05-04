@@ -22,16 +22,13 @@ def get_best_device(preferred_device=None):
         torch.device: Best available device
     """
     if preferred_device:
-        # User specified device - try to use it
         if preferred_device == "cuda" and torch.cuda.is_available():
             return torch.device("cuda")
         elif preferred_device == "mps" and torch.backends.mps.is_available():
             return torch.device("mps")
         elif preferred_device == "cpu":
             return torch.device("cpu")
-        # Fall through to auto-selection if preferred not available
 
-    # Auto-selection priority: CUDA > MPS > CPU
     if torch.cuda.is_available():
         return torch.device("cuda")
     elif torch.backends.mps.is_available():
