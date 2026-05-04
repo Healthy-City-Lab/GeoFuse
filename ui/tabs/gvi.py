@@ -203,8 +203,12 @@ def render(output_dir: str, parent_dir: str) -> None:
                             f"{job.get('task', 'Job')} | {job.get('start_time', '')}"
                         )
 
-                    st.progress(job["progress"])
-                    st.caption(f"Status: {job['status']}")
+                    bracket = job.get("ndvi_tile_bracket")
+                    if job_type == "ndvi" and bracket:
+                        st.progress(float(job["progress"]), text=str(bracket))
+                    else:
+                        st.progress(float(job["progress"]))
+                    st.caption(job["status"])
 
                     if "gvi_progress" in job and job["gvi_progress"]:
                         gvi = job["gvi_progress"]
@@ -216,6 +220,13 @@ def render(output_dir: str, parent_dir: str) -> None:
                     if "error_detail" in job:
                         with st.expander("Error Details"):
                             st.code(job["error_detail"])
+
+                    ndvi_job_active = (
+                        job_type == "ndvi"
+                        and job["status"] not in ("Completed", "Cancelled")
+                        and not str(job["status"]).startswith("Error")
+                        and not str(job["status"]).startswith("Completed")
+                    )
 
                     is_running = (
                         job["status"]
@@ -236,6 +247,7 @@ def render(output_dir: str, parent_dir: str) -> None:
                         or "Processing" in job["status"]
                         or "Optimizing" in job["status"]
                         or "Downloading" in job["status"]
+                        or ndvi_job_active
                     )
 
                     if is_running:

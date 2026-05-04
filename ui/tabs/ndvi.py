@@ -4,6 +4,7 @@ import io
 import os
 import threading
 import uuid
+from collections.abc import Mapping
 from datetime import date, datetime, timedelta
 
 import folium
@@ -42,7 +43,24 @@ def _ndvi_worker(
         job_tracker_dict[job_id]["status"] = "Initializing Earth Engine..."
         engine = NDVIEngine()
         geometry = apply_buffer_m(dataset_data["raw"], buffer_m)
-        job_tracker_dict[job_id]["status"] = "Downloading and processing..."
+
+        def check_cancel() -> bool:
+            return bool(job_tracker_dict[job_id]["cancel"])
+
+        def on_ndvi_progress(d: Mapping[str, object]) -> None:
+            if "sub_progress" in d:
+                job_tracker_dict[job_id]["progress"] = float(d["sub_progress"])
+            if "phase" in d:
+                job_tracker_dict[job_id]["status"] = str(d["phase"])
+            if "tiles" in d:
+                t = d["tiles"]
+                if isinstance(t, tuple) and len(t) == 2:
+                    k, n = int(t[0]), int(t[1])
+                    if n > 0:
+                        job_tracker_dict[job_id]["ndvi_tile_bracket"] = f"[{k}/{n}]"
+            if d.get("clear_bracket"):
+                job_tracker_dict[job_id].pop("ndvi_tile_bracket", None)
+
         result = engine.download_and_process(
             geometry=geometry,
             start_date=start_date,
@@ -51,7 +69,12 @@ def _ndvi_worker(
             cloud_max=cloud_pct,
             resolution=resolution,
             folder=output_dir,
+            cancel_callback=check_cancel,
+            ndvi_progress_callback=on_ndvi_progress,
         )
+        if result.get("status") == "cancelled":
+            job_tracker_dict[job_id]["status"] = "Cancelled"
+            return
         if result["status"] == "success":
             job_tracker_dict[job_id]["status"] = "Completed"
             job_tracker_dict[job_id]["progress"] = 1.0
@@ -107,7 +130,27 @@ def _ndvi_column_worker(
             job_tracker_dict[job_id][
                 "status"
             ] = f"Processing date {idx + 1}/{n_dates}: {target_date}"
-            job_tracker_dict[job_id]["progress"] = (idx + 0.5) / n_dates
+
+            def check_cancel() -> bool:
+                return bool(job_tracker_dict[job_id]["cancel"])
+
+            def on_ndvi_progress(d: Mapping[str, object]) -> None:
+                span = 1.0 / max(n_dates, 1)
+                base = idx / max(n_dates, 1)
+                if "sub_progress" in d:
+                    job_tracker_dict[job_id]["progress"] = base + span * float(
+                        d["sub_progress"]
+                    )
+                if "phase" in d:
+                    job_tracker_dict[job_id]["status"] = str(d["phase"])
+                if "tiles" in d:
+                    t = d["tiles"]
+                    if isinstance(t, tuple) and len(t) == 2:
+                        k, n = int(t[0]), int(t[1])
+                        if n > 0:
+                            job_tracker_dict[job_id]["ndvi_tile_bracket"] = f"[{k}/{n}]"
+                if d.get("clear_bracket"):
+                    job_tracker_dict[job_id].pop("ndvi_tile_bracket", None)
 
             result = engine.download_and_process(
                 geometry=full_extent,
@@ -117,7 +160,12 @@ def _ndvi_column_worker(
                 cloud_max=cloud_pct,
                 resolution=resolution,
                 folder=output_dir,
+                cancel_callback=check_cancel,
+                ndvi_progress_callback=on_ndvi_progress,
             )
+            if result.get("status") == "cancelled":
+                job_tracker_dict[job_id]["status"] = "Cancelled"
+                return
             if result["status"] != "success":
                 print(f"[NDVI column] {target_date} failed: {result.get('message')}")
                 continue
