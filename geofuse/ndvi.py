@@ -250,6 +250,8 @@ class NDVIEngine:
         max_tile_size_km=5,
         cancel_callback: Callable[[], bool] | None = None,
         ndvi_progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
+        write_geotiff: bool = True,
+        write_geojson: bool = True,
     ):
         """
         Download and process NDVI data with automatic tiling for large areas.
@@ -268,8 +270,16 @@ class NDVIEngine:
                 ``sub_progress`` (0–1 for this download), ``phase`` (status line),
                 ``tiles`` ``(k, n)`` while downloading tiles (shows ``[k/n]`` on the bar),
                 ``clear_bracket`` (drop tile bracket after tiles are done).
+            write_geotiff: Persist ``{output_name}_ndvi.tif`` when True.
+            write_geojson: Persist ``{output_name}_ndvi.geojson`` when True (needs raster).
         """
         os.makedirs(folder, exist_ok=True)
+
+        if not write_geotiff and not write_geojson:
+            return {
+                "status": "error",
+                "message": "Enable at least one output format (GeoTIFF or GeoJSON).",
+            }
 
         # 1. Convert Geometry
         if isinstance(geometry, gpd.GeoDataFrame):
@@ -316,6 +326,8 @@ class NDVIEngine:
                 max_tile_size_km,
                 cancel_callback=cancel_callback,
                 ndvi_progress_callback=ndvi_progress_callback,
+                write_geotiff=write_geotiff,
+                write_geojson=write_geojson,
             )
         else:
             print(
@@ -330,6 +342,8 @@ class NDVIEngine:
                 folder,
                 cancel_callback=cancel_callback,
                 ndvi_progress_callback=ndvi_progress_callback,
+                write_geotiff=write_geotiff,
+                write_geojson=write_geojson,
             )
 
     def _download_single(
@@ -342,6 +356,8 @@ class NDVIEngine:
         folder,
         cancel_callback: Callable[[], bool] | None = None,
         ndvi_progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
+        write_geotiff: bool = True,
+        write_geojson: bool = True,
     ):
         """Download NDVI as a single tile (for small areas)."""
         _emit_ndvi_progress(
@@ -398,8 +414,28 @@ class NDVIEngine:
         if cancel_callback and cancel_callback():
             return {"status": "cancelled", "message": "Cancelled by user"}
 
+        try:
+            with rasterio.open(final_tif) as src:
+                crs_meta = str(src.crs)
+        except Exception:
+            crs_meta = "EPSG:4326"
+        meta: dict[str, Any] = {"crs": crs_meta}
+
+        if not write_geojson:
+            _emit_ndvi_progress(
+                ndvi_progress_callback,
+                sub_progress=0.99,
+                phase="Finalizing",
+            )
+            return {
+                "status": "success",
+                "tif": final_tif if write_geotiff else None,
+                "geojson": None,
+                "meta": meta,
+            }
+
         geojson_path = os.path.join(folder, f"{output_name}_ndvi.geojson")
-        return self._raster_to_ndvi_points_geojson(
+        out = self._raster_to_ndvi_points_geojson(
             final_tif,
             geojson_path,
             geometry,
@@ -408,6 +444,14 @@ class NDVIEngine:
             sub_start=0.52,
             sub_end=0.99,
         )
+        if out.get("status") != "success":
+            return out
+        if not write_geotiff and os.path.isfile(final_tif):
+            os.remove(final_tif)
+            out["tif"] = None
+        elif write_geotiff:
+            out["tif"] = final_tif
+        return out
 
     def _download_with_tiling(
         self,
@@ -420,6 +464,8 @@ class NDVIEngine:
         max_tile_size_km,
         cancel_callback: Callable[[], bool] | None = None,
         ndvi_progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
+        write_geotiff: bool = True,
+        write_geojson: bool = True,
     ):
         """Download NDVI in tiles and mosaic them together (for large areas)."""
         minx, miny, maxx, maxy = bounds
@@ -574,9 +620,29 @@ class NDVIEngine:
         if cancel_callback and cancel_callback():
             return {"status": "cancelled", "message": "Cancelled by user"}
 
-        geojson_path = os.path.join(folder, f"{output_name}_ndvi.geojson")
         n_mosaic_tiles = len(tile_files)
-        return self._raster_to_ndvi_points_geojson(
+        meta_base: dict[str, Any] = {"tiles": n_mosaic_tiles}
+        try:
+            with rasterio.open(final_tif) as src:
+                meta_base["crs"] = str(src.crs)
+        except Exception:
+            meta_base["crs"] = "EPSG:4326"
+
+        if not write_geojson:
+            _emit_ndvi_progress(
+                ndvi_progress_callback,
+                sub_progress=0.99,
+                phase="Finalizing",
+            )
+            return {
+                "status": "success",
+                "tif": final_tif if write_geotiff else None,
+                "geojson": None,
+                "meta": meta_base,
+            }
+
+        geojson_path = os.path.join(folder, f"{output_name}_ndvi.geojson")
+        out = self._raster_to_ndvi_points_geojson(
             final_tif,
             geojson_path,
             None,
@@ -586,3 +652,11 @@ class NDVIEngine:
             sub_end=0.99,
             meta_extra={"tiles": n_mosaic_tiles},
         )
+        if out.get("status") != "success":
+            return out
+        if not write_geotiff and os.path.isfile(final_tif):
+            os.remove(final_tif)
+            out["tif"] = None
+        elif write_geotiff:
+            out["tif"] = final_tif
+        return out

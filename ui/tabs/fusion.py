@@ -13,10 +13,10 @@ import folium
 import geopandas as gpd
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 import rasterio
 import streamlit as st
 from branca.element import MacroElement
+from helpers import sanitize_gdf_attributes_for_json
 from jinja2 import Template
 from PIL import Image as PILImage
 from shapely.geometry import box as shapely_box
@@ -35,8 +35,7 @@ _FUSION_OUTCOME_ADD_PLACEHOLDER = "— Select column —"
 class _FusionVerticalScaleControl(MacroElement):
     """Leaflet control: vertical red→yellow→green strip with numeric bounds."""
 
-    _template = Template(
-        """
+    _template = Template("""
 {% macro script(this, kwargs) %}
     var {{ this.get_name() }}_vsc = L.control({position: 'topright'});
     {{ this.get_name() }}_vsc.onAdd = function (map) {
@@ -52,8 +51,7 @@ class _FusionVerticalScaleControl(MacroElement):
     };
     {{ this.get_name() }}_vsc.addTo({{ this._parent.get_name() }});
 {% endmacro %}
-"""
-    )
+""")
 
     def __init__(self, inner_html: str):
         super().__init__()
@@ -148,14 +146,14 @@ def _fusion_vertical_scale_inner_html(vmin: float, vmax: float) -> str:
     return (
         '<div aria-label="Outcome value scale" '
         'style="display:flex;flex-direction:row;align-items:stretch;gap:6px;'
-        "height:min(200px,36vh);max-height:240px;box-sizing:border-box;\">"
+        'height:min(200px,36vh);max-height:240px;box-sizing:border-box;">'
         '<div style="display:flex;flex-direction:column;justify-content:space-between;'
         "text-align:right;font-size:11px;line-height:1.15;color:#222;"
         'min-width:2.2rem;flex-shrink:0;">'
         f"<span>{vmax_s}</span><span>{vmin_s}</span></div>"
         '<div title="High (top) to low (bottom)" '
         'style="width:12px;border-radius:2px;border:1px solid rgba(0,0,0,0.3);'
-        f"background:{bar_bg};flex-shrink:0;\"></div></div>"
+        f'background:{bar_bg};flex-shrink:0;"></div></div>'
     )
 
 
@@ -233,9 +231,17 @@ def _add_outcome_geometry_preview(
 
 
 def _scan_metric_files(output_dir: str, suffix: str) -> list:
-    """Return sorted list of (label, path) for all *_{suffix}.geojson in output_dir."""
-    pattern = os.path.join(output_dir, f"*_{suffix}.geojson")
-    return [(os.path.basename(p), p) for p in sorted(glob.glob(pattern))]
+    """Return sorted (basename, path) for raster metrics ``*_{suffix}.tif`` / ``.tiff``.
+
+    Coverage checks use fast raster bounds only. Matching GeoJSON files duplicate the
+    same grids and are excluded from this scan.
+    """
+    seen: dict[str, str] = {}
+    for ext in (".tif", ".tiff"):
+        pattern = os.path.join(output_dir, f"*_{suffix}{ext}")
+        for p in glob.glob(pattern):
+            seen[os.path.basename(p)] = p
+    return [(bn, seen[bn]) for bn in sorted(seen.keys())]
 
 
 def _compute_buffered_extent(
@@ -271,16 +277,13 @@ def _compute_buffered_extent(
 
 
 def _check_coverage(metric_path: str, buffered_gdf: "gpd.GeoDataFrame") -> bool:
-    """Return True if the metric file's spatial extent fully covers buffered_gdf."""
+    """Return True if the metric raster's extent fully covers buffered_gdf."""
     try:
-        if metric_path.lower().endswith((".tif", ".tiff")):
-            with rasterio.open(metric_path) as src:
-                metric_box = shapely_box(*src.bounds)
-                metric_crs = src.crs
-        else:
-            mdf = gpd.read_file(metric_path)
-            metric_box = shapely_box(*mdf.total_bounds)
-            metric_crs = mdf.crs
+        if not metric_path.lower().endswith((".tif", ".tiff")):
+            return False
+        with rasterio.open(metric_path) as src:
+            metric_box = shapely_box(*src.bounds)
+            metric_crs = src.crs
 
         target_geom = buffered_gdf.to_crs(metric_crs).geometry.union_all()
         return metric_box.covers(target_geom)
@@ -329,11 +332,7 @@ def _fusion_worker(
     MetricFusionEngine,
 ):
     try:
-        targets = (
-            list(target_features_geojson)
-            if target_features_geojson
-            else [None]
-        )
+        targets = list(target_features_geojson) if target_features_geojson else [None]
         n_t = max(len(targets), 1)
         multi_outcome = len([t for t in targets if t is not None]) > 1
 
@@ -402,7 +401,9 @@ def _fusion_worker(
             print(f"{prefix}[FUSION] Engine initialized")
 
             job_tracker_dict[job_id]["status"] = (
-                f"{prefix}Loading target data..." if n_t > 1 else "Loading target data..."
+                f"{prefix}Loading target data..."
+                if n_t > 1
+                else "Loading target data..."
             )
             job_tracker_dict[job_id]["progress"] = prog(0.1)
             engine.load_target()
@@ -507,7 +508,9 @@ def _fusion_worker(
             )
 
             job_tracker_dict[job_id]["status"] = (
-                f"{prefix}Filtering robust trials..." if n_t > 1 else "Filtering robust trials..."
+                f"{prefix}Filtering robust trials..."
+                if n_t > 1
+                else "Filtering robust trials..."
             )
             job_tracker_dict[job_id]["progress"] = prog(0.85)
             robust_trials = engine.get_robust_trials(
@@ -653,7 +656,9 @@ def render(output_dir: str) -> None:
                         "column, choose the next from the updated list."
                     )
                     if st.session_state.fusion_outcome_columns:
-                        for i, col in enumerate(st.session_state.fusion_outcome_columns):
+                        for i, col in enumerate(
+                            st.session_state.fusion_outcome_columns
+                        ):
                             row_l, row_r = st.columns([4, 1])
                             with row_l:
                                 st.text(f"Outcome {i + 1}: {col}")
@@ -684,7 +689,9 @@ def render(output_dir: str) -> None:
                     elif not st.session_state.fusion_outcome_columns:
                         st.warning("No numeric columns available to add.")
 
-                    target_outcome_columns = list(st.session_state.fusion_outcome_columns)
+                    target_outcome_columns = list(
+                        st.session_state.fusion_outcome_columns
+                    )
                     if len(target_outcome_columns) > 1:
                         multi_objective_requested = st.checkbox(
                             "Multi-objective optimization run",
@@ -730,6 +737,7 @@ def render(output_dir: str) -> None:
                         preview_gdf.set_crs("EPSG:4326", inplace=True)
                     else:
                         preview_gdf = preview_gdf.to_crs("EPSG:4326")
+                    preview_gdf = sanitize_gdf_attributes_for_json(preview_gdf)
 
                     preview_feature = None
                     if target_outcome_columns:
@@ -926,14 +934,10 @@ def render(output_dir: str) -> None:
                 return [lbl for lbl, _ in file_list], []
             covering, non_covering = [], []
             for lbl, path in file_list:
-                (covering if _check_coverage(path, bext) else non_covering).append(
-                    lbl
-                )
+                (covering if _check_coverage(path, bext) else non_covering).append(lbl)
             return covering, non_covering
 
-        gvi_covering, gvi_outside = _filter_by_coverage(
-            all_gvi_files, buffered_extent
-        )
+        gvi_covering, gvi_outside = _filter_by_coverage(all_gvi_files, buffered_extent)
         ndvi_covering, ndvi_outside = _filter_by_coverage(
             all_ndvi_files, buffered_extent
         )
@@ -942,7 +946,10 @@ def render(output_dir: str) -> None:
 
         with col_gvi_sel:
             if not all_gvi_files:
-                st.info("No GVI results found in the output folder.")
+                st.info(
+                    "No GVI GeoTIFF results found in the output folder "
+                    "(files named *_gvi.tif)."
+                )
             else:
                 if buffered_extent is not None:
                     st.caption(
@@ -952,11 +959,7 @@ def render(output_dir: str) -> None:
                 options_gvi = (
                     [None]
                     + gvi_covering
-                    + (
-                        ["── outside target ──"] + gvi_outside
-                        if gvi_outside
-                        else []
-                    )
+                    + (["── outside target ──"] + gvi_outside if gvi_outside else [])
                 )
                 gvi_selection = st.selectbox(
                     "🌿 Select GVI Result",
@@ -971,19 +974,20 @@ def render(output_dir: str) -> None:
                     if not os.path.exists(gvi_path):
                         st.warning("⚠️ File not found on disk.")
                         gvi_path = None
-                    elif (
-                        buffered_extent is not None and gvi_selection in gvi_outside
-                    ):
+                    elif buffered_extent is not None and gvi_selection in gvi_outside:
                         st.warning(
-"⚠️ This result does not fully cover the buffered "
-                                "target area — spatial alignment may be incomplete."
+                            "⚠️ This result does not fully cover the buffered "
+                            "target area — spatial alignment may be incomplete."
                         )
                     else:
                         st.success(f"✓ {gvi_selection}")
 
         with col_ndvi_sel:
             if not all_ndvi_files:
-                st.info("No NDVI results found in the output folder.")
+                st.info(
+                    "No NDVI GeoTIFF results found in the output folder "
+                    "(files named *_ndvi.tif)."
+                )
             else:
                 if buffered_extent is not None:
                     st.caption(
@@ -993,11 +997,7 @@ def render(output_dir: str) -> None:
                 options_ndvi = (
                     [None]
                     + ndvi_covering
-                    + (
-                        ["── outside target ──"] + ndvi_outside
-                        if ndvi_outside
-                        else []
-                    )
+                    + (["── outside target ──"] + ndvi_outside if ndvi_outside else [])
                 )
                 ndvi_selection = st.selectbox(
                     "🛰️ Select NDVI Result",
@@ -1012,13 +1012,10 @@ def render(output_dir: str) -> None:
                     if not os.path.exists(ndvi_path):
                         st.warning("⚠️ File not found on disk.")
                         ndvi_path = None
-                    elif (
-                        buffered_extent is not None
-                        and ndvi_selection in ndvi_outside
-                    ):
+                    elif buffered_extent is not None and ndvi_selection in ndvi_outside:
                         st.warning(
-"⚠️ This result does not fully cover the buffered "
-                                "target area — spatial alignment may be incomplete."
+                            "⚠️ This result does not fully cover the buffered "
+                            "target area — spatial alignment may be incomplete."
                         )
                     else:
                         st.success(f"✓ {ndvi_selection}")
@@ -1235,10 +1232,10 @@ def render(output_dir: str) -> None:
         if not target_file:
             st.error("❌ Please upload a target file")
         elif is_geojson and not target_outcome_columns:
-            st.error(
-                "❌ Add at least one outcome column from the GeoJSON target file."
-            )
-        elif gvi_buffer_min_m > gvi_buffer_max_m or ndvi_buffer_min_m > ndvi_buffer_max_m:
+            st.error("❌ Add at least one outcome column from the GeoJSON target file.")
+        elif (
+            gvi_buffer_min_m > gvi_buffer_max_m or ndvi_buffer_min_m > ndvi_buffer_max_m
+        ):
             st.error(
                 "❌ Each modality's minimum buffer must be less than or equal to its maximum buffer."
             )
@@ -1424,11 +1421,7 @@ def render(output_dir: str) -> None:
 
             with col_m2:
                 terrain_pct = (
-                    (
-                        results_view["best_params"]["terrain_weight"]
-                        / total_weight
-                        * 100
-                    )
+                    (results_view["best_params"]["terrain_weight"] / total_weight * 100)
                     if total_weight > 0
                     else 0
                 )
@@ -1513,9 +1506,7 @@ def render(output_dir: str) -> None:
 
                     running_best = []
                     current_best = (
-                        -np.inf
-                        if engine.study.direction.name == "MAXIMIZE"
-                        else np.inf
+                        -np.inf if engine.study.direction.name == "MAXIMIZE" else np.inf
                     )
                     for val in trial_values:
                         if engine.study.direction.name == "MAXIMIZE":

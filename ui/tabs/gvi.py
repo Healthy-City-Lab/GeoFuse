@@ -16,11 +16,22 @@ import streamlit as st
 from helpers import apply_buffer_m, generate_raster_grid, load_clean_gdf
 from PIL import Image as PILImage
 from rasterio.transform import array_bounds
+from shapely.geometry import box as shapely_box
 from streamlit.runtime.scriptrunner import add_script_run_ctx
 from streamlit_folium import st_folium
 
 from geofuse.gvi import GVIEngine
 from geofuse.vision import get_best_device
+
+
+def _gvi_output_tif_path(output_dir: str, base_name: str) -> str | None:
+    """Resolve ``{base_name}_gvi.tif`` or ``.tiff`` on disk."""
+    for ext in (".tif", ".tiff"):
+        p = os.path.join(output_dir, f"{base_name}_gvi{ext}")
+        if os.path.isfile(p):
+            return p
+    return None
+
 
 # ---------------------------------------------------------------------------
 # Background worker (module-level)
@@ -28,7 +39,15 @@ from geofuse.vision import get_best_device
 
 
 def _job_worker(
-    job_id, fname, dataset_data, init_args, run_args, output_dir, job_tracker_dict
+    job_id,
+    fname,
+    dataset_data,
+    init_args,
+    run_args,
+    output_dir,
+    job_tracker_dict,
+    save_geotiff: bool,
+    save_geojson: bool,
 ):
     gpu_lock = _get_gpu_lock()
     try:
@@ -84,12 +103,13 @@ def _job_worker(
                 dataset_data["results"] = res_df
 
                 out_name = os.path.splitext(fname)[0]
-                res_df.to_file(
-                    os.path.join(output_dir, f"{out_name}_gvi.geojson"),
-                    driver="GeoJSON",
-                )
+                if save_geojson:
+                    res_df.to_file(
+                        os.path.join(output_dir, f"{out_name}_gvi.geojson"),
+                        driver="GeoJSON",
+                    )
 
-                if dataset_data["meta"]:
+                if dataset_data["meta"] and save_geotiff:
                     from rasterio.transform import rowcol
 
                     meta = dataset_data["meta"]
@@ -165,8 +185,8 @@ def render(output_dir: str, parent_dir: str) -> None:
         st.session_state.master_cache = {}
     if "jobs" not in st.session_state:
         st.session_state.jobs = {}
-    if "inspector_select_key" not in st.session_state:
-        st.session_state.inspector_select_key = None
+    if "gvi_inspector_select" not in st.session_state:
+        st.session_state.gvi_inspector_select = None
 
     # --- SIDEBAR JOB MONITOR ---
     def callback_dismiss_job(jid):
@@ -364,80 +384,116 @@ def render(output_dir: str, parent_dir: str) -> None:
                     st.success("Grids generated!")
 
         st.divider()
-        if st.button("🚀 Run GVI Analysis", type="primary", key="gvi_run"):
+        oc_gvi_a, oc_gvi_b = st.columns(2)
+        with oc_gvi_a:
+            st.checkbox("Save GeoTIFF", value=True, key="gvi_out_geotiff")
+        with oc_gvi_b:
+            st.checkbox("Save GeoJSON", value=True, key="gvi_out_geojson")
+        gvi_out_ok = st.session_state.get(
+            "gvi_out_geotiff", True
+        ) or st.session_state.get("gvi_out_geojson", True)
+        if not gvi_out_ok:
+            st.caption("Select at least one output format to run analysis.")
+
+        if st.button(
+            "🚀 Run GVI Analysis",
+            type="primary",
+            key="gvi_run",
+            disabled=not gvi_out_ok,
+        ):
             if not st.session_state.datasets:
                 st.warning("Upload at least one study area to get started.")
             else:
-                model_path = os.path.join(
-                    parent_dir, "geofuse", "model", "best_model.pth"
-                )
-                started = False
-                for fname, d in st.session_state.datasets.items():
-                    if d.get("type") == "restored":
-                        continue
-
-                    if d.get("processed") is None:
-                        if d["type"] == "poly":
-                            pts, meta = generate_raster_grid(
-                                apply_buffer_m(d["raw"], gvi_buffer), gvi_res
-                            )
-                            d["processed"] = pts
-                            d["meta"] = meta
-                        else:
-                            d["processed"] = d["raw"].copy()
-                            d["meta"] = None
-                        d["accumulated"] = []
-                        d["results"] = None
-
-                    existing = [
-                        j
-                        for j, v in st.session_state.jobs.items()
-                        if v["fname"] == fname
-                        and v["status"]
-                        in ["Running", "Waiting for GPU...", "Initializing..."]
-                    ]
-                    if existing:
-                        continue
-
-                    job_id = str(uuid.uuid4())[:8]
-                    st.session_state.jobs[job_id] = {
-                        "fname": fname,
-                        "task": "GVI",
-                        "start_time": datetime.now().strftime("%H:%M:%S"),
-                        "progress": 0.0,
-                        "status": "Queued",
-                        "cancel": False,
-                        "handoff_complete": False,
-                    }
-
-                    init_args = {"model_path": model_path, "api_key": api_key}
-                    run_args = {
-                        "step": gvi_res,
-                        "save_panos": save_debug,
-                        "save_masks": save_debug,
-                    }
-                    d["cache_ref"] = st.session_state.master_cache
-
-                    t = threading.Thread(
-                        target=_job_worker,
-                        args=(
-                            job_id,
-                            fname,
-                            d,
-                            init_args,
-                            run_args,
-                            output_dir,
-                            st.session_state.jobs,
-                        ),
+                save_gt = st.session_state.get("gvi_out_geotiff", True)
+                save_gj = st.session_state.get("gvi_out_geojson", True)
+                geotiff_only_with_points = (
+                    save_gt
+                    and not save_gj
+                    and any(
+                        d.get("type") == "point"
+                        for d in st.session_state.datasets.values()
+                        if d.get("type") != "restored"
                     )
-                    add_script_run_ctx(t)
-                    t.start()
-                    started = True
-
-                if started:
-                    st.success("Analysis started. Monitor progress in the sidebar.")
+                )
+                if geotiff_only_with_points:
+                    st.error(
+                        "GeoTIFF-only output needs polygon study areas that define a "
+                        "raster grid. Enable Save GeoJSON for point layers, or add "
+                        "polygon study areas."
+                    )
                 else:
-                    st.info("All study areas are already running or completed.")
+                    model_path = os.path.join(
+                        parent_dir, "geofuse", "model", "best_model.pth"
+                    )
+                    started = False
+                    for fname, d in st.session_state.datasets.items():
+                        if d.get("type") == "restored":
+                            continue
+
+                        if d.get("processed") is None:
+                            if d["type"] == "poly":
+                                pts, meta = generate_raster_grid(
+                                    apply_buffer_m(d["raw"], gvi_buffer), gvi_res
+                                )
+                                d["processed"] = pts
+                                d["meta"] = meta
+                            else:
+                                d["processed"] = d["raw"].copy()
+                                d["meta"] = None
+                            d["accumulated"] = []
+                            d["results"] = None
+
+                        existing = [
+                            j
+                            for j, v in st.session_state.jobs.items()
+                            if v["fname"] == fname
+                            and v["status"]
+                            in ["Running", "Waiting for GPU...", "Initializing..."]
+                        ]
+                        if existing:
+                            continue
+
+                        job_id = str(uuid.uuid4())[:8]
+                        st.session_state.jobs[job_id] = {
+                            "fname": fname,
+                            "task": "GVI",
+                            "start_time": datetime.now().strftime("%H:%M:%S"),
+                            "progress": 0.0,
+                            "status": "Queued",
+                            "cancel": False,
+                            "handoff_complete": False,
+                        }
+
+                        init_args = {"model_path": model_path, "api_key": api_key}
+                        run_args = {
+                            "step": gvi_res,
+                            "save_panos": save_debug,
+                            "save_masks": save_debug,
+                        }
+                        d["cache_ref"] = st.session_state.master_cache
+
+                        t = threading.Thread(
+                            target=_job_worker,
+                            args=(
+                                job_id,
+                                fname,
+                                d,
+                                init_args,
+                                run_args,
+                                output_dir,
+                                st.session_state.jobs,
+                                save_gt,
+                                save_gj,
+                            ),
+                        )
+                        add_script_run_ctx(t)
+                        t.start()
+                        started = True
+
+                    if started:
+                        st.success("Analysis started. Monitor progress in the sidebar.")
+                    else:
+                        st.info("All study areas are already running or completed.")
 
     with col_top_right:
         st.subheader("Study Area Preview")
@@ -510,19 +566,24 @@ def render(output_dir: str, parent_dir: str) -> None:
         st.subheader("Result Inspector")
 
         if st.button("🔄 Scan Output Folder", key="gvi_scan_folder"):
-            found_files = glob.glob(os.path.join(output_dir, "*_gvi.geojson"))
-            count = 0
-            for p in found_files:
-                base_name = os.path.basename(p).replace("_gvi.geojson", "")
-                tif_path = os.path.join(output_dir, f"{base_name}_gvi.tif")
-                if not os.path.exists(tif_path):
-                    continue
+            from rasterio.warp import transform_bounds
 
+            tif_paths: dict[str, str] = {}
+            for pat in (
+                os.path.join(output_dir, "*_gvi.tif"),
+                os.path.join(output_dir, "*_gvi.tiff"),
+            ):
+                for p in glob.glob(pat):
+                    tif_paths[os.path.basename(p)] = p
+            count = 0
+            for basename in sorted(tif_paths.keys()):
+                tif_path = tif_paths[basename]
+                stem = basename.rsplit(".", 1)[0]
+                base_name = stem.removesuffix("_gvi")
+                geojson_path = os.path.join(output_dir, f"{base_name}_gvi.geojson")
+                has_geojson = os.path.isfile(geojson_path)
                 if base_name not in st.session_state.datasets:
                     try:
-                        gdf = gpd.read_file(p)
-                        if gdf.crs is not None and gdf.crs.to_string() != "EPSG:4326":
-                            gdf = gdf.to_crs("EPSG:4326")
                         with rasterio.open(tif_path) as src:
                             meta = {
                                 "transform": src.transform,
@@ -530,15 +591,30 @@ def render(output_dir: str, parent_dir: str) -> None:
                                 "height": src.height,
                                 "crs": src.crs,
                             }
-                        raw_geom = gdf.geometry.union_all().envelope
-                        raw_gdf = gpd.GeoDataFrame(
-                            {"geometry": [raw_geom]}, crs=gdf.crs
-                        )
+                            b = src.bounds
+                            crs = src.crs
+                        if has_geojson:
+                            gdf = gpd.read_file(geojson_path)
+                            if gdf.crs is None:
+                                gdf = gdf.set_crs("EPSG:4326")
+                            gdf = gdf.to_crs("EPSG:4326")
+                            raw_geom = gdf.geometry.union_all().envelope
+                            raw_gdf = gpd.GeoDataFrame(
+                                {"geometry": [raw_geom]}, crs="EPSG:4326"
+                            )
+                            results = gdf
+                        else:
+                            w, s, e, n = transform_bounds(crs, "EPSG:4326", *b)
+                            raw_gdf = gpd.GeoDataFrame(
+                                {"geometry": [shapely_box(w, s, e, n)]},
+                                crs="EPSG:4326",
+                            )
+                            results = None
                         st.session_state.datasets[base_name] = {
                             "raw": raw_gdf,
                             "processed": None,
                             "accumulated": [],
-                            "results": gdf,
+                            "results": results,
                             "meta": meta,
                             "type": "restored",
                         }
@@ -548,7 +624,10 @@ def render(output_dir: str, parent_dir: str) -> None:
             if count > 0:
                 st.success(f"Loaded {count} result(s) from the output folder.")
             else:
-                st.info("No results found in the output folder.")
+                st.info(
+                    "No GVI GeoTIFF results found in the output folder "
+                    "(files named *_gvi.tif or *_gvi.tiff)."
+                )
 
         completed_ds = [
             k
@@ -563,7 +642,7 @@ def render(output_dir: str, parent_dir: str) -> None:
             options,
             index=None,
             placeholder="Choose a result...",
-            key="inspector_select_key",
+            key="gvi_inspector_select",
         )
 
         raster_layer = st.radio(
@@ -573,8 +652,33 @@ def render(output_dir: str, parent_dir: str) -> None:
             key="gvi_raster_layer",
         )
         r_opacity = st.slider("Layer Opacity", 0.0, 1.0, 0.7, key="gvi_layer_opacity")
+
+        def _gvi_inspector_has_geojson(sel: str | None) -> bool:
+            if not completed_ds:
+                return False
+            if sel is None:
+                return False
+            if sel == "All Regions":
+                return all(
+                    st.session_state.datasets[k].get("results") is not None
+                    for k in completed_ds
+                )
+            return st.session_state.datasets.get(sel, {}).get("results") is not None
+
+        gvi_pts_ok = _gvi_inspector_has_geojson(selected_option)
+        if not gvi_pts_ok and st.session_state.get("gvi_show_points"):
+            st.session_state.gvi_show_points = False
         show_points = st.checkbox(
-            "Show Sample Points", value=False, key="gvi_show_points"
+            "Show Sample Points",
+            value=False,
+            key="gvi_show_points",
+            disabled=not gvi_pts_ok,
+            help=(
+                "Requires a GeoJSON next to this GeoTIFF (same base name, "
+                "_gvi.geojson). Enable Save GeoJSON when running GVI or add the file."
+                if not gvi_pts_ok
+                else None
+            ),
         )
 
     with col_btm_right:
@@ -623,24 +727,36 @@ def render(output_dir: str, parent_dir: str) -> None:
                     arr = np.full((meta["height"], meta["width"]), np.nan)
 
                     col_name = "gvi_ter" if "Terrain" in raster_layer else "gvi_veg"
-                    res = ds["results"].dropna(subset=[col_name])
+                    if ds.get("results") is not None:
+                        res = ds["results"].dropna(subset=[col_name])
+                        if not res.empty:
+                            rows, cols = rowcol(
+                                meta["transform"],
+                                res.geometry.x.values,
+                                res.geometry.y.values,
+                            )
+                            mask_idx = (
+                                (rows >= 0)
+                                & (rows < meta["height"])
+                                & (cols >= 0)
+                                & (cols < meta["width"])
+                            )
+                            arr[rows[mask_idx], cols[mask_idx]] = res[col_name].values[
+                                mask_idx
+                            ]
 
-                    if not res.empty:
-                        rows, cols = rowcol(
-                            meta["transform"],
-                            res.geometry.x.values,
-                            res.geometry.y.values,
-                        )
-                        mask_idx = (
-                            (rows >= 0)
-                            & (rows < meta["height"])
-                            & (cols >= 0)
-                            & (cols < meta["width"])
-                        )
-                        arr[rows[mask_idx], cols[mask_idx]] = res[col_name].values[
-                            mask_idx
-                        ]
+                    tif_path_ds = _gvi_output_tif_path(output_dir, ds_name)
+                    if not np.any(np.isfinite(arr)) and tif_path_ds:
+                        with rasterio.open(tif_path_ds) as src:
+                            bi = 2 if "Terrain" in raster_layer else 1
+                            r = src.read(bi).astype(np.float64)
+                            nodata = src.nodata
+                        if r.shape == (meta["height"], meta["width"]):
+                            arr = r
+                            if nodata is not None:
+                                arr = np.where(arr == nodata, np.nan, arr)
 
+                    if np.any(np.isfinite(arr)):
                         cmap_name = "OrRd" if "Terrain" in raster_layer else "Greens"
                         try:
                             cmap = matplotlib.colormaps[cmap_name]
@@ -666,27 +782,33 @@ def render(output_dir: str, parent_dir: str) -> None:
                             interactive=False,
                         ).add_to(m_result)
 
-                if show_points:
-                    gdf_viz = ds["results"].copy()
-                    if "gvi_veg" in gdf_viz.columns:
-                        gdf_viz["gvi_veg"] = gdf_viz["gvi_veg"].round(4)
-                    if "gvi_ter" in gdf_viz.columns:
-                        gdf_viz["gvi_ter"] = gdf_viz["gvi_ter"].round(4)
+                if show_points and ds.get("results") is not None:
+                    try:
+                        gdf_viz = ds["results"].copy()
+                        if len(gdf_viz) > 5000:
+                            st.warning(f"{ds_name}: Displaying a 5,000-point sample.")
+                            gdf_viz = gdf_viz.sample(5000)
+                        if "gvi_veg" in gdf_viz.columns:
+                            gdf_viz["gvi_veg"] = gdf_viz["gvi_veg"].round(4)
+                        if "gvi_ter" in gdf_viz.columns:
+                            gdf_viz["gvi_ter"] = gdf_viz["gvi_ter"].round(4)
 
-                    valid_pts = gdf_viz.dropna(subset=["gvi_veg"])
-                    folium.GeoJson(
-                        valid_pts,
-                        marker=folium.Circle(
-                            radius=20,
-                            fill_color="green",
-                            fill_opacity=0.8,
-                            color=None,
-                        ),
-                        tooltip=folium.GeoJsonTooltip(
-                            fields=["gvi_veg", "gvi_ter"],
-                            aliases=["Veg Index:", "Ter Index:"],
-                        ),
-                    ).add_to(m_result)
+                        valid_pts = gdf_viz.dropna(subset=["gvi_veg"])
+                        folium.GeoJson(
+                            valid_pts,
+                            marker=folium.Circle(
+                                radius=20,
+                                fill_color="green",
+                                fill_opacity=0.8,
+                                color=None,
+                            ),
+                            tooltip=folium.GeoJsonTooltip(
+                                fields=["gvi_veg", "gvi_ter"],
+                                aliases=["Veg Index:", "Ter Index:"],
+                            ),
+                        ).add_to(m_result)
+                    except Exception as e:
+                        st.error(f"Error rendering sample points: {e}")
 
             if res_bounds:
                 min_x = min([b[0] for b in res_bounds])

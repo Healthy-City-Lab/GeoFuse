@@ -28,7 +28,9 @@ from sklearn.preprocessing import MinMaxScaler
 logger = logging.getLogger(__name__)
 
 
-def _radius_int_bounds(r_min: float, r_max: float, r_step: float) -> tuple[int, int, int]:
+def _radius_int_bounds(
+    r_min: float, r_max: float, r_step: float
+) -> tuple[int, int, int]:
     """Align Optuna integer radius search to user min/max/step (metres)."""
     lo = max(1, int(round(r_min)))
     hi = int(round(r_max))
@@ -735,7 +737,9 @@ class MetricFusionEngine:
             logger.info(f"Buffered extent area: ~{area_km2:.2f} km²")
             logger.info(f"Bounds (EPSG:4326): {bounds}")
             logger.info(f"Geometry type: {analysis_gdf.geometry.iloc[0].geom_type}")
-            logger.info(f"GVI will generate grid at ~{gvi_step} m spacing within this polygon")
+            logger.info(
+                f"GVI will generate grid at ~{gvi_step} m spacing within this polygon"
+            )
 
             # Verify the polygon is valid
             if not analysis_gdf.geometry.iloc[0].is_valid:
@@ -905,7 +909,9 @@ class MetricFusionEngine:
             logger.info(f"Buffered extent area: ~{area_km2:.2f} km²")
             logger.info(f"Bounds (EPSG:4326): {bounds}")
             logger.info(f"Geometry type: {analysis_gdf.geometry.iloc[0].geom_type}")
-            logger.info(f"GVI will generate grid at ~{gvi_step} m spacing within this polygon")
+            logger.info(
+                f"GVI will generate grid at ~{gvi_step} m spacing within this polygon"
+            )
 
             # Verify the polygon is valid
             if not analysis_gdf.geometry.iloc[0].is_valid:
@@ -1326,9 +1332,7 @@ class MetricFusionEngine:
             return float(np.percentile(vals, percentile))
         return np.nan
 
-    def _vector_metric_column(
-        self, metric_data: gpd.GeoDataFrame, channel: str
-    ) -> str:
+    def _vector_metric_column(self, metric_data: gpd.GeoDataFrame, channel: str) -> str:
         metric_col = metric_data.attrs.get("metric_column")
         if metric_col and metric_col in metric_data.columns:
             return metric_col
@@ -1439,9 +1443,7 @@ class MetricFusionEngine:
         centroid = points_wgs84.geometry.union_all().centroid
         lon, lat = centroid.x, centroid.y
         utm_zone = int((lon + 180) / 6) + 1
-        utm_crs = (
-            f"EPSG:326{utm_zone:02d}" if lat >= 0 else f"EPSG:327{utm_zone:02d}"
-        )
+        utm_crs = f"EPSG:326{utm_zone:02d}" if lat >= 0 else f"EPSG:327{utm_zone:02d}"
 
         points_utm = points_gdf.to_crs(utm_crs)
         metric_utm = metric_data.to_crs(utm_crs)
@@ -1576,9 +1578,7 @@ class MetricFusionEngine:
                 )
 
         _, rows = cache_store[key]
-        return self._aggregate_from_ring_cache(
-            radii, rows, radius_m, stat, percentile
-        )
+        return self._aggregate_from_ring_cache(radii, rows, radius_m, stat, percentile)
 
     def prepare_fusion_data(self) -> pd.DataFrame:
         """
@@ -2747,9 +2747,7 @@ class MetricFusionEngine:
         streetview_stat = params.get("streetview_stat", "mean")
         streetview_percentile = params.get("streetview_percentile", 50)
         veg_radius = params.get("veg_radius", int(round(self.gvi_buffer_max_m)))
-        terrain_radius = params.get(
-            "terrain_radius", int(round(self.gvi_buffer_max_m))
-        )
+        terrain_radius = params.get("terrain_radius", int(round(self.gvi_buffer_max_m)))
         ndvi_stat = params.get("ndvi_stat", "mean")
         ndvi_percentile = params.get("ndvi_percentile", 50)
         ndvi_radius = params.get("ndvi_radius", int(round(self.ndvi_buffer_max_m)))

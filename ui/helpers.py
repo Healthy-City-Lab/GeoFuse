@@ -1,3 +1,4 @@
+import datetime
 import os
 import tempfile
 
@@ -25,6 +26,36 @@ def apply_buffer_m(gdf: gpd.GeoDataFrame, buffer_m: float) -> gpd.GeoDataFrame:
     return result.to_crs(gdf.crs)
 
 
+def sanitize_gdf_attributes_for_json(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Cast non-geometry attributes to JSON-friendly values (Folium, ``json.dumps``).
+
+    GeoJSON sources with date/time properties are often read as ``datetime64`` or
+    ``Timestamp`` in object columns; Folium's ``GeoJson(gdf)`` then fails with
+    "Object of type Timestamp is not JSON serializable".
+    """
+    geom_col = gdf.geometry.name
+    out = gdf.copy()
+    for col in out.columns:
+        if col == geom_col:
+            continue
+        s = out[col]
+        if pd.api.types.is_datetime64_any_dtype(s):
+            out[col] = s.astype(str)
+        elif isinstance(s.dtype, pd.CategoricalDtype):
+            out[col] = s.astype(str)
+        elif s.dtype == object:
+
+            def _cell(v):
+                if isinstance(v, (pd.Timestamp, datetime.datetime, datetime.date)):
+                    return v.isoformat()
+                if isinstance(v, datetime.time):
+                    return str(v)
+                return v
+
+            out[col] = s.map(_cell)
+    return out
+
+
 @st.cache_data
 def load_clean_gdf(file_obj):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".geojson") as tmp:
@@ -36,16 +67,7 @@ def load_clean_gdf(file_obj):
             gdf.set_crs("EPSG:4326", inplace=True)
         else:
             gdf = gdf.to_crs("EPSG:4326")
-        for col in gdf.columns:
-            if (
-                pd.api.types.is_datetime64_any_dtype(gdf[col])
-                or gdf[col].dtype == "object"
-            ):
-                try:
-                    gdf[col] = gdf[col].astype(str)
-                except Exception:
-                    gdf = gdf.drop(columns=[col])
-        return gdf
+        return sanitize_gdf_attributes_for_json(gdf)
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
