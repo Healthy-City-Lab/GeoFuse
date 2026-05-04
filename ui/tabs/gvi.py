@@ -264,11 +264,20 @@ def render(output_dir: str, parent_dir: str) -> None:
     with col_top_left:
         st.subheader("Input Configuration")
         mode = st.radio(
-            "Download Mode", ["Package (Scraper)", "API (Google Key)"], horizontal=True
+            "Download Mode",
+            ["Package (Scraper)", "API (Street View)"],
+            horizontal=True,
+            key="gvi_download_mode",
         )
         api_key = (
-            st.text_input("Google API Key", type="password")
-            if mode == "API (Google Key)"
+            st.text_input(
+                "Street View API Key",
+                type="password",
+                autocomplete="off",
+                help="Optional Google Street View key; Will fall back to built-in access if not provided.",
+                key="gvi_google_api_key",
+            )
+            if mode == "API (Street View)"
             else None
         )
         gvi_res = st.slider("Grid Resolution (m)", 20, 500, 50, key="gvi_res")

@@ -1,5 +1,6 @@
 import base64
 import glob
+import html
 import io
 import os
 import tempfile
@@ -8,6 +9,8 @@ import time
 import uuid
 from datetime import date, datetime
 
+from branca.colormap import LinearColormap
+from branca.element import Element as BrancaHtmlElement
 import folium
 import geopandas as gpd
 import matplotlib.pyplot as plt
@@ -17,6 +20,7 @@ import rasterio
 import streamlit as st
 from PIL import Image as PILImage
 from shapely.geometry import box as shapely_box
+from shapely.geometry import mapping as shapely_mapping
 from streamlit.runtime.scriptrunner import add_script_run_ctx
 from streamlit_folium import st_folium
 
@@ -24,6 +28,202 @@ try:
     from geofuse.fusion import MetricFusionEngine as _MetricFusionEngine
 except ImportError:
     _MetricFusionEngine = None
+
+_FUSION_OUTCOME_ADD_PLACEHOLDER = "— Select column —"
+
+
+def _fusion_append_outcome_callback() -> None:
+    """Append the chosen GeoJSON outcome column and reset the add widget."""
+    pick = st.session_state.get("fusion_add_outcome_column")
+    if not pick or pick == _FUSION_OUTCOME_ADD_PLACEHOLDER:
+        return
+    if "fusion_outcome_columns" not in st.session_state:
+        st.session_state.fusion_outcome_columns = []
+    if pick not in st.session_state.fusion_outcome_columns:
+        st.session_state.fusion_outcome_columns.append(pick)
+    st.session_state.fusion_add_outcome_column = _FUSION_OUTCOME_ADD_PLACEHOLDER
+
+
+def _fusion_resolve_active_bundle():
+    """Return (per-outcome bundle dict, engine) for the outcome selected in results UI."""
+    fr = st.session_state.get("fusion_results")
+    if not fr:
+        return None, None
+    engines_map = st.session_state.get("fusion_engines_by_target") or {}
+    if fr.get("mode") == "multi":
+        labels = fr.get("ordered_labels") or []
+        pk = st.session_state.get("fusion_results_outcome_pick")
+        if not pk and labels:
+            pk = labels[0]
+        if not pk or pk not in fr.get("by_target", {}):
+            return None, None
+        return fr["by_target"][pk], engines_map.get(pk)
+    return fr, st.session_state.get("fusion_engine")
+
+
+def _geojson_geometry_summary(gdf: gpd.GeoDataFrame) -> str:
+    """Short human-readable geometry description for UI (not only points)."""
+    n = len(gdf)
+    if n == 0:
+        return "0 features"
+    vc = gdf.geometry.geom_type.value_counts()
+    if len(vc) == 1:
+        t = vc.index[0]
+        plural_map = {
+            "Point": ("point", "points"),
+            "MultiPoint": ("multi-point feature", "multi-point features"),
+            "LineString": ("line", "lines"),
+            "MultiLineString": ("multi-line", "multi-lines"),
+            "Polygon": ("polygon", "polygons"),
+            "MultiPolygon": ("multi-polygon", "multi-polygons"),
+            "GeometryCollection": (
+                "geometry collection",
+                "geometry collections",
+            ),
+        }
+        singular, plural = plural_map.get(t, (t.lower(), t.lower() + "s"))
+        return f"{n} {singular if n == 1 else plural}"
+    return f"{n} features (mixed geometry types)"
+
+
+def _add_outcome_geometry_preview(
+    m: folium.Map,
+    preview_gdf: gpd.GeoDataFrame,
+    preview_feature: str,
+) -> None:
+    """Draw outcome-colored geometries (not centroids) with a map colorbar."""
+    vals = preview_gdf[preview_feature].dropna()
+    if len(vals) == 0:
+        return
+    vmin, vmax = float(vals.min()), float(vals.max())
+    fill_opacity = 0.7
+    line_opacity = 0.7
+    const_hex = "#22aa44"
+
+    if vmax > vmin:
+        colormap = LinearColormap(
+            colors=["#ff0000", "#ffff00", "#00ff00"],
+            vmin=vmin,
+            vmax=vmax,
+            caption="",
+        )
+        # Slightly narrower than default 450px so axis labels (esp. vmax) fit inside the map.
+        colormap.width = 390
+    else:
+        colormap = None
+
+    def color_for_value(v: float) -> str:
+        if colormap is not None:
+            return colormap(float(v))
+        return const_hex
+
+    features: list[dict] = []
+    for _, row in preview_gdf.iterrows():
+        try:
+            v = float(row[preview_feature])
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(v):
+            continue
+        geom = row.geometry
+        if geom is None or geom.is_empty:
+            continue
+        hc = color_for_value(v)
+        try:
+            geom_d = shapely_mapping(geom)
+        except Exception:
+            continue
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": geom_d,
+                "properties": {
+                    "_color": hc,
+                    "_v": v,
+                },
+            }
+        )
+
+    if not features:
+        return
+
+    folium.GeoJson(
+        {"type": "FeatureCollection", "features": features},
+        style_function=lambda f, _fo=fill_opacity, _lo=line_opacity: {
+            "fillColor": f["properties"]["_color"],
+            "color": f["properties"]["_color"],
+            "weight": 2,
+            "fillOpacity": _fo,
+            "opacity": _lo,
+            "radius": 6,
+        },
+        tooltip=folium.GeoJsonTooltip(
+            fields=["_v"],
+            aliases=[preview_feature],
+            sticky=True,
+            localize=True,
+        ),
+    ).add_to(m)
+    if colormap is not None:
+        colormap.add_to(m)
+    else:
+        esc = html.escape(preview_feature)
+        legend_html = (
+            '<div style="position: fixed; bottom: 28px; right: 8px; z-index: 1000; '
+            "background: rgba(255,255,255,0.92); padding: 8px 10px; "
+            'border: 1px solid #999; border-radius: 4px; font-size: 11px; '
+            "max-width: min(85vw, 280px); box-sizing: border-box; "
+            'word-wrap: break-word;">'
+            '<div style="font-weight:600;margin-bottom:4px;">Outcome scale</div>'
+            '<div style="display:flex;align-items:center;gap:8px;">'
+            f'<span style="display:inline-block;width:36px;height:14px;'
+            f"background:{const_hex};opacity:{fill_opacity};"
+            f'border:2px solid {const_hex};"></span>'
+            f"<span>{esc}: {vmin:.4g} (uniform)</span></div></div>"
+        )
+        m.get_root().html.add_child(BrancaHtmlElement(legend_html))  # type: ignore[attr-defined]
+
+
+_FUSION_PREVIEW_RESPONSIVE_LEGEND_CSS = """
+<style>
+/* Branca colorbar SVG defaults to ~450px wide; scale it to the map width. */
+.leaflet-container {
+    container-type: inline-size;
+    container-name: geofuse-folium-map;
+}
+.leaflet-container .legend.leaflet-control {
+    max-width: calc(80cqw - 2rem) !important;
+    box-sizing: border-box !important;
+    margin-right: 18px !important;
+    overflow: visible !important;
+}
+.leaflet-container .legend.leaflet-control svg#legend {
+    display: block;
+    max-width: calc(80cqw - 2.5rem) !important;
+    width: min(390px, calc(80cqw - 2.5rem)) !important;
+    height: auto !important;
+    overflow: visible !important;
+}
+/* Column name is shown in the preview picker; hide Branca caption line. */
+.leaflet-container .legend.leaflet-control svg#legend text.caption {
+    display: none !important;
+}
+.leaflet-container .legend.leaflet-control svg#legend .key,
+.leaflet-container .legend.leaflet-control svg#legend text {
+    font-size: 12px !important;
+}
+/* GeoJSON hover tooltips (folium.GeoJsonTooltip): match colorbar text size. */
+.leaflet-container .leaflet-tooltip {
+    font-size: 12px !important;
+    line-height: 1.25 !important;
+}
+</style>
+"""
+
+
+def _inject_fusion_preview_responsive_legend_css(m: folium.Map) -> None:
+    """Shrink Branca LinearColormap bars when the map iframe/column is narrow."""
+    m.get_root().header.add_child(BrancaHtmlElement(_FUSION_PREVIEW_RESPONSIVE_LEGEND_CSS))  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +295,7 @@ def _check_coverage(metric_path: str, buffered_gdf: "gpd.GeoDataFrame") -> bool:
 def _fusion_worker(
     job_id,
     target_path,
-    target_feature,
+    target_features_geojson,
     target_band,
     buffer_meters,
     gvi_buffer_min_m,
@@ -122,15 +322,28 @@ def _fusion_worker(
     ndvi_start_date,
     ndvi_end_date,
     ndvi_project_id,
+    multi_objective_requested,
     output_dir,
     job_tracker_dict,
     MetricFusionEngine,
 ):
     try:
-        job_tracker_dict[job_id]["status"] = "Initializing fusion engine..."
-        job_tracker_dict[job_id]["progress"] = 0.05
+        targets = (
+            list(target_features_geojson)
+            if target_features_geojson
+            else [None]
+        )
+        n_t = max(len(targets), 1)
+        multi_outcome = len([t for t in targets if t is not None]) > 1
 
-        print(f"[FUSION] Starting fusion job {job_id}")
+        if multi_objective_requested and multi_outcome:
+            print(
+                "[FUSION] Multi-objective optimization run requested — "
+                "joint study not implemented yet; running separate single-objective "
+                "studies per outcome."
+            )
+
+        print(f"[FUSION] Starting fusion job {job_id} ({n_t} target run(s))")
         print(
             "[FUSION] Buffer ladders: "
             f"GVI [{gvi_buffer_min_m}, {gvi_buffer_max_m}] step={gvi_buffer_step_m} m, "
@@ -141,134 +354,213 @@ def _fusion_worker(
         if gvi_grid_spacing_m is not None:
             print(f"[FUSION] GVI sampling grid spacing: {gvi_grid_spacing_m} m")
 
-        engine = MetricFusionEngine(
-            target_file=target_path,
-            target_feature=target_feature,
-            target_band=target_band,
-            buffer_meters=buffer_meters,
-            gvi_buffer_min_m=gvi_buffer_min_m,
-            gvi_buffer_max_m=gvi_buffer_max_m,
-            gvi_buffer_step_m=gvi_buffer_step_m,
-            ndvi_buffer_min_m=ndvi_buffer_min_m,
-            ndvi_buffer_max_m=ndvi_buffer_max_m,
-            ndvi_buffer_step_m=ndvi_buffer_step_m,
-            n_bins=n_bins,
-            cache_dir=os.path.join(output_dir, "fusion_cache"),
-        )
+        by_target: dict = {}
+        engines_by_target: dict = {}
+        ordered_labels: list[str] = []
 
-        print("[FUSION] Engine initialized successfully")
+        cache_dir = os.path.join(output_dir, "fusion_cache")
 
-        job_tracker_dict[job_id]["status"] = "Loading target data..."
-        job_tracker_dict[job_id]["progress"] = 0.1
-        engine.load_target()
-
-        print("[FUSION] Target loaded successfully")
-        print("[FUSION] Starting metric loading/download phase")
-        print(
-            f"[FUSION] veg_path={veg_path}, terrain_path={terrain_path}, "
-            f"ndvi_path={ndvi_path}"
-        )
-
-        if not veg_path:
-            job_tracker_dict[job_id]["status"] = "Downloading GVI Vegetation data..."
-            job_tracker_dict[job_id]["progress"] = 0.15
-            print("[FUSION] Will auto-download GVI vegetation")
-        elif not terrain_path:
-            job_tracker_dict[job_id]["status"] = "Downloading GVI Terrain data..."
-            job_tracker_dict[job_id]["progress"] = 0.20
-            print("[FUSION] Will auto-download GVI terrain")
-        elif not ndvi_path:
-            job_tracker_dict[job_id]["status"] = "Downloading NDVI satellite data..."
-            job_tracker_dict[job_id]["progress"] = 0.25
-            print("[FUSION] Will auto-download NDVI")
-        elif veg_path and terrain_path and ndvi_path:
-            job_tracker_dict[job_id]["status"] = "Loading provided metric files..."
-            job_tracker_dict[job_id]["progress"] = 0.15
-            print("[FUSION] Loading from provided files")
-
-        if job_tracker_dict[job_id]["cancel"]:
-            job_tracker_dict[job_id]["status"] = "Cancelled"
-            return
-
-        last_update_time = {"veg": 0, "terrain": 0}
-
-        def gvi_progress_callback(component, curr, total):
-            current_time = time.time()
-            if (
-                current_time - last_update_time.get(component, 0) < 0.5
-                and curr != total
-            ):
+        for ti, target_feature in enumerate(targets):
+            if job_tracker_dict[job_id]["cancel"]:
+                job_tracker_dict[job_id]["status"] = "Cancelled"
                 return
-            last_update_time[component] = current_time
-            job_tracker_dict[job_id]["gvi_progress"] = {
-                "component": component,
-                "current": curr,
-                "total": total,
-                "percent": 100 * curr / total if total > 0 else 0,
+
+            label = (
+                target_feature
+                if target_feature is not None
+                else f"raster_band_{target_band}"
+            )
+            ordered_labels.append(label)
+            prefix = f"[{label}] " if n_t > 1 else ""
+
+            def prog(local: float) -> float:
+                return (ti + local) / n_t
+
+            job_tracker_dict[job_id]["status"] = (
+                f"{prefix}Initializing fusion engine..."
+                if n_t > 1
+                else "Initializing fusion engine..."
+            )
+            job_tracker_dict[job_id]["progress"] = prog(0.05)
+
+            engine = MetricFusionEngine(
+                target_file=target_path,
+                target_feature=target_feature,
+                target_band=target_band,
+                buffer_meters=buffer_meters,
+                gvi_buffer_min_m=gvi_buffer_min_m,
+                gvi_buffer_max_m=gvi_buffer_max_m,
+                gvi_buffer_step_m=gvi_buffer_step_m,
+                ndvi_buffer_min_m=ndvi_buffer_min_m,
+                ndvi_buffer_max_m=ndvi_buffer_max_m,
+                ndvi_buffer_step_m=ndvi_buffer_step_m,
+                n_bins=n_bins,
+                cache_dir=cache_dir,
+            )
+
+            print(f"{prefix}[FUSION] Engine initialized")
+
+            job_tracker_dict[job_id]["status"] = (
+                f"{prefix}Loading target data..." if n_t > 1 else "Loading target data..."
+            )
+            job_tracker_dict[job_id]["progress"] = prog(0.1)
+            engine.load_target()
+
+            print(f"{prefix}[FUSION] Target loaded")
+            print(
+                f"{prefix}[FUSION] veg_path={veg_path}, terrain_path={terrain_path}, "
+                f"ndvi_path={ndvi_path}"
+            )
+
+            if not veg_path:
+                job_tracker_dict[job_id]["status"] = (
+                    f"{prefix}Downloading GVI Vegetation data..."
+                    if n_t > 1
+                    else "Downloading GVI Vegetation data..."
+                )
+                job_tracker_dict[job_id]["progress"] = prog(0.15)
+            elif not terrain_path:
+                job_tracker_dict[job_id]["status"] = (
+                    f"{prefix}Downloading GVI Terrain data..."
+                    if n_t > 1
+                    else "Downloading GVI Terrain data..."
+                )
+                job_tracker_dict[job_id]["progress"] = prog(0.20)
+            elif not ndvi_path:
+                job_tracker_dict[job_id]["status"] = (
+                    f"{prefix}Downloading NDVI satellite data..."
+                    if n_t > 1
+                    else "Downloading NDVI satellite data..."
+                )
+                job_tracker_dict[job_id]["progress"] = prog(0.25)
+            else:
+                job_tracker_dict[job_id]["status"] = (
+                    f"{prefix}Loading provided metric files..."
+                    if n_t > 1
+                    else "Loading provided metric files..."
+                )
+                job_tracker_dict[job_id]["progress"] = prog(0.15)
+
+            if job_tracker_dict[job_id]["cancel"]:
+                job_tracker_dict[job_id]["status"] = "Cancelled"
+                return
+
+            last_update_time = {"veg": 0, "terrain": 0}
+
+            def gvi_progress_callback(component, curr, total):
+                current_time = time.time()
+                if (
+                    current_time - last_update_time.get(component, 0) < 0.5
+                    and curr != total
+                ):
+                    return
+                last_update_time[component] = current_time
+                job_tracker_dict[job_id]["gvi_progress"] = {
+                    "component": component,
+                    "current": curr,
+                    "total": total,
+                    "percent": 100 * curr / total if total > 0 else 0,
+                }
+
+            def cancel_check():
+                return job_tracker_dict[job_id]["cancel"]
+
+            engine.load_metrics(
+                veg_file=veg_path,
+                terrain_file=terrain_path,
+                ndvi_file=ndvi_path,
+                cache_metrics=cache_metrics,
+                gvi_api_key=gvi_api_key,
+                ndvi_start_date=ndvi_start_date,
+                ndvi_end_date=ndvi_end_date,
+                ndvi_project_id=ndvi_project_id,
+                progress_callback=gvi_progress_callback,
+                cancel_callback=cancel_check,
+                ndvi_resolution_m=ndvi_resolution_m,
+                gvi_grid_spacing_m=gvi_grid_spacing_m,
+            )
+
+            print(f"{prefix}[FUSION] Metrics loaded")
+
+            job_tracker_dict[job_id]["status"] = (
+                f"{prefix}Splitting data..." if n_t > 1 else "Splitting data..."
+            )
+            job_tracker_dict[job_id]["progress"] = prog(0.3)
+            engine.split_data(test_size=test_size, k_folds=k_folds, random_state=42)
+
+            job_tracker_dict[job_id]["status"] = (
+                f"{prefix}Optimizing ({n_trials} trials)..."
+                if n_t > 1
+                else f"Optimizing ({n_trials} trials)..."
+            )
+            job_tracker_dict[job_id]["progress"] = prog(0.35)
+
+            best_params = engine.optimize_fusion(
+                n_trials=n_trials,
+                n_startup_trials=n_startup_trials,
+                objective_metric=objective_metric,
+                pruner_type=pruner_type if pruner_type != "none" else None,
+                sampler_type=sampler_type,
+                seed=42,
+                show_progress=False,
+            )
+
+            job_tracker_dict[job_id]["status"] = (
+                f"{prefix}Filtering robust trials..." if n_t > 1 else "Filtering robust trials..."
+            )
+            job_tracker_dict[job_id]["progress"] = prog(0.85)
+            robust_trials = engine.get_robust_trials(
+                method="auto", p_threshold=0.05, tolerance=0.1, min_trials=10
+            )
+
+            job_tracker_dict[job_id]["status"] = (
+                f"{prefix}Evaluating on test set..."
+                if n_t > 1
+                else "Evaluating on test set..."
+            )
+            job_tracker_dict[job_id]["progress"] = prog(0.9)
+            test_results = engine.evaluate_on_test(
+                params=best_params, metric=objective_metric
+            )
+
+            job_tracker_dict[job_id]["status"] = (
+                f"{prefix}Applying fusion weights..."
+                if n_t > 1
+                else "Applying fusion weights..."
+            )
+            job_tracker_dict[job_id]["progress"] = prog(0.95)
+            composite_df = engine.apply_fusion()
+
+            bundle = {
+                "best_params": best_params,
+                "best_value": engine.study.best_value,
+                "robust_trials": robust_trials,
+                "composite_df": composite_df,
+                "objective_metric": objective_metric,
+                "test_results": test_results,
+                "target_feature": target_feature,
             }
+            by_target[label] = bundle
+            engines_by_target[label] = engine
 
-        def cancel_check():
-            return job_tracker_dict[job_id]["cancel"]
+            job_tracker_dict[job_id]["progress"] = prog(1.0)
 
-        engine.load_metrics(
-            veg_file=veg_path,
-            terrain_file=terrain_path,
-            ndvi_file=ndvi_path,
-            cache_metrics=cache_metrics,
-            gvi_api_key=gvi_api_key,
-            ndvi_start_date=ndvi_start_date,
-            ndvi_end_date=ndvi_end_date,
-            ndvi_project_id=ndvi_project_id,
-            progress_callback=gvi_progress_callback,
-            cancel_callback=cancel_check,
-            ndvi_resolution_m=ndvi_resolution_m,
-            gvi_grid_spacing_m=gvi_grid_spacing_m,
-        )
-
-        print("[FUSION] Metrics loaded successfully")
-
-        job_tracker_dict[job_id]["status"] = "Splitting data..."
-        job_tracker_dict[job_id]["progress"] = 0.3
-        engine.split_data(test_size=test_size, k_folds=k_folds, random_state=42)
-
-        job_tracker_dict[job_id]["status"] = f"Optimizing ({n_trials} trials)..."
-        job_tracker_dict[job_id]["progress"] = 0.35
-
-        best_params = engine.optimize_fusion(
-            n_trials=n_trials,
-            n_startup_trials=n_startup_trials,
-            objective_metric=objective_metric,
-            pruner_type=pruner_type if pruner_type != "none" else None,
-            sampler_type=sampler_type,
-            seed=42,
-            show_progress=False,
-        )
-
-        job_tracker_dict[job_id]["status"] = "Filtering robust trials..."
-        job_tracker_dict[job_id]["progress"] = 0.85
-        robust_trials = engine.get_robust_trials(
-            method="auto", p_threshold=0.05, tolerance=0.1, min_trials=10
-        )
-
-        job_tracker_dict[job_id]["status"] = "Evaluating on test set..."
-        job_tracker_dict[job_id]["progress"] = 0.9
-        test_results = engine.evaluate_on_test(
-            params=best_params, metric=objective_metric
-        )
-
-        job_tracker_dict[job_id]["status"] = "Applying fusion weights..."
-        job_tracker_dict[job_id]["progress"] = 0.95
-        composite_df = engine.apply_fusion()
-
-        job_tracker_dict[job_id]["engine"] = engine
-        job_tracker_dict[job_id]["results"] = {
-            "best_params": best_params,
-            "best_value": engine.study.best_value,
-            "robust_trials": robust_trials,
-            "composite_df": composite_df,
-            "objective_metric": objective_metric,
-            "test_results": test_results,
+        sole_label = ordered_labels[0]
+        results_payload = {
+            "mode": "multi" if multi_outcome else "single",
+            "ordered_labels": ordered_labels,
+            "by_target": by_target,
+            "multi_objective_requested": bool(multi_objective_requested)
+            and multi_outcome,
         }
+        if not multi_outcome:
+            results_payload.update(by_target[sole_label])
+
+        job_tracker_dict[job_id]["engine"] = (
+            None if multi_outcome else engines_by_target[sole_label]
+        )
+        job_tracker_dict[job_id]["engines_by_target"] = engines_by_target
+        job_tracker_dict[job_id]["results"] = results_payload
         job_tracker_dict[job_id]["status"] = "Completed"
         job_tracker_dict[job_id]["progress"] = 1.0
 
@@ -305,6 +597,10 @@ def render(output_dir: str) -> None:
         st.session_state.fusion_engine = None
     if "fusion_results" not in st.session_state:
         st.session_state.fusion_results = None
+    if "fusion_outcome_columns" not in st.session_state:
+        st.session_state.fusion_outcome_columns = []
+    if "fusion_engines_by_target" not in st.session_state:
+        st.session_state.fusion_engines_by_target = {}
 
     # =========================================================================
     # ROW 1: Configuration (Left) | Preview (Right)
@@ -314,8 +610,9 @@ def render(output_dir: str) -> None:
     tmp_target_path = None
     is_geojson = False
     is_tiff = False
-    target_feature = None
+    target_outcome_columns: list = []
     target_band = 1
+    multi_objective_requested = False
 
     with col_fusion_left:
         st.subheader("Target Configuration")
@@ -342,13 +639,62 @@ def render(output_dir: str) -> None:
                     numeric_cols = preview_gdf.select_dtypes(
                         include=[np.number]
                     ).columns.tolist()
-                    st.info(f"📍 Detected: **GeoJSON** with {len(preview_gdf)} points")
-                    target_feature = st.selectbox(
-                        "Target Attribute (Outcome Variable)",
-                        options=numeric_cols,
-                        help="Numeric outcome column.",
-                        key="fusion_target_attribute",
+                    sig = (target_file.name, target_file.size)
+                    if st.session_state.get("fusion_target_upload_sig") != sig:
+                        st.session_state.fusion_target_upload_sig = sig
+                        st.session_state.fusion_outcome_columns = []
+
+                    st.info(
+                        f"📍 Detected: **GeoJSON** — {_geojson_geometry_summary(preview_gdf)}"
                     )
+                    st.caption(
+                        "Add each numeric outcome column in order. After you pick one "
+                        "column, choose the next from the updated list."
+                    )
+                    if st.session_state.fusion_outcome_columns:
+                        for i, col in enumerate(st.session_state.fusion_outcome_columns):
+                            row_l, row_r = st.columns([4, 1])
+                            with row_l:
+                                st.text(f"Outcome {i + 1}: {col}")
+                            with row_r:
+                                if st.button(
+                                    "❌",
+                                    key=f"fusion_outcome_remove_{i}",
+                                    help="Remove this outcome column",
+                                ):
+                                    st.session_state.fusion_outcome_columns.pop(i)
+                                    st.rerun()
+
+                    remaining = [
+                        c
+                        for c in numeric_cols
+                        if c not in st.session_state.fusion_outcome_columns
+                    ]
+                    if remaining:
+                        st.selectbox(
+                            "Add outcome column",
+                            options=[_FUSION_OUTCOME_ADD_PLACEHOLDER] + remaining,
+                            key="fusion_add_outcome_column",
+                            on_change=_fusion_append_outcome_callback,
+                            help="Each choice adds one outcome column for optimization.",
+                        )
+                    elif not numeric_cols:
+                        st.warning("No numeric columns found in this GeoJSON.")
+                    elif not st.session_state.fusion_outcome_columns:
+                        st.warning("No numeric columns available to add.")
+
+                    target_outcome_columns = list(st.session_state.fusion_outcome_columns)
+                    if len(target_outcome_columns) > 1:
+                        multi_objective_requested = st.checkbox(
+                            "Multi-objective optimization run",
+                            value=False,
+                            help=(
+                                "When enabled, requests a joint optimization across all "
+                                "selected outcomes. Full multi-objective fusion is not "
+                                "available yet; runs stay sequential until implemented."
+                            ),
+                            key="fusion_multi_objective_run",
+                        )
                 except Exception as e:
                     st.error(f"Error loading GeoJSON: {e}")
                     tmp_target_path = None
@@ -370,379 +716,12 @@ def render(output_dir: str) -> None:
                     st.error(f"Error loading GeoTIFF: {e}")
                     tmp_target_path = None
 
-        st.divider()
-        st.subheader("Metric Configuration")
-
-        st.markdown("**GVI buffer exploration (m)**")
-        col_bgvi_a, col_bgvi_b, col_bgvi_c = st.columns(3)
-        with col_bgvi_a:
-            gvi_buffer_min_m = st.number_input(
-                "GVI minimum buffer",
-                min_value=50,
-                max_value=4900,
-                value=100,
-                step=50,
-                help="Smallest GVI radius searched (m).",
-                key="fusion_gvi_buffer_min",
-            )
-        with col_bgvi_b:
-            gvi_buffer_max_m = st.number_input(
-                "GVI maximum buffer",
-                min_value=100,
-                max_value=5000,
-                value=1500,
-                step=50,
-                help="Largest GVI radius (m); extent padding uses max with NDVI.",
-                key="fusion_gvi_buffer_max",
-            )
-        with col_bgvi_c:
-            gvi_buffer_step_m = st.number_input(
-                "GVI buffer step",
-                min_value=10,
-                max_value=500,
-                value=50,
-                step=10,
-                help="Radius discretization (m).",
-                key="fusion_gvi_buffer_step",
-            )
-
-        st.markdown("**NDVI buffer exploration (m)**")
-        col_bndvi_a, col_bndvi_b, col_bndvi_c = st.columns(3)
-        with col_bndvi_a:
-            ndvi_buffer_min_m = st.number_input(
-                "NDVI minimum buffer",
-                min_value=50,
-                max_value=4900,
-                value=100,
-                step=50,
-                help="Smallest NDVI radius searched (m).",
-                key="fusion_ndvi_buffer_min",
-            )
-        with col_bndvi_b:
-            ndvi_buffer_max_m = st.number_input(
-                "NDVI maximum buffer",
-                min_value=100,
-                max_value=5000,
-                value=1500,
-                step=50,
-                help="Largest NDVI radius (m); extent padding uses max with GVI.",
-                key="fusion_ndvi_buffer_max",
-            )
-        with col_bndvi_c:
-            ndvi_buffer_step_m = st.number_input(
-                "NDVI buffer step",
-                min_value=10,
-                max_value=500,
-                value=50,
-                step=10,
-                help="Radius discretization (m).",
-                key="fusion_ndvi_buffer_step",
-            )
-
-        buffer_extent_m = float(max(gvi_buffer_max_m, ndvi_buffer_max_m))
-
-        metric_mode = st.radio(
-            "Metric Source",
-            options=["Use Loaded Results", "Upload Files", "Auto-Download"],
-            horizontal=True,
-            help="Use existing outputs, upload rasters/vectors, or fetch metrics at run time.",
-            key="fusion_metric_source",
-        )
-
-        ndvi_auto_start = date(2023, 6, 1)
-        ndvi_auto_end = date(2023, 9, 30)
-        cache_metrics = False
-
-        gvi_path = None
-        ndvi_path = None
-        gvi_api_key_input = ""
-
-        if metric_mode == "Use Loaded Results":
-            # Scan output folder for all pre-computed files
-            all_gvi_files = _scan_metric_files(output_dir, "gvi")
-            all_ndvi_files = _scan_metric_files(output_dir, "ndvi")
-
-            # Compute buffered target extent for spatial filtering (if target loaded)
-            buffered_extent = None
-            if tmp_target_path:
-                buffered_extent = _compute_buffered_extent(
-                    tmp_target_path, is_geojson, buffer_extent_m
-                )
-
-            def _filter_by_coverage(file_list, bext):
-                """Return (covering, non_covering) label lists."""
-                if bext is None:
-                    return [lbl for lbl, _ in file_list], []
-                covering, non_covering = [], []
-                for lbl, path in file_list:
-                    (covering if _check_coverage(path, bext) else non_covering).append(
-                        lbl
-                    )
-                return covering, non_covering
-
-            gvi_covering, gvi_outside = _filter_by_coverage(
-                all_gvi_files, buffered_extent
-            )
-            ndvi_covering, ndvi_outside = _filter_by_coverage(
-                all_ndvi_files, buffered_extent
-            )
-
-            col_gvi_sel, col_ndvi_sel = st.columns(2)
-
-            with col_gvi_sel:
-                if not all_gvi_files:
-                    st.info("No GVI results found in the output folder.")
-                else:
-                    if buffered_extent is not None:
-                        st.caption(
-                            f"🌿 GVI: {len(gvi_covering)} cover target"
-                            + (f", {len(gvi_outside)} outside" if gvi_outside else "")
-                        )
-                    options_gvi = (
-                        [None]
-                        + gvi_covering
-                        + (
-                            ["── outside target ──"] + gvi_outside
-                            if gvi_outside
-                            else []
-                        )
-                    )
-                    gvi_selection = st.selectbox(
-                        "🌿 Select GVI Result",
-                        options=options_gvi,
-                        format_func=lambda x: (
-                            "(Optional — will auto-download)" if x is None else x
-                        ),
-                        key="fusion_gvi_select",
-                    )
-                    if gvi_selection and not gvi_selection.startswith("──"):
-                        gvi_path = os.path.join(output_dir, gvi_selection)
-                        if not os.path.exists(gvi_path):
-                            st.warning("⚠️ File not found on disk.")
-                            gvi_path = None
-                        elif (
-                            buffered_extent is not None and gvi_selection in gvi_outside
-                        ):
-                            st.warning(
-                                "⚠️ This result does not fully cover the buffered "
-                                "target area — spatial alignment may be incomplete."
-                            )
-                        else:
-                            st.success(f"✓ {gvi_selection}")
-
-            with col_ndvi_sel:
-                if not all_ndvi_files:
-                    st.info("No NDVI results found in the output folder.")
-                else:
-                    if buffered_extent is not None:
-                        st.caption(
-                            f"🛰️ NDVI: {len(ndvi_covering)} cover target"
-                            + (f", {len(ndvi_outside)} outside" if ndvi_outside else "")
-                        )
-                    options_ndvi = (
-                        [None]
-                        + ndvi_covering
-                        + (
-                            ["── outside target ──"] + ndvi_outside
-                            if ndvi_outside
-                            else []
-                        )
-                    )
-                    ndvi_selection = st.selectbox(
-                        "🛰️ Select NDVI Result",
-                        options=options_ndvi,
-                        format_func=lambda x: (
-                            "(Optional — will auto-download)" if x is None else x
-                        ),
-                        key="fusion_ndvi_select",
-                    )
-                    if ndvi_selection and not ndvi_selection.startswith("──"):
-                        ndvi_path = os.path.join(output_dir, ndvi_selection)
-                        if not os.path.exists(ndvi_path):
-                            st.warning("⚠️ File not found on disk.")
-                            ndvi_path = None
-                        elif (
-                            buffered_extent is not None
-                            and ndvi_selection in ndvi_outside
-                        ):
-                            st.warning(
-                                "⚠️ This result does not fully cover the buffered "
-                                "target area — spatial alignment may be incomplete."
-                            )
-                        else:
-                            st.success(f"✓ {ndvi_selection}")
-
-        elif metric_mode == "Upload Files":
-            col_gvi_up, col_ndvi_up = st.columns(2)
-
-            with col_gvi_up:
-                gvi_file = st.file_uploader(
-                    "🌿 Upload GVI File",
-                    type=["geojson", "json", "tif", "tiff"],
-                    key="fusion_gvi_upload",
-                )
-                if gvi_file:
-                    with tempfile.NamedTemporaryFile(
-                        delete=False, suffix=os.path.splitext(gvi_file.name)[1]
-                    ) as tmp:
-                        tmp.write(gvi_file.getvalue())
-                        gvi_path = tmp.name
-                    st.success(f"✓ Uploaded: {gvi_file.name}")
-
-            with col_ndvi_up:
-                ndvi_file = st.file_uploader(
-                    "🛰️ Upload NDVI File",
-                    type=["geojson", "json", "tif", "tiff"],
-                    key="fusion_ndvi_upload",
-                )
-                if ndvi_file:
-                    with tempfile.NamedTemporaryFile(
-                        delete=False, suffix=os.path.splitext(ndvi_file.name)[1]
-                    ) as tmp:
-                        tmp.write(ndvi_file.getvalue())
-                        ndvi_path = tmp.name
-                    st.success(f"✓ Uploaded: {ndvi_file.name}")
-
-        else:  # Auto-Download
-            col_ad1, col_ad2 = st.columns(2)
-            with col_ad1:
-                ndvi_auto_start = st.date_input(
-                    "NDVI Start Date",
-                    value=date(2023, 6, 1),
-                    help="Composite interval start (auto-download NDVI).",
-                    key="fusion_ndvi_start_date",
-                )
-            with col_ad2:
-                ndvi_auto_end = st.date_input(
-                    "NDVI End Date",
-                    value=date(2023, 9, 30),
-                    help="Composite interval end (auto-download NDVI).",
-                    key="fusion_ndvi_end_date",
-                )
-            cache_metrics = st.checkbox(
-                "Cache Metrics to Disk",
-                value=True,
-                help="Persist fetched metrics under the output fusion cache.",
-                key="fusion_cache_metrics",
-            )
-            gvi_api_key_input = st.text_input(
-                "Street View API Key (optional)",
-                type="password",
-                help="Optional Google Street View key; leave blank for built-in access.",
-                key="fusion_streetview_api_key",
-            )
-
-        if metric_mode != "Auto-Download":
-            ndvi_auto_start = date(2023, 6, 1)
-            ndvi_auto_end = date(2023, 9, 30)
-            cache_metrics = False
-
-        ndvi_resolution_m = None
-        gvi_grid_spacing_m = None
-
-        if metric_mode == "Auto-Download":
-            st.markdown("**Metric generation settings**")
-            ndvi_resolution_m = st.number_input(
-                "NDVI satellite resolution (m)",
-                min_value=5.0,
-                max_value=100.0,
-                value=10.0,
-                step=5.0,
-                help="Target pixel size for NDVI export (Earth Engine).",
-                key="fusion_ndvi_satellite_resolution",
-            )
-            gvi_grid_spacing_m = st.number_input(
-                "GVI sampling grid spacing (m)",
-                min_value=10.0,
-                max_value=500.0,
-                value=50.0,
-                step=10.0,
-                help="Spacing for street-view sample points on the grid.",
-                key="fusion_gvi_sampling_grid_spacing",
-            )
-
-        st.divider()
-        st.subheader("Optimization Settings")
-
-        col_opt1, col_opt2 = st.columns(2)
-        with col_opt1:
-            objective_metric = st.selectbox(
-                "Objective Metric",
-                options=["pearson", "spearman", "r2", "rmse", "mutual_info"],
-                index=0,
-                help="Quantity maximized or minimized across CV folds.",
-                key="fusion_objective_metric",
-            )
-            n_trials = st.number_input(
-                "Total Trials",
-                min_value=50,
-                max_value=1000,
-                value=300,
-                step=50,
-                help="Number of Optuna trials.",
-                key="fusion_n_trials",
-            )
-            optimizer = st.selectbox(
-                "Optimizer",
-                options=["TPE", "CMA-ES", "Random"],
-                index=0,
-                help="Hyperparameter search sampler.",
-                key="fusion_optimizer",
-            )
-
-        with col_opt2:
-            n_startup_trials = st.number_input(
-                "Random Startup Trials",
-                min_value=10,
-                max_value=500,
-                value=150,
-                step=10,
-                help="Uniformly random trials before the main sampler.",
-                key="fusion_n_startup",
-            )
-            pruner_type = st.selectbox(
-                "Pruner",
-                options=["median", "hyperband", "successive_halving", "none"],
-                index=0,
-                help="Early stopping rule for unpromising trials.",
-                key="fusion_pruner",
-            )
-
-        col_split1, col_split2, col_split3 = st.columns(3)
-        with col_split1:
-            test_size = st.slider(
-                "Test Set Size",
-                min_value=0.1,
-                max_value=0.5,
-                value=0.3,
-                step=0.05,
-                help="Held-out evaluation fraction.",
-                key="fusion_test_size",
-            )
-        with col_split2:
-            k_folds = st.number_input(
-                "K-Fold CV",
-                min_value=3,
-                max_value=10,
-                value=5,
-                help="Cross-validation folds on the non-test subset.",
-                key="fusion_k_folds",
-            )
-        with col_split3:
-            n_bins = st.number_input(
-                "Stratification Bins",
-                min_value=3,
-                max_value=10,
-                value=5,
-                help="Quantile bins for stratified train/test split.",
-                key="fusion_stratification_bins",
-            )
-
     with col_fusion_right:
         st.subheader("Target Preview")
 
         if target_file and tmp_target_path:
             m_fusion_preview = folium.Map(location=[51.0447, -114.0719], zoom_start=10)
+            _inject_fusion_preview_responsive_legend_css(m_fusion_preview)
 
             try:
                 if is_geojson:
@@ -752,32 +731,24 @@ def render(output_dir: str) -> None:
                     else:
                         preview_gdf = preview_gdf.to_crs("EPSG:4326")
 
-                    if target_feature and target_feature in preview_gdf.columns:
-                        vals = preview_gdf[target_feature].dropna()
+                    preview_feature = None
+                    if target_outcome_columns:
+                        preview_feature = st.selectbox(
+                            "Preview outcome column",
+                            options=target_outcome_columns,
+                            key="fusion_preview_outcome_column",
+                        )
+
+                    if preview_feature and preview_feature in preview_gdf.columns:
+                        vals = preview_gdf[preview_feature].dropna()
                         if len(vals) > 0:
-                            vmin, vmax = vals.min(), vals.max()
-                            for _, row in preview_gdf.iterrows():
-                                if pd.notna(row[target_feature]):
-                                    norm_val = (
-                                        (row[target_feature] - vmin) / (vmax - vmin)
-                                        if vmax > vmin
-                                        else 0.5
-                                    )
-                                    color = (
-                                        f"#{int(255*(1-norm_val)):02x}"
-                                        f"{int(255*norm_val):02x}00"
-                                    )
-                                    folium.CircleMarker(
-                                        location=[row.geometry.y, row.geometry.x],
-                                        radius=5,
-                                        color=color,
-                                        fill=True,
-                                        fill_opacity=0.7,
-                                        popup=(
-                                            f"{target_feature}: "
-                                            f"{row[target_feature]:.3f}"
-                                        ),
-                                    ).add_to(m_fusion_preview)
+                            _add_outcome_geometry_preview(
+                                m_fusion_preview,
+                                preview_gdf,
+                                preview_feature,
+                            )
+                        else:
+                            folium.GeoJson(preview_gdf).add_to(m_fusion_preview)
                     else:
                         folium.GeoJson(preview_gdf).add_to(m_fusion_preview)
 
@@ -845,7 +816,379 @@ def render(output_dir: str) -> None:
             st.info("Upload a target file to preview")
 
     # =========================================================================
-    # ROW 2: Run Button & Progress
+    # Full width: metric source and optimization (below the split preview row)
+    # =========================================================================
+    st.divider()
+    st.subheader("Metric Configuration")
+
+    st.markdown("**GVI buffer exploration (m)**")
+    col_bgvi_a, col_bgvi_b, col_bgvi_c = st.columns(3)
+    with col_bgvi_a:
+        gvi_buffer_min_m = st.number_input(
+            "GVI minimum buffer",
+            min_value=50,
+            max_value=4900,
+            value=100,
+            step=50,
+            help="Smallest GVI radius searched (m).",
+            key="fusion_gvi_buffer_min",
+        )
+    with col_bgvi_b:
+        gvi_buffer_max_m = st.number_input(
+            "GVI maximum buffer",
+            min_value=100,
+            max_value=5000,
+            value=1500,
+            step=50,
+            help="Largest GVI radius (m); extent padding uses max with NDVI.",
+            key="fusion_gvi_buffer_max",
+        )
+    with col_bgvi_c:
+        gvi_buffer_step_m = st.number_input(
+            "GVI buffer step",
+            min_value=10,
+            max_value=500,
+            value=50,
+            step=10,
+            help="Radius discretization (m).",
+            key="fusion_gvi_buffer_step",
+        )
+
+    st.markdown("**NDVI buffer exploration (m)**")
+    col_bndvi_a, col_bndvi_b, col_bndvi_c = st.columns(3)
+    with col_bndvi_a:
+        ndvi_buffer_min_m = st.number_input(
+            "NDVI minimum buffer",
+            min_value=50,
+            max_value=4900,
+            value=100,
+            step=50,
+            help="Smallest NDVI radius searched (m).",
+            key="fusion_ndvi_buffer_min",
+        )
+    with col_bndvi_b:
+        ndvi_buffer_max_m = st.number_input(
+            "NDVI maximum buffer",
+            min_value=100,
+            max_value=5000,
+            value=1500,
+            step=50,
+            help="Largest NDVI radius (m); extent padding uses max with GVI.",
+            key="fusion_ndvi_buffer_max",
+        )
+    with col_bndvi_c:
+        ndvi_buffer_step_m = st.number_input(
+            "NDVI buffer step",
+            min_value=10,
+            max_value=500,
+            value=50,
+            step=10,
+            help="Radius discretization (m).",
+            key="fusion_ndvi_buffer_step",
+        )
+
+    buffer_extent_m = float(max(gvi_buffer_max_m, ndvi_buffer_max_m))
+
+    metric_mode = st.radio(
+        "Metric Source",
+        options=["Use Loaded Results", "Upload Files", "Auto-Download"],
+        horizontal=True,
+        help="Use existing outputs, upload rasters/vectors, or fetch metrics at run time.",
+        key="fusion_metric_source",
+    )
+
+    ndvi_auto_start = date(2023, 6, 1)
+    ndvi_auto_end = date(2023, 9, 30)
+    cache_metrics = False
+
+    gvi_path = None
+    ndvi_path = None
+    gvi_api_key_input = ""
+
+    if metric_mode == "Use Loaded Results":
+        # Scan output folder for all pre-computed files
+        all_gvi_files = _scan_metric_files(output_dir, "gvi")
+        all_ndvi_files = _scan_metric_files(output_dir, "ndvi")
+
+        # Compute buffered target extent for spatial filtering (if target loaded)
+        buffered_extent = None
+        if tmp_target_path:
+            buffered_extent = _compute_buffered_extent(
+                tmp_target_path, is_geojson, buffer_extent_m
+            )
+
+        def _filter_by_coverage(file_list, bext):
+            """Return (covering, non_covering) label lists."""
+            if bext is None:
+                return [lbl for lbl, _ in file_list], []
+            covering, non_covering = [], []
+            for lbl, path in file_list:
+                (covering if _check_coverage(path, bext) else non_covering).append(
+                    lbl
+                )
+            return covering, non_covering
+
+        gvi_covering, gvi_outside = _filter_by_coverage(
+            all_gvi_files, buffered_extent
+        )
+        ndvi_covering, ndvi_outside = _filter_by_coverage(
+            all_ndvi_files, buffered_extent
+        )
+
+        col_gvi_sel, col_ndvi_sel = st.columns(2)
+
+        with col_gvi_sel:
+            if not all_gvi_files:
+                st.info("No GVI results found in the output folder.")
+            else:
+                if buffered_extent is not None:
+                    st.caption(
+                        f"🌿 GVI: {len(gvi_covering)} cover target"
+                        + (f", {len(gvi_outside)} outside" if gvi_outside else "")
+                    )
+                options_gvi = (
+                    [None]
+                    + gvi_covering
+                    + (
+                        ["── outside target ──"] + gvi_outside
+                        if gvi_outside
+                        else []
+                    )
+                )
+                gvi_selection = st.selectbox(
+                    "🌿 Select GVI Result",
+                    options=options_gvi,
+                    format_func=lambda x: (
+                        "(Optional — will auto-download)" if x is None else x
+                    ),
+                    key="fusion_gvi_select",
+                )
+                if gvi_selection and not gvi_selection.startswith("──"):
+                    gvi_path = os.path.join(output_dir, gvi_selection)
+                    if not os.path.exists(gvi_path):
+                        st.warning("⚠️ File not found on disk.")
+                        gvi_path = None
+                    elif (
+                        buffered_extent is not None and gvi_selection in gvi_outside
+                    ):
+                        st.warning(
+"⚠️ This result does not fully cover the buffered "
+                                "target area — spatial alignment may be incomplete."
+                        )
+                    else:
+                        st.success(f"✓ {gvi_selection}")
+
+        with col_ndvi_sel:
+            if not all_ndvi_files:
+                st.info("No NDVI results found in the output folder.")
+            else:
+                if buffered_extent is not None:
+                    st.caption(
+                        f"🛰️ NDVI: {len(ndvi_covering)} cover target"
+                        + (f", {len(ndvi_outside)} outside" if ndvi_outside else "")
+                    )
+                options_ndvi = (
+                    [None]
+                    + ndvi_covering
+                    + (
+                        ["── outside target ──"] + ndvi_outside
+                        if ndvi_outside
+                        else []
+                    )
+                )
+                ndvi_selection = st.selectbox(
+                    "🛰️ Select NDVI Result",
+                    options=options_ndvi,
+                    format_func=lambda x: (
+                        "(Optional — will auto-download)" if x is None else x
+                    ),
+                    key="fusion_ndvi_select",
+                )
+                if ndvi_selection and not ndvi_selection.startswith("──"):
+                    ndvi_path = os.path.join(output_dir, ndvi_selection)
+                    if not os.path.exists(ndvi_path):
+                        st.warning("⚠️ File not found on disk.")
+                        ndvi_path = None
+                    elif (
+                        buffered_extent is not None
+                        and ndvi_selection in ndvi_outside
+                    ):
+                        st.warning(
+"⚠️ This result does not fully cover the buffered "
+                                "target area — spatial alignment may be incomplete."
+                        )
+                    else:
+                        st.success(f"✓ {ndvi_selection}")
+
+    elif metric_mode == "Upload Files":
+        col_gvi_up, col_ndvi_up = st.columns(2)
+
+        with col_gvi_up:
+            gvi_file = st.file_uploader(
+                "🌿 Upload GVI File",
+                type=["geojson", "json", "tif", "tiff"],
+                key="fusion_gvi_upload",
+            )
+            if gvi_file:
+                with tempfile.NamedTemporaryFile(
+                    delete=False, suffix=os.path.splitext(gvi_file.name)[1]
+                ) as tmp:
+                    tmp.write(gvi_file.getvalue())
+                    gvi_path = tmp.name
+                st.success(f"✓ Uploaded: {gvi_file.name}")
+
+        with col_ndvi_up:
+            ndvi_file = st.file_uploader(
+                "🛰️ Upload NDVI File",
+                type=["geojson", "json", "tif", "tiff"],
+                key="fusion_ndvi_upload",
+            )
+            if ndvi_file:
+                with tempfile.NamedTemporaryFile(
+                    delete=False, suffix=os.path.splitext(ndvi_file.name)[1]
+                ) as tmp:
+                    tmp.write(ndvi_file.getvalue())
+                    ndvi_path = tmp.name
+                st.success(f"✓ Uploaded: {ndvi_file.name}")
+
+    else:  # Auto-Download
+        col_ad1, col_ad2 = st.columns(2)
+        with col_ad1:
+            ndvi_auto_start = st.date_input(
+                "NDVI Start Date",
+                value=date(2023, 6, 1),
+                help="Composite interval start (auto-download NDVI).",
+                key="fusion_ndvi_start_date",
+            )
+        with col_ad2:
+            ndvi_auto_end = st.date_input(
+                "NDVI End Date",
+                value=date(2023, 9, 30),
+                help="Composite interval end (auto-download NDVI).",
+                key="fusion_ndvi_end_date",
+            )
+        cache_metrics = st.checkbox(
+            "Cache Metrics to Disk",
+            value=True,
+            help="Persist fetched metrics under the output fusion cache.",
+            key="fusion_cache_metrics",
+        )
+        gvi_api_key_input = st.text_input(
+            "Street View API Key (optional)",
+            type="password",
+            autocomplete="off",
+            help="Optional Google Street View key; leave blank for built-in access. Masked input with autocomplete disabled (some browsers may still offer to save).",
+            key="fusion_streetview_api_key",
+        )
+
+    if metric_mode != "Auto-Download":
+        ndvi_auto_start = date(2023, 6, 1)
+        ndvi_auto_end = date(2023, 9, 30)
+        cache_metrics = False
+
+    ndvi_resolution_m = None
+    gvi_grid_spacing_m = None
+
+    if metric_mode == "Auto-Download":
+        st.markdown("**Metric generation settings**")
+        ndvi_resolution_m = st.number_input(
+            "NDVI satellite resolution (m)",
+            min_value=5.0,
+            max_value=100.0,
+            value=10.0,
+            step=5.0,
+            help="Target pixel size for NDVI export (Earth Engine).",
+            key="fusion_ndvi_satellite_resolution",
+        )
+        gvi_grid_spacing_m = st.number_input(
+            "GVI sampling grid spacing (m)",
+            min_value=10.0,
+            max_value=500.0,
+            value=50.0,
+            step=10.0,
+            help="Spacing for street-view sample points on the grid.",
+            key="fusion_gvi_sampling_grid_spacing",
+        )
+
+    st.divider()
+    st.subheader("Optimization Settings")
+
+    col_opt1, col_opt2 = st.columns(2)
+    with col_opt1:
+        objective_metric = st.selectbox(
+            "Objective Metric",
+            options=["pearson", "spearman", "r2", "rmse", "mutual_info"],
+            index=0,
+            help="Quantity maximized or minimized across CV folds.",
+            key="fusion_objective_metric",
+        )
+        n_trials = st.number_input(
+            "Total Trials",
+            min_value=50,
+            max_value=1000,
+            value=300,
+            step=50,
+            help="Number of Optuna trials.",
+            key="fusion_n_trials",
+        )
+        optimizer = st.selectbox(
+            "Optimizer",
+            options=["TPE", "CMA-ES", "Random"],
+            index=0,
+            help="Hyperparameter search sampler.",
+            key="fusion_optimizer",
+        )
+
+    with col_opt2:
+        n_startup_trials = st.number_input(
+            "Random Startup Trials",
+            min_value=10,
+            max_value=500,
+            value=150,
+            step=10,
+            help="Uniformly random trials before the main sampler.",
+            key="fusion_n_startup",
+        )
+        pruner_type = st.selectbox(
+            "Pruner",
+            options=["median", "hyperband", "successive_halving", "none"],
+            index=0,
+            help="Early stopping rule for unpromising trials.",
+            key="fusion_pruner",
+        )
+
+    col_split1, col_split2, col_split3 = st.columns(3)
+    with col_split1:
+        test_size = st.slider(
+            "Test Set Size",
+            min_value=0.1,
+            max_value=0.5,
+            value=0.3,
+            step=0.05,
+            help="Held-out evaluation fraction.",
+            key="fusion_test_size",
+        )
+    with col_split2:
+        k_folds = st.number_input(
+            "K-Fold CV",
+            min_value=3,
+            max_value=10,
+            value=5,
+            help="Cross-validation folds on the non-test subset.",
+            key="fusion_k_folds",
+        )
+    with col_split3:
+        n_bins = st.number_input(
+            "Stratification Bins",
+            min_value=3,
+            max_value=10,
+            value=5,
+            help="Quantile bins for stratified train/test split.",
+            key="fusion_stratification_bins",
+        )
+
+    # =========================================================================
+    # Run controls and progress
     # =========================================================================
     st.divider()
 
@@ -859,32 +1202,39 @@ def render(output_dir: str) -> None:
             if st.button(
                 "📊 Export Results", use_container_width=True, key="fusion_export"
             ):
-                result_df = st.session_state.fusion_results["composite_df"]
-                export_gdf = gpd.GeoDataFrame(
-                    result_df,
-                    geometry=gpd.points_from_xy(
-                        result_df.index % 100, result_df.index // 100
-                    ),
-                    crs="EPSG:4326",
-                )
-                export_path = os.path.join(
-                    output_dir,
-                    f"fusion_composite_{datetime.now().strftime('%Y%m%d_%H%M%S')}.geojson",
-                )
-                export_gdf.to_file(export_path, driver="GeoJSON")
-                st.success(f"Exported to: {export_path}")
+                bundle, _eng = _fusion_resolve_active_bundle()
+                if bundle is None or bundle.get("composite_df") is None:
+                    st.error("No composite table available to export.")
+                else:
+                    result_df = bundle["composite_df"]
+                    export_gdf = gpd.GeoDataFrame(
+                        result_df,
+                        geometry=gpd.points_from_xy(
+                            result_df.index % 100, result_df.index // 100
+                        ),
+                        crs="EPSG:4326",
+                    )
+                    export_path = os.path.join(
+                        output_dir,
+                        f"fusion_composite_{datetime.now().strftime('%Y%m%d_%H%M%S')}.geojson",
+                    )
+                    export_gdf.to_file(export_path, driver="GeoJSON")
+                    st.success(f"Exported to: {export_path}")
     with col_run3:
-        if st.session_state.fusion_engine:
+        if st.session_state.fusion_results:
             if st.button("🔄 Reset", use_container_width=True, key="fusion_reset"):
                 st.session_state.fusion_engine = None
                 st.session_state.fusion_results = None
+                st.session_state.fusion_engines_by_target = {}
                 st.rerun()
 
     if run_fusion:
         if not target_file:
             st.error("❌ Please upload a target file")
-        elif is_geojson and not target_feature:
-            st.error("❌ Please select a target attribute for the GeoJSON target")
+        elif is_geojson and not target_outcome_columns:
+            st.error(
+                "❌ Add at least one outcome column from the GeoJSON target file."
+            )
         elif gvi_buffer_min_m > gvi_buffer_max_m or ndvi_buffer_min_m > ndvi_buffer_max_m:
             st.error(
                 "❌ Each modality's minimum buffer must be less than or equal to its maximum buffer."
@@ -896,10 +1246,24 @@ def render(output_dir: str) -> None:
                     "switch to Auto-Download mode."
                 )
             else:
+                fusion_multi_objective = (
+                    multi_objective_requested
+                    if is_geojson and len(target_outcome_columns) > 1
+                    else False
+                )
                 with st.expander("Configuration Summary", expanded=True):
                     st.write(f"**Target:** {target_file.name}")
                     if is_geojson:
-                        st.write(f"**Feature:** {target_feature}")
+                        st.write(
+                            "**Outcomes:** "
+                            + ", ".join(f"`{c}`" for c in target_outcome_columns)
+                        )
+                        if len(target_outcome_columns) > 1:
+                            st.write(
+                                "**Multi-objective optimization run:** "
+                                f"{'Yes' if fusion_multi_objective else 'No'} "
+                                "(joint optimization not available yet)"
+                            )
                     else:
                         st.write(f"**Band:** {target_band}")
                     st.write(
@@ -934,11 +1298,17 @@ def render(output_dir: str) -> None:
                     st.session_state.jobs = {}
 
                 st.session_state.jobs[job_id] = {
-                    "name": f"Fusion: {target_file.name}",
+                    "name": (
+                        f"Fusion: {target_file.name} "
+                        f"({len(target_outcome_columns)} outcomes)"
+                        if is_geojson
+                        else f"Fusion: {target_file.name}"
+                    ),
                     "status": "Starting...",
                     "progress": 0.0,
                     "cancel": False,
                     "type": "fusion",
+                    "multi_objective_requested": fusion_multi_objective,
                 }
 
                 gvi_api_key = (
@@ -953,7 +1323,7 @@ def render(output_dir: str) -> None:
                     args=(
                         job_id,
                         tmp_target_path,
-                        target_feature if is_geojson else None,
+                        tuple(target_outcome_columns) if is_geojson else (),
                         target_band if is_tiff else 1,
                         buffer_extent_m,
                         gvi_buffer_min_m,
@@ -980,6 +1350,7 @@ def render(output_dir: str) -> None:
                         ndvi_auto_start.isoformat(),
                         ndvi_auto_end.isoformat(),
                         ndvi_project_id,
+                        fusion_multi_objective,
                         output_dir,
                         st.session_state.jobs,
                         MetricFusionEngine,
@@ -1001,6 +1372,9 @@ def render(output_dir: str) -> None:
                 and st.session_state.fusion_results is None
             ):
                 st.session_state.fusion_engine = job_data.get("engine")
+                st.session_state.fusion_engines_by_target = (
+                    job_data.get("engines_by_target") or {}
+                )
                 st.session_state.fusion_results = job_data["results"]
 
     # =========================================================================
@@ -1011,149 +1385,196 @@ def render(output_dir: str) -> None:
         st.subheader("Optimization Results")
 
         results = st.session_state.fusion_results
-        engine = st.session_state.fusion_engine
-
-        col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
-
-        total_weight = (
-            results["best_params"]["veg_weight"]
-            + results["best_params"]["terrain_weight"]
-            + results["best_params"]["ndvi_weight"]
-        )
-
-        with col_m1:
-            veg_pct = (
-                (results["best_params"]["veg_weight"] / total_weight * 100)
-                if total_weight > 0
-                else 0
+        if results.get("multi_objective_requested"):
+            st.info(
+                "Multi-objective optimization run was selected. Joint optimization "
+                "across outcomes is not implemented yet; each outcome still has its "
+                "own study."
             )
-            st.metric("Vegetation Weight", f"{veg_pct:.1f}%")
-
-        with col_m2:
-            terrain_pct = (
-                (results["best_params"]["terrain_weight"] / total_weight * 100)
-                if total_weight > 0
-                else 0
+        if results.get("mode") == "multi":
+            st.selectbox(
+                "Select outcome",
+                options=results["ordered_labels"],
+                key="fusion_results_outcome_pick",
             )
-            st.metric("Terrain Weight", f"{terrain_pct:.1f}%")
 
-        with col_m3:
-            ndvi_pct = (
-                (results["best_params"]["ndvi_weight"] / total_weight * 100)
-                if total_weight > 0
-                else 0
+        results_view, engine = _fusion_resolve_active_bundle()
+        if engine is None or results_view is None:
+            st.warning(
+                "Optimization details are not available for the selected outcome."
             )
-            st.metric("NDVI Weight", f"{ndvi_pct:.1f}%")
+        else:
+            col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
 
-        with col_m4:
-            metric_name = results["objective_metric"].upper()
-            st.metric(f"Best {metric_name}", f"{results['best_value']:.4f}")
+            total_weight = (
+                results_view["best_params"]["veg_weight"]
+                + results_view["best_params"]["terrain_weight"]
+                + results_view["best_params"]["ndvi_weight"]
+            )
 
-        with col_m5:
-            if results["robust_trials"]:
-                st.metric(
-                    "Robust Trials",
-                    f"{len(results['robust_trials'])}/{len(engine.study.trials)}",
+            with col_m1:
+                veg_pct = (
+                    (results_view["best_params"]["veg_weight"] / total_weight * 100)
+                    if total_weight > 0
+                    else 0
                 )
-            else:
-                st.metric("Total Trials", len(engine.study.trials))
+                st.metric("Vegetation Weight", f"{veg_pct:.1f}%")
 
-        col_detail1, col_detail2 = st.columns(2)
-
-        with col_detail1:
-            st.markdown("**Best Trial Details**")
-            best_trial = engine.study.best_trial
-
-            info_data = {
-                "Trial Number": best_trial.number,
-                "Buffer Distance": f"{engine.buffer_meters}m",
-                "Veg Weight (raw)": results["best_params"]["veg_weight"],
-                "Terrain Weight (raw)": results["best_params"]["terrain_weight"],
-                "NDVI Weight (raw)": results["best_params"]["ndvi_weight"],
-                "Veg Radius": f"{results['best_params'].get('veg_radius', 'N/A')}m",
-                "Terrain Radius": (
-                    f"{results['best_params'].get('terrain_radius', 'N/A')}m"
-                ),
-                "NDVI Radius": f"{results['best_params'].get('ndvi_radius', 'N/A')}m",
-                f"Train {metric_name}": (
-                    f"{best_trial.user_attrs.get('train_score_mean', 'N/A')}"
-                ),
-                f"Val {metric_name}": (
-                    f"{best_trial.user_attrs.get('val_score_mean', 'N/A')}"
-                ),
-            }
-
-            if "train_pvalue" in best_trial.user_attrs:
-                info_data["Train p-value"] = (
-                    f"{best_trial.user_attrs['train_pvalue']:.4e}"
+            with col_m2:
+                terrain_pct = (
+                    (
+                        results_view["best_params"]["terrain_weight"]
+                        / total_weight
+                        * 100
+                    )
+                    if total_weight > 0
+                    else 0
                 )
-            if "val_pvalue" in best_trial.user_attrs:
-                info_data["Val p-value"] = f"{best_trial.user_attrs['val_pvalue']:.4e}"
+                st.metric("Terrain Weight", f"{terrain_pct:.1f}%")
 
-            st.json(info_data)
-
-        with col_detail2:
-            st.markdown("**Optimization History**")
-
-            trial_values = [t.value for t in engine.study.trials if t.value is not None]
-            trial_numbers = [
-                t.number for t in engine.study.trials if t.value is not None
-            ]
-
-            if trial_values:
-                fig, ax = plt.subplots(figsize=(6, 4))
-                ax.plot(trial_numbers, trial_values, alpha=0.6, linewidth=0.5)
-
-                running_best = []
-                current_best = (
-                    -np.inf if engine.study.direction.name == "MAXIMIZE" else np.inf
+            with col_m3:
+                ndvi_pct = (
+                    (results_view["best_params"]["ndvi_weight"] / total_weight * 100)
+                    if total_weight > 0
+                    else 0
                 )
-                for val in trial_values:
-                    if engine.study.direction.name == "MAXIMIZE":
-                        current_best = max(current_best, val)
-                    else:
-                        current_best = min(current_best, val)
-                    running_best.append(current_best)
+                st.metric("NDVI Weight", f"{ndvi_pct:.1f}%")
 
-                ax.plot(
-                    trial_numbers,
-                    running_best,
-                    color="red",
-                    linewidth=2,
-                    label="Best",
-                )
-                ax.set_xlabel("Trial")
-                ax.set_ylabel(f"{metric_name}")
-                ax.set_title("Optimization Progress")
-                ax.legend()
-                ax.grid(True, alpha=0.3)
-                st.pyplot(fig)
-                plt.close()
+            with col_m4:
+                metric_name = results_view["objective_metric"].upper()
+                st.metric(f"Best {metric_name}", f"{results_view['best_value']:.4f}")
 
-        if results["robust_trials"]:
-            st.divider()
-            st.markdown("**Robust Trials (Statistically Significant)**")
+            with col_m5:
+                if results_view["robust_trials"]:
+                    st.metric(
+                        "Robust Trials",
+                        f"{len(results_view['robust_trials'])}/{len(engine.study.trials)}",
+                    )
+                else:
+                    st.metric("Total Trials", len(engine.study.trials))
 
-            robust_data = []
-            for t in results["robust_trials"][:10]:
-                robust_data.append(
-                    {
-                        "Trial": t.number,
-                        "GVI %": (
-                            f"{(t.params['gvi_weight'] / (t.params['gvi_weight'] + t.params['ndvi_weight']) * 100):.1f}"
-                        ),
-                        "NDVI %": (
-                            f"{(t.params['ndvi_weight'] / (t.params['gvi_weight'] + t.params['ndvi_weight']) * 100):.1f}"
-                        ),
-                        f"Train {metric_name}": (
-                            f"{t.user_attrs.get('train_score', 0):.4f}"
-                        ),
-                        f"Test {metric_name}": (
-                            f"{t.user_attrs.get('test_score', 0):.4f}"
-                        ),
-                        "Train p": f"{t.user_attrs.get('train_pvalue', 1):.4e}",
-                        "Test p": f"{t.user_attrs.get('test_pvalue', 1):.4e}",
-                    }
-                )
+            col_detail1, col_detail2 = st.columns(2)
 
-            st.dataframe(robust_data, use_container_width=True)
+            with col_detail1:
+                st.markdown("**Best Trial Details**")
+                best_trial = engine.study.best_trial
+
+                info_data = {
+                    "Trial Number": best_trial.number,
+                    "Buffer Distance": f"{engine.buffer_meters}m",
+                    "Veg Weight (raw)": results_view["best_params"]["veg_weight"],
+                    "Terrain Weight (raw)": results_view["best_params"][
+                        "terrain_weight"
+                    ],
+                    "NDVI Weight (raw)": results_view["best_params"]["ndvi_weight"],
+                    "Veg Radius": (
+                        f"{results_view['best_params'].get('veg_radius', 'N/A')}m"
+                    ),
+                    "Terrain Radius": (
+                        f"{results_view['best_params'].get('terrain_radius', 'N/A')}m"
+                    ),
+                    "NDVI Radius": (
+                        f"{results_view['best_params'].get('ndvi_radius', 'N/A')}m"
+                    ),
+                    f"Train {metric_name}": (
+                        f"{best_trial.user_attrs.get('train_score_mean', 'N/A')}"
+                    ),
+                    f"Val {metric_name}": (
+                        f"{best_trial.user_attrs.get('val_score_mean', 'N/A')}"
+                    ),
+                }
+
+                if "train_pvalue" in best_trial.user_attrs:
+                    info_data["Train p-value"] = (
+                        f"{best_trial.user_attrs['train_pvalue']:.4e}"
+                    )
+                if "val_pvalue" in best_trial.user_attrs:
+                    info_data["Val p-value"] = (
+                        f"{best_trial.user_attrs['val_pvalue']:.4e}"
+                    )
+
+                st.json(info_data)
+
+            with col_detail2:
+                st.markdown("**Optimization History**")
+
+                trial_values = [
+                    t.value for t in engine.study.trials if t.value is not None
+                ]
+                trial_numbers = [
+                    t.number for t in engine.study.trials if t.value is not None
+                ]
+
+                if trial_values:
+                    fig, ax = plt.subplots(figsize=(6, 4))
+                    ax.plot(trial_numbers, trial_values, alpha=0.6, linewidth=0.5)
+
+                    running_best = []
+                    current_best = (
+                        -np.inf
+                        if engine.study.direction.name == "MAXIMIZE"
+                        else np.inf
+                    )
+                    for val in trial_values:
+                        if engine.study.direction.name == "MAXIMIZE":
+                            current_best = max(current_best, val)
+                        else:
+                            current_best = min(current_best, val)
+                        running_best.append(current_best)
+
+                    ax.plot(
+                        trial_numbers,
+                        running_best,
+                        color="red",
+                        linewidth=2,
+                        label="Best",
+                    )
+                    ax.set_xlabel("Trial")
+                    ax.set_ylabel(f"{metric_name}")
+                    ax.set_title("Optimization Progress")
+                    ax.legend()
+                    ax.grid(True, alpha=0.3)
+                    st.pyplot(fig)
+                    plt.close()
+
+            if results_view["robust_trials"]:
+                st.divider()
+                st.markdown("**Robust Trials (Statistically Significant)**")
+
+                robust_data = []
+                for t in results_view["robust_trials"][:10]:
+                    tw = (
+                        t.params.get("veg_weight", 0)
+                        + t.params.get("terrain_weight", 0)
+                        + t.params.get("ndvi_weight", 0)
+                    )
+                    robust_data.append(
+                        {
+                            "Trial": t.number,
+                            "Veg %": (
+                                f"{(t.params.get('veg_weight', 0) / tw * 100):.1f}"
+                                if tw
+                                else "0"
+                            ),
+                            "Terrain %": (
+                                f"{(t.params.get('terrain_weight', 0) / tw * 100):.1f}"
+                                if tw
+                                else "0"
+                            ),
+                            "NDVI %": (
+                                f"{(t.params.get('ndvi_weight', 0) / tw * 100):.1f}"
+                                if tw
+                                else "0"
+                            ),
+                            f"Train {metric_name}": (
+                                f"{t.user_attrs.get('train_score', 0):.4f}"
+                            ),
+                            f"Test {metric_name}": (
+                                f"{t.user_attrs.get('test_score', 0):.4f}"
+                            ),
+                            "Train p": f"{t.user_attrs.get('train_pvalue', 1):.4e}",
+                            "Test p": f"{t.user_attrs.get('test_pvalue', 1):.4e}",
+                        }
+                    )
+
+                st.dataframe(robust_data, use_container_width=True)
