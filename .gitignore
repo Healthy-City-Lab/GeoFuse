@@ -10,6 +10,9 @@ geofuse.egg-info/
 ## Environment / secrets
 .env
 
+## Local NDVI tile workspace
+temp/
+
 ## Data, models, and outputs
 data/
 logs/

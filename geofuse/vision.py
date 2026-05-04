@@ -1,7 +1,6 @@
 import importlib
 import os
 import sys
-from unittest.mock import MagicMock
 
 import numpy as np
 import torch
@@ -23,16 +22,13 @@ def get_best_device(preferred_device=None):
         torch.device: Best available device
     """
     if preferred_device:
-        # User specified device - try to use it
         if preferred_device == "cuda" and torch.cuda.is_available():
             return torch.device("cuda")
         elif preferred_device == "mps" and torch.backends.mps.is_available():
             return torch.device("mps")
         elif preferred_device == "cpu":
             return torch.device("cpu")
-        # Fall through to auto-selection if preferred not available
 
-    # Auto-selection priority: CUDA > MPS > CPU
     if torch.cuda.is_available():
         return torch.device("cuda")
     elif torch.backends.mps.is_available():
@@ -49,12 +45,6 @@ dl_core_path = os.path.join(current_dir, "dl_core")
 
 if dl_core_path not in sys.path:
     sys.path.append(dl_core_path)
-
-# ---------------------------------------------------------
-# MOCKING VISUALIZATION LIBS
-# ---------------------------------------------------------
-sys.modules["visdom"] = MagicMock()
-sys.modules["dominate"] = MagicMock()
 
 
 class DeepLabSegmenter:
@@ -115,7 +105,7 @@ class DeepLabSegmenter:
             self.model.load_state_dict(state_dict, strict=False)
         except RuntimeError as e:
             print(
-                f"[FATAL] Weight Mismatch. You might need to specify num_classes manually."
+                "[FATAL] Weight Mismatch. You might need to specify num_classes manually."
             )
             raise e
 

@@ -1,22 +1,62 @@
+from __future__ import annotations
+
 import json
 import os
-import subprocess
-import tempfile
+import shutil
+import uuid
+from collections.abc import Callable, Mapping
+from typing import Any
 
 import ee
 import geemap
 import geopandas as gpd
 import numpy as np
-import pandas as pd
 import rasterio
 from rasterio.merge import merge
 from rasterio.transform import array_bounds
 from rasterio.warp import Resampling, calculate_default_transform, reproject
-from shapely.geometry import Point, box
+from shapely.geometry import box, mapping
 
 # TODO: NDVI_CACHE - Implement local caching of Earth Engine tiles to reduce API calls
 # TODO: NDVI_LANDSAT - Add Landsat 8/9 support alongside Sentinel-2
 # TODO: NDVI_TEMPORAL - Add time-series analysis for seasonal greenery changes
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _ndvi_tile_workspace(output_name: str) -> str:
+    """Per-run workspace under ``<repo>/temp/ndvi_tiles/`` (removed after mosaic)."""
+    root = os.path.join(_REPO_ROOT, "temp", "ndvi_tiles")
+    os.makedirs(root, exist_ok=True)
+    unique = f"{output_name}_{uuid.uuid4().hex[:10]}"
+    path = os.path.join(root, unique)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _emit_ndvi_progress(
+    ndvi_progress_callback: Callable[[Mapping[str, Any]], None] | None,
+    *,
+    sub_progress: float,
+    phase: str | None = None,
+    tiles: tuple[int, int] | None = None,
+    clear_bracket: bool = False,
+) -> None:
+    if not ndvi_progress_callback:
+        return
+    payload: dict[str, Any] = {"sub_progress": float(sub_progress)}
+    if phase is not None:
+        payload["phase"] = phase
+    if tiles is not None:
+        payload["tiles"] = tiles
+    if clear_bracket:
+        payload["clear_bracket"] = True
+    ndvi_progress_callback(payload)
+
+
+def _shapely_to_ee_geometry(geom):
+    """Convert Shapely geometry to ``ee.Geometry`` via GeoJSON (stable across geemap versions)."""
+    return ee.Geometry(mapping(geom))
 
 
 class NDVIEngine:
@@ -61,6 +101,143 @@ class NDVIEngine:
             .map(self.prep_ndvi)
         )
 
+    def _reproject_tile_to_4326(
+        self, src_path: str, dst_path: str, resolution: int
+    ) -> None:
+        """Reproject a 3857 GeoTIFF to 4326 with per-latitude aspect-ratio correction.
+
+        Downloads from Earth Engine arrive in EPSG:3857 (metres). A naive
+        reprojection produces non-square pixels in geographic space. This method
+        calculates the exact degree-per-metre scale at the tile's centroid
+        latitude and forces an explicit square-metre output resolution.
+        """
+        from rasterio.warp import transform as warp_transform
+
+        with rasterio.open(src_path) as src:
+            left, bottom, right, top = array_bounds(
+                src.height, src.width, src.transform
+            )
+            cx, cy = (left + right) / 2, (bottom + top) / 2
+            lon_c, lat_c = warp_transform(src.crs, "EPSG:4326", [cx], [cy])
+            avg_lat = lat_c[0]
+
+            lat_rad = np.radians(avg_lat)
+            m_per_deg_lat = 111132.954 - 559.822 * np.cos(2 * lat_rad)
+            m_per_deg_lon = 111412.84 * np.cos(lat_rad) - 93.5 * np.cos(3 * lat_rad)
+
+            res_x_deg = resolution / m_per_deg_lon
+            res_y_deg = resolution / m_per_deg_lat
+
+            dst_transform, width, height = calculate_default_transform(
+                src.crs,
+                "EPSG:4326",
+                src.width,
+                src.height,
+                *src.bounds,
+                resolution=(res_x_deg, res_y_deg),
+            )
+
+            kwargs = src.meta.copy()
+            kwargs.update(
+                {
+                    "crs": "EPSG:4326",
+                    "transform": dst_transform,
+                    "width": width,
+                    "height": height,
+                }
+            )
+
+            with rasterio.open(dst_path, "w", **kwargs) as dst:
+                for i in range(1, src.count + 1):
+                    reproject(
+                        source=rasterio.band(src, i),
+                        destination=rasterio.band(dst, i),
+                        src_transform=src.transform,
+                        src_crs=src.crs,
+                        dst_transform=dst_transform,
+                        dst_crs="EPSG:4326",
+                        resampling=Resampling.nearest,
+                    )
+
+    def _raster_to_ndvi_points_geojson(
+        self,
+        final_tif: str,
+        geojson_path: str,
+        geometry,
+        *,
+        ndvi_progress_callback: Callable[[Mapping[str, Any]], None] | None,
+        cancel_callback: Callable[[], bool] | None,
+        sub_start: float,
+        sub_end: float,
+        meta_extra: dict[str, Any] | None = None,
+    ) -> dict:
+        """Read NDVI raster and write a point GeoJSON (compact vs raw float noise)."""
+        if cancel_callback and cancel_callback():
+            return {"status": "cancelled", "message": "Cancelled by user"}
+
+        _emit_ndvi_progress(
+            ndvi_progress_callback,
+            sub_progress=sub_start,
+            phase="Writing GeoJSON",
+        )
+
+        try:
+            with rasterio.open(final_tif) as src:
+                band1 = src.read(1)
+                band1 = np.where(band1 == -9999, np.nan, band1)
+                height, width = band1.shape
+
+                cols, rows = np.meshgrid(np.arange(width), np.arange(height))
+                xs, ys = rasterio.transform.xy(
+                    src.transform, rows, cols, offset="center"
+                )
+
+                xs = np.array(xs).flatten()
+                ys = np.array(ys).flatten()
+                values = band1.flatten()
+
+                valid_mask = ~np.isnan(values)
+
+                if not np.any(valid_mask):
+                    return {"status": "error", "message": "Raster is empty."}
+
+                xs_r = np.round(xs[valid_mask], 5)
+                ys_r = np.round(ys[valid_mask], 5)
+                vals_r = np.round(values[valid_mask], 4)
+
+                gdf_out = gpd.GeoDataFrame(
+                    {"NDVI": vals_r.astype(np.float32)},
+                    geometry=gpd.points_from_xy(xs_r, ys_r),
+                    crs="EPSG:4326",
+                )
+
+                if isinstance(geometry, gpd.GeoDataFrame):
+                    clip_geom = geometry
+                    if clip_geom.crs != "EPSG:4326":
+                        clip_geom = clip_geom.to_crs("EPSG:4326")
+                    gdf_out = gpd.clip(gdf_out, clip_geom)
+
+                gdf_out.to_file(geojson_path, driver="GeoJSON")
+
+                _emit_ndvi_progress(
+                    ndvi_progress_callback,
+                    sub_progress=sub_end,
+                    phase="Writing GeoJSON",
+                )
+
+                meta = {"crs": str(src.crs)}
+                if meta_extra:
+                    meta.update(meta_extra)
+                return {
+                    "status": "success",
+                    "tif": final_tif,
+                    "geojson": geojson_path,
+                    "meta": meta,
+                }
+
+        except Exception as e:
+            return {"status": "error", "message": f"Pixel Extraction Failed: {str(e)}"}
+
     def download_and_process(
         self,
         geometry,
@@ -71,6 +248,10 @@ class NDVIEngine:
         resolution=10,
         folder="output_results",
         max_tile_size_km=5,
+        cancel_callback: Callable[[], bool] | None = None,
+        ndvi_progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
+        write_geotiff: bool = True,
+        write_geojson: bool = True,
     ):
         """
         Download and process NDVI data with automatic tiling for large areas.
@@ -84,18 +265,31 @@ class NDVIEngine:
             resolution: Pixel resolution in meters
             folder: Output directory
             max_tile_size_km: Maximum tile dimension in kilometers (prevents GEE size limit)
+            cancel_callback: If provided, return True to stop between tiles / major steps.
+            ndvi_progress_callback: Receives a mapping with optional keys:
+                ``sub_progress`` (0–1 for this download), ``phase`` (status line),
+                ``tiles`` ``(k, n)`` while downloading tiles (shows ``[k/n]`` on the bar),
+                ``clear_bracket`` (drop tile bracket after tiles are done).
+            write_geotiff: Persist ``{output_name}_ndvi.tif`` when True.
+            write_geojson: Persist ``{output_name}_ndvi.geojson`` when True (needs raster).
         """
         os.makedirs(folder, exist_ok=True)
+
+        if not write_geotiff and not write_geojson:
+            return {
+                "status": "error",
+                "message": "Enable at least one output format (GeoTIFF or GeoJSON).",
+            }
 
         # 1. Convert Geometry
         if isinstance(geometry, gpd.GeoDataFrame):
             geom_wgs84 = geometry.to_crs(epsg=4326)
             js = json.loads(geom_wgs84.to_json())
-            features = geemap.geojson_to_ee(js)
-            aoi = features.geometry()
+            js.pop("crs", None)
+            aoi = ee.FeatureCollection(js["features"]).geometry()
             bounds = geom_wgs84.total_bounds
         else:
-            aoi = geemap.shapely_to_ee(geometry)
+            aoi = _shapely_to_ee_geometry(geometry)
             bounds = geometry.bounds
 
         # 2. Get Collection
@@ -105,6 +299,9 @@ class NDVIEngine:
                 "status": "error",
                 "message": f"No images found for {start_date} to {end_date}.",
             }
+
+        if cancel_callback and cancel_callback():
+            return {"status": "cancelled", "message": "Cancelled by user"}
 
         ndvi_median = col.median().clip(aoi)
 
@@ -127,17 +324,50 @@ class NDVIEngine:
                 resolution,
                 folder,
                 max_tile_size_km,
+                cancel_callback=cancel_callback,
+                ndvi_progress_callback=ndvi_progress_callback,
+                write_geotiff=write_geotiff,
+                write_geojson=write_geojson,
             )
         else:
             print(
                 f"[NDVI] Area size: {width_km:.1f}x{height_km:.1f} km. Single download..."
             )
             return self._download_single(
-                ndvi_median, aoi, output_name, resolution, folder
+                ndvi_median,
+                aoi,
+                geometry,
+                output_name,
+                resolution,
+                folder,
+                cancel_callback=cancel_callback,
+                ndvi_progress_callback=ndvi_progress_callback,
+                write_geotiff=write_geotiff,
+                write_geojson=write_geojson,
             )
 
-    def _download_single(self, ndvi_median, aoi, output_name, resolution, folder):
+    def _download_single(
+        self,
+        ndvi_median,
+        aoi,
+        geometry,
+        output_name,
+        resolution,
+        folder,
+        cancel_callback: Callable[[], bool] | None = None,
+        ndvi_progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
+        write_geotiff: bool = True,
+        write_geojson: bool = True,
+    ):
         """Download NDVI as a single tile (for small areas)."""
+        _emit_ndvi_progress(
+            ndvi_progress_callback,
+            sub_progress=0.05,
+            phase="Downloading from Earth Engine",
+            tiles=(0, 1),
+        )
+        if cancel_callback and cancel_callback():
+            return {"status": "cancelled", "message": "Cancelled by user"}
         # Export as EPSG:3857 (Meters) first
         temp_tif = os.path.join(folder, f"temp_{output_name}.tif")
         final_tif = os.path.join(folder, f"{output_name}_ndvi.tif")
@@ -152,60 +382,26 @@ class NDVIEngine:
                 file_per_band=False,
             )
 
-            # 4. Reproject to EPSG:4326 with ASPECT RATIO CORRECTION
-            # This is the step that fixes the "irregular/rectangular" pixels.
-            with rasterio.open(temp_tif) as src:
-                # Calculate centroid latitude to determine degrees-per-meter
-                left, bottom, right, top = array_bounds(
-                    src.height, src.width, src.transform
-                )
-                # Convert 3857 centers to Lat/Lon
-                from rasterio.warp import transform
+            if cancel_callback and cancel_callback():
+                if os.path.exists(temp_tif):
+                    os.remove(temp_tif)
+                return {"status": "cancelled", "message": "Cancelled by user"}
 
-                cx, cy = (left + right) / 2, (bottom + top) / 2
-                lon_c, lat_c = transform(src.crs, "EPSG:4326", [cx], [cy])
-                avg_lat = lat_c[0]
+            _emit_ndvi_progress(
+                ndvi_progress_callback,
+                sub_progress=0.28,
+                phase="Downloading from Earth Engine",
+                tiles=(1, 1),
+            )
+            _emit_ndvi_progress(
+                ndvi_progress_callback,
+                sub_progress=0.32,
+                phase="Reprojecting GeoTIFF",
+                clear_bracket=True,
+            )
 
-                # Calculate Metric-to-Degree factors (Same logic as GVI)
-                lat_rad = np.radians(avg_lat)
-                m_per_deg_lat = 111132.954 - 559.822 * np.cos(2 * lat_rad)
-                m_per_deg_lon = 111412.84 * np.cos(lat_rad) - 93.5 * np.cos(3 * lat_rad)
-
-                # Calculate target resolution in Degrees
-                res_x_deg = resolution / m_per_deg_lon
-                res_y_deg = resolution / m_per_deg_lat
-
-                # Create transform with EXPLICIT resolution
-                dst_transform, width, height = calculate_default_transform(
-                    src.crs,
-                    "EPSG:4326",
-                    src.width,
-                    src.height,
-                    *src.bounds,
-                    resolution=(res_x_deg, res_y_deg),  # <--- Force Square Meters
-                )
-
-                kwargs = src.meta.copy()
-                kwargs.update(
-                    {
-                        "crs": "EPSG:4326",
-                        "transform": dst_transform,
-                        "width": width,
-                        "height": height,
-                    }
-                )
-
-                with rasterio.open(final_tif, "w", **kwargs) as dst:
-                    for i in range(1, src.count + 1):
-                        reproject(
-                            source=rasterio.band(src, i),
-                            destination=rasterio.band(dst, i),
-                            src_transform=src.transform,
-                            src_crs=src.crs,
-                            dst_transform=dst_transform,
-                            dst_crs="EPSG:4326",
-                            resampling=Resampling.nearest,
-                        )
+            # 4. Reproject to EPSG:4326 with aspect-ratio correction
+            self._reproject_tile_to_4326(temp_tif, final_tif, resolution)
 
             if os.path.exists(temp_tif):
                 os.remove(temp_tif)
@@ -215,57 +411,47 @@ class NDVIEngine:
                 os.remove(temp_tif)
             return {"status": "error", "message": f"Export/Reproject Failed: {str(e)}"}
 
-        # 5. Extract Points (Points will align because they use the same transform)
-        geojson_path = os.path.join(folder, f"{output_name}_ndvi.geojson")
+        if cancel_callback and cancel_callback():
+            return {"status": "cancelled", "message": "Cancelled by user"}
 
         try:
             with rasterio.open(final_tif) as src:
-                band1 = src.read(1)
-                band1 = np.where(band1 == -9999, np.nan, band1)
-                height, width = band1.shape
+                crs_meta = str(src.crs)
+        except Exception:
+            crs_meta = "EPSG:4326"
+        meta: dict[str, Any] = {"crs": crs_meta}
 
-                cols, rows = np.meshgrid(np.arange(width), np.arange(height))
-                xs, ys = rasterio.transform.xy(
-                    src.transform, rows, cols, offset="center"
-                )
+        if not write_geojson:
+            _emit_ndvi_progress(
+                ndvi_progress_callback,
+                sub_progress=0.99,
+                phase="Finalizing",
+            )
+            return {
+                "status": "success",
+                "tif": final_tif if write_geotiff else None,
+                "geojson": None,
+                "meta": meta,
+            }
 
-                xs = np.array(xs).flatten()
-                ys = np.array(ys).flatten()
-                values = band1.flatten()
-
-                valid_mask = ~np.isnan(values)
-
-                if not np.any(valid_mask):
-                    return {"status": "error", "message": "Raster is empty."}
-
-                df = pd.DataFrame(
-                    {
-                        "NDVI": values[valid_mask],
-                        "x": xs[valid_mask],
-                        "y": ys[valid_mask],
-                    }
-                )
-
-                gdf_out = gpd.GeoDataFrame(
-                    df, geometry=gpd.points_from_xy(df.x, df.y), crs="EPSG:4326"
-                )
-
-                if isinstance(geometry, gpd.GeoDataFrame):
-                    if geometry.crs != "EPSG:4326":
-                        geometry = geometry.to_crs("EPSG:4326")
-                    gdf_out = gpd.clip(gdf_out, geometry)
-
-                gdf_out.to_file(geojson_path, driver="GeoJSON")
-
-                return {
-                    "status": "success",
-                    "tif": final_tif,
-                    "geojson": geojson_path,
-                    "meta": {"crs": str(src.crs)},
-                }
-
-        except Exception as e:
-            return {"status": "error", "message": f"Pixel Extraction Failed: {str(e)}"}
+        geojson_path = os.path.join(folder, f"{output_name}_ndvi.geojson")
+        out = self._raster_to_ndvi_points_geojson(
+            final_tif,
+            geojson_path,
+            geometry,
+            ndvi_progress_callback=ndvi_progress_callback,
+            cancel_callback=cancel_callback,
+            sub_start=0.52,
+            sub_end=0.99,
+        )
+        if out.get("status") != "success":
+            return out
+        if not write_geotiff and os.path.isfile(final_tif):
+            os.remove(final_tif)
+            out["tif"] = None
+        elif write_geotiff:
+            out["tif"] = final_tif
+        return out
 
     def _download_with_tiling(
         self,
@@ -276,14 +462,16 @@ class NDVIEngine:
         resolution,
         folder,
         max_tile_size_km,
+        cancel_callback: Callable[[], bool] | None = None,
+        ndvi_progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
+        write_geotiff: bool = True,
+        write_geojson: bool = True,
     ):
         """Download NDVI in tiles and mosaic them together (for large areas)."""
         minx, miny, maxx, maxy = bounds
 
-        # Calculate tile size in degrees
         tile_size_deg = max_tile_size_km / 111  # Approximate degrees
 
-        # Generate tile grid
         tiles = []
         x = minx
         tile_idx = 0
@@ -304,21 +492,33 @@ class NDVIEngine:
 
         print(f"[NDVI] Generated {len(tiles)} tiles. Downloading...")
 
-        # Download each tile
-        with tempfile.TemporaryDirectory() as temp_dir:
-            tile_files = []
+        n_tiles = len(tiles)
+        _emit_ndvi_progress(
+            ndvi_progress_callback,
+            sub_progress=0.02,
+            phase="Downloading tiles",
+            tiles=(0, n_tiles),
+        )
 
+        work_dir = _ndvi_tile_workspace(output_name)
+        tile_files: list[str] = []
+        mosaic_ok = False
+        final_tif = os.path.join(folder, f"{output_name}_ndvi.tif")
+
+        try:
             for idx, tile_geom in tiles:
+                if cancel_callback and cancel_callback():
+                    return {"status": "cancelled", "message": "Cancelled by user"}
+
                 print(f"[NDVI] Downloading tile {idx+1}/{len(tiles)}...")
 
-                tile_aoi = geemap.shapely_to_ee(tile_geom)
+                tile_aoi = _shapely_to_ee_geometry(tile_geom)
                 tile_ndvi = ndvi_median.clip(tile_aoi)
 
-                tile_temp = os.path.join(temp_dir, f"tile_{idx}_temp.tif")
-                tile_final = os.path.join(temp_dir, f"tile_{idx}.tif")
+                tile_temp = os.path.join(work_dir, f"tile_{idx}_temp.tif")
+                tile_final = os.path.join(work_dir, f"tile_{idx}.tif")
 
                 try:
-                    # Export tile in EPSG:3857
                     geemap.ee_export_image(
                         tile_ndvi.unmask(-9999),
                         filename=tile_temp,
@@ -328,69 +528,32 @@ class NDVIEngine:
                         file_per_band=False,
                     )
 
-                    # Reproject to EPSG:4326 with aspect ratio correction
-                    with rasterio.open(tile_temp) as src:
-                        # Calculate centroid for this tile
-                        from rasterio.transform import array_bounds
-                        from rasterio.warp import transform
+                    if cancel_callback and cancel_callback():
+                        if os.path.exists(tile_temp):
+                            os.remove(tile_temp)
+                        return {"status": "cancelled", "message": "Cancelled by user"}
 
-                        left, bottom, right, top = array_bounds(
-                            src.height, src.width, src.transform
-                        )
-                        cx, cy = (left + right) / 2, (bottom + top) / 2
-                        lon_c, lat_c = transform(src.crs, "EPSG:4326", [cx], [cy])
-                        avg_lat = lat_c[0]
-
-                        # Calculate metric-to-degree factors
-                        lat_rad = np.radians(avg_lat)
-                        m_per_deg_lat = 111132.954 - 559.822 * np.cos(2 * lat_rad)
-                        m_per_deg_lon = 111412.84 * np.cos(lat_rad) - 93.5 * np.cos(
-                            3 * lat_rad
-                        )
-
-                        res_x_deg = resolution / m_per_deg_lon
-                        res_y_deg = resolution / m_per_deg_lat
-
-                        dst_transform, width, height = calculate_default_transform(
-                            src.crs,
-                            "EPSG:4326",
-                            src.width,
-                            src.height,
-                            *src.bounds,
-                            resolution=(res_x_deg, res_y_deg),
-                        )
-
-                        kwargs = src.meta.copy()
-                        kwargs.update(
-                            {
-                                "crs": "EPSG:4326",
-                                "transform": dst_transform,
-                                "width": width,
-                                "height": height,
-                            }
-                        )
-
-                        with rasterio.open(tile_final, "w", **kwargs) as dst:
-                            for i in range(1, src.count + 1):
-                                reproject(
-                                    source=rasterio.band(src, i),
-                                    destination=rasterio.band(dst, i),
-                                    src_transform=src.transform,
-                                    src_crs=src.crs,
-                                    dst_transform=dst_transform,
-                                    dst_crs="EPSG:4326",
-                                    resampling=Resampling.nearest,
-                                )
+                    self._reproject_tile_to_4326(tile_temp, tile_final, resolution)
 
                     tile_files.append(tile_final)
 
-                    # Cleanup temp file
                     if os.path.exists(tile_temp):
                         os.remove(tile_temp)
+
+                    k = len(tile_files)
+                    _emit_ndvi_progress(
+                        ndvi_progress_callback,
+                        sub_progress=0.70 * k / n_tiles if n_tiles else 0.0,
+                        phase="Downloading tiles",
+                        tiles=(k, n_tiles),
+                    )
 
                 except Exception as e:
                     print(f"[NDVI] Warning: Tile {idx+1} failed: {e}")
                     continue
+
+            if cancel_callback and cancel_callback():
+                return {"status": "cancelled", "message": "Cancelled by user"}
 
             if not tile_files:
                 return {"status": "error", "message": "All tiles failed to download"}
@@ -399,11 +562,17 @@ class NDVIEngine:
                 f"[NDVI] Successfully downloaded {len(tile_files)}/{len(tiles)} tiles. Mosaicking..."
             )
 
-            # Mosaic tiles together
-            final_tif = os.path.join(folder, f"{output_name}_ndvi.tif")
+            if cancel_callback and cancel_callback():
+                return {"status": "cancelled", "message": "Cancelled by user"}
+
+            _emit_ndvi_progress(
+                ndvi_progress_callback,
+                sub_progress=0.72,
+                phase="Mosaicking rasters",
+                clear_bracket=True,
+            )
 
             try:
-                # Read all tiles and mosaic
                 src_files_to_mosaic = []
                 for tile_file in tile_files:
                     src = rasterio.open(tile_file)
@@ -411,7 +580,6 @@ class NDVIEngine:
 
                 mosaic, out_trans = merge(src_files_to_mosaic, nodata=-9999)
 
-                # Get metadata from first tile
                 out_meta = src_files_to_mosaic[0].meta.copy()
                 out_meta.update(
                     {
@@ -421,62 +589,74 @@ class NDVIEngine:
                     }
                 )
 
-                # Write mosaic
+                _emit_ndvi_progress(
+                    ndvi_progress_callback,
+                    sub_progress=0.78,
+                    phase="Mosaicking rasters",
+                )
+
                 with rasterio.open(final_tif, "w", **out_meta) as dest:
                     dest.write(mosaic)
 
-                # Close all source files
                 for src in src_files_to_mosaic:
                     src.close()
 
                 print(f"[NDVI] Mosaic complete: {final_tif}")
+                mosaic_ok = True
 
             except Exception as e:
                 return {"status": "error", "message": f"Mosaic failed: {str(e)}"}
 
-        # Extract points from final mosaic
-        geojson_path = os.path.join(folder, f"{output_name}_ndvi.geojson")
+        finally:
+            if work_dir and os.path.isdir(work_dir):
+                if mosaic_ok:
+                    _emit_ndvi_progress(
+                        ndvi_progress_callback,
+                        sub_progress=0.86,
+                        phase="Removing temporary tiles",
+                    )
+                shutil.rmtree(work_dir, ignore_errors=True)
 
+        if cancel_callback and cancel_callback():
+            return {"status": "cancelled", "message": "Cancelled by user"}
+
+        n_mosaic_tiles = len(tile_files)
+        meta_base: dict[str, Any] = {"tiles": n_mosaic_tiles}
         try:
             with rasterio.open(final_tif) as src:
-                band1 = src.read(1)
-                band1 = np.where(band1 == -9999, np.nan, band1)
-                height, width = band1.shape
+                meta_base["crs"] = str(src.crs)
+        except Exception:
+            meta_base["crs"] = "EPSG:4326"
 
-                cols, rows = np.meshgrid(np.arange(width), np.arange(height))
-                xs, ys = rasterio.transform.xy(
-                    src.transform, rows, cols, offset="center"
-                )
+        if not write_geojson:
+            _emit_ndvi_progress(
+                ndvi_progress_callback,
+                sub_progress=0.99,
+                phase="Finalizing",
+            )
+            return {
+                "status": "success",
+                "tif": final_tif if write_geotiff else None,
+                "geojson": None,
+                "meta": meta_base,
+            }
 
-                xs = np.array(xs).flatten()
-                ys = np.array(ys).flatten()
-                values = band1.flatten()
-
-                valid_mask = ~np.isnan(values)
-
-                if not np.any(valid_mask):
-                    return {"status": "error", "message": "Mosaic is empty."}
-
-                df = pd.DataFrame(
-                    {
-                        "NDVI": values[valid_mask],
-                        "x": xs[valid_mask],
-                        "y": ys[valid_mask],
-                    }
-                )
-
-                gdf_out = gpd.GeoDataFrame(
-                    df, geometry=gpd.points_from_xy(df.x, df.y), crs="EPSG:4326"
-                )
-
-                gdf_out.to_file(geojson_path, driver="GeoJSON")
-
-                return {
-                    "status": "success",
-                    "tif": final_tif,
-                    "geojson": geojson_path,
-                    "meta": {"crs": str(src.crs), "tiles": len(tile_files)},
-                }
-
-        except Exception as e:
-            return {"status": "error", "message": f"Point extraction failed: {str(e)}"}
+        geojson_path = os.path.join(folder, f"{output_name}_ndvi.geojson")
+        out = self._raster_to_ndvi_points_geojson(
+            final_tif,
+            geojson_path,
+            None,
+            ndvi_progress_callback=ndvi_progress_callback,
+            cancel_callback=cancel_callback,
+            sub_start=0.88,
+            sub_end=0.99,
+            meta_extra={"tiles": n_mosaic_tiles},
+        )
+        if out.get("status") != "success":
+            return out
+        if not write_geotiff and os.path.isfile(final_tif):
+            os.remove(final_tif)
+            out["tif"] = None
+        elif write_geotiff:
+            out["tif"] = final_tif
+        return out

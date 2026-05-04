@@ -23,7 +23,7 @@ PIP_PACKAGES = [
     # Geospatial
     "rasterio==1.4.4",
     "shapely==2.1.2",
-    "fiona",
+    "fiona==1.10.1",
     # Data Science
     "matplotlib==3.10.8",
     "scikit-learn==1.6.0",
@@ -38,9 +38,6 @@ PIP_PACKAGES = [
     "folium==0.20.0",
     "geemap==0.36.6",
     "earthengine-api==1.7.4",
-    # Visualization
-    "visdom==0.2.4",
-    "dominate==2.9.1",
     # Utility
     "isort==7.0.0",
 ]
@@ -50,7 +47,18 @@ GIT_PACKAGES = [
 ]
 
 
-def run_cmd(command, log_file=None, echo_to_console=False):
+def run_cmd(command, log_file=None, optional=False):
+    """Run a shell command, streaming output to both console and (optionally) a log file.
+
+    Always echoes to the console so CI logs capture errors inline.  On
+    non-zero exit the last 40 lines of output are reprinted before aborting,
+    ensuring the failure reason is visible even when the surrounding log is large.
+
+    If ``optional=True`` the installer prints a warning on failure and
+    continues instead of aborting.  Use this for packages that degrade
+    gracefully when absent (e.g. training-only visualisation tools).
+    """
+    output_lines = []
     try:
         process = subprocess.Popen(
             command,
@@ -62,22 +70,15 @@ def run_cmd(command, log_file=None, echo_to_console=False):
             errors="replace",
         )
 
-        output_lines = []
         while True:
             line = process.stdout.readline()
             if not line:
                 break
             output_lines.append(line)
+            print(line, end="", flush=True)
             if log_file:
-                # Write to log file
                 with open(log_file, "a", encoding="utf-8") as f:
                     f.write(line)
-                # Also print to console if echo_to_console is True
-                if echo_to_console:
-                    print(line, end="")
-            else:
-                # Print to console only if no log file
-                print(line, end="")
 
         process.wait()
 
@@ -85,8 +86,22 @@ def run_cmd(command, log_file=None, echo_to_console=False):
             raise subprocess.CalledProcessError(process.returncode, command)
 
     except subprocess.CalledProcessError as e:
-        print(f"\n[ERROR] Command failed with exit code {e.returncode}: {command}")
-        sys.exit(1)
+        tail = output_lines[-40:] if len(output_lines) > 40 else output_lines
+        if optional:
+            print(f"\n[WARN] Optional command failed (continuing): {command}")
+            if tail:
+                print("\n--- last output ---")
+                for ln in tail:
+                    print(ln, end="")
+                print("--- end ---\n")
+        else:
+            print(f"\nError:  Command failed with exit code {e.returncode}: {command}")
+            if tail:
+                print("\n--- last output ---")
+                for ln in tail:
+                    print(ln, end="")
+                print("--- end ---\n")
+            sys.exit(1)
     except Exception as e:
         print(f"\n[ERROR] An unexpected error occurred: {e}")
         sys.exit(1)
@@ -155,7 +170,7 @@ def main(env_name, log_file=None):
     print(f"[0/6] Checking environment '{env_name}'...")
     # Check if environment exists
     env_check = subprocess.run(
-        f"conda env list", shell=True, capture_output=True, text=True
+        "conda env list", shell=True, capture_output=True, text=True
     )
     env_exists = env_name in env_check.stdout
 
@@ -169,7 +184,7 @@ def main(env_name, log_file=None):
         shell=True,
         check=True,
     )
-    print(f"[SUCCESS] Environment created successfully\n")
+    print("[SUCCESS] Environment created successfully\n")
 
     # 1. Prepare Conda List (Core + OS-Specific MPI)
     mpi_pkgs = get_mpi_packages(system)
@@ -181,7 +196,7 @@ def main(env_name, log_file=None):
     run_cmd(f"{solver} install -n {env_name} -y -c conda-forge {conda_str}", log_file)
 
     # 2. Install PyTorch
-    print(f"[2/6] Installing PyTorch Acceleration...")
+    print("[2/6] Installing PyTorch Acceleration...")
     if system == "Windows" or system == "Linux":
         cmd = f"{solver} install -n {env_name} -y {PYTORCH_VERSION} pytorch-cuda=12.1 -c pytorch -c nvidia"
     else:
@@ -191,32 +206,34 @@ def main(env_name, log_file=None):
     run_cmd(cmd, log_file)
 
     # 3. Install Pip Libraries
-    print(f"[3/6] Installing Python Libraries...")
+    print("[3/6] Installing Python Libraries...")
     env_python = get_env_python(env_name)
+    # Upgrade pip/setuptools first so the build backend has pkg_resources available
+    run_cmd(
+        f'"{env_python}" -m pip install --upgrade pip setuptools wheel',
+        log_file,
+    )
     pip_str = " ".join(PIP_PACKAGES)
     run_cmd(f'"{env_python}" -m pip install {pip_str}', log_file)
 
     # 4. Install Git Packages
-    print(f"[4/6] Installing Custom Git Packages...")
+    print("[4/6] Installing Custom Git Packages...")
     for git_url in GIT_PACKAGES:
         run_cmd(f'"{env_python}" -m pip install {git_url}', log_file)
 
     # 5. Editable Install
-    print(f"[5/6] Performing Editable Install of GeoFuse...")
+    print("[5/6] Performing Editable Install of GeoFuse...")
     root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     run_cmd(f'"{env_python}" -m pip install -e "{root_dir}"', log_file)
 
     # 6. Verify Installation
-    print(f"[6/6] Verifying Installation...")
+    print("[6/6] Verifying Installation...")
 
-    # Get the Python executable from the geofuse environment
     env_python = get_env_python(env_name)
 
-    # Construct a verification script that checks for the correct GPU backend based on OS
     verify_imports = (
         "import geofuse; import torch; import platform; from mpi4py import MPI; "
     )
-    # Use single quotes for f-strings and no parentheses in the output text to be shell-safe
     verify_geofuse = "print(f'   [OK] GeoFuse Package: {geofuse.__file__}'); "
     verify_mpi = "print(f'   [OK] MPI Rank: {MPI.COMM_WORLD.Get_rank()} - Vendor: {MPI.get_vendor()}');"
 
@@ -227,7 +244,7 @@ def main(env_name, log_file=None):
 
     verify_script = verify_imports + verify_geofuse + verify_torch + verify_mpi
 
-    run_cmd(f'"{env_python}" -c "{verify_script}"', log_file, echo_to_console=True)
+    run_cmd(f'"{env_python}" -c "{verify_script}"', log_file)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,10 @@ on:
       - '.github/workflows/code-quality.yml'
       - 'pyproject.toml'
 
+# Opt into Node.js 24 for all actions before it becomes the forced default (June 2026)
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   lint:
     name: Code Quality Checks

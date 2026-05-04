@@ -8,7 +8,8 @@ weighted combinations of NDVI and GVI metrics against target outcomes.
 import hashlib
 import logging
 import os
-from typing import Dict, List, Optional, Tuple, Union
+from collections.abc import Callable
+from typing import Any
 
 import geopandas as gpd
 import numpy as np
@@ -16,10 +17,8 @@ import optuna
 import pandas as pd
 import rasterio
 from optuna.pruners import HyperbandPruner, MedianPruner, SuccessiveHalvingPruner
-from optuna.samplers import TPESampler
-from rasterio.features import geometry_mask
+from optuna.samplers import CmaEsSampler, RandomSampler, TPESampler
 from rasterio.transform import from_origin, rowcol, xy
-from rasterio.warp import Resampling, reproject
 from scipy.stats import pearsonr, spearmanr
 from shapely.geometry import box
 from sklearn.metrics import mean_squared_error, mutual_info_score, r2_score
@@ -27,6 +26,22 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import MinMaxScaler
 
 logger = logging.getLogger(__name__)
+
+
+def _radius_int_bounds(
+    r_min: float, r_max: float, r_step: float
+) -> tuple[int, int, int]:
+    """Align Optuna integer radius search to user min/max/step (metres)."""
+    lo = max(1, int(round(r_min)))
+    hi = int(round(r_max))
+    step = max(1, int(round(r_step)))
+    if lo > hi:
+        lo, hi = hi, lo
+    span = hi - lo
+    hi_adj = lo + (span // step) * step
+    if hi_adj < lo:
+        hi_adj = lo
+    return lo, hi_adj, step
 
 
 class MetricFusionEngine:
@@ -39,7 +54,7 @@ class MetricFusionEngine:
     3. Splits data: holdout test set + k-fold CV on training data
     4. Optimizes 9 parameters matching CGI.ipynb:
        - Weights: veg_weight, terrain_weight, ndvi_weight (0-100, sum=100)
-       - Radii: veg_radius, terrain_radius, ndvi_radius (50-1500m)
+       - Radii: veg_radius, terrain_radius, ndvi_radius (GVI / NDVI ladder grids)
        - Streetview agg: streetview_stat, streetview_percentile (shared for veg+terrain)
        - NDVI agg: ndvi_stat, ndvi_percentile (separate for NDVI)
     5. Validates performance using cross-validation and held-out test set
@@ -48,9 +63,15 @@ class MetricFusionEngine:
     def __init__(
         self,
         target_file: str,
-        target_feature: Optional[str] = None,
+        target_feature: str | None = None,
         target_band: int = 1,
         buffer_meters: float = 1500.0,
+        gvi_buffer_min_m: float | None = None,
+        gvi_buffer_max_m: float | None = None,
+        gvi_buffer_step_m: float | None = None,
+        ndvi_buffer_min_m: float | None = None,
+        ndvi_buffer_max_m: float | None = None,
+        ndvi_buffer_step_m: float | None = None,
         n_bins: int = 5,
         cache_dir: str = "output_results/fusion_cache",
     ):
@@ -61,17 +82,59 @@ class MetricFusionEngine:
             target_file: Path to GeoJSON (points) or GeoTIFF (raster) target file
             target_feature: For GeoJSON, the column name to optimize towards
             target_band: For GeoTIFF, the band number to optimize towards
-            buffer_meters: Buffer distance around target geometry for metric sampling
+            buffer_meters: Maximum buffer (m) around target for extent padding and downloads;
+                typically max(GVI max, NDVI max). If modality maxima are omitted, they default here.
+            gvi_buffer_min_m / gvi_buffer_max_m / gvi_buffer_step_m: GVI (veg/terrain) radius search grid (m).
+            ndvi_buffer_min_m / ndvi_buffer_max_m / ndvi_buffer_step_m: NDVI radius search grid (m).
             n_bins: Number of bins for stratified splitting
             cache_dir: Directory to cache downloaded metrics
         """
         self.target_file = target_file
         self.target_feature = target_feature
         self.target_band = target_band
-        self.buffer_meters = buffer_meters
+        self.buffer_meters = float(buffer_meters)
+        self.gvi_buffer_max_m = (
+            float(gvi_buffer_max_m)
+            if gvi_buffer_max_m is not None
+            else self.buffer_meters
+        )
+        self.gvi_buffer_min_m = (
+            float(gvi_buffer_min_m)
+            if gvi_buffer_min_m is not None
+            else min(100.0, self.gvi_buffer_max_m)
+        )
+        self.gvi_buffer_step_m = (
+            float(gvi_buffer_step_m) if gvi_buffer_step_m is not None else 50.0
+        )
+        self.ndvi_buffer_max_m = (
+            float(ndvi_buffer_max_m)
+            if ndvi_buffer_max_m is not None
+            else self.buffer_meters
+        )
+        self.ndvi_buffer_min_m = (
+            float(ndvi_buffer_min_m)
+            if ndvi_buffer_min_m is not None
+            else min(100.0, self.ndvi_buffer_max_m)
+        )
+        self.ndvi_buffer_step_m = (
+            float(ndvi_buffer_step_m) if ndvi_buffer_step_m is not None else 50.0
+        )
+        if self.gvi_buffer_min_m > self.gvi_buffer_max_m:
+            self.gvi_buffer_min_m, self.gvi_buffer_max_m = (
+                self.gvi_buffer_max_m,
+                self.gvi_buffer_min_m,
+            )
+        if self.ndvi_buffer_min_m > self.ndvi_buffer_max_m:
+            self.ndvi_buffer_min_m, self.ndvi_buffer_max_m = (
+                self.ndvi_buffer_max_m,
+                self.ndvi_buffer_min_m,
+            )
+
         self.n_bins = n_bins
         self.cache_dir = cache_dir
         os.makedirs(cache_dir, exist_ok=True)
+        self._ndvi_export_resolution_m = 10.0
+        self._gvi_grid_spacing_m = 75.0
 
         # Data containers
         self.target_gdf = None
@@ -87,6 +150,11 @@ class MetricFusionEngine:
         self.best_params = None
         self.scaler = None
         self.k_folds = 5  # Number of CV folds
+
+        # Donut / ring cache: per-point annulus samples keyed by fold subset + indices
+        self._ring_raster_cache: dict = {}
+        self._ring_vector_cache: dict = {}
+        self._max_points_ring_cache = 8000
 
         # Determine input type
         self.is_points = target_file.lower().endswith((".geojson", ".shp"))
@@ -113,8 +181,10 @@ class MetricFusionEngine:
                     f"Target feature '{self.target_feature}' not found in columns: {list(self.target_gdf.columns)}"
                 )
 
-            # Create buffered extent for metric download
-            gdf_utm = self.target_gdf.to_crs("EPSG:32612")  # UTM for meter-based buffer
+            # Create buffered extent for metric download (metre-accurate buffer in local UTM)
+            gdf_wgs84 = self.target_gdf.to_crs("EPSG:4326")
+            utm_crs = gdf_wgs84.estimate_utm_crs()
+            gdf_utm = gdf_wgs84.to_crs(utm_crs)
             bounds = gdf_utm.total_bounds
             buffered_box = box(
                 bounds[0] - self.buffer_meters,
@@ -123,7 +193,7 @@ class MetricFusionEngine:
                 bounds[3] + self.buffer_meters,
             )
             self.buffered_extent = gpd.GeoDataFrame(
-                {"geometry": [buffered_box]}, crs="EPSG:32612"
+                {"geometry": [buffered_box]}, crs=utm_crs
             ).to_crs("EPSG:4326")
 
         else:  # Raster
@@ -154,17 +224,19 @@ class MetricFusionEngine:
 
     def load_metrics(
         self,
-        veg_file: Optional[str] = None,
-        terrain_file: Optional[str] = None,
-        ndvi_file: Optional[str] = None,
+        veg_file: str | None = None,
+        terrain_file: str | None = None,
+        ndvi_file: str | None = None,
         cache_metrics: bool = True,
-        gvi_api_key: Optional[str] = None,
+        gvi_api_key: str | None = None,
         ndvi_start_date: str = "2023-01-01",
         ndvi_end_date: str = "2023-12-31",
-        ndvi_project_id: Optional[str] = None,
-        progress_callback: Optional[callable] = None,
-        cancel_callback: Optional[callable] = None,
+        ndvi_project_id: str | None = None,
+        progress_callback: Callable[..., Any] | None = None,
+        cancel_callback: Callable[..., Any] | None = None,
         force_download: bool = False,
+        ndvi_resolution_m: float | None = None,
+        gvi_grid_spacing_m: float | None = None,
     ) -> None:
         """
         Load vegetation, terrain, and NDVI metrics from files or auto-download.
@@ -182,10 +254,19 @@ class MetricFusionEngine:
             ndvi_end_date: End date for NDVI composite (YYYY-MM-DD)
             ndvi_project_id: Google Earth Engine project ID for NDVI download
             force_download: If True, bypass cache and force fresh download of all metrics
+            ndvi_resolution_m: GEE export resolution (m) when fetching NDVI; default 10
+            gvi_grid_spacing_m: Street-view sampling grid spacing (m) when fetching GVI; default 75
         """
         if self.buffered_extent is None:
             self.load_target()
 
+        self._ndvi_export_resolution_m = (
+            float(ndvi_resolution_m) if ndvi_resolution_m is not None else 10.0
+        )
+        self._gvi_grid_spacing_m = (
+            float(gvi_grid_spacing_m) if gvi_grid_spacing_m is not None else 75.0
+        )
+        self._clear_ring_caches()
         # Check for multi-band GVI cache (Band 1=Veg, Band 2=Terrain)
         gvi_multiband_cache = self._get_cache_filename("gvi_combined", ".tif")
 
@@ -252,7 +333,6 @@ class MetricFusionEngine:
                 return False
 
         # Load or Auto-download Vegetation and Terrain
-        # Priority: 1) Uploaded multi-band file, 2) Cached multi-band, 3) Separate files, 4) Auto-download
 
         # Check if uploaded veg_file is a multi-band raster
         if (
@@ -261,10 +341,8 @@ class MetricFusionEngine:
             and veg_file.endswith((".tif", ".tiff"))
         ):
             if load_multiband_gvi(veg_file):
-                # Successfully loaded both veg and terrain from uploaded file
-                pass  # veg_data and terrain_data already set
+                pass
             else:
-                # Not multi-band, load normally below
                 self.veg_data = self._load_metric_file(veg_file)
                 if terrain_file and os.path.exists(terrain_file):
                     self.terrain_data = self._load_metric_file(terrain_file)
@@ -282,10 +360,8 @@ class MetricFusionEngine:
         # Check cached multi-band file
         elif os.path.exists(gvi_multiband_cache):
             if load_multiband_gvi(gvi_multiband_cache):
-                # Successfully loaded from cache
                 pass
             else:
-                # Cache corrupted, re-download
                 logger.warning("Cached multi-band file corrupted. Re-downloading...")
                 veg_file, terrain_file = self._auto_download_gvi_both(
                     api_key=gvi_api_key,
@@ -339,7 +415,6 @@ class MetricFusionEngine:
                 f"Please provide valid GVI files or enable auto-download."
             )
 
-        # Continue with NDVI loading (unchanged)
         if self.veg_data is not None and self.terrain_data is not None:
             logger.info("✓ GVI data loaded successfully")
 
@@ -385,7 +460,7 @@ class MetricFusionEngine:
             return False
         return True
 
-    def _load_metric_file(self, filepath: str) -> Union[gpd.GeoDataFrame, Dict]:
+    def _load_metric_file(self, filepath: str) -> gpd.GeoDataFrame | dict:
         """Load metric from GeoJSON or GeoTIFF."""
         if filepath.endswith((".tif", ".tiff")):
             with rasterio.open(filepath) as src:
@@ -438,7 +513,6 @@ class MetricFusionEngine:
 
     def _get_cache_filename(self, metric_type: str, extension: str = ".geojson") -> str:
         """Generate deterministic cache filename based on target file and boundary."""
-        import hashlib
 
         # Use target filename as base
         filename = os.path.basename(self.target_file)
@@ -521,7 +595,7 @@ class MetricFusionEngine:
             dst.write(grid_values.astype(rasterio.float32), 1)
 
     def _save_points_as_multiband_raster(
-        self, points_gdf: gpd.GeoDataFrame, value_cols: List[str], output_path: str
+        self, points_gdf: gpd.GeoDataFrame, value_cols: list[str], output_path: str
     ) -> None:
         """
         Convert point GeoDataFrame to multi-band raster matching the target raster grid.
@@ -603,11 +677,11 @@ class MetricFusionEngine:
 
     def _auto_download_gvi_both(
         self,
-        api_key: Optional[str] = None,
+        api_key: str | None = None,
         cache: bool = True,
-        progress_callback: Optional[callable] = None,
-        cancel_callback: Optional[callable] = None,
-    ) -> Tuple[str, str]:
+        progress_callback: Callable[..., Any] | None = None,
+        cancel_callback: Callable[..., Any] | None = None,
+    ) -> tuple[str, str]:
         """
         Auto-download GVI metrics (both veg and terrain) in a single analysis.
 
@@ -642,8 +716,10 @@ class MetricFusionEngine:
 
         # Run GVI analysis on buffered extent
         logger.info(
-            f"Computing GVI metrics for buffered extent (this may take a while)..."
+            "Computing GVI metrics for buffered extent (this may take a while)..."
         )
+
+        gvi_step = max(1, int(round(self._gvi_grid_spacing_m)))
 
         # Convert buffered extent to target points or grid
         if self.is_points:
@@ -661,7 +737,9 @@ class MetricFusionEngine:
             logger.info(f"Buffered extent area: ~{area_km2:.2f} km²")
             logger.info(f"Bounds (EPSG:4326): {bounds}")
             logger.info(f"Geometry type: {analysis_gdf.geometry.iloc[0].geom_type}")
-            logger.info(f"GVI will generate grid at 75m spacing within this polygon")
+            logger.info(
+                f"GVI will generate grid at ~{gvi_step} m spacing within this polygon"
+            )
 
             # Verify the polygon is valid
             if not analysis_gdf.geometry.iloc[0].is_valid:
@@ -685,7 +763,7 @@ class MetricFusionEngine:
                 # Use "gvi" as component name for combined download
                 progress_callback("gvi", curr, total)
 
-        logger.info(f"Starting GVI analysis...")
+        logger.info("Starting GVI analysis...")
         logger.info(
             f"Input GDF: {len(analysis_gdf)} features, CRS: {analysis_gdf.crs}, Geometry type: {analysis_gdf.geometry.iloc[0].geom_type}"
         )
@@ -693,7 +771,7 @@ class MetricFusionEngine:
         gvi_engine.run_analysis(
             analysis_gdf,
             folder=self.cache_dir,
-            step=75,  # 75m grid spacing (matches default)
+            step=gvi_step,
             save_panos=False,
             save_masks=False,
             result_callback=collect_result,
@@ -705,10 +783,10 @@ class MetricFusionEngine:
         if not accumulated_results:
             # Check if analysis was cancelled
             if cancel_callback and cancel_callback():
-                logger.info(f"GVI analysis cancelled by user")
-                raise InterruptedError(f"GVI analysis cancelled by user")
+                logger.info("GVI analysis cancelled by user")
+                raise InterruptedError("GVI analysis cancelled by user")
             raise ValueError(
-                f"No GVI data collected. Check if Street View is available in this area."
+                "No GVI data collected. Check if Street View is available in this area."
             )
 
         result_gdf = gpd.GeoDataFrame(accumulated_results, crs=analysis_gdf.crs)
@@ -747,7 +825,7 @@ class MetricFusionEngine:
                         f"Cached multi-band GVI GeoTIFF to: {gvi_multiband_path}"
                     )
                     logger.info(
-                        f"  Band 1: Vegetation (gvi_veg), Band 2: Terrain (gvi_ter)"
+                        "  Band 1: Vegetation (gvi_veg), Band 2: Terrain (gvi_ter)"
                     )
                 except Exception as e:
                     logger.warning(f"Could not create multi-band GeoTIFF cache: {e}")
@@ -774,10 +852,10 @@ class MetricFusionEngine:
     def _auto_download_gvi(
         self,
         component: str,
-        api_key: Optional[str] = None,
+        api_key: str | None = None,
         cache: bool = True,
-        progress_callback: Optional[callable] = None,
-        cancel_callback: Optional[callable] = None,
+        progress_callback: Callable[..., Any] | None = None,
+        cancel_callback: Callable[..., Any] | None = None,
     ) -> str:
         """
         Auto-download GVI metrics within buffered extent.
@@ -813,6 +891,8 @@ class MetricFusionEngine:
             f"Computing GVI {component} for buffered extent (this may take a while)..."
         )
 
+        gvi_step = max(1, int(round(self._gvi_grid_spacing_m)))
+
         # Convert buffered extent to target points or grid
         if self.is_points:
             # Use target points directly
@@ -829,7 +909,9 @@ class MetricFusionEngine:
             logger.info(f"Buffered extent area: ~{area_km2:.2f} km²")
             logger.info(f"Bounds (EPSG:4326): {bounds}")
             logger.info(f"Geometry type: {analysis_gdf.geometry.iloc[0].geom_type}")
-            logger.info(f"GVI will generate grid at 10m spacing within this polygon")
+            logger.info(
+                f"GVI will generate grid at ~{gvi_step} m spacing within this polygon"
+            )
 
             # Verify the polygon is valid
             if not analysis_gdf.geometry.iloc[0].is_valid:
@@ -862,7 +944,7 @@ class MetricFusionEngine:
         gvi_engine.run_analysis(
             analysis_gdf,
             folder=self.cache_dir,
-            step=75,  # 75m grid spacing (matches default)
+            step=gvi_step,
             save_panos=False,
             save_masks=False,
             result_callback=collect_result,
@@ -904,7 +986,7 @@ class MetricFusionEngine:
         self,
         start_date: str,
         end_date: str,
-        project_id: Optional[str] = None,
+        project_id: str | None = None,
         cache: bool = True,
         force_download: bool = False,
     ) -> str:
@@ -942,8 +1024,10 @@ class MetricFusionEngine:
 
         # Download NDVI for buffered extent
         bounds = self.buffered_extent.total_bounds
+        ndvi_res = int(max(5, round(self._ndvi_export_resolution_m)))
         logger.info(f"Downloading NDVI from Sentinel-2 ({start_date} to {end_date})...")
         logger.info(f"Area extent: {bounds}")
+        logger.info(f"NDVI export resolution: {ndvi_res} m")
         logger.info("This may take several minutes depending on area size...")
 
         # Extract base name for output
@@ -956,7 +1040,7 @@ class MetricFusionEngine:
             end_date=end_date,
             output_name=f"{name if cache else 'temp'}",
             folder=self.cache_dir,
-            resolution=10,
+            resolution=ndvi_res,
         )
 
         if result["status"] != "success":
@@ -976,7 +1060,7 @@ class MetricFusionEngine:
     def _apply_circular_buffer_aggregation(
         self,
         points_gdf: gpd.GeoDataFrame,
-        metric_data: Union[gpd.GeoDataFrame, Dict],
+        metric_data: gpd.GeoDataFrame | dict,
         radius_meters: float,
         stat: str,
         percentile: int = 50,
@@ -1185,6 +1269,317 @@ class MetricFusionEngine:
 
         return result
 
+    def _clear_ring_caches(self) -> None:
+        self._ring_raster_cache.clear()
+        self._ring_vector_cache.clear()
+
+    @staticmethod
+    def _polygonal_parts(geom):
+        gt = geom.geom_type
+        if gt == "Polygon":
+            return [geom]
+        if gt == "MultiPolygon":
+            return list(geom.geoms)
+        if gt == "GeometryCollection":
+            parts = []
+            for g in geom.geoms:
+                parts.extend(MetricFusionEngine._polygonal_parts(g))
+            return parts
+        return []
+
+    def _outer_radii_metres(self, *, gvi: bool) -> np.ndarray:
+        if gvi:
+            lo, hi, st = _radius_int_bounds(
+                self.gvi_buffer_min_m,
+                self.gvi_buffer_max_m,
+                self.gvi_buffer_step_m,
+            )
+        else:
+            lo, hi, st = _radius_int_bounds(
+                self.ndvi_buffer_min_m,
+                self.ndvi_buffer_max_m,
+                self.ndvi_buffer_step_m,
+            )
+        return np.arange(lo, hi + 1, st, dtype=np.int64)
+
+    @staticmethod
+    def _ring_end_index(radii: np.ndarray, radius_m: float) -> int:
+        r = int(round(float(radius_m)))
+        hits = np.flatnonzero(radii == r)
+        if hits.size:
+            return int(hits[-1])
+        return int(np.searchsorted(radii, r, side="right") - 1)
+
+    @staticmethod
+    def _aggregate_disk_from_rings(
+        ring_arrays: list[np.ndarray],
+        end_ring_idx: int,
+        stat: str,
+        percentile: int,
+    ) -> float:
+        if end_ring_idx < 0:
+            return np.nan
+        parts = ring_arrays[: end_ring_idx + 1]
+        nonempty = [p for p in parts if p.size > 0]
+        if not nonempty:
+            return np.nan
+        vals = np.concatenate(nonempty)
+        if stat == "mean":
+            return float(np.mean(vals))
+        if stat == "median":
+            return float(np.median(vals))
+        if stat == "percentile":
+            return float(np.percentile(vals, percentile))
+        return np.nan
+
+    def _vector_metric_column(self, metric_data: gpd.GeoDataFrame, channel: str) -> str:
+        metric_col = metric_data.attrs.get("metric_column")
+        if metric_col and metric_col in metric_data.columns:
+            return metric_col
+        if channel == "veg":
+            for col in ["veg", "gvi_veg", "gvi", "GVI", "value"]:
+                if col in metric_data.columns:
+                    return col
+        elif channel == "terrain":
+            for col in ["terrain", "gvi_ter", "NDVI", "ndvi", "value"]:
+                if col in metric_data.columns:
+                    return col
+        else:
+            for col in ["NDVI", "ndvi", "value"]:
+                if col in metric_data.columns:
+                    return col
+        numeric_cols = metric_data.select_dtypes(include=[np.number]).columns.tolist()
+        numeric_cols = [
+            c for c in numeric_cols if c not in ["index_right", "index_left", "index"]
+        ]
+        if numeric_cols:
+            return numeric_cols[0]
+        raise ValueError(f"No numeric metric column for channel={channel}")
+
+    def _precompute_raster_ring_values(
+        self,
+        metric_dict: dict,
+        points_gdf: gpd.GeoDataFrame,
+        radii_m: np.ndarray,
+    ) -> list[list[np.ndarray]]:
+        n_pts = len(points_gdf)
+        n_rings = len(radii_m)
+        ring_values: list[list[np.ndarray]] = [
+            [np.array([], dtype=np.float64) for _ in range(n_rings)]
+            for _ in range(n_pts)
+        ]
+
+        metric_array = metric_dict["data"]
+        transform = metric_dict["transform"]
+        metric_crs = metric_dict["crs"]
+        points_metric_crs = points_gdf.to_crs(metric_crs)
+
+        pixel_size = abs(transform.a)
+        if metric_crs.is_geographic:
+            pixel_size_meters = pixel_size * 111320
+        else:
+            pixel_size_meters = pixel_size
+
+        max_r_m = float(radii_m[-1])
+        max_r_px = int(max_r_m / pixel_size_meters)
+        max_r_px = max(1, min(max_r_px, 10000))
+
+        idx_to_pos = {idx: pos for pos, idx in enumerate(points_gdf.index)}
+
+        for idx, point in points_metric_crs.iterrows():
+            pos = idx_to_pos[idx]
+            row, col = rowcol(transform, point.geometry.x, point.geometry.y)
+
+            rmin = max(row - max_r_px, 0)
+            rmax = min(row + max_r_px + 1, metric_array.shape[0])
+            cmin = max(col - max_r_px, 0)
+            cmax = min(col + max_r_px + 1, metric_array.shape[1])
+            if rmin >= rmax or cmin >= cmax:
+                continue
+
+            window = metric_array[rmin:rmax, cmin:cmax]
+            rr = np.arange(rmin, rmax, dtype=np.float64)[:, None]
+            cc = np.arange(cmin, cmax, dtype=np.float64)[None, :]
+            dr = rr - float(row)
+            dc = cc - float(col)
+            dist_m = np.sqrt(dr * dr + dc * dc) * pixel_size_meters
+
+            if hasattr(window, "mask"):
+                base_valid = ~window.mask
+                data = window.data
+            else:
+                base_valid = np.ones(window.shape, dtype=bool)
+                data = window
+
+            for k in range(n_rings):
+                inner_m = 0.0 if k == 0 else float(radii_m[k - 1])
+                outer_m = float(radii_m[k])
+                if inner_m <= 0:
+                    ring_mask = dist_m <= outer_m
+                else:
+                    ring_mask = (dist_m <= outer_m) & (dist_m > inner_m)
+                valid = base_valid & ring_mask
+                vals = np.asarray(data[valid], dtype=np.float64).ravel()
+                vals = vals[~np.isnan(vals)]
+                ring_values[pos][k] = vals
+
+        return ring_values
+
+    def _precompute_vector_ring_values(
+        self,
+        metric_data: gpd.GeoDataFrame,
+        points_gdf: gpd.GeoDataFrame,
+        radii_m: np.ndarray,
+        metric_col: str,
+    ) -> list[list[np.ndarray]]:
+        n_pts = len(points_gdf)
+        n_rings = len(radii_m)
+        ring_values: list[list[np.ndarray]] = [
+            [np.array([], dtype=np.float64) for _ in range(n_rings)]
+            for _ in range(n_pts)
+        ]
+
+        points_wgs84 = points_gdf.to_crs("EPSG:4326")
+        centroid = points_wgs84.geometry.union_all().centroid
+        lon, lat = centroid.x, centroid.y
+        utm_zone = int((lon + 180) / 6) + 1
+        utm_crs = f"EPSG:326{utm_zone:02d}" if lat >= 0 else f"EPSG:327{utm_zone:02d}"
+
+        points_utm = points_gdf.to_crs(utm_crs)
+        metric_utm = metric_data.to_crs(utm_crs)
+
+        idx_to_pos = {idx: pos for pos, idx in enumerate(points_gdf.index)}
+
+        for idx, prow in points_utm.iterrows():
+            pos = idx_to_pos[idx]
+            pt = prow.geometry
+            for k in range(n_rings):
+                inner_m = 0.0 if k == 0 else float(radii_m[k - 1])
+                outer_m = float(radii_m[k])
+                buf_o = pt.buffer(outer_m)
+                if inner_m <= 0:
+                    ring_poly = buf_o
+                else:
+                    ring_poly = buf_o.difference(pt.buffer(inner_m))
+                vals_list: list[np.ndarray] = []
+                for poly in MetricFusionEngine._polygonal_parts(ring_poly):
+                    if poly.is_empty:
+                        continue
+                    tmp = gpd.GeoDataFrame(geometry=[poly], crs=points_utm.crs)
+                    joined = gpd.sjoin(
+                        metric_utm, tmp, how="inner", predicate="intersects"
+                    )
+                    if metric_col in joined.columns:
+                        v = joined[metric_col].dropna().values.astype(np.float64)
+                        if v.size:
+                            vals_list.append(v)
+                ring_values[pos][k] = (
+                    np.concatenate(vals_list) if vals_list else np.array([])
+                )
+
+        return ring_values
+
+    def _ring_cache_key(
+        self,
+        channel: str,
+        fold_idx: int,
+        subset: str,
+        points_gdf: gpd.GeoDataFrame,
+        radii: np.ndarray,
+    ) -> tuple:
+        return (
+            channel,
+            fold_idx,
+            subset,
+            tuple(points_gdf.index),
+            radii.tobytes(),
+        )
+
+    def _aggregate_from_ring_cache(
+        self,
+        radii: np.ndarray,
+        ring_rows: list[list[np.ndarray]],
+        radius_m: float,
+        stat: str,
+        percentile: int,
+    ) -> np.ndarray:
+        n = len(ring_rows)
+        out = np.full(n, np.nan, dtype=np.float64)
+        end_idx = MetricFusionEngine._ring_end_index(radii, radius_m)
+        if end_idx < 0:
+            return out
+        for pos in range(n):
+            out[pos] = MetricFusionEngine._aggregate_disk_from_rings(
+                ring_rows[pos], end_idx, stat, percentile
+            )
+        return out
+
+    def _aggregate_with_ring_cache(
+        self,
+        points_gdf: gpd.GeoDataFrame,
+        metric_data: gpd.GeoDataFrame | dict,
+        radius_m: float,
+        stat: str,
+        percentile: int,
+        *,
+        channel: str,
+        fold_idx: int | None,
+        subset: str | None,
+    ) -> np.ndarray:
+        """
+        Circular neighbourhood aggregation using precomputed annuli when possible.
+
+        Falls back to _apply_circular_buffer_aggregation for large point sets,
+        unsupported modes, or cache build failures.
+        """
+        if (
+            fold_idx is None
+            or subset is None
+            or len(points_gdf) > self._max_points_ring_cache
+        ):
+            return self._apply_circular_buffer_aggregation(
+                points_gdf, metric_data, radius_m, stat, percentile
+            )
+
+        gvi = channel in ("veg", "terrain")
+        radii = self._outer_radii_metres(gvi=gvi)
+        if radii.size == 0:
+            return self._apply_circular_buffer_aggregation(
+                points_gdf, metric_data, radius_m, stat, percentile
+            )
+
+        cache_store = (
+            self._ring_raster_cache
+            if isinstance(metric_data, dict)
+            else self._ring_vector_cache
+        )
+        key = self._ring_cache_key(channel, fold_idx, subset, points_gdf, radii)
+
+        if key not in cache_store:
+            try:
+                if isinstance(metric_data, dict):
+                    rows = self._precompute_raster_ring_values(
+                        metric_data, points_gdf, radii
+                    )
+                else:
+                    col = self._vector_metric_column(metric_data, channel)
+                    rows = self._precompute_vector_ring_values(
+                        metric_data, points_gdf, radii, col
+                    )
+                cache_store[key] = (radii, rows)
+                logger.info(
+                    f"Ring cache built: channel={channel} subset={subset} fold={fold_idx} "
+                    f"points={len(points_gdf)} rings={len(radii)}"
+                )
+            except Exception as e:
+                logger.warning(f"Ring cache build failed ({channel}): {e}")
+                return self._apply_circular_buffer_aggregation(
+                    points_gdf, metric_data, radius_m, stat, percentile
+                )
+
+        _, rows = cache_store[key]
+        return self._aggregate_from_ring_cache(radii, rows, radius_m, stat, percentile)
+
     def prepare_fusion_data(self) -> pd.DataFrame:
         """
         Align vegetation, terrain, NDVI, and target data into a single DataFrame.
@@ -1198,7 +1593,7 @@ class MetricFusionEngine:
         """
         import sys
 
-        print(f"\n[FUSION DEBUG] ====== PREPARE FUSION DATA ======", flush=True)
+        print("\n[FUSION DEBUG] ====== PREPARE FUSION DATA ======", flush=True)
         print(f"[FUSION DEBUG] is_points = {self.is_points}", flush=True)
         print(
             f"[FUSION DEBUG] Target type: {'POINT' if self.is_points else 'RASTER'}",
@@ -1215,9 +1610,9 @@ class MetricFusionEngine:
         """Sample metrics at point locations."""
         import sys
 
-        print(f"\n[FUSION DEBUG] ====== POINT FUSION ======", flush=True)
+        print("\n[FUSION DEBUG] ====== POINT FUSION ======", flush=True)
         logger.info("Preparing point-based fusion data...")
-        print(f"[FUSION DEBUG] Preparing point-based fusion data...", flush=True)
+        print("[FUSION DEBUG] Preparing point-based fusion data...", flush=True)
         sys.stdout.flush()
 
         # Only use target points as samples, not buffered area
@@ -1246,9 +1641,7 @@ class MetricFusionEngine:
         )
 
         # Log data quality before dropping NaN
-        print(
-            f"\n[FUSION DEBUG] ====== DATA QUALITY SUMMARY (POINT) ======", flush=True
-        )
+        print("\n[FUSION DEBUG] ====== DATA QUALITY SUMMARY (POINT) ======", flush=True)
         print(f"[FUSION DEBUG] Total rows: {len(fusion_df)}", flush=True)
         print(
             f"[FUSION DEBUG] Target NaN: {fusion_df['target'].isna().sum()} ({fusion_df['target'].isna().sum()/len(fusion_df)*100:.1f}%)",
@@ -1266,7 +1659,7 @@ class MetricFusionEngine:
             f"[FUSION DEBUG] NDVI NaN: {fusion_df['ndvi'].isna().sum()} ({fusion_df['ndvi'].isna().sum()/len(fusion_df)*100:.1f}%)",
             flush=True,
         )
-        print(f"[FUSION DEBUG] ================================\n", flush=True)
+        print("[FUSION DEBUG] ================================\n", flush=True)
 
         result = fusion_df.dropna()
         print(f"[FUSION DEBUG] After dropna: {len(result)} valid rows", flush=True)
@@ -1338,7 +1731,10 @@ class MetricFusionEngine:
             print(
                 f"[FUSION DEBUG] Points bounds: {points_gdf.total_bounds}", flush=True
             )
-            print(f"[FUSION DEBUG] Buffer distance: {self.buffer_meters}m", flush=True)
+            print(
+                f"[FUSION DEBUG] Nearest-feature max distance (veg): {self.gvi_buffer_max_m}m",
+                flush=True,
+            )
 
             # Ensure CRS match before spatial join
             veg_data_matched = self.veg_data.to_crs(points_gdf.crs)
@@ -1351,7 +1747,7 @@ class MetricFusionEngine:
                 points_gdf,
                 veg_data_matched[["geometry", veg_col]],
                 how="left",
-                max_distance=self.buffer_meters,
+                max_distance=self.gvi_buffer_max_m,
             )
 
             # Extract the metric column (may have been renamed with suffix)
@@ -1409,7 +1805,7 @@ class MetricFusionEngine:
                 points_gdf,
                 terrain_data_matched[["geometry", terrain_col]],
                 how="left",
-                max_distance=self.buffer_meters,
+                max_distance=self.gvi_buffer_max_m,
             )
 
             # Extract the metric column (may have been renamed with suffix)
@@ -1464,7 +1860,7 @@ class MetricFusionEngine:
                 points_gdf,
                 ndvi_data_matched[["geometry", ndvi_col]],
                 how="left",
-                max_distance=self.buffer_meters,
+                max_distance=self.ndvi_buffer_max_m,
             )
 
             # Extract the metric column (may have been renamed with suffix)
@@ -1522,8 +1918,8 @@ class MetricFusionEngine:
 
         if len(pixel_points) == 0:
             raise ValueError(
-                f"No valid pixels found in target raster. "
-                f"Target raster may be empty or all NaN."
+                "No valid pixels found in target raster. "
+                "Target raster may be empty or all NaN."
             )
 
         logger.info(f"Created {len(pixel_points):,} point samples from raster pixels")
@@ -1538,7 +1934,7 @@ class MetricFusionEngine:
         # Now sample metrics at these point locations using spatial joins
         # This is the same logic as _prepare_point_fusion()
         print(
-            f"[FUSION DEBUG] Now sampling metrics at pixel center points...", flush=True
+            "[FUSION DEBUG] Now sampling metrics at pixel center points...", flush=True
         )
 
         points_gdf = pixel_points.copy()
@@ -1558,7 +1954,7 @@ class MetricFusionEngine:
 
         # Log data quality before dropping NaN
         print(
-            f"\n[FUSION DEBUG] ====== DATA QUALITY SUMMARY (RASTER) ======", flush=True
+            "\n[FUSION DEBUG] ====== DATA QUALITY SUMMARY (RASTER) ======", flush=True
         )
         print(f"[FUSION DEBUG] Total rows: {len(fusion_df)}", flush=True)
         print(
@@ -1577,7 +1973,7 @@ class MetricFusionEngine:
             f"[FUSION DEBUG] NDVI NaN: {fusion_df['ndvi'].isna().sum()} ({fusion_df['ndvi'].isna().sum()/len(fusion_df)*100:.1f}%)",
             flush=True,
         )
-        print(f"[FUSION DEBUG] ================================\n", flush=True)
+        print("[FUSION DEBUG] ================================\n", flush=True)
 
         result = fusion_df.dropna()
         print(f"[FUSION DEBUG] After dropna: {len(result)} valid rows", flush=True)
@@ -1598,7 +1994,8 @@ class MetricFusionEngine:
         Split data into holdout test set and k-fold CV training/validation sets.
 
         Workflow:
-        1. Sample all metrics at point locations (initial sampling with buffer_meters)
+        1. Sample all metrics at point locations (nearest-feature caps: GVI max
+           ``gvi_buffer_max_m``, NDVI max ``ndvi_buffer_max_m``)
         2. Filter out rows with NaN values in any metric
         3. Bin target values for stratification
         4. Stratified split into train/val/test sets
@@ -1679,25 +2076,20 @@ class MetricFusionEngine:
         n_startup_trials: int = 150,
         objective_metric: str = "pearson",
         pruner_type: str = "median",
+        sampler_type: str = "TPE",
         seed: int = 42,
         show_progress: bool = True,
-        progress_callback: Optional[callable] = None,
-    ) -> Dict:
+        progress_callback: Callable[..., Any] | None = None,
+    ) -> dict:
         """
         Run Optuna optimization with k-fold cross-validation.
 
-        Matches CGI.ipynb optimization logic:
-        - CMA-ES sampler with startup trials
-        - Separate weights for veg, terrain (and optionally NDVI)
-        - Separate radius and aggregation function parameters
-        - K-fold CV for robust evaluation
-        - Train/validation tracking across folds
-
         Args:
             n_trials: Total optimization trials
-            n_startup_trials: Random exploration trials before CMA-ES
+            n_startup_trials: Random exploration trials before the main optimizer
             objective_metric: 'pearson', 'spearman', 'r2', 'rmse', 'mutual_info'
             pruner_type: 'median', 'hyperband', 'successive_halving', or None
+            sampler_type: 'TPE', 'CMA-ES', or 'Random'
             seed: Random seed for reproducibility
             show_progress: Whether to show progress bar
 
@@ -1707,13 +2099,23 @@ class MetricFusionEngine:
         if self.cv_folds is None:
             raise ValueError("Call split_data() first")
 
-        # Select sampler (TPE with settings for dynamic search space)
-        sampler = TPESampler(
-            n_startup_trials=n_startup_trials,
-            multivariate=False,  # Disable for dynamic search space
-            warn_independent_sampling=False,  # Suppress warnings
-            seed=seed,
-        )
+        self._clear_ring_caches()
+
+        # Build sampler
+        if sampler_type == "CMA-ES":
+            sampler = CmaEsSampler(
+                n_startup_trials=n_startup_trials,
+                seed=seed,
+            )
+        elif sampler_type == "Random":
+            sampler = RandomSampler(seed=seed)
+        else:  # default: TPE
+            sampler = TPESampler(
+                n_startup_trials=n_startup_trials,
+                multivariate=False,
+                warn_independent_sampling=False,
+                seed=seed,
+            )
 
         # Select pruner based on objective
         if pruner_type == "median":
@@ -1781,23 +2183,50 @@ class MetricFusionEngine:
 
         return self.best_params
 
+    def _suggest_gvi_radius(self, trial: optuna.Trial, name: str) -> int:
+        lo, hi, step = _radius_int_bounds(
+            self.gvi_buffer_min_m, self.gvi_buffer_max_m, self.gvi_buffer_step_m
+        )
+        if lo >= hi:
+            return lo
+        return trial.suggest_int(name, lo, hi, step=step)
+
+    def _suggest_ndvi_radius(self, trial: optuna.Trial) -> int:
+        lo, hi, step = _radius_int_bounds(
+            self.ndvi_buffer_min_m, self.ndvi_buffer_max_m, self.ndvi_buffer_step_m
+        )
+        if lo >= hi:
+            return lo
+        return trial.suggest_int("ndvi_radius", lo, hi, step=step)
+
     def _objective(self, trial: optuna.Trial, metric: str) -> float:
         """
         Optuna objective function with k-fold CV.
 
-        Matches CGI.ipynb parameter structure exactly:
-        - ndvi_weight, veg_weight, terrain_weight (0-100, summing to 100)
-        - veg_radius, terrain_radius, ndvi_radius (100 to buffer_meters, step=50)
-        - streetview_stat, streetview_percentile (SHARED for veg + terrain)
-        - ndvi_stat, ndvi_percentile (separate for NDVI)
-
-        Evaluates across all CV folds and returns average validation score.
+        Weight search matches CGI.ipynb (ndvi / veg / terrain summing to 100).
+        Radii use separate GVI and NDVI buffer ladders (min / max / step metres)
+        on the engine; extent padding remains ``buffer_meters``.
+        Street-view aggregation parameters are shared for veg and terrain; NDVI
+        uses separate stat / percentile choices.
         """
-        # Log buffer_meters to verify it's being used correctly (only for first trial)
+        gvi_cap = int(round(self.gvi_buffer_max_m))
+        ndvi_cap = int(round(self.ndvi_buffer_max_m))
+
         if trial.number == 0:
-            logger.info(f"Buffer distance for optimization: {self.buffer_meters}m")
+            gvi_lo, gvi_hi, gvi_st = _radius_int_bounds(
+                self.gvi_buffer_min_m,
+                self.gvi_buffer_max_m,
+                self.gvi_buffer_step_m,
+            )
+            ndvi_lo, ndvi_hi, ndvi_st = _radius_int_bounds(
+                self.ndvi_buffer_min_m,
+                self.ndvi_buffer_max_m,
+                self.ndvi_buffer_step_m,
+            )
             logger.info(
-                f"Radius range will be: 100 to {int(self.buffer_meters)}m (step=50)"
+                f"Fusion extent buffer: {self.buffer_meters} m; "
+                f"GVI radius search {gvi_lo}–{gvi_hi} m (step {gvi_st}); "
+                f"NDVI radius search {ndvi_lo}–{ndvi_hi} m (step {ndvi_st})"
             )
 
         # ─── Suggest Weights (matching CGI.ipynb logic) ───────────────────────
@@ -1830,33 +2259,25 @@ class MetricFusionEngine:
             else:
                 streetview_percentile = 50
 
-            # Separate radii for veg and terrain (min 100m to avoid spatial join mismatches)
-            # Max radius is user-specified buffer_meters
-            if veg_weight > 0:
-                veg_radius = trial.suggest_int(
-                    "veg_radius", 100, int(self.buffer_meters), step=50
-                )
-            else:
-                veg_radius = self.buffer_meters
-
-            if terrain_weight > 0:
-                terrain_radius = trial.suggest_int(
-                    "terrain_radius", 100, int(self.buffer_meters), step=50
-                )
-            else:
-                terrain_radius = self.buffer_meters
+            veg_radius = (
+                self._suggest_gvi_radius(trial, "veg_radius")
+                if veg_weight > 0
+                else gvi_cap
+            )
+            terrain_radius = (
+                self._suggest_gvi_radius(trial, "terrain_radius")
+                if terrain_weight > 0
+                else gvi_cap
+            )
         else:
             streetview_stat = "mean"
             streetview_percentile = 50
-            veg_radius = self.buffer_meters
-            terrain_radius = self.buffer_meters
+            veg_radius = gvi_cap
+            terrain_radius = gvi_cap
 
         # ─── Suggest NDVI Parameters (separate) ────────────────────────────────
-        # Max radius is user-specified buffer_meters
         if ndvi_weight > 0:
-            ndvi_radius = trial.suggest_int(
-                "ndvi_radius", 100, int(self.buffer_meters), step=50
-            )
+            ndvi_radius = self._suggest_ndvi_radius(trial)
             ndvi_stat = trial.suggest_categorical(
                 "ndvi_stat", ["mean", "median", "percentile"]
             )
@@ -1865,7 +2286,7 @@ class MetricFusionEngine:
             else:
                 ndvi_percentile = 50
         else:
-            ndvi_radius = self.buffer_meters
+            ndvi_radius = ndvi_cap
             ndvi_stat = "mean"
             ndvi_percentile = 50
 
@@ -1896,19 +2317,25 @@ class MetricFusionEngine:
 
             # Apply circular buffer aggregation for vegetation (with SHARED streetview_stat)
             if veg_weight > 0:
-                train_veg = self._apply_circular_buffer_aggregation(
+                train_veg = self._aggregate_with_ring_cache(
                     train_points,
                     self.veg_data,
                     veg_radius,
-                    streetview_stat,  # SHARED
-                    streetview_percentile,  # SHARED
+                    streetview_stat,
+                    streetview_percentile,
+                    channel="veg",
+                    fold_idx=fold_idx,
+                    subset="train",
                 )
-                val_veg = self._apply_circular_buffer_aggregation(
+                val_veg = self._aggregate_with_ring_cache(
                     val_points,
                     self.veg_data,
                     veg_radius,
-                    streetview_stat,  # SHARED
-                    streetview_percentile,  # SHARED
+                    streetview_stat,
+                    streetview_percentile,
+                    channel="veg",
+                    fold_idx=fold_idx,
+                    subset="val",
                 )
             else:
                 train_veg = np.zeros(len(train_points))
@@ -1916,19 +2343,25 @@ class MetricFusionEngine:
 
             # Apply circular buffer aggregation for terrain (with SHARED streetview_stat)
             if terrain_weight > 0:
-                train_terrain = self._apply_circular_buffer_aggregation(
+                train_terrain = self._aggregate_with_ring_cache(
                     train_points,
                     self.terrain_data,
                     terrain_radius,
-                    streetview_stat,  # SHARED
-                    streetview_percentile,  # SHARED
+                    streetview_stat,
+                    streetview_percentile,
+                    channel="terrain",
+                    fold_idx=fold_idx,
+                    subset="train",
                 )
-                val_terrain = self._apply_circular_buffer_aggregation(
+                val_terrain = self._aggregate_with_ring_cache(
                     val_points,
                     self.terrain_data,
                     terrain_radius,
-                    streetview_stat,  # SHARED
-                    streetview_percentile,  # SHARED
+                    streetview_stat,
+                    streetview_percentile,
+                    channel="terrain",
+                    fold_idx=fold_idx,
+                    subset="val",
                 )
             else:
                 train_terrain = np.zeros(len(train_points))
@@ -1936,19 +2369,25 @@ class MetricFusionEngine:
 
             # Apply circular buffer aggregation for NDVI (separate stat)
             if ndvi_weight > 0:
-                train_ndvi = self._apply_circular_buffer_aggregation(
+                train_ndvi = self._aggregate_with_ring_cache(
                     train_points,
                     self.ndvi_data,
                     ndvi_radius,
-                    ndvi_stat,  # SEPARATE
-                    ndvi_percentile,  # SEPARATE
+                    ndvi_stat,
+                    ndvi_percentile,
+                    channel="ndvi",
+                    fold_idx=fold_idx,
+                    subset="train",
                 )
-                val_ndvi = self._apply_circular_buffer_aggregation(
+                val_ndvi = self._aggregate_with_ring_cache(
                     val_points,
                     self.ndvi_data,
                     ndvi_radius,
-                    ndvi_stat,  # SEPARATE
-                    ndvi_percentile,  # SEPARATE
+                    ndvi_stat,
+                    ndvi_percentile,
+                    channel="ndvi",
+                    fold_idx=fold_idx,
+                    subset="val",
                 )
             else:
                 train_ndvi = np.zeros(len(train_points))
@@ -2000,13 +2439,13 @@ class MetricFusionEngine:
             if len(train_valid_vals) == 0 or np.var(train_valid_vals) == 0:
                 # Prune trial early if train composite is constant
                 raise optuna.TrialPruned(
-                    f"Train composite has no variance (constant values)"
+                    "Train composite has no variance (constant values)"
                 )
 
             if len(val_valid_vals) > 0 and np.var(val_valid_vals) == 0:
                 # Prune trial early if validation composite is constant
                 raise optuna.TrialPruned(
-                    f"Validation composite has no variance (constant values)"
+                    "Validation composite has no variance (constant values)"
                 )
 
             # Calculate metrics
@@ -2115,7 +2554,7 @@ class MetricFusionEngine:
         p_threshold: float = 0.05,
         tolerance: float = 0.1,
         min_trials: int = 10,
-    ) -> List[optuna.Trial]:
+    ) -> list[optuna.Trial]:
         """
         Filter trials for robustness based on the optimization metric.
 
@@ -2260,10 +2699,10 @@ class MetricFusionEngine:
 
     def evaluate_on_test(
         self,
-        params: Optional[Dict] = None,
+        params: dict | None = None,
         metric: str = "pearson",
         return_predictions: bool = False,
-    ) -> Dict:
+    ) -> dict:
         """
         Evaluate best parameters on held-out test set.
 
@@ -2307,11 +2746,11 @@ class MetricFusionEngine:
         # Extract aggregation parameters
         streetview_stat = params.get("streetview_stat", "mean")
         streetview_percentile = params.get("streetview_percentile", 50)
-        veg_radius = params.get("veg_radius", self.buffer_meters)
-        terrain_radius = params.get("terrain_radius", self.buffer_meters)
+        veg_radius = params.get("veg_radius", int(round(self.gvi_buffer_max_m)))
+        terrain_radius = params.get("terrain_radius", int(round(self.gvi_buffer_max_m)))
         ndvi_stat = params.get("ndvi_stat", "mean")
         ndvi_percentile = params.get("ndvi_percentile", 50)
-        ndvi_radius = params.get("ndvi_radius", self.buffer_meters)
+        ndvi_radius = params.get("ndvi_radius", int(round(self.ndvi_buffer_max_m)))
 
         # Apply dynamic circular buffer aggregation
         # Both points and rasters use the same approach (rasters converted to points)
@@ -2319,36 +2758,45 @@ class MetricFusionEngine:
 
         # Sample vegetation with optimized radius/stat
         if veg_weight > 0:
-            test_veg = self._apply_circular_buffer_aggregation(
+            test_veg = self._aggregate_with_ring_cache(
                 test_points,
                 self.veg_data,
                 veg_radius,
                 streetview_stat,
                 streetview_percentile,
+                channel="veg",
+                fold_idx=-1,
+                subset="test",
             )
         else:
             test_veg = np.zeros(len(test_points))
 
         # Sample terrain with optimized radius/stat
         if terrain_weight > 0:
-            test_terrain = self._apply_circular_buffer_aggregation(
+            test_terrain = self._aggregate_with_ring_cache(
                 test_points,
                 self.terrain_data,
                 terrain_radius,
                 streetview_stat,
                 streetview_percentile,
+                channel="terrain",
+                fold_idx=-1,
+                subset="test",
             )
         else:
             test_terrain = np.zeros(len(test_points))
 
         # Sample NDVI with optimized radius/stat
         if ndvi_weight > 0:
-            test_ndvi = self._apply_circular_buffer_aggregation(
+            test_ndvi = self._aggregate_with_ring_cache(
                 test_points,
                 self.ndvi_data,
                 ndvi_radius,
                 ndvi_stat,
                 ndvi_percentile,
+                channel="ndvi",
+                fold_idx=-1,
+                subset="test",
             )
         else:
             test_ndvi = np.zeros(len(test_points))
@@ -2411,7 +2859,7 @@ class MetricFusionEngine:
 
         return result
 
-    def apply_fusion(self, weights: Optional[Dict] = None) -> pd.DataFrame:
+    def apply_fusion(self, weights: dict | None = None) -> pd.DataFrame:
         """
         Apply fusion weights to create composite index.
 
@@ -2441,11 +2889,13 @@ class MetricFusionEngine:
         # Extract aggregation parameters
         streetview_stat = weights.get("streetview_stat", "mean")
         streetview_percentile = weights.get("streetview_percentile", 50)
-        veg_radius = weights.get("veg_radius", self.buffer_meters)
-        terrain_radius = weights.get("terrain_radius", self.buffer_meters)
+        veg_radius = weights.get("veg_radius", int(round(self.gvi_buffer_max_m)))
+        terrain_radius = weights.get(
+            "terrain_radius", int(round(self.gvi_buffer_max_m))
+        )
         ndvi_stat = weights.get("ndvi_stat", "mean")
         ndvi_percentile = weights.get("ndvi_percentile", 50)
-        ndvi_radius = weights.get("ndvi_radius", self.buffer_meters)
+        ndvi_radius = weights.get("ndvi_radius", int(round(self.ndvi_buffer_max_m)))
 
         # Combine all data (train+val+test)
         all_data = pd.concat([self.train_val_data, self.test_data])
@@ -2453,34 +2903,43 @@ class MetricFusionEngine:
 
         # Apply circular buffer aggregation with optimized parameters
         if weights["veg_weight"] > 0:
-            all_veg = self._apply_circular_buffer_aggregation(
+            all_veg = self._aggregate_with_ring_cache(
                 all_points,
                 self.veg_data,
                 veg_radius,
                 streetview_stat,
                 streetview_percentile,
+                channel="veg",
+                fold_idx=-1,
+                subset="all",
             )
         else:
             all_veg = np.zeros(len(all_points))
 
         if weights["terrain_weight"] > 0:
-            all_terrain = self._apply_circular_buffer_aggregation(
+            all_terrain = self._aggregate_with_ring_cache(
                 all_points,
                 self.terrain_data,
                 terrain_radius,
                 streetview_stat,
                 streetview_percentile,
+                channel="terrain",
+                fold_idx=-1,
+                subset="all",
             )
         else:
             all_terrain = np.zeros(len(all_points))
 
         if weights["ndvi_weight"] > 0:
-            all_ndvi = self._apply_circular_buffer_aggregation(
+            all_ndvi = self._aggregate_with_ring_cache(
                 all_points,
                 self.ndvi_data,
                 ndvi_radius,
                 ndvi_stat,
                 ndvi_percentile,
+                channel="ndvi",
+                fold_idx=-1,
+                subset="all",
             )
         else:
             all_ndvi = np.zeros(len(all_points))
@@ -2625,7 +3084,7 @@ class MetricFusionEngine:
         self,
         output_path: str = "output_results/composite_greenery.tif",
         top_percent: float = 0.2,
-        progress_callback: Optional[callable] = None,
+        progress_callback: Callable[..., Any] | None = None,
     ) -> str:
         """
         Generate final composite greenery map using averaged parameters from top robust trials.
@@ -2683,19 +3142,23 @@ class MetricFusionEngine:
             progress_callback(20, 100)
 
         # 3. Average parameters
-        from collections import Counter
         from statistics import mode
 
         weights_veg = [t.params.get("veg_weight", 0) for t in top_trials]
         weights_ter = [t.params.get("terrain_weight", 0) for t in top_trials]
         weights_ndvi = [t.params.get("ndvi_weight", 0) for t in top_trials]
 
-        radii_veg = [t.params.get("veg_radius", self.buffer_meters) for t in top_trials]
+        radii_veg = [
+            t.params.get("veg_radius", int(round(self.gvi_buffer_max_m)))
+            for t in top_trials
+        ]
         radii_ter = [
-            t.params.get("terrain_radius", self.buffer_meters) for t in top_trials
+            t.params.get("terrain_radius", int(round(self.gvi_buffer_max_m)))
+            for t in top_trials
         ]
         radii_ndvi = [
-            t.params.get("ndvi_radius", self.buffer_meters) for t in top_trials
+            t.params.get("ndvi_radius", int(round(self.ndvi_buffer_max_m)))
+            for t in top_trials
         ]
 
         streetview_stats = [t.params.get("streetview_stat", "mean") for t in top_trials]
@@ -2809,36 +3272,45 @@ class MetricFusionEngine:
 
         # 5. Sample metrics at grid points using final parameters
         logger.info("Sampling vegetation at grid points...")
-        veg_values = self._apply_circular_buffer_aggregation(
+        veg_values = self._aggregate_with_ring_cache(
             points_gdf,
             self.veg_data,
             final_params["veg_radius"],
             final_params["streetview_stat"],
             final_params["streetview_percentile"],
+            channel="veg",
+            fold_idx=-1,
+            subset="robust_map",
         )
 
         if progress_callback:
             progress_callback(55, 100)
 
         logger.info("Sampling terrain at grid points...")
-        terrain_values = self._apply_circular_buffer_aggregation(
+        terrain_values = self._aggregate_with_ring_cache(
             points_gdf,
             self.terrain_data,
             final_params["terrain_radius"],
             final_params["streetview_stat"],
             final_params["streetview_percentile"],
+            channel="terrain",
+            fold_idx=-1,
+            subset="robust_map",
         )
 
         if progress_callback:
             progress_callback(70, 100)
 
         logger.info("Sampling NDVI at grid points...")
-        ndvi_values = self._apply_circular_buffer_aggregation(
+        ndvi_values = self._aggregate_with_ring_cache(
             points_gdf,
             self.ndvi_data,
             final_params["ndvi_radius"],
             final_params["ndvi_stat"],
             final_params["ndvi_percentile"],
+            channel="ndvi",
+            fold_idx=-1,
+            subset="robust_map",
         )
 
         if progress_callback:
@@ -2908,7 +3380,7 @@ class MetricFusionEngine:
         self,
         output_dir: str = "output_results/fusion/study_results",
         include_plots: bool = True,
-        progress_callback: Optional[callable] = None,
+        progress_callback: Callable[..., Any] | None = None,
     ) -> None:
         """
         Generate comprehensive optimization results report with visualizations.
@@ -3023,17 +3495,17 @@ class MetricFusionEngine:
 
         report_lines = []
         report_lines.append("=" * 80)
-        report_lines.append(f"FUSION OPTIMIZATION RESULTS - ROBUST TRIALS (PRIMARY)")
+        report_lines.append("FUSION OPTIMIZATION RESULTS - ROBUST TRIALS (PRIMARY)")
         report_lines.append(
             f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
         report_lines.append("=" * 80)
-        report_lines.append(f"")
+        report_lines.append("")
         report_lines.append(
             "⚠ IMPORTANT: This report ONLY includes statistically significant trials"
         )
-        report_lines.append(f"  (FDR-corrected p-value < 0.05)")
-        report_lines.append(f"")
+        report_lines.append("  (FDR-corrected p-value < 0.05)")
+        report_lines.append("")
         report_lines.append(f"Original Study: {len(all_completed_trials)} trials")
         report_lines.append(
             f"Robust Trials (FILTERED): {len(robust_trials)} ({len(robust_trials)/len(all_completed_trials)*100:.1f}%)"
@@ -3041,30 +3513,30 @@ class MetricFusionEngine:
         report_lines.append(
             f"Excluded Trials: {len(all_completed_trials) - len(robust_trials)} (not statistically significant)"
         )
-        report_lines.append(f"")
+        report_lines.append("")
         report_lines.append(
-            f"This report focuses on statistically significant trials (FDR-corrected p<0.05)"
+            "This report focuses on statistically significant trials (FDR-corrected p<0.05)"
         )
-        report_lines.append(f"")
+        report_lines.append("")
         report_lines.append(f"Original Study: {len(all_completed_trials)} trials")
         report_lines.append(
             f"Robust Trials: {len(robust_trials)} ({len(robust_trials)/len(all_completed_trials)*100:.1f}%)"
         )
-        report_lines.append(f"")
+        report_lines.append("")
 
         # Best trial from robust trials
         best_robust = robust_study.best_trial
         report_lines.append(f"BEST ROBUST TRIAL (#{best_robust.number})")
-        report_lines.append(f"-" * 80)
+        report_lines.append("-" * 80)
         report_lines.append(f"Best Value: {best_robust.value:.6f}")
-        report_lines.append(f"")
-        report_lines.append(f"Parameters:")
+        report_lines.append("")
+        report_lines.append("Parameters:")
         for key, val in best_robust.params.items():
             report_lines.append(f"  {key}: {val}")
-        report_lines.append(f"")
+        report_lines.append("")
 
         # CV scores
-        report_lines.append(f"Cross-Validation Performance:")
+        report_lines.append("Cross-Validation Performance:")
         if "train_score_mean" in best_robust.user_attrs:
             report_lines.append(
                 f"  Train Score (mean): {best_robust.user_attrs['train_score_mean']:.6f}"
@@ -3083,12 +3555,12 @@ class MetricFusionEngine:
             report_lines.append(
                 f"  Val P-value (mean): {best_robust.user_attrs['val_pvalue_mean']:.6e}"
             )
-        report_lines.append(f"")
+        report_lines.append("")
 
         # Test set evaluation
         if self.test_data is not None:
-            report_lines.append(f"TEST SET EVALUATION")
-            report_lines.append(f"-" * 80)
+            report_lines.append("TEST SET EVALUATION")
+            report_lines.append("-" * 80)
             try:
                 test_results = self.evaluate_on_test(
                     params=best_robust.params, return_predictions=False
@@ -3101,11 +3573,11 @@ class MetricFusionEngine:
                 report_lines.append(f"Test Samples: {len(self.test_data)}")
             except Exception as e:
                 report_lines.append(f"Test evaluation failed: {e}")
-        report_lines.append(f"")
+        report_lines.append("")
 
         # Top 10 robust trials
-        report_lines.append(f"TOP 10 ROBUST TRIALS")
-        report_lines.append(f"-" * 80)
+        report_lines.append("TOP 10 ROBUST TRIALS")
+        report_lines.append("-" * 80)
         sorted_robust = sorted(
             robust_trials,
             key=lambda t: t.value,
@@ -3114,7 +3586,7 @@ class MetricFusionEngine:
         report_lines.append(
             f"{'Rank':<6} {'Trial':<8} {'Value':<12} {'P-val':<12} {'Veg%':<6} {'Ter%':<6} {'NDVI%':<6}"
         )
-        report_lines.append(f"-" * 80)
+        report_lines.append("-" * 80)
         for rank, trial in enumerate(sorted_robust, 1):
             veg_w = trial.params.get("veg_weight", 0)
             ter_w = trial.params.get("terrain_weight", 0)
@@ -3123,7 +3595,7 @@ class MetricFusionEngine:
             report_lines.append(
                 f"{rank:<6} #{trial.number:<7} {trial.value:<12.6f} {pval:<12.4e} {veg_w:<6} {ter_w:<6} {ndvi_w:<6}"
             )
-        report_lines.append(f"")
+        report_lines.append("")
 
         # Save robust trials report
         robust_report_path = os.path.join(robust_dir, "optimization_report.txt")
@@ -3163,13 +3635,13 @@ class MetricFusionEngine:
 
         debug_lines = []
         debug_lines.append("=" * 80)
-        debug_lines.append(f"FUSION OPTIMIZATION RESULTS - ALL TRIALS (DEBUG)")
+        debug_lines.append("FUSION OPTIMIZATION RESULTS - ALL TRIALS (DEBUG)")
         debug_lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         debug_lines.append("=" * 80)
-        debug_lines.append(f"")
-        debug_lines.append(f"This report includes ALL trials for debugging purposes.")
-        debug_lines.append(f"Use 'robust_trials' folder for primary analysis.")
-        debug_lines.append(f"")
+        debug_lines.append("")
+        debug_lines.append("This report includes ALL trials for debugging purposes.")
+        debug_lines.append("Use 'robust_trials' folder for primary analysis.")
+        debug_lines.append("")
         debug_lines.append(f"Total Trials: {len(self.study.trials)}")
         debug_lines.append(f"Completed: {len(all_completed_trials)}")
         debug_lines.append(
@@ -3178,18 +3650,18 @@ class MetricFusionEngine:
         debug_lines.append(
             f"Failed: {len([t for t in self.study.trials if t.state == optuna.trial.TrialState.FAIL])}"
         )
-        debug_lines.append(f"")
+        debug_lines.append("")
 
         best_all = self.study.best_trial
         debug_lines.append(f"BEST TRIAL (#{best_all.number})")
-        debug_lines.append(f"-" * 80)
+        debug_lines.append("-" * 80)
         debug_lines.append(f"Best Value: {best_all.value:.6f}")
         debug_lines.append(f"Parameters: {best_all.params}")
-        debug_lines.append(f"")
+        debug_lines.append("")
 
         # Top 10 all trials
-        debug_lines.append(f"TOP 10 TRIALS")
-        debug_lines.append(f"-" * 80)
+        debug_lines.append("TOP 10 TRIALS")
+        debug_lines.append("-" * 80)
         sorted_all = sorted(
             all_completed_trials,
             key=lambda t: t.value,
@@ -3198,7 +3670,7 @@ class MetricFusionEngine:
         debug_lines.append(
             f"{'Rank':<6} {'Trial':<8} {'Value':<12} {'Veg%':<6} {'Ter%':<6} {'NDVI%':<6}"
         )
-        debug_lines.append(f"-" * 80)
+        debug_lines.append("-" * 80)
         for rank, trial in enumerate(sorted_all, 1):
             veg_w = trial.params.get("veg_weight", 0)
             ter_w = trial.params.get("terrain_weight", 0)
@@ -3206,7 +3678,7 @@ class MetricFusionEngine:
             debug_lines.append(
                 f"{rank:<6} #{trial.number:<7} {trial.value:<12.6f} {veg_w:<6} {ter_w:<6} {ndvi_w:<6}"
             )
-        debug_lines.append(f"")
+        debug_lines.append("")
 
         all_report_path = os.path.join(all_trials_dir, "optimization_report.txt")
         with open(all_report_path, "w", encoding="utf-8") as f:
@@ -3235,14 +3707,14 @@ class MetricFusionEngine:
         print(
             f"Robust Trials (FDR p<0.05): {len(robust_trials)} ({len(robust_trials)/len(all_completed_trials)*100:.1f}%)"
         )
-        print(f"")
+        print("")
         print(f"BEST ROBUST TRIAL: #{best_robust.number} = {best_robust.value:.6f}")
         print(f"  Parameters: {best_robust.params}")
-        print(f"")
+        print("")
         print(f"Reports saved to: {output_dir}")
         print(f"  ✓ PRIMARY (robust trials): {robust_dir}/")
         print(f"  ✓ DEBUG (all trials):  : {best_robust.params}")
-        print(f"")
+        print("")
         print(f"Reports saved to: {output_dir}")
         print(f"  - PRIMARY: {robust_dir}/")
         print(f"  - DEBUG:   {all_trials_dir}/")
@@ -3268,7 +3740,7 @@ class MetricFusionEngine:
         if progress_callback:
             progress_callback(100, 100)
 
-        logger.info(f"✓ Results report generation complete!")
+        logger.info("✓ Results report generation complete!")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

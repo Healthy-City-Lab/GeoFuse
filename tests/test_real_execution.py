@@ -1,40 +1,30 @@
 import os
 import sys
 
+# Must come before any geofuse import when the package is not editable-installed
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 import geopandas as gpd
-import numpy as np
-import torch
 from PIL import Image
 from shapely.geometry import box
-from geofuse.gvi import search_panoramas
 
-# TODO: END_TO_END_TEST - Add complete pipeline test: GVI + NDVI + Fusion in one workflow
-# TODO: BENCHMARK_TEST - Add performance benchmarking suite for different hardware configs
-# TODO: CLI_INTEGRATION_TEST - Test MPI parallel execution with config.csv
-
-from geofuse.gvi import search_panoramas
-
-# TODO: END_TO_END_TEST - Add complete pipeline test: GVI + NDVI + Fusion in one workflow
-# TODO: BENCHMARK_TEST - Add performance benchmarking suite for different hardware configs
-# TODO: CLI_INTEGRATION_TEST - Test MPI parallel execution with config.csv
-
-from geofuse.gvi import search_panoramas
-
-# TODO: END_TO_END_TEST - Add complete pipeline test: GVI + NDVI + Fusion in one workflow
-# TODO: BENCHMARK_TEST - Add performance benchmarking suite for different hardware configs
-# TODO: CLI_INTEGRATION_TEST - Test MPI parallel execution with config.csv
-
-# Add parent path
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-import geofuse
-from geofuse.gvi import GVIEngine
+# search_panoramas is re-exported from geofuse.gvi (imported there from streetview)
+from geofuse.gvi import GVIEngine, search_panoramas
 from geofuse.ndvi import NDVIEngine
+
+# ---------------------------------------------------------------------------
+# Manual integration tests — run directly with `python tests/test_real_execution.py`
+# These require network access (Street View API, Google Earth Engine) and a GPU.
+# Not included in the automated CI suite.
+# TODO: END_TO_END_TEST   – Add complete pipeline test: GVI + NDVI + Fusion
+# TODO: BENCHMARK_TEST    – Add performance benchmarking for different hardware configs
+# TODO: CLI_TEST          – Test MPI parallel execution with config.csv
+# ---------------------------------------------------------------------------
 
 
 def test_real_gvi(model_path, output_dir):
     print("\n[TEST] Starting Real GVI Test (Visual Save Enabled)...")
 
-    # 1. Setup Engine (auto-selects best device: CUDA > MPS > CPU)
     try:
         engine = GVIEngine(model_path=model_path, download_mode="package")
         print("   [INFO] Engine initialized.")
@@ -42,7 +32,7 @@ def test_real_gvi(model_path, output_dir):
         print(f"   [FAIL] Engine init failed: {e}")
         return
 
-    # 2. Test Locations (University of Calgary)
+    # Test locations: University of Calgary campus
     test_points = [
         (51.0782, -114.1360),
         (51.0745, -114.1206),
@@ -54,7 +44,6 @@ def test_real_gvi(model_path, output_dir):
     for lat, lon in test_points:
         print(f"   [INFO] Searching for pano at: {lat}, {lon}...")
 
-        # Use the engine's current helpers: search_panoramas + _download_async_wrapper
         pano_img = None
         candidates = search_panoramas(lat=lat, lon=lon)
         if candidates:
@@ -72,12 +61,10 @@ def test_real_gvi(model_path, output_dir):
         if pano_img:
             print(f"   [PASS] Image found! Size: {pano_img.size}")
 
-            # --- SAVE ORIGINAL ---
             pano_path = os.path.join(output_dir, "test_pano_rgb.jpg")
             pano_img.save(pano_path)
             print(f"   [SAVE] Saved panorama to: {pano_path}")
 
-            # 3. Test Segmentation
             try:
                 mask = engine.segmenter.predict(pano_img)
                 print(f"   [PASS] Segmentation complete. Mask Shape: {mask.shape}")
@@ -85,7 +72,6 @@ def test_real_gvi(model_path, output_dir):
                 metrics = engine.segmenter.calculate_gvi_from_mask(mask)
                 print(f"   [PASS] Metrics: {metrics}")
 
-                # --- SAVE COLORED MASK ---
                 color_mask = engine.segmenter.decode_fn(mask)
                 mask_img = Image.fromarray(color_mask)
 
@@ -109,7 +95,6 @@ def test_demanding_ndvi(output_dir):
     try:
         engine = NDVIEngine()
 
-        # 1. Create a 1km Box around UofC
         minx, miny = -114.1337 - 0.0045, 51.0776 - 0.0045
         maxx, maxy = -114.1337 + 0.0045, 51.0776 + 0.0045
 
@@ -118,11 +103,9 @@ def test_demanding_ndvi(output_dir):
 
         print(f"   [INFO] Requesting Area: {large_bbox.area:.6f} sq deg (~1 sq km)")
 
-        # Save temp file inside the specific test output folder
         temp_file = os.path.join(output_dir, "large_area_test.geojson")
         gdf.to_file(temp_file, driver="GeoJSON")
 
-        # 2. Export with higher resolution (10m) using current API
         result = engine.download_and_process(
             geometry=gdf,
             start_date="2023-07-15",
@@ -134,11 +117,9 @@ def test_demanding_ndvi(output_dir):
 
         if result.get("status") == "success":
             out_file = result.get("tif")
-            file_size = os.path.getsize(out_file) / 1024  # KB
+            file_size = os.path.getsize(out_file) / 1024
             print(f"   [PASS] Large NDVI GeoTIFF exported ({file_size:.2f} KB)")
-            print(
-                f"   [INFO] You can open '{out_file}' in QGIS/ArcGIS to verify location."
-            )
+            print(f"   [INFO] Open '{out_file}' in QGIS/ArcGIS to verify location.")
         else:
             print(f"   [FAIL] NDVI export failed: {result}")
 
@@ -147,10 +128,7 @@ def test_demanding_ndvi(output_dir):
 
 
 if __name__ == "__main__":
-    # Path Logic
     base_dir = os.path.dirname(os.path.abspath(__file__))
-
-    # 1. Setup Output Directory
     OUTPUT_DIR = os.path.join(base_dir, "output", "test2_system")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -160,6 +138,7 @@ if __name__ == "__main__":
 
     if not os.path.exists(MODEL_PATH):
         print(f"[ERROR] Model not found at {MODEL_PATH}")
-    else:
-        test_real_gvi(MODEL_PATH, OUTPUT_DIR)
-        test_demanding_ndvi(OUTPUT_DIR)
+        sys.exit(1)
+
+    test_real_gvi(MODEL_PATH, OUTPUT_DIR)
+    test_demanding_ndvi(OUTPUT_DIR)

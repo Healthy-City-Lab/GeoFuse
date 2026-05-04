@@ -12,7 +12,6 @@ from tqdm import tqdm
 
 # Add parent path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-import geofuse
 from geofuse.gvi import GVIEngine
 
 
@@ -46,6 +45,7 @@ def stress_test_pipeline(model_path, iterations, output_dir):
 
             clean_img = engine._preprocess_image(fake_img, target_width=1920)
 
+            mask = None
             if clean_img:
                 mask = engine.segmenter.predict(clean_img)
                 _ = engine.segmenter.calculate_gvi_from_mask(mask)
@@ -82,6 +82,7 @@ def stress_test_pipeline(model_path, iterations, output_dir):
 
         if growth > 1000:
             print("[FAIL] Significant memory leak detected (>1GB).")
+            sys.exit(1)
         elif growth > 200:
             print("[WARN] Some memory growth detected (>200MB).")
         else:

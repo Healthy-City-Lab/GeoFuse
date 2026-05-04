@@ -4,20 +4,18 @@ on:
   # Manual triggering only
   workflow_dispatch:
 
+# Opt into Node.js 24 for all actions before it becomes the forced default (June 2026)
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   prepare-models:
     name: Download and Cache Models
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Cache PyTorch Hub models
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/torch/hub
-          key: torch-hub-models-v1
 
       - name: Cache model weights
         id: cache-model
@@ -30,45 +28,37 @@ jobs:
         if: steps.cache-model.outputs.cache-hit != 'true'
         run: |
           mkdir -p geofuse/model
-          
-          # Hardcoded model URL
-          MODEL_URL="https://drive.google.com/file/d/1t7TC8mxQaFECt4jutdq_NMnWxdm6B-Nb/view"
-          
           echo "Downloading model weights..."
-          
-          if [[ "$MODEL_URL" == *"drive.google.com"* ]] || [[ "$MODEL_URL" == *"docs.google.com"* ]]; then
-            echo "Detected Google Drive link - using gdown"
-            pip install gdown -q
-            gdown "$MODEL_URL" -O geofuse/model/best_model.pth --fuzzy
-          else
-            echo "Using direct download with curl"
-            curl -L "$MODEL_URL" -o geofuse/model/best_model.pth
-          fi
-          
-          echo "Verifying downloaded file..."
-          ls -lh geofuse/model/best_model.pth
-          
+          pip install gdown -q
+          gdown "1t7TC8mxQaFECt4jutdq_NMnWxdm6B-Nb" -O geofuse/model/best_model.pth
           echo "Model downloaded successfully"
-          ls -lh geofuse/model/
+          ls -lh geofuse/model/best_model.pth
 
   test-installation:
     name: Test on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     needs: prepare-models
-    
+
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
 
+    # Tell conda/mamba to store downloaded packages in the cached directory.
+    env:
+      CONDA_PKGS_DIRS: ~/conda_pkgs_dir
+
     defaults:
       run:
-        shell: bash -el {0}  # Use bash with error handling for all platforms
+        shell: bash -el {0}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # -----------------------------------------------------------------------
+      # Model weights
+      # -----------------------------------------------------------------------
       - name: Restore model weights from cache
         id: cache-model
         uses: actions/cache/restore@v4
@@ -82,85 +72,73 @@ jobs:
         run: |
           echo "Downloading model weights..."
           mkdir -p geofuse/model
-          
-          MODEL_URL="https://drive.google.com/file/d/1t7TC8mxQaFECt4jutdq_NMnWxdm6B-Nb/view"
-          
           pip install gdown -q
-          gdown "$MODEL_URL" -O geofuse/model/best_model.pth --fuzzy
-      
+          gdown "1t7TC8mxQaFECt4jutdq_NMnWxdm6B-Nb" -O geofuse/model/best_model.pth
+
       - name: Verify model exists
         shell: bash
         run: |
           python - <<'EOF'
-          import os
-          import sys
+          import os, sys
           model_path = "geofuse/model/best_model.pth"
           if os.path.exists(model_path):
-            size_mb = os.path.getsize(model_path) / (1024*1024)
+            size_mb = os.path.getsize(model_path) / (1024 * 1024)
             print(f"[OK] Model found: {size_mb:.1f} MB")
           else:
             print(f"[ERROR] Model not found at {model_path}")
             sys.exit(1)
           EOF
 
+      # -----------------------------------------------------------------------
+      # Conda package cache
+      # Content-addressed key: changes when setup_env.py changes.
+      # restore-keys allows a partial hit (different setup_env.py version)
+      # so unchanged packages are still served from cache.
+      # CONDA_PKGS_DIRS (set above) directs conda/mamba to read/write here.
+      # -----------------------------------------------------------------------
       - name: Cache conda packages
-        id: cache-conda
         uses: actions/cache@v4
         with:
           path: ~/conda_pkgs_dir
-          key: conda-pkgs-${{ runner.os }}-v1
+          key: conda-pkgs-${{ runner.os }}-${{ hashFiles('scripts/setup_env.py') }}
+          restore-keys: |
+            conda-pkgs-${{ runner.os }}-
 
-      - name: Verify conda cache
-        shell: bash
-        run: |
-          python - <<'EOF'
-          import os
-          cache_dir = os.path.expanduser("~/conda_pkgs_dir")
-          if os.path.exists(cache_dir):
-            file_count = len([f for f in os.listdir(cache_dir)]) if os.path.isdir(cache_dir) else 0
-            print(f"[OK] Conda cache: {file_count} packages")
-          else:
-            print("[INFO] Conda cache empty - will be populated during install")
-          EOF
-
-      - name: Restore PyTorch Hub models from cache
-        id: cache-torch
+      # -----------------------------------------------------------------------
+      # PyTorch Hub model cache (ResNet101 backbone, downloaded on first engine use)
+      # restore-keys allows reuse from a prior run even when key rotates.
+      # -----------------------------------------------------------------------
+      - name: Restore PyTorch Hub cache
         uses: actions/cache/restore@v4
         with:
           path: ~/.cache/torch/hub
-          key: torch-hub-models-v1
+          key: torch-hub-${{ runner.os }}-v1
+          restore-keys: |
+            torch-hub-${{ runner.os }}-
 
-      - name: Verify PyTorch Hub cache
-        shell: bash
-        run: |
-          python - <<'EOF'
-          import os
-          cache_dir = os.path.expanduser("~/.cache/torch/hub")
-          if os.path.exists(cache_dir):
-            subdirs = [d for d in os.listdir(cache_dir) if os.path.isdir(os.path.join(cache_dir, d))] if os.path.isdir(cache_dir) else []
-            print(f"[OK] PyTorch Hub cache: {len(subdirs)} models")
-          else:
-            print("[INFO] PyTorch Hub cache empty - will download ResNet101 on first use")
-          EOF
-
-      - name: Set up Conda (Miniforge)
+      # -----------------------------------------------------------------------
+      # Conda environment setup
+      # setup-miniconda with use-mamba:true already provides mamba — no
+      # separate "conda install mamba" step is needed.
+      # -----------------------------------------------------------------------
+      - name: Set up Conda (Miniforge + mamba)
         uses: conda-incubator/setup-miniconda@v3
         with:
           miniforge-version: latest
           activate-environment: base
           auto-activate: true
           use-mamba: true
-          conda-remove-defaults: true  # Suppress defaults channel warning
+          conda-remove-defaults: true
 
-      - name: Install mamba in base (for faster installs)
-        run: |
-          conda install mamba -n base -c conda-forge -y
+      - name: Configure conda to use package cache directory
+        run: conda config --add pkgs_dirs ~/conda_pkgs_dir
 
       - name: Remove existing environment (if any)
-        run: |
-          conda env remove -n geofuse -y || true
-          echo "Fresh environment will be created"
+        run: conda env remove -n geofuse -y || true
 
+      # -----------------------------------------------------------------------
+      # Install
+      # -----------------------------------------------------------------------
       - name: Make installer executable (Unix)
         if: runner.os != 'Windows'
         run: chmod +x install.sh
@@ -168,30 +146,41 @@ jobs:
       - name: Run installer (Unix)
         if: runner.os != 'Windows'
         run: ./install.sh
-        continue-on-error: false
 
       - name: Run installer (Windows)
         if: runner.os == 'Windows'
         shell: cmd /C CALL {0}
         run: install.bat
-        continue-on-error: false
 
+      # -----------------------------------------------------------------------
+      # Tests
+      # -----------------------------------------------------------------------
       - name: Run Logic Tests (Offline)
-        run: |
-          conda run -n geofuse python tests/test_pipeline.py
-        continue-on-error: false
+        run: conda run -n geofuse python tests/test_pipeline.py
 
       - name: Run Memory Stability Test (Short)
-        run: |
-          conda run -n geofuse python tests/test_memory_stability.py --iterations 20
+        run: conda run -n geofuse python tests/test_memory_stability.py --iterations 20
         continue-on-error: true
 
-      - name: Check installation log
+      # -----------------------------------------------------------------------
+      # Save PyTorch Hub cache after tests (populated during engine init)
+      # -----------------------------------------------------------------------
+      - name: Save PyTorch Hub cache
         if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/torch/hub
+          key: torch-hub-${{ runner.os }}-v1
+
+      # -----------------------------------------------------------------------
+      # Diagnostics & artefacts
+      # -----------------------------------------------------------------------
+      - name: Show installation log on failure
+        if: failure()
         run: |
           if [ -f "logs/install.log" ]; then
-            echo "=== Last 50 lines of installation log ==="
-            tail -n 50 logs/install.log
+            echo "=== Last 80 lines of installation log ==="
+            tail -n 80 logs/install.log
           else
             echo "No installation log found"
           fi
@@ -209,6 +198,4 @@ jobs:
 
       - name: Cleanup environment
         if: always()
-        run: |
-          conda env remove -n geofuse -y || true
-          echo "Environment cleaned up"
+        run: conda env remove -n geofuse -y || true

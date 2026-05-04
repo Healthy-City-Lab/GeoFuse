@@ -1,6 +1,7 @@
 import os
 import shutil
 import sys
+import tempfile
 import unittest
 import warnings
 
@@ -12,110 +13,267 @@ from unittest.mock import MagicMock, patch
 
 import geopandas as gpd
 import numpy as np
-import pandas as pd
+from PIL import Image
 from rasterio.warp import Resampling  # Needed for mocking
+from shapely.geometry import box as shapely_box
 
-import geofuse  # Must import before geopandas to load DLLs correctly
 from geofuse.gvi import GVIEngine
-from geofuse.vision import DeepLabSegmenter
+from geofuse.vision import DeepLabSegmenter, get_best_device
 
 
+# =========================================================================
+# Package Smoke Tests
+# =========================================================================
+class TestPackageSmoke(unittest.TestCase):
+    """Fast sanity checks that each installed package is functional.
+
+    These tests do not exercise GeoFuse business logic.  They confirm the
+    runtime environment is intact so that broken C-extension bindings,
+    version incompatibilities, or partial installations are caught before the
+    slower pipeline tests run.  Each test calls at least one non-trivial
+    function from the target package so that import-only survives are not
+    counted as passing.
+    """
+
+    def test_torch_device_selection(self):
+        """torch installed and device auto-selection resolves to a valid device."""
+        device = get_best_device()
+        device_str = str(device)
+        self.assertTrue(
+            device_str == "cpu" or device_str == "mps" or device_str.startswith("cuda"),
+            f"get_best_device() returned unexpected device: {device}",
+        )
+
+    def test_geopandas_crs_reproject(self):
+        """geopandas CRS reprojection works — confirms PROJ/GDAL C-bindings are intact."""
+        gdf = gpd.GeoDataFrame(
+            {"geometry": [shapely_box(-114.2, 51.0, -114.1, 51.1)]},
+            crs="EPSG:4326",
+        )
+        utm_crs = gdf.estimate_utm_crs()
+        gdf_utm = gdf.to_crs(utm_crs)
+        area_m2 = gdf_utm.geometry.area.iloc[0]
+        # ~100m x ~100m = ~10 000 m²; the actual box is ~7 x 11 km ≈ 77 km²
+        self.assertGreater(area_m2, 1e6, "Reprojected area should be > 1 sq km")
+
+    def test_rasterio_read_write(self):
+        """rasterio write + read round-trip confirms GDAL C-extensions are functional."""
+        import rasterio
+        from rasterio.transform import from_bounds
+
+        data = np.random.randint(0, 200, (1, 8, 8), dtype=np.uint8)
+        with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as f:
+            path = f.name
+        try:
+            transform = from_bounds(-114.2, 51.0, -114.1, 51.1, 8, 8)
+            with rasterio.open(
+                path,
+                "w",
+                driver="GTiff",
+                height=8,
+                width=8,
+                count=1,
+                dtype="uint8",
+                crs="EPSG:4326",
+                transform=transform,
+            ) as dst:
+                dst.write(data)
+            with rasterio.open(path) as src:
+                result = src.read(1)
+                epsg = src.crs.to_epsg()
+            np.testing.assert_array_equal(result, data[0])
+            self.assertEqual(epsg, 4326)
+        finally:
+            os.unlink(path)
+
+    def test_optuna_smoke(self):
+        """Optuna runs a minimal study — confirms the optimizer and SQLAlchemy backend work."""
+        import optuna
+
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        def objective(trial):
+            x = trial.suggest_float("x", -2.0, 2.0)
+            return (x - 1.0) ** 2
+
+        study = optuna.create_study(direction="minimize")
+        study.optimize(objective, n_trials=5)
+        # Best x should be near 1.0; accept anything ≤ 1 as "working"
+        self.assertLessEqual(study.best_value, 1.0)
+
+    def test_scipy_sklearn(self):
+        """scipy.optimize and scikit-learn produce correct results on trivial inputs."""
+        import scipy.optimize
+        from sklearn.ensemble import RandomForestClassifier
+
+        # scipy: minimize (x-1)^2 — solution must be near x=1
+        result = scipy.optimize.minimize(lambda x: (x[0] - 1.0) ** 2, [0.0])
+        self.assertAlmostEqual(result.x[0], 1.0, places=3)
+
+        # sklearn: XOR-like problem — just confirm fit/predict don't raise
+        X = np.array([[0, 0], [1, 0], [0, 1], [1, 1]], dtype=float)
+        y = np.array([0, 1, 1, 0])
+        clf = RandomForestClassifier(n_estimators=4, random_state=42)
+        clf.fit(X, y)
+        preds = clf.predict(X)
+        self.assertEqual(len(preds), 4)
+
+    def test_folium_smoke(self):
+        """folium can create a map and render to HTML — confirms leaflet bindings work."""
+        import folium
+
+        m = folium.Map(location=[51.07, -114.13], zoom_start=12)
+        folium.CircleMarker(location=[51.07, -114.13], radius=5).add_to(m)
+        html = m._repr_html_()
+        self.assertIn("leaflet", html.lower())
+
+    def test_dl_core_network_importable(self):
+        """dl_core/network can be imported and exposes the modeling dict.
+
+        vision.py adds dl_core to sys.path at import time.  This test
+        confirms that the inference backbone is intact and the segmentation
+        model factory is accessible — the minimum requirement for
+        DeepLabSegmenter to initialise.
+        """
+        import importlib
+
+        network = importlib.import_module("network")
+        self.assertTrue(
+            hasattr(network, "modeling"),
+            "dl_core.network must expose 'modeling' for DeepLab instantiation",
+        )
+        self.assertTrue(
+            hasattr(network.modeling, "deeplabv3plus_resnet101"),
+            "network.modeling must define deeplabv3plus_resnet101 (the deployed backbone)",
+        )
+
+
+# =========================================================================
+# GeoFuse Pipeline Logic Tests
+# =========================================================================
 class TestGeoFuse(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        # 1. Define specific output directory for this test
         cls.output_dir = os.path.join("tests", "output", "test1_logic")
 
-        # ROBUST CLEANUP: Try to delete, but don't crash if Windows locks it.
+        # Robust cleanup — don't crash if Windows holds a file lock
         if os.path.exists(cls.output_dir):
             try:
                 shutil.rmtree(cls.output_dir)
-            except OSError as e:
-                # This handles [WinError 5] Access is denied
+            except OSError:
                 print(
-                    f"\n[WARN] Could not delete old output folder (Windows lock?). Proceeding to overwrite files instead."
+                    "\n[WARN] Could not delete old output folder (Windows lock?). "
+                    "Proceeding to overwrite files instead."
                 )
 
         os.makedirs(cls.output_dir, exist_ok=True)
 
-        # 2. Ensure sample data exists (Force overwrite to ensure correct size)
         sample_path = "data/samples/test_area.geojson"
         os.makedirs("data/samples", exist_ok=True)
-
-        # Import the shared sample creator to ensure consistency
-        import sys
 
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
         from create_samples import create_sample_data
 
-        # Create standardized test data (~4.4km x 4.4km to avoid NDVI tiling)
         create_sample_data()
-
         print(f"[INFO] Using standardized test data at {sample_path}")
+
+        # Resolve model path once for all tests that need it
+        cls.model_path = os.path.abspath(
+            os.path.join(
+                os.path.dirname(__file__), "..", "geofuse", "model", "best_model.pth"
+            )
+        )
 
     @patch("geofuse.gvi.search_panoramas")
     def test_gvi_pipeline_logic(self, mock_search):
-        """Tests the Grid Gen -> Loop -> Raster logic without needing a real GPU."""
+        """Grid generation → processing loop → raster output — no real API calls."""
         print("\n[TEST] Testing GVI Pipeline Logic (Mocked)...")
 
-        # --- SUPPRESS PYTORCH 2.4+ WARNING ---
         warnings.filterwarnings(
             "ignore",
             category=DeprecationWarning,
             message="Python 3.14 will, by default, filter extracted tar archives",
         )
 
-        # Mock the external streetview search to return a dummy result
-        # This prevents hitting the real API or scraping
         mock_search.return_value = [{"panoid": "test_pano_id_123"}]
 
-        # Setup Mock Engine (auto-selects best device: CUDA > MPS > CPU)
         engine = GVIEngine(download_mode="package")
         engine.segmenter = MagicMock()
-
-        # Mock the Internal Async Wrapper (Critical for preventing ResourceWarnings)
-        # The engine uses `_download_async_wrapper`, NOT `_get_pano_img`
         engine._download_async_wrapper = MagicMock(
             return_value=np.zeros((300, 600, 3), dtype=np.uint8)
         )
 
         mock_mask = np.zeros((100, 100), dtype=int)
-        mock_mask[0:50, :] = 8  # Vegetation ID
+        mock_mask[0:50, :] = 8  # Vegetation class ID
         engine.segmenter.predict.return_value = mock_mask
         engine.segmenter.calculate_gvi_from_mask.return_value = {
             "GVI_Total": 0.5,
             "GVI_Terrain": 0.0,
         }
 
-        # Prepare Data
-        input_path = "data/samples/test_area.geojson"
-        gdf = gpd.read_file(input_path)
-
-        # Capture results since engine doesn't return them directly in this version
+        gdf = gpd.read_file("data/samples/test_area.geojson")
         results = []
 
         def result_callback(res):
             results.append(res)
 
-        # Run Analysis
-        # Step 500 meters for a ~4.4km area should give ~9x9 = 81 grid points
-        # Actual points may be less due to polygon clipping
-        results_gdf = engine.run_analysis(
+        # 500 m step over a ~4.4 km area should yield ~54 clipped grid points
+        engine.run_analysis(
             gdf,
-            step=500,  # 500 meters spacing
+            step=500,
             folder=self.output_dir,
             save_panos=False,
             save_masks=False,
             result_callback=result_callback,
         )
 
-        # Verify Output
-        # The engine processes points that fall within the polygon
-        # For a ~4.4km area with 500m step, expect ~60-85 points
         self.assertGreater(len(results), 50, "Should have processed at least 50 points")
         self.assertLess(len(results), 100, "Should not exceed 100 points")
         print(f"   [PASS] GVI Pipeline processed {len(results)} points")
+
+    def test_real_segmentation(self):
+        """DeepLabSegmenter runs a real forward pass — confirms model weights and torch work.
+
+        This is the only test that exercises the full stack from PIL image to
+        segmentation mask without any mocks.  It catches broken model weights,
+        incompatible torch versions, and device-selection regressions.
+        """
+        if not os.path.exists(self.model_path):
+            self.skipTest(f"Model weights not found at {self.model_path}")
+
+        print("\n[TEST] Testing Real Segmentation (No Mocks)...")
+
+        segmenter = DeepLabSegmenter(ckpt_path=self.model_path)
+
+        # 224×224 is the minimum size the ResNet101 backbone accepts
+        dummy_img = Image.fromarray(
+            np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
+        )
+        mask = segmenter.predict(dummy_img)
+
+        self.assertEqual(
+            mask.shape,
+            (224, 224),
+            f"Mask shape {mask.shape} does not match input (224, 224)",
+        )
+        self.assertTrue(
+            np.all(mask >= 0) and np.all(mask < 19),
+            f"Mask contains out-of-range Cityscapes IDs — "
+            f"min={mask.min()}, max={mask.max()} (valid range: 0–18)",
+        )
+
+        metrics = segmenter.calculate_gvi_from_mask(mask)
+        self.assertIn("GVI_Total", metrics)
+        self.assertIn("GVI_Terrain", metrics)
+        self.assertGreaterEqual(metrics["GVI_Total"], 0.0)
+        self.assertLessEqual(metrics["GVI_Total"], 1.0)
+
+        print(
+            f"   [PASS] Real segmentation: "
+            f"GVI_Total={metrics['GVI_Total']:.3f}, "
+            f"GVI_Terrain={metrics['GVI_Terrain']:.3f}"
+        )
 
     @patch("geofuse.ndvi.array_bounds", return_value=(0, 0, 10, 10))
     @patch(
@@ -134,26 +292,22 @@ class TestGeoFuse(unittest.TestCase):
         mock_cdt,
         mock_ab,
     ):
-        """Tests that the GEE wrapper constructs the correct calls."""
+        """GEE wrapper constructs the correct API calls (no real Earth Engine auth needed)."""
         print("\n[TEST] Testing NDVI Logic (Mocked GEE)...")
         from geofuse.ndvi import NDVIEngine
 
-        # Setup Mock
         mock_ee.ImageCollection.return_value.filterBounds.return_value.filterDate.return_value.filter.return_value.map.return_value.size.return_value.getInfo.return_value = (
             5
         )
 
-        # Side effect to create dummy file (needed for os.path.exists checks logic)
         def create_dummy_file(image, filename, **kwargs):
-            # Just create an empty file so os.path.exists returns True
             with open(filename, "w") as f:
                 f.write("Dummy")
 
         mock_geemap.ee_export_image.side_effect = create_dummy_file
 
-        # Setup Rasterio Mock for single-tile workflow
         mock_src = MagicMock()
-        mock_src.read.return_value = np.zeros((10, 10))  # Dummy band data
+        mock_src.read.return_value = np.zeros((10, 10))
         mock_src.transform = MagicMock()
         mock_src.meta = {
             "crs": "EPSG:3857",
@@ -167,24 +321,14 @@ class TestGeoFuse(unittest.TestCase):
         mock_src.width = 10
         mock_src.height = 10
 
-        # Configure the context manager for rasterio.open
         mock_rasterio.open.return_value.__enter__.return_value = mock_src
         mock_rasterio.open.return_value.__exit__.return_value = None
-
-        # Allow rasterio.band to be called safely on mocks
         mock_rasterio.band = MagicMock()
-
-        # Mock rasterio.warp module completely
         mock_rasterio.warp = MagicMock()
         mock_rasterio.warp.transform = MagicMock(return_value=([5.0], [5.0]))
-        mock_rasterio.warp.Resampling = Resampling  # Use the real Resampling enum
+        mock_rasterio.warp.Resampling = Resampling
 
-        # Mock rasterio.transform module for point extraction
-        # Note: transform.xy receives (transform, rows, cols) where rows/cols are 10x10 meshgrids
-        # It should return coordinate arrays matching the input shape
         def mock_xy(transform, rows, cols, offset="center"):
-            # Return coordinates matching the shape of input rows/cols
-            # For 10x10 grid, return 10x10 arrays
             if isinstance(rows, np.ndarray) and isinstance(cols, np.ndarray):
                 shape = rows.shape
                 xs = np.linspace(0, 10, shape[1] if len(shape) > 1 else len(rows))
@@ -197,15 +341,10 @@ class TestGeoFuse(unittest.TestCase):
 
         mock_rasterio.transform = MagicMock()
         mock_rasterio.transform.xy = MagicMock(side_effect=mock_xy)
-
-        # Ensure reproject doesn't raise errors (it writes to destination)
         mock_reproject.return_value = None
 
         engine = NDVIEngine()
-
-        # Run Export (area is now ~4.4km, should trigger single download)
-        input_geo = "data/samples/test_area.geojson"
-        gdf = gpd.read_file(input_geo)
+        gdf = gpd.read_file("data/samples/test_area.geojson")
 
         engine.download_and_process(
             geometry=gdf,
@@ -215,13 +354,12 @@ class TestGeoFuse(unittest.TestCase):
             folder=self.output_dir,
         )
 
-        # Verify - should be single call for area <5km
         mock_geemap.ee_export_image.assert_called_once()
-        print(f"   [PASS] NDVI Export Logic Verified")
+        print("   [PASS] NDVI Export Logic Verified")
 
 
-# TODO: NDVI_UNIT_TESTS - Add comprehensive unit tests for NDVIEngine with mocked Earth Engine API
-# TODO: FUSION_TESTS - Add test cases for FusionOptimizer when fully implemented
+# TODO: NDVI_UNIT_TESTS - Add unit tests for NDVIEngine tiling logic (>5 km areas)
+# TODO: FUSION_TESTS   - Add tests for MetricFusionEngine once optimizer API stabilises
 
 if __name__ == "__main__":
     unittest.main()
