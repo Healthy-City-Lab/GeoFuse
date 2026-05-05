@@ -24,6 +24,8 @@ if parent_dir not in sys.path:
 
 from streetview import get_streetview, search_panoramas
 
+from geofuse.vector_io import read_vector_path
+
 from geofuse.core import generate_raster_grid
 from geofuse.gvi import GVIEngine
 from geofuse.ndvi import NDVIEngine
@@ -95,11 +97,7 @@ def generate_gvi_points(config_df, resolution_m):
             continue
 
         try:
-            gdf = gpd.read_file(geo_path)
-            if gdf.crs is None:
-                gdf.set_crs("EPSG:4326", inplace=True)
-            elif gdf.crs.to_epsg() != 4326:
-                gdf = gdf.to_crs("EPSG:4326")
+            gdf = read_vector_path(geo_path)
 
             gdf_clipped, _ = generate_raster_grid(gdf, resolution_m)
 
@@ -217,9 +215,7 @@ def main():
                     print(f"[NDVI] Processing {out_name}...")
 
                     try:
-                        gdf_aoi = gpd.read_file(row["geojson"])
-                        if gdf_aoi.crs.to_epsg() != 4326:
-                            gdf_aoi = gdf_aoi.to_crs("EPSG:4326")
+                        gdf_aoi = read_vector_path(row["geojson"])
 
                         # Execute
                         res = ndvi_engine.download_and_process(
