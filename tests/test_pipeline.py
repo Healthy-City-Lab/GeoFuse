@@ -56,6 +56,43 @@ class TestPackageSmoke(unittest.TestCase):
         # ~100m x ~100m = ~10 000 m²; the actual box is ~7 x 11 km ≈ 77 km²
         self.assertGreater(area_m2, 1e6, "Reprojected area should be > 1 sq km")
 
+    def test_crs84_geojson_normalizes_to_epsg4326(self):
+        """OGC:CRS84 GeoJSON normalizes to EPSG:4326 with lon/lat as x/y."""
+        import json
+
+        from shapely.geometry import Point, mapping
+
+        from geofuse.crs_utils import reproject_geodataframe_to_wgs84
+
+        fc = {
+            "type": "FeatureCollection",
+            "crs": {
+                "type": "name",
+                "properties": {"name": "urn:ogc:def:crs:OGC:1.3:CRS84"},
+            },
+            "features": [
+                {
+                    "type": "Feature",
+                    "properties": {},
+                    "geometry": mapping(Point(-114.07, 51.04)),
+                }
+            ],
+        }
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".geojson", delete=False, encoding="utf-8"
+        ) as f:
+            json.dump(fc, f)
+            path = f.name
+        try:
+            gdf = gpd.read_file(path)
+            out = reproject_geodataframe_to_wgs84(gdf)
+            self.assertEqual(out.crs.to_epsg(), 4326)
+            p = out.geometry.iloc[0]
+            self.assertAlmostEqual(p.x, -114.07, places=3)
+            self.assertAlmostEqual(p.y, 51.04, places=3)
+        finally:
+            os.unlink(path)
+
     def test_rasterio_read_write(self):
         """rasterio write + read round-trip confirms GDAL C-extensions are functional."""
         import rasterio
