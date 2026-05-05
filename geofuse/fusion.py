@@ -9,6 +9,7 @@ import hashlib
 import logging
 import os
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import geopandas as gpd
@@ -24,6 +25,9 @@ from shapely.geometry import box
 from sklearn.metrics import mean_squared_error, mutual_info_score, r2_score
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import MinMaxScaler
+
+from .crs_utils import normalize_geographic_gdf_to_wgs84, reproject_geodataframe_to_wgs84
+from .vector_io import target_path_is_raster
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +69,7 @@ class MetricFusionEngine:
         target_file: str,
         target_feature: str | None = None,
         target_band: int = 1,
+        target_layer: str | int | None = None,
         buffer_meters: float = 1500.0,
         gvi_buffer_min_m: float | None = None,
         gvi_buffer_max_m: float | None = None,
@@ -79,9 +84,10 @@ class MetricFusionEngine:
         Initialize the fusion engine.
 
         Args:
-            target_file: Path to GeoJSON (points) or GeoTIFF (raster) target file
-            target_feature: For GeoJSON, the column name to optimize towards
+            target_file: Path to vector (GeoJSON, GPKG, Shapefile, zip) or GeoTIFF target
+            target_feature: For vector targets, the column name to optimize towards
             target_band: For GeoTIFF, the band number to optimize towards
+            target_layer: Fiona layer name or index for multi-layer files (e.g. GPKG)
             buffer_meters: Maximum buffer (m) around target for extent padding and downloads;
                 typically max(GVI max, NDVI max). If modality maxima are omitted, they default here.
             gvi_buffer_min_m / gvi_buffer_max_m / gvi_buffer_step_m: GVI (veg/terrain) radius search grid (m).
@@ -92,6 +98,7 @@ class MetricFusionEngine:
         self.target_file = target_file
         self.target_feature = target_feature
         self.target_band = target_band
+        self.target_layer = target_layer
         self.buffer_meters = float(buffer_meters)
         self.gvi_buffer_max_m = (
             float(gvi_buffer_max_m)
@@ -156,21 +163,27 @@ class MetricFusionEngine:
         self._ring_vector_cache: dict = {}
         self._max_points_ring_cache = 8000
 
-        # Determine input type
-        self.is_points = target_file.lower().endswith((".geojson", ".shp"))
-        self.is_raster = target_file.lower().endswith((".tif", ".tiff"))
+        # Vector vs raster (``is_points`` kept for backward compatibility = vector target)
+        self.is_raster = target_path_is_raster(target_file)
+        self.is_points = not self.is_raster
 
         if not (self.is_points or self.is_raster):
-            raise ValueError("Target file must be GeoJSON/Shapefile or GeoTIFF")
+            raise ValueError("Target file must be a supported vector format or GeoTIFF")
 
     def load_target(self) -> gpd.GeoDataFrame:
         """Load and prepare target data, return buffered extent."""
         logger.info(f"Loading target file: {self.target_file}")
 
         if self.is_points:
-            self.target_gdf = gpd.read_file(self.target_file)
-            if self.target_gdf.crs is None:
-                self.target_gdf.set_crs("EPSG:4326", inplace=True)
+            read_kwargs: dict = {}
+            if self.target_layer is not None and Path(self.target_file).suffix.lower() in (
+                ".gpkg",
+                ".zip",
+            ):
+                read_kwargs["layer"] = self.target_layer
+            self.target_gdf = reproject_geodataframe_to_wgs84(
+                gpd.read_file(self.target_file, **read_kwargs)
+            )
 
             # Validate feature exists
             if (
@@ -182,7 +195,7 @@ class MetricFusionEngine:
                 )
 
             # Create buffered extent for metric download (metre-accurate buffer in local UTM)
-            gdf_wgs84 = self.target_gdf.to_crs("EPSG:4326")
+            gdf_wgs84 = self.target_gdf
             utm_crs = gdf_wgs84.estimate_utm_crs()
             gdf_utm = gdf_wgs84.to_crs(utm_crs)
             bounds = gdf_utm.total_bounds
@@ -474,6 +487,7 @@ class MetricFusionEngine:
             gdf = gpd.read_file(filepath)
             if gdf.crs is None:
                 gdf.set_crs("EPSG:4326", inplace=True)
+            gdf = normalize_geographic_gdf_to_wgs84(gdf)
 
             # Detect metric column - look for common naming patterns
             metric_col = None
