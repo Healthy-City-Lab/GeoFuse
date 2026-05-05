@@ -115,6 +115,16 @@ st.markdown(
         border-right: 1px solid rgba(49, 51, 63, 0.18);
     }
 
+    /* Muted last tab (Job Monitor): de-emphasized until HPC workflow is finalized */
+    button.gf-tab-muted {
+        opacity: 0.48 !important;
+        color: #8c8c8c !important;
+    }
+    button.gf-tab-muted[aria-selected="true"] {
+        opacity: 0.72 !important;
+        color: #6d6d6d !important;
+    }
+
     /* Give the tab bar enough vertical room for the taller brand text */
     div[data-testid="stTabs"] [data-baseweb="tab-list"] {
         padding-top: 6px;
@@ -142,11 +152,25 @@ components.html(
         tabList.insertBefore(span, tabList.firstChild);
     }
 
+    function markMutedTab() {
+        var tabList = d.querySelector("[data-baseweb='tab-list']");
+        if (!tabList) return;
+        var tabs = tabList.querySelectorAll("button[role='tab']");
+        for (var i = 0; i < tabs.length; i++) {
+            tabs[i].classList.remove("gf-tab-muted");
+        }
+        if (tabs.length > 0) {
+            tabs[tabs.length - 1].classList.add("gf-tab-muted");
+        }
+    }
+
     new MutationObserver(function () {
         if (!d.querySelector("[data-baseweb='tab-list'] .gf-brand")) inject();
+        markMutedTab();
     }).observe(d.body || d.documentElement, { childList: true, subtree: true });
 
     inject();
+    markMutedTab();
 })();
 </script>
 """,
@@ -154,22 +178,22 @@ components.html(
     scrolling=False,
 )
 
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["Job Monitor", "NDVI Sourcing", "GVI Sourcing", "Fusion & Optimization"]
+tab_ndvi, tab_gvi, tab_fusion, tab_job = st.tabs(
+    ["NDVI Sourcing", "GVI Sourcing", "Fusion & Optimization", "Job Monitor"]
 )
 
 output_dir = "output_results"
 os.makedirs(output_dir, exist_ok=True)
 os.makedirs("logs", exist_ok=True)
 
-with tab1:
-    job_monitor.render(output_dir)
-
-with tab2:
+with tab_ndvi:
     ndvi.render(output_dir)
 
-with tab3:
+with tab_gvi:
     gvi.render(output_dir, parent_dir)
 
-with tab4:
+with tab_fusion:
     fusion.render(output_dir)
+
+with tab_job:
+    job_monitor.render(output_dir)

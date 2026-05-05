@@ -13,13 +13,19 @@ import matplotlib.pyplot as plt
 import numpy as np
 import rasterio
 import streamlit as st
-from helpers import apply_buffer_m, generate_raster_grid, load_clean_gdf
+from helpers import apply_buffer_m, generate_raster_grid, load_vector_upload_sessions
+from map_preview import (
+    add_study_area_layers,
+    add_uniform_point_layer,
+    trim_point_gdf_for_display,
+)
 from PIL import Image as PILImage
 from rasterio.transform import array_bounds
 from shapely.geometry import box as shapely_box
 from streamlit.runtime.scriptrunner import add_script_run_ctx
 from streamlit_folium import st_folium
 
+from geofuse.crs_utils import reproject_geodataframe_to_wgs84
 from geofuse.gvi import GVIEngine
 from geofuse.vision import get_best_device
 
@@ -31,6 +37,13 @@ def _gvi_output_tif_path(output_dir: str, base_name: str) -> str | None:
         if os.path.isfile(p):
             return p
     return None
+
+
+def _gvi_dataset_uses_raster_grid(dataset: dict, buffer_m: float) -> bool:
+    """Regular grid (GeoTIFF-capable) vs raw point features only."""
+    if dataset.get("type") == "poly":
+        return True
+    return dataset.get("type") == "point" and buffer_m > 0
 
 
 # ---------------------------------------------------------------------------
@@ -289,88 +302,263 @@ def render(output_dir: str, parent_dir: str) -> None:
         show_job_monitor_fragment()
 
     # =========================================================================
-    # ROW 1: INPUTS & SUBMISSION (Left) | INPUT PREVIEW MAP (Right)
+    # Study areas (full width) | Form: config | map (row) + actions (full width)
     # =========================================================================
-    col_top_left, col_top_right = st.columns(2)
+    st.subheader("Input Configuration")
 
-    with col_top_left:
-        st.subheader("Input Configuration")
-        mode = st.radio(
-            "Download Mode",
-            ["Package (Scraper)", "API (Street View)"],
-            horizontal=True,
-            key="gvi_download_mode",
-        )
-        api_key = (
-            st.text_input(
-                "Street View API Key",
-                type="password",
-                autocomplete="off",
-                help="Optional Google Street View key; Will fall back to built-in access if not provided.",
-                key="gvi_google_api_key",
-            )
-            if mode == "API (Street View)"
-            else None
-        )
-        gvi_res = st.slider("Grid Resolution (m)", 20, 500, 50, key="gvi_res")
-        gvi_buffer = st.slider(
-            "Download Buffer (m)",
-            min_value=0,
-            max_value=2000,
-            value=0,
-            step=50,
-            key="gvi_buffer",
-            help="Expand the study area boundary outward by this many metres before generating the sampling grid.",
-        )
-        save_debug = st.checkbox(
-            "Save Raw Images & Masks", value=False, key="gvi_save_debug"
-        )
+    uploaded_files = st.file_uploader(
+        "Upload Study Areas",
+        accept_multiple_files=True,
+        type=["geojson", "json", "gpkg", "shp", "dbf", "shx", "prj", "cpg", "zip"],
+        key="gvi_up",
+        help=(
+            "GeoJSON, GeoPackage, or a zipped archive. For Esri Shapefile, select "
+            "all components in one go (at minimum .shp, .dbf, .shx; include .prj when available)."
+        ),
+    )
 
-        uploaded_files = st.file_uploader(
-            "Upload Study Areas", accept_multiple_files=True, key="gvi_up"
-        )
+    if uploaded_files is not None:
+        loaded = load_vector_upload_sessions(uploaded_files)
+        logical_names = [name for name, _ in loaded]
+        for k in list(st.session_state.datasets.keys()):
+            ds = st.session_state.datasets[k]
+            if ds.get("type") == "restored":
+                continue
+            if k not in logical_names:
+                del st.session_state.datasets[k]
+        for fname, raw in loaded:
+            if fname not in st.session_state.datasets:
+                try:
+                    gtype = (
+                        "poly"
+                        if raw.geometry.iloc[0].geom_type
+                        in ["Polygon", "MultiPolygon"]
+                        else "point"
+                    )
+                    st.session_state.datasets[fname] = {
+                        "raw": raw,
+                        "processed": None,
+                        "accumulated": [],
+                        "results": None,
+                        "meta": None,
+                        "type": gtype,
+                    }
+                except Exception as e:
+                    st.error(f"Error loading {fname}: {e}")
 
-        if uploaded_files is not None:
-            current_names = [f.name for f in uploaded_files]
-            for k in list(st.session_state.datasets.keys()):
-                ds = st.session_state.datasets[k]
-                if ds.get("type") == "restored":
+    if uploaded_files == []:
+        for k in list(st.session_state.datasets.keys()):
+            if st.session_state.datasets[k].get("type") != "restored":
+                del st.session_state.datasets[k]
+
+    with st.form("gvi_job_form"):
+        gvi_buf_preview = int(st.session_state.get("gvi_buffer", 0))
+        fc_left, fc_right = st.columns(2)
+        with fc_left:
+            with st.container(border=True):
+                st.radio(
+                    "Download Mode",
+                    ["Package (Scraper)", "API (Street View)"],
+                    horizontal=True,
+                    key="gvi_download_mode",
+                    help=(
+                        "Grid spacing, download buffer, and debug export apply when you "
+                        "press Generate Sampling Grids or Run below. The study-area "
+                        "preview map does not update from these controls until you run "
+                        "one of those actions."
+                    ),
+                )
+                mode_sel = st.session_state.get(
+                    "gvi_download_mode", "Package (Scraper)"
+                )
+                if mode_sel == "API (Street View)":
+                    st.text_input(
+                        "Street View API Key",
+                        type="password",
+                        autocomplete="off",
+                        help="Optional Google Street View key; falls back to built-in access if empty.",
+                        key="gvi_google_api_key",
+                    )
+
+                st.slider(
+                    "Grid Resolution (m)",
+                    20,
+                    500,
+                    50,
+                    key="gvi_res",
+                    help="Spacing for sampling points in the generated grid (metres).",
+                )
+                st.slider(
+                    "Download Buffer (m)",
+                    min_value=0,
+                    max_value=2000,
+                    value=0,
+                    step=50,
+                    key="gvi_buffer",
+                    help=(
+                        "Expand the study area outward by this distance (metres) before "
+                        "building the sampling grid."
+                    ),
+                )
+                st.checkbox(
+                    "Save Raw Images & Masks",
+                    value=False,
+                    key="gvi_save_debug",
+                    help="Keep downloaded panoramas and segmentation masks under the output folder.",
+                )
+
+        with fc_right:
+            st.subheader("Study Area Preview")
+            m_input = folium.Map(location=[51.0447, -114.0719], zoom_start=11)
+
+            all_bounds = []
+            for fname, d in st.session_state.datasets.items():
+                if d.get("type") == "restored":
                     continue
-                if k not in current_names:
-                    del st.session_state.datasets[k]
-            for f in uploaded_files:
-                if f.name not in st.session_state.datasets:
-                    try:
-                        raw = load_clean_gdf(f)
-                        gtype = (
-                            "poly"
-                            if raw.geometry.iloc[0].geom_type
-                            in ["Polygon", "MultiPolygon"]
-                            else "point"
+                if d.get("raw") is not None:
+                    add_study_area_layers(
+                        m_input,
+                        d["raw"],
+                        study_name=f"{fname} (study area)",
+                        buffer_m=gvi_buf_preview,
+                        buffer_name=f"{fname} (buffer)",
+                    )
+                    all_bounds.append(d["raw"].total_bounds)
+                    if gvi_buf_preview > 0:
+                        all_bounds.append(
+                            apply_buffer_m(d["raw"], gvi_buf_preview).total_bounds
                         )
-                        st.session_state.datasets[f.name] = {
-                            "raw": raw,
-                            "processed": None,
-                            "accumulated": [],
-                            "results": None,
-                            "meta": None,
-                            "type": gtype,
-                        }
-                    except Exception as e:
-                        st.error(f"Error: {e}")
+                if d.get("processed") is not None and not d["processed"].empty:
+                    if d.get("meta") is not None:
+                        add_uniform_point_layer(
+                            m_input,
+                            d["processed"],
+                            tooltip_fields=[],
+                            tooltip_aliases=[],
+                            geojson_marker=folium.Circle(
+                                radius=3,
+                                color="#4a148c",
+                                weight=1,
+                                fill=True,
+                                fill_opacity=0.85,
+                            ),
+                            cluster_threshold=0,
+                            cluster_circle_radius=5,
+                            cluster_color="#4a148c",
+                            cluster_fill_color="#9c27b0",
+                            cluster_fill_opacity=0.82,
+                            layer_name=f"{fname} sampling grid",
+                        )
 
-        if uploaded_files == []:
-            for k in list(st.session_state.datasets.keys()):
-                if st.session_state.datasets[k].get("type") != "restored":
-                    del st.session_state.datasets[k]
+            if all_bounds:
+                min_x = min([b[0] for b in all_bounds])
+                min_y = min([b[1] for b in all_bounds])
+                max_x = max([b[2] for b in all_bounds])
+                max_y = max([b[3] for b in all_bounds])
+                m_input.fit_bounds([[min_y, min_x], [max_y, max_x]])
 
-        if st.session_state.datasets:
-            if st.button("Generate Sampling Grids", key="gvi_gen_grids"):
-                with st.spinner("Processing..."):
-                    for d in st.session_state.datasets.values():
-                        if d.get("type") == "restored":
-                            continue
-                        if d["type"] == "poly":
+            st_folium(
+                m_input, width="100%", height=500, key="map_input", returned_objects=[]
+            )
+
+        oc_gvi_a, oc_gvi_b = st.columns(2)
+        with oc_gvi_a:
+            st.checkbox(
+                "Save GeoTIFF",
+                value=True,
+                key="gvi_out_geotiff",
+                help="Raster GVI surface. At least one of GeoTIFF or GeoJSON must stay on to run.",
+            )
+        with oc_gvi_b:
+            st.checkbox(
+                "Save GeoJSON",
+                value=True,
+                key="gvi_out_geojson",
+                help="Vector sample points with attributes. At least one output format must stay on.",
+            )
+        gen = st.form_submit_button(
+            "Generate Sampling Grids",
+            use_container_width=True,
+            key="gvi_gen_sampling_grids",
+        )
+        run = st.form_submit_button(
+            "🚀 Run GVI Analysis",
+            type="primary",
+            use_container_width=True,
+            key="gvi_run_analysis",
+        )
+
+    gvi_buffer = int(st.session_state.get("gvi_buffer", 0))
+    gvi_res = int(st.session_state.get("gvi_res", 50))
+    gvi_out_ok = st.session_state.get("gvi_out_geotiff", True) or st.session_state.get(
+        "gvi_out_geojson", True
+    )
+
+    if gen:
+        if not st.session_state.datasets:
+            st.warning("Upload at least one study area first.")
+        else:
+            with st.spinner("Processing..."):
+                for d in st.session_state.datasets.values():
+                    if d.get("type") == "restored":
+                        continue
+                    if _gvi_dataset_uses_raster_grid(d, gvi_buffer):
+                        pts, meta = generate_raster_grid(
+                            apply_buffer_m(d["raw"], gvi_buffer), gvi_res
+                        )
+                        d["processed"] = pts
+                        d["meta"] = meta
+                    else:
+                        d["processed"] = d["raw"].copy()
+                        d["meta"] = None
+                    d["accumulated"] = []
+                    d["results"] = None
+                st.success("Grids generated!")
+
+    if run:
+        if not gvi_out_ok:
+            st.error("Select at least one output format.")
+        elif not st.session_state.datasets:
+            st.warning("Upload at least one study area to get started.")
+        else:
+            save_gt = st.session_state.get("gvi_out_geotiff", True)
+            save_gj = st.session_state.get("gvi_out_geojson", True)
+            save_debug = st.session_state.get("gvi_save_debug", False)
+            mode = st.session_state.get(
+                "gvi_download_mode", "Package (Scraper)"
+            )
+            api_key = None
+            if mode == "API (Street View)":
+                k = st.session_state.get("gvi_google_api_key", "")
+                api_key = k if k else None
+
+            geotiff_only_with_points = (
+                save_gt
+                and not save_gj
+                and any(
+                    d.get("type") == "point" and gvi_buffer <= 0
+                    for d in st.session_state.datasets.values()
+                    if d.get("type") != "restored"
+                )
+            )
+            if geotiff_only_with_points:
+                st.error(
+                    "GeoTIFF-only output needs a raster sampling grid. For point "
+                    "study areas, set Download Buffer (m) above zero so buffers "
+                    "define the grid extent, enable Save GeoJSON, or use polygon "
+                    "study areas."
+                )
+            else:
+                model_path = os.path.join(
+                    parent_dir, "geofuse", "model", "best_model.pth"
+                )
+                started = False
+                for fname, d in st.session_state.datasets.items():
+                    if d.get("type") == "restored":
+                        continue
+
+                    if d.get("processed") is None:
+                        if _gvi_dataset_uses_raster_grid(d, gvi_buffer):
                             pts, meta = generate_raster_grid(
                                 apply_buffer_m(d["raw"], gvi_buffer), gvi_res
                             )
@@ -381,179 +569,58 @@ def render(output_dir: str, parent_dir: str) -> None:
                             d["meta"] = None
                         d["accumulated"] = []
                         d["results"] = None
-                    st.success("Grids generated!")
 
-        st.divider()
-        oc_gvi_a, oc_gvi_b = st.columns(2)
-        with oc_gvi_a:
-            st.checkbox("Save GeoTIFF", value=True, key="gvi_out_geotiff")
-        with oc_gvi_b:
-            st.checkbox("Save GeoJSON", value=True, key="gvi_out_geojson")
-        gvi_out_ok = st.session_state.get(
-            "gvi_out_geotiff", True
-        ) or st.session_state.get("gvi_out_geojson", True)
-        if not gvi_out_ok:
-            st.caption("Select at least one output format to run analysis.")
+                    existing = [
+                        j
+                        for j, v in st.session_state.jobs.items()
+                        if v["fname"] == fname
+                        and v["status"]
+                        in ["Running", "Waiting for GPU...", "Initializing..."]
+                    ]
+                    if existing:
+                        continue
 
-        if st.button(
-            "🚀 Run GVI Analysis",
-            type="primary",
-            key="gvi_run",
-            disabled=not gvi_out_ok,
-        ):
-            if not st.session_state.datasets:
-                st.warning("Upload at least one study area to get started.")
-            else:
-                save_gt = st.session_state.get("gvi_out_geotiff", True)
-                save_gj = st.session_state.get("gvi_out_geojson", True)
-                geotiff_only_with_points = (
-                    save_gt
-                    and not save_gj
-                    and any(
-                        d.get("type") == "point"
-                        for d in st.session_state.datasets.values()
-                        if d.get("type") != "restored"
+                    job_id = str(uuid.uuid4())[:8]
+                    st.session_state.jobs[job_id] = {
+                        "fname": fname,
+                        "task": "GVI",
+                        "start_time": datetime.now().strftime("%H:%M:%S"),
+                        "progress": 0.0,
+                        "status": "Queued",
+                        "cancel": False,
+                        "handoff_complete": False,
+                    }
+
+                    init_args = {"model_path": model_path, "api_key": api_key}
+                    run_args = {
+                        "step": gvi_res,
+                        "save_panos": save_debug,
+                        "save_masks": save_debug,
+                    }
+                    d["cache_ref"] = st.session_state.master_cache
+
+                    t = threading.Thread(
+                        target=_job_worker,
+                        args=(
+                            job_id,
+                            fname,
+                            d,
+                            init_args,
+                            run_args,
+                            output_dir,
+                            st.session_state.jobs,
+                            save_gt,
+                            save_gj,
+                        ),
                     )
-                )
-                if geotiff_only_with_points:
-                    st.error(
-                        "GeoTIFF-only output needs polygon study areas that define a "
-                        "raster grid. Enable Save GeoJSON for point layers, or add "
-                        "polygon study areas."
-                    )
+                    add_script_run_ctx(t)
+                    t.start()
+                    started = True
+
+                if started:
+                    st.success("Analysis started. Monitor progress in the sidebar.")
                 else:
-                    model_path = os.path.join(
-                        parent_dir, "geofuse", "model", "best_model.pth"
-                    )
-                    started = False
-                    for fname, d in st.session_state.datasets.items():
-                        if d.get("type") == "restored":
-                            continue
-
-                        if d.get("processed") is None:
-                            if d["type"] == "poly":
-                                pts, meta = generate_raster_grid(
-                                    apply_buffer_m(d["raw"], gvi_buffer), gvi_res
-                                )
-                                d["processed"] = pts
-                                d["meta"] = meta
-                            else:
-                                d["processed"] = d["raw"].copy()
-                                d["meta"] = None
-                            d["accumulated"] = []
-                            d["results"] = None
-
-                        existing = [
-                            j
-                            for j, v in st.session_state.jobs.items()
-                            if v["fname"] == fname
-                            and v["status"]
-                            in ["Running", "Waiting for GPU...", "Initializing..."]
-                        ]
-                        if existing:
-                            continue
-
-                        job_id = str(uuid.uuid4())[:8]
-                        st.session_state.jobs[job_id] = {
-                            "fname": fname,
-                            "task": "GVI",
-                            "start_time": datetime.now().strftime("%H:%M:%S"),
-                            "progress": 0.0,
-                            "status": "Queued",
-                            "cancel": False,
-                            "handoff_complete": False,
-                        }
-
-                        init_args = {"model_path": model_path, "api_key": api_key}
-                        run_args = {
-                            "step": gvi_res,
-                            "save_panos": save_debug,
-                            "save_masks": save_debug,
-                        }
-                        d["cache_ref"] = st.session_state.master_cache
-
-                        t = threading.Thread(
-                            target=_job_worker,
-                            args=(
-                                job_id,
-                                fname,
-                                d,
-                                init_args,
-                                run_args,
-                                output_dir,
-                                st.session_state.jobs,
-                                save_gt,
-                                save_gj,
-                            ),
-                        )
-                        add_script_run_ctx(t)
-                        t.start()
-                        started = True
-
-                    if started:
-                        st.success("Analysis started. Monitor progress in the sidebar.")
-                    else:
-                        st.info("All study areas are already running or completed.")
-
-    with col_top_right:
-        st.subheader("Study Area Preview")
-        m_input = folium.Map(location=[51.0447, -114.0719], zoom_start=11)
-
-        all_bounds = []
-        for fname, d in st.session_state.datasets.items():
-            if d.get("type") == "restored":
-                continue
-            if d.get("raw") is not None:
-                folium.GeoJson(
-                    d["raw"],
-                    name=f"{fname} (study area)",
-                    style_function=lambda x: {
-                        "color": "#1a73e8",
-                        "weight": 2,
-                        "fill": False,
-                    },
-                ).add_to(m_input)
-                all_bounds.append(d["raw"].total_bounds)
-                if gvi_buffer > 0:
-                    buf_gdf = apply_buffer_m(d["raw"], gvi_buffer)
-                    folium.GeoJson(
-                        buf_gdf,
-                        name=f"{fname} (buffer)",
-                        style_function=lambda x: {
-                            "color": "#f4910c",
-                            "weight": 2,
-                            "fillOpacity": 0.07,
-                            "dashArray": "6 4",
-                        },
-                    ).add_to(m_input)
-                    all_bounds.append(buf_gdf.total_bounds)
-            if d.get("processed") is not None and not d["processed"].empty:
-                preview = d["processed"].iloc[:1000]
-                if preview.geometry.iloc[0].geom_type == "Point":
-                    for _, row in preview.iterrows():
-                        folium.CircleMarker(
-                            [row.geometry.y, row.geometry.x],
-                            radius=1,
-                            color="red",
-                            fill=True,
-                            fill_opacity=0.6,
-                        ).add_to(m_input)
-                else:
-                    folium.GeoJson(
-                        preview,
-                        style_function=lambda x: {"color": "red", "weight": 1},
-                    ).add_to(m_input)
-
-        if all_bounds:
-            min_x = min([b[0] for b in all_bounds])
-            min_y = min([b[1] for b in all_bounds])
-            max_x = max([b[2] for b in all_bounds])
-            max_y = max([b[3] for b in all_bounds])
-            m_input.fit_bounds([[min_y, min_x], [max_y, max_x]])
-
-        st_folium(
-            m_input, width="100%", height=500, key="map_input", returned_objects=[]
-        )
+                    st.info("All study areas are already running or completed.")
 
     st.divider()
 
@@ -594,10 +661,9 @@ def render(output_dir: str, parent_dir: str) -> None:
                             b = src.bounds
                             crs = src.crs
                         if has_geojson:
-                            gdf = gpd.read_file(geojson_path)
-                            if gdf.crs is None:
-                                gdf = gdf.set_crs("EPSG:4326")
-                            gdf = gdf.to_crs("EPSG:4326")
+                            gdf = reproject_geodataframe_to_wgs84(
+                                gpd.read_file(geojson_path)
+                            )
                             raw_geom = gdf.geometry.union_all().envelope
                             raw_gdf = gpd.GeoDataFrame(
                                 {"geometry": [raw_geom]}, crs="EPSG:4326"
@@ -785,28 +851,32 @@ def render(output_dir: str, parent_dir: str) -> None:
                 if show_points and ds.get("results") is not None:
                     try:
                         gdf_viz = ds["results"].copy()
-                        if len(gdf_viz) > 5000:
-                            st.warning(f"{ds_name}: Displaying a 5,000-point sample.")
-                            gdf_viz = gdf_viz.sample(5000)
+                        gdf_viz, trim_msg = trim_point_gdf_for_display(gdf_viz)
+                        if trim_msg:
+                            st.warning(f"{ds_name}: {trim_msg}")
                         if "gvi_veg" in gdf_viz.columns:
                             gdf_viz["gvi_veg"] = gdf_viz["gvi_veg"].round(4)
                         if "gvi_ter" in gdf_viz.columns:
                             gdf_viz["gvi_ter"] = gdf_viz["gvi_ter"].round(4)
 
                         valid_pts = gdf_viz.dropna(subset=["gvi_veg"])
-                        folium.GeoJson(
+                        add_uniform_point_layer(
+                            m_result,
                             valid_pts,
-                            marker=folium.Circle(
+                            tooltip_fields=["gvi_veg", "gvi_ter"],
+                            tooltip_aliases=["Veg Index:", "Ter Index:"],
+                            geojson_marker=folium.Circle(
                                 radius=20,
                                 fill_color="green",
                                 fill_opacity=0.8,
                                 color=None,
                             ),
-                            tooltip=folium.GeoJsonTooltip(
-                                fields=["gvi_veg", "gvi_ter"],
-                                aliases=["Veg Index:", "Ter Index:"],
-                            ),
-                        ).add_to(m_result)
+                            cluster_circle_radius=6,
+                            cluster_color="#1a7f37",
+                            cluster_fill_color="green",
+                            cluster_fill_opacity=0.8,
+                            layer_name=f"{ds_name} GVI sample points",
+                        )
                     except Exception as e:
                         st.error(f"Error rendering sample points: {e}")
 
