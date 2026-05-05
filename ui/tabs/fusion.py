@@ -34,7 +34,7 @@ try:
 except ImportError:
     _MetricFusionEngine = None
 
-from geofuse.crs_utils import reproject_geodataframe_to_wgs84
+from geofuse.crs_utils import buffer_gdf_union_metres, reproject_geodataframe_to_wgs84
 from geofuse.vector_io import list_gpkg_layer_names, read_vector_path, vector_format_from_path
 
 _FUSION_OUTCOME_ADD_PLACEHOLDER = "— Select column —"
@@ -240,12 +240,7 @@ def _compute_buffered_extent(
                 crs=src_crs,
             ).to_crs("EPSG:4326")
 
-        utm_crs = gdf.estimate_utm_crs()
-        gdf_utm = gdf.to_crs(utm_crs)
-        buffered_geom = gdf_utm.geometry.union_all().buffer(buffer_meters)
-        return gpd.GeoDataFrame({"geometry": [buffered_geom]}, crs=utm_crs).to_crs(
-            "EPSG:4326"
-        )
+        return buffer_gdf_union_metres(gdf, buffer_meters).to_crs("EPSG:4326")
     except Exception:
         return None
 

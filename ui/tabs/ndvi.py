@@ -1,4 +1,5 @@
 import base64
+import gc
 import glob
 import io
 import os
@@ -241,7 +242,6 @@ def render(output_dir: str) -> None:
     if "ndvi_date_configs" not in st.session_state:
         st.session_state.ndvi_date_configs = {}
 
-    # --- LAYOUT: study areas + dates (full width); form: download | map; actions row ---
     st.subheader("Input Configuration")
 
     ndvi_files = st.file_uploader(
@@ -278,11 +278,13 @@ def render(output_dir: str) -> None:
                     }
                 except Exception as e:
                     st.error(f"Failed to load {fname}: {e}")
+        gc.collect()
     if ndvi_files == []:
         for k in list(st.session_state.ndvi_datasets.keys()):
             if st.session_state.ndvi_datasets[k].get("type") != "restored":
                 del st.session_state.ndvi_datasets[k]
                 st.session_state.ndvi_date_configs.pop(k, None)
+        gc.collect()
 
     ndvi_input_datasets = {
         k: v
