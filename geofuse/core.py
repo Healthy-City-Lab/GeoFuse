@@ -6,6 +6,8 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 
+from .crs_utils import reproject_geodataframe_to_wgs84
+
 
 class JobTracker:
     """Handles logging for HPC and status updates for the Web UI."""
@@ -34,11 +36,11 @@ class JobTracker:
 
 
 def load_geometry(input_path):
-    """Loads a file (Shapefile/GeoJSON) and ensures it is a GeoDataFrame."""
+    """Load Shapefile/GeoJSON and return features in EPSG:4326 (lon/lat as x, y)."""
     gdf = gpd.read_file(input_path)
     if gdf.crs is None:
         raise ValueError("Input geometry missing CRS.")
-    return gdf
+    return reproject_geodataframe_to_wgs84(gdf)
 
 
 def generate_raster_grid(gdf_4326, spacing_meters):
