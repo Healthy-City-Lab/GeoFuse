@@ -50,7 +50,7 @@ streamlit run ui/app.py
 
 If you use GeoFuse in your research, please cite:
 
-> **Sadigh, A. G.** (2025). _GeoFuse: Multimodal Greenspace Profiling Toolbox_. Healthy City Lab, University of Calgary. [https://github.com/Healthy-City-Lab/GeoFuse](https://github.com/Healthy-City-Lab/GeoFuse)
+> **Ghayur Sadigh, A.** (2025). _GeoFuse: Multimodal Greenspace Profiling Toolbox_. Healthy City Lab, University of Calgary. [https://github.com/Healthy-City-Lab/GeoFuse](https://github.com/Healthy-City-Lab/GeoFuse)
 
 ## Credits & Acknowledgments
 
