@@ -67,7 +67,7 @@ The segmentation model runs out of VRAM during batch processing.
 
 ## Built With & References
 
-* **Street View Download:** Adapted from [streetview](https://github.com/robolyst/streetview) by `@robolyst`.
+* **Street View Download:** `geofuse/streetview.py` — a minimal custom port adapted from [streetlevel](https://github.com/sk-zk/streetlevel) (MIT). Uses Google's `SingleImageSearch` protobuf API for metadata and `streetviewpixels-pa.googleapis.com` for tiles. No external Street View package required.
 * **Semantic Segmentation:** [DeepLabV3+](https://github.com/VainF/DeepLabV3Plus-Pytorch/tree/master) via PyTorch.
 * **Training Data:** [Cityscapes Dataset](https://www.cityscapes-dataset.com/).
 * **Satellite Imagery:** [Google Earth Engine](https://earthengine.google.com/) and [geemap](https://geemap.org).

@@ -1,4 +1,5 @@
 import base64
+import gc
 import glob
 import io
 import os
@@ -14,12 +15,18 @@ import numpy as np
 import pandas as pd
 import rasterio
 import streamlit as st
-from helpers import apply_buffer_m, load_clean_gdf
+from helpers import apply_buffer_m, load_vector_upload_sessions
+from map_preview import (
+    add_study_area_layers,
+    add_uniform_point_layer,
+    trim_point_gdf_for_display,
+)
 from PIL import Image as PILImage
 from shapely.geometry import box as shapely_box
 from streamlit.runtime.scriptrunner import add_script_run_ctx
 from streamlit_folium import st_folium
 
+from geofuse.crs_utils import reproject_geodataframe_to_wgs84
 from geofuse.ndvi import NDVIEngine
 
 # ---------------------------------------------------------------------------
@@ -239,504 +246,525 @@ def render(output_dir: str) -> None:
     if "ndvi_date_configs" not in st.session_state:
         st.session_state.ndvi_date_configs = {}
 
-    # --- LAYOUT ---
-    col_ndvi_top_left, col_ndvi_top_right = st.columns(2)
-    with col_ndvi_top_left:
-        st.subheader("Input Configuration")
+    st.subheader("Input Configuration")
 
-        cloud_pct = st.slider(
-            "Maximum Cloud Coverage (%)", 0, 100, 10, key="ndvi_cloud"
-        )
-        resolution = st.number_input(
-            "Resolution (m)", value=10, min_value=10, key="ndvi_res"
-        )
-        buffer_m = st.slider(
-            "Download Buffer (m)",
-            min_value=0,
-            max_value=2000,
-            value=0,
-            step=50,
-            key="ndvi_buffer",
-            help="Expand the study area boundary outward by this many metres before downloading.",
-        )
-        ndvi_files = st.file_uploader(
-            "Upload Study Areas",
-            accept_multiple_files=True,
-            key="ndvi_up",
-        )
+    ndvi_files = st.file_uploader(
+        "Upload Study Areas",
+        accept_multiple_files=True,
+        type=["geojson", "json", "gpkg", "shp", "dbf", "shx", "prj", "cpg", "zip"],
+        key="ndvi_up",
+        help=(
+            "GeoJSON, GeoPackage, or zip. For Shapefile, select all parts together "
+            "(.shp, .dbf, .shx; add .prj when you have it)."
+        ),
+    )
 
-        # Sync uploaded files with session state
-        if ndvi_files is not None:
-            current_names = [f.name for f in ndvi_files]
-            for k in list(st.session_state.ndvi_datasets.keys()):
-                ds = st.session_state.ndvi_datasets[k]
-                if ds.get("type") == "restored":
-                    continue
-                if k not in current_names:
-                    del st.session_state.ndvi_datasets[k]
-                    st.session_state.ndvi_date_configs.pop(k, None)
-            for f in ndvi_files:
-                if f.name not in st.session_state.ndvi_datasets:
-                    try:
-                        raw = load_clean_gdf(f)
-                        st.session_state.ndvi_datasets[f.name] = {
-                            "raw": raw,
-                            "processed": None,
-                            "results": None,
-                            "meta": None,
-                            "type": "input",
-                        }
-                    except Exception as e:
-                        st.error(f"Failed to load {f.name}: {e}")
-        if ndvi_files == []:
-            for k in list(st.session_state.ndvi_datasets.keys()):
-                if st.session_state.ndvi_datasets[k].get("type") != "restored":
-                    del st.session_state.ndvi_datasets[k]
-                    st.session_state.ndvi_date_configs.pop(k, None)
-
-        ndvi_input_datasets = {
-            k: v
-            for k, v in st.session_state.ndvi_datasets.items()
-            if v.get("type") != "restored"
-        }
-
-        if ndvi_input_datasets:
-            st.markdown("**Date Configuration**")
-            for fname, d in ndvi_input_datasets.items():
-                if fname not in st.session_state.ndvi_date_configs:
-                    st.session_state.ndvi_date_configs[fname] = {
-                        "use_ranges": True,
-                        "use_specific": False,
-                        "use_column": False,
-                        "ranges": [(date(2023, 6, 1), date(2023, 9, 30))],
-                        "specific_dates": [date(2023, 7, 15)],
-                        "window_days_specific": 30,
-                        "window_days_column": 30,
+    # Sync uploaded files with session state
+    if ndvi_files is not None:
+        loaded = load_vector_upload_sessions(ndvi_files)
+        logical_names = [name for name, _ in loaded]
+        for k in list(st.session_state.ndvi_datasets.keys()):
+            ds = st.session_state.ndvi_datasets[k]
+            if ds.get("type") == "restored":
+                continue
+            if k not in logical_names:
+                del st.session_state.ndvi_datasets[k]
+                st.session_state.ndvi_date_configs.pop(k, None)
+        for fname, raw in loaded:
+            if fname not in st.session_state.ndvi_datasets:
+                try:
+                    st.session_state.ndvi_datasets[fname] = {
+                        "raw": raw,
+                        "processed": None,
+                        "results": None,
+                        "meta": None,
+                        "type": "input",
                     }
-                cfg = st.session_state.ndvi_date_configs[fname]
-                # Migrate old single-mode format
-                if "mode" in cfg and "use_ranges" not in cfg:
-                    old_mode = cfg.pop("mode")
-                    cfg["use_ranges"] = old_mode == "Date Range"
-                    cfg["use_specific"] = old_mode == "Specific Date"
-                    cfg["use_column"] = old_mode == "Use Attribute Column"
-                    cfg.setdefault("ranges", [(date(2023, 6, 1), date(2023, 9, 30))])
-                    cfg.setdefault("specific_dates", [date(2023, 7, 15)])
-                    cfg["window_days_specific"] = cfg.pop("window_days", 30)
-                    cfg.setdefault("window_days_column", 30)
+                except Exception as e:
+                    st.error(f"Failed to load {fname}: {e}")
+        gc.collect()
+    if ndvi_files == []:
+        for k in list(st.session_state.ndvi_datasets.keys()):
+            if st.session_state.ndvi_datasets[k].get("type") != "restored":
+                del st.session_state.ndvi_datasets[k]
+                st.session_state.ndvi_date_configs.pop(k, None)
+        gc.collect()
 
-                today = date.today()
+    ndvi_input_datasets = {
+        k: v
+        for k, v in st.session_state.ndvi_datasets.items()
+        if v.get("type") != "restored"
+    }
 
-                with st.expander(fname, expanded=True):
-                    chk_c1, chk_c2, chk_c3 = st.columns(3)
-                    use_ranges = chk_c1.checkbox(
-                        "Date Range(s)",
-                        value=cfg.get("use_ranges", True),
-                        key=f"ndvi_use_ranges_{fname}",
-                    )
-                    use_specific = chk_c2.checkbox(
-                        "Specific Date(s)",
-                        value=cfg.get("use_specific", False),
-                        key=f"ndvi_use_specific_{fname}",
-                    )
-                    use_column = chk_c3.checkbox(
-                        "Attribute Column",
-                        value=cfg.get("use_column", False),
-                        key=f"ndvi_use_col_{fname}",
-                    )
-                    cfg["use_ranges"] = use_ranges
-                    cfg["use_specific"] = use_specific
-                    cfg["use_column"] = use_column
+    if ndvi_input_datasets:
+        st.markdown("**Date Configuration**")
+        for fname, d in ndvi_input_datasets.items():
+            if fname not in st.session_state.ndvi_date_configs:
+                st.session_state.ndvi_date_configs[fname] = {
+                    "use_ranges": True,
+                    "use_specific": False,
+                    "use_column": False,
+                    "ranges": [(date(2023, 6, 1), date(2023, 9, 30))],
+                    "specific_dates": [date(2023, 7, 15)],
+                    "window_days_specific": 30,
+                    "window_days_column": 30,
+                }
+            cfg = st.session_state.ndvi_date_configs[fname]
+            # Migrate old single-mode format
+            if "mode" in cfg and "use_ranges" not in cfg:
+                old_mode = cfg.pop("mode")
+                cfg["use_ranges"] = old_mode == "Date Range"
+                cfg["use_specific"] = old_mode == "Specific Date"
+                cfg["use_column"] = old_mode == "Use Attribute Column"
+                cfg.setdefault("ranges", [(date(2023, 6, 1), date(2023, 9, 30))])
+                cfg.setdefault("specific_dates", [date(2023, 7, 15)])
+                cfg["window_days_specific"] = cfg.pop("window_days", 30)
+                cfg.setdefault("window_days_column", 30)
 
-                    if not any([use_ranges, use_specific, use_column]):
-                        st.warning("Select at least one date mode.")
+            today = date.today()
 
-                    # ── Date Range(s) ─────────────────────────────────────────
+            with st.expander(fname, expanded=True):
+                chk_c1, chk_c2, chk_c3 = st.columns(3)
+                use_ranges = chk_c1.checkbox(
+                    "Date Range(s)",
+                    value=cfg.get("use_ranges", True),
+                    key=f"ndvi_use_ranges_{fname}",
+                )
+                use_specific = chk_c2.checkbox(
+                    "Specific Date(s)",
+                    value=cfg.get("use_specific", False),
+                    key=f"ndvi_use_specific_{fname}",
+                )
+                use_column = chk_c3.checkbox(
+                    "Attribute Column",
+                    value=cfg.get("use_column", False),
+                    key=f"ndvi_use_col_{fname}",
+                )
+                cfg["use_ranges"] = use_ranges
+                cfg["use_specific"] = use_specific
+                cfg["use_column"] = use_column
+
+                if not any([use_ranges, use_specific, use_column]):
+                    st.warning("Select at least one date mode.")
+
+                # ── Date Range(s) ─────────────────────────────────────────
+                if use_ranges:
+                    st.markdown("**Date Range(s)**")
+                    remove_idx = None
+                    for i, (s, e) in enumerate(cfg["ranges"]):
+                        stored_s = st.session_state.get(f"ndvi_rs_{fname}_{i}", s)
+                        stored_e = st.session_state.get(f"ndvi_re_{fname}_{i}", e)
+                        range_invalid = stored_s >= stored_e
+                        s_help = (
+                            "Start date is on or after the end date."
+                            if range_invalid
+                            else None
+                        )
+                        e_help = (
+                            "End date is on or before the start date."
+                            if range_invalid
+                            else None
+                        )
+                        c1, c2, c3 = st.columns([4, 4, 1])
+                        new_s = c1.date_input(
+                            "Start",
+                            value=s,
+                            key=f"ndvi_rs_{fname}_{i}",
+                            max_value=today,
+                            label_visibility="collapsed",
+                            help=s_help,
+                        )
+                        new_e = c2.date_input(
+                            "End",
+                            value=e,
+                            key=f"ndvi_re_{fname}_{i}",
+                            max_value=today,
+                            label_visibility="collapsed",
+                            help=e_help,
+                        )
+                        cfg["ranges"][i] = (new_s, new_e)
+                        if new_s >= new_e:
+                            st.markdown(
+                                '<p style="color:#ff4b4b;font-size:0.78em;'
+                                'margin:0 0 4px 0;">'
+                                "⚠ End date must be after start date.</p>",
+                                unsafe_allow_html=True,
+                            )
+                        if len(cfg["ranges"]) > 1:
+                            if c3.button(
+                                "✕",
+                                key=f"ndvi_rrem_{fname}_{i}",
+                                help="Remove this range",
+                            ):
+                                remove_idx = i
+                    if remove_idx is not None:
+                        old_n = len(cfg["ranges"])
+                        cfg["ranges"].pop(remove_idx)
+                        for j in range(remove_idx, old_n):
+                            st.session_state.pop(f"ndvi_rs_{fname}_{j}", None)
+                            st.session_state.pop(f"ndvi_re_{fname}_{j}", None)
+                        st.rerun()
+                    if st.button(
+                        "Add Date Range",
+                        key=f"ndvi_radd_{fname}",
+                        help="Each range row produces its own NDVI output file.",
+                    ):
+                        cfg["ranges"].append((date(today.year, 1, 1), today))
+                        st.rerun()
+
+                # ── Specific Date(s) ──────────────────────────────────────
+                if use_specific:
                     if use_ranges:
-                        st.markdown("**Date Range(s)**")
-                        st.caption("One output file is produced per range.")
-                        remove_idx = None
-                        for i, (s, e) in enumerate(cfg["ranges"]):
-                            stored_s = st.session_state.get(f"ndvi_rs_{fname}_{i}", s)
-                            stored_e = st.session_state.get(f"ndvi_re_{fname}_{i}", e)
-                            range_invalid = stored_s >= stored_e
-                            s_help = (
-                                "Start date is on or after the end date."
-                                if range_invalid
-                                else None
-                            )
-                            e_help = (
-                                "End date is on or before the start date."
-                                if range_invalid
-                                else None
-                            )
-                            c1, c2, c3 = st.columns([4, 4, 1])
-                            new_s = c1.date_input(
-                                "Start",
-                                value=s,
-                                key=f"ndvi_rs_{fname}_{i}",
-                                max_value=today,
-                                label_visibility="collapsed",
-                                help=s_help,
-                            )
-                            new_e = c2.date_input(
-                                "End",
-                                value=e,
-                                key=f"ndvi_re_{fname}_{i}",
-                                max_value=today,
-                                label_visibility="collapsed",
-                                help=e_help,
-                            )
-                            cfg["ranges"][i] = (new_s, new_e)
-                            if new_s >= new_e:
-                                st.markdown(
-                                    '<p style="color:#ff4b4b;font-size:0.78em;'
-                                    'margin:0 0 4px 0;">'
-                                    "⚠ End date must be after start date.</p>",
-                                    unsafe_allow_html=True,
-                                )
-                            if len(cfg["ranges"]) > 1:
-                                if c3.button(
-                                    "✕",
-                                    key=f"ndvi_rrem_{fname}_{i}",
-                                    help="Remove this range",
-                                ):
-                                    remove_idx = i
-                        if remove_idx is not None:
-                            old_n = len(cfg["ranges"])
-                            cfg["ranges"].pop(remove_idx)
-                            for j in range(remove_idx, old_n):
-                                st.session_state.pop(f"ndvi_rs_{fname}_{j}", None)
-                                st.session_state.pop(f"ndvi_re_{fname}_{j}", None)
-                            st.rerun()
-                        if st.button("Add Date Range", key=f"ndvi_radd_{fname}"):
-                            cfg["ranges"].append((date(today.year, 1, 1), today))
-                            st.rerun()
+                        st.divider()
+                    st.markdown("**Specific Date(s)**")
+                    cfg["window_days_specific"] = st.number_input(
+                        "Composite window (± days)",
+                        min_value=7,
+                        max_value=180,
+                        value=cfg.get("window_days_specific", 30),
+                        key=f"ndvi_win_s_{fname}",
+                        help=(
+                            "Composite uses imagery within ± this many days around "
+                            "each date of interest. One output file per date row."
+                        ),
+                    )
+                    remove_idx = None
+                    for i, d_val in enumerate(cfg["specific_dates"]):
+                        c1, c2 = st.columns([9, 1])
+                        new_d = c1.date_input(
+                            "Date of interest",
+                            value=d_val,
+                            key=f"ndvi_sd_{fname}_{i}",
+                            max_value=today,
+                            label_visibility="collapsed",
+                        )
+                        cfg["specific_dates"][i] = new_d
+                        if len(cfg["specific_dates"]) > 1:
+                            if c2.button(
+                                "✕",
+                                key=f"ndvi_srem_{fname}_{i}",
+                                help="Remove this date",
+                            ):
+                                remove_idx = i
+                    if remove_idx is not None:
+                        old_n = len(cfg["specific_dates"])
+                        cfg["specific_dates"].pop(remove_idx)
+                        for j in range(remove_idx, old_n):
+                            st.session_state.pop(f"ndvi_sd_{fname}_{j}", None)
+                        st.rerun()
+                    if st.button("Add Date", key=f"ndvi_sadd_{fname}"):
+                        cfg["specific_dates"].append(today)
+                        st.rerun()
 
-                    # ── Specific Date(s) ──────────────────────────────────────
-                    if use_specific:
-                        if use_ranges:
-                            st.divider()
-                        st.markdown("**Specific Date(s)**")
-                        cfg["window_days_specific"] = st.number_input(
+                # ── Attribute Column ──────────────────────────────────────
+                if use_column:
+                    if use_ranges or use_specific:
+                        st.divider()
+                    st.markdown("**Attribute Column**")
+                    attr_cols = [c for c in d["raw"].columns if c.lower() != "geometry"]
+                    if attr_cols:
+                        col_sel = st.selectbox(
+                            "Date attribute column",
+                            attr_cols,
+                            key=f"ndvi_col_{fname}",
+                            help=(
+                                "Per-feature dates from this column; composite uses "
+                                "the window below. Produces one merged output for the layer."
+                            ),
+                        )
+                        cfg["window_days_column"] = st.number_input(
                             "Composite window (± days)",
                             min_value=7,
                             max_value=180,
-                            value=cfg.get("window_days_specific", 30),
-                            key=f"ndvi_win_s_{fname}",
+                            value=cfg.get("window_days_column", 30),
+                            key=f"ndvi_win_c_{fname}",
+                            help="± day window around each feature date for the Earth Engine composite.",
                         )
-                        st.caption(
-                            "An NDVI composite is built from imagery within ± the "
-                            "window above. One output file is produced per date."
+                    else:
+                        st.warning("No attribute columns found in this file.")
+
+    with st.form("ndvi_job_form"):
+        ndvi_buf_preview = int(st.session_state.get("ndvi_buffer", 0))
+        fc_ndvi_l, fc_ndvi_r = st.columns(2)
+        with fc_ndvi_l:
+            with st.container(border=True):
+                st.slider(
+                    "Maximum Cloud Coverage (%)",
+                    0,
+                    100,
+                    10,
+                    key="ndvi_cloud",
+                    help=(
+                        "Cloud mask threshold for Earth Engine. Together with resolution "
+                        "and buffer, these apply when you press Run below. Date controls "
+                        "above still refresh the app on change."
+                    ),
+                )
+                st.number_input(
+                    "Resolution (m)",
+                    value=10,
+                    min_value=10,
+                    key="ndvi_res",
+                    help="Target pixel size for the NDVI raster export.",
+                )
+                st.slider(
+                    "Download Buffer (m)",
+                    min_value=0,
+                    max_value=2000,
+                    value=0,
+                    step=50,
+                    key="ndvi_buffer",
+                    help="Expand the study area outward by this distance (metres) before download.",
+                )
+
+        with fc_ndvi_r:
+            st.subheader("Study Area Preview")
+            m_ndvi_input = folium.Map(location=[51.0447, -114.0719], zoom_start=10)
+            all_bounds = []
+            for fname, d in st.session_state.ndvi_datasets.items():
+                if d.get("type") == "restored":
+                    continue
+                if d.get("raw") is not None:
+                    add_study_area_layers(
+                        m_ndvi_input,
+                        d["raw"],
+                        study_name=fname,
+                        buffer_m=ndvi_buf_preview,
+                        buffer_name=f"{fname} (buffer)",
+                    )
+                    all_bounds.append(d["raw"].total_bounds)
+                    if ndvi_buf_preview > 0:
+                        all_bounds.append(
+                            apply_buffer_m(d["raw"], ndvi_buf_preview).total_bounds
                         )
-                        remove_idx = None
-                        for i, d_val in enumerate(cfg["specific_dates"]):
-                            c1, c2 = st.columns([9, 1])
-                            new_d = c1.date_input(
-                                "Date of interest",
-                                value=d_val,
-                                key=f"ndvi_sd_{fname}_{i}",
-                                max_value=today,
-                                label_visibility="collapsed",
-                            )
-                            cfg["specific_dates"][i] = new_d
-                            if len(cfg["specific_dates"]) > 1:
-                                if c2.button(
-                                    "✕",
-                                    key=f"ndvi_srem_{fname}_{i}",
-                                    help="Remove this date",
-                                ):
-                                    remove_idx = i
-                        if remove_idx is not None:
-                            old_n = len(cfg["specific_dates"])
-                            cfg["specific_dates"].pop(remove_idx)
-                            for j in range(remove_idx, old_n):
-                                st.session_state.pop(f"ndvi_sd_{fname}_{j}", None)
-                            st.rerun()
-                        if st.button("Add Date", key=f"ndvi_sadd_{fname}"):
-                            cfg["specific_dates"].append(today)
-                            st.rerun()
-
-                    # ── Attribute Column ──────────────────────────────────────
-                    if use_column:
-                        if use_ranges or use_specific:
-                            st.divider()
-                        st.markdown("**Attribute Column**")
-                        attr_cols = [
-                            c for c in d["raw"].columns if c.lower() != "geometry"
-                        ]
-                        if attr_cols:
-                            col_sel = st.selectbox(
-                                "Date attribute column",
-                                attr_cols,
-                                key=f"ndvi_col_{fname}",
-                            )
-                            cfg["window_days_column"] = st.number_input(
-                                "Composite window (± days)",
-                                min_value=7,
-                                max_value=180,
-                                value=cfg.get("window_days_column", 30),
-                                key=f"ndvi_win_c_{fname}",
-                            )
-                            st.caption(
-                                f"NDVI is sampled per entity using its date from "
-                                f"'{col_sel}'. Produces a single merged output file."
-                            )
-                        else:
-                            st.warning("No attribute columns found in this file.")
-
-        st.divider()
+            if all_bounds:
+                min_x = min([b[0] for b in all_bounds])
+                min_y = min([b[1] for b in all_bounds])
+                max_x = max([b[2] for b in all_bounds])
+                max_y = max([b[3] for b in all_bounds])
+                m_ndvi_input.fit_bounds([[min_y, min_x], [max_y, max_x]])
+            st_folium(
+                m_ndvi_input,
+                width="100%",
+                height=500,
+                key="map_ndvi_input",
+                returned_objects=[],
+            )
 
         oc_ndvi_a, oc_ndvi_b = st.columns(2)
         with oc_ndvi_a:
-            st.checkbox("Save GeoTIFF", value=True, key="ndvi_out_geotiff")
+            st.checkbox(
+                "Save GeoTIFF",
+                value=True,
+                key="ndvi_out_geotiff",
+                help="Raster NDVI. At least one of GeoTIFF or GeoJSON must stay on to run.",
+            )
         with oc_ndvi_b:
-            st.checkbox("Save GeoJSON", value=True, key="ndvi_out_geojson")
-        ndvi_out_ok = st.session_state.get(
-            "ndvi_out_geotiff", True
-        ) or st.session_state.get("ndvi_out_geojson", True)
-        if not ndvi_out_ok:
-            st.caption("Select at least one output format to run analysis.")
-
-        if st.button(
+            st.checkbox(
+                "Save GeoJSON",
+                value=True,
+                key="ndvi_out_geojson",
+                help="Vector summary per job. At least one output format must stay on.",
+            )
+        run = st.form_submit_button(
             "🚀 Run NDVI Analysis",
             type="primary",
-            key="ndvi_run",
-            disabled=not ndvi_out_ok,
-        ):
-            if not ndvi_input_datasets:
-                st.warning("Upload at least one study area to get started.")
-            else:
-                save_gt = st.session_state.get("ndvi_out_geotiff", True)
-                save_gj = st.session_state.get("ndvi_out_geojson", True)
-                if "jobs" not in st.session_state:
-                    st.session_state.jobs = {}
-                jobs_started = 0
-                validation_errors = []
-
-                for fname, d in ndvi_input_datasets.items():
-                    cfg = st.session_state.ndvi_date_configs.get(fname, {})
-                    base_name = fname.replace(".geojson", "")
-
-                    use_ranges = st.session_state.get(
-                        f"ndvi_use_ranges_{fname}", cfg.get("use_ranges", True)
-                    )
-                    use_specific = st.session_state.get(
-                        f"ndvi_use_specific_{fname}", cfg.get("use_specific", False)
-                    )
-                    use_column = st.session_state.get(
-                        f"ndvi_use_col_{fname}", cfg.get("use_column", False)
-                    )
-
-                    if not any([use_ranges, use_specific, use_column]):
-                        validation_errors.append(f"{fname}: No date mode is enabled.")
-                        continue
-
-                    # --- Date Range jobs ---
-                    if use_ranges:
-                        for i, (s_def, e_def) in enumerate(
-                            cfg.get("ranges", [(date(2023, 6, 1), date(2023, 9, 30))])
-                        ):
-                            start_d = st.session_state.get(
-                                f"ndvi_rs_{fname}_{i}", s_def
-                            )
-                            end_d = st.session_state.get(f"ndvi_re_{fname}_{i}", e_def)
-                            if start_d >= end_d:
-                                validation_errors.append(
-                                    f"{fname}: Date range {i + 1} — "
-                                    "start date must be before end date."
-                                )
-                                continue
-                            output_name = (
-                                f"{base_name}_"
-                                f"{start_d.strftime('%Y%m%d')}_"
-                                f"{end_d.strftime('%Y%m%d')}"
-                            )
-                            job_id = str(uuid.uuid4())[:8]
-                            st.session_state.jobs[job_id] = {
-                                "fname": fname,
-                                "name": f"{base_name} ({start_d} → {end_d})",
-                                "task": "NDVI",
-                                "type": "ndvi",
-                                "start_time": datetime.now().strftime("%H:%M:%S"),
-                                "progress": 0.0,
-                                "status": "Queued",
-                                "cancel": False,
-                            }
-                            t = threading.Thread(
-                                target=_ndvi_worker,
-                                args=(
-                                    job_id,
-                                    fname,
-                                    d,
-                                    start_d.isoformat(),
-                                    end_d.isoformat(),
-                                    cloud_pct,
-                                    resolution,
-                                    buffer_m,
-                                    output_name,
-                                    output_dir,
-                                    st.session_state.jobs,
-                                    save_gt,
-                                    save_gj,
-                                ),
-                            )
-                            add_script_run_ctx(t)
-                            t.start()
-                            jobs_started += 1
-
-                    # --- Specific Date jobs ---
-                    if use_specific:
-                        window_days = st.session_state.get(
-                            f"ndvi_win_s_{fname}",
-                            cfg.get("window_days_specific", 30),
-                        )
-                        for i, d_def in enumerate(
-                            cfg.get("specific_dates", [date(2023, 7, 15)])
-                        ):
-                            target_date = st.session_state.get(
-                                f"ndvi_sd_{fname}_{i}", d_def
-                            )
-                            start_d = target_date - timedelta(days=window_days)
-                            end_d = min(
-                                target_date + timedelta(days=window_days),
-                                date.today(),
-                            )
-                            output_name = (
-                                f"{base_name}_{target_date.strftime('%Y%m%d')}"
-                            )
-                            job_id = str(uuid.uuid4())[:8]
-                            st.session_state.jobs[job_id] = {
-                                "fname": fname,
-                                "name": f"{base_name} (near {target_date})",
-                                "task": "NDVI",
-                                "type": "ndvi",
-                                "start_time": datetime.now().strftime("%H:%M:%S"),
-                                "progress": 0.0,
-                                "status": "Queued",
-                                "cancel": False,
-                            }
-                            t = threading.Thread(
-                                target=_ndvi_worker,
-                                args=(
-                                    job_id,
-                                    fname,
-                                    d,
-                                    start_d.isoformat(),
-                                    end_d.isoformat(),
-                                    cloud_pct,
-                                    resolution,
-                                    buffer_m,
-                                    output_name,
-                                    output_dir,
-                                    st.session_state.jobs,
-                                    save_gt,
-                                    save_gj,
-                                ),
-                            )
-                            add_script_run_ctx(t)
-                            t.start()
-                            jobs_started += 1
-
-                    # --- Attribute Column job ---
-                    if use_column:
-                        date_col = st.session_state.get(f"ndvi_col_{fname}")
-                        window_days = st.session_state.get(
-                            f"ndvi_win_c_{fname}",
-                            cfg.get("window_days_column", 30),
-                        )
-                        if not date_col:
-                            validation_errors.append(
-                                f"{fname}: No date column selected."
-                            )
-                        else:
-                            job_id = str(uuid.uuid4())[:8]
-                            st.session_state.jobs[job_id] = {
-                                "fname": fname,
-                                "name": f"{base_name} (by column: {date_col})",
-                                "task": "NDVI",
-                                "type": "ndvi",
-                                "start_time": datetime.now().strftime("%H:%M:%S"),
-                                "progress": 0.0,
-                                "status": "Queued",
-                                "cancel": False,
-                            }
-                            t = threading.Thread(
-                                target=_ndvi_column_worker,
-                                args=(
-                                    job_id,
-                                    fname,
-                                    d,
-                                    date_col,
-                                    window_days,
-                                    cloud_pct,
-                                    resolution,
-                                    buffer_m,
-                                    output_dir,
-                                    st.session_state.jobs,
-                                    save_gt,
-                                    save_gj,
-                                ),
-                            )
-                            add_script_run_ctx(t)
-                            t.start()
-                            jobs_started += 1
-
-                for err in validation_errors:
-                    st.error(err)
-
-                if jobs_started:
-                    st.success(
-                        f"{jobs_started} job(s) started. "
-                        "Monitor progress in the Job Monitor tab."
-                    )
-                elif not validation_errors:
-                    st.info("No new jobs were submitted.")
-
-    with col_ndvi_top_right:
-        st.subheader("Study Area Preview")
-        m_ndvi_input = folium.Map(location=[51.0447, -114.0719], zoom_start=10)
-        all_bounds = []
-        for fname, d in st.session_state.ndvi_datasets.items():
-            if d.get("type") == "restored":
-                continue
-            if d.get("raw") is not None:
-                folium.GeoJson(
-                    d["raw"],
-                    name=fname,
-                    style_function=lambda x: {
-                        "color": "#1a73e8",
-                        "weight": 2,
-                        "fill": False,
-                    },
-                ).add_to(m_ndvi_input)
-                all_bounds.append(d["raw"].total_bounds)
-                if buffer_m > 0:
-                    buf_gdf = apply_buffer_m(d["raw"], buffer_m)
-                    folium.GeoJson(
-                        buf_gdf,
-                        name=f"{fname} (buffer)",
-                        style_function=lambda x: {
-                            "color": "#f4910c",
-                            "weight": 2,
-                            "fillOpacity": 0.07,
-                            "dashArray": "6 4",
-                        },
-                    ).add_to(m_ndvi_input)
-                    all_bounds.append(buf_gdf.total_bounds)
-        if all_bounds:
-            min_x = min([b[0] for b in all_bounds])
-            min_y = min([b[1] for b in all_bounds])
-            max_x = max([b[2] for b in all_bounds])
-            max_y = max([b[3] for b in all_bounds])
-            m_ndvi_input.fit_bounds([[min_y, min_x], [max_y, max_x]])
-        st_folium(
-            m_ndvi_input,
-            width="100%",
-            height=500,
-            key="map_ndvi_input",
-            returned_objects=[],
+            use_container_width=True,
+            key="ndvi_form_run_submit",
         )
+
+    cloud_pct = int(st.session_state.get("ndvi_cloud", 10))
+    resolution = int(st.session_state.get("ndvi_res", 10))
+    buffer_m = int(st.session_state.get("ndvi_buffer", 0))
+    ndvi_out_ok = st.session_state.get(
+        "ndvi_out_geotiff", True
+    ) or st.session_state.get("ndvi_out_geojson", True)
+
+    if run:
+        if not ndvi_out_ok:
+            st.error("Select at least one output format.")
+        elif not ndvi_input_datasets:
+            st.warning("Upload at least one study area to get started.")
+        else:
+            save_gt = st.session_state.get("ndvi_out_geotiff", True)
+            save_gj = st.session_state.get("ndvi_out_geojson", True)
+            if "jobs" not in st.session_state:
+                st.session_state.jobs = {}
+            jobs_started = 0
+            validation_errors = []
+
+            for fname, d in ndvi_input_datasets.items():
+                cfg = st.session_state.ndvi_date_configs.get(fname, {})
+                base_name = fname.replace(".geojson", "")
+
+                use_ranges = st.session_state.get(
+                    f"ndvi_use_ranges_{fname}", cfg.get("use_ranges", True)
+                )
+                use_specific = st.session_state.get(
+                    f"ndvi_use_specific_{fname}", cfg.get("use_specific", False)
+                )
+                use_column = st.session_state.get(
+                    f"ndvi_use_col_{fname}", cfg.get("use_column", False)
+                )
+
+                if not any([use_ranges, use_specific, use_column]):
+                    validation_errors.append(f"{fname}: No date mode is enabled.")
+                    continue
+
+                # --- Date Range jobs ---
+                if use_ranges:
+                    for i, (s_def, e_def) in enumerate(
+                        cfg.get("ranges", [(date(2023, 6, 1), date(2023, 9, 30))])
+                    ):
+                        start_d = st.session_state.get(f"ndvi_rs_{fname}_{i}", s_def)
+                        end_d = st.session_state.get(f"ndvi_re_{fname}_{i}", e_def)
+                        if start_d >= end_d:
+                            validation_errors.append(
+                                f"{fname}: Date range {i + 1} — "
+                                "start date must be before end date."
+                            )
+                            continue
+                        output_name = (
+                            f"{base_name}_"
+                            f"{start_d.strftime('%Y%m%d')}_"
+                            f"{end_d.strftime('%Y%m%d')}"
+                        )
+                        job_id = str(uuid.uuid4())[:8]
+                        st.session_state.jobs[job_id] = {
+                            "fname": fname,
+                            "name": f"{base_name} ({start_d} → {end_d})",
+                            "task": "NDVI",
+                            "type": "ndvi",
+                            "start_time": datetime.now().strftime("%H:%M:%S"),
+                            "progress": 0.0,
+                            "status": "Queued",
+                            "cancel": False,
+                        }
+                        t = threading.Thread(
+                            target=_ndvi_worker,
+                            args=(
+                                job_id,
+                                fname,
+                                d,
+                                start_d.isoformat(),
+                                end_d.isoformat(),
+                                cloud_pct,
+                                resolution,
+                                buffer_m,
+                                output_name,
+                                output_dir,
+                                st.session_state.jobs,
+                                save_gt,
+                                save_gj,
+                            ),
+                        )
+                        add_script_run_ctx(t)
+                        t.start()
+                        jobs_started += 1
+
+                # --- Specific Date jobs ---
+                if use_specific:
+                    window_days = st.session_state.get(
+                        f"ndvi_win_s_{fname}",
+                        cfg.get("window_days_specific", 30),
+                    )
+                    for i, d_def in enumerate(
+                        cfg.get("specific_dates", [date(2023, 7, 15)])
+                    ):
+                        target_date = st.session_state.get(
+                            f"ndvi_sd_{fname}_{i}", d_def
+                        )
+                        start_d = target_date - timedelta(days=window_days)
+                        end_d = min(
+                            target_date + timedelta(days=window_days),
+                            date.today(),
+                        )
+                        output_name = f"{base_name}_{target_date.strftime('%Y%m%d')}"
+                        job_id = str(uuid.uuid4())[:8]
+                        st.session_state.jobs[job_id] = {
+                            "fname": fname,
+                            "name": f"{base_name} (near {target_date})",
+                            "task": "NDVI",
+                            "type": "ndvi",
+                            "start_time": datetime.now().strftime("%H:%M:%S"),
+                            "progress": 0.0,
+                            "status": "Queued",
+                            "cancel": False,
+                        }
+                        t = threading.Thread(
+                            target=_ndvi_worker,
+                            args=(
+                                job_id,
+                                fname,
+                                d,
+                                start_d.isoformat(),
+                                end_d.isoformat(),
+                                cloud_pct,
+                                resolution,
+                                buffer_m,
+                                output_name,
+                                output_dir,
+                                st.session_state.jobs,
+                                save_gt,
+                                save_gj,
+                            ),
+                        )
+                        add_script_run_ctx(t)
+                        t.start()
+                        jobs_started += 1
+
+                # --- Attribute Column job ---
+                if use_column:
+                    date_col = st.session_state.get(f"ndvi_col_{fname}")
+                    window_days = st.session_state.get(
+                        f"ndvi_win_c_{fname}",
+                        cfg.get("window_days_column", 30),
+                    )
+                    if not date_col:
+                        validation_errors.append(f"{fname}: No date column selected.")
+                    else:
+                        job_id = str(uuid.uuid4())[:8]
+                        st.session_state.jobs[job_id] = {
+                            "fname": fname,
+                            "name": f"{base_name} (by column: {date_col})",
+                            "task": "NDVI",
+                            "type": "ndvi",
+                            "start_time": datetime.now().strftime("%H:%M:%S"),
+                            "progress": 0.0,
+                            "status": "Queued",
+                            "cancel": False,
+                        }
+                        t = threading.Thread(
+                            target=_ndvi_column_worker,
+                            args=(
+                                job_id,
+                                fname,
+                                d,
+                                date_col,
+                                window_days,
+                                cloud_pct,
+                                resolution,
+                                buffer_m,
+                                output_dir,
+                                st.session_state.jobs,
+                                save_gt,
+                                save_gj,
+                            ),
+                        )
+                        add_script_run_ctx(t)
+                        t.start()
+                        jobs_started += 1
+
+            for err in validation_errors:
+                st.error(err)
+
+            if jobs_started:
+                st.success(
+                    f"{jobs_started} job(s) started. "
+                    "Monitor progress in the Job Monitor tab."
+                )
+            elif not validation_errors:
+                st.info("No new jobs were submitted.")
 
     st.divider()
 
@@ -773,11 +801,10 @@ def render(output_dir: str) -> None:
                             crs = src.crs
                         results_gdf = None
                         if has_geojson:
-                            results_gdf = gpd.read_file(geojson_path)
-                            if results_gdf.crs is None:
-                                results_gdf = results_gdf.set_crs("EPSG:4326")
-                            g4326 = results_gdf.to_crs("EPSG:4326")
-                            raw_geom = g4326.geometry.union_all().envelope
+                            results_gdf = reproject_geodataframe_to_wgs84(
+                                gpd.read_file(geojson_path)
+                            )
+                            raw_geom = results_gdf.geometry.union_all().envelope
                             raw_gdf = gpd.GeoDataFrame(
                                 {"geometry": [raw_geom]}, crs="EPSG:4326"
                             )
@@ -922,10 +949,9 @@ def render(output_dir: str) -> None:
 
                 if show_points and ds.get("results") is not None:
                     try:
-                        gdf_pts = ds["results"]
-                        if len(gdf_pts) > 5000:
-                            st.warning(f"{ds_name}: Displaying a 5,000-point sample.")
-                            gdf_pts = gdf_pts.sample(5000)
+                        gdf_pts, trim_msg = trim_point_gdf_for_display(ds["results"])
+                        if trim_msg:
+                            st.warning(f"{ds_name}: {trim_msg}")
                         tooltip_fields = (
                             ["NDVI", "ndvi_date"]
                             if "ndvi_date" in gdf_pts.columns
@@ -936,19 +962,23 @@ def render(output_dir: str) -> None:
                             if "ndvi_date" in gdf_pts.columns
                             else ["NDVI:"]
                         )
-                        folium.GeoJson(
+                        add_uniform_point_layer(
+                            m_ndvi_result,
                             gdf_pts,
-                            marker=folium.Circle(
+                            tooltip_fields=tooltip_fields,
+                            tooltip_aliases=tooltip_aliases,
+                            geojson_marker=folium.Circle(
                                 radius=1,
                                 color="blue",
                                 fill=True,
                                 fill_opacity=1,
                             ),
-                            tooltip=folium.GeoJsonTooltip(
-                                fields=tooltip_fields,
-                                aliases=tooltip_aliases,
-                            ),
-                        ).add_to(m_ndvi_result)
+                            cluster_circle_radius=4,
+                            cluster_color="blue",
+                            cluster_fill_color="blue",
+                            cluster_fill_opacity=1.0,
+                            layer_name="NDVI sample points",
+                        )
                     except Exception as e:
                         st.error(f"Error rendering sample points: {e}")
 

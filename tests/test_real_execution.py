@@ -8,8 +8,8 @@ import geopandas as gpd
 from PIL import Image
 from shapely.geometry import box
 
-# search_panoramas is re-exported from geofuse.gvi (imported there from streetview)
-from geofuse.gvi import GVIEngine, search_panoramas
+from geofuse import streetview as gsv
+from geofuse.gvi import GVIEngine
 from geofuse.ndvi import NDVIEngine
 
 # ---------------------------------------------------------------------------
@@ -45,18 +45,12 @@ def test_real_gvi(model_path, output_dir):
         print(f"   [INFO] Searching for pano at: {lat}, {lon}...")
 
         pano_img = None
-        candidates = search_panoramas(lat=lat, lon=lon)
-        if candidates:
-            for meta in candidates:
-                pid = engine._extract_panoid(meta)
-                if not pid:
-                    continue
-                try:
-                    pano_img = engine._download_async_wrapper(pid)
-                    if pano_img is not None:
-                        break
-                except Exception as e:
-                    print(f"   [WARN] Failed to download pano {pid}: {e}")
+        pano = gsv.find_panorama(lat, lon, radius=50)
+        if pano is not None:
+            try:
+                pano_img = gsv.get_panorama(pano, zoom=1)
+            except Exception as e:
+                print(f"   [WARN] Failed to download pano {pano.id}: {e}")
 
         if pano_img:
             print(f"   [PASS] Image found! Size: {pano_img.size}")

@@ -31,7 +31,7 @@ jobs:
 
       - name: Install linting tools
         run: |
-          pip install black ruff isort
+          pip install black==25.1.0 ruff==0.15.12 isort
 
       - name: Check code formatting with Black
         run: |

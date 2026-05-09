@@ -9,7 +9,7 @@ import warnings
 # CRITICAL IMPORT ORDER FIX FOR WINDOWS
 # -------------------------------------------------------------------------
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import geopandas as gpd
 import numpy as np
@@ -55,6 +55,43 @@ class TestPackageSmoke(unittest.TestCase):
         area_m2 = gdf_utm.geometry.area.iloc[0]
         # ~100m x ~100m = ~10 000 m²; the actual box is ~7 x 11 km ≈ 77 km²
         self.assertGreater(area_m2, 1e6, "Reprojected area should be > 1 sq km")
+
+    def test_crs84_geojson_normalizes_to_epsg4326(self):
+        """OGC:CRS84 GeoJSON normalizes to EPSG:4326 with lon/lat as x/y."""
+        import json
+
+        from shapely.geometry import Point, mapping
+
+        from geofuse.crs_utils import reproject_geodataframe_to_wgs84
+
+        fc = {
+            "type": "FeatureCollection",
+            "crs": {
+                "type": "name",
+                "properties": {"name": "urn:ogc:def:crs:OGC:1.3:CRS84"},
+            },
+            "features": [
+                {
+                    "type": "Feature",
+                    "properties": {},
+                    "geometry": mapping(Point(-114.07, 51.04)),
+                }
+            ],
+        }
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".geojson", delete=False, encoding="utf-8"
+        ) as f:
+            json.dump(fc, f)
+            path = f.name
+        try:
+            gdf = gpd.read_file(path)
+            out = reproject_geodataframe_to_wgs84(gdf)
+            self.assertEqual(out.crs.to_epsg(), 4326)
+            p = out.geometry.iloc[0]
+            self.assertAlmostEqual(p.x, -114.07, places=3)
+            self.assertAlmostEqual(p.y, 51.04, places=3)
+        finally:
+            os.unlink(path)
 
     def test_rasterio_read_write(self):
         """rasterio write + read round-trip confirms GDAL C-extensions are functional."""
@@ -185,9 +222,10 @@ class TestGeoFuse(unittest.TestCase):
             )
         )
 
-    @patch("geofuse.gvi.search_panoramas")
-    def test_gvi_pipeline_logic(self, mock_search):
-        """Grid generation → processing loop → raster output — no real API calls."""
+    @patch("geofuse.streetview.get_panorama_async", new_callable=AsyncMock)
+    @patch("geofuse.streetview.find_panorama_async", new_callable=AsyncMock)
+    def test_gvi_pipeline_logic(self, mock_find, mock_get_pano):
+        """Grid generation → processing loop → result callbacks — no real API calls."""
         print("\n[TEST] Testing GVI Pipeline Logic (Mocked)...")
 
         warnings.filterwarnings(
@@ -196,13 +234,15 @@ class TestGeoFuse(unittest.TestCase):
             message="Python 3.14 will, by default, filter extracted tar archives",
         )
 
-        mock_search.return_value = [{"panoid": "test_pano_id_123"}]
+        mock_pano = MagicMock()
+        mock_pano.id = "test_pano_id_123"
+        mock_find.return_value = mock_pano
+        mock_get_pano.return_value = Image.fromarray(
+            np.zeros((300, 600, 3), dtype=np.uint8)
+        )
 
         engine = GVIEngine(download_mode="package")
         engine.segmenter = MagicMock()
-        engine._download_async_wrapper = MagicMock(
-            return_value=np.zeros((300, 600, 3), dtype=np.uint8)
-        )
 
         mock_mask = np.zeros((100, 100), dtype=int)
         mock_mask[0:50, :] = 8  # Vegetation class ID
@@ -215,9 +255,6 @@ class TestGeoFuse(unittest.TestCase):
         gdf = gpd.read_file("data/samples/test_area.geojson")
         results = []
 
-        def result_callback(res):
-            results.append(res)
-
         # 500 m step over a ~4.4 km area should yield ~54 clipped grid points
         engine.run_analysis(
             gdf,
@@ -225,7 +262,7 @@ class TestGeoFuse(unittest.TestCase):
             folder=self.output_dir,
             save_panos=False,
             save_masks=False,
-            result_callback=result_callback,
+            result_callback=results.append,
         )
 
         self.assertGreater(len(results), 50, "Should have processed at least 50 points")
