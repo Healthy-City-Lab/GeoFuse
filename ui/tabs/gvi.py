@@ -51,9 +51,7 @@ def _gvi_upload_signature(uploaded_files) -> tuple[tuple[str, int], ...] | None:
     """Stable fingerprint for the file uploader selection (None = widget not committed)."""
     if uploaded_files is None:
         return None
-    return tuple(
-        (str(f.name), int(getattr(f, "size", 0) or 0)) for f in uploaded_files
-    )
+    return tuple((str(f.name), int(getattr(f, "size", 0) or 0)) for f in uploaded_files)
 
 
 def _gvi_discard_heavy_dataset_fields() -> None:
@@ -122,6 +120,8 @@ def _job_worker(
     save_geojson: bool,
 ):
     gpu_lock = _get_gpu_lock()
+    job_update_lock = threading.Lock()
+    results_lock = threading.Lock()
     try:
         job_tracker_dict[job_id]["status"] = "Waiting for GPU..."
         with gpu_lock:
@@ -132,93 +132,95 @@ def _job_worker(
             job_tracker_dict[job_id]["status"] = "Initializing..."
             engine = _get_gvi_engine(init_args["model_path"], init_args.get("api_key"))
 
-            current_accumulated = dataset_data["accumulated"]
-            start_idx = len(current_accumulated)
+        current_accumulated = dataset_data["accumulated"]
+        start_idx = len(current_accumulated)
 
-            def on_progress(curr, total):
+        def on_progress(curr, total):
+            with job_update_lock:
                 job_tracker_dict[job_id]["progress"] = min(curr / total, 1.0)
                 job_tracker_dict[job_id]["status"] = f"Processing ({curr}/{total})"
 
-            def on_result(res):
+        def on_result(res):
+            with results_lock:
                 dataset_data["accumulated"].append(res)
 
-            def check_cancel():
-                return job_tracker_dict[job_id]["cancel"]
+        def check_cancel():
+            return job_tracker_dict[job_id]["cancel"]
 
-            job_tracker_dict[job_id]["status"] = "Running"
+        job_tracker_dict[job_id]["status"] = "Running"
 
-            engine.run_analysis(
-                dataset_data["processed"],
-                step=run_args["step"],
-                folder=output_dir,
-                save_panos=run_args["save_panos"],
-                save_masks=run_args["save_masks"],
-                external_cache=dataset_data["cache_ref"],
-                progress_callback=on_progress,
-                result_callback=on_result,
-                cancel_callback=check_cancel,
-                start_index=start_idx,
+        engine.run_analysis(
+            dataset_data["processed"],
+            step=run_args["step"],
+            folder=output_dir,
+            save_panos=run_args["save_panos"],
+            save_masks=run_args["save_masks"],
+            external_cache=dataset_data["cache_ref"],
+            progress_callback=on_progress,
+            result_callback=on_result,
+            cancel_callback=check_cancel,
+            start_index=start_idx,
+        )
+
+        if job_tracker_dict[job_id]["cancel"]:
+            job_tracker_dict[job_id]["status"] = "Cancelled"
+        else:
+            job_tracker_dict[job_id]["status"] = "Completed"
+            job_tracker_dict[job_id]["progress"] = 1.0
+
+            res_df = gpd.GeoDataFrame(
+                dataset_data["accumulated"], crs=dataset_data["processed"].crs
             )
+            if "orig_index" in res_df.columns:
+                res_df.set_index("orig_index", inplace=True)
+                res_df.index.name = None
+            dataset_data["results"] = res_df
 
-            if job_tracker_dict[job_id]["cancel"]:
-                job_tracker_dict[job_id]["status"] = "Cancelled"
-            else:
-                job_tracker_dict[job_id]["status"] = "Completed"
-                job_tracker_dict[job_id]["progress"] = 1.0
-
-                res_df = gpd.GeoDataFrame(
-                    dataset_data["accumulated"], crs=dataset_data["processed"].crs
+            out_name = os.path.splitext(fname)[0]
+            if save_geojson:
+                res_df.to_file(
+                    os.path.join(output_dir, f"{out_name}_gvi.geojson"),
+                    driver="GeoJSON",
                 )
-                if "orig_index" in res_df.columns:
-                    res_df.set_index("orig_index", inplace=True)
-                    res_df.index.name = None
-                dataset_data["results"] = res_df
 
-                out_name = os.path.splitext(fname)[0]
-                if save_geojson:
-                    res_df.to_file(
-                        os.path.join(output_dir, f"{out_name}_gvi.geojson"),
-                        driver="GeoJSON",
-                    )
+            if dataset_data["meta"] and save_geotiff:
+                from rasterio.transform import rowcol
 
-                if dataset_data["meta"] and save_geotiff:
-                    from rasterio.transform import rowcol
-
-                    meta = dataset_data["meta"]
-                    arr_veg = np.full(
-                        (meta["height"], meta["width"]), np.nan, dtype=np.float32
+                meta = dataset_data["meta"]
+                arr_veg = np.full(
+                    (meta["height"], meta["width"]), np.nan, dtype=np.float32
+                )
+                arr_ter = np.full(
+                    (meta["height"], meta["width"]), np.nan, dtype=np.float32
+                )
+                valid = res_df.dropna(subset=["gvi_veg"])
+                if not valid.empty:
+                    rows, cols = rowcol(
+                        meta["transform"],
+                        valid.geometry.x.values,
+                        valid.geometry.y.values,
                     )
-                    arr_ter = np.full(
-                        (meta["height"], meta["width"]), np.nan, dtype=np.float32
-                    )
-                    valid = res_df.dropna(subset=["gvi_veg"])
-                    if not valid.empty:
-                        rows, cols = rowcol(
-                            meta["transform"],
-                            valid.geometry.x.values,
-                            valid.geometry.y.values,
-                        )
-                        rows = np.clip(rows, 0, meta["height"] - 1)
-                        cols = np.clip(cols, 0, meta["width"] - 1)
-                        arr_veg[rows, cols] = valid["gvi_veg"].values
-                        arr_ter[rows, cols] = valid["gvi_ter"].values
-                    tif_path = os.path.join(output_dir, f"{out_name}_gvi.tif")
-                    with rasterio.open(
-                        tif_path,
-                        "w",
-                        driver="GTiff",
-                        height=meta["height"],
-                        width=meta["width"],
-                        count=2,
-                        dtype=np.float32,
-                        crs=meta["crs"],
-                        transform=meta["transform"],
-                        nodata=np.nan,
-                    ) as dst:
-                        dst.write(arr_veg, 1)
-                        dst.set_band_description(1, "Veg")
-                        dst.write(arr_ter, 2)
-                        dst.set_band_description(2, "Ter")
+                    rows = np.clip(rows, 0, meta["height"] - 1)
+                    cols = np.clip(cols, 0, meta["width"] - 1)
+                    arr_veg[rows, cols] = valid["gvi_veg"].values
+                    arr_ter[rows, cols] = valid["gvi_ter"].values
+                tif_path = os.path.join(output_dir, f"{out_name}_gvi.tif")
+                with rasterio.open(
+                    tif_path,
+                    "w",
+                    driver="GTiff",
+                    height=meta["height"],
+                    width=meta["width"],
+                    count=2,
+                    dtype=np.float32,
+                    crs=meta["crs"],
+                    transform=meta["transform"],
+                    nodata=np.nan,
+                ) as dst:
+                    dst.write(arr_veg, 1)
+                    dst.set_band_description(1, "Veg")
+                    dst.write(arr_ter, 2)
+                    dst.set_band_description(2, "Ter")
 
     except Exception as e:
         job_tracker_dict[job_id]["status"] = f"Error: {str(e)}"
@@ -336,6 +338,10 @@ def render(output_dir: str, parent_dir: str) -> None:
                             "Waiting for GPU...",
                             "Running",
                         ]
+                        or (
+                            isinstance(job["status"], str)
+                            and job["status"].startswith("Running ·")
+                        )
                         or "Processing" in job["status"]
                         or "Optimizing" in job["status"]
                         or "Downloading" in job["status"]
@@ -393,8 +399,7 @@ def render(output_dir: str, parent_dir: str) -> None:
                 try:
                     gtype = (
                         "poly"
-                        if raw.geometry.iloc[0].geom_type
-                        in ["Polygon", "MultiPolygon"]
+                        if raw.geometry.iloc[0].geom_type in ["Polygon", "MultiPolygon"]
                         else "point"
                     )
                     st.session_state.datasets[fname] = {
@@ -592,9 +597,7 @@ def render(output_dir: str, parent_dir: str) -> None:
                         for d in st.session_state.datasets.values():
                             if d.get("type") == "restored":
                                 continue
-                            if _gvi_dataset_uses_raster_grid(
-                                d, gvi_buffer_for_gen
-                            ):
+                            if _gvi_dataset_uses_raster_grid(d, gvi_buffer_for_gen):
                                 pts, meta = generate_raster_grid(
                                     apply_buffer_m(d["raw"], gvi_buffer_for_gen),
                                     gvi_res_for_gen,
@@ -640,9 +643,7 @@ def render(output_dir: str, parent_dir: str) -> None:
             save_gt = st.session_state.get("gvi_out_geotiff", True)
             save_gj = st.session_state.get("gvi_out_geojson", True)
             save_debug = st.session_state.get("gvi_save_debug", False)
-            mode = st.session_state.get(
-                "gvi_download_mode", "Package (Scraper)"
-            )
+            mode = st.session_state.get("gvi_download_mode", "Package (Scraper)")
             api_key = None
             if mode == "API (Street View)":
                 k = st.session_state.get("gvi_google_api_key", "")

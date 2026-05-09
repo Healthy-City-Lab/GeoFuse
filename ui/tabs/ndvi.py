@@ -16,7 +16,11 @@ import pandas as pd
 import rasterio
 import streamlit as st
 from helpers import apply_buffer_m, load_vector_upload_sessions
-from map_preview import add_study_area_layers, add_uniform_point_layer, trim_point_gdf_for_display
+from map_preview import (
+    add_study_area_layers,
+    add_uniform_point_layer,
+    trim_point_gdf_for_display,
+)
 from PIL import Image as PILImage
 from shapely.geometry import box as shapely_box
 from streamlit.runtime.scriptrunner import add_script_run_ctx
@@ -457,9 +461,7 @@ def render(output_dir: str) -> None:
                     if use_ranges or use_specific:
                         st.divider()
                     st.markdown("**Attribute Column**")
-                    attr_cols = [
-                        c for c in d["raw"].columns if c.lower() != "geometry"
-                    ]
+                    attr_cols = [c for c in d["raw"].columns if c.lower() != "geometry"]
                     if attr_cols:
                         col_sel = st.selectbox(
                             "Date attribute column",
@@ -614,9 +616,7 @@ def render(output_dir: str) -> None:
                     for i, (s_def, e_def) in enumerate(
                         cfg.get("ranges", [(date(2023, 6, 1), date(2023, 9, 30))])
                     ):
-                        start_d = st.session_state.get(
-                            f"ndvi_rs_{fname}_{i}", s_def
-                        )
+                        start_d = st.session_state.get(f"ndvi_rs_{fname}_{i}", s_def)
                         end_d = st.session_state.get(f"ndvi_re_{fname}_{i}", e_def)
                         if start_d >= end_d:
                             validation_errors.append(
@@ -679,9 +679,7 @@ def render(output_dir: str) -> None:
                             target_date + timedelta(days=window_days),
                             date.today(),
                         )
-                        output_name = (
-                            f"{base_name}_{target_date.strftime('%Y%m%d')}"
-                        )
+                        output_name = f"{base_name}_{target_date.strftime('%Y%m%d')}"
                         job_id = str(uuid.uuid4())[:8]
                         st.session_state.jobs[job_id] = {
                             "fname": fname,
@@ -723,9 +721,7 @@ def render(output_dir: str) -> None:
                         cfg.get("window_days_column", 30),
                     )
                     if not date_col:
-                        validation_errors.append(
-                            f"{fname}: No date column selected."
-                        )
+                        validation_errors.append(f"{fname}: No date column selected.")
                     else:
                         job_id = str(uuid.uuid4())[:8]
                         st.session_state.jobs[job_id] = {
@@ -769,7 +765,6 @@ def render(output_dir: str) -> None:
                 )
             elif not validation_errors:
                 st.info("No new jobs were submitted.")
-
 
     st.divider()
 

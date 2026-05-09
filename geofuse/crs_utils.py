@@ -73,7 +73,9 @@ def _geographic_to_epsg4326_always_xy(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame
         return (rx, ry)
 
     new_geom = gdf.geometry.map(
-        lambda g: shapely_xy_transform(_tf, g) if g is not None and not g.is_empty else g
+        lambda g: (
+            shapely_xy_transform(_tf, g) if g is not None and not g.is_empty else g
+        )
     )
     return gpd.GeoDataFrame(
         gdf.drop(columns=geom_col),
@@ -191,4 +193,3 @@ def reproject_geodataframe_to_wgs84(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         _raise_if_geographic_coords_outside_degree_range(gdf)
         return _geographic_to_epsg4326_always_xy(gdf)
     return gdf.to_crs(WGS84_EPSG)
-

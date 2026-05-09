@@ -9,7 +9,7 @@ import warnings
 # CRITICAL IMPORT ORDER FIX FOR WINDOWS
 # -------------------------------------------------------------------------
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import geopandas as gpd
 import numpy as np
@@ -222,9 +222,10 @@ class TestGeoFuse(unittest.TestCase):
             )
         )
 
-    @patch("geofuse.gvi.search_panoramas")
-    def test_gvi_pipeline_logic(self, mock_search):
-        """Grid generation → processing loop → raster output — no real API calls."""
+    @patch("geofuse.streetview.get_panorama_async", new_callable=AsyncMock)
+    @patch("geofuse.streetview.find_panorama_async", new_callable=AsyncMock)
+    def test_gvi_pipeline_logic(self, mock_find, mock_get_pano):
+        """Grid generation → processing loop → result callbacks — no real API calls."""
         print("\n[TEST] Testing GVI Pipeline Logic (Mocked)...")
 
         warnings.filterwarnings(
@@ -233,13 +234,15 @@ class TestGeoFuse(unittest.TestCase):
             message="Python 3.14 will, by default, filter extracted tar archives",
         )
 
-        mock_search.return_value = [{"panoid": "test_pano_id_123"}]
+        mock_pano = MagicMock()
+        mock_pano.id = "test_pano_id_123"
+        mock_find.return_value = mock_pano
+        mock_get_pano.return_value = Image.fromarray(
+            np.zeros((300, 600, 3), dtype=np.uint8)
+        )
 
         engine = GVIEngine(download_mode="package")
         engine.segmenter = MagicMock()
-        engine._download_async_wrapper = MagicMock(
-            return_value=np.zeros((300, 600, 3), dtype=np.uint8)
-        )
 
         mock_mask = np.zeros((100, 100), dtype=int)
         mock_mask[0:50, :] = 8  # Vegetation class ID
@@ -252,9 +255,6 @@ class TestGeoFuse(unittest.TestCase):
         gdf = gpd.read_file("data/samples/test_area.geojson")
         results = []
 
-        def result_callback(res):
-            results.append(res)
-
         # 500 m step over a ~4.4 km area should yield ~54 clipped grid points
         engine.run_analysis(
             gdf,
@@ -262,7 +262,7 @@ class TestGeoFuse(unittest.TestCase):
             folder=self.output_dir,
             save_panos=False,
             save_masks=False,
-            result_callback=result_callback,
+            result_callback=results.append,
         )
 
         self.assertGreater(len(results), 50, "Should have processed at least 50 points")

@@ -26,7 +26,10 @@ from sklearn.metrics import mean_squared_error, mutual_info_score, r2_score
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import MinMaxScaler
 
-from .crs_utils import normalize_geographic_gdf_to_wgs84, reproject_geodataframe_to_wgs84
+from .crs_utils import (
+    normalize_geographic_gdf_to_wgs84,
+    reproject_geodataframe_to_wgs84,
+)
 from .vector_io import target_path_is_raster
 
 logger = logging.getLogger(__name__)
@@ -176,7 +179,9 @@ class MetricFusionEngine:
 
         if self.is_points:
             read_kwargs: dict = {}
-            if self.target_layer is not None and Path(self.target_file).suffix.lower() in (
+            if self.target_layer is not None and Path(
+                self.target_file
+            ).suffix.lower() in (
                 ".gpkg",
                 ".zip",
             ):

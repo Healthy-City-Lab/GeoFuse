@@ -9,7 +9,6 @@ from pathlib import Path
 
 import geopandas as gpd
 import pandas as pd
-import streamlit as st
 
 from geofuse.core import (  # noqa: F401  (re-exported for UI modules)
     generate_raster_grid,
@@ -44,6 +43,7 @@ class MaterializedDataset:
     display_name: str
     cleanup_dir: str | None
     cleanup_file: str | None
+
 
 _SINGLE_VECTOR_SUFFIXES: frozenset[str] = frozenset(
     {".geojson", ".json", ".gpkg", ".zip"}
@@ -96,7 +96,9 @@ def materialize_uploaded_dataset(uploaded_files: Sequence) -> MaterializedDatase
         )
 
     if has_tif:
-        tif_members = [f for f in group if Path(f.name).suffix.lower() in _RASTER_SUFFIXES]
+        tif_members = [
+            f for f in group if Path(f.name).suffix.lower() in _RASTER_SUFFIXES
+        ]
         if len(tif_members) != 1:
             raise ValueError("Upload exactly one GeoTIFF file for a raster dataset.")
         f = tif_members[0]
@@ -112,7 +114,9 @@ def materialize_uploaded_dataset(uploaded_files: Sequence) -> MaterializedDatase
             cleanup_file=tpath,
         )
 
-    vector_files = [f for f in group if Path(f.name).suffix.lower() in _SINGLE_VECTOR_SUFFIXES]
+    vector_files = [
+        f for f in group if Path(f.name).suffix.lower() in _SINGLE_VECTOR_SUFFIXES
+    ]
     if len(vector_files) != 1:
         raise ValueError(
             "Upload one vector file (GeoJSON, GeoPackage, or zip), "

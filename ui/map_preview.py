@@ -11,11 +11,10 @@ import folium
 import geopandas as gpd
 import numpy as np
 import pandas as pd
-from pandas.api.types import is_scalar
 from folium.plugins import FastMarkerCluster
-from shapely.geometry import mapping as shapely_mapping
-
 from helpers import apply_buffer_m
+from pandas.api.types import is_scalar
+from shapely.geometry import mapping as shapely_mapping
 
 # Above this many point features, use Leaflet marker clustering (browser performance).
 MAP_CLUSTER_POINT_THRESHOLD = 500
@@ -144,9 +143,7 @@ def _row_tooltip_html(row: pd.Series, fields: list[str], aliases: list[str]) -> 
         v = row[f]
         if is_scalar(v) and bool(pd.isna(v)):
             continue
-        parts.append(
-            f"<b>{html.escape(str(alias))}</b> {html.escape(str(v))}"
-        )
+        parts.append(f"<b>{html.escape(str(alias))}</b> {html.escape(str(v))}")
     return "<br>".join(parts) if parts else ""
 
 
@@ -288,7 +285,9 @@ def add_mixed_geojson_preview(
     if gdf.empty:
         return
     nonpt, pt = split_points_and_nonpoints(gdf)
-    style = nonpoint_style or (lambda x: {"color": "#3388ff", "weight": 2, "fillOpacity": 0.2})
+    style = nonpoint_style or (
+        lambda x: {"color": "#3388ff", "weight": 2, "fillOpacity": 0.2}
+    )
     if not nonpt.empty:
         folium.GeoJson(
             nonpt,

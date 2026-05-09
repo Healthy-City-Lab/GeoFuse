@@ -22,8 +22,8 @@ from helpers import (
     materialize_uploaded_dataset,
     sanitize_gdf_attributes_for_json,
 )
-from map_preview import add_mixed_geojson_preview, add_outcome_colored_geometry_layer
 from jinja2 import Template
+from map_preview import add_mixed_geojson_preview, add_outcome_colored_geometry_layer
 from PIL import Image as PILImage
 from shapely.geometry import box as shapely_box
 from streamlit.runtime.scriptrunner import add_script_run_ctx
@@ -35,7 +35,11 @@ except ImportError:
     _MetricFusionEngine = None
 
 from geofuse.crs_utils import buffer_gdf_union_metres, reproject_geodataframe_to_wgs84
-from geofuse.vector_io import list_gpkg_layer_names, read_vector_path, vector_format_from_path
+from geofuse.vector_io import (
+    list_gpkg_layer_names,
+    read_vector_path,
+    vector_format_from_path,
+)
 
 _FUSION_OUTCOME_ADD_PLACEHOLDER = "— Select column —"
 
@@ -43,7 +47,8 @@ _FUSION_OUTCOME_ADD_PLACEHOLDER = "— Select column —"
 class _FusionVerticalScaleControl(MacroElement):
     """Leaflet control: vertical red→yellow→green strip with numeric bounds."""
 
-    _template = Template("""
+    _template = Template(
+        """
 {% macro script(this, kwargs) %}
     var {{ this.get_name() }}_vsc = L.control({position: 'topright'});
     {{ this.get_name() }}_vsc.onAdd = function (map) {
@@ -59,7 +64,8 @@ class _FusionVerticalScaleControl(MacroElement):
     };
     {{ this.get_name() }}_vsc.addTo({{ this._parent.get_name() }});
 {% endmacro %}
-""")
+"""
+    )
 
     def __init__(self, inner_html: str):
         super().__init__()
@@ -652,9 +658,9 @@ def render(output_dir: str) -> None:
                             target_layer_for_engine = layers[0]
 
                         rv_kwargs: dict = {}
-                        if (
-                            target_layer_for_engine is not None
-                            and suf in (".gpkg", ".zip")
+                        if target_layer_for_engine is not None and suf in (
+                            ".gpkg",
+                            ".zip",
                         ):
                             rv_kwargs["layer"] = target_layer_for_engine
                         preview_vector_gdf = read_vector_path(
@@ -665,9 +671,7 @@ def render(output_dir: str) -> None:
                         ).columns.tolist()
                         fmt = vector_format_from_path(tmp_target_path)
                         layer_note = (
-                            f" — layer **{layers[0]}**"
-                            if len(layers) == 1
-                            else ""
+                            f" — layer **{layers[0]}**" if len(layers) == 1 else ""
                         )
                         st.info(
                             f"📍 Detected: **{fmt}** — "
@@ -698,8 +702,7 @@ def render(output_dir: str) -> None:
                         if remaining:
                             st.selectbox(
                                 "Add outcome column",
-                                options=[_FUSION_OUTCOME_ADD_PLACEHOLDER]
-                                + remaining,
+                                options=[_FUSION_OUTCOME_ADD_PLACEHOLDER] + remaining,
                                 key="fusion_add_outcome_column",
                                 on_change=_fusion_append_outcome_callback,
                                 help=(
@@ -744,7 +747,10 @@ def render(output_dir: str) -> None:
                             "Outcome band",
                             min_value=1,
                             max_value=n_bands,
-                            value=min(int(st.session_state.get("fusion_target_band", 1)), n_bands),
+                            value=min(
+                                int(st.session_state.get("fusion_target_band", 1)),
+                                n_bands,
+                            ),
                             help="Raster band used as the outcome surface.",
                             key="fusion_target_band",
                         )
@@ -785,9 +791,7 @@ def render(output_dir: str) -> None:
                                 preview_gdf,
                                 preview_feature,
                             ):
-                                add_mixed_geojson_preview(
-                                    m_fusion_preview, preview_gdf
-                                )
+                                add_mixed_geojson_preview(m_fusion_preview, preview_gdf)
                         else:
                             add_mixed_geojson_preview(m_fusion_preview, preview_gdf)
                     else:
@@ -970,7 +974,7 @@ def render(output_dir: str) -> None:
                 help="Radius discretization (m).",
                 key="fusion_gvi_buffer_step",
             )
-    
+
         st.markdown("**NDVI buffer exploration (m)**")
         col_bndvi_a, col_bndvi_b, col_bndvi_c = st.columns(3)
         with col_bndvi_a:
@@ -1003,13 +1007,13 @@ def render(output_dir: str) -> None:
                 help="Radius discretization (m).",
                 key="fusion_ndvi_buffer_step",
             )
-    
+
         buffer_extent_m = float(max(gvi_buffer_max_m, ndvi_buffer_max_m))
-    
+
         if metric_mode == "Use Loaded Results":
             all_gvi_files = _scan_metric_files(output_dir, "gvi")
             all_ndvi_files = _scan_metric_files(output_dir, "ndvi")
-    
+
             buffered_extent = None
             if tmp_target_path:
                 buffered_extent = _compute_buffered_extent(
@@ -1018,23 +1022,27 @@ def render(output_dir: str) -> None:
                     buffer_extent_m,
                     target_layer_for_engine if is_vector_target else None,
                 )
-    
+
             def _filter_by_coverage(file_list, bext):
                 # Return (covering, non_covering) label lists.
                 if bext is None:
                     return [lbl for lbl, _ in file_list], []
                 covering, non_covering = [], []
                 for lbl, path in file_list:
-                    (covering if _check_coverage(path, bext) else non_covering).append(lbl)
+                    (covering if _check_coverage(path, bext) else non_covering).append(
+                        lbl
+                    )
                 return covering, non_covering
-    
-            gvi_covering, gvi_outside = _filter_by_coverage(all_gvi_files, buffered_extent)
+
+            gvi_covering, gvi_outside = _filter_by_coverage(
+                all_gvi_files, buffered_extent
+            )
             ndvi_covering, ndvi_outside = _filter_by_coverage(
                 all_ndvi_files, buffered_extent
             )
-    
+
             col_gvi_sel, col_ndvi_sel = st.columns(2)
-    
+
             with col_gvi_sel:
                 if not all_gvi_files:
                     st.info(
@@ -1079,8 +1087,7 @@ def render(output_dir: str) -> None:
                             st.warning("⚠️ File not found on disk.")
                             gvi_path = None
                         elif (
-                            buffered_extent is not None
-                            and gvi_selection in gvi_outside
+                            buffered_extent is not None and gvi_selection in gvi_outside
                         ):
                             st.warning(
                                 "⚠️ This result does not fully cover the buffered "
@@ -1088,7 +1095,7 @@ def render(output_dir: str) -> None:
                             )
                         else:
                             st.success(f"✓ {gvi_selection}")
-    
+
             with col_ndvi_sel:
                 if not all_ndvi_files:
                     st.info(
@@ -1106,9 +1113,7 @@ def render(output_dir: str) -> None:
                             f"target extent."
                         )
                         if ndvi_outside:
-                            ndvi_help += (
-                                f" {len(ndvi_outside)} file(s) do not cover that extent."
-                            )
+                            ndvi_help += f" {len(ndvi_outside)} file(s) do not cover that extent."
                     options_ndvi = (
                         [None]
                         + ndvi_covering
@@ -1142,13 +1147,13 @@ def render(output_dir: str) -> None:
                             )
                         else:
                             st.success(f"✓ {ndvi_selection}")
-    
+
         ndvi_auto_start = date(2023, 6, 1)
         ndvi_auto_end = date(2023, 9, 30)
         cache_metrics = False
         ndvi_resolution_m = None
         gvi_grid_spacing_m = None
-    
+
         if metric_mode == "Auto-Download":
             col_ad1, col_ad2 = st.columns(2)
             with col_ad1:
@@ -1197,13 +1202,12 @@ def render(output_dir: str) -> None:
                 help="Spacing for street-view sample points on the grid.",
                 key="fusion_gvi_sampling_grid_spacing",
             )
-    
 
     st.subheader("Optimization Settings")
 
     with st.form("fusion_metric_run"):
         with st.container(border=True):
-    
+
             col_opt1, col_opt2 = st.columns(2)
             with col_opt1:
                 objective_metric = st.selectbox(
@@ -1229,7 +1233,7 @@ def render(output_dir: str) -> None:
                     help="Hyperparameter search sampler.",
                     key="fusion_optimizer",
                 )
-    
+
             with col_opt2:
                 n_startup_trials = st.number_input(
                     "Random Startup Trials",
@@ -1247,7 +1251,7 @@ def render(output_dir: str) -> None:
                     help="Early stopping rule for unpromising trials.",
                     key="fusion_pruner",
                 )
-    
+
             col_split1, col_split2, col_split3 = st.columns(3)
             with col_split1:
                 test_size = st.slider(

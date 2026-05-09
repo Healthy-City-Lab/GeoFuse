@@ -38,13 +38,16 @@ PIP_PACKAGES = [
     "folium==0.20.0",
     "geemap==0.36.6",
     "earthengine-api==1.7.4",
+    # Async HTTP — used by the in-house geofuse.streetview client (GVIEngine)
+    "aiohttp==3.9.5",
     # Utility
     "isort==7.0.0",
+    # Dev tooling — must match the version pinned in .github/workflows/code-quality.yml
+    "black==25.1.0",
+    "ruff==0.15.12",
 ]
 
-GIT_PACKAGES = [
-    "git+https://github.com/robolyst/streetview.git@b07d69445161bc193a1e1a6aa5e098b6fcd6eef8"
-]
+GIT_PACKAGES = []
 
 
 def run_cmd(command, log_file=None, optional=False):
@@ -153,6 +156,19 @@ def main(env_name, log_file=None):
     system = platform.system()
     solver = get_solver()
 
+    try:
+        _conda_base = subprocess.run(
+            "conda info --base",
+            shell=True,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        os.environ["MAMBA_ROOT_PREFIX"] = _conda_base
+        print(f"[INFO] MAMBA_ROOT_PREFIX → {_conda_base}")
+    except Exception as exc:
+        print(f"[WARN] Could not detect conda base, mamba may fail: {exc}")
+
     # Create log file automatically if not provided
     if not log_file:
         log_dir = os.path.join(os.path.dirname(__file__), "..", "logs")
@@ -216,10 +232,13 @@ def main(env_name, log_file=None):
     pip_str = " ".join(PIP_PACKAGES)
     run_cmd(f'"{env_python}" -m pip install {pip_str}', log_file)
 
-    # 4. Install Git Packages
-    print("[4/6] Installing Custom Git Packages...")
-    for git_url in GIT_PACKAGES:
-        run_cmd(f'"{env_python}" -m pip install {git_url}', log_file)
+    # 4. Install Git Packages (none currently — kept for future use)
+    if GIT_PACKAGES:
+        print("[4/6] Installing Custom Git Packages...")
+        for git_url in GIT_PACKAGES:
+            run_cmd(f'"{env_python}" -m pip install {git_url}', log_file)
+    else:
+        print("[4/6] No git packages to install — skipping.")
 
     # 5. Editable Install
     print("[5/6] Performing Editable Install of GeoFuse...")
