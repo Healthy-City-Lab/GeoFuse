@@ -118,19 +118,16 @@ def render(output_dir: str, parent_dir: str) -> None:
     # --- SESSION STATE ---
     if "datasets" not in st.session_state:
         st.session_state.datasets = {}
-    if "master_cache" not in st.session_state:
-        # In-memory pano cache for the current Streamlit process.
-        # Feature 1 will replace this with a SQLite-backed PanoCache singleton.
-        st.session_state.master_cache = {}
     if "gvi_inspector_select" not in st.session_state:
         st.session_state.gvi_inspector_select = None
 
-    # JobStore + executor are process-level singletons (see ui/services.py).
+    # JobStore + executor + PanoCache are process-level singletons (see ui/services.py).
     # We import them lazily here to keep tab modules free of side-effect imports.
-    from services import get_job_executor, get_job_store
+    from services import get_job_executor, get_job_store, get_pano_cache
 
     store = get_job_store()
     executor = get_job_executor()
+    pano_cache = get_pano_cache()
 
     # --- SIDEBAR JOB MONITOR ---
     def callback_dismiss_job(jid):
@@ -581,7 +578,7 @@ def render(output_dir: str, parent_dir: str) -> None:
                     if duplicate:
                         continue
 
-                    d["cache_ref"] = st.session_state.master_cache
+                    d["cache_ref"] = pano_cache
 
                     record = store.submit(
                         type="gvi",

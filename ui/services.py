@@ -12,6 +12,7 @@ import streamlit as st
 
 from geofuse.persistence.job_executor import JobExecutor
 from geofuse.persistence.job_store import JobStore
+from geofuse.persistence.pano_cache import PanoCache
 
 
 @st.cache_resource
@@ -24,3 +25,9 @@ def get_job_store() -> JobStore:
 def get_job_executor() -> JobExecutor:
     """Process-level worker pool. Holds the GPU lock and the ThreadPoolExecutor."""
     return JobExecutor(get_job_store(), max_workers=4)
+
+
+@st.cache_resource
+def get_pano_cache() -> PanoCache:
+    """SQLite-backed GVI pano cache. Global across study areas and runs."""
+    return PanoCache("logs/caches/gvi_panos.db")
