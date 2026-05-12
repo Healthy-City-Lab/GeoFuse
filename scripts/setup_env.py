@@ -1,4 +1,4 @@
-import os
+﻿import os
 import platform
 import shutil
 import subprocess
@@ -165,7 +165,7 @@ def main(env_name, log_file=None):
             check=True,
         ).stdout.strip()
         os.environ["MAMBA_ROOT_PREFIX"] = _conda_base
-        print(f"[INFO] MAMBA_ROOT_PREFIX → {_conda_base}")
+        print(f"[INFO] MAMBA_ROOT_PREFIX -> {_conda_base}")
     except Exception as exc:
         print(f"[WARN] Could not detect conda base, mamba may fail: {exc}")
 
@@ -196,7 +196,7 @@ def main(env_name, log_file=None):
 
     print(f"[INFO] Creating environment '{env_name}' with Python 3.12...")
     subprocess.run(
-        f"conda create -n {env_name} python=3.12 -y -c conda-forge",
+        f"conda create -n {env_name} python=3.12 pip -y -c conda-forge",
         shell=True,
         check=True,
     )
