@@ -187,7 +187,9 @@ def render(output_dir: str, parent_dir: str) -> None:
                         "interrupted": "Interrupted (process restarted)",
                         "error": rec.error or "Error",
                     }
-                    status_label = terminal_labels.get(rec.status, rec.status.capitalize())
+                    status_label = terminal_labels.get(
+                        rec.status, rec.status.capitalize()
+                    )
                 else:
                     status_label = rec.status_text or rec.status.capitalize()
                 st.caption(status_label)
@@ -537,6 +539,7 @@ def render(output_dir: str, parent_dir: str) -> None:
                     parent_dir, "geofuse", "model", "best_model.pth"
                 )
                 started = False
+
                 # Identity tuple for an in-flight job — only an *identical*
                 # resubmission is blocked. Changing resolution, buffer, or any
                 # output flag produces a new signature and a new job.

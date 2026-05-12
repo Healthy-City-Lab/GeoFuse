@@ -14,11 +14,10 @@ from __future__ import annotations
 
 import json
 import threading
-import time
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from geofuse.persistence.sqlite_utils import open_wal_connection
 
@@ -29,7 +28,7 @@ _ACTIVE_STATUSES: frozenset[str] = frozenset({"queued", "running"})
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 @dataclass
@@ -222,7 +221,7 @@ class JobStore:
 
     def health(self, stuck_after_s: float = 30.0) -> dict:
         """Snapshot for the sidebar badge."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         stuck_cutoff = now - timedelta(seconds=stuck_after_s)
         err_cutoff = now - timedelta(hours=1)
         active = 0
@@ -237,7 +236,7 @@ class JobStore:
                     try:
                         ts = datetime.strptime(
                             rec.updated_at, "%Y-%m-%dT%H:%M:%S.%fZ"
-                        ).replace(tzinfo=timezone.utc)
+                        ).replace(tzinfo=UTC)
                         if ts < stuck_cutoff:
                             stuck += 1
                     except ValueError:
@@ -246,7 +245,7 @@ class JobStore:
                     try:
                         ts = datetime.strptime(
                             rec.started_at, "%Y-%m-%dT%H:%M:%S.%fZ"
-                        ).replace(tzinfo=timezone.utc)
+                        ).replace(tzinfo=UTC)
                         age = (now - ts).total_seconds()
                         if oldest_running_s is None or age > oldest_running_s:
                             oldest_running_s = age
@@ -256,7 +255,7 @@ class JobStore:
                     try:
                         ts = datetime.strptime(
                             rec.completed_at, "%Y-%m-%dT%H:%M:%S.%fZ"
-                        ).replace(tzinfo=timezone.utc)
+                        ).replace(tzinfo=UTC)
                         if ts > err_cutoff:
                             errored += 1
                     except ValueError:
@@ -363,9 +362,7 @@ class JobStore:
             except json.JSONDecodeError:
                 params = {}
             try:
-                outputs = (
-                    json.loads(output_paths_json) if output_paths_json else []
-                )
+                outputs = json.loads(output_paths_json) if output_paths_json else []
             except json.JSONDecodeError:
                 outputs = []
             self._records[jid] = JobRecord(

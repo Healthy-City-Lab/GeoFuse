@@ -32,7 +32,6 @@ except ImportError:
 # --- 4. UI IMPORTS (after geofuse to preserve DLL order on Windows) ---
 import streamlit as st  # noqa: E402
 import streamlit.components.v1 as components  # noqa: E402
-
 from services import get_job_executor, get_job_store  # noqa: E402, F401
 from tabs import fusion, gvi, job_monitor, ndvi  # noqa: E402
 

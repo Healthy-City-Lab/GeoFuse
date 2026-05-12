@@ -181,7 +181,9 @@ def run_gvi(
 # ---------------------------------------------------------------------------
 
 
-def _ndvi_on_progress_factory(ctx: JobContext, base_offset: float = 0.0, span: float = 1.0):
+def _ndvi_on_progress_factory(
+    ctx: JobContext, base_offset: float = 0.0, span: float = 1.0
+):
     """Build a callback that maps NDVIEngine progress dicts → ``ctx.progress``."""
 
     def on_ndvi_progress(d: Mapping[str, object]) -> None:
@@ -308,9 +310,7 @@ def run_ndvi_column(
         date_str = target_date.strftime("%Y%m%d")
         tmp_name = f"{base_name}_{date_str}_tmp"
 
-        ctx.progress(
-            status_text=f"Processing date {idx + 1}/{n_dates}: {target_date}"
-        )
+        ctx.progress(status_text=f"Processing date {idx + 1}/{n_dates}: {target_date}")
 
         span = 1.0 / max(n_dates, 1)
         base = idx / max(n_dates, 1)

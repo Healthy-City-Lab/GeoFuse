@@ -30,7 +30,6 @@ except ImportError:
     _MetricFusionEngine = None
 
 from geofuse.crs_utils import buffer_gdf_union_metres, reproject_geodataframe_to_wgs84
-from geofuse.jobs.runners import run_fusion
 from geofuse.vector_io import (
     list_gpkg_layer_names,
     read_vector_path,
@@ -1147,9 +1146,7 @@ def render(output_dir: str) -> None:
                     target_layer=(
                         target_layer_for_engine if is_vector_target else None
                     ),
-                    target_cleanup_dir=(
-                        target_mat.cleanup_dir if target_mat else None
-                    ),
+                    target_cleanup_dir=(target_mat.cleanup_dir if target_mat else None),
                     target_cleanup_file=(
                         target_mat.cleanup_file if target_mat else None
                     ),

@@ -12,9 +12,10 @@ from __future__ import annotations
 import logging
 import threading
 import traceback
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 from geofuse.persistence.job_store import JobRecord, JobStore
 
