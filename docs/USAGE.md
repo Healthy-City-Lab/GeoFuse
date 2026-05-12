@@ -14,8 +14,8 @@ streamlit run ui/app.py
 ### Tab Overview
 
 | Tab | Purpose |
-|-----|---------|
-| **Job Monitor** | Track HPC CLI jobs by Job ID; view stage, progress, and metrics in real time. |
+| --- | --- |
+| **Job Monitor** | Track HPC CLI jobs by Job ID; view stage, progress, and metrics in real time. UI job progress is tracked in the GVI tab sidebar. |
 | **NDVI Sourcing** | Upload study areas, configure date modes, run Earth Engine downloads, and inspect results on an interactive map. |
 | **GVI Sourcing** | Upload study areas, generate sampling grids, run Street View + segmentation batch jobs, and visualize vegetation/terrain heatmaps. |
 | **Fusion & Optimization** | Upload a target file (GeoJSON or GeoTIFF), configure metric sources and optimization settings, run Bayesian fusion, and inspect results. |
@@ -28,7 +28,7 @@ streamlit run ui/app.py
 4. Inspect the composite greenery weights and export results.
 
 > [!NOTE]
-> Long-running jobs execute in background threads. Monitor them in the **sidebar Job Monitor** (on the GVI tab) without blocking the UI.
+> Long-running jobs (GVI, NDVI, Fusion) execute in a process-level thread pool and **survive browser refresh**. Progress is tracked in the **sidebar Job Monitor** on the GVI tab, which is visible from all tabs. Jobs interrupted by a Streamlit restart reload automatically and appear as "Interrupted" with a re-submit prompt. Multiple study areas with different settings (resolution, buffer, dates) can run in parallel as separate jobs.
 
 ---
 

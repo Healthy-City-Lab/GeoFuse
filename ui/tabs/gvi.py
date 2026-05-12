@@ -3,9 +3,6 @@ import gc
 import glob
 import io
 import os
-import threading
-import uuid
-from datetime import datetime
 
 import folium
 import geopandas as gpd
@@ -23,12 +20,10 @@ from map_preview import (
 from PIL import Image as PILImage
 from rasterio.transform import array_bounds
 from shapely.geometry import box as shapely_box
-from streamlit.runtime.scriptrunner import add_script_run_ctx
 from streamlit_folium import st_folium
 
 from geofuse.crs_utils import reproject_geodataframe_to_wgs84
-from geofuse.gvi import GVIEngine
-from geofuse.vision import get_best_device
+from geofuse.jobs.runners import run_gvi
 
 
 def _gvi_output_tif_path(output_dir: str, base_name: str) -> str | None:
@@ -104,144 +99,12 @@ def _gvi_materialize_grids_if_missing(gvi_buffer: int, gvi_res: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Background worker (module-level)
+# Live dataset registry (per-session, in addition to the process-level store)
 # ---------------------------------------------------------------------------
-
-
-def _job_worker(
-    job_id,
-    fname,
-    dataset_data,
-    init_args,
-    run_args,
-    output_dir,
-    job_tracker_dict,
-    save_geotiff: bool,
-    save_geojson: bool,
-):
-    gpu_lock = _get_gpu_lock()
-    job_update_lock = threading.Lock()
-    results_lock = threading.Lock()
-    try:
-        job_tracker_dict[job_id]["status"] = "Waiting for GPU..."
-        with gpu_lock:
-            if job_tracker_dict[job_id]["cancel"]:
-                job_tracker_dict[job_id]["status"] = "Cancelled"
-                return
-
-            job_tracker_dict[job_id]["status"] = "Initializing..."
-            engine = _get_gvi_engine(init_args["model_path"], init_args.get("api_key"))
-
-        current_accumulated = dataset_data["accumulated"]
-        start_idx = len(current_accumulated)
-
-        def on_progress(curr, total):
-            with job_update_lock:
-                job_tracker_dict[job_id]["progress"] = min(curr / total, 1.0)
-                job_tracker_dict[job_id]["status"] = f"Processing ({curr}/{total})"
-
-        def on_result(res):
-            with results_lock:
-                dataset_data["accumulated"].append(res)
-
-        def check_cancel():
-            return job_tracker_dict[job_id]["cancel"]
-
-        job_tracker_dict[job_id]["status"] = "Running"
-
-        engine.run_analysis(
-            dataset_data["processed"],
-            step=run_args["step"],
-            folder=output_dir,
-            save_panos=run_args["save_panos"],
-            save_masks=run_args["save_masks"],
-            external_cache=dataset_data["cache_ref"],
-            progress_callback=on_progress,
-            result_callback=on_result,
-            cancel_callback=check_cancel,
-            start_index=start_idx,
-        )
-
-        if job_tracker_dict[job_id]["cancel"]:
-            job_tracker_dict[job_id]["status"] = "Cancelled"
-        else:
-            job_tracker_dict[job_id]["status"] = "Completed"
-            job_tracker_dict[job_id]["progress"] = 1.0
-
-            res_df = gpd.GeoDataFrame(
-                dataset_data["accumulated"], crs=dataset_data["processed"].crs
-            )
-            if "orig_index" in res_df.columns:
-                res_df.set_index("orig_index", inplace=True)
-                res_df.index.name = None
-            dataset_data["results"] = res_df
-
-            out_name = os.path.splitext(fname)[0]
-            if save_geojson:
-                res_df.to_file(
-                    os.path.join(output_dir, f"{out_name}_gvi.geojson"),
-                    driver="GeoJSON",
-                )
-
-            if dataset_data["meta"] and save_geotiff:
-                from rasterio.transform import rowcol
-
-                meta = dataset_data["meta"]
-                arr_veg = np.full(
-                    (meta["height"], meta["width"]), np.nan, dtype=np.float32
-                )
-                arr_ter = np.full(
-                    (meta["height"], meta["width"]), np.nan, dtype=np.float32
-                )
-                valid = res_df.dropna(subset=["gvi_veg"])
-                if not valid.empty:
-                    rows, cols = rowcol(
-                        meta["transform"],
-                        valid.geometry.x.values,
-                        valid.geometry.y.values,
-                    )
-                    rows = np.clip(rows, 0, meta["height"] - 1)
-                    cols = np.clip(cols, 0, meta["width"] - 1)
-                    arr_veg[rows, cols] = valid["gvi_veg"].values
-                    arr_ter[rows, cols] = valid["gvi_ter"].values
-                tif_path = os.path.join(output_dir, f"{out_name}_gvi.tif")
-                with rasterio.open(
-                    tif_path,
-                    "w",
-                    driver="GTiff",
-                    height=meta["height"],
-                    width=meta["width"],
-                    count=2,
-                    dtype=np.float32,
-                    crs=meta["crs"],
-                    transform=meta["transform"],
-                    nodata=np.nan,
-                ) as dst:
-                    dst.write(arr_veg, 1)
-                    dst.set_band_description(1, "Veg")
-                    dst.write(arr_ter, 2)
-                    dst.set_band_description(2, "Ter")
-
-    except Exception as e:
-        job_tracker_dict[job_id]["status"] = f"Error: {str(e)}"
-        print(f"Job Failed: {e}")
-
-
-# ---------------------------------------------------------------------------
-# Cached resources (defined at module level so cache keys are stable)
-# ---------------------------------------------------------------------------
-
-
-@st.cache_resource
-def _get_gpu_lock():
-    return threading.Lock()
-
-
-@st.cache_resource
-def _get_gvi_engine(model_path, api_key):
-    best_device = get_best_device()
-    st.info(f"🚀 Using device: {best_device}")
-    return GVIEngine(model_path=model_path, device=str(best_device), api_key=api_key)
+#
+# Job records persisted in SQLite carry only JSON-serializable parameters.
+# The live GeoDataFrames they operate on stay in ``st.session_state.datasets``
+# (per-session) and are looked up by ``fname`` from ``record.params``.
 
 
 # ---------------------------------------------------------------------------
@@ -256,112 +119,118 @@ def render(output_dir: str, parent_dir: str) -> None:
     if "datasets" not in st.session_state:
         st.session_state.datasets = {}
     if "master_cache" not in st.session_state:
+        # In-memory pano cache for the current Streamlit process.
+        # Feature 1 will replace this with a SQLite-backed PanoCache singleton.
         st.session_state.master_cache = {}
-    if "jobs" not in st.session_state:
-        st.session_state.jobs = {}
     if "gvi_inspector_select" not in st.session_state:
         st.session_state.gvi_inspector_select = None
 
+    # JobStore + executor are process-level singletons (see ui/services.py).
+    # We import them lazily here to keep tab modules free of side-effect imports.
+    from services import get_job_executor, get_job_store
+
+    store = get_job_store()
+    executor = get_job_executor()
+
     # --- SIDEBAR JOB MONITOR ---
     def callback_dismiss_job(jid):
-        if jid in st.session_state.jobs:
-            del st.session_state.jobs[jid]
+        store.dismiss(jid)
 
     def callback_cancel_job(jid):
-        if jid in st.session_state.jobs:
-            st.session_state.jobs[jid]["cancel"] = True
+        store.request_cancel(jid)
+
+    _ACTIVE = {"queued", "running"}
+    _TERMINAL = {"completed", "error", "cancelled", "interrupted"}
 
     @st.fragment(run_every=1)
     def show_job_monitor_fragment():
         st.header("Job Monitor")
 
-        job_keys = list(st.session_state.jobs.keys())
-        if not job_keys:
+        h = store.health()
+        st.caption(
+            f"Active: {h['active']} · Stuck: {h['stuck']} · "
+            f"Errors (1h): {h['errored_last_hour']}"
+        )
+
+        records = sorted(
+            store.list_all(),
+            key=lambda r: r.updated_at or "",
+            reverse=True,
+        )
+        if not records:
             st.info("No active jobs.")
-        else:
-            for jid in job_keys:
-                job = st.session_state.jobs[jid]
-                with st.container(border=True):
-                    job_type = job.get("type", "gvi")
-                    job_name = job.get("name", job.get("fname", "Unknown"))
+            return
 
-                    c1, c2 = st.columns([7, 3])
-                    c1.markdown(f"**{job_name}**")
+        for rec in records:
+            with st.container(border=True):
+                c1, c2 = st.columns([7, 3])
+                c1.markdown(f"**{rec.name}**")
+                if rec.type == "fusion":
+                    c2.caption("🔀 Fusion")
+                elif rec.type in ("ndvi", "ndvi_column"):
+                    c2.caption("🛰️ NDVI")
+                else:
+                    c2.caption("🌳 GVI")
 
-                    if job_type == "fusion":
-                        c2.caption("🔀 Fusion | Optimizing")
-                    elif job_type == "ndvi":
-                        c2.caption(f"🛰️ NDVI | {job.get('start_time', '')}")
-                    else:
-                        c2.caption(
-                            f"{job.get('task', 'Job')} | {job.get('start_time', '')}"
-                        )
+                bracket = rec.extra.get("ndvi_tile_bracket")
+                if rec.type in ("ndvi", "ndvi_column") and bracket:
+                    st.progress(float(rec.progress), text=str(bracket))
+                else:
+                    st.progress(float(rec.progress))
 
-                    bracket = job.get("ndvi_tile_bracket")
-                    if job_type == "ndvi" and bracket:
-                        st.progress(float(job["progress"]), text=str(bracket))
-                    else:
-                        st.progress(float(job["progress"]))
-                    st.caption(job["status"])
+                # Terminal status overrides the last in-progress text so the user
+                # doesn't see e.g. "Processing (26/425)" after a cancel.
+                if rec.status in _TERMINAL:
+                    terminal_labels = {
+                        "completed": "Completed",
+                        "cancelled": "Cancelled",
+                        "interrupted": "Interrupted (process restarted)",
+                        "error": rec.error or "Error",
+                    }
+                    status_label = terminal_labels.get(
+                        rec.status, rec.status.capitalize()
+                    )
+                else:
+                    status_label = rec.status_text or rec.status.capitalize()
+                st.caption(status_label)
 
-                    if "gvi_progress" in job and job["gvi_progress"]:
-                        gvi = job["gvi_progress"]
-                        st.progress(
-                            gvi["percent"] / 100,
-                            text=f"{gvi['current']:,} / {gvi['total']:,}",
-                        )
-
-                    if "error_detail" in job:
-                        with st.expander("Error Details"):
-                            st.code(job["error_detail"])
-
-                    ndvi_job_active = (
-                        job_type == "ndvi"
-                        and job["status"] not in ("Completed", "Cancelled")
-                        and not str(job["status"]).startswith("Error")
-                        and not str(job["status"]).startswith("Completed")
+                gvi_progress = rec.extra.get("gvi_progress")
+                if gvi_progress:
+                    st.progress(
+                        gvi_progress["percent"] / 100,
+                        text=f"{gvi_progress['current']:,} / {gvi_progress['total']:,}",
                     )
 
-                    is_running = (
-                        job["status"]
-                        in [
-                            "Queued",
-                            "Initializing...",
-                            "Initializing fusion engine...",
-                            "Loading target data...",
-                            "Loading metrics (may auto-download)...",
-                            "Downloading GVI Vegetation data...",
-                            "Downloading GVI Terrain data...",
-                            "Downloading NDVI satellite data...",
-                            "Loading provided metric files...",
-                            "Splitting data...",
-                            "Waiting for GPU...",
-                            "Running",
-                        ]
-                        or (
-                            isinstance(job["status"], str)
-                            and job["status"].startswith("Running ·")
-                        )
-                        or "Processing" in job["status"]
-                        or "Optimizing" in job["status"]
-                        or "Downloading" in job["status"]
-                        or ndvi_job_active
-                    )
+                error_detail = rec.extra.get("error_detail")
+                if rec.error:
+                    with st.expander("Error Details"):
+                        st.code(error_detail or rec.error)
 
-                    if is_running:
-                        st.button(
-                            "Cancel",
-                            key=f"cancel_{jid}",
-                            on_click=callback_cancel_job,
-                            args=(jid,),
-                        )
-                    else:
-                        st.button(
-                            "🗑️",
-                            key=f"del_{jid}",
-                            on_click=callback_dismiss_job,
-                            args=(jid,),
-                        )
+                if rec.status in _ACTIVE:
+                    st.button(
+                        "Cancel",
+                        key=f"cancel_{rec.id}",
+                        on_click=callback_cancel_job,
+                        args=(rec.id,),
+                    )
+                elif rec.status == "interrupted":
+                    st.caption(
+                        "Interrupted on restart. Re-upload the source "
+                        "dataset and re-submit from the form above."
+                    )
+                    st.button(
+                        "🗑️",
+                        key=f"del_{rec.id}",
+                        on_click=callback_dismiss_job,
+                        args=(rec.id,),
+                    )
+                else:
+                    st.button(
+                        "🗑️",
+                        key=f"del_{rec.id}",
+                        on_click=callback_dismiss_job,
+                        args=(rec.id,),
+                    )
 
     with st.sidebar:
         show_job_monitor_fragment()
@@ -670,55 +539,71 @@ def render(output_dir: str, parent_dir: str) -> None:
                     parent_dir, "geofuse", "model", "best_model.pth"
                 )
                 started = False
+
+                # Identity tuple for an in-flight job — only an *identical*
+                # resubmission is blocked. Changing resolution, buffer, or any
+                # output flag produces a new signature and a new job.
+                def _gvi_signature(p: dict) -> tuple:
+                    return (
+                        p.get("fname"),
+                        p.get("step"),
+                        p.get("buffer"),
+                        p.get("save_panos"),
+                        p.get("save_masks"),
+                        p.get("save_geotiff"),
+                        p.get("save_geojson"),
+                        p.get("has_api_key"),
+                    )
+
                 for fname, d in st.session_state.datasets.items():
                     if d.get("type") == "restored":
                         continue
 
-                    existing = [
-                        j
-                        for j, v in st.session_state.jobs.items()
-                        if v["fname"] == fname
-                        and v["status"]
-                        in ["Running", "Waiting for GPU...", "Initializing..."]
-                    ]
-                    if existing:
-                        continue
-
-                    job_id = str(uuid.uuid4())[:8]
-                    st.session_state.jobs[job_id] = {
+                    job_params = {
                         "fname": fname,
-                        "task": "GVI",
-                        "start_time": datetime.now().strftime("%H:%M:%S"),
-                        "progress": 0.0,
-                        "status": "Queued",
-                        "cancel": False,
-                        "handoff_complete": False,
-                    }
-
-                    init_args = {"model_path": model_path, "api_key": api_key}
-                    run_args = {
                         "step": gvi_res,
+                        "buffer": gvi_buffer,
                         "save_panos": save_debug,
                         "save_masks": save_debug,
+                        "save_geotiff": save_gt,
+                        "save_geojson": save_gj,
+                        "model_path": model_path,
+                        "has_api_key": api_key is not None,
                     }
+                    sig = _gvi_signature(job_params)
+
+                    # Skip only if an identical submission is still active.
+                    duplicate = [
+                        r
+                        for r in store.list_active()
+                        if r.type == "gvi" and _gvi_signature(r.params) == sig
+                    ]
+                    if duplicate:
+                        continue
+
                     d["cache_ref"] = st.session_state.master_cache
 
-                    t = threading.Thread(
-                        target=_job_worker,
-                        args=(
-                            job_id,
-                            fname,
-                            d,
-                            init_args,
-                            run_args,
-                            output_dir,
-                            st.session_state.jobs,
-                            save_gt,
-                            save_gj,
-                        ),
+                    record = store.submit(
+                        type="gvi",
+                        name=f"{fname} (GVI, step={gvi_res}m, buf={gvi_buffer}m)",
+                        params=job_params,
                     )
-                    add_script_run_ctx(t)
-                    t.start()
+                    executor.submit_runner(
+                        record,
+                        run_gvi,
+                        fname=fname,
+                        dataset_data=d,
+                        init_args={"model_path": model_path, "api_key": api_key},
+                        run_args={
+                            "step": gvi_res,
+                            "save_panos": save_debug,
+                            "save_masks": save_debug,
+                        },
+                        output_dir=output_dir,
+                        save_geotiff=save_gt,
+                        save_geojson=save_gj,
+                        gpu_lock=executor.gpu_lock,
+                    )
                     started = True
 
                 if started:

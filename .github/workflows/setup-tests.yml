@@ -45,8 +45,11 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
 
     # Tell conda/mamba to store downloaded packages in the cached directory.
+    # PYTHONUTF8 forces UTF-8 stdout so Unicode chars in mamba progress output
+    # don't crash the installer on Windows (default console encoding is cp1252).
     env:
       CONDA_PKGS_DIRS: ~/conda_pkgs_dir
+      PYTHONUTF8: "1"
 
     defaults:
       run:

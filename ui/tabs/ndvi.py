@@ -3,16 +3,12 @@ import gc
 import glob
 import io
 import os
-import threading
-import uuid
-from collections.abc import Mapping
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 
 import folium
 import geopandas as gpd
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 import rasterio
 import streamlit as st
 from helpers import apply_buffer_m, load_vector_upload_sessions
@@ -23,213 +19,10 @@ from map_preview import (
 )
 from PIL import Image as PILImage
 from shapely.geometry import box as shapely_box
-from streamlit.runtime.scriptrunner import add_script_run_ctx
 from streamlit_folium import st_folium
 
 from geofuse.crs_utils import reproject_geodataframe_to_wgs84
-from geofuse.ndvi import NDVIEngine
-
-# ---------------------------------------------------------------------------
-# Background workers (module-level so they can be pickled / called in threads)
-# ---------------------------------------------------------------------------
-
-
-def _ndvi_worker(
-    job_id,
-    fname,
-    dataset_data,
-    start_date,
-    end_date,
-    cloud_pct,
-    resolution,
-    buffer_m,
-    output_name,
-    output_dir,
-    job_tracker_dict,
-    save_geotiff: bool,
-    save_geojson: bool,
-):
-    try:
-        job_tracker_dict[job_id]["status"] = "Initializing Earth Engine..."
-        engine = NDVIEngine()
-        geometry = apply_buffer_m(dataset_data["raw"], buffer_m)
-
-        def check_cancel() -> bool:
-            return bool(job_tracker_dict[job_id]["cancel"])
-
-        def on_ndvi_progress(d: Mapping[str, object]) -> None:
-            if "sub_progress" in d:
-                job_tracker_dict[job_id]["progress"] = float(d["sub_progress"])
-            if "phase" in d:
-                job_tracker_dict[job_id]["status"] = str(d["phase"])
-            if "tiles" in d:
-                t = d["tiles"]
-                if isinstance(t, tuple) and len(t) == 2:
-                    k, n = int(t[0]), int(t[1])
-                    if n > 0:
-                        job_tracker_dict[job_id]["ndvi_tile_bracket"] = f"[{k}/{n}]"
-            if d.get("clear_bracket"):
-                job_tracker_dict[job_id].pop("ndvi_tile_bracket", None)
-
-        result = engine.download_and_process(
-            geometry=geometry,
-            start_date=start_date,
-            end_date=end_date,
-            output_name=output_name,
-            cloud_max=cloud_pct,
-            resolution=resolution,
-            folder=output_dir,
-            cancel_callback=check_cancel,
-            ndvi_progress_callback=on_ndvi_progress,
-            write_geotiff=save_geotiff,
-            write_geojson=save_geojson,
-        )
-        if result.get("status") == "cancelled":
-            job_tracker_dict[job_id]["status"] = "Cancelled"
-            return
-        if result["status"] == "success":
-            job_tracker_dict[job_id]["status"] = "Completed"
-            job_tracker_dict[job_id]["progress"] = 1.0
-        else:
-            job_tracker_dict[job_id]["status"] = f"Error: {result['message']}"
-    except Exception as e:
-        job_tracker_dict[job_id]["status"] = f"Error: {str(e)}"
-
-
-def _ndvi_column_worker(
-    job_id,
-    fname,
-    dataset_data,
-    date_column,
-    window_days,
-    cloud_pct,
-    resolution,
-    buffer_m,
-    output_dir,
-    job_tracker_dict,
-    save_geotiff: bool,
-    save_geojson: bool,
-):
-    """Extract NDVI for each entity using a per-entity date from an attribute column."""
-    try:
-        gdf = dataset_data["raw"].copy()
-        gdf["_parsed_date"] = pd.to_datetime(gdf[date_column], errors="coerce")
-        gdf = gdf.dropna(subset=["_parsed_date"])
-        if gdf.empty:
-            job_tracker_dict[job_id][
-                "status"
-            ] = "Error: No valid dates found in the selected column."
-            return
-
-        unique_dates = sorted(gdf["_parsed_date"].dt.date.unique())
-        n_dates = len(unique_dates)
-        engine = NDVIEngine()
-        base_extent = gpd.GeoDataFrame(
-            {"geometry": [gdf.geometry.union_all()]}, crs=gdf.crs
-        )
-        full_extent = apply_buffer_m(base_extent, buffer_m)
-        all_results = []
-
-        for idx, target_date in enumerate(unique_dates):
-            if job_tracker_dict[job_id]["cancel"]:
-                job_tracker_dict[job_id]["status"] = "Cancelled"
-                return
-
-            start_d = target_date - timedelta(days=window_days)
-            end_d = target_date + timedelta(days=window_days)
-            date_str = target_date.strftime("%Y%m%d")
-            base_name = fname.replace(".geojson", "")
-            tmp_name = f"{base_name}_{date_str}_tmp"
-
-            job_tracker_dict[job_id][
-                "status"
-            ] = f"Processing date {idx + 1}/{n_dates}: {target_date}"
-
-            def check_cancel() -> bool:
-                return bool(job_tracker_dict[job_id]["cancel"])
-
-            def on_ndvi_progress(d: Mapping[str, object]) -> None:
-                span = 1.0 / max(n_dates, 1)
-                base = idx / max(n_dates, 1)
-                if "sub_progress" in d:
-                    job_tracker_dict[job_id]["progress"] = base + span * float(
-                        d["sub_progress"]
-                    )
-                if "phase" in d:
-                    job_tracker_dict[job_id]["status"] = str(d["phase"])
-                if "tiles" in d:
-                    t = d["tiles"]
-                    if isinstance(t, tuple) and len(t) == 2:
-                        k, n = int(t[0]), int(t[1])
-                        if n > 0:
-                            job_tracker_dict[job_id]["ndvi_tile_bracket"] = f"[{k}/{n}]"
-                if d.get("clear_bracket"):
-                    job_tracker_dict[job_id].pop("ndvi_tile_bracket", None)
-
-            result = engine.download_and_process(
-                geometry=full_extent,
-                start_date=start_d.isoformat(),
-                end_date=end_d.isoformat(),
-                output_name=tmp_name,
-                cloud_max=cloud_pct,
-                resolution=resolution,
-                folder=output_dir,
-                cancel_callback=check_cancel,
-                ndvi_progress_callback=on_ndvi_progress,
-                write_geotiff=True,
-                write_geojson=False,
-            )
-            if result.get("status") == "cancelled":
-                job_tracker_dict[job_id]["status"] = "Cancelled"
-                return
-            if result["status"] != "success":
-                print(f"[NDVI column] {target_date} failed: {result.get('message')}")
-                continue
-
-            tif_path = os.path.join(output_dir, f"{tmp_name}_ndvi.tif")
-            if not os.path.exists(tif_path):
-                continue
-
-            date_gdf = gdf[gdf["_parsed_date"].dt.date == target_date].copy()
-            with rasterio.open(tif_path) as src:
-                for row_idx, row in date_gdf.iterrows():
-                    geom = row.geometry
-                    pt = geom if geom.geom_type == "Point" else geom.centroid
-                    try:
-                        r, c = src.index(pt.x, pt.y)
-                        window = rasterio.windows.Window(c, r, 1, 1)
-                        val = src.read(1, window=window)
-                        ndvi_val = float(val[0][0]) if val.size > 0 else np.nan
-                        if ndvi_val == -9999:
-                            ndvi_val = np.nan
-                    except Exception:
-                        ndvi_val = np.nan
-                    date_gdf.at[row_idx, "NDVI"] = ndvi_val
-                    date_gdf.at[row_idx, "ndvi_date"] = target_date.isoformat()
-            all_results.append(date_gdf)
-            if not save_geotiff and os.path.isfile(tif_path):
-                os.remove(tif_path)
-
-        if all_results:
-            merged = gpd.GeoDataFrame(
-                pd.concat(all_results, ignore_index=True), crs=gdf.crs
-            )
-            merged = merged.drop(columns=["_parsed_date"], errors="ignore")
-            base_name = fname.replace(".geojson", "")
-            out_path = os.path.join(output_dir, f"{base_name}_temporal_ndvi.geojson")
-            if save_geojson:
-                merged.to_file(out_path, driver="GeoJSON")
-            dataset_data["results"] = merged
-            job_tracker_dict[job_id]["status"] = "Completed"
-            job_tracker_dict[job_id]["progress"] = 1.0
-        else:
-            job_tracker_dict[job_id][
-                "status"
-            ] = "Completed — no valid NDVI data could be extracted."
-            job_tracker_dict[job_id]["progress"] = 1.0
-    except Exception as e:
-        job_tracker_dict[job_id]["status"] = f"Error: {str(e)}"
-
+from geofuse.jobs.runners import run_ndvi, run_ndvi_column
 
 # ---------------------------------------------------------------------------
 # Tab render entry point
@@ -586,10 +379,12 @@ def render(output_dir: str) -> None:
         elif not ndvi_input_datasets:
             st.warning("Upload at least one study area to get started.")
         else:
+            from services import get_job_executor, get_job_store
+
+            store = get_job_store()
+            executor = get_job_executor()
             save_gt = st.session_state.get("ndvi_out_geotiff", True)
             save_gj = st.session_state.get("ndvi_out_geojson", True)
-            if "jobs" not in st.session_state:
-                st.session_state.jobs = {}
             jobs_started = 0
             validation_errors = []
 
@@ -629,37 +424,37 @@ def render(output_dir: str) -> None:
                             f"{start_d.strftime('%Y%m%d')}_"
                             f"{end_d.strftime('%Y%m%d')}"
                         )
-                        job_id = str(uuid.uuid4())[:8]
-                        st.session_state.jobs[job_id] = {
-                            "fname": fname,
-                            "name": f"{base_name} ({start_d} → {end_d})",
-                            "task": "NDVI",
-                            "type": "ndvi",
-                            "start_time": datetime.now().strftime("%H:%M:%S"),
-                            "progress": 0.0,
-                            "status": "Queued",
-                            "cancel": False,
-                        }
-                        t = threading.Thread(
-                            target=_ndvi_worker,
-                            args=(
-                                job_id,
-                                fname,
-                                d,
-                                start_d.isoformat(),
-                                end_d.isoformat(),
-                                cloud_pct,
-                                resolution,
-                                buffer_m,
-                                output_name,
-                                output_dir,
-                                st.session_state.jobs,
-                                save_gt,
-                                save_gj,
-                            ),
+                        record = store.submit(
+                            type="ndvi",
+                            name=f"{base_name} ({start_d} → {end_d})",
+                            params={
+                                "fname": fname,
+                                "mode": "range",
+                                "start_date": start_d.isoformat(),
+                                "end_date": end_d.isoformat(),
+                                "cloud_pct": cloud_pct,
+                                "resolution": resolution,
+                                "buffer_m": buffer_m,
+                                "output_name": output_name,
+                                "save_geotiff": save_gt,
+                                "save_geojson": save_gj,
+                            },
                         )
-                        add_script_run_ctx(t)
-                        t.start()
+                        executor.submit_runner(
+                            record,
+                            run_ndvi,
+                            fname=fname,
+                            dataset_data=d,
+                            start_date=start_d.isoformat(),
+                            end_date=end_d.isoformat(),
+                            cloud_pct=cloud_pct,
+                            resolution=resolution,
+                            buffer_m=buffer_m,
+                            output_name=output_name,
+                            output_dir=output_dir,
+                            save_geotiff=save_gt,
+                            save_geojson=save_gj,
+                        )
                         jobs_started += 1
 
                 # --- Specific Date jobs ---
@@ -680,37 +475,37 @@ def render(output_dir: str) -> None:
                             date.today(),
                         )
                         output_name = f"{base_name}_{target_date.strftime('%Y%m%d')}"
-                        job_id = str(uuid.uuid4())[:8]
-                        st.session_state.jobs[job_id] = {
-                            "fname": fname,
-                            "name": f"{base_name} (near {target_date})",
-                            "task": "NDVI",
-                            "type": "ndvi",
-                            "start_time": datetime.now().strftime("%H:%M:%S"),
-                            "progress": 0.0,
-                            "status": "Queued",
-                            "cancel": False,
-                        }
-                        t = threading.Thread(
-                            target=_ndvi_worker,
-                            args=(
-                                job_id,
-                                fname,
-                                d,
-                                start_d.isoformat(),
-                                end_d.isoformat(),
-                                cloud_pct,
-                                resolution,
-                                buffer_m,
-                                output_name,
-                                output_dir,
-                                st.session_state.jobs,
-                                save_gt,
-                                save_gj,
-                            ),
+                        record = store.submit(
+                            type="ndvi",
+                            name=f"{base_name} (near {target_date})",
+                            params={
+                                "fname": fname,
+                                "mode": "specific",
+                                "target_date": target_date.isoformat(),
+                                "window_days": window_days,
+                                "cloud_pct": cloud_pct,
+                                "resolution": resolution,
+                                "buffer_m": buffer_m,
+                                "output_name": output_name,
+                                "save_geotiff": save_gt,
+                                "save_geojson": save_gj,
+                            },
                         )
-                        add_script_run_ctx(t)
-                        t.start()
+                        executor.submit_runner(
+                            record,
+                            run_ndvi,
+                            fname=fname,
+                            dataset_data=d,
+                            start_date=start_d.isoformat(),
+                            end_date=end_d.isoformat(),
+                            cloud_pct=cloud_pct,
+                            resolution=resolution,
+                            buffer_m=buffer_m,
+                            output_name=output_name,
+                            output_dir=output_dir,
+                            save_geotiff=save_gt,
+                            save_geojson=save_gj,
+                        )
                         jobs_started += 1
 
                 # --- Attribute Column job ---
@@ -723,36 +518,35 @@ def render(output_dir: str) -> None:
                     if not date_col:
                         validation_errors.append(f"{fname}: No date column selected.")
                     else:
-                        job_id = str(uuid.uuid4())[:8]
-                        st.session_state.jobs[job_id] = {
-                            "fname": fname,
-                            "name": f"{base_name} (by column: {date_col})",
-                            "task": "NDVI",
-                            "type": "ndvi",
-                            "start_time": datetime.now().strftime("%H:%M:%S"),
-                            "progress": 0.0,
-                            "status": "Queued",
-                            "cancel": False,
-                        }
-                        t = threading.Thread(
-                            target=_ndvi_column_worker,
-                            args=(
-                                job_id,
-                                fname,
-                                d,
-                                date_col,
-                                window_days,
-                                cloud_pct,
-                                resolution,
-                                buffer_m,
-                                output_dir,
-                                st.session_state.jobs,
-                                save_gt,
-                                save_gj,
-                            ),
+                        record = store.submit(
+                            type="ndvi_column",
+                            name=f"{base_name} (by column: {date_col})",
+                            params={
+                                "fname": fname,
+                                "mode": "column",
+                                "date_column": date_col,
+                                "window_days": window_days,
+                                "cloud_pct": cloud_pct,
+                                "resolution": resolution,
+                                "buffer_m": buffer_m,
+                                "save_geotiff": save_gt,
+                                "save_geojson": save_gj,
+                            },
                         )
-                        add_script_run_ctx(t)
-                        t.start()
+                        executor.submit_runner(
+                            record,
+                            run_ndvi_column,
+                            fname=fname,
+                            dataset_data=d,
+                            date_column=date_col,
+                            window_days=window_days,
+                            cloud_pct=cloud_pct,
+                            resolution=resolution,
+                            buffer_m=buffer_m,
+                            output_dir=output_dir,
+                            save_geotiff=save_gt,
+                            save_geojson=save_gj,
+                        )
                         jobs_started += 1
 
             for err in validation_errors:

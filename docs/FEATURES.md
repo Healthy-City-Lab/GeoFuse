@@ -9,8 +9,9 @@
 * **Robust Processing**:
   * Async/multi-threaded downloading.
   * Image pre-processing: ensures 360° coverage, corrects panorama artifacts, detects corrupt panoramas, standardizes resolution.
-* **Crash Recovery**: Re-upload the same input file and click "Start" to automatically resume from the last processed point.
-* **Job Monitor**: Track progress in the sidebar. Use "Scan Output Folder" to reload results from previous sessions.
+* **Crash Recovery**: Re-upload the same input file and click Run to automatically resume from the last processed point within the same session.
+* **Refresh-Safe Job Monitor**: Jobs run in a process-level thread pool and survive browser refresh or opening additional tabs. Track progress in the sidebar with a live health badge (active / stuck / errors). Job state is persisted to `logs/jobs.db`; jobs interrupted by a Streamlit restart appear as "Interrupted" and can be resubmitted. Use "Scan Output Folder" to reload completed results from prior sessions.
+* **Parallel Study Areas**: Submit multiple study areas with different resolution or buffer settings simultaneously — each unique parameter combination is treated as a separate job.
 * **Outputs**: GeoJSON point vectors, multi-band GeoTIFF heatmaps, optional raw panoramas and segmentation masks.
 
 ---
