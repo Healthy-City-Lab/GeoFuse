@@ -3,10 +3,6 @@ import glob
 import html
 import io
 import os
-import shutil
-import threading
-import time
-import uuid
 from datetime import date, datetime
 from pathlib import Path
 
@@ -26,7 +22,6 @@ from jinja2 import Template
 from map_preview import add_mixed_geojson_preview, add_outcome_colored_geometry_layer
 from PIL import Image as PILImage
 from shapely.geometry import box as shapely_box
-from streamlit.runtime.scriptrunner import add_script_run_ctx
 from streamlit_folium import st_folium
 
 try:
@@ -35,6 +30,7 @@ except ImportError:
     _MetricFusionEngine = None
 
 from geofuse.crs_utils import buffer_gdf_union_metres, reproject_geodataframe_to_wgs84
+from geofuse.jobs.runners import run_fusion
 from geofuse.vector_io import (
     list_gpkg_layer_names,
     read_vector_path,
@@ -264,307 +260,6 @@ def _check_coverage(metric_path: str, buffered_gdf: "gpd.GeoDataFrame") -> bool:
         return metric_box.covers(target_geom)
     except Exception:
         return False
-
-
-# ---------------------------------------------------------------------------
-# Background worker (module-level)
-# ---------------------------------------------------------------------------
-
-
-def _fusion_worker(
-    job_id,
-    target_path,
-    target_features_geojson,
-    target_band,
-    target_layer,
-    target_cleanup_dir,
-    target_cleanup_file,
-    buffer_meters,
-    gvi_buffer_min_m,
-    gvi_buffer_max_m,
-    gvi_buffer_step_m,
-    ndvi_buffer_min_m,
-    ndvi_buffer_max_m,
-    ndvi_buffer_step_m,
-    ndvi_resolution_m,
-    gvi_grid_spacing_m,
-    n_bins,
-    veg_path,
-    terrain_path,
-    ndvi_path,
-    cache_metrics,
-    test_size,
-    k_folds,
-    n_trials,
-    n_startup_trials,
-    objective_metric,
-    pruner_type,
-    sampler_type,
-    gvi_api_key,
-    ndvi_start_date,
-    ndvi_end_date,
-    ndvi_project_id,
-    multi_objective_requested,
-    output_dir,
-    job_tracker_dict,
-    MetricFusionEngine,
-):
-    try:
-        targets = list(target_features_geojson) if target_features_geojson else [None]
-        n_t = max(len(targets), 1)
-        multi_outcome = len([t for t in targets if t is not None]) > 1
-
-        if multi_objective_requested and multi_outcome:
-            print(
-                "[FUSION] Multi-objective optimization run requested — "
-                "joint study not implemented yet; running separate single-objective "
-                "studies per outcome."
-            )
-
-        print(f"[FUSION] Starting fusion job {job_id} ({n_t} target run(s))")
-        print(
-            "[FUSION] Buffer ladders: "
-            f"GVI [{gvi_buffer_min_m}, {gvi_buffer_max_m}] step={gvi_buffer_step_m} m, "
-            f"NDVI [{ndvi_buffer_min_m}, {ndvi_buffer_max_m}] step={ndvi_buffer_step_m} m"
-        )
-        if ndvi_resolution_m is not None:
-            print(f"[FUSION] NDVI export resolution: {ndvi_resolution_m} m")
-        if gvi_grid_spacing_m is not None:
-            print(f"[FUSION] GVI sampling grid spacing: {gvi_grid_spacing_m} m")
-
-        by_target: dict = {}
-        engines_by_target: dict = {}
-        ordered_labels: list[str] = []
-
-        cache_dir = os.path.join(output_dir, "fusion_cache")
-
-        for ti, target_feature in enumerate(targets):
-            if job_tracker_dict[job_id]["cancel"]:
-                job_tracker_dict[job_id]["status"] = "Cancelled"
-                return
-
-            label = (
-                target_feature
-                if target_feature is not None
-                else f"raster_band_{target_band}"
-            )
-            ordered_labels.append(label)
-            prefix = f"[{label}] " if n_t > 1 else ""
-
-            def prog(local: float) -> float:
-                return (ti + local) / n_t
-
-            job_tracker_dict[job_id]["status"] = (
-                f"{prefix}Initializing fusion engine..."
-                if n_t > 1
-                else "Initializing fusion engine..."
-            )
-            job_tracker_dict[job_id]["progress"] = prog(0.05)
-
-            engine = MetricFusionEngine(
-                target_file=target_path,
-                target_feature=target_feature,
-                target_band=target_band,
-                target_layer=target_layer,
-                buffer_meters=buffer_meters,
-                gvi_buffer_min_m=gvi_buffer_min_m,
-                gvi_buffer_max_m=gvi_buffer_max_m,
-                gvi_buffer_step_m=gvi_buffer_step_m,
-                ndvi_buffer_min_m=ndvi_buffer_min_m,
-                ndvi_buffer_max_m=ndvi_buffer_max_m,
-                ndvi_buffer_step_m=ndvi_buffer_step_m,
-                n_bins=n_bins,
-                cache_dir=cache_dir,
-            )
-
-            print(f"{prefix}[FUSION] Engine initialized")
-
-            job_tracker_dict[job_id]["status"] = (
-                f"{prefix}Loading target data..."
-                if n_t > 1
-                else "Loading target data..."
-            )
-            job_tracker_dict[job_id]["progress"] = prog(0.1)
-            engine.load_target()
-
-            print(f"{prefix}[FUSION] Target loaded")
-            print(
-                f"{prefix}[FUSION] veg_path={veg_path}, terrain_path={terrain_path}, "
-                f"ndvi_path={ndvi_path}"
-            )
-
-            if not veg_path:
-                job_tracker_dict[job_id]["status"] = (
-                    f"{prefix}Downloading GVI Vegetation data..."
-                    if n_t > 1
-                    else "Downloading GVI Vegetation data..."
-                )
-                job_tracker_dict[job_id]["progress"] = prog(0.15)
-            elif not terrain_path:
-                job_tracker_dict[job_id]["status"] = (
-                    f"{prefix}Downloading GVI Terrain data..."
-                    if n_t > 1
-                    else "Downloading GVI Terrain data..."
-                )
-                job_tracker_dict[job_id]["progress"] = prog(0.20)
-            elif not ndvi_path:
-                job_tracker_dict[job_id]["status"] = (
-                    f"{prefix}Downloading NDVI satellite data..."
-                    if n_t > 1
-                    else "Downloading NDVI satellite data..."
-                )
-                job_tracker_dict[job_id]["progress"] = prog(0.25)
-            else:
-                job_tracker_dict[job_id]["status"] = (
-                    f"{prefix}Loading provided metric files..."
-                    if n_t > 1
-                    else "Loading provided metric files..."
-                )
-                job_tracker_dict[job_id]["progress"] = prog(0.15)
-
-            if job_tracker_dict[job_id]["cancel"]:
-                job_tracker_dict[job_id]["status"] = "Cancelled"
-                return
-
-            last_update_time = {"veg": 0, "terrain": 0}
-
-            def gvi_progress_callback(component, curr, total):
-                current_time = time.time()
-                if (
-                    current_time - last_update_time.get(component, 0) < 0.5
-                    and curr != total
-                ):
-                    return
-                last_update_time[component] = current_time
-                job_tracker_dict[job_id]["gvi_progress"] = {
-                    "component": component,
-                    "current": curr,
-                    "total": total,
-                    "percent": 100 * curr / total if total > 0 else 0,
-                }
-
-            def cancel_check():
-                return job_tracker_dict[job_id]["cancel"]
-
-            engine.load_metrics(
-                veg_file=veg_path,
-                terrain_file=terrain_path,
-                ndvi_file=ndvi_path,
-                cache_metrics=cache_metrics,
-                gvi_api_key=gvi_api_key,
-                ndvi_start_date=ndvi_start_date,
-                ndvi_end_date=ndvi_end_date,
-                ndvi_project_id=ndvi_project_id,
-                progress_callback=gvi_progress_callback,
-                cancel_callback=cancel_check,
-                ndvi_resolution_m=ndvi_resolution_m,
-                gvi_grid_spacing_m=gvi_grid_spacing_m,
-            )
-
-            print(f"{prefix}[FUSION] Metrics loaded")
-
-            job_tracker_dict[job_id]["status"] = (
-                f"{prefix}Splitting data..." if n_t > 1 else "Splitting data..."
-            )
-            job_tracker_dict[job_id]["progress"] = prog(0.3)
-            engine.split_data(test_size=test_size, k_folds=k_folds, random_state=42)
-
-            job_tracker_dict[job_id]["status"] = (
-                f"{prefix}Optimizing ({n_trials} trials)..."
-                if n_t > 1
-                else f"Optimizing ({n_trials} trials)..."
-            )
-            job_tracker_dict[job_id]["progress"] = prog(0.35)
-
-            best_params = engine.optimize_fusion(
-                n_trials=n_trials,
-                n_startup_trials=n_startup_trials,
-                objective_metric=objective_metric,
-                pruner_type=pruner_type if pruner_type != "none" else None,
-                sampler_type=sampler_type,
-                seed=42,
-                show_progress=False,
-            )
-
-            job_tracker_dict[job_id]["status"] = (
-                f"{prefix}Filtering robust trials..."
-                if n_t > 1
-                else "Filtering robust trials..."
-            )
-            job_tracker_dict[job_id]["progress"] = prog(0.85)
-            robust_trials = engine.get_robust_trials(
-                method="auto", p_threshold=0.05, tolerance=0.1, min_trials=10
-            )
-
-            job_tracker_dict[job_id]["status"] = (
-                f"{prefix}Evaluating on test set..."
-                if n_t > 1
-                else "Evaluating on test set..."
-            )
-            job_tracker_dict[job_id]["progress"] = prog(0.9)
-            test_results = engine.evaluate_on_test(
-                params=best_params, metric=objective_metric
-            )
-
-            job_tracker_dict[job_id]["status"] = (
-                f"{prefix}Applying fusion weights..."
-                if n_t > 1
-                else "Applying fusion weights..."
-            )
-            job_tracker_dict[job_id]["progress"] = prog(0.95)
-            composite_df = engine.apply_fusion()
-
-            bundle = {
-                "best_params": best_params,
-                "best_value": engine.study.best_value,
-                "robust_trials": robust_trials,
-                "composite_df": composite_df,
-                "objective_metric": objective_metric,
-                "test_results": test_results,
-                "target_feature": target_feature,
-            }
-            by_target[label] = bundle
-            engines_by_target[label] = engine
-
-            job_tracker_dict[job_id]["progress"] = prog(1.0)
-
-        sole_label = ordered_labels[0]
-        results_payload = {
-            "mode": "multi" if multi_outcome else "single",
-            "ordered_labels": ordered_labels,
-            "by_target": by_target,
-            "multi_objective_requested": bool(multi_objective_requested)
-            and multi_outcome,
-        }
-        if not multi_outcome:
-            results_payload.update(by_target[sole_label])
-
-        job_tracker_dict[job_id]["engine"] = (
-            None if multi_outcome else engines_by_target[sole_label]
-        )
-        job_tracker_dict[job_id]["engines_by_target"] = engines_by_target
-        job_tracker_dict[job_id]["results"] = results_payload
-        job_tracker_dict[job_id]["status"] = "Completed"
-        job_tracker_dict[job_id]["progress"] = 1.0
-
-    except InterruptedError:
-        job_tracker_dict[job_id]["status"] = "Cancelled"
-        job_tracker_dict[job_id]["progress"] = 0.0
-        print(f"[FUSION] Job {job_id} cancelled by user")
-
-    except Exception as e:
-        import traceback
-
-        job_tracker_dict[job_id]["status"] = f"Error: {str(e)}"
-        job_tracker_dict[job_id]["error_detail"] = traceback.format_exc()
-    finally:
-        if target_cleanup_dir:
-            shutil.rmtree(target_cleanup_dir, ignore_errors=True)
-        if target_cleanup_file and os.path.isfile(target_cleanup_file):
-            try:
-                os.remove(target_cleanup_file)
-            except OSError:
-                pass
 
 
 # ---------------------------------------------------------------------------
@@ -1405,24 +1100,10 @@ def render(output_dir: str) -> None:
                         f"{test_size*100:.0f}% test set"
                     )
 
-                job_id = f"fusion_{uuid.uuid4().hex[:8]}"
+                from services import get_job_executor, get_job_store
 
-                if "jobs" not in st.session_state:
-                    st.session_state.jobs = {}
-
-                st.session_state.jobs[job_id] = {
-                    "name": (
-                        f"Fusion: {target_display_name} "
-                        f"({len(target_outcome_columns)} outcomes)"
-                        if is_vector_target
-                        else f"Fusion: {target_display_name}"
-                    ),
-                    "status": "Starting...",
-                    "progress": 0.0,
-                    "cancel": False,
-                    "type": "fusion",
-                    "multi_objective_requested": fusion_multi_objective,
-                }
+                store = get_job_store()
+                executor = get_job_executor()
 
                 gvi_api_key = (
                     (st.session_state.get("fusion_streetview_api_key") or None)
@@ -1430,70 +1111,97 @@ def render(output_dir: str) -> None:
                     else None
                 )
                 ndvi_project_id = None
-
                 job_target_band = int(
                     st.session_state.get("fusion_target_band", target_band)
                 )
-                thread = threading.Thread(
-                    target=_fusion_worker,
-                    args=(
-                        job_id,
-                        tmp_target_path,
-                        tuple(target_outcome_columns) if is_vector_target else (),
-                        job_target_band if is_raster_target else 1,
-                        target_layer_for_engine if is_vector_target else None,
-                        target_mat.cleanup_dir if target_mat else None,
-                        target_mat.cleanup_file if target_mat else None,
-                        buffer_extent_m,
-                        gvi_buffer_min_m,
-                        gvi_buffer_max_m,
-                        gvi_buffer_step_m,
-                        ndvi_buffer_min_m,
-                        ndvi_buffer_max_m,
-                        ndvi_buffer_step_m,
-                        ndvi_resolution_m,
-                        gvi_grid_spacing_m,
-                        n_bins,
-                        gvi_path,
-                        None,
-                        ndvi_path,
-                        cache_metrics,
-                        test_size,
-                        k_folds,
-                        n_trials,
-                        n_startup_trials,
-                        objective_metric,
-                        pruner_type,
-                        optimizer,
-                        gvi_api_key,
-                        ndvi_auto_start.isoformat(),
-                        ndvi_auto_end.isoformat(),
-                        ndvi_project_id,
-                        fusion_multi_objective,
-                        output_dir,
-                        st.session_state.jobs,
-                        MetricFusionEngine,
+
+                fusion_record = store.submit(
+                    type="fusion",
+                    name=(
+                        f"Fusion: {target_display_name} "
+                        f"({len(target_outcome_columns)} outcomes)"
+                        if is_vector_target
+                        else f"Fusion: {target_display_name}"
                     ),
-                    daemon=True,
+                    params={
+                        "target_display_name": target_display_name,
+                        "is_vector_target": is_vector_target,
+                        "outcome_columns": list(target_outcome_columns),
+                        "target_band": job_target_band,
+                        "n_trials": n_trials,
+                        "n_startup_trials": n_startup_trials,
+                        "objective_metric": objective_metric,
+                        "sampler_type": optimizer,
+                        "pruner_type": pruner_type,
+                        "multi_objective_requested": fusion_multi_objective,
+                    },
                 )
-                add_script_run_ctx(thread)
-                thread.start()
+                executor.submit_runner(
+                    fusion_record,
+                    run_fusion,
+                    target_path=tmp_target_path,
+                    target_features_geojson=(
+                        tuple(target_outcome_columns) if is_vector_target else ()
+                    ),
+                    target_band=job_target_band if is_raster_target else 1,
+                    target_layer=(
+                        target_layer_for_engine if is_vector_target else None
+                    ),
+                    target_cleanup_dir=(
+                        target_mat.cleanup_dir if target_mat else None
+                    ),
+                    target_cleanup_file=(
+                        target_mat.cleanup_file if target_mat else None
+                    ),
+                    buffer_meters=buffer_extent_m,
+                    gvi_buffer_min_m=gvi_buffer_min_m,
+                    gvi_buffer_max_m=gvi_buffer_max_m,
+                    gvi_buffer_step_m=gvi_buffer_step_m,
+                    ndvi_buffer_min_m=ndvi_buffer_min_m,
+                    ndvi_buffer_max_m=ndvi_buffer_max_m,
+                    ndvi_buffer_step_m=ndvi_buffer_step_m,
+                    ndvi_resolution_m=ndvi_resolution_m,
+                    gvi_grid_spacing_m=gvi_grid_spacing_m,
+                    n_bins=n_bins,
+                    veg_path=gvi_path,
+                    terrain_path=None,
+                    ndvi_path=ndvi_path,
+                    cache_metrics=cache_metrics,
+                    test_size=test_size,
+                    k_folds=k_folds,
+                    n_trials=n_trials,
+                    n_startup_trials=n_startup_trials,
+                    objective_metric=objective_metric,
+                    pruner_type=pruner_type,
+                    sampler_type=optimizer,
+                    gvi_api_key=gvi_api_key,
+                    ndvi_start_date=ndvi_auto_start.isoformat(),
+                    ndvi_end_date=ndvi_auto_end.isoformat(),
+                    ndvi_project_id=ndvi_project_id,
+                    multi_objective_requested=fusion_multi_objective,
+                    output_dir=output_dir,
+                    MetricFusionEngine=MetricFusionEngine,
+                )
 
                 st.success("✅ Fusion job started! Check sidebar for progress.")
 
-    if "jobs" in st.session_state:
-        for job_id, job_data in st.session_state.jobs.items():
-            if (
-                job_data.get("type") == "fusion"
-                and job_data.get("status") == "Completed"
-                and "results" in job_data
-                and st.session_state.fusion_results is None
-            ):
-                st.session_state.fusion_engine = job_data.get("engine")
-                st.session_state.fusion_engines_by_target = (
-                    job_data.get("engines_by_target") or {}
-                )
-                st.session_state.fusion_results = job_data["results"]
+    # Pull completed fusion results from the JobStore into session state for display.
+    from services import get_job_store as _get_fusion_store
+
+    _fusion_store = _get_fusion_store()
+    for rec in _fusion_store.list_terminal():
+        if (
+            rec.type == "fusion"
+            and rec.status == "completed"
+            and rec.extra.get("results") is not None
+            and st.session_state.fusion_results is None
+        ):
+            st.session_state.fusion_engine = rec.extra.get("engine")
+            st.session_state.fusion_engines_by_target = (
+                rec.extra.get("engines_by_target") or {}
+            )
+            st.session_state.fusion_results = rec.extra["results"]
+            break
 
     # =========================================================================
     # ROW 3: Results Display
