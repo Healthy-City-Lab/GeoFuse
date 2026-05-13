@@ -11,7 +11,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import rasterio
 import streamlit as st
-from helpers import apply_buffer_m, generate_raster_grid, load_vector_upload_sessions
+from helpers import (
+    apply_buffer_m,
+    generate_clustered_grid,
+    load_vector_upload_sessions,
+)
 from map_preview import (
     add_study_area_layers,
     add_uniform_point_layer,
@@ -86,8 +90,8 @@ def _gvi_materialize_grids_if_missing(gvi_buffer: int, gvi_res: int) -> None:
         if d.get("processed") is not None:
             continue
         if _gvi_dataset_uses_raster_grid(d, gvi_buffer):
-            pts, meta = generate_raster_grid(
-                apply_buffer_m(d["raw"], gvi_buffer), gvi_res
+            pts, meta = generate_clustered_grid(
+                d["raw"], buffer_m=float(gvi_buffer), step_m=float(gvi_res)
             )
             d["processed"] = pts
             d["meta"] = meta
@@ -568,9 +572,10 @@ def render(output_dir: str, parent_dir: str) -> None:
                             if d.get("type") == "restored":
                                 continue
                             if _gvi_dataset_uses_raster_grid(d, gvi_buffer_for_gen):
-                                pts, meta = generate_raster_grid(
-                                    apply_buffer_m(d["raw"], gvi_buffer_for_gen),
-                                    gvi_res_for_gen,
+                                pts, meta = generate_clustered_grid(
+                                    d["raw"],
+                                    buffer_m=float(gvi_buffer_for_gen),
+                                    step_m=float(gvi_res_for_gen),
                                 )
                                 d["processed"] = pts
                                 d["meta"] = meta
