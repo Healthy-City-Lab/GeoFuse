@@ -11,7 +11,7 @@ from __future__ import annotations
 import geopandas as gpd
 import numpy as np
 from pyproj import CRS as PyProjCRS
-from pyproj import Transformer
+from pyproj import Geod, Transformer
 from shapely.ops import transform as shapely_xy_transform
 
 # Single canonical CRS for web maps, Earth Engine clip geometries, and GVI/NDVI download.
@@ -149,6 +149,100 @@ def estimate_metre_projected_crs_for_gdf(gdf: gpd.GeoDataFrame) -> str | PyProjC
     if g_ll.crs is None:
         g_ll = g_ll.set_crs(WGS84_EPSG)
     return _estimate_utm_epsg_from_wgs84_centroid(g_ll)
+
+
+def _build_lcc(minx: float, maxx: float, miny: float, maxy: float) -> PyProjCRS:
+    """Two-parallel Lambert Conformal Conic, parallels by Kavraisky's rule."""
+    h = maxy - miny
+    lat_1 = miny + h / 6.0
+    lat_2 = maxy - h / 6.0
+    lat_0 = (miny + maxy) / 2.0
+    lon_0 = (minx + maxx) / 2.0
+    return PyProjCRS.from_proj4(
+        f"+proj=lcc +lat_1={lat_1} +lat_2={lat_2} +lat_0={lat_0} +lon_0={lon_0} "
+        f"+x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"
+    )
+
+
+def _measure_planar_distortion(
+    crs: PyProjCRS, minx: float, maxx: float, miny: float, maxy: float
+) -> float:
+    """Max relative deviation from 1.0 of a 1000 m planar step vs. true geodesic
+    distance, sampled on a 3x3 grid across the WGS84 extent."""
+    fwd = Transformer.from_crs(WGS84_EPSG, crs, always_xy=True)
+    inv = Transformer.from_crs(crs, WGS84_EPSG, always_xy=True)
+    geod = Geod(ellps="WGS84")
+    lons = np.linspace(minx, maxx, 3)
+    lats = np.linspace(miny, maxy, 3)
+    max_dev = 0.0
+    for slon in lons:
+        for slat in lats:
+            x0, y0 = fwd.transform(slon, slat)
+            x1, y1 = x0 + 1000.0, y0
+            lon1, lat1 = inv.transform(x1, y1)
+            _, _, dist = geod.inv(slon, slat, lon1, lat1)
+            dev = abs(dist / 1000.0 - 1.0)
+            if dev > max_dev:
+                max_dev = dev
+    return float(max_dev)
+
+
+def select_grid_crs(gdf: gpd.GeoDataFrame) -> tuple[PyProjCRS, float, str]:
+    """Pick a projected metre CRS for intermediate grid math from data extent.
+
+    Decision tree (on WGS84 bbox):
+      * Centroid |lat| > 75 deg          -> polar stereographic at the relevant pole.
+      * Lon span <= 6 deg and lat span <= 8 deg -> single UTM zone via ``estimate_utm_crs``.
+      * Otherwise                        -> two-parallel LCC centred on the data
+        (Kavraisky standard parallels: lat_min + h/6, lat_max - h/6).
+
+    Returns ``(crs, max_distortion, choice_name)``. ``max_distortion`` is the
+    largest relative error of a 1000 m planar step vs. true geodesic distance,
+    sampled across the extent; callers should warn when this exceeds ~0.02.
+    """
+    if gdf.empty:
+        raise ValueError("Cannot select grid CRS for empty GeoDataFrame.")
+
+    if gdf.crs is None:
+        gdf_ll = gdf.set_crs(WGS84_EPSG)
+    elif gdf.crs.is_geographic:
+        gdf_ll = gdf
+    else:
+        gdf_ll = gdf.to_crs(WGS84_EPSG)
+
+    minx, miny, maxx, maxy = gdf_ll.total_bounds
+    if not np.isfinite([minx, miny, maxx, maxy]).all():
+        raise ValueError("Cannot select grid CRS: non-finite bounds.")
+    cent_lat = (miny + maxy) / 2.0
+    span_lon = maxx - minx
+    span_lat = maxy - miny
+
+    if abs(cent_lat) > 75.0:
+        if cent_lat >= 0:
+            crs = PyProjCRS.from_proj4(
+                "+proj=stere +lat_0=90 +lat_ts=70 +lon_0=0 +x_0=0 +y_0=0 "
+                "+datum=WGS84 +units=m +no_defs"
+            )
+            name = "Polar Stereographic (North)"
+        else:
+            crs = PyProjCRS.from_proj4(
+                "+proj=stere +lat_0=-90 +lat_ts=-70 +lon_0=0 +x_0=0 +y_0=0 "
+                "+datum=WGS84 +units=m +no_defs"
+            )
+            name = "Polar Stereographic (South)"
+    elif span_lon <= 6.0 and span_lat <= 8.0:
+        try:
+            crs = gdf_ll.estimate_utm_crs()
+            name = f"UTM ({getattr(crs, 'name', str(crs))})"
+        except Exception:
+            crs = _build_lcc(minx, maxx, miny, maxy)
+            name = "Lambert Conformal Conic (UTM fallback)"
+    else:
+        crs = _build_lcc(minx, maxx, miny, maxy)
+        name = "Lambert Conformal Conic"
+
+    distortion = _measure_planar_distortion(crs, minx, maxx, miny, maxy)
+    return crs, distortion, name
 
 
 def buffer_gdf_union_metres(
