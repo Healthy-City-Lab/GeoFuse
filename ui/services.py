@@ -48,9 +48,7 @@ def _ansi_line_to_html(line: str) -> str:
                 out.append('<span style="font-weight:600;">')
                 open_spans += 1
             elif code in _ANSI_COLOUR_HEX:
-                out.append(
-                    f'<span style="color:{_ANSI_COLOUR_HEX[code]};">'
-                )
+                out.append(f'<span style="color:{_ANSI_COLOUR_HEX[code]};">')
                 open_spans += 1
             # Other codes are ignored.
         pos = m.end()

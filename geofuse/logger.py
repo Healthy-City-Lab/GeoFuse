@@ -94,9 +94,7 @@ def get_logger(engine: str):
 
     def log(level: str, msg: str) -> None:
         color = _ANSI.get(level, "")
-        line = (
-            f"{color}{_ANSI['BOLD']}[{tag} {level}]{_ANSI['RESET']} {msg}"
-        )
+        line = f"{color}{_ANSI['BOLD']}[{tag} {level}]{_ANSI['RESET']} {msg}"
         print(line, flush=True)
         # Mirror into the active job's buffer if any.
         job_id = getattr(_current_job, "job_id", None)

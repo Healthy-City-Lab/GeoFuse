@@ -97,8 +97,7 @@ class JobStore:
             self._conn.executescript(self._SCHEMA)
             # Migrate pre-existing DBs without submitted_at.
             cols = {
-                r[1]
-                for r in self._conn.execute("PRAGMA table_info(jobs)").fetchall()
+                r[1] for r in self._conn.execute("PRAGMA table_info(jobs)").fetchall()
             }
             if "submitted_at" not in cols:
                 self._conn.execute("ALTER TABLE jobs ADD COLUMN submitted_at TEXT")

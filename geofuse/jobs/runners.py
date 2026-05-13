@@ -187,9 +187,7 @@ def run_gvi(
                 arr_veg = np.full((h, w), np.nan, dtype=np.float32)
                 arr_ter = np.full((h, w), np.nan, dtype=np.float32)
                 if has_cluster_col:
-                    cdf = res_df[res_df["cluster_id"] == cid].dropna(
-                        subset=["gvi_veg"]
-                    )
+                    cdf = res_df[res_df["cluster_id"] == cid].dropna(subset=["gvi_veg"])
                     if not cdf.empty:
                         lr = (cdf["row"].to_numpy() - cluster["row_min"]).astype(int)
                         lc = (cdf["col"].to_numpy() - cluster["col_min"]).astype(int)
@@ -421,7 +419,9 @@ def run_ndvi_column(
         if result.get("status") == "cancelled":
             return {"output_paths": output_paths}
         if result.get("status") != "success":
-            _log_ndvi("WARN", f"Column run for {target_date} failed: {result.get('message')}")
+            _log_ndvi(
+                "WARN", f"Column run for {target_date} failed: {result.get('message')}"
+            )
             continue
 
         tif_path = os.path.join(output_dir, f"{tmp_name}_ndvi.tif")

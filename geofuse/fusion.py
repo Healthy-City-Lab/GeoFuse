@@ -188,7 +188,9 @@ class MetricFusionEngine:
 
         # Data containers
         self.target_gdf = None
-        self.target_polygons_gdf = None  # Set when target is polygon-shaped (areal mode)
+        self.target_polygons_gdf = (
+            None  # Set when target is polygon-shaped (areal mode)
+        )
         self.is_polygon_target = False
         self.target_raster = None
         self.buffered_extent = None
@@ -1728,7 +1730,15 @@ class MetricFusionEngine:
 
     _PREAGGR_STAT_NAMES = (
         "mean",
-        "p10", "p20", "p30", "p40", "p50", "p60", "p70", "p80", "p90",
+        "p10",
+        "p20",
+        "p30",
+        "p40",
+        "p50",
+        "p60",
+        "p70",
+        "p80",
+        "p90",
     )
     _PREAGGR_PERCENTILES = (10, 20, 30, 40, 50, 60, 70, 80, 90)
 
@@ -1809,9 +1819,9 @@ class MetricFusionEngine:
         n_points = len(self.target_gdf)
         n_stats = len(self._PREAGGR_STAT_NAMES)
 
-        size_mb = (
-            n_points * (len(gvi_radii) * 2 + len(ndvi_radii)) * n_stats * 2
-        ) / (1024 * 1024)
+        size_mb = (n_points * (len(gvi_radii) * 2 + len(ndvi_radii)) * n_stats * 2) / (
+            1024 * 1024
+        )
         _log(
             "INFO",
             f"Pre-aggregation: {n_points:,} sample points · "
@@ -1844,9 +1854,9 @@ class MetricFusionEngine:
                 raise ValueError(
                     f"Pre-aggregation: metric '{col}' has zero non-NaN features."
                 )
-            xy = np.column_stack(
-                [m.geometry.x.values, m.geometry.y.values]
-            ).astype(np.float64)
+            xy = np.column_stack([m.geometry.x.values, m.geometry.y.values]).astype(
+                np.float64
+            )
             tree = BallTree(xy)
             return tree, m[col].to_numpy(dtype=np.float32)
 
@@ -2035,7 +2045,11 @@ class MetricFusionEngine:
 
         # Vector metric data
         m = metric_data
-        if m.crs is not None and polygon_crs is not None and str(m.crs) != str(polygon_crs):
+        if (
+            m.crs is not None
+            and polygon_crs is not None
+            and str(m.crs) != str(polygon_crs)
+        ):
             m = m.to_crs(polygon_crs)
         inside = m[m.geometry.within(polygon_geom)]
         if len(inside) == 0:
@@ -2112,9 +2126,7 @@ class MetricFusionEngine:
 
             if len(best_pts) == 0:
                 # Centroid fallback
-                best_pts = gpd.GeoDataFrame(
-                    geometry=[poly_geom.centroid], crs=poly_crs
-                )
+                best_pts = gpd.GeoDataFrame(geometry=[poly_geom.centroid], crs=poly_crs)
                 fallback_count += 1
             elif best_label is not None:
                 ref_counts[best_label] += 1
@@ -2616,9 +2628,9 @@ class MetricFusionEngine:
             # Map polygon assignments back to row-level data.
             train_val_ids = set(train_val_poly["polygon_id"])
             test_ids = set(test_poly["polygon_id"])
-            self.train_val_data = (
-                fusion_df[fusion_df["polygon_id"].isin(train_val_ids)].copy()
-            )
+            self.train_val_data = fusion_df[
+                fusion_df["polygon_id"].isin(train_val_ids)
+            ].copy()
             self.test_data = fusion_df[fusion_df["polygon_id"].isin(test_ids)].copy()
 
             _log(
@@ -2633,9 +2645,7 @@ class MetricFusionEngine:
             from sklearn.model_selection import KFold
 
             min_per_bin = (
-                train_val_poly["target_bin"].value_counts().min()
-                if stratifiable
-                else 0
+                train_val_poly["target_bin"].value_counts().min() if stratifiable else 0
             )
             k_eff = max(2, min(k_folds, len(train_val_poly)))
             if stratifiable and min_per_bin < k_folds:
@@ -3177,9 +3187,7 @@ class MetricFusionEngine:
                 train_composite = (
                     pd.Series(train_composite).groupby(train_pid).mean().values
                 )
-                val_composite = (
-                    pd.Series(val_composite).groupby(val_pid).mean().values
-                )
+                val_composite = pd.Series(val_composite).groupby(val_pid).mean().values
                 train_targets_arr = (
                     pd.Series(train_data["target"].values)
                     .groupby(train_pid)
@@ -3187,10 +3195,7 @@ class MetricFusionEngine:
                     .values
                 )
                 val_targets_arr = (
-                    pd.Series(val_data["target"].values)
-                    .groupby(val_pid)
-                    .first()
-                    .values
+                    pd.Series(val_data["target"].values).groupby(val_pid).first().values
                 )
             else:
                 train_targets_arr = train_data["target"].values
@@ -3216,9 +3221,7 @@ class MetricFusionEngine:
             train_score = self._calculate_metric(
                 train_targets_arr, train_composite, metric
             )
-            val_score = self._calculate_metric(
-                val_targets_arr, val_composite, metric
-            )
+            val_score = self._calculate_metric(val_targets_arr, val_composite, metric)
 
             fold_train_scores.append(train_score)
             fold_val_scores.append(val_score)
@@ -3595,9 +3598,7 @@ class MetricFusionEngine:
         # the per-polygon outcome.
         if "polygon_id" in self.test_data.columns:
             test_pid = self.test_data["polygon_id"].values
-            test_composite = (
-                pd.Series(test_composite).groupby(test_pid).mean().values
-            )
+            test_composite = pd.Series(test_composite).groupby(test_pid).mean().values
             test_targets = (
                 pd.Series(self.test_data["target"].values)
                 .groupby(test_pid)

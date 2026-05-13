@@ -198,7 +198,9 @@ def generate_clustered_grid(
     elif isinstance(buffered, Polygon):
         cluster_polys = [buffered]
     else:
-        cluster_polys = [g for g in getattr(buffered, "geoms", []) if isinstance(g, Polygon)]
+        cluster_polys = [
+            g for g in getattr(buffered, "geoms", []) if isinstance(g, Polygon)
+        ]
 
     all_rows: list[np.ndarray] = []
     all_cols: list[np.ndarray] = []

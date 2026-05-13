@@ -65,22 +65,6 @@ def _gvi_discard_heavy_dataset_fields() -> None:
     gc.collect()
 
 
-def _gvi_geotiff_only_points_blocked() -> bool:
-    """True when Run would error: GeoTIFF-only with point study areas and no buffer."""
-    save_gt = st.session_state.get("gvi_out_geotiff", True)
-    save_gj = st.session_state.get("gvi_out_geojson", True)
-    gbuf = int(st.session_state.get("gvi_buffer", 0))
-    return bool(
-        save_gt
-        and not save_gj
-        and any(
-            d.get("type") == "point" and gbuf <= 0
-            for d in st.session_state.datasets.values()
-            if d.get("type") != "restored"
-        )
-    )
-
-
 def _gvi_materialize_grids_if_missing(gvi_buffer: int, gvi_res: int) -> None:
     """Set ``processed`` / ``meta`` for datasets that still need a grid."""
     gc.collect()
@@ -127,13 +111,14 @@ def render(output_dir: str, parent_dir: str) -> None:
 
     # JobStore + executor + PanoCache are process-level singletons (see ui/services.py).
     # We import them lazily here to keep tab modules free of side-effect imports.
-    from geofuse.logger import get_job_log_lines
     from services import (
         ansi_log_lines_to_html,
         get_job_executor,
         get_job_store,
         get_pano_cache,
     )
+
+    from geofuse.logger import get_job_log_lines
 
     store = get_job_store()
     executor = get_job_executor()
@@ -174,10 +159,13 @@ def render(output_dir: str, parent_dir: str) -> None:
                 f"{bool(p.get('save_panos'))} / {bool(p.get('save_masks'))}"
             )
             st.write(
-                f"**Outputs:** GeoTIFF={bool(p.get('save_geotiff'))} · "
+                f"**Outputs:** GeoPackage={bool(p.get('save_gpkg', True))} · "
+                f"GeoTIFF={bool(p.get('save_geotiff'))} · "
                 f"GeoJSON={bool(p.get('save_geojson'))}"
             )
-            st.write(f"**Street View API key:** {'yes' if p.get('has_api_key') else 'no'}")
+            st.write(
+                f"**Street View API key:** {'yes' if p.get('has_api_key') else 'no'}"
+            )
         elif rec.type in ("ndvi", "ndvi_column"):
             mode = p.get("mode", "?")
             st.write(f"**Mode:** {mode}")
@@ -214,7 +202,9 @@ def render(output_dir: str, parent_dir: str) -> None:
                 f"**Pruner:** {p.get('pruner_type', '?')}"
             )
             outcomes = p.get("outcome_columns") or []
-            st.write(f"**Outcomes:** {len(outcomes)}{' — ' + ', '.join(outcomes) if outcomes else ''}")
+            st.write(
+                f"**Outcomes:** {len(outcomes)}{' — ' + ', '.join(outcomes) if outcomes else ''}"
+            )
             st.write(f"**Resume study:** {bool(p.get('resume_existing_study', True))}")
             st.write(f"**Pre-aggregation:** {bool(p.get('pre_aggregate', False))}")
         if rec.output_paths:
@@ -513,20 +503,38 @@ def render(output_dir: str, parent_dir: str) -> None:
                 m_input, width="100%", height=500, key="map_input", returned_objects=[]
             )
 
-        oc_gvi_a, oc_gvi_b = st.columns(2)
+        oc_gvi_a, oc_gvi_b, oc_gvi_c = st.columns(3)
         with oc_gvi_a:
             st.checkbox(
-                "Save GeoTIFF",
+                "Save GeoPackage",
                 value=True,
-                key="gvi_out_geotiff",
-                help="Raster GVI surface. At least one of GeoTIFF or GeoJSON must stay on to run.",
+                key="gvi_out_gpkg",
+                help=(
+                    "Recommended. Single-file vector samples (EPSG:4326) "
+                    "readable by every modern GIS. Scales to country-scale "
+                    "runs and supports sparse cluster layouts without voids."
+                ),
             )
         with oc_gvi_b:
             st.checkbox(
+                "Save GeoTIFF (per-cluster tiles)",
+                value=False,
+                key="gvi_out_geotiff",
+                help=(
+                    "Optional. Writes one GeoTIFF tile per buffered cluster "
+                    "into a *_gvi_tiles/ folder, in the auto-selected planar "
+                    "CRS (no resampling). Skipped if no clusters are defined."
+                ),
+            )
+        with oc_gvi_c:
+            st.checkbox(
                 "Save GeoJSON",
-                value=True,
+                value=False,
                 key="gvi_out_geojson",
-                help="Vector sample points with attributes. At least one output format must stay on.",
+                help=(
+                    "Compatibility option only. Slow to read past ~100k "
+                    "points; prefer GeoPackage for large national runs."
+                ),
             )
 
         st.checkbox(
@@ -589,14 +597,12 @@ def render(output_dir: str, parent_dir: str) -> None:
                 st.rerun()
 
         elif run:
-            gvi_out_ok_form = st.session_state.get(
-                "gvi_out_geotiff", True
-            ) or st.session_state.get("gvi_out_geojson", True)
-            if (
-                gvi_out_ok_form
-                and st.session_state.datasets
-                and not _gvi_geotiff_only_points_blocked()
-            ):
+            gvi_out_ok_form = (
+                st.session_state.get("gvi_out_gpkg", True)
+                or st.session_state.get("gvi_out_geotiff", False)
+                or st.session_state.get("gvi_out_geojson", False)
+            )
+            if gvi_out_ok_form and st.session_state.datasets:
                 with run_action_spinner:
                     with st.spinner("\u200b"):
                         _gvi_materialize_grids_if_missing(
@@ -605,8 +611,10 @@ def render(output_dir: str, parent_dir: str) -> None:
 
     gvi_buffer = int(st.session_state.get("gvi_buffer", 0))
     gvi_res = int(st.session_state.get("gvi_res", 50))
-    gvi_out_ok = st.session_state.get("gvi_out_geotiff", True) or st.session_state.get(
-        "gvi_out_geojson", True
+    gvi_out_ok = (
+        st.session_state.get("gvi_out_gpkg", True)
+        or st.session_state.get("gvi_out_geotiff", False)
+        or st.session_state.get("gvi_out_geojson", False)
     )
 
     if run:
@@ -615,8 +623,9 @@ def render(output_dir: str, parent_dir: str) -> None:
         elif not st.session_state.datasets:
             st.warning("Upload at least one study area to get started.")
         else:
-            save_gt = st.session_state.get("gvi_out_geotiff", True)
-            save_gj = st.session_state.get("gvi_out_geojson", True)
+            save_gp = st.session_state.get("gvi_out_gpkg", True)
+            save_gt = st.session_state.get("gvi_out_geotiff", False)
+            save_gj = st.session_state.get("gvi_out_geojson", False)
             save_debug = st.session_state.get("gvi_save_debug", False)
             mode = st.session_state.get("gvi_download_mode", "Package (Scraper)")
             api_key = None
@@ -624,98 +633,82 @@ def render(output_dir: str, parent_dir: str) -> None:
                 k = st.session_state.get("gvi_google_api_key", "")
                 api_key = k if k else None
 
-            geotiff_only_with_points = (
-                save_gt
-                and not save_gj
-                and any(
-                    d.get("type") == "point" and gvi_buffer <= 0
-                    for d in st.session_state.datasets.values()
-                    if d.get("type") != "restored"
-                )
-            )
-            if geotiff_only_with_points:
-                st.error(
-                    "GeoTIFF-only output needs a raster sampling grid. For point "
-                    "study areas, set Download Buffer (m) above zero so buffers "
-                    "define the grid extent, enable Save GeoJSON, or use polygon "
-                    "study areas."
-                )
-            else:
-                model_path = os.path.join(
-                    parent_dir, "geofuse", "model", "best_model.pth"
-                )
-                started = False
+            model_path = os.path.join(parent_dir, "geofuse", "model", "best_model.pth")
+            started = False
 
-                # Identity tuple for an in-flight job — only an *identical*
-                # resubmission is blocked. Changing resolution, buffer, or any
-                # output flag produces a new signature and a new job.
-                def _gvi_signature(p: dict) -> tuple:
-                    return (
-                        p.get("fname"),
-                        p.get("step"),
-                        p.get("buffer"),
-                        p.get("save_panos"),
-                        p.get("save_masks"),
-                        p.get("save_geotiff"),
-                        p.get("save_geojson"),
-                        p.get("has_api_key"),
-                    )
+            # Identity tuple for an in-flight job — only an *identical*
+            # resubmission is blocked. Changing resolution, buffer, or any
+            # output flag produces a new signature and a new job.
+            def _gvi_signature(p: dict) -> tuple:
+                return (
+                    p.get("fname"),
+                    p.get("step"),
+                    p.get("buffer"),
+                    p.get("save_panos"),
+                    p.get("save_masks"),
+                    p.get("save_gpkg"),
+                    p.get("save_geotiff"),
+                    p.get("save_geojson"),
+                    p.get("has_api_key"),
+                )
 
-                for fname, d in st.session_state.datasets.items():
-                    if d.get("type") == "restored":
-                        continue
+            for fname, d in st.session_state.datasets.items():
+                if d.get("type") == "restored":
+                    continue
 
-                    job_params = {
-                        "fname": fname,
+                job_params = {
+                    "fname": fname,
+                    "step": gvi_res,
+                    "buffer": gvi_buffer,
+                    "save_panos": save_debug,
+                    "save_masks": save_debug,
+                    "save_gpkg": save_gp,
+                    "save_geotiff": save_gt,
+                    "save_geojson": save_gj,
+                    "model_path": model_path,
+                    "has_api_key": api_key is not None,
+                }
+                sig = _gvi_signature(job_params)
+
+                # Skip only if an identical submission is still active.
+                duplicate = [
+                    r
+                    for r in store.list_active()
+                    if r.type == "gvi" and _gvi_signature(r.params) == sig
+                ]
+                if duplicate:
+                    continue
+
+                d["cache_ref"] = pano_cache
+
+                record = store.submit(
+                    type="gvi",
+                    name=os.path.splitext(fname)[0],
+                    params=job_params,
+                )
+                executor.submit_runner(
+                    record,
+                    run_gvi,
+                    fname=fname,
+                    dataset_data=d,
+                    init_args={"model_path": model_path, "api_key": api_key},
+                    run_args={
                         "step": gvi_res,
-                        "buffer": gvi_buffer,
                         "save_panos": save_debug,
                         "save_masks": save_debug,
-                        "save_geotiff": save_gt,
-                        "save_geojson": save_gj,
-                        "model_path": model_path,
-                        "has_api_key": api_key is not None,
-                    }
-                    sig = _gvi_signature(job_params)
+                    },
+                    output_dir=output_dir,
+                    save_gpkg=save_gp,
+                    save_geotiff=save_gt,
+                    save_geojson=save_gj,
+                    gpu_lock=executor.gpu_lock,
+                )
+                started = True
 
-                    # Skip only if an identical submission is still active.
-                    duplicate = [
-                        r
-                        for r in store.list_active()
-                        if r.type == "gvi" and _gvi_signature(r.params) == sig
-                    ]
-                    if duplicate:
-                        continue
-
-                    d["cache_ref"] = pano_cache
-
-                    record = store.submit(
-                        type="gvi",
-                        name=os.path.splitext(fname)[0],
-                        params=job_params,
-                    )
-                    executor.submit_runner(
-                        record,
-                        run_gvi,
-                        fname=fname,
-                        dataset_data=d,
-                        init_args={"model_path": model_path, "api_key": api_key},
-                        run_args={
-                            "step": gvi_res,
-                            "save_panos": save_debug,
-                            "save_masks": save_debug,
-                        },
-                        output_dir=output_dir,
-                        save_geotiff=save_gt,
-                        save_geojson=save_gj,
-                        gpu_lock=executor.gpu_lock,
-                    )
-                    started = True
-
-                if started:
-                    st.success("Analysis started. Monitor progress in the sidebar.")
-                else:
-                    st.info("All study areas are already running or completed.")
+            if started:
+                st.success("Analysis started. Monitor progress in the sidebar.")
+            else:
+                st.info("All study areas are already running or completed.")
 
     st.divider()
 
