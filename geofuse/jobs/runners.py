@@ -15,6 +15,7 @@ These are direct lifts of the workers that used to live in ``ui/tabs/``:
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -29,12 +30,14 @@ import numpy as np
 import pandas as pd
 import rasterio
 
+from geofuse.crs_utils import reproject_geodataframe_to_wgs84
 from geofuse.gvi import GVIEngine
 from geofuse.logger import get_logger
 from geofuse.ndvi import NDVIEngine
 from geofuse.persistence.job_executor import JobContext
 from geofuse.vision import get_best_device
 
+_log_gvi = get_logger("GVI")
 _log_ndvi = get_logger("NDVI")
 _log_fusion = get_logger("FUSION")
 
@@ -76,6 +79,7 @@ def run_gvi(
     save_geotiff: bool,
     save_geojson: bool,
     gpu_lock: threading.Lock,
+    save_gpkg: bool = True,
 ) -> dict:
     """Run a GVI analysis. Mirrors the previous ``_job_worker`` in ``ui/tabs/gvi.py``."""
     ctx.progress(status_text="Waiting for GPU...")
@@ -132,51 +136,128 @@ def run_gvi(
     if "orig_index" in res_df.columns:
         res_df.set_index("orig_index", inplace=True)
         res_df.index.name = None
+    # Engine produces results in EPSG:4326; guard rail in case a future caller
+    # passes a projected dataset_data["processed"].
+    if res_df.crs is None:
+        res_df = res_df.set_crs("EPSG:4326")
+    elif res_df.crs.is_geographic:
+        res_df = reproject_geodataframe_to_wgs84(res_df)
+    else:
+        res_df = res_df.to_crs("EPSG:4326")
     dataset_data["results"] = res_df
 
     out_name = os.path.splitext(fname)[0]
     output_paths: list[str] = []
+    meta = dataset_data.get("meta") or {}
+    grid_crs_wkt = meta.get("grid_crs_wkt")
+    clusters = meta.get("clusters") or []
+
+    if save_gpkg:
+        gpkg_path = os.path.join(output_dir, f"{out_name}_gvi.gpkg")
+        res_df.to_file(gpkg_path, driver="GPKG", layer="gvi_samples")
+        output_paths.append(gpkg_path)
 
     if save_geojson:
         gj_path = os.path.join(output_dir, f"{out_name}_gvi.geojson")
         res_df.to_file(gj_path, driver="GeoJSON")
         output_paths.append(gj_path)
-
-    if dataset_data["meta"] and save_geotiff:
-        from rasterio.transform import rowcol
-
-        meta = dataset_data["meta"]
-        arr_veg = np.full((meta["height"], meta["width"]), np.nan, dtype=np.float32)
-        arr_ter = np.full((meta["height"], meta["width"]), np.nan, dtype=np.float32)
-        valid = res_df.dropna(subset=["gvi_veg"])
-        if not valid.empty:
-            rows, cols = rowcol(
-                meta["transform"],
-                valid.geometry.x.values,
-                valid.geometry.y.values,
+        if len(res_df) > 100_000:
+            _log_gvi(
+                "WARN",
+                f"GeoJSON output is large ({len(res_df):,} points); "
+                f"GeoPackage is preferred for re-reading.",
             )
-            rows = np.clip(rows, 0, meta["height"] - 1)
-            cols = np.clip(cols, 0, meta["width"] - 1)
-            arr_veg[rows, cols] = valid["gvi_veg"].values
-            arr_ter[rows, cols] = valid["gvi_ter"].values
-        tif_path = os.path.join(output_dir, f"{out_name}_gvi.tif")
-        with rasterio.open(
-            tif_path,
-            "w",
-            driver="GTiff",
-            height=meta["height"],
-            width=meta["width"],
-            count=2,
-            dtype=np.float32,
-            crs=meta["crs"],
-            transform=meta["transform"],
-            nodata=np.nan,
-        ) as dst:
-            dst.write(arr_veg, 1)
-            dst.set_band_description(1, "Veg")
-            dst.write(arr_ter, 2)
-            dst.set_band_description(2, "Ter")
-        output_paths.append(tif_path)
+
+    if save_geotiff:
+        if not clusters:
+            _log_gvi(
+                "WARN",
+                "GeoTIFF requested but no cluster metadata is available "
+                "(e.g. point input with buffer=0); skipping. Use GeoPackage.",
+            )
+        else:
+            tiles_dir = os.path.join(output_dir, f"{out_name}_gvi_tiles")
+            os.makedirs(tiles_dir, exist_ok=True)
+            has_cluster_col = "cluster_id" in res_df.columns
+            index_entries: list[dict] = []
+            for cluster in clusters:
+                cid = int(cluster["cluster_id"])
+                h = int(cluster["height"])
+                w = int(cluster["width"])
+                arr_veg = np.full((h, w), np.nan, dtype=np.float32)
+                arr_ter = np.full((h, w), np.nan, dtype=np.float32)
+                if has_cluster_col:
+                    cdf = res_df[res_df["cluster_id"] == cid].dropna(
+                        subset=["gvi_veg"]
+                    )
+                    if not cdf.empty:
+                        lr = (cdf["row"].to_numpy() - cluster["row_min"]).astype(int)
+                        lc = (cdf["col"].to_numpy() - cluster["col_min"]).astype(int)
+                        keep = (lr >= 0) & (lr < h) & (lc >= 0) & (lc < w)
+                        lr = lr[keep]
+                        lc = lc[keep]
+                        arr_veg[lr, lc] = cdf["gvi_veg"].to_numpy()[keep]
+                        arr_ter[lr, lc] = cdf["gvi_ter"].to_numpy()[keep]
+                tile_path = os.path.join(tiles_dir, f"cluster_{cid:04d}.tif")
+                with rasterio.open(
+                    tile_path,
+                    "w",
+                    driver="GTiff",
+                    height=h,
+                    width=w,
+                    count=2,
+                    dtype=np.float32,
+                    crs=grid_crs_wkt,
+                    transform=cluster["transform"],
+                    nodata=np.nan,
+                ) as dst:
+                    dst.write(arr_veg, 1)
+                    dst.set_band_description(1, "Veg")
+                    dst.write(arr_ter, 2)
+                    dst.set_band_description(2, "Ter")
+                index_entries.append(
+                    {
+                        "cluster_id": cid,
+                        "path": os.path.basename(tile_path),
+                        "bbox_grid_crs": list(cluster["bbox_grid_crs"]),
+                        "height": h,
+                        "width": w,
+                        "row_min": int(cluster["row_min"]),
+                        "col_min": int(cluster["col_min"]),
+                    }
+                )
+            index_path = os.path.join(tiles_dir, "tiles_index.json")
+            with open(index_path, "w") as f:
+                json.dump(
+                    {
+                        "grid_crs_wkt": grid_crs_wkt,
+                        "step_m": meta.get("step_m"),
+                        "anchor_x": meta.get("anchor_x"),
+                        "anchor_y": meta.get("anchor_y"),
+                        "tiles": index_entries,
+                    },
+                    f,
+                    indent=2,
+                )
+            output_paths.append(tiles_dir)
+
+    # Sidecar JSON next to the canonical GeoPackage for grid reconstruction.
+    if save_gpkg and meta:
+        sidecar_path = os.path.join(output_dir, f"{out_name}_gvi.json")
+        with open(sidecar_path, "w") as f:
+            json.dump(
+                {
+                    "grid_crs_wkt": grid_crs_wkt,
+                    "step_m": meta.get("step_m"),
+                    "anchor_x": meta.get("anchor_x"),
+                    "anchor_y": meta.get("anchor_y"),
+                    "distortion": meta.get("distortion"),
+                    "choice_name": meta.get("choice_name"),
+                    "n_clusters": len(clusters),
+                },
+                f,
+                indent=2,
+            )
 
     return {"output_paths": output_paths}
 
