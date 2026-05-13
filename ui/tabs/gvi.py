@@ -123,7 +123,13 @@ def render(output_dir: str, parent_dir: str) -> None:
 
     # JobStore + executor + PanoCache are process-level singletons (see ui/services.py).
     # We import them lazily here to keep tab modules free of side-effect imports.
-    from services import get_job_executor, get_job_store, get_pano_cache
+    from geofuse.logger import get_job_log_lines
+    from services import (
+        ansi_log_lines_to_html,
+        get_job_executor,
+        get_job_store,
+        get_pano_cache,
+    )
 
     store = get_job_store()
     executor = get_job_executor()
@@ -131,13 +137,97 @@ def render(output_dir: str, parent_dir: str) -> None:
 
     # --- SIDEBAR JOB MONITOR ---
     def callback_dismiss_job(jid):
-        store.dismiss(jid)
+        # Permanently remove from SQLite history as well so the entry doesn't
+        # reappear next time the page is loaded.
+        store.purge(jid)
 
     def callback_cancel_job(jid):
         store.request_cancel(jid)
 
     _ACTIVE = {"queued", "running"}
     _TERMINAL = {"completed", "error", "cancelled", "interrupted"}
+    _EMOJI = {
+        "fusion": "🔀",
+        "ndvi": "🛰️",
+        "ndvi_column": "🛰️",
+        "gvi": "🌳",
+    }
+    _TERMINAL_LABELS = {
+        "completed": "✅ Completed",
+        "cancelled": "🚫 Cancelled",
+        "interrupted": "⏸️ Interrupted (process restarted)",
+        "error": "❌ Error",
+    }
+
+    def _render_details(rec) -> None:
+        """Key/value summary of job parameters inside the Details expander."""
+        p = rec.params or {}
+        if rec.type == "gvi":
+            st.write(f"**Grid step:** {p.get('step', '?')} m")
+            st.write(f"**Buffer:** {p.get('buffer', '?')} m")
+            st.write(
+                f"**Save panos / masks:** "
+                f"{bool(p.get('save_panos'))} / {bool(p.get('save_masks'))}"
+            )
+            st.write(
+                f"**Outputs:** GeoTIFF={bool(p.get('save_geotiff'))} · "
+                f"GeoJSON={bool(p.get('save_geojson'))}"
+            )
+            st.write(f"**Street View API key:** {'yes' if p.get('has_api_key') else 'no'}")
+        elif rec.type in ("ndvi", "ndvi_column"):
+            mode = p.get("mode", "?")
+            st.write(f"**Mode:** {mode}")
+            if mode == "range":
+                st.write(
+                    f"**Date range:** {p.get('start_date', '?')} → "
+                    f"{p.get('end_date', '?')}"
+                )
+            elif mode == "specific":
+                st.write(
+                    f"**Target date:** {p.get('target_date', '?')} "
+                    f"(window ±{p.get('window_days', '?')} d)"
+                )
+            elif mode == "column":
+                st.write(
+                    f"**Date column:** {p.get('date_column', '?')} "
+                    f"(window ±{p.get('window_days', '?')} d)"
+                )
+            st.write(f"**Cloud max:** {p.get('cloud_pct', '?')}%")
+            st.write(f"**Resolution:** {p.get('resolution', '?')} m")
+            st.write(f"**Buffer:** {p.get('buffer_m', '?')} m")
+            st.write(
+                f"**Outputs:** GeoTIFF={bool(p.get('save_geotiff'))} · "
+                f"GeoJSON={bool(p.get('save_geojson'))}"
+            )
+        elif rec.type == "fusion":
+            st.write(
+                f"**Trials:** {p.get('n_trials', '?')} "
+                f"(startup {p.get('n_startup_trials', '?')})"
+            )
+            st.write(f"**Objective:** {p.get('objective_metric', '?')}")
+            st.write(
+                f"**Sampler:** {p.get('sampler_type', '?')} · "
+                f"**Pruner:** {p.get('pruner_type', '?')}"
+            )
+            outcomes = p.get("outcome_columns") or []
+            st.write(f"**Outcomes:** {len(outcomes)}{' — ' + ', '.join(outcomes) if outcomes else ''}")
+            st.write(f"**Resume study:** {bool(p.get('resume_existing_study', True))}")
+            st.write(f"**Pre-aggregation:** {bool(p.get('pre_aggregate', False))}")
+        if rec.output_paths:
+            st.write("**Output files:**")
+            for path in rec.output_paths:
+                st.code(path, language=None)
+        if rec.submitted_at:
+            st.caption(f"Submitted at: {rec.submitted_at}")
+        if rec.completed_at:
+            st.caption(f"Completed at: {rec.completed_at}")
+
+    def _render_logs(rec_id: str) -> None:
+        lines = get_job_log_lines(rec_id)
+        if not lines:
+            st.caption("(no log output captured yet)")
+            return
+        st.markdown(ansi_log_lines_to_html(lines), unsafe_allow_html=True)
 
     @st.fragment(run_every=1)
     def show_job_monitor_fragment():
@@ -149,60 +239,80 @@ def render(output_dir: str, parent_dir: str) -> None:
             f"Errors (1h): {h['errored_last_hour']}"
         )
 
-        records = sorted(
-            store.list_all(),
-            key=lambda r: r.updated_at or "",
+        all_recs = store.list_all()
+        active = sorted(
+            [r for r in all_recs if r.status in _ACTIVE],
+            key=lambda r: r.submitted_at or r.id,
+        )
+        terminal = sorted(
+            [r for r in all_recs if r.status in _TERMINAL],
+            key=lambda r: r.completed_at or r.updated_at or "",
             reverse=True,
         )
-        if not records:
+        ordered = active + terminal
+
+        if not ordered:
             st.info("No active jobs.")
             return
 
-        for rec in records:
+        for rec in ordered:
             with st.container(border=True):
-                c1, c2 = st.columns([7, 3])
-                c1.markdown(f"**{rec.name}**")
-                if rec.type == "fusion":
-                    c2.caption("🔀 Fusion")
-                elif rec.type in ("ndvi", "ndvi_column"):
-                    c2.caption("🛰️ NDVI")
+                emoji = _EMOJI.get(rec.type, "•")
+                # Title: emoji + clean name only — no extension, no params.
+                st.markdown(f"### {emoji} {rec.name}")
+
+                # Primary progress bar (no tile-bracket overlay here; the
+                # bracket appears as its own row below for clarity).
+                st.progress(float(rec.progress))
+
+                # Status line. Terminal jobs show the canonical label;
+                # active jobs show whatever the worker reported last.
+                if rec.status in _TERMINAL:
+                    label = _TERMINAL_LABELS.get(rec.status, rec.status.capitalize())
                 else:
-                    c2.caption("🌳 GVI")
+                    label = rec.status_text or rec.status.capitalize()
+                st.caption(label)
 
                 bracket = rec.extra.get("ndvi_tile_bracket")
                 if rec.type in ("ndvi", "ndvi_column") and bracket:
-                    st.progress(float(rec.progress), text=str(bracket))
-                else:
-                    st.progress(float(rec.progress))
-
-                # Terminal status overrides the last in-progress text so the user
-                # doesn't see e.g. "Processing (26/425)" after a cancel.
-                if rec.status in _TERMINAL:
-                    terminal_labels = {
-                        "completed": "Completed",
-                        "cancelled": "Cancelled",
-                        "interrupted": "Interrupted (process restarted)",
-                        "error": rec.error or "Error",
-                    }
-                    status_label = terminal_labels.get(
-                        rec.status, rec.status.capitalize()
-                    )
-                else:
-                    status_label = rec.status_text or rec.status.capitalize()
-                st.caption(status_label)
+                    st.caption(f"NDVI tile: {bracket}")
 
                 gvi_progress = rec.extra.get("gvi_progress")
                 if gvi_progress:
                     st.progress(
                         gvi_progress["percent"] / 100,
-                        text=f"{gvi_progress['current']:,} / {gvi_progress['total']:,}",
+                        text=(
+                            f"{gvi_progress['current']:,} / "
+                            f"{gvi_progress['total']:,}"
+                        ),
                     )
 
+                preaggr_progress = rec.extra.get("preaggr_progress")
+                if preaggr_progress:
+                    st.progress(
+                        preaggr_progress["percent"] / 100,
+                        text=(
+                            f"Spatial pre-processing: "
+                            f"{preaggr_progress['current']:,} / "
+                            f"{preaggr_progress['total']:,}"
+                        ),
+                    )
+
+                # Collapsible details (parameters)
+                with st.expander("Details", expanded=False):
+                    _render_details(rec)
+
+                # Collapsible per-job log
+                with st.expander("Logs", expanded=False):
+                    _render_logs(rec.id)
+
+                # Error detail block stays in its own expander when present
                 error_detail = rec.extra.get("error_detail")
                 if rec.error:
-                    with st.expander("Error Details"):
+                    with st.expander("Error trace"):
                         st.code(error_detail or rec.error)
 
+                # Action button
                 if rec.status in _ACTIVE:
                     st.button(
                         "Cancel",
@@ -210,18 +320,12 @@ def render(output_dir: str, parent_dir: str) -> None:
                         on_click=callback_cancel_job,
                         args=(rec.id,),
                     )
-                elif rec.status == "interrupted":
-                    st.caption(
-                        "Interrupted on restart. Re-upload the source "
-                        "dataset and re-submit from the form above."
-                    )
-                    st.button(
-                        "🗑️",
-                        key=f"del_{rec.id}",
-                        on_click=callback_dismiss_job,
-                        args=(rec.id,),
-                    )
                 else:
+                    if rec.status == "interrupted":
+                        st.caption(
+                            "Interrupted on restart — re-upload the source "
+                            "dataset and re-submit from the form above."
+                        )
                     st.button(
                         "🗑️",
                         key=f"del_{rec.id}",
@@ -582,7 +686,7 @@ def render(output_dir: str, parent_dir: str) -> None:
 
                     record = store.submit(
                         type="gvi",
-                        name=f"{fname} (GVI, step={gvi_res}m, buf={gvi_buffer}m)",
+                        name=os.path.splitext(fname)[0],
                         params=job_params,
                     )
                     executor.submit_runner(

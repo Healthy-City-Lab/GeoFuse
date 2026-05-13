@@ -7,6 +7,10 @@ import torch
 from PIL import Image
 from torchvision import transforms as T
 
+from .logger import get_logger
+
+_log = get_logger("GVI")
+
 
 # ---------------------------------------------------------
 # DEVICE SELECTION UTILITY
@@ -56,7 +60,7 @@ class DeepLabSegmenter:
             device (str): 'cuda', 'mps', or 'cpu'. Auto-selects best available if not valid.
         """
         self.device = get_best_device(device)
-        print(f"[INFO] Using device: {self.device}")
+        _log("INFO", f"Using device: {self.device}")
 
         # 1. Resolve Model Path
         if ckpt_path is None:
@@ -65,7 +69,7 @@ class DeepLabSegmenter:
         if not os.path.exists(ckpt_path):
             raise FileNotFoundError(f"[ERROR] Model not found at: {ckpt_path}")
 
-        print(f"[INFO] Loading checkpoint from: {ckpt_path}")
+        _log("INFO", f"Loading checkpoint from: {ckpt_path}")
 
         # 2. Load Checkpoint (CPU first to inspect structure)
         # weights_only=False allows loading legacy NumPy data in the checkpoint
@@ -80,7 +84,7 @@ class DeepLabSegmenter:
         # 3. AUTO-DETECT BACKBONE
         if model_name is None:
             model_name = self._detect_backbone(state_dict)
-            print(f"[INFO] Auto-detected architecture: {model_name}")
+            _log("INFO", f"Auto-detected architecture: {model_name}")
 
         # 4. Initialize Network Architecture
         try:
@@ -90,7 +94,7 @@ class DeepLabSegmenter:
                 num_classes=num_classes, output_stride=16
             )
         except KeyError:
-            print(f"[FAIL] Model '{model_name}' is not defined in network.modeling.")
+            _log("ERROR", f"Model '{model_name}' is not defined in network.modeling.")
             print(
                 "Available models usually include: deeplabv3plus_resnet101, deeplabv3plus_mobilenet"
             )
@@ -154,7 +158,7 @@ class DeepLabSegmenter:
                 return "deeplabv3plus_resnet18"  # Rare but possible
 
         # Fallback default if detection fails
-        print("[WARN] Could not auto-detect backbone. Defaulting to ResNet101.")
+        _log("WARN", "Could not auto-detect backbone. Defaulting to ResNet101.")
         return "deeplabv3plus_resnet101"
 
     def _get_cityscapes_decode_fn(self):

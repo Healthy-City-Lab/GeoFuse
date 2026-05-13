@@ -181,7 +181,10 @@ class GVIEngine:
         union_geom = gdf_metric.geometry.union_all()
         candidate_points = MultiPoint(list(zip(x_all.tolist(), y_all.tolist())))
         tree = STRtree(list(candidate_points.geoms))
-        inside_indices = tree.query(union_geom, predicate="within")
+        # Shapely 2 STRtree applies the predicate as query.<predicate>(tree_geom).
+        # We want "polygon contains point", so the predicate is "contains", not
+        # "within" (which would ask "polygon within point" — always False).
+        inside_indices = tree.query(union_geom, predicate="contains")
 
         if len(inside_indices) == 0:
             if gdf.crs.is_geographic:
@@ -550,7 +553,7 @@ class GVIEngine:
                 cols = gdf["col"].max() + 1
 
         if not points:
-            print("[FAIL] No points to process.")
+            _log("ERROR", "No points to process.")
             return gpd.GeoDataFrame()
 
         total_points = len(points)

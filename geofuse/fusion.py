@@ -30,9 +30,49 @@ from .crs_utils import (
     normalize_geographic_gdf_to_wgs84,
     reproject_geodataframe_to_wgs84,
 )
+from .logger import get_logger
 from .vector_io import target_path_is_raster
 
 logger = logging.getLogger(__name__)
+_log = get_logger("FUSION")
+
+
+def _nearest_metric_join(
+    points_gdf: gpd.GeoDataFrame,
+    metric_gdf: gpd.GeoDataFrame,
+    value_col: str,
+    max_distance_m: float,
+) -> pd.Series:
+    """Nearest-neighbour join in a metric CRS, returning one value per source row.
+
+    ``gpd.sjoin_nearest`` has two pitfalls that produced
+    ``ValueError: cannot reindex on an axis with duplicate labels`` in fusion:
+
+    1. Run in EPSG:4326 (degrees), the ``max_distance`` parameter is interpreted
+       in *degrees* rather than metres — effectively unbounded.
+    2. When multiple right-hand features are exactly equidistant from a source
+       point, the join returns *multiple rows for the same source index*. The
+       subsequent column assignment then fails because pandas cannot reindex
+       onto a duplicated axis.
+
+    This helper reprojects both sides to a common UTM CRS so ``max_distance_m``
+    is honoured, then drops duplicate left-index rows by keeping the first
+    match. The returned series is reindexed onto ``points_gdf.index`` so a
+    simple ``points_gdf[col] = result`` assignment is always safe.
+    """
+    metric_crs = points_gdf.estimate_utm_crs()
+    pts_m = points_gdf[["geometry"]].to_crs(metric_crs)
+    src_m = metric_gdf[["geometry", value_col]].to_crs(metric_crs)
+    joined = gpd.sjoin_nearest(
+        pts_m,
+        src_m,
+        how="left",
+        max_distance=max_distance_m,
+    )
+    # Collapse ties: keep the first match per source row.
+    joined = joined[~joined.index.duplicated(keep="first")]
+    col = value_col if value_col in joined.columns else f"{value_col}_right"
+    return joined[col].reindex(points_gdf.index)
 
 
 def _radius_int_bounds(
@@ -148,6 +188,8 @@ class MetricFusionEngine:
 
         # Data containers
         self.target_gdf = None
+        self.target_polygons_gdf = None  # Set when target is polygon-shaped (areal mode)
+        self.is_polygon_target = False
         self.target_raster = None
         self.buffered_extent = None
         self.veg_data = None  # Vegetation component (GVI vegetation)
@@ -165,6 +207,17 @@ class MetricFusionEngine:
         self._ring_raster_cache: dict = {}
         self._ring_vector_cache: dict = {}
         self._max_points_ring_cache = 8000
+
+        # Spatial pre-aggregation (opt-in; populated by precompute_aggregations()).
+        # Shape per metric: (n_points, n_radii, n_stats) where stats are
+        # mean + p10..p90 in the order given by ``_PREAGGR_STATS``.
+        self._preaggregation_done: bool = False
+        self._preaggr_veg: np.ndarray | None = None
+        self._preaggr_terrain: np.ndarray | None = None
+        self._preaggr_ndvi: np.ndarray | None = None
+        self._preaggr_gvi_radii: tuple[int, ...] = ()
+        self._preaggr_ndvi_radii: tuple[int, ...] = ()
+        self._cancel_callback: Callable[[], bool] | None = None
 
         # Vector vs raster (``is_points`` kept for backward compatibility = vector target)
         self.is_raster = target_path_is_raster(target_file)
@@ -197,6 +250,18 @@ class MetricFusionEngine:
             ):
                 raise ValueError(
                     f"Target feature '{self.target_feature}' not found in columns: {list(self.target_gdf.columns)}"
+                )
+
+            # Detect polygon target — switches fusion into areal-aggregation mode
+            # (per-polygon mean of pixel/point CGIs vs polygon outcome).
+            first_geom_type = self.target_gdf.geometry.iloc[0].geom_type
+            self.is_polygon_target = first_geom_type in ("Polygon", "MultiPolygon")
+            if self.is_polygon_target:
+                self.target_polygons_gdf = self.target_gdf.copy()
+                _log(
+                    "INFO",
+                    f"Polygon target detected ({len(self.target_polygons_gdf)} "
+                    "features). Fusion will aggregate per-polygon mean CGI vs outcome.",
                 )
 
             # Create buffered extent for metric download (metre-accurate buffer in local UTM)
@@ -452,7 +517,10 @@ class MetricFusionEngine:
                 project_id=ndvi_project_id,
                 cache=cache_metrics,
                 force_download=force_download,
+                cancel_callback=cancel_callback,
             )
+            if cancel_callback and cancel_callback():
+                return
             self.ndvi_data = self._load_metric_file(ndvi_file)
 
     def _validate_metric_bounds(self, metric_file: str) -> bool:
@@ -1008,6 +1076,7 @@ class MetricFusionEngine:
         project_id: str | None = None,
         cache: bool = True,
         force_download: bool = False,
+        cancel_callback: Callable[..., Any] | None = None,
     ) -> str:
         """
         Auto-download NDVI metrics within buffered extent.
@@ -1018,6 +1087,9 @@ class MetricFusionEngine:
             project_id: Google Earth Engine project ID
             cache: Whether to save to cache directory
             force_download: If True, bypass cache and force fresh download
+            cancel_callback: Optional ``() -> bool`` predicate. The NDVI engine
+                polls this between tile downloads; when it returns True the
+                run aborts with status ``"cancelled"``.
 
         Returns:
             Path to generated GeoTIFF file
@@ -1053,6 +1125,9 @@ class MetricFusionEngine:
         filename = os.path.basename(self.target_file)
         name, _ = os.path.splitext(filename)
 
+        if cancel_callback and cancel_callback():
+            raise InterruptedError("NDVI download cancelled by user")
+
         result = ndvi_engine.download_and_process(
             geometry=self.buffered_extent,
             start_date=start_date,
@@ -1060,8 +1135,11 @@ class MetricFusionEngine:
             output_name=f"{name if cache else 'temp'}",
             folder=self.cache_dir,
             resolution=ndvi_res,
+            cancel_callback=cancel_callback,
         )
 
+        if result.get("status") == "cancelled":
+            raise InterruptedError("NDVI download cancelled by user")
         if result["status"] != "success":
             raise RuntimeError(f"NDVI download failed: {result['message']}")
 
@@ -1548,9 +1626,21 @@ class MetricFusionEngine:
         """
         Circular neighbourhood aggregation using precomputed annuli when possible.
 
-        Falls back to _apply_circular_buffer_aggregation for large point sets,
-        unsupported modes, or cache build failures.
+        When ``precompute_aggregations()`` has populated the pre-aggregation
+        table and the trial's (radius, stat, percentile) maps to a cell, the
+        call becomes a vectorised ``numpy.take`` and returns immediately.
+
+        Otherwise falls back to the ring cache (or the direct circular buffer
+        path) — same behaviour as before.
         """
+        # ── Fast path: pre-aggregation lookup table ──────────────────────────
+        if getattr(self, "_preaggregation_done", False):
+            looked_up = self._lookup_preaggregation(
+                points_gdf.index.values, channel, radius_m, stat, percentile
+            )
+            if looked_up is not None:
+                return looked_up
+
         if (
             fold_idx is None
             or subset is None
@@ -1610,29 +1700,523 @@ class MetricFusionEngine:
         Returns:
             DataFrame with columns: [target, veg, terrain, ndvi]
         """
-        import sys
-
-        print("\n[FUSION DEBUG] ====== PREPARE FUSION DATA ======", flush=True)
-        print(f"[FUSION DEBUG] is_points = {self.is_points}", flush=True)
-        print(
-            f"[FUSION DEBUG] Target type: {'POINT' if self.is_points else 'RASTER'}",
-            flush=True,
+        _log("INFO", "====== PREPARE FUSION DATA ======")
+        if self.is_polygon_target:
+            _log("INFO", "Target type: POLYGON (areal aggregation)")
+            return self._prepare_polygon_fusion()
+        _log(
+            "INFO",
+            f"Target type: {'POINT' if self.is_points else 'RASTER'}",
         )
-        sys.stdout.flush()
-
         if self.is_points:
             return self._prepare_point_fusion()
         else:
             return self._prepare_raster_fusion()
 
+    # ------------------------------------------------------------------
+    # Spatial pre-aggregation (opt-in)
+    # ------------------------------------------------------------------
+    #
+    # Layout of every pre-aggregation table:
+    #     shape  = (n_sample_points, n_radii, n_stats)
+    #     dtype  = float16  (~3-digit precision; saves ~50% memory vs float32)
+    #     stats  = (mean, p10, p20, p30, p40, p50, p60, p70, p80, p90)
+    # Filled by ``precompute_aggregations()``; consumed by ``_aggregate_with_ring_cache``
+    # which short-circuits to a numpy take when the lookup is available.
+    # Trial-suggested percentiles are constrained to the 10 % grid below when
+    # the table is active so every trial maps to a valid cell.
+
+    _PREAGGR_STAT_NAMES = (
+        "mean",
+        "p10", "p20", "p30", "p40", "p50", "p60", "p70", "p80", "p90",
+    )
+    _PREAGGR_PERCENTILES = (10, 20, 30, 40, 50, 60, 70, 80, 90)
+
+    @classmethod
+    def _preaggr_stat_index(cls, stat: str, percentile: int | None) -> int | None:
+        """(stat, percentile) → row in the pre-aggregation stat axis, or None."""
+        if stat == "mean":
+            return 0
+        if stat == "median":
+            return cls._PREAGGR_PERCENTILES.index(50) + 1
+        if stat == "percentile":
+            try:
+                return cls._PREAGGR_PERCENTILES.index(int(percentile)) + 1
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _compute_all_stats_inplace(values: np.ndarray) -> np.ndarray:
+        """Return [mean, p10, p20, …, p90] in one go (float32)."""
+        if values.size == 0:
+            return np.full(10, np.nan, dtype=np.float32)
+        out = np.empty(10, dtype=np.float32)
+        out[0] = float(values.mean())
+        out[1:] = np.percentile(values, [10, 20, 30, 40, 50, 60, 70, 80, 90])
+        return out
+
+    def precompute_aggregations(
+        self,
+        progress_callback: Callable[[int, int], None] | None = None,
+        cancel_callback: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Build the per-point × radius × stat lookup table for every metric.
+
+        Each metric must currently be a GeoDataFrame (point features). Raster
+        metrics aren't supported by the pre-aggregation path yet — they would
+        still fall back to the lazy ring cache.
+
+        Results are stored as ``float16`` (~3-digit precision). Trials whose
+        percentile sits on the 10 % grid {10,20,…,90} take a single
+        ``numpy.take`` per call; trials off the grid fall back to the ring cache.
+
+        Returns ``True`` on completion, ``False`` if cancelled.
+        """
+        from sklearn.neighbors import BallTree
+
+        # ---- Validate that every metric is a GeoDataFrame ----
+        for label, data in (
+            ("veg", self.veg_data),
+            ("terrain", self.terrain_data),
+            ("ndvi", self.ndvi_data),
+        ):
+            if data is None:
+                raise ValueError(
+                    f"Pre-aggregation requires '{label}' metric data; got None."
+                )
+            if not isinstance(data, gpd.GeoDataFrame):
+                raise ValueError(
+                    f"Pre-aggregation requires '{label}' to be a GeoDataFrame; "
+                    "raster metrics are not yet supported in the pre-aggregation path."
+                )
+        if self.target_gdf is None or len(self.target_gdf) == 0:
+            raise ValueError(
+                "Pre-aggregation requires sample points; run split_data() first "
+                "(it triggers prepare_fusion_data())."
+            )
+
+        # ---- Radius ladders (snapped to int + step) ----
+        gvi_lo, gvi_hi, gvi_st = _radius_int_bounds(
+            self.gvi_buffer_min_m, self.gvi_buffer_max_m, self.gvi_buffer_step_m
+        )
+        ndvi_lo, ndvi_hi, ndvi_st = _radius_int_bounds(
+            self.ndvi_buffer_min_m, self.ndvi_buffer_max_m, self.ndvi_buffer_step_m
+        )
+        gvi_radii = tuple(range(gvi_lo, gvi_hi + 1, gvi_st))
+        ndvi_radii = tuple(range(ndvi_lo, ndvi_hi + 1, ndvi_st))
+
+        n_points = len(self.target_gdf)
+        n_stats = len(self._PREAGGR_STAT_NAMES)
+
+        size_mb = (
+            n_points * (len(gvi_radii) * 2 + len(ndvi_radii)) * n_stats * 2
+        ) / (1024 * 1024)
+        _log(
+            "INFO",
+            f"Pre-aggregation: {n_points:,} sample points · "
+            f"GVI radii {gvi_radii} m · NDVI radii {ndvi_radii} m · "
+            f"{n_stats} stats. Estimated table size: ~{size_mb:.1f} MB (float16).",
+        )
+
+        # ---- Project everything to a common metric CRS ----
+        metric_crs = self.target_gdf.estimate_utm_crs()
+        points_m = self.target_gdf.to_crs(metric_crs)
+        point_xy = np.column_stack(
+            [points_m.geometry.x.values, points_m.geometry.y.values]
+        ).astype(np.float64)
+
+        def _prepare(metric_gdf: gpd.GeoDataFrame, default_col: str):
+            col = metric_gdf.attrs.get("metric_column")
+            if not col or col not in metric_gdf.columns:
+                for c in (default_col, "value"):
+                    if c in metric_gdf.columns:
+                        col = c
+                        break
+            if not col:
+                raise ValueError(
+                    f"Pre-aggregation: cannot find value column in "
+                    f"metric (columns: {list(metric_gdf.columns)})."
+                )
+            m = metric_gdf.to_crs(metric_crs)
+            m = m[m[col].notna()]
+            if len(m) == 0:
+                raise ValueError(
+                    f"Pre-aggregation: metric '{col}' has zero non-NaN features."
+                )
+            xy = np.column_stack(
+                [m.geometry.x.values, m.geometry.y.values]
+            ).astype(np.float64)
+            tree = BallTree(xy)
+            return tree, m[col].to_numpy(dtype=np.float32)
+
+        veg_tree, veg_vals = _prepare(self.veg_data, "veg")
+        ter_tree, ter_vals = _prepare(self.terrain_data, "terrain")
+        ndvi_tree, ndvi_vals = _prepare(self.ndvi_data, "NDVI")
+
+        # ---- Allocate tables ----
+        self._preaggr_veg = np.full(
+            (n_points, len(gvi_radii), n_stats), np.nan, dtype=np.float16
+        )
+        self._preaggr_terrain = np.full(
+            (n_points, len(gvi_radii), n_stats), np.nan, dtype=np.float16
+        )
+        self._preaggr_ndvi = np.full(
+            (n_points, len(ndvi_radii), n_stats), np.nan, dtype=np.float16
+        )
+        self._preaggr_gvi_radii = gvi_radii
+        self._preaggr_ndvi_radii = ndvi_radii
+
+        gvi_max = float(max(gvi_radii))
+        ndvi_max = float(max(ndvi_radii))
+
+        # ---- Fill the tables. Per batch we query each tree once at the
+        # largest radius and then derive smaller-radius stats by masking. ----
+        batch_size = 1024
+        last_pct = -1
+        for batch_start in range(0, n_points, batch_size):
+            if cancel_callback is not None and cancel_callback():
+                _log("WARN", "Pre-aggregation cancelled.")
+                self._preaggregation_done = False
+                return False
+
+            batch_end = min(batch_start + batch_size, n_points)
+            batch_xy = point_xy[batch_start:batch_end]
+
+            veg_idx, veg_dist = veg_tree.query_radius(
+                batch_xy, r=gvi_max, return_distance=True
+            )
+            ter_idx, ter_dist = ter_tree.query_radius(
+                batch_xy, r=gvi_max, return_distance=True
+            )
+            nd_idx, nd_dist = ndvi_tree.query_radius(
+                batch_xy, r=ndvi_max, return_distance=True
+            )
+
+            for b in range(batch_end - batch_start):
+                i = batch_start + b
+
+                if len(veg_idx[b]):
+                    v_all, d_all = veg_vals[veg_idx[b]], veg_dist[b]
+                    for r_idx, r in enumerate(gvi_radii):
+                        mask = d_all <= r
+                        if mask.any():
+                            self._preaggr_veg[i, r_idx, :] = (
+                                self._compute_all_stats_inplace(v_all[mask])
+                            )
+
+                if len(ter_idx[b]):
+                    v_all, d_all = ter_vals[ter_idx[b]], ter_dist[b]
+                    for r_idx, r in enumerate(gvi_radii):
+                        mask = d_all <= r
+                        if mask.any():
+                            self._preaggr_terrain[i, r_idx, :] = (
+                                self._compute_all_stats_inplace(v_all[mask])
+                            )
+
+                if len(nd_idx[b]):
+                    v_all, d_all = ndvi_vals[nd_idx[b]], nd_dist[b]
+                    for r_idx, r in enumerate(ndvi_radii):
+                        mask = d_all <= r
+                        if mask.any():
+                            self._preaggr_ndvi[i, r_idx, :] = (
+                                self._compute_all_stats_inplace(v_all[mask])
+                            )
+
+            # Progress: percent-of-points granularity, with caller-side throttling.
+            pct = (batch_end * 100) // max(1, n_points)
+            if pct != last_pct:
+                if progress_callback is not None:
+                    progress_callback(batch_end, n_points)
+                last_pct = pct
+
+        self._preaggregation_done = True
+        _log(
+            "OK",
+            f"Pre-aggregation complete for {n_points:,} sample points.",
+        )
+        return True
+
+    def _lookup_preaggregation(
+        self,
+        point_indices: np.ndarray,
+        channel: str,
+        radius_m: float,
+        stat: str,
+        percentile: int | None,
+    ) -> np.ndarray | None:
+        """Pre-aggregation lookup. Returns float32 array (or None to fall back)."""
+        if not self._preaggregation_done:
+            return None
+
+        s_idx = self._preaggr_stat_index(stat, percentile)
+        if s_idx is None:
+            return None
+
+        if channel == "veg":
+            table = self._preaggr_veg
+            radii = self._preaggr_gvi_radii
+        elif channel == "terrain":
+            table = self._preaggr_terrain
+            radii = self._preaggr_gvi_radii
+        elif channel == "ndvi":
+            table = self._preaggr_ndvi
+            radii = self._preaggr_ndvi_radii
+        else:
+            return None
+
+        r_int = int(round(radius_m))
+        try:
+            r_idx = radii.index(r_int)
+        except ValueError:
+            return None
+
+        return table[np.asarray(point_indices), r_idx, s_idx].astype(np.float32)
+
+    # ------------------------------------------------------------------
+    # Polygon-target areal aggregation
+    # ------------------------------------------------------------------
+
+    def _reference_points_in_polygon(
+        self,
+        polygon_geom,
+        polygon_crs,
+        metric_data,
+    ) -> "gpd.GeoDataFrame":
+        """Return the in-polygon sample-point locations contributed by one metric.
+
+        For raster metrics: pixel centers (as Points) that fall inside the
+        polygon. For vector metrics: each feature whose geometry is strictly
+        inside the polygon, represented by its centroid (always a Point).
+        The returned GeoDataFrame's CRS matches ``polygon_crs``.
+        """
+        from rasterio.transform import xy as _xy
+        from shapely.geometry import Point
+
+        if isinstance(metric_data, dict):  # raster
+            raster_crs = metric_data["crs"]
+            if polygon_crs is not None and str(polygon_crs) != str(raster_crs):
+                poly_r = (
+                    gpd.GeoSeries([polygon_geom], crs=polygon_crs)
+                    .to_crs(raster_crs)
+                    .iloc[0]
+                )
+            else:
+                poly_r = polygon_geom
+
+            transform = metric_data["transform"]
+            height, width = metric_data["data"].shape
+            minx, miny, maxx, maxy = poly_r.bounds
+            from rasterio.transform import rowcol
+
+            r1, c1 = rowcol(transform, minx, maxy)
+            r2, c2 = rowcol(transform, maxx, miny)
+            r_start = max(0, min(r1, r2))
+            r_end = min(height, max(r1, r2) + 1)
+            c_start = max(0, min(c1, c2))
+            c_end = min(width, max(c1, c2) + 1)
+            if r_end <= r_start or c_end <= c_start:
+                return gpd.GeoDataFrame(geometry=[], crs=polygon_crs)
+
+            rows, cols = np.meshgrid(
+                np.arange(r_start, r_end),
+                np.arange(c_start, c_end),
+                indexing="ij",
+            )
+            xs, ys = _xy(transform, rows.flatten(), cols.flatten(), offset="center")
+            cand = gpd.GeoDataFrame(
+                geometry=[Point(x, y) for x, y in zip(xs, ys)],
+                crs=raster_crs,
+            )
+            inside = cand[cand.geometry.within(poly_r)]
+            if len(inside) and polygon_crs is not None:
+                inside = inside.to_crs(polygon_crs)
+            return inside.reset_index(drop=True)
+
+        # Vector metric data
+        m = metric_data
+        if m.crs is not None and polygon_crs is not None and str(m.crs) != str(polygon_crs):
+            m = m.to_crs(polygon_crs)
+        inside = m[m.geometry.within(polygon_geom)]
+        if len(inside) == 0:
+            return gpd.GeoDataFrame(geometry=[], crs=polygon_crs)
+        # Reduce non-Point geometries to centroids
+        geoms = inside.geometry.map(
+            lambda g: g if g.geom_type == "Point" else g.centroid
+        )
+        return gpd.GeoDataFrame(geometry=list(geoms), crs=polygon_crs).reset_index(
+            drop=True
+        )
+
+    def _prepare_polygon_fusion(self) -> pd.DataFrame:
+        """Build a long sample-point dataset from polygon targets (areal mode).
+
+        For each polygon:
+            1. Pick the metric with the most in-polygon features as the reference grid.
+            2. Use *every* in-polygon reference cell as a sample location.
+               If zero are inside, fall back to the polygon's centroid (WARN).
+            3. Stamp each sample point with ``polygon_id`` and the polygon's outcome.
+
+        The exploded sample points then replace ``self.target_gdf`` so the existing
+        ring-cache + ``_aggregate_with_ring_cache`` machinery keeps working.
+        ``_objective`` / ``evaluate_on_test`` / ``apply_fusion`` then group per-row
+        CGI by ``polygon_id`` and take the mean before computing the objective metric.
+        """
+        _log("INFO", "====== POLYGON FUSION ======")
+        if self.target_polygons_gdf is None:
+            self.target_polygons_gdf = self.target_gdf.copy()
+        polygons = self.target_polygons_gdf
+        poly_crs = polygons.crs
+
+        outcome_col = self.target_feature
+        _log(
+            "INFO",
+            f"Aggregating {len(polygons)} polygons with outcome column "
+            f"'{outcome_col}'. Per-polygon CGI = mean(CGI over all inside samples).",
+        )
+
+        metric_sources = [
+            ("veg", self.veg_data),
+            ("terrain", self.terrain_data),
+            ("ndvi", self.ndvi_data),
+        ]
+
+        sample_records: list[dict] = []
+        ref_counts = {"veg": 0, "terrain": 0, "ndvi": 0}
+        fallback_count = 0
+        skipped_nan_outcome = 0
+        total_polys = len(polygons)
+        log_interval = max(1, total_polys // 10)
+
+        for poly_iter_idx, (poly_id, row) in enumerate(polygons.iterrows(), 1):
+            outcome = row.get(outcome_col, np.nan)
+            if pd.isna(outcome):
+                skipped_nan_outcome += 1
+                continue
+            poly_geom = row.geometry
+
+            # Choose reference: metric with most in-polygon features.
+            candidates: dict[str, gpd.GeoDataFrame] = {}
+            for label, data in metric_sources:
+                if data is None:
+                    continue
+                pts = self._reference_points_in_polygon(poly_geom, poly_crs, data)
+                candidates[label] = pts
+
+            if candidates:
+                best_label = max(candidates, key=lambda k: len(candidates[k]))
+                best_pts = candidates[best_label]
+            else:
+                best_label = None
+                best_pts = gpd.GeoDataFrame(geometry=[], crs=poly_crs)
+
+            if len(best_pts) == 0:
+                # Centroid fallback
+                best_pts = gpd.GeoDataFrame(
+                    geometry=[poly_geom.centroid], crs=poly_crs
+                )
+                fallback_count += 1
+            elif best_label is not None:
+                ref_counts[best_label] += 1
+
+            for geom in best_pts.geometry:
+                sample_records.append(
+                    {
+                        "polygon_id": poly_id,
+                        "target": outcome,
+                        "geometry": geom,
+                    }
+                )
+
+            if poly_iter_idx % log_interval == 0 or poly_iter_idx == total_polys:
+                _log(
+                    "INFO",
+                    f"  built sample points for "
+                    f"{poly_iter_idx}/{total_polys} polygons "
+                    f"(total samples so far: {len(sample_records)})",
+                )
+
+        if skipped_nan_outcome:
+            _log(
+                "WARN",
+                f"Skipped {skipped_nan_outcome} polygon(s) with NaN outcome.",
+            )
+        ref_used = [f"{k}:{v}" for k, v in ref_counts.items() if v > 0]
+        if ref_used:
+            _log("INFO", f"Reference metric per polygon — {', '.join(ref_used)}")
+        if fallback_count:
+            _log(
+                "WARN",
+                f"{fallback_count} polygon(s) had no reference cells inside; "
+                "using polygon centroid as the single sample location.",
+            )
+
+        if not sample_records:
+            raise ValueError(
+                "Polygon fusion: no sample points could be generated. "
+                "Check that target polygons overlap the metric data."
+            )
+
+        sample_gdf = gpd.GeoDataFrame(sample_records, crs=poly_crs).reset_index(
+            drop=True
+        )
+        _log(
+            "INFO",
+            f"Generated {len(sample_gdf)} sample points across "
+            f"{sample_gdf['polygon_id'].nunique()} polygons.",
+        )
+
+        # Re-bind target_gdf to the long sample-points view so the ring cache
+        # in _objective/evaluate_on_test/apply_fusion can keep using
+        # ``self.target_gdf.loc[<row index>]`` unchanged.
+        self.target_gdf = sample_gdf
+
+        # Initial metric sampling at each sample location (used for NaN filtering).
+        _log(
+            "INFO",
+            "Sampling metrics at sample locations (initial values for filtering)...",
+        )
+        sample_gdf = self._sample_metrics_at_points(sample_gdf)
+
+        fusion_df = pd.DataFrame(
+            {
+                "polygon_id": sample_gdf["polygon_id"].values,
+                "target": sample_gdf["target"].values,
+                "veg": sample_gdf["veg"].values,
+                "terrain": sample_gdf["terrain"].values,
+                "ndvi": sample_gdf["ndvi"].values,
+            },
+            index=sample_gdf.index,
+        )
+
+        _log("INFO", "====== DATA QUALITY SUMMARY (POLYGON) ======")
+        _log(
+            "INFO",
+            f"Total sample rows: {len(fusion_df)} "
+            f"across {fusion_df['polygon_id'].nunique()} polygons",
+        )
+        for col in ("target", "veg", "terrain", "ndvi"):
+            nan_count = fusion_df[col].isna().sum()
+            pct = nan_count / max(len(fusion_df), 1) * 100
+            _log("INFO", f"{col.capitalize()} NaN: {nan_count} ({pct:.1f}%)")
+
+        result = fusion_df.dropna(subset=["target", "veg", "terrain", "ndvi"])
+        polygons_left = result["polygon_id"].nunique() if len(result) else 0
+        _log(
+            "OK" if polygons_left else "WARN",
+            f"After dropna: {len(result)} sample rows across {polygons_left} polygons",
+        )
+        if polygons_left < 2:
+            raise ValueError(
+                "Polygon fusion needs ≥2 polygons with valid samples after NaN "
+                f"filtering; got {polygons_left}. Check metric coverage."
+            )
+        return result
+
     def _prepare_point_fusion(self) -> pd.DataFrame:
         """Sample metrics at point locations."""
-        import sys
-
-        print("\n[FUSION DEBUG] ====== POINT FUSION ======", flush=True)
-        logger.info("Preparing point-based fusion data...")
-        print("[FUSION DEBUG] Preparing point-based fusion data...", flush=True)
-        sys.stdout.flush()
+        _log("INFO", "====== POINT FUSION ======")
+        _log("INFO", "Preparing point-based fusion data...")
 
         # Only use target points as samples, not buffered area
         points_gdf = self.target_gdf.copy()
@@ -1660,28 +2244,18 @@ class MetricFusionEngine:
         )
 
         # Log data quality before dropping NaN
-        print("\n[FUSION DEBUG] ====== DATA QUALITY SUMMARY (POINT) ======", flush=True)
-        print(f"[FUSION DEBUG] Total rows: {len(fusion_df)}", flush=True)
-        print(
-            f"[FUSION DEBUG] Target NaN: {fusion_df['target'].isna().sum()} ({fusion_df['target'].isna().sum()/len(fusion_df)*100:.1f}%)",
-            flush=True,
-        )
-        print(
-            f"[FUSION DEBUG] Veg NaN: {fusion_df['veg'].isna().sum()} ({fusion_df['veg'].isna().sum()/len(fusion_df)*100:.1f}%)",
-            flush=True,
-        )
-        print(
-            f"[FUSION DEBUG] Terrain NaN: {fusion_df['terrain'].isna().sum()} ({fusion_df['terrain'].isna().sum()/len(fusion_df)*100:.1f}%)",
-            flush=True,
-        )
-        print(
-            f"[FUSION DEBUG] NDVI NaN: {fusion_df['ndvi'].isna().sum()} ({fusion_df['ndvi'].isna().sum()/len(fusion_df)*100:.1f}%)",
-            flush=True,
-        )
-        print("[FUSION DEBUG] ================================\n", flush=True)
+        _log("INFO", "====== DATA QUALITY SUMMARY (POINT) ======")
+        _log("INFO", f"Total rows: {len(fusion_df)}")
+        for col in ("target", "veg", "terrain", "ndvi"):
+            nan_count = fusion_df[col].isna().sum()
+            pct = nan_count / max(len(fusion_df), 1) * 100
+            _log("INFO", f"{col.capitalize()} NaN: {nan_count} ({pct:.1f}%)")
 
         result = fusion_df.dropna()
-        print(f"[FUSION DEBUG] After dropna: {len(result)} valid rows", flush=True)
+        _log(
+            "OK" if len(result) else "WARN",
+            f"After dropna: {len(result)} valid rows",
+        )
 
         if len(result) == 0:
             raise ValueError(
@@ -1717,9 +2291,9 @@ class MetricFusionEngine:
             points_in_veg_crs = points_gdf.to_crs(self.veg_data["crs"])
 
             for idx, point in points_in_veg_crs.iterrows():
-                row, col = rowcol(
-                    self.veg_data["transform"], point.geometry.x, point.geometry.y
-                )
+                geom = point.geometry
+                pt = geom if geom.geom_type == "Point" else geom.centroid
+                row, col = rowcol(self.veg_data["transform"], pt.x, pt.y)
                 if (
                     0 <= row < self.veg_data["data"].shape[0]
                     and 0 <= col < self.veg_data["data"].shape[1]
@@ -1735,56 +2309,25 @@ class MetricFusionEngine:
                         veg_col = col
                         break
 
-            print(
-                f"[FUSION DEBUG] Veg data: {len(self.veg_data)} features, columns: {self.veg_data.columns.tolist()}",
-                flush=True,
+            _log(
+                "INFO",
+                f"Veg data: {len(self.veg_data)} features, "
+                f"columns: {self.veg_data.columns.tolist()}",
             )
-            print(f"[FUSION DEBUG] Using veg column: '{veg_col}'", flush=True)
-            print(
-                f"[FUSION DEBUG] Veg CRS: {self.veg_data.crs}, Points CRS: {points_gdf.crs}",
-                flush=True,
-            )
-            print(
-                f"[FUSION DEBUG] Veg bounds: {self.veg_data.total_bounds}", flush=True
-            )
-            print(
-                f"[FUSION DEBUG] Points bounds: {points_gdf.total_bounds}", flush=True
-            )
-            print(
-                f"[FUSION DEBUG] Nearest-feature max distance (veg): {self.gvi_buffer_max_m}m",
-                flush=True,
+            _log("INFO", f"Using veg column: '{veg_col}'")
+            _log(
+                "INFO",
+                f"Nearest-feature max distance (veg): {self.gvi_buffer_max_m} m",
             )
 
-            # Ensure CRS match before spatial join
-            veg_data_matched = self.veg_data.to_crs(points_gdf.crs)
-            print(
-                f"[FUSION DEBUG] Reprojected veg data to {points_gdf.crs}", flush=True
+            points_gdf["veg"] = _nearest_metric_join(
+                points_gdf, self.veg_data, veg_col, self.gvi_buffer_max_m
             )
-
-            # Spatial join nearest (within buffer distance)
-            points_with_veg = gpd.sjoin_nearest(
-                points_gdf,
-                veg_data_matched[["geometry", veg_col]],
-                how="left",
-                max_distance=self.gvi_buffer_max_m,
-            )
-
-            # Extract the metric column (may have been renamed with suffix)
-            if veg_col in points_with_veg.columns:
-                points_gdf["veg"] = points_with_veg[veg_col]
-            elif f"{veg_col}_right" in points_with_veg.columns:
-                points_gdf["veg"] = points_with_veg[f"{veg_col}_right"]
-            else:
-                print(
-                    f"[FUSION DEBUG] WARNING: Could not find veg column. Available: {points_with_veg.columns.tolist()}",
-                    flush=True,
-                )
-                points_gdf["veg"] = np.nan
 
             veg_valid = points_gdf["veg"].notna().sum()
-            print(
-                f"[FUSION DEBUG] Veg sampling: {veg_valid}/{len(points_gdf)} points have valid values",
-                flush=True,
+            _log(
+                "OK" if veg_valid else "WARN",
+                f"Veg sampling: {veg_valid}/{len(points_gdf)} points have valid values",
             )
 
         # Sample Terrain
@@ -1792,9 +2335,9 @@ class MetricFusionEngine:
             points_in_terrain_crs = points_gdf.to_crs(self.terrain_data["crs"])
 
             for idx, point in points_in_terrain_crs.iterrows():
-                row, col = rowcol(
-                    self.terrain_data["transform"], point.geometry.x, point.geometry.y
-                )
+                geom = point.geometry
+                pt = geom if geom.geom_type == "Point" else geom.centroid
+                row, col = rowcol(self.terrain_data["transform"], pt.x, pt.y)
                 if (
                     0 <= row < self.terrain_data["data"].shape[0]
                     and 0 <= col < self.terrain_data["data"].shape[1]
@@ -1810,35 +2353,22 @@ class MetricFusionEngine:
                         terrain_col = col
                         break
 
-            print(
-                f"[FUSION DEBUG] Terrain data: {len(self.terrain_data)} features, columns: {self.terrain_data.columns.tolist()}",
-                flush=True,
+            _log(
+                "INFO",
+                f"Terrain data: {len(self.terrain_data)} features, "
+                f"columns: {self.terrain_data.columns.tolist()}",
             )
-            print(f"[FUSION DEBUG] Using terrain column: '{terrain_col}'", flush=True)
+            _log("INFO", f"Using terrain column: '{terrain_col}'")
 
-            # Ensure CRS match before spatial join
-            terrain_data_matched = self.terrain_data.to_crs(points_gdf.crs)
-
-            # Spatial join nearest (within buffer distance)
-            points_with_terrain = gpd.sjoin_nearest(
-                points_gdf,
-                terrain_data_matched[["geometry", terrain_col]],
-                how="left",
-                max_distance=self.gvi_buffer_max_m,
+            points_gdf["terrain"] = _nearest_metric_join(
+                points_gdf, self.terrain_data, terrain_col, self.gvi_buffer_max_m
             )
-
-            # Extract the metric column (may have been renamed with suffix)
-            if terrain_col in points_with_terrain.columns:
-                points_gdf["terrain"] = points_with_terrain[terrain_col]
-            elif f"{terrain_col}_right" in points_with_terrain.columns:
-                points_gdf["terrain"] = points_with_terrain[f"{terrain_col}_right"]
-            else:
-                points_gdf["terrain"] = np.nan
 
             terrain_valid = points_gdf["terrain"].notna().sum()
-            print(
-                f"[FUSION DEBUG] Terrain sampling: {terrain_valid}/{len(points_gdf)} points have valid values",
-                flush=True,
+            _log(
+                "OK" if terrain_valid else "WARN",
+                f"Terrain sampling: {terrain_valid}/{len(points_gdf)} "
+                "points have valid values",
             )
 
         # Sample NDVI
@@ -1847,9 +2377,9 @@ class MetricFusionEngine:
             points_in_ndvi_crs = points_gdf.to_crs(self.ndvi_data["crs"])
 
             for idx, point in points_in_ndvi_crs.iterrows():
-                row, col = rowcol(
-                    self.ndvi_data["transform"], point.geometry.x, point.geometry.y
-                )
+                geom = point.geometry
+                pt = geom if geom.geom_type == "Point" else geom.centroid
+                row, col = rowcol(self.ndvi_data["transform"], pt.x, pt.y)
                 if (
                     0 <= row < self.ndvi_data["data"].shape[0]
                     and 0 <= col < self.ndvi_data["data"].shape[1]
@@ -1865,35 +2395,21 @@ class MetricFusionEngine:
                         ndvi_col = col
                         break
 
-            print(
-                f"[FUSION DEBUG] NDVI data: {len(self.ndvi_data)} features, columns: {self.ndvi_data.columns.tolist()}",
-                flush=True,
+            _log(
+                "INFO",
+                f"NDVI data: {len(self.ndvi_data)} features, "
+                f"columns: {self.ndvi_data.columns.tolist()}",
             )
-            print(f"[FUSION DEBUG] Using NDVI column: '{ndvi_col}'", flush=True)
+            _log("INFO", f"Using NDVI column: '{ndvi_col}'")
 
-            # Ensure CRS match before spatial join
-            ndvi_data_matched = self.ndvi_data.to_crs(points_gdf.crs)
-
-            # Spatial join nearest (within buffer distance)
-            points_with_ndvi = gpd.sjoin_nearest(
-                points_gdf,
-                ndvi_data_matched[["geometry", ndvi_col]],
-                how="left",
-                max_distance=self.ndvi_buffer_max_m,
+            points_gdf["ndvi"] = _nearest_metric_join(
+                points_gdf, self.ndvi_data, ndvi_col, self.ndvi_buffer_max_m
             )
-
-            # Extract the metric column (may have been renamed with suffix)
-            if ndvi_col in points_with_ndvi.columns:
-                points_gdf["ndvi"] = points_with_ndvi[ndvi_col]
-            elif f"{ndvi_col}_right" in points_with_ndvi.columns:
-                points_gdf["ndvi"] = points_with_ndvi[f"{ndvi_col}_right"]
-            else:
-                points_gdf["ndvi"] = np.nan
 
             ndvi_valid = points_gdf["ndvi"].notna().sum()
-            print(
-                f"[FUSION DEBUG] NDVI sampling: {ndvi_valid}/{len(points_gdf)} points have valid values",
-                flush=True,
+            _log(
+                "OK" if ndvi_valid else "WARN",
+                f"NDVI sampling: {ndvi_valid}/{len(points_gdf)} points have valid values",
             )
 
         return points_gdf
@@ -1972,30 +2488,18 @@ class MetricFusionEngine:
         )
 
         # Log data quality before dropping NaN
-        print(
-            "\n[FUSION DEBUG] ====== DATA QUALITY SUMMARY (RASTER) ======", flush=True
-        )
-        print(f"[FUSION DEBUG] Total rows: {len(fusion_df)}", flush=True)
-        print(
-            f"[FUSION DEBUG] Target NaN: {fusion_df['target'].isna().sum()} ({fusion_df['target'].isna().sum()/len(fusion_df)*100:.1f}%)",
-            flush=True,
-        )
-        print(
-            f"[FUSION DEBUG] Veg NaN: {fusion_df['veg'].isna().sum()} ({fusion_df['veg'].isna().sum()/len(fusion_df)*100:.1f}%)",
-            flush=True,
-        )
-        print(
-            f"[FUSION DEBUG] Terrain NaN: {fusion_df['terrain'].isna().sum()} ({fusion_df['terrain'].isna().sum()/len(fusion_df)*100:.1f}%)",
-            flush=True,
-        )
-        print(
-            f"[FUSION DEBUG] NDVI NaN: {fusion_df['ndvi'].isna().sum()} ({fusion_df['ndvi'].isna().sum()/len(fusion_df)*100:.1f}%)",
-            flush=True,
-        )
-        print("[FUSION DEBUG] ================================\n", flush=True)
+        _log("INFO", "====== DATA QUALITY SUMMARY (RASTER) ======")
+        _log("INFO", f"Total rows: {len(fusion_df)}")
+        for col in ("target", "veg", "terrain", "ndvi"):
+            nan_count = fusion_df[col].isna().sum()
+            pct = nan_count / max(len(fusion_df), 1) * 100
+            _log("INFO", f"{col.capitalize()} NaN: {nan_count} ({pct:.1f}%)")
 
         result = fusion_df.dropna()
-        print(f"[FUSION DEBUG] After dropna: {len(result)} valid rows", flush=True)
+        _log(
+            "OK" if len(result) else "WARN",
+            f"After dropna: {len(result)} valid rows",
+        )
 
         if len(result) == 0:
             raise ValueError(
@@ -2038,6 +2542,155 @@ class MetricFusionEngine:
         logger.info("Step 2/4: Filtering complete - removed samples with NaN values")
         logger.info(f"Valid samples after filtering: {len(fusion_df)}")
 
+        polygon_mode = "polygon_id" in fusion_df.columns
+
+        if polygon_mode:
+            # ── Polygon-level stratified split ────────────────────────────
+            # Stratify on the *per-polygon* outcome so the distribution of
+            # health outcomes stays balanced across train / val / test, and
+            # all rows from a single polygon stay together to avoid leakage.
+            _log("INFO", "Splitting at polygon level (stratified on outcome)...")
+            poly_df = (
+                fusion_df.groupby("polygon_id", sort=False)["target"]
+                .first()
+                .reset_index()
+            )
+
+            n_polys = len(poly_df)
+            n_test_target = max(1, int(round(test_size * n_polys)))
+            n_trainval_target = n_polys - n_test_target
+
+            # Bin count constrained by: at least 2 polys per bin so each fold
+            # gets ≥1 polygon per class, and ≤ n_test_target so the test split
+            # can include every class.
+            max_bins_for_test = max(2, n_test_target)
+            max_bins_for_kfold = max(2, n_trainval_target // max(k_folds, 1))
+            requested_bins = max(2, self.n_bins)
+            n_bins_eff = min(
+                requested_bins,
+                max_bins_for_test,
+                max_bins_for_kfold,
+                max(2, poly_df["target"].nunique()),
+            )
+
+            try:
+                poly_df["target_bin"] = pd.qcut(
+                    poly_df["target"],
+                    q=n_bins_eff,
+                    labels=False,
+                    duplicates="drop",
+                )
+            except ValueError:
+                poly_df["target_bin"] = 0
+            actual_bins = poly_df["target_bin"].nunique()
+            stratifiable = actual_bins >= 2 and (
+                poly_df["target_bin"].value_counts().min() >= 2
+            )
+            _log(
+                "INFO",
+                f"{n_polys} polygons across {actual_bins} outcome bin(s) "
+                f"(requested {requested_bins}; "
+                f"{'stratified' if stratifiable else 'unstratified — too few polygons per bin'}).",
+            )
+
+            if stratifiable:
+                try:
+                    train_val_poly, test_poly = train_test_split(
+                        poly_df,
+                        test_size=test_size,
+                        stratify=poly_df["target_bin"],
+                        random_state=random_state,
+                    )
+                except ValueError as e:
+                    _log("WARN", f"Stratified split failed ({e}); using random split.")
+                    train_val_poly, test_poly = train_test_split(
+                        poly_df, test_size=test_size, random_state=random_state
+                    )
+                    stratifiable = False
+            else:
+                train_val_poly, test_poly = train_test_split(
+                    poly_df, test_size=test_size, random_state=random_state
+                )
+            train_val_poly = train_val_poly.reset_index(drop=True)
+
+            # Map polygon assignments back to row-level data.
+            train_val_ids = set(train_val_poly["polygon_id"])
+            test_ids = set(test_poly["polygon_id"])
+            self.train_val_data = (
+                fusion_df[fusion_df["polygon_id"].isin(train_val_ids)].copy()
+            )
+            self.test_data = fusion_df[fusion_df["polygon_id"].isin(test_ids)].copy()
+
+            _log(
+                "INFO",
+                f"Split: {len(train_val_poly)} train+val polygons "
+                f"({len(self.train_val_data)} rows), "
+                f"{len(test_poly)} test polygons ({len(self.test_data)} rows).",
+            )
+
+            # K-fold within train_val. Use stratified k-fold only if every bin
+            # has ≥k_folds polygons; otherwise fall back to plain KFold.
+            from sklearn.model_selection import KFold
+
+            min_per_bin = (
+                train_val_poly["target_bin"].value_counts().min()
+                if stratifiable
+                else 0
+            )
+            k_eff = max(2, min(k_folds, len(train_val_poly)))
+            if stratifiable and min_per_bin < k_folds:
+                k_eff = max(2, min(k_folds, min_per_bin))
+                _log(
+                    "WARN",
+                    f"Requested {k_folds}-fold CV but smallest outcome bin has "
+                    f"{min_per_bin} polygons; reducing to {k_eff}-fold.",
+                )
+            self.k_folds = k_eff
+
+            if stratifiable and min_per_bin >= k_eff:
+                splitter = StratifiedKFold(
+                    n_splits=k_eff, shuffle=True, random_state=random_state
+                )
+                split_iter = splitter.split(
+                    train_val_poly, train_val_poly["target_bin"]
+                )
+            else:
+                splitter = KFold(
+                    n_splits=k_eff, shuffle=True, random_state=random_state
+                )
+                split_iter = splitter.split(train_val_poly)
+
+            self.cv_folds = []
+            for fold_idx, (tr_idx, vl_idx) in enumerate(split_iter, 1):
+                tr_polys = set(train_val_poly.iloc[tr_idx]["polygon_id"])
+                vl_polys = set(train_val_poly.iloc[vl_idx]["polygon_id"])
+                train_fold = self.train_val_data[
+                    self.train_val_data["polygon_id"].isin(tr_polys)
+                ].copy()
+                val_fold = self.train_val_data[
+                    self.train_val_data["polygon_id"].isin(vl_polys)
+                ].copy()
+
+                # Normalize features (0-1) using training fold data
+                scaler = MinMaxScaler()
+                train_fold[["veg", "terrain", "ndvi"]] = scaler.fit_transform(
+                    train_fold[["veg", "terrain", "ndvi"]]
+                )
+                val_fold[["veg", "terrain", "ndvi"]] = scaler.transform(
+                    val_fold[["veg", "terrain", "ndvi"]]
+                )
+
+                self.cv_folds.append(
+                    {"train": train_fold, "val": val_fold, "scaler": scaler}
+                )
+                logger.info(
+                    f"  Fold {fold_idx}: train={len(tr_polys)} polys "
+                    f"({len(train_fold)} rows), val={len(vl_polys)} polys "
+                    f"({len(val_fold)} rows)"
+                )
+            return
+
+        # ── Row-level (point / raster) split — original behaviour ────────────
         # Step 3: Create stratification bins based on target values
         logger.info("Step 3/4: Binning target values for stratified sampling...")
         fusion_df["target_bin"] = pd.qcut(
@@ -2099,6 +2752,9 @@ class MetricFusionEngine:
         seed: int = 42,
         show_progress: bool = True,
         progress_callback: Callable[..., Any] | None = None,
+        study_name: str | None = None,
+        study_dir: str | None = None,
+        cancel_callback: Callable[[], bool] | None = None,
     ) -> dict:
         """
         Run Optuna optimization with k-fold cross-validation.
@@ -2111,12 +2767,20 @@ class MetricFusionEngine:
             sampler_type: 'TPE', 'CMA-ES', or 'Random'
             seed: Random seed for reproducibility
             show_progress: Whether to show progress bar
+            study_name: If set together with ``study_dir``, the study is persisted
+                to ``<study_dir>/<study_name>.db`` via Optuna's SQLite storage
+                backend. Re-running with the same name reloads completed trials
+                and runs only the remaining count.
+            study_dir: Output directory for the per-study SQLite file.
 
         Returns:
             Best parameters dictionary
         """
         if self.cv_folds is None:
             raise ValueError("Call split_data() first")
+
+        # Expose cancel callback so _objective can prune long trials mid-fold.
+        self._cancel_callback = cancel_callback
 
         self._clear_ring_caches()
 
@@ -2149,10 +2813,37 @@ class MetricFusionEngine:
         # Determine optimization direction
         direction = "minimize" if objective_metric == "rmse" else "maximize"
 
-        # Create study
-        self.study = optuna.create_study(
-            direction=direction, sampler=sampler, pruner=pruner
-        )
+        # Create study — durable (SQLite RDB) when study_name + study_dir are set,
+        # otherwise in-memory (legacy behavior).
+        if study_name and study_dir:
+            os.makedirs(study_dir, exist_ok=True)
+            storage_path = os.path.join(study_dir, f"{study_name}.db")
+            storage_url = f"sqlite:///{storage_path}"
+            self.study = optuna.create_study(
+                study_name=study_name,
+                storage=storage_url,
+                load_if_exists=True,
+                direction=direction,
+                sampler=sampler,
+                pruner=pruner,
+            )
+            completed = len(
+                [
+                    t
+                    for t in self.study.trials
+                    if t.state == optuna.trial.TrialState.COMPLETE
+                ]
+            )
+            remaining = max(0, int(n_trials) - completed)
+            logger.info(
+                f"Optuna study '{study_name}' loaded "
+                f"({completed} completed); running {remaining} more trial(s)."
+            )
+        else:
+            self.study = optuna.create_study(
+                direction=direction, sampler=sampler, pruner=pruner
+            )
+            remaining = int(n_trials)
 
         # Run optimization
         logger.info(
@@ -2160,22 +2851,27 @@ class MetricFusionEngine:
             f"{objective_metric} metric"
         )
 
-        # Create callback for progress tracking
-        if progress_callback:
-
-            def optuna_callback(study, trial):
-                # Update progress: trial number / total trials
+        # Combined callback: progress + cancellation. Optuna invokes this after
+        # every trial finishes; calling ``study.stop()`` here ends the run at
+        # the next iteration boundary.
+        def optuna_callback(study, trial):
+            if cancel_callback is not None and cancel_callback():
+                logger.info(
+                    f"Cancellation requested — stopping study '{study.study_name}' "
+                    f"after trial {trial.number}."
+                )
+                study.stop()
+                return
+            if progress_callback:
                 progress_callback(trial.number + 1, n_trials)
 
-        else:
-            optuna_callback = None
-
-        self.study.optimize(
-            lambda trial: self._objective(trial, objective_metric),
-            n_trials=n_trials,
-            show_progress_bar=show_progress,
-            callbacks=[optuna_callback] if optuna_callback else None,
-        )
+        if remaining > 0:
+            self.study.optimize(
+                lambda trial: self._objective(trial, objective_metric),
+                n_trials=remaining,
+                show_progress_bar=show_progress,
+                callbacks=[optuna_callback],
+            )
 
         self.best_params = self.study.best_params
         logger.info(
@@ -2265,6 +2961,12 @@ class MetricFusionEngine:
             else trial.suggest_int("terrain_weight", 0, 0)
         )
 
+        # When pre-aggregation is active, percentile suggestions are restricted
+        # to the 10 % grid {10,20,…,90} so every trial maps to a precomputed
+        # cell. Otherwise the original 1-99 search space is used.
+        preaggr_on = getattr(self, "_preaggregation_done", False)
+        pct_grid = list(self._PREAGGR_PERCENTILES)
+
         # ─── Suggest Streetview Parameters (SHARED for veg + terrain) ─────────
         # Only suggest if either veg or terrain has weight > 0
         if veg_weight > 0 or terrain_weight > 0:
@@ -2272,9 +2974,14 @@ class MetricFusionEngine:
                 "streetview_stat", ["mean", "median", "percentile"]
             )
             if streetview_stat == "percentile":
-                streetview_percentile = trial.suggest_int(
-                    "streetview_percentile", 1, 99
-                )
+                if preaggr_on:
+                    streetview_percentile = trial.suggest_categorical(
+                        "streetview_percentile", pct_grid
+                    )
+                else:
+                    streetview_percentile = trial.suggest_int(
+                        "streetview_percentile", 1, 99
+                    )
             else:
                 streetview_percentile = 50
 
@@ -2301,7 +3008,12 @@ class MetricFusionEngine:
                 "ndvi_stat", ["mean", "median", "percentile"]
             )
             if ndvi_stat == "percentile":
-                ndvi_percentile = trial.suggest_int("ndvi_percentile", 1, 99)
+                if preaggr_on:
+                    ndvi_percentile = trial.suggest_categorical(
+                        "ndvi_percentile", pct_grid
+                    )
+                else:
+                    ndvi_percentile = trial.suggest_int("ndvi_percentile", 1, 99)
             else:
                 ndvi_percentile = 50
         else:
@@ -2316,6 +3028,12 @@ class MetricFusionEngine:
         fold_val_pvals = []
 
         for fold_idx, fold in enumerate(self.cv_folds):
+            # Mid-trial cancellation: prune this trial immediately so the
+            # study-level callback sees the next stop signal.
+            cb = getattr(self, "_cancel_callback", None)
+            if cb is not None and cb():
+                raise optuna.TrialPruned("Cancelled by user")
+
             train_data = fold["train"]
             val_data = fold["val"]
 
@@ -2451,6 +3169,33 @@ class MetricFusionEngine:
                 + val_ndvi_norm * ndvi_w
             )
 
+            # Polygon mode: per-row CGI → per-polygon mean CGI, then score
+            # against the per-polygon outcome.
+            if "polygon_id" in train_data.columns:
+                train_pid = train_data["polygon_id"].values
+                val_pid = val_data["polygon_id"].values
+                train_composite = (
+                    pd.Series(train_composite).groupby(train_pid).mean().values
+                )
+                val_composite = (
+                    pd.Series(val_composite).groupby(val_pid).mean().values
+                )
+                train_targets_arr = (
+                    pd.Series(train_data["target"].values)
+                    .groupby(train_pid)
+                    .first()
+                    .values
+                )
+                val_targets_arr = (
+                    pd.Series(val_data["target"].values)
+                    .groupby(val_pid)
+                    .first()
+                    .values
+                )
+            else:
+                train_targets_arr = train_data["target"].values
+                val_targets_arr = val_data["target"].values
+
             # Check for constant values (variance = 0) which cause NaN correlations
             train_valid_vals = train_composite[~np.isnan(train_composite)]
             val_valid_vals = val_composite[~np.isnan(val_composite)]
@@ -2469,10 +3214,10 @@ class MetricFusionEngine:
 
             # Calculate metrics
             train_score = self._calculate_metric(
-                train_data["target"].values, train_composite, metric
+                train_targets_arr, train_composite, metric
             )
             val_score = self._calculate_metric(
-                val_data["target"].values, val_composite, metric
+                val_targets_arr, val_composite, metric
             )
 
             fold_train_scores.append(train_score)
@@ -2488,17 +3233,11 @@ class MetricFusionEngine:
                     warnings.filterwarnings("ignore", category=RuntimeWarning)
                     warnings.filterwarnings("ignore", category=ConstantInputWarning)
                     if metric == "pearson":
-                        _, train_pval = pearsonr(
-                            train_data["target"].values, train_composite
-                        )
-                        _, val_pval = pearsonr(val_data["target"].values, val_composite)
+                        _, train_pval = pearsonr(train_targets_arr, train_composite)
+                        _, val_pval = pearsonr(val_targets_arr, val_composite)
                     else:
-                        _, train_pval = spearmanr(
-                            train_data["target"].values, train_composite
-                        )
-                        _, val_pval = spearmanr(
-                            val_data["target"].values, val_composite
-                        )
+                        _, train_pval = spearmanr(train_targets_arr, train_composite)
+                        _, val_pval = spearmanr(val_targets_arr, val_composite)
 
                     fold_train_pvals.append(train_pval)
                     fold_val_pvals.append(val_pval)
@@ -2852,8 +3591,21 @@ class MetricFusionEngine:
             + test_ndvi_norm * ndvi_w
         )
 
-        # Calculate test score
-        test_targets = self.test_data["target"].values
+        # Polygon mode: aggregate per-row CGI by polygon before scoring against
+        # the per-polygon outcome.
+        if "polygon_id" in self.test_data.columns:
+            test_pid = self.test_data["polygon_id"].values
+            test_composite = (
+                pd.Series(test_composite).groupby(test_pid).mean().values
+            )
+            test_targets = (
+                pd.Series(self.test_data["target"].values)
+                .groupby(test_pid)
+                .first()
+                .values
+            )
+        else:
+            test_targets = self.test_data["target"].values
         test_score = self._calculate_metric(test_targets, test_composite, metric)
 
         # Calculate p-value for correlation metrics
@@ -2987,6 +3739,24 @@ class MetricFusionEngine:
         result_df["terrain"] = all_terrain
         result_df["ndvi"] = all_ndvi
         result_df["composite"] = composite
+
+        # Polygon mode: collapse per-sample rows into one row per polygon.
+        # Each polygon's composite is the mean of per-sample CGIs inside it,
+        # which is what the optimizer was scoring against the per-polygon outcome.
+        if "polygon_id" in result_df.columns:
+            poly_df = (
+                result_df.groupby("polygon_id", sort=False)
+                .agg(
+                    target=("target", "first"),
+                    veg=("veg", "mean"),
+                    terrain=("terrain", "mean"),
+                    ndvi=("ndvi", "mean"),
+                    composite=("composite", "mean"),
+                    n_samples=("composite", "count"),
+                )
+                .reset_index()
+            )
+            return poly_df
 
         return result_df
 

@@ -16,11 +16,12 @@ These are direct lifts of the workers that used to live in ``ui/tabs/``:
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import threading
 import time
 from collections.abc import Mapping
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 import geopandas as gpd
@@ -29,9 +30,13 @@ import pandas as pd
 import rasterio
 
 from geofuse.gvi import GVIEngine
+from geofuse.logger import get_logger
 from geofuse.ndvi import NDVIEngine
 from geofuse.persistence.job_executor import JobContext
 from geofuse.vision import get_best_device
+
+_log_ndvi = get_logger("NDVI")
+_log_fusion = get_logger("FUSION")
 
 # ---------------------------------------------------------------------------
 # GVI engine cache (replaces @st.cache_resource _get_gvi_engine)
@@ -335,7 +340,7 @@ def run_ndvi_column(
         if result.get("status") == "cancelled":
             return {"output_paths": output_paths}
         if result.get("status") != "success":
-            print(f"[NDVI column] {target_date} failed: {result.get('message')}")
+            _log_ndvi("WARN", f"Column run for {target_date} failed: {result.get('message')}")
             continue
 
         tif_path = os.path.join(output_dir, f"{tmp_name}_ndvi.tif")
@@ -385,6 +390,24 @@ def run_ndvi_column(
 # ---------------------------------------------------------------------------
 
 
+_STUDY_NAME_UNSAFE = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def _build_fusion_study_name(
+    target_display_name: str,
+    label: str,
+    objective_metric: str,
+    suffix: str = "",
+) -> str:
+    """Filesystem-safe Optuna ``study_name`` (also the SQLite filename stem)."""
+    stem = os.path.splitext(target_display_name or "target")[0]
+    parts = [stem, str(label), objective_metric]
+    if suffix:
+        parts.append(suffix)
+    raw = "__".join(parts)
+    return _STUDY_NAME_UNSAFE.sub("_", raw).strip("_") or "fusion_study"
+
+
 def run_fusion(
     ctx: JobContext,
     *,
@@ -422,6 +445,9 @@ def run_fusion(
     multi_objective_requested: bool,
     output_dir: str,
     MetricFusionEngine,
+    target_display_name: str = "target",
+    resume_existing_study: bool = True,
+    pre_aggregate: bool = False,
 ) -> dict:
     """Run fusion optimization. Mirrors the previous ``_fusion_worker``."""
     try:
@@ -430,13 +456,13 @@ def run_fusion(
         multi_outcome = len([t for t in targets if t is not None]) > 1
 
         if multi_objective_requested and multi_outcome:
-            print(
-                "[FUSION] Multi-objective optimization run requested — "
-                "joint study not implemented yet; running separate single-objective "
-                "studies per outcome."
+            _log_fusion(
+                "WARN",
+                "Multi-objective optimization run requested — joint study not "
+                "implemented yet; running separate single-objective studies per outcome.",
             )
 
-        print(f"[FUSION] Starting fusion job {ctx.job_id} ({n_t} target run(s))")
+        _log_fusion("INFO", f"Starting fusion job {ctx.job_id} ({n_t} target run(s))")
 
         by_target: dict = {}
         engines_by_target: dict = {}
@@ -545,12 +571,69 @@ def run_fusion(
                 gvi_grid_spacing_m=gvi_grid_spacing_m,
             )
 
-            ctx.progress(value=prog(0.3), status_text=f"{prefix}Splitting data...")
+            ctx.progress(
+                value=prog(0.28),
+                status_text=(
+                    f"{prefix}Preparing fusion samples + splitting data "
+                    "(can take a while on large polygon targets)..."
+                ),
+            )
             engine.split_data(test_size=test_size, k_folds=k_folds, random_state=42)
+
+            # Optional spatial pre-processing: pre-aggregate per-point × radius
+            # × stat lookup table so every Optuna trial is a numpy.take.
+            if pre_aggregate:
+                _last_pct = {"v": -1}
+
+                def preaggr_progress(current: int, total: int) -> None:
+                    pct = (current * 100) // max(1, total)
+                    if pct == _last_pct["v"]:
+                        return
+                    _last_pct["v"] = pct
+                    ctx.set_extra(
+                        preaggr_progress={
+                            "current": current,
+                            "total": total,
+                            "percent": pct,
+                        }
+                    )
+                    ctx.progress(
+                        value=prog(0.30 + 0.04 * pct / 100),
+                        status_text=(
+                            f"{prefix}Spatial pre-processing: "
+                            f"{current:,}/{total:,} points ({pct}%)"
+                        ),
+                    )
+                    ctx.heartbeat()
+
+                completed = engine.precompute_aggregations(
+                    progress_callback=preaggr_progress,
+                    cancel_callback=cancel_check,
+                )
+                # Clear the dedicated preaggr_progress sub-bar so it doesn't
+                # linger past this stage in the monitor.
+                ctx.set_extra(preaggr_progress=None)
+                if not completed or ctx.is_cancelled():
+                    return {"output_paths": output_paths}
 
             ctx.progress(
                 value=prog(0.35),
                 status_text=f"{prefix}Optimizing ({n_trials} trials)...",
+            )
+            study_dir = os.path.join(output_dir, "fusion_studies")
+            # When the user opts out of resume, suffix the study name with a
+            # timestamp so a fresh SQLite file is created instead of attaching
+            # to the existing one.
+            suffix = (
+                ""
+                if resume_existing_study
+                else datetime.now().strftime("%Y%m%dT%H%M%S")
+            )
+            study_name = _build_fusion_study_name(
+                target_display_name=target_display_name,
+                label=label,
+                objective_metric=objective_metric,
+                suffix=suffix,
             )
             best_params = engine.optimize_fusion(
                 n_trials=n_trials,
@@ -560,7 +643,12 @@ def run_fusion(
                 sampler_type=sampler_type,
                 seed=42,
                 show_progress=False,
+                study_name=study_name,
+                study_dir=study_dir,
+                cancel_callback=cancel_check,
             )
+            if ctx.is_cancelled():
+                return {"output_paths": output_paths}
 
             ctx.progress(
                 value=prog(0.85), status_text=f"{prefix}Filtering robust trials..."

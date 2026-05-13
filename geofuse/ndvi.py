@@ -17,6 +17,10 @@ from rasterio.transform import array_bounds
 from rasterio.warp import Resampling, calculate_default_transform, reproject
 from shapely.geometry import box, mapping
 
+from .logger import get_logger
+
+_log = get_logger("NDVI")
+
 # TODO: NDVI_CACHE - Implement local caching of Earth Engine tiles to reduce API calls
 # TODO: NDVI_LANDSAT - Add Landsat 8/9 support alongside Sentinel-2
 # TODO: NDVI_TEMPORAL - Add time-series analysis for seasonal greenery changes
@@ -67,7 +71,7 @@ class NDVIEngine:
             else:
                 ee.Initialize()
         except ee.EEException as e:
-            print(f"[WARN] Earth Engine Init Failed: {e}")
+            _log("WARN", f"Earth Engine init failed: {e}")
             try:
                 ee.Authenticate()
                 ee.Initialize()
@@ -313,8 +317,10 @@ class NDVIEngine:
         needs_tiling = width_km > max_tile_size_km or height_km > max_tile_size_km
 
         if needs_tiling:
-            print(
-                f"[NDVI] Large area detected ({width_km:.1f}x{height_km:.1f} km). Using tiled download..."
+            _log(
+                "INFO",
+                f"Large area detected ({width_km:.1f}x{height_km:.1f} km). "
+                "Using tiled download...",
             )
             return self._download_with_tiling(
                 ndvi_median,
@@ -330,8 +336,9 @@ class NDVIEngine:
                 write_geojson=write_geojson,
             )
         else:
-            print(
-                f"[NDVI] Area size: {width_km:.1f}x{height_km:.1f} km. Single download..."
+            _log(
+                "INFO",
+                f"Area size: {width_km:.1f}x{height_km:.1f} km. Single download...",
             )
             return self._download_single(
                 ndvi_median,
@@ -476,7 +483,7 @@ class NDVIEngine:
         x = minx
         tile_idx = 0
 
-        print(f"[NDVI] Creating tile grid (max {max_tile_size_km} km per tile)...")
+        _log("INFO", f"Creating tile grid (max {max_tile_size_km} km per tile)...")
 
         while x < maxx:
             x_end = min(x + tile_size_deg, maxx)
@@ -490,7 +497,7 @@ class NDVIEngine:
 
             x = x_end
 
-        print(f"[NDVI] Generated {len(tiles)} tiles. Downloading...")
+        _log("INFO", f"Generated {len(tiles)} tiles. Downloading...")
 
         n_tiles = len(tiles)
         _emit_ndvi_progress(
@@ -510,7 +517,7 @@ class NDVIEngine:
                 if cancel_callback and cancel_callback():
                     return {"status": "cancelled", "message": "Cancelled by user"}
 
-                print(f"[NDVI] Downloading tile {idx+1}/{len(tiles)}...")
+                _log("INFO", f"Downloading tile {idx+1}/{len(tiles)}...")
 
                 tile_aoi = _shapely_to_ee_geometry(tile_geom)
                 tile_ndvi = ndvi_median.clip(tile_aoi)
@@ -549,7 +556,7 @@ class NDVIEngine:
                     )
 
                 except Exception as e:
-                    print(f"[NDVI] Warning: Tile {idx+1} failed: {e}")
+                    _log("WARN", f"Tile {idx+1} failed: {e}")
                     continue
 
             if cancel_callback and cancel_callback():
@@ -558,8 +565,10 @@ class NDVIEngine:
             if not tile_files:
                 return {"status": "error", "message": "All tiles failed to download"}
 
-            print(
-                f"[NDVI] Successfully downloaded {len(tile_files)}/{len(tiles)} tiles. Mosaicking..."
+            _log(
+                "OK",
+                f"Successfully downloaded {len(tile_files)}/{len(tiles)} tiles. "
+                "Mosaicking...",
             )
 
             if cancel_callback and cancel_callback():
@@ -601,7 +610,7 @@ class NDVIEngine:
                 for src in src_files_to_mosaic:
                     src.close()
 
-                print(f"[NDVI] Mosaic complete: {final_tif}")
+                _log("OK", f"Mosaic complete: {final_tif}")
                 mosaic_ok = True
 
             except Exception as e:
