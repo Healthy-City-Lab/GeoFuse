@@ -29,6 +29,62 @@ from geofuse.jobs.runners import run_ndvi, run_ndvi_column
 # ---------------------------------------------------------------------------
 
 
+def _ndvi_size_hint(buffer_m: int, resolution_m: int) -> None:
+    """Inline banner: estimated pixel count and GeoTIFF tile expectations.
+
+    Driven by the bbox of all uploaded NDVI datasets (already in EPSG:4326),
+    buffered by ``buffer_m``. Cheap heuristic — uses planar approximation at
+    each dataset's centroid latitude.
+    """
+    datasets = st.session_state.get("ndvi_datasets") or {}
+    if resolution_m <= 0:
+        return
+    bbox_minx = bbox_miny = float("inf")
+    bbox_maxx = bbox_maxy = float("-inf")
+    total_area_m2 = 0.0
+    have_data = False
+    for d in datasets.values():
+        raw = d.get("raw") if isinstance(d, dict) else None
+        if raw is None or len(raw) == 0:
+            continue
+        minx, miny, maxx, maxy = raw.total_bounds
+        if not np.isfinite([minx, miny, maxx, maxy]).all():
+            continue
+        have_data = True
+        bbox_minx = min(bbox_minx, minx)
+        bbox_miny = min(bbox_miny, miny)
+        bbox_maxx = max(bbox_maxx, maxx)
+        bbox_maxy = max(bbox_maxy, maxy)
+        cent_lat = (miny + maxy) / 2.0
+        m_per_deg_lat = 111000.0
+        m_per_deg_lon = 111000.0 * float(np.cos(np.radians(cent_lat)))
+        # bbox area in metres (NDVI rasterizes the bbox of the buffered geom)
+        width_m = (maxx - minx) * m_per_deg_lon + 2 * max(buffer_m, 0)
+        height_m = (maxy - miny) * m_per_deg_lat + 2 * max(buffer_m, 0)
+        total_area_m2 += max(0.0, width_m) * max(0.0, height_m)
+    if not have_data:
+        return
+
+    est_cells = int(total_area_m2 / (resolution_m * resolution_m))
+    span_lon = bbox_maxx - bbox_minx
+    span_lat = bbox_maxy - bbox_miny
+    msgs: list[str] = []
+    if est_cells > 0:
+        msgs.append(f"Estimated NDVI pixels: ~{est_cells:,}")
+    if est_cells > 1_000_000:
+        msgs.append(
+            "Vector output of every pixel would be very large — prefer GeoTIFF, "
+            "or use GeoPackage instead of GeoJSON if you need vector samples."
+        )
+    if span_lon > 6.0 or span_lat > 6.0:
+        msgs.append(
+            f"Study area spans {span_lon:.1f}° lon × {span_lat:.1f}° lat — "
+            "Earth Engine downloads will be tiled automatically."
+        )
+    if msgs:
+        st.info(" · ".join(msgs))
+
+
 def render(output_dir: str) -> None:
     st.header("NDVI Sourcing")
 
@@ -353,20 +409,35 @@ def render(output_dir: str) -> None:
                     else:
                         st.warning("No attribute columns found in this file.")
 
-    oc_ndvi_a, oc_ndvi_b = st.columns(2)
+    _ndvi_size_hint(
+        int(st.session_state.get("ndvi_buffer", 0)),
+        int(st.session_state.get("ndvi_res", 10)),
+    )
+
+    oc_ndvi_a, oc_ndvi_b, oc_ndvi_c = st.columns(3)
     with oc_ndvi_a:
         st.checkbox(
             "Save GeoTIFF",
             value=True,
             key="ndvi_out_geotiff",
-            help="Raster NDVI. At least one of GeoTIFF or GeoJSON must stay on to run.",
+            help="Raster NDVI surface (primary format for NDVI).",
         )
     with oc_ndvi_b:
         st.checkbox(
+            "Save GeoPackage",
+            value=False,
+            key="ndvi_out_gpkg",
+            help=(
+                "Vector samples in EPSG:4326, single file, readable by every "
+                "modern GIS. Recommended over GeoJSON for large outputs."
+            ),
+        )
+    with oc_ndvi_c:
+        st.checkbox(
             "Save GeoJSON",
-            value=True,
+            value=False,
             key="ndvi_out_geojson",
-            help="Vector summary per job. At least one output format must stay on.",
+            help="Compatibility option only. Slow to read past ~100k points.",
         )
     run = st.button(
         "🚀 Run NDVI Analysis",
@@ -378,9 +449,11 @@ def render(output_dir: str) -> None:
     cloud_pct = int(st.session_state.get("ndvi_cloud", 10))
     resolution = int(st.session_state.get("ndvi_res", 10))
     buffer_m = int(st.session_state.get("ndvi_buffer", 0))
-    ndvi_out_ok = st.session_state.get(
-        "ndvi_out_geotiff", True
-    ) or st.session_state.get("ndvi_out_geojson", True)
+    ndvi_out_ok = (
+        st.session_state.get("ndvi_out_geotiff", True)
+        or st.session_state.get("ndvi_out_gpkg", False)
+        or st.session_state.get("ndvi_out_geojson", False)
+    )
 
     if run:
         if not ndvi_out_ok:
@@ -393,7 +466,8 @@ def render(output_dir: str) -> None:
             store = get_job_store()
             executor = get_job_executor()
             save_gt = st.session_state.get("ndvi_out_geotiff", True)
-            save_gj = st.session_state.get("ndvi_out_geojson", True)
+            save_gj = st.session_state.get("ndvi_out_geojson", False)
+            save_gp = st.session_state.get("ndvi_out_gpkg", False)
             jobs_started = 0
             validation_errors = []
 
@@ -448,6 +522,7 @@ def render(output_dir: str) -> None:
                                 "buffer_m": buffer_m,
                                 "output_name": output_name,
                                 "save_geotiff": save_gt,
+                                "save_gpkg": save_gp,
                                 "save_geojson": save_gj,
                             },
                         )
@@ -464,6 +539,7 @@ def render(output_dir: str) -> None:
                             output_name=output_name,
                             output_dir=output_dir,
                             save_geotiff=save_gt,
+                            save_gpkg=save_gp,
                             save_geojson=save_gj,
                         )
                         jobs_started += 1
@@ -499,6 +575,7 @@ def render(output_dir: str) -> None:
                                 "buffer_m": buffer_m,
                                 "output_name": output_name,
                                 "save_geotiff": save_gt,
+                                "save_gpkg": save_gp,
                                 "save_geojson": save_gj,
                             },
                         )
@@ -515,6 +592,7 @@ def render(output_dir: str) -> None:
                             output_name=output_name,
                             output_dir=output_dir,
                             save_geotiff=save_gt,
+                            save_gpkg=save_gp,
                             save_geojson=save_gj,
                         )
                         jobs_started += 1
@@ -541,6 +619,7 @@ def render(output_dir: str) -> None:
                                 "resolution": resolution,
                                 "buffer_m": buffer_m,
                                 "save_geotiff": save_gt,
+                                "save_gpkg": save_gp,
                                 "save_geojson": save_gj,
                             },
                         )
@@ -556,6 +635,7 @@ def render(output_dir: str) -> None:
                             buffer_m=buffer_m,
                             output_dir=output_dir,
                             save_geotiff=save_gt,
+                            save_gpkg=save_gp,
                             save_geojson=save_gj,
                         )
                         jobs_started += 1

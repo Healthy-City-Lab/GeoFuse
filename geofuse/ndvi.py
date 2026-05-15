@@ -163,26 +163,27 @@ class NDVIEngine:
                         resampling=Resampling.nearest,
                     )
 
-    def _raster_to_ndvi_points_geojson(
+    def _raster_to_ndvi_points(
         self,
         final_tif: str,
-        geojson_path: str,
         geometry,
         *,
+        geojson_path: str | None,
+        gpkg_path: str | None,
         ndvi_progress_callback: Callable[[Mapping[str, Any]], None] | None,
         cancel_callback: Callable[[], bool] | None,
         sub_start: float,
         sub_end: float,
         meta_extra: dict[str, Any] | None = None,
     ) -> dict:
-        """Read NDVI raster and write a point GeoJSON (compact vs raw float noise)."""
+        """Read NDVI raster, build a point GDF, write to GeoJSON and/or GeoPackage."""
         if cancel_callback and cancel_callback():
             return {"status": "cancelled", "message": "Cancelled by user"}
 
         _emit_ndvi_progress(
             ndvi_progress_callback,
             sub_progress=sub_start,
-            phase="Writing GeoJSON",
+            phase="Writing vector samples",
         )
 
         try:
@@ -221,12 +222,15 @@ class NDVIEngine:
                         clip_geom = clip_geom.to_crs("EPSG:4326")
                     gdf_out = gpd.clip(gdf_out, clip_geom)
 
-                gdf_out.to_file(geojson_path, driver="GeoJSON")
+                if gpkg_path:
+                    gdf_out.to_file(gpkg_path, driver="GPKG", layer="ndvi_samples")
+                if geojson_path:
+                    gdf_out.to_file(geojson_path, driver="GeoJSON")
 
                 _emit_ndvi_progress(
                     ndvi_progress_callback,
                     sub_progress=sub_end,
-                    phase="Writing GeoJSON",
+                    phase="Writing vector samples",
                 )
 
                 meta = {"crs": str(src.crs)}
@@ -236,6 +240,7 @@ class NDVIEngine:
                     "status": "success",
                     "tif": final_tif,
                     "geojson": geojson_path,
+                    "gpkg": gpkg_path,
                     "meta": meta,
                 }
 
@@ -256,6 +261,7 @@ class NDVIEngine:
         ndvi_progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
         write_geotiff: bool = True,
         write_geojson: bool = True,
+        write_geopackage: bool = False,
     ):
         """
         Download and process NDVI data with automatic tiling for large areas.
@@ -276,13 +282,14 @@ class NDVIEngine:
                 ``clear_bracket`` (drop tile bracket after tiles are done).
             write_geotiff: Persist ``{output_name}_ndvi.tif`` when True.
             write_geojson: Persist ``{output_name}_ndvi.geojson`` when True (needs raster).
+            write_geopackage: Persist ``{output_name}_ndvi.gpkg`` when True (needs raster).
         """
         os.makedirs(folder, exist_ok=True)
 
-        if not write_geotiff and not write_geojson:
+        if not (write_geotiff or write_geojson or write_geopackage):
             return {
                 "status": "error",
-                "message": "Enable at least one output format (GeoTIFF or GeoJSON).",
+                "message": "Enable at least one output format (GeoTIFF, GeoPackage, or GeoJSON).",
             }
 
         # 1. Convert Geometry
@@ -334,6 +341,7 @@ class NDVIEngine:
                 ndvi_progress_callback=ndvi_progress_callback,
                 write_geotiff=write_geotiff,
                 write_geojson=write_geojson,
+                write_geopackage=write_geopackage,
             )
         else:
             _log(
@@ -351,6 +359,7 @@ class NDVIEngine:
                 ndvi_progress_callback=ndvi_progress_callback,
                 write_geotiff=write_geotiff,
                 write_geojson=write_geojson,
+                write_geopackage=write_geopackage,
             )
 
     def _download_single(
@@ -365,6 +374,7 @@ class NDVIEngine:
         ndvi_progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
         write_geotiff: bool = True,
         write_geojson: bool = True,
+        write_geopackage: bool = False,
     ):
         """Download NDVI as a single tile (for small areas)."""
         _emit_ndvi_progress(
@@ -428,7 +438,7 @@ class NDVIEngine:
             crs_meta = "EPSG:4326"
         meta: dict[str, Any] = {"crs": crs_meta}
 
-        if not write_geojson:
+        if not (write_geojson or write_geopackage):
             _emit_ndvi_progress(
                 ndvi_progress_callback,
                 sub_progress=0.99,
@@ -438,14 +448,25 @@ class NDVIEngine:
                 "status": "success",
                 "tif": final_tif if write_geotiff else None,
                 "geojson": None,
+                "gpkg": None,
                 "meta": meta,
             }
 
-        geojson_path = os.path.join(folder, f"{output_name}_ndvi.geojson")
-        out = self._raster_to_ndvi_points_geojson(
+        geojson_path = (
+            os.path.join(folder, f"{output_name}_ndvi.geojson")
+            if write_geojson
+            else None
+        )
+        gpkg_path = (
+            os.path.join(folder, f"{output_name}_ndvi.gpkg")
+            if write_geopackage
+            else None
+        )
+        out = self._raster_to_ndvi_points(
             final_tif,
-            geojson_path,
             geometry,
+            geojson_path=geojson_path,
+            gpkg_path=gpkg_path,
             ndvi_progress_callback=ndvi_progress_callback,
             cancel_callback=cancel_callback,
             sub_start=0.52,
@@ -473,6 +494,7 @@ class NDVIEngine:
         ndvi_progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
         write_geotiff: bool = True,
         write_geojson: bool = True,
+        write_geopackage: bool = False,
     ):
         """Download NDVI in tiles and mosaic them together (for large areas)."""
         minx, miny, maxx, maxy = bounds
@@ -637,7 +659,7 @@ class NDVIEngine:
         except Exception:
             meta_base["crs"] = "EPSG:4326"
 
-        if not write_geojson:
+        if not (write_geojson or write_geopackage):
             _emit_ndvi_progress(
                 ndvi_progress_callback,
                 sub_progress=0.99,
@@ -647,14 +669,25 @@ class NDVIEngine:
                 "status": "success",
                 "tif": final_tif if write_geotiff else None,
                 "geojson": None,
+                "gpkg": None,
                 "meta": meta_base,
             }
 
-        geojson_path = os.path.join(folder, f"{output_name}_ndvi.geojson")
-        out = self._raster_to_ndvi_points_geojson(
+        geojson_path = (
+            os.path.join(folder, f"{output_name}_ndvi.geojson")
+            if write_geojson
+            else None
+        )
+        gpkg_path = (
+            os.path.join(folder, f"{output_name}_ndvi.gpkg")
+            if write_geopackage
+            else None
+        )
+        out = self._raster_to_ndvi_points(
             final_tif,
-            geojson_path,
             None,
+            geojson_path=geojson_path,
+            gpkg_path=gpkg_path,
             ndvi_progress_callback=ndvi_progress_callback,
             cancel_callback=cancel_callback,
             sub_start=0.88,

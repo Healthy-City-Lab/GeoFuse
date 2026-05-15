@@ -11,6 +11,9 @@ from shapely.geometry import MultiPoint, MultiPolygon, Polygon
 from shapely.strtree import STRtree
 
 from .crs_utils import WGS84_EPSG, reproject_geodataframe_to_wgs84, select_grid_crs
+from .logger import get_logger
+
+_log_core = get_logger("GVI")
 
 # Inside-buffer vs outside-buffer in the raster mask (any value other than *fill* works).
 _RASTER_INSIDE = 1
@@ -169,6 +172,19 @@ def generate_clustered_grid(
         per-cluster GeoTIFF writer).
     """
     grid_crs, distortion, choice_name = select_grid_crs(gdf_4326)
+    if distortion > 0.02:
+        _log_core(
+            "WARN",
+            f"Grid CRS distortion ~ {distortion * 100:.2f}% across the extent "
+            f"({choice_name}). Sampling accuracy is preserved but planar "
+            f"distances may drift across widely-spaced clusters.",
+        )
+    else:
+        _log_core(
+            "INFO",
+            f"Grid CRS: {choice_name} (max planar distortion ~ "
+            f"{distortion * 100:.3f}%).",
+        )
     gdf_m = gdf_4326.to_crs(grid_crs)
     buffered = gdf_m.geometry.union_all()
     if buffer_m > 0:
