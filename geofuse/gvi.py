@@ -480,6 +480,17 @@ class GVIEngine:
             return gpd.GeoDataFrame()
 
         pano_cache = external_cache if external_cache is not None else {}
+        # Bulk-load the persistent cache into its in-memory overlay so every
+        # per-point lookup is a dict hit instead of a SQLite round-trip.
+        if hasattr(pano_cache, "preload"):
+            try:
+                n_cached = pano_cache.preload()
+                _log("INFO", f"Pano cache preloaded: {n_cached:,} entries in-memory.")
+            except Exception as e:
+                _log(
+                    "WARN",
+                    f"Pano cache preload failed: {type(e).__name__}: {e}",
+                )
 
         _progress_cb = progress_callback
         _close_pbar = False
