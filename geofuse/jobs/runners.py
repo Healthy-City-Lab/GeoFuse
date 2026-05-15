@@ -307,6 +307,7 @@ def run_ndvi(
     output_dir: str,
     save_geotiff: bool,
     save_geojson: bool,
+    save_gpkg: bool = False,
 ) -> dict:
     """Run NDVI for a single date range."""
     from geofuse.crs_utils import buffer_gdf_union_metres
@@ -332,6 +333,7 @@ def run_ndvi(
         ndvi_progress_callback=on_progress,
         write_geotiff=save_geotiff,
         write_geojson=save_geojson,
+        write_geopackage=save_gpkg,
     )
 
     if result.get("status") == "cancelled":
@@ -343,6 +345,9 @@ def run_ndvi(
     tif_path = os.path.join(output_dir, f"{output_name}_ndvi.tif")
     if save_geotiff and os.path.exists(tif_path):
         output_paths.append(tif_path)
+    gpkg_path = os.path.join(output_dir, f"{output_name}_ndvi.gpkg")
+    if save_gpkg and os.path.exists(gpkg_path):
+        output_paths.append(gpkg_path)
     gj_path = os.path.join(output_dir, f"{output_name}_ndvi.geojson")
     if save_geojson and os.path.exists(gj_path):
         output_paths.append(gj_path)
@@ -364,6 +369,7 @@ def run_ndvi_column(
     output_dir: str,
     save_geotiff: bool,
     save_geojson: bool,
+    save_gpkg: bool = False,
 ) -> dict:
     """Run NDVI extraction per feature using a date column."""
     from geofuse.crs_utils import buffer_gdf_union_metres
@@ -456,10 +462,14 @@ def run_ndvi_column(
             pd.concat(all_results, ignore_index=True), crs=gdf.crs
         )
         merged = merged.drop(columns=["_parsed_date"], errors="ignore")
-        out_path = os.path.join(output_dir, f"{base_name}_temporal_ndvi.geojson")
         if save_geojson:
-            merged.to_file(out_path, driver="GeoJSON")
-            output_paths.append(out_path)
+            gj_path = os.path.join(output_dir, f"{base_name}_temporal_ndvi.geojson")
+            merged.to_file(gj_path, driver="GeoJSON")
+            output_paths.append(gj_path)
+        if save_gpkg:
+            gpkg_path = os.path.join(output_dir, f"{base_name}_temporal_ndvi.gpkg")
+            merged.to_file(gpkg_path, driver="GPKG", layer="ndvi_samples")
+            output_paths.append(gpkg_path)
         dataset_data["results"] = merged
 
     ctx.progress(value=1.0, status_text="Completed")

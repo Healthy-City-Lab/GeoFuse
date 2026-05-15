@@ -353,20 +353,30 @@ def render(output_dir: str) -> None:
                     else:
                         st.warning("No attribute columns found in this file.")
 
-    oc_ndvi_a, oc_ndvi_b = st.columns(2)
+    oc_ndvi_a, oc_ndvi_b, oc_ndvi_c = st.columns(3)
     with oc_ndvi_a:
         st.checkbox(
             "Save GeoTIFF",
             value=True,
             key="ndvi_out_geotiff",
-            help="Raster NDVI. At least one of GeoTIFF or GeoJSON must stay on to run.",
+            help="Raster NDVI surface (primary format for NDVI).",
         )
     with oc_ndvi_b:
         st.checkbox(
+            "Save GeoPackage",
+            value=False,
+            key="ndvi_out_gpkg",
+            help=(
+                "Vector samples in EPSG:4326, single file, readable by every "
+                "modern GIS. Recommended over GeoJSON for large outputs."
+            ),
+        )
+    with oc_ndvi_c:
+        st.checkbox(
             "Save GeoJSON",
-            value=True,
+            value=False,
             key="ndvi_out_geojson",
-            help="Vector summary per job. At least one output format must stay on.",
+            help="Compatibility option only. Slow to read past ~100k points.",
         )
     run = st.button(
         "🚀 Run NDVI Analysis",
@@ -378,9 +388,11 @@ def render(output_dir: str) -> None:
     cloud_pct = int(st.session_state.get("ndvi_cloud", 10))
     resolution = int(st.session_state.get("ndvi_res", 10))
     buffer_m = int(st.session_state.get("ndvi_buffer", 0))
-    ndvi_out_ok = st.session_state.get(
-        "ndvi_out_geotiff", True
-    ) or st.session_state.get("ndvi_out_geojson", True)
+    ndvi_out_ok = (
+        st.session_state.get("ndvi_out_geotiff", True)
+        or st.session_state.get("ndvi_out_gpkg", False)
+        or st.session_state.get("ndvi_out_geojson", False)
+    )
 
     if run:
         if not ndvi_out_ok:
@@ -393,7 +405,8 @@ def render(output_dir: str) -> None:
             store = get_job_store()
             executor = get_job_executor()
             save_gt = st.session_state.get("ndvi_out_geotiff", True)
-            save_gj = st.session_state.get("ndvi_out_geojson", True)
+            save_gj = st.session_state.get("ndvi_out_geojson", False)
+            save_gp = st.session_state.get("ndvi_out_gpkg", False)
             jobs_started = 0
             validation_errors = []
 
@@ -448,6 +461,7 @@ def render(output_dir: str) -> None:
                                 "buffer_m": buffer_m,
                                 "output_name": output_name,
                                 "save_geotiff": save_gt,
+                                "save_gpkg": save_gp,
                                 "save_geojson": save_gj,
                             },
                         )
@@ -464,6 +478,7 @@ def render(output_dir: str) -> None:
                             output_name=output_name,
                             output_dir=output_dir,
                             save_geotiff=save_gt,
+                            save_gpkg=save_gp,
                             save_geojson=save_gj,
                         )
                         jobs_started += 1
@@ -499,6 +514,7 @@ def render(output_dir: str) -> None:
                                 "buffer_m": buffer_m,
                                 "output_name": output_name,
                                 "save_geotiff": save_gt,
+                                "save_gpkg": save_gp,
                                 "save_geojson": save_gj,
                             },
                         )
@@ -515,6 +531,7 @@ def render(output_dir: str) -> None:
                             output_name=output_name,
                             output_dir=output_dir,
                             save_geotiff=save_gt,
+                            save_gpkg=save_gp,
                             save_geojson=save_gj,
                         )
                         jobs_started += 1
@@ -541,6 +558,7 @@ def render(output_dir: str) -> None:
                                 "resolution": resolution,
                                 "buffer_m": buffer_m,
                                 "save_geotiff": save_gt,
+                                "save_gpkg": save_gp,
                                 "save_geojson": save_gj,
                             },
                         )
@@ -556,6 +574,7 @@ def render(output_dir: str) -> None:
                             buffer_m=buffer_m,
                             output_dir=output_dir,
                             save_geotiff=save_gt,
+                            save_gpkg=save_gp,
                             save_geojson=save_gj,
                         )
                         jobs_started += 1
