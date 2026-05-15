@@ -65,6 +65,66 @@ def _gvi_discard_heavy_dataset_fields() -> None:
     gc.collect()
 
 
+def _gvi_size_hint(buffer_m: int, step_m: int) -> None:
+    """Show an inline banner with rough sample-count and CRS-choice expectations.
+
+    Driven by previously-committed widget values (form widgets don't commit
+    until submit), so the message updates on each form interaction cycle.
+    """
+    if step_m <= 0:
+        return
+    bbox_minx = bbox_miny = float("inf")
+    bbox_maxx = bbox_maxy = float("-inf")
+    total_area_m2 = 0.0
+    have_data = False
+    for d in st.session_state.datasets.values():
+        if d.get("type") == "restored":
+            continue
+        raw = d.get("raw")
+        if raw is None or len(raw) == 0:
+            continue
+        minx, miny, maxx, maxy = raw.total_bounds
+        if not np.isfinite([minx, miny, maxx, maxy]).all():
+            continue
+        have_data = True
+        bbox_minx = min(bbox_minx, minx)
+        bbox_miny = min(bbox_miny, miny)
+        bbox_maxx = max(bbox_maxx, maxx)
+        bbox_maxy = max(bbox_maxy, maxy)
+        cent_lat = (miny + maxy) / 2.0
+        m_per_deg_lat = 111000.0
+        m_per_deg_lon = 111000.0 * float(np.cos(np.radians(cent_lat)))
+        if d.get("type") == "point":
+            n = len(raw)
+            disk = np.pi * (max(buffer_m, 0)) ** 2
+            total_area_m2 += n * disk
+        else:
+            try:
+                deg2 = float(raw.geometry.area.sum())
+                total_area_m2 += deg2 * m_per_deg_lat * m_per_deg_lon
+            except Exception:
+                pass
+    if not have_data:
+        return
+
+    est_pts = int(total_area_m2 / (step_m * step_m))
+    span_lon = bbox_maxx - bbox_minx
+    span_lat = bbox_maxy - bbox_miny
+    msgs: list[str] = []
+    if est_pts > 0:
+        msgs.append(f"Estimated sample points: ~{est_pts:,}")
+    if est_pts > 100_000:
+        msgs.append(
+            "GeoJSON is slow to read at this scale — keep GeoPackage on as your primary output."
+        )
+    if span_lon > 6.0 or span_lat > 6.0:
+        msgs.append(
+            f"Study area spans {span_lon:.1f}° lon × {span_lat:.1f}° lat — grid math will use Lambert Conformal Conic; outputs stay in WGS84."
+        )
+    if msgs:
+        st.info(" · ".join(msgs))
+
+
 def _gvi_materialize_grids_if_missing(gvi_buffer: int, gvi_res: int) -> None:
     """Set ``processed`` / ``meta`` for datasets that still need a grid."""
     gc.collect()
@@ -503,6 +563,11 @@ def render(output_dir: str, parent_dir: str) -> None:
             st_folium(
                 m_input, width="100%", height=500, key="map_input", returned_objects=[]
             )
+
+        _gvi_size_hint(
+            int(st.session_state.get("gvi_buffer", 0)),
+            int(st.session_state.get("gvi_res", 50)),
+        )
 
         oc_gvi_a, oc_gvi_b, oc_gvi_c = st.columns(3)
         with oc_gvi_a:

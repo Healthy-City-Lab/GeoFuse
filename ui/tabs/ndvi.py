@@ -29,6 +29,62 @@ from geofuse.jobs.runners import run_ndvi, run_ndvi_column
 # ---------------------------------------------------------------------------
 
 
+def _ndvi_size_hint(buffer_m: int, resolution_m: int) -> None:
+    """Inline banner: estimated pixel count and GeoTIFF tile expectations.
+
+    Driven by the bbox of all uploaded NDVI datasets (already in EPSG:4326),
+    buffered by ``buffer_m``. Cheap heuristic — uses planar approximation at
+    each dataset's centroid latitude.
+    """
+    datasets = st.session_state.get("ndvi_datasets") or {}
+    if resolution_m <= 0:
+        return
+    bbox_minx = bbox_miny = float("inf")
+    bbox_maxx = bbox_maxy = float("-inf")
+    total_area_m2 = 0.0
+    have_data = False
+    for d in datasets.values():
+        raw = d.get("raw") if isinstance(d, dict) else None
+        if raw is None or len(raw) == 0:
+            continue
+        minx, miny, maxx, maxy = raw.total_bounds
+        if not np.isfinite([minx, miny, maxx, maxy]).all():
+            continue
+        have_data = True
+        bbox_minx = min(bbox_minx, minx)
+        bbox_miny = min(bbox_miny, miny)
+        bbox_maxx = max(bbox_maxx, maxx)
+        bbox_maxy = max(bbox_maxy, maxy)
+        cent_lat = (miny + maxy) / 2.0
+        m_per_deg_lat = 111000.0
+        m_per_deg_lon = 111000.0 * float(np.cos(np.radians(cent_lat)))
+        # bbox area in metres (NDVI rasterizes the bbox of the buffered geom)
+        width_m = (maxx - minx) * m_per_deg_lon + 2 * max(buffer_m, 0)
+        height_m = (maxy - miny) * m_per_deg_lat + 2 * max(buffer_m, 0)
+        total_area_m2 += max(0.0, width_m) * max(0.0, height_m)
+    if not have_data:
+        return
+
+    est_cells = int(total_area_m2 / (resolution_m * resolution_m))
+    span_lon = bbox_maxx - bbox_minx
+    span_lat = bbox_maxy - bbox_miny
+    msgs: list[str] = []
+    if est_cells > 0:
+        msgs.append(f"Estimated NDVI pixels: ~{est_cells:,}")
+    if est_cells > 1_000_000:
+        msgs.append(
+            "Vector output of every pixel would be very large — prefer GeoTIFF, "
+            "or use GeoPackage instead of GeoJSON if you need vector samples."
+        )
+    if span_lon > 6.0 or span_lat > 6.0:
+        msgs.append(
+            f"Study area spans {span_lon:.1f}° lon × {span_lat:.1f}° lat — "
+            "Earth Engine downloads will be tiled automatically."
+        )
+    if msgs:
+        st.info(" · ".join(msgs))
+
+
 def render(output_dir: str) -> None:
     st.header("NDVI Sourcing")
 
@@ -352,6 +408,11 @@ def render(output_dir: str) -> None:
                         )
                     else:
                         st.warning("No attribute columns found in this file.")
+
+    _ndvi_size_hint(
+        int(st.session_state.get("ndvi_buffer", 0)),
+        int(st.session_state.get("ndvi_res", 10)),
+    )
 
     oc_ndvi_a, oc_ndvi_b, oc_ndvi_c = st.columns(3)
     with oc_ndvi_a:
