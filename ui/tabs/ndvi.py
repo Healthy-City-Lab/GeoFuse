@@ -23,6 +23,7 @@ from streamlit_folium import st_folium
 
 from geofuse.crs_utils import reproject_geodataframe_to_wgs84
 from geofuse.jobs.runners import run_ndvi, run_ndvi_column
+from geofuse.vector_io import geometry_sha256
 
 # ---------------------------------------------------------------------------
 # Tab render entry point
@@ -524,6 +525,7 @@ def render(output_dir: str) -> None:
                                 "save_geotiff": save_gt,
                                 "save_gpkg": save_gp,
                                 "save_geojson": save_gj,
+                                "geometry_sha256": geometry_sha256(d["raw"]),
                             },
                         )
                         executor.submit_runner(
@@ -577,6 +579,7 @@ def render(output_dir: str) -> None:
                                 "save_geotiff": save_gt,
                                 "save_gpkg": save_gp,
                                 "save_geojson": save_gj,
+                                "geometry_sha256": geometry_sha256(d["raw"]),
                             },
                         )
                         executor.submit_runner(
@@ -621,6 +624,7 @@ def render(output_dir: str) -> None:
                                 "save_geotiff": save_gt,
                                 "save_gpkg": save_gp,
                                 "save_geojson": save_gj,
+                                "geometry_sha256": geometry_sha256(d["raw"]),
                             },
                         )
                         executor.submit_runner(

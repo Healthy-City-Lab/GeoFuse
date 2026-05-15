@@ -28,6 +28,7 @@ from streamlit_folium import st_folium
 
 from geofuse.crs_utils import reproject_geodataframe_to_wgs84
 from geofuse.jobs.runners import run_gvi
+from geofuse.vector_io import geometry_sha256
 
 
 def _gvi_output_tif_path(output_dir: str, base_name: str) -> str | None:
@@ -746,6 +747,7 @@ def render(output_dir: str, parent_dir: str) -> None:
                     "save_geojson": save_gj,
                     "model_path": model_path,
                     "has_api_key": api_key is not None,
+                    "geometry_sha256": geometry_sha256(d["raw"]),
                 }
                 sig = _gvi_signature(job_params)
 
