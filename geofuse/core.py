@@ -6,9 +6,11 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 from rasterio import features
-from rasterio.transform import from_bounds, xy
+from rasterio.transform import from_bounds, from_origin, xy
+from shapely.geometry import MultiPoint, MultiPolygon, Polygon
+from shapely.strtree import STRtree
 
-from .crs_utils import reproject_geodataframe_to_wgs84
+from .crs_utils import WGS84_EPSG, reproject_geodataframe_to_wgs84, select_grid_crs
 
 # Inside-buffer vs outside-buffer in the raster mask (any value other than *fill* works).
 _RASTER_INSIDE = 1
@@ -140,3 +142,153 @@ def generate_raster_grid(gdf_4326, spacing_meters):
         "height": height,
         "crs": "EPSG:4326",
     }
+
+
+def generate_clustered_grid(
+    gdf_4326: gpd.GeoDataFrame,
+    buffer_m: float,
+    step_m: float,
+    anchor: tuple[float, float] = (0.0, 0.0),
+):
+    """Cluster-aware anchored sampling grid for nation-scale point inputs.
+
+    Buffers + unions input geometries in an auto-selected planar CRS, splits
+    the result into connected components, and generates a ``step_m``-spaced
+    grid per cluster snapped to a single global anchor in the planar CRS.
+    Sample points across all clusters land on one unified grid so no
+    resampling is needed if downstream code rasterizes the output.
+
+    Returns ``(GeoDataFrame, meta)``:
+      * GeoDataFrame columns ``row, col, x, y, cluster_id`` and Point geometry
+        in EPSG:4326. ``row`` / ``col`` index the *global* anchored grid in the
+        planar CRS — they are stable across clusters and runs given the same
+        anchor + step.
+      * ``meta`` dict with ``grid_crs_wkt``, ``anchor_x``, ``anchor_y``,
+        ``step_m``, ``distortion``, ``choice_name``, and ``clusters`` (one
+        entry per cluster: bounds, height, width, transform — used by the
+        per-cluster GeoTIFF writer).
+    """
+    grid_crs, distortion, choice_name = select_grid_crs(gdf_4326)
+    gdf_m = gdf_4326.to_crs(grid_crs)
+    buffered = gdf_m.geometry.union_all()
+    if buffer_m > 0:
+        buffered = buffered.buffer(buffer_m)
+
+    x0, y0 = float(anchor[0]), float(anchor[1])
+    base_meta: dict = {
+        "grid_crs_wkt": grid_crs.to_wkt(),
+        "anchor_x": x0,
+        "anchor_y": y0,
+        "step_m": float(step_m),
+        "distortion": float(distortion),
+        "choice_name": choice_name,
+        "clusters": [],
+    }
+
+    if buffered.is_empty:
+        empty = gpd.GeoDataFrame(
+            columns=["row", "col", "x", "y", "cluster_id"],
+            geometry=[],
+            crs=WGS84_EPSG,
+        )
+        return empty, base_meta
+
+    if isinstance(buffered, MultiPolygon):
+        cluster_polys = list(buffered.geoms)
+    elif isinstance(buffered, Polygon):
+        cluster_polys = [buffered]
+    else:
+        cluster_polys = [
+            g for g in getattr(buffered, "geoms", []) if isinstance(g, Polygon)
+        ]
+
+    all_rows: list[np.ndarray] = []
+    all_cols: list[np.ndarray] = []
+    all_x: list[np.ndarray] = []
+    all_y: list[np.ndarray] = []
+    all_cid: list[np.ndarray] = []
+    cluster_meta: list[dict] = []
+
+    for cid, poly in enumerate(cluster_polys):
+        if poly.is_empty:
+            continue
+        cmin_x, cmin_y, cmax_x, cmax_y = poly.bounds
+        col_min = int(np.floor((cmin_x - x0) / step_m))
+        col_max = int(np.ceil((cmax_x - x0) / step_m))
+        row_min = int(np.floor((y0 - cmax_y) / step_m))
+        row_max = int(np.ceil((y0 - cmin_y) / step_m))
+
+        local_width = max(0, col_max - col_min)
+        local_height = max(0, row_max - row_min)
+        if local_width == 0 or local_height == 0:
+            continue
+
+        cols_range = np.arange(col_min, col_max)
+        rows_range = np.arange(row_min, row_max)
+        col_grid, row_grid = np.meshgrid(cols_range, rows_range)
+        col_flat = col_grid.ravel()
+        row_flat = row_grid.ravel()
+        x_flat = x0 + (col_flat + 0.5) * step_m
+        y_flat = y0 - (row_flat + 0.5) * step_m
+
+        candidate_pts = MultiPoint(list(zip(x_flat.tolist(), y_flat.tolist())))
+        tree = STRtree(list(candidate_pts.geoms))
+        inside = tree.query(poly, predicate="contains")
+
+        snapped_left = x0 + col_min * step_m
+        snapped_top = y0 - row_min * step_m
+        local_transform = from_origin(snapped_left, snapped_top, step_m, step_m)
+        cluster_meta.append(
+            {
+                "cluster_id": cid,
+                "row_min": int(row_min),
+                "row_max": int(row_max),
+                "col_min": int(col_min),
+                "col_max": int(col_max),
+                "height": int(local_height),
+                "width": int(local_width),
+                "transform": local_transform,
+                "bbox_grid_crs": (
+                    float(snapped_left),
+                    float(snapped_top - local_height * step_m),
+                    float(snapped_left + local_width * step_m),
+                    float(snapped_top),
+                ),
+            }
+        )
+
+        if len(inside) == 0:
+            continue
+
+        all_rows.append(row_flat[inside])
+        all_cols.append(col_flat[inside])
+        all_x.append(x_flat[inside])
+        all_y.append(y_flat[inside])
+        all_cid.append(np.full(inside.size, cid, dtype=np.int64))
+
+    base_meta["clusters"] = cluster_meta
+
+    if not all_x:
+        empty = gpd.GeoDataFrame(
+            columns=["row", "col", "x", "y", "cluster_id"],
+            geometry=[],
+            crs=WGS84_EPSG,
+        )
+        return empty, base_meta
+
+    rows_arr = np.concatenate(all_rows).astype(np.int64)
+    cols_arr = np.concatenate(all_cols).astype(np.int64)
+    x_arr = np.concatenate(all_x)
+    y_arr = np.concatenate(all_y)
+    cid_arr = np.concatenate(all_cid).astype(np.int64)
+
+    pts_grid_crs = gpd.GeoDataFrame(
+        {"row": rows_arr, "col": cols_arr, "cluster_id": cid_arr},
+        geometry=gpd.points_from_xy(x_arr, y_arr),
+        crs=grid_crs,
+    )
+    pts_4326 = pts_grid_crs.to_crs(WGS84_EPSG)
+    pts_4326["x"] = pts_4326.geometry.x.to_numpy()
+    pts_4326["y"] = pts_4326.geometry.y.to_numpy()
+
+    return pts_4326, base_meta

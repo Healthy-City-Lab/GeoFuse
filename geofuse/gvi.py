@@ -7,9 +7,6 @@ import aiohttp
 import geopandas as gpd
 import numpy as np
 from PIL import Image
-from rasterio.transform import from_origin
-from shapely.geometry import MultiPoint
-from shapely.strtree import STRtree
 from tqdm import tqdm
 
 # --- CONFIGURATION ---
@@ -139,94 +136,6 @@ class GVIEngine:
         img_cropped = img.crop((x_min, y_min, x_max, y_max))
         target_height = int(target_width / 2)
         return img_cropped.resize((target_width, target_height), Image.BILINEAR)
-
-    def _generate_pixel_aligned_grid(self, gdf, resolution):
-        """Generate sampling grid using vectorized STRtree point-in-polygon query."""
-        if gdf.crs.is_geographic:
-            centroid = gdf.geometry.iloc[0].centroid
-            lon, lat = centroid.x, centroid.y
-            utm_zone = int((lon + 180) / 6) + 1
-            utm_crs = (
-                f"EPSG:326{utm_zone:02d}" if lat >= 0 else f"EPSG:327{utm_zone:02d}"
-            )
-            print(f"[GVI] Converting from {gdf.crs} to {utm_crs} for grid generation")
-            gdf_metric = gdf.to_crs(utm_crs)
-        else:
-            gdf_metric = gdf
-            utm_crs = None
-
-        minx, miny, maxx, maxy = gdf_metric.total_bounds
-        width = int(np.ceil((maxx - minx) / resolution))
-        height = int(np.ceil((maxy - miny) / resolution))
-
-        print(f"[GVI] Grid dimensions: {width}x{height} = {width * height} points")
-
-        max_points = 5_000_000
-        if width * height > max_points:
-            raise ValueError(
-                f"Grid too large: {width}x{height} = {width * height:,} points "
-                f"(max {max_points:,}). "
-                f"For a ~{(maxx - minx) / 1000:.1f}x{(maxy - miny) / 1000:.1f} km area, "
-                f"try step >= {int(np.sqrt((maxx - minx) * (maxy - miny) / max_points))} m."
-            )
-
-        cx = minx + (np.arange(width) + 0.5) * resolution
-        cy = maxy - (np.arange(height) + 0.5) * resolution
-        col_idx, row_idx = np.meshgrid(np.arange(width), np.arange(height))
-        x_all = (minx + (col_idx + 0.5) * resolution).ravel()
-        y_all = (maxy - (row_idx + 0.5) * resolution).ravel()
-        rows_all = row_idx.ravel()
-        cols_all = col_idx.ravel()
-
-        union_geom = gdf_metric.geometry.union_all()
-        candidate_points = MultiPoint(list(zip(x_all.tolist(), y_all.tolist())))
-        tree = STRtree(list(candidate_points.geoms))
-        inside_indices = tree.query(union_geom, predicate="within")
-
-        if len(inside_indices) == 0:
-            if gdf.crs.is_geographic:
-                return (
-                    [],
-                    height,
-                    width,
-                    from_origin(minx, maxy, resolution, resolution),
-                )
-            return [], height, width, from_origin(minx, maxy, resolution, resolution)
-
-        x_in = x_all[inside_indices]
-        y_in = y_all[inside_indices]
-        r_in = rows_all[inside_indices]
-        c_in = cols_all[inside_indices]
-
-        print(f"[GVI] Generated {len(x_in)} points within polygon")
-
-        if gdf.crs.is_geographic:
-            pts_gdf = gpd.GeoDataFrame(
-                geometry=gpd.points_from_xy(x_in, y_in),
-                crs=utm_crs,
-            ).to_crs(gdf.crs)
-            x_out = pts_gdf.geometry.x.to_numpy()
-            y_out = pts_gdf.geometry.y.to_numpy()
-        else:
-            x_out, y_out = x_in, y_in
-
-        transform = from_origin(minx, maxy, resolution, resolution)
-        pixel_centers = [
-            {
-                "geometry": (
-                    pts_gdf.geometry.iloc[i]
-                    if gdf.crs.is_geographic
-                    else gpd.points_from_xy([x_out[i]], [y_out[i]])[0]
-                ),
-                "row": int(r_in[i]),
-                "col": int(c_in[i]),
-                "lat": float(y_out[i]),
-                "lon": float(x_out[i]),
-            }
-            for i in range(len(x_out))
-        ]
-
-        return pixel_centers, height, width, transform
 
     async def _process_one_point_async(
         self,
@@ -416,6 +325,7 @@ class GVIEngine:
             "lon": search_lon,
             "row": pt["row"],
             "col": pt["col"],
+            "cluster_id": pt.get("cluster_id", 0),
         }
 
     @staticmethod
@@ -432,6 +342,7 @@ class GVIEngine:
             "lon": search_lon,
             "row": pt["row"],
             "col": pt["col"],
+            "cluster_id": pt.get("cluster_id", 0),
         }
 
     async def _run_analysis_async(
@@ -524,33 +435,41 @@ class GVIEngine:
         if save_masks:
             os.makedirs(os.path.join(folder, "masks"), exist_ok=True)
 
+        # Polygon fallback: caller passed raw polygons instead of pre-generating
+        # the sampling grid. The UI always pre-generates via generate_clustered_grid,
+        # so this branch is only hit by direct API callers.
         first_geom = gdf.geometry.iloc[0]
-        points = []
-
         if first_geom.geom_type in ["Polygon", "MultiPolygon"]:
-            points_data, _, _, _ = self._generate_pixel_aligned_grid(gdf, step)
-            for i, p in enumerate(points_data):
-                p["orig_index"] = i
-            points = points_data
-        else:
-            has_indices = "row" in gdf.columns and "col" in gdf.columns
-            for idx, row in gdf.iterrows():
-                points.append(
-                    {
-                        "orig_index": idx,
-                        "geometry": row.geometry,
-                        "row": int(row["row"]) if has_indices else 0,
-                        "col": int(row["col"]) if has_indices else idx,
-                        "lat": row.geometry.y,
-                        "lon": row.geometry.x,
-                    }
-                )
-            if has_indices:
-                rows = gdf["row"].max() + 1
-                cols = gdf["col"].max() + 1
+            from .core import generate_clustered_grid
+
+            gdf_4326 = (
+                gdf
+                if gdf.crs is not None and gdf.crs.is_geographic
+                else gdf.to_crs("EPSG:4326")
+            )
+            pts_gdf, _meta = generate_clustered_grid(
+                gdf_4326, buffer_m=0, step_m=float(step)
+            )
+            gdf = pts_gdf
+
+        points = []
+        has_indices = "row" in gdf.columns and "col" in gdf.columns
+        has_cluster = "cluster_id" in gdf.columns
+        for idx, row in gdf.iterrows():
+            points.append(
+                {
+                    "orig_index": idx,
+                    "geometry": row.geometry,
+                    "row": int(row["row"]) if has_indices else 0,
+                    "col": int(row["col"]) if has_indices else int(idx),  # type: ignore[arg-type]
+                    "cluster_id": int(row["cluster_id"]) if has_cluster else 0,
+                    "lat": row.geometry.y,
+                    "lon": row.geometry.x,
+                }
+            )
 
         if not points:
-            print("[FAIL] No points to process.")
+            _log("ERROR", "No points to process.")
             return gpd.GeoDataFrame()
 
         total_points = len(points)

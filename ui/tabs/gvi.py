@@ -11,7 +11,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import rasterio
 import streamlit as st
-from helpers import apply_buffer_m, generate_raster_grid, load_vector_upload_sessions
+from helpers import (
+    apply_buffer_m,
+    generate_clustered_grid,
+    load_vector_upload_sessions,
+)
 from map_preview import (
     add_study_area_layers,
     add_uniform_point_layer,
@@ -61,22 +65,6 @@ def _gvi_discard_heavy_dataset_fields() -> None:
     gc.collect()
 
 
-def _gvi_geotiff_only_points_blocked() -> bool:
-    """True when Run would error: GeoTIFF-only with point study areas and no buffer."""
-    save_gt = st.session_state.get("gvi_out_geotiff", True)
-    save_gj = st.session_state.get("gvi_out_geojson", True)
-    gbuf = int(st.session_state.get("gvi_buffer", 0))
-    return bool(
-        save_gt
-        and not save_gj
-        and any(
-            d.get("type") == "point" and gbuf <= 0
-            for d in st.session_state.datasets.values()
-            if d.get("type") != "restored"
-        )
-    )
-
-
 def _gvi_materialize_grids_if_missing(gvi_buffer: int, gvi_res: int) -> None:
     """Set ``processed`` / ``meta`` for datasets that still need a grid."""
     gc.collect()
@@ -86,8 +74,8 @@ def _gvi_materialize_grids_if_missing(gvi_buffer: int, gvi_res: int) -> None:
         if d.get("processed") is not None:
             continue
         if _gvi_dataset_uses_raster_grid(d, gvi_buffer):
-            pts, meta = generate_raster_grid(
-                apply_buffer_m(d["raw"], gvi_buffer), gvi_res
+            pts, meta = generate_clustered_grid(
+                d["raw"], buffer_m=float(gvi_buffer), step_m=float(gvi_res)
             )
             d["processed"] = pts
             d["meta"] = meta
@@ -118,29 +106,122 @@ def render(output_dir: str, parent_dir: str) -> None:
     # --- SESSION STATE ---
     if "datasets" not in st.session_state:
         st.session_state.datasets = {}
-    if "master_cache" not in st.session_state:
-        # In-memory pano cache for the current Streamlit process.
-        # Feature 1 will replace this with a SQLite-backed PanoCache singleton.
-        st.session_state.master_cache = {}
     if "gvi_inspector_select" not in st.session_state:
         st.session_state.gvi_inspector_select = None
 
-    # JobStore + executor are process-level singletons (see ui/services.py).
+    # JobStore + executor + PanoCache are process-level singletons (see ui/services.py).
     # We import them lazily here to keep tab modules free of side-effect imports.
-    from services import get_job_executor, get_job_store
+    from services import (
+        ansi_log_lines_to_html,
+        get_job_executor,
+        get_job_store,
+        get_pano_cache,
+    )
+
+    from geofuse.logger import get_job_log_lines
 
     store = get_job_store()
     executor = get_job_executor()
+    pano_cache = get_pano_cache()
 
     # --- SIDEBAR JOB MONITOR ---
     def callback_dismiss_job(jid):
-        store.dismiss(jid)
+        # Permanently remove from SQLite history as well so the entry doesn't
+        # reappear next time the page is loaded.
+        store.purge(jid)
 
     def callback_cancel_job(jid):
         store.request_cancel(jid)
 
     _ACTIVE = {"queued", "running"}
     _TERMINAL = {"completed", "error", "cancelled", "interrupted"}
+    _EMOJI = {
+        "fusion": "🔀",
+        "ndvi": "🛰️",
+        "ndvi_column": "🛰️",
+        "gvi": "🌳",
+    }
+    _TERMINAL_LABELS = {
+        "completed": "✅ Completed",
+        "cancelled": "🚫 Cancelled",
+        "interrupted": "⏸️ Interrupted (process restarted)",
+        "error": "❌ Error",
+    }
+
+    def _render_details(rec) -> None:
+        """Key/value summary of job parameters inside the Details expander."""
+        p = rec.params or {}
+        if rec.type == "gvi":
+            st.write(f"**Grid step:** {p.get('step', '?')} m")
+            st.write(f"**Buffer:** {p.get('buffer', '?')} m")
+            st.write(
+                f"**Save panos / masks:** "
+                f"{bool(p.get('save_panos'))} / {bool(p.get('save_masks'))}"
+            )
+            st.write(
+                f"**Outputs:** GeoPackage={bool(p.get('save_gpkg', True))} · "
+                f"GeoTIFF={bool(p.get('save_geotiff'))} · "
+                f"GeoJSON={bool(p.get('save_geojson'))}"
+            )
+            st.write(
+                f"**Street View API key:** {'yes' if p.get('has_api_key') else 'no'}"
+            )
+        elif rec.type in ("ndvi", "ndvi_column"):
+            mode = p.get("mode", "?")
+            st.write(f"**Mode:** {mode}")
+            if mode == "range":
+                st.write(
+                    f"**Date range:** {p.get('start_date', '?')} → "
+                    f"{p.get('end_date', '?')}"
+                )
+            elif mode == "specific":
+                st.write(
+                    f"**Target date:** {p.get('target_date', '?')} "
+                    f"(window ±{p.get('window_days', '?')} d)"
+                )
+            elif mode == "column":
+                st.write(
+                    f"**Date column:** {p.get('date_column', '?')} "
+                    f"(window ±{p.get('window_days', '?')} d)"
+                )
+            st.write(f"**Cloud max:** {p.get('cloud_pct', '?')}%")
+            st.write(f"**Resolution:** {p.get('resolution', '?')} m")
+            st.write(f"**Buffer:** {p.get('buffer_m', '?')} m")
+            st.write(
+                f"**Outputs:** GeoTIFF={bool(p.get('save_geotiff'))} · "
+                f"GeoJSON={bool(p.get('save_geojson'))}"
+            )
+        elif rec.type == "fusion":
+            st.write(
+                f"**Trials:** {p.get('n_trials', '?')} "
+                f"(startup {p.get('n_startup_trials', '?')})"
+            )
+            st.write(f"**Objective:** {p.get('objective_metric', '?')}")
+            st.write(
+                f"**Sampler:** {p.get('sampler_type', '?')} · "
+                f"**Pruner:** {p.get('pruner_type', '?')}"
+            )
+            outcomes = p.get("outcome_columns") or []
+            st.write(
+                f"**Outcomes:** {len(outcomes)}{' — ' + ', '.join(outcomes) if outcomes else ''}"
+            )
+            st.write(f"**Resume study:** {bool(p.get('resume_existing_study', True))}")
+            st.write(f"**Pre-aggregation:** {bool(p.get('pre_aggregate', False))}")
+        if rec.output_paths:
+            st.write("**Output files:**")
+            for path in rec.output_paths:
+                st.code(path, language=None)
+        if rec.submitted_at:
+            st.caption(f"Submitted at: {rec.submitted_at}")
+        if rec.completed_at:
+            st.caption(f"Completed at: {rec.completed_at}")
+
+    def _render_logs(rec_id: str) -> None:
+        lines = get_job_log_lines(rec_id)
+        if not lines:
+            st.caption("(no log output captured yet)")
+            return
+        st.markdown(ansi_log_lines_to_html(lines), unsafe_allow_html=True)
 
     @st.fragment(run_every=1)
     def show_job_monitor_fragment():
@@ -152,60 +233,80 @@ def render(output_dir: str, parent_dir: str) -> None:
             f"Errors (1h): {h['errored_last_hour']}"
         )
 
-        records = sorted(
-            store.list_all(),
-            key=lambda r: r.updated_at or "",
+        all_recs = store.list_all()
+        active = sorted(
+            [r for r in all_recs if r.status in _ACTIVE],
+            key=lambda r: r.submitted_at or r.id,
+        )
+        terminal = sorted(
+            [r for r in all_recs if r.status in _TERMINAL],
+            key=lambda r: r.completed_at or r.updated_at or "",
             reverse=True,
         )
-        if not records:
+        ordered = active + terminal
+
+        if not ordered:
             st.info("No active jobs.")
             return
 
-        for rec in records:
+        for rec in ordered:
             with st.container(border=True):
-                c1, c2 = st.columns([7, 3])
-                c1.markdown(f"**{rec.name}**")
-                if rec.type == "fusion":
-                    c2.caption("🔀 Fusion")
-                elif rec.type in ("ndvi", "ndvi_column"):
-                    c2.caption("🛰️ NDVI")
+                emoji = _EMOJI.get(rec.type, "•")
+                # Title: emoji + clean name only — no extension, no params.
+                st.markdown(f"### {emoji} {rec.name}")
+
+                # Primary progress bar (no tile-bracket overlay here; the
+                # bracket appears as its own row below for clarity).
+                st.progress(float(rec.progress))
+
+                # Status line. Terminal jobs show the canonical label;
+                # active jobs show whatever the worker reported last.
+                if rec.status in _TERMINAL:
+                    label = _TERMINAL_LABELS.get(rec.status, rec.status.capitalize())
                 else:
-                    c2.caption("🌳 GVI")
+                    label = rec.status_text or rec.status.capitalize()
+                st.caption(label)
 
                 bracket = rec.extra.get("ndvi_tile_bracket")
                 if rec.type in ("ndvi", "ndvi_column") and bracket:
-                    st.progress(float(rec.progress), text=str(bracket))
-                else:
-                    st.progress(float(rec.progress))
-
-                # Terminal status overrides the last in-progress text so the user
-                # doesn't see e.g. "Processing (26/425)" after a cancel.
-                if rec.status in _TERMINAL:
-                    terminal_labels = {
-                        "completed": "Completed",
-                        "cancelled": "Cancelled",
-                        "interrupted": "Interrupted (process restarted)",
-                        "error": rec.error or "Error",
-                    }
-                    status_label = terminal_labels.get(
-                        rec.status, rec.status.capitalize()
-                    )
-                else:
-                    status_label = rec.status_text or rec.status.capitalize()
-                st.caption(status_label)
+                    st.caption(f"NDVI tile: {bracket}")
 
                 gvi_progress = rec.extra.get("gvi_progress")
                 if gvi_progress:
                     st.progress(
                         gvi_progress["percent"] / 100,
-                        text=f"{gvi_progress['current']:,} / {gvi_progress['total']:,}",
+                        text=(
+                            f"{gvi_progress['current']:,} / "
+                            f"{gvi_progress['total']:,}"
+                        ),
                     )
 
+                preaggr_progress = rec.extra.get("preaggr_progress")
+                if preaggr_progress:
+                    st.progress(
+                        preaggr_progress["percent"] / 100,
+                        text=(
+                            f"Spatial pre-processing: "
+                            f"{preaggr_progress['current']:,} / "
+                            f"{preaggr_progress['total']:,}"
+                        ),
+                    )
+
+                # Collapsible details (parameters)
+                with st.expander("Details", expanded=False):
+                    _render_details(rec)
+
+                # Collapsible per-job log
+                with st.expander("Logs", expanded=False):
+                    _render_logs(rec.id)
+
+                # Error detail block stays in its own expander when present
                 error_detail = rec.extra.get("error_detail")
                 if rec.error:
-                    with st.expander("Error Details"):
+                    with st.expander("Error trace"):
                         st.code(error_detail or rec.error)
 
+                # Action button
                 if rec.status in _ACTIVE:
                     st.button(
                         "Cancel",
@@ -213,18 +314,12 @@ def render(output_dir: str, parent_dir: str) -> None:
                         on_click=callback_cancel_job,
                         args=(rec.id,),
                     )
-                elif rec.status == "interrupted":
-                    st.caption(
-                        "Interrupted on restart. Re-upload the source "
-                        "dataset and re-submit from the form above."
-                    )
-                    st.button(
-                        "🗑️",
-                        key=f"del_{rec.id}",
-                        on_click=callback_dismiss_job,
-                        args=(rec.id,),
-                    )
                 else:
+                    if rec.status == "interrupted":
+                        st.caption(
+                            "Interrupted on restart — re-upload the source "
+                            "dataset and re-submit from the form above."
+                        )
                     st.button(
                         "🗑️",
                         key=f"del_{rec.id}",
@@ -408,20 +503,38 @@ def render(output_dir: str, parent_dir: str) -> None:
                 m_input, width="100%", height=500, key="map_input", returned_objects=[]
             )
 
-        oc_gvi_a, oc_gvi_b = st.columns(2)
+        oc_gvi_a, oc_gvi_b, oc_gvi_c = st.columns(3)
         with oc_gvi_a:
             st.checkbox(
-                "Save GeoTIFF",
+                "Save GeoPackage",
                 value=True,
-                key="gvi_out_geotiff",
-                help="Raster GVI surface. At least one of GeoTIFF or GeoJSON must stay on to run.",
+                key="gvi_out_gpkg",
+                help=(
+                    "Recommended. Single-file vector samples (EPSG:4326) "
+                    "readable by every modern GIS. Scales to country-scale "
+                    "runs and supports sparse cluster layouts without voids."
+                ),
             )
         with oc_gvi_b:
             st.checkbox(
+                "Save GeoTIFF (per-cluster tiles)",
+                value=False,
+                key="gvi_out_geotiff",
+                help=(
+                    "Optional. Writes one GeoTIFF tile per buffered cluster "
+                    "into a *_gvi_tiles/ folder, in the auto-selected planar "
+                    "CRS (no resampling). Skipped if no clusters are defined."
+                ),
+            )
+        with oc_gvi_c:
+            st.checkbox(
                 "Save GeoJSON",
-                value=True,
+                value=False,
                 key="gvi_out_geojson",
-                help="Vector sample points with attributes. At least one output format must stay on.",
+                help=(
+                    "Compatibility option only. Slow to read past ~100k "
+                    "points; prefer GeoPackage for large national runs."
+                ),
             )
 
         st.checkbox(
@@ -467,9 +580,10 @@ def render(output_dir: str, parent_dir: str) -> None:
                             if d.get("type") == "restored":
                                 continue
                             if _gvi_dataset_uses_raster_grid(d, gvi_buffer_for_gen):
-                                pts, meta = generate_raster_grid(
-                                    apply_buffer_m(d["raw"], gvi_buffer_for_gen),
-                                    gvi_res_for_gen,
+                                pts, meta = generate_clustered_grid(
+                                    d["raw"],
+                                    buffer_m=float(gvi_buffer_for_gen),
+                                    step_m=float(gvi_res_for_gen),
                                 )
                                 d["processed"] = pts
                                 d["meta"] = meta
@@ -483,14 +597,12 @@ def render(output_dir: str, parent_dir: str) -> None:
                 st.rerun()
 
         elif run:
-            gvi_out_ok_form = st.session_state.get(
-                "gvi_out_geotiff", True
-            ) or st.session_state.get("gvi_out_geojson", True)
-            if (
-                gvi_out_ok_form
-                and st.session_state.datasets
-                and not _gvi_geotiff_only_points_blocked()
-            ):
+            gvi_out_ok_form = (
+                st.session_state.get("gvi_out_gpkg", True)
+                or st.session_state.get("gvi_out_geotiff", False)
+                or st.session_state.get("gvi_out_geojson", False)
+            )
+            if gvi_out_ok_form and st.session_state.datasets:
                 with run_action_spinner:
                     with st.spinner("\u200b"):
                         _gvi_materialize_grids_if_missing(
@@ -499,8 +611,10 @@ def render(output_dir: str, parent_dir: str) -> None:
 
     gvi_buffer = int(st.session_state.get("gvi_buffer", 0))
     gvi_res = int(st.session_state.get("gvi_res", 50))
-    gvi_out_ok = st.session_state.get("gvi_out_geotiff", True) or st.session_state.get(
-        "gvi_out_geojson", True
+    gvi_out_ok = (
+        st.session_state.get("gvi_out_gpkg", True)
+        or st.session_state.get("gvi_out_geotiff", False)
+        or st.session_state.get("gvi_out_geojson", False)
     )
 
     if run:
@@ -509,8 +623,9 @@ def render(output_dir: str, parent_dir: str) -> None:
         elif not st.session_state.datasets:
             st.warning("Upload at least one study area to get started.")
         else:
-            save_gt = st.session_state.get("gvi_out_geotiff", True)
-            save_gj = st.session_state.get("gvi_out_geojson", True)
+            save_gp = st.session_state.get("gvi_out_gpkg", True)
+            save_gt = st.session_state.get("gvi_out_geotiff", False)
+            save_gj = st.session_state.get("gvi_out_geojson", False)
             save_debug = st.session_state.get("gvi_save_debug", False)
             mode = st.session_state.get("gvi_download_mode", "Package (Scraper)")
             api_key = None
@@ -518,98 +633,82 @@ def render(output_dir: str, parent_dir: str) -> None:
                 k = st.session_state.get("gvi_google_api_key", "")
                 api_key = k if k else None
 
-            geotiff_only_with_points = (
-                save_gt
-                and not save_gj
-                and any(
-                    d.get("type") == "point" and gvi_buffer <= 0
-                    for d in st.session_state.datasets.values()
-                    if d.get("type") != "restored"
-                )
-            )
-            if geotiff_only_with_points:
-                st.error(
-                    "GeoTIFF-only output needs a raster sampling grid. For point "
-                    "study areas, set Download Buffer (m) above zero so buffers "
-                    "define the grid extent, enable Save GeoJSON, or use polygon "
-                    "study areas."
-                )
-            else:
-                model_path = os.path.join(
-                    parent_dir, "geofuse", "model", "best_model.pth"
-                )
-                started = False
+            model_path = os.path.join(parent_dir, "geofuse", "model", "best_model.pth")
+            started = False
 
-                # Identity tuple for an in-flight job — only an *identical*
-                # resubmission is blocked. Changing resolution, buffer, or any
-                # output flag produces a new signature and a new job.
-                def _gvi_signature(p: dict) -> tuple:
-                    return (
-                        p.get("fname"),
-                        p.get("step"),
-                        p.get("buffer"),
-                        p.get("save_panos"),
-                        p.get("save_masks"),
-                        p.get("save_geotiff"),
-                        p.get("save_geojson"),
-                        p.get("has_api_key"),
-                    )
+            # Identity tuple for an in-flight job — only an *identical*
+            # resubmission is blocked. Changing resolution, buffer, or any
+            # output flag produces a new signature and a new job.
+            def _gvi_signature(p: dict) -> tuple:
+                return (
+                    p.get("fname"),
+                    p.get("step"),
+                    p.get("buffer"),
+                    p.get("save_panos"),
+                    p.get("save_masks"),
+                    p.get("save_gpkg"),
+                    p.get("save_geotiff"),
+                    p.get("save_geojson"),
+                    p.get("has_api_key"),
+                )
 
-                for fname, d in st.session_state.datasets.items():
-                    if d.get("type") == "restored":
-                        continue
+            for fname, d in st.session_state.datasets.items():
+                if d.get("type") == "restored":
+                    continue
 
-                    job_params = {
-                        "fname": fname,
+                job_params = {
+                    "fname": fname,
+                    "step": gvi_res,
+                    "buffer": gvi_buffer,
+                    "save_panos": save_debug,
+                    "save_masks": save_debug,
+                    "save_gpkg": save_gp,
+                    "save_geotiff": save_gt,
+                    "save_geojson": save_gj,
+                    "model_path": model_path,
+                    "has_api_key": api_key is not None,
+                }
+                sig = _gvi_signature(job_params)
+
+                # Skip only if an identical submission is still active.
+                duplicate = [
+                    r
+                    for r in store.list_active()
+                    if r.type == "gvi" and _gvi_signature(r.params) == sig
+                ]
+                if duplicate:
+                    continue
+
+                d["cache_ref"] = pano_cache
+
+                record = store.submit(
+                    type="gvi",
+                    name=os.path.splitext(fname)[0],
+                    params=job_params,
+                )
+                executor.submit_runner(
+                    record,
+                    run_gvi,
+                    fname=fname,
+                    dataset_data=d,
+                    init_args={"model_path": model_path, "api_key": api_key},
+                    run_args={
                         "step": gvi_res,
-                        "buffer": gvi_buffer,
                         "save_panos": save_debug,
                         "save_masks": save_debug,
-                        "save_geotiff": save_gt,
-                        "save_geojson": save_gj,
-                        "model_path": model_path,
-                        "has_api_key": api_key is not None,
-                    }
-                    sig = _gvi_signature(job_params)
+                    },
+                    output_dir=output_dir,
+                    save_gpkg=save_gp,
+                    save_geotiff=save_gt,
+                    save_geojson=save_gj,
+                    gpu_lock=executor.gpu_lock,
+                )
+                started = True
 
-                    # Skip only if an identical submission is still active.
-                    duplicate = [
-                        r
-                        for r in store.list_active()
-                        if r.type == "gvi" and _gvi_signature(r.params) == sig
-                    ]
-                    if duplicate:
-                        continue
-
-                    d["cache_ref"] = st.session_state.master_cache
-
-                    record = store.submit(
-                        type="gvi",
-                        name=f"{fname} (GVI, step={gvi_res}m, buf={gvi_buffer}m)",
-                        params=job_params,
-                    )
-                    executor.submit_runner(
-                        record,
-                        run_gvi,
-                        fname=fname,
-                        dataset_data=d,
-                        init_args={"model_path": model_path, "api_key": api_key},
-                        run_args={
-                            "step": gvi_res,
-                            "save_panos": save_debug,
-                            "save_masks": save_debug,
-                        },
-                        output_dir=output_dir,
-                        save_geotiff=save_gt,
-                        save_geojson=save_gj,
-                        gpu_lock=executor.gpu_lock,
-                    )
-                    started = True
-
-                if started:
-                    st.success("Analysis started. Monitor progress in the sidebar.")
-                else:
-                    st.info("All study areas are already running or completed.")
+            if started:
+                st.success("Analysis started. Monitor progress in the sidebar.")
+            else:
+                st.info("All study areas are already running or completed.")
 
     st.divider()
 

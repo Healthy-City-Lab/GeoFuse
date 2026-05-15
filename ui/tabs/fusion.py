@@ -30,6 +30,7 @@ except ImportError:
     _MetricFusionEngine = None
 
 from geofuse.crs_utils import buffer_gdf_union_metres, reproject_geodataframe_to_wgs84
+from geofuse.jobs.runners import run_fusion
 from geofuse.vector_io import (
     list_gpkg_layer_names,
     read_vector_path,
@@ -945,6 +946,33 @@ def render(output_dir: str) -> None:
                     help="Early stopping rule for unpromising trials.",
                     key="fusion_pruner",
                 )
+                resume_existing_study = st.checkbox(
+                    "Resume previous study if exists",
+                    value=True,
+                    key="fusion_resume_study",
+                    help=(
+                        "When on, re-running with the same target + outcome + "
+                        "objective metric loads the existing SQLite study under "
+                        "output_results/fusion_studies/ and runs only the "
+                        "remaining trials. Turn off to start a fresh study."
+                    ),
+                )
+                pre_aggregate = st.checkbox(
+                    "Spatial pre-processing (faster trials, more memory)",
+                    value=False,
+                    key="fusion_pre_aggregate",
+                    help=(
+                        "When on, every sample point's metric values are "
+                        "pre-aggregated across every buffer radius in the ladder "
+                        "and every aggregation (mean + percentiles at 10% steps). "
+                        "Optuna trials then read from this lookup table instead "
+                        "of recomputing — typically 10-100× faster per trial. "
+                        "Cost: a one-time pre-process pass (minutes to hours on "
+                        "large datasets) and a few hundred MB to several GB of RAM "
+                        "for the float16 table. Percentile choices in each trial "
+                        "are restricted to {10, 20, …, 90} when this is on."
+                    ),
+                )
 
             col_split1, col_split2, col_split3 = st.columns(3)
             with col_split1:
@@ -979,7 +1007,7 @@ def render(output_dir: str) -> None:
         st.divider()
         _fus_run_spacer, _fus_run_col = st.columns([2.2, 1])
         with _fus_run_col:
-            run_fusion = st.form_submit_button(
+            fusion_run_clicked = st.form_submit_button(
                 "🚀 Run Fusion Optimization",
                 type="primary",
                 use_container_width=True,
@@ -1030,7 +1058,7 @@ def render(output_dir: str) -> None:
                 st.session_state.fusion_engines_by_target = {}
                 st.rerun()
 
-    if run_fusion:
+    if fusion_run_clicked:
         if not target_uploads or not tmp_target_path:
             st.error("❌ Please upload a target file")
         elif is_vector_target and not target_outcome_columns:
@@ -1116,12 +1144,7 @@ def render(output_dir: str) -> None:
 
                 fusion_record = store.submit(
                     type="fusion",
-                    name=(
-                        f"Fusion: {target_display_name} "
-                        f"({len(target_outcome_columns)} outcomes)"
-                        if is_vector_target
-                        else f"Fusion: {target_display_name}"
-                    ),
+                    name=os.path.splitext(target_display_name)[0],
                     params={
                         "target_display_name": target_display_name,
                         "is_vector_target": is_vector_target,
@@ -1133,6 +1156,8 @@ def render(output_dir: str) -> None:
                         "sampler_type": optimizer,
                         "pruner_type": pruner_type,
                         "multi_objective_requested": fusion_multi_objective,
+                        "resume_existing_study": resume_existing_study,
+                        "pre_aggregate": pre_aggregate,
                     },
                 )
                 executor.submit_runner(
@@ -1178,6 +1203,9 @@ def render(output_dir: str) -> None:
                     multi_objective_requested=fusion_multi_objective,
                     output_dir=output_dir,
                     MetricFusionEngine=MetricFusionEngine,
+                    target_display_name=target_display_name,
+                    resume_existing_study=resume_existing_study,
+                    pre_aggregate=pre_aggregate,
                 )
 
                 st.success("✅ Fusion job started! Check sidebar for progress.")

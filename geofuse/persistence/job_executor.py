@@ -17,6 +17,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
+from geofuse.logger import bind_job_log_buffer, unbind_job_log_buffer
 from geofuse.persistence.job_store import JobRecord, JobStore
 
 logger = logging.getLogger(__name__)
@@ -96,9 +97,19 @@ class JobExecutor:
         )
 
         def _wrapped():
+            # Bind this worker thread's _log(...) calls into the job's ring
+            # buffer so the sidebar monitor can display per-job logs.
+            bind_job_log_buffer(record.id)
             self._store.transition(record.id, "running")
             try:
                 result = runner_fn(ctx, *args, **kwargs)
+            except InterruptedError:
+                # Treated as a cancellation signal — workers raise this when
+                # they're aborted between steps (e.g. NDVI tile loop seeing
+                # cancel_callback() return True mid-download).
+                logger.info("Job %s (%s) cancelled by user.", record.id, record.type)
+                self._store.transition(record.id, "cancelled")
+                return
             except Exception as exc:  # noqa: BLE001 — workers surface any error
                 logger.exception("Job %s (%s) failed", record.id, record.type)
                 self._store.transition(
@@ -111,6 +122,7 @@ class JobExecutor:
                     rec.extra["error_detail"] = traceback.format_exc()
                 return
             finally:
+                unbind_job_log_buffer()
                 with self._lock:
                     self._futures.pop(record.id, None)
 

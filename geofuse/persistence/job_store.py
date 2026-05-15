@@ -19,6 +19,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
+from geofuse.logger import drop_job_log_buffer
 from geofuse.persistence.sqlite_utils import open_wal_connection
 
 _TERMINAL_STATUSES: frozenset[str] = frozenset(
@@ -42,6 +43,7 @@ class JobRecord:
     name: str = ""
     progress: float = 0.0
     status_text: str = ""
+    submitted_at: str | None = None
     started_at: str | None = None
     updated_at: str | None = None
     completed_at: str | None = None
@@ -63,6 +65,10 @@ class JobStore:
     connection; SQLite work is brief enough that this does not bottleneck.
     """
 
+    # idx_jobs_submitted is intentionally absent here — it is created lazily
+    # in __init__ after the submitted_at column is guaranteed to exist
+    # (either because the table was just created with it, or because the
+    # migration ALTER TABLE added it).
     _SCHEMA = """
     CREATE TABLE IF NOT EXISTS jobs (
         id                TEXT PRIMARY KEY,
@@ -72,6 +78,7 @@ class JobStore:
         params_json       TEXT NOT NULL,
         progress          REAL DEFAULT 0,
         status_text       TEXT DEFAULT '',
+        submitted_at      TEXT,
         started_at        TEXT,
         updated_at        TEXT NOT NULL DEFAULT (datetime('now')),
         completed_at      TEXT,
@@ -88,6 +95,21 @@ class JobStore:
         self._conn = open_wal_connection(db_path)
         with self._lock:
             self._conn.executescript(self._SCHEMA)
+            # Migrate pre-existing DBs without submitted_at.
+            cols = {
+                r[1] for r in self._conn.execute("PRAGMA table_info(jobs)").fetchall()
+            }
+            if "submitted_at" not in cols:
+                self._conn.execute("ALTER TABLE jobs ADD COLUMN submitted_at TEXT")
+                # Backfill with updated_at (best approximation of submission time).
+                self._conn.execute(
+                    "UPDATE jobs SET submitted_at = updated_at "
+                    "WHERE submitted_at IS NULL"
+                )
+            # Create the index now that submitted_at is guaranteed to exist.
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_jobs_submitted ON jobs(submitted_at)"
+            )
             self._reload_and_mark_interrupted()
 
         self._stop = threading.Event()
@@ -113,6 +135,7 @@ class JobStore:
             status="queued",
             params=params,
             name=name or job_id,
+            submitted_at=now,
             updated_at=now,
         )
         with self._lock:
@@ -277,10 +300,11 @@ class JobStore:
             self._records.pop(job_id, None)
 
     def purge(self, job_id: str) -> None:
-        """Remove from both in-memory and SQLite."""
+        """Remove from both in-memory and SQLite, plus drop the log buffer."""
         with self._lock:
             self._records.pop(job_id, None)
             self._conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+        drop_job_log_buffer(job_id)
 
     def shutdown(self) -> None:
         self._stop.set()
@@ -300,9 +324,9 @@ class JobStore:
             INSERT OR REPLACE INTO jobs (
                 id, type, status, name, params_json,
                 progress, status_text,
-                started_at, updated_at, completed_at,
+                submitted_at, started_at, updated_at, completed_at,
                 error, output_paths_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 rec.id,
@@ -312,6 +336,7 @@ class JobStore:
                 json.dumps(rec.params, default=str),
                 rec.progress,
                 rec.status_text,
+                rec.submitted_at,
                 rec.started_at,
                 rec.updated_at,
                 rec.completed_at,
@@ -331,7 +356,7 @@ class JobStore:
             """
             SELECT id, type, status, name, params_json,
                    progress, status_text,
-                   started_at, updated_at, completed_at,
+                   submitted_at, started_at, updated_at, completed_at,
                    error, output_paths_json
             FROM jobs
             ORDER BY updated_at DESC
@@ -348,6 +373,7 @@ class JobStore:
                 params_json,
                 progress,
                 status_text,
+                submitted_at,
                 started_at,
                 updated_at,
                 completed_at,
@@ -373,6 +399,7 @@ class JobStore:
                 params=params,
                 progress=float(progress or 0.0),
                 status_text=status_text or "",
+                submitted_at=submitted_at,
                 started_at=started_at,
                 updated_at=updated_at,
                 completed_at=completed_at,

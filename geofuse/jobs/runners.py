@@ -15,12 +15,14 @@ These are direct lifts of the workers that used to live in ``ui/tabs/``:
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import shutil
 import threading
 import time
 from collections.abc import Mapping
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 import geopandas as gpd
@@ -28,10 +30,16 @@ import numpy as np
 import pandas as pd
 import rasterio
 
+from geofuse.crs_utils import reproject_geodataframe_to_wgs84
 from geofuse.gvi import GVIEngine
+from geofuse.logger import get_logger
 from geofuse.ndvi import NDVIEngine
 from geofuse.persistence.job_executor import JobContext
 from geofuse.vision import get_best_device
+
+_log_gvi = get_logger("GVI")
+_log_ndvi = get_logger("NDVI")
+_log_fusion = get_logger("FUSION")
 
 # ---------------------------------------------------------------------------
 # GVI engine cache (replaces @st.cache_resource _get_gvi_engine)
@@ -71,6 +79,7 @@ def run_gvi(
     save_geotiff: bool,
     save_geojson: bool,
     gpu_lock: threading.Lock,
+    save_gpkg: bool = True,
 ) -> dict:
     """Run a GVI analysis. Mirrors the previous ``_job_worker`` in ``ui/tabs/gvi.py``."""
     ctx.progress(status_text="Waiting for GPU...")
@@ -127,51 +136,126 @@ def run_gvi(
     if "orig_index" in res_df.columns:
         res_df.set_index("orig_index", inplace=True)
         res_df.index.name = None
+    # Engine produces results in EPSG:4326; guard rail in case a future caller
+    # passes a projected dataset_data["processed"].
+    if res_df.crs is None:
+        res_df = res_df.set_crs("EPSG:4326")
+    elif res_df.crs.is_geographic:
+        res_df = reproject_geodataframe_to_wgs84(res_df)
+    else:
+        res_df = res_df.to_crs("EPSG:4326")
     dataset_data["results"] = res_df
 
     out_name = os.path.splitext(fname)[0]
     output_paths: list[str] = []
+    meta = dataset_data.get("meta") or {}
+    grid_crs_wkt = meta.get("grid_crs_wkt")
+    clusters = meta.get("clusters") or []
+
+    if save_gpkg:
+        gpkg_path = os.path.join(output_dir, f"{out_name}_gvi.gpkg")
+        res_df.to_file(gpkg_path, driver="GPKG", layer="gvi_samples")
+        output_paths.append(gpkg_path)
 
     if save_geojson:
         gj_path = os.path.join(output_dir, f"{out_name}_gvi.geojson")
         res_df.to_file(gj_path, driver="GeoJSON")
         output_paths.append(gj_path)
-
-    if dataset_data["meta"] and save_geotiff:
-        from rasterio.transform import rowcol
-
-        meta = dataset_data["meta"]
-        arr_veg = np.full((meta["height"], meta["width"]), np.nan, dtype=np.float32)
-        arr_ter = np.full((meta["height"], meta["width"]), np.nan, dtype=np.float32)
-        valid = res_df.dropna(subset=["gvi_veg"])
-        if not valid.empty:
-            rows, cols = rowcol(
-                meta["transform"],
-                valid.geometry.x.values,
-                valid.geometry.y.values,
+        if len(res_df) > 100_000:
+            _log_gvi(
+                "WARN",
+                f"GeoJSON output is large ({len(res_df):,} points); "
+                f"GeoPackage is preferred for re-reading.",
             )
-            rows = np.clip(rows, 0, meta["height"] - 1)
-            cols = np.clip(cols, 0, meta["width"] - 1)
-            arr_veg[rows, cols] = valid["gvi_veg"].values
-            arr_ter[rows, cols] = valid["gvi_ter"].values
-        tif_path = os.path.join(output_dir, f"{out_name}_gvi.tif")
-        with rasterio.open(
-            tif_path,
-            "w",
-            driver="GTiff",
-            height=meta["height"],
-            width=meta["width"],
-            count=2,
-            dtype=np.float32,
-            crs=meta["crs"],
-            transform=meta["transform"],
-            nodata=np.nan,
-        ) as dst:
-            dst.write(arr_veg, 1)
-            dst.set_band_description(1, "Veg")
-            dst.write(arr_ter, 2)
-            dst.set_band_description(2, "Ter")
-        output_paths.append(tif_path)
+
+    if save_geotiff:
+        if not clusters:
+            _log_gvi(
+                "WARN",
+                "GeoTIFF requested but no cluster metadata is available "
+                "(e.g. point input with buffer=0); skipping. Use GeoPackage.",
+            )
+        else:
+            tiles_dir = os.path.join(output_dir, f"{out_name}_gvi_tiles")
+            os.makedirs(tiles_dir, exist_ok=True)
+            has_cluster_col = "cluster_id" in res_df.columns
+            index_entries: list[dict] = []
+            for cluster in clusters:
+                cid = int(cluster["cluster_id"])
+                h = int(cluster["height"])
+                w = int(cluster["width"])
+                arr_veg = np.full((h, w), np.nan, dtype=np.float32)
+                arr_ter = np.full((h, w), np.nan, dtype=np.float32)
+                if has_cluster_col:
+                    cdf = res_df[res_df["cluster_id"] == cid].dropna(subset=["gvi_veg"])
+                    if not cdf.empty:
+                        lr = (cdf["row"].to_numpy() - cluster["row_min"]).astype(int)
+                        lc = (cdf["col"].to_numpy() - cluster["col_min"]).astype(int)
+                        keep = (lr >= 0) & (lr < h) & (lc >= 0) & (lc < w)
+                        lr = lr[keep]
+                        lc = lc[keep]
+                        arr_veg[lr, lc] = cdf["gvi_veg"].to_numpy()[keep]
+                        arr_ter[lr, lc] = cdf["gvi_ter"].to_numpy()[keep]
+                tile_path = os.path.join(tiles_dir, f"cluster_{cid:04d}.tif")
+                with rasterio.open(
+                    tile_path,
+                    "w",
+                    driver="GTiff",
+                    height=h,
+                    width=w,
+                    count=2,
+                    dtype=np.float32,
+                    crs=grid_crs_wkt,
+                    transform=cluster["transform"],
+                    nodata=np.nan,
+                ) as dst:
+                    dst.write(arr_veg, 1)
+                    dst.set_band_description(1, "Veg")
+                    dst.write(arr_ter, 2)
+                    dst.set_band_description(2, "Ter")
+                index_entries.append(
+                    {
+                        "cluster_id": cid,
+                        "path": os.path.basename(tile_path),
+                        "bbox_grid_crs": list(cluster["bbox_grid_crs"]),
+                        "height": h,
+                        "width": w,
+                        "row_min": int(cluster["row_min"]),
+                        "col_min": int(cluster["col_min"]),
+                    }
+                )
+            index_path = os.path.join(tiles_dir, "tiles_index.json")
+            with open(index_path, "w") as f:
+                json.dump(
+                    {
+                        "grid_crs_wkt": grid_crs_wkt,
+                        "step_m": meta.get("step_m"),
+                        "anchor_x": meta.get("anchor_x"),
+                        "anchor_y": meta.get("anchor_y"),
+                        "tiles": index_entries,
+                    },
+                    f,
+                    indent=2,
+                )
+            output_paths.append(tiles_dir)
+
+    # Sidecar JSON next to the canonical GeoPackage for grid reconstruction.
+    if save_gpkg and meta:
+        sidecar_path = os.path.join(output_dir, f"{out_name}_gvi.json")
+        with open(sidecar_path, "w") as f:
+            json.dump(
+                {
+                    "grid_crs_wkt": grid_crs_wkt,
+                    "step_m": meta.get("step_m"),
+                    "anchor_x": meta.get("anchor_x"),
+                    "anchor_y": meta.get("anchor_y"),
+                    "distortion": meta.get("distortion"),
+                    "choice_name": meta.get("choice_name"),
+                    "n_clusters": len(clusters),
+                },
+                f,
+                indent=2,
+            )
 
     return {"output_paths": output_paths}
 
@@ -335,7 +419,9 @@ def run_ndvi_column(
         if result.get("status") == "cancelled":
             return {"output_paths": output_paths}
         if result.get("status") != "success":
-            print(f"[NDVI column] {target_date} failed: {result.get('message')}")
+            _log_ndvi(
+                "WARN", f"Column run for {target_date} failed: {result.get('message')}"
+            )
             continue
 
         tif_path = os.path.join(output_dir, f"{tmp_name}_ndvi.tif")
@@ -385,6 +471,24 @@ def run_ndvi_column(
 # ---------------------------------------------------------------------------
 
 
+_STUDY_NAME_UNSAFE = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def _build_fusion_study_name(
+    target_display_name: str,
+    label: str,
+    objective_metric: str,
+    suffix: str = "",
+) -> str:
+    """Filesystem-safe Optuna ``study_name`` (also the SQLite filename stem)."""
+    stem = os.path.splitext(target_display_name or "target")[0]
+    parts = [stem, str(label), objective_metric]
+    if suffix:
+        parts.append(suffix)
+    raw = "__".join(parts)
+    return _STUDY_NAME_UNSAFE.sub("_", raw).strip("_") or "fusion_study"
+
+
 def run_fusion(
     ctx: JobContext,
     *,
@@ -422,6 +526,9 @@ def run_fusion(
     multi_objective_requested: bool,
     output_dir: str,
     MetricFusionEngine,
+    target_display_name: str = "target",
+    resume_existing_study: bool = True,
+    pre_aggregate: bool = False,
 ) -> dict:
     """Run fusion optimization. Mirrors the previous ``_fusion_worker``."""
     try:
@@ -430,13 +537,13 @@ def run_fusion(
         multi_outcome = len([t for t in targets if t is not None]) > 1
 
         if multi_objective_requested and multi_outcome:
-            print(
-                "[FUSION] Multi-objective optimization run requested — "
-                "joint study not implemented yet; running separate single-objective "
-                "studies per outcome."
+            _log_fusion(
+                "WARN",
+                "Multi-objective optimization run requested — joint study not "
+                "implemented yet; running separate single-objective studies per outcome.",
             )
 
-        print(f"[FUSION] Starting fusion job {ctx.job_id} ({n_t} target run(s))")
+        _log_fusion("INFO", f"Starting fusion job {ctx.job_id} ({n_t} target run(s))")
 
         by_target: dict = {}
         engines_by_target: dict = {}
@@ -545,12 +652,69 @@ def run_fusion(
                 gvi_grid_spacing_m=gvi_grid_spacing_m,
             )
 
-            ctx.progress(value=prog(0.3), status_text=f"{prefix}Splitting data...")
+            ctx.progress(
+                value=prog(0.28),
+                status_text=(
+                    f"{prefix}Preparing fusion samples + splitting data "
+                    "(can take a while on large polygon targets)..."
+                ),
+            )
             engine.split_data(test_size=test_size, k_folds=k_folds, random_state=42)
+
+            # Optional spatial pre-processing: pre-aggregate per-point × radius
+            # × stat lookup table so every Optuna trial is a numpy.take.
+            if pre_aggregate:
+                _last_pct = {"v": -1}
+
+                def preaggr_progress(current: int, total: int) -> None:
+                    pct = (current * 100) // max(1, total)
+                    if pct == _last_pct["v"]:
+                        return
+                    _last_pct["v"] = pct
+                    ctx.set_extra(
+                        preaggr_progress={
+                            "current": current,
+                            "total": total,
+                            "percent": pct,
+                        }
+                    )
+                    ctx.progress(
+                        value=prog(0.30 + 0.04 * pct / 100),
+                        status_text=(
+                            f"{prefix}Spatial pre-processing: "
+                            f"{current:,}/{total:,} points ({pct}%)"
+                        ),
+                    )
+                    ctx.heartbeat()
+
+                completed = engine.precompute_aggregations(
+                    progress_callback=preaggr_progress,
+                    cancel_callback=cancel_check,
+                )
+                # Clear the dedicated preaggr_progress sub-bar so it doesn't
+                # linger past this stage in the monitor.
+                ctx.set_extra(preaggr_progress=None)
+                if not completed or ctx.is_cancelled():
+                    return {"output_paths": output_paths}
 
             ctx.progress(
                 value=prog(0.35),
                 status_text=f"{prefix}Optimizing ({n_trials} trials)...",
+            )
+            study_dir = os.path.join(output_dir, "fusion_studies")
+            # When the user opts out of resume, suffix the study name with a
+            # timestamp so a fresh SQLite file is created instead of attaching
+            # to the existing one.
+            suffix = (
+                ""
+                if resume_existing_study
+                else datetime.now().strftime("%Y%m%dT%H%M%S")
+            )
+            study_name = _build_fusion_study_name(
+                target_display_name=target_display_name,
+                label=label,
+                objective_metric=objective_metric,
+                suffix=suffix,
             )
             best_params = engine.optimize_fusion(
                 n_trials=n_trials,
@@ -560,7 +724,12 @@ def run_fusion(
                 sampler_type=sampler_type,
                 seed=42,
                 show_progress=False,
+                study_name=study_name,
+                study_dir=study_dir,
+                cancel_callback=cancel_check,
             )
+            if ctx.is_cancelled():
+                return {"output_paths": output_paths}
 
             ctx.progress(
                 value=prog(0.85), status_text=f"{prefix}Filtering robust trials..."

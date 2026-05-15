@@ -11,6 +11,7 @@ import geopandas as gpd
 import pandas as pd
 
 from geofuse.core import (  # noqa: F401  (re-exported for UI modules)
+    generate_clustered_grid,
     generate_raster_grid,
 )
 from geofuse.crs_utils import buffer_gdf_union_metres

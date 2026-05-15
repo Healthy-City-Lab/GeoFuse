@@ -89,6 +89,83 @@ def render(output_dir: str) -> None:
         if v.get("type") != "restored"
     }
 
+    # ── Settings + map (form prevents per-keystroke reruns on sliders) ──────
+    with st.form("ndvi_job_form"):
+        ndvi_buf_preview = int(st.session_state.get("ndvi_buffer", 0))
+        fc_ndvi_l, fc_ndvi_r = st.columns(2)
+        with fc_ndvi_l:
+            with st.container(border=True):
+                st.slider(
+                    "Maximum Cloud Coverage (%)",
+                    0,
+                    100,
+                    10,
+                    key="ndvi_cloud",
+                    help=(
+                        "Cloud mask threshold for Earth Engine. Together with resolution "
+                        "and buffer, these apply when you press Run below."
+                    ),
+                )
+                st.number_input(
+                    "Resolution (m)",
+                    value=10,
+                    min_value=10,
+                    key="ndvi_res",
+                    help="Target pixel size for the NDVI raster export.",
+                )
+                st.slider(
+                    "Download Buffer (m)",
+                    min_value=0,
+                    max_value=2000,
+                    value=0,
+                    step=50,
+                    key="ndvi_buffer",
+                    help="Expand the study area outward by this distance (metres) before download.",
+                )
+        with fc_ndvi_r:
+            st.subheader("Study Area Preview")
+            m_ndvi_input = folium.Map(location=[51.0447, -114.0719], zoom_start=10)
+            all_bounds = []
+            for fname, d in st.session_state.ndvi_datasets.items():
+                if d.get("type") == "restored":
+                    continue
+                if d.get("raw") is not None:
+                    add_study_area_layers(
+                        m_ndvi_input,
+                        d["raw"],
+                        study_name=fname,
+                        buffer_m=ndvi_buf_preview,
+                        buffer_name=f"{fname} (buffer)",
+                    )
+                    all_bounds.append(d["raw"].total_bounds)
+                    if ndvi_buf_preview > 0:
+                        all_bounds.append(
+                            apply_buffer_m(d["raw"], ndvi_buf_preview).total_bounds
+                        )
+            if all_bounds:
+                min_x = min([b[0] for b in all_bounds])
+                min_y = min([b[1] for b in all_bounds])
+                max_x = max([b[2] for b in all_bounds])
+                max_y = max([b[3] for b in all_bounds])
+                m_ndvi_input.fit_bounds([[min_y, min_x], [max_y, max_x]])
+            st_folium(
+                m_ndvi_input,
+                width="100%",
+                height=500,
+                key="map_ndvi_input",
+                returned_objects=[],
+            )
+        # Submit in the form so the buffer/cloud/res changes are committed before run.
+        st.form_submit_button(
+            "Apply Settings",
+            use_container_width=False,
+            help="Commit slider values before adjusting dates below.",
+        )
+
+    # ── Date configuration + output format + run ─────────────────────────────
+    # These are outside the form because "Add / Remove" date buttons cannot live
+    # inside a Streamlit form. They sit immediately below the settings+map
+    # section so the page still reads top-to-bottom as one workflow.
     if ndvi_input_datasets:
         st.markdown("**Date Configuration**")
         for fname, d in ndvi_input_datasets.items():
@@ -276,95 +353,27 @@ def render(output_dir: str) -> None:
                     else:
                         st.warning("No attribute columns found in this file.")
 
-    with st.form("ndvi_job_form"):
-        ndvi_buf_preview = int(st.session_state.get("ndvi_buffer", 0))
-        fc_ndvi_l, fc_ndvi_r = st.columns(2)
-        with fc_ndvi_l:
-            with st.container(border=True):
-                st.slider(
-                    "Maximum Cloud Coverage (%)",
-                    0,
-                    100,
-                    10,
-                    key="ndvi_cloud",
-                    help=(
-                        "Cloud mask threshold for Earth Engine. Together with resolution "
-                        "and buffer, these apply when you press Run below. Date controls "
-                        "above still refresh the app on change."
-                    ),
-                )
-                st.number_input(
-                    "Resolution (m)",
-                    value=10,
-                    min_value=10,
-                    key="ndvi_res",
-                    help="Target pixel size for the NDVI raster export.",
-                )
-                st.slider(
-                    "Download Buffer (m)",
-                    min_value=0,
-                    max_value=2000,
-                    value=0,
-                    step=50,
-                    key="ndvi_buffer",
-                    help="Expand the study area outward by this distance (metres) before download.",
-                )
-
-        with fc_ndvi_r:
-            st.subheader("Study Area Preview")
-            m_ndvi_input = folium.Map(location=[51.0447, -114.0719], zoom_start=10)
-            all_bounds = []
-            for fname, d in st.session_state.ndvi_datasets.items():
-                if d.get("type") == "restored":
-                    continue
-                if d.get("raw") is not None:
-                    add_study_area_layers(
-                        m_ndvi_input,
-                        d["raw"],
-                        study_name=fname,
-                        buffer_m=ndvi_buf_preview,
-                        buffer_name=f"{fname} (buffer)",
-                    )
-                    all_bounds.append(d["raw"].total_bounds)
-                    if ndvi_buf_preview > 0:
-                        all_bounds.append(
-                            apply_buffer_m(d["raw"], ndvi_buf_preview).total_bounds
-                        )
-            if all_bounds:
-                min_x = min([b[0] for b in all_bounds])
-                min_y = min([b[1] for b in all_bounds])
-                max_x = max([b[2] for b in all_bounds])
-                max_y = max([b[3] for b in all_bounds])
-                m_ndvi_input.fit_bounds([[min_y, min_x], [max_y, max_x]])
-            st_folium(
-                m_ndvi_input,
-                width="100%",
-                height=500,
-                key="map_ndvi_input",
-                returned_objects=[],
-            )
-
-        oc_ndvi_a, oc_ndvi_b = st.columns(2)
-        with oc_ndvi_a:
-            st.checkbox(
-                "Save GeoTIFF",
-                value=True,
-                key="ndvi_out_geotiff",
-                help="Raster NDVI. At least one of GeoTIFF or GeoJSON must stay on to run.",
-            )
-        with oc_ndvi_b:
-            st.checkbox(
-                "Save GeoJSON",
-                value=True,
-                key="ndvi_out_geojson",
-                help="Vector summary per job. At least one output format must stay on.",
-            )
-        run = st.form_submit_button(
-            "🚀 Run NDVI Analysis",
-            type="primary",
-            use_container_width=True,
-            key="ndvi_form_run_submit",
+    oc_ndvi_a, oc_ndvi_b = st.columns(2)
+    with oc_ndvi_a:
+        st.checkbox(
+            "Save GeoTIFF",
+            value=True,
+            key="ndvi_out_geotiff",
+            help="Raster NDVI. At least one of GeoTIFF or GeoJSON must stay on to run.",
         )
+    with oc_ndvi_b:
+        st.checkbox(
+            "Save GeoJSON",
+            value=True,
+            key="ndvi_out_geojson",
+            help="Vector summary per job. At least one output format must stay on.",
+        )
+    run = st.button(
+        "🚀 Run NDVI Analysis",
+        type="primary",
+        use_container_width=True,
+        key="ndvi_run_btn",
+    )
 
     cloud_pct = int(st.session_state.get("ndvi_cloud", 10))
     resolution = int(st.session_state.get("ndvi_res", 10))
@@ -390,7 +399,9 @@ def render(output_dir: str) -> None:
 
             for fname, d in ndvi_input_datasets.items():
                 cfg = st.session_state.ndvi_date_configs.get(fname, {})
-                base_name = fname.replace(".geojson", "")
+                # Strip *any* extension (.geojson / .shp / .gpkg / .zip / …)
+                # so the monitor title is just the file stem.
+                base_name = os.path.splitext(fname)[0]
 
                 use_ranges = st.session_state.get(
                     f"ndvi_use_ranges_{fname}", cfg.get("use_ranges", True)
@@ -426,7 +437,7 @@ def render(output_dir: str) -> None:
                         )
                         record = store.submit(
                             type="ndvi",
-                            name=f"{base_name} ({start_d} → {end_d})",
+                            name=base_name,
                             params={
                                 "fname": fname,
                                 "mode": "range",
@@ -477,7 +488,7 @@ def render(output_dir: str) -> None:
                         output_name = f"{base_name}_{target_date.strftime('%Y%m%d')}"
                         record = store.submit(
                             type="ndvi",
-                            name=f"{base_name} (near {target_date})",
+                            name=base_name,
                             params={
                                 "fname": fname,
                                 "mode": "specific",
@@ -520,7 +531,7 @@ def render(output_dir: str) -> None:
                     else:
                         record = store.submit(
                             type="ndvi_column",
-                            name=f"{base_name} (by column: {date_col})",
+                            name=base_name,
                             params={
                                 "fname": fname,
                                 "mode": "column",
