@@ -640,9 +640,10 @@ def render(output_dir: str, parent_dir: str) -> None:
                 st.warning("Upload at least one study area first.")
             else:
                 _gvi_discard_heavy_dataset_fields()
+                distortion_msgs: list[str] = []
                 with gen_action_spinner:
                     with st.spinner("\u200b"):
-                        for d in st.session_state.datasets.values():
+                        for fname_g, d in st.session_state.datasets.items():
                             if d.get("type") == "restored":
                                 continue
                             if _gvi_dataset_uses_raster_grid(d, gvi_buffer_for_gen):
@@ -653,11 +654,23 @@ def render(output_dir: str, parent_dir: str) -> None:
                                 )
                                 d["processed"] = pts
                                 d["meta"] = meta
+                                dist = float(meta.get("distortion", 0.0) or 0.0)
+                                if dist > 0.02:
+                                    distortion_msgs.append(
+                                        f"{fname_g}: planar CRS "
+                                        f"{meta.get('choice_name', '?')} \u2014 "
+                                        f"distortion ~{dist * 100:.1f}% across "
+                                        f"the extent. Outputs stay in WGS84; "
+                                        f"distances may drift across far-apart "
+                                        f"clusters."
+                                    )
                             else:
                                 d["processed"] = d["raw"].copy()
                                 d["meta"] = None
                             d["accumulated"] = []
                             d["results"] = None
+                for msg in distortion_msgs:
+                    st.warning(msg)
                 st.success("Grids generated!")
                 gc.collect()
                 st.rerun()
@@ -802,9 +815,7 @@ def render(output_dir: str, parent_dir: str) -> None:
                     stem = os.path.basename(p).rsplit(".", 1)[0]
                     base_names.add(stem.removesuffix("_gvi"))
             for tiles_dir in glob.glob(os.path.join(output_dir, "*_gvi_tiles")):
-                base_names.add(
-                    os.path.basename(tiles_dir).removesuffix("_gvi_tiles")
-                )
+                base_names.add(os.path.basename(tiles_dir).removesuffix("_gvi_tiles"))
 
             count = 0
             for base_name in sorted(base_names):
