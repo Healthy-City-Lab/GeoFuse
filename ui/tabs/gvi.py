@@ -12,9 +12,11 @@ import numpy as np
 import rasterio
 import streamlit as st
 from helpers import (
+    RESTART_SESSION_KEY,
     apply_buffer_m,
     generate_clustered_grid,
     load_vector_upload_sessions,
+    render_job_restart_panel,
 )
 from map_preview import (
     add_study_area_layers,
@@ -124,6 +126,134 @@ def _gvi_size_hint(buffer_m: int, step_m: int) -> None:
         )
     if msgs:
         st.info(" · ".join(msgs))
+
+
+def _gvi_restart_summary_lines(p: dict) -> list[str]:
+    return [
+        f"**Original file:** `{p.get('fname', '?')}`",
+        f"**Grid step:** {p.get('step', '?')} m · **Buffer:** {p.get('buffer', '?')} m",
+        f"**Outputs:** GeoPackage={bool(p.get('save_gpkg', True))} · "
+        f"GeoTIFF={bool(p.get('save_geotiff'))} · "
+        f"GeoJSON={bool(p.get('save_geojson'))}",
+        f"**Save panos / masks:** {bool(p.get('save_panos'))} / {bool(p.get('save_masks'))}",
+    ]
+
+
+def _render_gvi_restart_panel(
+    store, executor, pano_cache, output_dir, parent_dir
+) -> None:
+    """Show the restart workflow when the user clicked ↻ on a GVI job."""
+    job_id = st.session_state.get(RESTART_SESSION_KEY)
+    if not job_id:
+        return
+    rec = store.get(job_id)
+    if rec is None:
+        return
+    if rec.type in ("ndvi", "ndvi_column"):
+        st.info(
+            "A restart is pending for an NDVI job. Switch to the **NDVI "
+            "Sourcing** tab to complete it."
+        )
+        return
+    if rec.type != "gvi":
+        return
+
+    p = rec.params or {}
+    had_api_key = bool(p.get("has_api_key"))
+
+    def _extra_inputs() -> dict:
+        if not had_api_key:
+            return {}
+        st.caption(
+            "Original job used the Street View API. Re-supply the API key — "
+            "secrets aren't persisted between runs."
+        )
+        key = st.text_input(
+            "Street View API Key",
+            type="password",
+            autocomplete="off",
+            key=f"restart_apikey_{rec.id}",
+        )
+        return {"api_key": key or None}
+
+    def _on_confirm(gdf, fname_new: str, extras: dict) -> None:
+        # Stage the verified GDF in this tab's session datasets so
+        # generate_clustered_grid + the engine see it the same way they do
+        # for a fresh upload.
+        fname = fname_new
+        try:
+            gtype = (
+                "poly"
+                if gdf.geometry.iloc[0].geom_type in ["Polygon", "MultiPolygon"]
+                else "point"
+            )
+        except Exception:
+            gtype = "point"
+        st.session_state.datasets[fname] = {
+            "raw": gdf,
+            "processed": None,
+            "accumulated": [],
+            "results": None,
+            "meta": None,
+            "type": gtype,
+        }
+
+        # Materialize the sampling grid using the *original* step/buffer
+        # rather than the form's current values, so the restart is faithful.
+        step_m = int(p.get("step", 50))
+        buffer_m = int(p.get("buffer", 0))
+        if _gvi_dataset_uses_raster_grid(st.session_state.datasets[fname], buffer_m):
+            pts, meta = generate_clustered_grid(
+                gdf, buffer_m=float(buffer_m), step_m=float(step_m)
+            )
+            st.session_state.datasets[fname]["processed"] = pts
+            st.session_state.datasets[fname]["meta"] = meta
+        else:
+            st.session_state.datasets[fname]["processed"] = gdf.copy()
+
+        st.session_state.datasets[fname]["cache_ref"] = pano_cache
+
+        model_path = p.get("model_path") or os.path.join(
+            parent_dir, "geofuse", "model", "best_model.pth"
+        )
+        api_key = extras.get("api_key") if had_api_key else None
+
+        new_params = dict(p)
+        new_params["geometry_sha256"] = geometry_sha256(gdf)
+        new_params["restart_of"] = rec.id
+        new_params["has_api_key"] = api_key is not None
+        new_params["fname"] = fname
+
+        record = store.submit(
+            type="gvi",
+            name=os.path.splitext(fname)[0],
+            params=new_params,
+        )
+        executor.submit_runner(
+            record,
+            run_gvi,
+            fname=fname,
+            dataset_data=st.session_state.datasets[fname],
+            init_args={"model_path": model_path, "api_key": api_key},
+            run_args={
+                "step": step_m,
+                "save_panos": bool(p.get("save_panos")),
+                "save_masks": bool(p.get("save_masks")),
+            },
+            output_dir=output_dir,
+            save_gpkg=bool(p.get("save_gpkg", True)),
+            save_geotiff=bool(p.get("save_geotiff")),
+            save_geojson=bool(p.get("save_geojson")),
+            gpu_lock=executor.gpu_lock,
+        )
+
+    render_job_restart_panel(
+        rec,
+        accept_types=["geojson", "json", "gpkg", "shp", "dbf", "shx", "prj", "cpg", "zip"],
+        summary_lines=_gvi_restart_summary_lines(p),
+        extra_inputs_renderer=_extra_inputs if had_api_key else None,
+        on_confirm=_on_confirm,
+    )
 
 
 def _gvi_materialize_grids_if_missing(gvi_buffer: int, gvi_res: int) -> None:
@@ -368,7 +498,7 @@ def render(output_dir: str, parent_dir: str) -> None:
                     with st.expander("Error trace"):
                         st.code(error_detail or rec.error)
 
-                # Action button
+                # Action buttons
                 if rec.status in _ACTIVE:
                     st.button(
                         "Cancel",
@@ -377,20 +507,40 @@ def render(output_dir: str, parent_dir: str) -> None:
                         args=(rec.id,),
                     )
                 else:
-                    if rec.status == "interrupted":
-                        st.caption(
-                            "Interrupted on restart — re-upload the source "
-                            "dataset and re-submit from the form above."
-                        )
-                    st.button(
-                        "🗑️",
-                        key=f"del_{rec.id}",
-                        on_click=callback_dismiss_job,
-                        args=(rec.id,),
+                    restart_eligible = (
+                        rec.type in ("gvi", "ndvi", "ndvi_column")
+                        and rec.status in ("interrupted", "cancelled", "error")
                     )
+                    btn_cols = st.columns(2, gap="medium")
+                    if restart_eligible:
+                        restart_col, dismiss_col = btn_cols[0], btn_cols[1]
+                    else:
+                        restart_col, dismiss_col = None, btn_cols[0]
+                    if restart_col is not None:
+                        with restart_col:
+                            if st.button(
+                                "🔄",
+                                key=f"restart_{rec.id}",
+                                use_container_width=True,
+                                help="Restart — re-upload the original input geometry.",
+                            ):
+                                st.session_state[RESTART_SESSION_KEY] = rec.id
+                                st.rerun()
+                    with dismiss_col:
+                        st.button(
+                            "🗑️",
+                            key=f"del_{rec.id}",
+                            use_container_width=True,
+                            on_click=callback_dismiss_job,
+                            args=(rec.id,),
+                            help="Dismiss — remove this job from history.",
+                        )
 
     with st.sidebar:
         show_job_monitor_fragment()
+
+    # --- RESTART PANEL (above the main form when a terminal job was clicked) ---
+    _render_gvi_restart_panel(store, executor, pano_cache, output_dir, parent_dir)
 
     st.subheader("Input Configuration")
 

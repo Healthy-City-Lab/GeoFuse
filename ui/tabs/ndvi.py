@@ -11,7 +11,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import rasterio
 import streamlit as st
-from helpers import apply_buffer_m, load_vector_upload_sessions
+from helpers import (
+    RESTART_SESSION_KEY,
+    apply_buffer_m,
+    load_vector_upload_sessions,
+    render_job_restart_panel,
+)
 from map_preview import (
     add_study_area_layers,
     add_uniform_point_layer,
@@ -28,6 +33,121 @@ from geofuse.vector_io import geometry_sha256
 # ---------------------------------------------------------------------------
 # Tab render entry point
 # ---------------------------------------------------------------------------
+
+
+def _ndvi_restart_summary_lines(p: dict) -> list[str]:
+    mode = p.get("mode", "?")
+    lines = [
+        f"**Original file:** `{p.get('fname', '?')}`",
+        f"**Mode:** {mode}",
+    ]
+    if mode == "range":
+        lines.append(
+            f"**Date range:** {p.get('start_date', '?')} → "
+            f"{p.get('end_date', '?')}"
+        )
+    elif mode == "specific":
+        lines.append(
+            f"**Target date:** {p.get('target_date', '?')} "
+            f"(±{p.get('window_days', '?')} d)"
+        )
+    elif mode == "column":
+        lines.append(
+            f"**Date column:** `{p.get('date_column', '?')}` "
+            f"(±{p.get('window_days', '?')} d)"
+        )
+    lines.append(
+        f"**Cloud max:** {p.get('cloud_pct', '?')}% · "
+        f"**Resolution:** {p.get('resolution', '?')} m · "
+        f"**Buffer:** {p.get('buffer_m', '?')} m"
+    )
+    lines.append(
+        f"**Outputs:** GeoTIFF={bool(p.get('save_geotiff'))} · "
+        f"GeoPackage={bool(p.get('save_gpkg'))} · "
+        f"GeoJSON={bool(p.get('save_geojson'))}"
+    )
+    return lines
+
+
+def _render_ndvi_restart_panel(store, executor, output_dir) -> None:
+    """Show the restart workflow when the user clicked ↻ on an NDVI job."""
+    job_id = st.session_state.get(RESTART_SESSION_KEY)
+    if not job_id:
+        return
+    rec = store.get(job_id)
+    if rec is None:
+        return
+    if rec.type == "gvi":
+        st.info(
+            "A restart is pending for a GVI job. Switch to the **GVI "
+            "Sourcing** tab to complete it."
+        )
+        return
+    if rec.type not in ("ndvi", "ndvi_column"):
+        return
+
+    p = rec.params or {}
+
+    def _on_confirm(gdf, fname_new: str, _extras: dict) -> None:
+        fname = fname_new
+        # Stage the verified GDF in the NDVI tab's dataset registry.
+        try:
+            gtype = (
+                "poly"
+                if gdf.geometry.iloc[0].geom_type in ["Polygon", "MultiPolygon"]
+                else "point"
+            )
+        except Exception:
+            gtype = "point"
+        if "ndvi_datasets" not in st.session_state:
+            st.session_state.ndvi_datasets = {}
+        st.session_state.ndvi_datasets[fname] = {"raw": gdf, "type": gtype}
+
+        new_params = dict(p)
+        new_params["geometry_sha256"] = geometry_sha256(gdf)
+        new_params["restart_of"] = rec.id
+        new_params["fname"] = fname
+
+        base_name = os.path.splitext(fname)[0]
+        record = store.submit(type=rec.type, name=base_name, params=new_params)
+
+        common = {
+            "fname": fname,
+            "dataset_data": st.session_state.ndvi_datasets[fname],
+            "cloud_pct": int(p.get("cloud_pct", 10)),
+            "resolution": int(p.get("resolution", 10)),
+            "buffer_m": int(p.get("buffer_m", 0)),
+            "output_dir": output_dir,
+            "save_geotiff": bool(p.get("save_geotiff", True)),
+            "save_geojson": bool(p.get("save_geojson", False)),
+            "save_gpkg": bool(p.get("save_gpkg", False)),
+        }
+
+        if rec.type == "ndvi":
+            executor.submit_runner(
+                record,
+                run_ndvi,
+                start_date=str(p.get("start_date", "")),
+                end_date=str(p.get("end_date", "")),
+                output_name=str(p.get("output_name", base_name)),
+                **common,
+            )
+        else:  # ndvi_column
+            executor.submit_runner(
+                record,
+                run_ndvi_column,
+                date_column=str(p.get("date_column", "")),
+                window_days=int(p.get("window_days", 30)),
+                **common,
+            )
+
+    render_job_restart_panel(
+        rec,
+        accept_types=["geojson", "json", "gpkg", "shp", "dbf", "shx", "prj", "cpg", "zip"],
+        summary_lines=_ndvi_restart_summary_lines(p),
+        extra_inputs_renderer=None,
+        on_confirm=_on_confirm,
+    )
 
 
 def _ndvi_size_hint(buffer_m: int, resolution_m: int) -> None:
@@ -95,6 +215,10 @@ def render(output_dir: str) -> None:
         st.session_state.ndvi_inspector_select = None
     if "ndvi_date_configs" not in st.session_state:
         st.session_state.ndvi_date_configs = {}
+
+    from services import get_job_executor, get_job_store
+
+    _render_ndvi_restart_panel(get_job_store(), get_job_executor(), output_dir)
 
     st.subheader("Input Configuration")
 
