@@ -784,66 +784,115 @@ def render(output_dir: str, parent_dir: str) -> None:
         st.subheader("Result Inspector")
 
         if st.button("🔄 Scan Output Folder", key="gvi_scan_folder"):
+            import json as _json
+
             from rasterio.warp import transform_bounds
 
-            tif_paths: dict[str, str] = {}
+            # Discover every base name by union of GPKG / GeoJSON / single TIF
+            # / per-cluster tiles folder. The new canonical output is GPKG +
+            # sidecar JSON, but legacy single-TIF outputs are still supported.
+            base_names: set[str] = set()
             for pat in (
-                os.path.join(output_dir, "*_gvi.tif"),
-                os.path.join(output_dir, "*_gvi.tiff"),
+                "*_gvi.gpkg",
+                "*_gvi.geojson",
+                "*_gvi.tif",
+                "*_gvi.tiff",
             ):
-                for p in glob.glob(pat):
-                    tif_paths[os.path.basename(p)] = p
+                for p in glob.glob(os.path.join(output_dir, pat)):
+                    stem = os.path.basename(p).rsplit(".", 1)[0]
+                    base_names.add(stem.removesuffix("_gvi"))
+            for tiles_dir in glob.glob(os.path.join(output_dir, "*_gvi_tiles")):
+                base_names.add(
+                    os.path.basename(tiles_dir).removesuffix("_gvi_tiles")
+                )
+
             count = 0
-            for basename in sorted(tif_paths.keys()):
-                tif_path = tif_paths[basename]
-                stem = basename.rsplit(".", 1)[0]
-                base_name = stem.removesuffix("_gvi")
-                geojson_path = os.path.join(output_dir, f"{base_name}_gvi.geojson")
-                has_geojson = os.path.isfile(geojson_path)
-                if base_name not in st.session_state.datasets:
-                    try:
-                        with rasterio.open(tif_path) as src:
+            for base_name in sorted(base_names):
+                if base_name in st.session_state.datasets:
+                    continue
+
+                gpkg_path = os.path.join(output_dir, f"{base_name}_gvi.gpkg")
+                gj_path = os.path.join(output_dir, f"{base_name}_gvi.geojson")
+                sidecar_path = os.path.join(output_dir, f"{base_name}_gvi.json")
+                single_tif: str | None = None
+                for ext in (".tif", ".tiff"):
+                    p = os.path.join(output_dir, f"{base_name}_gvi{ext}")
+                    if os.path.isfile(p):
+                        single_tif = p
+                        break
+                tiles_dir = os.path.join(output_dir, f"{base_name}_gvi_tiles")
+                has_tiles = os.path.isdir(tiles_dir)
+
+                try:
+                    results = None
+                    if os.path.isfile(gpkg_path):
+                        results = reproject_geodataframe_to_wgs84(
+                            gpd.read_file(gpkg_path)
+                        )
+                    elif os.path.isfile(gj_path):
+                        results = reproject_geodataframe_to_wgs84(
+                            gpd.read_file(gj_path)
+                        )
+
+                    meta: dict | None = None
+                    if single_tif:
+                        with rasterio.open(single_tif) as src:
                             meta = {
                                 "transform": src.transform,
                                 "width": src.width,
                                 "height": src.height,
                                 "crs": src.crs,
                             }
+                    elif os.path.isfile(sidecar_path):
+                        with open(sidecar_path) as f:
+                            sc = _json.load(f)
+                        meta = {
+                            "grid_crs_wkt": sc.get("grid_crs_wkt"),
+                            "step_m": sc.get("step_m"),
+                            "anchor_x": sc.get("anchor_x"),
+                            "anchor_y": sc.get("anchor_y"),
+                            "tiles_dir": tiles_dir if has_tiles else None,
+                            "n_clusters": sc.get("n_clusters"),
+                        }
+                    elif has_tiles:
+                        meta = {"tiles_dir": tiles_dir}
+
+                    if results is not None and not results.empty:
+                        raw_geom = results.geometry.union_all().envelope
+                        raw_gdf = gpd.GeoDataFrame(
+                            {"geometry": [raw_geom]}, crs="EPSG:4326"
+                        )
+                    elif single_tif:
+                        with rasterio.open(single_tif) as src:
                             b = src.bounds
                             crs = src.crs
-                        if has_geojson:
-                            gdf = reproject_geodataframe_to_wgs84(
-                                gpd.read_file(geojson_path)
-                            )
-                            raw_geom = gdf.geometry.union_all().envelope
-                            raw_gdf = gpd.GeoDataFrame(
-                                {"geometry": [raw_geom]}, crs="EPSG:4326"
-                            )
-                            results = gdf
-                        else:
-                            w, s, e, n = transform_bounds(crs, "EPSG:4326", *b)
-                            raw_gdf = gpd.GeoDataFrame(
-                                {"geometry": [shapely_box(w, s, e, n)]},
-                                crs="EPSG:4326",
-                            )
-                            results = None
-                        st.session_state.datasets[base_name] = {
-                            "raw": raw_gdf,
-                            "processed": None,
-                            "accumulated": [],
-                            "results": results,
-                            "meta": meta,
-                            "type": "restored",
-                        }
-                        count += 1
-                    except Exception as e:
-                        print(f"Error: {e}")
+                        w, s, e, n = transform_bounds(crs, "EPSG:4326", *b)
+                        raw_gdf = gpd.GeoDataFrame(
+                            {"geometry": [shapely_box(w, s, e, n)]},
+                            crs="EPSG:4326",
+                        )
+                    else:
+                        # Nothing readable for this base name.
+                        continue
+
+                    st.session_state.datasets[base_name] = {
+                        "raw": raw_gdf,
+                        "processed": None,
+                        "accumulated": [],
+                        "results": results,
+                        "meta": meta,
+                        "type": "restored",
+                    }
+                    count += 1
+                except Exception as e:
+                    print(f"Error scanning {base_name}: {e}")
             if count > 0:
                 st.success(f"Loaded {count} result(s) from the output folder.")
             else:
                 st.info(
-                    "No GVI GeoTIFF results found in the output folder "
-                    "(files named *_gvi.tif or *_gvi.tiff)."
+                    "No GVI results found in the output folder "
+                    "(looked for *_gvi.gpkg, *_gvi.geojson, *_gvi.tif, "
+                    "*_gvi_tiles/)."
                 )
 
         completed_ds = [
@@ -915,20 +964,33 @@ def render(output_dir: str, parent_dir: str) -> None:
                     continue
                 ds = st.session_state.datasets[ds_name]
 
-                if ds.get("meta"):
-                    meta = ds["meta"]
+                meta = ds.get("meta") or {}
+                has_single_raster = (
+                    meta.get("transform") is not None
+                    and meta.get("height") is not None
+                    and meta.get("width") is not None
+                )
+
+                # Always show an extent rectangle for the dataset, derived from
+                # the legacy raster meta when available, otherwise from the
+                # raw envelope produced by Scan Output Folder.
+                if has_single_raster:
+                    from rasterio.warp import transform_bounds
+
                     left, bottom, right, top = array_bounds(
                         meta["height"], meta["width"], meta["transform"]
                     )
-
-                    from rasterio.warp import transform_bounds
-
                     meta_crs = meta.get("crs", "EPSG:4326")
                     if meta_crs != "EPSG:4326":
                         left, bottom, right, top = transform_bounds(
                             meta_crs, "EPSG:4326", left, bottom, right, top
                         )
+                elif ds.get("raw") is not None and not ds["raw"].empty:
+                    left, bottom, right, top = ds["raw"].total_bounds
+                else:
+                    left = bottom = right = top = None
 
+                if left is not None:
                     folium.Rectangle(
                         bounds=[[bottom, left], [top, right]],
                         color="grey",
@@ -938,11 +1000,13 @@ def render(output_dir: str, parent_dir: str) -> None:
                     ).add_to(m_result)
                     res_bounds.append([left, bottom, right, top])
 
+                # Raster overlay is only available for legacy single-TIF
+                # outputs. New GeoPackage-only outputs render as points only
+                # (toggle Show Sample Points below).
+                if has_single_raster:
                     from rasterio.transform import rowcol
 
-                    meta = ds["meta"]
                     arr = np.full((meta["height"], meta["width"]), np.nan)
-
                     col_name = "gvi_ter" if "Terrain" in raster_layer else "gvi_veg"
                     if ds.get("results") is not None:
                         res = ds["results"].dropna(subset=[col_name])
