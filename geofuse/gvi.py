@@ -87,6 +87,14 @@ _SEARCH_RADIUS_M = 50.0
 _DOWNLOAD_ZOOM = 1
 # Hard timeout per panorama download (covers all tile fetches together).
 _DOWNLOAD_TIMEOUT_S = 20.0
+# Sliding window of points that may have their **panorama-search HTTP call**
+# in flight at the same time. Small enough not to rate-limit Google's
+# SingleImageSearch endpoint or oversubscribe local sockets; large enough
+# that one task's TCP/TLS reconnect cost is hidden by others' in-flight
+# requests. The heavy download+GPU stretch still serializes — see the
+# inner lock built in _run_analysis_async — so cache-miss throughput is
+# unchanged while cache-hit / no-pano points fly through concurrently.
+_MAX_CONCURRENT_POINTS = 4
 
 
 class GVIEngine:
@@ -148,6 +156,7 @@ class GVIEngine:
         pano_cache: dict,
         failed_panos: set,
         cancel_callback: Callable[..., bool] | None,
+        download_gpu_lock: asyncio.Lock,
     ) -> dict:
         idx = pt["orig_index"]
         lat, lon = pt["lat"], pt["lon"]
@@ -206,65 +215,87 @@ class GVIEngine:
                 pt, search_lat, search_lon, cached["veg"], cached["ter"], pid
             )
 
-        # 3. Download tiles (parallel via aiohttp inside get_panorama_async)
-        _log("INFO", f"  Downloading {short}… (zoom={_DOWNLOAD_ZOOM})")
-        try:
-            raw_image = await asyncio.wait_for(
-                gsv.get_panorama_async(pano, session, zoom=_DOWNLOAD_ZOOM),
-                timeout=_DOWNLOAD_TIMEOUT_S,
-            )
-        except TimeoutError:
+        # 3. Download + 4. GPU inference — serialized across all in-flight
+        # points so we don't oversubscribe the tile endpoint or the GPU.
+        # While this lock is held by one task, the other concurrent tasks
+        # remain free to run their search HTTP (step 1) and resolve cache
+        # hits without waiting.
+        async with download_gpu_lock:
+            # Cache hit may have arrived while we were queued for the lock.
+            if pid in pano_cache:
+                cached = pano_cache[pid]
+                _log(
+                    "OK",
+                    f"  Cache hit (after queue) {short}… → "
+                    f"veg={cached['veg']:.3f} ter={cached['ter']:.3f}",
+                )
+                return self._make_result(
+                    pt, search_lat, search_lon, cached["veg"], cached["ter"], pid
+                )
+
+            # 3. Download tiles (parallel via aiohttp inside get_panorama_async)
+            _log("INFO", f"  Downloading {short}… (zoom={_DOWNLOAD_ZOOM})")
+            try:
+                raw_image = await asyncio.wait_for(
+                    gsv.get_panorama_async(pano, session, zoom=_DOWNLOAD_ZOOM),
+                    timeout=_DOWNLOAD_TIMEOUT_S,
+                )
+            except TimeoutError:
+                _log(
+                    "ERROR",
+                    f"  Timeout (>{_DOWNLOAD_TIMEOUT_S:.0f}s) downloading "
+                    f"{short}… — marking failed",
+                )
+                failed_panos.add(pid)
+                return self._empty_result(pt, search_lat, search_lon)
+            except Exception as e:
+                _log(
+                    "ERROR",
+                    f"  Download error for {short}…: " f"{type(e).__name__}: {e}",
+                )
+                failed_panos.add(pid)
+                return self._empty_result(pt, search_lat, search_lon)
+
+            if cancel_callback and cancel_callback():
+                return self._empty_result(pt, search_lat, search_lon)
+
             _log(
-                "ERROR",
-                f"  Timeout (>{_DOWNLOAD_TIMEOUT_S:.0f}s) downloading "
-                f"{short}… — marking failed",
+                "INFO",
+                f"  Downloaded {short}… ({raw_image.width}×{raw_image.height}) "
+                f"— preprocessing",
             )
-            failed_panos.add(pid)
-            return self._empty_result(pt, search_lat, search_lon)
-        except Exception as e:
-            _log("ERROR", f"  Download error for {short}…: " f"{type(e).__name__}: {e}")
-            failed_panos.add(pid)
-            return self._empty_result(pt, search_lat, search_lon)
 
-        if cancel_callback and cancel_callback():
-            return self._empty_result(pt, search_lat, search_lon)
+            img = self._preprocess_image(raw_image)
+            try:
+                raw_image.close()
+            except Exception:
+                pass
+            del raw_image
 
-        _log(
-            "INFO",
-            f"  Downloaded {short}… ({raw_image.width}×{raw_image.height}) "
-            f"— preprocessing",
-        )
+            if not img:
+                _log("WARN", f"  Preprocess failed for {short}…: blank or black image")
+                failed_panos.add(pid)
+                return self._empty_result(pt, search_lat, search_lon)
 
-        img = self._preprocess_image(raw_image)
-        try:
-            raw_image.close()
-        except Exception:
-            pass
-        del raw_image
+            # 4. GPU inference (offloaded to executor so it doesn't block the loop)
+            _log("INFO", f"  Running segmentation for {short}…")
+            loop = asyncio.get_running_loop()
+            try:
+                mask = await loop.run_in_executor(None, self.segmenter.predict, img)
+            except Exception as e:
+                _log(
+                    "ERROR",
+                    f"  GPU inference failed for {short}…: "
+                    f"{type(e).__name__}: {e}",
+                )
+                return self._empty_result(pt, search_lat, search_lon)
 
-        if not img:
-            _log("WARN", f"  Preprocess failed for {short}…: blank or black image")
-            failed_panos.add(pid)
-            return self._empty_result(pt, search_lat, search_lon)
+            metrics = self.segmenter.calculate_gvi_from_mask(mask)
+            val_veg = metrics.get("GVI_Total", 0.0)
+            val_ter = metrics.get("GVI_Terrain", 0.0)
+            pano_cache[pid] = {"veg": val_veg, "ter": val_ter}
 
-        # 4. GPU inference (offloaded to executor so it doesn't block the loop)
-        _log("INFO", f"  Running segmentation for {short}…")
-        loop = asyncio.get_running_loop()
-        try:
-            mask = await loop.run_in_executor(None, self.segmenter.predict, img)
-        except Exception as e:
-            _log(
-                "ERROR",
-                f"  GPU inference failed for {short}…: " f"{type(e).__name__}: {e}",
-            )
-            return self._empty_result(pt, search_lat, search_lon)
-
-        metrics = self.segmenter.calculate_gvi_from_mask(mask)
-        val_veg = metrics.get("GVI_Total", 0.0)
-        val_ter = metrics.get("GVI_Terrain", 0.0)
-        pano_cache[pid] = {"veg": val_veg, "ter": val_ter}
-
-        _log("OK", f"  GVI {short}… → veg={val_veg:.3f}  ter={val_ter:.3f}")
+            _log("OK", f"  GVI {short}… → veg={val_veg:.3f}  ter={val_ter:.3f}")
 
         # 5. Optional disk artefacts
         if save_panos:
@@ -363,54 +394,77 @@ class GVIEngine:
         # Never written to pano_cache (which is the persistent session cache).
         failed_panos: set[str] = set()
         completed = 0
-        current_task: asyncio.Task | None = None
+
+        # Fixed worker pool: exactly _MAX_CONCURRENT_POINTS workers pull
+        # points from a shared queue. Only a constant number of task objects
+        # ever exist, regardless of how many points the run has. The inner
+        # download_gpu_lock keeps the heavy download + GPU stretch strictly
+        # serial so cache-miss throughput is unaffected.
+        download_gpu_lock = asyncio.Lock()
+        queue: asyncio.Queue = asyncio.Queue()
+        for pt in points_to_process:
+            queue.put_nowait(pt)
+
+        completed_lock = asyncio.Lock()
 
         async with aiohttp.ClientSession() as session:
-            # Watcher: cancel the active point's task as soon as the user clicks Cancel.
+
+            async def _worker() -> None:
+                nonlocal completed
+                while True:
+                    if cancel_callback and cancel_callback():
+                        return
+                    try:
+                        pt = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        return
+                    try:
+                        res = await self._process_one_point_async(
+                            pt,
+                            session,
+                            gdf,
+                            folder,
+                            save_panos,
+                            save_masks,
+                            pano_cache,
+                            failed_panos,
+                            cancel_callback,
+                            download_gpu_lock,
+                        )
+                    except asyncio.CancelledError:
+                        return
+                    if result_callback:
+                        result_callback(res)
+                    async with completed_lock:
+                        completed += 1
+                        curr = completed
+                    if progress_callback:
+                        progress_callback(start_index + curr, total_points)
+
+            workers: list[asyncio.Task] = [
+                asyncio.create_task(_worker()) for _ in range(_MAX_CONCURRENT_POINTS)
+            ]
+
+            # Watcher: cancels every worker on user cancel.
             async def _cancel_watcher() -> None:
                 while True:
                     await asyncio.sleep(0.25)
                     if cancel_callback and cancel_callback():
-                        if current_task and not current_task.done():
-                            current_task.cancel()
+                        for t in workers:
+                            if not t.done():
+                                t.cancel()
                         return
 
             watcher = asyncio.create_task(_cancel_watcher())
 
-            # Serial loop — one point at a time, search → download → GPU → next.
-            for pt in points_to_process:
-                if cancel_callback and cancel_callback():
-                    break
-
-                current_task = asyncio.create_task(
-                    self._process_one_point_async(
-                        pt,
-                        session,
-                        gdf,
-                        folder,
-                        save_panos,
-                        save_masks,
-                        pano_cache,
-                        failed_panos,
-                        cancel_callback,
-                    )
-                )
-                try:
-                    res = await current_task
-                except asyncio.CancelledError:
-                    break
-
-                if result_callback:
-                    result_callback(res)
-                completed += 1
-                if progress_callback:
-                    progress_callback(start_index + completed, total_points)
-
-            watcher.cancel()
             try:
-                await watcher
-            except asyncio.CancelledError:
-                pass
+                await asyncio.gather(*workers, return_exceptions=True)
+            finally:
+                watcher.cancel()
+                try:
+                    await watcher
+                except asyncio.CancelledError:
+                    pass
 
             if cancel_callback and cancel_callback():
                 _log("WARN", "Analysis Aborted by User.")
