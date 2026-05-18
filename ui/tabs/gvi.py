@@ -408,12 +408,28 @@ def render(output_dir: str, parent_dir: str) -> None:
         if rec.completed_at:
             st.caption(f"Completed at: {rec.completed_at}")
 
+    # Re-rendering job log buffers every fragment tick (1 Hz) holds the log
+    # lock and competes with worker threads that are appending to the same
+    # buffers. Cache the rendered HTML per job and only refresh it every few
+    # seconds — the per-line log throughput is far higher than what a user
+    # can read, so the cache is essentially invisible to the user.
+    import time as _time
+
+    _LOG_REFRESH_INTERVAL_S = 3.0
+
     def _render_logs(rec_id: str) -> None:
-        lines = get_job_log_lines(rec_id)
-        if not lines:
+        cache = st.session_state.setdefault("_gvi_log_cache", {})
+        entry = cache.get(rec_id)
+        now = _time.monotonic()
+        if entry is None or now - entry["t"] > _LOG_REFRESH_INTERVAL_S:
+            lines = get_job_log_lines(rec_id)
+            html = ansi_log_lines_to_html(lines) if lines else None
+            entry = {"t": now, "html": html}
+            cache[rec_id] = entry
+        if entry["html"] is None:
             st.caption("(no log output captured yet)")
             return
-        st.markdown(ansi_log_lines_to_html(lines), unsafe_allow_html=True)
+        st.markdown(entry["html"], unsafe_allow_html=True)
 
     @st.fragment(run_every=1)
     def show_job_monitor_fragment():
