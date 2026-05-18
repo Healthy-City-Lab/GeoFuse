@@ -94,20 +94,24 @@ def run_gvi(
     start_idx = len(current_accumulated)
     results_lock = threading.Lock()
 
-    # Throttle progress callbacks: the UI fragment refreshes at ~1 Hz, so
-    # emitting on every point only adds JobStore lock contention without
-    # improving what the user sees. Cap at ~3 Hz, always emit on the final
-    # point so the bar reaches 100%.
-    _last_progress_emit = {"t": 0.0}
-    _PROGRESS_MIN_INTERVAL_S = 0.33
+    # Throttle progress callbacks: the JobStore lock is also taken by the UI
+    # fragment, so frequent emits starve the worker. Interval scales with the
+    # total point count — 2 s up to 200 points, then +1 s per 100 points,
+    # capped at 10 s for 1000+ points. The final point always emits so the
+    # bar reaches 100%.
+    _last_progress_t = {"v": 0.0}
+
+    def _progress_interval_s(total: int) -> float:
+        return float(min(10, max(2, total // 100)))
 
     def on_progress(curr: int, total: int) -> None:
         if total <= 0:
             return
-        now = time.monotonic()
-        if curr < total and now - _last_progress_emit["t"] < _PROGRESS_MIN_INTERVAL_S:
-            return
-        _last_progress_emit["t"] = now
+        if curr < total:
+            now = time.monotonic()
+            if now - _last_progress_t["v"] < _progress_interval_s(total):
+                return
+        _last_progress_t["v"] = time.monotonic()
         ctx.progress(
             value=min(curr / total, 1.0),
             status_text=f"Processing ({curr}/{total})",

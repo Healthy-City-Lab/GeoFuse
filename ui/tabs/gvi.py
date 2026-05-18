@@ -431,7 +431,7 @@ def render(output_dir: str, parent_dir: str) -> None:
             return
         st.markdown(entry["html"], unsafe_allow_html=True)
 
-    @st.fragment(run_every=1)
+    @st.fragment(run_every=2)
     def show_job_monitor_fragment():
         st.header("Job Monitor")
 
