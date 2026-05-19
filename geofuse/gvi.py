@@ -105,9 +105,9 @@ class GVIEngine:
         self.device = get_best_device(device)
         self.api_key = api_key
 
-        print(f"[GVI] Initializing DeepLabV3+ Model on {self.device}...")
+        _log("INFO", f"Initializing DeepLabV3+ Model on {self.device}...")
         self.segmenter = DeepLabSegmenter(ckpt_path=model_path, device=str(self.device))
-        print("[GVI] Model Ready.")
+        _log("OK", "Model Ready.")
 
     def _preprocess_image(self, img, target_width=1920):
         if img is None:
@@ -482,7 +482,7 @@ class GVIEngine:
         cancel_callback=None,
         start_index=0,
     ):
-        print(f"[GVI] Starting Analysis (Resume Index: {start_index})...")
+        _log("INFO", f"Starting Analysis (Resume Index: {start_index})...")
         os.makedirs(folder, exist_ok=True)
         if save_panos:
             os.makedirs(os.path.join(folder, "images"), exist_ok=True)
@@ -530,7 +530,7 @@ class GVIEngine:
         points_to_process = points[start_index:]
 
         if len(points_to_process) == 0:
-            print("[GVI] All points already processed.")
+            _log("INFO", "All points already processed.")
             return gpd.GeoDataFrame()
 
         pano_cache = external_cache if external_cache is not None else {}
@@ -558,7 +558,7 @@ class GVIEngine:
         else:
             _progress_cb(start_index, total_points)
 
-        print(f"[GVI] Processing {len(points_to_process)} points...")
+        _log("INFO", f"Processing {len(points_to_process)} points...")
 
         asyncio.run(
             self._run_analysis_async(
