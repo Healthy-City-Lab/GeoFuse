@@ -13,7 +13,10 @@ markdown block.
 from __future__ import annotations
 
 import html
+import os
+import platform
 import re
+import subprocess
 
 import streamlit as st
 
@@ -77,6 +80,23 @@ def ansi_log_lines_to_html(lines: list[str]) -> str:
         f"{rendered}"
         "</div>"
     )
+
+
+def open_path_in_default_editor(path: str) -> None:
+    """Open ``path`` in the OS's default associated application.
+
+    Used by the job-monitor's "Open log file" button so terminal jobs link
+    out to their full persistent log instead of relying on the in-memory
+    deque (which only keeps the last 100 lines).
+    """
+    abspath = os.path.abspath(path)
+    system = platform.system()
+    if system == "Windows":
+        os.startfile(abspath)  # type: ignore[attr-defined]
+    elif system == "Darwin":
+        subprocess.Popen(["open", abspath])
+    else:
+        subprocess.Popen(["xdg-open", abspath])
 
 
 @st.cache_resource

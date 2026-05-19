@@ -307,9 +307,10 @@ def render(output_dir: str, parent_dir: str) -> None:
         get_job_executor,
         get_job_store,
         get_pano_cache,
+        open_path_in_default_editor,
     )
 
-    from geofuse.logger import get_job_log_lines
+    from geofuse.logger import get_job_log_lines, get_job_log_path
 
     store = get_job_store()
     executor = get_job_executor()
@@ -408,30 +409,18 @@ def render(output_dir: str, parent_dir: str) -> None:
         if rec.completed_at:
             st.caption(f"Completed at: {rec.completed_at}")
 
-    # Re-rendering job log buffers every fragment tick (1 Hz) holds the log
-    # lock and competes with worker threads that are appending to the same
-    # buffers. Cache the rendered HTML per job and only refresh it every few
-    # seconds — the per-line log throughput is far higher than what a user
-    # can read, so the cache is essentially invisible to the user.
-    import time as _time
-
-    _LOG_REFRESH_INTERVAL_S = 3.0
-
     def _render_logs(rec_id: str) -> None:
-        cache = st.session_state.setdefault("_gvi_log_cache", {})
-        entry = cache.get(rec_id)
-        now = _time.monotonic()
-        if entry is None or now - entry["t"] > _LOG_REFRESH_INTERVAL_S:
-            lines = get_job_log_lines(rec_id)
-            html = ansi_log_lines_to_html(lines) if lines else None
-            entry = {"t": now, "html": html}
-            cache[rec_id] = entry
-        if entry["html"] is None:
+        # Reads straight from the per-job deque. Lock contention is now
+        # negligible: the listener thread (logger.py) holds the deque lock
+        # briefly to append, the fragment holds it briefly to copy. Active
+        # jobs only — terminal jobs use the "Open log file" button instead.
+        lines = get_job_log_lines(rec_id)
+        if not lines:
             st.caption("(no log output captured yet)")
             return
-        st.markdown(entry["html"], unsafe_allow_html=True)
+        st.markdown(ansi_log_lines_to_html(lines), unsafe_allow_html=True)
 
-    @st.fragment(run_every=2)
+    @st.fragment(run_every=1)
     def show_job_monitor_fragment():
         st.header("Job Monitor")
 
@@ -504,9 +493,32 @@ def render(output_dir: str, parent_dir: str) -> None:
                 with st.expander("Details", expanded=False):
                     _render_details(rec)
 
-                # Collapsible per-job log
-                with st.expander("Logs", expanded=False):
-                    _render_logs(rec.id)
+                # Per-job log:
+                #   * Active jobs → collapsible live tail (reads the in-memory
+                #     deque; only the last 100 lines).
+                #   * Terminal jobs → button that opens the full persistent
+                #     log file in the OS's default editor.
+                if rec.status in _TERMINAL:
+                    log_path = get_job_log_path(rec.id)
+                    have_file = os.path.isfile(log_path)
+                    if st.button(
+                        "Open log file",
+                        key=f"openlog_{rec.id}",
+                        use_container_width=True,
+                        disabled=not have_file,
+                        help=(
+                            log_path
+                            if have_file
+                            else "Log file not found on disk."
+                        ),
+                    ):
+                        try:
+                            open_path_in_default_editor(log_path)
+                        except Exception as e:
+                            st.error(f"Could not open log file: {e}")
+                else:
+                    with st.expander("Logs", expanded=False):
+                        _render_logs(rec.id)
 
                 # Error detail block stays in its own expander when present
                 error_detail = rec.extra.get("error_detail")
