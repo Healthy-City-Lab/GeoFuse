@@ -20,6 +20,7 @@ from helpers import (
     render_job_restart_panel,
 )
 from map_preview import (
+    add_black_point_layer,
     add_study_area_layers,
     add_uniform_point_layer,
     trim_point_gdf_for_display,
@@ -1287,50 +1288,15 @@ def render(output_dir: str, parent_dir: str) -> None:
                             interactive=False,
                         ).add_to(m_result)
                 elif ds.get("results") is not None:
-                    col_name = "gvi_ter" if "Terrain" in raster_layer else "gvi_veg"
-                    # If the user has zoomed/panned, clip + rasterize at the
-                    # current view extent so resolution scales with the view.
-                    view_bounds = None
-                    map_view = st.session_state.get("_gvi_map_view")
-                    if map_view and map_view.get("bounds"):
-                        b = map_view["bounds"]
-                        view_bounds = (
-                            b["_southWest"]["lng"],
-                            b["_southWest"]["lat"],
-                            b["_northEast"]["lng"],
-                            b["_northEast"]["lat"],
-                        )
-                    binned = rasterize_points_for_preview(
-                        ds["results"], col_name, max_dim=1200, bounds=view_bounds
+                    # GeoPackage-only: black points, no tooltips (too heavy
+                    # for ~2 M-point runs over a WebSocket).
+                    add_black_point_layer(
+                        m_result,
+                        ds["results"],
+                        radius=6,
+                        fill_opacity=r_opacity,
+                        layer_name=f"{ds_name} samples",
                     )
-                    if binned is not None:
-                        arr, (left_g, bottom_g, right_g, top_g), _w, _h = binned
-                        cmap_name = (
-                            "OrRd" if "Terrain" in raster_layer else "Greens"
-                        )
-                        try:
-                            cmap = matplotlib.colormaps[cmap_name]
-                        except (AttributeError, KeyError):
-                            cmap = plt.get_cmap(cmap_name)
-
-                        norm_data = np.clip((arr - 0) / 0.6, 0, 1)
-                        colored = cmap(norm_data)
-                        colored[..., 3] = np.where(np.isnan(arr), 0, r_opacity)
-                        img_bytes = (colored * 255).astype(np.uint8)
-                        im = PILImage.fromarray(img_bytes)
-                        buff = io.BytesIO()
-                        im.save(buff, format="PNG")
-                        img_url = (
-                            f"data:image/png;base64,"
-                            f"{base64.b64encode(buff.getvalue()).decode()}"
-                        )
-
-                        folium.raster_layers.ImageOverlay(
-                            image=img_url,
-                            bounds=[[bottom_g, left_g], [top_g, right_g]],
-                            opacity=r_opacity,
-                            interactive=False,
-                        ).add_to(m_result)
 
                 if show_points and ds.get("results") is not None:
                     try:
@@ -1364,19 +1330,17 @@ def render(output_dir: str, parent_dir: str) -> None:
                     except Exception as e:
                         st.error(f"Error rendering sample points: {e}")
 
-            if res_bounds:
+            # Only fit bounds when the selection changes — otherwise the
+            # user's manual zoom/pan would be reset on every script rerun.
+            last_sel = st.session_state.get("_gvi_inspector_last_sel")
+            if res_bounds and selected_option != last_sel:
                 min_x = min([b[0] for b in res_bounds])
                 min_y = min([b[1] for b in res_bounds])
                 max_x = max([b[2] for b in res_bounds])
                 max_y = max([b[3] for b in res_bounds])
                 m_result.fit_bounds([[min_y, min_x], [max_y, max_x]])
+            st.session_state["_gvi_inspector_last_sel"] = selected_option
 
-        _map_out = st_folium(
-            m_result,
-            width="100%",
-            height=500,
-            key="map_result",
-            returned_objects=["bounds", "zoom"],
+        st_folium(
+            m_result, width="100%", height=500, key="map_result", returned_objects=[]
         )
-        if _map_out and _map_out.get("bounds"):
-            st.session_state["_gvi_map_view"] = _map_out

@@ -19,6 +19,7 @@ from helpers import (
     render_job_restart_panel,
 )
 from map_preview import (
+    add_black_point_layer,
     add_study_area_layers,
     add_uniform_point_layer,
     trim_point_gdf_for_display,
@@ -1027,51 +1028,19 @@ def render(output_dir: str) -> None:
                     except Exception as e:
                         print(f"Viz Error {ds_name}: {e}")
 
-                # GeoPackage / GeoJSON fallback: clip + rasterize at the
-                # current map view (if known) so resolution scales with zoom.
+                # GeoPackage / GeoJSON fallback: black points, no tooltips.
                 if not rendered_from_tif and ds.get("results") is not None:
-                    view_bounds = None
-                    map_view = st.session_state.get("_ndvi_map_view")
-                    if map_view and map_view.get("bounds"):
-                        b = map_view["bounds"]
-                        view_bounds = (
-                            b["_southWest"]["lng"],
-                            b["_southWest"]["lat"],
-                            b["_northEast"]["lng"],
-                            b["_northEast"]["lat"],
+                    pts = ds["results"]
+                    if pts is not None and not pts.empty:
+                        l, btm, r, t = pts.total_bounds
+                        res_bounds.append([l, btm, r, t])
+                        add_black_point_layer(
+                            m_ndvi_result,
+                            pts,
+                            radius=6,
+                            fill_opacity=r_opacity,
+                            layer_name=f"{ds_name} NDVI samples",
                         )
-                    binned = rasterize_points_for_preview(
-                        ds["results"], "NDVI", max_dim=1200, bounds=view_bounds
-                    )
-                    if binned is not None:
-                        arr, (left, bottom, right, top), _w, _h = binned
-                        folium_bounds = [[bottom, left], [top, right]]
-                        res_bounds.append([left, bottom, right, top])
-
-                        norm_data = np.clip((arr - (-0.2)) / (1.0 - (-0.2)), 0, 1)
-                        cmap = plt.get_cmap("RdYlGn")
-                        colored = cmap(norm_data)
-                        colored[..., 3] = np.where(np.isnan(arr), 0, r_opacity)
-                        img_bytes = (colored * 255).astype(np.uint8)
-                        im = PILImage.fromarray(img_bytes)
-                        buff = io.BytesIO()
-                        im.save(buff, format="PNG")
-                        img_url = (
-                            f"data:image/png;base64,"
-                            f"{base64.b64encode(buff.getvalue()).decode()}"
-                        )
-                        folium.raster_layers.ImageOverlay(
-                            image=img_url,
-                            bounds=folium_bounds,
-                            opacity=r_opacity,
-                            interactive=True,
-                        ).add_to(m_ndvi_result)
-                        folium.Rectangle(
-                            bounds=folium_bounds,
-                            color="red",
-                            weight=2,
-                            fill=False,
-                        ).add_to(m_ndvi_result)
 
                 if show_points and ds.get("results") is not None:
                     try:
@@ -1108,22 +1077,24 @@ def render(output_dir: str) -> None:
                     except Exception as e:
                         st.error(f"Error rendering sample points: {e}")
 
-            if res_bounds:
+            # Only fit bounds when the selection changes — otherwise the
+            # user's pan/zoom would be reset on every script rerun.
+            last_sel = st.session_state.get("_ndvi_inspector_last_sel")
+            if res_bounds and selected_opt != last_sel:
                 min_x = min([b[0] for b in res_bounds])
                 min_y = min([b[1] for b in res_bounds])
                 max_x = max([b[2] for b in res_bounds])
                 max_y = max([b[3] for b in res_bounds])
                 m_ndvi_result.fit_bounds([[min_y, min_x], [max_y, max_x]])
+            st.session_state["_ndvi_inspector_last_sel"] = selected_opt
 
         map_data = st_folium(
             m_ndvi_result,
             width="100%",
             height=500,
             key="map_ndvi_result",
-            returned_objects=["last_clicked", "bounds", "zoom"],
+            returned_objects=["last_clicked"],
         )
-        if map_data and map_data.get("bounds"):
-            st.session_state["_ndvi_map_view"] = map_data
 
         if map_data and map_data.get("last_clicked"):
             lat = map_data["last_clicked"]["lat"]
