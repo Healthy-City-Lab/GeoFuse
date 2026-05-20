@@ -263,6 +263,21 @@ class GVIEngine:
             failed_panos.add(pid)
             return self._empty_result(pt, search_lat, search_lon)
 
+        # Build the input tensor (CPU + pinned memory) outside the GPU lock so
+        # the next forward can overlap with H2D transfer.
+        loop = asyncio.get_running_loop()
+        try:
+            tensor = await loop.run_in_executor(
+                None, self.segmenter.preprocess_to_tensor, img
+            )
+        except Exception as e:
+            _log(
+                "ERROR",
+                f"  Tensor build failed for {short}…: "
+                f"{type(e).__name__}: {e}",
+            )
+            return self._empty_result(pt, search_lat, search_lon)
+
         # 4. GPU inference — serialised so one image is on the device at a
         # time. While this lock is held by one task, others can download
         # tiles or preprocess in parallel.
@@ -281,9 +296,10 @@ class GVIEngine:
                 )
 
             _log("INFO", f"  Running segmentation for {short}…")
-            loop = asyncio.get_running_loop()
             try:
-                mask = await loop.run_in_executor(None, self.segmenter.predict, img)
+                mask = await loop.run_in_executor(
+                    None, self.segmenter.predict_from_tensor, tensor
+                )
             except Exception as e:
                 _log(
                     "ERROR",

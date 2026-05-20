@@ -178,19 +178,40 @@ class DeepLabSegmenter:
 
         return decode
 
-    def predict(self, image_input):
+    def preprocess_to_tensor(self, image_input):
+        """CPU-only path: returns a pinned (1, 3, H, W) tensor ready for H2D.
+
+        Workers call this *outside* the GPU lock so multiple images can be
+        preprocessed in parallel while another worker holds the GPU. The
+        ``pin_memory()`` call makes the eventual ``to(device, non_blocking=True)``
+        transfer go through pinned-DMA, overlapping with the previous forward.
+        """
         if isinstance(image_input, str):
             img = Image.open(image_input).convert("RGB")
         else:
             img = image_input.convert("RGB")
+        tensor = self.transform(img).unsqueeze(0)
+        if self.device.type == "cuda":
+            try:
+                tensor = tensor.pin_memory()
+            except RuntimeError:
+                # Pinning can fail under heavy memory pressure — degrade
+                # gracefully to a regular host tensor.
+                pass
+        return tensor
 
-        img_t = self.transform(img).unsqueeze(0).to(self.device)
-
+    def predict_from_tensor(self, tensor):
+        """GPU-only path: takes the preprocessed tensor, runs one forward, returns mask."""
+        tensor = tensor.to(self.device, non_blocking=True)
         with torch.no_grad():
-            output = self.model(img_t)
+            output = self.model(tensor)
             pred_mask = output.max(1)[1].cpu().numpy()[0]
-
         return pred_mask
+
+    def predict(self, image_input):
+        """Backward-compatible single-call path: CPU preprocess + GPU forward."""
+        tensor = self.preprocess_to_tensor(image_input)
+        return self.predict_from_tensor(tensor)
 
     def calculate_gvi_from_mask(self, mask_array):
         total_pixels = mask_array.size
