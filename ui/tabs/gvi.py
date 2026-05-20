@@ -95,17 +95,16 @@ def _gvi_size_hint(buffer_m: int, step_m: int) -> None:
         bbox_miny = min(bbox_miny, miny)
         bbox_maxx = max(bbox_maxx, maxx)
         bbox_maxy = max(bbox_maxy, maxy)
-        cent_lat = (miny + maxy) / 2.0
-        m_per_deg_lat = 111000.0
-        m_per_deg_lon = 111000.0 * float(np.cos(np.radians(cent_lat)))
         if d.get("type") == "point":
             n = len(raw)
             disk = np.pi * (max(buffer_m, 0)) ** 2
             total_area_m2 += n * disk
         else:
             try:
-                deg2 = float(raw.geometry.area.sum())
-                total_area_m2 += deg2 * m_per_deg_lat * m_per_deg_lon
+                # Reproject to a metric CRS before computing area to avoid
+                # geopandas' geographic-CRS warning and get accurate metres².
+                m_gdf = raw.to_crs(raw.estimate_utm_crs())
+                total_area_m2 += float(m_gdf.geometry.area.sum())
             except Exception:
                 pass
     if not have_data:
