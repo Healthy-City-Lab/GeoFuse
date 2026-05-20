@@ -95,6 +95,9 @@ _DOWNLOAD_TIMEOUT_S = 20.0
 # inner lock built in _run_analysis_async — so cache-miss throughput is
 # unchanged while cache-hit / no-pano points fly through concurrently.
 _MAX_CONCURRENT_POINTS = 4
+# Periodic ``torch.cuda.empty_cache()`` cadence (per-worker completions).
+# Defensive against PyTorch allocator fragmentation over million-point runs.
+_EMPTY_CACHE_EVERY_N = 200
 
 
 class GVIEngine:
@@ -456,6 +459,19 @@ class GVIEngine:
                         curr = completed
                     if progress_callback:
                         progress_callback(start_index + curr, total_points)
+                    # Defensive: release cached blocks back to the device
+                    # periodically so long-running jobs don't accumulate
+                    # allocator fragmentation.
+                    if (
+                        curr % _EMPTY_CACHE_EVERY_N == 0
+                        and self.device.type == "cuda"
+                    ):
+                        try:
+                            import torch
+
+                            torch.cuda.empty_cache()
+                        except Exception:
+                            pass
 
             workers: list[asyncio.Task] = [
                 asyncio.create_task(_worker()) for _ in range(_MAX_CONCURRENT_POINTS)
