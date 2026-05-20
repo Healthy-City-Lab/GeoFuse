@@ -15,6 +15,7 @@ from helpers import (
     RESTART_SESSION_KEY,
     apply_buffer_m,
     load_vector_upload_sessions,
+    rasterize_points_for_preview,
     render_job_restart_panel,
 )
 from map_preview import (
@@ -787,22 +788,41 @@ def render(output_dir: str) -> None:
         if st.button("🔄 Scan Output Folder", key="ndvi_scan_folder"):
             from rasterio.warp import transform_bounds
 
-            tif_paths: dict[str, str] = {}
+            # Discover every base name by union of TIF / GeoJSON / GeoPackage.
+            base_names: set[str] = set()
             for pat in (
-                os.path.join(output_dir, "*_ndvi.tif"),
-                os.path.join(output_dir, "*_ndvi.tiff"),
+                "*_ndvi.tif",
+                "*_ndvi.tiff",
+                "*_ndvi.geojson",
+                "*_ndvi.gpkg",
             ):
-                for p in glob.glob(pat):
-                    tif_paths[os.path.basename(p)] = p
+                for p in glob.glob(os.path.join(output_dir, pat)):
+                    stem = os.path.basename(p).rsplit(".", 1)[0]
+                    base_names.add(stem.removesuffix("_ndvi"))
+
             count = 0
-            for basename in sorted(tif_paths.keys()):
-                tif_path = tif_paths[basename]
-                stem = basename.rsplit(".", 1)[0]
-                base_name = stem.removesuffix("_ndvi")
+            for base_name in sorted(base_names):
+                if base_name in st.session_state.ndvi_datasets:
+                    continue
+
+                tif_path = next(
+                    (
+                        os.path.join(output_dir, f"{base_name}_ndvi{ext}")
+                        for ext in (".tif", ".tiff")
+                        if os.path.isfile(
+                            os.path.join(output_dir, f"{base_name}_ndvi{ext}")
+                        )
+                    ),
+                    None,
+                )
+                gpkg_path = os.path.join(output_dir, f"{base_name}_ndvi.gpkg")
                 geojson_path = os.path.join(output_dir, f"{base_name}_ndvi.geojson")
+                has_gpkg = os.path.isfile(gpkg_path)
                 has_geojson = os.path.isfile(geojson_path)
-                if base_name not in st.session_state.ndvi_datasets:
-                    try:
+
+                try:
+                    meta: dict | None = None
+                    if tif_path:
                         with rasterio.open(tif_path) as src:
                             meta = {
                                 "transform": src.transform,
@@ -812,37 +832,51 @@ def render(output_dir: str) -> None:
                             }
                             b = src.bounds
                             crs = src.crs
-                        results_gdf = None
-                        if has_geojson:
-                            results_gdf = reproject_geodataframe_to_wgs84(
-                                gpd.read_file(geojson_path)
-                            )
-                            raw_geom = results_gdf.geometry.union_all().envelope
-                            raw_gdf = gpd.GeoDataFrame(
-                                {"geometry": [raw_geom]}, crs="EPSG:4326"
-                            )
-                        else:
-                            w, s, e, n = transform_bounds(crs, "EPSG:4326", *b)
-                            raw_gdf = gpd.GeoDataFrame(
-                                {"geometry": [shapely_box(w, s, e, n)]},
-                                crs="EPSG:4326",
-                            )
-                        st.session_state.ndvi_datasets[base_name] = {
-                            "raw": raw_gdf,
-                            "processed": None,
-                            "results": results_gdf,
-                            "meta": meta,
-                            "type": "restored",
-                        }
-                        count += 1
-                    except Exception as e:
-                        print(f"Error loading {base_name}: {e}")
+
+                    # Prefer GeoPackage for the points payload (more compact,
+                    # better attribute typing); fall back to GeoJSON.
+                    results_gdf = None
+                    if has_gpkg:
+                        results_gdf = reproject_geodataframe_to_wgs84(
+                            gpd.read_file(gpkg_path)
+                        )
+                    elif has_geojson:
+                        results_gdf = reproject_geodataframe_to_wgs84(
+                            gpd.read_file(geojson_path)
+                        )
+
+                    if results_gdf is not None and not results_gdf.empty:
+                        raw_geom = results_gdf.geometry.union_all().envelope
+                        raw_gdf = gpd.GeoDataFrame(
+                            {"geometry": [raw_geom]}, crs="EPSG:4326"
+                        )
+                    elif tif_path:
+                        w, s, e, n = transform_bounds(crs, "EPSG:4326", *b)
+                        raw_gdf = gpd.GeoDataFrame(
+                            {"geometry": [shapely_box(w, s, e, n)]},
+                            crs="EPSG:4326",
+                        )
+                    else:
+                        # Nothing readable for this base name.
+                        continue
+
+                    st.session_state.ndvi_datasets[base_name] = {
+                        "raw": raw_gdf,
+                        "processed": None,
+                        "results": results_gdf,
+                        "meta": meta,
+                        "type": "restored",
+                    }
+                    count += 1
+                except Exception as e:
+                    print(f"Error loading {base_name}: {e}")
             if count > 0:
                 st.success(f"Loaded {count} result(s) from the output folder.")
             else:
                 st.info(
-                    "No NDVI GeoTIFF results found in the output folder "
-                    "(files named *_ndvi.tif or *_ndvi.tiff)."
+                    "No NDVI results found in the output folder "
+                    "(looked for *_ndvi.tif, *_ndvi.tiff, *_ndvi.gpkg, "
+                    "*_ndvi.geojson)."
                 )
 
         completed_ds = [
@@ -905,6 +939,7 @@ def render(output_dir: str) -> None:
                 ds = st.session_state.ndvi_datasets[ds_name]
 
                 tif_path = os.path.join(output_dir, f"{ds_name}_ndvi.tif")
+                rendered_from_tif = False
                 if os.path.exists(tif_path):
                     try:
                         with rasterio.open(tif_path) as src:
@@ -957,8 +992,45 @@ def render(output_dir: str) -> None:
                                 weight=2,
                                 fill=False,
                             ).add_to(m_ndvi_result)
+                            rendered_from_tif = True
                     except Exception as e:
                         print(f"Viz Error {ds_name}: {e}")
+
+                # GeoPackage / GeoJSON fallback: synthesise a small grid from
+                # the points' bbox and render the same RdYlGn heatmap.
+                if not rendered_from_tif and ds.get("results") is not None:
+                    binned = rasterize_points_for_preview(
+                        ds["results"], "NDVI", max_dim=400
+                    )
+                    if binned is not None:
+                        arr, (left, bottom, right, top), _w, _h = binned
+                        folium_bounds = [[bottom, left], [top, right]]
+                        res_bounds.append([left, bottom, right, top])
+
+                        norm_data = np.clip((arr - (-0.2)) / (1.0 - (-0.2)), 0, 1)
+                        cmap = plt.get_cmap("RdYlGn")
+                        colored = cmap(norm_data)
+                        colored[..., 3] = np.where(np.isnan(arr), 0, r_opacity)
+                        img_bytes = (colored * 255).astype(np.uint8)
+                        im = PILImage.fromarray(img_bytes)
+                        buff = io.BytesIO()
+                        im.save(buff, format="PNG")
+                        img_url = (
+                            f"data:image/png;base64,"
+                            f"{base64.b64encode(buff.getvalue()).decode()}"
+                        )
+                        folium.raster_layers.ImageOverlay(
+                            image=img_url,
+                            bounds=folium_bounds,
+                            opacity=r_opacity,
+                            interactive=True,
+                        ).add_to(m_ndvi_result)
+                        folium.Rectangle(
+                            bounds=folium_bounds,
+                            color="red",
+                            weight=2,
+                            fill=False,
+                        ).add_to(m_ndvi_result)
 
                 if show_points and ds.get("results") is not None:
                     try:

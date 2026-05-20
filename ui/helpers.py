@@ -149,6 +149,52 @@ def cleanup_materialized_dataset(ds: MaterializedDataset) -> None:
             pass
 
 
+def rasterize_points_for_preview(
+    gdf: gpd.GeoDataFrame,
+    value_col: str,
+    max_dim: int = 400,
+):
+    """Bin a sparse point GeoDataFrame into a small array for a Folium overlay.
+
+    Used by the result inspectors when only a GeoPackage / GeoJSON of samples is
+    on disk (no contiguous raster). Synthesises a regular grid covering the
+    GDF's bounding box, picks the longer axis to be ``max_dim`` pixels, and
+    drops each point into the cell it falls into. Cells with no point stay NaN.
+
+    Returns ``(arr, (left, bottom, right, top), width, height)`` in the GDF's
+    CRS (callers pass an EPSG:4326 GDF and use the bounds directly for the
+    Folium ``ImageOverlay``). Returns ``None`` if the GDF is empty or has a
+    degenerate extent.
+    """
+    import numpy as _np
+    from rasterio.transform import from_bounds, rowcol
+
+    if gdf is None or gdf.empty or value_col not in gdf.columns:
+        return None
+    res = gdf.dropna(subset=[value_col])
+    if res.empty:
+        return None
+    left, bottom, right, top = res.total_bounds
+    width_unit = right - left
+    height_unit = top - bottom
+    if width_unit <= 0 or height_unit <= 0:
+        return None
+    if width_unit >= height_unit:
+        width = max_dim
+        height = max(1, int(round(max_dim * height_unit / width_unit)))
+    else:
+        height = max_dim
+        width = max(1, int(round(max_dim * width_unit / height_unit)))
+    transform = from_bounds(left, bottom, right, top, width, height)
+    arr = _np.full((height, width), _np.nan, dtype=_np.float32)
+    rows, cols = rowcol(transform, res.geometry.x.values, res.geometry.y.values)
+    rows = _np.asarray(rows, dtype=int)
+    cols = _np.asarray(cols, dtype=int)
+    in_range = (rows >= 0) & (rows < height) & (cols >= 0) & (cols < width)
+    arr[rows[in_range], cols[in_range]] = res[value_col].to_numpy()[in_range]
+    return arr, (left, bottom, right, top), width, height
+
+
 def apply_buffer_m(gdf: gpd.GeoDataFrame, buffer_m: float) -> gpd.GeoDataFrame:
     """Return a GeoDataFrame whose geometry is the union of ``gdf`` buffered by
     ``buffer_m`` metres, re-projected back to the original CRS.

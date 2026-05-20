@@ -16,6 +16,7 @@ from helpers import (
     apply_buffer_m,
     generate_clustered_grid,
     load_vector_upload_sessions,
+    rasterize_points_for_preview,
     render_job_restart_panel,
 )
 from map_preview import (
@@ -1191,9 +1192,12 @@ def render(output_dir: str, parent_dir: str) -> None:
                     ).add_to(m_result)
                     res_bounds.append([left, bottom, right, top])
 
-                # Raster overlay is only available for legacy single-TIF
-                # outputs. New GeoPackage-only outputs render as points only
-                # (toggle Show Sample Points below).
+                # Raster overlay rendering:
+                #   * Legacy single-TIF outputs use the on-disk grid directly.
+                #   * GeoPackage-only outputs synthesise a small grid from the
+                #     points' bbox via :func:`rasterize_points_for_preview`.
+                # In both cases the rest of the pipeline (colormap + PNG +
+                # ImageOverlay) is identical.
                 if has_single_raster:
                     from rasterio.transform import rowcol
 
@@ -1250,6 +1254,39 @@ def render(output_dir: str, parent_dir: str) -> None:
                         folium.raster_layers.ImageOverlay(
                             image=img_url,
                             bounds=[[bottom, left], [top, right]],
+                            opacity=r_opacity,
+                            interactive=False,
+                        ).add_to(m_result)
+                elif ds.get("results") is not None:
+                    col_name = "gvi_ter" if "Terrain" in raster_layer else "gvi_veg"
+                    binned = rasterize_points_for_preview(
+                        ds["results"], col_name, max_dim=400
+                    )
+                    if binned is not None:
+                        arr, (left_g, bottom_g, right_g, top_g), _w, _h = binned
+                        cmap_name = (
+                            "OrRd" if "Terrain" in raster_layer else "Greens"
+                        )
+                        try:
+                            cmap = matplotlib.colormaps[cmap_name]
+                        except (AttributeError, KeyError):
+                            cmap = plt.get_cmap(cmap_name)
+
+                        norm_data = np.clip((arr - 0) / 0.6, 0, 1)
+                        colored = cmap(norm_data)
+                        colored[..., 3] = np.where(np.isnan(arr), 0, r_opacity)
+                        img_bytes = (colored * 255).astype(np.uint8)
+                        im = PILImage.fromarray(img_bytes)
+                        buff = io.BytesIO()
+                        im.save(buff, format="PNG")
+                        img_url = (
+                            f"data:image/png;base64,"
+                            f"{base64.b64encode(buff.getvalue()).decode()}"
+                        )
+
+                        folium.raster_layers.ImageOverlay(
+                            image=img_url,
+                            bounds=[[bottom_g, left_g], [top_g, right_g]],
                             opacity=r_opacity,
                             interactive=False,
                         ).add_to(m_result)
