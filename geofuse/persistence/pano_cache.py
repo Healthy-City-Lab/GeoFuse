@@ -43,6 +43,7 @@ class PanoCache:
     """
 
     def __init__(self, db_path: str):
+        self.db_path = db_path  # exposed for the GVI subprocess to reopen
         self._lock = threading.RLock()
         self._conn = open_wal_connection(db_path)
         with self._lock:

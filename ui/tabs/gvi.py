@@ -322,9 +322,8 @@ def _render_gvi_restart_panel(
             name=os.path.splitext(fname)[0],
             params=new_params,
         )
-        executor.submit_runner(
+        executor.submit_gvi_subprocess(
             record,
-            run_gvi,
             fname=fname,
             dataset_data=st.session_state.datasets[fname],
             init_args={"model_path": model_path, "api_key": api_key},
@@ -337,7 +336,7 @@ def _render_gvi_restart_panel(
             save_gpkg=bool(p.get("save_gpkg", True)),
             save_geotiff=bool(p.get("save_geotiff")),
             save_geojson=bool(p.get("save_geojson")),
-            gpu_lock=executor.gpu_lock,
+            pano_cache_db_path=pano_cache.db_path,
         )
 
     render_job_restart_panel(
@@ -1038,9 +1037,8 @@ def render(output_dir: str, parent_dir: str) -> None:
                     name=os.path.splitext(fname)[0],
                     params=job_params,
                 )
-                executor.submit_runner(
+                executor.submit_gvi_subprocess(
                     record,
-                    run_gvi,
                     fname=fname,
                     dataset_data=d,
                     init_args={"model_path": model_path, "api_key": api_key},
@@ -1053,7 +1051,7 @@ def render(output_dir: str, parent_dir: str) -> None:
                     save_gpkg=save_gp,
                     save_geotiff=save_gt,
                     save_geojson=save_gj,
-                    gpu_lock=executor.gpu_lock,
+                    pano_cache_db_path=pano_cache.db_path,
                 )
                 started = True
 
