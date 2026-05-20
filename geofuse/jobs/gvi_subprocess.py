@@ -173,3 +173,90 @@ def run_gvi_child(
             )
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Parent-side queue reader
+# ---------------------------------------------------------------------------
+
+
+def drain_events_until_done(
+    job_id: str,
+    store,
+    event_queue,
+    cancel_event,
+    process_handle=None,
+    poll_timeout: float = 0.5,
+):
+    """Loop on ``event_queue.get(...)`` until a terminal message arrives.
+
+    Dispatches each message to its parent-side effect:
+      * ``MSG_PROGRESS`` / ``MSG_SET_EXTRA`` → ``store.update_progress(...)``
+      * ``MSG_HEARTBEAT``                    → ``store.heartbeat(...)``
+      * ``MSG_LOG``                          → forward the pre-formatted line
+        into :data:`geofuse.logger._log_queue` so the same listener thread
+        that handles in-process ``_log()`` calls also writes child-side
+        lines to the job's deque + ``logs/jobs/<job_id>.log``. This keeps
+        a single writer for the on-disk file (no cross-process races).
+      * ``MSG_COMPLETE`` / ``MSG_ERROR``     → return so the caller can
+        transition the JobRecord to the terminal status.
+
+    Returns one of:
+      ``("completed", output_paths: list[str])``
+      ``("error",     (short_msg: str, traceback_text: str))``
+      ``("cancelled", None)``  — only if ``cancel_event`` was set *and* the
+                                 child died without sending COMPLETE/ERROR.
+
+    The caller is responsible for joining ``process_handle`` after this
+    function returns.
+    """
+    import queue as _queue
+
+    from geofuse.logger import _log_queue
+
+    while True:
+        try:
+            item = event_queue.get(timeout=poll_timeout)
+        except (_queue.Empty, EOFError):
+            # Child may have died without sending a terminal message.
+            if process_handle is not None and not process_handle.is_alive():
+                # Drain any straggler messages before declaring crash.
+                try:
+                    item = event_queue.get_nowait()
+                except (_queue.Empty, EOFError):
+                    if cancel_event.is_set():
+                        return ("cancelled", None)
+                    return (
+                        "error",
+                        (
+                            "Worker process exited without sending result.",
+                            f"exit_code={process_handle.exitcode}",
+                        ),
+                    )
+            else:
+                continue
+        if not item:
+            continue
+        tag = item[0]
+        if tag == MSG_PROGRESS:
+            _, value, status_text, extras = item
+            store.update_progress(
+                job_id, progress=value, status_text=status_text, **(extras or {})
+            )
+        elif tag == MSG_HEARTBEAT:
+            store.heartbeat(job_id)
+        elif tag == MSG_SET_EXTRA:
+            _, extras = item
+            if extras:
+                store.update_progress(job_id, **extras)
+        elif tag == MSG_LOG:
+            _, colored, plain = item
+            try:
+                _log_queue.put_nowait((job_id, colored, plain))
+            except Exception:
+                pass
+        elif tag == MSG_COMPLETE:
+            return ("completed", list(item[1] or []))
+        elif tag == MSG_ERROR:
+            return ("error", (item[1], item[2]))
+        # Unknown tags are silently ignored — forward-compatibility hook.
