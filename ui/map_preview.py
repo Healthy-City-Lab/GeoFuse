@@ -72,11 +72,8 @@ def split_points_and_nonpoints(
 def trim_point_gdf_for_display(
     gdf: gpd.GeoDataFrame, *, max_points: int = MAP_POINT_DISPLAY_MAX
 ) -> tuple[gpd.GeoDataFrame, str | None]:
-    """Random-sample when over ``max_points``; return optional warning label."""
-    if len(gdf) <= max_points:
-        return gdf, None
-    msg = f"Displaying a random sample of {max_points:,} points (of {len(gdf):,})."
-    return gdf.sample(max_points, random_state=0), msg
+    """Pass through unchanged. FastMarkerCluster handles large N client-side."""
+    return gdf, None
 
 
 def _fast_cluster_uniform_callback(
