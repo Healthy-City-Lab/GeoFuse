@@ -62,6 +62,12 @@ class DeepLabSegmenter:
         self.device = get_best_device(device)
         _log("INFO", f"Using device: {self.device}")
 
+        # Inputs are always 1920x960 RGB so cuDNN can tune once and reuse the
+        # selected algorithm — particularly useful for the dilated convs in
+        # the ResNet101 backbone and ASPP module.
+        if self.device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
+
         # 1. Resolve Model Path
         if ckpt_path is None:
             ckpt_path = os.path.join(current_dir, "model", "best_model.pth")
