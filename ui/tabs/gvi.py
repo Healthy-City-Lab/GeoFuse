@@ -1288,8 +1288,20 @@ def render(output_dir: str, parent_dir: str) -> None:
                         ).add_to(m_result)
                 elif ds.get("results") is not None:
                     col_name = "gvi_ter" if "Terrain" in raster_layer else "gvi_veg"
+                    # If the user has zoomed/panned, clip + rasterize at the
+                    # current view extent so resolution scales with the view.
+                    view_bounds = None
+                    map_view = st.session_state.get("_gvi_map_view")
+                    if map_view and map_view.get("bounds"):
+                        b = map_view["bounds"]
+                        view_bounds = (
+                            b["_southWest"]["lng"],
+                            b["_southWest"]["lat"],
+                            b["_northEast"]["lng"],
+                            b["_northEast"]["lat"],
+                        )
                     binned = rasterize_points_for_preview(
-                        ds["results"], col_name, max_dim=400
+                        ds["results"], col_name, max_dim=1200, bounds=view_bounds
                     )
                     if binned is not None:
                         arr, (left_g, bottom_g, right_g, top_g), _w, _h = binned
@@ -1359,6 +1371,12 @@ def render(output_dir: str, parent_dir: str) -> None:
                 max_y = max([b[3] for b in res_bounds])
                 m_result.fit_bounds([[min_y, min_x], [max_y, max_x]])
 
-        st_folium(
-            m_result, width="100%", height=500, key="map_result", returned_objects=[]
+        _map_out = st_folium(
+            m_result,
+            width="100%",
+            height=500,
+            key="map_result",
+            returned_objects=["bounds", "zoom"],
         )
+        if _map_out and _map_out.get("bounds"):
+            st.session_state["_gvi_map_view"] = _map_out

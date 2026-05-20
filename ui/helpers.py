@@ -152,19 +152,16 @@ def cleanup_materialized_dataset(ds: MaterializedDataset) -> None:
 def rasterize_points_for_preview(
     gdf: gpd.GeoDataFrame,
     value_col: str,
-    max_dim: int = 400,
+    max_dim: int = 1200,
+    bounds: tuple[float, float, float, float] | None = None,
 ):
-    """Bin a sparse point GeoDataFrame into a small array for a Folium overlay.
+    """Bin a point GeoDataFrame into a (h, w) array for a Folium overlay.
 
-    Used by the result inspectors when only a GeoPackage / GeoJSON of samples is
-    on disk (no contiguous raster). Synthesises a regular grid covering the
-    GDF's bounding box, picks the longer axis to be ``max_dim`` pixels, and
-    drops each point into the cell it falls into. Cells with no point stay NaN.
-
-    Returns ``(arr, (left, bottom, right, top), width, height)`` in the GDF's
-    CRS (callers pass an EPSG:4326 GDF and use the bounds directly for the
-    Folium ``ImageOverlay``). Returns ``None`` if the GDF is empty or has a
-    degenerate extent.
+    When ``bounds`` is provided (left, bottom, right, top) the GDF is first
+    clipped to that bbox and the output grid spans exactly the bbox; otherwise
+    the GDF's ``total_bounds`` drive the grid. The longer axis becomes
+    ``max_dim`` pixels. Cells with no point stay NaN. Returns
+    ``(arr, (left, bottom, right, top), width, height)`` or ``None``.
     """
     import numpy as _np
     from rasterio.transform import from_bounds, rowcol
@@ -174,7 +171,13 @@ def rasterize_points_for_preview(
     res = gdf.dropna(subset=[value_col])
     if res.empty:
         return None
-    left, bottom, right, top = res.total_bounds
+    if bounds is not None:
+        left, bottom, right, top = bounds
+        res = res.cx[left:right, bottom:top]
+        if res.empty:
+            return None
+    else:
+        left, bottom, right, top = res.total_bounds
     width_unit = right - left
     height_unit = top - bottom
     if width_unit <= 0 or height_unit <= 0:

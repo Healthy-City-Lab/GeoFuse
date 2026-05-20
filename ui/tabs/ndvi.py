@@ -1027,11 +1027,21 @@ def render(output_dir: str) -> None:
                     except Exception as e:
                         print(f"Viz Error {ds_name}: {e}")
 
-                # GeoPackage / GeoJSON fallback: synthesise a small grid from
-                # the points' bbox and render the same RdYlGn heatmap.
+                # GeoPackage / GeoJSON fallback: clip + rasterize at the
+                # current map view (if known) so resolution scales with zoom.
                 if not rendered_from_tif and ds.get("results") is not None:
+                    view_bounds = None
+                    map_view = st.session_state.get("_ndvi_map_view")
+                    if map_view and map_view.get("bounds"):
+                        b = map_view["bounds"]
+                        view_bounds = (
+                            b["_southWest"]["lng"],
+                            b["_southWest"]["lat"],
+                            b["_northEast"]["lng"],
+                            b["_northEast"]["lat"],
+                        )
                     binned = rasterize_points_for_preview(
-                        ds["results"], "NDVI", max_dim=400
+                        ds["results"], "NDVI", max_dim=1200, bounds=view_bounds
                     )
                     if binned is not None:
                         arr, (left, bottom, right, top), _w, _h = binned
@@ -1110,8 +1120,10 @@ def render(output_dir: str) -> None:
             width="100%",
             height=500,
             key="map_ndvi_result",
-            returned_objects=["last_clicked"],
+            returned_objects=["last_clicked", "bounds", "zoom"],
         )
+        if map_data and map_data.get("bounds"):
+            st.session_state["_ndvi_map_view"] = map_data
 
         if map_data and map_data.get("last_clicked"):
             lat = map_data["last_clicked"]["lat"]
