@@ -156,7 +156,7 @@ class GVIEngine:
         pano_cache: dict,
         failed_panos: set,
         cancel_callback: Callable[..., bool] | None,
-        download_gpu_lock: asyncio.Lock,
+        gpu_lock: asyncio.Lock,
     ) -> dict:
         idx = pt["orig_index"]
         lat, lon = pt["lat"], pt["lon"]
@@ -215,13 +215,60 @@ class GVIEngine:
                 pt, search_lat, search_lon, cached["veg"], cached["ter"], pid
             )
 
-        # 3. Download + 4. GPU inference — serialized across all in-flight
-        # points so we don't oversubscribe the tile endpoint or the GPU.
-        # While this lock is held by one task, the other concurrent tasks
-        # remain free to run their search HTTP (step 1) and resolve cache
-        # hits without waiting.
-        async with download_gpu_lock:
-            # Cache hit may have arrived while we were queued for the lock.
+        # 3. Download tiles — no lock. All workers can fetch tiles in parallel
+        # (separate aiohttp keep-alive connections share the session pool).
+        _log("INFO", f"  Downloading {short}… (zoom={_DOWNLOAD_ZOOM})")
+        try:
+            raw_image = await asyncio.wait_for(
+                gsv.get_panorama_async(pano, session, zoom=_DOWNLOAD_ZOOM),
+                timeout=_DOWNLOAD_TIMEOUT_S,
+            )
+        except TimeoutError:
+            _log(
+                "ERROR",
+                f"  Timeout (>{_DOWNLOAD_TIMEOUT_S:.0f}s) downloading "
+                f"{short}… — marking failed",
+            )
+            failed_panos.add(pid)
+            return self._empty_result(pt, search_lat, search_lon)
+        except Exception as e:
+            _log(
+                "ERROR",
+                f"  Download error for {short}…: " f"{type(e).__name__}: {e}",
+            )
+            failed_panos.add(pid)
+            return self._empty_result(pt, search_lat, search_lon)
+
+        if cancel_callback and cancel_callback():
+            return self._empty_result(pt, search_lat, search_lon)
+
+        _log(
+            "INFO",
+            f"  Downloaded {short}… ({raw_image.width}×{raw_image.height}) "
+            f"— preprocessing",
+        )
+
+        # Preprocess on the worker thread — no lock (CPU only). Multiple
+        # workers can preprocess concurrently while another worker holds the
+        # GPU lock for its forward pass.
+        img = self._preprocess_image(raw_image)
+        try:
+            raw_image.close()
+        except Exception:
+            pass
+        del raw_image
+
+        if not img:
+            _log("WARN", f"  Preprocess failed for {short}…: blank or black image")
+            failed_panos.add(pid)
+            return self._empty_result(pt, search_lat, search_lon)
+
+        # 4. GPU inference — serialised so one image is on the device at a
+        # time. While this lock is held by one task, others can download
+        # tiles or preprocess in parallel.
+        async with gpu_lock:
+            # Another worker may have written the cache for this pano while
+            # we were queued at the GPU lock; skip the forward in that case.
             if pid in pano_cache:
                 cached = pano_cache[pid]
                 _log(
@@ -233,51 +280,6 @@ class GVIEngine:
                     pt, search_lat, search_lon, cached["veg"], cached["ter"], pid
                 )
 
-            # 3. Download tiles (parallel via aiohttp inside get_panorama_async)
-            _log("INFO", f"  Downloading {short}… (zoom={_DOWNLOAD_ZOOM})")
-            try:
-                raw_image = await asyncio.wait_for(
-                    gsv.get_panorama_async(pano, session, zoom=_DOWNLOAD_ZOOM),
-                    timeout=_DOWNLOAD_TIMEOUT_S,
-                )
-            except TimeoutError:
-                _log(
-                    "ERROR",
-                    f"  Timeout (>{_DOWNLOAD_TIMEOUT_S:.0f}s) downloading "
-                    f"{short}… — marking failed",
-                )
-                failed_panos.add(pid)
-                return self._empty_result(pt, search_lat, search_lon)
-            except Exception as e:
-                _log(
-                    "ERROR",
-                    f"  Download error for {short}…: " f"{type(e).__name__}: {e}",
-                )
-                failed_panos.add(pid)
-                return self._empty_result(pt, search_lat, search_lon)
-
-            if cancel_callback and cancel_callback():
-                return self._empty_result(pt, search_lat, search_lon)
-
-            _log(
-                "INFO",
-                f"  Downloaded {short}… ({raw_image.width}×{raw_image.height}) "
-                f"— preprocessing",
-            )
-
-            img = self._preprocess_image(raw_image)
-            try:
-                raw_image.close()
-            except Exception:
-                pass
-            del raw_image
-
-            if not img:
-                _log("WARN", f"  Preprocess failed for {short}…: blank or black image")
-                failed_panos.add(pid)
-                return self._empty_result(pt, search_lat, search_lon)
-
-            # 4. GPU inference (offloaded to executor so it doesn't block the loop)
             _log("INFO", f"  Running segmentation for {short}…")
             loop = asyncio.get_running_loop()
             try:
@@ -396,11 +398,9 @@ class GVIEngine:
         completed = 0
 
         # Fixed worker pool: exactly _MAX_CONCURRENT_POINTS workers pull
-        # points from a shared queue. Only a constant number of task objects
-        # ever exist, regardless of how many points the run has. The inner
-        # download_gpu_lock keeps the heavy download + GPU stretch strictly
-        # serial so cache-miss throughput is unaffected.
-        download_gpu_lock = asyncio.Lock()
+        # points from a shared queue. ``gpu_lock`` serializes only the GPU
+        # forward pass; downloads and CPU preprocessing run in parallel.
+        gpu_lock = asyncio.Lock()
         queue: asyncio.Queue = asyncio.Queue()
         for pt in points_to_process:
             queue.put_nowait(pt)
@@ -429,7 +429,7 @@ class GVIEngine:
                             pano_cache,
                             failed_panos,
                             cancel_callback,
-                            download_gpu_lock,
+                            gpu_lock,
                         )
                     except asyncio.CancelledError:
                         return
