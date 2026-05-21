@@ -264,9 +264,17 @@ class JobExecutor:
                     proc.join(timeout=5)
 
                 if status == "completed":
-                    self._store.transition(
-                        record.id, "completed", output_paths=payload
-                    )
+                    # The child returns ``output_paths=[]`` when it short-
+                    # circuits on cancel, which would otherwise look like a
+                    # successful empty completion to the JobStore. Treat any
+                    # COMPLETE that arrives after cancel was requested as a
+                    # genuine cancellation.
+                    if cancel_event.is_set() or parent_cancel.is_set():
+                        self._store.transition(record.id, "cancelled")
+                    else:
+                        self._store.transition(
+                            record.id, "completed", output_paths=payload
+                        )
                 elif status == "error":
                     short_msg, tb = payload
                     self._store.transition(record.id, "error", error=short_msg)
