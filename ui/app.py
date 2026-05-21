@@ -1,50 +1,51 @@
 import os
 import sys
 
-# --- 1. GLOBAL PATH SETUP (must happen before other imports) ---
-current_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.dirname(current_dir)
-if parent_dir not in sys.path:
-    sys.path.append(parent_dir)
-# Ensure ui/ is on sys.path so tab modules can import helpers
-if current_dir not in sys.path:
-    sys.path.insert(0, current_dir)
+if __name__ == "__main__":
+    # --- 1. GLOBAL PATH SETUP (must happen before other imports) ---
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    parent_dir = os.path.dirname(current_dir)
+    if parent_dir not in sys.path:
+        sys.path.append(parent_dir)
+    # Ensure ui/ is on sys.path so tab modules can import helpers
+    if current_dir not in sys.path:
+        sys.path.insert(0, current_dir)
 
-# --- 2. GDAL ENVIRONMENT FIX ---
-if "GDAL_DATA" not in os.environ:
-    conda_prefix = sys.prefix
-    gdal_data_path = os.path.join(conda_prefix, "Library", "share", "gdal")
-    if os.path.exists(gdal_data_path):
-        os.environ["GDAL_DATA"] = gdal_data_path
+    # --- 2. GDAL ENVIRONMENT FIX ---
+    if "GDAL_DATA" not in os.environ:
+        conda_prefix = sys.prefix
+        gdal_data_path = os.path.join(conda_prefix, "Library", "share", "gdal")
+        if os.path.exists(gdal_data_path):
+            os.environ["GDAL_DATA"] = gdal_data_path
 
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+    os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-# --- 3. LOAD GEOFUSE (forces torch DLL load on Windows before GDAL stack) ---
-from geofuse.gvi import GVIEngine  # noqa: F401, E402
-from geofuse.ndvi import NDVIEngine  # noqa: F401, E402
-from geofuse.vision import get_best_device  # noqa: F401, E402
+    # --- 3. LOAD GEOFUSE (forces torch DLL load on Windows before GDAL stack) ---
+    from geofuse.gvi import GVIEngine  # noqa: F401, E402
+    from geofuse.ndvi import NDVIEngine  # noqa: F401, E402
+    from geofuse.vision import get_best_device  # noqa: F401, E402
 
-try:
-    from geofuse.fusion import MetricFusionEngine  # noqa: F401, E402
-except ImportError:
-    pass
+    try:
+        from geofuse.fusion import MetricFusionEngine  # noqa: F401, E402
+    except ImportError:
+        pass
 
-# --- 4. UI IMPORTS (after geofuse to preserve DLL order on Windows) ---
-import streamlit as st  # noqa: E402
-import streamlit.components.v1 as components  # noqa: E402
-from services import get_job_executor, get_job_store  # noqa: E402, F401
-from tabs import fusion, gvi, job_monitor, ndvi  # noqa: E402
+    # --- 4. UI IMPORTS (after geofuse to preserve DLL order on Windows) ---
+    import streamlit as st  # noqa: E402
+    import streamlit.components.v1 as components  # noqa: E402
+    from services import get_job_executor, get_job_store  # noqa: E402, F401
+    from tabs import fusion, gvi, job_monitor, ndvi  # noqa: E402
 
-# Warm the singletons once per process so the heartbeat thread starts even
-# before any job is submitted.
-get_job_store()
-get_job_executor()
+    # Warm the singletons once per process so the heartbeat thread starts even
+    # before any job is submitted.
+    get_job_store()
+    get_job_executor()
 
-# --- 5. PAGE CONFIG ---
-st.set_page_config(page_title="GeoFuse Toolbox", layout="wide")
+    # --- 5. PAGE CONFIG ---
+    st.set_page_config(page_title="GeoFuse Toolbox", layout="wide")
 
-st.markdown(
-    """
+    st.markdown(
+        """
 <style>
     .block-container { padding-top: 1rem; padding-bottom: 1rem; }
     iframe { width: 100% !important; }
@@ -138,12 +139,12 @@ st.markdown(
     }
 </style>
 """,
-    unsafe_allow_html=True,
-)
+        unsafe_allow_html=True,
+    )
 
-# Brand label in the tab bar: zero-height iframe + MutationObserver (BaseWeb owns ::before).
-components.html(
-    """
+    # Brand label in the tab bar: zero-height iframe + MutationObserver (BaseWeb owns ::before).
+    components.html(
+        """
 <script>
 (function () {
     var d = window.parent.document;
@@ -180,26 +181,26 @@ components.html(
 })();
 </script>
 """,
-    height=0,
-    scrolling=False,
-)
+        height=0,
+        scrolling=False,
+    )
 
-tab_ndvi, tab_gvi, tab_fusion, tab_job = st.tabs(
-    ["NDVI Sourcing", "GVI Sourcing", "Fusion & Optimization", "Job Monitor"]
-)
+    tab_ndvi, tab_gvi, tab_fusion, tab_job = st.tabs(
+        ["NDVI Sourcing", "GVI Sourcing", "Fusion & Optimization", "Job Monitor"]
+    )
 
-output_dir = "output_results"
-os.makedirs(output_dir, exist_ok=True)
-os.makedirs("logs", exist_ok=True)
+    output_dir = "output_results"
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs("logs", exist_ok=True)
 
-with tab_ndvi:
-    ndvi.render(output_dir)
+    with tab_ndvi:
+        ndvi.render(output_dir)
 
-with tab_gvi:
-    gvi.render(output_dir, parent_dir)
+    with tab_gvi:
+        gvi.render(output_dir, parent_dir)
 
-with tab_fusion:
-    fusion.render(output_dir)
+    with tab_fusion:
+        fusion.render(output_dir)
 
-with tab_job:
-    job_monitor.render(output_dir)
+    with tab_job:
+        job_monitor.render(output_dir)
