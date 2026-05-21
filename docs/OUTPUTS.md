@@ -6,11 +6,11 @@ All outputs are saved to `output_results/` by default.
 
 ## GVI Engine Outputs
 
-For each input file processed through the GVI pipeline:
+For each input file processed through the GVI pipeline. You choose which of the three formats are written via checkboxes in the GVI tab (defaults: **GeoPackage on**, GeoTIFF off, GeoJSON off).
 
-### `[Filename]_gvi.geojson`
+### `[Filename]_gvi.gpkg` (canonical, default)
 
-Vector point data (EPSG:4326) with:
+GeoPackage with layer `gvi_samples` — EPSG:4326 point geometries:
 
 | Field | Description |
 |-------|-------------|
@@ -18,14 +18,32 @@ Vector point data (EPSG:4326) with:
 | `gvi_ter` | Green View Index — Terrain (%) |
 | `pano_id` | Google Street View panorama identifier |
 | `lat`, `lon` | Geographic coordinates |
-| `row`, `col` | Grid position (if raster-aligned) |
+| `row`, `col` | Position on the shared anchored grid (cells across clusters are on one global grid) |
+| `cluster_id` | Spatial cluster the point belongs to (0-indexed) |
 
-### `[Filename]_gvi.tif`
+This is the recommended format for large or geographically scattered study areas. GeoPackage is sparse on disk, opens in QGIS, GeoPandas, and ogr2ogr, and avoids the mostly-empty cells that would dominate a single bbox-wide raster.
 
-Multi-band GeoTIFF (EPSG:4326):
+### `[Filename]_gvi.json` (sidecar)
 
-* **Band 1**: Vegetation GVI heatmap
-* **Band 2**: Terrain GVI heatmap
+Plain-JSON sidecar written next to the GeoPackage. Records `grid_crs_wkt`, `step_m`, `anchor_x`, `anchor_y`, `n_clusters`, and the measured planar distortion. Used by the result inspector and useful if you later want to rasterise the GeoPackage on the same grid as the source run.
+
+### `[Filename]_gvi_tiles/` (optional, GeoTIFF on)
+
+One dense GeoTIFF per spatial cluster — instead of one huge mostly-empty raster:
+
+```text
+[Filename]_gvi_tiles/
+  cluster_0000.tif   # 2-band: Band 1 = Vegetation GVI, Band 2 = Terrain GVI
+  cluster_0001.tif
+  ...
+  tiles_index.json   # bbox in grid CRS and WGS84 + grid CRS WKT for each tile
+```
+
+Tiles are written in the auto-selected projected CRS (UTM / LCC / Polar Stereographic) — not WGS84 — so cells stay square in metres and no resampling is involved. Open `tiles_index.json` to reproject or merge on demand.
+
+### `[Filename]_gvi.geojson` (optional, GeoJSON on)
+
+Same point data as the GeoPackage. Kept for compatibility with tools that don't read GeoPackage. A warning is logged if the file exceeds 100,000 points (GeoJSON read performance degrades quickly past that).
 
 ### Optional Debug Outputs
 
@@ -34,13 +52,30 @@ Multi-band GeoTIFF (EPSG:4326):
 | `output_results/images/{pano_id}.jpg` | Original Street View panoramas |
 | `output_results/masks/{pano_id}.png` | Semantic segmentation masks (Cityscapes palette) |
 
+### Per-job log files
+
+| Path | Contents |
+|------|----------|
+| `logs/jobs/<job_id>.log` | Full plain-text log of one job (no ANSI escapes); kept indefinitely so you can inspect long runs after the in-memory deque has rolled over |
+
 ---
 
 ## NDVI Engine Outputs
 
-For each input file / date range processed through the NDVI pipeline:
+For each input file / date range processed through the NDVI pipeline. Defaults: **GeoTIFF on**, GeoPackage off, GeoJSON off.
 
-### `[Filename]_ndvi.geojson`
+### `[Filename]_ndvi.tif` (default)
+
+Single-band GeoTIFF (EPSG:4326):
+
+* **Band 1**: NDVI values sampled from satellite imagery
+* NoData value: `−9999`
+
+### `[Filename]_ndvi.gpkg` (optional)
+
+GeoPackage with layer `ndvi_samples` (EPSG:4326) — same per-point data as the GeoJSON form, but loads orders of magnitude faster for large extents.
+
+### `[Filename]_ndvi.geojson` (optional)
 
 Vector point data with:
 
@@ -49,13 +84,6 @@ Vector point data with:
 | `NDVI` | Normalized Difference Vegetation Index (−1 to 1) |
 | `x`, `y` | Geographic coordinates (EPSG:4326) |
 | `ndvi_date` | Source date (attribute-column mode only) |
-
-### `[Filename]_ndvi.tif`
-
-Single-band GeoTIFF (EPSG:4326):
-
-* **Band 1**: NDVI values sampled from satellite imagery
-* NoData value: `−9999`
 
 ---
 

@@ -22,13 +22,25 @@ streamlit run ui/app.py
 
 ### Typical Workflow
 
-1. **NDVI tab** → upload a study area file → set date range → "Run NDVI Analysis"
-2. **GVI tab** → upload the same study area → set grid resolution → "Start Batch Analysis"
+1. **NDVI tab** → upload a study area file → set date range → choose output formats (**GeoTIFF** is default; **GeoPackage** and **GeoJSON** optional) → "Run NDVI Analysis"
+2. **GVI tab** → upload the same study area → set grid resolution and buffer → choose output formats (**GeoPackage** is default; **GeoTIFF** for per-cluster tile rasters; **GeoJSON** for compatibility) → "Generate Sampling Grids" → "Run GVI Analysis"
 3. **Fusion tab** → upload a target outcomes file (GeoJSON or GeoTIFF) → select loaded GVI/NDVI results → "Run Fusion Optimization"
 4. Inspect the composite greenery weights and export results.
 
 > [!NOTE]
-> Long-running jobs (GVI, NDVI, Fusion) execute in a process-level thread pool and **survive browser refresh**. Progress is tracked in the **sidebar Job Monitor** on the GVI tab, which is visible from all tabs. Jobs interrupted by a Streamlit restart reload automatically and appear as "Interrupted" with a re-submit prompt. Multiple study areas with different settings (resolution, buffer, dates) can run in parallel as separate jobs.
+> Long-running jobs survive browser refresh. **GVI runs in a separate Python process** so the UI stays responsive (and the GPU stays fed) even while the browser tab is in the foreground. **NDVI** and **Fusion** run inside the Streamlit process. Progress is tracked in the **sidebar Job Monitor** on the GVI tab, which is visible from all tabs. Multiple study areas with different settings (resolution, buffer, dates) can run in parallel as separate jobs.
+
+#### Resuming after a crash or restart
+
+If Streamlit (or the machine) restarts mid-job, the affected jobs reload as **"Interrupted"**. To resume: switch to the same tab the job came from, re-upload the **same** study area file you originally used. A restart panel appears with **Resume Job** and **Discard** buttons. Resume continues from the exact point where the job stopped — already-processed points and cached panoramas are skipped.
+
+#### Per-job log files
+
+Each job writes a persistent log to `logs/jobs/<job_id>.log`. The job-monitor expander has a "📄 Open log file" button that opens the file in your OS default text editor — useful for jobs longer than the 100-line in-memory deque.
+
+#### National-scale GVI study areas
+
+For widely-scattered inputs (e.g. neighbourhoods across multiple cities), the engine automatically clusters the buffered features and generates one sampling grid per cluster, all anchored to a common reference. There is no special "national mode" — just upload the file. The chosen projected CRS (UTM / LCC / Polar Stereographic) and an estimated distortion are reported in the job log.
 
 ---
 

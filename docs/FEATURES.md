@@ -4,15 +4,20 @@
 
 * **Automated Sourcing**: Scrapes or downloads Google Street View panoramas for any study area (GeoJSON or Shapefile). Operates _with_ or _without_ an API Key.
 * **Deep Learning Segmentation**: Uses the **DeepLabV3+** model (PyTorch) trained on the **Cityscapes** dataset to identify Vegetation (class 8) and Terrain (class 9) greenery coverage.
+* **Nation-Scale Clustered Sampling Grids**: For widely-scattered inputs (e.g. neighbourhoods across multiple cities), the engine automatically dissolves touching buffers, splits the study area into spatial clusters, and generates a separate sampling grid per cluster — all anchored to one common reference grid. This avoids the exponential bbox blow-up that would otherwise produce hundreds of millions of empty cells across a country.
+* **Automatic Projected CRS Selection**: For each study area, the engine picks the most accurate planar CRS by extent — a local UTM zone for compact areas (≤ 6° lon / 8° lat), a two-parallel Lambert Conformal Conic for continent-scale extents, or Polar Stereographic above 75° latitude. A measured distortion estimate is logged; warnings appear if distortion exceeds 2 %.
+* **Subprocess Execution**: GVI workers run in a separate Python process so they no longer share the Python GIL with the Streamlit UI. This eliminates the GPU-utilisation drop that happened when the browser tab was in the foreground (measured ~37 percentage-point recovery on a Cityscapes / DeepLabV3+ workload).
+* **Concurrent Per-Point Pipeline**: Up to 4 panoramas are downloaded, pre-processed, and queued for the GPU concurrently. Network I/O and CPU pre-processing run lock-free; only the GPU forward pass is serialised so one point's inference overlaps the next point's download.
 * **Batch Processing**: Upload multiple study areas to process distinct regions simultaneously.
-* **Smart Caching**: Shared panorama cache across all batch files prevents redundant downloads for overlapping areas, reducing processing time and API costs.
+* **Smart Caching**: Shared, cross-process panorama cache (`logs/caches/gvi_panos.db`) prevents redundant downloads for overlapping areas, reducing processing time and API costs. An in-memory overlay keeps repeated lookups microsecond-fast.
 * **Robust Processing**:
   * Async/multi-threaded downloading.
   * Image pre-processing: ensures 360° coverage, corrects panorama artifacts, detects corrupt panoramas, standardizes resolution.
-* **Crash Recovery**: Re-upload the same input file and click Run to automatically resume from the last processed point within the same session.
-* **Refresh-Safe Job Monitor**: Jobs run in a process-level thread pool and survive browser refresh or opening additional tabs. Track progress in the sidebar with a live health badge (active / stuck / errors). Job state is persisted to `logs/jobs.db`; jobs interrupted by a Streamlit restart appear as "Interrupted" and can be resubmitted. Use "Scan Output Folder" to reload completed results from prior sessions.
+* **Restart System for Interrupted Jobs**: If Streamlit (or the machine) restarts mid-run, the affected jobs appear as "Interrupted" in the affected tab. Re-uploading the **same** study area file shows a restart panel with "Resume Job" / "Discard" buttons; resume continues from the exact point where the job stopped. The re-uploaded file is hash-verified to ensure it is the same study area.
+* **Refresh-Safe Job Monitor**: Jobs survive browser refresh and additional tabs. Track progress in the sidebar with a live health badge (active / stuck / errors). Job state is persisted to `logs/jobs.db`; per-job text logs are written to `logs/jobs/<job_id>.log` and can be opened directly from the UI with the "📄 Open log file" button.
+* **Live Per-Job Logs**: Engine logs (including Earth Engine and Optuna internals) appear inside the job's own expander rather than the host terminal. Job log files persist on disk indefinitely for later inspection.
 * **Parallel Study Areas**: Submit multiple study areas with different resolution or buffer settings simultaneously — each unique parameter combination is treated as a separate job.
-* **Outputs**: GeoJSON point vectors, multi-band GeoTIFF heatmaps, optional raw panoramas and segmentation masks.
+* **Outputs**: **GeoPackage** point layer (canonical, recommended), per-cluster **GeoTIFF tiles** (optional, dense — no inter-cluster gaps), **GeoJSON** (compatibility), optional raw panoramas and segmentation masks. All canonical outputs in EPSG:4326.
 
 ---
 
@@ -24,6 +29,8 @@
   * **Specific Date(s)**: Builds a composite from imagery within a ± window around each date.
   * **Attribute Column**: Matches each feature to its own date from an attribute column, producing a single temporally-aligned output file.
 * **Dynamic Calculation**: Computes NDVI for the exact timeframe matching your street view data.
+* **GeoPackage Output Option**: GeoTIFF remains the default, but a `Save GeoPackage` checkbox writes `*_ndvi.gpkg` (layer `ndvi_samples`) alongside the raster for QGIS / GeoPandas consumption.
+* **Restart System**: Like GVI, NDVI jobs interrupted by a Streamlit restart appear as "Interrupted" and can be resumed by re-uploading the original study area.
 
 ---
 
