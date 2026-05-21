@@ -76,36 +76,41 @@ class SubprocJobContext:
         return bool(self._cancel_event.is_set())
 
 
-def _route_engine_logging_to_queue(event_queue) -> None:
-    """Replace :func:`geofuse.logger.get_logger` so each ``_log`` call pushes
-    formatted lines onto the parent-side queue.
+def _route_engine_logging_to_queue(job_id: str, event_queue) -> None:
+    """Forward every engine ``_log()`` call to the parent via ``event_queue``.
 
-    Engines call ``_log = get_logger("GVI")`` at module import time, so they
-    capture the *original* closure. We monkey-patch on the geofuse.logger
-    module object directly to redirect future calls; existing closures are
-    rebound via the module symbol below if needed.
+    Engine modules cached ``_log = get_logger("ENGINE")`` at import time, so
+    we can't intercept by replacing ``get_logger``. Instead we replace the
+    queue the closures push onto — Python resolves free variables against
+    the module namespace at call time, so existing closures see the swap.
+
+    The ``_current_job.job_id`` setup ensures the closures' ``if job_id is
+    None: return`` guard doesn't drop everything before we get a chance.
     """
     from geofuse import logger as _logger
 
-    ANSI = _logger._ANSI
-    ANSI_RE = _logger._ANSI_ESCAPE_RE
+    _logger._current_job.job_id = job_id
 
-    def _patched(engine: str):
-        tag = engine.upper()
+    class _ForwardingQueue:
+        """Drop-in replacement for ``geofuse.logger._log_queue`` that pushes
+        each item out to the parent process via the multiprocessing queue.
 
-        def log(level: str, msg: str) -> None:
-            color = ANSI.get(level, "")
-            colored = f"{color}{ANSI['BOLD']}[{tag} {level}]{ANSI['RESET']} {msg}"
-            plain = ANSI_RE.sub("", f"[{tag} {level}] {msg}")
+        Only the methods the engine closures touch (``put_nowait`` and
+        ``put``) are implemented. The in-process listener never runs in the
+        child so its ``get(...)`` side is irrelevant.
+        """
+
+        def put_nowait(self, item):
             try:
+                _job_id, colored, plain = item
                 event_queue.put((MSG_LOG, colored, plain))
             except Exception:
-                # Best-effort: never crash the worker on a logging hiccup.
                 pass
 
-        return log
+        def put(self, item):
+            self.put_nowait(item)
 
-    _logger.get_logger = _patched
+    _logger._log_queue = _ForwardingQueue()
 
 
 def run_gvi_child(
@@ -134,7 +139,7 @@ def run_gvi_child(
     try:
         # Route engine log lines into the parent queue *before* the runner
         # imports anything that might cache a logger closure.
-        _route_engine_logging_to_queue(event_queue)
+        _route_engine_logging_to_queue(job_id, event_queue)
 
         # Lazy: keep these out of module import path. The child re-imports
         # the modules under spawn anyway; doing it here makes failures more
