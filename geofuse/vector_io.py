@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,28 @@ def vector_format_from_path(path: str | Path) -> str:
     if ext == ".zip":
         return "zip"
     return ext.lstrip(".") or "unknown"
+
+
+def geometry_sha256(gdf: gpd.GeoDataFrame) -> str:
+    """Stable SHA-256 over a GeoDataFrame's geometries + CRS string.
+
+    Used to verify on job restart that the user re-uploaded the same input
+    file. Stable across runs for an unchanged GDF: features are sorted by
+    pandas index, each geometry's WKB is appended to the hash, then the CRS
+    string is appended. Attribute columns are intentionally excluded so
+    column reorderings or dtype roundtrips don't invalidate the hash.
+    """
+    h = hashlib.sha256()
+    # str(crs) covers EPSG codes and full WKT; falls back to "None" when unset.
+    h.update(f"crs:{gdf.crs}\n".encode())
+    # Sort by index so row order can't change the hash.
+    for _, geom in gdf.geometry.sort_index().items():
+        if geom is None or geom.is_empty:
+            h.update(b"\x00")
+            continue
+        h.update(geom.wkb)
+        h.update(b"\x1e")  # record separator
+    return h.hexdigest()
 
 
 def read_vector_path(

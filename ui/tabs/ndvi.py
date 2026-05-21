@@ -11,8 +11,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 import rasterio
 import streamlit as st
-from helpers import apply_buffer_m, load_vector_upload_sessions
+from helpers import (
+    RESTART_SESSION_KEY,
+    apply_buffer_m,
+    load_vector_upload_sessions,
+    render_job_restart_panel,
+)
 from map_preview import (
+    add_black_point_layer,
     add_study_area_layers,
     add_uniform_point_layer,
     trim_point_gdf_for_display,
@@ -23,10 +29,208 @@ from streamlit_folium import st_folium
 
 from geofuse.crs_utils import reproject_geodataframe_to_wgs84
 from geofuse.jobs.runners import run_ndvi, run_ndvi_column
+from geofuse.vector_io import geometry_sha256
 
 # ---------------------------------------------------------------------------
 # Tab render entry point
 # ---------------------------------------------------------------------------
+
+
+def _ndvi_scan_outputs(output_dir: str) -> dict[str, dict]:
+    """Discover NDVI result files and return ``{base_name: dataset_dict}``.
+
+    Pure function — no Streamlit calls — so it can run safely in a background
+    thread while workers keep processing.
+    """
+    from rasterio.warp import transform_bounds
+
+    base_names: set[str] = set()
+    for pat in ("*_ndvi.tif", "*_ndvi.tiff", "*_ndvi.geojson", "*_ndvi.gpkg"):
+        for p in glob.glob(os.path.join(output_dir, pat)):
+            stem = os.path.basename(p).rsplit(".", 1)[0]
+            base_names.add(stem.removesuffix("_ndvi"))
+
+    found: dict[str, dict] = {}
+    for base_name in sorted(base_names):
+        tif_path = next(
+            (
+                os.path.join(output_dir, f"{base_name}_ndvi{ext}")
+                for ext in (".tif", ".tiff")
+                if os.path.isfile(os.path.join(output_dir, f"{base_name}_ndvi{ext}"))
+            ),
+            None,
+        )
+        gpkg_path = os.path.join(output_dir, f"{base_name}_ndvi.gpkg")
+        geojson_path = os.path.join(output_dir, f"{base_name}_ndvi.geojson")
+
+        try:
+            meta: dict | None = None
+            b = crs = None
+            if tif_path:
+                with rasterio.open(tif_path) as src:
+                    meta = {
+                        "transform": src.transform,
+                        "width": src.width,
+                        "height": src.height,
+                        "crs": src.crs,
+                    }
+                    b = src.bounds
+                    crs = src.crs
+
+            results_gdf = None
+            if os.path.isfile(gpkg_path):
+                results_gdf = reproject_geodataframe_to_wgs84(gpd.read_file(gpkg_path))
+            elif os.path.isfile(geojson_path):
+                results_gdf = reproject_geodataframe_to_wgs84(
+                    gpd.read_file(geojson_path)
+                )
+
+            if results_gdf is not None and not results_gdf.empty:
+                raw_geom = results_gdf.geometry.union_all().envelope
+                raw_gdf = gpd.GeoDataFrame({"geometry": [raw_geom]}, crs="EPSG:4326")
+            elif tif_path:
+                w, s, e, n = transform_bounds(crs, "EPSG:4326", *b)
+                raw_gdf = gpd.GeoDataFrame(
+                    {"geometry": [shapely_box(w, s, e, n)]},
+                    crs="EPSG:4326",
+                )
+            else:
+                continue
+
+            found[base_name] = {
+                "raw": raw_gdf,
+                "processed": None,
+                "results": results_gdf,
+                "meta": meta,
+                "type": "restored",
+            }
+        except Exception as e:
+            print(f"Error loading {base_name}: {e}")
+    return found
+
+
+def _ndvi_restart_summary_lines(p: dict) -> list[str]:
+    mode = p.get("mode", "?")
+    lines = [
+        f"**Original file:** `{p.get('fname', '?')}`",
+        f"**Mode:** {mode}",
+    ]
+    if mode == "range":
+        lines.append(
+            f"**Date range:** {p.get('start_date', '?')} → " f"{p.get('end_date', '?')}"
+        )
+    elif mode == "specific":
+        lines.append(
+            f"**Target date:** {p.get('target_date', '?')} "
+            f"(±{p.get('window_days', '?')} d)"
+        )
+    elif mode == "column":
+        lines.append(
+            f"**Date column:** `{p.get('date_column', '?')}` "
+            f"(±{p.get('window_days', '?')} d)"
+        )
+    lines.append(
+        f"**Cloud max:** {p.get('cloud_pct', '?')}% · "
+        f"**Resolution:** {p.get('resolution', '?')} m · "
+        f"**Buffer:** {p.get('buffer_m', '?')} m"
+    )
+    lines.append(
+        f"**Outputs:** GeoTIFF={bool(p.get('save_geotiff'))} · "
+        f"GeoPackage={bool(p.get('save_gpkg'))} · "
+        f"GeoJSON={bool(p.get('save_geojson'))}"
+    )
+    return lines
+
+
+def _render_ndvi_restart_panel(store, executor, output_dir) -> None:
+    """Show the restart workflow when the user clicked ↻ on an NDVI job."""
+    job_id = st.session_state.get(RESTART_SESSION_KEY)
+    if not job_id:
+        return
+    rec = store.get(job_id)
+    if rec is None:
+        return
+    if rec.type == "gvi":
+        st.info(
+            "A restart is pending for a GVI job. Switch to the **GVI "
+            "Sourcing** tab to complete it."
+        )
+        return
+    if rec.type not in ("ndvi", "ndvi_column"):
+        return
+
+    p = rec.params or {}
+
+    def _on_confirm(gdf, fname_new: str, _extras: dict) -> None:
+        fname = fname_new
+        # Stage the verified GDF in the NDVI tab's dataset registry.
+        try:
+            gtype = (
+                "poly"
+                if gdf.geometry.iloc[0].geom_type in ["Polygon", "MultiPolygon"]
+                else "point"
+            )
+        except Exception:
+            gtype = "point"
+        if "ndvi_datasets" not in st.session_state:
+            st.session_state.ndvi_datasets = {}
+        st.session_state.ndvi_datasets[fname] = {"raw": gdf, "type": gtype}
+
+        new_params = dict(p)
+        new_params["geometry_sha256"] = geometry_sha256(gdf)
+        new_params["restart_of"] = rec.id
+        new_params["fname"] = fname
+
+        base_name = os.path.splitext(fname)[0]
+        record = store.submit(type=rec.type, name=base_name, params=new_params)
+
+        common = {
+            "fname": fname,
+            "dataset_data": st.session_state.ndvi_datasets[fname],
+            "cloud_pct": int(p.get("cloud_pct", 10)),
+            "resolution": int(p.get("resolution", 10)),
+            "buffer_m": int(p.get("buffer_m", 0)),
+            "output_dir": output_dir,
+            "save_geotiff": bool(p.get("save_geotiff", True)),
+            "save_geojson": bool(p.get("save_geojson", False)),
+            "save_gpkg": bool(p.get("save_gpkg", False)),
+        }
+
+        if rec.type == "ndvi":
+            executor.submit_runner(
+                record,
+                run_ndvi,
+                start_date=str(p.get("start_date", "")),
+                end_date=str(p.get("end_date", "")),
+                output_name=str(p.get("output_name", base_name)),
+                **common,
+            )
+        else:  # ndvi_column
+            executor.submit_runner(
+                record,
+                run_ndvi_column,
+                date_column=str(p.get("date_column", "")),
+                window_days=int(p.get("window_days", 30)),
+                **common,
+            )
+
+    render_job_restart_panel(
+        rec,
+        accept_types=[
+            "geojson",
+            "json",
+            "gpkg",
+            "shp",
+            "dbf",
+            "shx",
+            "prj",
+            "cpg",
+            "zip",
+        ],
+        summary_lines=_ndvi_restart_summary_lines(p),
+        extra_inputs_renderer=None,
+        on_confirm=_on_confirm,
+    )
 
 
 def _ndvi_size_hint(buffer_m: int, resolution_m: int) -> None:
@@ -94,6 +298,10 @@ def render(output_dir: str) -> None:
         st.session_state.ndvi_inspector_select = None
     if "ndvi_date_configs" not in st.session_state:
         st.session_state.ndvi_date_configs = {}
+
+    from services import get_job_executor, get_job_store
+
+    _render_ndvi_restart_panel(get_job_store(), get_job_executor(), output_dir)
 
     st.subheader("Input Configuration")
 
@@ -524,6 +732,7 @@ def render(output_dir: str) -> None:
                                 "save_geotiff": save_gt,
                                 "save_gpkg": save_gp,
                                 "save_geojson": save_gj,
+                                "geometry_sha256": geometry_sha256(d["raw"]),
                             },
                         )
                         executor.submit_runner(
@@ -577,6 +786,7 @@ def render(output_dir: str) -> None:
                                 "save_geotiff": save_gt,
                                 "save_gpkg": save_gp,
                                 "save_geojson": save_gj,
+                                "geometry_sha256": geometry_sha256(d["raw"]),
                             },
                         )
                         executor.submit_runner(
@@ -621,6 +831,7 @@ def render(output_dir: str) -> None:
                                 "save_geotiff": save_gt,
                                 "save_gpkg": save_gp,
                                 "save_geojson": save_gj,
+                                "geometry_sha256": geometry_sha256(d["raw"]),
                             },
                         )
                         executor.submit_runner(
@@ -656,66 +867,53 @@ def render(output_dir: str) -> None:
     col_ndvi_btm_left, col_ndvi_btm_right = st.columns(2)
     with col_ndvi_btm_left:
         st.subheader("Result Inspector")
-        if st.button("🔄 Scan Output Folder", key="ndvi_scan_folder"):
-            from rasterio.warp import transform_bounds
+        scan_row_l, scan_row_r = st.columns([11, 1])
+        with scan_row_l:
+            ndvi_scan_clicked = st.button(
+                "🔄 Scan Output Folder",
+                key="ndvi_scan_folder",
+                use_container_width=True,
+            )
+        with scan_row_r:
+            ndvi_scan_spinner_slot = st.empty()
 
-            tif_paths: dict[str, str] = {}
-            for pat in (
-                os.path.join(output_dir, "*_ndvi.tif"),
-                os.path.join(output_dir, "*_ndvi.tiff"),
-            ):
-                for p in glob.glob(pat):
-                    tif_paths[os.path.basename(p)] = p
-            count = 0
-            for basename in sorted(tif_paths.keys()):
-                tif_path = tif_paths[basename]
-                stem = basename.rsplit(".", 1)[0]
-                base_name = stem.removesuffix("_ndvi")
-                geojson_path = os.path.join(output_dir, f"{base_name}_ndvi.geojson")
-                has_geojson = os.path.isfile(geojson_path)
-                if base_name not in st.session_state.ndvi_datasets:
-                    try:
-                        with rasterio.open(tif_path) as src:
-                            meta = {
-                                "transform": src.transform,
-                                "width": src.width,
-                                "height": src.height,
-                                "crs": src.crs,
-                            }
-                            b = src.bounds
-                            crs = src.crs
-                        results_gdf = None
-                        if has_geojson:
-                            results_gdf = reproject_geodataframe_to_wgs84(
-                                gpd.read_file(geojson_path)
-                            )
-                            raw_geom = results_gdf.geometry.union_all().envelope
-                            raw_gdf = gpd.GeoDataFrame(
-                                {"geometry": [raw_geom]}, crs="EPSG:4326"
-                            )
-                        else:
-                            w, s, e, n = transform_bounds(crs, "EPSG:4326", *b)
-                            raw_gdf = gpd.GeoDataFrame(
-                                {"geometry": [shapely_box(w, s, e, n)]},
-                                crs="EPSG:4326",
-                            )
-                        st.session_state.ndvi_datasets[base_name] = {
-                            "raw": raw_gdf,
-                            "processed": None,
-                            "results": results_gdf,
-                            "meta": meta,
-                            "type": "restored",
-                        }
-                        count += 1
-                    except Exception as e:
-                        print(f"Error loading {base_name}: {e}")
-            if count > 0:
-                st.success(f"Loaded {count} result(s) from the output folder.")
+        if ndvi_scan_clicked:
+            import threading as _threading
+
+            holder: dict = {}
+
+            def _scan_worker(out_dir: str, target: dict) -> None:
+                try:
+                    target["result"] = _ndvi_scan_outputs(out_dir)
+                except Exception as exc:  # noqa: BLE001
+                    target["error"] = exc
+
+            with ndvi_scan_spinner_slot:
+                with st.spinner("​"):
+                    t = _threading.Thread(
+                        target=_scan_worker, args=(output_dir, holder), daemon=True
+                    )
+                    t.start()
+                    t.join()
+
+            err = holder.get("error")
+            if err is not None:
+                st.error(f"Scan failed: {err}")
             else:
-                st.info(
-                    "No NDVI GeoTIFF results found in the output folder "
-                    "(files named *_ndvi.tif or *_ndvi.tiff)."
-                )
+                result = holder.get("result") or {}
+                count = 0
+                for base_name, dataset_dict in result.items():
+                    if base_name not in st.session_state.ndvi_datasets:
+                        st.session_state.ndvi_datasets[base_name] = dataset_dict
+                        count += 1
+                if count > 0:
+                    st.success(f"Loaded {count} result(s) from the output folder.")
+                else:
+                    st.info(
+                        "No new NDVI results found "
+                        "(looked for *_ndvi.tif, *_ndvi.tiff, *_ndvi.gpkg, "
+                        "*_ndvi.geojson)."
+                    )
 
         completed_ds = [
             k
@@ -777,6 +975,7 @@ def render(output_dir: str) -> None:
                 ds = st.session_state.ndvi_datasets[ds_name]
 
                 tif_path = os.path.join(output_dir, f"{ds_name}_ndvi.tif")
+                rendered_from_tif = False
                 if os.path.exists(tif_path):
                     try:
                         with rasterio.open(tif_path) as src:
@@ -829,8 +1028,23 @@ def render(output_dir: str) -> None:
                                 weight=2,
                                 fill=False,
                             ).add_to(m_ndvi_result)
+                            rendered_from_tif = True
                     except Exception as e:
                         print(f"Viz Error {ds_name}: {e}")
+
+                # GeoPackage / GeoJSON fallback: black points, no tooltips.
+                if not rendered_from_tif and ds.get("results") is not None:
+                    pts = ds["results"]
+                    if pts is not None and not pts.empty:
+                        l, btm, r, t = pts.total_bounds
+                        res_bounds.append([l, btm, r, t])
+                        add_black_point_layer(
+                            m_ndvi_result,
+                            pts,
+                            radius=6,
+                            fill_opacity=r_opacity,
+                            layer_name=f"{ds_name} NDVI samples",
+                        )
 
                 if show_points and ds.get("results") is not None:
                     try:
@@ -867,12 +1081,16 @@ def render(output_dir: str) -> None:
                     except Exception as e:
                         st.error(f"Error rendering sample points: {e}")
 
-            if res_bounds:
+            # Only fit bounds when the selection changes — otherwise the
+            # user's pan/zoom would be reset on every script rerun.
+            last_sel = st.session_state.get("_ndvi_inspector_last_sel")
+            if res_bounds and selected_opt != last_sel:
                 min_x = min([b[0] for b in res_bounds])
                 min_y = min([b[1] for b in res_bounds])
                 max_x = max([b[2] for b in res_bounds])
                 max_y = max([b[3] for b in res_bounds])
                 m_ndvi_result.fit_bounds([[min_y, min_x], [max_y, max_x]])
+            st.session_state["_ndvi_inspector_last_sel"] = selected_opt
 
         map_data = st_folium(
             m_ndvi_result,

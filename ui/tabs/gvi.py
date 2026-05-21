@@ -12,11 +12,14 @@ import numpy as np
 import rasterio
 import streamlit as st
 from helpers import (
+    RESTART_SESSION_KEY,
     apply_buffer_m,
     generate_clustered_grid,
     load_vector_upload_sessions,
+    render_job_restart_panel,
 )
 from map_preview import (
+    add_black_point_layer,
     add_study_area_layers,
     add_uniform_point_layer,
     trim_point_gdf_for_display,
@@ -27,7 +30,7 @@ from shapely.geometry import box as shapely_box
 from streamlit_folium import st_folium
 
 from geofuse.crs_utils import reproject_geodataframe_to_wgs84
-from geofuse.jobs.runners import run_gvi
+from geofuse.vector_io import geometry_sha256
 
 
 def _gvi_output_tif_path(output_dir: str, base_name: str) -> str | None:
@@ -65,6 +68,96 @@ def _gvi_discard_heavy_dataset_fields() -> None:
     gc.collect()
 
 
+def _gvi_scan_outputs(output_dir: str) -> dict[str, dict]:
+    """Discover GVI result files and return ``{base_name: dataset_dict}``.
+
+    Pure function — no Streamlit calls — so it can run safely in a background
+    thread while workers keep processing.
+    """
+    import json as _json
+
+    from rasterio.warp import transform_bounds
+
+    base_names: set[str] = set()
+    for pat in ("*_gvi.gpkg", "*_gvi.geojson", "*_gvi.tif", "*_gvi.tiff"):
+        for p in glob.glob(os.path.join(output_dir, pat)):
+            stem = os.path.basename(p).rsplit(".", 1)[0]
+            base_names.add(stem.removesuffix("_gvi"))
+    for tiles_dir in glob.glob(os.path.join(output_dir, "*_gvi_tiles")):
+        base_names.add(os.path.basename(tiles_dir).removesuffix("_gvi_tiles"))
+
+    found: dict[str, dict] = {}
+    for base_name in sorted(base_names):
+        gpkg_path = os.path.join(output_dir, f"{base_name}_gvi.gpkg")
+        gj_path = os.path.join(output_dir, f"{base_name}_gvi.geojson")
+        sidecar_path = os.path.join(output_dir, f"{base_name}_gvi.json")
+        single_tif: str | None = None
+        for ext in (".tif", ".tiff"):
+            p = os.path.join(output_dir, f"{base_name}_gvi{ext}")
+            if os.path.isfile(p):
+                single_tif = p
+                break
+        tiles_dir = os.path.join(output_dir, f"{base_name}_gvi_tiles")
+        has_tiles = os.path.isdir(tiles_dir)
+
+        try:
+            results = None
+            if os.path.isfile(gpkg_path):
+                results = reproject_geodataframe_to_wgs84(gpd.read_file(gpkg_path))
+            elif os.path.isfile(gj_path):
+                results = reproject_geodataframe_to_wgs84(gpd.read_file(gj_path))
+
+            meta: dict | None = None
+            if single_tif:
+                with rasterio.open(single_tif) as src:
+                    meta = {
+                        "transform": src.transform,
+                        "width": src.width,
+                        "height": src.height,
+                        "crs": src.crs,
+                    }
+            elif os.path.isfile(sidecar_path):
+                with open(sidecar_path) as f:
+                    sc = _json.load(f)
+                meta = {
+                    "grid_crs_wkt": sc.get("grid_crs_wkt"),
+                    "step_m": sc.get("step_m"),
+                    "anchor_x": sc.get("anchor_x"),
+                    "anchor_y": sc.get("anchor_y"),
+                    "tiles_dir": tiles_dir if has_tiles else None,
+                    "n_clusters": sc.get("n_clusters"),
+                }
+            elif has_tiles:
+                meta = {"tiles_dir": tiles_dir}
+
+            if results is not None and not results.empty:
+                raw_geom = results.geometry.union_all().envelope
+                raw_gdf = gpd.GeoDataFrame({"geometry": [raw_geom]}, crs="EPSG:4326")
+            elif single_tif:
+                with rasterio.open(single_tif) as src:
+                    b = src.bounds
+                    crs = src.crs
+                w, s, e, n = transform_bounds(crs, "EPSG:4326", *b)
+                raw_gdf = gpd.GeoDataFrame(
+                    {"geometry": [shapely_box(w, s, e, n)]},
+                    crs="EPSG:4326",
+                )
+            else:
+                continue
+
+            found[base_name] = {
+                "raw": raw_gdf,
+                "processed": None,
+                "accumulated": [],
+                "results": results,
+                "meta": meta,
+                "type": "restored",
+            }
+        except Exception as e:
+            print(f"Error scanning {base_name}: {e}")
+    return found
+
+
 def _gvi_size_hint(buffer_m: int, step_m: int) -> None:
     """Show an inline banner with rough sample-count and CRS-choice expectations.
 
@@ -91,17 +184,16 @@ def _gvi_size_hint(buffer_m: int, step_m: int) -> None:
         bbox_miny = min(bbox_miny, miny)
         bbox_maxx = max(bbox_maxx, maxx)
         bbox_maxy = max(bbox_maxy, maxy)
-        cent_lat = (miny + maxy) / 2.0
-        m_per_deg_lat = 111000.0
-        m_per_deg_lon = 111000.0 * float(np.cos(np.radians(cent_lat)))
         if d.get("type") == "point":
             n = len(raw)
             disk = np.pi * (max(buffer_m, 0)) ** 2
             total_area_m2 += n * disk
         else:
             try:
-                deg2 = float(raw.geometry.area.sum())
-                total_area_m2 += deg2 * m_per_deg_lat * m_per_deg_lon
+                # Reproject to a metric CRS before computing area to avoid
+                # geopandas' geographic-CRS warning and get accurate metres².
+                m_gdf = raw.to_crs(raw.estimate_utm_crs())
+                total_area_m2 += float(m_gdf.geometry.area.sum())
             except Exception:
                 pass
     if not have_data:
@@ -123,6 +215,143 @@ def _gvi_size_hint(buffer_m: int, step_m: int) -> None:
         )
     if msgs:
         st.info(" · ".join(msgs))
+
+
+def _gvi_restart_summary_lines(p: dict) -> list[str]:
+    return [
+        f"**Original file:** `{p.get('fname', '?')}`",
+        f"**Grid step:** {p.get('step', '?')} m · **Buffer:** {p.get('buffer', '?')} m",
+        f"**Outputs:** GeoPackage={bool(p.get('save_gpkg', True))} · "
+        f"GeoTIFF={bool(p.get('save_geotiff'))} · "
+        f"GeoJSON={bool(p.get('save_geojson'))}",
+        f"**Save panos / masks:** {bool(p.get('save_panos'))} / {bool(p.get('save_masks'))}",
+    ]
+
+
+def _render_gvi_restart_panel(
+    store, executor, pano_cache, output_dir, parent_dir
+) -> None:
+    """Show the restart workflow when the user clicked ↻ on a GVI job."""
+    job_id = st.session_state.get(RESTART_SESSION_KEY)
+    if not job_id:
+        return
+    rec = store.get(job_id)
+    if rec is None:
+        return
+    if rec.type in ("ndvi", "ndvi_column"):
+        st.info(
+            "A restart is pending for an NDVI job. Switch to the **NDVI "
+            "Sourcing** tab to complete it."
+        )
+        return
+    if rec.type != "gvi":
+        return
+
+    p = rec.params or {}
+    had_api_key = bool(p.get("has_api_key"))
+
+    def _extra_inputs() -> dict:
+        if not had_api_key:
+            return {}
+        st.caption(
+            "Original job used the Street View API. Re-supply the API key — "
+            "secrets aren't persisted between runs."
+        )
+        key = st.text_input(
+            "Street View API Key",
+            type="password",
+            autocomplete="off",
+            key=f"restart_apikey_{rec.id}",
+        )
+        return {"api_key": key or None}
+
+    def _on_confirm(gdf, fname_new: str, extras: dict) -> None:
+        # Stage the verified GDF in this tab's session datasets so
+        # generate_clustered_grid + the engine see it the same way they do
+        # for a fresh upload.
+        fname = fname_new
+        try:
+            gtype = (
+                "poly"
+                if gdf.geometry.iloc[0].geom_type in ["Polygon", "MultiPolygon"]
+                else "point"
+            )
+        except Exception:
+            gtype = "point"
+        st.session_state.datasets[fname] = {
+            "raw": gdf,
+            "processed": None,
+            "accumulated": [],
+            "results": None,
+            "meta": None,
+            "type": gtype,
+        }
+
+        # Materialize the sampling grid using the *original* step/buffer
+        # rather than the form's current values, so the restart is faithful.
+        step_m = int(p.get("step", 50))
+        buffer_m = int(p.get("buffer", 0))
+        if _gvi_dataset_uses_raster_grid(st.session_state.datasets[fname], buffer_m):
+            pts, meta = generate_clustered_grid(
+                gdf, buffer_m=float(buffer_m), step_m=float(step_m)
+            )
+            st.session_state.datasets[fname]["processed"] = pts
+            st.session_state.datasets[fname]["meta"] = meta
+        else:
+            st.session_state.datasets[fname]["processed"] = gdf.copy()
+
+        st.session_state.datasets[fname]["cache_ref"] = pano_cache
+
+        model_path = p.get("model_path") or os.path.join(
+            parent_dir, "geofuse", "model", "best_model.pth"
+        )
+        api_key = extras.get("api_key") if had_api_key else None
+
+        new_params = dict(p)
+        new_params["geometry_sha256"] = geometry_sha256(gdf)
+        new_params["restart_of"] = rec.id
+        new_params["has_api_key"] = api_key is not None
+        new_params["fname"] = fname
+
+        record = store.submit(
+            type="gvi",
+            name=os.path.splitext(fname)[0],
+            params=new_params,
+        )
+        executor.submit_gvi_subprocess(
+            record,
+            fname=fname,
+            dataset_data=st.session_state.datasets[fname],
+            init_args={"model_path": model_path, "api_key": api_key},
+            run_args={
+                "step": step_m,
+                "save_panos": bool(p.get("save_panos")),
+                "save_masks": bool(p.get("save_masks")),
+            },
+            output_dir=output_dir,
+            save_gpkg=bool(p.get("save_gpkg", True)),
+            save_geotiff=bool(p.get("save_geotiff")),
+            save_geojson=bool(p.get("save_geojson")),
+            pano_cache_db_path=pano_cache.db_path,
+        )
+
+    render_job_restart_panel(
+        rec,
+        accept_types=[
+            "geojson",
+            "json",
+            "gpkg",
+            "shp",
+            "dbf",
+            "shx",
+            "prj",
+            "cpg",
+            "zip",
+        ],
+        summary_lines=_gvi_restart_summary_lines(p),
+        extra_inputs_renderer=_extra_inputs if had_api_key else None,
+        on_confirm=_on_confirm,
+    )
 
 
 def _gvi_materialize_grids_if_missing(gvi_buffer: int, gvi_res: int) -> None:
@@ -176,9 +405,10 @@ def render(output_dir: str, parent_dir: str) -> None:
         get_job_executor,
         get_job_store,
         get_pano_cache,
+        open_path_in_default_editor,
     )
 
-    from geofuse.logger import get_job_log_lines
+    from geofuse.logger import get_job_log_lines, get_job_log_path
 
     store = get_job_store()
     executor = get_job_executor()
@@ -278,6 +508,10 @@ def render(output_dir: str, parent_dir: str) -> None:
             st.caption(f"Completed at: {rec.completed_at}")
 
     def _render_logs(rec_id: str) -> None:
+        # Reads straight from the per-job deque. Lock contention is now
+        # negligible: the listener thread (logger.py) holds the deque lock
+        # briefly to append, the fragment holds it briefly to copy. Active
+        # jobs only — terminal jobs use the "Open log file" button instead.
         lines = get_job_log_lines(rec_id)
         if not lines:
             st.caption("(no log output captured yet)")
@@ -357,9 +591,28 @@ def render(output_dir: str, parent_dir: str) -> None:
                 with st.expander("Details", expanded=False):
                     _render_details(rec)
 
-                # Collapsible per-job log
-                with st.expander("Logs", expanded=False):
-                    _render_logs(rec.id)
+                # Per-job log:
+                #   * Active jobs → collapsible live tail (reads the in-memory
+                #     deque; only the last 100 lines).
+                #   * Terminal jobs → button that opens the full persistent
+                #     log file in the OS's default editor.
+                if rec.status in _TERMINAL:
+                    log_path = get_job_log_path(rec.id)
+                    have_file = os.path.isfile(log_path)
+                    if st.button(
+                        "Open log file",
+                        key=f"openlog_{rec.id}",
+                        use_container_width=True,
+                        disabled=not have_file,
+                        help=(log_path if have_file else "Log file not found on disk."),
+                    ):
+                        try:
+                            open_path_in_default_editor(log_path)
+                        except Exception as e:
+                            st.error(f"Could not open log file: {e}")
+                else:
+                    with st.expander("Logs", expanded=False):
+                        _render_logs(rec.id)
 
                 # Error detail block stays in its own expander when present
                 error_detail = rec.extra.get("error_detail")
@@ -367,7 +620,7 @@ def render(output_dir: str, parent_dir: str) -> None:
                     with st.expander("Error trace"):
                         st.code(error_detail or rec.error)
 
-                # Action button
+                # Action buttons
                 if rec.status in _ACTIVE:
                     st.button(
                         "Cancel",
@@ -376,20 +629,41 @@ def render(output_dir: str, parent_dir: str) -> None:
                         args=(rec.id,),
                     )
                 else:
-                    if rec.status == "interrupted":
-                        st.caption(
-                            "Interrupted on restart — re-upload the source "
-                            "dataset and re-submit from the form above."
+                    restart_eligible = rec.type in (
+                        "gvi",
+                        "ndvi",
+                        "ndvi_column",
+                    ) and rec.status in ("interrupted", "cancelled", "error")
+                    btn_cols = st.columns(2, gap="medium")
+                    if restart_eligible:
+                        restart_col, dismiss_col = btn_cols[0], btn_cols[1]
+                    else:
+                        restart_col, dismiss_col = None, btn_cols[0]
+                    if restart_col is not None:
+                        with restart_col:
+                            if st.button(
+                                "🔄",
+                                key=f"restart_{rec.id}",
+                                use_container_width=True,
+                                help="Restart — re-upload the original input geometry.",
+                            ):
+                                st.session_state[RESTART_SESSION_KEY] = rec.id
+                                st.rerun()
+                    with dismiss_col:
+                        st.button(
+                            "🗑️",
+                            key=f"del_{rec.id}",
+                            use_container_width=True,
+                            on_click=callback_dismiss_job,
+                            args=(rec.id,),
+                            help="Dismiss — remove this job from history.",
                         )
-                    st.button(
-                        "🗑️",
-                        key=f"del_{rec.id}",
-                        on_click=callback_dismiss_job,
-                        args=(rec.id,),
-                    )
 
     with st.sidebar:
         show_job_monitor_fragment()
+
+    # --- RESTART PANEL (above the main form when a terminal job was clicked) ---
+    _render_gvi_restart_panel(store, executor, pano_cache, output_dir, parent_dir)
 
     st.subheader("Input Configuration")
 
@@ -746,6 +1020,7 @@ def render(output_dir: str, parent_dir: str) -> None:
                     "save_geojson": save_gj,
                     "model_path": model_path,
                     "has_api_key": api_key is not None,
+                    "geometry_sha256": geometry_sha256(d["raw"]),
                 }
                 sig = _gvi_signature(job_params)
 
@@ -765,9 +1040,8 @@ def render(output_dir: str, parent_dir: str) -> None:
                     name=os.path.splitext(fname)[0],
                     params=job_params,
                 )
-                executor.submit_runner(
+                executor.submit_gvi_subprocess(
                     record,
-                    run_gvi,
                     fname=fname,
                     dataset_data=d,
                     init_args={"model_path": model_path, "api_key": api_key},
@@ -780,7 +1054,7 @@ def render(output_dir: str, parent_dir: str) -> None:
                     save_gpkg=save_gp,
                     save_geotiff=save_gt,
                     save_geojson=save_gj,
-                    gpu_lock=executor.gpu_lock,
+                    pano_cache_db_path=pano_cache.db_path,
                 )
                 started = True
 
@@ -796,115 +1070,53 @@ def render(output_dir: str, parent_dir: str) -> None:
     with col_btm_left:
         st.subheader("Result Inspector")
 
-        if st.button("🔄 Scan Output Folder", key="gvi_scan_folder"):
-            import json as _json
+        scan_row_l, scan_row_r = st.columns([11, 1])
+        with scan_row_l:
+            scan_clicked = st.button(
+                "🔄 Scan Output Folder",
+                key="gvi_scan_folder",
+                use_container_width=True,
+            )
+        with scan_row_r:
+            scan_spinner_slot = st.empty()
 
-            from rasterio.warp import transform_bounds
+        if scan_clicked:
+            import threading as _threading
 
-            # Discover every base name by union of GPKG / GeoJSON / single TIF
-            # / per-cluster tiles folder. The new canonical output is GPKG +
-            # sidecar JSON, but legacy single-TIF outputs are still supported.
-            base_names: set[str] = set()
-            for pat in (
-                "*_gvi.gpkg",
-                "*_gvi.geojson",
-                "*_gvi.tif",
-                "*_gvi.tiff",
-            ):
-                for p in glob.glob(os.path.join(output_dir, pat)):
-                    stem = os.path.basename(p).rsplit(".", 1)[0]
-                    base_names.add(stem.removesuffix("_gvi"))
-            for tiles_dir in glob.glob(os.path.join(output_dir, "*_gvi_tiles")):
-                base_names.add(os.path.basename(tiles_dir).removesuffix("_gvi_tiles"))
+            holder: dict = {}
 
-            count = 0
-            for base_name in sorted(base_names):
-                if base_name in st.session_state.datasets:
-                    continue
-
-                gpkg_path = os.path.join(output_dir, f"{base_name}_gvi.gpkg")
-                gj_path = os.path.join(output_dir, f"{base_name}_gvi.geojson")
-                sidecar_path = os.path.join(output_dir, f"{base_name}_gvi.json")
-                single_tif: str | None = None
-                for ext in (".tif", ".tiff"):
-                    p = os.path.join(output_dir, f"{base_name}_gvi{ext}")
-                    if os.path.isfile(p):
-                        single_tif = p
-                        break
-                tiles_dir = os.path.join(output_dir, f"{base_name}_gvi_tiles")
-                has_tiles = os.path.isdir(tiles_dir)
-
+            def _scan_worker(out_dir: str, target: dict) -> None:
                 try:
-                    results = None
-                    if os.path.isfile(gpkg_path):
-                        results = reproject_geodataframe_to_wgs84(
-                            gpd.read_file(gpkg_path)
-                        )
-                    elif os.path.isfile(gj_path):
-                        results = reproject_geodataframe_to_wgs84(
-                            gpd.read_file(gj_path)
-                        )
+                    target["result"] = _gvi_scan_outputs(out_dir)
+                except Exception as exc:  # noqa: BLE001
+                    target["error"] = exc
 
-                    meta: dict | None = None
-                    if single_tif:
-                        with rasterio.open(single_tif) as src:
-                            meta = {
-                                "transform": src.transform,
-                                "width": src.width,
-                                "height": src.height,
-                                "crs": src.crs,
-                            }
-                    elif os.path.isfile(sidecar_path):
-                        with open(sidecar_path) as f:
-                            sc = _json.load(f)
-                        meta = {
-                            "grid_crs_wkt": sc.get("grid_crs_wkt"),
-                            "step_m": sc.get("step_m"),
-                            "anchor_x": sc.get("anchor_x"),
-                            "anchor_y": sc.get("anchor_y"),
-                            "tiles_dir": tiles_dir if has_tiles else None,
-                            "n_clusters": sc.get("n_clusters"),
-                        }
-                    elif has_tiles:
-                        meta = {"tiles_dir": tiles_dir}
+            with scan_spinner_slot:
+                with st.spinner("​"):
+                    t = _threading.Thread(
+                        target=_scan_worker, args=(output_dir, holder), daemon=True
+                    )
+                    t.start()
+                    t.join()
 
-                    if results is not None and not results.empty:
-                        raw_geom = results.geometry.union_all().envelope
-                        raw_gdf = gpd.GeoDataFrame(
-                            {"geometry": [raw_geom]}, crs="EPSG:4326"
-                        )
-                    elif single_tif:
-                        with rasterio.open(single_tif) as src:
-                            b = src.bounds
-                            crs = src.crs
-                        w, s, e, n = transform_bounds(crs, "EPSG:4326", *b)
-                        raw_gdf = gpd.GeoDataFrame(
-                            {"geometry": [shapely_box(w, s, e, n)]},
-                            crs="EPSG:4326",
-                        )
-                    else:
-                        # Nothing readable for this base name.
-                        continue
-
-                    st.session_state.datasets[base_name] = {
-                        "raw": raw_gdf,
-                        "processed": None,
-                        "accumulated": [],
-                        "results": results,
-                        "meta": meta,
-                        "type": "restored",
-                    }
-                    count += 1
-                except Exception as e:
-                    print(f"Error scanning {base_name}: {e}")
-            if count > 0:
-                st.success(f"Loaded {count} result(s) from the output folder.")
+            err = holder.get("error")
+            if err is not None:
+                st.error(f"Scan failed: {err}")
             else:
-                st.info(
-                    "No GVI results found in the output folder "
-                    "(looked for *_gvi.gpkg, *_gvi.geojson, *_gvi.tif, "
-                    "*_gvi_tiles/)."
-                )
+                result = holder.get("result") or {}
+                count = 0
+                for base_name, dataset_dict in result.items():
+                    if base_name not in st.session_state.datasets:
+                        st.session_state.datasets[base_name] = dataset_dict
+                        count += 1
+                if count > 0:
+                    st.success(f"Loaded {count} result(s) from the output folder.")
+                else:
+                    st.info(
+                        "No new GVI results found "
+                        "(looked for *_gvi.gpkg, *_gvi.geojson, *_gvi.tif, "
+                        "*_gvi_tiles/)."
+                    )
 
         completed_ds = [
             k
@@ -1011,9 +1223,12 @@ def render(output_dir: str, parent_dir: str) -> None:
                     ).add_to(m_result)
                     res_bounds.append([left, bottom, right, top])
 
-                # Raster overlay is only available for legacy single-TIF
-                # outputs. New GeoPackage-only outputs render as points only
-                # (toggle Show Sample Points below).
+                # Raster overlay rendering:
+                #   * Legacy single-TIF outputs use the on-disk grid directly.
+                #   * GeoPackage-only outputs synthesise a small grid from the
+                #     points' bbox via :func:`rasterize_points_for_preview`.
+                # In both cases the rest of the pipeline (colormap + PNG +
+                # ImageOverlay) is identical.
                 if has_single_raster:
                     from rasterio.transform import rowcol
 
@@ -1073,6 +1288,16 @@ def render(output_dir: str, parent_dir: str) -> None:
                             opacity=r_opacity,
                             interactive=False,
                         ).add_to(m_result)
+                elif ds.get("results") is not None:
+                    # GeoPackage-only: black points, no tooltips (too heavy
+                    # for ~2 M-point runs over a WebSocket).
+                    add_black_point_layer(
+                        m_result,
+                        ds["results"],
+                        radius=6,
+                        fill_opacity=r_opacity,
+                        layer_name=f"{ds_name} samples",
+                    )
 
                 if show_points and ds.get("results") is not None:
                     try:
@@ -1106,12 +1331,16 @@ def render(output_dir: str, parent_dir: str) -> None:
                     except Exception as e:
                         st.error(f"Error rendering sample points: {e}")
 
-            if res_bounds:
+            # Only fit bounds when the selection changes — otherwise the
+            # user's manual zoom/pan would be reset on every script rerun.
+            last_sel = st.session_state.get("_gvi_inspector_last_sel")
+            if res_bounds and selected_option != last_sel:
                 min_x = min([b[0] for b in res_bounds])
                 min_y = min([b[1] for b in res_bounds])
                 max_x = max([b[2] for b in res_bounds])
                 max_y = max([b[3] for b in res_bounds])
                 m_result.fit_bounds([[min_y, min_x], [max_y, max_x]])
+            st.session_state["_gvi_inspector_last_sel"] = selected_option
 
         st_folium(
             m_result, width="100%", height=500, key="map_result", returned_objects=[]

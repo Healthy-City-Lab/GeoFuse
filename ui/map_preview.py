@@ -72,11 +72,67 @@ def split_points_and_nonpoints(
 def trim_point_gdf_for_display(
     gdf: gpd.GeoDataFrame, *, max_points: int = MAP_POINT_DISPLAY_MAX
 ) -> tuple[gpd.GeoDataFrame, str | None]:
-    """Random-sample when over ``max_points``; return optional warning label."""
-    if len(gdf) <= max_points:
-        return gdf, None
-    msg = f"Displaying a random sample of {max_points:,} points (of {len(gdf):,})."
-    return gdf.sample(max_points, random_state=0), msg
+    """Pass through unchanged. FastMarkerCluster handles large N client-side."""
+    return gdf, None
+
+
+def add_black_point_layer(
+    m: folium.Map,
+    gdf_points: gpd.GeoDataFrame,
+    *,
+    radius: int = 6,
+    fill_color: str = "#000",
+    fill_opacity: float = 0.85,
+    layer_name: str = "Samples",
+) -> None:
+    """Render uniform black points via FastMarkerCluster.
+
+    Sends only lat/lon — no per-point payload, no tooltips — so 2 M+ points
+    transfer to the browser without blowing the WebSocket frame. Cluster
+    bubbles are themed black + white so they read against any basemap.
+    """
+    if gdf_points is None or gdf_points.empty:
+        return
+    ys = gdf_points.geometry.y.to_numpy(dtype=float, copy=False)
+    xs = gdf_points.geometry.x.to_numpy(dtype=float, copy=False)
+    finite = np.isfinite(ys) & np.isfinite(xs)
+    if not np.any(finite):
+        return
+    data = np.column_stack([ys[finite], xs[finite]]).tolist()
+
+    callback = (
+        "function(row) { "
+        "return L.circleMarker(new L.LatLng(row[0], row[1]), {"
+        f"radius: {int(radius)}, "
+        f"color: {json.dumps(fill_color)}, "
+        f"fillColor: {json.dumps(fill_color)}, "
+        f"fillOpacity: {float(fill_opacity)}, "
+        "weight: 0"
+        "}); "
+        "}"
+    )
+
+    cluster_icon_fn = (
+        "function(cluster) { "
+        "var n = cluster.getChildCount(); "
+        "var size = Math.min(50, 24 + Math.log10(n + 1) * 8); "
+        "return L.divIcon({"
+        "html: '<div style=\"background-color:rgba(0,0,0,0.85);color:white;"
+        "border-radius:50%;display:flex;align-items:center;justify-content:center;"
+        "font-weight:600;border:2px solid white;font-size:0.85em;width:'"
+        "+size+'px;height:'+size+'px;\">' + n + '</div>',"
+        "className: 'gf-cluster-icon',"
+        "iconSize: L.point(size, size) "
+        "}); "
+        "}"
+    )
+
+    FastMarkerCluster(
+        data=data,
+        callback=callback,
+        name=layer_name,
+        icon_create_function=cluster_icon_fn,
+    ).add_to(m)
 
 
 def _fast_cluster_uniform_callback(

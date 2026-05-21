@@ -87,6 +87,17 @@ _SEARCH_RADIUS_M = 50.0
 _DOWNLOAD_ZOOM = 1
 # Hard timeout per panorama download (covers all tile fetches together).
 _DOWNLOAD_TIMEOUT_S = 20.0
+# Sliding window of points that may have their **panorama-search HTTP call**
+# in flight at the same time. Small enough not to rate-limit Google's
+# SingleImageSearch endpoint or oversubscribe local sockets; large enough
+# that one task's TCP/TLS reconnect cost is hidden by others' in-flight
+# requests. The heavy download+GPU stretch still serializes — see the
+# inner lock built in _run_analysis_async — so cache-miss throughput is
+# unchanged while cache-hit / no-pano points fly through concurrently.
+_MAX_CONCURRENT_POINTS = 4
+# Periodic ``torch.cuda.empty_cache()`` cadence (per-worker completions).
+# Defensive against PyTorch allocator fragmentation over million-point runs.
+_EMPTY_CACHE_EVERY_N = 200
 
 
 class GVIEngine:
@@ -97,9 +108,9 @@ class GVIEngine:
         self.device = get_best_device(device)
         self.api_key = api_key
 
-        print(f"[GVI] Initializing DeepLabV3+ Model on {self.device}...")
+        _log("INFO", f"Initializing DeepLabV3+ Model on {self.device}...")
         self.segmenter = DeepLabSegmenter(ckpt_path=model_path, device=str(self.device))
-        print("[GVI] Model Ready.")
+        _log("OK", "Model Ready.")
 
     def _preprocess_image(self, img, target_width=1920):
         if img is None:
@@ -148,6 +159,7 @@ class GVIEngine:
         pano_cache: dict,
         failed_panos: set,
         cancel_callback: Callable[..., bool] | None,
+        gpu_lock: asyncio.Lock,
     ) -> dict:
         idx = pt["orig_index"]
         lat, lon = pt["lat"], pt["lon"]
@@ -206,7 +218,8 @@ class GVIEngine:
                 pt, search_lat, search_lon, cached["veg"], cached["ter"], pid
             )
 
-        # 3. Download tiles (parallel via aiohttp inside get_panorama_async)
+        # 3. Download tiles — no lock. All workers can fetch tiles in parallel
+        # (separate aiohttp keep-alive connections share the session pool).
         _log("INFO", f"  Downloading {short}… (zoom={_DOWNLOAD_ZOOM})")
         try:
             raw_image = await asyncio.wait_for(
@@ -222,7 +235,10 @@ class GVIEngine:
             failed_panos.add(pid)
             return self._empty_result(pt, search_lat, search_lon)
         except Exception as e:
-            _log("ERROR", f"  Download error for {short}…: " f"{type(e).__name__}: {e}")
+            _log(
+                "ERROR",
+                f"  Download error for {short}…: " f"{type(e).__name__}: {e}",
+            )
             failed_panos.add(pid)
             return self._empty_result(pt, search_lat, search_lon)
 
@@ -235,6 +251,9 @@ class GVIEngine:
             f"— preprocessing",
         )
 
+        # Preprocess on the worker thread — no lock (CPU only). Multiple
+        # workers can preprocess concurrently while another worker holds the
+        # GPU lock for its forward pass.
         img = self._preprocess_image(raw_image)
         try:
             raw_image.close()
@@ -247,24 +266,55 @@ class GVIEngine:
             failed_panos.add(pid)
             return self._empty_result(pt, search_lat, search_lon)
 
-        # 4. GPU inference (offloaded to executor so it doesn't block the loop)
-        _log("INFO", f"  Running segmentation for {short}…")
+        # Build the input tensor (CPU + pinned memory) outside the GPU lock so
+        # the next forward can overlap with H2D transfer.
         loop = asyncio.get_running_loop()
         try:
-            mask = await loop.run_in_executor(None, self.segmenter.predict, img)
+            tensor = await loop.run_in_executor(
+                None, self.segmenter.preprocess_to_tensor, img
+            )
         except Exception as e:
             _log(
                 "ERROR",
-                f"  GPU inference failed for {short}…: " f"{type(e).__name__}: {e}",
+                f"  Tensor build failed for {short}…: " f"{type(e).__name__}: {e}",
             )
             return self._empty_result(pt, search_lat, search_lon)
 
-        metrics = self.segmenter.calculate_gvi_from_mask(mask)
-        val_veg = metrics.get("GVI_Total", 0.0)
-        val_ter = metrics.get("GVI_Terrain", 0.0)
-        pano_cache[pid] = {"veg": val_veg, "ter": val_ter}
+        # 4. GPU inference — serialised so one image is on the device at a
+        # time. While this lock is held by one task, others can download
+        # tiles or preprocess in parallel.
+        async with gpu_lock:
+            # Another worker may have written the cache for this pano while
+            # we were queued at the GPU lock; skip the forward in that case.
+            if pid in pano_cache:
+                cached = pano_cache[pid]
+                _log(
+                    "OK",
+                    f"  Cache hit (after queue) {short}… → "
+                    f"veg={cached['veg']:.3f} ter={cached['ter']:.3f}",
+                )
+                return self._make_result(
+                    pt, search_lat, search_lon, cached["veg"], cached["ter"], pid
+                )
 
-        _log("OK", f"  GVI {short}… → veg={val_veg:.3f}  ter={val_ter:.3f}")
+            _log("INFO", f"  Running segmentation for {short}…")
+            try:
+                mask = await loop.run_in_executor(
+                    None, self.segmenter.predict_from_tensor, tensor
+                )
+            except Exception as e:
+                _log(
+                    "ERROR",
+                    f"  GPU inference failed for {short}…: " f"{type(e).__name__}: {e}",
+                )
+                return self._empty_result(pt, search_lat, search_lon)
+
+            metrics = self.segmenter.calculate_gvi_from_mask(mask)
+            val_veg = metrics.get("GVI_Total", 0.0)
+            val_ter = metrics.get("GVI_Terrain", 0.0)
+            pano_cache[pid] = {"veg": val_veg, "ter": val_ter}
+
+            _log("OK", f"  GVI {short}… → veg={val_veg:.3f}  ter={val_ter:.3f}")
 
         # 5. Optional disk artefacts
         if save_panos:
@@ -363,54 +413,85 @@ class GVIEngine:
         # Never written to pano_cache (which is the persistent session cache).
         failed_panos: set[str] = set()
         completed = 0
-        current_task: asyncio.Task | None = None
+
+        # Fixed worker pool: exactly _MAX_CONCURRENT_POINTS workers pull
+        # points from a shared queue. ``gpu_lock`` serializes only the GPU
+        # forward pass; downloads and CPU preprocessing run in parallel.
+        gpu_lock = asyncio.Lock()
+        queue: asyncio.Queue = asyncio.Queue()
+        for pt in points_to_process:
+            queue.put_nowait(pt)
+
+        completed_lock = asyncio.Lock()
 
         async with aiohttp.ClientSession() as session:
-            # Watcher: cancel the active point's task as soon as the user clicks Cancel.
+
+            async def _worker() -> None:
+                nonlocal completed
+                while True:
+                    if cancel_callback and cancel_callback():
+                        return
+                    try:
+                        pt = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        return
+                    try:
+                        res = await self._process_one_point_async(
+                            pt,
+                            session,
+                            gdf,
+                            folder,
+                            save_panos,
+                            save_masks,
+                            pano_cache,
+                            failed_panos,
+                            cancel_callback,
+                            gpu_lock,
+                        )
+                    except asyncio.CancelledError:
+                        return
+                    if result_callback:
+                        result_callback(res)
+                    async with completed_lock:
+                        completed += 1
+                        curr = completed
+                    if progress_callback:
+                        progress_callback(start_index + curr, total_points)
+                    # Defensive: release cached blocks back to the device
+                    # periodically so long-running jobs don't accumulate
+                    # allocator fragmentation.
+                    if curr % _EMPTY_CACHE_EVERY_N == 0 and self.device.type == "cuda":
+                        try:
+                            import torch
+
+                            torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+
+            workers: list[asyncio.Task] = [
+                asyncio.create_task(_worker()) for _ in range(_MAX_CONCURRENT_POINTS)
+            ]
+
+            # Watcher: cancels every worker on user cancel.
             async def _cancel_watcher() -> None:
                 while True:
                     await asyncio.sleep(0.25)
                     if cancel_callback and cancel_callback():
-                        if current_task and not current_task.done():
-                            current_task.cancel()
+                        for t in workers:
+                            if not t.done():
+                                t.cancel()
                         return
 
             watcher = asyncio.create_task(_cancel_watcher())
 
-            # Serial loop — one point at a time, search → download → GPU → next.
-            for pt in points_to_process:
-                if cancel_callback and cancel_callback():
-                    break
-
-                current_task = asyncio.create_task(
-                    self._process_one_point_async(
-                        pt,
-                        session,
-                        gdf,
-                        folder,
-                        save_panos,
-                        save_masks,
-                        pano_cache,
-                        failed_panos,
-                        cancel_callback,
-                    )
-                )
-                try:
-                    res = await current_task
-                except asyncio.CancelledError:
-                    break
-
-                if result_callback:
-                    result_callback(res)
-                completed += 1
-                if progress_callback:
-                    progress_callback(start_index + completed, total_points)
-
-            watcher.cancel()
             try:
-                await watcher
-            except asyncio.CancelledError:
-                pass
+                await asyncio.gather(*workers, return_exceptions=True)
+            finally:
+                watcher.cancel()
+                try:
+                    await watcher
+                except asyncio.CancelledError:
+                    pass
 
             if cancel_callback and cancel_callback():
                 _log("WARN", "Analysis Aborted by User.")
@@ -428,7 +509,7 @@ class GVIEngine:
         cancel_callback=None,
         start_index=0,
     ):
-        print(f"[GVI] Starting Analysis (Resume Index: {start_index})...")
+        _log("INFO", f"Starting Analysis (Resume Index: {start_index})...")
         os.makedirs(folder, exist_ok=True)
         if save_panos:
             os.makedirs(os.path.join(folder, "images"), exist_ok=True)
@@ -476,10 +557,21 @@ class GVIEngine:
         points_to_process = points[start_index:]
 
         if len(points_to_process) == 0:
-            print("[GVI] All points already processed.")
+            _log("INFO", "All points already processed.")
             return gpd.GeoDataFrame()
 
         pano_cache = external_cache if external_cache is not None else {}
+        # Bulk-load the persistent cache into its in-memory overlay so every
+        # per-point lookup is a dict hit instead of a SQLite round-trip.
+        if hasattr(pano_cache, "preload"):
+            try:
+                n_cached = pano_cache.preload()
+                _log("INFO", f"Pano cache preloaded: {n_cached:,} entries in-memory.")
+            except Exception as e:
+                _log(
+                    "WARN",
+                    f"Pano cache preload failed: {type(e).__name__}: {e}",
+                )
 
         _progress_cb = progress_callback
         _close_pbar = False
@@ -493,7 +585,7 @@ class GVIEngine:
         else:
             _progress_cb(start_index, total_points)
 
-        print(f"[GVI] Processing {len(points_to_process)} points...")
+        _log("INFO", f"Processing {len(points_to_process)} points...")
 
         asyncio.run(
             self._run_analysis_async(
