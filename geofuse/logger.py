@@ -62,7 +62,7 @@ _job_state_lock = threading.RLock()
 # Non-blocking producer/consumer pipeline. ``log()`` is the producer (microseconds
 # per call); a single daemon listener thread is the consumer that does the
 # (potentially blocking) file I/O off the worker's critical path.
-_log_queue: "queue.Queue[tuple[str, str, str] | None]" = queue.Queue()
+_log_queue: queue.Queue[tuple[str, str, str] | None] = queue.Queue()
 _listener_thread: threading.Thread | None = None
 _listener_lock = threading.Lock()
 
@@ -163,15 +163,13 @@ def get_logger(engine: str):
 
     def log(level: str, msg: str) -> None:
         color = _ANSI.get(level, "")
-        colored_line = (
-            f"{color}{_ANSI['BOLD']}[{tag} {level}]{_ANSI['RESET']} {msg}"
-        )
+        colored_line = f"{color}{_ANSI['BOLD']}[{tag} {level}]{_ANSI['RESET']} {msg}"
         plain_line = _ANSI_ESCAPE_RE.sub("", f"[{tag} {level}] {msg}")
         job_id = getattr(_current_job, "job_id", None)
         if job_id is None:
             return  # Unbound: silently drop. Engines are bound for their
-                     # entire runner lifecycle so init logs still land in
-                     # the correct job's file.
+            # entire runner lifecycle so init logs still land in
+            # the correct job's file.
         try:
             _log_queue.put_nowait((job_id, colored_line, plain_line))
         except queue.Full:

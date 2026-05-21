@@ -15,7 +15,6 @@ from helpers import (
     RESTART_SESSION_KEY,
     apply_buffer_m,
     load_vector_upload_sessions,
-    rasterize_points_for_preview,
     render_job_restart_panel,
 )
 from map_preview import (
@@ -80,9 +79,7 @@ def _ndvi_scan_outputs(output_dir: str) -> dict[str, dict]:
 
             results_gdf = None
             if os.path.isfile(gpkg_path):
-                results_gdf = reproject_geodataframe_to_wgs84(
-                    gpd.read_file(gpkg_path)
-                )
+                results_gdf = reproject_geodataframe_to_wgs84(gpd.read_file(gpkg_path))
             elif os.path.isfile(geojson_path):
                 results_gdf = reproject_geodataframe_to_wgs84(
                     gpd.read_file(geojson_path)
@@ -90,9 +87,7 @@ def _ndvi_scan_outputs(output_dir: str) -> dict[str, dict]:
 
             if results_gdf is not None and not results_gdf.empty:
                 raw_geom = results_gdf.geometry.union_all().envelope
-                raw_gdf = gpd.GeoDataFrame(
-                    {"geometry": [raw_geom]}, crs="EPSG:4326"
-                )
+                raw_gdf = gpd.GeoDataFrame({"geometry": [raw_geom]}, crs="EPSG:4326")
             elif tif_path:
                 w, s, e, n = transform_bounds(crs, "EPSG:4326", *b)
                 raw_gdf = gpd.GeoDataFrame(
@@ -122,8 +117,7 @@ def _ndvi_restart_summary_lines(p: dict) -> list[str]:
     ]
     if mode == "range":
         lines.append(
-            f"**Date range:** {p.get('start_date', '?')} → "
-            f"{p.get('end_date', '?')}"
+            f"**Date range:** {p.get('start_date', '?')} → " f"{p.get('end_date', '?')}"
         )
     elif mode == "specific":
         lines.append(
@@ -222,7 +216,17 @@ def _render_ndvi_restart_panel(store, executor, output_dir) -> None:
 
     render_job_restart_panel(
         rec,
-        accept_types=["geojson", "json", "gpkg", "shp", "dbf", "shx", "prj", "cpg", "zip"],
+        accept_types=[
+            "geojson",
+            "json",
+            "gpkg",
+            "shp",
+            "dbf",
+            "shx",
+            "prj",
+            "cpg",
+            "zip",
+        ],
         summary_lines=_ndvi_restart_summary_lines(p),
         extra_inputs_renderer=None,
         on_confirm=_on_confirm,

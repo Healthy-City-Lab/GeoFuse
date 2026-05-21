@@ -276,8 +276,7 @@ class GVIEngine:
         except Exception as e:
             _log(
                 "ERROR",
-                f"  Tensor build failed for {short}…: "
-                f"{type(e).__name__}: {e}",
+                f"  Tensor build failed for {short}…: " f"{type(e).__name__}: {e}",
             )
             return self._empty_result(pt, search_lat, search_lon)
 
@@ -306,8 +305,7 @@ class GVIEngine:
             except Exception as e:
                 _log(
                     "ERROR",
-                    f"  GPU inference failed for {short}…: "
-                    f"{type(e).__name__}: {e}",
+                    f"  GPU inference failed for {short}…: " f"{type(e).__name__}: {e}",
                 )
                 return self._empty_result(pt, search_lat, search_lon)
 
@@ -462,10 +460,7 @@ class GVIEngine:
                     # Defensive: release cached blocks back to the device
                     # periodically so long-running jobs don't accumulate
                     # allocator fragmentation.
-                    if (
-                        curr % _EMPTY_CACHE_EVERY_N == 0
-                        and self.device.type == "cuda"
-                    ):
+                    if curr % _EMPTY_CACHE_EVERY_N == 0 and self.device.type == "cuda":
                         try:
                             import torch
 

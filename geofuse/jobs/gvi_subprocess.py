@@ -34,7 +34,7 @@ import traceback
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # only for type hints — runtime import would tie this module
-    import multiprocessing as _mp  # to multiprocessing's spawn path unnecessarily
+    pass  # to multiprocessing's spawn path unnecessarily
 
 # Message tags (kept as short strings for legibility in queue dumps / logs)
 MSG_PROGRESS = "progress"

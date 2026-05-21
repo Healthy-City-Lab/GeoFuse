@@ -16,7 +16,6 @@ from helpers import (
     apply_buffer_m,
     generate_clustered_grid,
     load_vector_upload_sessions,
-    rasterize_points_for_preview,
     render_job_restart_panel,
 )
 from map_preview import (
@@ -31,7 +30,6 @@ from shapely.geometry import box as shapely_box
 from streamlit_folium import st_folium
 
 from geofuse.crs_utils import reproject_geodataframe_to_wgs84
-from geofuse.jobs.runners import run_gvi
 from geofuse.vector_io import geometry_sha256
 
 
@@ -134,9 +132,7 @@ def _gvi_scan_outputs(output_dir: str) -> dict[str, dict]:
 
             if results is not None and not results.empty:
                 raw_geom = results.geometry.union_all().envelope
-                raw_gdf = gpd.GeoDataFrame(
-                    {"geometry": [raw_geom]}, crs="EPSG:4326"
-                )
+                raw_gdf = gpd.GeoDataFrame({"geometry": [raw_geom]}, crs="EPSG:4326")
             elif single_tif:
                 with rasterio.open(single_tif) as src:
                     b = src.bounds
@@ -341,7 +337,17 @@ def _render_gvi_restart_panel(
 
     render_job_restart_panel(
         rec,
-        accept_types=["geojson", "json", "gpkg", "shp", "dbf", "shx", "prj", "cpg", "zip"],
+        accept_types=[
+            "geojson",
+            "json",
+            "gpkg",
+            "shp",
+            "dbf",
+            "shx",
+            "prj",
+            "cpg",
+            "zip",
+        ],
         summary_lines=_gvi_restart_summary_lines(p),
         extra_inputs_renderer=_extra_inputs if had_api_key else None,
         on_confirm=_on_confirm,
@@ -598,11 +604,7 @@ def render(output_dir: str, parent_dir: str) -> None:
                         key=f"openlog_{rec.id}",
                         use_container_width=True,
                         disabled=not have_file,
-                        help=(
-                            log_path
-                            if have_file
-                            else "Log file not found on disk."
-                        ),
+                        help=(log_path if have_file else "Log file not found on disk."),
                     ):
                         try:
                             open_path_in_default_editor(log_path)
@@ -627,10 +629,11 @@ def render(output_dir: str, parent_dir: str) -> None:
                         args=(rec.id,),
                     )
                 else:
-                    restart_eligible = (
-                        rec.type in ("gvi", "ndvi", "ndvi_column")
-                        and rec.status in ("interrupted", "cancelled", "error")
-                    )
+                    restart_eligible = rec.type in (
+                        "gvi",
+                        "ndvi",
+                        "ndvi_column",
+                    ) and rec.status in ("interrupted", "cancelled", "error")
                     btn_cols = st.columns(2, gap="medium")
                     if restart_eligible:
                         restart_col, dismiss_col = btn_cols[0], btn_cols[1]

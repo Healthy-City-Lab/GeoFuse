@@ -63,7 +63,7 @@ def geometry_sha256(gdf: gpd.GeoDataFrame) -> str:
     """
     h = hashlib.sha256()
     # str(crs) covers EPSG codes and full WKT; falls back to "None" when unset.
-    h.update(f"crs:{gdf.crs}\n".encode("utf-8"))
+    h.update(f"crs:{gdf.crs}\n".encode())
     # Sort by index so row order can't change the hash.
     for _, geom in gdf.geometry.sort_index().items():
         if geom is None or geom.is_empty:

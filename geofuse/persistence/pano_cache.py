@@ -62,9 +62,7 @@ class PanoCache:
         with self._lock:
             if self._mem_loaded:
                 return len(self._mem)
-            rows = self._conn.execute(
-                "SELECT pano_id, veg, ter FROM panos"
-            ).fetchall()
+            rows = self._conn.execute("SELECT pano_id, veg, ter FROM panos").fetchall()
             self._mem = {pid: (float(v), float(t)) for pid, v, t in rows}
             self._mem_loaded = True
             return len(self._mem)
