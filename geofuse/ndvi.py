@@ -17,6 +17,7 @@ from rasterio.transform import array_bounds
 from rasterio.warp import Resampling, calculate_default_transform, reproject
 from shapely.geometry import box, mapping
 
+from .crs_utils import reproject_geodataframe_to_wgs84, select_grid_crs
 from .logger import get_logger
 
 _log = get_logger("NDVI")
@@ -292,9 +293,11 @@ class NDVIEngine:
                 "message": "Enable at least one output format (GeoTIFF, GeoPackage, or GeoJSON).",
             }
 
-        # 1. Convert Geometry
+        # 1. Convert Geometry — reproject_geodataframe_to_wgs84 raises on
+        # malformed inputs (geographic CRS metadata + metre-valued coords) so
+        # direct API callers get the same guard the UI runner gets.
         if isinstance(geometry, gpd.GeoDataFrame):
-            geom_wgs84 = geometry.to_crs(epsg=4326)
+            geom_wgs84 = reproject_geodataframe_to_wgs84(geometry)
             js = json.loads(geom_wgs84.to_json())
             js.pop("crs", None)
             aoi = ee.FeatureCollection(js["features"]).geometry()
