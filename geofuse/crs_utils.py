@@ -10,12 +10,138 @@ from __future__ import annotations
 
 import geopandas as gpd
 import numpy as np
+import rasterio
 from pyproj import CRS as PyProjCRS
 from pyproj import Geod, Transformer
+from rasterio.transform import array_bounds
+from rasterio.warp import Resampling, calculate_default_transform, reproject
+from rasterio.warp import transform as rio_warp_transform
 from shapely.ops import transform as shapely_xy_transform
 
 # Single canonical CRS for web maps, Earth Engine clip geometries, and GVI/NDVI download.
 WGS84_EPSG = "EPSG:4326"
+
+
+def metres_per_degree_at_lat(lat_deg: float) -> tuple[float, float]:
+    """Geodesic metres-per-degree at ``lat_deg`` for square-metre raster math.
+
+    Returns ``(m_per_deg_lon, m_per_deg_lat)`` using the standard WGS84 series
+    (third-order in latitude). Replaces several copies of this formula that
+    had drifted in precision across the engines and UI hint helpers; one
+    canonical value here keeps grid sizing, raster reprojection, and the
+    size-estimate banners consistent.
+    """
+    lat_rad = np.radians(lat_deg)
+    m_per_deg_lat = 111132.954 - 559.822 * np.cos(2 * lat_rad)
+    m_per_deg_lon = 111412.84 * np.cos(lat_rad) - 93.5 * np.cos(3 * lat_rad)
+    return float(m_per_deg_lon), float(m_per_deg_lat)
+
+
+def select_grid_crs_with_warning(
+    gdf: gpd.GeoDataFrame,
+    log_fn,
+    *,
+    role: str = "Grid CRS",
+    threshold: float = 0.02,
+):
+    """:func:`select_grid_crs` + the standard "warn if > 2 %" emit pattern.
+
+    GVI and NDVI both call ``select_grid_crs`` and emit the same WARN/INFO
+    pair depending on the measured distortion. ``log_fn`` is the engine's
+    ``_log`` callable so each engine's messages still appear under its own
+    logger name (e.g. ``[GVI]`` vs ``[NDVI]``); only the boilerplate is shared.
+    """
+    crs, distortion, choice_name = select_grid_crs(gdf)
+    if distortion > threshold:
+        log_fn(
+            "WARN",
+            f"{role} distortion ~ {distortion * 100:.2f}% across the extent "
+            f"({choice_name}). Pixel scale will drift across widely-spaced tiles.",
+        )
+    else:
+        log_fn(
+            "INFO",
+            f"{role}: {choice_name} (max planar distortion ~ "
+            f"{distortion * 100:.3f}%).",
+        )
+    return crs, float(distortion), choice_name
+
+
+def crs_to_ee_string(crs) -> str:
+    """Earth-Engine-friendly CRS string: prefer ``EPSG:<n>``, fall back to WKT.
+
+    EE accepts WKT for non-standard projections (the LCC / Polar Stereographic
+    that :func:`select_grid_crs` synthesises for wide-span or polar extents),
+    so every CRS this module returns can be passed through to
+    ``ee_export_image``. Lives here next to the CRS-selection logic so the EE
+    wrapping is one tidy unit.
+    """
+    epsg = crs.to_epsg()
+    if epsg is not None:
+        return f"EPSG:{epsg}"
+    return crs.to_wkt()
+
+
+def reproject_raster_to_wgs84(
+    src_path: str,
+    dst_path: str,
+    *,
+    target_resolution_m: float,
+    resampling: Resampling = Resampling.bilinear,
+) -> None:
+    """Reproject a planar-CRS GeoTIFF to EPSG:4326 with per-latitude aspect-ratio correction.
+
+    Earth Engine (and any other producer that writes in a metre-based CRS such
+    as UTM, LCC, or Polar Stereographic) places pixels on a square-metre grid.
+    A naive reprojection to geographic coordinates yields rectangular pixels
+    because a degree of longitude is shorter than a degree of latitude. This
+    function derives the exact metres-per-degree ratio at the tile's centroid
+    latitude (via :func:`metres_per_degree_at_lat`) and forces an explicit
+    square-metre output resolution.
+
+    Defaults to bilinear resampling — appropriate for continuous bands like
+    NDVI. Pass ``resampling=Resampling.nearest`` for QA / classification bands.
+    """
+    with rasterio.open(src_path) as src:
+        left, bottom, right, top = array_bounds(src.height, src.width, src.transform)
+        cx, cy = (left + right) / 2, (bottom + top) / 2
+        lon_c, lat_c = rio_warp_transform(src.crs, WGS84_EPSG, [cx], [cy])
+        avg_lat = lat_c[0]
+
+        m_per_deg_lon, m_per_deg_lat = metres_per_degree_at_lat(avg_lat)
+        res_x_deg = target_resolution_m / m_per_deg_lon
+        res_y_deg = target_resolution_m / m_per_deg_lat
+
+        dst_transform, width, height = calculate_default_transform(
+            src.crs,
+            WGS84_EPSG,
+            src.width,
+            src.height,
+            *src.bounds,
+            resolution=(res_x_deg, res_y_deg),
+        )
+
+        kwargs = src.meta.copy()
+        kwargs.update(
+            {
+                "crs": WGS84_EPSG,
+                "transform": dst_transform,
+                "width": width,
+                "height": height,
+            }
+        )
+
+        with rasterio.open(dst_path, "w", **kwargs) as dst:
+            for i in range(1, src.count + 1):
+                reproject(
+                    source=rasterio.band(src, i),
+                    destination=rasterio.band(dst, i),
+                    src_transform=src.transform,
+                    src_crs=src.crs,
+                    dst_transform=dst_transform,
+                    dst_crs=WGS84_EPSG,
+                    resampling=resampling,
+                )
 
 
 def _raise_if_geographic_coords_outside_degree_range(gdf: gpd.GeoDataFrame) -> None:

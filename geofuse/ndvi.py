@@ -14,13 +14,16 @@ import numpy as np
 import rasterio
 from pyproj import Transformer
 from rasterio.merge import merge
-from rasterio.transform import array_bounds
-from rasterio.warp import Resampling, calculate_default_transform, reproject
 from shapely.geometry import MultiPolygon, Polygon, box, mapping
 from shapely.ops import transform as shapely_transform
 from shapely.strtree import STRtree
 
-from .crs_utils import reproject_geodataframe_to_wgs84, select_grid_crs
+from .crs_utils import (
+    crs_to_ee_string,
+    reproject_geodataframe_to_wgs84,
+    reproject_raster_to_wgs84,
+    select_grid_crs_with_warning,
+)
 from .logger import get_logger
 
 _log = get_logger("NDVI")
@@ -114,45 +117,19 @@ def _write_ndvi_sidecar(
     return sidecar_path
 
 
-def _crs_to_ee_string(crs) -> str:
-    """Earth-Engine-friendly CRS string: prefer ``EPSG:<n>``, fall back to WKT.
-
-    EE accepts WKT for non-standard projections (the LCC/Polar Stereographic
-    that ``select_grid_crs`` synthesises for wide-span or polar extents), so
-    every CRS the selector returns can be passed through to ``ee_export_image``.
-    """
-    epsg = crs.to_epsg()
-    if epsg is not None:
-        return f"EPSG:{epsg}"
-    return crs.to_wkt()
-
-
 def _select_export_crs(geom_wgs84_gdf: gpd.GeoDataFrame):
     """Pick an EE export CRS for true-ground-metre pixels at any latitude.
 
-    Wraps :func:`geofuse.crs_utils.select_grid_crs` and warns when the
-    resulting planar CRS would distort 1000 m steps by more than 2%, matching
-    the warning surface ``generate_clustered_grid`` uses on the GVI path.
-
-    Returns ``(ee_string, crs_obj, distortion, choice_name)``. ``crs_obj`` is
-    the pyproj CRS so callers can reproject geometries for cluster-aware
-    tiling without re-running the selector.
+    Thin NDVI-side adapter on top of :func:`select_grid_crs_with_warning`
+    that also formats the CRS for Earth Engine. Returns
+    ``(ee_string, crs_obj, distortion, choice_name)``; ``crs_obj`` is the
+    pyproj CRS so the cluster-aware tile builder can reproject geometries
+    without re-running the selector.
     """
-    crs, distortion, choice_name = select_grid_crs(geom_wgs84_gdf)
-    if distortion > 0.02:
-        _log(
-            "WARN",
-            f"Export CRS distortion ~ {distortion * 100:.2f}% across the extent "
-            f"({choice_name}). Pixel scale will drift slightly across widely-spaced "
-            f"tiles.",
-        )
-    else:
-        _log(
-            "INFO",
-            f"Export CRS: {choice_name} (max planar distortion ~ "
-            f"{distortion * 100:.3f}%).",
-        )
-    return _crs_to_ee_string(crs), crs, float(distortion), choice_name
+    crs, distortion, choice_name = select_grid_crs_with_warning(
+        geom_wgs84_gdf, _log, role="Export CRS"
+    )
+    return crs_to_ee_string(crs), crs, distortion, choice_name
 
 
 def _build_planar_tiles(
@@ -278,69 +255,6 @@ class NDVIEngine:
             .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", cloud_max))
             .map(self.prep_ndvi)
         )
-
-    def _reproject_tile_to_4326(
-        self, src_path: str, dst_path: str, resolution: int
-    ) -> None:
-        """Reproject a planar-CRS GeoTIFF to 4326 with per-latitude aspect-ratio correction.
-
-        Earth Engine exports arrive in whatever planar CRS we asked for
-        (UTM / LCC / Polar Stereographic via :func:`select_grid_crs`, or the
-        legacy ``EPSG:3857`` fallback). A naive reprojection produces
-        non-square pixels in geographic space, so this method derives the
-        exact degree-per-metre scale at the tile's centroid latitude and
-        forces an explicit square-metre output resolution.
-
-        Uses :data:`Resampling.bilinear` because NDVI is a continuous index;
-        QA / classification bands would need nearest-neighbour.
-        """
-        from rasterio.warp import transform as warp_transform
-
-        with rasterio.open(src_path) as src:
-            left, bottom, right, top = array_bounds(
-                src.height, src.width, src.transform
-            )
-            cx, cy = (left + right) / 2, (bottom + top) / 2
-            lon_c, lat_c = warp_transform(src.crs, "EPSG:4326", [cx], [cy])
-            avg_lat = lat_c[0]
-
-            lat_rad = np.radians(avg_lat)
-            m_per_deg_lat = 111132.954 - 559.822 * np.cos(2 * lat_rad)
-            m_per_deg_lon = 111412.84 * np.cos(lat_rad) - 93.5 * np.cos(3 * lat_rad)
-
-            res_x_deg = resolution / m_per_deg_lon
-            res_y_deg = resolution / m_per_deg_lat
-
-            dst_transform, width, height = calculate_default_transform(
-                src.crs,
-                "EPSG:4326",
-                src.width,
-                src.height,
-                *src.bounds,
-                resolution=(res_x_deg, res_y_deg),
-            )
-
-            kwargs = src.meta.copy()
-            kwargs.update(
-                {
-                    "crs": "EPSG:4326",
-                    "transform": dst_transform,
-                    "width": width,
-                    "height": height,
-                }
-            )
-
-            with rasterio.open(dst_path, "w", **kwargs) as dst:
-                for i in range(1, src.count + 1):
-                    reproject(
-                        source=rasterio.band(src, i),
-                        destination=rasterio.band(dst, i),
-                        src_transform=src.transform,
-                        src_crs=src.crs,
-                        dst_transform=dst_transform,
-                        dst_crs="EPSG:4326",
-                        resampling=Resampling.bilinear,
-                    )
 
     def _raster_to_ndvi_points(
         self,
@@ -656,7 +570,9 @@ class NDVIEngine:
             )
 
             # 4. Reproject to EPSG:4326 with aspect-ratio correction
-            self._reproject_tile_to_4326(temp_tif, final_tif, resolution)
+            reproject_raster_to_wgs84(
+                temp_tif, final_tif, target_resolution_m=resolution
+            )
 
             if os.path.exists(temp_tif):
                 os.remove(temp_tif)
@@ -809,7 +725,9 @@ class NDVIEngine:
                             os.remove(tile_temp)
                         return {"status": "cancelled", "message": "Cancelled by user"}
 
-                    self._reproject_tile_to_4326(tile_temp, tile_final, resolution)
+                    reproject_raster_to_wgs84(
+                        tile_temp, tile_final, target_resolution_m=resolution
+                    )
 
                     tile_files.append(tile_final)
 

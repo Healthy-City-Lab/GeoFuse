@@ -27,7 +27,10 @@ from PIL import Image as PILImage
 from shapely.geometry import box as shapely_box
 from streamlit_folium import st_folium
 
-from geofuse.crs_utils import reproject_geodataframe_to_wgs84
+from geofuse.crs_utils import (
+    metres_per_degree_at_lat,
+    reproject_geodataframe_to_wgs84,
+)
 from geofuse.jobs.runners import run_ndvi, run_ndvi_column
 from geofuse.vector_io import geometry_sha256
 
@@ -260,8 +263,7 @@ def _ndvi_size_hint(buffer_m: int, resolution_m: int) -> None:
         bbox_maxx = max(bbox_maxx, maxx)
         bbox_maxy = max(bbox_maxy, maxy)
         cent_lat = (miny + maxy) / 2.0
-        m_per_deg_lat = 111000.0
-        m_per_deg_lon = 111000.0 * float(np.cos(np.radians(cent_lat)))
+        m_per_deg_lon, m_per_deg_lat = metres_per_degree_at_lat(cent_lat)
         # bbox area in metres (NDVI rasterizes the bbox of the buffered geom)
         width_m = (maxx - minx) * m_per_deg_lon + 2 * max(buffer_m, 0)
         height_m = (maxy - miny) * m_per_deg_lat + 2 * max(buffer_m, 0)

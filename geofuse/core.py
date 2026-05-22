@@ -10,7 +10,12 @@ from rasterio.transform import from_bounds, from_origin, xy
 from shapely.geometry import MultiPoint, MultiPolygon, Polygon
 from shapely.strtree import STRtree
 
-from .crs_utils import WGS84_EPSG, reproject_geodataframe_to_wgs84, select_grid_crs
+from .crs_utils import (
+    WGS84_EPSG,
+    metres_per_degree_at_lat,
+    reproject_geodataframe_to_wgs84,
+    select_grid_crs_with_warning,
+)
 from .logger import get_logger
 
 _log_core = get_logger("GVI")
@@ -97,9 +102,7 @@ def generate_raster_grid(gdf_4326, spacing_meters):
 
     minx, miny, maxx, maxy = geom_union.bounds
     center_lat = (miny + maxy) / 2.0
-    lat_rad = np.radians(center_lat)
-    m_per_deg_lat = 111132.92 - 559.82 * np.cos(2 * lat_rad)
-    m_per_deg_lon = 111412.84 * np.cos(lat_rad) - 93.5 * np.cos(3 * lat_rad)
+    m_per_deg_lon, m_per_deg_lat = metres_per_degree_at_lat(center_lat)
     res_x = spacing_meters / m_per_deg_lon
     res_y = spacing_meters / m_per_deg_lat
     width = max(1, int(np.ceil(float(maxx - minx) / float(res_x))))
@@ -171,20 +174,9 @@ def generate_clustered_grid(
         entry per cluster: bounds, height, width, transform — used by the
         per-cluster GeoTIFF writer).
     """
-    grid_crs, distortion, choice_name = select_grid_crs(gdf_4326)
-    if distortion > 0.02:
-        _log_core(
-            "WARN",
-            f"Grid CRS distortion ~ {distortion * 100:.2f}% across the extent "
-            f"({choice_name}). Sampling accuracy is preserved but planar "
-            f"distances may drift across widely-spaced clusters.",
-        )
-    else:
-        _log_core(
-            "INFO",
-            f"Grid CRS: {choice_name} (max planar distortion ~ "
-            f"{distortion * 100:.3f}%).",
-        )
+    grid_crs, distortion, choice_name = select_grid_crs_with_warning(
+        gdf_4326, _log_core, role="Grid CRS"
+    )
     gdf_m = gdf_4326.to_crs(grid_crs)
     buffered = gdf_m.geometry.union_all()
     if buffer_m > 0:
