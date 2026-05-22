@@ -13,7 +13,6 @@ import geopandas as gpd
 import numpy as np
 import rasterio
 from pyproj import Transformer
-from rasterio.merge import merge
 from shapely.geometry import MultiPolygon, Polygon, box, mapping
 from shapely.ops import transform as shapely_transform
 from shapely.strtree import STRtree
@@ -23,6 +22,7 @@ from .crs_utils import (
     reproject_geodataframe_to_wgs84,
     reproject_raster_to_wgs84,
     select_grid_crs_with_warning,
+    stream_mosaic_to_geotiff,
 )
 from .logger import get_logger
 
@@ -765,37 +765,37 @@ class NDVIEngine:
                 ndvi_progress_callback,
                 sub_progress=0.72,
                 phase="Mosaicking rasters",
+                tiles=(0, len(tile_files)),
                 clear_bracket=True,
             )
 
             try:
-                src_files_to_mosaic = []
-                for tile_file in tile_files:
-                    src = rasterio.open(tile_file)
-                    src_files_to_mosaic.append(src)
+                # Stream-mosaic the per-tile rasters into the final GeoTIFF.
+                # Memory ceiling is one tile at a time (vs. ``rasterio.merge``,
+                # which would materialise the entire mosaic up front and OOM
+                # on national-scale outputs).
+                def _mosaic_progress(k: int, n: int) -> None:
+                    span = 0.78 - 0.72
+                    _emit_ndvi_progress(
+                        ndvi_progress_callback,
+                        sub_progress=0.72 + (span * k / n if n else 0.0),
+                        phase="Mosaicking rasters",
+                        tiles=(k, n),
+                    )
 
-                mosaic, out_trans = merge(src_files_to_mosaic, nodata=-9999)
-
-                out_meta = src_files_to_mosaic[0].meta.copy()
-                out_meta.update(
-                    {
-                        "height": mosaic.shape[1],
-                        "width": mosaic.shape[2],
-                        "transform": out_trans,
-                    }
+                stream_mosaic_to_geotiff(
+                    tile_files,
+                    final_tif,
+                    nodata=-9999,
+                    progress_cb=_mosaic_progress,
                 )
 
                 _emit_ndvi_progress(
                     ndvi_progress_callback,
                     sub_progress=0.78,
                     phase="Mosaicking rasters",
+                    clear_bracket=True,
                 )
-
-                with rasterio.open(final_tif, "w", **out_meta) as dest:
-                    dest.write(mosaic)
-
-                for src in src_files_to_mosaic:
-                    src.close()
 
                 _log("OK", f"Mosaic complete: {final_tif}")
                 mosaic_ok = True

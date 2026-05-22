@@ -8,14 +8,18 @@ which matches Leaflet/Folium and ``generate_raster_grid`` in ``geofuse.core``.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import geopandas as gpd
 import numpy as np
 import rasterio
 from pyproj import CRS as PyProjCRS
 from pyproj import Geod, Transformer
-from rasterio.transform import array_bounds
+from rasterio.transform import array_bounds, from_bounds
 from rasterio.warp import Resampling, calculate_default_transform, reproject
 from rasterio.warp import transform as rio_warp_transform
+from rasterio.windows import from_bounds as window_from_bounds
+from rasterio.windows import transform as window_transform
 from shapely.ops import transform as shapely_xy_transform
 
 # Single canonical CRS for web maps, Earth Engine clip geometries, and GVI/NDVI download.
@@ -80,6 +84,109 @@ def crs_to_ee_string(crs) -> str:
     if epsg is not None:
         return f"EPSG:{epsg}"
     return crs.to_wkt()
+
+
+def stream_mosaic_to_geotiff(
+    tile_paths: list[str],
+    dst_path: str,
+    *,
+    nodata: float = -9999,
+    resampling: Resampling = Resampling.bilinear,
+    progress_cb: Callable[[int, int], None] | None = None,
+) -> int:
+    """Stream-mosaic same-CRS GeoTIFF tiles into one output via windowed writes.
+
+    Never holds more than one tile's worth of pixels in memory at a time, so
+    national-scale outputs don't OOM (vs. ``rasterio.merge.merge`` which
+    materialises the entire mosaic up front). All tiles must share the same
+    CRS and band count; minor pixel-size differences between tiles — e.g.
+    WGS84 tiles reprojected at different centroid latitudes — are resampled
+    into the unified grid via ``resampling``. The first tile defines the
+    output's pixel size, dtype, and band count.
+
+    ``progress_cb(k, n)`` fires after each tile lands; pass it to mirror
+    download-phase progress into the mosaic phase. Returns the number of
+    tiles written.
+    """
+    if not tile_paths:
+        raise ValueError("stream_mosaic_to_geotiff: tile_paths is empty.")
+
+    tile_profiles: list[dict] = []
+    for path in tile_paths:
+        with rasterio.open(path) as src:
+            tile_profiles.append(
+                {
+                    "path": path,
+                    "bounds": src.bounds,
+                    "transform": src.transform,
+                    "crs": src.crs,
+                    "dtype": src.dtypes[0],
+                    "count": src.count,
+                }
+            )
+
+    ref = tile_profiles[0]
+    union_left = min(p["bounds"].left for p in tile_profiles)
+    union_bottom = min(p["bounds"].bottom for p in tile_profiles)
+    union_right = max(p["bounds"].right for p in tile_profiles)
+    union_top = max(p["bounds"].top for p in tile_profiles)
+
+    pixel_w = abs(ref["transform"].a)
+    pixel_h = abs(ref["transform"].e)
+    out_width = max(1, int(round((union_right - union_left) / pixel_w)))
+    out_height = max(1, int(round((union_top - union_bottom) / pixel_h)))
+    out_transform = from_bounds(
+        union_left, union_bottom, union_right, union_top, out_width, out_height
+    )
+
+    dst_profile = {
+        "driver": "GTiff",
+        "height": out_height,
+        "width": out_width,
+        "count": ref["count"],
+        "dtype": ref["dtype"],
+        "crs": ref["crs"],
+        "transform": out_transform,
+        "nodata": nodata,
+    }
+
+    n = len(tile_profiles)
+    written = 0
+    with rasterio.open(dst_path, "w", **dst_profile) as dst:
+        for tp in tile_profiles:
+            win = (
+                window_from_bounds(*tp["bounds"], transform=out_transform)
+                .round_offsets()
+                .round_lengths()
+            )
+            if win.width <= 0 or win.height <= 0:
+                if progress_cb is not None:
+                    progress_cb(written, n)
+                continue
+            win_transform = window_transform(win, out_transform)
+            with rasterio.open(tp["path"]) as src:
+                for band in range(1, src.count + 1):
+                    dst_arr = np.full(
+                        (win.height, win.width),
+                        fill_value=nodata,
+                        dtype=src.dtypes[band - 1],
+                    )
+                    reproject(
+                        source=rasterio.band(src, band),
+                        destination=dst_arr,
+                        src_transform=src.transform,
+                        src_crs=src.crs,
+                        dst_transform=win_transform,
+                        dst_crs=ref["crs"],
+                        resampling=resampling,
+                        src_nodata=nodata,
+                        dst_nodata=nodata,
+                    )
+                    dst.write(dst_arr, indexes=band, window=win)
+            written += 1
+            if progress_cb is not None:
+                progress_cb(written, n)
+    return written
 
 
 def reproject_raster_to_wgs84(
