@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import time
 import uuid
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 import ee
@@ -12,11 +14,9 @@ import geemap
 import geopandas as gpd
 import numpy as np
 import rasterio
-from pyproj import Transformer
-from shapely.geometry import MultiPolygon, Polygon, box, mapping
-from shapely.ops import transform as shapely_transform
-from shapely.strtree import STRtree
+from shapely.geometry import mapping
 
+from .core import build_planar_tiles
 from .crs_utils import (
     crs_to_ee_string,
     reproject_geodataframe_to_wgs84,
@@ -24,6 +24,7 @@ from .crs_utils import (
     select_grid_crs_with_warning,
     stream_mosaic_to_geotiff,
 )
+from .jobs import progress_interval_s
 from .logger import get_logger
 
 _log = get_logger("NDVI")
@@ -33,6 +34,13 @@ _log = get_logger("NDVI")
 # TODO: NDVI_TEMPORAL - Add time-series analysis for seasonal greenery changes
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Concurrent tile-download workers. Earth Engine allows several parallel
+# ``ee_export_image`` calls per user well above this; the cap exists to avoid
+# saturating local sockets and to keep the post-download rasterio decode +
+# reproject step from contending too heavily for the GIL on a small machine.
+# Mirrors the GVI engine's ``_MAX_CONCURRENT_POINTS = 4`` choice.
+_MAX_CONCURRENT_TILES = 4
 
 
 def _ndvi_tile_workspace(output_name: str) -> str:
@@ -130,82 +138,6 @@ def _select_export_crs(geom_wgs84_gdf: gpd.GeoDataFrame):
         geom_wgs84_gdf, _log, role="Export CRS"
     )
     return crs_to_ee_string(crs), crs, distortion, choice_name
-
-
-def _build_planar_tiles(
-    geom_wgs84_gdf: gpd.GeoDataFrame,
-    grid_crs,
-    max_tile_size_km: float,
-) -> list[dict]:
-    """Cluster-aware EE tile specs in true metres.
-
-    Decomposes the geometry (after a planar union) into connected polygon
-    components — each is treated as a cluster — and tiles every cluster's
-    bbox at ``max_tile_size_km`` step in the planar CRS. STRtree-culls
-    candidate tiles that don't intersect their cluster polygon, so scattered
-    national-scale inputs (e.g. one feature per province) no longer waste
-    Earth Engine calls on tiles over ocean or empty bbox regions. Non-polygon
-    inputs (raw points, lines) fall back to a single envelope cluster.
-
-    Returns a list of ``{cluster_id, tile_idx, tile_geom_4326}`` dicts where
-    ``tile_geom_4326`` is a shapely polygon ready for ``ee.Geometry``.
-    """
-    tile_size_m = float(max_tile_size_km) * 1000.0
-    if tile_size_m <= 0:
-        return []
-    gdf_planar = geom_wgs84_gdf.to_crs(grid_crs)
-    merged = gdf_planar.geometry.union_all()
-    if merged is None or merged.is_empty:
-        return []
-
-    if isinstance(merged, MultiPolygon):
-        cluster_polys: list = list(merged.geoms)
-    elif isinstance(merged, Polygon):
-        cluster_polys = [merged]
-    else:
-        # Raw points / lines: degrade gracefully to one envelope cluster so
-        # the rest of the pipeline still has a polygon to tile.
-        env = merged.envelope
-        cluster_polys = [env] if not env.is_empty else []
-
-    fwd = Transformer.from_crs(grid_crs, "EPSG:4326", always_xy=True)
-
-    def _to_4326(box_geom):
-        return shapely_transform(
-            lambda x, y, z=None: fwd.transform(x, y), box_geom
-        )
-
-    tiles: list[dict] = []
-    tile_idx_global = 0
-    for cid, poly in enumerate(cluster_polys):
-        if poly.is_empty:
-            continue
-        cmin_x, cmin_y, cmax_x, cmax_y = poly.bounds
-        candidate: list = []
-        x = cmin_x
-        while x < cmax_x:
-            x_end = min(x + tile_size_m, cmax_x)
-            y = cmin_y
-            while y < cmax_y:
-                y_end = min(y + tile_size_m, cmax_y)
-                candidate.append(box(x, y, x_end, y_end))
-                y = y_end
-            x = x_end
-        if not candidate:
-            continue
-        tree = STRtree(candidate)
-        keep_idx = tree.query(poly, predicate="intersects")
-        for ki in sorted(int(i) for i in keep_idx):
-            tiles.append(
-                {
-                    "cluster_id": cid,
-                    "tile_idx": tile_idx_global,
-                    "tile_geom_4326": _to_4326(candidate[ki]),
-                }
-            )
-            tile_idx_global += 1
-
-    return tiles
 
 
 class NDVIEngine:
@@ -424,7 +356,7 @@ class NDVIEngine:
         # inputs decompose into connected components, and tiles that fall over
         # empty bbox regions (ocean, gaps between provinces) are STRtree-culled
         # before they reach Earth Engine.
-        tiles = _build_planar_tiles(geom_for_crs, grid_crs, max_tile_size_km)
+        tiles = build_planar_tiles(geom_for_crs, grid_crs, max_tile_size_km)
         n_tiles = len(tiles)
         if n_tiles == 0:
             return {
@@ -648,6 +580,70 @@ class NDVIEngine:
             out["tif"] = final_tif
         return out
 
+    def _download_one_tile(
+        self,
+        tile_spec: dict,
+        ndvi_median,
+        work_dir: str,
+        resolution: int,
+        export_crs: str,
+        cancel_callback: Callable[[], bool] | None,
+    ) -> dict:
+        """Worker: one tile through Earth Engine + reproject to WGS84.
+
+        Runs on a ThreadPoolExecutor thread (see :meth:`_download_with_tiling`).
+        Returns ``{success, tile_final, idx, error}``; failures surface as
+        ``success=False`` rather than raising so a single bad tile can't sink
+        the whole batch. Cancel checks short-circuit at safe boundaries —
+        Earth Engine's HTTP call is one blocking step that can't be killed
+        mid-flight, so a freshly-cancelled run may still have a few in-flight
+        downloads finish and be discarded by the caller.
+        """
+        idx = int(tile_spec["tile_idx"])
+        tile_geom = tile_spec["tile_geom_4326"]
+        result: dict = {"success": False, "tile_final": None, "idx": idx, "error": None}
+
+        if cancel_callback and cancel_callback():
+            return result
+
+        tile_temp = os.path.join(work_dir, f"tile_{idx}_temp.tif")
+        tile_final = os.path.join(work_dir, f"tile_{idx}.tif")
+
+        try:
+            tile_aoi = _shapely_to_ee_geometry(tile_geom)
+            tile_ndvi = ndvi_median.clip(tile_aoi)
+            geemap.ee_export_image(
+                tile_ndvi.unmask(-9999),
+                filename=tile_temp,
+                scale=resolution,
+                crs=export_crs,
+                region=tile_aoi,
+                file_per_band=False,
+            )
+
+            if cancel_callback and cancel_callback():
+                if os.path.exists(tile_temp):
+                    os.remove(tile_temp)
+                return result
+
+            reproject_raster_to_wgs84(
+                tile_temp, tile_final, target_resolution_m=resolution
+            )
+            if os.path.exists(tile_temp):
+                os.remove(tile_temp)
+
+            result["success"] = True
+            result["tile_final"] = tile_final
+            return result
+        except Exception as e:
+            if os.path.exists(tile_temp):
+                try:
+                    os.remove(tile_temp)
+                except OSError:
+                    pass
+            result["error"] = f"{type(e).__name__}: {e}"
+            return result
+
     def _download_with_tiling(
         self,
         ndvi_median,
@@ -670,7 +666,7 @@ class NDVIEngine:
     ):
         """Download NDVI for a precomputed cluster-aware tile list and mosaic.
 
-        ``tiles`` is the output of :func:`_build_planar_tiles` — a list of
+        ``tiles`` is the output of :func:`geofuse.core.build_planar_tiles` — a list of
         ``{cluster_id, tile_idx, tile_geom_4326}`` dicts. Each tile is exported
         independently and mosaicked into one GeoTIFF; per-cluster GeoTIFF tile
         outputs are a separate downstream step (Phase 4).
@@ -695,58 +691,70 @@ class NDVIEngine:
         final_tif = os.path.join(folder, f"{output_name}_ndvi.tif")
 
         try:
-            for tile_spec in tiles:
-                idx = int(tile_spec["tile_idx"])
-                tile_geom = tile_spec["tile_geom_4326"]
+            # Parallel tile downloads. Each worker handles one tile end-to-end
+            # (Earth Engine export → reproject to WGS84). The ThreadPoolExecutor
+            # caps concurrency at ``_MAX_CONCURRENT_TILES`` so we don't saturate
+            # local sockets or oversubscribe EE per-user. Heartbeat emits are
+            # throttled by the shared :func:`progress_interval_s` so the UI
+            # bracket stays responsive without slamming the JobStore lock on
+            # big runs.
+            done_count = 0
+            last_emit_t = {"v": time.monotonic()}
+            interval_s = progress_interval_s(n_tiles)
 
-                if cancel_callback and cancel_callback():
-                    return {"status": "cancelled", "message": "Cancelled by user"}
+            def _emit_progress(k: int) -> None:
+                now = time.monotonic()
+                is_final = k >= n_tiles
+                if not is_final and now - last_emit_t["v"] < interval_s:
+                    return
+                last_emit_t["v"] = now
+                _emit_ndvi_progress(
+                    ndvi_progress_callback,
+                    sub_progress=0.70 * k / n_tiles if n_tiles else 0.0,
+                    phase="Downloading tiles",
+                    tiles=(k, n_tiles),
+                )
 
-                _log("INFO", f"Downloading tile {idx+1}/{n_tiles}...")
-
-                tile_aoi = _shapely_to_ee_geometry(tile_geom)
-                tile_ndvi = ndvi_median.clip(tile_aoi)
-
-                tile_temp = os.path.join(work_dir, f"tile_{idx}_temp.tif")
-                tile_final = os.path.join(work_dir, f"tile_{idx}.tif")
-
-                try:
-                    geemap.ee_export_image(
-                        tile_ndvi.unmask(-9999),
-                        filename=tile_temp,
-                        scale=resolution,
-                        crs=export_crs,
-                        region=tile_aoi,
-                        file_per_band=False,
-                    )
-
+            with ThreadPoolExecutor(
+                max_workers=_MAX_CONCURRENT_TILES,
+                thread_name_prefix="ndvi-tile",
+            ) as pool:
+                futures = {
+                    pool.submit(
+                        self._download_one_tile,
+                        ts,
+                        ndvi_median,
+                        work_dir,
+                        resolution,
+                        export_crs,
+                        cancel_callback,
+                    ): ts
+                    for ts in tiles
+                }
+                cancelled = False
+                for fut in as_completed(futures):
+                    res = fut.result()
+                    done_count += 1
+                    if res["success"] and res["tile_final"] is not None:
+                        tile_files.append(res["tile_final"])
+                    elif res.get("error"):
+                        _log(
+                            "WARN",
+                            f"Tile {res['idx'] + 1} failed: {res['error']}",
+                        )
+                    _emit_progress(done_count)
                     if cancel_callback and cancel_callback():
-                        if os.path.exists(tile_temp):
-                            os.remove(tile_temp)
-                        return {"status": "cancelled", "message": "Cancelled by user"}
+                        cancelled = True
+                        # Cancel any not-yet-running futures; in-flight tiles
+                        # finish on their own (EE export is one blocking call,
+                        # we can't kill it mid-flight) and their results are
+                        # discarded.
+                        for f in futures:
+                            if not f.done():
+                                f.cancel()
+                        break
 
-                    reproject_raster_to_wgs84(
-                        tile_temp, tile_final, target_resolution_m=resolution
-                    )
-
-                    tile_files.append(tile_final)
-
-                    if os.path.exists(tile_temp):
-                        os.remove(tile_temp)
-
-                    k = len(tile_files)
-                    _emit_ndvi_progress(
-                        ndvi_progress_callback,
-                        sub_progress=0.70 * k / n_tiles if n_tiles else 0.0,
-                        phase="Downloading tiles",
-                        tiles=(k, n_tiles),
-                    )
-
-                except Exception as e:
-                    _log("WARN", f"Tile {idx+1} failed: {e}")
-                    continue
-
-            if cancel_callback and cancel_callback():
+            if cancelled or (cancel_callback and cancel_callback()):
                 return {"status": "cancelled", "message": "Cancelled by user"}
 
             if not tile_files:

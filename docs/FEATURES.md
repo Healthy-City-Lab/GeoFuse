@@ -32,6 +32,7 @@
 * **Latitude-aware export CRS**: Earth Engine exports use an auto-selected planar CRS (UTM / two-parallel LCC / Polar Stereographic) so pixels are rasterised in true ground metres at any latitude; reprojection to WGS84 for delivery uses bilinear resampling.
 * **Cluster-aware tiling**: For nationally-scattered inputs, the engine dissolves the buffered geometry into connected components and tiles each component's bbox in true metres, dropping tiles that fall over empty bbox regions (ocean, gaps between provinces) before they reach Earth Engine.
 * **Streaming mosaic**: Per-tile rasters land in the final GeoTIFF one at a time via windowed writes. National-scale outputs no longer have to fit in RAM during the mosaic step. The mosaic progress bracket mirrors the download bracket so the UI heartbeat keeps ticking through the final stage.
+* **Parallel tile downloads**: Up to 4 tiles download from Earth Engine and reproject concurrently. A single failed tile is logged as a warning and skipped; the rest of the batch keeps going. Progress emits are throttled to a few seconds based on tile count so the UI heartbeat stays responsive on large-scale runs.
 * **GeoPackage Output Option**: GeoTIFF remains the default, but a `Save GeoPackage` checkbox writes `*_ndvi.gpkg` (layer `ndvi_samples`) alongside the raster for QGIS / GeoPandas consumption.
 * **Restart System**: Like GVI, NDVI jobs interrupted by a Streamlit restart appear as "Interrupted" and can be resumed by re-uploading the original study area.
 

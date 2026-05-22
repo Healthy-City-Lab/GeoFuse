@@ -5,9 +5,11 @@ import os
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+from pyproj import Transformer
 from rasterio import features
 from rasterio.transform import from_bounds, from_origin, xy
-from shapely.geometry import MultiPoint, MultiPolygon, Polygon
+from shapely.geometry import MultiPoint, MultiPolygon, Polygon, box
+from shapely.ops import transform as shapely_transform
 from shapely.strtree import STRtree
 
 from .crs_utils import (
@@ -300,3 +302,84 @@ def generate_clustered_grid(
     pts_4326["y"] = pts_4326.geometry.y.to_numpy()
 
     return pts_4326, base_meta
+
+
+def build_planar_tiles(
+    geom_wgs84_gdf: gpd.GeoDataFrame,
+    grid_crs,
+    max_tile_size_km: float,
+) -> list[dict]:
+    """Cluster-aware export tile specs in true planar metres.
+
+    The polygon-input counterpart to :func:`generate_clustered_grid`. Where
+    that builds a per-cluster *point* grid for sampling, this builds a
+    per-cluster *tile rectangle* grid for raster exports (Earth Engine, in
+    practice — but the helper itself has no EE coupling).
+
+    Decomposes the geometry into connected polygon components in
+    ``grid_crs``, tiles each component's bbox at ``max_tile_size_km`` step
+    in true metres, and STRtree-culls candidate tiles that don't intersect
+    their cluster polygon. Scattered national-scale inputs (e.g. one feature
+    per province) no longer spend export quota on tiles that fall over ocean
+    or empty bbox regions. Non-polygon inputs (raw points / lines) degrade
+    gracefully to one envelope cluster so the rest of the pipeline still has
+    a polygon to tile.
+
+    Returns a list of ``{cluster_id, tile_idx, tile_geom_4326}`` dicts;
+    ``tile_geom_4326`` is a shapely polygon (reprojected from ``grid_crs``
+    to EPSG:4326) ready to feed into ``ee.Geometry`` or any other consumer.
+    """
+    tile_size_m = float(max_tile_size_km) * 1000.0
+    if tile_size_m <= 0:
+        return []
+    gdf_planar = geom_wgs84_gdf.to_crs(grid_crs)
+    merged = gdf_planar.geometry.union_all()
+    if merged is None or merged.is_empty:
+        return []
+
+    if isinstance(merged, MultiPolygon):
+        cluster_polys: list = list(merged.geoms)
+    elif isinstance(merged, Polygon):
+        cluster_polys = [merged]
+    else:
+        env = merged.envelope
+        cluster_polys = [env] if not env.is_empty else []
+
+    fwd = Transformer.from_crs(grid_crs, WGS84_EPSG, always_xy=True)
+
+    def _to_4326(box_geom):
+        return shapely_transform(
+            lambda x, y, z=None: fwd.transform(x, y), box_geom
+        )
+
+    tiles: list[dict] = []
+    tile_idx_global = 0
+    for cid, poly in enumerate(cluster_polys):
+        if poly.is_empty:
+            continue
+        cmin_x, cmin_y, cmax_x, cmax_y = poly.bounds
+        candidate: list = []
+        x = cmin_x
+        while x < cmax_x:
+            x_end = min(x + tile_size_m, cmax_x)
+            y = cmin_y
+            while y < cmax_y:
+                y_end = min(y + tile_size_m, cmax_y)
+                candidate.append(box(x, y, x_end, y_end))
+                y = y_end
+            x = x_end
+        if not candidate:
+            continue
+        tree = STRtree(candidate)
+        keep_idx = tree.query(poly, predicate="intersects")
+        for ki in sorted(int(i) for i in keep_idx):
+            tiles.append(
+                {
+                    "cluster_id": cid,
+                    "tile_idx": tile_idx_global,
+                    "tile_geom_4326": _to_4326(candidate[ki]),
+                }
+            )
+            tile_idx_global += 1
+
+    return tiles
