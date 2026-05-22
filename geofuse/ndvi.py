@@ -67,6 +67,53 @@ def _shapely_to_ee_geometry(geom):
     return ee.Geometry(mapping(geom))
 
 
+def _write_ndvi_sidecar(
+    folder: str,
+    output_name: str,
+    *,
+    grid_crs,
+    export_crs: str,
+    export_crs_name: str,
+    export_distortion: float,
+    n_clusters: int,
+    tiles_total: int,
+    tiles_succeeded: int,
+    start_date: str,
+    end_date: str,
+    cloud_max: float,
+    resolution_m: int,
+    max_tile_size_km: float,
+    ee_collection: str,
+) -> str:
+    """Write ``{output_name}_ndvi.json`` capturing the parameters and grid CRS.
+
+    Mirrors GVI's ``_gvi.json`` so any downstream tool (fusion, custom
+    notebooks) can introspect an NDVI raster after the fact: which planar CRS
+    pixels were rasterised in, how much distortion that introduced, how many
+    clusters and tiles the input decomposed into, the exact date range, and
+    which Earth Engine ImageCollection was queried.
+    """
+    sidecar_path = os.path.join(folder, f"{output_name}_ndvi.json")
+    payload = {
+        "export_crs": export_crs,
+        "export_crs_name": export_crs_name,
+        "export_crs_wkt": grid_crs.to_wkt() if grid_crs is not None else None,
+        "distortion": float(export_distortion),
+        "n_clusters": int(n_clusters),
+        "tiles_total": int(tiles_total),
+        "tiles_succeeded": int(tiles_succeeded),
+        "start_date": str(start_date),
+        "end_date": str(end_date),
+        "cloud_max": float(cloud_max),
+        "resolution_m": int(resolution_m),
+        "max_tile_size_km": float(max_tile_size_km),
+        "ee_collection": ee_collection,
+    }
+    with open(sidecar_path, "w") as f:
+        json.dump(payload, f, indent=2)
+    return sidecar_path
+
+
 def _crs_to_ee_string(crs) -> str:
     """Earth-Engine-friendly CRS string: prefer ``EPSG:<n>``, fall back to WKT.
 
@@ -185,6 +232,12 @@ def _build_planar_tiles(
 
 
 class NDVIEngine:
+    #: Earth Engine ImageCollection ID used by :meth:`get_collection`. Exposed
+    #: as a class attribute so the sidecar JSON can record exactly which
+    #: dataset produced a given NDVI output (and so a subclass can override
+    #: the collection without re-implementing the wrapper).
+    EE_COLLECTION_ID = "COPERNICUS/S2_SR_HARMONIZED"
+
     def __init__(self, project_id=None):
         try:
             if project_id:
@@ -219,7 +272,7 @@ class NDVIEngine:
 
     def get_collection(self, aoi, start_date, end_date, cloud_max=10):
         return (
-            ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+            ee.ImageCollection(self.EE_COLLECTION_ID)
             .filterBounds(aoi)
             .filterDate(start_date, end_date)
             .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", cloud_max))
@@ -472,7 +525,7 @@ class NDVIEngine:
                 "INFO",
                 f"Single-tile download ({n_clusters} cluster(s), planar metres).",
             )
-            return self._download_single(
+            result = self._download_single(
                 ndvi_median,
                 aoi,
                 geometry,
@@ -488,30 +541,61 @@ class NDVIEngine:
                 write_geojson=write_geojson,
                 write_geopackage=write_geopackage,
             )
+        else:
+            _log(
+                "INFO",
+                f"Tiled download: {n_tiles} tiles across {n_clusters} cluster(s) "
+                f"(max {max_tile_size_km} km/tile).",
+            )
+            result = self._download_with_tiling(
+                ndvi_median,
+                aoi,
+                tiles,
+                output_name,
+                resolution,
+                folder,
+                max_tile_size_km,
+                export_crs=export_crs,
+                export_distortion=export_distortion,
+                export_crs_name=export_crs_name,
+                n_clusters=n_clusters,
+                cancel_callback=cancel_callback,
+                ndvi_progress_callback=ndvi_progress_callback,
+                write_geotiff=write_geotiff,
+                write_geojson=write_geojson,
+                write_geopackage=write_geopackage,
+            )
 
-        _log(
-            "INFO",
-            f"Tiled download: {n_tiles} tiles across {n_clusters} cluster(s) "
-            f"(max {max_tile_size_km} km/tile).",
-        )
-        return self._download_with_tiling(
-            ndvi_median,
-            aoi,
-            tiles,
-            output_name,
-            resolution,
-            folder,
-            max_tile_size_km,
-            export_crs=export_crs,
-            export_distortion=export_distortion,
-            export_crs_name=export_crs_name,
-            n_clusters=n_clusters,
-            cancel_callback=cancel_callback,
-            ndvi_progress_callback=ndvi_progress_callback,
-            write_geotiff=write_geotiff,
-            write_geojson=write_geojson,
-            write_geopackage=write_geopackage,
-        )
+        # Sidecar: write on success so direct API callers (CLI / fusion auto-
+        # download / notebooks) get the same parameter+CRS audit trail the GVI
+        # ``_gvi.json`` provides. Failures and cancellations skip this — the
+        # sidecar should only describe outputs that actually landed on disk.
+        if result.get("status") == "success":
+            raw_meta = result.get("meta")
+            result_meta: dict = raw_meta if isinstance(raw_meta, dict) else {}
+            tiles_succeeded = int(result_meta.get("tiles", n_tiles))
+            try:
+                sidecar_path = _write_ndvi_sidecar(
+                    folder,
+                    output_name,
+                    grid_crs=grid_crs,
+                    export_crs=export_crs,
+                    export_crs_name=export_crs_name,
+                    export_distortion=export_distortion,
+                    n_clusters=n_clusters,
+                    tiles_total=n_tiles,
+                    tiles_succeeded=tiles_succeeded,
+                    start_date=str(start_date),
+                    end_date=str(end_date),
+                    cloud_max=cloud_max,
+                    resolution_m=resolution,
+                    max_tile_size_km=max_tile_size_km,
+                    ee_collection=self.EE_COLLECTION_ID,
+                )
+                result["sidecar"] = sidecar_path
+            except Exception as e:
+                _log("WARN", f"Sidecar write failed (non-fatal): {e}")
+        return result
 
     def _download_single(
         self,

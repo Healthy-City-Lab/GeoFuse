@@ -85,6 +85,20 @@ Vector point data with:
 | `x`, `y` | Geographic coordinates (EPSG:4326) |
 | `ndvi_date` | Source date (attribute-column mode only) |
 
+### `[Filename]_ndvi.json` (always written on success)
+
+Sidecar metadata mirroring GVI's `_gvi.json`. Lets fusion and custom tooling
+introspect a raster after the fact without re-running Earth Engine:
+
+| Field | Description |
+|-------|-------------|
+| `export_crs` / `export_crs_name` / `export_crs_wkt` | Planar CRS pixels were rasterised in (EPSG ID, human-readable name, full WKT) |
+| `distortion` | Max relative deviation of a 1000 m planar step from true geodesic distance across the extent |
+| `n_clusters` / `tiles_total` / `tiles_succeeded` | How the input decomposed into connected components and tiles, and how many tiles actually landed on disk |
+| `start_date` / `end_date` / `cloud_max` | EE collection filter used |
+| `resolution_m` / `max_tile_size_km` | Export resolution and tiling cap |
+| `ee_collection` | Earth Engine ImageCollection ID (e.g. `COPERNICUS/S2_SR_HARMONIZED`) |
+
 ---
 
 ## Fusion Engine Outputs

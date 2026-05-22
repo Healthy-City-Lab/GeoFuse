@@ -366,6 +366,9 @@ def run_ndvi(
     gj_path = os.path.join(output_dir, f"{output_name}_ndvi.geojson")
     if save_geojson and os.path.exists(gj_path):
         output_paths.append(gj_path)
+    sidecar_path = os.path.join(output_dir, f"{output_name}_ndvi.json")
+    if os.path.exists(sidecar_path):
+        output_paths.append(sidecar_path)
 
     ctx.progress(value=1.0, status_text="Completed")
     return {"output_paths": output_paths}
