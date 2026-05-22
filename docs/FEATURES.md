@@ -29,6 +29,7 @@
   * **Specific Date(s)**: Builds a composite from imagery within a ± window around each date.
   * **Attribute Column**: Matches each feature to its own date from an attribute column, producing a single temporally-aligned output file.
 * **Dynamic Calculation**: Computes NDVI for the exact timeframe matching your street view data.
+* **Latitude-aware export CRS**: Earth Engine exports use an auto-selected planar CRS (UTM / two-parallel LCC / Polar Stereographic) so pixels are rasterised in true ground metres at any latitude; reprojection to WGS84 for delivery uses bilinear resampling. The legacy Web Mercator export (which silently halved cell area near 60°N) is no longer used.
 * **GeoPackage Output Option**: GeoTIFF remains the default, but a `Save GeoPackage` checkbox writes `*_ndvi.gpkg` (layer `ndvi_samples`) alongside the raster for QGIS / GeoPandas consumption.
 * **Restart System**: Like GVI, NDVI jobs interrupted by a Streamlit restart appear as "Interrupted" and can be resumed by re-uploading the original study area.
 

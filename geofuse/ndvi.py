@@ -64,6 +64,43 @@ def _shapely_to_ee_geometry(geom):
     return ee.Geometry(mapping(geom))
 
 
+def _crs_to_ee_string(crs) -> str:
+    """Earth-Engine-friendly CRS string: prefer ``EPSG:<n>``, fall back to WKT.
+
+    EE accepts WKT for non-standard projections (the LCC/Polar Stereographic
+    that ``select_grid_crs`` synthesises for wide-span or polar extents), so
+    every CRS the selector returns can be passed through to ``ee_export_image``.
+    """
+    epsg = crs.to_epsg()
+    if epsg is not None:
+        return f"EPSG:{epsg}"
+    return crs.to_wkt()
+
+
+def _select_export_crs(geom_wgs84_gdf: gpd.GeoDataFrame) -> tuple[str, float, str]:
+    """Pick an EE export CRS for true-ground-metre pixels at any latitude.
+
+    Wraps :func:`geofuse.crs_utils.select_grid_crs` and warns when the
+    resulting planar CRS would distort 1000 m steps by more than 2%, matching
+    the warning surface ``generate_clustered_grid`` uses on the GVI path.
+    """
+    crs, distortion, choice_name = select_grid_crs(geom_wgs84_gdf)
+    if distortion > 0.02:
+        _log(
+            "WARN",
+            f"Export CRS distortion ~ {distortion * 100:.2f}% across the extent "
+            f"({choice_name}). Pixel scale will drift slightly across widely-spaced "
+            f"tiles.",
+        )
+    else:
+        _log(
+            "INFO",
+            f"Export CRS: {choice_name} (max planar distortion ~ "
+            f"{distortion * 100:.3f}%).",
+        )
+    return _crs_to_ee_string(crs), float(distortion), choice_name
+
+
 class NDVIEngine:
     def __init__(self, project_id=None):
         try:
@@ -109,12 +146,17 @@ class NDVIEngine:
     def _reproject_tile_to_4326(
         self, src_path: str, dst_path: str, resolution: int
     ) -> None:
-        """Reproject a 3857 GeoTIFF to 4326 with per-latitude aspect-ratio correction.
+        """Reproject a planar-CRS GeoTIFF to 4326 with per-latitude aspect-ratio correction.
 
-        Downloads from Earth Engine arrive in EPSG:3857 (metres). A naive
-        reprojection produces non-square pixels in geographic space. This method
-        calculates the exact degree-per-metre scale at the tile's centroid
-        latitude and forces an explicit square-metre output resolution.
+        Earth Engine exports arrive in whatever planar CRS we asked for
+        (UTM / LCC / Polar Stereographic via :func:`select_grid_crs`, or the
+        legacy ``EPSG:3857`` fallback). A naive reprojection produces
+        non-square pixels in geographic space, so this method derives the
+        exact degree-per-metre scale at the tile's centroid latitude and
+        forces an explicit square-metre output resolution.
+
+        Uses :data:`Resampling.bilinear` because NDVI is a continuous index;
+        QA / classification bands would need nearest-neighbour.
         """
         from rasterio.warp import transform as warp_transform
 
@@ -161,7 +203,7 @@ class NDVIEngine:
                         src_crs=src.crs,
                         dst_transform=dst_transform,
                         dst_crs="EPSG:4326",
-                        resampling=Resampling.nearest,
+                        resampling=Resampling.bilinear,
                     )
 
     def _raster_to_ndvi_points(
@@ -302,9 +344,20 @@ class NDVIEngine:
             js.pop("crs", None)
             aoi = ee.FeatureCollection(js["features"]).geometry()
             bounds = geom_wgs84.total_bounds
+            geom_for_crs = geom_wgs84
         else:
             aoi = _shapely_to_ee_geometry(geometry)
             bounds = geometry.bounds
+            geom_for_crs = gpd.GeoDataFrame(
+                {"geometry": [geometry]}, crs="EPSG:4326"
+            )
+
+        # 2. Pick an EE export CRS so pixels are rasterised in true ground
+        # metres regardless of latitude (vs. the legacy hardcoded Web Mercator,
+        # which doubles cell area near 60°N).
+        export_crs, export_distortion, export_crs_name = _select_export_crs(
+            geom_for_crs
+        )
 
         # 2. Get Collection
         col = self.get_collection(aoi, str(start_date), str(end_date), cloud_max)
@@ -340,6 +393,9 @@ class NDVIEngine:
                 resolution,
                 folder,
                 max_tile_size_km,
+                export_crs=export_crs,
+                export_distortion=export_distortion,
+                export_crs_name=export_crs_name,
                 cancel_callback=cancel_callback,
                 ndvi_progress_callback=ndvi_progress_callback,
                 write_geotiff=write_geotiff,
@@ -358,6 +414,9 @@ class NDVIEngine:
                 output_name,
                 resolution,
                 folder,
+                export_crs=export_crs,
+                export_distortion=export_distortion,
+                export_crs_name=export_crs_name,
                 cancel_callback=cancel_callback,
                 ndvi_progress_callback=ndvi_progress_callback,
                 write_geotiff=write_geotiff,
@@ -373,6 +432,10 @@ class NDVIEngine:
         output_name,
         resolution,
         folder,
+        *,
+        export_crs: str = "EPSG:3857",
+        export_distortion: float = 0.0,
+        export_crs_name: str = "Web Mercator (legacy)",
         cancel_callback: Callable[[], bool] | None = None,
         ndvi_progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
         write_geotiff: bool = True,
@@ -388,7 +451,6 @@ class NDVIEngine:
         )
         if cancel_callback and cancel_callback():
             return {"status": "cancelled", "message": "Cancelled by user"}
-        # Export as EPSG:3857 (Meters) first
         temp_tif = os.path.join(folder, f"temp_{output_name}.tif")
         final_tif = os.path.join(folder, f"{output_name}_ndvi.tif")
 
@@ -397,7 +459,7 @@ class NDVIEngine:
                 ndvi_median.unmask(-9999),
                 filename=temp_tif,
                 scale=resolution,
-                crs="EPSG:3857",
+                crs=export_crs,
                 region=aoi,
                 file_per_band=False,
             )
@@ -439,7 +501,12 @@ class NDVIEngine:
                 crs_meta = str(src.crs)
         except Exception:
             crs_meta = "EPSG:4326"
-        meta: dict[str, Any] = {"crs": crs_meta}
+        meta: dict[str, Any] = {
+            "crs": crs_meta,
+            "export_crs": export_crs,
+            "export_crs_name": export_crs_name,
+            "export_distortion": export_distortion,
+        }
 
         if not (write_geojson or write_geopackage):
             _emit_ndvi_progress(
@@ -474,6 +541,11 @@ class NDVIEngine:
             cancel_callback=cancel_callback,
             sub_start=0.52,
             sub_end=0.99,
+            meta_extra={
+                "export_crs": export_crs,
+                "export_crs_name": export_crs_name,
+                "export_distortion": export_distortion,
+            },
         )
         if out.get("status") != "success":
             return out
@@ -493,6 +565,10 @@ class NDVIEngine:
         resolution,
         folder,
         max_tile_size_km,
+        *,
+        export_crs: str = "EPSG:3857",
+        export_distortion: float = 0.0,
+        export_crs_name: str = "Web Mercator (legacy)",
         cancel_callback: Callable[[], bool] | None = None,
         ndvi_progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
         write_geotiff: bool = True,
@@ -555,7 +631,7 @@ class NDVIEngine:
                         tile_ndvi.unmask(-9999),
                         filename=tile_temp,
                         scale=resolution,
-                        crs="EPSG:3857",
+                        crs=export_crs,
                         region=tile_aoi,
                         file_per_band=False,
                     )
@@ -655,7 +731,12 @@ class NDVIEngine:
             return {"status": "cancelled", "message": "Cancelled by user"}
 
         n_mosaic_tiles = len(tile_files)
-        meta_base: dict[str, Any] = {"tiles": n_mosaic_tiles}
+        meta_base: dict[str, Any] = {
+            "tiles": n_mosaic_tiles,
+            "export_crs": export_crs,
+            "export_crs_name": export_crs_name,
+            "export_distortion": export_distortion,
+        }
         try:
             with rasterio.open(final_tif) as src:
                 meta_base["crs"] = str(src.crs)
@@ -695,7 +776,12 @@ class NDVIEngine:
             cancel_callback=cancel_callback,
             sub_start=0.88,
             sub_end=0.99,
-            meta_extra={"tiles": n_mosaic_tiles},
+            meta_extra={
+                "tiles": n_mosaic_tiles,
+                "export_crs": export_crs,
+                "export_crs_name": export_crs_name,
+                "export_distortion": export_distortion,
+            },
         )
         if out.get("status") != "success":
             return out
