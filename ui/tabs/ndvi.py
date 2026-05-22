@@ -290,7 +290,7 @@ def _ndvi_size_hint(buffer_m: int, resolution_m: int) -> None:
 
 
 def render(output_dir: str) -> None:
-    st.header("NDVI Sourcing")
+    st.header("NDVI")
 
     if "ndvi_datasets" not in st.session_state:
         st.session_state.ndvi_datasets = {}
@@ -857,7 +857,7 @@ def render(output_dir: str) -> None:
             if jobs_started:
                 st.success(
                     f"{jobs_started} job(s) started. "
-                    "Monitor progress in the Job Monitor tab."
+                    "Monitor progress in the sidebar Job Monitor."
                 )
             elif not validation_errors:
                 st.info("No new jobs were submitted.")

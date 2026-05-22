@@ -390,7 +390,7 @@ def _gvi_materialize_grids_if_missing(gvi_buffer: int, gvi_res: int) -> None:
 
 
 def render(output_dir: str, parent_dir: str) -> None:
-    st.header("GVI Sourcing")
+    st.header("GVI")
 
     # --- SESSION STATE ---
     if "datasets" not in st.session_state:
@@ -520,6 +520,10 @@ def render(output_dir: str, parent_dir: str) -> None:
 
     @st.fragment(run_every=1)
     def show_job_monitor_fragment():
+        # Custom flex header so the sidebar-collapse button sits flush to the
+        # right of the title. The button is wired up by the JS in app.py
+        # which forwards the click to Streamlit's hidden stSidebarHeader
+        # collapse control.
         st.header("Job Monitor")
 
         h = store.health()

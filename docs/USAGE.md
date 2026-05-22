@@ -15,9 +15,9 @@ streamlit run ui/app.py
 
 | Tab | Purpose |
 | --- | --- |
-| **Job Monitor** | Track HPC CLI jobs by Job ID; view stage, progress, and metrics in real time. UI job progress is tracked in the GVI tab sidebar. |
-| **NDVI Sourcing** | Upload study areas, configure date modes, run Earth Engine downloads, and inspect results on an interactive map. |
-| **GVI Sourcing** | Upload study areas, generate sampling grids, run Street View + segmentation batch jobs, and visualize vegetation/terrain heatmaps. |
+| **NDVI** | Upload study areas, configure date modes, run Earth Engine downloads, and inspect results on an interactive map. |
+| **GVI** | Upload study areas, generate sampling grids, run Street View + segmentation batch jobs, and visualize vegetation/terrain heatmaps. |
+| **HPC Monitoring** | Track HPC CLI jobs by Job ID; view stage, progress, and metrics in real time. UI job progress is tracked in the GVI tab sidebar. |
 | **Fusion & Optimization** | Upload a target file (GeoJSON or GeoTIFF), configure metric sources and optimization settings, run Bayesian fusion, and inspect results. |
 
 ### Typical Workflow

@@ -1,0 +1,154 @@
+/* Resource monitor: floating bottom-right pill + expanded panel.
+ *
+ * Loaded by ui/resource_monitor.py via ui/chrome.py:load_asset(). The pill
+ * is position:fixed so it's removed from document flow and never displaces
+ * other content; the JS in resource_monitor.js toggles body.gf-rm-open to
+ * reveal the panel.
+ *
+ * Cross-browser notes:
+ *   - backdrop-filter -> -webkit-backdrop-filter first (Safari).
+ *   - user-select     -> -webkit-, -moz-, then standard (Safari/Firefox).
+ */
+
+.gf-rm-floater {
+	position: fixed;
+	bottom: 14px;
+	right: 14px;
+	z-index: 1000;
+	display: flex;
+	flex-direction: column;
+	align-items: flex-end;
+	gap: 6px;
+	pointer-events: none;
+	font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Source Sans Pro", sans-serif;
+}
+.gf-rm-floater > * {
+	pointer-events: auto;
+}
+
+/* Expanded panel: hidden by default; revealed when JS sets body.gf-rm-open. */
+.gf-rm-panel {
+	display: none;
+	width: 320px;
+	max-width: 92vw;
+	background: rgba(11, 16, 22, 0.97);
+	border: 1px solid #2a3340;
+	border-radius: 8px;
+	padding: 10px 12px 8px 12px;
+	box-shadow:
+		0 12px 40px rgba(0, 0, 0, 0.55),
+		0 0 0 1px rgba(255, 255, 255, 0.025);
+	-webkit-backdrop-filter: blur(6px);
+	backdrop-filter: blur(6px);
+}
+body.gf-rm-open .gf-rm-panel {
+	display: block;
+}
+
+.gf-rm-panel-title {
+	font-size: 0.66rem;
+	font-weight: 700;
+	letter-spacing: 0.09em;
+	text-transform: uppercase;
+	color: #a5acb6;
+	margin: 0 0 7px 0;
+}
+
+/* Mini pill */
+.gf-rm-mini {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 5px 11px 5px 11px;
+	background: rgba(11, 16, 22, 0.94);
+	border: 1px solid #2a3340;
+	border-radius: 999px;
+	cursor: pointer;
+	-webkit-user-select: none;
+	-moz-user-select: none;
+	user-select: none;
+	box-shadow:
+		0 4px 18px rgba(0, 0, 0, 0.45),
+		0 0 0 1px rgba(255, 255, 255, 0.02);
+	transition:
+		border-color 0.15s ease,
+		transform 0.15s ease;
+	font-size: 0.66rem;
+	line-height: 1.1;
+}
+.gf-rm-mini:hover {
+	border-color: #3b4754;
+	transform: translateY(-1px);
+}
+
+.gf-rm-chip {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	font-variant-numeric: tabular-nums;
+	color: #e0e3e8;
+}
+.gf-rm-chip-dot {
+	width: 6px;
+	height: 6px;
+	border-radius: 50%;
+	display: inline-block;
+	box-shadow: 0 0 4px currentColor;
+}
+.gf-rm-chip-val {
+	font-weight: 600;
+	font-size: 0.7rem;
+}
+.gf-rm-net {
+	font-size: 0.62rem;
+}
+
+.gf-rm-chevron {
+	color: #6b7280;
+	font-size: 0.85rem;
+	line-height: 1;
+	margin-left: 1px;
+	transition: transform 0.2s ease;
+}
+body.gf-rm-open .gf-rm-chevron {
+	transform: rotate(180deg);
+	color: #cfd3da;
+}
+
+/* Re-used chart block styles inside the panel */
+.gf-rm-block {
+	margin: 0 0 5px 0;
+}
+.gf-rm-row {
+	display: flex;
+	justify-content: space-between;
+	align-items: baseline;
+	font-size: 0.68rem;
+	line-height: 1.1;
+	margin: 0 0 1px 0;
+	color: #cfd3da;
+}
+.gf-rm-label {
+	letter-spacing: 0.04em;
+	text-transform: uppercase;
+	color: #a5acb6;
+	font-weight: 600;
+	font-size: 0.62rem;
+}
+.gf-rm-value {
+	font-weight: 700;
+	font-size: 0.72rem;
+	font-variant-numeric: tabular-nums;
+}
+.gf-rm-svg {
+	display: block;
+	background: linear-gradient(180deg, #0b1118 0%, #0a0d12 100%);
+	border: 1px solid #1c2229;
+	border-radius: 4px;
+}
+
+/* Hide the empty Streamlit wrapper around our injected block so the page
+   layout isn't affected. The floater itself uses position:fixed. */
+.gf-rm-host {
+	display: contents !important;
+}
