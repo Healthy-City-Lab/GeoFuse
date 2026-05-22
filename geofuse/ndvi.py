@@ -12,10 +12,13 @@ import geemap
 import geopandas as gpd
 import numpy as np
 import rasterio
+from pyproj import Transformer
 from rasterio.merge import merge
 from rasterio.transform import array_bounds
 from rasterio.warp import Resampling, calculate_default_transform, reproject
-from shapely.geometry import box, mapping
+from shapely.geometry import MultiPolygon, Polygon, box, mapping
+from shapely.ops import transform as shapely_transform
+from shapely.strtree import STRtree
 
 from .crs_utils import reproject_geodataframe_to_wgs84, select_grid_crs
 from .logger import get_logger
@@ -77,12 +80,16 @@ def _crs_to_ee_string(crs) -> str:
     return crs.to_wkt()
 
 
-def _select_export_crs(geom_wgs84_gdf: gpd.GeoDataFrame) -> tuple[str, float, str]:
+def _select_export_crs(geom_wgs84_gdf: gpd.GeoDataFrame):
     """Pick an EE export CRS for true-ground-metre pixels at any latitude.
 
     Wraps :func:`geofuse.crs_utils.select_grid_crs` and warns when the
     resulting planar CRS would distort 1000 m steps by more than 2%, matching
     the warning surface ``generate_clustered_grid`` uses on the GVI path.
+
+    Returns ``(ee_string, crs_obj, distortion, choice_name)``. ``crs_obj`` is
+    the pyproj CRS so callers can reproject geometries for cluster-aware
+    tiling without re-running the selector.
     """
     crs, distortion, choice_name = select_grid_crs(geom_wgs84_gdf)
     if distortion > 0.02:
@@ -98,7 +105,83 @@ def _select_export_crs(geom_wgs84_gdf: gpd.GeoDataFrame) -> tuple[str, float, st
             f"Export CRS: {choice_name} (max planar distortion ~ "
             f"{distortion * 100:.3f}%).",
         )
-    return _crs_to_ee_string(crs), float(distortion), choice_name
+    return _crs_to_ee_string(crs), crs, float(distortion), choice_name
+
+
+def _build_planar_tiles(
+    geom_wgs84_gdf: gpd.GeoDataFrame,
+    grid_crs,
+    max_tile_size_km: float,
+) -> list[dict]:
+    """Cluster-aware EE tile specs in true metres.
+
+    Decomposes the geometry (after a planar union) into connected polygon
+    components — each is treated as a cluster — and tiles every cluster's
+    bbox at ``max_tile_size_km`` step in the planar CRS. STRtree-culls
+    candidate tiles that don't intersect their cluster polygon, so scattered
+    national-scale inputs (e.g. one feature per province) no longer waste
+    Earth Engine calls on tiles over ocean or empty bbox regions. Non-polygon
+    inputs (raw points, lines) fall back to a single envelope cluster.
+
+    Returns a list of ``{cluster_id, tile_idx, tile_geom_4326}`` dicts where
+    ``tile_geom_4326`` is a shapely polygon ready for ``ee.Geometry``.
+    """
+    tile_size_m = float(max_tile_size_km) * 1000.0
+    if tile_size_m <= 0:
+        return []
+    gdf_planar = geom_wgs84_gdf.to_crs(grid_crs)
+    merged = gdf_planar.geometry.union_all()
+    if merged is None or merged.is_empty:
+        return []
+
+    if isinstance(merged, MultiPolygon):
+        cluster_polys: list = list(merged.geoms)
+    elif isinstance(merged, Polygon):
+        cluster_polys = [merged]
+    else:
+        # Raw points / lines: degrade gracefully to one envelope cluster so
+        # the rest of the pipeline still has a polygon to tile.
+        env = merged.envelope
+        cluster_polys = [env] if not env.is_empty else []
+
+    fwd = Transformer.from_crs(grid_crs, "EPSG:4326", always_xy=True)
+
+    def _to_4326(box_geom):
+        return shapely_transform(
+            lambda x, y, z=None: fwd.transform(x, y), box_geom
+        )
+
+    tiles: list[dict] = []
+    tile_idx_global = 0
+    for cid, poly in enumerate(cluster_polys):
+        if poly.is_empty:
+            continue
+        cmin_x, cmin_y, cmax_x, cmax_y = poly.bounds
+        candidate: list = []
+        x = cmin_x
+        while x < cmax_x:
+            x_end = min(x + tile_size_m, cmax_x)
+            y = cmin_y
+            while y < cmax_y:
+                y_end = min(y + tile_size_m, cmax_y)
+                candidate.append(box(x, y, x_end, y_end))
+                y = y_end
+            x = x_end
+        if not candidate:
+            continue
+        tree = STRtree(candidate)
+        keep_idx = tree.query(poly, predicate="intersects")
+        for ki in sorted(int(i) for i in keep_idx):
+            tiles.append(
+                {
+                    "cluster_id": cid,
+                    "tile_idx": tile_idx_global,
+                    "tile_geom_4326": _to_4326(candidate[ki]),
+                }
+            )
+            tile_idx_global += 1
+
+    return tiles
 
 
 class NDVIEngine:
@@ -343,11 +426,9 @@ class NDVIEngine:
             js = json.loads(geom_wgs84.to_json())
             js.pop("crs", None)
             aoi = ee.FeatureCollection(js["features"]).geometry()
-            bounds = geom_wgs84.total_bounds
             geom_for_crs = geom_wgs84
         else:
             aoi = _shapely_to_ee_geometry(geometry)
-            bounds = geometry.bounds
             geom_for_crs = gpd.GeoDataFrame(
                 {"geometry": [geometry]}, crs="EPSG:4326"
             )
@@ -355,11 +436,11 @@ class NDVIEngine:
         # 2. Pick an EE export CRS so pixels are rasterised in true ground
         # metres regardless of latitude (vs. the legacy hardcoded Web Mercator,
         # which doubles cell area near 60°N).
-        export_crs, export_distortion, export_crs_name = _select_export_crs(
-            geom_for_crs
+        export_crs, grid_crs, export_distortion, export_crs_name = (
+            _select_export_crs(geom_for_crs)
         )
 
-        # 2. Get Collection
+        # 3. Get Collection
         col = self.get_collection(aoi, str(start_date), str(end_date), cloud_max)
         if col.size().getInfo() == 0:
             return {
@@ -372,40 +453,24 @@ class NDVIEngine:
 
         ndvi_median = col.median().clip(aoi)
 
-        # 3. Check if tiling is needed based on area size
-        minx, miny, maxx, maxy = bounds
-        width_km = (maxx - minx) * 111  # Rough approximation at equator
-        height_km = (maxy - miny) * 111
+        # 4. Build cluster-aware tile list in true metres. Scattered national
+        # inputs decompose into connected components, and tiles that fall over
+        # empty bbox regions (ocean, gaps between provinces) are STRtree-culled
+        # before they reach Earth Engine.
+        tiles = _build_planar_tiles(geom_for_crs, grid_crs, max_tile_size_km)
+        n_tiles = len(tiles)
+        if n_tiles == 0:
+            return {
+                "status": "error",
+                "message": "No tiles cover the study area — check input geometry.",
+            }
 
-        needs_tiling = width_km > max_tile_size_km or height_km > max_tile_size_km
+        n_clusters = len({t["cluster_id"] for t in tiles})
 
-        if needs_tiling:
+        if n_tiles == 1:
             _log(
                 "INFO",
-                f"Large area detected ({width_km:.1f}x{height_km:.1f} km). "
-                "Using tiled download...",
-            )
-            return self._download_with_tiling(
-                ndvi_median,
-                aoi,
-                bounds,
-                output_name,
-                resolution,
-                folder,
-                max_tile_size_km,
-                export_crs=export_crs,
-                export_distortion=export_distortion,
-                export_crs_name=export_crs_name,
-                cancel_callback=cancel_callback,
-                ndvi_progress_callback=ndvi_progress_callback,
-                write_geotiff=write_geotiff,
-                write_geojson=write_geojson,
-                write_geopackage=write_geopackage,
-            )
-        else:
-            _log(
-                "INFO",
-                f"Area size: {width_km:.1f}x{height_km:.1f} km. Single download...",
+                f"Single-tile download ({n_clusters} cluster(s), planar metres).",
             )
             return self._download_single(
                 ndvi_median,
@@ -423,6 +488,30 @@ class NDVIEngine:
                 write_geojson=write_geojson,
                 write_geopackage=write_geopackage,
             )
+
+        _log(
+            "INFO",
+            f"Tiled download: {n_tiles} tiles across {n_clusters} cluster(s) "
+            f"(max {max_tile_size_km} km/tile).",
+        )
+        return self._download_with_tiling(
+            ndvi_median,
+            aoi,
+            tiles,
+            output_name,
+            resolution,
+            folder,
+            max_tile_size_km,
+            export_crs=export_crs,
+            export_distortion=export_distortion,
+            export_crs_name=export_crs_name,
+            n_clusters=n_clusters,
+            cancel_callback=cancel_callback,
+            ndvi_progress_callback=ndvi_progress_callback,
+            write_geotiff=write_geotiff,
+            write_geojson=write_geojson,
+            write_geopackage=write_geopackage,
+        )
 
     def _download_single(
         self,
@@ -503,6 +592,9 @@ class NDVIEngine:
             crs_meta = "EPSG:4326"
         meta: dict[str, Any] = {
             "crs": crs_meta,
+            "tiles": 1,
+            "tiles_total": 1,
+            "n_clusters": 1,
             "export_crs": export_crs,
             "export_crs_name": export_crs_name,
             "export_distortion": export_distortion,
@@ -560,7 +652,7 @@ class NDVIEngine:
         self,
         ndvi_median,
         aoi,
-        bounds,
+        tiles: list[dict],
         output_name,
         resolution,
         folder,
@@ -569,38 +661,27 @@ class NDVIEngine:
         export_crs: str = "EPSG:3857",
         export_distortion: float = 0.0,
         export_crs_name: str = "Web Mercator (legacy)",
+        n_clusters: int = 1,
         cancel_callback: Callable[[], bool] | None = None,
         ndvi_progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
         write_geotiff: bool = True,
         write_geojson: bool = True,
         write_geopackage: bool = False,
     ):
-        """Download NDVI in tiles and mosaic them together (for large areas)."""
-        minx, miny, maxx, maxy = bounds
+        """Download NDVI for a precomputed cluster-aware tile list and mosaic.
 
-        tile_size_deg = max_tile_size_km / 111  # Approximate degrees
-
-        tiles = []
-        x = minx
-        tile_idx = 0
-
-        _log("INFO", f"Creating tile grid (max {max_tile_size_km} km per tile)...")
-
-        while x < maxx:
-            x_end = min(x + tile_size_deg, maxx)
-            y = miny
-
-            while y < maxy:
-                y_end = min(y + tile_size_deg, maxy)
-                tiles.append((tile_idx, box(x, y, x_end, y_end)))
-                tile_idx += 1
-                y = y_end
-
-            x = x_end
-
-        _log("INFO", f"Generated {len(tiles)} tiles. Downloading...")
-
+        ``tiles`` is the output of :func:`_build_planar_tiles` — a list of
+        ``{cluster_id, tile_idx, tile_geom_4326}`` dicts. Each tile is exported
+        independently and mosaicked into one GeoTIFF; per-cluster GeoTIFF tile
+        outputs are a separate downstream step (Phase 4).
+        """
         n_tiles = len(tiles)
+        _log(
+            "INFO",
+            f"Downloading {n_tiles} tile(s) across {n_clusters} cluster(s) "
+            f"(max {max_tile_size_km} km/tile)...",
+        )
+
         _emit_ndvi_progress(
             ndvi_progress_callback,
             sub_progress=0.02,
@@ -614,11 +695,14 @@ class NDVIEngine:
         final_tif = os.path.join(folder, f"{output_name}_ndvi.tif")
 
         try:
-            for idx, tile_geom in tiles:
+            for tile_spec in tiles:
+                idx = int(tile_spec["tile_idx"])
+                tile_geom = tile_spec["tile_geom_4326"]
+
                 if cancel_callback and cancel_callback():
                     return {"status": "cancelled", "message": "Cancelled by user"}
 
-                _log("INFO", f"Downloading tile {idx+1}/{len(tiles)}...")
+                _log("INFO", f"Downloading tile {idx+1}/{n_tiles}...")
 
                 tile_aoi = _shapely_to_ee_geometry(tile_geom)
                 tile_ndvi = ndvi_median.clip(tile_aoi)
@@ -668,7 +752,7 @@ class NDVIEngine:
 
             _log(
                 "OK",
-                f"Successfully downloaded {len(tile_files)}/{len(tiles)} tiles. "
+                f"Successfully downloaded {len(tile_files)}/{n_tiles} tiles. "
                 "Mosaicking...",
             )
 
@@ -733,6 +817,8 @@ class NDVIEngine:
         n_mosaic_tiles = len(tile_files)
         meta_base: dict[str, Any] = {
             "tiles": n_mosaic_tiles,
+            "tiles_total": n_tiles,
+            "n_clusters": n_clusters,
             "export_crs": export_crs,
             "export_crs_name": export_crs_name,
             "export_distortion": export_distortion,
@@ -778,6 +864,8 @@ class NDVIEngine:
             sub_end=0.99,
             meta_extra={
                 "tiles": n_mosaic_tiles,
+                "tiles_total": n_tiles,
+                "n_clusters": n_clusters,
                 "export_crs": export_crs,
                 "export_crs_name": export_crs_name,
                 "export_distortion": export_distortion,
