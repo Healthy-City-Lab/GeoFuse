@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 import time
-import uuid
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
@@ -26,6 +26,7 @@ from .crs_utils import (
 )
 from .jobs import progress_interval_s, retry_with_backoff
 from .logger import get_logger
+from .vector_io import geometry_sha256
 
 _log = get_logger("NDVI")
 
@@ -43,14 +44,72 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _MAX_CONCURRENT_TILES = 4
 
 
-def _ndvi_tile_workspace(output_name: str) -> str:
-    """Per-run workspace under ``<repo>/temp/ndvi_tiles/`` (removed after mosaic)."""
-    root = os.path.join(_REPO_ROOT, "temp", "ndvi_tiles")
-    os.makedirs(root, exist_ok=True)
-    unique = f"{output_name}_{uuid.uuid4().hex[:10]}"
-    path = os.path.join(root, unique)
+def _compute_resume_key(
+    geom_wgs84_gdf: gpd.GeoDataFrame,
+    start_date: str,
+    end_date: str,
+    cloud_max: float,
+    resolution: int,
+    ee_collection: str,
+) -> str:
+    """Stable 16-hex-char key identifying a unique NDVI run.
+
+    Two runs that hash to the same key produce identical output, so they can
+    share an on-disk tile workspace — that's what lets resume work. The key
+    includes everything that affects the per-tile contents: study area
+    (geometry + CRS), date range, cloud threshold, export resolution, and
+    Earth Engine collection ID. Changing any one of these spawns a fresh
+    workspace and forces a full re-download (which is what you want — old
+    tiles would be from a different question).
+    """
+    h = hashlib.sha256()
+    h.update(geometry_sha256(geom_wgs84_gdf).encode())
+    h.update(f"|{start_date}|{end_date}|{cloud_max}|{resolution}|".encode())
+    h.update(ee_collection.encode())
+    return h.hexdigest()[:16]
+
+
+def _ndvi_resume_workspace(resume_key: str) -> str:
+    """Deterministic tile workspace at ``<repo>/temp/ndvi_tiles/<resume_key>/``.
+
+    Survives across runs and process restarts so an interrupted job can
+    resume from disk — successful runs clean their own workspace at the end
+    (see :meth:`NDVIEngine._download_with_tiling`). Errored or cancelled
+    runs leave it intact for the next attempt with the same key to pick up.
+    """
+    path = os.path.join(_REPO_ROOT, "temp", "ndvi_tiles", resume_key)
     os.makedirs(path, exist_ok=True)
     return path
+
+
+def _discover_resumable_tiles(
+    work_dir: str, tiles: list[dict]
+) -> tuple[list[str], list[dict]]:
+    """Split ``tiles`` into (already-on-disk, still-pending).
+
+    A tile counts as "already on disk" iff ``tile_<idx>.tif`` exists in
+    ``work_dir`` and opens cleanly. Half-written / corrupt files are
+    discarded so the next run re-downloads them.
+    """
+    existing_files: list[str] = []
+    pending: list[dict] = []
+    for ts in tiles:
+        idx = int(ts["tile_idx"])
+        path = os.path.join(work_dir, f"tile_{idx}.tif")
+        if not os.path.isfile(path):
+            pending.append(ts)
+            continue
+        try:
+            with rasterio.open(path) as _src:
+                _ = _src.bounds  # touch metadata to detect truncation
+            existing_files.append(path)
+        except Exception:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            pending.append(ts)
+    return existing_files, pending
 
 
 def _emit_ndvi_progress(
@@ -90,7 +149,9 @@ def _write_ndvi_sidecar(
     tiles_total: int,
     tiles_succeeded: int,
     tiles_failed: int = 0,
+    tiles_resumed: int = 0,
     failed_tile_refs: list[dict] | None = None,
+    resume_key: str = "",
     start_date: str,
     end_date: str,
     cloud_max: float,
@@ -118,6 +179,8 @@ def _write_ndvi_sidecar(
         "tiles_total": int(tiles_total),
         "tiles_succeeded": int(tiles_succeeded),
         "tiles_failed": int(tiles_failed),
+        "tiles_resumed": int(tiles_resumed),
+        "resume_key": resume_key,
         "failed_tile_refs": list(failed_tile_refs or []),
         "start_date": str(start_date),
         "end_date": str(end_date),
@@ -372,6 +435,19 @@ class NDVIEngine:
 
         n_clusters = len({t["cluster_id"] for t in tiles})
 
+        # 5. Compute the resume key from the same fields that identify a
+        # unique run; two runs with the same key share an on-disk tile
+        # workspace so an interrupted job can pick up where it left off
+        # without re-downloading any tile that already landed cleanly.
+        resume_key = _compute_resume_key(
+            geom_for_crs,
+            str(start_date),
+            str(end_date),
+            cloud_max,
+            resolution,
+            self.EE_COLLECTION_ID,
+        )
+
         if n_tiles == 1:
             _log(
                 "INFO",
@@ -411,6 +487,7 @@ class NDVIEngine:
                 export_distortion=export_distortion,
                 export_crs_name=export_crs_name,
                 n_clusters=n_clusters,
+                resume_key=resume_key,
                 cancel_callback=cancel_callback,
                 ndvi_progress_callback=ndvi_progress_callback,
                 write_geotiff=write_geotiff,
@@ -427,6 +504,7 @@ class NDVIEngine:
             result_meta: dict = raw_meta if isinstance(raw_meta, dict) else {}
             tiles_succeeded = int(result_meta.get("tiles", n_tiles))
             tiles_failed = int(result_meta.get("tiles_failed", 0))
+            tiles_resumed = int(result_meta.get("tiles_resumed", 0))
             failed_refs = result_meta.get("failed_tile_refs") or []
             try:
                 sidecar_path = _write_ndvi_sidecar(
@@ -440,7 +518,9 @@ class NDVIEngine:
                     tiles_total=n_tiles,
                     tiles_succeeded=tiles_succeeded,
                     tiles_failed=tiles_failed,
+                    tiles_resumed=tiles_resumed,
                     failed_tile_refs=failed_refs,
+                    resume_key=resume_key,
                     start_date=str(start_date),
                     end_date=str(end_date),
                     cloud_max=cloud_max,
@@ -550,6 +630,7 @@ class NDVIEngine:
             "tiles": 1,
             "tiles_total": 1,
             "tiles_failed": 0,
+            "tiles_resumed": 0,
             "failed_tile_refs": [],
             "n_clusters": 1,
             "export_crs": export_crs,
@@ -594,6 +675,7 @@ class NDVIEngine:
                 "tiles": 1,
                 "tiles_total": 1,
                 "tiles_failed": 0,
+                "tiles_resumed": 0,
                 "failed_tile_refs": [],
                 "n_clusters": 1,
                 "export_crs": export_crs,
@@ -705,6 +787,7 @@ class NDVIEngine:
         export_distortion: float = 0.0,
         export_crs_name: str = "Web Mercator (legacy)",
         n_clusters: int = 1,
+        resume_key: str = "",
         cancel_callback: Callable[[], bool] | None = None,
         ndvi_progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
         write_geotiff: bool = True,
@@ -717,6 +800,9 @@ class NDVIEngine:
         ``{cluster_id, tile_idx, tile_geom_4326}`` dicts. Each tile is exported
         independently and mosaicked into one GeoTIFF; per-cluster GeoTIFF tile
         outputs are a separate downstream step (Phase 4).
+
+        ``resume_key`` selects the tile workspace; tiles already present from
+        a previous interrupted run with the same key are skipped.
         """
         n_tiles = len(tiles)
         _log(
@@ -732,8 +818,24 @@ class NDVIEngine:
             tiles=(0, n_tiles),
         )
 
-        work_dir = _ndvi_tile_workspace(output_name)
-        tile_files: list[str] = []
+        work_dir = _ndvi_resume_workspace(resume_key) if resume_key else (
+            _ndvi_resume_workspace("scratch")
+        )
+
+        # Resume: any tile already present on disk (and openable as a
+        # rasterio dataset) is reused as-is; only the remainder gets queued
+        # for download. Workspace survives across runs, so an interrupted job
+        # resumes mid-batch on the next attempt with the same key.
+        existing_tile_files, pending_tiles = _discover_resumable_tiles(work_dir, tiles)
+        n_resumed = len(existing_tile_files)
+        if n_resumed:
+            _log(
+                "INFO",
+                f"Resumed {n_resumed}/{n_tiles} tile(s) from previous run "
+                f"({work_dir}).",
+            )
+
+        tile_files: list[str] = list(existing_tile_files)
         # Tiles that exhausted the retry budget. Recorded with their
         # ``cluster_id`` / ``tile_idx`` / final error so the sidecar can
         # surface exactly which areas are NaN gaps in the mosaic.
@@ -749,7 +851,7 @@ class NDVIEngine:
             # throttled by the shared :func:`progress_interval_s` so the UI
             # bracket stays responsive without slamming the JobStore lock on
             # big runs.
-            done_count = 0
+            done_count = n_resumed
             last_emit_t = {"v": time.monotonic()}
             interval_s = progress_interval_s(n_tiles)
 
@@ -766,6 +868,10 @@ class NDVIEngine:
                     tiles=(k, n_tiles),
                 )
 
+            # Show the resumed count immediately so the bracket jumps to the
+            # right starting point instead of flashing 0/N.
+            _emit_progress(n_resumed)
+
             with ThreadPoolExecutor(
                 max_workers=_MAX_CONCURRENT_TILES,
                 thread_name_prefix="ndvi-tile",
@@ -780,7 +886,7 @@ class NDVIEngine:
                         export_crs,
                         cancel_callback,
                     ): ts
-                    for ts in tiles
+                    for ts in pending_tiles
                 }
                 cancelled = False
                 for fut in as_completed(futures):
@@ -882,12 +988,21 @@ class NDVIEngine:
         finally:
             if work_dir and os.path.isdir(work_dir):
                 if mosaic_ok:
+                    # Clean up only when the final mosaic landed cleanly.
+                    # Cancelled or errored runs keep the workspace on disk so
+                    # the next run with the same ``resume_key`` can pick up
+                    # the already-downloaded tiles instead of redoing them.
                     _emit_ndvi_progress(
                         ndvi_progress_callback,
                         sub_progress=0.86,
                         phase="Removing temporary tiles",
                     )
-                shutil.rmtree(work_dir, ignore_errors=True)
+                    shutil.rmtree(work_dir, ignore_errors=True)
+                else:
+                    _log(
+                        "INFO",
+                        f"Tile workspace preserved for resume: {work_dir}",
+                    )
 
         if cancel_callback and cancel_callback():
             return {"status": "cancelled", "message": "Cancelled by user"}
@@ -897,8 +1012,10 @@ class NDVIEngine:
             "tiles": n_mosaic_tiles,
             "tiles_total": n_tiles,
             "tiles_failed": len(failed_tile_refs),
+            "tiles_resumed": n_resumed,
             "failed_tile_refs": failed_tile_refs,
             "n_clusters": n_clusters,
+            "resume_key": resume_key,
             "export_crs": export_crs,
             "export_crs_name": export_crs_name,
             "export_distortion": export_distortion,
@@ -946,8 +1063,10 @@ class NDVIEngine:
                 "tiles": n_mosaic_tiles,
                 "tiles_total": n_tiles,
                 "tiles_failed": len(failed_tile_refs),
+                "tiles_resumed": n_resumed,
                 "failed_tile_refs": failed_tile_refs,
                 "n_clusters": n_clusters,
+                "resume_key": resume_key,
                 "export_crs": export_crs,
                 "export_crs_name": export_crs_name,
                 "export_distortion": export_distortion,
