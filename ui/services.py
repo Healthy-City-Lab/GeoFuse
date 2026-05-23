@@ -22,6 +22,7 @@ import streamlit as st
 
 from geofuse.persistence.job_executor import JobExecutor
 from geofuse.persistence.job_store import JobStore
+from geofuse.persistence.ndvi_tile_cache import NdviTileCache
 from geofuse.persistence.pano_cache import PanoCache
 
 # Colours mirror geofuse.logger._ANSI. We don't import them so that this
@@ -115,3 +116,10 @@ def get_job_executor() -> JobExecutor:
 def get_pano_cache() -> PanoCache:
     """SQLite-backed GVI pano cache. Global across study areas and runs."""
     return PanoCache("logs/caches/gvi_panos.db")
+
+
+@st.cache_resource
+def get_ndvi_tile_cache() -> NdviTileCache:
+    """Persistent NDVI tile cache. Filesystem-backed tile bodies + SQLite WAL
+    index for LRU eviction. Shared across runs and subprocesses."""
+    return NdviTileCache("logs/caches/ndvi_tiles")

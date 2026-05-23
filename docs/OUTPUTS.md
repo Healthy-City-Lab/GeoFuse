@@ -95,7 +95,7 @@ introspect a raster after the fact without re-running Earth Engine:
 | `export_crs` / `export_crs_name` / `export_crs_wkt` | Planar CRS pixels were rasterised in (EPSG ID, human-readable name, full WKT) |
 | `distortion` | Max relative deviation of a 1000 m planar step from true geodesic distance across the extent |
 | `n_clusters` / `tiles_total` / `tiles_succeeded` / `tiles_failed` / `tiles_resumed` | How the input decomposed into connected components and tiles, how many landed on disk vs. exhausted retry, and how many were reused from a previous interrupted run |
-| `resume_key` | Short hash over geometry + date range + cloud max + resolution + collection. Identifies the workspace under `temp/ndvi_tiles/<resume_key>/` and lets the next run with the same key skip already-downloaded tiles |
+| `resume_key` | Short hash over geometry + date range + cloud max + resolution + collection. Identifies the cache entry under `logs/caches/ndvi_tiles/<resume_key>/`. Lets any future run with the same key reuse already-downloaded tiles instantly (whether the previous run was interrupted or finished cleanly). LRU-evicted by the cache once total size exceeds the cap |
 | `failed_tile_refs` | List of `{cluster_id, tile_idx, error}` for tiles that hit the retry ceiling — these areas appear as NaN gaps in the mosaic, this lets you audit which |
 | `start_date` / `end_date` / `cloud_max` | EE collection filter used |
 | `resolution_m` / `max_tile_size_km` | Export resolution and tiling cap |

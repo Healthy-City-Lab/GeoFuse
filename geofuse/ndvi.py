@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 import time
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -26,15 +25,21 @@ from .crs_utils import (
 )
 from .jobs import progress_interval_s, retry_with_backoff
 from .logger import get_logger
+from .persistence.ndvi_tile_cache import DEFAULT_MAX_BYTES, NdviTileCache
 from .vector_io import geometry_sha256
 
 _log = get_logger("NDVI")
 
-# TODO: NDVI_CACHE - Implement local caching of Earth Engine tiles to reduce API calls
 # TODO: NDVI_LANDSAT - Add Landsat 8/9 support alongside Sentinel-2
 # TODO: NDVI_TEMPORAL - Add time-series analysis for seasonal greenery changes
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Persistent NDVI tile cache root. Mirrors the GVI pano cache location
+# (``logs/caches/gvi_panos.db``) so cross-process caches live under one
+# well-known directory. Tile bodies live under ``<root>/<resume_key>/``
+# alongside a SQLite WAL index used for LRU eviction.
+_TILE_CACHE_ROOT = os.path.join(_REPO_ROOT, "logs", "caches", "ndvi_tiles")
 
 # Concurrent tile-download workers. Earth Engine allows several parallel
 # ``ee_export_image`` calls per user well above this; the cap exists to avoid
@@ -67,19 +72,6 @@ def _compute_resume_key(
     h.update(f"|{start_date}|{end_date}|{cloud_max}|{resolution}|".encode())
     h.update(ee_collection.encode())
     return h.hexdigest()[:16]
-
-
-def _ndvi_resume_workspace(resume_key: str) -> str:
-    """Deterministic tile workspace at ``<repo>/temp/ndvi_tiles/<resume_key>/``.
-
-    Survives across runs and process restarts so an interrupted job can
-    resume from disk — successful runs clean their own workspace at the end
-    (see :meth:`NDVIEngine._download_with_tiling`). Errored or cancelled
-    runs leave it intact for the next attempt with the same key to pick up.
-    """
-    path = os.path.join(_REPO_ROOT, "temp", "ndvi_tiles", resume_key)
-    os.makedirs(path, exist_ok=True)
-    return path
 
 
 def _discover_resumable_tiles(
@@ -216,7 +208,24 @@ class NDVIEngine:
     #: the collection without re-implementing the wrapper).
     EE_COLLECTION_ID = "COPERNICUS/S2_SR_HARMONIZED"
 
-    def __init__(self, project_id=None):
+    def __init__(
+        self,
+        project_id=None,
+        *,
+        tile_cache: NdviTileCache | None = None,
+        tile_cache_dir: str | None = None,
+        tile_cache_max_bytes: int = DEFAULT_MAX_BYTES,
+    ):
+        """Initialize Earth Engine and open the persistent tile cache.
+
+        ``tile_cache`` lets the caller inject a shared :class:`NdviTileCache`
+        (e.g. a singleton from ``ui/services.py``). When omitted, the engine
+        opens its own at ``tile_cache_dir`` (default
+        ``<repo>/logs/caches/ndvi_tiles/``) so direct API callers — fusion
+        auto-download, CLI, notebooks — benefit from the same cross-run
+        cache the UI uses. The cache is keyed by ``resume_key`` (Step 9) so
+        repeat runs over the same area + date range are near-instant.
+        """
         try:
             if project_id:
                 ee.Initialize(project=project_id)
@@ -229,6 +238,12 @@ class NDVIEngine:
                 ee.Initialize()
             except Exception as final_e:
                 raise final_e
+
+        if tile_cache is not None:
+            self.tile_cache = tile_cache
+        else:
+            root = tile_cache_dir if tile_cache_dir is not None else _TILE_CACHE_ROOT
+            self.tile_cache = NdviTileCache(root, max_bytes=tile_cache_max_bytes)
 
     def prep_ndvi(self, img):
         scale = 0.0001
@@ -818,14 +833,19 @@ class NDVIEngine:
             tiles=(0, n_tiles),
         )
 
-        work_dir = _ndvi_resume_workspace(resume_key) if resume_key else (
-            _ndvi_resume_workspace("scratch")
-        )
+        # The cache directory doubles as both the in-progress workspace
+        # *and* the cross-run cache: successful runs leave their tiles in
+        # place so a future run with the same ``resume_key`` (same area +
+        # date range + cloud max + resolution + collection) reuses every
+        # tile instantly. The cache's LRU + size cap reclaims old entries
+        # when it grows past the configured ceiling.
+        work_dir = self.tile_cache.workspace_dir(resume_key or "scratch")
 
         # Resume: any tile already present on disk (and openable as a
         # rasterio dataset) is reused as-is; only the remainder gets queued
-        # for download. Workspace survives across runs, so an interrupted job
-        # resumes mid-batch on the next attempt with the same key.
+        # for download. Same lookup whether we're resuming an interrupted
+        # run or hitting a previously-cached one — only the user-facing log
+        # message differs.
         existing_tile_files, pending_tiles = _discover_resumable_tiles(work_dir, tiles)
         n_resumed = len(existing_tile_files)
         if n_resumed:
@@ -987,18 +1007,27 @@ class NDVIEngine:
 
         finally:
             if work_dir and os.path.isdir(work_dir):
-                if mosaic_ok:
-                    # Clean up only when the final mosaic landed cleanly.
-                    # Cancelled or errored runs keep the workspace on disk so
-                    # the next run with the same ``resume_key`` can pick up
-                    # the already-downloaded tiles instead of redoing them.
+                if mosaic_ok and resume_key:
+                    # Don't delete the workspace — it's the persistent cache
+                    # now. Record the on-disk footprint + access time so the
+                    # LRU eviction has correct numbers, then trim to the cap.
                     _emit_ndvi_progress(
                         ndvi_progress_callback,
                         sub_progress=0.86,
-                        phase="Removing temporary tiles",
+                        phase="Updating tile cache",
                     )
-                    shutil.rmtree(work_dir, ignore_errors=True)
-                else:
+                    try:
+                        self.tile_cache.touch(resume_key)
+                        n_evicted, bytes_freed = self.tile_cache.evict_lru()
+                        if n_evicted:
+                            _log(
+                                "INFO",
+                                f"Tile cache: evicted {n_evicted} LRU entry/entries "
+                                f"({bytes_freed / 1024**2:.0f} MB) to stay under cap.",
+                            )
+                    except Exception as e:
+                        _log("WARN", f"Tile cache bookkeeping failed: {e}")
+                elif not mosaic_ok:
                     _log(
                         "INFO",
                         f"Tile workspace preserved for resume: {work_dir}",
