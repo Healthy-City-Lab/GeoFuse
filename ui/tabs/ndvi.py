@@ -31,7 +31,6 @@ from geofuse.crs_utils import (
     metres_per_degree_at_lat,
     reproject_geodataframe_to_wgs84,
 )
-from geofuse.jobs.runners import run_ndvi, run_ndvi_column
 from geofuse.vector_io import geometry_sha256
 
 # ---------------------------------------------------------------------------
@@ -200,18 +199,16 @@ def _render_ndvi_restart_panel(store, executor, output_dir) -> None:
         }
 
         if rec.type == "ndvi":
-            executor.submit_runner(
+            executor.submit_ndvi_subprocess(
                 record,
-                run_ndvi,
                 start_date=str(p.get("start_date", "")),
                 end_date=str(p.get("end_date", "")),
                 output_name=str(p.get("output_name", base_name)),
                 **common,
             )
         else:  # ndvi_column
-            executor.submit_runner(
+            executor.submit_ndvi_column_subprocess(
                 record,
-                run_ndvi_column,
                 date_column=str(p.get("date_column", "")),
                 window_days=int(p.get("window_days", 30)),
                 **common,
@@ -737,9 +734,8 @@ def render(output_dir: str) -> None:
                                 "geometry_sha256": geometry_sha256(d["raw"]),
                             },
                         )
-                        executor.submit_runner(
+                        executor.submit_ndvi_subprocess(
                             record,
-                            run_ndvi,
                             fname=fname,
                             dataset_data=d,
                             start_date=start_d.isoformat(),
@@ -791,9 +787,8 @@ def render(output_dir: str) -> None:
                                 "geometry_sha256": geometry_sha256(d["raw"]),
                             },
                         )
-                        executor.submit_runner(
+                        executor.submit_ndvi_subprocess(
                             record,
-                            run_ndvi,
                             fname=fname,
                             dataset_data=d,
                             start_date=start_d.isoformat(),
@@ -836,9 +831,8 @@ def render(output_dir: str) -> None:
                                 "geometry_sha256": geometry_sha256(d["raw"]),
                             },
                         )
-                        executor.submit_runner(
+                        executor.submit_ndvi_column_subprocess(
                             record,
-                            run_ndvi_column,
                             fname=fname,
                             dataset_data=d,
                             date_column=date_col,
