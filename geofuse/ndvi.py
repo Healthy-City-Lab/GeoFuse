@@ -24,7 +24,7 @@ from .crs_utils import (
     select_grid_crs_with_warning,
     stream_mosaic_to_geotiff,
 )
-from .jobs import progress_interval_s
+from .jobs import progress_interval_s, retry_with_backoff
 from .logger import get_logger
 
 _log = get_logger("NDVI")
@@ -89,6 +89,8 @@ def _write_ndvi_sidecar(
     n_clusters: int,
     tiles_total: int,
     tiles_succeeded: int,
+    tiles_failed: int = 0,
+    failed_tile_refs: list[dict] | None = None,
     start_date: str,
     end_date: str,
     cloud_max: float,
@@ -102,7 +104,9 @@ def _write_ndvi_sidecar(
     notebooks) can introspect an NDVI raster after the fact: which planar CRS
     pixels were rasterised in, how much distortion that introduced, how many
     clusters and tiles the input decomposed into, the exact date range, and
-    which Earth Engine ImageCollection was queried.
+    which Earth Engine ImageCollection was queried. ``failed_tile_refs``
+    lists the cluster/tile IDs that exhausted their retry budget — those
+    areas appear as NaN gaps in the mosaic.
     """
     sidecar_path = os.path.join(folder, f"{output_name}_ndvi.json")
     payload = {
@@ -113,6 +117,8 @@ def _write_ndvi_sidecar(
         "n_clusters": int(n_clusters),
         "tiles_total": int(tiles_total),
         "tiles_succeeded": int(tiles_succeeded),
+        "tiles_failed": int(tiles_failed),
+        "failed_tile_refs": list(failed_tile_refs or []),
         "start_date": str(start_date),
         "end_date": str(end_date),
         "cloud_max": float(cloud_max),
@@ -420,6 +426,8 @@ class NDVIEngine:
             raw_meta = result.get("meta")
             result_meta: dict = raw_meta if isinstance(raw_meta, dict) else {}
             tiles_succeeded = int(result_meta.get("tiles", n_tiles))
+            tiles_failed = int(result_meta.get("tiles_failed", 0))
+            failed_refs = result_meta.get("failed_tile_refs") or []
             try:
                 sidecar_path = _write_ndvi_sidecar(
                     folder,
@@ -431,6 +439,8 @@ class NDVIEngine:
                     n_clusters=n_clusters,
                     tiles_total=n_tiles,
                     tiles_succeeded=tiles_succeeded,
+                    tiles_failed=tiles_failed,
+                    failed_tile_refs=failed_refs,
                     start_date=str(start_date),
                     end_date=str(end_date),
                     cloud_max=cloud_max,
@@ -474,13 +484,26 @@ class NDVIEngine:
         final_tif = os.path.join(folder, f"{output_name}_ndvi.tif")
 
         try:
-            geemap.ee_export_image(
-                ndvi_median.unmask(-9999),
-                filename=temp_tif,
-                scale=resolution,
-                crs=export_crs,
-                region=aoi,
-                file_per_band=False,
+
+            def _do_export() -> None:
+                geemap.ee_export_image(
+                    ndvi_median.unmask(-9999),
+                    filename=temp_tif,
+                    scale=resolution,
+                    crs=export_crs,
+                    region=aoi,
+                    file_per_band=False,
+                )
+
+            # Same retry policy as the tiled path so a flaky network doesn't
+            # blow up the single small-area run on the first transient.
+            retry_with_backoff(
+                _do_export,
+                attempts=3,
+                base_delay=2.0,
+                cancel_callback=cancel_callback,
+                log_fn=_log,
+                label="EE export",
             )
 
             if cancel_callback and cancel_callback():
@@ -526,6 +549,8 @@ class NDVIEngine:
             "crs": crs_meta,
             "tiles": 1,
             "tiles_total": 1,
+            "tiles_failed": 0,
+            "failed_tile_refs": [],
             "n_clusters": 1,
             "export_crs": export_crs,
             "export_crs_name": export_crs_name,
@@ -566,6 +591,11 @@ class NDVIEngine:
             sub_start=0.52,
             sub_end=0.99,
             meta_extra={
+                "tiles": 1,
+                "tiles_total": 1,
+                "tiles_failed": 0,
+                "failed_tile_refs": [],
+                "n_clusters": 1,
                 "export_crs": export_crs,
                 "export_crs_name": export_crs_name,
                 "export_distortion": export_distortion,
@@ -612,13 +642,30 @@ class NDVIEngine:
         try:
             tile_aoi = _shapely_to_ee_geometry(tile_geom)
             tile_ndvi = ndvi_median.clip(tile_aoi)
-            geemap.ee_export_image(
-                tile_ndvi.unmask(-9999),
-                filename=tile_temp,
-                scale=resolution,
-                crs=export_crs,
-                region=tile_aoi,
-                file_per_band=False,
+
+            def _do_export() -> None:
+                # Whole EE-export step is the retry unit. Tile-temp on disk
+                # from a half-finished previous attempt would be overwritten
+                # by the next call; geemap doesn't refuse to overwrite.
+                geemap.ee_export_image(
+                    tile_ndvi.unmask(-9999),
+                    filename=tile_temp,
+                    scale=resolution,
+                    crs=export_crs,
+                    region=tile_aoi,
+                    file_per_band=False,
+                )
+
+            # 3 attempts with 2 s base delay, doubling each time (≈ 2 s, 4 s
+            # between retries before jitter). Flaky network = single failed
+            # tile, not a swiss-cheese mosaic.
+            retry_with_backoff(
+                _do_export,
+                attempts=3,
+                base_delay=2.0,
+                cancel_callback=cancel_callback,
+                log_fn=_log,
+                label=f"Tile {idx + 1} EE export",
             )
 
             if cancel_callback and cancel_callback():
@@ -687,6 +734,10 @@ class NDVIEngine:
 
         work_dir = _ndvi_tile_workspace(output_name)
         tile_files: list[str] = []
+        # Tiles that exhausted the retry budget. Recorded with their
+        # ``cluster_id`` / ``tile_idx`` / final error so the sidecar can
+        # surface exactly which areas are NaN gaps in the mosaic.
+        failed_tile_refs: list[dict] = []
         mosaic_ok = False
         final_tif = os.path.join(folder, f"{output_name}_ndvi.tif")
 
@@ -738,9 +789,18 @@ class NDVIEngine:
                     if res["success"] and res["tile_final"] is not None:
                         tile_files.append(res["tile_final"])
                     elif res.get("error"):
+                        tile_spec = futures[fut]
+                        failed_tile_refs.append(
+                            {
+                                "cluster_id": int(tile_spec["cluster_id"]),
+                                "tile_idx": int(res["idx"]),
+                                "error": str(res["error"]),
+                            }
+                        )
                         _log(
                             "WARN",
-                            f"Tile {res['idx'] + 1} failed: {res['error']}",
+                            f"Tile {res['idx'] + 1} failed after retry: "
+                            f"{res['error']}",
                         )
                     _emit_progress(done_count)
                     if cancel_callback and cancel_callback():
@@ -759,6 +819,14 @@ class NDVIEngine:
 
             if not tile_files:
                 return {"status": "error", "message": "All tiles failed to download"}
+
+            if failed_tile_refs:
+                _log(
+                    "WARN",
+                    f"{len(failed_tile_refs)}/{n_tiles} tile(s) failed after retry "
+                    "— mosaic will have NaN gaps in those areas. "
+                    "See sidecar JSON for the cluster/tile IDs.",
+                )
 
             _log(
                 "OK",
@@ -828,6 +896,8 @@ class NDVIEngine:
         meta_base: dict[str, Any] = {
             "tiles": n_mosaic_tiles,
             "tiles_total": n_tiles,
+            "tiles_failed": len(failed_tile_refs),
+            "failed_tile_refs": failed_tile_refs,
             "n_clusters": n_clusters,
             "export_crs": export_crs,
             "export_crs_name": export_crs_name,
@@ -875,6 +945,8 @@ class NDVIEngine:
             meta_extra={
                 "tiles": n_mosaic_tiles,
                 "tiles_total": n_tiles,
+                "tiles_failed": len(failed_tile_refs),
+                "failed_tile_refs": failed_tile_refs,
                 "n_clusters": n_clusters,
                 "export_crs": export_crs,
                 "export_crs_name": export_crs_name,
