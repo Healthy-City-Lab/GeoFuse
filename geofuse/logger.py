@@ -26,6 +26,7 @@ Levels
 
 from __future__ import annotations
 
+import logging
 import os
 import queue
 import re
@@ -176,3 +177,103 @@ def get_logger(engine: str):
             pass  # Queue is unbounded so this is defensive only.
 
     return log
+
+
+# ---------------------------------------------------------------------------
+# External-library log routing (Earth Engine, urllib3, optuna, …)
+# ---------------------------------------------------------------------------
+#
+# Third-party packages emit their own diagnostics through stdlib ``logging``.
+# Without intervention these bubble up to the root logger and print on the
+# host terminal — for Streamlit jobs that means a steady stream of EE / HTTP
+# noise on the parent console while the job runs. The handler below pushes
+# those records into the *same* per-job pipeline that engine ``_log()`` calls
+# use, and ``attach_external_logger`` flips ``propagate = False`` so root
+# never sees them.
+
+_attached_external_loggers: set[str] = set()
+_attached_lock = threading.Lock()
+
+
+def _map_stdlib_level(levelno: int) -> str:
+    """Coarse mapping from stdlib log levels to our four-level palette."""
+    if levelno >= logging.ERROR:
+        return "ERROR"
+    if levelno >= logging.WARNING:
+        return "WARN"
+    return "INFO"
+
+
+class _ExternalLoggerHandler(logging.Handler):
+    """Bridge a stdlib :class:`logging.Logger` into the per-job log pipeline.
+
+    The handler formats the record, maps the level into our palette, and
+    pushes it onto ``_log_queue`` for the same listener thread that handles
+    in-process ``_log()`` calls. When unbound (no job in flight) the record
+    is silently dropped, mirroring ``get_logger().log`` behaviour.
+    """
+
+    def __init__(self, source_name: str) -> None:
+        super().__init__()
+        self._tag = source_name.upper()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        job_id = getattr(_current_job, "job_id", None)
+        if job_id is None:
+            return
+        try:
+            msg = record.getMessage()
+        except Exception:
+            msg = str(record.msg)
+        level = _map_stdlib_level(record.levelno)
+        color = _ANSI.get(level, "")
+        colored_line = (
+            f"{color}{_ANSI['BOLD']}[{self._tag} {level}]{_ANSI['RESET']} {msg}"
+        )
+        plain_line = _ANSI_ESCAPE_RE.sub("", f"[{self._tag} {level}] {msg}")
+        try:
+            _log_queue.put_nowait((job_id, colored_line, plain_line))
+        except queue.Full:
+            pass
+
+
+def attach_external_logger(name: str, level: int = logging.INFO) -> None:
+    """Route a third-party stdlib logger into the per-job log pipeline.
+
+    Call once per logger name (idempotent). After attachment:
+
+    * Records emitted at ``level`` or above land in the bound job's deque +
+      file alongside engine ``_log()`` output.
+    * ``propagate = False`` on the source logger so records **do not** reach
+      the root logger — this is what keeps the Streamlit host terminal
+      clean of Earth Engine / urllib3 chatter.
+
+    Child loggers (``ee.client``, ``ee.deserializer``, …) inherit the
+    attachment automatically because stdlib logging walks up the dotted
+    namespace until it finds a handler.
+
+    Safe to call from multiple engines / subprocesses — global stdlib
+    logging state is per-process and a ``_attached_external_loggers`` set
+    keeps re-attachment a no-op.
+
+    Any pre-existing handlers on the source logger are removed — some
+    libraries (Optuna in particular) install their own ``StreamHandler``
+    writing to ``sys.stderr`` at import time, and that handler bypasses
+    propagation entirely. We take exclusive ownership so the host terminal
+    stays clean.
+    """
+    with _attached_lock:
+        if name in _attached_external_loggers:
+            return
+        _attached_external_loggers.add(name)
+    src = logging.getLogger(name)
+    # Drop library-installed handlers (Optuna's default stderr StreamHandler
+    # is the canonical offender) so we own routing for this logger.
+    for h in list(src.handlers):
+        src.removeHandler(h)
+    src.setLevel(level)
+    # Critical: stop records from propagating to root, which is where the
+    # default Streamlit / Python console output lives.
+    src.propagate = False
+    src.addHandler(_ExternalLoggerHandler(name))
+    _ensure_listener()

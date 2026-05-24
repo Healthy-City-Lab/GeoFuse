@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import time
 from collections.abc import Callable, Mapping
@@ -24,7 +25,7 @@ from .crs_utils import (
     stream_mosaic_to_geotiff,
 )
 from .jobs import progress_interval_s, retry_with_backoff
-from .logger import get_logger
+from .logger import attach_external_logger, get_logger
 from .persistence.ndvi_tile_cache import DEFAULT_MAX_BYTES, NdviTileCache
 from .vector_io import geometry_sha256
 
@@ -225,7 +226,16 @@ class NDVIEngine:
         auto-download, CLI, notebooks — benefit from the same cross-run
         cache the UI uses. The cache is keyed by ``resume_key`` (Step 9) so
         repeat runs over the same area + date range are near-instant.
+
+        Earth Engine's stdlib ``logging`` output is captured into the bound
+        per-job log here (with propagation to the root logger disabled),
+        keeping the Streamlit host terminal free of EE chatter.
         """
+        # Route the Earth Engine stdlib logger (and its descendants) into
+        # the per-job pipeline before EE itself starts talking. Idempotent
+        # across engine instances and processes.
+        attach_external_logger("ee", logging.INFO)
+
         try:
             if project_id:
                 ee.Initialize(project=project_id)

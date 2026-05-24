@@ -30,7 +30,7 @@ from .crs_utils import (
     normalize_geographic_gdf_to_wgs84,
     reproject_geodataframe_to_wgs84,
 )
-from .logger import get_logger
+from .logger import attach_external_logger, get_logger
 from .vector_io import target_path_is_raster
 
 logger = logging.getLogger(__name__)
@@ -138,6 +138,15 @@ class MetricFusionEngine:
             n_bins: Number of bins for stratified splitting
             cache_dir: Directory to cache downloaded metrics
         """
+        # Route Optuna's chatter ("Trial X finished with value Y …") into
+        # the per-job log instead of the Streamlit host terminal. Fusion
+        # auto-downloads NDVI for the buffered extent, so attach ``ee`` too —
+        # those records would otherwise propagate to root from this process.
+        import logging as _logging
+
+        attach_external_logger("optuna", _logging.INFO)
+        attach_external_logger("ee", _logging.INFO)
+
         self.target_file = target_file
         self.target_feature = target_feature
         self.target_band = target_band
