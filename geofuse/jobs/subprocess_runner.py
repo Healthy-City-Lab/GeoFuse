@@ -64,17 +64,113 @@ class SubprocJobContext:
         return bool(self._cancel_event.is_set())
 
 
-def route_engine_logging_to_queue(job_id: str, event_queue) -> None:
-    """Forward every engine ``_log()`` call to the parent via ``event_queue``.
+class _QueueStreamWriter:
+    """File-like wrapper that forwards each line written to it onto an
+    ``mp.Queue`` as an ``MSG_LOG`` event.
 
-    Engine modules cached ``_log = get_logger("ENGINE")`` at import time, so
-    we can't intercept by replacing ``get_logger``. Instead we replace the
-    queue the closures push onto — Python resolves free variables against
-    the module namespace at call time, so existing closures see the swap.
-
-    The ``_current_job.job_id`` setup ensures the closures' ``if job_id is
-    None: return`` guard doesn't drop everything before we get a chance.
+    Installed on the subprocess child's ``sys.stdout`` / ``sys.stderr`` so
+    that third-party libraries which write directly to those streams
+    (``geemap.ee_export_image`` prints "Generating URL …" / "Downloading
+    data from …", Earth Engine's auth flow, tqdm progress, etc.) land in
+    the per-job log instead of leaking through to the parent process's
+    terminal. Buffered to a newline so partial writes (e.g. ``tqdm`` ``\r``
+    repaints) don't produce a flood of one-character messages.
     """
+
+    def __init__(self, tag: str, level: str, event_queue) -> None:
+        self._tag = tag.upper()
+        self._level = level
+        self._queue = event_queue
+        self._buf = ""
+
+    def write(self, s):  # noqa: D401 — file-like API
+        if not s:
+            return 0
+        # Some libraries write ``bytes`` to the underlying stream; coerce.
+        if isinstance(s, bytes):
+            try:
+                s = s.decode("utf-8", errors="replace")
+            except Exception:
+                s = repr(s)
+        self._buf += s
+        # Treat ``\r`` like ``\n`` so tqdm progress bars get flushed
+        # instead of silently accumulating in the buffer.
+        normalised = self._buf.replace("\r", "\n")
+        if "\n" not in normalised:
+            return len(s)
+        parts = normalised.split("\n")
+        # Last fragment is the still-incomplete tail.
+        self._buf = parts[-1]
+        for line in parts[:-1]:
+            line = line.rstrip()
+            if line:
+                self._emit(line)
+        return len(s)
+
+    def flush(self) -> None:
+        if self._buf.strip():
+            self._emit(self._buf.strip())
+        self._buf = ""
+
+    def isatty(self) -> bool:
+        return False
+
+    def writable(self) -> bool:
+        return True
+
+    def readable(self) -> bool:
+        return False
+
+    def fileno(self) -> int:
+        # Some libraries probe for the underlying OS file descriptor.
+        # ``UnsupportedOperation`` is the standard signal that this stream
+        # is text-only / synthetic — libraries that handle it gracefully
+        # (tqdm, click, …) fall back to non-fd code paths.
+        import io
+
+        raise io.UnsupportedOperation("fileno")
+
+    def _emit(self, line: str) -> None:
+        # Lazy import keeps this file importable before geofuse.logger
+        # finishes initialising in a freshly-spawned child.
+        from geofuse.logger import _ANSI, _ANSI_ESCAPE_RE
+
+        color = _ANSI.get(self._level, "")
+        colored = (
+            f"{color}{_ANSI['BOLD']}[{self._tag} {self._level}]"
+            f"{_ANSI['RESET']} {line}"
+        )
+        plain = _ANSI_ESCAPE_RE.sub("", f"[{self._tag} {self._level}] {line}")
+        try:
+            self._queue.put((MSG_LOG, colored, plain))
+        except Exception:
+            pass
+
+
+def route_engine_logging_to_queue(job_id: str, event_queue) -> None:
+    """Forward every engine log line *and stdout/stderr write* in the child to the parent.
+
+    Three things happen here:
+
+    1. ``geofuse.logger._current_job.job_id`` is set so the captured-at-
+       import-time engine ``_log()`` closures stop short-circuiting on the
+       unbound-job guard.
+    2. ``geofuse.logger._log_queue`` is swapped for a forwarding queue that
+       pushes onto ``event_queue``. Python resolves free variables against
+       the module namespace at call time, so existing engine closures pick
+       up the swap automatically.
+    3. ``sys.stdout`` / ``sys.stderr`` are replaced with line-buffered
+       writers that push onto the same queue. Without this, libraries that
+       use ``print()`` or ``sys.stderr.write()`` (notably ``geemap`` —
+       which prints "Generating URL …" / "Downloading data from …" for
+       every tile — and Earth Engine's auth flow) bypass stdlib logging
+       entirely and their output leaks straight to the parent's terminal.
+       Subprocess children inherit the parent's stdio handles by default,
+       so this replacement is what stops the PowerShell window from
+       filling up with EE chatter during a run.
+    """
+    import sys
+
     from geofuse import logger as _logger
 
     _logger._current_job.job_id = job_id
@@ -99,6 +195,13 @@ def route_engine_logging_to_queue(job_id: str, event_queue) -> None:
             self.put_nowait(item)
 
     _logger._log_queue = _ForwardingQueue()
+
+    # Replace child stdio so ``print()`` / ``sys.stderr.write`` from any
+    # library running in this process land in the per-job log instead of
+    # the parent's terminal. The child is dedicated to one job, so this
+    # is process-wide by design.
+    sys.stdout = _QueueStreamWriter("STDOUT", "INFO", event_queue)
+    sys.stderr = _QueueStreamWriter("STDERR", "WARN", event_queue)
 
 
 def drain_events_until_done(
