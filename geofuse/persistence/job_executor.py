@@ -360,6 +360,7 @@ class JobExecutor:
         save_geotiff: bool,
         save_geojson: bool,
         save_gpkg: bool,
+        save_cluster_tiles: bool = False,
     ) -> Future:
         """Run an NDVI (single-range) job in a fresh subprocess.
 
@@ -390,6 +391,7 @@ class JobExecutor:
                 save_geotiff=save_geotiff,
                 save_geojson=save_geojson,
                 save_gpkg=save_gpkg,
+                save_cluster_tiles=save_cluster_tiles,
             ),
             process_name=f"ndvi-child-{record.id}",
         )

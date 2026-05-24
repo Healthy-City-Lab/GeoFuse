@@ -85,6 +85,19 @@ Vector point data with:
 | `x`, `y` | Geographic coordinates (EPSG:4326) |
 | `ndvi_date` | Source date (attribute-column mode only) |
 
+### `[Filename]_ndvi_tiles/` (optional)
+
+Per-cluster GeoTIFF tile directory, written when the **Per-cluster tiles**
+output is enabled. Avoids the giant mostly-NaN single mosaic that scattered
+national-scale inputs would otherwise produce. Contents:
+
+* `cluster_NNNN.tif` — one EPSG:4326 GeoTIFF per connected component of the
+  buffered input geometry, sized to the cluster's bbox.
+* `tiles_index.json` — `{crs, export_crs, export_crs_name, resume_key,
+  n_clusters, clusters: [{cluster_id, path, bounds_4326, n_tiles}, …]}`
+  so downstream tools can pick the right cluster file without reopening
+  every raster.
+
 ### `[Filename]_ndvi.json` (always written on success)
 
 Sidecar metadata mirroring GVI's `_gvi.json`. Lets fusion and custom tooling

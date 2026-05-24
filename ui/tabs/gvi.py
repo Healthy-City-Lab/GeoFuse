@@ -480,7 +480,8 @@ def render(output_dir: str, parent_dir: str) -> None:
             st.write(
                 f"**Outputs:** GeoTIFF={bool(p.get('save_geotiff'))} · "
                 f"GeoPackage={bool(p.get('save_gpkg'))} · "
-                f"GeoJSON={bool(p.get('save_geojson'))}"
+                f"GeoJSON={bool(p.get('save_geojson'))} · "
+                f"ClusterTiles={bool(p.get('save_cluster_tiles'))}"
             )
         elif rec.type == "fusion":
             st.write(

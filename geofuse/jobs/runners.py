@@ -319,6 +319,7 @@ def run_ndvi(
     save_geotiff: bool,
     save_geojson: bool,
     save_gpkg: bool = False,
+    save_cluster_tiles: bool = False,
 ) -> dict:
     """Run NDVI for a single date range."""
     from geofuse.crs_utils import buffer_gdf_union_metres
@@ -345,6 +346,7 @@ def run_ndvi(
         write_geotiff=save_geotiff,
         write_geojson=save_geojson,
         write_geopackage=save_gpkg,
+        write_cluster_tiles=save_cluster_tiles,
     )
 
     if result.get("status") == "cancelled":
@@ -365,6 +367,9 @@ def run_ndvi(
     sidecar_path = os.path.join(output_dir, f"{output_name}_ndvi.json")
     if os.path.exists(sidecar_path):
         output_paths.append(sidecar_path)
+    cluster_tiles_dir = os.path.join(output_dir, f"{output_name}_ndvi_tiles")
+    if save_cluster_tiles and os.path.isdir(cluster_tiles_dir):
+        output_paths.append(cluster_tiles_dir)
 
     ctx.progress(value=1.0, status_text="Completed")
     return {"output_paths": output_paths}

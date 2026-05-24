@@ -139,7 +139,8 @@ def _ndvi_restart_summary_lines(p: dict) -> list[str]:
     lines.append(
         f"**Outputs:** GeoTIFF={bool(p.get('save_geotiff'))} · "
         f"GeoPackage={bool(p.get('save_gpkg'))} · "
-        f"GeoJSON={bool(p.get('save_geojson'))}"
+        f"GeoJSON={bool(p.get('save_geojson'))} · "
+        f"ClusterTiles={bool(p.get('save_cluster_tiles'))}"
     )
     return lines
 
@@ -204,9 +205,12 @@ def _render_ndvi_restart_panel(store, executor, output_dir) -> None:
                 start_date=str(p.get("start_date", "")),
                 end_date=str(p.get("end_date", "")),
                 output_name=str(p.get("output_name", base_name)),
+                save_cluster_tiles=bool(p.get("save_cluster_tiles", False)),
                 **common,
             )
         else:  # ndvi_column
+            # Per-cluster tiles only apply to the single-range path (column
+            # mode produces per-date outputs already).
             executor.submit_ndvi_column_subprocess(
                 record,
                 date_column=str(p.get("date_column", "")),
@@ -621,7 +625,7 @@ def render(output_dir: str) -> None:
         int(st.session_state.get("ndvi_res", 10)),
     )
 
-    oc_ndvi_a, oc_ndvi_b, oc_ndvi_c = st.columns(3)
+    oc_ndvi_a, oc_ndvi_b, oc_ndvi_c, oc_ndvi_d = st.columns(4)
     with oc_ndvi_a:
         st.checkbox(
             "Save GeoTIFF",
@@ -646,6 +650,18 @@ def render(output_dir: str) -> None:
             key="ndvi_out_geojson",
             help="Compatibility option only. Slow to read past ~100k points.",
         )
+    with oc_ndvi_d:
+        st.checkbox(
+            "Per-cluster tiles",
+            value=False,
+            key="ndvi_out_cluster_tiles",
+            help=(
+                "For scattered inputs (one feature per city / province), write "
+                "one GeoTIFF per connected component into "
+                "`{name}_ndvi_tiles/` plus a `tiles_index.json`. Avoids the "
+                "single mostly-NaN continent-spanning mosaic."
+            ),
+        )
     run = st.button(
         "🚀 Run NDVI Analysis",
         type="primary",
@@ -660,6 +676,7 @@ def render(output_dir: str) -> None:
         st.session_state.get("ndvi_out_geotiff", True)
         or st.session_state.get("ndvi_out_gpkg", False)
         or st.session_state.get("ndvi_out_geojson", False)
+        or st.session_state.get("ndvi_out_cluster_tiles", False)
     )
 
     if run:
@@ -675,6 +692,7 @@ def render(output_dir: str) -> None:
             save_gt = st.session_state.get("ndvi_out_geotiff", True)
             save_gj = st.session_state.get("ndvi_out_geojson", False)
             save_gp = st.session_state.get("ndvi_out_gpkg", False)
+            save_ct = st.session_state.get("ndvi_out_cluster_tiles", False)
             jobs_started = 0
             validation_errors = []
 
@@ -731,6 +749,7 @@ def render(output_dir: str) -> None:
                                 "save_geotiff": save_gt,
                                 "save_gpkg": save_gp,
                                 "save_geojson": save_gj,
+                                "save_cluster_tiles": save_ct,
                                 "geometry_sha256": geometry_sha256(d["raw"]),
                             },
                         )
@@ -748,6 +767,7 @@ def render(output_dir: str) -> None:
                             save_geotiff=save_gt,
                             save_gpkg=save_gp,
                             save_geojson=save_gj,
+                            save_cluster_tiles=save_ct,
                         )
                         jobs_started += 1
 
@@ -784,6 +804,7 @@ def render(output_dir: str) -> None:
                                 "save_geotiff": save_gt,
                                 "save_gpkg": save_gp,
                                 "save_geojson": save_gj,
+                                "save_cluster_tiles": save_ct,
                                 "geometry_sha256": geometry_sha256(d["raw"]),
                             },
                         )
@@ -801,6 +822,7 @@ def render(output_dir: str) -> None:
                             save_geotiff=save_gt,
                             save_gpkg=save_gp,
                             save_geojson=save_gj,
+                            save_cluster_tiles=save_ct,
                         )
                         jobs_started += 1
 

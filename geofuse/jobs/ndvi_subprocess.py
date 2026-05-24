@@ -34,6 +34,7 @@ def run_ndvi_child(
     save_geotiff: bool,
     save_geojson: bool,
     save_gpkg: bool,
+    save_cluster_tiles: bool,
     event_queue,
     cancel_event,
 ) -> None:
@@ -64,6 +65,7 @@ def run_ndvi_child(
             save_geotiff=save_geotiff,
             save_geojson=save_geojson,
             save_gpkg=save_gpkg,
+            save_cluster_tiles=save_cluster_tiles,
         )
         event_queue.put((MSG_COMPLETE, list(result.get("output_paths") or [])))
 

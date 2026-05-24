@@ -381,6 +381,7 @@ class NDVIEngine:
         write_geotiff: bool = True,
         write_geojson: bool = True,
         write_geopackage: bool = False,
+        write_cluster_tiles: bool = False,
     ):
         """
         Download and process NDVI data with automatic tiling for large areas.
@@ -402,13 +403,20 @@ class NDVIEngine:
             write_geotiff: Persist ``{output_name}_ndvi.tif`` when True.
             write_geojson: Persist ``{output_name}_ndvi.geojson`` when True (needs raster).
             write_geopackage: Persist ``{output_name}_ndvi.gpkg`` when True (needs raster).
+            write_cluster_tiles: For multi-cluster inputs, mosaic each cluster
+                into its own ``{output_name}_ndvi_tiles/cluster_NNNN.tif`` plus
+                a ``tiles_index.json``. Mirrors GVI's per-cluster GeoTIFF tile
+                output and avoids the giant mostly-NaN mosaic that scattered
+                national-scale inputs would otherwise produce.
         """
         os.makedirs(folder, exist_ok=True)
 
-        if not (write_geotiff or write_geojson or write_geopackage):
+        if not (
+            write_geotiff or write_geojson or write_geopackage or write_cluster_tiles
+        ):
             return {
                 "status": "error",
-                "message": "Enable at least one output format (GeoTIFF, GeoPackage, or GeoJSON).",
+                "message": "Enable at least one output format (GeoTIFF, GeoPackage, GeoJSON, or cluster tiles).",
             }
 
         # 1. Convert Geometry — reproject_geodataframe_to_wgs84 raises on
@@ -422,15 +430,13 @@ class NDVIEngine:
             geom_for_crs = geom_wgs84
         else:
             aoi = _shapely_to_ee_geometry(geometry)
-            geom_for_crs = gpd.GeoDataFrame(
-                {"geometry": [geometry]}, crs="EPSG:4326"
-            )
+            geom_for_crs = gpd.GeoDataFrame({"geometry": [geometry]}, crs="EPSG:4326")
 
         # 2. Pick an EE export CRS so pixels are rasterised in true ground
         # metres regardless of latitude (vs. the legacy hardcoded Web Mercator,
         # which doubles cell area near 60°N).
-        export_crs, grid_crs, export_distortion, export_crs_name = (
-            _select_export_crs(geom_for_crs)
+        export_crs, grid_crs, export_distortion, export_crs_name = _select_export_crs(
+            geom_for_crs
         )
 
         # 3. Get Collection
@@ -518,6 +524,7 @@ class NDVIEngine:
                 write_geotiff=write_geotiff,
                 write_geojson=write_geojson,
                 write_geopackage=write_geopackage,
+                write_cluster_tiles=write_cluster_tiles,
             )
 
         # Sidecar: write on success so direct API callers (CLI / fusion auto-
@@ -717,6 +724,89 @@ class NDVIEngine:
             out["tif"] = final_tif
         return out
 
+    def _write_per_cluster_outputs(
+        self,
+        work_dir: str,
+        tiles: list[dict],
+        failed_tile_refs: list[dict],
+        output_root: str,
+        export_crs: str,
+        export_crs_name: str,
+        resume_key: str,
+    ) -> list[dict]:
+        """Mosaic cached tiles per cluster and write a ``tiles_index.json``.
+
+        Groups every tile that landed cleanly by ``cluster_id`` (failed ones
+        in ``failed_tile_refs`` are skipped), stream-mosaics each group into
+        ``cluster_NNNN.tif`` under ``output_root``, and writes an index JSON
+        next to the tiles.
+
+        Returns the per-cluster index entries (also written to disk).
+        """
+        from collections import defaultdict
+
+        os.makedirs(output_root, exist_ok=True)
+
+        cluster_to_paths: dict[int, list[str]] = defaultdict(list)
+        failed_pairs = {
+            (int(r["cluster_id"]), int(r["tile_idx"])) for r in failed_tile_refs
+        }
+        for ts in tiles:
+            cid = int(ts["cluster_id"])
+            tidx = int(ts["tile_idx"])
+            if (cid, tidx) in failed_pairs:
+                continue
+            p = os.path.join(work_dir, f"tile_{tidx}.tif")
+            if os.path.isfile(p):
+                cluster_to_paths[cid].append(p)
+
+        entries: list[dict] = []
+        for cid in sorted(cluster_to_paths):
+            paths = cluster_to_paths[cid]
+            if not paths:
+                continue
+            cluster_path = os.path.join(output_root, f"cluster_{cid:04d}.tif")
+            try:
+                stream_mosaic_to_geotiff(paths, cluster_path, nodata=-9999)
+            except Exception as e:
+                _log("WARN", f"Cluster {cid} mosaic failed: {e}")
+                continue
+            try:
+                with rasterio.open(cluster_path) as src:
+                    b = src.bounds
+                    bounds_4326 = [
+                        float(b.left),
+                        float(b.bottom),
+                        float(b.right),
+                        float(b.top),
+                    ]
+            except Exception:
+                bounds_4326 = None
+            entries.append(
+                {
+                    "cluster_id": cid,
+                    "path": os.path.basename(cluster_path),
+                    "bounds_4326": bounds_4326,
+                    "n_tiles": len(paths),
+                }
+            )
+
+        index_path = os.path.join(output_root, "tiles_index.json")
+        with open(index_path, "w") as f:
+            json.dump(
+                {
+                    "crs": "EPSG:4326",
+                    "export_crs": export_crs,
+                    "export_crs_name": export_crs_name,
+                    "resume_key": resume_key,
+                    "n_clusters": len(entries),
+                    "clusters": entries,
+                },
+                f,
+                indent=2,
+            )
+        return entries
+
     def _download_one_tile(
         self,
         tile_spec: dict,
@@ -818,6 +908,7 @@ class NDVIEngine:
         write_geotiff: bool = True,
         write_geojson: bool = True,
         write_geopackage: bool = False,
+        write_cluster_tiles: bool = False,
     ):
         """Download NDVI for a precomputed cluster-aware tile list and mosaic.
 
@@ -1015,6 +1106,40 @@ class NDVIEngine:
             except Exception as e:
                 return {"status": "error", "message": f"Mosaic failed: {str(e)}"}
 
+            # Per-cluster GeoTIFF tiles + tiles_index.json. Best-effort:
+            # main mosaic already succeeded, so per-cluster failures log
+            # a WARN rather than failing the whole run.
+            if write_cluster_tiles:
+                cluster_tiles_dir = os.path.join(folder, f"{output_name}_ndvi_tiles")
+                _emit_ndvi_progress(
+                    ndvi_progress_callback,
+                    sub_progress=0.82,
+                    phase="Writing per-cluster tiles",
+                )
+                try:
+                    entries = self._write_per_cluster_outputs(
+                        work_dir,
+                        tiles,
+                        failed_tile_refs,
+                        cluster_tiles_dir,
+                        export_crs,
+                        export_crs_name,
+                        resume_key,
+                    )
+                    _log(
+                        "OK",
+                        f"Wrote {len(entries)} per-cluster tile(s) to "
+                        f"{cluster_tiles_dir}",
+                    )
+                    cluster_tiles_written = len(entries)
+                except Exception as e:
+                    _log("WARN", f"Per-cluster tile output failed: {e}")
+                    cluster_tiles_dir = None
+                    cluster_tiles_written = 0
+            else:
+                cluster_tiles_dir = None
+                cluster_tiles_written = 0
+
         finally:
             if work_dir and os.path.isdir(work_dir):
                 if mosaic_ok and resume_key:
@@ -1055,6 +1180,8 @@ class NDVIEngine:
             "failed_tile_refs": failed_tile_refs,
             "n_clusters": n_clusters,
             "resume_key": resume_key,
+            "cluster_tiles_dir": cluster_tiles_dir,
+            "cluster_tiles_written": cluster_tiles_written,
             "export_crs": export_crs,
             "export_crs_name": export_crs_name,
             "export_distortion": export_distortion,
@@ -1106,6 +1233,8 @@ class NDVIEngine:
                 "failed_tile_refs": failed_tile_refs,
                 "n_clusters": n_clusters,
                 "resume_key": resume_key,
+                "cluster_tiles_dir": cluster_tiles_dir,
+                "cluster_tiles_written": cluster_tiles_written,
                 "export_crs": export_crs,
                 "export_crs_name": export_crs_name,
                 "export_distortion": export_distortion,
