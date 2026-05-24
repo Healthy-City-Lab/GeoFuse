@@ -27,6 +27,8 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import MinMaxScaler
 
 from .crs_utils import (
+    build_internal_overviews,
+    default_geotiff_creation_options,
     normalize_geographic_gdf_to_wgs84,
     reproject_geodataframe_to_wgs84,
 )
@@ -677,7 +679,9 @@ class MetricFusionEngine:
         grid_values = griddata(coords, values, grid_coords, method="nearest")
         grid_values = grid_values.reshape(height, width)
 
-        # Write to GeoTIFF
+        # Write to GeoTIFF — shared compression / tiling / BIGTIFF defaults
+        # so internal cache rasters benefit from the same disk savings as
+        # the user-facing outputs.
         with rasterio.open(
             output_path,
             "w",
@@ -688,7 +692,7 @@ class MetricFusionEngine:
             dtype=rasterio.float32,
             crs=crs,
             transform=transform,
-            compress="lzw",
+            **default_geotiff_creation_options(rasterio.float32),
         ) as dst:
             dst.write(grid_values.astype(rasterio.float32), 1)
 
@@ -746,7 +750,7 @@ class MetricFusionEngine:
 
             bands.append(grid_values)
 
-        # Write multi-band GeoTIFF
+        # Write multi-band GeoTIFF — shared compression / tiling defaults.
         with rasterio.open(
             output_path,
             "w",
@@ -757,7 +761,7 @@ class MetricFusionEngine:
             dtype=rasterio.float32,
             crs=crs,
             transform=transform,
-            compress="lzw",
+            **default_geotiff_creation_options(rasterio.float32),
         ) as dst:
             for i, band_data in enumerate(bands, 1):
                 dst.write(band_data, i)
@@ -4146,9 +4150,16 @@ class MetricFusionEngine:
             dtype=rasterio.float32,
             crs=crs,
             transform=transform,
-            compress="lzw",
+            **default_geotiff_creation_options(rasterio.float32),
         ) as dst:
             dst.write(composite_grid, 1)
+
+        # Composite is the user-visible fusion output — build overviews so
+        # the result viewer (Folium) renders the full raster instantly.
+        try:
+            build_internal_overviews(output_path)
+        except Exception:
+            pass
 
         if progress_callback:
             progress_callback(100, 100)

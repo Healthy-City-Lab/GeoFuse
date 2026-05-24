@@ -71,6 +71,51 @@ def select_grid_crs_with_warning(
     return crs, float(distortion), choice_name
 
 
+def default_geotiff_creation_options(dtype) -> dict:
+    """Compression / tiling / BIGTIFF defaults for our GeoTIFF outputs.
+
+    Applied by every helper that writes a GeoTIFF (``reproject_raster_to_wgs84``,
+    ``stream_mosaic_to_geotiff``) and by the GVI per-cluster writer in
+    ``runners.py``. The combination — DEFLATE with a dtype-appropriate
+    predictor, 256×256 internal tiling, BIGTIFF support — cuts national-scale
+    NDVI outputs by ~5–10× and unlocks fast random reads for Folium overlays
+    and downstream raster sampling.
+
+    Predictor choice follows the libtiff convention:
+      * ``3`` (floating-point predictor) for ``float32`` / ``float64`` rasters
+        — handles NDVI's continuous values well.
+      * ``2`` (horizontal differencing) for integer rasters.
+    """
+    predictor = 3 if np.issubdtype(np.dtype(dtype), np.floating) else 2
+    return {
+        "compress": "DEFLATE",
+        "predictor": predictor,
+        "tiled": True,
+        "blockxsize": 256,
+        "blockysize": 256,
+        "BIGTIFF": "YES",
+    }
+
+
+def build_internal_overviews(
+    path: str,
+    factors: tuple[int, ...] = (2, 4, 8, 16, 32),
+    resampling: Resampling = Resampling.average,
+) -> None:
+    """Add internal overview pyramids to an existing GeoTIFF in place.
+
+    Overviews make map previews (Folium, QGIS) and zoomed-out raster reads
+    near-instant; the on-disk overhead is ~33 % for a 2× pyramid down to
+    32×. Default resampling is ``average``.
+
+    GDAL silently drops factors that would shrink the raster below 1 px, so
+    passing a generous default tuple is safe even for small tiles.
+    """
+    with rasterio.open(path, "r+") as dst:
+        dst.build_overviews(list(factors), resampling)
+        dst.update_tags(ns="rio_overview", resampling=resampling.name)
+
+
 def crs_to_ee_string(crs) -> str:
     """Earth-Engine-friendly CRS string: prefer ``EPSG:<n>``, fall back to WKT.
 
@@ -93,6 +138,7 @@ def stream_mosaic_to_geotiff(
     nodata: float = -9999,
     resampling: Resampling = Resampling.bilinear,
     progress_cb: Callable[[int, int], None] | None = None,
+    build_overviews: bool = True,
 ) -> int:
     """Stream-mosaic same-CRS GeoTIFF tiles into one output via windowed writes.
 
@@ -149,6 +195,7 @@ def stream_mosaic_to_geotiff(
         "transform": out_transform,
         "nodata": nodata,
     }
+    dst_profile.update(default_geotiff_creation_options(ref["dtype"]))
 
     n = len(tile_profiles)
     written = 0
@@ -186,6 +233,16 @@ def stream_mosaic_to_geotiff(
             written += 1
             if progress_cb is not None:
                 progress_cb(written, n)
+
+    if build_overviews and written > 0:
+        # Overviews are added *after* the dataset is closed so GDAL flushes
+        # the base raster first. Float NDVI uses ``average`` resampling —
+        # nearest would alias on smooth gradients.
+        try:
+            build_internal_overviews(dst_path)
+        except Exception:
+            # Overview build is non-fatal — the base raster is still valid.
+            pass
     return written
 
 
@@ -195,6 +252,7 @@ def reproject_raster_to_wgs84(
     *,
     target_resolution_m: float,
     resampling: Resampling = Resampling.bilinear,
+    build_overviews: bool = False,
 ) -> None:
     """Reproject a planar-CRS GeoTIFF to EPSG:4326 with per-latitude aspect-ratio correction.
 
@@ -208,6 +266,13 @@ def reproject_raster_to_wgs84(
 
     Defaults to bilinear resampling — appropriate for continuous bands like
     NDVI. Pass ``resampling=Resampling.nearest`` for QA / classification bands.
+
+    The destination GeoTIFF picks up the shared compression / tiling defaults
+    (``DEFLATE`` + float-aware predictor + 256×256 internal tiling + BIGTIFF).
+    ``build_overviews`` is **off by default** because this helper is also
+    used for intermediate per-tile cache files (where overviews would be
+    wasted disk). Final outputs (single-area NDVI download) pass
+    ``build_overviews=True``.
     """
     with rasterio.open(src_path) as src:
         left, bottom, right, top = array_bounds(src.height, src.width, src.transform)
@@ -237,6 +302,7 @@ def reproject_raster_to_wgs84(
                 "height": height,
             }
         )
+        kwargs.update(default_geotiff_creation_options(src.dtypes[0]))
 
         with rasterio.open(dst_path, "w", **kwargs) as dst:
             for i in range(1, src.count + 1):
@@ -249,6 +315,13 @@ def reproject_raster_to_wgs84(
                     dst_crs=WGS84_EPSG,
                     resampling=resampling,
                 )
+
+    if build_overviews:
+        try:
+            build_internal_overviews(dst_path)
+        except Exception:
+            # Non-fatal: the base raster is still valid without overviews.
+            pass
 
 
 def _raise_if_geographic_coords_outside_degree_range(gdf: gpd.GeoDataFrame) -> None:

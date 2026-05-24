@@ -636,9 +636,14 @@ class NDVIEngine:
                 clear_bracket=True,
             )
 
-            # 4. Reproject to EPSG:4326 with aspect-ratio correction
+            # 4. Reproject to EPSG:4326 with aspect-ratio correction.
+            # Single-tile path → ``final_tif`` is the user-visible output,
+            # so build overview pyramids for fast map previews.
             reproject_raster_to_wgs84(
-                temp_tif, final_tif, target_resolution_m=resolution
+                temp_tif,
+                final_tif,
+                target_resolution_m=resolution,
+                build_overviews=True,
             )
 
             if os.path.exists(temp_tif):
