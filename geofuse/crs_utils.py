@@ -253,6 +253,8 @@ def reproject_raster_to_wgs84(
     target_resolution_m: float,
     resampling: Resampling = Resampling.bilinear,
     build_overviews: bool = False,
+    src_nodata: float | None = None,
+    dst_nodata: float | None = None,
 ) -> None:
     """Reproject a planar-CRS GeoTIFF to EPSG:4326 with per-latitude aspect-ratio correction.
 
@@ -273,6 +275,12 @@ def reproject_raster_to_wgs84(
     used for intermediate per-tile cache files (where overviews would be
     wasted disk). Final outputs (single-area NDVI download) pass
     ``build_overviews=True``.
+
+    ``src_nodata`` and ``dst_nodata`` are forwarded to the underlying
+    :func:`rasterio.warp.reproject`. **Pass them explicitly** when the
+    source uses a sentinel like ``-9999`` for masked pixels — without them,
+    bilinear resampling will interpolate the sentinel into edge pixels and
+    produce nonsense values (e.g. NDVI ``-1`` at tile borders).
     """
     with rasterio.open(src_path) as src:
         left, bottom, right, top = array_bounds(src.height, src.width, src.transform)
@@ -302,6 +310,10 @@ def reproject_raster_to_wgs84(
                 "height": height,
             }
         )
+        # Stamp the dst nodata on the file metadata so downstream readers
+        # (and the overview builder) treat the sentinel correctly.
+        if dst_nodata is not None:
+            kwargs["nodata"] = dst_nodata
         kwargs.update(default_geotiff_creation_options(src.dtypes[0]))
 
         with rasterio.open(dst_path, "w", **kwargs) as dst:
@@ -314,6 +326,8 @@ def reproject_raster_to_wgs84(
                     dst_transform=dst_transform,
                     dst_crs=WGS84_EPSG,
                     resampling=resampling,
+                    src_nodata=src_nodata,
+                    dst_nodata=dst_nodata,
                 )
 
     if build_overviews:

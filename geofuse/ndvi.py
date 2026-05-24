@@ -69,6 +69,11 @@ def _compute_resume_key(
     tiles would be from a different question).
     """
     h = hashlib.sha256()
+    # Schema tag — bump when the on-disk tile format changes. ``planar_v1``
+    # marks the post-Step-13.5 layout (planar-CRS tiles snapped to a global
+    # grid). Older WGS84-tile cache entries hash to different keys and are
+    # naturally orphaned (LRU-evicted as space pressure builds).
+    h.update(b"planar_v1|")
     h.update(geometry_sha256(geom_wgs84_gdf).encode())
     h.update(f"|{start_date}|{end_date}|{cloud_max}|{resolution}|".encode())
     h.update(ee_collection.encode())
@@ -439,6 +444,15 @@ class NDVIEngine:
             geom_for_crs
         )
 
+        # Global snap grid for every EE export in this run. Anchoring the
+        # transform at (0, 0) in the planar CRS means adjacent tiles share
+        # one pixel grid — boundaries align to the pixel and the mosaic step
+        # joins them with zero sub-pixel drift (the root cause of the
+        # tile-gap / tile-shift artefacts the WGS84-per-tile path used to
+        # produce). ``crs_transform`` is the standard GDAL affine
+        # ``[a, b, c, d, e, f]`` form: ``[scale, 0, x0, 0, -scale, y0]``.
+        crs_transform = [float(resolution), 0.0, 0.0, 0.0, -float(resolution), 0.0]
+
         # 3. Get Collection
         col = self.get_collection(aoi, str(start_date), str(end_date), cloud_max)
         if col.size().getInfo() == 0:
@@ -494,6 +508,7 @@ class NDVIEngine:
                 export_crs=export_crs,
                 export_distortion=export_distortion,
                 export_crs_name=export_crs_name,
+                crs_transform=crs_transform,
                 cancel_callback=cancel_callback,
                 ndvi_progress_callback=ndvi_progress_callback,
                 write_geotiff=write_geotiff,
@@ -517,6 +532,7 @@ class NDVIEngine:
                 export_crs=export_crs,
                 export_distortion=export_distortion,
                 export_crs_name=export_crs_name,
+                crs_transform=crs_transform,
                 n_clusters=n_clusters,
                 resume_key=resume_key,
                 cancel_callback=cancel_callback,
@@ -577,6 +593,7 @@ class NDVIEngine:
         export_crs: str = "EPSG:3857",
         export_distortion: float = 0.0,
         export_crs_name: str = "Web Mercator (legacy)",
+        crs_transform: list[float] | None = None,
         cancel_callback: Callable[[], bool] | None = None,
         ndvi_progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
         write_geotiff: bool = True,
@@ -598,11 +615,16 @@ class NDVIEngine:
         try:
 
             def _do_export() -> None:
+                # EE export goes straight into the planar temp file; the
+                # single final reproject below turns it into the WGS84
+                # user-visible output. ``crs_transform`` is passed for
+                # symmetry with the tiled path even though there's only one
+                # tile here — it keeps the EE call shape identical between paths.
                 geemap.ee_export_image(
                     ndvi_median.unmask(-9999),
                     filename=temp_tif,
-                    scale=resolution,
                     crs=export_crs,
+                    crs_transform=crs_transform,
                     region=aoi,
                     file_per_band=False,
                 )
@@ -636,14 +658,16 @@ class NDVIEngine:
                 clear_bracket=True,
             )
 
-            # 4. Reproject to EPSG:4326 with aspect-ratio correction.
-            # Single-tile path → ``final_tif`` is the user-visible output,
-            # so build overview pyramids for fast map previews.
+            # Final reproject: planar → WGS84 with explicit nodata so the
+            # ``-9999`` fill doesn't bleed into edge pixels. Builds overviews
+            # for fast Folium previews.
             reproject_raster_to_wgs84(
                 temp_tif,
                 final_tif,
                 target_resolution_m=resolution,
                 build_overviews=True,
+                src_nodata=-9999,
+                dst_nodata=-9999,
             )
 
             if os.path.exists(temp_tif):
@@ -738,15 +762,18 @@ class NDVIEngine:
         export_crs: str,
         export_crs_name: str,
         resume_key: str,
+        resolution: int,
     ) -> list[dict]:
         """Mosaic cached tiles per cluster and write a ``tiles_index.json``.
 
-        Groups every tile that landed cleanly by ``cluster_id`` (failed ones
-        in ``failed_tile_refs`` are skipped), stream-mosaics each group into
-        ``cluster_NNNN.tif`` under ``output_root``, and writes an index JSON
-        next to the tiles.
+        Same two-step shape as the main mosaic: per-cluster planar mosaic
+        into a scratch file in ``work_dir``, then a single reproject to
+        WGS84 with explicit nodata. Keeps boundaries aligned to the pixel
+        and avoids the ``-9999``-bleed edge artefacts.
 
-        Returns the per-cluster index entries (also written to disk).
+        Failed tiles in ``failed_tile_refs`` are skipped. Per-cluster
+        failures log a WARN and continue — the rest of the clusters still
+        land. Returns the per-cluster index entries (also written to disk).
         """
         from collections import defaultdict
 
@@ -771,11 +798,28 @@ class NDVIEngine:
             if not paths:
                 continue
             cluster_path = os.path.join(output_root, f"cluster_{cid:04d}.tif")
+            planar_tmp = os.path.join(work_dir, f"_cluster_{cid:04d}_planar.tif")
             try:
-                stream_mosaic_to_geotiff(paths, cluster_path, nodata=-9999)
+                stream_mosaic_to_geotiff(
+                    paths, planar_tmp, nodata=-9999, build_overviews=False
+                )
+                reproject_raster_to_wgs84(
+                    planar_tmp,
+                    cluster_path,
+                    target_resolution_m=resolution,
+                    build_overviews=True,
+                    src_nodata=-9999,
+                    dst_nodata=-9999,
+                )
             except Exception as e:
                 _log("WARN", f"Cluster {cid} mosaic failed: {e}")
                 continue
+            finally:
+                if os.path.exists(planar_tmp):
+                    try:
+                        os.remove(planar_tmp)
+                    except OSError:
+                        pass
             try:
                 with rasterio.open(cluster_path) as src:
                     b = src.bounds
@@ -819,17 +863,26 @@ class NDVIEngine:
         work_dir: str,
         resolution: int,
         export_crs: str,
+        crs_transform: list[float],
         cancel_callback: Callable[[], bool] | None,
     ) -> dict:
-        """Worker: one tile through Earth Engine + reproject to WGS84.
+        """Worker: one tile downloaded from EE straight into the planar cache.
 
         Runs on a ThreadPoolExecutor thread (see :meth:`_download_with_tiling`).
         Returns ``{success, tile_final, idx, error}``; failures surface as
         ``success=False`` rather than raising so a single bad tile can't sink
-        the whole batch. Cancel checks short-circuit at safe boundaries —
-        Earth Engine's HTTP call is one blocking step that can't be killed
-        mid-flight, so a freshly-cancelled run may still have a few in-flight
-        downloads finish and be discarded by the caller.
+        the whole batch.
+
+        Tiles stay in the engine's chosen planar CRS — *no* per-tile reproject
+        to WGS84 — so all tiles share one snap grid (``crs_transform`` fixes
+        the origin globally) and the mosaic step joins them with zero
+        sub-pixel drift. A single final reproject converts the merged planar
+        mosaic to WGS84 with explicit nodata.
+
+        Cancel checks short-circuit at safe boundaries — Earth Engine's HTTP
+        call is one blocking step that can't be killed mid-flight, so a
+        freshly-cancelled run may still have a few in-flight downloads finish
+        and be discarded by the caller.
         """
         idx = int(tile_spec["tile_idx"])
         tile_geom = tile_spec["tile_geom_4326"]
@@ -838,7 +891,6 @@ class NDVIEngine:
         if cancel_callback and cancel_callback():
             return result
 
-        tile_temp = os.path.join(work_dir, f"tile_{idx}_temp.tif")
         tile_final = os.path.join(work_dir, f"tile_{idx}.tif")
 
         try:
@@ -846,14 +898,16 @@ class NDVIEngine:
             tile_ndvi = ndvi_median.clip(tile_aoi)
 
             def _do_export() -> None:
-                # Whole EE-export step is the retry unit. Tile-temp on disk
-                # from a half-finished previous attempt would be overwritten
-                # by the next call; geemap doesn't refuse to overwrite.
+                # Save the EE export *directly* as the final cache tile —
+                # no intermediate temp file, no per-tile WGS84 reproject.
+                # ``crs_transform`` snaps every tile to one global grid in
+                # the planar CRS so adjacent tiles' boundaries align to the
+                # pixel.
                 geemap.ee_export_image(
                     tile_ndvi.unmask(-9999),
-                    filename=tile_temp,
-                    scale=resolution,
+                    filename=tile_final,
                     crs=export_crs,
+                    crs_transform=crs_transform,
                     region=tile_aoi,
                     file_per_band=False,
                 )
@@ -871,23 +925,17 @@ class NDVIEngine:
             )
 
             if cancel_callback and cancel_callback():
-                if os.path.exists(tile_temp):
-                    os.remove(tile_temp)
+                if os.path.exists(tile_final):
+                    os.remove(tile_final)
                 return result
-
-            reproject_raster_to_wgs84(
-                tile_temp, tile_final, target_resolution_m=resolution
-            )
-            if os.path.exists(tile_temp):
-                os.remove(tile_temp)
 
             result["success"] = True
             result["tile_final"] = tile_final
             return result
         except Exception as e:
-            if os.path.exists(tile_temp):
+            if os.path.exists(tile_final):
                 try:
-                    os.remove(tile_temp)
+                    os.remove(tile_final)
                 except OSError:
                     pass
             result["error"] = f"{type(e).__name__}: {e}"
@@ -906,6 +954,7 @@ class NDVIEngine:
         export_crs: str = "EPSG:3857",
         export_distortion: float = 0.0,
         export_crs_name: str = "Web Mercator (legacy)",
+        crs_transform: list[float] | None = None,
         n_clusters: int = 1,
         resume_key: str = "",
         cancel_callback: Callable[[], bool] | None = None,
@@ -1010,6 +1059,7 @@ class NDVIEngine:
                         work_dir,
                         resolution,
                         export_crs,
+                        crs_transform,
                         cancel_callback,
                     ): ts
                     for ts in pending_tiles
@@ -1077,13 +1127,15 @@ class NDVIEngine:
                 clear_bracket=True,
             )
 
+            # Two-step output: (1) stream-mosaic the per-tile rasters in
+            # their shared **planar** CRS, then (2) reproject the merged
+            # mosaic to WGS84 once. This keeps tile boundaries aligned to
+            # the pixel.
+            planar_mosaic_tif = os.path.join(work_dir, "_mosaic_planar.tif")
             try:
-                # Stream-mosaic the per-tile rasters into the final GeoTIFF.
-                # Memory ceiling is one tile at a time (vs. ``rasterio.merge``,
-                # which would materialise the entire mosaic up front and OOM
-                # on national-scale outputs).
+
                 def _mosaic_progress(k: int, n: int) -> None:
-                    span = 0.78 - 0.72
+                    span = 0.76 - 0.72
                     _emit_ndvi_progress(
                         ndvi_progress_callback,
                         sub_progress=0.72 + (span * k / n if n else 0.0),
@@ -1091,18 +1143,38 @@ class NDVIEngine:
                         tiles=(k, n),
                     )
 
+                # Intermediate planar mosaic — no overviews, they'd be
+                # discarded by the WGS84 reproject below.
                 stream_mosaic_to_geotiff(
                     tile_files,
-                    final_tif,
+                    planar_mosaic_tif,
                     nodata=-9999,
                     progress_cb=_mosaic_progress,
+                    build_overviews=False,
                 )
 
                 _emit_ndvi_progress(
                     ndvi_progress_callback,
-                    sub_progress=0.78,
-                    phase="Mosaicking rasters",
+                    sub_progress=0.76,
+                    phase="Reprojecting to WGS84",
                     clear_bracket=True,
+                )
+
+                # Single final reproject with explicit nodata so the
+                # ``-9999`` fill never bleeds into edge pixels.
+                reproject_raster_to_wgs84(
+                    planar_mosaic_tif,
+                    final_tif,
+                    target_resolution_m=resolution,
+                    build_overviews=True,
+                    src_nodata=-9999,
+                    dst_nodata=-9999,
+                )
+
+                _emit_ndvi_progress(
+                    ndvi_progress_callback,
+                    sub_progress=0.80,
+                    phase="Reprojecting to WGS84",
                 )
 
                 _log("OK", f"Mosaic complete: {final_tif}")
@@ -1110,6 +1182,15 @@ class NDVIEngine:
 
             except Exception as e:
                 return {"status": "error", "message": f"Mosaic failed: {str(e)}"}
+            finally:
+                # The planar intermediate is not part of the cache (we only
+                # cache the per-tile inputs); drop it whether or not the
+                # mosaic step succeeded.
+                if os.path.exists(planar_mosaic_tif):
+                    try:
+                        os.remove(planar_mosaic_tif)
+                    except OSError:
+                        pass
 
             # Per-cluster GeoTIFF tiles + tiles_index.json. Best-effort:
             # main mosaic already succeeded, so per-cluster failures log
@@ -1130,6 +1211,7 @@ class NDVIEngine:
                         export_crs,
                         export_crs_name,
                         resume_key,
+                        resolution,
                     )
                     _log(
                         "OK",
