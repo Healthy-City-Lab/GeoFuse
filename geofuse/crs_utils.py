@@ -8,14 +8,334 @@ which matches Leaflet/Folium and ``generate_raster_grid`` in ``geofuse.core``.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import geopandas as gpd
 import numpy as np
+import rasterio
 from pyproj import CRS as PyProjCRS
 from pyproj import Geod, Transformer
+from rasterio.transform import array_bounds, from_bounds
+from rasterio.warp import Resampling, calculate_default_transform, reproject
+from rasterio.warp import transform as rio_warp_transform
+from rasterio.windows import from_bounds as window_from_bounds
+from rasterio.windows import transform as window_transform
 from shapely.ops import transform as shapely_xy_transform
 
 # Single canonical CRS for web maps, Earth Engine clip geometries, and GVI/NDVI download.
 WGS84_EPSG = "EPSG:4326"
+
+
+def metres_per_degree_at_lat(lat_deg: float) -> tuple[float, float]:
+    """Geodesic metres-per-degree at ``lat_deg`` for square-metre raster math.
+
+    Returns ``(m_per_deg_lon, m_per_deg_lat)`` using the standard WGS84 series
+    (third-order in latitude). Replaces several copies of this formula that
+    had drifted in precision across the engines and UI hint helpers; one
+    canonical value here keeps grid sizing, raster reprojection, and the
+    size-estimate banners consistent.
+    """
+    lat_rad = np.radians(lat_deg)
+    m_per_deg_lat = 111132.954 - 559.822 * np.cos(2 * lat_rad)
+    m_per_deg_lon = 111412.84 * np.cos(lat_rad) - 93.5 * np.cos(3 * lat_rad)
+    return float(m_per_deg_lon), float(m_per_deg_lat)
+
+
+def select_grid_crs_with_warning(
+    gdf: gpd.GeoDataFrame,
+    log_fn,
+    *,
+    role: str = "Grid CRS",
+    threshold: float = 0.02,
+):
+    """:func:`select_grid_crs` + the standard "warn if > 2 %" emit pattern.
+
+    GVI and NDVI both call ``select_grid_crs`` and emit the same WARN/INFO
+    pair depending on the measured distortion. ``log_fn`` is the engine's
+    ``_log`` callable so each engine's messages still appear under its own
+    logger name (e.g. ``[GVI]`` vs ``[NDVI]``); only the boilerplate is shared.
+    """
+    crs, distortion, choice_name = select_grid_crs(gdf)
+    if distortion > threshold:
+        log_fn(
+            "WARN",
+            f"{role} distortion ~ {distortion * 100:.2f}% across the extent "
+            f"({choice_name}). Pixel scale will drift across widely-spaced tiles.",
+        )
+    else:
+        log_fn(
+            "INFO",
+            f"{role}: {choice_name} (max planar distortion ~ "
+            f"{distortion * 100:.3f}%).",
+        )
+    return crs, float(distortion), choice_name
+
+
+def default_geotiff_creation_options(dtype) -> dict:
+    """Compression / tiling / BIGTIFF defaults for our GeoTIFF outputs.
+
+    Applied by every helper that writes a GeoTIFF (``reproject_raster_to_wgs84``,
+    ``stream_mosaic_to_geotiff``) and by the GVI per-cluster writer in
+    ``runners.py``. The combination — DEFLATE with a dtype-appropriate
+    predictor, 256×256 internal tiling, BIGTIFF support — cuts national-scale
+    NDVI outputs by ~5–10× and unlocks fast random reads for Folium overlays
+    and downstream raster sampling.
+
+    Predictor choice follows the libtiff convention:
+      * ``3`` (floating-point predictor) for ``float32`` / ``float64`` rasters
+        — handles NDVI's continuous values well.
+      * ``2`` (horizontal differencing) for integer rasters.
+    """
+    predictor = 3 if np.issubdtype(np.dtype(dtype), np.floating) else 2
+    return {
+        "compress": "DEFLATE",
+        "predictor": predictor,
+        "tiled": True,
+        "blockxsize": 256,
+        "blockysize": 256,
+        "BIGTIFF": "YES",
+    }
+
+
+def build_internal_overviews(
+    path: str,
+    factors: tuple[int, ...] = (2, 4, 8, 16, 32),
+    resampling: Resampling = Resampling.average,
+) -> None:
+    """Add internal overview pyramids to an existing GeoTIFF in place.
+
+    Overviews make map previews (Folium, QGIS) and zoomed-out raster reads
+    near-instant; the on-disk overhead is ~33 % for a 2× pyramid down to
+    32×. Default resampling is ``average``.
+
+    GDAL silently drops factors that would shrink the raster below 1 px, so
+    passing a generous default tuple is safe even for small tiles.
+    """
+    with rasterio.open(path, "r+") as dst:
+        dst.build_overviews(list(factors), resampling)
+        dst.update_tags(ns="rio_overview", resampling=resampling.name)
+
+
+def crs_to_ee_string(crs) -> str:
+    """Earth-Engine-friendly CRS string: prefer ``EPSG:<n>``, fall back to WKT.
+
+    EE accepts WKT for non-standard projections (the LCC / Polar Stereographic
+    that :func:`select_grid_crs` synthesises for wide-span or polar extents),
+    so every CRS this module returns can be passed through to
+    ``ee_export_image``. Lives here next to the CRS-selection logic so the EE
+    wrapping is one tidy unit.
+    """
+    epsg = crs.to_epsg()
+    if epsg is not None:
+        return f"EPSG:{epsg}"
+    return crs.to_wkt()
+
+
+def stream_mosaic_to_geotiff(
+    tile_paths: list[str],
+    dst_path: str,
+    *,
+    nodata: float = -9999,
+    resampling: Resampling = Resampling.bilinear,
+    progress_cb: Callable[[int, int], None] | None = None,
+    build_overviews: bool = True,
+) -> int:
+    """Stream-mosaic same-CRS GeoTIFF tiles into one output via windowed writes.
+
+    Never holds more than one tile's worth of pixels in memory at a time, so
+    national-scale outputs don't OOM (vs. ``rasterio.merge.merge`` which
+    materialises the entire mosaic up front). All tiles must share the same
+    CRS and band count; minor pixel-size differences between tiles — e.g.
+    WGS84 tiles reprojected at different centroid latitudes — are resampled
+    into the unified grid via ``resampling``. The first tile defines the
+    output's pixel size, dtype, and band count.
+
+    ``progress_cb(k, n)`` fires after each tile lands; pass it to mirror
+    download-phase progress into the mosaic phase. Returns the number of
+    tiles written.
+    """
+    if not tile_paths:
+        raise ValueError("stream_mosaic_to_geotiff: tile_paths is empty.")
+
+    tile_profiles: list[dict] = []
+    for path in tile_paths:
+        with rasterio.open(path) as src:
+            tile_profiles.append(
+                {
+                    "path": path,
+                    "bounds": src.bounds,
+                    "transform": src.transform,
+                    "crs": src.crs,
+                    "dtype": src.dtypes[0],
+                    "count": src.count,
+                }
+            )
+
+    ref = tile_profiles[0]
+    union_left = min(p["bounds"].left for p in tile_profiles)
+    union_bottom = min(p["bounds"].bottom for p in tile_profiles)
+    union_right = max(p["bounds"].right for p in tile_profiles)
+    union_top = max(p["bounds"].top for p in tile_profiles)
+
+    pixel_w = abs(ref["transform"].a)
+    pixel_h = abs(ref["transform"].e)
+    out_width = max(1, int(round((union_right - union_left) / pixel_w)))
+    out_height = max(1, int(round((union_top - union_bottom) / pixel_h)))
+    out_transform = from_bounds(
+        union_left, union_bottom, union_right, union_top, out_width, out_height
+    )
+
+    dst_profile = {
+        "driver": "GTiff",
+        "height": out_height,
+        "width": out_width,
+        "count": ref["count"],
+        "dtype": ref["dtype"],
+        "crs": ref["crs"],
+        "transform": out_transform,
+        "nodata": nodata,
+    }
+    dst_profile.update(default_geotiff_creation_options(ref["dtype"]))
+
+    n = len(tile_profiles)
+    written = 0
+    with rasterio.open(dst_path, "w", **dst_profile) as dst:
+        for tp in tile_profiles:
+            win = (
+                window_from_bounds(*tp["bounds"], transform=out_transform)
+                .round_offsets()
+                .round_lengths()
+            )
+            if win.width <= 0 or win.height <= 0:
+                if progress_cb is not None:
+                    progress_cb(written, n)
+                continue
+            win_transform = window_transform(win, out_transform)
+            with rasterio.open(tp["path"]) as src:
+                for band in range(1, src.count + 1):
+                    dst_arr = np.full(
+                        (win.height, win.width),
+                        fill_value=nodata,
+                        dtype=src.dtypes[band - 1],
+                    )
+                    reproject(
+                        source=rasterio.band(src, band),
+                        destination=dst_arr,
+                        src_transform=src.transform,
+                        src_crs=src.crs,
+                        dst_transform=win_transform,
+                        dst_crs=ref["crs"],
+                        resampling=resampling,
+                        src_nodata=nodata,
+                        dst_nodata=nodata,
+                    )
+                    dst.write(dst_arr, indexes=band, window=win)
+            written += 1
+            if progress_cb is not None:
+                progress_cb(written, n)
+
+    if build_overviews and written > 0:
+        # Overviews are added *after* the dataset is closed so GDAL flushes
+        # the base raster first. Float NDVI uses ``average`` resampling —
+        # nearest would alias on smooth gradients.
+        try:
+            build_internal_overviews(dst_path)
+        except Exception:
+            # Overview build is non-fatal — the base raster is still valid.
+            pass
+    return written
+
+
+def reproject_raster_to_wgs84(
+    src_path: str,
+    dst_path: str,
+    *,
+    target_resolution_m: float,
+    resampling: Resampling = Resampling.bilinear,
+    build_overviews: bool = False,
+    src_nodata: float | None = None,
+    dst_nodata: float | None = None,
+) -> None:
+    """Reproject a planar-CRS GeoTIFF to EPSG:4326 with per-latitude aspect-ratio correction.
+
+    Earth Engine (and any other producer that writes in a metre-based CRS such
+    as UTM, LCC, or Polar Stereographic) places pixels on a square-metre grid.
+    A naive reprojection to geographic coordinates yields rectangular pixels
+    because a degree of longitude is shorter than a degree of latitude. This
+    function derives the exact metres-per-degree ratio at the tile's centroid
+    latitude (via :func:`metres_per_degree_at_lat`) and forces an explicit
+    square-metre output resolution.
+
+    Defaults to bilinear resampling — appropriate for continuous bands like
+    NDVI. Pass ``resampling=Resampling.nearest`` for QA / classification bands.
+
+    The destination GeoTIFF picks up the shared compression / tiling defaults
+    (``DEFLATE`` + float-aware predictor + 256×256 internal tiling + BIGTIFF).
+    ``build_overviews`` is **off by default** because this helper is also
+    used for intermediate per-tile cache files (where overviews would be
+    wasted disk). Final outputs (single-area NDVI download) pass
+    ``build_overviews=True``.
+
+    ``src_nodata`` and ``dst_nodata`` are forwarded to the underlying
+    :func:`rasterio.warp.reproject`. **Pass them explicitly** when the
+    source uses a sentinel like ``-9999`` for masked pixels — without them,
+    bilinear resampling will interpolate the sentinel into edge pixels and
+    produce nonsense values (e.g. NDVI ``-1`` at tile borders).
+    """
+    with rasterio.open(src_path) as src:
+        left, bottom, right, top = array_bounds(src.height, src.width, src.transform)
+        cx, cy = (left + right) / 2, (bottom + top) / 2
+        lon_c, lat_c = rio_warp_transform(src.crs, WGS84_EPSG, [cx], [cy])
+        avg_lat = lat_c[0]
+
+        m_per_deg_lon, m_per_deg_lat = metres_per_degree_at_lat(avg_lat)
+        res_x_deg = target_resolution_m / m_per_deg_lon
+        res_y_deg = target_resolution_m / m_per_deg_lat
+
+        dst_transform, width, height = calculate_default_transform(
+            src.crs,
+            WGS84_EPSG,
+            src.width,
+            src.height,
+            *src.bounds,
+            resolution=(res_x_deg, res_y_deg),
+        )
+
+        kwargs = src.meta.copy()
+        kwargs.update(
+            {
+                "crs": WGS84_EPSG,
+                "transform": dst_transform,
+                "width": width,
+                "height": height,
+            }
+        )
+        # Stamp the dst nodata on the file metadata so downstream readers
+        # (and the overview builder) treat the sentinel correctly.
+        if dst_nodata is not None:
+            kwargs["nodata"] = dst_nodata
+        kwargs.update(default_geotiff_creation_options(src.dtypes[0]))
+
+        with rasterio.open(dst_path, "w", **kwargs) as dst:
+            for i in range(1, src.count + 1):
+                reproject(
+                    source=rasterio.band(src, i),
+                    destination=rasterio.band(dst, i),
+                    src_transform=src.transform,
+                    src_crs=src.crs,
+                    dst_transform=dst_transform,
+                    dst_crs=WGS84_EPSG,
+                    resampling=resampling,
+                    src_nodata=src_nodata,
+                    dst_nodata=dst_nodata,
+                )
+
+    if build_overviews:
+        try:
+            build_internal_overviews(dst_path)
+        except Exception:
+            # Non-fatal: the base raster is still valid without overviews.
+            pass
 
 
 def _raise_if_geographic_coords_outside_degree_range(gdf: gpd.GeoDataFrame) -> None:

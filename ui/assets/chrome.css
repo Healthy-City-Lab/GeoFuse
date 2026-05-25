@@ -1,0 +1,285 @@
+/* GeoFuse global page chrome.
+ *
+ * Loaded once per script run by ui/chrome.py:inject_chrome(). New page-level
+ * CSS belongs here, not in triple-quoted strings inside .py files.
+ *
+ * Cross-browser notes:
+ *   - mask-image      -> -webkit-mask-image first (Safari/Chromium need it)
+ *   - user-select     -> -webkit-, -moz-, then standard (Safari/Firefox)
+ *   - backdrop-filter -> -webkit-backdrop-filter (Safari, including macOS)
+ *   - min(), calc(), CSS variables, flex, transform, transition are baseline.
+ */
+
+.block-container {
+	padding-top: 1rem;
+	padding-bottom: 1rem;
+}
+iframe {
+	width: 100% !important;
+}
+/* Ensure the brand-injection iframe takes no space */
+iframe[height="0"] {
+	display: block;
+	height: 0 !important;
+	min-height: 0 !important;
+}
+
+/* Hide the Streamlit sidebar header (collapse-button strip). */
+section[data-testid="stSidebar"] [data-testid="stSidebarHeader"] {
+	display: none !important;
+}
+
+/* Sidebar (Job Monitor on GVI, etc.): compact width + smaller type for all content */
+section[data-testid="stSidebar"] {
+	width: min(13.25rem, 28vw) !important;
+	min-width: 9.25rem !important;
+}
+section[data-testid="stSidebar"] [data-testid="stSidebarContent"] {
+	font-size: 0.74rem !important;
+}
+section[data-testid="stSidebar"] .block-container {
+	padding: 0.95rem 0.5rem 0.55rem 0.5rem !important;
+	font-size: 0.74rem !important;
+	max-width: 100% !important;
+}
+/* Restore a little breathing room between stacked widgets in the sidebar
+   so cards don't look glued together. */
+section[data-testid="stSidebar"] [data-testid="stVerticalBlock"] {
+	gap: 0.5rem !important;
+}
+section[data-testid="stSidebar"] h1,
+section[data-testid="stSidebar"] h2,
+section[data-testid="stSidebar"] h3 {
+	font-size: 0.92rem !important;
+	line-height: 1.25 !important;
+	margin-top: 0.2rem !important;
+	margin-bottom: 0.3rem !important;
+}
+section[data-testid="stSidebar"] .stMarkdown p,
+section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {
+	font-size: 0.72rem !important;
+	line-height: 1.35 !important;
+}
+section[data-testid="stSidebar"] [data-testid="stCaption"],
+section[data-testid="stSidebar"] .stCaption {
+	font-size: 0.65rem !important;
+}
+section[data-testid="stSidebar"] .stButton > button {
+	font-size: 0.7rem !important;
+	padding: 0.12rem 0.32rem !important;
+	min-height: 1.6rem !important;
+}
+section[data-testid="stSidebar"] [data-testid="column"] {
+	font-size: 0.72rem !important;
+}
+section[data-testid="stSidebar"] [data-testid="stVerticalBlockBorderWrapper"] {
+	padding: 0.3rem !important;
+}
+section[data-testid="stSidebar"] .streamlit-expanderHeader {
+	font-size: 0.7rem !important;
+}
+section[data-testid="stSidebar"] .stCodeBlock,
+section[data-testid="stSidebar"] pre {
+	font-size: 0.65rem !important;
+}
+section[data-testid="stSidebar"] .stAlert {
+	font-size: 0.68rem !important;
+	padding: 0.3rem 0.4rem !important;
+}
+section[data-testid="stSidebar"] [data-testid="stProgress"] > div {
+	font-size: 0.65rem !important;
+}
+
+/* Styling for the GeoFuse brand span injected by JS below */
+.gf-brand {
+	font-size: 1.4rem;
+	font-weight: 700;
+	font-family:
+		"Source Sans Pro",
+		"Source Sans 3",
+		-apple-system,
+		BlinkMacSystemFont,
+		"Segoe UI",
+		sans-serif;
+	letter-spacing: -0.01em;
+	white-space: nowrap;
+	flex-shrink: 0;
+	align-self: center;
+	padding-right: 0.9rem;
+	padding-left: 0.9rem;
+	margin-right: 0.4rem;
+	border-right: 1px solid rgba(49, 51, 63, 0.18);
+}
+
+/* Muted last tab (HPC Monitoring): de-emphasized until the HPC workflow is finalized */
+button.gf-tab-muted {
+	opacity: 0.48 !important;
+	color: #8c8c8c !important;
+}
+button.gf-tab-muted[aria-selected="true"] {
+	opacity: 0.72 !important;
+	color: #6d6d6d !important;
+}
+
+/* Give the tab bar enough vertical room for the taller brand text */
+div[data-testid="stTabs"] [data-baseweb="tab-list"] {
+	padding-top: 6px;
+	padding-bottom: 4px;
+}
+
+/* --- Tab list relocated into the top app toolbar -------------------- */
+/* The JS in chrome.js moves [data-baseweb="tab-list"] into stToolbar so
+   tabs render in the same row as Deploy / overflow menu, freeing the
+   page header for content. */
+[data-testid="stToolbar"] {
+	display: flex !important;
+	align-items: center !important;
+	gap: 0.5rem !important;
+	padding-left: 0.9rem !important;
+	max-width: none !important;
+	width: 100% !important;
+}
+/* Streamlit's toolbar uses a nested wrapper; let the left slot (where we
+   drop the tab list) flex to fill the space before Deploy/overflow. */
+[data-testid="stToolbar"] > div {
+	display: flex !important;
+	align-items: center !important;
+	width: 100% !important;
+	gap: 0.5rem;
+}
+[data-testid="stToolbar"] > div > div:first-child {
+	flex: 1 1 auto !important;
+	min-width: 0 !important;
+}
+[data-testid="stToolbar"] [data-baseweb="tab-list"] {
+	flex: 1 1 auto;
+	border-bottom: none !important;
+	padding: 0 !important;
+	margin: 0 !important;
+	align-items: center !important;
+	min-height: 0 !important;
+	height: auto !important;
+	gap: 0.15rem;
+	overflow-x: auto;
+	/* Firefox-only scrollbar slimming; ignored elsewhere. */
+	scrollbar-width: thin;
+}
+[data-testid="stToolbar"] [data-baseweb="tab-list"] button[role="tab"] {
+	padding: 0 0.6rem !important;
+	height: 2rem !important;
+	min-height: 0 !important;
+	font-size: 0.9rem !important;
+}
+/* Brand label fits inside a 36-40px toolbar; trim the larger page-level styling. */
+[data-testid="stToolbar"] .gf-brand {
+	font-size: 1.05rem !important;
+	padding-right: 0.6rem !important;
+	margin-right: 0.3rem !important;
+	line-height: 1 !important;
+}
+/* Remove the empty placeholder strip stTabs leaves behind once the
+   tab-list is moved out (the tab-panel is still its child). */
+div[data-testid="stTabs"] {
+	margin-top: 0 !important;
+}
+
+/* --- Sidebar toggle living inside the toolbar ----------------------- */
+/* The JS observer moves this element into stToolbar's left slot, just
+   before the brand label. Until then it stays hidden so it can't briefly
+   flash anywhere else on the page on initial render. The icon swaps
+   between panel-left-close and panel-left-open based on body.gf-sb-hidden. */
+.gf-sidebar-floater {
+	visibility: hidden !important;
+	width: 0 !important;
+	height: 0 !important;
+	margin: 0 !important;
+	padding: 0 !important;
+	border: 0 !important;
+	background: transparent !important;
+	overflow: hidden !important;
+}
+[data-testid="stToolbar"] .gf-sidebar-floater {
+	visibility: visible !important;
+	width: 30px !important;
+	height: 28px !important;
+	box-sizing: border-box !important;
+	border-radius: 6px !important;
+	background: transparent !important;
+	border: 1px solid rgba(255, 255, 255, 0.14) !important;
+	color: #cfd3da !important;
+	cursor: pointer !important;
+	padding: 0 !important;
+	margin: 0 0.55rem 0 0 !important;
+	line-height: 0 !important;
+	display: inline-flex !important;
+	align-items: center !important;
+	justify-content: center !important;
+	overflow: visible !important;
+	-webkit-user-select: none !important;
+	-moz-user-select: none !important;
+	user-select: none !important;
+	flex-shrink: 0 !important;
+	transition:
+		background 0.12s ease,
+		color 0.12s ease,
+		border-color 0.12s ease,
+		transform 0.12s ease !important;
+}
+[data-testid="stToolbar"] .gf-sidebar-floater:hover {
+	background: rgba(255, 255, 255, 0.08) !important;
+	color: #ffffff !important;
+	border-color: rgba(255, 255, 255, 0.3) !important;
+	transform: translateY(-1px) !important;
+}
+[data-testid="stToolbar"] .gf-sidebar-floater::before {
+	content: "" !important;
+	display: block !important;
+	width: 16px !important;
+	height: 16px !important;
+	background-color: currentColor !important;
+	-webkit-mask-repeat: no-repeat !important;
+	-webkit-mask-position: center !important;
+	-webkit-mask-size: contain !important;
+	mask-repeat: no-repeat !important;
+	mask-position: center !important;
+	mask-size: contain !important;
+	/* Default = sidebar shown -> panel-left-close (chevron points in) */
+	-webkit-mask-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><rect x='3' y='3' width='18' height='18' rx='2'/><line x1='9' y1='3' x2='9' y2='21'/><polyline points='14 9 11 12 14 15'/></svg>") !important;
+	mask-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><rect x='3' y='3' width='18' height='18' rx='2'/><line x1='9' y1='3' x2='9' y2='21'/><polyline points='14 9 11 12 14 15'/></svg>") !important;
+}
+body.gf-sb-hidden [data-testid="stToolbar"] .gf-sidebar-floater::before {
+	/* Sidebar hidden -> panel-left-open (chevron points out) */
+	-webkit-mask-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><rect x='3' y='3' width='18' height='18' rx='2'/><line x1='9' y1='3' x2='9' y2='21'/><polyline points='11 9 14 12 11 15'/></svg>") !important;
+	mask-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><rect x='3' y='3' width='18' height='18' rx='2'/><line x1='9' y1='3' x2='9' y2='21'/><polyline points='11 9 14 12 11 15'/></svg>") !important;
+}
+
+/* Collapsed-state layout: hide the sidebar, then let the main content
+   reclaim the freed horizontal space. */
+body.gf-sb-hidden section[data-testid="stSidebar"] {
+	width: 0 !important;
+	min-width: 0 !important;
+	max-width: 0 !important;
+	overflow: hidden !important;
+	visibility: hidden !important;
+	transform: translateX(-100%);
+}
+body.gf-sb-hidden [data-testid="stMain"],
+body.gf-sb-hidden [data-testid="stAppViewBlockContainer"],
+body.gf-sb-hidden [data-testid="stMainBlockContainer"] {
+	margin-left: 0 !important;
+	max-width: 100% !important;
+	width: 100% !important;
+}
+/* Suppress every Streamlit-version flavour of the native collapsed-state
+   arrow -- we replace it with our own toolbar-resident button.
+   In recent Streamlit the test-id is `stExpandSidebarButton` (the
+   `keyboard_double_arrow_right` Material icon). */
+[data-testid="stExpandSidebarButton"],
+[data-testid="stSidebarCollapsedControl"],
+[data-testid="collapsedControl"],
+[data-testid="stSidebarCollapseButton"],
+[data-testid="baseButton-headerNoPadding"][aria-label*="sidebar" i],
+button[aria-label="open sidebar" i],
+button[aria-label="Open sidebar"] {
+	display: none !important;
+}

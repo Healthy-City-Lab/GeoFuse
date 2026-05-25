@@ -6,7 +6,7 @@ import streamlit as st
 
 
 def render(output_dir: str) -> None:
-    st.header("HPC Job Monitor")
+    st.header("HPC Monitoring")
 
     with st.form("job_mon_form"):
         with st.container(border=True):

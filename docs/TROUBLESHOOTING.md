@@ -59,15 +59,33 @@ Google Earth Engine credentials are missing or expired.
 The segmentation model runs out of VRAM during batch processing.
 
 **Fix:**
-* Reduce the grid resolution (increase meters-per-point spacing in the GVI tab).
 * Process fewer study areas simultaneously.
 * The engine automatically falls back from CUDA → MPS → CPU if a device runs out of memory mid-job.
 
 ---
 
-## Built With & References
+## GVI Job Shows as "Interrupted" After a Streamlit Restart
 
-* **Street View Download:** `geofuse/streetview.py` — a minimal custom port adapted from [streetlevel](https://github.com/sk-zk/streetlevel) (MIT). Uses Google's `SingleImageSearch` protobuf API for metadata and `streetviewpixels-pa.googleapis.com` for tiles. No external Street View package required.
-* **Semantic Segmentation:** [DeepLabV3+](https://github.com/VainF/DeepLabV3Plus-Pytorch/tree/master) via PyTorch.
-* **Training Data:** [Cityscapes Dataset](https://www.cityscapes-dataset.com/).
-* **Satellite Imagery:** [Google Earth Engine](https://earthengine.google.com/) and [geemap](https://geemap.org).
+The job was running when Streamlit (or the machine) restarted. The job state was saved but the worker process was killed.
+
+**Fix:** Switch to the tab the job came from (GVI or NDVI). Re-upload the **same** study area file you originally used. A restart panel appears above the input form with **Resume Job** and **Discard** buttons. **Resume Job** continues from the exact point where the job stopped — already-processed points and cached panoramas are skipped.
+
+If the file you re-upload does not match the original geometry, the restart panel will refuse to resume. Discard the interrupted job and start a new run instead.
+
+---
+
+## Where Are Per-Job Logs Stored?
+
+Every job writes a persistent text log to `logs/jobs/<job_id>.log`. The in-UI expander only keeps the last 100 lines in memory; the file on disk has the full log indefinitely.
+
+**Quick access:** open the job's expander in the sidebar Job Monitor and click "📄 Open log file" — it opens in your OS default text editor.
+
+External library logs (Google Earth Engine, Optuna) are routed into the same per-job file so they no longer appear in the host terminal.
+
+---
+
+## GeoTIFF File Is Huge or Mostly Empty (GVI)
+
+This happens when a single bbox-wide raster is rendered for a study area whose points are clustered in a few small regions (e.g. neighbourhoods across multiple cities). The bbox contains millions of empty cells.
+
+**Fix:** Switch to **GeoPackage** as the GVI output format — it is the recommended default for sparse / national-scale data. If you still want raster output, enable **Save GeoTIFF** in the GVI tab — GeoFuse will write one dense GeoTIFF per spatial cluster into `[Filename]_gvi_tiles/` along with a `tiles_index.json` describing each tile's bounds. No empty cells.

@@ -27,8 +27,10 @@ from PIL import Image as PILImage
 from shapely.geometry import box as shapely_box
 from streamlit_folium import st_folium
 
-from geofuse.crs_utils import reproject_geodataframe_to_wgs84
-from geofuse.jobs.runners import run_ndvi, run_ndvi_column
+from geofuse.crs_utils import (
+    metres_per_degree_at_lat,
+    reproject_geodataframe_to_wgs84,
+)
 from geofuse.vector_io import geometry_sha256
 
 # ---------------------------------------------------------------------------
@@ -137,7 +139,8 @@ def _ndvi_restart_summary_lines(p: dict) -> list[str]:
     lines.append(
         f"**Outputs:** GeoTIFF={bool(p.get('save_geotiff'))} · "
         f"GeoPackage={bool(p.get('save_gpkg'))} · "
-        f"GeoJSON={bool(p.get('save_geojson'))}"
+        f"GeoJSON={bool(p.get('save_geojson'))} · "
+        f"ClusterTiles={bool(p.get('save_cluster_tiles'))}"
     )
     return lines
 
@@ -197,18 +200,22 @@ def _render_ndvi_restart_panel(store, executor, output_dir) -> None:
         }
 
         if rec.type == "ndvi":
-            executor.submit_runner(
+            executor.submit_ndvi_subprocess(
                 record,
-                run_ndvi,
                 start_date=str(p.get("start_date", "")),
                 end_date=str(p.get("end_date", "")),
                 output_name=str(p.get("output_name", base_name)),
+                save_cluster_tiles=bool(p.get("save_cluster_tiles", False)),
+                save_features_samples=bool(p.get("save_features_samples", False)),
+                sample_radius_m=float(p.get("sample_radius_m", 0.0)),
+                sample_stat=str(p.get("sample_stat", "mean")),
                 **common,
             )
         else:  # ndvi_column
-            executor.submit_runner(
+            # Per-cluster tiles only apply to the single-range path (column
+            # mode produces per-date outputs already).
+            executor.submit_ndvi_column_subprocess(
                 record,
-                run_ndvi_column,
                 date_column=str(p.get("date_column", "")),
                 window_days=int(p.get("window_days", 30)),
                 **common,
@@ -260,8 +267,7 @@ def _ndvi_size_hint(buffer_m: int, resolution_m: int) -> None:
         bbox_maxx = max(bbox_maxx, maxx)
         bbox_maxy = max(bbox_maxy, maxy)
         cent_lat = (miny + maxy) / 2.0
-        m_per_deg_lat = 111000.0
-        m_per_deg_lon = 111000.0 * float(np.cos(np.radians(cent_lat)))
+        m_per_deg_lon, m_per_deg_lat = metres_per_degree_at_lat(cent_lat)
         # bbox area in metres (NDVI rasterizes the bbox of the buffered geom)
         width_m = (maxx - minx) * m_per_deg_lon + 2 * max(buffer_m, 0)
         height_m = (maxy - miny) * m_per_deg_lat + 2 * max(buffer_m, 0)
@@ -290,7 +296,7 @@ def _ndvi_size_hint(buffer_m: int, resolution_m: int) -> None:
 
 
 def render(output_dir: str) -> None:
-    st.header("NDVI Sourcing")
+    st.header("NDVI")
 
     if "ndvi_datasets" not in st.session_state:
         st.session_state.ndvi_datasets = {}
@@ -622,7 +628,7 @@ def render(output_dir: str) -> None:
         int(st.session_state.get("ndvi_res", 10)),
     )
 
-    oc_ndvi_a, oc_ndvi_b, oc_ndvi_c = st.columns(3)
+    oc_ndvi_a, oc_ndvi_b, oc_ndvi_c, oc_ndvi_d = st.columns(4)
     with oc_ndvi_a:
         st.checkbox(
             "Save GeoTIFF",
@@ -647,6 +653,57 @@ def render(output_dir: str) -> None:
             key="ndvi_out_geojson",
             help="Compatibility option only. Slow to read past ~100k points.",
         )
+    with oc_ndvi_d:
+        st.checkbox(
+            "Per-cluster tiles",
+            value=False,
+            key="ndvi_out_cluster_tiles",
+            help=(
+                "For scattered inputs (one feature per city / province), write "
+                "one GeoTIFF per connected component into "
+                "`{name}_ndvi_tiles/` plus a `tiles_index.json`. Avoids the "
+                "single mostly-NaN continent-spanning mosaic."
+            ),
+        )
+
+    # Sample-at-features row: optional vector output that attaches NDVI
+    # values to the uploaded features (mean / median / etc. within a buffer).
+    sa_a, sa_b, sa_c = st.columns([2, 2, 3])
+    with sa_a:
+        st.checkbox(
+            "Sample at uploaded features",
+            value=False,
+            key="ndvi_sample_at_features",
+            help=(
+                "Write a side `{name}_ndvi_at_features.gpkg` with NDVI values "
+                "attached to each uploaded feature (zonal aggregate over the "
+                "buffer for points, or over the polygon directly). Pairs with "
+                "GVI for fusion downstream."
+            ),
+        )
+    with sa_b:
+        st.number_input(
+            "Sample radius (m)",
+            min_value=0,
+            max_value=5000,
+            value=0,
+            step=10,
+            key="ndvi_sample_radius",
+            help=(
+                "Buffer around each point before aggregating. 0 = exact-pixel "
+                "read. Ignored for polygon inputs (the polygon itself is the "
+                "zone)."
+            ),
+        )
+    with sa_c:
+        st.selectbox(
+            "Sample stat",
+            options=["mean", "median", "min", "max", "std", "count"],
+            index=0,
+            key="ndvi_sample_stat",
+            help="Aggregator applied to pixels under each feature.",
+        )
+
     run = st.button(
         "🚀 Run NDVI Analysis",
         type="primary",
@@ -661,6 +718,8 @@ def render(output_dir: str) -> None:
         st.session_state.get("ndvi_out_geotiff", True)
         or st.session_state.get("ndvi_out_gpkg", False)
         or st.session_state.get("ndvi_out_geojson", False)
+        or st.session_state.get("ndvi_out_cluster_tiles", False)
+        or st.session_state.get("ndvi_sample_at_features", False)
     )
 
     if run:
@@ -676,6 +735,10 @@ def render(output_dir: str) -> None:
             save_gt = st.session_state.get("ndvi_out_geotiff", True)
             save_gj = st.session_state.get("ndvi_out_geojson", False)
             save_gp = st.session_state.get("ndvi_out_gpkg", False)
+            save_ct = st.session_state.get("ndvi_out_cluster_tiles", False)
+            save_sf = st.session_state.get("ndvi_sample_at_features", False)
+            sample_radius = float(st.session_state.get("ndvi_sample_radius", 0))
+            sample_stat = st.session_state.get("ndvi_sample_stat", "mean")
             jobs_started = 0
             validation_errors = []
 
@@ -732,12 +795,15 @@ def render(output_dir: str) -> None:
                                 "save_geotiff": save_gt,
                                 "save_gpkg": save_gp,
                                 "save_geojson": save_gj,
+                                "save_cluster_tiles": save_ct,
+                                "save_features_samples": save_sf,
+                                "sample_radius_m": sample_radius,
+                                "sample_stat": sample_stat,
                                 "geometry_sha256": geometry_sha256(d["raw"]),
                             },
                         )
-                        executor.submit_runner(
+                        executor.submit_ndvi_subprocess(
                             record,
-                            run_ndvi,
                             fname=fname,
                             dataset_data=d,
                             start_date=start_d.isoformat(),
@@ -750,6 +816,10 @@ def render(output_dir: str) -> None:
                             save_geotiff=save_gt,
                             save_gpkg=save_gp,
                             save_geojson=save_gj,
+                            save_cluster_tiles=save_ct,
+                            save_features_samples=save_sf,
+                            sample_radius_m=sample_radius,
+                            sample_stat=sample_stat,
                         )
                         jobs_started += 1
 
@@ -786,12 +856,15 @@ def render(output_dir: str) -> None:
                                 "save_geotiff": save_gt,
                                 "save_gpkg": save_gp,
                                 "save_geojson": save_gj,
+                                "save_cluster_tiles": save_ct,
+                                "save_features_samples": save_sf,
+                                "sample_radius_m": sample_radius,
+                                "sample_stat": sample_stat,
                                 "geometry_sha256": geometry_sha256(d["raw"]),
                             },
                         )
-                        executor.submit_runner(
+                        executor.submit_ndvi_subprocess(
                             record,
-                            run_ndvi,
                             fname=fname,
                             dataset_data=d,
                             start_date=start_d.isoformat(),
@@ -804,6 +877,10 @@ def render(output_dir: str) -> None:
                             save_geotiff=save_gt,
                             save_gpkg=save_gp,
                             save_geojson=save_gj,
+                            save_cluster_tiles=save_ct,
+                            save_features_samples=save_sf,
+                            sample_radius_m=sample_radius,
+                            sample_stat=sample_stat,
                         )
                         jobs_started += 1
 
@@ -834,9 +911,8 @@ def render(output_dir: str) -> None:
                                 "geometry_sha256": geometry_sha256(d["raw"]),
                             },
                         )
-                        executor.submit_runner(
+                        executor.submit_ndvi_column_subprocess(
                             record,
-                            run_ndvi_column,
                             fname=fname,
                             dataset_data=d,
                             date_column=date_col,
@@ -857,7 +933,7 @@ def render(output_dir: str) -> None:
             if jobs_started:
                 st.success(
                     f"{jobs_started} job(s) started. "
-                    "Monitor progress in the Job Monitor tab."
+                    "Monitor progress in the sidebar Job Monitor."
                 )
             elif not validation_errors:
                 st.info("No new jobs were submitted.")

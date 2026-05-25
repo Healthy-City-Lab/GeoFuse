@@ -36,13 +36,13 @@ streamlit run ui/app.py
 
 ## Documentation
 
-| Guide | Contents |
-|-------|----------|
-| [Features](docs/FEATURES.md) | Detailed breakdown of GVI, NDVI, Fusion, and HPC capabilities |
-| [Installation](docs/INSTALLATION.md) | Full setup instructions, segmentation model requirements, and verification tests |
-| [Usage](docs/USAGE.md) | Web UI walkthrough and CLI reference |
-| [Outputs](docs/OUTPUTS.md) | All generated files and directory structure |
-| [Troubleshooting](docs/TROUBLESHOOTING.md) | Common errors and fixes |
+| Guide                                      | Contents                                                                         |
+| ------------------------------------------ | -------------------------------------------------------------------------------- |
+| [Features](docs/FEATURES.md)               | Detailed breakdown of GVI, NDVI, Fusion, and HPC capabilities                    |
+| [Installation](docs/INSTALLATION.md)       | Full setup instructions, segmentation model requirements, and verification tests |
+| [Usage](docs/USAGE.md)                     | Web UI walkthrough and CLI reference                                             |
+| [Outputs](docs/OUTPUTS.md)                 | All generated files and directory structure                                      |
+| [Troubleshooting](docs/TROUBLESHOOTING.md) | Common errors and fixes                                                          |
 
 ---
 
@@ -57,3 +57,10 @@ If you use GeoFuse in your research, please cite:
 **Primary Developer:** [Armin Ghayur Sadigh](https://github.com/Armin-GS) — Ph.D. research at the [Healthy City Lab](https://www.healthycitylab.ca/), [University of Calgary](https://ucalgary.ca/).
 
 **License:** GNU General Public License v3.0 — see [LICENSE](LICENSE).
+
+**Built With & References**:
+
+* **Street View Download:** `geofuse/streetview.py` — a minimal custom port adapted from [streetlevel](https://github.com/sk-zk/streetlevel) (MIT). Uses Google's `SingleImageSearch` protobuf API for metadata and `streetviewpixels-pa.googleapis.com` for tiles.
+* **Semantic Segmentation:** [DeepLabV3+](https://github.com/VainF/DeepLabV3Plus-Pytorch/tree/master) via PyTorch.
+* **Training Data:** [Cityscapes Dataset](https://www.cityscapes-dataset.com/).
+* **Satellite Imagery:** [Google Earth Engine](https://earthengine.google.com/) and [geemap](https://geemap.org).

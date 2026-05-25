@@ -30,8 +30,13 @@ import numpy as np
 import pandas as pd
 import rasterio
 
-from geofuse.crs_utils import reproject_geodataframe_to_wgs84
+from geofuse.crs_utils import (
+    build_internal_overviews,
+    default_geotiff_creation_options,
+    reproject_geodataframe_to_wgs84,
+)
 from geofuse.gvi import GVIEngine
+from geofuse.jobs import progress_interval_s
 from geofuse.logger import get_logger
 from geofuse.ndvi import NDVIEngine
 from geofuse.persistence.job_executor import JobContext
@@ -94,22 +99,17 @@ def run_gvi(
     start_idx = len(current_accumulated)
     results_lock = threading.Lock()
 
-    # Throttle progress callbacks: the JobStore lock is also taken by the UI
-    # fragment, so frequent emits starve the worker. Interval scales with the
-    # total point count — 2 s up to 200 points, then +1 s per 100 points,
-    # capped at 10 s for 1000+ points. The final point always emits so the
-    # bar reaches 100%.
+    # Throttle progress callbacks via the shared :func:`progress_interval_s`
+    # so the JobStore lock stays cheap on big runs. The final point always
+    # emits so the bar reaches 100 %.
     _last_progress_t = {"v": 0.0}
-
-    def _progress_interval_s(total: int) -> float:
-        return float(min(10, max(2, total // 100)))
 
     def on_progress(curr: int, total: int) -> None:
         if total <= 0:
             return
         if curr < total:
             now = time.monotonic()
-            if now - _last_progress_t["v"] < _progress_interval_s(total):
+            if now - _last_progress_t["v"] < progress_interval_s(total):
                 return
         _last_progress_t["v"] = time.monotonic()
         ctx.progress(
@@ -212,6 +212,10 @@ def run_gvi(
                         arr_veg[lr, lc] = cdf["gvi_veg"].to_numpy()[keep]
                         arr_ter[lr, lc] = cdf["gvi_ter"].to_numpy()[keep]
                 tile_path = os.path.join(tiles_dir, f"cluster_{cid:04d}.tif")
+                # Shared compression / tiling / BIGTIFF defaults from
+                # crs_utils — cuts per-cluster tile size ~5–10× vs. the
+                # legacy uncompressed write and unlocks fast Folium previews
+                # via internal overviews built after close.
                 with rasterio.open(
                     tile_path,
                     "w",
@@ -223,11 +227,16 @@ def run_gvi(
                     crs=grid_crs_wkt,
                     transform=cluster["transform"],
                     nodata=np.nan,
+                    **default_geotiff_creation_options(np.float32),
                 ) as dst:
                     dst.write(arr_veg, 1)
                     dst.set_band_description(1, "Veg")
                     dst.write(arr_ter, 2)
                     dst.set_band_description(2, "Ter")
+                try:
+                    build_internal_overviews(tile_path)
+                except Exception:
+                    pass  # Non-fatal: base raster still valid.
                 index_entries.append(
                     {
                         "cluster_id": cid,
@@ -323,6 +332,12 @@ def run_ndvi(
     save_geotiff: bool,
     save_geojson: bool,
     save_gpkg: bool = False,
+    save_cluster_tiles: bool = False,
+    save_features_samples: bool = False,
+    sample_radius_m: float = 0.0,
+    sample_stat: str = "mean",
+    satellite: str = "auto",
+    coverage_rescue: bool = True,
 ) -> dict:
     """Run NDVI for a single date range."""
     from geofuse.crs_utils import buffer_gdf_union_metres
@@ -335,6 +350,10 @@ def run_ndvi(
 
     def check_cancel() -> bool:
         return ctx.is_cancelled()
+
+    # Sample-at-features uses the *un-buffered* raw input — the user wants
+    # NDVI at their original locations, not at the buffered download AOI.
+    sample_at = dataset_data["raw"] if save_features_samples else None
 
     result = engine.download_and_process(
         geometry=geometry,
@@ -349,6 +368,12 @@ def run_ndvi(
         write_geotiff=save_geotiff,
         write_geojson=save_geojson,
         write_geopackage=save_gpkg,
+        write_cluster_tiles=save_cluster_tiles,
+        satellite=satellite,
+        coverage_rescue=coverage_rescue,
+        sample_at_features=sample_at,
+        sample_radius_m=sample_radius_m,
+        sample_stat=sample_stat,
     )
 
     if result.get("status") == "cancelled":
@@ -366,6 +391,15 @@ def run_ndvi(
     gj_path = os.path.join(output_dir, f"{output_name}_ndvi.geojson")
     if save_geojson and os.path.exists(gj_path):
         output_paths.append(gj_path)
+    sidecar_path = os.path.join(output_dir, f"{output_name}_ndvi.json")
+    if os.path.exists(sidecar_path):
+        output_paths.append(sidecar_path)
+    cluster_tiles_dir = os.path.join(output_dir, f"{output_name}_ndvi_tiles")
+    if save_cluster_tiles and os.path.isdir(cluster_tiles_dir):
+        output_paths.append(cluster_tiles_dir)
+    samples_gpkg = os.path.join(output_dir, f"{output_name}_ndvi_at_features.gpkg")
+    if save_features_samples and os.path.exists(samples_gpkg):
+        output_paths.append(samples_gpkg)
 
     ctx.progress(value=1.0, status_text="Completed")
     return {"output_paths": output_paths}
