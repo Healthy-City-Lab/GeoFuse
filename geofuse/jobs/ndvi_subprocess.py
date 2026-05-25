@@ -35,6 +35,11 @@ def run_ndvi_child(
     save_geojson: bool,
     save_gpkg: bool,
     save_cluster_tiles: bool,
+    save_features_samples: bool,
+    sample_radius_m: float,
+    sample_stat: str,
+    satellite: str,
+    coverage_rescue: bool,
     event_queue,
     cancel_event,
 ) -> None:
@@ -66,6 +71,11 @@ def run_ndvi_child(
             save_geojson=save_geojson,
             save_gpkg=save_gpkg,
             save_cluster_tiles=save_cluster_tiles,
+            save_features_samples=save_features_samples,
+            sample_radius_m=sample_radius_m,
+            sample_stat=sample_stat,
+            satellite=satellite,
+            coverage_rescue=coverage_rescue,
         )
         event_queue.put((MSG_COMPLETE, list(result.get("output_paths") or [])))
 

@@ -384,6 +384,7 @@ def _full_panel(snap: dict[str, list[float]], has_gpu: bool) -> str:
 # live in ui/assets/resource_monitor.css and resource_monitor.js. See
 # ui/chrome.py for the load_asset() helper and the why-not-inline rule.
 
+
 def render_resource_monitor() -> None:
     """Render the floating resource monitor.
 

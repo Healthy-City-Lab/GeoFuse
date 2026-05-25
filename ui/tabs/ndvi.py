@@ -206,6 +206,9 @@ def _render_ndvi_restart_panel(store, executor, output_dir) -> None:
                 end_date=str(p.get("end_date", "")),
                 output_name=str(p.get("output_name", base_name)),
                 save_cluster_tiles=bool(p.get("save_cluster_tiles", False)),
+                save_features_samples=bool(p.get("save_features_samples", False)),
+                sample_radius_m=float(p.get("sample_radius_m", 0.0)),
+                sample_stat=str(p.get("sample_stat", "mean")),
                 **common,
             )
         else:  # ndvi_column
@@ -662,6 +665,45 @@ def render(output_dir: str) -> None:
                 "single mostly-NaN continent-spanning mosaic."
             ),
         )
+
+    # Sample-at-features row: optional vector output that attaches NDVI
+    # values to the uploaded features (mean / median / etc. within a buffer).
+    sa_a, sa_b, sa_c = st.columns([2, 2, 3])
+    with sa_a:
+        st.checkbox(
+            "Sample at uploaded features",
+            value=False,
+            key="ndvi_sample_at_features",
+            help=(
+                "Write a side `{name}_ndvi_at_features.gpkg` with NDVI values "
+                "attached to each uploaded feature (zonal aggregate over the "
+                "buffer for points, or over the polygon directly). Pairs with "
+                "GVI for fusion downstream."
+            ),
+        )
+    with sa_b:
+        st.number_input(
+            "Sample radius (m)",
+            min_value=0,
+            max_value=5000,
+            value=0,
+            step=10,
+            key="ndvi_sample_radius",
+            help=(
+                "Buffer around each point before aggregating. 0 = exact-pixel "
+                "read. Ignored for polygon inputs (the polygon itself is the "
+                "zone)."
+            ),
+        )
+    with sa_c:
+        st.selectbox(
+            "Sample stat",
+            options=["mean", "median", "min", "max", "std", "count"],
+            index=0,
+            key="ndvi_sample_stat",
+            help="Aggregator applied to pixels under each feature.",
+        )
+
     run = st.button(
         "🚀 Run NDVI Analysis",
         type="primary",
@@ -677,6 +719,7 @@ def render(output_dir: str) -> None:
         or st.session_state.get("ndvi_out_gpkg", False)
         or st.session_state.get("ndvi_out_geojson", False)
         or st.session_state.get("ndvi_out_cluster_tiles", False)
+        or st.session_state.get("ndvi_sample_at_features", False)
     )
 
     if run:
@@ -693,6 +736,9 @@ def render(output_dir: str) -> None:
             save_gj = st.session_state.get("ndvi_out_geojson", False)
             save_gp = st.session_state.get("ndvi_out_gpkg", False)
             save_ct = st.session_state.get("ndvi_out_cluster_tiles", False)
+            save_sf = st.session_state.get("ndvi_sample_at_features", False)
+            sample_radius = float(st.session_state.get("ndvi_sample_radius", 0))
+            sample_stat = st.session_state.get("ndvi_sample_stat", "mean")
             jobs_started = 0
             validation_errors = []
 
@@ -750,6 +796,9 @@ def render(output_dir: str) -> None:
                                 "save_gpkg": save_gp,
                                 "save_geojson": save_gj,
                                 "save_cluster_tiles": save_ct,
+                                "save_features_samples": save_sf,
+                                "sample_radius_m": sample_radius,
+                                "sample_stat": sample_stat,
                                 "geometry_sha256": geometry_sha256(d["raw"]),
                             },
                         )
@@ -768,6 +817,9 @@ def render(output_dir: str) -> None:
                             save_gpkg=save_gp,
                             save_geojson=save_gj,
                             save_cluster_tiles=save_ct,
+                            save_features_samples=save_sf,
+                            sample_radius_m=sample_radius,
+                            sample_stat=sample_stat,
                         )
                         jobs_started += 1
 
@@ -805,6 +857,9 @@ def render(output_dir: str) -> None:
                                 "save_gpkg": save_gp,
                                 "save_geojson": save_gj,
                                 "save_cluster_tiles": save_ct,
+                                "save_features_samples": save_sf,
+                                "sample_radius_m": sample_radius,
+                                "sample_stat": sample_stat,
                                 "geometry_sha256": geometry_sha256(d["raw"]),
                             },
                         )
@@ -823,6 +878,9 @@ def render(output_dir: str) -> None:
                             save_gpkg=save_gp,
                             save_geojson=save_gj,
                             save_cluster_tiles=save_ct,
+                            save_features_samples=save_sf,
+                            sample_radius_m=sample_radius,
+                            sample_stat=sample_stat,
                         )
                         jobs_started += 1
 

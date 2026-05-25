@@ -27,17 +27,16 @@ from .crs_utils import (
 from .jobs import progress_interval_s, retry_with_backoff
 from .logger import attach_external_logger, get_logger
 from .persistence.ndvi_tile_cache import DEFAULT_MAX_BYTES, NdviTileCache
+from .raster_sampling import sample_raster_at_features_to_file
 from .vector_io import geometry_sha256
 
 _log = get_logger("NDVI")
 
-# TODO: NDVI_LANDSAT - Add Landsat 8/9 support alongside Sentinel-2
 # TODO: NDVI_TEMPORAL - Add time-series analysis for seasonal greenery changes
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# Persistent NDVI tile cache root. Mirrors the GVI pano cache location
-# (``logs/caches/gvi_panos.db``) so cross-process caches live under one
+# Persistent NDVI tile cache root. Cross-process caches live under one
 # well-known directory. Tile bodies live under ``<root>/<resume_key>/``
 # alongside a SQLite WAL index used for LRU eviction.
 _TILE_CACHE_ROOT = os.path.join(_REPO_ROOT, "logs", "caches", "ndvi_tiles")
@@ -152,10 +151,16 @@ def _write_ndvi_sidecar(
     resume_key: str = "",
     start_date: str,
     end_date: str,
+    used_start_date: str | None = None,
+    used_end_date: str | None = None,
+    coverage_widened: bool = False,
     cloud_max: float,
     resolution_m: int,
     max_tile_size_km: float,
     ee_collection: str,
+    satellite: str = "sentinel2",
+    bands: list[str] | None = None,
+    n_cloud_filtered_images: int | None = None,
 ) -> str:
     """Write ``{output_name}_ndvi.json`` capturing the parameters and grid CRS.
 
@@ -182,10 +187,20 @@ def _write_ndvi_sidecar(
         "failed_tile_refs": list(failed_tile_refs or []),
         "start_date": str(start_date),
         "end_date": str(end_date),
+        "used_start_date": str(used_start_date or start_date),
+        "used_end_date": str(used_end_date or end_date),
+        "coverage_widened": bool(coverage_widened),
         "cloud_max": float(cloud_max),
         "resolution_m": int(resolution_m),
         "max_tile_size_km": float(max_tile_size_km),
         "ee_collection": ee_collection,
+        "satellite": satellite,
+        "bands": list(bands or ["NDVI", "valid_obs"]),
+        "n_cloud_filtered_images": (
+            int(n_cloud_filtered_images)
+            if n_cloud_filtered_images is not None
+            else None
+        ),
     }
     with open(sidecar_path, "w") as f:
         json.dump(payload, f, indent=2)
@@ -208,11 +223,21 @@ def _select_export_crs(geom_wgs84_gdf: gpd.GeoDataFrame):
 
 
 class NDVIEngine:
-    #: Earth Engine ImageCollection ID used by :meth:`get_collection`. Exposed
-    #: as a class attribute so the sidecar JSON can record exactly which
-    #: dataset produced a given NDVI output (and so a subclass can override
-    #: the collection without re-implementing the wrapper).
+    #: Default Earth Engine ImageCollection. ``download_and_process``
+    #: substitutes a Landsat collection when ``satellite="landsat"`` or
+    #: ``satellite="auto"`` resolves to Landsat (pre-Sentinel-2 dates).
     EE_COLLECTION_ID = "COPERNICUS/S2_SR_HARMONIZED"
+
+    #: First date covered by ``COPERNICUS/S2_SR_HARMONIZED``. Anything
+    #: earlier comes back empty; ``auto`` satellite mode picks Landsat for
+    #: ranges that end before this. Diagnostics also reference it.
+    S2_COLLECTION_START = "2017-03-28"
+
+    #: Merged Landsat 8/9 Collection 2 Tier 1 Level-2 source for the
+    #: pre-Sentinel-2 fallback. LC08 covers 2013-04+, LC09 covers 2021-10+;
+    #: combined as a single ee.ImageCollection at query time.
+    LANDSAT8_COLLECTION_ID = "LANDSAT/LC08/C02/T1_L2"
+    LANDSAT9_COLLECTION_ID = "LANDSAT/LC09/C02/T1_L2"
 
     def __init__(
         self,
@@ -286,6 +311,52 @@ class NDVIEngine:
             .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", cloud_max))
             .map(self.prep_ndvi)
         )
+
+    def prep_ndvi_landsat(self, img):
+        """NDVI from Landsat 8/9 Collection 2 Level-2 surface reflectance.
+
+        Bands: ``SR_B4`` (red) / ``SR_B5`` (NIR). Apply the C2 L2 scale +
+        offset (``DN * 0.0000275 - 0.2``) before computing the index, and
+        mask cloud / cloud-shadow via the ``QA_PIXEL`` band so cloudy
+        observations don't pollute the composite. Same output band name
+        (``NDVI``) as :meth:`prep_ndvi` so downstream code is collection-
+        agnostic.
+        """
+        scale = 0.0000275
+        offset = -0.2
+        red = img.select("SR_B4").multiply(scale).add(offset)
+        nir = img.select("SR_B5").multiply(scale).add(offset)
+        ndvi = nir.subtract(red).divide(nir.add(red)).rename("NDVI")
+        qa = img.select("QA_PIXEL")
+        # Bit 3 = cloud, bit 4 = cloud shadow, bit 5 = snow.
+        cloudy = (
+            qa.bitwiseAnd(1 << 3).Or(qa.bitwiseAnd(1 << 4)).Or(qa.bitwiseAnd(1 << 5))
+        )
+        return ndvi.updateMask(cloudy.eq(0)).copyProperties(img, img.propertyNames())
+
+    def get_collection_landsat(self, aoi, start_date, end_date, cloud_max=10):
+        """Merged LC08 + LC09 collection with the same shape as
+        :meth:`get_collection` for Sentinel-2."""
+        lc8 = ee.ImageCollection(self.LANDSAT8_COLLECTION_ID).filterBounds(aoi)
+        lc9 = ee.ImageCollection(self.LANDSAT9_COLLECTION_ID).filterBounds(aoi)
+        merged = lc8.merge(lc9)
+        return (
+            merged.filterDate(start_date, end_date)
+            .filter(ee.Filter.lt("CLOUD_COVER", cloud_max))
+            .map(self.prep_ndvi_landsat)
+        )
+
+    def _pick_satellite(self, start_date: str, end_date: str, satellite: str) -> str:
+        """Resolve ``satellite='auto'`` → ``'sentinel2'`` or ``'landsat'``.
+
+        ``end_date`` falling before the Sentinel-2 collection start picks
+        Landsat; everything else stays on Sentinel-2 (higher resolution +
+        more frequent revisit). Explicit ``'sentinel2'`` / ``'landsat'`` are
+        passed through untouched.
+        """
+        if satellite != "auto":
+            return satellite
+        return "landsat" if str(end_date) < self.S2_COLLECTION_START else "sentinel2"
 
     #: Block-iteration buffer cap. Points accumulate here across raster
     #: windows; once we cross this threshold we build a GeoDataFrame and
@@ -518,6 +589,11 @@ class NDVIEngine:
         write_geojson: bool = True,
         write_geopackage: bool = False,
         write_cluster_tiles: bool = False,
+        satellite: str = "auto",
+        coverage_rescue: bool = True,
+        sample_at_features: gpd.GeoDataFrame | None = None,
+        sample_radius_m: float = 0.0,
+        sample_stat: str = "mean",
     ):
         """
         Download and process NDVI data with automatic tiling for large areas.
@@ -544,6 +620,14 @@ class NDVIEngine:
                 a ``tiles_index.json``. Mirrors GVI's per-cluster GeoTIFF tile
                 output and avoids the giant mostly-NaN mosaic that scattered
                 national-scale inputs would otherwise produce.
+            satellite: ``'auto'`` (default — Sentinel-2 for ≥2017, Landsat 8/9
+                otherwise), ``'sentinel2'``, or ``'landsat'``. Auto picks
+                Landsat for date ranges that end before
+                :attr:`S2_COLLECTION_START`.
+            coverage_rescue: When the cloud-filtered collection has fewer
+                than 3 images, widen the date range by ±50 % once and retry.
+                Documented in the sidecar so the user knows the composite
+                spans a wider window than they originally asked for.
         """
         os.makedirs(folder, exist_ok=True)
 
@@ -584,18 +668,135 @@ class NDVIEngine:
         # ``[a, b, c, d, e, f]`` form: ``[scale, 0, x0, 0, -scale, y0]``.
         crs_transform = [float(resolution), 0.0, 0.0, 0.0, -float(resolution), 0.0]
 
-        # 3. Get Collection
-        col = self.get_collection(aoi, str(start_date), str(end_date), cloud_max)
-        if col.size().getInfo() == 0:
+        # 3. Pick the satellite collection. ``auto`` falls back to Landsat
+        # for ranges that end before Sentinel-2 SR_HARMONIZED started.
+        chosen_satellite = self._pick_satellite(
+            str(start_date), str(end_date), satellite
+        )
+        if chosen_satellite == "landsat":
+            ee_collection_id = (
+                f"{self.LANDSAT8_COLLECTION_ID}+{self.LANDSAT9_COLLECTION_ID}"
+            )
+
+            def _get_col(s, e, cmax):
+                return self.get_collection_landsat(aoi, s, e, cmax)
+
+            def _get_base(s, e):
+                lc8 = ee.ImageCollection(self.LANDSAT8_COLLECTION_ID).filterBounds(aoi)
+                lc9 = ee.ImageCollection(self.LANDSAT9_COLLECTION_ID).filterBounds(aoi)
+                return lc8.merge(lc9).filterDate(s, e)
+
+            cloud_field = "CLOUD_COVER"
+        else:
+            ee_collection_id = self.EE_COLLECTION_ID
+
+            def _get_col(s, e, cmax):
+                return self.get_collection(aoi, s, e, cmax)
+
+            def _get_base(s, e):
+                return (
+                    ee.ImageCollection(self.EE_COLLECTION_ID)
+                    .filterBounds(aoi)
+                    .filterDate(s, e)
+                )
+
+            cloud_field = "CLOUDY_PIXEL_PERCENTAGE"
+
+        _log(
+            "INFO",
+            f"Satellite: {chosen_satellite} (collection: {ee_collection_id})",
+        )
+
+        # 3a. Distinguish "no images in range" vs "all images filtered by
+        # cloud threshold" so the user gets an actionable error instead of
+        # the legacy "No images found." (which conflated the two).
+        used_start, used_end = str(start_date), str(end_date)
+        coverage_widened = False
+        n_total = _get_base(used_start, used_end).size().getInfo()
+        if n_total == 0:
+            suggestion = ""
+            if chosen_satellite == "sentinel2" and used_end < self.S2_COLLECTION_START:
+                suggestion = (
+                    f" Sentinel-2 SR_HARMONIZED starts {self.S2_COLLECTION_START}"
+                    " — set satellite='landsat' (or 'auto') for earlier dates."
+                )
             return {
                 "status": "error",
-                "message": f"No images found for {start_date} to {end_date}.",
+                "message": (
+                    f"No {chosen_satellite} images in collection for "
+                    f"{used_start} → {used_end}.{suggestion}"
+                ),
             }
+        n_cloud_filtered = (
+            _get_base(used_start, used_end)
+            .filter(ee.Filter.lt(cloud_field, cloud_max))
+            .size()
+            .getInfo()
+        )
+        if n_cloud_filtered == 0:
+            return {
+                "status": "error",
+                "message": (
+                    f"All {n_total} {chosen_satellite} image(s) for "
+                    f"{used_start} → {used_end} exceeded the {cloud_max}% cloud "
+                    "threshold. Try raising the cloud max."
+                ),
+            }
+
+        # 3b. Coverage rescue: if too few cloud-free images, widen the date
+        # range by ±50 % once and re-query. Single attempt — anything more
+        # aggressive belongs in user-controlled config.
+        MIN_IMAGES_FOR_COMPOSITE = 3
+        if (
+            coverage_rescue
+            and n_cloud_filtered < MIN_IMAGES_FOR_COMPOSITE
+            and used_end >= used_start
+        ):
+            try:
+                from datetime import date as _date
+                from datetime import timedelta as _timedelta
+
+                s_dt = _date.fromisoformat(used_start)
+                e_dt = _date.fromisoformat(used_end)
+                span = max((e_dt - s_dt).days, 1)
+                pad = _timedelta(days=int(span * 0.5))
+                w_start = (s_dt - pad).isoformat()
+                w_end = (e_dt + pad).isoformat()
+                n_widened = (
+                    _get_base(w_start, w_end)
+                    .filter(ee.Filter.lt(cloud_field, cloud_max))
+                    .size()
+                    .getInfo()
+                )
+                if n_widened > n_cloud_filtered:
+                    _log(
+                        "WARN",
+                        f"Coverage rescue: only {n_cloud_filtered} cloud-free "
+                        f"image(s) in {used_start}→{used_end}, widening to "
+                        f"{w_start}→{w_end} ({n_widened} images).",
+                    )
+                    used_start, used_end = w_start, w_end
+                    n_cloud_filtered = n_widened
+                    coverage_widened = True
+            except Exception as e:
+                _log("WARN", f"Coverage rescue skipped: {e}")
+
+        col = _get_col(used_start, used_end, cloud_max)
 
         if cancel_callback and cancel_callback():
             return {"status": "cancelled", "message": "Cancelled by user"}
 
-        ndvi_median = col.median().clip(aoi)
+        # 3c. Build a 2-band image: NDVI median + valid-obs count per pixel.
+        # ``count()`` over the masked collection is the number of unmasked
+        # (i.e. cloud-free, in-collection) observations at each pixel; The
+        # right "did this pixel get enough samples?" signal for downstream
+        # consumers. ``toUint16()`` keeps the band small. Each band gets its
+        # own nodata sentinel (NDVI: −9999 in float32, valid_obs: 0 in
+        # uint16) so a per-tile ``unmask(-9999)`` later wouldn't saturate the
+        # integer band.
+        ndvi_band = col.select("NDVI").median().rename("NDVI").unmask(-9999)
+        obs_band = col.select("NDVI").count().rename("valid_obs").toUint16().unmask(0)
+        ndvi_median = ndvi_band.addBands(obs_band).clip(aoi)
 
         # 4. Build cluster-aware tile list in true metres. Scattered national
         # inputs decompose into connected components, and tiles that fall over
@@ -611,17 +812,18 @@ class NDVIEngine:
 
         n_clusters = len({t["cluster_id"] for t in tiles})
 
-        # 5. Compute the resume key from the same fields that identify a
-        # unique run; two runs with the same key share an on-disk tile
-        # workspace so an interrupted job can pick up where it left off
-        # without re-downloading any tile that already landed cleanly.
+        # 5. Compute the resume key from the *effective* run parameters
+        # (post coverage-rescue date range + post satellite-pick collection).
+        # Anchoring the key on what was actually downloaded means a future
+        # run that hits the same widened window / Landsat fallback reuses
+        # the cache; runs that resolve differently get isolated workspaces.
         resume_key = _compute_resume_key(
             geom_for_crs,
-            str(start_date),
-            str(end_date),
+            used_start,
+            used_end,
             cloud_max,
             resolution,
-            self.EE_COLLECTION_ID,
+            ee_collection_id,
         )
 
         if n_tiles == 1:
@@ -702,14 +904,59 @@ class NDVIEngine:
                     resume_key=resume_key,
                     start_date=str(start_date),
                     end_date=str(end_date),
+                    used_start_date=used_start,
+                    used_end_date=used_end,
+                    coverage_widened=coverage_widened,
                     cloud_max=cloud_max,
                     resolution_m=resolution,
                     max_tile_size_km=max_tile_size_km,
-                    ee_collection=self.EE_COLLECTION_ID,
+                    ee_collection=ee_collection_id,
+                    satellite=chosen_satellite,
+                    bands=["NDVI", "valid_obs"],
+                    n_cloud_filtered_images=n_cloud_filtered,
                 )
                 result["sidecar"] = sidecar_path
             except Exception as e:
                 _log("WARN", f"Sidecar write failed (non-fatal): {e}")
+
+            # Sample-at-features (Step 15): attach NDVI values to the
+            # caller's features and write a side GeoPackage. Skipped when
+            # the user didn't ask for it or the raster wasn't written. The
+            # source raster is the final NDVI mosaic; Read once, sampled
+            # per-feature via the shared helper.
+            if sample_at_features is not None and not sample_at_features.empty:
+                final_tif = os.path.join(folder, f"{output_name}_ndvi.tif")
+                if os.path.exists(final_tif):
+                    samples_path = os.path.join(
+                        folder, f"{output_name}_ndvi_at_features.gpkg"
+                    )
+                    try:
+                        n = sample_raster_at_features_to_file(
+                            final_tif,
+                            sample_at_features,
+                            samples_path,
+                            band=1,
+                            radius_m=float(sample_radius_m or 0.0),
+                            stat=sample_stat,
+                            value_column="NDVI",
+                            count_column="ndvi_obs",
+                        )
+                        result["features_samples"] = samples_path
+                        _log(
+                            "OK",
+                            f"Sampled NDVI at {n} feature(s) → "
+                            f"{samples_path} (radius={sample_radius_m} m, "
+                            f"stat={sample_stat}).",
+                        )
+                    except Exception as e:
+                        _log("WARN", f"Sample-at-features failed: {e}")
+                else:
+                    _log(
+                        "WARN",
+                        "Sample-at-features requested but the NDVI raster "
+                        "wasn't kept on disk; enable write_geotiff or skip "
+                        "this option.",
+                    )
         return result
 
     def _download_single(
@@ -752,7 +999,9 @@ class NDVIEngine:
                 # symmetry with the tiled path even though there's only one
                 # tile here — it keeps the EE call shape identical between paths.
                 geemap.ee_export_image(
-                    ndvi_median.unmask(-9999),
+                    # Per-band nodata already applied in download_and_process
+                    # so the uint16 valid_obs band isn't clobbered with -9999.
+                    ndvi_median,
                     filename=temp_tif,
                     crs=export_crs,
                     crs_transform=crs_transform,
@@ -825,6 +1074,8 @@ class NDVIEngine:
             "tiles_resumed": 0,
             "failed_tile_refs": [],
             "n_clusters": 1,
+            "cluster_tiles_dir": None,
+            "cluster_tiles_written": 0,
             "export_crs": export_crs,
             "export_crs_name": export_crs_name,
             "export_distortion": export_distortion,
@@ -870,6 +1121,8 @@ class NDVIEngine:
                 "tiles_resumed": 0,
                 "failed_tile_refs": [],
                 "n_clusters": 1,
+                "cluster_tiles_dir": None,
+                "cluster_tiles_written": 0,
                 "export_crs": export_crs,
                 "export_crs_name": export_crs_name,
                 "export_distortion": export_distortion,
@@ -1035,7 +1288,8 @@ class NDVIEngine:
                 # the planar CRS so adjacent tiles' boundaries align to the
                 # pixel.
                 geemap.ee_export_image(
-                    tile_ndvi.unmask(-9999),
+                    # Per-band nodata already baked in (see download_and_process).
+                    tile_ndvi,
                     filename=tile_final,
                     crs=export_crs,
                     crs_transform=crs_transform,

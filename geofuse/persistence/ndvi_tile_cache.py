@@ -130,9 +130,7 @@ class NdviTileCache:
             path = os.path.join(self.cache_root, key)
             shutil.rmtree(path, ignore_errors=True)
             with self._lock:
-                self._conn.execute(
-                    "DELETE FROM entries WHERE resume_key = ?", (key,)
-                )
+                self._conn.execute("DELETE FROM entries WHERE resume_key = ?", (key,))
             total -= int(byte_count)
             n_removed += 1
             bytes_freed += int(byte_count)

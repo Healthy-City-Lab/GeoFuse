@@ -348,9 +348,7 @@ def build_planar_tiles(
     fwd = Transformer.from_crs(grid_crs, WGS84_EPSG, always_xy=True)
 
     def _to_4326(box_geom):
-        return shapely_transform(
-            lambda x, y, z=None: fwd.transform(x, y), box_geom
-        )
+        return shapely_transform(lambda x, y, z=None: fwd.transform(x, y), box_geom)
 
     tiles: list[dict] = []
     tile_idx_global = 0

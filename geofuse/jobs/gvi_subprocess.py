@@ -18,11 +18,11 @@ from __future__ import annotations
 import threading
 import traceback
 
-from .subprocess_runner import (
+from .subprocess_runner import (  # noqa: F401 — re-exported for back-compat
     MSG_COMPLETE,
     MSG_ERROR,
     SubprocJobContext,
-    drain_events_until_done,  # noqa: F401 — re-exported for back-compat
+    drain_events_until_done,
     route_engine_logging_to_queue,
 )
 

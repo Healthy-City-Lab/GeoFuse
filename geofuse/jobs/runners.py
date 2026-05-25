@@ -333,6 +333,11 @@ def run_ndvi(
     save_geojson: bool,
     save_gpkg: bool = False,
     save_cluster_tiles: bool = False,
+    save_features_samples: bool = False,
+    sample_radius_m: float = 0.0,
+    sample_stat: str = "mean",
+    satellite: str = "auto",
+    coverage_rescue: bool = True,
 ) -> dict:
     """Run NDVI for a single date range."""
     from geofuse.crs_utils import buffer_gdf_union_metres
@@ -345,6 +350,10 @@ def run_ndvi(
 
     def check_cancel() -> bool:
         return ctx.is_cancelled()
+
+    # Sample-at-features uses the *un-buffered* raw input — the user wants
+    # NDVI at their original locations, not at the buffered download AOI.
+    sample_at = dataset_data["raw"] if save_features_samples else None
 
     result = engine.download_and_process(
         geometry=geometry,
@@ -360,6 +369,11 @@ def run_ndvi(
         write_geojson=save_geojson,
         write_geopackage=save_gpkg,
         write_cluster_tiles=save_cluster_tiles,
+        satellite=satellite,
+        coverage_rescue=coverage_rescue,
+        sample_at_features=sample_at,
+        sample_radius_m=sample_radius_m,
+        sample_stat=sample_stat,
     )
 
     if result.get("status") == "cancelled":
@@ -383,6 +397,9 @@ def run_ndvi(
     cluster_tiles_dir = os.path.join(output_dir, f"{output_name}_ndvi_tiles")
     if save_cluster_tiles and os.path.isdir(cluster_tiles_dir):
         output_paths.append(cluster_tiles_dir)
+    samples_gpkg = os.path.join(output_dir, f"{output_name}_ndvi_at_features.gpkg")
+    if save_features_samples and os.path.exists(samples_gpkg):
+        output_paths.append(samples_gpkg)
 
     ctx.progress(value=1.0, status_text="Completed")
     return {"output_paths": output_paths}

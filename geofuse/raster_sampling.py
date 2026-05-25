@@ -1,0 +1,216 @@
+"""Sample a raster at vector features (points with optional buffer, polygons).
+
+Promoted out of the fusion engine's ``_apply_circular_buffer_aggregation`` so
+the NDVI engine — and any future consumer — can attach raster values to
+arbitrary input features without depending on fusion's internals.
+
+Output shape: the input GeoDataFrame plus one numeric column (default name
+``value``). Each row's value is the raster's pixel reading at the feature
+(exact pixel for unbuffered points, zonal stat for polygons / buffered
+points). Geometry and CRS are preserved.
+
+Two stat families are supported:
+
+* Exact-pixel reads (``radius_m == 0`` and geometry is a Point) → take the
+  pixel under the point.
+* Zonal aggregates (``radius_m > 0`` or polygon features) → mask raster
+  values within the geometry and reduce via ``mean`` / ``median`` /
+  ``min`` / ``max`` / ``std`` / ``count``.
+
+The raster is opened once and each feature is read through a small window,
+so memory use is proportional to one feature's worth of pixels.
+"""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Callable
+from typing import Any
+
+import geopandas as gpd
+import numpy as np
+import rasterio
+from rasterio.features import geometry_mask
+from rasterio.windows import from_bounds as window_from_bounds
+from shapely.geometry import Point
+
+from .crs_utils import metres_per_degree_at_lat
+
+_STAT_FUNCS: dict[str, Callable[[np.ndarray], float]] = {
+    "mean": lambda a: float(np.nanmean(a)),
+    "median": lambda a: float(np.nanmedian(a)),
+    "min": lambda a: float(np.nanmin(a)),
+    "max": lambda a: float(np.nanmax(a)),
+    "std": lambda a: float(np.nanstd(a)),
+    "count": lambda a: float(np.count_nonzero(~np.isnan(a))),
+}
+
+
+def _buffer_geom_in_metres(point: Point, point_lat: float, radius_m: float):
+    """Approximate circular buffer in degrees using metres-per-degree at ``point_lat``.
+
+    Faster than reprojecting to a metric CRS per feature and accurate enough
+    for the small-radius use case (10s to 100s of metres) the NDVI tab
+    typically asks for. For polygons / large radii callers should pre-
+    reproject to a metric CRS and pass the already-projected geometry.
+    """
+    m_per_deg_lon, m_per_deg_lat = metres_per_degree_at_lat(point_lat)
+    return point.buffer(
+        radius_m / max(m_per_deg_lon, m_per_deg_lat),
+        resolution=16,
+    )
+
+
+def sample_raster_at_features(
+    raster_path: str,
+    features_gdf: gpd.GeoDataFrame,
+    *,
+    band: int = 1,
+    radius_m: float = 0.0,
+    stat: str = "mean",
+    value_column: str = "value",
+    count_column: str | None = None,
+    nodata_sentinels: tuple[float, ...] = (-9999.0,),
+) -> gpd.GeoDataFrame:
+    """Attach raster values to each feature in ``features_gdf``.
+
+    Returns a copy of ``features_gdf`` with ``value_column`` added (and
+    optionally ``count_column`` recording how many valid pixels contributed
+    to each aggregate — useful as a confidence signal).
+
+    ``radius_m == 0`` with point features → exact-pixel read. Otherwise the
+    feature is rasterised into the window and the masked pixels are reduced
+    via ``stat``. Features that fall outside the raster, or end up with
+    only nodata pixels, get ``NaN``.
+    """
+    if stat not in _STAT_FUNCS:
+        raise ValueError(
+            f"Unknown stat '{stat}'. Expected one of {sorted(_STAT_FUNCS)}."
+        )
+    reducer = _STAT_FUNCS[stat]
+    out = features_gdf.copy()
+    out[value_column] = np.nan
+    if count_column:
+        out[count_column] = 0
+
+    if features_gdf.empty:
+        return out
+
+    with rasterio.open(raster_path) as src:
+        # Reproject features to raster CRS up front — cheap one-shot vs.
+        # per-feature transforms.
+        if src.crs is None:
+            feat_in_src = features_gdf
+        elif features_gdf.crs is None or features_gdf.crs == src.crs:
+            feat_in_src = features_gdf
+        else:
+            feat_in_src = features_gdf.to_crs(src.crs)
+
+        src_nodata = src.nodata
+        is_geographic = bool(getattr(src.crs, "is_geographic", False))
+
+        for fid, row in feat_in_src.iterrows():
+            geom = row.geometry
+            if geom is None or geom.is_empty:
+                continue
+
+            # Resolve the working geometry for this feature.
+            if geom.geom_type == "Point":
+                if radius_m and radius_m > 0:
+                    if is_geographic:
+                        work_geom = _buffer_geom_in_metres(geom, geom.y, radius_m)
+                    else:
+                        work_geom = geom.buffer(radius_m, resolution=16)
+                else:
+                    # Exact-pixel sample.
+                    try:
+                        r, c = src.index(geom.x, geom.y)
+                        if r < 0 or c < 0 or r >= src.height or c >= src.width:
+                            continue
+                        val = float(
+                            src.read(band, window=rasterio.windows.Window(c, r, 1, 1))[
+                                0, 0
+                            ]
+                        )
+                        if (
+                            math.isnan(val)
+                            or val in nodata_sentinels
+                            or (src_nodata is not None and val == src_nodata)
+                        ):
+                            continue
+                        out.at[fid, value_column] = val
+                        if count_column:
+                            out.at[fid, count_column] = 1
+                    except Exception:
+                        continue
+                    continue
+            else:
+                work_geom = geom
+
+            # Zonal aggregate path — compute the window, mask, reduce.
+            try:
+                minx, miny, maxx, maxy = work_geom.bounds
+                win = (
+                    window_from_bounds(minx, miny, maxx, maxy, transform=src.transform)
+                    .round_offsets()
+                    .round_lengths()
+                )
+                if win.width <= 0 or win.height <= 0:
+                    continue
+                # Clamp to raster bounds — rasterio is permissive but the
+                # downstream mask call wants a positive window.
+                col_off = max(0, int(win.col_off))
+                row_off = max(0, int(win.row_off))
+                width = min(int(win.width), src.width - col_off)
+                height = min(int(win.height), src.height - row_off)
+                if width <= 0 or height <= 0:
+                    continue
+                win = rasterio.windows.Window(col_off, row_off, width, height)
+                arr = src.read(band, window=win).astype(np.float64)
+                if arr.size == 0:
+                    continue
+
+                win_transform = rasterio.windows.transform(win, src.transform)
+                mask = geometry_mask(
+                    [work_geom],
+                    transform=win_transform,
+                    out_shape=arr.shape,
+                    invert=True,
+                )
+                arr[~mask] = np.nan
+                if src_nodata is not None:
+                    arr[arr == src_nodata] = np.nan
+                for sentinel in nodata_sentinels:
+                    arr[arr == sentinel] = np.nan
+                valid = arr[~np.isnan(arr)]
+                if valid.size == 0:
+                    continue
+                out.at[fid, value_column] = reducer(arr)
+                if count_column:
+                    out.at[fid, count_column] = int(valid.size)
+            except Exception:
+                continue
+
+    return out
+
+
+def sample_raster_at_features_to_file(
+    raster_path: str,
+    features_gdf: gpd.GeoDataFrame,
+    output_gpkg_path: str,
+    *,
+    layer: str = "ndvi_at_features",
+    progress_cb: Callable[[int, int], None] | None = None,
+    **sampling_kwargs: Any,
+) -> int:
+    """Convenience wrapper: sample, write to GeoPackage, return feature count.
+
+    ``progress_cb(k, n)`` is currently called once at the end — the per-
+    feature loop is fast enough that batched reporting is fine for the
+    typical scale (≲100k features).
+    """
+    out = sample_raster_at_features(raster_path, features_gdf, **sampling_kwargs)
+    out.to_file(output_gpkg_path, driver="GPKG", layer=layer)
+    if progress_cb is not None:
+        progress_cb(len(out), len(out))
+    return len(out)

@@ -361,6 +361,11 @@ class JobExecutor:
         save_geojson: bool,
         save_gpkg: bool,
         save_cluster_tiles: bool = False,
+        save_features_samples: bool = False,
+        sample_radius_m: float = 0.0,
+        sample_stat: str = "mean",
+        satellite: str = "auto",
+        coverage_rescue: bool = True,
     ) -> Future:
         """Run an NDVI (single-range) job in a fresh subprocess.
 
@@ -392,6 +397,11 @@ class JobExecutor:
                 save_geojson=save_geojson,
                 save_gpkg=save_gpkg,
                 save_cluster_tiles=save_cluster_tiles,
+                save_features_samples=save_features_samples,
+                sample_radius_m=sample_radius_m,
+                sample_stat=sample_stat,
+                satellite=satellite,
+                coverage_rescue=coverage_rescue,
             ),
             process_name=f"ndvi-child-{record.id}",
         )

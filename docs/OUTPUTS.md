@@ -66,10 +66,11 @@ For each input file / date range processed through the NDVI pipeline. Defaults: 
 
 ### `[Filename]_ndvi.tif` (default)
 
-Single-band GeoTIFF (EPSG:4326):
+Two-band GeoTIFF (EPSG:4326):
 
-* **Band 1**: NDVI values sampled from satellite imagery
-* NoData value: `−9999`
+* **Band 1 (`NDVI`, float32)**: median NDVI over the date range, after cloud masking.
+* **Band 2 (`valid_obs`, uint16)**: per-pixel count of cloud-free observations that contributed to the median. You can reject pixels below your minimum-observation threshold downstream.
+* NoData value: `−9999` on band 1.
 
 ### `[Filename]_ndvi.gpkg` (optional)
 
@@ -84,6 +85,17 @@ Vector point data with:
 | `NDVI` | Normalized Difference Vegetation Index (−1 to 1) |
 | `x`, `y` | Geographic coordinates (EPSG:4326) |
 | `ndvi_date` | Source date (attribute-column mode only) |
+
+### `[Filename]_ndvi_at_features.gpkg` (optional)
+
+GeoPackage with layer `ndvi_at_features`, written when **Sample at uploaded features** is enabled. Each row preserves the original feature's attributes, plus:
+
+| Field | Description |
+|-------|-------------|
+| `NDVI` | Aggregated NDVI under the feature — exact-pixel read for unbuffered points, otherwise the chosen stat (mean / median / min / max / std / count) over the buffer or polygon |
+| `ndvi_obs` | Count of valid raster pixels that contributed to the aggregate. Zero ⇒ outside raster footprint or all-nodata |
+
+Pairs cleanly with GVI sample points for fusion downstream; Both formats deliver per-feature greenery values keyed on the original uploaded geometry.
 
 ### `[Filename]_ndvi_tiles/` (optional)
 
@@ -110,9 +122,11 @@ introspect a raster after the fact without re-running Earth Engine:
 | `n_clusters` / `tiles_total` / `tiles_succeeded` / `tiles_failed` / `tiles_resumed` | How the input decomposed into connected components and tiles, how many landed on disk vs. exhausted retry, and how many were reused from a previous interrupted run |
 | `resume_key` | Short hash over geometry + date range + cloud max + resolution + collection. Identifies the cache entry under `logs/caches/ndvi_tiles/<resume_key>/`. Lets any future run with the same key reuse already-downloaded tiles instantly (whether the previous run was interrupted or finished cleanly). LRU-evicted by the cache once total size exceeds the cap |
 | `failed_tile_refs` | List of `{cluster_id, tile_idx, error}` for tiles that hit the retry ceiling — these areas appear as NaN gaps in the mosaic, this lets you audit which |
-| `start_date` / `end_date` / `cloud_max` | EE collection filter used |
+| `start_date` / `end_date` | Date range the *user* asked for (unmodified) |
+| `used_start_date` / `used_end_date` / `coverage_widened` | Date range actually queried (may be wider than the user's request if coverage rescue fired). `coverage_widened: true` flags that the composite spans a bigger window than requested |
+| `cloud_max` / `n_cloud_filtered_images` | Cloud-percentage threshold + how many images survived it |
 | `resolution_m` / `max_tile_size_km` | Export resolution and tiling cap |
-| `ee_collection` | Earth Engine ImageCollection ID (e.g. `COPERNICUS/S2_SR_HARMONIZED`) |
+| `satellite` / `ee_collection` / `bands` | `'sentinel2'` or `'landsat'` (auto-picked by date range), the ImageCollection ID actually queried, and the list of bands in the GeoTIFF (`["NDVI", "valid_obs"]`) |
 
 ---
 
