@@ -16,7 +16,7 @@ ENV_NAME = "geofuse"
 CONDA_PACKAGES = ["gdal=3.12.0", "geopandas=1.1.1", "statsmodels=0.14.6"]
 
 # 2. PYTORCH
-PYTORCH_VERSION = "pytorch=2.4.1 torchvision=0.19.1 torchaudio=2.4.1"
+PYTORCH_VERSION = "torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0"
 
 # 3. PIP PACKAGES
 PIP_PACKAGES = [
@@ -36,6 +36,7 @@ PIP_PACKAGES = [
     "streamlit==1.52.1",
     "streamlit-folium==0.25.3",
     "folium==0.20.0",
+    # Earth Engine & Geospatial APIs
     "geemap==0.36.6",
     "earthengine-api==1.7.4",
     # Async HTTP — used by the in-house geofuse.streetview client (GVIEngine)
@@ -46,8 +47,6 @@ PIP_PACKAGES = [
     "black==25.1.0",
     "ruff==0.15.12",
 ]
-
-GIT_PACKAGES = []
 
 
 def run_cmd(command, log_file=None, optional=False):
@@ -194,9 +193,9 @@ def main(env_name, log_file=None):
         print(f"[WARN] Environment '{env_name}' already exists. Removing...")
         subprocess.run(f"conda env remove -n {env_name} -y", shell=True, check=True)
 
-    print(f"[INFO] Creating environment '{env_name}' with Python 3.12...")
+    print(f"[INFO] Creating environment '{env_name}' with Python 3.13...")
     subprocess.run(
-        f"conda create -n {env_name} python=3.12 pip -y -c conda-forge",
+        f"conda create -n {env_name} python=3.13 pip -y -c conda-forge",
         shell=True,
         check=True,
     )
@@ -206,47 +205,39 @@ def main(env_name, log_file=None):
     mpi_pkgs = get_mpi_packages(system)
     full_conda_list = CONDA_PACKAGES + mpi_pkgs
     conda_str = " ".join(full_conda_list)
+    env_python = get_env_python(env_name)
 
-    print(f"[1/6] Installing Core & MPI Binaries ({solver})...")
+    print(f"[1/5] Installing Core & MPI Binaries ({solver})...")
     # Conda handles the binary linking for mpi4py automatically here
     run_cmd(f"{solver} install -n {env_name} -y -c conda-forge {conda_str}", log_file)
 
     # 2. Install PyTorch
-    print("[2/6] Installing PyTorch Acceleration...")
+    print("[2/5] Installing PyTorch Acceleration...")
     if system == "Windows" or system == "Linux":
-        cmd = f"{solver} install -n {env_name} -y {PYTORCH_VERSION} pytorch-cuda=12.1 -c pytorch -c nvidia"
+        cmd = f'"{env_python}" -m pip install {PYTORCH_VERSION} --index-url https://download.pytorch.org/whl/cu128 --no-warn-script-location'
     else:
         # macOS uses CPU or MPS (Metal Performance Shaders), no CUDA
         # Use the standard command, ensuring the pytorch channel is primary.
-        cmd = f"{solver} install -n {env_name} -y {PYTORCH_VERSION} -c pytorch"
+        cmd = f'"{env_python}" -m pip install {PYTORCH_VERSION} --no-warn-script-location'
     run_cmd(cmd, log_file)
 
     # 3. Install Pip Libraries
-    print("[3/6] Installing Python Libraries...")
-    env_python = get_env_python(env_name)
-    # Upgrade pip/setuptools first so the build backend has pkg_resources available
+    print("[3/5] Installing Python Libraries...")
+    # Upgrade pip/setuptools first so the build backend has pkg_resources available.
     run_cmd(
-        f'"{env_python}" -m pip install --upgrade pip setuptools wheel',
+        f'"{env_python}" -m pip install --upgrade pip setuptools wheel --no-warn-script-location',
         log_file,
     )
     pip_str = " ".join(PIP_PACKAGES)
-    run_cmd(f'"{env_python}" -m pip install {pip_str}', log_file)
+    run_cmd(f'"{env_python}" -m pip install {pip_str} --no-warn-script-location', log_file)
 
-    # 4. Install Git Packages (none currently — kept for future use)
-    if GIT_PACKAGES:
-        print("[4/6] Installing Custom Git Packages...")
-        for git_url in GIT_PACKAGES:
-            run_cmd(f'"{env_python}" -m pip install {git_url}', log_file)
-    else:
-        print("[4/6] No git packages to install — skipping.")
-
-    # 5. Editable Install
-    print("[5/6] Performing Editable Install of GeoFuse...")
+    # 4. Editable Install
+    print("[4/5] Performing Editable Install of GeoFuse...")
     root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    run_cmd(f'"{env_python}" -m pip install -e "{root_dir}"', log_file)
+    run_cmd(f'"{env_python}" -m pip install -e "{root_dir}" --no-warn-script-location', log_file)
 
-    # 6. Verify Installation
-    print("[6/6] Verifying Installation...")
+    # 5. Verify Installation
+    print("[5/5] Verifying Installation...")
 
     env_python = get_env_python(env_name)
 
