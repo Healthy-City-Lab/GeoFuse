@@ -287,6 +287,13 @@ class NDVIEngine:
             .map(self.prep_ndvi)
         )
 
+    #: Block-iteration buffer cap. Points accumulate here across raster
+    #: windows; once we cross this threshold we build a GeoDataFrame and
+    #: append it to the GeoPackage, then reset. Keeps peak memory bounded
+    #: while batching enough features that GPKG open/append overhead doesn't
+    #: dominate
+    _VECTOR_FLUSH_POINTS = 500_000
+
     def _raster_to_ndvi_points(
         self,
         final_tif: str,
@@ -300,7 +307,20 @@ class NDVIEngine:
         sub_end: float,
         meta_extra: dict[str, Any] | None = None,
     ) -> dict:
-        """Read NDVI raster, build a point GDF, write to GeoJSON and/or GeoPackage."""
+        """Stream raster blocks → points, append to GeoPackage in chunks.
+
+        Walks the raster's native block grid (typically 256×256 tiles for
+        our outputs) instead of slurping the whole band into RAM. Each
+        valid-pixel chunk gets buffered until the buffer hits
+        ``_VECTOR_FLUSH_POINTS``, then a small GeoDataFrame is built,
+        clipped to the study geometry, and appended to the GeoPackage.
+        Keeps peak memory usage low.
+
+        GeoJSON output (when requested) is materialised at the end from the
+        GeoPackage — it has no streaming-append story of its own, but
+        anyone asking for GeoJSON at this scale has already been warned
+        in the UI that it's a compatibility-only path.
+        """
         if cancel_callback and cancel_callback():
             return {"status": "cancelled", "message": "Cancelled by user"}
 
@@ -310,63 +330,174 @@ class NDVIEngine:
             phase="Writing vector samples",
         )
 
+        # Prepare the clip union geometry once (in 4326) so per-chunk filter
+        # is a single shapely predicate rather than a full ``gpd.clip``.
+        clip_geom = None
+        if isinstance(geometry, gpd.GeoDataFrame) and not geometry.empty:
+            clip_gdf = (
+                geometry
+                if geometry.crs == "EPSG:4326"
+                else geometry.to_crs("EPSG:4326")
+            )
+            try:
+                clip_geom = clip_gdf.geometry.union_all()
+                if clip_geom is not None and clip_geom.is_empty:
+                    clip_geom = None
+            except Exception:
+                clip_geom = None
+
+        layer_name = "ndvi_samples"
+        # Always stream into the GeoPackage when one was requested. When the
+        # user only wants GeoJSON, route through a temp GPKG next door (same
+        # streaming benefit) and convert at the end.
+        if gpkg_path:
+            stream_target = gpkg_path
+            stream_target_is_temp = False
+        elif geojson_path:
+            stream_target = geojson_path + ".tmp.gpkg"
+            stream_target_is_temp = True
+        else:
+            # Neither vector output requested — the caller should not have
+            # called us. Treat as a no-op success.
+            meta = {"crs": "EPSG:4326"}
+            if meta_extra:
+                meta.update(meta_extra)
+            return {
+                "status": "success",
+                "tif": final_tif,
+                "geojson": None,
+                "gpkg": None,
+                "meta": meta,
+            }
+
+        # Working buffers (Python lists — appending is amortised O(1) and
+        # numpy conversion happens once per flush).
+        buf_x: list[float] = []
+        buf_y: list[float] = []
+        buf_v: list[float] = []
+        n_written = 0
+        first_chunk = True
+
         try:
             with rasterio.open(final_tif) as src:
-                band1 = src.read(1)
-                band1 = np.where(band1 == -9999, np.nan, band1)
-                height, width = band1.shape
+                nodata = src.nodata if src.nodata is not None else -9999
+                blocks = list(src.block_windows(1))
+                n_blocks = max(1, len(blocks))
 
-                cols, rows = np.meshgrid(np.arange(width), np.arange(height))
-                xs, ys = rasterio.transform.xy(
-                    src.transform, rows, cols, offset="center"
-                )
+                def flush() -> None:
+                    nonlocal first_chunk, n_written
+                    if not buf_v:
+                        return
+                    gdf_chunk = gpd.GeoDataFrame(
+                        {"NDVI": np.round(np.asarray(buf_v, dtype=np.float32), 4)},
+                        geometry=gpd.points_from_xy(
+                            np.round(np.asarray(buf_x), 5),
+                            np.round(np.asarray(buf_y), 5),
+                        ),
+                        crs="EPSG:4326",
+                    )
+                    if clip_geom is not None:
+                        gdf_chunk = gdf_chunk[gdf_chunk.geometry.intersects(clip_geom)]
+                    if not gdf_chunk.empty:
+                        mode = "w" if first_chunk else "a"
+                        gdf_chunk.to_file(
+                            stream_target,
+                            driver="GPKG",
+                            layer=layer_name,
+                            mode=mode,
+                        )
+                        first_chunk = False
+                        n_written += len(gdf_chunk)
+                    buf_x.clear()
+                    buf_y.clear()
+                    buf_v.clear()
 
-                xs = np.array(xs).flatten()
-                ys = np.array(ys).flatten()
-                values = band1.flatten()
+                span = max(sub_end - sub_start, 0.0)
+                for bi, (_block_idx, window) in enumerate(blocks):
+                    if cancel_callback and cancel_callback():
+                        return {"status": "cancelled", "message": "Cancelled by user"}
 
-                valid_mask = ~np.isnan(values)
+                    arr = src.read(1, window=window)
+                    # Treat both NaN and the EE nodata sentinel as missing.
+                    if np.issubdtype(arr.dtype, np.floating):
+                        valid = (arr != nodata) & ~np.isnan(arr)
+                    else:
+                        valid = arr != nodata
+                    if not valid.any():
+                        _emit_ndvi_progress(
+                            ndvi_progress_callback,
+                            sub_progress=sub_start + span * ((bi + 1) / n_blocks),
+                            phase="Writing vector samples",
+                        )
+                        continue
 
-                if not np.any(valid_mask):
-                    return {"status": "error", "message": "Raster is empty."}
+                    rows_local, cols_local = np.nonzero(valid)
+                    rows_global = rows_local + int(window.row_off)
+                    cols_global = cols_local + int(window.col_off)
+                    xs, ys = rasterio.transform.xy(
+                        src.transform,
+                        rows_global.tolist(),
+                        cols_global.tolist(),
+                        offset="center",
+                    )
+                    buf_x.extend(xs if isinstance(xs, list) else [xs])
+                    buf_y.extend(ys if isinstance(ys, list) else [ys])
+                    buf_v.extend(arr[valid].tolist())
 
-                xs_r = np.round(xs[valid_mask], 5)
-                ys_r = np.round(ys[valid_mask], 5)
-                vals_r = np.round(values[valid_mask], 4)
+                    if len(buf_v) >= self._VECTOR_FLUSH_POINTS:
+                        flush()
 
-                gdf_out = gpd.GeoDataFrame(
-                    {"NDVI": vals_r.astype(np.float32)},
-                    geometry=gpd.points_from_xy(xs_r, ys_r),
-                    crs="EPSG:4326",
-                )
+                    _emit_ndvi_progress(
+                        ndvi_progress_callback,
+                        sub_progress=sub_start + span * ((bi + 1) / n_blocks),
+                        phase="Writing vector samples",
+                    )
 
-                if isinstance(geometry, gpd.GeoDataFrame):
-                    clip_geom = geometry
-                    if clip_geom.crs != "EPSG:4326":
-                        clip_geom = clip_geom.to_crs("EPSG:4326")
-                    gdf_out = gpd.clip(gdf_out, clip_geom)
+                flush()
 
-                if gpkg_path:
-                    gdf_out.to_file(gpkg_path, driver="GPKG", layer="ndvi_samples")
-                if geojson_path:
-                    gdf_out.to_file(geojson_path, driver="GeoJSON")
+            if n_written == 0:
+                # Clean up the empty temp GPKG before reporting empty raster.
+                if stream_target_is_temp and os.path.exists(stream_target):
+                    try:
+                        os.remove(stream_target)
+                    except OSError:
+                        pass
+                return {"status": "error", "message": "Raster is empty."}
 
-                _emit_ndvi_progress(
-                    ndvi_progress_callback,
-                    sub_progress=sub_end,
-                    phase="Writing vector samples",
-                )
+            # GeoJSON convert path: read the streamed GPKG back and dump.
+            # Acceptable for the UI's small / medium GeoJSON use case; the
+            # checkbox is documented as compatibility-only.
+            if geojson_path:
+                try:
+                    gdf_full = gpd.read_file(stream_target, layer=layer_name)
+                    gdf_full.to_file(geojson_path, driver="GeoJSON")
+                except Exception as e:
+                    _log("WARN", f"GeoJSON conversion failed: {e}")
+            if stream_target_is_temp and os.path.exists(stream_target):
+                try:
+                    os.remove(stream_target)
+                except OSError:
+                    pass
 
-                meta = {"crs": str(src.crs)}
-                if meta_extra:
-                    meta.update(meta_extra)
-                return {
-                    "status": "success",
-                    "tif": final_tif,
-                    "geojson": geojson_path,
-                    "gpkg": gpkg_path,
-                    "meta": meta,
-                }
+            _emit_ndvi_progress(
+                ndvi_progress_callback,
+                sub_progress=sub_end,
+                phase="Writing vector samples",
+            )
+
+            meta: dict[str, Any] = {
+                "crs": "EPSG:4326",
+                "vector_points": n_written,
+            }
+            if meta_extra:
+                meta.update(meta_extra)
+            return {
+                "status": "success",
+                "tif": final_tif,
+                "geojson": geojson_path,
+                "gpkg": gpkg_path,
+                "meta": meta,
+            }
 
         except Exception as e:
             return {"status": "error", "message": f"Pixel Extraction Failed: {str(e)}"}

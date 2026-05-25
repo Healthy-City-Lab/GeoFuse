@@ -73,7 +73,7 @@ Single-band GeoTIFF (EPSG:4326):
 
 ### `[Filename]_ndvi.gpkg` (optional)
 
-GeoPackage with layer `ndvi_samples` (EPSG:4326) — same per-point data as the GeoJSON form, but loads orders of magnitude faster for large extents.
+GeoPackage with layer `ndvi_samples` (EPSG:4326) — same per-point data as the GeoJSON form, but loads orders of magnitude faster for large extents. Written via streaming block iteration so peak memory usage is kept low.
 
 ### `[Filename]_ndvi.geojson` (optional)
 
