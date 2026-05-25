@@ -1,7 +1,5 @@
-import base64
 import gc
 import glob
-import io
 import os
 
 import folium
@@ -24,7 +22,7 @@ from map_preview import (
     add_uniform_point_layer,
     trim_point_gdf_for_display,
 )
-from PIL import Image as PILImage
+from raster_overlay import add_mercator_image_overlay
 from rasterio.transform import array_bounds
 from shapely.geometry import box as shapely_box
 from streamlit_folium import st_folium
@@ -1275,24 +1273,22 @@ def render(output_dir: str, parent_dir: str) -> None:
                         except (AttributeError, KeyError):
                             cmap = plt.get_cmap(cmap_name)
 
-                        norm_data = np.clip((arr - 0) / 0.6, 0, 1)
-                        colored = cmap(norm_data)
-                        colored[..., 3] = np.where(np.isnan(arr), 0, r_opacity)
-                        img_bytes = (colored * 255).astype(np.uint8)
-                        im = PILImage.fromarray(img_bytes)
-                        buff = io.BytesIO()
-                        im.save(buff, format="PNG")
-                        img_url = (
-                            f"data:image/png;base64,"
-                            f"{base64.b64encode(buff.getvalue()).decode()}"
-                        )
-
-                        folium.raster_layers.ImageOverlay(
-                            image=img_url,
-                            bounds=[[bottom, left], [top, right]],
+                        # Mercator-warp + colorize via shared helper so the
+                        # overlay aligns with the basemap (Leaflet otherwise
+                        # linearly stretches an EPSG:4326 image in Mercator
+                        # screen space, displacing rows N-S).
+                        add_mercator_image_overlay(
+                            m_result,
+                            arr,
+                            src_transform=meta["transform"],
+                            src_crs=meta.get("crs") or "EPSG:4326",
+                            cmap=cmap,
+                            vmin=0.0,
+                            vmax=0.6,
+                            nodata_mask=np.isnan(arr),
                             opacity=r_opacity,
                             interactive=False,
-                        ).add_to(m_result)
+                        )
                 elif ds.get("results") is not None:
                     # GeoPackage-only: black points, no tooltips (too heavy
                     # for ~2 M-point runs over a WebSocket).
