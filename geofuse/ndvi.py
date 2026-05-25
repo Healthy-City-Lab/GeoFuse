@@ -14,7 +14,6 @@ import geemap
 import geopandas as gpd
 import numpy as np
 import rasterio
-from shapely.geometry import mapping
 
 from .core import build_planar_tiles
 from .crs_utils import (
@@ -24,6 +23,7 @@ from .crs_utils import (
     select_grid_crs_with_warning,
     stream_mosaic_to_geotiff,
 )
+from .ee_utils import shapely_to_ee_geometry, shrink_gdf_for_ee
 from .jobs import progress_interval_s, retry_with_backoff
 from .logger import attach_external_logger, get_logger
 from .persistence.ndvi_tile_cache import DEFAULT_MAX_BYTES, NdviTileCache
@@ -129,9 +129,6 @@ def _emit_ndvi_progress(
     ndvi_progress_callback(payload)
 
 
-def _shapely_to_ee_geometry(geom):
-    """Convert Shapely geometry to ``ee.Geometry`` via GeoJSON (stable across geemap versions)."""
-    return ee.Geometry(mapping(geom))
 
 
 def _write_ndvi_sidecar(
@@ -644,13 +641,20 @@ class NDVIEngine:
         # direct API callers get the same guard the UI runner gets.
         if isinstance(geometry, gpd.GeoDataFrame):
             geom_wgs84 = reproject_geodataframe_to_wgs84(geometry)
-            js = json.loads(geom_wgs84.to_json())
+            # ``geom_for_ee`` is the (possibly shrunk) version that fits the
+            # EE 10 MB request budget; ``geom_for_crs`` keeps full input
+            # precision for client-side per-tile clipping downstream.
+            geom_for_ee = shrink_gdf_for_ee(geom_wgs84)
+            js = json.loads(geom_for_ee.to_json())
             js.pop("crs", None)
             aoi = ee.FeatureCollection(js["features"]).geometry()
             geom_for_crs = geom_wgs84
         else:
-            aoi = _shapely_to_ee_geometry(geometry)
-            geom_for_crs = gpd.GeoDataFrame({"geometry": [geometry]}, crs="EPSG:4326")
+            geom_for_crs = gpd.GeoDataFrame(
+                {"geometry": [geometry]}, crs="EPSG:4326"
+            )
+            geom_for_ee_gdf = shrink_gdf_for_ee(geom_for_crs)
+            aoi = shapely_to_ee_geometry(geom_for_ee_gdf.geometry.iloc[0])
 
         # 2. Pick an EE export CRS so pixels are rasterised in true ground
         # metres regardless of latitude (vs. the legacy hardcoded Web Mercator,
@@ -1278,7 +1282,7 @@ class NDVIEngine:
         tile_final = os.path.join(work_dir, f"tile_{idx}.tif")
 
         try:
-            tile_aoi = _shapely_to_ee_geometry(tile_geom)
+            tile_aoi = shapely_to_ee_geometry(tile_geom)
             tile_ndvi = ndvi_median.clip(tile_aoi)
 
             def _do_export() -> None:
