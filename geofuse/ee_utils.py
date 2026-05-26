@@ -27,6 +27,21 @@ def shapely_to_ee_geometry(geom):
     return ee.Geometry(mapping(geom))
 
 
+def crs_to_ee_string(crs) -> str:
+    """Return an Earth Engine compatible CRS identifier.
+
+    Prefers ``EPSG:<n>`` when the CRS has an EPSG code; otherwise emits an
+    OGC WKT1 (GDAL flavour) string. WKT1_GDAL is the format Earth Engine
+    accepts for the custom LCC / Polar Stereographic projections that
+    :func:`geofuse.crs_utils.select_grid_crs` synthesises for wide or
+    polar inputs.
+    """
+    epsg = crs.to_epsg()
+    if epsg is not None:
+        return f"EPSG:{epsg}"
+    return crs.to_wkt("WKT1_GDAL")
+
+
 # Earth Engine's /compute endpoint caps each request body at 10 MiB.  The
 # full AOI geometry is embedded in every request the engine makes
 # (filterBounds, clip, export region), so a vertex-heavy input — a country

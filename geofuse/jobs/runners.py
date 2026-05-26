@@ -213,9 +213,8 @@ def run_gvi(
                         arr_ter[lr, lc] = cdf["gvi_ter"].to_numpy()[keep]
                 tile_path = os.path.join(tiles_dir, f"cluster_{cid:04d}.tif")
                 # Shared compression / tiling / BIGTIFF defaults from
-                # crs_utils — cuts per-cluster tile size ~5–10× vs. the
-                # legacy uncompressed write and unlocks fast Folium previews
-                # via internal overviews built after close.
+                # crs_utils. Internal overviews built after close enable
+                # fast Folium previews.
                 with rasterio.open(
                     tile_path,
                     "w",

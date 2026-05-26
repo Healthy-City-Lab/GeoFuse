@@ -2836,8 +2836,8 @@ class MetricFusionEngine:
         # Determine optimization direction
         direction = "minimize" if objective_metric == "rmse" else "maximize"
 
-        # Create study — durable (SQLite RDB) when study_name + study_dir are set,
-        # otherwise in-memory (legacy behavior).
+        # Create study — durable (SQLite RDB) when study_name + study_dir are
+        # set, otherwise in-memory.
         if study_name and study_dir:
             os.makedirs(study_dir, exist_ok=True)
             storage_path = os.path.join(study_dir, f"{study_name}.db")

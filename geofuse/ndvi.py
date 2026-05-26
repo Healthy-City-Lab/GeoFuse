@@ -17,13 +17,16 @@ import rasterio
 
 from .core import build_planar_tiles
 from .crs_utils import (
-    crs_to_ee_string,
     reproject_geodataframe_to_wgs84,
     reproject_raster_to_wgs84,
     select_grid_crs_with_warning,
     stream_mosaic_to_geotiff,
 )
-from .ee_utils import shapely_to_ee_geometry, shrink_gdf_for_ee
+from .ee_utils import (
+    crs_to_ee_string,
+    shapely_to_ee_geometry,
+    shrink_gdf_for_ee,
+)
 from .jobs import progress_interval_s, retry_with_backoff
 from .logger import attach_external_logger, get_logger
 from .persistence.ndvi_tile_cache import DEFAULT_MAX_BYTES, NdviTileCache
@@ -508,8 +511,8 @@ class NDVIEngine:
                         cols_global.tolist(),
                         offset="center",
                     )
-                    buf_x.extend(xs if isinstance(xs, list) else [xs])
-                    buf_y.extend(ys if isinstance(ys, list) else [ys])
+                    buf_x.extend(np.atleast_1d(np.asarray(xs)).ravel().tolist())
+                    buf_y.extend(np.atleast_1d(np.asarray(ys)).ravel().tolist())
                     buf_v.extend(arr[valid].tolist())
 
                     if len(buf_v) >= self._VECTOR_FLUSH_POINTS:
@@ -657,19 +660,17 @@ class NDVIEngine:
             aoi = shapely_to_ee_geometry(geom_for_ee_gdf.geometry.iloc[0])
 
         # 2. Pick an EE export CRS so pixels are rasterised in true ground
-        # metres regardless of latitude (vs. the legacy hardcoded Web Mercator,
-        # which doubles cell area near 60°N).
+        # metres regardless of latitude.
         export_crs, grid_crs, export_distortion, export_crs_name = _select_export_crs(
             geom_for_crs
         )
 
         # Global snap grid for every EE export in this run. Anchoring the
         # transform at (0, 0) in the planar CRS means adjacent tiles share
-        # one pixel grid — boundaries align to the pixel and the mosaic step
-        # joins them with zero sub-pixel drift (the root cause of the
-        # tile-gap / tile-shift artefacts the WGS84-per-tile path used to
-        # produce). ``crs_transform`` is the standard GDAL affine
-        # ``[a, b, c, d, e, f]`` form: ``[scale, 0, x0, 0, -scale, y0]``.
+        # one pixel grid, so boundaries align to the pixel and the mosaic
+        # step joins them with zero sub-pixel drift. ``crs_transform`` is
+        # the standard GDAL affine ``[a, b, c, d, e, f]`` form:
+        # ``[scale, 0, x0, 0, -scale, y0]``.
         crs_transform = [float(resolution), 0.0, 0.0, 0.0, -float(resolution), 0.0]
 
         # 3. Pick the satellite collection. ``auto`` falls back to Landsat
@@ -712,8 +713,7 @@ class NDVIEngine:
         )
 
         # 3a. Distinguish "no images in range" vs "all images filtered by
-        # cloud threshold" so the user gets an actionable error instead of
-        # the legacy "No images found." (which conflated the two).
+        # cloud threshold" so the user gets an actionable error.
         used_start, used_end = str(start_date), str(end_date)
         coverage_widened = False
         n_total = _get_base(used_start, used_end).size().getInfo()
@@ -997,14 +997,7 @@ class NDVIEngine:
         try:
 
             def _do_export() -> None:
-                # EE export goes straight into the planar temp file; the
-                # single final reproject below turns it into the WGS84
-                # user-visible output. ``crs_transform`` is passed for
-                # symmetry with the tiled path even though there's only one
-                # tile here — it keeps the EE call shape identical between paths.
                 geemap.ee_export_image(
-                    # Per-band nodata already applied in download_and_process
-                    # so the uint16 valid_obs band isn't clobbered with -9999.
                     ndvi_median,
                     filename=temp_tif,
                     crs=export_crs,
@@ -1012,6 +1005,13 @@ class NDVIEngine:
                     region=aoi,
                     file_per_band=False,
                 )
+                if not (
+                    os.path.isfile(temp_tif) and os.path.getsize(temp_tif) > 0
+                ):
+                    raise RuntimeError(
+                        f"geemap.ee_export_image returned but {temp_tif} "
+                        "was not written."
+                    )
 
             # Same retry policy as the tiled path so a flaky network doesn't
             # blow up the single small-area run on the first transient.
@@ -1286,13 +1286,7 @@ class NDVIEngine:
             tile_ndvi = ndvi_median.clip(tile_aoi)
 
             def _do_export() -> None:
-                # Save the EE export *directly* as the final cache tile —
-                # no intermediate temp file, no per-tile WGS84 reproject.
-                # ``crs_transform`` snaps every tile to one global grid in
-                # the planar CRS so adjacent tiles' boundaries align to the
-                # pixel.
                 geemap.ee_export_image(
-                    # Per-band nodata already baked in (see download_and_process).
                     tile_ndvi,
                     filename=tile_final,
                     crs=export_crs,
@@ -1300,6 +1294,13 @@ class NDVIEngine:
                     region=tile_aoi,
                     file_per_band=False,
                 )
+                if not (
+                    os.path.isfile(tile_final) and os.path.getsize(tile_final) > 0
+                ):
+                    raise RuntimeError(
+                        f"geemap.ee_export_image returned but {tile_final} "
+                        "was not written."
+                    )
 
             # 3 attempts with 2 s base delay, doubling each time (≈ 2 s, 4 s
             # between retries before jitter). Flaky network = single failed
@@ -1546,11 +1547,27 @@ class NDVIEngine:
                     ndvi_progress_callback,
                     sub_progress=0.76,
                     phase="Reprojecting to WGS84",
+                    tiles=(0, 1),
                     clear_bracket=True,
                 )
 
-                # Single final reproject with explicit nodata so the
-                # ``-9999`` fill never bleeds into edge pixels.
+                reproject_last_emit = {"v": time.monotonic()}
+
+                def _reproject_progress(k: int, n: int) -> None:
+                    now = time.monotonic()
+                    is_final = k >= n
+                    if not is_final and now - reproject_last_emit["v"] < interval_s:
+                        return
+                    reproject_last_emit["v"] = now
+                    span = 0.80 - 0.76
+                    frac = k / n if n else 0.0
+                    _emit_ndvi_progress(
+                        ndvi_progress_callback,
+                        sub_progress=0.76 + span * frac,
+                        phase="Reprojecting to WGS84",
+                        tiles=(k, n),
+                    )
+
                 reproject_raster_to_wgs84(
                     planar_mosaic_tif,
                     final_tif,
@@ -1558,6 +1575,7 @@ class NDVIEngine:
                     build_overviews=True,
                     src_nodata=-9999,
                     dst_nodata=-9999,
+                    progress_cb=_reproject_progress,
                 )
 
                 _emit_ndvi_progress(

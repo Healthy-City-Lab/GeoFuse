@@ -8,6 +8,7 @@ which matches Leaflet/Folium and ``generate_raster_grid`` in ``geofuse.core``.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 
 import geopandas as gpd
@@ -16,6 +17,7 @@ import rasterio
 from pyproj import CRS as PyProjCRS
 from pyproj import Geod, Transformer
 from rasterio.transform import array_bounds, from_bounds
+from rasterio.vrt import WarpedVRT
 from rasterio.warp import Resampling, calculate_default_transform, reproject
 from rasterio.warp import transform as rio_warp_transform
 from rasterio.windows import from_bounds as window_from_bounds
@@ -71,7 +73,7 @@ def select_grid_crs_with_warning(
     return crs, float(distortion), choice_name
 
 
-def default_geotiff_creation_options(dtype) -> dict:
+def default_geotiff_creation_options(dtype, *, sparse: bool = False) -> dict:
     """Compression / tiling / BIGTIFF defaults for our GeoTIFF outputs.
 
     Applied by every helper that writes a GeoTIFF (``reproject_raster_to_wgs84``,
@@ -85,9 +87,13 @@ def default_geotiff_creation_options(dtype) -> dict:
       * ``3`` (floating-point predictor) for ``float32`` / ``float64`` rasters
         — handles NDVI's continuous values well.
       * ``2`` (horizontal differencing) for integer rasters.
+
+    Pass ``sparse=True`` to enable ``SPARSE_OK``, which lets libtiff omit
+    blocks whose pixels are all zero or all the nodata value. Useful for
+    buffered-AOI outputs where most of the bounding box is empty.
     """
     predictor = 3 if np.issubdtype(np.dtype(dtype), np.floating) else 2
-    return {
+    opts = {
         "compress": "DEFLATE",
         "predictor": predictor,
         "tiled": True,
@@ -95,6 +101,9 @@ def default_geotiff_creation_options(dtype) -> dict:
         "blockysize": 256,
         "BIGTIFF": "YES",
     }
+    if sparse:
+        opts["SPARSE_OK"] = "TRUE"
+    return opts
 
 
 def build_internal_overviews(
@@ -114,21 +123,6 @@ def build_internal_overviews(
     with rasterio.open(path, "r+") as dst:
         dst.build_overviews(list(factors), resampling)
         dst.update_tags(ns="rio_overview", resampling=resampling.name)
-
-
-def crs_to_ee_string(crs) -> str:
-    """Earth-Engine-friendly CRS string: prefer ``EPSG:<n>``, fall back to WKT.
-
-    EE accepts WKT for non-standard projections (the LCC / Polar Stereographic
-    that :func:`select_grid_crs` synthesises for wide-span or polar extents),
-    so every CRS this module returns can be passed through to
-    ``ee_export_image``. Lives here next to the CRS-selection logic so the EE
-    wrapping is one tidy unit.
-    """
-    epsg = crs.to_epsg()
-    if epsg is not None:
-        return f"EPSG:{epsg}"
-    return crs.to_wkt()
 
 
 def stream_mosaic_to_geotiff(
@@ -195,7 +189,9 @@ def stream_mosaic_to_geotiff(
         "transform": out_transform,
         "nodata": nodata,
     }
-    dst_profile.update(default_geotiff_creation_options(ref["dtype"]))
+    dst_profile.update(
+        default_geotiff_creation_options(ref["dtype"], sparse=True)
+    )
 
     n = len(tile_profiles)
     written = 0
@@ -255,6 +251,8 @@ def reproject_raster_to_wgs84(
     build_overviews: bool = False,
     src_nodata: float | None = None,
     dst_nodata: float | None = None,
+    num_threads: int | None = None,
+    progress_cb: Callable[[int, int], None] | None = None,
 ) -> None:
     """Reproject a planar-CRS GeoTIFF to EPSG:4326 with per-latitude aspect-ratio correction.
 
@@ -270,18 +268,30 @@ def reproject_raster_to_wgs84(
     NDVI. Pass ``resampling=Resampling.nearest`` for QA / classification bands.
 
     The destination GeoTIFF picks up the shared compression / tiling defaults
-    (``DEFLATE`` + float-aware predictor + 256×256 internal tiling + BIGTIFF).
-    ``build_overviews`` is **off by default** because this helper is also
-    used for intermediate per-tile cache files (where overviews would be
-    wasted disk). Final outputs (single-area NDVI download) pass
-    ``build_overviews=True``.
+    (``DEFLATE`` + float-aware predictor + 256×256 internal tiling + BIGTIFF
+    + ``SPARSE_OK``). ``build_overviews`` is **off by default** because this
+    helper is also used for intermediate per-tile cache files (where
+    overviews would be wasted disk). Final outputs pass ``build_overviews=True``.
 
-    ``src_nodata`` and ``dst_nodata`` are forwarded to the underlying
-    :func:`rasterio.warp.reproject`. **Pass them explicitly** when the
-    source uses a sentinel like ``-9999`` for masked pixels — without them,
-    bilinear resampling will interpolate the sentinel into edge pixels and
-    produce nonsense values (e.g. NDVI ``-1`` at tile borders).
+    Implementation: the source is wrapped in a :class:`rasterio.vrt.WarpedVRT`
+    targeting the WGS84 grid, then each destination block is read from the VRT
+    and written only when it contains valid pixels. ``SPARSE_OK=TRUE`` means
+    skipped blocks stay off disk and read back as nodata. Blocks that miss the
+    source extent or fall entirely inside nodata regions are not allocated,
+    written, or compressed, so a sparse buffered AOI costs roughly the
+    populated pixels and not the full bounding box.
+
+    ``src_nodata`` and ``dst_nodata`` propagate through both the VRT and the
+    output metadata. Pass them when the source uses a sentinel like ``-9999``
+    so bilinear resampling does not interpolate the sentinel into edge pixels.
+
+    ``num_threads`` is forwarded to the VRT's GDAL warper (defaults to
+    ``os.cpu_count()``). ``progress_cb(k, n)`` fires after each destination
+    block is processed; ``n`` is the total block count.
     """
+    if num_threads is None:
+        num_threads = max(1, os.cpu_count() or 1)
+
     with rasterio.open(src_path) as src:
         left, bottom, right, top = array_bounds(src.height, src.width, src.transform)
         cx, cy = (left + right) / 2, (bottom + top) / 2
@@ -310,32 +320,59 @@ def reproject_raster_to_wgs84(
                 "height": height,
             }
         )
-        # Stamp the dst nodata on the file metadata so downstream readers
-        # (and the overview builder) treat the sentinel correctly.
         if dst_nodata is not None:
             kwargs["nodata"] = dst_nodata
-        kwargs.update(default_geotiff_creation_options(src.dtypes[0]))
+        kwargs.update(
+            default_geotiff_creation_options(src.dtypes[0], sparse=True)
+        )
+        kwargs["NUM_THREADS"] = str(num_threads)
 
-        with rasterio.open(dst_path, "w", **kwargs) as dst:
-            for i in range(1, src.count + 1):
-                reproject(
-                    source=rasterio.band(src, i),
-                    destination=rasterio.band(dst, i),
-                    src_transform=src.transform,
-                    src_crs=src.crs,
-                    dst_transform=dst_transform,
-                    dst_crs=WGS84_EPSG,
-                    resampling=resampling,
-                    src_nodata=src_nodata,
-                    dst_nodata=dst_nodata,
-                )
+        vrt_opts: dict = {
+            "crs": WGS84_EPSG,
+            "transform": dst_transform,
+            "width": width,
+            "height": height,
+            "resampling": resampling,
+            "warp_mem_limit": 512,
+            "num_threads": num_threads,
+        }
+        if src_nodata is not None:
+            vrt_opts["src_nodata"] = src_nodata
+        if dst_nodata is not None:
+            vrt_opts["nodata"] = dst_nodata
+
+        with WarpedVRT(src, **vrt_opts) as vrt:
+            with rasterio.open(dst_path, "w", **kwargs) as dst:
+                windows = [w for _, w in dst.block_windows(1)]
+                n = len(windows)
+                for k, window in enumerate(windows):
+                    for band_idx in range(1, src.count + 1):
+                        data = vrt.read(band_idx, window=window)
+                        if _block_is_empty(data, dst_nodata):
+                            continue
+                        dst.write(data, indexes=band_idx, window=window)
+                    if progress_cb is not None:
+                        progress_cb(k + 1, n)
 
     if build_overviews:
         try:
             build_internal_overviews(dst_path)
         except Exception:
-            # Non-fatal: the base raster is still valid without overviews.
             pass
+
+
+def _block_is_empty(data: np.ndarray, nodata: float | None) -> bool:
+    """Return True when an array carries no data the destination should store."""
+    if nodata is None:
+        if np.issubdtype(data.dtype, np.floating):
+            return bool(np.all(np.isnan(data)))
+        return False
+    if np.issubdtype(data.dtype, np.floating):
+        finite = np.isfinite(data)
+        if not np.any(finite):
+            return True
+        return bool(np.all((data[finite] == nodata)))
+    return bool(np.all(data == nodata))
 
 
 def _raise_if_geographic_coords_outside_degree_range(gdf: gpd.GeoDataFrame) -> None:
