@@ -116,21 +116,35 @@
 		}
 	}
 
+	var _sidebarToggleBound = false;
+
 	function bindSidebarToggle() {
-		d.querySelectorAll(".gf-sidebar-floater:not([data-gfsb])").forEach(function (el) {
-			el.setAttribute("data-gfsb", "1");
-			el.addEventListener("click", function (e) {
-				e.preventDefault();
-				e.stopPropagation();
-				toggleSidebar();
-			});
-			el.addEventListener("keydown", function (e) {
-				if (e.key === "Enter" || e.key === " ") {
+		if (_sidebarToggleBound) return;
+		_sidebarToggleBound = true;
+		d.addEventListener("click", function (e) {
+			var el = e.target;
+			while (el && el !== d.body) {
+				if (el.classList && el.classList.contains("gf-sidebar-floater")) {
+					e.preventDefault();
+					e.stopPropagation();
+					toggleSidebar();
+					return;
+				}
+				el = el.parentElement;
+			}
+		}, true);
+		d.addEventListener("keydown", function (e) {
+			if (e.key !== "Enter" && e.key !== " ") return;
+			var el = e.target;
+			while (el && el !== d.body) {
+				if (el.classList && el.classList.contains("gf-sidebar-floater")) {
 					e.preventDefault();
 					toggleSidebar();
+					return;
 				}
-			});
-		});
+				el = el.parentElement;
+			}
+		}, true);
 	}
 
 	function injectBrand() {

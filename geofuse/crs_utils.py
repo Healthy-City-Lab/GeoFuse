@@ -311,7 +311,7 @@ def reproject_raster_to_wgs84(
     if num_threads is None:
         num_threads = max(1, os.cpu_count() or 1)
 
-    with rasterio.Env(GDAL_CACHEMAX=str(gdal_cachemax_mb)):
+    with rasterio.Env(GDAL_CACHEMAX=int(gdal_cachemax_mb)):
         with rasterio.open(src_path) as src:
             left, bottom, right, top = array_bounds(
                 src.height, src.width, src.transform

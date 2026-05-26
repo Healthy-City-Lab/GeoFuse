@@ -15,6 +15,7 @@ rather than inside a single engine's tab module.
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 
 import streamlit as st
 
@@ -44,6 +45,17 @@ _TERMINAL_LABELS = {
 
 _RESTART_ELIGIBLE_TYPES = {"gvi", "ndvi", "ndvi_column"}
 _RESTART_ELIGIBLE_STATUSES = {"interrupted", "cancelled", "error"}
+
+
+def _fmt_timestamp(iso: str) -> str:
+    """Parse a UTC ISO timestamp string and return a local-time string."""
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            ts = datetime.strptime(iso, fmt).replace(tzinfo=timezone.utc)
+            return ts.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+    return iso.replace("T", " ")
 
 
 def _render_details(rec) -> None:
@@ -112,9 +124,11 @@ def _render_details(rec) -> None:
         for path in rec.output_paths:
             st.code(path, language=None)
     if rec.submitted_at:
-        st.caption(f"Submitted at: {rec.submitted_at}")
+        st.caption("Submitted at:")
+        st.caption(_fmt_timestamp(rec.submitted_at))
     if rec.completed_at:
-        st.caption(f"Completed at: {rec.completed_at}")
+        st.caption("Completed at:")
+        st.caption(_fmt_timestamp(rec.completed_at))
 
 
 def _render_logs(rec_id: str) -> None:

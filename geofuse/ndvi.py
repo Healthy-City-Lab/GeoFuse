@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import time
+import traceback
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
@@ -1602,6 +1603,10 @@ class NDVIEngine:
                 mosaic_ok = True
 
             except Exception as e:
+                _log(
+                    "ERROR",
+                    f"Mosaic step failed with traceback:\n{traceback.format_exc()}",
+                )
                 return {"status": "error", "message": f"Mosaic failed: {str(e)}"}
             finally:
                 # The planar intermediate is not part of the cache (we only
