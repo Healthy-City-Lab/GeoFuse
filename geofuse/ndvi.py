@@ -196,7 +196,7 @@ def _write_ndvi_sidecar(
         "max_tile_size_km": float(max_tile_size_km),
         "ee_collection": ee_collection,
         "satellite": satellite,
-        "bands": list(bands or ["NDVI", "valid_obs"]),
+        "bands": list(bands or ["NDVI"]),
         "n_cloud_filtered_images": (
             int(n_cloud_filtered_images)
             if n_cloud_filtered_images is not None
@@ -791,17 +791,13 @@ class NDVIEngine:
         if cancel_callback and cancel_callback():
             return {"status": "cancelled", "message": "Cancelled by user"}
 
-        # 3c. Build a 2-band image: NDVI median + valid-obs count per pixel.
-        # ``count()`` over the masked collection is the number of unmasked
-        # (i.e. cloud-free, in-collection) observations at each pixel; The
-        # right "did this pixel get enough samples?" signal for downstream
-        # consumers. ``toUint16()`` keeps the band small. Each band gets its
-        # own nodata sentinel (NDVI: −9999 in float32, valid_obs: 0 in
-        # uint16) so a per-tile ``unmask(-9999)`` later wouldn't saturate the
-        # integer band.
-        ndvi_band = col.select("NDVI").median().rename("NDVI").unmask(-9999)
-        obs_band = col.select("NDVI").count().rename("valid_obs").toUint16().unmask(0)
-        ndvi_median = ndvi_band.addBands(obs_band).clip(aoi)
+        # Single-band median NDVI composite. ``unmask(-9999)`` paints
+        # cloud-masked / out-of-collection pixels with the sentinel so the
+        # downstream reproject can mask them out instead of bilinear-blending
+        # them with valid neighbours.
+        ndvi_median = (
+            col.select("NDVI").median().rename("NDVI").unmask(-9999).clip(aoi)
+        )
 
         # 4. Build cluster-aware tile list in true metres. Scattered national
         # inputs decompose into connected components, and tiles that fall over
@@ -917,7 +913,7 @@ class NDVIEngine:
                     max_tile_size_km=max_tile_size_km,
                     ee_collection=ee_collection_id,
                     satellite=chosen_satellite,
-                    bands=["NDVI", "valid_obs"],
+                    bands=["NDVI"],
                     n_cloud_filtered_images=n_cloud_filtered,
                 )
                 result["sidecar"] = sidecar_path
@@ -1534,14 +1530,16 @@ class NDVIEngine:
                         tiles=(k, n),
                     )
 
-                # Intermediate planar mosaic — no overviews, they'd be
-                # discarded by the WGS84 reproject below.
+                # Intermediate planar mosaic — read once by the WGS84 warp
+                # below, then deleted. Skip overviews and compression so the
+                # warp's block reads don't pay decompression cost.
                 stream_mosaic_to_geotiff(
                     tile_files,
                     planar_mosaic_tif,
                     nodata=-9999,
                     progress_cb=_mosaic_progress,
                     build_overviews=False,
+                    compress=False,
                 )
 
                 _emit_ndvi_progress(
@@ -1554,18 +1552,18 @@ class NDVIEngine:
                 reproject_last_emit = {"v": time.monotonic()}
                 reproject_block_span = 0.79 - 0.76
 
-                def _reproject_progress(flushed: int, n: int) -> None:
+                def _reproject_progress(done: int, n: int) -> None:
                     now = time.monotonic()
-                    is_final = flushed >= n
+                    is_final = done >= n
                     if not is_final and now - reproject_last_emit["v"] < interval_s:
                         return
                     reproject_last_emit["v"] = now
-                    frac = flushed / n if n else 0.0
+                    frac = done / n if n else 0.0
                     _emit_ndvi_progress(
                         ndvi_progress_callback,
                         sub_progress=0.76 + reproject_block_span * frac,
                         phase="Reprojecting to WGS84",
-                        tiles=(flushed, n),
+                        tiles=(done, n),
                     )
 
                 def _overview_start() -> None:

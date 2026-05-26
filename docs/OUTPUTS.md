@@ -66,11 +66,10 @@ For each input file / date range processed through the NDVI pipeline. Defaults: 
 
 ### `[Filename]_ndvi.tif` (default)
 
-Two-band GeoTIFF (EPSG:4326):
+Single-band GeoTIFF (EPSG:4326):
 
 * **Band 1 (`NDVI`, float32)**: median NDVI over the date range, after cloud masking.
-* **Band 2 (`valid_obs`, uint16)**: per-pixel count of cloud-free observations that contributed to the median. You can reject pixels below your minimum-observation threshold downstream.
-* NoData value: `−9999` on band 1.
+* NoData value: `−9999`.
 
 ### `[Filename]_ndvi.gpkg` (optional)
 
@@ -126,7 +125,7 @@ introspect a raster after the fact without re-running Earth Engine:
 | `used_start_date` / `used_end_date` / `coverage_widened` | Date range actually queried (may be wider than the user's request if coverage rescue fired). `coverage_widened: true` flags that the composite spans a bigger window than requested |
 | `cloud_max` / `n_cloud_filtered_images` | Cloud-percentage threshold + how many images survived it |
 | `resolution_m` / `max_tile_size_km` | Export resolution and tiling cap |
-| `satellite` / `ee_collection` / `bands` | `'sentinel2'` or `'landsat'` (auto-picked by date range), the ImageCollection ID actually queried, and the list of bands in the GeoTIFF (`["NDVI", "valid_obs"]`) |
+| `satellite` / `ee_collection` / `bands` | `'sentinel2'` or `'landsat'` (auto-picked by date range), the ImageCollection ID actually queried, and the list of bands in the GeoTIFF (`["NDVI"]`) |
 
 ---
 

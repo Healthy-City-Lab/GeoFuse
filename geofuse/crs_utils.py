@@ -17,7 +17,6 @@ import rasterio
 from pyproj import CRS as PyProjCRS
 from pyproj import Geod, Transformer
 from rasterio.transform import array_bounds, from_bounds
-from rasterio.vrt import WarpedVRT
 from rasterio.warp import Resampling, calculate_default_transform, reproject
 from rasterio.warp import transform as rio_warp_transform
 from rasterio.windows import from_bounds as window_from_bounds
@@ -133,6 +132,7 @@ def stream_mosaic_to_geotiff(
     resampling: Resampling = Resampling.bilinear,
     progress_cb: Callable[[int, int], None] | None = None,
     build_overviews: bool = True,
+    compress: bool = True,
 ) -> int:
     """Stream-mosaic same-CRS GeoTIFF tiles into one output via windowed writes.
 
@@ -147,6 +147,11 @@ def stream_mosaic_to_geotiff(
     ``progress_cb(k, n)`` fires after each tile lands; pass it to mirror
     download-phase progress into the mosaic phase. Returns the number of
     tiles written.
+
+    Set ``compress=False`` for ephemeral intermediate mosaics that are read
+    once and deleted (e.g. the planar mosaic feeding a WGS84 reproject).
+    Skipping DEFLATE saves write time and lets the downstream reader scan
+    the file without per-block decompression.
     """
     if not tile_paths:
         raise ValueError("stream_mosaic_to_geotiff: tile_paths is empty.")
@@ -189,9 +194,20 @@ def stream_mosaic_to_geotiff(
         "transform": out_transform,
         "nodata": nodata,
     }
-    dst_profile.update(
-        default_geotiff_creation_options(ref["dtype"], sparse=True)
-    )
+    if compress:
+        dst_profile.update(
+            default_geotiff_creation_options(ref["dtype"], sparse=True)
+        )
+    else:
+        dst_profile.update(
+            {
+                "tiled": True,
+                "blockxsize": 256,
+                "blockysize": 256,
+                "BIGTIFF": "YES",
+                "SPARSE_OK": "TRUE",
+            }
+        )
 
     n = len(tile_profiles)
     written = 0
@@ -273,36 +289,27 @@ def reproject_raster_to_wgs84(
 
     The destination GeoTIFF uses ``DEFLATE`` + float-aware predictor +
     ``block_size``×``block_size`` internal tiling + BIGTIFF + ``SPARSE_OK``.
-    Block iteration uses the destination grid; the source is wrapped in a
-    :class:`rasterio.vrt.WarpedVRT` so each destination block is filled by
-    on-demand reprojection of just the source pixels that fall into it.
-    Empty blocks are not written, so ``SPARSE_OK`` keeps them off disk and
-    they read back as nodata. A sparse buffered AOI costs roughly the
-    populated pixels, not the full bounding box.
+    Blocks that end up entirely nodata are never written to disk.
 
-    ``src_nodata`` and ``dst_nodata`` propagate through both the VRT and the
-    output metadata. Pass them when the source uses a sentinel like ``-9999``
-    so bilinear resampling does not interpolate the sentinel into edge pixels.
+    ``src_nodata`` and ``dst_nodata`` propagate through both the warper and
+    the output metadata. Pass them when the source uses a sentinel like
+    ``-9999`` so bilinear resampling does not interpolate the sentinel into
+    edge pixels. Each destination block is driven through a direct
+    :func:`rasterio.warp.reproject` call.
 
-    Speed knobs (set higher on machines with plenty of RAM):
+    Before iterating destination blocks the source dataset mask is read at a
+    coarse resolution (capped at 2048 px) using ``Resampling.max`` — a coarse
+    pixel is 255 if *any* source pixel it covers is valid, so isolated pixels
+    and thin strips are never missed. That coarse mask is then reprojected to
+    the destination CRS (also with ``Resampling.max``), producing a small
+    lookup table that lets each destination block be skipped in O(1) if it
+    has no chance of containing valid data. This eliminates warp work for both
+    empty border regions and interior nodata gaps (e.g. cloud masks).
 
-    * ``num_threads`` — forwarded to the VRT warper and the GeoTIFF writer;
-      defaults to ``os.cpu_count()``.
-    * ``block_size`` — destination tile edge (default 512). Larger blocks
-      reduce per-block overhead at the cost of finer-grained progress.
-    * ``warp_mem_limit_mb`` — VRT scratch budget per call (default 2048 MB).
-    * ``gdal_cachemax_mb`` — GDAL block cache for the lifetime of this call
-      (default 2048 MB), set via :class:`rasterio.Env`.
-
-    Progress hooks:
-
-    * ``progress_cb(flushed, n)`` fires after each destination block is
-      processed. ``flushed`` is the number of non-empty blocks actually
-      written, not the iteration index, so it advances in step with real
-      work. ``n`` is the total block count.
-    * ``overview_start_cb()`` fires once after the destination is closed and
-      before overview pyramids are built. Use it to flip the UI status to
-      "Building overviews".
+    ``progress_cb(done, total)`` tracks iteration position across all
+    destination blocks (including skipped ones) so the progress bar moves
+    steadily from the first block onward. ``overview_start_cb()`` fires once
+    after block writes finish and before overview pyramids are built.
 
     ``build_overviews`` is **off by default** because this helper is also
     used for intermediate per-tile cache files. Final outputs pass
@@ -317,8 +324,8 @@ def reproject_raster_to_wgs84(
                 src.height, src.width, src.transform
             )
             cx, cy = (left + right) / 2, (bottom + top) / 2
-            lon_c, lat_c = rio_warp_transform(src.crs, WGS84_EPSG, [cx], [cy])
-            avg_lat = lat_c[0]
+            transformed = rio_warp_transform(src.crs, WGS84_EPSG, [cx], [cy])
+            avg_lat = transformed[1][0]
 
             m_per_deg_lon, m_per_deg_lat = metres_per_degree_at_lat(avg_lat)
             res_x_deg = target_resolution_m / m_per_deg_lon
@@ -332,6 +339,49 @@ def reproject_raster_to_wgs84(
                 *src.bounds,
                 resolution=(res_x_deg, res_y_deg),
             )
+            assert width is not None and height is not None
+            width = int(width)
+            height = int(height)
+
+            # Coarse source coverage mask: 255 where any source pixel is valid.
+            max_dim = 2048
+            src_scale = max(src.width / max_dim, src.height / max_dim, 1.0)
+            c_src_w = max(1, int(src.width / src_scale))
+            c_src_h = max(1, int(src.height / src_scale))
+            src_coarse_transform = from_bounds(
+                src.bounds.left, src.bounds.bottom,
+                src.bounds.right, src.bounds.top,
+                c_src_w, c_src_h,
+            )
+            effective_src_nodata = (
+                src_nodata if src_nodata is not None else src.nodata
+            )
+            src_dtype = np.dtype(src.dtypes[0])
+            fill_value = (
+                effective_src_nodata if effective_src_nodata is not None else 0
+            )
+            src_coarse_data = np.full(
+                (c_src_h, c_src_w), fill_value, dtype=src_dtype
+            )
+            reproject(
+                source=rasterio.band(src, 1),
+                destination=src_coarse_data,
+                src_transform=src.transform,
+                src_crs=src.crs,
+                dst_transform=src_coarse_transform,
+                dst_crs=src.crs,
+                resampling=Resampling.max,
+                src_nodata=effective_src_nodata,
+                dst_nodata=effective_src_nodata,
+            )
+            if effective_src_nodata is not None:
+                src_coarse_mask = np.where(
+                    src_coarse_data != effective_src_nodata, 255, 0
+                ).astype(np.uint8)
+            else:
+                src_coarse_mask = np.full(
+                    (c_src_h, c_src_w), 255, dtype=np.uint8
+                )
 
             kwargs = src.meta.copy()
             kwargs.update(
@@ -351,56 +401,113 @@ def reproject_raster_to_wgs84(
             kwargs["blockysize"] = block_size
             kwargs["NUM_THREADS"] = str(num_threads)
 
-            vrt_opts: dict = {
-                "crs": WGS84_EPSG,
-                "transform": dst_transform,
-                "width": width,
-                "height": height,
-                "resampling": resampling,
-                "warp_mem_limit": warp_mem_limit_mb,
-                "num_threads": num_threads,
-            }
-            if src_nodata is not None:
-                vrt_opts["src_nodata"] = src_nodata
-            if dst_nodata is not None:
-                vrt_opts["nodata"] = dst_nodata
+            # Reproject the coarse source mask into destination CRS once.
+            # Resampling.max preserves coverage: a destination coarse pixel is
+            # 255 if any source pixel maps into it.
+            dst_scale = max(width / max_dim, height / max_dim, 1.0)
+            c_dst_w = max(1, int(width / dst_scale))
+            c_dst_h = max(1, int(height / dst_scale))
+            dst_coarse_transform = from_bounds(
+                dst_transform.c,
+                dst_transform.f + height * dst_transform.e,
+                dst_transform.c + width * dst_transform.a,
+                dst_transform.f,
+                c_dst_w, c_dst_h,
+            )
+            dst_coarse_mask = np.zeros((c_dst_h, c_dst_w), dtype=np.uint8)
+            reproject(
+                source=src_coarse_mask,
+                destination=dst_coarse_mask,
+                src_transform=src_coarse_transform,
+                src_crs=src.crs,
+                dst_transform=dst_coarse_transform,
+                dst_crs=WGS84_EPSG,
+                resampling=Resampling.max,
+                src_nodata=0,
+                dst_nodata=0,
+            )
 
-            with WarpedVRT(src, **vrt_opts) as vrt:
-                with rasterio.open(dst_path, "w", **kwargs) as dst:
-                    windows = [w for _, w in dst.block_windows(1)]
-                    n = len(windows)
-                    flushed = 0
-                    for window in windows:
-                        # Band 1 is the spatial-presence gate. Secondary integer
-                        # bands (e.g. valid_obs) may be filled with 0 via EE
-                        # unmask rather than the nodata sentinel, so per-band
-                        # _block_is_empty checks would not catch them. If band 1
-                        # is entirely nodata the block has no useful information
-                        # for any band and should be skipped entirely.
-                        band1_data = vrt.read(1, window=window)
-                        if _block_is_empty(band1_data, dst_nodata):
-                            if progress_cb is not None:
-                                progress_cb(flushed, n)
-                            continue
-                        dst.write(band1_data, indexes=1, window=window)
-                        for band_idx in range(2, src.count + 1):
-                            data = vrt.read(band_idx, window=window)
-                            if not _block_is_empty(data, dst_nodata):
-                                dst.write(data, indexes=band_idx, window=window)
-                        flushed += 1
+            # Per-block direct reproject
+            with rasterio.open(dst_path, "w", **kwargs) as dst:
+                windows = [w for _, w in dst.block_windows(1)]
+                n = len(windows)
+                flushed = 0
+                src_dtypes = src.dtypes
+                src_count = src.count
+                src_transform_ = src.transform
+                src_crs_ = src.crs
+                for i, window in enumerate(windows):
+                    # Map this destination block to the coarse dest mask.
+                    m_r0 = max(0, int(window.row_off * c_dst_h / height))
+                    m_r1 = min(c_dst_h, int((window.row_off + window.height) * c_dst_h / height) + 1)
+                    m_c0 = max(0, int(window.col_off * c_dst_w / width))
+                    m_c1 = min(c_dst_w, int((window.col_off + window.width) * c_dst_w / width) + 1)
+                    if not dst_coarse_mask[m_r0:m_r1, m_c0:m_c1].any():
                         if progress_cb is not None:
-                            progress_cb(flushed, n)
+                            progress_cb(i + 1, n)
+                        continue
 
-        if build_overviews:
-            if overview_start_cb is not None:
-                try:
-                    overview_start_cb()
-                except Exception:
-                    pass
+                    win_dst_transform = window_transform(window, dst_transform)
+                    win_h = int(window.height)
+                    win_w = int(window.width)
+                    band1_fill = dst_nodata if dst_nodata is not None else 0
+                    band1_data = np.full(
+                        (win_h, win_w), band1_fill, dtype=src_dtypes[0]
+                    )
+                    reproject(
+                        source=rasterio.band(src, 1),
+                        destination=band1_data,
+                        src_transform=src_transform_,
+                        src_crs=src_crs_,
+                        dst_transform=win_dst_transform,
+                        dst_crs=WGS84_EPSG,
+                        resampling=resampling,
+                        src_nodata=src_nodata,
+                        dst_nodata=dst_nodata,
+                        num_threads=num_threads,
+                        warp_mem_limit=warp_mem_limit_mb,
+                    )
+                    if _block_is_empty(band1_data, dst_nodata):
+                        if progress_cb is not None:
+                            progress_cb(i + 1, n)
+                        continue
+                    dst.write(band1_data, indexes=1, window=window)
+                    for band_idx in range(2, src_count + 1):
+                        band_fill = dst_nodata if dst_nodata is not None else 0
+                        data = np.full(
+                            (win_h, win_w),
+                            band_fill,
+                            dtype=src_dtypes[band_idx - 1],
+                        )
+                        reproject(
+                            source=rasterio.band(src, band_idx),
+                            destination=data,
+                            src_transform=src_transform_,
+                            src_crs=src_crs_,
+                            dst_transform=win_dst_transform,
+                            dst_crs=WGS84_EPSG,
+                            resampling=resampling,
+                            src_nodata=src_nodata,
+                            dst_nodata=dst_nodata,
+                            num_threads=num_threads,
+                            warp_mem_limit=warp_mem_limit_mb,
+                        )
+                        if not _block_is_empty(data, dst_nodata):
+                            dst.write(data, indexes=band_idx, window=window)
+                    flushed += 1
+                    if progress_cb is not None:
+                        progress_cb(i + 1, n)
+
+    if build_overviews:
+        if overview_start_cb is not None:
             try:
-                build_internal_overviews(dst_path)
+                overview_start_cb()
             except Exception:
                 pass
+        try:
+            build_internal_overviews(dst_path)
+        except Exception:
+            pass
 
 
 def _block_is_empty(data: np.ndarray, nodata: float | None) -> bool:
@@ -413,7 +520,7 @@ def _block_is_empty(data: np.ndarray, nodata: float | None) -> bool:
         finite = np.isfinite(data)
         if not np.any(finite):
             return True
-        return bool(np.all((data[finite] == nodata)))
+        return bool(np.all(data[finite] == nodata))
     return bool(np.all(data == nodata))
 
 
