@@ -264,56 +264,43 @@ def reproject_raster_to_wgs84(
     *,
     target_resolution_m: float,
     resampling: Resampling = Resampling.bilinear,
-    build_overviews: bool = False,
     src_nodata: float | None = None,
     dst_nodata: float | None = None,
     num_threads: int | None = None,
     block_size: int = 512,
     warp_mem_limit_mb: int = 2048,
     gdal_cachemax_mb: int = 2048,
-    progress_cb: Callable[[int, int], None] | None = None,
-    overview_start_cb: Callable[[], None] | None = None,
 ) -> None:
-    """Reproject a planar-CRS GeoTIFF to EPSG:4326 with per-latitude aspect-ratio correction.
+    """Reproject a planar-CRS GeoTIFF to EPSG:4326 in a single GDAL warp call.
 
-    Earth Engine (and any other producer that writes in a metre-based CRS such
-    as UTM, LCC, or Polar Stereographic) places pixels on a square-metre grid.
-    A naive reprojection to geographic coordinates yields rectangular pixels
-    because a degree of longitude is shorter than a degree of latitude. This
-    function derives the exact metres-per-degree ratio at the tile's centroid
-    latitude (via :func:`metres_per_degree_at_lat`) and forces an explicit
-    square-metre output resolution.
+    Drives the same warp kernel that ``gdalwarp`` / QGIS use, in-process
+    and end-to-end: one :func:`rasterio.warp.reproject` call per band with
+    ``source=rasterio.band(src, b)`` and ``destination=rasterio.band(dst, b)``.
+    GDAL streams blocks internally on ``num_threads`` worker threads,
+    ``SPARSE_OK=TRUE`` keeps fully-nodata blocks off disk, and
+    ``src_nodata`` / ``dst_nodata`` propagate through the resampler so
+    bilinear does not bleed the sentinel into edge pixels.
 
-    Defaults to bilinear resampling — appropriate for continuous bands like
-    NDVI. Pass ``resampling=Resampling.nearest`` for QA / classification bands.
+    No overview pyramids are built. For float-nodata sparse rasters
+    GDAL's overview builder reads sparse blocks as nodata, which the
+    `average` resampler then mixes with valid pixels to produce
+    misleading level-0 values, and the pass adds tens of minutes to
+    national-scale runs. Call :func:`build_internal_overviews` on the
+    finished file if a specific consumer needs them.
 
-    The destination GeoTIFF uses ``DEFLATE`` + float-aware predictor +
-    ``block_size``×``block_size`` internal tiling + BIGTIFF + ``SPARSE_OK``.
-    Blocks that end up entirely nodata are never written to disk.
+    Defaults to bilinear resampling — appropriate for continuous bands
+    like NDVI. Pass ``resampling=Resampling.nearest`` for QA /
+    classification bands.
 
-    ``src_nodata`` and ``dst_nodata`` propagate through both the warper and
-    the output metadata. Pass them when the source uses a sentinel like
-    ``-9999`` so bilinear resampling does not interpolate the sentinel into
-    edge pixels. Each destination block is driven through a direct
-    :func:`rasterio.warp.reproject` call.
-
-    Before iterating destination blocks the source dataset mask is read at a
-    coarse resolution (capped at 2048 px) using ``Resampling.max`` — a coarse
-    pixel is 255 if *any* source pixel it covers is valid, so isolated pixels
-    and thin strips are never missed. That coarse mask is then reprojected to
-    the destination CRS (also with ``Resampling.max``), producing a small
-    lookup table that lets each destination block be skipped in O(1) if it
-    has no chance of containing valid data. This eliminates warp work for both
-    empty border regions and interior nodata gaps (e.g. cloud masks).
-
-    ``progress_cb(done, total)`` tracks iteration position across all
-    destination blocks (including skipped ones) so the progress bar moves
-    steadily from the first block onward. ``overview_start_cb()`` fires once
-    after block writes finish and before overview pyramids are built.
-
-    ``build_overviews`` is **off by default** because this helper is also
-    used for intermediate per-tile cache files. Final outputs pass
-    ``build_overviews=True``.
+    Geometry note: pixels end up roughly square in **ground metres** at
+    the centroid latitude (``res_*_deg = target_resolution_m /
+    m_per_deg_*``). EPSG:4326 is a geographic CRS so the corresponding
+    **degree** resolution is rectangular — one degree of longitude is
+    ``cos(lat)`` shorter than one degree of latitude, so the lon/lat
+    degree-per-pixel ratio sits at ~1.3-1.7 at mid-latitudes. QGIS
+    displays pixel size as ``degrees × 111139`` without the cos-lat
+    correction, which reads as "wider in EW than NS" even though the
+    on-ground spacing is square at the centroid.
     """
     if num_threads is None:
         num_threads = max(1, os.cpu_count() or 1)
@@ -343,48 +330,8 @@ def reproject_raster_to_wgs84(
             width = int(width)
             height = int(height)
 
-            # Coarse source coverage mask: 255 where any source pixel is valid.
-            max_dim = 2048
-            src_scale = max(src.width / max_dim, src.height / max_dim, 1.0)
-            c_src_w = max(1, int(src.width / src_scale))
-            c_src_h = max(1, int(src.height / src_scale))
-            src_coarse_transform = from_bounds(
-                src.bounds.left, src.bounds.bottom,
-                src.bounds.right, src.bounds.top,
-                c_src_w, c_src_h,
-            )
-            effective_src_nodata = (
-                src_nodata if src_nodata is not None else src.nodata
-            )
-            src_dtype = np.dtype(src.dtypes[0])
-            fill_value = (
-                effective_src_nodata if effective_src_nodata is not None else 0
-            )
-            src_coarse_data = np.full(
-                (c_src_h, c_src_w), fill_value, dtype=src_dtype
-            )
-            reproject(
-                source=rasterio.band(src, 1),
-                destination=src_coarse_data,
-                src_transform=src.transform,
-                src_crs=src.crs,
-                dst_transform=src_coarse_transform,
-                dst_crs=src.crs,
-                resampling=Resampling.max,
-                src_nodata=effective_src_nodata,
-                dst_nodata=effective_src_nodata,
-            )
-            if effective_src_nodata is not None:
-                src_coarse_mask = np.where(
-                    src_coarse_data != effective_src_nodata, 255, 0
-                ).astype(np.uint8)
-            else:
-                src_coarse_mask = np.full(
-                    (c_src_h, c_src_w), 255, dtype=np.uint8
-                )
-
-            kwargs = src.meta.copy()
-            kwargs.update(
+            dst_kwargs = src.meta.copy()
+            dst_kwargs.update(
                 {
                     "crs": WGS84_EPSG,
                     "transform": dst_transform,
@@ -393,135 +340,25 @@ def reproject_raster_to_wgs84(
                 }
             )
             if dst_nodata is not None:
-                kwargs["nodata"] = dst_nodata
-            kwargs.update(
+                dst_kwargs["nodata"] = dst_nodata
+            dst_kwargs.update(
                 default_geotiff_creation_options(src.dtypes[0], sparse=True)
             )
-            kwargs["blockxsize"] = block_size
-            kwargs["blockysize"] = block_size
-            kwargs["NUM_THREADS"] = str(num_threads)
+            dst_kwargs["blockxsize"] = block_size
+            dst_kwargs["blockysize"] = block_size
+            dst_kwargs["NUM_THREADS"] = str(num_threads)
 
-            # Reproject the coarse source mask into destination CRS once.
-            # Resampling.max preserves coverage: a destination coarse pixel is
-            # 255 if any source pixel maps into it.
-            dst_scale = max(width / max_dim, height / max_dim, 1.0)
-            c_dst_w = max(1, int(width / dst_scale))
-            c_dst_h = max(1, int(height / dst_scale))
-            dst_coarse_transform = from_bounds(
-                dst_transform.c,
-                dst_transform.f + height * dst_transform.e,
-                dst_transform.c + width * dst_transform.a,
-                dst_transform.f,
-                c_dst_w, c_dst_h,
-            )
-            dst_coarse_mask = np.zeros((c_dst_h, c_dst_w), dtype=np.uint8)
-            reproject(
-                source=src_coarse_mask,
-                destination=dst_coarse_mask,
-                src_transform=src_coarse_transform,
-                src_crs=src.crs,
-                dst_transform=dst_coarse_transform,
-                dst_crs=WGS84_EPSG,
-                resampling=Resampling.max,
-                src_nodata=0,
-                dst_nodata=0,
-            )
-
-            # Per-block direct reproject
-            with rasterio.open(dst_path, "w", **kwargs) as dst:
-                windows = [w for _, w in dst.block_windows(1)]
-                n = len(windows)
-                flushed = 0
-                src_dtypes = src.dtypes
-                src_count = src.count
-                src_transform_ = src.transform
-                src_crs_ = src.crs
-                for i, window in enumerate(windows):
-                    # Map this destination block to the coarse dest mask.
-                    m_r0 = max(0, int(window.row_off * c_dst_h / height))
-                    m_r1 = min(c_dst_h, int((window.row_off + window.height) * c_dst_h / height) + 1)
-                    m_c0 = max(0, int(window.col_off * c_dst_w / width))
-                    m_c1 = min(c_dst_w, int((window.col_off + window.width) * c_dst_w / width) + 1)
-                    if not dst_coarse_mask[m_r0:m_r1, m_c0:m_c1].any():
-                        if progress_cb is not None:
-                            progress_cb(i + 1, n)
-                        continue
-
-                    win_dst_transform = window_transform(window, dst_transform)
-                    win_h = int(window.height)
-                    win_w = int(window.width)
-                    band1_fill = dst_nodata if dst_nodata is not None else 0
-                    band1_data = np.full(
-                        (win_h, win_w), band1_fill, dtype=src_dtypes[0]
-                    )
+            with rasterio.open(dst_path, "w", **dst_kwargs) as dst:
+                for b in range(1, src.count + 1):
                     reproject(
-                        source=rasterio.band(src, 1),
-                        destination=band1_data,
-                        src_transform=src_transform_,
-                        src_crs=src_crs_,
-                        dst_transform=win_dst_transform,
-                        dst_crs=WGS84_EPSG,
+                        source=rasterio.band(src, b),
+                        destination=rasterio.band(dst, b),
                         resampling=resampling,
                         src_nodata=src_nodata,
                         dst_nodata=dst_nodata,
                         num_threads=num_threads,
                         warp_mem_limit=warp_mem_limit_mb,
                     )
-                    if _block_is_empty(band1_data, dst_nodata):
-                        if progress_cb is not None:
-                            progress_cb(i + 1, n)
-                        continue
-                    dst.write(band1_data, indexes=1, window=window)
-                    for band_idx in range(2, src_count + 1):
-                        band_fill = dst_nodata if dst_nodata is not None else 0
-                        data = np.full(
-                            (win_h, win_w),
-                            band_fill,
-                            dtype=src_dtypes[band_idx - 1],
-                        )
-                        reproject(
-                            source=rasterio.band(src, band_idx),
-                            destination=data,
-                            src_transform=src_transform_,
-                            src_crs=src_crs_,
-                            dst_transform=win_dst_transform,
-                            dst_crs=WGS84_EPSG,
-                            resampling=resampling,
-                            src_nodata=src_nodata,
-                            dst_nodata=dst_nodata,
-                            num_threads=num_threads,
-                            warp_mem_limit=warp_mem_limit_mb,
-                        )
-                        if not _block_is_empty(data, dst_nodata):
-                            dst.write(data, indexes=band_idx, window=window)
-                    flushed += 1
-                    if progress_cb is not None:
-                        progress_cb(i + 1, n)
-
-    if build_overviews:
-        if overview_start_cb is not None:
-            try:
-                overview_start_cb()
-            except Exception:
-                pass
-        try:
-            build_internal_overviews(dst_path)
-        except Exception:
-            pass
-
-
-def _block_is_empty(data: np.ndarray, nodata: float | None) -> bool:
-    """Return True when an array carries no data the destination should store."""
-    if nodata is None:
-        if np.issubdtype(data.dtype, np.floating):
-            return bool(np.all(np.isnan(data)))
-        return False
-    if np.issubdtype(data.dtype, np.floating):
-        finite = np.isfinite(data)
-        if not np.any(finite):
-            return True
-        return bool(np.all(data[finite] == nodata))
-    return bool(np.all(data == nodata))
 
 
 def _raise_if_geographic_coords_outside_degree_range(gdf: gpd.GeoDataFrame) -> None:

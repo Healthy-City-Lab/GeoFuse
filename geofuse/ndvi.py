@@ -1040,13 +1040,11 @@ class NDVIEngine:
             )
 
             # Final reproject: planar → WGS84 with explicit nodata so the
-            # ``-9999`` fill doesn't bleed into edge pixels. Builds overviews
-            # for fast Folium previews.
+            # ``-9999`` fill doesn't bleed into edge pixels.
             reproject_raster_to_wgs84(
                 temp_tif,
                 final_tif,
                 target_resolution_m=resolution,
-                build_overviews=True,
                 src_nodata=-9999,
                 dst_nodata=-9999,
             )
@@ -1192,7 +1190,6 @@ class NDVIEngine:
                     planar_tmp,
                     cluster_path,
                     target_resolution_m=resolution,
-                    build_overviews=True,
                     src_nodata=-9999,
                     dst_nodata=-9999,
                 )
@@ -1548,53 +1545,25 @@ class NDVIEngine:
                     phase="Reprojecting to WGS84",
                     clear_bracket=True,
                 )
-
-                reproject_last_emit = {"v": time.monotonic()}
-                reproject_block_span = 0.79 - 0.76
-
-                def _reproject_progress(done: int, n: int) -> None:
-                    now = time.monotonic()
-                    is_final = done >= n
-                    if not is_final and now - reproject_last_emit["v"] < interval_s:
-                        return
-                    reproject_last_emit["v"] = now
-                    frac = done / n if n else 0.0
-                    _emit_ndvi_progress(
-                        ndvi_progress_callback,
-                        sub_progress=0.76 + reproject_block_span * frac,
-                        phase="Reprojecting to WGS84",
-                        tiles=(done, n),
-                    )
-
-                def _overview_start() -> None:
-                    _log(
-                        "INFO",
-                        "Block writes complete. Building internal overviews "
-                        "(2x, 4x, 8x) for fast previews — this may take a few "
-                        "minutes on national-scale rasters.",
-                    )
-                    _emit_ndvi_progress(
-                        ndvi_progress_callback,
-                        sub_progress=0.79,
-                        phase="Building overviews",
-                        clear_bracket=True,
-                    )
+                _log(
+                    "INFO",
+                    "Reprojecting planar mosaic to WGS84 in a single GDAL "
+                    "warp pass — this may take a few minutes on large-"
+                    "scale rasters.",
+                )
 
                 reproject_raster_to_wgs84(
                     planar_mosaic_tif,
                     final_tif,
                     target_resolution_m=resolution,
-                    build_overviews=True,
                     src_nodata=-9999,
                     dst_nodata=-9999,
-                    progress_cb=_reproject_progress,
-                    overview_start_cb=_overview_start,
                 )
 
                 _emit_ndvi_progress(
                     ndvi_progress_callback,
                     sub_progress=0.80,
-                    phase="Building overviews",
+                    phase="Reprojecting to WGS84",
                 )
 
                 _log("OK", f"Mosaic complete: {final_tif}")
