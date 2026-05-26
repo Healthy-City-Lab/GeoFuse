@@ -371,15 +371,23 @@ def reproject_raster_to_wgs84(
                     n = len(windows)
                     flushed = 0
                     for window in windows:
-                        wrote_any = False
-                        for band_idx in range(1, src.count + 1):
+                        # Band 1 is the spatial-presence gate. Secondary integer
+                        # bands (e.g. valid_obs) may be filled with 0 via EE
+                        # unmask rather than the nodata sentinel, so per-band
+                        # _block_is_empty checks would not catch them. If band 1
+                        # is entirely nodata the block has no useful information
+                        # for any band and should be skipped entirely.
+                        band1_data = vrt.read(1, window=window)
+                        if _block_is_empty(band1_data, dst_nodata):
+                            if progress_cb is not None:
+                                progress_cb(flushed, n)
+                            continue
+                        dst.write(band1_data, indexes=1, window=window)
+                        for band_idx in range(2, src.count + 1):
                             data = vrt.read(band_idx, window=window)
-                            if _block_is_empty(data, dst_nodata):
-                                continue
-                            dst.write(data, indexes=band_idx, window=window)
-                            wrote_any = True
-                        if wrote_any:
-                            flushed += 1
+                            if not _block_is_empty(data, dst_nodata):
+                                dst.write(data, indexes=band_idx, window=window)
+                        flushed += 1
                         if progress_cb is not None:
                             progress_cb(flushed, n)
 
