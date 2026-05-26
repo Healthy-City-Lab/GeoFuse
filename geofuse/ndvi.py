@@ -1547,25 +1547,38 @@ class NDVIEngine:
                     ndvi_progress_callback,
                     sub_progress=0.76,
                     phase="Reprojecting to WGS84",
-                    tiles=(0, 1),
                     clear_bracket=True,
                 )
 
                 reproject_last_emit = {"v": time.monotonic()}
+                reproject_block_span = 0.79 - 0.76
 
-                def _reproject_progress(k: int, n: int) -> None:
+                def _reproject_progress(flushed: int, n: int) -> None:
                     now = time.monotonic()
-                    is_final = k >= n
+                    is_final = flushed >= n
                     if not is_final and now - reproject_last_emit["v"] < interval_s:
                         return
                     reproject_last_emit["v"] = now
-                    span = 0.80 - 0.76
-                    frac = k / n if n else 0.0
+                    frac = flushed / n if n else 0.0
                     _emit_ndvi_progress(
                         ndvi_progress_callback,
-                        sub_progress=0.76 + span * frac,
+                        sub_progress=0.76 + reproject_block_span * frac,
                         phase="Reprojecting to WGS84",
-                        tiles=(k, n),
+                        tiles=(flushed, n),
+                    )
+
+                def _overview_start() -> None:
+                    _log(
+                        "INFO",
+                        "Block writes complete. Building internal overviews "
+                        "(2x, 4x, 8x) for fast previews — this may take a few "
+                        "minutes on national-scale rasters.",
+                    )
+                    _emit_ndvi_progress(
+                        ndvi_progress_callback,
+                        sub_progress=0.79,
+                        phase="Building overviews",
+                        clear_bracket=True,
                     )
 
                 reproject_raster_to_wgs84(
@@ -1576,12 +1589,13 @@ class NDVIEngine:
                     src_nodata=-9999,
                     dst_nodata=-9999,
                     progress_cb=_reproject_progress,
+                    overview_start_cb=_overview_start,
                 )
 
                 _emit_ndvi_progress(
                     ndvi_progress_callback,
                     sub_progress=0.80,
-                    phase="Reprojecting to WGS84",
+                    phase="Building overviews",
                 )
 
                 _log("OK", f"Mosaic complete: {final_tif}")
