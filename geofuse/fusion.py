@@ -26,6 +26,7 @@ from sklearn.metrics import mean_squared_error, mutual_info_score, r2_score
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import MinMaxScaler
 
+from . import preaggregation
 from .crs_utils import (
     build_internal_overviews,
     default_geotiff_creation_options,
@@ -33,7 +34,7 @@ from .crs_utils import (
     reproject_geodataframe_to_wgs84,
 )
 from .logger import attach_external_logger, get_logger
-from .vector_io import target_path_is_raster
+from .vector_io import geometry_sha256, target_path_is_raster
 
 logger = logging.getLogger(__name__)
 _log = get_logger("FUSION")
@@ -221,15 +222,12 @@ class MetricFusionEngine:
         self._ring_vector_cache: dict = {}
         self._max_points_ring_cache = 8000
 
-        # Spatial pre-aggregation (opt-in; populated by precompute_aggregations()).
-        # Shape per metric: (n_points, n_radii, n_stats) where stats are
-        # mean + p10..p90 in the order given by ``_PREAGGR_STATS``.
+        # Spatial pre-aggregation (mandatory; built by precompute_aggregations()).
+        # Backed by an on-disk SQLite cache (geofuse/preaggregation.py) so the
+        # per-(entity, radius) stat table survives cancels/crashes and is reused
+        # across runs.
         self._preaggregation_done: bool = False
-        self._preaggr_veg: np.ndarray | None = None
-        self._preaggr_terrain: np.ndarray | None = None
-        self._preaggr_ndvi: np.ndarray | None = None
-        self._preaggr_gvi_radii: tuple[int, ...] = ()
-        self._preaggr_ndvi_radii: tuple[int, ...] = ()
+        self._preaggr_cache: preaggregation.PreAggregationCache | None = None
         self._cancel_callback: Callable[[], bool] | None = None
 
         # Vector vs raster (``is_points`` kept for backward compatibility = vector target)
@@ -1729,76 +1727,76 @@ class MetricFusionEngine:
             return self._prepare_raster_fusion()
 
     # ------------------------------------------------------------------
-    # Spatial pre-aggregation (opt-in)
+    # Spatial pre-aggregation (mandatory; on-disk SQLite cache)
     # ------------------------------------------------------------------
     #
-    # Layout of every pre-aggregation table:
-    #     shape  = (n_sample_points, n_radii, n_stats)
-    #     dtype  = float16  (~3-digit precision; saves ~50% memory vs float32)
-    #     stats  = (mean, p10, p20, p30, p40, p50, p60, p70, p80, p90)
-    # Filled by ``precompute_aggregations()``; consumed by ``_aggregate_with_ring_cache``
-    # which short-circuits to a numpy take when the lookup is available.
-    # Trial-suggested percentiles are constrained to the 10 % grid below when
-    # the table is active so every trial maps to a valid cell.
+    # ``precompute_aggregations()`` builds a per-(entity, radius) table of
+    # (mean, p10..p90) for every channel and persists it via
+    # ``geofuse/preaggregation.py`` so the table survives cancels/crashes and is
+    # reused across runs. ``_aggregate_with_ring_cache`` short-circuits to a
+    # single column read when the trial's (radius, stat) maps onto the stored
+    # grid; off-grid percentiles fall back to the lazy ring cache.
+    # Trial-suggested percentiles are constrained to this 10 % grid so every
+    # trial maps to a stored column.
+    _PREAGGR_PERCENTILES = preaggregation.PERCENTILES
 
-    _PREAGGR_STAT_NAMES = (
-        "mean",
-        "p10",
-        "p20",
-        "p30",
-        "p40",
-        "p50",
-        "p60",
-        "p70",
-        "p80",
-        "p90",
-    )
-    _PREAGGR_PERCENTILES = (10, 20, 30, 40, 50, 60, 70, 80, 90)
-
-    @classmethod
-    def _preaggr_stat_index(cls, stat: str, percentile: int | None) -> int | None:
-        """(stat, percentile) → row in the pre-aggregation stat axis, or None."""
-        if stat == "mean":
-            return 0
-        if stat == "median":
-            return cls._PREAGGR_PERCENTILES.index(50) + 1
-        if stat == "percentile":
-            try:
-                return cls._PREAGGR_PERCENTILES.index(int(percentile)) + 1
-            except ValueError:
-                return None
-        return None
+    def _preaggr_radii(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        """(gvi_radii, ndvi_radii) snapped to int + step from the buffer ladders."""
+        gvi_lo, gvi_hi, gvi_st = _radius_int_bounds(
+            self.gvi_buffer_min_m, self.gvi_buffer_max_m, self.gvi_buffer_step_m
+        )
+        ndvi_lo, ndvi_hi, ndvi_st = _radius_int_bounds(
+            self.ndvi_buffer_min_m, self.ndvi_buffer_max_m, self.ndvi_buffer_step_m
+        )
+        return (
+            tuple(range(gvi_lo, gvi_hi + 1, gvi_st)),
+            tuple(range(ndvi_lo, ndvi_hi + 1, ndvi_st)),
+        )
 
     @staticmethod
-    def _compute_all_stats_inplace(values: np.ndarray) -> np.ndarray:
-        """Return [mean, p10, p20, …, p90] in one go (float32)."""
-        if values.size == 0:
-            return np.full(10, np.nan, dtype=np.float32)
-        out = np.empty(10, dtype=np.float32)
-        out[0] = float(values.mean())
-        out[1:] = np.percentile(values, [10, 20, 30, 40, 50, 60, 70, 80, 90])
-        return out
+    def _metric_value_column(metric_gdf: gpd.GeoDataFrame, default_col: str) -> str:
+        col = metric_gdf.attrs.get("metric_column")
+        if not col or col not in metric_gdf.columns:
+            for c in (default_col, "value"):
+                if c in metric_gdf.columns:
+                    col = c
+                    break
+        if not col:
+            raise ValueError(
+                "Pre-aggregation: cannot find value column in metric "
+                f"(columns: {list(metric_gdf.columns)})."
+            )
+        return col
+
+    def _metric_fingerprint(self, metric, default_col: str) -> str:
+        """Cheap, deterministic identity for a loaded metric (vector or raster)."""
+        if isinstance(metric, dict):  # raster
+            arr = metric["data"]
+            data = arr.data if hasattr(arr, "data") else np.asarray(arr)
+            sample = np.ascontiguousarray(data[::17, ::17]).tobytes()
+            digest = hashlib.sha256(sample).hexdigest()[:16]
+            return f"ras:{data.shape}:{tuple(metric['bounds'])}:{data.dtype}:{digest}"
+        col = self._metric_value_column(metric, default_col)
+        vals = np.ascontiguousarray(metric[col].to_numpy(dtype=np.float64))
+        digest = hashlib.sha256(vals.tobytes()).hexdigest()[:16]
+        return f"vec:{len(metric)}:{tuple(metric.total_bounds)}:{col}:{digest}"
 
     def precompute_aggregations(
         self,
         progress_callback: Callable[[int, int], None] | None = None,
         cancel_callback: Callable[[], bool] | None = None,
     ) -> bool:
-        """Build the per-point × radius × stat lookup table for every metric.
+        """Build (or reuse/resume) the on-disk per-(entity, radius) stat cache.
 
-        Each metric must currently be a GeoDataFrame (point features). Raster
-        metrics aren't supported by the pre-aggregation path yet — they would
-        still fall back to the lazy ring cache.
-
-        Results are stored as ``float16`` (~3-digit precision). Trials whose
-        percentile sits on the 10 % grid {10,20,…,90} take a single
-        ``numpy.take`` per call; trials off the grid fall back to the ring cache.
+        For every sample entity and every buffer radius in the ladder, stores
+        (mean, p10..p90) per channel in a per-job SQLite database
+        (``geofuse/preaggregation.py``). Handles both vector (point) and raster
+        metrics. The cache is fingerprinted on the sample geometry, metric
+        sources, radius ladders, and stat set, so an identical re-run reuses it;
+        an interrupted build resumes from its per-entity watermark.
 
         Returns ``True`` on completion, ``False`` if cancelled.
         """
-        from sklearn.neighbors import BallTree
-
-        # ---- Validate that every metric is a GeoDataFrame ----
         for label, data in (
             ("veg", self.veg_data),
             ("terrain", self.terrain_data),
@@ -1808,156 +1806,133 @@ class MetricFusionEngine:
                 raise ValueError(
                     f"Pre-aggregation requires '{label}' metric data; got None."
                 )
-            if not isinstance(data, gpd.GeoDataFrame):
-                raise ValueError(
-                    f"Pre-aggregation requires '{label}' to be a GeoDataFrame; "
-                    "raster metrics are not yet supported in the pre-aggregation path."
-                )
         if self.target_gdf is None or len(self.target_gdf) == 0:
             raise ValueError(
-                "Pre-aggregation requires sample points; run split_data() first "
-                "(it triggers prepare_fusion_data())."
+                "Pre-aggregation requires sample points; call prepare_fusion_data() "
+                "first."
             )
 
-        # ---- Radius ladders (snapped to int + step) ----
-        gvi_lo, gvi_hi, gvi_st = _radius_int_bounds(
-            self.gvi_buffer_min_m, self.gvi_buffer_max_m, self.gvi_buffer_step_m
-        )
-        ndvi_lo, ndvi_hi, ndvi_st = _radius_int_bounds(
-            self.ndvi_buffer_min_m, self.ndvi_buffer_max_m, self.ndvi_buffer_step_m
-        )
-        gvi_radii = tuple(range(gvi_lo, gvi_hi + 1, gvi_st))
-        ndvi_radii = tuple(range(ndvi_lo, ndvi_hi + 1, ndvi_st))
-
+        gvi_radii, ndvi_radii = self._preaggr_radii()
         n_points = len(self.target_gdf)
-        n_stats = len(self._PREAGGR_STAT_NAMES)
+        defaults = {"veg": "veg", "terrain": "terrain", "ndvi": "NDVI"}
 
-        size_mb = (n_points * (len(gvi_radii) * 2 + len(ndvi_radii)) * n_stats * 2) / (
-            1024 * 1024
+        # ---- Fingerprint + cache file (per data-config; reused across runs) ----
+        fp_src = "|".join(
+            [
+                f"geom:{geometry_sha256(self.target_gdf)}",
+                self._metric_fingerprint(self.veg_data, defaults["veg"]),
+                self._metric_fingerprint(self.terrain_data, defaults["terrain"]),
+                self._metric_fingerprint(self.ndvi_data, defaults["ndvi"]),
+                f"gvi:{gvi_radii}",
+                f"ndvi:{ndvi_radii}",
+                f"stats:{preaggregation.STAT_COLUMNS}",
+            ]
         )
+        fingerprint = hashlib.sha256(fp_src.encode()).hexdigest()
+        preaggr_dir = os.path.join(self.cache_dir, "preaggr")
+        os.makedirs(preaggr_dir, exist_ok=True)
+        base = os.path.splitext(os.path.basename(self.target_file))[0]
+        db_path = os.path.join(preaggr_dir, f"preaggr-{base}-{fingerprint[:12]}.sqlite")
+
+        cache = preaggregation.PreAggregationCache(
+            db_path,
+            gvi_radii=gvi_radii,
+            ndvi_radii=ndvi_radii,
+            fingerprint=fingerprint,
+        )
+
+        if cache.is_complete():
+            _log(
+                "OK",
+                f"Reusing pre-aggregation cache ({n_points:,} entities): {db_path}",
+            )
+            self._preaggr_cache = cache
+            self._preaggregation_done = True
+            if progress_callback is not None:
+                progress_callback(n_points, n_points)
+            return True
+
+        if not cache.matches_fingerprint():
+            cache.reset()
+        cache.write_header(n_points)
+
         _log(
             "INFO",
-            f"Pre-aggregation: {n_points:,} sample points · "
-            f"GVI radii {gvi_radii} m · NDVI radii {ndvi_radii} m · "
-            f"{n_stats} stats. Estimated table size: ~{size_mb:.1f} MB (float16).",
+            f"Pre-aggregation: {n_points:,} entities · GVI radii {gvi_radii} m · "
+            f"NDVI radii {ndvi_radii} m · stats {preaggregation.STAT_COLUMNS}. "
+            f"Cache: {db_path}",
         )
 
-        # ---- Project everything to a common metric CRS ----
-        metric_crs = self.target_gdf.estimate_utm_crs()
-        points_m = self.target_gdf.to_crs(metric_crs)
-        point_xy = np.column_stack(
-            [points_m.geometry.x.values, points_m.geometry.y.values]
+        # ---- Prepare per-channel samplers (format-aware) ----
+        utm_crs = self.target_gdf.estimate_utm_crs()
+        pts_utm = self.target_gdf.to_crs(utm_crs)
+        point_xy_utm = np.column_stack(
+            [pts_utm.geometry.x.to_numpy(), pts_utm.geometry.y.to_numpy()]
         ).astype(np.float64)
 
-        def _prepare(metric_gdf: gpd.GeoDataFrame, default_col: str):
-            col = metric_gdf.attrs.get("metric_column")
-            if not col or col not in metric_gdf.columns:
-                for c in (default_col, "value"):
-                    if c in metric_gdf.columns:
-                        col = c
-                        break
-            if not col:
-                raise ValueError(
-                    f"Pre-aggregation: cannot find value column in "
-                    f"metric (columns: {list(metric_gdf.columns)})."
+        prep: dict = {}
+        for ch, metric in (
+            ("veg", self.veg_data),
+            ("terrain", self.terrain_data),
+            ("ndvi", self.ndvi_data),
+        ):
+            if isinstance(metric, dict):  # raster
+                pts_r = self.target_gdf.to_crs(metric["crs"])
+                xy_r = np.column_stack(
+                    [pts_r.geometry.x.to_numpy(), pts_r.geometry.y.to_numpy()]
+                ).astype(np.float64)
+                px_m = preaggregation.raster_pixel_size_m(
+                    metric["transform"], metric["crs"].is_geographic
                 )
-            m = metric_gdf.to_crs(metric_crs)
-            m = m[m[col].notna()]
-            if len(m) == 0:
-                raise ValueError(
-                    f"Pre-aggregation: metric '{col}' has zero non-NaN features."
-                )
-            xy = np.column_stack([m.geometry.x.values, m.geometry.y.values]).astype(
-                np.float64
-            )
-            tree = BallTree(xy)
-            return tree, m[col].to_numpy(dtype=np.float32)
+                prep[ch] = ("raster", metric["data"], metric["transform"], px_m, xy_r)
+            else:  # vector points
+                col = self._metric_value_column(metric, defaults[ch])
+                tree, vals = preaggregation.build_vector_index(metric, utm_crs, col)
+                prep[ch] = ("vector", tree, vals)
 
-        veg_tree, veg_vals = _prepare(self.veg_data, "veg")
-        ter_tree, ter_vals = _prepare(self.terrain_data, "terrain")
-        ndvi_tree, ndvi_vals = _prepare(self.ndvi_data, "NDVI")
+        # ---- Resume: only compute entities not already written ----
+        entity_ids = [int(x) for x in self.target_gdf.index]
+        pos_of = {eid: i for i, eid in enumerate(entity_ids)}
+        pending = cache.pending_entities(entity_ids)
+        done0 = n_points - len(pending)
+        if progress_callback is not None and done0:
+            progress_callback(done0, n_points)
 
-        # ---- Allocate tables ----
-        self._preaggr_veg = np.full(
-            (n_points, len(gvi_radii), n_stats), np.nan, dtype=np.float16
-        )
-        self._preaggr_terrain = np.full(
-            (n_points, len(gvi_radii), n_stats), np.nan, dtype=np.float16
-        )
-        self._preaggr_ndvi = np.full(
-            (n_points, len(ndvi_radii), n_stats), np.nan, dtype=np.float16
-        )
-        self._preaggr_gvi_radii = gvi_radii
-        self._preaggr_ndvi_radii = ndvi_radii
-
-        gvi_max = float(max(gvi_radii))
-        ndvi_max = float(max(ndvi_radii))
-
-        # ---- Fill the tables. Per batch we query each tree once at the
-        # largest radius and then derive smaller-radius stats by masking. ----
         batch_size = 1024
-        last_pct = -1
-        for batch_start in range(0, n_points, batch_size):
+        for bs in range(0, len(pending), batch_size):
             if cancel_callback is not None and cancel_callback():
-                _log("WARN", "Pre-aggregation cancelled.")
+                _log("WARN", "Pre-aggregation cancelled (resumable).")
                 self._preaggregation_done = False
+                cache.close()
                 return False
 
-            batch_end = min(batch_start + batch_size, n_points)
-            batch_xy = point_xy[batch_start:batch_end]
-
-            veg_idx, veg_dist = veg_tree.query_radius(
-                batch_xy, r=gvi_max, return_distance=True
+            bids = pending[bs : bs + batch_size]
+            bpos = np.fromiter(
+                (pos_of[e] for e in bids), dtype=np.int64, count=len(bids)
             )
-            ter_idx, ter_dist = ter_tree.query_radius(
-                batch_xy, r=gvi_max, return_distance=True
-            )
-            nd_idx, nd_dist = ndvi_tree.query_radius(
-                batch_xy, r=ndvi_max, return_distance=True
-            )
+            channel_stats: dict[str, np.ndarray] = {}
+            for ch in preaggregation.CHANNELS:
+                kind = prep[ch][0]
+                radii = cache.radii_for(ch)
+                if kind == "vector":
+                    _, tree, vals = prep[ch]
+                    channel_stats[ch] = preaggregation.vector_batch_stats(
+                        tree, vals, point_xy_utm[bpos], radii
+                    )
+                else:
+                    _, array, transform, px_m, xy_r = prep[ch]
+                    channel_stats[ch] = preaggregation.raster_batch_stats(
+                        array, transform, px_m, xy_r[bpos], radii
+                    )
+            cache.write_batch(bids, channel_stats)
 
-            for b in range(batch_end - batch_start):
-                i = batch_start + b
+            if progress_callback is not None:
+                progress_callback(done0 + bs + len(bids), n_points)
 
-                if len(veg_idx[b]):
-                    v_all, d_all = veg_vals[veg_idx[b]], veg_dist[b]
-                    for r_idx, r in enumerate(gvi_radii):
-                        mask = d_all <= r
-                        if mask.any():
-                            self._preaggr_veg[i, r_idx, :] = (
-                                self._compute_all_stats_inplace(v_all[mask])
-                            )
-
-                if len(ter_idx[b]):
-                    v_all, d_all = ter_vals[ter_idx[b]], ter_dist[b]
-                    for r_idx, r in enumerate(gvi_radii):
-                        mask = d_all <= r
-                        if mask.any():
-                            self._preaggr_terrain[i, r_idx, :] = (
-                                self._compute_all_stats_inplace(v_all[mask])
-                            )
-
-                if len(nd_idx[b]):
-                    v_all, d_all = ndvi_vals[nd_idx[b]], nd_dist[b]
-                    for r_idx, r in enumerate(ndvi_radii):
-                        mask = d_all <= r
-                        if mask.any():
-                            self._preaggr_ndvi[i, r_idx, :] = (
-                                self._compute_all_stats_inplace(v_all[mask])
-                            )
-
-            # Progress: percent-of-points granularity, with caller-side throttling.
-            pct = (batch_end * 100) // max(1, n_points)
-            if pct != last_pct:
-                if progress_callback is not None:
-                    progress_callback(batch_end, n_points)
-                last_pct = pct
-
+        cache.mark_complete()
+        self._preaggr_cache = cache
         self._preaggregation_done = True
-        _log(
-            "OK",
-            f"Pre-aggregation complete for {n_points:,} sample points.",
-        )
+        _log("OK", f"Pre-aggregation complete for {n_points:,} entities.")
         return True
 
     def _lookup_preaggregation(
@@ -1968,33 +1943,16 @@ class MetricFusionEngine:
         stat: str,
         percentile: int | None,
     ) -> np.ndarray | None:
-        """Pre-aggregation lookup. Returns float32 array (or None to fall back)."""
-        if not self._preaggregation_done:
+        """Cache-backed lookup. Returns float32 array (or None to fall back)."""
+        cache = self._preaggr_cache
+        if cache is None or not self._preaggregation_done:
             return None
-
-        s_idx = self._preaggr_stat_index(stat, percentile)
-        if s_idx is None:
+        column = preaggregation.stat_to_column(stat, percentile)
+        if column is None:
             return None
-
-        if channel == "veg":
-            table = self._preaggr_veg
-            radii = self._preaggr_gvi_radii
-        elif channel == "terrain":
-            table = self._preaggr_terrain
-            radii = self._preaggr_gvi_radii
-        elif channel == "ndvi":
-            table = self._preaggr_ndvi
-            radii = self._preaggr_ndvi_radii
-        else:
-            return None
-
-        r_int = int(round(radius_m))
-        try:
-            r_idx = radii.index(r_int)
-        except ValueError:
-            return None
-
-        return table[np.asarray(point_indices), r_idx, s_idx].astype(np.float32)
+        return cache.lookup(
+            np.asarray(point_indices), channel, int(round(radius_m)), column
+        )
 
     # ------------------------------------------------------------------
     # Polygon-target areal aggregation
@@ -2536,7 +2494,11 @@ class MetricFusionEngine:
         return result
 
     def split_data(
-        self, test_size: float = 0.2, k_folds: int = 5, random_state: int = 42
+        self,
+        test_size: float = 0.2,
+        k_folds: int = 5,
+        random_state: int = 42,
+        fusion_df: pd.DataFrame | None = None,
     ) -> None:
         """
         Split data into holdout test set and k-fold CV training/validation sets.
@@ -2558,7 +2520,8 @@ class MetricFusionEngine:
         """
         # Step 1: Sample all metrics at initial buffer distance
         logger.info("Step 1/4: Sampling metrics at point locations...")
-        fusion_df = self.prepare_fusion_data()
+        if fusion_df is None:
+            fusion_df = self.prepare_fusion_data()
         self.k_folds = k_folds
 
         logger.info(f"Initial samples before filtering: {len(fusion_df)}")

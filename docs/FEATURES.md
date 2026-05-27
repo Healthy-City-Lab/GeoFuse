@@ -53,6 +53,7 @@
 
 * **Automated Metric Alignment**: Auto-downloads and spatially aligns GVI (vegetation/terrain) and NDVI within your study area when pre-computed files are not provided.
 * **Dual Input Support**: Works with **point-based** targets (GeoJSON with health/environmental data) and **raster-based** targets (GeoTIFF continuous surfaces).
+* **Mandatory Spatial Pre-processing**: Before optimization, every sample entity's metric values are pre-aggregated across all buffer radii in the ladder and all statistics (mean + p10–p90) for each channel, into a per-job SQLite cache (`output_results/fusion_cache/preaggr/`). Each Optuna trial then reads a single indexed column instead of recomputing buffer aggregations. The build runs first, reports entities-processed progress, supports both vector and raster metrics, and is **resumable** (survives cancels/crashes) and **reused** across runs with identical inputs.
 * **Bayesian Optimization**: Uses **Optuna** (TPE sampler) to optimize 9 parameters:
   * **Weights**: Vegetation, Terrain, NDVI contribution (0–100%, sum = 100%)
   * **Spatial Aggregation**: Circular buffer radii (100m to user-defined max, step = 50m)

@@ -189,3 +189,4 @@ Automatically reused for identical study areas to avoid redundant downloads:
 | `cache-terrain-{hash}.geojson` | Cached GVI terrain component |
 | `cache-ndvi-{hash}.tif` | Cached NDVI raster |
 | `cache-gvi_combined-{hash}.tif` | Multi-band raster (Band 1: Vegetation, Band 2: Terrain) |
+| `preaggr/preaggr-{target}-{fp}.sqlite` | Pre-aggregation cache: per-(entity, radius) mean + p10–p90 for each channel. Built before optimization, resumable, reused across runs with identical inputs. Safe to delete to force a rebuild. |
