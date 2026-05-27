@@ -15,10 +15,9 @@ rather than inside a single engine's tab module.
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import streamlit as st
-
 from helpers import RESTART_SESSION_KEY
 from services import (
     ansi_log_lines_to_html,
@@ -49,9 +48,14 @@ _RESTART_ELIGIBLE_STATUSES = {"interrupted", "cancelled", "error"}
 
 def _fmt_timestamp(iso: str) -> str:
     """Parse a UTC ISO timestamp string and return a local-time string."""
-    for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%S.%fZ",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%dT%H:%M:%S.%f",
+        "%Y-%m-%dT%H:%M:%S",
+    ):
         try:
-            ts = datetime.strptime(iso, fmt).replace(tzinfo=timezone.utc)
+            ts = datetime.strptime(iso, fmt).replace(tzinfo=UTC)
             return ts.astimezone().strftime("%Y-%m-%d %H:%M:%S")
         except ValueError:
             continue
@@ -73,9 +77,7 @@ def _render_details(rec) -> None:
             f"GeoTIFF={bool(p.get('save_geotiff'))} · "
             f"GeoJSON={bool(p.get('save_geojson'))}"
         )
-        st.write(
-            f"**Street View API key:** {'yes' if p.get('has_api_key') else 'no'}"
-        )
+        st.write(f"**Street View API key:** {'yes' if p.get('has_api_key') else 'no'}")
     elif rec.type in ("ndvi", "ndvi_column"):
         mode = p.get("mode", "?")
         st.write(f"**Mode:** {mode}")
@@ -162,10 +164,7 @@ def _render_job_card(rec, store) -> None:
         if gvi_progress:
             st.progress(
                 gvi_progress["percent"] / 100,
-                text=(
-                    f"{gvi_progress['current']:,} / "
-                    f"{gvi_progress['total']:,}"
-                ),
+                text=(f"{gvi_progress['current']:,} / " f"{gvi_progress['total']:,}"),
             )
 
         preaggr_progress = rec.extra.get("preaggr_progress")

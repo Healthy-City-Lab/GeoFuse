@@ -218,7 +218,9 @@ def main(env_name, log_file=None):
     else:
         # macOS uses CPU or MPS (Metal Performance Shaders), no CUDA
         # Use the standard command, ensuring the pytorch channel is primary.
-        cmd = f'"{env_python}" -m pip install {PYTORCH_VERSION} --no-warn-script-location'
+        cmd = (
+            f'"{env_python}" -m pip install {PYTORCH_VERSION} --no-warn-script-location'
+        )
     run_cmd(cmd, log_file)
 
     # 3. Install Pip Libraries
@@ -229,12 +231,17 @@ def main(env_name, log_file=None):
         log_file,
     )
     pip_str = " ".join(PIP_PACKAGES)
-    run_cmd(f'"{env_python}" -m pip install {pip_str} --no-warn-script-location', log_file)
+    run_cmd(
+        f'"{env_python}" -m pip install {pip_str} --no-warn-script-location', log_file
+    )
 
     # 4. Editable Install
     print("[4/5] Performing Editable Install of GeoFuse...")
     root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    run_cmd(f'"{env_python}" -m pip install -e "{root_dir}" --no-warn-script-location', log_file)
+    run_cmd(
+        f'"{env_python}" -m pip install -e "{root_dir}" --no-warn-script-location',
+        log_file,
+    )
 
     # 5. Verify Installation
     print("[5/5] Verifying Installation...")

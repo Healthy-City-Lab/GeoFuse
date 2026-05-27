@@ -50,7 +50,9 @@ def crs_to_ee_string(crs) -> str:
 # long before any download starts.  ``shrink_gdf_for_ee`` shrinks only the
 # EE-side AOI; callers should retain the precise input geometry for
 # client-side per-tile clipping so output precision is unaffected.
-EE_REQUEST_BUDGET_BYTES = 5_000_000  # ~5 MiB — leave headroom for the rest of the EE compute graph
+EE_REQUEST_BUDGET_BYTES = (
+    5_000_000  # ~5 MiB — leave headroom for the rest of the EE compute graph
+)
 
 
 def shrink_gdf_for_ee(

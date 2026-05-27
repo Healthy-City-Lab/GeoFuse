@@ -142,9 +142,7 @@ def add_mercator_image_overlay(
     img_bytes = (colored * 255).astype(np.uint8)
     buff = io.BytesIO()
     PILImage.fromarray(img_bytes).save(buff, format="PNG")
-    img_url = (
-        f"data:image/png;base64,{base64.b64encode(buff.getvalue()).decode()}"
-    )
+    img_url = f"data:image/png;base64,{base64.b64encode(buff.getvalue()).decode()}"
 
     folium.raster_layers.ImageOverlay(
         image=img_url,

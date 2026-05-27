@@ -17,7 +17,7 @@
 * **Refresh-Safe Job Monitor**: Jobs survive browser refresh and additional tabs. Track progress in the sidebar with a live health badge (active / stuck / errors). Job state is persisted to `logs/jobs.db`; per-job text logs are written to `logs/jobs/<job_id>.log` and can be opened directly from the UI with the "📄 Open log file" button.
 * **Live Per-Job Logs**: Engine logs (including Earth Engine and Optuna internals) appear inside the job's own expander rather than the host terminal. Job log files persist on disk indefinitely for later inspection.
 * **Parallel Study Areas**: Submit multiple study areas with different resolution or buffer settings simultaneously — each unique parameter combination is treated as a separate job.
-* **Outputs**: **GeoPackage** point layer (canonical, recommended, EPSG:4326), per-cluster **GeoTIFF tiles** (optional, dense — no inter-cluster gaps, written in the engine-selected planar CRS so cells stay true 1 step × 1 step squares in metres), **GeoJSON** (compatibility, EPSG:4326), optional raw panoramas and segmentation masks.
+* **Outputs**: **GeoPackage** point layer (canonical, recommended), per-cluster **GeoTIFF tiles** (optional, dense — no inter-cluster gaps), **GeoJSON** (compatibility, EPSG:4326 only), optional raw panoramas and segmentation masks. GeoPackage, GeoTIFF, and per-cluster tiles ship in the engine-selected **planar CRS** (UTM / LCC / Polar Stereographic from `select_grid_crs`) so cells stay true squares in metres; lat/lon stay available as data columns on GVI points.
 
 ---
 

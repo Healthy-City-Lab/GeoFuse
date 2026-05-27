@@ -40,6 +40,7 @@ from geofuse.jobs import progress_interval_s
 from geofuse.logger import get_logger
 from geofuse.ndvi import NDVIEngine
 from geofuse.persistence.job_executor import JobContext
+from geofuse.raster_sampling import sample_raster_at_features
 from geofuse.vision import get_best_device
 
 _log_gvi = get_logger("GVI")
@@ -151,21 +152,22 @@ def run_gvi(
     if "orig_index" in res_df.columns:
         res_df.set_index("orig_index", inplace=True)
         res_df.index.name = None
-    # Engine produces results in EPSG:4326; guard rail in case a future caller
-    # passes a projected dataset_data["processed"].
     if res_df.crs is None:
         res_df = res_df.set_crs("EPSG:4326")
-    elif res_df.crs.is_geographic:
-        res_df = reproject_geodataframe_to_wgs84(res_df)
-    else:
-        res_df = res_df.to_crs("EPSG:4326")
-    dataset_data["results"] = res_df
 
     out_name = os.path.splitext(fname)[0]
     output_paths: list[str] = []
     meta = dataset_data.get("meta") or {}
     grid_crs_wkt = meta.get("grid_crs_wkt")
     clusters = meta.get("clusters") or []
+
+    # All GVI outputs land in the toolbox-selected planar CRS so cells stay
+    # square in metres across the entire study area. Falls back to EPSG:4326
+    # only when the runner is invoked without clustered-grid metadata
+    # (direct API callers with point inputs + buffer=0).
+    if grid_crs_wkt:
+        res_df = res_df.to_crs(grid_crs_wkt)
+    dataset_data["results"] = res_df
 
     if save_gpkg:
         gpkg_path = os.path.join(output_dir, f"{out_name}_gvi.gpkg")
@@ -174,7 +176,7 @@ def run_gvi(
 
     if save_geojson:
         gj_path = os.path.join(output_dir, f"{out_name}_gvi.geojson")
-        res_df.to_file(gj_path, driver="GeoJSON")
+        reproject_geodataframe_to_wgs84(res_df).to_file(gj_path, driver="GeoJSON")
         output_paths.append(gj_path)
         if len(res_df) > 100_000:
             _log_gvi(
@@ -482,24 +484,21 @@ def run_ndvi_column(
         if not os.path.exists(tif_path):
             continue
 
+        # Delegate the exact-pixel sample to the shared helper — it
+        # handles the planar-CRS reprojection, nodata sentinel, and
+        # NaN filtering uniformly with every other raster consumer.
         date_gdf = gdf[gdf["_parsed_date"].dt.date == target_date].copy()
-        with rasterio.open(tif_path) as src:
-            for row_idx, row in date_gdf.iterrows():
-                geom = row.geometry
-                pt = geom if geom.geom_type == "Point" else geom.centroid
-                try:
-                    r, c = src.index(pt.x, pt.y)
-                    window = rasterio.windows.Window(c, r, 1, 1)
-                    val = src.read(1, window=window)
-                    ndvi_val = float(val[0][0]) if val.size > 0 else np.nan
-                    if ndvi_val == -9999:
-                        ndvi_val = np.nan
-                except Exception:
-                    ndvi_val = np.nan
-                date_gdf.at[row_idx, "NDVI"] = ndvi_val
-                date_gdf.at[row_idx, "ndvi_date"] = target_date.isoformat()
+        out = sample_raster_at_features(
+            tif_path,
+            date_gdf,
+            band=1,
+            radius_m=0.0,
+            stat="mean",
+            value_column="NDVI",
+        )
+        out["ndvi_date"] = target_date.isoformat()
+        all_results.append(out)
 
-        all_results.append(date_gdf)
         if not save_geotiff and os.path.isfile(tif_path):
             os.remove(tif_path)
         elif save_geotiff:
@@ -507,12 +506,12 @@ def run_ndvi_column(
 
     if all_results:
         merged = gpd.GeoDataFrame(
-            pd.concat(all_results, ignore_index=True), crs=gdf.crs
+            pd.concat(all_results, ignore_index=True), crs=all_results[0].crs
         )
         merged = merged.drop(columns=["_parsed_date"], errors="ignore")
         if save_geojson:
             gj_path = os.path.join(output_dir, f"{base_name}_temporal_ndvi.geojson")
-            merged.to_file(gj_path, driver="GeoJSON")
+            reproject_geodataframe_to_wgs84(merged).to_file(gj_path, driver="GeoJSON")
             output_paths.append(gj_path)
         if save_gpkg:
             gpkg_path = os.path.join(output_dir, f"{base_name}_temporal_ndvi.gpkg")

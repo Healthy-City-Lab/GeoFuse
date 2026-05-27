@@ -388,10 +388,8 @@ class NDVIEngine:
         The output GeoPackage carries the raster's native CRS (planar
         UTM/LCC for our pipeline) so its X/Y columns are already in metres
         on the engine's pixel grid. GeoJSON output (when requested) is
-        materialised at the end from the GeoPackage — it has no streaming-
-        append story of its own, but anyone asking for GeoJSON at this
-        scale has already been warned in the UI that it's a compatibility-
-        only path.
+        materialised at the end from the GeoPackage and reprojected to
+        EPSG:4326 — the only output format that leaves the planar CRS.
         """
         if cancel_callback and cancel_callback():
             return {"status": "cancelled", "message": "Cancelled by user"}
@@ -410,7 +408,12 @@ class NDVIEngine:
             stream_target = geojson_path + ".tmp.gpkg"
             stream_target_is_temp = True
         else:
-            meta = {"crs": "EPSG:4326"}
+            try:
+                with rasterio.open(final_tif) as src:
+                    crs_str = str(src.crs) if src.crs is not None else None
+            except Exception:
+                crs_str = None
+            meta = {"crs": crs_str}
             if meta_extra:
                 meta.update(meta_extra)
             return {
@@ -528,13 +531,14 @@ class NDVIEngine:
                         pass
                 return {"status": "error", "message": "Raster is empty."}
 
-            # GeoJSON convert path: read the streamed GPKG back and dump.
-            # Acceptable for the UI's small / medium GeoJSON use case; the
-            # checkbox is documented as compatibility-only.
+            # GeoJSON is the one compatibility format that must ship in
+            # EPSG:4326 — stream into the planar GPKG first, then dump.
             if geojson_path:
                 try:
                     gdf_full = gpd.read_file(stream_target, layer=layer_name)
-                    gdf_full.to_file(geojson_path, driver="GeoJSON")
+                    reproject_geodataframe_to_wgs84(gdf_full).to_file(
+                        geojson_path, driver="GeoJSON"
+                    )
                 except Exception as e:
                     _log("WARN", f"GeoJSON conversion failed: {e}")
             if stream_target_is_temp and os.path.exists(stream_target):

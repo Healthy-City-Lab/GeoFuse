@@ -397,8 +397,8 @@ def render(output_dir: str, parent_dir: str) -> None:
         st.session_state.gvi_inspector_select = None
 
     # JobStore + executor + PanoCache are process-level singletons (see ui/services.py).
-    from services import get_job_executor, get_job_store, get_pano_cache
     from job_panel import render_sidebar_job_monitor
+    from services import get_job_executor, get_job_store, get_pano_cache
 
     store = get_job_store()
     executor = get_job_executor()

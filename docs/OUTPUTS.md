@@ -2,6 +2,12 @@
 
 All outputs are saved to `output_results/` by default.
 
+## CRS policy
+
+Every per-engine output — GeoTIFF, GeoPackage, per-cluster tiles, sample-at-features GPKG, temporal GPKG, fusion composite raster — is written in the **engine-selected planar CRS** (UTM / LCC / Polar Stereographic chosen by `geofuse.crs_utils.select_grid_crs` from the input geometry). Cells stay square in metres, the index values never pass through a resampler, and downstream consumers don't have to reproject before sampling. The exact CRS used for a run is recorded in the matching `_gvi.json` / `_ndvi.json` sidecar (`grid_crs_wkt` / `export_crs_wkt`) and embedded in every non-GeoJSON file.
+
+**Exception — GeoJSON:** `*_gvi.geojson`, `*_ndvi.geojson`, and `*_temporal_ndvi.geojson` are reprojected to **EPSG:4326** at write time. The format has no reliable CRS metadata, so these files always ship as lon/lat degrees. Use GeoPackage for analysis in the planar CRS.
+
 ---
 
 ## GVI Engine Outputs
@@ -10,18 +16,21 @@ For each input file processed through the GVI pipeline. You choose which of the 
 
 ### `[Filename]_gvi.gpkg` (canonical, default)
 
-GeoPackage with layer `gvi_samples` — EPSG:4326 point geometries:
+GeoPackage with layer `gvi_samples` in the engine-selected **planar CRS**
+(UTM / LCC / Polar Stereographic — same CRS the per-cluster tiles and the
+`_gvi.json` sidecar `grid_crs_wkt` field reference, so points lie exactly
+on the planar pixel grid). Lat/lon stay available as data columns:
 
 | Field | Description |
 |-------|-------------|
 | `gvi_veg` | Green View Index — Vegetation (%) |
 | `gvi_ter` | Green View Index — Terrain (%) |
 | `pano_id` | Google Street View panorama identifier |
-| `lat`, `lon` | Geographic coordinates |
+| `lat`, `lon` | Geographic coordinates of the source panorama |
 | `row`, `col` | Position on the shared anchored grid (cells across clusters are on one global grid) |
 | `cluster_id` | Spatial cluster the point belongs to (0-indexed) |
 
-This is the recommended format for large or geographically scattered study areas. GeoPackage is sparse on disk, opens in QGIS, GeoPandas, and ogr2ogr, and avoids the mostly-empty cells that would dominate a single bbox-wide raster.
+This is the recommended format for large or geographically scattered study areas. GeoPackage is sparse on disk, opens in QGIS, GeoPandas, and ogr2ogr, and avoids the mostly-empty cells that would dominate a single bbox-wide raster. QGIS / ArcGIS / GeoPandas all read the embedded CRS automatically.
 
 ### `[Filename]_gvi.json` (sidecar)
 
@@ -43,7 +52,7 @@ Tiles are written in the auto-selected projected CRS (UTM / LCC / Polar Stereogr
 
 ### `[Filename]_gvi.geojson` (optional, GeoJSON on)
 
-Same point data as the GeoPackage. Kept for compatibility with tools that don't read GeoPackage. A warning is logged if the file exceeds 100,000 points (GeoJSON read performance degrades quickly past that).
+Same point data as the GeoPackage, reprojected to **EPSG:4326** at write time for compatibility with web map libraries and tools that assume lon/lat degrees. Use the GeoPackage when you need the planar CRS.
 
 ### Optional Debug Outputs
 
@@ -87,12 +96,12 @@ kept low.
 
 ### `[Filename]_ndvi.geojson` (optional)
 
-Vector point data with:
+Vector point data in **EPSG:4326** (reprojected from the planar GeoPackage stream at write time):
 
 | Field | Description |
 |-------|-------------|
 | `NDVI` | Normalized Difference Vegetation Index (−1 to 1) |
-| `x`, `y` | Coordinates in the raster's planar CRS, metres |
+| geometry | Point coordinates in lon/lat degrees |
 | `ndvi_date` | Source date (attribute-column mode only) |
 
 ### `[Filename]_ndvi_at_features.gpkg` (optional)
