@@ -1785,6 +1785,7 @@ class MetricFusionEngine:
         self,
         progress_callback: Callable[[int, int], None] | None = None,
         cancel_callback: Callable[[], bool] | None = None,
+        max_workers: int | None = None,
     ) -> bool:
         """Build (or reuse/resume) the on-disk per-(entity, radius) stat cache.
 
@@ -1899,14 +1900,11 @@ class MetricFusionEngine:
             progress_callback(done0, n_points)
 
         batch_size = 1024
-        for bs in range(0, len(pending), batch_size):
-            if cancel_callback is not None and cancel_callback():
-                _log("WARN", "Pre-aggregation cancelled (resumable).")
-                self._preaggregation_done = False
-                cache.close()
-                return False
+        batches = [
+            pending[i : i + batch_size] for i in range(0, len(pending), batch_size)
+        ]
 
-            bids = pending[bs : bs + batch_size]
+        def _compute_batch(bids: list[int]):
             bpos = np.fromiter(
                 (pos_of[e] for e in bids), dtype=np.int64, count=len(bids)
             )
@@ -1924,10 +1922,65 @@ class MetricFusionEngine:
                     channel_stats[ch] = preaggregation.raster_batch_stats(
                         array, transform, px_m, xy_r[bpos], radii
                     )
-            cache.write_batch(bids, channel_stats)
+            return bids, channel_stats
 
+        if max_workers is None:
+            max_workers = max(1, min((os.cpu_count() or 2), 8))
+        max_workers = max(1, min(max_workers, len(batches) or 1))
+        _log("INFO", f"Pre-aggregation workers: {max_workers}")
+
+        # Worker threads do the compute (BallTree queries / numpy stats release
+        # the GIL and share the read-only metric indices in memory — no pickling,
+        # which matters for national-scale rasters); the SQLite writes stay on this
+        # thread so there is a single writer and the build remains resumable.
+        processed = done0
+        cancelled = False
+
+        def _on_done(bids, channel_stats) -> None:
+            nonlocal processed
+            cache.write_batch(bids, channel_stats)
+            processed += len(bids)
             if progress_callback is not None:
-                progress_callback(done0 + bs + len(bids), n_points)
+                progress_callback(processed, n_points)
+
+        if max_workers == 1:
+            for bids in batches:
+                if cancel_callback is not None and cancel_callback():
+                    cancelled = True
+                    break
+                _on_done(*_compute_batch(bids))
+        else:
+            from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                it = iter(batches)
+                in_flight = {
+                    ex.submit(_compute_batch, b)
+                    for b in (
+                        next(it, None) for _ in range(min(2 * max_workers, len(batches)))
+                    )
+                    if b is not None
+                }
+                while in_flight:
+                    if cancel_callback is not None and cancel_callback():
+                        cancelled = True
+                        for fut in in_flight:
+                            fut.cancel()
+                        break
+                    done, in_flight = wait(
+                        in_flight, timeout=0.5, return_when=FIRST_COMPLETED
+                    )
+                    for fut in done:
+                        _on_done(*fut.result())
+                        nb = next(it, None)
+                        if nb is not None:
+                            in_flight.add(ex.submit(_compute_batch, nb))
+
+        if cancelled:
+            _log("WARN", "Pre-aggregation cancelled (resumable).")
+            self._preaggregation_done = False
+            cache.close()
+            return False
 
         cache.mark_complete()
         self._preaggr_cache = cache

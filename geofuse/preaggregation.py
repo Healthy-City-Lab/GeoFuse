@@ -360,8 +360,8 @@ class PreAggregationCache:
 
         key = (channel, radius, column)
         with self._lock:
-            series = self._col_cache.get(key)
-            if series is None:
+            entry = self._col_cache.get(key)
+            if entry is None:
                 rows = self._conn.execute(
                     f"SELECT entity_id, {column} FROM {channel} WHERE radius = ?",
                     (radius,),
@@ -371,28 +371,26 @@ class PreAggregationCache:
                 ids = np.fromiter((r[0] for r in rows), dtype=np.int64, count=len(rows))
                 vals = np.fromiter(
                     (np.nan if r[1] is None else r[1] for r in rows),
-                    dtype=np.float64,
+                    dtype=np.float32,
                     count=len(rows),
                 )
-                series = {"ids": ids, "vals": vals, "map": None}
-                self._col_cache[key] = series
+                # Store sorted-by-id so lookups vectorise via ``searchsorted``.
+                order = np.argsort(ids, kind="stable")
+                entry = (ids[order], vals[order])
+                self._col_cache[key] = entry
                 if len(self._col_cache) > _COLUMN_CACHE_MAX:
                     self._col_cache.popitem(last=False)
             else:
                 self._col_cache.move_to_end(key)
+            sorted_ids, sorted_vals = entry
 
-            id_map = series["map"]
-            if id_map is None:
-                id_map = {int(i): j for j, i in enumerate(series["ids"])}
-                series["map"] = id_map
-            vals = series["vals"]
-
-        req = np.asarray(entity_ids)
+        req = np.asarray(entity_ids).astype(np.int64, copy=False)
         out = np.full(req.shape[0], np.nan, dtype=np.float32)
-        for k, e in enumerate(req):
-            pos = id_map.get(int(e))
-            if pos is not None:
-                out[k] = vals[pos]
+        if sorted_ids.size:
+            pos = np.searchsorted(sorted_ids, req)
+            pos_clip = np.clip(pos, 0, sorted_ids.size - 1)
+            valid = sorted_ids[pos_clip] == req
+            out[valid] = sorted_vals[pos_clip[valid]]
         return out
 
     def close(self) -> None:
