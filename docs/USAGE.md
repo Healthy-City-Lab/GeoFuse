@@ -28,7 +28,7 @@ streamlit run ui/app.py
 4. Inspect the composite greenery weights and export results.
 
 > [!NOTE]
-> Long-running jobs survive browser refresh. **GVI runs in a separate Python process** so the UI stays responsive (and the GPU stays fed) even while the browser tab is in the foreground. **NDVI** and **Fusion** run inside the Streamlit process. Progress is tracked in the **sidebar Job Monitor** on the GVI tab, which is visible from all tabs. Multiple study areas with different settings (resolution, buffer, dates) can run in parallel as separate jobs.
+> Long-running jobs survive browser refresh. **GVI runs in a separate Python process** so the UI stays responsive (and the GPU stays fed) even while the browser tab is in the foreground. **NDVI** and **Fusion** run inside the Streamlit process. Progress is tracked in the **sidebar Job Monitor** (rendered by `ui/job_panel.py`), which is visible from all tabs and shows every job type — GVI, NDVI, NDVI-from-column, and Fusion. Multiple study areas with different settings (resolution, buffer, dates) can run in parallel as separate jobs.
 
 #### Resuming after a crash or restart
 

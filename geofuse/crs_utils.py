@@ -8,6 +8,7 @@ which matches Leaflet/Folium and ``generate_raster_grid`` in ``geofuse.core``.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 
 import geopandas as gpd
@@ -16,7 +17,12 @@ import rasterio
 from pyproj import CRS as PyProjCRS
 from pyproj import Geod, Transformer
 from rasterio.transform import array_bounds, from_bounds
-from rasterio.warp import Resampling, calculate_default_transform, reproject
+from rasterio.warp import (
+    Resampling,
+    calculate_default_transform,
+    reproject,
+    transform_bounds,
+)
 from rasterio.warp import transform as rio_warp_transform
 from rasterio.windows import from_bounds as window_from_bounds
 from rasterio.windows import transform as window_transform
@@ -71,7 +77,7 @@ def select_grid_crs_with_warning(
     return crs, float(distortion), choice_name
 
 
-def default_geotiff_creation_options(dtype) -> dict:
+def default_geotiff_creation_options(dtype, *, sparse: bool = False) -> dict:
     """Compression / tiling / BIGTIFF defaults for our GeoTIFF outputs.
 
     Applied by every helper that writes a GeoTIFF (``reproject_raster_to_wgs84``,
@@ -85,9 +91,13 @@ def default_geotiff_creation_options(dtype) -> dict:
       * ``3`` (floating-point predictor) for ``float32`` / ``float64`` rasters
         — handles NDVI's continuous values well.
       * ``2`` (horizontal differencing) for integer rasters.
+
+    Pass ``sparse=True`` to enable ``SPARSE_OK``, which lets libtiff omit
+    blocks whose pixels are all zero or all the nodata value. Useful for
+    buffered-AOI outputs where most of the bounding box is empty.
     """
     predictor = 3 if np.issubdtype(np.dtype(dtype), np.floating) else 2
-    return {
+    opts = {
         "compress": "DEFLATE",
         "predictor": predictor,
         "tiled": True,
@@ -95,40 +105,49 @@ def default_geotiff_creation_options(dtype) -> dict:
         "blockysize": 256,
         "BIGTIFF": "YES",
     }
+    if sparse:
+        opts["SPARSE_OK"] = "TRUE"
+    return opts
+
+
+def raster_geographic_bounds(
+    raster_path: str,
+) -> tuple[float, float, float, float] | None:
+    """Return the raster's bounding box in EPSG:4326 as ``(left, bottom, right, top)``.
+
+    Returns ``None`` if the file cannot be opened or has no declared CRS.
+    Used by sidecar / tile-index writers that want a geographic locator
+    alongside the raster's native-CRS extent.
+    """
+    try:
+        with rasterio.open(raster_path) as src:
+            if src.crs is None:
+                return None
+            left, bottom, right, top = transform_bounds(
+                src.crs, WGS84_EPSG, *src.bounds
+            )
+            return float(left), float(bottom), float(right), float(top)
+    except Exception:
+        return None
 
 
 def build_internal_overviews(
     path: str,
-    factors: tuple[int, ...] = (2, 4, 8, 16, 32),
+    factors: tuple[int, ...] = (2, 4, 8),
     resampling: Resampling = Resampling.average,
 ) -> None:
     """Add internal overview pyramids to an existing GeoTIFF in place.
 
-    Overviews make map previews (Folium, QGIS) and zoomed-out raster reads
-    near-instant; the on-disk overhead is ~33 % for a 2× pyramid down to
-    32×. Default resampling is ``average``.
+    Three levels (2×, 4×, 8×) give Folium / QGIS previews snappy zoom-out
+    without doubling write time on national-scale rasters. Default
+    resampling is ``average``.
 
-    GDAL silently drops factors that would shrink the raster below 1 px, so
-    passing a generous default tuple is safe even for small tiles.
+    GDAL drops factors that would shrink the raster below 1 px, so the
+    default tuple is safe for small tiles too.
     """
     with rasterio.open(path, "r+") as dst:
         dst.build_overviews(list(factors), resampling)
         dst.update_tags(ns="rio_overview", resampling=resampling.name)
-
-
-def crs_to_ee_string(crs) -> str:
-    """Earth-Engine-friendly CRS string: prefer ``EPSG:<n>``, fall back to WKT.
-
-    EE accepts WKT for non-standard projections (the LCC / Polar Stereographic
-    that :func:`select_grid_crs` synthesises for wide-span or polar extents),
-    so every CRS this module returns can be passed through to
-    ``ee_export_image``. Lives here next to the CRS-selection logic so the EE
-    wrapping is one tidy unit.
-    """
-    epsg = crs.to_epsg()
-    if epsg is not None:
-        return f"EPSG:{epsg}"
-    return crs.to_wkt()
 
 
 def stream_mosaic_to_geotiff(
@@ -139,6 +158,7 @@ def stream_mosaic_to_geotiff(
     resampling: Resampling = Resampling.bilinear,
     progress_cb: Callable[[int, int], None] | None = None,
     build_overviews: bool = True,
+    compress: bool = True,
 ) -> int:
     """Stream-mosaic same-CRS GeoTIFF tiles into one output via windowed writes.
 
@@ -153,6 +173,11 @@ def stream_mosaic_to_geotiff(
     ``progress_cb(k, n)`` fires after each tile lands; pass it to mirror
     download-phase progress into the mosaic phase. Returns the number of
     tiles written.
+
+    Set ``compress=False`` for ephemeral intermediate mosaics that are read
+    once and deleted (e.g. the planar mosaic feeding a WGS84 reproject).
+    Skipping DEFLATE saves write time and lets the downstream reader scan
+    the file without per-block decompression.
     """
     if not tile_paths:
         raise ValueError("stream_mosaic_to_geotiff: tile_paths is empty.")
@@ -195,7 +220,18 @@ def stream_mosaic_to_geotiff(
         "transform": out_transform,
         "nodata": nodata,
     }
-    dst_profile.update(default_geotiff_creation_options(ref["dtype"]))
+    if compress:
+        dst_profile.update(default_geotiff_creation_options(ref["dtype"], sparse=True))
+    else:
+        dst_profile.update(
+            {
+                "tiled": True,
+                "blockxsize": 256,
+                "blockysize": 256,
+                "BIGTIFF": "YES",
+                "SPARSE_OK": "TRUE",
+            }
+        )
 
     n = len(tile_profiles)
     written = 0
@@ -252,90 +288,101 @@ def reproject_raster_to_wgs84(
     *,
     target_resolution_m: float,
     resampling: Resampling = Resampling.bilinear,
-    build_overviews: bool = False,
     src_nodata: float | None = None,
     dst_nodata: float | None = None,
+    num_threads: int | None = None,
+    block_size: int = 512,
+    warp_mem_limit_mb: int = 2048,
+    gdal_cachemax_mb: int = 2048,
 ) -> None:
-    """Reproject a planar-CRS GeoTIFF to EPSG:4326 with per-latitude aspect-ratio correction.
+    """Reproject a planar-CRS GeoTIFF to EPSG:4326 in a single GDAL warp call.
 
-    Earth Engine (and any other producer that writes in a metre-based CRS such
-    as UTM, LCC, or Polar Stereographic) places pixels on a square-metre grid.
-    A naive reprojection to geographic coordinates yields rectangular pixels
-    because a degree of longitude is shorter than a degree of latitude. This
-    function derives the exact metres-per-degree ratio at the tile's centroid
-    latitude (via :func:`metres_per_degree_at_lat`) and forces an explicit
-    square-metre output resolution.
+    Drives the same warp kernel that ``gdalwarp`` / QGIS use, in-process
+    and end-to-end: one :func:`rasterio.warp.reproject` call per band with
+    ``source=rasterio.band(src, b)`` and ``destination=rasterio.band(dst, b)``.
+    GDAL streams blocks internally on ``num_threads`` worker threads,
+    ``SPARSE_OK=TRUE`` keeps fully-nodata blocks off disk, and
+    ``src_nodata`` / ``dst_nodata`` propagate through the resampler so
+    bilinear does not bleed the sentinel into edge pixels.
 
-    Defaults to bilinear resampling — appropriate for continuous bands like
-    NDVI. Pass ``resampling=Resampling.nearest`` for QA / classification bands.
+    No overview pyramids are built. For float-nodata sparse rasters
+    GDAL's overview builder reads sparse blocks as nodata, which the
+    `average` resampler then mixes with valid pixels to produce
+    misleading level-0 values, and the pass adds tens of minutes to
+    national-scale runs. Call :func:`build_internal_overviews` on the
+    finished file if a specific consumer needs them.
 
-    The destination GeoTIFF picks up the shared compression / tiling defaults
-    (``DEFLATE`` + float-aware predictor + 256×256 internal tiling + BIGTIFF).
-    ``build_overviews`` is **off by default** because this helper is also
-    used for intermediate per-tile cache files (where overviews would be
-    wasted disk). Final outputs (single-area NDVI download) pass
-    ``build_overviews=True``.
+    Defaults to bilinear resampling — appropriate for continuous bands
+    like NDVI. Pass ``resampling=Resampling.nearest`` for QA /
+    classification bands.
 
-    ``src_nodata`` and ``dst_nodata`` are forwarded to the underlying
-    :func:`rasterio.warp.reproject`. **Pass them explicitly** when the
-    source uses a sentinel like ``-9999`` for masked pixels — without them,
-    bilinear resampling will interpolate the sentinel into edge pixels and
-    produce nonsense values (e.g. NDVI ``-1`` at tile borders).
+    Geometry note: pixels end up roughly square in **ground metres** at
+    the centroid latitude (``res_*_deg = target_resolution_m /
+    m_per_deg_*``). EPSG:4326 is a geographic CRS so the corresponding
+    **degree** resolution is rectangular — one degree of longitude is
+    ``cos(lat)`` shorter than one degree of latitude, so the lon/lat
+    degree-per-pixel ratio sits at ~1.3-1.7 at mid-latitudes. QGIS
+    displays pixel size as ``degrees × 111139`` without the cos-lat
+    correction, which reads as "wider in EW than NS" even though the
+    on-ground spacing is square at the centroid.
     """
-    with rasterio.open(src_path) as src:
-        left, bottom, right, top = array_bounds(src.height, src.width, src.transform)
-        cx, cy = (left + right) / 2, (bottom + top) / 2
-        lon_c, lat_c = rio_warp_transform(src.crs, WGS84_EPSG, [cx], [cy])
-        avg_lat = lat_c[0]
+    if num_threads is None:
+        num_threads = max(1, os.cpu_count() or 1)
 
-        m_per_deg_lon, m_per_deg_lat = metres_per_degree_at_lat(avg_lat)
-        res_x_deg = target_resolution_m / m_per_deg_lon
-        res_y_deg = target_resolution_m / m_per_deg_lat
+    with rasterio.Env(GDAL_CACHEMAX=int(gdal_cachemax_mb)):
+        with rasterio.open(src_path) as src:
+            left, bottom, right, top = array_bounds(
+                src.height, src.width, src.transform
+            )
+            cx, cy = (left + right) / 2, (bottom + top) / 2
+            transformed = rio_warp_transform(src.crs, WGS84_EPSG, [cx], [cy])
+            avg_lat = transformed[1][0]
 
-        dst_transform, width, height = calculate_default_transform(
-            src.crs,
-            WGS84_EPSG,
-            src.width,
-            src.height,
-            *src.bounds,
-            resolution=(res_x_deg, res_y_deg),
-        )
+            m_per_deg_lon, m_per_deg_lat = metres_per_degree_at_lat(avg_lat)
+            res_x_deg = target_resolution_m / m_per_deg_lon
+            res_y_deg = target_resolution_m / m_per_deg_lat
 
-        kwargs = src.meta.copy()
-        kwargs.update(
-            {
-                "crs": WGS84_EPSG,
-                "transform": dst_transform,
-                "width": width,
-                "height": height,
-            }
-        )
-        # Stamp the dst nodata on the file metadata so downstream readers
-        # (and the overview builder) treat the sentinel correctly.
-        if dst_nodata is not None:
-            kwargs["nodata"] = dst_nodata
-        kwargs.update(default_geotiff_creation_options(src.dtypes[0]))
+            dst_transform, width, height = calculate_default_transform(
+                src.crs,
+                WGS84_EPSG,
+                src.width,
+                src.height,
+                *src.bounds,
+                resolution=(res_x_deg, res_y_deg),
+            )
+            assert width is not None and height is not None
+            width = int(width)
+            height = int(height)
 
-        with rasterio.open(dst_path, "w", **kwargs) as dst:
-            for i in range(1, src.count + 1):
-                reproject(
-                    source=rasterio.band(src, i),
-                    destination=rasterio.band(dst, i),
-                    src_transform=src.transform,
-                    src_crs=src.crs,
-                    dst_transform=dst_transform,
-                    dst_crs=WGS84_EPSG,
-                    resampling=resampling,
-                    src_nodata=src_nodata,
-                    dst_nodata=dst_nodata,
-                )
+            dst_kwargs = src.meta.copy()
+            dst_kwargs.update(
+                {
+                    "crs": WGS84_EPSG,
+                    "transform": dst_transform,
+                    "width": width,
+                    "height": height,
+                }
+            )
+            if dst_nodata is not None:
+                dst_kwargs["nodata"] = dst_nodata
+            dst_kwargs.update(
+                default_geotiff_creation_options(src.dtypes[0], sparse=True)
+            )
+            dst_kwargs["blockxsize"] = block_size
+            dst_kwargs["blockysize"] = block_size
+            dst_kwargs["NUM_THREADS"] = str(num_threads)
 
-    if build_overviews:
-        try:
-            build_internal_overviews(dst_path)
-        except Exception:
-            # Non-fatal: the base raster is still valid without overviews.
-            pass
+            with rasterio.open(dst_path, "w", **dst_kwargs) as dst:
+                for b in range(1, src.count + 1):
+                    reproject(
+                        source=rasterio.band(src, b),
+                        destination=rasterio.band(dst, b),
+                        resampling=resampling,
+                        src_nodata=src_nodata,
+                        dst_nodata=dst_nodata,
+                        num_threads=num_threads,
+                        warp_mem_limit=warp_mem_limit_mb,
+                    )
 
 
 def _raise_if_geographic_coords_outside_degree_range(gdf: gpd.GeoDataFrame) -> None:

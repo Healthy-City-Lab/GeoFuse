@@ -2,6 +2,12 @@
 
 All outputs are saved to `output_results/` by default.
 
+## CRS policy
+
+Every per-engine output — GeoTIFF, GeoPackage, per-cluster tiles, sample-at-features GPKG, temporal GPKG, fusion composite raster — is written in the **engine-selected planar CRS** (UTM / LCC / Polar Stereographic chosen by `geofuse.crs_utils.select_grid_crs` from the input geometry). Cells stay square in metres, the index values never pass through a resampler, and downstream consumers don't have to reproject before sampling. The exact CRS used for a run is recorded in the matching `_gvi.json` / `_ndvi.json` sidecar (`grid_crs_wkt` / `export_crs_wkt`) and embedded in every non-GeoJSON file.
+
+**Exception — GeoJSON:** `*_gvi.geojson`, `*_ndvi.geojson`, and `*_temporal_ndvi.geojson` are reprojected to **EPSG:4326** at write time. The format has no reliable CRS metadata, so these files always ship as lon/lat degrees. Use GeoPackage for analysis in the planar CRS.
+
 ---
 
 ## GVI Engine Outputs
@@ -10,18 +16,21 @@ For each input file processed through the GVI pipeline. You choose which of the 
 
 ### `[Filename]_gvi.gpkg` (canonical, default)
 
-GeoPackage with layer `gvi_samples` — EPSG:4326 point geometries:
+GeoPackage with layer `gvi_samples` in the engine-selected **planar CRS**
+(UTM / LCC / Polar Stereographic — same CRS the per-cluster tiles and the
+`_gvi.json` sidecar `grid_crs_wkt` field reference, so points lie exactly
+on the planar pixel grid). Lat/lon stay available as data columns:
 
 | Field | Description |
 |-------|-------------|
 | `gvi_veg` | Green View Index — Vegetation (%) |
 | `gvi_ter` | Green View Index — Terrain (%) |
 | `pano_id` | Google Street View panorama identifier |
-| `lat`, `lon` | Geographic coordinates |
+| `lat`, `lon` | Geographic coordinates of the source panorama |
 | `row`, `col` | Position on the shared anchored grid (cells across clusters are on one global grid) |
 | `cluster_id` | Spatial cluster the point belongs to (0-indexed) |
 
-This is the recommended format for large or geographically scattered study areas. GeoPackage is sparse on disk, opens in QGIS, GeoPandas, and ogr2ogr, and avoids the mostly-empty cells that would dominate a single bbox-wide raster.
+This is the recommended format for large or geographically scattered study areas. GeoPackage is sparse on disk, opens in QGIS, GeoPandas, and ogr2ogr, and avoids the mostly-empty cells that would dominate a single bbox-wide raster. QGIS / ArcGIS / GeoPandas all read the embedded CRS automatically.
 
 ### `[Filename]_gvi.json` (sidecar)
 
@@ -36,14 +45,14 @@ One dense GeoTIFF per spatial cluster — instead of one huge mostly-empty raste
   cluster_0000.tif   # 2-band: Band 1 = Vegetation GVI, Band 2 = Terrain GVI
   cluster_0001.tif
   ...
-  tiles_index.json   # bbox in grid CRS and WGS84 + grid CRS WKT for each tile
+  tiles_index.json   # planar bbox + EPSG:4326 locator + grid CRS WKT per tile
 ```
 
-Tiles are written in the auto-selected projected CRS (UTM / LCC / Polar Stereographic) — not WGS84 — so cells stay square in metres and no resampling is involved. Open `tiles_index.json` to reproject or merge on demand.
+Tiles are written in the auto-selected projected CRS (UTM / LCC / Polar Stereographic) — not WGS84 — so cells stay square in metres and no resampling is involved. Each file uses DEFLATE + float predictor + `SPARSE_OK=TRUE`, so the all-NaN majority of the raster costs zero bytes on disk; no overview pyramids are pre-built (open in QGIS / ArcGIS to generate local pyramids on demand). Each `tiles_index.json` entry carries the native-CRS `bbox_grid_crs` and a derived `bounds_4326` so downstream tools can locate a tile geographically without re-reading the raster.
 
 ### `[Filename]_gvi.geojson` (optional, GeoJSON on)
 
-Same point data as the GeoPackage. Kept for compatibility with tools that don't read GeoPackage. A warning is logged if the file exceeds 100,000 points (GeoJSON read performance degrades quickly past that).
+Same point data as the GeoPackage, reprojected to **EPSG:4326** at write time for compatibility with web map libraries and tools that assume lon/lat degrees. Use the GeoPackage when you need the planar CRS.
 
 ### Optional Debug Outputs
 
@@ -66,24 +75,33 @@ For each input file / date range processed through the NDVI pipeline. Defaults: 
 
 ### `[Filename]_ndvi.tif` (default)
 
-Two-band GeoTIFF (EPSG:4326):
+Single-band GeoTIFF in the engine-selected **planar CRS** (UTM / LCC /
+Polar Stereographic — same family used by the GVI tiles, chosen by
+`select_grid_crs` to keep pixels square in metres):
 
 * **Band 1 (`NDVI`, float32)**: median NDVI over the date range, after cloud masking.
-* **Band 2 (`valid_obs`, uint16)**: per-pixel count of cloud-free observations that contributed to the median. You can reject pixels below your minimum-observation threshold downstream.
-* NoData value: `−9999` on band 1.
+* NoData value: `−9999`.
+
+The raster has no WGS84 reprojection step — it ships in the same CRS the Earth
+Engine tiles were exported in, so every pixel is a true 10 m × 10 m square on
+the ground. The exact CRS for the run is recorded in the `_ndvi.json` sidecar
+(`export_crs`, `export_crs_wkt`) and in each output's own embedded CRS tag.
 
 ### `[Filename]_ndvi.gpkg` (optional)
 
-GeoPackage with layer `ndvi_samples` (EPSG:4326) — same per-point data as the GeoJSON form, but loads orders of magnitude faster for large extents. Written via streaming block iteration so peak memory usage is kept low.
+GeoPackage with layer `ndvi_samples` in the raster's planar CRS — same
+per-point data as the GeoJSON form, but loads orders of magnitude faster for
+large extents. Written via streaming block iteration so peak memory usage is
+kept low.
 
 ### `[Filename]_ndvi.geojson` (optional)
 
-Vector point data with:
+Vector point data in **EPSG:4326** (reprojected from the planar GeoPackage stream at write time):
 
 | Field | Description |
 |-------|-------------|
 | `NDVI` | Normalized Difference Vegetation Index (−1 to 1) |
-| `x`, `y` | Geographic coordinates (EPSG:4326) |
+| geometry | Point coordinates in lon/lat degrees |
 | `ndvi_date` | Source date (attribute-column mode only) |
 
 ### `[Filename]_ndvi_at_features.gpkg` (optional)
@@ -103,12 +121,14 @@ Per-cluster GeoTIFF tile directory, written when the **Per-cluster tiles**
 output is enabled. Avoids the giant mostly-NaN single mosaic that scattered
 national-scale inputs would otherwise produce. Contents:
 
-* `cluster_NNNN.tif` — one EPSG:4326 GeoTIFF per connected component of the
-  buffered input geometry, sized to the cluster's bbox.
+* `cluster_NNNN.tif` — one planar-CRS GeoTIFF per connected component of the
+  buffered input geometry, sized to the cluster's bbox. Same CRS as the main
+  `_ndvi.tif`.
 * `tiles_index.json` — `{crs, export_crs, export_crs_name, resume_key,
-  n_clusters, clusters: [{cluster_id, path, bounds_4326, n_tiles}, …]}`
-  so downstream tools can pick the right cluster file without reopening
-  every raster.
+  n_clusters, clusters: [{cluster_id, path, bounds, bounds_4326, n_tiles}, …]}`.
+  Each entry carries the cluster's native-CRS extent in `bounds` and a
+  derived geographic locator in `bounds_4326`, so downstream tools can pick
+  the right cluster file without reopening every raster.
 
 ### `[Filename]_ndvi.json` (always written on success)
 
@@ -126,7 +146,7 @@ introspect a raster after the fact without re-running Earth Engine:
 | `used_start_date` / `used_end_date` / `coverage_widened` | Date range actually queried (may be wider than the user's request if coverage rescue fired). `coverage_widened: true` flags that the composite spans a bigger window than requested |
 | `cloud_max` / `n_cloud_filtered_images` | Cloud-percentage threshold + how many images survived it |
 | `resolution_m` / `max_tile_size_km` | Export resolution and tiling cap |
-| `satellite` / `ee_collection` / `bands` | `'sentinel2'` or `'landsat'` (auto-picked by date range), the ImageCollection ID actually queried, and the list of bands in the GeoTIFF (`["NDVI", "valid_obs"]`) |
+| `satellite` / `ee_collection` / `bands` | `'sentinel2'` or `'landsat'` (auto-picked by date range), the ImageCollection ID actually queried, and the list of bands in the GeoTIFF (`["NDVI"]`) |
 
 ---
 

@@ -20,20 +20,38 @@
 
 	function moveTabsToToolbar() {
 		var toolbar = d.querySelector("[data-testid='stToolbar']");
-		var tabList = d.querySelector("[data-baseweb='tab-list']");
-		if (!toolbar || !tabList) return;
-		if (toolbar.contains(tabList)) return;
-		// Streamlit's toolbar layout is:
-		//   <stToolbar><div wrapper><div left-slot/><div right-slot/></div></stToolbar>
-		// The left slot is intentionally empty -- drop the tab list into it
-		// so Deploy / overflow stay on the right.
+		if (!toolbar) return;
+
+		var allTabLists = d.querySelectorAll("[data-baseweb='tab-list']");
+		if (allTabLists.length === 0) return;
+
+		// Prefer a tab-list that lives outside the toolbar — it is the one
+		// React just rendered. The stale copy we moved on a prior run is
+		// already inside the toolbar but is now orphaned from React's vDOM,
+		// so React created a new one in the main body instead of updating it.
+		var fresh = null;
+		for (var i = 0; i < allTabLists.length; i++) {
+			if (!toolbar.contains(allTabLists[i])) {
+				fresh = allTabLists[i];
+				break;
+			}
+		}
+		if (!fresh) return; // all tab-lists already in toolbar — nothing to do
+
+		// Remove stale copies left behind in the toolbar by a prior rerun.
+		for (var j = 0; j < allTabLists.length; j++) {
+			if (toolbar.contains(allTabLists[j])) {
+				allTabLists[j].remove();
+			}
+		}
+
 		var inner = toolbar.firstElementChild;
 		if (!inner) return;
 		var leftSlot = inner.firstElementChild;
 		if (leftSlot) {
-			leftSlot.appendChild(tabList);
+			leftSlot.appendChild(fresh);
 		} else {
-			inner.insertBefore(tabList, inner.firstChild);
+			inner.insertBefore(fresh, inner.firstChild);
 		}
 	}
 
@@ -65,31 +83,75 @@
 		var toolbar = d.querySelector("[data-testid='stToolbar']");
 		var inner = toolbar && toolbar.firstElementChild;
 		var leftSlot = inner && inner.firstElementChild;
-		var floater = d.querySelector(".gf-sidebar-floater");
-		if (!leftSlot || !floater) return;
-		if (floater.parentElement === leftSlot && floater === leftSlot.firstElementChild) return;
-		leftSlot.insertBefore(floater, leftSlot.firstElementChild);
+		if (!leftSlot) return;
+
+		var allFloaters = d.querySelectorAll(".gf-sidebar-floater");
+		if (allFloaters.length === 0) return;
+
+		// Prefer a floater outside the left slot — it is the one Streamlit
+		// just rendered. The stale copy (moved on a prior run) is in leftSlot
+		// but orphaned from Streamlit's render tree.
+		var fresh = null;
+		for (var i = 0; i < allFloaters.length; i++) {
+			if (allFloaters[i].parentElement !== leftSlot) {
+				fresh = allFloaters[i];
+				break;
+			}
+		}
+
+		if (fresh) {
+			// Evict stale copies from the left slot before inserting the fresh one.
+			var stale = leftSlot.querySelectorAll(".gf-sidebar-floater");
+			for (var j = 0; j < stale.length; j++) {
+				stale[j].remove();
+			}
+			leftSlot.insertBefore(fresh, leftSlot.firstElementChild);
+			return;
+		}
+
+		// All floaters are already in the left slot; make sure one is first.
+		var existing = leftSlot.querySelector(".gf-sidebar-floater");
+		if (existing && existing !== leftSlot.firstElementChild) {
+			leftSlot.insertBefore(existing, leftSlot.firstElementChild);
+		}
 	}
 
+	var _sidebarToggleBound = false;
+
 	function bindSidebarToggle() {
-		d.querySelectorAll(".gf-sidebar-floater:not([data-gfsb])").forEach(function (el) {
-			el.setAttribute("data-gfsb", "1");
-			el.addEventListener("click", function (e) {
-				e.preventDefault();
-				e.stopPropagation();
-				toggleSidebar();
-			});
-			el.addEventListener("keydown", function (e) {
-				if (e.key === "Enter" || e.key === " ") {
+		if (_sidebarToggleBound) return;
+		_sidebarToggleBound = true;
+		d.addEventListener("click", function (e) {
+			var el = e.target;
+			while (el && el !== d.body) {
+				if (el.classList && el.classList.contains("gf-sidebar-floater")) {
+					e.preventDefault();
+					e.stopPropagation();
+					toggleSidebar();
+					return;
+				}
+				el = el.parentElement;
+			}
+		}, true);
+		d.addEventListener("keydown", function (e) {
+			if (e.key !== "Enter" && e.key !== " ") return;
+			var el = e.target;
+			while (el && el !== d.body) {
+				if (el.classList && el.classList.contains("gf-sidebar-floater")) {
 					e.preventDefault();
 					toggleSidebar();
+					return;
 				}
-			});
-		});
+				el = el.parentElement;
+			}
+		}, true);
 	}
 
 	function injectBrand() {
-		var tabList = d.querySelector("[data-baseweb='tab-list']");
+		// Scope to the toolbar so we inject into the moved tab-list, not a
+		// stale orphan or the pre-move copy in the main body.
+		var toolbar = d.querySelector("[data-testid='stToolbar']");
+		var tabList = toolbar && toolbar.querySelector("[data-baseweb='tab-list']");
 		if (!tabList) {
 			setTimeout(injectBrand, 200);
 			return;
@@ -102,7 +164,9 @@
 	}
 
 	function markMutedTab() {
-		var tabList = d.querySelector("[data-baseweb='tab-list']");
+		// Scope to the toolbar for the same reason as injectBrand.
+		var toolbar = d.querySelector("[data-testid='stToolbar']");
+		var tabList = toolbar && toolbar.querySelector("[data-baseweb='tab-list']");
 		if (!tabList) return;
 		var tabs = tabList.querySelectorAll("button[role='tab']");
 		for (var i = 0; i < tabs.length; i++) {
@@ -115,7 +179,8 @@
 
 	function apply() {
 		moveTabsToToolbar();
-		if (!d.querySelector("[data-baseweb='tab-list'] .gf-brand")) injectBrand();
+		var toolbar = d.querySelector("[data-testid='stToolbar']");
+		if (!toolbar || !toolbar.querySelector("[data-baseweb='tab-list'] .gf-brand")) injectBrand();
 		markMutedTab();
 		ensureFloaterButton();
 		placeFloater();

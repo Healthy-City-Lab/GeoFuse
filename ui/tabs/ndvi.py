@@ -1,7 +1,5 @@
-import base64
 import gc
 import glob
-import io
 import os
 from datetime import date, timedelta
 
@@ -23,7 +21,7 @@ from map_preview import (
     add_uniform_point_layer,
     trim_point_gdf_for_display,
 )
-from PIL import Image as PILImage
+from raster_overlay import add_mercator_image_overlay_from_file
 from shapely.geometry import box as shapely_box
 from streamlit_folium import st_folium
 
@@ -1054,57 +1052,30 @@ def render(output_dir: str) -> None:
                 rendered_from_tif = False
                 if os.path.exists(tif_path):
                     try:
-                        with rasterio.open(tif_path) as src:
-                            arr = src.read(1)
-
-                            from rasterio.warp import transform_bounds
-
-                            bounds_native = src.bounds
-                            src_crs = src.crs
-                            bounds_4326 = transform_bounds(
-                                src_crs, "EPSG:4326", *bounds_native
-                            )
-                            folium_bounds = [
-                                [bounds_4326[1], bounds_4326[0]],
-                                [bounds_4326[3], bounds_4326[2]],
-                            ]
-                            res_bounds.append(
-                                [
-                                    bounds_4326[0],
-                                    bounds_4326[1],
-                                    bounds_4326[2],
-                                    bounds_4326[3],
-                                ]
-                            )
-
-                            norm_data = np.clip((arr - (-0.2)) / (1.0 - (-0.2)), 0, 1)
-                            cmap = plt.get_cmap("RdYlGn")
-                            colored = cmap(norm_data)
-                            mask = (arr == -9999) | np.isnan(arr) | (arr == 0)
-                            colored[..., 3] = np.where(mask, 0, r_opacity)
-
-                            img_bytes = (colored * 255).astype(np.uint8)
-                            im = PILImage.fromarray(img_bytes)
-                            buff = io.BytesIO()
-                            im.save(buff, format="PNG")
-                            img_url = (
-                                f"data:image/png;base64,"
-                                f"{base64.b64encode(buff.getvalue()).decode()}"
-                            )
-
-                            folium.raster_layers.ImageOverlay(
-                                image=img_url,
-                                bounds=folium_bounds,
+                        # ``extra_nodata_values=(0,)`` because the NDVI
+                        # pipeline writes 0 as an undeclared sentinel at the
+                        # polygon edge; without it the polygon's outline
+                        # renders as a red halo at the bottom of the ramp.
+                        w_lon, s_lat, e_lon, n_lat = (
+                            add_mercator_image_overlay_from_file(
+                                m_ndvi_result,
+                                tif_path,
+                                cmap=plt.get_cmap("RdYlGn"),
+                                vmin=-0.2,
+                                vmax=1.0,
+                                extra_nodata_values=(0,),
                                 opacity=r_opacity,
                                 interactive=True,
-                            ).add_to(m_ndvi_result)
-                            folium.Rectangle(
-                                bounds=folium_bounds,
-                                color="red",
-                                weight=2,
-                                fill=False,
-                            ).add_to(m_ndvi_result)
-                            rendered_from_tif = True
+                            )
+                        )
+                        res_bounds.append([w_lon, s_lat, e_lon, n_lat])
+                        folium.Rectangle(
+                            bounds=[[s_lat, w_lon], [n_lat, e_lon]],
+                            color="red",
+                            weight=2,
+                            fill=False,
+                        ).add_to(m_ndvi_result)
+                        rendered_from_tif = True
                     except Exception as e:
                         print(f"Viz Error {ds_name}: {e}")
 
