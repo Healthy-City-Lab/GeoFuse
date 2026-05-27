@@ -31,8 +31,8 @@ import pandas as pd
 import rasterio
 
 from geofuse.crs_utils import (
-    build_internal_overviews,
     default_geotiff_creation_options,
+    raster_geographic_bounds,
     reproject_geodataframe_to_wgs84,
 )
 from geofuse.gvi import GVIEngine
@@ -212,9 +212,9 @@ def run_gvi(
                         arr_veg[lr, lc] = cdf["gvi_veg"].to_numpy()[keep]
                         arr_ter[lr, lc] = cdf["gvi_ter"].to_numpy()[keep]
                 tile_path = os.path.join(tiles_dir, f"cluster_{cid:04d}.tif")
-                # Shared compression / tiling / BIGTIFF defaults from
-                # crs_utils. Internal overviews built after close enable
-                # fast Folium previews.
+                # SPARSE_OK=TRUE drops all-NaN blocks — GVI tiles are largely
+                # empty along street networks, so this is a significant
+                # disk-size win on top of DEFLATE compression.
                 with rasterio.open(
                     tile_path,
                     "w",
@@ -226,21 +226,21 @@ def run_gvi(
                     crs=grid_crs_wkt,
                     transform=cluster["transform"],
                     nodata=np.nan,
-                    **default_geotiff_creation_options(np.float32),
+                    **default_geotiff_creation_options(np.float32, sparse=True),
                 ) as dst:
                     dst.write(arr_veg, 1)
                     dst.set_band_description(1, "Veg")
                     dst.write(arr_ter, 2)
                     dst.set_band_description(2, "Ter")
-                try:
-                    build_internal_overviews(tile_path)
-                except Exception:
-                    pass  # Non-fatal: base raster still valid.
+                bounds_4326 = raster_geographic_bounds(tile_path)
                 index_entries.append(
                     {
                         "cluster_id": cid,
                         "path": os.path.basename(tile_path),
                         "bbox_grid_crs": list(cluster["bbox_grid_crs"]),
+                        "bounds_4326": (
+                            list(bounds_4326) if bounds_4326 is not None else None
+                        ),
                         "height": h,
                         "width": w,
                         "row_min": int(cluster["row_min"]),

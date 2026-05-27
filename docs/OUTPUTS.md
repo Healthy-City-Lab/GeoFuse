@@ -36,10 +36,10 @@ One dense GeoTIFF per spatial cluster — instead of one huge mostly-empty raste
   cluster_0000.tif   # 2-band: Band 1 = Vegetation GVI, Band 2 = Terrain GVI
   cluster_0001.tif
   ...
-  tiles_index.json   # bbox in grid CRS and WGS84 + grid CRS WKT for each tile
+  tiles_index.json   # planar bbox + EPSG:4326 locator + grid CRS WKT per tile
 ```
 
-Tiles are written in the auto-selected projected CRS (UTM / LCC / Polar Stereographic) — not WGS84 — so cells stay square in metres and no resampling is involved. Open `tiles_index.json` to reproject or merge on demand.
+Tiles are written in the auto-selected projected CRS (UTM / LCC / Polar Stereographic) — not WGS84 — so cells stay square in metres and no resampling is involved. Each file uses DEFLATE + float predictor + `SPARSE_OK=TRUE`, so the all-NaN majority of the raster costs zero bytes on disk; no overview pyramids are pre-built (open in QGIS / ArcGIS to generate local pyramids on demand). Each `tiles_index.json` entry carries the native-CRS `bbox_grid_crs` and a derived `bounds_4326` so downstream tools can locate a tile geographically without re-reading the raster.
 
 ### `[Filename]_gvi.geojson` (optional, GeoJSON on)
 
