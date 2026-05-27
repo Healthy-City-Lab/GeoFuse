@@ -17,8 +17,15 @@ import rasterio
 from pyproj import CRS as PyProjCRS
 from pyproj import Geod, Transformer
 from rasterio.transform import array_bounds, from_bounds
-from rasterio.warp import Resampling, calculate_default_transform, reproject
+from rasterio.warp import (
+    Resampling,
+    calculate_default_transform,
+    reproject,
+)
 from rasterio.warp import transform as rio_warp_transform
+from rasterio.warp import (
+    transform_bounds,
+)
 from rasterio.windows import from_bounds as window_from_bounds
 from rasterio.windows import transform as window_transform
 from shapely.ops import transform as shapely_xy_transform
@@ -103,6 +110,27 @@ def default_geotiff_creation_options(dtype, *, sparse: bool = False) -> dict:
     if sparse:
         opts["SPARSE_OK"] = "TRUE"
     return opts
+
+
+def raster_geographic_bounds(
+    raster_path: str,
+) -> tuple[float, float, float, float] | None:
+    """Return the raster's bounding box in EPSG:4326 as ``(left, bottom, right, top)``.
+
+    Returns ``None`` if the file cannot be opened or has no declared CRS.
+    Used by sidecar / tile-index writers that want a geographic locator
+    alongside the raster's native-CRS extent.
+    """
+    try:
+        with rasterio.open(raster_path) as src:
+            if src.crs is None:
+                return None
+            left, bottom, right, top = transform_bounds(
+                src.crs, WGS84_EPSG, *src.bounds
+            )
+            return float(left), float(bottom), float(right), float(top)
+    except Exception:
+        return None
 
 
 def build_internal_overviews(
@@ -195,9 +223,7 @@ def stream_mosaic_to_geotiff(
         "nodata": nodata,
     }
     if compress:
-        dst_profile.update(
-            default_geotiff_creation_options(ref["dtype"], sparse=True)
-        )
+        dst_profile.update(default_geotiff_creation_options(ref["dtype"], sparse=True))
     else:
         dst_profile.update(
             {

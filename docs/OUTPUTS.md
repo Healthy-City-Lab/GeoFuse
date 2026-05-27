@@ -66,14 +66,24 @@ For each input file / date range processed through the NDVI pipeline. Defaults: 
 
 ### `[Filename]_ndvi.tif` (default)
 
-Single-band GeoTIFF (EPSG:4326):
+Single-band GeoTIFF in the engine-selected **planar CRS** (UTM / LCC /
+Polar Stereographic — same family used by the GVI tiles, chosen by
+`select_grid_crs` to keep pixels square in metres):
 
 * **Band 1 (`NDVI`, float32)**: median NDVI over the date range, after cloud masking.
 * NoData value: `−9999`.
 
+The raster has no WGS84 reprojection step — it ships in the same CRS the Earth
+Engine tiles were exported in, so every pixel is a true 10 m × 10 m square on
+the ground. The exact CRS for the run is recorded in the `_ndvi.json` sidecar
+(`export_crs`, `export_crs_wkt`) and in each output's own embedded CRS tag.
+
 ### `[Filename]_ndvi.gpkg` (optional)
 
-GeoPackage with layer `ndvi_samples` (EPSG:4326) — same per-point data as the GeoJSON form, but loads orders of magnitude faster for large extents. Written via streaming block iteration so peak memory usage is kept low.
+GeoPackage with layer `ndvi_samples` in the raster's planar CRS — same
+per-point data as the GeoJSON form, but loads orders of magnitude faster for
+large extents. Written via streaming block iteration so peak memory usage is
+kept low.
 
 ### `[Filename]_ndvi.geojson` (optional)
 
@@ -82,7 +92,7 @@ Vector point data with:
 | Field | Description |
 |-------|-------------|
 | `NDVI` | Normalized Difference Vegetation Index (−1 to 1) |
-| `x`, `y` | Geographic coordinates (EPSG:4326) |
+| `x`, `y` | Coordinates in the raster's planar CRS, metres |
 | `ndvi_date` | Source date (attribute-column mode only) |
 
 ### `[Filename]_ndvi_at_features.gpkg` (optional)
@@ -102,12 +112,14 @@ Per-cluster GeoTIFF tile directory, written when the **Per-cluster tiles**
 output is enabled. Avoids the giant mostly-NaN single mosaic that scattered
 national-scale inputs would otherwise produce. Contents:
 
-* `cluster_NNNN.tif` — one EPSG:4326 GeoTIFF per connected component of the
-  buffered input geometry, sized to the cluster's bbox.
+* `cluster_NNNN.tif` — one planar-CRS GeoTIFF per connected component of the
+  buffered input geometry, sized to the cluster's bbox. Same CRS as the main
+  `_ndvi.tif`.
 * `tiles_index.json` — `{crs, export_crs, export_crs_name, resume_key,
-  n_clusters, clusters: [{cluster_id, path, bounds_4326, n_tiles}, …]}`
-  so downstream tools can pick the right cluster file without reopening
-  every raster.
+  n_clusters, clusters: [{cluster_id, path, bounds, bounds_4326, n_tiles}, …]}`.
+  Each entry carries the cluster's native-CRS extent in `bounds` and a
+  derived geographic locator in `bounds_4326`, so downstream tools can pick
+  the right cluster file without reopening every raster.
 
 ### `[Filename]_ndvi.json` (always written on success)
 

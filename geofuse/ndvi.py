@@ -18,8 +18,8 @@ import rasterio
 
 from .core import build_planar_tiles
 from .crs_utils import (
+    raster_geographic_bounds,
     reproject_geodataframe_to_wgs84,
-    reproject_raster_to_wgs84,
     select_grid_crs_with_warning,
     stream_mosaic_to_geotiff,
 )
@@ -131,8 +131,6 @@ def _emit_ndvi_progress(
     if clear_bracket:
         payload["clear_bracket"] = True
     ndvi_progress_callback(payload)
-
-
 
 
 def _write_ndvi_sidecar(
@@ -379,19 +377,21 @@ class NDVIEngine:
         sub_end: float,
         meta_extra: dict[str, Any] | None = None,
     ) -> dict:
-        """Stream raster blocks → points, append to GeoPackage in chunks.
+        """Stream raster blocks → points in the raster's native CRS.
 
         Walks the raster's native block grid (typically 256×256 tiles for
         our outputs) instead of slurping the whole band into RAM. Each
         valid-pixel chunk gets buffered until the buffer hits
         ``_VECTOR_FLUSH_POINTS``, then a small GeoDataFrame is built,
         clipped to the study geometry, and appended to the GeoPackage.
-        Keeps peak memory usage low.
 
-        GeoJSON output (when requested) is materialised at the end from the
-        GeoPackage — it has no streaming-append story of its own, but
-        anyone asking for GeoJSON at this scale has already been warned
-        in the UI that it's a compatibility-only path.
+        The output GeoPackage carries the raster's native CRS (planar
+        UTM/LCC for our pipeline) so its X/Y columns are already in metres
+        on the engine's pixel grid. GeoJSON output (when requested) is
+        materialised at the end from the GeoPackage — it has no streaming-
+        append story of its own, but anyone asking for GeoJSON at this
+        scale has already been warned in the UI that it's a compatibility-
+        only path.
         """
         if cancel_callback and cancel_callback():
             return {"status": "cancelled", "message": "Cancelled by user"}
@@ -402,26 +402,7 @@ class NDVIEngine:
             phase="Writing vector samples",
         )
 
-        # Prepare the clip union geometry once (in 4326) so per-chunk filter
-        # is a single shapely predicate rather than a full ``gpd.clip``.
-        clip_geom = None
-        if isinstance(geometry, gpd.GeoDataFrame) and not geometry.empty:
-            clip_gdf = (
-                geometry
-                if geometry.crs == "EPSG:4326"
-                else geometry.to_crs("EPSG:4326")
-            )
-            try:
-                clip_geom = clip_gdf.geometry.union_all()
-                if clip_geom is not None and clip_geom.is_empty:
-                    clip_geom = None
-            except Exception:
-                clip_geom = None
-
         layer_name = "ndvi_samples"
-        # Always stream into the GeoPackage when one was requested. When the
-        # user only wants GeoJSON, route through a temp GPKG next door (same
-        # streaming benefit) and convert at the end.
         if gpkg_path:
             stream_target = gpkg_path
             stream_target_is_temp = False
@@ -429,8 +410,6 @@ class NDVIEngine:
             stream_target = geojson_path + ".tmp.gpkg"
             stream_target_is_temp = True
         else:
-            # Neither vector output requested — the caller should not have
-            # called us. Treat as a no-op success.
             meta = {"crs": "EPSG:4326"}
             if meta_extra:
                 meta.update(meta_extra)
@@ -442,8 +421,6 @@ class NDVIEngine:
                 "meta": meta,
             }
 
-        # Working buffers (Python lists — appending is amortised O(1) and
-        # numpy conversion happens once per flush).
         buf_x: list[float] = []
         buf_y: list[float] = []
         buf_v: list[float] = []
@@ -452,9 +429,27 @@ class NDVIEngine:
 
         try:
             with rasterio.open(final_tif) as src:
+                raster_crs = src.crs
                 nodata = src.nodata if src.nodata is not None else -9999
                 blocks = list(src.block_windows(1))
                 n_blocks = max(1, len(blocks))
+
+                # Pre-compute the clip predicate in the raster's CRS so every
+                # chunk filter is a single shapely call rather than a per-
+                # chunk reprojection.
+                clip_geom = None
+                if isinstance(geometry, gpd.GeoDataFrame) and not geometry.empty:
+                    clip_gdf = (
+                        geometry
+                        if raster_crs is not None and geometry.crs == raster_crs
+                        else geometry.to_crs(raster_crs)
+                    )
+                    try:
+                        clip_geom = clip_gdf.geometry.union_all()
+                        if clip_geom is not None and clip_geom.is_empty:
+                            clip_geom = None
+                    except Exception:
+                        clip_geom = None
 
                 def flush() -> None:
                     nonlocal first_chunk, n_written
@@ -462,11 +457,8 @@ class NDVIEngine:
                         return
                     gdf_chunk = gpd.GeoDataFrame(
                         {"NDVI": np.round(np.asarray(buf_v, dtype=np.float32), 4)},
-                        geometry=gpd.points_from_xy(
-                            np.round(np.asarray(buf_x), 5),
-                            np.round(np.asarray(buf_y), 5),
-                        ),
-                        crs="EPSG:4326",
+                        geometry=gpd.points_from_xy(buf_x, buf_y),
+                        crs=raster_crs,
                     )
                     if clip_geom is not None:
                         gdf_chunk = gdf_chunk[gdf_chunk.geometry.intersects(clip_geom)]
@@ -558,7 +550,7 @@ class NDVIEngine:
             )
 
             meta: dict[str, Any] = {
-                "crs": "EPSG:4326",
+                "crs": str(raster_crs) if raster_crs is not None else None,
                 "vector_points": n_written,
             }
             if meta_extra:
@@ -654,9 +646,7 @@ class NDVIEngine:
             aoi = ee.FeatureCollection(js["features"]).geometry()
             geom_for_crs = geom_wgs84
         else:
-            geom_for_crs = gpd.GeoDataFrame(
-                {"geometry": [geometry]}, crs="EPSG:4326"
-            )
+            geom_for_crs = gpd.GeoDataFrame({"geometry": [geometry]}, crs="EPSG:4326")
             geom_for_ee_gdf = shrink_gdf_for_ee(geom_for_crs)
             aoi = shapely_to_ee_geometry(geom_for_ee_gdf.geometry.iloc[0])
 
@@ -795,9 +785,7 @@ class NDVIEngine:
         # cloud-masked / out-of-collection pixels with the sentinel so the
         # downstream reproject can mask them out instead of bilinear-blending
         # them with valid neighbours.
-        ndvi_median = (
-            col.select("NDVI").median().rename("NDVI").unmask(-9999).clip(aoi)
-        )
+        ndvi_median = col.select("NDVI").median().rename("NDVI").unmask(-9999).clip(aoi)
 
         # 4. Build cluster-aware tile list in true metres. Scattered national
         # inputs decompose into connected components, and tiles that fall over
@@ -988,30 +976,26 @@ class NDVIEngine:
         )
         if cancel_callback and cancel_callback():
             return {"status": "cancelled", "message": "Cancelled by user"}
-        temp_tif = os.path.join(folder, f"temp_{output_name}.tif")
         final_tif = os.path.join(folder, f"{output_name}_ndvi.tif")
+        tmp_tif = final_tif + ".tmp"
 
         try:
 
             def _do_export() -> None:
                 geemap.ee_export_image(
                     ndvi_median,
-                    filename=temp_tif,
+                    filename=tmp_tif,
                     crs=export_crs,
                     crs_transform=crs_transform,
                     region=aoi,
                     file_per_band=False,
                 )
-                if not (
-                    os.path.isfile(temp_tif) and os.path.getsize(temp_tif) > 0
-                ):
+                if not (os.path.isfile(tmp_tif) and os.path.getsize(tmp_tif) > 0):
                     raise RuntimeError(
-                        f"geemap.ee_export_image returned but {temp_tif} "
+                        f"geemap.ee_export_image returned but {tmp_tif} "
                         "was not written."
                     )
 
-            # Same retry policy as the tiled path so a flaky network doesn't
-            # blow up the single small-area run on the first transient.
             retry_with_backoff(
                 _do_export,
                 attempts=3,
@@ -1022,40 +1006,25 @@ class NDVIEngine:
             )
 
             if cancel_callback and cancel_callback():
-                if os.path.exists(temp_tif):
-                    os.remove(temp_tif)
+                if os.path.exists(tmp_tif):
+                    os.remove(tmp_tif)
                 return {"status": "cancelled", "message": "Cancelled by user"}
 
-            _emit_ndvi_progress(
-                ndvi_progress_callback,
-                sub_progress=0.28,
-                phase="Downloading from Earth Engine",
-                tiles=(1, 1),
-            )
+            # Atomic publish: the user-visible final raster only appears
+            # once the EE write finished cleanly.
+            os.replace(tmp_tif, final_tif)
+
             _emit_ndvi_progress(
                 ndvi_progress_callback,
                 sub_progress=0.32,
-                phase="Reprojecting GeoTIFF",
-                clear_bracket=True,
+                phase="Downloading from Earth Engine",
+                tiles=(1, 1),
             )
-
-            # Final reproject: planar → WGS84 with explicit nodata so the
-            # ``-9999`` fill doesn't bleed into edge pixels.
-            reproject_raster_to_wgs84(
-                temp_tif,
-                final_tif,
-                target_resolution_m=resolution,
-                src_nodata=-9999,
-                dst_nodata=-9999,
-            )
-
-            if os.path.exists(temp_tif):
-                os.remove(temp_tif)
 
         except Exception as e:
-            if os.path.exists(temp_tif):
-                os.remove(temp_tif)
-            return {"status": "error", "message": f"Export/Reproject Failed: {str(e)}"}
+            if os.path.exists(tmp_tif):
+                os.remove(tmp_tif)
+            return {"status": "error", "message": f"EE export failed: {str(e)}"}
 
         if cancel_callback and cancel_callback():
             return {"status": "cancelled", "message": "Cancelled by user"}
@@ -1064,7 +1033,7 @@ class NDVIEngine:
             with rasterio.open(final_tif) as src:
                 crs_meta = str(src.crs)
         except Exception:
-            crs_meta = "EPSG:4326"
+            crs_meta = export_crs
         meta: dict[str, Any] = {
             "crs": crs_meta,
             "tiles": 1,
@@ -1145,18 +1114,19 @@ class NDVIEngine:
         export_crs: str,
         export_crs_name: str,
         resume_key: str,
-        resolution: int,
     ) -> list[dict]:
         """Mosaic cached tiles per cluster and write a ``tiles_index.json``.
 
-        Same two-step shape as the main mosaic: per-cluster planar mosaic
-        into a scratch file in ``work_dir``, then a single reproject to
-        WGS84 with explicit nodata. Keeps boundaries aligned to the pixel
-        and avoids the ``-9999``-bleed edge artefacts.
+        Each cluster's planar tiles are stream-mosaicked directly into the
+        final per-cluster GeoTIFF (no intermediate reprojection): every tile
+        shares the engine's ``crs_transform`` snap grid, so boundaries land
+        on pixel centers.
 
         Failed tiles in ``failed_tile_refs`` are skipped. Per-cluster
         failures log a WARN and continue — the rest of the clusters still
-        land. Returns the per-cluster index entries (also written to disk).
+        land. Each entry records both the cluster's native-CRS ``bounds``
+        and a derived ``bounds_4326`` so downstream consumers can locate
+        the tile geographically without re-reading the raster.
         """
         from collections import defaultdict
 
@@ -1176,48 +1146,46 @@ class NDVIEngine:
                 cluster_to_paths[cid].append(p)
 
         entries: list[dict] = []
+        index_crs: str | None = None
         for cid in sorted(cluster_to_paths):
             paths = cluster_to_paths[cid]
             if not paths:
                 continue
             cluster_path = os.path.join(output_root, f"cluster_{cid:04d}.tif")
-            planar_tmp = os.path.join(work_dir, f"_cluster_{cid:04d}_planar.tif")
             try:
                 stream_mosaic_to_geotiff(
-                    paths, planar_tmp, nodata=-9999, build_overviews=False
-                )
-                reproject_raster_to_wgs84(
-                    planar_tmp,
+                    paths,
                     cluster_path,
-                    target_resolution_m=resolution,
-                    src_nodata=-9999,
-                    dst_nodata=-9999,
+                    nodata=-9999,
+                    build_overviews=False,
+                    compress=True,
                 )
             except Exception as e:
                 _log("WARN", f"Cluster {cid} mosaic failed: {e}")
                 continue
-            finally:
-                if os.path.exists(planar_tmp):
-                    try:
-                        os.remove(planar_tmp)
-                    except OSError:
-                        pass
+
             try:
                 with rasterio.open(cluster_path) as src:
                     b = src.bounds
-                    bounds_4326 = [
+                    native_bounds = [
                         float(b.left),
                         float(b.bottom),
                         float(b.right),
                         float(b.top),
                     ]
+                    if index_crs is None and src.crs is not None:
+                        index_crs = str(src.crs)
             except Exception:
-                bounds_4326 = None
+                native_bounds = None
+            bounds_4326 = raster_geographic_bounds(cluster_path)
             entries.append(
                 {
                     "cluster_id": cid,
                     "path": os.path.basename(cluster_path),
-                    "bounds_4326": bounds_4326,
+                    "bounds": native_bounds,
+                    "bounds_4326": (
+                        list(bounds_4326) if bounds_4326 is not None else None
+                    ),
                     "n_tiles": len(paths),
                 }
             )
@@ -1226,7 +1194,7 @@ class NDVIEngine:
         with open(index_path, "w") as f:
             json.dump(
                 {
-                    "crs": "EPSG:4326",
+                    "crs": index_crs or export_crs,
                     "export_crs": export_crs,
                     "export_crs_name": export_crs_name,
                     "resume_key": resume_key,
@@ -1288,9 +1256,7 @@ class NDVIEngine:
                     region=tile_aoi,
                     file_per_band=False,
                 )
-                if not (
-                    os.path.isfile(tile_final) and os.path.getsize(tile_final) > 0
-                ):
+                if not (os.path.isfile(tile_final) and os.path.getsize(tile_final) > 0):
                     raise RuntimeError(
                         f"geemap.ee_export_image returned but {tile_final} "
                         "was not written."
@@ -1511,15 +1477,15 @@ class NDVIEngine:
                 clear_bracket=True,
             )
 
-            # Two-step output: (1) stream-mosaic the per-tile rasters in
-            # their shared **planar** CRS, then (2) reproject the merged
-            # mosaic to WGS84 once. This keeps tile boundaries aligned to
-            # the pixel.
-            planar_mosaic_tif = os.path.join(work_dir, "_mosaic_planar.tif")
+            # Stream-mosaic the per-tile rasters in their shared planar
+            # CRS straight into the user-facing GeoTIFF. Tile boundaries
+            # are pixel-aligned because every EE export was anchored to
+            # the same crs_transform; mosaic memory never holds more than
+            # one tile.
             try:
 
                 def _mosaic_progress(k: int, n: int) -> None:
-                    span = 0.76 - 0.72
+                    span = 0.80 - 0.72
                     _emit_ndvi_progress(
                         ndvi_progress_callback,
                         sub_progress=0.72 + (span * k / n if n else 0.0),
@@ -1527,45 +1493,20 @@ class NDVIEngine:
                         tiles=(k, n),
                     )
 
-                # Intermediate planar mosaic — read once by the WGS84 warp
-                # below, then deleted. Skip overviews and compression so the
-                # warp's block reads don't pay decompression cost.
                 stream_mosaic_to_geotiff(
                     tile_files,
-                    planar_mosaic_tif,
+                    final_tif,
                     nodata=-9999,
                     progress_cb=_mosaic_progress,
                     build_overviews=False,
-                    compress=False,
-                )
-
-                _emit_ndvi_progress(
-                    ndvi_progress_callback,
-                    sub_progress=0.76,
-                    phase="Reprojecting to WGS84",
-                    clear_bracket=True,
-                )
-                _log(
-                    "INFO",
-                    "Reprojecting planar mosaic to WGS84 in a single GDAL "
-                    "warp pass — this may take a few minutes on large-"
-                    "scale rasters.",
-                )
-
-                reproject_raster_to_wgs84(
-                    planar_mosaic_tif,
-                    final_tif,
-                    target_resolution_m=resolution,
-                    src_nodata=-9999,
-                    dst_nodata=-9999,
+                    compress=True,
                 )
 
                 _emit_ndvi_progress(
                     ndvi_progress_callback,
                     sub_progress=0.80,
-                    phase="Reprojecting to WGS84",
+                    phase="Mosaicking rasters",
                 )
-
                 _log("OK", f"Mosaic complete: {final_tif}")
                 mosaic_ok = True
 
@@ -1575,15 +1516,6 @@ class NDVIEngine:
                     f"Mosaic step failed with traceback:\n{traceback.format_exc()}",
                 )
                 return {"status": "error", "message": f"Mosaic failed: {str(e)}"}
-            finally:
-                # The planar intermediate is not part of the cache (we only
-                # cache the per-tile inputs); drop it whether or not the
-                # mosaic step succeeded.
-                if os.path.exists(planar_mosaic_tif):
-                    try:
-                        os.remove(planar_mosaic_tif)
-                    except OSError:
-                        pass
 
             # Per-cluster GeoTIFF tiles + tiles_index.json. Best-effort:
             # main mosaic already succeeded, so per-cluster failures log
@@ -1604,7 +1536,6 @@ class NDVIEngine:
                         export_crs,
                         export_crs_name,
                         resume_key,
-                        resolution,
                     )
                     _log(
                         "OK",
@@ -1670,7 +1601,7 @@ class NDVIEngine:
             with rasterio.open(final_tif) as src:
                 meta_base["crs"] = str(src.crs)
         except Exception:
-            meta_base["crs"] = "EPSG:4326"
+            meta_base["crs"] = export_crs
 
         if not (write_geojson or write_geopackage):
             _emit_ndvi_progress(
