@@ -120,7 +120,6 @@ def _render_details(rec) -> None:
             f"**Outcomes:** {len(outcomes)}{' — ' + ', '.join(outcomes) if outcomes else ''}"
         )
         st.write(f"**Resume study:** {bool(p.get('resume_existing_study', True))}")
-        st.write(f"**Pre-aggregation:** {bool(p.get('pre_aggregate', False))}")
     if rec.output_paths:
         st.write("**Output files:**")
         for path in rec.output_paths:

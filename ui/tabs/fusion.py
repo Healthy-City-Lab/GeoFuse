@@ -957,22 +957,6 @@ def render(output_dir: str) -> None:
                         "remaining trials. Turn off to start a fresh study."
                     ),
                 )
-                pre_aggregate = st.checkbox(
-                    "Spatial pre-processing (faster trials, more memory)",
-                    value=False,
-                    key="fusion_pre_aggregate",
-                    help=(
-                        "When on, every sample point's metric values are "
-                        "pre-aggregated across every buffer radius in the ladder "
-                        "and every aggregation (mean + percentiles at 10% steps). "
-                        "Optuna trials then read from this lookup table instead "
-                        "of recomputing — typically 10-100× faster per trial. "
-                        "Cost: a one-time pre-process pass (minutes to hours on "
-                        "large datasets) and a few hundred MB to several GB of RAM "
-                        "for the float16 table. Percentile choices in each trial "
-                        "are restricted to {10, 20, …, 90} when this is on."
-                    ),
-                )
 
             col_split1, col_split2, col_split3 = st.columns(3)
             with col_split1:
@@ -1157,7 +1141,6 @@ def render(output_dir: str) -> None:
                         "pruner_type": pruner_type,
                         "multi_objective_requested": fusion_multi_objective,
                         "resume_existing_study": resume_existing_study,
-                        "pre_aggregate": pre_aggregate,
                     },
                 )
                 executor.submit_runner(
@@ -1205,7 +1188,6 @@ def render(output_dir: str) -> None:
                     MetricFusionEngine=MetricFusionEngine,
                     target_display_name=target_display_name,
                     resume_existing_study=resume_existing_study,
-                    pre_aggregate=pre_aggregate,
                 )
 
                 st.success("✅ Fusion job started! Check sidebar for progress.")

@@ -24,6 +24,7 @@ so memory use is proportional to one feature's worth of pixels.
 from __future__ import annotations
 
 import math
+import threading
 from collections.abc import Callable
 from typing import Any
 
@@ -31,10 +32,76 @@ import geopandas as gpd
 import numpy as np
 import rasterio
 from rasterio.features import geometry_mask
+from rasterio.windows import Window
 from rasterio.windows import from_bounds as window_from_bounds
 from shapely.geometry import Point
 
 from .crs_utils import metres_per_degree_at_lat
+
+
+class LazyRasterArray:
+    """A 2D, array-like view over one raster band that reads windows from disk.
+
+    Lets large (national-scale) metric rasters be sampled without holding the
+    whole band in memory. Supports ``.shape`` / ``.dtype`` plus:
+
+    * integer indexing ``arr[row, col]`` → a single masked pixel value, and
+    * contiguous slice indexing ``arr[r0:r1, c0:c1]`` → a masked 2D window,
+
+    matching how the fusion engine reads in-memory ``src.read(masked=True)``
+    arrays, so consumers work unchanged.
+
+    Concurrency: GDAL datasets are **not** safe for concurrent reads on a single
+    handle, so each thread gets its **own** read-only handle (``threading.local``).
+    Multiple read-only handles to the same file do not conflict, which lets the
+    parallel pre-aggregation build sample windows from many threads at once.
+    """
+
+    def __init__(self, path: str, band: int = 1) -> None:
+        self.path = str(path)
+        self.band = int(band)
+        with rasterio.open(self.path) as src:
+            self.shape = (int(src.height), int(src.width))
+            self.dtype = np.dtype(src.dtypes[self.band - 1])
+            self.nodata = src.nodata
+        self._local = threading.local()
+
+    @property
+    def ndim(self) -> int:
+        return 2
+
+    def _src(self) -> rasterio.io.DatasetReader:
+        src = getattr(self._local, "src", None)
+        if src is None or src.closed:
+            src = rasterio.open(self.path)
+            self._local.src = src
+        return src
+
+    def __getitem__(self, key):
+        rk, ck = key
+        h, w = self.shape
+        if isinstance(rk, slice) or isinstance(ck, slice):
+            r0 = 0 if rk.start is None else max(0, int(rk.start))
+            r1 = h if rk.stop is None else min(h, int(rk.stop))
+            c0 = 0 if ck.start is None else max(0, int(ck.start))
+            c1 = w if ck.stop is None else min(w, int(ck.stop))
+            if r1 <= r0 or c1 <= c0:
+                return np.ma.masked_array(
+                    np.empty((max(0, r1 - r0), max(0, c1 - c0)), dtype=self.dtype),
+                    mask=True,
+                )
+            win = Window(c0, r0, c1 - c0, r1 - r0)
+            return self._src().read(self.band, window=win, masked=True)
+        r, c = int(rk), int(ck)
+        return self._src().read(self.band, window=Window(c, r, 1, 1), masked=True)[0, 0]
+
+    def close(self) -> None:
+        """Close the calling thread's handle (others close on thread teardown)."""
+        src = getattr(self._local, "src", None)
+        if src is not None and not src.closed:
+            src.close()
+            self._local.src = None
+
 
 _STAT_FUNCS: dict[str, Callable[[np.ndarray], float]] = {
     "mean": lambda a: float(np.nanmean(a)),

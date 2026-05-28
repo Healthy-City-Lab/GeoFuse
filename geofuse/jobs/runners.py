@@ -585,7 +585,6 @@ def run_fusion(
     MetricFusionEngine,
     target_display_name: str = "target",
     resume_existing_study: bool = True,
-    pre_aggregate: bool = False,
 ) -> dict:
     """Run fusion optimization. Mirrors the previous ``_fusion_worker``."""
     try:
@@ -712,47 +711,61 @@ def run_fusion(
             ctx.progress(
                 value=prog(0.28),
                 status_text=(
-                    f"{prefix}Preparing fusion samples + splitting data "
+                    f"{prefix}Preparing fusion samples "
                     "(can take a while on large polygon targets)..."
                 ),
             )
-            engine.split_data(test_size=test_size, k_folds=k_folds, random_state=42)
+            fusion_df = engine.prepare_fusion_data()
+            if ctx.is_cancelled():
+                return {"output_paths": output_paths}
 
-            # Optional spatial pre-processing: pre-aggregate per-point × radius
-            # × stat lookup table so every Optuna trial is a numpy.take.
-            if pre_aggregate:
-                _last_pct = {"v": -1}
+            # Mandatory spatial pre-processing (first compute step): build or
+            # reuse the on-disk per-(entity, radius) stat cache so every Optuna
+            # trial is a fast column read instead of recomputing buffer
+            # aggregations. Resumable across cancels/crashes.
+            _last_pct = {"v": -1}
 
-                def preaggr_progress(current: int, total: int) -> None:
-                    pct = (current * 100) // max(1, total)
-                    if pct == _last_pct["v"]:
-                        return
-                    _last_pct["v"] = pct
-                    ctx.set_extra(
-                        preaggr_progress={
-                            "current": current,
-                            "total": total,
-                            "percent": pct,
-                        }
-                    )
-                    ctx.progress(
-                        value=prog(0.30 + 0.04 * pct / 100),
-                        status_text=(
-                            f"{prefix}Spatial pre-processing: "
-                            f"{current:,}/{total:,} points ({pct}%)"
-                        ),
-                    )
-                    ctx.heartbeat()
-
-                completed = engine.precompute_aggregations(
-                    progress_callback=preaggr_progress,
-                    cancel_callback=cancel_check,
+            def preaggr_progress(current: int, total: int) -> None:
+                pct = (current * 100) // max(1, total)
+                if pct == _last_pct["v"]:
+                    return
+                _last_pct["v"] = pct
+                ctx.set_extra(
+                    preaggr_progress={
+                        "current": current,
+                        "total": total,
+                        "percent": pct,
+                    }
                 )
-                # Clear the dedicated preaggr_progress sub-bar so it doesn't
-                # linger past this stage in the monitor.
-                ctx.set_extra(preaggr_progress=None)
-                if not completed or ctx.is_cancelled():
-                    return {"output_paths": output_paths}
+                ctx.progress(
+                    value=prog(0.30 + 0.04 * pct / 100),
+                    status_text=(
+                        f"{prefix}Spatial pre-processing: "
+                        f"{current:,}/{total:,} entities ({pct}%)"
+                    ),
+                )
+                ctx.heartbeat()
+
+            completed = engine.precompute_aggregations(
+                progress_callback=preaggr_progress,
+                cancel_callback=cancel_check,
+            )
+            # Clear the dedicated preaggr_progress sub-bar so it doesn't linger
+            # past this stage in the monitor.
+            ctx.set_extra(preaggr_progress=None)
+            if not completed or ctx.is_cancelled():
+                return {"output_paths": output_paths}
+
+            ctx.progress(
+                value=prog(0.34),
+                status_text=f"{prefix}Splitting data into train/val/test folds...",
+            )
+            engine.split_data(
+                fusion_df=fusion_df,
+                test_size=test_size,
+                k_folds=k_folds,
+                random_state=42,
+            )
 
             ctx.progress(
                 value=prog(0.35),
