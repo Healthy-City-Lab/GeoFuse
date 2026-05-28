@@ -6,7 +6,7 @@
 * **Deep Learning Segmentation**: Uses the **DeepLabV3+** model (PyTorch) trained on the **Cityscapes** dataset to identify Vegetation (class 8) and Terrain (class 9) greenery coverage.
 * **Nation-Scale Clustered Sampling Grids**: For widely-scattered inputs (e.g. neighbourhoods across multiple cities), the engine automatically dissolves touching buffers, splits the study area into spatial clusters, and generates a separate sampling grid per cluster — all anchored to one common reference grid. This avoids the exponential bbox blow-up that would otherwise produce hundreds of millions of empty cells across a country.
 * **Automatic Projected CRS Selection**: For each study area, the engine picks the most accurate planar CRS by extent — a local UTM zone for compact areas (≤ 6° lon / 8° lat), a two-parallel Lambert Conformal Conic for continent-scale extents, or Polar Stereographic above 75° latitude. A measured distortion estimate is logged; warnings appear if distortion exceeds 2 %.
-* **Subprocess Execution**: GVI workers run in a separate Python process so they no longer share the Python GIL with the Streamlit UI. This eliminates the GPU-utilisation drop that happened when the browser tab was in the foreground (measured ~37 percentage-point recovery on a Cityscapes / DeepLabV3+ workload).
+* **Subprocess Execution**: GVI workers run in a separate Python process so they no longer share the Python GIL with the Streamlit UI. This eliminates the GPU-utilisation drop that happened when the browser tab was in the foreground.
 * **Concurrent Per-Point Pipeline**: Up to 4 panoramas are downloaded, pre-processed, and queued for the GPU concurrently. Network I/O and CPU pre-processing run lock-free; only the GPU forward pass is serialised so one point's inference overlaps the next point's download.
 * **Batch Processing**: Upload multiple study areas to process distinct regions simultaneously.
 * **Smart Caching**: Shared, cross-process panorama cache (`logs/caches/gvi_panos.db`) prevents redundant downloads for overlapping areas, reducing processing time and API costs. An in-memory overlay keeps repeated lookups microsecond-fast.
@@ -54,11 +54,14 @@
 * **Automated Metric Alignment**: Auto-downloads and spatially aligns GVI (vegetation/terrain) and NDVI within your study area when pre-computed files are not provided.
 * **Dual Input Support**: Works with **point-based** targets (GeoJSON with health/environmental data) and **raster-based** targets (GeoTIFF continuous surfaces).
 * **Mandatory Spatial Pre-processing**: Before optimization, every sample entity's metric values are pre-aggregated across all buffer radii in the ladder and all statistics (mean + p10–p90) for each channel, into a per-job SQLite cache (`output_results/fusion_cache/preaggr/`). Each Optuna trial then reads a single indexed column instead of recomputing buffer aggregations. The build runs first, reports entities-processed progress, supports both vector and raster metrics, and is **resumable** (survives cancels/crashes) and **reused** across runs with identical inputs.
-* **Bayesian Optimization**: Uses **Optuna** (TPE sampler) to optimize 9 parameters:
-  * **Weights**: Vegetation, Terrain, NDVI contribution (0–100%, sum = 100%)
+* **Pluggable CGI Formula**: Pick the composite formulation in the UI; the optimizer searches that formula's parameters.
+  * **Weighted average** (default, legacy): three weights (Vegetation / Terrain / NDVI) summing to 100%.
+  * **Synergy** (three-metric generalisation of Wang et al. 2026, doi:10.3390/rs18010009): seven weights summing to 1 plus three powers on the main NDVI / Veg / Terrain terms only (interaction products stay plain); powers chosen on the {0.2..1.0} step-0.1 grid.
+* **Bayesian Optimization**: Uses **Optuna** (TPE sampler) to optimize the CGI formula's parameters plus:
   * **Spatial Aggregation**: Circular buffer radii (100m to user-defined max, step = 50m)
   * **Statistical Functions**: Mean, median, or percentile-based aggregation
   * Separate radius and aggregation controls per metric component
+* **Covariate-Aware Objective**: Optional **Covariates (control variables)** multi-select picks numeric attribute columns from the (vector) target. With covariates the score becomes the greenery term's _partial_ contribution so a dominant covariate can't make the optimizer ignore the CGI parameters. **`mutual_info` ignores covariates by design** (conditional MI on binned data is lossy). With no covariates the objective reduces to the legacy single-variable scoring exactly.
 * **Robust Cross-Validation**:
   * Stratified K-Fold CV ensures representative sampling across the target distribution.
   * 20% held-out test set for final validation.

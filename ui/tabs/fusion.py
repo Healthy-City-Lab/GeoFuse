@@ -30,6 +30,7 @@ try:
 except ImportError:
     _MetricFusionEngine = None
 
+from geofuse import cgi_formulas as _cgi_formulas
 from geofuse.crs_utils import buffer_gdf_union_metres, reproject_geodataframe_to_wgs84
 from geofuse.jobs.runners import run_fusion
 from geofuse.vector_io import (
@@ -1665,50 +1666,102 @@ def render(output_dir: str) -> None:
                 "Optimization details are not available for the selected outcome."
             )
         else:
-            col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
+            metric_name = results_view["objective_metric"].upper()
+            best_params = results_view.get("best_params") or {}
 
-            total_weight = (
-                results_view["best_params"]["veg_weight"]
-                + results_view["best_params"]["terrain_weight"]
-                + results_view["best_params"]["ndvi_weight"]
-            )
+            # Formula introspection. Legacy results from before the formula
+            # registry don't carry the attribute → fall back to weighted_average
+            # so old studies still render with the original three weights.
+            formula_name = getattr(engine, "cgi_formula", "weighted_average")
+            try:
+                formula = _cgi_formulas.get_formula(formula_name)
+            except ValueError:
+                formula = _cgi_formulas.get_formula("weighted_average")
 
-            with col_m1:
-                veg_pct = (
-                    (results_view["best_params"]["veg_weight"] / total_weight * 100)
-                    if total_weight > 0
-                    else 0
+            covariates_used = list(getattr(engine, "covariate_columns", []) or [])
+
+            # ── Top tile row ───────────────────────────────────────────────
+            # For weighted_average we keep the legacy 3-weight tiles so the
+            # display matches the user's mental model. For synergy a 7-weight
+            # tile row would be unreadable, so we report the dominant main
+            # weight + main-term power range instead, and let the JSON / table
+            # below carry the full breakdown.
+            if formula.name == _cgi_formulas.WEIGHTED_AVERAGE:
+                col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
+                total_weight = sum(
+                    float(best_params.get(k, 0)) for k in formula.weight_keys
                 )
-                st.metric("Vegetation Weight", f"{veg_pct:.1f}%")
-
-            with col_m2:
-                terrain_pct = (
-                    (results_view["best_params"]["terrain_weight"] / total_weight * 100)
-                    if total_weight > 0
-                    else 0
-                )
-                st.metric("Terrain Weight", f"{terrain_pct:.1f}%")
-
-            with col_m3:
-                ndvi_pct = (
-                    (results_view["best_params"]["ndvi_weight"] / total_weight * 100)
-                    if total_weight > 0
-                    else 0
-                )
-                st.metric("NDVI Weight", f"{ndvi_pct:.1f}%")
-
-            with col_m4:
-                metric_name = results_view["objective_metric"].upper()
-                st.metric(f"Best {metric_name}", f"{results_view['best_value']:.4f}")
-
-            with col_m5:
-                if results_view["robust_trials"]:
-                    st.metric(
-                        "Robust Trials",
-                        f"{len(results_view['robust_trials'])}/{len(engine.study.trials)}",
+                with col_m1:
+                    pct = (
+                        100.0 * float(best_params.get("veg_weight", 0)) / total_weight
+                        if total_weight > 0 else 0.0
                     )
-                else:
-                    st.metric("Total Trials", len(engine.study.trials))
+                    st.metric("Vegetation Weight", f"{pct:.1f}%")
+                with col_m2:
+                    pct = (
+                        100.0 * float(best_params.get("terrain_weight", 0))
+                        / total_weight
+                        if total_weight > 0 else 0.0
+                    )
+                    st.metric("Terrain Weight", f"{pct:.1f}%")
+                with col_m3:
+                    pct = (
+                        100.0 * float(best_params.get("ndvi_weight", 0)) / total_weight
+                        if total_weight > 0 else 0.0
+                    )
+                    st.metric("NDVI Weight", f"{pct:.1f}%")
+                with col_m4:
+                    st.metric(
+                        f"Best {metric_name}", f"{results_view['best_value']:.4f}"
+                    )
+                with col_m5:
+                    if results_view["robust_trials"]:
+                        st.metric(
+                            "Robust Trials",
+                            f"{len(results_view['robust_trials'])}/{len(engine.study.trials)}",
+                        )
+                    else:
+                        st.metric("Total Trials", len(engine.study.trials))
+            else:
+                col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+                with col_m1:
+                    st.metric("CGI Formula", formula.name)
+                with col_m2:
+                    main_weights = {
+                        k: float(best_params.get(k, 0))
+                        for k in formula.main_weight_keys
+                    }
+                    dom_key = max(main_weights, key=main_weights.get)
+                    dom_label = dom_key.removeprefix("w_").upper()
+                    st.metric(
+                        "Dominant Main Term",
+                        f"{dom_label} ({main_weights[dom_key]*100:.1f}%)",
+                    )
+                with col_m3:
+                    st.metric(
+                        f"Best {metric_name}", f"{results_view['best_value']:.4f}"
+                    )
+                with col_m4:
+                    if results_view["robust_trials"]:
+                        st.metric(
+                            "Robust Trials",
+                            f"{len(results_view['robust_trials'])}/{len(engine.study.trials)}",
+                        )
+                    else:
+                        st.metric("Total Trials", len(engine.study.trials))
+
+            # Formula label + the list of controlled covariates surfaced
+            # below the tile row so the user can read what the score means.
+            st.caption(
+                f"**Formula:** `{formula.name}` · **Covariates:** "
+                + (", ".join(f"`{c}`" for c in covariates_used) if covariates_used
+                   else "_none_")
+                + (
+                    "  ·  ℹ️ `mutual_info` ignores covariates"
+                    if results_view["objective_metric"] == "mutual_info" and covariates_used
+                    else ""
+                )
+            )
 
             col_detail1, col_detail2 = st.columns(2)
 
@@ -1716,30 +1769,27 @@ def render(output_dir: str) -> None:
                 st.markdown("**Best Trial Details**")
                 best_trial = engine.study.best_trial
 
-                info_data = {
+                info_data: dict = {
                     "Trial Number": best_trial.number,
                     "Buffer Distance": f"{engine.buffer_meters}m",
-                    "Veg Weight (raw)": results_view["best_params"]["veg_weight"],
-                    "Terrain Weight (raw)": results_view["best_params"][
-                        "terrain_weight"
-                    ],
-                    "NDVI Weight (raw)": results_view["best_params"]["ndvi_weight"],
-                    "Veg Radius": (
-                        f"{results_view['best_params'].get('veg_radius', 'N/A')}m"
-                    ),
-                    "Terrain Radius": (
-                        f"{results_view['best_params'].get('terrain_radius', 'N/A')}m"
-                    ),
-                    "NDVI Radius": (
-                        f"{results_view['best_params'].get('ndvi_radius', 'N/A')}m"
-                    ),
-                    f"Train {metric_name}": (
-                        f"{best_trial.user_attrs.get('train_score_mean', 'N/A')}"
-                    ),
-                    f"Val {metric_name}": (
-                        f"{best_trial.user_attrs.get('val_score_mean', 'N/A')}"
-                    ),
                 }
+                # Formula-driven weight + power dump, then shared spatial params,
+                # then the train/val scores + p-values.
+                for k in formula.weight_keys:
+                    info_data[f"{k} (raw)"] = best_params.get(k, "N/A")
+                for k in formula.power_keys:
+                    info_data[k] = best_params.get(k, "N/A")
+                for k in ("veg_radius", "terrain_radius", "ndvi_radius"):
+                    info_data[k] = f"{best_params.get(k, 'N/A')}m"
+                if covariates_used:
+                    info_data["Covariates controlled"] = covariates_used
+
+                info_data[f"Train {metric_name}"] = (
+                    f"{best_trial.user_attrs.get('train_score_mean', 'N/A')}"
+                )
+                info_data[f"Val {metric_name}"] = (
+                    f"{best_trial.user_attrs.get('val_score_mean', 'N/A')}"
+                )
 
                 if "train_pvalue" in best_trial.user_attrs:
                     info_data["Train p-value"] = (
@@ -1796,40 +1846,41 @@ def render(output_dir: str) -> None:
                 st.divider()
                 st.markdown("**Robust Trials (Statistically Significant)**")
 
-                robust_data = []
+                # One column per formula weight (renormalised %), plus the
+                # main-term powers (synergy only). Train / test scores +
+                # p-values stay shared. Building columns from
+                # ``formula.weight_keys`` / ``power_keys`` means the table
+                # can't drift away from the registry as new formulas land.
+                def _wlabel(key: str) -> str:
+                    # ``ndvi_weight`` → "NDVI", ``w_ndvi_veg`` → "NDVI·VEG".
+                    cleaned = key.removeprefix("w_").removesuffix("_weight")
+                    return cleaned.replace("_", "·").upper() + " %"
+
+                def _plabel(key: str) -> str:
+                    # ``ndvi_power`` → "NDVI p".
+                    return key.removesuffix("_power").upper() + " p"
+
+                robust_data: list[dict] = []
                 for t in results_view["robust_trials"][:10]:
-                    tw = (
-                        t.params.get("veg_weight", 0)
-                        + t.params.get("terrain_weight", 0)
-                        + t.params.get("ndvi_weight", 0)
+                    row: dict = {"Trial": t.number}
+                    weight_total = sum(
+                        float(t.params.get(k, 0)) for k in formula.weight_keys
                     )
-                    robust_data.append(
-                        {
-                            "Trial": t.number,
-                            "Veg %": (
-                                f"{(t.params.get('veg_weight', 0) / tw * 100):.1f}"
-                                if tw
-                                else "0"
-                            ),
-                            "Terrain %": (
-                                f"{(t.params.get('terrain_weight', 0) / tw * 100):.1f}"
-                                if tw
-                                else "0"
-                            ),
-                            "NDVI %": (
-                                f"{(t.params.get('ndvi_weight', 0) / tw * 100):.1f}"
-                                if tw
-                                else "0"
-                            ),
-                            f"Train {metric_name}": (
-                                f"{t.user_attrs.get('train_score', 0):.4f}"
-                            ),
-                            f"Test {metric_name}": (
-                                f"{t.user_attrs.get('test_score', 0):.4f}"
-                            ),
-                            "Train p": f"{t.user_attrs.get('train_pvalue', 1):.4e}",
-                            "Test p": f"{t.user_attrs.get('test_pvalue', 1):.4e}",
-                        }
+                    for k in formula.weight_keys:
+                        row[_wlabel(k)] = (
+                            f"{100.0 * float(t.params.get(k, 0)) / weight_total:.1f}"
+                            if weight_total > 0 else "0.0"
+                        )
+                    for k in formula.power_keys:
+                        row[_plabel(k)] = f"{float(t.params.get(k, 1.0)):.2f}"
+                    row[f"Train {metric_name}"] = (
+                        f"{t.user_attrs.get('train_score', 0):.4f}"
                     )
+                    row[f"Test {metric_name}"] = (
+                        f"{t.user_attrs.get('test_score', 0):.4f}"
+                    )
+                    row["Train p"] = f"{t.user_attrs.get('train_pvalue', 1):.4e}"
+                    row["Test p"] = f"{t.user_attrs.get('test_pvalue', 1):.4e}"
+                    robust_data.append(row)
 
                 st.dataframe(robust_data, use_container_width=True)
