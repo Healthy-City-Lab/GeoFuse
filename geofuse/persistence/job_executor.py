@@ -73,6 +73,10 @@ class JobContext:
         """Stash live, non-persisted values (engine handles, GeoDataFrames) on the record."""
         self.store.update_progress(self.job_id, **kwargs)
 
+    def update_stage_ledger(self, ledger: dict) -> None:
+        """Persist the job's staged-resume ledger (see geofuse.jobs.stage_ledger)."""
+        self.store.update_stage_ledger(self.job_id, ledger)
+
 
 class JobExecutor:
     """ThreadPoolExecutor that runs runners with a shared GPU lock."""

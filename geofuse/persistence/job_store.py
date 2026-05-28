@@ -49,6 +49,10 @@ class JobRecord:
     completed_at: str | None = None
     error: str | None = None
     output_paths: list[str] = field(default_factory=list)
+    # Ordered staged-resume ledger (see geofuse.jobs.stage_ledger). Persisted as
+    # JSON; the store treats it as an opaque dict. Empty for jobs that don't
+    # track stages.
+    stage_ledger: dict = field(default_factory=dict)
 
     # Runtime-only — never persisted.
     cancel_event: threading.Event = field(
@@ -83,7 +87,8 @@ class JobStore:
         updated_at        TEXT NOT NULL DEFAULT (datetime('now')),
         completed_at      TEXT,
         error             TEXT,
-        output_paths_json TEXT
+        output_paths_json TEXT,
+        stage_ledger_json TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_jobs_status  ON jobs(status);
     CREATE INDEX IF NOT EXISTS idx_jobs_updated ON jobs(updated_at);
@@ -106,6 +111,8 @@ class JobStore:
                     "UPDATE jobs SET submitted_at = updated_at "
                     "WHERE submitted_at IS NULL"
                 )
+            if "stage_ledger_json" not in cols:
+                self._conn.execute("ALTER TABLE jobs ADD COLUMN stage_ledger_json TEXT")
             # Create the index now that submitted_at is guaranteed to exist.
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_jobs_submitted ON jobs(submitted_at)"
@@ -196,6 +203,21 @@ class JobStore:
                 rec.extra.update(extra)
             rec.updated_at = _utc_now_iso()
             rec._dirty = True
+
+    def update_stage_ledger(self, job_id: str, ledger: dict) -> None:
+        """Replace the job's staged-resume ledger and persist it immediately.
+
+        Stage transitions are infrequent (a handful per run), so this writes
+        SQLite straight away — unlike progress ticks — so the ledger survives a
+        process crash between stages and drives the re-run UI.
+        """
+        with self._lock:
+            rec = self._records.get(job_id)
+            if rec is None:
+                return
+            rec.stage_ledger = dict(ledger)
+            rec.updated_at = _utc_now_iso()
+            self._write_row(rec)
 
     def heartbeat(self, job_id: str) -> None:
         """Bump ``updated_at`` to mark the worker as alive."""
@@ -325,8 +347,8 @@ class JobStore:
                 id, type, status, name, params_json,
                 progress, status_text,
                 submitted_at, started_at, updated_at, completed_at,
-                error, output_paths_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                error, output_paths_json, stage_ledger_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 rec.id,
@@ -342,6 +364,7 @@ class JobStore:
                 rec.completed_at,
                 rec.error,
                 json.dumps(rec.output_paths) if rec.output_paths else None,
+                json.dumps(rec.stage_ledger) if rec.stage_ledger else None,
             ),
         )
 
@@ -357,7 +380,7 @@ class JobStore:
             SELECT id, type, status, name, params_json,
                    progress, status_text,
                    submitted_at, started_at, updated_at, completed_at,
-                   error, output_paths_json
+                   error, output_paths_json, stage_ledger_json
             FROM jobs
             ORDER BY updated_at DESC
             LIMIT 200
@@ -379,6 +402,7 @@ class JobStore:
                 completed_at,
                 error,
                 output_paths_json,
+                stage_ledger_json,
             ) = row
             if status in ("running", "queued"):
                 status = "interrupted"
@@ -391,6 +415,12 @@ class JobStore:
                 outputs = json.loads(output_paths_json) if output_paths_json else []
             except json.JSONDecodeError:
                 outputs = []
+            try:
+                stage_ledger = (
+                    json.loads(stage_ledger_json) if stage_ledger_json else {}
+                )
+            except json.JSONDecodeError:
+                stage_ledger = {}
             self._records[jid] = JobRecord(
                 id=jid,
                 type=jtype,
@@ -405,6 +435,7 @@ class JobStore:
                 completed_at=completed_at,
                 error=error,
                 output_paths=outputs,
+                stage_ledger=stage_ledger,
             )
         for jid in to_interrupt:
             rec = self._records[jid]

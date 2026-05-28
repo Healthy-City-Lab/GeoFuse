@@ -15,6 +15,7 @@ import streamlit as st
 from branca.element import MacroElement
 from helpers import (
     FUSION_TARGET_UPLOAD_TYPES,
+    RESTART_SESSION_KEY,
     materialize_uploaded_dataset,
     sanitize_gdf_attributes_for_json,
 )
@@ -32,6 +33,7 @@ except ImportError:
 from geofuse.crs_utils import buffer_gdf_union_metres, reproject_geodataframe_to_wgs84
 from geofuse.jobs.runners import run_fusion
 from geofuse.vector_io import (
+    geometry_sha256,
     list_gpkg_layer_names,
     read_vector_path,
     vector_format_from_path,
@@ -263,6 +265,291 @@ def _check_coverage(metric_path: str, buffered_gdf: "gpd.GeoDataFrame") -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Restart workflow
+# ---------------------------------------------------------------------------
+
+
+def _fusion_restart_summary_lines(p: dict) -> list[str]:
+    """Read-only summary of the original job's config shown above the re-run form."""
+    lines = [
+        f"**Target:** `{p.get('target_display_name', '?')}`",
+        f"**Outcomes:** {', '.join(p.get('outcome_columns') or []) or '—'}",
+        f"**Trials:** {p.get('n_trials', '?')} "
+        f"(startup {p.get('n_startup_trials', '?')})",
+        f"**Objective:** {p.get('objective_metric', '?')} · "
+        f"**Sampler:** {p.get('sampler_type', '?')} · "
+        f"**Pruner:** {p.get('pruner_type', '?')}",
+        f"**GVI buffers (m):** {p.get('gvi_buffer_min_m', '?')} – "
+        f"{p.get('gvi_buffer_max_m', '?')} (step {p.get('gvi_buffer_step_m', '?')})",
+        f"**NDVI buffers (m):** {p.get('ndvi_buffer_min_m', '?')} – "
+        f"{p.get('ndvi_buffer_max_m', '?')} (step {p.get('ndvi_buffer_step_m', '?')})",
+        f"**Metric source:** {p.get('metric_mode', '?')}",
+    ]
+    return lines
+
+
+def _submit_fusion_restart(
+    store,
+    executor,
+    rec,
+    p: dict,
+    target_mat,
+    output_dir: str,
+    veg_path: str | None,
+    ndvi_path: str | None,
+    api_key: str | None,
+) -> None:
+    """Resubmit a fusion job with identical params; on-disk caches resume.
+
+    The Optuna study (by ``study_name``), the per-job pre-aggregation cache (by
+    fingerprint), and the metric-download cache are all content-addressed, so a
+    same-config resubmit picks up where the previous run left off — the new job
+    just walks the stage ledger, with stages whose underlying caches are
+    populated completing near-instantly.
+    """
+    if _MetricFusionEngine is None:
+        raise RuntimeError("MetricFusionEngine is unavailable; cannot restart.")
+
+    new_params = dict(p)
+    new_params["restart_of"] = rec.id
+    new_params["resume_existing_study"] = True
+    new_params["has_api_key"] = api_key is not None
+
+    is_vector = bool(p.get("is_vector_target"))
+    outcome_columns = list(p.get("outcome_columns") or [])
+    job_target_band = int(p.get("target_band", 1))
+
+    new_rec = store.submit(type="fusion", name=rec.name, params=new_params)
+    executor.submit_runner(
+        new_rec,
+        run_fusion,
+        target_path=target_mat.path,
+        target_features_geojson=(tuple(outcome_columns) if is_vector else ()),
+        target_band=job_target_band if not is_vector else 1,
+        target_layer=p.get("target_layer") if is_vector else None,
+        target_cleanup_dir=target_mat.cleanup_dir,
+        target_cleanup_file=target_mat.cleanup_file,
+        buffer_meters=float(p.get("buffer_meters", 0.0)),
+        gvi_buffer_min_m=float(p.get("gvi_buffer_min_m", 100)),
+        gvi_buffer_max_m=float(p.get("gvi_buffer_max_m", 1500)),
+        gvi_buffer_step_m=float(p.get("gvi_buffer_step_m", 50)),
+        ndvi_buffer_min_m=float(p.get("ndvi_buffer_min_m", 100)),
+        ndvi_buffer_max_m=float(p.get("ndvi_buffer_max_m", 1500)),
+        ndvi_buffer_step_m=float(p.get("ndvi_buffer_step_m", 50)),
+        ndvi_resolution_m=p.get("ndvi_resolution_m"),
+        gvi_grid_spacing_m=p.get("gvi_grid_spacing_m"),
+        n_bins=int(p.get("n_bins", 5)),
+        veg_path=veg_path,
+        terrain_path=None,
+        ndvi_path=ndvi_path,
+        cache_metrics=bool(p.get("cache_metrics", False)),
+        test_size=float(p.get("test_size", 0.3)),
+        k_folds=int(p.get("k_folds", 5)),
+        n_trials=int(p.get("n_trials", 300)),
+        n_startup_trials=int(p.get("n_startup_trials", 150)),
+        objective_metric=p.get("objective_metric", "pearson"),
+        pruner_type=p.get("pruner_type", "median"),
+        sampler_type=p.get("sampler_type", "TPE"),
+        gvi_api_key=api_key,
+        ndvi_start_date=p.get("ndvi_start_date") or date(2023, 6, 1).isoformat(),
+        ndvi_end_date=p.get("ndvi_end_date") or date(2023, 9, 30).isoformat(),
+        ndvi_project_id=None,
+        multi_objective_requested=bool(p.get("multi_objective_requested")),
+        output_dir=output_dir,
+        MetricFusionEngine=_MetricFusionEngine,
+        target_display_name=p.get("target_display_name") or "target",
+        resume_existing_study=True,
+    )
+
+
+def _render_fusion_restart_panel(store, executor, output_dir: str) -> bool:
+    """Restart workflow for a stopped fusion job.
+
+    Returns True when the panel handled the active restart session — the caller
+    should ``return`` and skip the rest of the tab so the user finishes the
+    restart flow before submitting anything else.
+    """
+    job_id = st.session_state.get(RESTART_SESSION_KEY)
+    if not job_id:
+        return False
+    rec = store.get(job_id)
+    if rec is None or rec.type != "fusion":
+        return False
+
+    p = rec.params or {}
+    is_vector = bool(p.get("is_vector_target"))
+    metric_mode = p.get("metric_mode") or "Use Loaded Results"
+    had_api_key = bool(p.get("has_api_key"))
+    expected_hash = p.get("geometry_sha256")
+
+    with st.expander(f"↻ Restart fusion job: {rec.name or rec.id}", expanded=True):
+        st.caption(
+            "Re-upload the original target file. The Optuna study, "
+            "pre-aggregation cache, and metric downloads are all content-"
+            "addressed, so a same-config restart resumes where the previous "
+            "run stopped."
+        )
+        for line in _fusion_restart_summary_lines(p):
+            st.write(line)
+
+        cancel_col, _ = st.columns([1, 4])
+        with cancel_col:
+            if st.button("Cancel restart", key=f"f_restart_cancel_{rec.id}"):
+                st.session_state[RESTART_SESSION_KEY] = None
+                st.rerun()
+
+        target_uploads = st.file_uploader(
+            f"Re-upload target (original: `{p.get('target_display_name', '?')}`)",
+            accept_multiple_files=True,
+            type=FUSION_TARGET_UPLOAD_TYPES,
+            key=f"f_restart_target_{rec.id}",
+        )
+        if not target_uploads:
+            st.info("Select the original target file(s) to continue.")
+            return True
+
+        try:
+            target_mat = materialize_uploaded_dataset(target_uploads)
+        except ValueError as e:
+            st.error(str(e))
+            return True
+
+        if is_vector:
+            try:
+                rv_kwargs: dict = {}
+                target_layer = p.get("target_layer")
+                if target_layer is not None and Path(
+                    target_mat.path
+                ).suffix.lower() in (
+                    ".gpkg",
+                    ".zip",
+                ):
+                    rv_kwargs["layer"] = target_layer
+                gdf_re = read_vector_path(target_mat.path, **rv_kwargs)
+            except Exception as e:
+                st.error(f"Failed to read target: {e}")
+                return True
+            actual_hash = geometry_sha256(gdf_re)
+            if expected_hash:
+                if actual_hash != expected_hash:
+                    st.error(
+                        "Hash mismatch — uploaded target is not the original.\n\n"
+                        f"  Expected: `{expected_hash[:16]}…`\n"
+                        f"  Got:      `{actual_hash[:16]}…`"
+                    )
+                    return True
+                st.success("Target geometry verified against the original.")
+            else:
+                st.toast(
+                    "Original geometry hash was not recorded — skipping verification.",
+                    icon="⚠️",
+                )
+        else:
+            st.toast("Raster target — content hash not verified.", icon="ℹ️")
+
+        # Re-resolve metric files. Loaded-results paths live under the output
+        # folder and are stable; uploaded files were tempdir-scoped and gone;
+        # auto-download skips both (the runner re-fetches via the disk cache).
+        veg_path_re: str | None = None
+        ndvi_path_re: str | None = None
+        if metric_mode == "Upload Files":
+            st.markdown("**Re-upload metric files (original temp uploads are gone)**")
+            col_g, col_n = st.columns(2)
+            with col_g:
+                gvi_up = st.file_uploader(
+                    "🌿 GVI File",
+                    accept_multiple_files=True,
+                    type=FUSION_TARGET_UPLOAD_TYPES,
+                    key=f"f_restart_gvi_{rec.id}",
+                )
+                if gvi_up:
+                    try:
+                        veg_path_re = materialize_uploaded_dataset(gvi_up).path
+                    except ValueError as e:
+                        st.error(f"GVI: {e}")
+                        return True
+            with col_n:
+                ndvi_up = st.file_uploader(
+                    "🛰️ NDVI File",
+                    accept_multiple_files=True,
+                    type=FUSION_TARGET_UPLOAD_TYPES,
+                    key=f"f_restart_ndvi_{rec.id}",
+                )
+                if ndvi_up:
+                    try:
+                        ndvi_path_re = materialize_uploaded_dataset(ndvi_up).path
+                    except ValueError as e:
+                        st.error(f"NDVI: {e}")
+                        return True
+        elif metric_mode == "Use Loaded Results":
+            gvi_bn = p.get("gvi_basename")
+            ndvi_bn = p.get("ndvi_basename")
+            if gvi_bn and p.get("gvi_under_output_dir"):
+                cand = os.path.join(output_dir, gvi_bn)
+                if os.path.exists(cand):
+                    veg_path_re = cand
+                    st.success(f"✓ Reusing GVI file from output folder: `{gvi_bn}`")
+                else:
+                    st.warning(
+                        f"⚠️ GVI file `{gvi_bn}` is no longer in the output folder; "
+                        "the runner will auto-download (cache reused when present)."
+                    )
+            if ndvi_bn and p.get("ndvi_under_output_dir"):
+                cand = os.path.join(output_dir, ndvi_bn)
+                if os.path.exists(cand):
+                    ndvi_path_re = cand
+                    st.success(f"✓ Reusing NDVI file from output folder: `{ndvi_bn}`")
+                else:
+                    st.warning(
+                        f"⚠️ NDVI file `{ndvi_bn}` is no longer in the output folder; "
+                        "the runner will auto-download (cache reused when present)."
+                    )
+        # Auto-Download: leave both paths None; runner re-runs the download
+        # against the metric cache (cache_metrics flag preserved in params).
+
+        api_key: str | None = None
+        if had_api_key:
+            st.caption(
+                "Original job used the Street View API. Re-supply the API key "
+                "(secrets are not persisted between runs)."
+            )
+            api_key = (
+                st.text_input(
+                    "Street View API Key",
+                    type="password",
+                    autocomplete="off",
+                    key=f"f_restart_apikey_{rec.id}",
+                )
+                or None
+            )
+
+        if st.button(
+            "Verify & re-run",
+            type="primary",
+            key=f"f_restart_confirm_{rec.id}",
+        ):
+            try:
+                _submit_fusion_restart(
+                    store,
+                    executor,
+                    rec,
+                    p,
+                    target_mat,
+                    output_dir,
+                    veg_path_re,
+                    ndvi_path_re,
+                    api_key,
+                )
+            except Exception as e:
+                st.error(f"Re-submission failed: {e}")
+                return True
+            st.session_state[RESTART_SESSION_KEY] = None
+            st.success("Restart submitted. Monitor progress in the sidebar.")
+            st.rerun()
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Tab render entry point
 # ---------------------------------------------------------------------------
 
@@ -274,6 +561,16 @@ def render(output_dir: str) -> None:
 
     if MetricFusionEngine is None:
         st.error("MetricFusionEngine module not found in geofuse/fusion.py")
+        return
+
+    # Surface the restart workflow if the user clicked ↻ on a fusion job in the
+    # sidebar monitor. The panel takes over the tab until cancelled or
+    # confirmed — same pattern as the GVI / NDVI tabs.
+    from services import get_job_executor, get_job_store
+
+    _restart_store = get_job_store()
+    _restart_executor = get_job_executor()
+    if _render_fusion_restart_panel(_restart_store, _restart_executor, output_dir):
         return
 
     if "fusion_engine" not in st.session_state:
@@ -1126,6 +1423,26 @@ def render(output_dir: str) -> None:
                     st.session_state.get("fusion_target_band", target_band)
                 )
 
+                # Persist the full re-runnable config so the fusion restart
+                # panel can resubmit a stopped job with identical settings.
+                # Temp paths (target_path, uploaded metric temp files) and the
+                # API key are intentionally omitted — re-upload / re-supply on
+                # restart. For metric files chosen from the output folder
+                # ("Use Loaded Results"), we store the basename + a flag and
+                # re-join against the current output_dir at restart time.
+                def _under_dir(path: str | None, base: str) -> bool:
+                    if not path:
+                        return False
+                    return os.path.dirname(os.path.abspath(path)).rstrip(
+                        os.sep
+                    ) == os.path.abspath(base).rstrip(os.sep)
+
+                target_geom_sha = (
+                    geometry_sha256(preview_vector_gdf)
+                    if is_vector_target and preview_vector_gdf is not None
+                    else None
+                )
+
                 fusion_record = store.submit(
                     type="fusion",
                     name=os.path.splitext(target_display_name)[0],
@@ -1134,6 +1451,8 @@ def render(output_dir: str) -> None:
                         "is_vector_target": is_vector_target,
                         "outcome_columns": list(target_outcome_columns),
                         "target_band": job_target_band,
+                        "target_layer": target_layer_for_engine,
+                        "geometry_sha256": target_geom_sha,
                         "n_trials": n_trials,
                         "n_startup_trials": n_startup_trials,
                         "objective_metric": objective_metric,
@@ -1141,6 +1460,37 @@ def render(output_dir: str) -> None:
                         "pruner_type": pruner_type,
                         "multi_objective_requested": fusion_multi_objective,
                         "resume_existing_study": resume_existing_study,
+                        # Spatial / sampling config — recreates the same engine
+                        # build and pre-aggregation cache fingerprint on restart.
+                        "buffer_meters": float(buffer_extent_m),
+                        "gvi_buffer_min_m": float(gvi_buffer_min_m),
+                        "gvi_buffer_max_m": float(gvi_buffer_max_m),
+                        "gvi_buffer_step_m": float(gvi_buffer_step_m),
+                        "ndvi_buffer_min_m": float(ndvi_buffer_min_m),
+                        "ndvi_buffer_max_m": float(ndvi_buffer_max_m),
+                        "ndvi_buffer_step_m": float(ndvi_buffer_step_m),
+                        "ndvi_resolution_m": ndvi_resolution_m,
+                        "gvi_grid_spacing_m": gvi_grid_spacing_m,
+                        "n_bins": int(n_bins),
+                        "cache_metrics": bool(cache_metrics),
+                        "test_size": float(test_size),
+                        "k_folds": int(k_folds),
+                        "ndvi_start_date": ndvi_auto_start.isoformat(),
+                        "ndvi_end_date": ndvi_auto_end.isoformat(),
+                        # Metric source + how to re-resolve metric files on
+                        # restart. Temp uploads can't be re-resolved without
+                        # the original session; the restart panel asks the
+                        # user to re-upload in that case.
+                        "metric_mode": metric_mode,
+                        "gvi_basename": (
+                            os.path.basename(gvi_path) if gvi_path else None
+                        ),
+                        "ndvi_basename": (
+                            os.path.basename(ndvi_path) if ndvi_path else None
+                        ),
+                        "gvi_under_output_dir": _under_dir(gvi_path, output_dir),
+                        "ndvi_under_output_dir": _under_dir(ndvi_path, output_dir),
+                        "has_api_key": bool(gvi_api_key),
                     },
                 )
                 executor.submit_runner(

@@ -157,6 +157,12 @@ def _render_ndvi_restart_panel(store, executor, output_dir) -> None:
             "Sourcing** tab to complete it."
         )
         return
+    if rec.type == "fusion":
+        st.info(
+            "A restart is pending for a fusion job. Switch to the **Metric "
+            "Fusion** tab to complete it."
+        )
+        return
     if rec.type not in ("ndvi", "ndvi_column"):
         return
 
