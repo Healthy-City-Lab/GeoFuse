@@ -26,7 +26,7 @@ from sklearn.metrics import mean_squared_error, mutual_info_score, r2_score
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import MinMaxScaler
 
-from . import cgi_formulas, preaggregation
+from . import cgi_formulas, objective_scoring, preaggregation
 from .cgi_formulas import WEIGHTED_AVERAGE, compute_cgi
 from .crs_utils import (
     build_internal_overviews,
@@ -133,6 +133,7 @@ class MetricFusionEngine:
         n_bins: int = 5,
         cache_dir: str = "output_results/fusion_cache",
         cgi_formula: str = WEIGHTED_AVERAGE,
+        covariate_columns: list[str] | None = None,
     ):
         """
         Initialize the fusion engine.
@@ -151,6 +152,17 @@ class MetricFusionEngine:
             cgi_formula: Which composite formula to optimize against. One of
                 :data:`geofuse.cgi_formulas.available_formulas` — defaults to
                 ``"weighted_average"`` so existing studies replay unchanged.
+            covariate_columns: Numeric column names on the (vector) target to
+                carry through ``prepare_fusion_data`` and use as additional
+                predictors in the objective. The score becomes the greenery
+                term's *partial* contribution (partial correlation /
+                incremental R² / full-model RMSE) — see
+                :mod:`geofuse.objective_scoring` for the per-metric semantics.
+                ``mutual_info`` ignores covariates by design. Not supported
+                for raster targets (no attribute table); a non-empty list
+                with a raster target raises ``ValueError`` from
+                :meth:`prepare_fusion_data`. Defaults to ``None`` → score
+                reduces exactly to the legacy ``_calculate_metric``.
         """
         # Route Optuna's chatter ("Trial X finished with value Y …") into
         # the per-job log instead of the Streamlit host terminal. Fusion
@@ -211,6 +223,14 @@ class MetricFusionEngine:
         # optimization. ``get_formula`` raises ValueError with the supported list.
         self.cgi_formula = cgi_formula
         cgi_formulas.get_formula(cgi_formula)
+
+        # Covariate columns are stashed on self; per-row values are carried into
+        # the prepared fusion DataFrame, then split + scored alongside target
+        # and CGI. Empty list = legacy single-variable scoring (no change).
+        # De-duplicated to avoid a singular design matrix in the partial-
+        # correlation / incremental-R² OLS.
+        cov_in = list(covariate_columns) if covariate_columns else []
+        self.covariate_columns: list[str] = list(dict.fromkeys(cov_in))
         self._ndvi_export_resolution_m = 10.0
         self._gvi_grid_spacing_m = 75.0
 
@@ -1743,9 +1763,43 @@ class MetricFusionEngine:
         - For raster targets: align all data to target grid
 
         Returns:
-            DataFrame with columns: [target, veg, terrain, ndvi]
+            DataFrame with columns: [target, veg, terrain, ndvi] plus any
+            configured covariate columns (broadcast per-row from the target
+            attributes, or per-polygon for the polygon path).
         """
         _log("INFO", "====== PREPARE FUSION DATA ======")
+
+        # Covariates need attribute columns — raster targets don't have them
+        # and the polygon/point paths need to validate the requested names
+        # before any heavy work happens.
+        if self.covariate_columns:
+            if self.is_raster and not self.is_polygon_target:
+                raise ValueError(
+                    "covariate_columns are only supported for vector (point / "
+                    "polygon) targets; this target is a raster. Got "
+                    f"covariate_columns={self.covariate_columns}."
+                )
+            if self.target_gdf is not None:
+                missing = [
+                    c for c in self.covariate_columns
+                    if c not in self.target_gdf.columns
+                ]
+                if missing:
+                    raise ValueError(
+                        f"covariate_columns not found on target: {missing}. "
+                        f"Available numeric attribute columns: "
+                        f"{sorted(self.target_gdf.columns)}"
+                    )
+                non_numeric = [
+                    c for c in self.covariate_columns
+                    if not pd.api.types.is_numeric_dtype(self.target_gdf[c])
+                ]
+                if non_numeric:
+                    raise ValueError(
+                        "covariate_columns must be numeric for the regression-"
+                        f"based scorers; got non-numeric: {non_numeric}."
+                    )
+
         if self.is_polygon_target:
             _log("INFO", "Target type: POLYGON (areal aggregation)")
             return self._prepare_polygon_fusion()
@@ -2196,12 +2250,18 @@ class MetricFusionEngine:
             elif best_label is not None:
                 ref_counts[best_label] += 1
 
+            # Polygon-level covariate values are broadcast onto every in-polygon
+            # sample so the per-row data flow stays uniform; the per-polygon
+            # collapse in _objective / evaluate_on_test groupby-first()s them
+            # back to one value per polygon for scoring.
+            cov_values = {col: row.get(col, np.nan) for col in self.covariate_columns}
             for geom in best_pts.geometry:
                 sample_records.append(
                     {
                         "polygon_id": poly_id,
                         "target": outcome,
                         "geometry": geom,
+                        **cov_values,
                     }
                 )
 
@@ -2265,6 +2325,10 @@ class MetricFusionEngine:
             },
             index=sample_gdf.index,
         )
+        # Polygon-broadcast covariates ride on every sample row; the per-
+        # polygon collapse in _objective recovers one value per polygon.
+        for col in self.covariate_columns:
+            fusion_df[col] = sample_gdf[col].values
 
         _log("INFO", "====== DATA QUALITY SUMMARY (POLYGON) ======")
         _log(
@@ -2272,12 +2336,14 @@ class MetricFusionEngine:
             f"Total sample rows: {len(fusion_df)} "
             f"across {fusion_df['polygon_id'].nunique()} polygons",
         )
-        for col in ("target", "veg", "terrain", "ndvi"):
+        for col in ["target", "veg", "terrain", "ndvi", *self.covariate_columns]:
             nan_count = fusion_df[col].isna().sum()
             pct = nan_count / max(len(fusion_df), 1) * 100
-            _log("INFO", f"{col.capitalize()} NaN: {nan_count} ({pct:.1f}%)")
+            _log("INFO", f"{col} NaN: {nan_count} ({pct:.1f}%)")
 
-        result = fusion_df.dropna(subset=["target", "veg", "terrain", "ndvi"])
+        result = fusion_df.dropna(
+            subset=["target", "veg", "terrain", "ndvi", *self.covariate_columns]
+        )
         polygons_left = result["polygon_id"].nunique() if len(result) else 0
         _log(
             "OK" if polygons_left else "WARN",
@@ -2319,14 +2385,18 @@ class MetricFusionEngine:
                 "ndvi": points_gdf["ndvi"],
             }
         )
+        # Carry covariate values onto each row alongside the target so the
+        # split / objective / evaluate paths all see them as plain columns.
+        for col in self.covariate_columns:
+            fusion_df[col] = points_gdf[col].to_numpy()
 
         # Log data quality before dropping NaN
         _log("INFO", "====== DATA QUALITY SUMMARY (POINT) ======")
         _log("INFO", f"Total rows: {len(fusion_df)}")
-        for col in ("target", "veg", "terrain", "ndvi"):
+        for col in ["target", "veg", "terrain", "ndvi", *self.covariate_columns]:
             nan_count = fusion_df[col].isna().sum()
             pct = nan_count / max(len(fusion_df), 1) * 100
-            _log("INFO", f"{col.capitalize()} NaN: {nan_count} ({pct:.1f}%)")
+            _log("INFO", f"{col} NaN: {nan_count} ({pct:.1f}%)")
 
         result = fusion_df.dropna()
         _log(
@@ -3261,6 +3331,16 @@ class MetricFusionEngine:
                 },
             )
 
+            # Per-fold covariate design matrix (or None when no covariates
+            # configured). Polygon mode collapses these alongside the target.
+            cov_cols = self.covariate_columns
+            if cov_cols:
+                train_cov = train_data[cov_cols].to_numpy(dtype=np.float64)
+                val_cov = val_data[cov_cols].to_numpy(dtype=np.float64)
+            else:
+                train_cov = None
+                val_cov = None
+
             # Polygon mode: per-row CGI → per-polygon mean CGI, then score
             # against the per-polygon outcome.
             if "polygon_id" in train_data.columns:
@@ -3279,6 +3359,25 @@ class MetricFusionEngine:
                 val_targets_arr = (
                     pd.Series(val_data["target"].values).groupby(val_pid).first().values
                 )
+                if train_cov is not None and val_cov is not None:
+                    # Covariates were broadcast onto every in-polygon sample by
+                    # _prepare_polygon_fusion, so first() per polygon recovers
+                    # one value per polygon — same shape as the collapsed
+                    # target / composite.
+                    tc = train_cov  # local binding for the type checker
+                    vc = val_cov
+                    train_cov = np.column_stack(
+                        [
+                            pd.Series(tc[:, j]).groupby(train_pid).first().values
+                            for j in range(tc.shape[1])
+                        ]
+                    )
+                    val_cov = np.column_stack(
+                        [
+                            pd.Series(vc[:, j]).groupby(val_pid).first().values
+                            for j in range(vc.shape[1])
+                        ]
+                    )
             else:
                 train_targets_arr = train_data["target"].values
                 val_targets_arr = val_data["target"].values
@@ -3299,33 +3398,32 @@ class MetricFusionEngine:
                     "Validation composite has no variance (constant values)"
                 )
 
-            # Calculate metrics
-            train_score = self._calculate_metric(
-                train_targets_arr, train_composite, metric
+            # Calculate scores via the covariate-aware scorer. With no
+            # covariates this reduces exactly to the legacy _calculate_metric.
+            # The p-value for correlation metrics is the residual correlation's
+            # p-value — i.e. the partial-correlation significance.
+            wants_pval = metric in ("pearson", "spearman")
+            train_out = objective_scoring.score(
+                metric, train_targets_arr, train_composite,
+                covariates=train_cov, return_pvalue=wants_pval,
             )
-            val_score = self._calculate_metric(val_targets_arr, val_composite, metric)
+            val_out = objective_scoring.score(
+                metric, val_targets_arr, val_composite,
+                covariates=val_cov, return_pvalue=wants_pval,
+            )
+            if wants_pval:
+                # return_pvalue=True returns (score, pvalue); type cast is for
+                # the static checker.
+                train_score, train_pval = train_out  # type: ignore[misc]
+                val_score, val_pval = val_out  # type: ignore[misc]
+                fold_train_pvals.append(train_pval)
+                fold_val_pvals.append(val_pval)
+            else:
+                train_score = train_out
+                val_score = val_out
 
             fold_train_scores.append(train_score)
             fold_val_scores.append(val_score)
-
-            # Calculate p-values for correlation metrics
-            if metric in ["pearson", "spearman"]:
-                import warnings
-
-                from scipy.stats import ConstantInputWarning
-
-                with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore", category=RuntimeWarning)
-                    warnings.filterwarnings("ignore", category=ConstantInputWarning)
-                    if metric == "pearson":
-                        _, train_pval = pearsonr(train_targets_arr, train_composite)
-                        _, val_pval = pearsonr(val_targets_arr, val_composite)
-                    else:
-                        _, train_pval = spearmanr(train_targets_arr, train_composite)
-                        _, val_pval = spearmanr(val_targets_arr, val_composite)
-
-                    fold_train_pvals.append(train_pval)
-                    fold_val_pvals.append(val_pval)
 
         # ─── Store Aggregate Statistics ────────────────────────────────────────
         avg_train_score = np.mean(fold_train_scores)
@@ -3678,6 +3776,13 @@ class MetricFusionEngine:
             },
         )
 
+        # Test-set covariate matrix (or None when no covariates configured).
+        cov_cols = self.covariate_columns
+        if cov_cols:
+            test_cov = self.test_data[cov_cols].to_numpy(dtype=np.float64)
+        else:
+            test_cov = None
+
         # Polygon mode: aggregate per-row CGI by polygon before scoring against
         # the per-polygon outcome.
         if "polygon_id" in self.test_data.columns:
@@ -3689,18 +3794,33 @@ class MetricFusionEngine:
                 .first()
                 .values
             )
+            if test_cov is not None:
+                tc = test_cov  # type-narrow for the comprehension
+                test_cov = np.column_stack(
+                    [
+                        pd.Series(tc[:, j]).groupby(test_pid).first().values
+                        for j in range(tc.shape[1])
+                    ]
+                )
         else:
             test_targets = self.test_data["target"].values
-        test_score = self._calculate_metric(test_targets, test_composite, metric)
 
-        # Calculate p-value for correlation metrics
+        # Covariate-aware scoring; reduces exactly to _calculate_metric when
+        # no covariates are configured. Partial-correlation p-value falls out
+        # of return_pvalue=True for the two correlation metrics.
+        wants_pval = metric in ("pearson", "spearman")
+        score_out = objective_scoring.score(
+            metric, test_targets, test_composite,
+            covariates=test_cov, return_pvalue=wants_pval,
+        )
+        if wants_pval:
+            test_score, test_pval = score_out  # type: ignore[misc]
+        else:
+            test_score = float(score_out)
+            test_pval = None
+
         result = {"test_score": test_score, "metric": metric}
-
-        if metric in ["pearson", "spearman"]:
-            if metric == "pearson":
-                _, test_pval = pearsonr(test_targets, test_composite)
-            else:
-                _, test_pval = spearmanr(test_targets, test_composite)
+        if test_pval is not None:
             result["test_pvalue"] = test_pval
             logger.info(
                 f"Test {metric}: {test_score:.4f} (p={test_pval:.4e}, n={len(test_targets)})"
