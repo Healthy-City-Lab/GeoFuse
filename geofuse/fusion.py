@@ -224,6 +224,15 @@ class MetricFusionEngine:
         self.cgi_formula = cgi_formula
         cgi_formulas.get_formula(cgi_formula)
 
+        # Greenery channel for the active study. ``cgi`` runs the combined
+        # formula (the standard fusion behaviour); ``veg`` / ``terrain`` /
+        # ``ndvi`` run a standalone single-metric study that uses that
+        # channel's normalised value directly as the greenery value and
+        # searches only its radius + aggregation. Set per call by
+        # ``optimize_fusion``; ``evaluate_on_test`` reads it so the held-out
+        # test score stays aligned with what the study actually scored.
+        self._active_greenery_channel: str = "cgi"
+
         # Covariate columns are stashed on self; per-row values are carried into
         # the prepared fusion DataFrame, then split + scored alongside target
         # and CGI. Empty list = legacy single-variable scoring (no change).
@@ -2908,6 +2917,7 @@ class MetricFusionEngine:
         study_dir: str | None = None,
         cancel_callback: Callable[[], bool] | None = None,
         cgi_formula: str | None = None,
+        greenery_channel: str = "cgi",
     ) -> dict:
         """
         Run Optuna optimization with k-fold cross-validation.
@@ -2942,6 +2952,17 @@ class MetricFusionEngine:
         if cgi_formula is not None:
             cgi_formulas.get_formula(cgi_formula)
             self.cgi_formula = cgi_formula
+
+        # Greenery channel — ``cgi`` runs the formula; any other value (one of
+        # ``veg`` / ``terrain`` / ``ndvi``) runs a standalone single-metric
+        # study. Validated here; the value is stashed on self so _objective
+        # and evaluate_on_test see the same mode after this call returns.
+        if greenery_channel not in ("cgi", "veg", "terrain", "ndvi"):
+            raise ValueError(
+                f"greenery_channel must be one of 'cgi','veg','terrain','ndvi'; "
+                f"got {greenery_channel!r}."
+            )
+        self._active_greenery_channel = greenery_channel
 
         self._clear_ring_caches()
 
@@ -3106,14 +3127,25 @@ class MetricFusionEngine:
             )
 
         # ─── Suggest formula parameters (weights + powers) ────────────────────
-        # All weight-sum / power constraints are baked into the search space by
-        # the formula's ``suggest_params`` (sequential conditional allocation on
-        # the simplex). The legacy ``weighted_average`` formula produces the
-        # same ``veg_weight`` / ``terrain_weight`` / ``ndvi_weight`` integer
-        # keys the old inline code did, so existing studies replay unchanged.
-        formula = cgi_formulas.get_formula(self.cgi_formula)
-        formula_params = formula.suggest_params(trial)
-        channel_active = formula.channel_active(formula_params)
+        # In ``cgi`` mode the formula's ``suggest_params`` bakes the weight-sum
+        # / power constraints into the search space (sequential conditional
+        # allocation on the simplex), and ``channel_active`` drives the
+        # per-channel skip below. In a standalone single-metric study no
+        # weights are recorded — only the active channel needs aggregation —
+        # so ``formula_params`` is empty and the channel flags are hard-coded.
+        channel_mode = self._active_greenery_channel
+        if channel_mode == "cgi":
+            formula = cgi_formulas.get_formula(self.cgi_formula)
+            formula_params = formula.suggest_params(trial)
+            channel_active = formula.channel_active(formula_params)
+        else:
+            formula = None
+            formula_params = {}
+            channel_active = {
+                "veg": channel_mode == "veg",
+                "terrain": channel_mode == "terrain",
+                "ndvi": channel_mode == "ndvi",
+            }
 
         # When pre-aggregation is active, percentile suggestions are restricted
         # to the 10 % grid {10,20,…,90} so every trial maps to a precomputed
@@ -3312,26 +3344,34 @@ class MetricFusionEngine:
             val_terrain_norm = val_combined[:, 1]
             val_ndvi_norm = val_combined[:, 2]
 
-            # Calculate composite index from the selected CGI formula. Both
-            # weighted_average and synergy normalize / clamp internally.
-            train_composite = compute_cgi(
-                self.cgi_formula,
-                formula_params,
-                {
+            # Build the greenery value the objective scores against. In CGI
+            # mode that's the selected formula's composite; in standalone mode
+            # it's the active channel's normalised value used directly (the
+            # role the CGI value plays in the combined run).
+            if channel_mode == "cgi":
+                train_components = {
                     "veg": train_veg_norm,
                     "terrain": train_terrain_norm,
                     "ndvi": train_ndvi_norm,
-                },
-            )
-            val_composite = compute_cgi(
-                self.cgi_formula,
-                formula_params,
-                {
+                }
+                val_components = {
                     "veg": val_veg_norm,
                     "terrain": val_terrain_norm,
                     "ndvi": val_ndvi_norm,
-                },
-            )
+                }
+                train_composite = compute_cgi(
+                    self.cgi_formula, formula_params, train_components
+                )
+                val_composite = compute_cgi(
+                    self.cgi_formula, formula_params, val_components
+                )
+            else:
+                single = {
+                    "veg": (train_veg_norm, val_veg_norm),
+                    "terrain": (train_terrain_norm, val_terrain_norm),
+                    "ndvi": (train_ndvi_norm, val_ndvi_norm),
+                }[channel_mode]
+                train_composite, val_composite = single
 
             # Per-fold covariate design matrix (or None when no covariates
             # configured). Polygon mode collapses these alongside the target.
@@ -3683,11 +3723,22 @@ class MetricFusionEngine:
 
         logger.info("Evaluating on held-out test set...")
 
-        # Use the engine's active formula to decide which channels contribute
-        # (matches the per-trial gating in ``_objective`` and routes the final
-        # composite through the same ``compute_cgi`` call site).
-        formula = cgi_formulas.get_formula(self.cgi_formula)
-        channel_active = formula.channel_active(params)
+        # Use the engine's active mode to decide which channels contribute and
+        # how the composite is built. CGI mode delegates to the formula's
+        # ``channel_active`` + ``compute_cgi``; standalone mode uses the active
+        # channel directly so the test score is on the same scale the study
+        # optimised against.
+        channel_mode = self._active_greenery_channel
+        if channel_mode == "cgi":
+            channel_active = cgi_formulas.get_formula(self.cgi_formula).channel_active(
+                params
+            )
+        else:
+            channel_active = {
+                "veg": channel_mode == "veg",
+                "terrain": channel_mode == "terrain",
+                "ndvi": channel_mode == "ndvi",
+            }
 
         # Extract aggregation parameters
         streetview_stat = params.get("streetview_stat", "mean")
@@ -3772,17 +3823,24 @@ class MetricFusionEngine:
         test_terrain_norm = test_combined[:, 1]
         test_ndvi_norm = test_combined[:, 2]
 
-        # Calculate composite via the active CGI formula (same call site the
-        # objective uses, so test scores stay consistent with optimization).
-        test_composite = compute_cgi(
-            self.cgi_formula,
-            params,
-            {
+        # Calculate composite via the active mode. Same fork as ``_objective``
+        # so the held-out score is on the same scale the study optimised.
+        if channel_mode == "cgi":
+            test_composite = compute_cgi(
+                self.cgi_formula,
+                params,
+                {
+                    "veg": test_veg_norm,
+                    "terrain": test_terrain_norm,
+                    "ndvi": test_ndvi_norm,
+                },
+            )
+        else:
+            test_composite = {
                 "veg": test_veg_norm,
                 "terrain": test_terrain_norm,
                 "ndvi": test_ndvi_norm,
-            },
-        )
+            }[channel_mode]
 
         # Test-set covariate matrix (or None when no covariates configured).
         cov_cols = self.covariate_columns
