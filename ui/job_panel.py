@@ -42,8 +42,18 @@ _TERMINAL_LABELS = {
     "error": "❌ Error",
 }
 
-_RESTART_ELIGIBLE_TYPES = {"gvi", "ndvi", "ndvi_column"}
+_RESTART_ELIGIBLE_TYPES = {"gvi", "ndvi", "ndvi_column", "fusion"}
 _RESTART_ELIGIBLE_STATUSES = {"interrupted", "cancelled", "error"}
+
+# Staged-resume ledger glyphs (see geofuse.jobs.stage_ledger).
+_STAGE_ICONS = {
+    "done": "✅",
+    "skipped": "⏭️",
+    "running": "▶️",
+    "failed": "❌",
+    "pending": "⬜",
+}
+_STAGE_FINISHED = {"done", "skipped"}
 
 
 def _fmt_timestamp(iso: str) -> str:
@@ -111,6 +121,9 @@ def _render_details(rec) -> None:
             f"(startup {p.get('n_startup_trials', '?')})"
         )
         st.write(f"**Objective:** {p.get('objective_metric', '?')}")
+        st.write(f"**CGI formula:** `{p.get('cgi_formula') or 'weighted_average'}`")
+        covs = p.get("covariate_columns") or []
+        st.write(f"**Covariates:** {', '.join(covs) if covs else '—'}")
         st.write(
             f"**Sampler:** {p.get('sampler_type', '?')} · "
             f"**Pruner:** {p.get('pruner_type', '?')}"
@@ -130,6 +143,37 @@ def _render_details(rec) -> None:
     if rec.completed_at:
         st.caption("Completed at:")
         st.caption(_fmt_timestamp(rec.completed_at))
+
+
+def _render_stage_ledger(rec) -> None:
+    """Render the staged-resume checklist for any job that carries a ledger.
+
+    Driven by the runner via ``ctx.update_stage_ledger`` (see
+    ``geofuse.jobs.stage_ledger``) and persisted on the ``JobStore`` record, so
+    the checklist survives process death — an interrupted job re-loads showing
+    exactly where it stopped, which is the same signal the re-run uses to
+    explain "continue from here" to the user.
+    """
+    ledger = rec.stage_ledger or {}
+    stages = ledger.get("stages") or []
+    if not stages:
+        return
+    done_count = sum(1 for s in stages if s.get("status") in _STAGE_FINISHED)
+    total = len(stages)
+    expanded = rec.status in _ACTIVE or rec.status in {
+        "interrupted",
+        "cancelled",
+        "error",
+    }
+    with st.expander(f"Stages ({done_count}/{total})", expanded=expanded):
+        for s in stages:
+            icon = _STAGE_ICONS.get(s.get("status", "pending"), "⬜")
+            label = s.get("label") or s.get("key", "")
+            msg = s.get("message") or ""
+            line = f"{icon} {label}"
+            if msg:
+                line += f" — _{msg}_"
+            st.markdown(line)
 
 
 def _render_logs(rec_id: str) -> None:
@@ -176,6 +220,8 @@ def _render_job_card(rec, store) -> None:
                     f"{preaggr_progress['total']:,}"
                 ),
             )
+
+        _render_stage_ledger(rec)
 
         with st.expander("Details", expanded=False):
             _render_details(rec)

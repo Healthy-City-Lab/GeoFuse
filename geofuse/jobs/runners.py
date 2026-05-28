@@ -37,6 +37,7 @@ from geofuse.crs_utils import (
 )
 from geofuse.gvi import GVIEngine
 from geofuse.jobs import progress_interval_s
+from geofuse.jobs.stage_ledger import DONE, RUNNING, StageLedger
 from geofuse.logger import get_logger
 from geofuse.ndvi import NDVIEngine
 from geofuse.persistence.job_executor import JobContext
@@ -546,6 +547,40 @@ def _build_fusion_study_name(
     return _STUDY_NAME_UNSAFE.sub("_", raw).strip("_") or "fusion_study"
 
 
+# Ordered pipeline steps a fusion run moves through per target outcome. The
+# staged-resume ledger (geofuse.jobs.stage_ledger) records each so the monitor
+# shows where a run is and a stopped job reports where it left off. Resume itself
+# is content-addressed (metric cache, pre-aggregation cache, Optuna study), so
+# re-running the same job reuses/resumes each on-disk artifact transparently —
+# the ledger is the visibility layer over that durability.
+_FUSION_STAGE_STEPS: tuple[tuple[str, str], ...] = (
+    ("load_target", "Load target"),
+    ("load_metrics", "Load metric maps"),
+    ("preaggregate", "Spatial pre-processing"),
+    ("split", "Split train / test folds"),
+    ("optimize", "Optimize CGI study"),
+    ("robust", "Filter robust trials"),
+    ("evaluate", "Evaluate on test"),
+    ("apply", "Apply fusion weights"),
+)
+
+
+def _fusion_stage_key(label: str, step: str, *, multi: bool) -> str:
+    """Stage-ledger key for ``step`` under outcome ``label`` (label-scoped if multi)."""
+    return f"{label}::{step}" if multi else step
+
+
+def _build_fusion_ledger(labels: list[str], *, multi: bool) -> StageLedger:
+    """Fresh ledger covering every (outcome, step) pair in run order."""
+    steps: list[tuple[str, str]] = []
+    for label in labels:
+        for step_key, step_label in _FUSION_STAGE_STEPS:
+            key = _fusion_stage_key(label, step_key, multi=multi)
+            disp = f"[{label}] {step_label}" if multi else step_label
+            steps.append((key, disp))
+    return StageLedger.from_steps(steps)
+
+
 def run_fusion(
     ctx: JobContext,
     *,
@@ -585,6 +620,8 @@ def run_fusion(
     MetricFusionEngine,
     target_display_name: str = "target",
     resume_existing_study: bool = True,
+    cgi_formula: str = "weighted_average",
+    covariate_columns: list[str] | None = None,
 ) -> dict:
     """Run fusion optimization. Mirrors the previous ``_fusion_worker``."""
     try:
@@ -603,8 +640,27 @@ def run_fusion(
 
         by_target: dict = {}
         engines_by_target: dict = {}
-        ordered_labels: list[str] = []
         output_paths: list[str] = []
+
+        # Pre-compute every outcome label so the staged-resume ledger can list
+        # all (outcome, step) stages up front; the monitor then shows pending
+        # stages before the runner reaches them.
+        all_labels = [
+            (t if t is not None else f"raster_band_{target_band}") for t in targets
+        ]
+        ordered_labels: list[str] = list(all_labels)
+        ledger = _build_fusion_ledger(all_labels, multi=multi_outcome)
+        ctx.update_stage_ledger(ledger.to_dict())
+
+        def stage(key: str, status: str, message: str = "") -> None:
+            """Record a stage transition in the ledger and persist it."""
+            ledger.set_status(
+                key,
+                status,
+                progress=1.0 if status == DONE else 0.0,
+                message=message or None,
+            )
+            ctx.update_stage_ledger(ledger.to_dict())
 
         cache_dir = os.path.join(output_dir, "fusion_cache")
 
@@ -612,13 +668,11 @@ def run_fusion(
             if ctx.is_cancelled():
                 return {"output_paths": output_paths}
 
-            label = (
-                target_feature
-                if target_feature is not None
-                else f"raster_band_{target_band}"
-            )
-            ordered_labels.append(label)
+            label = all_labels[ti]
             prefix = f"[{label}] " if n_t > 1 else ""
+
+            def skey(step: str, _label: str = label) -> str:
+                return _fusion_stage_key(_label, step, multi=multi_outcome)
 
             def prog(local: float) -> float:
                 return (ti + local) / n_t
@@ -627,6 +681,18 @@ def run_fusion(
                 value=prog(0.05),
                 status_text=f"{prefix}Initializing fusion engine...",
             )
+
+            # If the current outcome was also picked as a covariate (only
+            # possible when several outcomes share a covariate list), drop it
+            # for *this* outcome's run — a column can't predict itself.
+            user_covs = list(covariate_columns or [])
+            outcome_covs = [c for c in user_covs if c != target_feature]
+            if outcome_covs != user_covs:
+                _log_fusion(
+                    "INFO",
+                    f"[{label}] Dropping covariate(s) that match this outcome: "
+                    f"{sorted(set(user_covs) - set(outcome_covs))}",
+                )
 
             engine = MetricFusionEngine(
                 target_file=target_path,
@@ -642,10 +708,14 @@ def run_fusion(
                 ndvi_buffer_step_m=ndvi_buffer_step_m,
                 n_bins=n_bins,
                 cache_dir=cache_dir,
+                cgi_formula=cgi_formula,
+                covariate_columns=outcome_covs,
             )
 
             ctx.progress(value=prog(0.1), status_text=f"{prefix}Loading target data...")
+            stage(skey("load_target"), RUNNING)
             engine.load_target()
+            stage(skey("load_target"), DONE)
 
             if not veg_path:
                 ctx.progress(
@@ -693,6 +763,7 @@ def run_fusion(
             def cancel_check():
                 return ctx.is_cancelled()
 
+            stage(skey("load_metrics"), RUNNING)
             engine.load_metrics(
                 veg_file=veg_path,
                 terrain_file=terrain_path,
@@ -707,7 +778,11 @@ def run_fusion(
                 ndvi_resolution_m=ndvi_resolution_m,
                 gvi_grid_spacing_m=gvi_grid_spacing_m,
             )
+            stage(skey("load_metrics"), DONE)
 
+            # Sample materialization + the on-disk pre-aggregation cache form one
+            # "spatial pre-processing" stage; prepare_fusion_data feeds the cache.
+            stage(skey("preaggregate"), RUNNING)
             ctx.progress(
                 value=prog(0.28),
                 status_text=(
@@ -755,7 +830,9 @@ def run_fusion(
             ctx.set_extra(preaggr_progress=None)
             if not completed or ctx.is_cancelled():
                 return {"output_paths": output_paths}
+            stage(skey("preaggregate"), DONE)
 
+            stage(skey("split"), RUNNING)
             ctx.progress(
                 value=prog(0.34),
                 status_text=f"{prefix}Splitting data into train/val/test folds...",
@@ -766,7 +843,9 @@ def run_fusion(
                 k_folds=k_folds,
                 random_state=42,
             )
+            stage(skey("split"), DONE)
 
+            stage(skey("optimize"), RUNNING)
             ctx.progress(
                 value=prog(0.35),
                 status_text=f"{prefix}Optimizing ({n_trials} trials)...",
@@ -800,25 +879,32 @@ def run_fusion(
             )
             if ctx.is_cancelled():
                 return {"output_paths": output_paths}
+            stage(skey("optimize"), DONE)
 
+            stage(skey("robust"), RUNNING)
             ctx.progress(
                 value=prog(0.85), status_text=f"{prefix}Filtering robust trials..."
             )
             robust_trials = engine.get_robust_trials(
                 method="auto", p_threshold=0.05, tolerance=0.1, min_trials=10
             )
+            stage(skey("robust"), DONE)
 
+            stage(skey("evaluate"), RUNNING)
             ctx.progress(
                 value=prog(0.9), status_text=f"{prefix}Evaluating on test set..."
             )
             test_results = engine.evaluate_on_test(
                 params=best_params, metric=objective_metric
             )
+            stage(skey("evaluate"), DONE)
 
+            stage(skey("apply"), RUNNING)
             ctx.progress(
                 value=prog(0.95), status_text=f"{prefix}Applying fusion weights..."
             )
             composite_df = engine.apply_fusion()
+            stage(skey("apply"), DONE)
 
             bundle = {
                 "best_params": best_params,

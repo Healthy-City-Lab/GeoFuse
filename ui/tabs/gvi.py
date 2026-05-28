@@ -242,6 +242,12 @@ def _render_gvi_restart_panel(
             "Sourcing** tab to complete it."
         )
         return
+    if rec.type == "fusion":
+        st.info(
+            "A restart is pending for a fusion job. Switch to the **Metric "
+            "Fusion** tab to complete it."
+        )
+        return
     if rec.type != "gvi":
         return
 
