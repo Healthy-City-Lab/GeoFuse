@@ -1781,7 +1781,8 @@ class MetricFusionEngine:
                 )
             if self.target_gdf is not None:
                 missing = [
-                    c for c in self.covariate_columns
+                    c
+                    for c in self.covariate_columns
                     if c not in self.target_gdf.columns
                 ]
                 if missing:
@@ -1791,7 +1792,8 @@ class MetricFusionEngine:
                         f"{sorted(self.target_gdf.columns)}"
                     )
                 non_numeric = [
-                    c for c in self.covariate_columns
+                    c
+                    for c in self.covariate_columns
                     if not pd.api.types.is_numeric_dtype(self.target_gdf[c])
                 ]
                 if non_numeric:
@@ -3404,12 +3406,18 @@ class MetricFusionEngine:
             # p-value — i.e. the partial-correlation significance.
             wants_pval = metric in ("pearson", "spearman")
             train_out = objective_scoring.score(
-                metric, train_targets_arr, train_composite,
-                covariates=train_cov, return_pvalue=wants_pval,
+                metric,
+                train_targets_arr,
+                train_composite,
+                covariates=train_cov,
+                return_pvalue=wants_pval,
             )
             val_out = objective_scoring.score(
-                metric, val_targets_arr, val_composite,
-                covariates=val_cov, return_pvalue=wants_pval,
+                metric,
+                val_targets_arr,
+                val_composite,
+                covariates=val_cov,
+                return_pvalue=wants_pval,
             )
             if wants_pval:
                 # return_pvalue=True returns (score, pvalue); type cast is for
@@ -3810,8 +3818,11 @@ class MetricFusionEngine:
         # of return_pvalue=True for the two correlation metrics.
         wants_pval = metric in ("pearson", "spearman")
         score_out = objective_scoring.score(
-            metric, test_targets, test_composite,
-            covariates=test_cov, return_pvalue=wants_pval,
+            metric,
+            test_targets,
+            test_composite,
+            covariates=test_cov,
+            return_pvalue=wants_pval,
         )
         if wants_pval:
             test_score, test_pval = score_out  # type: ignore[misc]
@@ -4178,9 +4189,9 @@ class MetricFusionEngine:
         }
 
         # Per-formula weight + power averaging. Powers stay as floats; weights
-        # are averaged then renormalized to the formula's expected total
-        # (100 for weighted_average ints, 1.0 for synergy floats) so the
-        # composite-map scaling stays consistent with how trials were scored.
+        # are averaged and then renormalized back to the unified int 0–100
+        # scale both formulas record on so the composite-map scaling stays
+        # consistent with how trials were scored.
         for power_key in formula.power_keys:
             final_params[power_key] = float(
                 np.mean([t.params.get(power_key, 1.0) for t in top_trials])
@@ -4192,13 +4203,9 @@ class MetricFusionEngine:
         }
         weight_sum = sum(avg_weights.values())
         if weight_sum > 0:
-            if formula.name == cgi_formulas.WEIGHTED_AVERAGE:
-                scale = 100.0 / weight_sum
-                for k, v in avg_weights.items():
-                    final_params[k] = int(round(v * scale))
-            else:
-                for k, v in avg_weights.items():
-                    final_params[k] = v / weight_sum
+            scale = 100.0 / weight_sum
+            for k, v in avg_weights.items():
+                final_params[k] = int(round(v * scale))
         else:
             for k in avg_weights:
                 final_params[k] = 0

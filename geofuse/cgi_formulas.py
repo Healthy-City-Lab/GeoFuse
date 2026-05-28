@@ -25,22 +25,30 @@ Formulas
             + w_TV · Ter  · Veg
             + w_NVT · NDVI · Veg · Ter
 
-    Seven weights ``w_*`` constrained to sum to 1, plus three powers
-    ``pN`` / ``pV`` / ``pT``. AHP-set in the paper; optimizer-driven here.
+    Seven weights ``w_*`` constrained to sum to 100 (same integer 0–100 scale
+    as ``weighted_average`` for consistency in the trial DB — the user's
+    post-hoc weight-vs-association analysis pools both formulas without a
+    scale conversion), plus three powers ``pN`` / ``pV`` / ``pT``. The
+    ``compute`` function divides each weight by their total so the final
+    composite is on a [0, 1]-ish range. AHP-set in the paper; optimizer-driven
+    here.
 
 Weight sampling
 ---------------
 
 Every formula's weight suggestion uses **sequential conditional allocation on
-the simplex**: each weight is suggested with bounds that depend on the
-previously-suggested weights, and the *last* weight is pinned to the remainder
-via ``trial.suggest_int(rem, rem)`` / ``trial.suggest_float(rem, rem)`` so it
-is recorded as a real trial parameter. This guarantees **recorded params ==
-used params** — the user does post-hoc weight-vs-association analyses on the
-recorded trial parameters, so a "sample raw then normalize" gap would silently
-break the analysis. *Caveat:* sequential allocation is order-dependent (a mild
-prior bias toward larger early weights); ordering is fixed (main terms first,
-then pairwise, then triple) and documented per formula.
+the simplex** with **integer weights summing to 100**: each weight is
+suggested with bounds that depend on the previously-suggested weights, and the
+*last* weight is pinned to the remainder via ``trial.suggest_int(rem, rem)``
+so it is recorded as a real trial parameter. This guarantees **recorded params
+== used params** — the user does post-hoc weight-vs-association analyses on
+the recorded trial parameters, so a "sample raw then normalize" gap would
+silently break the analysis. Picking the same int 0–100 scale for both
+formulas (over float [0, 1] for synergy) keeps the trial-DB analysis pipeline
+uniform across formulas and across the Phase-3 cutover. *Caveat:* sequential
+allocation is order-dependent (a mild prior bias toward larger early weights);
+ordering is fixed (main terms first, then pairwise, then triple) and
+documented per formula.
 """
 
 from __future__ import annotations
@@ -76,7 +84,6 @@ SYNERGY_POWER_STEP: float = 0.1
 # produce ``NaN`` (e.g. ``(-1e-12)**0.5``).
 _CLAMP_LO = 0.0
 _CLAMP_HI = 1.0
-_FLOAT_EPS = 1e-12
 
 
 # ---------------------------------------------------------------------------
@@ -135,28 +142,6 @@ def _suggest_simplex_weights_int(
         else:
             out[k] = trial.suggest_int(k, 0, remaining)
             remaining -= out[k]
-    return out
-
-
-def _suggest_simplex_weights_float(
-    trial: optuna.Trial, keys: tuple[str, ...], total: float = 1.0
-) -> dict[str, float]:
-    """Float analogue of :func:`_suggest_simplex_weights_int`.
-
-    The last key is pinned via ``suggest_float(rem, rem)``. A tiny epsilon
-    bumps the upper bound on intermediate weights to avoid Optuna's empty-
-    range error when the running remainder hits exactly 0 partway through.
-    """
-    out: dict[str, float] = {}
-    remaining = float(total)
-    last = len(keys) - 1
-    for i, k in enumerate(keys):
-        if i == last:
-            out[k] = trial.suggest_float(k, remaining, remaining)
-        else:
-            hi = max(_FLOAT_EPS, remaining)
-            out[k] = trial.suggest_float(k, 0.0, hi)
-            remaining = max(0.0, remaining - out[k])
     return out
 
 
@@ -221,7 +206,10 @@ def _suggest_synergy(trial: optuna.Trial) -> dict:
         params[k] = trial.suggest_float(
             k, SYNERGY_POWER_LOW, SYNERGY_POWER_HIGH, step=SYNERGY_POWER_STEP
         )
-    params.update(_suggest_simplex_weights_float(trial, _SYN_WEIGHT_KEYS, total=1.0))
+    # Same int 0–100 scale as ``weighted_average`` so the two formulas share
+    # one downstream trial-DB convention; ``_compute_synergy`` self-renormalizes
+    # by their actual total before evaluating the composite.
+    params.update(_suggest_simplex_weights_int(trial, _SYN_WEIGHT_KEYS, total=100))
     return params
 
 
@@ -252,7 +240,16 @@ def _compute_synergy(params: dict, components: ComponentDict) -> np.ndarray:
     wTV = float(params["w_ter_veg"])
     wNVT = float(params["w_ndvi_veg_ter"])
 
-    return (
+    # Self-renormalize by the actual weight sum (100 for trial-recorded ints,
+    # 1.0 for hand-built float params) so the composite is on a comparable
+    # scale regardless of which convention the caller used — same pattern as
+    # ``_compute_weighted_average``.
+    total = wN + wV + wT + wNV + wNT + wTV + wNVT
+    if total <= 0:
+        return np.full_like(veg, np.nan, dtype=np.float64)
+    inv = 1.0 / total
+
+    return inv * (
         wN * main_n
         + wV * main_v
         + wT * main_t
@@ -267,9 +264,9 @@ def _synergy_channel_active(params: dict) -> dict[str, bool]:
     """A channel is active iff any term that involves it has non-zero weight.
 
     Mostly informational for the engine's "skip aggregation when channel
-    contributes nothing" optimisation. With seven weights summing to 1 in
-    continuous floats the all-zero case is vanishingly rare for synergy, so
-    the engine generally aggregates every channel anyway.
+    contributes nothing" optimisation. With seven int weights summing to 100
+    the all-zero case is vanishingly rare for synergy, so the engine generally
+    aggregates every channel anyway.
     """
     n = (
         float(params.get("w_ndvi", 0)),

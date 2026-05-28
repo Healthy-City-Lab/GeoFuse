@@ -1209,9 +1209,9 @@ def render(output_dir: str) -> None:
     # targets (raster targets have no attribute table).
     available_covariates: list[str] = []
     if is_vector_target and preview_vector_gdf is not None:
-        numeric_attr_cols = (
-            preview_vector_gdf.select_dtypes(include=[np.number]).columns.tolist()
-        )
+        numeric_attr_cols = preview_vector_gdf.select_dtypes(
+            include=[np.number]
+        ).columns.tolist()
         outcome_set = set(target_outcome_columns)
         available_covariates = [c for c in numeric_attr_cols if c not in outcome_set]
 
@@ -1694,20 +1694,24 @@ def render(output_dir: str) -> None:
                 with col_m1:
                     pct = (
                         100.0 * float(best_params.get("veg_weight", 0)) / total_weight
-                        if total_weight > 0 else 0.0
+                        if total_weight > 0
+                        else 0.0
                     )
                     st.metric("Vegetation Weight", f"{pct:.1f}%")
                 with col_m2:
                     pct = (
-                        100.0 * float(best_params.get("terrain_weight", 0))
+                        100.0
+                        * float(best_params.get("terrain_weight", 0))
                         / total_weight
-                        if total_weight > 0 else 0.0
+                        if total_weight > 0
+                        else 0.0
                     )
                     st.metric("Terrain Weight", f"{pct:.1f}%")
                 with col_m3:
                     pct = (
                         100.0 * float(best_params.get("ndvi_weight", 0)) / total_weight
-                        if total_weight > 0 else 0.0
+                        if total_weight > 0
+                        else 0.0
                     )
                     st.metric("NDVI Weight", f"{pct:.1f}%")
                 with col_m4:
@@ -1754,11 +1758,15 @@ def render(output_dir: str) -> None:
             # below the tile row so the user can read what the score means.
             st.caption(
                 f"**Formula:** `{formula.name}` · **Covariates:** "
-                + (", ".join(f"`{c}`" for c in covariates_used) if covariates_used
-                   else "_none_")
+                + (
+                    ", ".join(f"`{c}`" for c in covariates_used)
+                    if covariates_used
+                    else "_none_"
+                )
                 + (
                     "  ·  ℹ️ `mutual_info` ignores covariates"
-                    if results_view["objective_metric"] == "mutual_info" and covariates_used
+                    if results_view["objective_metric"] == "mutual_info"
+                    and covariates_used
                     else ""
                 )
             )
@@ -1869,7 +1877,8 @@ def render(output_dir: str) -> None:
                     for k in formula.weight_keys:
                         row[_wlabel(k)] = (
                             f"{100.0 * float(t.params.get(k, 0)) / weight_total:.1f}"
-                            if weight_total > 0 else "0.0"
+                            if weight_total > 0
+                            else "0.0"
                         )
                     for k in formula.power_keys:
                         row[_plabel(k)] = f"{float(t.params.get(k, 1.0)):.2f}"

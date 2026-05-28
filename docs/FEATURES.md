@@ -56,7 +56,7 @@
 * **Mandatory Spatial Pre-processing**: Before optimization, every sample entity's metric values are pre-aggregated across all buffer radii in the ladder and all statistics (mean + p10–p90) for each channel, into a per-job SQLite cache (`output_results/fusion_cache/preaggr/`). Each Optuna trial then reads a single indexed column instead of recomputing buffer aggregations. The build runs first, reports entities-processed progress, supports both vector and raster metrics, and is **resumable** (survives cancels/crashes) and **reused** across runs with identical inputs.
 * **Pluggable CGI Formula**: Pick the composite formulation in the UI; the optimizer searches that formula's parameters.
   * **Weighted average** (default, legacy): three weights (Vegetation / Terrain / NDVI) summing to 100%.
-  * **Synergy** (three-metric generalisation of Wang et al. 2026, doi:10.3390/rs18010009): seven weights summing to 1 plus three powers on the main NDVI / Veg / Terrain terms only (interaction products stay plain); powers chosen on the {0.2..1.0} step-0.1 grid.
+  * **Synergy** (three-metric generalisation of Wang et al. 2026, doi:10.3390/rs18010009): seven weights (same int 0–100 scale as weighted-average so post-hoc weight-vs-association analyses pool both formulas) plus three powers on the main NDVI / Veg / Terrain terms only (interaction products stay plain); powers chosen on the {0.2..1.0} step-0.1 grid.
 * **Bayesian Optimization**: Uses **Optuna** (TPE sampler) to optimize the CGI formula's parameters plus:
   * **Spatial Aggregation**: Circular buffer radii (100m to user-defined max, step = 50m)
   * **Statistical Functions**: Mean, median, or percentile-based aggregation
