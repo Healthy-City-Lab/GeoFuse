@@ -26,7 +26,8 @@ from sklearn.metrics import mean_squared_error, mutual_info_score, r2_score
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import MinMaxScaler
 
-from . import preaggregation
+from . import cgi_formulas, preaggregation
+from .cgi_formulas import WEIGHTED_AVERAGE, compute_cgi
 from .crs_utils import (
     build_internal_overviews,
     default_geotiff_creation_options,
@@ -131,6 +132,7 @@ class MetricFusionEngine:
         ndvi_buffer_step_m: float | None = None,
         n_bins: int = 5,
         cache_dir: str = "output_results/fusion_cache",
+        cgi_formula: str = WEIGHTED_AVERAGE,
     ):
         """
         Initialize the fusion engine.
@@ -146,6 +148,9 @@ class MetricFusionEngine:
             ndvi_buffer_min_m / ndvi_buffer_max_m / ndvi_buffer_step_m: NDVI radius search grid (m).
             n_bins: Number of bins for stratified splitting
             cache_dir: Directory to cache downloaded metrics
+            cgi_formula: Which composite formula to optimize against. One of
+                :data:`geofuse.cgi_formulas.available_formulas` — defaults to
+                ``"weighted_average"`` so existing studies replay unchanged.
         """
         # Route Optuna's chatter ("Trial X finished with value Y …") into
         # the per-job log instead of the Streamlit host terminal. Fusion
@@ -201,6 +206,11 @@ class MetricFusionEngine:
         self.n_bins = n_bins
         self.cache_dir = cache_dir
         os.makedirs(cache_dir, exist_ok=True)
+
+        # Validate up-front so a typo in the runner / UI doesn't blow up mid-
+        # optimization. ``get_formula`` raises ValueError with the supported list.
+        self.cgi_formula = cgi_formula
+        cgi_formulas.get_formula(cgi_formula)
         self._ndvi_export_resolution_m = 10.0
         self._gvi_grid_spacing_m = 75.0
 
@@ -2825,6 +2835,7 @@ class MetricFusionEngine:
         study_name: str | None = None,
         study_dir: str | None = None,
         cancel_callback: Callable[[], bool] | None = None,
+        cgi_formula: str | None = None,
     ) -> dict:
         """
         Run Optuna optimization with k-fold cross-validation.
@@ -2851,6 +2862,14 @@ class MetricFusionEngine:
 
         # Expose cancel callback so _objective can prune long trials mid-fold.
         self._cancel_callback = cancel_callback
+
+        # Per-call formula override falls back to the engine-level choice from
+        # ``__init__``. Validated here so a bad name fails before any Optuna
+        # state is touched. The active formula is stored on self so _objective
+        # / evaluate_on_test / apply_fusion all see the same value.
+        if cgi_formula is not None:
+            cgi_formulas.get_formula(cgi_formula)
+            self.cgi_formula = cgi_formula
 
         self._clear_ring_caches()
 
@@ -3014,22 +3033,15 @@ class MetricFusionEngine:
                 f"NDVI radius search {ndvi_lo}–{ndvi_hi} m (step {ndvi_st})"
             )
 
-        # ─── Suggest Weights (matching CGI.ipynb logic) ───────────────────────
-        ndvi_weight = trial.suggest_int("ndvi_weight", 0, 100)
-        veg_weight = (
-            trial.suggest_int("veg_weight", 0, 100 - ndvi_weight)
-            if ndvi_weight < 100
-            else trial.suggest_int("veg_weight", 0, 0)
-        )
-        terrain_weight = (
-            trial.suggest_int(
-                "terrain_weight",
-                100 - ndvi_weight - veg_weight,
-                100 - ndvi_weight - veg_weight,
-            )
-            if (ndvi_weight + veg_weight) < 100
-            else trial.suggest_int("terrain_weight", 0, 0)
-        )
+        # ─── Suggest formula parameters (weights + powers) ────────────────────
+        # All weight-sum / power constraints are baked into the search space by
+        # the formula's ``suggest_params`` (sequential conditional allocation on
+        # the simplex). The legacy ``weighted_average`` formula produces the
+        # same ``veg_weight`` / ``terrain_weight`` / ``ndvi_weight`` integer
+        # keys the old inline code did, so existing studies replay unchanged.
+        formula = cgi_formulas.get_formula(self.cgi_formula)
+        formula_params = formula.suggest_params(trial)
+        channel_active = formula.channel_active(formula_params)
 
         # When pre-aggregation is active, percentile suggestions are restricted
         # to the 10 % grid {10,20,…,90} so every trial maps to a precomputed
@@ -3038,8 +3050,12 @@ class MetricFusionEngine:
         pct_grid = list(self._PREAGGR_PERCENTILES)
 
         # ─── Suggest Streetview Parameters (SHARED for veg + terrain) ─────────
-        # Only suggest if either veg or terrain has weight > 0
-        if veg_weight > 0 or terrain_weight > 0:
+        # Only suggest if either veg or terrain channel contributes. The
+        # gating mirrors the legacy weighted-average ``weight > 0`` skip so an
+        # all-NDVI trial doesn't burn search dimensions on unused street-view
+        # radii — under synergy a channel is virtually always active, so the
+        # gating just doesn't fire there.
+        if channel_active["veg"] or channel_active["terrain"]:
             streetview_stat = trial.suggest_categorical(
                 "streetview_stat", ["mean", "median", "percentile"]
             )
@@ -3057,12 +3073,12 @@ class MetricFusionEngine:
 
             veg_radius = (
                 self._suggest_gvi_radius(trial, "veg_radius")
-                if veg_weight > 0
+                if channel_active["veg"]
                 else gvi_cap
             )
             terrain_radius = (
                 self._suggest_gvi_radius(trial, "terrain_radius")
-                if terrain_weight > 0
+                if channel_active["terrain"]
                 else gvi_cap
             )
         else:
@@ -3072,7 +3088,7 @@ class MetricFusionEngine:
             terrain_radius = gvi_cap
 
         # ─── Suggest NDVI Parameters (separate) ────────────────────────────────
-        if ndvi_weight > 0:
+        if channel_active["ndvi"]:
             ndvi_radius = self._suggest_ndvi_radius(trial)
             ndvi_stat = trial.suggest_categorical(
                 "ndvi_stat", ["mean", "median", "percentile"]
@@ -3107,14 +3123,11 @@ class MetricFusionEngine:
             train_data = fold["train"]
             val_data = fold["val"]
 
-            # Normalize weights to 0-1 range
-            total = veg_weight + terrain_weight + ndvi_weight
-            if total == 0:
+            # All-zero trial guard. If every channel reports inactive (weighted-
+            # average with all three weights == 0) we can't form a composite,
+            # so return the metric's worst score so Optuna learns to avoid it.
+            if not any(channel_active.values()):
                 return -np.inf if metric != "rmse" else np.inf
-
-            veg_w = veg_weight / total
-            terrain_w = terrain_weight / total
-            ndvi_w = ndvi_weight / total
 
             # ─── Apply Dynamic Radius and Aggregation ─────────────────────────────
             # Both points and rasters use the same circular buffer aggregation
@@ -3123,7 +3136,7 @@ class MetricFusionEngine:
             val_points = self.target_gdf.loc[val_data.index].copy()
 
             # Apply circular buffer aggregation for vegetation (with SHARED streetview_stat)
-            if veg_weight > 0:
+            if channel_active["veg"]:
                 train_veg = self._aggregate_with_ring_cache(
                     train_points,
                     self.veg_data,
@@ -3149,7 +3162,7 @@ class MetricFusionEngine:
                 val_veg = np.zeros(len(val_points))
 
             # Apply circular buffer aggregation for terrain (with SHARED streetview_stat)
-            if terrain_weight > 0:
+            if channel_active["terrain"]:
                 train_terrain = self._aggregate_with_ring_cache(
                     train_points,
                     self.terrain_data,
@@ -3175,7 +3188,7 @@ class MetricFusionEngine:
                 val_terrain = np.zeros(len(val_points))
 
             # Apply circular buffer aggregation for NDVI (separate stat)
-            if ndvi_weight > 0:
+            if channel_active["ndvi"]:
                 train_ndvi = self._aggregate_with_ring_cache(
                     train_points,
                     self.ndvi_data,
@@ -3227,16 +3240,25 @@ class MetricFusionEngine:
             val_terrain_norm = val_combined[:, 1]
             val_ndvi_norm = val_combined[:, 2]
 
-            # Calculate composite index with normalized values
-            train_composite = (
-                train_veg_norm * veg_w
-                + train_terrain_norm * terrain_w
-                + train_ndvi_norm * ndvi_w
+            # Calculate composite index from the selected CGI formula. Both
+            # weighted_average and synergy normalize / clamp internally.
+            train_composite = compute_cgi(
+                self.cgi_formula,
+                formula_params,
+                {
+                    "veg": train_veg_norm,
+                    "terrain": train_terrain_norm,
+                    "ndvi": train_ndvi_norm,
+                },
             )
-            val_composite = (
-                val_veg_norm * veg_w
-                + val_terrain_norm * terrain_w
-                + val_ndvi_norm * ndvi_w
+            val_composite = compute_cgi(
+                self.cgi_formula,
+                formula_params,
+                {
+                    "veg": val_veg_norm,
+                    "terrain": val_terrain_norm,
+                    "ndvi": val_ndvi_norm,
+                },
             )
 
             # Polygon mode: per-row CGI → per-polygon mean CGI, then score
@@ -3555,14 +3577,11 @@ class MetricFusionEngine:
 
         logger.info("Evaluating on held-out test set...")
 
-        # Extract weights
-        veg_weight = params["veg_weight"]
-        terrain_weight = params["terrain_weight"]
-        ndvi_weight = params["ndvi_weight"]
-        total = veg_weight + terrain_weight + ndvi_weight
-        veg_w = veg_weight / total
-        terrain_w = terrain_weight / total
-        ndvi_w = ndvi_weight / total
+        # Use the engine's active formula to decide which channels contribute
+        # (matches the per-trial gating in ``_objective`` and routes the final
+        # composite through the same ``compute_cgi`` call site).
+        formula = cgi_formulas.get_formula(self.cgi_formula)
+        channel_active = formula.channel_active(params)
 
         # Extract aggregation parameters
         streetview_stat = params.get("streetview_stat", "mean")
@@ -3578,7 +3597,7 @@ class MetricFusionEngine:
         test_points = self.target_gdf.loc[self.test_data.index].copy()
 
         # Sample vegetation with optimized radius/stat
-        if veg_weight > 0:
+        if channel_active["veg"]:
             test_veg = self._aggregate_with_ring_cache(
                 test_points,
                 self.veg_data,
@@ -3593,7 +3612,7 @@ class MetricFusionEngine:
             test_veg = np.zeros(len(test_points))
 
         # Sample terrain with optimized radius/stat
-        if terrain_weight > 0:
+        if channel_active["terrain"]:
             test_terrain = self._aggregate_with_ring_cache(
                 test_points,
                 self.terrain_data,
@@ -3608,7 +3627,7 @@ class MetricFusionEngine:
             test_terrain = np.zeros(len(test_points))
 
         # Sample NDVI with optimized radius/stat
-        if ndvi_weight > 0:
+        if channel_active["ndvi"]:
             test_ndvi = self._aggregate_with_ring_cache(
                 test_points,
                 self.ndvi_data,
@@ -3647,11 +3666,16 @@ class MetricFusionEngine:
         test_terrain_norm = test_combined[:, 1]
         test_ndvi_norm = test_combined[:, 2]
 
-        # Calculate composite
-        test_composite = (
-            test_veg_norm * veg_w
-            + test_terrain_norm * terrain_w
-            + test_ndvi_norm * ndvi_w
+        # Calculate composite via the active CGI formula (same call site the
+        # objective uses, so test scores stay consistent with optimization).
+        test_composite = compute_cgi(
+            self.cgi_formula,
+            params,
+            {
+                "veg": test_veg_norm,
+                "terrain": test_terrain_norm,
+                "ndvi": test_ndvi_norm,
+            },
         )
 
         # Polygon mode: aggregate per-row CGI by polygon before scoring against
@@ -3710,13 +3734,11 @@ class MetricFusionEngine:
                 )
             weights = self.best_params
 
-        # Normalize weights
-        total = (
-            weights["veg_weight"] + weights["terrain_weight"] + weights["ndvi_weight"]
-        )
-        veg_w = weights["veg_weight"] / total
-        terrain_w = weights["terrain_weight"] / total
-        ndvi_w = weights["ndvi_weight"] / total
+        # The active formula decides which channels contribute and how the
+        # composite is built — apply_fusion routes through the same compute_cgi
+        # call site as _objective / evaluate_on_test so all four agree.
+        formula = cgi_formulas.get_formula(self.cgi_formula)
+        channel_active = formula.channel_active(weights)
 
         # Extract aggregation parameters
         streetview_stat = weights.get("streetview_stat", "mean")
@@ -3734,7 +3756,7 @@ class MetricFusionEngine:
         all_points = self.target_gdf.loc[all_data.index].copy()
 
         # Apply circular buffer aggregation with optimized parameters
-        if weights["veg_weight"] > 0:
+        if channel_active["veg"]:
             all_veg = self._aggregate_with_ring_cache(
                 all_points,
                 self.veg_data,
@@ -3748,7 +3770,7 @@ class MetricFusionEngine:
         else:
             all_veg = np.zeros(len(all_points))
 
-        if weights["terrain_weight"] > 0:
+        if channel_active["terrain"]:
             all_terrain = self._aggregate_with_ring_cache(
                 all_points,
                 self.terrain_data,
@@ -3762,7 +3784,7 @@ class MetricFusionEngine:
         else:
             all_terrain = np.zeros(len(all_points))
 
-        if weights["ndvi_weight"] > 0:
+        if channel_active["ndvi"]:
             all_ndvi = self._aggregate_with_ring_cache(
                 all_points,
                 self.ndvi_data,
@@ -3790,9 +3812,16 @@ class MetricFusionEngine:
         all_terrain_norm = all_combined[:, 1]
         all_ndvi_norm = all_combined[:, 2]
 
-        # Calculate composite
-        composite = (
-            all_veg_norm * veg_w + all_terrain_norm * terrain_w + all_ndvi_norm * ndvi_w
+        # Calculate composite via the active CGI formula (same call site as
+        # _objective / evaluate_on_test).
+        composite = compute_cgi(
+            self.cgi_formula,
+            weights,
+            {
+                "veg": all_veg_norm,
+                "terrain": all_terrain_norm,
+                "ndvi": all_ndvi_norm,
+            },
         )
 
         result_df = all_data.copy()
@@ -3991,12 +4020,13 @@ class MetricFusionEngine:
         if progress_callback:
             progress_callback(20, 100)
 
-        # 3. Average parameters
+        # 3. Average parameters across the top robust trials. The formula's
+        # ``weight_keys`` + ``power_keys`` tell us which numeric trial params
+        # belong to the composite definition for this run; everything else
+        # (radii, stats, percentiles) is shared across formulas.
         from statistics import mode
 
-        weights_veg = [t.params.get("veg_weight", 0) for t in top_trials]
-        weights_ter = [t.params.get("terrain_weight", 0) for t in top_trials]
-        weights_ndvi = [t.params.get("ndvi_weight", 0) for t in top_trials]
+        formula = cgi_formulas.get_formula(self.cgi_formula)
 
         radii_veg = [
             t.params.get("veg_radius", int(round(self.gvi_buffer_max_m)))
@@ -4010,7 +4040,6 @@ class MetricFusionEngine:
             t.params.get("ndvi_radius", int(round(self.ndvi_buffer_max_m)))
             for t in top_trials
         ]
-
         streetview_stats = [t.params.get("streetview_stat", "mean") for t in top_trials]
         ndvi_stats = [t.params.get("ndvi_stat", "mean") for t in top_trials]
         streetview_percentiles = [
@@ -4018,11 +4047,7 @@ class MetricFusionEngine:
         ]
         ndvi_percentiles = [t.params.get("ndvi_percentile", 50) for t in top_trials]
 
-        # Calculate averaged/mode parameters
-        final_params = {
-            "veg_weight": int(np.mean(weights_veg)),
-            "terrain_weight": int(np.mean(weights_ter)),
-            "ndvi_weight": int(np.mean(weights_ndvi)),
+        final_params: dict[str, Any] = {
             "veg_radius": int(np.mean(radii_veg)),
             "terrain_radius": int(np.mean(radii_ter)),
             "ndvi_radius": int(np.mean(radii_ndvi)),
@@ -4031,6 +4056,32 @@ class MetricFusionEngine:
             "streetview_percentile": int(np.mean(streetview_percentiles)),
             "ndvi_percentile": int(np.mean(ndvi_percentiles)),
         }
+
+        # Per-formula weight + power averaging. Powers stay as floats; weights
+        # are averaged then renormalized to the formula's expected total
+        # (100 for weighted_average ints, 1.0 for synergy floats) so the
+        # composite-map scaling stays consistent with how trials were scored.
+        for power_key in formula.power_keys:
+            final_params[power_key] = float(
+                np.mean([t.params.get(power_key, 1.0) for t in top_trials])
+            )
+
+        avg_weights: dict[str, float] = {
+            k: float(np.mean([t.params.get(k, 0.0) for t in top_trials]))
+            for k in formula.weight_keys
+        }
+        weight_sum = sum(avg_weights.values())
+        if weight_sum > 0:
+            if formula.name == cgi_formulas.WEIGHTED_AVERAGE:
+                scale = 100.0 / weight_sum
+                for k, v in avg_weights.items():
+                    final_params[k] = int(round(v * scale))
+            else:
+                for k, v in avg_weights.items():
+                    final_params[k] = v / weight_sum
+        else:
+            for k in avg_weights:
+                final_params[k] = 0
 
         logger.info(f"Final averaged parameters: {final_params}")
 
@@ -4166,12 +4217,19 @@ class MetricFusionEngine:
         if progress_callback:
             progress_callback(85, 100)
 
-        # 6. Calculate composite
-        logger.info("Calculating weighted composite...")
-        composite = (
-            (final_params["veg_weight"] / 100.0) * veg_values
-            + (final_params["terrain_weight"] / 100.0) * terrain_values
-            + (final_params["ndvi_weight"] / 100.0) * ndvi_values
+        # 6. Calculate composite via the active CGI formula. The arrays land
+        # in [0, 1] (synergy clamps internally to handle any roundoff from
+        # MinMaxScaler), so both formulas can be evaluated without further
+        # normalization here.
+        logger.info(f"Calculating composite via formula '{formula.name}'...")
+        composite = compute_cgi(
+            self.cgi_formula,
+            final_params,
+            {
+                "veg": veg_values,
+                "terrain": terrain_values,
+                "ndvi": ndvi_values,
+            },
         )
 
         # 7. Create raster
