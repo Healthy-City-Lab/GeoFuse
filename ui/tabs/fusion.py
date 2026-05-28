@@ -46,8 +46,7 @@ _FUSION_OUTCOME_ADD_PLACEHOLDER = "— Select column —"
 class _FusionVerticalScaleControl(MacroElement):
     """Leaflet control: vertical red→yellow→green strip with numeric bounds."""
 
-    _template = Template(
-        """
+    _template = Template("""
 {% macro script(this, kwargs) %}
     var {{ this.get_name() }}_vsc = L.control({position: 'topright'});
     {{ this.get_name() }}_vsc.onAdd = function (map) {
@@ -63,8 +62,7 @@ class _FusionVerticalScaleControl(MacroElement):
     };
     {{ this.get_name() }}_vsc.addTo({{ this._parent.get_name() }});
 {% endmacro %}
-"""
-    )
+""")
 
     def __init__(self, inner_html: str):
         super().__init__()
@@ -273,11 +271,13 @@ def _check_coverage(metric_path: str, buffered_gdf: "gpd.GeoDataFrame") -> bool:
 def _fusion_restart_summary_lines(p: dict) -> list[str]:
     """Read-only summary of the original job's config shown above the re-run form."""
     covs = p.get("covariate_columns") or []
+    standalones = p.get("standalone_channels") or []
     lines = [
         f"**Target:** `{p.get('target_display_name', '?')}`",
         f"**Outcomes:** {', '.join(p.get('outcome_columns') or []) or '—'}",
         f"**CGI formula:** `{p.get('cgi_formula') or 'weighted_average'}`",
         f"**Covariates:** {', '.join(covs) if covs else '—'}",
+        f"**Standalone metrics:** " f"{', '.join(standalones) if standalones else '—'}",
         f"**Trials:** {p.get('n_trials', '?')} "
         f"(startup {p.get('n_startup_trials', '?')})",
         f"**Objective:** {p.get('objective_metric', '?')} · "
@@ -365,6 +365,7 @@ def _submit_fusion_restart(
         resume_existing_study=True,
         cgi_formula=str(p.get("cgi_formula") or "weighted_average"),
         covariate_columns=list(p.get("covariate_columns") or []),
+        standalone_channels=list(p.get("standalone_channels") or []),
     )
 
 
@@ -1364,6 +1365,18 @@ def render(output_dir: str) -> None:
                     key="fusion_stratification_bins",
                 )
 
+            run_standalones = st.checkbox(
+                "Also optimize each metric on its own (NDVI / Vegetation / Terrain)",
+                value=False,
+                key="fusion_run_standalones",
+                help=(
+                    "Adds three single-metric Optuna studies alongside the "
+                    "combined CGI run, searching only its radius + aggregation. "
+                    "Reuses the same train/val/test split and the per-job "
+                    "pre-aggregation cache."
+                ),
+            )
+
         st.divider()
         _fus_run_spacer, _fus_run_col = st.columns([2.2, 1])
         with _fus_run_col:
@@ -1543,6 +1556,12 @@ def render(output_dir: str) -> None:
                         # so the restart panel can re-run with the same config.
                         "cgi_formula": cgi_formula,
                         "covariate_columns": list(covariate_columns or []),
+                        # Standalone single-metric studies, expanded from the
+                        # single UI checkbox into the explicit channel list the
+                        # runner expects. Empty list = CGI only.
+                        "standalone_channels": (
+                            ["veg", "terrain", "ndvi"] if run_standalones else []
+                        ),
                         # Spatial / sampling config — recreates the same engine
                         # build and pre-aggregation cache fingerprint on restart.
                         "buffer_meters": float(buffer_extent_m),
@@ -1623,6 +1642,9 @@ def render(output_dir: str) -> None:
                     resume_existing_study=resume_existing_study,
                     cgi_formula=cgi_formula,
                     covariate_columns=list(covariate_columns or []),
+                    standalone_channels=(
+                        ["veg", "terrain", "ndvi"] if run_standalones else []
+                    ),
                 )
 
                 st.success("✅ Fusion job started! Check sidebar for progress.")
@@ -1893,3 +1915,62 @@ def render(output_dir: str) -> None:
                     robust_data.append(row)
 
                 st.dataframe(robust_data, use_container_width=True)
+
+            # ── CGI vs single-metric standalones (when enabled) ─────────────
+            # One row per study (CGI + each enabled standalone). Headline
+            # numbers come straight from the bundle the runner built so this
+            # block stays Streamlit-only — no engine access required.
+            standalones = results_view.get("standalones") or {}
+            if standalones:
+                st.divider()
+                st.markdown("**CGI vs Standalone Single-Metric Studies**")
+
+                def _fmt_score(v) -> str:
+                    try:
+                        return f"{float(v):.4f}"
+                    except (TypeError, ValueError):
+                        return "—"
+
+                def _fmt_pval(v) -> str:
+                    if v is None:
+                        return "—"
+                    try:
+                        return f"{float(v):.4e}"
+                    except (TypeError, ValueError):
+                        return "—"
+
+                cgi_test = results_view.get("test_results") or {}
+                cmp_rows: list[dict] = [
+                    {
+                        "Study": "CGI (combined)",
+                        f"CV val {metric_name}": _fmt_score(
+                            results_view.get("best_value")
+                        ),
+                        f"Test {metric_name}": _fmt_score(cgi_test.get("test_score")),
+                        "Test p": _fmt_pval(cgi_test.get("test_pvalue")),
+                        "Robust trials": len(results_view.get("robust_trials") or []),
+                    }
+                ]
+                channel_display = {
+                    "veg": "Vegetation",
+                    "terrain": "Terrain",
+                    "ndvi": "NDVI",
+                }
+                for ch_key, ch_bundle in standalones.items():
+                    ch_test = ch_bundle.get("test_results") or {}
+                    cmp_rows.append(
+                        {
+                            "Study": (
+                                channel_display.get(ch_key, ch_key) + " (standalone)"
+                            ),
+                            f"CV val {metric_name}": _fmt_score(
+                                ch_bundle.get("best_value")
+                            ),
+                            f"Test {metric_name}": _fmt_score(
+                                ch_test.get("test_score")
+                            ),
+                            "Test p": _fmt_pval(ch_test.get("test_pvalue")),
+                            "Robust trials": len(ch_bundle.get("robust_trials") or []),
+                        }
+                    )
+                st.dataframe(cmp_rows, use_container_width=True)
