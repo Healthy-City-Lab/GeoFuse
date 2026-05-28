@@ -61,11 +61,15 @@ SYNERGY = "synergy"
 ALL_CHANNELS: tuple[str, ...] = ("veg", "terrain", "ndvi")
 
 # Power range for the synergy formula's main-term exponents. The paper used
-# 0.4–0.7 with AHP-fixed values; widening the upper bound to 1.0 lets the
-# optimizer fall back to the "no transform" case when the data prefers a plain
-# weighted sum of channels + interactions. Adjustable from one place.
-SYNERGY_POWER_LOW: float = 0.4
+# 0.4–0.7 with AHP-fixed values; widened to 0.2–1.0 so the optimizer can pick
+# anything from a strongly concave transform down to the "no transform"
+# endpoint (1.0) if the data prefers a plain weighted sum + interactions. Step
+# of 0.1 makes the grid match the pre-aggregation cache's stat resolution
+# (percentiles in 10 % steps) and gives TPE clean ordinal bins for the
+# weight-vs-association post-hoc analysis. Adjustable from one place.
+SYNERGY_POWER_LOW: float = 0.2
 SYNERGY_POWER_HIGH: float = 1.0
+SYNERGY_POWER_STEP: float = 0.1
 
 # Numeric floor used when clamping channel values before raising to a
 # fractional power so float roundoff in the min-max normalisation can't
@@ -210,11 +214,13 @@ _SYN_POWER_KEYS: tuple[str, ...] = ("ndvi_power", "veg_power", "terrain_power")
 def _suggest_synergy(trial: optuna.Trial) -> dict:
     params: dict = {}
     # Powers attach only to the main (standalone) terms — paper-faithful
-    # pattern generalised to three metrics. Range tuned to include the
-    # "no transform" endpoint (1.0) so the optimizer can recover the linear
-    # weighted-sum-plus-interactions case if the data prefers it.
+    # pattern generalised to three metrics. Stepped grid keeps the parameter
+    # ordinal (TPE exploits the order; categorical wouldn't) and reflects the
+    # coarse-grained nature of the synergy concavity choice.
     for k in _SYN_POWER_KEYS:
-        params[k] = trial.suggest_float(k, SYNERGY_POWER_LOW, SYNERGY_POWER_HIGH)
+        params[k] = trial.suggest_float(
+            k, SYNERGY_POWER_LOW, SYNERGY_POWER_HIGH, step=SYNERGY_POWER_STEP
+        )
     params.update(_suggest_simplex_weights_float(trial, _SYN_WEIGHT_KEYS, total=1.0))
     return params
 
