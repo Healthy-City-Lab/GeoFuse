@@ -271,9 +271,12 @@ def _check_coverage(metric_path: str, buffered_gdf: "gpd.GeoDataFrame") -> bool:
 
 def _fusion_restart_summary_lines(p: dict) -> list[str]:
     """Read-only summary of the original job's config shown above the re-run form."""
+    covs = p.get("covariate_columns") or []
     lines = [
         f"**Target:** `{p.get('target_display_name', '?')}`",
         f"**Outcomes:** {', '.join(p.get('outcome_columns') or []) or '—'}",
+        f"**CGI formula:** `{p.get('cgi_formula') or 'weighted_average'}`",
+        f"**Covariates:** {', '.join(covs) if covs else '—'}",
         f"**Trials:** {p.get('n_trials', '?')} "
         f"(startup {p.get('n_startup_trials', '?')})",
         f"**Objective:** {p.get('objective_metric', '?')} · "
@@ -359,6 +362,8 @@ def _submit_fusion_restart(
         MetricFusionEngine=_MetricFusionEngine,
         target_display_name=p.get("target_display_name") or "target",
         resume_existing_study=True,
+        cgi_formula=str(p.get("cgi_formula") or "weighted_average"),
+        covariate_columns=list(p.get("covariate_columns") or []),
     )
 
 
@@ -1197,8 +1202,81 @@ def render(output_dir: str) -> None:
 
     st.subheader("Optimization Settings")
 
+    # Numeric attribute columns the user can pick as covariates. Outcomes are
+    # excluded because a column can't predict itself — same defensive check the
+    # runner applies per-outcome at submit time. Only available for vector
+    # targets (raster targets have no attribute table).
+    available_covariates: list[str] = []
+    if is_vector_target and preview_vector_gdf is not None:
+        numeric_attr_cols = (
+            preview_vector_gdf.select_dtypes(include=[np.number]).columns.tolist()
+        )
+        outcome_set = set(target_outcome_columns)
+        available_covariates = [c for c in numeric_attr_cols if c not in outcome_set]
+
     with st.form("fusion_metric_run"):
         with st.container(border=True):
+
+            col_cgi1, col_cgi2 = st.columns([1, 2])
+            with col_cgi1:
+                cgi_formula = st.selectbox(
+                    "CGI Formula",
+                    options=["weighted_average", "synergy"],
+                    index=0,
+                    help=(
+                        "**weighted_average** — three weights on min-max-"
+                        "normalized veg / terrain / NDVI (sum = 100). "
+                        "**synergy** — three-metric generalisation of Wang et "
+                        "al. 2026: seven weights (sum = 1) plus three powers "
+                        "on the main NDVI / Veg / Terrain terms only "
+                        "(interactions stay plain). The optimizer searches "
+                        "whichever parameter shape you pick."
+                    ),
+                    key="fusion_cgi_formula",
+                )
+            with col_cgi2:
+                if is_vector_target:
+                    objective_metric_now = st.session_state.get(
+                        "fusion_objective_metric", "pearson"
+                    )
+                    cov_help = (
+                        "Additional numeric attribute columns to **control for** "
+                        "when scoring the CGI's predictive power. With "
+                        "covariates the score becomes the greenery term's "
+                        "*partial* contribution (partial correlation, "
+                        "incremental R², or full-model RMSE depending on the "
+                        "objective metric). "
+                        "**`mutual_info` ignores covariates by design** — "
+                        "conditional MI is hard to estimate from binned data, "
+                        "so the score stays the raw greenery↔outcome MI "
+                        "regardless of what you pick here. Outcomes you "
+                        "already selected are filtered out (a column can't "
+                        "predict itself); duplicate selections are de-duplicated."
+                    )
+                    covariate_columns = st.multiselect(
+                        "Covariates (control variables)",
+                        options=available_covariates,
+                        default=[],
+                        help=cov_help,
+                        key="fusion_covariate_columns",
+                        disabled=not available_covariates,
+                    )
+                    if not available_covariates:
+                        st.caption(
+                            "_No numeric attribute columns available outside the "
+                            "chosen outcomes._"
+                        )
+                    if objective_metric_now == "mutual_info" and covariate_columns:
+                        st.caption(
+                            "ℹ️ The selected covariates will be **ignored** while "
+                            "the objective metric is `mutual_info`."
+                        )
+                else:
+                    covariate_columns = []
+                    st.caption(
+                        "_Covariates are only supported for vector targets — "
+                        "raster targets have no attribute table to draw from._"
+                    )
 
             col_opt1, col_opt2 = st.columns(2)
             with col_opt1:
@@ -1460,6 +1538,10 @@ def render(output_dir: str) -> None:
                         "pruner_type": pruner_type,
                         "multi_objective_requested": fusion_multi_objective,
                         "resume_existing_study": resume_existing_study,
+                        # CGI formula + covariate columns persist into rec.params
+                        # so the restart panel can re-run with the same config.
+                        "cgi_formula": cgi_formula,
+                        "covariate_columns": list(covariate_columns or []),
                         # Spatial / sampling config — recreates the same engine
                         # build and pre-aggregation cache fingerprint on restart.
                         "buffer_meters": float(buffer_extent_m),
@@ -1538,6 +1620,8 @@ def render(output_dir: str) -> None:
                     MetricFusionEngine=MetricFusionEngine,
                     target_display_name=target_display_name,
                     resume_existing_study=resume_existing_study,
+                    cgi_formula=cgi_formula,
+                    covariate_columns=list(covariate_columns or []),
                 )
 
                 st.success("✅ Fusion job started! Check sidebar for progress.")

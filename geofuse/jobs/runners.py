@@ -620,6 +620,8 @@ def run_fusion(
     MetricFusionEngine,
     target_display_name: str = "target",
     resume_existing_study: bool = True,
+    cgi_formula: str = "weighted_average",
+    covariate_columns: list[str] | None = None,
 ) -> dict:
     """Run fusion optimization. Mirrors the previous ``_fusion_worker``."""
     try:
@@ -680,6 +682,18 @@ def run_fusion(
                 status_text=f"{prefix}Initializing fusion engine...",
             )
 
+            # If the current outcome was also picked as a covariate (only
+            # possible when several outcomes share a covariate list), drop it
+            # for *this* outcome's run — a column can't predict itself.
+            user_covs = list(covariate_columns or [])
+            outcome_covs = [c for c in user_covs if c != target_feature]
+            if outcome_covs != user_covs:
+                _log_fusion(
+                    "INFO",
+                    f"[{label}] Dropping covariate(s) that match this outcome: "
+                    f"{sorted(set(user_covs) - set(outcome_covs))}",
+                )
+
             engine = MetricFusionEngine(
                 target_file=target_path,
                 target_feature=target_feature,
@@ -694,6 +708,8 @@ def run_fusion(
                 ndvi_buffer_step_m=ndvi_buffer_step_m,
                 n_bins=n_bins,
                 cache_dir=cache_dir,
+                cgi_formula=cgi_formula,
+                covariate_columns=outcome_covs,
             )
 
             ctx.progress(value=prog(0.1), status_text=f"{prefix}Loading target data...")

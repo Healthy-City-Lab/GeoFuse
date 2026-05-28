@@ -121,6 +121,9 @@ def _render_details(rec) -> None:
             f"(startup {p.get('n_startup_trials', '?')})"
         )
         st.write(f"**Objective:** {p.get('objective_metric', '?')}")
+        st.write(f"**CGI formula:** `{p.get('cgi_formula') or 'weighted_average'}`")
+        covs = p.get("covariate_columns") or []
+        st.write(f"**Covariates:** {', '.join(covs) if covs else '—'}")
         st.write(
             f"**Sampler:** {p.get('sampler_type', '?')} · "
             f"**Pruner:** {p.get('pruner_type', '?')}"
