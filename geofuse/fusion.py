@@ -34,10 +34,16 @@ from .crs_utils import (
     reproject_geodataframe_to_wgs84,
 )
 from .logger import attach_external_logger, get_logger
+from .raster_sampling import LazyRasterArray
 from .vector_io import geometry_sha256, target_path_is_raster
 
 logger = logging.getLogger(__name__)
 _log = get_logger("FUSION")
+
+# Metric rasters larger than this (uncompressed band bytes) are read lazily in
+# windows from disk instead of loaded whole — keeps national-scale rasters off
+# the heap. Smaller rasters stay in RAM (faster per-point reads).
+_LAZY_RASTER_THRESHOLD_BYTES = 256 * 1024 * 1024
 
 
 def _nearest_metric_join(
@@ -561,12 +567,28 @@ class MetricFusionEngine:
         """Load metric from GeoJSON or GeoTIFF."""
         if filepath.endswith((".tif", ".tiff")):
             with rasterio.open(filepath) as src:
-                return {
-                    "data": src.read(1, masked=True),
-                    "transform": src.transform,
-                    "crs": src.crs,
-                    "bounds": src.bounds,
-                }
+                transform, crs, bounds = src.transform, src.crs, src.bounds
+                itemsize = np.dtype(src.dtypes[0]).itemsize
+                est_bytes = src.width * src.height * itemsize
+                data = (
+                    src.read(1, masked=True)
+                    if est_bytes <= _LAZY_RASTER_THRESHOLD_BYTES
+                    else None
+                )
+            if data is None:
+                # Too large to hold in RAM (national-scale): read windows from
+                # disk on demand instead. Each thread gets its own handle.
+                data = LazyRasterArray(filepath, band=1)
+                logger.info(
+                    f"Metric raster ~{est_bytes / (1024**2):.0f} MB exceeds the "
+                    f"in-memory threshold; reading windows lazily from {filepath}"
+                )
+            return {
+                "data": data,
+                "transform": transform,
+                "crs": crs,
+                "bounds": bounds,
+            }
         else:
             gdf = gpd.read_file(filepath)
             if gdf.crs is None:
@@ -1772,7 +1794,15 @@ class MetricFusionEngine:
         """Cheap, deterministic identity for a loaded metric (vector or raster)."""
         if isinstance(metric, dict):  # raster
             arr = metric["data"]
-            data = arr.data if hasattr(arr, "data") else np.asarray(arr)
+            if isinstance(arr, LazyRasterArray):
+                # Lazy raster: identify by file stat + grid (no full pixel read).
+                stt = os.stat(arr.path)
+                return (
+                    f"ras:{os.path.basename(arr.path)}:{stt.st_size}:"
+                    f"{int(stt.st_mtime)}:{arr.shape}:{arr.dtype}:"
+                    f"{tuple(metric['bounds'])}"
+                )
+            data = np.ma.getdata(arr)
             sample = np.ascontiguousarray(data[::17, ::17]).tobytes()
             digest = hashlib.sha256(sample).hexdigest()[:16]
             return f"ras:{data.shape}:{tuple(metric['bounds'])}:{data.dtype}:{digest}"
@@ -1957,7 +1987,8 @@ class MetricFusionEngine:
                 in_flight = {
                     ex.submit(_compute_batch, b)
                     for b in (
-                        next(it, None) for _ in range(min(2 * max_workers, len(batches)))
+                        next(it, None)
+                        for _ in range(min(2 * max_workers, len(batches)))
                     )
                     if b is not None
                 }

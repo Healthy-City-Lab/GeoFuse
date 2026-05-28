@@ -153,7 +153,6 @@ def raster_batch_stats(
 
     h, w = metric_array.shape
     max_r_px = max(1, min(int(float(radii_m[-1]) / pixel_size_m), 10000))
-    is_masked = hasattr(metric_array, "mask")
 
     for i in range(n):
         x, y = batch_xy_raster_crs[i]
@@ -165,18 +164,15 @@ def raster_batch_stats(
         if rmin >= rmax or cmin >= cmax:
             continue
 
+        # ``metric_array`` may be an in-memory masked array or a LazyRasterArray
+        # (windowed disk read); both return a masked window here.
         window = metric_array[rmin:rmax, cmin:cmax]
         rr = np.arange(rmin, rmax, dtype=np.float64)[:, None]
         cc = np.arange(cmin, cmax, dtype=np.float64)[None, :]
         dist_m = np.sqrt((rr - row) ** 2 + (cc - col) ** 2) * pixel_size_m
 
-        if is_masked:
-            base_valid = ~window.mask
-            data = np.asarray(window.data)
-        else:
-            base_valid = np.ones(window.shape, dtype=bool)
-            data = np.asarray(window)
-        base_valid = base_valid & ~np.isnan(data)
+        data = np.asarray(np.ma.getdata(window), dtype=np.float64)
+        base_valid = ~np.ma.getmaskarray(window) & ~np.isnan(data)
 
         for ri, r in enumerate(radii_m):
             mask = base_valid & (dist_m <= r)
