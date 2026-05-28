@@ -564,19 +564,46 @@ _FUSION_STAGE_STEPS: tuple[tuple[str, str], ...] = (
     ("apply", "Apply fusion weights"),
 )
 
+# Human labels for the standalone channels surfaced in ledger stages and
+# logs. Keys match the engine's ``greenery_channel`` values.
+_STANDALONE_CHANNEL_LABELS: dict[str, str] = {
+    "veg": "Vegetation",
+    "terrain": "Terrain",
+    "ndvi": "NDVI",
+}
+
 
 def _fusion_stage_key(label: str, step: str, *, multi: bool) -> str:
     """Stage-ledger key for ``step`` under outcome ``label`` (label-scoped if multi)."""
     return f"{label}::{step}" if multi else step
 
 
-def _build_fusion_ledger(labels: list[str], *, multi: bool) -> StageLedger:
-    """Fresh ledger covering every (outcome, step) pair in run order."""
+def _build_fusion_ledger(
+    labels: list[str],
+    *,
+    multi: bool,
+    standalone_channels: list[str] | None = None,
+) -> StageLedger:
+    """Fresh ledger covering every (outcome, step) pair in run order.
+
+    For each outcome the 8-step CGI pipeline (`_FUSION_STAGE_STEPS`) lands
+    first, then one stage per enabled standalone metric — those reuse the
+    already-built split + pre-aggregation cache, so each is a single
+    optimize/robust/evaluate burst that's compact enough to fit in one
+    ledger row.
+    """
+    standalones = list(standalone_channels or [])
     steps: list[tuple[str, str]] = []
     for label in labels:
         for step_key, step_label in _FUSION_STAGE_STEPS:
             key = _fusion_stage_key(label, step_key, multi=multi)
             disp = f"[{label}] {step_label}" if multi else step_label
+            steps.append((key, disp))
+        for ch in standalones:
+            key = _fusion_stage_key(label, f"standalone_{ch}", multi=multi)
+            ch_lbl = _STANDALONE_CHANNEL_LABELS.get(ch, ch)
+            disp_step = f"Standalone {ch_lbl} study"
+            disp = f"[{label}] {disp_step}" if multi else disp_step
             steps.append((key, disp))
     return StageLedger.from_steps(steps)
 
@@ -622,6 +649,7 @@ def run_fusion(
     resume_existing_study: bool = True,
     cgi_formula: str = "weighted_average",
     covariate_columns: list[str] | None = None,
+    standalone_channels: list[str] | None = None,
 ) -> dict:
     """Run fusion optimization. Mirrors the previous ``_fusion_worker``."""
     try:
@@ -638,6 +666,22 @@ def run_fusion(
 
         _log_fusion("INFO", f"Starting fusion job {ctx.job_id} ({n_t} target run(s))")
 
+        # Validate the standalone request up front so a typo doesn't slip
+        # through to the ledger and engine. ``None`` and empty list both mean
+        # "CGI only" (the legacy behaviour).
+        standalones: list[str] = list(standalone_channels or [])
+        for _ch in standalones:
+            if _ch not in ("veg", "terrain", "ndvi"):
+                raise ValueError(
+                    f"standalone_channels entries must be one of "
+                    f"'veg','terrain','ndvi'; got {_ch!r}."
+                )
+        if standalones:
+            _log_fusion(
+                "INFO",
+                f"Standalone single-metric studies enabled: {', '.join(standalones)}",
+            )
+
         by_target: dict = {}
         engines_by_target: dict = {}
         output_paths: list[str] = []
@@ -649,7 +693,9 @@ def run_fusion(
             (t if t is not None else f"raster_band_{target_band}") for t in targets
         ]
         ordered_labels: list[str] = list(all_labels)
-        ledger = _build_fusion_ledger(all_labels, multi=multi_outcome)
+        ledger = _build_fusion_ledger(
+            all_labels, multi=multi_outcome, standalone_channels=standalones
+        )
         ctx.update_stage_ledger(ledger.to_dict())
 
         def stage(key: str, status: str, message: str = "") -> None:
@@ -906,14 +952,89 @@ def run_fusion(
             composite_df = engine.apply_fusion()
             stage(skey("apply"), DONE)
 
+            # ── Standalone single-metric studies ────────────────────────────
+            # One Optuna study per enabled channel, reusing the same engine,
+            # the already-built per-(entity, radius) cache, and the train/val/
+            # test split. Each gets its own study SQLite file (suffix = the
+            # channel name) so trials don't pool with the CGI study.
+            #
+            # Each ``optimize_fusion`` call replaces ``engine.study`` /
+            # ``engine.best_params`` / ``engine._active_greenery_channel`` with
+            # the standalone's, so we snapshot the CGI state up front and
+            # restore it after the loop. The results UI reads
+            # ``engine.study.trials`` etc. on the returned engine and expects
+            # the CGI study there.
+            cgi_study = engine.study
+            cgi_best_value = engine.study.best_value if engine.study else None
+            cgi_best_params = engine.best_params
+
+            standalones_bundle: dict[str, dict] = {}
+            for ch in standalones:
+                if ctx.is_cancelled():
+                    return {"output_paths": output_paths}
+                ch_disp = _STANDALONE_CHANNEL_LABELS.get(ch, ch)
+                stage(skey(f"standalone_{ch}"), RUNNING)
+                ctx.progress(
+                    value=prog(0.95),
+                    status_text=(
+                        f"{prefix}Standalone {ch_disp} study ({n_trials} trials)..."
+                    ),
+                )
+                ch_suffix = ch if resume_existing_study else f"{ch}_{suffix}"
+                ch_study_name = _build_fusion_study_name(
+                    target_display_name=target_display_name,
+                    label=label,
+                    objective_metric=objective_metric,
+                    suffix=ch_suffix,
+                )
+                ch_best = engine.optimize_fusion(
+                    n_trials=n_trials,
+                    n_startup_trials=n_startup_trials,
+                    objective_metric=objective_metric,
+                    pruner_type=pruner_type if pruner_type != "none" else None,
+                    sampler_type=sampler_type,
+                    seed=42,
+                    show_progress=False,
+                    study_name=ch_study_name,
+                    study_dir=study_dir,
+                    cancel_callback=cancel_check,
+                    greenery_channel=ch,
+                )
+                if ctx.is_cancelled():
+                    return {"output_paths": output_paths}
+                ch_robust = engine.get_robust_trials(
+                    method="auto", p_threshold=0.05, tolerance=0.1, min_trials=10
+                )
+                ch_test = engine.evaluate_on_test(
+                    params=ch_best, metric=objective_metric
+                )
+                standalones_bundle[ch] = {
+                    "best_params": ch_best,
+                    "best_value": engine.study.best_value,
+                    "robust_trials": ch_robust,
+                    "test_results": ch_test,
+                    "objective_metric": objective_metric,
+                    "study_name": ch_study_name,
+                }
+                stage(skey(f"standalone_{ch}"), DONE)
+
+            # Restore the engine to its CGI-study state so downstream UI code
+            # that reads ``engine.study.trials`` / ``engine.best_params`` /
+            # ``engine._active_greenery_channel`` sees the combined run.
+            if standalones:
+                engine.study = cgi_study
+                engine.best_params = cgi_best_params
+                engine._active_greenery_channel = "cgi"
+
             bundle = {
                 "best_params": best_params,
-                "best_value": engine.study.best_value,
+                "best_value": cgi_best_value,
                 "robust_trials": robust_trials,
                 "composite_df": composite_df,
                 "objective_metric": objective_metric,
                 "test_results": test_results,
                 "target_feature": target_feature,
+                "standalones": standalones_bundle,
             }
             by_target[label] = bundle
             engines_by_target[label] = engine

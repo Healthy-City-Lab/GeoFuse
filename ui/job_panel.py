@@ -124,6 +124,11 @@ def _render_details(rec) -> None:
         st.write(f"**CGI formula:** `{p.get('cgi_formula') or 'weighted_average'}`")
         covs = p.get("covariate_columns") or []
         st.write(f"**Covariates:** {', '.join(covs) if covs else '—'}")
+        standalones = p.get("standalone_channels") or []
+        st.write(
+            f"**Standalone metrics:** "
+            f"{', '.join(standalones) if standalones else '—'}"
+        )
         st.write(
             f"**Sampler:** {p.get('sampler_type', '?')} · "
             f"**Pruner:** {p.get('pruner_type', '?')}"
