@@ -253,8 +253,8 @@ class NDVIEngine:
         opens its own at ``tile_cache_dir`` (default
         ``<repo>/logs/caches/ndvi_tiles/``) so direct API callers — fusion
         auto-download, CLI, notebooks — benefit from the same cross-run
-        cache the UI uses. The cache is keyed by ``resume_key`` (Step 9) so
-        repeat runs over the same area + date range are near-instant.
+        cache the UI uses. The cache is keyed by ``resume_key`` so repeat
+        runs over the same area + date range are near-instant.
 
         Earth Engine's stdlib ``logging`` output is captured into the bound
         per-job log here (with propagation to the root logger disabled),
@@ -912,8 +912,8 @@ class NDVIEngine:
             except Exception as e:
                 _log("WARN", f"Sidecar write failed (non-fatal): {e}")
 
-            # Sample-at-features (Step 15): attach NDVI values to the
-            # caller's features and write a side GeoPackage. Skipped when
+            # Sample-at-features: attach NDVI values to the caller's
+            # features and write a side GeoPackage. Skipped when
             # the user didn't ask for it or the raster wasn't written. The
             # source raster is the final NDVI mosaic; Read once, sampled
             # per-feature via the shared helper.
@@ -1323,7 +1323,7 @@ class NDVIEngine:
         ``tiles`` is the output of :func:`geofuse.core.build_planar_tiles` — a list of
         ``{cluster_id, tile_idx, tile_geom_4326}`` dicts. Each tile is exported
         independently and mosaicked into one GeoTIFF; per-cluster GeoTIFF tile
-        outputs are a separate downstream step (Phase 4).
+        outputs are written separately by the cluster-tiles path.
 
         ``resume_key`` selects the tile workspace; tiles already present from
         a previous interrupted run with the same key are skipped.

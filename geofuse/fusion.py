@@ -325,6 +325,14 @@ class MetricFusionEngine:
         self._longitudinal_wave_frames: (
             list[tuple[str, gpd.GeoDataFrame]] | None
         ) = None
+        # Per-wave metric sources for the mixed-effects mode. Populated by
+        # ``set_longitudinal_metric_data`` before ``precompute_aggregations``.
+        # Outer dict: channel → wave_label → metric source (GeoDataFrame for
+        # vector channels, raster-dict for raster channels — same layout
+        # ``load_metrics`` produces). Cross-sectional runs leave this ``None``.
+        self._longitudinal_metric_data: (
+            dict[str, dict[str, Any]] | None
+        ) = None
 
         if self.is_longitudinal and self.is_raster:
             raise ValueError(
@@ -340,6 +348,53 @@ class MetricFusionEngine:
     def is_longitudinal(self) -> bool:
         """True when a :class:`LongitudinalSpec` was provided at construction."""
         return self.longitudinal_spec is not None
+
+    def set_longitudinal_metric_data(
+        self,
+        channel: str,
+        per_wave_data: dict[str, Any],
+    ) -> None:
+        """Inject pre-loaded per-wave metric data for one greenery channel.
+
+        Cross-sectional callers populate ``self.veg_data`` / ``self.terrain_data``
+        / ``self.ndvi_data`` via :meth:`load_metrics`. Mixed-effects callers
+        instead supply one metric source per wave for each channel (the runner
+        resolves each wave's file path against loaded results / uploads /
+        auto-download and hands the result here). ``per_wave_data`` maps every
+        wave label in the spec to either a ``GeoDataFrame`` (vector metric) or
+        the raster-dict layout ``load_metrics`` produces; the cache build then
+        consults the right per-wave source for each ``(entity_id, wave)`` row.
+        """
+        if not self.is_longitudinal:
+            raise RuntimeError(
+                "set_longitudinal_metric_data() requires longitudinal_spec to be set."
+            )
+        if channel not in longitudinal.GREENERY_CHANNELS:
+            raise ValueError(
+                f"Unknown channel {channel!r}; expected one of "
+                f"{longitudinal.GREENERY_CHANNELS}."
+            )
+        spec = self.longitudinal_spec
+        assert spec is not None
+        missing = [w for w in spec.wave_labels if w not in per_wave_data]
+        if missing:
+            raise ValueError(
+                f"per_wave_data is missing entries for {channel!r} waves: {missing}."
+            )
+        if self._longitudinal_metric_data is None:
+            self._longitudinal_metric_data = {}
+        self._longitudinal_metric_data[channel] = dict(per_wave_data)
+        # Mirror to the cross-sectional attribute so any code path that
+        # still checks ``self.<channel>_data is None`` (e.g. the
+        # pre-aggregation entry guard) passes. The actual per-wave source
+        # is consulted via ``_longitudinal_metric_data``.
+        rep_source = per_wave_data[spec.wave_labels[0]]
+        if channel == "veg":
+            self.veg_data = rep_source
+        elif channel == "terrain":
+            self.terrain_data = rep_source
+        elif channel == "ndvi":
+            self.ndvi_data = rep_source
 
     def set_longitudinal_wave_frames(
         self, frames: list[tuple[str, gpd.GeoDataFrame]]
@@ -1864,8 +1919,18 @@ class MetricFusionEngine:
         """
         # ── Fast path: pre-aggregation lookup table ──────────────────────────
         if getattr(self, "_preaggregation_done", False):
+            wave_indices = None
+            if self.is_longitudinal and "wave" in points_gdf.columns:
+                spec = self.longitudinal_spec
+                assert spec is not None
+                wave_index_of = {w: i for i, w in enumerate(spec.wave_labels)}
+                wave_indices = np.asarray(
+                    [wave_index_of[str(w)] for w in points_gdf["wave"]],
+                    dtype=np.int64,
+                )
             looked_up = self._lookup_preaggregation(
-                points_gdf.index.values, channel, radius_m, stat, percentile
+                points_gdf.index.values, channel, radius_m, stat, percentile,
+                wave_indices=wave_indices,
             )
             if looked_up is not None:
                 return looked_up
@@ -2065,6 +2130,13 @@ class MetricFusionEngine:
 
         Returns ``True`` on completion, ``False`` if cancelled.
         """
+        if self.is_longitudinal:
+            return self._precompute_aggregations_longitudinal(
+                progress_callback=progress_callback,
+                cancel_callback=cancel_callback,
+                max_workers=max_workers,
+            )
+
         for label, data in (
             ("veg", self.veg_data),
             ("terrain", self.terrain_data),
@@ -2256,6 +2328,274 @@ class MetricFusionEngine:
         _log("OK", f"Pre-aggregation complete for {n_points:,} entities.")
         return True
 
+    def _precompute_aggregations_longitudinal(
+        self,
+        progress_callback: Callable[[int, int], None] | None = None,
+        cancel_callback: Callable[[], bool] | None = None,
+        max_workers: int | None = None,
+    ) -> bool:
+        """Wave-aware variant of :meth:`precompute_aggregations`.
+
+        For each greenery channel the runner has already loaded a per-wave
+        metric source into ``self._longitudinal_metric_data[channel]``. This
+        method:
+
+        - Groups waves by file fingerprint so identical-file waves share a
+          single compute pass (a static channel that reuses one file across
+          all waves only gets computed once).
+        - Registers wave aliases on the cache so every aliased wave's lookup
+          resolves to the same representative-wave storage.
+        - For each ``(channel, representative_wave)`` group, computes stats
+          for the entities whose row in the long-format target falls in any
+          wave of that group, and writes them to the cache under the
+          representative wave index.
+        """
+        spec = self.longitudinal_spec
+        assert spec is not None
+        if self.target_gdf is None or len(self.target_gdf) == 0:
+            raise ValueError(
+                "Pre-aggregation requires sample points; call prepare_fusion_data() "
+                "first."
+            )
+        if self._longitudinal_metric_data is None or not all(
+            ch in self._longitudinal_metric_data
+            for ch in longitudinal.GREENERY_CHANNELS
+        ):
+            raise ValueError(
+                "Longitudinal pre-aggregation requires per-wave metric data for "
+                "every channel; call set_longitudinal_metric_data() first."
+            )
+
+        gvi_radii, ndvi_radii = self._preaggr_radii()
+        n_points = len(self.target_gdf)
+        defaults = {"veg": "veg", "terrain": "terrain", "ndvi": "NDVI"}
+
+        # Per-(channel, wave) source identity contributes to the fingerprint
+        # so changing any wave's file invalidates the cache.
+        fp_parts: list[str] = [f"geom:{geometry_sha256(self.target_gdf)}"]
+        for ch in longitudinal.GREENERY_CHANNELS:
+            for wave_label in spec.wave_labels:
+                src = self._longitudinal_metric_data[ch][wave_label]
+                fp_parts.append(
+                    f"{ch}@{wave_label}:"
+                    + self._metric_fingerprint(src, defaults[ch])
+                )
+        fp_parts.append(f"gvi:{gvi_radii}")
+        fp_parts.append(f"ndvi:{ndvi_radii}")
+        fp_parts.append(f"stats:{preaggregation.STAT_COLUMNS}")
+        fp_parts.append(f"waves:{list(spec.wave_labels)}")
+        fingerprint = hashlib.sha256("|".join(fp_parts).encode()).hexdigest()
+
+        preaggr_dir = os.path.join(self.cache_dir, "preaggr")
+        os.makedirs(preaggr_dir, exist_ok=True)
+        base = os.path.splitext(os.path.basename(self.target_file))[0]
+        db_path = os.path.join(
+            preaggr_dir, f"preaggr-{base}-{fingerprint[:12]}.sqlite"
+        )
+
+        cache = preaggregation.PreAggregationCache(
+            db_path,
+            gvi_radii=gvi_radii,
+            ndvi_radii=ndvi_radii,
+            fingerprint=fingerprint,
+            wave_labels=spec.wave_labels,
+        )
+
+        if cache.is_complete():
+            _log(
+                "OK",
+                f"Reusing longitudinal pre-aggregation cache "
+                f"({n_points:,} rows): {db_path}",
+            )
+            self._preaggr_cache = cache
+            self._preaggregation_done = True
+            if progress_callback is not None:
+                progress_callback(n_points, n_points)
+            return True
+
+        if not cache.matches_fingerprint():
+            cache.reset()
+        cache.write_header(n_points)
+
+        _log(
+            "INFO",
+            f"Longitudinal pre-aggregation: {n_points:,} rows · "
+            f"{len(spec.wave_labels)} waves · GVI radii {gvi_radii} m · "
+            f"NDVI radii {ndvi_radii} m · stats {preaggregation.STAT_COLUMNS}. "
+            f"Cache: {db_path}",
+        )
+
+        # Group waves by file fingerprint for each channel. Identical-file
+        # waves share one compute pass; the first wave in each group is the
+        # representative storage slot.
+        wave_index_of = {w: i for i, w in enumerate(spec.wave_labels)}
+        waves_by_row = self.target_gdf["wave"].astype(str).to_numpy()
+
+        utm_crs = self.target_gdf.estimate_utm_crs()
+        pts_utm = self.target_gdf.to_crs(utm_crs)
+        point_xy_utm = np.column_stack(
+            [pts_utm.geometry.x.to_numpy(), pts_utm.geometry.y.to_numpy()]
+        ).astype(np.float64)
+        entity_ids_all = np.asarray(
+            [int(x) for x in self.target_gdf.index], dtype=np.int64
+        )
+        pos_of = {int(eid): i for i, eid in enumerate(entity_ids_all)}
+
+        # Walk each channel: build file groups, register aliases, prep + fill
+        # one group at a time so memory only ever holds one channel's metric
+        # data per group.
+        processed = 0
+        total_jobs = 0
+        plan: list[
+            tuple[str, int, list[str], Any]
+        ] = []  # (channel, rep_wave_index, wave_labels_in_group, source)
+        for ch in longitudinal.GREENERY_CHANNELS:
+            per_wave = self._longitudinal_metric_data[ch]
+            groups: dict[str, list[str]] = {}
+            for wave_label in spec.wave_labels:
+                key = self._metric_fingerprint(per_wave[wave_label], defaults[ch])
+                groups.setdefault(key, []).append(wave_label)
+
+            alias_map: dict[int, int] = {}
+            for group_waves in groups.values():
+                rep_label = group_waves[0]
+                rep_idx = wave_index_of[rep_label]
+                for w in group_waves:
+                    alias_map[wave_index_of[w]] = rep_idx
+                plan.append(
+                    (ch, rep_idx, group_waves, per_wave[rep_label])
+                )
+            cache.register_wave_aliases(ch, alias_map)
+            _log(
+                "INFO",
+                f"  {ch}: {len(groups)} unique file(s) across "
+                f"{len(spec.wave_labels)} wave(s) — "
+                f"{'static' if len(groups) == 1 else 'time-varying'}.",
+            )
+
+        # Pre-count the total work for the progress bar.
+        for ch, rep_idx, group_waves, _src in plan:
+            n_rows_in_group = int(np.isin(waves_by_row, group_waves).sum())
+            pending = cache.pending_entities_for(
+                ch, rep_idx, entity_ids_all[np.isin(waves_by_row, group_waves)].tolist()
+            )
+            total_jobs += len(pending)
+        if progress_callback is not None and total_jobs > 0:
+            progress_callback(0, total_jobs)
+
+        cancelled = False
+        for ch, rep_idx, group_waves, src in plan:
+            if cancel_callback is not None and cancel_callback():
+                cancelled = True
+                break
+            in_group_mask = np.isin(waves_by_row, group_waves)
+            group_eids = entity_ids_all[in_group_mask].tolist()
+            pending = cache.pending_entities_for(ch, rep_idx, group_eids)
+            if not pending:
+                continue
+
+            radii = cache.radii_for(ch)
+            if isinstance(src, dict):  # raster source
+                pts_r = self.target_gdf.to_crs(src["crs"])
+                xy_r = np.column_stack(
+                    [pts_r.geometry.x.to_numpy(), pts_r.geometry.y.to_numpy()]
+                ).astype(np.float64)
+                px_m = preaggregation.raster_pixel_size_m(
+                    src["transform"], src["crs"].is_geographic
+                )
+                kind = "raster"
+                raster_array = src["data"]
+                transform = src["transform"]
+            else:
+                col = self._metric_value_column(src, defaults[ch])
+                tree, vals = preaggregation.build_vector_index(src, utm_crs, col)
+                kind = "vector"
+
+            batch_size = 1024
+            batches = [
+                pending[i : i + batch_size]
+                for i in range(0, len(pending), batch_size)
+            ]
+
+            def _compute_one(bids: list[int]):
+                bpos = np.fromiter(
+                    (pos_of[int(e)] for e in bids), dtype=np.int64, count=len(bids)
+                )
+                if kind == "vector":
+                    stats = preaggregation.vector_batch_stats(
+                        tree, vals, point_xy_utm[bpos], radii
+                    )
+                else:
+                    stats = preaggregation.raster_batch_stats(
+                        raster_array, transform, px_m, xy_r[bpos], radii
+                    )
+                return bids, stats
+
+            workers = max(1, min((os.cpu_count() or 2), 8)) if max_workers is None else max_workers
+            workers = max(1, min(workers, len(batches) or 1))
+
+            def _on_done(bids: list[int], stats: np.ndarray) -> None:
+                nonlocal processed
+                cache.write_channel_wave_batch(ch, rep_idx, bids, stats)
+                processed += len(bids)
+                if progress_callback is not None and total_jobs > 0:
+                    progress_callback(processed, total_jobs)
+
+            if workers == 1:
+                for bids in batches:
+                    if cancel_callback is not None and cancel_callback():
+                        cancelled = True
+                        break
+                    _on_done(*_compute_one(bids))
+            else:
+                from concurrent.futures import (
+                    FIRST_COMPLETED,
+                    ThreadPoolExecutor,
+                    wait,
+                )
+
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    it = iter(batches)
+                    in_flight = {
+                        ex.submit(_compute_one, b)
+                        for b in (
+                            next(it, None)
+                            for _ in range(min(2 * workers, len(batches)))
+                        )
+                        if b is not None
+                    }
+                    while in_flight:
+                        if cancel_callback is not None and cancel_callback():
+                            cancelled = True
+                            for fut in in_flight:
+                                fut.cancel()
+                            break
+                        done, in_flight = wait(
+                            in_flight, timeout=0.5, return_when=FIRST_COMPLETED
+                        )
+                        for fut in done:
+                            _on_done(*fut.result())
+                            nb = next(it, None)
+                            if nb is not None:
+                                in_flight.add(ex.submit(_compute_one, nb))
+            if cancelled:
+                break
+
+        if cancelled:
+            _log("WARN", "Longitudinal pre-aggregation cancelled (resumable).")
+            self._preaggregation_done = False
+            cache.close()
+            return False
+
+        cache.mark_complete()
+        self._preaggr_cache = cache
+        self._preaggregation_done = True
+        _log(
+            "OK",
+            f"Longitudinal pre-aggregation complete for {n_points:,} rows.",
+        )
+        return True
+
     def _lookup_preaggregation(
         self,
         point_indices: np.ndarray,
@@ -2263,17 +2603,44 @@ class MetricFusionEngine:
         radius_m: float,
         stat: str,
         percentile: int | None,
+        *,
+        wave_indices: np.ndarray | None = None,
     ) -> np.ndarray | None:
-        """Cache-backed lookup. Returns float32 array (or None to fall back)."""
+        """Cache-backed lookup. Returns float32 array (or None to fall back).
+
+        ``wave_indices`` (longitudinal mode only) is a per-row wave index of
+        the same shape as ``point_indices``; rows are grouped by wave and
+        looked up per-wave, then re-assembled in the input order. When
+        ``None`` (cross-sectional mode) the cache returns the single
+        implicit wave 0 for all entities.
+        """
         cache = self._preaggr_cache
         if cache is None or not self._preaggregation_done:
             return None
         column = preaggregation.stat_to_column(stat, percentile)
         if column is None:
             return None
-        return cache.lookup(
-            np.asarray(point_indices), channel, int(round(radius_m)), column
-        )
+        ids = np.asarray(point_indices)
+        radius = int(round(radius_m))
+        if wave_indices is None:
+            return cache.lookup(ids, channel, radius, column)
+
+        waves = np.asarray(wave_indices)
+        out = np.full(ids.shape[0], np.nan, dtype=np.float32)
+        # Per-wave grouped reads: each wave maps to one cache column, so
+        # repeated entity reads within a wave benefit from the cache's
+        # column LRU.
+        for w in np.unique(waves):
+            mask = waves == w
+            sub = cache.lookup(
+                ids[mask], channel, radius, column, wave_index=int(w)
+            )
+            if sub is None:
+                # An off-grid (channel, wave, radius, column) cell — caller
+                # falls back to the ring/buffer aggregation path.
+                return None
+            out[mask] = sub
+        return out
 
     # ------------------------------------------------------------------
     # Polygon-target areal aggregation

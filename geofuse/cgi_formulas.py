@@ -45,7 +45,7 @@ so it is recorded as a real trial parameter. This guarantees **recorded params
 the recorded trial parameters, so a "sample raw then normalize" gap would
 silently break the analysis. Picking the same int 0–100 scale for both
 formulas (over float [0, 1] for synergy) keeps the trial-DB analysis pipeline
-uniform across formulas and across the Phase-3 cutover. *Caveat:* sequential
+uniform across formulas. *Caveat:* sequential
 allocation is order-dependent (a mild prior bias toward larger early weights);
 ordering is fixed (main terms first, then pairwise, then triple) and
 documented per formula.
