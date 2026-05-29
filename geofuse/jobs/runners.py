@@ -1228,6 +1228,30 @@ def run_fusion(
                     "objective_metric": objective_metric,
                     "study_name": ch_study_name,
                 }
+                # Post-hoc all-4 MixedLM metrics for this standalone, written
+                # to a per-channel CSV beside the CGI one. The engine's
+                # ``_active_greenery_channel`` is still set to ``ch`` here
+                # so ``evaluate_on_test`` builds the right composite.
+                if longitudinal_spec is not None:
+                    ps_dir = os.path.join(output_dir, "fusion", "study_results")
+                    ps_basename = (
+                        f"mixedlm_metrics__{label}__{ch}.csv"
+                        if multi_outcome
+                        else f"mixedlm_metrics__{ch}.csv"
+                    )
+                    try:
+                        _compute_mixedlm_post_metrics(
+                            engine,
+                            ps_dir,
+                            csv_basename=ps_basename,
+                            log=_log_fusion,
+                        )
+                    except Exception as exc:
+                        _log_fusion(
+                            "WARN",
+                            f"[{label}] Standalone {ch} post-hoc MixedLM "
+                            f"scoring failed: {exc}",
+                        )
                 stage(skey(f"standalone_{ch}"), DONE)
 
             # Restore the engine to its CGI-study state so downstream UI code

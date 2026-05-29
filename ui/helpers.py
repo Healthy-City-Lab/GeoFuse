@@ -198,6 +198,26 @@ def rasterize_points_for_preview(
     return arr, (left, bottom, right, top), width, height
 
 
+def file_size_mtime_fingerprint(path: str | None) -> str:
+    """Cheap deterministic fingerprint for a file: ``"<size>:<mtime_int>"``.
+
+    Used by the fusion restart flow to detect whether per-wave longitudinal
+    files have been edited / moved / replaced since the original job ran. An
+    empty string means the path is missing or ``None`` (treated as drift on
+    comparison). Size + integer-mtime is intentionally lightweight — a full
+    SHA256 of a large NDVI raster would block the submit handler for several
+    seconds and isn't needed to detect the cases the restart panel cares
+    about (file gone, file rewritten in place, file truncated).
+    """
+    if not path:
+        return ""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return ""
+    return f"{st.st_size}:{int(st.st_mtime)}"
+
+
 def apply_buffer_m(gdf: gpd.GeoDataFrame, buffer_m: float) -> gpd.GeoDataFrame:
     """Return a GeoDataFrame whose geometry is the union of ``gdf`` buffered by
     ``buffer_m`` metres, re-projected back to the original CRS.

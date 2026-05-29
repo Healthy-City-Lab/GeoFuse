@@ -10,6 +10,7 @@ import folium
 import geopandas as gpd
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import rasterio
 import streamlit as st
 from branca.element import MacroElement
@@ -538,17 +539,135 @@ def _render_fusion_restart_panel(store, executor, output_dir: str) -> bool:
                 or None
             )
 
+        # Mixed-effects restart: validate every per-wave file path against the
+        # fingerprint recorded at submit time and prompt the user to re-supply
+        # any that have moved or changed. Resubmit blocks until all drift is
+        # resolved so the cache can't index against stale-content files.
+        lon_payload = p.get("longitudinal_spec_payload") or None
+        lon_payload_for_submit = lon_payload
+        lon_restart_blocked = False
+        if lon_payload:
+            from helpers import file_size_mtime_fingerprint
+
+            stored_fps = lon_payload.get("__file_fingerprints__") or {}
+            wave_labels = list(lon_payload.get("wave_labels") or [])
+            target_files = dict(lon_payload.get("target_files_per_wave") or {})
+            greenery_files = {
+                ch: dict(per_wave or {})
+                for ch, per_wave in (lon_payload.get("greenery_files") or {}).items()
+            }
+
+            def _drift_status(path: str, expected_fp: str) -> str:
+                if not path:
+                    return "no-path"
+                if not os.path.isfile(path):
+                    return "missing"
+                if expected_fp and file_size_mtime_fingerprint(path) != expected_fp:
+                    return "modified"
+                return "ok"
+
+            # Walk every (group, wave) entry once to discover drift.
+            groups: list[tuple[str, str, dict[str, str]]] = []
+            if lon_payload.get("intake_mode") == "wide":
+                groups.append(("target", "Per-wave target files", target_files))
+            for ch_key, ch_lbl in (
+                ("veg", "Vegetation per-wave files"),
+                ("terrain", "Terrain per-wave files"),
+                ("ndvi", "NDVI per-wave files"),
+            ):
+                groups.append((ch_key, ch_lbl, greenery_files.get(ch_key) or {}))
+
+            drift_items: list[tuple[str, str, str, str, str]] = []
+            for group_key, lbl, files in groups:
+                exp_group = stored_fps.get(group_key) or {}
+                for wave in wave_labels:
+                    path = files.get(wave) or ""
+                    status = _drift_status(path, exp_group.get(wave, ""))
+                    if status != "ok":
+                        drift_items.append((group_key, lbl, wave, path, status))
+
+            if drift_items:
+                st.markdown("**Mixed-effects: per-wave files need to be re-supplied**")
+                st.caption(
+                    "Each entry below either moved, was edited, or never "
+                    "existed at the recorded path. Paste the current absolute "
+                    "path to resolve. The restart is blocked until every drift "
+                    "is fixed."
+                )
+                resolved_overrides: dict[tuple[str, str], str] = {}
+                all_resolved = True
+                for group_key, lbl, wave, orig_path, status in drift_items:
+                    status_icon = (
+                        "❌" if status == "missing"
+                        else "⚠️" if status == "modified"
+                        else "•"
+                    )
+                    key_id = f"f_restart_lon_{group_key}_{wave}_{rec.id}"
+                    new_path = st.text_input(
+                        f"{status_icon} {lbl} — wave `{wave}` ({status})",
+                        value=orig_path,
+                        key=key_id,
+                        help=(
+                            f"Original path: `{orig_path or '(none)'}`. "
+                            "Paste an absolute path to the replacement file."
+                        ),
+                    )
+                    if new_path and os.path.isfile(new_path):
+                        resolved_overrides[(group_key, wave)] = new_path
+                    else:
+                        all_resolved = False
+
+                if not all_resolved:
+                    st.warning(
+                        "Resolve every drifted file above before re-running."
+                    )
+                    lon_restart_blocked = True
+                else:
+                    # Build a fresh payload with updated paths + fingerprints
+                    # for the storage layer's next restart cycle.
+                    updated_payload = dict(lon_payload)
+                    new_target_files = dict(target_files)
+                    new_greenery_files = {
+                        ch: dict(per_wave) for ch, per_wave in greenery_files.items()
+                    }
+                    for (gk, wv), new_p in resolved_overrides.items():
+                        if gk == "target":
+                            new_target_files[wv] = new_p
+                        else:
+                            new_greenery_files.setdefault(gk, {})[wv] = new_p
+                    updated_payload["target_files_per_wave"] = new_target_files
+                    updated_payload["greenery_files"] = new_greenery_files
+                    new_fps = {
+                        gk: dict(stored_fps.get(gk) or {})
+                        for gk in ("target", "veg", "terrain", "ndvi")
+                    }
+                    for (gk, wv), new_p in resolved_overrides.items():
+                        new_fps.setdefault(gk, {})[wv] = file_size_mtime_fingerprint(new_p)
+                    updated_payload["__file_fingerprints__"] = new_fps
+                    lon_payload_for_submit = updated_payload
+                    st.success(
+                        f"All {len(drift_items)} drifted file(s) resolved."
+                    )
+            else:
+                st.success("Mixed-effects per-wave files verified.")
+
         if st.button(
             "Verify & re-run",
             type="primary",
             key=f"f_restart_confirm_{rec.id}",
+            disabled=lon_restart_blocked,
         ):
+            # Substitute the validated payload into ``p`` so the existing
+            # ``_submit_fusion_restart`` path picks it up via ``p.get(...)``.
+            p_for_submit = dict(p)
+            if lon_payload_for_submit is not None:
+                p_for_submit["longitudinal_spec_payload"] = lon_payload_for_submit
             try:
                 _submit_fusion_restart(
                     store,
                     executor,
                     rec,
-                    p,
+                    p_for_submit,
                     target_mat,
                     output_dir,
                     veg_path_re,
@@ -1216,12 +1335,59 @@ def render(output_dir: str) -> None:
     # excluded because a column can't predict itself — same defensive check the
     # runner applies per-outcome at submit time. Only available for vector
     # targets (raster targets have no attribute table).
+    #
+    # Wide-mode mixed-effects runs join several per-wave target files on
+    # the entity-id column at runtime; a covariate is only usable when it's
+    # present in **every** wave's file. When wide mode is active and the per-
+    # wave target paths have been filled in, intersect the numeric column
+    # sets across all readable per-wave files so the dropdown can't surface
+    # a column that's missing from later waves.
     available_covariates: list[str] = []
     if is_vector_target and preview_vector_gdf is not None:
         numeric_attr_cols = preview_vector_gdf.select_dtypes(
             include=[np.number]
         ).columns.tolist()
         outcome_set = set(target_outcome_columns)
+
+        if (
+            st.session_state.get("fusion_run_mode")
+            == "Mixed-effects (longitudinal)"
+            and st.session_state.get("fusion_lon_intake") == "wide"
+        ):
+            _target_paths_raw = st.session_state.get(
+                "fusion_lon_target_paths_raw", ""
+            )
+            _paths = [
+                p.strip() for p in _target_paths_raw.split(",") if p.strip()
+            ]
+            _existing = [p for p in _paths if os.path.isfile(p)]
+            if len(_existing) >= 2:
+                # Intersect numeric columns across every readable wave file
+                # so the dropdown only offers columns guaranteed to be present
+                # in every wave's data (otherwise the runtime concat would
+                # surface NaN columns for the missing waves and silently drop
+                # rows from the long-format frame).
+                _common: set[str] | None = None
+                for _p in _existing:
+                    try:
+                        _frame = gpd.read_file(_p, rows=64)
+                    except Exception:
+                        continue
+                    _nums = set(
+                        _frame.select_dtypes(include=[np.number]).columns
+                    )
+                    _common = _nums if _common is None else _common & _nums
+                if _common is not None:
+                    numeric_attr_cols = sorted(
+                        _common & set(numeric_attr_cols)
+                    ) or sorted(_common)
+                    if len(_existing) < len(_paths):
+                        st.caption(
+                            f"_Covariate list intersected across "
+                            f"{len(_existing)}/{len(_paths)} per-wave files "
+                            "found on disk._"
+                        )
+
         available_covariates = [c for c in numeric_attr_cols if c not in outcome_set]
 
     with st.form("fusion_metric_run"):
@@ -1811,6 +1977,18 @@ def render(output_dir: str) -> None:
                         )
                         st.stop()
                     longitudinal_spec_payload = _spec.to_payload()
+                    # Fingerprint every per-wave file so the restart panel
+                    # can detect drift (file moved, edited, or replaced) and
+                    # prompt the user to re-supply before resubmitting.
+                    from helpers import file_size_mtime_fingerprint
+
+                    _fps: dict[str, dict[str, str]] = {"target": {}, **{ch: {} for ch in _LON_CHANNELS}}
+                    for w, p in target_files_per_wave.items():
+                        _fps["target"][w] = file_size_mtime_fingerprint(p)
+                    for _ch in _LON_CHANNELS:
+                        for w, p in _spec.greenery_files[_ch].items():
+                            _fps[_ch][w] = file_size_mtime_fingerprint(p)
+                    longitudinal_spec_payload["__file_fingerprints__"] = _fps
 
                 fusion_record = store.submit(
                     type="fusion",
@@ -2258,11 +2436,14 @@ def render(output_dir: str) -> None:
                 st.dataframe(cmp_rows, use_container_width=True)
 
             # ── Mixed-effects post-hoc metrics (when present) ────────────────
-            # The post-score stage writes ``mixedlm_metrics.csv`` per outcome
-            # into ``output_results/fusion/study_results/``. Multi-outcome
-            # runs disambiguate with ``mixedlm_metrics__<outcome>.csv``;
-            # check the outcome-specific path first, then fall back to the
-            # single-outcome name.
+            # The post-score stage writes one CSV per study (CGI + each
+            # standalone) into ``output_results/fusion/study_results/``.
+            # Naming:
+            #   single outcome: ``mixedlm_metrics.csv``,
+            #                   ``mixedlm_metrics__<channel>.csv``
+            #   multi outcome:  ``mixedlm_metrics__<outcome>.csv``,
+            #                   ``mixedlm_metrics__<outcome>__<channel>.csv``
+            # Show one tab per available file so users can compare studies.
             try:
                 _study_root = os.path.join(
                     output_dir, "fusion", "study_results"
@@ -2272,32 +2453,57 @@ def render(output_dir: str) -> None:
                     if results.get("mode") == "multi"
                     else None
                 )
-                _candidates = []
-                if _active_label:
-                    _candidates.append(
-                        os.path.join(
-                            _study_root, f"mixedlm_metrics__{_active_label}.csv"
-                        )
-                    )
-                _candidates.append(
-                    os.path.join(_study_root, "mixedlm_metrics.csv")
-                )
-                _mixedlm_csv_path = next(
-                    (p for p in _candidates if os.path.isfile(p)), None
-                )
-                if _mixedlm_csv_path:
+
+                def _match_outcome(fname: str) -> bool:
+                    # Single-outcome run: only the no-outcome-prefix files
+                    # apply. Multi-outcome run: keep files whose name carries
+                    # the active outcome label.
+                    if _active_label is None:
+                        return f"__{_active_label}" not in fname
+                    return f"__{_active_label}" in fname
+
+                _csv_paths: list[str] = []
+                if os.path.isdir(_study_root):
+                    for _fn in sorted(os.listdir(_study_root)):
+                        if not _fn.startswith("mixedlm_metrics") or not _fn.endswith(
+                            ".csv"
+                        ):
+                            continue
+                        if not _match_outcome(_fn):
+                            continue
+                        _csv_paths.append(os.path.join(_study_root, _fn))
+
+                if _csv_paths:
                     st.divider()
                     st.markdown(
                         "**Mixed-effects: all metrics across trial pools**"
                     )
                     st.caption(
-                        f"Source: `{_mixedlm_csv_path}`. Each pool's per-"
-                        "trial rows are followed by `__mean__`, `__ci_lo__`, "
-                        "`__ci_hi__`, and `__n__` summary rows."
+                        "Each pool's per-trial rows are followed by "
+                        "`__mean__`, `__ci_lo__`, `__ci_hi__`, and `__n__` "
+                        "summary rows."
                     )
-                    _mixedlm_df = pd.read_csv(_mixedlm_csv_path)
-                    st.dataframe(_mixedlm_df, use_container_width=True)
+
+                    def _tab_label(path: str) -> str:
+                        base = os.path.basename(path).replace(".csv", "")
+                        # Trim the outcome prefix in multi-mode so the tabs
+                        # read like "CGI / Veg / Terrain / NDVI" instead of
+                        # "<outcome> / <outcome>__veg / …".
+                        if _active_label:
+                            base = base.replace(
+                                f"mixedlm_metrics__{_active_label}", "CGI"
+                            ).replace(f"__{_active_label}__", "__")
+                        else:
+                            base = base.replace("mixedlm_metrics", "CGI")
+                        return base.replace("__", " ").strip() or "CGI"
+
+                    _tab_labels = [_tab_label(p) for p in _csv_paths]
+                    _tabs = st.tabs(_tab_labels)
+                    for _tab, _path in zip(_tabs, _csv_paths):
+                        with _tab:
+                            st.caption(f"Source: `{_path}`")
+                            st.dataframe(
+                                pd.read_csv(_path), use_container_width=True
+                            )
             except Exception as _exc:  # pragma: no cover -- UI-only guard
-                st.warning(
-                    f"Could not read mixedlm_metrics.csv: {_exc}"
-                )
+                st.warning(f"Could not read mixedlm_metrics CSVs: {_exc}")
