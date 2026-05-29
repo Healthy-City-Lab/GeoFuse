@@ -26,7 +26,13 @@ from sklearn.metrics import mean_squared_error, mutual_info_score, r2_score
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import MinMaxScaler
 
-from . import cgi_formulas, longitudinal, objective_scoring, preaggregation
+from . import (
+    cgi_formulas,
+    longitudinal,
+    mixed_effects_scoring,
+    objective_scoring,
+    preaggregation,
+)
 from .cgi_formulas import WEIGHTED_AVERAGE, compute_cgi
 from .crs_utils import (
     build_internal_overviews,
@@ -3161,6 +3167,22 @@ class MetricFusionEngine:
             )
         self._active_greenery_channel = greenery_channel
 
+        # In longitudinal mode the scoring metric comes from the spec
+        # (one of the four mixedlm_* options, default mixedlm_tstat). The
+        # ``objective_metric`` arg is whatever the runner / UI surfaced for
+        # cross-sectional mode and would be the wrong validator otherwise;
+        # override it here so callers don't need to coordinate.
+        if self.is_longitudinal:
+            spec = self.longitudinal_spec
+            assert spec is not None
+            if objective_metric not in mixed_effects_scoring.MIXEDLM_METRICS:
+                logger.info(
+                    f"Longitudinal mode: overriding objective_metric "
+                    f"{objective_metric!r} with spec.scoring_metric "
+                    f"{spec.scoring_metric!r}."
+                )
+                objective_metric = spec.scoring_metric
+
         self._clear_ring_caches()
 
         # Build sampler
@@ -3581,7 +3603,14 @@ class MetricFusionEngine:
                 val_cov = None
 
             # Polygon mode: per-row CGI → per-polygon mean CGI, then score
-            # against the per-polygon outcome.
+            # against the per-polygon outcome. In longitudinal+polygon mode
+            # polygon_id was set to f"{entity}|{wave}" by
+            # _prepare_polygon_fusion so the collapse produces one row per
+            # (entity, wave) — the exact shape the MixedLM scorer wants.
+            train_entity_id = None
+            val_entity_id = None
+            train_ysb = None
+            val_ysb = None
             if "polygon_id" in train_data.columns:
                 train_pid = train_data["polygon_id"].values
                 val_pid = val_data["polygon_id"].values
@@ -3617,9 +3646,31 @@ class MetricFusionEngine:
                             for j in range(vc.shape[1])
                         ]
                     )
+                if self.is_longitudinal:
+                    train_entity_id = (
+                        pd.Series(train_data["entity_id"].values)
+                        .groupby(train_pid).first().values
+                    )
+                    val_entity_id = (
+                        pd.Series(val_data["entity_id"].values)
+                        .groupby(val_pid).first().values
+                    )
+                    train_ysb = (
+                        pd.Series(train_data["years_since_baseline"].values)
+                        .groupby(train_pid).first().values
+                    )
+                    val_ysb = (
+                        pd.Series(val_data["years_since_baseline"].values)
+                        .groupby(val_pid).first().values
+                    )
             else:
                 train_targets_arr = train_data["target"].values
                 val_targets_arr = val_data["target"].values
+                if self.is_longitudinal:
+                    train_entity_id = train_data["entity_id"].values
+                    val_entity_id = val_data["entity_id"].values
+                    train_ysb = train_data["years_since_baseline"].values
+                    val_ysb = val_data["years_since_baseline"].values
 
             # Check for constant values (variance = 0) which cause NaN correlations
             train_valid_vals = train_composite[~np.isnan(train_composite)]
@@ -3637,25 +3688,53 @@ class MetricFusionEngine:
                     "Validation composite has no variance (constant values)"
                 )
 
-            # Calculate scores via the covariate-aware scorer. With no
-            # covariates this reduces exactly to the legacy _calculate_metric.
-            # The p-value for correlation metrics is the residual correlation's
-            # p-value — i.e. the partial-correlation significance.
-            wants_pval = metric in ("pearson", "spearman")
-            train_out = objective_scoring.score(
-                metric,
-                train_targets_arr,
-                train_composite,
-                covariates=train_cov,
-                return_pvalue=wants_pval,
-            )
-            val_out = objective_scoring.score(
-                metric,
-                val_targets_arr,
-                val_composite,
-                covariates=val_cov,
-                return_pvalue=wants_pval,
-            )
+            # ─── Score: longitudinal MixedLM or cross-sectional partial-corr ──
+            if self.is_longitudinal:
+                spec = self.longitudinal_spec
+                assert spec is not None  # guaranteed by is_longitudinal
+                wants_pval = metric in mixed_effects_scoring.HAS_PVALUE
+                train_out = mixed_effects_scoring.score_mixedlm(
+                    metric,
+                    train_targets_arr,
+                    train_composite,
+                    entity_id=train_entity_id,
+                    years_since_baseline=train_ysb,
+                    covariates=train_cov,
+                    include_time_fixed=spec.include_time_fixed_effect,
+                    random_slope=spec.random_slope_time,
+                    return_pvalue=wants_pval,
+                )
+                val_out = mixed_effects_scoring.score_mixedlm(
+                    metric,
+                    val_targets_arr,
+                    val_composite,
+                    entity_id=val_entity_id,
+                    years_since_baseline=val_ysb,
+                    covariates=val_cov,
+                    include_time_fixed=spec.include_time_fixed_effect,
+                    random_slope=spec.random_slope_time,
+                    return_pvalue=wants_pval,
+                )
+            else:
+                # Cross-sectional path: covariate-aware partial-correlation /
+                # incremental-R² scorer; with no covariates it reduces exactly
+                # to the engine's legacy _calculate_metric.
+                wants_pval = metric in ("pearson", "spearman")
+                train_out = objective_scoring.score(
+                    metric,
+                    train_targets_arr,
+                    train_composite,
+                    covariates=train_cov,
+                    return_pvalue=wants_pval,
+                )
+                val_out = objective_scoring.score(
+                    metric,
+                    val_targets_arr,
+                    val_composite,
+                    covariates=val_cov,
+                    return_pvalue=wants_pval,
+                )
+
             if wants_pval:
                 # return_pvalue=True returns (score, pvalue); type cast is for
                 # the static checker.
@@ -3682,7 +3761,13 @@ class MetricFusionEngine:
         trial.set_user_attr("fold_train_scores", fold_train_scores)
         trial.set_user_attr("fold_val_scores", fold_val_scores)
 
-        if metric in ["pearson", "spearman"]:
+        # p-value bookkeeping: cross-sectional pearson/spearman OR longitudinal
+        # tstat/coef. Recorded as user_attrs so the robust-trials filter and
+        # the post-hoc reporting can read them per trial.
+        produced_pvals = metric in ("pearson", "spearman") or (
+            self.is_longitudinal and metric in mixed_effects_scoring.HAS_PVALUE
+        )
+        if produced_pvals:
             trial.set_user_attr("train_pvalue_mean", np.mean(fold_train_pvals))
             trial.set_user_attr("val_pvalue_mean", np.mean(fold_val_pvals))
             trial.set_user_attr("fold_train_pvals", fold_train_pvals)
@@ -4047,7 +4132,11 @@ class MetricFusionEngine:
             test_cov = None
 
         # Polygon mode: aggregate per-row CGI by polygon before scoring against
-        # the per-polygon outcome.
+        # the per-polygon outcome. Longitudinal+polygon mode keys the collapse
+        # on f"{entity}|{wave}" so the result is one row per (entity, wave) —
+        # the shape the MixedLM scorer expects.
+        test_entity_id = None
+        test_ysb = None
         if "polygon_id" in self.test_data.columns:
             test_pid = self.test_data["polygon_id"].values
             test_composite = pd.Series(test_composite).groupby(test_pid).mean().values
@@ -4065,20 +4154,49 @@ class MetricFusionEngine:
                         for j in range(tc.shape[1])
                     ]
                 )
+            if self.is_longitudinal:
+                test_entity_id = (
+                    pd.Series(self.test_data["entity_id"].values)
+                    .groupby(test_pid).first().values
+                )
+                test_ysb = (
+                    pd.Series(self.test_data["years_since_baseline"].values)
+                    .groupby(test_pid).first().values
+                )
         else:
             test_targets = self.test_data["target"].values
+            if self.is_longitudinal:
+                test_entity_id = self.test_data["entity_id"].values
+                test_ysb = self.test_data["years_since_baseline"].values
 
-        # Covariate-aware scoring; reduces exactly to _calculate_metric when
-        # no covariates are configured. Partial-correlation p-value falls out
-        # of return_pvalue=True for the two correlation metrics.
-        wants_pval = metric in ("pearson", "spearman")
-        score_out = objective_scoring.score(
-            metric,
-            test_targets,
-            test_composite,
-            covariates=test_cov,
-            return_pvalue=wants_pval,
-        )
+        # ─── Score: longitudinal MixedLM or cross-sectional partial-corr ──
+        if self.is_longitudinal:
+            spec = self.longitudinal_spec
+            assert spec is not None
+            wants_pval = metric in mixed_effects_scoring.HAS_PVALUE
+            score_out = mixed_effects_scoring.score_mixedlm(
+                metric,
+                test_targets,
+                test_composite,
+                entity_id=test_entity_id,
+                years_since_baseline=test_ysb,
+                covariates=test_cov,
+                include_time_fixed=spec.include_time_fixed_effect,
+                random_slope=spec.random_slope_time,
+                return_pvalue=wants_pval,
+            )
+        else:
+            # Covariate-aware scoring; reduces exactly to _calculate_metric
+            # when no covariates are configured. Partial-correlation p-value
+            # falls out of return_pvalue=True for the two correlation metrics.
+            wants_pval = metric in ("pearson", "spearman")
+            score_out = objective_scoring.score(
+                metric,
+                test_targets,
+                test_composite,
+                covariates=test_cov,
+                return_pvalue=wants_pval,
+            )
         if wants_pval:
             test_score, test_pval = score_out  # type: ignore[misc]
         else:
