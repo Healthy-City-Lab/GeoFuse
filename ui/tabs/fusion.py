@@ -272,6 +272,7 @@ def _fusion_restart_summary_lines(p: dict) -> list[str]:
     """Read-only summary of the original job's config shown above the re-run form."""
     covs = p.get("covariate_columns") or []
     standalones = p.get("standalone_channels") or []
+    lon_payload = p.get("longitudinal_spec_payload") or None
     lines = [
         f"**Target:** `{p.get('target_display_name', '?')}`",
         f"**Outcomes:** {', '.join(p.get('outcome_columns') or []) or '—'}",
@@ -289,6 +290,12 @@ def _fusion_restart_summary_lines(p: dict) -> list[str]:
         f"{p.get('ndvi_buffer_max_m', '?')} (step {p.get('ndvi_buffer_step_m', '?')})",
         f"**Metric source:** {p.get('metric_mode', '?')}",
     ]
+    if lon_payload:
+        lines.append(
+            f"**Mixed-effects:** `{lon_payload.get('intake_mode')}` intake, "
+            f"waves={lon_payload.get('wave_labels')}, "
+            f"scoring=`{lon_payload.get('scoring_metric')}`"
+        )
     return lines
 
 
@@ -366,6 +373,7 @@ def _submit_fusion_restart(
         cgi_formula=str(p.get("cgi_formula") or "weighted_average"),
         covariate_columns=list(p.get("covariate_columns") or []),
         standalone_channels=list(p.get("standalone_channels") or []),
+        longitudinal_spec_payload=p.get("longitudinal_spec_payload"),
     )
 
 
@@ -1219,6 +1227,217 @@ def render(output_dir: str) -> None:
     with st.form("fusion_metric_run"):
         with st.container(border=True):
 
+            # ── Mixed-effects / longitudinal mode ────────────────────────────
+            # Compact expander up-top because the mode choice changes what
+            # every downstream field even means (single target file vs N per-
+            # wave files; cross-sectional scoring vs MixedLM scoring). Stays
+            # collapsed by default so cross-sectional users see the legacy
+            # form unchanged.
+            with st.expander(
+                "Mixed-effects / longitudinal mode (advanced)", expanded=False
+            ):
+                fusion_mode = st.radio(
+                    "Run mode",
+                    options=["Cross-sectional", "Mixed-effects (longitudinal)"],
+                    index=0,
+                    horizontal=True,
+                    key="fusion_run_mode",
+                    help=(
+                        "**Cross-sectional** — one observation per entity, "
+                        "standard CGI optimisation (the default). "
+                        "**Mixed-effects** — entities measured at multiple "
+                        "time points; CGI scored via a linear mixed model "
+                        "(`statsmodels.MixedLM`) with a random intercept "
+                        "(and optional random slope on time) per entity."
+                    ),
+                )
+                is_longitudinal = fusion_mode == "Mixed-effects (longitudinal)"
+
+                lon_intake = "long"
+                lon_entity_id_col = ""
+                lon_wave_col = ""
+                lon_date_col = "measurement_date"
+                lon_wave_labels_raw = ""
+                lon_target_paths_raw = ""
+                lon_veg_paths_raw = ""
+                lon_terrain_paths_raw = ""
+                lon_ndvi_paths_raw = ""
+                lon_veg_reuse = False
+                lon_terrain_reuse = False
+                lon_ndvi_reuse = False
+                lon_scoring_metric = "mixedlm_tstat"
+                lon_include_time_fixed = True
+                lon_random_slope = True
+
+                if is_longitudinal:
+                    st.caption(
+                        "Per-wave files take **absolute paths** — paste one path "
+                        "per wave, comma-separated, in the same order as the "
+                        "wave labels. Set the per-channel \"reuse single file\" "
+                        "checkbox to use one path across every wave (useful for "
+                        "channels that don't change over time)."
+                    )
+
+                    lc1, lc2 = st.columns([1, 1])
+                    with lc1:
+                        lon_intake = st.radio(
+                            "Intake mode",
+                            options=["long", "wide"],
+                            index=0,
+                            horizontal=True,
+                            key="fusion_lon_intake",
+                            help=(
+                                "**long** — one target file with one row per "
+                                "(entity, wave) and an explicit wave column. "
+                                "**wide** — one target file per wave, joined on "
+                                "a shared entity-id column."
+                            ),
+                        )
+                        lon_wave_labels_raw = st.text_input(
+                            "Wave labels (comma-separated, baseline first)",
+                            value=st.session_state.get(
+                                "fusion_lon_wave_labels_raw", "baseline,w2,w3"
+                            ),
+                            key="fusion_lon_wave_labels_raw",
+                            help=(
+                                "Ordered list of wave identifiers — the first one "
+                                "is treated as baseline for the time variable. "
+                                "Example: `baseline,w2,w3` or `2010,2013,2017`."
+                            ),
+                        )
+                        lon_entity_id_col = st.text_input(
+                            "Entity ID column",
+                            value=st.session_state.get(
+                                "fusion_lon_entity_id_col", "entity_id"
+                            ),
+                            key="fusion_lon_entity_id_col",
+                            help=(
+                                "Column on the target that uniquely identifies "
+                                "each entity (e.g. participant ID). Present in "
+                                "the long-format target, or in every per-wave "
+                                "file for wide mode."
+                            ),
+                        )
+                    with lc2:
+                        lon_date_col = st.text_input(
+                            "Measurement-date column",
+                            value=st.session_state.get(
+                                "fusion_lon_date_col", "measurement_date"
+                            ),
+                            key="fusion_lon_date_col",
+                            help=(
+                                "Column carrying the per-row date. Accepts full "
+                                "ISO dates (`2010-01-15`), year + month "
+                                "(`2010-01`), year-only (`2010`), or integer "
+                                "years. Used to derive `years_since_baseline` "
+                                "per entity."
+                            ),
+                        )
+                        if lon_intake == "long":
+                            lon_wave_col = st.text_input(
+                                "Wave column (long mode)",
+                                value=st.session_state.get(
+                                    "fusion_lon_wave_col", "wave"
+                                ),
+                                key="fusion_lon_wave_col",
+                                help=(
+                                    "Column on the long-format target that "
+                                    "carries the wave label per row. Every "
+                                    "value must appear in the wave-labels list."
+                                ),
+                            )
+                        else:
+                            lon_target_paths_raw = st.text_input(
+                                "Per-wave target file paths (comma-separated)",
+                                value=st.session_state.get(
+                                    "fusion_lon_target_paths_raw", ""
+                                ),
+                                key="fusion_lon_target_paths_raw",
+                                help=(
+                                    "Absolute paths to one target file per wave, "
+                                    "in the same order as the wave labels."
+                                ),
+                            )
+
+                    st.markdown("**Per-channel per-wave greenery files**")
+                    for ch_label, ch_key in (
+                        ("Vegetation (GVI)", "veg"),
+                        ("Terrain (GVI class 9)", "terrain"),
+                        ("NDVI", "ndvi"),
+                    ):
+                        cc1, cc2 = st.columns([1, 3])
+                        with cc1:
+                            reuse_key = f"fusion_lon_{ch_key}_reuse"
+                            reuse = st.checkbox(
+                                "Same file all waves",
+                                value=st.session_state.get(reuse_key, False),
+                                key=reuse_key,
+                            )
+                        with cc2:
+                            raw_key = f"fusion_lon_{ch_key}_paths_raw"
+                            raw = st.text_input(
+                                ch_label,
+                                value=st.session_state.get(raw_key, ""),
+                                key=raw_key,
+                                placeholder=(
+                                    "single absolute path"
+                                    if reuse
+                                    else "abs/path/wave1.gpkg, abs/path/wave2.gpkg, ..."
+                                ),
+                            )
+                        if ch_key == "veg":
+                            lon_veg_paths_raw, lon_veg_reuse = raw, reuse
+                        elif ch_key == "terrain":
+                            lon_terrain_paths_raw, lon_terrain_reuse = raw, reuse
+                        else:
+                            lon_ndvi_paths_raw, lon_ndvi_reuse = raw, reuse
+
+                    mc1, mc2 = st.columns([1, 1])
+                    with mc1:
+                        lon_scoring_metric = st.selectbox(
+                            "MixedLM scoring metric (Optuna target)",
+                            options=[
+                                "mixedlm_tstat",
+                                "mixedlm_marginal_r2",
+                                "mixedlm_lr",
+                                "mixedlm_coef",
+                            ],
+                            index=0,
+                            key="fusion_lon_scoring_metric",
+                            help=(
+                                "Which MixedLM scorer Optuna optimises per "
+                                "trial. The other three are computed post-hoc "
+                                "on robust + top-20 % trials + the final "
+                                "averaged-composite parameters and written to "
+                                "`mixedlm_metrics.csv`. **`mixedlm_tstat`** is "
+                                "the default — |t-stat| of the greenery fixed "
+                                "effect, robust to outcome scale."
+                            ),
+                        )
+                    with mc2:
+                        lon_include_time_fixed = st.checkbox(
+                            "Include `years_since_baseline` as fixed effect",
+                            value=True,
+                            key="fusion_lon_include_time_fixed",
+                            help=(
+                                "Adds `+ years_since_baseline` to the fixed-"
+                                "effect design. Keep on unless you want any "
+                                "global temporal trend to load onto the "
+                                "greenery coefficient."
+                            ),
+                        )
+                        lon_random_slope = st.checkbox(
+                            "Random slope on time per entity",
+                            value=True,
+                            key="fusion_lon_random_slope",
+                            help=(
+                                "Switches the random-effects structure from "
+                                "`(1 | entity)` to `(1 + years_since_baseline | "
+                                "entity)`. Costs more fit iterations but lets "
+                                "each entity's trajectory have its own slope."
+                            ),
+                        )
+
             col_cgi1, col_cgi2 = st.columns([1, 2])
             with col_cgi1:
                 cgi_formula = st.selectbox(
@@ -1535,6 +1754,64 @@ def render(output_dir: str) -> None:
                     else None
                 )
 
+                # Assemble the longitudinal spec from the form inputs. Bail
+                # out with a UI error if validation fails so the submit
+                # button can't kick off an invalid run.
+                longitudinal_spec_payload: dict | None = None
+                if is_longitudinal:
+                    from geofuse.longitudinal import (
+                        GREENERY_CHANNELS as _LON_CHANNELS,
+                        LongitudinalSpec as _LonSpec,
+                        validate_spec as _validate_lon_spec,
+                    )
+
+                    def _split_csv(s: str) -> list[str]:
+                        return [p.strip() for p in (s or "").split(",") if p.strip()]
+
+                    wave_labels = tuple(_split_csv(lon_wave_labels_raw))
+
+                    def _per_wave_files(raw: str, reuse: bool) -> dict[str, str]:
+                        items = _split_csv(raw)
+                        if reuse and items:
+                            return {w: items[0] for w in wave_labels}
+                        return {w: p for w, p in zip(wave_labels, items)}
+
+                    target_files_per_wave: dict[str, str] = {}
+                    if lon_intake == "wide":
+                        wide_paths = _split_csv(lon_target_paths_raw)
+                        target_files_per_wave = {
+                            w: p for w, p in zip(wave_labels, wide_paths)
+                        }
+
+                    _spec = _LonSpec(
+                        intake_mode=lon_intake,  # type: ignore[arg-type]
+                        entity_id_col=lon_entity_id_col,
+                        wave_labels=wave_labels,
+                        wave_col=lon_wave_col if lon_intake == "long" else None,
+                        date_col=lon_date_col or "measurement_date",
+                        greenery_files={
+                            "veg": _per_wave_files(lon_veg_paths_raw, lon_veg_reuse),
+                            "terrain": _per_wave_files(
+                                lon_terrain_paths_raw, lon_terrain_reuse
+                            ),
+                            "ndvi": _per_wave_files(
+                                lon_ndvi_paths_raw, lon_ndvi_reuse
+                            ),
+                        },
+                        target_files_per_wave=target_files_per_wave,
+                        scoring_metric=lon_scoring_metric,
+                        include_time_fixed_effect=lon_include_time_fixed,
+                        random_slope_time=lon_random_slope,
+                    )
+                    spec_errs = _validate_lon_spec(_spec)
+                    if spec_errs:
+                        st.error(
+                            "Mixed-effects spec is invalid:\n- "
+                            + "\n- ".join(spec_errs)
+                        )
+                        st.stop()
+                    longitudinal_spec_payload = _spec.to_payload()
+
                 fusion_record = store.submit(
                     type="fusion",
                     name=os.path.splitext(target_display_name)[0],
@@ -1593,6 +1870,10 @@ def render(output_dir: str) -> None:
                         "gvi_under_output_dir": _under_dir(gvi_path, output_dir),
                         "ndvi_under_output_dir": _under_dir(ndvi_path, output_dir),
                         "has_api_key": bool(gvi_api_key),
+                        # Mixed-effects / longitudinal spec persists as a
+                        # plain-dict payload so the restart panel can rebuild
+                        # the spec identically without re-prompting.
+                        "longitudinal_spec_payload": longitudinal_spec_payload,
                     },
                 )
                 executor.submit_runner(
@@ -1645,6 +1926,7 @@ def render(output_dir: str) -> None:
                     standalone_channels=(
                         ["veg", "terrain", "ndvi"] if run_standalones else []
                     ),
+                    longitudinal_spec_payload=longitudinal_spec_payload,
                 )
 
                 st.success("✅ Fusion job started! Check sidebar for progress.")
@@ -1974,3 +2256,48 @@ def render(output_dir: str) -> None:
                         }
                     )
                 st.dataframe(cmp_rows, use_container_width=True)
+
+            # ── Mixed-effects post-hoc metrics (when present) ────────────────
+            # The post-score stage writes ``mixedlm_metrics.csv`` per outcome
+            # into ``output_results/fusion/study_results/``. Multi-outcome
+            # runs disambiguate with ``mixedlm_metrics__<outcome>.csv``;
+            # check the outcome-specific path first, then fall back to the
+            # single-outcome name.
+            try:
+                _study_root = os.path.join(
+                    output_dir, "fusion", "study_results"
+                )
+                _active_label = (
+                    st.session_state.get("fusion_results_outcome_pick")
+                    if results.get("mode") == "multi"
+                    else None
+                )
+                _candidates = []
+                if _active_label:
+                    _candidates.append(
+                        os.path.join(
+                            _study_root, f"mixedlm_metrics__{_active_label}.csv"
+                        )
+                    )
+                _candidates.append(
+                    os.path.join(_study_root, "mixedlm_metrics.csv")
+                )
+                _mixedlm_csv_path = next(
+                    (p for p in _candidates if os.path.isfile(p)), None
+                )
+                if _mixedlm_csv_path:
+                    st.divider()
+                    st.markdown(
+                        "**Mixed-effects: all metrics across trial pools**"
+                    )
+                    st.caption(
+                        f"Source: `{_mixedlm_csv_path}`. Each pool's per-"
+                        "trial rows are followed by `__mean__`, `__ci_lo__`, "
+                        "`__ci_hi__`, and `__n__` summary rows."
+                    )
+                    _mixedlm_df = pd.read_csv(_mixedlm_csv_path)
+                    st.dataframe(_mixedlm_df, use_container_width=True)
+            except Exception as _exc:  # pragma: no cover -- UI-only guard
+                st.warning(
+                    f"Could not read mixedlm_metrics.csv: {_exc}"
+                )

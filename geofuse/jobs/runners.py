@@ -1132,7 +1132,8 @@ def run_fusion(
             # Re-score every robust + top-20% trial + the averaged-composite
             # parameters on the test set with all four mixedlm_* metrics so
             # the user can compare metric agreement across the trial pool.
-            # Output: ``<study_results>/mixedlm_metrics.csv``.
+            # The CSV basename includes the outcome label so multi-outcome
+            # runs don't overwrite each other.
             if longitudinal_spec is not None:
                 stage(skey("mixedlm_postscore"), RUNNING)
                 ctx.progress(
@@ -1144,9 +1145,17 @@ def run_fusion(
                 postscore_dir = os.path.join(
                     output_dir, "fusion", "study_results"
                 )
+                csv_basename = (
+                    f"mixedlm_metrics__{label}.csv"
+                    if multi_outcome
+                    else "mixedlm_metrics.csv"
+                )
                 try:
                     _compute_mixedlm_post_metrics(
-                        engine, postscore_dir, log=_log_fusion
+                        engine,
+                        postscore_dir,
+                        csv_basename=csv_basename,
+                        log=_log_fusion,
                     )
                 except Exception as exc:
                     _log_fusion(

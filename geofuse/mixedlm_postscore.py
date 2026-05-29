@@ -150,6 +150,7 @@ def compute_post_metrics(
     *,
     top_percent: float = 0.2,
     min_robust: int = 10,
+    csv_basename: str = "mixedlm_metrics.csv",
     log: Any = None,
 ) -> str | None:
     """Score every robust + top-``top_percent`` trial + the final composite
@@ -225,7 +226,7 @@ def compute_post_metrics(
             rows.extend(_pool_summary_rows(pool_name, per_trial_values))
 
     os.makedirs(output_dir, exist_ok=True)
-    csv_path = os.path.join(output_dir, "mixedlm_metrics.csv")
+    csv_path = os.path.join(output_dir, csv_basename)
     fields = ["pool", "trial_id"] + sorted(mixed_effects_scoring.MIXEDLM_METRICS)
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)

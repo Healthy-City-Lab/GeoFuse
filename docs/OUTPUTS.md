@@ -178,6 +178,7 @@ Each contains:
 | `edf.html` | Empirical Distribution Function |
 | `rank.html` | Trial ranking |
 | `timeline.html` | Trial execution timeline |
+| `mixedlm_metrics.csv` | **Mixed-effects mode only.** Per-trial values of all four `mixedlm_*` metrics scored on the held-out test set across three pools: every robust trial, every top-20 % trial that feeds the averaged composite, and the final composite parameters themselves. Each pool's per-trial rows are followed by `__mean__`, `__ci_lo__`, `__ci_hi__`, and `__n__` summary rows (1.96·SE CI for n≥30, 2.5/97.5 quantiles otherwise). |
 
 ### Metric Cache (`output_results/fusion_cache/`)
 

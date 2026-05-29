@@ -42,6 +42,10 @@ Each job writes a persistent log to `logs/jobs/<job_id>.log`. The job-monitor ex
 
 For widely-scattered inputs (e.g. neighbourhoods across multiple cities), the engine automatically clusters the buffered features and generates one sampling grid per cluster, all anchored to a common reference. There is no special "national mode" — just upload the file. The chosen projected CRS (UTM / LCC / Polar Stereographic) and an estimated distortion are reported in the job log.
 
+#### Mixed-effects fusion (longitudinal data)
+
+When entities are measured at multiple time points, open the **Mixed-effects / longitudinal mode** expander at the top of the fusion form. Set the wave labels (comma-separated, baseline first), pick the intake mode — **long** (one target file with a wave column) or **wide** (one target file per wave joined on a shared entity-id column) — and fill in the entity-id, date, and (long mode) wave-column names. Then, per greenery channel, paste the per-wave file paths comma-separated in the same order as the wave labels; tick **"Same file all waves"** for channels that don't change over time (typical for terrain and one-snapshot NDVI). Pick the MixedLM scorer Optuna should optimise (default `mixedlm_tstat`); the other three metrics are computed post-hoc and saved to `output_results/fusion/study_results/mixedlm_metrics.csv` with mean + 95 % CI rows per pool. Date columns accept full ISO dates (`2010-01-15`), year + month (`2010-01`), year-only strings (`2010`), or integer years — `years_since_baseline` is derived per entity from the earliest measurement date.
+
 ---
 
 ## 2. Command-Line Interface (CLI) for Batch Processing
