@@ -35,6 +35,25 @@ A GDAL or GDAL-dependent library (GeoPandas, rasterio) fails to import.
 
 ---
 
+## `Windows fatal exception: code 0xc06d007f` from `numpy.linalg.cholesky` (or `MixedLM`)
+
+A fatal exception terminates the interpreter with no Python traceback the moment a matrix operation runs. Most often surfaces when running the mixed-effects fusion (`statsmodels.regression.mixed_linear_model.MixedLM.fit`).
+
+**Cause:** Conda-forge's MKL 2026.x ships an INTEL OpenMP threading runtime whose symbols clash with `numpy.linalg.cholesky` and matrix-multiply (`gemm`) on Windows. The mismatch causes the OS loader to fail entry-point resolution and kill the process.
+
+**Fix:** Switch the env's BLAS metapackage from MKL to openblas, then reinstall `numpy` and `scipy` via conda so they bind to the new BLAS:
+
+```bash
+conda activate geofuse
+conda install -c conda-forge "libblas=*=*openblas" "libcblas=*=*openblas" "liblapack=*=*openblas" -y
+pip uninstall numpy scipy -y
+conda install -c conda-forge numpy scipy --force-reinstall -y
+```
+
+Fresh installs run by the current `install.bat` / `install.sh` already pin openblas + conda-installed numpy/scipy (see `scripts/setup_env.py`), so this fix is only needed for envs built manually, or before this recent fix.
+
+---
+
 ## `DecompressionBombWarning`
 
 A warning appears in the terminal when downloading very high-resolution Street View images.

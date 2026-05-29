@@ -13,7 +13,16 @@ ENV_NAME = "geofuse"
 
 # 1. CONDA PACKAGES (System Binaries & Core Geospatial)
 #    MPI packages are added dynamically below based on OS.
-CONDA_PACKAGES = ["gdal=3.12.0", "geopandas=1.1.1", "statsmodels=0.14.6"]
+CONDA_PACKAGES = [
+    "libblas=*=*openblas",
+    "libcblas=*=*openblas",
+    "liblapack=*=*openblas",
+    "numpy=2.4.6",
+    "scipy=1.17.1",
+    "gdal=3.12.0",
+    "geopandas=1.1.1",
+    "statsmodels=0.14.6",
+]
 
 # 2. PYTORCH
 PYTORCH_VERSION = "torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0"
@@ -27,7 +36,6 @@ PIP_PACKAGES = [
     # Data Science
     "matplotlib==3.10.8",
     "scikit-learn==1.6.0",
-    "scipy==1.16.3",
     "tqdm==4.67.1",
     "pillow==12.0.0",
     "optuna==4.6.0",

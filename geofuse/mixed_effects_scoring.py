@@ -238,9 +238,7 @@ def _compute_all_metrics(
             re_var += float(cov_re_mat[i, i]) * float(np.mean(exog_re[:, i] ** 2))
 
     total_var = var_fe_full + re_var + sigma2_resid
-    marginal_r2 = (
-        (var_fe_full - var_fe_no_g) / total_var if total_var > 0 else 0.0
-    )
+    marginal_r2 = (var_fe_full - var_fe_no_g) / total_var if total_var > 0 else 0.0
 
     lr_stat = 0.0
     if result_null is not None:
@@ -320,7 +318,9 @@ def score_mixedlm(
         return (s, 1.0) if return_pvalue else s
 
     X_full, g_col = _build_fixed_design(
-        g, cov, t,
+        g,
+        cov,
+        t,
         include_time_fixed=include_time_fixed,
         include_greenery=True,
     )
@@ -336,7 +336,9 @@ def score_mixedlm(
     result_null = None
     if metric == "mixedlm_lr" or return_all:
         X_null, _ = _build_fixed_design(
-            g, cov, t,
+            g,
+            cov,
+            t,
             include_time_fixed=include_time_fixed,
             include_greenery=False,
         )

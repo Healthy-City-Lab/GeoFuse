@@ -981,7 +981,7 @@ class NDVIEngine:
         if cancel_callback and cancel_callback():
             return {"status": "cancelled", "message": "Cancelled by user"}
         final_tif = os.path.join(folder, f"{output_name}_ndvi.tif")
-        tmp_tif = final_tif + ".tmp"
+        tmp_tif = final_tif[:-4] + ".tmp.tif"
 
         try:
 
