@@ -39,6 +39,7 @@ from geofuse.gvi import GVIEngine
 from geofuse.jobs import progress_interval_s
 from geofuse.jobs.stage_ledger import DONE, RUNNING, StageLedger
 from geofuse.logger import get_logger
+from geofuse.longitudinal import GREENERY_CHANNELS, LongitudinalSpec
 from geofuse.ndvi import NDVIEngine
 from geofuse.persistence.job_executor import JobContext
 from geofuse.raster_sampling import sample_raster_at_features
@@ -564,6 +565,89 @@ _FUSION_STAGE_STEPS: tuple[tuple[str, str], ...] = (
     ("apply", "Apply fusion weights"),
 )
 
+# Mixed-effects fusion inserts an extra step before pre-aggregation: load
+# the per-wave target frames (wide intake only) and the per-wave greenery
+# files for every channel, then hand them to the engine. The cross-
+# sectional pipeline skips this stage.
+_FUSION_LONGITUDINAL_STAGE: tuple[str, str] = (
+    "prepare_longitudinal",
+    "Load longitudinal data",
+)
+
+
+def _load_longitudinal_metric_file(path: str, channel: str) -> Any:
+    """Read one per-wave metric file into the layout the engine expects.
+
+    Returns either a GeoDataFrame (vector metric) or the raster-dict layout
+    ``{"data", "transform", "crs", "bounds", "width", "height"}`` that
+    matches what ``MetricFusionEngine.load_metrics`` builds for the cross-
+    sectional case. Multi-band GVI rasters split into ``veg`` + ``terrain``
+    point GeoDataFrames per ``GVIEngine`` convention (band 1 = vegetation,
+    band 2 = terrain); the caller picks which to keep based on ``channel``.
+    """
+    import geopandas as gpd
+    import numpy as np
+    import rasterio
+    from rasterio.transform import xy
+
+    if path.lower().endswith((".tif", ".tiff")):
+        with rasterio.open(path) as src:
+            n_bands = src.count
+            if channel in ("veg", "terrain") and n_bands >= 2:
+                band = 1 if channel == "veg" else 2
+                arr = src.read(band)
+                transform = src.transform
+                crs = src.crs
+                h, w = arr.shape
+                rows_i, cols_i = np.meshgrid(
+                    np.arange(h), np.arange(w), indexing="ij"
+                )
+                xs, ys = xy(
+                    transform, rows_i.flatten(), cols_i.flatten(), offset="center"
+                )
+                vals = arr.flatten()
+                mask = ~np.isnan(vals)
+                gdf = gpd.GeoDataFrame(
+                    {channel: vals[mask]},
+                    geometry=gpd.points_from_xy(np.asarray(xs)[mask], np.asarray(ys)[mask]),
+                    crs=crs,
+                )
+                gdf.attrs["metric_column"] = channel
+                return gdf
+            data = src.read(1, masked=True)
+            return {
+                "data": data,
+                "transform": src.transform,
+                "crs": src.crs,
+                "bounds": src.bounds,
+                "width": src.width,
+                "height": src.height,
+            }
+    # Vector formats (GPKG / GeoJSON / shapefile / zip)
+    gdf = gpd.read_file(path)
+    default_col = {"veg": "veg", "terrain": "terrain", "ndvi": "NDVI"}[channel]
+    col = default_col if default_col in gdf.columns else (
+        "value" if "value" in gdf.columns else None
+    )
+    if col is None:
+        raise ValueError(
+            f"Cannot find metric value column in {path} for channel {channel!r}. "
+            f"Expected one of [{default_col!r}, 'value']; got columns "
+            f"{list(gdf.columns)}."
+        )
+    gdf.attrs["metric_column"] = col
+    return gdf
+
+
+def _resolve_longitudinal_spec(
+    payload: dict | None,
+) -> LongitudinalSpec | None:
+    """Reconstruct the dataclass from the runner kwarg, returning ``None`` for
+    cross-sectional jobs."""
+    if not payload:
+        return None
+    return LongitudinalSpec.from_payload(payload)
+
 # Human labels for the standalone channels surfaced in ledger stages and
 # logs. Keys match the engine's ``greenery_channel`` values.
 _STANDALONE_CHANNEL_LABELS: dict[str, str] = {
@@ -583,6 +667,7 @@ def _build_fusion_ledger(
     *,
     multi: bool,
     standalone_channels: list[str] | None = None,
+    longitudinal: bool = False,
 ) -> StageLedger:
     """Fresh ledger covering every (outcome, step) pair in run order.
 
@@ -590,7 +675,9 @@ def _build_fusion_ledger(
     first, then one stage per enabled standalone metric — those reuse the
     already-built split + pre-aggregation cache, so each is a single
     optimize/robust/evaluate burst that's compact enough to fit in one
-    ledger row.
+    ledger row. When ``longitudinal`` is true an extra
+    ``prepare_longitudinal`` stage is inserted between ``load_metrics`` and
+    ``preaggregate`` to cover per-wave file loading.
     """
     standalones = list(standalone_channels or [])
     steps: list[tuple[str, str]] = []
@@ -599,6 +686,13 @@ def _build_fusion_ledger(
             key = _fusion_stage_key(label, step_key, multi=multi)
             disp = f"[{label}] {step_label}" if multi else step_label
             steps.append((key, disp))
+            # Slot the longitudinal-prep stage in right after load_metrics so
+            # the monitor reads top-to-bottom in actual execution order.
+            if longitudinal and step_key == "load_metrics":
+                lon_key_raw, lon_label = _FUSION_LONGITUDINAL_STAGE
+                lon_key = _fusion_stage_key(label, lon_key_raw, multi=multi)
+                lon_disp = f"[{label}] {lon_label}" if multi else lon_label
+                steps.append((lon_key, lon_disp))
         for ch in standalones:
             key = _fusion_stage_key(label, f"standalone_{ch}", multi=multi)
             ch_lbl = _STANDALONE_CHANNEL_LABELS.get(ch, ch)
@@ -650,6 +744,7 @@ def run_fusion(
     cgi_formula: str = "weighted_average",
     covariate_columns: list[str] | None = None,
     standalone_channels: list[str] | None = None,
+    longitudinal_spec_payload: dict | None = None,
 ) -> dict:
     """Run fusion optimization. Mirrors the previous ``_fusion_worker``."""
     try:
@@ -682,6 +777,19 @@ def run_fusion(
                 f"Standalone single-metric studies enabled: {', '.join(standalones)}",
             )
 
+        # Mixed-effects / longitudinal mode. Reconstructed once up front so
+        # spec errors surface before any heavy compute. Cross-sectional jobs
+        # pass ``longitudinal_spec_payload=None`` (the default) and follow the
+        # legacy pipeline unchanged.
+        longitudinal_spec = _resolve_longitudinal_spec(longitudinal_spec_payload)
+        if longitudinal_spec is not None:
+            _log_fusion(
+                "INFO",
+                f"Mixed-effects fusion enabled: intake_mode={longitudinal_spec.intake_mode!r}, "
+                f"waves={list(longitudinal_spec.wave_labels)}, "
+                f"scoring_metric={longitudinal_spec.scoring_metric!r}.",
+            )
+
         by_target: dict = {}
         engines_by_target: dict = {}
         output_paths: list[str] = []
@@ -694,7 +802,10 @@ def run_fusion(
         ]
         ordered_labels: list[str] = list(all_labels)
         ledger = _build_fusion_ledger(
-            all_labels, multi=multi_outcome, standalone_channels=standalones
+            all_labels,
+            multi=multi_outcome,
+            standalone_channels=standalones,
+            longitudinal=longitudinal_spec is not None,
         )
         ctx.update_stage_ledger(ledger.to_dict())
 
@@ -756,6 +867,7 @@ def run_fusion(
                 cache_dir=cache_dir,
                 cgi_formula=cgi_formula,
                 covariate_columns=outcome_covs,
+                longitudinal_spec=longitudinal_spec,
             )
 
             ctx.progress(value=prog(0.1), status_text=f"{prefix}Loading target data...")
@@ -810,21 +922,67 @@ def run_fusion(
                 return ctx.is_cancelled()
 
             stage(skey("load_metrics"), RUNNING)
-            engine.load_metrics(
-                veg_file=veg_path,
-                terrain_file=terrain_path,
-                ndvi_file=ndvi_path,
-                cache_metrics=cache_metrics,
-                gvi_api_key=gvi_api_key,
-                ndvi_start_date=ndvi_start_date,
-                ndvi_end_date=ndvi_end_date,
-                ndvi_project_id=ndvi_project_id,
-                progress_callback=gvi_progress_callback,
-                cancel_callback=cancel_check,
-                ndvi_resolution_m=ndvi_resolution_m,
-                gvi_grid_spacing_m=gvi_grid_spacing_m,
-            )
+            if longitudinal_spec is None:
+                engine.load_metrics(
+                    veg_file=veg_path,
+                    terrain_file=terrain_path,
+                    ndvi_file=ndvi_path,
+                    cache_metrics=cache_metrics,
+                    gvi_api_key=gvi_api_key,
+                    ndvi_start_date=ndvi_start_date,
+                    ndvi_end_date=ndvi_end_date,
+                    ndvi_project_id=ndvi_project_id,
+                    progress_callback=gvi_progress_callback,
+                    cancel_callback=cancel_check,
+                    ndvi_resolution_m=ndvi_resolution_m,
+                    gvi_grid_spacing_m=gvi_grid_spacing_m,
+                )
+            else:
+                # Longitudinal mode bypasses ``load_metrics`` (whose path
+                # builds one cross-sectional source per channel); the per-
+                # wave files are loaded in the prepare_longitudinal stage
+                # below and pushed via ``set_longitudinal_metric_data``.
+                _log_fusion(
+                    "INFO",
+                    f"[{label}] Longitudinal mode: per-wave metric files will "
+                    "load in the prepare_longitudinal stage.",
+                )
             stage(skey("load_metrics"), DONE)
+
+            # Per-wave file resolution + engine injection. Wide-mode also
+            # loads N per-wave target frames here. Long-mode skips the wide
+            # frames branch and uses the single ``load_target`` result.
+            if longitudinal_spec is not None:
+                stage(skey("prepare_longitudinal"), RUNNING)
+                ctx.progress(
+                    value=prog(0.26),
+                    status_text=f"{prefix}Loading per-wave files...",
+                )
+                if longitudinal_spec.intake_mode == "wide":
+                    wide_frames: list[tuple[str, gpd.GeoDataFrame]] = []
+                    for wave_label in longitudinal_spec.wave_labels:
+                        wpath = longitudinal_spec.target_files_per_wave[wave_label]
+                        wide_frames.append((wave_label, gpd.read_file(wpath)))
+                    engine.set_longitudinal_wave_frames(wide_frames)
+                    _log_fusion(
+                        "INFO",
+                        f"[{label}] Loaded {len(wide_frames)} per-wave target "
+                        "files (wide intake).",
+                    )
+                for ch in GREENERY_CHANNELS:
+                    per_wave: dict[str, Any] = {}
+                    for wave_label, fp in longitudinal_spec.greenery_files[ch].items():
+                        per_wave[wave_label] = _load_longitudinal_metric_file(fp, ch)
+                    engine.set_longitudinal_metric_data(ch, per_wave)
+                    n_unique = len({id(v) for v in per_wave.values()})
+                    _log_fusion(
+                        "INFO",
+                        f"[{label}] Loaded {ch}: {len(per_wave)} wave(s), "
+                        f"{n_unique} unique source(s).",
+                    )
+                stage(skey("prepare_longitudinal"), DONE)
+                if ctx.is_cancelled():
+                    return {"output_paths": output_paths}
 
             # Sample materialization + the on-disk pre-aggregation cache form one
             # "spatial pre-processing" stage; prepare_fusion_data feeds the cache.

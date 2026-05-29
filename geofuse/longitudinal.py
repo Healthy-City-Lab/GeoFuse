@@ -123,6 +123,7 @@ class LongitudinalSpec:
     wave_col: str | None = None
     date_col: str = "measurement_date"
     greenery_files: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    target_files_per_wave: Mapping[str, str] = field(default_factory=dict)
     include_time_fixed_effect: bool = True
     random_slope_time: bool = True
     scoring_metric: str = DEFAULT_MIXEDLM_METRIC
@@ -138,6 +139,7 @@ class LongitudinalSpec:
             "greenery_files": {
                 ch: dict(per_wave) for ch, per_wave in self.greenery_files.items()
             },
+            "target_files_per_wave": dict(self.target_files_per_wave),
             "include_time_fixed_effect": self.include_time_fixed_effect,
             "random_slope_time": self.random_slope_time,
             "scoring_metric": self.scoring_metric,
@@ -156,6 +158,9 @@ class LongitudinalSpec:
                 ch: dict(per_wave)
                 for ch, per_wave in (payload.get("greenery_files") or {}).items()
             },
+            target_files_per_wave=dict(
+                payload.get("target_files_per_wave") or {}
+            ),
             include_time_fixed_effect=bool(
                 payload.get("include_time_fixed_effect", True)
             ),
@@ -181,6 +186,13 @@ def validate_spec(spec: LongitudinalSpec) -> list[str]:
         errs.append("wave_labels contains duplicates.")
     if spec.intake_mode == "long" and not spec.wave_col:
         errs.append("wave_col is required when intake_mode == 'long'.")
+    if spec.intake_mode == "wide":
+        missing_t = [w for w in spec.wave_labels if w not in spec.target_files_per_wave]
+        if missing_t:
+            errs.append(
+                "target_files_per_wave is missing entries for waves "
+                f"{missing_t} (required when intake_mode == 'wide')."
+            )
     if spec.scoring_metric not in MIXEDLM_METRICS:
         errs.append(
             f"scoring_metric must be one of {MIXEDLM_METRICS}, "
