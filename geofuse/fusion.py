@@ -26,7 +26,7 @@ from sklearn.metrics import mean_squared_error, mutual_info_score, r2_score
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import MinMaxScaler
 
-from . import cgi_formulas, objective_scoring, preaggregation
+from . import cgi_formulas, longitudinal, objective_scoring, preaggregation
 from .cgi_formulas import WEIGHTED_AVERAGE, compute_cgi
 from .crs_utils import (
     build_internal_overviews,
@@ -134,6 +134,7 @@ class MetricFusionEngine:
         cache_dir: str = "output_results/fusion_cache",
         cgi_formula: str = WEIGHTED_AVERAGE,
         covariate_columns: list[str] | None = None,
+        longitudinal_spec: longitudinal.LongitudinalSpec | None = None,
     ):
         """
         Initialize the fusion engine.
@@ -163,6 +164,18 @@ class MetricFusionEngine:
                 with a raster target raises ``ValueError`` from
                 :meth:`prepare_fusion_data`. Defaults to ``None`` → score
                 reduces exactly to the legacy ``_calculate_metric``.
+            longitudinal_spec: When set, switches the engine into
+                mixed-effects / longitudinal mode. The spec controls intake
+                shape (long-format target or N per-wave files joined on
+                ``entity_id``) and carries the per-wave greenery file
+                assignment. :meth:`prepare_fusion_data` then routes through
+                :func:`geofuse.longitudinal.build_long_format` and emits a
+                fusion DataFrame keyed by ``(entity_id, wave)`` plus the
+                derived continuous ``years_since_baseline`` predictor.
+                :meth:`split_data` keeps every row of an entity together
+                (mirrors polygon mode) so the mixed-effects scorer sees a
+                clean within-entity panel. Defaults to ``None`` → engine
+                stays in cross-sectional mode.
         """
         # Route Optuna's chatter ("Trial X finished with value Y …") into
         # the per-job log instead of the Streamlit host terminal. Fusion
@@ -240,6 +253,22 @@ class MetricFusionEngine:
         # correlation / incremental-R² OLS.
         cov_in = list(covariate_columns) if covariate_columns else []
         self.covariate_columns: list[str] = list(dict.fromkeys(cov_in))
+
+        # Longitudinal / mixed-effects spec. ``None`` keeps the engine in
+        # cross-sectional mode (no behaviour change). When set, every code
+        # path that today threads a single per-entity row through Optuna
+        # forks to use (entity_id, wave) rows + a continuous
+        # ``years_since_baseline`` time predictor instead.
+        self.longitudinal_spec: longitudinal.LongitudinalSpec | None = (
+            longitudinal_spec
+        )
+        if self.longitudinal_spec is not None:
+            spec_errs = longitudinal.validate_spec(self.longitudinal_spec)
+            if spec_errs:
+                raise ValueError(
+                    "Invalid longitudinal_spec: " + "; ".join(spec_errs)
+                )
+
         self._ndvi_export_resolution_m = 10.0
         self._gvi_grid_spacing_m = 75.0
 
@@ -281,6 +310,126 @@ class MetricFusionEngine:
 
         if not (self.is_points or self.is_raster):
             raise ValueError("Target file must be a supported vector format or GeoTIFF")
+
+        # Wide-mode longitudinal frames are populated by the runner before
+        # ``prepare_fusion_data`` via :meth:`set_longitudinal_target_frames`.
+        # Long-mode skips this — the engine reads the single target file via
+        # ``load_target`` exactly as in cross-sectional mode and converts it
+        # to long format inside ``prepare_fusion_data``.
+        self._longitudinal_wave_frames: (
+            list[tuple[str, gpd.GeoDataFrame]] | None
+        ) = None
+
+        if self.is_longitudinal and self.is_raster:
+            raise ValueError(
+                "longitudinal_spec is only supported for vector targets; "
+                "raster targets have no entity-id attribute column."
+            )
+
+    # ------------------------------------------------------------------
+    # Longitudinal mode — entry points + helpers
+    # ------------------------------------------------------------------
+
+    @property
+    def is_longitudinal(self) -> bool:
+        """True when a :class:`LongitudinalSpec` was provided at construction."""
+        return self.longitudinal_spec is not None
+
+    def set_longitudinal_wave_frames(
+        self, frames: list[tuple[str, gpd.GeoDataFrame]]
+    ) -> None:
+        """Inject pre-loaded per-wave target frames for wide-mode runs.
+
+        The runner loads each per-wave target file separately (under each
+        wave's date column and shared ``entity_id_col`` from the spec) and
+        hands the list of ``(wave_label, GeoDataFrame)`` pairs to the engine
+        via this method before :meth:`prepare_fusion_data`. Long-mode runs
+        do not call this — the standard :meth:`load_target` flow reads the
+        single long-format file into ``self.target_gdf``.
+        """
+        if not self.is_longitudinal:
+            raise RuntimeError(
+                "set_longitudinal_wave_frames() requires longitudinal_spec to be set."
+            )
+        if self.longitudinal_spec.intake_mode != "wide":
+            raise RuntimeError(
+                "set_longitudinal_wave_frames() is only valid for intake_mode='wide'; "
+                f"current spec uses intake_mode={self.longitudinal_spec.intake_mode!r}."
+            )
+        self._longitudinal_wave_frames = list(frames)
+
+    _LONGITUDINAL_EXTRA_COLS: tuple[str, ...] = (
+        "entity_id",
+        "wave",
+        "years_since_baseline",
+    )
+
+    def _longitudinal_extra_cols(self) -> tuple[str, ...]:
+        """Extra DataFrame columns carried through every prep path in long mode."""
+        return self._LONGITUDINAL_EXTRA_COLS if self.is_longitudinal else ()
+
+    def _materialize_longitudinal_target(self) -> None:
+        """Replace ``self.target_gdf`` with the normalised long-format frame.
+
+        Run as the first step of :meth:`prepare_fusion_data` whenever
+        ``longitudinal_spec`` is set. After this returns, every row of
+        ``self.target_gdf`` represents one ``(entity_id, wave)`` observation
+        carrying ``years_since_baseline`` and the original geometry — so the
+        existing point / polygon prep paths sample metrics at the right
+        location for each observation without further changes.
+        """
+        spec = self.longitudinal_spec
+        assert spec is not None  # guaranteed by caller
+
+        outcome_col = self.target_feature
+        if not outcome_col:
+            raise ValueError(
+                "longitudinal mode requires target_feature (outcome column) to be set."
+            )
+
+        if spec.intake_mode == "long":
+            if self.target_gdf is None:
+                raise RuntimeError(
+                    "longitudinal long-mode requires load_target() to have run first."
+                )
+            target_input: (
+                gpd.GeoDataFrame | list[tuple[str, gpd.GeoDataFrame]]
+            ) = self.target_gdf
+        else:
+            if not self._longitudinal_wave_frames:
+                raise RuntimeError(
+                    "longitudinal wide-mode requires set_longitudinal_wave_frames() "
+                    "to have been called before prepare_fusion_data()."
+                )
+            target_input = self._longitudinal_wave_frames
+
+        long_gdf = longitudinal.build_long_format(
+            spec, target_input, outcome_col=outcome_col,
+            covariate_cols=self.covariate_columns,
+        )
+        dropped = long_gdf.attrs.get("dropped_rows", {})
+        if dropped:
+            _log(
+                "INFO",
+                "longitudinal intake — dropped rows: "
+                + ", ".join(f"{k}={v}" for k, v in dropped.items()),
+            )
+
+        # Re-detect polygon mode based on the long-format frame's geometry
+        # (per-entity geometries may differ from what load_target inferred
+        # when wide-mode supplies one frame per wave).
+        first_geom_type = long_gdf.geometry.iloc[0].geom_type
+        self.is_polygon_target = first_geom_type in ("Polygon", "MultiPolygon")
+        if self.is_polygon_target:
+            self.target_polygons_gdf = long_gdf.copy()
+        self.target_gdf = long_gdf
+        _log(
+            "INFO",
+            f"longitudinal intake: {len(long_gdf)} rows across "
+            f"{long_gdf['entity_id'].nunique()} entities × "
+            f"{long_gdf['wave'].nunique()} waves "
+            f"(geometry: {first_geom_type}).",
+        )
 
     def load_target(self) -> gpd.GeoDataFrame:
         """Load and prepare target data, return buffered extent."""
@@ -1778,6 +1927,13 @@ class MetricFusionEngine:
         """
         _log("INFO", "====== PREPARE FUSION DATA ======")
 
+        # Longitudinal mode replaces the as-loaded target with a long-format
+        # frame keyed by (entity_id, wave) BEFORE the point/polygon prep
+        # path runs — so the existing samplers see one row per (entity, wave)
+        # observation and need no other changes.
+        if self.is_longitudinal:
+            self._materialize_longitudinal_target()
+
         # Covariates need attribute columns — raster targets don't have them
         # and the polygon/point paths need to validate the requested names
         # before any heavy work happens.
@@ -2266,13 +2422,28 @@ class MetricFusionEngine:
             # collapse in _objective / evaluate_on_test groupby-first()s them
             # back to one value per polygon for scoring.
             cov_values = {col: row.get(col, np.nan) for col in self.covariate_columns}
+            # Longitudinal polygon mode keys the collapse on (entity_id, wave)
+            # so the per-polygon mean turns into a per-(entity, wave) mean —
+            # each (entity, wave) observation contributes one CGI value to
+            # the MixedLM, with within-entity correlation handled by the
+            # random-effects structure rather than by repeated rows here.
+            if self.is_longitudinal:
+                lon_values = {
+                    col: row.get(col, np.nan)
+                    for col in self._longitudinal_extra_cols()
+                }
+                collapse_key = f"{lon_values['entity_id']}|{lon_values['wave']}"
+            else:
+                lon_values = {}
+                collapse_key = poly_id
             for geom in best_pts.geometry:
                 sample_records.append(
                     {
-                        "polygon_id": poly_id,
+                        "polygon_id": collapse_key,
                         "target": outcome,
                         "geometry": geom,
                         **cov_values,
+                        **lon_values,
                     }
                 )
 
@@ -2340,6 +2511,11 @@ class MetricFusionEngine:
         # polygon collapse in _objective recovers one value per polygon.
         for col in self.covariate_columns:
             fusion_df[col] = sample_gdf[col].values
+        # In longitudinal mode the same broadcast applies to (entity_id,
+        # wave, years_since_baseline) — every in-polygon sample carries the
+        # owning (entity, wave) observation's keys + time.
+        for col in self._longitudinal_extra_cols():
+            fusion_df[col] = sample_gdf[col].values
 
         _log("INFO", "====== DATA QUALITY SUMMARY (POLYGON) ======")
         _log(
@@ -2400,6 +2576,10 @@ class MetricFusionEngine:
         # split / objective / evaluate paths all see them as plain columns.
         for col in self.covariate_columns:
             fusion_df[col] = points_gdf[col].to_numpy()
+        # Longitudinal mode adds the (entity_id, wave) keys and the time
+        # predictor; downstream split + MixedLM scorer key on these.
+        for col in self._longitudinal_extra_cols():
+            fusion_df[col] = points_gdf[col].to_numpy()
 
         # Log data quality before dropping NaN
         _log("INFO", "====== DATA QUALITY SUMMARY (POINT) ======")
@@ -2409,7 +2589,9 @@ class MetricFusionEngine:
             pct = nan_count / max(len(fusion_df), 1) * 100
             _log("INFO", f"{col} NaN: {nan_count} ({pct:.1f}%)")
 
-        result = fusion_df.dropna()
+        result = fusion_df.dropna(
+            subset=["target", "veg", "terrain", "ndvi", *self.covariate_columns]
+        )
         _log(
             "OK" if len(result) else "WARN",
             f"After dropna: {len(result)} valid rows",
@@ -2705,17 +2887,32 @@ class MetricFusionEngine:
         logger.info("Step 2/4: Filtering complete - removed samples with NaN values")
         logger.info(f"Valid samples after filtering: {len(fusion_df)}")
 
-        polygon_mode = "polygon_id" in fusion_df.columns
+        # Determine the group column for leakage-safe splitting. entity_id
+        # takes priority over polygon_id because in longitudinal+polygon mode
+        # both are present, but we want every (entity, *) row to stay in the
+        # same split. Per-entity outcome for stratification = mean across
+        # waves; polygon-mode stratifies on each polygon's single outcome.
+        group_col: str | None = None
+        group_label: str = ""
+        group_agg: str = "first"
+        if "entity_id" in fusion_df.columns:
+            group_col, group_label, group_agg = "entity_id", "entity", "mean"
+        elif "polygon_id" in fusion_df.columns:
+            group_col, group_label, group_agg = "polygon_id", "polygon", "first"
 
-        if polygon_mode:
-            # ── Polygon-level stratified split ────────────────────────────
-            # Stratify on the *per-polygon* outcome so the distribution of
-            # health outcomes stays balanced across train / val / test, and
-            # all rows from a single polygon stay together to avoid leakage.
-            _log("INFO", "Splitting at polygon level (stratified on outcome)...")
+        if group_col is not None:
+            # ── Group-level stratified split ──────────────────────────────
+            # Stratify on the per-group outcome so the distribution stays
+            # balanced across train / val / test, and all rows of a group
+            # stay together to avoid leakage.
+            _log(
+                "INFO",
+                f"Splitting at {group_label} level (stratified on outcome, "
+                f"agg={group_agg})...",
+            )
             poly_df = (
-                fusion_df.groupby("polygon_id", sort=False)["target"]
-                .first()
+                fusion_df.groupby(group_col, sort=False)["target"]
+                .agg(group_agg)
                 .reset_index()
             )
 
@@ -2723,9 +2920,9 @@ class MetricFusionEngine:
             n_test_target = max(1, int(round(test_size * n_polys)))
             n_trainval_target = n_polys - n_test_target
 
-            # Bin count constrained by: at least 2 polys per bin so each fold
-            # gets ≥1 polygon per class, and ≤ n_test_target so the test split
-            # can include every class.
+            # Bin count constrained by: at least 2 groups per bin so each
+            # fold gets ≥1 group per class, and ≤ n_test_target so the test
+            # split can include every class.
             max_bins_for_test = max(2, n_test_target)
             max_bins_for_kfold = max(2, n_trainval_target // max(k_folds, 1))
             requested_bins = max(2, self.n_bins)
@@ -2751,9 +2948,9 @@ class MetricFusionEngine:
             )
             _log(
                 "INFO",
-                f"{n_polys} polygons across {actual_bins} outcome bin(s) "
+                f"{n_polys} {group_label}s across {actual_bins} outcome bin(s) "
                 f"(requested {requested_bins}; "
-                f"{'stratified' if stratifiable else 'unstratified — too few polygons per bin'}).",
+                f"{'stratified' if stratifiable else f'unstratified — too few {group_label}s per bin'}).",
             )
 
             if stratifiable:
@@ -2776,23 +2973,23 @@ class MetricFusionEngine:
                 )
             train_val_poly = train_val_poly.reset_index(drop=True)
 
-            # Map polygon assignments back to row-level data.
-            train_val_ids = set(train_val_poly["polygon_id"])
-            test_ids = set(test_poly["polygon_id"])
+            # Map group assignments back to row-level data.
+            train_val_ids = set(train_val_poly[group_col])
+            test_ids = set(test_poly[group_col])
             self.train_val_data = fusion_df[
-                fusion_df["polygon_id"].isin(train_val_ids)
+                fusion_df[group_col].isin(train_val_ids)
             ].copy()
-            self.test_data = fusion_df[fusion_df["polygon_id"].isin(test_ids)].copy()
+            self.test_data = fusion_df[fusion_df[group_col].isin(test_ids)].copy()
 
             _log(
                 "INFO",
-                f"Split: {len(train_val_poly)} train+val polygons "
+                f"Split: {len(train_val_poly)} train+val {group_label}s "
                 f"({len(self.train_val_data)} rows), "
-                f"{len(test_poly)} test polygons ({len(self.test_data)} rows).",
+                f"{len(test_poly)} test {group_label}s ({len(self.test_data)} rows).",
             )
 
             # K-fold within train_val. Use stratified k-fold only if every bin
-            # has ≥k_folds polygons; otherwise fall back to plain KFold.
+            # has ≥k_folds groups; otherwise fall back to plain KFold.
             from sklearn.model_selection import KFold
 
             min_per_bin = (
@@ -2804,7 +3001,7 @@ class MetricFusionEngine:
                 _log(
                     "WARN",
                     f"Requested {k_folds}-fold CV but smallest outcome bin has "
-                    f"{min_per_bin} polygons; reducing to {k_eff}-fold.",
+                    f"{min_per_bin} {group_label}s; reducing to {k_eff}-fold.",
                 )
             self.k_folds = k_eff
 
@@ -2823,13 +3020,13 @@ class MetricFusionEngine:
 
             self.cv_folds = []
             for fold_idx, (tr_idx, vl_idx) in enumerate(split_iter, 1):
-                tr_polys = set(train_val_poly.iloc[tr_idx]["polygon_id"])
-                vl_polys = set(train_val_poly.iloc[vl_idx]["polygon_id"])
+                tr_polys = set(train_val_poly.iloc[tr_idx][group_col])
+                vl_polys = set(train_val_poly.iloc[vl_idx][group_col])
                 train_fold = self.train_val_data[
-                    self.train_val_data["polygon_id"].isin(tr_polys)
+                    self.train_val_data[group_col].isin(tr_polys)
                 ].copy()
                 val_fold = self.train_val_data[
-                    self.train_val_data["polygon_id"].isin(vl_polys)
+                    self.train_val_data[group_col].isin(vl_polys)
                 ].copy()
 
                 # Normalize features (0-1) using training fold data
