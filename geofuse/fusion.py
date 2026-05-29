@@ -4340,6 +4340,8 @@ class MetricFusionEngine:
         params: dict | None = None,
         metric: str = "pearson",
         return_predictions: bool = False,
+        *,
+        return_all_mixedlm: bool = False,
     ) -> dict:
         """
         Evaluate best parameters on held-out test set.
@@ -4352,6 +4354,13 @@ class MetricFusionEngine:
             params: Parameters to evaluate (uses best_params if None)
             metric: Evaluation metric ('pearson', 'spearman', 'r2', 'rmse', 'mutual_info')
             return_predictions: Whether to include predictions in return dict
+            return_all_mixedlm: Longitudinal mode only. When true, replaces
+                ``test_score``/``test_pvalue`` in the returned dict with a
+                ``mixedlm_metrics`` dict containing all four MixedLM scorer
+                outputs (computed from a single fit + one null-model refit
+                for the LR test). The post-hoc reporting layer uses this to
+                surface every metric per trial without re-running the
+                cross-sectional scoring path.
 
         Returns:
             Dictionary with:
@@ -4359,6 +4368,8 @@ class MetricFusionEngine:
                 - test_pvalue: P-value (for correlation metrics)
                 - predictions: Test set predictions (if return_predictions=True)
                 - targets: Test set targets (if return_predictions=True)
+                - mixedlm_metrics: dict of all four scores (when
+                  ``return_all_mixedlm=True`` in longitudinal mode)
         """
         if self.test_data is None:
             raise ValueError("No test data available. Run split_data() first.")
@@ -4537,21 +4548,40 @@ class MetricFusionEngine:
                 test_ysb = self.test_data["years_since_baseline"].values
 
         # ─── Score: longitudinal MixedLM or cross-sectional partial-corr ──
+        mixedlm_all: dict[str, float] | None = None
         if self.is_longitudinal:
             spec = self.longitudinal_spec
             assert spec is not None
             wants_pval = metric in mixed_effects_scoring.HAS_PVALUE
-            score_out = mixed_effects_scoring.score_mixedlm(
-                metric,
-                test_targets,
-                test_composite,
-                entity_id=test_entity_id,
-                years_since_baseline=test_ysb,
-                covariates=test_cov,
-                include_time_fixed=spec.include_time_fixed_effect,
-                random_slope=spec.random_slope_time,
-                return_pvalue=wants_pval,
-            )
+            if return_all_mixedlm:
+                mixedlm_all = mixed_effects_scoring.score_mixedlm(  # type: ignore[assignment]
+                    metric,
+                    test_targets,
+                    test_composite,
+                    entity_id=test_entity_id,
+                    years_since_baseline=test_ysb,
+                    covariates=test_cov,
+                    include_time_fixed=spec.include_time_fixed_effect,
+                    random_slope=spec.random_slope_time,
+                    return_all=True,
+                )
+                # Surface the requested metric's value alongside the dict so
+                # ``test_score`` still reflects the engine's active scoring
+                # metric for downstream code that inspects it.
+                s = float(mixedlm_all.get(metric, 0.0))  # type: ignore[union-attr]
+                score_out = (s, 1.0) if wants_pval else s
+            else:
+                score_out = mixed_effects_scoring.score_mixedlm(
+                    metric,
+                    test_targets,
+                    test_composite,
+                    entity_id=test_entity_id,
+                    years_since_baseline=test_ysb,
+                    covariates=test_cov,
+                    include_time_fixed=spec.include_time_fixed_effect,
+                    random_slope=spec.random_slope_time,
+                    return_pvalue=wants_pval,
+                )
         else:
             # Covariate-aware scoring; reduces exactly to _calculate_metric
             # when no covariates are configured. Partial-correlation p-value
@@ -4578,6 +4608,9 @@ class MetricFusionEngine:
             )
         else:
             logger.info(f"Test {metric}: {test_score:.4f} (n={len(test_targets)})")
+
+        if mixedlm_all is not None:
+            result["mixedlm_metrics"] = mixedlm_all
 
         # Include predictions if requested
         if return_predictions:

@@ -40,6 +40,7 @@ from geofuse.jobs import progress_interval_s
 from geofuse.jobs.stage_ledger import DONE, RUNNING, StageLedger
 from geofuse.logger import get_logger
 from geofuse.longitudinal import GREENERY_CHANNELS, LongitudinalSpec
+from geofuse.mixedlm_postscore import compute_post_metrics as _compute_mixedlm_post_metrics
 from geofuse.ndvi import NDVIEngine
 from geofuse.persistence.job_executor import JobContext
 from geofuse.raster_sampling import sample_raster_at_features
@@ -574,6 +575,15 @@ _FUSION_LONGITUDINAL_STAGE: tuple[str, str] = (
     "Load longitudinal data",
 )
 
+# After the final ``apply`` stage, mixed-effects runs also score every
+# robust + top-X% trial + the averaged-composite parameters on the held-out
+# test set with all four ``mixedlm_*`` metrics, and write the results to
+# ``mixedlm_metrics.csv`` for downstream analysis.
+_FUSION_MIXEDLM_POSTSCORE_STAGE: tuple[str, str] = (
+    "mixedlm_postscore",
+    "Score all MixedLM metrics on robust + top trials",
+)
+
 
 def _load_longitudinal_metric_file(path: str, channel: str) -> Any:
     """Read one per-wave metric file into the layout the engine expects.
@@ -693,6 +703,14 @@ def _build_fusion_ledger(
                 lon_key = _fusion_stage_key(label, lon_key_raw, multi=multi)
                 lon_disp = f"[{label}] {lon_label}" if multi else lon_label
                 steps.append((lon_key, lon_disp))
+            # And the post-score stage right after ``apply`` so the
+            # multi-metric CSV is written before any standalone studies
+            # take over the engine state.
+            if longitudinal and step_key == "apply":
+                ps_key_raw, ps_label = _FUSION_MIXEDLM_POSTSCORE_STAGE
+                ps_key = _fusion_stage_key(label, ps_key_raw, multi=multi)
+                ps_disp = f"[{label}] {ps_label}" if multi else ps_label
+                steps.append((ps_key, ps_disp))
         for ch in standalones:
             key = _fusion_stage_key(label, f"standalone_{ch}", multi=multi)
             ch_lbl = _STANDALONE_CHANNEL_LABELS.get(ch, ch)
@@ -1109,6 +1127,33 @@ def run_fusion(
             )
             composite_df = engine.apply_fusion()
             stage(skey("apply"), DONE)
+
+            # ── Post-hoc multi-metric reporting (mixed-effects mode only) ──
+            # Re-score every robust + top-20% trial + the averaged-composite
+            # parameters on the test set with all four mixedlm_* metrics so
+            # the user can compare metric agreement across the trial pool.
+            # Output: ``<study_results>/mixedlm_metrics.csv``.
+            if longitudinal_spec is not None:
+                stage(skey("mixedlm_postscore"), RUNNING)
+                ctx.progress(
+                    value=prog(0.97),
+                    status_text=(
+                        f"{prefix}Scoring all MixedLM metrics on robust trials..."
+                    ),
+                )
+                postscore_dir = os.path.join(
+                    output_dir, "fusion", "study_results"
+                )
+                try:
+                    _compute_mixedlm_post_metrics(
+                        engine, postscore_dir, log=_log_fusion
+                    )
+                except Exception as exc:
+                    _log_fusion(
+                        "WARN",
+                        f"[{label}] Post-hoc MixedLM scoring failed: {exc}",
+                    )
+                stage(skey("mixedlm_postscore"), DONE)
 
             # ── Standalone single-metric studies ────────────────────────────
             # One Optuna study per enabled channel, reusing the same engine,
