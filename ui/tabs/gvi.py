@@ -12,7 +12,9 @@ import streamlit as st
 from helpers import (
     RESTART_SESSION_KEY,
     apply_buffer_m,
+    file_size_mtime_fingerprint,
     generate_clustered_grid,
+    load_vector_paths,
     load_vector_upload_sessions,
     render_job_restart_panel,
 )
@@ -52,6 +54,21 @@ def _gvi_upload_signature(uploaded_files) -> tuple[tuple[str, int], ...] | None:
     if uploaded_files is None:
         return None
     return tuple((str(f.name), int(getattr(f, "size", 0) or 0)) for f in uploaded_files)
+
+
+def _gvi_path_signature(paths) -> tuple[tuple[str, int], ...] | None:
+    """Path-input variant of :func:`_gvi_upload_signature` — basename + size."""
+    if paths is None:
+        return None
+    out: list[tuple[str, int]] = []
+    for p in paths:
+        if not p:
+            continue
+        try:
+            out.append((os.path.basename(str(p)), int(os.path.getsize(p))))
+        except OSError:
+            out.append((os.path.basename(str(p)), 0))
+    return tuple(out)
 
 
 def _gvi_discard_heavy_dataset_fields() -> None:
@@ -417,25 +434,29 @@ def render(output_dir: str, parent_dir: str) -> None:
 
     st.subheader("Input Configuration")
 
-    uploaded_files = st.file_uploader(
-        "Upload Study Areas",
-        accept_multiple_files=True,
-        type=["geojson", "json", "gpkg", "shp", "dbf", "shx", "prj", "cpg", "zip"],
-        key="gvi_up",
-        help=(
-            "GeoJSON, GeoPackage, or a zipped archive. For Esri Shapefile, select "
-            "all components in one go (at minimum .shp, .dbf, .shx; include .prj when available)."
+    from file_picker import FT_VECTOR, pick_multiple_paths
+
+    picked_paths = pick_multiple_paths(
+        "Pick Study Areas",
+        key="gvi_picked_paths",
+        file_types=FT_VECTOR,
+        help_text=(
+            "GeoJSON, GeoPackage, shapefile (.shp with sidecars in the same "
+            "folder), or vector zip. Pick one or several — every selected "
+            "file becomes a separate dataset. Bytes are not read until "
+            "preview, grid generation, or processing actually needs them."
         ),
     )
 
-    if uploaded_files is not None:
-        sig_new = _gvi_upload_signature(uploaded_files)
+    valid_paths = [p for p in picked_paths if p and os.path.isfile(p)]
+    if valid_paths:
+        sig_new = _gvi_path_signature(valid_paths)
         sig_prev = st.session_state.get("_gvi_prev_upload_sig")
         if sig_prev is not None and sig_new is not None and sig_prev != sig_new:
             _gvi_discard_heavy_dataset_fields()
         st.session_state._gvi_prev_upload_sig = sig_new
 
-        loaded = load_vector_upload_sessions(uploaded_files)
+        loaded = load_vector_paths(valid_paths)
         logical_names = [name for name, _ in loaded]
         for k in list(st.session_state.datasets.keys()):
             ds = st.session_state.datasets[k]
@@ -464,7 +485,7 @@ def render(output_dir: str, parent_dir: str) -> None:
 
         gc.collect()
 
-    if uploaded_files == []:
+    if not valid_paths:
         for k in list(st.session_state.datasets.keys()):
             if st.session_state.datasets[k].get("type") != "restored":
                 del st.session_state.datasets[k]
@@ -755,12 +776,19 @@ def render(output_dir: str, parent_dir: str) -> None:
                     p.get("has_api_key"),
                 )
 
+            # basename -> absolute path map so each submitted job records
+            # the on-disk location of its study area for silent-restart.
+            path_by_basename = {os.path.basename(p): p for p in valid_paths}
+
             for fname, d in st.session_state.datasets.items():
                 if d.get("type") == "restored":
                     continue
 
+                ds_path = path_by_basename.get(fname)
                 job_params = {
                     "fname": fname,
+                    "input_path": ds_path,
+                    "input_fingerprint": file_size_mtime_fingerprint(ds_path),
                     "step": gvi_res,
                     "buffer": gvi_buffer,
                     "save_panos": save_debug,

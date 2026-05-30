@@ -17,7 +17,9 @@ from branca.element import MacroElement
 from helpers import (
     FUSION_TARGET_UPLOAD_TYPES,
     RESTART_SESSION_KEY,
+    file_size_mtime_fingerprint,
     materialize_uploaded_dataset,
+    path_drift_status,
     sanitize_gdf_attributes_for_json,
 )
 from jinja2 import Template
@@ -400,19 +402,67 @@ def _render_fusion_restart_panel(store, executor, output_dir: str) -> bool:
 
     with st.expander(f"↻ Restart fusion job: {rec.name or rec.id}", expanded=True):
         st.caption(
-            "Re-upload the original target file. The Optuna study, "
-            "pre-aggregation cache, and metric downloads are all content-"
-            "addressed, so a same-config restart resumes where the previous "
-            "run stopped."
+            "The Optuna study, pre-aggregation cache, and metric downloads "
+            "are all content-addressed, so a same-config restart resumes "
+            "where the previous run stopped. Files that still match the "
+            "recorded fingerprint don't need to be re-supplied."
         )
         for line in _fusion_restart_summary_lines(p):
             st.write(line)
 
-        cancel_col, _ = st.columns([1, 4])
-        with cancel_col:
-            if st.button("Cancel restart", key=f"f_restart_cancel_{rec.id}"):
-                st.session_state[RESTART_SESSION_KEY] = None
-                st.rerun()
+        # Silent-restart fast path: every recorded input file is still at
+        # its original absolute path with the same fingerprint. Skip every
+        # uploader and rerun directly from the stored paths.
+        rec_target_path = p.get("target_path")
+        rec_target_fp = p.get("target_fingerprint", "")
+        if (
+            rec_target_path
+            and path_drift_status(rec_target_path, rec_target_fp) == "ok"
+        ):
+            st.success(
+                f"✓ Target verified at `{rec_target_path}` — no re-upload "
+                "needed."
+            )
+            from file_picker import path_to_dataset
+
+            target_mat = path_to_dataset(rec_target_path)
+            cancel_col, rerun_col = st.columns([1, 1])
+            with cancel_col:
+                if st.button(
+                    "Cancel restart",
+                    key=f"f_restart_cancel_silent_{rec.id}",
+                    use_container_width=True,
+                ):
+                    st.session_state[RESTART_SESSION_KEY] = None
+                    st.rerun()
+            with rerun_col:
+                if st.button(
+                    "Re-run",
+                    type="primary",
+                    key=f"f_restart_confirm_silent_{rec.id}",
+                    use_container_width=True,
+                ):
+                    try:
+                        _submit_fusion_restart(
+                            store,
+                            executor,
+                            rec,
+                            p,
+                            target_mat,
+                            output_dir,
+                            p.get("gvi_path"),
+                            p.get("ndvi_path"),
+                            None,
+                        )
+                    except Exception as e:
+                        st.error(f"Re-submission failed: {e}")
+                        return True
+                    st.session_state[RESTART_SESSION_KEY] = None
+                    st.success(
+                        "Restart submitted. Monitor progress in the sidebar."
+                    )
+                    st.rerun()
+            return True
 
         target_uploads = st.file_uploader(
             f"Re-upload target (original: `{p.get('target_display_name', '?')}`)",
@@ -547,8 +597,6 @@ def _render_fusion_restart_panel(store, executor, output_dir: str) -> bool:
         lon_payload_for_submit = lon_payload
         lon_restart_blocked = False
         if lon_payload:
-            from helpers import file_size_mtime_fingerprint
-
             stored_fps = lon_payload.get("__file_fingerprints__") or {}
             wave_labels = list(lon_payload.get("wave_labels") or [])
             target_files = dict(lon_payload.get("target_files_per_wave") or {})
@@ -651,12 +699,24 @@ def _render_fusion_restart_panel(store, executor, output_dir: str) -> bool:
             else:
                 st.success("Mixed-effects per-wave files verified.")
 
-        if st.button(
-            "Verify & re-run",
-            type="primary",
-            key=f"f_restart_confirm_{rec.id}",
-            disabled=lon_restart_blocked,
-        ):
+        cancel_col, rerun_col = st.columns([1, 1])
+        with cancel_col:
+            if st.button(
+                "Cancel restart",
+                key=f"f_restart_cancel_{rec.id}",
+                use_container_width=True,
+            ):
+                st.session_state[RESTART_SESSION_KEY] = None
+                st.rerun()
+        with rerun_col:
+            rerun_clicked = st.button(
+                "Verify & re-run",
+                type="primary",
+                key=f"f_restart_confirm_{rec.id}",
+                disabled=lon_restart_blocked,
+                use_container_width=True,
+            )
+        if rerun_clicked:
             # Substitute the validated payload into ``p`` so the existing
             # ``_submit_fusion_restart`` path picks it up via ``p.get(...)``.
             p_for_submit = dict(p)
@@ -735,34 +795,32 @@ def render(output_dir: str) -> None:
     with col_fusion_left:
         st.subheader("Target Configuration")
 
-        target_uploads = st.file_uploader(
-            "Upload Target File",
-            accept_multiple_files=True,
-            type=FUSION_TARGET_UPLOAD_TYPES,
-            key="fusion_target_upload",
-            help=(
-                "Vector: GeoJSON, GeoPackage, shapefile sidecars (.shp, .dbf, .shx, "
-                ".prj), or vector zip. Raster: GeoTIFF or a raster zip. Select all "
-                "shapefile parts in one batch."
+        from file_picker import FT_VECTOR_OR_RASTER, path_to_dataset, pick_file_path
+
+        target_picked_path = pick_file_path(
+            "Pick Target File",
+            key="fusion_target_path",
+            file_types=FT_VECTOR_OR_RASTER,
+            help_text=(
+                "Vector: GeoJSON, GeoPackage, shapefile (.shp with sidecars in "
+                "the same folder), or vector zip. Raster: GeoTIFF. The toolbox "
+                "reads from this path lazily — bytes are not copied into "
+                "memory until preview, sampling, or compute needs them."
             ),
         )
 
-        if target_uploads:
-            try:
-                target_mat = materialize_uploaded_dataset(target_uploads)
-            except ValueError as e:
-                st.error(str(e))
-                target_mat = None
+        if target_picked_path and os.path.isfile(target_picked_path):
+            target_mat = path_to_dataset(target_picked_path)
+            tmp_target_path = target_mat.path
+            is_vector_target = target_mat.is_vector
+            is_raster_target = not target_mat.is_vector
+            target_display_name = target_mat.display_name
+            sig = (target_mat.path, os.path.getsize(target_mat.path))
+            if st.session_state.get("fusion_target_upload_sig") != sig:
+                st.session_state.fusion_target_upload_sig = sig
+                st.session_state.fusion_outcome_columns = []
 
             if target_mat is not None:
-                tmp_target_path = target_mat.path
-                is_vector_target = target_mat.is_vector
-                is_raster_target = not target_mat.is_vector
-                target_display_name = target_mat.display_name
-                sig = tuple(sorted((f.name, f.size) for f in target_uploads))
-                if st.session_state.get("fusion_target_upload_sig") != sig:
-                    st.session_state.fusion_target_upload_sig = sig
-                    st.session_state.fusion_outcome_columns = []
 
                 if is_vector_target:
                     try:
@@ -889,7 +947,7 @@ def render(output_dir: str) -> None:
     with col_fusion_right:
         st.subheader("Target Preview")
 
-        if target_uploads and tmp_target_path:
+        if target_picked_path and tmp_target_path:
             m_fusion_preview = folium.Map(location=[51.0447, -114.0719], zoom_start=10)
 
             try:
@@ -1032,38 +1090,24 @@ def render(output_dir: str) -> None:
             col_gvi_up, col_ndvi_up = st.columns(2)
 
             with col_gvi_up:
-                gvi_uploads = st.file_uploader(
-                    "🌿 Upload GVI File",
-                    accept_multiple_files=True,
-                    type=FUSION_TARGET_UPLOAD_TYPES,
-                    key="fusion_gvi_upload",
-                    help="GeoTIFF or vector metric. Shapefile requires all sidecars in one selection.",
+                _gvi_path = pick_file_path(
+                    "🌿 Pick GVI File",
+                    key="fusion_gvi_path",
+                    file_types=FT_VECTOR_OR_RASTER,
+                    help_text="GeoTIFF or vector metric. Shapefile sidecars must sit beside the .shp.",
                 )
-                if gvi_uploads:
-                    try:
-                        gvi_ds = materialize_uploaded_dataset(gvi_uploads)
-                        gvi_path = gvi_ds.path
-                        st.success(f"✓ Loaded: {gvi_ds.display_name}")
-                    except ValueError as e:
-                        st.error(str(e))
-                        gvi_path = None
+                if _gvi_path and os.path.isfile(_gvi_path):
+                    gvi_path = _gvi_path
 
             with col_ndvi_up:
-                ndvi_uploads = st.file_uploader(
-                    "🛰️ Upload NDVI File",
-                    accept_multiple_files=True,
-                    type=FUSION_TARGET_UPLOAD_TYPES,
-                    key="fusion_ndvi_upload",
-                    help="GeoTIFF or vector metric. Shapefile requires all sidecars in one selection.",
+                _ndvi_path = pick_file_path(
+                    "🛰️ Pick NDVI File",
+                    key="fusion_ndvi_path",
+                    file_types=FT_VECTOR_OR_RASTER,
+                    help_text="GeoTIFF or vector metric. Shapefile sidecars must sit beside the .shp.",
                 )
-                if ndvi_uploads:
-                    try:
-                        ndvi_ds = materialize_uploaded_dataset(ndvi_uploads)
-                        ndvi_path = ndvi_ds.path
-                        st.success(f"✓ Loaded: {ndvi_ds.display_name}")
-                    except ValueError as e:
-                        st.error(str(e))
-                        ndvi_path = None
+                if _ndvi_path and os.path.isfile(_ndvi_path):
+                    ndvi_path = _ndvi_path
 
         st.markdown("**GVI buffer exploration (m)**")
         col_bgvi_a, col_bgvi_b, col_bgvi_c = st.columns(3)
@@ -1817,7 +1861,7 @@ def render(output_dir: str) -> None:
                 st.rerun()
 
     if fusion_run_clicked:
-        if not target_uploads or not tmp_target_path:
+        if not target_picked_path or not tmp_target_path:
             st.error("❌ Please upload a target file")
         elif is_vector_target and not target_outcome_columns:
             st.error(
@@ -1980,8 +2024,6 @@ def render(output_dir: str) -> None:
                     # Fingerprint every per-wave file so the restart panel
                     # can detect drift (file moved, edited, or replaced) and
                     # prompt the user to re-supply before resubmitting.
-                    from helpers import file_size_mtime_fingerprint
-
                     _fps: dict[str, dict[str, str]] = {"target": {}, **{ch: {} for ch in _LON_CHANNELS}}
                     for w, p in target_files_per_wave.items():
                         _fps["target"][w] = file_size_mtime_fingerprint(p)
@@ -2048,6 +2090,18 @@ def render(output_dir: str) -> None:
                         "gvi_under_output_dir": _under_dir(gvi_path, output_dir),
                         "ndvi_under_output_dir": _under_dir(ndvi_path, output_dir),
                         "has_api_key": bool(gvi_api_key),
+                        # Absolute paths + size+mtime fingerprints so the
+                        # restart panel can silent-restart when nothing
+                        # moved or was edited, and show a per-file drift
+                        # prompt otherwise.
+                        "target_path": tmp_target_path,
+                        "target_fingerprint": file_size_mtime_fingerprint(
+                            tmp_target_path
+                        ),
+                        "gvi_path": gvi_path,
+                        "gvi_fingerprint": file_size_mtime_fingerprint(gvi_path),
+                        "ndvi_path": ndvi_path,
+                        "ndvi_fingerprint": file_size_mtime_fingerprint(ndvi_path),
                         # Mixed-effects / longitudinal spec persists as a
                         # plain-dict payload so the restart panel can rebuild
                         # the spec identically without re-prompting.

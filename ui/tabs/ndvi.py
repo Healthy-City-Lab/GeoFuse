@@ -12,6 +12,8 @@ import streamlit as st
 from helpers import (
     RESTART_SESSION_KEY,
     apply_buffer_m,
+    file_size_mtime_fingerprint,
+    load_vector_paths,
     load_vector_upload_sessions,
     render_job_restart_panel,
 )
@@ -315,20 +317,22 @@ def render(output_dir: str) -> None:
 
     st.subheader("Input Configuration")
 
-    ndvi_files = st.file_uploader(
-        "Upload Study Areas",
-        accept_multiple_files=True,
-        type=["geojson", "json", "gpkg", "shp", "dbf", "shx", "prj", "cpg", "zip"],
-        key="ndvi_up",
-        help=(
-            "GeoJSON, GeoPackage, or zip. For Shapefile, select all parts together "
-            "(.shp, .dbf, .shx; add .prj when you have it)."
+    from file_picker import FT_VECTOR, pick_multiple_paths
+
+    ndvi_picked_paths = pick_multiple_paths(
+        "Pick Study Areas",
+        key="ndvi_picked_paths",
+        file_types=FT_VECTOR,
+        help_text=(
+            "GeoJSON, GeoPackage, shapefile (.shp with sidecars in the same "
+            "folder), or vector zip. Pick one or several — every selected "
+            "file becomes a separate dataset and gets its own NDVI run."
         ),
     )
 
-    # Sync uploaded files with session state
-    if ndvi_files is not None:
-        loaded = load_vector_upload_sessions(ndvi_files)
+    ndvi_valid_paths = [p for p in ndvi_picked_paths if p and os.path.isfile(p)]
+    if ndvi_valid_paths:
+        loaded = load_vector_paths(ndvi_valid_paths)
         logical_names = [name for name, _ in loaded]
         for k in list(st.session_state.ndvi_datasets.keys()):
             ds = st.session_state.ndvi_datasets[k]
@@ -350,7 +354,7 @@ def render(output_dir: str) -> None:
                 except Exception as e:
                     st.error(f"Failed to load {fname}: {e}")
         gc.collect()
-    if ndvi_files == []:
+    if not ndvi_valid_paths:
         for k in list(st.session_state.ndvi_datasets.keys()):
             if st.session_state.ndvi_datasets[k].get("type") != "restored":
                 del st.session_state.ndvi_datasets[k]
@@ -746,11 +750,19 @@ def render(output_dir: str) -> None:
             jobs_started = 0
             validation_errors = []
 
+            # basename -> absolute path map so each submitted job records its
+            # study-area location for silent-restart.
+            ndvi_path_by_basename = {
+                os.path.basename(p): p for p in ndvi_valid_paths
+            }
+
             for fname, d in ndvi_input_datasets.items():
                 cfg = st.session_state.ndvi_date_configs.get(fname, {})
                 # Strip *any* extension (.geojson / .shp / .gpkg / .zip / …)
                 # so the monitor title is just the file stem.
                 base_name = os.path.splitext(fname)[0]
+                ds_path = ndvi_path_by_basename.get(fname)
+                ds_fp = file_size_mtime_fingerprint(ds_path)
 
                 use_ranges = st.session_state.get(
                     f"ndvi_use_ranges_{fname}", cfg.get("use_ranges", True)
@@ -789,6 +801,8 @@ def render(output_dir: str) -> None:
                             name=base_name,
                             params={
                                 "fname": fname,
+                                "input_path": ds_path,
+                                "input_fingerprint": ds_fp,
                                 "mode": "range",
                                 "start_date": start_d.isoformat(),
                                 "end_date": end_d.isoformat(),
@@ -850,6 +864,8 @@ def render(output_dir: str) -> None:
                             name=base_name,
                             params={
                                 "fname": fname,
+                                "input_path": ds_path,
+                                "input_fingerprint": ds_fp,
                                 "mode": "specific",
                                 "target_date": target_date.isoformat(),
                                 "window_days": window_days,
@@ -903,6 +919,8 @@ def render(output_dir: str) -> None:
                             name=base_name,
                             params={
                                 "fname": fname,
+                                "input_path": ds_path,
+                                "input_fingerprint": ds_fp,
                                 "mode": "column",
                                 "date_column": date_col,
                                 "window_days": window_days,
