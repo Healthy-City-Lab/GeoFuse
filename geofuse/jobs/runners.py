@@ -39,7 +39,11 @@ from geofuse.gvi import GVIEngine
 from geofuse.jobs import progress_interval_s
 from geofuse.jobs.stage_ledger import DONE, RUNNING, StageLedger
 from geofuse.logger import get_logger
-from geofuse.longitudinal import GREENERY_CHANNELS, LongitudinalSpec
+from geofuse.longitudinal import (
+    GREENERY_CHANNELS,
+    MIXEDLM_METRICS as _LON_MIXEDLM_METRICS,
+    LongitudinalSpec,
+)
 from geofuse.mixedlm_postscore import compute_post_metrics as _compute_mixedlm_post_metrics
 from geofuse.ndvi import NDVIEngine
 from geofuse.persistence.job_executor import JobContext
@@ -678,6 +682,7 @@ def _build_fusion_ledger(
     multi: bool,
     standalone_channels: list[str] | None = None,
     longitudinal: bool = False,
+    mixedlm_postscore: bool = False,
 ) -> StageLedger:
     """Fresh ledger covering every (outcome, step) pair in run order.
 
@@ -687,7 +692,11 @@ def _build_fusion_ledger(
     optimize/robust/evaluate burst that's compact enough to fit in one
     ledger row. When ``longitudinal`` is true an extra
     ``prepare_longitudinal`` stage is inserted between ``load_metrics`` and
-    ``preaggregate`` to cover per-wave file loading.
+    ``preaggregate`` to cover per-wave file loading. The MixedLM
+    post-score stage is only added when ``mixedlm_postscore`` is true
+    (a longitudinal study whose scoring metric is actually a
+    ``mixedlm_*`` one — year-aware cross-sectional studies sit on a
+    spec too but score with OLS so they skip the post-score step).
     """
     standalones = list(standalone_channels or [])
     steps: list[tuple[str, str]] = []
@@ -706,7 +715,7 @@ def _build_fusion_ledger(
             # And the post-score stage right after ``apply`` so the
             # multi-metric CSV is written before any standalone studies
             # take over the engine state.
-            if longitudinal and step_key == "apply":
+            if mixedlm_postscore and step_key == "apply":
                 ps_key_raw, ps_label = _FUSION_MIXEDLM_POSTSCORE_STAGE
                 ps_key = _fusion_stage_key(label, ps_key_raw, multi=multi)
                 ps_disp = f"[{label}] {ps_label}" if multi else ps_label
@@ -736,25 +745,25 @@ def run_fusion(
     ndvi_buffer_min_m: float,
     ndvi_buffer_max_m: float,
     ndvi_buffer_step_m: float,
-    ndvi_resolution_m: float | None,
-    gvi_grid_spacing_m: float | None,
+    ndvi_resolution_m: float | None = None,
+    gvi_grid_spacing_m: float | None = None,
     n_bins: int,
-    veg_path: str | None,
-    terrain_path: str | None,
-    ndvi_path: str | None,
-    cache_metrics: bool,
+    veg_path: str | None = None,
+    terrain_path: str | None = None,
+    ndvi_path: str | None = None,
+    cache_metrics: bool = False,
     test_size: float,
     k_folds: int,
     n_trials: int,
     n_startup_trials: int,
     objective_metric: str,
-    pruner_type: str,
+    pruner_type: str = "none",
     sampler_type: str,
-    gvi_api_key: str | None,
-    ndvi_start_date: str | None,
-    ndvi_end_date: str | None,
-    ndvi_project_id: str | None,
-    multi_objective_requested: bool,
+    gvi_api_key: str | None = None,
+    ndvi_start_date: str | None = None,
+    ndvi_end_date: str | None = None,
+    ndvi_project_id: str | None = None,
+    multi_objective_requested: bool = False,
     output_dir: str,
     MetricFusionEngine,
     target_display_name: str = "target",
@@ -819,11 +828,16 @@ def run_fusion(
             (t if t is not None else f"raster_band_{target_band}") for t in targets
         ]
         ordered_labels: list[str] = list(all_labels)
+        mixedlm_postscore_enabled = (
+            longitudinal_spec is not None
+            and longitudinal_spec.scoring_metric in _LON_MIXEDLM_METRICS
+        )
         ledger = _build_fusion_ledger(
             all_labels,
             multi=multi_outcome,
             standalone_channels=standalones,
             longitudinal=longitudinal_spec is not None,
+            mixedlm_postscore=mixedlm_postscore_enabled,
         )
         ctx.update_stage_ledger(ledger.to_dict())
 
@@ -1128,13 +1142,16 @@ def run_fusion(
             composite_df = engine.apply_fusion()
             stage(skey("apply"), DONE)
 
-            # ── Post-hoc multi-metric reporting (mixed-effects mode only) ──
+            # ── Post-hoc multi-metric reporting (MixedLM scoring only) ──
             # Re-score every robust + top-20% trial + the averaged-composite
             # parameters on the test set with all four mixedlm_* metrics so
             # the user can compare metric agreement across the trial pool.
             # The CSV basename includes the outcome label so multi-outcome
-            # runs don't overwrite each other.
-            if longitudinal_spec is not None:
+            # runs don't overwrite each other. Skipped when the
+            # longitudinal spec is acting only as a per-year file-routing
+            # key with an OLS scorer — there are no MixedLM metrics to
+            # report.
+            if mixedlm_postscore_enabled:
                 stage(skey("mixedlm_postscore"), RUNNING)
                 ctx.progress(
                     value=prog(0.97),
@@ -1231,8 +1248,10 @@ def run_fusion(
                 # Post-hoc all-4 MixedLM metrics for this standalone, written
                 # to a per-channel CSV beside the CGI one. The engine's
                 # ``_active_greenery_channel`` is still set to ``ch`` here
-                # so ``evaluate_on_test`` builds the right composite.
-                if longitudinal_spec is not None:
+                # so ``evaluate_on_test`` builds the right composite. Skipped
+                # in OLS-scoring longitudinal mode (same gate as the CGI
+                # post-score block above).
+                if mixedlm_postscore_enabled:
                     ps_dir = os.path.join(output_dir, "fusion", "study_results")
                     ps_basename = (
                         f"mixedlm_metrics__{label}__{ch}.csv"

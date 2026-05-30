@@ -744,6 +744,789 @@ def _render_fusion_restart_panel(store, executor, output_dir: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Section panels (new layout)
+# ---------------------------------------------------------------------------
+
+# Public set of cross-sectional objective metrics offered by the OLS scorer
+# (covariate-aware partial correlation / incremental R² / RMSE / MI).
+_CROSS_METRICS: tuple[str, ...] = (
+    "pearson",
+    "spearman",
+    "r2",
+    "rmse",
+    "mutual_info",
+)
+# MixedLM scoring metrics — mirror the engine's MIXEDLM_METRICS so they can
+# round-trip through the spec without an explicit import.
+_MIXEDLM_METRICS: tuple[str, ...] = (
+    "mixedlm_tstat",
+    "mixedlm_marginal_r2",
+    "mixedlm_lr",
+    "mixedlm_coef",
+)
+
+# Run-mode placeholder is encoded as None in session-state so the rest of the
+# form stays hidden until the user picks a mode (no default).
+_FUSION_RUN_MODE_CROSS = "Cross-sectional"
+_FUSION_RUN_MODE_LON = "Mixed-effects (longitudinal)"
+_FUSION_RUN_MODE_OPTIONS = (_FUSION_RUN_MODE_CROSS, _FUSION_RUN_MODE_LON)
+
+
+def _date_parseable_columns(gdf: gpd.GeoDataFrame) -> list[str]:
+    """Return column names whose values parse as dates via the engine's parser.
+
+    The longitudinal module's :func:`parse_date_column` accepts full ISO,
+    year+month, year-only strings, integer years, and native datetime dtypes.
+    A column is offered when at least 80 % of its non-null values parse
+    successfully — same liberal threshold used today by the outcome picker.
+    """
+    try:
+        from geofuse.longitudinal import parse_date_column
+    except ImportError:
+        return []
+    out: list[str] = []
+    for col in gdf.columns:
+        if col == "geometry":
+            continue
+        s = gdf[col]
+        non_null = s.dropna()
+        if not len(non_null):
+            continue
+        parsed = parse_date_column(non_null)
+        if parsed.notna().mean() >= 0.8:
+            out.append(col)
+    return out
+
+
+def _discover_years_from_date_column(
+    gdf: gpd.GeoDataFrame, date_col: str
+) -> list[str]:
+    """Return unique years in the date column as sorted string labels."""
+    try:
+        from geofuse.longitudinal import parse_date_column
+    except ImportError:
+        return []
+    parsed = parse_date_column(gdf[date_col])
+    years = sorted(int(d.year) for d in parsed.dropna().unique())
+    return [str(y) for y in years]
+
+
+def _render_optimization_setup_panel(
+    preview_gdf: gpd.GeoDataFrame | None,
+    target_outcome_columns: list[str],
+) -> dict | None:
+    """Render the optimization-setup section and return the collected state.
+
+    Returns a dict with:
+      - ``run_mode`` (str | None)
+      - ``is_longitudinal`` (bool)
+      - ``intake_mode`` (str | None — only for longitudinal)
+      - ``date_col`` (str | None)
+      - ``entity_id_col`` (str | None)
+      - ``wave_col`` (str | None — long intake)
+      - ``discovered_waves`` (list[str]) — empty when none discovered yet
+      - ``wide_files`` (list[dict]) — one entry per wide-mode file:
+        ``{"path": str, "wave_label": str, "entity_col": str, "date_col": str}``
+      - ``cross_sectional_date_on`` (bool)
+      - ``mixedlm_random_slope`` (bool)
+      - ``mixedlm_time_fixed`` (bool)
+
+    Returns ``None`` until the user picks a run mode (no default selection).
+    """
+    st.subheader("Optimization Setup")
+
+    date_candidates = (
+        _date_parseable_columns(preview_gdf) if preview_gdf is not None else []
+    )
+    all_cols = (
+        [c for c in preview_gdf.columns if c != "geometry"]
+        if preview_gdf is not None
+        else []
+    )
+    id_candidates = [c for c in all_cols if c not in target_outcome_columns]
+
+    run_mode = st.radio(
+        "Run mode",
+        options=_FUSION_RUN_MODE_OPTIONS,
+        index=None,
+        horizontal=True,
+        key="fusion_run_mode",
+        help=(
+            "**Cross-sectional** — one observation per entity; OLS-based "
+            "partial correlation / incremental R² / RMSE / MI. "
+            "**Mixed-effects (longitudinal)** — entities measured at "
+            "multiple time points; CGI scored via "
+            "`statsmodels.MixedLM` with random intercept (+ optional "
+            "random slope on time) per entity. Pick a mode to reveal the "
+            "rest of the form."
+        ),
+    )
+    if run_mode is None:
+        st.caption("_Pick a run mode to configure the rest of the form._")
+        return None
+
+    is_longitudinal = run_mode == _FUSION_RUN_MODE_LON
+
+    state: dict = {
+        "run_mode": run_mode,
+        "is_longitudinal": is_longitudinal,
+        "intake_mode": None,
+        "date_col": None,
+        "entity_id_col": None,
+        "wave_col": None,
+        "discovered_waves": [],
+        "wide_files": [],
+        "cross_sectional_date_on": False,
+        "mixedlm_random_slope": True,
+        "mixedlm_time_fixed": True,
+    }
+
+    if not is_longitudinal:
+        # ── Cross-sectional ──────────────────────────────────────────────
+        date_on = st.checkbox(
+            "Date column available?",
+            value=False,
+            key="fusion_cross_date_on",
+            help=(
+                "Turn on if the target carries a measurement-date column. "
+                "When on, distinct measurement years are discovered and "
+                "drive the per-channel metric-file assignment below, so "
+                "entities measured in different years can sample greenery "
+                "from the right per-year file. The year column is only a "
+                "metric-file routing key — it never enters the regression."
+            ),
+        )
+        state["cross_sectional_date_on"] = date_on
+        if date_on:
+            if not date_candidates:
+                st.warning(
+                    "No date-parseable columns found in the target. "
+                    "Turn the toggle off, or pick a target with a date column."
+                )
+            else:
+                date_col = st.selectbox(
+                    "Date column",
+                    options=date_candidates,
+                    key="fusion_cross_date_col",
+                    help=(
+                        "Column carrying each row's measurement date. "
+                        "Accepts ISO (`2010-01-15`), year+month (`2010-01`), "
+                        "year-only strings (`2010`), or numeric years."
+                    ),
+                )
+                state["date_col"] = date_col
+                if preview_gdf is not None and date_col:
+                    years = _discover_years_from_date_column(preview_gdf, date_col)
+                    state["discovered_waves"] = years
+                    if years:
+                        st.caption(
+                            "Discovered years: "
+                            + ", ".join(f"`{y}`" for y in years)
+                        )
+                    else:
+                        st.warning("No parseable dates in the selected column.")
+        return state
+
+    # ── Longitudinal ────────────────────────────────────────────────────
+    intake_mode = st.radio(
+        "Intake mode",
+        options=("long", "wide"),
+        index=0,
+        horizontal=True,
+        key="fusion_lon_intake",
+        format_func=lambda x: (
+            "Long-format target" if x == "long" else "Wide / multi-file"
+        ),
+        help=(
+            "**long** — one target file with one row per (entity, wave) "
+            "and an explicit wave column. **wide** — N target files, one "
+            "per wave, joined on a shared entity-id column."
+        ),
+    )
+    state["intake_mode"] = intake_mode
+
+    if intake_mode == "long":
+        if preview_gdf is None:
+            st.info("Upload a target file first to populate the column pickers.")
+            return state
+        lc1, lc2 = st.columns(2)
+        with lc1:
+            if id_candidates:
+                state["entity_id_col"] = st.selectbox(
+                    "Entity ID column",
+                    options=id_candidates,
+                    key="fusion_lon_entity_id_col",
+                    help=(
+                        "Column that uniquely identifies each entity "
+                        "(e.g. participant ID). Must be present in the "
+                        "long-format target."
+                    ),
+                )
+            else:
+                st.warning("No candidate ID columns found in the target.")
+        with lc2:
+            if date_candidates:
+                state["date_col"] = st.selectbox(
+                    "Date column",
+                    options=date_candidates,
+                    key="fusion_lon_date_col",
+                    help=(
+                        "Per-row measurement date. Used to derive "
+                        "`years_since_baseline` per entity."
+                    ),
+                )
+            else:
+                st.warning("No date-parseable columns found in the target.")
+        wave_candidates = [
+            c
+            for c in all_cols
+            if c not in (state["entity_id_col"], state["date_col"])
+            and c not in target_outcome_columns
+        ]
+        if wave_candidates:
+            state["wave_col"] = st.selectbox(
+                "Wave column",
+                options=wave_candidates,
+                key="fusion_lon_wave_col",
+                help=(
+                    "Column carrying each row's wave label. Distinct "
+                    "values populate the per-channel file-assignment grid."
+                ),
+            )
+            if state["wave_col"]:
+                waves = sorted(
+                    str(v)
+                    for v in preview_gdf[state["wave_col"]].dropna().unique()
+                )
+                state["discovered_waves"] = waves
+                if waves:
+                    st.caption(
+                        "Discovered waves: "
+                        + ", ".join(f"`{w}`" for w in waves)
+                    )
+        else:
+            st.warning("No candidate wave columns found in the target.")
+        return state
+
+    # ── Wide / multi-file intake ────────────────────────────────────────
+    st.caption(
+        "Upload one target file per wave. Each file contributes its own "
+        "rows; they are joined on the entity-id column at load time. "
+        "Wave labels default to each file's basename and can be edited."
+    )
+    if "fusion_lon_wide_count" not in st.session_state:
+        st.session_state.fusion_lon_wide_count = 1
+    n_wide = st.session_state.fusion_lon_wide_count
+    wide_files: list[dict] = []
+    for i in range(n_wide):
+        with st.container(border=True):
+            wc1, wc2 = st.columns([3, 1])
+            with wc1:
+                up = st.file_uploader(
+                    f"Wave file {i + 1}",
+                    accept_multiple_files=True,
+                    type=FUSION_TARGET_UPLOAD_TYPES,
+                    key=f"fusion_lon_wide_file_{i}",
+                )
+            with wc2:
+                if i > 0 and st.button(
+                    "❌",
+                    key=f"fusion_lon_wide_rm_{i}",
+                    help="Remove this wave file",
+                ):
+                    st.session_state.fusion_lon_wide_count -= 1
+                    st.rerun()
+            default_label = ""
+            if up:
+                default_label = os.path.splitext(up[0].name)[0]
+            wave_label = st.text_input(
+                "Wave label",
+                value=st.session_state.get(
+                    f"fusion_lon_wide_label_{i}", default_label
+                ),
+                key=f"fusion_lon_wide_label_{i}",
+                help="Wave identifier; ordered by appearance, baseline first.",
+            )
+            file_cols: list[str] = []
+            file_date_cands: list[str] = []
+            file_path: str | None = None
+            if up:
+                try:
+                    mat = materialize_uploaded_dataset(up)
+                    file_path = mat.path
+                    file_gdf = read_vector_path(file_path)
+                    file_cols = [
+                        c for c in file_gdf.columns if c != "geometry"
+                    ]
+                    file_date_cands = _date_parseable_columns(file_gdf)
+                except Exception as exc:
+                    st.error(f"Could not read wave {i + 1}: {exc}")
+            ec1, ec2 = st.columns(2)
+            with ec1:
+                entity_col = st.selectbox(
+                    "Entity ID column",
+                    options=file_cols or ["—"],
+                    key=f"fusion_lon_wide_entity_{i}",
+                    disabled=not file_cols,
+                )
+            with ec2:
+                date_col = st.selectbox(
+                    "Date column",
+                    options=file_date_cands or ["—"],
+                    key=f"fusion_lon_wide_date_{i}",
+                    disabled=not file_date_cands,
+                )
+            if file_path and wave_label and file_cols and file_date_cands:
+                wide_files.append(
+                    {
+                        "path": file_path,
+                        "wave_label": wave_label,
+                        "entity_col": entity_col,
+                        "date_col": date_col,
+                    }
+                )
+
+    if st.button(
+        "+ Add another wave file",
+        key="fusion_lon_wide_add",
+        help="Add a row for one more wave's target file.",
+    ):
+        st.session_state.fusion_lon_wide_count += 1
+        st.rerun()
+
+    state["wide_files"] = wide_files
+    state["discovered_waves"] = [f["wave_label"] for f in wide_files]
+    if state["discovered_waves"]:
+        st.caption(
+            "Discovered waves: "
+            + ", ".join(f"`{w}`" for w in state["discovered_waves"])
+        )
+    return state
+
+
+# Channel display config for the metric-assignment panel.
+_FUSION_METRIC_CHANNELS: tuple[tuple[str, str, str], ...] = (
+    ("ndvi", "🛰️ NDVI", "ndvi"),
+    ("gvi", "🌿 GVI", "gvi"),
+)
+
+
+def _render_metric_assignment_panel(
+    discovered_waves: list[str],
+    year_aware: bool,
+) -> dict | None:
+    """Per-channel buffer ladder + per-file year/wave assignment.
+
+    Parameters
+    ----------
+    discovered_waves
+        Ordered list of wave labels (longitudinal) or year strings (cross-
+        sectional + date-on). When empty, the panel falls back to one file
+        per channel (no per-file multi-select).
+    year_aware
+        True when ``discovered_waves`` should drive a per-file multi-select.
+        False = simple one-file-per-channel mode.
+
+    Returns
+    -------
+    dict with keys (or ``None`` if upload coverage is incomplete):
+      - ``gvi_files``: list of ``(path, list[wave_or_None])``
+      - ``ndvi_files``: list of ``(path, list[wave_or_None])``
+      - ``gvi_buffer_min/max/step``: int
+      - ``ndvi_buffer_min/max/step``: int
+      - ``coverage_complete``: bool — True iff every wave is covered
+        exactly once per channel (always True in non-year-aware mode when
+        each channel has exactly one file)
+      - ``coverage_errors``: list[str] — human-readable error messages
+    """
+    st.subheader("Metric File Assignment")
+
+    state: dict = {
+        "gvi_files": [],
+        "ndvi_files": [],
+        "coverage_complete": True,
+        "coverage_errors": [],
+    }
+
+    for ch_key, ch_label, ch_short in _FUSION_METRIC_CHANNELS:
+        st.markdown(f"#### {ch_label}")
+        with st.container(border=True):
+            bcol1, bcol2, bcol3 = st.columns(3)
+            with bcol1:
+                bmin = st.number_input(
+                    f"{ch_short.upper()} minimum buffer",
+                    min_value=50,
+                    max_value=4900,
+                    value=int(
+                        st.session_state.get(
+                            f"fusion_{ch_short}_buffer_min", 100
+                        )
+                    ),
+                    step=50,
+                    key=f"fusion_{ch_short}_buffer_min",
+                    help=f"Smallest {ch_short.upper()} radius (m) searched by Optuna.",
+                )
+            with bcol2:
+                bmax = st.number_input(
+                    f"{ch_short.upper()} maximum buffer",
+                    min_value=100,
+                    max_value=5000,
+                    value=int(
+                        st.session_state.get(
+                            f"fusion_{ch_short}_buffer_max", 1500
+                        )
+                    ),
+                    step=50,
+                    key=f"fusion_{ch_short}_buffer_max",
+                    help=f"Largest {ch_short.upper()} radius (m). Extent padding uses the max.",
+                )
+            with bcol3:
+                bstep = st.number_input(
+                    f"{ch_short.upper()} buffer step",
+                    min_value=10,
+                    max_value=500,
+                    value=int(
+                        st.session_state.get(
+                            f"fusion_{ch_short}_buffer_step", 50
+                        )
+                    ),
+                    step=10,
+                    key=f"fusion_{ch_short}_buffer_step",
+                    help="Radius discretisation (m).",
+                )
+            state[f"{ch_key}_buffer_min"] = int(bmin)
+            state[f"{ch_key}_buffer_max"] = int(bmax)
+            state[f"{ch_key}_buffer_step"] = int(bstep)
+
+            # Files repeater
+            count_key = f"fusion_{ch_short}_file_count"
+            if count_key not in st.session_state:
+                st.session_state[count_key] = 1
+            n_files = st.session_state[count_key]
+            channel_files: list[tuple[str, list]] = []
+            for i in range(n_files):
+                col_up, col_rm = st.columns([5, 1])
+                with col_up:
+                    up = st.file_uploader(
+                        f"{ch_label} file {i + 1}",
+                        accept_multiple_files=True,
+                        type=FUSION_TARGET_UPLOAD_TYPES,
+                        key=f"fusion_{ch_short}_upload_{i}",
+                        help=(
+                            "GeoTIFF or vector metric. Shapefile requires "
+                            "all sidecars in one selection."
+                        ),
+                    )
+                with col_rm:
+                    if i > 0 and st.button(
+                        "❌",
+                        key=f"fusion_{ch_short}_rm_{i}",
+                        help=f"Remove this {ch_short.upper()} file",
+                    ):
+                        st.session_state[count_key] -= 1
+                        st.rerun()
+                file_path: str | None = None
+                if up:
+                    try:
+                        ds = materialize_uploaded_dataset(up)
+                        file_path = ds.path
+                        st.success(f"✓ Loaded: {ds.display_name}")
+                    except ValueError as exc:
+                        st.error(str(exc))
+                assigned: list = []
+                if year_aware and discovered_waves:
+                    assigned = st.multiselect(
+                        f"{ch_label} file {i + 1} — applies to year(s) / wave(s)",
+                        options=discovered_waves,
+                        default=st.session_state.get(
+                            f"fusion_{ch_short}_assign_{i}", []
+                        ),
+                        key=f"fusion_{ch_short}_assign_{i}",
+                        help=(
+                            "Years / waves whose entities should sample "
+                            "greenery from this file."
+                        ),
+                    )
+                if file_path:
+                    channel_files.append((file_path, assigned))
+
+            if st.button(
+                f"+ Add another {ch_short.upper()} file",
+                key=f"fusion_{ch_short}_add",
+            ):
+                st.session_state[count_key] += 1
+                st.rerun()
+
+            state[f"{ch_key}_files"] = channel_files
+
+            # Coverage check + caption.
+            if year_aware and discovered_waves:
+                covered: dict[str, int] = {w: 0 for w in discovered_waves}
+                for _, waves in channel_files:
+                    for w in waves:
+                        if w in covered:
+                            covered[w] += 1
+                missing = [w for w, n in covered.items() if n == 0]
+                duplicates = [w for w, n in covered.items() if n > 1]
+                bits = []
+                for w in discovered_waves:
+                    n = covered.get(w, 0)
+                    if n == 1:
+                        bits.append(f"`{w}` ✓")
+                    elif n == 0:
+                        bits.append(f"`{w}` ❌ unassigned")
+                    else:
+                        bits.append(f"`{w}` ⚠️ ×{n}")
+                st.caption("Coverage: " + "  ".join(bits))
+                if missing:
+                    state["coverage_complete"] = False
+                    state["coverage_errors"].append(
+                        f"{ch_label}: no file assigned to "
+                        + ", ".join(missing)
+                    )
+                if duplicates:
+                    state["coverage_complete"] = False
+                    state["coverage_errors"].append(
+                        f"{ch_label}: more than one file assigned to "
+                        + ", ".join(duplicates)
+                    )
+            else:
+                if len(channel_files) != 1:
+                    state["coverage_complete"] = False
+                    state["coverage_errors"].append(
+                        f"{ch_label}: exactly one file is required "
+                        f"(got {len(channel_files)})."
+                    )
+
+    return state
+
+
+def _render_study_details_panel(
+    is_longitudinal: bool,
+    available_covariates: list[str],
+) -> dict:
+    """Final form section: CGI formula, covariates, objective metric, …
+
+    Returns the collected widget values; the caller wraps this in
+    ``st.form`` and reads the submit click separately.
+    """
+    st.subheader("Study Details")
+
+    # ── Row 1: CGI formula + covariates ──────────────────────────────────
+    col_cgi1, col_cgi2 = st.columns([1, 2])
+    with col_cgi1:
+        cgi_formula = st.selectbox(
+            "CGI Formula",
+            options=["weighted_average", "synergy"],
+            index=0,
+            help=(
+                "**weighted_average** — three weights on min-max-"
+                "normalized veg / terrain / NDVI (sum = 100). "
+                "**synergy** — three-metric generalisation of Wang et "
+                "al. 2026: seven weights (sum = 100) plus three powers "
+                "on the main NDVI / Veg / Terrain terms only."
+            ),
+            key="fusion_cgi_formula",
+        )
+    with col_cgi2:
+        if available_covariates:
+            covariate_columns = st.multiselect(
+                "Covariates (control variables)",
+                options=available_covariates,
+                default=st.session_state.get("fusion_covariate_columns", []),
+                key="fusion_covariate_columns",
+                help=(
+                    "Additional numeric attribute columns to control for "
+                    "when scoring the CGI's predictive power. With "
+                    "covariates the score becomes the greenery term's "
+                    "*partial* contribution (partial correlation, "
+                    "incremental R², or full-model RMSE). "
+                    "`mutual_info` ignores covariates by design."
+                ),
+            )
+        else:
+            covariate_columns = []
+            st.caption(
+                "_No numeric attribute columns available for covariates "
+                "(raster target or no spare numeric columns)._"
+            )
+
+    # ── Row 2: Objective metric + trials + optimizer ────────────────────
+    metric_options = list(_MIXEDLM_METRICS if is_longitudinal else _CROSS_METRICS)
+    default_metric = metric_options[0]
+    prior = st.session_state.get("fusion_objective_metric")
+    if prior not in metric_options:
+        st.session_state["fusion_objective_metric"] = default_metric
+
+    col_o1, col_o2, col_o3 = st.columns(3)
+    with col_o1:
+        objective_metric = st.selectbox(
+            "Objective metric",
+            options=metric_options,
+            key="fusion_objective_metric",
+            help=(
+                "Quantity Optuna maximises (or minimises for RMSE) per "
+                "trial. Options switch automatically with the run mode: "
+                "OLS-based metrics for cross-sectional; MixedLM-based "
+                "metrics for longitudinal."
+            ),
+        )
+    with col_o2:
+        n_trials = st.number_input(
+            "Total trials",
+            min_value=50,
+            max_value=1000,
+            value=int(st.session_state.get("fusion_n_trials", 300)),
+            step=50,
+            key="fusion_n_trials",
+            help="Number of Optuna trials.",
+        )
+    with col_o3:
+        optimizer = st.selectbox(
+            "Optimizer",
+            options=["TPE", "CMA-ES", "Random"],
+            index=0,
+            key="fusion_optimizer",
+            help="Hyperparameter search sampler.",
+        )
+
+    # ── Row 3: startup, k-fold toggle + slider, test, bins ──────────────
+    col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+    with col_s1:
+        n_startup_trials = st.number_input(
+            "Random startup trials",
+            min_value=10,
+            max_value=500,
+            value=int(st.session_state.get("fusion_n_startup", 150)),
+            step=10,
+            key="fusion_n_startup",
+            help="Uniformly random trials before the main sampler engages.",
+        )
+    with col_s2:
+        use_cv = st.checkbox(
+            "Use k-fold cross-validation",
+            value=bool(st.session_state.get("fusion_use_cv", True)),
+            key="fusion_use_cv",
+            help=(
+                "When on, each trial fits k models on a stratified k-fold "
+                "split. When off, a single train/val split is used and "
+                "each trial fits one model — ~k× faster, no fold-variance."
+            ),
+        )
+    with col_s3:
+        if use_cv:
+            k_folds = st.number_input(
+                "K-Fold CV",
+                min_value=3,
+                max_value=10,
+                value=int(st.session_state.get("fusion_k_folds", 5)),
+                key="fusion_k_folds",
+                help=(
+                    "Cross-validation folds on the non-test subset. The "
+                    "test set is always carved off first via the "
+                    "**Test set size** slider regardless of this toggle."
+                ),
+            )
+        else:
+            k_folds = 1
+            st.caption(
+                "_Single train/val split on the non-test subset; "
+                "test set still held out._"
+            )
+    with col_s4:
+        test_size = st.slider(
+            "Test set size",
+            min_value=0.1,
+            max_value=0.5,
+            value=float(st.session_state.get("fusion_test_size", 0.3)),
+            step=0.05,
+            key="fusion_test_size",
+            help="Held-out evaluation fraction.",
+        )
+
+    n_bins = st.number_input(
+        "Stratification bins",
+        min_value=3,
+        max_value=10,
+        value=int(st.session_state.get("fusion_stratification_bins", 5)),
+        key="fusion_stratification_bins",
+        help="Quantile bins for the stratified train/test split.",
+    )
+
+    # ── Longitudinal-only mixed-effects toggles ─────────────────────────
+    mixedlm_random_slope = True
+    mixedlm_time_fixed = True
+    if is_longitudinal:
+        mc1, mc2 = st.columns(2)
+        with mc1:
+            mixedlm_random_slope = st.checkbox(
+                "Random slope on time per entity",
+                value=bool(st.session_state.get("fusion_lon_random_slope", True)),
+                key="fusion_lon_random_slope",
+                help=(
+                    "Switches the random-effects structure from "
+                    "`(1 | entity)` to `(1 + years_since_baseline | "
+                    "entity)`. Costs more fit iterations but lets each "
+                    "entity's trajectory have its own slope."
+                ),
+            )
+        with mc2:
+            mixedlm_time_fixed = st.checkbox(
+                "Include `years_since_baseline` as fixed effect",
+                value=bool(
+                    st.session_state.get("fusion_lon_include_time_fixed", True)
+                ),
+                key="fusion_lon_include_time_fixed",
+                help=(
+                    "Adds `+ years_since_baseline` to the fixed-effect "
+                    "design. Keep on unless you want any global temporal "
+                    "trend to load onto the greenery coefficient."
+                ),
+            )
+
+    # ── Resume + standalones ────────────────────────────────────────────
+    col_r1, col_r2 = st.columns(2)
+    with col_r1:
+        resume_existing_study = st.checkbox(
+            "Resume previous study if exists",
+            value=bool(st.session_state.get("fusion_resume_study", True)),
+            key="fusion_resume_study",
+            help=(
+                "When on, re-running with the same target + outcome + "
+                "objective metric loads the existing SQLite study and "
+                "runs only the remaining trials."
+            ),
+        )
+    with col_r2:
+        run_standalones = st.checkbox(
+            "Also optimize each metric on its own (NDVI / Vegetation / Terrain)",
+            value=bool(st.session_state.get("fusion_run_standalones", False)),
+            key="fusion_run_standalones",
+            help=(
+                "Adds three single-metric Optuna studies alongside the "
+                "combined CGI run, searching only its radius + aggregation."
+            ),
+        )
+
+    return {
+        "cgi_formula": cgi_formula,
+        "covariate_columns": list(covariate_columns or []),
+        "objective_metric": objective_metric,
+        "n_trials": int(n_trials),
+        "n_startup_trials": int(n_startup_trials),
+        "optimizer": optimizer,
+        "use_cv": bool(use_cv),
+        "k_folds": int(k_folds),
+        "test_size": float(test_size),
+        "n_bins": int(n_bins),
+        "mixedlm_random_slope": bool(mixedlm_random_slope),
+        "mixedlm_time_fixed": bool(mixedlm_time_fixed),
+        "resume_existing_study": bool(resume_existing_study),
+        "run_standalones": bool(run_standalones),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Tab render entry point
 # ---------------------------------------------------------------------------
 

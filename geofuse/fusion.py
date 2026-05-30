@@ -3229,6 +3229,7 @@ class MetricFusionEngine:
         k_folds: int = 5,
         random_state: int = 42,
         fusion_df: pd.DataFrame | None = None,
+        single_split_val_ratio: float = 0.2,
     ) -> None:
         """
         Split data into holdout test set and k-fold CV training/validation sets.
@@ -3238,21 +3239,35 @@ class MetricFusionEngine:
            ``gvi_buffer_max_m``, NDVI max ``ndvi_buffer_max_m``)
         2. Filter out rows with NaN values in any metric
         3. Bin target values for stratification
-        4. Stratified split into train/val/test sets
+        4. Stratified train/val/test split. The held-out **test set is
+           always carved off first** via ``test_size`` regardless of
+           ``k_folds``; ``k_folds`` only decides whether the non-test
+           subset becomes k cv folds or a single train/val split.
 
         During optimization, metrics will be re-sampled with trial-specific radii
         using circular buffer aggregation.
 
         Args:
-            test_size: Proportion for holdout test set (e.g., 0.2 = 20%)
-            k_folds: Number of cross-validation folds (e.g., 5)
+            test_size: Proportion for holdout test set (e.g., 0.2 = 20%);
+                applied independently of ``k_folds`` so a held-out test
+                set exists in both CV and single-split modes.
+            k_folds: Number of cross-validation folds. Pass ``1`` (or ``0``)
+                to disable CV and use a single stratified train/val split
+                instead; ``self.cv_folds`` becomes a length-1 list and each
+                trial fits one model per study iteration. The held-out
+                test set still exists either way.
             random_state: Random seed for reproducibility
+            single_split_val_ratio: When ``k_folds <= 1``, the fraction of
+                the non-test subset used as validation in the single fit.
+                Default 0.2 matches the size of one fold in a 5-fold CV
+                run so the trial-level signal stays comparable.
         """
         # Step 1: Sample all metrics at initial buffer distance
         logger.info("Step 1/4: Sampling metrics at point locations...")
         if fusion_df is None:
             fusion_df = self.prepare_fusion_data()
-        self.k_folds = k_folds
+        use_cv = k_folds > 1
+        self.k_folds = k_folds if use_cv else 1
 
         logger.info(f"Initial samples before filtering: {len(fusion_df)}")
 
@@ -3361,64 +3376,110 @@ class MetricFusionEngine:
                 f"{len(test_poly)} test {group_label}s ({len(self.test_data)} rows).",
             )
 
-            # K-fold within train_val. Use stratified k-fold only if every bin
-            # has ≥k_folds groups; otherwise fall back to plain KFold.
-            from sklearn.model_selection import KFold
-
-            min_per_bin = (
-                train_val_poly["target_bin"].value_counts().min() if stratifiable else 0
-            )
-            k_eff = max(2, min(k_folds, len(train_val_poly)))
-            if stratifiable and min_per_bin < k_folds:
-                k_eff = max(2, min(k_folds, min_per_bin))
-                _log(
-                    "WARN",
-                    f"Requested {k_folds}-fold CV but smallest outcome bin has "
-                    f"{min_per_bin} {group_label}s; reducing to {k_eff}-fold.",
-                )
-            self.k_folds = k_eff
-
-            if stratifiable and min_per_bin >= k_eff:
-                splitter = StratifiedKFold(
-                    n_splits=k_eff, shuffle=True, random_state=random_state
-                )
-                split_iter = splitter.split(
-                    train_val_poly, train_val_poly["target_bin"]
-                )
-            else:
-                splitter = KFold(
-                    n_splits=k_eff, shuffle=True, random_state=random_state
-                )
-                split_iter = splitter.split(train_val_poly)
-
             self.cv_folds = []
-            for fold_idx, (tr_idx, vl_idx) in enumerate(split_iter, 1):
-                tr_polys = set(train_val_poly.iloc[tr_idx][group_col])
-                vl_polys = set(train_val_poly.iloc[vl_idx][group_col])
-                train_fold = self.train_val_data[
-                    self.train_val_data[group_col].isin(tr_polys)
-                ].copy()
-                val_fold = self.train_val_data[
-                    self.train_val_data[group_col].isin(vl_polys)
-                ].copy()
+            if use_cv:
+                # K-fold within train_val. Use stratified k-fold only if every bin
+                # has ≥k_folds groups; otherwise fall back to plain KFold.
+                from sklearn.model_selection import KFold
 
-                # Normalize features (0-1) using training fold data
-                scaler = MinMaxScaler()
-                train_fold[["veg", "terrain", "ndvi"]] = scaler.fit_transform(
-                    train_fold[["veg", "terrain", "ndvi"]]
+                min_per_bin = (
+                    train_val_poly["target_bin"].value_counts().min()
+                    if stratifiable
+                    else 0
                 )
-                val_fold[["veg", "terrain", "ndvi"]] = scaler.transform(
-                    val_fold[["veg", "terrain", "ndvi"]]
-                )
+                k_eff = max(2, min(k_folds, len(train_val_poly)))
+                if stratifiable and min_per_bin < k_folds:
+                    k_eff = max(2, min(k_folds, min_per_bin))
+                    _log(
+                        "WARN",
+                        f"Requested {k_folds}-fold CV but smallest outcome bin has "
+                        f"{min_per_bin} {group_label}s; reducing to {k_eff}-fold.",
+                    )
+                self.k_folds = k_eff
 
-                self.cv_folds.append(
-                    {"train": train_fold, "val": val_fold, "scaler": scaler}
+                if stratifiable and min_per_bin >= k_eff:
+                    splitter = StratifiedKFold(
+                        n_splits=k_eff, shuffle=True, random_state=random_state
+                    )
+                    split_iter = splitter.split(
+                        train_val_poly, train_val_poly["target_bin"]
+                    )
+                else:
+                    splitter = KFold(
+                        n_splits=k_eff, shuffle=True, random_state=random_state
+                    )
+                    split_iter = splitter.split(train_val_poly)
+
+                for fold_idx, (tr_idx, vl_idx) in enumerate(split_iter, 1):
+                    tr_polys = set(train_val_poly.iloc[tr_idx][group_col])
+                    vl_polys = set(train_val_poly.iloc[vl_idx][group_col])
+                    train_fold = self.train_val_data[
+                        self.train_val_data[group_col].isin(tr_polys)
+                    ].copy()
+                    val_fold = self.train_val_data[
+                        self.train_val_data[group_col].isin(vl_polys)
+                    ].copy()
+
+                    # Normalize features (0-1) using training fold data
+                    scaler = MinMaxScaler()
+                    train_fold[["veg", "terrain", "ndvi"]] = scaler.fit_transform(
+                        train_fold[["veg", "terrain", "ndvi"]]
+                    )
+                    val_fold[["veg", "terrain", "ndvi"]] = scaler.transform(
+                        val_fold[["veg", "terrain", "ndvi"]]
+                    )
+
+                    self.cv_folds.append(
+                        {"train": train_fold, "val": val_fold, "scaler": scaler}
+                    )
+                    logger.info(
+                        f"  Fold {fold_idx}: train={len(tr_polys)} polys "
+                        f"({len(train_fold)} rows), val={len(vl_polys)} polys "
+                        f"({len(val_fold)} rows)"
+                    )
+                return
+
+            # Single stratified train/val split at the group level. Same
+            # stratification logic as the test split above so val mirrors the
+            # outcome distribution; scaler fits on the single train slice.
+            try:
+                train_poly, val_poly = train_test_split(
+                    train_val_poly,
+                    test_size=single_split_val_ratio,
+                    stratify=(
+                        train_val_poly["target_bin"] if stratifiable else None
+                    ),
+                    random_state=random_state,
                 )
-                logger.info(
-                    f"  Fold {fold_idx}: train={len(tr_polys)} polys "
-                    f"({len(train_fold)} rows), val={len(vl_polys)} polys "
-                    f"({len(val_fold)} rows)"
+            except ValueError:
+                train_poly, val_poly = train_test_split(
+                    train_val_poly,
+                    test_size=single_split_val_ratio,
+                    random_state=random_state,
                 )
+            tr_polys = set(train_poly[group_col])
+            vl_polys = set(val_poly[group_col])
+            train_fold = self.train_val_data[
+                self.train_val_data[group_col].isin(tr_polys)
+            ].copy()
+            val_fold = self.train_val_data[
+                self.train_val_data[group_col].isin(vl_polys)
+            ].copy()
+            scaler = MinMaxScaler()
+            train_fold[["veg", "terrain", "ndvi"]] = scaler.fit_transform(
+                train_fold[["veg", "terrain", "ndvi"]]
+            )
+            val_fold[["veg", "terrain", "ndvi"]] = scaler.transform(
+                val_fold[["veg", "terrain", "ndvi"]]
+            )
+            self.cv_folds.append(
+                {"train": train_fold, "val": val_fold, "scaler": scaler}
+            )
+            logger.info(
+                f"Single train/val split (no CV): train={len(tr_polys)} polys "
+                f"({len(train_fold)} rows), val={len(vl_polys)} polys "
+                f"({len(val_fold)} rows)"
+            )
             return
 
         # ── Row-level (point / raster) split — original behaviour ────────────
@@ -3441,37 +3502,72 @@ class MetricFusionEngine:
         )
 
         logger.info(
-            f"Split complete: {len(self.train_val_data)} train+val samples ({k_folds} folds), "
+            f"Split complete: {len(self.train_val_data)} train+val samples "
+            f"({k_folds if use_cv else 1} fold(s)), "
             f"{len(self.test_data)} test samples (holdout)"
         )
 
-        # Create stratified k-fold splits on train_val_data
-        logger.info(f"Creating {k_folds}-fold cross-validation splits...")
-        skf = StratifiedKFold(n_splits=k_folds, shuffle=True, random_state=random_state)
         self.cv_folds = []
 
-        for fold_idx, (train_idx, val_idx) in enumerate(
-            skf.split(self.train_val_data, self.train_val_data["target_bin"]), 1
-        ):
-            train_fold = self.train_val_data.iloc[train_idx].copy()
-            val_fold = self.train_val_data.iloc[val_idx].copy()
+        if use_cv:
+            logger.info(f"Creating {k_folds}-fold cross-validation splits...")
+            skf = StratifiedKFold(
+                n_splits=k_folds, shuffle=True, random_state=random_state
+            )
+            for fold_idx, (train_idx, val_idx) in enumerate(
+                skf.split(self.train_val_data, self.train_val_data["target_bin"]), 1
+            ):
+                train_fold = self.train_val_data.iloc[train_idx].copy()
+                val_fold = self.train_val_data.iloc[val_idx].copy()
 
-            # Normalize features (0-1) using training fold data
-            scaler = MinMaxScaler()
-            train_fold[["veg", "terrain", "ndvi"]] = scaler.fit_transform(
-                train_fold[["veg", "terrain", "ndvi"]]
-            )
-            val_fold[["veg", "terrain", "ndvi"]] = scaler.transform(
-                val_fold[["veg", "terrain", "ndvi"]]
-            )
+                # Normalize features (0-1) using training fold data
+                scaler = MinMaxScaler()
+                train_fold[["veg", "terrain", "ndvi"]] = scaler.fit_transform(
+                    train_fold[["veg", "terrain", "ndvi"]]
+                )
+                val_fold[["veg", "terrain", "ndvi"]] = scaler.transform(
+                    val_fold[["veg", "terrain", "ndvi"]]
+                )
 
-            self.cv_folds.append(
-                {"train": train_fold, "val": val_fold, "scaler": scaler}
-            )
+                self.cv_folds.append(
+                    {"train": train_fold, "val": val_fold, "scaler": scaler}
+                )
 
-            logger.info(
-                f"  Fold {fold_idx}: {len(train_fold)} train, {len(val_fold)} val"
+                logger.info(
+                    f"  Fold {fold_idx}: {len(train_fold)} train, {len(val_fold)} val"
+                )
+            return
+
+        # Single stratified train/val split at the row level.
+        logger.info("Creating single train/val split (no CV)...")
+        try:
+            train_fold, val_fold = train_test_split(
+                self.train_val_data,
+                test_size=single_split_val_ratio,
+                stratify=self.train_val_data["target_bin"],
+                random_state=random_state,
             )
+        except ValueError:
+            train_fold, val_fold = train_test_split(
+                self.train_val_data,
+                test_size=single_split_val_ratio,
+                random_state=random_state,
+            )
+        train_fold = train_fold.copy()
+        val_fold = val_fold.copy()
+        scaler = MinMaxScaler()
+        train_fold[["veg", "terrain", "ndvi"]] = scaler.fit_transform(
+            train_fold[["veg", "terrain", "ndvi"]]
+        )
+        val_fold[["veg", "terrain", "ndvi"]] = scaler.transform(
+            val_fold[["veg", "terrain", "ndvi"]]
+        )
+        self.cv_folds.append(
+            {"train": train_fold, "val": val_fold, "scaler": scaler}
+        )
+        logger.info(
+            f"  Single split: {len(train_fold)} train, {len(val_fold)} val"
+        )
 
     def optimize_fusion(
         self,
@@ -3534,15 +3630,18 @@ class MetricFusionEngine:
             )
         self._active_greenery_channel = greenery_channel
 
-        # In longitudinal mode the scoring metric comes from the spec
-        # (one of the four mixedlm_* options, default mixedlm_tstat). The
-        # ``objective_metric`` arg is whatever the runner / UI surfaced for
-        # cross-sectional mode and would be the wrong validator otherwise;
-        # override it here so callers don't need to coordinate.
+        # In longitudinal mode the scoring metric is authoritative on the
+        # spec — either one of the four ``mixedlm_*`` options (MixedLM
+        # scoring, default ``mixedlm_tstat``) or one of the cross-sectional
+        # OLS options (``pearson``/``spearman``/``r2``/``rmse``/``mutual_info``)
+        # used when the spec exists only as a metric-file routing key (year-
+        # aware cross-sectional). Override whatever the caller passed so the
+        # scorer fork in ``_objective`` and ``evaluate_on_test`` sees the
+        # same metric the spec advertised.
         if self.is_longitudinal:
             spec = self.longitudinal_spec
             assert spec is not None
-            if objective_metric not in mixed_effects_scoring.MIXEDLM_METRICS:
+            if objective_metric != spec.scoring_metric:
                 logger.info(
                     f"Longitudinal mode: overriding objective_metric "
                     f"{objective_metric!r} with spec.scoring_metric "
@@ -4055,8 +4154,21 @@ class MetricFusionEngine:
                     "Validation composite has no variance (constant values)"
                 )
 
-            # ─── Score: longitudinal MixedLM or cross-sectional partial-corr ──
-            if self.is_longitudinal:
+            # ─── Score: MixedLM (longitudinal) or OLS partial-corr ────────────
+            # Three modes route through this fork:
+            #   1. Cross-sectional (no longitudinal_spec) → OLS scorer.
+            #   2. Mixed-effects (spec + ``mixedlm_*`` scoring_metric) →
+            #      MixedLM scorer with per-entity random effects.
+            #   3. Year-aware cross-sectional (spec + cross-sectional
+            #      scoring_metric) → OLS scorer, ignoring entity_id /
+            #      years_since_baseline. The spec exists purely so the
+            #      pre-aggregation cache can pick the right metric file per
+            #      year; the model has no temporal predictor.
+            use_mixedlm = (
+                self.is_longitudinal
+                and metric in mixed_effects_scoring.MIXEDLM_METRICS
+            )
+            if use_mixedlm:
                 spec = self.longitudinal_spec
                 assert spec is not None  # guaranteed by is_longitudinal
                 wants_pval = metric in mixed_effects_scoring.HAS_PVALUE
@@ -4083,9 +4195,9 @@ class MetricFusionEngine:
                     return_pvalue=wants_pval,
                 )
             else:
-                # Cross-sectional path: covariate-aware partial-correlation /
-                # incremental-R² scorer; with no covariates it reduces exactly
-                # to the engine's legacy _calculate_metric.
+                # OLS path: covariate-aware partial-correlation / incremental-R²
+                # / RMSE / MI scorer; with no covariates it reduces exactly to
+                # the engine's legacy _calculate_metric.
                 wants_pval = metric in ("pearson", "spearman")
                 train_out = objective_scoring.score(
                     metric,
@@ -4547,9 +4659,16 @@ class MetricFusionEngine:
                 test_entity_id = self.test_data["entity_id"].values
                 test_ysb = self.test_data["years_since_baseline"].values
 
-        # ─── Score: longitudinal MixedLM or cross-sectional partial-corr ──
+        # ─── Score: MixedLM (longitudinal) or OLS partial-corr ────────────
+        # Same three-mode fork as ``_objective``: year-aware cross-sectional
+        # studies sit on a ``LongitudinalSpec`` whose ``scoring_metric`` is
+        # one of the OLS options, and route here through the ``else`` arm.
         mixedlm_all: dict[str, float] | None = None
-        if self.is_longitudinal:
+        use_mixedlm = (
+            self.is_longitudinal
+            and metric in mixed_effects_scoring.MIXEDLM_METRICS
+        )
+        if use_mixedlm:
             spec = self.longitudinal_spec
             assert spec is not None
             wants_pval = metric in mixed_effects_scoring.HAS_PVALUE
@@ -4583,9 +4702,9 @@ class MetricFusionEngine:
                     return_pvalue=wants_pval,
                 )
         else:
-            # Covariate-aware scoring; reduces exactly to _calculate_metric
-            # when no covariates are configured. Partial-correlation p-value
-            # falls out of return_pvalue=True for the two correlation metrics.
+            # OLS scoring. Reduces to _calculate_metric when no covariates;
+            # partial-correlation p-value falls out of ``return_pvalue=True``
+            # for the two correlation metrics.
             wants_pval = metric in ("pearson", "spearman")
             score_out = objective_scoring.score(
                 metric,

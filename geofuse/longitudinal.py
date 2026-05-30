@@ -57,6 +57,23 @@ MIXEDLM_METRICS: tuple[str, ...] = (
 )
 DEFAULT_MIXEDLM_METRIC = "mixedlm_tstat"
 
+# Cross-sectional scoring metrics accepted by ``LongitudinalSpec`` so a
+# cross-sectional study can use the per-wave cache infrastructure to assign
+# different greenery files per measurement year while still scoring with OLS-
+# based partial correlation / incremental R² / RMSE / mutual_info — see
+# :mod:`geofuse.objective_scoring`. The year column is only a routing key in
+# this mode (synthesised in the runner); the scorer never reads it.
+CROSS_SECTIONAL_METRICS: tuple[str, ...] = (
+    "pearson",
+    "spearman",
+    "r2",
+    "rmse",
+    "mutual_info",
+)
+SUPPORTED_SCORING_METRICS: tuple[str, ...] = (
+    MIXEDLM_METRICS + CROSS_SECTIONAL_METRICS
+)
+
 # Channels that participate in the per-wave greenery file assignment. Terrain
 # is GVI Cityscapes class 9 (horizontal flat greenery), not DEM; it varies
 # year-to-year only if the user re-runs GVI with new street-view imagery.
@@ -193,9 +210,9 @@ def validate_spec(spec: LongitudinalSpec) -> list[str]:
                 "target_files_per_wave is missing entries for waves "
                 f"{missing_t} (required when intake_mode == 'wide')."
             )
-    if spec.scoring_metric not in MIXEDLM_METRICS:
+    if spec.scoring_metric not in SUPPORTED_SCORING_METRICS:
         errs.append(
-            f"scoring_metric must be one of {MIXEDLM_METRICS}, "
+            f"scoring_metric must be one of {SUPPORTED_SCORING_METRICS}, "
             f"got {spec.scoring_metric!r}."
         )
     for ch in GREENERY_CHANNELS:
