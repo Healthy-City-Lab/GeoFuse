@@ -13,18 +13,18 @@ streamlit run ui/app.py
 
 ### Tab Overview
 
-| Tab | Purpose |
-| --- | --- |
-| **NDVI** | Upload study areas, configure date modes, run Earth Engine downloads, and inspect results on an interactive map. |
-| **GVI** | Upload study areas, generate sampling grids, run Street View + segmentation batch jobs, and visualize vegetation/terrain heatmaps. |
-| **HPC Monitoring** | Track HPC CLI jobs by Job ID; view stage, progress, and metrics in real time. UI job progress is tracked in the GVI tab sidebar. |
-| **Fusion & Optimization** | Upload a target file (GeoJSON or GeoTIFF), configure metric sources and optimization settings, run Bayesian fusion, and inspect results. |
+| Tab                       | Purpose                                                                                                                                                                                                                                     |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **NDVI**                  | Upload study areas, configure date modes, run Earth Engine downloads, and inspect results on an interactive map.                                                                                                                            |
+| **GVI**                   | Upload study areas, generate sampling grids, run Street View + segmentation batch jobs, and visualize vegetation/terrain heatmaps.                                                                                                          |
+| **HPC Monitoring**        | Track HPC CLI jobs by Job ID; view stage, progress, and metrics in real time. UI job progress is tracked in the GVI tab sidebar.                                                                                                            |
+| **Fusion & Optimization** | Upload a target file (GeoJSON or GeoTIFF), pick a run mode (cross-sectional or mixed-effects longitudinal), assign one or more GVI/NDVI files per measurement year/wave, configure study details, run Bayesian fusion, and inspect results. |
 
 ### Typical Workflow
 
 1. **NDVI tab** → upload a study area file → set date range → choose output formats (**GeoTIFF** is default; **GeoPackage** and **GeoJSON** optional) → "Run NDVI Analysis"
 2. **GVI tab** → upload the same study area → set grid resolution and buffer → choose output formats (**GeoPackage** is default; **GeoTIFF** for per-cluster tile rasters; **GeoJSON** for compatibility) → "Generate Sampling Grids" → "Run GVI Analysis"
-3. **Fusion tab** → upload a target outcomes file (GeoJSON or GeoTIFF) → select loaded GVI/NDVI results → "Run Fusion Optimization"
+3. **Fusion tab** → upload a target outcomes file (GeoJSON or GeoTIFF) → pick a **Run mode** (Cross-sectional or Mixed-effects longitudinal) → upload one GVI file + one NDVI file per measurement year/wave in the **Metric File Assignment** section → set CGI formula, covariates, objective metric, trial budget, k-fold toggle, etc. in **Study Details** → "🚀 Run Fusion Optimization"
 4. Inspect the composite greenery weights and export results.
 
 > [!NOTE]
@@ -42,9 +42,25 @@ Each job writes a persistent log to `logs/jobs/<job_id>.log`. The job-monitor ex
 
 For widely-scattered inputs (e.g. neighbourhoods across multiple cities), the engine automatically clusters the buffered features and generates one sampling grid per cluster, all anchored to a common reference. There is no special "national mode" — just upload the file. The chosen projected CRS (UTM / LCC / Polar Stereographic) and an estimated distortion are reported in the job log.
 
+#### Fusion form layout
+
+The Fusion tab reads top-to-bottom in the order you reason about a run:
+
+1. **Target Configuration** — upload the target file, pick outcome column(s), and preview on the map.
+2. **Optimization Setup** — pick the **Run mode** (Cross-sectional or Mixed-effects longitudinal); the rest of the section adapts:
+   - **Cross-sectional** offers a **Date column available?** toggle. With the toggle off, no date column is needed and each metric channel takes one file. With it on, pick the date column; distinct measurement years are discovered and drive the per-year file assignment in the next section (years are only a metric-file routing key — they never enter the regression).
+   - **Mixed-effects longitudinal** offers **long** intake (one target file with explicit wave column — pick the entity-ID, date, and wave columns from selectboxes) or **wide** intake (one target file per wave, with per-file column pickers + a free-text wave label). A date column is mandatory in this mode.
+3. **Metric File Assignment** — per channel (NDVI then GVI), set the buffer ladder (min / max / step in metres) that applies to every uploaded file in that channel, then upload one or more files. When years/waves were discovered above, each uploaded file gets a multi-select listing which years/waves it applies to. Every year/wave must be covered by exactly one file per channel — coverage status is shown live and the run fails with an error on submit if anything is unassigned.
+4. **Study Details** (form) — CGI formula (`weighted_average` or `synergy`), covariates (numeric attribute columns to control for; wide-mode longitudinal intersects across wave files), a single mode-aware **Objective metric** dropdown (OLS-based options for cross-sectional, MixedLM-based options for mixed-effects), trial budget, **Use k-fold cross-validation** toggle (off ⇒ single train/val split, ~k× faster per trial), test size, stratification bins, MixedLM toggles (`Random slope on time per entity`, `Include years_since_baseline as fixed effect`), resume previous study, and the **Also optimize each metric on its own** standalones checkbox.
+5. **🚀 Run Fusion Optimization**.
+
 #### Mixed-effects fusion (longitudinal data)
 
-When entities are measured at multiple time points, open the **Mixed-effects / longitudinal mode** expander at the top of the fusion form. Set the wave labels (comma-separated, baseline first), pick the intake mode — **long** (one target file with a wave column) or **wide** (one target file per wave joined on a shared entity-id column) — and fill in the entity-id, date, and (long mode) wave-column names. Then, per greenery channel, paste the per-wave file paths comma-separated in the same order as the wave labels; tick **"Same file all waves"** for channels that don't change over time (typical for terrain and one-snapshot NDVI). Pick the MixedLM scorer Optuna should optimise (default `mixedlm_tstat`); the other three metrics are computed post-hoc and saved to `output_results/fusion/study_results/mixedlm_metrics.csv` with mean + 95 % CI rows per pool. Date columns accept full ISO dates (`2010-01-15`), year + month (`2010-01`), year-only strings (`2010`), or integer years — `years_since_baseline` is derived per entity from the earliest measurement date.
+Pick **Mixed-effects (longitudinal)** as the run mode. The four `mixedlm_*` scorers measure greenery's contribution net of within-entity temporal correlation, so a date column is required. Date columns accept full ISO dates (`2010-01-15`), year + month (`2010-01`), year-only strings (`2010`), or integer years — `years_since_baseline` is derived per entity from each entity's earliest measurement date. Pick the MixedLM scorer Optuna should optimise (default `mixedlm_tstat`); the other three metrics are computed post-hoc and saved to `output_results/fusion/study_results/mixedlm_metrics.csv` with mean + 95 % CI rows per pool. A channel can use the same file across every wave (typical for terrain or one-snapshot NDVI) — just assign that one upload to every discovered wave.
+
+#### Year-aware cross-sectional
+
+Cross-sectional runs typically use one GVI file and one NDVI file. When the cohort was sampled in different years and you have per-year greenery files, turn **Date column available?** on and pick the date column; the discovered years drive the same per-channel file-assignment grid the longitudinal mode uses. The OLS scorer (pearson / spearman / r² / rmse / mutual_info) is unchanged — the spec sits underneath only as a per-year metric-file routing key.
 
 ---
 
@@ -65,8 +81,8 @@ conda activate geofuse
 mpiexec -n 4 python scripts/cli.py --config config.csv
 ```
 
-| Argument | Description |
-|----------|-------------|
+| Argument   | Description                                            |
+| ---------- | ------------------------------------------------------ |
 | `--config` | Path to a CSV file defining input files and parameters |
 
 > [!NOTE]

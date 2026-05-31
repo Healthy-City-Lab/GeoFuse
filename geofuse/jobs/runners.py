@@ -41,10 +41,14 @@ from geofuse.jobs.stage_ledger import DONE, RUNNING, StageLedger
 from geofuse.logger import get_logger
 from geofuse.longitudinal import (
     GREENERY_CHANNELS,
-    MIXEDLM_METRICS as _LON_MIXEDLM_METRICS,
+)
+from geofuse.longitudinal import MIXEDLM_METRICS as _LON_MIXEDLM_METRICS
+from geofuse.longitudinal import (
     LongitudinalSpec,
 )
-from geofuse.mixedlm_postscore import compute_post_metrics as _compute_mixedlm_post_metrics
+from geofuse.mixedlm_postscore import (
+    compute_post_metrics as _compute_mixedlm_post_metrics,
+)
 from geofuse.ndvi import NDVIEngine
 from geofuse.persistence.job_executor import JobContext
 from geofuse.raster_sampling import sample_raster_at_features
@@ -613,9 +617,7 @@ def _load_longitudinal_metric_file(path: str, channel: str) -> Any:
                 transform = src.transform
                 crs = src.crs
                 h, w = arr.shape
-                rows_i, cols_i = np.meshgrid(
-                    np.arange(h), np.arange(w), indexing="ij"
-                )
+                rows_i, cols_i = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")
                 xs, ys = xy(
                     transform, rows_i.flatten(), cols_i.flatten(), offset="center"
                 )
@@ -623,7 +625,9 @@ def _load_longitudinal_metric_file(path: str, channel: str) -> Any:
                 mask = ~np.isnan(vals)
                 gdf = gpd.GeoDataFrame(
                     {channel: vals[mask]},
-                    geometry=gpd.points_from_xy(np.asarray(xs)[mask], np.asarray(ys)[mask]),
+                    geometry=gpd.points_from_xy(
+                        np.asarray(xs)[mask], np.asarray(ys)[mask]
+                    ),
                     crs=crs,
                 )
                 gdf.attrs["metric_column"] = channel
@@ -640,8 +644,10 @@ def _load_longitudinal_metric_file(path: str, channel: str) -> Any:
     # Vector formats (GPKG / GeoJSON / shapefile / zip)
     gdf = gpd.read_file(path)
     default_col = {"veg": "veg", "terrain": "terrain", "ndvi": "NDVI"}[channel]
-    col = default_col if default_col in gdf.columns else (
-        "value" if "value" in gdf.columns else None
+    col = (
+        default_col
+        if default_col in gdf.columns
+        else ("value" if "value" in gdf.columns else None)
     )
     if col is None:
         raise ValueError(
@@ -661,6 +667,7 @@ def _resolve_longitudinal_spec(
     if not payload:
         return None
     return LongitudinalSpec.from_payload(payload)
+
 
 # Human labels for the standalone channels surfaced in ledger stages and
 # logs. Keys match the engine's ``greenery_channel`` values.
@@ -990,6 +997,34 @@ def run_fusion(
                     value=prog(0.26),
                     status_text=f"{prefix}Loading per-wave files...",
                 )
+                # Year-aware cross-sectional
+                if longitudinal_spec.derive_wave_from_date:
+                    from geofuse.longitudinal import parse_date_column as _parse_date
+
+                    tgdf = engine.target_gdf
+                    if tgdf is None:
+                        raise RuntimeError(
+                            "derive_wave_from_date requires load_target() to have run."
+                        )
+                    date_col = longitudinal_spec.date_col
+                    if date_col not in tgdf.columns:
+                        raise ValueError(
+                            f"derive_wave_from_date: date column {date_col!r} "
+                            f"is not present in the target frame."
+                        )
+                    parsed_dates = _parse_date(tgdf[date_col])
+                    wave_col_name = longitudinal_spec.wave_col or "_gf_year"
+                    entity_col_name = longitudinal_spec.entity_id_col
+                    tgdf[wave_col_name] = parsed_dates.dt.year.astype("Int64").astype(
+                        str
+                    )
+                    tgdf[entity_col_name] = np.arange(len(tgdf)).astype(str)
+                    _log_fusion(
+                        "INFO",
+                        f"[{label}] Synthesised wave column {wave_col_name!r} "
+                        f"and entity column {entity_col_name!r} for year-aware "
+                        "cross-sectional run.",
+                    )
                 if longitudinal_spec.intake_mode == "wide":
                     wide_frames: list[tuple[str, gpd.GeoDataFrame]] = []
                     for wave_label in longitudinal_spec.wave_labels:
@@ -1159,9 +1194,7 @@ def run_fusion(
                         f"{prefix}Scoring all MixedLM metrics on robust trials..."
                     ),
                 )
-                postscore_dir = os.path.join(
-                    output_dir, "fusion", "study_results"
-                )
+                postscore_dir = os.path.join(output_dir, "fusion", "study_results")
                 csv_basename = (
                     f"mixedlm_metrics__{label}.csv"
                     if multi_outcome

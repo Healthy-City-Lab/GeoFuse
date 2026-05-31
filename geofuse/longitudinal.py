@@ -144,6 +144,7 @@ class LongitudinalSpec:
     include_time_fixed_effect: bool = True
     random_slope_time: bool = True
     scoring_metric: str = DEFAULT_MIXEDLM_METRIC
+    derive_wave_from_date: bool = False
 
     def to_payload(self) -> dict:
         """Serialise to a plain-dict payload (for ``rec.params`` / restart)."""
@@ -160,6 +161,7 @@ class LongitudinalSpec:
             "include_time_fixed_effect": self.include_time_fixed_effect,
             "random_slope_time": self.random_slope_time,
             "scoring_metric": self.scoring_metric,
+            "derive_wave_from_date": self.derive_wave_from_date,
         }
 
     @classmethod
@@ -183,6 +185,9 @@ class LongitudinalSpec:
             ),
             random_slope_time=bool(payload.get("random_slope_time", True)),
             scoring_metric=payload.get("scoring_metric", DEFAULT_MIXEDLM_METRIC),
+            derive_wave_from_date=bool(
+                payload.get("derive_wave_from_date", False)
+            ),
         )
 
 

@@ -276,6 +276,8 @@ def _fusion_restart_summary_lines(p: dict) -> list[str]:
     covs = p.get("covariate_columns") or []
     standalones = p.get("standalone_channels") or []
     lon_payload = p.get("longitudinal_spec_payload") or None
+    k_folds = int(p.get("k_folds", 5))
+    cv_label = f"{k_folds}-fold CV" if k_folds > 1 else "single split (no CV)"
     lines = [
         f"**Target:** `{p.get('target_display_name', '?')}`",
         f"**Outcomes:** {', '.join(p.get('outcome_columns') or []) or '—'}",
@@ -283,19 +285,23 @@ def _fusion_restart_summary_lines(p: dict) -> list[str]:
         f"**Covariates:** {', '.join(covs) if covs else '—'}",
         f"**Standalone metrics:** " f"{', '.join(standalones) if standalones else '—'}",
         f"**Trials:** {p.get('n_trials', '?')} "
-        f"(startup {p.get('n_startup_trials', '?')})",
+        f"(startup {p.get('n_startup_trials', '?')}, {cv_label})",
         f"**Objective:** {p.get('objective_metric', '?')} · "
-        f"**Sampler:** {p.get('sampler_type', '?')} · "
-        f"**Pruner:** {p.get('pruner_type', '?')}",
+        f"**Sampler:** {p.get('sampler_type', '?')}",
         f"**GVI buffers (m):** {p.get('gvi_buffer_min_m', '?')} – "
         f"{p.get('gvi_buffer_max_m', '?')} (step {p.get('gvi_buffer_step_m', '?')})",
         f"**NDVI buffers (m):** {p.get('ndvi_buffer_min_m', '?')} – "
         f"{p.get('ndvi_buffer_max_m', '?')} (step {p.get('ndvi_buffer_step_m', '?')})",
-        f"**Metric source:** {p.get('metric_mode', '?')}",
     ]
     if lon_payload:
+        derived = lon_payload.get("derive_wave_from_date")
+        descriptor = (
+            "year-aware cross-sectional (OLS scorer)"
+            if derived
+            else f"`{lon_payload.get('intake_mode')}` intake"
+        )
         lines.append(
-            f"**Mixed-effects:** `{lon_payload.get('intake_mode')}` intake, "
+            f"**Year/wave-aware:** {descriptor}, "
             f"waves={lon_payload.get('wave_labels')}, "
             f"scoring=`{lon_payload.get('scoring_metric')}`"
         )
@@ -311,7 +317,6 @@ def _submit_fusion_restart(
     output_dir: str,
     veg_path: str | None,
     ndvi_path: str | None,
-    api_key: str | None,
 ) -> None:
     """Resubmit a fusion job with identical params; on-disk caches resume.
 
@@ -327,7 +332,6 @@ def _submit_fusion_restart(
     new_params = dict(p)
     new_params["restart_of"] = rec.id
     new_params["resume_existing_study"] = True
-    new_params["has_api_key"] = api_key is not None
 
     is_vector = bool(p.get("is_vector_target"))
     outcome_columns = list(p.get("outcome_columns") or [])
@@ -350,25 +354,15 @@ def _submit_fusion_restart(
         ndvi_buffer_min_m=float(p.get("ndvi_buffer_min_m", 100)),
         ndvi_buffer_max_m=float(p.get("ndvi_buffer_max_m", 1500)),
         ndvi_buffer_step_m=float(p.get("ndvi_buffer_step_m", 50)),
-        ndvi_resolution_m=p.get("ndvi_resolution_m"),
-        gvi_grid_spacing_m=p.get("gvi_grid_spacing_m"),
         n_bins=int(p.get("n_bins", 5)),
         veg_path=veg_path,
-        terrain_path=None,
         ndvi_path=ndvi_path,
-        cache_metrics=bool(p.get("cache_metrics", False)),
         test_size=float(p.get("test_size", 0.3)),
         k_folds=int(p.get("k_folds", 5)),
         n_trials=int(p.get("n_trials", 300)),
         n_startup_trials=int(p.get("n_startup_trials", 150)),
         objective_metric=p.get("objective_metric", "pearson"),
-        pruner_type=p.get("pruner_type", "median"),
         sampler_type=p.get("sampler_type", "TPE"),
-        gvi_api_key=api_key,
-        ndvi_start_date=p.get("ndvi_start_date") or date(2023, 6, 1).isoformat(),
-        ndvi_end_date=p.get("ndvi_end_date") or date(2023, 9, 30).isoformat(),
-        ndvi_project_id=None,
-        multi_objective_requested=bool(p.get("multi_objective_requested")),
         output_dir=output_dir,
         MetricFusionEngine=_MetricFusionEngine,
         target_display_name=p.get("target_display_name") or "target",
@@ -396,8 +390,6 @@ def _render_fusion_restart_panel(store, executor, output_dir: str) -> bool:
 
     p = rec.params or {}
     is_vector = bool(p.get("is_vector_target"))
-    metric_mode = p.get("metric_mode") or "Use Loaded Results"
-    had_api_key = bool(p.get("has_api_key"))
     expected_hash = p.get("geometry_sha256")
 
     with st.expander(f"↻ Restart fusion job: {rec.name or rec.id}", expanded=True):
@@ -420,8 +412,7 @@ def _render_fusion_restart_panel(store, executor, output_dir: str) -> bool:
             and path_drift_status(rec_target_path, rec_target_fp) == "ok"
         ):
             st.success(
-                f"✓ Target verified at `{rec_target_path}` — no re-upload "
-                "needed."
+                f"✓ Target verified at `{rec_target_path}` — no re-upload " "needed."
             )
             from file_picker import path_to_dataset
 
@@ -452,15 +443,12 @@ def _render_fusion_restart_panel(store, executor, output_dir: str) -> bool:
                             output_dir,
                             p.get("gvi_path"),
                             p.get("ndvi_path"),
-                            None,
                         )
                     except Exception as e:
                         st.error(f"Re-submission failed: {e}")
                         return True
                     st.session_state[RESTART_SESSION_KEY] = None
-                    st.success(
-                        "Restart submitted. Monitor progress in the sidebar."
-                    )
+                    st.success("Restart submitted. Monitor progress in the sidebar.")
                     st.rerun()
             return True
 
@@ -513,15 +501,28 @@ def _render_fusion_restart_panel(store, executor, output_dir: str) -> bool:
         else:
             st.toast("Raster target — content hash not verified.", icon="ℹ️")
 
-        # Re-resolve metric files. Loaded-results paths live under the output
-        # folder and are stable; uploaded files were tempdir-scoped and gone;
-        # auto-download skips both (the runner re-fetches via the disk cache).
+        # Re-resolve metric files. The drift fast path reuses the original
+        # absolute paths when their size+mtime still match; otherwise the
+        # user re-uploads. Loaded-results / auto-download metric modes were
+        # removed from the submission UI, so the only fallback path is
+        # re-upload.
         veg_path_re: str | None = None
         ndvi_path_re: str | None = None
-        if metric_mode == "Upload Files":
-            st.markdown("**Re-upload metric files (original temp uploads are gone)**")
-            col_g, col_n = st.columns(2)
-            with col_g:
+
+        rec_gvi_path = p.get("gvi_path")
+        rec_gvi_fp = p.get("gvi_fingerprint", "")
+        rec_ndvi_path = p.get("ndvi_path")
+        rec_ndvi_fp = p.get("ndvi_fingerprint", "")
+
+        col_g, col_n = st.columns(2)
+        with col_g:
+            if rec_gvi_path and path_drift_status(rec_gvi_path, rec_gvi_fp) == "ok":
+                veg_path_re = rec_gvi_path
+                st.success(
+                    f"✓ Reusing GVI file from original path: "
+                    f"`{os.path.basename(rec_gvi_path)}`"
+                )
+            else:
                 gvi_up = st.file_uploader(
                     "🌿 GVI File",
                     accept_multiple_files=True,
@@ -534,7 +535,14 @@ def _render_fusion_restart_panel(store, executor, output_dir: str) -> bool:
                     except ValueError as e:
                         st.error(f"GVI: {e}")
                         return True
-            with col_n:
+        with col_n:
+            if rec_ndvi_path and path_drift_status(rec_ndvi_path, rec_ndvi_fp) == "ok":
+                ndvi_path_re = rec_ndvi_path
+                st.success(
+                    f"✓ Reusing NDVI file from original path: "
+                    f"`{os.path.basename(rec_ndvi_path)}`"
+                )
+            else:
                 ndvi_up = st.file_uploader(
                     "🛰️ NDVI File",
                     accept_multiple_files=True,
@@ -547,47 +555,6 @@ def _render_fusion_restart_panel(store, executor, output_dir: str) -> bool:
                     except ValueError as e:
                         st.error(f"NDVI: {e}")
                         return True
-        elif metric_mode == "Use Loaded Results":
-            gvi_bn = p.get("gvi_basename")
-            ndvi_bn = p.get("ndvi_basename")
-            if gvi_bn and p.get("gvi_under_output_dir"):
-                cand = os.path.join(output_dir, gvi_bn)
-                if os.path.exists(cand):
-                    veg_path_re = cand
-                    st.success(f"✓ Reusing GVI file from output folder: `{gvi_bn}`")
-                else:
-                    st.warning(
-                        f"⚠️ GVI file `{gvi_bn}` is no longer in the output folder; "
-                        "the runner will auto-download (cache reused when present)."
-                    )
-            if ndvi_bn and p.get("ndvi_under_output_dir"):
-                cand = os.path.join(output_dir, ndvi_bn)
-                if os.path.exists(cand):
-                    ndvi_path_re = cand
-                    st.success(f"✓ Reusing NDVI file from output folder: `{ndvi_bn}`")
-                else:
-                    st.warning(
-                        f"⚠️ NDVI file `{ndvi_bn}` is no longer in the output folder; "
-                        "the runner will auto-download (cache reused when present)."
-                    )
-        # Auto-Download: leave both paths None; runner re-runs the download
-        # against the metric cache (cache_metrics flag preserved in params).
-
-        api_key: str | None = None
-        if had_api_key:
-            st.caption(
-                "Original job used the Street View API. Re-supply the API key "
-                "(secrets are not persisted between runs)."
-            )
-            api_key = (
-                st.text_input(
-                    "Street View API Key",
-                    type="password",
-                    autocomplete="off",
-                    key=f"f_restart_apikey_{rec.id}",
-                )
-                or None
-            )
 
         # Mixed-effects restart: validate every per-wave file path against the
         # fingerprint recorded at submit time and prompt the user to re-supply
@@ -646,9 +613,9 @@ def _render_fusion_restart_panel(store, executor, output_dir: str) -> bool:
                 all_resolved = True
                 for group_key, lbl, wave, orig_path, status in drift_items:
                     status_icon = (
-                        "❌" if status == "missing"
-                        else "⚠️" if status == "modified"
-                        else "•"
+                        "❌"
+                        if status == "missing"
+                        else "⚠️" if status == "modified" else "•"
                     )
                     key_id = f"f_restart_lon_{group_key}_{wave}_{rec.id}"
                     new_path = st.text_input(
@@ -666,9 +633,7 @@ def _render_fusion_restart_panel(store, executor, output_dir: str) -> bool:
                         all_resolved = False
 
                 if not all_resolved:
-                    st.warning(
-                        "Resolve every drifted file above before re-running."
-                    )
+                    st.warning("Resolve every drifted file above before re-running.")
                     lon_restart_blocked = True
                 else:
                     # Build a fresh payload with updated paths + fingerprints
@@ -690,12 +655,12 @@ def _render_fusion_restart_panel(store, executor, output_dir: str) -> bool:
                         for gk in ("target", "veg", "terrain", "ndvi")
                     }
                     for (gk, wv), new_p in resolved_overrides.items():
-                        new_fps.setdefault(gk, {})[wv] = file_size_mtime_fingerprint(new_p)
+                        new_fps.setdefault(gk, {})[wv] = file_size_mtime_fingerprint(
+                            new_p
+                        )
                     updated_payload["__file_fingerprints__"] = new_fps
                     lon_payload_for_submit = updated_payload
-                    st.success(
-                        f"All {len(drift_items)} drifted file(s) resolved."
-                    )
+                    st.success(f"All {len(drift_items)} drifted file(s) resolved.")
             else:
                 st.success("Mixed-effects per-wave files verified.")
 
@@ -732,7 +697,6 @@ def _render_fusion_restart_panel(store, executor, output_dir: str) -> bool:
                     output_dir,
                     veg_path_re,
                     ndvi_path_re,
-                    api_key,
                 )
             except Exception as e:
                 st.error(f"Re-submission failed: {e}")
@@ -777,30 +741,37 @@ def _date_parseable_columns(gdf: gpd.GeoDataFrame) -> list[str]:
 
     The longitudinal module's :func:`parse_date_column` accepts full ISO,
     year+month, year-only strings, integer years, and native datetime dtypes.
-    A column is offered when at least 80 % of its non-null values parse
-    successfully — same liberal threshold used today by the outcome picker.
+    A column is offered when at least 80 % of its sampled non-null values
+    parse successfully — same liberal threshold used today by the outcome
+    picker. Only the first 200 non-null rows are sampled per column so the
+    scan stays fast on large targets.
     """
+    import warnings as _warnings
+
     try:
         from geofuse.longitudinal import parse_date_column
     except ImportError:
         return []
     out: list[str] = []
-    for col in gdf.columns:
-        if col == "geometry":
-            continue
-        s = gdf[col]
-        non_null = s.dropna()
-        if not len(non_null):
-            continue
-        parsed = parse_date_column(non_null)
-        if parsed.notna().mean() >= 0.8:
-            out.append(col)
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("ignore", category=UserWarning)
+        for col in gdf.columns:
+            if col == "geometry":
+                continue
+            s = gdf[col]
+            non_null = s.dropna().head(200)
+            if not len(non_null):
+                continue
+            try:
+                parsed = parse_date_column(non_null)
+            except Exception:
+                continue
+            if parsed.notna().mean() >= 0.8:
+                out.append(col)
     return out
 
 
-def _discover_years_from_date_column(
-    gdf: gpd.GeoDataFrame, date_col: str
-) -> list[str]:
+def _discover_years_from_date_column(gdf: gpd.GeoDataFrame, date_col: str) -> list[str]:
     """Return unique years in the date column as sorted string labels."""
     try:
         from geofuse.longitudinal import parse_date_column
@@ -920,8 +891,7 @@ def _render_optimization_setup_panel(
                     state["discovered_waves"] = years
                     if years:
                         st.caption(
-                            "Discovered years: "
-                            + ", ".join(f"`{y}`" for y in years)
+                            "Discovered years: " + ", ".join(f"`{y}`" for y in years)
                         )
                     else:
                         st.warning("No parseable dates in the selected column.")
@@ -995,14 +965,12 @@ def _render_optimization_setup_panel(
             )
             if state["wave_col"]:
                 waves = sorted(
-                    str(v)
-                    for v in preview_gdf[state["wave_col"]].dropna().unique()
+                    str(v) for v in preview_gdf[state["wave_col"]].dropna().unique()
                 )
                 state["discovered_waves"] = waves
                 if waves:
                     st.caption(
-                        "Discovered waves: "
-                        + ", ".join(f"`{w}`" for w in waves)
+                        "Discovered waves: " + ", ".join(f"`{w}`" for w in waves)
                     )
         else:
             st.warning("No candidate wave columns found in the target.")
@@ -1017,16 +985,22 @@ def _render_optimization_setup_panel(
     if "fusion_lon_wide_count" not in st.session_state:
         st.session_state.fusion_lon_wide_count = 1
     n_wide = st.session_state.fusion_lon_wide_count
+    from file_picker import FT_VECTOR_OR_RASTER, pick_file_path
+
     wide_files: list[dict] = []
     for i in range(n_wide):
         with st.container(border=True):
             wc1, wc2 = st.columns([3, 1])
             with wc1:
-                up = st.file_uploader(
+                file_path = pick_file_path(
                     f"Wave file {i + 1}",
-                    accept_multiple_files=True,
-                    type=FUSION_TARGET_UPLOAD_TYPES,
-                    key=f"fusion_lon_wide_file_{i}",
+                    key=f"fusion_lon_wide_path_{i}",
+                    file_types=FT_VECTOR_OR_RASTER,
+                    help_text=(
+                        "Pick a per-wave target file from disk. The path "
+                        "picker bypasses Streamlit's upload limit so "
+                        "large per-wave files are supported directly."
+                    ),
                 )
             with wc2:
                 if i > 0 and st.button(
@@ -1037,30 +1011,27 @@ def _render_optimization_setup_panel(
                     st.session_state.fusion_lon_wide_count -= 1
                     st.rerun()
             default_label = ""
-            if up:
-                default_label = os.path.splitext(up[0].name)[0]
+            if file_path:
+                default_label = os.path.splitext(os.path.basename(file_path))[0]
             wave_label = st.text_input(
                 "Wave label",
-                value=st.session_state.get(
-                    f"fusion_lon_wide_label_{i}", default_label
-                ),
+                value=st.session_state.get(f"fusion_lon_wide_label_{i}", default_label),
                 key=f"fusion_lon_wide_label_{i}",
                 help="Wave identifier; ordered by appearance, baseline first.",
             )
             file_cols: list[str] = []
             file_date_cands: list[str] = []
-            file_path: str | None = None
-            if up:
-                try:
-                    mat = materialize_uploaded_dataset(up)
-                    file_path = mat.path
-                    file_gdf = read_vector_path(file_path)
-                    file_cols = [
-                        c for c in file_gdf.columns if c != "geometry"
-                    ]
-                    file_date_cands = _date_parseable_columns(file_gdf)
-                except Exception as exc:
-                    st.error(f"Could not read wave {i + 1}: {exc}")
+            if file_path:
+                if not os.path.isfile(file_path):
+                    st.error(f"Path no longer exists: `{file_path}`")
+                    file_path = None
+                else:
+                    try:
+                        file_gdf = read_vector_path(file_path)
+                        file_cols = [c for c in file_gdf.columns if c != "geometry"]
+                        file_date_cands = _date_parseable_columns(file_gdf)
+                    except Exception as exc:
+                        st.error(f"Could not read wave {i + 1}: {exc}")
             ec1, ec2 = st.columns(2)
             with ec1:
                 entity_col = st.selectbox(
@@ -1158,9 +1129,7 @@ def _render_metric_assignment_panel(
                     min_value=50,
                     max_value=4900,
                     value=int(
-                        st.session_state.get(
-                            f"fusion_{ch_short}_buffer_min", 100
-                        )
+                        st.session_state.get(f"fusion_{ch_short}_buffer_min", 100)
                     ),
                     step=50,
                     key=f"fusion_{ch_short}_buffer_min",
@@ -1172,9 +1141,7 @@ def _render_metric_assignment_panel(
                     min_value=100,
                     max_value=5000,
                     value=int(
-                        st.session_state.get(
-                            f"fusion_{ch_short}_buffer_max", 1500
-                        )
+                        st.session_state.get(f"fusion_{ch_short}_buffer_max", 1500)
                     ),
                     step=50,
                     key=f"fusion_{ch_short}_buffer_max",
@@ -1186,9 +1153,7 @@ def _render_metric_assignment_panel(
                     min_value=10,
                     max_value=500,
                     value=int(
-                        st.session_state.get(
-                            f"fusion_{ch_short}_buffer_step", 50
-                        )
+                        st.session_state.get(f"fusion_{ch_short}_buffer_step", 50)
                     ),
                     step=10,
                     key=f"fusion_{ch_short}_buffer_step",
@@ -1203,50 +1168,79 @@ def _render_metric_assignment_panel(
             if count_key not in st.session_state:
                 st.session_state[count_key] = 1
             n_files = st.session_state[count_key]
+            from file_picker import FT_VECTOR_OR_RASTER, pick_file_path
+
+            sibling_assignments: dict[int, list] = {
+                j: list(st.session_state.get(f"fusion_{ch_short}_assign_{j}", []))
+                for j in range(n_files)
+            }
+
             channel_files: list[tuple[str, list]] = []
             for i in range(n_files):
                 col_up, col_rm = st.columns([5, 1])
                 with col_up:
-                    up = st.file_uploader(
+                    file_path = pick_file_path(
                         f"{ch_label} file {i + 1}",
-                        accept_multiple_files=True,
-                        type=FUSION_TARGET_UPLOAD_TYPES,
-                        key=f"fusion_{ch_short}_upload_{i}",
-                        help=(
-                            "GeoTIFF or vector metric. Shapefile requires "
-                            "all sidecars in one selection."
+                        key=f"fusion_{ch_short}_path_{i}",
+                        file_types=FT_VECTOR_OR_RASTER,
+                        help_text=(
+                            "Pick a GeoTIFF or vector metric file from disk. "
+                            "The path picker bypasses Streamlit's upload limit "
+                            "so national-scale rasters are supported directly."
                         ),
                     )
                 with col_rm:
                     if i > 0 and st.button(
                         "❌",
                         key=f"fusion_{ch_short}_rm_{i}",
-                        help=f"Remove this {ch_short.upper()} file",
+                        help=f"Remove this {ch_short.upper()} file row",
                     ):
                         st.session_state[count_key] -= 1
                         st.rerun()
-                file_path: str | None = None
-                if up:
-                    try:
-                        ds = materialize_uploaded_dataset(up)
-                        file_path = ds.path
-                        st.success(f"✓ Loaded: {ds.display_name}")
-                    except ValueError as exc:
-                        st.error(str(exc))
+                if file_path and not os.path.isfile(file_path):
+                    st.error(f"Path no longer exists: `{file_path}`")
+                    file_path = None
                 assigned: list = []
                 if year_aware and discovered_waves:
+                    my_current = set(sibling_assignments.get(i, []))
+                    taken_by_others = set().union(
+                        *(
+                            set(waves)
+                            for j, waves in sibling_assignments.items()
+                            if j != i
+                        )
+                    )
+                    visible_options = [
+                        w
+                        for w in discovered_waves
+                        if w not in taken_by_others or w in my_current
+                    ]
+                    assign_key = f"fusion_{ch_short}_assign_{i}"
+                    # Stale session_state can hold a wave that's no longer
+                    # in the visible options (sibling claimed it last run).
+                    # Prune those before rendering so Streamlit doesn't
+                    # error on the invalid value.
+                    if assign_key in st.session_state:
+                        st.session_state[assign_key] = [
+                            w
+                            for w in st.session_state[assign_key]
+                            if w in visible_options
+                        ]
                     assigned = st.multiselect(
                         f"{ch_label} file {i + 1} — applies to year(s) / wave(s)",
-                        options=discovered_waves,
-                        default=st.session_state.get(
-                            f"fusion_{ch_short}_assign_{i}", []
-                        ),
-                        key=f"fusion_{ch_short}_assign_{i}",
+                        options=visible_options,
+                        key=assign_key,
                         help=(
                             "Years / waves whose entities should sample "
-                            "greenery from this file."
+                            "greenery from this file. Years already "
+                            "claimed by another file in this channel "
+                            "are hidden from the list."
                         ),
                     )
+                    # Update the snapshot so the NEXT row's option list
+                    # reflects this row's freshly-rendered selection
+                    # (otherwise late rows lag by one rerun).
+                    sibling_assignments[i] = list(assigned)
                 if file_path:
                     channel_files.append((file_path, assigned))
 
@@ -1281,8 +1275,7 @@ def _render_metric_assignment_panel(
                 if missing:
                     state["coverage_complete"] = False
                     state["coverage_errors"].append(
-                        f"{ch_label}: no file assigned to "
-                        + ", ".join(missing)
+                        f"{ch_label}: no file assigned to " + ", ".join(missing)
                     )
                 if duplicates:
                     state["coverage_complete"] = False
@@ -1473,9 +1466,7 @@ def _render_study_details_panel(
         with mc2:
             mixedlm_time_fixed = st.checkbox(
                 "Include `years_since_baseline` as fixed effect",
-                value=bool(
-                    st.session_state.get("fusion_lon_include_time_fixed", True)
-                ),
+                value=bool(st.session_state.get("fusion_lon_include_time_fixed", True)),
                 key="fusion_lon_include_time_fixed",
                 help=(
                     "Adds `+ years_since_baseline` to the fixed-effect "
@@ -1847,748 +1838,81 @@ def render(output_dir: str) -> None:
             st.info("Upload a target file to preview")
 
     # =========================================================================
-    # Full width: metric source and optimization (below the split preview row)
+    # SECTION 2 — Optimization setup
     # =========================================================================
     st.divider()
-    st.subheader("Metric Configuration")
-    with st.container(border=True):
+    opt_state = _render_optimization_setup_panel(
+        preview_vector_gdf if is_vector_target else None,
+        target_outcome_columns,
+    )
+    if opt_state is None:
+        # No run mode picked yet — bail out so downstream sections don't
+        # render with empty discovery state.
+        return
+    is_longitudinal = opt_state["is_longitudinal"]
+    year_aware = is_longitudinal or opt_state["cross_sectional_date_on"]
 
-        metric_mode = st.radio(
-            "Metric Source",
-            options=["Use Loaded Results", "Upload Files", "Auto-Download"],
-            horizontal=True,
-            help=(
-                "Use outputs already in the output folder, upload GVI/NDVI files, or "
-                "download metrics at run time. Buffer ladders, loaded-result picks, "
-                "auto-download fields, and optimization apply when you press "
-                "Run Fusion Optimization. Uploading new metric files still refreshes the app."
-            ),
-            key="fusion_metric_source",
-        )
+    # =========================================================================
+    # SECTION 3 — Metric file assignment
+    # =========================================================================
+    st.divider()
+    metric_state = _render_metric_assignment_panel(
+        opt_state["discovered_waves"],
+        year_aware=year_aware,
+    )
+    if metric_state is None:
+        return
 
-        gvi_path = None
-        ndvi_path = None
+    # Legacy variables submission still reads — derived from metric_state.
+    gvi_buffer_min_m = metric_state["gvi_buffer_min"]
+    gvi_buffer_max_m = metric_state["gvi_buffer_max"]
+    gvi_buffer_step_m = metric_state["gvi_buffer_step"]
+    ndvi_buffer_min_m = metric_state["ndvi_buffer_min"]
+    ndvi_buffer_max_m = metric_state["ndvi_buffer_max"]
+    ndvi_buffer_step_m = metric_state["ndvi_buffer_step"]
+    buffer_extent_m = float(max(gvi_buffer_max_m, ndvi_buffer_max_m))
 
-        if metric_mode == "Upload Files":
-            col_gvi_up, col_ndvi_up = st.columns(2)
+    # Auto-download mode is no longer exposed; defaults reproduce the
+    # legacy non-Auto-Download path.
+    ndvi_auto_start = date(2023, 6, 1)
+    ndvi_auto_end = date(2023, 9, 30)
+    cache_metrics = False
+    ndvi_resolution_m = None
+    gvi_grid_spacing_m = None
 
-            with col_gvi_up:
-                _gvi_path = pick_file_path(
-                    "🌿 Pick GVI File",
-                    key="fusion_gvi_path",
-                    file_types=FT_VECTOR_OR_RASTER,
-                    help_text="GeoTIFF or vector metric. Shapefile sidecars must sit beside the .shp.",
-                )
-                if _gvi_path and os.path.isfile(_gvi_path):
-                    gvi_path = _gvi_path
+    # =========================================================================
+    # SECTION 4 — Study details (form)
+    # =========================================================================
+    st.divider()
 
-            with col_ndvi_up:
-                _ndvi_path = pick_file_path(
-                    "🛰️ Pick NDVI File",
-                    key="fusion_ndvi_path",
-                    file_types=FT_VECTOR_OR_RASTER,
-                    help_text="GeoTIFF or vector metric. Shapefile sidecars must sit beside the .shp.",
-                )
-                if _ndvi_path and os.path.isfile(_ndvi_path):
-                    ndvi_path = _ndvi_path
-
-        st.markdown("**GVI buffer exploration (m)**")
-        col_bgvi_a, col_bgvi_b, col_bgvi_c = st.columns(3)
-        with col_bgvi_a:
-            gvi_buffer_min_m = st.number_input(
-                "GVI minimum buffer",
-                min_value=50,
-                max_value=4900,
-                value=100,
-                step=50,
-                help=(
-                    "Smallest GVI radius searched (m). Used with the NDVI buffer ladder "
-                    "for fusion; values apply when you run optimization below."
-                ),
-                key="fusion_gvi_buffer_min",
-            )
-        with col_bgvi_b:
-            gvi_buffer_max_m = st.number_input(
-                "GVI maximum buffer",
-                min_value=100,
-                max_value=5000,
-                value=1500,
-                step=50,
-                help="Largest GVI radius (m); extent padding uses max with NDVI.",
-                key="fusion_gvi_buffer_max",
-            )
-        with col_bgvi_c:
-            gvi_buffer_step_m = st.number_input(
-                "GVI buffer step",
-                min_value=10,
-                max_value=500,
-                value=50,
-                step=10,
-                help="Radius discretization (m).",
-                key="fusion_gvi_buffer_step",
-            )
-
-        st.markdown("**NDVI buffer exploration (m)**")
-        col_bndvi_a, col_bndvi_b, col_bndvi_c = st.columns(3)
-        with col_bndvi_a:
-            ndvi_buffer_min_m = st.number_input(
-                "NDVI minimum buffer",
-                min_value=50,
-                max_value=4900,
-                value=100,
-                step=50,
-                help="Smallest NDVI radius searched (m).",
-                key="fusion_ndvi_buffer_min",
-            )
-        with col_bndvi_b:
-            ndvi_buffer_max_m = st.number_input(
-                "NDVI maximum buffer",
-                min_value=100,
-                max_value=5000,
-                value=1500,
-                step=50,
-                help="Largest NDVI radius (m); extent padding uses max with GVI.",
-                key="fusion_ndvi_buffer_max",
-            )
-        with col_bndvi_c:
-            ndvi_buffer_step_m = st.number_input(
-                "NDVI buffer step",
-                min_value=10,
-                max_value=500,
-                value=50,
-                step=10,
-                help="Radius discretization (m).",
-                key="fusion_ndvi_buffer_step",
-            )
-
-        buffer_extent_m = float(max(gvi_buffer_max_m, ndvi_buffer_max_m))
-
-        if metric_mode == "Use Loaded Results":
-            all_gvi_files = _scan_metric_files(output_dir, "gvi")
-            all_ndvi_files = _scan_metric_files(output_dir, "ndvi")
-
-            buffered_extent = None
-            if tmp_target_path:
-                buffered_extent = _compute_buffered_extent(
-                    tmp_target_path,
-                    is_vector_target,
-                    buffer_extent_m,
-                    target_layer_for_engine if is_vector_target else None,
-                )
-
-            def _filter_by_coverage(file_list, bext):
-                # Return (covering, non_covering) label lists.
-                if bext is None:
-                    return [lbl for lbl, _ in file_list], []
-                covering, non_covering = [], []
-                for lbl, path in file_list:
-                    (covering if _check_coverage(path, bext) else non_covering).append(
-                        lbl
-                    )
-                return covering, non_covering
-
-            gvi_covering, gvi_outside = _filter_by_coverage(
-                all_gvi_files, buffered_extent
-            )
-            ndvi_covering, ndvi_outside = _filter_by_coverage(
-                all_ndvi_files, buffered_extent
-            )
-
-            col_gvi_sel, col_ndvi_sel = st.columns(2)
-
-            with col_gvi_sel:
-                if not all_gvi_files:
-                    st.info(
-                        "No GVI GeoTIFF results found in the output folder "
-                        "(files named *_gvi.tif)."
-                    )
-                else:
-                    gvi_help = (
-                        "GeoTIFFs named *_gvi.tif in the output folder. "
-                        "Leave unset to auto-download if needed."
-                    )
-                    if buffered_extent is not None:
-                        gvi_help += (
-                            f" {len(gvi_covering)} file(s) fully cover the buffered "
-                            f"target extent."
-                        )
-                        if gvi_outside:
-                            gvi_help += (
-                                f" {len(gvi_outside)} file(s) do not cover that extent."
-                            )
-                    options_gvi = (
-                        [None]
-                        + gvi_covering
-                        + (
-                            ["── outside target ──"] + gvi_outside
-                            if gvi_outside
-                            else []
-                        )
-                    )
-                    gvi_selection = st.selectbox(
-                        "🌿 Select GVI Result",
-                        options=options_gvi,
-                        format_func=lambda x: (
-                            "(Optional — will auto-download)" if x is None else x
-                        ),
-                        key="fusion_gvi_select",
-                        help=gvi_help,
-                    )
-                    if gvi_selection and not gvi_selection.startswith("──"):
-                        gvi_path = os.path.join(output_dir, gvi_selection)
-                        if not os.path.exists(gvi_path):
-                            st.warning("⚠️ File not found on disk.")
-                            gvi_path = None
-                        elif (
-                            buffered_extent is not None and gvi_selection in gvi_outside
-                        ):
-                            st.warning(
-                                "⚠️ This result does not fully cover the buffered "
-                                "target area — spatial alignment may be incomplete."
-                            )
-                        else:
-                            st.success(f"✓ {gvi_selection}")
-
-            with col_ndvi_sel:
-                if not all_ndvi_files:
-                    st.info(
-                        "No NDVI GeoTIFF results found in the output folder "
-                        "(files named *_ndvi.tif)."
-                    )
-                else:
-                    ndvi_help = (
-                        "GeoTIFFs named *_ndvi.tif in the output folder. "
-                        "Leave unset to auto-download if needed."
-                    )
-                    if buffered_extent is not None:
-                        ndvi_help += (
-                            f" {len(ndvi_covering)} file(s) fully cover the buffered "
-                            f"target extent."
-                        )
-                        if ndvi_outside:
-                            ndvi_help += f" {len(ndvi_outside)} file(s) do not cover that extent."
-                    options_ndvi = (
-                        [None]
-                        + ndvi_covering
-                        + (
-                            ["── outside target ──"] + ndvi_outside
-                            if ndvi_outside
-                            else []
-                        )
-                    )
-                    ndvi_selection = st.selectbox(
-                        "🛰️ Select NDVI Result",
-                        options=options_ndvi,
-                        format_func=lambda x: (
-                            "(Optional — will auto-download)" if x is None else x
-                        ),
-                        key="fusion_ndvi_select",
-                        help=ndvi_help,
-                    )
-                    if ndvi_selection and not ndvi_selection.startswith("──"):
-                        ndvi_path = os.path.join(output_dir, ndvi_selection)
-                        if not os.path.exists(ndvi_path):
-                            st.warning("⚠️ File not found on disk.")
-                            ndvi_path = None
-                        elif (
-                            buffered_extent is not None
-                            and ndvi_selection in ndvi_outside
-                        ):
-                            st.warning(
-                                "⚠️ This result does not fully cover the buffered "
-                                "target area — spatial alignment may be incomplete."
-                            )
-                        else:
-                            st.success(f"✓ {ndvi_selection}")
-
-        ndvi_auto_start = date(2023, 6, 1)
-        ndvi_auto_end = date(2023, 9, 30)
-        cache_metrics = False
-        ndvi_resolution_m = None
-        gvi_grid_spacing_m = None
-
-        if metric_mode == "Auto-Download":
-            col_ad1, col_ad2 = st.columns(2)
-            with col_ad1:
-                ndvi_auto_start = st.date_input(
-                    "NDVI Start Date",
-                    value=date(2023, 6, 1),
-                    help="Composite interval start (auto-download NDVI).",
-                    key="fusion_ndvi_start_date",
-                )
-            with col_ad2:
-                ndvi_auto_end = st.date_input(
-                    "NDVI End Date",
-                    value=date(2023, 9, 30),
-                    help="Composite interval end (auto-download NDVI).",
-                    key="fusion_ndvi_end_date",
-                )
-            cache_metrics = st.checkbox(
-                "Cache Metrics to Disk",
-                value=True,
-                help="Persist fetched metrics under the output fusion cache.",
-                key="fusion_cache_metrics",
-            )
-            st.text_input(
-                "Street View API Key (optional)",
-                type="password",
-                autocomplete="off",
-                help="Optional Google Street View key; leave blank for built-in access. Masked input with autocomplete disabled (some browsers may still offer to save).",
-                key="fusion_streetview_api_key",
-            )
-            st.markdown("**Metric generation settings**")
-            ndvi_resolution_m = st.number_input(
-                "NDVI satellite resolution (m)",
-                min_value=5.0,
-                max_value=100.0,
-                value=10.0,
-                step=5.0,
-                help="Target pixel size for NDVI export (Earth Engine).",
-                key="fusion_ndvi_satellite_resolution",
-            )
-            gvi_grid_spacing_m = st.number_input(
-                "GVI sampling grid spacing (m)",
-                min_value=10.0,
-                max_value=500.0,
-                value=50.0,
-                step=10.0,
-                help="Spacing for street-view sample points on the grid.",
-                key="fusion_gvi_sampling_grid_spacing",
-            )
-
-    st.subheader("Optimization Settings")
-
-    # Numeric attribute columns the user can pick as covariates. Outcomes are
-    # excluded because a column can't predict itself — same defensive check the
-    # runner applies per-outcome at submit time. Only available for vector
-    # targets (raster targets have no attribute table).
-    #
-    # Wide-mode mixed-effects runs join several per-wave target files on
-    # the entity-id column at runtime; a covariate is only usable when it's
-    # present in **every** wave's file. When wide mode is active and the per-
-    # wave target paths have been filled in, intersect the numeric column
-    # sets across all readable per-wave files so the dropdown can't surface
-    # a column that's missing from later waves.
+    # Numeric attribute columns the user can pick as covariates
     available_covariates: list[str] = []
     if is_vector_target and preview_vector_gdf is not None:
         numeric_attr_cols = preview_vector_gdf.select_dtypes(
             include=[np.number]
         ).columns.tolist()
         outcome_set = set(target_outcome_columns)
-
-        if (
-            st.session_state.get("fusion_run_mode")
-            == "Mixed-effects (longitudinal)"
-            and st.session_state.get("fusion_lon_intake") == "wide"
-        ):
-            _target_paths_raw = st.session_state.get(
-                "fusion_lon_target_paths_raw", ""
-            )
-            _paths = [
-                p.strip() for p in _target_paths_raw.split(",") if p.strip()
-            ]
-            _existing = [p for p in _paths if os.path.isfile(p)]
-            if len(_existing) >= 2:
-                # Intersect numeric columns across every readable wave file
-                # so the dropdown only offers columns guaranteed to be present
-                # in every wave's data (otherwise the runtime concat would
-                # surface NaN columns for the missing waves and silently drop
-                # rows from the long-format frame).
-                _common: set[str] | None = None
-                for _p in _existing:
-                    try:
-                        _frame = gpd.read_file(_p, rows=64)
-                    except Exception:
-                        continue
-                    _nums = set(
-                        _frame.select_dtypes(include=[np.number]).columns
-                    )
-                    _common = _nums if _common is None else _common & _nums
-                if _common is not None:
-                    numeric_attr_cols = sorted(
-                        _common & set(numeric_attr_cols)
-                    ) or sorted(_common)
-                    if len(_existing) < len(_paths):
-                        st.caption(
-                            f"_Covariate list intersected across "
-                            f"{len(_existing)}/{len(_paths)} per-wave files "
-                            "found on disk._"
-                        )
-
+        wide_files = opt_state.get("wide_files") or []
+        if is_longitudinal and opt_state.get("intake_mode") == "wide" and wide_files:
+            common: set[str] | None = None
+            for wf in wide_files:
+                try:
+                    _frame = gpd.read_file(wf["path"], rows=64)
+                except Exception:
+                    continue
+                _nums = set(_frame.select_dtypes(include=[np.number]).columns)
+                common = _nums if common is None else common & _nums
+            if common is not None:
+                numeric_attr_cols = sorted(common & set(numeric_attr_cols)) or sorted(
+                    common
+                )
         available_covariates = [c for c in numeric_attr_cols if c not in outcome_set]
 
     with st.form("fusion_metric_run"):
-        with st.container(border=True):
-
-            # ── Mixed-effects / longitudinal mode ────────────────────────────
-            # Compact expander up-top because the mode choice changes what
-            # every downstream field even means (single target file vs N per-
-            # wave files; cross-sectional scoring vs MixedLM scoring). Stays
-            # collapsed by default so cross-sectional users see the legacy
-            # form unchanged.
-            with st.expander(
-                "Mixed-effects / longitudinal mode (advanced)", expanded=False
-            ):
-                fusion_mode = st.radio(
-                    "Run mode",
-                    options=["Cross-sectional", "Mixed-effects (longitudinal)"],
-                    index=0,
-                    horizontal=True,
-                    key="fusion_run_mode",
-                    help=(
-                        "**Cross-sectional** — one observation per entity, "
-                        "standard CGI optimisation (the default). "
-                        "**Mixed-effects** — entities measured at multiple "
-                        "time points; CGI scored via a linear mixed model "
-                        "(`statsmodels.MixedLM`) with a random intercept "
-                        "(and optional random slope on time) per entity."
-                    ),
-                )
-                is_longitudinal = fusion_mode == "Mixed-effects (longitudinal)"
-
-                lon_intake = "long"
-                lon_entity_id_col = ""
-                lon_wave_col = ""
-                lon_date_col = "measurement_date"
-                lon_wave_labels_raw = ""
-                lon_target_paths_raw = ""
-                lon_veg_paths_raw = ""
-                lon_terrain_paths_raw = ""
-                lon_ndvi_paths_raw = ""
-                lon_veg_reuse = False
-                lon_terrain_reuse = False
-                lon_ndvi_reuse = False
-                lon_scoring_metric = "mixedlm_tstat"
-                lon_include_time_fixed = True
-                lon_random_slope = True
-
-                if is_longitudinal:
-                    st.caption(
-                        "Per-wave files take **absolute paths** — paste one path "
-                        "per wave, comma-separated, in the same order as the "
-                        "wave labels. Set the per-channel \"reuse single file\" "
-                        "checkbox to use one path across every wave (useful for "
-                        "channels that don't change over time)."
-                    )
-
-                    lc1, lc2 = st.columns([1, 1])
-                    with lc1:
-                        lon_intake = st.radio(
-                            "Intake mode",
-                            options=["long", "wide"],
-                            index=0,
-                            horizontal=True,
-                            key="fusion_lon_intake",
-                            help=(
-                                "**long** — one target file with one row per "
-                                "(entity, wave) and an explicit wave column. "
-                                "**wide** — one target file per wave, joined on "
-                                "a shared entity-id column."
-                            ),
-                        )
-                        lon_wave_labels_raw = st.text_input(
-                            "Wave labels (comma-separated, baseline first)",
-                            value=st.session_state.get(
-                                "fusion_lon_wave_labels_raw", "baseline,w2,w3"
-                            ),
-                            key="fusion_lon_wave_labels_raw",
-                            help=(
-                                "Ordered list of wave identifiers — the first one "
-                                "is treated as baseline for the time variable. "
-                                "Example: `baseline,w2,w3` or `2010,2013,2017`."
-                            ),
-                        )
-                        lon_entity_id_col = st.text_input(
-                            "Entity ID column",
-                            value=st.session_state.get(
-                                "fusion_lon_entity_id_col", "entity_id"
-                            ),
-                            key="fusion_lon_entity_id_col",
-                            help=(
-                                "Column on the target that uniquely identifies "
-                                "each entity (e.g. participant ID). Present in "
-                                "the long-format target, or in every per-wave "
-                                "file for wide mode."
-                            ),
-                        )
-                    with lc2:
-                        lon_date_col = st.text_input(
-                            "Measurement-date column",
-                            value=st.session_state.get(
-                                "fusion_lon_date_col", "measurement_date"
-                            ),
-                            key="fusion_lon_date_col",
-                            help=(
-                                "Column carrying the per-row date. Accepts full "
-                                "ISO dates (`2010-01-15`), year + month "
-                                "(`2010-01`), year-only (`2010`), or integer "
-                                "years. Used to derive `years_since_baseline` "
-                                "per entity."
-                            ),
-                        )
-                        if lon_intake == "long":
-                            lon_wave_col = st.text_input(
-                                "Wave column (long mode)",
-                                value=st.session_state.get(
-                                    "fusion_lon_wave_col", "wave"
-                                ),
-                                key="fusion_lon_wave_col",
-                                help=(
-                                    "Column on the long-format target that "
-                                    "carries the wave label per row. Every "
-                                    "value must appear in the wave-labels list."
-                                ),
-                            )
-                        else:
-                            lon_target_paths_raw = st.text_input(
-                                "Per-wave target file paths (comma-separated)",
-                                value=st.session_state.get(
-                                    "fusion_lon_target_paths_raw", ""
-                                ),
-                                key="fusion_lon_target_paths_raw",
-                                help=(
-                                    "Absolute paths to one target file per wave, "
-                                    "in the same order as the wave labels."
-                                ),
-                            )
-
-                    st.markdown("**Per-channel per-wave greenery files**")
-                    for ch_label, ch_key in (
-                        ("Vegetation (GVI)", "veg"),
-                        ("Terrain (GVI class 9)", "terrain"),
-                        ("NDVI", "ndvi"),
-                    ):
-                        cc1, cc2 = st.columns([1, 3])
-                        with cc1:
-                            reuse_key = f"fusion_lon_{ch_key}_reuse"
-                            reuse = st.checkbox(
-                                "Same file all waves",
-                                value=st.session_state.get(reuse_key, False),
-                                key=reuse_key,
-                            )
-                        with cc2:
-                            raw_key = f"fusion_lon_{ch_key}_paths_raw"
-                            raw = st.text_input(
-                                ch_label,
-                                value=st.session_state.get(raw_key, ""),
-                                key=raw_key,
-                                placeholder=(
-                                    "single absolute path"
-                                    if reuse
-                                    else "abs/path/wave1.gpkg, abs/path/wave2.gpkg, ..."
-                                ),
-                            )
-                        if ch_key == "veg":
-                            lon_veg_paths_raw, lon_veg_reuse = raw, reuse
-                        elif ch_key == "terrain":
-                            lon_terrain_paths_raw, lon_terrain_reuse = raw, reuse
-                        else:
-                            lon_ndvi_paths_raw, lon_ndvi_reuse = raw, reuse
-
-                    mc1, mc2 = st.columns([1, 1])
-                    with mc1:
-                        lon_scoring_metric = st.selectbox(
-                            "MixedLM scoring metric (Optuna target)",
-                            options=[
-                                "mixedlm_tstat",
-                                "mixedlm_marginal_r2",
-                                "mixedlm_lr",
-                                "mixedlm_coef",
-                            ],
-                            index=0,
-                            key="fusion_lon_scoring_metric",
-                            help=(
-                                "Which MixedLM scorer Optuna optimises per "
-                                "trial. The other three are computed post-hoc "
-                                "on robust + top-20 % trials + the final "
-                                "averaged-composite parameters and written to "
-                                "`mixedlm_metrics.csv`. **`mixedlm_tstat`** is "
-                                "the default — |t-stat| of the greenery fixed "
-                                "effect, robust to outcome scale."
-                            ),
-                        )
-                    with mc2:
-                        lon_include_time_fixed = st.checkbox(
-                            "Include `years_since_baseline` as fixed effect",
-                            value=True,
-                            key="fusion_lon_include_time_fixed",
-                            help=(
-                                "Adds `+ years_since_baseline` to the fixed-"
-                                "effect design. Keep on unless you want any "
-                                "global temporal trend to load onto the "
-                                "greenery coefficient."
-                            ),
-                        )
-                        lon_random_slope = st.checkbox(
-                            "Random slope on time per entity",
-                            value=True,
-                            key="fusion_lon_random_slope",
-                            help=(
-                                "Switches the random-effects structure from "
-                                "`(1 | entity)` to `(1 + years_since_baseline | "
-                                "entity)`. Costs more fit iterations but lets "
-                                "each entity's trajectory have its own slope."
-                            ),
-                        )
-
-            col_cgi1, col_cgi2 = st.columns([1, 2])
-            with col_cgi1:
-                cgi_formula = st.selectbox(
-                    "CGI Formula",
-                    options=["weighted_average", "synergy"],
-                    index=0,
-                    help=(
-                        "**weighted_average** — three weights on min-max-"
-                        "normalized veg / terrain / NDVI (sum = 100). "
-                        "**synergy** — three-metric generalisation of Wang et "
-                        "al. 2026: seven weights (sum = 1) plus three powers "
-                        "on the main NDVI / Veg / Terrain terms only "
-                        "(interactions stay plain). The optimizer searches "
-                        "whichever parameter shape you pick."
-                    ),
-                    key="fusion_cgi_formula",
-                )
-            with col_cgi2:
-                if is_vector_target:
-                    objective_metric_now = st.session_state.get(
-                        "fusion_objective_metric", "pearson"
-                    )
-                    cov_help = (
-                        "Additional numeric attribute columns to **control for** "
-                        "when scoring the CGI's predictive power. With "
-                        "covariates the score becomes the greenery term's "
-                        "*partial* contribution (partial correlation, "
-                        "incremental R², or full-model RMSE depending on the "
-                        "objective metric). "
-                        "**`mutual_info` ignores covariates by design** — "
-                        "conditional MI is hard to estimate from binned data, "
-                        "so the score stays the raw greenery↔outcome MI "
-                        "regardless of what you pick here. Outcomes you "
-                        "already selected are filtered out (a column can't "
-                        "predict itself); duplicate selections are de-duplicated."
-                    )
-                    covariate_columns = st.multiselect(
-                        "Covariates (control variables)",
-                        options=available_covariates,
-                        default=[],
-                        help=cov_help,
-                        key="fusion_covariate_columns",
-                        disabled=not available_covariates,
-                    )
-                    if not available_covariates:
-                        st.caption(
-                            "_No numeric attribute columns available outside the "
-                            "chosen outcomes._"
-                        )
-                    if objective_metric_now == "mutual_info" and covariate_columns:
-                        st.caption(
-                            "ℹ️ The selected covariates will be **ignored** while "
-                            "the objective metric is `mutual_info`."
-                        )
-                else:
-                    covariate_columns = []
-                    st.caption(
-                        "_Covariates are only supported for vector targets — "
-                        "raster targets have no attribute table to draw from._"
-                    )
-
-            col_opt1, col_opt2 = st.columns(2)
-            with col_opt1:
-                objective_metric = st.selectbox(
-                    "Objective Metric",
-                    options=["pearson", "spearman", "r2", "rmse", "mutual_info"],
-                    index=0,
-                    help="Quantity maximized or minimized across CV folds.",
-                    key="fusion_objective_metric",
-                )
-                n_trials = st.number_input(
-                    "Total Trials",
-                    min_value=50,
-                    max_value=1000,
-                    value=300,
-                    step=50,
-                    help="Number of Optuna trials.",
-                    key="fusion_n_trials",
-                )
-                optimizer = st.selectbox(
-                    "Optimizer",
-                    options=["TPE", "CMA-ES", "Random"],
-                    index=0,
-                    help="Hyperparameter search sampler.",
-                    key="fusion_optimizer",
-                )
-
-            with col_opt2:
-                n_startup_trials = st.number_input(
-                    "Random Startup Trials",
-                    min_value=10,
-                    max_value=500,
-                    value=150,
-                    step=10,
-                    help="Uniformly random trials before the main sampler.",
-                    key="fusion_n_startup",
-                )
-                pruner_type = st.selectbox(
-                    "Pruner",
-                    options=["median", "hyperband", "successive_halving", "none"],
-                    index=0,
-                    help="Early stopping rule for unpromising trials.",
-                    key="fusion_pruner",
-                )
-                resume_existing_study = st.checkbox(
-                    "Resume previous study if exists",
-                    value=True,
-                    key="fusion_resume_study",
-                    help=(
-                        "When on, re-running with the same target + outcome + "
-                        "objective metric loads the existing SQLite study under "
-                        "output_results/fusion_studies/ and runs only the "
-                        "remaining trials. Turn off to start a fresh study."
-                    ),
-                )
-
-            col_split1, col_split2, col_split3 = st.columns(3)
-            with col_split1:
-                test_size = st.slider(
-                    "Test Set Size",
-                    min_value=0.1,
-                    max_value=0.5,
-                    value=0.3,
-                    step=0.05,
-                    help="Held-out evaluation fraction.",
-                    key="fusion_test_size",
-                )
-            with col_split2:
-                k_folds = st.number_input(
-                    "K-Fold CV",
-                    min_value=3,
-                    max_value=10,
-                    value=5,
-                    help="Cross-validation folds on the non-test subset.",
-                    key="fusion_k_folds",
-                )
-            with col_split3:
-                n_bins = st.number_input(
-                    "Stratification Bins",
-                    min_value=3,
-                    max_value=10,
-                    value=5,
-                    help="Quantile bins for stratified train/test split.",
-                    key="fusion_stratification_bins",
-                )
-
-            run_standalones = st.checkbox(
-                "Also optimize each metric on its own (NDVI / Vegetation / Terrain)",
-                value=False,
-                key="fusion_run_standalones",
-                help=(
-                    "Adds three single-metric Optuna studies alongside the "
-                    "combined CGI run, searching only its radius + aggregation. "
-                    "Reuses the same train/val/test split and the per-job "
-                    "pre-aggregation cache."
-                ),
-            )
-
+        study_state = _render_study_details_panel(
+            is_longitudinal=is_longitudinal,
+            available_covariates=available_covariates,
+        )
         st.divider()
         _fus_run_spacer, _fus_run_col = st.columns([2.2, 1])
         with _fus_run_col:
@@ -2599,12 +1923,22 @@ def render(output_dir: str) -> None:
                 key="fusion_form_run_submit",
             )
 
-    if metric_mode != "Auto-Download":
-        ndvi_auto_start = date(2023, 6, 1)
-        ndvi_auto_end = date(2023, 9, 30)
-        cache_metrics = False
-        ndvi_resolution_m = None
-        gvi_grid_spacing_m = None
+    # Pull study-state values into the legacy local names the submission
+    # block below still reads.
+    cgi_formula = study_state["cgi_formula"]
+    covariate_columns = study_state["covariate_columns"]
+    objective_metric = study_state["objective_metric"]
+    n_trials = study_state["n_trials"]
+    n_startup_trials = study_state["n_startup_trials"]
+    optimizer = study_state["optimizer"]
+    k_folds = study_state["k_folds"]
+    test_size = study_state["test_size"]
+    n_bins = study_state["n_bins"]
+    resume_existing_study = study_state["resume_existing_study"]
+    run_standalones = study_state["run_standalones"]
+    pruner_type = "none"  # UI removed; engine accepts NopPruner via "none"
+    lon_random_slope = study_state["mixedlm_random_slope"]
+    lon_include_time_fixed = study_state["mixedlm_time_fixed"]
 
     # =========================================================================
     # Run controls and progress
@@ -2644,6 +1978,7 @@ def render(output_dir: str) -> None:
                 st.rerun()
 
     if fusion_run_clicked:
+        # ── Basic validation ─────────────────────────────────────────────
         if not target_picked_path or not tmp_target_path:
             st.error("❌ Please upload a target file")
         elif is_vector_target and not target_outcome_columns:
@@ -2656,296 +1991,330 @@ def render(output_dir: str) -> None:
             st.error(
                 "❌ Each modality's minimum buffer must be less than or equal to its maximum buffer."
             )
+        elif not metric_state["coverage_complete"]:
+            for _err in metric_state["coverage_errors"]:
+                st.error(f"❌ {_err}")
         else:
-            if metric_mode == "Use Loaded Results" and not gvi_path and not ndvi_path:
-                st.error(
-                    "❌ No metrics selected. Please select GVI/NDVI results or "
-                    "switch to Auto-Download mode."
-                )
-            else:
-                fusion_multi_objective = (
-                    multi_objective_requested
-                    if is_vector_target and len(target_outcome_columns) > 1
-                    else False
-                )
-                with st.expander("Configuration Summary", expanded=True):
-                    st.write(f"**Target:** {target_display_name or 'unknown'}")
-                    if is_vector_target:
-                        st.write(
-                            "**Outcomes:** "
-                            + ", ".join(f"`{c}`" for c in target_outcome_columns)
+            # ── Build LongitudinalSpec (or None) ─────────────────────────
+            from geofuse.longitudinal import GREENERY_CHANNELS as _LON_CHANNELS
+            from geofuse.longitudinal import LongitudinalSpec as _LonSpec
+            from geofuse.longitudinal import validate_spec as _validate_lon_spec
+
+            def _per_wave_file_map(
+                channel_files: list[tuple[str, list]],
+            ) -> dict[str, str]:
+                """Flatten [(path, [waves])] to {wave: path}."""
+                out: dict[str, str] = {}
+                for fp, assigned in channel_files:
+                    for w in assigned:
+                        out[str(w)] = fp
+                return out
+
+            longitudinal_spec_payload: dict | None = None
+            veg_path: str | None = None
+            ndvi_path: str | None = None
+            spec_errs: list[str] = []
+
+            if is_longitudinal:
+                intake = opt_state["intake_mode"]
+                wave_labels = tuple(opt_state["discovered_waves"])
+                gvi_per_wave = _per_wave_file_map(metric_state["gvi_files"])
+                ndvi_per_wave = _per_wave_file_map(metric_state["ndvi_files"])
+                # GVI multi-band raster (or vector) fills both veg + terrain
+                # channels for each wave; the engine's per-channel loader
+                # picks the right band based on the channel name.
+                greenery_files = {
+                    "veg": dict(gvi_per_wave),
+                    "terrain": dict(gvi_per_wave),
+                    "ndvi": dict(ndvi_per_wave),
+                }
+                if intake == "wide":
+                    wide_files = opt_state["wide_files"]
+                    if len(wide_files) < 1:
+                        spec_errs.append(
+                            "Wide-mode longitudinal requires at least one per-wave file."
                         )
-                        if len(target_outcome_columns) > 1:
-                            st.write(
-                                "**Multi-objective optimization run:** "
-                                f"{'Yes' if fusion_multi_objective else 'No'} "
-                                "(joint optimization not available yet)"
+                    if wide_files:
+                        # Use the first file's column choices as canonical;
+                        # the runner reads each per-wave file as-is and the
+                        # engine joins on these names.
+                        canonical_entity = wide_files[0]["entity_col"]
+                        canonical_date = wide_files[0]["date_col"]
+                        mismatches = [
+                            wf["wave_label"]
+                            for wf in wide_files[1:]
+                            if wf["entity_col"] != canonical_entity
+                            or wf["date_col"] != canonical_date
+                        ]
+                        if mismatches:
+                            st.warning(
+                                "⚠️ Wide-mode files use mixed column names; "
+                                "first file's columns ({}, {}) are canonical. "
+                                "Mismatched waves: {}".format(
+                                    canonical_entity,
+                                    canonical_date,
+                                    ", ".join(mismatches),
+                                )
                             )
-                    else:
-                        st.write(
-                            "**Outcome band:** "
-                            f"{int(st.session_state.get('fusion_target_band', target_band))}"
-                        )
-                    st.write(
-                        f"**GVI buffers (m):** {gvi_buffer_min_m} – {gvi_buffer_max_m} "
-                        f"(step {gvi_buffer_step_m})"
-                    )
-                    st.write(
-                        f"**NDVI buffers (m):** {ndvi_buffer_min_m} – {ndvi_buffer_max_m} "
-                        f"(step {ndvi_buffer_step_m})"
-                    )
-                    st.write(f"**Extent padding (m):** {buffer_extent_m}")
-                    if ndvi_resolution_m is not None:
-                        st.write(f"**NDVI resolution (m):** {ndvi_resolution_m}")
-                    if gvi_grid_spacing_m is not None:
-                        st.write(f"**GVI grid spacing (m):** {gvi_grid_spacing_m}")
-                    st.write(
-                        f"**GVI Source:** "
-                        f"{'✓ ' + os.path.basename(gvi_path) if gvi_path else '📥 Auto-download'}"
-                    )
-                    st.write(
-                        f"**NDVI Source:** "
-                        f"{'✓ ' + os.path.basename(ndvi_path) if ndvi_path else '📥 Auto-download'}"
-                    )
-                    st.write(
-                        f"**Optimization:** {n_trials} trials, {k_folds}-fold CV, "
-                        f"{test_size*100:.0f}% test set"
-                    )
-
-                from services import get_job_executor, get_job_store
-
-                store = get_job_store()
-                executor = get_job_executor()
-
-                gvi_api_key = (
-                    (st.session_state.get("fusion_streetview_api_key") or None)
-                    if metric_mode == "Auto-Download"
-                    else None
-                )
-                ndvi_project_id = None
-                job_target_band = int(
-                    st.session_state.get("fusion_target_band", target_band)
-                )
-
-                # Persist the full re-runnable config so the fusion restart
-                # panel can resubmit a stopped job with identical settings.
-                # Temp paths (target_path, uploaded metric temp files) and the
-                # API key are intentionally omitted — re-upload / re-supply on
-                # restart. For metric files chosen from the output folder
-                # ("Use Loaded Results"), we store the basename + a flag and
-                # re-join against the current output_dir at restart time.
-                def _under_dir(path: str | None, base: str) -> bool:
-                    if not path:
-                        return False
-                    return os.path.dirname(os.path.abspath(path)).rstrip(
-                        os.sep
-                    ) == os.path.abspath(base).rstrip(os.sep)
-
-                target_geom_sha = (
-                    geometry_sha256(preview_vector_gdf)
-                    if is_vector_target and preview_vector_gdf is not None
-                    else None
-                )
-
-                # Assemble the longitudinal spec from the form inputs. Bail
-                # out with a UI error if validation fails so the submit
-                # button can't kick off an invalid run.
-                longitudinal_spec_payload: dict | None = None
-                if is_longitudinal:
-                    from geofuse.longitudinal import (
-                        GREENERY_CHANNELS as _LON_CHANNELS,
-                        LongitudinalSpec as _LonSpec,
-                        validate_spec as _validate_lon_spec,
-                    )
-
-                    def _split_csv(s: str) -> list[str]:
-                        return [p.strip() for p in (s or "").split(",") if p.strip()]
-
-                    wave_labels = tuple(_split_csv(lon_wave_labels_raw))
-
-                    def _per_wave_files(raw: str, reuse: bool) -> dict[str, str]:
-                        items = _split_csv(raw)
-                        if reuse and items:
-                            return {w: items[0] for w in wave_labels}
-                        return {w: p for w, p in zip(wave_labels, items)}
-
-                    target_files_per_wave: dict[str, str] = {}
-                    if lon_intake == "wide":
-                        wide_paths = _split_csv(lon_target_paths_raw)
                         target_files_per_wave = {
-                            w: p for w, p in zip(wave_labels, wide_paths)
+                            wf["wave_label"]: wf["path"] for wf in wide_files
                         }
+                        entity_id_col = canonical_entity
+                        date_col_eff = canonical_date
+                    else:
+                        target_files_per_wave = {}
+                        entity_id_col = ""
+                        date_col_eff = ""
+                    wave_col_eff: str | None = None
+                else:
+                    target_files_per_wave = {}
+                    entity_id_col = opt_state["entity_id_col"] or ""
+                    date_col_eff = opt_state["date_col"] or ""
+                    wave_col_eff = opt_state["wave_col"]
 
-                    _spec = _LonSpec(
-                        intake_mode=lon_intake,  # type: ignore[arg-type]
-                        entity_id_col=lon_entity_id_col,
-                        wave_labels=wave_labels,
-                        wave_col=lon_wave_col if lon_intake == "long" else None,
-                        date_col=lon_date_col or "measurement_date",
-                        greenery_files={
-                            "veg": _per_wave_files(lon_veg_paths_raw, lon_veg_reuse),
-                            "terrain": _per_wave_files(
-                                lon_terrain_paths_raw, lon_terrain_reuse
-                            ),
-                            "ndvi": _per_wave_files(
-                                lon_ndvi_paths_raw, lon_ndvi_reuse
-                            ),
-                        },
-                        target_files_per_wave=target_files_per_wave,
-                        scoring_metric=lon_scoring_metric,
-                        include_time_fixed_effect=lon_include_time_fixed,
-                        random_slope_time=lon_random_slope,
-                    )
-                    spec_errs = _validate_lon_spec(_spec)
-                    if spec_errs:
-                        st.error(
-                            "Mixed-effects spec is invalid:\n- "
-                            + "\n- ".join(spec_errs)
-                        )
-                        st.stop()
-                    longitudinal_spec_payload = _spec.to_payload()
-                    # Fingerprint every per-wave file so the restart panel
-                    # can detect drift (file moved, edited, or replaced) and
-                    # prompt the user to re-supply before resubmitting.
-                    _fps: dict[str, dict[str, str]] = {"target": {}, **{ch: {} for ch in _LON_CHANNELS}}
-                    for w, p in target_files_per_wave.items():
-                        _fps["target"][w] = file_size_mtime_fingerprint(p)
-                    for _ch in _LON_CHANNELS:
-                        for w, p in _spec.greenery_files[_ch].items():
-                            _fps[_ch][w] = file_size_mtime_fingerprint(p)
-                    longitudinal_spec_payload["__file_fingerprints__"] = _fps
-
-                fusion_record = store.submit(
-                    type="fusion",
-                    name=os.path.splitext(target_display_name)[0],
-                    params={
-                        "target_display_name": target_display_name,
-                        "is_vector_target": is_vector_target,
-                        "outcome_columns": list(target_outcome_columns),
-                        "target_band": job_target_band,
-                        "target_layer": target_layer_for_engine,
-                        "geometry_sha256": target_geom_sha,
-                        "n_trials": n_trials,
-                        "n_startup_trials": n_startup_trials,
-                        "objective_metric": objective_metric,
-                        "sampler_type": optimizer,
-                        "pruner_type": pruner_type,
-                        "multi_objective_requested": fusion_multi_objective,
-                        "resume_existing_study": resume_existing_study,
-                        # CGI formula + covariate columns persist into rec.params
-                        # so the restart panel can re-run with the same config.
-                        "cgi_formula": cgi_formula,
-                        "covariate_columns": list(covariate_columns or []),
-                        # Standalone single-metric studies, expanded from the
-                        # single UI checkbox into the explicit channel list the
-                        # runner expects. Empty list = CGI only.
-                        "standalone_channels": (
-                            ["veg", "terrain", "ndvi"] if run_standalones else []
-                        ),
-                        # Spatial / sampling config — recreates the same engine
-                        # build and pre-aggregation cache fingerprint on restart.
-                        "buffer_meters": float(buffer_extent_m),
-                        "gvi_buffer_min_m": float(gvi_buffer_min_m),
-                        "gvi_buffer_max_m": float(gvi_buffer_max_m),
-                        "gvi_buffer_step_m": float(gvi_buffer_step_m),
-                        "ndvi_buffer_min_m": float(ndvi_buffer_min_m),
-                        "ndvi_buffer_max_m": float(ndvi_buffer_max_m),
-                        "ndvi_buffer_step_m": float(ndvi_buffer_step_m),
-                        "ndvi_resolution_m": ndvi_resolution_m,
-                        "gvi_grid_spacing_m": gvi_grid_spacing_m,
-                        "n_bins": int(n_bins),
-                        "cache_metrics": bool(cache_metrics),
-                        "test_size": float(test_size),
-                        "k_folds": int(k_folds),
-                        "ndvi_start_date": ndvi_auto_start.isoformat(),
-                        "ndvi_end_date": ndvi_auto_end.isoformat(),
-                        # Metric source + how to re-resolve metric files on
-                        # restart. Temp uploads can't be re-resolved without
-                        # the original session; the restart panel asks the
-                        # user to re-upload in that case.
-                        "metric_mode": metric_mode,
-                        "gvi_basename": (
-                            os.path.basename(gvi_path) if gvi_path else None
-                        ),
-                        "ndvi_basename": (
-                            os.path.basename(ndvi_path) if ndvi_path else None
-                        ),
-                        "gvi_under_output_dir": _under_dir(gvi_path, output_dir),
-                        "ndvi_under_output_dir": _under_dir(ndvi_path, output_dir),
-                        "has_api_key": bool(gvi_api_key),
-                        # Absolute paths + size+mtime fingerprints so the
-                        # restart panel can silent-restart when nothing
-                        # moved or was edited, and show a per-file drift
-                        # prompt otherwise.
-                        "target_path": tmp_target_path,
-                        "target_fingerprint": file_size_mtime_fingerprint(
-                            tmp_target_path
-                        ),
-                        "gvi_path": gvi_path,
-                        "gvi_fingerprint": file_size_mtime_fingerprint(gvi_path),
-                        "ndvi_path": ndvi_path,
-                        "ndvi_fingerprint": file_size_mtime_fingerprint(ndvi_path),
-                        # Mixed-effects / longitudinal spec persists as a
-                        # plain-dict payload so the restart panel can rebuild
-                        # the spec identically without re-prompting.
-                        "longitudinal_spec_payload": longitudinal_spec_payload,
-                    },
+                spec = _LonSpec(
+                    intake_mode=intake,  # type: ignore[arg-type]
+                    entity_id_col=entity_id_col,
+                    wave_labels=wave_labels,
+                    wave_col=wave_col_eff,
+                    date_col=date_col_eff or "measurement_date",
+                    greenery_files=greenery_files,
+                    target_files_per_wave=target_files_per_wave,
+                    scoring_metric=objective_metric,
+                    include_time_fixed_effect=lon_include_time_fixed,
+                    random_slope_time=lon_random_slope,
+                    derive_wave_from_date=False,
                 )
-                executor.submit_runner(
-                    fusion_record,
-                    run_fusion,
-                    target_path=tmp_target_path,
-                    target_features_geojson=(
-                        tuple(target_outcome_columns) if is_vector_target else ()
-                    ),
-                    target_band=job_target_band if is_raster_target else 1,
-                    target_layer=(
-                        target_layer_for_engine if is_vector_target else None
-                    ),
-                    target_cleanup_dir=(target_mat.cleanup_dir if target_mat else None),
-                    target_cleanup_file=(
-                        target_mat.cleanup_file if target_mat else None
-                    ),
-                    buffer_meters=buffer_extent_m,
-                    gvi_buffer_min_m=gvi_buffer_min_m,
-                    gvi_buffer_max_m=gvi_buffer_max_m,
-                    gvi_buffer_step_m=gvi_buffer_step_m,
-                    ndvi_buffer_min_m=ndvi_buffer_min_m,
-                    ndvi_buffer_max_m=ndvi_buffer_max_m,
-                    ndvi_buffer_step_m=ndvi_buffer_step_m,
-                    ndvi_resolution_m=ndvi_resolution_m,
-                    gvi_grid_spacing_m=gvi_grid_spacing_m,
-                    n_bins=n_bins,
-                    veg_path=gvi_path,
-                    terrain_path=None,
-                    ndvi_path=ndvi_path,
-                    cache_metrics=cache_metrics,
-                    test_size=test_size,
-                    k_folds=k_folds,
-                    n_trials=n_trials,
-                    n_startup_trials=n_startup_trials,
-                    objective_metric=objective_metric,
-                    pruner_type=pruner_type,
-                    sampler_type=optimizer,
-                    gvi_api_key=gvi_api_key,
-                    ndvi_start_date=ndvi_auto_start.isoformat(),
-                    ndvi_end_date=ndvi_auto_end.isoformat(),
-                    ndvi_project_id=ndvi_project_id,
-                    multi_objective_requested=fusion_multi_objective,
-                    output_dir=output_dir,
-                    MetricFusionEngine=MetricFusionEngine,
-                    target_display_name=target_display_name,
-                    resume_existing_study=resume_existing_study,
-                    cgi_formula=cgi_formula,
-                    covariate_columns=list(covariate_columns or []),
-                    standalone_channels=(
+                spec_errs += _validate_lon_spec(spec)
+                if spec_errs:
+                    st.error(
+                        "Mixed-effects spec is invalid:\n- " + "\n- ".join(spec_errs)
+                    )
+                    st.stop()
+                longitudinal_spec_payload = spec.to_payload()
+
+            elif opt_state["cross_sectional_date_on"]:
+                # Year-aware cross-sectional: same per-wave cache pipeline
+                # as longitudinal, but with an OLS scoring metric and a
+                # synthesised entity/year column derived in the runner.
+                wave_labels = tuple(opt_state["discovered_waves"])
+                gvi_per_wave = _per_wave_file_map(metric_state["gvi_files"])
+                ndvi_per_wave = _per_wave_file_map(metric_state["ndvi_files"])
+                greenery_files = {
+                    "veg": dict(gvi_per_wave),
+                    "terrain": dict(gvi_per_wave),
+                    "ndvi": dict(ndvi_per_wave),
+                }
+                spec = _LonSpec(
+                    intake_mode="long",  # type: ignore[arg-type]
+                    entity_id_col="_gf_entity",
+                    wave_labels=wave_labels,
+                    wave_col="_gf_year",
+                    date_col=opt_state["date_col"] or "",
+                    greenery_files=greenery_files,
+                    target_files_per_wave={},
+                    scoring_metric=objective_metric,
+                    derive_wave_from_date=True,
+                )
+                spec_errs = _validate_lon_spec(spec)
+                if spec_errs:
+                    st.error(
+                        "Year-aware cross-sectional spec is invalid:\n- "
+                        + "\n- ".join(spec_errs)
+                    )
+                    st.stop()
+                longitudinal_spec_payload = spec.to_payload()
+
+            else:
+                # Plain cross-sectional: one file per channel goes directly
+                # to the runner's veg_path / ndvi_path; no spec.
+                if metric_state["gvi_files"]:
+                    veg_path = metric_state["gvi_files"][0][0]
+                if metric_state["ndvi_files"]:
+                    ndvi_path = metric_state["ndvi_files"][0][0]
+
+            # ── Configuration summary ───────────────────────────────────
+            fusion_multi_objective = (
+                multi_objective_requested
+                if is_vector_target and len(target_outcome_columns) > 1
+                else False
+            )
+            with st.expander("Configuration Summary", expanded=True):
+                st.write(f"**Target:** {target_display_name or 'unknown'}")
+                if is_vector_target:
+                    st.write(
+                        "**Outcomes:** "
+                        + ", ".join(f"`{c}`" for c in target_outcome_columns)
+                    )
+                    if len(target_outcome_columns) > 1:
+                        st.write(
+                            "**Multi-objective optimization run:** "
+                            f"{'Yes' if fusion_multi_objective else 'No'} "
+                            "(joint optimization not available yet)"
+                        )
+                else:
+                    st.write(
+                        "**Outcome band:** "
+                        f"{int(st.session_state.get('fusion_target_band', target_band))}"
+                    )
+                st.write(
+                    f"**Run mode:** {opt_state['run_mode']}"
+                    + (
+                        f" · intake = `{opt_state['intake_mode']}`"
+                        if is_longitudinal
+                        else ""
+                    )
+                )
+                if opt_state["discovered_waves"]:
+                    st.write(
+                        "**Discovered years / waves:** "
+                        + ", ".join(f"`{w}`" for w in opt_state["discovered_waves"])
+                    )
+                st.write(
+                    f"**GVI buffers (m):** {gvi_buffer_min_m} – {gvi_buffer_max_m} "
+                    f"(step {gvi_buffer_step_m})"
+                )
+                st.write(
+                    f"**NDVI buffers (m):** {ndvi_buffer_min_m} – {ndvi_buffer_max_m} "
+                    f"(step {ndvi_buffer_step_m})"
+                )
+                st.write(f"**Extent padding (m):** {buffer_extent_m}")
+                st.write(
+                    f"**Optimization:** {n_trials} trials, "
+                    f"{f'{k_folds}-fold CV' if k_folds > 1 else 'single split (no CV)'}, "
+                    f"{test_size*100:.0f}% test set"
+                )
+
+            from services import get_job_executor, get_job_store
+
+            store = get_job_store()
+            executor = get_job_executor()
+
+            job_target_band = int(
+                st.session_state.get("fusion_target_band", target_band)
+            )
+            target_geom_sha = (
+                geometry_sha256(preview_vector_gdf)
+                if is_vector_target and preview_vector_gdf is not None
+                else None
+            )
+
+            fusion_record = store.submit(
+                type="fusion",
+                name=os.path.splitext(target_display_name)[0],
+                params={
+                    "target_display_name": target_display_name,
+                    "is_vector_target": is_vector_target,
+                    "outcome_columns": list(target_outcome_columns),
+                    "target_band": job_target_band,
+                    "target_layer": target_layer_for_engine,
+                    "geometry_sha256": target_geom_sha,
+                    "n_trials": n_trials,
+                    "n_startup_trials": n_startup_trials,
+                    "objective_metric": objective_metric,
+                    "sampler_type": optimizer,
+                    "pruner_type": pruner_type,
+                    "multi_objective_requested": fusion_multi_objective,
+                    "resume_existing_study": resume_existing_study,
+                    "cgi_formula": cgi_formula,
+                    "covariate_columns": list(covariate_columns or []),
+                    "standalone_channels": (
                         ["veg", "terrain", "ndvi"] if run_standalones else []
                     ),
-                    longitudinal_spec_payload=longitudinal_spec_payload,
+                    "buffer_meters": float(buffer_extent_m),
+                    "gvi_buffer_min_m": float(gvi_buffer_min_m),
+                    "gvi_buffer_max_m": float(gvi_buffer_max_m),
+                    "gvi_buffer_step_m": float(gvi_buffer_step_m),
+                    "ndvi_buffer_min_m": float(ndvi_buffer_min_m),
+                    "ndvi_buffer_max_m": float(ndvi_buffer_max_m),
+                    "ndvi_buffer_step_m": float(ndvi_buffer_step_m),
+                    "ndvi_resolution_m": ndvi_resolution_m,
+                    "gvi_grid_spacing_m": gvi_grid_spacing_m,
+                    "n_bins": int(n_bins),
+                    "cache_metrics": bool(cache_metrics),
+                    "test_size": float(test_size),
+                    "k_folds": int(k_folds),
+                    "ndvi_start_date": ndvi_auto_start.isoformat(),
+                    "ndvi_end_date": ndvi_auto_end.isoformat(),
+                    "target_path": tmp_target_path,
+                    "target_fingerprint": file_size_mtime_fingerprint(tmp_target_path),
+                    # Canonical metric paths persisted under the UI-side
+                    # names (``gvi_*`` / ``ndvi_*``); the runner reads them
+                    # as ``veg_path`` / ``ndvi_path`` (legacy naming).
+                    "gvi_path": veg_path,
+                    "gvi_fingerprint": file_size_mtime_fingerprint(veg_path),
+                    "ndvi_path": ndvi_path,
+                    "ndvi_fingerprint": file_size_mtime_fingerprint(ndvi_path),
+                    "has_api_key": False,
+                    "metric_mode": "Upload Files",
+                    "longitudinal_spec_payload": longitudinal_spec_payload,
+                },
+            )
+            # Attach per-wave file fingerprints to the spec payload so the
+            # restart panel can detect drift on individual per-wave files.
+            if longitudinal_spec_payload is not None:
+                _fps: dict[str, dict[str, str]] = {
+                    "target": {},
+                    "veg": {},
+                    "terrain": {},
+                    "ndvi": {},
+                }
+                for _w, _p in (
+                    longitudinal_spec_payload.get("target_files_per_wave") or {}
+                ).items():
+                    _fps["target"][_w] = file_size_mtime_fingerprint(_p)
+                for _ch in ("veg", "terrain", "ndvi"):
+                    for _w, _p in (
+                        longitudinal_spec_payload.get("greenery_files", {}).get(_ch)
+                        or {}
+                    ).items():
+                        _fps[_ch][_w] = file_size_mtime_fingerprint(_p)
+                fusion_record.params.setdefault(
+                    "longitudinal_spec_payload", longitudinal_spec_payload
                 )
+                fusion_record.params["longitudinal_spec_payload"][
+                    "__file_fingerprints__"
+                ] = _fps
+            executor.submit_runner(
+                fusion_record,
+                run_fusion,
+                target_path=tmp_target_path,
+                target_features_geojson=(
+                    tuple(target_outcome_columns) if is_vector_target else ()
+                ),
+                target_band=job_target_band if is_raster_target else 1,
+                target_layer=(target_layer_for_engine if is_vector_target else None),
+                target_cleanup_dir=(target_mat.cleanup_dir if target_mat else None),
+                target_cleanup_file=(target_mat.cleanup_file if target_mat else None),
+                buffer_meters=buffer_extent_m,
+                gvi_buffer_min_m=gvi_buffer_min_m,
+                gvi_buffer_max_m=gvi_buffer_max_m,
+                gvi_buffer_step_m=gvi_buffer_step_m,
+                ndvi_buffer_min_m=ndvi_buffer_min_m,
+                ndvi_buffer_max_m=ndvi_buffer_max_m,
+                ndvi_buffer_step_m=ndvi_buffer_step_m,
+                n_bins=n_bins,
+                veg_path=veg_path,
+                ndvi_path=ndvi_path,
+                test_size=test_size,
+                k_folds=k_folds,
+                n_trials=n_trials,
+                n_startup_trials=n_startup_trials,
+                objective_metric=objective_metric,
+                sampler_type=optimizer,
+                output_dir=output_dir,
+                MetricFusionEngine=MetricFusionEngine,
+                target_display_name=target_display_name,
+                resume_existing_study=resume_existing_study,
+                cgi_formula=cgi_formula,
+                covariate_columns=list(covariate_columns or []),
+                standalone_channels=(
+                    ["veg", "terrain", "ndvi"] if run_standalones else []
+                ),
+                longitudinal_spec_payload=longitudinal_spec_payload,
+            )
 
-                st.success("✅ Fusion job started! Check sidebar for progress.")
-
+            st.success("✅ Fusion job started! Check sidebar for progress.")
     # Pull completed fusion results from the JobStore into session state for display.
     from services import get_job_store as _get_fusion_store
 
@@ -3282,9 +2651,7 @@ def render(output_dir: str) -> None:
             #                   ``mixedlm_metrics__<outcome>__<channel>.csv``
             # Show one tab per available file so users can compare studies.
             try:
-                _study_root = os.path.join(
-                    output_dir, "fusion", "study_results"
-                )
+                _study_root = os.path.join(output_dir, "fusion", "study_results")
                 _active_label = (
                     st.session_state.get("fusion_results_outcome_pick")
                     if results.get("mode") == "multi"
@@ -3312,9 +2679,7 @@ def render(output_dir: str) -> None:
 
                 if _csv_paths:
                     st.divider()
-                    st.markdown(
-                        "**Mixed-effects: all metrics across trial pools**"
-                    )
+                    st.markdown("**Mixed-effects: all metrics across trial pools**")
                     st.caption(
                         "Each pool's per-trial rows are followed by "
                         "`__mean__`, `__ci_lo__`, `__ci_hi__`, and `__n__` "
@@ -3339,8 +2704,6 @@ def render(output_dir: str) -> None:
                     for _tab, _path in zip(_tabs, _csv_paths):
                         with _tab:
                             st.caption(f"Source: `{_path}`")
-                            st.dataframe(
-                                pd.read_csv(_path), use_container_width=True
-                            )
+                            st.dataframe(pd.read_csv(_path), use_container_width=True)
             except Exception as _exc:  # pragma: no cover -- UI-only guard
                 st.warning(f"Could not read mixedlm_metrics CSVs: {_exc}")

@@ -681,6 +681,51 @@ class MetricFusionEngine:
                 logger.debug(f"Failed to load as multi-band GVI: {e}")
                 return False
 
+        _VEG_COLUMN_ALIASES = ("gvi_veg", "gvi", "veg", "vegetation")
+        _TER_COLUMN_ALIASES = ("gvi_ter", "gvi_terrain", "terrain")
+
+        def load_combined_gvi_vector(filepath: str) -> bool:
+            """Split a single GVI vector file carrying both veg + terrain columns.
+
+            The GVI engine writes its GeoPackage with both ``gvi_veg`` and
+            ``gvi_ter`` columns in one file (see :func:`geofuse.gvi._make_result`);
+            uploading just that file as ``veg_file`` should populate both
+            ``self.veg_data`` and ``self.terrain_data``. Returns True if a
+            split was performed, False otherwise (caller falls back to the
+            single-column path).
+            """
+            try:
+                gdf = gpd.read_file(filepath)
+            except Exception as exc:
+                logger.debug(f"Failed to read combined GVI vector: {exc}")
+                return False
+            lowered = {c.lower(): c for c in gdf.columns}
+            veg_col = next(
+                (lowered[a] for a in _VEG_COLUMN_ALIASES if a in lowered), None
+            )
+            ter_col = next(
+                (lowered[a] for a in _TER_COLUMN_ALIASES if a in lowered), None
+            )
+            if not (veg_col and ter_col):
+                return False
+            if gdf.crs is None:
+                gdf.set_crs("EPSG:4326", inplace=True)
+            gdf = normalize_geographic_gdf_to_wgs84(gdf)
+            veg_gdf = gdf[["geometry", veg_col]].rename(columns={veg_col: "veg"}).copy()
+            veg_gdf = veg_gdf.dropna(subset=["veg"])
+            veg_gdf.attrs["metric_column"] = "veg"
+            ter_gdf = gdf[["geometry", ter_col]].rename(columns={ter_col: "terrain"}).copy()
+            ter_gdf = ter_gdf.dropna(subset=["terrain"])
+            ter_gdf.attrs["metric_column"] = "terrain"
+            self.veg_data = veg_gdf
+            self.terrain_data = ter_gdf
+            logger.info(
+                f"✓ Split combined GVI vector ({filepath}): "
+                f"{len(veg_gdf):,} veg samples (column {veg_col!r}), "
+                f"{len(ter_gdf):,} terrain samples (column {ter_col!r})."
+            )
+            return True
+
         # Load or Auto-download Vegetation and Terrain
 
         # Check if uploaded veg_file is a multi-band raster
@@ -706,6 +751,16 @@ class MetricFusionEngine:
                         cancel_callback=cancel_callback,
                     )
                     self.terrain_data = self._load_metric_file(terrain_file)
+        # Check if uploaded veg_file is a combined GVI vector
+        # (single GeoPackage / GeoJSON with both ``gvi_veg`` and ``gvi_ter``
+        # columns — the default shape produced by ``geofuse.gvi``).
+        elif (
+            veg_file
+            and os.path.exists(veg_file)
+            and not terrain_file
+            and load_combined_gvi_vector(veg_file)
+        ):
+            pass
         # Check cached multi-band file
         elif os.path.exists(gvi_multiband_cache):
             if load_multiband_gvi(gvi_multiband_cache):
