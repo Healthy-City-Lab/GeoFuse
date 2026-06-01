@@ -70,9 +70,7 @@ CROSS_SECTIONAL_METRICS: tuple[str, ...] = (
     "rmse",
     "mutual_info",
 )
-SUPPORTED_SCORING_METRICS: tuple[str, ...] = (
-    MIXEDLM_METRICS + CROSS_SECTIONAL_METRICS
-)
+SUPPORTED_SCORING_METRICS: tuple[str, ...] = MIXEDLM_METRICS + CROSS_SECTIONAL_METRICS
 
 # Channels that participate in the per-wave greenery file assignment. Terrain
 # is GVI Cityscapes class 9 (horizontal flat greenery), not DEM; it varies
@@ -177,17 +175,13 @@ class LongitudinalSpec:
                 ch: dict(per_wave)
                 for ch, per_wave in (payload.get("greenery_files") or {}).items()
             },
-            target_files_per_wave=dict(
-                payload.get("target_files_per_wave") or {}
-            ),
+            target_files_per_wave=dict(payload.get("target_files_per_wave") or {}),
             include_time_fixed_effect=bool(
                 payload.get("include_time_fixed_effect", True)
             ),
             random_slope_time=bool(payload.get("random_slope_time", True)),
             scoring_metric=payload.get("scoring_metric", DEFAULT_MIXEDLM_METRIC),
-            derive_wave_from_date=bool(
-                payload.get("derive_wave_from_date", False)
-            ),
+            derive_wave_from_date=bool(payload.get("derive_wave_from_date", False)),
         )
 
 

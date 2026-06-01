@@ -52,11 +52,11 @@
 ## 3. Metric Fusion & Optimization
 
 * **Automated Metric Alignment**: Auto-downloads and spatially aligns GVI (vegetation/terrain) and NDVI within your study area when pre-computed files are not provided.
-* **Dual Input Support**: Works with **point-based** targets (GeoJSON with health/environmental data) and **raster-based** targets (GeoTIFF continuous surfaces).
+* **Dual Input Support**: Works with **point-based** targets (GeoJSON with health/environmental data), **polygon-based** targets (e.g. census-tract or neighbourhood outcomes — scored via per-pixel CGI averaged inside each polygon, with a user-tunable grid pixel size, an opt-in whole-grid scaling toggle, and an opt-in area-balanced stratified split), and **raster-based** targets (GeoTIFF continuous surfaces).
 * **Mandatory Spatial Pre-processing**: Before optimization, every sample entity's metric values are pre-aggregated across all buffer radii in the ladder and all statistics (mean + p10–p90) for each channel, into a per-job SQLite cache (`output_results/fusion_cache/preaggr/`). Each Optuna trial then reads a single indexed column instead of recomputing buffer aggregations. The build runs first, reports entities-processed progress, supports both vector and raster metrics, and is **resumable** (survives cancels/crashes) and **reused** across runs with identical inputs.
 * **Pluggable CGI Formula**: Pick the composite formulation in the UI; the optimizer searches that formula's parameters.
   * **Weighted average** (default, legacy): three weights (Vegetation / Terrain / NDVI) summing to 100%.
-  * **Synergy** (three-metric generalisation of Wang et al. 2026, doi:10.3390/rs18010009): seven weights (same int 0–100 scale as weighted-average so post-hoc weight-vs-association analyses pool both formulas) plus three powers on the main NDVI / Veg / Terrain terms only (interaction products stay plain); powers chosen on the {0.2..1.0} step-0.1 grid.
+  * **Synergy** (three-metric generalisation of Wang et al. 2026, doi:10.3390/rs18010009): seven weights (same int 0–100 scale as weighted-average so post-hoc weight-vs-association analyses pool both formulas) plus three powers on the main NDVI / Vegetation / Terrain terms only (interaction products stay plain); powers chosen on the {0.2..1.0} step-0.1 grid.
 * **Bayesian Optimization**: Uses **Optuna** (TPE sampler) to optimize the CGI formula's parameters plus:
   * **Spatial Aggregation**: Circular buffer radii (100m to user-defined max, step = 50m)
   * **Statistical Functions**: Mean, median, or percentile-based aggregation
@@ -68,11 +68,17 @@
 * **Robust Cross-Validation**:
   * Stratified K-Fold CV ensures representative sampling across the target distribution.
   * Toggle CV on/off — when off, each trial fits one model on a single stratified train/val split (~k× faster per trial; per-fold variance is no longer available).
-  * 20 %–50 % held-out test set for final validation (configurable).
+  * Independent **Test set size** + **Validation set size** sliders (both as fractions of the whole dataset; defaults 0.25 / 0.25) — sliders update live so train / val / test always sum visibly.
   * Benjamini-Hochberg FDR correction for correlation-based metrics; consistency-based filter for the others.
 * **Multi-Metric Objectives**: A single mode-aware **Objective metric** dropdown picks one of Pearson, Spearman, R², RMSE, Mutual Information for cross-sectional runs, or one of the four `mixedlm_*` metrics for longitudinal runs. The four MixedLM metrics are also computed post-hoc on robust + top trials in mixed-effects mode (`mixedlm_metrics.csv`).
-* **Comprehensive Reporting**: Optuna visualization suite (history, parameter importance, parallel coordinates, contour plots, EDF, slice plots, timeline) for both robust and all-trials analyses.
-* **Composite Map**: Ensemble-averaged parameters from the top 20% of robust trials generate a grid-aligned GeoTIFF composite greenery raster.
+* **Per-Subset Score Caching**: After optimisation, the runner scores the averaged top-20% params on every data subset (train / val / test / all) for the CGI study and each standalone, and caches `{score, pvalue, n}` per (study, subset) on the result bundle. The results UI reads from the cache so re-rendering is free.
+* **Per-Trial Test Scoring**: Each robust trial (CGI + standalones) gets its test score recorded back into `user_attrs` after the search ends, so the **Per-trial objective distributions** box plot can show test CIs alongside train / val. Test feedback never enters the search itself.
+* **Covariate Impact Reporting**: When covariates are set, the engine fits `target ~ CGI + covariates` vs `target ~ CGI` on the full dataset using the averaged top-20% params and reports per-covariate coefficient, t-stat, p-value, direction, and partial R², plus the lift in full-model R² over CGI-only. Surfaced as a dedicated panel in the results section.
+* **Comprehensive Reporting**: Live, interactive Optuna visualisation viewer in the results panel — pick any of history, parameter importance, parallel coordinates, slice, contour, rank, EDF, or timeline; filter trials (all completed vs robust); choose axes for plots that take param picks.
+* **Composite Map**: Ensemble-averaged parameters from the top 20 % of robust trials generate a grid-aligned GeoTIFF composite greenery raster (CGI + per-standalone). All composite TIFFs are min-max normalised to `[0, 1]`. The results panel includes a side-by-side viewer that draws the target outcome + selected composite TIFFs as subplots at 300 dpi with a shared `[0, 1]` colorbar.
+* **Per-Job Output Folder**: Every run writes its artefacts to `output_results/fusion/<timestamp>__<short_job_id>/` so reruns don't overwrite earlier outputs.
+* **Study Persistence Safety**: Each Optuna study's SQLite filename is content-addressed via a config fingerprint covering buffer ladders, CGI formula, covariates, scaling toggles, split sizes, and k-fold count. A config change starts a brand-new study so out-of-range trials from the previous config can't contaminate the new search.
+* **Load Results On Demand**: Completed fusion jobs in the sidebar Job Monitor expose a **Load results** button that hydrates the results panel from that job's bundle. The results panel is independent of the configuration form, so it survives page refreshes and renders without any active study setup.
 * **Intelligent Caching**: Deterministic filenames allow reuse of downloaded metrics for identical study areas.
 
 ---

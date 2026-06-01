@@ -547,14 +547,72 @@ def _build_fusion_study_name(
     label: str,
     objective_metric: str,
     suffix: str = "",
+    *,
+    config_fingerprint: str | None = None,
 ) -> str:
-    """Filesystem-safe Optuna ``study_name`` (also the SQLite filename stem)."""
+    """Filesystem-safe Optuna ``study_name`` (also the SQLite filename stem).
+
+    ``config_fingerprint`` lets the caller bake an arbitrary short hash
+    of the run config (buffer ladders, CGI formula, covariates, …) into
+    the name so a config change starts a brand-new study instead of
+    silently appending trials to the previous study's SQLite file.
+    Without the fingerprint, e.g. a buffer-max change from 800 m to
+    1500 m would mix old long-radius trials into the new pool and the
+    rerun's reports / robust trials would be contaminated.
+    """
     stem = os.path.splitext(target_display_name or "target")[0]
     parts = [stem, str(label), objective_metric]
+    if config_fingerprint:
+        parts.append(config_fingerprint)
     if suffix:
         parts.append(suffix)
     raw = "__".join(parts)
     return _STUDY_NAME_UNSAFE.sub("_", raw).strip("_") or "fusion_study"
+
+
+def _fusion_config_fingerprint(
+    *,
+    buffer_meters: float,
+    gvi_buffer_min_m: float,
+    gvi_buffer_max_m: float,
+    gvi_buffer_step_m: float,
+    ndvi_buffer_min_m: float,
+    ndvi_buffer_max_m: float,
+    ndvi_buffer_step_m: float,
+    cgi_formula: str,
+    covariate_columns: list[str] | None,
+    whole_grid_scaling: bool,
+    cgi_grid_spacing_m: float | None,
+    area_balanced_split: bool,
+    test_size: float,
+    val_size: float,
+    k_folds: int,
+) -> str:
+    """8-char hex hash of every setting that changes Optuna's search space.
+
+    Anything that affects which params are suggested or which entities
+    are sampled lives here. Anything purely cosmetic (sampler choice,
+    standalone toggle, trial count) is excluded so swapping samplers
+    or extending the trial budget doesn't fragment the study DB.
+    """
+    import hashlib as _hl
+
+    payload = "|".join(
+        [
+            f"bm:{buffer_meters:.1f}",
+            f"gvi:{gvi_buffer_min_m:.1f}-{gvi_buffer_max_m:.1f}@{gvi_buffer_step_m:.1f}",
+            f"ndvi:{ndvi_buffer_min_m:.1f}-{ndvi_buffer_max_m:.1f}@{ndvi_buffer_step_m:.1f}",
+            f"fmla:{cgi_formula}",
+            f"cov:{','.join(sorted(covariate_columns or []))}",
+            f"wg:{int(whole_grid_scaling)}",
+            f"grid:{cgi_grid_spacing_m if cgi_grid_spacing_m is not None else 'na'}",
+            f"ab:{int(area_balanced_split)}",
+            f"ts:{test_size:.3f}",
+            f"vs:{val_size:.3f}",
+            f"k:{k_folds}",
+        ]
+    )
+    return _hl.sha256(payload.encode()).hexdigest()[:8]
 
 
 # Ordered pipeline steps a fusion run moves through per target outcome. The
@@ -572,6 +630,7 @@ _FUSION_STAGE_STEPS: tuple[tuple[str, str], ...] = (
     ("robust", "Filter robust trials"),
     ("evaluate", "Evaluate on test"),
     ("apply", "Apply fusion weights"),
+    ("reports", "Generate reports and composite map"),
 )
 
 # Mixed-effects fusion inserts an extra step before pre-aggregation: load
@@ -669,6 +728,168 @@ def _resolve_longitudinal_spec(
     return LongitudinalSpec.from_payload(payload)
 
 
+def _write_split_scores_csv(
+    *,
+    engine,
+    label: str,
+    multi_outcome: bool,
+    output_dir: str,
+    objective_metric: str,
+    best_value: float | None,
+    best_params: dict | None,
+    averaged_params: dict | None,
+    test_results: dict,
+    log,
+) -> None:
+    """Persist per-split objective scores for the best + averaged params.
+
+    Writes ``split_scores.csv`` (or ``split_scores__<label>.csv`` for
+    multi-outcome runs) with one row per param-source × split:
+
+    - ``best`` — the single best trial's params (the row with the highest
+      CV val score).
+    - ``averaged_top20`` — the ensemble-averaged params from the top 20 %
+      of robust trials. These are the canonical "final" params and the
+      ones the composite GeoTIFF is built from.
+
+    Splits:
+
+    - ``cv_train_mean`` — mean per-fold train score (CV).
+    - ``cv_val_mean`` — mean per-fold val score; this is what Optuna's
+      objective value reports.
+    - ``test`` — score on the held-out test set.
+
+    For ``averaged_top20`` the CV-time scores are derived by averaging the
+    top-20 % trials' own per-trial CV means (the natural extension of how
+    the params were averaged). ``test`` is recomputed by calling
+    ``evaluate_on_test`` with the averaged params.
+    """
+    import csv
+
+    import numpy as np
+    import optuna as _optuna
+
+    rows: list[dict] = []
+
+    study = getattr(engine, "study", None)
+    best_trial = study.best_trial if study is not None else None
+    best_train = (
+        float(best_trial.user_attrs.get("train_score_mean"))
+        if best_trial is not None
+        and best_trial.user_attrs.get("train_score_mean") is not None
+        else None
+    )
+    best_val_csv = float(best_value) if best_value is not None else None
+    best_test = (
+        float(test_results.get("test_score"))
+        if test_results is not None and test_results.get("test_score") is not None
+        else None
+    )
+    rows.append(
+        {
+            "params_source": "best",
+            "split": "cv_train_mean",
+            "metric": objective_metric,
+            "score": best_train if best_train is not None else "",
+        }
+    )
+    rows.append(
+        {
+            "params_source": "best",
+            "split": "cv_val_mean",
+            "metric": objective_metric,
+            "score": best_val_csv if best_val_csv is not None else "",
+        }
+    )
+    rows.append(
+        {
+            "params_source": "best",
+            "split": "test",
+            "metric": objective_metric,
+            "score": best_test if best_test is not None else "",
+        }
+    )
+
+    if averaged_params is not None and study is not None:
+        try:
+            robust = engine.get_robust_trials(
+                method="auto", p_threshold=0.05, tolerance=0.1, min_trials=10
+            )
+        except Exception:
+            robust = []
+        if not robust:
+            robust = [
+                t for t in study.trials if t.state == _optuna.trial.TrialState.COMPLETE
+            ]
+        n_top = max(1, int(len(robust) * 0.2))
+        top_trials = sorted(
+            robust,
+            key=lambda t: t.value if t.value is not None else float("nan"),
+            reverse=(study.direction.name == "MAXIMIZE"),
+        )[:n_top]
+        top_train_means = [
+            float(t.user_attrs.get("train_score_mean"))
+            for t in top_trials
+            if t.user_attrs.get("train_score_mean") is not None
+        ]
+        top_val_means = [
+            float(t.user_attrs.get("val_score_mean"))
+            for t in top_trials
+            if t.user_attrs.get("val_score_mean") is not None
+        ]
+        avg_train = float(np.mean(top_train_means)) if top_train_means else None
+        avg_val = float(np.mean(top_val_means)) if top_val_means else None
+
+        clean_avg = {k: v for k, v in averaged_params.items() if not k.startswith("__")}
+        try:
+            avg_test_result = engine.evaluate_on_test(
+                params=clean_avg, metric=objective_metric
+            )
+            avg_test = float(avg_test_result.get("test_score"))
+        except Exception as exc:
+            log(
+                "WARN",
+                f"[{label}] Test scoring for averaged params failed: {exc}",
+            )
+            avg_test = None
+
+        rows.append(
+            {
+                "params_source": "averaged_top20",
+                "split": "cv_train_mean",
+                "metric": objective_metric,
+                "score": avg_train if avg_train is not None else "",
+            }
+        )
+        rows.append(
+            {
+                "params_source": "averaged_top20",
+                "split": "cv_val_mean",
+                "metric": objective_metric,
+                "score": avg_val if avg_val is not None else "",
+            }
+        )
+        rows.append(
+            {
+                "params_source": "averaged_top20",
+                "split": "test",
+                "metric": objective_metric,
+                "score": avg_test if avg_test is not None else "",
+            }
+        )
+
+    os.makedirs(output_dir, exist_ok=True)
+    basename = f"split_scores__{label}.csv" if multi_outcome else "split_scores.csv"
+    csv_path = os.path.join(output_dir, basename)
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["params_source", "split", "metric", "score"]
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+    log("OK", f"[{label}] Wrote per-split objective scores: {csv_path}")
+
+
 # Human labels for the standalone channels surfaced in ledger stages and
 # logs. Keys match the engine's ``greenery_channel`` values.
 _STANDALONE_CHANNEL_LABELS: dict[str, str] = {
@@ -760,6 +981,7 @@ def run_fusion(
     ndvi_path: str | None = None,
     cache_metrics: bool = False,
     test_size: float,
+    val_size: float = 0.25,
     k_folds: int,
     n_trials: int,
     n_startup_trials: int,
@@ -779,6 +1001,9 @@ def run_fusion(
     covariate_columns: list[str] | None = None,
     standalone_channels: list[str] | None = None,
     longitudinal_spec_payload: dict | None = None,
+    cgi_grid_spacing_m: float | None = None,
+    whole_grid_scaling: bool = False,
+    area_balanced_split: bool = False,
 ) -> dict:
     """Run fusion optimization. Mirrors the previous ``_fusion_worker``."""
     try:
@@ -860,6 +1085,16 @@ def run_fusion(
 
         cache_dir = os.path.join(output_dir, "fusion_cache")
 
+        # Per-run artifact folder so reruns don't overwrite each other.
+        from datetime import datetime as _dt
+
+        _job_short = ctx.job_id.replace("-", "")[:8] if ctx.job_id else "anon"
+        job_stamp = _dt.now().strftime("%Y%m%dT%H%M%S")
+        job_artifacts_root = os.path.join(
+            output_dir, "fusion", f"{job_stamp}__{_job_short}"
+        )
+        os.makedirs(job_artifacts_root, exist_ok=True)
+
         for ti, target_feature in enumerate(targets):
             if ctx.is_cancelled():
                 return {"output_paths": output_paths}
@@ -907,6 +1142,9 @@ def run_fusion(
                 cgi_formula=cgi_formula,
                 covariate_columns=outcome_covs,
                 longitudinal_spec=longitudinal_spec,
+                cgi_grid_spacing_m=cgi_grid_spacing_m,
+                whole_grid_scaling=whole_grid_scaling,
+                area_balanced_split=area_balanced_split,
             )
 
             ctx.progress(value=prog(0.1), status_text=f"{prefix}Loading target data...")
@@ -1087,7 +1325,7 @@ def run_fusion(
                     value=prog(0.30 + 0.04 * pct / 100),
                     status_text=(
                         f"{prefix}Spatial pre-processing: "
-                        f"{current:,}/{total:,} entities ({pct}%)"
+                        f"{current:,}/{total:,} grid cells ({pct}%)"
                     ),
                 )
                 ctx.heartbeat()
@@ -1108,11 +1346,15 @@ def run_fusion(
                 value=prog(0.34),
                 status_text=f"{prefix}Splitting data into train/val/test folds...",
             )
+            # Convert whole-dataset val fraction to within-(train+val) ratio.
+            denom = max(1.0 - float(test_size), 1e-6)
+            single_split_val_ratio = max(0.01, min(0.99, float(val_size) / denom))
             engine.split_data(
                 fusion_df=fusion_df,
                 test_size=test_size,
                 k_folds=k_folds,
                 random_state=42,
+                single_split_val_ratio=single_split_val_ratio,
             )
             stage(skey("split"), DONE)
 
@@ -1130,11 +1372,31 @@ def run_fusion(
                 if resume_existing_study
                 else datetime.now().strftime("%Y%m%dT%H%M%S")
             )
+            # Bake the search-space config into the study name so reruns
+            # with different config don't inherit stale trials.
+            config_fp = _fusion_config_fingerprint(
+                buffer_meters=float(buffer_meters),
+                gvi_buffer_min_m=float(gvi_buffer_min_m),
+                gvi_buffer_max_m=float(gvi_buffer_max_m),
+                gvi_buffer_step_m=float(gvi_buffer_step_m),
+                ndvi_buffer_min_m=float(ndvi_buffer_min_m),
+                ndvi_buffer_max_m=float(ndvi_buffer_max_m),
+                ndvi_buffer_step_m=float(ndvi_buffer_step_m),
+                cgi_formula=cgi_formula,
+                covariate_columns=outcome_covs,
+                whole_grid_scaling=bool(whole_grid_scaling),
+                cgi_grid_spacing_m=cgi_grid_spacing_m,
+                area_balanced_split=bool(area_balanced_split),
+                test_size=float(test_size),
+                val_size=float(val_size),
+                k_folds=int(k_folds),
+            )
             study_name = _build_fusion_study_name(
                 target_display_name=target_display_name,
                 label=label,
                 objective_metric=objective_metric,
                 suffix=suffix,
+                config_fingerprint=config_fp,
             )
             best_params = engine.optimize_fusion(
                 n_trials=n_trials,
@@ -1168,6 +1430,20 @@ def run_fusion(
             test_results = engine.evaluate_on_test(
                 params=best_params, metric=objective_metric
             )
+
+            # Score every robust trial on the held-out test set so the
+            # distribution viewer can plot test CIs.
+            for _t in robust_trials or []:
+                try:
+                    _tr = engine.evaluate_on_test(
+                        params=_t.params, metric=objective_metric
+                    )
+                    if _tr.get("test_score") is not None:
+                        _t.set_user_attr("test_score", float(_tr["test_score"]))
+                    if _tr.get("test_pvalue") is not None:
+                        _t.set_user_attr("test_pvalue", float(_tr["test_pvalue"]))
+                except Exception:
+                    continue
             stage(skey("evaluate"), DONE)
 
             stage(skey("apply"), RUNNING)
@@ -1194,7 +1470,7 @@ def run_fusion(
                         f"{prefix}Scoring all MixedLM metrics on robust trials..."
                     ),
                 )
-                postscore_dir = os.path.join(output_dir, "fusion", "study_results")
+                postscore_dir = os.path.join(job_artifacts_root, "study_results")
                 csv_basename = (
                     f"mixedlm_metrics__{label}.csv"
                     if multi_outcome
@@ -1248,6 +1524,7 @@ def run_fusion(
                     label=label,
                     objective_metric=objective_metric,
                     suffix=ch_suffix,
+                    config_fingerprint=config_fp,
                 )
                 ch_best = engine.optimize_fusion(
                     n_trials=n_trials,
@@ -1270,13 +1547,94 @@ def run_fusion(
                 ch_test = engine.evaluate_on_test(
                     params=ch_best, metric=objective_metric
                 )
+
+                # Per-trial test scoring for the distribution viewer.
+                for _t in ch_robust or []:
+                    try:
+                        _tr = engine.evaluate_on_test(
+                            params=_t.params, metric=objective_metric
+                        )
+                        if _tr.get("test_score") is not None:
+                            _t.set_user_attr("test_score", float(_tr["test_score"]))
+                        if _tr.get("test_pvalue") is not None:
+                            _t.set_user_attr("test_pvalue", float(_tr["test_pvalue"]))
+                    except Exception:
+                        continue
+
+                # Reports + composite TIFF + averaged top-20 % params for
+                # this standalone, mirroring what the CGI study gets. Each
+                # standalone writes into its own subdirectory so plots,
+                # TIFFs, and JSONs don't collide with the CGI run.
+                ch_report_dir = os.path.join(
+                    job_artifacts_root, "study_results", f"standalone_{ch}"
+                )
+                ch_averaged_params: dict | None = None
+                ch_composite_path = os.path.join(
+                    job_artifacts_root, f"composite_greenery_{ch}.tif"
+                )
+                try:
+                    ch_averaged_params = engine.generate_results_report(
+                        output_dir=ch_report_dir,
+                        include_plots=True,
+                        composite_path=ch_composite_path,
+                    )
+                    _log_fusion(
+                        "OK",
+                        f"[{label}] Standalone {ch}: reports + composite TIFF "
+                        f"written to {ch_report_dir}.",
+                    )
+                except Exception as exc:
+                    _log_fusion(
+                        "WARN",
+                        f"[{label}] Standalone {ch} report / composite "
+                        f"generation failed: {exc}",
+                    )
+
+                # Per-split objective metrics CSV for this standalone.
+                try:
+                    _write_split_scores_csv(
+                        engine=engine,
+                        label=f"{label}__standalone_{ch}",
+                        multi_outcome=multi_outcome,
+                        output_dir=ch_report_dir,
+                        objective_metric=objective_metric,
+                        best_value=engine.study.best_value,
+                        best_params=ch_best,
+                        averaged_params=ch_averaged_params,
+                        test_results=ch_test,
+                        log=_log_fusion,
+                    )
+                except Exception as exc:
+                    _log_fusion(
+                        "WARN",
+                        f"[{label}] Standalone {ch} split-scores CSV failed: " f"{exc}",
+                    )
+
+                ch_subset_scores: dict | None = None
+                try:
+                    ch_subset_scores = engine.compute_subset_scores(
+                        params=ch_averaged_params or ch_best,
+                        metric=objective_metric,
+                        top_percent=0.2,
+                    )
+                except Exception as exc:
+                    _log_fusion(
+                        "WARN",
+                        f"[{label}] Standalone {ch} subset-score computation "
+                        f"failed: {exc}",
+                    )
+
                 standalones_bundle[ch] = {
+                    "channel": ch,
                     "best_params": ch_best,
+                    "averaged_params": ch_averaged_params,
                     "best_value": engine.study.best_value,
                     "robust_trials": ch_robust,
                     "test_results": ch_test,
+                    "subset_scores": ch_subset_scores,
                     "objective_metric": objective_metric,
                     "study_name": ch_study_name,
+                    "report_dir": ch_report_dir,
                 }
                 # Post-hoc all-4 MixedLM metrics for this standalone, written
                 # to a per-channel CSV beside the CGI one. The engine's
@@ -1285,7 +1643,7 @@ def run_fusion(
                 # in OLS-scoring longitudinal mode (same gate as the CGI
                 # post-score block above).
                 if mixedlm_postscore_enabled:
-                    ps_dir = os.path.join(output_dir, "fusion", "study_results")
+                    ps_dir = os.path.join(job_artifacts_root, "study_results")
                     ps_basename = (
                         f"mixedlm_metrics__{label}__{ch}.csv"
                         if multi_outcome
@@ -1314,15 +1672,101 @@ def run_fusion(
                 engine.best_params = cgi_best_params
                 engine._active_greenery_channel = "cgi"
 
+            # ── Reports + composite GeoTIFF (plotting + raster write) ──
+            # Pulled out of ``optimize_fusion`` so the standalone stages above
+            # can advance the ledger while plotting runs separately at the
+            # end. Failures here don't kill the run — the trial results +
+            # composite_df are already captured in ``bundle``.
+            stage(skey("reports"), RUNNING)
+            ctx.progress(
+                value=prog(0.98),
+                status_text=f"{prefix}Generating reports + composite GeoTIFF...",
+            )
+            report_dir = os.path.join(job_artifacts_root, "study_results")
+            cgi_composite_path = os.path.join(
+                job_artifacts_root, "composite_greenery.tif"
+            )
+            averaged_params: dict | None = None
+            try:
+                averaged_params = engine.generate_results_report(
+                    output_dir=report_dir,
+                    include_plots=True,
+                    composite_path=cgi_composite_path,
+                )
+                _log_fusion(
+                    "OK",
+                    f"[{label}] Reports + composite TIFF written to "
+                    f"{job_artifacts_root}.",
+                )
+            except Exception as exc:
+                _log_fusion(
+                    "WARN",
+                    f"[{label}] Report / composite generation failed: {exc}",
+                )
+            stage(skey("reports"), DONE)
+
+            # Persist the train / val / test scores for the averaged (top-20%)
+            # params alongside the CV best score so downstream analysis has
+            # one canonical metrics CSV per job.
+            try:
+                _write_split_scores_csv(
+                    engine=engine,
+                    label=label,
+                    multi_outcome=multi_outcome,
+                    output_dir=report_dir,
+                    objective_metric=objective_metric,
+                    best_value=cgi_best_value,
+                    best_params=best_params,
+                    averaged_params=averaged_params,
+                    test_results=test_results,
+                    log=_log_fusion,
+                )
+            except Exception as exc:
+                _log_fusion(
+                    "WARN",
+                    f"[{label}] Could not write per-split metrics CSV: {exc}",
+                )
+
+            cgi_subset_scores: dict | None = None
+            try:
+                cgi_subset_scores = engine.compute_subset_scores(
+                    params=averaged_params or best_params,
+                    metric=objective_metric,
+                    top_percent=0.2,
+                )
+            except Exception as exc:
+                _log_fusion(
+                    "WARN",
+                    f"[{label}] CGI subset-score computation failed: {exc}",
+                )
+
+            covariate_impact: dict | None = None
+            try:
+                covariate_impact = engine.compute_covariate_impact(
+                    params=averaged_params or best_params,
+                    metric=objective_metric,
+                )
+            except Exception as exc:
+                _log_fusion(
+                    "WARN",
+                    f"[{label}] Covariate impact computation failed: {exc}",
+                )
+
             bundle = {
                 "best_params": best_params,
+                "averaged_params": averaged_params,
                 "best_value": cgi_best_value,
                 "robust_trials": robust_trials,
                 "composite_df": composite_df,
                 "objective_metric": objective_metric,
                 "test_results": test_results,
+                "subset_scores": cgi_subset_scores,
+                "covariate_impact": covariate_impact,
                 "target_feature": target_feature,
                 "standalones": standalones_bundle,
+                "artifacts_dir": job_artifacts_root,
+                "composite_path": cgi_composite_path,
+                "report_dir": report_dir,
             }
             by_target[label] = bundle
             engines_by_target[label] = engine
@@ -1343,6 +1787,7 @@ def run_fusion(
             engine=None if multi_outcome else engines_by_target[sole_label],
             engines_by_target=engines_by_target,
             results=results_payload,
+            artifacts_dir=job_artifacts_root,
         )
         ctx.progress(value=1.0, status_text="Completed")
         return {"output_paths": output_paths}

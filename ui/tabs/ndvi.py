@@ -14,7 +14,6 @@ from helpers import (
     apply_buffer_m,
     file_size_mtime_fingerprint,
     load_vector_paths,
-    load_vector_upload_sessions,
     render_job_restart_panel,
 )
 from map_preview import (
@@ -752,9 +751,7 @@ def render(output_dir: str) -> None:
 
             # basename -> absolute path map so each submitted job records its
             # study-area location for silent-restart.
-            ndvi_path_by_basename = {
-                os.path.basename(p): p for p in ndvi_valid_paths
-            }
+            ndvi_path_by_basename = {os.path.basename(p): p for p in ndvi_valid_paths}
 
             for fname, d in ndvi_input_datasets.items():
                 cfg = st.session_state.ndvi_date_configs.get(fname, {})

@@ -232,7 +232,10 @@ def path_drift_status(path: str | None, expected_fingerprint: str) -> str:
         return "no-path"
     if not os.path.isfile(path):
         return "missing"
-    if expected_fingerprint and file_size_mtime_fingerprint(path) != expected_fingerprint:
+    if (
+        expected_fingerprint
+        and file_size_mtime_fingerprint(path) != expected_fingerprint
+    ):
         return "modified"
     return "ok"
 
@@ -302,9 +305,7 @@ def load_vector_paths(
         if not path or not os.path.isfile(path):
             continue
         gdf = read_vector_path(path)
-        results.append(
-            (os.path.basename(path), sanitize_gdf_attributes_for_json(gdf))
-        )
+        results.append((os.path.basename(path), sanitize_gdf_attributes_for_json(gdf)))
     return results
 
 
@@ -462,9 +463,7 @@ def render_job_restart_panel(
                         st.error(f"Re-submission failed: {e}")
                         return
                     st.session_state[RESTART_SESSION_KEY] = None
-                    st.success(
-                        "Restart submitted. Monitor progress in the sidebar."
-                    )
+                    st.success("Restart submitted. Monitor progress in the sidebar.")
                     st.rerun()
             return
 
@@ -576,7 +575,6 @@ def render_path_based_restart_panel(
     file) plus the extras dict.
     """
     import streamlit as st  # local import keeps headless callers cheap
-
     from file_picker import FT_VECTOR_OR_RASTER, pick_file_path
 
     file_types = file_types or {}
@@ -634,9 +632,7 @@ def render_path_based_restart_panel(
         all_resolved = True
         for slot, status, recorded, _ in drift_slots:
             status_icon = (
-                "❌" if status == "missing"
-                else "⚠️" if status == "modified"
-                else "•"
+                "❌" if status == "missing" else "⚠️" if status == "modified" else "•"
             )
             picker_key = f"restart_path_{rec.id}_{slot}"
             label = f"{status_icon} {slot} ({status})" + (

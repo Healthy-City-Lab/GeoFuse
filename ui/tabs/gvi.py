@@ -15,7 +15,6 @@ from helpers import (
     file_size_mtime_fingerprint,
     generate_clustered_grid,
     load_vector_paths,
-    load_vector_upload_sessions,
     render_job_restart_panel,
 )
 from map_preview import (

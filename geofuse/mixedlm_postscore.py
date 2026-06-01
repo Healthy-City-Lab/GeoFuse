@@ -41,8 +41,9 @@ def _formula_average_params(engine, top_trials: list[Any]) -> dict | None:
     """
     if not top_trials:
         return None
-    from . import cgi_formulas
     from statistics import mode as _mode
+
+    from . import cgi_formulas
 
     channel_mode = engine._active_greenery_channel
     if channel_mode != "cgi":
@@ -125,8 +126,12 @@ def _pool_summary_rows(
             m: float(np.std([r[m] for r in trial_metric_values], ddof=1) / np.sqrt(n))
             for m in metrics
         }
-        rows.append(_summary("__ci_lo__", {m: means[m] - 1.96 * ses[m] for m in metrics}))
-        rows.append(_summary("__ci_hi__", {m: means[m] + 1.96 * ses[m] for m in metrics}))
+        rows.append(
+            _summary("__ci_lo__", {m: means[m] - 1.96 * ses[m] for m in metrics})
+        )
+        rows.append(
+            _summary("__ci_hi__", {m: means[m] + 1.96 * ses[m] for m in metrics})
+        )
     else:
         # Quantile CI: empirical 2.5 / 97.5 percentiles (more robust for
         # the small-n pools we typically see).
@@ -178,9 +183,9 @@ def compute_post_metrics(
 
     n_top = max(1, int(len(robust_trials) * top_percent))
     direction_max = engine.study.direction.name == "MAXIMIZE"
-    top_trials = sorted(
-        robust_trials, key=lambda t: t.value, reverse=direction_max
-    )[:n_top]
+    top_trials = sorted(robust_trials, key=lambda t: t.value, reverse=direction_max)[
+        :n_top
+    ]
 
     final_params = _formula_average_params(engine, top_trials)
 
@@ -213,12 +218,17 @@ def compute_post_metrics(
                     "WARN",
                     f"Post-hoc score failed for {pool_name} trial {trial_id}: {exc}",
                 )
-                metrics = {m: float("nan") for m in mixed_effects_scoring.MIXEDLM_METRICS}
+                metrics = {
+                    m: float("nan") for m in mixed_effects_scoring.MIXEDLM_METRICS
+                }
             row = {"pool": pool_name, "trial_id": trial_id, **metrics}
             rows.append(row)
             if all(m in metrics for m in mixed_effects_scoring.MIXEDLM_METRICS):
                 per_trial_values.append(
-                    {m: float(metrics[m]) for m in mixed_effects_scoring.MIXEDLM_METRICS}
+                    {
+                        m: float(metrics[m])
+                        for m in mixed_effects_scoring.MIXEDLM_METRICS
+                    }
                 )
         # Only summarise pools with more than one entry (the ``final`` pool
         # is a single point estimate by design — no spread).

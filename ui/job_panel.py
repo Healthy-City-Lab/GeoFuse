@@ -45,6 +45,24 @@ _TERMINAL_LABELS = {
 _RESTART_ELIGIBLE_TYPES = {"gvi", "ndvi", "ndvi_column", "fusion"}
 _RESTART_ELIGIBLE_STATUSES = {"interrupted", "cancelled", "error"}
 
+
+def _load_fusion_results_into_session(rec) -> bool:
+    """Hydrate ``st.session_state`` from a completed fusion job's bundle.
+
+    Returns ``True`` when the load succeeds and the caller should rerun,
+    ``False`` when the record has no usable results payload.
+    """
+    if rec.type != "fusion" or rec.status != "completed":
+        return False
+    results = rec.extra.get("results") if rec.extra else None
+    if results is None:
+        return False
+    st.session_state.fusion_engine = rec.extra.get("engine")
+    st.session_state.fusion_engines_by_target = rec.extra.get("engines_by_target") or {}
+    st.session_state.fusion_results = results
+    return True
+
+
 # Staged-resume ledger glyphs (see geofuse.jobs.stage_ledger).
 _STAGE_ICONS = {
     "done": "✅",
@@ -125,9 +143,10 @@ def _render_details(rec) -> None:
         covs = p.get("covariate_columns") or []
         st.write(f"**Covariates:** {', '.join(covs) if covs else '—'}")
         standalones = p.get("standalone_channels") or []
+        _ch_disp = {"veg": "Vegetation", "terrain": "Terrain", "ndvi": "NDVI"}
         st.write(
             f"**Standalone metrics:** "
-            f"{', '.join(standalones) if standalones else '—'}"
+            f"{', '.join(_ch_disp.get(s, s) for s in standalones) if standalones else '—'}"
         )
         st.write(
             f"**Sampler:** {p.get('sampler_type', '?')} · "
@@ -215,17 +234,6 @@ def _render_job_card(rec, store) -> None:
                 text=(f"{gvi_progress['current']:,} / " f"{gvi_progress['total']:,}"),
             )
 
-        preaggr_progress = rec.extra.get("preaggr_progress")
-        if preaggr_progress:
-            st.progress(
-                preaggr_progress["percent"] / 100,
-                text=(
-                    f"Spatial pre-processing: "
-                    f"{preaggr_progress['current']:,} / "
-                    f"{preaggr_progress['total']:,}"
-                ),
-            )
-
         _render_stage_ledger(rec)
 
         with st.expander("Details", expanded=False):
@@ -245,6 +253,24 @@ def _render_job_card(rec, store) -> None:
                     open_path_in_default_editor(log_path)
                 except Exception as e:
                     st.error(f"Could not open log file: {e}")
+
+            if (
+                rec.type == "fusion"
+                and rec.status == "completed"
+                and rec.extra.get("results") is not None
+            ):
+                if st.button(
+                    "Load results",
+                    key=f"loadres_{rec.id}",
+                    use_container_width=True,
+                    help=(
+                        "Replace the active result overview with this job's "
+                        "bundle (composite map, robust trials, standalone "
+                        "studies, etc.)."
+                    ),
+                ):
+                    if _load_fusion_results_into_session(rec):
+                        st.rerun()
         else:
             with st.expander("Logs", expanded=False):
                 _render_logs(rec.id)

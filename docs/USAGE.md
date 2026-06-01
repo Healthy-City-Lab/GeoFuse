@@ -51,8 +51,45 @@ The Fusion tab reads top-to-bottom in the order you reason about a run:
    - **Cross-sectional** offers a **Date column available?** toggle. With the toggle off, no date column is needed and each metric channel takes one file. With it on, pick the date column; distinct measurement years are discovered and drive the per-year file assignment in the next section (years are only a metric-file routing key — they never enter the regression).
    - **Mixed-effects longitudinal** offers **long** intake (one target file with explicit wave column — pick the entity-ID, date, and wave columns from selectboxes) or **wide** intake (one target file per wave, with per-file column pickers + a free-text wave label). A date column is mandatory in this mode.
 3. **Metric File Assignment** — per channel (NDVI then GVI), set the buffer ladder (min / max / step in metres) that applies to every uploaded file in that channel, then upload one or more files. When years/waves were discovered above, each uploaded file gets a multi-select listing which years/waves it applies to. Every year/wave must be covered by exactly one file per channel — coverage status is shown live and the run fails with an error on submit if anything is unassigned.
-4. **Study Details** (form) — CGI formula (`weighted_average` or `synergy`), covariates (numeric attribute columns to control for; wide-mode longitudinal intersects across wave files), a single mode-aware **Objective metric** dropdown (OLS-based options for cross-sectional, MixedLM-based options for mixed-effects), trial budget, **Use k-fold cross-validation** toggle (off ⇒ single train/val split, ~k× faster per trial), test size, stratification bins, MixedLM toggles (`Random slope on time per entity`, `Include years_since_baseline as fixed effect`), resume previous study, and the **Also optimize each metric on its own** standalones checkbox.
+4. **Study Details** (form) — CGI formula (`weighted_average` or `synergy`), covariates (numeric attribute columns to control for; wide-mode longitudinal intersects across wave files), a single mode-aware **Objective metric** dropdown (OLS-based options for cross-sectional, MixedLM-based options for mixed-effects), trial budget, **Use k-fold cross-validation** toggle (off ⇒ single train/val split, ~k× faster per trial), **Test set size** and **Validation set size** sliders (both as fractions of the whole dataset; defaults 0.25 / 0.25), stratification bins, MixedLM toggles, resume previous study, the **Also optimize each metric on its own** standalones checkbox, and — for polygon targets only — a **Polygon scoring** block with the **CGI grid pixel size (m)** slider (25–500 m, step 25, default 50), the **Whole-grid scaling** checkbox, and the **Area-balanced stratified split** checkbox.
 5. **🚀 Run Fusion Optimization**.
+
+#### Optimization results panel
+
+After a job completes (or when you click **Load results** on a completed job in the sidebar Job Monitor) the results section renders with these blocks, in order:
+
+- **Summary tiles** — formula name, test score on the averaged top-20% params, robust-trial ratio, weights, radii, aggregators.
+- **Best Trial Details** + **Final (averaged top-20%) Parameters** — side-by-side JSON dumps; the composite GeoTIFF is built from the averaged params.
+- **Interactive Plots** — pick from optimization history, parameter importances, parallel coordinates, slice, contour, rank, EDF, or timeline; filter trial pool (all completed vs robust only); choose parameter axes where applicable.
+- **Robust Trials browser** — scrollable table; the study selector switches between CGI (combined) and each standalone.
+- **CGI vs Standalone Single-Metric Studies** — grouped bar charts comparing studies across selectable subsets (`train` / `val` / `test` / `all`) and values (`score` / `pvalue` / `n`); rendered only when standalones ran.
+- **Covariate impact** — when covariates are set, two OLS regressions (`target ~ CGI + covariates` vs `target ~ CGI`) on the full dataset; per-covariate coefficient, t-stat, p-value, direction, and partial R²; lift over CGI-only R² summarised at the top.
+- **Per-trial objective distributions** — Plotly box plot of per-trial `train` / `val` / `test` scores, with selectors for studies, trial pool (`robust` / `all completed`), and subsets. Test scores are post-processed per robust trial after the search (no leakage during optimization).
+- **Composite map viewer** — multi-select composites + target outcome rendered as subplots in a near-square grid at 300 dpi; composite subplots share a `[0, 1]` colorbar.
+- **Mixed-effects metric tabs** — when MixedLM scoring is on, one tab per `mixedlm_metrics*.csv` written under the per-job folder.
+
+#### Per-job output folder
+
+Every fusion run writes its artifacts to `output_results/fusion/<YYYYMMDDTHHMMSS>__<short_job_id>/` so reruns no longer overwrite previous outputs. Layout:
+
+```text
+<job_root>/
+├── composite_greenery.tif            ← CGI averaged-params raster
+├── composite_greenery_params.json
+├── composite_greenery_<veg|terrain|ndvi>.tif         ← one per standalone
+└── study_results/
+    ├── robust_trials/                 ← CGI plots + reports
+    ├── all_trials/
+    ├── split_scores.csv               ← CGI per-split scores
+    ├── mixedlm_metrics*.csv           ← if longitudinal + MixedLM
+    └── standalone_<ch>/               ← per-standalone plots + reports + split scores
+```
+
+The Optuna study SQLite files live in `output_results/fusion_studies/` and are content-addressed via a config fingerprint — a config change (buffer ladder, formula, scaling toggles, val / test sizes, …) starts a fresh study so old trials with out-of-range params can never contaminate a new run.
+
+#### Polygon scoring (per-pixel CGI)
+
+When the target carries polygon (or multipolygon) geometries, each polygon is scored against the **average of per-pixel CGI** inside its footprint. The engine builds a regular grid of pixel centroids at the configured spacing inside the union of the target polygons, every pixel becomes a pre-aggregation cache entity, per-trial CGI is evaluated at every pixel, and a `groupby(polygon).mean()` collapses to per-polygon CGI before scoring. Smaller spacing = higher fidelity and bigger SQLite cache; larger spacing = smaller cache + faster build. **Whole-grid scaling** skips per-channel MinMax scaling so the composite is a weighted sum on raw channel values (only the composite raster is min-max normalised); useful when channels are already on comparable scales. **Area-balanced stratified split** greedily allocates polygons inside each outcome quartile so total polygon area is balanced across train / val / test, rather than just polygon counts.
 
 #### Mixed-effects fusion (longitudinal data)
 

@@ -45,11 +45,18 @@ from geofuse.vector_io import (
 
 _FUSION_OUTCOME_ADD_PLACEHOLDER = "— Select column —"
 
+# Canonical display labels for greenery channels. Internal keys stay
+# ``veg``/``terrain``/``ndvi`` everywhere in code and JSON payloads;
+# anything user-visible (UI labels, captions, log lines surfaced to
+# users) goes through this mapping so the spelling is uniform.
+_CHANNEL_DISPLAY = {"veg": "Vegetation", "terrain": "Terrain", "ndvi": "NDVI"}
+
 
 class _FusionVerticalScaleControl(MacroElement):
     """Leaflet control: vertical red→yellow→green strip with numeric bounds."""
 
-    _template = Template("""
+    _template = Template(
+        """
 {% macro script(this, kwargs) %}
     var {{ this.get_name() }}_vsc = L.control({position: 'topright'});
     {{ this.get_name() }}_vsc.onAdd = function (map) {
@@ -65,7 +72,8 @@ class _FusionVerticalScaleControl(MacroElement):
     };
     {{ this.get_name() }}_vsc.addTo({{ this._parent.get_name() }});
 {% endmacro %}
-""")
+"""
+    )
 
     def __init__(self, inner_html: str):
         super().__init__()
@@ -283,7 +291,8 @@ def _fusion_restart_summary_lines(p: dict) -> list[str]:
         f"**Outcomes:** {', '.join(p.get('outcome_columns') or []) or '—'}",
         f"**CGI formula:** `{p.get('cgi_formula') or 'weighted_average'}`",
         f"**Covariates:** {', '.join(covs) if covs else '—'}",
-        f"**Standalone metrics:** " f"{', '.join(standalones) if standalones else '—'}",
+        f"**Standalone metrics:** "
+        f"{', '.join(_CHANNEL_DISPLAY.get(s, s) for s in standalones) if standalones else '—'}",
         f"**Trials:** {p.get('n_trials', '?')} "
         f"(startup {p.get('n_startup_trials', '?')}, {cv_label})",
         f"**Objective:** {p.get('objective_metric', '?')} · "
@@ -304,6 +313,16 @@ def _fusion_restart_summary_lines(p: dict) -> list[str]:
             f"**Year/wave-aware:** {descriptor}, "
             f"waves={lon_payload.get('wave_labels')}, "
             f"scoring=`{lon_payload.get('scoring_metric')}`"
+        )
+    cgi_grid = p.get("cgi_grid_spacing_m")
+    if cgi_grid is not None:
+        scaling_scope = "whole-grid" if p.get("whole_grid_scaling") else "per-fold"
+        split_kind = (
+            "area-balanced" if p.get("area_balanced_split") else "count-balanced"
+        )
+        lines.append(
+            f"**Polygon scoring:** per-pixel CGI · pixel size "
+            f"{cgi_grid} m · {scaling_scope} scaling · {split_kind} split"
         )
     return lines
 
@@ -358,6 +377,7 @@ def _submit_fusion_restart(
         veg_path=veg_path,
         ndvi_path=ndvi_path,
         test_size=float(p.get("test_size", 0.3)),
+        val_size=float(p.get("val_size", 0.25)),
         k_folds=int(p.get("k_folds", 5)),
         n_trials=int(p.get("n_trials", 300)),
         n_startup_trials=int(p.get("n_startup_trials", 150)),
@@ -371,6 +391,13 @@ def _submit_fusion_restart(
         covariate_columns=list(p.get("covariate_columns") or []),
         standalone_channels=list(p.get("standalone_channels") or []),
         longitudinal_spec_payload=p.get("longitudinal_spec_payload"),
+        cgi_grid_spacing_m=(
+            float(p["cgi_grid_spacing_m"])
+            if p.get("cgi_grid_spacing_m") is not None
+            else None
+        ),
+        whole_grid_scaling=bool(p.get("whole_grid_scaling", False)),
+        area_balanced_split=bool(p.get("area_balanced_split", False)),
     )
 
 
@@ -822,15 +849,7 @@ def _render_optimization_setup_panel(
         index=None,
         horizontal=True,
         key="fusion_run_mode",
-        help=(
-            "**Cross-sectional** — one observation per entity; OLS-based "
-            "partial correlation / incremental R² / RMSE / MI. "
-            "**Mixed-effects (longitudinal)** — entities measured at "
-            "multiple time points; CGI scored via "
-            "`statsmodels.MixedLM` with random intercept (+ optional "
-            "random slope on time) per entity. Pick a mode to reveal the "
-            "rest of the form."
-        ),
+        help="Cross-sectional uses OLS scoring; mixed-effects uses MixedLM with per-entity random effects.",
     )
     if run_mode is None:
         st.caption("_Pick a run mode to configure the rest of the form._")
@@ -858,14 +877,7 @@ def _render_optimization_setup_panel(
             "Date column available?",
             value=False,
             key="fusion_cross_date_on",
-            help=(
-                "Turn on if the target carries a measurement-date column. "
-                "When on, distinct measurement years are discovered and "
-                "drive the per-channel metric-file assignment below, so "
-                "entities measured in different years can sample greenery "
-                "from the right per-year file. The year column is only a "
-                "metric-file routing key — it never enters the regression."
-            ),
+            help="Enables per-year greenery-file routing. The date column never enters the regression.",
         )
         state["cross_sectional_date_on"] = date_on
         if date_on:
@@ -879,11 +891,7 @@ def _render_optimization_setup_panel(
                     "Date column",
                     options=date_candidates,
                     key="fusion_cross_date_col",
-                    help=(
-                        "Column carrying each row's measurement date. "
-                        "Accepts ISO (`2010-01-15`), year+month (`2010-01`), "
-                        "year-only strings (`2010`), or numeric years."
-                    ),
+                    help="Accepts ISO dates, year+month, year-only, or numeric years.",
                 )
                 state["date_col"] = date_col
                 if preview_gdf is not None and date_col:
@@ -907,11 +915,7 @@ def _render_optimization_setup_panel(
         format_func=lambda x: (
             "Long-format target" if x == "long" else "Wide / multi-file"
         ),
-        help=(
-            "**long** — one target file with one row per (entity, wave) "
-            "and an explicit wave column. **wide** — N target files, one "
-            "per wave, joined on a shared entity-id column."
-        ),
+        help="long = one file, one row per (entity, wave). wide = one file per wave.",
     )
     state["intake_mode"] = intake_mode
 
@@ -926,11 +930,7 @@ def _render_optimization_setup_panel(
                     "Entity ID column",
                     options=id_candidates,
                     key="fusion_lon_entity_id_col",
-                    help=(
-                        "Column that uniquely identifies each entity "
-                        "(e.g. participant ID). Must be present in the "
-                        "long-format target."
-                    ),
+                    help="Unique entity identifier column.",
                 )
             else:
                 st.warning("No candidate ID columns found in the target.")
@@ -940,10 +940,7 @@ def _render_optimization_setup_panel(
                     "Date column",
                     options=date_candidates,
                     key="fusion_lon_date_col",
-                    help=(
-                        "Per-row measurement date. Used to derive "
-                        "`years_since_baseline` per entity."
-                    ),
+                    help="Used to derive `years_since_baseline` per entity.",
                 )
             else:
                 st.warning("No date-parseable columns found in the target.")
@@ -958,10 +955,7 @@ def _render_optimization_setup_panel(
                 "Wave column",
                 options=wave_candidates,
                 key="fusion_lon_wave_col",
-                help=(
-                    "Column carrying each row's wave label. Distinct "
-                    "values populate the per-channel file-assignment grid."
-                ),
+                help="Wave labels populate the per-channel file-assignment grid.",
             )
             if state["wave_col"]:
                 waves = sorted(
@@ -1141,7 +1135,7 @@ def _render_metric_assignment_panel(
                     min_value=100,
                     max_value=5000,
                     value=int(
-                        st.session_state.get(f"fusion_{ch_short}_buffer_max", 1500)
+                        st.session_state.get(f"fusion_{ch_short}_buffer_max", 1000)
                     ),
                     step=50,
                     key=f"fusion_{ch_short}_buffer_max",
@@ -1153,7 +1147,7 @@ def _render_metric_assignment_panel(
                     min_value=10,
                     max_value=500,
                     value=int(
-                        st.session_state.get(f"fusion_{ch_short}_buffer_step", 50)
+                        st.session_state.get(f"fusion_{ch_short}_buffer_step", 100)
                     ),
                     step=10,
                     key=f"fusion_{ch_short}_buffer_step",
@@ -1230,12 +1224,7 @@ def _render_metric_assignment_panel(
                         f"{ch_label} file {i + 1} — applies to year(s) / wave(s)",
                         options=visible_options,
                         key=assign_key,
-                        help=(
-                            "Years / waves whose entities should sample "
-                            "greenery from this file. Years already "
-                            "claimed by another file in this channel "
-                            "are hidden from the list."
-                        ),
+                        help="Years already assigned to another file are hidden.",
                     )
                     # Update the snapshot so the NEXT row's option list
                     # reflects this row's freshly-rendered selection
@@ -1255,7 +1244,7 @@ def _render_metric_assignment_panel(
 
             # Coverage check + caption.
             if year_aware and discovered_waves:
-                covered: dict[str, int] = {w: 0 for w in discovered_waves}
+                covered: dict[str, int] = dict.fromkeys(discovered_waves, 0)
                 for _, waves in channel_files:
                     for w in waves:
                         if w in covered:
@@ -1297,6 +1286,7 @@ def _render_metric_assignment_panel(
 def _render_study_details_panel(
     is_longitudinal: bool,
     available_covariates: list[str],
+    is_polygon_target: bool = False,
 ) -> dict:
     """Final form section: CGI formula, covariates, objective metric, …
 
@@ -1313,11 +1303,10 @@ def _render_study_details_panel(
             options=["weighted_average", "synergy"],
             index=0,
             help=(
-                "**weighted_average** — three weights on min-max-"
-                "normalized veg / terrain / NDVI (sum = 100). "
-                "**synergy** — three-metric generalisation of Wang et "
-                "al. 2026: seven weights (sum = 100) plus three powers "
-                "on the main NDVI / Veg / Terrain terms only."
+                "**weighted_average** — three weights on Vegetation / "
+                "Terrain / NDVI summing to 100. "
+                "**synergy** — seven weights summing to 100 plus three "
+                "powers on the main channel terms."
             ),
             key="fusion_cgi_formula",
         )
@@ -1329,12 +1318,9 @@ def _render_study_details_panel(
                 default=st.session_state.get("fusion_covariate_columns", []),
                 key="fusion_covariate_columns",
                 help=(
-                    "Additional numeric attribute columns to control for "
-                    "when scoring the CGI's predictive power. With "
+                    "Numeric attribute columns to control for. With "
                     "covariates the score becomes the greenery term's "
-                    "*partial* contribution (partial correlation, "
-                    "incremental R², or full-model RMSE). "
-                    "`mutual_info` ignores covariates by design."
+                    "partial contribution. `mutual_info` ignores covariates."
                 ),
             )
         else:
@@ -1357,19 +1343,14 @@ def _render_study_details_panel(
             "Objective metric",
             options=metric_options,
             key="fusion_objective_metric",
-            help=(
-                "Quantity Optuna maximises (or minimises for RMSE) per "
-                "trial. Options switch automatically with the run mode: "
-                "OLS-based metrics for cross-sectional; MixedLM-based "
-                "metrics for longitudinal."
-            ),
+            help="Quantity Optuna optimises per trial (maximised; RMSE minimised).",
         )
     with col_o2:
         n_trials = st.number_input(
             "Total trials",
             min_value=50,
             max_value=1000,
-            value=int(st.session_state.get("fusion_n_trials", 300)),
+            value=int(st.session_state.get("fusion_n_trials", 100)),
             step=50,
             key="fusion_n_trials",
             help="Number of Optuna trials.",
@@ -1390,7 +1371,7 @@ def _render_study_details_panel(
             "Random startup trials",
             min_value=10,
             max_value=500,
-            value=int(st.session_state.get("fusion_n_startup", 150)),
+            value=int(st.session_state.get("fusion_n_startup", 50)),
             step=10,
             key="fusion_n_startup",
             help="Uniformly random trials before the main sampler engages.",
@@ -1400,11 +1381,7 @@ def _render_study_details_panel(
             "Use k-fold cross-validation",
             value=bool(st.session_state.get("fusion_use_cv", True)),
             key="fusion_use_cv",
-            help=(
-                "When on, each trial fits k models on a stratified k-fold "
-                "split. When off, a single train/val split is used and "
-                "each trial fits one model — ~k× faster, no fold-variance."
-            ),
+            help="On: k models per trial. Off: single train/val split, ~k× faster.",
         )
     with col_s3:
         if use_cv:
@@ -1414,11 +1391,7 @@ def _render_study_details_panel(
                 max_value=10,
                 value=int(st.session_state.get("fusion_k_folds", 5)),
                 key="fusion_k_folds",
-                help=(
-                    "Cross-validation folds on the non-test subset. The "
-                    "test set is always carved off first via the "
-                    "**Test set size** slider regardless of this toggle."
-                ),
+                help="CV folds on the non-test subset.",
             )
         else:
             k_folds = 1
@@ -1431,10 +1404,41 @@ def _render_study_details_panel(
             "Test set size",
             min_value=0.1,
             max_value=0.5,
-            value=float(st.session_state.get("fusion_test_size", 0.3)),
+            value=float(st.session_state.get("fusion_test_size", 0.25)),
             step=0.05,
             key="fusion_test_size",
-            help="Held-out evaluation fraction.",
+            help="Held-out evaluation fraction of the whole dataset.",
+        )
+
+    # Single-split validation size (whole-dataset fraction). Hidden in CV mode.
+    if not use_cv:
+        col_val, col_train = st.columns([1, 1])
+        val_default = float(st.session_state.get("fusion_val_size", 0.25))
+        with col_val:
+            val_size_whole = st.slider(
+                "Validation set size",
+                min_value=0.05,
+                max_value=0.5,
+                value=val_default,
+                step=0.05,
+                key="fusion_val_size",
+                help="Validation fraction of the whole dataset (single-split mode).",
+            )
+        with col_train:
+            train_pct = max(0.0, 1.0 - float(test_size) - float(val_size_whole))
+            st.caption(
+                f"_Train ≈ {train_pct*100:.0f}% · Val = "
+                f"{val_size_whole*100:.0f}% · Test = "
+                f"{float(test_size)*100:.0f}% of the whole dataset._"
+            )
+    else:
+        # CV mode: val is implicit per fold.
+        val_size_whole = float(st.session_state.get("fusion_val_size", 0.25))
+        per_fold_val = (1.0 - float(test_size)) / max(int(k_folds), 1)
+        st.caption(
+            f"_K-fold CV: train = {(1.0 - float(test_size))*100:.0f}% × "
+            f"(k-1)/k of the non-test subset, val = "
+            f"{per_fold_val*100:.0f}% of the whole dataset per fold._"
         )
 
     n_bins = st.number_input(
@@ -1456,23 +1460,14 @@ def _render_study_details_panel(
                 "Random slope on time per entity",
                 value=bool(st.session_state.get("fusion_lon_random_slope", True)),
                 key="fusion_lon_random_slope",
-                help=(
-                    "Switches the random-effects structure from "
-                    "`(1 | entity)` to `(1 + years_since_baseline | "
-                    "entity)`. Costs more fit iterations but lets each "
-                    "entity's trajectory have its own slope."
-                ),
+                help="Switches RE structure to `(1 + years_since_baseline | entity)`.",
             )
         with mc2:
             mixedlm_time_fixed = st.checkbox(
                 "Include `years_since_baseline` as fixed effect",
                 value=bool(st.session_state.get("fusion_lon_include_time_fixed", True)),
                 key="fusion_lon_include_time_fixed",
-                help=(
-                    "Adds `+ years_since_baseline` to the fixed-effect "
-                    "design. Keep on unless you want any global temporal "
-                    "trend to load onto the greenery coefficient."
-                ),
+                help="Adds `+ years_since_baseline` to the fixed-effect design.",
             )
 
     # ── Resume + standalones ────────────────────────────────────────────
@@ -1482,21 +1477,43 @@ def _render_study_details_panel(
             "Resume previous study if exists",
             value=bool(st.session_state.get("fusion_resume_study", True)),
             key="fusion_resume_study",
-            help=(
-                "When on, re-running with the same target + outcome + "
-                "objective metric loads the existing SQLite study and "
-                "runs only the remaining trials."
-            ),
+            help="Reuses the existing SQLite study and runs only remaining trials.",
         )
     with col_r2:
         run_standalones = st.checkbox(
             "Also optimize each metric on its own (NDVI / Vegetation / Terrain)",
             value=bool(st.session_state.get("fusion_run_standalones", False)),
             key="fusion_run_standalones",
-            help=(
-                "Adds three single-metric Optuna studies alongside the "
-                "combined CGI run, searching only its radius + aggregation."
-            ),
+            help="Adds three single-metric Optuna studies alongside the combined CGI run.",
+        )
+
+    # ── Polygon scoring (per-pixel CGI) ─────────────────────────────────
+    cgi_grid_spacing_m = 50
+    whole_grid_scaling = True
+    area_balanced_split = True
+    if is_polygon_target:
+        st.markdown("**Polygon scoring**")
+        col_p1, col_p2 = st.columns([2, 1])
+        with col_p1:
+            cgi_grid_spacing_m = st.select_slider(
+                "CGI grid pixel size (m)",
+                options=list(range(25, 525, 25)),
+                value=int(st.session_state.get("fusion_cgi_grid_spacing_m", 50)),
+                key="fusion_cgi_grid_spacing_m",
+                help="Per-pixel CGI grid spacing inside the polygon union. Smaller = higher fidelity, bigger cache.",
+            )
+        with col_p2:
+            whole_grid_scaling = st.checkbox(
+                "Whole-grid scaling",
+                value=bool(st.session_state.get("fusion_whole_grid_scaling", True)),
+                key="fusion_whole_grid_scaling",
+                help="Skip per-channel scaling; only the composite raster is normalised.",
+            )
+        area_balanced_split = st.checkbox(
+            "Area-balanced stratified split",
+            value=bool(st.session_state.get("fusion_area_balanced_split", True)),
+            key="fusion_area_balanced_split",
+            help="Balance polygon area (not count) across train / val / test within each quartile.",
         )
 
     return {
@@ -1509,17 +1526,1164 @@ def _render_study_details_panel(
         "use_cv": bool(use_cv),
         "k_folds": int(k_folds),
         "test_size": float(test_size),
+        "val_size": float(val_size_whole),
         "n_bins": int(n_bins),
         "mixedlm_random_slope": bool(mixedlm_random_slope),
         "mixedlm_time_fixed": bool(mixedlm_time_fixed),
         "resume_existing_study": bool(resume_existing_study),
         "run_standalones": bool(run_standalones),
+        "cgi_grid_spacing_m": int(cgi_grid_spacing_m),
+        "whole_grid_scaling": bool(whole_grid_scaling),
+        "area_balanced_split": bool(area_balanced_split),
     }
 
 
 # ---------------------------------------------------------------------------
 # Tab render entry point
 # ---------------------------------------------------------------------------
+
+
+def _render_fusion_results_section(output_dir: str) -> None:
+    """Render the optimization results overview when one is loaded.
+
+    Renders nothing when ``st.session_state.fusion_results`` is unset, so
+    callers can invoke it unconditionally. Lives independently of the
+    configuration UI so the user can browse a loaded run's results even
+    when no fresh study is being set up.
+    """
+    if "fusion_results" not in st.session_state:
+        st.session_state.fusion_results = None
+    if "fusion_engine" not in st.session_state:
+        st.session_state.fusion_engine = None
+    if "fusion_engines_by_target" not in st.session_state:
+        st.session_state.fusion_engines_by_target = {}
+
+    if not st.session_state.fusion_results:
+        return
+
+    # Darken the results-panel background + shrink metric tile fonts via CSS.
+    st.markdown(
+        """
+<style>
+div[data-testid="stVerticalBlock"]:has(> div > div > div[data-fusion-results-anchor]) {
+    background-color: rgba(38, 39, 48, 0.55);
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin-top: 8px;
+}
+div[data-testid="stVerticalBlock"]:has(> div > div > div[data-fusion-results-anchor])
+    div[data-testid="stMetric"] {
+    padding: 2px 6px;
+}
+div[data-testid="stVerticalBlock"]:has(> div > div > div[data-fusion-results-anchor])
+    div[data-testid="stMetricLabel"] {
+    font-size: 11px;
+    color: #c0c0c8;
+}
+div[data-testid="stVerticalBlock"]:has(> div > div > div[data-fusion-results-anchor])
+    div[data-testid="stMetricValue"] {
+    font-size: 18px;
+    line-height: 1.2;
+}
+</style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.container(border=True):
+        st.markdown(
+            "<div data-fusion-results-anchor></div>",
+            unsafe_allow_html=True,
+        )
+        _render_fusion_results_body(output_dir)
+
+
+def _render_covariate_impact(results_view: dict, metric_name: str) -> None:
+    """Show per-covariate effect direction + importance + lift over CGI-only."""
+    impact = results_view.get("covariate_impact")
+    if not impact:
+        return
+
+    st.divider()
+    st.markdown("**Covariate impact**")
+    st.caption(
+        "Two OLS models fit on the full dataset using the averaged top-20 % "
+        "params: **Full** = `target ~ CGI + covariates`, **CGI-only** = "
+        "`target ~ CGI`. Coefficients show each covariate's effect direction "
+        "and magnitude in the full model; partial R² is the variance only "
+        "that covariate explains (drop in R² when it's removed from Full)."
+    )
+
+    summary_cols = st.columns(3)
+    with summary_cols[0]:
+        st.metric("Full model R²", f"{impact.get('r2_full', 0):.4f}")
+    with summary_cols[1]:
+        st.metric("CGI-only R²", f"{impact.get('r2_cgi_only', 0):.4f}")
+    with summary_cols[2]:
+        st.metric(
+            "Lift from covariates",
+            f"{impact.get('r2_lift_from_covariates', 0):.4f}",
+        )
+    st.caption(
+        f"Sample size: n = {impact.get('n', 0)} · CGI coefficient = "
+        f"{impact.get('cgi_coef', 0):.4f} "
+        f"(SE = {impact.get('cgi_std_err', 0):.4f})"
+    )
+
+    rows = impact.get("per_covariate") or []
+    if not rows:
+        return
+
+    df = pd.DataFrame(rows)
+    df = df[
+        ["covariate", "direction", "coef", "std_err", "t_stat", "pvalue", "partial_r2"]
+    ]
+    df = df.sort_values("partial_r2", ascending=False).reset_index(drop=True)
+    st.dataframe(df, use_container_width=True)
+
+    try:
+        import plotly.express as _px
+
+        bar_df = df.copy()
+        bar_df["abs_coef"] = bar_df["coef"].abs()
+        fig = _px.bar(
+            bar_df,
+            x="covariate",
+            y="coef",
+            color="direction",
+            color_discrete_map={
+                "positive": "#2ca02c",
+                "negative": "#d62728",
+                "—": "#7f7f7f",
+            },
+            title="Covariate coefficients (full model)",
+        )
+        fig.update_layout(margin=dict(l=60, r=20, t=60, b=80))
+        st.plotly_chart(fig, use_container_width=True)
+    except Exception:
+        pass
+
+
+def _render_trial_distribution_viewer(
+    results_view: dict, engine, metric_name: str, standalones: dict
+) -> None:
+    """Box-plot CI viewer for per-trial objective values.
+
+    Lets the user pick studies, trial pools (all / robust), and subsets
+    (train / val / test if recorded per trial) to compare distributions
+    side-by-side. Pulls train/val from each trial's CV-fold means stored
+    in ``user_attrs`` and test from the trial-level test attr (when
+    present); skips subsets that aren't recorded per trial.
+    """
+    study = getattr(engine, "study", None)
+    if study is None or not study.trials:
+        return
+
+    st.divider()
+    st.markdown("**Per-trial objective distributions**")
+    st.caption(
+        "Distributions are built from per-trial CV-fold means stored on "
+        "each trial. **train** / **val** are recorded for every trial; "
+        "**test** is recorded only when test-per-trial scoring is on (see "
+        "the engine's `record_test_per_trial` flag)."
+    )
+
+    try:
+        import optuna as _optuna
+        import plotly.express as _px
+    except Exception:
+        st.info("Plotly + Optuna required for the distribution viewer.")
+        return
+
+    # ── Selectors ─────────────────────────────────────────────────────
+    study_labels: list[tuple[str, dict, Any]] = [
+        ("CGI (combined)", results_view, study)
+    ]
+    for ch_key, ch_bundle in (standalones or {}).items():
+        study_labels.append(
+            (f"{_CHANNEL_DISPLAY.get(ch_key, ch_key)} (standalone)", ch_bundle, None)
+        )
+
+    sel_cols = st.columns([2, 1, 1])
+    with sel_cols[0]:
+        picked_studies = st.multiselect(
+            "Studies",
+            options=[lbl for lbl, _, _ in study_labels],
+            default=[study_labels[0][0]],
+            key="fusion_distrib_studies",
+        )
+    with sel_cols[1]:
+        pool_pick = st.selectbox(
+            "Trial pool",
+            options=["robust", "all completed"],
+            key="fusion_distrib_pool",
+        )
+    with sel_cols[2]:
+        subset_picks = st.multiselect(
+            "Subsets",
+            options=["train", "val", "test"],
+            default=["train", "val"],
+            key="fusion_distrib_subsets",
+        )
+
+    if not picked_studies or not subset_picks:
+        st.info("Pick at least one study and one subset.")
+        return
+
+    # ── Build the long-format dataframe ───────────────────────────────
+    rows: list[dict] = []
+    for lbl in picked_studies:
+        bundle = next(b for l, b, _ in study_labels if l == lbl)
+        if lbl.startswith("CGI"):
+            trial_pool = (
+                bundle.get("robust_trials") or []
+                if pool_pick == "robust"
+                else [
+                    t
+                    for t in study.trials
+                    if t.state == _optuna.trial.TrialState.COMPLETE
+                ]
+            )
+        else:
+            # Standalones: robust list is stored directly; "all
+            # completed" isn't available without reloading the standalone
+            # study from disk, so fall back to robust regardless.
+            trial_pool = bundle.get("robust_trials") or []
+
+        key_for_subset = {
+            "train": "train_score_mean",
+            "val": "val_score_mean",
+            "test": "test_score",
+        }
+        for t in trial_pool:
+            for subset in subset_picks:
+                attr_key = key_for_subset[subset]
+                v = t.user_attrs.get(attr_key)
+                if v is None:
+                    continue
+                try:
+                    fv = float(v)
+                except (TypeError, ValueError):
+                    continue
+                rows.append(
+                    {
+                        "Study": lbl,
+                        "Subset": subset,
+                        "Value": fv,
+                    }
+                )
+
+    if not rows:
+        st.info("No matching per-trial values were recorded for this selection.")
+        return
+
+    df = pd.DataFrame(rows)
+    fig = _px.box(
+        df,
+        x="Study",
+        y="Value",
+        color="Subset",
+        points="outliers",
+        title=f"Per-trial {metric_name} distributions ({pool_pick} trials)",
+    )
+    fig.update_layout(margin=dict(l=60, r=20, t=60, b=80))
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Summary stats per (Study, Subset) for users who want exact numbers.
+    with st.expander("Show distribution stats", expanded=False):
+        stats = (
+            df.groupby(["Study", "Subset"])["Value"]
+            .agg(["count", "mean", "std", "min", "max"])
+            .round(4)
+            .reset_index()
+        )
+        st.dataframe(stats, use_container_width=True)
+
+
+def _render_composite_map_viewer(results_view: dict, engine) -> None:
+    """Render the target outcome + selected study composite TIFFs together.
+
+    The user picks which composite GeoTIFFs to display alongside the
+    target outcome (drawn from the loaded polygon / point file). All
+    composite subplots share a single colorbar fixed at [0, 1]; the
+    target gets its own colorbar because its units differ. The figure
+    is rendered at 300 dpi and laid out so the subplot count fills a
+    near-square grid with minimal wasted space.
+    """
+    artifacts_dir = results_view.get("artifacts_dir")
+    if not artifacts_dir or not os.path.isdir(artifacts_dir):
+        return
+
+    # Discover composite TIFFs in the job folder: CGI + each standalone.
+    composite_options: list[tuple[str, str]] = []
+    cgi_path = os.path.join(artifacts_dir, "composite_greenery.tif")
+    if os.path.isfile(cgi_path):
+        composite_options.append(("CGI (combined)", cgi_path))
+    for ch in ("veg", "terrain", "ndvi"):
+        path = os.path.join(artifacts_dir, f"composite_greenery_{ch}.tif")
+        if os.path.isfile(path):
+            composite_options.append(
+                (f"{_CHANNEL_DISPLAY.get(ch, ch)} (standalone)", path)
+            )
+
+    if not composite_options:
+        return
+
+    st.divider()
+    st.markdown("**Composite map viewer**")
+    st.caption(
+        "Pick one or more composite GeoTIFFs to display next to the "
+        "target outcome. All composite subplots share the [0, 1] colorbar."
+    )
+
+    label_to_path = {label: path for label, path in composite_options}
+    default_pick = [composite_options[0][0]]
+    picks = st.multiselect(
+        "Studies to plot",
+        options=[label for label, _ in composite_options],
+        default=default_pick,
+        key="fusion_map_picks",
+    )
+
+    if not picks:
+        return
+
+    try:
+        import rasterio
+    except Exception:
+        st.warning("rasterio not available; cannot render maps.")
+        return
+
+    # Read each composite TIFF + the target geometries once.
+    composites: list[tuple[str, np.ndarray, Any, Any]] = []
+    common_crs = None
+    for label in picks:
+        path = label_to_path[label]
+        try:
+            with rasterio.open(path) as src:
+                arr = src.read(1, masked=True)
+                composites.append((label, arr, src.transform, src.crs))
+                if common_crs is None:
+                    common_crs = src.crs
+        except Exception as exc:
+            st.warning(f"Could not read {label}: {exc}")
+
+    if not composites:
+        return
+
+    target_gdf = None
+    target_feature = results_view.get("target_feature")
+    try:
+        if engine is not None and engine.target_polygons_gdf is not None:
+            target_gdf = engine.target_polygons_gdf.copy()
+        elif engine is not None and engine.target_gdf is not None:
+            target_gdf = engine.target_gdf.copy()
+        if target_gdf is not None and common_crs is not None:
+            target_gdf = target_gdf.to_crs(common_crs)
+    except Exception as exc:
+        st.warning(f"Could not reproject target: {exc}")
+        target_gdf = None
+
+    # Figure layout: target + N composites packed into a near-square grid
+    # that minimises wasted slots.
+    total = len(composites) + (1 if target_gdf is not None else 0)
+    import math as _math
+
+    ncols = max(1, int(_math.ceil(_math.sqrt(total))))
+    nrows = max(1, int(_math.ceil(total / ncols)))
+
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(4.5 * ncols, 4.5 * nrows),
+        dpi=300,
+        constrained_layout=True,
+    )
+    flat_axes = np.atleast_1d(axes).ravel().tolist()
+
+    panel_idx = 0
+    # ── Target panel ─────────────────────────────────────────────────
+    if target_gdf is not None and target_feature is not None:
+        ax = flat_axes[panel_idx]
+        panel_idx += 1
+        try:
+            if target_feature in target_gdf.columns:
+                vals = (
+                    target_gdf[target_feature]
+                    .astype(float)
+                    .replace([np.inf, -np.inf], np.nan)
+                )
+                target_gdf.plot(
+                    column=vals,
+                    ax=ax,
+                    cmap="RdYlGn",
+                    legend=True,
+                    legend_kwds={"shrink": 0.7},
+                    missing_kwds={"color": "#cccccc"},
+                )
+                ax.set_title(f"Target: {target_feature}", fontsize=10)
+            else:
+                target_gdf.boundary.plot(ax=ax, color="black", linewidth=0.5)
+                ax.set_title("Target geometry", fontsize=10)
+        except Exception as exc:
+            ax.text(0.5, 0.5, f"Target render failed:\n{exc}", ha="center", va="center")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_aspect("equal")
+
+    # ── Composite panels (shared colorbar at [0, 1]) ─────────────────
+    last_im = None
+    for label, arr, transform, crs in composites:
+        ax = flat_axes[panel_idx]
+        panel_idx += 1
+        try:
+            data = np.ma.masked_invalid(arr)
+            height, width = data.shape
+            from rasterio.transform import array_bounds as _ab
+
+            left, bottom, right, top = _ab(height, width, transform)
+            last_im = ax.imshow(
+                data,
+                cmap="RdYlGn",
+                vmin=0.0,
+                vmax=1.0,
+                extent=(left, right, bottom, top),
+                origin="upper",
+                interpolation="nearest",
+            )
+            if target_gdf is not None:
+                try:
+                    target_gdf.boundary.plot(ax=ax, color="black", linewidth=0.3)
+                except Exception:
+                    pass
+        except Exception as exc:
+            ax.text(0.5, 0.5, f"Render failed:\n{exc}", ha="center", va="center")
+        ax.set_title(label, fontsize=10)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_aspect("equal")
+
+    # Hide unused axes (when total < ncols*nrows).
+    for ax in flat_axes[panel_idx:]:
+        ax.set_visible(False)
+
+    # One shared colorbar for every composite panel.
+    if last_im is not None:
+        composite_axes = flat_axes[(1 if target_gdf is not None else 0) : panel_idx]
+        if composite_axes:
+            cbar = fig.colorbar(
+                last_im,
+                ax=composite_axes,
+                shrink=0.7,
+                fraction=0.04,
+                pad=0.02,
+            )
+            cbar.set_label("Composite (0–1)")
+
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+
+
+def _render_optuna_plot_explorer(engine, results_view: dict, metric_name: str) -> None:
+    """Live Optuna visualisation picker.
+
+    Renders all standard ``optuna.visualization`` plots from the in-memory
+    study. The user picks the plot type, the trial pool (all completed
+    trials vs the robust subset), and — when applicable — the parameter
+    axes. Returns silently if the engine doesn't carry a study (e.g.
+    legacy bundles).
+    """
+    study = getattr(engine, "study", None)
+    if study is None:
+        return
+
+    try:
+        import optuna as _optuna
+        from optuna.visualization import (
+            plot_contour,
+            plot_edf,
+            plot_optimization_history,
+            plot_parallel_coordinate,
+            plot_param_importances,
+            plot_rank,
+            plot_slice,
+            plot_timeline,
+        )
+    except Exception:
+        return
+
+    completed = [
+        t for t in study.trials if t.state == _optuna.trial.TrialState.COMPLETE
+    ]
+    if not completed:
+        return
+
+    robust_trials = results_view.get("robust_trials") or []
+
+    st.divider()
+    st.markdown("**Interactive Plots**")
+
+    plot_options = [
+        "Optimization history",
+        "Parameter importances",
+        "Parallel coordinates",
+        "Slice",
+        "Contour",
+        "Rank",
+        "EDF",
+        "Timeline",
+    ]
+    selector_cols = st.columns([2, 2])
+    with selector_cols[0]:
+        plot_pick = st.selectbox(
+            "Plot type",
+            options=plot_options,
+            key="fusion_optuna_plot_pick",
+        )
+    with selector_cols[1]:
+        pool_options = ["All completed trials"]
+        if robust_trials:
+            pool_options.append(f"Robust only ({len(robust_trials)})")
+        pool_pick = st.selectbox(
+            "Trial pool",
+            options=pool_options,
+            key="fusion_optuna_pool_pick",
+        )
+
+    if pool_pick.startswith("Robust"):
+        sub_study = _optuna.create_study(
+            direction=study.direction, sampler=study.sampler
+        )
+        for t in robust_trials:
+            sub_study.add_trial(t)
+        target_study = sub_study
+    else:
+        target_study = study
+
+    # Discover the union of parameter names across the picked pool so
+    # axis selectors only offer params that actually exist in the data
+    # being plotted.
+    available_params: list[str] = sorted(
+        {p for t in target_study.trials for p in t.params}
+    )
+
+    params_axes_needed = plot_pick in {
+        "Parallel coordinates",
+        "Slice",
+        "Contour",
+        "Rank",
+    }
+
+    selected_params: list[str] | None = None
+    if params_axes_needed and available_params:
+        default_axes = available_params[: min(3, len(available_params))]
+        selected_params = st.multiselect(
+            "Parameters to include",
+            options=available_params,
+            default=default_axes,
+            key=f"fusion_optuna_params_{plot_pick}",
+        )
+        if not selected_params:
+            st.info("Pick at least one parameter to draw this plot.")
+            return
+
+    try:
+        if plot_pick == "Optimization history":
+            fig = plot_optimization_history(target_study)
+        elif plot_pick == "Parameter importances":
+            fig = plot_param_importances(target_study)
+        elif plot_pick == "Parallel coordinates":
+            fig = plot_parallel_coordinate(target_study, params=selected_params)
+            # The y-axis label ("Objective Value" by default) sits in the
+            # very left margin and Optuna's default layout clips it.
+            # Add explicit padding so every label is visible regardless
+            # of window width.
+            fig.update_layout(
+                margin=dict(l=120, r=80, t=70, b=60),
+                width=None,
+            )
+        elif plot_pick == "Slice":
+            fig = plot_slice(target_study, params=selected_params)
+        elif plot_pick == "Contour":
+            if not selected_params or len(selected_params) < 2:
+                st.info("Contour needs at least two parameters.")
+                return
+            fig = plot_contour(target_study, params=selected_params)
+        elif plot_pick == "Rank":
+            fig = plot_rank(target_study, params=selected_params)
+        elif plot_pick == "EDF":
+            fig = plot_edf(target_study)
+        elif plot_pick == "Timeline":
+            fig = plot_timeline(target_study)
+        else:
+            return
+        st.plotly_chart(fig, use_container_width=True)
+    except Exception as exc:
+        st.warning(f"Could not render {plot_pick}: {exc}")
+
+
+def _render_fusion_results_body(output_dir: str) -> None:
+    """Inner body of the results panel — kept separate so the styled
+    container above stays readable."""
+    head_col, clear_col = st.columns([4, 1])
+    with head_col:
+        st.subheader("Optimization Results")
+    with clear_col:
+        if st.button(
+            "Clear",
+            key="fusion_results_clear",
+            use_container_width=True,
+            help="Unload these results from the panel (does not delete files).",
+        ):
+            st.session_state.fusion_engine = None
+            st.session_state.fusion_results = None
+            st.session_state.fusion_engines_by_target = {}
+            st.rerun()
+
+    results = st.session_state.fusion_results
+    if results.get("mode") == "multi":
+        st.selectbox(
+            "Select outcome",
+            options=results["ordered_labels"],
+            key="fusion_results_outcome_pick",
+        )
+
+    results_view, engine = _fusion_resolve_active_bundle()
+    if engine is None or results_view is None:
+        st.warning("Optimization details are not available for the selected outcome.")
+        return
+
+    metric_name = results_view["objective_metric"].upper()
+    best_params = results_view.get("best_params") or {}
+    averaged_params_raw = results_view.get("averaged_params") or {}
+    final_params = {
+        k: v for k, v in averaged_params_raw.items() if not k.startswith("__")
+    } or best_params
+
+    # Formula introspection. Legacy results from before the formula
+    # registry don't carry the attribute → fall back to weighted_average
+    # so old studies still render with the original three weights.
+    formula_name = getattr(engine, "cgi_formula", "weighted_average")
+    try:
+        formula = _cgi_formulas.get_formula(formula_name)
+    except ValueError:
+        formula = _cgi_formulas.get_formula("weighted_average")
+
+    covariates_used = list(getattr(engine, "covariate_columns", []) or [])
+
+    # ── Top summary: averaged top-20% params, grouped by category ──────
+    # The composite GeoTIFF is built from these averaged params, so the
+    # overview reports them rather than the single best trial. Four
+    # rows in order: formula + headline scores · weights · radii · aggregators.
+    _CHANNEL_LABELS = _CHANNEL_DISPLAY
+    _FORMULA_DISPLAY = {
+        "weighted_average": "Weighted Average",
+        "synergy": "Synergy",
+    }
+
+    def _agg_label(stat: str | None, percentile: int | float | None) -> str:
+        if stat == "mean":
+            return "Mean"
+        if stat == "median":
+            return "Median"
+        if stat == "percentile":
+            try:
+                p = int(round(float(percentile)))
+            except (TypeError, ValueError):
+                return "Percentile"
+            suffix = "th"
+            if p % 100 not in (11, 12, 13):
+                suffix = {1: "st", 2: "nd", 3: "rd"}.get(p % 10, "th")
+            return f"{p}{suffix} percentile"
+        return "—"
+
+    # ── Row 1: formula · top-20% test score · robust ratio ─────────────
+    test_subset_score = (
+        (results_view.get("subset_scores") or {}).get("test") or {}
+    ).get("score")
+    formula_display = _FORMULA_DISPLAY.get(formula.name, formula.name.title())
+
+    headline_cols = st.columns(3)
+    with headline_cols[0]:
+        st.metric("CGI Formula", formula_display)
+    with headline_cols[1]:
+        if test_subset_score is not None:
+            st.metric(
+                f"Test {metric_name} (avg top-20%)",
+                f"{float(test_subset_score):.4f}",
+            )
+        else:
+            st.metric(f"Best {metric_name}", f"{results_view['best_value']:.4f}")
+    with headline_cols[2]:
+        if results_view["robust_trials"]:
+            st.metric(
+                "Robust Trials",
+                f"{len(results_view['robust_trials'])}/{len(engine.study.trials)}",
+            )
+        else:
+            st.metric("Total Trials", len(engine.study.trials))
+
+    # ── Row 2: weights ─────────────────────────────────────────────────
+    if formula.name == _cgi_formulas.WEIGHTED_AVERAGE:
+        st.markdown("**Weights (averaged top-20%)**")
+        weight_cols = st.columns(len(formula.weight_keys))
+        total_weight = sum(float(final_params.get(k, 0)) for k in formula.weight_keys)
+        for col, key in zip(weight_cols, formula.weight_keys):
+            ch = key.removesuffix("_weight")
+            label = _CHANNEL_LABELS.get(ch, ch.upper())
+            pct = (
+                100.0 * float(final_params.get(key, 0)) / total_weight
+                if total_weight > 0
+                else 0.0
+            )
+            with col:
+                st.metric(label, f"{pct:.1f}%")
+    else:
+        st.markdown("**Weights and powers (averaged top-20%)**")
+        all_keys = list(formula.weight_keys) + list(formula.power_keys)
+        groups = [all_keys[i : i + 4] for i in range(0, len(all_keys), 4)]
+        for group in groups:
+            cols = st.columns(len(group))
+            for col, key in zip(cols, group):
+                val = float(final_params.get(key, 0))
+                if key in formula.power_keys:
+                    pretty = key.removesuffix("_power").upper() + " power"
+                    with col:
+                        st.metric(pretty, f"{val:.2f}")
+                else:
+                    pretty = key.removeprefix("w_").replace("_", "·").upper() + " %"
+                    with col:
+                        st.metric(pretty, f"{val:.1f}")
+
+    # ── Row 3: radii ───────────────────────────────────────────────────
+    st.markdown("**Radii (m)**")
+    radii_cols = st.columns(3)
+    for col, key in zip(radii_cols, ("veg_radius", "terrain_radius", "ndvi_radius")):
+        ch = key.removesuffix("_radius")
+        label = _CHANNEL_LABELS.get(ch, ch.upper())
+        with col:
+            try:
+                v = int(round(float(final_params.get(key, 0))))
+                st.metric(label, f"{v} m")
+            except (TypeError, ValueError):
+                st.metric(label, "—")
+
+    # ── Row 4: aggregators ─────────────────────────────────────────────
+    st.markdown("**Aggregators**")
+    agg_cols = st.columns(2)
+    with agg_cols[0]:
+        st.metric(
+            "GVI (Vegetation + Terrain)",
+            _agg_label(
+                final_params.get("streetview_stat"),
+                final_params.get("streetview_percentile"),
+            ),
+        )
+    with agg_cols[1]:
+        st.metric(
+            "NDVI",
+            _agg_label(
+                final_params.get("ndvi_stat"),
+                final_params.get("ndvi_percentile"),
+            ),
+        )
+
+    st.caption(
+        "**Covariates:** "
+        + (
+            ", ".join(f"`{c}`" for c in covariates_used)
+            if covariates_used
+            else "_none_"
+        )
+        + (
+            "  ·  ℹ️ `mutual_info` ignores covariates"
+            if results_view["objective_metric"] == "mutual_info" and covariates_used
+            else ""
+        )
+    )
+    artifacts_dir = results_view.get("artifacts_dir")
+    if artifacts_dir:
+        st.caption(f"📁 Job artifacts: `{artifacts_dir}`")
+
+    col_detail1, col_detail2 = st.columns(2)
+
+    with col_detail1:
+        st.markdown("**Best Trial Details**")
+        best_trial = engine.study.best_trial
+
+        info_data: dict = {
+            "Trial Number": best_trial.number,
+            "Buffer Distance": f"{engine.buffer_meters}m",
+        }
+        # Formula-driven weight + power dump, then shared spatial params,
+        # then the train/val scores + p-values.
+        for k in formula.weight_keys:
+            info_data[f"{k} (raw)"] = best_params.get(k, "N/A")
+        for k in formula.power_keys:
+            info_data[k] = best_params.get(k, "N/A")
+        for k in ("veg_radius", "terrain_radius", "ndvi_radius"):
+            info_data[k] = best_params.get(k, "N/A")
+        if covariates_used:
+            info_data["Covariates controlled"] = covariates_used
+
+        info_data[f"Train {metric_name}"] = (
+            f"{best_trial.user_attrs.get('train_score_mean', 'N/A')}"
+        )
+        info_data[f"Val {metric_name}"] = (
+            f"{best_trial.user_attrs.get('val_score_mean', 'N/A')}"
+        )
+
+        if "train_pvalue" in best_trial.user_attrs:
+            info_data["Train p-value"] = f"{best_trial.user_attrs['train_pvalue']:.4e}"
+        if "val_pvalue" in best_trial.user_attrs:
+            info_data["Val p-value"] = f"{best_trial.user_attrs['val_pvalue']:.4e}"
+
+        st.json(info_data)
+
+    with col_detail2:
+        averaged_params = results_view.get("averaged_params") or {}
+        if averaged_params:
+            st.markdown("**Final (averaged top-20%) Parameters**")
+            clean_avg = {
+                k: v for k, v in averaged_params.items() if not k.startswith("__")
+            }
+            st.json(clean_avg)
+            n_top = averaged_params.get("__n_top_trials__")
+            n_robust = averaged_params.get("__n_robust_trials__")
+            if n_top is not None and n_robust is not None:
+                st.caption(
+                    f"Ensemble of the top {n_top} trials from "
+                    f"{n_robust} robust trials. These are the params "
+                    "used to render the composite GeoTIFF."
+                )
+        else:
+            st.caption("_No averaged top-20% parameters were recorded for this run._")
+
+    # ── Interactive Optuna plot viewer ─────────────────────────────────
+    # The user picks a plot type and (optionally) a study filter +
+    # parameter axes; the plot is rendered live from the in-memory study
+    # so it's free to explore without regenerating files on disk.
+    _render_optuna_plot_explorer(engine, results_view, metric_name)
+
+    # ── Robust trials browser (CGI + per-standalone) ─────────────────
+    # One scrollable dataframe per study. The selector lets the user
+    # pivot between the combined CGI run and each standalone single-
+    # metric study without leaving the results panel.
+    study_options: list[tuple[str, dict, Any]] = [
+        (
+            "CGI (combined)",
+            results_view,
+            engine,
+        )
+    ]
+    standalones_for_robust = results_view.get("standalones") or {}
+    for _ch, _ch_bundle in standalones_for_robust.items():
+        study_options.append(
+            (
+                f"{_CHANNEL_DISPLAY.get(_ch, _ch)} (standalone)",
+                _ch_bundle,
+                engine,  # standalone study object isn't pickled separately
+            )
+        )
+
+    if any(opt[1].get("robust_trials") for opt in study_options):
+        st.divider()
+        st.markdown("**Robust Trials (Statistically Significant)**")
+
+        picked = st.selectbox(
+            "Study",
+            options=[opt[0] for opt in study_options],
+            key="fusion_robust_study_pick",
+        )
+        picked_view = next(opt[1] for opt in study_options if opt[0] == picked)
+        picked_robust = picked_view.get("robust_trials") or []
+
+        def _wlabel(key: str) -> str:
+            cleaned = key.removeprefix("w_").removesuffix("_weight")
+            return cleaned.replace("_", "·").upper() + " %"
+
+        def _plabel(key: str) -> str:
+            return key.removesuffix("_power").upper() + " p"
+
+        if not picked_robust:
+            st.info("No robust trials in this study.")
+        else:
+            # Standalones never suggest weights for non-active channels;
+            # show 100 % on the active one and "—" for inapplicable columns.
+            picked_channel: str | None = picked_view.get("channel")
+            active_weight_keys: set[str] = set()
+            if picked_channel == "veg":
+                active_weight_keys = {"veg_weight", "w_veg"}
+            elif picked_channel == "terrain":
+                active_weight_keys = {"terrain_weight", "w_ter"}
+            elif picked_channel == "ndvi":
+                active_weight_keys = {"ndvi_weight", "w_ndvi"}
+
+            def _radius_applies(radius_key: str) -> bool:
+                if picked_channel is None:
+                    return True
+                return radius_key == f"{picked_channel}_radius"
+
+            def _stat_applies(stat_key: str) -> bool:
+                if picked_channel is None:
+                    return True
+                if picked_channel == "ndvi":
+                    return stat_key == "ndvi_stat"
+                return stat_key == "streetview_stat"
+
+            robust_data: list[dict] = []
+            for t in picked_robust:
+                row: dict = {"Trial": t.number}
+                if picked_channel is None:
+                    weight_total = sum(
+                        float(t.params.get(k, 0)) for k in formula.weight_keys
+                    )
+                    for k in formula.weight_keys:
+                        row[_wlabel(k)] = (
+                            round(100.0 * float(t.params.get(k, 0)) / weight_total, 1)
+                            if weight_total > 0
+                            else 0.0
+                        )
+                else:
+                    # Standalone: synthesize 100/0 weights so the table
+                    # mirrors the actual scoring (single channel only).
+                    for k in formula.weight_keys:
+                        row[_wlabel(k)] = 100.0 if k in active_weight_keys else 0.0
+                for k in formula.power_keys:
+                    row[_plabel(k)] = round(float(t.params.get(k, 1.0)), 2)
+                for k in ("veg_radius", "terrain_radius", "ndvi_radius"):
+                    label = k.replace("_", " ")
+                    if k in t.params and _radius_applies(k):
+                        row[label] = t.params[k]
+                    elif _radius_applies(k):
+                        row[label] = None
+                for k in ("streetview_stat", "ndvi_stat"):
+                    label = k.replace("_", " ")
+                    if k in t.params and _stat_applies(k):
+                        row[label] = t.params[k]
+                    elif _stat_applies(k):
+                        row[label] = "—"
+                for k in ("streetview_percentile", "ndvi_percentile"):
+                    label = k.replace("_", " ")
+                    stat_key = (
+                        "ndvi_stat" if k == "ndvi_percentile" else "streetview_stat"
+                    )
+                    if (
+                        k in t.params
+                        and _stat_applies(stat_key)
+                        and t.params.get(stat_key) == "percentile"
+                    ):
+                        row[label] = t.params[k]
+                train_mean = t.user_attrs.get("train_score_mean")
+                val_mean = t.user_attrs.get("val_score_mean")
+                train_pv = t.user_attrs.get("train_pvalue_mean")
+                val_pv = t.user_attrs.get("val_pvalue_mean")
+                row[f"Train {metric_name}"] = (
+                    round(float(train_mean), 4) if train_mean is not None else None
+                )
+                row[f"Val {metric_name}"] = (
+                    round(float(val_mean), 4) if val_mean is not None else None
+                )
+                row["Train p"] = float(train_pv) if train_pv is not None else None
+                row["Val p"] = float(val_pv) if val_pv is not None else None
+                robust_data.append(row)
+
+            st.caption(
+                f"Showing all {len(robust_data)} robust trials. "
+                "Sort by clicking column headers; scroll inside the table "
+                "to see more rows."
+            )
+            st.dataframe(
+                pd.DataFrame(robust_data),
+                use_container_width=True,
+                height=420,
+            )
+
+    standalones = results_view.get("standalones") or {}
+    if standalones and any(b.get("subset_scores") for b in standalones.values()):
+        st.divider()
+        st.markdown("**CGI vs Standalone Single-Metric Studies**")
+
+        # Subset / value multi-select; scores are pre-cached in the bundle.
+        subset_cols = st.columns([1, 1])
+        with subset_cols[0]:
+            subset_picks = st.multiselect(
+                "Data subsets",
+                options=["train", "val", "test", "all"],
+                default=["test"],
+                key="fusion_subset_pick",
+                help="Scores recorded per study with the averaged top-20% params.",
+            )
+        with subset_cols[1]:
+            value_picks = st.multiselect(
+                "Values",
+                options=["score", "pvalue", "n"],
+                default=["score"],
+                key="fusion_subset_value_pick",
+                help="Rendered as separate charts (different scales).",
+            )
+
+        if not subset_picks or not value_picks:
+            st.info("Pick at least one subset and one value to compare.")
+        else:
+
+            def _study_label(key: str) -> str:
+                if key == "cgi":
+                    return "CGI (combined)"
+                return f"{_CHANNEL_DISPLAY.get(key, key)} (standalone)"
+
+            all_studies: list[tuple[str, dict]] = [("cgi", results_view)]
+            for ch_key, ch_bundle in standalones.items():
+                all_studies.append((ch_key, ch_bundle))
+
+            try:
+                import plotly.express as _px
+            except Exception:
+                _px = None
+
+            # One grouped-bar chart per value (different scales can't share an axis).
+            for value_pick in value_picks:
+                rows: list[dict] = []
+                for sk, bundle in all_studies:
+                    for subset_pick in subset_picks:
+                        sub = (bundle.get("subset_scores") or {}).get(subset_pick) or {}
+                        val = sub.get(value_pick)
+                        try:
+                            fval = float(val) if val is not None else None
+                        except (TypeError, ValueError):
+                            fval = None
+                        rows.append(
+                            {
+                                "Study": _study_label(sk),
+                                "Subset": subset_pick,
+                                "Value": fval,
+                            }
+                        )
+
+                df = pd.DataFrame(rows)
+                y_title = {
+                    "score": f"{metric_name}",
+                    "pvalue": "p-value",
+                    "n": "n entities",
+                }[value_pick]
+
+                if _px is not None:
+                    fig = _px.bar(
+                        df,
+                        x="Study",
+                        y="Value",
+                        color="Subset",
+                        barmode="group",
+                        title=y_title,
+                        labels={"Value": y_title},
+                    )
+                    fig.update_layout(
+                        margin=dict(l=60, r=20, t=60, b=60),
+                        legend_title_text="Subset",
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    # Fallback: pivot to wide and use streamlit's
+                    # native bar chart, which auto-groups by columns.
+                    wide = df.pivot(index="Study", columns="Subset", values="Value")
+                    st.markdown(f"_{y_title}_")
+                    st.bar_chart(wide, use_container_width=True)
+
+            # Compact textual summary so users can read off exact values.
+            with st.expander("Show exact values", expanded=False):
+                summary: list[dict] = []
+                for sk, bundle in all_studies:
+                    for subset_pick in subset_picks:
+                        sub = (bundle.get("subset_scores") or {}).get(subset_pick) or {}
+                        row: dict = {
+                            "Study": _study_label(sk),
+                            "Subset": subset_pick,
+                        }
+                        for value_pick in value_picks:
+                            v = sub.get(value_pick)
+                            try:
+                                fv = float(v) if v is not None else None
+                            except (TypeError, ValueError):
+                                fv = None
+                            if fv is None:
+                                row[value_pick] = "—"
+                            elif value_pick == "pvalue":
+                                row[value_pick] = f"{fv:.4e}"
+                            elif value_pick == "n":
+                                row[value_pick] = int(fv)
+                            else:
+                                row[value_pick] = round(fv, 4)
+                        summary.append(row)
+                st.dataframe(pd.DataFrame(summary), use_container_width=True)
+
+    # ── Covariate impact panel ────────────────────────────────────────
+    _render_covariate_impact(results_view, metric_name)
+
+    # ── Per-trial CI box plot viewer ──────────────────────────────────
+    _render_trial_distribution_viewer(results_view, engine, metric_name, standalones)
+
+    # ── Composite map viewer ──────────────────────────────────────────
+    _render_composite_map_viewer(results_view, engine)
+
+    # ── Mixed-effects post-hoc metrics CSV viewer ─────────────────────
+    # The post-score stage writes one CSV per study (CGI + each
+    # standalone) under the job's ``study_results/`` directory. Pull
+    # the artifacts dir from the bundle so we look in the right per-
+    # job folder; fall back to the legacy shared location for older
+    # bundles that don't carry one.
+    try:
+        bundle_artifacts = results_view.get("artifacts_dir")
+        if bundle_artifacts:
+            _study_root = os.path.join(bundle_artifacts, "study_results")
+        else:
+            _study_root = os.path.join(output_dir, "fusion", "study_results")
+        _active_label = (
+            st.session_state.get("fusion_results_outcome_pick")
+            if results.get("mode") == "multi"
+            else None
+        )
+
+        def _match_outcome(fname: str) -> bool:
+            if _active_label is None:
+                return f"__{_active_label}" not in fname
+            return f"__{_active_label}" in fname
+
+        _csv_paths: list[str] = []
+        if os.path.isdir(_study_root):
+            for _fn in sorted(os.listdir(_study_root)):
+                if not _fn.startswith("mixedlm_metrics") or not _fn.endswith(".csv"):
+                    continue
+                if not _match_outcome(_fn):
+                    continue
+                _csv_paths.append(os.path.join(_study_root, _fn))
+
+        if _csv_paths:
+            st.divider()
+            st.markdown("**Mixed-effects: all metrics across trial pools**")
+            st.caption(
+                "Each pool's per-trial rows are followed by "
+                "`__mean__`, `__ci_lo__`, `__ci_hi__`, and `__n__` "
+                "summary rows."
+            )
+
+            def _tab_label(path: str) -> str:
+                base = os.path.basename(path).replace(".csv", "")
+                if _active_label:
+                    base = base.replace(
+                        f"mixedlm_metrics__{_active_label}", "CGI"
+                    ).replace(f"__{_active_label}__", "__")
+                else:
+                    base = base.replace("mixedlm_metrics", "CGI")
+                return base.replace("__", " ").strip() or "CGI"
+
+            _tab_labels = [_tab_label(p) for p in _csv_paths]
+            _tabs = st.tabs(_tab_labels)
+            for _tab, _path in zip(_tabs, _csv_paths):
+                with _tab:
+                    st.caption(f"Source: `{_path}`")
+                    st.dataframe(pd.read_csv(_path), use_container_width=True)
+    except Exception as _exc:  # pragma: no cover -- UI-only guard
+        st.warning(f"Could not read mixedlm_metrics CSVs: {_exc}")
 
 
 def render(output_dir: str) -> None:
@@ -1549,6 +2713,16 @@ def render(output_dir: str) -> None:
         st.session_state.fusion_outcome_columns = []
     if "fusion_engines_by_target" not in st.session_state:
         st.session_state.fusion_engines_by_target = {}
+
+    # =========================================================================
+    # Loaded-results overview
+    # =========================================================================
+    # Render the results section first so it survives the configuration-UI
+    # early returns below. The user loads a completed job's bundle via the
+    # **Load results** button in the sidebar Job Monitor; once loaded, this
+    # block keeps showing it across page refreshes and across changes to
+    # the configuration form below.
+    _render_fusion_results_section(output_dir)
 
     # =========================================================================
     # ROW 1: Configuration (Left) | Preview (Right)
@@ -1663,11 +2837,7 @@ def render(output_dir: str) -> None:
                                 options=[_FUSION_OUTCOME_ADD_PLACEHOLDER] + remaining,
                                 key="fusion_add_outcome_column",
                                 on_change=_fusion_append_outcome_callback,
-                                help=(
-                                    "Add each numeric outcome in order; after each "
-                                    "choice the list updates for the next column. "
-                                    "Each selection is used as an optimization target."
-                                ),
+                                help="Each selection becomes one optimization target.",
                             )
                         elif not numeric_cols:
                             st.warning("No numeric columns found in this target.")
@@ -1681,11 +2851,7 @@ def render(output_dir: str) -> None:
                             multi_objective_requested = st.checkbox(
                                 "Multi-objective optimization run",
                                 value=False,
-                                help=(
-                                    "When enabled, requests a joint optimization across all "
-                                    "selected outcomes. Full multi-objective fusion is not "
-                                    "available yet; runs stay sequential until implemented."
-                                ),
+                                help="Joint multi-objective optimization (currently runs sequentially).",
                                 key="fusion_multi_objective_run",
                             )
                     except Exception as e:
@@ -1908,15 +3074,25 @@ def render(output_dir: str) -> None:
                 )
         available_covariates = [c for c in numeric_attr_cols if c not in outcome_set]
 
-    with st.form("fusion_metric_run"):
+    # Only render polygon-only controls when the target carries polygons.
+    is_polygon_target_ui = False
+    if is_vector_target and preview_vector_gdf is not None:
+        try:
+            gt = preview_vector_gdf.geometry.geom_type
+            is_polygon_target_ui = bool(gt.isin(["Polygon", "MultiPolygon"]).any())
+        except Exception:
+            is_polygon_target_ui = False
+
+    with st.container():
         study_state = _render_study_details_panel(
             is_longitudinal=is_longitudinal,
             available_covariates=available_covariates,
+            is_polygon_target=is_polygon_target_ui,
         )
         st.divider()
         _fus_run_spacer, _fus_run_col = st.columns([2.2, 1])
         with _fus_run_col:
-            fusion_run_clicked = st.form_submit_button(
+            fusion_run_clicked = st.button(
                 "🚀 Run Fusion Optimization",
                 type="primary",
                 use_container_width=True,
@@ -1933,12 +3109,16 @@ def render(output_dir: str) -> None:
     optimizer = study_state["optimizer"]
     k_folds = study_state["k_folds"]
     test_size = study_state["test_size"]
+    val_size = study_state.get("val_size", 0.25)
     n_bins = study_state["n_bins"]
     resume_existing_study = study_state["resume_existing_study"]
     run_standalones = study_state["run_standalones"]
     pruner_type = "none"  # UI removed; engine accepts NopPruner via "none"
     lon_random_slope = study_state["mixedlm_random_slope"]
     lon_include_time_fixed = study_state["mixedlm_time_fixed"]
+    cgi_grid_spacing_m_param = study_state.get("cgi_grid_spacing_m")
+    whole_grid_scaling_param = bool(study_state.get("whole_grid_scaling", False))
+    area_balanced_split_param = bool(study_state.get("area_balanced_split", False))
 
     # =========================================================================
     # Run controls and progress
@@ -1949,26 +3129,68 @@ def render(output_dir: str) -> None:
     with col_run2:
         if st.session_state.fusion_results:
             if st.button(
-                "📊 Export Results", use_container_width=True, key="fusion_export"
+                "Export per-entity CGI",
+                use_container_width=True,
+                key="fusion_export",
+                help="One row per target entity with sampled channels + composite CGI.",
             ):
                 bundle, _eng = _fusion_resolve_active_bundle()
                 if bundle is None or bundle.get("composite_df") is None:
                     st.error("No composite table available to export.")
+                elif _eng is None:
+                    st.error("Engine state unavailable; cannot attach geometries.")
                 else:
-                    result_df = bundle["composite_df"]
-                    export_gdf = gpd.GeoDataFrame(
-                        result_df,
-                        geometry=gpd.points_from_xy(
-                            result_df.index % 100, result_df.index // 100
-                        ),
-                        crs="EPSG:4326",
+                    result_df = bundle["composite_df"].copy()
+                    artifacts_dir = bundle.get("artifacts_dir") or output_dir
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+                    geom_attached = False
+                    export_path: str | None = None
+
+                    if (
+                        "polygon_id" in result_df.columns
+                        and _eng.target_polygons_gdf is not None
+                    ):
+                        polys = _eng.target_polygons_gdf.reset_index(drop=True).copy()
+                        polys["polygon_id"] = polys.index
+                        keep_attr_cols = [
+                            c for c in polys.columns if c == "geometry"
+                        ] + ["polygon_id"]
+                        result_gdf = polys[keep_attr_cols].merge(
+                            result_df, on="polygon_id", how="inner"
+                        )
+                        export_path = os.path.join(
+                            artifacts_dir,
+                            f"fusion_composite_{ts}.gpkg",
+                        )
+                        result_gdf.to_file(export_path, driver="GPKG", layer="cgi")
+                        geom_attached = True
+                    elif _eng.target_gdf is not None and len(_eng.target_gdf) == len(
+                        result_df
+                    ):
+                        base = _eng.target_gdf.reset_index(drop=True).copy()
+                        for col in result_df.columns:
+                            base[col] = result_df[col].reset_index(drop=True).values
+                        export_path = os.path.join(
+                            artifacts_dir,
+                            f"fusion_composite_{ts}.gpkg",
+                        )
+                        base.to_file(export_path, driver="GPKG", layer="cgi")
+                        geom_attached = True
+
+                    if not geom_attached:
+                        export_path = os.path.join(
+                            artifacts_dir,
+                            f"fusion_composite_{ts}.csv",
+                        )
+                        result_df.to_csv(export_path, index=False)
+
+                    st.success(f"Exported {len(result_df)} rows to: `{export_path}`")
+                    st.caption(
+                        "Columns: `polygon_id`, `target`, `veg` / `terrain` / "
+                        "`ndvi`, `composite`, `n_samples`. Geometries joined "
+                        "from the loaded target file."
                     )
-                    export_path = os.path.join(
-                        output_dir,
-                        f"fusion_composite_{datetime.now().strftime('%Y%m%d_%H%M%S')}.geojson",
-                    )
-                    export_gdf.to_file(export_path, driver="GeoJSON")
-                    st.success(f"Exported to: {export_path}")
     with col_run3:
         if st.session_state.fusion_results:
             if st.button("🔄 Reset", use_container_width=True, key="fusion_reset"):
@@ -1996,7 +3218,6 @@ def render(output_dir: str) -> None:
                 st.error(f"❌ {_err}")
         else:
             # ── Build LongitudinalSpec (or None) ─────────────────────────
-            from geofuse.longitudinal import GREENERY_CHANNELS as _LON_CHANNELS
             from geofuse.longitudinal import LongitudinalSpec as _LonSpec
             from geofuse.longitudinal import validate_spec as _validate_lon_spec
 
@@ -2233,6 +3454,7 @@ def render(output_dir: str) -> None:
                     "n_bins": int(n_bins),
                     "cache_metrics": bool(cache_metrics),
                     "test_size": float(test_size),
+                    "val_size": float(val_size),
                     "k_folds": int(k_folds),
                     "ndvi_start_date": ndvi_auto_start.isoformat(),
                     "ndvi_end_date": ndvi_auto_end.isoformat(),
@@ -2248,6 +3470,17 @@ def render(output_dir: str) -> None:
                     "has_api_key": False,
                     "metric_mode": "Upload Files",
                     "longitudinal_spec_payload": longitudinal_spec_payload,
+                    "cgi_grid_spacing_m": (
+                        int(cgi_grid_spacing_m_param)
+                        if cgi_grid_spacing_m_param is not None and is_polygon_target_ui
+                        else None
+                    ),
+                    "whole_grid_scaling": (
+                        whole_grid_scaling_param if is_polygon_target_ui else False
+                    ),
+                    "area_balanced_split": (
+                        area_balanced_split_param if is_polygon_target_ui else False
+                    ),
                 },
             )
             # Attach per-wave file fingerprints to the spec payload so the
@@ -2297,6 +3530,7 @@ def render(output_dir: str) -> None:
                 veg_path=veg_path,
                 ndvi_path=ndvi_path,
                 test_size=test_size,
+                val_size=float(val_size),
                 k_folds=k_folds,
                 n_trials=n_trials,
                 n_startup_trials=n_startup_trials,
@@ -2312,398 +3546,22 @@ def render(output_dir: str) -> None:
                     ["veg", "terrain", "ndvi"] if run_standalones else []
                 ),
                 longitudinal_spec_payload=longitudinal_spec_payload,
+                cgi_grid_spacing_m=(
+                    float(cgi_grid_spacing_m_param)
+                    if cgi_grid_spacing_m_param is not None and is_polygon_target_ui
+                    else None
+                ),
+                whole_grid_scaling=(
+                    whole_grid_scaling_param if is_polygon_target_ui else False
+                ),
+                area_balanced_split=(
+                    area_balanced_split_param if is_polygon_target_ui else False
+                ),
             )
 
             st.success("✅ Fusion job started! Check sidebar for progress.")
-    # Pull completed fusion results from the JobStore into session state for display.
-    from services import get_job_store as _get_fusion_store
-
-    _fusion_store = _get_fusion_store()
-    for rec in _fusion_store.list_terminal():
-        if (
-            rec.type == "fusion"
-            and rec.status == "completed"
-            and rec.extra.get("results") is not None
-            and st.session_state.fusion_results is None
-        ):
-            st.session_state.fusion_engine = rec.extra.get("engine")
-            st.session_state.fusion_engines_by_target = (
-                rec.extra.get("engines_by_target") or {}
-            )
-            st.session_state.fusion_results = rec.extra["results"]
-            break
-
-    # =========================================================================
-    # ROW 3: Results Display
-    # =========================================================================
-    if st.session_state.fusion_results:
-        st.divider()
-        st.subheader("Optimization Results")
-
-        results = st.session_state.fusion_results
-        if results.get("mode") == "multi":
-            st.selectbox(
-                "Select outcome",
-                options=results["ordered_labels"],
-                key="fusion_results_outcome_pick",
-            )
-
-        results_view, engine = _fusion_resolve_active_bundle()
-        if engine is None or results_view is None:
-            st.warning(
-                "Optimization details are not available for the selected outcome."
-            )
-        else:
-            metric_name = results_view["objective_metric"].upper()
-            best_params = results_view.get("best_params") or {}
-
-            # Formula introspection. Legacy results from before the formula
-            # registry don't carry the attribute → fall back to weighted_average
-            # so old studies still render with the original three weights.
-            formula_name = getattr(engine, "cgi_formula", "weighted_average")
-            try:
-                formula = _cgi_formulas.get_formula(formula_name)
-            except ValueError:
-                formula = _cgi_formulas.get_formula("weighted_average")
-
-            covariates_used = list(getattr(engine, "covariate_columns", []) or [])
-
-            # ── Top tile row ───────────────────────────────────────────────
-            # For weighted_average we keep the legacy 3-weight tiles so the
-            # display matches the user's mental model. For synergy a 7-weight
-            # tile row would be unreadable, so we report the dominant main
-            # weight + main-term power range instead, and let the JSON / table
-            # below carry the full breakdown.
-            if formula.name == _cgi_formulas.WEIGHTED_AVERAGE:
-                col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
-                total_weight = sum(
-                    float(best_params.get(k, 0)) for k in formula.weight_keys
-                )
-                with col_m1:
-                    pct = (
-                        100.0 * float(best_params.get("veg_weight", 0)) / total_weight
-                        if total_weight > 0
-                        else 0.0
-                    )
-                    st.metric("Vegetation Weight", f"{pct:.1f}%")
-                with col_m2:
-                    pct = (
-                        100.0
-                        * float(best_params.get("terrain_weight", 0))
-                        / total_weight
-                        if total_weight > 0
-                        else 0.0
-                    )
-                    st.metric("Terrain Weight", f"{pct:.1f}%")
-                with col_m3:
-                    pct = (
-                        100.0 * float(best_params.get("ndvi_weight", 0)) / total_weight
-                        if total_weight > 0
-                        else 0.0
-                    )
-                    st.metric("NDVI Weight", f"{pct:.1f}%")
-                with col_m4:
-                    st.metric(
-                        f"Best {metric_name}", f"{results_view['best_value']:.4f}"
-                    )
-                with col_m5:
-                    if results_view["robust_trials"]:
-                        st.metric(
-                            "Robust Trials",
-                            f"{len(results_view['robust_trials'])}/{len(engine.study.trials)}",
-                        )
-                    else:
-                        st.metric("Total Trials", len(engine.study.trials))
-            else:
-                col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-                with col_m1:
-                    st.metric("CGI Formula", formula.name)
-                with col_m2:
-                    main_weights = {
-                        k: float(best_params.get(k, 0))
-                        for k in formula.main_weight_keys
-                    }
-                    dom_key = max(main_weights, key=main_weights.get)
-                    dom_label = dom_key.removeprefix("w_").upper()
-                    st.metric(
-                        "Dominant Main Term",
-                        f"{dom_label} ({main_weights[dom_key]*100:.1f}%)",
-                    )
-                with col_m3:
-                    st.metric(
-                        f"Best {metric_name}", f"{results_view['best_value']:.4f}"
-                    )
-                with col_m4:
-                    if results_view["robust_trials"]:
-                        st.metric(
-                            "Robust Trials",
-                            f"{len(results_view['robust_trials'])}/{len(engine.study.trials)}",
-                        )
-                    else:
-                        st.metric("Total Trials", len(engine.study.trials))
-
-            # Formula label + the list of controlled covariates surfaced
-            # below the tile row so the user can read what the score means.
-            st.caption(
-                f"**Formula:** `{formula.name}` · **Covariates:** "
-                + (
-                    ", ".join(f"`{c}`" for c in covariates_used)
-                    if covariates_used
-                    else "_none_"
-                )
-                + (
-                    "  ·  ℹ️ `mutual_info` ignores covariates"
-                    if results_view["objective_metric"] == "mutual_info"
-                    and covariates_used
-                    else ""
-                )
-            )
-
-            col_detail1, col_detail2 = st.columns(2)
-
-            with col_detail1:
-                st.markdown("**Best Trial Details**")
-                best_trial = engine.study.best_trial
-
-                info_data: dict = {
-                    "Trial Number": best_trial.number,
-                    "Buffer Distance": f"{engine.buffer_meters}m",
-                }
-                # Formula-driven weight + power dump, then shared spatial params,
-                # then the train/val scores + p-values.
-                for k in formula.weight_keys:
-                    info_data[f"{k} (raw)"] = best_params.get(k, "N/A")
-                for k in formula.power_keys:
-                    info_data[k] = best_params.get(k, "N/A")
-                for k in ("veg_radius", "terrain_radius", "ndvi_radius"):
-                    info_data[k] = f"{best_params.get(k, 'N/A')}m"
-                if covariates_used:
-                    info_data["Covariates controlled"] = covariates_used
-
-                info_data[f"Train {metric_name}"] = (
-                    f"{best_trial.user_attrs.get('train_score_mean', 'N/A')}"
-                )
-                info_data[f"Val {metric_name}"] = (
-                    f"{best_trial.user_attrs.get('val_score_mean', 'N/A')}"
-                )
-
-                if "train_pvalue" in best_trial.user_attrs:
-                    info_data["Train p-value"] = (
-                        f"{best_trial.user_attrs['train_pvalue']:.4e}"
-                    )
-                if "val_pvalue" in best_trial.user_attrs:
-                    info_data["Val p-value"] = (
-                        f"{best_trial.user_attrs['val_pvalue']:.4e}"
-                    )
-
-                st.json(info_data)
-
-            with col_detail2:
-                st.markdown("**Optimization History**")
-
-                trial_values = [
-                    t.value for t in engine.study.trials if t.value is not None
-                ]
-                trial_numbers = [
-                    t.number for t in engine.study.trials if t.value is not None
-                ]
-
-                if trial_values:
-                    fig, ax = plt.subplots(figsize=(6, 4))
-                    ax.plot(trial_numbers, trial_values, alpha=0.6, linewidth=0.5)
-
-                    running_best = []
-                    current_best = (
-                        -np.inf if engine.study.direction.name == "MAXIMIZE" else np.inf
-                    )
-                    for val in trial_values:
-                        if engine.study.direction.name == "MAXIMIZE":
-                            current_best = max(current_best, val)
-                        else:
-                            current_best = min(current_best, val)
-                        running_best.append(current_best)
-
-                    ax.plot(
-                        trial_numbers,
-                        running_best,
-                        color="red",
-                        linewidth=2,
-                        label="Best",
-                    )
-                    ax.set_xlabel("Trial")
-                    ax.set_ylabel(f"{metric_name}")
-                    ax.set_title("Optimization Progress")
-                    ax.legend()
-                    ax.grid(True, alpha=0.3)
-                    st.pyplot(fig)
-                    plt.close()
-
-            if results_view["robust_trials"]:
-                st.divider()
-                st.markdown("**Robust Trials (Statistically Significant)**")
-
-                # One column per formula weight (renormalised %), plus the
-                # main-term powers (synergy only). Train / test scores +
-                # p-values stay shared. Building columns from
-                # ``formula.weight_keys`` / ``power_keys`` means the table
-                # can't drift away from the registry as new formulas land.
-                def _wlabel(key: str) -> str:
-                    # ``ndvi_weight`` → "NDVI", ``w_ndvi_veg`` → "NDVI·VEG".
-                    cleaned = key.removeprefix("w_").removesuffix("_weight")
-                    return cleaned.replace("_", "·").upper() + " %"
-
-                def _plabel(key: str) -> str:
-                    # ``ndvi_power`` → "NDVI p".
-                    return key.removesuffix("_power").upper() + " p"
-
-                robust_data: list[dict] = []
-                for t in results_view["robust_trials"][:10]:
-                    row: dict = {"Trial": t.number}
-                    weight_total = sum(
-                        float(t.params.get(k, 0)) for k in formula.weight_keys
-                    )
-                    for k in formula.weight_keys:
-                        row[_wlabel(k)] = (
-                            f"{100.0 * float(t.params.get(k, 0)) / weight_total:.1f}"
-                            if weight_total > 0
-                            else "0.0"
-                        )
-                    for k in formula.power_keys:
-                        row[_plabel(k)] = f"{float(t.params.get(k, 1.0)):.2f}"
-                    row[f"Train {metric_name}"] = (
-                        f"{t.user_attrs.get('train_score', 0):.4f}"
-                    )
-                    row[f"Test {metric_name}"] = (
-                        f"{t.user_attrs.get('test_score', 0):.4f}"
-                    )
-                    row["Train p"] = f"{t.user_attrs.get('train_pvalue', 1):.4e}"
-                    row["Test p"] = f"{t.user_attrs.get('test_pvalue', 1):.4e}"
-                    robust_data.append(row)
-
-                st.dataframe(robust_data, use_container_width=True)
-
-            # ── CGI vs single-metric standalones (when enabled) ─────────────
-            # One row per study (CGI + each enabled standalone). Headline
-            # numbers come straight from the bundle the runner built so this
-            # block stays Streamlit-only — no engine access required.
-            standalones = results_view.get("standalones") or {}
-            if standalones:
-                st.divider()
-                st.markdown("**CGI vs Standalone Single-Metric Studies**")
-
-                def _fmt_score(v) -> str:
-                    try:
-                        return f"{float(v):.4f}"
-                    except (TypeError, ValueError):
-                        return "—"
-
-                def _fmt_pval(v) -> str:
-                    if v is None:
-                        return "—"
-                    try:
-                        return f"{float(v):.4e}"
-                    except (TypeError, ValueError):
-                        return "—"
-
-                cgi_test = results_view.get("test_results") or {}
-                cmp_rows: list[dict] = [
-                    {
-                        "Study": "CGI (combined)",
-                        f"CV val {metric_name}": _fmt_score(
-                            results_view.get("best_value")
-                        ),
-                        f"Test {metric_name}": _fmt_score(cgi_test.get("test_score")),
-                        "Test p": _fmt_pval(cgi_test.get("test_pvalue")),
-                        "Robust trials": len(results_view.get("robust_trials") or []),
-                    }
-                ]
-                channel_display = {
-                    "veg": "Vegetation",
-                    "terrain": "Terrain",
-                    "ndvi": "NDVI",
-                }
-                for ch_key, ch_bundle in standalones.items():
-                    ch_test = ch_bundle.get("test_results") or {}
-                    cmp_rows.append(
-                        {
-                            "Study": (
-                                channel_display.get(ch_key, ch_key) + " (standalone)"
-                            ),
-                            f"CV val {metric_name}": _fmt_score(
-                                ch_bundle.get("best_value")
-                            ),
-                            f"Test {metric_name}": _fmt_score(
-                                ch_test.get("test_score")
-                            ),
-                            "Test p": _fmt_pval(ch_test.get("test_pvalue")),
-                            "Robust trials": len(ch_bundle.get("robust_trials") or []),
-                        }
-                    )
-                st.dataframe(cmp_rows, use_container_width=True)
-
-            # ── Mixed-effects post-hoc metrics (when present) ────────────────
-            # The post-score stage writes one CSV per study (CGI + each
-            # standalone) into ``output_results/fusion/study_results/``.
-            # Naming:
-            #   single outcome: ``mixedlm_metrics.csv``,
-            #                   ``mixedlm_metrics__<channel>.csv``
-            #   multi outcome:  ``mixedlm_metrics__<outcome>.csv``,
-            #                   ``mixedlm_metrics__<outcome>__<channel>.csv``
-            # Show one tab per available file so users can compare studies.
-            try:
-                _study_root = os.path.join(output_dir, "fusion", "study_results")
-                _active_label = (
-                    st.session_state.get("fusion_results_outcome_pick")
-                    if results.get("mode") == "multi"
-                    else None
-                )
-
-                def _match_outcome(fname: str) -> bool:
-                    # Single-outcome run: only the no-outcome-prefix files
-                    # apply. Multi-outcome run: keep files whose name carries
-                    # the active outcome label.
-                    if _active_label is None:
-                        return f"__{_active_label}" not in fname
-                    return f"__{_active_label}" in fname
-
-                _csv_paths: list[str] = []
-                if os.path.isdir(_study_root):
-                    for _fn in sorted(os.listdir(_study_root)):
-                        if not _fn.startswith("mixedlm_metrics") or not _fn.endswith(
-                            ".csv"
-                        ):
-                            continue
-                        if not _match_outcome(_fn):
-                            continue
-                        _csv_paths.append(os.path.join(_study_root, _fn))
-
-                if _csv_paths:
-                    st.divider()
-                    st.markdown("**Mixed-effects: all metrics across trial pools**")
-                    st.caption(
-                        "Each pool's per-trial rows are followed by "
-                        "`__mean__`, `__ci_lo__`, `__ci_hi__`, and `__n__` "
-                        "summary rows."
-                    )
-
-                    def _tab_label(path: str) -> str:
-                        base = os.path.basename(path).replace(".csv", "")
-                        # Trim the outcome prefix in multi-mode so the tabs
-                        # read like "CGI / Veg / Terrain / NDVI" instead of
-                        # "<outcome> / <outcome>__veg / …".
-                        if _active_label:
-                            base = base.replace(
-                                f"mixedlm_metrics__{_active_label}", "CGI"
-                            ).replace(f"__{_active_label}__", "__")
-                        else:
-                            base = base.replace("mixedlm_metrics", "CGI")
-                        return base.replace("__", " ").strip() or "CGI"
-
-                    _tab_labels = [_tab_label(p) for p in _csv_paths]
-                    _tabs = st.tabs(_tab_labels)
-                    for _tab, _path in zip(_tabs, _csv_paths):
-                        with _tab:
-                            st.caption(f"Source: `{_path}`")
-                            st.dataframe(pd.read_csv(_path), use_container_width=True)
-            except Exception as _exc:  # pragma: no cover -- UI-only guard
-                st.warning(f"Could not read mixedlm_metrics CSVs: {_exc}")
+    # Result-loading is explicit — use the **Load results** button on a
+    # completed job card in the sidebar Job Monitor to populate the
+    # results panel. The previous auto-load-first-terminal-job behaviour
+    # was removed at the user's request so they can choose which run to
+    # inspect (or none at all).
