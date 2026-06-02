@@ -449,7 +449,7 @@ def _render_fusion_restart_panel(store, executor, output_dir: str) -> bool:
                 if st.button(
                     "Cancel restart",
                     key=f"f_restart_cancel_silent_{rec.id}",
-                    use_container_width=True,
+                    width="stretch",
                 ):
                     st.session_state[RESTART_SESSION_KEY] = None
                     st.rerun()
@@ -458,7 +458,7 @@ def _render_fusion_restart_panel(store, executor, output_dir: str) -> bool:
                     "Re-run",
                     type="primary",
                     key=f"f_restart_confirm_silent_{rec.id}",
-                    use_container_width=True,
+                    width="stretch",
                 ):
                     try:
                         _submit_fusion_restart(
@@ -696,7 +696,7 @@ def _render_fusion_restart_panel(store, executor, output_dir: str) -> bool:
             if st.button(
                 "Cancel restart",
                 key=f"f_restart_cancel_{rec.id}",
-                use_container_width=True,
+                width="stretch",
             ):
                 st.session_state[RESTART_SESSION_KEY] = None
                 st.rerun()
@@ -706,7 +706,7 @@ def _render_fusion_restart_panel(store, executor, output_dir: str) -> bool:
                 type="primary",
                 key=f"f_restart_confirm_{rec.id}",
                 disabled=lon_restart_blocked,
-                use_container_width=True,
+                width="stretch",
             )
         if rerun_clicked:
             # Substitute the validated payload into ``p`` so the existing
@@ -812,6 +812,8 @@ def _discover_years_from_date_column(gdf: gpd.GeoDataFrame, date_col: str) -> li
 def _render_optimization_setup_panel(
     preview_gdf: gpd.GeoDataFrame | None,
     target_outcome_columns: list[str],
+    *,
+    target_file_entries: list[dict] | None = None,
 ) -> dict | None:
     """Render the optimization-setup section and return the collected state.
 
@@ -828,6 +830,12 @@ def _render_optimization_setup_panel(
       - ``cross_sectional_date_on`` (bool)
       - ``mixedlm_random_slope`` (bool)
       - ``mixedlm_time_fixed`` (bool)
+
+    ``target_file_entries`` is the ordered list produced by Section 1's
+    multi-file picker (``[{"path", "label"}]``); wide-mode longitudinal
+    reads its per-wave paths and labels from there. Long vs wide intake
+    is auto-selected from ``len(target_file_entries)``: 1 ⇒ long, 2+ ⇒
+    wide.
 
     Returns ``None`` until the user picks a run mode (no default selection).
     """
@@ -871,7 +879,17 @@ def _render_optimization_setup_panel(
         "mixedlm_time_fixed": True,
     }
 
+    entries = list(target_file_entries or [])
+    n_files = len(entries)
+
     if not is_longitudinal:
+        if n_files > 1:
+            st.warning(
+                f"Cross-sectional mode uses only the first target file "
+                f"(`{entries[0]['label']}`). The remaining "
+                f"{n_files - 1} file(s) will be ignored — switch to "
+                f"mixed-effects (longitudinal) to use all of them."
+            )
         # ── Cross-sectional ──────────────────────────────────────────────
         date_on = st.checkbox(
             "Date column available?",
@@ -906,18 +924,15 @@ def _render_optimization_setup_panel(
         return state
 
     # ── Longitudinal ────────────────────────────────────────────────────
-    intake_mode = st.radio(
-        "Intake mode",
-        options=("long", "wide"),
-        index=0,
-        horizontal=True,
-        key="fusion_lon_intake",
-        format_func=lambda x: (
-            "Long-format target" if x == "long" else "Wide / multi-file"
-        ),
-        help="long = one file, one row per (entity, wave). wide = one file per wave.",
-    )
+    # Intake mode is auto-selected from how many files are in Section 1:
+    # one file ⇒ long format (single table with a wave column), two or
+    # more ⇒ wide format (one file per wave, joined on the entity id).
+    if n_files <= 1:
+        intake_mode = "long"
+    else:
+        intake_mode = "wide"
     state["intake_mode"] = intake_mode
+    st.caption(f"Intake mode: **{intake_mode}** ")
 
     if intake_mode == "long":
         if preview_gdf is None:
@@ -971,93 +986,70 @@ def _render_optimization_setup_panel(
         return state
 
     # ── Wide / multi-file intake ────────────────────────────────────────
+    if not entries:
+        st.warning(
+            "Pick two or more target files in Section 1 to populate the "
+            "per-wave column mapping below."
+        )
+        state["wide_files"] = []
+        state["discovered_waves"] = []
+        return state
+
     st.caption(
-        "Upload one target file per wave. Each file contributes its own "
-        "rows; they are joined on the entity-id column at load time. "
-        "Wave labels default to each file's basename and can be edited."
+        "Each file contributes its own rows; they are joined on the "
+        "entity-id column at load time. Wave labels come from Section 1 "
+        "(reorder there to change baseline-first ordering); pick the "
+        "entity-ID and date columns for each file below."
     )
-    if "fusion_lon_wide_count" not in st.session_state:
-        st.session_state.fusion_lon_wide_count = 1
-    n_wide = st.session_state.fusion_lon_wide_count
-    from file_picker import FT_VECTOR_OR_RASTER, pick_file_path
+
+    from file_picker import path_to_widget_id
 
     wide_files: list[dict] = []
-    for i in range(n_wide):
+    for i, entry in enumerate(entries):
+        path = entry["path"]
+        wave_label = entry["label"]
+        wid = path_to_widget_id(path)
         with st.container(border=True):
-            wc1, wc2 = st.columns([3, 1])
-            with wc1:
-                file_path = pick_file_path(
-                    f"Wave file {i + 1}",
-                    key=f"fusion_lon_wide_path_{i}",
-                    file_types=FT_VECTOR_OR_RASTER,
-                    help_text=(
-                        "Pick a per-wave target file from disk. The path "
-                        "picker bypasses Streamlit's upload limit so "
-                        "large per-wave files are supported directly."
-                    ),
-                )
-            with wc2:
-                if i > 0 and st.button(
-                    "❌",
-                    key=f"fusion_lon_wide_rm_{i}",
-                    help="Remove this wave file",
-                ):
-                    st.session_state.fusion_lon_wide_count -= 1
-                    st.rerun()
-            default_label = ""
-            if file_path:
-                default_label = os.path.splitext(os.path.basename(file_path))[0]
-            wave_label = st.text_input(
-                "Wave label",
-                value=st.session_state.get(f"fusion_lon_wide_label_{i}", default_label),
-                key=f"fusion_lon_wide_label_{i}",
-                help="Wave identifier; ordered by appearance, baseline first.",
-            )
+            header = f"Wave {i + 1} — **{wave_label}**"
+            if i == 0:
+                header += "  _(baseline)_"
+            st.markdown(header, help=path)
             file_cols: list[str] = []
             file_date_cands: list[str] = []
-            if file_path:
-                if not os.path.isfile(file_path):
-                    st.error(f"Path no longer exists: `{file_path}`")
-                    file_path = None
-                else:
-                    try:
-                        file_gdf = read_vector_path(file_path)
-                        file_cols = [c for c in file_gdf.columns if c != "geometry"]
-                        file_date_cands = _date_parseable_columns(file_gdf)
-                    except Exception as exc:
-                        st.error(f"Could not read wave {i + 1}: {exc}")
+            if not os.path.isfile(path):
+                st.error(f"Path no longer exists: `{path}`")
+                continue
+            try:
+                file_gdf = read_vector_path(path)
+                file_cols = [c for c in file_gdf.columns if c != "geometry"]
+                file_date_cands = _date_parseable_columns(file_gdf)
+            except Exception as exc:
+                st.error(f"Could not read wave {i + 1}: {exc}")
+                continue
             ec1, ec2 = st.columns(2)
             with ec1:
                 entity_col = st.selectbox(
                     "Entity ID column",
                     options=file_cols or ["—"],
-                    key=f"fusion_lon_wide_entity_{i}",
+                    key=f"fusion_lon_wide_entity__{wid}",
                     disabled=not file_cols,
                 )
             with ec2:
                 date_col = st.selectbox(
                     "Date column",
                     options=file_date_cands or ["—"],
-                    key=f"fusion_lon_wide_date_{i}",
+                    key=f"fusion_lon_wide_date__{wid}",
                     disabled=not file_date_cands,
                 )
-            if file_path and wave_label and file_cols and file_date_cands:
+            if wave_label and file_cols and file_date_cands:
                 wide_files.append(
                     {
-                        "path": file_path,
+                        "path": path,
                         "wave_label": wave_label,
                         "entity_col": entity_col,
                         "date_col": date_col,
                     }
                 )
-
-    if st.button(
-        "+ Add another wave file",
-        key="fusion_lon_wide_add",
-        help="Add a row for one more wave's target file.",
-    ):
-        st.session_state.fusion_lon_wide_count += 1
-        st.rerun()
 
     state["wide_files"] = wide_files
     state["discovered_waves"] = [f["wave_label"] for f in wide_files]
@@ -1383,22 +1375,6 @@ def _render_study_details_panel(
             key="fusion_use_cv",
             help="On: k models per trial. Off: single train/val split, ~k× faster.",
         )
-    with col_s3:
-        if use_cv:
-            k_folds = st.number_input(
-                "K-Fold CV",
-                min_value=3,
-                max_value=10,
-                value=int(st.session_state.get("fusion_k_folds", 5)),
-                key="fusion_k_folds",
-                help="CV folds on the non-test subset.",
-            )
-        else:
-            k_folds = 1
-            st.caption(
-                "_Single train/val split on the non-test subset; "
-                "test set still held out._"
-            )
     with col_s4:
         test_size = st.slider(
             "Test set size",
@@ -1409,12 +1385,20 @@ def _render_study_details_panel(
             key="fusion_test_size",
             help="Held-out evaluation fraction of the whole dataset.",
         )
-
-    # Single-split validation size (whole-dataset fraction). Hidden in CV mode.
-    if not use_cv:
-        col_val, col_train = st.columns([1, 1])
-        val_default = float(st.session_state.get("fusion_val_size", 0.25))
-        with col_val:
+    k_folds = int(st.session_state.get("fusion_k_folds", 5))
+    with col_s3:
+        if use_cv:
+            k_folds = st.number_input(
+                "K-Fold CV",
+                min_value=3,
+                max_value=10,
+                value=int(st.session_state.get("fusion_k_folds", 5)),
+                key="fusion_k_folds",
+                help="CV folds on the non-test subset.",
+            )
+            val_size_whole = (1.0 - float(test_size)) / max(1, int(k_folds))
+        else:
+            val_default = float(st.session_state.get("fusion_val_size", 0.25))
             val_size_whole = st.slider(
                 "Validation set size",
                 min_value=0.05,
@@ -1424,22 +1408,24 @@ def _render_study_details_panel(
                 key="fusion_val_size",
                 help="Validation fraction of the whole dataset (single-split mode).",
             )
-        with col_train:
-            train_pct = max(0.0, 1.0 - float(test_size) - float(val_size_whole))
+
+    col_info = st.columns(1)
+    with col_info[0]:
+        train_pct = max(0.0, 1.0 - float(test_size) - float(val_size_whole))
+        if use_cv:
+            st.caption(
+                f"_Test = {float(test_size)*100:.0f}% held out; "
+                f"remaining {(1.0 - float(test_size))*100:.0f}% is split "
+                f"into {int(k_folds)} folds "
+                f"(~{val_size_whole*100:.0f}% val + "
+                f"~{(train_pct)*100:.0f}% train per fold)._"
+            )
+        else:
             st.caption(
                 f"_Train ≈ {train_pct*100:.0f}% · Val = "
                 f"{val_size_whole*100:.0f}% · Test = "
                 f"{float(test_size)*100:.0f}% of the whole dataset._"
             )
-    else:
-        # CV mode: val is implicit per fold.
-        val_size_whole = float(st.session_state.get("fusion_val_size", 0.25))
-        per_fold_val = (1.0 - float(test_size)) / max(int(k_folds), 1)
-        st.caption(
-            f"_K-fold CV: train = {(1.0 - float(test_size))*100:.0f}% × "
-            f"(k-1)/k of the non-test subset, val = "
-            f"{per_fold_val*100:.0f}% of the whole dataset per fold._"
-        )
 
     n_bins = st.number_input(
         "Stratification bins",
@@ -1639,7 +1625,7 @@ def _render_covariate_impact(results_view: dict, metric_name: str) -> None:
         ["covariate", "direction", "coef", "std_err", "t_stat", "pvalue", "partial_r2"]
     ]
     df = df.sort_values("partial_r2", ascending=False).reset_index(drop=True)
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(df, width="stretch")
 
     try:
         import plotly.express as _px
@@ -1659,7 +1645,7 @@ def _render_covariate_impact(results_view: dict, metric_name: str) -> None:
             title="Covariate coefficients (full model)",
         )
         fig.update_layout(margin=dict(l=60, r=20, t=60, b=80))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     except Exception:
         pass
 
@@ -1682,10 +1668,11 @@ def _render_trial_distribution_viewer(
     st.divider()
     st.markdown("**Per-trial objective distributions**")
     st.caption(
-        "Distributions are built from per-trial CV-fold means stored on "
-        "each trial. **train** / **val** are recorded for every trial; "
-        "**test** is recorded only when test-per-trial scoring is on (see "
-        "the engine's `record_test_per_trial` flag)."
+        "Distributions are built from per-trial CV-fold means recorded on "
+        "every trial. **test** is computed only for the robust trial set "
+        "(per-trial test scoring is expensive), so the test box will hold "
+        "≤ robust-trial-count points even when the **all completed** pool "
+        "is selected."
     )
 
     try:
@@ -1745,20 +1732,36 @@ def _render_trial_distribution_viewer(
                 ]
             )
         else:
-            # Standalones: robust list is stored directly; "all
-            # completed" isn't available without reloading the standalone
-            # study from disk, so fall back to robust regardless.
-            trial_pool = bundle.get("robust_trials") or []
+            # Standalones are scored in a separate study and the engine
+            # is rebound to CGI before results are returned, so the
+            # runner snapshots all completed trials into the bundle for
+            # the "all completed" pool.
+            trial_pool = (
+                bundle.get("robust_trials") or []
+                if pool_pick == "robust"
+                else bundle.get("all_completed_trials")
+                or bundle.get("robust_trials")
+                or []
+            )
 
-        key_for_subset = {
-            "train": "train_score_mean",
-            "val": "val_score_mean",
-            "test": "test_score",
-        }
+        # ``FrozenTrial.set_user_attr`` only mutates the in-memory copy;
+        # for test scores the runner also writes a sidecar dict keyed by
+        # ``trial.number`` so the value survives a fresh materialisation
+        # of ``study.trials`` from storage.
+        per_trial_test = bundle.get("per_trial_test") or {}
         for t in trial_pool:
             for subset in subset_picks:
-                attr_key = key_for_subset[subset]
-                v = t.user_attrs.get(attr_key)
+                v: float | None = None
+                if subset == "train":
+                    v = t.user_attrs.get("train_score_mean")
+                elif subset == "val":
+                    v = t.user_attrs.get("val_score_mean")
+                elif subset == "test":
+                    rec = per_trial_test.get(int(t.number))
+                    if rec is not None:
+                        v = rec.get("test_score")
+                    if v is None:
+                        v = t.user_attrs.get("test_score")
                 if v is None:
                     continue
                 try:
@@ -1787,7 +1790,7 @@ def _render_trial_distribution_viewer(
         title=f"Per-trial {metric_name} distributions ({pool_pick} trials)",
     )
     fig.update_layout(margin=dict(l=60, r=20, t=60, b=80))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     # Summary stats per (Study, Subset) for users who want exact numbers.
     with st.expander("Show distribution stats", expanded=False):
@@ -1797,7 +1800,7 @@ def _render_trial_distribution_viewer(
             .round(4)
             .reset_index()
         )
-        st.dataframe(stats, use_container_width=True)
+        st.dataframe(stats, width="stretch")
 
 
 def _render_composite_map_viewer(results_view: dict, engine) -> None:
@@ -1980,7 +1983,7 @@ def _render_composite_map_viewer(results_view: dict, engine) -> None:
             )
             cbar.set_label("Composite (0–1)")
 
-    st.pyplot(fig, use_container_width=True)
+    st.pyplot(fig, width="stretch")
     plt.close(fig)
 
 
@@ -2117,7 +2120,7 @@ def _render_optuna_plot_explorer(engine, results_view: dict, metric_name: str) -
             fig = plot_timeline(target_study)
         else:
             return
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     except Exception as exc:
         st.warning(f"Could not render {plot_pick}: {exc}")
 
@@ -2132,7 +2135,7 @@ def _render_fusion_results_body(output_dir: str) -> None:
         if st.button(
             "Clear",
             key="fusion_results_clear",
-            use_container_width=True,
+            width="stretch",
             help="Unload these results from the panel (does not delete files).",
         ):
             st.session_state.fusion_engine = None
@@ -2495,7 +2498,7 @@ def _render_fusion_results_body(output_dir: str) -> None:
             )
             st.dataframe(
                 pd.DataFrame(robust_data),
-                use_container_width=True,
+                width="stretch",
                 height=420,
             )
 
@@ -2581,13 +2584,13 @@ def _render_fusion_results_body(output_dir: str) -> None:
                         margin=dict(l=60, r=20, t=60, b=60),
                         legend_title_text="Subset",
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
                 else:
                     # Fallback: pivot to wide and use streamlit's
                     # native bar chart, which auto-groups by columns.
                     wide = df.pivot(index="Study", columns="Subset", values="Value")
                     st.markdown(f"_{y_title}_")
-                    st.bar_chart(wide, use_container_width=True)
+                    st.bar_chart(wide, width="stretch")
 
             # Compact textual summary so users can read off exact values.
             with st.expander("Show exact values", expanded=False):
@@ -2614,7 +2617,7 @@ def _render_fusion_results_body(output_dir: str) -> None:
                             else:
                                 row[value_pick] = round(fv, 4)
                         summary.append(row)
-                st.dataframe(pd.DataFrame(summary), use_container_width=True)
+                st.dataframe(pd.DataFrame(summary), width="stretch")
 
     # ── Covariate impact panel ────────────────────────────────────────
     _render_covariate_impact(results_view, metric_name)
@@ -2681,7 +2684,7 @@ def _render_fusion_results_body(output_dir: str) -> None:
             for _tab, _path in zip(_tabs, _csv_paths):
                 with _tab:
                     st.caption(f"Source: `{_path}`")
-                    st.dataframe(pd.read_csv(_path), use_container_width=True)
+                    st.dataframe(pd.read_csv(_path), width="stretch")
     except Exception as _exc:  # pragma: no cover -- UI-only guard
         st.warning(f"Could not read mixedlm_metrics CSVs: {_exc}")
 
@@ -2743,18 +2746,21 @@ def render(output_dir: str) -> None:
     with col_fusion_left:
         st.subheader("Target Configuration")
 
-        from file_picker import FT_VECTOR_OR_RASTER, path_to_dataset, pick_file_path
+        from file_picker import FT_VECTOR_OR_RASTER, path_to_dataset, pick_ordered_files
 
-        target_picked_path = pick_file_path(
-            "Pick Target File",
-            key="fusion_target_path",
+        target_file_entries = pick_ordered_files(
+            "Pick Target File(s)",
+            key="fusion_target_paths",
             file_types=FT_VECTOR_OR_RASTER,
             help_text=(
-                "Vector: GeoJSON, GeoPackage, shapefile (.shp with sidecars in "
-                "the same folder), or vector zip. Raster: GeoTIFF. The toolbox "
-                "reads from this path lazily — bytes are not copied into "
-                "memory until preview, sampling, or compute needs them."
+                "Pick one file for cross-sectional or long-format longitudinal "
+                "runs, or multiple files (one per wave) for wide-format "
+                "longitudinal. Drag-free reorder via ▲/▼ — first file is the "
+                "baseline and drives the preview, outcome and covariate pickers."
             ),
+        )
+        target_picked_path: str | None = (
+            target_file_entries[0]["path"] if target_file_entries else None
         )
 
         if target_picked_path and os.path.isfile(target_picked_path):
@@ -3010,6 +3016,7 @@ def render(output_dir: str) -> None:
     opt_state = _render_optimization_setup_panel(
         preview_vector_gdf if is_vector_target else None,
         target_outcome_columns,
+        target_file_entries=target_file_entries,
     )
     if opt_state is None:
         # No run mode picked yet — bail out so downstream sections don't
@@ -3095,7 +3102,7 @@ def render(output_dir: str) -> None:
             fusion_run_clicked = st.button(
                 "🚀 Run Fusion Optimization",
                 type="primary",
-                use_container_width=True,
+                width="stretch",
                 key="fusion_form_run_submit",
             )
 
@@ -3130,7 +3137,7 @@ def render(output_dir: str) -> None:
         if st.session_state.fusion_results:
             if st.button(
                 "Export per-entity CGI",
-                use_container_width=True,
+                width="stretch",
                 key="fusion_export",
                 help="One row per target entity with sampled channels + composite CGI.",
             ):
@@ -3193,7 +3200,7 @@ def render(output_dir: str) -> None:
                     )
     with col_run3:
         if st.session_state.fusion_results:
-            if st.button("🔄 Reset", use_container_width=True, key="fusion_reset"):
+            if st.button("🔄 Reset", width="stretch", key="fusion_reset"):
                 st.session_state.fusion_engine = None
                 st.session_state.fusion_results = None
                 st.session_state.fusion_engines_by_target = {}

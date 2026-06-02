@@ -441,7 +441,7 @@ def render_job_restart_panel(
                 if st.button(
                     "Cancel restart",
                     key=f"restart_cancel_{rec.id}",
-                    use_container_width=True,
+                    width="stretch",
                 ):
                     st.session_state[RESTART_SESSION_KEY] = None
                     st.rerun()
@@ -450,7 +450,7 @@ def render_job_restart_panel(
                     "Re-run",
                     type="primary",
                     key=f"restart_confirm_{rec.id}_silent",
-                    use_container_width=True,
+                    width="stretch",
                 ):
                     try:
                         gdf_silent = read_vector_path(rec_path)
@@ -526,7 +526,7 @@ def render_job_restart_panel(
             if st.button(
                 "Cancel restart",
                 key=f"restart_cancel_{rec.id}",
-                use_container_width=True,
+                width="stretch",
             ):
                 st.session_state[RESTART_SESSION_KEY] = None
                 st.rerun()
@@ -535,7 +535,7 @@ def render_job_restart_panel(
                 "Verify & re-run",
                 type="primary",
                 key=f"restart_confirm_{rec.id}",
-                use_container_width=True,
+                width="stretch",
             ):
                 try:
                     on_confirm(gdf, fname_new, extras)

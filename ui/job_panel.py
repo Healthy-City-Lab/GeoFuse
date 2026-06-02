@@ -245,7 +245,7 @@ def _render_job_card(rec, store) -> None:
             if st.button(
                 "Open log file",
                 key=f"openlog_{rec.id}",
-                use_container_width=True,
+                width="stretch",
                 disabled=not have_file,
                 help=(log_path if have_file else "Log file not found on disk."),
             ):
@@ -262,7 +262,7 @@ def _render_job_card(rec, store) -> None:
                 if st.button(
                     "Load results",
                     key=f"loadres_{rec.id}",
-                    use_container_width=True,
+                    width="stretch",
                     help=(
                         "Replace the active result overview with this job's "
                         "bundle (composite map, robust trials, standalone "
@@ -302,7 +302,7 @@ def _render_job_card(rec, store) -> None:
                     if st.button(
                         "🔄",
                         key=f"restart_{rec.id}",
-                        use_container_width=True,
+                        width="stretch",
                         help="Restart — re-upload the original input geometry.",
                     ):
                         st.session_state[RESTART_SESSION_KEY] = rec.id
@@ -311,7 +311,7 @@ def _render_job_card(rec, store) -> None:
                 st.button(
                     "🗑️",
                     key=f"del_{rec.id}",
-                    use_container_width=True,
+                    width="stretch",
                     on_click=store.purge,
                     args=(rec.id,),
                     help="Dismiss — remove this job from history.",

@@ -435,7 +435,7 @@ def render(output_dir: str) -> None:
         # Submit in the form so the buffer/cloud/res changes are committed before run.
         st.form_submit_button(
             "Apply Settings",
-            use_container_width=False,
+            width="content",
             help="Commit slider values before adjusting dates below.",
         )
 
@@ -714,7 +714,7 @@ def render(output_dir: str) -> None:
     run = st.button(
         "🚀 Run NDVI Analysis",
         type="primary",
-        use_container_width=True,
+        width="stretch",
         key="ndvi_run_btn",
     )
 
@@ -967,7 +967,7 @@ def render(output_dir: str) -> None:
             ndvi_scan_clicked = st.button(
                 "🔄 Scan Output Folder",
                 key="ndvi_scan_folder",
-                use_container_width=True,
+                width="stretch",
             )
         with scan_row_r:
             ndvi_scan_spinner_slot = st.empty()

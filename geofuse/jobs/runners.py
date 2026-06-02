@@ -1432,16 +1432,26 @@ def run_fusion(
             )
 
             # Score every robust trial on the held-out test set so the
-            # distribution viewer can plot test CIs.
+            # distribution viewer can plot test CIs. ``FrozenTrial.set_user_attr``
+            # only mutates the in-memory copy, so we also collect a sidecar
+            # ``trial.number -> {test_score, test_pvalue}`` dict that the
+            # viewer can read regardless of which trial-pool selection
+            # rematerialises the trials from storage.
+            cgi_per_trial_test: dict[int, dict[str, float]] = {}
             for _t in robust_trials or []:
                 try:
                     _tr = engine.evaluate_on_test(
                         params=_t.params, metric=objective_metric
                     )
+                    rec: dict[str, float] = {}
                     if _tr.get("test_score") is not None:
                         _t.set_user_attr("test_score", float(_tr["test_score"]))
+                        rec["test_score"] = float(_tr["test_score"])
                     if _tr.get("test_pvalue") is not None:
                         _t.set_user_attr("test_pvalue", float(_tr["test_pvalue"]))
+                        rec["test_pvalue"] = float(_tr["test_pvalue"])
+                    if rec:
+                        cgi_per_trial_test[int(_t.number)] = rec
                 except Exception:
                     continue
             stage(skey("evaluate"), DONE)
@@ -1544,20 +1554,40 @@ def run_fusion(
                 ch_robust = engine.get_robust_trials(
                     method="auto", p_threshold=0.05, tolerance=0.1, min_trials=10
                 )
+                # Snapshot every completed trial for this channel's study
+                # while ``engine.study`` still points at it — the engine is
+                # rebound to the CGI study at the end of the standalones
+                # loop, so the viewer has no other way to access the full
+                # standalone trial population.
+                import optuna as _optuna_mod
+
+                ch_all_completed = [
+                    _t
+                    for _t in engine.study.trials
+                    if _t.state == _optuna_mod.trial.TrialState.COMPLETE
+                ]
                 ch_test = engine.evaluate_on_test(
                     params=ch_best, metric=objective_metric
                 )
 
-                # Per-trial test scoring for the distribution viewer.
+                # Per-trial test scoring + sidecar so the distribution
+                # viewer can plot test CIs after the engine's study has
+                # been rebound to CGI.
+                ch_per_trial_test: dict[int, dict[str, float]] = {}
                 for _t in ch_robust or []:
                     try:
                         _tr = engine.evaluate_on_test(
                             params=_t.params, metric=objective_metric
                         )
+                        rec: dict[str, float] = {}
                         if _tr.get("test_score") is not None:
                             _t.set_user_attr("test_score", float(_tr["test_score"]))
+                            rec["test_score"] = float(_tr["test_score"])
                         if _tr.get("test_pvalue") is not None:
                             _t.set_user_attr("test_pvalue", float(_tr["test_pvalue"]))
+                            rec["test_pvalue"] = float(_tr["test_pvalue"])
+                        if rec:
+                            ch_per_trial_test[int(_t.number)] = rec
                     except Exception:
                         continue
 
@@ -1630,6 +1660,8 @@ def run_fusion(
                     "averaged_params": ch_averaged_params,
                     "best_value": engine.study.best_value,
                     "robust_trials": ch_robust,
+                    "all_completed_trials": ch_all_completed,
+                    "per_trial_test": ch_per_trial_test,
                     "test_results": ch_test,
                     "subset_scores": ch_subset_scores,
                     "objective_metric": objective_metric,
@@ -1757,6 +1789,7 @@ def run_fusion(
                 "averaged_params": averaged_params,
                 "best_value": cgi_best_value,
                 "robust_trials": robust_trials,
+                "per_trial_test": cgi_per_trial_test,
                 "composite_df": composite_df,
                 "objective_metric": objective_metric,
                 "test_results": test_results,

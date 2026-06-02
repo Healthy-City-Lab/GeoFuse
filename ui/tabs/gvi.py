@@ -660,7 +660,7 @@ def render(output_dir: str, parent_dir: str) -> None:
         with gen_row_l:
             gen = st.form_submit_button(
                 "Generate Sampling Grids",
-                use_container_width=True,
+                width="stretch",
                 key="gvi_gen_sampling_grids",
             )
         with gen_row_r:
@@ -670,7 +670,7 @@ def render(output_dir: str, parent_dir: str) -> None:
             run = st.form_submit_button(
                 "🚀 Run GVI Analysis",
                 type="primary",
-                use_container_width=True,
+                width="stretch",
                 key="gvi_run_analysis",
             )
         with run_row_r:
@@ -852,7 +852,7 @@ def render(output_dir: str, parent_dir: str) -> None:
             scan_clicked = st.button(
                 "🔄 Scan Output Folder",
                 key="gvi_scan_folder",
-                use_container_width=True,
+                width="stretch",
             )
         with scan_row_r:
             scan_spinner_slot = st.empty()

@@ -25,7 +25,7 @@ def render(output_dir: str) -> None:
                 help="Reload status every 2 seconds until the job reaches 100%.",
             )
         load = st.form_submit_button(
-            "Load status", use_container_width=True, key="job_load_status"
+            "Load status", width="stretch", key="job_load_status"
         )
 
     if load:

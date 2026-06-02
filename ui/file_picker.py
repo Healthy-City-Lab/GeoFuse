@@ -129,10 +129,10 @@ def _render_path_chip(path: str, *, key: str) -> bool:
         with row_rm:
             return bool(
                 st.button(
-                    ":red[✕]",
+                    "❌",
                     key=key,
                     help="Remove this file",
-                    use_container_width=True,
+                    width="stretch",
                 )
             )
 
@@ -220,6 +220,136 @@ def pick_multiple_paths(
         ]
         st.rerun()
     return current
+
+
+def path_to_widget_id(path: str) -> str:
+    """Stable, short, alnum-safe widget-key fragment for ``path``.
+
+    Reordering the kept list must not move the user's label or column
+    selections with the *index* — bindings stick to the **file**.
+    """
+    import hashlib
+
+    return hashlib.md5(path.encode("utf-8", errors="replace")).hexdigest()[:10]
+
+
+def pick_ordered_files(
+    label: str,
+    *,
+    key: str,
+    file_types: Sequence[tuple[str, str]] = FT_VECTOR_OR_RASTER,
+    initial_dir: str | None = None,
+    help_text: str | None = None,
+) -> list[dict]:
+    """Browse-and-list multi-file picker with reorder + editable labels.
+
+    Each kept file renders as one bordered chip showing its custom label,
+    a ▲/▼ pair to move it up/down in the list, an editable label input,
+    and a ✕ remove button. The basename's stem is the default label; the
+    full absolute path is the chip's native hover tooltip. The returned
+    order reflects the user's reordering — the first entry is treated as
+    the baseline by callers.
+    """
+    if st.button(
+        f"📂 {label}",
+        key=f"{key}__btn",
+        help=help_text,
+    ):
+        picked = _open_tk_picker(
+            label, file_types=file_types, initial_dir=initial_dir, multi=True
+        )
+        if picked:
+            existing = list(st.session_state.get(key) or [])
+            for new_path in picked:
+                if new_path and new_path not in existing:
+                    existing.append(new_path)
+            st.session_state[key] = existing
+            st.rerun()
+
+    current: list[str] = list(st.session_state.get(key) or [])
+    if not current:
+        return []
+
+    move_up: int | None = None
+    move_down: int | None = None
+    to_remove: int | None = None
+    for idx, path in enumerate(current):
+        wid = path_to_widget_id(path)
+        label_widget_key = f"{key}__label__{wid}"
+        if label_widget_key not in st.session_state:
+            st.session_state[label_widget_key] = Path(path).stem
+        base = os.path.basename(path)
+        missing = not os.path.isfile(path)
+        with st.container(border=True):
+            # Compact 4-equal-column control row keeps the buttons from
+            # being squeezed in a half-width parent column. The filename
+            # lives in the row-2 placeholder + tooltip, not row 1, so
+            # long names can't wrap into the controls.
+            c_idx, c_up, c_dn, c_rm = st.columns([1, 1, 1, 1])
+            with c_idx:
+                st.markdown(f"**#{idx + 1}**", help=f"{path}")
+            with c_up:
+                if st.button(
+                    "▲",
+                    key=f"{key}__up__{wid}",
+                    help="Move up",
+                    width="stretch",
+                    disabled=(idx == 0),
+                ):
+                    move_up = idx
+            with c_dn:
+                if st.button(
+                    "▼",
+                    key=f"{key}__dn__{wid}",
+                    help="Move down",
+                    width="stretch",
+                    disabled=(idx == len(current) - 1),
+                ):
+                    move_down = idx
+            with c_rm:
+                if st.button(
+                    "❌",
+                    key=f"{key}__rm__{wid}",
+                    help="Remove this file",
+                    width="stretch",
+                ):
+                    to_remove = idx
+            if missing:
+                st.warning(f"⚠️ File no longer exists at `{path}`")
+            st.text_input(
+                f"Label #{idx + 1}",
+                key=label_widget_key,
+                label_visibility="collapsed",
+                help=f"{base}\n\n{path}",
+                placeholder=base,
+            )
+    if to_remove is not None:
+        new_list = [p for i, p in enumerate(current) if i != to_remove]
+        st.session_state[key] = new_list
+        st.rerun()
+    if move_up is not None and move_up > 0:
+        new_list = list(current)
+        new_list[move_up - 1], new_list[move_up] = (
+            new_list[move_up],
+            new_list[move_up - 1],
+        )
+        st.session_state[key] = new_list
+        st.rerun()
+    if move_down is not None and move_down < len(current) - 1:
+        new_list = list(current)
+        new_list[move_down + 1], new_list[move_down] = (
+            new_list[move_down],
+            new_list[move_down + 1],
+        )
+        st.session_state[key] = new_list
+        st.rerun()
+
+    out: list[dict] = []
+    for path in current:
+        wid = path_to_widget_id(path)
+        lbl = st.session_state.get(f"{key}__label__{wid}") or Path(path).stem
+        out.append({"path": path, "label": str(lbl)})
+    return out
 
 
 def clear_path_state(key: str) -> None:
