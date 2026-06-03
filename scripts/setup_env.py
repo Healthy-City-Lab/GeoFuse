@@ -22,6 +22,7 @@ CONDA_PACKAGES = [
     "gdal=3.12.0",
     "geopandas=1.1.1",
     "statsmodels=0.14.6",
+    "cmaes=0.13.0",
 ]
 
 # 2. PYTORCH

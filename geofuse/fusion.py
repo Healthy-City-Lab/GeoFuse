@@ -4244,6 +4244,16 @@ class MetricFusionEngine:
 
         # Build sampler
         if sampler_type == "CMA-ES":
+            try:
+                import cmaes  # noqa: F401
+            except ImportError:
+                _log.warning(
+                    "CMA-ES sampler requested but the `cmaes` package is not "
+                    "installed; falling back to TPE. Install with "
+                    "`conda install -c conda-forge cmaes`."
+                )
+                sampler_type = "TPE"
+        if sampler_type == "CMA-ES":
             sampler = CmaEsSampler(
                 n_startup_trials=n_startup_trials,
                 seed=seed,

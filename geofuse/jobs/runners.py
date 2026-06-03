@@ -610,6 +610,9 @@ def _fusion_config_fingerprint(
             f"ts:{test_size:.3f}",
             f"vs:{val_size:.3f}",
             f"k:{k_folds}",
+            # Bump when the weight-sampler prior or trial.params shape
+            # changes so an old SQLite study can't pool with a new one.
+            "ws:dirichlet1",
         ]
     )
     return _hl.sha256(payload.encode()).hexdigest()[:8]
@@ -1431,29 +1434,45 @@ def run_fusion(
                 params=best_params, metric=objective_metric
             )
 
-            # Score every robust trial on the held-out test set so the
-            # distribution viewer can plot test CIs. ``FrozenTrial.set_user_attr``
-            # only mutates the in-memory copy, so we also collect a sidecar
-            # ``trial.number -> {test_score, test_pvalue}`` dict that the
-            # viewer can read regardless of which trial-pool selection
-            # rematerialises the trials from storage.
+            # Score every completed CGI trial on the held-out test set so
+            # the distribution viewer reflects the true test-side spread —
+            # restricting to robust trials made the test box collapse
+            # whenever the robust filter clustered on identical params.
+            # ``FrozenTrial.set_user_attr`` only mutates the in-memory copy,
+            # so we also collect a sidecar ``trial.number -> {test_score,
+            # test_pvalue}`` dict for the viewer to consult.
+            import optuna as _optuna_cgi
+
+            cgi_completed = [
+                _t
+                for _t in engine.study.trials
+                if _t.state == _optuna_cgi.trial.TrialState.COMPLETE
+            ]
             cgi_per_trial_test: dict[int, dict[str, float]] = {}
-            for _t in robust_trials or []:
+            for _t in cgi_completed:
                 try:
                     _tr = engine.evaluate_on_test(
                         params=_t.params, metric=objective_metric
                     )
                     rec: dict[str, float] = {}
                     if _tr.get("test_score") is not None:
-                        _t.set_user_attr("test_score", float(_tr["test_score"]))
                         rec["test_score"] = float(_tr["test_score"])
                     if _tr.get("test_pvalue") is not None:
-                        _t.set_user_attr("test_pvalue", float(_tr["test_pvalue"]))
                         rec["test_pvalue"] = float(_tr["test_pvalue"])
                     if rec:
                         cgi_per_trial_test[int(_t.number)] = rec
                 except Exception:
                     continue
+            # Mirror the sidecar onto the robust-trial FrozenTrials so the
+            # robust-trials browser table still reads test_score per row.
+            for _t in robust_trials or []:
+                rec = cgi_per_trial_test.get(int(_t.number))
+                if rec is None:
+                    continue
+                if "test_score" in rec:
+                    _t.set_user_attr("test_score", rec["test_score"])
+                if "test_pvalue" in rec:
+                    _t.set_user_attr("test_pvalue", rec["test_pvalue"])
             stage(skey("evaluate"), DONE)
 
             stage(skey("apply"), RUNNING)
@@ -1572,24 +1591,35 @@ def run_fusion(
 
                 # Per-trial test scoring + sidecar so the distribution
                 # viewer can plot test CIs after the engine's study has
-                # been rebound to CGI.
+                # been rebound to CGI. Score every completed trial so
+                # the test box reflects real trial-to-trial variation,
+                # not just the (often-converged) robust subset.
                 ch_per_trial_test: dict[int, dict[str, float]] = {}
-                for _t in ch_robust or []:
+                for _t in ch_all_completed:
                     try:
                         _tr = engine.evaluate_on_test(
                             params=_t.params, metric=objective_metric
                         )
                         rec: dict[str, float] = {}
                         if _tr.get("test_score") is not None:
-                            _t.set_user_attr("test_score", float(_tr["test_score"]))
                             rec["test_score"] = float(_tr["test_score"])
                         if _tr.get("test_pvalue") is not None:
-                            _t.set_user_attr("test_pvalue", float(_tr["test_pvalue"]))
                             rec["test_pvalue"] = float(_tr["test_pvalue"])
                         if rec:
                             ch_per_trial_test[int(_t.number)] = rec
                     except Exception:
                         continue
+                # Mirror the sidecar onto the robust-trial FrozenTrials so
+                # the robust-trials browser table still surfaces test_score
+                # per row.
+                for _t in ch_robust or []:
+                    rec = ch_per_trial_test.get(int(_t.number))
+                    if rec is None:
+                        continue
+                    if "test_score" in rec:
+                        _t.set_user_attr("test_score", rec["test_score"])
+                    if "test_pvalue" in rec:
+                        _t.set_user_attr("test_pvalue", rec["test_pvalue"])
 
                 # Reports + composite TIFF + averaged top-20 % params for
                 # this standalone, mirroring what the CGI study gets. Each

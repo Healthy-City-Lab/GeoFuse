@@ -36,19 +36,24 @@ Formulas
 Weight sampling
 ---------------
 
-Every formula's weight suggestion uses **sequential conditional allocation on
-the simplex** with **integer weights summing to 100**: each weight is
-suggested with bounds that depend on the previously-suggested weights, and the
-*last* weight is pinned to the remainder via ``trial.suggest_int(rem, rem)``
-so it is recorded as a real trial parameter. This guarantees **recorded params
-== used params** — the user does post-hoc weight-vs-association analyses on
-the recorded trial parameters, so a "sample raw then normalize" gap would
-silently break the analysis. Picking the same int 0–100 scale for both
-formulas (over float [0, 1] for synergy) keeps the trial-DB analysis pipeline
-uniform across formulas. *Caveat:* sequential
-allocation is order-dependent (a mild prior bias toward larger early weights);
-ordering is fixed (main terms first, then pairwise, then triple) and
-documented per formula.
+Every formula's weight suggestion draws from a **symmetric Dirichlet(1, …, 1)
+prior** — i.e. uniform on the simplex, no per-channel ordering bias. The
+implementation uses the Gamma-normalize trick: an ``Exp(1)`` sample (computed
+as ``-log(U(0, 1))``) is drawn per weight key, then the values are normalised
+to sum to ``total``. By symmetry every weight has the same marginal
+distribution.
+
+Optuna integration: the raw uniform draws live in ``trial.params`` under
+``<key>_raw`` so TPE has flat per-dimension axes to model; the normalised
+**integer** weight is then *pinned* via ``trial.suggest_int(value, value)`` so
+``trial.params`` still carries the canonical ``*_weight`` keys that downstream
+Optuna plots, robust-trial reports, and weight-vs-association CSV analyses
+expect. TPE searches over the ``*_raw`` axes; the pinned weights are
+bookkeeping.
+
+Edge cases: the raw float is clamped to ``[1e-9, 1 - 1e-9]`` so ``-log(u)``
+never hits ``±inf`` or ``0``. Largest-remainder rounding keeps the integer
+weights summing to exactly ``total``.
 """
 
 from __future__ import annotations
@@ -120,28 +125,57 @@ class CGIFormula:
 
 
 # ---------------------------------------------------------------------------
-# Sequential conditional simplex sampling
+# Symmetric Dirichlet(1,…,1) sampling (uniform on the simplex)
 # ---------------------------------------------------------------------------
 
+# Floor for the raw uniform draws so ``-log(u)`` stays finite and the
+# normalising sum is never zero. The symmetric upper clamp keeps every key's
+# marginal exactly identical.
+_DIRICHLET_EPS: float = 1e-9
 
-def _suggest_simplex_weights_int(
+
+def _suggest_simplex_weights_dirichlet(
     trial: optuna.Trial, keys: tuple[str, ...], total: int = 100
 ) -> dict[str, int]:
-    """Suggest ``keys`` as integers in ``[0, remaining]`` summing exactly to ``total``.
+    """Sample ``keys`` from symmetric Dirichlet(1, …, 1), rounded to integers
+    summing exactly to ``total``.
 
-    The last key is pinned via ``suggest_int(rem, rem)`` so it is recorded as
-    a real parameter rather than implicit — keeps "recorded == used" intact
-    for downstream weight-vs-association analyses on the study DB.
+    Each key gets the SAME marginal distribution (Beta(1, K-1)) by the
+    Gamma-normalize construction's symmetry, so no key is favoured by the
+    prior. TPE optimises against the per-key ``<key>_raw`` axes recorded by
+    ``trial.suggest_float`` (flat U(eps, 1-eps), which TPE can model cleanly);
+    the integer weight is then pinned via ``trial.suggest_int(w, w)`` so the
+    canonical ``*_weight`` keys still appear in ``trial.params`` for Optuna
+    plots, robust-trial reports, and weight-vs-association CSV readers.
     """
+    import math as _math
+
+    raw_xs: list[float] = []
+    for k in keys:
+        u = trial.suggest_float(
+            f"{k}_raw", _DIRICHLET_EPS, 1.0 - _DIRICHLET_EPS
+        )
+        raw_xs.append(-_math.log(u))
+    sum_x = sum(raw_xs)
+    if sum_x <= 0.0:
+        # Defensive: all u_i hit the upper clamp. Fall back to equal weights.
+        scaled = [float(total) / len(keys)] * len(keys)
+    else:
+        scaled = [x / sum_x * total for x in raw_xs]
+
+    # Largest-remainder rounding so the integer weights sum to ``total`` exactly.
+    floors = [int(_math.floor(s)) for s in scaled]
+    remainder = int(total) - sum(floors)
+    if remainder > 0:
+        order = sorted(
+            range(len(keys)), key=lambda i: scaled[i] - floors[i], reverse=True
+        )
+        for i in order[:remainder]:
+            floors[i] += 1
+
     out: dict[str, int] = {}
-    remaining = int(total)
-    last = len(keys) - 1
-    for i, k in enumerate(keys):
-        if i == last:
-            out[k] = trial.suggest_int(k, remaining, remaining)
-        else:
-            out[k] = trial.suggest_int(k, 0, remaining)
-            remaining -= out[k]
+    for k, w in zip(keys, floors):
+        out[k] = trial.suggest_int(k, int(w), int(w))
     return out
 
 
@@ -153,7 +187,7 @@ _WA_WEIGHT_KEYS: tuple[str, ...] = ("ndvi_weight", "veg_weight", "terrain_weight
 
 
 def _suggest_weighted_average(trial: optuna.Trial) -> dict:
-    return _suggest_simplex_weights_int(trial, _WA_WEIGHT_KEYS, total=100)
+    return _suggest_simplex_weights_dirichlet(trial, _WA_WEIGHT_KEYS, total=100)
 
 
 def _compute_weighted_average(params: dict, components: ComponentDict) -> np.ndarray:
@@ -181,10 +215,9 @@ def _wa_channel_active(params: dict) -> dict[str, bool]:
 # synergy formula
 # ---------------------------------------------------------------------------
 
-# Order is fixed: main NDVI / Veg / Ter first, then pairwise (NV / NT / TV),
-# then the triple. Sequential allocation biases toward larger early weights, so
-# the main terms get the most prior mass — matches the paper, which gives the
-# main terms the dominant share of the AHP-set weights.
+# Key ordering is informational only — the symmetric Dirichlet sampler treats
+# every key identically, so the (main NDVI / Veg / Ter, then pairwise NV / NT
+# / TV, then triple) order doesn't bias which terms get larger prior mass.
 _SYN_MAIN_KEYS: tuple[str, ...] = ("w_ndvi", "w_veg", "w_ter")
 _SYN_INTER_KEYS: tuple[str, ...] = (
     "w_ndvi_veg",
@@ -209,7 +242,9 @@ def _suggest_synergy(trial: optuna.Trial) -> dict:
     # Same int 0–100 scale as ``weighted_average`` so the two formulas share
     # one downstream trial-DB convention; ``_compute_synergy`` self-renormalizes
     # by their actual total before evaluating the composite.
-    params.update(_suggest_simplex_weights_int(trial, _SYN_WEIGHT_KEYS, total=100))
+    params.update(
+        _suggest_simplex_weights_dirichlet(trial, _SYN_WEIGHT_KEYS, total=100)
+    )
     return params
 
 

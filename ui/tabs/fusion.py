@@ -2200,24 +2200,39 @@ def _render_fusion_results_body(output_dir: str) -> None:
             return f"{p}{suffix} percentile"
         return "—"
 
-    # ── Row 1: formula · top-20% test score · robust ratio ─────────────
-    test_subset_score = (
-        (results_view.get("subset_scores") or {}).get("test") or {}
-    ).get("score")
+    # ── Row 1: formula · train/val/test (avg top-20%) · robust ratio ────
+    subset_scores_view = results_view.get("subset_scores") or {}
+
+    def _subset_score(name: str) -> float | None:
+        block = subset_scores_view.get(name) or {}
+        v = block.get("score")
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    train_subset_score = _subset_score("train")
+    val_subset_score = _subset_score("val")
+    test_subset_score = _subset_score("test")
     formula_display = _FORMULA_DISPLAY.get(formula.name, formula.name.title())
 
-    headline_cols = st.columns(3)
+    headline_cols = st.columns(5)
     with headline_cols[0]:
         st.metric("CGI Formula", formula_display)
-    with headline_cols[1]:
-        if test_subset_score is not None:
-            st.metric(
-                f"Test {metric_name} (avg top-20%)",
-                f"{float(test_subset_score):.4f}",
-            )
-        else:
-            st.metric(f"Best {metric_name}", f"{results_view['best_value']:.4f}")
-    with headline_cols[2]:
+    for col, label, score in (
+        (headline_cols[1], "Train", train_subset_score),
+        (headline_cols[2], "Val", val_subset_score),
+        (headline_cols[3], "Test", test_subset_score),
+    ):
+        with col:
+            if score is not None:
+                st.metric(
+                    f"{label} {metric_name} (avg top-20%)",
+                    f"{score:.4f}",
+                )
+            else:
+                st.metric(f"{label} {metric_name} (avg top-20%)", "—")
+    with headline_cols[4]:
         if results_view["robust_trials"]:
             st.metric(
                 "Robust Trials",
