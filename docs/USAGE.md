@@ -24,7 +24,7 @@ streamlit run ui/app.py
 
 1. **NDVI tab** → upload a study area file → set date range → choose output formats (**GeoTIFF** is default; **GeoPackage** and **GeoJSON** optional) → "Run NDVI Analysis"
 2. **GVI tab** → upload the same study area → set grid resolution and buffer → choose output formats (**GeoPackage** is default; **GeoTIFF** for per-cluster tile rasters; **GeoJSON** for compatibility) → "Generate Sampling Grids" → "Run GVI Analysis"
-3. **Fusion tab** → upload a target outcomes file (GeoJSON or GeoTIFF) → pick a **Run mode** (Cross-sectional or Mixed-effects longitudinal) → upload one GVI file + one NDVI file per measurement year/wave in the **Metric File Assignment** section → set CGI formula, covariates, objective metric, trial budget, k-fold toggle, etc. in **Study Details** → "🚀 Run Fusion Optimization"
+3. **Fusion tab** → upload a target outcomes file (GeoJSON or GeoTIFF) → pick a **Run mode** (Cross-sectional or Mixed-effects longitudinal) → upload one GVI file + one NDVI file per measurement year/wave in the **Metric File Assignment** section → set CGI formula, covariates, objective metric, test-set size, and the stability-selection knobs in **Study Details** → "🚀 Run Fusion Optimization"
 4. Inspect the composite greenery weights and export results.
 
 > [!NOTE]
@@ -51,20 +51,18 @@ The Fusion tab reads top-to-bottom in the order you reason about a run:
    - **Cross-sectional** offers a **Date column available?** toggle. With the toggle off, no date column is needed and each metric channel takes one file. With it on, pick the date column; distinct measurement years are discovered and drive the per-year file assignment in the next section (years are only a metric-file routing key — they never enter the regression).
    - **Mixed-effects longitudinal** offers **long** intake (one target file with explicit wave column — pick the entity-ID, date, and wave columns from selectboxes) or **wide** intake (one target file per wave, with per-file column pickers + a free-text wave label). A date column is mandatory in this mode.
 3. **Metric File Assignment** — per channel (NDVI then GVI), set the buffer ladder (min / max / step in metres) that applies to every uploaded file in that channel, then upload one or more files. When years/waves were discovered above, each uploaded file gets a multi-select listing which years/waves it applies to. Every year/wave must be covered by exactly one file per channel — coverage status is shown live and the run fails with an error on submit if anything is unassigned.
-4. **Study Details** (form) — CGI formula (`weighted_average` or `synergy`), covariates (numeric attribute columns to control for; wide-mode longitudinal intersects across wave files), a single mode-aware **Objective metric** dropdown (OLS-based options for cross-sectional, MixedLM-based options for mixed-effects), trial budget, **Use k-fold cross-validation** toggle (off ⇒ single train/val split, ~k× faster per trial), **Test set size** and **Validation set size** sliders (both as fractions of the whole dataset; defaults 0.25 / 0.25), stratification bins, MixedLM toggles, resume previous study, the **Also optimize each metric on its own** standalones checkbox, and — for polygon targets only — a **Polygon scoring** block with the **CGI grid pixel size (m)** slider (25–500 m, step 25, default 50), the **Whole-grid scaling** checkbox, and the **Area-balanced stratified split** checkbox.
+4. **Study Details** (form) — CGI formula (`weighted_average` or `synergy`), covariates (numeric attribute columns to control for; wide-mode longitudinal intersects across wave files), a single mode-aware **Objective metric** dropdown (OLS-based options for cross-sectional, MixedLM-based options for mixed-effects), a **Test set size** slider (fraction of the whole dataset; default 0.25), stratification bins, the **Stability selection** knobs (bootstraps, trials per bootstrap, minimum trials per cell), MixedLM toggles, resume previous study, the **Also optimize each metric on its own** standalones checkbox, and — for polygon targets only — a **Polygon scoring** block with the **CGI grid pixel size (m)** slider (25–500 m, step 25, default 50), the **Whole-grid scaling** checkbox, and the **Area-balanced stratified split** checkbox.
 5. **🚀 Run Fusion Optimization**.
 
 #### Optimization results panel
 
 After a job completes (or when you click **Load results** on a completed job in the sidebar Job Monitor) the results section renders with these blocks, in order:
 
-- **Summary tiles** — formula name, test score on the averaged top-20% params, robust-trial ratio, weights, radii, aggregators.
-- **Best Trial Details** + **Final (averaged top-20%) Parameters** — side-by-side JSON dumps; the composite GeoTIFF is built from the averaged params.
-- **Interactive Plots** — pick from optimization history, parameter importances, parallel coordinates, slice, contour, rank, EDF, or timeline; filter trial pool (all completed vs robust only); choose parameter axes where applicable.
-- **Robust Trials browser** — scrollable table; the study selector switches between CGI (combined) and each standalone.
-- **CGI vs Standalone Single-Metric Studies** — grouped bar charts comparing studies across selectable subsets (`train` / `val` / `test` / `all`) and values (`score` / `pvalue` / `n`); rendered only when standalones ran.
+- **Summary tiles** — formula name, held-out test score + 95% percentile CI, the greenery↔outcome direction, the CGI-vs-best-standalone AIC/BIC verdict (when standalones ran), weights, radii, aggregators.
+- **Final (stability-selection) Parameters** — JSON dump of the winning weight cell's averaged params; the composite GeoTIFF is built from these.
+- **Stability diagnostics** — the winning cell's worst-quantile / median OOB score and selection probability, the top-ranked competing weight cells, the winning cell's OOB-score spread, and a per-bootstrap summary table.
+- **CGI vs Standalone Single-Metric Studies** — per-channel held-out test scores plus the AIC/BIC verdict (ΔAIC / ΔBIC, with the strength band) on whether the multi-channel CGI is justified over the best single channel; rendered only when standalones ran.
 - **Covariate impact** — when covariates are set, two OLS regressions (`target ~ CGI + covariates` vs `target ~ CGI`) on the full dataset; per-covariate coefficient, t-stat, p-value, direction, and partial R²; lift over CGI-only R² summarised at the top.
-- **Per-trial objective distributions** — Plotly box plot of per-trial `train` / `val` / `test` scores, with selectors for studies, trial pool (`robust` / `all completed`), and subsets. Test scores are post-processed per robust trial after the search (no leakage during optimization).
 - **Composite map viewer** — multi-select composites + target outcome rendered as subplots in a near-square grid at 300 dpi; composite subplots share a `[0, 1]` colorbar.
 - **Mixed-effects metric tabs** — when MixedLM scoring is on, one tab per `mixedlm_metrics*.csv` written under the per-job folder.
 
@@ -74,18 +72,15 @@ Every fusion run writes its artifacts to `output_results/fusion/<YYYYMMDDTHHMMSS
 
 ```text
 <job_root>/
-├── composite_greenery.tif            ← CGI averaged-params raster
+├── composite_greenery.tif            ← CGI winning-params raster
 ├── composite_greenery_params.json
 ├── composite_greenery_<veg|terrain|ndvi>.tif         ← one per standalone
 └── study_results/
-    ├── robust_trials/                 ← CGI plots + reports
-    ├── all_trials/
-    ├── split_scores.csv               ← CGI per-split scores
     ├── mixedlm_metrics*.csv           ← if longitudinal + MixedLM
-    └── standalone_<ch>/               ← per-standalone plots + reports + split scores
+    └── standalone_<ch>/               ← per-standalone outputs
 ```
 
-The Optuna study SQLite files live in `output_results/fusion_studies/` and are content-addressed via a config fingerprint — a config change (buffer ladder, formula, scaling toggles, val / test sizes, …) starts a fresh study so old trials with out-of-range params can never contaminate a new run.
+Run settings are recorded on the job record and replayed verbatim on restart (see **Full run-setting fidelity** in [FEATURES.md](FEATURES.md)). The per-job caches — metric downloads, the pre-aggregation SQLite cache, and artifacts — are content-addressed via a fingerprint of the search-space settings (buffer ladder, formula, scaling toggles, test size, …), so a config change starts fresh while an identical re-run resumes.
 
 #### Polygon scoring (per-pixel CGI)
 
@@ -93,11 +88,11 @@ When the target carries polygon (or multipolygon) geometries, each polygon is sc
 
 #### Mixed-effects fusion (longitudinal data)
 
-Pick **Mixed-effects (longitudinal)** as the run mode. The four `mixedlm_*` scorers measure greenery's contribution net of within-entity temporal correlation, so a date column is required. Date columns accept full ISO dates (`2010-01-15`), year + month (`2010-01`), year-only strings (`2010`), or integer years — `years_since_baseline` is derived per entity from each entity's earliest measurement date. Pick the MixedLM scorer Optuna should optimise (default `mixedlm_tstat`); the other three metrics are computed post-hoc and saved to `output_results/fusion/study_results/mixedlm_metrics.csv` with mean + 95 % CI rows per pool. A channel can use the same file across every wave (typical for terrain or one-snapshot NDVI) — just assign that one upload to every discovered wave.
+Pick **Mixed-effects (longitudinal)** as the run mode. The four `mixedlm_*` scorers measure greenery's contribution net of within-entity temporal correlation, so a date column is required. Date columns accept full ISO dates (`2010-01-15`), year + month (`2010-01`), year-only strings (`2010`), or integer years — `years_since_baseline` is derived per entity from each entity's earliest measurement date. Pick the MixedLM scorer Optuna should optimize (default `mixedlm_tstat`); the other three metrics are computed post-hoc and saved to `output_results/fusion/study_results/mixedlm_metrics.csv` with mean + 95 % CI rows per pool. A channel can use the same file across every wave (typical for terrain or one-snapshot NDVI) — just assign that one upload to every discovered wave.
 
 #### Year-aware cross-sectional
 
-Cross-sectional runs typically use one GVI file and one NDVI file. When the cohort was sampled in different years and you have per-year greenery files, turn **Date column available?** on and pick the date column; the discovered years drive the same per-channel file-assignment grid the longitudinal mode uses. The OLS scorer (pearson / spearman / r² / rmse / mutual_info) is unchanged — the spec sits underneath only as a per-year metric-file routing key.
+Cross-sectional runs typically use one GVI file and one NDVI file. When the cohort was sampled in different years and you have per-year greenery files, turn **Date column available?** on and pick the date column; the discovered years drive the same per-channel file-assignment grid the longitudinal mode uses. The OLS scorer (distance correlation / spearman / r² / nrmse / mutual_info) is unchanged — the spec sits underneath only as a per-year metric-file routing key.
 
 ---
 

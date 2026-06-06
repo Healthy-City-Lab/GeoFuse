@@ -3,7 +3,7 @@
 After the Optuna study completes, this module re-scores every robust trial
 (BH-FDR filtered) and every top-``top_percent`` trial on the held-out test
 set, computing all four ``mixedlm_*`` scorer metrics per trial regardless of
-which one was optimised. The final composite — using the averaged
+which one was optimized. The final composite — using the averaged
 top-``top_percent`` parameters that ``generate_composite_greenery_map`` picks
 — is also scored once. Per-trial values land in ``mixedlm_metrics.csv``
 alongside a per-(pool, metric) summary row carrying the sample mean + 95 %

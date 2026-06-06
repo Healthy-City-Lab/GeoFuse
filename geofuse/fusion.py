@@ -328,6 +328,16 @@ class MetricFusionEngine:
         self._preaggr_cache: preaggregation.PreAggregationCache | None = None
         self._cancel_callback: Callable[[], bool] | None = None
 
+        # Channels turned off by the optional collinearity check
+        # (``check_channel_collinearity``). Disabled channels are pinned to
+        # weight 0 in every trial and skipped in the per-channel
+        # aggregation path. Default: all three channels active.
+        self._disabled_channels: set[str] = set()
+        # Collinearity report from the most recent check (or ``None`` if
+        # the check wasn't requested). Stored so the runner can hand it to
+        # the results UI without re-running the analysis.
+        self._collinearity_report: dict | None = None
+
         # Vector vs raster (``is_points`` kept for backward compatibility = vector target)
         self.is_raster = target_path_is_raster(target_file)
         self.is_points = not self.is_raster
@@ -2352,6 +2362,105 @@ class MetricFusionEngine:
         digest = hashlib.sha256(vals.tobytes()).hexdigest()[:16]
         return f"vec:{len(metric)}:{tuple(metric.total_bounds)}:{col}:{digest}"
 
+    def check_channel_collinearity(
+        self,
+        *,
+        data: "pd.DataFrame | None" = None,
+        vif_threshold: float = 10.0,
+        sample_size: int = 20_000,
+        seed: int = 42,
+    ) -> dict:
+        """Run iterative-VIF channel reduction on the CGI grid pixel values.
+
+        Reads per-pixel ``veg`` / ``terrain`` / ``ndvi`` columns from
+        ``data`` (typically the ``fusion_df`` produced by
+        :meth:`prepare_fusion_data` — every CGI grid pixel before any
+        train/val/test split), optionally subsamples to ``sample_size``
+        rows for speed, then delegates the math to
+        :func:`statistical_testing.iterative_vif_reduction`.
+
+        When ``data`` is not supplied, falls back to the post-split pool
+        (``train_val_data`` + ``test_data``) — but the typical runner
+        path calls this **before** ``split_data`` runs, so passing
+        ``fusion_df`` explicitly is the standard usage.
+
+        Channels dropped by the procedure are recorded in
+        ``self._disabled_channels`` and pinned to weight 0 in every trial.
+        The full report (pairwise Pearson, initial / final VIFs, the
+        per-iteration drop history) is stored on
+        ``self._collinearity_report`` so the runner can hand it to the UI.
+
+        The check uses the raw pixel values rather than the
+        pre-aggregated cache because the aggregation step smooths spatial
+        detail and inflates correlations between channels (1000m buffers
+        make everything look similar). The raw test is the strictest.
+
+        Returns the same dict written to ``self._collinearity_report``.
+        """
+        from . import statistical_testing as _stats_mod
+
+        if data is not None:
+            df = data
+        else:
+            frames: list[pd.DataFrame] = []
+            if self.train_val_data is not None:
+                frames.append(self.train_val_data)
+            if self.test_data is not None:
+                frames.append(self.test_data)
+            if not frames:
+                raise ValueError(
+                    "check_channel_collinearity needs a pixel-level DataFrame: "
+                    "either pass ``data=fusion_df`` (the output of "
+                    "prepare_fusion_data) or call split_data first so "
+                    "``train_val_data`` / ``test_data`` are populated."
+                )
+            df = pd.concat(frames, ignore_index=False) if len(frames) > 1 else frames[0]
+
+        all_channels = ["veg", "terrain", "ndvi"]
+        missing = [c for c in all_channels if c not in df.columns]
+        if missing:
+            raise ValueError(
+                f"Channel columns missing from CGI pool: {missing}. "
+                "Re-run prepare_fusion_data() with all channels loaded."
+            )
+
+        X = df[all_channels].to_numpy(dtype=np.float64)
+        mask = np.isfinite(X).all(axis=1)
+        X = X[mask]
+        if len(X) > int(sample_size):
+            rng = np.random.default_rng(int(seed))
+            idx = rng.choice(len(X), size=int(sample_size), replace=False)
+            X = X[idx]
+        logger.info(
+            f"Collinearity check: {len(X):,} pixel rows over channels "
+            f"{all_channels}, VIF threshold = {vif_threshold}."
+        )
+
+        report = _stats_mod.iterative_vif_reduction(
+            X, names=list(all_channels), vif_threshold=float(vif_threshold)
+        )
+
+        kept = set(report["kept"])
+        dropped = set(report["dropped"])
+        self._disabled_channels = {c for c in all_channels if c not in kept}
+        self._collinearity_report = dict(report)
+        self._collinearity_report["vif_threshold"] = float(vif_threshold)
+        self._collinearity_report["sample_size"] = int(len(X))
+        self._collinearity_report["channels_in"] = list(all_channels)
+
+        if dropped:
+            logger.warning(
+                f"Collinearity reduction dropped: {sorted(dropped)}. "
+                f"Kept: {sorted(kept)}. Initial VIFs: "
+                f"{dict(zip(all_channels, report['initial_vifs']))}."
+            )
+        else:
+            logger.info(
+                f"Collinearity check passed: all VIFs ≤ {vif_threshold}. "
+                f"VIFs: {dict(zip(all_channels, report['initial_vifs']))}."
+            )
+        return self._collinearity_report
+
     def precompute_aggregations(
         self,
         progress_callback: Callable[[int, int], None] | None = None,
@@ -3801,37 +3910,43 @@ class MetricFusionEngine:
         random_state: int = 42,
         fusion_df: pd.DataFrame | None = None,
         single_split_val_ratio: float = 0.2,
+        *,
+        outer_fold_idx: int | None = None,
+        n_outer_folds: int | None = None,
     ) -> None:
-        """
-        Split data into holdout test set and k-fold CV training/validation sets.
+        """Carve a held-out test set, then build k inner CV folds (or one
+        single split) over the remainder.
 
-        Workflow:
-        1. Sample all metrics at point locations (nearest-feature caps: GVI max
-           ``gvi_buffer_max_m``, NDVI max ``ndvi_buffer_max_m``)
-        2. Filter out rows with NaN values in any metric
-        3. Bin target values for stratification
-        4. Stratified train/val/test split. The held-out **test set is
-           always carved off first** via ``test_size`` regardless of
-           ``k_folds``; ``k_folds`` only decides whether the non-test
-           subset becomes k cv folds or a single train/val split.
-
-        During optimization, metrics will be re-sampled with trial-specific radii
-        using circular buffer aggregation.
+        Nested cross-validation: when ``outer_fold_idx`` and ``n_outer_folds``
+        are both set, the held-out test set is the ``outer_fold_idx``-th
+        partition of a stratified ``n_outer_folds``-fold split over the data
+        (group-aware when ``entity_id`` / ``polygon_id`` is present). Every
+        entity appears in test exactly once across the K calls, so the runner
+        can build an outer-CV-averaged prediction column with no leakage. When
+        the two args are ``None`` the original ``test_size``-based stratified
+        split is used (back-compat path for single-test-split runs).
 
         Args:
-            test_size: Proportion for holdout test set (e.g., 0.2 = 20%);
-                applied independently of ``k_folds`` so a held-out test
-                set exists in both CV and single-split modes.
-            k_folds: Number of cross-validation folds. Pass ``1`` (or ``0``)
-                to disable CV and use a single stratified train/val split
-                instead; ``self.cv_folds`` becomes a length-1 list and each
-                trial fits one model per study iteration. The held-out
-                test set still exists either way.
-            random_state: Random seed for reproducibility
-            single_split_val_ratio: When ``k_folds <= 1``, the fraction of
-                the non-test subset used as validation in the single fit.
-                Default 0.2 matches the size of one fold in a 5-fold CV
-                run so the trial-level signal stays comparable.
+            test_size: Held-out fraction when ``outer_fold_idx`` is unset.
+                Ignored in nested-CV mode (the outer fold sets the test size
+                to ``≈ 1/n_outer_folds``).
+            k_folds: Inner CV folds within train+val. ``1`` (or ``0``) =
+                single stratified train/val split (``self.cv_folds`` becomes
+                length-1 and each trial fits one model).
+            random_state: RNG seed for reproducibility. In nested-CV mode
+                this must be held constant across all K outer-fold calls so
+                the K test partitions form a proper non-overlapping K-fold
+                partition over the data. Inner CV partitions still differ
+                per outer fold because they operate on a different train+val
+                subset each call.
+            single_split_val_ratio: When ``k_folds <= 1``, fraction of the
+                non-test subset used as validation in the single fit.
+            outer_fold_idx: 0-based index of the outer fold whose held-out
+                partition becomes the test set. Must be set together with
+                ``n_outer_folds``.
+            n_outer_folds: Total outer folds (typically 5-10). When set, the
+                test set is derived from a stratified K-fold partition; when
+                unset, the legacy ``test_size`` random split is used.
         """
         # Step 1: Sample all metrics at initial buffer distance
         logger.info("Step 1/4: Sampling metrics at point locations...")
@@ -3912,50 +4027,88 @@ class MetricFusionEngine:
                 f"{'stratified' if stratifiable else f'unstratified — too few {group_label}s per bin'}).",
             )
 
-            # For polygon-level splits we can optionally do area-balanced allocation to maximize spatial representativeness in each split.
-            use_area_balanced = (
-                stratifiable
-                and self.area_balanced_split
-                and group_label == "polygon"
-                and self._polygon_id_to_area_km2
-            )
-            if use_area_balanced:
-                target_fractions = {
-                    "train_val": 1.0 - test_size,
-                    "test": test_size,
-                }
-                allocations = self._area_balanced_polygon_split(
-                    poly_df,
-                    group_col=group_col,
-                    target_fractions=target_fractions,
-                    random_state=random_state,
-                )
-                train_val_poly = allocations["train_val"]
-                test_poly = allocations["test"]
+            # Nested-CV mode: the test set is one slice of a stratified
+            # K-fold partition over groups. Every group appears in test
+            # exactly once across the K outer-fold calls.
+            outer_cv_mode = outer_fold_idx is not None and n_outer_folds is not None
+            if outer_cv_mode:
+                from sklearn.model_selection import KFold
+
+                assert n_outer_folds is not None and outer_fold_idx is not None
+                k_outer = max(2, int(n_outer_folds))
+                fold_i = max(0, min(int(outer_fold_idx), k_outer - 1))
+                if stratifiable and (
+                    poly_df["target_bin"].value_counts().min() >= k_outer
+                ):
+                    outer_splitter = StratifiedKFold(
+                        n_splits=k_outer, shuffle=True, random_state=random_state
+                    )
+                    outer_iter = list(
+                        outer_splitter.split(poly_df, poly_df["target_bin"])
+                    )
+                else:
+                    outer_splitter = KFold(
+                        n_splits=k_outer, shuffle=True, random_state=random_state
+                    )
+                    outer_iter = list(outer_splitter.split(poly_df))
+                tv_idx, te_idx = outer_iter[fold_i]
+                train_val_poly = poly_df.iloc[tv_idx].copy()
+                test_poly = poly_df.iloc[te_idx].copy()
                 _log(
                     "INFO",
-                    "Area-balanced stratified test split: "
-                    f"train+val={len(train_val_poly)} polygons, "
-                    f"test={len(test_poly)} polygons.",
+                    f"Outer fold {fold_i + 1}/{k_outer}: "
+                    f"train+val={len(train_val_poly)} {group_label}s, "
+                    f"test={len(test_poly)} {group_label}s.",
                 )
-            elif stratifiable:
-                try:
-                    train_val_poly, test_poly = train_test_split(
+            else:
+                # Single-split mode: area-balanced or stratified random split
+                # on ``test_size`` (original behaviour).
+                use_area_balanced = (
+                    stratifiable
+                    and self.area_balanced_split
+                    and group_label == "polygon"
+                    and self._polygon_id_to_area_km2
+                )
+                if use_area_balanced:
+                    target_fractions = {
+                        "train_val": 1.0 - test_size,
+                        "test": test_size,
+                    }
+                    allocations = self._area_balanced_polygon_split(
                         poly_df,
-                        test_size=test_size,
-                        stratify=poly_df["target_bin"],
+                        group_col=group_col,
+                        target_fractions=target_fractions,
                         random_state=random_state,
                     )
-                except ValueError as e:
-                    _log("WARN", f"Stratified split failed ({e}); using random split.")
+                    train_val_poly = allocations["train_val"]
+                    test_poly = allocations["test"]
+                    _log(
+                        "INFO",
+                        "Area-balanced stratified test split: "
+                        f"train+val={len(train_val_poly)} polygons, "
+                        f"test={len(test_poly)} polygons.",
+                    )
+                elif stratifiable:
+                    try:
+                        train_val_poly, test_poly = train_test_split(
+                            poly_df,
+                            test_size=test_size,
+                            stratify=poly_df["target_bin"],
+                            random_state=random_state,
+                        )
+                    except ValueError as e:
+                        _log(
+                            "WARN",
+                            f"Stratified split failed ({e}); using random split.",
+                        )
+                        train_val_poly, test_poly = train_test_split(
+                            poly_df, test_size=test_size, random_state=random_state
+                        )
+                        stratifiable = False
+                else:
                     train_val_poly, test_poly = train_test_split(
                         poly_df, test_size=test_size, random_state=random_state
                     )
-                    stratifiable = False
-            else:
-                train_val_poly, test_poly = train_test_split(
-                    poly_df, test_size=test_size, random_state=random_state
-                )
             train_val_poly = train_val_poly.reset_index(drop=True)
 
             # Map group assignments back to row-level data.
@@ -4077,7 +4230,7 @@ class MetricFusionEngine:
             )
             return
 
-        # ── Row-level (point / raster) split — original behaviour ────────────
+        # ── Row-level (point / raster) split ────────────────────────────────
         # Step 3: Create stratification bins based on target values
         logger.info("Step 3/4: Binning target values for stratified sampling...")
         fusion_df["target_bin"] = pd.qcut(
@@ -4087,14 +4240,43 @@ class MetricFusionEngine:
             f"Created {fusion_df['target_bin'].nunique()} bins for stratification"
         )
 
-        # Step 4: Stratified split into train/val and test sets
-        logger.info("Step 4/4: Performing stratified train/test split...")
-        self.train_val_data, self.test_data = train_test_split(
-            fusion_df,
-            test_size=test_size,
-            stratify=fusion_df["target_bin"],
-            random_state=random_state,
-        )
+        # Step 4: Stratified split into train/val and test sets — nested-CV
+        # mode pulls test from one slice of a stratified K-fold partition;
+        # legacy single-split mode uses the ``test_size`` random split.
+        outer_cv_mode_rows = outer_fold_idx is not None and n_outer_folds is not None
+        if outer_cv_mode_rows:
+            from sklearn.model_selection import KFold
+
+            assert n_outer_folds is not None and outer_fold_idx is not None
+            k_outer = max(2, int(n_outer_folds))
+            fold_i = max(0, min(int(outer_fold_idx), k_outer - 1))
+            bins_series = fusion_df["target_bin"]
+            try:
+                outer_splitter = StratifiedKFold(
+                    n_splits=k_outer, shuffle=True, random_state=random_state
+                )
+                outer_iter = list(outer_splitter.split(fusion_df, bins_series))
+            except ValueError:
+                outer_splitter = KFold(
+                    n_splits=k_outer, shuffle=True, random_state=random_state
+                )
+                outer_iter = list(outer_splitter.split(fusion_df))
+            tv_idx, te_idx = outer_iter[fold_i]
+            self.train_val_data = fusion_df.iloc[tv_idx].copy()
+            self.test_data = fusion_df.iloc[te_idx].copy()
+            logger.info(
+                f"Outer fold {fold_i + 1}/{k_outer}: "
+                f"train+val={len(self.train_val_data)} rows, "
+                f"test={len(self.test_data)} rows."
+            )
+        else:
+            logger.info("Step 4/4: Performing stratified train/test split...")
+            self.train_val_data, self.test_data = train_test_split(
+                fusion_df,
+                test_size=test_size,
+                stratify=fusion_df["target_bin"],
+                random_state=random_state,
+            )
 
         logger.info(
             f"Split complete: {len(self.train_val_data)} train+val samples "
@@ -4164,7 +4346,7 @@ class MetricFusionEngine:
         self,
         n_trials: int = 300,
         n_startup_trials: int = 150,
-        objective_metric: str = "pearson",
+        objective_metric: str = "distance_corr",
         pruner_type: str = "median",
         sampler_type: str = "TPE",
         seed: int = 42,
@@ -4182,7 +4364,7 @@ class MetricFusionEngine:
         Args:
             n_trials: Total optimization trials
             n_startup_trials: Random exploration trials before the main optimizer
-            objective_metric: 'pearson', 'spearman', 'r2', 'rmse', 'mutual_info'
+            objective_metric: 'distance_corr', 'spearman', 'r2', 'nrmse', 'mutual_info'
             pruner_type: 'median', 'hyperband', 'successive_halving', or None
             sampler_type: 'TPE', 'CMA-ES', or 'Random'
             seed: Random seed for reproducibility
@@ -4224,7 +4406,7 @@ class MetricFusionEngine:
         # In longitudinal mode the scoring metric is authoritative on the
         # spec — either one of the four ``mixedlm_*`` options (MixedLM
         # scoring, default ``mixedlm_tstat``) or one of the cross-sectional
-        # OLS options (``pearson``/``spearman``/``r2``/``rmse``/``mutual_info``)
+        # OLS options (``distance_corr``/``spearman``/``r2``/``nrmse``/``mutual_info``)
         # used when the spec exists only as a metric-file routing key (year-
         # aware cross-sectional). Override whatever the caller passed so the
         # scorer fork in ``_objective`` and ``evaluate_on_test`` sees the
@@ -4278,8 +4460,9 @@ class MetricFusionEngine:
         else:
             pruner = None
 
-        # Determine optimization direction
-        direction = "minimize" if objective_metric == "rmse" else "maximize"
+        # Determine optimization direction (nrmse is the only lower-is-better
+        # metric; correlation / R² / MI / mixedlm metrics all maximize).
+        direction = "minimize" if objective_metric == "nrmse" else "maximize"
 
         # Create study — durable (SQLite RDB) when study_name + study_dir are
         # set, otherwise in-memory.
@@ -4404,7 +4587,14 @@ class MetricFusionEngine:
         channel_mode = self._active_greenery_channel
         if channel_mode == "cgi":
             formula = cgi_formulas.get_formula(self.cgi_formula)
-            formula_params = formula.suggest_params(trial)
+            # Any channels turned off by check_channel_collinearity get
+            # their weights pinned to 0 inside ``suggest_params`` so the
+            # optimizer never wastes trials on disabled-channel
+            # combinations and every trial's recorded params still satisfy
+            # the formula's simplex constraint.
+            formula_params = formula.suggest_params(
+                trial, disabled_channels=set(self._disabled_channels)
+            )
             channel_active = formula.channel_active(formula_params)
         else:
             formula = None
@@ -4499,7 +4689,7 @@ class MetricFusionEngine:
             # average with all three weights == 0) we can't form a composite,
             # so return the metric's worst score so Optuna learns to avoid it.
             if not any(channel_active.values()):
-                return -np.inf if metric != "rmse" else np.inf
+                return -np.inf if metric != "nrmse" else np.inf
 
             # ─── Apply Dynamic Radius and Aggregation ─────────────────────────────
             # Both points and rasters use the same circular buffer aggregation
@@ -4792,10 +4982,11 @@ class MetricFusionEngine:
                     return_pvalue=wants_pval,
                 )
             else:
-                # OLS path: covariate-aware partial-correlation / incremental-R²
-                # / RMSE / MI scorer; with no covariates it reduces exactly to
-                # the engine's legacy _calculate_metric.
-                wants_pval = metric in ("pearson", "spearman")
+                # OLS path: covariate-aware distance-correlation / partial rank
+                # correlation / incremental-R² / normalized-RMSE / MI scorer.
+                # None of these expose a usable p-value (robustness comes from
+                # stability selection, not a per-trial p-gate).
+                wants_pval = False
                 train_out = objective_scoring.score(
                     metric,
                     train_targets_arr,
@@ -4837,11 +5028,11 @@ class MetricFusionEngine:
         trial.set_user_attr("fold_train_scores", fold_train_scores)
         trial.set_user_attr("fold_val_scores", fold_val_scores)
 
-        # p-value bookkeeping: cross-sectional pearson/spearman OR longitudinal
-        # tstat/coef. Recorded as user_attrs so the robust-trials filter and
-        # the post-hoc reporting can read them per trial.
-        produced_pvals = metric in ("pearson", "spearman") or (
-            self.is_longitudinal and metric in mixed_effects_scoring.HAS_PVALUE
+        # p-value bookkeeping: only the longitudinal MixedLM tstat/coef metrics
+        # carry a genuine Wald p-value. Recorded as user_attrs so the post-hoc
+        # reporting can read them per trial.
+        produced_pvals = self.is_longitudinal and metric in (
+            mixed_effects_scoring.HAS_PVALUE
         )
         if produced_pvals:
             trial.set_user_attr("train_pvalue_mean", np.mean(fold_train_pvals))
@@ -4852,76 +5043,49 @@ class MetricFusionEngine:
         # Return average validation score across folds
         return avg_val_score
 
-    def _calculate_metric(
-        self, y_true: np.ndarray, y_pred: np.ndarray, metric: str
-    ) -> float:
-        """Calculate specified metric between target and composite."""
-        import warnings
-
-        from scipy.stats import ConstantInputWarning
-
-        # Check for constant inputs before computing correlations
-        if np.var(y_true) == 0 or np.var(y_pred) == 0:
-            return 0.0  # Return worst score for constant inputs
-
-        if metric == "pearson":
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", category=RuntimeWarning)
-                warnings.filterwarnings("ignore", category=ConstantInputWarning)
-                corr, _ = pearsonr(y_true, y_pred)
-                if np.isnan(corr):
-                    return 0.0
-                return abs(corr)  # Return absolute correlation
-        elif metric == "spearman":
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", category=RuntimeWarning)
-                warnings.filterwarnings("ignore", category=ConstantInputWarning)
-                corr, _ = spearmanr(y_true, y_pred)
-                if np.isnan(corr):
-                    return 0.0
-                return abs(corr)
-        elif metric == "r2":
-            score = r2_score(y_true, y_pred)
-            if np.isnan(score):
-                return 0.0
-            return score
-        elif metric == "rmse":
-            return np.sqrt(mean_squared_error(y_true, y_pred))
-        elif metric == "mutual_info":
-            # Bin data for MI calculation
-            y_true_binned = pd.qcut(y_true, 10, labels=False, duplicates="drop")
-            y_pred_binned = pd.qcut(y_pred, 10, labels=False, duplicates="drop")
-            return mutual_info_score(y_true_binned, y_pred_binned)
-        else:
-            raise ValueError(f"Unknown metric: {metric}")
-
     def get_robust_trials(
         self,
-        method: str = "auto",
-        p_threshold: float = 0.05,
-        tolerance: float = 0.1,
+        *,
+        val_p_threshold: float = 0.05,
+        consistency_tolerance: float = 0.1,
         min_trials: int = 10,
     ) -> list[optuna.Trial]:
-        """
-        Filter trials for robustness based on the optimization metric.
+        """Pool of trials credible enough to enter top-X% selection.
 
-        For correlation metrics (pearson, spearman):
-            - Uses Benjamini-Hochberg FDR correction (CGI.ipynb methodology)
-            - Filters by corrected train p-value < threshold
-            - Validates with test p-value < threshold
+        Two-step gate, applied in this order:
 
-        For other metrics (r2, rmse, mutual_info):
-            - Selects trials with test performance within tolerance of train
-            - Filters for minimal train-test gap to avoid overfitting
+        1. **Train↔val consistency.** Drop trials whose ``|train_score −
+           val_score|`` exceeds ``consistency_tolerance``. Catches trials
+           that exploit val-set noise — these have high val |r| but the
+           train fit is much weaker, signalling a val-specific fluke.
+
+        2. **Validation significance.** When the metric produces a
+           p-value (Pearson / Spearman cross-sectional, MixedLM tstat or
+           coef longitudinal), drop trials with
+           ``val_pvalue_mean >= val_p_threshold``. The val partition is
+           independent of the optimizer's training target, so its p-value
+           is the right credibility gate.
+
+        Callers (``compute_averaged_top_params``, ``compute_subset_scores``)
+        rank the surviving pool by val score and take the top X %.
+        Ordering matters: filtering by significance first then ranking by
+        magnitude surfaces the strongest effects **among credible trials**,
+        rather than ranking everything by |r| (which is biased upward by
+        the best-of-N selection) and only then checking significance.
 
         Args:
-            method: 'auto' (detect from study), 'pvalue', or 'consistency'
-            p_threshold: Significance threshold for correlation metrics
-            tolerance: Max allowable gap between train/test for non-correlation metrics
-            min_trials: Minimum number of trials to return
+            val_p_threshold: Validation p-value cutoff (correlation metrics
+                only). Trials at or above this are dropped.
+            consistency_tolerance: Maximum allowed ``|train − val|`` score
+                gap. Tighter values filter more aggressively.
+            min_trials: When fewer than this many trials survive both
+                gates, fall back to the top ``min_trials`` ranked by val
+                score, with a logged warning so the caller knows the
+                gates didn't bind.
 
         Returns:
-            List of robust trials
+            List of trials passing both gates (or the fallback top-N when
+            too few survive).
         """
         if self.study is None:
             raise ValueError("Run optimization first")
@@ -4929,116 +5093,57 @@ class MetricFusionEngine:
         completed_trials = [
             t for t in self.study.trials if t.state == optuna.trial.TrialState.COMPLETE
         ]
-
         if not completed_trials:
             logger.warning("No completed trials found")
             return []
 
-        # Auto-detect method based on available user attributes
-        if method == "auto":
-            if "train_pvalue_mean" in completed_trials[0].user_attrs:
-                method = "pvalue"
-            else:
-                method = "consistency"
+        higher_is_better = self.study.direction.name == "MAXIMIZE"
 
-        # Method 1: P-value based (correlation metrics)
-        if method == "pvalue":
-            trials_with_pvals = [
-                t for t in completed_trials if "train_pvalue_mean" in t.user_attrs
+        # Step 1: consistency pre-filter applies to every metric.
+        consistent: list[optuna.Trial] = []
+        for trial in completed_trials:
+            train_score = trial.user_attrs.get("train_score_mean")
+            val_score = trial.user_attrs.get("val_score_mean")
+            if train_score is None or val_score is None:
+                continue
+            if abs(float(train_score) - float(val_score)) > consistency_tolerance:
+                continue
+            consistent.append(trial)
+
+        # Step 2: validation-p significance, only when the metric produces one.
+        has_pvals = any(
+            "val_pvalue_mean" in t.user_attrs for t in completed_trials
+        )
+        if has_pvals:
+            robust_trials = [
+                t
+                for t in consistent
+                if t.user_attrs.get("val_pvalue_mean", 1.0) < val_p_threshold
             ]
-
-            if not trials_with_pvals:
-                logger.warning(
-                    "No trials with p-values. Using consistency method instead."
-                )
-                return self.get_robust_trials(
-                    method="consistency", tolerance=tolerance, min_trials=min_trials
-                )
-
-            try:
-                from statsmodels.stats.multitest import multipletests
-
-                has_statsmodels = True
-            except ImportError:
-                # Silently fall back to consistency method
-                return self.get_robust_trials(
-                    method="consistency", tolerance=tolerance, min_trials=min_trials
-                )
-
-            # Extract average p-values across folds
-            train_pvals = [t.user_attrs["train_pvalue_mean"] for t in trials_with_pvals]
-
-            # Benjamini-Hochberg FDR correction (CGI.ipynb methodology)
-            _, corrected_pvals, _, _ = multipletests(train_pvals, method="fdr_bh")
-
-            # Filter by corrected train p-value and validation p-value
-            robust_trials = []
-            for trial, corrected_pval in zip(trials_with_pvals, corrected_pvals):
-                if (
-                    corrected_pval < p_threshold
-                    and trial.user_attrs.get("val_pvalue_mean", 1.0) < p_threshold
-                ):
-                    robust_trials.append(trial)
-
-            logger.info(f"Found {len(robust_trials)} robust trials (p < {p_threshold})")
-
-        # Method 2: Consistency based (non-correlation metrics)
-        else:
-            robust_trials = []
-            for trial in completed_trials:
-                train_score = trial.user_attrs.get("train_score_mean")
-                val_score = trial.user_attrs.get("val_score_mean")
-                val_std = trial.user_attrs.get("val_score_std", 0)
-
-                if train_score is None or val_score is None:
-                    continue
-
-                # For maximization metrics (r2, correlation, mutual_info)
-                if self.study.direction.name == "MAXIMIZE":
-                    # Validation score should be reasonably close to train score
-                    score_gap = abs(train_score - val_score)
-                    # Val should not be too much worse than train, and low variance across folds
-                    if (
-                        score_gap <= tolerance
-                        and val_score >= train_score * (1 - tolerance)
-                        and val_std <= tolerance
-                    ):
-                        robust_trials.append(trial)
-
-                # For minimization metrics (rmse)
-                else:
-                    # Val error should not be much higher than train error
-                    score_gap = abs(val_score - train_score)
-                    if (
-                        score_gap <= tolerance
-                        and val_score <= train_score * (1 + tolerance)
-                        and val_std <= tolerance
-                    ):
-                        robust_trials.append(trial)
-
             logger.info(
-                f"Found {len(robust_trials)} consistent trials (tolerance={tolerance})"
+                f"Found {len(robust_trials)} robust trials "
+                f"(consistency<={consistency_tolerance}, val p<{val_p_threshold})"
+            )
+        else:
+            robust_trials = consistent
+            logger.info(
+                f"Found {len(robust_trials)} consistent trials "
+                f"(tolerance={consistency_tolerance})"
             )
 
-        # If too few robust trials, relax criteria and return best performers
         if len(robust_trials) < min_trials:
             logger.warning(
-                f"Only {len(robust_trials)} robust trials found (< {min_trials}). "
-                f"Returning top {min_trials} by train score instead."
+                f"Only {len(robust_trials)} trials passed the credibility gates "
+                f"(< {min_trials}). Falling back to top {min_trials} by val score "
+                "— the headline numbers reflect this fallback, not a credible pool."
             )
-
-            # Sort by validation score (descending for maximize, ascending for minimize)
             sorted_trials = sorted(
                 completed_trials,
                 key=lambda t: t.user_attrs.get(
                     "val_score_mean",
-                    (
-                        float("-inf")
-                        if self.study.direction.name == "MAXIMIZE"
-                        else float("inf")
-                    ),
+                    float("-inf") if higher_is_better else float("inf"),
                 ),
-                reverse=(self.study.direction.name == "MAXIMIZE"),
+                reverse=higher_is_better,
             )
             return sorted_trials[:min_trials]
 
@@ -5047,7 +5152,7 @@ class MetricFusionEngine:
     def evaluate_on_test(
         self,
         params: dict | None = None,
-        metric: str = "pearson",
+        metric: str = "distance_corr",
         return_predictions: bool = False,
         *,
         return_all_mixedlm: bool = False,
@@ -5061,7 +5166,7 @@ class MetricFusionEngine:
 
         Args:
             params: Parameters to evaluate (uses best_params if None)
-            metric: Evaluation metric ('pearson', 'spearman', 'r2', 'rmse', 'mutual_info')
+            metric: Evaluation metric ('distance_corr', 'spearman', 'r2', 'nrmse', 'mutual_info')
             return_predictions: Whether to include predictions in return dict
             return_all_mixedlm: Longitudinal mode only. When true, replaces
                 ``test_score``/``test_pvalue`` in the returned dict with a
@@ -5096,7 +5201,7 @@ class MetricFusionEngine:
         # how the composite is built. CGI mode delegates to the formula's
         # ``channel_active`` + ``compute_cgi``; standalone mode uses the active
         # channel directly so the test score is on the same scale the study
-        # optimised against.
+        # optimized against.
         channel_mode = self._active_greenery_channel
         if channel_mode == "cgi":
             channel_active = cgi_formulas.get_formula(self.cgi_formula).channel_active(
@@ -5194,7 +5299,7 @@ class MetricFusionEngine:
         test_ndvi_norm = test_combined[:, 2]
 
         # Calculate composite via the active mode. Same fork as ``_objective``
-        # so the held-out score is on the same scale the study optimised.
+        # so the held-out score is on the same scale the study optimized.
         if channel_mode == "cgi":
             test_composite = compute_cgi(
                 self.cgi_formula,
@@ -5303,10 +5408,10 @@ class MetricFusionEngine:
                     return_pvalue=wants_pval,
                 )
         else:
-            # OLS scoring. Reduces to _calculate_metric when no covariates;
-            # partial-correlation p-value falls out of ``return_pvalue=True``
-            # for the two correlation metrics.
-            wants_pval = metric in ("pearson", "spearman")
+            # OLS scoring (distance correlation / partial rank corr / R² /
+            # normalized RMSE / MI). No usable p-value — robustness is reported
+            # via the stability-selection OOB distribution + test-set CI.
+            wants_pval = False
             score_out = objective_scoring.score(
                 metric,
                 test_targets,
@@ -5332,12 +5437,193 @@ class MetricFusionEngine:
         if mixedlm_all is not None:
             result["mixedlm_metrics"] = mixedlm_all
 
-        # Include predictions if requested
+        # Include predictions if requested. Covariates ride alongside so the
+        # downstream permutation / bootstrap helpers can score the same
+        # partial-correlation the optimizer optimized.
         if return_predictions:
             result["predictions"] = test_composite
             result["targets"] = test_targets
+            result["covariates"] = test_cov
 
         return result
+
+    def build_channel_design(self, params: dict, subset: str = "train_val") -> dict:
+        """Per-entity raw channel values for the CGI-vs-standalone AIC/BIC test.
+
+        Aggregates **all three** channels (veg / terrain / ndvi) at ``params``'
+        radii / stats / percentiles on the requested ``subset`` (``"train_val"``
+        for the resampling pool, ``"test"`` for the held-out set), collapses to
+        one row per entity (polygon mean when polygon-keyed), and returns the
+        raw arrays plus the aligned target, covariates, and — in longitudinal
+        mode — entity ids and ``years_since_baseline``.
+
+        No scaling is applied: OLS / MixedLM AIC and BIC are invariant to an
+        affine transform of an individual predictor, so raw channel values are
+        what :func:`objective_scoring.compare_models_aic_bic` and its MixedLM
+        analogue need.
+        """
+        if subset == "test":
+            data = self.test_data
+        elif subset == "train_val":
+            data = self.train_val_data
+        else:
+            raise ValueError(f"subset must be 'train_val' or 'test'; got {subset!r}.")
+        if data is None:
+            raise ValueError(f"No {subset} data available. Run split_data() first.")
+
+        points = self.target_gdf.loc[data.index].copy()
+        streetview_stat = params.get("streetview_stat", "mean")
+        streetview_percentile = params.get("streetview_percentile", 50)
+        veg_radius = params.get("veg_radius", int(round(self.gvi_buffer_max_m)))
+        terrain_radius = params.get("terrain_radius", int(round(self.gvi_buffer_max_m)))
+        ndvi_stat = params.get("ndvi_stat", "mean")
+        ndvi_percentile = params.get("ndvi_percentile", 50)
+        ndvi_radius = params.get("ndvi_radius", int(round(self.ndvi_buffer_max_m)))
+
+        veg = self._aggregate_with_ring_cache(
+            points, self.veg_data, veg_radius, streetview_stat,
+            streetview_percentile, channel="veg", fold_idx=None, subset=None,
+        )
+        terrain = self._aggregate_with_ring_cache(
+            points, self.terrain_data, terrain_radius, streetview_stat,
+            streetview_percentile, channel="terrain", fold_idx=None, subset=None,
+        )
+        ndvi = self._aggregate_with_ring_cache(
+            points, self.ndvi_data, ndvi_radius, ndvi_stat,
+            ndvi_percentile, channel="ndvi", fold_idx=None, subset=None,
+        )
+
+        cov_cols = self.covariate_columns
+        cov = data[cov_cols].to_numpy(dtype=np.float64) if cov_cols else None
+
+        entity_id = None
+        ysb = None
+        if "polygon_id" in data.columns:
+            pid = data["polygon_id"].values
+            veg = pd.Series(veg).groupby(pid).mean().values
+            terrain = pd.Series(terrain).groupby(pid).mean().values
+            ndvi = pd.Series(ndvi).groupby(pid).mean().values
+            target = pd.Series(data["target"].values).groupby(pid).first().values
+            if cov is not None:
+                c = cov
+                cov = np.column_stack(
+                    [
+                        pd.Series(c[:, j]).groupby(pid).first().values
+                        for j in range(c.shape[1])
+                    ]
+                )
+            if self.is_longitudinal:
+                entity_id = (
+                    pd.Series(data["entity_id"].values).groupby(pid).first().values
+                )
+                ysb = (
+                    pd.Series(data["years_since_baseline"].values)
+                    .groupby(pid)
+                    .first()
+                    .values
+                )
+        else:
+            target = data["target"].values
+            if self.is_longitudinal:
+                entity_id = data["entity_id"].values
+                ysb = data["years_since_baseline"].values
+
+        return {
+            "channels": np.column_stack([veg, terrain, ndvi]),
+            "channel_names": ["veg", "terrain", "ndvi"],
+            "target": np.asarray(target, dtype=np.float64),
+            "covariates": cov,
+            "entity_id": entity_id,
+            "years_since_baseline": ysb,
+        }
+
+    def bootstrap_test_score_ci(
+        self,
+        params: dict,
+        metric: str,
+        *,
+        n_bootstrap: int = 10000,
+        ci_level: float = 0.95,
+        method: str = "percentile",
+        seed: int = 42,
+    ) -> dict:
+        """Bootstrap CI for the test-set score.
+
+        Builds the test composite from ``params`` via :meth:`evaluate_on_test`,
+        then resamples paired ``(target, composite, covariates)`` rows to
+        construct a percentile CI on the chosen metric. When the engine has
+        ``covariate_columns`` configured, the test covariate matrix is resampled
+        jointly with target/prediction so the CI is on the **partial**
+        association (the same quantity the optimizer optimized). The score
+        function is taken from :func:`objective_scoring.score`, which switches
+        between full and partial residual scoring based on whether covariates
+        are supplied.
+
+        Returns a dict with ``observed``, ``mean``, ``lower``, ``upper``,
+        ``ci_level``, ``method``, ``n``.
+        """
+        from . import statistical_testing as _stats_mod
+
+        res = self.evaluate_on_test(
+            params=params, metric=metric, return_predictions=True
+        )
+        target = np.asarray(res.get("targets"), dtype=np.float64)
+        prediction = np.asarray(res.get("predictions"), dtype=np.float64)
+        test_cov = res.get("covariates")
+        cov_mat = (
+            np.asarray(test_cov, dtype=np.float64) if test_cov is not None else None
+        )
+        mask = np.isfinite(target) & np.isfinite(prediction)
+        if cov_mat is not None:
+            mask &= np.isfinite(cov_mat).all(axis=1)
+        n = int(mask.sum())
+
+        if cov_mat is None:
+            def _score_fn(t_arr: np.ndarray, p_arr: np.ndarray) -> float:
+                score_out = objective_scoring.score(
+                    metric, t_arr, p_arr, covariates=None, return_pvalue=False
+                )
+                return float(score_out)  # type: ignore[arg-type]
+        else:
+            def _score_fn(t_arr: np.ndarray, p_arr: np.ndarray, c_arr: np.ndarray) -> float:
+                score_out = objective_scoring.score(
+                    metric, t_arr, p_arr, covariates=c_arr, return_pvalue=False
+                )
+                return float(score_out)  # type: ignore[arg-type]
+
+        ci = _stats_mod.bootstrap_score_ci(
+            target,
+            prediction,
+            score_fn=_score_fn,
+            n_bootstrap=int(n_bootstrap),
+            ci_level=float(ci_level),
+            method=method,
+            seed=int(seed),
+            covariates=cov_mat,
+        )
+        ci["n"] = n
+        return ci
+
+    def build_test_prediction_column(self, params: dict, metric: str) -> dict:
+        """Convenience: return the per-test-entity (composite, target) arrays.
+
+        The nested-CV runner aggregates these across outer folds to form the
+        outer-CV-averaged prediction column used for the headline polygon-level
+        bootstrap CI.
+        """
+        res = self.evaluate_on_test(
+            params=params, metric=metric, return_predictions=True
+        )
+        return {
+            "predictions": np.asarray(res.get("predictions"), dtype=np.float64),
+            "targets": np.asarray(res.get("targets"), dtype=np.float64),
+            "test_score": float(res.get("test_score", float("nan"))),
+            "test_pvalue": (
+                float(res["test_pvalue"])
+                if res.get("test_pvalue") is not None
+                else None
+            ),
+        }
 
     def apply_fusion(self, weights: dict | None = None) -> pd.DataFrame:
         """
@@ -5474,13 +5760,89 @@ class MetricFusionEngine:
 
         return result_df
 
+    def _score_data_subset(
+        self,
+        data: "pd.DataFrame | None",
+        params: dict,
+        metric: str,
+    ) -> dict[str, float | None]:
+        """Score the winning params on an arbitrary data slice — both
+        covariate-adjusted (partial) and unadjusted (raw).
+
+        Used by ``compute_subset_scores`` for train+val / test / all blocks
+        so the UI can surface BOTH the optimizer's actual objective
+        (partial when covariates exist) AND the unadjusted correlation —
+        they're complementary and answer different questions:
+
+        * ``score`` (partial) — how much does CGI add **over and above**
+          the covariates? Answers "is greenery doing real work?"
+        * ``score_raw`` — what does CGI predict on its own? Answers "how
+          predictive is the composite without controls?"
+
+        Returns ``{"score", "score_raw", "pvalue", "pvalue_raw"}``.
+        ``score_raw`` collapses to ``score`` when no covariates are
+        configured (they're the same number in that case).
+        """
+        empty = {"score": None, "score_raw": None, "pvalue": None, "pvalue_raw": None}
+        if data is None or len(data) == 0:
+            return empty
+        try:
+            df_full = self.apply_fusion(weights=dict(params))
+            if "polygon_id" in df_full.columns:
+                target_polys = set(data["polygon_id"].unique().tolist())
+                df = df_full[df_full["polygon_id"].isin(target_polys)].copy()
+            else:
+                # Row-keyed targets: ``apply_fusion`` returns rows in the
+                # same order as ``self.train_val_data + self.test_data``.
+                # Restrict to the subset's indices.
+                df = df_full.loc[
+                    df_full.index.intersection(data.index)
+                ].copy()
+            if len(df) == 0:
+                return empty
+            target = np.asarray(df["target"].values, dtype=np.float64)
+            composite = np.asarray(df["composite"].values, dtype=np.float64)
+            cov_mat: np.ndarray | None = None
+            cov_cols = self.covariate_columns or []
+            if cov_cols and "polygon_id" in df.columns:
+                full = pd.concat([self.train_val_data, self.test_data])
+                cov_per_poly = (
+                    full.groupby("polygon_id", sort=False)[cov_cols]
+                    .first()
+                    .reindex(df["polygon_id"].values)
+                )
+                cov_mat = cov_per_poly.to_numpy(dtype=np.float64)
+            # Cross-sectional metrics no longer expose a usable p-value.
+            wants_pval = False
+
+            def _do(cov: np.ndarray | None) -> tuple[float | None, float | None]:
+                out = objective_scoring.score(
+                    metric, target, composite, covariates=cov, return_pvalue=wants_pval
+                )
+                if wants_pval:
+                    s, p = out  # type: ignore[misc]
+                    return float(s), float(p)
+                return float(out), None  # type: ignore[arg-type]
+
+            partial_s, partial_p = _do(cov_mat)
+            raw_s, raw_p = _do(None) if cov_mat is not None else (partial_s, partial_p)
+            return {
+                "score": partial_s,
+                "score_raw": raw_s,
+                "pvalue": partial_p,
+                "pvalue_raw": raw_p,
+            }
+        except Exception as exc:
+            logger.warning(f"_score_data_subset failed: {exc}")
+            return empty
+
     def compute_subset_scores(
         self,
         params: dict,
         metric: str,
         top_percent: float = 0.2,
     ) -> dict[str, dict[str, float | None]]:
-        """Score ``params`` on every data slice the optimiser saw.
+        """Score ``params`` on every data slice the optimizer saw.
 
         Returns a dict of ``{subset: {score, pvalue, n}}`` for the four
         canonical slices:
@@ -5499,83 +5861,154 @@ class MetricFusionEngine:
         """
         out: dict[str, dict[str, float | None]] = {}
 
-        if self.study is None:
-            return out
-
-        # ── train / val: mean across top-K robust trials ──────────────
-        try:
-            robust = self.get_robust_trials(
-                method="auto", p_threshold=0.05, tolerance=0.1, min_trials=10
-            )
-        except Exception:
-            robust = []
-        if not robust:
-            robust = [
-                t
-                for t in self.study.trials
-                if t.state == optuna.trial.TrialState.COMPLETE
-            ]
-        n_top = max(1, int(len(robust) * top_percent))
-        top_trials = sorted(
-            robust,
-            key=lambda t: t.value if t.value is not None else float("nan"),
-            reverse=(self.study.direction.name == "MAXIMIZE"),
-        )[:n_top]
-
-        def _mean_attr(name: str) -> float | None:
-            vals = [
-                float(t.user_attrs.get(name))
-                for t in top_trials
-                if t.user_attrs.get(name) is not None
-            ]
-            return float(np.mean(vals)) if vals else None
-
-        out["train"] = {
-            "score": _mean_attr("train_score_mean"),
-            "pvalue": _mean_attr("train_pvalue_mean"),
-            "n": (
-                int(self.train_val_data["polygon_id"].nunique())
+        train_val_n = (
+            int(self.train_val_data["polygon_id"].nunique())
+            if self.train_val_data is not None
+            and "polygon_id" in self.train_val_data.columns
+            else (
+                int(len(self.train_val_data))
                 if self.train_val_data is not None
-                and "polygon_id" in self.train_val_data.columns
-                else (
-                    int(len(self.train_val_data))
-                    if self.train_val_data is not None
-                    else None
+                else None
+            )
+        )
+
+        if self.study is not None:
+            # Standard mode: train/val are the per-fold means across the
+            # top-K robust trials (the same pool the composite is built
+            # from).
+            try:
+                robust = self.get_robust_trials(
+                    val_p_threshold=0.05,
+                    consistency_tolerance=0.1,
+                    min_trials=10,
                 )
-            ),
-        }
-        out["val"] = {
-            "score": _mean_attr("val_score_mean"),
-            "pvalue": _mean_attr("val_pvalue_mean"),
-            "n": out["train"]["n"],
-        }
+            except Exception:
+                robust = []
+            if not robust:
+                robust = [
+                    t
+                    for t in self.study.trials
+                    if t.state == optuna.trial.TrialState.COMPLETE
+                ]
+            n_top = max(1, int(len(robust) * top_percent))
+            top_trials = sorted(
+                robust,
+                key=lambda t: t.value if t.value is not None else float("nan"),
+                reverse=(self.study.direction.name == "MAXIMIZE"),
+            )[:n_top]
+
+            def _mean_attr(name: str) -> float | None:
+                vals = [
+                    float(t.user_attrs.get(name))
+                    for t in top_trials
+                    if t.user_attrs.get(name) is not None
+                ]
+                return float(np.mean(vals)) if vals else None
+
+            # Standard mode: per-trial user_attrs only carry the partial
+            # (covariate-adjusted) score the objective optimized. To also
+            # surface a raw correlation, apply the averaged params to the
+            # train+val pool once and score without covariates — that's
+            # what ``score_raw`` represents below.
+            tv_both = self._score_data_subset(
+                data=self.train_val_data, params=params, metric=metric
+            )
+            out["train"] = {
+                "score": _mean_attr("train_score_mean"),
+                "score_raw": tv_both.get("score_raw"),
+                "pvalue": _mean_attr("train_pvalue_mean"),
+                "pvalue_raw": tv_both.get("pvalue_raw"),
+                "n": train_val_n,
+            }
+            out["val"] = {
+                "score": _mean_attr("val_score_mean"),
+                "score_raw": tv_both.get("score_raw"),
+                "pvalue": _mean_attr("val_pvalue_mean"),
+                "pvalue_raw": tv_both.get("pvalue_raw"),
+                "n": train_val_n,
+            }
+        else:
+            # Stability-selection mode: there's no per-trial study to read
+            # train/val means from. Surrogate mapping:
+            # * ``train`` → score on the full train+val pool with the
+            #   winning params (in-pool fit, the closest analogue to
+            #   "train" the paradigm has — the pool is what the bootstrap
+            #   draws from).
+            # * ``val`` → the cell-aggregation **median** OOB score
+            #   already recorded by ``bootstrap_stability_selection`` under
+            #   ``__cell_median__``. This is the per-bootstrap held-out
+            #   score averaged across all trials in the winning cell — a
+            #   direct measure of cross-resample predictive performance.
+            train_val_score = self._score_data_subset(
+                data=self.train_val_data, params=params, metric=metric
+            )
+            out["train"] = {
+                "score": train_val_score.get("score"),
+                "score_raw": train_val_score.get("score_raw"),
+                "pvalue": train_val_score.get("pvalue"),
+                "pvalue_raw": train_val_score.get("pvalue_raw"),
+                "n": train_val_n,
+            }
+            cell_median = params.get("__cell_median__") if isinstance(params, dict) else None
+            out["val"] = {
+                "score": (
+                    float(cell_median)
+                    if cell_median is not None and np.isfinite(float(cell_median))
+                    else None
+                ),
+                # ``val`` is the cell-median OOB score, which is computed
+                # by ``_objective`` with covariates configured on the
+                # engine — i.e. it's a partial-correlation analogue. No
+                # raw equivalent exists at this level because each
+                # bootstrap's OOB rows score with covariates always
+                # present.
+                "score_raw": None,
+                "pvalue": None,
+                "pvalue_raw": None,
+                "n": train_val_n,
+            }
 
         # ── test: fresh evaluate_on_test with these params ────────────
+        # ``evaluate_on_test`` returns the partial (covariate-adjusted)
+        # score that the optimizer optimized; the raw equivalent is
+        # produced by ``_score_data_subset`` on the test slice.
         try:
             test_result = self.evaluate_on_test(params=dict(params), metric=metric)
+            test_n = (
+                int(self.test_data["polygon_id"].nunique())
+                if self.test_data is not None
+                and "polygon_id" in self.test_data.columns
+                else (
+                    int(len(self.test_data)) if self.test_data is not None else None
+                )
+            )
+            test_both = self._score_data_subset(
+                data=self.test_data, params=params, metric=metric
+            )
             out["test"] = {
                 "score": (
                     float(test_result["test_score"])
                     if test_result.get("test_score") is not None
                     else None
                 ),
+                "score_raw": test_both.get("score_raw"),
                 "pvalue": (
                     float(test_result["test_pvalue"])
                     if test_result.get("test_pvalue") is not None
                     else None
                 ),
-                "n": (
-                    int(self.test_data["polygon_id"].nunique())
-                    if self.test_data is not None
-                    and "polygon_id" in self.test_data.columns
-                    else (
-                        int(len(self.test_data)) if self.test_data is not None else None
-                    )
-                ),
+                "pvalue_raw": test_both.get("pvalue_raw"),
+                "n": test_n,
             }
         except Exception as exc:
             logger.warning(f"compute_subset_scores: test scoring failed: {exc}")
-            out["test"] = {"score": None, "pvalue": None, "n": None}
+            out["test"] = {
+                "score": None,
+                "score_raw": None,
+                "pvalue": None,
+                "pvalue_raw": None,
+                "n": None,
+            }
 
         # ── all: composite on every entity (full dataset) ─────────────
         try:
@@ -5592,27 +6025,36 @@ class MetricFusionEngine:
                     .reindex(df["polygon_id"].values)
                 )
                 cov = cov_per_poly.to_numpy(dtype=np.float64)
-            wants_pval = metric in ("pearson", "spearman")
-            score_out = objective_scoring.score(
-                metric,
-                target,
-                composite,
-                covariates=cov,
-                return_pvalue=wants_pval,
-            )
-            if wants_pval:
-                score_v, pval_v = score_out  # type: ignore[misc]
-            else:
-                score_v = float(score_out)
-                pval_v = None
+            # Cross-sectional metrics no longer expose a usable p-value.
+            wants_pval = False
+
+            def _full_score(c: np.ndarray | None) -> tuple[float | None, float | None]:
+                s_out = objective_scoring.score(
+                    metric, target, composite, covariates=c, return_pvalue=wants_pval
+                )
+                if wants_pval:
+                    s, p = s_out  # type: ignore[misc]
+                    return float(s), float(p)
+                return float(s_out), None  # type: ignore[arg-type]
+
+            partial_s, partial_p = _full_score(cov)
+            raw_s, raw_p = _full_score(None) if cov is not None else (partial_s, partial_p)
             out["all"] = {
-                "score": float(score_v) if score_v is not None else None,
-                "pvalue": float(pval_v) if pval_v is not None else None,
+                "score": partial_s,
+                "score_raw": raw_s,
+                "pvalue": partial_p,
+                "pvalue_raw": raw_p,
                 "n": int(len(target)),
             }
         except Exception as exc:
             logger.warning(f"compute_subset_scores: full-dataset scoring failed: {exc}")
-            out["all"] = {"score": None, "pvalue": None, "n": None}
+            out["all"] = {
+                "score": None,
+                "score_raw": None,
+                "pvalue": None,
+                "pvalue_raw": None,
+                "n": None,
+            }
 
         return out
 
@@ -5855,6 +6297,594 @@ class MetricFusionEngine:
             logger.warning(f"Optuna visualization not available: {e}")
             logger.warning("Install with: pip install optuna[visualization] plotly")
 
+    def bootstrap_stability_selection(
+        self,
+        metric: str,
+        *,
+        n_bootstraps: int = 20,
+        n_trials_per_bootstrap: int = 50,
+        weight_bin_pct: int = 10,
+        top_percent_per_bootstrap: float = 0.2,
+        min_cell_count: int = 3,
+        worst_quantile: float = 0.10,
+        seed: int = 42,
+        cancel_callback: Callable[..., bool] | None = None,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> dict[str, Any]:
+        """Stability selection via bootstrap out-of-bag scoring.
+
+        Adapts Meinshausen & Bühlmann's stability selection (2010) to
+        hyperparameter search. The procedure draws ``n_bootstraps`` resamples
+        of the (train+val) data, runs a short ``RandomSampler`` study on each,
+        and rates each parameter region by how well it does **on the held-out
+        OOB rows** of every resample. The headline robustness metric is the
+        worst-quantile OOB score across all trials that landed in each region
+        — i.e. "how badly can this parameter region perform on a resample of
+        my data?". This is a direct statement about predictive power across
+        samples, not a selection-bias-prone p-value.
+
+        Per bootstrap:
+
+        1. Resample entities (polygons when ``polygon_id`` is present, rows
+           otherwise) with replacement from ``train_val_data``. The unique
+           entities **not** chosen form the OOB set (~37 % of entities).
+        2. Build a fresh in-memory Optuna study with ``RandomSampler`` (TPE
+           is intentionally avoided: each bootstrap is short, and stability
+           wants uniform parameter-space coverage, not depth on this
+           particular resample). The engine's ``_objective`` already handles
+           in-bag/OOB scaler fitting, channel aggregation, polygon collapse,
+           covariate-aware partial-correlation scoring (cross-sectional), and
+           MixedLM scoring (longitudinal) — so we splice the bootstrap split
+           into ``self.cv_folds`` and reuse the existing pipeline.
+        3. Record per-trial ``(snapped_params, oob_score)``.
+
+        Across all bootstraps:
+
+        * Snap each trial's weights to ``weight_bin_pct``-wide buckets via
+          :func:`cgi_formulas.weight_cell_key`.
+        * Pool OOB scores per cell.
+        * Robust cell = the one with the best worst-quantile score
+          (``q_worst = quantile(scores, worst_quantile)`` for higher-is-
+          better metrics; ``quantile(scores, 1 - worst_quantile)`` for
+          lower-is-better metrics like RMSE) subject to ``count >=
+          min_cell_count``.
+        * Within the chosen cell, average all parameters using the same
+          renormalization logic as :meth:`compute_averaged_top_params` so the
+          output is drop-in compatible with downstream code.
+
+        Args:
+            metric: Scoring metric (any value supported by ``_objective``).
+            n_bootstraps: Number of resampling iterations. 20–50 typical.
+            n_trials_per_bootstrap: RandomSampler trials inside each
+                bootstrap. 30–100 typical.
+            weight_bin_pct: Cell width for weight binning. 10 % bins yield
+                ~78 valid simplex cells for the weighted-average formula.
+            top_percent_per_bootstrap: Fraction of each bootstrap's trials
+                considered "selected" for the selection-probability sidecar.
+            min_cell_count: A cell is eligible only when at least this many
+                trials landed in it across all bootstraps. Prevents a
+                single-trial outlier cell from claiming "best".
+            worst_quantile: 0.10 → 10th percentile worst-case score for
+                higher-is-better metrics; 90th percentile for lower-is-
+                better. Tighter (e.g. 0.05) penalises rare-bad-luck cells
+                harder; looser (e.g. 0.25) tolerates more bad-luck draws.
+            seed: RNG seed for reproducibility.
+            cancel_callback: Bumped from the runner so a user-cancelled job
+                aborts the bootstrap loop cleanly.
+            progress_callback: ``(done, total)`` called after each bootstrap.
+
+        Returns: averaged-params dict in the same shape as
+        :meth:`compute_averaged_top_params`, plus bookkeeping keys
+        ``__cell_q_worst__``, ``__cell_count__``, ``__cell_median__``,
+        ``__cell_selection_probability__``, ``__n_bootstraps__``,
+        ``__n_trials_per_bootstrap__``, ``__n_total_trials__``,
+        ``__worst_quantile__``.
+        """
+        from statistics import mode
+
+        if self.train_val_data is None:
+            raise ValueError(
+                "Call split_data() (or the runner's split stage) before "
+                "bootstrap_stability_selection() — there's no train+val "
+                "pool to resample."
+            )
+
+        # Direction-aware: higher-is-better → q_worst is the lower tail
+        # (e.g. q10), and we pick the cell with the *highest* q_worst.
+        # Lower-is-better (RMSE) inverts both.
+        higher_is_better = metric in objective_scoring.HIGHER_IS_BETTER or (
+            self.is_longitudinal and metric in mixed_effects_scoring.HIGHER_IS_BETTER
+        )
+
+        # Sampling unit. Polygon-mode targets must resample *polygons* —
+        # row-level resampling would split a single polygon's pixels across
+        # in-bag and OOB and produce a leaky OOB set. For row-keyed targets
+        # we fall back to plain row resampling.
+        train_val = self.train_val_data
+        use_groups = "polygon_id" in train_val.columns
+        # Resolve the formula descriptor up front — the per-bootstrap
+        # summary block inside the loop needs ``weight_keys`` to record
+        # the leader's weights, and the cell-stats block after the loop
+        # uses the same descriptor for cell-key decoding.
+        formula = cgi_formulas.get_formula(self.cgi_formula)
+        if use_groups:
+            group_col = "polygon_id"
+            groups = pd.Series(train_val[group_col].unique())
+        else:
+            group_col = None
+            groups = pd.Series(np.arange(len(train_val)))
+
+        # Save engine state we're about to splice over. Restored in ``finally``
+        # so a cancelled / failing bootstrap loop never leaves the engine in a
+        # half-mutated state for downstream callers.
+        prev_cv_folds = self.cv_folds
+        prev_study = self.study
+        prev_cancel_cb = getattr(self, "_cancel_callback", None)
+        prev_optuna_verbosity = optuna.logging.get_verbosity()
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        # The runner passes its own cancellation hook — install it so
+        # ``_objective`` can short-circuit when the user stops the job. We
+        # also poll between bootstraps to abort the whole loop.
+        if cancel_callback is not None:
+            self._cancel_callback = cancel_callback
+
+        # Ring caches are keyed by ``points_gdf.index`` so per-bootstrap
+        # entries don't collide, but they accumulate at ~thousands of arrays
+        # over the loop. Start clean and clear between bootstraps so memory
+        # stays flat regardless of B / N_per_BS choice.
+        self._clear_ring_caches()
+
+        records: list[dict] = []  # one entry per completed trial across all bootstraps
+        per_bootstrap_top_cells: list[set] = []  # selection-probability sidecar
+        per_bootstrap_summary: list[dict] = []  # one row per bootstrap for the UI table
+        # Per-bootstrap diagnostics — used to build a useful error message
+        # when zero trials end up usable so the caller can tell apart
+        # "every resample was degenerate" from "objective returned NaN".
+        diag = {
+            "bootstraps_attempted": 0,
+            "bootstraps_degenerate_split": 0,
+            "bootstraps_zero_completed": 0,
+            "bootstraps_all_nan_scores": 0,
+            "bootstraps_with_records": 0,
+            "trials_complete": 0,
+            "trials_pruned": 0,
+            "trials_failed": 0,
+            "trials_nan_score": 0,
+            "trials_kept": 0,
+        }
+
+        try:
+            rng = np.random.default_rng(int(seed))
+            for b in range(int(n_bootstraps)):
+                if cancel_callback is not None and cancel_callback():
+                    break
+                # Per-bootstrap clear: each resample's data has its own
+                # ``points_gdf.index`` tuples, so cached annuli from prior
+                # bootstraps will never be hit again — keep the cache flat.
+                self._clear_ring_caches()
+
+                # Bootstrap sample of groups (with replacement). The unique
+                # set of selected groups is in-bag; the complement is OOB.
+                sel = rng.integers(0, len(groups), size=len(groups))
+                in_bag_groups = groups.iloc[sel].to_numpy()
+                in_bag_unique = np.unique(in_bag_groups)
+                oob_unique = np.setdiff1d(groups.to_numpy(), in_bag_unique)
+                diag["bootstraps_attempted"] += 1
+                if len(oob_unique) < 3 or len(in_bag_unique) < 3:
+                    # Degenerate resample — almost all groups landed in-bag
+                    # or out. Skip and let the loop continue.
+                    diag["bootstraps_degenerate_split"] += 1
+                    continue
+
+                if use_groups:
+                    # Materialise in-bag with multiplicity by concatenating
+                    # per-group slices in the order they were drawn.
+                    # **Preserve the original DataFrame index** — the
+                    # pre-aggregation cache is keyed by entity_id ==
+                    # ``train_val_data.index`` (see
+                    # ``precompute_aggregations``), so ``ignore_index=True``
+                    # would replace every entity_id with 0..N-1 and the
+                    # cache lookup would return NaN for every row. Duplicate
+                    # indices from the bootstrap are harmless: the
+                    # polygon-collapse downstream groups by ``polygon_id``
+                    # (column, not index) and the scaler fit tolerates
+                    # repeated rows.
+                    grouped = {
+                        g: train_val[train_val[group_col] == g]
+                        for g in in_bag_unique
+                    }
+                    in_bag_df = pd.concat(
+                        [grouped[g] for g in in_bag_groups]
+                    )
+                    oob_df = train_val[
+                        train_val[group_col].isin(oob_unique)
+                    ].copy()
+                else:
+                    in_bag_df = train_val.iloc[in_bag_groups].copy()
+                    oob_df = train_val.iloc[oob_unique].copy()
+
+                # Splice the bootstrap split into ``cv_folds`` — the existing
+                # ``_objective`` reads ``train`` / ``val`` from each fold and
+                # handles aggregation, scaler fit on train, scoring on val.
+                self.cv_folds = [{"train": in_bag_df, "val": oob_df}]
+
+                # Fresh in-memory study with RandomSampler — uniform coverage
+                # across the search space; TPE wouldn't add value at 30-100
+                # trials per bootstrap and would just concentrate on the
+                # local maximum of this particular resample (fighting the
+                # stability-selection goal).
+                study = optuna.create_study(
+                    direction="maximize" if higher_is_better else "minimize",
+                    sampler=optuna.samplers.RandomSampler(seed=int(seed) + b),
+                )
+                self.study = study
+                try:
+                    study.optimize(
+                        lambda t: self._objective(t, metric),
+                        n_trials=int(n_trials_per_bootstrap),
+                        show_progress_bar=False,
+                        catch=(Exception,),
+                    )
+                except Exception:
+                    # Catastrophic study failure — skip this bootstrap and
+                    # continue rather than aborting the whole selection.
+                    continue
+
+                # Extract per-trial (params, val_score). ``_objective`` puts
+                # the mean val score into ``user_attrs["val_score_mean"]`` and
+                # returns the same number as ``trial.value``.
+                for _t in study.trials:
+                    state = _t.state
+                    if state == optuna.trial.TrialState.COMPLETE:
+                        diag["trials_complete"] += 1
+                    elif state == optuna.trial.TrialState.PRUNED:
+                        diag["trials_pruned"] += 1
+                    elif state == optuna.trial.TrialState.FAIL:
+                        diag["trials_failed"] += 1
+                completed = [
+                    t
+                    for t in study.trials
+                    if t.state == optuna.trial.TrialState.COMPLETE
+                ]
+                if not completed:
+                    diag["bootstraps_zero_completed"] += 1
+                    continue
+                bootstrap_records: list[dict] = []
+                for t in completed:
+                    score = t.user_attrs.get("val_score_mean", t.value)
+                    if score is None or not np.isfinite(float(score)):
+                        diag["trials_nan_score"] += 1
+                        continue
+                    diag["trials_kept"] += 1
+                    bootstrap_records.append(
+                        {
+                            "bootstrap": b,
+                            "params": dict(t.params),
+                            "oob_score": float(score),
+                            "cell": cgi_formulas.weight_cell_key(
+                                self.cgi_formula, dict(t.params), weight_bin_pct
+                            ),
+                        }
+                    )
+
+                # Selection-probability sidecar: which cells landed in this
+                # bootstrap's top-X %? Reported alongside q_worst so the user
+                # can sanity-check ("this region won often AND won well").
+                if bootstrap_records:
+                    diag["bootstraps_with_records"] += 1
+                    bootstrap_records.sort(
+                        key=lambda r: r["oob_score"], reverse=higher_is_better
+                    )
+                    n_top = max(
+                        1, int(len(bootstrap_records) * top_percent_per_bootstrap)
+                    )
+                    top_cells = {r["cell"] for r in bootstrap_records[:n_top]}
+                    per_bootstrap_top_cells.append(top_cells)
+                    records.extend(bootstrap_records)
+
+                    # Per-bootstrap row for the UI table: the leader, its
+                    # cell, and the spread of OOB scores within this
+                    # resample. Lets the user see if all bootstraps agree
+                    # on a region or scatter wildly.
+                    top_record = bootstrap_records[0]
+                    all_oob = [r["oob_score"] for r in bootstrap_records]
+                    per_bootstrap_summary.append(
+                        {
+                            "bootstrap": int(b),
+                            "n_trials": int(len(bootstrap_records)),
+                            "top_oob": float(top_record["oob_score"]),
+                            "top_cell": tuple(int(x) for x in top_record["cell"]),
+                            "top_params": {
+                                k: top_record["params"].get(k)
+                                for k in formula.weight_keys
+                                if k in top_record["params"]
+                            },
+                            "mean_oob": float(np.mean(all_oob)),
+                            "median_oob": float(np.median(all_oob)),
+                            "min_oob": float(np.min(all_oob)),
+                            "max_oob": float(np.max(all_oob)),
+                        }
+                    )
+                else:
+                    diag["bootstraps_all_nan_scores"] += 1
+
+                if progress_callback is not None:
+                    try:
+                        progress_callback(b + 1, int(n_bootstraps))
+                    except Exception:
+                        pass
+
+        finally:
+            self.cv_folds = prev_cv_folds
+            self.study = prev_study
+            self._cancel_callback = prev_cancel_cb
+            optuna.logging.set_verbosity(prev_optuna_verbosity)
+
+        if not records:
+            raise RuntimeError(
+                "bootstrap_stability_selection produced zero usable trials. "
+                "Diagnostics: "
+                f"bootstraps_attempted={diag['bootstraps_attempted']}, "
+                f"degenerate_split={diag['bootstraps_degenerate_split']}, "
+                f"zero_completed={diag['bootstraps_zero_completed']}, "
+                f"all_nan_scores={diag['bootstraps_all_nan_scores']}, "
+                f"with_records={diag['bootstraps_with_records']}, "
+                f"trials_complete={diag['trials_complete']}, "
+                f"trials_pruned={diag['trials_pruned']}, "
+                f"trials_failed={diag['trials_failed']}, "
+                f"trials_nan_score={diag['trials_nan_score']}, "
+                f"trials_kept={diag['trials_kept']}. "
+                "If most trials were pruned → variance-zero composites "
+                "(check that the pre-aggregation cache covers the bootstrap "
+                "entity_ids). If most trials returned NaN → check "
+                "covariate / target NaN coverage on OOB rows."
+            )
+
+        # ── Per-cell aggregation ─────────────────────────────────────────
+        cells: dict[tuple, list[dict]] = {}
+        for r in records:
+            cells.setdefault(r["cell"], []).append(r)
+
+        def _q_worst(scores: list[float]) -> float:
+            if higher_is_better:
+                return float(np.quantile(scores, worst_quantile))
+            return float(np.quantile(scores, 1.0 - worst_quantile))
+
+        n_bs_used = max(1, len(per_bootstrap_top_cells))
+
+        cell_stats: list[dict] = []
+        for cell_key, rs in cells.items():
+            if len(rs) < int(min_cell_count):
+                continue
+            scores = [r["oob_score"] for r in rs]
+            sel_prob = (
+                sum(1 for s in per_bootstrap_top_cells if cell_key in s) / n_bs_used
+            )
+            cell_stats.append(
+                {
+                    "cell": cell_key,
+                    "count": len(rs),
+                    "q_worst": _q_worst(scores),
+                    "median": float(np.median(scores)),
+                    "selection_probability": float(sel_prob),
+                    "records": rs,
+                }
+            )
+
+        if not cell_stats:
+            # No cell met min_cell_count — fall back to "best single cell by
+            # q_worst regardless of count" so the run still produces params,
+            # but log loudly so the caller knows the result is fragile.
+            logger.warning(
+                f"No weight cell reached min_cell_count={min_cell_count}. "
+                "Falling back to the single-best cell ignoring the count "
+                "threshold; consider raising n_bootstraps or "
+                "n_trials_per_bootstrap."
+            )
+            cell_stats = [
+                {
+                    "cell": cell_key,
+                    "count": len(rs),
+                    "q_worst": _q_worst([r["oob_score"] for r in rs]),
+                    "median": float(np.median([r["oob_score"] for r in rs])),
+                    "selection_probability": (
+                        sum(1 for s in per_bootstrap_top_cells if cell_key in s)
+                        / n_bs_used
+                    ),
+                    "records": rs,
+                }
+                for cell_key, rs in cells.items()
+            ]
+
+        # Pick the cell with the best q_worst.
+        best = max(
+            cell_stats,
+            key=lambda c: c["q_worst"] if higher_is_better else -c["q_worst"],
+        )
+
+        # ── Average params within the winning cell ───────────────────────
+        # Re-uses the same renormalization rules as compute_averaged_top_params
+        # so downstream code (composite generation, report) can consume the
+        # output identically. ``formula`` was resolved up front (see above).
+        winners = best["records"]
+
+        def _mean_int(name: str, default: int) -> int:
+            vals = [int(r["params"].get(name, default)) for r in winners]
+            return int(round(float(np.mean(vals)))) if vals else int(default)
+
+        def _mode_str(name: str, default: str) -> str:
+            vals = [r["params"].get(name, default) for r in winners]
+            try:
+                return mode(vals)
+            except Exception:
+                return vals[0] if vals else default
+
+        gvi_radii, ndvi_radii = self._preaggr_radii()
+        gvi_choices = np.asarray(gvi_radii) if gvi_radii else None
+        ndvi_choices = np.asarray(ndvi_radii) if ndvi_radii else None
+
+        def _snap(value: float, choices: np.ndarray | None) -> int:
+            if choices is None or len(choices) == 0:
+                return int(round(value))
+            idx = int(np.argmin(np.abs(choices - value)))
+            return int(choices[idx])
+
+        pct_grid = np.asarray(preaggregation.PERCENTILES)
+
+        def _snap_pct(value: float) -> int:
+            idx = int(np.argmin(np.abs(pct_grid - value)))
+            return int(pct_grid[idx])
+
+        final_params: dict[str, Any] = {
+            "veg_radius": _snap(
+                float(
+                    np.mean(
+                        [
+                            r["params"].get("veg_radius", self.gvi_buffer_max_m)
+                            for r in winners
+                        ]
+                    )
+                ),
+                gvi_choices,
+            ),
+            "terrain_radius": _snap(
+                float(
+                    np.mean(
+                        [
+                            r["params"].get("terrain_radius", self.gvi_buffer_max_m)
+                            for r in winners
+                        ]
+                    )
+                ),
+                gvi_choices,
+            ),
+            "ndvi_radius": _snap(
+                float(
+                    np.mean(
+                        [
+                            r["params"].get("ndvi_radius", self.ndvi_buffer_max_m)
+                            for r in winners
+                        ]
+                    )
+                ),
+                ndvi_choices,
+            ),
+            "streetview_stat": _mode_str("streetview_stat", "mean"),
+            "ndvi_stat": _mode_str("ndvi_stat", "mean"),
+            "streetview_percentile": _snap_pct(
+                float(
+                    np.mean(
+                        [
+                            r["params"].get("streetview_percentile", 50)
+                            for r in winners
+                        ]
+                    )
+                )
+            ),
+            "ndvi_percentile": _snap_pct(
+                float(
+                    np.mean(
+                        [r["params"].get("ndvi_percentile", 50) for r in winners]
+                    )
+                )
+            ),
+        }
+        for power_key in formula.power_keys:
+            final_params[power_key] = float(
+                np.mean([r["params"].get(power_key, 1.0) for r in winners])
+            )
+        avg_weights = {
+            k: float(np.mean([r["params"].get(k, 0.0) for r in winners]))
+            for k in formula.weight_keys
+        }
+        weight_sum = sum(avg_weights.values())
+        if weight_sum > 0:
+            # Renormalize to sum=100 on the 5% recorded grid. Snap to 5% steps
+            # via largest-remainder so the downstream apply path sees
+            # canonical integer weights compatible with the picker's output.
+            step = cgi_formulas.WEIGHT_STEP_PCT
+            n_slots = 100 // step
+            scaled = [
+                avg_weights[k] / weight_sum * (100.0 / step) for k in avg_weights
+            ]
+            floors = [int(np.floor(s)) for s in scaled]
+            remainder = n_slots - sum(floors)
+            if remainder > 0:
+                order = sorted(
+                    range(len(scaled)),
+                    key=lambda i: scaled[i] - floors[i],
+                    reverse=True,
+                )
+                for i in order[:remainder]:
+                    floors[i] += 1
+            for k, slots in zip(list(avg_weights), floors):
+                final_params[k] = int(slots) * step
+        else:
+            for k in avg_weights:
+                final_params[k] = 0
+            # Standalone fallback — keep the active channel at 100 % so the
+            # composite generator can still build a meaningful raster.
+            ch = getattr(self, "_active_greenery_channel", "cgi") or "cgi"
+            channel_to_keys = {
+                "veg": ("veg_weight", "w_veg"),
+                "terrain": ("terrain_weight", "w_ter"),
+                "ndvi": ("ndvi_weight", "w_ndvi"),
+            }
+            for candidate in channel_to_keys.get(ch, ()):
+                if candidate in avg_weights:
+                    final_params[candidate] = 100
+                    break
+
+        final_params["__cell_q_worst__"] = float(best["q_worst"])
+        final_params["__cell_count__"] = int(best["count"])
+        final_params["__cell_median__"] = float(best["median"])
+        final_params["__cell_selection_probability__"] = float(
+            best["selection_probability"]
+        )
+        final_params["__n_bootstraps__"] = int(n_bs_used)
+        final_params["__n_trials_per_bootstrap__"] = int(n_trials_per_bootstrap)
+        final_params["__n_total_trials__"] = int(len(records))
+        final_params["__worst_quantile__"] = float(worst_quantile)
+        # Compatibility with downstream code that reads the field names
+        # ``compute_averaged_top_params`` populates.
+        final_params["__n_top_trials__"] = int(best["count"])
+        final_params["__n_robust_trials__"] = int(
+            sum(c["count"] for c in cell_stats)
+        )
+
+        # Diagnostics for the results UI: top-10 ranked cells (so the user
+        # can see whether the winner is alone or part of a tight cluster of
+        # similar regions) and the winner's OOB-score distribution (for a
+        # histogram showing q_worst → median → max). These live under ``__``
+        # keys so the "Final params" panel still strips them out, but the
+        # raw bundle in the runner preserves them.
+        weight_keys = formula.weight_keys
+        ranked = sorted(
+            cell_stats,
+            key=lambda c: c["q_worst"] if higher_is_better else -c["q_worst"],
+            reverse=True,
+        )
+        final_params["__cell_stats__"] = [
+            {
+                "weights": {
+                    k: int(c["cell"][i] * weight_bin_pct)
+                    for i, k in enumerate(weight_keys)
+                },
+                "count": int(c["count"]),
+                "q_worst": float(c["q_worst"]),
+                "median": float(c["median"]),
+                "selection_probability": float(c["selection_probability"]),
+            }
+            for c in ranked[:10]
+        ]
+        final_params["__winning_cell_oob_scores__"] = [
+            float(r["oob_score"]) for r in best["records"]
+        ]
+        final_params["__per_bootstrap_summary__"] = per_bootstrap_summary
+        final_params["__higher_is_better__"] = bool(higher_is_better)
+        return final_params
+
     def compute_averaged_top_params(
         self,
         top_percent: float = 0.2,
@@ -5880,7 +6910,9 @@ class MetricFusionEngine:
             )
 
         robust_trials = self.get_robust_trials(
-            method="auto", p_threshold=0.05, tolerance=0.1, min_trials=10
+            val_p_threshold=0.05,
+            consistency_tolerance=0.1,
+            min_trials=10,
         )
         if not robust_trials:
             robust_trials = [
@@ -6001,13 +7033,29 @@ class MetricFusionEngine:
         if progress_callback:
             progress_callback(0, 100)
 
-        final_params = self.compute_averaged_top_params(top_percent=top_percent)
+        # Source the final params from whichever selection path the run used:
+        # * normal mode → averaged top-X % of robust trials from ``self.study``
+        # * stability-selection mode → the cell-winner already pinned on
+        #   ``self.best_params`` (bootstrap_stability_selection has no master
+        #   study so ``compute_averaged_top_params`` would raise).
+        if self.study is None:
+            if self.best_params is None:
+                raise ValueError(
+                    "Composite generation needs either a study to average from "
+                    "or ``self.best_params`` set by a prior selection step."
+                )
+            final_params = dict(self.best_params)
+            logger.info(
+                f"Composite TIFF stability-selected params: {final_params}"
+            )
+        else:
+            final_params = self.compute_averaged_top_params(top_percent=top_percent)
+            logger.info(
+                f"Composite TIFF averaged params (top {top_percent*100:.0f}% of "
+                f"{final_params['__n_robust_trials__']} robust trials, "
+                f"n_top={final_params['__n_top_trials__']}): {final_params}"
+            )
         formula = cgi_formulas.get_formula(self.cgi_formula)
-        logger.info(
-            f"Composite TIFF averaged params (top {top_percent*100:.0f}% of "
-            f"{final_params['__n_robust_trials__']} robust trials, "
-            f"n_top={final_params['__n_top_trials__']}): {final_params}"
-        )
 
         if progress_callback:
             progress_callback(30, 100)
@@ -6311,9 +7359,11 @@ class MetricFusionEngine:
             progress_callback(5, 100)
 
         # ═══ GET ROBUST TRIALS ═══
-        logger.info("Extracting robust trials using FDR correction...")
+        logger.info("Extracting robust trials (val-p + train-val consistency)...")
         robust_trials = self.get_robust_trials(
-            method="auto", p_threshold=0.05, tolerance=0.1, min_trials=10
+            val_p_threshold=0.05,
+            consistency_tolerance=0.1,
+            min_trials=10,
         )
 
         logger.info(

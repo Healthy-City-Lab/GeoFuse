@@ -115,13 +115,53 @@ class CGIFormula:
     main_weight_keys: tuple[str, ...]
     interaction_weight_keys: tuple[str, ...]
     power_keys: tuple[str, ...]
-    suggest_params: Callable[[optuna.Trial], dict]
+    suggest_params: Callable[..., dict]
     compute: Callable[[dict, ComponentDict], np.ndarray]
     channel_active: Callable[[dict], dict[str, bool]]
 
     @property
     def weight_keys(self) -> tuple[str, ...]:
         return self.main_weight_keys + self.interaction_weight_keys
+
+
+# ---------------------------------------------------------------------------
+# Cell binning (stability-selection aggregation)
+# ---------------------------------------------------------------------------
+
+# Bucket width for the weight-cell key used by bootstrap stability selection.
+# Trials are recorded at 5 % resolution (:data:`WEIGHT_STEP_PCT`); for cell
+# aggregation we coarsen to 10 % buckets so each cell collects enough OOB
+# scores across bootstraps to produce a meaningful worst-quantile estimate.
+WEIGHT_BIN_PCT: int = 10
+
+
+def bin_weight(value: int | float, bin_pct: int = WEIGHT_BIN_PCT) -> int:
+    """Snap ``value`` to a 0-indexed bucket of width ``bin_pct``.
+
+    A weight of 37 with 10 % buckets returns 3 (= the [30, 40) bucket). A
+    weight of 100 saturates to ``100 // bin_pct - 1`` so the rightmost edge
+    falls in the last bucket rather than a phantom (n_buckets)-th one.
+    """
+    b = int(value) // int(bin_pct)
+    max_bucket = (100 // int(bin_pct)) - 1
+    return min(b, max_bucket)
+
+
+def weight_cell_key(
+    formula: str, params: dict, bin_pct: int = WEIGHT_BIN_PCT
+) -> tuple[int, ...]:
+    """Cell key from a trial's weight params for stability-selection counting.
+
+    Returns a tuple of bucketed weights ordered by the formula's
+    ``weight_keys``. Two trials map to the same cell iff every weight falls
+    in the same bucket. Other parameters (radii, stats, percentiles, powers)
+    are NOT part of the key — they are averaged within the chosen cell after
+    selection. Stability is judged primarily on the channel-mix decision,
+    not on the spatial-aggregation tuning, because in practice the mix
+    drives the parameter-space landscape and the rest is noise on top.
+    """
+    desc = get_formula(formula)
+    return tuple(bin_weight(params.get(k, 0), bin_pct) for k in desc.weight_keys)
 
 
 # ---------------------------------------------------------------------------
@@ -133,28 +173,40 @@ class CGIFormula:
 # marginal exactly identical.
 _DIRICHLET_EPS: float = 1e-9
 
+# Discretisation step for recorded weights. Snapping to 5 % yields 21 valid
+# values per weight (0, 5, …, 100). This is fine enough to express any
+# meaningful ratio between channels and coarse enough to make
+# ``count_trials_per_param_cell`` viable for stability-selection analyses
+# (otherwise the 0–100 integer grid scatters trials across ~10⁴ cells and
+# every cell has count 1 in any realistic compute budget).
+WEIGHT_STEP_PCT: int = 5
+
 
 def _suggest_simplex_weights_dirichlet(
     trial: optuna.Trial, keys: tuple[str, ...], total: int = 100
 ) -> dict[str, int]:
-    """Sample ``keys`` from symmetric Dirichlet(1, …, 1), rounded to integers
-    summing exactly to ``total``.
+    """Sample ``keys`` from symmetric Dirichlet(1, …, 1), then snap to
+    multiples of :data:`WEIGHT_STEP_PCT` summing exactly to ``total``.
 
     Each key gets the SAME marginal distribution (Beta(1, K-1)) by the
     Gamma-normalize construction's symmetry, so no key is favoured by the
-    prior. TPE optimises against the per-key ``<key>_raw`` axes recorded by
+    prior. TPE optimizes against the per-key ``<key>_raw`` axes recorded by
     ``trial.suggest_float`` (flat U(eps, 1-eps), which TPE can model cleanly);
-    the integer weight is then pinned via ``trial.suggest_int(w, w)`` so the
+    the snapped weight is then pinned via ``trial.suggest_int(w, w)`` so the
     canonical ``*_weight`` keys still appear in ``trial.params`` for Optuna
     plots, robust-trial reports, and weight-vs-association CSV readers.
+
+    The 5 % grid is enforced via largest-remainder rounding on the
+    ``total / WEIGHT_STEP_PCT`` "slot" count: divide each scaled weight by
+    the step, take the floor, and distribute the remainder to the keys with
+    the largest fractional parts. Guarantees ``sum(out) == total`` and every
+    value ``≡ 0 (mod WEIGHT_STEP_PCT)``.
     """
     import math as _math
 
     raw_xs: list[float] = []
     for k in keys:
-        u = trial.suggest_float(
-            f"{k}_raw", _DIRICHLET_EPS, 1.0 - _DIRICHLET_EPS
-        )
+        u = trial.suggest_float(f"{k}_raw", _DIRICHLET_EPS, 1.0 - _DIRICHLET_EPS)
         raw_xs.append(-_math.log(u))
     sum_x = sum(raw_xs)
     if sum_x <= 0.0:
@@ -163,18 +215,32 @@ def _suggest_simplex_weights_dirichlet(
     else:
         scaled = [x / sum_x * total for x in raw_xs]
 
-    # Largest-remainder rounding so the integer weights sum to ``total`` exactly.
-    floors = [int(_math.floor(s)) for s in scaled]
-    remainder = int(total) - sum(floors)
+    # Snap to the WEIGHT_STEP_PCT grid via largest-remainder rounding on the
+    # number of step-sized "slots" each key claims. ``total`` must be a
+    # multiple of WEIGHT_STEP_PCT (100 / 5 = 20 slots — the call sites all
+    # pass total=100, asserted defensively below).
+    step = int(WEIGHT_STEP_PCT)
+    if int(total) % step != 0:
+        raise ValueError(
+            f"total={total} must be a multiple of WEIGHT_STEP_PCT={step} so "
+            "snapped weights can sum to exactly ``total``."
+        )
+    n_slots = int(total) // step
+    slot_floats = [s / step for s in scaled]
+    slot_floors = [int(_math.floor(sf)) for sf in slot_floats]
+    remainder = n_slots - sum(slot_floors)
     if remainder > 0:
         order = sorted(
-            range(len(keys)), key=lambda i: scaled[i] - floors[i], reverse=True
+            range(len(keys)),
+            key=lambda i: slot_floats[i] - slot_floors[i],
+            reverse=True,
         )
         for i in order[:remainder]:
-            floors[i] += 1
+            slot_floors[i] += 1
 
     out: dict[str, int] = {}
-    for k, w in zip(keys, floors):
+    for k, slots in zip(keys, slot_floors):
+        w = int(slots) * step
         out[k] = trial.suggest_int(k, int(w), int(w))
     return out
 
@@ -184,10 +250,38 @@ def _suggest_simplex_weights_dirichlet(
 # ---------------------------------------------------------------------------
 
 _WA_WEIGHT_KEYS: tuple[str, ...] = ("ndvi_weight", "veg_weight", "terrain_weight")
+_WA_KEY_TO_CHANNEL: dict[str, str] = {
+    "ndvi_weight": "ndvi",
+    "veg_weight": "veg",
+    "terrain_weight": "terrain",
+}
 
 
-def _suggest_weighted_average(trial: optuna.Trial) -> dict:
-    return _suggest_simplex_weights_dirichlet(trial, _WA_WEIGHT_KEYS, total=100)
+def _suggest_weighted_average(
+    trial: optuna.Trial, *, disabled_channels: "set[str] | None" = None
+) -> dict:
+    disabled = set(disabled_channels or ())
+    active_keys = tuple(
+        k for k in _WA_WEIGHT_KEYS if _WA_KEY_TO_CHANNEL[k] not in disabled
+    )
+    disabled_keys = tuple(
+        k for k in _WA_WEIGHT_KEYS if _WA_KEY_TO_CHANNEL[k] in disabled
+    )
+    if not active_keys:
+        # Degenerate: every channel disabled. Pin all weights to zero —
+        # ``compute_cgi`` will return NaN and the optimizer will skip it.
+        return {k: trial.suggest_int(k, 0, 0) for k in _WA_WEIGHT_KEYS}
+    if len(active_keys) == 1:
+        # Single-channel run: pin the active one to 100, the rest to 0.
+        out: dict[str, int] = {active_keys[0]: trial.suggest_int(active_keys[0], 100, 100)}
+        for k in disabled_keys:
+            out[k] = trial.suggest_int(k, 0, 0)
+        return out
+    # Sample a Dirichlet simplex over the active keys; pin disabled to 0.
+    out = _suggest_simplex_weights_dirichlet(trial, active_keys, total=100)
+    for k in disabled_keys:
+        out[k] = trial.suggest_int(k, 0, 0)
+    return out
 
 
 def _compute_weighted_average(params: dict, components: ComponentDict) -> np.ndarray:
@@ -228,23 +322,62 @@ _SYN_INTER_KEYS: tuple[str, ...] = (
 _SYN_WEIGHT_KEYS: tuple[str, ...] = _SYN_MAIN_KEYS + _SYN_INTER_KEYS
 _SYN_POWER_KEYS: tuple[str, ...] = ("ndvi_power", "veg_power", "terrain_power")
 
+# Per-weight channel involvement for synergy: any disabled channel zeros
+# every weight key whose name mentions it.
+_SYN_KEY_CHANNELS: dict[str, frozenset[str]] = {
+    "w_ndvi": frozenset({"ndvi"}),
+    "w_veg": frozenset({"veg"}),
+    "w_ter": frozenset({"terrain"}),
+    "w_ndvi_veg": frozenset({"ndvi", "veg"}),
+    "w_ndvi_ter": frozenset({"ndvi", "terrain"}),
+    "w_ter_veg": frozenset({"terrain", "veg"}),
+    "w_ndvi_veg_ter": frozenset({"ndvi", "veg", "terrain"}),
+}
+_SYN_POWER_CHANNEL: dict[str, str] = {
+    "ndvi_power": "ndvi",
+    "veg_power": "veg",
+    "terrain_power": "terrain",
+}
 
-def _suggest_synergy(trial: optuna.Trial) -> dict:
+
+def _suggest_synergy(
+    trial: optuna.Trial, *, disabled_channels: "set[str] | None" = None
+) -> dict:
+    disabled = set(disabled_channels or ())
     params: dict = {}
-    # Powers attach only to the main (standalone) terms — paper-faithful
-    # pattern generalised to three metrics. Stepped grid keeps the parameter
-    # ordinal (TPE exploits the order; categorical wouldn't) and reflects the
-    # coarse-grained nature of the synergy concavity choice.
+    # Powers: sample the active channels' powers, pin disabled ones to 1.0
+    # (multiplied by a zero weight downstream, so the value is inert).
     for k in _SYN_POWER_KEYS:
-        params[k] = trial.suggest_float(
-            k, SYNERGY_POWER_LOW, SYNERGY_POWER_HIGH, step=SYNERGY_POWER_STEP
-        )
-    # Same int 0–100 scale as ``weighted_average`` so the two formulas share
-    # one downstream trial-DB convention; ``_compute_synergy`` self-renormalizes
-    # by their actual total before evaluating the composite.
-    params.update(
-        _suggest_simplex_weights_dirichlet(trial, _SYN_WEIGHT_KEYS, total=100)
+        if _SYN_POWER_CHANNEL[k] in disabled:
+            params[k] = trial.suggest_float(k, 1.0, 1.0)
+        else:
+            params[k] = trial.suggest_float(
+                k, SYNERGY_POWER_LOW, SYNERGY_POWER_HIGH, step=SYNERGY_POWER_STEP
+            )
+    # Weights: any term touching a disabled channel goes to zero; the
+    # rest split the 100 mass via the Dirichlet sampler.
+    active_keys = tuple(
+        k for k in _SYN_WEIGHT_KEYS
+        if not (_SYN_KEY_CHANNELS[k] & disabled)
     )
+    disabled_keys = tuple(
+        k for k in _SYN_WEIGHT_KEYS
+        if _SYN_KEY_CHANNELS[k] & disabled
+    )
+    if not active_keys:
+        for k in _SYN_WEIGHT_KEYS:
+            params[k] = trial.suggest_int(k, 0, 0)
+        return params
+    if len(active_keys) == 1:
+        params[active_keys[0]] = trial.suggest_int(active_keys[0], 100, 100)
+        for k in disabled_keys:
+            params[k] = trial.suggest_int(k, 0, 0)
+        return params
+    params.update(
+        _suggest_simplex_weights_dirichlet(trial, active_keys, total=100)
+    )
+    for k in disabled_keys:
+        params[k] = trial.suggest_int(k, 0, 0)
     return params
 
 

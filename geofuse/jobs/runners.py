@@ -585,15 +585,12 @@ def _fusion_config_fingerprint(
     cgi_grid_spacing_m: float | None,
     area_balanced_split: bool,
     test_size: float,
-    val_size: float,
-    k_folds: int,
 ) -> str:
-    """8-char hex hash of every setting that changes Optuna's search space.
+    """8-char hex hash of every setting that changes the search space / split.
 
-    Anything that affects which params are suggested or which entities
-    are sampled lives here. Anything purely cosmetic (sampler choice,
-    standalone toggle, trial count) is excluded so swapping samplers
-    or extending the trial budget doesn't fragment the study DB.
+    Anything that affects which params are suggested or which entities are
+    sampled lives here; purely cosmetic knobs (standalone toggle, bootstrap
+    counts) are excluded so they don't fragment the per-job caches.
     """
     import hashlib as _hl
 
@@ -608,14 +605,17 @@ def _fusion_config_fingerprint(
             f"grid:{cgi_grid_spacing_m if cgi_grid_spacing_m is not None else 'na'}",
             f"ab:{int(area_balanced_split)}",
             f"ts:{test_size:.3f}",
-            f"vs:{val_size:.3f}",
-            f"k:{k_folds}",
-            # Bump when the weight-sampler prior or trial.params shape
-            # changes so an old SQLite study can't pool with a new one.
-            "ws:dirichlet1",
+            # Bump when the search space / selection scheme changes so old
+            # per-job caches can't pool with a new run.
+            "sel:stabsel-dcor-v1",
         ]
     )
     return _hl.sha256(payload.encode()).hexdigest()[:8]
+
+
+# ---------------------------------------------------------------------------
+# Nested-CV helpers
+# ---------------------------------------------------------------------------
 
 
 # Ordered pipeline steps a fusion run moves through per target outcome. The
@@ -816,7 +816,9 @@ def _write_split_scores_csv(
     if averaged_params is not None and study is not None:
         try:
             robust = engine.get_robust_trials(
-                method="auto", p_threshold=0.05, tolerance=0.1, min_trials=10
+                val_p_threshold=0.05,
+                consistency_tolerance=0.1,
+                min_trials=10,
             )
         except Exception:
             robust = []
@@ -960,6 +962,119 @@ def _build_fusion_ledger(
     return StageLedger.from_steps(steps)
 
 
+def _stability_summary(params: dict) -> dict:
+    """Lift the stability-selection diagnostics out of a winning-params dict.
+
+    ``bootstrap_stability_selection`` stashes its bookkeeping under ``__``-
+    prefixed keys (so the "Final params" panel strips them). This surfaces the
+    ones the results UI shows as a plain summary dict.
+    """
+
+    def g(key: str, default: Any = None) -> Any:
+        return params.get(key, default)
+
+    return {
+        "q_worst": g("__cell_q_worst__"),
+        "median": g("__cell_median__"),
+        "count": g("__cell_count__"),
+        "selection_probability": g("__cell_selection_probability__"),
+        "worst_quantile": g("__worst_quantile__"),
+        "n_bootstraps": g("__n_bootstraps__"),
+        "n_trials_per_bootstrap": g("__n_trials_per_bootstrap__"),
+        "n_total_trials": g("__n_total_trials__"),
+        "higher_is_better": g("__higher_is_better__"),
+        "cell_stats": g("__cell_stats__", []),
+        "winning_cell_oob_scores": g("__winning_cell_oob_scores__", []),
+        "per_bootstrap_summary": g("__per_bootstrap_summary__", []),
+    }
+
+
+def _direction_sign(engine: Any, params: dict, metric: str) -> int:
+    """``+1`` / ``-1`` sign of the greenery↔outcome relationship on the test set.
+
+    Distance correlation is unsigned, so the report needs a separate direction
+    indicator. Returns ``+1`` (neutral) on any failure.
+    """
+    from .. import objective_scoring as _scoring
+
+    try:
+        res = engine.evaluate_on_test(
+            params=params, metric=metric, return_predictions=True
+        )
+        target = np.asarray(res.get("targets"), dtype=np.float64)
+        pred = np.asarray(res.get("predictions"), dtype=np.float64)
+        cov = res.get("covariates")
+        return int(_scoring.relationship_sign(target, pred, cov))
+    except Exception:
+        return 1
+
+
+def _compare_cgi_vs_standalone(
+    engine: Any,
+    standalones_bundle: dict,
+    cgi_params: dict,
+    metric: str,
+    *,
+    longitudinal: bool,
+    log,
+) -> dict | None:
+    """AIC/BIC verdict: is CGI justified over the best single standalone channel?
+
+    The best standalone is the channel with the strongest held-out test score
+    (direction-aware). The full (3-channel) and reduced (best-channel) models
+    are fit on the train+val pool's per-entity channel design built at the CGI
+    winning aggregation params. Returns ``None`` when no standalone qualifies or
+    the design / fit fails.
+    """
+    from .. import mixed_effects_scoring as _me
+    from .. import objective_scoring as _scoring
+
+    chans = ["veg", "terrain", "ndvi"]
+    higher_is_better = (
+        metric in _scoring.HIGHER_IS_BETTER or metric in _me.HIGHER_IS_BETTER
+    )
+    scored: list[tuple[str, float]] = []
+    for ch in chans:
+        b = standalones_bundle.get(ch)
+        if not b:
+            continue
+        ts = (b.get("test_results") or {}).get("test_score")
+        if ts is None or not np.isfinite(float(ts)):
+            continue
+        scored.append((ch, float(ts)))
+    if not scored:
+        return None
+    best_ch = max(scored, key=lambda kv: kv[1] if higher_is_better else -kv[1])[0]
+    best_idx = chans.index(best_ch)
+
+    try:
+        design = engine.build_channel_design(cgi_params, subset="train_val")
+    except Exception as exc:
+        log("WARN", f"AIC/BIC channel design failed: {exc}")
+        return None
+
+    X = design["channels"]
+    target = design["target"]
+    cov = design["covariates"]
+    try:
+        if longitudinal and design.get("entity_id") is not None:
+            return _me.compare_models_aic_bic_mixedlm(
+                target,
+                X,
+                chans,
+                best_idx,
+                design["entity_id"],
+                design["years_since_baseline"],
+                covariates=cov,
+            )
+        return _scoring.compare_models_aic_bic(
+            target, X, chans, best_idx, covariates=cov
+        )
+    except Exception as exc:
+        log("WARN", f"AIC/BIC comparison failed: {exc}")
+        return None
+
+
 def run_fusion(
     ctx: JobContext,
     *,
@@ -984,13 +1099,7 @@ def run_fusion(
     ndvi_path: str | None = None,
     cache_metrics: bool = False,
     test_size: float,
-    val_size: float = 0.25,
-    k_folds: int,
-    n_trials: int,
-    n_startup_trials: int,
     objective_metric: str,
-    pruner_type: str = "none",
-    sampler_type: str,
     gvi_api_key: str | None = None,
     ndvi_start_date: str | None = None,
     ndvi_end_date: str | None = None,
@@ -1007,8 +1116,21 @@ def run_fusion(
     cgi_grid_spacing_m: float | None = None,
     whole_grid_scaling: bool = False,
     area_balanced_split: bool = False,
+    n_bootstraps: int = 20,
+    n_trials_per_bootstrap: int = 50,
+    min_cell_count: int = 3,
+    check_collinearity: bool = False,
+    vif_threshold: float = 10.0,
 ) -> dict:
-    """Run fusion optimization. Mirrors the previous ``_fusion_worker``."""
+    """Run a fusion job: stability-selection tuning + held-out test scoring.
+
+    For CGI (and each enabled standalone channel) the engine draws
+    ``n_bootstraps`` resamples of the train+val pool, runs an
+    ``n_trials_per_bootstrap``-trial RandomSampler search per resample, and
+    selects the weight cell with the best worst-quantile out-of-bag score. The
+    winning params are then scored once on the held-out test split with a
+    percentile bootstrap CI. When standalones are enabled, an AIC/BIC
+    comparison reports whether CGI is justified over the best single channel."""
     try:
         targets = list(target_features_geojson) if target_features_geojson else [None]
         n_t = max(len(targets), 1)
@@ -1344,39 +1466,47 @@ def run_fusion(
                 return {"output_paths": output_paths}
             stage(skey("preaggregate"), DONE)
 
-            stage(skey("split"), RUNNING)
-            ctx.progress(
-                value=prog(0.34),
-                status_text=f"{prefix}Splitting data into train/val/test folds...",
-            )
-            # Convert whole-dataset val fraction to within-(train+val) ratio.
-            denom = max(1.0 - float(test_size), 1e-6)
-            single_split_val_ratio = max(0.01, min(0.99, float(val_size) / denom))
-            engine.split_data(
-                fusion_df=fusion_df,
-                test_size=test_size,
-                k_folds=k_folds,
-                random_state=42,
-                single_split_val_ratio=single_split_val_ratio,
-            )
-            stage(skey("split"), DONE)
+            # Optional iterative-VIF collinearity check on the CGI grid
+            # pixel values. Disabled channels get pinned to weight 0 in
+            # every subsequent trial (the engine threads
+            # ``self._disabled_channels`` into ``formula.suggest_params``).
+            if check_collinearity:
+                try:
+                    # Pass ``fusion_df`` explicitly — this stage runs
+                    # before ``split_data``, so ``engine.train_val_data``
+                    # and ``engine.test_data`` are still ``None``.
+                    collinearity_report = engine.check_channel_collinearity(
+                        data=fusion_df,
+                        vif_threshold=float(vif_threshold),
+                    )
+                    if engine._disabled_channels:
+                        _log_fusion(
+                            "WARN",
+                            f"[{label}] Collinearity check dropped: "
+                            f"{sorted(engine._disabled_channels)}. "
+                            f"VIFs (initial): "
+                            f"{dict(zip(collinearity_report['channels_in'], collinearity_report['initial_vifs']))}.",
+                        )
+                    else:
+                        _log_fusion(
+                            "OK",
+                            f"[{label}] Collinearity check passed (max VIF ≤ "
+                            f"{vif_threshold}).",
+                        )
+                except Exception as exc:
+                    _log_fusion(
+                        "WARN",
+                        f"[{label}] Collinearity check failed: {exc}. "
+                        "Continuing with all three channels enabled.",
+                    )
 
-            stage(skey("optimize"), RUNNING)
-            ctx.progress(
-                value=prog(0.35),
-                status_text=f"{prefix}Optimizing ({n_trials} trials)...",
-            )
-            study_dir = os.path.join(output_dir, "fusion_studies")
-            # When the user opts out of resume, suffix the study name with a
-            # timestamp so a fresh SQLite file is created instead of attaching
-            # to the existing one.
+            # Config fingerprint keys the per-job caches; ``suffix`` forces a
+            # fresh artifact namespace when the user opts out of resume.
             suffix = (
                 ""
                 if resume_existing_study
                 else datetime.now().strftime("%Y%m%dT%H%M%S")
             )
-            # Bake the search-space config into the study name so reruns
-            # with different config don't inherit stale trials.
             config_fp = _fusion_config_fingerprint(
                 buffer_meters=float(buffer_meters),
                 gvi_buffer_min_m=float(gvi_buffer_min_m),
@@ -1391,88 +1521,99 @@ def run_fusion(
                 cgi_grid_spacing_m=cgi_grid_spacing_m,
                 area_balanced_split=bool(area_balanced_split),
                 test_size=float(test_size),
-                val_size=float(val_size),
-                k_folds=int(k_folds),
             )
-            study_name = _build_fusion_study_name(
-                target_display_name=target_display_name,
-                label=label,
-                objective_metric=objective_metric,
-                suffix=suffix,
-                config_fingerprint=config_fp,
+
+            def _standalone_study_name(ch: str) -> str:
+                ch_suffix = ch if resume_existing_study else f"{ch}_{suffix}"
+                return _build_fusion_study_name(
+                    target_display_name=target_display_name,
+                    label=label,
+                    objective_metric=objective_metric,
+                    suffix=ch_suffix,
+                    config_fingerprint=config_fp,
+                )
+
+            # One held-out test split + the train+val pool that stability
+            # selection resamples.
+            stage(skey("split"), RUNNING)
+            ctx.progress(
+                value=prog(0.89),
+                status_text=f"{prefix}Splitting data into train / val / test...",
             )
-            best_params = engine.optimize_fusion(
-                n_trials=n_trials,
-                n_startup_trials=n_startup_trials,
-                objective_metric=objective_metric,
-                pruner_type=pruner_type if pruner_type != "none" else None,
-                sampler_type=sampler_type,
-                seed=42,
-                show_progress=False,
-                study_name=study_name,
-                study_dir=study_dir,
-                cancel_callback=cancel_check,
+            engine.split_data(
+                fusion_df=fusion_df,
+                test_size=test_size,
+                random_state=42,
             )
+            stage(skey("split"), DONE)
+
+            stage(skey("optimize"), RUNNING)
+            ctx.progress(
+                value=prog(0.90),
+                status_text=(
+                    f"{prefix}Stability selection "
+                    f"({int(n_bootstraps)}×{int(n_trials_per_bootstrap)})..."
+                ),
+            )
+            # Stability selection has no master Optuna study; ``best_params``
+            # stays empty and the winning cell is computed in the evaluate
+            # stage below.
+            best_params: dict = {}
             if ctx.is_cancelled():
                 return {"output_paths": output_paths}
             stage(skey("optimize"), DONE)
 
             stage(skey("robust"), RUNNING)
             ctx.progress(
-                value=prog(0.85), status_text=f"{prefix}Filtering robust trials..."
+                value=prog(0.85),
+                status_text=f"{prefix}Aggregating bootstrap cells...",
             )
-            robust_trials = engine.get_robust_trials(
-                method="auto", p_threshold=0.05, tolerance=0.1, min_trials=10
-            )
+            # No master Optuna study to filter — the robust pool is implicit in
+            # the per-cell OOB aggregation stability selection performs.
+            robust_trials: list = []
             stage(skey("robust"), DONE)
 
             stage(skey("evaluate"), RUNNING)
             ctx.progress(
                 value=prog(0.9), status_text=f"{prefix}Evaluating on test set..."
             )
-            test_results = engine.evaluate_on_test(
-                params=best_params, metric=objective_metric
+            # Headline params: the stability-selection winning weight cell on
+            # the full train+val pool (params averaged within the cell).
+            headline_params = engine.bootstrap_stability_selection(
+                metric=objective_metric,
+                n_bootstraps=int(n_bootstraps),
+                n_trials_per_bootstrap=int(n_trials_per_bootstrap),
+                min_cell_count=int(min_cell_count),
+                seed=42,
+                cancel_callback=cancel_check,
             )
+            engine.best_params = dict(headline_params)
+            cgi_stability_summary = _stability_summary(headline_params)
 
-            # Score every completed CGI trial on the held-out test set so
-            # the distribution viewer reflects the true test-side spread —
-            # restricting to robust trials made the test box collapse
-            # whenever the robust filter clustered on identical params.
-            # ``FrozenTrial.set_user_attr`` only mutates the in-memory copy,
-            # so we also collect a sidecar ``trial.number -> {test_score,
-            # test_pvalue}`` dict for the viewer to consult.
-            import optuna as _optuna_cgi
+            test_results = engine.evaluate_on_test(
+                params=headline_params, metric=objective_metric
+            )
+            # Independent held-out effect size + percentile bootstrap CI.
+            try:
+                cgi_test_ci = engine.bootstrap_test_score_ci(
+                    headline_params,
+                    objective_metric,
+                    n_bootstrap=10000,
+                    ci_level=0.95,
+                    method="percentile",
+                    seed=42,
+                )
+                test_results["test_ci"] = cgi_test_ci
+            except Exception as exc:
+                _log_fusion("WARN", f"[{label}] Bootstrap CI failed: {exc}")
 
-            cgi_completed = [
-                _t
-                for _t in engine.study.trials
-                if _t.state == _optuna_cgi.trial.TrialState.COMPLETE
-            ]
+            # Direction of the greenery↔outcome relationship (distance
+            # correlation is unsigned, so the sign is reported separately).
+            cgi_direction = _direction_sign(engine, headline_params, objective_metric)
+
+            # No master Optuna study in stability mode, so there is no per-trial
+            # test sidecar to build.
             cgi_per_trial_test: dict[int, dict[str, float]] = {}
-            for _t in cgi_completed:
-                try:
-                    _tr = engine.evaluate_on_test(
-                        params=_t.params, metric=objective_metric
-                    )
-                    rec: dict[str, float] = {}
-                    if _tr.get("test_score") is not None:
-                        rec["test_score"] = float(_tr["test_score"])
-                    if _tr.get("test_pvalue") is not None:
-                        rec["test_pvalue"] = float(_tr["test_pvalue"])
-                    if rec:
-                        cgi_per_trial_test[int(_t.number)] = rec
-                except Exception:
-                    continue
-            # Mirror the sidecar onto the robust-trial FrozenTrials so the
-            # robust-trials browser table still reads test_score per row.
-            for _t in robust_trials or []:
-                rec = cgi_per_trial_test.get(int(_t.number))
-                if rec is None:
-                    continue
-                if "test_score" in rec:
-                    _t.set_user_attr("test_score", rec["test_score"])
-                if "test_pvalue" in rec:
-                    _t.set_user_attr("test_pvalue", rec["test_pvalue"])
             stage(skey("evaluate"), DONE)
 
             stage(skey("apply"), RUNNING)
@@ -1544,156 +1685,89 @@ def run_fusion(
                 ctx.progress(
                     value=prog(0.95),
                     status_text=(
-                        f"{prefix}Standalone {ch_disp} study ({n_trials} trials)..."
+                        f"{prefix}Standalone {ch_disp} stability selection "
+                        f"({int(n_bootstraps)}×{int(n_trials_per_bootstrap)})..."
                     ),
                 )
-                ch_suffix = ch if resume_existing_study else f"{ch}_{suffix}"
-                ch_study_name = _build_fusion_study_name(
-                    target_display_name=target_display_name,
-                    label=label,
-                    objective_metric=objective_metric,
-                    suffix=ch_suffix,
-                    config_fingerprint=config_fp,
-                )
-                ch_best = engine.optimize_fusion(
-                    n_trials=n_trials,
-                    n_startup_trials=n_startup_trials,
-                    objective_metric=objective_metric,
-                    pruner_type=pruner_type if pruner_type != "none" else None,
-                    sampler_type=sampler_type,
+                ch_study_name = _standalone_study_name(ch)
+                # Pin the active channel so _objective treats the trial's
+                # composite as this channel's normalized value, then run the
+                # same bootstrap stability search as CGI. The channel stays
+                # pinned through the composite write below; the CGI state is
+                # restored after the loop.
+                engine._active_greenery_channel = ch
+                ch_best = engine.bootstrap_stability_selection(
+                    metric=objective_metric,
+                    n_bootstraps=int(n_bootstraps),
+                    n_trials_per_bootstrap=int(n_trials_per_bootstrap),
+                    min_cell_count=int(min_cell_count),
                     seed=42,
-                    show_progress=False,
-                    study_name=ch_study_name,
-                    study_dir=study_dir,
                     cancel_callback=cancel_check,
-                    greenery_channel=ch,
                 )
-                if ctx.is_cancelled():
-                    return {"output_paths": output_paths}
-                ch_robust = engine.get_robust_trials(
-                    method="auto", p_threshold=0.05, tolerance=0.1, min_trials=10
-                )
-                # Snapshot every completed trial for this channel's study
-                # while ``engine.study`` still points at it — the engine is
-                # rebound to the CGI study at the end of the standalones
-                # loop, so the viewer has no other way to access the full
-                # standalone trial population.
-                import optuna as _optuna_mod
+                engine.best_params = dict(ch_best)
+                ch_headline_params = dict(ch_best)
+                ch_stability_summary = _stability_summary(ch_best)
 
-                ch_all_completed = [
-                    _t
-                    for _t in engine.study.trials
-                    if _t.state == _optuna_mod.trial.TrialState.COMPLETE
-                ]
                 ch_test = engine.evaluate_on_test(
-                    params=ch_best, metric=objective_metric
+                    params=ch_headline_params, metric=objective_metric
+                )
+                try:
+                    ch_test_ci = engine.bootstrap_test_score_ci(
+                        ch_headline_params,
+                        objective_metric,
+                        n_bootstrap=10000,
+                        ci_level=0.95,
+                        method="percentile",
+                        seed=42,
+                    )
+                    ch_test["test_ci"] = ch_test_ci
+                except Exception as exc:
+                    _log_fusion(
+                        "WARN",
+                        f"[{label}] Standalone {ch} bootstrap CI failed: {exc}",
+                    )
+                ch_direction = _direction_sign(
+                    engine, ch_headline_params, objective_metric
                 )
 
-                # Per-trial test scoring + sidecar so the distribution
-                # viewer can plot test CIs after the engine's study has
-                # been rebound to CGI. Score every completed trial so
-                # the test box reflects real trial-to-trial variation,
-                # not just the (often-converged) robust subset.
-                ch_per_trial_test: dict[int, dict[str, float]] = {}
-                for _t in ch_all_completed:
-                    try:
-                        _tr = engine.evaluate_on_test(
-                            params=_t.params, metric=objective_metric
-                        )
-                        rec: dict[str, float] = {}
-                        if _tr.get("test_score") is not None:
-                            rec["test_score"] = float(_tr["test_score"])
-                        if _tr.get("test_pvalue") is not None:
-                            rec["test_pvalue"] = float(_tr["test_pvalue"])
-                        if rec:
-                            ch_per_trial_test[int(_t.number)] = rec
-                    except Exception:
-                        continue
-                # Mirror the sidecar onto the robust-trial FrozenTrials so
-                # the robust-trials browser table still surfaces test_score
-                # per row.
-                for _t in ch_robust or []:
-                    rec = ch_per_trial_test.get(int(_t.number))
-                    if rec is None:
-                        continue
-                    if "test_score" in rec:
-                        _t.set_user_attr("test_score", rec["test_score"])
-                    if "test_pvalue" in rec:
-                        _t.set_user_attr("test_pvalue", rec["test_pvalue"])
-
-                # Reports + composite TIFF + averaged top-20 % params for
-                # this standalone, mirroring what the CGI study gets. Each
-                # standalone writes into its own subdirectory so plots,
-                # TIFFs, and JSONs don't collide with the CGI run.
+                # Composite TIFF for this standalone (no master study → no
+                # per-trial plots). Written into its own subdirectory.
                 ch_report_dir = os.path.join(
                     job_artifacts_root, "study_results", f"standalone_{ch}"
                 )
-                ch_averaged_params: dict | None = None
+                ch_averaged_params: dict = dict(ch_headline_params)
                 ch_composite_path = os.path.join(
                     job_artifacts_root, f"composite_greenery_{ch}.tif"
                 )
                 try:
-                    ch_averaged_params = engine.generate_results_report(
-                        output_dir=ch_report_dir,
-                        include_plots=True,
-                        composite_path=ch_composite_path,
+                    engine.generate_composite_greenery_map(
+                        output_path=ch_composite_path,
                     )
                     _log_fusion(
                         "OK",
-                        f"[{label}] Standalone {ch}: reports + composite TIFF "
-                        f"written to {ch_report_dir}.",
+                        f"[{label}] Standalone {ch}: composite TIFF written to "
+                        f"{ch_report_dir}.",
                     )
                 except Exception as exc:
                     _log_fusion(
                         "WARN",
-                        f"[{label}] Standalone {ch} report / composite "
-                        f"generation failed: {exc}",
-                    )
-
-                # Per-split objective metrics CSV for this standalone.
-                try:
-                    _write_split_scores_csv(
-                        engine=engine,
-                        label=f"{label}__standalone_{ch}",
-                        multi_outcome=multi_outcome,
-                        output_dir=ch_report_dir,
-                        objective_metric=objective_metric,
-                        best_value=engine.study.best_value,
-                        best_params=ch_best,
-                        averaged_params=ch_averaged_params,
-                        test_results=ch_test,
-                        log=_log_fusion,
-                    )
-                except Exception as exc:
-                    _log_fusion(
-                        "WARN",
-                        f"[{label}] Standalone {ch} split-scores CSV failed: " f"{exc}",
-                    )
-
-                ch_subset_scores: dict | None = None
-                try:
-                    ch_subset_scores = engine.compute_subset_scores(
-                        params=ch_averaged_params or ch_best,
-                        metric=objective_metric,
-                        top_percent=0.2,
-                    )
-                except Exception as exc:
-                    _log_fusion(
-                        "WARN",
-                        f"[{label}] Standalone {ch} subset-score computation "
+                        f"[{label}] Standalone {ch} composite generation "
                         f"failed: {exc}",
                     )
 
+                ch_best_value = float(ch_best.get("__cell_q_worst__", float("nan")))
                 standalones_bundle[ch] = {
                     "channel": ch,
                     "best_params": ch_best,
                     "averaged_params": ch_averaged_params,
-                    "best_value": engine.study.best_value,
-                    "robust_trials": ch_robust,
-                    "all_completed_trials": ch_all_completed,
-                    "per_trial_test": ch_per_trial_test,
+                    "best_value": ch_best_value,
+                    "robust_trials": [],
+                    "all_completed_trials": [],
+                    "per_trial_test": {},
                     "test_results": ch_test,
-                    "subset_scores": ch_subset_scores,
+                    "subset_scores": None,
+                    "stability_summary": ch_stability_summary,
+                    "direction_sign": ch_direction,
                     "objective_metric": objective_metric,
                     "study_name": ch_study_name,
                     "report_dir": ch_report_dir,
@@ -1734,6 +1808,26 @@ def run_fusion(
                 engine.best_params = cgi_best_params
                 engine._active_greenery_channel = "cgi"
 
+            # ── AIC/BIC: is CGI justified over the best standalone channel? ──
+            cgi_vs_standalone_aic_bic: dict | None = None
+            if standalones:
+                cgi_vs_standalone_aic_bic = _compare_cgi_vs_standalone(
+                    engine,
+                    standalones_bundle,
+                    headline_params,
+                    objective_metric,
+                    longitudinal=longitudinal_spec is not None,
+                    log=_log_fusion,
+                )
+                if cgi_vs_standalone_aic_bic and cgi_vs_standalone_aic_bic.get("ok"):
+                    _log_fusion(
+                        "OK",
+                        f"[{label}] CGI vs best standalone "
+                        f"({cgi_vs_standalone_aic_bic['best_channel']}): "
+                        f"ΔBIC={cgi_vs_standalone_aic_bic['delta_bic']:.1f} → "
+                        f"{cgi_vs_standalone_aic_bic['verdict']}.",
+                    )
+
             # ── Reports + composite GeoTIFF (plotting + raster write) ──
             # Pulled out of ``optimize_fusion`` so the standalone stages above
             # can advance the ledger while plotting runs separately at the
@@ -1748,22 +1842,21 @@ def run_fusion(
             cgi_composite_path = os.path.join(
                 job_artifacts_root, "composite_greenery.tif"
             )
-            averaged_params: dict | None = None
+            averaged_params: dict | None = dict(headline_params)
             try:
-                averaged_params = engine.generate_results_report(
-                    output_dir=report_dir,
-                    include_plots=True,
-                    composite_path=cgi_composite_path,
+                # No master study to plot trials from — generate the composite
+                # TIFF directly from the stability-selection winning params.
+                engine.generate_composite_greenery_map(
+                    output_path=cgi_composite_path,
                 )
                 _log_fusion(
                     "OK",
-                    f"[{label}] Reports + composite TIFF written to "
-                    f"{job_artifacts_root}.",
+                    f"[{label}] Composite TIFF written to {job_artifacts_root}.",
                 )
             except Exception as exc:
                 _log_fusion(
                     "WARN",
-                    f"[{label}] Report / composite generation failed: {exc}",
+                    f"[{label}] Composite generation failed: {exc}",
                 )
             stage(skey("reports"), DONE)
 
@@ -1830,6 +1923,16 @@ def run_fusion(
                 "artifacts_dir": job_artifacts_root,
                 "composite_path": cgi_composite_path,
                 "report_dir": report_dir,
+                # ``None`` when the collinearity check wasn't requested.
+                "collinearity_report": getattr(engine, "_collinearity_report", None),
+                "disabled_channels": sorted(
+                    getattr(engine, "_disabled_channels", set()) or set()
+                ),
+                # Stability-selection diagnostics, the held-out direction sign,
+                # and the AIC/BIC verdict vs the best standalone (when run).
+                "stability_summary": cgi_stability_summary,
+                "direction_sign": cgi_direction,
+                "cgi_vs_standalone_aic_bic": cgi_vs_standalone_aic_bic,
             }
             by_target[label] = bundle
             engines_by_target[label] = engine

@@ -55,8 +55,7 @@ _CHANNEL_DISPLAY = {"veg": "Vegetation", "terrain": "Terrain", "ndvi": "NDVI"}
 class _FusionVerticalScaleControl(MacroElement):
     """Leaflet control: vertical red→yellow→green strip with numeric bounds."""
 
-    _template = Template(
-        """
+    _template = Template("""
 {% macro script(this, kwargs) %}
     var {{ this.get_name() }}_vsc = L.control({position: 'topright'});
     {{ this.get_name() }}_vsc.onAdd = function (map) {
@@ -72,8 +71,7 @@ class _FusionVerticalScaleControl(MacroElement):
     };
     {{ this.get_name() }}_vsc.addTo({{ this._parent.get_name() }});
 {% endmacro %}
-"""
-    )
+""")
 
     def __init__(self, inner_html: str):
         super().__init__()
@@ -284,8 +282,6 @@ def _fusion_restart_summary_lines(p: dict) -> list[str]:
     covs = p.get("covariate_columns") or []
     standalones = p.get("standalone_channels") or []
     lon_payload = p.get("longitudinal_spec_payload") or None
-    k_folds = int(p.get("k_folds", 5))
-    cv_label = f"{k_folds}-fold CV" if k_folds > 1 else "single split (no CV)"
     lines = [
         f"**Target:** `{p.get('target_display_name', '?')}`",
         f"**Outcomes:** {', '.join(p.get('outcome_columns') or []) or '—'}",
@@ -293,10 +289,11 @@ def _fusion_restart_summary_lines(p: dict) -> list[str]:
         f"**Covariates:** {', '.join(covs) if covs else '—'}",
         f"**Standalone metrics:** "
         f"{', '.join(_CHANNEL_DISPLAY.get(s, s) for s in standalones) if standalones else '—'}",
-        f"**Trials:** {p.get('n_trials', '?')} "
-        f"(startup {p.get('n_startup_trials', '?')}, {cv_label})",
-        f"**Objective:** {p.get('objective_metric', '?')} · "
-        f"**Sampler:** {p.get('sampler_type', '?')}",
+        f"**Objective:** `{p.get('objective_metric', '?')}` · "
+        f"**Test set:** {float(p.get('test_size', 0.0) or 0.0) * 100:.0f}%",
+        f"**Stability selection:** {p.get('n_bootstraps', '?')} bootstraps × "
+        f"{p.get('n_trials_per_bootstrap', '?')} trials "
+        f"(min {p.get('min_cell_count', '?')}/cell)",
         f"**GVI buffers (m):** {p.get('gvi_buffer_min_m', '?')} – "
         f"{p.get('gvi_buffer_max_m', '?')} (step {p.get('gvi_buffer_step_m', '?')})",
         f"**NDVI buffers (m):** {p.get('ndvi_buffer_min_m', '?')} – "
@@ -356,6 +353,19 @@ def _submit_fusion_restart(
     outcome_columns = list(p.get("outcome_columns") or [])
     job_target_band = int(p.get("target_band", 1))
 
+    # Replay the recorded run configuration verbatim — no per-key defaults, so
+    # a restart reproduces the original run exactly. A missing key means the
+    # job was recorded by an older build; fail loudly rather than silently
+    # substitute a default.
+    missing = [k for k in _FUSION_RUN_CONFIG_KEYS if k not in p]
+    if missing:
+        raise RuntimeError(
+            f"Cannot restart: the stored job is missing settings {missing}. "
+            "Re-run it fresh from the form instead."
+        )
+    run_config = {k: p[k] for k in _FUSION_RUN_CONFIG_KEYS}
+    run_config["resume_existing_study"] = True
+
     new_rec = store.submit(type="fusion", name=rec.name, params=new_params)
     executor.submit_runner(
         new_rec,
@@ -366,38 +376,11 @@ def _submit_fusion_restart(
         target_layer=p.get("target_layer") if is_vector else None,
         target_cleanup_dir=target_mat.cleanup_dir,
         target_cleanup_file=target_mat.cleanup_file,
-        buffer_meters=float(p.get("buffer_meters", 0.0)),
-        gvi_buffer_min_m=float(p.get("gvi_buffer_min_m", 100)),
-        gvi_buffer_max_m=float(p.get("gvi_buffer_max_m", 1500)),
-        gvi_buffer_step_m=float(p.get("gvi_buffer_step_m", 50)),
-        ndvi_buffer_min_m=float(p.get("ndvi_buffer_min_m", 100)),
-        ndvi_buffer_max_m=float(p.get("ndvi_buffer_max_m", 1500)),
-        ndvi_buffer_step_m=float(p.get("ndvi_buffer_step_m", 50)),
-        n_bins=int(p.get("n_bins", 5)),
         veg_path=veg_path,
         ndvi_path=ndvi_path,
-        test_size=float(p.get("test_size", 0.3)),
-        val_size=float(p.get("val_size", 0.25)),
-        k_folds=int(p.get("k_folds", 5)),
-        n_trials=int(p.get("n_trials", 300)),
-        n_startup_trials=int(p.get("n_startup_trials", 150)),
-        objective_metric=p.get("objective_metric", "pearson"),
-        sampler_type=p.get("sampler_type", "TPE"),
         output_dir=output_dir,
         MetricFusionEngine=_MetricFusionEngine,
-        target_display_name=p.get("target_display_name") or "target",
-        resume_existing_study=True,
-        cgi_formula=str(p.get("cgi_formula") or "weighted_average"),
-        covariate_columns=list(p.get("covariate_columns") or []),
-        standalone_channels=list(p.get("standalone_channels") or []),
-        longitudinal_spec_payload=p.get("longitudinal_spec_payload"),
-        cgi_grid_spacing_m=(
-            float(p["cgi_grid_spacing_m"])
-            if p.get("cgi_grid_spacing_m") is not None
-            else None
-        ),
-        whole_grid_scaling=bool(p.get("whole_grid_scaling", False)),
-        area_balanced_split=bool(p.get("area_balanced_split", False)),
+        **run_config,
     )
 
 
@@ -739,12 +722,13 @@ def _render_fusion_restart_panel(store, executor, output_dir: str) -> bool:
 # ---------------------------------------------------------------------------
 
 # Public set of cross-sectional objective metrics offered by the OLS scorer
-# (covariate-aware partial correlation / incremental R² / RMSE / MI).
+# (covariate-aware distance correlation / partial rank correlation /
+# incremental R² / normalized RMSE / MI).
 _CROSS_METRICS: tuple[str, ...] = (
-    "pearson",
+    "distance_corr",
     "spearman",
     "r2",
-    "rmse",
+    "nrmse",
     "mutual_info",
 )
 # MixedLM scoring metrics — mirror the engine's MIXEDLM_METRICS so they can
@@ -754,6 +738,45 @@ _MIXEDLM_METRICS: tuple[str, ...] = (
     "mixedlm_marginal_r2",
     "mixedlm_lr",
     "mixedlm_coef",
+)
+
+# Authoritative list of every ``run_fusion`` setting that isn't a file path or
+# runtime object. The submit path records exactly these (under the same names)
+# and the restart path replays exactly these — so a re-run can never silently
+# substitute a default for a forgotten setting. Keep in sync with the
+# ``run_fusion`` signature and the ``run_config`` dict built at submit time.
+_FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
+    "buffer_meters",
+    "gvi_buffer_min_m",
+    "gvi_buffer_max_m",
+    "gvi_buffer_step_m",
+    "ndvi_buffer_min_m",
+    "ndvi_buffer_max_m",
+    "ndvi_buffer_step_m",
+    "ndvi_resolution_m",
+    "gvi_grid_spacing_m",
+    "n_bins",
+    "cache_metrics",
+    "test_size",
+    "objective_metric",
+    "ndvi_start_date",
+    "ndvi_end_date",
+    "ndvi_project_id",
+    "multi_objective_requested",
+    "target_display_name",
+    "resume_existing_study",
+    "cgi_formula",
+    "covariate_columns",
+    "standalone_channels",
+    "longitudinal_spec_payload",
+    "cgi_grid_spacing_m",
+    "whole_grid_scaling",
+    "area_balanced_split",
+    "n_bootstraps",
+    "n_trials_per_bootstrap",
+    "min_cell_count",
+    "check_collinearity",
+    "vif_threshold",
 )
 
 # Run-mode placeholder is encoded as None in session-state so the rest of the
@@ -1322,7 +1345,7 @@ def _render_study_details_panel(
                 "(raster target or no spare numeric columns)._"
             )
 
-    # ── Row 2: Objective metric + trials + optimizer ────────────────────
+    # ── Objective metric + test split + stratification bins ─────────────
     metric_options = list(_MIXEDLM_METRICS if is_longitudinal else _CROSS_METRICS)
     default_metric = metric_options[0]
     prior = st.session_state.get("fusion_objective_metric")
@@ -1335,47 +1358,12 @@ def _render_study_details_panel(
             "Objective metric",
             options=metric_options,
             key="fusion_objective_metric",
-            help="Quantity Optuna optimises per trial (maximised; RMSE minimised).",
+            help=(
+                "Quantity each stability-selection trial scores on its "
+                "out-of-bag rows (maximised; nrmse minimised)."
+            ),
         )
     with col_o2:
-        n_trials = st.number_input(
-            "Total trials",
-            min_value=50,
-            max_value=1000,
-            value=int(st.session_state.get("fusion_n_trials", 100)),
-            step=50,
-            key="fusion_n_trials",
-            help="Number of Optuna trials.",
-        )
-    with col_o3:
-        optimizer = st.selectbox(
-            "Optimizer",
-            options=["TPE", "CMA-ES", "Random"],
-            index=0,
-            key="fusion_optimizer",
-            help="Hyperparameter search sampler.",
-        )
-
-    # ── Row 3: startup, k-fold toggle + slider, test, bins ──────────────
-    col_s1, col_s2, col_s3, col_s4 = st.columns(4)
-    with col_s1:
-        n_startup_trials = st.number_input(
-            "Random startup trials",
-            min_value=10,
-            max_value=500,
-            value=int(st.session_state.get("fusion_n_startup", 50)),
-            step=10,
-            key="fusion_n_startup",
-            help="Uniformly random trials before the main sampler engages.",
-        )
-    with col_s2:
-        use_cv = st.checkbox(
-            "Use k-fold cross-validation",
-            value=bool(st.session_state.get("fusion_use_cv", True)),
-            key="fusion_use_cv",
-            help="On: k models per trial. Off: single train/val split, ~k× faster.",
-        )
-    with col_s4:
         test_size = st.slider(
             "Test set size",
             min_value=0.1,
@@ -1383,57 +1371,24 @@ def _render_study_details_panel(
             value=float(st.session_state.get("fusion_test_size", 0.25)),
             step=0.05,
             key="fusion_test_size",
-            help="Held-out evaluation fraction of the whole dataset.",
+            help=(
+                "Held-out evaluation fraction; the remainder is the train+val "
+                "pool that stability selection resamples."
+            ),
         )
-    k_folds = int(st.session_state.get("fusion_k_folds", 5))
-    with col_s3:
-        if use_cv:
-            k_folds = st.number_input(
-                "K-Fold CV",
-                min_value=3,
-                max_value=10,
-                value=int(st.session_state.get("fusion_k_folds", 5)),
-                key="fusion_k_folds",
-                help="CV folds on the non-test subset.",
-            )
-            val_size_whole = (1.0 - float(test_size)) / max(1, int(k_folds))
-        else:
-            val_default = float(st.session_state.get("fusion_val_size", 0.25))
-            val_size_whole = st.slider(
-                "Validation set size",
-                min_value=0.05,
-                max_value=0.5,
-                value=val_default,
-                step=0.05,
-                key="fusion_val_size",
-                help="Validation fraction of the whole dataset (single-split mode).",
-            )
-
-    col_info = st.columns(1)
-    with col_info[0]:
-        train_pct = max(0.0, 1.0 - float(test_size) - float(val_size_whole))
-        if use_cv:
-            st.caption(
-                f"_Test = {float(test_size)*100:.0f}% held out; "
-                f"remaining {(1.0 - float(test_size))*100:.0f}% is split "
-                f"into {int(k_folds)} folds "
-                f"(~{val_size_whole*100:.0f}% val + "
-                f"~{(train_pct)*100:.0f}% train per fold)._"
-            )
-        else:
-            st.caption(
-                f"_Train ≈ {train_pct*100:.0f}% · Val = "
-                f"{val_size_whole*100:.0f}% · Test = "
-                f"{float(test_size)*100:.0f}% of the whole dataset._"
-            )
-
-    n_bins = st.number_input(
-        "Stratification bins",
-        min_value=3,
-        max_value=10,
-        value=int(st.session_state.get("fusion_stratification_bins", 5)),
-        key="fusion_stratification_bins",
-        help="Quantile bins for the stratified train/test split.",
+    with col_o3:
+        n_bins = st.number_input(
+            "Stratification bins",
+            min_value=3,
+            max_value=10,
+            value=int(st.session_state.get("fusion_stratification_bins", 5)),
+            key="fusion_stratification_bins",
+            help="Quantile bins for the stratified train / test split.",
+        )
+    st.caption(
+        f"_Test = {float(test_size)*100:.0f}% held out · "
+        f"train+val pool = {(1.0 - float(test_size))*100:.0f}% "
+        "(resampled by stability selection)._"
     )
 
     # ── Longitudinal-only mixed-effects toggles ─────────────────────────
@@ -1473,6 +1428,88 @@ def _render_study_details_panel(
             help="Adds three single-metric Optuna studies alongside the combined CGI run.",
         )
 
+    # ── Channel collinearity check (iterative VIF) ──────────────────────
+    # Runs after pre-aggregation, before optimization. Drops channels
+    # whose pixel-level values are redundant with the others (high VIF).
+    # Dropped channels get pinned to weight 0 in every subsequent trial.
+    col_c1, col_c2 = st.columns([2, 1])
+    with col_c1:
+        check_collinearity = st.checkbox(
+            "Check channel collinearity (iterative VIF)",
+            value=bool(st.session_state.get("fusion_check_collinearity", False)),
+            key="fusion_check_collinearity",
+            help=(
+                "Computes pairwise Pearson + VIF on the per-pixel "
+                "veg / terrain / NDVI values across the CGI grid (20 k "
+                "random sample). Iteratively drops the highest-VIF "
+                "channel until all remaining VIFs are below threshold or "
+                "only one channel is left. Disabled channels are pinned "
+                "to weight 0 in every trial — saves optimizer budget and "
+                "produces a more interpretable winner."
+            ),
+        )
+    with col_c2:
+        vif_threshold_ui = st.number_input(
+            "VIF threshold",
+            min_value=2.0,
+            max_value=100.0,
+            value=float(st.session_state.get("fusion_vif_threshold", 10.0)),
+            step=1.0,
+            key="fusion_vif_threshold",
+            disabled=not check_collinearity,
+            help=(
+                "Rule of thumb: VIF > 5 moderate, > 10 severe, > 20 very "
+                "severe multicollinearity. 10 is the textbook default."
+            ),
+        )
+
+    # ── Stability selection ─────────────────────────────────────────────
+    # Tuning is done by bootstrap stability selection: B random-sampler
+    # studies on resamples of the train+val pool, scored on out-of-bag rows,
+    # picking the weight cell with the best worst-quantile OOB score.
+    st.markdown("**Stability selection**")
+    col_s1, col_s2, col_s3 = st.columns(3)
+    with col_s1:
+        n_bootstraps_ui = st.number_input(
+            "Bootstraps (B)",
+            min_value=5,
+            max_value=200,
+            value=int(st.session_state.get("fusion_n_bootstraps", 20)),
+            step=5,
+            key="fusion_n_bootstraps",
+            help=(
+                "Number of bootstrap resamples of the train+val pool. 20-50 "
+                "typical; raise for tighter cell counts."
+            ),
+        )
+    with col_s2:
+        n_trials_per_bootstrap_ui = st.number_input(
+            "Trials per bootstrap",
+            min_value=10,
+            max_value=500,
+            value=int(st.session_state.get("fusion_n_trials_per_bootstrap", 50)),
+            step=10,
+            key="fusion_n_trials_per_bootstrap",
+            help=(
+                "Random-sampler trials inside each bootstrap. 30-100 typical — "
+                "uniform coverage matters more than depth."
+            ),
+        )
+    with col_s3:
+        min_cell_count_ui = st.number_input(
+            "Min trials per cell",
+            min_value=1,
+            max_value=100,
+            value=int(st.session_state.get("fusion_min_cell_count", 3)),
+            step=1,
+            key="fusion_min_cell_count",
+            help=(
+                "A weight cell only competes for the worst-quantile ranking "
+                "if it holds at least this many trials across all bootstraps. "
+                "Rule of thumb: at least 10 for a stable quantile estimate."
+            ),
+        )
+
     # ── Polygon scoring (per-pixel CGI) ─────────────────────────────────
     cgi_grid_spacing_m = 50
     whole_grid_scaling = True
@@ -1506,13 +1543,7 @@ def _render_study_details_panel(
         "cgi_formula": cgi_formula,
         "covariate_columns": list(covariate_columns or []),
         "objective_metric": objective_metric,
-        "n_trials": int(n_trials),
-        "n_startup_trials": int(n_startup_trials),
-        "optimizer": optimizer,
-        "use_cv": bool(use_cv),
-        "k_folds": int(k_folds),
         "test_size": float(test_size),
-        "val_size": float(val_size_whole),
         "n_bins": int(n_bins),
         "mixedlm_random_slope": bool(mixedlm_random_slope),
         "mixedlm_time_fixed": bool(mixedlm_time_fixed),
@@ -1521,6 +1552,11 @@ def _render_study_details_panel(
         "cgi_grid_spacing_m": int(cgi_grid_spacing_m),
         "whole_grid_scaling": bool(whole_grid_scaling),
         "area_balanced_split": bool(area_balanced_split),
+        "n_bootstraps": int(n_bootstraps_ui),
+        "n_trials_per_bootstrap": int(n_trials_per_bootstrap_ui),
+        "min_cell_count": int(min_cell_count_ui),
+        "check_collinearity": bool(check_collinearity),
+        "vif_threshold": float(vif_threshold_ui),
     }
 
 
@@ -1582,6 +1618,97 @@ div[data-testid="stVerticalBlock"]:has(> div > div > div[data-fusion-results-anc
             unsafe_allow_html=True,
         )
         _render_fusion_results_body(output_dir)
+
+
+def _render_collinearity_report(results_view: dict) -> None:
+    """Show the iterative-VIF channel reduction report, if one was produced.
+
+    Reads ``results_view["collinearity_report"]`` and renders:
+    * Pairwise Pearson r between channels (3×3 matrix as a heatmap-styled table)
+    * VIF before / after each drop iteration
+    * Channels kept vs dropped
+    """
+    report = results_view.get("collinearity_report") or None
+    if not report:
+        return
+    try:
+        import pandas as _pd
+    except Exception:
+        return
+
+    st.divider()
+    st.markdown("**Channel collinearity check (iterative VIF)**")
+
+    channels = report.get("channels_in") or ["veg", "terrain", "ndvi"]
+    initial = report.get("initial_vifs") or []
+    final = report.get("final_vifs") or []
+    kept = report.get("kept") or []
+    dropped = report.get("dropped") or []
+    threshold = float(report.get("vif_threshold", 10.0))
+    n_sample = int(report.get("sample_size", 0))
+
+    summary_cols = st.columns(3)
+    with summary_cols[0]:
+        st.metric("VIF threshold", f"{threshold:.1f}")
+    with summary_cols[1]:
+        st.metric("Pixels sampled", f"{n_sample:,}")
+    with summary_cols[2]:
+        st.metric(
+            "Channels kept",
+            f"{len(kept)}/{len(channels)}",
+            delta=(
+                f"dropped: {', '.join(dropped)}" if dropped else "all retained"
+            ),
+            delta_color="off",
+        )
+
+    # Pairwise Pearson r heatmap.
+    pearson = report.get("pearson_matrix") or []
+    if pearson and len(pearson) == len(channels):
+        st.markdown("**Pairwise Pearson r**")
+        df_pearson = _pd.DataFrame(pearson, index=channels, columns=channels).round(3)
+        st.dataframe(df_pearson, width="stretch")
+        st.caption(
+            "Pairwise correlation on the sampled CGI grid pixels. "
+            "|r| > 0.85 is a common collinearity threshold; "
+            "|r| > 0.95 is near-perfect redundancy."
+        )
+
+    # VIFs before / after, side by side.
+    st.markdown("**VIF: before vs after reduction**")
+    rows: list[dict] = []
+    final_by_name = {kept[i]: final[i] for i in range(len(kept))} if final else {}
+    for ch, vif_in in zip(channels, initial):
+        rows.append(
+            {
+                "Channel": ch,
+                "Initial VIF": (
+                    round(float(vif_in), 3) if vif_in is not None else float("nan")
+                ),
+                "Status": "dropped" if ch in dropped else "kept",
+                "Final VIF": (
+                    round(float(final_by_name[ch]), 3)
+                    if ch in final_by_name
+                    else "—"
+                ),
+            }
+        )
+    st.dataframe(_pd.DataFrame(rows), width="stretch")
+
+    # Per-iteration drop history (only if anything was actually dropped).
+    iterations = report.get("iterations") or []
+    if iterations:
+        with st.expander(
+            f"Drop history ({len(iterations)} iteration(s))", expanded=False
+        ):
+            for i, it in enumerate(iterations, start=1):
+                st.write(f"**Iteration {i}** — removed `{it.get('removed', '?')}`")
+                before = it.get("vifs_before") or []
+                after = it.get("vifs_after") or []
+                st.caption(
+                    f"VIFs before: {[round(float(v), 2) for v in before]} → "
+                    f"after: {[round(float(v), 2) for v in after]}"
+                )
 
 
 def _render_covariate_impact(results_view: dict, metric_name: str) -> None:
@@ -1987,6 +2114,182 @@ def _render_composite_map_viewer(results_view: dict, engine) -> None:
     plt.close(fig)
 
 
+def _render_stability_diagnostics(
+    results_view: dict, averaged_params_raw: dict, metric_name: str
+) -> None:
+    """Diagnostics panel for bootstrap stability selection.
+
+    Surfaces the cell-aggregation outputs ``bootstrap_stability_selection``
+    writes to ``averaged_params_raw`` under ``__*__`` keys: the top-K cell
+    ranking (so the user can compare the winner to runners-up) and the
+    winning cell's empirical OOB-score distribution (so the user can see
+    where ``q_worst`` and ``median`` actually sit relative to the spread).
+
+    Returns silently if the diagnostics keys are missing (e.g. legacy
+    bundles or a failed run).
+    """
+    cell_stats = averaged_params_raw.get("__cell_stats__") or []
+    oob_scores = averaged_params_raw.get("__winning_cell_oob_scores__") or []
+    per_bs = averaged_params_raw.get("__per_bootstrap_summary__") or []
+    if not cell_stats and not oob_scores and not per_bs:
+        return
+
+    try:
+        import pandas as _pd
+        import plotly.express as _px
+    except Exception:
+        st.info("Plotly + pandas required for stability-selection diagnostics.")
+        return
+
+    st.divider()
+    st.markdown("**Stability selection diagnostics**")
+
+    higher_is_better = bool(
+        averaged_params_raw.get("__higher_is_better__", True)
+    )
+    worst_q = float(
+        averaged_params_raw.get("__worst_quantile__", 0.10)
+    )
+    direction_msg = (
+        f"Higher {metric_name} is better — `q_worst` is the {worst_q:.0%} "
+        "*lower* quantile of OOB scores in the cell."
+        if higher_is_better
+        else f"Lower {metric_name} is better — `q_worst` is the "
+        f"{1.0 - worst_q:.0%} *upper* quantile of OOB scores in the cell."
+    )
+    st.caption(direction_msg)
+    st.info(
+        "**How this paradigm differs from standard mode:**\n\n"
+        "* **No outer folds / no permutation p / no robust-trial browser**"
+        " — stability mode forces a single train/test split. Cross-resample"
+        " robustness is judged by the OOB-score distribution across "
+        "bootstraps, not by Fisher-combining per-fold p-values.\n"
+        "* **No Optuna plot explorer** — bootstrap studies are short "
+        "in-memory RandomSampler runs that get torn down between "
+        "iterations. The plots below replace them.\n"
+        "* **Train/Val/Test scores in the headline** — these *do* "
+        "populate after my latest fixes. `Train` = score on the full "
+        "train+val pool with the winning params; `Val` = winning cell's "
+        "median OOB score (the held-out signal during selection); "
+        "`Test` = score on the held-out test set with BCa CI.\n"
+        "* **Covariate impact panel** — works exactly the same in both "
+        "modes (no study dependency).\n\n"
+        "*Note*: results below come from new bookkeeping. If a panel is "
+        "still missing for a previous run, re-run the job."
+    )
+
+    # ── Top cells ranking ─────────────────────────────────────────────
+    if cell_stats:
+        st.markdown("**Top weight cells (ranked by `q_worst`)**")
+        rows: list[dict] = []
+        for rank, c in enumerate(cell_stats, start=1):
+            row: dict = {"Rank": rank}
+            for k, v in (c.get("weights") or {}).items():
+                # Strip ``_weight`` / ``w_`` for compact column headers.
+                short = k.removeprefix("w_").removesuffix("_weight").upper()
+                row[short] = int(v)
+            row["Count"] = int(c.get("count", 0))
+            row[f"q_worst {metric_name}"] = round(
+                float(c.get("q_worst", float("nan"))), 4
+            )
+            row[f"Median {metric_name}"] = round(
+                float(c.get("median", float("nan"))), 4
+            )
+            row["Selection prob."] = round(
+                float(c.get("selection_probability", float("nan"))), 3
+            )
+            rows.append(row)
+        st.dataframe(_pd.DataFrame(rows), width="stretch")
+        st.caption(
+            "Each row is a 10-percent weight bucket. **Count** = trials "
+            "across all bootstraps that landed in this bucket. "
+            "**Selection prob.** = fraction of bootstraps where the cell "
+            "appeared in the top-20% by OOB score. A winner with a tight "
+            "cluster of similar runners-up is more credible than an "
+            "isolated outlier."
+        )
+
+    # ── Winning cell OOB distribution ─────────────────────────────────
+    if oob_scores and len(oob_scores) >= 3:
+        st.markdown("**Winning-cell OOB score distribution**")
+        df_oob = _pd.DataFrame({f"OOB {metric_name}": list(oob_scores)})
+        fig = _px.histogram(
+            df_oob,
+            x=f"OOB {metric_name}",
+            nbins=min(30, max(5, len(oob_scores) // 3)),
+            opacity=0.85,
+        )
+        # Overlay vertical markers for q_worst and median so the user can
+        # see exactly what the cell-winner panel summarised.
+        q_w = float(averaged_params_raw.get("__cell_q_worst__", float("nan")))
+        med = float(averaged_params_raw.get("__cell_median__", float("nan")))
+        import numpy as _np
+
+        if _np.isfinite(q_w):
+            fig.add_vline(
+                x=q_w,
+                line_dash="dash",
+                line_color="red",
+                annotation_text=f"q_worst={q_w:.3f}",
+                annotation_position="top left",
+            )
+        if _np.isfinite(med):
+            fig.add_vline(
+                x=med,
+                line_dash="dot",
+                line_color="green",
+                annotation_text=f"median={med:.3f}",
+                annotation_position="top right",
+            )
+        fig.update_layout(
+            height=350,
+            margin={"l": 20, "r": 20, "t": 30, "b": 20},
+        )
+        st.plotly_chart(fig, width="stretch")
+        st.caption(
+            f"Each bar counts trials in the winning cell with that OOB "
+            f"{metric_name}. The closer `q_worst` sits to `median`, the "
+            "tighter the cell's distribution — i.e. the more consistently "
+            "the picked weights performed across bootstrap resamples."
+        )
+
+    # ── Per-bootstrap leaderboard (analogue of "per-fold" table) ──────
+    if per_bs:
+        st.markdown(
+            "**Per-bootstrap leaderboard** (one row per resample — analogue "
+            "of the per-fold table in standard mode)"
+        )
+        rows: list[dict] = []
+        for entry in per_bs:
+            row: dict = {
+                "Bootstrap": int(entry.get("bootstrap", -1)),
+                "Trials": int(entry.get("n_trials", 0)),
+                f"Top OOB {metric_name}": round(
+                    float(entry.get("top_oob", float("nan"))), 4
+                ),
+                f"Median OOB {metric_name}": round(
+                    float(entry.get("median_oob", float("nan"))), 4
+                ),
+                "OOB range": (
+                    f"[{float(entry.get('min_oob', float('nan'))):.3f}, "
+                    f"{float(entry.get('max_oob', float('nan'))):.3f}]"
+                ),
+            }
+            for k, v in (entry.get("top_params") or {}).items():
+                short = k.removeprefix("w_").removesuffix("_weight").upper()
+                row[short] = int(v) if v is not None else None
+            rows.append(row)
+        st.dataframe(_pd.DataFrame(rows), width="stretch")
+        st.caption(
+            "Each row is one bootstrap resample. **Top OOB** is the "
+            "highest-scoring trial in that bootstrap; the columns at the "
+            "right show that trial's weights. If a single set of weights "
+            "wins across many bootstraps, that's strong evidence the "
+            "winner cell is stable. Wide **OOB range** within a bootstrap "
+            "means the random sampler explored a varied space inside."
+        )
+
+
 def _render_optuna_plot_explorer(engine, results_view: dict, metric_name: str) -> None:
     """Live Optuna visualisation picker.
 
@@ -2200,40 +2503,153 @@ def _render_fusion_results_body(output_dir: str) -> None:
             return f"{p}{suffix} percentile"
         return "—"
 
+    # ── Held-out test score + CI · direction · CGI-vs-standalone AIC/BIC ─
+    test_ci = (results_view.get("test_results") or {}).get("test_ci") or {}
+    direction = results_view.get("direction_sign")
+    aic_bic = results_view.get("cgi_vs_standalone_aic_bic") or None
+
+    summary_cols = st.columns(3)
+    with summary_cols[0]:
+        obs = test_ci.get("observed")
+        lo = test_ci.get("lower")
+        hi = test_ci.get("upper")
+        if obs is not None:
+            ci_str = (
+                f"[{float(lo):.4f}, {float(hi):.4f}]"
+                if lo is not None and hi is not None
+                else "—"
+            )
+            st.metric(
+                f"Held-out test {metric_name}",
+                f"{float(obs):.4f}",
+                help=(
+                    "Stability-selection winning params scored on the untouched "
+                    f"test split. 95% percentile bootstrap CI: {ci_str}."
+                ),
+            )
+        else:
+            st.metric(f"Held-out test {metric_name}", "—")
+    with summary_cols[1]:
+        if direction is not None:
+            arrow = "↑ positive" if int(direction) > 0 else "↓ negative"
+            st.metric(
+                "Direction",
+                arrow,
+                help=(
+                    "Sign of the greenery↔outcome relationship — reported "
+                    "separately because distance correlation is unsigned."
+                ),
+            )
+        else:
+            st.metric("Direction", "—")
+    with summary_cols[2]:
+        if aic_bic and aic_bic.get("ok"):
+            d_bic = aic_bic.get("delta_bic")
+            st.metric(
+                "CGI vs best standalone",
+                str(aic_bic.get("verdict", "—")),
+                help=(
+                    "AIC/BIC of CGI (all channels) vs the best single channel "
+                    f"(`{aic_bic.get('best_channel')}`). "
+                    f"ΔBIC={float(d_bic):.1f} (positive favours CGI)."
+                ),
+            )
+        elif aic_bic is not None:
+            st.metric(
+                "CGI vs best standalone",
+                "inconclusive",
+                help=str(aic_bic.get("reason", "Comparison unavailable.")),
+            )
+        else:
+            st.metric(
+                "CGI vs best standalone",
+                "—",
+                help="Enable standalone studies to compare CGI against them.",
+            )
+    st.divider()
+
     # ── Row 1: formula · train/val/test (avg top-20%) · robust ratio ────
     subset_scores_view = results_view.get("subset_scores") or {}
 
-    def _subset_score(name: str) -> float | None:
+    def _subset_field(name: str, field: str) -> float | None:
         block = subset_scores_view.get(name) or {}
-        v = block.get("score")
+        v = block.get(field)
         try:
             return float(v) if v is not None else None
         except (TypeError, ValueError):
             return None
 
-    train_subset_score = _subset_score("train")
-    val_subset_score = _subset_score("val")
-    test_subset_score = _subset_score("test")
+    # Partial = covariate-adjusted (the optimizer's actual objective).
+    # Raw = plain correlation without covariate adjustment. When no
+    # covariates are configured, the two values are identical and the
+    # ``(raw)`` sub-line is suppressed for compactness.
+    has_covariates = bool(covariates_used)
+    train_partial = _subset_field("train", "score")
+    val_partial = _subset_field("val", "score")
+    test_partial = _subset_field("test", "score")
+    train_raw = _subset_field("train", "score_raw")
+    val_raw = _subset_field("val", "score_raw")
+    test_raw = _subset_field("test", "score_raw")
+
     formula_display = _FORMULA_DISPLAY.get(formula.name, formula.name.title())
 
     headline_cols = st.columns(5)
     with headline_cols[0]:
         st.metric("CGI Formula", formula_display)
-    for col, label, score in (
-        (headline_cols[1], "Train", train_subset_score),
-        (headline_cols[2], "Val", val_subset_score),
-        (headline_cols[3], "Test", test_subset_score),
+    for col, label, partial, raw in (
+        (headline_cols[1], "Train", train_partial, train_raw),
+        (headline_cols[2], "Val", val_partial, val_raw),
+        (headline_cols[3], "Test", test_partial, test_raw),
     ):
         with col:
-            if score is not None:
+            if partial is None:
+                st.metric(f"{label} {metric_name}", "—")
+            elif has_covariates and raw is not None:
+                # Surface BOTH the partial (covariate-adjusted) and raw
+                # correlation so the user can compare "what does CGI add
+                # over covariates?" with "what does CGI predict alone?".
+                delta = partial - raw
                 st.metric(
-                    f"{label} {metric_name} (avg top-20%)",
-                    f"{score:.4f}",
+                    f"{label} {metric_name} (partial)",
+                    f"{partial:.4f}",
+                    delta=f"raw {raw:.4f}",
+                    delta_color="off",
+                    help=(
+                        f"**Partial** = covariate-adjusted (optimizer's "
+                        f"actual objective). **Raw** = unadjusted "
+                        f"correlation between CGI and outcome. The gap "
+                        f"({delta:+.4f}) reflects how much of the "
+                        f"correlation is being lifted by the covariate-"
+                        f"residualisation step."
+                    ),
                 )
             else:
-                st.metric(f"{label} {metric_name} (avg top-20%)", "—")
+                st.metric(
+                    f"{label} {metric_name}",
+                    f"{partial:.4f}",
+                )
     with headline_cols[4]:
-        if results_view["robust_trials"]:
+        # Stability mode has no master Optuna study; the headline-trial
+        # bookkeeping lives on the cell-winner ``final_params`` dict that
+        # bootstrap_stability_selection populates.
+        if engine.study is None:
+            # Same gotcha as the cell-winner panel — these ``__*__`` keys
+            # live on the raw bundle dict, not the stripped ``final_params``
+            # the weights panel reads from.
+            n_total = int(averaged_params_raw.get("__n_total_trials__", 0))
+            n_cell = int(averaged_params_raw.get("__cell_count__", 0))
+            if n_total:
+                st.metric(
+                    "Cell trials",
+                    f"{n_cell}/{n_total}",
+                    help=(
+                        "Trials whose binned weights fell into the winning "
+                        "cell, over all bootstrap-OOB trials."
+                    ),
+                )
+            else:
+                st.metric("Cell trials", "—")
+        elif results_view["robust_trials"]:
             st.metric(
                 "Robust Trials",
                 f"{len(results_view['robust_trials'])}/{len(engine.study.trials)}",
@@ -2326,37 +2742,79 @@ def _render_fusion_results_body(output_dir: str) -> None:
     col_detail1, col_detail2 = st.columns(2)
 
     with col_detail1:
-        st.markdown("**Best Trial Details**")
-        best_trial = engine.study.best_trial
+        if engine.study is None:
+            # Stability mode: no single "best trial" — the cell-winner is
+            # an ensemble. The bookkeeping keys live on the **unfiltered**
+            # ``averaged_params_raw`` dict (``final_params`` strips every
+            # ``__*__`` key for the user-facing weights panel), so read
+            # from there.
+            st.markdown("**Cell-winner details (stability selection)**")
+            cell_info: dict = {
+                "Bootstraps run": int(
+                    averaged_params_raw.get("__n_bootstraps__", 0)
+                ),
+                "Trials per bootstrap": int(
+                    averaged_params_raw.get("__n_trials_per_bootstrap__", 0)
+                ),
+                "Total bootstrap trials": int(
+                    averaged_params_raw.get("__n_total_trials__", 0)
+                ),
+                "Trials in winning cell": int(
+                    averaged_params_raw.get("__cell_count__", 0)
+                ),
+                f"Cell q_worst {metric_name}": (
+                    f"{float(averaged_params_raw.get('__cell_q_worst__', float('nan'))):.4f}"
+                ),
+                f"Cell median {metric_name}": (
+                    f"{float(averaged_params_raw.get('__cell_median__', float('nan'))):.4f}"
+                ),
+                "Cell selection probability": (
+                    f"{float(averaged_params_raw.get('__cell_selection_probability__', float('nan'))):.2%}"
+                ),
+                "Worst quantile": (
+                    f"{float(averaged_params_raw.get('__worst_quantile__', float('nan'))):.2f}"
+                ),
+                "Buffer distance": f"{engine.buffer_meters}m",
+            }
+            if covariates_used:
+                cell_info["Covariates controlled"] = covariates_used
+            st.json(cell_info)
+        else:
+            st.markdown("**Best Trial Details**")
+            best_trial = engine.study.best_trial
 
-        info_data: dict = {
-            "Trial Number": best_trial.number,
-            "Buffer Distance": f"{engine.buffer_meters}m",
-        }
-        # Formula-driven weight + power dump, then shared spatial params,
-        # then the train/val scores + p-values.
-        for k in formula.weight_keys:
-            info_data[f"{k} (raw)"] = best_params.get(k, "N/A")
-        for k in formula.power_keys:
-            info_data[k] = best_params.get(k, "N/A")
-        for k in ("veg_radius", "terrain_radius", "ndvi_radius"):
-            info_data[k] = best_params.get(k, "N/A")
-        if covariates_used:
-            info_data["Covariates controlled"] = covariates_used
+            info_data: dict = {
+                "Trial Number": best_trial.number,
+                "Buffer Distance": f"{engine.buffer_meters}m",
+            }
+            # Formula-driven weight + power dump, then shared spatial params,
+            # then the train/val scores + p-values.
+            for k in formula.weight_keys:
+                info_data[f"{k} (raw)"] = best_params.get(k, "N/A")
+            for k in formula.power_keys:
+                info_data[k] = best_params.get(k, "N/A")
+            for k in ("veg_radius", "terrain_radius", "ndvi_radius"):
+                info_data[k] = best_params.get(k, "N/A")
+            if covariates_used:
+                info_data["Covariates controlled"] = covariates_used
 
-        info_data[f"Train {metric_name}"] = (
-            f"{best_trial.user_attrs.get('train_score_mean', 'N/A')}"
-        )
-        info_data[f"Val {metric_name}"] = (
-            f"{best_trial.user_attrs.get('val_score_mean', 'N/A')}"
-        )
+            info_data[f"Train {metric_name}"] = (
+                f"{best_trial.user_attrs.get('train_score_mean', 'N/A')}"
+            )
+            info_data[f"Val {metric_name}"] = (
+                f"{best_trial.user_attrs.get('val_score_mean', 'N/A')}"
+            )
 
-        if "train_pvalue" in best_trial.user_attrs:
-            info_data["Train p-value"] = f"{best_trial.user_attrs['train_pvalue']:.4e}"
-        if "val_pvalue" in best_trial.user_attrs:
-            info_data["Val p-value"] = f"{best_trial.user_attrs['val_pvalue']:.4e}"
+            if "train_pvalue" in best_trial.user_attrs:
+                info_data["Train p-value"] = (
+                    f"{best_trial.user_attrs['train_pvalue']:.4e}"
+                )
+            if "val_pvalue" in best_trial.user_attrs:
+                info_data["Val p-value"] = (
+                    f"{best_trial.user_attrs['val_pvalue']:.4e}"
+                )
 
-        st.json(info_data)
+            st.json(info_data)
 
     with col_detail2:
         averaged_params = results_view.get("averaged_params") or {}
@@ -2376,6 +2834,18 @@ def _render_fusion_results_body(output_dir: str) -> None:
                 )
         else:
             st.caption("_No averaged top-20% parameters were recorded for this run._")
+
+    # ── Stability-selection diagnostics ───────────────────────────────
+    # Shown only in stability mode. Two panels:
+    # 1. Top-K cell ranking — lets the user see whether the winner is in a
+    #    cluster of similar regions or an isolated outlier.
+    # 2. Winning cell's OOB-score distribution — shows q_worst, median,
+    #    and spread directly so the user can judge how stable the cell is
+    #    across resamples.
+    if engine.study is None:
+        _render_stability_diagnostics(
+            results_view, averaged_params_raw, metric_name
+        )
 
     # ── Interactive Optuna plot viewer ─────────────────────────────────
     # The user picks a plot type and (optionally) a study filter +
@@ -2633,6 +3103,9 @@ def _render_fusion_results_body(output_dir: str) -> None:
                                 row[value_pick] = round(fv, 4)
                         summary.append(row)
                 st.dataframe(pd.DataFrame(summary), width="stretch")
+
+    # ── Channel collinearity report ───────────────────────────────────
+    _render_collinearity_report(results_view)
 
     # ── Covariate impact panel ────────────────────────────────────────
     _render_covariate_impact(results_view, metric_name)
@@ -3126,21 +3599,22 @@ def render(output_dir: str) -> None:
     cgi_formula = study_state["cgi_formula"]
     covariate_columns = study_state["covariate_columns"]
     objective_metric = study_state["objective_metric"]
-    n_trials = study_state["n_trials"]
-    n_startup_trials = study_state["n_startup_trials"]
-    optimizer = study_state["optimizer"]
-    k_folds = study_state["k_folds"]
     test_size = study_state["test_size"]
-    val_size = study_state.get("val_size", 0.25)
     n_bins = study_state["n_bins"]
     resume_existing_study = study_state["resume_existing_study"]
     run_standalones = study_state["run_standalones"]
-    pruner_type = "none"  # UI removed; engine accepts NopPruner via "none"
     lon_random_slope = study_state["mixedlm_random_slope"]
     lon_include_time_fixed = study_state["mixedlm_time_fixed"]
     cgi_grid_spacing_m_param = study_state.get("cgi_grid_spacing_m")
     whole_grid_scaling_param = bool(study_state.get("whole_grid_scaling", False))
     area_balanced_split_param = bool(study_state.get("area_balanced_split", False))
+    n_bootstraps_param = int(study_state.get("n_bootstraps", 20))
+    n_trials_per_bootstrap_param = int(
+        study_state.get("n_trials_per_bootstrap", 50)
+    )
+    min_cell_count_param = int(study_state.get("min_cell_count", 3))
+    check_collinearity_param = bool(study_state.get("check_collinearity", False))
+    vif_threshold_param = float(study_state.get("vif_threshold", 10.0))
 
     # =========================================================================
     # Run controls and progress
@@ -3423,8 +3897,8 @@ def render(output_dir: str) -> None:
                 )
                 st.write(f"**Extent padding (m):** {buffer_extent_m}")
                 st.write(
-                    f"**Optimization:** {n_trials} trials, "
-                    f"{f'{k_folds}-fold CV' if k_folds > 1 else 'single split (no CV)'}, "
+                    f"**Stability selection:** {n_bootstraps_param} bootstraps × "
+                    f"{n_trials_per_bootstrap_param} trials, "
                     f"{test_size*100:.0f}% test set"
                 )
 
@@ -3442,44 +3916,73 @@ def render(output_dir: str) -> None:
                 else None
             )
 
+            # Canonical run configuration — every ``run_fusion`` setting that
+            # isn't a file path or runtime object. Recorded verbatim and
+            # replayed verbatim on restart (see ``_FUSION_RUN_CONFIG_KEYS`` /
+            # ``_submit_fusion_restart``) so a re-run can never silently fall
+            # back to a default for a forgotten setting.
+            run_config = {
+                "buffer_meters": float(buffer_extent_m),
+                "gvi_buffer_min_m": float(gvi_buffer_min_m),
+                "gvi_buffer_max_m": float(gvi_buffer_max_m),
+                "gvi_buffer_step_m": float(gvi_buffer_step_m),
+                "ndvi_buffer_min_m": float(ndvi_buffer_min_m),
+                "ndvi_buffer_max_m": float(ndvi_buffer_max_m),
+                "ndvi_buffer_step_m": float(ndvi_buffer_step_m),
+                "ndvi_resolution_m": ndvi_resolution_m,
+                "gvi_grid_spacing_m": gvi_grid_spacing_m,
+                "n_bins": int(n_bins),
+                "cache_metrics": bool(cache_metrics),
+                "test_size": float(test_size),
+                "objective_metric": objective_metric,
+                "ndvi_start_date": ndvi_auto_start.isoformat(),
+                "ndvi_end_date": ndvi_auto_end.isoformat(),
+                "ndvi_project_id": None,
+                "multi_objective_requested": fusion_multi_objective,
+                "target_display_name": target_display_name,
+                "resume_existing_study": resume_existing_study,
+                "cgi_formula": cgi_formula,
+                "covariate_columns": list(covariate_columns or []),
+                "standalone_channels": (
+                    ["veg", "terrain", "ndvi"] if run_standalones else []
+                ),
+                "longitudinal_spec_payload": longitudinal_spec_payload,
+                "cgi_grid_spacing_m": (
+                    int(cgi_grid_spacing_m_param)
+                    if cgi_grid_spacing_m_param is not None and is_polygon_target_ui
+                    else None
+                ),
+                "whole_grid_scaling": (
+                    whole_grid_scaling_param if is_polygon_target_ui else False
+                ),
+                "area_balanced_split": (
+                    area_balanced_split_param if is_polygon_target_ui else False
+                ),
+                "n_bootstraps": int(n_bootstraps_param),
+                "n_trials_per_bootstrap": int(n_trials_per_bootstrap_param),
+                "min_cell_count": int(min_cell_count_param),
+                "check_collinearity": bool(check_collinearity_param),
+                "vif_threshold": float(vif_threshold_param),
+            }
+            _missing = [k for k in _FUSION_RUN_CONFIG_KEYS if k not in run_config]
+            if _missing:
+                raise RuntimeError(
+                    f"run_config is missing keys {_missing}; refusing to submit a "
+                    "job whose settings wouldn't round-trip on restart."
+                )
+
             fusion_record = store.submit(
                 type="fusion",
                 name=os.path.splitext(target_display_name)[0],
                 params={
-                    "target_display_name": target_display_name,
+                    # Run settings — replayed verbatim on restart.
+                    **run_config,
+                    # File references + UI metadata — re-resolved on restart.
                     "is_vector_target": is_vector_target,
                     "outcome_columns": list(target_outcome_columns),
                     "target_band": job_target_band,
                     "target_layer": target_layer_for_engine,
                     "geometry_sha256": target_geom_sha,
-                    "n_trials": n_trials,
-                    "n_startup_trials": n_startup_trials,
-                    "objective_metric": objective_metric,
-                    "sampler_type": optimizer,
-                    "pruner_type": pruner_type,
-                    "multi_objective_requested": fusion_multi_objective,
-                    "resume_existing_study": resume_existing_study,
-                    "cgi_formula": cgi_formula,
-                    "covariate_columns": list(covariate_columns or []),
-                    "standalone_channels": (
-                        ["veg", "terrain", "ndvi"] if run_standalones else []
-                    ),
-                    "buffer_meters": float(buffer_extent_m),
-                    "gvi_buffer_min_m": float(gvi_buffer_min_m),
-                    "gvi_buffer_max_m": float(gvi_buffer_max_m),
-                    "gvi_buffer_step_m": float(gvi_buffer_step_m),
-                    "ndvi_buffer_min_m": float(ndvi_buffer_min_m),
-                    "ndvi_buffer_max_m": float(ndvi_buffer_max_m),
-                    "ndvi_buffer_step_m": float(ndvi_buffer_step_m),
-                    "ndvi_resolution_m": ndvi_resolution_m,
-                    "gvi_grid_spacing_m": gvi_grid_spacing_m,
-                    "n_bins": int(n_bins),
-                    "cache_metrics": bool(cache_metrics),
-                    "test_size": float(test_size),
-                    "val_size": float(val_size),
-                    "k_folds": int(k_folds),
-                    "ndvi_start_date": ndvi_auto_start.isoformat(),
-                    "ndvi_end_date": ndvi_auto_end.isoformat(),
                     "target_path": tmp_target_path,
                     "target_fingerprint": file_size_mtime_fingerprint(tmp_target_path),
                     # Canonical metric paths persisted under the UI-side
@@ -3491,18 +3994,6 @@ def render(output_dir: str) -> None:
                     "ndvi_fingerprint": file_size_mtime_fingerprint(ndvi_path),
                     "has_api_key": False,
                     "metric_mode": "Upload Files",
-                    "longitudinal_spec_payload": longitudinal_spec_payload,
-                    "cgi_grid_spacing_m": (
-                        int(cgi_grid_spacing_m_param)
-                        if cgi_grid_spacing_m_param is not None and is_polygon_target_ui
-                        else None
-                    ),
-                    "whole_grid_scaling": (
-                        whole_grid_scaling_param if is_polygon_target_ui else False
-                    ),
-                    "area_balanced_split": (
-                        area_balanced_split_param if is_polygon_target_ui else False
-                    ),
                 },
             )
             # Attach per-wave file fingerprints to the spec payload so the
@@ -3533,6 +4024,8 @@ def render(output_dir: str) -> None:
             executor.submit_runner(
                 fusion_record,
                 run_fusion,
+                # File / runtime args (re-resolved each run); the rest of the
+                # settings ride in verbatim via ``**run_config``.
                 target_path=tmp_target_path,
                 target_features_geojson=(
                     tuple(target_outcome_columns) if is_vector_target else ()
@@ -3541,44 +4034,11 @@ def render(output_dir: str) -> None:
                 target_layer=(target_layer_for_engine if is_vector_target else None),
                 target_cleanup_dir=(target_mat.cleanup_dir if target_mat else None),
                 target_cleanup_file=(target_mat.cleanup_file if target_mat else None),
-                buffer_meters=buffer_extent_m,
-                gvi_buffer_min_m=gvi_buffer_min_m,
-                gvi_buffer_max_m=gvi_buffer_max_m,
-                gvi_buffer_step_m=gvi_buffer_step_m,
-                ndvi_buffer_min_m=ndvi_buffer_min_m,
-                ndvi_buffer_max_m=ndvi_buffer_max_m,
-                ndvi_buffer_step_m=ndvi_buffer_step_m,
-                n_bins=n_bins,
                 veg_path=veg_path,
                 ndvi_path=ndvi_path,
-                test_size=test_size,
-                val_size=float(val_size),
-                k_folds=k_folds,
-                n_trials=n_trials,
-                n_startup_trials=n_startup_trials,
-                objective_metric=objective_metric,
-                sampler_type=optimizer,
                 output_dir=output_dir,
                 MetricFusionEngine=MetricFusionEngine,
-                target_display_name=target_display_name,
-                resume_existing_study=resume_existing_study,
-                cgi_formula=cgi_formula,
-                covariate_columns=list(covariate_columns or []),
-                standalone_channels=(
-                    ["veg", "terrain", "ndvi"] if run_standalones else []
-                ),
-                longitudinal_spec_payload=longitudinal_spec_payload,
-                cgi_grid_spacing_m=(
-                    float(cgi_grid_spacing_m_param)
-                    if cgi_grid_spacing_m_param is not None and is_polygon_target_ui
-                    else None
-                ),
-                whole_grid_scaling=(
-                    whole_grid_scaling_param if is_polygon_target_ui else False
-                ),
-                area_balanced_split=(
-                    area_balanced_split_param if is_polygon_target_ui else False
-                ),
+                **run_config,
             )
 
             st.success("✅ Fusion job started! Check sidebar for progress.")

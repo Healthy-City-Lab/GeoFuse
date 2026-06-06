@@ -37,7 +37,7 @@ Per-metric semantics
     greenery → lower blood pressure → negative coefficient).
 
 All four scores are higher-is-better for Optuna (``mixedlm_coef`` is the
-exception in spirit, but the engine optimises ``|coef|``-style magnitude
+exception in spirit, but the engine optimizes ``|coef|``-style magnitude
 by configuration; see :data:`HIGHER_IS_BETTER`). A MixedLM convergence
 failure, singular design, or input with no variance returns the
 degenerate value ``0.0`` so a bad trial fails soft instead of crashing.
@@ -168,12 +168,19 @@ def _fit_mixedlm(
     X: np.ndarray,
     groups: np.ndarray,
     exog_re: np.ndarray,
+    *,
+    reml: bool = True,
 ):
-    """Fit a MixedLM with REML+lbfgs, swallowing fit failures.
+    """Fit a MixedLM with lbfgs, swallowing fit failures.
 
     Returns the fitted result or ``None`` if anything went wrong (singular
     design, non-convergence, numerical failure). Callers map ``None`` to
     the metric's degenerate score so a bad trial doesn't kill the study.
+
+    ``reml=True`` (default) is the right estimator for variance components and
+    for the scoring metrics. AIC/BIC comparisons across models with **different
+    fixed effects** must pass ``reml=False`` — REML likelihoods aren't
+    comparable when the fixed-effects design changes.
     """
     from statsmodels.regression.mixed_linear_model import MixedLM
 
@@ -181,7 +188,7 @@ def _fit_mixedlm(
         model = MixedLM(endog=outcome, exog=X, groups=groups, exog_re=exog_re)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            result = model.fit(method="lbfgs", reml=True)
+            result = model.fit(method="lbfgs", reml=reml)
         if result is None:
             return None
         # Some statsmodels versions surface convergence via ``.converged``.
@@ -362,3 +369,106 @@ def score_mixedlm(
 
     score = all_metrics[metric]
     return (score, pval) if return_pvalue else score
+
+
+# ---------------------------------------------------------------------------
+# Penalized model comparison (CGI vs best standalone channel) — longitudinal
+# ---------------------------------------------------------------------------
+
+
+def compare_models_aic_bic_mixedlm(
+    outcome: np.ndarray,
+    channel_matrix: np.ndarray,
+    channel_names: list[str],
+    best_channel_idx: int,
+    entity_id: np.ndarray,
+    years_since_baseline: np.ndarray,
+    covariates: np.ndarray | None = None,
+    *,
+    include_time_fixed: bool = True,
+    random_slope: bool = True,
+) -> dict:
+    """AIC/BIC comparison of a full multi-channel MixedLM vs the best single channel.
+
+    The longitudinal analogue of
+    :func:`geofuse.objective_scoring.compare_models_aic_bic`. Fits two mixed
+    models with the same random-effects structure used for scoring:
+
+    * **full** — ``outcome ~ all channels + covariates [+ time] + (RE | entity)``
+    * **reduced** — ``outcome ~ best channel + covariates [+ time] + (RE | entity)``
+
+    Returns the same dict shape, with ``delta_*`` = reduced − full (positive
+    favours the full CGI model). On a fit failure or non-finite criterion the
+    result is ``{"ok": False, ...}`` so the caller can fall back gracefully.
+    """
+    y = np.asarray(outcome, dtype=np.float64).ravel()
+    X = np.asarray(channel_matrix, dtype=np.float64)
+    t = np.asarray(years_since_baseline, dtype=np.float64).ravel()
+    cov = _coerce_2d(covariates)
+
+    if X.ndim != 2 or X.shape[1] != len(channel_names):
+        raise ValueError("channel_matrix shape must match channel_names length.")
+    if not (0 <= best_channel_idx < X.shape[1]):
+        raise ValueError(f"best_channel_idx {best_channel_idx} out of range.")
+
+    eids = np.asarray(entity_id)
+    mask = (
+        np.isfinite(y)
+        & np.isfinite(X).all(axis=1)
+        & np.isfinite(t)
+        & ~_entity_missing_mask(eids)
+    )
+    if cov is not None:
+        mask &= np.isfinite(cov).all(axis=1)
+    y, X, t, eids = y[mask], X[mask], t[mask], eids[mask]
+    cov = None if cov is None else cov[mask]
+
+    fail = {
+        "ok": False,
+        "channel_names": list(channel_names),
+        "best_channel": channel_names[best_channel_idx],
+    }
+    if len(y) < _MIN_ROWS or len(np.unique(eids)) < 2:
+        return {**fail, "reason": "too few rows / entities for a MixedLM comparison"}
+
+    def _fixed(cols: np.ndarray) -> np.ndarray:
+        parts: list[np.ndarray] = [np.ones((len(y), 1)), cols]
+        if cov is not None and cov.shape[1] > 0:
+            parts.append(cov)
+        if include_time_fixed:
+            parts.append(t.reshape(-1, 1))
+        return np.hstack(parts)
+
+    # ML (not REML) so the two fixed-effects structures are comparable.
+    exog_re = _build_re_design(t, random_slope=random_slope)
+    full = _fit_mixedlm(y, _fixed(X), eids, exog_re, reml=False)
+    reduced = _fit_mixedlm(
+        y, _fixed(X[:, [best_channel_idx]]), eids, exog_re, reml=False
+    )
+    if full is None or reduced is None:
+        return {**fail, "reason": "MixedLM fit did not converge"}
+
+    try:
+        aic_full, bic_full = float(full.aic), float(full.bic)
+        aic_reduced, bic_reduced = float(reduced.aic), float(reduced.bic)
+    except Exception:
+        return {**fail, "reason": "AIC/BIC unavailable from the fitted model"}
+    if not all(np.isfinite([aic_full, bic_full, aic_reduced, bic_reduced])):
+        return {**fail, "reason": "non-finite AIC/BIC"}
+
+    from .objective_scoring import _verdict_from_delta_bic
+
+    delta_bic = bic_reduced - bic_full
+    return {
+        "ok": True,
+        "channel_names": list(channel_names),
+        "best_channel": channel_names[best_channel_idx],
+        "aic_full": aic_full,
+        "bic_full": bic_full,
+        "aic_reduced": aic_reduced,
+        "bic_reduced": bic_reduced,
+        "delta_aic": float(aic_reduced - aic_full),
+        "delta_bic": float(delta_bic),
+        "n": int(len(y)),
+        "verdict": _verdict_from_delta_bic(delta_bic),
+    }
