@@ -7278,25 +7278,44 @@ class MetricFusionEngine:
 
         logger.info(f"✓ Composite greenery map saved: {output_path}")
 
-        # Save parameters used. The double-underscore book-keeping keys
-        # carry the trial counts; everything else is the user-facing
-        # averaged params.
+        # Save parameters used. The double-underscore book-keeping keys carry
+        # the selection diagnostics; everything else is the user-facing final
+        # params the composite was built from. The recorded provenance adapts
+        # to the selection path: stability selection reports the winning-cell
+        # diagnostics, the legacy averaging path reports the trial counts.
         params_path = output_path.replace(".tif", "_params.json")
         import json
 
         clean_params = {k: v for k, v in final_params.items() if not k.startswith("__")}
+        if self.study is None:
+            provenance = {
+                "selection_method": "bootstrap_stability_selection",
+                "cell_q_worst": final_params.get("__cell_q_worst__"),
+                "cell_median": final_params.get("__cell_median__"),
+                "cell_count": final_params.get("__cell_count__"),
+                "cell_selection_probability": final_params.get(
+                    "__cell_selection_probability__"
+                ),
+                "worst_quantile": final_params.get("__worst_quantile__"),
+                "n_bootstraps": final_params.get("__n_bootstraps__"),
+                "n_trials_per_bootstrap": final_params.get(
+                    "__n_trials_per_bootstrap__"
+                ),
+                "n_total_trials": final_params.get("__n_total_trials__"),
+            }
+        else:
+            provenance = {
+                "selection_method": "averaged_top_robust_trials",
+                "n_trials_averaged": int(final_params.get("__n_top_trials__", 0)),
+                "total_robust_trials": int(final_params.get("__n_robust_trials__", 0)),
+                "top_percent": top_percent,
+            }
         with open(params_path, "w") as f:
             json.dump(
-                {
-                    "final_parameters": clean_params,
-                    "n_trials_averaged": int(final_params.get("__n_top_trials__", 0)),
-                    "total_robust_trials": int(
-                        final_params.get("__n_robust_trials__", 0)
-                    ),
-                    "top_percent": top_percent,
-                },
+                {"final_parameters": clean_params, **provenance},
                 f,
                 indent=2,
+                default=str,
             )
 
         logger.info(f"✓ Parameters saved: {params_path}")

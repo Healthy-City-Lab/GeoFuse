@@ -1720,7 +1720,7 @@ def _render_covariate_impact(results_view: dict, metric_name: str) -> None:
     st.divider()
     st.markdown("**Covariate impact**")
     st.caption(
-        "Two OLS models fit on the full dataset using the averaged top-20 % "
+        "Two OLS models fit on the full dataset using the stability-selected "
         "params: **Full** = `target ~ CGI + covariates`, **CGI-only** = "
         "`target ~ CGI`. Coefficients show each covariate's effect direction "
         "and magnitude in the full model; partial R² is the variance only "
@@ -1775,159 +1775,6 @@ def _render_covariate_impact(results_view: dict, metric_name: str) -> None:
         st.plotly_chart(fig, width="stretch")
     except Exception:
         pass
-
-
-def _render_trial_distribution_viewer(
-    results_view: dict, engine, metric_name: str, standalones: dict
-) -> None:
-    """Box-plot CI viewer for per-trial objective values.
-
-    Lets the user pick studies, trial pools (all / robust), and subsets
-    (train / val / test if recorded per trial) to compare distributions
-    side-by-side. Pulls train/val from each trial's CV-fold means stored
-    in ``user_attrs`` and test from the trial-level test attr (when
-    present); skips subsets that aren't recorded per trial.
-    """
-    study = getattr(engine, "study", None)
-    if study is None or not study.trials:
-        return
-
-    st.divider()
-    st.markdown("**Per-trial objective distributions**")
-    st.caption(
-        "Distributions are built from per-trial CV-fold means recorded on "
-        "every trial. **test** is computed only for the robust trial set "
-        "(per-trial test scoring is expensive), so the test box will hold "
-        "≤ robust-trial-count points even when the **all completed** pool "
-        "is selected."
-    )
-
-    try:
-        import optuna as _optuna
-        import plotly.express as _px
-    except Exception:
-        st.info("Plotly + Optuna required for the distribution viewer.")
-        return
-
-    # ── Selectors ─────────────────────────────────────────────────────
-    study_labels: list[tuple[str, dict, Any]] = [
-        ("CGI (combined)", results_view, study)
-    ]
-    for ch_key, ch_bundle in (standalones or {}).items():
-        study_labels.append(
-            (f"{_CHANNEL_DISPLAY.get(ch_key, ch_key)} (standalone)", ch_bundle, None)
-        )
-
-    sel_cols = st.columns([2, 1, 1])
-    with sel_cols[0]:
-        picked_studies = st.multiselect(
-            "Studies",
-            options=[lbl for lbl, _, _ in study_labels],
-            default=[study_labels[0][0]],
-            key="fusion_distrib_studies",
-        )
-    with sel_cols[1]:
-        pool_pick = st.selectbox(
-            "Trial pool",
-            options=["robust", "all completed"],
-            key="fusion_distrib_pool",
-        )
-    with sel_cols[2]:
-        subset_picks = st.multiselect(
-            "Subsets",
-            options=["train", "val", "test"],
-            default=["train", "val"],
-            key="fusion_distrib_subsets",
-        )
-
-    if not picked_studies or not subset_picks:
-        st.info("Pick at least one study and one subset.")
-        return
-
-    # ── Build the long-format dataframe ───────────────────────────────
-    rows: list[dict] = []
-    for lbl in picked_studies:
-        bundle = next(b for l, b, _ in study_labels if l == lbl)
-        if lbl.startswith("CGI"):
-            trial_pool = (
-                bundle.get("robust_trials") or []
-                if pool_pick == "robust"
-                else [
-                    t
-                    for t in study.trials
-                    if t.state == _optuna.trial.TrialState.COMPLETE
-                ]
-            )
-        else:
-            # Standalones are scored in a separate study and the engine
-            # is rebound to CGI before results are returned, so the
-            # runner snapshots all completed trials into the bundle for
-            # the "all completed" pool.
-            trial_pool = (
-                bundle.get("robust_trials") or []
-                if pool_pick == "robust"
-                else bundle.get("all_completed_trials")
-                or bundle.get("robust_trials")
-                or []
-            )
-
-        # ``FrozenTrial.set_user_attr`` only mutates the in-memory copy;
-        # for test scores the runner also writes a sidecar dict keyed by
-        # ``trial.number`` so the value survives a fresh materialisation
-        # of ``study.trials`` from storage.
-        per_trial_test = bundle.get("per_trial_test") or {}
-        for t in trial_pool:
-            for subset in subset_picks:
-                v: float | None = None
-                if subset == "train":
-                    v = t.user_attrs.get("train_score_mean")
-                elif subset == "val":
-                    v = t.user_attrs.get("val_score_mean")
-                elif subset == "test":
-                    rec = per_trial_test.get(int(t.number))
-                    if rec is not None:
-                        v = rec.get("test_score")
-                    if v is None:
-                        v = t.user_attrs.get("test_score")
-                if v is None:
-                    continue
-                try:
-                    fv = float(v)
-                except (TypeError, ValueError):
-                    continue
-                rows.append(
-                    {
-                        "Study": lbl,
-                        "Subset": subset,
-                        "Value": fv,
-                    }
-                )
-
-    if not rows:
-        st.info("No matching per-trial values were recorded for this selection.")
-        return
-
-    df = pd.DataFrame(rows)
-    fig = _px.box(
-        df,
-        x="Study",
-        y="Value",
-        color="Subset",
-        points="outliers",
-        title=f"Per-trial {metric_name} distributions ({pool_pick} trials)",
-    )
-    fig.update_layout(margin=dict(l=60, r=20, t=60, b=80))
-    st.plotly_chart(fig, width="stretch")
-
-    # Summary stats per (Study, Subset) for users who want exact numbers.
-    with st.expander("Show distribution stats", expanded=False):
-        stats = (
-            df.groupby(["Study", "Subset"])["Value"]
-            .agg(["count", "mean", "std", "min", "max"])
-            .round(4)
-            .reset_index()
-        )
-        st.dataframe(stats, width="stretch")
 
 
 def _render_composite_map_viewer(results_view: dict, engine) -> None:
@@ -2114,23 +1961,46 @@ def _render_composite_map_viewer(results_view: dict, engine) -> None:
     plt.close(fig)
 
 
-def _render_stability_diagnostics(
-    results_view: dict, averaged_params_raw: dict, metric_name: str
-) -> None:
-    """Diagnostics panel for bootstrap stability selection.
+def _direction_badge(direction: object) -> str:
+    """Human label for a ``+1`` / ``-1`` greenery↔outcome direction sign."""
+    if direction is None:
+        return "—"
+    try:
+        return "↑ positive" if int(direction) > 0 else "↓ negative"
+    except (TypeError, ValueError):
+        return "—"
 
-    Surfaces the cell-aggregation outputs ``bootstrap_stability_selection``
-    writes to ``averaged_params_raw`` under ``__*__`` keys: the top-K cell
-    ranking (so the user can compare the winner to runners-up) and the
-    winning cell's empirical OOB-score distribution (so the user can see
-    where ``q_worst`` and ``median`` actually sit relative to the spread).
 
-    Returns silently if the diagnostics keys are missing (e.g. legacy
-    bundles or a failed run).
+def _agg_label(stat: str | None, percentile: int | float | None) -> str:
+    """Pretty aggregator label (Mean / Median / Nth percentile)."""
+    if stat == "mean":
+        return "Mean"
+    if stat == "median":
+        return "Median"
+    if stat == "percentile":
+        try:
+            p = int(round(float(percentile)))
+        except (TypeError, ValueError):
+            return "Percentile"
+        suffix = "th"
+        if p % 100 not in (11, 12, 13):
+            suffix = {1: "st", 2: "nd", 3: "rd"}.get(p % 10, "th")
+        return f"{p}{suffix} percentile"
+    return "—"
+
+
+def _render_stability_diagnostics(summary: dict, metric_name: str) -> None:
+    """Diagnostics panel for one study's bootstrap stability selection.
+
+    Reads the cell-aggregation outputs ``bootstrap_stability_selection``
+    records (surfaced on each study's ``stability_summary`` bundle): the
+    ranked weight cells, the winning cell's empirical OOB-score
+    distribution, and the per-bootstrap leaderboard. Returns silently when
+    none are present.
     """
-    cell_stats = averaged_params_raw.get("__cell_stats__") or []
-    oob_scores = averaged_params_raw.get("__winning_cell_oob_scores__") or []
-    per_bs = averaged_params_raw.get("__per_bootstrap_summary__") or []
+    cell_stats = summary.get("cell_stats") or []
+    oob_scores = summary.get("winning_cell_oob_scores") or []
+    per_bs = summary.get("per_bootstrap_summary") or []
     if not cell_stats and not oob_scores and not per_bs:
         return
 
@@ -2141,15 +2011,8 @@ def _render_stability_diagnostics(
         st.info("Plotly + pandas required for stability-selection diagnostics.")
         return
 
-    st.divider()
-    st.markdown("**Stability selection diagnostics**")
-
-    higher_is_better = bool(
-        averaged_params_raw.get("__higher_is_better__", True)
-    )
-    worst_q = float(
-        averaged_params_raw.get("__worst_quantile__", 0.10)
-    )
+    higher_is_better = bool(summary.get("higher_is_better", True))
+    worst_q = float(summary.get("worst_quantile") or 0.10)
     direction_msg = (
         f"Higher {metric_name} is better — `q_worst` is the {worst_q:.0%} "
         "*lower* quantile of OOB scores in the cell."
@@ -2158,25 +2021,6 @@ def _render_stability_diagnostics(
         f"{1.0 - worst_q:.0%} *upper* quantile of OOB scores in the cell."
     )
     st.caption(direction_msg)
-    st.info(
-        "**How this paradigm differs from standard mode:**\n\n"
-        "* **No outer folds / no permutation p / no robust-trial browser**"
-        " — stability mode forces a single train/test split. Cross-resample"
-        " robustness is judged by the OOB-score distribution across "
-        "bootstraps, not by Fisher-combining per-fold p-values.\n"
-        "* **No Optuna plot explorer** — bootstrap studies are short "
-        "in-memory RandomSampler runs that get torn down between "
-        "iterations. The plots below replace them.\n"
-        "* **Train/Val/Test scores in the headline** — these *do* "
-        "populate after my latest fixes. `Train` = score on the full "
-        "train+val pool with the winning params; `Val` = winning cell's "
-        "median OOB score (the held-out signal during selection); "
-        "`Test` = score on the held-out test set with BCa CI.\n"
-        "* **Covariate impact panel** — works exactly the same in both "
-        "modes (no study dependency).\n\n"
-        "*Note*: results below come from new bookkeeping. If a panel is "
-        "still missing for a previous run, re-run the job."
-    )
 
     # ── Top cells ranking ─────────────────────────────────────────────
     if cell_stats:
@@ -2185,7 +2029,6 @@ def _render_stability_diagnostics(
         for rank, c in enumerate(cell_stats, start=1):
             row: dict = {"Rank": rank}
             for k, v in (c.get("weights") or {}).items():
-                # Strip ``_weight`` / ``w_`` for compact column headers.
                 short = k.removeprefix("w_").removesuffix("_weight").upper()
                 row[short] = int(v)
             row["Count"] = int(c.get("count", 0))
@@ -2219,13 +2062,9 @@ def _render_stability_diagnostics(
             nbins=min(30, max(5, len(oob_scores) // 3)),
             opacity=0.85,
         )
-        # Overlay vertical markers for q_worst and median so the user can
-        # see exactly what the cell-winner panel summarised.
-        q_w = float(averaged_params_raw.get("__cell_q_worst__", float("nan")))
-        med = float(averaged_params_raw.get("__cell_median__", float("nan")))
-        import numpy as _np
-
-        if _np.isfinite(q_w):
+        q_w = float(summary.get("q_worst", float("nan")) or float("nan"))
+        med = float(summary.get("median", float("nan")) or float("nan"))
+        if np.isfinite(q_w):
             fig.add_vline(
                 x=q_w,
                 line_dash="dash",
@@ -2233,7 +2072,7 @@ def _render_stability_diagnostics(
                 annotation_text=f"q_worst={q_w:.3f}",
                 annotation_position="top left",
             )
-        if _np.isfinite(med):
+        if np.isfinite(med):
             fig.add_vline(
                 x=med,
                 line_dash="dot",
@@ -2253,15 +2092,14 @@ def _render_stability_diagnostics(
             "the picked weights performed across bootstrap resamples."
         )
 
-    # ── Per-bootstrap leaderboard (analogue of "per-fold" table) ──────
+    # ── Per-bootstrap leaderboard ─────────────────────────────────────
     if per_bs:
         st.markdown(
-            "**Per-bootstrap leaderboard** (one row per resample — analogue "
-            "of the per-fold table in standard mode)"
+            "**Per-bootstrap leaderboard** (one row per resample)"
         )
-        rows: list[dict] = []
+        rows = []
         for entry in per_bs:
-            row: dict = {
+            row = {
                 "Bootstrap": int(entry.get("bootstrap", -1)),
                 "Trials": int(entry.get("n_trials", 0)),
                 f"Top OOB {metric_name}": round(
@@ -2282,155 +2120,407 @@ def _render_stability_diagnostics(
         st.dataframe(_pd.DataFrame(rows), width="stretch")
         st.caption(
             "Each row is one bootstrap resample. **Top OOB** is the "
-            "highest-scoring trial in that bootstrap; the columns at the "
-            "right show that trial's weights. If a single set of weights "
-            "wins across many bootstraps, that's strong evidence the "
-            "winner cell is stable. Wide **OOB range** within a bootstrap "
-            "means the random sampler explored a varied space inside."
+            "highest-scoring trial in that bootstrap; the right-hand columns "
+            "show that trial's weights. If one set of weights wins across "
+            "many bootstraps, that's strong evidence the winner is stable."
         )
 
 
-def _render_optuna_plot_explorer(engine, results_view: dict, metric_name: str) -> None:
-    """Live Optuna visualisation picker.
+def _render_results_headline(results_view: dict, metric_name: str) -> None:
+    """At-a-glance CGI bottom line: test score + CI, direction, AIC/BIC verdict."""
+    test_ci = (results_view.get("test_results") or {}).get("test_ci") or {}
+    direction = results_view.get("direction_sign")
+    aic_bic = results_view.get("cgi_vs_standalone_aic_bic") or None
 
-    Renders all standard ``optuna.visualization`` plots from the in-memory
-    study. The user picks the plot type, the trial pool (all completed
-    trials vs the robust subset), and — when applicable — the parameter
-    axes. Returns silently if the engine doesn't carry a study (e.g.
-    legacy bundles).
+    cols = st.columns(3)
+    with cols[0]:
+        obs = test_ci.get("observed")
+        lo = test_ci.get("lower")
+        hi = test_ci.get("upper")
+        if obs is None:
+            obs = (results_view.get("test_results") or {}).get("test_score")
+        if obs is not None:
+            ci_str = (
+                f"[{float(lo):.4f}, {float(hi):.4f}]"
+                if lo is not None and hi is not None
+                else "—"
+            )
+            st.metric(
+                f"CGI held-out test {metric_name}",
+                f"{float(obs):.4f}",
+                help=(
+                    "Stability-selection winning params scored on the untouched "
+                    f"test split. 95% percentile bootstrap CI: {ci_str}."
+                ),
+            )
+        else:
+            st.metric(f"CGI held-out test {metric_name}", "—")
+    with cols[1]:
+        st.metric(
+            "Direction (greenery↔outcome)",
+            _direction_badge(direction),
+            help=(
+                "Sign of the greenery↔outcome relationship — reported "
+                "separately because distance correlation is unsigned. A "
+                "positive sign means the composite rises with the outcome."
+            ),
+        )
+    with cols[2]:
+        if aic_bic and aic_bic.get("ok"):
+            d_bic = aic_bic.get("delta_bic")
+            st.metric(
+                "CGI vs best standalone",
+                str(aic_bic.get("verdict", "—")),
+                help=(
+                    "AIC/BIC of CGI (all channels) vs the best single channel "
+                    f"(`{aic_bic.get('best_channel')}`). "
+                    f"ΔBIC={float(d_bic):.1f} (positive favours CGI)."
+                ),
+            )
+        elif aic_bic is not None:
+            st.metric(
+                "CGI vs best standalone",
+                "inconclusive",
+                help=str(aic_bic.get("reason", "Comparison unavailable.")),
+            )
+        else:
+            st.metric(
+                "CGI vs best standalone",
+                "—",
+                help="Enable standalone studies to compare CGI against them.",
+            )
+
+
+def _render_study_detail(
+    study_view: dict,
+    engine,
+    formula,
+    metric_name: str,
+    study_key: str,
+    covariates_used: list[str],
+) -> None:
+    """Full detail for one study (CGI or a standalone channel).
+
+    Renders: test score + CI / direction / n tiles · the winning params
+    (weights + radii + aggregators, formula-aware; standalones show their
+    single active channel) · per-subset scores (train / val / test / all) ·
+    the final params JSON · and the stability-selection diagnostics.
     """
-    study = getattr(engine, "study", None)
-    if study is None:
-        return
+    averaged_raw = study_view.get("averaged_params") or {}
+    best_params = study_view.get("best_params") or {}
+    final_params = {
+        k: v for k, v in averaged_raw.items() if not str(k).startswith("__")
+    } or {k: v for k, v in best_params.items() if not str(k).startswith("__")}
+    summary = study_view.get("stability_summary") or {}
+    test_res = study_view.get("test_results") or {}
+    test_ci = test_res.get("test_ci") or {}
+    subset_scores = study_view.get("subset_scores") or {}
+    has_covariates = bool(covariates_used)
+    is_cgi = study_key == "cgi"
 
-    try:
-        import optuna as _optuna
-        from optuna.visualization import (
-            plot_contour,
-            plot_edf,
-            plot_optimization_history,
-            plot_parallel_coordinate,
-            plot_param_importances,
-            plot_rank,
-            plot_slice,
-            plot_timeline,
-        )
-    except Exception:
-        return
+    # ── Tiles: test score + CI · direction · n ────────────────────────
+    tile_cols = st.columns(3)
+    with tile_cols[0]:
+        obs = test_ci.get("observed")
+        if obs is None:
+            obs = test_res.get("test_score")
+        lo, hi = test_ci.get("lower"), test_ci.get("upper")
+        if obs is not None:
+            ci_str = (
+                f"95% CI [{float(lo):.4f}, {float(hi):.4f}]"
+                if lo is not None and hi is not None
+                else "no CI"
+            )
+            st.metric(
+                f"Test {metric_name}",
+                f"{float(obs):.4f}",
+                delta=ci_str,
+                delta_color="off",
+            )
+        else:
+            st.metric(f"Test {metric_name}", "—")
+    with tile_cols[1]:
+        st.metric("Direction", _direction_badge(study_view.get("direction_sign")))
+    with tile_cols[2]:
+        test_n = (subset_scores.get("test") or {}).get("n")
+        st.metric("Test entities (n)", f"{int(test_n)}" if test_n else "—")
 
-    completed = [
-        t for t in study.trials if t.state == _optuna.trial.TrialState.COMPLETE
-    ]
-    if not completed:
-        return
+    # ── Winning params ────────────────────────────────────────────────
+    if is_cgi:
+        if formula.name == _cgi_formulas.WEIGHTED_AVERAGE:
+            st.markdown("**Weights (stability-selected)**")
+            weight_cols = st.columns(len(formula.weight_keys))
+            total_weight = sum(
+                float(final_params.get(k, 0)) for k in formula.weight_keys
+            )
+            for col, key in zip(weight_cols, formula.weight_keys):
+                ch = key.removesuffix("_weight")
+                label = _CHANNEL_DISPLAY.get(ch, ch.upper())
+                pct = (
+                    100.0 * float(final_params.get(key, 0)) / total_weight
+                    if total_weight > 0
+                    else 0.0
+                )
+                with col:
+                    st.metric(label, f"{pct:.1f}%")
+        else:
+            st.markdown("**Weights and powers (stability-selected)**")
+            all_keys = list(formula.weight_keys) + list(formula.power_keys)
+            groups = [all_keys[i : i + 4] for i in range(0, len(all_keys), 4)]
+            for group in groups:
+                cols = st.columns(len(group))
+                for col, key in zip(cols, group):
+                    val = float(final_params.get(key, 0))
+                    if key in formula.power_keys:
+                        pretty = key.removesuffix("_power").upper() + " power"
+                        with col:
+                            st.metric(pretty, f"{val:.2f}")
+                    else:
+                        pretty = key.removeprefix("w_").replace("_", "·").upper() + " %"
+                        with col:
+                            st.metric(pretty, f"{val:.1f}")
 
-    robust_trials = results_view.get("robust_trials") or []
+        st.markdown("**Radii (m)**")
+        radii_cols = st.columns(3)
+        for col, key in zip(
+            radii_cols, ("veg_radius", "terrain_radius", "ndvi_radius")
+        ):
+            ch = key.removesuffix("_radius")
+            label = _CHANNEL_DISPLAY.get(ch, ch.upper())
+            with col:
+                try:
+                    v = int(round(float(final_params.get(key, 0))))
+                    st.metric(label, f"{v} m")
+                except (TypeError, ValueError):
+                    st.metric(label, "—")
+
+        st.markdown("**Aggregators**")
+        agg_cols = st.columns(2)
+        with agg_cols[0]:
+            st.metric(
+                "GVI (Vegetation + Terrain)",
+                _agg_label(
+                    final_params.get("streetview_stat"),
+                    final_params.get("streetview_percentile"),
+                ),
+            )
+        with agg_cols[1]:
+            st.metric(
+                "NDVI",
+                _agg_label(
+                    final_params.get("ndvi_stat"),
+                    final_params.get("ndvi_percentile"),
+                ),
+            )
+    else:
+        # Standalone: a single channel at 100 % — weights are not
+        # meaningful, so only the active channel's radius + aggregator are
+        # surfaced.
+        ch_label = _CHANNEL_DISPLAY.get(study_key, study_key.upper())
+        st.caption(f"Single channel — **100 % {ch_label}**.")
+        radius_key = f"{study_key}_radius"
+        stat_key = "ndvi_stat" if study_key == "ndvi" else "streetview_stat"
+        pct_key = "ndvi_percentile" if study_key == "ndvi" else "streetview_percentile"
+        detail_cols = st.columns(2)
+        with detail_cols[0]:
+            try:
+                v = int(round(float(final_params.get(radius_key, 0))))
+                st.metric(f"{ch_label} radius", f"{v} m")
+            except (TypeError, ValueError):
+                st.metric(f"{ch_label} radius", "—")
+        with detail_cols[1]:
+            st.metric(
+                f"{ch_label} aggregator",
+                _agg_label(
+                    final_params.get(stat_key), final_params.get(pct_key)
+                ),
+            )
+
+    # ── Per-subset scores ─────────────────────────────────────────────
+    if subset_scores:
+        st.markdown("**Scores by data subset**")
+        rows: list[dict] = []
+        for subset in ("train", "val", "test", "all"):
+            block = subset_scores.get(subset) or {}
+            if not block:
+                continue
+            score = block.get("score")
+            raw = block.get("score_raw")
+            row = {
+                "Subset": subset,
+                metric_name: round(float(score), 4) if score is not None else None,
+            }
+            if has_covariates:
+                row[f"{metric_name} (raw)"] = (
+                    round(float(raw), 4) if raw is not None else None
+                )
+            row["n"] = block.get("n")
+            rows.append(row)
+        if rows:
+            st.dataframe(pd.DataFrame(rows), width="stretch")
+            cap = (
+                "**train** = winning params on the full train+val pool · "
+                "**val** = winning-cell median out-of-bag score (cross-resample "
+                "held-out signal) · **test** = untouched held-out split · "
+                "**all** = every entity."
+            )
+            if has_covariates:
+                cap += (
+                    " The metric column is covariate-adjusted (partial); "
+                    "`(raw)` is the unadjusted correlation."
+                )
+            st.caption(cap)
+
+    # ── Final params JSON ─────────────────────────────────────────────
+    with st.expander("Final parameters (composite is built from these)"):
+        st.json(final_params)
+
+    # ── Stability-selection diagnostics ───────────────────────────────
+    _render_stability_diagnostics(summary, metric_name)
+
+
+def _render_cross_study_comparison(results_view: dict, metric_name: str) -> None:
+    """CGI vs each standalone: subset-score bars + the AIC/BIC verdict detail."""
+    standalones = results_view.get("standalones") or {}
+    if not standalones:
+        return
 
     st.divider()
-    st.markdown("**Interactive Plots**")
+    st.markdown("**CGI vs standalone single-metric studies**")
 
-    plot_options = [
-        "Optimization history",
-        "Parameter importances",
-        "Parallel coordinates",
-        "Slice",
-        "Contour",
-        "Rank",
-        "EDF",
-        "Timeline",
-    ]
-    selector_cols = st.columns([2, 2])
-    with selector_cols[0]:
-        plot_pick = st.selectbox(
-            "Plot type",
-            options=plot_options,
-            key="fusion_optuna_plot_pick",
-        )
-    with selector_cols[1]:
-        pool_options = ["All completed trials"]
-        if robust_trials:
-            pool_options.append(f"Robust only ({len(robust_trials)})")
-        pool_pick = st.selectbox(
-            "Trial pool",
-            options=pool_options,
-            key="fusion_optuna_pool_pick",
-        )
+    studies: list[tuple[str, str, dict]] = [("cgi", "CGI (combined)", results_view)]
+    for ch in ("veg", "terrain", "ndvi"):
+        b = standalones.get(ch)
+        if b:
+            studies.append((ch, f"{_CHANNEL_DISPLAY.get(ch, ch)} (standalone)", b))
 
-    if pool_pick.startswith("Robust"):
-        sub_study = _optuna.create_study(
-            direction=study.direction, sampler=study.sampler
-        )
-        for t in robust_trials:
-            sub_study.add_trial(t)
-        target_study = sub_study
-    else:
-        target_study = study
-
-    # Discover the union of parameter names across the picked pool so
-    # axis selectors only offer params that actually exist in the data
-    # being plotted.
-    available_params: list[str] = sorted(
-        {p for t in target_study.trials for p in t.params}
+    # ── Score bars (test + all) ───────────────────────────────────────
+    subset_picks = st.multiselect(
+        "Subsets to compare",
+        options=["train", "val", "test", "all"],
+        default=["test", "all"],
+        key="fusion_compare_subsets",
+        help="Each study's stability-selected params, scored on each subset.",
     )
+    if subset_picks:
+        rows: list[dict] = []
+        for _key, disp, b in studies:
+            subs = b.get("subset_scores") or {}
+            for subset in subset_picks:
+                block = subs.get(subset) or {}
+                val = block.get("score")
+                try:
+                    fval = float(val) if val is not None else None
+                except (TypeError, ValueError):
+                    fval = None
+                rows.append({"Study": disp, "Subset": subset, metric_name: fval})
+        df = pd.DataFrame(rows)
+        try:
+            import plotly.express as _px
 
-    params_axes_needed = plot_pick in {
-        "Parallel coordinates",
-        "Slice",
-        "Contour",
-        "Rank",
-    }
-
-    selected_params: list[str] | None = None
-    if params_axes_needed and available_params:
-        default_axes = available_params[: min(3, len(available_params))]
-        selected_params = st.multiselect(
-            "Parameters to include",
-            options=available_params,
-            default=default_axes,
-            key=f"fusion_optuna_params_{plot_pick}",
-        )
-        if not selected_params:
-            st.info("Pick at least one parameter to draw this plot.")
-            return
-
-    try:
-        if plot_pick == "Optimization history":
-            fig = plot_optimization_history(target_study)
-        elif plot_pick == "Parameter importances":
-            fig = plot_param_importances(target_study)
-        elif plot_pick == "Parallel coordinates":
-            fig = plot_parallel_coordinate(target_study, params=selected_params)
-            # The y-axis label ("Objective Value" by default) sits in the
-            # very left margin and Optuna's default layout clips it.
-            # Add explicit padding so every label is visible regardless
-            # of window width.
-            fig.update_layout(
-                margin=dict(l=120, r=80, t=70, b=60),
-                width=None,
+            fig = _px.bar(
+                df,
+                x="Study",
+                y=metric_name,
+                color="Subset",
+                barmode="group",
+                title=f"{metric_name} by study and subset",
             )
-        elif plot_pick == "Slice":
-            fig = plot_slice(target_study, params=selected_params)
-        elif plot_pick == "Contour":
-            if not selected_params or len(selected_params) < 2:
-                st.info("Contour needs at least two parameters.")
-                return
-            fig = plot_contour(target_study, params=selected_params)
-        elif plot_pick == "Rank":
-            fig = plot_rank(target_study, params=selected_params)
-        elif plot_pick == "EDF":
-            fig = plot_edf(target_study)
-        elif plot_pick == "Timeline":
-            fig = plot_timeline(target_study)
-        else:
-            return
-        st.plotly_chart(fig, width="stretch")
-    except Exception as exc:
-        st.warning(f"Could not render {plot_pick}: {exc}")
+            fig.update_layout(margin=dict(l=60, r=20, t=60, b=80))
+            st.plotly_chart(fig, width="stretch")
+        except Exception:
+            st.bar_chart(
+                df.pivot(index="Study", columns="Subset", values=metric_name),
+                width="stretch",
+            )
+        with st.expander("Show exact values"):
+            st.dataframe(df, width="stretch")
+
+    # ── AIC/BIC verdict detail ────────────────────────────────────────
+    aic_bic = results_view.get("cgi_vs_standalone_aic_bic") or None
+    if aic_bic and aic_bic.get("ok"):
+        st.markdown("**Penalized model comparison (AIC / BIC)**")
+        best_ch = _CHANNEL_DISPLAY.get(
+            aic_bic.get("best_channel"), str(aic_bic.get("best_channel"))
+        )
+        st.caption(
+            f"Full model = `outcome ~ veg + terrain + ndvi (+ covariates)`; "
+            f"reduced model = `outcome ~ {best_ch} (+ covariates)` — the best "
+            f"single channel by held-out test score. Lower AIC/BIC is better; "
+            f"a positive Δ favours CGI. **Verdict: {aic_bic.get('verdict')}** "
+            f"(n = {aic_bic.get('n')})."
+        )
+        comp_rows = [
+            {
+                "Model": "CGI (full, 3 channels)",
+                "AIC": round(float(aic_bic.get("aic_full", float("nan"))), 2),
+                "BIC": round(float(aic_bic.get("bic_full", float("nan"))), 2),
+            },
+            {
+                "Model": f"{best_ch} (reduced, 1 channel)",
+                "AIC": round(float(aic_bic.get("aic_reduced", float("nan"))), 2),
+                "BIC": round(float(aic_bic.get("bic_reduced", float("nan"))), 2),
+            },
+            {
+                "Model": "Δ (reduced − full)",
+                "AIC": round(float(aic_bic.get("delta_aic", float("nan"))), 2),
+                "BIC": round(float(aic_bic.get("delta_bic", float("nan"))), 2),
+            },
+        ]
+        st.dataframe(pd.DataFrame(comp_rows), width="stretch")
+    elif aic_bic is not None:
+        st.info(
+            "AIC/BIC comparison inconclusive: "
+            + str(aic_bic.get("reason", "unavailable."))
+        )
+
+
+def _render_artifact_index(results_view: dict) -> None:
+    """List every file the job wrote to disk so the user can find them."""
+    artifacts_dir = results_view.get("artifacts_dir")
+    if not artifacts_dir or not os.path.isdir(artifacts_dir):
+        return
+
+    entries: list[tuple[str, int]] = []
+    for root, _dirs, files in os.walk(artifacts_dir):
+        for fn in files:
+            full = os.path.join(root, fn)
+            try:
+                size = os.path.getsize(full)
+            except OSError:
+                size = 0
+            rel = os.path.relpath(full, artifacts_dir)
+            entries.append((rel, size))
+    if not entries:
+        return
+
+    st.divider()
+    with st.expander(f"📁 Output files on disk ({len(entries)})"):
+        st.caption(f"Job folder: `{artifacts_dir}`")
+
+        def _human(n: int) -> str:
+            for unit in ("B", "KB", "MB", "GB"):
+                if n < 1024 or unit == "GB":
+                    return f"{n:.0f} {unit}" if unit == "B" else f"{n / 1024:.1f} {unit}"
+                n /= 1024
+            return f"{n:.0f} B"
+
+        rows = [
+            {"File": rel, "Size": _human(size)}
+            for rel, size in sorted(entries)
+        ]
+        st.dataframe(pd.DataFrame(rows), width="stretch", height=min(420, 60 + 28 * len(rows)))
 
 
 def _render_fusion_results_body(output_dir: str) -> None:
     """Inner body of the results panel — kept separate so the styled
-    container above stays readable."""
+    container above stays readable.
+
+    Layout: a CGI headline (test score + CI, direction, AIC/BIC verdict),
+    a study selector (CGI + each standalone), the selected study's full
+    detail, then cross-study comparison, covariate impact, collinearity,
+    composite maps, mixed-effects metrics, and an on-disk artifact index.
+    """
     head_col, clear_col = st.columns([4, 1])
     with head_col:
         st.subheader("Optimization Results")
@@ -2460,275 +2550,22 @@ def _render_fusion_results_body(output_dir: str) -> None:
         return
 
     metric_name = results_view["objective_metric"].upper()
-    best_params = results_view.get("best_params") or {}
-    averaged_params_raw = results_view.get("averaged_params") or {}
-    final_params = {
-        k: v for k, v in averaged_params_raw.items() if not k.startswith("__")
-    } or best_params
 
-    # Formula introspection. Legacy results from before the formula
-    # registry don't carry the attribute → fall back to weighted_average
-    # so old studies still render with the original three weights.
     formula_name = getattr(engine, "cgi_formula", "weighted_average")
     try:
         formula = _cgi_formulas.get_formula(formula_name)
     except ValueError:
         formula = _cgi_formulas.get_formula("weighted_average")
-
     covariates_used = list(getattr(engine, "covariate_columns", []) or [])
+    _FORMULA_DISPLAY = {"weighted_average": "Weighted Average", "synergy": "Synergy"}
 
-    # ── Top summary: averaged top-20% params, grouped by category ──────
-    # The composite GeoTIFF is built from these averaged params, so the
-    # overview reports them rather than the single best trial. Four
-    # rows in order: formula + headline scores · weights · radii · aggregators.
-    _CHANNEL_LABELS = _CHANNEL_DISPLAY
-    _FORMULA_DISPLAY = {
-        "weighted_average": "Weighted Average",
-        "synergy": "Synergy",
-    }
-
-    def _agg_label(stat: str | None, percentile: int | float | None) -> str:
-        if stat == "mean":
-            return "Mean"
-        if stat == "median":
-            return "Median"
-        if stat == "percentile":
-            try:
-                p = int(round(float(percentile)))
-            except (TypeError, ValueError):
-                return "Percentile"
-            suffix = "th"
-            if p % 100 not in (11, 12, 13):
-                suffix = {1: "st", 2: "nd", 3: "rd"}.get(p % 10, "th")
-            return f"{p}{suffix} percentile"
-        return "—"
-
-    # ── Held-out test score + CI · direction · CGI-vs-standalone AIC/BIC ─
-    test_ci = (results_view.get("test_results") or {}).get("test_ci") or {}
-    direction = results_view.get("direction_sign")
-    aic_bic = results_view.get("cgi_vs_standalone_aic_bic") or None
-
-    summary_cols = st.columns(3)
-    with summary_cols[0]:
-        obs = test_ci.get("observed")
-        lo = test_ci.get("lower")
-        hi = test_ci.get("upper")
-        if obs is not None:
-            ci_str = (
-                f"[{float(lo):.4f}, {float(hi):.4f}]"
-                if lo is not None and hi is not None
-                else "—"
-            )
-            st.metric(
-                f"Held-out test {metric_name}",
-                f"{float(obs):.4f}",
-                help=(
-                    "Stability-selection winning params scored on the untouched "
-                    f"test split. 95% percentile bootstrap CI: {ci_str}."
-                ),
-            )
-        else:
-            st.metric(f"Held-out test {metric_name}", "—")
-    with summary_cols[1]:
-        if direction is not None:
-            arrow = "↑ positive" if int(direction) > 0 else "↓ negative"
-            st.metric(
-                "Direction",
-                arrow,
-                help=(
-                    "Sign of the greenery↔outcome relationship — reported "
-                    "separately because distance correlation is unsigned."
-                ),
-            )
-        else:
-            st.metric("Direction", "—")
-    with summary_cols[2]:
-        if aic_bic and aic_bic.get("ok"):
-            d_bic = aic_bic.get("delta_bic")
-            st.metric(
-                "CGI vs best standalone",
-                str(aic_bic.get("verdict", "—")),
-                help=(
-                    "AIC/BIC of CGI (all channels) vs the best single channel "
-                    f"(`{aic_bic.get('best_channel')}`). "
-                    f"ΔBIC={float(d_bic):.1f} (positive favours CGI)."
-                ),
-            )
-        elif aic_bic is not None:
-            st.metric(
-                "CGI vs best standalone",
-                "inconclusive",
-                help=str(aic_bic.get("reason", "Comparison unavailable.")),
-            )
-        else:
-            st.metric(
-                "CGI vs best standalone",
-                "—",
-                help="Enable standalone studies to compare CGI against them.",
-            )
-    st.divider()
-
-    # ── Row 1: formula · train/val/test (avg top-20%) · robust ratio ────
-    subset_scores_view = results_view.get("subset_scores") or {}
-
-    def _subset_field(name: str, field: str) -> float | None:
-        block = subset_scores_view.get(name) or {}
-        v = block.get(field)
-        try:
-            return float(v) if v is not None else None
-        except (TypeError, ValueError):
-            return None
-
-    # Partial = covariate-adjusted (the optimizer's actual objective).
-    # Raw = plain correlation without covariate adjustment. When no
-    # covariates are configured, the two values are identical and the
-    # ``(raw)`` sub-line is suppressed for compactness.
-    has_covariates = bool(covariates_used)
-    train_partial = _subset_field("train", "score")
-    val_partial = _subset_field("val", "score")
-    test_partial = _subset_field("test", "score")
-    train_raw = _subset_field("train", "score_raw")
-    val_raw = _subset_field("val", "score_raw")
-    test_raw = _subset_field("test", "score_raw")
-
-    formula_display = _FORMULA_DISPLAY.get(formula.name, formula.name.title())
-
-    headline_cols = st.columns(5)
-    with headline_cols[0]:
-        st.metric("CGI Formula", formula_display)
-    for col, label, partial, raw in (
-        (headline_cols[1], "Train", train_partial, train_raw),
-        (headline_cols[2], "Val", val_partial, val_raw),
-        (headline_cols[3], "Test", test_partial, test_raw),
-    ):
-        with col:
-            if partial is None:
-                st.metric(f"{label} {metric_name}", "—")
-            elif has_covariates and raw is not None:
-                # Surface BOTH the partial (covariate-adjusted) and raw
-                # correlation so the user can compare "what does CGI add
-                # over covariates?" with "what does CGI predict alone?".
-                delta = partial - raw
-                st.metric(
-                    f"{label} {metric_name} (partial)",
-                    f"{partial:.4f}",
-                    delta=f"raw {raw:.4f}",
-                    delta_color="off",
-                    help=(
-                        f"**Partial** = covariate-adjusted (optimizer's "
-                        f"actual objective). **Raw** = unadjusted "
-                        f"correlation between CGI and outcome. The gap "
-                        f"({delta:+.4f}) reflects how much of the "
-                        f"correlation is being lifted by the covariate-"
-                        f"residualisation step."
-                    ),
-                )
-            else:
-                st.metric(
-                    f"{label} {metric_name}",
-                    f"{partial:.4f}",
-                )
-    with headline_cols[4]:
-        # Stability mode has no master Optuna study; the headline-trial
-        # bookkeeping lives on the cell-winner ``final_params`` dict that
-        # bootstrap_stability_selection populates.
-        if engine.study is None:
-            # Same gotcha as the cell-winner panel — these ``__*__`` keys
-            # live on the raw bundle dict, not the stripped ``final_params``
-            # the weights panel reads from.
-            n_total = int(averaged_params_raw.get("__n_total_trials__", 0))
-            n_cell = int(averaged_params_raw.get("__cell_count__", 0))
-            if n_total:
-                st.metric(
-                    "Cell trials",
-                    f"{n_cell}/{n_total}",
-                    help=(
-                        "Trials whose binned weights fell into the winning "
-                        "cell, over all bootstrap-OOB trials."
-                    ),
-                )
-            else:
-                st.metric("Cell trials", "—")
-        elif results_view["robust_trials"]:
-            st.metric(
-                "Robust Trials",
-                f"{len(results_view['robust_trials'])}/{len(engine.study.trials)}",
-            )
-        else:
-            st.metric("Total Trials", len(engine.study.trials))
-
-    # ── Row 2: weights ─────────────────────────────────────────────────
-    if formula.name == _cgi_formulas.WEIGHTED_AVERAGE:
-        st.markdown("**Weights (averaged top-20%)**")
-        weight_cols = st.columns(len(formula.weight_keys))
-        total_weight = sum(float(final_params.get(k, 0)) for k in formula.weight_keys)
-        for col, key in zip(weight_cols, formula.weight_keys):
-            ch = key.removesuffix("_weight")
-            label = _CHANNEL_LABELS.get(ch, ch.upper())
-            pct = (
-                100.0 * float(final_params.get(key, 0)) / total_weight
-                if total_weight > 0
-                else 0.0
-            )
-            with col:
-                st.metric(label, f"{pct:.1f}%")
-    else:
-        st.markdown("**Weights and powers (averaged top-20%)**")
-        all_keys = list(formula.weight_keys) + list(formula.power_keys)
-        groups = [all_keys[i : i + 4] for i in range(0, len(all_keys), 4)]
-        for group in groups:
-            cols = st.columns(len(group))
-            for col, key in zip(cols, group):
-                val = float(final_params.get(key, 0))
-                if key in formula.power_keys:
-                    pretty = key.removesuffix("_power").upper() + " power"
-                    with col:
-                        st.metric(pretty, f"{val:.2f}")
-                else:
-                    pretty = key.removeprefix("w_").replace("_", "·").upper() + " %"
-                    with col:
-                        st.metric(pretty, f"{val:.1f}")
-
-    # ── Row 3: radii ───────────────────────────────────────────────────
-    st.markdown("**Radii (m)**")
-    radii_cols = st.columns(3)
-    for col, key in zip(radii_cols, ("veg_radius", "terrain_radius", "ndvi_radius")):
-        ch = key.removesuffix("_radius")
-        label = _CHANNEL_LABELS.get(ch, ch.upper())
-        with col:
-            try:
-                v = int(round(float(final_params.get(key, 0))))
-                st.metric(label, f"{v} m")
-            except (TypeError, ValueError):
-                st.metric(label, "—")
-
-    # ── Row 4: aggregators ─────────────────────────────────────────────
-    st.markdown("**Aggregators**")
-    agg_cols = st.columns(2)
-    with agg_cols[0]:
-        st.metric(
-            "GVI (Vegetation + Terrain)",
-            _agg_label(
-                final_params.get("streetview_stat"),
-                final_params.get("streetview_percentile"),
-            ),
-        )
-    with agg_cols[1]:
-        st.metric(
-            "NDVI",
-            _agg_label(
-                final_params.get("ndvi_stat"),
-                final_params.get("ndvi_percentile"),
-            ),
-        )
-
+    # ── Headline ──────────────────────────────────────────────────────
+    _render_results_headline(results_view, metric_name)
     st.caption(
+        "**Formula:** "
+        f"{_FORMULA_DISPLAY.get(formula.name, formula.name.title())}  ·  "
         "**Covariates:** "
-        + (
-            ", ".join(f"`{c}`" for c in covariates_used)
-            if covariates_used
-            else "_none_"
-        )
+        + (", ".join(f"`{c}`" for c in covariates_used) if covariates_used else "_none_")
         + (
             "  ·  ℹ️ `mutual_info` ignores covariates"
             if results_view["objective_metric"] == "mutual_info" and covariates_used
@@ -2738,371 +2575,34 @@ def _render_fusion_results_body(output_dir: str) -> None:
     artifacts_dir = results_view.get("artifacts_dir")
     if artifacts_dir:
         st.caption(f"📁 Job artifacts: `{artifacts_dir}`")
+    st.divider()
 
-    col_detail1, col_detail2 = st.columns(2)
-
-    with col_detail1:
-        if engine.study is None:
-            # Stability mode: no single "best trial" — the cell-winner is
-            # an ensemble. The bookkeeping keys live on the **unfiltered**
-            # ``averaged_params_raw`` dict (``final_params`` strips every
-            # ``__*__`` key for the user-facing weights panel), so read
-            # from there.
-            st.markdown("**Cell-winner details (stability selection)**")
-            cell_info: dict = {
-                "Bootstraps run": int(
-                    averaged_params_raw.get("__n_bootstraps__", 0)
-                ),
-                "Trials per bootstrap": int(
-                    averaged_params_raw.get("__n_trials_per_bootstrap__", 0)
-                ),
-                "Total bootstrap trials": int(
-                    averaged_params_raw.get("__n_total_trials__", 0)
-                ),
-                "Trials in winning cell": int(
-                    averaged_params_raw.get("__cell_count__", 0)
-                ),
-                f"Cell q_worst {metric_name}": (
-                    f"{float(averaged_params_raw.get('__cell_q_worst__', float('nan'))):.4f}"
-                ),
-                f"Cell median {metric_name}": (
-                    f"{float(averaged_params_raw.get('__cell_median__', float('nan'))):.4f}"
-                ),
-                "Cell selection probability": (
-                    f"{float(averaged_params_raw.get('__cell_selection_probability__', float('nan'))):.2%}"
-                ),
-                "Worst quantile": (
-                    f"{float(averaged_params_raw.get('__worst_quantile__', float('nan'))):.2f}"
-                ),
-                "Buffer distance": f"{engine.buffer_meters}m",
-            }
-            if covariates_used:
-                cell_info["Covariates controlled"] = covariates_used
-            st.json(cell_info)
-        else:
-            st.markdown("**Best Trial Details**")
-            best_trial = engine.study.best_trial
-
-            info_data: dict = {
-                "Trial Number": best_trial.number,
-                "Buffer Distance": f"{engine.buffer_meters}m",
-            }
-            # Formula-driven weight + power dump, then shared spatial params,
-            # then the train/val scores + p-values.
-            for k in formula.weight_keys:
-                info_data[f"{k} (raw)"] = best_params.get(k, "N/A")
-            for k in formula.power_keys:
-                info_data[k] = best_params.get(k, "N/A")
-            for k in ("veg_radius", "terrain_radius", "ndvi_radius"):
-                info_data[k] = best_params.get(k, "N/A")
-            if covariates_used:
-                info_data["Covariates controlled"] = covariates_used
-
-            info_data[f"Train {metric_name}"] = (
-                f"{best_trial.user_attrs.get('train_score_mean', 'N/A')}"
-            )
-            info_data[f"Val {metric_name}"] = (
-                f"{best_trial.user_attrs.get('val_score_mean', 'N/A')}"
-            )
-
-            if "train_pvalue" in best_trial.user_attrs:
-                info_data["Train p-value"] = (
-                    f"{best_trial.user_attrs['train_pvalue']:.4e}"
-                )
-            if "val_pvalue" in best_trial.user_attrs:
-                info_data["Val p-value"] = (
-                    f"{best_trial.user_attrs['val_pvalue']:.4e}"
-                )
-
-            st.json(info_data)
-
-    with col_detail2:
-        averaged_params = results_view.get("averaged_params") or {}
-        if averaged_params:
-            st.markdown("**Final (averaged top-20%) Parameters**")
-            clean_avg = {
-                k: v for k, v in averaged_params.items() if not k.startswith("__")
-            }
-            st.json(clean_avg)
-            n_top = averaged_params.get("__n_top_trials__")
-            n_robust = averaged_params.get("__n_robust_trials__")
-            if n_top is not None and n_robust is not None:
-                st.caption(
-                    f"Ensemble of the top {n_top} trials from "
-                    f"{n_robust} robust trials. These are the params "
-                    "used to render the composite GeoTIFF."
-                )
-        else:
-            st.caption("_No averaged top-20% parameters were recorded for this run._")
-
-    # ── Stability-selection diagnostics ───────────────────────────────
-    # Shown only in stability mode. Two panels:
-    # 1. Top-K cell ranking — lets the user see whether the winner is in a
-    #    cluster of similar regions or an isolated outlier.
-    # 2. Winning cell's OOB-score distribution — shows q_worst, median,
-    #    and spread directly so the user can judge how stable the cell is
-    #    across resamples.
-    if engine.study is None:
-        _render_stability_diagnostics(
-            results_view, averaged_params_raw, metric_name
-        )
-
-    # ── Interactive Optuna plot viewer ─────────────────────────────────
-    # The user picks a plot type and (optionally) a study filter +
-    # parameter axes; the plot is rendered live from the in-memory study
-    # so it's free to explore without regenerating files on disk.
-    _render_optuna_plot_explorer(engine, results_view, metric_name)
-
-    # ── Robust trials browser (CGI + per-standalone) ─────────────────
-    # One scrollable dataframe per study. The selector lets the user
-    # pivot between the combined CGI run and each standalone single-
-    # metric study without leaving the results panel.
-    study_options: list[tuple[str, dict, Any]] = [
-        (
-            "CGI (combined)",
-            results_view,
-            engine,
-        )
-    ]
-    standalones_for_robust = results_view.get("standalones") or {}
-    for _ch, _ch_bundle in standalones_for_robust.items():
-        study_options.append(
-            (
-                f"{_CHANNEL_DISPLAY.get(_ch, _ch)} (standalone)",
-                _ch_bundle,
-                engine,  # standalone study object isn't pickled separately
-            )
-        )
-
-    if any(opt[1].get("robust_trials") for opt in study_options):
-        st.divider()
-        st.markdown("**Robust Trials (Statistically Significant)**")
-
-        picked = st.selectbox(
-            "Study",
-            options=[opt[0] for opt in study_options],
-            key="fusion_robust_study_pick",
-        )
-        picked_view = next(opt[1] for opt in study_options if opt[0] == picked)
-        picked_robust = picked_view.get("robust_trials") or []
-
-        def _wlabel(key: str) -> str:
-            cleaned = key.removeprefix("w_").removesuffix("_weight")
-            return cleaned.replace("_", "·").upper() + " %"
-
-        def _plabel(key: str) -> str:
-            return key.removesuffix("_power").upper() + " p"
-
-        if not picked_robust:
-            st.info("No robust trials in this study.")
-        else:
-            # Standalones never suggest weights for non-active channels;
-            # show 100 % on the active one and "—" for inapplicable columns.
-            picked_channel: str | None = picked_view.get("channel")
-            active_weight_keys: set[str] = set()
-            if picked_channel == "veg":
-                active_weight_keys = {"veg_weight", "w_veg"}
-            elif picked_channel == "terrain":
-                active_weight_keys = {"terrain_weight", "w_ter"}
-            elif picked_channel == "ndvi":
-                active_weight_keys = {"ndvi_weight", "w_ndvi"}
-
-            def _radius_applies(radius_key: str) -> bool:
-                if picked_channel is None:
-                    return True
-                return radius_key == f"{picked_channel}_radius"
-
-            def _stat_applies(stat_key: str) -> bool:
-                if picked_channel is None:
-                    return True
-                if picked_channel == "ndvi":
-                    return stat_key == "ndvi_stat"
-                return stat_key == "streetview_stat"
-
-            robust_data: list[dict] = []
-            for t in picked_robust:
-                row: dict = {"Trial": t.number}
-                if picked_channel is None:
-                    weight_total = sum(
-                        float(t.params.get(k, 0)) for k in formula.weight_keys
-                    )
-                    for k in formula.weight_keys:
-                        row[_wlabel(k)] = (
-                            round(100.0 * float(t.params.get(k, 0)) / weight_total, 1)
-                            if weight_total > 0
-                            else 0.0
-                        )
-                else:
-                    # Standalone: synthesize 100/0 weights so the table
-                    # mirrors the actual scoring (single channel only).
-                    for k in formula.weight_keys:
-                        row[_wlabel(k)] = 100.0 if k in active_weight_keys else 0.0
-                for k in formula.power_keys:
-                    row[_plabel(k)] = round(float(t.params.get(k, 1.0)), 2)
-                for k in ("veg_radius", "terrain_radius", "ndvi_radius"):
-                    label = k.replace("_", " ")
-                    if k in t.params and _radius_applies(k):
-                        row[label] = t.params[k]
-                    elif _radius_applies(k):
-                        row[label] = None
-                for k in ("streetview_stat", "ndvi_stat"):
-                    label = k.replace("_", " ")
-                    if k in t.params and _stat_applies(k):
-                        row[label] = t.params[k]
-                    elif _stat_applies(k):
-                        row[label] = "—"
-                for k in ("streetview_percentile", "ndvi_percentile"):
-                    label = k.replace("_", " ")
-                    stat_key = (
-                        "ndvi_stat" if k == "ndvi_percentile" else "streetview_stat"
-                    )
-                    if (
-                        k in t.params
-                        and _stat_applies(stat_key)
-                        and t.params.get(stat_key) == "percentile"
-                    ):
-                        row[label] = t.params[k]
-                train_mean = t.user_attrs.get("train_score_mean")
-                val_mean = t.user_attrs.get("val_score_mean")
-                train_pv = t.user_attrs.get("train_pvalue_mean")
-                val_pv = t.user_attrs.get("val_pvalue_mean")
-                row[f"Train {metric_name}"] = (
-                    round(float(train_mean), 4) if train_mean is not None else None
-                )
-                row[f"Val {metric_name}"] = (
-                    round(float(val_mean), 4) if val_mean is not None else None
-                )
-                row["Train p"] = float(train_pv) if train_pv is not None else None
-                row["Val p"] = float(val_pv) if val_pv is not None else None
-                robust_data.append(row)
-
-            st.caption(
-                f"Showing all {len(robust_data)} robust trials. "
-                "Sort by clicking column headers; scroll inside the table "
-                "to see more rows."
-            )
-            st.dataframe(
-                pd.DataFrame(robust_data),
-                width="stretch",
-                height=420,
-            )
-
+    # ── Study selector + per-study detail ─────────────────────────────
     standalones = results_view.get("standalones") or {}
-    if standalones and any(b.get("subset_scores") for b in standalones.values()):
-        st.divider()
-        st.markdown("**CGI vs Standalone Single-Metric Studies**")
+    study_options: list[tuple[str, str]] = [("cgi", "CGI (combined)")]
+    for ch in ("veg", "terrain", "ndvi"):
+        if standalones.get(ch):
+            study_options.append((ch, f"{_CHANNEL_DISPLAY.get(ch, ch)} (standalone)"))
 
-        # Subset / value multi-select; scores are pre-cached in the bundle.
-        subset_cols = st.columns([1, 1])
-        with subset_cols[0]:
-            subset_picks = st.multiselect(
-                "Data subsets",
-                options=["train", "val", "test", "all"],
-                default=["test"],
-                key="fusion_subset_pick",
-                help="Scores recorded per study with the averaged top-20% params.",
-            )
-        with subset_cols[1]:
-            value_picks = st.multiselect(
-                "Values",
-                options=["score", "pvalue", "n"],
-                default=["score"],
-                key="fusion_subset_value_pick",
-                help="Rendered as separate charts (different scales).",
-            )
+    if len(study_options) > 1:
+        picked_key = st.radio(
+            "Study detail",
+            options=[k for k, _ in study_options],
+            format_func=lambda k: dict(study_options)[k],
+            horizontal=True,
+            key="fusion_study_detail_pick",
+        )
+    else:
+        picked_key = "cgi"
 
-        if not subset_picks or not value_picks:
-            st.info("Pick at least one subset and one value to compare.")
-        else:
+    study_view = results_view if picked_key == "cgi" else standalones.get(picked_key)
+    if study_view is not None:
+        _render_study_detail(
+            study_view, engine, formula, metric_name, picked_key, covariates_used
+        )
 
-            def _study_label(key: str) -> str:
-                if key == "cgi":
-                    return "CGI (combined)"
-                return f"{_CHANNEL_DISPLAY.get(key, key)} (standalone)"
-
-            all_studies: list[tuple[str, dict]] = [("cgi", results_view)]
-            for ch_key, ch_bundle in standalones.items():
-                all_studies.append((ch_key, ch_bundle))
-
-            try:
-                import plotly.express as _px
-            except Exception:
-                _px = None
-
-            # One grouped-bar chart per value (different scales can't share an axis).
-            for value_pick in value_picks:
-                rows: list[dict] = []
-                for sk, bundle in all_studies:
-                    for subset_pick in subset_picks:
-                        sub = (bundle.get("subset_scores") or {}).get(subset_pick) or {}
-                        val = sub.get(value_pick)
-                        try:
-                            fval = float(val) if val is not None else None
-                        except (TypeError, ValueError):
-                            fval = None
-                        rows.append(
-                            {
-                                "Study": _study_label(sk),
-                                "Subset": subset_pick,
-                                "Value": fval,
-                            }
-                        )
-
-                df = pd.DataFrame(rows)
-                y_title = {
-                    "score": f"{metric_name}",
-                    "pvalue": "p-value",
-                    "n": "n entities",
-                }[value_pick]
-
-                if _px is not None:
-                    fig = _px.bar(
-                        df,
-                        x="Study",
-                        y="Value",
-                        color="Subset",
-                        barmode="group",
-                        title=y_title,
-                        labels={"Value": y_title},
-                    )
-                    fig.update_layout(
-                        margin=dict(l=60, r=20, t=60, b=60),
-                        legend_title_text="Subset",
-                    )
-                    st.plotly_chart(fig, width="stretch")
-                else:
-                    # Fallback: pivot to wide and use streamlit's
-                    # native bar chart, which auto-groups by columns.
-                    wide = df.pivot(index="Study", columns="Subset", values="Value")
-                    st.markdown(f"_{y_title}_")
-                    st.bar_chart(wide, width="stretch")
-
-            # Compact textual summary so users can read off exact values.
-            with st.expander("Show exact values", expanded=False):
-                summary: list[dict] = []
-                for sk, bundle in all_studies:
-                    for subset_pick in subset_picks:
-                        sub = (bundle.get("subset_scores") or {}).get(subset_pick) or {}
-                        row: dict = {
-                            "Study": _study_label(sk),
-                            "Subset": subset_pick,
-                        }
-                        for value_pick in value_picks:
-                            v = sub.get(value_pick)
-                            try:
-                                fv = float(v) if v is not None else None
-                            except (TypeError, ValueError):
-                                fv = None
-                            if fv is None:
-                                row[value_pick] = "—"
-                            elif value_pick == "pvalue":
-                                row[value_pick] = f"{fv:.4e}"
-                            elif value_pick == "n":
-                                row[value_pick] = int(fv)
-                            else:
-                                row[value_pick] = round(fv, 4)
-                        summary.append(row)
-                st.dataframe(pd.DataFrame(summary), width="stretch")
+    # ── Cross-study comparison (CGI vs standalones) ───────────────────
+    _render_cross_study_comparison(results_view, metric_name)
 
     # ── Channel collinearity report ───────────────────────────────────
     _render_collinearity_report(results_view)
@@ -3110,18 +2610,10 @@ def _render_fusion_results_body(output_dir: str) -> None:
     # ── Covariate impact panel ────────────────────────────────────────
     _render_covariate_impact(results_view, metric_name)
 
-    # ── Per-trial CI box plot viewer ──────────────────────────────────
-    _render_trial_distribution_viewer(results_view, engine, metric_name, standalones)
-
     # ── Composite map viewer ──────────────────────────────────────────
     _render_composite_map_viewer(results_view, engine)
 
     # ── Mixed-effects post-hoc metrics CSV viewer ─────────────────────
-    # The post-score stage writes one CSV per study (CGI + each
-    # standalone) under the job's ``study_results/`` directory. Pull
-    # the artifacts dir from the bundle so we look in the right per-
-    # job folder; fall back to the legacy shared location for older
-    # bundles that don't carry one.
     try:
         bundle_artifacts = results_view.get("artifacts_dir")
         if bundle_artifacts:
@@ -3175,6 +2667,9 @@ def _render_fusion_results_body(output_dir: str) -> None:
                     st.dataframe(pd.read_csv(_path), width="stretch")
     except Exception as _exc:  # pragma: no cover -- UI-only guard
         st.warning(f"Could not read mixedlm_metrics CSVs: {_exc}")
+
+    # ── On-disk artifact index ────────────────────────────────────────
+    _render_artifact_index(results_view)
 
 
 def render(output_dir: str) -> None:

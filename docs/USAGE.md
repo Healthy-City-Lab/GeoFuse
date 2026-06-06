@@ -56,15 +56,16 @@ The Fusion tab reads top-to-bottom in the order you reason about a run:
 
 #### Optimization results panel
 
-After a job completes (or when you click **Load results** on a completed job in the sidebar Job Monitor) the results section renders with these blocks, in order:
+After a job completes (or when you click **Load results** on a completed job in the sidebar Job Monitor) the results section renders top-to-bottom in these blocks:
 
-- **Summary tiles** — formula name, held-out test score + 95% percentile CI, the greenery↔outcome direction, the CGI-vs-best-standalone AIC/BIC verdict (when standalones ran), weights, radii, aggregators.
-- **Final (stability-selection) Parameters** — JSON dump of the winning weight cell's averaged params; the composite GeoTIFF is built from these.
-- **Stability diagnostics** — the winning cell's worst-quantile / median OOB score and selection probability, the top-ranked competing weight cells, the winning cell's OOB-score spread, and a per-bootstrap summary table.
-- **CGI vs Standalone Single-Metric Studies** — per-channel held-out test scores plus the AIC/BIC verdict (ΔAIC / ΔBIC, with the strength band) on whether the multi-channel CGI is justified over the best single channel; rendered only when standalones ran.
+- **Headline** — the CGI bottom line: held-out test score + 95% percentile CI, the greenery↔outcome direction, and the CGI-vs-best-standalone AIC/BIC verdict (when standalones ran), with the formula and covariates noted underneath.
+- **Study detail** — a **study selector** (CGI · Vegetation · Terrain · NDVI, when standalones ran) drives a self-contained detail block for the picked study: its test score + CI / direction / n tiles, the stability-selected weights · radii · aggregators (standalones show their single 100% channel), per-subset scores (train / val / test / all, partial + raw when covariates are set), the final parameters JSON, and that study's full stability diagnostics (top weight cells, winning-cell OOB-score distribution, per-bootstrap leaderboard).
+- **CGI vs standalone single-metric studies** — a grouped score bar chart across studies and subsets plus the penalized model comparison (AIC / BIC of the 3-channel full model vs the best single channel, ΔAIC / ΔBIC with the strength band); rendered only when standalones ran.
+- **Channel collinearity check** — the iterative-VIF report, when the collinearity check was requested.
 - **Covariate impact** — when covariates are set, two OLS regressions (`target ~ CGI + covariates` vs `target ~ CGI`) on the full dataset; per-covariate coefficient, t-stat, p-value, direction, and partial R²; lift over CGI-only R² summarised at the top.
 - **Composite map viewer** — multi-select composites + target outcome rendered as subplots in a near-square grid at 300 dpi; composite subplots share a `[0, 1]` colorbar.
 - **Mixed-effects metric tabs** — when MixedLM scoring is on, one tab per `mixedlm_metrics*.csv` written under the per-job folder.
+- **Output files on disk** — an index of every file the job wrote (path + size), so the saved manifest, CSVs, composites, and `run_config.json` are easy to locate.
 
 #### Per-job output folder
 
@@ -73,14 +74,24 @@ Every fusion run writes its artifacts to `output_results/fusion/<YYYYMMDDTHHMMSS
 ```text
 <job_root>/
 ├── composite_greenery.tif            ← CGI winning-params raster
-├── composite_greenery_params.json
+├── composite_greenery_params.json    ← winning params + stability provenance
 ├── composite_greenery_<veg|terrain|ndvi>.tif         ← one per standalone
 └── study_results/
+    ├── run_config.json                ← every setting the job ran with
+    ├── results_summary.json           ← master manifest (all studies)
+    ├── test_scores.csv                ← held-out test score + CI per study
+    ├── scores.csv                     ← every subset score per study
+    ├── parameters.csv                 ← winning params per study (long form)
+    ├── stability_cells.csv            ← ranked weight cells per study
+    ├── stability_bootstraps.csv       ← per-bootstrap leaderboard per study
+    ├── aic_bic.json                   ← CGI-vs-standalone verdict (if standalones)
+    ├── covariate_impact.csv           ← per-covariate effects (if covariates)
+    ├── collinearity.json              ← VIF report (if requested)
     ├── mixedlm_metrics*.csv           ← if longitudinal + MixedLM
-    └── standalone_<ch>/               ← per-standalone outputs
+    └── standalone_<ch>/               ← per-standalone composite outputs
 ```
 
-Run settings are recorded on the job record and replayed verbatim on restart (see **Full run-setting fidelity** in [FEATURES.md](FEATURES.md)). The per-job caches — metric downloads, the pre-aggregation SQLite cache, and artifacts — are content-addressed via a fingerprint of the search-space settings (buffer ladder, formula, scaling toggles, test size, …), so a config change starts fresh while an identical re-run resumes.
+Every test the job produces is recorded both as the machine-readable `results_summary.json` manifest and as the tidy CSVs above (multi-outcome runs suffix each basename with `__<outcome>`). Run settings are recorded on the job record **and** snapshotted to `run_config.json`, and replayed verbatim on restart (see **Full run-setting fidelity** in [FEATURES.md](FEATURES.md)). The per-job caches — metric downloads, the pre-aggregation SQLite cache, and artifacts — are content-addressed via a fingerprint of the search-space settings (buffer ladder, formula, scaling toggles, test size, …), so a config change starts fresh while an identical re-run resumes.
 
 #### Polygon scoring (per-pixel CGI)
 

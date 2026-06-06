@@ -731,168 +731,270 @@ def _resolve_longitudinal_spec(
     return LongitudinalSpec.from_payload(payload)
 
 
-def _write_split_scores_csv(
+def _clean_params(params: dict | None) -> dict:
+    """Drop the ``__*__`` stability-selection bookkeeping keys from a params dict."""
+    if not params:
+        return {}
+    return {k: v for k, v in params.items() if not str(k).startswith("__")}
+
+
+def _study_bundles(
+    cgi_bundle: dict, standalones_bundle: dict
+) -> list[tuple[str, str, dict]]:
+    """``(study_key, display, bundle)`` for the CGI study then each standalone."""
+    out: list[tuple[str, str, dict]] = [("cgi", "CGI (combined)", cgi_bundle)]
+    for ch in ("veg", "terrain", "ndvi"):
+        b = standalones_bundle.get(ch)
+        if b:
+            out.append((ch, _STANDALONE_CHANNEL_LABELS.get(ch, ch), b))
+    return out
+
+
+def _write_fusion_outputs(
     *,
-    engine,
+    output_dir: str,
     label: str,
     multi_outcome: bool,
-    output_dir: str,
     objective_metric: str,
-    best_value: float | None,
-    best_params: dict | None,
-    averaged_params: dict | None,
-    test_results: dict,
+    formula_name: str,
+    cgi_bundle: dict,
+    standalones_bundle: dict,
+    aic_bic: dict | None,
+    covariate_impact: dict | None,
+    collinearity_report: dict | None,
+    run_config_record: dict | None,
     log,
-) -> None:
-    """Persist per-split objective scores for the best + averaged params.
+) -> list[str]:
+    """Persist every test result a fusion job produces to disk.
 
-    Writes ``split_scores.csv`` (or ``split_scores__<label>.csv`` for
-    multi-outcome runs) with one row per param-source × split:
+    Writes, under ``output_dir`` (``study_results/``), a machine-readable
+    manifest plus tidy CSVs so each result is recorded both for replay and
+    for spreadsheet analysis. ``__<label>`` is appended to every basename in
+    multi-outcome runs. Returns the list of files written (best-effort: a
+    failed individual write is logged and skipped, never fatal).
 
-    - ``best`` — the single best trial's params (the row with the highest
-      CV val score).
-    - ``averaged_top20`` — the ensemble-averaged params from the top 20 %
-      of robust trials. These are the canonical "final" params and the
-      ones the composite GeoTIFF is built from.
+    Files (per outcome):
 
-    Splits:
-
-    - ``cv_train_mean`` — mean per-fold train score (CV).
-    - ``cv_val_mean`` — mean per-fold val score; this is what Optuna's
-      objective value reports.
-    - ``test`` — score on the held-out test set.
-
-    For ``averaged_top20`` the CV-time scores are derived by averaging the
-    top-20 % trials' own per-trial CV means (the natural extension of how
-    the params were averaged). ``test`` is recomputed by calling
-    ``evaluate_on_test`` with the averaged params.
+    - ``run_config.json`` — every setting the job ran with (fidelity record).
+    - ``results_summary.json`` — nested manifest: each study's params, test
+      score + CI, direction, subset scores, and stability stats, plus the
+      CGI-vs-standalone AIC/BIC verdict, covariate-impact summary, and the
+      collinearity report.
+    - ``test_scores.csv`` — one headline row per study (test score, CI,
+      direction).
+    - ``scores.csv`` — long form: study × subset (train/val/test/all) ×
+      score/score_raw/n.
+    - ``parameters.csv`` — long form: study × param → value.
+    - ``stability_cells.csv`` — the ranked weight cells per study.
+    - ``stability_bootstraps.csv`` — the per-bootstrap leaderboard per study.
+    - ``covariate_impact.csv`` — per-covariate effects (when covariates set).
     """
-    import csv
+    import json
 
     import numpy as np
-    import optuna as _optuna
-
-    rows: list[dict] = []
-
-    study = getattr(engine, "study", None)
-    best_trial = study.best_trial if study is not None else None
-    best_train = (
-        float(best_trial.user_attrs.get("train_score_mean"))
-        if best_trial is not None
-        and best_trial.user_attrs.get("train_score_mean") is not None
-        else None
-    )
-    best_val_csv = float(best_value) if best_value is not None else None
-    best_test = (
-        float(test_results.get("test_score"))
-        if test_results is not None and test_results.get("test_score") is not None
-        else None
-    )
-    rows.append(
-        {
-            "params_source": "best",
-            "split": "cv_train_mean",
-            "metric": objective_metric,
-            "score": best_train if best_train is not None else "",
-        }
-    )
-    rows.append(
-        {
-            "params_source": "best",
-            "split": "cv_val_mean",
-            "metric": objective_metric,
-            "score": best_val_csv if best_val_csv is not None else "",
-        }
-    )
-    rows.append(
-        {
-            "params_source": "best",
-            "split": "test",
-            "metric": objective_metric,
-            "score": best_test if best_test is not None else "",
-        }
-    )
-
-    if averaged_params is not None and study is not None:
-        try:
-            robust = engine.get_robust_trials(
-                val_p_threshold=0.05,
-                consistency_tolerance=0.1,
-                min_trials=10,
-            )
-        except Exception:
-            robust = []
-        if not robust:
-            robust = [
-                t for t in study.trials if t.state == _optuna.trial.TrialState.COMPLETE
-            ]
-        n_top = max(1, int(len(robust) * 0.2))
-        top_trials = sorted(
-            robust,
-            key=lambda t: t.value if t.value is not None else float("nan"),
-            reverse=(study.direction.name == "MAXIMIZE"),
-        )[:n_top]
-        top_train_means = [
-            float(t.user_attrs.get("train_score_mean"))
-            for t in top_trials
-            if t.user_attrs.get("train_score_mean") is not None
-        ]
-        top_val_means = [
-            float(t.user_attrs.get("val_score_mean"))
-            for t in top_trials
-            if t.user_attrs.get("val_score_mean") is not None
-        ]
-        avg_train = float(np.mean(top_train_means)) if top_train_means else None
-        avg_val = float(np.mean(top_val_means)) if top_val_means else None
-
-        clean_avg = {k: v for k, v in averaged_params.items() if not k.startswith("__")}
-        try:
-            avg_test_result = engine.evaluate_on_test(
-                params=clean_avg, metric=objective_metric
-            )
-            avg_test = float(avg_test_result.get("test_score"))
-        except Exception as exc:
-            log(
-                "WARN",
-                f"[{label}] Test scoring for averaged params failed: {exc}",
-            )
-            avg_test = None
-
-        rows.append(
-            {
-                "params_source": "averaged_top20",
-                "split": "cv_train_mean",
-                "metric": objective_metric,
-                "score": avg_train if avg_train is not None else "",
-            }
-        )
-        rows.append(
-            {
-                "params_source": "averaged_top20",
-                "split": "cv_val_mean",
-                "metric": objective_metric,
-                "score": avg_val if avg_val is not None else "",
-            }
-        )
-        rows.append(
-            {
-                "params_source": "averaged_top20",
-                "split": "test",
-                "metric": objective_metric,
-                "score": avg_test if avg_test is not None else "",
-            }
-        )
+    import pandas as pd
 
     os.makedirs(output_dir, exist_ok=True)
-    basename = f"split_scores__{label}.csv" if multi_outcome else "split_scores.csv"
-    csv_path = os.path.join(output_dir, basename)
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f, fieldnames=["params_source", "split", "metric", "score"]
+    sfx = f"__{label}" if multi_outcome else ""
+    written: list[str] = []
+    studies = _study_bundles(cgi_bundle, standalones_bundle)
+
+    def _path(name: str) -> str:
+        return os.path.join(output_dir, name)
+
+    def _f(v: Any) -> float | None:
+        try:
+            fv = float(v)
+            return fv if np.isfinite(fv) else None
+        except (TypeError, ValueError):
+            return None
+
+    def _ci(bundle: dict) -> dict:
+        return (bundle.get("test_results") or {}).get("test_ci") or {}
+
+    def _emit_json(name: str, payload: Any) -> None:
+        try:
+            p = _path(name)
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, default=str)
+            written.append(p)
+        except Exception as exc:  # pragma: no cover - disk-IO guard
+            log("WARN", f"[{label}] Could not write {name}: {exc}")
+
+    def _emit_csv(name: str, rows: list[dict]) -> None:
+        if not rows:
+            return
+        try:
+            p = _path(name)
+            pd.DataFrame(rows).to_csv(p, index=False)
+            written.append(p)
+        except Exception as exc:  # pragma: no cover - disk-IO guard
+            log("WARN", f"[{label}] Could not write {name}: {exc}")
+
+    # ── run_config.json (fidelity record) ─────────────────────────────
+    if run_config_record is not None:
+        _emit_json(f"run_config{sfx}.json", run_config_record)
+
+    # ── test_scores.csv ───────────────────────────────────────────────
+    test_rows: list[dict] = []
+    for key, _disp, b in studies:
+        tr = b.get("test_results") or {}
+        ci = _ci(b)
+        test_rows.append(
+            {
+                "study": key,
+                "metric": objective_metric,
+                "test_score": _f(tr.get("test_score")),
+                "ci_lower": _f(ci.get("lower")),
+                "ci_upper": _f(ci.get("upper")),
+                "direction": (
+                    int(b["direction_sign"])
+                    if b.get("direction_sign") is not None
+                    else None
+                ),
+            }
         )
-        writer.writeheader()
-        writer.writerows(rows)
-    log("OK", f"[{label}] Wrote per-split objective scores: {csv_path}")
+    _emit_csv(f"test_scores{sfx}.csv", test_rows)
+
+    # ── scores.csv (every subset) ─────────────────────────────────────
+    score_rows: list[dict] = []
+    for key, _disp, b in studies:
+        subsets = b.get("subset_scores") or {}
+        for subset in ("train", "val", "test", "all"):
+            block = subsets.get(subset) or {}
+            if not block:
+                continue
+            score_rows.append(
+                {
+                    "study": key,
+                    "subset": subset,
+                    "metric": objective_metric,
+                    "score": _f(block.get("score")),
+                    "score_raw": _f(block.get("score_raw")),
+                    "n": block.get("n"),
+                }
+            )
+    _emit_csv(f"scores{sfx}.csv", score_rows)
+
+    # ── parameters.csv (long form) ────────────────────────────────────
+    param_rows: list[dict] = []
+    for key, _disp, b in studies:
+        params = _clean_params(b.get("averaged_params") or b.get("best_params"))
+        for pname, pval in params.items():
+            param_rows.append({"study": key, "param": pname, "value": pval})
+    _emit_csv(f"parameters{sfx}.csv", param_rows)
+
+    # ── stability_cells.csv + stability_bootstraps.csv ────────────────
+    cell_rows: list[dict] = []
+    bs_rows: list[dict] = []
+    for key, _disp, b in studies:
+        summ = b.get("stability_summary") or {}
+        for rank, c in enumerate(summ.get("cell_stats") or [], start=1):
+            row: dict = {"study": key, "rank": rank}
+            for wk, wv in (c.get("weights") or {}).items():
+                row[wk] = wv
+            row["count"] = c.get("count")
+            row["q_worst"] = _f(c.get("q_worst"))
+            row["median"] = _f(c.get("median"))
+            row["selection_probability"] = _f(c.get("selection_probability"))
+            cell_rows.append(row)
+        for entry in summ.get("per_bootstrap_summary") or []:
+            row = {
+                "study": key,
+                "bootstrap": entry.get("bootstrap"),
+                "n_trials": entry.get("n_trials"),
+                "top_oob": _f(entry.get("top_oob")),
+                "median_oob": _f(entry.get("median_oob")),
+                "min_oob": _f(entry.get("min_oob")),
+                "max_oob": _f(entry.get("max_oob")),
+            }
+            for pk, pv in (entry.get("top_params") or {}).items():
+                row[pk] = pv
+            bs_rows.append(row)
+    _emit_csv(f"stability_cells{sfx}.csv", cell_rows)
+    _emit_csv(f"stability_bootstraps{sfx}.csv", bs_rows)
+
+    # ── covariate_impact.csv ──────────────────────────────────────────
+    if covariate_impact and covariate_impact.get("per_covariate"):
+        _emit_csv(
+            f"covariate_impact{sfx}.csv",
+            [dict(r) for r in covariate_impact["per_covariate"]],
+        )
+
+    # ── results_summary.json (master manifest) ────────────────────────
+    studies_manifest: dict[str, dict] = {}
+    for key, disp, b in studies:
+        tr = b.get("test_results") or {}
+        summ = b.get("stability_summary") or {}
+        studies_manifest[key] = {
+            "display": disp,
+            "channel": b.get("channel", "cgi"),
+            "params": _clean_params(b.get("averaged_params") or b.get("best_params")),
+            "test_score": _f(tr.get("test_score")),
+            "test_ci": {
+                "lower": _f(_ci(b).get("lower")),
+                "upper": _f(_ci(b).get("upper")),
+                "method": _ci(b).get("method", "percentile"),
+            },
+            "direction": (
+                int(b["direction_sign"])
+                if b.get("direction_sign") is not None
+                else None
+            ),
+            "subset_scores": b.get("subset_scores") or {},
+            "stability": {
+                k: summ.get(k)
+                for k in (
+                    "q_worst",
+                    "median",
+                    "count",
+                    "selection_probability",
+                    "worst_quantile",
+                    "n_bootstraps",
+                    "n_trials_per_bootstrap",
+                    "n_total_trials",
+                    "higher_is_better",
+                )
+            },
+        }
+
+    cov_summary = None
+    if covariate_impact:
+        cov_summary = {
+            k: covariate_impact.get(k)
+            for k in (
+                "r2_full",
+                "r2_cgi_only",
+                "r2_lift_from_covariates",
+                "cgi_coef",
+                "cgi_std_err",
+                "n",
+            )
+        }
+        cov_summary["per_covariate"] = covariate_impact.get("per_covariate") or []
+
+    manifest = {
+        "outcome": label,
+        "objective_metric": objective_metric,
+        "cgi_formula": formula_name,
+        "studies": studies_manifest,
+        "cgi_vs_standalone_aic_bic": aic_bic,
+        "covariate_impact": cov_summary,
+        "collinearity": collinearity_report,
+    }
+    _emit_json(f"results_summary{sfx}.json", manifest)
+
+    # ── aic_bic.json + collinearity.json (standalone copies) ──────────
+    if aic_bic is not None:
+        _emit_json(f"aic_bic{sfx}.json", aic_bic)
+    if collinearity_report:
+        _emit_json(f"collinearity{sfx}.json", collinearity_report)
+
+    log(
+        "OK",
+        f"[{label}] Wrote {len(written)} result file(s) to {output_dir}.",
+    )
+    return written
 
 
 # Human labels for the standalone channels surfaced in ledger stages and
@@ -1197,6 +1299,45 @@ def run_fusion(
             mixedlm_postscore=mixedlm_postscore_enabled,
         )
         ctx.update_stage_ledger(ledger.to_dict())
+
+        # Settings snapshot written verbatim into each job's ``study_results``
+        # so the run is reproducible from disk (the job store records the same
+        # config, but the JSON travels with the artifacts). Secrets and
+        # infra-only handles (API key, project id, file paths, engine class)
+        # are intentionally excluded.
+        run_config_record: dict[str, Any] = {
+            "objective_metric": objective_metric,
+            "cgi_formula": cgi_formula,
+            "covariate_columns": list(covariate_columns or []),
+            "standalone_channels": list(standalones),
+            "test_size": float(test_size),
+            "n_bins": n_bins,
+            "n_bootstraps": int(n_bootstraps),
+            "n_trials_per_bootstrap": int(n_trials_per_bootstrap),
+            "min_cell_count": int(min_cell_count),
+            "buffer_meters": buffer_meters,
+            "gvi_buffer_min_m": gvi_buffer_min_m,
+            "gvi_buffer_max_m": gvi_buffer_max_m,
+            "gvi_buffer_step_m": gvi_buffer_step_m,
+            "ndvi_buffer_min_m": ndvi_buffer_min_m,
+            "ndvi_buffer_max_m": ndvi_buffer_max_m,
+            "ndvi_buffer_step_m": ndvi_buffer_step_m,
+            "ndvi_resolution_m": ndvi_resolution_m,
+            "gvi_grid_spacing_m": gvi_grid_spacing_m,
+            "cgi_grid_spacing_m": cgi_grid_spacing_m,
+            "whole_grid_scaling": bool(whole_grid_scaling),
+            "area_balanced_split": bool(area_balanced_split),
+            "check_collinearity": bool(check_collinearity),
+            "vif_threshold": float(vif_threshold),
+            "cache_metrics": bool(cache_metrics),
+            "resume_existing_study": bool(resume_existing_study),
+            "ndvi_start_date": ndvi_start_date,
+            "ndvi_end_date": ndvi_end_date,
+            "multi_objective_requested": bool(multi_objective_requested),
+            "longitudinal_spec": longitudinal_spec_payload,
+            "target_display_name": target_display_name,
+            "selection_method": "bootstrap_stability_selection",
+        }
 
         def stage(key: str, status: str, message: str = "") -> None:
             """Record a stage transition in the ledger and persist it."""
@@ -1730,6 +1871,25 @@ def run_fusion(
                     engine, ch_headline_params, objective_metric
                 )
 
+                # Per-subset scores (train / val / test / all) for this
+                # standalone, computed while ``_active_greenery_channel`` is
+                # still pinned to ``ch`` so the composite is the single-channel
+                # value the study optimized. Gives the standalone the same
+                # subset-score parity the CGI study has.
+                ch_subset_scores: dict | None = None
+                try:
+                    ch_subset_scores = engine.compute_subset_scores(
+                        params=ch_headline_params,
+                        metric=objective_metric,
+                        top_percent=0.2,
+                    )
+                except Exception as exc:
+                    _log_fusion(
+                        "WARN",
+                        f"[{label}] Standalone {ch} subset-score "
+                        f"computation failed: {exc}",
+                    )
+
                 # Composite TIFF for this standalone (no master study → no
                 # per-trial plots). Written into its own subdirectory.
                 ch_report_dir = os.path.join(
@@ -1765,7 +1925,7 @@ def run_fusion(
                     "all_completed_trials": [],
                     "per_trial_test": {},
                     "test_results": ch_test,
-                    "subset_scores": None,
+                    "subset_scores": ch_subset_scores,
                     "stability_summary": ch_stability_summary,
                     "direction_sign": ch_direction,
                     "objective_metric": objective_metric,
@@ -1860,28 +2020,6 @@ def run_fusion(
                 )
             stage(skey("reports"), DONE)
 
-            # Persist the train / val / test scores for the averaged (top-20%)
-            # params alongside the CV best score so downstream analysis has
-            # one canonical metrics CSV per job.
-            try:
-                _write_split_scores_csv(
-                    engine=engine,
-                    label=label,
-                    multi_outcome=multi_outcome,
-                    output_dir=report_dir,
-                    objective_metric=objective_metric,
-                    best_value=cgi_best_value,
-                    best_params=best_params,
-                    averaged_params=averaged_params,
-                    test_results=test_results,
-                    log=_log_fusion,
-                )
-            except Exception as exc:
-                _log_fusion(
-                    "WARN",
-                    f"[{label}] Could not write per-split metrics CSV: {exc}",
-                )
-
             cgi_subset_scores: dict | None = None
             try:
                 cgi_subset_scores = engine.compute_subset_scores(
@@ -1936,6 +2074,32 @@ def run_fusion(
             }
             by_target[label] = bundle
             engines_by_target[label] = engine
+
+            # Persist every test result (CGI + standalones) to disk: a
+            # machine-readable manifest plus tidy CSVs. Best-effort — a write
+            # failure is logged, never fatal to the run.
+            try:
+                result_files = _write_fusion_outputs(
+                    output_dir=report_dir,
+                    label=label,
+                    multi_outcome=multi_outcome,
+                    objective_metric=objective_metric,
+                    formula_name=cgi_formula,
+                    cgi_bundle=bundle,
+                    standalones_bundle=standalones_bundle,
+                    aic_bic=cgi_vs_standalone_aic_bic,
+                    covariate_impact=covariate_impact,
+                    collinearity_report=bundle.get("collinearity_report"),
+                    run_config_record=run_config_record,
+                    log=_log_fusion,
+                )
+                output_paths.extend(result_files)
+            except Exception as exc:
+                _log_fusion(
+                    "WARN",
+                    f"[{label}] Could not write fusion result files: {exc}",
+                )
+
             ctx.progress(value=prog(1.0))
 
         sole_label = ordered_labels[0]
