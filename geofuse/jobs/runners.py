@@ -1088,6 +1088,12 @@ def _stability_summary(params: dict) -> dict:
         "cell_stats": g("__cell_stats__", []),
         "winning_cell_oob_scores": g("__winning_cell_oob_scores__", []),
         "per_bootstrap_summary": g("__per_bootstrap_summary__", []),
+        # Stage-2 (radius sub-cell) diagnostics.
+        "radius_cell_q_worst": g("__radius_cell_q_worst__"),
+        "radius_cell_median": g("__radius_cell_median__"),
+        "radius_cell_count": g("__radius_cell_count__"),
+        "radius_bin_m": g("__radius_bin_m__"),
+        "radius_cell_stats": g("__radius_cell_stats__", []),
     }
 
 
@@ -1221,6 +1227,7 @@ def run_fusion(
     n_bootstraps: int = 20,
     n_trials_per_bootstrap: int = 50,
     min_cell_count: int = 3,
+    worst_quantile: float = 0.10,
     check_collinearity: bool = False,
     vif_threshold: float = 10.0,
 ) -> dict:
@@ -1315,6 +1322,7 @@ def run_fusion(
             "n_bootstraps": int(n_bootstraps),
             "n_trials_per_bootstrap": int(n_trials_per_bootstrap),
             "min_cell_count": int(min_cell_count),
+            "worst_quantile": float(worst_quantile),
             "buffer_meters": buffer_meters,
             "gvi_buffer_min_m": gvi_buffer_min_m,
             "gvi_buffer_max_m": gvi_buffer_max_m,
@@ -1725,6 +1733,7 @@ def run_fusion(
                 n_bootstraps=int(n_bootstraps),
                 n_trials_per_bootstrap=int(n_trials_per_bootstrap),
                 min_cell_count=int(min_cell_count),
+                worst_quantile=float(worst_quantile),
                 seed=42,
                 cancel_callback=cancel_check,
             )
@@ -1842,6 +1851,7 @@ def run_fusion(
                     n_bootstraps=int(n_bootstraps),
                     n_trials_per_bootstrap=int(n_trials_per_bootstrap),
                     min_cell_count=int(min_cell_count),
+                    worst_quantile=float(worst_quantile),
                     seed=42,
                     cancel_callback=cancel_check,
                 )

@@ -775,6 +775,7 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "n_bootstraps",
     "n_trials_per_bootstrap",
     "min_cell_count",
+    "worst_quantile",
     "check_collinearity",
     "vif_threshold",
 )
@@ -1468,7 +1469,7 @@ def _render_study_details_panel(
     # studies on resamples of the train+val pool, scored on out-of-bag rows,
     # picking the weight cell with the best worst-quantile OOB score.
     st.markdown("**Stability selection**")
-    col_s1, col_s2, col_s3 = st.columns(3)
+    col_s1, col_s2, col_s3, col_s4 = st.columns(4)
     with col_s1:
         n_bootstraps_ui = st.number_input(
             "Bootstraps (B)",
@@ -1507,6 +1508,24 @@ def _render_study_details_panel(
                 "A weight cell only competes for the worst-quantile ranking "
                 "if it holds at least this many trials across all bootstraps. "
                 "Rule of thumb: at least 10 for a stable quantile estimate."
+            ),
+        )
+    with col_s4:
+        worst_quantile_ui = st.number_input(
+            "Worst quantile",
+            min_value=0.01,
+            max_value=0.50,
+            value=float(st.session_state.get("fusion_worst_quantile", 0.10)),
+            step=0.05,
+            format="%.2f",
+            key="fusion_worst_quantile",
+            help=(
+                "The cell winner is the one with the best score at this lower "
+                "quantile of its out-of-bag scores (upper quantile for "
+                "lower-is-better metrics). 0.10 = judge on the 10th-percentile "
+                "worst case (robust). Lower (0.05) is stricter; higher (0.25-"
+                "0.50) leans toward typical/peak performance. Needs enough "
+                "trials per cell to be a stable estimate."
             ),
         )
 
@@ -1555,6 +1574,7 @@ def _render_study_details_panel(
         "n_bootstraps": int(n_bootstraps_ui),
         "n_trials_per_bootstrap": int(n_trials_per_bootstrap_ui),
         "min_cell_count": int(min_cell_count_ui),
+        "worst_quantile": float(worst_quantile_ui),
         "check_collinearity": bool(check_collinearity),
         "vif_threshold": float(vif_threshold_ui),
     }
@@ -2050,6 +2070,43 @@ def _render_stability_diagnostics(summary: dict, metric_name: str) -> None:
             "appeared in the top-20% by OOB score. A winner with a tight "
             "cluster of similar runners-up is more credible than an "
             "isolated outlier."
+        )
+
+    # ── Stage-2 radius sub-cells (within the winning weight cell) ─────
+    radius_stats = summary.get("radius_cell_stats") or []
+    if radius_stats:
+        bin_m = summary.get("radius_bin_m")
+        st.markdown(
+            "**Top radius sub-cells** (within the winning weight cell, "
+            "ranked by `q_worst`)"
+        )
+        rrows: list[dict] = []
+        for rank, c in enumerate(radius_stats, start=1):
+            row = {"Rank": rank}
+            for rk, lo in (c.get("radii") or {}).items():
+                label = rk.removesuffix("_radius").upper() + " radius (m)"
+                try:
+                    hi = int(lo) + int(bin_m) if bin_m else None
+                    row[label] = f"{int(lo)}–{hi}" if hi else int(lo)
+                except (TypeError, ValueError):
+                    row[label] = lo
+            row["Count"] = int(c.get("count", 0))
+            row[f"q_worst {metric_name}"] = round(
+                float(c.get("q_worst", float("nan"))), 4
+            )
+            row[f"Median {metric_name}"] = round(
+                float(c.get("median", float("nan"))), 4
+            )
+            rrows.append(row)
+        st.dataframe(_pd.DataFrame(rrows), width="stretch")
+        st.caption(
+            "Stage 2 of selection: with the channel mix fixed by the winning "
+            "weight cell above, the radii are stability-selected the same way "
+            "— each row is a radius bucket"
+            + (f" of width {int(bin_m)} m" if bin_m else "")
+            + ". The final composite uses the params averaged within the "
+            "top radius sub-cell, so the reported radii are a validated "
+            "configuration rather than a mean across disagreeing trials."
         )
 
     # ── Winning cell OOB distribution ─────────────────────────────────
@@ -3108,6 +3165,7 @@ def render(output_dir: str) -> None:
         study_state.get("n_trials_per_bootstrap", 50)
     )
     min_cell_count_param = int(study_state.get("min_cell_count", 3))
+    worst_quantile_param = float(study_state.get("worst_quantile", 0.10))
     check_collinearity_param = bool(study_state.get("check_collinearity", False))
     vif_threshold_param = float(study_state.get("vif_threshold", 10.0))
 
@@ -3456,6 +3514,7 @@ def render(output_dir: str) -> None:
                 "n_bootstraps": int(n_bootstraps_param),
                 "n_trials_per_bootstrap": int(n_trials_per_bootstrap_param),
                 "min_cell_count": int(min_cell_count_param),
+                "worst_quantile": float(worst_quantile_param),
                 "check_collinearity": bool(check_collinearity_param),
                 "vif_threshold": float(vif_threshold_param),
             }

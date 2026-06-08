@@ -154,14 +154,50 @@ def weight_cell_key(
 
     Returns a tuple of bucketed weights ordered by the formula's
     ``weight_keys``. Two trials map to the same cell iff every weight falls
-    in the same bucket. Other parameters (radii, stats, percentiles, powers)
-    are NOT part of the key — they are averaged within the chosen cell after
-    selection. Stability is judged primarily on the channel-mix decision,
-    not on the spatial-aggregation tuning, because in practice the mix
-    drives the parameter-space landscape and the rest is noise on top.
+    in the same bucket. This keys the **first** stability-selection stage,
+    which judges the channel-mix decision; the spatial tuning (radii,
+    aggregators) is then judged within the winning weight cell by
+    :func:`radius_cell_key` in the second stage.
     """
     desc = get_formula(formula)
     return tuple(bin_weight(params.get(k, 0), bin_pct) for k in desc.weight_keys)
+
+
+# Bucket width (metres) for the radius-cell key used by the second stability-
+# selection stage. Defaults to the typical buffer-ladder step so each radius
+# bucket collects enough trials within the winning weight cell to produce a
+# meaningful worst-quantile estimate.
+RADIUS_BIN_M: int = 50
+
+
+def bin_radius(value: int | float, step_m: int | float = RADIUS_BIN_M) -> int:
+    """Snap a radius (metres) to a 0-indexed bucket of width ``step_m``.
+
+    A radius of 275 with 50 m buckets returns 5 (= the [250, 300) bucket).
+    """
+    s = max(1, int(round(float(step_m))))
+    return int(float(value)) // s
+
+
+def radius_cell_key(
+    params: dict,
+    radius_keys: tuple[str, ...],
+    stat_keys: tuple[str, ...],
+    step_m: int | float = RADIUS_BIN_M,
+) -> tuple:
+    """Cell key from a trial's spatial-tuning params (second selection stage).
+
+    Bins each radius in ``radius_keys`` to a ``step_m`` bucket and appends each
+    aggregator in ``stat_keys`` as an exact category. ``radius_keys`` /
+    ``stat_keys`` are restricted to the **active** channels by the caller so a
+    standalone study keys only on its own channel (the other channels' radii
+    are sampled but never enter that study's score). Percentiles are not part
+    of the key — they are averaged within the chosen radius cell, like the
+    radii were before two-stage selection.
+    """
+    parts: list = [bin_radius(params.get(k, 0), step_m) for k in radius_keys]
+    parts += [str(params.get(k, "mean")) for k in stat_keys]
+    return tuple(parts)
 
 
 # ---------------------------------------------------------------------------

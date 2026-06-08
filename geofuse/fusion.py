@@ -6307,6 +6307,7 @@ class MetricFusionEngine:
         top_percent_per_bootstrap: float = 0.2,
         min_cell_count: int = 3,
         worst_quantile: float = 0.10,
+        radius_bin_m: int | None = None,
         seed: int = 42,
         cancel_callback: Callable[..., bool] | None = None,
         progress_callback: Callable[[int, int], None] | None = None,
@@ -6373,12 +6374,22 @@ class MetricFusionEngine:
                 aborts the bootstrap loop cleanly.
             progress_callback: ``(done, total)`` called after each bootstrap.
 
+        Selection is two-stage: stage 1 picks the weight cell (channel mix)
+        as above; stage 2 re-bins that cell's trials by a coarse radius key
+        (active channels only, width ``radius_bin_m`` — auto-derived to ~3
+        buckets across the ladder when ``None``) and picks the radius
+        sub-cell with the best q_worst. The final params are averaged within
+        that sub-cell, so the reported radii are a validated configuration
+        rather than a mean across disagreeing trials.
+
         Returns: averaged-params dict in the same shape as
         :meth:`compute_averaged_top_params`, plus bookkeeping keys
         ``__cell_q_worst__``, ``__cell_count__``, ``__cell_median__``,
         ``__cell_selection_probability__``, ``__n_bootstraps__``,
         ``__n_trials_per_bootstrap__``, ``__n_total_trials__``,
-        ``__worst_quantile__``.
+        ``__worst_quantile__``, and stage-2 keys ``__radius_cell_q_worst__``,
+        ``__radius_cell_median__``, ``__radius_cell_count__``,
+        ``__radius_bin_m__``, ``__radius_cell_stats__``.
         """
         from statistics import mode
 
@@ -6697,17 +6708,88 @@ class MetricFusionEngine:
                 for cell_key, rs in cells.items()
             ]
 
-        # Pick the cell with the best q_worst.
+        # Pick the weight cell with the best q_worst (stage 1: channel mix).
         best = max(
             cell_stats,
             key=lambda c: c["q_worst"] if higher_is_better else -c["q_worst"],
         )
 
-        # ── Average params within the winning cell ───────────────────────
+        # ── Stage 2: spatial tuning within the winning weight cell ────────
+        # The weight cell fixes the channel mix; now stability-select the
+        # radii the same way — re-bin the cell's trials by a coarse radius
+        # key (active channels only) and pick the radius sub-cell with the
+        # best q_worst. This stops the final radii from being a mean of
+        # disagreeing values that no trial actually validated.
+        active_ch = getattr(self, "_active_greenery_channel", "cgi") or "cgi"
+        radius_keys: tuple[str, ...] = {
+            "veg": ("veg_radius",),
+            "terrain": ("terrain_radius",),
+            "ndvi": ("ndvi_radius",),
+        }.get(active_ch, ("veg_radius", "terrain_radius", "ndvi_radius"))
+
+        if radius_bin_m is None:
+            # Coarsen to ~3 buckets across the active channels' ladder so the
+            # sub-cells stay populated within one weight cell's trials.
+            gvi_r = self._outer_radii_metres(gvi=True)
+            ndvi_r = self._outer_radii_metres(gvi=False)
+            spans: list[float] = []
+            if active_ch in ("veg", "terrain", "cgi") and gvi_r.size:
+                spans.append(float(gvi_r.max()) - float(gvi_r.min()))
+            if active_ch in ("ndvi", "cgi") and ndvi_r.size:
+                spans.append(float(ndvi_r.max()) - float(ndvi_r.min()))
+            span = max(spans) if spans else 0.0
+            radius_bin_eff = (
+                max(1, int(round(span / 3.0)))
+                if span > 0
+                else int(cgi_formulas.RADIUS_BIN_M)
+            )
+        else:
+            radius_bin_eff = max(1, int(round(float(radius_bin_m))))
+
+        radius_cells: dict[tuple, list[dict]] = {}
+        for r in best["records"]:
+            rk = cgi_formulas.radius_cell_key(
+                r["params"], radius_keys, (), radius_bin_eff
+            )
+            radius_cells.setdefault(rk, []).append(r)
+
+        def _radius_stat(rk: tuple, rs: list[dict]) -> dict:
+            s = [r["oob_score"] for r in rs]
+            return {
+                "cell": rk,
+                "count": len(rs),
+                "q_worst": _q_worst(s),
+                "median": float(np.median(s)),
+                "records": rs,
+            }
+
+        radius_stats = [
+            _radius_stat(rk, rs)
+            for rk, rs in radius_cells.items()
+            if len(rs) >= int(min_cell_count)
+        ]
+        if not radius_stats:
+            # Same fallback as stage 1: no radius sub-cell met the count
+            # threshold, so rank every sub-cell regardless of count.
+            logger.warning(
+                "No radius sub-cell reached min_cell_count="
+                f"{min_cell_count} within the winning weight cell; ranking "
+                "all radius sub-cells regardless of count. Consider raising "
+                "n_trials_per_bootstrap."
+            )
+            radius_stats = [
+                _radius_stat(rk, rs) for rk, rs in radius_cells.items()
+            ]
+        radius_best = max(
+            radius_stats,
+            key=lambda c: c["q_worst"] if higher_is_better else -c["q_worst"],
+        )
+
+        # ── Average params within the winning radius sub-cell ─────────────
         # Re-uses the same renormalization rules as compute_averaged_top_params
         # so downstream code (composite generation, report) can consume the
         # output identically. ``formula`` was resolved up front (see above).
-        winners = best["records"]
+        winners = radius_best["records"]
 
         def _mean_int(name: str, default: int) -> int:
             vals = [int(r["params"].get(name, default)) for r in winners]
@@ -6846,6 +6928,31 @@ class MetricFusionEngine:
         final_params["__n_trials_per_bootstrap__"] = int(n_trials_per_bootstrap)
         final_params["__n_total_trials__"] = int(len(records))
         final_params["__worst_quantile__"] = float(worst_quantile)
+        # Stage-2 (radius sub-cell) diagnostics: the spatial-tuning winner
+        # within the chosen weight cell. ``__cell_*__`` above describe the
+        # channel-mix decision; these describe the radii the final params
+        # were actually averaged from.
+        final_params["__radius_cell_count__"] = int(radius_best["count"])
+        final_params["__radius_cell_q_worst__"] = float(radius_best["q_worst"])
+        final_params["__radius_cell_median__"] = float(radius_best["median"])
+        final_params["__radius_bin_m__"] = int(radius_bin_eff)
+        ranked_radius = sorted(
+            radius_stats,
+            key=lambda c: c["q_worst"] if higher_is_better else -c["q_worst"],
+            reverse=True,
+        )
+        final_params["__radius_cell_stats__"] = [
+            {
+                "radii": {
+                    radius_keys[i]: int(c["cell"][i] * radius_bin_eff)
+                    for i in range(len(radius_keys))
+                },
+                "count": int(c["count"]),
+                "q_worst": float(c["q_worst"]),
+                "median": float(c["median"]),
+            }
+            for c in ranked_radius[:10]
+        ]
         # Compatibility with downstream code that reads the field names
         # ``compute_averaged_top_params`` populates.
         final_params["__n_top_trials__"] = int(best["count"])
