@@ -24,7 +24,6 @@ from scipy.stats import pearsonr, spearmanr
 from shapely.geometry import box
 from sklearn.metrics import mean_squared_error, mutual_info_score, r2_score
 from sklearn.model_selection import StratifiedKFold, train_test_split
-from sklearn.preprocessing import MinMaxScaler
 
 from . import (
     cgi_formulas,
@@ -3451,8 +3450,8 @@ class MetricFusionEngine:
         self.target_gdf = entity_gdf.copy()
 
         # Coverage probe: nearest-feature sample at each pixel using the
-        # channel's max radius. The values feed the split-time MinMaxScaler
-        # and the dropna gate; per-trial values come from the cache.
+        # channel's max radius. The values feed only the NaN-filtering dropna
+        # gate; per-trial channel values come from the cache.
         _log(
             "INFO",
             "Probing initial veg / terrain / NDVI coverage at pixel centroids "
@@ -3652,8 +3651,8 @@ class MetricFusionEngine:
 
         self.target_gdf = entity_gdf.copy()
 
-        # Coverage probe at the pixel centroids (used only for NaN-filtering
-        # and the feature MinMaxScaler; per-trial values come from the cache).
+        # Coverage probe at the pixel centroids (used only for NaN-filtering;
+        # per-trial channel values come from the cache).
         _log(
             "INFO",
             "Probing initial veg / terrain / NDVI coverage at pixel centroids...",
@@ -3777,6 +3776,37 @@ class MetricFusionEngine:
             pid = pid[mask]
         g = pd.Series(v).groupby(pid)
         return (g.mean() if how == "mean" else g.first()).to_numpy()
+
+    def _finalize_composite(self, composite: np.ndarray) -> np.ndarray:
+        """Apply the ``whole_grid_scaling`` toggle to a per-pixel composite.
+
+        Per-channel scaling is never applied — the composite (CGI in combined
+        mode, the single channel in standalone mode) is always a weighted
+        combination of **raw** aggregated channel values. This toggle instead
+        governs the composite itself: when on, the per-pixel composite is
+        min-max normalized to ``[0, 1]`` over the supplied pixels before it is
+        collapsed to entities / scored / written; when off, the raw composite
+        is used everywhere. Applied identically in scoring and in the output
+        raster (and mirrored for standalone single-channel maps) so the
+        rendered map always matches the values that were scored.
+
+        Note: the cross-sectional metrics are scale-invariant (distance
+        correlation and r² are affine-invariant; Spearman and quantile-binned
+        mutual information are rank-invariant; nRMSE min-max normalizes
+        internally), so this changes the recorded composite values and the
+        output raster — not the optimization objective.
+        """
+        if not self.whole_grid_scaling:
+            return composite
+        arr = np.asarray(composite, dtype=np.float64)
+        valid = ~np.isnan(arr)
+        if np.any(valid):
+            lo = float(arr[valid].min())
+            hi = float(arr[valid].max())
+            if hi > lo:
+                arr = arr.copy()
+                arr[valid] = (arr[valid] - lo) / (hi - lo)
+        return arr
 
     def _prepare_point_fusion(self) -> pd.DataFrame:
         """Sample metrics at point locations."""
@@ -4445,18 +4475,9 @@ class MetricFusionEngine:
                         self.train_val_data[group_col].isin(vl_polys)
                     ].copy()
 
-                    # Normalize features (0-1) using training fold data
-                    scaler = MinMaxScaler()
-                    train_fold[["veg", "terrain", "ndvi"]] = scaler.fit_transform(
-                        train_fold[["veg", "terrain", "ndvi"]]
-                    )
-                    val_fold[["veg", "terrain", "ndvi"]] = scaler.transform(
-                        val_fold[["veg", "terrain", "ndvi"]]
-                    )
-
-                    self.cv_folds.append(
-                        {"train": train_fold, "val": val_fold, "scaler": scaler}
-                    )
+                    # Per-channel scaling removed — folds keep raw channels;
+                    # the composite is normalized (when enabled) at scoring.
+                    self.cv_folds.append({"train": train_fold, "val": val_fold})
                     logger.info(
                         f"  Fold {fold_idx}: train={len(tr_polys)} polys "
                         f"({len(train_fold)} rows), val={len(vl_polys)} polys "
@@ -4488,16 +4509,7 @@ class MetricFusionEngine:
             val_fold = self.train_val_data[
                 self.train_val_data[group_col].isin(vl_polys)
             ].copy()
-            scaler = MinMaxScaler()
-            train_fold[["veg", "terrain", "ndvi"]] = scaler.fit_transform(
-                train_fold[["veg", "terrain", "ndvi"]]
-            )
-            val_fold[["veg", "terrain", "ndvi"]] = scaler.transform(
-                val_fold[["veg", "terrain", "ndvi"]]
-            )
-            self.cv_folds.append(
-                {"train": train_fold, "val": val_fold, "scaler": scaler}
-            )
+            self.cv_folds.append({"train": train_fold, "val": val_fold})
             logger.info(
                 f"Single train/val split (no CV): train={len(tr_polys)} polys "
                 f"({len(train_fold)} rows), val={len(vl_polys)} polys "
@@ -4572,18 +4584,8 @@ class MetricFusionEngine:
                 train_fold = self.train_val_data.iloc[train_idx].copy()
                 val_fold = self.train_val_data.iloc[val_idx].copy()
 
-                # Normalize features (0-1) using training fold data
-                scaler = MinMaxScaler()
-                train_fold[["veg", "terrain", "ndvi"]] = scaler.fit_transform(
-                    train_fold[["veg", "terrain", "ndvi"]]
-                )
-                val_fold[["veg", "terrain", "ndvi"]] = scaler.transform(
-                    val_fold[["veg", "terrain", "ndvi"]]
-                )
-
-                self.cv_folds.append(
-                    {"train": train_fold, "val": val_fold, "scaler": scaler}
-                )
+                # Per-channel scaling removed — folds keep raw channels.
+                self.cv_folds.append({"train": train_fold, "val": val_fold})
 
                 logger.info(
                     f"  Fold {fold_idx}: {len(train_fold)} train, {len(val_fold)} val"
@@ -4607,14 +4609,8 @@ class MetricFusionEngine:
             )
         train_fold = train_fold.copy()
         val_fold = val_fold.copy()
-        scaler = MinMaxScaler()
-        train_fold[["veg", "terrain", "ndvi"]] = scaler.fit_transform(
-            train_fold[["veg", "terrain", "ndvi"]]
-        )
-        val_fold[["veg", "terrain", "ndvi"]] = scaler.transform(
-            val_fold[["veg", "terrain", "ndvi"]]
-        )
-        self.cv_folds.append({"train": train_fold, "val": val_fold, "scaler": scaler})
+        # Per-channel scaling removed — folds keep raw channels.
+        self.cv_folds.append({"train": train_fold, "val": val_fold})
         logger.info(f"  Single split: {len(train_fold)} train, {len(val_fold)} val")
 
     def optimize_fusion(
@@ -5050,32 +5046,16 @@ class MetricFusionEngine:
                 train_ndvi = np.zeros(len(train_points))
                 val_ndvi = np.zeros(len(val_points))
 
-            # Normalize sampled values (0-1) using fold's scaler — or skip
-            # per-channel scaling entirely under whole-grid mode so the
-            # composite is a weighted sum on raw values and only the
-            # composite itself is min-max normalized over the grid.
+            # Per-channel scaling has been removed: the composite is always a
+            # weighted combination of RAW aggregated channel values. The
+            # ``whole_grid_scaling`` toggle instead normalizes the resulting
+            # composite to [0, 1] (applied after compute_cgi, below).
             train_combined = np.column_stack([train_veg, train_terrain, train_ndvi])
             val_combined = np.column_stack([val_veg, val_terrain, val_ndvi])
 
-            # Remove NaN rows before fitting scaler
             train_valid_mask = ~np.isnan(train_combined).any(axis=1)
-            val_valid_mask = ~np.isnan(val_combined).any(axis=1)
-
             if train_valid_mask.sum() == 0:
                 continue  # Skip this fold if no valid data
-
-            if self.whole_grid_scaling:
-                # In whole-grid mode the fold-level scaler is a no-op since the composite is formed on raw values and the min-max normalization happens at the end on the combined CGI value across the whole grid.
-                pass
-            else:
-                scaler = MinMaxScaler()
-                train_combined[train_valid_mask] = scaler.fit_transform(
-                    train_combined[train_valid_mask]
-                )
-                if val_valid_mask.sum() > 0:
-                    val_combined[val_valid_mask] = scaler.transform(
-                        val_combined[val_valid_mask]
-                    )
 
             train_veg_norm = train_combined[:, 0]
             train_terrain_norm = train_combined[:, 1]
@@ -5112,6 +5092,12 @@ class MetricFusionEngine:
                     "ndvi": (train_ndvi_norm, val_ndvi_norm),
                 }[channel_mode]
                 train_composite, val_composite = single
+
+            # Composite-level [0, 1] normalization when whole_grid_scaling is on
+            # (raw otherwise) — per-pixel, before the entity collapse, and
+            # applied to the standalone single-channel composite too.
+            train_composite = self._finalize_composite(train_composite)
+            val_composite = self._finalize_composite(val_composite)
 
             # Per-fold covariate design matrix (or None when no covariates
             # configured). Polygon mode collapses these alongside the target.
@@ -5551,27 +5537,13 @@ class MetricFusionEngine:
         else:
             test_ndvi = np.zeros(len(test_points))
 
-        # Normalize using a scaler fit on train+val data, or skip per-channel
-        # scaling under ``whole_grid_scaling``.
+        # Per-channel scaling removed — the composite uses raw aggregated
+        # channels. ``whole_grid_scaling`` normalizes the composite below.
         test_combined = np.column_stack([test_veg, test_terrain, test_ndvi])
         test_valid_mask = ~np.isnan(test_combined).any(axis=1)
 
         if test_valid_mask.sum() == 0:
             raise ValueError("No valid test data after aggregation")
-
-        if not self.whole_grid_scaling:
-            scaler = MinMaxScaler()
-            train_val_combined = np.column_stack(
-                [
-                    self.train_val_data["veg"].values,
-                    self.train_val_data["terrain"].values,
-                    self.train_val_data["ndvi"].values,
-                ]
-            )
-            scaler.fit(train_val_combined)
-            test_combined[test_valid_mask] = scaler.transform(
-                test_combined[test_valid_mask]
-            )
 
         test_veg_norm = test_combined[:, 0]
         test_terrain_norm = test_combined[:, 1]
@@ -5595,6 +5567,10 @@ class MetricFusionEngine:
                 "terrain": test_terrain_norm,
                 "ndvi": test_ndvi_norm,
             }[channel_mode]
+
+        # Composite-level [0, 1] normalization (raw when the toggle is off),
+        # mirrored for standalone single-channel composites.
+        test_composite = self._finalize_composite(test_composite)
 
         # Test-set covariate matrix (or None when no covariates configured).
         cov_cols = self.covariate_columns
@@ -5992,16 +5968,9 @@ class MetricFusionEngine:
         else:
             all_ndvi = np.zeros(len(all_points))
 
-        # Normalize using scaler fit on all data
-        scaler = MinMaxScaler()
+        # Per-channel scaling removed — the composite uses raw aggregated
+        # channel values.
         all_combined = np.column_stack([all_veg, all_terrain, all_ndvi])
-        all_valid_mask = ~np.isnan(all_combined).any(axis=1)
-
-        if all_valid_mask.sum() > 0:
-            all_combined[all_valid_mask] = scaler.fit_transform(
-                all_combined[all_valid_mask]
-            )
-
         all_veg_norm = all_combined[:, 0]
         all_terrain_norm = all_combined[:, 1]
         all_ndvi_norm = all_combined[:, 2]
@@ -6017,6 +5986,9 @@ class MetricFusionEngine:
                 "ndvi": all_ndvi_norm,
             },
         )
+        # Composite-level [0, 1] normalization over the whole grid when the
+        # toggle is on (raw otherwise); mirrors the output raster + standalones.
+        composite = self._finalize_composite(composite)
 
         result_df = all_data.copy()
         result_df["veg"] = all_veg
@@ -7639,8 +7611,11 @@ class MetricFusionEngine:
         if progress_callback:
             progress_callback(85, 100)
 
-        # Compute composite, then min-max normalise to [0, 1] so every TIFF
-        # shares the same colour scale.
+        # Compute the composite from RAW channels (no per-channel scaling),
+        # then apply the ``whole_grid_scaling`` toggle: min-max normalise to
+        # [0, 1] over the whole grid when on, raw otherwise — the same
+        # treatment the scorer applied, mirrored for standalone single-channel
+        # maps.
         logger.info(f"Calculating composite via formula '{formula.name}'...")
         composite = compute_cgi(
             self.cgi_formula,
@@ -7651,16 +7626,7 @@ class MetricFusionEngine:
                 "ndvi": ndvi_values,
             },
         )
-        composite_arr = np.asarray(composite, dtype=np.float64)
-        valid_mask_norm = ~np.isnan(composite_arr)
-        if np.any(valid_mask_norm):
-            cmin = float(composite_arr[valid_mask_norm].min())
-            cmax = float(composite_arr[valid_mask_norm].max())
-            if cmax > cmin:
-                composite_arr[valid_mask_norm] = (
-                    composite_arr[valid_mask_norm] - cmin
-                ) / (cmax - cmin)
-        composite = composite_arr
+        composite = self._finalize_composite(np.asarray(composite, dtype=np.float64))
 
         # 7. Create raster
         logger.info(f"Saving composite greenery map to {output_path}")

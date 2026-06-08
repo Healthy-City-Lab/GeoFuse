@@ -1522,11 +1522,7 @@ def _render_study_details_panel(
             key="fusion_worst_quantile",
             help=(
                 "The cell winner is the one with the best score at this lower "
-                "quantile of its out-of-bag scores (upper quantile for "
-                "lower-is-better metrics). 0.10 = judge on the 10th-percentile "
-                "worst case (robust). Lower (0.05) is stricter; higher (0.25-"
-                "0.50) leans toward typical/peak performance. Needs enough "
-                "trials per cell to be a stable estimate."
+                "quantile of its out-of-bag scores."
             ),
         )
 
@@ -1542,33 +1538,26 @@ def _render_study_details_panel(
             value=int(st.session_state.get("fusion_cgi_grid_spacing_m", 50)),
             key="fusion_cgi_grid_spacing_m",
             help=(
-                "Per-pixel CGI grid spacing. For polygons the grid tiles each "
-                "polygon footprint; for points / lines it tiles each entity's "
-                "catchment (its buffer up to the largest tested radius), and "
-                "the entity value is the mean per-pixel CGI inside the trial's "
-                "radius. Smaller = higher fidelity and a bigger cache."
+                "Per-pixel CGI grid spacing. Smaller = higher fidelity and a bigger cache."
+            ),
+        )
+        whole_grid_scaling = st.checkbox(
+            "Scale composite map to [0, 1]",
+            value=bool(st.session_state.get("fusion_whole_grid_scaling", True)),
+            key="fusion_whole_grid_scaling",
+            help=(
+                "Min-max normalise the optimized greenery map (the CGI, or each "
+                "standalone channel) to [0, 1] over the whole grid before it is "
+                "used. "
             ),
         )
         if is_polygon_target:
-            col_p1, col_p2 = st.columns(2)
-            with col_p1:
-                whole_grid_scaling = st.checkbox(
-                    "Whole-grid scaling",
-                    value=bool(
-                        st.session_state.get("fusion_whole_grid_scaling", True)
-                    ),
-                    key="fusion_whole_grid_scaling",
-                    help="Skip per-channel scaling; only the composite raster is normalised.",
-                )
-            with col_p2:
-                area_balanced_split = st.checkbox(
-                    "Area-balanced stratified split",
-                    value=bool(
-                        st.session_state.get("fusion_area_balanced_split", True)
-                    ),
-                    key="fusion_area_balanced_split",
-                    help="Balance polygon area (not count) across train / val / test within each quartile.",
-                )
+            area_balanced_split = st.checkbox(
+                "Area-balanced stratified split",
+                value=bool(st.session_state.get("fusion_area_balanced_split", True)),
+                key="fusion_area_balanced_split",
+                help="Balance polygon area (not count) across train / val / test within each quartile.",
+            )
 
     return {
         "cgi_formula": cgi_formula,
@@ -1688,9 +1677,7 @@ def _render_collinearity_report(results_view: dict) -> None:
         st.metric(
             "Channels kept",
             f"{len(kept)}/{len(channels)}",
-            delta=(
-                f"dropped: {', '.join(dropped)}" if dropped else "all retained"
-            ),
+            delta=(f"dropped: {', '.join(dropped)}" if dropped else "all retained"),
             delta_color="off",
         )
 
@@ -1719,9 +1706,7 @@ def _render_collinearity_report(results_view: dict) -> None:
                 ),
                 "Status": "dropped" if ch in dropped else "kept",
                 "Final VIF": (
-                    round(float(final_by_name[ch]), 3)
-                    if ch in final_by_name
-                    else "—"
+                    round(float(final_by_name[ch]), 3) if ch in final_by_name else "—"
                 ),
             }
         )
@@ -2113,8 +2098,8 @@ def _render_stability_diagnostics(summary: dict, metric_name: str) -> None:
         st.dataframe(_pd.DataFrame(rrows), width="stretch")
         st.caption(
             "Stage 2 of selection: with the channel mix fixed by the winning "
-            "weight cell above, the radii are stability-selected the same way "
-            "— each row is a radius bucket"
+            "weight cell above, the radii are stability-selected the same way. "
+            "Each row is a radius bucket"
             + (f" of width {int(bin_m)} m" if bin_m else "")
             + ". The final composite uses the params averaged within the "
             "top radius sub-cell, so the reported radii are a validated "
@@ -2163,9 +2148,7 @@ def _render_stability_diagnostics(summary: dict, metric_name: str) -> None:
 
     # ── Per-bootstrap leaderboard ─────────────────────────────────────
     if per_bs:
-        st.markdown(
-            "**Per-bootstrap leaderboard** (one row per resample)"
-        )
+        st.markdown("**Per-bootstrap leaderboard** (one row per resample)")
         rows = []
         for entry in per_bs:
             row = {
@@ -2229,7 +2212,7 @@ def _render_results_headline(results_view: dict, metric_name: str) -> None:
             "Direction (greenery↔outcome)",
             _direction_badge(direction),
             help=(
-                "Sign of the greenery↔outcome relationship — reported "
+                "Sign of the greenery↔outcome relationship; reported "
                 "separately because distance correlation is unsigned. A "
                 "positive sign means the composite rises with the outcome."
             ),
@@ -2400,9 +2383,7 @@ def _render_study_detail(
         with detail_cols[1]:
             st.metric(
                 f"{ch_label} aggregator",
-                _agg_label(
-                    final_params.get(stat_key), final_params.get(pct_key)
-                ),
+                _agg_label(final_params.get(stat_key), final_params.get(pct_key)),
             )
 
     # ── Per-subset scores ─────────────────────────────────────────────
@@ -2570,15 +2551,16 @@ def _render_artifact_index(results_view: dict) -> None:
         def _human(n: int) -> str:
             for unit in ("B", "KB", "MB", "GB"):
                 if n < 1024 or unit == "GB":
-                    return f"{n:.0f} {unit}" if unit == "B" else f"{n / 1024:.1f} {unit}"
+                    return (
+                        f"{n:.0f} {unit}" if unit == "B" else f"{n / 1024:.1f} {unit}"
+                    )
                 n /= 1024
             return f"{n:.0f} B"
 
-        rows = [
-            {"File": rel, "Size": _human(size)}
-            for rel, size in sorted(entries)
-        ]
-        st.dataframe(pd.DataFrame(rows), width="stretch", height=min(420, 60 + 28 * len(rows)))
+        rows = [{"File": rel, "Size": _human(size)} for rel, size in sorted(entries)]
+        st.dataframe(
+            pd.DataFrame(rows), width="stretch", height=min(420, 60 + 28 * len(rows))
+        )
 
 
 def _render_fusion_results_body(output_dir: str) -> None:
@@ -2634,7 +2616,11 @@ def _render_fusion_results_body(output_dir: str) -> None:
         "**Formula:** "
         f"{_FORMULA_DISPLAY.get(formula.name, formula.name.title())}  ·  "
         "**Covariates:** "
-        + (", ".join(f"`{c}`" for c in covariates_used) if covariates_used else "_none_")
+        + (
+            ", ".join(f"`{c}`" for c in covariates_used)
+            if covariates_used
+            else "_none_"
+        )
         + (
             "  ·  ℹ️ `mutual_info` ignores covariates"
             if results_view["objective_metric"] == "mutual_info" and covariates_used
@@ -3174,9 +3160,7 @@ def render(output_dir: str) -> None:
     whole_grid_scaling_param = bool(study_state.get("whole_grid_scaling", False))
     area_balanced_split_param = bool(study_state.get("area_balanced_split", False))
     n_bootstraps_param = int(study_state.get("n_bootstraps", 20))
-    n_trials_per_bootstrap_param = int(
-        study_state.get("n_trials_per_bootstrap", 50)
-    )
+    n_trials_per_bootstrap_param = int(study_state.get("n_trials_per_bootstrap", 50))
     min_cell_count_param = int(study_state.get("min_cell_count", 3))
     worst_quantile_param = float(study_state.get("worst_quantile", 0.10))
     check_collinearity_param = bool(study_state.get("check_collinearity", False))
@@ -3518,8 +3502,10 @@ def render(output_dir: str) -> None:
                     if cgi_grid_spacing_m_param is not None and is_vector_target
                     else None
                 ),
+                # Composite [0, 1] scaling: user-chosen for vector targets;
+                # raster targets keep the long-standing normalized output.
                 "whole_grid_scaling": (
-                    whole_grid_scaling_param if is_polygon_target_ui else False
+                    bool(whole_grid_scaling_param) if is_vector_target else True
                 ),
                 "area_balanced_split": (
                     area_balanced_split_param if is_polygon_target_ui else False
