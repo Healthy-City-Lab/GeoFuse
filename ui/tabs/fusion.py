@@ -1303,6 +1303,7 @@ def _render_study_details_panel(
     is_longitudinal: bool,
     available_covariates: list[str],
     is_polygon_target: bool = False,
+    is_vector_target: bool = False,
 ) -> dict:
     """Final form section: CGI formula, covariates, objective metric, …
 
@@ -1529,34 +1530,45 @@ def _render_study_details_panel(
             ),
         )
 
-    # ── Polygon scoring (per-pixel CGI) ─────────────────────────────────
+    # ── Per-pixel CGI scoring (vector targets) ──────────────────────────
     cgi_grid_spacing_m = 50
     whole_grid_scaling = True
     area_balanced_split = True
-    if is_polygon_target:
-        st.markdown("**Polygon scoring**")
-        col_p1, col_p2 = st.columns([2, 1])
-        with col_p1:
-            cgi_grid_spacing_m = st.select_slider(
-                "CGI grid pixel size (m)",
-                options=list(range(25, 525, 25)),
-                value=int(st.session_state.get("fusion_cgi_grid_spacing_m", 50)),
-                key="fusion_cgi_grid_spacing_m",
-                help="Per-pixel CGI grid spacing inside the polygon union. Smaller = higher fidelity, bigger cache.",
-            )
-        with col_p2:
-            whole_grid_scaling = st.checkbox(
-                "Whole-grid scaling",
-                value=bool(st.session_state.get("fusion_whole_grid_scaling", True)),
-                key="fusion_whole_grid_scaling",
-                help="Skip per-channel scaling; only the composite raster is normalised.",
-            )
-        area_balanced_split = st.checkbox(
-            "Area-balanced stratified split",
-            value=bool(st.session_state.get("fusion_area_balanced_split", True)),
-            key="fusion_area_balanced_split",
-            help="Balance polygon area (not count) across train / val / test within each quartile.",
+    if is_vector_target:
+        st.markdown("**Per-pixel CGI scoring**")
+        cgi_grid_spacing_m = st.select_slider(
+            "CGI grid pixel size (m)",
+            options=list(range(25, 525, 25)),
+            value=int(st.session_state.get("fusion_cgi_grid_spacing_m", 50)),
+            key="fusion_cgi_grid_spacing_m",
+            help=(
+                "Per-pixel CGI grid spacing. For polygons the grid tiles each "
+                "polygon footprint; for points / lines it tiles each entity's "
+                "catchment (its buffer up to the largest tested radius), and "
+                "the entity value is the mean per-pixel CGI inside the trial's "
+                "radius. Smaller = higher fidelity and a bigger cache."
+            ),
         )
+        if is_polygon_target:
+            col_p1, col_p2 = st.columns(2)
+            with col_p1:
+                whole_grid_scaling = st.checkbox(
+                    "Whole-grid scaling",
+                    value=bool(
+                        st.session_state.get("fusion_whole_grid_scaling", True)
+                    ),
+                    key="fusion_whole_grid_scaling",
+                    help="Skip per-channel scaling; only the composite raster is normalised.",
+                )
+            with col_p2:
+                area_balanced_split = st.checkbox(
+                    "Area-balanced stratified split",
+                    value=bool(
+                        st.session_state.get("fusion_area_balanced_split", True)
+                    ),
+                    key="fusion_area_balanced_split",
+                    help="Balance polygon area (not count) across train / val / test within each quartile.",
+                )
 
     return {
         "cgi_formula": cgi_formula,
@@ -3135,6 +3147,7 @@ def render(output_dir: str) -> None:
             is_longitudinal=is_longitudinal,
             available_covariates=available_covariates,
             is_polygon_target=is_polygon_target_ui,
+            is_vector_target=bool(is_vector_target),
         )
         st.divider()
         _fus_run_spacer, _fus_run_col = st.columns([2.2, 1])
@@ -3502,7 +3515,7 @@ def render(output_dir: str) -> None:
                 "longitudinal_spec_payload": longitudinal_spec_payload,
                 "cgi_grid_spacing_m": (
                     int(cgi_grid_spacing_m_param)
-                    if cgi_grid_spacing_m_param is not None and is_polygon_target_ui
+                    if cgi_grid_spacing_m_param is not None and is_vector_target
                     else None
                 ),
                 "whole_grid_scaling": (

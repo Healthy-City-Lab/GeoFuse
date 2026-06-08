@@ -295,6 +295,11 @@ class MetricFusionEngine:
         self._polygon_grid_crs: Any = None
         self._polygon_grid_transform: Any = None
         self._polygon_grid_shape: tuple[int, int] | None = None
+        # Per-pixel CGI grid metadata for point / line targets (the composite
+        # raster reuses these so it matches the scored CGI field).
+        self._entity_grid_crs: Any = None
+        self._entity_grid_transform: Any = None
+        self._entity_grid_shape: tuple[int, int] | None = None
 
         # Data containers
         self.target_gdf = None
@@ -2288,14 +2293,14 @@ class MetricFusionEngine:
                     )
 
         if self.is_polygon_target:
-            _log("INFO", "Target type: POLYGON (areal aggregation)")
+            _log("INFO", "Target type: POLYGON (per-pixel CGI)")
             return self._prepare_polygon_fusion()
         _log(
             "INFO",
-            f"Target type: {'POINT' if self.is_points else 'RASTER'}",
+            f"Target type: {'POINT/LINE (per-pixel CGI)' if self.is_points else 'RASTER'}",
         )
         if self.is_points:
-            return self._prepare_point_fusion()
+            return self._prepare_entity_fusion()
         else:
             return self._prepare_raster_fusion()
 
@@ -2514,7 +2519,7 @@ class MetricFusionEngine:
                 f"gvi:{gvi_radii}",
                 f"ndvi:{ndvi_radii}",
                 f"stats:{preaggregation.STAT_COLUMNS}",
-                f"cgi_grid:{self.cgi_grid_spacing_m if self.is_polygon_target else 'na'}",
+                f"cgi_grid:{self.cgi_grid_spacing_m if (self.is_polygon_target or self.is_points) else 'na'}",
             ]
         )
         fingerprint = hashlib.sha256(fp_src.encode()).hexdigest()
@@ -2887,7 +2892,7 @@ class MetricFusionEngine:
         fp_parts.append(f"stats:{preaggregation.STAT_COLUMNS}")
         fp_parts.append(f"waves:{list(spec.wave_labels)}")
         fp_parts.append(
-            f"cgi_grid:{self.cgi_grid_spacing_m if self.is_polygon_target else 'na'}"
+            f"cgi_grid:{self.cgi_grid_spacing_m if (self.is_polygon_target or self.is_points) else 'na'}"
         )
         fingerprint = hashlib.sha256("|".join(fp_parts).encode()).hexdigest()
 
@@ -3502,6 +3507,276 @@ class MetricFusionEngine:
         # only see entities that passed the coverage probe.
         self.target_gdf = entity_gdf.loc[result.index].copy()
         return result
+
+    def _prepare_entity_fusion(self) -> pd.DataFrame:
+        """Per-pixel CGI dataset for point / line targets.
+
+        Mirrors :meth:`_prepare_polygon_fusion` so every geometry type scores
+        the same way: build a regular pixel grid from the pre-aggregation
+        cache, evaluate per-pixel CGI, and aggregate the pixels in each
+        entity's catchment to the entity value. Points and lines have no
+        footprint, so each entity's catchment is the pixels within its
+        **buffer**; the per-trial collapse
+        (:meth:`_entity_collapse_mask`) later restricts that buffer to the
+        trial's largest channel radius.
+
+        Returns one row per ``(entity, catchment-pixel)``, keyed by
+        ``polygon_id`` (= the entity/observation index) and carrying
+        ``_catchment_dist`` (pixel→entity distance, metres) and
+        ``_is_nearest`` (the entity's closest surviving pixel, always kept so
+        no entity drops out at small radii). Shared pixels between nearby
+        entities are duplicated per entity, which keeps fixed ``polygon_id``
+        membership so :meth:`split_data` and the in-bag/OOB scaler work
+        exactly as in the polygon path.
+        """
+        _log("INFO", "====== POINT/LINE FUSION (per-pixel CGI) ======")
+        entities = self.target_gdf.copy()
+        outcome_col = self.target_feature
+        spacing_m = float(self.cgi_grid_spacing_m)
+
+        # Drop NaN-outcome / NaN-covariate entities up front.
+        valid_mask = entities[outcome_col].notna()
+        if self.covariate_columns:
+            for col in self.covariate_columns:
+                valid_mask &= entities[col].notna()
+        skipped_nan = int((~valid_mask).sum())
+        if skipped_nan:
+            _log(
+                "WARN",
+                f"Skipped {skipped_nan} entity(ies) with NaN outcome / covariate.",
+            )
+        entities = entities.loc[valid_mask].reset_index(drop=True)
+        if len(entities) < 2:
+            raise ValueError(
+                "Point/line fusion needs ≥2 entities with a valid outcome "
+                f"(and covariates if configured); got {len(entities)}."
+            )
+
+        # Project to a low-distortion CRS so the grid step + buffers are metres.
+        grid_crs, _grid_distortion, _grid_name = select_grid_crs_with_warning(
+            entities, _log, role="CGI grid CRS"
+        )
+        ent = entities.to_crs(grid_crs)
+        ent["__entity_id"] = np.arange(len(ent), dtype=np.int64)
+
+        # Catchment cap = the largest radius any trial can request. Each
+        # trial's collapse then masks down to its own max channel radius.
+        r_max = float(max(self.gvi_buffer_max_m, self.ndvi_buffer_max_m))
+        buffers = ent.geometry.buffer(r_max)
+        union_geom = buffers.union_all()
+        minx, miny, maxx, maxy = union_geom.bounds
+
+        xs = np.arange(minx + spacing_m / 2.0, maxx, spacing_m, dtype=np.float64)
+        ys = np.arange(miny + spacing_m / 2.0, maxy, spacing_m, dtype=np.float64)
+        if xs.size == 0 or ys.size == 0:
+            raise ValueError(
+                f"CGI grid spacing {spacing_m:g} m is larger than the buffered "
+                f"target extent — lower the grid spacing or raise the buffer."
+            )
+        ys_topdown = ys[::-1]
+        gx, gy = np.meshgrid(xs, ys_topdown, indexing="xy")
+        n_cols = len(xs)
+        n_rows = len(ys_topdown)
+        pixels = gpd.GeoDataFrame(
+            {
+                "_grid_row": np.repeat(np.arange(n_rows, dtype=np.int64), n_cols),
+                "_grid_col": np.tile(np.arange(n_cols, dtype=np.int64), n_rows),
+            },
+            geometry=gpd.points_from_xy(gx.ravel(), gy.ravel()),
+            crs=grid_crs,
+        )
+        _log(
+            "INFO",
+            f"Entities: {len(ent)} · catchment cap: {r_max:g} m · CGI grid "
+            f"pixel size: {spacing_m:g} m · {len(pixels):,} candidate pixels.",
+        )
+
+        # Assign every pixel to each entity whose catchment buffer contains it
+        # (duplicate shared pixels per entity → fixed polygon_id membership).
+        ent_buffers = gpd.GeoDataFrame(
+            {"__entity_id": ent["__entity_id"].to_numpy()},
+            geometry=buffers.values,
+            crs=grid_crs,
+        )
+        joined = gpd.sjoin(
+            pixels, ent_buffers, how="inner", predicate="within"
+        ).reset_index(drop=True)
+        if len(joined) == 0:
+            raise ValueError(
+                "Entity catchment grid produced zero pixels — the grid spacing "
+                "may exceed the buffer extent."
+            )
+
+        # pixel→entity distance (point-to-point for points, perpendicular for
+        # lines), aligned positionally with the joined rows.
+        ent_geom_by_id = ent.set_index("__entity_id").geometry
+        aligned_geoms = gpd.GeoSeries(
+            ent_geom_by_id.loc[joined["__entity_id"].to_numpy()].to_numpy(),
+            crs=grid_crs,
+        )
+        pix_geoms = gpd.GeoSeries(joined.geometry.to_numpy(), crs=grid_crs)
+        catchment_dist = pix_geoms.distance(aligned_geoms).to_numpy()
+
+        # Carry outcome + covariates + longitudinal extras onto each pixel.
+        attr_cols = [outcome_col, *self.covariate_columns]
+        if self.is_longitudinal:
+            attr_cols.extend(self._longitudinal_extra_cols())
+        attr_cols = list(dict.fromkeys(attr_cols))
+        attr_lookup = ent.set_index("__entity_id")[attr_cols]
+        attrs = attr_lookup.loc[joined["__entity_id"].to_numpy()].reset_index(drop=True)
+
+        # ``polygon_id`` = the entity/observation index; each (entity, wave)
+        # row in longitudinal mode is already its own observation, so the
+        # row index doubles as the collapse key.
+        entity_gdf = gpd.GeoDataFrame(
+            {
+                "polygon_id": joined["__entity_id"].to_numpy(),
+                "target": attrs[outcome_col].to_numpy(),
+                "_grid_row": joined["_grid_row"].to_numpy(),
+                "_grid_col": joined["_grid_col"].to_numpy(),
+                "_catchment_dist": catchment_dist,
+            },
+            geometry=joined.geometry.values,
+            crs=grid_crs,
+        ).reset_index(drop=True)
+        for col in self.covariate_columns:
+            entity_gdf[col] = attrs[col].to_numpy()
+        for col in self._longitudinal_extra_cols():
+            if col in attrs.columns:
+                entity_gdf[col] = attrs[col].to_numpy()
+
+        # Grid metadata for the composite-map writer (the CGI field raster).
+        self._entity_grid_crs = grid_crs
+        self._entity_grid_transform = from_origin(minx, maxy, spacing_m, spacing_m)
+        self._entity_grid_shape = (n_rows, n_cols)
+
+        self.target_gdf = entity_gdf.copy()
+
+        # Coverage probe at the pixel centroids (used only for NaN-filtering
+        # and the feature MinMaxScaler; per-trial values come from the cache).
+        _log(
+            "INFO",
+            "Probing initial veg / terrain / NDVI coverage at pixel centroids...",
+        )
+        probe_gdf = entity_gdf[["geometry"]].copy()
+        probe_gdf = self._sample_metrics_at_points(probe_gdf)
+
+        fusion_df = pd.DataFrame(
+            {
+                "polygon_id": entity_gdf["polygon_id"].values,
+                "target": entity_gdf["target"].values,
+                "veg": probe_gdf["veg"].values,
+                "terrain": probe_gdf["terrain"].values,
+                "ndvi": probe_gdf["ndvi"].values,
+                "_catchment_dist": entity_gdf["_catchment_dist"].values,
+            },
+            index=entity_gdf.index,
+        )
+        for col in self.covariate_columns:
+            fusion_df[col] = entity_gdf[col].values
+        for col in self._longitudinal_extra_cols():
+            if col in entity_gdf.columns:
+                fusion_df[col] = entity_gdf[col].values
+
+        _log("INFO", "====== DATA QUALITY SUMMARY (POINT/LINE / PER-PIXEL) ======")
+        for col in ["target", "veg", "terrain", "ndvi", *self.covariate_columns]:
+            nan_count = int(fusion_df[col].isna().sum())
+            pct = nan_count / max(len(fusion_df), 1) * 100
+            _log("INFO", f"{col} NaN: {nan_count} ({pct:.1f}%)")
+
+        result = fusion_df.dropna(
+            subset=["target", "veg", "terrain", "ndvi", *self.covariate_columns]
+        )
+        entities_left = result["polygon_id"].nunique() if len(result) else 0
+        _log(
+            "OK" if entities_left else "WARN",
+            f"After dropna: {len(result):,} pixel rows "
+            f"({entities_left} unique entities)",
+        )
+        if entities_left < 2:
+            raise ValueError(
+                "Point/line fusion needs ≥2 entities with valid coverage after "
+                f"NaN filtering; got {entities_left}. Check metric coverage or "
+                "increase the buffer."
+            )
+
+        # Always keep each entity's nearest surviving pixel so no entity drops
+        # out when a trial's catchment radius is smaller than its closest
+        # pixel — computed on the surviving rows so the flag stays valid.
+        nearest_idx = result.groupby("polygon_id")["_catchment_dist"].idxmin()
+        result = result.copy()
+        result["_is_nearest"] = False
+        result.loc[nearest_idx, "_is_nearest"] = True
+
+        # Trim target_gdf to surviving pixels and carry the nearest flag.
+        self.target_gdf = entity_gdf.loc[result.index].copy()
+        self.target_gdf["_is_nearest"] = result["_is_nearest"].to_numpy()
+        return result
+
+    # ------------------------------------------------------------------
+    # Per-pixel CGI → per-entity collapse (shared by every scoring path)
+    # ------------------------------------------------------------------
+    def _catchment_radius(
+        self, veg_radius: float, terrain_radius: float, ndvi_radius: float
+    ) -> float:
+        """Per-trial catchment radius for the point/line collapse.
+
+        The active channel's radius for a standalone study (only that channel
+        contributes to the score), or the largest of the three for the
+        combined CGI run (every channel feeds the per-pixel composite).
+        """
+        ch = getattr(self, "_active_greenery_channel", "cgi") or "cgi"
+        if ch == "veg":
+            return float(veg_radius)
+        if ch == "terrain":
+            return float(terrain_radius)
+        if ch == "ndvi":
+            return float(ndvi_radius)
+        return float(max(veg_radius, terrain_radius, ndvi_radius))
+
+    def _entity_collapse_mask(
+        self, data: pd.DataFrame, catchment_radius: float | None
+    ) -> np.ndarray | None:
+        """Row mask for the per-trial catchment collapse, or ``None``.
+
+        Returns ``None`` for polygon / raster targets (no radius mask — every
+        in-footprint pixel contributes, the original behavior). For point /
+        line targets, keeps pixels within ``catchment_radius`` of their
+        entity plus each entity's nearest pixel, so no entity drops out at
+        small radii.
+        """
+        if "_catchment_dist" not in data.columns or catchment_radius is None:
+            return None
+        dist = data["_catchment_dist"].to_numpy(dtype=np.float64)
+        if "_is_nearest" in data.columns:
+            near = data["_is_nearest"].to_numpy(dtype=bool)
+        else:
+            near = np.zeros(len(data), dtype=bool)
+        return (dist <= float(catchment_radius)) | near
+
+    @staticmethod
+    def _collapse_to_entities(
+        values: np.ndarray,
+        polygon_id: np.ndarray,
+        mask: np.ndarray | None = None,
+        how: str = "mean",
+    ) -> np.ndarray:
+        """Collapse per-pixel ``values`` to one value per ``polygon_id``.
+
+        ``how="mean"`` for the composite, ``"first"`` for per-entity constants
+        (target / covariates / entity_id / years_since_baseline). When
+        ``mask`` is given only the masked rows contribute; the
+        nearest-pixel guarantee keeps every entity present, so the grouped
+        key order matches across every collapsed array (pandas sorts the
+        group keys).
+        """
+        v = np.asarray(values)
+        pid = np.asarray(polygon_id)
+        if mask is not None:
+            v = v[mask]
+            pid = pid[mask]
+        g = pd.Series(v).groupby(pid)
+        return (g.mean() if how == "mean" else g.first()).to_numpy()
 
     def _prepare_point_fusion(self) -> pd.DataFrame:
         """Sample metrics at point locations."""
@@ -4860,62 +5135,66 @@ class MetricFusionEngine:
             if "polygon_id" in train_data.columns:
                 train_pid = train_data["polygon_id"].values
                 val_pid = val_data["polygon_id"].values
-                train_composite = (
-                    pd.Series(train_composite).groupby(train_pid).mean().values
+                # Catchment collapse: polygons average every in-footprint pixel
+                # (mask None); point/line entities average only the pixels
+                # within this trial's catchment radius (+ each entity's nearest
+                # pixel). ``__entity_id``/wave keys were set per observation in
+                # the prepare step, so the collapse yields one row per
+                # observation — the shape the OLS / MixedLM scorers want.
+                catchment_r = self._catchment_radius(
+                    veg_radius, terrain_radius, ndvi_radius
                 )
-                val_composite = pd.Series(val_composite).groupby(val_pid).mean().values
-                train_targets_arr = (
-                    pd.Series(train_data["target"].values)
-                    .groupby(train_pid)
-                    .first()
-                    .values
+                train_mask = self._entity_collapse_mask(train_data, catchment_r)
+                val_mask = self._entity_collapse_mask(val_data, catchment_r)
+                train_composite = self._collapse_to_entities(
+                    train_composite, train_pid, train_mask, "mean"
                 )
-                val_targets_arr = (
-                    pd.Series(val_data["target"].values).groupby(val_pid).first().values
+                val_composite = self._collapse_to_entities(
+                    val_composite, val_pid, val_mask, "mean"
+                )
+                train_targets_arr = self._collapse_to_entities(
+                    train_data["target"].values, train_pid, train_mask, "first"
+                )
+                val_targets_arr = self._collapse_to_entities(
+                    val_data["target"].values, val_pid, val_mask, "first"
                 )
                 if train_cov is not None and val_cov is not None:
-                    # Covariates were broadcast onto every in-polygon sample by
-                    # _prepare_polygon_fusion, so first() per polygon recovers
-                    # one value per polygon — same shape as the collapsed
-                    # target / composite.
                     tc = train_cov  # local binding for the type checker
                     vc = val_cov
                     train_cov = np.column_stack(
                         [
-                            pd.Series(tc[:, j]).groupby(train_pid).first().values
+                            self._collapse_to_entities(
+                                tc[:, j], train_pid, train_mask, "first"
+                            )
                             for j in range(tc.shape[1])
                         ]
                     )
                     val_cov = np.column_stack(
                         [
-                            pd.Series(vc[:, j]).groupby(val_pid).first().values
+                            self._collapse_to_entities(
+                                vc[:, j], val_pid, val_mask, "first"
+                            )
                             for j in range(vc.shape[1])
                         ]
                     )
                 if self.is_longitudinal:
-                    train_entity_id = (
-                        pd.Series(train_data["entity_id"].values)
-                        .groupby(train_pid)
-                        .first()
-                        .values
+                    train_entity_id = self._collapse_to_entities(
+                        train_data["entity_id"].values, train_pid, train_mask, "first"
                     )
-                    val_entity_id = (
-                        pd.Series(val_data["entity_id"].values)
-                        .groupby(val_pid)
-                        .first()
-                        .values
+                    val_entity_id = self._collapse_to_entities(
+                        val_data["entity_id"].values, val_pid, val_mask, "first"
                     )
-                    train_ysb = (
-                        pd.Series(train_data["years_since_baseline"].values)
-                        .groupby(train_pid)
-                        .first()
-                        .values
+                    train_ysb = self._collapse_to_entities(
+                        train_data["years_since_baseline"].values,
+                        train_pid,
+                        train_mask,
+                        "first",
                     )
-                    val_ysb = (
-                        pd.Series(val_data["years_since_baseline"].values)
-                        .groupby(val_pid)
-                        .first()
-                        .values
+                    val_ysb = self._collapse_to_entities(
+                        val_data["years_since_baseline"].values,
+                        val_pid,
+                        val_mask,
+                        "first",
                     )
             else:
                 train_targets_arr = train_data["target"].values
@@ -5332,33 +5611,35 @@ class MetricFusionEngine:
         test_ysb = None
         if "polygon_id" in self.test_data.columns:
             test_pid = self.test_data["polygon_id"].values
-            test_composite = pd.Series(test_composite).groupby(test_pid).mean().values
-            test_targets = (
-                pd.Series(self.test_data["target"].values)
-                .groupby(test_pid)
-                .first()
-                .values
+            catchment_r = self._catchment_radius(
+                veg_radius, terrain_radius, ndvi_radius
+            )
+            test_mask = self._entity_collapse_mask(self.test_data, catchment_r)
+            test_composite = self._collapse_to_entities(
+                test_composite, test_pid, test_mask, "mean"
+            )
+            test_targets = self._collapse_to_entities(
+                self.test_data["target"].values, test_pid, test_mask, "first"
             )
             if test_cov is not None:
                 tc = test_cov  # type-narrow for the comprehension
                 test_cov = np.column_stack(
                     [
-                        pd.Series(tc[:, j]).groupby(test_pid).first().values
+                        self._collapse_to_entities(
+                            tc[:, j], test_pid, test_mask, "first"
+                        )
                         for j in range(tc.shape[1])
                     ]
                 )
             if self.is_longitudinal:
-                test_entity_id = (
-                    pd.Series(self.test_data["entity_id"].values)
-                    .groupby(test_pid)
-                    .first()
-                    .values
+                test_entity_id = self._collapse_to_entities(
+                    self.test_data["entity_id"].values, test_pid, test_mask, "first"
                 )
-                test_ysb = (
-                    pd.Series(self.test_data["years_since_baseline"].values)
-                    .groupby(test_pid)
-                    .first()
-                    .values
+                test_ysb = self._collapse_to_entities(
+                    self.test_data["years_since_baseline"].values,
+                    test_pid,
+                    test_mask,
+                    "first",
                 )
         else:
             test_targets = self.test_data["target"].values
@@ -5500,27 +5781,30 @@ class MetricFusionEngine:
         ysb = None
         if "polygon_id" in data.columns:
             pid = data["polygon_id"].values
-            veg = pd.Series(veg).groupby(pid).mean().values
-            terrain = pd.Series(terrain).groupby(pid).mean().values
-            ndvi = pd.Series(ndvi).groupby(pid).mean().values
-            target = pd.Series(data["target"].values).groupby(pid).first().values
+            # Full 3-channel design → catchment = max of the three radii for
+            # point/line targets (mask None for polygons).
+            catchment_r = self._catchment_radius(veg_radius, terrain_radius, ndvi_radius)
+            mask = self._entity_collapse_mask(data, catchment_r)
+            veg = self._collapse_to_entities(veg, pid, mask, "mean")
+            terrain = self._collapse_to_entities(terrain, pid, mask, "mean")
+            ndvi = self._collapse_to_entities(ndvi, pid, mask, "mean")
+            target = self._collapse_to_entities(
+                data["target"].values, pid, mask, "first"
+            )
             if cov is not None:
                 c = cov
                 cov = np.column_stack(
                     [
-                        pd.Series(c[:, j]).groupby(pid).first().values
+                        self._collapse_to_entities(c[:, j], pid, mask, "first")
                         for j in range(c.shape[1])
                     ]
                 )
             if self.is_longitudinal:
-                entity_id = (
-                    pd.Series(data["entity_id"].values).groupby(pid).first().values
+                entity_id = self._collapse_to_entities(
+                    data["entity_id"].values, pid, mask, "first"
                 )
-                ysb = (
-                    pd.Series(data["years_since_baseline"].values)
-                    .groupby(pid)
-                    .first()
-                    .values
+                ysb = self._collapse_to_entities(
+                    data["years_since_baseline"].values, pid, mask, "first"
                 )
         else:
             target = data["target"].values
@@ -5740,12 +6024,19 @@ class MetricFusionEngine:
         result_df["ndvi"] = all_ndvi
         result_df["composite"] = composite
 
-        # Polygon mode: collapse per-sample rows into one row per polygon.
-        # Each polygon's composite is the mean of per-sample CGIs inside it,
-        # which is what the optimizer was scoring against the per-polygon outcome.
+        # Per-pixel mode: collapse per-pixel rows into one row per entity.
+        # Each entity's composite is the mean of per-pixel CGIs in its
+        # catchment (the whole footprint for polygons; the pixels within the
+        # trial's catchment radius for point/line targets), matching what the
+        # optimizer scored against the per-entity outcome.
         if "polygon_id" in result_df.columns:
+            catchment_r = self._catchment_radius(
+                veg_radius, terrain_radius, ndvi_radius
+            )
+            mask = self._entity_collapse_mask(result_df, catchment_r)
+            masked_df = result_df if mask is None else result_df[mask]
             poly_df = (
-                result_df.groupby("polygon_id", sort=False)
+                masked_df.groupby("polygon_id", sort=False)
                 .agg(
                     target=("target", "first"),
                     veg=("veg", "mean"),
@@ -7212,6 +7503,32 @@ class MetricFusionEngine:
             logger.info(
                 f"Generating composite for {len(points_gdf)} pixels "
                 f"({self.cgi_grid_spacing_m:g} m grid inside polygon union)"
+            )
+
+        elif (
+            self.is_points
+            and self._entity_grid_shape is not None
+            and self._entity_grid_transform is not None
+        ):
+            # Point/line target: render the CGI field over the same per-pixel
+            # grid the scorer used (``_prepare_entity_fusion``), so the
+            # composite matches the scored values. The catchment pixels were
+            # duplicated per entity, so collapse to the unique grid cells.
+            transform = self._entity_grid_transform
+            crs = self._entity_grid_crs
+            height, width = self._entity_grid_shape
+            uniq = self.target_gdf.drop_duplicates(subset=["_grid_row", "_grid_col"])
+            grid_rows = uniq["_grid_row"].to_numpy(dtype=np.int64)
+            grid_cols = uniq["_grid_col"].to_numpy(dtype=np.int64)
+            points_gdf = gpd.GeoDataFrame(
+                {"row": grid_rows, "col": grid_cols},
+                geometry=uniq.geometry.values,
+                crs=crs,
+                index=uniq.index,
+            )
+            logger.info(
+                f"Generating composite for {len(points_gdf)} pixels "
+                f"({self.cgi_grid_spacing_m:g} m grid over point/line catchments)"
             )
 
         else:
