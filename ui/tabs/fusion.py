@@ -317,9 +317,11 @@ def _fusion_restart_summary_lines(p: dict) -> list[str]:
         split_kind = (
             "area-balanced" if p.get("area_balanced_split") else "count-balanced"
         )
+        chan_norm = "normalized" if p.get("normalize_channels") else "raw"
         lines.append(
             f"**Polygon scoring:** per-pixel CGI · pixel size "
-            f"{cgi_grid} m · {scaling_scope} scaling · {split_kind} split"
+            f"{cgi_grid} m · {scaling_scope} scaling · {split_kind} split · "
+            f"{chan_norm} channels"
         )
     return lines
 
@@ -772,6 +774,10 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "cgi_grid_spacing_m",
     "whole_grid_scaling",
     "area_balanced_split",
+    "normalize_channels",
+    "spatial_split",
+    "spatial_block_size_m",
+    "n_spatial_blocks",
     "n_bootstraps",
     "n_trials_per_bootstrap",
     "min_cell_count",
@@ -1441,13 +1447,8 @@ def _render_study_details_panel(
             value=bool(st.session_state.get("fusion_check_collinearity", False)),
             key="fusion_check_collinearity",
             help=(
-                "Computes pairwise Pearson + VIF on the per-pixel "
-                "veg / terrain / NDVI values across the CGI grid (20 k "
-                "random sample). Iteratively drops the highest-VIF "
-                "channel until all remaining VIFs are below threshold or "
-                "only one channel is left. Disabled channels are pinned "
-                "to weight 0 in every trial — saves optimizer budget and "
-                "produces a more interpretable winner."
+                "Iteratively drop the highest-VIF channel until all remaining "
+                "VIFs are below threshold, pinning dropped channels to weight 0."
             ),
         )
     with col_c2:
@@ -1466,11 +1467,18 @@ def _render_study_details_panel(
         )
 
     # ── Stability selection ─────────────────────────────────────────────
-    # Tuning is done by bootstrap stability selection: B random-sampler
-    # studies on resamples of the train+val pool, scored on out-of-bag rows,
-    # picking the weight cell with the best worst-quantile OOB score.
+    # Tuning is bootstrap stability selection: B random-sampler studies on
+    # resamples of the train+val pool, scored on out-of-bag rows. The channel
+    # mix is chosen by automated threshold calibration (Bodinier) — the
+    # selection size and threshold are calibrated by maximizing the stability
+    # score, so there are no manual selection knobs.
     st.markdown("**Stability selection**")
-    col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+    st.caption(
+        "The channel-mix winner is calibrated automatically (selection size "
+        "K + threshold π maximize the stability score, with a reported PFER "
+        "bound). Only the resampling effort is set here."
+    )
+    col_s1, col_s2 = st.columns(2)
     with col_s1:
         n_bootstraps_ui = st.number_input(
             "Bootstraps (B)",
@@ -1480,8 +1488,8 @@ def _render_study_details_panel(
             step=5,
             key="fusion_n_bootstraps",
             help=(
-                "Number of bootstrap resamples of the train+val pool. 20-50 "
-                "typical; raise for tighter cell counts."
+                "Number of ⌊n/2⌋ subsamples of the train+val pool (drawn as "
+                "complementary pairs). 20-50 typical; raise for a tighter calibration."
             ),
         )
     with col_s2:
@@ -1497,39 +1505,20 @@ def _render_study_details_panel(
                 "uniform coverage matters more than depth."
             ),
         )
-    with col_s3:
-        min_cell_count_ui = st.number_input(
-            "Min trials per cell",
-            min_value=1,
-            max_value=100,
-            value=int(st.session_state.get("fusion_min_cell_count", 3)),
-            step=1,
-            key="fusion_min_cell_count",
-            help=(
-                "A weight cell only competes for the worst-quantile ranking "
-                "if it holds at least this many trials across all bootstraps. "
-                "Rule of thumb: at least 10 for a stable quantile estimate."
-            ),
-        )
-    with col_s4:
-        worst_quantile_ui = st.number_input(
-            "Worst quantile",
-            min_value=0.01,
-            max_value=0.50,
-            value=float(st.session_state.get("fusion_worst_quantile", 0.10)),
-            step=0.05,
-            format="%.2f",
-            key="fusion_worst_quantile",
-            help=(
-                "The cell winner is the one with the best score at this lower "
-                "quantile of its out-of-bag scores."
-            ),
-        )
+    # Retained internals (no longer user-tuned): the radius sub-cell still
+    # needs a minimum trial count, and q_worst is reported as a secondary
+    # diagnostic at this quantile.
+    min_cell_count_ui = 3
+    worst_quantile_ui = 0.10
 
     # ── Per-pixel CGI scoring (vector targets) ──────────────────────────
     cgi_grid_spacing_m = 50
     whole_grid_scaling = True
     area_balanced_split = True
+    normalize_channels = True
+    spatial_split = False
+    spatial_block_size_m: float | None = None
+    n_spatial_blocks: int | None = None
     if is_vector_target:
         st.markdown("**Per-pixel CGI scoring**")
         cgi_grid_spacing_m = st.select_slider(
@@ -1545,10 +1534,16 @@ def _render_study_details_panel(
             "Scale composite map to [0, 1]",
             value=bool(st.session_state.get("fusion_whole_grid_scaling", True)),
             key="fusion_whole_grid_scaling",
+            help="Min-max normalise the optimized greenery map to [0, 1] over the whole grid.",
+        )
+        normalize_channels = st.checkbox(
+            "Normalize channels before fusion",
+            value=bool(st.session_state.get("fusion_normalize_channels", True)),
+            key="fusion_normalize_channels",
             help=(
-                "Min-max normalise the optimized greenery map (the CGI, or each "
-                "standalone channel) to [0, 1] over the whole grid before it is "
-                "used. "
+                "Scale each channel to [0, 1] before combining, so CGI weights "
+                "are comparable across channels and the comparison with the "
+                "standalone studies is on equal footing. Off = legacy raw mix."
             ),
         )
         if is_polygon_target:
@@ -1557,6 +1552,34 @@ def _render_study_details_panel(
                 value=bool(st.session_state.get("fusion_area_balanced_split", True)),
                 key="fusion_area_balanced_split",
                 help="Balance polygon area (not count) across train / val / test within each quartile.",
+            )
+
+        spatial_split = st.checkbox(
+            "Spatial block validation",
+            value=bool(st.session_state.get("fusion_spatial_split", True)),
+            key="fusion_spatial_split",
+            help=(
+                "Hold out whole spatial blocks (and resample blocks during "
+                "stability selection) so geographic autocorrelation can't "
+                "inflate scores. Test blocks are striped across the full "
+                "extent so every region is represented in the held-out test."
+            ),
+        )
+        if spatial_split:
+            block_size_ui = st.number_input(
+                "Spatial block size (m, 0 = auto)",
+                min_value=0,
+                value=int(st.session_state.get("fusion_spatial_block_size_m", 0)),
+                step=100,
+                key="fusion_spatial_block_size_m",
+                help=(
+                    "Edge length of each block. 0 sizes blocks from the data "
+                    "extent and the catchment radius (a block stays wider than "
+                    "the greenery autocorrelation range)."
+                ),
+            )
+            spatial_block_size_m = (
+                float(block_size_ui) if block_size_ui and block_size_ui > 0 else None
             )
 
     return {
@@ -1572,6 +1595,10 @@ def _render_study_details_panel(
         "cgi_grid_spacing_m": int(cgi_grid_spacing_m),
         "whole_grid_scaling": bool(whole_grid_scaling),
         "area_balanced_split": bool(area_balanced_split),
+        "normalize_channels": bool(normalize_channels),
+        "spatial_split": bool(spatial_split),
+        "spatial_block_size_m": spatial_block_size_m,
+        "n_spatial_blocks": n_spatial_blocks,
         "n_bootstraps": int(n_bootstraps_ui),
         "n_trials_per_bootstrap": int(n_trials_per_bootstrap_ui),
         "min_cell_count": int(min_cell_count_ui),
@@ -1886,11 +1913,14 @@ def _render_composite_map_viewer(results_view: dict, engine) -> None:
     ncols = max(1, int(_math.ceil(_math.sqrt(total))))
     nrows = max(1, int(_math.ceil(total / ncols)))
 
+    # Screen dpi — the composite viewer is an on-screen preview, not an export,
+    # so a high-dpi canvas is rebuilt on every results rerun (study switch /
+    # map pick) for no visible gain and steady memory growth.
     fig, axes = plt.subplots(
         nrows,
         ncols,
         figsize=(4.5 * ncols, 4.5 * nrows),
-        dpi=300,
+        dpi=140,
         constrained_layout=True,
     )
     flat_axes = np.atleast_1d(axes).ravel().tolist()
@@ -2030,6 +2060,50 @@ def _render_stability_diagnostics(summary: dict, metric_name: str) -> None:
 
     higher_is_better = bool(summary.get("higher_is_better", True))
     worst_q = float(summary.get("worst_quantile") or 0.10)
+
+    # ── Automated threshold calibration (Bodinier) ────────────────────
+    if summary.get("selection_threshold") is not None:
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric(
+                "Threshold π*",
+                f"{float(summary['selection_threshold']):.2f}",
+                help="Calibrated selection-probability threshold (maximizes the stability score).",
+            )
+        with c2:
+            st.metric(
+                "Selection size K*",
+                str(summary.get("selection_size_k", "—")),
+                help="Calibrated number of top cells counted as selected per resample (the sparsity / λ analogue).",
+            )
+        with c3:
+            nss = summary.get("n_stably_selected")
+            ncc = summary.get("n_candidate_cells")
+            st.metric(
+                "Stable cells",
+                f"{nss} / {ncc}" if nss is not None and ncc is not None else "—",
+                help="Channel-mix cells with selection probability ≥ π* — the calibrated stable set.",
+            )
+        with c4:
+            pfer = summary.get("pfer")
+            st.metric(
+                "PFER (approx.)",
+                f"{float(pfer):.2f}" if pfer is not None else "—",
+                help=(
+                    "Expected number of falsely-stable cells (Meinshausen–Bühlmann "
+                    "bound), rigorous under the ⌊n/2⌋ complementary-pairs "
+                    "subsampling used here."
+                ),
+            )
+        sscore = summary.get("stability_score")
+        if sscore is not None:
+            st.caption(
+                "Channel-mix selection is calibrated automatically (Bodinier): K "
+                f"and π maximize the stability score ({float(sscore):.1f}). The "
+                "winner is the most consistently selected cell in the stable set; "
+                "`q_worst` is a secondary performance diagnostic."
+            )
+
     direction_msg = (
         f"Higher {metric_name} is better — `q_worst` is the {worst_q:.0%} "
         "*lower* quantile of OOB scores in the cell."
@@ -2041,7 +2115,7 @@ def _render_stability_diagnostics(summary: dict, metric_name: str) -> None:
 
     # ── Top cells ranking ─────────────────────────────────────────────
     if cell_stats:
-        st.markdown("**Top weight cells (ranked by `q_worst`)**")
+        st.markdown("**Top weight cells (ranked by selection probability)**")
         rows: list[dict] = []
         for rank, c in enumerate(cell_stats, start=1):
             row: dict = {"Rank": rank}
@@ -2063,10 +2137,11 @@ def _render_stability_diagnostics(summary: dict, metric_name: str) -> None:
         st.caption(
             "Each row is a 10-percent weight bucket. **Count** = trials "
             "across all bootstraps that landed in this bucket. "
-            "**Selection prob.** = fraction of bootstraps where the cell "
-            "appeared in the top-20% by OOB score. A winner with a tight "
-            "cluster of similar runners-up is more credible than an "
-            "isolated outlier."
+            "**Selection prob.** = fraction of resamples where the cell was in "
+            "the calibrated top-K by OOB score; the winner is the cell with the "
+            "highest selection probability in the stable set (≥ π*). A tight "
+            "cluster of similar runners-up is more credible than an isolated "
+            "winner."
         )
 
     # ── Stage-2 radius sub-cells (within the winning weight cell) ─────
@@ -2179,54 +2254,132 @@ def _render_stability_diagnostics(summary: dict, metric_name: str) -> None:
 
 
 def _render_results_headline(results_view: dict, metric_name: str) -> None:
-    """At-a-glance CGI bottom line: test score + CI, direction, AIC/BIC verdict."""
+    """At-a-glance CGI bottom line: the whole-data greenery effect (headline),
+    the held-out significance check, direction, and the CGI-vs-standalone
+    verdict (paired objective difference, AIC/BIC fallback)."""
+    effects = results_view.get("cgi_effects") or {}
+    all_eff = effects.get("all") or {}
+    test_eff = effects.get("test") or {}
     test_ci = (results_view.get("test_results") or {}).get("test_ci") or {}
     direction = results_view.get("direction_sign")
     aic_bic = results_view.get("cgi_vs_standalone_aic_bic") or None
+    paired = results_view.get("cgi_vs_standalone_paired") or None
 
-    cols = st.columns(3)
+    def _f(x):
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return None
+
+    cols = st.columns(4)
+
+    # 1) Whole-data effect — the headline greenery effect.
     with cols[0]:
-        obs = test_ci.get("observed")
-        lo = test_ci.get("lower")
-        hi = test_ci.get("upper")
-        if obs is None:
-            obs = (results_view.get("test_results") or {}).get("test_score")
-        if obs is not None:
+        score = _f(all_eff.get("score"))
+        lo, hi = _f(all_eff.get("lower")), _f(all_eff.get("upper"))
+        if score is not None:
             ci_str = (
-                f"[{float(lo):.4f}, {float(hi):.4f}]"
-                if lo is not None and hi is not None
-                else "—"
+                f"[{lo:.4f}, {hi:.4f}]" if lo is not None and hi is not None else "—"
             )
             st.metric(
-                f"CGI held-out test {metric_name}",
-                f"{float(obs):.4f}",
+                f"Whole-data {metric_name}",
+                f"{score:.4f}",
                 help=(
-                    "Stability-selection winning params scored on the untouched "
-                    f"test split. 95% percentile bootstrap CI: {ci_str}."
+                    "The greenery effect: stability-selected params scored on "
+                    f"every entity. 95% bootstrap CI: {ci_str}. Params were "
+                    "tuned on train+val, so this is a mild upper bound — the "
+                    "held-out p-value is the generalizability check."
                 ),
             )
         else:
-            st.metric(f"CGI held-out test {metric_name}", "—")
+            obs = _f(test_ci.get("observed"))
+            if obs is None:
+                obs = _f((results_view.get("test_results") or {}).get("test_score"))
+            st.metric(
+                f"CGI {metric_name}",
+                f"{obs:.4f}" if obs is not None else "—",
+            )
+
+    # 2) Held-out significance — permutation p on the untouched test split.
     with cols[1]:
+        p = _f(test_eff.get("p_value"))
+        t_score = _f(test_eff.get("score"))
+        if t_score is None:
+            t_score = _f(test_ci.get("observed"))
+        if p is not None:
+            prefix = (
+                f"Held-out {metric_name}={t_score:.4f}. " if t_score is not None else ""
+            )
+            st.metric(
+                "Held-out test (p-value)",
+                f"p = {p:.3g}",
+                help=(
+                    prefix + "Permutation p-value on the untouched test split — "
+                    "the honest generalizability check (the params never saw it)."
+                ),
+            )
+        elif t_score is not None:
+            lo, hi = _f(test_ci.get("lower")), _f(test_ci.get("upper"))
+            ci_str = (
+                f"[{lo:.4f}, {hi:.4f}]" if lo is not None and hi is not None else "—"
+            )
+            st.metric(
+                f"Held-out test {metric_name}",
+                f"{t_score:.4f}",
+                help=f"95% bootstrap CI: {ci_str}.",
+            )
+        else:
+            st.metric("Held-out test", "—")
+
+    # 3) Direction of the greenery↔outcome relationship.
+    with cols[2]:
         st.metric(
             "Direction (greenery↔outcome)",
             _direction_badge(direction),
             help=(
-                "Sign of the greenery↔outcome relationship; reported "
-                "separately because distance correlation is unsigned. A "
-                "positive sign means the composite rises with the outcome."
+                "Sign of the greenery↔outcome relationship; reported separately "
+                "because distance correlation is unsigned. Positive means the "
+                "composite rises with the outcome."
             ),
         )
-    with cols[2]:
-        if aic_bic and aic_bic.get("ok"):
-            d_bic = aic_bic.get("delta_bic")
+
+    # 4) CGI vs best standalone — paired objective difference (primary),
+    #    AIC/BIC as a secondary fallback.
+    with cols[3]:
+        if paired:
+            diff = _f(paired.get("observed_diff"))
+            lo, hi = _f(paired.get("lower")), _f(paired.get("upper"))
+            pp = _f(paired.get("p_value"))
+            ch = paired.get("standalone_channel")
+            verdict = "CGI better" if paired.get("favors_cgi") else "not better"
+            if diff is not None:
+                ci_str = (
+                    f"[{lo:.4f}, {hi:.4f}]"
+                    if lo is not None and hi is not None
+                    else "—"
+                )
+                p_str = f"{pp:.3g}" if pp is not None else "—"
+                help_txt = (
+                    f"Paired bootstrap difference in {metric_name} (CGI − `{ch}`) "
+                    f"on the full dataset: Δ={diff:.4f} {ci_str}, one-sided "
+                    f"p={p_str} (positive favours CGI)."
+                )
+            else:
+                help_txt = "Comparison unavailable."
+            st.metric("CGI vs best standalone", verdict, help=help_txt)
+        elif aic_bic and aic_bic.get("ok"):
+            d_bic = _f(aic_bic.get("delta_bic"))
             st.metric(
                 "CGI vs best standalone",
                 str(aic_bic.get("verdict", "—")),
                 help=(
                     "AIC/BIC of CGI (all channels) vs the best single channel "
                     f"(`{aic_bic.get('best_channel')}`). "
-                    f"ΔBIC={float(d_bic):.1f} (positive favours CGI)."
+                    + (
+                        f"ΔBIC={d_bic:.1f} (positive favours CGI)."
+                        if d_bic is not None
+                        else ""
+                    )
                 ),
             )
         elif aic_bic is not None:
@@ -2388,6 +2541,21 @@ def _render_study_detail(
 
     # ── Per-subset scores ─────────────────────────────────────────────
     if subset_scores:
+        # Bootstrap CIs + held-out permutation p-value (CGI study only).
+        effects = study_view.get("cgi_effects") or {}
+        eff_for = {"test": effects.get("test"), "all": effects.get("all")}
+
+        def _fmt_ci(block: dict | None) -> str | None:
+            if not block:
+                return None
+            lo, hi = block.get("lower"), block.get("upper")
+            if lo is None or hi is None:
+                return None
+            try:
+                return f"[{float(lo):.4f}, {float(hi):.4f}]"
+            except (TypeError, ValueError):
+                return None
+
         st.markdown("**Scores by data subset**")
         rows: list[dict] = []
         for subset in ("train", "val", "test", "all"):
@@ -2404,6 +2572,12 @@ def _render_study_detail(
                 row[f"{metric_name} (raw)"] = (
                     round(float(raw), 4) if raw is not None else None
                 )
+            eff = eff_for.get(subset)
+            row["95% CI"] = _fmt_ci(eff)
+            p_val = (eff or {}).get("p_value")
+            row["p (perm)"] = (
+                f"{float(p_val):.3g}" if p_val is not None else None
+            )
             row["n"] = block.get("n")
             rows.append(row)
         if rows:
@@ -2412,7 +2586,9 @@ def _render_study_detail(
                 "**train** = winning params on the full train+val pool · "
                 "**val** = winning-cell median out-of-bag score (cross-resample "
                 "held-out signal) · **test** = untouched held-out split · "
-                "**all** = every entity."
+                "**all** = every entity (the headline effect). 95% CIs are "
+                "percentile bootstrap; `p (perm)` is the held-out permutation "
+                "p-value."
             )
             if has_covariates:
                 cap += (
@@ -2596,9 +2772,12 @@ def _render_fusion_results_body(output_dir: str) -> None:
         )
 
     results_view, engine = _fusion_resolve_active_bundle()
-    if engine is None or results_view is None:
+    if results_view is None:
         st.warning("Optimization details are not available for the selected outcome.")
         return
+    # ``engine`` may be ``None`` when results were rehydrated from disk after a
+    # restart; every panel below reads ``results_view`` and only the composite
+    # map viewer touches the engine (which it guards).
 
     metric_name = results_view["objective_metric"].upper()
 
@@ -3159,6 +3338,10 @@ def render(output_dir: str) -> None:
     cgi_grid_spacing_m_param = study_state.get("cgi_grid_spacing_m")
     whole_grid_scaling_param = bool(study_state.get("whole_grid_scaling", False))
     area_balanced_split_param = bool(study_state.get("area_balanced_split", False))
+    normalize_channels_param = bool(study_state.get("normalize_channels", False))
+    spatial_split_param = bool(study_state.get("spatial_split", False))
+    spatial_block_size_m_param = study_state.get("spatial_block_size_m")
+    n_spatial_blocks_param = study_state.get("n_spatial_blocks")
     n_bootstraps_param = int(study_state.get("n_bootstraps", 20))
     n_trials_per_bootstrap_param = int(study_state.get("n_trials_per_bootstrap", 50))
     min_cell_count_param = int(study_state.get("min_cell_count", 3))
@@ -3509,6 +3692,21 @@ def render(output_dir: str) -> None:
                 ),
                 "area_balanced_split": (
                     area_balanced_split_param if is_polygon_target_ui else False
+                ),
+                # Per-channel normalization applies to vector targets only.
+                "normalize_channels": (
+                    bool(normalize_channels_param) if is_vector_target else False
+                ),
+                # Spatial block validation applies to vector targets only;
+                # raster targets keep the row-level stratified split.
+                "spatial_split": (
+                    bool(spatial_split_param) if is_vector_target else False
+                ),
+                "spatial_block_size_m": (
+                    spatial_block_size_m_param if is_vector_target else None
+                ),
+                "n_spatial_blocks": (
+                    n_spatial_blocks_param if is_vector_target else None
                 ),
                 "n_bootstraps": int(n_bootstraps_param),
                 "n_trials_per_bootstrap": int(n_trials_per_bootstrap_param),

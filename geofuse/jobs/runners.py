@@ -585,6 +585,10 @@ def _fusion_config_fingerprint(
     cgi_grid_spacing_m: float | None,
     area_balanced_split: bool,
     test_size: float,
+    spatial_split: bool = False,
+    spatial_block_size_m: float | None = None,
+    n_spatial_blocks: int | None = None,
+    normalize_channels: bool = False,
 ) -> str:
     """8-char hex hash of every setting that changes the search space / split.
 
@@ -605,10 +609,15 @@ def _fusion_config_fingerprint(
             f"grid:{cgi_grid_spacing_m if cgi_grid_spacing_m is not None else 'na'}",
             f"ab:{int(area_balanced_split)}",
             f"ts:{test_size:.3f}",
+            f"sp:{int(spatial_split)}",
+            f"spb:{spatial_block_size_m if spatial_block_size_m is not None else 'na'}",
+            f"spn:{n_spatial_blocks if n_spatial_blocks is not None else 'na'}",
             # Bump when the search space / selection scheme changes so old
             # per-job caches can't pool with a new run.
-            "sel:stabsel-dcor-v1",
+            "sel:stabsel-cpss-v3",
         ]
+        # Only appended when on, so legacy (un-normalized) runs keep their hash.
+        + (["nc:1"] if normalize_channels else [])
     )
     return _hl.sha256(payload.encode()).hexdigest()[:8]
 
@@ -1081,6 +1090,13 @@ def _stability_summary(params: dict) -> dict:
         "count": g("__cell_count__"),
         "selection_probability": g("__cell_selection_probability__"),
         "worst_quantile": g("__worst_quantile__"),
+        # Automated threshold calibration (Bodinier).
+        "stability_score": g("__stability_score__"),
+        "selection_threshold": g("__selection_threshold__"),
+        "selection_size_k": g("__selection_size_k__"),
+        "n_candidate_cells": g("__n_candidate_cells__"),
+        "n_stably_selected": g("__n_stably_selected__"),
+        "pfer": g("__pfer__"),
         "n_bootstraps": g("__n_bootstraps__"),
         "n_trials_per_bootstrap": g("__n_trials_per_bootstrap__"),
         "n_total_trials": g("__n_total_trials__"),
@@ -1183,6 +1199,50 @@ def _compare_cgi_vs_standalone(
         return None
 
 
+def _jsonsafe_results(obj, _depth: int = 0):
+    """Recursively convert a fusion results payload to JSON-serializable types.
+
+    Heavy or non-serializable values (DataFrames, ndarrays, per-trial pools)
+    are dropped — they're reproducible from the on-disk artifacts — so the
+    compact bundle written beside the job can rehydrate the results view after
+    a Streamlit restart without pinning engines in memory.
+    """
+    if _depth > 12:
+        return None
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return None
+    if isinstance(obj, dict):
+        out: dict = {}
+        for k, v in obj.items():
+            if k in (
+                "composite_df",
+                "robust_trials",
+                "per_trial_test",
+                "all_completed_trials",
+            ):
+                continue
+            out[str(k)] = _jsonsafe_results(v, _depth + 1)
+        return out
+    if isinstance(obj, (list, tuple, set)):
+        return [_jsonsafe_results(v, _depth + 1) for v in obj]
+    try:
+        import pandas as _pd
+
+        if isinstance(obj, (_pd.DataFrame, _pd.Series)):
+            return None
+    except Exception:
+        pass
+    try:
+        s = str(obj)
+        return s if len(s) <= 2000 else None
+    except Exception:
+        return None
+
+
 def run_fusion(
     ctx: JobContext,
     *,
@@ -1224,10 +1284,14 @@ def run_fusion(
     cgi_grid_spacing_m: float | None = None,
     whole_grid_scaling: bool = False,
     area_balanced_split: bool = False,
+    normalize_channels: bool = False,
     n_bootstraps: int = 20,
     n_trials_per_bootstrap: int = 50,
     min_cell_count: int = 3,
     worst_quantile: float = 0.10,
+    spatial_split: bool = False,
+    spatial_block_size_m: float | None = None,
+    n_spatial_blocks: int | None = None,
     check_collinearity: bool = False,
     vif_threshold: float = 10.0,
 ) -> dict:
@@ -1335,6 +1399,10 @@ def run_fusion(
             "cgi_grid_spacing_m": cgi_grid_spacing_m,
             "whole_grid_scaling": bool(whole_grid_scaling),
             "area_balanced_split": bool(area_balanced_split),
+            "normalize_channels": bool(normalize_channels),
+            "spatial_split": bool(spatial_split),
+            "spatial_block_size_m": spatial_block_size_m,
+            "n_spatial_blocks": n_spatial_blocks,
             "check_collinearity": bool(check_collinearity),
             "vif_threshold": float(vif_threshold),
             "cache_metrics": bool(cache_metrics),
@@ -1419,6 +1487,7 @@ def run_fusion(
                 cgi_grid_spacing_m=cgi_grid_spacing_m,
                 whole_grid_scaling=whole_grid_scaling,
                 area_balanced_split=area_balanced_split,
+                normalize_channels=normalize_channels,
             )
 
             ctx.progress(value=prog(0.1), status_text=f"{prefix}Loading target data...")
@@ -1670,6 +1739,10 @@ def run_fusion(
                 cgi_grid_spacing_m=cgi_grid_spacing_m,
                 area_balanced_split=bool(area_balanced_split),
                 test_size=float(test_size),
+                spatial_split=bool(spatial_split),
+                spatial_block_size_m=spatial_block_size_m,
+                n_spatial_blocks=n_spatial_blocks,
+                normalize_channels=bool(normalize_channels),
             )
 
             def _standalone_study_name(ch: str) -> str:
@@ -1693,15 +1766,87 @@ def run_fusion(
                 fusion_df=fusion_df,
                 test_size=test_size,
                 random_state=42,
+                spatial_split=bool(spatial_split),
+                spatial_block_size_m=spatial_block_size_m,
+                n_spatial_blocks=n_spatial_blocks,
             )
             stage(skey("split"), DONE)
+
+            # Distance correlation builds O(n²) distance matrices per score, so
+            # large entity counts make the bootstrap + permutation passes slow.
+            # Warn rather than cap, so the metric stays exact.
+            if objective_metric == "distance_corr":
+                try:
+                    n_entities = (
+                        int(fusion_df["polygon_id"].nunique())
+                        if "polygon_id" in fusion_df.columns
+                        else int(len(fusion_df))
+                    )
+                except Exception:
+                    n_entities = 0
+                if n_entities > 5000:
+                    _log_fusion(
+                        "WARN",
+                        f"[{label}] distance_corr scores are O(n²) over "
+                        f"{n_entities:,} entities — bootstrap CIs and permutation "
+                        "tests will take noticeably longer. 'spearman' is a faster "
+                        "partial-correlation objective if runtime matters.",
+                    )
+
+            # Scale the CGI search budget by its dimensionality so the
+            # high-dimensional fusion search is sampled at a per-axis density
+            # comparable to the (low-dim) standalone studies — otherwise a real
+            # CGI gain can be masked by under-exploration.
+            from .. import cgi_formulas as _cgi_formulas
+
+            _cgi_desc = _cgi_formulas.get_formula(cgi_formula)
+            _cgi_free_dims = len(_cgi_desc.weight_keys) + len(_cgi_desc.power_keys)
+            cgi_trials_per_bootstrap = int(n_trials_per_bootstrap) * max(
+                1, round(_cgi_free_dims / 2)
+            )
+            if cgi_trials_per_bootstrap != int(n_trials_per_bootstrap):
+                _log_fusion(
+                    "INFO",
+                    f"[{label}] CGI search budget scaled to "
+                    f"{int(n_bootstraps)}×{cgi_trials_per_bootstrap} "
+                    f"({_cgi_free_dims} free weight/power axes); standalones use "
+                    f"{int(n_bootstraps)}×{int(n_trials_per_bootstrap)}.",
+                )
+
+            def _study_progress_cb(study_label: str):
+                """Per-trial callback → live caption + secondary trial bar.
+
+                Throttled to ~0.4 s (always fires on the final trial) so the
+                job card shows "<study>: k / N trials" without flooding the
+                store. Leaves the stage-driven main bar untouched.
+                """
+                state = {"t": 0.0}
+
+                def _cb(done: int, total: int) -> None:
+                    now = time.monotonic()
+                    if done < total and (now - state["t"]) < 0.4:
+                        return
+                    state["t"] = now
+                    pct = (100.0 * done / total) if total else 0.0
+                    ctx.progress(
+                        value=None,
+                        status_text=f"{prefix}{study_label}: {done:,}/{total:,} trials",
+                        fusion_study_progress={
+                            "study": study_label,
+                            "current": int(done),
+                            "total": int(total),
+                            "percent": float(pct),
+                        },
+                    )
+
+                return _cb
 
             stage(skey("optimize"), RUNNING)
             ctx.progress(
                 value=prog(0.90),
                 status_text=(
                     f"{prefix}Stability selection "
-                    f"({int(n_bootstraps)}×{int(n_trials_per_bootstrap)})..."
+                    f"({int(n_bootstraps)}×{cgi_trials_per_bootstrap})..."
                 ),
             )
             # Stability selection has no master Optuna study; ``best_params``
@@ -1731,11 +1876,13 @@ def run_fusion(
             headline_params = engine.bootstrap_stability_selection(
                 metric=objective_metric,
                 n_bootstraps=int(n_bootstraps),
-                n_trials_per_bootstrap=int(n_trials_per_bootstrap),
+                n_trials_per_bootstrap=cgi_trials_per_bootstrap,
                 min_cell_count=int(min_cell_count),
                 worst_quantile=float(worst_quantile),
+                spatial_resample=bool(spatial_split),
                 seed=42,
                 cancel_callback=cancel_check,
+                progress_callback=_study_progress_cb("CGI"),
             )
             engine.best_params = dict(headline_params)
             cgi_stability_summary = _stability_summary(headline_params)
@@ -1760,6 +1907,27 @@ def run_fusion(
             # Direction of the greenery↔outcome relationship (distance
             # correlation is unsigned, so the sign is reported separately).
             cgi_direction = _direction_sign(engine, headline_params, objective_metric)
+
+            # Whole-data effect (the headline greenery effect) with per-subset
+            # bootstrap CIs and a held-out permutation p-value, all in the
+            # objective metric's own units.
+            cgi_effects: dict | None = None
+            try:
+                cgi_effects = engine.evaluate_effects(
+                    headline_params, objective_metric, seed=42
+                )
+                if cgi_effects and cgi_effects.get("all"):
+                    _a = cgi_effects["all"]
+                    _t = cgi_effects.get("test") or {}
+                    _log_fusion(
+                        "OK",
+                        f"[{label}] Whole-data {objective_metric}="
+                        f"{_a.get('score')} "
+                        f"[{_a.get('lower')}, {_a.get('upper')}]; held-out "
+                        f"p={_t.get('p_value')}.",
+                    )
+            except Exception as exc:
+                _log_fusion("WARN", f"[{label}] Whole-data effects failed: {exc}")
 
             # No master Optuna study in stability mode, so there is no per-trial
             # test sidecar to build.
@@ -1852,8 +2020,10 @@ def run_fusion(
                     n_trials_per_bootstrap=int(n_trials_per_bootstrap),
                     min_cell_count=int(min_cell_count),
                     worst_quantile=float(worst_quantile),
+                    spatial_resample=bool(spatial_split),
                     seed=42,
                     cancel_callback=cancel_check,
+                    progress_callback=_study_progress_cb(f"Standalone: {ch_disp}"),
                 )
                 engine.best_params = dict(ch_best)
                 ch_headline_params = dict(ch_best)
@@ -1998,6 +2168,42 @@ def run_fusion(
                         f"{cgi_vs_standalone_aic_bic['verdict']}.",
                     )
 
+            # Paired bootstrap objective difference (CGI − best standalone) on
+            # the full dataset, in the metric's own units — the primary
+            # CGI-vs-standalone verdict; AIC/BIC stays a secondary report.
+            cgi_vs_standalone_paired: dict | None = None
+            if (
+                standalones
+                and cgi_vs_standalone_aic_bic
+                and cgi_vs_standalone_aic_bic.get("best_channel") in standalones_bundle
+            ):
+                best_ch = cgi_vs_standalone_aic_bic["best_channel"]
+                ch_bundle = standalones_bundle[best_ch]
+                ch_params = (
+                    ch_bundle.get("averaged_params")
+                    or ch_bundle.get("best_params")
+                    or {}
+                )
+                try:
+                    cgi_vs_standalone_paired = engine.paired_objective_difference(
+                        headline_params,
+                        ch_params,
+                        best_ch,
+                        objective_metric,
+                        seed=42,
+                    )
+                    if cgi_vs_standalone_paired:
+                        _log_fusion(
+                            "OK",
+                            f"[{label}] CGI − {best_ch} {objective_metric} "
+                            f"Δ={cgi_vs_standalone_paired['observed_diff']:.4f} "
+                            f"[{cgi_vs_standalone_paired['lower']:.4f}, "
+                            f"{cgi_vs_standalone_paired['upper']:.4f}], "
+                            f"p={cgi_vs_standalone_paired['p_value']:.4g}.",
+                        )
+                except Exception as exc:
+                    _log_fusion("WARN", f"[{label}] Paired difference failed: {exc}")
+
             # ── Reports + composite GeoTIFF (plotting + raster write) ──
             # Pulled out of ``optimize_fusion`` so the standalone stages above
             # can advance the ledger while plotting runs separately at the
@@ -2081,6 +2287,11 @@ def run_fusion(
                 "stability_summary": cgi_stability_summary,
                 "direction_sign": cgi_direction,
                 "cgi_vs_standalone_aic_bic": cgi_vs_standalone_aic_bic,
+                # Whole-data objective effect (headline) + per-subset CIs +
+                # held-out permutation p-value, and the paired objective
+                # difference vs the best standalone (the primary verdict).
+                "cgi_effects": cgi_effects,
+                "cgi_vs_standalone_paired": cgi_vs_standalone_paired,
             }
             by_target[label] = bundle
             engines_by_target[label] = engine
@@ -2129,6 +2340,18 @@ def run_fusion(
             results=results_payload,
             artifacts_dir=job_artifacts_root,
         )
+
+        # Compact on-disk results bundle so a completed run re-opens after a
+        # Streamlit restart (``rec.extra`` isn't persisted, but ``output_paths``
+        # is). Best-effort — a write failure never fails the run.
+        try:
+            bundle_json_path = os.path.join(job_artifacts_root, "results_bundle.json")
+            with open(bundle_json_path, "w", encoding="utf-8") as _bf:
+                json.dump(_jsonsafe_results(results_payload), _bf, default=str)
+            output_paths.append(bundle_json_path)
+        except Exception as exc:
+            _log_fusion("WARN", f"Could not write results bundle JSON: {exc}")
+
         ctx.progress(value=1.0, status_text="Completed")
         return {"output_paths": output_paths}
 

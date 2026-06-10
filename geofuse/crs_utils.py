@@ -644,6 +644,95 @@ def buffer_gdf_union_metres(
     return out.to_crs(orig_crs)
 
 
+def assign_spatial_blocks(
+    gdf: gpd.GeoDataFrame,
+    *,
+    block_size_m: float | None = None,
+    target_blocks: int | None = None,
+    min_block_size_m: float | None = None,
+) -> tuple[np.ndarray, dict]:
+    """Label each feature with a coarse spatial-grid block id.
+
+    Bins feature representative points onto a regular square grid in a
+    minimal-distortion projected metre CRS, then densely relabels the
+    occupied cells in a row-major (space-filling) order. Returned ids run
+    ``0 .. n_blocks-1`` and are aligned row-for-row with ``gdf``; because the
+    order sweeps space, callers get even geographic coverage by striping
+    blocks across folds (``block_id % n_folds``) and keep each block intact by
+    assigning whole blocks to a split.
+
+    Block edge length is ``block_size_m`` when given; otherwise it is derived
+    so roughly ``target_blocks`` non-empty cells result, floored at
+    ``min_block_size_m`` (used to keep a block larger than the spatial
+    autocorrelation range, e.g. a few × the catchment radius).
+
+    Returns ``(block_ids, info)`` where ``info`` records the metre CRS, the
+    block size used, and the number of occupied blocks. A degenerate extent
+    (single location / zero span) yields a single block.
+    """
+    n = len(gdf)
+    if n == 0:
+        return np.empty(0, dtype=np.int64), {
+            "block_size_m": 0.0,
+            "n_blocks": 0,
+            "crs": None,
+        }
+
+    if gdf.crs is not None and crs_uses_metre_axes(gdf.crs):
+        gdf_m = gdf
+    else:
+        work = gdf.set_crs(WGS84_EPSG) if gdf.crs is None else gdf
+        utm = estimate_metre_projected_crs_for_gdf(work)
+        gdf_m = work.to_crs(utm)
+
+    pts = gdf_m.geometry.representative_point()
+    x = pts.x.to_numpy(dtype=np.float64)
+    y = pts.y.to_numpy(dtype=np.float64)
+    finite = np.isfinite(x) & np.isfinite(y)
+    if not finite.any():
+        return np.zeros(n, dtype=np.int64), {
+            "block_size_m": 0.0,
+            "n_blocks": 1,
+            "crs": str(gdf_m.crs),
+        }
+
+    minx, miny = float(np.min(x[finite])), float(np.min(y[finite]))
+    w = float(np.max(x[finite]) - minx)
+    h = float(np.max(y[finite]) - miny)
+
+    if block_size_m is not None and float(block_size_m) > 0:
+        s = float(block_size_m)
+    else:
+        if target_blocks is None:
+            target_blocks = max(9, min(200, int(round(n / 15))))
+        area = max(w * h, 1.0)
+        s = float(np.sqrt(area / max(int(target_blocks), 1)))
+    if min_block_size_m is not None:
+        s = max(s, float(min_block_size_m))
+    if not np.isfinite(s) or s <= 0:
+        # Zero-span extent (all points coincident) → one block.
+        return np.zeros(n, dtype=np.int64), {
+            "block_size_m": float(max(w, h, 1.0)),
+            "n_blocks": 1,
+            "crs": str(gdf_m.crs),
+        }
+
+    ix = np.clip(np.floor((x - minx) / s), 0, None).astype(np.int64)
+    iy = np.clip(np.floor((y - miny) / s), 0, None).astype(np.int64)
+    # Non-finite reps fall into cell (0, 0); they keep a valid block label.
+    ix[~finite] = 0
+    iy[~finite] = 0
+    n_cols = int(ix.max()) + 1
+    raw = iy * n_cols + ix  # row-major scan order across the grid
+    _uniq, inverse = np.unique(raw, return_inverse=True)
+    block_ids = inverse.astype(np.int64)
+    return block_ids, {
+        "block_size_m": float(s),
+        "n_blocks": int(len(_uniq)),
+        "crs": str(gdf_m.crs),
+    }
+
+
 def reproject_geodataframe_to_wgs84(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """Put every feature in EPSG:4326 (x=lon°, y=lat°) for engines and map previews."""
     if gdf.empty:

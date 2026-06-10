@@ -553,3 +553,50 @@ def compute_cgi(formula: str, params: dict, components: ComponentDict) -> np.nda
 def channel_active(formula: str, params: dict) -> dict[str, bool]:
     """Which channels contribute under ``formula`` for the given ``params``."""
     return get_formula(formula).channel_active(params)
+
+
+# Per-formula map: channel → the main weight key that carries it alone.
+_CHANNEL_MAIN_KEY: dict[str, dict[str, str]] = {
+    WEIGHTED_AVERAGE: {
+        "ndvi": "ndvi_weight",
+        "veg": "veg_weight",
+        "terrain": "terrain_weight",
+    },
+    SYNERGY: {"ndvi": "w_ndvi", "veg": "w_veg", "terrain": "w_ter"},
+}
+
+
+def seed_param_sets(
+    formula: str, disabled_channels: "set[str] | None" = None
+) -> list[dict]:
+    """Enqueue-ready params seeding each single-channel vertex + the centroid.
+
+    Each dict sets the Dirichlet ``*_raw`` axes so the snapped weights put all
+    mass on one channel's main term (a standalone-equivalent composite), powers
+    pinned to 1.0; the sampler fills the remaining radius / stat axes. Seeding
+    these makes CGI's nesting of every standalone reachable in practice rather
+    than relying on the sampler to land near a simplex vertex. Returns ``[]``
+    for formulas without a vertex map.
+    """
+    desc = get_formula(formula)
+    main_key = _CHANNEL_MAIN_KEY.get(formula)
+    if not main_key:
+        return []
+    disabled = set(disabled_channels or ())
+    active = [c for c in ALL_CHANNELS if c not in disabled]
+    seeds: list[dict] = []
+    for ch in active:
+        dom = main_key[ch]
+        params: dict = {
+            f"{k}_raw": (_DIRICHLET_EPS if k == dom else 1.0 - _DIRICHLET_EPS)
+            for k in desc.weight_keys
+        }
+        for pk in desc.power_keys:
+            params[pk] = 1.0
+        seeds.append(params)
+    if len(active) > 1:
+        params = {f"{k}_raw": 0.5 for k in desc.weight_keys}
+        for pk in desc.power_keys:
+            params[pk] = 1.0
+        seeds.append(params)
+    return seeds

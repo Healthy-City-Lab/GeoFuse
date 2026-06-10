@@ -78,12 +78,6 @@ _DEGENERATE_SCORE: dict[str, float] = {
     "mutual_info": 0.0,
 }
 
-# Above this many rows the distance-correlation O(n²) distance matrices are
-# capped via a deterministic subsample. Collapsed polygon / entity counts are
-# normally a few hundred, so this is a safety rail rather than a routine path.
-_DCOR_N_CAP: int = 2000
-
-
 def _validate_metric(metric: str) -> None:
     if metric not in SUPPORTED_METRICS:
         raise ValueError(
@@ -173,8 +167,9 @@ def distance_correlation(
     Uses the Székely–Rizzo double-centred distance matrices:
     ``dCov² = mean(A ⊙ B)``, ``dVar = mean(A ⊙ A)``, and
     ``dCor = sqrt(dCov² / sqrt(dVarx · dVary))``. Returns ``0.0`` when either
-    input is constant (no spread → no distances). For ``n > _DCOR_N_CAP`` a
-    deterministic subsample bounds the O(n²) memory.
+    input is constant. The O(n²) distance matrices are built on the full
+    sample (no row cap); the runner warns when the entity count is large and
+    this metric is selected. ``seed`` is retained for signature stability.
     """
     xa = np.asarray(x, dtype=np.float64).ravel()
     ya = np.asarray(y, dtype=np.float64).ravel()
@@ -185,10 +180,6 @@ def distance_correlation(
     n = len(xa)
     if n < 3:
         return 0.0
-    if n > _DCOR_N_CAP:
-        idx = np.random.default_rng(seed).choice(n, size=_DCOR_N_CAP, replace=False)
-        xa = xa[idx]
-        ya = ya[idx]
     if float(np.var(xa)) == 0 or float(np.var(ya)) == 0:
         return 0.0
 

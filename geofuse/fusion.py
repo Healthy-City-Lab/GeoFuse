@@ -34,6 +34,7 @@ from . import (
 )
 from .cgi_formulas import WEIGHTED_AVERAGE, compute_cgi
 from .crs_utils import (
+    assign_spatial_blocks,
     build_internal_overviews,
     default_geotiff_creation_options,
     estimate_metre_projected_crs_for_gdf,
@@ -219,6 +220,7 @@ class MetricFusionEngine:
         cgi_grid_spacing_m: float | None = None,
         whole_grid_scaling: bool = False,
         area_balanced_split: bool = False,
+        normalize_channels: bool = False,
     ):
         """
         Initialize the fusion engine.
@@ -359,6 +361,14 @@ class MetricFusionEngine:
             float(cgi_grid_spacing_m) if cgi_grid_spacing_m is not None else 25.0
         )
         self.whole_grid_scaling: bool = bool(whole_grid_scaling)
+        # When True, each channel is min-max scaled to [0, 1] (per-channel
+        # bounds fixed at prepare time from the predictor distribution only —
+        # no outcome leakage) before the composite is formed, so weights are
+        # interpretable and the synergy powers see their assumed [0, 1] domain.
+        # Default False keeps legacy raw-channel composites bit-for-bit.
+        self.normalize_channels: bool = bool(normalize_channels)
+        # Per-channel (lo, hi) min-max bounds, filled by prepare_fusion_data.
+        self._channel_minmax: dict[str, tuple[float, float]] | None = None
         # When True, the area-balanced train-val split tries to keep the total
         # area balanced across train / val / test sets.
         self.area_balanced_split: bool = bool(area_balanced_split)
@@ -412,6 +422,10 @@ class MetricFusionEngine:
         # and duplicated scoring rows translate to a pixel id at lookup time.
         # ``None`` for polygon / raster targets, where one row == one entity.
         self._preaggr_entity_gdf: gpd.GeoDataFrame | None = None
+        # Spatial-block labels per split group, set by ``split_data`` when
+        # spatial blocking is enabled and reused by the bootstrap resampler.
+        self._spatial_block_by_group: dict | None = None
+        self._spatial_block_group_col: str | None = None
         self._cancel_callback: Callable[[], bool] | None = None
 
         # Channels turned off by the optional collinearity check
@@ -2399,15 +2413,63 @@ class MetricFusionEngine:
         self._preaggr_entity_gdf = None
         if self.is_polygon_target:
             _log("INFO", "Target type: POLYGON (per-pixel CGI)")
-            return self._prepare_polygon_fusion()
-        _log(
-            "INFO",
-            f"Target type: {'POINT/LINE (per-pixel CGI)' if self.is_points else 'RASTER'}",
-        )
-        if self.is_points:
-            return self._prepare_entity_fusion()
+            df = self._prepare_polygon_fusion()
         else:
-            return self._prepare_raster_fusion()
+            _log(
+                "INFO",
+                f"Target type: {'POINT/LINE (per-pixel CGI)' if self.is_points else 'RASTER'}",
+            )
+            df = (
+                self._prepare_entity_fusion()
+                if self.is_points
+                else self._prepare_raster_fusion()
+            )
+        self._compute_channel_scale(df)
+        return df
+
+    def _compute_channel_scale(self, fusion_df: pd.DataFrame) -> None:
+        """Fix per-channel [0, 1] min-max bounds from the predictor distribution.
+
+        Robust 2nd/98th-percentile bounds per channel, computed once on the
+        prepared probe values (no outcome involved, so no CV leakage) and
+        applied identically to every fold / split / output. No-op unless
+        ``normalize_channels`` is on.
+        """
+        if not self.normalize_channels:
+            self._channel_minmax = None
+            return
+        bounds: dict[str, tuple[float, float]] = {}
+        for ch in ("veg", "terrain", "ndvi"):
+            if ch not in fusion_df.columns:
+                bounds[ch] = (0.0, 1.0)
+                continue
+            vals = pd.to_numeric(fusion_df[ch], errors="coerce").to_numpy(np.float64)
+            vals = vals[np.isfinite(vals)]
+            if vals.size == 0:
+                bounds[ch] = (0.0, 1.0)
+                continue
+            lo = float(np.percentile(vals, 2.0))
+            hi = float(np.percentile(vals, 98.0))
+            if hi <= lo:
+                lo, hi = float(vals.min()), float(vals.max())
+            bounds[ch] = (lo, hi)
+        self._channel_minmax = bounds
+        _log("INFO", f"Channel normalization bounds (2–98 pct): {bounds}")
+
+    def _normalize_channel_arrays(
+        self, veg: np.ndarray, terrain: np.ndarray, ndvi: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Min-max scale each channel to [0, 1] using the fixed bounds, or pass through."""
+        if not self.normalize_channels or not self._channel_minmax:
+            return veg, terrain, ndvi
+
+        def _scale(a: np.ndarray, ch: str) -> np.ndarray:
+            lo, hi = self._channel_minmax.get(ch, (0.0, 1.0))
+            if hi <= lo:
+                return np.asarray(a, dtype=np.float64)
+            return np.clip((np.asarray(a, dtype=np.float64) - lo) / (hi - lo), 0.0, 1.0)
+
+        return _scale(veg, "veg"), _scale(terrain, "terrain"), _scale(ndvi, "ndvi")
 
     # ------------------------------------------------------------------
     # Spatial pre-aggregation (mandatory; on-disk SQLite cache)
@@ -4008,8 +4070,21 @@ class MetricFusionEngine:
         if mask is not None:
             v = v[mask]
             pid = pid[mask]
-        g = pd.Series(v).groupby(pid)
-        return (g.mean() if how == "mean" else g.first()).to_numpy()
+        if how == "mean":
+            # factorize(sort=True) reproduces the sorted-key order pandas
+            # groupby uses, so every collapsed array stays row-aligned, while
+            # bincount avoids building a Series + GroupBy on the hot path.
+            codes, uniq = pd.factorize(pid, sort=True)
+            vv = np.asarray(v, dtype=np.float64)
+            valid = ~np.isnan(vv)
+            n = len(uniq)
+            counts = np.bincount(codes[valid], minlength=n)
+            sums = np.bincount(codes[valid], weights=vv[valid], minlength=n)
+            out = np.full(n, np.nan, dtype=np.float64)
+            nz = counts > 0
+            out[nz] = sums[nz] / counts[nz]
+            return out
+        return pd.Series(v).groupby(pid).first().to_numpy()
 
     def _finalize_composite(self, composite: np.ndarray) -> np.ndarray:
         """Apply the ``whole_grid_scaling`` toggle to a per-pixel composite.
@@ -4418,6 +4493,112 @@ class MetricFusionEngine:
             for name, idxs in per_bin_assignments.items()
         }
 
+    def _resolve_group_block_ids(
+        self,
+        group_ids: np.ndarray,
+        group_col: str,
+        fusion_df: pd.DataFrame,
+        *,
+        block_size_m: float | None,
+        n_blocks: int | None,
+    ) -> tuple[dict, dict] | None:
+        """Map each split group to a coarse spatial-block id.
+
+        Resolves a representative point per group from ``target_gdf`` (point
+        pixel centres, or polygon representative points), reducing to the
+        split's group key — directly when ``group_col`` is a ``target_gdf``
+        column, otherwise via the ``polygon_id → group_col`` map carried in
+        ``fusion_df``. Returns ``({group_id: block_id}, info)`` or ``None`` when
+        group geometry can't be resolved (caller then skips spatial blocking).
+
+        The block edge is floored at twice the largest catchment radius so a
+        block is wider than the greenery autocorrelation range, keeping a
+        held-out block's catchments clear of the train blocks around it.
+        """
+        tg = self.target_gdf
+        if tg is None or getattr(tg, "geometry", None) is None or len(tg) == 0:
+            return None
+        try:
+            geom = tg.geometry
+            is_point = bool((geom.geom_type == "Point").all())
+            if is_point:
+                rx = geom.x.to_numpy(dtype=np.float64)
+                ry = geom.y.to_numpy(dtype=np.float64)
+            else:
+                rep = geom.representative_point()
+                rx = rep.x.to_numpy(dtype=np.float64)
+                ry = rep.y.to_numpy(dtype=np.float64)
+        except Exception:
+            return None
+
+        if group_col in tg.columns:
+            keys = tg[group_col].to_numpy()
+        elif (
+            "polygon_id" in tg.columns
+            and "polygon_id" in fusion_df.columns
+            and group_col in fusion_df.columns
+        ):
+            pid_to_group = dict(
+                zip(
+                    fusion_df["polygon_id"].to_numpy(),
+                    fusion_df[group_col].to_numpy(),
+                )
+            )
+            keys = np.array(
+                [pid_to_group.get(p) for p in tg["polygon_id"].to_numpy()],
+                dtype=object,
+            )
+        else:
+            return None
+
+        cdf = pd.DataFrame({"_g": keys, "x": rx, "y": ry}).dropna(subset=["_g"])
+        if cdf.empty:
+            return None
+        agg = cdf.groupby("_g", sort=False)[["x", "y"]].mean()
+        group_pts = gpd.GeoDataFrame(
+            {"_g": agg.index.to_numpy()},
+            geometry=gpd.points_from_xy(
+                agg["x"].to_numpy(), agg["y"].to_numpy()
+            ),
+            crs=tg.crs,
+        )
+        r_max = max(
+            float(getattr(self, "gvi_buffer_max_m", 0.0) or 0.0),
+            float(getattr(self, "ndvi_buffer_max_m", 0.0) or 0.0),
+        )
+        min_block = 2.0 * r_max if r_max > 0 else None
+        try:
+            block_ids, info = assign_spatial_blocks(
+                group_pts,
+                block_size_m=block_size_m,
+                target_blocks=n_blocks,
+                min_block_size_m=min_block,
+            )
+        except Exception:
+            return None
+        block_by_group = dict(zip(agg.index.to_numpy(), block_ids.tolist()))
+        return block_by_group, info
+
+    @staticmethod
+    def _stripe_to_test_blocks(
+        ordered_blocks: np.ndarray, test_fraction: float, rng: np.random.Generator
+    ) -> set:
+        """Pick ~``test_fraction`` of blocks, spread evenly across their order.
+
+        ``ordered_blocks`` is the space-filling block sequence; selecting evenly
+        spaced positions (with a seed-jittered start) spreads the held-out
+        blocks across the full extent rather than into one contiguous corner.
+        """
+        n = len(ordered_blocks)
+        if n == 0:
+            return set()
+        n_pick = max(1, int(round(test_fraction * n)))
+        n_pick = min(n_pick, n)
+        step = n / n_pick
+        start = int(rng.integers(0, max(1, int(np.floor(step)))))
+        idxs = (np.floor(np.arange(n_pick) * step).astype(int) + start) % n
+        return set(ordered_blocks[np.unique(idxs)].tolist())
+
     def split_data(
         self,
         test_size: float = 0.2,
@@ -4428,6 +4609,9 @@ class MetricFusionEngine:
         *,
         outer_fold_idx: int | None = None,
         n_outer_folds: int | None = None,
+        spatial_split: bool = False,
+        spatial_block_size_m: float | None = None,
+        n_spatial_blocks: int | None = None,
     ) -> None:
         """Carve a held-out test set, then build k inner CV folds (or one
         single split) over the remainder.
@@ -4546,6 +4730,52 @@ class MetricFusionEngine:
             # K-fold partition over groups. Every group appears in test
             # exactly once across the K outer-fold calls.
             outer_cv_mode = outer_fold_idx is not None and n_outer_folds is not None
+
+            # Optional spatial blocking: tag each group with a coarse grid
+            # block so whole blocks — never split groups — can be striped
+            # across the held-out test and inner folds, spreading them over
+            # the full extent while keeping a block's catchments clear of its
+            # neighbours.
+            spatial_ok = False
+            self._spatial_block_by_group = None
+            self._spatial_block_group_col = None
+            if spatial_split and not outer_cv_mode:
+                resolved = self._resolve_group_block_ids(
+                    poly_df[group_col].to_numpy(),
+                    group_col,
+                    fusion_df,
+                    block_size_m=spatial_block_size_m,
+                    n_blocks=n_spatial_blocks,
+                )
+                if resolved is not None:
+                    block_by_group, binfo = resolved
+                    poly_df["_block"] = poly_df[group_col].map(block_by_group)
+                    n_mapped_blocks = int(poly_df["_block"].dropna().nunique())
+                    if poly_df["_block"].notna().any() and n_mapped_blocks >= 2:
+                        poly_df["_block"] = poly_df["_block"].fillna(-1).astype(int)
+                        spatial_ok = True
+                        self._spatial_block_by_group = block_by_group
+                        self._spatial_block_group_col = group_col
+                        _log(
+                            "INFO",
+                            f"Spatial blocking: {n_mapped_blocks} blocks "
+                            f"(~{binfo.get('block_size_m', 0.0):.0f} m) over "
+                            f"{n_polys} {group_label}s; held-out test and folds "
+                            "striped across blocks.",
+                        )
+                    else:
+                        _log(
+                            "WARN",
+                            "Spatial blocking produced <2 usable blocks; "
+                            "falling back to outcome-stratified split.",
+                        )
+                else:
+                    _log(
+                        "WARN",
+                        "Spatial blocking could not resolve group geometry; "
+                        "falling back to outcome-stratified split.",
+                    )
+
             if outer_cv_mode:
                 from sklearn.model_selection import KFold
 
@@ -4572,6 +4802,26 @@ class MetricFusionEngine:
                 _log(
                     "INFO",
                     f"Outer fold {fold_i + 1}/{k_outer}: "
+                    f"train+val={len(train_val_poly)} {group_label}s, "
+                    f"test={len(test_poly)} {group_label}s.",
+                )
+            elif spatial_ok:
+                # Spatial single-split: assign whole blocks to the held-out
+                # test by even striping across the space-filling block order,
+                # so the test tiles the full extent and no group straddles
+                # train and test.
+                rng_sp = np.random.default_rng(random_state)
+                ordered_blocks = np.sort(poly_df["_block"].unique())
+                test_blocks = self._stripe_to_test_blocks(
+                    ordered_blocks, test_size, rng_sp
+                )
+                test_mask = poly_df["_block"].isin(test_blocks)
+                test_poly = poly_df[test_mask].copy()
+                train_val_poly = poly_df[~test_mask].copy()
+                _log(
+                    "INFO",
+                    f"Spatial block test split: {len(test_blocks)} of "
+                    f"{len(ordered_blocks)} blocks held out — "
                     f"train+val={len(train_val_poly)} {group_label}s, "
                     f"test={len(test_poly)} {group_label}s.",
                 )
@@ -4642,6 +4892,36 @@ class MetricFusionEngine:
             )
 
             self.cv_folds = []
+            if use_cv and spatial_ok and "_block" in train_val_poly.columns:
+                # Spatial inner folds: stripe blocks across folds so each
+                # validation fold is spread over the extent and a block's
+                # groups never split across train and val.
+                ordered_tv_blocks = np.sort(train_val_poly["_block"].unique())
+                k_eff = max(2, min(k_folds, len(ordered_tv_blocks)))
+                self.k_folds = k_eff
+                rank_of_block = {b: i for i, b in enumerate(ordered_tv_blocks)}
+                fold_of_block = {b: rank_of_block[b] % k_eff for b in ordered_tv_blocks}
+                for fold_idx in range(1, k_eff + 1):
+                    vl_blocks = {b for b, f in fold_of_block.items() if f == fold_idx - 1}
+                    vl_polys = set(
+                        train_val_poly[train_val_poly["_block"].isin(vl_blocks)][
+                            group_col
+                        ]
+                    )
+                    tr_polys = set(train_val_poly[group_col]) - vl_polys
+                    train_fold = self.train_val_data[
+                        self.train_val_data[group_col].isin(tr_polys)
+                    ].copy()
+                    val_fold = self.train_val_data[
+                        self.train_val_data[group_col].isin(vl_polys)
+                    ].copy()
+                    self.cv_folds.append({"train": train_fold, "val": val_fold})
+                    logger.info(
+                        f"  Spatial fold {fold_idx}: train={len(tr_polys)} "
+                        f"{group_label}s ({len(train_fold)} rows), "
+                        f"val={len(vl_polys)} {group_label}s ({len(val_fold)} rows)"
+                    )
+                return
             if use_cv:
                 # K-fold within train_val. Use stratified k-fold only if every bin
                 # has ≥k_folds groups; otherwise fall back to plain KFold.
@@ -4698,6 +4978,29 @@ class MetricFusionEngine:
             # Single stratified train/val split at the group level. Same
             # stratification logic as the test split above so val mirrors the
             # outcome distribution; scaler fits on the single train slice.
+            if spatial_ok and "_block" in train_val_poly.columns:
+                rng_v = np.random.default_rng(random_state + 1)
+                ordered_tv_blocks = np.sort(train_val_poly["_block"].unique())
+                val_blocks = self._stripe_to_test_blocks(
+                    ordered_tv_blocks, single_split_val_ratio, rng_v
+                )
+                vl_polys = set(
+                    train_val_poly[train_val_poly["_block"].isin(val_blocks)][group_col]
+                )
+                tr_polys = set(train_val_poly[group_col]) - vl_polys
+                train_fold = self.train_val_data[
+                    self.train_val_data[group_col].isin(tr_polys)
+                ].copy()
+                val_fold = self.train_val_data[
+                    self.train_val_data[group_col].isin(vl_polys)
+                ].copy()
+                self.cv_folds.append({"train": train_fold, "val": val_fold})
+                logger.info(
+                    f"Spatial single train/val split: train={len(tr_polys)} "
+                    f"{group_label}s ({len(train_fold)} rows), val={len(vl_polys)} "
+                    f"{group_label}s ({len(val_fold)} rows)"
+                )
+                return
             try:
                 train_poly, val_poly = train_test_split(
                     train_val_poly,
@@ -5274,6 +5577,19 @@ class MetricFusionEngine:
             val_terrain_norm = val_combined[:, 1]
             val_ndvi_norm = val_combined[:, 2]
 
+            # Optional per-channel [0, 1] scaling (raw otherwise). Applied to
+            # both the CGI and standalone paths so they share one footing.
+            train_veg_norm, train_terrain_norm, train_ndvi_norm = (
+                self._normalize_channel_arrays(
+                    train_veg_norm, train_terrain_norm, train_ndvi_norm
+                )
+            )
+            val_veg_norm, val_terrain_norm, val_ndvi_norm = (
+                self._normalize_channel_arrays(
+                    val_veg_norm, val_terrain_norm, val_ndvi_norm
+                )
+            )
+
             # Build the greenery value the objective scores against. In CGI
             # mode that's the selected formula's composite; in standalone mode
             # it's the active channel's normalised value used directly (the
@@ -5756,6 +6072,11 @@ class MetricFusionEngine:
         test_veg_norm = test_combined[:, 0]
         test_terrain_norm = test_combined[:, 1]
         test_ndvi_norm = test_combined[:, 2]
+        test_veg_norm, test_terrain_norm, test_ndvi_norm = (
+            self._normalize_channel_arrays(
+                test_veg_norm, test_terrain_norm, test_ndvi_norm
+            )
+        )
 
         # Calculate composite via the active mode. Same fork as ``_objective``
         # so the held-out score is on the same scale the study optimized.
@@ -6137,11 +6458,21 @@ class MetricFusionEngine:
                 )
             weights = self.best_params
 
-        # The active formula decides which channels contribute and how the
-        # composite is built — apply_fusion routes through the same compute_cgi
-        # call site as _objective / evaluate_on_test so all four agree.
-        formula = cgi_formulas.get_formula(self.cgi_formula)
-        channel_active = formula.channel_active(weights)
+        # The active mode decides which channels contribute and how the
+        # composite is built — apply_fusion routes through the same fork as
+        # _objective / evaluate_on_test so all four agree. CGI mode delegates
+        # to the formula; standalone mode isolates the active channel.
+        channel_mode = self._active_greenery_channel
+        if channel_mode == "cgi":
+            channel_active = cgi_formulas.get_formula(self.cgi_formula).channel_active(
+                weights
+            )
+        else:
+            channel_active = {
+                "veg": channel_mode == "veg",
+                "terrain": channel_mode == "terrain",
+                "ndvi": channel_mode == "ndvi",
+            }
 
         # Extract aggregation parameters
         streetview_stat = weights.get("streetview_stat", "mean")
@@ -6207,18 +6538,29 @@ class MetricFusionEngine:
         all_veg_norm = all_combined[:, 0]
         all_terrain_norm = all_combined[:, 1]
         all_ndvi_norm = all_combined[:, 2]
+        all_veg_norm, all_terrain_norm, all_ndvi_norm = (
+            self._normalize_channel_arrays(all_veg_norm, all_terrain_norm, all_ndvi_norm)
+        )
 
-        # Calculate composite via the active CGI formula (same call site as
-        # _objective / evaluate_on_test).
-        composite = compute_cgi(
-            self.cgi_formula,
-            weights,
-            {
+        # Calculate composite via the active mode (same fork as _objective /
+        # evaluate_on_test). CGI mode uses the formula; standalone mode takes
+        # the single active channel directly.
+        if channel_mode == "cgi":
+            composite = compute_cgi(
+                self.cgi_formula,
+                weights,
+                {
+                    "veg": all_veg_norm,
+                    "terrain": all_terrain_norm,
+                    "ndvi": all_ndvi_norm,
+                },
+            )
+        else:
+            composite = {
                 "veg": all_veg_norm,
                 "terrain": all_terrain_norm,
                 "ndvi": all_ndvi_norm,
-            },
-        )
+            }[channel_mode]
         # Composite-level [0, 1] normalization over the whole grid when the
         # toggle is on (raw otherwise); mirrors the output raster + standalones.
         composite = self._finalize_composite(composite)
@@ -6329,6 +6671,259 @@ class MetricFusionEngine:
         except Exception as exc:
             logger.warning(f"_score_data_subset failed: {exc}")
             return empty
+
+    def _whole_data_covariates(self, df: "pd.DataFrame") -> "np.ndarray | None":
+        """Per-row covariate matrix aligned to a collapsed ``apply_fusion`` frame.
+
+        Looks each row's covariates up by ``polygon_id`` from the union of
+        train+val and test data (covariates are a property of the entity, not
+        the split). Returns ``None`` when no covariates are configured or the
+        frame isn't polygon-keyed.
+        """
+        cov_cols = self.covariate_columns or []
+        if not cov_cols or "polygon_id" not in df.columns:
+            return None
+        parts = [d for d in (self.train_val_data, self.test_data) if d is not None]
+        if not parts:
+            return None
+        full = pd.concat(parts)
+        cov_per_poly = (
+            full.groupby("polygon_id", sort=False)[cov_cols]
+            .first()
+            .reindex(df["polygon_id"].values)
+        )
+        return cov_per_poly.to_numpy(dtype=np.float64)
+
+    def evaluate_effects(
+        self,
+        params: dict,
+        metric: str,
+        *,
+        n_bootstrap: int = 2000,
+        n_perm: int = 1000,
+        ci_level: float = 0.95,
+        seed: int = 42,
+    ) -> dict[str, dict]:
+        """Objective effect on the full dataset and per-subset, with CIs + a
+        held-out permutation p-value.
+
+        The ``all`` slice (whole dataset, the stability-selected params applied
+        to every entity) is the headline greenery effect; ``test`` is the
+        held-out generalizability check and carries the permutation p-value;
+        ``train_val`` is the tuning pool (CI only). Each entry is
+        ``{score, lower, upper, p_value, n}``. Defined for cross-sectional
+        objective metrics; returns ``{}`` for metrics it doesn't support
+        (e.g. longitudinal MixedLM metrics, scored elsewhere).
+        """
+        if metric not in objective_scoring.SUPPORTED_METRICS:
+            return {}
+        from . import statistical_testing as _stats_mod
+
+        higher = metric in objective_scoring.HIGHER_IS_BETTER
+
+        def _score_fn(t_arr, c_arr, cov=None):
+            return objective_scoring.score(metric, t_arr, c_arr, cov)
+
+        def _block(t_arr, c_arr, cov, *, do_perm, sub_seed):
+            out = {
+                "score": None,
+                "lower": None,
+                "upper": None,
+                "p_value": None,
+                "n": None,
+            }
+            if t_arr is None or c_arr is None or len(t_arr) < 3:
+                return out
+            try:
+                ci = _stats_mod.bootstrap_score_ci(
+                    t_arr,
+                    c_arr,
+                    score_fn=_score_fn,
+                    n_bootstrap=int(n_bootstrap),
+                    ci_level=ci_level,
+                    method="percentile",
+                    seed=int(sub_seed),
+                    covariates=cov,
+                )
+                out["score"] = ci.get("observed")
+                out["lower"] = ci.get("lower")
+                out["upper"] = ci.get("upper")
+            except Exception as exc:
+                logger.warning(f"evaluate_effects: CI failed: {exc}")
+            if do_perm:
+                try:
+                    perm = _stats_mod.permutation_pvalue(
+                        t_arr,
+                        c_arr,
+                        score_fn=_score_fn,
+                        higher_is_better=higher,
+                        n_perm=int(n_perm),
+                        seed=int(sub_seed) + 7,
+                        covariates=cov,
+                    )
+                    out["p_value"] = perm.get("p_value")
+                    if out["score"] is None:
+                        out["score"] = perm.get("observed")
+                except Exception as exc:
+                    logger.warning(f"evaluate_effects: permutation failed: {exc}")
+            out["n"] = int(len(t_arr))
+            return out
+
+        results: dict[str, dict] = {}
+        df_full = None
+        try:
+            df_full = self.apply_fusion(weights=dict(params))
+            t_all = np.asarray(df_full["target"].values, dtype=np.float64)
+            c_all = np.asarray(df_full["composite"].values, dtype=np.float64)
+            cov_all = self._whole_data_covariates(df_full)
+            results["all"] = _block(t_all, c_all, cov_all, do_perm=True, sub_seed=seed)
+        except Exception as exc:
+            logger.warning(f"evaluate_effects: whole-data scoring failed: {exc}")
+
+        try:
+            if self.test_data is not None and len(self.test_data) > 0:
+                tr = self.evaluate_on_test(
+                    params=dict(params), metric=metric, return_predictions=True
+                )
+                tg = tr.get("targets")
+                pr = tr.get("predictions")
+                cv = tr.get("covariates")
+                t_te = None if tg is None else np.asarray(tg, dtype=np.float64)
+                c_te = None if pr is None else np.asarray(pr, dtype=np.float64)
+                cov_te = None if cv is None else np.asarray(cv, dtype=np.float64)
+                results["test"] = _block(
+                    t_te, c_te, cov_te, do_perm=True, sub_seed=seed + 101
+                )
+        except Exception as exc:
+            logger.warning(f"evaluate_effects: test scoring failed: {exc}")
+
+        try:
+            if (
+                self.train_val_data is not None
+                and df_full is not None
+                and "polygon_id" in df_full.columns
+            ):
+                pids = set(self.train_val_data["polygon_id"].unique().tolist())
+                sub = df_full[df_full["polygon_id"].isin(pids)]
+                t_tv = np.asarray(sub["target"].values, dtype=np.float64)
+                c_tv = np.asarray(sub["composite"].values, dtype=np.float64)
+                cov_tv = self._whole_data_covariates(sub)
+                results["train_val"] = _block(
+                    t_tv, c_tv, cov_tv, do_perm=False, sub_seed=seed + 202
+                )
+        except Exception as exc:
+            logger.warning(f"evaluate_effects: train_val scoring failed: {exc}")
+
+        return results
+
+    def paired_objective_difference(
+        self,
+        cgi_params: dict,
+        standalone_params: dict,
+        standalone_channel: str,
+        metric: str,
+        *,
+        n_bootstrap: int = 2000,
+        ci_level: float = 0.95,
+        seed: int = 42,
+    ) -> dict | None:
+        """Whole-data objective difference between CGI and the best standalone.
+
+        Builds both composites on the full dataset (CGI via the formula, the
+        standalone via its single channel), then bootstraps entities once per
+        replicate and scores both on the same resample so the paired
+        difference is in the objective metric's own units. The difference is
+        signed so a **positive** value favours CGI regardless of metric
+        direction. Returns ``{observed_diff, lower, upper, p_value, cgi_score,
+        standalone_score, standalone_channel, n, favors_cgi}`` or ``None`` when
+        the metric isn't an objective-scoring metric or the composites can't be
+        built. ``p_value`` is the one-sided bootstrap tail (share of replicates
+        with difference ≤ 0).
+        """
+        if metric not in objective_scoring.SUPPORTED_METRICS:
+            return None
+        prev_ch = self._active_greenery_channel
+        try:
+            self._active_greenery_channel = "cgi"
+            df_cgi = self.apply_fusion(weights=dict(cgi_params))
+            self._active_greenery_channel = standalone_channel
+            df_std = self.apply_fusion(weights=dict(standalone_params))
+        except Exception as exc:
+            logger.warning(
+                f"paired_objective_difference: composite build failed: {exc}"
+            )
+            return None
+        finally:
+            self._active_greenery_channel = prev_ch
+
+        try:
+            if "polygon_id" in df_cgi.columns and "polygon_id" in df_std.columns:
+                merged = df_cgi[["polygon_id", "target", "composite"]].merge(
+                    df_std[["polygon_id", "composite"]],
+                    on="polygon_id",
+                    suffixes=("_cgi", "_std"),
+                )
+                cov = self._whole_data_covariates(merged)
+            else:
+                merged = pd.DataFrame(
+                    {
+                        "target": np.asarray(df_cgi["target"].values),
+                        "composite_cgi": np.asarray(df_cgi["composite"].values),
+                        "composite_std": np.asarray(df_std["composite"].values),
+                    }
+                )
+                cov = None
+            target = merged["target"].to_numpy(dtype=np.float64)
+            cgi_c = merged["composite_cgi"].to_numpy(dtype=np.float64)
+            std_c = merged["composite_std"].to_numpy(dtype=np.float64)
+        except Exception as exc:
+            logger.warning(f"paired_objective_difference: alignment failed: {exc}")
+            return None
+
+        if len(target) < 3:
+            return None
+
+        higher = metric in objective_scoring.HIGHER_IS_BETTER
+        sign = 1.0 if higher else -1.0
+
+        def _score(t_arr, c_arr, cov_arr):
+            return float(objective_scoring.score(metric, t_arr, c_arr, cov_arr))
+
+        obs_cgi = _score(target, cgi_c, cov)
+        obs_std = _score(target, std_c, cov)
+        obs_diff = sign * (obs_cgi - obs_std)
+
+        rng = np.random.default_rng(int(seed))
+        n = len(target)
+        diffs = np.empty(int(n_bootstrap), dtype=np.float64)
+        for i in range(int(n_bootstrap)):
+            idx = rng.integers(0, n, size=n)
+            cov_i = None if cov is None else cov[idx]
+            try:
+                sc = _score(target[idx], cgi_c[idx], cov_i)
+                ss = _score(target[idx], std_c[idx], cov_i)
+                diffs[i] = sign * (sc - ss)
+            except Exception:
+                diffs[i] = np.nan
+
+        valid = diffs[np.isfinite(diffs)]
+        if len(valid) == 0:
+            return None
+        alpha = (1.0 - ci_level) / 2.0
+        lower = float(np.quantile(valid, alpha))
+        upper = float(np.quantile(valid, 1.0 - alpha))
+        p_value = float((np.sum(valid <= 0.0) + 1) / (len(valid) + 1))
+        return {
+            "observed_diff": float(obs_diff),
+            "lower": lower,
+            "upper": upper,
+            "p_value": p_value,
+            "cgi_score": float(obs_cgi),
+            "standalone_score": float(obs_std),
+            "standalone_channel": standalone_channel,
+            "n": int(n),
+            "favors_cgi": bool(obs_diff > 0),
+        }
 
     def compute_subset_scores(
         self,
@@ -6803,38 +7398,41 @@ class MetricFusionEngine:
         min_cell_count: int = 3,
         worst_quantile: float = 0.10,
         radius_bin_m: int | None = None,
+        spatial_resample: bool = False,
         seed: int = 42,
         cancel_callback: Callable[..., bool] | None = None,
         progress_callback: Callable[[int, int], None] | None = None,
     ) -> dict[str, Any]:
-        """Stability selection via bootstrap out-of-bag scoring.
+        """Stability selection via complementary-pairs out-of-bag scoring.
 
         Adapts Meinshausen & Bühlmann's stability selection (2010) to
-        hyperparameter search. The procedure draws ``n_bootstraps`` resamples
-        of the (train+val) data, runs a short ``RandomSampler`` study on each,
-        and rates each parameter region by how well it does **on the held-out
-        OOB rows** of every resample. The headline robustness metric is the
+        hyperparameter search, using the complementary-pairs subsampling of
+        Shah & Samworth (2013) so the reported PFER bound is rigorous. The
+        procedure draws ``n_bootstraps`` ⌊n/2⌋ subsamples (in complementary
+        pairs), runs a short objective-blind QMC (Sobol) study on each, and
+        rates each parameter region by how well it does **on the held-out OOB
+        rows** of every subsample. The headline robustness metric is the
         worst-quantile OOB score across all trials that landed in each region
         — i.e. "how badly can this parameter region perform on a resample of
         my data?". This is a direct statement about predictive power across
         samples, not a selection-bias-prone p-value.
 
-        Per bootstrap:
+        Per subsample:
 
-        1. Resample entities (polygons when ``polygon_id`` is present, rows
-           otherwise) with replacement from ``train_val_data``. The unique
-           entities **not** chosen form the OOB set (~37 % of entities).
-        2. Build a fresh in-memory Optuna study with ``RandomSampler`` (TPE
-           is intentionally avoided: each bootstrap is short, and stability
-           wants uniform parameter-space coverage, not depth on this
-           particular resample). The engine's ``_objective`` already handles
+        1. Split entities (polygons when ``polygon_id`` is present, rows
+           otherwise) into two complementary halves; the in-bag is one half
+           and the OOB is the other (~50 % of entities, genuinely held out).
+        2. Build a fresh in-memory Optuna study with a low-discrepancy QMC
+           (Sobol) sampler (objective-aware samplers are intentionally avoided:
+           stability wants even parameter-space coverage, not depth on this
+           particular subsample). The engine's ``_objective`` already handles
            in-bag/OOB scaler fitting, channel aggregation, polygon collapse,
            covariate-aware partial-correlation scoring (cross-sectional), and
-           MixedLM scoring (longitudinal) — so we splice the bootstrap split
+           MixedLM scoring (longitudinal) — so we splice the subsample split
            into ``self.cv_folds`` and reuse the existing pipeline.
         3. Record per-trial ``(snapped_params, oob_score)``.
 
-        Across all bootstraps:
+        Across all subsamples:
 
         * Snap each trial's weights to ``weight_bin_pct``-wide buckets via
           :func:`cgi_formulas.weight_cell_key`.
@@ -6850,9 +7448,10 @@ class MetricFusionEngine:
 
         Args:
             metric: Scoring metric (any value supported by ``_objective``).
-            n_bootstraps: Number of resampling iterations. 20–50 typical.
-            n_trials_per_bootstrap: RandomSampler trials inside each
-                bootstrap. 30–100 typical.
+            n_bootstraps: Target number of ⌊n/2⌋ subsamples (rounded to an even
+                count of complementary pairs). 20–50 typical.
+            n_trials_per_bootstrap: QMC trials inside each subsample.
+                30–100 typical.
             weight_bin_pct: Cell width for weight binning. 10 % bins yield
                 ~78 valid simplex cells for the weighted-average formula.
             top_percent_per_bootstrap: Fraction of each bootstrap's trials
@@ -6867,7 +7466,8 @@ class MetricFusionEngine:
             seed: RNG seed for reproducibility.
             cancel_callback: Bumped from the runner so a user-cancelled job
                 aborts the bootstrap loop cleanly.
-            progress_callback: ``(done, total)`` called after each bootstrap.
+            progress_callback: ``(trials_done, trials_total)`` called after each
+                trial, where the counts span every subsample of this study.
 
         Selection is two-stage: stage 1 picks the weight cell (channel mix)
         as above; stage 2 re-bins that cell's trials by a coarse radius key
@@ -6920,6 +7520,46 @@ class MetricFusionEngine:
             group_col = None
             groups = pd.Series(np.arange(len(train_val)))
 
+        # Spatial block resampling: resample whole grid blocks instead of
+        # individual groups so the out-of-bag set is genuinely out-of-region
+        # and the worst-quantile OOB score stops rewarding spatial leakage.
+        # Each block carries all of its groups; degenerate or too-coarse block
+        # layouts fall back to plain group resampling.
+        spatial_resample_ok = (
+            bool(spatial_resample)
+            and use_groups
+            and self._spatial_block_by_group is not None
+            and self._spatial_block_group_col == group_col
+        )
+        blocks = np.empty(0, dtype=np.int64)
+        groups_in_block: dict = {}
+        if spatial_resample_ok:
+            block_of = self._spatial_block_by_group
+            g_arr = groups.to_numpy()
+            block_labels = np.empty(len(g_arr), dtype=np.int64)
+            singleton = -1
+            for i, g in enumerate(g_arr):
+                bk = block_of.get(g)
+                if bk is None:
+                    block_labels[i] = singleton
+                    singleton -= 1
+                else:
+                    block_labels[i] = int(bk)
+            for g, bk in zip(g_arr, block_labels):
+                groups_in_block.setdefault(int(bk), []).append(g)
+            groups_in_block = {
+                bk: np.asarray(gs, dtype=g_arr.dtype)
+                for bk, gs in groups_in_block.items()
+            }
+            blocks = np.asarray(sorted(groups_in_block.keys()), dtype=np.int64)
+            if len(blocks) < 4:
+                spatial_resample_ok = False
+                logger.warning(
+                    "Spatial block resampling requested but only "
+                    f"{len(blocks)} block(s) cover the train+val pool; "
+                    "falling back to group resampling."
+                )
+
         # Save engine state we're about to splice over. Restored in ``finally``
         # so a cancelled / failing bootstrap loop never leaves the engine in a
         # half-mutated state for downstream callers.
@@ -6940,6 +7580,13 @@ class MetricFusionEngine:
         # over the loop. Start clean and clear between bootstraps so memory
         # stays flat regardless of B / N_per_BS choice.
         self._clear_ring_caches()
+
+        # Group → rows once, so each bootstrap's in-bag materialisation is a
+        # dict lookup + concat instead of an O(G·N) boolean scan per group.
+        group_rows: dict = {}
+        if use_groups:
+            for g, sub in train_val.groupby(group_col, sort=False):
+                group_rows[g] = sub
 
         records: list[dict] = []  # one entry per completed trial across all bootstraps
         per_bootstrap_top_cells: list[set] = []  # selection-probability sidecar
@@ -6962,73 +7609,134 @@ class MetricFusionEngine:
 
         try:
             rng = np.random.default_rng(int(seed))
-            for b in range(int(n_bootstraps)):
+            # Complementary-pairs subsampling (Shah & Samworth 2013): each pair
+            # partitions the sampling units into halves A | B; each half is an
+            # in-bag scored on its complement, giving two ~50%-OOB subsamples.
+            # This is the ⌊n/2⌋ scheme the Meinshausen–Bühlmann PFER bound
+            # assumes, so the reported bound is rigorous rather than the
+            # approximation bootstrap resampling gives. Whole blocks are split
+            # when spatial resampling is on so each OOB half is out-of-region.
+            n_pairs = max(1, int(round(int(n_bootstraps) / 2)))
+            subsamples: list[tuple[np.ndarray, np.ndarray]] = []
+            for _pair in range(n_pairs):
+                if spatial_resample_ok:
+                    perm_blocks = rng.permutation(blocks)
+                    cut_b = len(perm_blocks) // 2
+
+                    def _units(bk_arr: np.ndarray) -> np.ndarray:
+                        if len(bk_arr) == 0:
+                            return np.empty(0, dtype=groups.to_numpy().dtype)
+                        return np.unique(
+                            np.concatenate([groups_in_block[int(bk)] for bk in bk_arr])
+                        )
+
+                    half_a = _units(perm_blocks[:cut_b])
+                    half_b = _units(perm_blocks[cut_b:])
+                else:
+                    perm_units = rng.permutation(groups.to_numpy())
+                    cut_u = len(perm_units) // 2
+                    half_a = np.unique(perm_units[:cut_u])
+                    half_b = np.unique(perm_units[cut_u:])
+                subsamples.append((half_a, half_b))
+                subsamples.append((half_b, half_a))
+
+            total_resamples = len(subsamples)
+            total_trials = total_resamples * int(n_trials_per_bootstrap)
+            for b, (in_bag_unique, oob_unique) in enumerate(subsamples):
                 if cancel_callback is not None and cancel_callback():
                     break
-                # Per-bootstrap clear: each resample's data has its own
-                # ``points_gdf.index`` tuples, so cached annuli from prior
-                # bootstraps will never be hit again — keep the cache flat.
+                # Each subsample has its own index tuples, so cached annuli never
+                # carry over — clear to keep memory flat.
                 self._clear_ring_caches()
-
-                # Bootstrap sample of groups (with replacement). The unique
-                # set of selected groups is in-bag; the complement is OOB.
-                sel = rng.integers(0, len(groups), size=len(groups))
-                in_bag_groups = groups.iloc[sel].to_numpy()
-                in_bag_unique = np.unique(in_bag_groups)
-                oob_unique = np.setdiff1d(groups.to_numpy(), in_bag_unique)
                 diag["bootstraps_attempted"] += 1
                 if len(oob_unique) < 3 or len(in_bag_unique) < 3:
-                    # Degenerate resample — almost all groups landed in-bag
-                    # or out. Skip and let the loop continue.
+                    # Degenerate half — too few units in-bag or OOB. Skip, but
+                    # advance the trial bar past this subsample's allotment so
+                    # the UI doesn't stall.
                     diag["bootstraps_degenerate_split"] += 1
+                    if progress_callback is not None:
+                        try:
+                            progress_callback(
+                                (b + 1) * int(n_trials_per_bootstrap), total_trials
+                            )
+                        except Exception:
+                            pass
                     continue
 
                 if use_groups:
-                    # Materialise in-bag with multiplicity by concatenating
-                    # per-group slices in the order they were drawn.
-                    # **Preserve the original DataFrame index** — the
-                    # pre-aggregation cache is keyed by entity_id ==
-                    # ``train_val_data.index`` (see
-                    # ``precompute_aggregations``), so ``ignore_index=True``
-                    # would replace every entity_id with 0..N-1 and the
-                    # cache lookup would return NaN for every row. Duplicate
-                    # indices from the bootstrap are harmless: the
-                    # polygon-collapse downstream groups by ``polygon_id``
-                    # (column, not index) and the scaler fit tolerates
-                    # repeated rows.
-                    grouped = {
-                        g: train_val[train_val[group_col] == g] for g in in_bag_unique
-                    }
-                    in_bag_df = pd.concat([grouped[g] for g in in_bag_groups])
+                    # One row-slice per in-bag group (no multiplicity under
+                    # subsampling), preserving the original DataFrame index the
+                    # pre-aggregation cache is keyed by.
+                    in_bag_df = pd.concat([group_rows[g] for g in in_bag_unique])
                     oob_df = train_val[train_val[group_col].isin(oob_unique)].copy()
                 else:
-                    in_bag_df = train_val.iloc[in_bag_groups].copy()
+                    in_bag_df = train_val.iloc[in_bag_unique].copy()
                     oob_df = train_val.iloc[oob_unique].copy()
 
-                # Splice the bootstrap split into ``cv_folds`` — the existing
+                # Splice this subsample into ``cv_folds`` — the existing
                 # ``_objective`` reads ``train`` / ``val`` from each fold and
-                # handles aggregation, scaler fit on train, scoring on val.
+                # handles aggregation, channel collapse, and OOB scoring.
                 self.cv_folds = [{"train": in_bag_df, "val": oob_df}]
 
-                # Fresh in-memory study with RandomSampler — uniform coverage
-                # across the search space; TPE wouldn't add value at 30-100
-                # trials per bootstrap and would just concentrate on the
-                # local maximum of this particular resample (fighting the
-                # stability-selection goal).
-                study = optuna.create_study(
-                    direction="maximize" if higher_is_better else "minimize",
-                    sampler=optuna.samplers.RandomSampler(seed=int(seed) + b),
-                )
+                # Fresh in-memory study with a low-discrepancy QMC (Sobol)
+                # sampler: objective-blind like RandomSampler (so the per-cell
+                # selection frequencies the calibration relies on stay
+                # unbiased), but it fills the high-dimensional CGI search space
+                # far more evenly at the same trial budget. An objective-aware
+                # sampler (TPE / CMA-ES) would concentrate on this resample's
+                # local optimum and inflate the stability counts.
+                import warnings as _warnings
+
+                from optuna.exceptions import ExperimentalWarning as _ExpWarning
+
+                with _warnings.catch_warnings():
+                    _warnings.simplefilter("ignore", _ExpWarning)
+                    study = optuna.create_study(
+                        direction="maximize" if higher_is_better else "minimize",
+                        sampler=optuna.samplers.QMCSampler(
+                            qmc_type="sobol",
+                            scramble=True,
+                            seed=int(seed) + b,
+                            warn_independent_sampling=False,
+                        ),
+                    )
                 self.study = study
+                # Seed each bootstrap with the single-channel vertices + the
+                # centroid so the CGI search always evaluates the configurations
+                # the standalone studies explore (CGI nests every standalone).
+                if self._active_greenery_channel == "cgi":
+                    for seed_params in cgi_formulas.seed_param_sets(
+                        self.cgi_formula, self._disabled_channels
+                    ):
+                        try:
+                            study.enqueue_trial(seed_params, skip_if_exists=True)
+                        except Exception:
+                            pass
+                # Per-trial progress: report the global trial index across all
+                # subsamples so the UI can show a live "k / N trials" bar for
+                # this study.
+                n_trials_b = int(n_trials_per_bootstrap)
+
+                def _trial_progress(_study, _trial, _b=b):
+                    if progress_callback is None:
+                        return
+                    try:
+                        progress_callback(
+                            _b * n_trials_b + _trial.number + 1, total_trials
+                        )
+                    except Exception:
+                        pass
+
                 try:
                     study.optimize(
                         lambda t: self._objective(t, metric),
-                        n_trials=int(n_trials_per_bootstrap),
+                        n_trials=n_trials_b,
                         show_progress_bar=False,
                         catch=(Exception,),
+                        callbacks=[_trial_progress],
                     )
                 except Exception:
-                    # Catastrophic study failure — skip this bootstrap and
+                    # Catastrophic study failure — skip this subsample and
                     # continue rather than aborting the whole selection.
                     continue
 
@@ -7110,12 +7818,6 @@ class MetricFusionEngine:
                 else:
                     diag["bootstraps_all_nan_scores"] += 1
 
-                if progress_callback is not None:
-                    try:
-                        progress_callback(b + 1, int(n_bootstraps))
-                    except Exception:
-                        pass
-
         finally:
             self.cv_folds = prev_cv_folds
             self.study = prev_study
@@ -7143,6 +7845,8 @@ class MetricFusionEngine:
             )
 
         # ── Per-cell aggregation ─────────────────────────────────────────
+        from . import statistical_testing as _stats_mod
+
         cells: dict[tuple, list[dict]] = {}
         for r in records:
             cells.setdefault(r["cell"], []).append(r)
@@ -7152,57 +7856,85 @@ class MetricFusionEngine:
                 return float(np.quantile(scores, worst_quantile))
             return float(np.quantile(scores, 1.0 - worst_quantile))
 
-        n_bs_used = max(1, len(per_bootstrap_top_cells))
+        # ── Automated threshold calibration (stage 1: channel mix) ────────
+        # Rank cells within each bootstrap by their best out-of-bag score, then
+        # calibrate the selection size K and threshold π by maximizing the
+        # stability score (Bodinier et al.) — no hand-set threshold. The
+        # channel-mix winner is the most consistently top-ranked cell in the
+        # calibrated stable set (a reproducibility statement), with q_worst
+        # kept as a secondary performance diagnostic.
+        by_bootstrap: dict[int, dict[tuple, list[float]]] = {}
+        for r in records:
+            by_bootstrap.setdefault(r["bootstrap"], {}).setdefault(
+                r["cell"], []
+            ).append(r["oob_score"])
+        rankings: list[list[tuple]] = []
+        for _bs, cellmap in by_bootstrap.items():
+            rep = {
+                cell: (max(s) if higher_is_better else min(s))
+                for cell, s in cellmap.items()
+            }
+            rankings.append(
+                sorted(rep, key=lambda c: rep[c], reverse=higher_is_better)
+            )
+        n_candidate_cells = len(cells)
+        calib = _stats_mod.calibrate_stability_selection(rankings, n_candidate_cells)
+        n_bs_used = max(1, len(rankings))
+
+        if calib is not None:
+            calib_counts = calib["selection_counts"]
+            calib_b = calib["n_resamples"]
+            sel_prob_of = {c: calib_counts.get(c, 0) / calib_b for c in cells}
+        else:
+            calib_counts = {}
+            sel_prob_of = {
+                c: sum(1 for s in per_bootstrap_top_cells if c in s) / n_bs_used
+                for c in cells
+            }
 
         cell_stats: list[dict] = []
         for cell_key, rs in cells.items():
-            if len(rs) < int(min_cell_count):
-                continue
             scores = [r["oob_score"] for r in rs]
-            sel_prob = (
-                sum(1 for s in per_bootstrap_top_cells if cell_key in s) / n_bs_used
-            )
             cell_stats.append(
                 {
                     "cell": cell_key,
                     "count": len(rs),
                     "q_worst": _q_worst(scores),
                     "median": float(np.median(scores)),
-                    "selection_probability": float(sel_prob),
+                    "selection_probability": float(sel_prob_of.get(cell_key, 0.0)),
                     "records": rs,
                 }
             )
 
-        if not cell_stats:
-            # No cell met min_cell_count — fall back to "best single cell by
-            # q_worst regardless of count" so the run still produces params,
-            # but log loudly so the caller knows the result is fragile.
-            logger.warning(
-                f"No weight cell reached min_cell_count={min_cell_count}. "
-                "Falling back to the single-best cell ignoring the count "
-                "threshold; consider raising n_bootstraps or "
-                "n_trials_per_bootstrap."
+        if calib is not None:
+            hi_count = int(np.ceil(calib["pi"] * calib_b))
+            stable_cells = {c for c, h in calib_counts.items() if h >= hi_count}
+            candidates = [c for c in cell_stats if c["cell"] in stable_cells]
+            if not candidates:
+                candidates = cell_stats
+            # Most consistently selected cell; ties broken by median OOB score.
+            best = max(
+                candidates,
+                key=lambda c: (
+                    c["selection_probability"],
+                    c["median"] if higher_is_better else -c["median"],
+                ),
             )
-            cell_stats = [
-                {
-                    "cell": cell_key,
-                    "count": len(rs),
-                    "q_worst": _q_worst([r["oob_score"] for r in rs]),
-                    "median": float(np.median([r["oob_score"] for r in rs])),
-                    "selection_probability": (
-                        sum(1 for s in per_bootstrap_top_cells if cell_key in s)
-                        / n_bs_used
-                    ),
-                    "records": rs,
-                }
-                for cell_key, rs in cells.items()
-            ]
-
-        # Pick the weight cell with the best q_worst (stage 1: channel mix).
-        best = max(
-            cell_stats,
-            key=lambda c: c["q_worst"] if higher_is_better else -c["q_worst"],
-        )
+            _log(
+                "INFO",
+                f"Stability calibration: K={calib['K']}, π={calib['pi']:.2f}, "
+                f"score={calib['score']:.1f}, {calib['n_stably_selected']} of "
+                f"{n_candidate_cells} cells stable, PFER≤{calib['pfer']:.2f}; "
+                f"winner selection prob={best['selection_probability']:.2f}.",
+            )
+        else:
+            # Too few candidate cells / resamples to calibrate (e.g. a
+            # standalone's single weight cell) — fall back to the best
+            # worst-quantile cell.
+            best = max(
+                cell_stats,
+                key=lambda c: c["q_worst"] if higher_is_better else -c["q_worst"],
+            )
 
         # ── Stage 2: spatial tuning within the winning weight cell ────────
         # The weight cell fixes the channel mix; now stability-select the
@@ -7409,6 +8141,18 @@ class MetricFusionEngine:
         final_params["__n_trials_per_bootstrap__"] = int(n_trials_per_bootstrap)
         final_params["__n_total_trials__"] = int(len(records))
         final_params["__worst_quantile__"] = float(worst_quantile)
+        # Automated threshold calibration (Bodinier) diagnostics: the
+        # calibrated selection size K, threshold π, stability score, stable-set
+        # size, candidate count, and the PFER upper bound (rigorous under the
+        # ⌊n/2⌋ complementary-pairs subsampling). Absent when calibration was
+        # skipped.
+        if calib is not None:
+            final_params["__stability_score__"] = float(calib["score"])
+            final_params["__selection_threshold__"] = float(calib["pi"])
+            final_params["__selection_size_k__"] = int(calib["K"])
+            final_params["__n_candidate_cells__"] = int(calib["n_candidates"])
+            final_params["__n_stably_selected__"] = int(calib["n_stably_selected"])
+            final_params["__pfer__"] = float(calib["pfer"])
         # Stage-2 (radius sub-cell) diagnostics: the spatial-tuning winner
         # within the chosen weight cell. ``__cell_*__`` above describe the
         # channel-mix decision; these describe the radii the final params
@@ -7446,9 +8190,15 @@ class MetricFusionEngine:
         # keys so the "Final params" panel still strips them out, but the
         # raw bundle in the runner preserves them.
         weight_keys = formula.weight_keys
+        # Rank the diagnostics table by the decision criterion — calibrated
+        # selection probability (median OOB breaks ties) — so the top row is
+        # the chosen winner; q_worst is shown alongside as a diagnostic.
         ranked = sorted(
             cell_stats,
-            key=lambda c: c["q_worst"] if higher_is_better else -c["q_worst"],
+            key=lambda c: (
+                c["selection_probability"],
+                c["median"] if higher_is_better else -c["median"],
+            ),
             reverse=True,
         )
         final_params["__cell_stats__"] = [
@@ -7836,6 +8586,9 @@ class MetricFusionEngine:
         # treatment the scorer applied, mirrored for standalone single-channel
         # maps.
         logger.info(f"Calculating composite via formula '{formula.name}'...")
+        veg_values, terrain_values, ndvi_values = self._normalize_channel_arrays(
+            veg_values, terrain_values, ndvi_values
+        )
         composite = compute_cgi(
             self.cgi_formula,
             final_params,

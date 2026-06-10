@@ -354,3 +354,189 @@ def bootstrap_score_ci(
         "ci_level": float(ci_level),
         "method": "BCa" if method_norm == "bca" else "percentile",
     }
+
+
+# ---------------------------------------------------------------------------
+# Permutation significance
+# ---------------------------------------------------------------------------
+
+
+def permutation_pvalue(
+    target: np.ndarray,
+    prediction: np.ndarray,
+    *,
+    score_fn,
+    higher_is_better: bool = True,
+    n_perm: int = 2000,
+    seed: int = 42,
+    covariates: np.ndarray | None = None,
+) -> dict:
+    """One-sided permutation p-value for ``score_fn(target, prediction)``.
+
+    Shuffles ``prediction`` against the fixed ``target`` (and covariates, which
+    stay row-aligned with ``target``) ``n_perm`` times to build the null
+    distribution of the score under no association, then reports the add-one
+    smoothed fraction of null scores at least as extreme as the observed one.
+    ``higher_is_better`` sets the tail: the upper tail for correlation-style
+    metrics, the lower tail for error-style metrics. When ``covariates`` is
+    given, ``score_fn`` is called in its 3-argument form and the p-value
+    reflects the covariate-adjusted score the scorer computes.
+
+    Returns a dict with ``observed``, ``p_value``, ``n_perm`` (effective),
+    ``null_mean``, and ``higher_is_better``.
+    """
+    t = np.asarray(target, dtype=np.float64).ravel()
+    p = np.asarray(prediction, dtype=np.float64).ravel()
+
+    cov_arr: np.ndarray | None = None
+    if covariates is not None:
+        cov_arr = np.asarray(covariates, dtype=np.float64)
+        if cov_arr.ndim == 1:
+            cov_arr = cov_arr.reshape(-1, 1)
+
+    mask = ~(np.isnan(t) | np.isnan(p))
+    if cov_arr is not None:
+        mask &= np.isfinite(cov_arr).all(axis=1)
+    t = t[mask]
+    p = p[mask]
+    if cov_arr is not None:
+        cov_arr = cov_arr[mask]
+
+    nan_result = {
+        "observed": float("nan"),
+        "p_value": float("nan"),
+        "n_perm": 0,
+        "null_mean": float("nan"),
+        "higher_is_better": bool(higher_is_better),
+    }
+    if len(t) < 3:
+        return nan_result
+
+    def _score(pred_arr: np.ndarray) -> float:
+        if cov_arr is None:
+            return float(score_fn(t, pred_arr))
+        return float(score_fn(t, pred_arr, cov_arr))
+
+    observed = _score(p)
+    if not np.isfinite(observed):
+        return nan_result
+
+    rng = np.random.default_rng(seed)
+    n = len(t)
+    null = np.empty(int(n_perm), dtype=np.float64)
+    for i in range(int(n_perm)):
+        idx = rng.permutation(n)
+        try:
+            null[i] = _score(p[idx])
+        except Exception:
+            null[i] = np.nan
+
+    valid = null[np.isfinite(null)]
+    if len(valid) == 0:
+        return {**nan_result, "observed": observed}
+
+    if higher_is_better:
+        count = int(np.sum(valid >= observed))
+    else:
+        count = int(np.sum(valid <= observed))
+    p_value = (count + 1) / (len(valid) + 1)
+    return {
+        "observed": float(observed),
+        "p_value": float(p_value),
+        "n_perm": int(len(valid)),
+        "null_mean": float(np.mean(valid)),
+        "higher_is_better": bool(higher_is_better),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Stability-selection threshold calibration (Bodinier et al., 2023)
+# ---------------------------------------------------------------------------
+
+
+def calibrate_stability_selection(
+    per_resample_rankings: list,
+    n_candidates: int,
+    *,
+    pi_min: float = 0.5,
+) -> dict | None:
+    """Automated calibration of the stability-selection threshold.
+
+    Adapts the calibration of Bodinier et al. (2023) — chosen instead of a
+    hand-set selection threshold. Each entry of ``per_resample_rankings`` is a
+    sequence of candidate ids ordered best→worst for one resample. For a grid
+    of selection sizes ``K`` (the top-K candidates counted as "selected" per
+    resample — the sparsity analogue of the regularisation λ) and thresholds
+    ``π``, the stability score ``S = −log L`` is computed, where ``L`` is the
+    likelihood of the observed stably-selected / unstable / stably-excluded
+    split under the null that every candidate is selected with the same
+    probability ``γ = K / N`` each resample (``N = n_candidates``). Each
+    candidate's selection count over ``B`` resamples is ``Binomial(B, γ)`` under
+    the null; a candidate is **stably selected** when its count ``≥ ⌈Bπ⌉``,
+    **stably excluded** when ``≤ ⌊B(1−π)⌋``, and unstable in between. The
+    ``(K, π)`` maximising ``S`` is the calibrated configuration.
+
+    Returns a dict with ``K``, ``pi``, ``score``, ``gamma``, ``n_candidates``,
+    ``n_resamples``, ``n_stably_selected``, ``selection_counts`` (id → count at
+    ``K``), and ``pfer`` — the Meinshausen–Bühlmann per-family error-rate upper
+    bound ``E[V] ≤ K² / ((2π−1)·N)`` (rigorous under ⌊n/2⌋ subsampling; an
+    approximate guide under bootstrap resampling). Returns ``None`` when there
+    are too few candidates or resamples to calibrate.
+    """
+    import math
+
+    from scipy.stats import binom
+
+    rankings = [list(r) for r in per_resample_rankings if len(r) > 0]
+    B = len(rankings)
+    N = int(n_candidates)
+    if B < 3 or N < 2:
+        return None
+
+    k_max = min(max(len(r) for r in rankings), N)
+    best: dict | None = None
+    for K in range(1, k_max + 1):
+        counts: dict = {}
+        for r in rankings:
+            for cid in r[:K]:
+                counts[cid] = counts.get(cid, 0) + 1
+        # Selection counts over all N candidates (those never in any top-K
+        # contribute a 0, i.e. stably excluded under the null).
+        h_vals = np.array(list(counts.values()), dtype=np.int64)
+        gamma = min(1.0, K / N)
+        realized = sorted({h / B for h in h_vals if h / B > pi_min})
+        for pi in realized:
+            hi = math.ceil(pi * B)
+            lo = math.floor((1.0 - pi) * B)
+            n_ss = int(np.sum(h_vals >= hi))
+            if n_ss == 0:
+                continue
+            n_se = int(N - np.sum(h_vals > lo))  # everything not above lo
+            n_se = max(0, n_se)
+            n_us = max(0, N - n_ss - n_se)
+            p_high = max(float(binom.sf(hi - 1, B, gamma)), 1e-300)
+            p_low = max(float(binom.cdf(lo, B, gamma)), 1e-300)
+            p_mid = max(1.0 - p_high - p_low, 1e-300)
+            score = -(
+                n_ss * math.log(p_high)
+                + n_se * math.log(p_low)
+                + n_us * math.log(p_mid)
+            )
+            if best is None or score > best["score"]:
+                pfer = (
+                    (K * K) / ((2.0 * pi - 1.0) * N)
+                    if pi > 0.5
+                    else float("inf")
+                )
+                best = {
+                    "K": int(K),
+                    "pi": float(pi),
+                    "score": float(score),
+                    "gamma": float(gamma),
+                    "n_candidates": int(N),
+                    "n_resamples": int(B),
+                    "n_stably_selected": int(n_ss),
+                    "selection_counts": dict(counts),
+                    "pfer": float(pfer),
+                }
+    return best

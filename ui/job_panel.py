@@ -14,6 +14,7 @@ rather than inside a single engine's tab module.
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import UTC, datetime
 
@@ -49,17 +50,43 @@ _RESTART_ELIGIBLE_STATUSES = {"interrupted", "cancelled", "error"}
 def _load_fusion_results_into_session(rec) -> bool:
     """Hydrate ``st.session_state`` from a completed fusion job's bundle.
 
-    Returns ``True`` when the load succeeds and the caller should rerun,
-    ``False`` when the record has no usable results payload.
+    Prefers the live in-memory payload (``rec.extra``); when that's gone — e.g.
+    after a Streamlit restart, since ``extra`` isn't persisted — it falls back
+    to the on-disk ``results_bundle.json`` recorded in ``rec.output_paths``,
+    rehydrating the results view without the engine objects (the composite map
+    viewer reads its GeoTIFFs from disk and skips the target overlay when no
+    engine is present). Returns ``True`` when a load succeeds.
     """
     if rec.type != "fusion" or rec.status != "completed":
         return False
     results = rec.extra.get("results") if rec.extra else None
-    if results is None:
+    if results is not None:
+        st.session_state.fusion_engine = rec.extra.get("engine")
+        st.session_state.fusion_engines_by_target = (
+            rec.extra.get("engines_by_target") or {}
+        )
+        st.session_state.fusion_results = results
+        return True
+
+    # Disk fallback: find the persisted results bundle among the job's outputs.
+    bundle_path = None
+    for p in rec.output_paths or []:
+        try:
+            if os.path.basename(str(p)) == "results_bundle.json" and os.path.isfile(p):
+                bundle_path = p
+                break
+        except Exception:
+            continue
+    if bundle_path is None:
         return False
-    st.session_state.fusion_engine = rec.extra.get("engine")
-    st.session_state.fusion_engines_by_target = rec.extra.get("engines_by_target") or {}
-    st.session_state.fusion_results = results
+    try:
+        with open(bundle_path, encoding="utf-8") as f:
+            disk_results = json.load(f)
+    except Exception:
+        return False
+    st.session_state.fusion_engine = None
+    st.session_state.fusion_engines_by_target = {}
+    st.session_state.fusion_results = disk_results
     return True
 
 
@@ -232,6 +259,17 @@ def _render_job_card(rec, store) -> None:
             st.progress(
                 gvi_progress["percent"] / 100,
                 text=(f"{gvi_progress['current']:,} / " f"{gvi_progress['total']:,}"),
+            )
+
+        fusion_progress = rec.extra.get("fusion_study_progress")
+        if rec.type == "fusion" and rec.status not in _TERMINAL and fusion_progress:
+            st.progress(
+                min(1.0, fusion_progress["percent"] / 100),
+                text=(
+                    f"{fusion_progress['study']} · "
+                    f"{fusion_progress['current']:,} / "
+                    f"{fusion_progress['total']:,} trials"
+                ),
             )
 
         _render_stage_ledger(rec)
