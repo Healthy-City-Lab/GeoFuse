@@ -47,6 +47,32 @@ _RESTART_ELIGIBLE_TYPES = {"gvi", "ndvi", "ndvi_column", "fusion"}
 _RESTART_ELIGIBLE_STATUSES = {"interrupted", "cancelled", "error"}
 
 
+def _fusion_results_bundle_path(rec) -> str | None:
+    """Path to the job's on-disk ``results_bundle.json`` if one exists."""
+    for p in rec.output_paths or []:
+        try:
+            if os.path.basename(str(p)) == "results_bundle.json" and os.path.isfile(p):
+                return str(p)
+        except Exception:
+            continue
+    return None
+
+
+def _fusion_results_loadable(rec) -> bool:
+    """True when a completed fusion job can hydrate the results view.
+
+    Either the live in-memory payload survives (same process) or the persisted
+    ``results_bundle.json`` is still on disk (after a Streamlit restart, where
+    ``rec.extra`` is gone). Gates the "Load results" button so it stays visible
+    once the process recycles.
+    """
+    if rec.type != "fusion" or rec.status != "completed":
+        return False
+    if rec.extra and rec.extra.get("results") is not None:
+        return True
+    return _fusion_results_bundle_path(rec) is not None
+
+
 def _load_fusion_results_into_session(rec) -> bool:
     """Hydrate ``st.session_state`` from a completed fusion job's bundle.
 
@@ -69,14 +95,7 @@ def _load_fusion_results_into_session(rec) -> bool:
         return True
 
     # Disk fallback: find the persisted results bundle among the job's outputs.
-    bundle_path = None
-    for p in rec.output_paths or []:
-        try:
-            if os.path.basename(str(p)) == "results_bundle.json" and os.path.isfile(p):
-                bundle_path = p
-                break
-        except Exception:
-            continue
+    bundle_path = _fusion_results_bundle_path(rec)
     if bundle_path is None:
         return False
     try:
@@ -292,11 +311,7 @@ def _render_job_card(rec, store) -> None:
                 except Exception as e:
                     st.error(f"Could not open log file: {e}")
 
-            if (
-                rec.type == "fusion"
-                and rec.status == "completed"
-                and rec.extra.get("results") is not None
-            ):
+            if _fusion_results_loadable(rec):
                 if st.button(
                     "Load results",
                     key=f"loadres_{rec.id}",
