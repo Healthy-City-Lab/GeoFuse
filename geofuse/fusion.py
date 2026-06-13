@@ -31,11 +31,13 @@ from . import (
     mixed_effects_scoring,
     objective_scoring,
     preaggregation,
+    spatial_basis,
 )
 from .cgi_formulas import WEIGHTED_AVERAGE, compute_cgi
 from .crs_utils import (
     assign_spatial_blocks,
     build_internal_overviews,
+    crs_uses_metre_axes,
     default_geotiff_creation_options,
     estimate_metre_projected_crs_for_gdf,
     normalize_geographic_gdf_to_wgs84,
@@ -221,6 +223,9 @@ class MetricFusionEngine:
         whole_grid_scaling: bool = False,
         area_balanced_split: bool = False,
         normalize_channels: bool = False,
+        spatial_adjust_method: str = "none",
+        spatial_adjust_max_df: int = 10,
+        spatial_adjust_eps_m: float | None = None,
     ):
         """
         Initialize the fusion engine.
@@ -339,6 +344,29 @@ class MetricFusionEngine:
         # correlation / incremental-R² OLS.
         cov_in = list(covariate_columns) if covariate_columns else []
         self.covariate_columns: list[str] = list(dict.fromkeys(cov_in))
+
+        # Spatial-confounding adjustment. ``none`` keeps the plain covariate-
+        # residualized objective. ``ks_aic`` / ``spatial_plus`` fold a low-rank
+        # coordinate smooth (built per spatial cluster, df chosen by AIC) into
+        # the residualization so the score reflects greenery↔outcome co-variation
+        # beyond an unmeasured smooth spatial confounder. Entity coordinates ride
+        # on the prepared frame as ``_cx`` / ``_cy``; the per-split candidate
+        # basis is cached on ``_spatial_basis_cache`` keyed by split id.
+        method = str(spatial_adjust_method or "none").lower()
+        if method not in objective_scoring.SPATIAL_METHODS:
+            raise ValueError(
+                f"spatial_adjust_method must be one of "
+                f"{sorted(objective_scoring.SPATIAL_METHODS)}; got {method!r}."
+            )
+        self.spatial_adjust_method: str = method
+        self.spatial_adjust_max_df: int = max(1, int(spatial_adjust_max_df))
+        self.spatial_adjust_eps_m: float | None = (
+            float(spatial_adjust_eps_m)
+            if spatial_adjust_eps_m is not None and float(spatial_adjust_eps_m) > 0
+            else None
+        )
+        self._spatial_basis_cache: dict = {}
+        self._spatial_adjust_summary: dict | None = None
 
         # Longitudinal / mixed-effects spec. ``None`` keeps the engine in
         # cross-sectional mode (no behaviour change). When set, every code
@@ -3676,6 +3704,7 @@ class MetricFusionEngine:
         for col in self._longitudinal_extra_cols():
             if col in entity_gdf.columns:
                 fusion_df[col] = entity_gdf[col].values
+        fusion_df = self._attach_entity_coords(fusion_df, entity_gdf)
 
         _log("INFO", "====== DATA QUALITY SUMMARY (POLYGON / PER-PIXEL) ======")
         _log(
@@ -3958,6 +3987,7 @@ class MetricFusionEngine:
         for col in self._longitudinal_extra_cols():
             if col in entity_gdf.columns:
                 fusion_df[col] = entity_gdf[col].values
+        fusion_df = self._attach_entity_coords(fusion_df, entity_gdf)
 
         _log("INFO", "====== DATA QUALITY SUMMARY (POINT/LINE / PER-PIXEL) ======")
         for col in ["target", "veg", "terrain", "ndvi", *self.covariate_columns]:
@@ -4086,6 +4116,120 @@ class MetricFusionEngine:
             return out
         return pd.Series(v).groupby(pid).first().to_numpy()
 
+    def _attach_entity_coords(
+        self, fusion_df: pd.DataFrame, src_gdf: "gpd.GeoDataFrame"
+    ) -> pd.DataFrame:
+        """Attach representative-point metre coordinates as ``_cx`` / ``_cy``.
+
+        Used only by the spatial-confounding adjustment: the coordinates ride
+        through the train/val/test split and (in polygon mode) the entity
+        collapse exactly like a covariate, so the per-split smooth can be built
+        at scoring time. No-op when spatial adjustment is off, the geometry is
+        missing, or the row counts do not line up; coordinates are not added to
+        any NaN-drop subset so they never remove rows.
+        """
+        if self.spatial_adjust_method == "none":
+            return fusion_df
+        geom = getattr(src_gdf, "geometry", None)
+        if geom is None or len(src_gdf) != len(fusion_df):
+            return fusion_df
+        try:
+            g = src_gdf
+            if g.crs is not None and not crs_uses_metre_axes(g.crs):
+                g = g.to_crs(estimate_metre_projected_crs_for_gdf(g))
+            gg = g.geometry
+            if bool((gg.geom_type == "Point").all()):
+                cx = gg.x.to_numpy(dtype=np.float64)
+                cy = gg.y.to_numpy(dtype=np.float64)
+            else:
+                rep = gg.representative_point()
+                cx = rep.x.to_numpy(dtype=np.float64)
+                cy = rep.y.to_numpy(dtype=np.float64)
+        except Exception as exc:  # geometry/CRS trouble → skip, fall back to covariates
+            _log("WARN", f"Could not attach entity coordinates for spatial adjustment: {exc}")
+            return fusion_df
+        fusion_df = fusion_df.copy()
+        fusion_df["_cx"] = cx
+        fusion_df["_cy"] = cy
+        return fusion_df
+
+    @staticmethod
+    def _spatial_cache_key(
+        coords_xy: np.ndarray, target: np.ndarray, cov: np.ndarray | None
+    ) -> tuple:
+        """Content fingerprint of a scored split for memoizing its spatial basis.
+
+        Keyed on the coordinates and outcome (both stable across Optuna trials)
+        so studies sharing a fold reuse the basis, while bootstrap resamples —
+        which change row membership — get a fresh one without manual cache
+        invalidation.
+        """
+        t = np.asarray(target, dtype=np.float64)
+        cs = float(0.0 if cov is None else np.nansum(np.asarray(cov, dtype=np.float64)))
+        return (
+            int(coords_xy.shape[0]),
+            float(np.nansum(coords_xy[:, 0])),
+            float(np.nansum(coords_xy[:, 1])),
+            float(np.nansum(coords_xy[:, 0] ** 2)),
+            float(np.nansum(t)),
+            float(np.nansum(t**2)),
+            cs,
+        )
+
+    def _spatial_basis_columns(
+        self,
+        coords_xy: np.ndarray | None,
+        target: np.ndarray,
+        cov: np.ndarray | None,
+        cgi: np.ndarray,
+    ) -> np.ndarray | None:
+        """Df-selected spatial smooth columns for one scored split, or ``None``.
+
+        Builds the per-cluster candidate basis once per split fingerprint (the
+        coordinates and outcome are stable across trials) and memoizes it on
+        ``_spatial_basis_cache``. For ``ks_aic`` the df is selected once on the
+        outcome (cached); for ``spatial_plus`` the df is selected per call on the
+        exposure ``cgi``. ``None`` means no spatial adjustment is applied (off,
+        no coordinates, degenerate geometry, or AIC preferred no smooth).
+        """
+        if self.spatial_adjust_method == "none" or coords_xy is None:
+            return None
+        coords_xy = np.asarray(coords_xy, dtype=np.float64)
+        cache_key = self._spatial_cache_key(coords_xy, target, cov)
+        entry = self._spatial_basis_cache.get(cache_key)
+        if entry is None:
+            basis = spatial_basis.build_block_basis(
+                np.asarray(coords_xy, dtype=np.float64),
+                max_df=self.spatial_adjust_max_df,
+                eps=self.spatial_adjust_eps_m,
+            )
+            ks_df, ks_cols = (None, None)
+            if basis.has_spatial:
+                ks_df, ks_cols = spatial_basis.select_df_aic(
+                    np.asarray(target, dtype=np.float64),
+                    basis,
+                    None if cov is None else np.asarray(cov, dtype=np.float64),
+                )
+            entry = {"basis": basis, "ks_cols": ks_cols, "ks_df": ks_df}
+            self._spatial_basis_cache[cache_key] = entry
+            if self._spatial_adjust_summary is None and basis.has_spatial:
+                self._spatial_adjust_summary = {
+                    "method": self.spatial_adjust_method,
+                    "ks_df": ks_df,
+                    **basis.summary,
+                }
+        basis = entry["basis"]
+        if not basis.has_spatial:
+            return None
+        if self.spatial_adjust_method == "ks_aic":
+            return entry["ks_cols"]
+        # spatial_plus: the exposure is residualized on the smooth, so df is
+        # selected on the exposure (df-Spatial+); the candidate basis is reused.
+        _df, sp_cols = spatial_basis.select_df_aic(
+            np.asarray(cgi, dtype=np.float64), basis, None
+        )
+        return sp_cols
+
     def _finalize_composite(self, composite: np.ndarray) -> np.ndarray:
         """Apply the ``whole_grid_scaling`` toggle to a per-pixel composite.
 
@@ -4154,6 +4298,7 @@ class MetricFusionEngine:
         # predictor; downstream split + MixedLM scorer key on these.
         for col in self._longitudinal_extra_cols():
             fusion_df[col] = points_gdf[col].to_numpy()
+        fusion_df = self._attach_entity_coords(fusion_df, points_gdf)
 
         # Log data quality before dropping NaN
         _log("INFO", "====== DATA QUALITY SUMMARY (POINT) ======")
@@ -4376,6 +4521,7 @@ class MetricFusionEngine:
                 "ndvi": points_gdf["ndvi"],
             }
         )
+        fusion_df = self._attach_entity_coords(fusion_df, points_gdf)
 
         # Log data quality before dropping NaN
         _log("INFO", "====== DATA QUALITY SUMMARY (RASTER) ======")
@@ -4892,6 +5038,8 @@ class MetricFusionEngine:
             )
 
             self.cv_folds = []
+            self._spatial_basis_cache = {}
+            self._spatial_adjust_summary = None
             if use_cv and spatial_ok and "_block" in train_val_poly.columns:
                 # Spatial inner folds: stripe blocks across folds so each
                 # validation fold is spread over the extent and a block's
@@ -5085,6 +5233,8 @@ class MetricFusionEngine:
         )
 
         self.cv_folds = []
+        self._spatial_basis_cache = {}
+        self._spatial_adjust_summary = None
 
         if use_cv:
             logger.info(f"Creating {k_folds}-fold cross-validation splits...")
@@ -5644,6 +5794,11 @@ class MetricFusionEngine:
             val_entity_id = None
             train_ysb = None
             val_ysb = None
+            # Per-entity coordinates for the spatial-confounding smooth. ``None``
+            # whenever the adjustment is off or coordinates were not attached.
+            train_coords = None
+            val_coords = None
+            have_coords = "_cx" in train_data.columns and "_cy" in train_data.columns
             if "polygon_id" in train_data.columns:
                 train_pid = train_data["polygon_id"].values
                 val_pid = val_data["polygon_id"].values
@@ -5689,6 +5844,32 @@ class MetricFusionEngine:
                             for j in range(vc.shape[1])
                         ]
                     )
+                if have_coords:
+                    # Collapse coordinates with an unmasked "first" so the
+                    # per-entity representative point is independent of the
+                    # trial's catchment radius — the spatial basis can then be
+                    # cached once per fold. The collapse key order (sorted
+                    # polygon_id) matches the target/covariate collapse above.
+                    train_coords = np.column_stack(
+                        [
+                            self._collapse_to_entities(
+                                train_data["_cx"].to_numpy(np.float64), train_pid, None, "first"
+                            ),
+                            self._collapse_to_entities(
+                                train_data["_cy"].to_numpy(np.float64), train_pid, None, "first"
+                            ),
+                        ]
+                    )
+                    val_coords = np.column_stack(
+                        [
+                            self._collapse_to_entities(
+                                val_data["_cx"].to_numpy(np.float64), val_pid, None, "first"
+                            ),
+                            self._collapse_to_entities(
+                                val_data["_cy"].to_numpy(np.float64), val_pid, None, "first"
+                            ),
+                        ]
+                    )
                 if self.is_longitudinal:
                     train_entity_id = self._collapse_to_entities(
                         train_data["entity_id"].values, train_pid, train_mask, "first"
@@ -5711,6 +5892,9 @@ class MetricFusionEngine:
             else:
                 train_targets_arr = train_data["target"].values
                 val_targets_arr = val_data["target"].values
+                if have_coords:
+                    train_coords = train_data[["_cx", "_cy"]].to_numpy(np.float64)
+                    val_coords = val_data[["_cx", "_cy"]].to_numpy(np.float64)
                 if self.is_longitudinal:
                     train_entity_id = train_data["entity_id"].values
                     val_entity_id = val_data["entity_id"].values
@@ -5732,6 +5916,15 @@ class MetricFusionEngine:
                 raise optuna.TrialPruned(
                     "Validation composite has no variance (constant values)"
                 )
+
+            # Spatial-confounding smooth (or None when off): a df-selected
+            # coordinate basis folded into the scorer's residualization.
+            train_sb = self._spatial_basis_columns(
+                train_coords, train_targets_arr, train_cov, train_composite
+            )
+            val_sb = self._spatial_basis_columns(
+                val_coords, val_targets_arr, val_cov, val_composite
+            )
 
             # ─── Score: MixedLM (longitudinal) or OLS partial-corr ────────────
             # Three modes route through this fork:
@@ -5760,6 +5953,8 @@ class MetricFusionEngine:
                     include_time_fixed=spec.include_time_fixed_effect,
                     random_slope=spec.random_slope_time,
                     return_pvalue=wants_pval,
+                    spatial_basis=train_sb,
+                    spatial_method=self.spatial_adjust_method,
                 )
                 val_out = mixed_effects_scoring.score_mixedlm(
                     metric,
@@ -5771,6 +5966,8 @@ class MetricFusionEngine:
                     include_time_fixed=spec.include_time_fixed_effect,
                     random_slope=spec.random_slope_time,
                     return_pvalue=wants_pval,
+                    spatial_basis=val_sb,
+                    spatial_method=self.spatial_adjust_method,
                 )
             else:
                 # OLS path: covariate-aware distance-correlation / partial rank
@@ -5784,6 +5981,8 @@ class MetricFusionEngine:
                     train_composite,
                     covariates=train_cov,
                     return_pvalue=wants_pval,
+                    spatial_basis=train_sb,
+                    spatial_method=self.spatial_adjust_method,
                 )
                 val_out = objective_scoring.score(
                     metric,
@@ -5791,6 +5990,8 @@ class MetricFusionEngine:
                     val_composite,
                     covariates=val_cov,
                     return_pvalue=wants_pval,
+                    spatial_basis=val_sb,
+                    spatial_method=self.spatial_adjust_method,
                 )
 
             if wants_pval:
@@ -6114,6 +6315,10 @@ class MetricFusionEngine:
         # the shape the MixedLM scorer expects.
         test_entity_id = None
         test_ysb = None
+        test_coords = None
+        have_coords = (
+            "_cx" in self.test_data.columns and "_cy" in self.test_data.columns
+        )
         if "polygon_id" in self.test_data.columns:
             test_pid = self.test_data["polygon_id"].values
             catchment_r = self._catchment_radius(
@@ -6136,6 +6341,19 @@ class MetricFusionEngine:
                         for j in range(tc.shape[1])
                     ]
                 )
+            if have_coords:
+                test_coords = np.column_stack(
+                    [
+                        self._collapse_to_entities(
+                            self.test_data["_cx"].to_numpy(np.float64),
+                            test_pid, None, "first",
+                        ),
+                        self._collapse_to_entities(
+                            self.test_data["_cy"].to_numpy(np.float64),
+                            test_pid, None, "first",
+                        ),
+                    ]
+                )
             if self.is_longitudinal:
                 test_entity_id = self._collapse_to_entities(
                     self.test_data["entity_id"].values, test_pid, test_mask, "first"
@@ -6148,9 +6366,15 @@ class MetricFusionEngine:
                 )
         else:
             test_targets = self.test_data["target"].values
+            if have_coords:
+                test_coords = self.test_data[["_cx", "_cy"]].to_numpy(np.float64)
             if self.is_longitudinal:
                 test_entity_id = self.test_data["entity_id"].values
                 test_ysb = self.test_data["years_since_baseline"].values
+
+        test_sb = self._spatial_basis_columns(
+            test_coords, test_targets, test_cov, test_composite
+        )
 
         # ─── Score: MixedLM (longitudinal) or OLS partial-corr ────────────
         # Same three-mode fork as ``_objective``: year-aware cross-sectional
@@ -6175,6 +6399,8 @@ class MetricFusionEngine:
                     include_time_fixed=spec.include_time_fixed_effect,
                     random_slope=spec.random_slope_time,
                     return_all=True,
+                    spatial_basis=test_sb,
+                    spatial_method=self.spatial_adjust_method,
                 )
                 # Surface the requested metric's value alongside the dict so
                 # ``test_score`` still reflects the engine's active scoring
@@ -6192,6 +6418,8 @@ class MetricFusionEngine:
                     include_time_fixed=spec.include_time_fixed_effect,
                     random_slope=spec.random_slope_time,
                     return_pvalue=wants_pval,
+                    spatial_basis=test_sb,
+                    spatial_method=self.spatial_adjust_method,
                 )
         else:
             # OLS scoring (distance correlation / partial rank corr / R² /
@@ -6204,6 +6432,8 @@ class MetricFusionEngine:
                 test_composite,
                 covariates=test_cov,
                 return_pvalue=wants_pval,
+                spatial_basis=test_sb,
+                spatial_method=self.spatial_adjust_method,
             )
         if wants_pval:
             test_score, test_pval = score_out  # type: ignore[misc]
@@ -6212,6 +6442,11 @@ class MetricFusionEngine:
             test_pval = None
 
         result = {"test_score": test_score, "metric": metric}
+        if self.spatial_adjust_method != "none":
+            result["spatial_adjustment"] = (
+                self._spatial_adjust_summary
+                or {"method": self.spatial_adjust_method, "applied": False}
+            )
         if test_pval is not None:
             result["test_pvalue"] = test_pval
             logger.info(
@@ -6230,6 +6465,9 @@ class MetricFusionEngine:
             result["predictions"] = test_composite
             result["targets"] = test_targets
             result["covariates"] = test_cov
+            # The df-selected smooth so downstream bootstrap / permutation CIs can
+            # condition on the same spatial adjustment the score used.
+            result["spatial_basis"] = test_sb
 
         return result
 
@@ -6382,6 +6620,13 @@ class MetricFusionEngine:
         cov_mat = (
             np.asarray(test_cov, dtype=np.float64) if test_cov is not None else None
         )
+        # Condition the CI on the spatial smooth by folding the df-selected basis
+        # columns into the resampled control matrix (equivalent to KS-AIC for the
+        # symmetric metrics: both sides residualize on [covariates, smooth]).
+        sb = res.get("spatial_basis")
+        if sb is not None:
+            sb = np.asarray(sb, dtype=np.float64)
+            cov_mat = sb if cov_mat is None else np.column_stack([cov_mat, sb])
         mask = np.isfinite(target) & np.isfinite(prediction)
         if cov_mat is not None:
             mask &= np.isfinite(cov_mat).all(axis=1)
@@ -6651,17 +6896,35 @@ class MetricFusionEngine:
             # Cross-sectional metrics no longer expose a usable p-value.
             wants_pval = False
 
-            def _do(cov: np.ndarray | None) -> tuple[float | None, float | None]:
+            # Spatial smooth for the partial (adjusted) score; the raw score
+            # stays fully unadjusted (no covariates, no smooth).
+            sb = self._spatial_basis_columns(
+                self._whole_data_coords(df), target, cov_mat, composite
+            )
+
+            def _do(
+                cov: np.ndarray | None, spat: np.ndarray | None
+            ) -> tuple[float | None, float | None]:
                 out = objective_scoring.score(
-                    metric, target, composite, covariates=cov, return_pvalue=wants_pval
+                    metric,
+                    target,
+                    composite,
+                    covariates=cov,
+                    return_pvalue=wants_pval,
+                    spatial_basis=spat,
+                    spatial_method=self.spatial_adjust_method,
                 )
                 if wants_pval:
                     s, p = out  # type: ignore[misc]
                     return float(s), float(p)
                 return float(out), None  # type: ignore[arg-type]
 
-            partial_s, partial_p = _do(cov_mat)
-            raw_s, raw_p = _do(None) if cov_mat is not None else (partial_s, partial_p)
+            partial_s, partial_p = _do(cov_mat, sb)
+            raw_s, raw_p = (
+                _do(None, None)
+                if (cov_mat is not None or sb is not None)
+                else (partial_s, partial_p)
+            )
             return {
                 "score": partial_s,
                 "score_raw": raw_s,
@@ -6693,6 +6956,56 @@ class MetricFusionEngine:
             .reindex(df["polygon_id"].values)
         )
         return cov_per_poly.to_numpy(dtype=np.float64)
+
+    def _whole_data_coords(self, df: "pd.DataFrame") -> "np.ndarray | None":
+        """Per-row entity coordinates aligned to a collapsed ``apply_fusion`` frame.
+
+        Mirrors :meth:`_whole_data_covariates` for the spatial smooth: looks each
+        row's ``_cx`` / ``_cy`` up by ``polygon_id`` (or by index for row-keyed
+        targets) from the union of train+val and test data. Returns ``None`` when
+        spatial adjustment is off or coordinates were not attached.
+        """
+        if self.spatial_adjust_method == "none":
+            return None
+        parts = [d for d in (self.train_val_data, self.test_data) if d is not None]
+        if not parts:
+            return None
+        full = pd.concat(parts)
+        if "_cx" not in full.columns or "_cy" not in full.columns:
+            return None
+        if "polygon_id" in df.columns and "polygon_id" in full.columns:
+            coords = (
+                full.groupby("polygon_id", sort=False)[["_cx", "_cy"]]
+                .first()
+                .reindex(df["polygon_id"].values)
+            )
+        else:
+            coords = full[["_cx", "_cy"]].reindex(df.index)
+        return coords.to_numpy(dtype=np.float64)
+
+    def _augment_cov_with_spatial(
+        self,
+        df: "pd.DataFrame",
+        target: np.ndarray,
+        composite: np.ndarray,
+        cov: np.ndarray | None,
+    ) -> np.ndarray | None:
+        """Fold the df-selected spatial smooth into a control matrix for the
+        reporting CIs (bootstrap / permutation), which resample the controls
+        jointly with the rows.
+
+        Equivalent to KS-AIC for the symmetric metrics (both sides residualize on
+        ``[covariates, smooth]``); a no-op when spatial adjustment is off or the
+        geometry is degenerate.
+        """
+        if self.spatial_adjust_method == "none":
+            return cov
+        sb = self._spatial_basis_columns(
+            self._whole_data_coords(df), target, cov, composite
+        )
+        if sb is None:
+            return cov
+        return sb if cov is None else np.column_stack([cov, sb])
 
     def evaluate_effects(
         self,
@@ -6775,7 +7088,9 @@ class MetricFusionEngine:
             df_full = self.apply_fusion(weights=dict(params))
             t_all = np.asarray(df_full["target"].values, dtype=np.float64)
             c_all = np.asarray(df_full["composite"].values, dtype=np.float64)
-            cov_all = self._whole_data_covariates(df_full)
+            cov_all = self._augment_cov_with_spatial(
+                df_full, t_all, c_all, self._whole_data_covariates(df_full)
+            )
             results["all"] = _block(t_all, c_all, cov_all, do_perm=True, sub_seed=seed)
         except Exception as exc:
             logger.warning(f"evaluate_effects: whole-data scoring failed: {exc}")
@@ -6791,6 +7106,11 @@ class MetricFusionEngine:
                 t_te = None if tg is None else np.asarray(tg, dtype=np.float64)
                 c_te = None if pr is None else np.asarray(pr, dtype=np.float64)
                 cov_te = None if cv is None else np.asarray(cv, dtype=np.float64)
+                # Fold the test smooth into the resampled controls (KS-style).
+                te_sb = tr.get("spatial_basis")
+                if te_sb is not None:
+                    te_sb = np.asarray(te_sb, dtype=np.float64)
+                    cov_te = te_sb if cov_te is None else np.column_stack([cov_te, te_sb])
                 results["test"] = _block(
                     t_te, c_te, cov_te, do_perm=True, sub_seed=seed + 101
                 )
@@ -6807,7 +7127,9 @@ class MetricFusionEngine:
                 sub = df_full[df_full["polygon_id"].isin(pids)]
                 t_tv = np.asarray(sub["target"].values, dtype=np.float64)
                 c_tv = np.asarray(sub["composite"].values, dtype=np.float64)
-                cov_tv = self._whole_data_covariates(sub)
+                cov_tv = self._augment_cov_with_spatial(
+                    sub, t_tv, c_tv, self._whole_data_covariates(sub)
+                )
                 results["train_val"] = _block(
                     t_tv, c_tv, cov_tv, do_perm=False, sub_seed=seed + 202
                 )
@@ -6876,6 +7198,9 @@ class MetricFusionEngine:
             target = merged["target"].to_numpy(dtype=np.float64)
             cgi_c = merged["composite_cgi"].to_numpy(dtype=np.float64)
             std_c = merged["composite_std"].to_numpy(dtype=np.float64)
+            # Both composites share the same outcome-selected smooth; fold it into
+            # the resampled controls so the paired difference is spatially adjusted.
+            cov = self._augment_cov_with_spatial(merged, target, cgi_c, cov)
         except Exception as exc:
             logger.warning(f"paired_objective_difference: alignment failed: {exc}")
             return None
@@ -7116,18 +7441,32 @@ class MetricFusionEngine:
             # Cross-sectional metrics no longer expose a usable p-value.
             wants_pval = False
 
-            def _full_score(c: np.ndarray | None) -> tuple[float | None, float | None]:
+            sb = self._spatial_basis_columns(
+                self._whole_data_coords(df), target, cov, composite
+            )
+
+            def _full_score(
+                c: np.ndarray | None, spat: np.ndarray | None
+            ) -> tuple[float | None, float | None]:
                 s_out = objective_scoring.score(
-                    metric, target, composite, covariates=c, return_pvalue=wants_pval
+                    metric,
+                    target,
+                    composite,
+                    covariates=c,
+                    return_pvalue=wants_pval,
+                    spatial_basis=spat,
+                    spatial_method=self.spatial_adjust_method,
                 )
                 if wants_pval:
                     s, p = s_out  # type: ignore[misc]
                     return float(s), float(p)
                 return float(s_out), None  # type: ignore[arg-type]
 
-            partial_s, partial_p = _full_score(cov)
+            partial_s, partial_p = _full_score(cov, sb)
             raw_s, raw_p = (
-                _full_score(None) if cov is not None else (partial_s, partial_p)
+                _full_score(None, None)
+                if (cov is not None or sb is not None)
+                else (partial_s, partial_p)
             )
             out["all"] = {
                 "score": partial_s,
@@ -7677,6 +8016,9 @@ class MetricFusionEngine:
                 # ``_objective`` reads ``train`` / ``val`` from each fold and
                 # handles aggregation, channel collapse, and OOB scoring.
                 self.cv_folds = [{"train": in_bag_df, "val": oob_df}]
+                # Each resample is a different row set, so its spatial basis is
+                # rebuilt; drop the previous resample's cache to bound memory.
+                self._spatial_basis_cache = {}
 
                 # Fresh in-memory study with a low-discrepancy QMC (Sobol)
                 # sampler: objective-blind like RandomSampler (so the per-cell

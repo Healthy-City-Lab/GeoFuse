@@ -589,6 +589,9 @@ def _fusion_config_fingerprint(
     spatial_block_size_m: float | None = None,
     n_spatial_blocks: int | None = None,
     normalize_channels: bool = False,
+    spatial_adjust_method: str = "none",
+    spatial_adjust_max_df: int = 10,
+    spatial_adjust_eps_m: float | None = None,
 ) -> str:
     """8-char hex hash of every setting that changes the search space / split.
 
@@ -618,6 +621,16 @@ def _fusion_config_fingerprint(
         ]
         # Only appended when on, so legacy (un-normalized) runs keep their hash.
         + (["nc:1"] if normalize_channels else [])
+        # Spatial-confounding adjustment changes the objective, so it splits the
+        # cache; only appended when on so legacy runs keep their hash.
+        + (
+            [
+                f"spadj:{spatial_adjust_method}@{int(spatial_adjust_max_df)}@"
+                f"{spatial_adjust_eps_m if spatial_adjust_eps_m is not None else 'auto'}"
+            ]
+            if spatial_adjust_method and spatial_adjust_method != "none"
+            else []
+        )
     )
     return _hl.sha256(payload.encode()).hexdigest()[:8]
 
@@ -1285,6 +1298,9 @@ def run_fusion(
     whole_grid_scaling: bool = False,
     area_balanced_split: bool = False,
     normalize_channels: bool = False,
+    spatial_adjust_method: str = "none",
+    spatial_adjust_max_df: int = 10,
+    spatial_adjust_eps_m: float | None = None,
     n_bootstraps: int = 20,
     n_trials_per_bootstrap: int = 50,
     min_cell_count: int = 3,
@@ -1488,6 +1504,9 @@ def run_fusion(
                 whole_grid_scaling=whole_grid_scaling,
                 area_balanced_split=area_balanced_split,
                 normalize_channels=normalize_channels,
+                spatial_adjust_method=spatial_adjust_method,
+                spatial_adjust_max_df=spatial_adjust_max_df,
+                spatial_adjust_eps_m=spatial_adjust_eps_m,
             )
 
             ctx.progress(value=prog(0.1), status_text=f"{prefix}Loading target data...")
@@ -1743,6 +1762,9 @@ def run_fusion(
                 spatial_block_size_m=spatial_block_size_m,
                 n_spatial_blocks=n_spatial_blocks,
                 normalize_channels=bool(normalize_channels),
+                spatial_adjust_method=spatial_adjust_method,
+                spatial_adjust_max_df=spatial_adjust_max_df,
+                spatial_adjust_eps_m=spatial_adjust_eps_m,
             )
 
             def _standalone_study_name(ch: str) -> str:

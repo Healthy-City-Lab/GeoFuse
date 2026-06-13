@@ -68,6 +68,12 @@ HIGHER_IS_BETTER: frozenset[str] = frozenset(
 # uses this list to render a tooltip on the covariate multi-select.
 COVARIATE_IGNORED: frozenset[str] = frozenset({"mutual_info"})
 
+# Spatial-confounding adjustment methods. ``none`` reproduces the plain
+# covariate-residualized score. ``ks_aic`` (Keller & Szpiro) and ``spatial_plus``
+# (df-Spatial+) fold a coordinate smooth into the residualization — see
+# :func:`score` and :mod:`geofuse.spatial_basis`.
+SPATIAL_METHODS: frozenset[str] = frozenset({"none", "ks_aic", "spatial_plus"})
+
 # Worst score returned when the inputs are degenerate (all-NaN, constant, < 3
 # rows).
 _DEGENERATE_SCORE: dict[str, float] = {
@@ -97,22 +103,6 @@ def _coerce_covariates(covariates: np.ndarray | None) -> np.ndarray | None:
     return cov
 
 
-def _drop_nan_rows(
-    target: np.ndarray, cgi: np.ndarray, cov: np.ndarray | None
-) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
-    """Mask rows where any of ``target`` / ``cgi`` / any covariate is non-finite."""
-    mask = np.isfinite(target) & np.isfinite(cgi)
-    if cov is not None:
-        mask &= np.isfinite(cov).all(axis=1)
-    if mask.all():
-        return target, cgi, cov
-    return (
-        target[mask],
-        cgi[mask],
-        None if cov is None else cov[mask],
-    )
-
-
 def _residualize(y: np.ndarray, X: np.ndarray | None) -> np.ndarray:
     """OLS residuals of ``y ~ X`` (intercept added). ``X=None`` returns ``y``."""
     if X is None or X.shape[1] == 0:
@@ -120,6 +110,48 @@ def _residualize(y: np.ndarray, X: np.ndarray | None) -> np.ndarray:
     Xc = np.column_stack([np.ones(len(y)), X])
     beta, *_ = np.linalg.lstsq(Xc, y, rcond=None)
     return y - Xc @ beta
+
+
+def _stack(*mats: np.ndarray | None) -> np.ndarray | None:
+    """Column-stack the non-empty design matrices, or ``None`` if all are empty."""
+    parts = [m for m in mats if m is not None and m.shape[1] > 0]
+    if not parts:
+        return None
+    return parts[0] if len(parts) == 1 else np.column_stack(parts)
+
+
+def _spatial_designs(
+    cov: np.ndarray | None, spatial_basis: np.ndarray | None, method: str
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Control designs to residualize the (target, cgi) sides on, per method.
+
+    * ``none`` / no basis → both sides get the covariates.
+    * ``ks_aic`` → both sides get ``[covariates, spatial_basis]`` (symmetric
+      partial association of cgi in ``target ~ cgi + covariates + smooth``).
+    * ``spatial_plus`` → target gets ``[covariates, spatial_basis]``; cgi gets the
+      spatial smooth only (the exposure is residualized on the smooth).
+    """
+    if spatial_basis is None or method == "none":
+        return cov, cov
+    both = _stack(cov, spatial_basis)
+    if method == "spatial_plus":
+        return both, spatial_basis
+    return both, both
+
+
+def _finite_mask(
+    target: np.ndarray,
+    cgi: np.ndarray,
+    cov: np.ndarray | None,
+    spatial_basis: np.ndarray | None,
+) -> np.ndarray:
+    """Row mask keeping observations finite across target / cgi / cov / basis."""
+    mask = np.isfinite(target) & np.isfinite(cgi)
+    if cov is not None:
+        mask &= np.isfinite(cov).all(axis=1)
+    if spatial_basis is not None:
+        mask &= np.isfinite(spatial_basis).all(axis=1)
+    return mask
 
 
 def _ols_r2(y: np.ndarray, X: np.ndarray | None) -> float:
@@ -205,19 +237,28 @@ def relationship_sign(
     target: np.ndarray,
     cgi: np.ndarray,
     covariates: np.ndarray | None = None,
+    *,
+    spatial_basis: np.ndarray | None = None,
+    spatial_method: str = "none",
 ) -> int:
     """Sign (``+1`` / ``-1``) of the greenery↔outcome relationship.
 
     Distance correlation is unsigned, so the report needs a separate direction
     indicator. Uses the sign of the partial Spearman correlation (rank
-    residuals on ranked covariates). Returns ``+1`` when higher greenery tracks
-    higher outcome, ``-1`` otherwise, and ``+1`` as a neutral default for
-    degenerate inputs.
+    residuals on ranked covariates, plus the spatial smooth when supplied, so the
+    reported direction matches the spatially-adjusted score). Returns ``+1`` when
+    higher greenery tracks higher outcome, ``-1`` otherwise, and ``+1`` as a
+    neutral default for degenerate inputs.
     """
     t = np.asarray(target, dtype=np.float64).ravel()
     c = np.asarray(cgi, dtype=np.float64).ravel()
     cov = _coerce_covariates(covariates)
-    t, c, cov = _drop_nan_rows(t, c, cov)
+    sb = _coerce_covariates(spatial_basis) if spatial_method != "none" else None
+    mask = _finite_mask(t, c, cov, sb)
+    if not mask.all():
+        t, c = t[mask], c[mask]
+        cov = None if cov is None else cov[mask]
+        sb = None if sb is None else sb[mask]
     if len(t) < 3 or float(np.var(t)) == 0 or float(np.var(c)) == 0:
         return 1
     tt = rankdata(t)
@@ -226,8 +267,9 @@ def relationship_sign(
         cov_use = np.column_stack([rankdata(cov[:, j]) for j in range(cov.shape[1])])
     else:
         cov_use = None
-    tr = _residualize(tt, cov_use)
-    cr = _residualize(cc, cov_use)
+    x_t, x_c = _spatial_designs(cov_use, sb, spatial_method)
+    tr = _residualize(tt, x_t)
+    cr = _residualize(cc, x_c)
     if float(np.var(tr)) == 0 or float(np.var(cr)) == 0:
         return 1
     with warnings.catch_warnings():
@@ -250,6 +292,8 @@ def score(
     covariates: np.ndarray | None = None,
     *,
     return_pvalue: bool = False,
+    spatial_basis: np.ndarray | None = None,
+    spatial_method: str = "none",
 ) -> float | tuple[float, float]:
     """Score CGI's predictive power for ``target``, controlling for ``covariates``.
 
@@ -259,8 +303,20 @@ def score(
     ``return_pvalue=True`` returns ``(score, 1.0)`` — the ``1.0`` is a retained
     sentinel (no metric feeds a p-value gate anymore; robustness comes from
     bootstrap stability selection).
+
+    ``spatial_basis`` is an optional already-df-selected coordinate smooth (the
+    output of :func:`geofuse.spatial_basis.select_df_aic`). With ``spatial_method``
+    ``ks_aic`` it joins the covariates on both sides; with ``spatial_plus`` the
+    exposure is residualized on the smooth only. ``spatial_method="none"`` (or a
+    missing basis) reproduces the plain covariate-residualized score. The smooth
+    is ignored by ``mutual_info`` (like covariates).
     """
     _validate_metric(metric)
+    if spatial_method not in SPATIAL_METHODS:
+        raise ValueError(
+            f"Unknown spatial_method '{spatial_method}'. "
+            f"Expected one of {sorted(SPATIAL_METHODS)}."
+        )
     t = np.asarray(target, dtype=np.float64)
     c = np.asarray(cgi, dtype=np.float64)
     if t.shape != c.shape:
@@ -269,10 +325,18 @@ def score(
         )
 
     cov = _coerce_covariates(covariates)
+    sb = _coerce_covariates(spatial_basis)
+    if metric in COVARIATE_IGNORED or spatial_method == "none":
+        sb = None
     if metric in COVARIATE_IGNORED:
         # MI ignores covariates by design (documented).
         cov = None
-    t, c, cov = _drop_nan_rows(t, c, cov)
+
+    mask = _finite_mask(t, c, cov, sb)
+    if not mask.all():
+        t, c = t[mask], c[mask]
+        cov = None if cov is None else cov[mask]
+        sb = None if sb is None else sb[mask]
 
     if len(t) < 3 or float(np.var(t)) == 0 or float(np.var(c)) == 0:
         s = _DEGENERATE_SCORE[metric]
@@ -283,8 +347,9 @@ def score(
         warnings.filterwarnings("ignore", category=ConstantInputWarning)
 
         if metric == "distance_corr":
-            tr = _residualize(t, cov)
-            cr = _residualize(c, cov)
+            x_t, x_c = _spatial_designs(cov, sb, spatial_method)
+            tr = _residualize(t, x_t)
+            cr = _residualize(c, x_c)
             if float(np.var(tr)) == 0 or float(np.var(cr)) == 0:
                 return (0.0, 1.0) if return_pvalue else 0.0
             s = distance_correlation(tr, cr)
@@ -299,8 +364,9 @@ def score(
                 )
             else:
                 cov_use = None
-            tr = _residualize(tt, cov_use)
-            cr = _residualize(cc, cov_use)
+            x_t, x_c = _spatial_designs(cov_use, sb, spatial_method)
+            tr = _residualize(tt, x_t)
+            cr = _residualize(cc, x_c)
             if float(np.var(tr)) == 0 or float(np.var(cr)) == 0:
                 return (0.0, 1.0) if return_pvalue else 0.0
             corr, _pval = pearsonr(tr, cr)
@@ -310,13 +376,16 @@ def score(
             return (s, 1.0) if return_pvalue else s
 
         if metric == "r2":
-            if cov is None:
+            # Incremental R² with the spatial smooth folded into the control
+            # design (both methods condition the outcome on cov + smooth).
+            ctrl = _stack(cov, sb)
+            if ctrl is None:
                 # Legacy path: r2 of cgi treated as a direct prediction of
                 # target — preserves the previous engine behaviour exactly.
                 s = float(r2_score(t, c))
             else:
-                X_red = cov
-                X_full = np.column_stack([cov, c])
+                X_red = ctrl
+                X_full = np.column_stack([ctrl, c])
                 s = _ols_r2(t, X_full) - _ols_r2(t, X_red)
             if np.isnan(s):
                 s = 0.0
@@ -324,10 +393,11 @@ def score(
 
         if metric == "nrmse":
             # Min-max normalized RMSE: scale-free pattern error. Residualize on
-            # covariates first (matching distance_corr) so the score reflects
-            # the greenery term's partial contribution.
-            tr = _residualize(t, cov) if cov is not None else t
-            cr = _residualize(c, cov) if cov is not None else c
+            # covariates (+ spatial smooth) first, matching distance_corr, so the
+            # score reflects the greenery term's partial contribution.
+            x_t, x_c = _spatial_designs(cov, sb, spatial_method)
+            tr = _residualize(t, x_t)
+            cr = _residualize(c, x_c)
             t01 = _minmax01(tr)
             c01 = _minmax01(cr)
             s = float(np.sqrt(np.mean((t01 - c01) ** 2)))
@@ -375,13 +445,14 @@ def compare_models_aic_bic(
     channel_names: list[str],
     best_channel_idx: int,
     covariates: np.ndarray | None = None,
+    spatial_basis: np.ndarray | None = None,
 ) -> dict:
     """AIC/BIC comparison of a full multi-channel model vs the best single channel.
 
     Fits two OLS models on ``target``:
 
-    * **full** — ``target ~ all channels + covariates``
-    * **reduced** — ``target ~ best single channel + covariates``
+    * **full** — ``target ~ all channels + covariates (+ spatial smooth)``
+    * **reduced** — ``target ~ best single channel + covariates (+ spatial smooth)``
 
     and returns their AIC/BIC plus ``delta_aic`` / ``delta_bic`` (reduced minus
     full, so a *positive* delta means the extra channels improve the penalized
@@ -389,6 +460,8 @@ def compare_models_aic_bic(
 
     The full model is naturally penalized for its extra predictors, so this
     answers "do the other channels earn their keep over the best one alone?".
+    When ``spatial_basis`` is supplied it conditions both models on the same
+    coordinate smooth, matching the spatially-adjusted objective.
     """
     import statsmodels.api as sm
 
@@ -405,14 +478,19 @@ def compare_models_aic_bic(
         raise ValueError(f"best_channel_idx {best_channel_idx} out of range.")
 
     cov = _coerce_covariates(covariates)
+    sb = _coerce_covariates(spatial_basis)
     mask = np.isfinite(t) & np.isfinite(X).all(axis=1)
     if cov is not None:
         mask &= np.isfinite(cov).all(axis=1)
+    if sb is not None:
+        mask &= np.isfinite(sb).all(axis=1)
     t = t[mask]
     X = X[mask]
     cov = None if cov is None else cov[mask]
+    sb = None if sb is None else sb[mask]
 
-    if len(t) < (X.shape[1] + (0 if cov is None else cov.shape[1]) + 3):
+    n_ctrl = (0 if cov is None else cov.shape[1]) + (0 if sb is None else sb.shape[1])
+    if len(t) < (X.shape[1] + n_ctrl + 3):
         return {
             "ok": False,
             "reason": "too few rows for a stable OLS comparison",
@@ -424,6 +502,8 @@ def compare_models_aic_bic(
         parts = [cols]
         if cov is not None:
             parts.append(cov)
+        if sb is not None:
+            parts.append(sb)
         return sm.add_constant(np.column_stack(parts), has_constant="add")
 
     with warnings.catch_warnings():

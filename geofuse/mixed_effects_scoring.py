@@ -264,6 +264,13 @@ def _compute_all_metrics(
     }
 
 
+def _residualize_on(y: np.ndarray, X: np.ndarray) -> np.ndarray:
+    """OLS residuals of ``y ~ X`` (intercept added)."""
+    Xc = np.column_stack([np.ones(len(y)), X])
+    beta, *_ = np.linalg.lstsq(Xc, y, rcond=None)
+    return y - Xc @ beta
+
+
 def score_mixedlm(
     metric: str,
     outcome: np.ndarray,
@@ -276,6 +283,8 @@ def score_mixedlm(
     random_slope: bool = True,
     return_pvalue: bool = False,
     return_all: bool = False,
+    spatial_basis: np.ndarray | None = None,
+    spatial_method: str = "none",
 ) -> float | tuple[float, float] | dict[str, float]:
     """Score the greenery fixed effect in a mixed-effects linear model.
 
@@ -299,6 +308,11 @@ def score_mixedlm(
     return_all
         Return a ``dict`` of all four metric values from the same fit (uses
         one extra fit for the LR test). Overrides ``return_pvalue``.
+    spatial_basis, spatial_method
+        Optional df-selected coordinate smooth and the adjustment method. With
+        ``ks_aic`` the smooth enters the model as extra fixed effects; with
+        ``spatial_plus`` the greenery is additionally residualized on the smooth
+        before fitting. ``none`` (or no basis) leaves the model unchanged.
     """
     if metric not in MIXEDLM_METRICS:
         raise ValueError(
@@ -309,8 +323,26 @@ def score_mixedlm(
     g = np.asarray(greenery, dtype=np.float64)
     t = np.asarray(years_since_baseline, dtype=np.float64)
     cov = _coerce_2d(covariates)
+    sb = _coerce_2d(spatial_basis) if spatial_method != "none" else None
 
-    y, g, eids, t, cov = _drop_nan(y, g, entity_id, t, cov)
+    # Combine covariates and the smooth for joint NaN masking, then split back.
+    n_cov = 0 if cov is None else cov.shape[1]
+    combined = cov if sb is None else (sb if cov is None else np.hstack([cov, sb]))
+    y, g, eids, t, combined = _drop_nan(y, g, entity_id, t, combined)
+    if sb is None:
+        cov = combined
+    elif combined is None:
+        cov, sb = None, None
+    else:
+        cov = combined[:, :n_cov] if n_cov > 0 else None
+        sb = combined[:, n_cov:]
+
+    # Fold the smooth in: as fixed effects (both methods) and, for spatial_plus,
+    # by residualizing the greenery exposure on it first.
+    if sb is not None and sb.shape[1] > 0 and len(g) > sb.shape[1] + 1:
+        if spatial_method == "spatial_plus" and float(np.var(g)) > 0:
+            g = _residualize_on(g, sb)
+        cov = sb if cov is None else np.hstack([cov, sb])
 
     n_groups = len(np.unique(eids)) if len(eids) else 0
     if (

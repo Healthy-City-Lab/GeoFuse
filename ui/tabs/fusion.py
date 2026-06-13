@@ -323,6 +323,17 @@ def _fusion_restart_summary_lines(p: dict) -> list[str]:
             f"{cgi_grid} m · {scaling_scope} scaling · {split_kind} split · "
             f"{chan_norm} channels"
         )
+    sa_method = p.get("spatial_adjust_method", "none")
+    if sa_method and sa_method != "none":
+        sa_label = {"ks_aic": "KS-AIC", "spatial_plus": "Spatial+"}.get(
+            sa_method, sa_method
+        )
+        sa_eps = p.get("spatial_adjust_eps_m")
+        lines.append(
+            f"**Spatial confounding:** {sa_label} · max df "
+            f"{p.get('spatial_adjust_max_df', 10)} · "
+            f"eps {'auto' if sa_eps is None else f'{sa_eps:g} m'}"
+        )
     return lines
 
 
@@ -358,14 +369,27 @@ def _submit_fusion_restart(
     # Replay the recorded run configuration verbatim — no per-key defaults, so
     # a restart reproduces the original run exactly. A missing key means the
     # job was recorded by an older build; fail loudly rather than silently
-    # substitute a default.
-    missing = [k for k in _FUSION_RUN_CONFIG_KEYS if k not in p]
+    # substitute a default. The spatial-confounding keys are exempt: jobs
+    # recorded before they existed replay with the adjustment off (which is what
+    # those runs used), so old jobs still restart.
+    _restart_defaults = {
+        "spatial_adjust_method": "none",
+        "spatial_adjust_max_df": 10,
+        "spatial_adjust_eps_m": None,
+    }
+    missing = [
+        k
+        for k in _FUSION_RUN_CONFIG_KEYS
+        if k not in p and k not in _restart_defaults
+    ]
     if missing:
         raise RuntimeError(
             f"Cannot restart: the stored job is missing settings {missing}. "
             "Re-run it fresh from the form instead."
         )
-    run_config = {k: p[k] for k in _FUSION_RUN_CONFIG_KEYS}
+    run_config = {
+        k: p.get(k, _restart_defaults.get(k)) for k in _FUSION_RUN_CONFIG_KEYS
+    }
     run_config["resume_existing_study"] = True
 
     new_rec = store.submit(type="fusion", name=rec.name, params=new_params)
@@ -775,6 +799,9 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "whole_grid_scaling",
     "area_balanced_split",
     "normalize_channels",
+    "spatial_adjust_method",
+    "spatial_adjust_max_df",
+    "spatial_adjust_eps_m",
     "spatial_split",
     "spatial_block_size_m",
     "n_spatial_blocks",
@@ -1519,6 +1546,9 @@ def _render_study_details_panel(
     spatial_split = False
     spatial_block_size_m: float | None = None
     n_spatial_blocks: int | None = None
+    spatial_adjust_method = "none"
+    spatial_adjust_max_df = 10
+    spatial_adjust_eps_m: float | None = None
     if is_vector_target:
         st.markdown("**Per-pixel CGI scoring**")
         cgi_grid_spacing_m = st.select_slider(
@@ -1582,6 +1612,66 @@ def _render_study_details_panel(
                 float(block_size_ui) if block_size_ui and block_size_ui > 0 else None
             )
 
+        # ── Spatial-confounding adjustment ──────────────────────────────
+        _spatial_adjust_labels = {
+            "none": "Off (control listed covariates only)",
+            "ks_aic": "KS-AIC (recommended)",
+            "spatial_plus": "Spatial+ (df-Spatial+)",
+        }
+        _spatial_adjust_keys = ["none", "ks_aic", "spatial_plus"]
+        _sa_default = st.session_state.get("fusion_spatial_adjust_method", "none")
+        spatial_adjust_method = st.selectbox(
+            "Spatial-confounding adjustment",
+            options=_spatial_adjust_keys,
+            index=(
+                _spatial_adjust_keys.index(_sa_default)
+                if _sa_default in _spatial_adjust_keys
+                else 0
+            ),
+            format_func=lambda k: _spatial_adjust_labels[k],
+            key="fusion_spatial_adjust_method",
+            help=(
+                "Remove unmeasured smooth spatial confounding by adding a "
+                "coordinate smooth (per spatial cluster, df chosen by AIC) to the "
+                "objective. KS-AIC (Keller & Szpiro) is recommended; Spatial+ "
+                "residualizes the greenery exposure on the smooth instead. The "
+                "reported CGI association becomes fine-scale (within-cluster) "
+                "contrast, so the optimal CGI parameters will shift versus an "
+                "unadjusted run."
+            ),
+        )
+        if spatial_adjust_method != "none":
+            with st.expander("Spatial adjustment — advanced", expanded=False):
+                spatial_adjust_max_df = int(
+                    st.number_input(
+                        "Max spatial df per cluster",
+                        min_value=1,
+                        max_value=50,
+                        value=int(
+                            st.session_state.get("fusion_spatial_adjust_max_df", 10)
+                        ),
+                        step=1,
+                        key="fusion_spatial_adjust_max_df",
+                        help=(
+                            "Upper bound on the radial smooth functions per spatial "
+                            "cluster; AIC selects the actual count up to this."
+                        ),
+                    )
+                )
+                eps_ui = st.number_input(
+                    "Cluster gap eps (m, 0 = auto)",
+                    min_value=0,
+                    value=int(st.session_state.get("fusion_spatial_adjust_eps_m", 0)),
+                    step=100,
+                    key="fusion_spatial_adjust_eps_m",
+                    help=(
+                        "Distance above which entities fall into different spatial "
+                        "clusters (so the smooth never spans a void). 0 derives it "
+                        "from the data via nearest-neighbour connectivity."
+                    ),
+                )
+                spatial_adjust_eps_m = float(eps_ui) if eps_ui and eps_ui > 0 else None
+
     return {
         "cgi_formula": cgi_formula,
         "covariate_columns": list(covariate_columns or []),
@@ -1596,6 +1686,9 @@ def _render_study_details_panel(
         "whole_grid_scaling": bool(whole_grid_scaling),
         "area_balanced_split": bool(area_balanced_split),
         "normalize_channels": bool(normalize_channels),
+        "spatial_adjust_method": str(spatial_adjust_method),
+        "spatial_adjust_max_df": int(spatial_adjust_max_df),
+        "spatial_adjust_eps_m": spatial_adjust_eps_m,
         "spatial_split": bool(spatial_split),
         "spatial_block_size_m": spatial_block_size_m,
         "n_spatial_blocks": n_spatial_blocks,
@@ -3339,6 +3432,9 @@ def render(output_dir: str) -> None:
     whole_grid_scaling_param = bool(study_state.get("whole_grid_scaling", False))
     area_balanced_split_param = bool(study_state.get("area_balanced_split", False))
     normalize_channels_param = bool(study_state.get("normalize_channels", False))
+    spatial_adjust_method_param = str(study_state.get("spatial_adjust_method", "none"))
+    spatial_adjust_max_df_param = int(study_state.get("spatial_adjust_max_df", 10))
+    spatial_adjust_eps_m_param = study_state.get("spatial_adjust_eps_m")
     spatial_split_param = bool(study_state.get("spatial_split", False))
     spatial_block_size_m_param = study_state.get("spatial_block_size_m")
     n_spatial_blocks_param = study_state.get("n_spatial_blocks")
@@ -3696,6 +3792,14 @@ def render(output_dir: str) -> None:
                 # Per-channel normalization applies to vector targets only.
                 "normalize_channels": (
                     bool(normalize_channels_param) if is_vector_target else False
+                ),
+                # Spatial-confounding adjustment applies to vector targets only.
+                "spatial_adjust_method": (
+                    spatial_adjust_method_param if is_vector_target else "none"
+                ),
+                "spatial_adjust_max_df": int(spatial_adjust_max_df_param),
+                "spatial_adjust_eps_m": (
+                    spatial_adjust_eps_m_param if is_vector_target else None
                 ),
                 # Spatial block validation applies to vector targets only;
                 # raster targets keep the row-level stratified split.

@@ -24,7 +24,7 @@ streamlit run ui/app.py
 
 1. **NDVI tab** → upload a study area file → set date range → choose output formats (**GeoTIFF** is default; **GeoPackage** and **GeoJSON** optional) → "Run NDVI Analysis"
 2. **GVI tab** → upload the same study area → set grid resolution and buffer → choose output formats (**GeoPackage** is default; **GeoTIFF** for per-cluster tile rasters; **GeoJSON** for compatibility) → "Generate Sampling Grids" → "Run GVI Analysis"
-3. **Fusion tab** → upload a target outcomes file (GeoJSON or GeoTIFF) → pick a **Run mode** (Cross-sectional or Mixed-effects longitudinal) → upload one GVI file + one NDVI file per measurement year/wave in the **Metric File Assignment** section → set CGI formula, covariates, objective metric, test-set size, and the stability-selection knobs in **Study Details** → "🚀 Run Fusion Optimization"
+3. **Fusion tab** → upload a target outcomes file (GeoJSON or GeoTIFF) → pick a **Run mode** (Cross-sectional or Mixed-effects longitudinal) → upload one GVI file + one NDVI file per measurement year/wave in the **Metric File Assignment** section → set CGI formula, covariates, objective metric, optional **spatial-confounding adjustment** (KS-AIC / Spatial+), test-set size, and the stability-selection knobs in **Study Details** → "🚀 Run Fusion Optimization"
 4. Inspect the composite greenery weights and export results.
 
 > [!NOTE]
