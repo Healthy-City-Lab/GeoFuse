@@ -3,17 +3,15 @@
 [![Installation & Test Suite](https://github.com/Healthy-City-Lab/GeoFuse/actions/workflows/setup-tests.yml/badge.svg)](https://github.com/Healthy-City-Lab/GeoFuse/actions/workflows/setup-tests.yml)
 [![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Python Version](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-[![OS](https://img.shields.io/badge/OS-Linux|Windows|macOS-blue)](#)
-[![Code Style](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
-[![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?logo=PyTorch&logoColor=white)](https://pytorch.org/)
-[![Conda Env](https://img.shields.io/badge/Conda%20Env-geofuse-342B029.svg?logo=anaconda&logoColor=white)](#)
-[![MPI](https://img.shields.io/badge/MPI-Parallel-blue)](#)
-[![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?logo=Streamlit&logoColor=white)](#)
-[![Google Earth Engine](https://img.shields.io/badge/Google%20Earth%20Engine-4285F4?logo=google-earth&logoColor=white)](#)
 
-**GeoFuse** is a Python toolbox for urban health and greenspace research. It automates the sourcing, processing, and fusion of **Green View Index (GVI)** — measured from street-level imagery using DeepLabV3+ segmentation — and **NDVI** — fetched from Google Earth Engine satellite data — then uses **Bayesian optimization** (Optuna) to fuse them into a composite greenery index optimized against health or environmental outcomes.
+**GeoFuse** is a Python toolbox for urban health and greenspace research. It sources, processes, and fuses two complementary greenery signals:
 
-Two deployment modes are available: an interactive **Streamlit web dashboard** for exploratory analysis, and an **MPI-parallel CLI** for large-scale HPC batch processing.
+- **Green View Index (GVI)** — *eye-level* greenery measured from Google Street View panoramas with DeepLabV3+ semantic segmentation.
+- **NDVI** — *overhead* greenery from Google Earth Engine satellite imagery (Sentinel-2 / Landsat).
+
+It then combines them into a single **composite greenery index** whose channel weights, spatial scales, and formula are tuned by **bootstrap stability selection** and reported on a held-out test set — optimized against a health or environmental outcome you supply.
+
+Two ways to run it: an interactive **Streamlit dashboard** for exploratory analysis, and an **MPI-parallel CLI** for large-scale HPC batch processing.
 
 ---
 
@@ -38,7 +36,7 @@ streamlit run ui/app.py
 
 | Guide                                      | Contents                                                                         |
 | ------------------------------------------ | -------------------------------------------------------------------------------- |
-| [Features](docs/FEATURES.md)               | Detailed breakdown of GVI, NDVI, Fusion, and HPC capabilities                    |
+| [Features](docs/FEATURES.md)               | High-level tour of GVI, NDVI, Fusion, and HPC capabilities                       |
 | [Installation](docs/INSTALLATION.md)       | Full setup instructions, segmentation model requirements, and verification tests |
 | [Usage](docs/USAGE.md)                     | Web UI walkthrough and CLI reference                                             |
 | [Outputs](docs/OUTPUTS.md)                 | All generated files and directory structure                                      |

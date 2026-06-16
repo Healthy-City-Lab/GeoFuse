@@ -7,6 +7,13 @@ import streamlit as st
 
 def render(output_dir: str) -> None:
     st.header("HPC Monitoring")
+    st.warning(
+        "**Work in progress — this view is incomplete.** HPC job monitoring "
+        "reads status files written by CLI runs on a cluster and is still under "
+        "active development. Interactive (in-app) job progress is tracked in the "
+        "sidebar Job Monitor, which is visible from every tab.",
+        icon="🚧",
+    )
 
     with st.form("job_mon_form"):
         with st.container(border=True):
