@@ -459,6 +459,7 @@ def calibrate_stability_selection(
     n_candidates: int,
     *,
     pi_min: float = 0.5,
+    max_pfer: float | None = 1.0,
 ) -> dict | None:
     """Automated calibration of the stability-selection threshold.
 
@@ -476,12 +477,19 @@ def calibrate_stability_selection(
     **stably excluded** when ``≤ ⌊B(1−π)⌋``, and unstable in between. The
     ``(K, π)`` maximising ``S`` is the calibrated configuration.
 
+    ``max_pfer`` caps the selection size: configs whose PFER bound exceeds it
+    are excluded, so ``K`` can't grow large enough to make the error control
+    vacuous (PFER grows like ``K²``). When no controlled config has any stably
+    selected cell, the best uncontrolled config is returned with
+    ``pfer_controlled=False`` so the caller can flag the degenerate regime.
+    Pass ``None`` to disable the cap.
+
     Returns a dict with ``K``, ``pi``, ``score``, ``gamma``, ``n_candidates``,
     ``n_resamples``, ``n_stably_selected``, ``selection_counts`` (id → count at
-    ``K``), and ``pfer`` — the Meinshausen–Bühlmann per-family error-rate upper
+    ``K``), ``pfer`` — the Meinshausen–Bühlmann per-family error-rate upper
     bound ``E[V] ≤ K² / ((2π−1)·N)`` (rigorous under ⌊n/2⌋ subsampling; an
-    approximate guide under bootstrap resampling). Returns ``None`` when there
-    are too few candidates or resamples to calibrate.
+    approximate guide under bootstrap resampling) — and ``pfer_controlled``.
+    Returns ``None`` when there are too few candidates or resamples to calibrate.
     """
     import math
 
@@ -494,7 +502,8 @@ def calibrate_stability_selection(
         return None
 
     k_max = min(max(len(r) for r in rankings), N)
-    best: dict | None = None
+    best: dict | None = None  # best score among PFER-controlled configs
+    best_any: dict | None = None  # best score overall (fallback)
     for K in range(1, k_max + 1):
         counts: dict = {}
         for r in rankings:
@@ -522,21 +531,28 @@ def calibrate_stability_selection(
                 + n_se * math.log(p_low)
                 + n_us * math.log(p_mid)
             )
-            if best is None or score > best["score"]:
-                pfer = (
-                    (K * K) / ((2.0 * pi - 1.0) * N)
-                    if pi > 0.5
-                    else float("inf")
-                )
-                best = {
-                    "K": int(K),
-                    "pi": float(pi),
-                    "score": float(score),
-                    "gamma": float(gamma),
-                    "n_candidates": int(N),
-                    "n_resamples": int(B),
-                    "n_stably_selected": int(n_ss),
-                    "selection_counts": dict(counts),
-                    "pfer": float(pfer),
-                }
-    return best
+            pfer = (K * K) / ((2.0 * pi - 1.0) * N) if pi > 0.5 else float("inf")
+            cand = {
+                "K": int(K),
+                "pi": float(pi),
+                "score": float(score),
+                "gamma": float(gamma),
+                "n_candidates": int(N),
+                "n_resamples": int(B),
+                "n_stably_selected": int(n_ss),
+                "selection_counts": dict(counts),
+                "pfer": float(pfer),
+            }
+            if best_any is None or score > best_any["score"]:
+                best_any = cand
+            if (max_pfer is None or pfer <= max_pfer) and (
+                best is None or score > best["score"]
+            ):
+                best = cand
+    if best is not None:
+        best["pfer_controlled"] = True
+        return best
+    if best_any is not None:
+        best_any["pfer_controlled"] = False
+        return best_any
+    return None

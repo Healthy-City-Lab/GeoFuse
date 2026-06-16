@@ -23,7 +23,7 @@ from rasterio.transform import from_origin, rowcol, xy
 from scipy.stats import pearsonr, spearmanr
 from shapely.geometry import box
 from sklearn.metrics import mean_squared_error, mutual_info_score, r2_score
-from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.model_selection import train_test_split
 
 from . import (
     cgi_formulas,
@@ -218,6 +218,7 @@ class MetricFusionEngine:
         cache_dir: str = "output_results/fusion_cache",
         cgi_formula: str = WEIGHTED_AVERAGE,
         covariate_columns: list[str] | None = None,
+        covariate_types: dict[str, str] | None = None,
         longitudinal_spec: longitudinal.LongitudinalSpec | None = None,
         cgi_grid_spacing_m: float | None = None,
         whole_grid_scaling: bool = False,
@@ -328,13 +329,13 @@ class MetricFusionEngine:
         self.cgi_formula = cgi_formula
         cgi_formulas.get_formula(cgi_formula)
 
-        # Greenery channel for the active study. ``cgi`` runs the combined
+        # Greenery channel for the active search. ``cgi`` runs the combined
         # formula (the standard fusion behaviour); ``veg`` / ``terrain`` /
-        # ``ndvi`` run a standalone single-metric study that uses that
+        # ``ndvi`` run a standalone single-metric search that uses that
         # channel's normalised value directly as the greenery value and
-        # searches only its radius + aggregation. Set per call by
-        # ``optimize_fusion``; ``evaluate_on_test`` reads it so the held-out
-        # test score stays aligned with what the study actually scored.
+        # searches only its radius + aggregation. Set per call by the runner
+        # before each stability search; ``evaluate_on_test`` reads it so the
+        # held-out test score stays aligned with what the search scored.
         self._active_greenery_channel: str = "cgi"
 
         # Covariate columns are stashed on self; per-row values are carried into
@@ -344,6 +345,18 @@ class MetricFusionEngine:
         # correlation / incremental-R² OLS.
         cov_in = list(covariate_columns) if covariate_columns else []
         self.covariate_columns: list[str] = list(dict.fromkeys(cov_in))
+        # Per-covariate kind: ``"numeric"`` (default) or ``"categorical"``.
+        # Categorical columns are one-hot expanded (drop-first) onto the target
+        # frame at prepare time and their dummy columns replace the original name
+        # in ``covariate_columns``. ``_covariate_dummy_map`` records original →
+        # dummy names for reporting; ``_covariate_columns_user`` keeps the
+        # user-facing names. Defaults make every covariate numeric (legacy).
+        self.covariate_types: dict[str, str] = {
+            k: str(v).lower() for k, v in (covariate_types or {}).items()
+        }
+        self._covariate_columns_user: list[str] = list(self.covariate_columns)
+        self._covariate_dummy_map: dict[str, list[str]] = {}
+        self._covariates_expanded: bool = False
 
         # Spatial-confounding adjustment. ``none`` keeps the plain covariate-
         # residualized objective. ``ks_aic`` / ``spatial_plus`` fold a low-rank
@@ -424,13 +437,12 @@ class MetricFusionEngine:
         self.veg_data = None  # Vegetation component (GVI vegetation)
         self.terrain_data = None  # Terrain component (GVI terrain)
         self.ndvi_data = None  # NDVI satellite data
-        self.train_val_data = None  # Data for k-fold CV
+        self.train_val_data = None  # Train+val pool the bootstrap resamples
         self.test_data = None  # Held-out test set
-        self.cv_folds = None  # K-fold splits
-        self.study = None
+        self.cv_folds = None  # In-bag/OOB fold spliced in per bootstrap resample
+        self.study = None  # Per-resample Optuna study (set inside the bootstrap)
         self.best_params = None
         self.scaler = None
-        self.k_folds = 5  # Number of CV folds
 
         # Donut / ring cache: per-point annulus samples keyed by fold subset + indices
         self._ring_raster_cache: dict = {}
@@ -731,120 +743,71 @@ class MetricFusionEngine:
         channel_label: str,
         extra_margin_m: float = 100.0,
     ):
-        """Trim a metric source to the target's buffered extent + a margin.
+        """Trim a *vector* metric source to the target's buffered extent.
 
-        For a small study area, most of a national-scale NDVI / GVI source
-        is dead weight: it's never queried because no entity's buffer
-        reaches it. Cropping once at load time shrinks RAM, sindex build
-        time (vector), and per-window read latency (raster) without
-        changing any aggregation values.
+        For a small study area, most of a national-scale source is dead
+        weight: it's never queried because no entity's buffer reaches it.
+        Cropping a vector source at load time shrinks RAM and sindex build
+        time without changing any aggregation values.
 
-        The crop box = the target's pre-computed ``buffered_extent``
-        (already buffered by ``buffer_meters`` = max(GVI, NDVI) at job
-        submit) plus a small ``extra_margin_m`` slack so floating-point
-        corner cases don't accidentally drop pixels at the very edge.
+        Raster metrics are **not** cropped: they're sampled through small
+        per-entity windowed reads (``LazyRasterArray`` / windowed slices), so
+        a cropped in-memory copy buys nothing and, for a national-scale grid,
+        can be hundreds of GB. The raster dict is returned unchanged after a
+        cheap, read-free overlap check that warns on a CRS / extent mismatch.
 
-        Vector metrics are spatially filtered to features intersecting
-        the crop polygon. Raster metrics get a windowed read covering the
-        crop bbox; the returned dict has the same keys as ``load_metrics``
-        produces, with updated ``data`` / ``transform`` / ``width`` /
-        ``height`` / ``bounds``. Returns the input unchanged when
-        ``self.buffered_extent`` isn't yet available.
+        The vector crop box = the target's pre-computed ``buffered_extent``
+        (already buffered by ``buffer_meters`` = max(GVI, NDVI) at job submit)
+        plus a small ``extra_margin_m`` slack. Returns the input unchanged
+        when ``self.buffered_extent`` isn't yet available.
         """
         if self.buffered_extent is None or metric_data is None:
             return metric_data
 
-        if isinstance(metric_data, dict):  # raster
-            from rasterio.windows import Window as _Window
-            from rasterio.windows import transform as _window_transform
-
-            raster_crs = metric_data["crs"]
+        if isinstance(metric_data, dict):  # raster — sampled lazily, not cropped
+            # No materialization: downstream reads small per-entity windows
+            # from disk (LazyRasterArray). Run only a cheap, read-free sanity
+            # check on the reprojected extent so a CRS / extent mismatch is
+            # flagged loudly instead of silently sampling the wrong pixels.
             try:
-                extent_in_raster_crs = self.buffered_extent.to_crs(raster_crs)
-                if getattr(extent_in_raster_crs.crs, "is_geographic", False):
-                    metric_crs_buf = estimate_metre_projected_crs_for_gdf(
-                        extent_in_raster_crs
-                    )
-                    crop_in_raster = (
-                        extent_in_raster_crs.to_crs(metric_crs_buf)
-                        .buffer(extra_margin_m)
-                        .to_crs(raster_crs)
-                    )
-                else:
-                    crop_in_raster = extent_in_raster_crs.buffer(extra_margin_m)
-            except Exception:
-                crop_in_raster = self.buffered_extent.to_crs(raster_crs)
-            minx, miny, maxx, maxy = crop_in_raster.total_bounds
-            transform = metric_data["transform"]
-            h_full = metric_data.get("height") or (
-                metric_data["data"].shape[0]
-                if hasattr(metric_data["data"], "shape")
-                else None
-            )
-            w_full = metric_data.get("width") or (
-                metric_data["data"].shape[1]
-                if hasattr(metric_data["data"], "shape")
-                else None
-            )
-            if h_full is None or w_full is None:
-                return metric_data
-            from rasterio.transform import rowcol
-
-            r1, c1 = rowcol(transform, minx, maxy)
-            r2, c2 = rowcol(transform, maxx, miny)
-            rmin = max(0, min(int(r1), int(r2)))
-            rmax = min(int(h_full), max(int(r1), int(r2)) + 1)
-            cmin = max(0, min(int(c1), int(c2)))
-            cmax = min(int(w_full), max(int(c1), int(c2)) + 1)
-            if rmin >= rmax or cmin >= cmax:
-                _log(
-                    "WARN",
-                    f"{channel_label}: cropped raster window is empty — target "
-                    "extent does not overlap the metric raster. Leaving full "
-                    "raster in place.",
+                raster_crs = metric_data["crs"]
+                bounds = metric_data.get("bounds")
+                minx, miny, maxx, maxy = (
+                    float(v)
+                    for v in self.buffered_extent.to_crs(raster_crs).total_bounds
                 )
-                return metric_data
-            new_h = rmax - rmin
-            new_w = cmax - cmin
-            if new_h == h_full and new_w == w_full:
-                return metric_data  # already fits the target
-            arr = metric_data["data"]
-            cropped = arr[rmin:rmax, cmin:cmax]
-            cropped = np.ma.MaskedArray(
-                np.asarray(np.ma.getdata(cropped)),
-                mask=np.ma.getmaskarray(cropped),
-            )
-            new_transform = _window_transform(
-                _Window(cmin, rmin, new_w, new_h), transform
-            )
-            saved_pct = 100.0 * (1.0 - (new_h * new_w) / (h_full * w_full))
-            _log(
-                "INFO",
-                f"{channel_label}: raster cropped to target extent "
-                f"({h_full:,}×{w_full:,} → {new_h:,}×{new_w:,} px, "
-                f"~{saved_pct:.1f}% memory saved).",
-            )
-            # Recompute bounds from the new window so downstream code that
-            # reads them sees the cropped footprint, not the original.
-            from rasterio.coords import BoundingBox as _BBox
-
-            new_left = new_transform.c
-            new_top = new_transform.f
-            new_right = new_left + new_w * new_transform.a
-            new_bottom = new_top + new_h * new_transform.e
-            return {
-                "data": cropped,
-                "transform": new_transform,
-                "crs": raster_crs,
-                "bounds": _BBox(
-                    min(new_left, new_right),
-                    min(new_top, new_bottom),
-                    max(new_left, new_right),
-                    max(new_top, new_bottom),
-                ),
-                "width": new_w,
-                "height": new_h,
-            }
+                if bounds is not None and np.all(
+                    np.isfinite([minx, miny, maxx, maxy])
+                ):
+                    rl, rb, rr, rt = (
+                        float(bounds.left),
+                        float(bounds.bottom),
+                        float(bounds.right),
+                        float(bounds.top),
+                    )
+                    if maxx < rl or minx > rr or maxy < rb or miny > rt:
+                        _log(
+                            "WARN",
+                            f"{channel_label}: target extent does not overlap the "
+                            "metric raster — check the target / raster CRS.",
+                        )
+                    else:
+                        ix = max(0.0, min(maxx, rr) - max(minx, rl))
+                        iy = max(0.0, min(maxy, rt) - max(miny, rb))
+                        fx, fy = (rr - rl), (rt - rb)
+                        frac = (ix / fx) * (iy / fy) if fx > 0 and fy > 0 else 0.0
+                        if frac > 0.5:
+                            _log(
+                                "WARN",
+                                f"{channel_label}: the buffered target extent covers "
+                                f"~{frac * 100:.0f}% of the metric raster — a study "
+                                "area should be a small slice, so this likely means a "
+                                "target/raster CRS mismatch (sampled values would be "
+                                "wrong). Sampling proceeds via windowed reads.",
+                            )
+            except Exception:
+                pass
+            return metric_data
 
         # Vector path
         try:
@@ -2414,27 +2377,7 @@ class MetricFusionEngine:
                     f"covariate_columns={self.covariate_columns}."
                 )
             if self.target_gdf is not None:
-                missing = [
-                    c
-                    for c in self.covariate_columns
-                    if c not in self.target_gdf.columns
-                ]
-                if missing:
-                    raise ValueError(
-                        f"covariate_columns not found on target: {missing}. "
-                        f"Available numeric attribute columns: "
-                        f"{sorted(self.target_gdf.columns)}"
-                    )
-                non_numeric = [
-                    c
-                    for c in self.covariate_columns
-                    if not pd.api.types.is_numeric_dtype(self.target_gdf[c])
-                ]
-                if non_numeric:
-                    raise ValueError(
-                        "covariate_columns must be numeric for the regression-"
-                        f"based scorers; got non-numeric: {non_numeric}."
-                    )
+                self._expand_categorical_covariates()
 
         # Only the point/line per-pixel path dedups the cache to unique pixels;
         # reset here so a re-prepared study can't inherit a stale source.
@@ -4116,6 +4059,67 @@ class MetricFusionEngine:
             return out
         return pd.Series(v).groupby(pid).first().to_numpy()
 
+    def _expand_categorical_covariates(self) -> None:
+        """Validate covariates and one-hot expand the categorical ones in place.
+
+        Runs once on the full ``self.target_gdf`` (before any train/val/test
+        split) so the dummy columns are identical across splits and ride through
+        the carry → split → collapse flow as plain numeric controls. Each
+        categorical covariate is replaced in ``self.covariate_columns`` by its
+        drop-first dummy column names; numeric covariates are kept as-is. After
+        expansion, any covariate the user tagged numeric that isn't numeric is
+        rejected.
+        """
+        gdf = self.target_gdf
+        if gdf is None or not self._covariate_columns_user:
+            return
+
+        missing = [c for c in self._covariate_columns_user if c not in gdf.columns]
+        if missing:
+            raise ValueError(
+                f"covariate_columns not found on target: {missing}. "
+                f"Available attribute columns: {sorted(gdf.columns)}"
+            )
+
+        if not self._covariates_expanded:
+            expanded: list[str] = []
+            for c in self._covariate_columns_user:
+                if self.covariate_types.get(c) == "categorical":
+                    dummies = pd.get_dummies(
+                        gdf[c],
+                        prefix=c,
+                        prefix_sep="=",
+                        drop_first=True,
+                        dummy_na=False,
+                    ).astype(np.float64)
+                    if dummies.shape[1] == 0:
+                        _log(
+                            "WARN",
+                            f"Categorical covariate '{c}' has <2 levels after "
+                            "drop-first; dropping it.",
+                        )
+                        continue
+                    for dcol in dummies.columns:
+                        gdf[dcol] = dummies[dcol].to_numpy()
+                    self._covariate_dummy_map[c] = list(dummies.columns)
+                    expanded.extend(dummies.columns)
+                else:
+                    expanded.append(c)
+            self.covariate_columns = list(dict.fromkeys(expanded))
+            self._covariates_expanded = True
+
+        non_numeric = [
+            c
+            for c in self.covariate_columns
+            if not pd.api.types.is_numeric_dtype(gdf[c])
+        ]
+        if non_numeric:
+            raise ValueError(
+                "Numeric covariate columns must be numeric for the regression-"
+                f"based scorers; got non-numeric: {non_numeric}. Tag them as "
+                "categorical to one-hot encode instead."
+            )
+
     def _attach_entity_coords(
         self, fusion_df: pd.DataFrame, src_gdf: "gpd.GeoDataFrame"
     ) -> pd.DataFrame:
@@ -4748,57 +4752,37 @@ class MetricFusionEngine:
     def split_data(
         self,
         test_size: float = 0.2,
-        k_folds: int = 5,
         random_state: int = 42,
         fusion_df: pd.DataFrame | None = None,
-        single_split_val_ratio: float = 0.2,
         *,
-        outer_fold_idx: int | None = None,
-        n_outer_folds: int | None = None,
         spatial_split: bool = False,
         spatial_block_size_m: float | None = None,
         n_spatial_blocks: int | None = None,
     ) -> None:
-        """Carve a held-out test set, then build k inner CV folds (or one
-        single split) over the remainder.
+        """Carve a held-out test set and the train+val pool the bootstrap
+        stability search resamples.
 
-        Nested cross-validation: when ``outer_fold_idx`` and ``n_outer_folds``
-        are both set, the held-out test set is the ``outer_fold_idx``-th
-        partition of a stratified ``n_outer_folds``-fold split over the data
-        (group-aware when ``entity_id`` / ``polygon_id`` is present). Every
-        entity appears in test exactly once across the K calls, so the runner
-        can build an outer-CV-averaged prediction column with no leakage. When
-        the two args are ``None`` the original ``test_size``-based stratified
-        split is used (back-compat path for single-test-split runs).
+        Stability selection does its own complementary-half resampling of the
+        train+val pool (see :meth:`bootstrap_stability_selection`), so this
+        method only sets aside the untouched test split and the pool; it does
+        not build CV folds. The split is leakage-safe (groups stay together
+        when ``entity_id`` / ``polygon_id`` is present) and outcome-stratified,
+        with optional spatial blocking so the held-out test tiles the extent.
 
         Args:
-            test_size: Held-out fraction when ``outer_fold_idx`` is unset.
-                Ignored in nested-CV mode (the outer fold sets the test size
-                to ``≈ 1/n_outer_folds``).
-            k_folds: Inner CV folds within train+val. ``1`` (or ``0``) =
-                single stratified train/val split (``self.cv_folds`` becomes
-                length-1 and each trial fits one model).
-            random_state: RNG seed for reproducibility. In nested-CV mode
-                this must be held constant across all K outer-fold calls so
-                the K test partitions form a proper non-overlapping K-fold
-                partition over the data. Inner CV partitions still differ
-                per outer fold because they operate on a different train+val
-                subset each call.
-            single_split_val_ratio: When ``k_folds <= 1``, fraction of the
-                non-test subset used as validation in the single fit.
-            outer_fold_idx: 0-based index of the outer fold whose held-out
-                partition becomes the test set. Must be set together with
-                ``n_outer_folds``.
-            n_outer_folds: Total outer folds (typically 5-10). When set, the
-                test set is derived from a stratified K-fold partition; when
-                unset, the legacy ``test_size`` random split is used.
+            test_size: Held-out test fraction.
+            random_state: RNG seed for reproducibility.
+            fusion_df: Prepared fusion frame; built via
+                :meth:`prepare_fusion_data` when ``None``.
+            spatial_split: Stripe whole spatial blocks into the test set so it
+                tiles the full extent and no group straddles train and test.
+            spatial_block_size_m: Block edge length (metres) when blocking.
+            n_spatial_blocks: Target block count when blocking.
         """
         # Step 1: Sample all metrics at initial buffer distance
         logger.info("Step 1/4: Sampling metrics at point locations...")
         if fusion_df is None:
             fusion_df = self.prepare_fusion_data()
-        use_cv = k_folds > 1
-        self.k_folds = k_folds if use_cv else 1
 
         logger.info(f"Initial samples before filtering: {len(fusion_df)}")
 
@@ -4837,18 +4821,14 @@ class MetricFusionEngine:
 
             n_polys = len(poly_df)
             n_test_target = max(1, int(round(test_size * n_polys)))
-            n_trainval_target = n_polys - n_test_target
 
-            # Bin count constrained by: at least 2 groups per bin so each
-            # fold gets ≥1 group per class, and ≤ n_test_target so the test
-            # split can include every class.
+            # Bin count constrained by ``n_test_target`` so the test split can
+            # include every class (at least 2 groups per bin).
             max_bins_for_test = max(2, n_test_target)
-            max_bins_for_kfold = max(2, n_trainval_target // max(k_folds, 1))
             requested_bins = max(2, self.n_bins)
             n_bins_eff = min(
                 requested_bins,
                 max_bins_for_test,
-                max_bins_for_kfold,
                 max(2, poly_df["target"].nunique()),
             )
 
@@ -4872,20 +4852,14 @@ class MetricFusionEngine:
                 f"{'stratified' if stratifiable else f'unstratified — too few {group_label}s per bin'}).",
             )
 
-            # Nested-CV mode: the test set is one slice of a stratified
-            # K-fold partition over groups. Every group appears in test
-            # exactly once across the K outer-fold calls.
-            outer_cv_mode = outer_fold_idx is not None and n_outer_folds is not None
-
             # Optional spatial blocking: tag each group with a coarse grid
             # block so whole blocks — never split groups — can be striped
-            # across the held-out test and inner folds, spreading them over
-            # the full extent while keeping a block's catchments clear of its
-            # neighbours.
+            # across the held-out test, spreading it over the full extent
+            # while keeping a block's catchments clear of its neighbours.
             spatial_ok = False
             self._spatial_block_by_group = None
             self._spatial_block_group_col = None
-            if spatial_split and not outer_cv_mode:
+            if spatial_split:
                 resolved = self._resolve_group_block_ids(
                     poly_df[group_col].to_numpy(),
                     group_col,
@@ -4922,36 +4896,7 @@ class MetricFusionEngine:
                         "falling back to outcome-stratified split.",
                     )
 
-            if outer_cv_mode:
-                from sklearn.model_selection import KFold
-
-                assert n_outer_folds is not None and outer_fold_idx is not None
-                k_outer = max(2, int(n_outer_folds))
-                fold_i = max(0, min(int(outer_fold_idx), k_outer - 1))
-                if stratifiable and (
-                    poly_df["target_bin"].value_counts().min() >= k_outer
-                ):
-                    outer_splitter = StratifiedKFold(
-                        n_splits=k_outer, shuffle=True, random_state=random_state
-                    )
-                    outer_iter = list(
-                        outer_splitter.split(poly_df, poly_df["target_bin"])
-                    )
-                else:
-                    outer_splitter = KFold(
-                        n_splits=k_outer, shuffle=True, random_state=random_state
-                    )
-                    outer_iter = list(outer_splitter.split(poly_df))
-                tv_idx, te_idx = outer_iter[fold_i]
-                train_val_poly = poly_df.iloc[tv_idx].copy()
-                test_poly = poly_df.iloc[te_idx].copy()
-                _log(
-                    "INFO",
-                    f"Outer fold {fold_i + 1}/{k_outer}: "
-                    f"train+val={len(train_val_poly)} {group_label}s, "
-                    f"test={len(test_poly)} {group_label}s.",
-                )
-            elif spatial_ok:
+            if spatial_ok:
                 # Spatial single-split: assign whole blocks to the held-out
                 # test by even striping across the space-filling block order,
                 # so the test tiles the full extent and no group straddles
@@ -5037,145 +4982,11 @@ class MetricFusionEngine:
                 f"{len(test_poly)} test {group_label}s ({len(self.test_data)} rows).",
             )
 
+            # No CV folds — the bootstrap stability search resamples the pool
+            # itself. Reset the caches the resampler rebuilds per run.
             self.cv_folds = []
             self._spatial_basis_cache = {}
             self._spatial_adjust_summary = None
-            if use_cv and spatial_ok and "_block" in train_val_poly.columns:
-                # Spatial inner folds: stripe blocks across folds so each
-                # validation fold is spread over the extent and a block's
-                # groups never split across train and val.
-                ordered_tv_blocks = np.sort(train_val_poly["_block"].unique())
-                k_eff = max(2, min(k_folds, len(ordered_tv_blocks)))
-                self.k_folds = k_eff
-                rank_of_block = {b: i for i, b in enumerate(ordered_tv_blocks)}
-                fold_of_block = {b: rank_of_block[b] % k_eff for b in ordered_tv_blocks}
-                for fold_idx in range(1, k_eff + 1):
-                    vl_blocks = {b for b, f in fold_of_block.items() if f == fold_idx - 1}
-                    vl_polys = set(
-                        train_val_poly[train_val_poly["_block"].isin(vl_blocks)][
-                            group_col
-                        ]
-                    )
-                    tr_polys = set(train_val_poly[group_col]) - vl_polys
-                    train_fold = self.train_val_data[
-                        self.train_val_data[group_col].isin(tr_polys)
-                    ].copy()
-                    val_fold = self.train_val_data[
-                        self.train_val_data[group_col].isin(vl_polys)
-                    ].copy()
-                    self.cv_folds.append({"train": train_fold, "val": val_fold})
-                    logger.info(
-                        f"  Spatial fold {fold_idx}: train={len(tr_polys)} "
-                        f"{group_label}s ({len(train_fold)} rows), "
-                        f"val={len(vl_polys)} {group_label}s ({len(val_fold)} rows)"
-                    )
-                return
-            if use_cv:
-                # K-fold within train_val. Use stratified k-fold only if every bin
-                # has ≥k_folds groups; otherwise fall back to plain KFold.
-                from sklearn.model_selection import KFold
-
-                min_per_bin = (
-                    train_val_poly["target_bin"].value_counts().min()
-                    if stratifiable
-                    else 0
-                )
-                k_eff = max(2, min(k_folds, len(train_val_poly)))
-                if stratifiable and min_per_bin < k_folds:
-                    k_eff = max(2, min(k_folds, min_per_bin))
-                    _log(
-                        "WARN",
-                        f"Requested {k_folds}-fold CV but smallest outcome bin has "
-                        f"{min_per_bin} {group_label}s; reducing to {k_eff}-fold.",
-                    )
-                self.k_folds = k_eff
-
-                if stratifiable and min_per_bin >= k_eff:
-                    splitter = StratifiedKFold(
-                        n_splits=k_eff, shuffle=True, random_state=random_state
-                    )
-                    split_iter = splitter.split(
-                        train_val_poly, train_val_poly["target_bin"]
-                    )
-                else:
-                    splitter = KFold(
-                        n_splits=k_eff, shuffle=True, random_state=random_state
-                    )
-                    split_iter = splitter.split(train_val_poly)
-
-                for fold_idx, (tr_idx, vl_idx) in enumerate(split_iter, 1):
-                    tr_polys = set(train_val_poly.iloc[tr_idx][group_col])
-                    vl_polys = set(train_val_poly.iloc[vl_idx][group_col])
-                    train_fold = self.train_val_data[
-                        self.train_val_data[group_col].isin(tr_polys)
-                    ].copy()
-                    val_fold = self.train_val_data[
-                        self.train_val_data[group_col].isin(vl_polys)
-                    ].copy()
-
-                    # Per-channel scaling removed — folds keep raw channels;
-                    # the composite is normalized (when enabled) at scoring.
-                    self.cv_folds.append({"train": train_fold, "val": val_fold})
-                    logger.info(
-                        f"  Fold {fold_idx}: train={len(tr_polys)} polys "
-                        f"({len(train_fold)} rows), val={len(vl_polys)} polys "
-                        f"({len(val_fold)} rows)"
-                    )
-                return
-
-            # Single stratified train/val split at the group level. Same
-            # stratification logic as the test split above so val mirrors the
-            # outcome distribution; scaler fits on the single train slice.
-            if spatial_ok and "_block" in train_val_poly.columns:
-                rng_v = np.random.default_rng(random_state + 1)
-                ordered_tv_blocks = np.sort(train_val_poly["_block"].unique())
-                val_blocks = self._stripe_to_test_blocks(
-                    ordered_tv_blocks, single_split_val_ratio, rng_v
-                )
-                vl_polys = set(
-                    train_val_poly[train_val_poly["_block"].isin(val_blocks)][group_col]
-                )
-                tr_polys = set(train_val_poly[group_col]) - vl_polys
-                train_fold = self.train_val_data[
-                    self.train_val_data[group_col].isin(tr_polys)
-                ].copy()
-                val_fold = self.train_val_data[
-                    self.train_val_data[group_col].isin(vl_polys)
-                ].copy()
-                self.cv_folds.append({"train": train_fold, "val": val_fold})
-                logger.info(
-                    f"Spatial single train/val split: train={len(tr_polys)} "
-                    f"{group_label}s ({len(train_fold)} rows), val={len(vl_polys)} "
-                    f"{group_label}s ({len(val_fold)} rows)"
-                )
-                return
-            try:
-                train_poly, val_poly = train_test_split(
-                    train_val_poly,
-                    test_size=single_split_val_ratio,
-                    stratify=(train_val_poly["target_bin"] if stratifiable else None),
-                    random_state=random_state,
-                )
-            except ValueError:
-                train_poly, val_poly = train_test_split(
-                    train_val_poly,
-                    test_size=single_split_val_ratio,
-                    random_state=random_state,
-                )
-            tr_polys = set(train_poly[group_col])
-            vl_polys = set(val_poly[group_col])
-            train_fold = self.train_val_data[
-                self.train_val_data[group_col].isin(tr_polys)
-            ].copy()
-            val_fold = self.train_val_data[
-                self.train_val_data[group_col].isin(vl_polys)
-            ].copy()
-            self.cv_folds.append({"train": train_fold, "val": val_fold})
-            logger.info(
-                f"Single train/val split (no CV): train={len(tr_polys)} polys "
-                f"({len(train_fold)} rows), val={len(vl_polys)} polys "
-                f"({len(val_fold)} rows)"
-            )
             return
 
         # ── Row-level (point / raster) split ────────────────────────────────
@@ -5188,282 +4999,25 @@ class MetricFusionEngine:
             f"Created {fusion_df['target_bin'].nunique()} bins for stratification"
         )
 
-        # Step 4: Stratified split into train/val and test sets — nested-CV
-        # mode pulls test from one slice of a stratified K-fold partition;
-        # legacy single-split mode uses the ``test_size`` random split.
-        outer_cv_mode_rows = outer_fold_idx is not None and n_outer_folds is not None
-        if outer_cv_mode_rows:
-            from sklearn.model_selection import KFold
-
-            assert n_outer_folds is not None and outer_fold_idx is not None
-            k_outer = max(2, int(n_outer_folds))
-            fold_i = max(0, min(int(outer_fold_idx), k_outer - 1))
-            bins_series = fusion_df["target_bin"]
-            try:
-                outer_splitter = StratifiedKFold(
-                    n_splits=k_outer, shuffle=True, random_state=random_state
-                )
-                outer_iter = list(outer_splitter.split(fusion_df, bins_series))
-            except ValueError:
-                outer_splitter = KFold(
-                    n_splits=k_outer, shuffle=True, random_state=random_state
-                )
-                outer_iter = list(outer_splitter.split(fusion_df))
-            tv_idx, te_idx = outer_iter[fold_i]
-            self.train_val_data = fusion_df.iloc[tv_idx].copy()
-            self.test_data = fusion_df.iloc[te_idx].copy()
-            logger.info(
-                f"Outer fold {fold_i + 1}/{k_outer}: "
-                f"train+val={len(self.train_val_data)} rows, "
-                f"test={len(self.test_data)} rows."
-            )
-        else:
-            logger.info("Step 4/4: Performing stratified train/test split...")
-            self.train_val_data, self.test_data = train_test_split(
-                fusion_df,
-                test_size=test_size,
-                stratify=fusion_df["target_bin"],
-                random_state=random_state,
-            )
+        # Step 4: Stratified train/test split on ``test_size``.
+        logger.info("Step 4/4: Performing stratified train/test split...")
+        self.train_val_data, self.test_data = train_test_split(
+            fusion_df,
+            test_size=test_size,
+            stratify=fusion_df["target_bin"],
+            random_state=random_state,
+        )
 
         logger.info(
-            f"Split complete: {len(self.train_val_data)} train+val samples "
-            f"({k_folds if use_cv else 1} fold(s)), "
+            f"Split complete: {len(self.train_val_data)} train+val samples, "
             f"{len(self.test_data)} test samples (holdout)"
         )
 
+        # No CV folds — the bootstrap stability search resamples the pool
+        # itself. Reset the caches the resampler rebuilds per run.
         self.cv_folds = []
         self._spatial_basis_cache = {}
         self._spatial_adjust_summary = None
-
-        if use_cv:
-            logger.info(f"Creating {k_folds}-fold cross-validation splits...")
-            skf = StratifiedKFold(
-                n_splits=k_folds, shuffle=True, random_state=random_state
-            )
-            for fold_idx, (train_idx, val_idx) in enumerate(
-                skf.split(self.train_val_data, self.train_val_data["target_bin"]), 1
-            ):
-                train_fold = self.train_val_data.iloc[train_idx].copy()
-                val_fold = self.train_val_data.iloc[val_idx].copy()
-
-                # Per-channel scaling removed — folds keep raw channels.
-                self.cv_folds.append({"train": train_fold, "val": val_fold})
-
-                logger.info(
-                    f"  Fold {fold_idx}: {len(train_fold)} train, {len(val_fold)} val"
-                )
-            return
-
-        # Single stratified train/val split at the row level.
-        logger.info("Creating single train/val split (no CV)...")
-        try:
-            train_fold, val_fold = train_test_split(
-                self.train_val_data,
-                test_size=single_split_val_ratio,
-                stratify=self.train_val_data["target_bin"],
-                random_state=random_state,
-            )
-        except ValueError:
-            train_fold, val_fold = train_test_split(
-                self.train_val_data,
-                test_size=single_split_val_ratio,
-                random_state=random_state,
-            )
-        train_fold = train_fold.copy()
-        val_fold = val_fold.copy()
-        # Per-channel scaling removed — folds keep raw channels.
-        self.cv_folds.append({"train": train_fold, "val": val_fold})
-        logger.info(f"  Single split: {len(train_fold)} train, {len(val_fold)} val")
-
-    def optimize_fusion(
-        self,
-        n_trials: int = 300,
-        n_startup_trials: int = 150,
-        objective_metric: str = "distance_corr",
-        pruner_type: str = "median",
-        sampler_type: str = "TPE",
-        seed: int = 42,
-        show_progress: bool = True,
-        progress_callback: Callable[..., Any] | None = None,
-        study_name: str | None = None,
-        study_dir: str | None = None,
-        cancel_callback: Callable[[], bool] | None = None,
-        cgi_formula: str | None = None,
-        greenery_channel: str = "cgi",
-    ) -> dict:
-        """
-        Run Optuna optimization with k-fold cross-validation.
-
-        Args:
-            n_trials: Total optimization trials
-            n_startup_trials: Random exploration trials before the main optimizer
-            objective_metric: 'distance_corr', 'spearman', 'r2', 'nrmse', 'mutual_info'
-            pruner_type: 'median', 'hyperband', 'successive_halving', or None
-            sampler_type: 'TPE', 'CMA-ES', or 'Random'
-            seed: Random seed for reproducibility
-            show_progress: Whether to show progress bar
-            study_name: If set together with ``study_dir``, the study is persisted
-                to ``<study_dir>/<study_name>.db`` via Optuna's SQLite storage
-                backend. Re-running with the same name reloads completed trials
-                and runs only the remaining count.
-            study_dir: Output directory for the per-study SQLite file.
-
-        Returns:
-            Best parameters dictionary
-        """
-        if self.cv_folds is None:
-            raise ValueError("Call split_data() first")
-
-        # Expose cancel callback so _objective can prune long trials mid-fold.
-        self._cancel_callback = cancel_callback
-
-        # Per-call formula override falls back to the engine-level choice from
-        # ``__init__``. Validated here so a bad name fails before any Optuna
-        # state is touched. The active formula is stored on self so _objective
-        # / evaluate_on_test / apply_fusion all see the same value.
-        if cgi_formula is not None:
-            cgi_formulas.get_formula(cgi_formula)
-            self.cgi_formula = cgi_formula
-
-        # Greenery channel — ``cgi`` runs the formula; any other value (one of
-        # ``veg`` / ``terrain`` / ``ndvi``) runs a standalone single-metric
-        # study. Validated here; the value is stashed on self so _objective
-        # and evaluate_on_test see the same mode after this call returns.
-        if greenery_channel not in ("cgi", "veg", "terrain", "ndvi"):
-            raise ValueError(
-                f"greenery_channel must be one of 'cgi','veg','terrain','ndvi'; "
-                f"got {greenery_channel!r}."
-            )
-        self._active_greenery_channel = greenery_channel
-
-        # In longitudinal mode the scoring metric is authoritative on the
-        # spec — either one of the four ``mixedlm_*`` options (MixedLM
-        # scoring, default ``mixedlm_tstat``) or one of the cross-sectional
-        # OLS options (``distance_corr``/``spearman``/``r2``/``nrmse``/``mutual_info``)
-        # used when the spec exists only as a metric-file routing key (year-
-        # aware cross-sectional). Override whatever the caller passed so the
-        # scorer fork in ``_objective`` and ``evaluate_on_test`` sees the
-        # same metric the spec advertised.
-        if self.is_longitudinal:
-            spec = self.longitudinal_spec
-            assert spec is not None
-            if objective_metric != spec.scoring_metric:
-                logger.info(
-                    f"Longitudinal mode: overriding objective_metric "
-                    f"{objective_metric!r} with spec.scoring_metric "
-                    f"{spec.scoring_metric!r}."
-                )
-                objective_metric = spec.scoring_metric
-
-        self._clear_ring_caches()
-
-        # Build sampler
-        if sampler_type == "CMA-ES":
-            try:
-                import cmaes  # noqa: F401
-            except ImportError:
-                _log.warning(
-                    "CMA-ES sampler requested but the `cmaes` package is not "
-                    "installed; falling back to TPE. Install with "
-                    "`conda install -c conda-forge cmaes`."
-                )
-                sampler_type = "TPE"
-        if sampler_type == "CMA-ES":
-            sampler = CmaEsSampler(
-                n_startup_trials=n_startup_trials,
-                seed=seed,
-            )
-        elif sampler_type == "Random":
-            sampler = RandomSampler(seed=seed)
-        else:  # default: TPE
-            sampler = TPESampler(
-                n_startup_trials=n_startup_trials,
-                multivariate=False,
-                warn_independent_sampling=False,
-                seed=seed,
-            )
-
-        # Select pruner based on objective
-        if pruner_type == "median":
-            pruner = MedianPruner(n_startup_trials=n_startup_trials)
-        elif pruner_type == "hyperband":
-            pruner = HyperbandPruner()
-        elif pruner_type == "successive_halving":
-            pruner = SuccessiveHalvingPruner()
-        else:
-            pruner = None
-
-        # Determine optimization direction (nrmse is the only lower-is-better
-        # metric; correlation / R² / MI / mixedlm metrics all maximize).
-        direction = "minimize" if objective_metric == "nrmse" else "maximize"
-
-        # Create study — durable (SQLite RDB) when study_name + study_dir are
-        # set, otherwise in-memory.
-        if study_name and study_dir:
-            os.makedirs(study_dir, exist_ok=True)
-            storage_path = os.path.join(study_dir, f"{study_name}.db")
-            storage_url = f"sqlite:///{storage_path}"
-            self.study = optuna.create_study(
-                study_name=study_name,
-                storage=storage_url,
-                load_if_exists=True,
-                direction=direction,
-                sampler=sampler,
-                pruner=pruner,
-            )
-            completed = len(
-                [
-                    t
-                    for t in self.study.trials
-                    if t.state == optuna.trial.TrialState.COMPLETE
-                ]
-            )
-            remaining = max(0, int(n_trials) - completed)
-            logger.info(
-                f"Optuna study '{study_name}' loaded "
-                f"({completed} completed); running {remaining} more trial(s)."
-            )
-        else:
-            self.study = optuna.create_study(
-                direction=direction, sampler=sampler, pruner=pruner
-            )
-            remaining = int(n_trials)
-
-        # Run optimization
-        logger.info(
-            f"Starting {self.k_folds}-fold CV optimization: {n_trials} trials, "
-            f"{objective_metric} metric"
-        )
-
-        # Combined callback: progress + cancellation. Optuna invokes this after
-        # every trial finishes; calling ``study.stop()`` here ends the run at
-        # the next iteration boundary.
-        def optuna_callback(study, trial):
-            if cancel_callback is not None and cancel_callback():
-                logger.info(
-                    f"Cancellation requested — stopping study '{study.study_name}' "
-                    f"after trial {trial.number}."
-                )
-                study.stop()
-                return
-            if progress_callback:
-                progress_callback(trial.number + 1, n_trials)
-
-        if remaining > 0:
-            self.study.optimize(
-                lambda trial: self._objective(trial, objective_metric),
-                n_trials=remaining,
-                show_progress_bar=show_progress,
-                callbacks=[optuna_callback],
-            )
-
-        self.best_params = self.study.best_params
-        logger.info(
-            f"Optimization complete. Best {objective_metric} (CV avg): {self.study.best_value:.4f}"
-        )
-
-        return self.best_params
 
     def _suggest_gvi_radius(self, trial: optuna.Trial, name: str) -> int:
         lo, hi, step = _radius_int_bounds(
@@ -6034,110 +5588,6 @@ class MetricFusionEngine:
 
         # Return average validation score across folds
         return avg_val_score
-
-    def get_robust_trials(
-        self,
-        *,
-        val_p_threshold: float = 0.05,
-        consistency_tolerance: float = 0.1,
-        min_trials: int = 10,
-    ) -> list[optuna.Trial]:
-        """Pool of trials credible enough to enter top-X% selection.
-
-        Two-step gate, applied in this order:
-
-        1. **Train↔val consistency.** Drop trials whose ``|train_score −
-           val_score|`` exceeds ``consistency_tolerance``. Catches trials
-           that exploit val-set noise — these have high val |r| but the
-           train fit is much weaker, signalling a val-specific fluke.
-
-        2. **Validation significance.** When the metric produces a
-           p-value (Pearson / Spearman cross-sectional, MixedLM tstat or
-           coef longitudinal), drop trials with
-           ``val_pvalue_mean >= val_p_threshold``. The val partition is
-           independent of the optimizer's training target, so its p-value
-           is the right credibility gate.
-
-        Callers (``compute_averaged_top_params``, ``compute_subset_scores``)
-        rank the surviving pool by val score and take the top X %.
-        Ordering matters: filtering by significance first then ranking by
-        magnitude surfaces the strongest effects **among credible trials**,
-        rather than ranking everything by |r| (which is biased upward by
-        the best-of-N selection) and only then checking significance.
-
-        Args:
-            val_p_threshold: Validation p-value cutoff (correlation metrics
-                only). Trials at or above this are dropped.
-            consistency_tolerance: Maximum allowed ``|train − val|`` score
-                gap. Tighter values filter more aggressively.
-            min_trials: When fewer than this many trials survive both
-                gates, fall back to the top ``min_trials`` ranked by val
-                score, with a logged warning so the caller knows the
-                gates didn't bind.
-
-        Returns:
-            List of trials passing both gates (or the fallback top-N when
-            too few survive).
-        """
-        if self.study is None:
-            raise ValueError("Run optimization first")
-
-        completed_trials = [
-            t for t in self.study.trials if t.state == optuna.trial.TrialState.COMPLETE
-        ]
-        if not completed_trials:
-            logger.warning("No completed trials found")
-            return []
-
-        higher_is_better = self.study.direction.name == "MAXIMIZE"
-
-        # Step 1: consistency pre-filter applies to every metric.
-        consistent: list[optuna.Trial] = []
-        for trial in completed_trials:
-            train_score = trial.user_attrs.get("train_score_mean")
-            val_score = trial.user_attrs.get("val_score_mean")
-            if train_score is None or val_score is None:
-                continue
-            if abs(float(train_score) - float(val_score)) > consistency_tolerance:
-                continue
-            consistent.append(trial)
-
-        # Step 2: validation-p significance, only when the metric produces one.
-        has_pvals = any("val_pvalue_mean" in t.user_attrs for t in completed_trials)
-        if has_pvals:
-            robust_trials = [
-                t
-                for t in consistent
-                if t.user_attrs.get("val_pvalue_mean", 1.0) < val_p_threshold
-            ]
-            logger.info(
-                f"Found {len(robust_trials)} robust trials "
-                f"(consistency<={consistency_tolerance}, val p<{val_p_threshold})"
-            )
-        else:
-            robust_trials = consistent
-            logger.info(
-                f"Found {len(robust_trials)} consistent trials "
-                f"(tolerance={consistency_tolerance})"
-            )
-
-        if len(robust_trials) < min_trials:
-            logger.warning(
-                f"Only {len(robust_trials)} trials passed the credibility gates "
-                f"(< {min_trials}). Falling back to top {min_trials} by val score "
-                "— the headline numbers reflect this fallback, not a credible pool."
-            )
-            sorted_trials = sorted(
-                completed_trials,
-                key=lambda t: t.user_attrs.get(
-                    "val_score_mean",
-                    float("-inf") if higher_is_better else float("inf"),
-                ),
-                reverse=higher_is_better,
-            )
-            return sorted_trials[:min_trials]
-
-        return robust_trials
 
     def evaluate_on_test(
         self,
@@ -7254,24 +6704,28 @@ class MetricFusionEngine:
         self,
         params: dict,
         metric: str,
-        top_percent: float = 0.2,
     ) -> dict[str, dict[str, float | None]]:
-        """Score ``params`` on every data slice the optimizer saw.
+        """Score ``params`` on every data slice the stability run produced.
 
         Returns a dict of ``{subset: {score, pvalue, n}}`` for the four
-        canonical slices:
+        canonical slices. There is no train→fit→validate step — stability
+        selection resamples the train+val pool into complementary halves — so
+        ``train`` / ``val`` are *labels for continuity*, relabelled in-pool /
+        OOB in the results view:
 
-        - ``train`` / ``val`` — the per-fold means across the **top
-          ``top_percent`` of robust trials**, the same pool the composite
-          GeoTIFF is built from. Pulled from each trial's ``user_attrs``.
+        - ``train`` — the winning params scored on the full train+val pool
+          (an in-pool fit; the pool is what the bootstrap resamples).
+        - ``val`` — the winning cell's **median** out-of-bag score across the
+          complementary-half resamples (``__cell_median__``), a direct measure
+          of cross-resample predictive performance.
         - ``test`` — fresh test-set score by re-running
           :meth:`evaluate_on_test` with the supplied params.
         - ``all`` — composite applied to every entity (the full dataset)
           via :meth:`apply_fusion`, polygon-collapsed for polygon
           targets, scored against the per-entity outcome.
 
-        The runner caches the returned dict on each study's bundle so the
-        results UI doesn't re-score on every page rerun.
+        The runner caches the returned dict on the bundle so the results UI
+        doesn't re-score on every page rerun.
         """
         out: dict[str, dict[str, float | None]] = {}
 
@@ -7286,103 +6740,39 @@ class MetricFusionEngine:
             )
         )
 
-        if self.study is not None:
-            # Standard mode: train/val are the per-fold means across the
-            # top-K robust trials (the same pool the composite is built
-            # from).
-            try:
-                robust = self.get_robust_trials(
-                    val_p_threshold=0.05,
-                    consistency_tolerance=0.1,
-                    min_trials=10,
-                )
-            except Exception:
-                robust = []
-            if not robust:
-                robust = [
-                    t
-                    for t in self.study.trials
-                    if t.state == optuna.trial.TrialState.COMPLETE
-                ]
-            n_top = max(1, int(len(robust) * top_percent))
-            top_trials = sorted(
-                robust,
-                key=lambda t: t.value if t.value is not None else float("nan"),
-                reverse=(self.study.direction.name == "MAXIMIZE"),
-            )[:n_top]
-
-            def _mean_attr(name: str) -> float | None:
-                vals = [
-                    float(t.user_attrs.get(name))
-                    for t in top_trials
-                    if t.user_attrs.get(name) is not None
-                ]
-                return float(np.mean(vals)) if vals else None
-
-            # Standard mode: per-trial user_attrs only carry the partial
-            # (covariate-adjusted) score the objective optimized. To also
-            # surface a raw correlation, apply the averaged params to the
-            # train+val pool once and score without covariates — that's
-            # what ``score_raw`` represents below.
-            tv_both = self._score_data_subset(
-                data=self.train_val_data, params=params, metric=metric
-            )
-            out["train"] = {
-                "score": _mean_attr("train_score_mean"),
-                "score_raw": tv_both.get("score_raw"),
-                "pvalue": _mean_attr("train_pvalue_mean"),
-                "pvalue_raw": tv_both.get("pvalue_raw"),
-                "n": train_val_n,
-            }
-            out["val"] = {
-                "score": _mean_attr("val_score_mean"),
-                "score_raw": tv_both.get("score_raw"),
-                "pvalue": _mean_attr("val_pvalue_mean"),
-                "pvalue_raw": tv_both.get("pvalue_raw"),
-                "n": train_val_n,
-            }
-        else:
-            # Stability-selection mode: there's no per-trial study to read
-            # train/val means from. Surrogate mapping:
-            # * ``train`` → score on the full train+val pool with the
-            #   winning params (in-pool fit, the closest analogue to
-            #   "train" the paradigm has — the pool is what the bootstrap
-            #   draws from).
-            # * ``val`` → the cell-aggregation **median** OOB score
-            #   already recorded by ``bootstrap_stability_selection`` under
-            #   ``__cell_median__``. This is the per-bootstrap held-out
-            #   score averaged across all trials in the winning cell — a
-            #   direct measure of cross-resample predictive performance.
-            train_val_score = self._score_data_subset(
-                data=self.train_val_data, params=params, metric=metric
-            )
-            out["train"] = {
-                "score": train_val_score.get("score"),
-                "score_raw": train_val_score.get("score_raw"),
-                "pvalue": train_val_score.get("pvalue"),
-                "pvalue_raw": train_val_score.get("pvalue_raw"),
-                "n": train_val_n,
-            }
-            cell_median = (
-                params.get("__cell_median__") if isinstance(params, dict) else None
-            )
-            out["val"] = {
-                "score": (
-                    float(cell_median)
-                    if cell_median is not None and np.isfinite(float(cell_median))
-                    else None
-                ),
-                # ``val`` is the cell-median OOB score, which is computed
-                # by ``_objective`` with covariates configured on the
-                # engine — i.e. it's a partial-correlation analogue. No
-                # raw equivalent exists at this level because each
-                # bootstrap's OOB rows score with covariates always
-                # present.
-                "score_raw": None,
-                "pvalue": None,
-                "pvalue_raw": None,
-                "n": train_val_n,
-            }
+        # In-pool slice: the winning params scored on the full train+val pool
+        # (the closest analogue to "train" — the pool is what the bootstrap
+        # resamples).
+        train_val_score = self._score_data_subset(
+            data=self.train_val_data, params=params, metric=metric
+        )
+        out["train"] = {
+            "score": train_val_score.get("score"),
+            "score_raw": train_val_score.get("score_raw"),
+            "pvalue": train_val_score.get("pvalue"),
+            "pvalue_raw": train_val_score.get("pvalue_raw"),
+            "n": train_val_n,
+        }
+        # OOB slice: the winning cell's median out-of-bag score across the
+        # complementary-half resamples, recorded by
+        # ``bootstrap_stability_selection`` under ``__cell_median__`` — a
+        # cross-resample held-out measure. It's computed by ``_objective`` with
+        # covariates configured on the engine (a partial-correlation analogue),
+        # so there's no raw equivalent at this level.
+        cell_median = (
+            params.get("__cell_median__") if isinstance(params, dict) else None
+        )
+        out["val"] = {
+            "score": (
+                float(cell_median)
+                if cell_median is not None and np.isfinite(float(cell_median))
+                else None
+            ),
+            "score_raw": None,
+            "pvalue": None,
+            "pvalue_raw": None,
+            "n": train_val_n,
+        }
 
         # ── test: fresh evaluate_on_test with these params ────────────
         # ``evaluate_on_test`` returns the partial (covariate-adjusted)
@@ -7617,115 +7007,6 @@ class MetricFusionEngine:
             logger.warning(f"compute_covariate_impact failed: {exc}")
             return None
 
-    def _generate_all_optuna_plots(
-        self, study: optuna.Study, output_dir: str, study_name: str = "study"
-    ) -> None:
-        """Generate all available Optuna visualization plots for a study."""
-        try:
-            from optuna.visualization import (
-                plot_contour,
-                plot_edf,
-                plot_optimization_history,
-                plot_parallel_coordinate,
-                plot_param_importances,
-                plot_rank,
-                plot_slice,
-                plot_timeline,
-            )
-
-            os.makedirs(output_dir, exist_ok=True)
-            logger.info(f"Generating Optuna plots for {study_name} in {output_dir}")
-
-            # Get completed trials
-            completed_trials = [
-                t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE
-            ]
-
-            if len(completed_trials) == 0:
-                logger.warning(f"No completed trials for {study_name}")
-                return
-
-            # 1. Optimization History
-            try:
-                fig = plot_optimization_history(study)
-                fig.write_html(os.path.join(output_dir, "optimization_history.html"))
-            except Exception as e:
-                logger.warning(f"Could not generate optimization_history: {e}")
-
-            # 2. Parameter Importances
-            try:
-                fig = plot_param_importances(study)
-                fig.write_html(os.path.join(output_dir, "param_importances.html"))
-            except Exception as e:
-                logger.warning(f"Could not generate param_importances: {e}")
-
-            # 3. Parallel Coordinates (weights)
-            try:
-                fig = plot_parallel_coordinate(
-                    study, params=["veg_weight", "terrain_weight", "ndvi_weight"]
-                )
-                fig.update_layout(title_text=f"Parameter Weights - {study_name}")
-                fig.write_html(
-                    os.path.join(output_dir, "parallel_coordinates_weights.html")
-                )
-            except Exception as e:
-                logger.warning(f"Could not generate parallel_coordinates: {e}")
-
-            # 4. Parallel Coordinates (all params)
-            try:
-                fig = plot_parallel_coordinate(study)
-                fig.update_layout(title_text=f"All Parameters - {study_name}")
-                fig.write_html(
-                    os.path.join(output_dir, "parallel_coordinates_all.html")
-                )
-            except Exception as e:
-                logger.warning(f"Could not generate parallel_coordinates_all: {e}")
-
-            # 5. Slice Plot (weights)
-            try:
-                fig = plot_slice(
-                    study, params=["veg_weight", "terrain_weight", "ndvi_weight"]
-                )
-                fig.write_html(os.path.join(output_dir, "slice_plot_weights.html"))
-            except Exception as e:
-                logger.warning(f"Could not generate slice_plot: {e}")
-
-            # 6. Contour Plot (weights)
-            try:
-                fig = plot_contour(
-                    study, params=["veg_weight", "terrain_weight", "ndvi_weight"]
-                )
-                fig.write_html(os.path.join(output_dir, "contour_weights.html"))
-            except Exception as e:
-                logger.warning(f"Could not generate contour: {e}")
-
-            # 7. EDF (Empirical Distribution Function)
-            try:
-                fig = plot_edf(study)
-                fig.write_html(os.path.join(output_dir, "edf.html"))
-            except Exception as e:
-                logger.warning(f"Could not generate edf: {e}")
-
-            # 8. Rank Plot
-            try:
-                fig = plot_rank(study)
-                fig.write_html(os.path.join(output_dir, "rank.html"))
-            except Exception as e:
-                logger.warning(f"Could not generate rank: {e}")
-
-            # 9. Timeline
-            try:
-                fig = plot_timeline(study)
-                fig.write_html(os.path.join(output_dir, "timeline.html"))
-            except Exception as e:
-                logger.warning(f"Could not generate timeline: {e}")
-
-            logger.info(f"✓ Generated plots for {study_name}")
-
-        except ImportError as e:
-            logger.warning(f"Optuna visualization not available: {e}")
-            logger.warning("Install with: pip install optuna[visualization] plotly")
-
     def bootstrap_stability_selection(
         self,
         metric: str,
@@ -7775,15 +7056,17 @@ class MetricFusionEngine:
 
         * Snap each trial's weights to ``weight_bin_pct``-wide buckets via
           :func:`cgi_formulas.weight_cell_key`.
-        * Pool OOB scores per cell.
-        * Robust cell = the one with the best worst-quantile score
-          (``q_worst = quantile(scores, worst_quantile)`` for higher-is-
-          better metrics; ``quantile(scores, 1 - worst_quantile)`` for
-          lower-is-better metrics like RMSE) subject to ``count >=
+        * Pool OOB scores per cell and rank cells within each resample.
+        * Calibrate the selection size ``K`` and threshold ``π`` (Bodinier
+          et al.) and take the winning cell as the one with the highest
+          selection probability in the calibrated stable set, ties broken by
+          the worst-quantile OOB score (``q_worst = quantile(scores,
+          worst_quantile)`` for higher-is-better metrics; ``quantile(scores,
+          1 - worst_quantile)`` otherwise) subject to ``count >=
           min_cell_count``.
-        * Within the chosen cell, average all parameters using the same
-          renormalization logic as :meth:`compute_averaged_top_params` so the
-          output is drop-in compatible with downstream code.
+        * Within the chosen cell, snap + renormalize the winners' weights to
+          canonical integer steps so the output is drop-in compatible with the
+          composite/apply path.
 
         Args:
             metric: Scoring metric (any value supported by ``_objective``).
@@ -7816,14 +7099,15 @@ class MetricFusionEngine:
         that sub-cell, so the reported radii are a validated configuration
         rather than a mean across disagreeing trials.
 
-        Returns: averaged-params dict in the same shape as
-        :meth:`compute_averaged_top_params`, plus bookkeeping keys
+        Returns: a final-params dict (snapped weights, radii, stats) plus
+        bookkeeping keys
         ``__cell_q_worst__``, ``__cell_count__``, ``__cell_median__``,
         ``__cell_selection_probability__``, ``__n_bootstraps__``,
         ``__n_trials_per_bootstrap__``, ``__n_total_trials__``,
-        ``__worst_quantile__``, and stage-2 keys ``__radius_cell_q_worst__``,
+        ``__worst_quantile__``, stage-2 keys ``__radius_cell_q_worst__``,
         ``__radius_cell_median__``, ``__radius_cell_count__``,
-        ``__radius_bin_m__``, ``__radius_cell_stats__``.
+        ``__radius_bin_m__``, ``__radius_cell_stats__``, and the per-trial
+        ``__trial_history__`` table.
         """
         from statistics import mode
 
@@ -8254,12 +7538,15 @@ class MetricFusionEngine:
             candidates = [c for c in cell_stats if c["cell"] in stable_cells]
             if not candidates:
                 candidates = cell_stats
-            # Most consistently selected cell; ties broken by median OOB score.
+            # Most consistently selected cell; ties broken by worst-quantile
+            # OOB score so that, when selection probability saturates (every
+            # stable cell at 1.0), the winner is the most robust rather than
+            # the best typical-case cell.
             best = max(
                 candidates,
                 key=lambda c: (
                     c["selection_probability"],
-                    c["median"] if higher_is_better else -c["median"],
+                    c["q_worst"] if higher_is_better else -c["q_worst"],
                 ),
             )
             _log(
@@ -8348,9 +7635,9 @@ class MetricFusionEngine:
         )
 
         # ── Average params within the winning radius sub-cell ─────────────
-        # Re-uses the same renormalization rules as compute_averaged_top_params
-        # so downstream code (composite generation, report) can consume the
-        # output identically. ``formula`` was resolved up front (see above).
+        # Snap + renormalize the winners' weights to canonical integer steps so
+        # downstream code (composite generation, apply path) consumes them
+        # directly. ``formula`` was resolved up front (see above).
         winners = radius_best["records"]
 
         def _mean_int(name: str, default: int) -> int:
@@ -8495,6 +7782,9 @@ class MetricFusionEngine:
             final_params["__n_candidate_cells__"] = int(calib["n_candidates"])
             final_params["__n_stably_selected__"] = int(calib["n_stably_selected"])
             final_params["__pfer__"] = float(calib["pfer"])
+            final_params["__pfer_controlled__"] = bool(
+                calib.get("pfer_controlled", True)
+            )
         # Stage-2 (radius sub-cell) diagnostics: the spatial-tuning winner
         # within the chosen weight cell. ``__cell_*__`` above describe the
         # channel-mix decision; these describe the radii the final params
@@ -8520,26 +7810,25 @@ class MetricFusionEngine:
             }
             for c in ranked_radius[:10]
         ]
-        # Compatibility with downstream code that reads the field names
-        # ``compute_averaged_top_params`` populates.
-        final_params["__n_top_trials__"] = int(best["count"])
-        final_params["__n_robust_trials__"] = int(sum(c["count"] for c in cell_stats))
-
         # Diagnostics for the results UI: top-10 ranked cells (so the user
         # can see whether the winner is alone or part of a tight cluster of
         # similar regions) and the winner's OOB-score distribution (for a
         # histogram showing q_worst → median → max). These live under ``__``
         # keys so the "Final params" panel still strips them out, but the
         # raw bundle in the runner preserves them.
-        weight_keys = formula.weight_keys
+        # The stability cell keys on the main-component weights only (see
+        # ``cgi_formulas.weight_cell_key``), so map the cell tuple back through
+        # the main weight keys when reconstructing each cell's representative mix.
+        cell_weight_keys = formula.main_weight_keys
         # Rank the diagnostics table by the decision criterion — calibrated
-        # selection probability (median OOB breaks ties) — so the top row is
-        # the chosen winner; q_worst is shown alongside as a diagnostic.
+        # selection probability, with worst-quantile OOB breaking ties — so the
+        # top row is the chosen winner; median is shown alongside as a
+        # diagnostic.
         ranked = sorted(
             cell_stats,
             key=lambda c: (
                 c["selection_probability"],
-                c["median"] if higher_is_better else -c["median"],
+                c["q_worst"] if higher_is_better else -c["q_worst"],
             ),
             reverse=True,
         )
@@ -8547,7 +7836,7 @@ class MetricFusionEngine:
             {
                 "weights": {
                     k: int(c["cell"][i] * weight_bin_pct)
-                    for i, k in enumerate(weight_keys)
+                    for i, k in enumerate(cell_weight_keys)
                 },
                 "count": int(c["count"]),
                 "q_worst": float(c["q_worst"]),
@@ -8561,176 +7850,81 @@ class MetricFusionEngine:
         ]
         final_params["__per_bootstrap_summary__"] = per_bootstrap_summary
         final_params["__higher_is_better__"] = bool(higher_is_better)
-        return final_params
 
-    def compute_averaged_top_params(
-        self,
-        top_percent: float = 0.2,
-    ) -> dict[str, Any]:
-        """Return the ensemble-averaged params from the top X% of robust trials.
-
-        The composite GeoTIFF and the canonical "final parameters" reported
-        back to the user are both built from this average rather than from
-        the single best trial — averaging across the top of the robust
-        pool smooths out one-trial noise on the Optuna response surface
-        and keeps the composite stable across reruns.
-
-        Weights are averaged and renormalised to sum to 100 on the int
-        scale both formulas record on; powers stay as floats; per-channel
-        radii / percentiles take the integer mean; stat categoricals take
-        the mode.
-        """
-        from statistics import mode
-
-        if self.study is None:
-            raise ValueError(
-                "No optimization study available. Run optimize_fusion() first."
-            )
-
-        robust_trials = self.get_robust_trials(
-            val_p_threshold=0.05,
-            consistency_tolerance=0.1,
-            min_trials=10,
-        )
-        if not robust_trials:
-            robust_trials = [
-                t
-                for t in self.study.trials
-                if t.state == optuna.trial.TrialState.COMPLETE
-            ]
-        if not robust_trials:
-            raise ValueError("No completed trials available for ensemble averaging.")
-        n_top = max(1, int(len(robust_trials) * top_percent))
-        top_trials = sorted(
-            robust_trials,
-            key=lambda t: t.value,
-            reverse=(self.study.direction.name == "MAXIMIZE"),
-        )[:n_top]
-
-        formula = cgi_formulas.get_formula(self.cgi_formula)
-        radii_veg = [
-            t.params.get("veg_radius", int(round(self.gvi_buffer_max_m)))
-            for t in top_trials
-        ]
-        radii_ter = [
-            t.params.get("terrain_radius", int(round(self.gvi_buffer_max_m)))
-            for t in top_trials
-        ]
-        radii_ndvi = [
-            t.params.get("ndvi_radius", int(round(self.ndvi_buffer_max_m)))
-            for t in top_trials
-        ]
-        streetview_stats = [t.params.get("streetview_stat", "mean") for t in top_trials]
-        ndvi_stats = [t.params.get("ndvi_stat", "mean") for t in top_trials]
-        streetview_percentiles = [
-            t.params.get("streetview_percentile", 50) for t in top_trials
-        ]
-        ndvi_percentiles = [t.params.get("ndvi_percentile", 50) for t in top_trials]
-
-        # Snap averaged radii + percentiles to the cache grid so the
-        # composite-map lookup hits cached cells.
-        gvi_radii, ndvi_radii = self._preaggr_radii()
-        gvi_choices = np.asarray(gvi_radii) if gvi_radii else None
-        ndvi_choices = np.asarray(ndvi_radii) if ndvi_radii else None
-
-        def _snap(value: float, choices: np.ndarray | None) -> int:
-            if choices is None or len(choices) == 0:
-                return int(round(value))
-            idx = int(np.argmin(np.abs(choices - value)))
-            return int(choices[idx])
-
-        pct_grid = np.asarray(preaggregation.PERCENTILES)
-
-        def _snap_pct(value: float) -> int:
-            idx = int(np.argmin(np.abs(pct_grid - value)))
-            return int(pct_grid[idx])
-
-        final_params: dict[str, Any] = {
-            "veg_radius": _snap(float(np.mean(radii_veg)), gvi_choices),
-            "terrain_radius": _snap(float(np.mean(radii_ter)), gvi_choices),
-            "ndvi_radius": _snap(float(np.mean(radii_ndvi)), ndvi_choices),
-            "streetview_stat": mode(streetview_stats),
-            "ndvi_stat": mode(ndvi_stats),
-            "streetview_percentile": _snap_pct(float(np.mean(streetview_percentiles))),
-            "ndvi_percentile": _snap_pct(float(np.mean(ndvi_percentiles))),
-        }
-        for power_key in formula.power_keys:
-            final_params[power_key] = float(
-                np.mean([t.params.get(power_key, 1.0) for t in top_trials])
-            )
-        avg_weights = {
-            k: float(np.mean([t.params.get(k, 0.0) for t in top_trials]))
-            for k in formula.weight_keys
-        }
-        weight_sum = sum(avg_weights.values())
-        if weight_sum > 0:
-            scale = 100.0 / weight_sum
-            for k, v in avg_weights.items():
-                final_params[k] = int(round(v * scale))
-        else:
-            for k in avg_weights:
-                final_params[k] = 0
-            # Standalone mode: force the active channel's weight to 100
-            # so the composite uses that channel only.
-            ch = getattr(self, "_active_greenery_channel", "cgi") or "cgi"
-            channel_to_keys = {
-                "veg": ("veg_weight", "w_veg"),
-                "terrain": ("terrain_weight", "w_ter"),
-                "ndvi": ("ndvi_weight", "w_ndvi"),
+        # Per-trial history: every completed trial across all subsamples, with
+        # its resample id, OOB score, snapped weight cell, flattened weights /
+        # radii, and whether the trial's cell was in that resample's calibrated
+        # top-K. This is the stability-selection analogue of an Optuna trial
+        # log — a tidy table the results UI renders (OOB spread per resample,
+        # cell-selection frequency, weight×score) and the MixedLM post-scoring
+        # re-scores from. Cells are stored as lists so the bundle stays
+        # JSON-serializable.
+        k_for_top = int(calib["K"]) if calib is not None else None
+        top_cells_by_bs: dict[int, set] = {}
+        for bs, cellmap in by_bootstrap.items():
+            rep = {
+                cell: (max(s) if higher_is_better else min(s))
+                for cell, s in cellmap.items()
             }
-            for candidate in channel_to_keys.get(ch, ()):
-                if candidate in avg_weights:
-                    final_params[candidate] = 100
-                    break
-        final_params["__n_top_trials__"] = int(n_top)
-        final_params["__n_robust_trials__"] = int(len(robust_trials))
+            order = sorted(rep, key=lambda c: rep[c], reverse=higher_is_better)
+            k = (
+                k_for_top
+                if k_for_top is not None
+                else max(1, int(len(order) * top_percent_per_bootstrap))
+            )
+            top_cells_by_bs[bs] = set(order[:k])
+        trial_history: list[dict] = []
+        for r in records:
+            row: dict[str, Any] = {
+                "bootstrap": int(r["bootstrap"]),
+                "oob_score": float(r["oob_score"]),
+                "cell": [int(x) for x in r["cell"]],
+                "in_top_k": bool(
+                    r["cell"] in top_cells_by_bs.get(r["bootstrap"], set())
+                ),
+            }
+            # Full per-trial params (weights, radii, stats, percentiles,
+            # powers) so the history both drives the UI panels and can be
+            # re-scored by the MixedLM post-scoring without re-running the
+            # search.
+            for pk, pv in r["params"].items():
+                row[pk] = pv
+            trial_history.append(row)
+        final_params["__trial_history__"] = trial_history
+        final_params["__winning_cell__"] = [int(x) for x in best["cell"]]
         return final_params
 
     def generate_composite_greenery_map(
         self,
         output_path: str = "output_results/composite_greenery.tif",
-        top_percent: float = 0.2,
         progress_callback: Callable[..., Any] | None = None,
     ) -> str:
-        """
-        Generate final composite greenery map using averaged parameters from top robust trials.
+        """Render the composite greenery map from the stability-selected params.
 
-        Takes top 20% of robust trials, averages their parameters, and generates a composite
-        greenery raster matching the target grid (if raster input) or 50m grid (if geojson input).
+        Builds a composite greenery raster matching the target grid (if raster
+        input) or the CGI grid (if vector input) using the winning weight cell's
+        averaged parameters that ``bootstrap_stability_selection`` pinned on
+        ``self.best_params``.
 
         Args:
             output_path: Path to save the composite greenery GeoTIFF
-            top_percent: Top percentage of robust trials to average (default: 0.2 = 20%)
             progress_callback: Optional callback(current, total) for progress updates
 
         Returns:
             Path to the saved composite greenery map
         """
-        logger.info("Generating composite greenery map from top robust trials...")
+        logger.info("Generating composite greenery map from stability-selected params...")
 
         if progress_callback:
             progress_callback(0, 100)
 
-        # Source the final params from whichever selection path the run used:
-        # * normal mode → averaged top-X % of robust trials from ``self.study``
-        # * stability-selection mode → the cell-winner already pinned on
-        #   ``self.best_params`` (bootstrap_stability_selection has no master
-        #   study so ``compute_averaged_top_params`` would raise).
-        if self.study is None:
-            if self.best_params is None:
-                raise ValueError(
-                    "Composite generation needs either a study to average from "
-                    "or ``self.best_params`` set by a prior selection step."
-                )
-            final_params = dict(self.best_params)
-            logger.info(f"Composite TIFF stability-selected params: {final_params}")
-        else:
-            final_params = self.compute_averaged_top_params(top_percent=top_percent)
-            logger.info(
-                f"Composite TIFF averaged params (top {top_percent*100:.0f}% of "
-                f"{final_params['__n_robust_trials__']} robust trials, "
-                f"n_top={final_params['__n_top_trials__']}): {final_params}"
+        if self.best_params is None:
+            raise ValueError(
+                "Composite generation needs ``self.best_params`` set by a prior "
+                "stability-selection step."
             )
+        final_params = dict(self.best_params)
+        logger.info(f"Composite TIFF stability-selected params: {final_params}")
         formula = cgi_formulas.get_formula(self.cgi_formula)
 
         if progress_callback:
@@ -9014,36 +8208,24 @@ class MetricFusionEngine:
 
         # Save parameters used. The double-underscore book-keeping keys carry
         # the selection diagnostics; everything else is the user-facing final
-        # params the composite was built from. The recorded provenance adapts
-        # to the selection path: stability selection reports the winning-cell
-        # diagnostics, the legacy averaging path reports the trial counts.
+        # params the composite was built from.
         params_path = output_path.replace(".tif", "_params.json")
         import json
 
         clean_params = {k: v for k, v in final_params.items() if not k.startswith("__")}
-        if self.study is None:
-            provenance = {
-                "selection_method": "bootstrap_stability_selection",
-                "cell_q_worst": final_params.get("__cell_q_worst__"),
-                "cell_median": final_params.get("__cell_median__"),
-                "cell_count": final_params.get("__cell_count__"),
-                "cell_selection_probability": final_params.get(
-                    "__cell_selection_probability__"
-                ),
-                "worst_quantile": final_params.get("__worst_quantile__"),
-                "n_bootstraps": final_params.get("__n_bootstraps__"),
-                "n_trials_per_bootstrap": final_params.get(
-                    "__n_trials_per_bootstrap__"
-                ),
-                "n_total_trials": final_params.get("__n_total_trials__"),
-            }
-        else:
-            provenance = {
-                "selection_method": "averaged_top_robust_trials",
-                "n_trials_averaged": int(final_params.get("__n_top_trials__", 0)),
-                "total_robust_trials": int(final_params.get("__n_robust_trials__", 0)),
-                "top_percent": top_percent,
-            }
+        provenance = {
+            "selection_method": "bootstrap_stability_selection",
+            "cell_q_worst": final_params.get("__cell_q_worst__"),
+            "cell_median": final_params.get("__cell_median__"),
+            "cell_count": final_params.get("__cell_count__"),
+            "cell_selection_probability": final_params.get(
+                "__cell_selection_probability__"
+            ),
+            "worst_quantile": final_params.get("__worst_quantile__"),
+            "n_bootstraps": final_params.get("__n_bootstraps__"),
+            "n_trials_per_bootstrap": final_params.get("__n_trials_per_bootstrap__"),
+            "n_total_trials": final_params.get("__n_total_trials__"),
+        }
         with open(params_path, "w") as f:
             json.dump(
                 {"final_parameters": clean_params, **provenance},
@@ -9056,387 +8238,3 @@ class MetricFusionEngine:
 
         return output_path
 
-    def generate_results_report(
-        self,
-        output_dir: str = "output_results/fusion/study_results",
-        include_plots: bool = True,
-        progress_callback: Callable[..., Any] | None = None,
-        composite_path: str | None = None,
-    ) -> dict[str, Any] | None:
-        """
-        Generate comprehensive optimization results report with visualizations.
-
-        Creates reports similar to CGI.ipynb including:
-        - Separate analysis for ROBUST trials (main focus) and ALL trials (debugging)
-        - Trial history plots for both studies
-        - Parameter importance analysis
-        - Parallel coordinates visualization
-        - Best trial summary
-        - Test set evaluation
-        - Composite greenery map generation
-
-        Args:
-            output_dir: Directory to save reports and plots
-            include_plots: Whether to generate and save visualization plots
-            progress_callback: Optional callback for progress updates
-
-        Returns:
-            The ensemble-averaged top-20% parameter dict that was used to
-            build the composite GeoTIFF, or ``None`` when no completed
-            trials exist (warning is logged).
-        """
-        import json
-        from datetime import datetime
-
-        if self.study is None:
-            raise ValueError(
-                "No optimization study available. Run optimize_fusion() first."
-            )
-
-        os.makedirs(output_dir, exist_ok=True)
-        logger.info(f"Generating results report in {output_dir}")
-
-        if progress_callback:
-            progress_callback(0, 100)
-
-        # Get completed trials
-        all_completed_trials = [
-            t for t in self.study.trials if t.state == optuna.trial.TrialState.COMPLETE
-        ]
-
-        if len(all_completed_trials) == 0:
-            logger.warning("No completed trials to report on")
-            return
-
-        if progress_callback:
-            progress_callback(5, 100)
-
-        # ═══ GET ROBUST TRIALS ═══
-        logger.info("Extracting robust trials (val-p + train-val consistency)...")
-        robust_trials = self.get_robust_trials(
-            val_p_threshold=0.05,
-            consistency_tolerance=0.1,
-            min_trials=10,
-        )
-
-        logger.info(
-            f"Found {len(robust_trials)} robust trials out of {len(all_completed_trials)} total"
-        )
-
-        if not robust_trials:
-            logger.warning(
-                "⚠ No robust trials found (all p-values > 0.05 after FDR correction)."
-            )
-            logger.warning(
-                "  Reports will be based on all trials. Consider relaxing p_threshold or check data quality."
-            )
-            robust_trials = all_completed_trials
-        else:
-            logger.info(
-                f"✓ Robust trials: {len(robust_trials)}/{len(all_completed_trials)} "
-                f"({len(robust_trials)/len(all_completed_trials)*100:.1f}%)"
-            )
-
-        if progress_callback:
-            progress_callback(10, 100)
-
-        # ═══ CREATE ROBUST TRIALS STUDY ═══
-        logger.info("=" * 80)
-        logger.info(
-            f"Creating SEPARATE Optuna study from {len(robust_trials)} robust trials..."
-        )
-        logger.info("This study will ONLY contain statistically significant trials")
-        logger.info("=" * 80)
-
-        # Create a new study containing only robust trials
-        robust_study = optuna.create_study(
-            direction=self.study.direction,
-            sampler=self.study.sampler,
-        )
-
-        # Add robust trials to the new study
-        trial_numbers_added = []
-        for trial in robust_trials:
-            robust_study.add_trial(trial)
-            trial_numbers_added.append(trial.number)
-
-        logger.info(f"✓ Robust study created with {len(robust_study.trials)} trials")
-        logger.info(
-            f"  Trial numbers: {sorted(trial_numbers_added)[:20]}..."
-        )  # Show first 20
-
-        if progress_callback:
-            progress_callback(15, 100)
-
-        # ═══════════════════════════════════════════════════════════════════
-        # PRIMARY ANALYSIS: ROBUST TRIALS ONLY
-        # ═══════════════════════════════════════════════════════════════════
-
-        robust_dir = os.path.join(output_dir, "robust_trials")
-        os.makedirs(robust_dir, exist_ok=True)
-
-        logger.info("=" * 80)
-        logger.info("GENERATING PRIMARY REPORT: ROBUST TRIALS ONLY")
-        logger.info(f"Study contains: {len(robust_study.trials)} trials (FILTERED)")
-        logger.info(f"Original study: {len(self.study.trials)} trials (FULL)")
-        logger.info("=" * 80)
-
-        report_lines = []
-        report_lines.append("=" * 80)
-        report_lines.append("FUSION OPTIMIZATION RESULTS - ROBUST TRIALS (PRIMARY)")
-        report_lines.append(
-            f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-        report_lines.append("=" * 80)
-        report_lines.append("")
-        report_lines.append(
-            "⚠ IMPORTANT: This report ONLY includes statistically significant trials"
-        )
-        report_lines.append("  (FDR-corrected p-value < 0.05)")
-        report_lines.append("")
-        report_lines.append(f"Original Study: {len(all_completed_trials)} trials")
-        report_lines.append(
-            f"Robust Trials (FILTERED): {len(robust_trials)} ({len(robust_trials)/len(all_completed_trials)*100:.1f}%)"
-        )
-        report_lines.append(
-            f"Excluded Trials: {len(all_completed_trials) - len(robust_trials)} (not statistically significant)"
-        )
-        report_lines.append("")
-        report_lines.append(
-            "This report focuses on statistically significant trials (FDR-corrected p<0.05)"
-        )
-        report_lines.append("")
-        report_lines.append(f"Original Study: {len(all_completed_trials)} trials")
-        report_lines.append(
-            f"Robust Trials: {len(robust_trials)} ({len(robust_trials)/len(all_completed_trials)*100:.1f}%)"
-        )
-        report_lines.append("")
-
-        # Best trial from robust trials
-        best_robust = robust_study.best_trial
-        report_lines.append(f"BEST ROBUST TRIAL (#{best_robust.number})")
-        report_lines.append("-" * 80)
-        report_lines.append(f"Best Value: {best_robust.value:.6f}")
-        report_lines.append("")
-        report_lines.append("Parameters:")
-        for key, val in best_robust.params.items():
-            report_lines.append(f"  {key}: {val}")
-        report_lines.append("")
-
-        # CV scores
-        report_lines.append("Cross-Validation Performance:")
-        if "train_score_mean" in best_robust.user_attrs:
-            report_lines.append(
-                f"  Train Score (mean): {best_robust.user_attrs['train_score_mean']:.6f}"
-            )
-            report_lines.append(
-                f"  Val Score (mean): {best_robust.user_attrs['val_score_mean']:.6f}"
-            )
-            report_lines.append(
-                f"  Val Score (std): {best_robust.user_attrs['val_score_std']:.6f}"
-            )
-
-        if "train_pvalue_mean" in best_robust.user_attrs:
-            report_lines.append(
-                f"  Train P-value (mean): {best_robust.user_attrs['train_pvalue_mean']:.6e}"
-            )
-            report_lines.append(
-                f"  Val P-value (mean): {best_robust.user_attrs['val_pvalue_mean']:.6e}"
-            )
-        report_lines.append("")
-
-        # Test set evaluation
-        if self.test_data is not None:
-            report_lines.append("TEST SET EVALUATION")
-            report_lines.append("-" * 80)
-            try:
-                test_results = self.evaluate_on_test(
-                    params=best_robust.params, return_predictions=False
-                )
-                report_lines.append(f"Test Score: {test_results['test_score']:.6f}")
-                if "test_pvalue" in test_results:
-                    report_lines.append(
-                        f"Test P-value: {test_results['test_pvalue']:.6e}"
-                    )
-                report_lines.append(f"Test Samples: {len(self.test_data)}")
-            except Exception as e:
-                report_lines.append(f"Test evaluation failed: {e}")
-        report_lines.append("")
-
-        # Top 10 robust trials
-        report_lines.append("TOP 10 ROBUST TRIALS")
-        report_lines.append("-" * 80)
-        sorted_robust = sorted(
-            robust_trials,
-            key=lambda t: t.value,
-            reverse=(robust_study.direction.name == "MAXIMIZE"),
-        )[:10]
-        report_lines.append(
-            f"{'Rank':<6} {'Trial':<8} {'Value':<12} {'P-val':<12} {'Veg%':<6} {'Ter%':<6} {'NDVI%':<6}"
-        )
-        report_lines.append("-" * 80)
-        for rank, trial in enumerate(sorted_robust, 1):
-            veg_w = trial.params.get("veg_weight", 0)
-            ter_w = trial.params.get("terrain_weight", 0)
-            ndvi_w = trial.params.get("ndvi_weight", 0)
-            pval = trial.user_attrs.get("train_pvalue_mean", np.nan)
-            report_lines.append(
-                f"{rank:<6} #{trial.number:<7} {trial.value:<12.6f} {pval:<12.4e} {veg_w:<6} {ter_w:<6} {ndvi_w:<6}"
-            )
-        report_lines.append("")
-
-        # Save robust trials report
-        robust_report_path = os.path.join(robust_dir, "optimization_report.txt")
-        with open(robust_report_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(report_lines))
-        logger.info(f"✓ Robust trials report saved: {robust_report_path}")
-
-        # Save best params
-        robust_params_path = os.path.join(robust_dir, "best_params.json")
-        with open(robust_params_path, "w") as f:
-            json.dump(best_robust.params, f, indent=2)
-
-        if progress_callback:
-            progress_callback(30, 100)
-        logger.info("GENERATING COMPREHENSIVE PLOTS FOR ROBUST TRIALS ONLY...")
-        logger.info(f"  (Based on {len(robust_study.trials)} filtered trials)")
-        self._generate_all_optuna_plots(
-            robust_study, robust_dir, study_name="Robust Trials"
-        )
-
-        if progress_callback:
-            progress_callback(50, 100)
-
-        # ═══════════════════════════════════════════════════════════════════
-        # SECONDARY ANALYSIS: ALL TRIALS (Debug Only)
-        # ═══════════════════════════════════════════════════════════════════
-
-        all_trials_dir = os.path.join(output_dir, "all_trials")
-        os.makedirs(all_trials_dir, exist_ok=True)
-
-        logger.info("=" * 80)
-        logger.info("GENERATING DEBUG REPORT: ALL TRIALS (INCLUDING NON-SIGNIFICANT)")
-        logger.info(f"Study contains: {len(self.study.trials)} trials (UNFILTERED)")
-        logger.info("=" * 80)
-
-        logger.info("Generating debug report: ALL trials...")
-
-        debug_lines = []
-        debug_lines.append("=" * 80)
-        debug_lines.append("FUSION OPTIMIZATION RESULTS - ALL TRIALS (DEBUG)")
-        debug_lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        debug_lines.append("=" * 80)
-        debug_lines.append("")
-        debug_lines.append("This report includes ALL trials for debugging purposes.")
-        debug_lines.append("Use 'robust_trials' folder for primary analysis.")
-        debug_lines.append("")
-        debug_lines.append(f"Total Trials: {len(self.study.trials)}")
-        debug_lines.append(f"Completed: {len(all_completed_trials)}")
-        debug_lines.append(
-            f"Pruned: {len([t for t in self.study.trials if t.state == optuna.trial.TrialState.PRUNED])}"
-        )
-        debug_lines.append(
-            f"Failed: {len([t for t in self.study.trials if t.state == optuna.trial.TrialState.FAIL])}"
-        )
-        debug_lines.append("")
-
-        best_all = self.study.best_trial
-        debug_lines.append(f"BEST TRIAL (#{best_all.number})")
-        debug_lines.append("-" * 80)
-        debug_lines.append(f"Best Value: {best_all.value:.6f}")
-        debug_lines.append(f"Parameters: {best_all.params}")
-        debug_lines.append("")
-
-        # Top 10 all trials
-        debug_lines.append("TOP 10 TRIALS")
-        debug_lines.append("-" * 80)
-        sorted_all = sorted(
-            all_completed_trials,
-            key=lambda t: t.value,
-            reverse=(self.study.direction.name == "MAXIMIZE"),
-        )[:10]
-        debug_lines.append(
-            f"{'Rank':<6} {'Trial':<8} {'Value':<12} {'Veg%':<6} {'Ter%':<6} {'NDVI%':<6}"
-        )
-        debug_lines.append("-" * 80)
-        for rank, trial in enumerate(sorted_all, 1):
-            veg_w = trial.params.get("veg_weight", 0)
-            ter_w = trial.params.get("terrain_weight", 0)
-            ndvi_w = trial.params.get("ndvi_weight", 0)
-            debug_lines.append(
-                f"{rank:<6} #{trial.number:<7} {trial.value:<12.6f} {veg_w:<6} {ter_w:<6} {ndvi_w:<6}"
-            )
-        debug_lines.append("")
-
-        all_report_path = os.path.join(all_trials_dir, "optimization_report.txt")
-        with open(all_report_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(debug_lines))
-        logger.info(f"✓ All trials debug report saved: {all_report_path}")
-
-        if progress_callback:
-            progress_callback(60, 100)
-
-        # Generate plots for all trials
-        if include_plots:
-            logger.info("Generating debug plots for ALL TRIALS (unfiltered)...")
-            logger.info(f"  (Based on {len(self.study.trials)} total trials)")
-            self._generate_all_optuna_plots(
-                self.study, all_trials_dir, study_name="All Trials (Debug)"
-            )
-
-        if progress_callback:
-            progress_callback(75, 100)
-
-        # ═══ PRINT SUMMARY TO CONSOLE ═══
-        print("\n" + "=" * 80)
-        print("OPTIMIZATION COMPLETE - SUMMARY")
-        print("=" * 80)
-        print(f"Total Trials: {len(all_completed_trials)}")
-        print(
-            f"Robust Trials (FDR p<0.05): {len(robust_trials)} ({len(robust_trials)/len(all_completed_trials)*100:.1f}%)"
-        )
-        print("")
-        print(f"BEST ROBUST TRIAL: #{best_robust.number} = {best_robust.value:.6f}")
-        print(f"  Parameters: {best_robust.params}")
-        print("")
-        print(f"Reports saved to: {output_dir}")
-        print(f"  ✓ PRIMARY (robust trials): {robust_dir}/")
-        print(f"  ✓ DEBUG (all trials):  : {best_robust.params}")
-        print("")
-        print(f"Reports saved to: {output_dir}")
-        print(f"  - PRIMARY: {robust_dir}/")
-        print(f"  - DEBUG:   {all_trials_dir}/")
-        print("=" * 80 + "\n")
-
-        if progress_callback:
-            progress_callback(85, 100)
-
-        # ═══ GENERATE COMPOSITE GREENERY MAP ═══
-        logger.info("Generating composite greenery map from top 20% robust trials...")
-        averaged_params: dict[str, Any] | None = None
-        try:
-            # Include the active greenery channel in the filename so
-            # standalone runs (veg / terrain / ndvi) don't overwrite the
-            # combined CGI composite TIFF. When the caller doesn't pass
-            # an explicit path, fall back to writing one directory above
-            # ``output_dir`` (legacy layout).
-            ch = getattr(self, "_active_greenery_channel", "cgi") or "cgi"
-            suffix = "" if ch == "cgi" else f"_{ch}"
-            if composite_path is None:
-                composite_path = os.path.join(
-                    output_dir, f"../composite_greenery{suffix}.tif"
-                )
-            self.generate_composite_greenery_map(
-                output_path=composite_path,
-                top_percent=0.2,
-                progress_callback=None,  # Nested progress not supported yet
-            )
-            averaged_params = self.compute_averaged_top_params(top_percent=0.2)
-        except Exception as e:
-            logger.warning(f"Could not generate composite greenery map: {e}")
-
-        if progress_callback:
-            progress_callback(100, 100)
-
-        logger.info("✓ Results report generation complete!")
-        return averaged_params

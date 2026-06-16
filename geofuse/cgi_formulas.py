@@ -60,6 +60,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import lru_cache
 
 import numpy as np
 import optuna
@@ -147,20 +148,84 @@ def bin_weight(value: int | float, bin_pct: int = WEIGHT_BIN_PCT) -> int:
     return min(b, max_bucket)
 
 
+def _snap_weight_buckets(
+    values: list[float], bin_pct: int = WEIGHT_BIN_PCT
+) -> tuple[int, ...]:
+    """Snap weights to integer ``bin_pct`` buckets that tile the simplex cleanly.
+
+    Weights are recorded on a finer (``WEIGHT_STEP_PCT``) grid than the cell
+    bucket width, so a plain ``floor`` scatters trials into ragged bucket-sums
+    (e.g. 9 *and* 10 for a 3-weight sum-100 simplex), inflating the cell count.
+    Largest-remainder rounding instead snaps the buckets so they sum to
+    ``round(sum/bin_pct)`` — the clean simplex tiling — making each distinct
+    main-mix correspond to exactly one cell.
+    """
+    if not values:
+        return ()
+    raw = [max(0.0, v) / bin_pct for v in values]
+    floors = [int(x) for x in raw]
+    target = int(round(sum(raw)))
+    rem = target - sum(floors)
+    if rem > 0:
+        order = sorted(range(len(raw)), key=lambda i: raw[i] - floors[i], reverse=True)
+        for i in order[:rem]:
+            floors[i] += 1
+    elif rem < 0:
+        order = sorted(range(len(raw)), key=lambda i: raw[i] - floors[i])
+        for i in order[: -rem]:
+            floors[i] = max(0, floors[i] - 1)
+    return tuple(floors)
+
+
 def weight_cell_key(
     formula: str, params: dict, bin_pct: int = WEIGHT_BIN_PCT
 ) -> tuple[int, ...]:
-    """Cell key from a trial's weight params for stability-selection counting.
+    """Cell key from a trial's main-component weights for stability selection.
 
-    Returns a tuple of bucketed weights ordered by the formula's
-    ``weight_keys``. Two trials map to the same cell iff every weight falls
-    in the same bucket. This keys the **first** stability-selection stage,
-    which judges the channel-mix decision; the spatial tuning (radii,
-    aggregators) is then judged within the winning weight cell by
-    :func:`radius_cell_key` in the second stage.
+    Returns the **main** weights snapped to ``bin_pct`` buckets (ordered by the
+    formula's ``main_weight_keys``). Two trials map to the same cell iff every
+    main weight snaps to the same bucket. This keys the **first** stability-
+    selection stage, which judges the channel-mix decision among the main
+    components; everything else — interaction weights, main-term powers, radii,
+    and aggregators — is tuned within the winning cell (radii via
+    :func:`radius_cell_key` in the second stage; the rest averaged within the
+    cell). Snapping (vs flooring) makes the buckets tile the weight simplex
+    cleanly so the cells match :func:`weight_cell_count`.
     """
     desc = get_formula(formula)
-    return tuple(bin_weight(params.get(k, 0), bin_pct) for k in desc.weight_keys)
+    mains = [float(params.get(k, 0)) for k in desc.main_weight_keys]
+    return _snap_weight_buckets(mains, bin_pct)
+
+
+@lru_cache(maxsize=None)
+def weight_cell_count(formula: str, bin_pct: int = WEIGHT_BIN_PCT) -> int:
+    """Number of distinct stability-selection weight cells a formula can reach.
+
+    Cells are keyed on the **main** component weights snapped to ``bin_pct``
+    buckets (see :func:`weight_cell_key`), so interaction weights and powers —
+    tuned within a cell, like radii — do not inflate the count. With ``k`` main
+    weights and ``slots = 100 / bin_pct`` buckets per axis, the count is the
+    number of clean simplex cells:
+
+    * no interactions (mains sum to exactly 100) → bucket tuples summing to
+      ``slots`` → ``C(slots + k - 1, k - 1)`` (e.g. weighted_average at 10 %:
+      ``C(12, 2) = 66``);
+    * with interactions (mains sum to ``≤ 100``, the interactions absorb the
+      rest) → bucket tuples summing to ``≤ slots`` → ``C(slots + k, k)``.
+
+    A formula with no main weight keys (a standalone single channel) has one
+    weight cell. Used to scale the CGI search budget per main-mix cell.
+    """
+    from math import comb
+
+    desc = get_formula(formula)
+    k = len(desc.main_weight_keys)
+    if k == 0:
+        return 1
+    slots = 100 // int(bin_pct)
+    if len(desc.interaction_weight_keys) > 0:
+        return comb(slots + k, k)
+    return comb(slots + k - 1, k - 1)
 
 
 # Bucket width (metres) for the radius-cell key used by the second stability-

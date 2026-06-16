@@ -181,13 +181,21 @@ def _render_details(rec) -> None:
         )
     elif rec.type == "fusion":
         st.write(
-            f"**Trials:** {p.get('n_trials', '?')} "
-            f"(startup {p.get('n_startup_trials', '?')})"
+            f"**Stability selection:** {p.get('n_bootstraps', '?')} bootstraps × "
+            f"{p.get('n_trials_per_bootstrap', '?')} trials/bootstrap "
+            f"(min {p.get('min_cell_count', '?')}/cell)"
         )
         st.write(f"**Objective:** {p.get('objective_metric', '?')}")
         st.write(f"**CGI formula:** `{p.get('cgi_formula') or 'weighted_average'}`")
         covs = p.get("covariate_columns") or []
-        st.write(f"**Covariates:** {', '.join(covs) if covs else '—'}")
+        cov_types = p.get("covariate_types") or {}
+
+        def _cov_disp(c: str) -> str:
+            return f"{c} ({'cat' if str(cov_types.get(c)).lower() == 'categorical' else 'num'})"
+
+        st.write(
+            f"**Covariates:** {', '.join(_cov_disp(c) for c in covs) if covs else '—'}"
+        )
         standalones = p.get("standalone_channels") or []
         _ch_disp = {"veg": "Vegetation", "terrain": "Terrain", "ndvi": "NDVI"}
         st.write(

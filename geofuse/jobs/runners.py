@@ -585,6 +585,7 @@ def _fusion_config_fingerprint(
     cgi_grid_spacing_m: float | None,
     area_balanced_split: bool,
     test_size: float,
+    covariate_types: dict[str, str] | None = None,
     spatial_split: bool = False,
     spatial_block_size_m: float | None = None,
     n_spatial_blocks: int | None = None,
@@ -629,6 +630,24 @@ def _fusion_config_fingerprint(
                 f"{spatial_adjust_eps_m if spatial_adjust_eps_m is not None else 'auto'}"
             ]
             if spatial_adjust_method and spatial_adjust_method != "none"
+            else []
+        )
+        # Categorical covariates change the design matrix (one-hot dummies), so
+        # they split the cache; only appended when any covariate is categorical
+        # so legacy (all-numeric) runs keep their hash.
+        + (
+            [
+                "covt:"
+                + ",".join(
+                    f"{k}={v}"
+                    for k, v in sorted((covariate_types or {}).items())
+                    if str(v).lower() == "categorical"
+                )
+            ]
+            if any(
+                str(v).lower() == "categorical"
+                for v in (covariate_types or {}).values()
+            )
             else []
         )
     )
@@ -1110,13 +1129,16 @@ def _stability_summary(params: dict) -> dict:
         "n_candidate_cells": g("__n_candidate_cells__"),
         "n_stably_selected": g("__n_stably_selected__"),
         "pfer": g("__pfer__"),
+        "pfer_controlled": g("__pfer_controlled__"),
         "n_bootstraps": g("__n_bootstraps__"),
         "n_trials_per_bootstrap": g("__n_trials_per_bootstrap__"),
         "n_total_trials": g("__n_total_trials__"),
         "higher_is_better": g("__higher_is_better__"),
         "cell_stats": g("__cell_stats__", []),
+        "winning_cell": g("__winning_cell__"),
         "winning_cell_oob_scores": g("__winning_cell_oob_scores__", []),
         "per_bootstrap_summary": g("__per_bootstrap_summary__", []),
+        "trial_history": g("__trial_history__", []),
         # Stage-2 (radius sub-cell) diagnostics.
         "radius_cell_q_worst": g("__radius_cell_q_worst__"),
         "radius_cell_median": g("__radius_cell_median__"),
@@ -1292,6 +1314,7 @@ def run_fusion(
     resume_existing_study: bool = True,
     cgi_formula: str = "weighted_average",
     covariate_columns: list[str] | None = None,
+    covariate_types: dict[str, str] | None = None,
     standalone_channels: list[str] | None = None,
     longitudinal_spec_payload: dict | None = None,
     cgi_grid_spacing_m: float | None = None,
@@ -1499,6 +1522,7 @@ def run_fusion(
                 cache_dir=cache_dir,
                 cgi_formula=cgi_formula,
                 covariate_columns=outcome_covs,
+                covariate_types=dict(covariate_types or {}),
                 longitudinal_spec=longitudinal_spec,
                 cgi_grid_spacing_m=cgi_grid_spacing_m,
                 whole_grid_scaling=whole_grid_scaling,
@@ -1754,6 +1778,7 @@ def run_fusion(
                 ndvi_buffer_step_m=float(ndvi_buffer_step_m),
                 cgi_formula=cgi_formula,
                 covariate_columns=outcome_covs,
+                covariate_types=dict(covariate_types or {}),
                 whole_grid_scaling=bool(whole_grid_scaling),
                 cgi_grid_spacing_m=cgi_grid_spacing_m,
                 area_balanced_split=bool(area_balanced_split),
@@ -1815,24 +1840,29 @@ def run_fusion(
                         "partial-correlation objective if runtime matters.",
                     )
 
-            # Scale the CGI search budget by its dimensionality so the
-            # high-dimensional fusion search is sampled at a per-axis density
-            # comparable to the (low-dim) standalone studies — otherwise a real
-            # CGI gain can be masked by under-exploration.
+            # ``n_trials_per_bootstrap`` is the CGI (target) per-bootstrap budget.
+            # A standalone single channel explores a far smaller stability-
+            # selection space — one weight axis (``slots`` 10 %-bins) vs the CGI's
+            # main-weight simplex (``weight_cell_count`` cells) — so it scales DOWN
+            # by that cell ratio to match the CGI's per-cell trial density instead
+            # of over-sampling its tiny search.
             from .. import cgi_formulas as _cgi_formulas
 
-            _cgi_desc = _cgi_formulas.get_formula(cgi_formula)
-            _cgi_free_dims = len(_cgi_desc.weight_keys) + len(_cgi_desc.power_keys)
-            cgi_trials_per_bootstrap = int(n_trials_per_bootstrap) * max(
-                1, round(_cgi_free_dims / 2)
+            _cgi_cells = max(1, _cgi_formulas.weight_cell_count(cgi_formula))
+            _standalone_cells = max(1, 100 // int(_cgi_formulas.WEIGHT_BIN_PCT))
+            cgi_trials_per_bootstrap = int(n_trials_per_bootstrap)
+            standalone_trials_per_bootstrap = max(
+                1,
+                round(int(n_trials_per_bootstrap) * _standalone_cells / _cgi_cells),
             )
-            if cgi_trials_per_bootstrap != int(n_trials_per_bootstrap):
+            if standalone_trials_per_bootstrap != cgi_trials_per_bootstrap:
                 _log_fusion(
                     "INFO",
-                    f"[{label}] CGI search budget scaled to "
-                    f"{int(n_bootstraps)}×{cgi_trials_per_bootstrap} "
-                    f"({_cgi_free_dims} free weight/power axes); standalones use "
-                    f"{int(n_bootstraps)}×{int(n_trials_per_bootstrap)}.",
+                    f"[{label}] CGI uses {int(n_bootstraps)}×{cgi_trials_per_bootstrap} "
+                    f"trials over {_cgi_cells} weight cells; each standalone scales "
+                    f"down to {int(n_bootstraps)}×{standalone_trials_per_bootstrap} "
+                    f"({_standalone_cells} cells / {_cgi_cells} = "
+                    f"×{_standalone_cells / _cgi_cells:.2f}).",
                 )
 
             def _study_progress_cb(study_label: str):
@@ -1990,6 +2020,7 @@ def run_fusion(
                     _compute_mixedlm_post_metrics(
                         engine,
                         postscore_dir,
+                        winning_params=headline_params,
                         csv_basename=csv_basename,
                         log=_log_fusion,
                     )
@@ -2000,20 +2031,17 @@ def run_fusion(
                     )
                 stage(skey("mixedlm_postscore"), DONE)
 
-            # ── Standalone single-metric studies ────────────────────────────
-            # One Optuna study per enabled channel, reusing the same engine,
-            # the already-built per-(entity, radius) cache, and the train/val/
-            # test split. Each gets its own study SQLite file (suffix = the
-            # channel name) so trials don't pool with the CGI study.
+            # ── Standalone single-metric stability searches ─────────────────
+            # One bootstrap stability search per enabled channel, reusing the
+            # same engine, the already-built per-(entity, radius) cache, and the
+            # train+val/test split.
             #
-            # Each ``optimize_fusion`` call replaces ``engine.study`` /
-            # ``engine.best_params`` / ``engine._active_greenery_channel`` with
-            # the standalone's, so we snapshot the CGI state up front and
-            # restore it after the loop. The results UI reads
-            # ``engine.study.trials`` etc. on the returned engine and expects
-            # the CGI study there.
-            cgi_study = engine.study
-            cgi_best_value = engine.study.best_value if engine.study else None
+            # Each search overwrites ``engine.best_params`` /
+            # ``engine._active_greenery_channel`` with the standalone's, so we
+            # snapshot the CGI state up front and restore it after the loop.
+            cgi_best_value = float(
+                headline_params.get("__cell_q_worst__", float("nan"))
+            )
             cgi_best_params = engine.best_params
 
             standalones_bundle: dict[str, dict] = {}
@@ -2039,7 +2067,7 @@ def run_fusion(
                 ch_best = engine.bootstrap_stability_selection(
                     metric=objective_metric,
                     n_bootstraps=int(n_bootstraps),
-                    n_trials_per_bootstrap=int(n_trials_per_bootstrap),
+                    n_trials_per_bootstrap=int(standalone_trials_per_bootstrap),
                     min_cell_count=int(min_cell_count),
                     worst_quantile=float(worst_quantile),
                     spatial_resample=bool(spatial_split),
@@ -2083,7 +2111,6 @@ def run_fusion(
                     ch_subset_scores = engine.compute_subset_scores(
                         params=ch_headline_params,
                         metric=objective_metric,
-                        top_percent=0.2,
                     )
                 except Exception as exc:
                     _log_fusion(
@@ -2151,6 +2178,7 @@ def run_fusion(
                         _compute_mixedlm_post_metrics(
                             engine,
                             ps_dir,
+                            winning_params=ch_best,
                             csv_basename=ps_basename,
                             log=_log_fusion,
                         )
@@ -2162,11 +2190,10 @@ def run_fusion(
                         )
                 stage(skey(f"standalone_{ch}"), DONE)
 
-            # Restore the engine to its CGI-study state so downstream UI code
-            # that reads ``engine.study.trials`` / ``engine.best_params`` /
-            # ``engine._active_greenery_channel`` sees the combined run.
+            # Restore the engine to its CGI state so downstream code that reads
+            # ``engine.best_params`` / ``engine._active_greenery_channel`` sees
+            # the CGI run.
             if standalones:
-                engine.study = cgi_study
                 engine.best_params = cgi_best_params
                 engine._active_greenery_channel = "cgi"
 
@@ -2226,11 +2253,10 @@ def run_fusion(
                 except Exception as exc:
                     _log_fusion("WARN", f"[{label}] Paired difference failed: {exc}")
 
-            # ── Reports + composite GeoTIFF (plotting + raster write) ──
-            # Pulled out of ``optimize_fusion`` so the standalone stages above
-            # can advance the ledger while plotting runs separately at the
-            # end. Failures here don't kill the run — the trial results +
-            # composite_df are already captured in ``bundle``.
+            # ── Composite GeoTIFF (raster write) ──
+            # Runs after the standalone stages so they can advance the ledger
+            # first. Failures here don't kill the run — the composite_df is
+            # already captured in ``bundle``.
             stage(skey("reports"), RUNNING)
             ctx.progress(
                 value=prog(0.98),
@@ -2263,7 +2289,6 @@ def run_fusion(
                 cgi_subset_scores = engine.compute_subset_scores(
                     params=averaged_params or best_params,
                     metric=objective_metric,
-                    top_percent=0.2,
                 )
             except Exception as exc:
                 _log_fusion(
@@ -2295,6 +2320,19 @@ def run_fusion(
                 "subset_scores": cgi_subset_scores,
                 "covariate_impact": covariate_impact,
                 "target_feature": target_feature,
+                # Run details persisted so the results panel survives a disk
+                # reload (when the live engine is gone): user-facing covariate
+                # names + their types, the formula, and the target / outcome.
+                "covariate_columns": list(
+                    getattr(engine, "_covariate_columns_user", None) or outcome_covs
+                ),
+                "covariate_types": dict(getattr(engine, "covariate_types", {}) or {}),
+                "covariate_dummy_map": dict(
+                    getattr(engine, "_covariate_dummy_map", {}) or {}
+                ),
+                "cgi_formula": cgi_formula,
+                "target_display_name": target_display_name,
+                "outcome_label": target_feature or target_display_name,
                 "standalones": standalones_bundle,
                 "artifacts_dir": job_artifacts_root,
                 "composite_path": cgi_composite_path,

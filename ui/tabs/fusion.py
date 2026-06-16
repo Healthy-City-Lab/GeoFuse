@@ -376,6 +376,7 @@ def _submit_fusion_restart(
         "spatial_adjust_method": "none",
         "spatial_adjust_max_df": 10,
         "spatial_adjust_eps_m": None,
+        "covariate_types": {},
     }
     missing = [
         k
@@ -793,6 +794,7 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "resume_existing_study",
     "cgi_formula",
     "covariate_columns",
+    "covariate_types",
     "standalone_channels",
     "longitudinal_spec_payload",
     "cgi_grid_spacing_m",
@@ -862,7 +864,7 @@ def _discover_years_from_date_column(gdf: gpd.GeoDataFrame, date_col: str) -> li
     except ImportError:
         return []
     parsed = parse_date_column(gdf[date_col])
-    years = sorted(int(d.year) for d in parsed.dropna().unique())
+    years = sorted({int(d.year) for d in parsed.dropna()})
     return [str(y) for y in years]
 
 
@@ -1337,6 +1339,7 @@ def _render_study_details_panel(
     available_covariates: list[str],
     is_polygon_target: bool = False,
     is_vector_target: bool = False,
+    categorical_candidates: list[str] | None = None,
 ) -> dict:
     """Final form section: CGI formula, covariates, objective metric, …
 
@@ -1361,6 +1364,7 @@ def _render_study_details_panel(
             key="fusion_cgi_formula",
         )
     with col_cgi2:
+        categorical_candidates = list(categorical_candidates or [])
         if available_covariates:
             covariate_columns = st.multiselect(
                 "Covariates (control variables)",
@@ -1368,16 +1372,42 @@ def _render_study_details_panel(
                 default=st.session_state.get("fusion_covariate_columns", []),
                 key="fusion_covariate_columns",
                 help=(
-                    "Numeric attribute columns to control for. With "
-                    "covariates the score becomes the greenery term's "
-                    "partial contribution. `mutual_info` ignores covariates."
+                    "Attribute columns to control for. With covariates the "
+                    "score becomes the greenery term's partial contribution. "
+                    "`mutual_info` ignores covariates."
                 ),
             )
+            # Per-column type tag, form-safe: a second multiselect marks which
+            # covariates are categorical (one-hot encoded). Options are the full
+            # static column list so it doesn't depend on the selection above;
+            # non-numeric columns are pre-marked. Only the marks on the chosen
+            # covariates are used.
+            cat_default = st.session_state.get(
+                "fusion_covariate_categorical", categorical_candidates
+            )
+            categorical_pick = st.multiselect(
+                "…treat as categorical (one-hot encoded)",
+                options=available_covariates,
+                default=[c for c in cat_default if c in available_covariates],
+                key="fusion_covariate_categorical",
+                help=(
+                    "Covariates here are one-hot encoded (drop-first) and entered "
+                    "as dummy controls; the rest are used as numeric values. "
+                    "Non-numeric columns are pre-selected. Tag a numeric-coded "
+                    "category (e.g. an SES band stored as 1–5) here too."
+                ),
+            )
+            cat_set = set(categorical_pick)
+            covariate_types = {
+                c: ("categorical" if c in cat_set else "numeric")
+                for c in covariate_columns
+            }
         else:
             covariate_columns = []
+            covariate_types = {}
             st.caption(
-                "_No numeric attribute columns available for covariates "
-                "(raster target or no spare numeric columns)._"
+                "_No attribute columns available for covariates "
+                "(raster target or no spare columns)._"
             )
 
     # ── Objective metric + test split + stratification bins ─────────────
@@ -1675,6 +1705,7 @@ def _render_study_details_panel(
     return {
         "cgi_formula": cgi_formula,
         "covariate_columns": list(covariate_columns or []),
+        "covariate_types": dict(covariate_types or {}),
         "objective_metric": objective_metric,
         "test_size": float(test_size),
         "n_bins": int(n_bins),
@@ -1855,7 +1886,7 @@ def _render_covariate_impact(results_view: dict, metric_name: str) -> None:
         return
 
     st.divider()
-    st.markdown("**Covariate impact**")
+    st.markdown("**Covariate impact (CGI study)**")
     st.caption(
         "Two OLS models fit on the full dataset using the stability-selected "
         "params: **Full** = `target ~ CGI + covariates`, **CGI-only** = "
@@ -2193,8 +2224,32 @@ def _render_stability_diagnostics(summary: dict, metric_name: str) -> None:
             st.caption(
                 "Channel-mix selection is calibrated automatically (Bodinier): K "
                 f"and π maximize the stability score ({float(sscore):.1f}). The "
-                "winner is the most consistently selected cell in the stable set; "
-                "`q_worst` is a secondary performance diagnostic."
+                "winner is the most consistently selected cell in the stable set, "
+                "ties broken by the worst-quantile OOB score (`q_worst`)."
+            )
+
+        # Degenerate-regime flag: when the PFER bound exceeds the number of
+        # stably-selected cells (or K covers most candidates), the "stable set"
+        # carries no real error control — selection probability isn't
+        # discriminating and q_worst is the effective decision.
+        nss = summary.get("n_stably_selected")
+        ncc = summary.get("n_candidate_cells")
+        pfer = summary.get("pfer")
+        ksel = summary.get("selection_size_k")
+        degenerate = summary.get("pfer_controlled") is False or (
+            pfer is not None and nss and float(pfer) >= max(1.0, float(nss))
+        ) or (ksel and ncc and float(ksel) > 0.5 * float(ncc))
+        if degenerate:
+            detail = (
+                f" (PFER ≈ {float(pfer):.0f} vs {nss} stable cells)"
+                if pfer is not None and nss
+                else ""
+            )
+            st.warning(
+                f"Selection not error-controlled here{detail} — the channel "
+                "mixes aren't separable, so the `q_worst` winner is the "
+                "trustworthy signal, not the stable-set size. Lean on the "
+                "held-out test / all-entity effect."
             )
 
     direction_msg = (
@@ -2232,9 +2287,11 @@ def _render_stability_diagnostics(summary: dict, metric_name: str) -> None:
             "across all bootstraps that landed in this bucket. "
             "**Selection prob.** = fraction of resamples where the cell was in "
             "the calibrated top-K by OOB score; the winner is the cell with the "
-            "highest selection probability in the stable set (≥ π*). A tight "
-            "cluster of similar runners-up is more credible than an isolated "
-            "winner."
+            "highest selection probability in the stable set (≥ π*), ties broken "
+            "by the worst-quantile OOB score (`q_worst`). When selection "
+            "probability saturates (every stable cell at 1.0), `q_worst` is the "
+            "effective decision — the most robust cell wins. A tight cluster of "
+            "similar runners-up is more credible than an isolated winner."
         )
 
     # ── Stage-2 radius sub-cells (within the winning weight cell) ─────
@@ -2345,6 +2402,92 @@ def _render_stability_diagnostics(summary: dict, metric_name: str) -> None:
             "many bootstraps, that's strong evidence the winner is stable."
         )
 
+    # ── Per-trial history (the stability analogue of an Optuna trial log) ──
+    history = summary.get("trial_history") or []
+    if history and len(history) >= 5:
+        with st.expander(
+            f"Trial history ({len(history)} trials across all resamples)"
+        ):
+            hist_df = _pd.DataFrame(history)
+
+            # OOB score per resample, top-K trials highlighted.
+            if {"bootstrap", "oob_score"}.issubset(hist_df.columns):
+                if "in_top_k" in hist_df.columns:
+                    hist_df["Membership"] = np.where(
+                        hist_df["in_top_k"].astype(bool), "Top-K", "Other"
+                    )
+                    color_arg: dict = {
+                        "color": "Membership",
+                        "color_discrete_map": {"Top-K": "#2ca02c", "Other": "#9aa0a6"},
+                    }
+                else:
+                    color_arg = {}
+                fig_h = _px.strip(
+                    hist_df,
+                    x="bootstrap",
+                    y="oob_score",
+                    labels={
+                        "bootstrap": "Resample",
+                        "oob_score": f"OOB {metric_name}",
+                    },
+                    **color_arg,
+                )
+                fig_h.update_layout(
+                    height=360, margin={"l": 20, "r": 20, "t": 30, "b": 20}
+                )
+                st.plotly_chart(fig_h, width="stretch")
+                st.caption(
+                    "Every completed trial's out-of-bag score, one column per "
+                    "complementary-half resample. Green = trial whose channel-mix "
+                    "cell was in that resample's calibrated top-K. Tight green "
+                    "bands that recur across resamples are what selection "
+                    "probability rewards."
+                )
+
+            # Parallel coordinates over the channel weights, colored by OOB —
+            # where the high-scoring weight combinations concentrate.
+            weight_keys = (
+                [
+                    k
+                    for k in (cell_stats[0].get("weights") or {}).keys()
+                    if k in hist_df.columns and hist_df[k].notna().any()
+                ]
+                if cell_stats
+                else []
+            )
+            if len(weight_keys) >= 2 and "oob_score" in hist_df.columns:
+                pc_df = hist_df[weight_keys + ["oob_score"]].dropna()
+                if len(pc_df) >= 5:
+                    label_map = {
+                        k: k.removeprefix("w_").removesuffix("_weight").upper()
+                        for k in weight_keys
+                    }
+                    label_map["oob_score"] = f"OOB {metric_name}"
+                    fig_pc = _px.parallel_coordinates(
+                        pc_df,
+                        dimensions=weight_keys + ["oob_score"],
+                        color="oob_score",
+                        labels=label_map,
+                        color_continuous_scale=_px.colors.sequential.Viridis,
+                    )
+                    fig_pc.update_layout(
+                        height=380, margin={"l": 60, "r": 40, "t": 40, "b": 30}
+                    )
+                    st.plotly_chart(fig_pc, width="stretch")
+                    st.caption(
+                        "Each line is one trial's channel-weight combination, "
+                        "colored by its OOB score. Brighter lines converging on "
+                        "the same weight region show where the high-scoring "
+                        "mixes concentrate."
+                    )
+
+            st.dataframe(hist_df, width="stretch", height=240)
+            st.caption(
+                "The full per-trial record (resample, OOB score, snapped cell, "
+                "and every parameter), kept so the run's exploration is "
+                "reproducible and re-scorable without re-running the search."
+            )
+
 
 def _render_results_headline(results_view: dict, metric_name: str) -> None:
     """At-a-glance CGI bottom line: the whole-data greenery effect (headline),
@@ -2364,7 +2507,10 @@ def _render_results_headline(results_view: dict, metric_name: str) -> None:
         except (TypeError, ValueError):
             return None
 
-    cols = st.columns(4)
+    # Two rows of two so the metric labels have room to breathe — four narrow
+    # columns clip every label with "…" in a narrow window.
+    cols = st.columns(2)
+    cols2 = st.columns(2)
 
     # 1) Whole-data effect — the headline greenery effect.
     with cols[0]:
@@ -2425,9 +2571,9 @@ def _render_results_headline(results_view: dict, metric_name: str) -> None:
             st.metric("Held-out test", "—")
 
     # 3) Direction of the greenery↔outcome relationship.
-    with cols[2]:
+    with cols2[0]:
         st.metric(
-            "Direction (greenery↔outcome)",
+            "Direction",
             _direction_badge(direction),
             help=(
                 "Sign of the greenery↔outcome relationship; reported separately "
@@ -2438,7 +2584,7 @@ def _render_results_headline(results_view: dict, metric_name: str) -> None:
 
     # 4) CGI vs best standalone — paired objective difference (primary),
     #    AIC/BIC as a secondary fallback.
-    with cols[3]:
+    with cols2[1]:
         if paired:
             diff = _f(paired.get("observed_diff"))
             lo, hi = _f(paired.get("lower")), _f(paired.get("upper"))
@@ -2564,7 +2710,7 @@ def _render_study_detail(
         else:
             st.markdown("**Weights and powers (stability-selected)**")
             all_keys = list(formula.weight_keys) + list(formula.power_keys)
-            groups = [all_keys[i : i + 4] for i in range(0, len(all_keys), 4)]
+            groups = [all_keys[i : i + 3] for i in range(0, len(all_keys), 3)]
             for group in groups:
                 cols = st.columns(len(group))
                 for col, key in zip(cols, group):
@@ -2634,9 +2780,24 @@ def _render_study_detail(
 
     # ── Per-subset scores ─────────────────────────────────────────────
     if subset_scores:
-        # Bootstrap CIs + held-out permutation p-value (CGI study only).
+        # Bootstrap CIs + held-out permutation p-value. The in-pool slice
+        # carries the train+val CI only (no permutation p: the params were
+        # selected on this pool, so a permutation test there is in-sample and
+        # optimistic). Test + all carry both CI and the held-out p.
         effects = study_view.get("cgi_effects") or {}
-        eff_for = {"test": effects.get("test"), "all": effects.get("all")}
+        eff_for = {
+            "train": effects.get("train_val"),
+            "test": effects.get("test"),
+            "all": effects.get("all"),
+        }
+        # Friendly labels — there is no train→fit→validate step; these are the
+        # in-pool fit and the cross-resample out-of-bag signal.
+        subset_label = {
+            "train": "In-pool (train+val)",
+            "val": "OOB (cross-resample)",
+            "test": "Test (held-out)",
+            "all": "All entities",
+        }
 
         def _fmt_ci(block: dict | None) -> str | None:
             if not block:
@@ -2658,7 +2819,7 @@ def _render_study_detail(
             score = block.get("score")
             raw = block.get("score_raw")
             row = {
-                "Subset": subset,
+                "Subset": subset_label.get(subset, subset),
                 metric_name: round(float(score), 4) if score is not None else None,
             }
             if has_covariates:
@@ -2676,12 +2837,16 @@ def _render_study_detail(
         if rows:
             st.dataframe(pd.DataFrame(rows), width="stretch")
             cap = (
-                "**train** = winning params on the full train+val pool · "
-                "**val** = winning-cell median out-of-bag score (cross-resample "
-                "held-out signal) · **test** = untouched held-out split · "
-                "**all** = every entity (the headline effect). 95% CIs are "
-                "percentile bootstrap; `p (perm)` is the held-out permutation "
-                "p-value."
+                "Stability selection resamples the train+val pool into "
+                "complementary halves — there is no train→fit→validate step. "
+                "**In-pool** = winning params scored on the full train+val pool "
+                "(an in-sample fit) · **OOB** = winning-cell median out-of-bag "
+                "score across resamples (cross-resample held-out signal) · "
+                "**Test** = untouched held-out split · **All** = every entity "
+                "(the headline effect). 95% CIs are percentile bootstrap; the "
+                "in-pool CI is in-sample (optimistic) and carries no "
+                "permutation p. `p (perm)` is the held-out permutation p-value "
+                "on the test and all slices."
             )
             if has_covariates:
                 cap += (
@@ -2714,10 +2879,17 @@ def _render_cross_study_comparison(results_view: dict, metric_name: str) -> None
             studies.append((ch, f"{_CHANNEL_DISPLAY.get(ch, ch)} (standalone)", b))
 
     # ── Score bars (test + all) ───────────────────────────────────────
+    _subset_label = {
+        "train": "In-pool",
+        "val": "OOB",
+        "test": "Test",
+        "all": "All",
+    }
     subset_picks = st.multiselect(
         "Subsets to compare",
         options=["train", "val", "test", "all"],
         default=["test", "all"],
+        format_func=lambda s: _subset_label.get(s, s),
         key="fusion_compare_subsets",
         help="Each study's stability-selected params, scored on each subset.",
     )
@@ -2732,7 +2904,13 @@ def _render_cross_study_comparison(results_view: dict, metric_name: str) -> None
                     fval = float(val) if val is not None else None
                 except (TypeError, ValueError):
                     fval = None
-                rows.append({"Study": disp, "Subset": subset, metric_name: fval})
+                rows.append(
+                    {
+                        "Study": disp,
+                        "Subset": _subset_label.get(subset, subset),
+                        metric_name: fval,
+                    }
+                )
         df = pd.DataFrame(rows)
         try:
             import plotly.express as _px
@@ -2874,22 +3052,52 @@ def _render_fusion_results_body(output_dir: str) -> None:
 
     metric_name = results_view["objective_metric"].upper()
 
-    formula_name = getattr(engine, "cgi_formula", "weighted_average")
+    # Read run details from the persisted bundle first so they survive a disk
+    # reload (when the live ``engine`` is gone); fall back to the engine.
+    formula_name = (
+        results_view.get("cgi_formula")
+        or getattr(engine, "cgi_formula", "weighted_average")
+    )
     try:
         formula = _cgi_formulas.get_formula(formula_name)
     except ValueError:
         formula = _cgi_formulas.get_formula("weighted_average")
-    covariates_used = list(getattr(engine, "covariate_columns", []) or [])
+    covariates_used = list(
+        results_view.get("covariate_columns")
+        or getattr(engine, "_covariate_columns_user", None)
+        or getattr(engine, "covariate_columns", [])
+        or []
+    )
+    cov_types = results_view.get("covariate_types") or getattr(
+        engine, "covariate_types", {}
+    ) or {}
+    target_name = results_view.get("target_display_name") or getattr(
+        engine, "target_file", None
+    )
+    outcome_name = results_view.get("outcome_label") or results_view.get(
+        "target_feature"
+    )
     _FORMULA_DISPLAY = {"weighted_average": "Weighted Average", "synergy": "Synergy"}
+
+    def _cov_chip(c: str) -> str:
+        kind = "categorical" if str(cov_types.get(c)).lower() == "categorical" else None
+        return f"`{c}`" + (f" _({kind})_" if kind else "")
 
     # ── Headline ──────────────────────────────────────────────────────
     _render_results_headline(results_view, metric_name)
+    if target_name or outcome_name:
+        bits = []
+        if target_name:
+            bits.append(f"**Target:** `{os.path.basename(str(target_name))}`")
+        if outcome_name:
+            bits.append(f"**Outcome:** `{outcome_name}`")
+        st.caption("  ·  ".join(bits))
     st.caption(
         "**Formula:** "
         f"{_FORMULA_DISPLAY.get(formula.name, formula.name.title())}  ·  "
         "**Covariates:** "
         + (
-            ", ".join(f"`{c}`" for c in covariates_used)
+            ", ".join(_cov_chip(c) for c in covariates_used)
             if covariates_used
             else "_none_"
         )
@@ -2927,6 +3135,13 @@ def _render_fusion_results_body(output_dir: str) -> None:
         _render_study_detail(
             study_view, engine, formula, metric_name, picked_key, covariates_used
         )
+
+    st.divider()
+    st.caption(
+        "_The sections below are fixed at the **CGI study** and **cross-study** "
+        "scope — they don't change with the study selector above (which only "
+        "switches the per-study detail)._"
+    )
 
     # ── Cross-study comparison (CGI vs standalones) ───────────────────
     _render_cross_study_comparison(results_view, metric_name)
@@ -3368,28 +3583,51 @@ def render(output_dir: str) -> None:
     # =========================================================================
     st.divider()
 
-    # Numeric attribute columns the user can pick as covariates
+    # Attribute columns the user can pick as covariates — numeric columns are
+    # used as-is; categorical (object / category / bool, or numeric-coded ones
+    # the user tags) are one-hot encoded by the engine. ``categorical_candidates``
+    # pre-marks the genuinely non-numeric columns.
     available_covariates: list[str] = []
+    categorical_candidates: list[str] = []
     if is_vector_target and preview_vector_gdf is not None:
-        numeric_attr_cols = preview_vector_gdf.select_dtypes(
-            include=[np.number]
-        ).columns.tolist()
         outcome_set = set(target_outcome_columns)
+        try:
+            geom_name = preview_vector_gdf.geometry.name
+        except Exception:
+            geom_name = "geometry"
+
+        def _num_cat(frame) -> tuple[set[str], set[str]]:
+            num = set(frame.select_dtypes(include=[np.number]).columns)
+            cat = set(
+                frame.select_dtypes(include=["object", "category", "bool"]).columns
+            )
+            return num, cat
+
+        numeric_set, categorical_set = _num_cat(preview_vector_gdf)
         wide_files = opt_state.get("wide_files") or []
         if is_longitudinal and opt_state.get("intake_mode") == "wide" and wide_files:
-            common: set[str] | None = None
+            common_num: set[str] | None = None
+            common_cat: set[str] | None = None
             for wf in wide_files:
                 try:
                     _frame = gpd.read_file(wf["path"], rows=64)
                 except Exception:
                     continue
-                _nums = set(_frame.select_dtypes(include=[np.number]).columns)
-                common = _nums if common is None else common & _nums
-            if common is not None:
-                numeric_attr_cols = sorted(common & set(numeric_attr_cols)) or sorted(
-                    common
-                )
-        available_covariates = [c for c in numeric_attr_cols if c not in outcome_set]
+                _n, _c = _num_cat(_frame)
+                common_num = _n if common_num is None else common_num & _n
+                common_cat = _c if common_cat is None else common_cat & _c
+            if common_num is not None:
+                numeric_set = (common_num & numeric_set) or common_num
+            if common_cat is not None:
+                categorical_set = (common_cat & categorical_set) or common_cat
+
+        def _ok(c: str) -> bool:
+            return c not in outcome_set and c != geom_name
+
+        numeric_cols = sorted(c for c in numeric_set if _ok(c))
+        categorical_cols = sorted(c for c in categorical_set if _ok(c))
+        available_covariates = sorted(set(numeric_cols) | set(categorical_cols))
+        categorical_candidates = categorical_cols
 
     # Only render polygon-only controls when the target carries polygons.
     is_polygon_target_ui = False
@@ -3406,6 +3644,7 @@ def render(output_dir: str) -> None:
             available_covariates=available_covariates,
             is_polygon_target=is_polygon_target_ui,
             is_vector_target=bool(is_vector_target),
+            categorical_candidates=categorical_candidates,
         )
         st.divider()
         _fus_run_spacer, _fus_run_col = st.columns([2.2, 1])
@@ -3421,6 +3660,7 @@ def render(output_dir: str) -> None:
     # block below still reads.
     cgi_formula = study_state["cgi_formula"]
     covariate_columns = study_state["covariate_columns"]
+    covariate_types = study_state.get("covariate_types") or {}
     objective_metric = study_state["objective_metric"]
     test_size = study_state["test_size"]
     n_bins = study_state["n_bins"]
@@ -3772,6 +4012,7 @@ def render(output_dir: str) -> None:
                 "resume_existing_study": resume_existing_study,
                 "cgi_formula": cgi_formula,
                 "covariate_columns": list(covariate_columns or []),
+                "covariate_types": dict(covariate_types or {}),
                 "standalone_channels": (
                     ["veg", "terrain", "ndvi"] if run_standalones else []
                 ),
