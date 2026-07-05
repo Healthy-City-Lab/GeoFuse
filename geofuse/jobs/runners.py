@@ -1328,6 +1328,7 @@ def run_fusion(
     spatial_adjust_eps_m: float | None = None,
     n_bootstraps: int = 20,
     n_trials_per_bootstrap: int = 50,
+    weight_bin_pct: int = 10,
     min_cell_count: int = 3,
     worst_quantile: float = 0.10,
     max_pfer: float = 1.0,
@@ -1430,6 +1431,7 @@ def run_fusion(
             "n_bins": n_bins,
             "n_bootstraps": int(n_bootstraps),
             "n_trials_per_bootstrap": int(n_trials_per_bootstrap),
+            "weight_bin_pct": int(weight_bin_pct),
             "min_cell_count": int(min_cell_count),
             "worst_quantile": float(worst_quantile),
             "max_pfer": float(max_pfer),
@@ -1855,8 +1857,10 @@ def run_fusion(
             # of over-sampling its tiny search.
             from .. import cgi_formulas as _cgi_formulas
 
-            _cgi_cells = max(1, _cgi_formulas.weight_cell_count(cgi_formula))
-            _standalone_cells = max(1, 100 // int(_cgi_formulas.WEIGHT_BIN_PCT))
+            _cgi_cells = max(
+                1, _cgi_formulas.weight_cell_count(cgi_formula, int(weight_bin_pct))
+            )
+            _standalone_cells = max(1, 100 // int(weight_bin_pct))
             cgi_trials_per_bootstrap = int(n_trials_per_bootstrap)
             standalone_trials_per_bootstrap = max(
                 1,
@@ -1939,6 +1943,7 @@ def run_fusion(
                 metric=objective_metric,
                 n_bootstraps=int(n_bootstraps),
                 n_trials_per_bootstrap=cgi_trials_per_bootstrap,
+                weight_bin_pct=int(weight_bin_pct),
                 min_cell_count=int(min_cell_count),
                 worst_quantile=float(worst_quantile),
                 max_pfer=max_pfer_arg,
@@ -2079,6 +2084,7 @@ def run_fusion(
                     metric=objective_metric,
                     n_bootstraps=int(n_bootstraps),
                     n_trials_per_bootstrap=int(standalone_trials_per_bootstrap),
+                    weight_bin_pct=int(weight_bin_pct),
                     min_cell_count=int(min_cell_count),
                     worst_quantile=float(worst_quantile),
                     max_pfer=max_pfer_arg,

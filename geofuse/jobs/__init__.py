@@ -40,6 +40,7 @@ def retry_with_backoff(
     cancel_callback: Callable[[], bool] | None = None,
     log_fn: Callable[[str, str], None] | None = None,
     label: str = "operation",
+    non_retryable: tuple[type[BaseException], ...] = (),
 ) -> T:
     """Invoke ``fn()`` with up to ``attempts`` tries and jittered backoff.
 
@@ -55,6 +56,11 @@ def retry_with_backoff(
     this helper just re-raises so retry policy is decoupled from error
     surfacing.
 
+    ``non_retryable`` names exception types that are deterministic rather
+    than transient (e.g. an Earth Engine "memory limit exceeded" rejection
+    that will fail identically every attempt): they re-raise immediately so
+    the caller can take a different path instead of burning the retry budget.
+
     Used by NDVI per-tile downloads (flaky EE / network) and is a good fit
     for any other network-bound worker that wants the same "transient
     failure shouldn't sink the batch" semantic.
@@ -66,6 +72,8 @@ def retry_with_backoff(
             return fn()
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
+            if non_retryable and isinstance(exc, non_retryable):
+                raise
             if attempt >= attempts:
                 break
             # ±jitter so concurrent workers don't retry in lockstep and

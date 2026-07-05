@@ -6,15 +6,17 @@ import logging
 import os
 import time
 import traceback
+import zipfile
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 import ee
-import geemap
 import geopandas as gpd
 import numpy as np
 import rasterio
+import requests
+from shapely.geometry import box
 
 from .core import build_planar_tiles
 from .crs_utils import (
@@ -51,6 +53,157 @@ _TILE_CACHE_ROOT = os.path.join(_REPO_ROOT, "logs", "caches", "ndvi_tiles")
 # reproject step from contending too heavily for the GIL on a small machine.
 # Mirrors the GVI engine's ``_MAX_CONCURRENT_POINTS = 4`` choice.
 _MAX_CONCURRENT_TILES = 4
+
+# How many times a single export tile may be halved (2×2) when Earth Engine
+# rejects it as too large to compute in one request. Depth 3 turns one tile
+# into at most 64 sub-tiles (each ~1/8 the linear size); past that the region
+# is almost certainly failing for a non-size reason and we surface it.
+_MAX_TILE_SUBDIVISION_DEPTH = 3
+
+# Substrings that mark an Earth Engine rejection as "this request was too big
+# to compute in one shot" — halving the export region fixes these, unlike a
+# transient network failure which a plain retry handles. Matched case-folded.
+_EE_TOO_LARGE_MARKERS = (
+    "user memory limit exceeded",
+    "output of image computation is too large",
+    "total request size",
+    "request payload size exceeds",
+    "computed value is too large",
+)
+
+
+class _EEComputeTooLargeError(RuntimeError):
+    """Earth Engine rejected an export for exceeding a per-request compute
+    budget (memory or output size). Signals the caller to subdivide the
+    export region rather than retry the identical request."""
+
+
+def _classify_ee_error(message: str) -> RuntimeError:
+    """Wrap an Earth Engine error string in the right exception type.
+
+    Returns an :class:`_EEComputeTooLargeError` when the message names a
+    size/memory limit (subdivision helps), otherwise a plain ``RuntimeError``
+    (transient — the retry path handles it).
+    """
+    lowered = message.casefold()
+    if any(marker in lowered for marker in _EE_TOO_LARGE_MARKERS):
+        return _EEComputeTooLargeError(message)
+    return RuntimeError(message)
+
+
+def _describe_ee_download_error(resp: requests.Response) -> str:
+    """Pull Earth Engine's error message out of a failed download response.
+
+    EE returns its failures as a JSON body of the shape
+    ``{"error": {"code": .., "message": ".."}}``. Fall back to the raw
+    (truncated) response text when the body isn't the expected JSON.
+    """
+    try:
+        body = resp.json()
+    except ValueError:
+        text = (resp.text or "").strip()
+        return text[:300]
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict) and err.get("message"):
+            return str(err["message"])
+    return str(body)[:300]
+
+
+def _export_ee_image_to_tif(
+    ee_image,
+    filename: str,
+    *,
+    crs: str,
+    crs_transform: list[float],
+    region,
+    timeout: int = 300,
+) -> None:
+    """Download a single-band ``ee.Image`` to ``filename`` as a GeoTIFF.
+
+    A diagnostics-preserving stand-in for ``geemap.ee_export_image``. geemap
+    catches every failure behind a generic ``"An error occurred while
+    downloading."`` print and returns without writing the file, so a caller
+    can't tell a rate-limit (HTTP 429) from an over-large request, an Earth
+    Engine memory-limit rejection, or a local disk error. This runs the same
+    ``ZIPPED_GEO_TIFF`` fetch-and-unzip but **raises** a message carrying the
+    HTTP status and Earth Engine's own error text, so the caller's retry /
+    logging path records exactly what went wrong.
+    """
+    name = os.path.splitext(os.path.basename(filename))[0]
+    params = {
+        "name": name,
+        "filePerBand": False,
+        "region": region,
+        "crs": crs,
+        "crs_transform": crs_transform,
+    }
+    try:
+        url = ee_image.getDownloadURL(params)
+    except Exception as e:  # noqa: BLE001 — surface the EE-side rejection verbatim
+        raise _classify_ee_error(f"Earth Engine getDownloadURL failed: {e}") from e
+
+    resp = requests.get(url, stream=True, timeout=timeout)
+    if resp.status_code != 200:
+        detail = _describe_ee_download_error(resp)
+        raise _classify_ee_error(
+            f"Earth Engine pixel download failed with HTTP {resp.status_code}"
+            + (f": {detail}" if detail else "")
+        )
+
+    filename_zip = filename[:-4] + ".zip" if filename.endswith(".tif") else filename + ".zip"
+    try:
+        with open(filename_zip, "wb") as fd:
+            for chunk in resp.iter_content(chunk_size=1024):
+                fd.write(chunk)
+        with zipfile.ZipFile(filename_zip) as z:
+            tif_members = [m for m in z.namelist() if m.lower().endswith(".tif")]
+            if not tif_members:
+                raise RuntimeError(
+                    "Earth Engine returned a zip with no GeoTIFF member "
+                    f"(members: {z.namelist()})."
+                )
+            z.extract(tif_members[0], os.path.dirname(filename))
+        extracted = os.path.join(os.path.dirname(filename), tif_members[0])
+        if os.path.abspath(extracted) != os.path.abspath(filename):
+            os.replace(extracted, filename)
+    finally:
+        try:
+            os.remove(filename_zip)
+        except OSError:
+            pass
+
+    if not (os.path.isfile(filename) and os.path.getsize(filename) > 0):
+        raise RuntimeError(f"Download completed but {filename} is empty or missing.")
+
+
+def _split_geom_quadrants(region_geom):
+    """Split a region into up to four bbox quadrants clipped to its footprint.
+
+    Halves the geometry's bounding box on both axes and intersects each of the
+    four cells with ``region_geom`` so the union of the returned pieces covers
+    exactly the original footprint — no extra area, no gaps. Empty cells (the
+    original geometry didn't reach that corner) are dropped. Returns ``[]`` for
+    a degenerate (zero-width or zero-height) region, signalling the caller that
+    no further subdivision is possible.
+    """
+    minx, miny, maxx, maxy = region_geom.bounds
+    if maxx <= minx or maxy <= miny:
+        return []
+    midx = (minx + maxx) / 2.0
+    midy = (miny + maxy) / 2.0
+    cells = (
+        box(minx, miny, midx, midy),
+        box(midx, miny, maxx, midy),
+        box(minx, midy, midx, maxy),
+        box(midx, midy, maxx, maxy),
+    )
+    pieces = []
+    for cell in cells:
+        piece = region_geom.intersection(cell)
+        if not piece.is_empty and piece.area > 0:
+            pieces.append(piece)
+    return pieces
 
 
 def _compute_resume_key(
@@ -986,19 +1139,13 @@ class NDVIEngine:
         try:
 
             def _do_export() -> None:
-                geemap.ee_export_image(
+                _export_ee_image_to_tif(
                     ndvi_median,
-                    filename=tmp_tif,
+                    tmp_tif,
                     crs=export_crs,
                     crs_transform=crs_transform,
                     region=aoi,
-                    file_per_band=False,
                 )
-                if not (os.path.isfile(tmp_tif) and os.path.getsize(tmp_tif) > 0):
-                    raise RuntimeError(
-                        f"geemap.ee_export_image returned but {tmp_tif} "
-                        "was not written."
-                    )
 
             retry_with_backoff(
                 _do_export,
@@ -1248,34 +1395,15 @@ class NDVIEngine:
         tile_final = os.path.join(work_dir, f"tile_{idx}.tif")
 
         try:
-            tile_aoi = shapely_to_ee_geometry(tile_geom)
-            tile_ndvi = ndvi_median.clip(tile_aoi)
-
-            def _do_export() -> None:
-                geemap.ee_export_image(
-                    tile_ndvi,
-                    filename=tile_final,
-                    crs=export_crs,
-                    crs_transform=crs_transform,
-                    region=tile_aoi,
-                    file_per_band=False,
-                )
-                if not (os.path.isfile(tile_final) and os.path.getsize(tile_final) > 0):
-                    raise RuntimeError(
-                        f"geemap.ee_export_image returned but {tile_final} "
-                        "was not written."
-                    )
-
-            # 3 attempts with 2 s base delay, doubling each time (≈ 2 s, 4 s
-            # between retries before jitter). Flaky network = single failed
-            # tile, not a swiss-cheese mosaic.
-            retry_with_backoff(
-                _do_export,
-                attempts=3,
-                base_delay=2.0,
+            self._export_region_adaptive(
+                ndvi_median,
+                tile_geom,
+                tile_final,
+                export_crs=export_crs,
+                crs_transform=crs_transform,
                 cancel_callback=cancel_callback,
-                log_fn=_log,
-                label=f"Tile {idx + 1} EE export",
+                depth=0,
+                label=f"Tile {idx + 1}",
             )
 
             if cancel_callback and cancel_callback():
@@ -1294,6 +1422,103 @@ class NDVIEngine:
                     pass
             result["error"] = f"{type(e).__name__}: {e}"
             return result
+
+    def _export_region_adaptive(
+        self,
+        ndvi_median,
+        region_geom_4326,
+        out_path: str,
+        *,
+        export_crs: str,
+        crs_transform: list[float],
+        cancel_callback: Callable[[], bool] | None,
+        depth: int,
+        label: str,
+    ) -> None:
+        """Export one region to ``out_path``, subdividing on EE size limits.
+
+        The common case is a single EE export of ``region_geom_4326`` (with
+        transient-failure retries). When Earth Engine rejects the request as
+        too large to compute — ``_EEComputeTooLargeError`` — the region is
+        halved into a 2×2 grid of sub-regions, each exported the same way
+        (recursively, so a still-too-big quadrant halves again up to
+        :data:`_MAX_TILE_SUBDIVISION_DEPTH`), and the pieces are stream-
+        mosaicked back into ``out_path``. Every sub-region shares the global
+        ``crs_transform``, so the merged result is pixel-identical to what a
+        single successful export would have produced — the on-disk tile is
+        indistinguishable from a tile that never needed splitting.
+        """
+        region_aoi = shapely_to_ee_geometry(region_geom_4326)
+
+        def _do_export() -> None:
+            _export_ee_image_to_tif(
+                ndvi_median.clip(region_aoi),
+                out_path,
+                crs=export_crs,
+                crs_transform=crs_transform,
+                region=region_aoi,
+            )
+
+        try:
+            # 3 attempts with 2 s base delay for transient (network) failures.
+            # A size/memory rejection is deterministic, so it is non-retryable
+            # here and re-raises immediately for the subdivision path below.
+            retry_with_backoff(
+                _do_export,
+                attempts=3,
+                base_delay=2.0,
+                cancel_callback=cancel_callback,
+                log_fn=_log,
+                label=f"{label} EE export",
+                non_retryable=(_EEComputeTooLargeError,),
+            )
+            return
+        except _EEComputeTooLargeError as too_large:
+            quadrants = _split_geom_quadrants(region_geom_4326)
+            if depth >= _MAX_TILE_SUBDIVISION_DEPTH or len(quadrants) < 2:
+                raise
+            _log(
+                "INFO",
+                f"{label}: {too_large} — subdividing into {len(quadrants)} "
+                f"sub-tiles (level {depth + 1}).",
+            )
+            sub_paths: list[str] = []
+            try:
+                for qi, quad in enumerate(quadrants):
+                    if cancel_callback and cancel_callback():
+                        return
+                    sub_out = f"{out_path}.sub{depth}_{qi}.tif"
+                    self._export_region_adaptive(
+                        ndvi_median,
+                        quad,
+                        sub_out,
+                        export_crs=export_crs,
+                        crs_transform=crs_transform,
+                        cancel_callback=cancel_callback,
+                        depth=depth + 1,
+                        label=f"{label}.{qi + 1}",
+                    )
+                    sub_paths.append(sub_out)
+                stream_mosaic_to_geotiff(
+                    sub_paths,
+                    out_path,
+                    nodata=-9999,
+                    build_overviews=False,
+                    compress=True,
+                )
+            except Exception:
+                if os.path.exists(out_path):
+                    try:
+                        os.remove(out_path)
+                    except OSError:
+                        pass
+                raise
+            finally:
+                for p in sub_paths:
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
 
     def _download_with_tiling(
         self,

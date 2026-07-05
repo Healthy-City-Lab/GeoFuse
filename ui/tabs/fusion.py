@@ -295,7 +295,8 @@ def _fusion_restart_summary_lines(p: dict) -> list[str]:
         f"**Test set:** {float(p.get('test_size', 0.0) or 0.0) * 100:.0f}%",
         f"**Stability selection:** {p.get('n_bootstraps', '?')} bootstraps × "
         f"{p.get('n_trials_per_bootstrap', '?')} trials "
-        f"(min {p.get('min_cell_count', '?')}/cell · max PFER {_max_pfer_lbl})",
+        f"({p.get('weight_bin_pct', 10)}% cells · min {p.get('min_cell_count', '?')}"
+        f"/cell · max PFER {_max_pfer_lbl})",
         f"**GVI buffers (m):** {p.get('gvi_buffer_min_m', '?')} – "
         f"{p.get('gvi_buffer_max_m', '?')} (step {p.get('gvi_buffer_step_m', '?')})",
         f"**NDVI buffers (m):** {p.get('ndvi_buffer_min_m', '?')} – "
@@ -811,6 +812,7 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "n_spatial_blocks",
     "n_bootstraps",
     "n_trials_per_bootstrap",
+    "weight_bin_pct",
     "min_cell_count",
     "worst_quantile",
     "max_pfer",
@@ -1538,13 +1540,30 @@ def _render_study_details_panel(
         "K + threshold π maximize the stability score, with a reported PFER "
         "bound). Set the resampling effort and the PFER cap here."
     )
-    col_s1, col_s2 = st.columns(2)
+    col_s0, col_s1, col_s2 = st.columns(3)
+    with col_s0:
+        weight_bin_pct_ui = st.select_slider(
+            "Weight cell size (%)",
+            options=[5, 10, 20, 25, 50],
+            value=int(
+                st.session_state.get(
+                    "fusion_weight_bin_pct", _cgi_formulas.WEIGHT_BIN_PCT
+                )
+            ),
+            key="fusion_weight_bin_pct",
+            help=(
+                "Bin width for the channel-mix weight cells the stability "
+                "selection ranks. Wider cells → fewer, coarser cells (a good "
+                "region fragments less and each cell collects more trials); "
+                "narrower cells → finer resolution but many more cells to cover."
+            ),
+        )
     with col_s1:
         n_bootstraps_ui = st.number_input(
             "Bootstraps (B)",
             min_value=5,
             max_value=200,
-            value=int(st.session_state.get("fusion_n_bootstraps", 20)),
+            value=int(st.session_state.get("fusion_n_bootstraps", 30)),
             step=5,
             key="fusion_n_bootstraps",
             help=(
@@ -1555,16 +1574,28 @@ def _render_study_details_panel(
     with col_s2:
         n_trials_per_bootstrap_ui = st.number_input(
             "Trials per bootstrap",
-            min_value=10,
-            max_value=500,
-            value=int(st.session_state.get("fusion_n_trials_per_bootstrap", 50)),
+            min_value=100,
+            max_value=800,
+            value=int(st.session_state.get("fusion_n_trials_per_bootstrap", 150)),
             step=10,
             key="fusion_n_trials_per_bootstrap",
             help=(
-                "Random-sampler trials inside each bootstrap. 30-100 typical — "
-                "uniform coverage matters more than depth."
+                "Random-sampler trials inside each bootstrap. Coverage of the "
+                "weight cells matters more than depth — see the per-cell density "
+                "below."
             ),
         )
+    _n_weight_cells = max(
+        1, _cgi_formulas.weight_cell_count(cgi_formula, int(weight_bin_pct_ui))
+    )
+    _avg_trials_per_cell = int(n_trials_per_bootstrap_ui) / _n_weight_cells
+    st.caption(
+        f"≈ **{_avg_trials_per_cell:.1f} trials per weight cell** on average "
+        f"({int(n_trials_per_bootstrap_ui)} trials ÷ {_n_weight_cells} cells at "
+        f"{int(weight_bin_pct_ui)}% bins). Aim for ≥ 5 so each cell's OOB "
+        "ranking is reproducible across resamples; raise the trial count or the "
+        "cell size if this is low."
+    )
     max_pfer_ui = st.number_input(
         "Max PFER (approx.)",
         min_value=0.0,
@@ -1743,6 +1774,7 @@ def _render_study_details_panel(
         "n_spatial_blocks": n_spatial_blocks,
         "n_bootstraps": int(n_bootstraps_ui),
         "n_trials_per_bootstrap": int(n_trials_per_bootstrap_ui),
+        "weight_bin_pct": int(weight_bin_pct_ui),
         "min_cell_count": int(min_cell_count_ui),
         "worst_quantile": float(worst_quantile_ui),
         "max_pfer": float(max_pfer_ui),
@@ -3734,8 +3766,11 @@ def render(output_dir: str) -> None:
     spatial_split_param = bool(study_state.get("spatial_split", False))
     spatial_block_size_m_param = study_state.get("spatial_block_size_m")
     n_spatial_blocks_param = study_state.get("n_spatial_blocks")
-    n_bootstraps_param = int(study_state.get("n_bootstraps", 20))
-    n_trials_per_bootstrap_param = int(study_state.get("n_trials_per_bootstrap", 50))
+    n_bootstraps_param = int(study_state.get("n_bootstraps", 30))
+    n_trials_per_bootstrap_param = int(study_state.get("n_trials_per_bootstrap", 150))
+    weight_bin_pct_param = int(
+        study_state.get("weight_bin_pct", _cgi_formulas.WEIGHT_BIN_PCT)
+    )
     min_cell_count_param = int(study_state.get("min_cell_count", 3))
     worst_quantile_param = float(study_state.get("worst_quantile", 0.10))
     max_pfer_param = float(study_state.get("max_pfer", 1.0))
@@ -4025,6 +4060,7 @@ def render(output_dir: str) -> None:
                 st.write(
                     f"**Stability selection:** {n_bootstraps_param} bootstraps × "
                     f"{n_trials_per_bootstrap_param} trials, "
+                    f"{weight_bin_pct_param}% weight cells, "
                     f"{test_size*100:.0f}% test set · max PFER "
                     f"{'off' if max_pfer_param <= 0 else f'{max_pfer_param:g}'}"
                 )
@@ -4113,6 +4149,7 @@ def render(output_dir: str) -> None:
                 ),
                 "n_bootstraps": int(n_bootstraps_param),
                 "n_trials_per_bootstrap": int(n_trials_per_bootstrap_param),
+                "weight_bin_pct": int(weight_bin_pct_param),
                 "min_cell_count": int(min_cell_count_param),
                 "worst_quantile": float(worst_quantile_param),
                 "max_pfer": float(max_pfer_param),
