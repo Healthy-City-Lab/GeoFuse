@@ -282,6 +282,8 @@ def _fusion_restart_summary_lines(p: dict) -> list[str]:
     covs = p.get("covariate_columns") or []
     standalones = p.get("standalone_channels") or []
     lon_payload = p.get("longitudinal_spec_payload") or None
+    _max_pfer = float(p.get("max_pfer", 1.0) or 0.0)
+    _max_pfer_lbl = "off" if _max_pfer <= 0 else f"{_max_pfer:g}"
     lines = [
         f"**Target:** `{p.get('target_display_name', '?')}`",
         f"**Outcomes:** {', '.join(p.get('outcome_columns') or []) or '—'}",
@@ -293,7 +295,7 @@ def _fusion_restart_summary_lines(p: dict) -> list[str]:
         f"**Test set:** {float(p.get('test_size', 0.0) or 0.0) * 100:.0f}%",
         f"**Stability selection:** {p.get('n_bootstraps', '?')} bootstraps × "
         f"{p.get('n_trials_per_bootstrap', '?')} trials "
-        f"(min {p.get('min_cell_count', '?')}/cell)",
+        f"(min {p.get('min_cell_count', '?')}/cell · max PFER {_max_pfer_lbl})",
         f"**GVI buffers (m):** {p.get('gvi_buffer_min_m', '?')} – "
         f"{p.get('gvi_buffer_max_m', '?')} (step {p.get('gvi_buffer_step_m', '?')})",
         f"**NDVI buffers (m):** {p.get('ndvi_buffer_min_m', '?')} – "
@@ -811,6 +813,7 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "n_trials_per_bootstrap",
     "min_cell_count",
     "worst_quantile",
+    "max_pfer",
     "check_collinearity",
     "vif_threshold",
 )
@@ -1533,7 +1536,7 @@ def _render_study_details_panel(
     st.caption(
         "The channel-mix winner is calibrated automatically (selection size "
         "K + threshold π maximize the stability score, with a reported PFER "
-        "bound). Only the resampling effort is set here."
+        "bound). Set the resampling effort and the PFER cap here."
     )
     col_s1, col_s2 = st.columns(2)
     with col_s1:
@@ -1562,6 +1565,21 @@ def _render_study_details_panel(
                 "uniform coverage matters more than depth."
             ),
         )
+    max_pfer_ui = st.number_input(
+        "Max PFER (approx.)",
+        min_value=0.0,
+        max_value=50.0,
+        value=float(st.session_state.get("fusion_max_pfer", 1.0)),
+        step=0.5,
+        key="fusion_max_pfer",
+        help=(
+            "Caps the calibrated selection size K and threshold π so the "
+            "reported PFER bound K²/((2π−1)·N) stays at or below this value — "
+            "tighter values keep the stable set small and the error control "
+            "meaningful, looser values let more cells be called stable. "
+            "0 = no cap."
+        ),
+    )
     # Retained internals (no longer user-tuned): the radius sub-cell still
     # needs a minimum trial count, and q_worst is reported as a secondary
     # diagnostic at this quantile.
@@ -1727,6 +1745,7 @@ def _render_study_details_panel(
         "n_trials_per_bootstrap": int(n_trials_per_bootstrap_ui),
         "min_cell_count": int(min_cell_count_ui),
         "worst_quantile": float(worst_quantile_ui),
+        "max_pfer": float(max_pfer_ui),
         "check_collinearity": bool(check_collinearity),
         "vif_threshold": float(vif_threshold_ui),
     }
@@ -2231,15 +2250,29 @@ def _render_stability_diagnostics(summary: dict, metric_name: str) -> None:
         # Degenerate-regime flag: when the PFER bound exceeds the number of
         # stably-selected cells (or K covers most candidates), the "stable set"
         # carries no real error control — selection probability isn't
-        # discriminating and q_worst is the effective decision.
+        # discriminating and q_worst is the effective decision. An empty stable
+        # set means the PFER cap admitted no recurring cell at all.
         nss = summary.get("n_stably_selected")
         ncc = summary.get("n_candidate_cells")
         pfer = summary.get("pfer")
         ksel = summary.get("selection_size_k")
-        degenerate = summary.get("pfer_controlled") is False or (
-            pfer is not None and nss and float(pfer) >= max(1.0, float(nss))
-        ) or (ksel and ncc and float(ksel) > 0.5 * float(ncc))
-        if degenerate:
+        no_stable_set = nss is not None and int(nss) == 0
+        degenerate = (
+            summary.get("pfer_controlled") is False
+            or no_stable_set
+            or (pfer is not None and nss and float(pfer) >= max(1.0, float(nss)))
+            or (ksel and ncc and float(ksel) > 0.5 * float(ncc))
+        )
+        if no_stable_set:
+            st.warning(
+                "No stable channel-mix cell fits under your PFER cap — the cap "
+                "was honoured (reported PFER stays within budget), but no cell "
+                "recurs across resamples often enough to be called stable at "
+                "this error budget. The `q_worst` winner is the trustworthy "
+                "signal here; raise **Max PFER** to admit a (less error-"
+                "controlled) stable set."
+            )
+        elif degenerate:
             detail = (
                 f" (PFER ≈ {float(pfer):.0f} vs {nss} stable cells)"
                 if pfer is not None and nss
@@ -2410,7 +2443,10 @@ def _render_stability_diagnostics(summary: dict, metric_name: str) -> None:
         ):
             hist_df = _pd.DataFrame(history)
 
-            # OOB score per resample, top-K trials highlighted.
+            # OOB score per resample as a pair of boxplots: one for the
+            # resample's calibrated top-K trials (winners), one for the rest
+            # (losers). Boxes show each group's spread per resample instead of a
+            # cloud of individual dots.
             if {"bootstrap", "oob_score"}.issubset(hist_df.columns):
                 if "in_top_k" in hist_df.columns:
                     hist_df["Membership"] = np.where(
@@ -2419,13 +2455,15 @@ def _render_stability_diagnostics(summary: dict, metric_name: str) -> None:
                     color_arg: dict = {
                         "color": "Membership",
                         "color_discrete_map": {"Top-K": "#2ca02c", "Other": "#9aa0a6"},
+                        "category_orders": {"Membership": ["Top-K", "Other"]},
                     }
                 else:
                     color_arg = {}
-                fig_h = _px.strip(
+                fig_h = _px.box(
                     hist_df,
                     x="bootstrap",
                     y="oob_score",
+                    points=False,
                     labels={
                         "bootstrap": "Resample",
                         "oob_score": f"OOB {metric_name}",
@@ -2433,15 +2471,21 @@ def _render_stability_diagnostics(summary: dict, metric_name: str) -> None:
                     **color_arg,
                 )
                 fig_h.update_layout(
-                    height=360, margin={"l": 20, "r": 20, "t": 30, "b": 20}
+                    height=360,
+                    margin={"l": 20, "r": 20, "t": 30, "b": 20},
+                    boxmode="group",
                 )
                 st.plotly_chart(fig_h, width="stretch")
                 st.caption(
-                    "Every completed trial's out-of-bag score, one column per "
-                    "complementary-half resample. Green = trial whose channel-mix "
-                    "cell was in that resample's calibrated top-K. Tight green "
-                    "bands that recur across resamples are what selection "
-                    "probability rewards."
+                    "Two boxplots per complementary-half resample: trials whose "
+                    "channel-mix cell was in that resample's calibrated top-K "
+                    "(green = winners) versus the rest (grey = losers). A winner "
+                    "box can sit below a loser box in a resample — top-K "
+                    "membership ranks cells by their *best* trial, so a winning "
+                    "cell's other trials (different radii/aggregators) spread "
+                    "lower. The chosen winner is the cell that recurs in the "
+                    "top-K across resamples (selection probability), not the one "
+                    "scoring highest in any single resample."
                 )
 
             # Parallel coordinates over the channel weights, colored by OOB —
@@ -2492,7 +2536,8 @@ def _render_stability_diagnostics(summary: dict, metric_name: str) -> None:
 def _render_results_headline(results_view: dict, metric_name: str) -> None:
     """At-a-glance CGI bottom line: the whole-data greenery effect (headline),
     the held-out significance check, direction, and the CGI-vs-standalone
-    verdict (paired objective difference, AIC/BIC fallback)."""
+    verdict as two whole-data (all) sub-answers — the paired objective
+    difference and the AIC/BIC penalized-model comparison."""
     effects = results_view.get("cgi_effects") or {}
     all_eff = effects.get("all") or {}
     test_eff = effects.get("test") or {}
@@ -2507,10 +2552,12 @@ def _render_results_headline(results_view: dict, metric_name: str) -> None:
         except (TypeError, ValueError):
             return None
 
-    # Two rows of two so the metric labels have room to breathe — four narrow
-    # columns clip every label with "…" in a narrow window.
+    # Rows of two so the metric labels have room to breathe — narrow columns
+    # clip every label with "…" in a narrow window. The CGI-vs-standalone
+    # verdict is two adjacent sub-answers (objective + AIC/BIC) on their own row.
     cols = st.columns(2)
     cols2 = st.columns(2)
+    cols3 = st.columns(2)
 
     # 1) Whole-data effect — the headline greenery effect.
     with cols[0]:
@@ -2570,21 +2617,9 @@ def _render_results_headline(results_view: dict, metric_name: str) -> None:
         else:
             st.metric("Held-out test", "—")
 
-    # 3) Direction of the greenery↔outcome relationship.
+    # 3) CGI vs best standalone — sub-answer A: whole-data (all) paired
+    #    objective difference.
     with cols2[0]:
-        st.metric(
-            "Direction",
-            _direction_badge(direction),
-            help=(
-                "Sign of the greenery↔outcome relationship; reported separately "
-                "because distance correlation is unsigned. Positive means the "
-                "composite rises with the outcome."
-            ),
-        )
-
-    # 4) CGI vs best standalone — paired objective difference (primary),
-    #    AIC/BIC as a secondary fallback.
-    with cols2[1]:
         if paired:
             diff = _f(paired.get("observed_diff"))
             lo, hi = _f(paired.get("lower")), _f(paired.get("upper"))
@@ -2599,21 +2634,32 @@ def _render_results_headline(results_view: dict, metric_name: str) -> None:
                 )
                 p_str = f"{pp:.3g}" if pp is not None else "—"
                 help_txt = (
-                    f"Paired bootstrap difference in {metric_name} (CGI − `{ch}`) "
-                    f"on the full dataset: Δ={diff:.4f} {ci_str}, one-sided "
-                    f"p={p_str} (positive favours CGI)."
+                    f"Whole-data (all) paired bootstrap difference in "
+                    f"{metric_name} (CGI − `{ch}`): Δ={diff:.4f} {ci_str}, "
+                    f"one-sided p={p_str} (positive favours CGI)."
                 )
             else:
                 help_txt = "Comparison unavailable."
-            st.metric("CGI vs best standalone", verdict, help=help_txt)
-        elif aic_bic and aic_bic.get("ok"):
+            st.metric("CGI vs standalone — objective (all)", verdict, help=help_txt)
+        else:
+            st.metric(
+                "CGI vs standalone — objective (all)",
+                "—",
+                help="Enable standalone studies to compare CGI against them.",
+            )
+
+    # 4) CGI vs best standalone — sub-answer B: whole-data (all) AIC/BIC
+    #    penalized-model comparison.
+    with cols2[1]:
+        if aic_bic and aic_bic.get("ok"):
             d_bic = _f(aic_bic.get("delta_bic"))
             st.metric(
-                "CGI vs best standalone",
+                "CGI vs standalone — AIC/BIC (all)",
                 str(aic_bic.get("verdict", "—")),
                 help=(
                     "AIC/BIC of CGI (all channels) vs the best single channel "
-                    f"(`{aic_bic.get('best_channel')}`). "
+                    f"(`{aic_bic.get('best_channel')}`), both fit on the whole "
+                    "dataset. "
                     + (
                         f"ΔBIC={d_bic:.1f} (positive favours CGI)."
                         if d_bic is not None
@@ -2623,16 +2669,28 @@ def _render_results_headline(results_view: dict, metric_name: str) -> None:
             )
         elif aic_bic is not None:
             st.metric(
-                "CGI vs best standalone",
+                "CGI vs standalone — AIC/BIC (all)",
                 "inconclusive",
                 help=str(aic_bic.get("reason", "Comparison unavailable.")),
             )
         else:
             st.metric(
-                "CGI vs best standalone",
+                "CGI vs standalone — AIC/BIC (all)",
                 "—",
                 help="Enable standalone studies to compare CGI against them.",
             )
+
+    # 5) Direction of the greenery↔outcome relationship.
+    with cols3[0]:
+        st.metric(
+            "Direction",
+            _direction_badge(direction),
+            help=(
+                "Sign of the greenery↔outcome relationship; reported separately "
+                "because distance correlation is unsigned. Positive means the "
+                "composite rises with the outcome."
+            ),
+        )
 
 
 def _render_study_detail(
@@ -2647,8 +2705,8 @@ def _render_study_detail(
 
     Renders: test score + CI / direction / n tiles · the winning params
     (weights + radii + aggregators, formula-aware; standalones show their
-    single active channel) · per-subset scores (train / val / test / all) ·
-    the final params JSON · and the stability-selection diagnostics.
+    single active channel) · per-subset scores (bootstraps / held-out test /
+    all) · the final params JSON · and the stability-selection diagnostics.
     """
     averaged_raw = study_view.get("averaged_params") or {}
     best_params = study_view.get("best_params") or {}
@@ -2790,13 +2848,13 @@ def _render_study_detail(
             "test": effects.get("test"),
             "all": effects.get("all"),
         }
-        # Friendly labels — there is no train→fit→validate step; these are the
-        # in-pool fit and the cross-resample out-of-bag signal.
+        # Friendly labels — there is no train→fit→validate step. The displayed
+        # slices are the cross-resample bootstrap signal, the untouched held-out
+        # test, and the whole dataset.
         subset_label = {
-            "train": "In-pool (train+val)",
-            "val": "OOB (cross-resample)",
-            "test": "Test (held-out)",
-            "all": "All entities",
+            "val": "Bootstraps",
+            "test": "Held-out test",
+            "all": "All",
         }
 
         def _fmt_ci(block: dict | None) -> str | None:
@@ -2812,7 +2870,7 @@ def _render_study_detail(
 
         st.markdown("**Scores by data subset**")
         rows: list[dict] = []
-        for subset in ("train", "val", "test", "all"):
+        for subset in ("val", "test", "all"):
             block = subset_scores.get(subset) or {}
             if not block:
                 continue
@@ -2837,16 +2895,14 @@ def _render_study_detail(
         if rows:
             st.dataframe(pd.DataFrame(rows), width="stretch")
             cap = (
-                "Stability selection resamples the train+val pool into "
-                "complementary halves — there is no train→fit→validate step. "
-                "**In-pool** = winning params scored on the full train+val pool "
-                "(an in-sample fit) · **OOB** = winning-cell median out-of-bag "
-                "score across resamples (cross-resample held-out signal) · "
-                "**Test** = untouched held-out split · **All** = every entity "
-                "(the headline effect). 95% CIs are percentile bootstrap; the "
-                "in-pool CI is in-sample (optimistic) and carries no "
-                "permutation p. `p (perm)` is the held-out permutation p-value "
-                "on the test and all slices."
+                "Stability selection resamples the full train+val pool into "
+                "complementary halves, so there is no train→fit→validate step. "
+                "**Bootstraps** = winning-cell median out-of-bag score across "
+                "the complementary-half resamples (the cross-resample signal) · "
+                "**Held-out test** = untouched test split the params never saw · "
+                "**All** = every entity (the headline effect). 95% CIs are "
+                "percentile bootstrap; `p (perm)` is the permutation p-value on "
+                "the held-out test and all slices."
             )
             if has_covariates:
                 cap += (
@@ -2878,17 +2934,16 @@ def _render_cross_study_comparison(results_view: dict, metric_name: str) -> None
         if b:
             studies.append((ch, f"{_CHANNEL_DISPLAY.get(ch, ch)} (standalone)", b))
 
-    # ── Score bars (test + all) ───────────────────────────────────────
+    # ── Score bars (bootstraps + all) ─────────────────────────────────
     _subset_label = {
-        "train": "In-pool",
-        "val": "OOB",
-        "test": "Test",
+        "val": "Bootstraps",
+        "test": "Held-out test",
         "all": "All",
     }
     subset_picks = st.multiselect(
         "Subsets to compare",
-        options=["train", "val", "test", "all"],
-        default=["test", "all"],
+        options=["val", "test", "all"],
+        default=["val", "all"],
         format_func=lambda s: _subset_label.get(s, s),
         key="fusion_compare_subsets",
         help="Each study's stability-selected params, scored on each subset.",
@@ -2943,8 +2998,9 @@ def _render_cross_study_comparison(results_view: dict, metric_name: str) -> None
         st.caption(
             f"Full model = `outcome ~ veg + terrain + ndvi (+ covariates)`; "
             f"reduced model = `outcome ~ {best_ch} (+ covariates)` — the best "
-            f"single channel by held-out test score. Lower AIC/BIC is better; "
-            f"a positive Δ favours CGI. **Verdict: {aic_bic.get('verdict')}** "
+            f"single channel by whole-data (all) score. Both models are fit on "
+            f"the whole dataset (all entities). Lower AIC/BIC is better; a "
+            f"positive Δ favours CGI. **Verdict: {aic_bic.get('verdict')}** "
             f"(n = {aic_bic.get('n')})."
         )
         comp_rows = [
@@ -3682,6 +3738,7 @@ def render(output_dir: str) -> None:
     n_trials_per_bootstrap_param = int(study_state.get("n_trials_per_bootstrap", 50))
     min_cell_count_param = int(study_state.get("min_cell_count", 3))
     worst_quantile_param = float(study_state.get("worst_quantile", 0.10))
+    max_pfer_param = float(study_state.get("max_pfer", 1.0))
     check_collinearity_param = bool(study_state.get("check_collinearity", False))
     vif_threshold_param = float(study_state.get("vif_threshold", 10.0))
 
@@ -3968,7 +4025,8 @@ def render(output_dir: str) -> None:
                 st.write(
                     f"**Stability selection:** {n_bootstraps_param} bootstraps × "
                     f"{n_trials_per_bootstrap_param} trials, "
-                    f"{test_size*100:.0f}% test set"
+                    f"{test_size*100:.0f}% test set · max PFER "
+                    f"{'off' if max_pfer_param <= 0 else f'{max_pfer_param:g}'}"
                 )
 
             from services import get_job_executor, get_job_store
@@ -4057,6 +4115,7 @@ def render(output_dir: str) -> None:
                 "n_trials_per_bootstrap": int(n_trials_per_bootstrap_param),
                 "min_cell_count": int(min_cell_count_param),
                 "worst_quantile": float(worst_quantile_param),
+                "max_pfer": float(max_pfer_param),
                 "check_collinearity": bool(check_collinearity_param),
                 "vif_threshold": float(vif_threshold_param),
             }

@@ -477,19 +477,25 @@ def calibrate_stability_selection(
     **stably excluded** when ``≤ ⌊B(1−π)⌋``, and unstable in between. The
     ``(K, π)`` maximising ``S`` is the calibrated configuration.
 
-    ``max_pfer`` caps the selection size: configs whose PFER bound exceeds it
-    are excluded, so ``K`` can't grow large enough to make the error control
-    vacuous (PFER grows like ``K²``). When no controlled config has any stably
-    selected cell, the best uncontrolled config is returned with
-    ``pfer_controlled=False`` so the caller can flag the degenerate regime.
-    Pass ``None`` to disable the cap.
+    ``max_pfer`` is a **hard** cap on the selection size: configs whose PFER
+    bound exceeds it are excluded, so ``K`` can't grow large enough to make the
+    error control vacuous (PFER grows like ``K²``). When no in-budget config has
+    a non-empty stable set, the cap is still honoured — the unconstrained
+    optimum's ``K`` is clamped down to the largest value whose PFER stays within
+    budget and the (usually empty) stable set is recomputed there, so the
+    reported ``pfer`` never exceeds ``max_pfer``. An empty stable set is the
+    honest "no stable set exists at this error budget", flagged via
+    ``stable_set_under_cap=False`` for the caller to surface. Pass ``None`` to
+    disable the cap (then a ``pi == 0.5`` optimum can still be returned with
+    ``pfer_controlled=False``).
 
     Returns a dict with ``K``, ``pi``, ``score``, ``gamma``, ``n_candidates``,
     ``n_resamples``, ``n_stably_selected``, ``selection_counts`` (id → count at
     ``K``), ``pfer`` — the Meinshausen–Bühlmann per-family error-rate upper
     bound ``E[V] ≤ K² / ((2π−1)·N)`` (rigorous under ⌊n/2⌋ subsampling; an
-    approximate guide under bootstrap resampling) — and ``pfer_controlled``.
-    Returns ``None`` when there are too few candidates or resamples to calibrate.
+    approximate guide under bootstrap resampling) — ``pfer_controlled``, and
+    ``stable_set_under_cap``. Returns ``None`` when there are too few candidates
+    or resamples to calibrate.
     """
     import math
 
@@ -542,6 +548,7 @@ def calibrate_stability_selection(
                 "n_stably_selected": int(n_ss),
                 "selection_counts": dict(counts),
                 "pfer": float(pfer),
+                "stable_set_under_cap": True,
             }
             if best_any is None or score > best_any["score"]:
                 best_any = cand
@@ -552,7 +559,45 @@ def calibrate_stability_selection(
     if best is not None:
         best["pfer_controlled"] = True
         return best
-    if best_any is not None:
+    if best_any is None:
+        return None
+    if max_pfer is None:
+        # No cap in force yet no controlled config — only reachable when the
+        # optimum sits at pi == 0.5 (infinite PFER). Report it honestly.
         best_any["pfer_controlled"] = False
         return best_any
-    return None
+    # A cap is in force but no configuration with a non-empty stable set fits
+    # under it. Honour the cap rather than abandoning it: clamp the
+    # unconstrained optimum's selection size K down to the largest value whose
+    # PFER bound stays within budget at that threshold, and recompute the stable
+    # set there. The reported PFER never exceeds ``max_pfer``; the stable set is
+    # usually empty (the honest "no stable set at this error budget").
+    pi_star = float(best_any["pi"])
+    denom = (2.0 * pi_star - 1.0) * N
+    k_cap = int(math.floor(math.sqrt(max_pfer * denom))) if denom > 0 else 0
+    k_cap = max(0, min(int(best_any["K"]), k_cap))
+    counts = {}
+    for r in rankings:
+        for cid in r[:k_cap]:
+            counts[cid] = counts.get(cid, 0) + 1
+    h_vals = (
+        np.array(list(counts.values()), dtype=np.int64)
+        if counts
+        else np.zeros(0, dtype=np.int64)
+    )
+    hi = math.ceil(pi_star * B)
+    n_ss = int(np.sum(h_vals >= hi)) if h_vals.size else 0
+    pfer_capped = (k_cap * k_cap) / denom if (denom > 0 and k_cap > 0) else 0.0
+    return {
+        "K": int(k_cap),
+        "pi": pi_star,
+        "score": float(best_any["score"]),
+        "gamma": float(min(1.0, k_cap / N)) if N else 0.0,
+        "n_candidates": int(N),
+        "n_resamples": int(B),
+        "n_stably_selected": int(n_ss),
+        "selection_counts": dict(counts),
+        "pfer": float(pfer_capped),
+        "pfer_controlled": True,
+        "stable_set_under_cap": bool(n_ss > 0),
+    }

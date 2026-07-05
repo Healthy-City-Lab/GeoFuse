@@ -1179,11 +1179,12 @@ def _compare_cgi_vs_standalone(
 ) -> dict | None:
     """AIC/BIC verdict: is CGI justified over the best single standalone channel?
 
-    The best standalone is the channel with the strongest held-out test score
-    (direction-aware). The full (3-channel) and reduced (best-channel) models
-    are fit on the train+val pool's per-entity channel design built at the CGI
-    winning aggregation params. Returns ``None`` when no standalone qualifies or
-    the design / fit fails.
+    The best standalone is the channel with the strongest whole-data (``all``)
+    score (direction-aware). The full (3-channel) and reduced (best-channel)
+    models are fit on the whole dataset's per-entity channel design built at the
+    CGI winning aggregation params, so the verdict is on the same ``all`` slice
+    as the paired objective comparison. Returns ``None`` when no standalone
+    qualifies or the design / fit fails.
     """
     from .. import mixed_effects_scoring as _me
     from .. import objective_scoring as _scoring
@@ -1197,7 +1198,8 @@ def _compare_cgi_vs_standalone(
         b = standalones_bundle.get(ch)
         if not b:
             continue
-        ts = (b.get("test_results") or {}).get("test_score")
+        ss = (b.get("subset_scores") or {}).get("all") or {}
+        ts = ss.get("score")
         if ts is None or not np.isfinite(float(ts)):
             continue
         scored.append((ch, float(ts)))
@@ -1207,7 +1209,7 @@ def _compare_cgi_vs_standalone(
     best_idx = chans.index(best_ch)
 
     try:
-        design = engine.build_channel_design(cgi_params, subset="train_val")
+        design = engine.build_channel_design(cgi_params, subset="all")
     except Exception as exc:
         log("WARN", f"AIC/BIC channel design failed: {exc}")
         return None
@@ -1328,6 +1330,7 @@ def run_fusion(
     n_trials_per_bootstrap: int = 50,
     min_cell_count: int = 3,
     worst_quantile: float = 0.10,
+    max_pfer: float = 1.0,
     spatial_split: bool = False,
     spatial_block_size_m: float | None = None,
     n_spatial_blocks: int | None = None,
@@ -1339,10 +1342,13 @@ def run_fusion(
     For CGI (and each enabled standalone channel) the engine draws
     ``n_bootstraps`` resamples of the train+val pool, runs an
     ``n_trials_per_bootstrap``-trial RandomSampler search per resample, and
-    selects the weight cell with the best worst-quantile out-of-bag score. The
-    winning params are then scored once on the held-out test split with a
-    percentile bootstrap CI. When standalones are enabled, an AIC/BIC
-    comparison reports whether CGI is justified over the best single channel."""
+    selects the weight cell with the best worst-quantile out-of-bag score.
+    ``max_pfer`` caps the calibrated selection size so the reported PFER bound
+    stays under it (a non-positive value disables the cap). The winning params
+    are then scored once on the held-out test split with a percentile bootstrap
+    CI. When standalones are enabled, both a whole-data (``all``) paired
+    objective comparison and an ``all``-data AIC/BIC comparison report whether
+    CGI is justified over the best single channel."""
     try:
         targets = list(target_features_geojson) if target_features_geojson else [None]
         n_t = max(len(targets), 1)
@@ -1426,6 +1432,7 @@ def run_fusion(
             "n_trials_per_bootstrap": int(n_trials_per_bootstrap),
             "min_cell_count": int(min_cell_count),
             "worst_quantile": float(worst_quantile),
+            "max_pfer": float(max_pfer),
             "buffer_meters": buffer_meters,
             "gvi_buffer_min_m": gvi_buffer_min_m,
             "gvi_buffer_max_m": gvi_buffer_max_m,
@@ -1923,6 +1930,9 @@ def run_fusion(
             ctx.progress(
                 value=prog(0.9), status_text=f"{prefix}Evaluating on test set..."
             )
+            # A non-positive cap means "no PFER cap" — pass None so the
+            # calibration is free to grow the selection size K.
+            max_pfer_arg = None if float(max_pfer) <= 0 else float(max_pfer)
             # Headline params: the stability-selection winning weight cell on
             # the full train+val pool (params averaged within the cell).
             headline_params = engine.bootstrap_stability_selection(
@@ -1931,6 +1941,7 @@ def run_fusion(
                 n_trials_per_bootstrap=cgi_trials_per_bootstrap,
                 min_cell_count=int(min_cell_count),
                 worst_quantile=float(worst_quantile),
+                max_pfer=max_pfer_arg,
                 spatial_resample=bool(spatial_split),
                 seed=42,
                 cancel_callback=cancel_check,
@@ -2070,6 +2081,7 @@ def run_fusion(
                     n_trials_per_bootstrap=int(standalone_trials_per_bootstrap),
                     min_cell_count=int(min_cell_count),
                     worst_quantile=float(worst_quantile),
+                    max_pfer=max_pfer_arg,
                     spatial_resample=bool(spatial_split),
                     seed=42,
                     cancel_callback=cancel_check,

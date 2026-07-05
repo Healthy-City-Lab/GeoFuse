@@ -5926,10 +5926,11 @@ class MetricFusionEngine:
 
         Aggregates **all three** channels (veg / terrain / ndvi) at ``params``'
         radii / stats / percentiles on the requested ``subset`` (``"train_val"``
-        for the resampling pool, ``"test"`` for the held-out set), collapses to
-        one row per entity (polygon mean when polygon-keyed), and returns the
-        raw arrays plus the aligned target, covariates, and — in longitudinal
-        mode — entity ids and ``years_since_baseline``.
+        for the resampling pool, ``"test"`` for the held-out set, ``"all"`` for
+        every entity), collapses to one row per entity (polygon mean when
+        polygon-keyed), and returns the raw arrays plus the aligned target,
+        covariates, and — in longitudinal mode — entity ids and
+        ``years_since_baseline``.
 
         No scaling is applied: OLS / MixedLM AIC and BIC are invariant to an
         affine transform of an individual predictor, so raw channel values are
@@ -5940,8 +5941,17 @@ class MetricFusionEngine:
             data = self.test_data
         elif subset == "train_val":
             data = self.train_val_data
+        elif subset == "all":
+            parts = [
+                d
+                for d in (self.train_val_data, self.test_data)
+                if d is not None and len(d) > 0
+            ]
+            data = pd.concat(parts) if parts else None
         else:
-            raise ValueError(f"subset must be 'train_val' or 'test'; got {subset!r}.")
+            raise ValueError(
+                f"subset must be 'train_val', 'test', or 'all'; got {subset!r}."
+            )
         if data is None:
             raise ValueError(f"No {subset} data available. Run split_data() first.")
 
@@ -7017,6 +7027,7 @@ class MetricFusionEngine:
         top_percent_per_bootstrap: float = 0.2,
         min_cell_count: int = 3,
         worst_quantile: float = 0.10,
+        max_pfer: float | None = 1.0,
         radius_bin_m: int | None = None,
         spatial_resample: bool = False,
         seed: int = 42,
@@ -7085,6 +7096,12 @@ class MetricFusionEngine:
                 higher-is-better metrics; 90th percentile for lower-is-
                 better. Tighter (e.g. 0.05) penalises rare-bad-luck cells
                 harder; looser (e.g. 0.25) tolerates more bad-luck draws.
+            max_pfer: Upper bound on the (approximate) per-family error rate
+                the calibration is allowed to accept. Configs whose PFER bound
+                ``K² / ((2π−1)·N)`` exceeds this are excluded, capping the
+                selection size K and threshold π so the error control can't go
+                vacuous. ``None`` (or a non-positive value, normalised by the
+                caller) disables the cap.
             seed: RNG seed for reproducibility.
             cancel_callback: Bumped from the runner so a user-cancelled job
                 aborts the bootstrap loop cleanly.
@@ -7504,7 +7521,9 @@ class MetricFusionEngine:
                 sorted(rep, key=lambda c: rep[c], reverse=higher_is_better)
             )
         n_candidate_cells = len(cells)
-        calib = _stats_mod.calibrate_stability_selection(rankings, n_candidate_cells)
+        calib = _stats_mod.calibrate_stability_selection(
+            rankings, n_candidate_cells, max_pfer=max_pfer
+        )
         n_bs_used = max(1, len(rankings))
 
         if calib is not None:
