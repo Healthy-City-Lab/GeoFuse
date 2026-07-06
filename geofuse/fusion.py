@@ -461,6 +461,12 @@ class MetricFusionEngine:
         self._ring_vector_cache: dict = {}
         self._max_points_ring_cache = 8000
 
+        # Reporting-phase caches (all invalidated by ``split_data``): the
+        # train+val+test union frame is rebuilt by several report helpers, and
+        # ``apply_fusion`` is called repeatedly with the same winning params.
+        self._full_data_cache: pd.DataFrame | None = None
+        self._apply_fusion_cache: tuple[tuple, pd.DataFrame] | None = None
+
         # Spatial pre-aggregation (mandatory; built by precompute_aggregations()).
         # Backed by an on-disk SQLite cache (geofuse/preaggregation.py) so the
         # per-(entity, radius) stat table survives cancels/crashes and is reused
@@ -1871,9 +1877,12 @@ class MetricFusionEngine:
             ]
             circle_mask = (x**2 + y**2) <= radius_pixels**2
 
-            # Sample each point
-            for idx, point in points_metric_crs.iterrows():
-                row, col = rowcol(transform, point.geometry.x, point.geometry.y)
+            # Sample each point — positional loop over pre-extracted coordinate
+            # arrays (avoids the per-row Series construction of iterrows()).
+            _xs = points_metric_crs.geometry.x.to_numpy()
+            _ys = points_metric_crs.geometry.y.to_numpy()
+            for idx, _px, _py in zip(points_metric_crs.index, _xs, _ys):
+                row, col = rowcol(transform, _px, _py)
 
                 # Extract window around point
                 rmin = max(row - radius_pixels, 0)
@@ -1990,19 +1999,20 @@ class MetricFusionEngine:
                 f"Joined shape: {joined.shape}, Points shape: {len(points_gdf)}"
             )
 
-            # Aggregate by original point index
-            for idx in points_gdf.index:
-                subset = joined[joined.index == idx]
-                if len(subset) > 0 and metric_col in subset.columns:
-                    values = subset[metric_col].dropna().values
-                    if len(values) > 0:
-                        pos = idx_to_pos[idx]
-                        if stat == "mean":
-                            result[pos] = np.mean(values)
-                        elif stat == "median":
-                            result[pos] = np.median(values)
-                        elif stat == "percentile":
-                            result[pos] = np.percentile(values, percentile)
+            # Aggregate by original point index — one vectorized groupby over the
+            # joined frame instead of a per-point boolean scan (which was O(n²)).
+            if metric_col in joined.columns:
+                grouped = joined[metric_col].dropna().groupby(level=0)
+                if stat == "median":
+                    agg = grouped.median()
+                elif stat == "percentile":
+                    agg = grouped.quantile(percentile / 100.0)
+                else:
+                    agg = grouped.mean()
+                for idx, val in agg.items():
+                    pos = idx_to_pos.get(idx)
+                    if pos is not None:
+                        result[pos] = val
 
             # Log summary of results
             valid_count = np.sum(~np.isnan(result))
@@ -2129,9 +2139,13 @@ class MetricFusionEngine:
 
         idx_to_pos = {idx: pos for pos, idx in enumerate(points_gdf.index)}
 
-        for idx, point in points_metric_crs.iterrows():
+        # Positional loop over pre-extracted coordinates (skips iterrows' per-row
+        # Series construction).
+        _xs = points_metric_crs.geometry.x.to_numpy()
+        _ys = points_metric_crs.geometry.y.to_numpy()
+        for idx, _px, _py in zip(points_metric_crs.index, _xs, _ys):
             pos = idx_to_pos[idx]
-            row, col = rowcol(transform, point.geometry.x, point.geometry.y)
+            row, col = rowcol(transform, _px, _py)
 
             rmin = max(row - max_r_px, 0)
             rmax = min(row + max_r_px + 1, metric_array.shape[0])
@@ -2307,6 +2321,12 @@ class MetricFusionEngine:
             )
             if looked_up is not None:
                 return looked_up
+
+        # Fell through the fast path (or pre-aggregation off): the ring-cache and
+        # circular-buffer routines need geometry, so re-materialize it if a
+        # geometry-free slice was passed in (see the fast path in ``_objective``).
+        if not isinstance(points_gdf, gpd.GeoDataFrame):
+            points_gdf = self.target_gdf.loc[points_gdf.index]
 
         if (
             fold_idx is None
@@ -4791,6 +4811,11 @@ class MetricFusionEngine:
             spatial_block_size_m: Block edge length (metres) when blocking.
             n_spatial_blocks: Target block count when blocking.
         """
+        # A fresh split invalidates the reporting-phase caches (they key off the
+        # train+val / test frames this method rebuilds).
+        self._full_data_cache = None
+        self._apply_fusion_cache = None
+
         # Step 1: Sample all metrics at initial buffer distance
         logger.info("Step 1/4: Sampling metrics at point locations...")
         if fusion_df is None:
@@ -5193,9 +5218,21 @@ class MetricFusionEngine:
 
             # ─── Apply Dynamic Radius and Aggregation ─────────────────────────────
             # Both points and rasters use the same circular buffer aggregation
-            # For rasters, _prepare_raster_fusion() converted pixels to points at centers
-            train_points = self.target_gdf.loc[train_data.index].copy()
-            val_points = self.target_gdf.loc[val_data.index].copy()
+            # For rasters, _prepare_raster_fusion() converted pixels to points at centers.
+            # On the pre-aggregation fast path the aggregator only needs row
+            # indices (+ wave / _preaggr_id), so pass a geometry-free slice and
+            # skip copying the geometry column every trial × fold.
+            if getattr(self, "_preaggregation_done", False):
+                light_cols = [
+                    c
+                    for c in ("wave", "_preaggr_id")
+                    if c in self.target_gdf.columns
+                ]
+                train_points = self.target_gdf.loc[train_data.index, light_cols]
+                val_points = self.target_gdf.loc[val_data.index, light_cols]
+            else:
+                train_points = self.target_gdf.loc[train_data.index]
+                val_points = self.target_gdf.loc[val_data.index]
 
             # Apply circular buffer aggregation for vegetation (with SHARED streetview_stat)
             if channel_active["veg"]:
@@ -5575,6 +5612,12 @@ class MetricFusionEngine:
 
             fold_train_scores.append(train_score)
             fold_val_scores.append(val_score)
+
+        # Every fold was skipped (all-NaN composites) → no usable score; return
+        # the metric's worst value so Optuna avoids this region (and no empty
+        # np.mean warning fires).
+        if not fold_val_scores:
+            return -np.inf if metric != "nrmse" else np.inf
 
         # ─── Store Aggregate Statistics ────────────────────────────────────────
         avg_train_score = np.mean(fold_train_scores)
@@ -6159,6 +6202,31 @@ class MetricFusionEngine:
             ),
         }
 
+    def _full_data_frame(self) -> "pd.DataFrame | None":
+        """train+val+test union frame, concatenated once and cached.
+
+        Several report helpers need every entity's rows; rebuilding the concat
+        each time is wasteful. Invalidated by :meth:`split_data`.
+        """
+        if self._full_data_cache is None:
+            parts = [
+                d for d in (self.train_val_data, self.test_data) if d is not None
+            ]
+            self._full_data_cache = pd.concat(parts) if parts else None
+        return self._full_data_cache
+
+    @staticmethod
+    def _fusion_param_key(channel_mode: str, weights: dict) -> tuple:
+        """Hashable key over the params that determine the composite."""
+        items = tuple(
+            sorted(
+                (str(k), v)
+                for k, v in weights.items()
+                if not str(k).startswith("__")
+            )
+        )
+        return (channel_mode, items)
+
     def apply_fusion(self, weights: dict | None = None) -> pd.DataFrame:
         """
         Apply fusion weights to create composite index.
@@ -6170,6 +6238,11 @@ class MetricFusionEngine:
 
         Returns:
             DataFrame with target, veg, terrain, ndvi, and composite columns
+
+        The result is memoized on ``(active channel, composite params)`` so the
+        reporting layer — which applies the same winning params on several
+        subsets — recomputes it at most once. The cache is invalidated by
+        :meth:`split_data`.
         """
         if weights is None:
             if self.best_params is None:
@@ -6177,6 +6250,11 @@ class MetricFusionEngine:
                     "No weights available. Run optimization or provide weights."
                 )
             weights = self.best_params
+
+        cache_key = self._fusion_param_key(self._active_greenery_channel, weights)
+        cached = self._apply_fusion_cache
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
 
         # The active mode decides which channels contribute and how the
         # composite is built — apply_fusion routes through the same fork as
@@ -6205,8 +6283,10 @@ class MetricFusionEngine:
         ndvi_percentile = weights.get("ndvi_percentile", 50)
         ndvi_radius = weights.get("ndvi_radius", int(round(self.ndvi_buffer_max_m)))
 
-        # Combine all data (train+val+test)
-        all_data = pd.concat([self.train_val_data, self.test_data])
+        # Combine all data (train+val+test) — cached union frame.
+        all_data = self._full_data_frame()
+        if all_data is None:
+            raise ValueError("No data available. Run split_data() first.")
         all_points = self.target_gdf.loc[all_data.index].copy()
 
         # Apply circular buffer aggregation with optimized parameters
@@ -6314,8 +6394,10 @@ class MetricFusionEngine:
                 )
                 .reset_index()
             )
+            self._apply_fusion_cache = (cache_key, poly_df)
             return poly_df
 
+        self._apply_fusion_cache = (cache_key, result_df)
         return result_df
 
     def _score_data_subset(
@@ -6360,8 +6442,8 @@ class MetricFusionEngine:
             composite = np.asarray(df["composite"].values, dtype=np.float64)
             cov_mat: np.ndarray | None = None
             cov_cols = self.covariate_columns or []
-            if cov_cols and "polygon_id" in df.columns:
-                full = pd.concat([self.train_val_data, self.test_data])
+            full = self._full_data_frame()
+            if cov_cols and full is not None and "polygon_id" in df.columns:
                 cov_per_poly = (
                     full.groupby("polygon_id", sort=False)[cov_cols]
                     .first()
@@ -6422,10 +6504,9 @@ class MetricFusionEngine:
         cov_cols = self.covariate_columns or []
         if not cov_cols or "polygon_id" not in df.columns:
             return None
-        parts = [d for d in (self.train_val_data, self.test_data) if d is not None]
-        if not parts:
+        full = self._full_data_frame()
+        if full is None:
             return None
-        full = pd.concat(parts)
         cov_per_poly = (
             full.groupby("polygon_id", sort=False)[cov_cols]
             .first()
@@ -6443,10 +6524,9 @@ class MetricFusionEngine:
         """
         if self.spatial_adjust_method == "none":
             return None
-        parts = [d for d in (self.train_val_data, self.test_data) if d is not None]
-        if not parts:
+        full = self._full_data_frame()
+        if full is None:
             return None
-        full = pd.concat(parts)
         if "_cx" not in full.columns or "_cy" not in full.columns:
             return None
         if "polygon_id" in df.columns and "polygon_id" in full.columns:
@@ -6935,8 +7015,10 @@ class MetricFusionEngine:
             df = self.apply_fusion(weights=dict(params))
             target = np.asarray(df["target"].values, dtype=np.float64)
             composite = np.asarray(df["composite"].values, dtype=np.float64)
+            full = self._full_data_frame()
+            if full is None:
+                return None
             if "polygon_id" in df.columns:
-                full = pd.concat([self.train_val_data, self.test_data])
                 cov_per_poly = (
                     full.groupby("polygon_id", sort=False)[cov_cols]
                     .first()
@@ -6944,7 +7026,6 @@ class MetricFusionEngine:
                 )
                 cov_mat = cov_per_poly.to_numpy(dtype=np.float64)
             else:
-                full = pd.concat([self.train_val_data, self.test_data])
                 cov_mat = full[cov_cols].to_numpy(dtype=np.float64)
 
             mask = ~(
