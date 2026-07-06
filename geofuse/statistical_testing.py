@@ -274,8 +274,11 @@ def bootstrap_score_ci(
     rng = np.random.default_rng(seed)
     n = len(t)
     scores = np.empty(n_bootstrap, dtype=np.float64)
+    # One batched draw is bit-identical to per-replicate ``integers`` (row-major
+    # fill) but skips the per-iteration RNG-call overhead.
+    boot_idx = rng.integers(0, n, size=(n_bootstrap, n))
     for i in range(n_bootstrap):
-        idx = rng.integers(0, n, size=n)
+        idx = boot_idx[i]
         try:
             scores[i] = _score(t[idx], p[idx], idx)
         except Exception:
@@ -309,14 +312,19 @@ def bootstrap_score_ci(
         # Captures how the variance of the score depends on the data —
         # without it, BCa collapses to a bias-corrected interval that
         # under-covers when the score is skewed (correlation near ±1, etc.).
+        # Leave-one-out via a toggled boolean mask — same keep-set as
+        # ``np.delete`` per i, without rebuilding an index array each pass.
         jack_scores = np.empty(n, dtype=np.float64)
-        all_idx = np.arange(n)
+        base_idx = np.arange(n)
+        keep_mask = np.ones(n, dtype=bool)
         for i in range(n):
-            keep = np.delete(all_idx, i)
+            keep_mask[i] = False
+            keep = base_idx[keep_mask]
             try:
                 jack_scores[i] = _score(t[keep], p[keep], keep)
             except Exception:
                 jack_scores[i] = np.nan
+            keep_mask[i] = True
         jack_valid = jack_scores[~np.isnan(jack_scores)]
         if len(jack_valid) >= 2:
             jack_mean = float(np.mean(jack_valid))
@@ -373,14 +381,17 @@ def permutation_pvalue(
 ) -> dict:
     """One-sided permutation p-value for ``score_fn(target, prediction)``.
 
-    Shuffles ``prediction`` against the fixed ``target`` (and covariates, which
-    stay row-aligned with ``target``) ``n_perm`` times to build the null
-    distribution of the score under no association, then reports the add-one
+    Without covariates the null shuffles ``prediction`` against the fixed
+    ``target``. With covariates it uses **Freedman–Lane**: the target is
+    regressed on the covariates and only its residuals are permuted (then added
+    back to the fitted part), so both sides keep their covariate structure and
+    the null isolates the *partial* target↔prediction association — the correct
+    null for the covariate-adjusted score (plain prediction-shuffling would break
+    the prediction↔covariate link and bias the p-value). ``score_fn`` is called
+    in its 3-argument form. The surrogate outcome uses a linear covariate model,
+    so for metrics that condition on covariates nonlinearly it is an
+    approximation. ``higher_is_better`` sets the tail; the report is the add-one
     smoothed fraction of null scores at least as extreme as the observed one.
-    ``higher_is_better`` sets the tail: the upper tail for correlation-style
-    metrics, the lower tail for error-style metrics. When ``covariates`` is
-    given, ``score_fn`` is called in its 3-argument form and the p-value
-    reflects the covariate-adjusted score the scorer computes.
 
     Returns a dict with ``observed``, ``p_value``, ``n_perm`` (effective),
     ``null_mean``, and ``higher_is_better``.
@@ -412,22 +423,34 @@ def permutation_pvalue(
     if len(t) < 3:
         return nan_result
 
-    def _score(pred_arr: np.ndarray) -> float:
-        if cov_arr is None:
-            return float(score_fn(t, pred_arr))
-        return float(score_fn(t, pred_arr, cov_arr))
-
-    observed = _score(p)
+    n = len(t)
+    observed = (
+        float(score_fn(t, p)) if cov_arr is None else float(score_fn(t, p, cov_arr))
+    )
     if not np.isfinite(observed):
         return nan_result
 
+    if cov_arr is None:
+        # No covariates: shuffle the prediction against the fixed target.
+        def _perm_score(idx: np.ndarray) -> float:
+            return float(score_fn(t, p[idx]))
+    else:
+        # Freedman–Lane: permute the target residuals after regressing on the
+        # covariates, keeping each side's covariate structure intact.
+        Xc = np.column_stack([np.ones(n), cov_arr])
+        beta, *_ = np.linalg.lstsq(Xc, t, rcond=None)
+        t_fit = Xc @ beta
+        t_res = t - t_fit
+
+        def _perm_score(idx: np.ndarray) -> float:
+            return float(score_fn(t_fit + t_res[idx], p, cov_arr))
+
     rng = np.random.default_rng(seed)
-    n = len(t)
     null = np.empty(int(n_perm), dtype=np.float64)
     for i in range(int(n_perm)):
         idx = rng.permutation(n)
         try:
-            null[i] = _score(p[idx])
+            null[i] = _perm_score(idx)
         except Exception:
             null[i] = np.nan
 
