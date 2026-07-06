@@ -1163,7 +1163,14 @@ def _direction_sign(engine: Any, params: dict, metric: str) -> int:
         target = np.asarray(res.get("targets"), dtype=np.float64)
         pred = np.asarray(res.get("predictions"), dtype=np.float64)
         cov = res.get("covariates")
-        return int(_scoring.relationship_sign(target, pred, cov))
+        return int(
+            _scoring.relationship_sign(
+                target,
+                pred,
+                cov,
+                residualize_method=getattr(engine, "residualize_method", "linear"),
+            )
+        )
     except Exception:
         return 1
 
@@ -1326,6 +1333,7 @@ def run_fusion(
     spatial_adjust_method: str = "none",
     spatial_adjust_max_df: int = 10,
     spatial_adjust_eps_m: float | None = None,
+    residualize_method: str = "linear",
     n_bootstraps: int = 20,
     n_trials_per_bootstrap: int = 50,
     weight_bin_pct: int = 10,
@@ -1424,6 +1432,7 @@ def run_fusion(
         # are intentionally excluded.
         run_config_record: dict[str, Any] = {
             "objective_metric": objective_metric,
+            "residualize_method": str(residualize_method),
             "cgi_formula": cgi_formula,
             "covariate_columns": list(covariate_columns or []),
             "standalone_channels": list(standalones),
@@ -1540,6 +1549,7 @@ def run_fusion(
                 spatial_adjust_method=spatial_adjust_method,
                 spatial_adjust_max_df=spatial_adjust_max_df,
                 spatial_adjust_eps_m=spatial_adjust_eps_m,
+                residualize_method=residualize_method,
             )
 
             ctx.progress(value=prog(0.1), status_text=f"{prefix}Loading target data...")
@@ -1828,10 +1838,12 @@ def run_fusion(
             )
             stage(skey("split"), DONE)
 
-            # Distance correlation builds O(n²) distance matrices per score, so
-            # large entity counts make the bootstrap + permutation passes slow.
-            # Warn rather than cap, so the metric stays exact.
-            if objective_metric == "distance_corr":
+            # Partial distance correlation builds O(n²) distance matrices per
+            # score when conditioning on covariates, so large entity counts make
+            # the bootstrap + permutation passes slow. Plain distance_corr uses
+            # the fast O(n log n) estimator and is unaffected. Warn rather than
+            # cap so the metric stays exact.
+            if objective_metric == "partial_distance_corr" and outcome_covs:
                 try:
                     n_entities = (
                         int(fusion_df["polygon_id"].nunique())
@@ -1843,10 +1855,11 @@ def run_fusion(
                 if n_entities > 5000:
                     _log_fusion(
                         "WARN",
-                        f"[{label}] distance_corr scores are O(n²) over "
-                        f"{n_entities:,} entities — bootstrap CIs and permutation "
-                        "tests will take noticeably longer. 'spearman' is a faster "
-                        "partial-correlation objective if runtime matters.",
+                        f"[{label}] partial_distance_corr scores are O(n²) over "
+                        f"{n_entities:,} entities with covariates — bootstrap CIs "
+                        "and permutation tests will take noticeably longer. "
+                        "'distance_corr' (fast) or 'spearman' are cheaper "
+                        "covariate-aware objectives if runtime matters.",
                     )
 
             # ``n_trials_per_bootstrap`` is the CGI (target) per-bootstrap budget.

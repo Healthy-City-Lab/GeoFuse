@@ -291,7 +291,8 @@ def _fusion_restart_summary_lines(p: dict) -> list[str]:
         f"**Covariates:** {', '.join(covs) if covs else '—'}",
         f"**Standalone metrics:** "
         f"{', '.join(_CHANNEL_DISPLAY.get(s, s) for s in standalones) if standalones else '—'}",
-        f"**Objective:** `{p.get('objective_metric', '?')}` · "
+        f"**Objective:** `{p.get('objective_metric', '?')}` "
+        f"(residualize: `{p.get('residualize_method', 'linear')}`) · "
         f"**Test set:** {float(p.get('test_size', 0.0) or 0.0) * 100:.0f}%",
         f"**Stability selection:** {p.get('n_bootstraps', '?')} bootstraps × "
         f"{p.get('n_trials_per_bootstrap', '?')} trials "
@@ -380,6 +381,7 @@ def _submit_fusion_restart(
         "spatial_adjust_max_df": 10,
         "spatial_adjust_eps_m": None,
         "covariate_types": {},
+        "residualize_method": "linear",
     }
     missing = [
         k
@@ -755,11 +757,26 @@ def _render_fusion_restart_panel(store, executor, output_dir: str) -> bool:
 # (covariate-aware distance correlation / partial rank correlation /
 # incremental R² / normalized RMSE / MI).
 _CROSS_METRICS: tuple[str, ...] = (
+    "partial_distance_corr",
     "distance_corr",
     "spearman",
     "r2",
     "nrmse",
     "mutual_info",
+)
+# Friendly labels for the objective-metric picker.
+_CROSS_METRIC_LABELS: dict[str, str] = {
+    "partial_distance_corr": "Partial distance correlation (linear + nonlinear, covariate-aware)",
+    "distance_corr": "Distance correlation (fast; linear covariate adjustment)",
+    "spearman": "Partial rank correlation (Spearman)",
+    "r2": "Incremental R²",
+    "nrmse": "Normalized RMSE (lower is better)",
+    "mutual_info": "Mutual information (ignores covariates)",
+}
+# Metrics that condition on covariates intrinsically, so the residualization
+# picker doesn't apply. Mirror of ``objective_scoring.RESIDUALIZE_IGNORED``.
+_RESIDUALIZE_IGNORED_METRICS: frozenset[str] = frozenset(
+    {"partial_distance_corr", "mutual_info"}
 )
 # MixedLM scoring metrics — mirror the engine's MIXEDLM_METRICS so they can
 # round-trip through the spec without an explicit import.
@@ -789,6 +806,7 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "cache_metrics",
     "test_size",
     "objective_metric",
+    "residualize_method",
     "ndvi_start_date",
     "ndvi_end_date",
     "ndvi_project_id",
@@ -1427,10 +1445,13 @@ def _render_study_details_panel(
         objective_metric = st.selectbox(
             "Objective metric",
             options=metric_options,
+            format_func=lambda m: _CROSS_METRIC_LABELS.get(m, m),
             key="fusion_objective_metric",
             help=(
                 "Quantity each stability-selection trial scores on its "
-                "out-of-bag rows (maximised; nrmse minimised)."
+                "out-of-bag rows (maximised; nrmse minimised). "
+                "**Partial distance correlation** (default) captures linear and "
+                "nonlinear association and conditions on covariates nonlinearly."
             ),
         )
     with col_o2:
@@ -1460,6 +1481,33 @@ def _render_study_details_panel(
         f"train+val pool = {(1.0 - float(test_size))*100:.0f}% "
         "(resampled by stability selection)._"
     )
+
+    # ── Covariate residualization (cross-sectional metrics) ─────────────
+    residualize_method = "linear"
+    if not is_longitudinal:
+        _res_ignored = objective_metric in _RESIDUALIZE_IGNORED_METRICS
+        _res_rec = (
+            "This metric conditions on covariates intrinsically, so the setting "
+            "has no effect."
+            if _res_ignored
+            else "Spline removes nonlinear covariate effects (recommended when a "
+            "covariate may relate to the outcome nonlinearly); linear is faster "
+            "and assumes covariate effects are linear."
+        )
+        residualize_method = st.selectbox(
+            "Covariate residualization",
+            options=["linear", "spline"],
+            format_func=lambda m: {"linear": "Linear", "spline": "Spline (natural cubic)"}[m],
+            index=["linear", "spline"].index(
+                st.session_state.get("fusion_residualize_method", "linear")
+            ),
+            key="fusion_residualize_method",
+            disabled=_res_ignored,
+            help=(
+                "How continuous covariates are partialled out of the "
+                f"greenery↔outcome association. {_res_rec}"
+            ),
+        )
 
     # ── Longitudinal-only mixed-effects toggles ─────────────────────────
     mixedlm_random_slope = True
@@ -1756,6 +1804,7 @@ def _render_study_details_panel(
         "covariate_columns": list(covariate_columns or []),
         "covariate_types": dict(covariate_types or {}),
         "objective_metric": objective_metric,
+        "residualize_method": str(residualize_method),
         "test_size": float(test_size),
         "n_bins": int(n_bins),
         "mixedlm_random_slope": bool(mixedlm_random_slope),
@@ -3760,6 +3809,7 @@ def render(output_dir: str) -> None:
     whole_grid_scaling_param = bool(study_state.get("whole_grid_scaling", False))
     area_balanced_split_param = bool(study_state.get("area_balanced_split", False))
     normalize_channels_param = bool(study_state.get("normalize_channels", False))
+    residualize_method_param = str(study_state.get("residualize_method", "linear"))
     spatial_adjust_method_param = str(study_state.get("spatial_adjust_method", "none"))
     spatial_adjust_max_df_param = int(study_state.get("spatial_adjust_max_df", 10))
     spatial_adjust_eps_m_param = study_state.get("spatial_adjust_eps_m")
@@ -4098,6 +4148,7 @@ def render(output_dir: str) -> None:
                 "cache_metrics": bool(cache_metrics),
                 "test_size": float(test_size),
                 "objective_metric": objective_metric,
+                "residualize_method": residualize_method_param,
                 "ndvi_start_date": ndvi_auto_start.isoformat(),
                 "ndvi_end_date": ndvi_auto_end.isoformat(),
                 "ndvi_project_id": None,

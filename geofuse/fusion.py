@@ -227,6 +227,7 @@ class MetricFusionEngine:
         spatial_adjust_method: str = "none",
         spatial_adjust_max_df: int = 10,
         spatial_adjust_eps_m: float | None = None,
+        residualize_method: str = "linear",
     ):
         """
         Initialize the fusion engine.
@@ -380,6 +381,17 @@ class MetricFusionEngine:
         )
         self._spatial_basis_cache: dict = {}
         self._spatial_adjust_summary: dict | None = None
+
+        # Covariate residualization basis for the residualizing metrics
+        # (distance_corr / spearman / r2 / nrmse). ``spline`` removes nonlinear
+        # covariate effects; ``partial_distance_corr`` / ``mutual_info`` ignore it.
+        res_method = str(residualize_method or "linear").lower()
+        if res_method not in objective_scoring.RESIDUALIZE_METHODS:
+            raise ValueError(
+                f"residualize_method must be one of "
+                f"{sorted(objective_scoring.RESIDUALIZE_METHODS)}; got {res_method!r}."
+            )
+        self.residualize_method: str = res_method
 
         # Longitudinal / mixed-effects spec. ``None`` keeps the engine in
         # cross-sectional mode (no behaviour change). When set, every code
@@ -5537,6 +5549,7 @@ class MetricFusionEngine:
                     return_pvalue=wants_pval,
                     spatial_basis=train_sb,
                     spatial_method=self.spatial_adjust_method,
+                    residualize_method=self.residualize_method,
                 )
                 val_out = objective_scoring.score(
                     metric,
@@ -5546,6 +5559,7 @@ class MetricFusionEngine:
                     return_pvalue=wants_pval,
                     spatial_basis=val_sb,
                     spatial_method=self.spatial_adjust_method,
+                    residualize_method=self.residualize_method,
                 )
 
             if wants_pval:
@@ -5884,6 +5898,7 @@ class MetricFusionEngine:
                 return_pvalue=wants_pval,
                 spatial_basis=test_sb,
                 spatial_method=self.spatial_adjust_method,
+                residualize_method=self.residualize_method,
             )
         if wants_pval:
             test_score, test_pval = score_out  # type: ignore[misc]
@@ -6373,6 +6388,7 @@ class MetricFusionEngine:
                     return_pvalue=wants_pval,
                     spatial_basis=spat,
                     spatial_method=self.spatial_adjust_method,
+                    residualize_method=self.residualize_method,
                 )
                 if wants_pval:
                     s, p = out  # type: ignore[misc]
@@ -6856,6 +6872,7 @@ class MetricFusionEngine:
                     return_pvalue=wants_pval,
                     spatial_basis=spat,
                     spatial_method=self.spatial_adjust_method,
+                    residualize_method=self.residualize_method,
                 )
                 if wants_pval:
                     s, p = s_out  # type: ignore[misc]

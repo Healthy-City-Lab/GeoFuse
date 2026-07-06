@@ -41,6 +41,9 @@ PIP_PACKAGES = [
     "pillow==12.0.0",
     "optuna==4.6.0",
     "skrebate==0.62",
+    # Partial distance correlation (default objective) + spline residualization
+    "dcor==0.7",
+    "patsy==1.0.2",
     # UI / Web
     "streamlit==1.52.1",
     "streamlit-folium==0.25.3",
