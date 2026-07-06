@@ -473,6 +473,38 @@ def permutation_pvalue(
 
 
 # ---------------------------------------------------------------------------
+# Multiple-comparison correction
+# ---------------------------------------------------------------------------
+
+
+def holm_bonferroni(pvalues) -> list[float]:
+    """Holm–Bonferroni step-down family-wise adjusted p-values.
+
+    Controls the family-wise error rate across a family of tests (less
+    conservative than Bonferroni, no independence assumption). Returns a list
+    aligned to the input order. ``None`` / non-finite entries pass through as
+    ``nan`` and don't count toward the family size.
+    """
+    vals = list(pvalues)
+    finite_idx = [
+        i
+        for i, p in enumerate(vals)
+        if p is not None and np.isfinite(float(p))
+    ]
+    out = [float("nan")] * len(vals)
+    m = len(finite_idx)
+    if m == 0:
+        return out
+    order = sorted(finite_idx, key=lambda i: float(vals[i]))
+    running = 0.0
+    for rank, i in enumerate(order):
+        # Enforce monotone non-decreasing adjusted p-values down the sorted list.
+        running = max(running, (m - rank) * float(vals[i]))
+        out[i] = float(min(1.0, running))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Stability-selection threshold calibration (Bodinier et al., 2023)
 # ---------------------------------------------------------------------------
 

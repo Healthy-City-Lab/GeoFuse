@@ -1989,23 +1989,24 @@ def run_fusion(
             # correlation is unsigned, so the sign is reported separately).
             cgi_direction = _direction_sign(engine, headline_params, objective_metric)
 
-            # Whole-data effect (the headline greenery effect) with per-subset
-            # bootstrap CIs and a held-out permutation p-value, all in the
-            # objective metric's own units.
+            # Held-out test effect (the headline) plus a descriptive whole-data
+            # figure, per-subset bootstrap CIs, and the held-out permutation
+            # p-value — all in the objective metric's own units.
             cgi_effects: dict | None = None
             try:
                 cgi_effects = engine.evaluate_effects(
                     headline_params, objective_metric, seed=42
                 )
-                if cgi_effects and cgi_effects.get("all"):
-                    _a = cgi_effects["all"]
-                    _t = cgi_effects.get("test") or {}
+                if cgi_effects and cgi_effects.get("test"):
+                    _t = cgi_effects["test"]
+                    _a = cgi_effects.get("all") or {}
                     _log_fusion(
                         "OK",
-                        f"[{label}] Whole-data {objective_metric}="
-                        f"{_a.get('score')} "
-                        f"[{_a.get('lower')}, {_a.get('upper')}]; held-out "
-                        f"p={_t.get('p_value')}.",
+                        f"[{label}] Held-out test {objective_metric}="
+                        f"{_t.get('score')} "
+                        f"[{_t.get('lower')}, {_t.get('upper')}], "
+                        f"p={_t.get('p_value')}; whole-data (in-sample) "
+                        f"{_a.get('score')}.",
                     )
             except Exception as exc:
                 _log_fusion("WARN", f"[{label}] Whole-data effects failed: {exc}")
@@ -2248,41 +2249,64 @@ def run_fusion(
                         f"{cgi_vs_standalone_aic_bic['verdict']}.",
                     )
 
-            # Paired bootstrap objective difference (CGI − best standalone) on
-            # the full dataset, in the metric's own units — the primary
-            # CGI-vs-standalone verdict; AIC/BIC stays a secondary report.
+            # Paired bootstrap objective difference (CGI − standalone) on the
+            # full dataset, in the metric's own units — computed for every
+            # standalone channel as one family and Holm-corrected across it, so
+            # comparing CGI against several channels doesn't inflate
+            # significance. The headline verdict is the AIC/BIC best channel;
+            # AIC/BIC stays a secondary report.
             cgi_vs_standalone_paired: dict | None = None
-            if (
-                standalones
-                and cgi_vs_standalone_aic_bic
-                and cgi_vs_standalone_aic_bic.get("best_channel") in standalones_bundle
-            ):
-                best_ch = cgi_vs_standalone_aic_bic["best_channel"]
-                ch_bundle = standalones_bundle[best_ch]
-                ch_params = (
-                    ch_bundle.get("averaged_params")
-                    or ch_bundle.get("best_params")
-                    or {}
-                )
-                try:
-                    cgi_vs_standalone_paired = engine.paired_objective_difference(
-                        headline_params,
-                        ch_params,
-                        best_ch,
-                        objective_metric,
-                        seed=42,
+            cgi_vs_standalone_paired_family: list[dict] = []
+            if standalones and standalones_bundle:
+                for ch in [c for c in ("veg", "terrain", "ndvi") if c in standalones_bundle]:
+                    ch_bundle = standalones_bundle[ch]
+                    ch_params = (
+                        ch_bundle.get("averaged_params")
+                        or ch_bundle.get("best_params")
+                        or {}
                     )
-                    if cgi_vs_standalone_paired:
-                        _log_fusion(
-                            "OK",
-                            f"[{label}] CGI − {best_ch} {objective_metric} "
-                            f"Δ={cgi_vs_standalone_paired['observed_diff']:.4f} "
-                            f"[{cgi_vs_standalone_paired['lower']:.4f}, "
-                            f"{cgi_vs_standalone_paired['upper']:.4f}], "
-                            f"p={cgi_vs_standalone_paired['p_value']:.4g}.",
+                    try:
+                        pd_res = engine.paired_objective_difference(
+                            headline_params, ch_params, ch, objective_metric, seed=42
                         )
-                except Exception as exc:
-                    _log_fusion("WARN", f"[{label}] Paired difference failed: {exc}")
+                    except Exception as exc:
+                        _log_fusion(
+                            "WARN", f"[{label}] Paired difference ({ch}) failed: {exc}"
+                        )
+                        pd_res = None
+                    if pd_res:
+                        cgi_vs_standalone_paired_family.append(pd_res)
+
+            if cgi_vs_standalone_paired_family:
+                from .. import statistical_testing as _stats_mod
+
+                holm = _stats_mod.holm_bonferroni(
+                    [d.get("p_value") for d in cgi_vs_standalone_paired_family]
+                )
+                for d, hp in zip(cgi_vs_standalone_paired_family, holm):
+                    d["p_value_holm"] = None if hp != hp else float(hp)
+                    d["family_size"] = len(cgi_vs_standalone_paired_family)
+                best_ch = (cgi_vs_standalone_aic_bic or {}).get("best_channel")
+                cgi_vs_standalone_paired = next(
+                    (
+                        d
+                        for d in cgi_vs_standalone_paired_family
+                        if d.get("standalone_channel") == best_ch
+                    ),
+                    None,
+                ) or max(
+                    cgi_vs_standalone_paired_family,
+                    key=lambda d: d.get("observed_diff", float("-inf")),
+                )
+                _log_fusion(
+                    "OK",
+                    f"[{label}] CGI vs standalones (family of "
+                    f"{len(cgi_vs_standalone_paired_family)}): headline "
+                    f"`{cgi_vs_standalone_paired.get('standalone_channel')}` "
+                    f"Δ={cgi_vs_standalone_paired.get('observed_diff'):.4f}, "
+                    f"p={cgi_vs_standalone_paired.get('p_value'):.4g}, "
+                    f"Holm p={cgi_vs_standalone_paired.get('p_value_holm')}.",
+                )
 
             # ── Composite GeoTIFF (raster write) ──
             # Runs after the standalone stages so they can advance the ledger
@@ -2378,11 +2402,13 @@ def run_fusion(
                 "stability_summary": cgi_stability_summary,
                 "direction_sign": cgi_direction,
                 "cgi_vs_standalone_aic_bic": cgi_vs_standalone_aic_bic,
-                # Whole-data objective effect (headline) + per-subset CIs +
+                # Held-out test effect (headline) + descriptive whole-data CI +
                 # held-out permutation p-value, and the paired objective
-                # difference vs the best standalone (the primary verdict).
+                # difference vs each standalone (headline = best channel; the
+                # family carries Holm-corrected p-values).
                 "cgi_effects": cgi_effects,
                 "cgi_vs_standalone_paired": cgi_vs_standalone_paired,
+                "cgi_vs_standalone_paired_family": cgi_vs_standalone_paired_family,
             }
             by_target[label] = bundle
             engines_by_target[label] = engine

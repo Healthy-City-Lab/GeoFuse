@@ -6493,16 +6493,17 @@ class MetricFusionEngine:
         ci_level: float = 0.95,
         seed: int = 42,
     ) -> dict[str, dict]:
-        """Objective effect on the full dataset and per-subset, with CIs + a
-        held-out permutation p-value.
+        """Objective effect on the held-out test set (headline) + descriptive
+        per-subset effects.
 
-        The ``all`` slice (whole dataset, the stability-selected params applied
-        to every entity) is the headline greenery effect; ``test`` is the
-        held-out generalizability check and carries the permutation p-value;
-        ``train_val`` is the tuning pool (CI only). Each entry is
-        ``{score, lower, upper, p_value, n}``. Defined for cross-sectional
-        objective metrics; returns ``{}`` for metrics it doesn't support
-        (e.g. longitudinal MixedLM metrics, scored elsewhere).
+        The ``test`` slice is the headline: the stability-selected params never
+        saw it, so it carries the permutation p-value — the honest
+        generalizability check. The ``all`` (whole-data) and ``train_val``
+        slices are descriptive (CI only, no p-value): the params were tuned on
+        the train+val pool, so a p-value there would be optimistic
+        (double-dipping). Each entry is ``{score, lower, upper, p_value, n}``.
+        Defined for cross-sectional objective metrics; returns ``{}`` for metrics
+        it doesn't support (e.g. longitudinal MixedLM metrics, scored elsewhere).
         """
         if metric not in objective_scoring.SUPPORTED_METRICS:
             return {}
@@ -6567,7 +6568,10 @@ class MetricFusionEngine:
             cov_all = self._augment_cov_with_spatial(
                 df_full, t_all, c_all, self._whole_data_covariates(df_full)
             )
-            results["all"] = _block(t_all, c_all, cov_all, do_perm=True, sub_seed=seed)
+            # Whole-data effect is descriptive only (CI, no permutation p): the
+            # params were tuned on most of these rows, so a p-value here would
+            # double-dip. The held-out ``test`` block below carries the p-value.
+            results["all"] = _block(t_all, c_all, cov_all, do_perm=False, sub_seed=seed)
         except Exception as exc:
             logger.warning(f"evaluate_effects: whole-data scoring failed: {exc}")
 
@@ -7055,7 +7059,12 @@ class MetricFusionEngine:
 
         Adapts Meinshausen & Bühlmann's stability selection (2010) to
         hyperparameter search, using the complementary-pairs subsampling of
-        Shah & Samworth (2013) so the reported PFER bound is rigorous. The
+        Shah & Samworth (2013). The ⌊n/2⌋ subsampling is what the PFER bound
+        assumes; because the candidate set here is the weight cells discovered
+        by the QMC search (not a fixed selector applied identically each
+        resample), the reported PFER is best read as a guide, not a certified
+        bound. Enqueued seed trials are excluded from the selection counts so
+        the calibration frequencies stay unbiased. The
         procedure draws ``n_bootstraps`` ⌊n/2⌋ subsamples (in complementary
         pairs), runs a short objective-blind QMC (Sobol) study on each, and
         rates each parameter region by how well it does **on the held-out OOB
@@ -7261,6 +7270,7 @@ class MetricFusionEngine:
             "trials_pruned": 0,
             "trials_failed": 0,
             "trials_nan_score": 0,
+            "trials_seed_excluded": 0,
             "trials_kept": 0,
         }
 
@@ -7421,6 +7431,13 @@ class MetricFusionEngine:
                     continue
                 bootstrap_records: list[dict] = []
                 for t in completed:
+                    # Enqueued seed trials (single-channel vertices + centroid)
+                    # are non-random, so they'd give their cells a guaranteed
+                    # selection in every resample and bias the calibration.
+                    # Keep them for search coverage; drop them from the counts.
+                    if "fixed_params" in t.system_attrs:
+                        diag["trials_seed_excluded"] += 1
+                        continue
                     score = t.user_attrs.get("val_score_mean", t.value)
                     if score is None or not np.isfinite(float(score)):
                         diag["trials_nan_score"] += 1
@@ -7512,6 +7529,10 @@ class MetricFusionEngine:
             cells.setdefault(r["cell"], []).append(r)
 
         def _q_worst(scores: list[float]) -> float:
+            # Note: a weight cell pools trials across resamples *and* across
+            # radii / aggregation stats, so q_worst mixes resample-luck variance
+            # with within-cell hyperparameter variance. It's a secondary
+            # tie-breaker here; stage-2 re-selects the radii at a fixed cell.
             if higher_is_better:
                 return float(np.quantile(scores, worst_quantile))
             return float(np.quantile(scores, 1.0 - worst_quantile))

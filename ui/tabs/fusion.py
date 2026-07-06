@@ -2615,10 +2615,11 @@ def _render_stability_diagnostics(summary: dict, metric_name: str) -> None:
 
 
 def _render_results_headline(results_view: dict, metric_name: str) -> None:
-    """At-a-glance CGI bottom line: the whole-data greenery effect (headline),
-    the held-out significance check, direction, and the CGI-vs-standalone
-    verdict as two whole-data (all) sub-answers — the paired objective
-    difference and the AIC/BIC penalized-model comparison."""
+    """At-a-glance CGI bottom line: the held-out test greenery effect (headline,
+    with the whole-data figure in its tooltip), the held-out significance check,
+    direction, and the CGI-vs-standalone verdict as two whole-data (all)
+    sub-answers — the paired objective difference and the AIC/BIC
+    penalized-model comparison."""
     effects = results_view.get("cgi_effects") or {}
     all_eff = effects.get("all") or {}
     test_eff = effects.get("test") or {}
@@ -2640,32 +2641,46 @@ def _render_results_headline(results_view: dict, metric_name: str) -> None:
     cols2 = st.columns(2)
     cols3 = st.columns(2)
 
-    # 1) Whole-data effect — the headline greenery effect.
+    # 1) Held-out test effect — the headline (params never saw this split).
+    #    The whole-data (all) figure is folded into the tooltip as descriptive,
+    #    in-sample context so it isn't read as an independent result.
     with cols[0]:
-        score = _f(all_eff.get("score"))
-        lo, hi = _f(all_eff.get("lower")), _f(all_eff.get("upper"))
-        if score is not None:
-            ci_str = (
-                f"[{lo:.4f}, {hi:.4f}]" if lo is not None and hi is not None else "—"
+        t_score = _f(test_eff.get("score"))
+        if t_score is None:
+            t_score = _f(test_ci.get("observed"))
+        t_lo, t_hi = _f(test_ci.get("lower")), _f(test_ci.get("upper"))
+        if t_lo is None and t_hi is None:
+            t_lo, t_hi = _f(test_eff.get("lower")), _f(test_eff.get("upper"))
+        t_p = _f(test_eff.get("p_value"))
+        a_score = _f(all_eff.get("score"))
+        a_lo, a_hi = _f(all_eff.get("lower")), _f(all_eff.get("upper"))
+        if a_score is not None and a_lo is not None and a_hi is not None:
+            all_str = (
+                f" Whole-data (all, in-sample): {a_score:.4f} "
+                f"[{a_lo:.4f}, {a_hi:.4f}] — optimistic (params were tuned on "
+                "this data)."
             )
+        elif a_score is not None:
+            all_str = f" Whole-data (all, in-sample): {a_score:.4f} — optimistic."
+        else:
+            all_str = ""
+        ci_str = (
+            f"[{t_lo:.4f}, {t_hi:.4f}]"
+            if t_lo is not None and t_hi is not None
+            else "—"
+        )
+        p_str = f"; permutation p={t_p:.3g}" if t_p is not None else ""
+        if t_score is not None:
             st.metric(
-                f"Whole-data {metric_name}",
-                f"{score:.4f}",
+                f"Held-out test {metric_name}",
+                f"{t_score:.4f}",
                 help=(
-                    "The greenery effect: stability-selected params scored on "
-                    f"every entity. 95% bootstrap CI: {ci_str}. Params were "
-                    "tuned on train+val, so this is a mild upper bound — the "
-                    "held-out p-value is the generalizability check."
+                    "The headline greenery effect, on the untouched test split "
+                    f"the params never saw. 95% bootstrap CI: {ci_str}{p_str}.{all_str}"
                 ),
             )
         else:
-            obs = _f(test_ci.get("observed"))
-            if obs is None:
-                obs = _f((results_view.get("test_results") or {}).get("test_score"))
-            st.metric(
-                f"CGI {metric_name}",
-                f"{obs:.4f}" if obs is not None else "—",
-            )
+            st.metric(f"Held-out test {metric_name}", "—", help=all_str or None)
 
     # 2) Held-out significance — permutation p on the untouched test split.
     with cols[1]:
@@ -2674,15 +2689,13 @@ def _render_results_headline(results_view: dict, metric_name: str) -> None:
         if t_score is None:
             t_score = _f(test_ci.get("observed"))
         if p is not None:
-            prefix = (
-                f"Held-out {metric_name}={t_score:.4f}. " if t_score is not None else ""
-            )
             st.metric(
-                "Held-out test (p-value)",
+                "Held-out significance (p-value)",
                 f"p = {p:.3g}",
                 help=(
-                    prefix + "Permutation p-value on the untouched test split — "
-                    "the honest generalizability check (the params never saw it)."
+                    "Permutation p-value on the untouched test split "
+                    "(Freedman–Lane when covariates are controlled) — the honest "
+                    "generalizability check (the params never saw it)."
                 ),
             )
         elif t_score is not None:
@@ -2691,12 +2704,12 @@ def _render_results_headline(results_view: dict, metric_name: str) -> None:
                 f"[{lo:.4f}, {hi:.4f}]" if lo is not None and hi is not None else "—"
             )
             st.metric(
-                f"Held-out test {metric_name}",
-                f"{t_score:.4f}",
-                help=f"95% bootstrap CI: {ci_str}.",
+                "Held-out significance",
+                "—",
+                help=f"No permutation p-value; 95% bootstrap CI: {ci_str}.",
             )
         else:
-            st.metric("Held-out test", "—")
+            st.metric("Held-out significance", "—")
 
     # 3) CGI vs best standalone — sub-answer A: whole-data (all) paired
     #    objective difference.
@@ -2705,6 +2718,8 @@ def _render_results_headline(results_view: dict, metric_name: str) -> None:
             diff = _f(paired.get("observed_diff"))
             lo, hi = _f(paired.get("lower")), _f(paired.get("upper"))
             pp = _f(paired.get("p_value"))
+            pp_holm = _f(paired.get("p_value_holm"))
+            fam_n = paired.get("family_size")
             ch = paired.get("standalone_channel")
             verdict = "CGI better" if paired.get("favors_cgi") else "not better"
             if diff is not None:
@@ -2714,10 +2729,16 @@ def _render_results_headline(results_view: dict, metric_name: str) -> None:
                     else "—"
                 )
                 p_str = f"{pp:.3g}" if pp is not None else "—"
+                holm_str = (
+                    f" Holm-adjusted p={pp_holm:.3g} across {fam_n} standalone "
+                    "comparison(s)."
+                    if pp_holm is not None and fam_n
+                    else ""
+                )
                 help_txt = (
                     f"Whole-data (all) paired bootstrap difference in "
                     f"{metric_name} (CGI − `{ch}`): Δ={diff:.4f} {ci_str}, "
-                    f"one-sided p={p_str} (positive favours CGI)."
+                    f"one-sided p={p_str} (positive favours CGI).{holm_str}"
                 )
             else:
                 help_txt = "Comparison unavailable."
@@ -2980,10 +3001,11 @@ def _render_study_detail(
                 "complementary halves, so there is no train→fit→validate step. "
                 "**Bootstraps** = winning-cell median out-of-bag score across "
                 "the complementary-half resamples (the cross-resample signal) · "
-                "**Held-out test** = untouched test split the params never saw · "
-                "**All** = every entity (the headline effect). 95% CIs are "
-                "percentile bootstrap; `p (perm)` is the permutation p-value on "
-                "the held-out test and all slices."
+                "**Held-out test** = untouched test split the params never saw "
+                "(the headline) · **All** = every entity (in-sample, descriptive). "
+                "95% CIs are percentile bootstrap; `p (perm)` is the permutation "
+                "p-value on the held-out test only (the params were tuned on the "
+                "rest, so an all-slice p-value would double-dip)."
             )
             if has_covariates:
                 cap += (
@@ -3068,6 +3090,41 @@ def _render_cross_study_comparison(results_view: dict, metric_name: str) -> None
             )
         with st.expander("Show exact values"):
             st.dataframe(df, width="stretch")
+
+    # ── Paired objective difference vs each standalone (Holm-corrected) ──
+    fam = results_view.get("cgi_vs_standalone_paired_family") or []
+    if fam:
+        st.markdown("**Paired objective difference (CGI − standalone)**")
+        fam_rows = []
+        for d in fam:
+            diff = d.get("observed_diff")
+            lo, hi = d.get("lower"), d.get("upper")
+            pr, ph = d.get("p_value"), d.get("p_value_holm")
+            fam_rows.append(
+                {
+                    "Standalone": _CHANNEL_DISPLAY.get(
+                        d.get("standalone_channel"), str(d.get("standalone_channel"))
+                    ),
+                    f"Δ {metric_name} (CGI − ch)": (
+                        round(float(diff), 4) if diff is not None else None
+                    ),
+                    "95% CI": (
+                        f"[{float(lo):.4f}, {float(hi):.4f}]"
+                        if lo is not None and hi is not None
+                        else "—"
+                    ),
+                    "p (one-sided)": f"{float(pr):.3g}" if pr is not None else None,
+                    "p (Holm)": f"{float(ph):.3g}" if ph is not None else None,
+                }
+            )
+        st.dataframe(pd.DataFrame(fam_rows), width="stretch")
+        st.caption(
+            "Whole-data paired bootstrap difference of CGI against each "
+            "standalone channel (positive Δ favours CGI). `p (Holm)` controls "
+            "the family-wise error rate across these comparisons. When several "
+            "outcomes are optimised, treat those as a further family and discount "
+            "the p-values accordingly."
+        )
 
     # ── AIC/BIC verdict detail ────────────────────────────────────────
     aic_bic = results_view.get("cgi_vs_standalone_aic_bic") or None

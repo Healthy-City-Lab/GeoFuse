@@ -55,7 +55,7 @@ This is the analytical core: it learns how to combine GVI (vegetation + terrain)
 ### Why you can trust the result
 
 - **Bootstrap stability selection** (Meinshausen & Bühlmann 2010, adapted to hyperparameter search). The engine draws many resamples of the training pool, explores each with a **space-filling quasi-random (Sobol) search**, and scores every candidate on that resample's held-out **out-of-bag** rows. The winning configuration is the one whose **worst-case out-of-bag score is best across resamples** — i.e. cross-validated predictive power, not a selection-inflated in-sample fit. (A uniform-coverage search is used deliberately; an objective-chasing sampler would concentrate on each resample's local optimum and inflate the stability counts.)
-- **Held-out test set.** A fraction of the data (default 25 %) is set aside and never touched during tuning. The winning configuration is scored on it once, with a **percentile bootstrap confidence interval** — an independent effect size, reported without a permutation p-value to hunt.
+- **Held-out test set (the headline).** A fraction of the data (default 25 %) is set aside and never touched during tuning. The winning configuration is scored on it once — a **percentile bootstrap confidence interval** plus a **held-out permutation p-value** (Freedman–Lane when covariates are controlled). This is the honest generalizability check. The whole-data ("all") figure is also shown, but only as a *descriptive, in-sample* number: the parameters were tuned on most of those rows, so it is optimistic and carries no p-value.
 - **Objective metrics.** **Partial distance correlation** (default) detects non-linear as well as linear associations *and* conditions on the covariates non-linearly, so a curved covariate effect is removed rather than partly credited as greenery signal. It is unsigned, so a separate **direction** indicator is reported alongside it. Also available: **distance correlation** (a faster variant with linear covariate adjustment), **Spearman**, **R²**, **normalized RMSE**, and **mutual information**.
 
 ### Controlling for confounders
@@ -66,7 +66,7 @@ This is the analytical core: it learns how to combine GVI (vegetation + terrain)
 
 ### Is combining channels worth it?
 
-- **Standalone single-metric studies (optional).** Run the same selection on each channel alone (NDVI / vegetation / terrain). When enabled, the report adds an **AIC/BIC verdict** on whether the multi-channel CGI is justified over the best single channel — so you can see whether fusion earns its added complexity.
+- **Standalone single-metric studies (optional).** Run the same selection on each channel alone (NDVI / vegetation / terrain). When enabled, the report adds an **AIC/BIC verdict** on whether the multi-channel CGI is justified over the best single channel, plus a **paired objective difference** of CGI against each standalone. Those paired p-values are **Holm-corrected** across the family of channels so comparing CGI against several of them doesn't inflate significance; when several outcomes are optimised, treat those as a further family.
 
 ### Longitudinal and multi-year data
 
