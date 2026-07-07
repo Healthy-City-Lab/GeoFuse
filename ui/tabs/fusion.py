@@ -43,6 +43,41 @@ from geofuse.vector_io import (
     vector_format_from_path,
 )
 
+
+def _file_sig(path: str) -> tuple:
+    """(size, mtime_ns) fingerprint so a cache entry invalidates on file change."""
+    try:
+        s = os.stat(path)
+        return (int(s.st_size), int(s.st_mtime_ns))
+    except OSError:
+        return (0, 0)
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def _read_vector_cached(
+    path: str, sig: tuple, layer: str | int | None = None
+) -> "gpd.GeoDataFrame":
+    """``read_vector_path`` memoized by (path, file fingerprint, layer).
+
+    Streamlit reruns the whole tab on every widget edit; without this the target
+    file was re-read and reprojected each keystroke — the main cause of the tab
+    stalling on large targets. ``sig`` is part of the key so an edited file is
+    re-read.
+    """
+    return read_vector_path(path, layer=layer) if layer is not None else read_vector_path(path)
+
+
+def _read_vector_for_ui(path: str, layer: str | int | None = None) -> "gpd.GeoDataFrame":
+    """Cached target read for the tab (keyed by the file's current fingerprint)."""
+    return _read_vector_cached(path, _file_sig(path), layer)
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def _read_vector_head(path: str, sig: tuple) -> "gpd.GeoDataFrame":
+    """A 64-row peek, cached so wide-mode reruns don't re-read for schema/dtypes."""
+    return gpd.read_file(path, rows=64)
+
+
 _FUSION_OUTCOME_ADD_PLACEHOLDER = "— Select column —"
 
 # Canonical display labels for greenery channels. Internal keys stay
@@ -1102,7 +1137,7 @@ def _render_optimization_setup_panel(
                 st.error(f"Path no longer exists: `{path}`")
                 continue
             try:
-                file_gdf = read_vector_path(path)
+                file_gdf = _read_vector_for_ui(path)
                 file_cols = [c for c in file_gdf.columns if c != "geometry"]
                 file_date_cands = _date_parseable_columns(file_gdf)
             except Exception as exc:
@@ -3408,6 +3443,124 @@ def _render_fusion_results_body(output_dir: str) -> None:
     _render_artifact_index(results_view)
 
 
+@st.fragment
+def _render_target_preview(
+    target_picked_path: str | None,
+    tmp_target_path: str | None,
+    is_vector_target: bool,
+    is_raster_target: bool,
+    preview_vector_gdf: "gpd.GeoDataFrame | None",
+) -> None:
+    """Target preview map, isolated in a fragment.
+
+    Its own controls (value column / preview band) rerun only this fragment, and
+    with the cached target read the whole preview stays cheap on unrelated edits.
+    """
+    if not (target_picked_path and tmp_target_path):
+        st.info("Upload a target file to preview")
+        return
+
+    m_fusion_preview = folium.Map(location=[51.0447, -114.0719], zoom_start=10)
+    try:
+        if is_vector_target and preview_vector_gdf is not None:
+            preview_gdf = sanitize_gdf_attributes_for_json(preview_vector_gdf)
+            numeric_cols = preview_gdf.select_dtypes(include=[np.number]).columns.tolist()
+            geom_only = "— Outline only —"
+            preview_pick = st.selectbox(
+                "Preview value column",
+                options=[geom_only] + numeric_cols,
+                key="fusion_preview_value_column",
+                help="Colour map features by this numeric column, or outline only.",
+            )
+            preview_feature = None if preview_pick == geom_only else preview_pick
+
+            if preview_feature and preview_feature in preview_gdf.columns:
+                vals = preview_gdf[preview_feature].dropna()
+                if len(vals) > 0:
+                    if not _add_outcome_geometry_preview(
+                        m_fusion_preview, preview_gdf, preview_feature
+                    ):
+                        add_mixed_geojson_preview(m_fusion_preview, preview_gdf)
+                else:
+                    add_mixed_geojson_preview(m_fusion_preview, preview_gdf)
+            else:
+                add_mixed_geojson_preview(m_fusion_preview, preview_gdf)
+
+            bounds = preview_gdf.total_bounds
+            m_fusion_preview.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
+
+        elif is_raster_target:
+            with rasterio.open(tmp_target_path) as src:
+                n_bands_preview = src.count
+            preview_band = st.number_input(
+                "Preview band",
+                min_value=1,
+                max_value=max(1, n_bands_preview),
+                value=min(
+                    int(st.session_state.get("fusion_target_band", 1)), n_bands_preview
+                ),
+                help="Band shown on the map (can differ from the outcome band on the left).",
+                key="fusion_preview_raster_band",
+            )
+            with rasterio.open(tmp_target_path) as src:
+                n_bands = src.count
+                pb = int(min(max(1, preview_band), n_bands))
+                arr = src.read(pb)
+                bounds_native = src.bounds
+                src_crs = src.crs
+
+                from rasterio.warp import transform_bounds
+
+                bounds_4326 = transform_bounds(src_crs, "EPSG:4326", *bounds_native)
+
+                valid_data = arr[(arr != src.nodata) & ~np.isnan(arr)]
+                if len(valid_data) > 0:
+                    vmin, vmax = np.percentile(valid_data, [2, 98])
+                    norm_data = np.clip((arr - vmin) / (vmax - vmin), 0, 1)
+                    cmap = plt.get_cmap("RdYlGn")
+                    colored = cmap(norm_data)
+                    mask = (arr == src.nodata) | np.isnan(arr)
+                    colored[..., 3] = np.where(mask, 0, 0.7)
+
+                    img_bytes = (colored * 255).astype(np.uint8)
+                    im = PILImage.fromarray(img_bytes)
+                    buff = io.BytesIO()
+                    im.save(buff, format="PNG")
+                    img_url = (
+                        f"data:image/png;base64,"
+                        f"{base64.b64encode(buff.getvalue()).decode()}"
+                    )
+
+                    folium.raster_layers.ImageOverlay(
+                        image=img_url,
+                        bounds=[
+                            [bounds_4326[1], bounds_4326[0]],
+                            [bounds_4326[3], bounds_4326[2]],
+                        ],
+                        opacity=0.7,
+                    ).add_to(m_fusion_preview)
+
+                    m_fusion_preview.fit_bounds(
+                        [
+                            [bounds_4326[1], bounds_4326[0]],
+                            [bounds_4326[3], bounds_4326[2]],
+                        ]
+                    )
+                    _add_fusion_vertical_scale_to_map(
+                        m_fusion_preview, float(vmin), float(vmax)
+                    )
+
+        st_folium(
+            m_fusion_preview,
+            width="100%",
+            height=400,
+            key="fusion_preview_map",
+            returned_objects=[],
+        )
+    except Exception as e:
+        st.error(f"Preview error: {e}")
+
+
 def render(output_dir: str) -> None:
     st.header("Metric Fusion & Optimization")
 
@@ -3514,14 +3667,14 @@ def render(output_dir: str) -> None:
                         elif len(layers) == 1:
                             target_layer_for_engine = layers[0]
 
-                        rv_kwargs: dict = {}
+                        rv_layer = None
                         if target_layer_for_engine is not None and suf in (
                             ".gpkg",
                             ".zip",
                         ):
-                            rv_kwargs["layer"] = target_layer_for_engine
-                        preview_vector_gdf = read_vector_path(
-                            tmp_target_path, **rv_kwargs
+                            rv_layer = target_layer_for_engine
+                        preview_vector_gdf = _read_vector_for_ui(
+                            tmp_target_path, layer=rv_layer
                         )
                         numeric_cols = preview_vector_gdf.select_dtypes(
                             include=[np.number]
@@ -3611,122 +3764,13 @@ def render(output_dir: str) -> None:
 
     with col_fusion_right:
         st.subheader("Target Preview")
-
-        if target_picked_path and tmp_target_path:
-            m_fusion_preview = folium.Map(location=[51.0447, -114.0719], zoom_start=10)
-
-            try:
-                if is_vector_target and preview_vector_gdf is not None:
-                    preview_gdf = sanitize_gdf_attributes_for_json(preview_vector_gdf)
-                    numeric_cols = preview_gdf.select_dtypes(
-                        include=[np.number]
-                    ).columns.tolist()
-                    geom_only = "— Outline only —"
-                    preview_pick = st.selectbox(
-                        "Preview value column",
-                        options=[geom_only] + numeric_cols,
-                        key="fusion_preview_value_column",
-                        help="Colour map features by this numeric column, or outline only.",
-                    )
-                    preview_feature = (
-                        None if preview_pick == geom_only else preview_pick
-                    )
-
-                    if preview_feature and preview_feature in preview_gdf.columns:
-                        vals = preview_gdf[preview_feature].dropna()
-                        if len(vals) > 0:
-                            if not _add_outcome_geometry_preview(
-                                m_fusion_preview,
-                                preview_gdf,
-                                preview_feature,
-                            ):
-                                add_mixed_geojson_preview(m_fusion_preview, preview_gdf)
-                        else:
-                            add_mixed_geojson_preview(m_fusion_preview, preview_gdf)
-                    else:
-                        add_mixed_geojson_preview(m_fusion_preview, preview_gdf)
-
-                    bounds = preview_gdf.total_bounds
-                    m_fusion_preview.fit_bounds(
-                        [[bounds[1], bounds[0]], [bounds[3], bounds[2]]]
-                    )
-
-                elif is_raster_target:
-                    with rasterio.open(tmp_target_path) as src:
-                        n_bands_preview = src.count
-                    preview_band = st.number_input(
-                        "Preview band",
-                        min_value=1,
-                        max_value=max(1, n_bands_preview),
-                        value=min(
-                            int(st.session_state.get("fusion_target_band", 1)),
-                            n_bands_preview,
-                        ),
-                        help="Band shown on the map (can differ from the outcome band on the left).",
-                        key="fusion_preview_raster_band",
-                    )
-                    with rasterio.open(tmp_target_path) as src:
-                        n_bands = src.count
-                        pb = int(min(max(1, preview_band), n_bands))
-                        arr = src.read(pb)
-                        bounds_native = src.bounds
-                        src_crs = src.crs
-
-                        from rasterio.warp import transform_bounds
-
-                        bounds_4326 = transform_bounds(
-                            src_crs, "EPSG:4326", *bounds_native
-                        )
-
-                        valid_data = arr[(arr != src.nodata) & ~np.isnan(arr)]
-                        if len(valid_data) > 0:
-                            vmin, vmax = np.percentile(valid_data, [2, 98])
-                            norm_data = np.clip((arr - vmin) / (vmax - vmin), 0, 1)
-                            cmap = plt.get_cmap("RdYlGn")
-                            colored = cmap(norm_data)
-                            mask = (arr == src.nodata) | np.isnan(arr)
-                            colored[..., 3] = np.where(mask, 0, 0.7)
-
-                            img_bytes = (colored * 255).astype(np.uint8)
-                            im = PILImage.fromarray(img_bytes)
-                            buff = io.BytesIO()
-                            im.save(buff, format="PNG")
-                            img_url = (
-                                f"data:image/png;base64,"
-                                f"{base64.b64encode(buff.getvalue()).decode()}"
-                            )
-
-                            folium.raster_layers.ImageOverlay(
-                                image=img_url,
-                                bounds=[
-                                    [bounds_4326[1], bounds_4326[0]],
-                                    [bounds_4326[3], bounds_4326[2]],
-                                ],
-                                opacity=0.7,
-                            ).add_to(m_fusion_preview)
-
-                            m_fusion_preview.fit_bounds(
-                                [
-                                    [bounds_4326[1], bounds_4326[0]],
-                                    [bounds_4326[3], bounds_4326[2]],
-                                ]
-                            )
-                            _add_fusion_vertical_scale_to_map(
-                                m_fusion_preview, float(vmin), float(vmax)
-                            )
-
-                st_folium(
-                    m_fusion_preview,
-                    width="100%",
-                    height=400,
-                    key="fusion_preview_map",
-                    returned_objects=[],
-                )
-
-            except Exception as e:
-                st.error(f"Preview error: {e}")
-        else:
-            st.info("Upload a target file to preview")
+        _render_target_preview(
+            target_picked_path,
+            tmp_target_path,
+            bool(is_vector_target),
+            bool(is_raster_target),
+            preview_vector_gdf if is_vector_target else None,
+        )
 
     # =========================================================================
     # SECTION 2 — Optimization setup
@@ -3804,7 +3848,7 @@ def render(output_dir: str) -> None:
             common_cat: set[str] | None = None
             for wf in wide_files:
                 try:
-                    _frame = gpd.read_file(wf["path"], rows=64)
+                    _frame = _read_vector_head(wf["path"], _file_sig(wf["path"]))
                 except Exception:
                     continue
                 _n, _c = _num_cat(_frame)

@@ -455,16 +455,22 @@ def render(output_dir: str, parent_dir: str) -> None:
             _gvi_discard_heavy_dataset_fields()
         st.session_state._gvi_prev_upload_sig = sig_new
 
-        loaded = load_vector_paths(valid_paths)
-        logical_names = [name for name, _ in loaded]
+        current_names = [os.path.basename(p) for p in valid_paths]
         for k in list(st.session_state.datasets.keys()):
             ds = st.session_state.datasets[k]
             if ds.get("type") == "restored":
                 continue
-            if k not in logical_names:
+            if k not in current_names:
                 del st.session_state.datasets[k]
-        for fname, raw in loaded:
-            if fname not in st.session_state.datasets:
+        # Read only files that aren't already loaded, so the study-area vectors
+        # are not re-read from disk on every rerun.
+        new_paths = [
+            p
+            for p in valid_paths
+            if os.path.basename(p) not in st.session_state.datasets
+        ]
+        if new_paths:
+            for fname, raw in load_vector_paths(new_paths):
                 try:
                     gtype = (
                         "poly"
@@ -490,7 +496,9 @@ def render(output_dir: str, parent_dir: str) -> None:
                 del st.session_state.datasets[k]
         gc.collect()
 
-    with st.form("gvi_job_form"):
+    # border=False so the job-setup section reads as flat sections (matching the
+    # NDVI tab); the form still batches the settings and submits on Run.
+    with st.form("gvi_job_form", border=False):
         gvi_buf_preview = int(st.session_state.get("gvi_buffer", 0))
         fc_gvi_l, fc_gvi_r = st.columns(2)
         with fc_gvi_l:
