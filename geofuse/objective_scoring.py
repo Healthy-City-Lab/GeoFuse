@@ -110,6 +110,7 @@ _DEGENERATE_SCORE: dict[str, float] = {
     "mutual_info": 0.0,
 }
 
+
 def _validate_metric(metric: str) -> None:
     if metric not in SUPPORTED_METRICS:
         raise ValueError(
@@ -252,9 +253,7 @@ def _minmax01(v: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
-def distance_correlation(
-    x: np.ndarray, y: np.ndarray, *, seed: int = 0
-) -> float:
+def distance_correlation(x: np.ndarray, y: np.ndarray, *, seed: int = 0) -> float:
     """Distance correlation between two 1-D arrays (``[0, 1]``).
 
     Uses :mod:`dcor`'s fast O(n log n) mergesort estimator for the univariate
@@ -618,9 +617,7 @@ def compare_models_aic_bic(
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         full = sm.OLS(t, _design(X)).fit()
-        reduced = sm.OLS(
-            t, _design(X[:, [best_channel_idx]])
-        ).fit()
+        reduced = sm.OLS(t, _design(X[:, [best_channel_idx]])).fit()
 
     delta_aic = float(reduced.aic - full.aic)
     delta_bic = float(reduced.bic - full.bic)

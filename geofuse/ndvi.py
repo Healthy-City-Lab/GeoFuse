@@ -33,7 +33,6 @@ from .ee_utils import (
 from .jobs import progress_interval_s, retry_with_backoff
 from .logger import attach_external_logger, get_logger
 from .persistence.ndvi_tile_cache import DEFAULT_MAX_BYTES, NdviTileCache
-from .raster_sampling import sample_raster_at_features_to_file
 from .vector_io import geometry_sha256
 
 _log = get_logger("NDVI")
@@ -151,7 +150,9 @@ def _export_ee_image_to_tif(
             + (f": {detail}" if detail else "")
         )
 
-    filename_zip = filename[:-4] + ".zip" if filename.endswith(".tif") else filename + ".zip"
+    filename_zip = (
+        filename[:-4] + ".zip" if filename.endswith(".tif") else filename + ".zip"
+    )
     try:
         with open(filename_zip, "wb") as fd:
             for chunk in resp.iter_content(chunk_size=1024):
@@ -741,9 +742,6 @@ class NDVIEngine:
         write_cluster_tiles: bool = False,
         satellite: str = "auto",
         coverage_rescue: bool = True,
-        sample_at_features: gpd.GeoDataFrame | None = None,
-        sample_radius_m: float = 0.0,
-        sample_stat: str = "mean",
     ):
         """
         Download and process NDVI data with automatic tiling for large areas.
@@ -1065,44 +1063,6 @@ class NDVIEngine:
             except Exception as e:
                 _log("WARN", f"Sidecar write failed (non-fatal): {e}")
 
-            # Sample-at-features: attach NDVI values to the caller's
-            # features and write a side GeoPackage. Skipped when
-            # the user didn't ask for it or the raster wasn't written. The
-            # source raster is the final NDVI mosaic; Read once, sampled
-            # per-feature via the shared helper.
-            if sample_at_features is not None and not sample_at_features.empty:
-                final_tif = os.path.join(folder, f"{output_name}_ndvi.tif")
-                if os.path.exists(final_tif):
-                    samples_path = os.path.join(
-                        folder, f"{output_name}_ndvi_at_features.gpkg"
-                    )
-                    try:
-                        n = sample_raster_at_features_to_file(
-                            final_tif,
-                            sample_at_features,
-                            samples_path,
-                            band=1,
-                            radius_m=float(sample_radius_m or 0.0),
-                            stat=sample_stat,
-                            value_column="NDVI",
-                            count_column="ndvi_obs",
-                        )
-                        result["features_samples"] = samples_path
-                        _log(
-                            "OK",
-                            f"Sampled NDVI at {n} feature(s) → "
-                            f"{samples_path} (radius={sample_radius_m} m, "
-                            f"stat={sample_stat}).",
-                        )
-                    except Exception as e:
-                        _log("WARN", f"Sample-at-features failed: {e}")
-                else:
-                    _log(
-                        "WARN",
-                        "Sample-at-features requested but the NDVI raster "
-                        "wasn't kept on disk; enable write_geotiff or skip "
-                        "this option.",
-                    )
         return result
 
     def _download_single(

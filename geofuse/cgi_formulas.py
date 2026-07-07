@@ -60,7 +60,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cache
 
 import numpy as np
 import optuna
@@ -172,7 +172,7 @@ def _snap_weight_buckets(
             floors[i] += 1
     elif rem < 0:
         order = sorted(range(len(raw)), key=lambda i: raw[i] - floors[i])
-        for i in order[: -rem]:
+        for i in order[:-rem]:
             floors[i] = max(0, floors[i] - 1)
     return tuple(floors)
 
@@ -197,7 +197,7 @@ def weight_cell_key(
     return _snap_weight_buckets(mains, bin_pct)
 
 
-@lru_cache(maxsize=None)
+@cache
 def weight_cell_count(formula: str, bin_pct: int = WEIGHT_BIN_PCT) -> int:
     """Number of distinct stability-selection weight cells a formula can reach.
 
@@ -359,7 +359,7 @@ _WA_KEY_TO_CHANNEL: dict[str, str] = {
 
 
 def _suggest_weighted_average(
-    trial: optuna.Trial, *, disabled_channels: "set[str] | None" = None
+    trial: optuna.Trial, *, disabled_channels: set[str] | None = None
 ) -> dict:
     disabled = set(disabled_channels or ())
     active_keys = tuple(
@@ -374,7 +374,9 @@ def _suggest_weighted_average(
         return {k: trial.suggest_int(k, 0, 0) for k in _WA_WEIGHT_KEYS}
     if len(active_keys) == 1:
         # Single-channel run: pin the active one to 100, the rest to 0.
-        out: dict[str, int] = {active_keys[0]: trial.suggest_int(active_keys[0], 100, 100)}
+        out: dict[str, int] = {
+            active_keys[0]: trial.suggest_int(active_keys[0], 100, 100)
+        }
         for k in disabled_keys:
             out[k] = trial.suggest_int(k, 0, 0)
         return out
@@ -442,7 +444,7 @@ _SYN_POWER_CHANNEL: dict[str, str] = {
 
 
 def _suggest_synergy(
-    trial: optuna.Trial, *, disabled_channels: "set[str] | None" = None
+    trial: optuna.Trial, *, disabled_channels: set[str] | None = None
 ) -> dict:
     disabled = set(disabled_channels or ())
     params: dict = {}
@@ -458,12 +460,10 @@ def _suggest_synergy(
     # Weights: any term touching a disabled channel goes to zero; the
     # rest split the 100 mass via the Dirichlet sampler.
     active_keys = tuple(
-        k for k in _SYN_WEIGHT_KEYS
-        if not (_SYN_KEY_CHANNELS[k] & disabled)
+        k for k in _SYN_WEIGHT_KEYS if not (_SYN_KEY_CHANNELS[k] & disabled)
     )
     disabled_keys = tuple(
-        k for k in _SYN_WEIGHT_KEYS
-        if _SYN_KEY_CHANNELS[k] & disabled
+        k for k in _SYN_WEIGHT_KEYS if _SYN_KEY_CHANNELS[k] & disabled
     )
     if not active_keys:
         for k in _SYN_WEIGHT_KEYS:
@@ -474,9 +474,7 @@ def _suggest_synergy(
         for k in disabled_keys:
             params[k] = trial.suggest_int(k, 0, 0)
         return params
-    params.update(
-        _suggest_simplex_weights_dirichlet(trial, active_keys, total=100)
-    )
+    params.update(_suggest_simplex_weights_dirichlet(trial, active_keys, total=100))
     for k in disabled_keys:
         params[k] = trial.suggest_int(k, 0, 0)
     return params
@@ -632,7 +630,7 @@ _CHANNEL_MAIN_KEY: dict[str, dict[str, str]] = {
 
 
 def seed_param_sets(
-    formula: str, disabled_channels: "set[str] | None" = None
+    formula: str, disabled_channels: set[str] | None = None
 ) -> list[dict]:
     """Enqueue-ready params seeding each single-channel vertex + the centroid.
 

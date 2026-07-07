@@ -93,7 +93,9 @@ def connected_components(
     rows = np.repeat(np.arange(n), kk)
     cols = idx[:, 1:].ravel()
     graph = csr_matrix((np.ones(len(cols)), (rows, cols)), shape=(n, n))
-    graph = graph.maximum(graph.T)  # symmetric: connect if either is the other's neighbour
+    graph = graph.maximum(
+        graph.T
+    )  # symmetric: connect if either is the other's neighbour
     _ncomp, labels = _csgraph_components(graph, directed=False)
     scale = float(np.median(dists[:, 1])) if n > 1 else 0.0
     return labels.astype(np.int64), scale
@@ -138,7 +140,7 @@ def _component_columns(
     # invariant to this up to the linear null space).
     center = xy_c.mean(axis=0)
     z = xy_c - center
-    span = float(np.sqrt((z ** 2).sum(axis=1)).std())
+    span = float(np.sqrt((z**2).sum(axis=1)).std())
     if span <= 0:
         # Coincident points carry no within-component spatial information.
         return empty, empty
@@ -245,7 +247,12 @@ def build_block_basis(
         radial=empty,
         radial_rank=np.empty(0, dtype=np.int64),
         n=n,
-        summary={"n_components": 0, "eps_used": 0.0, "max_df_avail": 0, "knots_per_component": []},
+        summary={
+            "n_components": 0,
+            "eps_used": 0.0,
+            "max_df_avail": 0,
+            "knots_per_component": [],
+        },
     )
     if n < 4 or finite.sum() < 4:
         return base
@@ -308,9 +315,7 @@ def build_block_basis(
     )
 
 
-def _ols_info_criterion(
-    y: np.ndarray, X: np.ndarray | None, criterion: str
-) -> float:
+def _ols_info_criterion(y: np.ndarray, X: np.ndarray | None, criterion: str) -> float:
     """Gaussian AIC/BIC of ``OLS(y ~ X)`` (intercept added).
 
     Uses the MLE log-likelihood ``ℓ = −n/2 (ln 2π + ln(RSS/n) + 1)`` and counts

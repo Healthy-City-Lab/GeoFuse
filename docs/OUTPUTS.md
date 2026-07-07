@@ -4,7 +4,7 @@ All outputs are written under `output_results/` by default.
 
 ## Coordinate reference system
 
-Every raster and vector output — GeoTIFFs, GeoPackages, per-cluster tiles, sample-at-features layers, and the fusion composite — ships in the **engine-selected planar CRS** (UTM, Lambert Conformal Conic, or Polar Stereographic, chosen from the input geometry). Cells stay square in metres, index values never pass through a resampler, and downstream tools read the embedded CRS automatically. The exact CRS for a run is recorded in its `_gvi.json` / `_ndvi.json` sidecar.
+Every raster and vector output — GeoTIFFs, GeoPackages, per-cluster tiles, and the fusion composite — ships in the **engine-selected planar CRS** (UTM, Lambert Conformal Conic, or Polar Stereographic, chosen from the input geometry). Cells stay square in metres, index values never pass through a resampler, and downstream tools read the embedded CRS automatically. The exact CRS for a run is recorded in its `_gvi.json` / `_ndvi.json` sidecar.
 
 > [!NOTE]
 > **GeoJSON is the one exception.** `*_gvi.geojson`, `*_ndvi.geojson`, and `*_temporal_ndvi.geojson` are reprojected to **EPSG:4326** (lon/lat) at write time, because the format has no reliable CRS metadata. Use GeoPackage for analysis in the planar CRS.
@@ -71,15 +71,6 @@ Per-pixel point data. The GeoPackage is in the planar CRS and loads far faster a
 | --- | --- |
 | `NDVI` | Normalized Difference Vegetation Index (−1 to 1) |
 | `ndvi_date` | Source date (attribute-column mode only) |
-
-### `[name]_ndvi_at_features.gpkg` — optional (Sample at uploaded features)
-
-Your original features with NDVI attached (layer `ndvi_at_features`):
-
-| Field | Description |
-| --- | --- |
-| `NDVI` | Exact-pixel value for unbuffered points, otherwise the chosen zonal stat (mean / median / min / max / std / count) |
-| `ndvi_obs` | Count of valid pixels contributing; `0` means outside the raster or all-nodata |
 
 ### `[name]_ndvi_tiles/` — optional (Per-cluster tiles)
 

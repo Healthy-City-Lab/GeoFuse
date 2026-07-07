@@ -121,9 +121,7 @@ def compute_post_metrics(
     winning_cell = list(winning_params.get("__winning_cell__") or [])
     higher = bool(winning_params.get("__higher_is_better__", True))
 
-    cell_rows = [
-        r for r in history if list(r.get("cell") or []) == winning_cell
-    ]
+    cell_rows = [r for r in history if list(r.get("cell") or []) == winning_cell]
     cell_rows.sort(
         key=lambda r: (
             r.get("oob_score")
@@ -135,9 +133,7 @@ def compute_post_metrics(
     if max_trials and len(cell_rows) > max_trials:
         cell_rows = cell_rows[:max_trials]
 
-    final_clean = {
-        k: v for k, v in winning_params.items() if not k.startswith("__")
-    }
+    final_clean = {k: v for k, v in winning_params.items() if not k.startswith("__")}
 
     pools: list[tuple[str, list[dict]]] = [("winning_cell", cell_rows)]
     if final_clean:

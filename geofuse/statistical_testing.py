@@ -116,9 +116,7 @@ def iterative_vif_reduction(
     there's only one column), ``dropped`` is empty and ``kept == names``.
     """
     if len(names) != X.shape[1]:
-        raise ValueError(
-            f"len(names)={len(names)} must equal X.shape[1]={X.shape[1]}."
-        )
+        raise ValueError(f"len(names)={len(names)} must equal X.shape[1]={X.shape[1]}.")
     initial_vifs = compute_vif(X)
     pearson = pairwise_pearson_matrix(X)
     if X.shape[1] < 2:
@@ -153,12 +151,16 @@ def iterative_vif_reduction(
             )
             active_idx.pop(worst_pos)
             # Tag the post-drop VIFs so the caller can see the effect.
-            after_vifs = compute_vif(X[:, active_idx]) if len(active_idx) > 1 else (
-                np.array([1.0])
+            after_vifs = (
+                compute_vif(X[:, active_idx])
+                if len(active_idx) > 1
+                else (np.array([1.0]))
             )
             iterations[-1]["vifs_after"] = after_vifs.tolist()
-            if not (np.isfinite(np.nanmax(after_vifs)) and
-                    float(np.nanmax(after_vifs)) > vif_threshold):
+            if not (
+                np.isfinite(np.nanmax(after_vifs))
+                and float(np.nanmax(after_vifs)) > vif_threshold
+            ):
                 break
         else:
             break
@@ -166,7 +168,8 @@ def iterative_vif_reduction(
     kept_names = [names[i] for i in active_idx]
     dropped_names = [it["removed"] for it in iterations]
     final_vifs = (
-        compute_vif(X[:, active_idx]) if len(active_idx) > 1
+        compute_vif(X[:, active_idx])
+        if len(active_idx) > 1
         else np.array([1.0] * len(active_idx))
     )
     return {
@@ -264,7 +267,9 @@ def bootstrap_score_ci(
             "method": method,
         }
 
-    def _score(target_arr: np.ndarray, pred_arr: np.ndarray, sel: np.ndarray | None) -> float:
+    def _score(
+        target_arr: np.ndarray, pred_arr: np.ndarray, sel: np.ndarray | None
+    ) -> float:
         if cov_arr is None:
             return float(score_fn(target_arr, pred_arr))
         sub = cov_arr if sel is None else cov_arr[sel]
@@ -434,6 +439,7 @@ def permutation_pvalue(
         # No covariates: shuffle the prediction against the fixed target.
         def _perm_score(idx: np.ndarray) -> float:
             return float(score_fn(t, p[idx]))
+
     else:
         # Freedman–Lane: permute the target residuals after regressing on the
         # covariates, keeping each side's covariate structure intact.
@@ -487,9 +493,7 @@ def holm_bonferroni(pvalues) -> list[float]:
     """
     vals = list(pvalues)
     finite_idx = [
-        i
-        for i, p in enumerate(vals)
-        if p is not None and np.isfinite(float(p))
+        i for i, p in enumerate(vals) if p is not None and np.isfinite(float(p))
     ]
     out = [float("nan")] * len(vals)
     m = len(finite_idx)

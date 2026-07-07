@@ -17,12 +17,8 @@ import numpy as np
 import optuna
 import pandas as pd
 import rasterio
-from optuna.pruners import HyperbandPruner, MedianPruner, SuccessiveHalvingPruner
-from optuna.samplers import CmaEsSampler, RandomSampler, TPESampler
 from rasterio.transform import from_origin, rowcol, xy
-from scipy.stats import pearsonr, spearmanr
 from shapely.geometry import box
-from sklearn.metrics import mean_squared_error, mutual_info_score, r2_score
 from sklearn.model_selection import train_test_split
 
 from . import (
@@ -667,9 +663,7 @@ class MetricFusionEngine:
                     float(v)
                     for v in self.buffered_extent.to_crs(raster_crs).total_bounds
                 )
-                if bounds is not None and np.all(
-                    np.isfinite([minx, miny, maxx, maxy])
-                ):
+                if bounds is not None and np.all(np.isfinite([minx, miny, maxx, maxy])):
                     rl, rb, rr, rt = (
                         float(bounds.left),
                         float(bounds.bottom),
@@ -1992,7 +1986,9 @@ class MetricFusionEngine:
             if isinstance(metric_data, dict)
             else self._ring_vector_cache
         )
-        key = metric_sampling.ring_cache_key(channel, fold_idx, subset, points_gdf, radii)
+        key = metric_sampling.ring_cache_key(
+            channel, fold_idx, subset, points_gdf, radii
+        )
 
         if key not in cache_store:
             try:
@@ -2017,7 +2013,9 @@ class MetricFusionEngine:
                 )
 
         _, rows = cache_store[key]
-        return metric_sampling.aggregate_from_ring_cache(radii, rows, radius_m, stat, percentile)
+        return metric_sampling.aggregate_from_ring_cache(
+            radii, rows, radius_m, stat, percentile
+        )
 
     def prepare_fusion_data(self) -> pd.DataFrame:
         """
@@ -3825,7 +3823,10 @@ class MetricFusionEngine:
                 cx = rep.x.to_numpy(dtype=np.float64)
                 cy = rep.y.to_numpy(dtype=np.float64)
         except Exception as exc:  # geometry/CRS trouble → skip, fall back to covariates
-            _log("WARN", f"Could not attach entity coordinates for spatial adjustment: {exc}")
+            _log(
+                "WARN",
+                f"Could not attach entity coordinates for spatial adjustment: {exc}",
+            )
             return fusion_df
         fusion_df = fusion_df.copy()
         fusion_df["_cx"] = cx
@@ -4026,7 +4027,9 @@ class MetricFusionEngine:
         # Sample Vegetation
         if isinstance(self.veg_data, dict):  # Raster
             points_in_veg_crs = points_gdf.to_crs(self.veg_data["crs"])
-            points_gdf["veg"] = metric_sampling.sample_raster_values(points_in_veg_crs, self.veg_data)
+            points_gdf["veg"] = metric_sampling.sample_raster_values(
+                points_in_veg_crs, self.veg_data
+            )
         else:  # GeoDataFrame
             # Detect metric column
             veg_col = self.veg_data.attrs.get("metric_column", "gvi")
@@ -4382,9 +4385,7 @@ class MetricFusionEngine:
         agg = cdf.groupby("_g", sort=False)[["x", "y"]].mean()
         group_pts = gpd.GeoDataFrame(
             {"_g": agg.index.to_numpy()},
-            geometry=gpd.points_from_xy(
-                agg["x"].to_numpy(), agg["y"].to_numpy()
-            ),
+            geometry=gpd.points_from_xy(agg["x"].to_numpy(), agg["y"].to_numpy()),
             crs=tg.crs,
         )
         r_max = max(
@@ -4867,9 +4868,7 @@ class MetricFusionEngine:
             # skip copying the geometry column every trial × fold.
             if getattr(self, "_preaggregation_done", False):
                 light_cols = [
-                    c
-                    for c in ("wave", "_preaggr_id")
-                    if c in self.target_gdf.columns
+                    c for c in ("wave", "_preaggr_id") if c in self.target_gdf.columns
                 ]
                 train_points = self.target_gdf.loc[train_data.index, light_cols]
                 val_points = self.target_gdf.loc[val_data.index, light_cols]
@@ -5099,20 +5098,32 @@ class MetricFusionEngine:
                     train_coords = np.column_stack(
                         [
                             self._collapse_to_entities(
-                                train_data["_cx"].to_numpy(np.float64), train_pid, None, "first"
+                                train_data["_cx"].to_numpy(np.float64),
+                                train_pid,
+                                None,
+                                "first",
                             ),
                             self._collapse_to_entities(
-                                train_data["_cy"].to_numpy(np.float64), train_pid, None, "first"
+                                train_data["_cy"].to_numpy(np.float64),
+                                train_pid,
+                                None,
+                                "first",
                             ),
                         ]
                     )
                     val_coords = np.column_stack(
                         [
                             self._collapse_to_entities(
-                                val_data["_cx"].to_numpy(np.float64), val_pid, None, "first"
+                                val_data["_cx"].to_numpy(np.float64),
+                                val_pid,
+                                None,
+                                "first",
                             ),
                             self._collapse_to_entities(
-                                val_data["_cy"].to_numpy(np.float64), val_pid, None, "first"
+                                val_data["_cy"].to_numpy(np.float64),
+                                val_pid,
+                                None,
+                                "first",
                             ),
                         ]
                     )
@@ -5496,11 +5507,15 @@ class MetricFusionEngine:
                     [
                         self._collapse_to_entities(
                             self.test_data["_cx"].to_numpy(np.float64),
-                            test_pid, None, "first",
+                            test_pid,
+                            None,
+                            "first",
                         ),
                         self._collapse_to_entities(
                             self.test_data["_cy"].to_numpy(np.float64),
-                            test_pid, None, "first",
+                            test_pid,
+                            None,
+                            "first",
                         ),
                     ]
                 )
@@ -5594,10 +5609,10 @@ class MetricFusionEngine:
 
         result = {"test_score": test_score, "metric": metric}
         if self.spatial_adjust_method != "none":
-            result["spatial_adjustment"] = (
-                self._spatial_adjust_summary
-                or {"method": self.spatial_adjust_method, "applied": False}
-            )
+            result["spatial_adjustment"] = self._spatial_adjust_summary or {
+                "method": self.spatial_adjust_method,
+                "applied": False,
+            }
         if test_pval is not None:
             result["test_pvalue"] = test_pval
             logger.info(
@@ -5852,9 +5867,7 @@ class MetricFusionEngine:
         each time is wasteful. Invalidated by :meth:`split_data`.
         """
         if self._full_data_cache is None:
-            parts = [
-                d for d in (self.train_val_data, self.test_data) if d is not None
-            ]
+            parts = [d for d in (self.train_val_data, self.test_data) if d is not None]
             self._full_data_cache = pd.concat(parts) if parts else None
         return self._full_data_cache
 
@@ -5863,9 +5876,7 @@ class MetricFusionEngine:
         """Hashable key over the params that determine the composite."""
         items = tuple(
             sorted(
-                (str(k), v)
-                for k, v in weights.items()
-                if not str(k).startswith("__")
+                (str(k), v) for k, v in weights.items() if not str(k).startswith("__")
             )
         )
         return (channel_mode, items)
@@ -5981,8 +5992,8 @@ class MetricFusionEngine:
         all_veg_norm = all_combined[:, 0]
         all_terrain_norm = all_combined[:, 1]
         all_ndvi_norm = all_combined[:, 2]
-        all_veg_norm, all_terrain_norm, all_ndvi_norm = (
-            self._normalize_channel_arrays(all_veg_norm, all_terrain_norm, all_ndvi_norm)
+        all_veg_norm, all_terrain_norm, all_ndvi_norm = self._normalize_channel_arrays(
+            all_veg_norm, all_terrain_norm, all_ndvi_norm
         )
 
         # Calculate composite via the active mode (same fork as _objective /
@@ -6313,7 +6324,9 @@ class MetricFusionEngine:
                 te_sb = tr.get("spatial_basis")
                 if te_sb is not None:
                     te_sb = np.asarray(te_sb, dtype=np.float64)
-                    cov_te = te_sb if cov_te is None else np.column_stack([cov_te, te_sb])
+                    cov_te = (
+                        te_sb if cov_te is None else np.column_stack([cov_te, te_sb])
+                    )
                 results["test"] = _block(
                     t_te, c_te, cov_te, do_perm=True, sub_seed=seed + 101
                 )
@@ -7279,9 +7292,7 @@ class MetricFusionEngine:
                 cell: (max(s) if higher_is_better else min(s))
                 for cell, s in cellmap.items()
             }
-            rankings.append(
-                sorted(rep, key=lambda c: rep[c], reverse=higher_is_better)
-            )
+            rankings.append(sorted(rep, key=lambda c: rep[c], reverse=higher_is_better))
         n_candidate_cells = len(cells)
         calib = _stats_mod.calibrate_stability_selection(
             rankings, n_candidate_cells, max_pfer=max_pfer
@@ -7694,7 +7705,9 @@ class MetricFusionEngine:
         Returns:
             Path to the saved composite greenery map
         """
-        logger.info("Generating composite greenery map from stability-selected params...")
+        logger.info(
+            "Generating composite greenery map from stability-selected params..."
+        )
 
         if progress_callback:
             progress_callback(0, 100)
@@ -8018,4 +8031,3 @@ class MetricFusionEngine:
         logger.info(f"✓ Parameters saved: {params_path}")
 
         return output_path
-

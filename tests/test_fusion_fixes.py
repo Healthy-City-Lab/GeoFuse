@@ -30,7 +30,7 @@ class TestWeightCellCount(unittest.TestCase):
         # cell key length must be the number of main weights.
         syn = cf.get_formula("synergy")
         self.assertEqual(len(syn.main_weight_keys), 3)
-        params = {k: 20 for k in syn.weight_keys}
+        params = dict.fromkeys(syn.weight_keys, 20)
         key = cf.weight_cell_key("synergy", params)
         self.assertEqual(len(key), len(syn.main_weight_keys))
 
@@ -39,8 +39,9 @@ class TestWeightCellCount(unittest.TestCase):
         # main == all weights for weighted_average, so the key spans every weight
         self.assertEqual(wa.main_weight_keys, wa.weight_keys)
         params = {k: 100 // len(wa.weight_keys) for k in wa.weight_keys}
-        self.assertEqual(len(cf.weight_cell_key("weighted_average", params)),
-                         len(wa.weight_keys))
+        self.assertEqual(
+            len(cf.weight_cell_key("weighted_average", params)), len(wa.weight_keys)
+        )
 
     def test_hand_enumerated_two_weight_case(self):
         # Two weights at 5% step summing to 100, binned to 10%: reachable bucket
@@ -50,9 +51,10 @@ class TestWeightCellCount(unittest.TestCase):
         }
         # Drive the same logic the counter uses for a 2-main-weight, no-interaction
         # formula by checking the enumeration matches the hand set size.
-        self.assertEqual(len(expected), len({
-            (cf.bin_weight(w), cf.bin_weight(100 - w)) for w in range(0, 101, 5)
-        }))
+        self.assertEqual(
+            len(expected),
+            len({(cf.bin_weight(w), cf.bin_weight(100 - w)) for w in range(0, 101, 5)}),
+        )
 
 
 class TestCategoricalCovariateExpansion(unittest.TestCase):
@@ -100,9 +102,7 @@ class TestCategoricalCovariateExpansion(unittest.TestCase):
         eng.target_gdf = self._gdf()
         eng._expand_categorical_covariates()
         self.assertNotIn("ses_band", eng.covariate_columns)
-        self.assertTrue(
-            all(c.startswith("ses_band=") for c in eng.covariate_columns)
-        )
+        self.assertTrue(all(c.startswith("ses_band=") for c in eng.covariate_columns))
 
     def test_untagged_non_numeric_raises(self):
         eng = self._engine(["land_use"], {"land_use": "numeric"})

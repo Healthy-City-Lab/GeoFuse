@@ -135,7 +135,9 @@ def sample_raster_values(
     return out
 
 
-def radius_int_bounds(r_min: float, r_max: float, r_step: float) -> tuple[int, int, int]:
+def radius_int_bounds(
+    r_min: float, r_max: float, r_step: float
+) -> tuple[int, int, int]:
     """Align Optuna integer radius search to user min/max/step (metres)."""
     lo = max(1, int(round(r_min)))
     hi = int(round(r_max))

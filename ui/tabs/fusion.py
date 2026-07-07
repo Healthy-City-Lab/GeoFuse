@@ -64,10 +64,16 @@ def _read_vector_cached(
     stalling on large targets. ``sig`` is part of the key so an edited file is
     re-read.
     """
-    return read_vector_path(path, layer=layer) if layer is not None else read_vector_path(path)
+    return (
+        read_vector_path(path, layer=layer)
+        if layer is not None
+        else read_vector_path(path)
+    )
 
 
-def _read_vector_for_ui(path: str, layer: str | int | None = None) -> "gpd.GeoDataFrame":
+def _read_vector_for_ui(
+    path: str, layer: str | int | None = None
+) -> "gpd.GeoDataFrame":
     """Cached target read for the tab (keyed by the file's current fingerprint)."""
     return _read_vector_cached(path, _file_sig(path), layer)
 
@@ -90,7 +96,8 @@ _CHANNEL_DISPLAY = {"veg": "Vegetation", "terrain": "Terrain", "ndvi": "NDVI"}
 class _FusionVerticalScaleControl(MacroElement):
     """Leaflet control: vertical red→yellow→green strip with numeric bounds."""
 
-    _template = Template("""
+    _template = Template(
+        """
 {% macro script(this, kwargs) %}
     var {{ this.get_name() }}_vsc = L.control({position: 'topright'});
     {{ this.get_name() }}_vsc.onAdd = function (map) {
@@ -106,7 +113,8 @@ class _FusionVerticalScaleControl(MacroElement):
     };
     {{ this.get_name() }}_vsc.addTo({{ this._parent.get_name() }});
 {% endmacro %}
-""")
+"""
+    )
 
     def __init__(self, inner_html: str):
         super().__init__()
@@ -419,9 +427,7 @@ def _submit_fusion_restart(
         "residualize_method": "linear",
     }
     missing = [
-        k
-        for k in _FUSION_RUN_CONFIG_KEYS
-        if k not in p and k not in _restart_defaults
+        k for k in _FUSION_RUN_CONFIG_KEYS if k not in p and k not in _restart_defaults
     ]
     if missing:
         raise RuntimeError(
@@ -1532,7 +1538,10 @@ def _render_study_details_panel(
         residualize_method = st.selectbox(
             "Covariate residualization",
             options=["linear", "spline"],
-            format_func=lambda m: {"linear": "Linear", "spline": "Spline (natural cubic)"}[m],
+            format_func=lambda m: {
+                "linear": "Linear",
+                "spline": "Spline (natural cubic)",
+            }[m],
             index=["linear", "spline"].index(
                 st.session_state.get("fusion_residualize_method", "linear")
             ),
@@ -2554,9 +2563,7 @@ def _render_stability_diagnostics(summary: dict, metric_name: str) -> None:
     # ── Per-trial history (the stability analogue of an Optuna trial log) ──
     history = summary.get("trial_history") or []
     if history and len(history) >= 5:
-        with st.expander(
-            f"Trial history ({len(history)} trials across all resamples)"
-        ):
+        with st.expander(f"Trial history ({len(history)} trials across all resamples)"):
             hist_df = _pd.DataFrame(history)
 
             # OOB score per resample as a pair of boxplots: one for the
@@ -3024,9 +3031,7 @@ def _render_study_detail(
             eff = eff_for.get(subset)
             row["95% CI"] = _fmt_ci(eff)
             p_val = (eff or {}).get("p_value")
-            row["p (perm)"] = (
-                f"{float(p_val):.3g}" if p_val is not None else None
-            )
+            row["p (perm)"] = f"{float(p_val):.3g}" if p_val is not None else None
             row["n"] = block.get("n")
             rows.append(row)
         if rows:
@@ -3283,9 +3288,8 @@ def _render_fusion_results_body(output_dir: str) -> None:
 
     # Read run details from the persisted bundle first so they survive a disk
     # reload (when the live ``engine`` is gone); fall back to the engine.
-    formula_name = (
-        results_view.get("cgi_formula")
-        or getattr(engine, "cgi_formula", "weighted_average")
+    formula_name = results_view.get("cgi_formula") or getattr(
+        engine, "cgi_formula", "weighted_average"
     )
     try:
         formula = _cgi_formulas.get_formula(formula_name)
@@ -3297,9 +3301,11 @@ def _render_fusion_results_body(output_dir: str) -> None:
         or getattr(engine, "covariate_columns", [])
         or []
     )
-    cov_types = results_view.get("covariate_types") or getattr(
-        engine, "covariate_types", {}
-    ) or {}
+    cov_types = (
+        results_view.get("covariate_types")
+        or getattr(engine, "covariate_types", {})
+        or {}
+    )
     target_name = results_view.get("target_display_name") or getattr(
         engine, "target_file", None
     )
@@ -3464,7 +3470,9 @@ def _render_target_preview(
     try:
         if is_vector_target and preview_vector_gdf is not None:
             preview_gdf = sanitize_gdf_attributes_for_json(preview_vector_gdf)
-            numeric_cols = preview_gdf.select_dtypes(include=[np.number]).columns.tolist()
+            numeric_cols = preview_gdf.select_dtypes(
+                include=[np.number]
+            ).columns.tolist()
             geom_only = "— Outline only —"
             preview_pick = st.selectbox(
                 "Preview value column",
@@ -3487,7 +3495,9 @@ def _render_target_preview(
                 add_mixed_geojson_preview(m_fusion_preview, preview_gdf)
 
             bounds = preview_gdf.total_bounds
-            m_fusion_preview.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
+            m_fusion_preview.fit_bounds(
+                [[bounds[1], bounds[0]], [bounds[3], bounds[2]]]
+            )
 
         elif is_raster_target:
             with rasterio.open(tmp_target_path) as src:
