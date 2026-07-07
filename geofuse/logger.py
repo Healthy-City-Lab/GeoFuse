@@ -67,14 +67,27 @@ _log_queue: queue.Queue[tuple[str, str, str] | None] = queue.Queue()
 _listener_thread: threading.Thread | None = None
 _listener_lock = threading.Lock()
 
+# Subprocess children (see :mod:`geofuse.jobs.subprocess_runner`) replace
+# ``_log_queue`` with a forwarding queue that ships lines straight to the
+# parent and drop this to ``False``: there is nothing on the child side for a
+# listener thread to consume, so it must not start. Parent processes leave it
+# ``True`` and the listener drains the real queue as usual.
+_listener_enabled: bool = True
+
 # Strip ANSI colour codes from the plain (file) line so editors don't show
 # escape sequences.
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def _ensure_listener() -> None:
-    """Start the listener thread on first use. Idempotent."""
+    """Start the listener thread on first use. Idempotent.
+
+    A no-op when :data:`_listener_enabled` is ``False`` (subprocess children),
+    where the forwarding ``_log_queue`` has no ``get`` for the loop to call.
+    """
     global _listener_thread
+    if not _listener_enabled:
+        return
     if _listener_thread is not None and _listener_thread.is_alive():
         return
     with _listener_lock:

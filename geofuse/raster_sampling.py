@@ -26,7 +26,6 @@ from __future__ import annotations
 import math
 import threading
 from collections.abc import Callable
-from typing import Any
 
 import geopandas as gpd
 import numpy as np
@@ -259,25 +258,3 @@ def sample_raster_at_features(
                 continue
 
     return out
-
-
-def sample_raster_at_features_to_file(
-    raster_path: str,
-    features_gdf: gpd.GeoDataFrame,
-    output_gpkg_path: str,
-    *,
-    layer: str = "ndvi_at_features",
-    progress_cb: Callable[[int, int], None] | None = None,
-    **sampling_kwargs: Any,
-) -> int:
-    """Convenience wrapper: sample, write to GeoPackage, return feature count.
-
-    ``progress_cb(k, n)`` is currently called once at the end — the per-
-    feature loop is fast enough that batched reporting is fine for the
-    typical scale (≲100k features).
-    """
-    out = sample_raster_at_features(raster_path, features_gdf, **sampling_kwargs)
-    out.to_file(output_gpkg_path, driver="GPKG", layer=layer)
-    if progress_cb is not None:
-        progress_cb(len(out), len(out))
-    return len(out)

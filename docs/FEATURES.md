@@ -1,83 +1,92 @@
 # GeoFuse — Feature Reference
 
-## 1. Street View Intelligence (GVI)
-
-* **Automated Sourcing**: Scrapes or downloads Google Street View panoramas for any study area (GeoJSON or Shapefile). Operates _with_ or _without_ an API Key.
-* **Deep Learning Segmentation**: Uses the **DeepLabV3+** model (PyTorch) trained on the **Cityscapes** dataset to identify Vegetation (class 8) and Terrain (class 9) greenery coverage.
-* **Nation-Scale Clustered Sampling Grids**: For widely-scattered inputs (e.g. neighbourhoods across multiple cities), the engine automatically dissolves touching buffers, splits the study area into spatial clusters, and generates a separate sampling grid per cluster — all anchored to one common reference grid. This avoids the exponential bbox blow-up that would otherwise produce hundreds of millions of empty cells across a country.
-* **Automatic Projected CRS Selection**: For each study area, the engine picks the most accurate planar CRS by extent — a local UTM zone for compact areas (≤ 6° lon / 8° lat), a two-parallel Lambert Conformal Conic for continent-scale extents, or Polar Stereographic above 75° latitude. A measured distortion estimate is logged; warnings appear if distortion exceeds 2 %.
-* **Subprocess Execution**: GVI workers run in a separate Python process so they no longer share the Python GIL with the Streamlit UI. This eliminates the GPU-utilisation drop that happened when the browser tab was in the foreground.
-* **Concurrent Per-Point Pipeline**: Up to 4 panoramas are downloaded, pre-processed, and queued for the GPU concurrently. Network I/O and CPU pre-processing run lock-free; only the GPU forward pass is serialised so one point's inference overlaps the next point's download.
-* **Batch Processing**: Upload multiple study areas to process distinct regions simultaneously.
-* **Smart Caching**: Shared, cross-process panorama cache (`logs/caches/gvi_panos.db`) prevents redundant downloads for overlapping areas, reducing processing time and API costs. An in-memory overlay keeps repeated lookups microsecond-fast.
-* **Robust Processing**:
-  * Async/multi-threaded downloading.
-  * Image pre-processing: ensures 360° coverage, corrects panorama artifacts, detects corrupt panoramas, standardizes resolution.
-* **Restart System for Interrupted Jobs**: If Streamlit (or the machine) restarts mid-run, the affected jobs appear as "Interrupted" in the affected tab. Re-uploading the **same** study area file shows a restart panel with "Resume Job" / "Discard" buttons; resume continues from the exact point where the job stopped. The re-uploaded file is hash-verified to ensure it is the same study area.
-* **Refresh-Safe Job Monitor**: Jobs survive browser refresh and additional tabs. Track progress in the sidebar with a live health badge (active / stuck / errors). Job state is persisted to `logs/jobs.db`; per-job text logs are written to `logs/jobs/<job_id>.log` and can be opened directly from the UI with the "📄 Open log file" button.
-* **Live Per-Job Logs**: Engine logs (including Earth Engine and Optuna internals) appear inside the job's own expander rather than the host terminal. Job log files persist on disk indefinitely for later inspection.
-* **Parallel Study Areas**: Submit multiple study areas with different resolution or buffer settings simultaneously — each unique parameter combination is treated as a separate job.
-* **Outputs**: **GeoPackage** point layer (canonical, recommended), per-cluster **GeoTIFF tiles** (optional, dense — no inter-cluster gaps), **GeoJSON** (compatibility, EPSG:4326 only), optional raw panoramas and segmentation masks. GeoPackage, GeoTIFF, and per-cluster tiles ship in the engine-selected **planar CRS** (UTM / LCC / Polar Stereographic from `select_grid_crs`) so cells stay true squares in metres; lat/lon stay available as data columns on GVI points.
+GeoFuse measures two complementary views of urban greenery, then fuses them into a single composite index tuned against a health or environmental outcome. This page is a high-level tour of what each part does and the design choices that matter for trusting the results.
 
 ---
 
-## 2. Satellite Intelligence (NDVI)
+## 1. Eye-Level Greenery — GVI
 
-* **Google Earth Engine Integration**: Fetches cloud-free Sentinel-2 or Landsat imagery for any study area.
-* **Flexible Date Modes** (any combination):
-  * **Date Range(s)**: Produces one composite output file per range.
-  * **Specific Date(s)**: Builds a composite from imagery within a ± window around each date.
-  * **Attribute Column**: Matches each feature to its own date from an attribute column, producing a single temporally-aligned output file.
-* **Dynamic Calculation**: Computes NDVI for the exact timeframe matching your street view data.
-* **Latitude-aware planar CRS**: Earth Engine exports use an auto-selected planar CRS (UTM / two-parallel LCC / Polar Stereographic) so pixels are rasterised in true ground metres at any latitude. The final raster ships in that same CRS — no WGS84 reprojection step — so every output pixel is a true square on the ground.
-* **Cluster-aware tiling**: For nationally-scattered inputs, the engine dissolves the buffered geometry into connected components and tiles each component's bbox in true metres, dropping tiles that fall over empty bbox regions (ocean, gaps between provinces) before they reach Earth Engine.
-* **Pixel-aligned streaming mosaic**: Tiles are exported in a single planar CRS with a global snap grid and stream-mosaicked directly into the user-facing GeoTIFF in that same CRS. Adjacent tile boundaries align to the pixel, peak mosaic memory never exceeds one tile, and there is no second reprojection pass to drag out the wall clock or smear nodata into edge pixels.
-* **Parallel tile downloads**: Up to 4 tiles download from Earth Engine concurrently. A single failed tile is logged as a warning and skipped; the rest of the batch keeps going. Progress emits are throttled to a few seconds based on tile count so the UI heartbeat stays responsive on large-scale runs.
-* **Automatic retry on flaky networks**: Every Earth Engine export retries up to 3 times with jittered exponential backoff before giving up. Tiles that exhaust the retry budget are recorded in the sidecar JSON (cluster + tile ID + last error) so a swiss-cheese mosaic from a bad network minute is auditable instead of mysterious.
-* **Persistent tile cache + resume from interruption**: Every tile lands in a per-key cache directory (`logs/caches/ndvi_tiles/`) keyed by geometry + date range + cloud max + resolution. Repeat runs over the same area + date range are near-instant and every previously-downloaded tile is reused without touching Earth Engine. A cancelled or crashed run also benefits: the next attempt with the same parameters picks up exactly where it left off. The cache is LRU-evicted with a default 5 GB cap so it can't grow unbounded; the audit trail in the sidecar JSON records the cache key and how many tiles were reused.
-* **Subprocess execution**: NDVI runs in a separate Python process (same scaffold as GVI). Earth Engine HTTP, zip-extract, and rasterio decode no longer share the GIL with the Streamlit UI — the job-monitor fragment and result-inspector stay responsive while a large mosaic is downloading.
-* **Per-cluster GeoTIFF tiles (optional)**: For scattered inputs (multiple city / provinces), enable **Per-cluster tiles** to get one GeoTIFF per connected component in `{name}_ndvi_tiles/` plus a `tiles_index.json`. Avoids the single mostly-NaN continent-spanning mosaic so downstream fusion / GIS tools can index by cluster.
-* **Compressed tiled BIGTIFF outputs**: NDVI and GVI GeoTIFFs use DEFLATE compression with a float-aware predictor, internal 256×256 tiling, BIGTIFF support, and `SPARSE_OK=TRUE` so all-nodata blocks cost zero bytes on disk — a big win for GVI's mostly-NaN cluster rasters in particular. Overview pyramids are deliberately omitted from both engines' GeoTIFFs so the user-facing raster is exactly what the engine produced — QGIS and ArcGIS build local pyramids on demand if you need them.
-* **Streaming vector export**: When **Save GeoPackage** is enabled, NDVI walks the raster in its native 256×256 blocks and appends to the GeoPackage in bounded chunks. Peak memory stays low regardless of raster size, so national-scale `*_ndvi.gpkg` exports will not OOM at the vector step. GeoJSON output is materialised from the streamed GPKG at the end.
-* **Single-band NDVI raster**: NDVI GeoTIFFs hold one float32 band — the median NDVI over the requested date range — with `-9999` as nodata. Cloud-masked and out-of-collection pixels are painted with the sentinel before export so the downstream warp respects coverage gaps cleanly.
-* **Actionable Earth Engine diagnostics**: When a job returns no usable imagery, the engine distinguishes "no images in the date range" from "all images exceeded the cloud threshold" so you get a useful error message instead of a generic "no images found." Pre-2017 ranges suggest switching to Landsat / auto mode.
-* **Automatic coverage rescue**: When the cloud-filtered collection has fewer than 3 images, the engine widens the date window by ±50 % once and re-queries. If the wider window helps, the run proceeds and the sidecar JSON records the wider range so you know the composite is broader than what you asked for.
-* **Landsat 8/9 fallback for pre-2017 dates**: The new `Satellite` option defaults to `auto`; Sentinel-2 for ranges ending on/after 2017-03-28, Landsat 8 + 9 (Collection 2 Level-2) otherwise. The NDVI band name and downstream consumers are identical between collections; only the source and per-pixel scale differ. Sidecar records which satellite was used.
-* **Sample at uploaded features (optional)**: Enable **Sample at uploaded features** to also write `{name}_ndvi_at_features.gpkg` — your original features with NDVI attached (exact-pixel read or zonal mean/median/min/max/std/count over a buffer or polygon). Useful for fusion downstream where you need per-feature greenery values instead of dense rasters.
-* **GeoPackage Output Option**: GeoTIFF remains the default, but a `Save GeoPackage` checkbox writes `*_ndvi.gpkg` (layer `ndvi_samples`) alongside the raster for QGIS / GeoPandas consumption.
-* **Restart System**: Like GVI, NDVI jobs interrupted by a Streamlit restart appear as "Interrupted" and can be resumed by re-uploading the original study area.
+The **Green View Index** estimates how much greenery a person sees at street level.
+
+- **Automated panorama sourcing.** Pulls Google Street View imagery for any study area (GeoJSON, Shapefile, or GeoPackage), with or without an API key.
+- **Deep-learning segmentation.** A **DeepLabV3+** model trained on the **Cityscapes** classes labels each panorama; GVI is the share of pixels classed as **vegetation** and **terrain**.
+- **Scales from a block to a nation.** For scattered inputs (neighbourhoods across many cities), the engine dissolves overlapping buffers, splits the area into spatial clusters, and builds one sampling grid per cluster on a shared reference grid — avoiding the millions of empty cells a single continent-wide bounding box would create.
+- **True-metre grids.** Each study area is projected to the most accurate planar CRS for its extent (local UTM, Lambert Conformal Conic for continental spans, or Polar Stereographic near the poles), so every grid cell is a true square in metres. Estimated map distortion is logged, with a warning past 2 %.
+- **Responsive and fast.** GVI runs in its own process so the dashboard stays interactive, and downloads, pre-processing, and GPU inference overlap across points.
+- **Shared panorama cache.** Downloaded panoramas are cached across runs and study areas, cutting redundant downloads and API cost.
+- **Crash-safe.** Interrupted jobs reappear as *Interrupted*; re-uploading the same study area resumes exactly where it stopped (the file is hash-verified first).
+- **Outputs.** **GeoPackage** point layer (canonical), optional per-cluster **GeoTIFF** tiles and **GeoJSON**, plus optional raw panoramas and segmentation masks. See [OUTPUTS.md](OUTPUTS.md).
 
 ---
 
-## 3. Metric Fusion & Optimization
+## 2. Overhead Greenery — NDVI
 
-* **Automated Metric Alignment**: Auto-downloads and spatially aligns GVI (vegetation/terrain) and NDVI within your study area when pre-computed files are not provided.
-* **Dual Input Support**: Works with **point-based** targets (GeoJSON with health/environmental data) and **raster-based** targets (GeoTIFF continuous surfaces).
-* **Mandatory Spatial Pre-processing**: Before optimization, every sample entity's metric values are pre-aggregated across all buffer radii in the ladder and all statistics (mean + p10–p90) for each channel, into a per-job SQLite cache (`output_results/fusion_cache/preaggr/`). Each Optuna trial then reads a single indexed column instead of recomputing buffer aggregations. The build runs first, reports entities-processed progress, supports both vector and raster metrics, and is **resumable** (survives cancels/crashes) and **reused** across runs with identical inputs.
-* **Pluggable CGI Formula**: Pick the composite formulation in the UI; the optimizer searches that formula's parameters.
-  * **Weighted average** (default, legacy): three weights (Vegetation / Terrain / NDVI) summing to 100%.
-  * **Synergy** (three-metric generalisation of Wang et al. 2026, doi:10.3390/rs18010009): seven weights (same int 0–100 scale as weighted-average so post-hoc weight-vs-association analyses pool both formulas) plus three powers on the main NDVI / Veg / Terrain terms only (interaction products stay plain); powers chosen on the {0.2..1.0} step-0.1 grid.
-* **Bayesian Optimization**: Uses **Optuna** (TPE sampler) to optimize the CGI formula's parameters plus:
-  * **Spatial Aggregation**: Circular buffer radii (100m to user-defined max, step = 50m)
-  * **Statistical Functions**: Mean, median, or percentile-based aggregation
-  * Separate radius and aggregation controls per metric component
-* **Standalone Single-Metric Studies (optional)**: A checkbox at the end of the form ("Also optimize each metric on its own (NDVI / Vegetation / Terrain)") runs three independent Optuna studies alongside the combined CGI run using that single metric's value directly as the greenery value and searching only its radius + aggregation (no weights / powers). Each standalone reuses the same train/val/test split and the per-job pre-aggregation cache, so the only added cost is three extra optimization studies. The results panel shows a **CGI vs Standalone Single-Metric Studies** comparison table (CV val score, test score, test p-value, robust-trial count per study) so you can judge whether the combined CGI beats the best single metric on your target.
-* **Covariate-Aware Objective**: Optional **Covariates (control variables)** multi-select picks numeric attribute columns from the (vector) target. With covariates the score becomes the greenery term's _partial_ contribution so a dominant covariate can't make the optimizer ignore the CGI parameters. **`mutual_info` ignores covariates by design** (conditional MI on binned data is lossy). With no covariates the objective reduces to the legacy single-variable scoring exactly.
-* **Robust Cross-Validation**:
-  * Stratified K-Fold CV ensures representative sampling across the target distribution.
-  * 20% held-out test set for final validation.
-  * Benjamini-Hochberg FDR correction for correlation-based metrics.
-  * Pruning support: Median, Hyperband, or Successive Halving.
-* **Multi-Metric Objectives**: Pearson, Spearman, R², RMSE, Mutual Information.
-* **Comprehensive Reporting**: Optuna visualization suite (history, parameter importance, parallel coordinates, contour plots, EDF, slice plots, timeline) for both robust and all-trials analyses.
-* **Composite Map**: Ensemble-averaged parameters from the top 20% of robust trials generate a grid-aligned GeoTIFF composite greenery raster.
-* **Intelligent Caching**: Deterministic filenames allow reuse of downloaded metrics for identical study areas.
+The **Normalized Difference Vegetation Index** measures greenery from above, from satellite imagery.
+
+- **Earth Engine integration.** Fetches cloud-masked **Sentinel-2** or **Landsat 8/9** imagery for any study area. `auto` mode picks Sentinel-2 from 2017 onward and Landsat for earlier dates; the choice is recorded.
+- **Flexible date modes** (mix freely):
+  - **Date range(s)** — one composite per range.
+  - **Specific date(s)** — a composite from a ± window around each date.
+  - **Attribute column** — each feature matched to its own date, producing one temporally-aligned output.
+- **True-metre, pixel-aligned rasters.** Tiles are exported in an auto-selected planar CRS on a shared snap grid and stream-mosaicked directly into the final GeoTIFF — no second reprojection, so output pixels are exactly what Earth Engine produced.
+- **Robust at scale.** Cluster-aware tiling skips empty regions (ocean, gaps between provinces); tiles download in parallel, retry on flaky networks, and resume from a persistent tile cache after an interruption.
+- **Honest coverage.** Clear diagnostics distinguish "no images in range" from "all images too cloudy." When a window is too sparse it widens once automatically and records that it did. Tiles that never arrive are listed in the sidecar so gaps are auditable, not mysterious.
+- **Sample at your features (optional).** Attach an NDVI value (exact-pixel or a zonal statistic over a buffer/polygon) to your own uploaded features — handy for downstream fusion.
+- **Outputs.** Single-band **GeoTIFF** (default), optional **GeoPackage**, **GeoJSON**, per-cluster tiles, and a metadata sidecar JSON. See [OUTPUTS.md](OUTPUTS.md).
 
 ---
 
-## 4. High-Performance Computing (HPC) Integration
+## 3. Fusion & Optimization
 
-* **MPI-Enabled CLI**: The `scripts/cli.py` interface supports parallel execution via `mpiexec`/`mpirun`.
-* **Headless Batch Processing**: Core engines are fully decoupled from the UI; run them directly from Python scripts or the CLI without a browser.
-* **GPU Acceleration**: Automatic device selection (CUDA → MPS → CPU) via `geofuse.vision.get_best_device`.
-* **Memory-Efficient I/O**: Asynchronous downloads and windowed raster reads/writes for maximum throughput on shared compute nodes.
+This is the analytical core: it learns how to combine GVI (vegetation + terrain) and NDVI into one **composite greenery index (CGI)** that best tracks an outcome you provide, and it reports that relationship with statistics you can defend.
+
+### Inputs and scoring
+
+- **You supply the metrics.** Upload the GVI and NDVI files produced by the tabs above (one per measurement year/wave where relevant). They are spatially aligned to your outcome automatically.
+- **Consistent per-pixel scoring.** Every vector target — **points, lines, or polygons** — is scored the same way: a regular CGI grid is computed per trial, and each entity's value is the **mean per-pixel CGI inside its catchment** (a polygon's footprint, or a point/line's buffer up to that trial's largest radius). The composite map you see therefore matches the values that were scored. Raster targets keep their native grid.
+
+### Choosing the formula and its parameters
+
+- **Pluggable CGI formula.**
+  - **Weighted average** (default) — three channel weights (vegetation / terrain / NDVI).
+  - **Synergy** — a three-metric generalization of Wang et al. 2026 ([doi:10.3390/rs18010009](https://doi.org/10.3390/rs18010009)) with interaction terms and tunable powers on the main channels.
+- **What gets tuned.** Channel weights/powers, each channel's **spatial scale** (circular buffer radius, on a ladder up to a limit you set), and the **aggregation** (mean / median / percentile).
+
+### Why you can trust the result
+
+- **Bootstrap stability selection** (Meinshausen & Bühlmann 2010, adapted to hyperparameter search). The engine draws many resamples of the training pool, explores each with a **space-filling quasi-random (Sobol) search**, and scores every candidate on that resample's held-out **out-of-bag** rows. The winning configuration is the one whose **worst-case out-of-bag score is best across resamples** — i.e. cross-validated predictive power, not a selection-inflated in-sample fit. (A uniform-coverage search is used deliberately; an objective-chasing sampler would concentrate on each resample's local optimum and inflate the stability counts.)
+- **Held-out test set (the headline).** A fraction of the data (default 25 %) is set aside and never touched during tuning. The winning configuration is scored on it once — a **percentile bootstrap confidence interval** plus a **held-out permutation p-value** (Freedman–Lane when covariates are controlled). This is the honest generalizability check. The whole-data ("all") figure is also shown, but only as a *descriptive, in-sample* number: the parameters were tuned on most of those rows, so it is optimistic and carries no p-value.
+- **Objective metrics.** **Partial distance correlation** (default) detects non-linear as well as linear associations *and* conditions on the covariates non-linearly, so a curved covariate effect is removed rather than partly credited as greenery signal. It is unsigned, so a separate **direction** indicator is reported alongside it. Also available: **distance correlation** (a faster variant with linear covariate adjustment), **Spearman**, **R²**, **normalized RMSE**, and **mutual information**.
+
+### Controlling for confounders
+
+- **Covariate-aware objective.** Select numeric attribute columns to control for, and the score becomes the greenery term's *partial* contribution, so a dominant covariate can't crowd out the CGI parameters. (Mutual information ignores covariates by design.)
+- **Covariate residualization.** For the residualizing metrics (distance correlation, Spearman, R², normalized RMSE), choose how covariates are partialled out: **linear** (default) or **spline** (natural cubic), which removes non-linear covariate effects. Partial distance correlation conditions on covariates intrinsically, so it ignores this setting.
+- **Spatial-confounding adjustment (optional).** Adds a flexible smooth of location so the reported association reflects greenery↔outcome co-variation *beyond* an unmeasured smooth spatial confounder. Two methods: **KS-AIC** (Keller & Szpiro 2020; recommended) and **Spatial+** (Dupont, Wood & Augustin 2022 / Rainey et al. 2025). The smooth is built per spatial cluster, so it never spans gaps between clusters. *Note: with this on, the optimizer chases the de-confounded association, so the winning parameters shift versus an unadjusted run.*
+
+### Is combining channels worth it?
+
+- **Standalone single-metric studies (optional).** Run the same selection on each channel alone (NDVI / vegetation / terrain). When enabled, the report adds an **AIC/BIC verdict** on whether the multi-channel CGI is justified over the best single channel, plus a **paired objective difference** of CGI against each standalone. Those paired p-values are **Holm-corrected** across the family of channels so comparing CGI against several of them doesn't inflate significance; when several outcomes are optimised, treat those as a further family.
+
+### Longitudinal and multi-year data
+
+- **Mixed-effects (longitudinal) mode.** When entities are measured at several time points, each trial is scored with a linear mixed model (`statsmodels.MixedLM`) that accounts for within-entity correlation over time. Four scorers are available (t-statistic by default); all four are also reported post-hoc on the winning composite.
+- **Year-aware cross-sectional mode.** For a cohort sampled across different years, route each entity to its year-matched greenery file. The cross-sectional scorer is unchanged — the year is only a file-routing key, never a regression input.
+
+### Outputs and reproducibility
+
+- **Composite map.** A grid-aligned GeoTIFF of the winning composite (plus one per standalone). A whole-grid **[0, 1] scaling** toggle controls normalization of the written/rendered map.
+- **Everything on disk, per run.** Each run writes to its own timestamped folder so reruns never overwrite earlier results. Alongside the composite rasters, a `study_results/` folder holds a machine-readable manifest, tidy CSVs (test scores, subset scores, parameters, stability diagnostics, covariate impact), and a full settings snapshot. See [OUTPUTS.md](OUTPUTS.md).
+- **Faithful restarts.** A run records its exact configuration and replays it verbatim on restart. Per-job caches (metric alignment, pre-aggregation, the search study) are keyed by a fingerprint of the settings, so an identical re-run resumes while any change starts fresh.
+- **Load results any time.** Completed jobs can rehydrate the results panel from disk, independent of the configuration form.
+
+---
+
+## 4. Running at Scale — HPC & CLI
+
+- **MPI-parallel CLI.** `scripts/cli.py` runs the same engines headlessly under `mpiexec` / `srun`; each rank processes a separate study area. See [USAGE.md](USAGE.md).
+- **No browser required.** The core engines are fully decoupled from the dashboard — call them from the CLI or your own Python scripts.
+- **GPU acceleration.** Automatic device selection (CUDA → MPS → CPU).
+
+> [!WARNING]
+> **HPC Monitoring tab — work in progress.** The dashboard's *HPC Monitoring* tab (last tab) is incomplete and under active development. It reads status files written by CLI runs on a cluster; the workflow is not yet finalized. For interactive runs, track progress in the **sidebar Job Monitor** instead.

@@ -7,6 +7,13 @@ import streamlit as st
 
 def render(output_dir: str) -> None:
     st.header("HPC Monitoring")
+    st.warning(
+        "**Work in progress — this view is incomplete.** HPC job monitoring "
+        "reads status files written by CLI runs on a cluster and is still under "
+        "active development. Interactive (in-app) job progress is tracked in the "
+        "sidebar Job Monitor, which is visible from every tab.",
+        icon="🚧",
+    )
 
     with st.form("job_mon_form"):
         with st.container(border=True):
@@ -25,7 +32,7 @@ def render(output_dir: str) -> None:
                 help="Reload status every 2 seconds until the job reaches 100%.",
             )
         load = st.form_submit_button(
-            "Load status", use_container_width=True, key="job_load_status"
+            "Load status", width="stretch", key="job_load_status"
         )
 
     if load:

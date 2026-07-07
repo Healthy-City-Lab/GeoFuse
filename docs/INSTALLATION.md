@@ -41,7 +41,7 @@ Then run it:
 
 Place your pre-trained `.pth` file inside `geofuse/model/` and rename it to `best_model.pth`:
 
-```
+```text
 geofuse/model/best_model.pth
 ```
 
@@ -71,11 +71,10 @@ conda activate geofuse
 python tests/test_pipeline.py
 ```
 
-Expected output:
+Expected output (a successful run ends with unittest's `OK`):
 
 ```text
-[PASS] GVI Pipeline processed 100 points
-...
+[PASS] GVI Pipeline processed N points
 [PASS] NDVI Export Logic Verified
 ...
 OK
@@ -93,17 +92,13 @@ python tests/test_real_execution.py
 Expected console output:
 
 ```text
-[PASS] Image found! Size: (1024, 512)
-[PASS] Segmentation complete. Mask Shape: (512, 1024)
-[PASS] Metrics: {'GVI_Vegetation': ..., 'GVI_Terrain': ..., 'GVI_Total': ...}
-...
-[PASS] Large NDVI GeoTIFF exported (50.90 KB)
+[PASS] Sample GVI: veg=..., ter=... (pano=...)
+[PASS] Large NDVI GeoTIFF exported (... KB)
 ```
 
 Expected files in `tests/output/test2_system/`:
 
-* `test_pano_rgb.jpg` — Street View panorama
-* `test_pano_mask.png` — Segmentation mask
+* `images/` — downloaded Street View panoramas
 * `test_ndvi.tif` — NDVI tile
 
 ### Stability / Memory Test

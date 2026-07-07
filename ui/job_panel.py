@@ -14,6 +14,7 @@ rather than inside a single engine's tab module.
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import UTC, datetime
 
@@ -44,6 +45,69 @@ _TERMINAL_LABELS = {
 
 _RESTART_ELIGIBLE_TYPES = {"gvi", "ndvi", "ndvi_column", "fusion"}
 _RESTART_ELIGIBLE_STATUSES = {"interrupted", "cancelled", "error"}
+
+
+def _fusion_results_bundle_path(rec) -> str | None:
+    """Path to the job's on-disk ``results_bundle.json`` if one exists."""
+    for p in rec.output_paths or []:
+        try:
+            if os.path.basename(str(p)) == "results_bundle.json" and os.path.isfile(p):
+                return str(p)
+        except Exception:
+            continue
+    return None
+
+
+def _fusion_results_loadable(rec) -> bool:
+    """True when a completed fusion job can hydrate the results view.
+
+    Either the live in-memory payload survives (same process) or the persisted
+    ``results_bundle.json`` is still on disk (after a Streamlit restart, where
+    ``rec.extra`` is gone). Gates the "Load results" button so it stays visible
+    once the process recycles.
+    """
+    if rec.type != "fusion" or rec.status != "completed":
+        return False
+    if rec.extra and rec.extra.get("results") is not None:
+        return True
+    return _fusion_results_bundle_path(rec) is not None
+
+
+def _load_fusion_results_into_session(rec) -> bool:
+    """Hydrate ``st.session_state`` from a completed fusion job's bundle.
+
+    Prefers the live in-memory payload (``rec.extra``); when that's gone — e.g.
+    after a Streamlit restart, since ``extra`` isn't persisted — it falls back
+    to the on-disk ``results_bundle.json`` recorded in ``rec.output_paths``,
+    rehydrating the results view without the engine objects (the composite map
+    viewer reads its GeoTIFFs from disk and skips the target overlay when no
+    engine is present). Returns ``True`` when a load succeeds.
+    """
+    if rec.type != "fusion" or rec.status != "completed":
+        return False
+    results = rec.extra.get("results") if rec.extra else None
+    if results is not None:
+        st.session_state.fusion_engine = rec.extra.get("engine")
+        st.session_state.fusion_engines_by_target = (
+            rec.extra.get("engines_by_target") or {}
+        )
+        st.session_state.fusion_results = results
+        return True
+
+    # Disk fallback: find the persisted results bundle among the job's outputs.
+    bundle_path = _fusion_results_bundle_path(rec)
+    if bundle_path is None:
+        return False
+    try:
+        with open(bundle_path, encoding="utf-8") as f:
+            disk_results = json.load(f)
+    except Exception:
+        return False
+    st.session_state.fusion_engine = None
+    st.session_state.fusion_engines_by_target = {}
+    st.session_state.fusion_results = disk_results
+    return True
+
 
 # Staged-resume ledger glyphs (see geofuse.jobs.stage_ledger).
 _STAGE_ICONS = {
@@ -117,17 +181,26 @@ def _render_details(rec) -> None:
         )
     elif rec.type == "fusion":
         st.write(
-            f"**Trials:** {p.get('n_trials', '?')} "
-            f"(startup {p.get('n_startup_trials', '?')})"
+            f"**Stability selection:** {p.get('n_bootstraps', '?')} bootstraps × "
+            f"{p.get('n_trials_per_bootstrap', '?')} trials/bootstrap "
+            f"(min {p.get('min_cell_count', '?')}/cell)"
         )
         st.write(f"**Objective:** {p.get('objective_metric', '?')}")
         st.write(f"**CGI formula:** `{p.get('cgi_formula') or 'weighted_average'}`")
         covs = p.get("covariate_columns") or []
-        st.write(f"**Covariates:** {', '.join(covs) if covs else '—'}")
+        cov_types = p.get("covariate_types") or {}
+
+        def _cov_disp(c: str) -> str:
+            return f"{c} ({'cat' if str(cov_types.get(c)).lower() == 'categorical' else 'num'})"
+
+        st.write(
+            f"**Covariates:** {', '.join(_cov_disp(c) for c in covs) if covs else '—'}"
+        )
         standalones = p.get("standalone_channels") or []
+        _ch_disp = {"veg": "Vegetation", "terrain": "Terrain", "ndvi": "NDVI"}
         st.write(
             f"**Standalone metrics:** "
-            f"{', '.join(standalones) if standalones else '—'}"
+            f"{', '.join(_ch_disp.get(s, s) for s in standalones) if standalones else '—'}"
         )
         st.write(
             f"**Sampler:** {p.get('sampler_type', '?')} · "
@@ -215,14 +288,14 @@ def _render_job_card(rec, store) -> None:
                 text=(f"{gvi_progress['current']:,} / " f"{gvi_progress['total']:,}"),
             )
 
-        preaggr_progress = rec.extra.get("preaggr_progress")
-        if preaggr_progress:
+        fusion_progress = rec.extra.get("fusion_study_progress")
+        if rec.type == "fusion" and rec.status not in _TERMINAL and fusion_progress:
             st.progress(
-                preaggr_progress["percent"] / 100,
+                min(1.0, fusion_progress["percent"] / 100),
                 text=(
-                    f"Spatial pre-processing: "
-                    f"{preaggr_progress['current']:,} / "
-                    f"{preaggr_progress['total']:,}"
+                    f"{fusion_progress['study']} · "
+                    f"{fusion_progress['current']:,} / "
+                    f"{fusion_progress['total']:,} trials"
                 ),
             )
 
@@ -237,7 +310,7 @@ def _render_job_card(rec, store) -> None:
             if st.button(
                 "Open log file",
                 key=f"openlog_{rec.id}",
-                use_container_width=True,
+                width="stretch",
                 disabled=not have_file,
                 help=(log_path if have_file else "Log file not found on disk."),
             ):
@@ -245,6 +318,20 @@ def _render_job_card(rec, store) -> None:
                     open_path_in_default_editor(log_path)
                 except Exception as e:
                     st.error(f"Could not open log file: {e}")
+
+            if _fusion_results_loadable(rec):
+                if st.button(
+                    "Load results",
+                    key=f"loadres_{rec.id}",
+                    width="stretch",
+                    help=(
+                        "Replace the active result overview with this job's "
+                        "bundle (composite map, robust trials, standalone "
+                        "studies, etc.)."
+                    ),
+                ):
+                    if _load_fusion_results_into_session(rec):
+                        st.rerun()
         else:
             with st.expander("Logs", expanded=False):
                 _render_logs(rec.id)
@@ -276,7 +363,7 @@ def _render_job_card(rec, store) -> None:
                     if st.button(
                         "🔄",
                         key=f"restart_{rec.id}",
-                        use_container_width=True,
+                        width="stretch",
                         help="Restart — re-upload the original input geometry.",
                     ):
                         st.session_state[RESTART_SESSION_KEY] = rec.id
@@ -285,7 +372,7 @@ def _render_job_card(rec, store) -> None:
                 st.button(
                     "🗑️",
                     key=f"del_{rec.id}",
-                    use_container_width=True,
+                    width="stretch",
                     on_click=store.purge,
                     args=(rec.id,),
                     help="Dismiss — remove this job from history.",

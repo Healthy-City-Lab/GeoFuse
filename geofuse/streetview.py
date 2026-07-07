@@ -260,6 +260,19 @@ _TILE_URL = (
 )
 _THIRD_PARTY_URL = "https://lh3.ggpht.com/jsapi2/a/b/c/w{w}-h{h}/{panoid}"
 
+# Google's streetviewpixels-pa.googleapis.com tile endpoint now returns 403
+# Forbidden for requests with a non-browser User-Agent (Python's default UA
+# is blocked). Sending a plain Chrome UA restores 200 OK responses without
+# any other auth.
+_TILE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/121.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://www.google.com/maps",
+}
+
 
 def _validate_zoom(pano: StreetViewPanorama, zoom: int) -> int:
     if not pano.image_sizes:
@@ -299,7 +312,7 @@ def get_panorama(
     if pano.is_third_party:
         size = pano.image_sizes[_validate_zoom(pano, zoom)]
         url = _THIRD_PARTY_URL.format(w=size.x, h=size.y, panoid=pano.id)
-        resp = requester.get(url)
+        resp = requester.get(url, headers=_TILE_HEADERS)
         resp.raise_for_status()
         return Image.open(io.BytesIO(resp.content))
 
@@ -308,7 +321,7 @@ def get_panorama(
 
     tile_data: dict = {}
     for t in tile_list:
-        resp = requester.get(t.url)
+        resp = requester.get(t.url, headers=_TILE_HEADERS)
         resp.raise_for_status()
         tile_data[(t.x, t.y)] = resp.content
 
@@ -330,7 +343,7 @@ async def get_panorama_async(
     if pano.is_third_party:
         size = pano.image_sizes[_validate_zoom(pano, zoom)]
         url = _THIRD_PARTY_URL.format(w=size.x, h=size.y, panoid=pano.id)
-        async with session.get(url) as resp:
+        async with session.get(url, headers=_TILE_HEADERS) as resp:
             resp.raise_for_status()
             return Image.open(io.BytesIO(await resp.read()))
 
@@ -338,7 +351,7 @@ async def get_panorama_async(
     tile_list = _generate_tile_list(pano, zoom)
 
     async def _fetch(t: Tile) -> tuple[int, int, bytes]:
-        async with session.get(t.url) as resp:
+        async with session.get(t.url, headers=_TILE_HEADERS) as resp:
             resp.raise_for_status()
             return t.x, t.y, await resp.read()
 

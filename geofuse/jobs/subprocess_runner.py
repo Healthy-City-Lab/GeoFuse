@@ -195,6 +195,11 @@ def route_engine_logging_to_queue(job_id: str, event_queue) -> None:
             self.put_nowait(item)
 
     _logger._log_queue = _ForwardingQueue()
+    # The forwarding queue has no ``get``; keep the in-process listener thread
+    # from starting in the child (``attach_external_logger`` would otherwise
+    # spin it up when EE logging is wired in). Lines reach the parent's
+    # listener via ``event_queue`` instead.
+    _logger._listener_enabled = False
 
     # Replace child stdio so ``print()`` / ``sys.stderr.write`` from any
     # library running in this process land in the per-job log instead of

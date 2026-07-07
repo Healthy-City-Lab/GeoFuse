@@ -12,7 +12,8 @@ import streamlit as st
 from helpers import (
     RESTART_SESSION_KEY,
     apply_buffer_m,
-    load_vector_upload_sessions,
+    file_size_mtime_fingerprint,
+    load_vector_paths,
     render_job_restart_panel,
 )
 from map_preview import (
@@ -210,9 +211,6 @@ def _render_ndvi_restart_panel(store, executor, output_dir) -> None:
                 end_date=str(p.get("end_date", "")),
                 output_name=str(p.get("output_name", base_name)),
                 save_cluster_tiles=bool(p.get("save_cluster_tiles", False)),
-                save_features_samples=bool(p.get("save_features_samples", False)),
-                sample_radius_m=float(p.get("sample_radius_m", 0.0)),
-                sample_stat=str(p.get("sample_stat", "mean")),
                 **common,
             )
         else:  # ndvi_column
@@ -299,147 +297,80 @@ def _ndvi_size_hint(buffer_m: int, resolution_m: int) -> None:
         st.info(" · ".join(msgs))
 
 
-def render(output_dir: str) -> None:
-    st.header("NDVI")
-
-    if "ndvi_datasets" not in st.session_state:
-        st.session_state.ndvi_datasets = {}
-    if "ndvi_inspector_select" not in st.session_state:
-        st.session_state.ndvi_inspector_select = None
-    if "ndvi_date_configs" not in st.session_state:
-        st.session_state.ndvi_date_configs = {}
-
-    from services import get_job_executor, get_job_store
-
-    _render_ndvi_restart_panel(get_job_store(), get_job_executor(), output_dir)
-
-    st.subheader("Input Configuration")
-
-    ndvi_files = st.file_uploader(
-        "Upload Study Areas",
-        accept_multiple_files=True,
-        type=["geojson", "json", "gpkg", "shp", "dbf", "shx", "prj", "cpg", "zip"],
-        key="ndvi_up",
-        help=(
-            "GeoJSON, GeoPackage, or zip. For Shapefile, select all parts together "
-            "(.shp, .dbf, .shx; add .prj when you have it)."
-        ),
-    )
-
-    # Sync uploaded files with session state
-    if ndvi_files is not None:
-        loaded = load_vector_upload_sessions(ndvi_files)
-        logical_names = [name for name, _ in loaded]
-        for k in list(st.session_state.ndvi_datasets.keys()):
-            ds = st.session_state.ndvi_datasets[k]
-            if ds.get("type") == "restored":
+@st.fragment
+def _render_ndvi_settings_map() -> None:
+    """Download settings + study-area map, in a fragment so slider edits rerun
+    only this section and the values stay live in session_state (no separate
+    Apply step before Run)."""
+    fc_ndvi_l, fc_ndvi_r = st.columns(2)
+    with fc_ndvi_l:
+        with st.container(border=True):
+            st.slider(
+                "Maximum Cloud Coverage (%)",
+                0,
+                100,
+                10,
+                key="ndvi_cloud",
+                help="Cloud mask threshold for Earth Engine, applied on Run.",
+            )
+            st.number_input(
+                "Resolution (m)",
+                value=10,
+                min_value=10,
+                key="ndvi_res",
+                help="Target pixel size for the NDVI raster export.",
+            )
+            buffer_m = st.slider(
+                "Download Buffer (m)",
+                min_value=0,
+                max_value=2000,
+                value=0,
+                step=50,
+                key="ndvi_buffer",
+                help="Expand the study area outward by this distance (metres) before download.",
+            )
+    with fc_ndvi_r:
+        st.subheader("Study Area Preview")
+        m_ndvi_input = folium.Map(location=[51.0447, -114.0719], zoom_start=10)
+        all_bounds = []
+        for fname, d in st.session_state.ndvi_datasets.items():
+            if d.get("type") == "restored" or d.get("raw") is None:
                 continue
-            if k not in logical_names:
-                del st.session_state.ndvi_datasets[k]
-                st.session_state.ndvi_date_configs.pop(k, None)
-        for fname, raw in loaded:
-            if fname not in st.session_state.ndvi_datasets:
-                try:
-                    st.session_state.ndvi_datasets[fname] = {
-                        "raw": raw,
-                        "processed": None,
-                        "results": None,
-                        "meta": None,
-                        "type": "input",
-                    }
-                except Exception as e:
-                    st.error(f"Failed to load {fname}: {e}")
-        gc.collect()
-    if ndvi_files == []:
-        for k in list(st.session_state.ndvi_datasets.keys()):
-            if st.session_state.ndvi_datasets[k].get("type") != "restored":
-                del st.session_state.ndvi_datasets[k]
-                st.session_state.ndvi_date_configs.pop(k, None)
-        gc.collect()
+            add_study_area_layers(
+                m_ndvi_input,
+                d["raw"],
+                study_name=fname,
+                buffer_m=int(buffer_m),
+                buffer_name=f"{fname} (buffer)",
+            )
+            all_bounds.append(d["raw"].total_bounds)
+            if buffer_m > 0:
+                all_bounds.append(apply_buffer_m(d["raw"], int(buffer_m)).total_bounds)
+        if all_bounds:
+            min_x = min(b[0] for b in all_bounds)
+            min_y = min(b[1] for b in all_bounds)
+            max_x = max(b[2] for b in all_bounds)
+            max_y = max(b[3] for b in all_bounds)
+            m_ndvi_input.fit_bounds([[min_y, min_x], [max_y, max_x]])
+        st_folium(
+            m_ndvi_input,
+            width="100%",
+            height=500,
+            key="map_ndvi_input",
+            returned_objects=[],
+        )
+    _ndvi_size_hint(int(buffer_m), int(st.session_state.get("ndvi_res", 10)))
 
+
+@st.fragment
+def _render_ndvi_date_config() -> None:
+    """Per-dataset date configuration. In a fragment so add/remove-date buttons
+    rerun only this section, not the settings + map above."""
     ndvi_input_datasets = {
         k: v
         for k, v in st.session_state.ndvi_datasets.items()
         if v.get("type") != "restored"
     }
-
-    # ── Settings + map (form prevents per-keystroke reruns on sliders) ──────
-    with st.form("ndvi_job_form"):
-        ndvi_buf_preview = int(st.session_state.get("ndvi_buffer", 0))
-        fc_ndvi_l, fc_ndvi_r = st.columns(2)
-        with fc_ndvi_l:
-            with st.container(border=True):
-                st.slider(
-                    "Maximum Cloud Coverage (%)",
-                    0,
-                    100,
-                    10,
-                    key="ndvi_cloud",
-                    help=(
-                        "Cloud mask threshold for Earth Engine. Together with resolution "
-                        "and buffer, these apply when you press Run below."
-                    ),
-                )
-                st.number_input(
-                    "Resolution (m)",
-                    value=10,
-                    min_value=10,
-                    key="ndvi_res",
-                    help="Target pixel size for the NDVI raster export.",
-                )
-                st.slider(
-                    "Download Buffer (m)",
-                    min_value=0,
-                    max_value=2000,
-                    value=0,
-                    step=50,
-                    key="ndvi_buffer",
-                    help="Expand the study area outward by this distance (metres) before download.",
-                )
-        with fc_ndvi_r:
-            st.subheader("Study Area Preview")
-            m_ndvi_input = folium.Map(location=[51.0447, -114.0719], zoom_start=10)
-            all_bounds = []
-            for fname, d in st.session_state.ndvi_datasets.items():
-                if d.get("type") == "restored":
-                    continue
-                if d.get("raw") is not None:
-                    add_study_area_layers(
-                        m_ndvi_input,
-                        d["raw"],
-                        study_name=fname,
-                        buffer_m=ndvi_buf_preview,
-                        buffer_name=f"{fname} (buffer)",
-                    )
-                    all_bounds.append(d["raw"].total_bounds)
-                    if ndvi_buf_preview > 0:
-                        all_bounds.append(
-                            apply_buffer_m(d["raw"], ndvi_buf_preview).total_bounds
-                        )
-            if all_bounds:
-                min_x = min([b[0] for b in all_bounds])
-                min_y = min([b[1] for b in all_bounds])
-                max_x = max([b[2] for b in all_bounds])
-                max_y = max([b[3] for b in all_bounds])
-                m_ndvi_input.fit_bounds([[min_y, min_x], [max_y, max_x]])
-            st_folium(
-                m_ndvi_input,
-                width="100%",
-                height=500,
-                key="map_ndvi_input",
-                returned_objects=[],
-            )
-        # Submit in the form so the buffer/cloud/res changes are committed before run.
-        st.form_submit_button(
-            "Apply Settings",
-            use_container_width=False,
-            help="Commit slider values before adjusting dates below.",
-        )
-
-    # ── Date configuration + output format + run ─────────────────────────────
-    # These are outside the form because "Add / Remove" date buttons cannot live
-    # inside a Streamlit form. They sit immediately below the settings+map
-    # section so the page still reads top-to-bottom as one workflow.
     if ndvi_input_datasets:
         st.markdown("**Date Configuration**")
         for fname, d in ndvi_input_datasets.items():
@@ -547,14 +478,14 @@ def render(output_dir: str) -> None:
                         for j in range(remove_idx, old_n):
                             st.session_state.pop(f"ndvi_rs_{fname}_{j}", None)
                             st.session_state.pop(f"ndvi_re_{fname}_{j}", None)
-                        st.rerun()
+                        st.rerun(scope="fragment")
                     if st.button(
                         "Add Date Range",
                         key=f"ndvi_radd_{fname}",
                         help="Each range row produces its own NDVI output file.",
                     ):
                         cfg["ranges"].append((date(today.year, 1, 1), today))
-                        st.rerun()
+                        st.rerun(scope="fragment")
 
                 # ── Specific Date(s) ──────────────────────────────────────
                 if use_specific:
@@ -595,10 +526,10 @@ def render(output_dir: str) -> None:
                         cfg["specific_dates"].pop(remove_idx)
                         for j in range(remove_idx, old_n):
                             st.session_state.pop(f"ndvi_sd_{fname}_{j}", None)
-                        st.rerun()
+                        st.rerun(scope="fragment")
                     if st.button("Add Date", key=f"ndvi_sadd_{fname}"):
                         cfg["specific_dates"].append(today)
-                        st.rerun()
+                        st.rerun(scope="fragment")
 
                 # ── Attribute Column ──────────────────────────────────────
                 if use_column:
@@ -627,10 +558,87 @@ def render(output_dir: str) -> None:
                     else:
                         st.warning("No attribute columns found in this file.")
 
-    _ndvi_size_hint(
-        int(st.session_state.get("ndvi_buffer", 0)),
-        int(st.session_state.get("ndvi_res", 10)),
+
+def render(output_dir: str) -> None:
+    st.header("NDVI")
+
+    if "ndvi_datasets" not in st.session_state:
+        st.session_state.ndvi_datasets = {}
+    if "ndvi_inspector_select" not in st.session_state:
+        st.session_state.ndvi_inspector_select = None
+    if "ndvi_date_configs" not in st.session_state:
+        st.session_state.ndvi_date_configs = {}
+
+    from services import get_job_executor, get_job_store
+
+    _render_ndvi_restart_panel(get_job_store(), get_job_executor(), output_dir)
+
+    st.subheader("Input Configuration")
+
+    from file_picker import FT_VECTOR, pick_multiple_paths
+
+    ndvi_picked_paths = pick_multiple_paths(
+        "Pick Study Areas",
+        key="ndvi_picked_paths",
+        file_types=FT_VECTOR,
+        help_text=(
+            "GeoJSON, GeoPackage, shapefile (.shp with sidecars in the same "
+            "folder), or vector zip. Pick one or several — every selected "
+            "file becomes a separate dataset and gets its own NDVI run."
+        ),
     )
+
+    ndvi_valid_paths = [p for p in ndvi_picked_paths if p and os.path.isfile(p)]
+    if ndvi_valid_paths:
+        current_names = [os.path.basename(p) for p in ndvi_valid_paths]
+        # Drop datasets no longer picked (restored results stay in place).
+        for k in list(st.session_state.ndvi_datasets.keys()):
+            ds = st.session_state.ndvi_datasets[k]
+            if ds.get("type") == "restored":
+                continue
+            if k not in current_names:
+                del st.session_state.ndvi_datasets[k]
+                st.session_state.ndvi_date_configs.pop(k, None)
+        # Read only files that aren't already loaded, so the study-area vectors
+        # are not re-read from disk on every rerun.
+        new_paths = [
+            p
+            for p in ndvi_valid_paths
+            if os.path.basename(p) not in st.session_state.ndvi_datasets
+        ]
+        if new_paths:
+            try:
+                for fname, raw in load_vector_paths(new_paths):
+                    st.session_state.ndvi_datasets[fname] = {
+                        "raw": raw,
+                        "processed": None,
+                        "results": None,
+                        "meta": None,
+                        "type": "input",
+                    }
+            except Exception as e:
+                st.error(f"Failed to load study area(s): {e}")
+        gc.collect()
+    if not ndvi_valid_paths:
+        for k in list(st.session_state.ndvi_datasets.keys()):
+            if st.session_state.ndvi_datasets[k].get("type") != "restored":
+                del st.session_state.ndvi_datasets[k]
+                st.session_state.ndvi_date_configs.pop(k, None)
+        gc.collect()
+
+    ndvi_input_datasets = {
+        k: v
+        for k, v in st.session_state.ndvi_datasets.items()
+        if v.get("type") != "restored"
+    }
+
+    # Settings + map and the date config are each isolated in a fragment, so a
+    # slider or add-date edit reruns only its own section — the rest of the tab
+    # (and the disk reads above) is untouched. Settings stay live in
+    # session_state, so Run always uses the current values.
+    _render_ndvi_settings_map()
+
+    _render_ndvi_date_config()
 
     oc_ndvi_a, oc_ndvi_b, oc_ndvi_c, oc_ndvi_d = st.columns(4)
     with oc_ndvi_a:
@@ -670,48 +678,10 @@ def render(output_dir: str) -> None:
             ),
         )
 
-    # Sample-at-features row: optional vector output that attaches NDVI
-    # values to the uploaded features (mean / median / etc. within a buffer).
-    sa_a, sa_b, sa_c = st.columns([2, 2, 3])
-    with sa_a:
-        st.checkbox(
-            "Sample at uploaded features",
-            value=False,
-            key="ndvi_sample_at_features",
-            help=(
-                "Write a side `{name}_ndvi_at_features.gpkg` with NDVI values "
-                "attached to each uploaded feature (zonal aggregate over the "
-                "buffer for points, or over the polygon directly). Pairs with "
-                "GVI for fusion downstream."
-            ),
-        )
-    with sa_b:
-        st.number_input(
-            "Sample radius (m)",
-            min_value=0,
-            max_value=5000,
-            value=0,
-            step=10,
-            key="ndvi_sample_radius",
-            help=(
-                "Buffer around each point before aggregating. 0 = exact-pixel "
-                "read. Ignored for polygon inputs (the polygon itself is the "
-                "zone)."
-            ),
-        )
-    with sa_c:
-        st.selectbox(
-            "Sample stat",
-            options=["mean", "median", "min", "max", "std", "count"],
-            index=0,
-            key="ndvi_sample_stat",
-            help="Aggregator applied to pixels under each feature.",
-        )
-
     run = st.button(
         "🚀 Run NDVI Analysis",
         type="primary",
-        use_container_width=True,
+        width="stretch",
         key="ndvi_run_btn",
     )
 
@@ -723,7 +693,6 @@ def render(output_dir: str) -> None:
         or st.session_state.get("ndvi_out_gpkg", False)
         or st.session_state.get("ndvi_out_geojson", False)
         or st.session_state.get("ndvi_out_cluster_tiles", False)
-        or st.session_state.get("ndvi_sample_at_features", False)
     )
 
     if run:
@@ -740,17 +709,20 @@ def render(output_dir: str) -> None:
             save_gj = st.session_state.get("ndvi_out_geojson", False)
             save_gp = st.session_state.get("ndvi_out_gpkg", False)
             save_ct = st.session_state.get("ndvi_out_cluster_tiles", False)
-            save_sf = st.session_state.get("ndvi_sample_at_features", False)
-            sample_radius = float(st.session_state.get("ndvi_sample_radius", 0))
-            sample_stat = st.session_state.get("ndvi_sample_stat", "mean")
             jobs_started = 0
             validation_errors = []
+
+            # basename -> absolute path map so each submitted job records its
+            # study-area location for silent-restart.
+            ndvi_path_by_basename = {os.path.basename(p): p for p in ndvi_valid_paths}
 
             for fname, d in ndvi_input_datasets.items():
                 cfg = st.session_state.ndvi_date_configs.get(fname, {})
                 # Strip *any* extension (.geojson / .shp / .gpkg / .zip / …)
                 # so the monitor title is just the file stem.
                 base_name = os.path.splitext(fname)[0]
+                ds_path = ndvi_path_by_basename.get(fname)
+                ds_fp = file_size_mtime_fingerprint(ds_path)
 
                 use_ranges = st.session_state.get(
                     f"ndvi_use_ranges_{fname}", cfg.get("use_ranges", True)
@@ -789,6 +761,8 @@ def render(output_dir: str) -> None:
                             name=base_name,
                             params={
                                 "fname": fname,
+                                "input_path": ds_path,
+                                "input_fingerprint": ds_fp,
                                 "mode": "range",
                                 "start_date": start_d.isoformat(),
                                 "end_date": end_d.isoformat(),
@@ -800,9 +774,6 @@ def render(output_dir: str) -> None:
                                 "save_gpkg": save_gp,
                                 "save_geojson": save_gj,
                                 "save_cluster_tiles": save_ct,
-                                "save_features_samples": save_sf,
-                                "sample_radius_m": sample_radius,
-                                "sample_stat": sample_stat,
                                 "geometry_sha256": geometry_sha256(d["raw"]),
                             },
                         )
@@ -821,9 +792,6 @@ def render(output_dir: str) -> None:
                             save_gpkg=save_gp,
                             save_geojson=save_gj,
                             save_cluster_tiles=save_ct,
-                            save_features_samples=save_sf,
-                            sample_radius_m=sample_radius,
-                            sample_stat=sample_stat,
                         )
                         jobs_started += 1
 
@@ -850,6 +818,8 @@ def render(output_dir: str) -> None:
                             name=base_name,
                             params={
                                 "fname": fname,
+                                "input_path": ds_path,
+                                "input_fingerprint": ds_fp,
                                 "mode": "specific",
                                 "target_date": target_date.isoformat(),
                                 "window_days": window_days,
@@ -861,9 +831,6 @@ def render(output_dir: str) -> None:
                                 "save_gpkg": save_gp,
                                 "save_geojson": save_gj,
                                 "save_cluster_tiles": save_ct,
-                                "save_features_samples": save_sf,
-                                "sample_radius_m": sample_radius,
-                                "sample_stat": sample_stat,
                                 "geometry_sha256": geometry_sha256(d["raw"]),
                             },
                         )
@@ -882,9 +849,6 @@ def render(output_dir: str) -> None:
                             save_gpkg=save_gp,
                             save_geojson=save_gj,
                             save_cluster_tiles=save_ct,
-                            save_features_samples=save_sf,
-                            sample_radius_m=sample_radius,
-                            sample_stat=sample_stat,
                         )
                         jobs_started += 1
 
@@ -903,6 +867,8 @@ def render(output_dir: str) -> None:
                             name=base_name,
                             params={
                                 "fname": fname,
+                                "input_path": ds_path,
+                                "input_fingerprint": ds_fp,
                                 "mode": "column",
                                 "date_column": date_col,
                                 "window_days": window_days,
@@ -952,7 +918,7 @@ def render(output_dir: str) -> None:
             ndvi_scan_clicked = st.button(
                 "🔄 Scan Output Folder",
                 key="ndvi_scan_folder",
-                use_container_width=True,
+                width="stretch",
             )
         with scan_row_r:
             ndvi_scan_spinner_slot = st.empty()

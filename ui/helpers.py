@@ -198,6 +198,53 @@ def rasterize_points_for_preview(
     return arr, (left, bottom, right, top), width, height
 
 
+def file_size_mtime_fingerprint(path: str | None) -> str:
+    """Cheap deterministic fingerprint for a file: ``"<size>:<mtime_int>"``.
+
+    Used by the restart flow to detect whether an input file has been
+    edited / moved / replaced since the original job ran. An empty string
+    means the path is missing or ``None`` (treated as drift on comparison).
+    Size + integer-mtime is intentionally lightweight — a full SHA256 of a
+    large NDVI raster would block the submit handler for several seconds
+    and isn't needed to detect the cases the restart panel cares about
+    (file gone, file rewritten in place, file truncated).
+    """
+    if not path:
+        return ""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return ""
+    return f"{st.st_size}:{int(st.st_mtime)}"
+
+
+def path_drift_status(path: str | None, expected_fingerprint: str) -> str:
+    """Return one of ``"ok"`` / ``"no-path"`` / ``"missing"`` / ``"modified"``.
+
+    Drift semantics shared across every tab's restart flow:
+    - ``no-path``: the spec never had a value for this slot (empty string / None)
+    - ``missing``: the recorded path is no longer present on disk
+    - ``modified``: the file exists but its size+mtime fingerprint differs
+      from the one recorded at submit time
+    - ``ok``: file present and fingerprint matches
+    """
+    if not path:
+        return "no-path"
+    if not os.path.isfile(path):
+        return "missing"
+    if (
+        expected_fingerprint
+        and file_size_mtime_fingerprint(path) != expected_fingerprint
+    ):
+        return "modified"
+    return "ok"
+
+
+def fingerprint_paths(paths: dict[str, str | None]) -> dict[str, str]:
+    """Fingerprint every path in ``paths``; missing files produce ``""``."""
+    return {k: file_size_mtime_fingerprint(v) for k, v in paths.items()}
+
+
 def apply_buffer_m(gdf: gpd.GeoDataFrame, buffer_m: float) -> gpd.GeoDataFrame:
     """Return a GeoDataFrame whose geometry is the union of ``gdf`` buffered by
     ``buffer_m`` metres, re-projected back to the original CRS.
@@ -238,6 +285,28 @@ def sanitize_gdf_attributes_for_json(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 
             out[col] = s.map(_cell)
     return out
+
+
+def load_vector_paths(
+    paths: Sequence[str],
+) -> list[tuple[str, gpd.GeoDataFrame]]:
+    """Read vector datasets from disk paths to ``(basename, gdf)`` pairs.
+
+    Direct path-based sibling of :func:`load_vector_upload_sessions` for
+    flows that capture absolute filesystem paths instead of HTTP-uploaded
+    bytes (the file-picker workflow). Each path is read lazily through
+    :func:`geofuse.vector_io.read_vector_path` and the attributes are
+    sanitised the same way the uploads pathway does. Shapefile sidecars
+    must already sit beside the ``.shp`` in the same folder — GDAL picks
+    them up automatically.
+    """
+    results: list[tuple[str, gpd.GeoDataFrame]] = []
+    for path in paths:
+        if not path or not os.path.isfile(path):
+            continue
+        gdf = read_vector_path(path)
+        results.append((os.path.basename(path), sanitize_gdf_attributes_for_json(gdf)))
+    return results
 
 
 def load_vector_upload_sessions(
@@ -345,18 +414,58 @@ def render_job_restart_panel(
 
     with st.expander(expander_label, expanded=True):
         st.caption(
-            "Re-upload the original input file. The job will be re-submitted "
-            "with the same parameters; cached panoramas / tiles will be reused "
-            "where available."
+            "The job will be re-submitted with the same parameters; cached "
+            "panoramas / tiles will be reused where available. If the "
+            "recorded input file is still on disk with the same fingerprint "
+            "no upload is needed — otherwise re-upload it below."
         )
         for line in summary_lines:
             st.write(line)
 
-        cancel_col, _ = st.columns([1, 4])
-        with cancel_col:
-            if st.button("Cancel restart", key=f"restart_cancel_{rec.id}"):
-                st.session_state[RESTART_SESSION_KEY] = None
-                st.rerun()
+        # Silent-restart path: when the recorded absolute path is still on
+        # disk and its size+mtime fingerprint matches, skip the uploader and
+        # rerun directly from the original location. Drift triggers the
+        # legacy upload flow below.
+        rec_path = (rec.params or {}).get("input_path")
+        rec_fp = (rec.params or {}).get("input_fingerprint", "")
+        silent_ok = bool(rec_path) and path_drift_status(rec_path, rec_fp) == "ok"
+
+        if silent_ok:
+            st.success(
+                f"✓ Recorded input file verified at `{rec_path}` — no "
+                "re-upload needed."
+            )
+            extras = extra_inputs_renderer() if extra_inputs_renderer else {}
+            cancel_col, rerun_col = st.columns([1, 1])
+            with cancel_col:
+                if st.button(
+                    "Cancel restart",
+                    key=f"restart_cancel_{rec.id}",
+                    width="stretch",
+                ):
+                    st.session_state[RESTART_SESSION_KEY] = None
+                    st.rerun()
+            with rerun_col:
+                if st.button(
+                    "Re-run",
+                    type="primary",
+                    key=f"restart_confirm_{rec.id}_silent",
+                    width="stretch",
+                ):
+                    try:
+                        gdf_silent = read_vector_path(rec_path)
+                        on_confirm(
+                            gdf_silent,
+                            os.path.basename(rec_path),
+                            extras,
+                        )
+                    except Exception as e:
+                        st.error(f"Re-submission failed: {e}")
+                        return
+                    st.session_state[RESTART_SESSION_KEY] = None
+                    st.success("Restart submitted. Monitor progress in the sidebar.")
+                    st.rerun()
+            return
 
         uploaded = st.file_uploader(
             f"Re-upload input geometry (original: `{fname_orig}`)",
@@ -412,14 +521,153 @@ def render_job_restart_panel(
         if extra_inputs_renderer is not None:
             extras = extra_inputs_renderer() or {}
 
-        if st.button(
-            "Verify & re-run", type="primary", key=f"restart_confirm_{rec.id}"
-        ):
-            try:
-                on_confirm(gdf, fname_new, extras)
-            except Exception as e:
-                st.error(f"Re-submission failed: {e}")
-                return
-            st.session_state[RESTART_SESSION_KEY] = None
-            st.success("Restart submitted. Monitor progress in the sidebar.")
-            st.rerun()
+        cancel_col, rerun_col = st.columns([1, 1])
+        with cancel_col:
+            if st.button(
+                "Cancel restart",
+                key=f"restart_cancel_{rec.id}",
+                width="stretch",
+            ):
+                st.session_state[RESTART_SESSION_KEY] = None
+                st.rerun()
+        with rerun_col:
+            if st.button(
+                "Verify & re-run",
+                type="primary",
+                key=f"restart_confirm_{rec.id}",
+                width="stretch",
+            ):
+                try:
+                    on_confirm(gdf, fname_new, extras)
+                except Exception as e:
+                    st.error(f"Re-submission failed: {e}")
+                    return
+                st.session_state[RESTART_SESSION_KEY] = None
+                st.success("Restart submitted. Monitor progress in the sidebar.")
+                st.rerun()
+
+
+def render_path_based_restart_panel(
+    rec,
+    *,
+    paths: dict[str, str | None],
+    expected_fingerprints: dict[str, str],
+    file_types: dict[str, Sequence[tuple[str, str]]] | None = None,
+    summary_lines: Sequence[str],
+    extra_inputs_renderer: Callable[[], dict] | None = None,
+    on_confirm: Callable[[dict[str, str], dict], None],
+) -> None:
+    """Path-based restart workflow.
+
+    ``paths`` maps slot names (e.g. ``"target"``, ``"veg"``, ``"ndvi"``)
+    to the absolute file path the original job used. ``expected_fingerprints``
+    holds the size+mtime fingerprint captured at submit. The panel:
+
+    1. Walks every slot once and computes its drift status.
+    2. If every slot is ``ok``, auto-submits the restart immediately with
+       the original paths and any ``extra_inputs_renderer`` extras.
+    3. Otherwise renders one row per drifted slot with a "Browse..." picker
+       so the user can re-supply just the moved/edited file. Resubmit is
+       blocked until every drifted slot has a valid replacement path.
+
+    ``on_confirm`` is called with the resolved-paths dict (same keys as
+    ``paths``, but containing replacements where the user re-supplied a
+    file) plus the extras dict.
+    """
+    import streamlit as st  # local import keeps headless callers cheap
+    from file_picker import FT_VECTOR_OR_RASTER, pick_file_path
+
+    file_types = file_types or {}
+    expander_label = f"↻ Restart job: {rec.name or rec.id}"
+
+    with st.expander(expander_label, expanded=True):
+        st.caption(
+            "The original input paths are checked against their recorded "
+            "fingerprints. Files that still match restart silently; any "
+            "moved or edited file is listed below and needs to be re-picked."
+        )
+        for line in summary_lines:
+            st.write(line)
+
+        drift_slots: list[tuple[str, str, str | None, str]] = []
+        for slot, recorded in paths.items():
+            status = path_drift_status(recorded, expected_fingerprints.get(slot, ""))
+            if status != "ok":
+                drift_slots.append((slot, status, recorded, recorded or ""))
+
+        # Build the "resolved" mapping starting from the original paths so a
+        # silent restart can pass them straight through.
+        resolved: dict[str, str] = {k: v or "" for k, v in paths.items()}
+
+        if not drift_slots:
+            st.success("All recorded paths still match — restarting silently.")
+            extras = extra_inputs_renderer() if extra_inputs_renderer else {} or {}
+            cancel_col, rerun_col = st.columns([1, 1])
+            with cancel_col:
+                if st.button("Cancel restart", key=f"restart_cancel_{rec.id}"):
+                    st.session_state[RESTART_SESSION_KEY] = None
+                    st.rerun()
+            with rerun_col:
+                if st.button(
+                    "Re-run",
+                    type="primary",
+                    key=f"restart_confirm_{rec.id}",
+                ):
+                    try:
+                        on_confirm(resolved, extras)
+                    except Exception as e:
+                        st.error(f"Re-submission failed: {e}")
+                        return
+                    st.session_state[RESTART_SESSION_KEY] = None
+                    st.success("Restart submitted. Monitor progress in the sidebar.")
+                    st.rerun()
+            return
+
+        st.markdown("**Files that need to be re-supplied**")
+        st.caption(
+            "Each entry below either moved, was edited, or never existed at "
+            "the recorded path. Click each ``Browse...`` to point the job "
+            "at the current location."
+        )
+        all_resolved = True
+        for slot, status, recorded, _ in drift_slots:
+            status_icon = (
+                "❌" if status == "missing" else "⚠️" if status == "modified" else "•"
+            )
+            picker_key = f"restart_path_{rec.id}_{slot}"
+            label = f"{status_icon} {slot} ({status})" + (
+                f" — was: `{recorded}`" if recorded else ""
+            )
+            new_path = pick_file_path(
+                label,
+                key=picker_key,
+                file_types=file_types.get(slot, FT_VECTOR_OR_RASTER),
+                initial_dir=(os.path.dirname(recorded) if recorded else None),
+            )
+            if new_path and os.path.isfile(new_path):
+                resolved[slot] = new_path
+            else:
+                all_resolved = False
+
+        extras = extra_inputs_renderer() if extra_inputs_renderer else {} or {}
+
+        cancel_col, rerun_col = st.columns([1, 1])
+        with cancel_col:
+            if st.button("Cancel restart", key=f"restart_cancel_{rec.id}"):
+                st.session_state[RESTART_SESSION_KEY] = None
+                st.rerun()
+        with rerun_col:
+            if st.button(
+                "Re-run",
+                type="primary",
+                key=f"restart_confirm_{rec.id}",
+                disabled=not all_resolved,
+            ):
+                try:
+                    on_confirm(resolved, extras)
+                except Exception as e:
+                    st.error(f"Re-submission failed: {e}")
+                    return
+                st.session_state[RESTART_SESSION_KEY] = None
+                st.success("Restart submitted. Monitor progress in the sidebar.")
+                st.rerun()
