@@ -50,6 +50,7 @@ from geofuse.mixedlm_postscore import (
     compute_post_metrics as _compute_mixedlm_post_metrics,
 )
 from geofuse.ndvi import NDVIEngine
+from geofuse import pdcor as _pdcor_mod
 from geofuse.persistence.job_executor import JobContext
 from geofuse.raster_sampling import sample_raster_at_features
 from geofuse.vision import get_best_device
@@ -1332,6 +1333,10 @@ def run_fusion(
     n_spatial_blocks: int | None = None,
     check_collinearity: bool = False,
     vif_threshold: float = 10.0,
+    report_ci_bootstrap: int | None = None,
+    report_effects_bootstrap: int = 2000,
+    report_effects_permutations: int = 1000,
+    report_paired_bootstrap: int = 2000,
 ) -> dict:
     """Run a fusion job: stability-selection tuning + held-out test scoring.
 
@@ -1344,7 +1349,13 @@ def run_fusion(
     are then scored once on the held-out test split with a percentile bootstrap
     CI. When standalones are enabled, both a whole-data (``all``) paired
     objective comparison and an ``all``-data AIC/BIC comparison report whether
-    CGI is justified over the best single channel."""
+    CGI is justified over the best single channel.
+
+    The ``report_*`` knobs set the reporting replicate budgets: the test-set
+    CI bootstrap (``report_ci_bootstrap``; ``None`` picks 2,000 for the O(n²)
+    ``partial_distance_corr`` objective and 10,000 otherwise — percentile CIs
+    are stable well below the higher figure), the effects bootstrap /
+    permutation counts, and the paired CGI-vs-standalone bootstrap."""
     try:
         targets = list(target_features_geojson) if target_features_geojson else [None]
         n_t = max(len(targets), 1)
@@ -1374,6 +1385,14 @@ def run_fusion(
                 "INFO",
                 f"Standalone single-metric studies enabled: {', '.join(standalones)}",
             )
+
+        # Test-CI replicate budget: explicit value wins; otherwise 2,000 for
+        # the O(n²) partial-distance-correlation objective, 10,000 otherwise.
+        report_ci_n = (
+            int(report_ci_bootstrap)
+            if report_ci_bootstrap is not None
+            else (2_000 if objective_metric == "partial_distance_corr" else 10_000)
+        )
 
         # Mixed-effects / longitudinal mode. Reconstructed once up front so
         # spec errors surface before any heavy compute. Cross-sectional jobs
@@ -1449,6 +1468,10 @@ def run_fusion(
             "n_spatial_blocks": n_spatial_blocks,
             "check_collinearity": bool(check_collinearity),
             "vif_threshold": float(vif_threshold),
+            "report_ci_bootstrap": int(report_ci_n),
+            "report_effects_bootstrap": int(report_effects_bootstrap),
+            "report_effects_permutations": int(report_effects_permutations),
+            "report_paired_bootstrap": int(report_paired_bootstrap),
             "cache_metrics": bool(cache_metrics),
             "resume_existing_study": bool(resume_existing_study),
             "ndvi_start_date": ndvi_start_date,
@@ -1825,10 +1848,11 @@ def run_fusion(
             )
             stage(skey("split"), DONE)
 
-            # Partial distance correlation builds O(n²) distance matrices per
-            # score when conditioning on covariates, so large entity counts make
-            # the bootstrap + permutation passes slow. Plain distance_corr uses
-            # the fast O(n log n) estimator and is unaffected. Warn rather than
+            # Partial distance correlation is O(n²) in entities even with the
+            # cached-side scorer (each trial still builds the composite's
+            # distance matrix), and above the cached-path budget it falls back
+            # to the stock estimator entirely. Plain distance_corr uses the
+            # fast O(n log n) estimator and is unaffected. Warn rather than
             # cap so the metric stays exact.
             if objective_metric == "partial_distance_corr" and outcome_covs:
                 try:
@@ -1843,9 +1867,15 @@ def run_fusion(
                     _log_fusion(
                         "WARN",
                         f"[{label}] partial_distance_corr scores are O(n²) over "
-                        f"{n_entities:,} entities with covariates — bootstrap CIs "
-                        "and permutation tests will take noticeably longer. "
-                        "'distance_corr' (fast) or 'spearman' are cheaper "
+                        f"{n_entities:,} entities with covariates — trials and "
+                        "reporting CIs will take noticeably longer"
+                        + (
+                            " (and the cached fast path is disabled at this "
+                            "entity count)"
+                            if n_entities > _pdcor_mod.MAX_CACHE_N
+                            else ""
+                        )
+                        + ". 'distance_corr' (fast) or 'spearman' are cheaper "
                         "covariate-aware objectives if runtime matters.",
                     )
 
@@ -1963,7 +1993,7 @@ def run_fusion(
                 cgi_test_ci = engine.bootstrap_test_score_ci(
                     headline_params,
                     objective_metric,
-                    n_bootstrap=10000,
+                    n_bootstrap=report_ci_n,
                     ci_level=0.95,
                     method="percentile",
                     seed=42,
@@ -1982,7 +2012,11 @@ def run_fusion(
             cgi_effects: dict | None = None
             try:
                 cgi_effects = engine.evaluate_effects(
-                    headline_params, objective_metric, seed=42
+                    headline_params,
+                    objective_metric,
+                    n_bootstrap=int(report_effects_bootstrap),
+                    n_perm=int(report_effects_permutations),
+                    seed=42,
                 )
                 if cgi_effects and cgi_effects.get("test"):
                     _t = cgi_effects["test"]
@@ -2105,7 +2139,7 @@ def run_fusion(
                     ch_test_ci = engine.bootstrap_test_score_ci(
                         ch_headline_params,
                         objective_metric,
-                        n_bootstrap=10000,
+                        n_bootstrap=report_ci_n,
                         ci_level=0.95,
                         method="percentile",
                         seed=42,
@@ -2256,7 +2290,12 @@ def run_fusion(
                     )
                     try:
                         pd_res = engine.paired_objective_difference(
-                            headline_params, ch_params, ch, objective_metric, seed=42
+                            headline_params,
+                            ch_params,
+                            ch,
+                            objective_metric,
+                            n_bootstrap=int(report_paired_bootstrap),
+                            seed=42,
                         )
                     except Exception as exc:
                         _log_fusion(

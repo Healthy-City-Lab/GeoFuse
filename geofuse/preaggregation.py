@@ -686,6 +686,11 @@ class PreAggregationCache:
         self._conn = open_wal_connection(db_path)
         self._lock = threading.Lock()
         self._col_cache: OrderedDict[tuple, Any] = OrderedDict()
+        # Memoized searchsorted positions per (requested-ids, channel, wave):
+        # the fusion optimizer re-reads the same fold row set for every trial
+        # and every (radius, stat) column of a channel wave shares one sorted
+        # entity-id vector, so the indexer is computed once per fold subset.
+        self._indexer_cache: OrderedDict[tuple, Any] = OrderedDict()
         self._ensure_schema()
         self._restore_aliases_from_meta()
 
@@ -786,6 +791,7 @@ class PreAggregationCache:
             self._conn.execute("DELETE FROM done_channel_wave_entity")
             self._conn.execute("DELETE FROM meta")
             self._col_cache.clear()
+            self._indexer_cache.clear()
             # Restore identity alias map; aliases get re-registered by the
             # runner during the new build.
             self._wave_alias = {
@@ -962,10 +968,14 @@ class PreAggregationCache:
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
-            # Invalidate any cached column reads for this (channel, wave).
+            # Invalidate any cached column reads / row indexers for this
+            # (channel, wave) — a write changes the stored entity-id set.
             for key in list(self._col_cache.keys()):
                 if key[0] == channel and key[1] == rep:
                     self._col_cache.pop(key, None)
+            for key in list(self._indexer_cache.keys()):
+                if key[0] == channel and key[1] == rep:
+                    self._indexer_cache.pop(key, None)
 
     def write_batch(
         self, entity_ids: list[int], channel_stats: dict[str, np.ndarray]
@@ -1035,11 +1045,38 @@ class PreAggregationCache:
 
         req = np.asarray(entity_ids).astype(np.int64, copy=False)
         out = np.full(req.shape[0], np.nan, dtype=np.float32)
-        if sorted_ids.size:
+        if not sorted_ids.size:
+            return out
+
+        # Row indexer: positions of ``req`` inside the channel wave's sorted
+        # entity ids. Keyed on a content fingerprint of both id vectors so a
+        # repeated fold read (every trial) skips the searchsorted pass.
+        ikey = (
+            channel,
+            rep,
+            int(req.shape[0]),
+            int(req[0]) if req.size else -1,
+            int(req[-1]) if req.size else -1,
+            int(req.sum()) if req.size else 0,
+            int(sorted_ids.shape[0]),
+            int(sorted_ids[0]),
+            int(sorted_ids[-1]),
+        )
+        with self._lock:
+            indexer = self._indexer_cache.get(ikey)
+            if indexer is not None:
+                self._indexer_cache.move_to_end(ikey)
+        if indexer is None:
             pos = np.searchsorted(sorted_ids, req)
             pos_clip = np.clip(pos, 0, sorted_ids.size - 1)
             valid = sorted_ids[pos_clip] == req
-            out[valid] = sorted_vals[pos_clip[valid]]
+            indexer = (pos_clip, valid)
+            with self._lock:
+                self._indexer_cache[ikey] = indexer
+                while len(self._indexer_cache) > 64:
+                    self._indexer_cache.popitem(last=False)
+        pos_clip, valid = indexer
+        out[valid] = sorted_vals[pos_clip[valid]]
         return out
 
     def close(self) -> None:

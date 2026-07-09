@@ -387,17 +387,36 @@ def _suggest_weighted_average(
     return out
 
 
+def _component_dtype(components: ComponentDict) -> np.dtype:
+    """Working float dtype: float32 stays float32, everything else float64.
+
+    The per-pixel trial path feeds float32 channel arrays (halving the
+    bandwidth of the power/product math); reporting paths keep float64.
+    """
+    return np.result_type(
+        np.asarray(components["veg"]).dtype,
+        np.asarray(components["terrain"]).dtype,
+        np.asarray(components["ndvi"]).dtype,
+        np.float32,
+    )
+
+
 def _compute_weighted_average(params: dict, components: ComponentDict) -> np.ndarray:
-    veg = np.asarray(components["veg"], dtype=np.float64)
-    ter = np.asarray(components["terrain"], dtype=np.float64)
-    ndvi = np.asarray(components["ndvi"], dtype=np.float64)
+    dt = _component_dtype(components)
+    veg = np.asarray(components["veg"], dtype=dt)
+    ter = np.asarray(components["terrain"], dtype=dt)
+    ndvi = np.asarray(components["ndvi"], dtype=dt)
     wv = float(params.get("veg_weight", 0))
     wt = float(params.get("terrain_weight", 0))
     wn = float(params.get("ndvi_weight", 0))
     total = wv + wt + wn
     if total <= 0:
-        return np.full_like(veg, np.nan, dtype=np.float64)
-    return (wv / total) * veg + (wt / total) * ter + (wn / total) * ndvi
+        return np.full_like(veg, np.nan, dtype=dt)
+    return (
+        dt.type(wv / total) * veg
+        + dt.type(wt / total) * ter
+        + dt.type(wn / total) * ndvi
+    )
 
 
 def _wa_channel_active(params: dict) -> dict[str, bool]:
@@ -481,9 +500,10 @@ def _suggest_synergy(
 
 
 def _compute_synergy(params: dict, components: ComponentDict) -> np.ndarray:
-    veg = np.asarray(components["veg"], dtype=np.float64)
-    ter = np.asarray(components["terrain"], dtype=np.float64)
-    ndvi = np.asarray(components["ndvi"], dtype=np.float64)
+    dt = _component_dtype(components)
+    veg = np.asarray(components["veg"], dtype=dt)
+    ter = np.asarray(components["terrain"], dtype=dt)
+    ndvi = np.asarray(components["ndvi"], dtype=dt)
 
     # Channels arrive min-max normalised to [0, 1]; clamp away any float
     # roundoff so a 0.4 power doesn't produce NaN on a slightly-negative input.
@@ -513,17 +533,17 @@ def _compute_synergy(params: dict, components: ComponentDict) -> np.ndarray:
     # ``_compute_weighted_average``.
     total = wN + wV + wT + wNV + wNT + wTV + wNVT
     if total <= 0:
-        return np.full_like(veg, np.nan, dtype=np.float64)
-    inv = 1.0 / total
+        return np.full_like(veg, np.nan, dtype=dt)
+    inv = dt.type(1.0 / total)
 
     return inv * (
-        wN * main_n
-        + wV * main_v
-        + wT * main_t
-        + wNV * ndvi * veg
-        + wNT * ndvi * ter
-        + wTV * ter * veg
-        + wNVT * ndvi * veg * ter
+        dt.type(wN) * main_n
+        + dt.type(wV) * main_v
+        + dt.type(wT) * main_t
+        + dt.type(wNV) * ndvi * veg
+        + dt.type(wNT) * ndvi * ter
+        + dt.type(wTV) * ter * veg
+        + dt.type(wNVT) * ndvi * veg * ter
     )
 
 

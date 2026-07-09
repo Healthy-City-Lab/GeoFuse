@@ -387,3 +387,102 @@ def select_df_aic(
             best_cols = spatial
 
     return best_df, best_cols
+
+
+@dataclass
+class DfSelectionPrecompute:
+    """Precomputed nested-QR structures for repeated df selection on one basis.
+
+    The candidate designs are nested in df (linear columns first, then radial
+    columns in resolution order), so one economy QR of the full-df design
+    ``[1, linear, radial(rank-ordered)]`` yields every candidate's RSS as a
+    prefix of ``‖Qᵀy‖²`` — the per-call df search becomes a single matvec
+    instead of ``max_df + 1`` least-squares fits.
+
+    ``k_of_df[df]`` is the column count in ``Q`` (intercept included) at that
+    df level; ``designs[df]`` is the spatial design (no intercept) returned to
+    the caller — same column *span* as ``SpatialBasis.design(df)``.
+    """
+
+    Q: np.ndarray
+    k_of_df: np.ndarray
+    designs: list
+
+
+def precompute_df_selection(basis: SpatialBasis) -> DfSelectionPrecompute | None:
+    """Build the nested-QR precompute for ``select_df_aic_fast``, or ``None``."""
+    if not basis.has_spatial:
+        return None
+    order = np.argsort(basis.radial_rank, kind="stable")
+    radial_sorted = basis.radial[:, order]
+    sorted_ranks = basis.radial_rank[order]
+    n_linear = basis.linear.shape[1]
+
+    M = np.column_stack([np.ones(basis.n), basis.linear, radial_sorted])
+    Q, _r = np.linalg.qr(M, mode="reduced")
+
+    k_of_df = np.empty(basis.max_df + 1, dtype=np.int64)
+    designs: list = []
+    for df in range(basis.max_df + 1):
+        n_radial = int(np.searchsorted(sorted_ranks, df, side="left"))
+        k_of_df[df] = 1 + n_linear + n_radial
+        parts = []
+        if n_linear:
+            parts.append(basis.linear)
+        if n_radial:
+            parts.append(radial_sorted[:, :n_radial])
+        designs.append(np.column_stack(parts) if parts else None)
+    return DfSelectionPrecompute(Q=Q, k_of_df=k_of_df, designs=designs)
+
+
+def select_df_aic_fast(
+    y: np.ndarray,
+    basis: SpatialBasis,
+    pre: DfSelectionPrecompute | None,
+    *,
+    criterion: str = "aic",
+) -> tuple[int | None, np.ndarray | None]:
+    """Covariate-free :func:`select_df_aic` via the nested-QR precompute.
+
+    Matches ``select_df_aic(y, basis, None)`` (same RSS, hence the same
+    information criterion and the same selected df) at one ``Qᵀy`` matvec per
+    call. Returned columns span the same space as ``basis.design(df)`` — the
+    downstream residualization is order-invariant. Falls back to the exact
+    legacy search when the precompute is missing or ``y`` has non-finite rows
+    (the legacy path drops those rows for the criterion fits).
+    """
+    y = np.asarray(y, dtype=np.float64).ravel()
+    if pre is None or not np.isfinite(y).all():
+        return select_df_aic(y, basis, None, criterion=criterion)
+    n = len(y)
+    if n < 4:
+        return None, None
+
+    yy = float(y @ y)
+    proj = pre.Q.T @ y
+    cum = np.cumsum(proj * proj)
+
+    def _ic(rss: float, k_cols: int) -> float:
+        if rss <= 0:
+            rss = 1e-300
+        k = k_cols + 1  # params + variance, matching _ols_info_criterion
+        loglik = -0.5 * n * (np.log(2 * np.pi) + np.log(rss / n) + 1.0)
+        if criterion == "bic":
+            return float(np.log(n) * k - 2.0 * loglik)
+        return float(2.0 * k - 2.0 * loglik)
+
+    best_df: int | None = None
+    best_cols: np.ndarray | None = None
+    best_ic = _ic(yy - float(cum[0]), 1)  # baseline: intercept only
+
+    for df in range(len(pre.k_of_df)):
+        k_cols = int(pre.k_of_df[df])
+        if k_cols <= 1:  # no spatial columns at this level
+            continue
+        ic = _ic(yy - float(cum[k_cols - 1]), k_cols)
+        if ic < best_ic:
+            best_ic = ic
+            best_df = df
+            best_cols = pre.designs[df]
+
+    return best_df, best_cols

@@ -197,6 +197,7 @@ def bootstrap_score_ci(
     method: str = "BCa",
     seed: int = 42,
     covariates: np.ndarray | None = None,
+    replicate_scorer_factory=None,
 ) -> dict:
     """Bootstrap CI on ``score_fn(target, prediction)``.
 
@@ -229,6 +230,14 @@ def bootstrap_score_ci(
             every bootstrap iteration so the partial-correlation interpretation
             is preserved (covariates are a property of the observation, not the
             score). ``score_fn`` must accept the 3-arg form when this is set.
+        replicate_scorer_factory: optional
+            ``(t, p, cov) -> (callable(idx) -> float) | None`` called once with
+            the NaN-masked arrays. When it returns a scorer, every replicate
+            (and the BCa jackknife) is scored via ``scorer(index_vector)``
+            instead of ``score_fn`` — the O(n²) metrics use this to reuse
+            precomputed distance matrices per resample. The observed score
+            always comes from ``score_fn``. A ``None`` return keeps the generic
+            path.
 
     Returns:
         Dict with ``observed``, ``mean``, ``lower``, ``upper``, ``ci_level``,
@@ -276,6 +285,15 @@ def bootstrap_score_ci(
         return float(score_fn(target_arr, pred_arr, sub))
 
     observed = _score(t, p, None)
+
+    # Optional index-vector fast path (precomputed distance matrices etc.).
+    replicate_scorer = None
+    if replicate_scorer_factory is not None:
+        try:
+            replicate_scorer = replicate_scorer_factory(t, p, cov_arr)
+        except Exception:
+            replicate_scorer = None
+
     rng = np.random.default_rng(seed)
     n = len(t)
     scores = np.empty(n_bootstrap, dtype=np.float64)
@@ -285,7 +303,10 @@ def bootstrap_score_ci(
     for i in range(n_bootstrap):
         idx = boot_idx[i]
         try:
-            scores[i] = _score(t[idx], p[idx], idx)
+            if replicate_scorer is not None:
+                scores[i] = replicate_scorer(idx)
+            else:
+                scores[i] = _score(t[idx], p[idx], idx)
         except Exception:
             scores[i] = np.nan
 
@@ -326,7 +347,10 @@ def bootstrap_score_ci(
             keep_mask[i] = False
             keep = base_idx[keep_mask]
             try:
-                jack_scores[i] = _score(t[keep], p[keep], keep)
+                if replicate_scorer is not None:
+                    jack_scores[i] = replicate_scorer(keep)
+                else:
+                    jack_scores[i] = _score(t[keep], p[keep], keep)
             except Exception:
                 jack_scores[i] = np.nan
             keep_mask[i] = True
@@ -383,6 +407,7 @@ def permutation_pvalue(
     n_perm: int = 2000,
     seed: int = 42,
     covariates: np.ndarray | None = None,
+    surrogate_scorer_factory=None,
 ) -> dict:
     """One-sided permutation p-value for ``score_fn(target, prediction)``.
 
@@ -397,6 +422,14 @@ def permutation_pvalue(
     so for metrics that condition on covariates nonlinearly it is an
     approximation. ``higher_is_better`` sets the tail; the report is the add-one
     smoothed fraction of null scores at least as extreme as the observed one.
+
+    ``surrogate_scorer_factory`` (optional, covariate case only):
+    ``(p, cov) -> (callable(t_star) -> float) | None`` called once with the
+    NaN-masked arrays. When it returns a scorer, each Freedman–Lane replicate
+    is scored via ``scorer(surrogate_target)`` — the prediction and covariate
+    sides stay fixed across all permutations, so the O(n²) metrics reuse their
+    precomputed U-centered matrices. The observed score always comes from
+    ``score_fn``; ``None`` keeps the generic path.
 
     Returns a dict with ``observed``, ``p_value``, ``n_perm`` (effective),
     ``null_mean``, and ``higher_is_better``.
@@ -448,8 +481,23 @@ def permutation_pvalue(
         t_fit = Xc @ beta
         t_res = t - t_fit
 
-        def _perm_score(idx: np.ndarray) -> float:
-            return float(score_fn(t_fit + t_res[idx], p, cov_arr))
+        surrogate_scorer = None
+        if surrogate_scorer_factory is not None:
+            try:
+                surrogate_scorer = surrogate_scorer_factory(p, cov_arr)
+            except Exception:
+                surrogate_scorer = None
+
+        if surrogate_scorer is not None:
+            _fast_scorer = surrogate_scorer
+
+            def _perm_score(idx: np.ndarray) -> float:
+                return float(_fast_scorer(t_fit + t_res[idx]))
+
+        else:
+
+            def _perm_score(idx: np.ndarray) -> float:
+                return float(score_fn(t_fit + t_res[idx], p, cov_arr))
 
     rng = np.random.default_rng(seed)
     null = np.empty(int(n_perm), dtype=np.float64)

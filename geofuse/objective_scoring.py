@@ -54,12 +54,27 @@ baseline.
 
 from __future__ import annotations
 
+import logging
 import warnings
 
 import numpy as np
 import pandas as pd
 from scipy.stats import ConstantInputWarning, pearsonr, rankdata
 from sklearn.metrics import mutual_info_score, r2_score
+
+from . import pdcor
+
+logger = logging.getLogger(__name__)
+
+# Fallback events already warned about — each degraded code path logs once per
+# process instead of flooding a 1000-trial study log.
+_warned_fallbacks: set[str] = set()
+
+
+def _warn_once(key: str, message: str) -> None:
+    if key not in _warned_fallbacks:
+        _warned_fallbacks.add(key)
+        logger.warning(message)
 
 # Public set of metric names this module knows how to score; engine-level
 # validation should compare against it before calling :func:`score`.
@@ -145,7 +160,9 @@ _SPLINE_MIN_UNIQUE: int = 7
 _SPLINE_DF: int = 4
 
 
-def _expand_covariate_basis(X: np.ndarray | None, method: str) -> np.ndarray | None:
+def _expand_covariate_basis(
+    X: np.ndarray | None, method: str, cache: dict | None = None
+) -> np.ndarray | None:
     """Optionally expand continuous covariate columns into a spline basis.
 
     ``method="linear"`` (or a degenerate input) returns ``X`` unchanged. With
@@ -153,9 +170,24 @@ def _expand_covariate_basis(X: np.ndarray | None, method: str) -> np.ndarray | N
     natural-cubic-spline basis so the later OLS residualization removes
     nonlinear covariate effects; discrete columns (dummies, coarse codes) pass
     through as-is. Falls back to the raw column on any expansion error.
+
+    ``cache`` (optional dict) memoizes the expanded basis on a content
+    fingerprint of ``X`` — per Optuna trial the covariate matrix is fixed per
+    scored subset, so the patsy expansion only runs once per subset.
     """
     if X is None or method != "spline" or X.shape[1] == 0:
         return X
+    cache_key: tuple | None = None
+    if cache is not None:
+        cache_key = (
+            int(X.shape[0]),
+            int(X.shape[1]),
+            float(np.nansum(X)),
+            float(np.nansum(X * X)),
+        )
+        hit = cache.get(cache_key)
+        if hit is not None:
+            return hit
     try:
         from patsy import dmatrix
     except Exception:
@@ -178,7 +210,12 @@ def _expand_covariate_basis(X: np.ndarray | None, method: str) -> np.ndarray | N
             cols.append(basis if basis.shape[1] else col.reshape(-1, 1))
         except Exception:
             cols.append(col.reshape(-1, 1))
-    return np.column_stack(cols)
+    expanded = np.column_stack(cols)
+    if cache is not None and cache_key is not None:
+        cache[cache_key] = expanded
+        while len(cache) > 8:
+            cache.pop(next(iter(cache)))
+    return expanded
 
 
 def _stack(*mats: np.ndarray | None) -> np.ndarray | None:
@@ -279,13 +316,22 @@ def distance_correlation(x: np.ndarray, y: np.ndarray, *, seed: int = 0) -> floa
                 xa, ya, method=dcor.DistanceCovarianceMethod.MERGESORT
             )
         )
-    except Exception:
+    except Exception as exc:
+        _warn_once(
+            "dcor-mergesort",
+            f"Fast mergesort distance correlation failed ({exc!r}); falling "
+            "back to the O(n²) estimator for this process.",
+        )
         s = float(dcor.distance_correlation(xa, ya))
     return s if np.isfinite(s) else 0.0
 
 
 def partial_distance_correlation(
-    x: np.ndarray, y: np.ndarray, z: np.ndarray | None
+    x: np.ndarray,
+    y: np.ndarray,
+    z: np.ndarray | None,
+    *,
+    cache: "dict | None" = None,
 ) -> float:
     """Partial distance correlation of ``x`` and ``y`` given ``z`` (Székely–Rizzo).
 
@@ -294,6 +340,11 @@ def partial_distance_correlation(
     ``z=None`` reduces to plain distance correlation. Can be slightly negative
     (``x`` adds nothing beyond ``z``); returned as-is so the optimizer ranks it.
     The estimate is O(n²); the runner warns at large n.
+
+    ``cache`` (an :class:`collections.OrderedDict` owned by the engine) enables
+    the fast path that reuses the U-centered matrices of the ``(x, z)`` sides
+    across calls — pass the vector that stays constant per scored subset (the
+    target) as ``x``. Oversized inputs fall back to the stock estimator.
     """
     import dcor
 
@@ -304,9 +355,26 @@ def partial_distance_correlation(
     za = np.asarray(z, dtype=np.float64).reshape(len(xa), -1)
     if float(np.var(xa)) == 0 or float(np.var(ya)) == 0:
         return 0.0
+    n = xa.shape[0]
+    if cache is not None and 4 <= n <= pdcor.MAX_CACHE_N:
+        try:
+            s = pdcor.partial_distance_correlation_cached(xa, ya, za, cache)
+            return s if np.isfinite(s) else 0.0
+        except Exception as exc:
+            _warn_once(
+                "pdcor-cached",
+                f"Cached partial distance correlation failed ({exc!r}); "
+                "falling back to the stock dcor estimator for this process.",
+            )
     try:
         s = float(dcor.partial_distance_correlation(xa, ya, za))
-    except Exception:
+    except Exception as exc:
+        _warn_once(
+            "pdcor-unconditioned",
+            "dcor.partial_distance_correlation failed "
+            f"({exc!r}); returning the UNCONDITIONED distance correlation — "
+            "covariates/smooth are NOT partialled out of this score.",
+        )
         return distance_correlation(xa.ravel(), ya.ravel())
     return s if np.isfinite(s) else 0.0
 
@@ -382,6 +450,8 @@ def score(
     spatial_basis: np.ndarray | None = None,
     spatial_method: str = "none",
     residualize_method: str = "linear",
+    pdcor_cache: "dict | None" = None,
+    spline_cache: "dict | None" = None,
 ) -> float | tuple[float, float]:
     """Score CGI's predictive power for ``target``, controlling for ``covariates``.
 
@@ -402,6 +472,12 @@ def score(
     ``residualize_method`` (``"linear"`` / ``"spline"``) sets the covariate basis
     for the residualizing metrics. ``partial_distance_corr`` conditions on the
     controls intrinsically and ``mutual_info`` ignores them, so both ignore it.
+
+    ``pdcor_cache`` / ``spline_cache`` are optional engine-owned caches for the
+    inputs that stay constant across many calls on one scored subset: the
+    U-centered target/conditioning matrices of ``partial_distance_corr`` and
+    the spline-expanded covariate basis. Both are pure accelerations — scores
+    are identical (to float32 noise for the pdcor path) with or without them.
     """
     _validate_metric(metric)
     if spatial_method not in SPATIAL_METHODS:
@@ -439,9 +515,6 @@ def score(
         s = _DEGENERATE_SCORE[metric]
         return (s, 1.0) if return_pvalue else s
 
-    # Covariate basis for the residualizing metrics (spline-expanded when asked).
-    cov_res = _expand_covariate_basis(cov, residualize_method)
-
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=RuntimeWarning)
         warnings.filterwarnings("ignore", category=ConstantInputWarning)
@@ -450,8 +523,13 @@ def score(
             # Condition on [covariates, smooth] in the distance space (both are
             # partialled out nonlinearly; no linear residualization).
             z = _stack(cov, sb)
-            s = partial_distance_correlation(t, c, z)
+            s = partial_distance_correlation(t, c, z, cache=pdcor_cache)
             return (s, 1.0) if return_pvalue else s
+
+        # Covariate basis for the residualizing metrics (spline-expanded when
+        # asked). Deliberately below the pdcor branch — that metric (and
+        # mutual_info, whose cov is already None here) never consumes it.
+        cov_res = _expand_covariate_basis(cov, residualize_method, spline_cache)
 
         if metric == "distance_corr":
             x_t, x_c = _spatial_designs(cov_res, sb, spatial_method)
@@ -469,6 +547,7 @@ def score(
                 cov_use = _expand_covariate_basis(
                     np.column_stack([rankdata(cov[:, j]) for j in range(cov.shape[1])]),
                     residualize_method,
+                    spline_cache,
                 )
             else:
                 cov_use = None

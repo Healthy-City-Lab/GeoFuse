@@ -8,6 +8,7 @@ weighted combinations of NDVI and GVI metrics against target outcomes.
 import hashlib
 import logging
 import os
+from collections import OrderedDict
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,7 @@ from . import (
     metric_sampling,
     mixed_effects_scoring,
     objective_scoring,
+    pdcor,
     preaggregation,
     spatial_basis,
 )
@@ -331,10 +333,23 @@ class MetricFusionEngine:
         self._max_points_ring_cache = 8000
 
         # Reporting-phase caches (all invalidated by ``split_data``): the
-        # train+val+test union frame is rebuilt by several report helpers, and
-        # ``apply_fusion`` is called repeatedly with the same winning params.
+        # train+val+test union frame is rebuilt by several report helpers,
+        # ``apply_fusion`` is called repeatedly with the same winning params,
+        # and ``evaluate_on_test`` is re-invoked with identical params by the
+        # runner headline, the effects block, and the subset-score table.
         self._full_data_cache: pd.DataFrame | None = None
         self._apply_fusion_cache: tuple[tuple, pd.DataFrame] | None = None
+        self._evaluate_test_cache: dict[tuple, dict] = {}
+
+        # Scoring-side caches, cleared with the spatial-basis cache (their
+        # contents are constant per scored subset, not per trial): the fixed
+        # U-centered sides of the partial-distance-correlation estimator and
+        # the spline-expanded covariate bases.
+        self._pdcor_cache: OrderedDict = OrderedDict()
+        self._spline_basis_cache: dict = {}
+        # Trial-invariant per-fold data (collapse codes, collapsed target /
+        # covariates / coords, points slices); cleared with the ring caches.
+        self._fold_static_cache: dict = {}
 
         # Spatial pre-aggregation (mandatory; built by precompute_aggregations()).
         # Backed by an on-disk SQLite cache (geofuse/preaggregation.py) so the
@@ -1892,6 +1907,19 @@ class MetricFusionEngine:
     def _clear_ring_caches(self) -> None:
         self._ring_raster_cache.clear()
         self._ring_vector_cache.clear()
+        # Fold-static data (collapse codes, collapsed target/covariates,
+        # points slices) shares the ring caches' lifecycle: both key off the
+        # live fold row sets, which change with every bootstrap resample.
+        self._fold_static_cache.clear()
+
+    def _clear_scoring_caches(self) -> None:
+        """Drop the per-subset scoring caches (pdcor sides, spline bases).
+
+        Shares the spatial-basis cache's lifecycle: their entries fingerprint
+        the scored subset's rows, which change on every split / resample.
+        """
+        self._pdcor_cache.clear()
+        self._spline_basis_cache.clear()
 
     def _outer_radii_metres(self, *, gvi: bool) -> np.ndarray:
         if gvi:
@@ -1934,13 +1962,26 @@ class MetricFusionEngine:
         if getattr(self, "_preaggregation_done", False):
             wave_indices = None
             if self.is_longitudinal and "wave" in points_gdf.columns:
-                spec = self.longitudinal_spec
-                assert spec is not None
-                wave_index_of = {w: i for i, w in enumerate(spec.wave_labels)}
-                wave_indices = np.asarray(
-                    [wave_index_of[str(w)] for w in points_gdf["wave"]],
-                    dtype=np.int64,
+                # Per-row wave indices are trial-invariant per fold subset;
+                # memoized alongside the fold statics (same lifecycle).
+                wkey = (
+                    ("waveidx", fold_idx, subset, len(points_gdf))
+                    if fold_idx is not None and subset is not None
+                    else None
                 )
+                wave_indices = (
+                    self._fold_static_cache.get(wkey) if wkey is not None else None
+                )
+                if wave_indices is None:
+                    spec = self.longitudinal_spec
+                    assert spec is not None
+                    wave_index_of = {w: i for i, w in enumerate(spec.wave_labels)}
+                    wave_indices = np.asarray(
+                        [wave_index_of[str(w)] for w in points_gdf["wave"]],
+                        dtype=np.int64,
+                    )
+                    if wkey is not None:
+                        self._fold_static_cache[wkey] = wave_indices
             # Point/line targets cache stats per unique pixel: resolve each
             # duplicated catchment row to its pixel id. Other targets key the
             # cache by row index directly.
@@ -2001,7 +2042,8 @@ class MetricFusionEngine:
                     rows = metric_sampling.precompute_vector_ring_values(
                         metric_data, points_gdf, radii, col
                     )
-                cache_store[key] = (radii, rows)
+                prefix = metric_sampling.ring_prefix_stats(rows)
+                cache_store[key] = (radii, rows, prefix, {})
                 logger.info(
                     f"Ring cache built: channel={channel} subset={subset} fold={fold_idx} "
                     f"points={len(points_gdf)} rings={len(radii)}"
@@ -2012,10 +2054,20 @@ class MetricFusionEngine:
                     points_gdf, metric_data, radius_m, stat, percentile
                 )
 
-        _, rows = cache_store[key]
-        return metric_sampling.aggregate_from_ring_cache(
-            radii, rows, radius_m, stat, percentile
+        _, rows, prefix, memo = cache_store[key]
+        # Result memo: trials repeat the same (radius, stat, percentile) cells
+        # constantly, and the grid is small (n_radii × mean/median/deciles) —
+        # so the per-point percentile reduce runs once per distinct cell.
+        end_idx = metric_sampling.ring_end_index(radii, radius_m)
+        memo_key = (end_idx, stat, int(percentile) if stat == "percentile" else 0)
+        hit = memo.get(memo_key)
+        if hit is not None:
+            return hit
+        out = metric_sampling.aggregate_from_ring_cache(
+            radii, rows, radius_m, stat, percentile, prefix=prefix
         )
+        memo[memo_key] = out
+        return out
 
     def prepare_fusion_data(self) -> pd.DataFrame:
         """
@@ -2109,9 +2161,15 @@ class MetricFusionEngine:
 
         def _scale(a: np.ndarray, ch: str) -> np.ndarray:
             lo, hi = self._channel_minmax.get(ch, (0.0, 1.0))
+            arr = np.asarray(a)
+            if not np.issubdtype(arr.dtype, np.floating):
+                arr = arr.astype(np.float64)
             if hi <= lo:
-                return np.asarray(a, dtype=np.float64)
-            return np.clip((np.asarray(a, dtype=np.float64) - lo) / (hi - lo), 0.0, 1.0)
+                return arr
+            # Scalar ops keep the input float width (float32 on the per-pixel
+            # trial path, float64 elsewhere).
+            dt = arr.dtype.type
+            return np.clip((arr - dt(lo)) / dt(hi - lo), dt(0.0), dt(1.0))
 
         return _scale(veg, "veg"), _scale(terrain, "terrain"), _scale(ndvi, "ndvi")
 
@@ -3216,8 +3274,8 @@ class MetricFusionEngine:
         # writer. After sjoin + dedup the surviving subset keeps these tags.
         n_cols = len(xs)
         n_rows = len(ys_topdown)
-        pixels["_grid_row"] = np.repeat(np.arange(n_rows, dtype=np.int64), n_cols)
-        pixels["_grid_col"] = np.tile(np.arange(n_cols, dtype=np.int64), n_rows)
+        pixels["_grid_row"] = np.repeat(np.arange(n_rows, dtype=np.int32), n_cols)
+        pixels["_grid_col"] = np.tile(np.arange(n_cols, dtype=np.int32), n_rows)
         _log(
             "INFO",
             f"CGI grid bbox: {len(xs)} × {len(ys)} = {len(pixels):,} candidate "
@@ -3309,9 +3367,11 @@ class MetricFusionEngine:
             {
                 "polygon_id": entity_gdf["polygon_id"].values,
                 "target": entity_gdf["target"].values,
-                "veg": probe_gdf["veg"].values,
-                "terrain": probe_gdf["terrain"].values,
-                "ndvi": probe_gdf["ndvi"].values,
+                # Probe channels only feed the NaN-coverage gate and the
+                # channel-scale bounds — float32 halves the pixel-frame cost.
+                "veg": np.asarray(probe_gdf["veg"].values, dtype=np.float32),
+                "terrain": np.asarray(probe_gdf["terrain"].values, dtype=np.float32),
+                "ndvi": np.asarray(probe_gdf["ndvi"].values, dtype=np.float32),
             },
             index=entity_gdf.index,
         )
@@ -3482,8 +3542,8 @@ class MetricFusionEngine:
         maxy = -row_origin * spacing_m
         pixels = gpd.GeoDataFrame(
             {
-                "_grid_row": (g_row - row_origin).astype(np.int64),
-                "_grid_col": (g_col - col_origin).astype(np.int64),
+                "_grid_row": (g_row - row_origin).astype(np.int32),
+                "_grid_col": (g_col - col_origin).astype(np.int32),
             },
             geometry=gpd.points_from_xy(g_x, g_y),
             crs=grid_crs,
@@ -3514,7 +3574,7 @@ class MetricFusionEngine:
             )
             pix_idx = sdm.row.astype(np.int64)
             ent_idx = sdm.col.astype(np.int64)
-            catchment_dist = sdm.data.astype(np.float64)
+            catchment_dist = sdm.data.astype(np.float32)
         else:
             ent_buffers = gpd.GeoDataFrame(
                 {"__entity_id": ent["__entity_id"].to_numpy()},
@@ -3529,7 +3589,9 @@ class MetricFusionEngine:
                 ent_geom_by_id.loc[ent_idx].to_numpy(), crs=grid_crs
             )
             pix_geoms = gpd.GeoSeries(joined.geometry.to_numpy(), crs=grid_crs)
-            catchment_dist = pix_geoms.distance(aligned_geoms).to_numpy()
+            catchment_dist = pix_geoms.distance(aligned_geoms).to_numpy(
+                dtype=np.float32
+            )
 
         if pix_idx.size == 0:
             raise ValueError(
@@ -3591,9 +3653,11 @@ class MetricFusionEngine:
             {
                 "polygon_id": entity_gdf["polygon_id"].values,
                 "target": entity_gdf["target"].values,
-                "veg": veg_u[pix_idx],
-                "terrain": terrain_u[pix_idx],
-                "ndvi": ndvi_u[pix_idx],
+                # Probe channels only feed the NaN-coverage gate and the
+                # channel-scale bounds — float32 halves the pixel-frame cost.
+                "veg": np.asarray(veg_u, dtype=np.float32)[pix_idx],
+                "terrain": np.asarray(terrain_u, dtype=np.float32)[pix_idx],
+                "ndvi": np.asarray(ndvi_u, dtype=np.float32)[pix_idx],
                 "_catchment_dist": entity_gdf["_catchment_dist"].values,
             },
             index=entity_gdf.index,
@@ -3731,6 +3795,117 @@ class MetricFusionEngine:
             out[nz] = sums[nz] / counts[nz]
             return out
         return pd.Series(v).groupby(pid).first().to_numpy()
+
+    @staticmethod
+    def _collapse_mean_from_codes(
+        values: np.ndarray,
+        codes: np.ndarray,
+        n_uniq: int,
+        mask: np.ndarray | None,
+    ) -> np.ndarray:
+        """Per-entity mean of ``values`` from precomputed collapse codes.
+
+        Equivalent to ``_collapse_to_entities(values, pid, mask, "mean")``
+        without the per-call ``factorize``: ``codes`` / ``n_uniq`` come from
+        one sorted-key factorization of the fold's ``polygon_id``. The
+        ``minlength`` pin keeps the output aligned to the full entity set, so
+        the row order matches every other collapsed array even under a
+        catchment mask (the nearest-pixel guarantee keeps each entity
+        represented, exactly as the legacy masked factorize relied on).
+        """
+        v = np.asarray(values, dtype=np.float64)
+        cd = codes
+        if mask is not None:
+            v = v[mask]
+            cd = cd[mask]
+        valid = ~np.isnan(v)
+        counts = np.bincount(cd[valid], minlength=n_uniq)
+        sums = np.bincount(cd[valid], weights=v[valid], minlength=n_uniq)
+        out = np.full(n_uniq, np.nan, dtype=np.float64)
+        nz = counts > 0
+        out[nz] = sums[nz] / counts[nz]
+        return out
+
+    def _fold_entity_statics(
+        self, data: pd.DataFrame, fold_idx: Any, subset: str
+    ) -> dict:
+        """Trial-invariant arrays for one scored fold subset, computed once.
+
+        Everything here depends only on the fold's row set — never on trial
+        parameters — so every trial of a bootstrap study reuses one
+        computation: the sorted-key collapse codes of ``polygon_id``, each
+        entity's first-occurrence row (target / covariates / coords /
+        longitudinal keys are per-entity constants broadcast to pixels, so a
+        "first" collapse is a plain row-take), and the points slice the
+        aggregation path consumes. Cached on ``_fold_static_cache`` and
+        cleared with the ring caches — both key off the live fold row sets.
+        """
+        key = (fold_idx, subset, len(data), id(data))
+        st = self._fold_static_cache.get(key)
+        if st is not None:
+            return st
+
+        st = {}
+        cov_cols = self.covariate_columns
+        has_pid = "polygon_id" in data.columns
+        have_coords = "_cx" in data.columns and "_cy" in data.columns
+        st["has_pid"] = has_pid
+        if has_pid:
+            pid = data["polygon_id"].values
+            codes, uniq = pd.factorize(pid, sort=True)
+            codes = np.asarray(codes, dtype=np.int64)
+            n_uniq = len(uniq)
+            order = np.argsort(codes, kind="stable")
+            first_idx = order[np.searchsorted(codes[order], np.arange(n_uniq))]
+            st["codes"] = codes
+            st["n_uniq"] = n_uniq
+            st["target"] = np.asarray(data["target"].values, dtype=np.float64)[
+                first_idx
+            ]
+            st["cov"] = (
+                data[cov_cols].to_numpy(dtype=np.float64)[first_idx]
+                if cov_cols
+                else None
+            )
+            st["coords"] = (
+                np.column_stack(
+                    [
+                        data["_cx"].to_numpy(np.float64)[first_idx],
+                        data["_cy"].to_numpy(np.float64)[first_idx],
+                    ]
+                )
+                if have_coords
+                else None
+            )
+            if self.is_longitudinal:
+                st["entity_id"] = np.asarray(data["entity_id"].values)[first_idx]
+                st["ysb"] = np.asarray(
+                    data["years_since_baseline"].values, dtype=np.float64
+                )[first_idx]
+        else:
+            st["target"] = data["target"].values
+            st["cov"] = (
+                data[cov_cols].to_numpy(dtype=np.float64) if cov_cols else None
+            )
+            st["coords"] = (
+                data[["_cx", "_cy"]].to_numpy(np.float64) if have_coords else None
+            )
+            if self.is_longitudinal:
+                st["entity_id"] = data["entity_id"].values
+                st["ysb"] = data["years_since_baseline"].values
+
+        # Aggregation input: geometry-free on the pre-aggregation fast path
+        # (the cache needs only row ids + wave), full geometry rows otherwise.
+        if getattr(self, "_preaggregation_done", False):
+            light_cols = [
+                c for c in ("wave", "_preaggr_id") if c in self.target_gdf.columns
+            ]
+            st["points"] = self.target_gdf.loc[data.index, light_cols]
+        else:
+            st["points"] = self.target_gdf.loc[data.index]
+
+        self._fold_static_cache[key] = st
+        return st
 
     def _expand_categorical_covariates(self) -> None:
         """Validate covariates and one-hot expand the categorical ones in place.
@@ -3904,9 +4079,15 @@ class MetricFusionEngine:
         if self.spatial_adjust_method == "ks_aic":
             return entry["ks_cols"]
         # spatial_plus: the exposure is residualized on the smooth, so df is
-        # selected on the exposure (df-Spatial+); the candidate basis is reused.
-        _df, sp_cols = spatial_basis.select_df_aic(
-            np.asarray(cgi, dtype=np.float64), basis, None
+        # selected on the exposure (df-Spatial+); the candidate basis is reused
+        # and the per-call df search runs off the memoized nested-QR precompute
+        # (one matvec instead of max_df+1 least-squares fits).
+        pre = entry.get("plus_pre")
+        if pre is None and "plus_pre" not in entry:
+            pre = spatial_basis.precompute_df_selection(basis)
+            entry["plus_pre"] = pre
+        _df, sp_cols = spatial_basis.select_df_aic_fast(
+            np.asarray(cgi, dtype=np.float64), basis, pre
         )
         return sp_cols
 
@@ -3931,14 +4112,17 @@ class MetricFusionEngine:
         """
         if not self.whole_grid_scaling:
             return composite
-        arr = np.asarray(composite, dtype=np.float64)
+        arr = np.asarray(composite)
+        if not np.issubdtype(arr.dtype, np.floating):
+            arr = arr.astype(np.float64)
         valid = ~np.isnan(arr)
         if np.any(valid):
             lo = float(arr[valid].min())
             hi = float(arr[valid].max())
             if hi > lo:
                 arr = arr.copy()
-                arr[valid] = (arr[valid] - lo) / (hi - lo)
+                dt = arr.dtype.type
+                arr[valid] = (arr[valid] - dt(lo)) / dt(hi - lo)
         return arr
 
     def _prepare_point_fusion(self) -> pd.DataFrame:
@@ -4459,6 +4643,9 @@ class MetricFusionEngine:
         # train+val / test frames this method rebuilds).
         self._full_data_cache = None
         self._apply_fusion_cache = None
+        self._evaluate_test_cache.clear()
+        self._fold_static_cache.clear()
+        self._clear_scoring_caches()
 
         # Step 1: Sample all metrics at initial buffer distance
         logger.info("Step 1/4: Sampling metrics at point locations...")
@@ -4863,18 +5050,13 @@ class MetricFusionEngine:
             # ─── Apply Dynamic Radius and Aggregation ─────────────────────────────
             # Both points and rasters use the same circular buffer aggregation
             # For rasters, _prepare_raster_fusion() converted pixels to points at centers.
-            # On the pre-aggregation fast path the aggregator only needs row
-            # indices (+ wave / _preaggr_id), so pass a geometry-free slice and
-            # skip copying the geometry column every trial × fold.
-            if getattr(self, "_preaggregation_done", False):
-                light_cols = [
-                    c for c in ("wave", "_preaggr_id") if c in self.target_gdf.columns
-                ]
-                train_points = self.target_gdf.loc[train_data.index, light_cols]
-                val_points = self.target_gdf.loc[val_data.index, light_cols]
-            else:
-                train_points = self.target_gdf.loc[train_data.index]
-                val_points = self.target_gdf.loc[val_data.index]
+            # Points slices, collapse codes, and every per-entity constant are
+            # trial-invariant — served from the fold statics (computed once per
+            # fold subset, reused by all of this bootstrap's trials).
+            train_static = self._fold_entity_statics(train_data, fold_idx, "train")
+            val_static = self._fold_entity_statics(val_data, fold_idx, "val")
+            train_points = train_static["points"]
+            val_points = val_static["points"]
 
             # Apply circular buffer aggregation for vegetation (with SHARED streetview_stat)
             if channel_active["veg"]:
@@ -4899,8 +5081,8 @@ class MetricFusionEngine:
                     subset="val",
                 )
             else:
-                train_veg = np.zeros(len(train_points))
-                val_veg = np.zeros(len(val_points))
+                train_veg = np.zeros(len(train_points), dtype=np.float32)
+                val_veg = np.zeros(len(val_points), dtype=np.float32)
 
             # Apply circular buffer aggregation for terrain (with SHARED streetview_stat)
             if channel_active["terrain"]:
@@ -4925,8 +5107,8 @@ class MetricFusionEngine:
                     subset="val",
                 )
             else:
-                train_terrain = np.zeros(len(train_points))
-                val_terrain = np.zeros(len(val_points))
+                train_terrain = np.zeros(len(train_points), dtype=np.float32)
+                val_terrain = np.zeros(len(val_points), dtype=np.float32)
 
             # Apply circular buffer aggregation for NDVI (separate stat)
             if channel_active["ndvi"]:
@@ -4951,8 +5133,8 @@ class MetricFusionEngine:
                     subset="val",
                 )
             else:
-                train_ndvi = np.zeros(len(train_points))
-                val_ndvi = np.zeros(len(val_points))
+                train_ndvi = np.zeros(len(train_points), dtype=np.float32)
+                val_ndvi = np.zeros(len(val_points), dtype=np.float32)
 
             # Per-channel scaling has been removed: the composite is always a
             # weighted combination of RAW aggregated channel values. The
@@ -5020,143 +5202,46 @@ class MetricFusionEngine:
             train_composite = self._finalize_composite(train_composite)
             val_composite = self._finalize_composite(val_composite)
 
-            # Per-fold covariate design matrix (or None when no covariates
-            # configured). Polygon mode collapses these alongside the target.
-            cov_cols = self.covariate_columns
-            if cov_cols:
-                train_cov = train_data[cov_cols].to_numpy(dtype=np.float64)
-                val_cov = val_data[cov_cols].to_numpy(dtype=np.float64)
-            else:
-                train_cov = None
-                val_cov = None
+            # Per-fold covariate design matrix, per-entity target / coords /
+            # longitudinal keys: all trial-invariant, served from the fold
+            # statics (already entity-collapsed for polygon-keyed targets).
+            train_cov = train_static["cov"]
+            val_cov = val_static["cov"]
+            train_targets_arr = train_static["target"]
+            val_targets_arr = val_static["target"]
+            train_coords = train_static["coords"]
+            val_coords = val_static["coords"]
+            train_entity_id = train_static.get("entity_id")
+            val_entity_id = val_static.get("entity_id")
+            train_ysb = train_static.get("ysb")
+            val_ysb = val_static.get("ysb")
 
             # Polygon mode: per-row CGI → per-polygon mean CGI, then score
             # against the per-polygon outcome. In longitudinal+polygon mode
             # polygon_id was set to f"{entity}|{wave}" by
             # _prepare_polygon_fusion so the collapse produces one row per
             # (entity, wave) — the exact shape the MixedLM scorer wants.
-            train_entity_id = None
-            val_entity_id = None
-            train_ysb = None
-            val_ysb = None
-            # Per-entity coordinates for the spatial-confounding smooth. ``None``
-            # whenever the adjustment is off or coordinates were not attached.
-            train_coords = None
-            val_coords = None
-            have_coords = "_cx" in train_data.columns and "_cy" in train_data.columns
-            if "polygon_id" in train_data.columns:
-                train_pid = train_data["polygon_id"].values
-                val_pid = val_data["polygon_id"].values
-                # Catchment collapse: polygons average every in-footprint pixel
-                # (mask None); point/line entities average only the pixels
-                # within this trial's catchment radius (+ each entity's nearest
-                # pixel). ``__entity_id``/wave keys were set per observation in
-                # the prepare step, so the collapse yields one row per
-                # observation — the shape the OLS / MixedLM scorers want.
+            # Catchment collapse: polygons average every in-footprint pixel
+            # (mask None); point/line entities average only the pixels within
+            # this trial's catchment radius (+ each entity's nearest pixel).
+            if train_static["has_pid"]:
                 catchment_r = self._catchment_radius(
                     veg_radius, terrain_radius, ndvi_radius
                 )
                 train_mask = self._entity_collapse_mask(train_data, catchment_r)
                 val_mask = self._entity_collapse_mask(val_data, catchment_r)
-                train_composite = self._collapse_to_entities(
-                    train_composite, train_pid, train_mask, "mean"
+                train_composite = self._collapse_mean_from_codes(
+                    train_composite,
+                    train_static["codes"],
+                    train_static["n_uniq"],
+                    train_mask,
                 )
-                val_composite = self._collapse_to_entities(
-                    val_composite, val_pid, val_mask, "mean"
+                val_composite = self._collapse_mean_from_codes(
+                    val_composite,
+                    val_static["codes"],
+                    val_static["n_uniq"],
+                    val_mask,
                 )
-                train_targets_arr = self._collapse_to_entities(
-                    train_data["target"].values, train_pid, train_mask, "first"
-                )
-                val_targets_arr = self._collapse_to_entities(
-                    val_data["target"].values, val_pid, val_mask, "first"
-                )
-                if train_cov is not None and val_cov is not None:
-                    tc = train_cov  # local binding for the type checker
-                    vc = val_cov
-                    train_cov = np.column_stack(
-                        [
-                            self._collapse_to_entities(
-                                tc[:, j], train_pid, train_mask, "first"
-                            )
-                            for j in range(tc.shape[1])
-                        ]
-                    )
-                    val_cov = np.column_stack(
-                        [
-                            self._collapse_to_entities(
-                                vc[:, j], val_pid, val_mask, "first"
-                            )
-                            for j in range(vc.shape[1])
-                        ]
-                    )
-                if have_coords:
-                    # Collapse coordinates with an unmasked "first" so the
-                    # per-entity representative point is independent of the
-                    # trial's catchment radius — the spatial basis can then be
-                    # cached once per fold. The collapse key order (sorted
-                    # polygon_id) matches the target/covariate collapse above.
-                    train_coords = np.column_stack(
-                        [
-                            self._collapse_to_entities(
-                                train_data["_cx"].to_numpy(np.float64),
-                                train_pid,
-                                None,
-                                "first",
-                            ),
-                            self._collapse_to_entities(
-                                train_data["_cy"].to_numpy(np.float64),
-                                train_pid,
-                                None,
-                                "first",
-                            ),
-                        ]
-                    )
-                    val_coords = np.column_stack(
-                        [
-                            self._collapse_to_entities(
-                                val_data["_cx"].to_numpy(np.float64),
-                                val_pid,
-                                None,
-                                "first",
-                            ),
-                            self._collapse_to_entities(
-                                val_data["_cy"].to_numpy(np.float64),
-                                val_pid,
-                                None,
-                                "first",
-                            ),
-                        ]
-                    )
-                if self.is_longitudinal:
-                    train_entity_id = self._collapse_to_entities(
-                        train_data["entity_id"].values, train_pid, train_mask, "first"
-                    )
-                    val_entity_id = self._collapse_to_entities(
-                        val_data["entity_id"].values, val_pid, val_mask, "first"
-                    )
-                    train_ysb = self._collapse_to_entities(
-                        train_data["years_since_baseline"].values,
-                        train_pid,
-                        train_mask,
-                        "first",
-                    )
-                    val_ysb = self._collapse_to_entities(
-                        val_data["years_since_baseline"].values,
-                        val_pid,
-                        val_mask,
-                        "first",
-                    )
-            else:
-                train_targets_arr = train_data["target"].values
-                val_targets_arr = val_data["target"].values
-                if have_coords:
-                    train_coords = train_data[["_cx", "_cy"]].to_numpy(np.float64)
-                    val_coords = val_data[["_cx", "_cy"]].to_numpy(np.float64)
-                if self.is_longitudinal:
-                    train_entity_id = train_data["entity_id"].values
-                    val_entity_id = val_data["entity_id"].values
-                    train_ysb = train_data["years_since_baseline"].values
-                    val_ysb = val_data["years_since_baseline"].values
 
             # Check for constant values (variance = 0) which cause NaN correlations
             train_valid_vals = train_composite[~np.isnan(train_composite)]
@@ -5241,6 +5326,8 @@ class MetricFusionEngine:
                     spatial_basis=train_sb,
                     spatial_method=self.spatial_adjust_method,
                     residualize_method=self.residualize_method,
+                    pdcor_cache=self._pdcor_cache,
+                    spline_cache=self._spline_basis_cache,
                 )
                 val_out = objective_scoring.score(
                     metric,
@@ -5251,6 +5338,8 @@ class MetricFusionEngine:
                     spatial_basis=val_sb,
                     spatial_method=self.spatial_adjust_method,
                     residualize_method=self.residualize_method,
+                    pdcor_cache=self._pdcor_cache,
+                    spline_cache=self._spline_basis_cache,
                 )
 
             if wants_pval:
@@ -5346,6 +5435,21 @@ class MetricFusionEngine:
                 )
             params = self.best_params
 
+        # Memoized on the composite-determining params (like apply_fusion):
+        # the runner headline, the effects block, the subset-score table, and
+        # the MixedLM post-score loop all re-evaluate identical configurations.
+        # Invalidated by split_data. Shallow-copied on return so callers that
+        # attach keys (e.g. ``test_ci``) don't mutate the cached entry.
+        memo_key = (
+            self._fusion_param_key(self._active_greenery_channel, params),
+            metric,
+            bool(return_predictions),
+            bool(return_all_mixedlm),
+        )
+        memo_hit = self._evaluate_test_cache.get(memo_key)
+        if memo_hit is not None:
+            return dict(memo_hit)
+
         logger.info("Evaluating on held-out test set...")
 
         # Use the engine's active mode to decide which channels contribute and
@@ -5376,7 +5480,8 @@ class MetricFusionEngine:
 
         # Apply dynamic circular buffer aggregation
         # Both points and rasters use the same approach (rasters converted to points)
-        test_points = self.target_gdf.loc[self.test_data.index].copy()
+        # .loc with an index array materialises a new frame; read-only below.
+        test_points = self.target_gdf.loc[self.test_data.index]
 
         # Sample vegetation with optimized radius/stat
         if channel_active["veg"]:
@@ -5391,7 +5496,7 @@ class MetricFusionEngine:
                 subset="test",
             )
         else:
-            test_veg = np.zeros(len(test_points))
+            test_veg = np.zeros(len(test_points), dtype=np.float32)
 
         # Sample terrain with optimized radius/stat
         if channel_active["terrain"]:
@@ -5406,7 +5511,7 @@ class MetricFusionEngine:
                 subset="test",
             )
         else:
-            test_terrain = np.zeros(len(test_points))
+            test_terrain = np.zeros(len(test_points), dtype=np.float32)
 
         # Sample NDVI with optimized radius/stat
         if channel_active["ndvi"]:
@@ -5421,7 +5526,7 @@ class MetricFusionEngine:
                 subset="test",
             )
         else:
-            test_ndvi = np.zeros(len(test_points))
+            test_ndvi = np.zeros(len(test_points), dtype=np.float32)
 
         # Per-channel scaling removed — the composite uses raw aggregated
         # channels. ``whole_grid_scaling`` normalizes the composite below.
@@ -5463,79 +5568,32 @@ class MetricFusionEngine:
         # mirrored for standalone single-channel composites.
         test_composite = self._finalize_composite(test_composite)
 
-        # Test-set covariate matrix (or None when no covariates configured).
-        cov_cols = self.covariate_columns
-        if cov_cols:
-            test_cov = self.test_data[cov_cols].to_numpy(dtype=np.float64)
-        else:
-            test_cov = None
+        # Per-entity constants (covariates, target, coords, longitudinal keys)
+        # come from the fold statics — identical across every params
+        # evaluation on this test split, so the MixedLM post-score loop and
+        # the reporting passes stop re-collapsing the pixel frame per call.
+        test_static = self._fold_entity_statics(self.test_data, -1, "test")
+        test_cov = test_static["cov"]
+        test_targets = test_static["target"]
+        test_coords = test_static["coords"]
+        test_entity_id = test_static.get("entity_id")
+        test_ysb = test_static.get("ysb")
 
         # Polygon mode: aggregate per-row CGI by polygon before scoring against
         # the per-polygon outcome. Longitudinal+polygon mode keys the collapse
         # on f"{entity}|{wave}" so the result is one row per (entity, wave) —
         # the shape the MixedLM scorer expects.
-        test_entity_id = None
-        test_ysb = None
-        test_coords = None
-        have_coords = (
-            "_cx" in self.test_data.columns and "_cy" in self.test_data.columns
-        )
-        if "polygon_id" in self.test_data.columns:
-            test_pid = self.test_data["polygon_id"].values
+        if test_static["has_pid"]:
             catchment_r = self._catchment_radius(
                 veg_radius, terrain_radius, ndvi_radius
             )
             test_mask = self._entity_collapse_mask(self.test_data, catchment_r)
-            test_composite = self._collapse_to_entities(
-                test_composite, test_pid, test_mask, "mean"
+            test_composite = self._collapse_mean_from_codes(
+                test_composite,
+                test_static["codes"],
+                test_static["n_uniq"],
+                test_mask,
             )
-            test_targets = self._collapse_to_entities(
-                self.test_data["target"].values, test_pid, test_mask, "first"
-            )
-            if test_cov is not None:
-                tc = test_cov  # type-narrow for the comprehension
-                test_cov = np.column_stack(
-                    [
-                        self._collapse_to_entities(
-                            tc[:, j], test_pid, test_mask, "first"
-                        )
-                        for j in range(tc.shape[1])
-                    ]
-                )
-            if have_coords:
-                test_coords = np.column_stack(
-                    [
-                        self._collapse_to_entities(
-                            self.test_data["_cx"].to_numpy(np.float64),
-                            test_pid,
-                            None,
-                            "first",
-                        ),
-                        self._collapse_to_entities(
-                            self.test_data["_cy"].to_numpy(np.float64),
-                            test_pid,
-                            None,
-                            "first",
-                        ),
-                    ]
-                )
-            if self.is_longitudinal:
-                test_entity_id = self._collapse_to_entities(
-                    self.test_data["entity_id"].values, test_pid, test_mask, "first"
-                )
-                test_ysb = self._collapse_to_entities(
-                    self.test_data["years_since_baseline"].values,
-                    test_pid,
-                    test_mask,
-                    "first",
-                )
-        else:
-            test_targets = self.test_data["target"].values
-            if have_coords:
-                test_coords = self.test_data[["_cx", "_cy"]].to_numpy(np.float64)
-            if self.is_longitudinal:
-                test_entity_id = self.test_data["entity_id"].values
-                test_ysb = self.test_data["years_since_baseline"].values
 
         test_sb = self._spatial_basis_columns(
             test_coords, test_targets, test_cov, test_composite
@@ -5600,6 +5658,8 @@ class MetricFusionEngine:
                 spatial_basis=test_sb,
                 spatial_method=self.spatial_adjust_method,
                 residualize_method=self.residualize_method,
+                pdcor_cache=self._pdcor_cache,
+                spline_cache=self._spline_basis_cache,
             )
         if wants_pval:
             test_score, test_pval = score_out  # type: ignore[misc]
@@ -5635,7 +5695,10 @@ class MetricFusionEngine:
             # condition on the same spatial adjustment the score used.
             result["spatial_basis"] = test_sb
 
-        return result
+        self._evaluate_test_cache[memo_key] = result
+        while len(self._evaluate_test_cache) > 256:
+            self._evaluate_test_cache.pop(next(iter(self._evaluate_test_cache)))
+        return dict(result)
 
     def build_channel_design(self, params: dict, subset: str = "train_val") -> dict:
         """Per-entity raw channel values for the CGI-vs-standalone AIC/BIC test.
@@ -5812,7 +5875,13 @@ class MetricFusionEngine:
 
             def _score_fn(t_arr: np.ndarray, p_arr: np.ndarray) -> float:
                 score_out = objective_scoring.score(
-                    metric, t_arr, p_arr, covariates=None, return_pvalue=False
+                    metric,
+                    t_arr,
+                    p_arr,
+                    covariates=None,
+                    return_pvalue=False,
+                    pdcor_cache=self._pdcor_cache,
+                    spline_cache=self._spline_basis_cache,
                 )
                 return float(score_out)  # type: ignore[arg-type]
 
@@ -5822,7 +5891,13 @@ class MetricFusionEngine:
                 t_arr: np.ndarray, p_arr: np.ndarray, c_arr: np.ndarray
             ) -> float:
                 score_out = objective_scoring.score(
-                    metric, t_arr, p_arr, covariates=c_arr, return_pvalue=False
+                    metric,
+                    t_arr,
+                    p_arr,
+                    covariates=c_arr,
+                    return_pvalue=False,
+                    pdcor_cache=self._pdcor_cache,
+                    spline_cache=self._spline_basis_cache,
                 )
                 return float(score_out)  # type: ignore[arg-type]
 
@@ -5835,6 +5910,11 @@ class MetricFusionEngine:
             method=method,
             seed=int(seed),
             covariates=cov_mat,
+            replicate_scorer_factory=(
+                pdcor.pdcor_replicate_scorer_factory
+                if metric == "partial_distance_corr"
+                else None
+            ),
         )
         ci["n"] = n
         return ci
@@ -5941,7 +6021,8 @@ class MetricFusionEngine:
         all_data = self._full_data_frame()
         if all_data is None:
             raise ValueError("No data available. Run split_data() first.")
-        all_points = self.target_gdf.loc[all_data.index].copy()
+        # .loc with an index array materialises a new frame; read-only below.
+        all_points = self.target_gdf.loc[all_data.index]
 
         # Apply circular buffer aggregation with optimized parameters
         if channel_active["veg"]:
@@ -5956,7 +6037,7 @@ class MetricFusionEngine:
                 subset="all",
             )
         else:
-            all_veg = np.zeros(len(all_points))
+            all_veg = np.zeros(len(all_points), dtype=np.float32)
 
         if channel_active["terrain"]:
             all_terrain = self._aggregate_with_ring_cache(
@@ -5970,7 +6051,7 @@ class MetricFusionEngine:
                 subset="all",
             )
         else:
-            all_terrain = np.zeros(len(all_points))
+            all_terrain = np.zeros(len(all_points), dtype=np.float32)
 
         if channel_active["ndvi"]:
             all_ndvi = self._aggregate_with_ring_cache(
@@ -5984,7 +6065,7 @@ class MetricFusionEngine:
                 subset="all",
             )
         else:
-            all_ndvi = np.zeros(len(all_points))
+            all_ndvi = np.zeros(len(all_points), dtype=np.float32)
 
         # Per-channel scaling removed — the composite uses raw aggregated
         # channel values.
@@ -6125,6 +6206,8 @@ class MetricFusionEngine:
                     spatial_basis=spat,
                     spatial_method=self.spatial_adjust_method,
                     residualize_method=self.residualize_method,
+                    pdcor_cache=self._pdcor_cache,
+                    spline_cache=self._spline_basis_cache,
                 )
                 if wants_pval:
                     s, p = out  # type: ignore[misc]
@@ -6246,7 +6329,22 @@ class MetricFusionEngine:
         higher = metric in objective_scoring.HIGHER_IS_BETTER
 
         def _score_fn(t_arr, c_arr, cov=None):
-            return objective_scoring.score(metric, t_arr, c_arr, cov)
+            return objective_scoring.score(
+                metric,
+                t_arr,
+                c_arr,
+                cov,
+                pdcor_cache=self._pdcor_cache,
+                spline_cache=self._spline_basis_cache,
+            )
+
+        # Replicate fast paths for the O(n²) metric: bootstrap replicates
+        # fancy-index precomputed distance matrices; permutation replicates
+        # reuse the fixed prediction/conditioning sides (Freedman–Lane only
+        # varies the surrogate outcome).
+        is_pdcor = metric == "partial_distance_corr"
+        rep_factory = pdcor.pdcor_replicate_scorer_factory if is_pdcor else None
+        sur_factory = pdcor.pdcor_surrogate_scorer_factory if is_pdcor else None
 
         def _block(t_arr, c_arr, cov, *, do_perm, sub_seed):
             out = {
@@ -6268,6 +6366,7 @@ class MetricFusionEngine:
                     method="percentile",
                     seed=int(sub_seed),
                     covariates=cov,
+                    replicate_scorer_factory=rep_factory,
                 )
                 out["score"] = ci.get("observed")
                 out["lower"] = ci.get("lower")
@@ -6284,6 +6383,7 @@ class MetricFusionEngine:
                         n_perm=int(n_perm),
                         seed=int(sub_seed) + 7,
                         covariates=cov,
+                        surrogate_scorer_factory=sur_factory,
                     )
                     out["p_value"] = perm.get("p_value")
                     if out["score"] is None:
@@ -6428,21 +6528,50 @@ class MetricFusionEngine:
         sign = 1.0 if higher else -1.0
 
         def _score(t_arr, c_arr, cov_arr):
-            return float(objective_scoring.score(metric, t_arr, c_arr, cov_arr))
+            return float(
+                objective_scoring.score(
+                    metric,
+                    t_arr,
+                    c_arr,
+                    cov_arr,
+                    pdcor_cache=self._pdcor_cache,
+                    spline_cache=self._spline_basis_cache,
+                )
+            )
 
         obs_cgi = _score(target, cgi_c, cov)
         obs_std = _score(target, std_c, cov)
         obs_diff = sign * (obs_cgi - obs_std)
+
+        # Replicate fast path for the O(n²) metric: both composites are scored
+        # on the same resample, so the target / conditioning distance matrices
+        # are precomputed once and shared. Requires fully finite inputs (the
+        # generic path masks NaN rows inside score(), which an index-vector
+        # scorer cannot reproduce per composite).
+        fast_pair = None
+        if (
+            metric == "partial_distance_corr"
+            and cov is not None
+            and np.isfinite(target).all()
+            and np.isfinite(cgi_c).all()
+            and np.isfinite(std_c).all()
+            and np.isfinite(cov).all()
+        ):
+            fast_pair = pdcor.pdcor_paired_replicate_scorers(target, cgi_c, std_c, cov)
 
         rng = np.random.default_rng(int(seed))
         n = len(target)
         diffs = np.empty(int(n_bootstrap), dtype=np.float64)
         for i in range(int(n_bootstrap)):
             idx = rng.integers(0, n, size=n)
-            cov_i = None if cov is None else cov[idx]
             try:
-                sc = _score(target[idx], cgi_c[idx], cov_i)
-                ss = _score(target[idx], std_c[idx], cov_i)
+                if fast_pair is not None:
+                    sc = fast_pair[0](idx)
+                    ss = fast_pair[1](idx)
+                else:
+                    cov_i = None if cov is None else cov[idx]
+                    sc = _score(target[idx], cgi_c[idx], cov_i)
+                    ss = _score(target[idx], std_c[idx], cov_i)
                 diffs[i] = sign * (sc - ss)
             except Exception:
                 diffs[i] = np.nan
@@ -6587,7 +6716,7 @@ class MetricFusionEngine:
             cov: np.ndarray | None = None
             cov_cols = self.covariate_columns
             if cov_cols and "polygon_id" in df.columns:
-                full = pd.concat([self.train_val_data, self.test_data])
+                full = self._full_data_frame()
                 cov_per_poly = (
                     full.groupby("polygon_id", sort=False)[cov_cols]
                     .first()
@@ -6613,6 +6742,8 @@ class MetricFusionEngine:
                     spatial_basis=spat,
                     spatial_method=self.spatial_adjust_method,
                     residualize_method=self.residualize_method,
+                    pdcor_cache=self._pdcor_cache,
+                    spline_cache=self._spline_basis_cache,
                 )
                 if wants_pval:
                     s, p = s_out  # type: ignore[misc]
@@ -7068,22 +7199,28 @@ class MetricFusionEngine:
                     continue
 
                 if use_groups:
-                    # One row-slice per in-bag group (no multiplicity under
+                    # One row-slice per group (no multiplicity under
                     # subsampling), preserving the original DataFrame index the
-                    # pre-aggregation cache is keyed by.
+                    # pre-aggregation cache is keyed by. Both halves come from
+                    # the same group→rows map — no per-subsample isin scan over
+                    # the pixel frame, and the concat already owns its data.
                     in_bag_df = pd.concat([group_rows[g] for g in in_bag_unique])
-                    oob_df = train_val[train_val[group_col].isin(oob_unique)].copy()
+                    oob_df = pd.concat([group_rows[g] for g in oob_unique])
                 else:
-                    in_bag_df = train_val.iloc[in_bag_unique].copy()
-                    oob_df = train_val.iloc[oob_unique].copy()
+                    # iloc with an index array materialises a new frame; the
+                    # fold frames are read-only downstream.
+                    in_bag_df = train_val.iloc[in_bag_unique]
+                    oob_df = train_val.iloc[oob_unique]
 
                 # Splice this subsample into ``cv_folds`` — the existing
                 # ``_objective`` reads ``train`` / ``val`` from each fold and
                 # handles aggregation, channel collapse, and OOB scoring.
                 self.cv_folds = [{"train": in_bag_df, "val": oob_df}]
                 # Each resample is a different row set, so its spatial basis is
-                # rebuilt; drop the previous resample's cache to bound memory.
+                # rebuilt; drop the previous resample's caches to bound memory
+                # (the pdcor / spline caches fingerprint the same row sets).
                 self._spatial_basis_cache = {}
+                self._clear_scoring_caches()
 
                 # Fresh in-memory study with a low-discrepancy QMC (Sobol)
                 # sampler: objective-blind like RandomSampler (so the per-cell
@@ -7237,6 +7374,10 @@ class MetricFusionEngine:
             self.study = prev_study
             self._cancel_callback = prev_cancel_cb
             optuna.logging.set_verbosity(prev_optuna_verbosity)
+            # The last resample's cached matrices (up to hundreds of MB for
+            # the pdcor sides) have no future hits — release them now.
+            self._clear_scoring_caches()
+            self._clear_ring_caches()
 
         if not records:
             raise RuntimeError(
