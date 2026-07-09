@@ -348,6 +348,30 @@ class JobExecutor:
             process_name=f"gvi-child-{record.id}",
         )
 
+    def submit_fusion_subprocess(
+        self,
+        record: JobRecord,
+        run_kwargs: dict,
+    ) -> Future:
+        """Run a fusion job in a fresh subprocess. See :meth:`submit_subprocess_job`.
+
+        Isolates the GIL-bound stability-selection search + reporting from the
+        Streamlit render loop. All of ``run_fusion``'s arguments are
+        JSON-persisted run config, so ``run_kwargs`` pickles cleanly across the
+        spawn boundary now that the engine class is imported inside the runner
+        rather than passed in. Stage-ledger updates ride the wire protocol's
+        ``MSG_STAGE_LEDGER`` message; ``cancel_check`` works unchanged via the
+        bridged ``mp.Event``.
+        """
+        from geofuse.jobs.fusion_subprocess import run_fusion_child
+
+        return self.submit_subprocess_job(
+            record,
+            run_fusion_child,
+            dict(job_id=record.id, run_kwargs=run_kwargs),
+            process_name=f"fusion-child-{record.id}",
+        )
+
     def submit_ndvi_subprocess(
         self,
         record: JobRecord,

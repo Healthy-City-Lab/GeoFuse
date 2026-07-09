@@ -35,7 +35,6 @@ except ImportError:
 
 from geofuse import cgi_formulas as _cgi_formulas
 from geofuse.crs_utils import buffer_gdf_union_metres, reproject_geodataframe_to_wgs84
-from geofuse.jobs.runners import run_fusion
 from geofuse.vector_io import (
     geometry_sha256,
     list_gpkg_layer_names,
@@ -440,20 +439,20 @@ def _submit_fusion_restart(
     run_config["resume_existing_study"] = True
 
     new_rec = store.submit(type="fusion", name=rec.name, params=new_params)
-    executor.submit_runner(
+    executor.submit_fusion_subprocess(
         new_rec,
-        run_fusion,
-        target_path=target_mat.path,
-        target_features_geojson=(tuple(outcome_columns) if is_vector else ()),
-        target_band=job_target_band if not is_vector else 1,
-        target_layer=p.get("target_layer") if is_vector else None,
-        target_cleanup_dir=target_mat.cleanup_dir,
-        target_cleanup_file=target_mat.cleanup_file,
-        veg_path=veg_path,
-        ndvi_path=ndvi_path,
-        output_dir=output_dir,
-        MetricFusionEngine=_MetricFusionEngine,
-        **run_config,
+        dict(
+            target_path=target_mat.path,
+            target_features_geojson=(tuple(outcome_columns) if is_vector else ()),
+            target_band=job_target_band if not is_vector else 1,
+            target_layer=p.get("target_layer") if is_vector else None,
+            target_cleanup_dir=target_mat.cleanup_dir,
+            target_cleanup_file=target_mat.cleanup_file,
+            veg_path=veg_path,
+            ndvi_path=ndvi_path,
+            output_dir=output_dir,
+            **run_config,
+        ),
     )
 
 
@@ -4375,24 +4374,30 @@ def render(output_dir: str) -> None:
                 fusion_record.params["longitudinal_spec_payload"][
                     "__file_fingerprints__"
                 ] = _fps
-            executor.submit_runner(
+            executor.submit_fusion_subprocess(
                 fusion_record,
-                run_fusion,
-                # File / runtime args (re-resolved each run); the rest of the
-                # settings ride in verbatim via ``**run_config``.
-                target_path=tmp_target_path,
-                target_features_geojson=(
-                    tuple(target_outcome_columns) if is_vector_target else ()
+                dict(
+                    # File / runtime args (re-resolved each run); the rest of the
+                    # settings ride in verbatim via ``**run_config``.
+                    target_path=tmp_target_path,
+                    target_features_geojson=(
+                        tuple(target_outcome_columns) if is_vector_target else ()
+                    ),
+                    target_band=job_target_band if is_raster_target else 1,
+                    target_layer=(
+                        target_layer_for_engine if is_vector_target else None
+                    ),
+                    target_cleanup_dir=(
+                        target_mat.cleanup_dir if target_mat else None
+                    ),
+                    target_cleanup_file=(
+                        target_mat.cleanup_file if target_mat else None
+                    ),
+                    veg_path=veg_path,
+                    ndvi_path=ndvi_path,
+                    output_dir=output_dir,
+                    **run_config,
                 ),
-                target_band=job_target_band if is_raster_target else 1,
-                target_layer=(target_layer_for_engine if is_vector_target else None),
-                target_cleanup_dir=(target_mat.cleanup_dir if target_mat else None),
-                target_cleanup_file=(target_mat.cleanup_file if target_mat else None),
-                veg_path=veg_path,
-                ndvi_path=ndvi_path,
-                output_dir=output_dir,
-                MetricFusionEngine=MetricFusionEngine,
-                **run_config,
             )
 
             st.success("✅ Fusion job started! Check sidebar for progress.")

@@ -14,12 +14,13 @@ Message protocol
 The child pushes tuples onto a ``multiprocessing.Queue`` provided by the
 parent. The first element is a string tag from the ``MSG_*`` constants:
 
-    (MSG_PROGRESS,  value: float | None, status_text: str | None, extras: dict)
+    (MSG_PROGRESS,     value: float | None, status_text: str | None, extras: dict)
     (MSG_HEARTBEAT,)
-    (MSG_SET_EXTRA, extras: dict)
-    (MSG_LOG,       colored_line: str,  plain_line: str)
-    (MSG_COMPLETE,  output_paths: list[str])
-    (MSG_ERROR,     short_msg: str,     traceback_text: str)
+    (MSG_SET_EXTRA,    extras: dict)
+    (MSG_STAGE_LEDGER, ledger: dict)
+    (MSG_LOG,          colored_line: str,  plain_line: str)
+    (MSG_COMPLETE,     output_paths: list[str])
+    (MSG_ERROR,        short_msg: str,     traceback_text: str)
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from __future__ import annotations
 MSG_PROGRESS = "progress"
 MSG_HEARTBEAT = "heartbeat"
 MSG_SET_EXTRA = "set_extra"
+MSG_STAGE_LEDGER = "stage_ledger"
 MSG_LOG = "log"
 MSG_COMPLETE = "complete"
 MSG_ERROR = "error"
@@ -59,6 +61,10 @@ class SubprocJobContext:
 
     def set_extra(self, **extras) -> None:
         self._queue.put((MSG_SET_EXTRA, dict(extras)))
+
+    def update_stage_ledger(self, ledger: dict) -> None:
+        """Forward the staged-resume ledger to the parent (see stage_ledger)."""
+        self._queue.put((MSG_STAGE_LEDGER, ledger))
 
     def is_cancelled(self) -> bool:
         return bool(self._cancel_event.is_set())
@@ -221,6 +227,7 @@ def drain_events_until_done(
 
     Dispatches each message to its parent-side effect:
       * ``MSG_PROGRESS`` / ``MSG_SET_EXTRA`` → ``store.update_progress(...)``
+      * ``MSG_STAGE_LEDGER``                 → ``store.update_stage_ledger(...)``
       * ``MSG_HEARTBEAT``                    → ``store.heartbeat(...)``
       * ``MSG_LOG``                          → forward the pre-formatted line
         into :data:`geofuse.logger._log_queue` so the same listener thread
@@ -278,6 +285,9 @@ def drain_events_until_done(
             _, extras = item
             if extras:
                 store.update_progress(job_id, **extras)
+        elif tag == MSG_STAGE_LEDGER:
+            _, ledger = item
+            store.update_stage_ledger(job_id, ledger)
         elif tag == MSG_LOG:
             _, colored, plain = item
             try:

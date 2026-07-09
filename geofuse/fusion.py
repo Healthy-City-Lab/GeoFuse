@@ -55,6 +55,12 @@ _log = get_logger("FUSION")
 # the heap. Smaller rasters stay in RAM (faster per-point reads).
 _LAZY_RASTER_THRESHOLD_BYTES = 256 * 1024 * 1024
 
+# Files whose buffered-extent shortfall has already been reported this process,
+# keyed by (abspath, rounded bounds). A cached NDVI file's sub-pixel shortfall
+# is permanent, so without this the multi-outcome loop (a fresh engine per
+# outcome) and every repeated run would re-emit the same warning.
+_WARNED_METRIC_BOUNDS: set[tuple] = set()
+
 
 class MetricFusionEngine:
     """
@@ -149,6 +155,12 @@ class MetricFusionEngine:
 
         attach_external_logger("optuna", _logging.INFO)
         attach_external_logger("ee", _logging.INFO)
+        # This module's own stdlib ``logger`` (``geofuse.fusion``) carries
+        # engine diagnostics — bounds checks, metric load notes, cache messages.
+        # Attaching it routes those into the per-job log (and stops them
+        # propagating to the host terminal) alongside the engine's ``_log``
+        # output, instead of leaking to the backend console.
+        attach_external_logger("geofuse.fusion", _logging.INFO)
 
         self.target_file = target_file
         self.target_feature = target_feature
@@ -749,6 +761,36 @@ class MetricFusionEngine:
         )
         return cropped
 
+    def adopt_metric_data(
+        self,
+        veg_data,
+        terrain_data,
+        ndvi_data,
+        *,
+        ndvi_resolution_m: float | None = None,
+        gvi_grid_spacing_m: float | None = None,
+    ) -> None:
+        """Reuse already-loaded, already-cropped metric frames from another engine.
+
+        Multi-outcome fusion builds a fresh engine per outcome, but every outcome
+        shares the same target file, buffer, and metric paths, so the cropped
+        veg / terrain / NDVI sources are identical. Adopting the first engine's
+        frames skips N-fold file reads, reprojection, cropping, and spatial-index
+        rebuilds. The frames are treated as read-only downstream (spatial-index
+        caching onto the shared GeoDataFrame only makes later engines faster), so
+        sharing references is safe. The two sampling-grid steps are carried over
+        because they drive aggregation, not just download, and are otherwise only
+        set inside :meth:`load_metrics`.
+        """
+        self.veg_data = veg_data
+        self.terrain_data = terrain_data
+        self.ndvi_data = ndvi_data
+        if ndvi_resolution_m is not None:
+            self._ndvi_export_resolution_m = float(ndvi_resolution_m)
+        if gvi_grid_spacing_m is not None:
+            self._gvi_grid_spacing_m = float(gvi_grid_spacing_m)
+        self._clear_ring_caches()
+
     def load_metrics(
         self,
         veg_file: str | None = None,
@@ -1040,27 +1082,91 @@ class MetricFusionEngine:
         )
 
     def _validate_metric_bounds(self, metric_file: str) -> bool:
-        """Check if manually provided metric covers the buffered extent."""
-        if metric_file.endswith((".tif", ".tiff")):
+        """Warn only when a metric misses the buffered extent beyond real slack.
+
+        Earth Engine exports snap to their pixel grid, and reprojecting the
+        extent transforms only the box's corners (the true region bulges past
+        the straight-edged polygon), so a file downloaded for this very extent
+        routinely falls a fraction of a pixel short on an edge. Strict
+        containment flags that harmless shortfall; instead the gap is measured
+        in metres and only a shortfall beyond ``max(2·pixel, 20 m)`` (rasters)
+        or ``20 m`` (vectors) is reported — once per file per process, with the
+        size of the gap and the share of the extent left uncovered.
+
+        Returns ``True`` when coverage is within tolerance, ``False`` otherwise.
+        """
+        is_raster = metric_file.endswith((".tif", ".tiff"))
+        px = py = 0.0
+        if is_raster:
             with rasterio.open(metric_file) as src:
                 metric_box = box(*src.bounds)
                 metric_crs = src.crs
+                px, py = abs(src.transform.a), abs(src.transform.e)
         else:
             metric_gdf = gpd.read_file(metric_file)
             metric_box = box(*metric_gdf.total_bounds)
             metric_crs = metric_gdf.crs
 
-        # Reproject extent to metric CRS for comparison
-        extent_reprojected = self.buffered_extent.to_crs(metric_crs)
-        extent_box = extent_reprojected.geometry.iloc[0]
+        # Measure the shortfall in metres: reproject both boxes into a metre CRS
+        # (the metric CRS itself if already projected, otherwise a local UTM).
+        extent_in_metric = self.buffered_extent.to_crs(metric_crs)
+        if getattr(metric_crs, "is_geographic", True):
+            measure_crs = estimate_metre_projected_crs_for_gdf(extent_in_metric)
+        else:
+            measure_crs = metric_crs
+        ext_m = extent_in_metric.to_crs(measure_crs).geometry.iloc[0]
+        met_m = gpd.GeoSeries([metric_box], crs=metric_crs).to_crs(measure_crs).iloc[0]
+        exb, meb = ext_m.bounds, met_m.bounds  # (minx, miny, maxx, maxy), metres
+        shortfalls = {
+            "west": max(0.0, meb[0] - exb[0]),
+            "south": max(0.0, meb[1] - exb[1]),
+            "east": max(0.0, exb[2] - meb[2]),
+            "north": max(0.0, exb[3] - meb[3]),
+        }
+        worst_edge = max(shortfalls, key=shortfalls.__getitem__)
+        max_short = shortfalls[worst_edge]
 
-        if not metric_box.contains(extent_box):
-            logger.warning(
-                f"Metric file {metric_file} does not fully cover buffered extent. "
-                "Results may be incomplete."
+        if is_raster:
+            # Convert a geographic pixel to metres via the box's own deg→m scale.
+            if getattr(metric_crs, "is_geographic", True):
+                deg_w = metric_box.bounds[2] - metric_box.bounds[0]
+                scale = ((meb[2] - meb[0]) / deg_w) if deg_w > 0 else 111_320.0
+                pixel_m = max(px, py) * scale
+            else:
+                pixel_m = max(px, py)
+            tolerance_m = max(2.0 * pixel_m, 20.0)
+        else:
+            tolerance_m = 20.0
+
+        if max_short <= tolerance_m:
+            return True
+
+        try:
+            uncovered_pct = (
+                100.0 * (1.0 - ext_m.intersection(met_m).area / ext_m.area)
+                if ext_m.area > 0
+                else float("nan")
             )
-            return False
-        return True
+        except Exception:
+            uncovered_pct = float("nan")
+
+        key = (
+            os.path.abspath(metric_file),
+            tuple(round(b, 3) for b in metric_box.bounds),
+        )
+        if key not in _WARNED_METRIC_BOUNDS:
+            _WARNED_METRIC_BOUNDS.add(key)
+            logger.warning(
+                "%s metric falls short of the buffered extent by up to %.0f m on "
+                "the %s edge (~%.1f%% of the extent uncovered); rings near that "
+                "edge will be partially empty. File: %s",
+                "Raster" if is_raster else "Vector",
+                max_short,
+                worst_edge,
+                uncovered_pct,
+                metric_file,
+            )
+        return False
 
     def _load_metric_file(self, filepath: str) -> gpd.GeoDataFrame | dict:
         """Load metric from GeoJSON or GeoTIFF."""

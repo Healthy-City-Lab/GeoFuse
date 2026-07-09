@@ -37,7 +37,7 @@ from geofuse.crs_utils import (
 )
 from geofuse.gvi import GVIEngine
 from geofuse.jobs import progress_interval_s
-from geofuse.jobs.stage_ledger import DONE, RUNNING, StageLedger
+from geofuse.jobs.stage_ledger import DONE, RUNNING, SKIPPED, StageLedger
 from geofuse.logger import get_logger
 from geofuse.longitudinal import (
     GREENERY_CHANNELS,
@@ -643,27 +643,71 @@ def _fusion_config_fingerprint(
 
 
 # ---------------------------------------------------------------------------
-# Nested-CV helpers
+# Fusion pipeline / stage-ledger helpers
 # ---------------------------------------------------------------------------
 
 
 # Ordered pipeline steps a fusion run moves through per target outcome. The
 # staged-resume ledger (geofuse.jobs.stage_ledger) records each so the monitor
 # shows where a run is and a stopped job reports where it left off. Resume itself
-# is content-addressed (metric cache, pre-aggregation cache, Optuna study), so
-# re-running the same job reuses/resumes each on-disk artifact transparently —
-# the ledger is the visibility layer over that durability.
+# is content-addressed (metric cache, pre-aggregation cache), so re-running the
+# same job reuses/resumes each on-disk artifact transparently — the ledger is
+# the visibility layer over that durability. The heavy stages map one-to-one
+# onto real work: ``optimize`` is the bootstrap stability search (the dominant
+# compute, and where the "k/N trials" sub-bar lives), ``evaluate`` scores the
+# winning weights once on the held-out test set (fast), and ``report_stats``
+# runs the replicate statistics — test-set bootstrap CIs, effect sizes, and
+# permutation tests — that form the long tail users otherwise misread as
+# "evaluating".
 _FUSION_STAGE_STEPS: tuple[tuple[str, str], ...] = (
     ("load_target", "Load target"),
     ("load_metrics", "Load metric maps"),
     ("preaggregate", "Spatial pre-processing"),
     ("split", "Split train / test folds"),
-    ("optimize", "Optimize CGI study"),
-    ("robust", "Filter robust trials"),
-    ("evaluate", "Evaluate on test"),
+    ("optimize", "Stability selection (bootstrap search)"),
+    ("evaluate", "Score held-out test set"),
+    ("report_stats", "Bootstrap CIs, effects & permutation tests"),
     ("apply", "Apply fusion weights"),
     ("reports", "Generate reports and composite map"),
 )
+
+# Relative wall-time weights for the main progress bar. Bootstrap searches
+# dominate a run; the replicate-statistics tail is the next largest cost, while
+# I/O and apply stages are comparatively instant. Weighting keeps the ledger-
+# derived bar monotonic *and* roughly time-proportional instead of leaping to
+# ~50 % the moment the fast setup stages finish.
+_FUSION_STAGE_WEIGHTS: dict[str, float] = {
+    "load_target": 1.0,
+    "load_metrics": 2.0,
+    "prepare_longitudinal": 1.0,
+    "preaggregate": 3.0,
+    "split": 1.0,
+    "optimize": 20.0,
+    "evaluate": 1.0,
+    "report_stats": 8.0,
+    "apply": 1.0,
+    "mixedlm_postscore": 2.0,
+    "reports": 1.0,
+}
+_FUSION_STANDALONE_SEARCH_WEIGHT = 20.0
+_FUSION_STANDALONE_REPORT_WEIGHT = 8.0
+
+
+def _fusion_stage_weight(stage_key: str) -> float:
+    """Relative wall-time weight of a ledger stage key (see _FUSION_STAGE_WEIGHTS).
+
+    Strips the ``"<label>::"`` multi-outcome prefix, then maps standalone
+    search / report keys onto their dedicated weights and everything else onto
+    the per-step table. Unknown steps default to unit weight.
+    """
+    step = stage_key.split("::", 1)[1] if "::" in stage_key else stage_key
+    if step.startswith("standalone_"):
+        return (
+            _FUSION_STANDALONE_REPORT_WEIGHT
+            if step.endswith("_report")
+            else _FUSION_STANDALONE_SEARCH_WEIGHT
+        )
+    return _FUSION_STAGE_WEIGHTS.get(step, 1.0)
 
 # Mixed-effects fusion inserts an extra step before pre-aggregation: load
 # the per-wave target frames (wide intake only) and the per-wave greenery
@@ -1050,11 +1094,10 @@ def _build_fusion_ledger(
 ) -> StageLedger:
     """Fresh ledger covering every (outcome, step) pair in run order.
 
-    For each outcome the 8-step CGI pipeline (`_FUSION_STAGE_STEPS`) lands
-    first, then one stage per enabled standalone metric — those reuse the
-    already-built split + pre-aggregation cache, so each is a single
-    optimize/robust/evaluate burst that's compact enough to fit in one
-    ledger row. When ``longitudinal`` is true an extra
+    For each outcome the CGI pipeline (`_FUSION_STAGE_STEPS`) lands first, then
+    two stages per enabled standalone metric — the stability search and the
+    test scoring / reporting that follows it. Standalones reuse the already-
+    built split + pre-aggregation cache. When ``longitudinal`` is true an extra
     ``prepare_longitudinal`` stage is inserted between ``load_metrics`` and
     ``preaggregate`` to cover per-wave file loading. The MixedLM
     post-score stage is only added when ``mixedlm_postscore`` is true
@@ -1085,11 +1128,19 @@ def _build_fusion_ledger(
                 ps_disp = f"[{label}] {ps_label}" if multi else ps_label
                 steps.append((ps_key, ps_disp))
         for ch in standalones:
-            key = _fusion_stage_key(label, f"standalone_{ch}", multi=multi)
             ch_lbl = _STANDALONE_CHANNEL_LABELS.get(ch, ch)
-            disp_step = f"Standalone {ch_lbl} study"
-            disp = f"[{label}] {disp_step}" if multi else disp_step
-            steps.append((key, disp))
+            search_key = _fusion_stage_key(label, f"standalone_{ch}", multi=multi)
+            report_key = _fusion_stage_key(
+                label, f"standalone_{ch}_report", multi=multi
+            )
+            search_step = f"Standalone {ch_lbl} stability selection"
+            report_step = f"Standalone {ch_lbl} test scoring & reports"
+            steps.append(
+                (search_key, f"[{label}] {search_step}" if multi else search_step)
+            )
+            steps.append(
+                (report_key, f"[{label}] {report_step}" if multi else report_step)
+            )
     return StageLedger.from_steps(steps)
 
 
@@ -1306,7 +1357,6 @@ def run_fusion(
     ndvi_project_id: str | None = None,
     multi_objective_requested: bool = False,
     output_dir: str,
-    MetricFusionEngine,
     target_display_name: str = "target",
     resume_existing_study: bool = True,
     cgi_formula: str = "weighted_average",
@@ -1357,6 +1407,11 @@ def run_fusion(
     are stable well below the higher figure), the effects bootstrap /
     permutation counts, and the paired CGI-vs-standalone bootstrap."""
     try:
+        # Imported here (not at module load) so the runner module stays light
+        # and the fusion engine is only pulled into the process that runs the
+        # job — the spawn child, where fusion now executes.
+        from geofuse.fusion import MetricFusionEngine
+
         targets = list(target_features_geojson) if target_features_geojson else [None]
         n_t = max(len(targets), 1)
         multi_outcome = len([t for t in targets if t is not None]) > 1
@@ -1408,7 +1463,6 @@ def run_fusion(
             )
 
         by_target: dict = {}
-        engines_by_target: dict = {}
         output_paths: list[str] = []
 
         # Pre-compute every outcome label so the staged-resume ledger can list
@@ -1492,6 +1546,25 @@ def run_fusion(
             )
             ctx.update_stage_ledger(ledger.to_dict())
 
+        # Per-stage monotonic-time gate for ``stage_progress``. ``update_stage_
+        # ledger`` writes SQLite synchronously (unlike the memory-only
+        # ``update_progress``), so per-trial fractional updates must be
+        # throttled or they hammer the store.
+        _stage_prog_t: dict[str, float] = {}
+
+        def stage_progress(key: str, frac: float, message: str = "") -> None:
+            """Advance a *running* stage's fractional progress, throttled to ~1/s.
+
+            The final tick (``frac >= 1``) always writes so the ledger row lands
+            on its true endpoint; intermediate ticks are gated at 1 s per stage.
+            """
+            now = time.monotonic()
+            if frac < 1.0 and (now - _stage_prog_t.get(key, 0.0)) < 1.0:
+                return
+            _stage_prog_t[key] = now
+            ledger.mark_progress(key, frac, message)
+            ctx.update_stage_ledger(ledger.to_dict())
+
         cache_dir = os.path.join(output_dir, "fusion_cache")
 
         # Per-run artifact folder so reruns don't overwrite each other.
@@ -1503,6 +1576,13 @@ def run_fusion(
             output_dir, "fusion", f"{job_stamp}__{_job_short}"
         )
         os.makedirs(job_artifacts_root, exist_ok=True)
+
+        # Cross-sectional metric sources (cropped veg / terrain / NDVI frames)
+        # depend only on the shared target extent + buffer, so they're loaded
+        # once and adopted by every later outcome's engine — no N-fold re-read.
+        # ``None`` until the first outcome loads them; longitudinal mode routes
+        # per-wave files instead and leaves this unused.
+        shared_metric_data: tuple | None = None
 
         for ti, target_feature in enumerate(targets):
             if ctx.is_cancelled():
@@ -1517,8 +1597,43 @@ def run_fusion(
             def prog(local: float) -> float:
                 return (ti + local) / n_t
 
+            # Stage keys belonging to this outcome, for the ledger-derived main
+            # progress bar. For multi-outcome runs keys carry a "<label>::"
+            # prefix; single-outcome runs own the whole ledger.
+            _label_prefix = f"{label}::" if multi_outcome else None
+            label_stage_keys = [
+                s.key
+                for s in ledger.stages
+                if _label_prefix is None or s.key.startswith(_label_prefix)
+            ]
+            _label_total_weight = sum(
+                _fusion_stage_weight(k) for k in label_stage_keys
+            )
+
+            def prog_ledger() -> float:
+                """Main-bar value derived from this outcome's ledger state.
+
+                ``(finished + running·progress)`` weighted by
+                ``_fusion_stage_weight`` over the outcome's total weight, mapped
+                into the outcome's slice via ``prog``. Monotonic by construction
+                — stages only advance and a running stage's fraction only grows.
+                """
+                if _label_total_weight <= 0:
+                    return prog(0.0)
+                done = 0.0
+                for k in label_stage_keys:
+                    st_ = ledger.get(k)
+                    if st_ is None:
+                        continue
+                    w = _fusion_stage_weight(k)
+                    if st_.status in (DONE, SKIPPED):
+                        done += w
+                    elif st_.status == RUNNING:
+                        done += w * st_.progress
+                return prog(done / _label_total_weight)
+
             ctx.progress(
-                value=prog(0.05),
+                value=prog_ledger(),
                 status_text=f"{prefix}Initializing fusion engine...",
             )
 
@@ -1562,29 +1677,31 @@ def run_fusion(
                 residualize_method=residualize_method,
             )
 
-            ctx.progress(value=prog(0.1), status_text=f"{prefix}Loading target data...")
+            ctx.progress(
+                value=prog_ledger(), status_text=f"{prefix}Loading target data..."
+            )
             stage(skey("load_target"), RUNNING)
             engine.load_target()
             stage(skey("load_target"), DONE)
 
             if not veg_path:
                 ctx.progress(
-                    value=prog(0.15),
+                    value=prog_ledger(),
                     status_text=f"{prefix}Downloading GVI Vegetation data...",
                 )
             elif not terrain_path:
                 ctx.progress(
-                    value=prog(0.20),
+                    value=prog_ledger(),
                     status_text=f"{prefix}Downloading GVI Terrain data...",
                 )
             elif not ndvi_path:
                 ctx.progress(
-                    value=prog(0.25),
+                    value=prog_ledger(),
                     status_text=f"{prefix}Downloading NDVI satellite data...",
                 )
             else:
                 ctx.progress(
-                    value=prog(0.15),
+                    value=prog_ledger(),
                     status_text=f"{prefix}Loading provided metric files...",
                 )
 
@@ -1615,20 +1732,40 @@ def run_fusion(
 
             stage(skey("load_metrics"), RUNNING)
             if longitudinal_spec is None:
-                engine.load_metrics(
-                    veg_file=veg_path,
-                    terrain_file=terrain_path,
-                    ndvi_file=ndvi_path,
-                    cache_metrics=cache_metrics,
-                    gvi_api_key=gvi_api_key,
-                    ndvi_start_date=ndvi_start_date,
-                    ndvi_end_date=ndvi_end_date,
-                    ndvi_project_id=ndvi_project_id,
-                    progress_callback=gvi_progress_callback,
-                    cancel_callback=cancel_check,
-                    ndvi_resolution_m=ndvi_resolution_m,
-                    gvi_grid_spacing_m=gvi_grid_spacing_m,
-                )
+                if shared_metric_data is None:
+                    engine.load_metrics(
+                        veg_file=veg_path,
+                        terrain_file=terrain_path,
+                        ndvi_file=ndvi_path,
+                        cache_metrics=cache_metrics,
+                        gvi_api_key=gvi_api_key,
+                        ndvi_start_date=ndvi_start_date,
+                        ndvi_end_date=ndvi_end_date,
+                        ndvi_project_id=ndvi_project_id,
+                        progress_callback=gvi_progress_callback,
+                        cancel_callback=cancel_check,
+                        ndvi_resolution_m=ndvi_resolution_m,
+                        gvi_grid_spacing_m=gvi_grid_spacing_m,
+                    )
+                    shared_metric_data = (
+                        engine.veg_data,
+                        engine.terrain_data,
+                        engine.ndvi_data,
+                    )
+                else:
+                    # Every outcome shares the same target extent + metric
+                    # paths, so reuse the first outcome's cropped frames instead
+                    # of re-reading them from disk.
+                    engine.adopt_metric_data(
+                        *shared_metric_data,
+                        ndvi_resolution_m=ndvi_resolution_m,
+                        gvi_grid_spacing_m=gvi_grid_spacing_m,
+                    )
+                    _log_fusion(
+                        "INFO",
+                        f"[{label}] Reusing metric data loaded for the first "
+                        "outcome (skipped re-reading veg / terrain / NDVI).",
+                    )
             else:
                 # Longitudinal mode bypasses ``load_metrics`` (whose path
                 # builds one cross-sectional source per channel); the per-
@@ -1647,7 +1784,7 @@ def run_fusion(
             if longitudinal_spec is not None:
                 stage(skey("prepare_longitudinal"), RUNNING)
                 ctx.progress(
-                    value=prog(0.26),
+                    value=prog_ledger(),
                     status_text=f"{prefix}Loading per-wave files...",
                 )
                 # Year-aware cross-sectional
@@ -1708,7 +1845,7 @@ def run_fusion(
             # "spatial pre-processing" stage; prepare_fusion_data feeds the cache.
             stage(skey("preaggregate"), RUNNING)
             ctx.progress(
-                value=prog(0.28),
+                value=prog_ledger(),
                 status_text=(
                     f"{prefix}Preparing fusion samples "
                     "(can take a while on large polygon targets)..."
@@ -1736,8 +1873,9 @@ def run_fusion(
                         "percent": pct,
                     }
                 )
+                stage_progress(skey("preaggregate"), pct / 100.0)
                 ctx.progress(
-                    value=prog(0.30 + 0.04 * pct / 100),
+                    value=prog_ledger(),
                     status_text=(
                         f"{prefix}Spatial pre-processing: "
                         f"{current:,}/{total:,} grid cells ({pct}%)"
@@ -1835,7 +1973,7 @@ def run_fusion(
             # selection resamples.
             stage(skey("split"), RUNNING)
             ctx.progress(
-                value=prog(0.89),
+                value=prog_ledger(),
                 status_text=f"{prefix}Splitting data into train / val / test...",
             )
             engine.split_data(
@@ -1906,12 +2044,15 @@ def run_fusion(
                     f"×{_standalone_cells / _cgi_cells:.2f}).",
                 )
 
-            def _study_progress_cb(study_label: str):
-                """Per-trial callback → live caption + secondary trial bar.
+            def _study_progress_cb(study_label: str, stage_key: str | None = None):
+                """Per-trial callback → live caption, trial bar, and stage row.
 
                 Throttled to ~0.4 s (always fires on the final trial) so the
                 job card shows "<study>: k / N trials" without flooding the
-                store. Leaves the stage-driven main bar untouched.
+                store. When ``stage_key`` is given it also advances that
+                running search stage's ledger fraction (via ``stage_progress``,
+                which self-throttles the synchronous SQLite write) and steps the
+                ledger-derived main bar.
                 """
                 state = {"t": 0.0}
 
@@ -1921,8 +2062,14 @@ def run_fusion(
                         return
                     state["t"] = now
                     pct = (100.0 * done / total) if total else 0.0
+                    if stage_key is not None:
+                        stage_progress(
+                            stage_key,
+                            (done / total) if total else 0.0,
+                            f"{done:,}/{total:,} trials",
+                        )
                     ctx.progress(
-                        value=None,
+                        value=prog_ledger() if stage_key is not None else None,
                         status_text=f"{prefix}{study_label}: {done:,}/{total:,} trials",
                         fusion_study_progress={
                             "study": study_label,
@@ -1934,41 +2081,23 @@ def run_fusion(
 
                 return _cb
 
+            # A non-positive cap means "no PFER cap" — pass None so the
+            # calibration is free to grow the selection size K.
+            max_pfer_arg = None if float(max_pfer) <= 0 else float(max_pfer)
+
+            # ── Stability selection: the dominant compute ──
+            # Headline params: the stability-selection winning weight cell on
+            # the full train+val pool (params averaged within the cell). The
+            # "CGI: k/N trials" sub-bar and the running-stage fraction both live
+            # here, so the running stage and the trial counter agree.
             stage(skey("optimize"), RUNNING)
             ctx.progress(
-                value=prog(0.90),
+                value=prog_ledger(),
                 status_text=(
                     f"{prefix}Stability selection "
                     f"({int(n_bootstraps)}×{cgi_trials_per_bootstrap})..."
                 ),
             )
-            # Stability selection has no master Optuna study; ``best_params``
-            # stays empty and the winning cell is computed in the evaluate
-            # stage below.
-            best_params: dict = {}
-            if ctx.is_cancelled():
-                return {"output_paths": output_paths}
-            stage(skey("optimize"), DONE)
-
-            stage(skey("robust"), RUNNING)
-            ctx.progress(
-                value=prog(0.85),
-                status_text=f"{prefix}Aggregating bootstrap cells...",
-            )
-            # No master Optuna study to filter — the robust pool is implicit in
-            # the per-cell OOB aggregation stability selection performs.
-            robust_trials: list = []
-            stage(skey("robust"), DONE)
-
-            stage(skey("evaluate"), RUNNING)
-            ctx.progress(
-                value=prog(0.9), status_text=f"{prefix}Evaluating on test set..."
-            )
-            # A non-positive cap means "no PFER cap" — pass None so the
-            # calibration is free to grow the selection size K.
-            max_pfer_arg = None if float(max_pfer) <= 0 else float(max_pfer)
-            # Headline params: the stability-selection winning weight cell on
-            # the full train+val pool (params averaged within the cell).
             headline_params = engine.bootstrap_stability_selection(
                 metric=objective_metric,
                 n_bootstraps=int(n_bootstraps),
@@ -1980,13 +2109,46 @@ def run_fusion(
                 spatial_resample=bool(spatial_split),
                 seed=42,
                 cancel_callback=cancel_check,
-                progress_callback=_study_progress_cb("CGI"),
+                progress_callback=_study_progress_cb("CGI", skey("optimize")),
             )
             engine.best_params = dict(headline_params)
             cgi_stability_summary = _stability_summary(headline_params)
+            # Kept for the results bundle's schema. Stability selection has no
+            # master Optuna study, so there is no explicit best/robust trial
+            # pool — the winning cell is the aggregate over bootstrap resamples.
+            best_params: dict = {}
+            robust_trials: list = []
+            if ctx.is_cancelled():
+                return {"output_paths": output_paths}
+            stage(skey("optimize"), DONE)
 
+            # ── Score the held-out test set: fast, the honest "evaluate" ──
+            stage(skey("evaluate"), RUNNING)
+            ctx.progress(
+                value=prog_ledger(),
+                status_text=f"{prefix}Scoring held-out test set...",
+            )
             test_results = engine.evaluate_on_test(
                 params=headline_params, metric=objective_metric
+            )
+            stage(skey("evaluate"), DONE)
+
+            # ── Replicate statistics: the long tail ──
+            # Test-set percentile bootstrap CI, relationship direction, and the
+            # held-out effect sizes / permutation p-value — thousands of
+            # replicates, named for what it is instead of hiding under
+            # "evaluate".
+            stage(
+                skey("report_stats"),
+                RUNNING,
+                f"Test CI: {report_ci_n:,} bootstrap replicates...",
+            )
+            ctx.progress(
+                value=prog_ledger(),
+                status_text=(
+                    f"{prefix}Bootstrap CIs, effects & permutation tests "
+                    f"({report_ci_n:,} replicates)..."
+                ),
             )
             # Independent held-out effect size + percentile bootstrap CI.
             try:
@@ -2035,11 +2197,11 @@ def run_fusion(
             # No master Optuna study in stability mode, so there is no per-trial
             # test sidecar to build.
             cgi_per_trial_test: dict[int, dict[str, float]] = {}
-            stage(skey("evaluate"), DONE)
+            stage(skey("report_stats"), DONE)
 
             stage(skey("apply"), RUNNING)
             ctx.progress(
-                value=prog(0.95), status_text=f"{prefix}Applying fusion weights..."
+                value=prog_ledger(), status_text=f"{prefix}Applying fusion weights..."
             )
             composite_df = engine.apply_fusion()
             stage(skey("apply"), DONE)
@@ -2056,7 +2218,7 @@ def run_fusion(
             if mixedlm_postscore_enabled:
                 stage(skey("mixedlm_postscore"), RUNNING)
                 ctx.progress(
-                    value=prog(0.97),
+                    value=prog_ledger(),
                     status_text=(
                         f"{prefix}Scoring all MixedLM metrics on robust trials..."
                     ),
@@ -2102,7 +2264,7 @@ def run_fusion(
                 ch_disp = _STANDALONE_CHANNEL_LABELS.get(ch, ch)
                 stage(skey(f"standalone_{ch}"), RUNNING)
                 ctx.progress(
-                    value=prog(0.95),
+                    value=prog_ledger(),
                     status_text=(
                         f"{prefix}Standalone {ch_disp} stability selection "
                         f"({int(n_bootstraps)}×{int(n_trials_per_bootstrap)})..."
@@ -2126,12 +2288,22 @@ def run_fusion(
                     spatial_resample=bool(spatial_split),
                     seed=42,
                     cancel_callback=cancel_check,
-                    progress_callback=_study_progress_cb(f"Standalone: {ch_disp}"),
+                    progress_callback=_study_progress_cb(
+                        f"Standalone: {ch_disp}", skey(f"standalone_{ch}")
+                    ),
                 )
                 engine.best_params = dict(ch_best)
                 ch_headline_params = dict(ch_best)
                 ch_stability_summary = _stability_summary(ch_best)
+                stage(skey(f"standalone_{ch}"), DONE)
 
+                # Test scoring, CIs, subset scores, composite TIFF, and the
+                # optional MixedLM post-score form this channel's report stage.
+                stage(skey(f"standalone_{ch}_report"), RUNNING)
+                ctx.progress(
+                    value=prog_ledger(),
+                    status_text=f"{prefix}Standalone {ch_disp} test scoring & reports...",
+                )
                 ch_test = engine.evaluate_on_test(
                     params=ch_headline_params, metric=objective_metric
                 )
@@ -2241,7 +2413,7 @@ def run_fusion(
                             f"[{label}] Standalone {ch} post-hoc MixedLM "
                             f"scoring failed: {exc}",
                         )
-                stage(skey(f"standalone_{ch}"), DONE)
+                stage(skey(f"standalone_{ch}_report"), DONE)
 
             # Restore the engine to its CGI state so downstream code that reads
             # ``engine.best_params`` / ``engine._active_greenery_channel`` sees
@@ -2342,7 +2514,7 @@ def run_fusion(
             # already captured in ``bundle``.
             stage(skey("reports"), RUNNING)
             ctx.progress(
-                value=prog(0.98),
+                value=prog_ledger(),
                 status_text=f"{prefix}Generating reports + composite GeoTIFF...",
             )
             report_dir = os.path.join(job_artifacts_root, "study_results")
@@ -2439,7 +2611,6 @@ def run_fusion(
                 "cgi_vs_standalone_paired_family": cgi_vs_standalone_paired_family,
             }
             by_target[label] = bundle
-            engines_by_target[label] = engine
 
             # Persist every test result (CGI + standalones) to disk: a
             # machine-readable manifest plus tidy CSVs. Best-effort — a write
@@ -2479,10 +2650,17 @@ def run_fusion(
         if not multi_outcome:
             results_payload.update(by_target[sole_label])
 
+        # Fusion runs in a spawn child, so live engine objects (unpicklable and
+        # large) never cross the process boundary. Ship only the JSON-safe
+        # results — the same payload persisted below — with no live engine. The
+        # results view hydrates from this exactly as it does from disk after a
+        # Streamlit restart: the composite viewer reads its GeoTIFFs from disk
+        # and simply omits the live-engine target overlay.
+        jsonsafe_payload = _jsonsafe_results(results_payload)
         ctx.set_extra(
-            engine=None if multi_outcome else engines_by_target[sole_label],
-            engines_by_target=engines_by_target,
-            results=results_payload,
+            engine=None,
+            engines_by_target={},
+            results=jsonsafe_payload,
             artifacts_dir=job_artifacts_root,
         )
 
@@ -2492,7 +2670,7 @@ def run_fusion(
         try:
             bundle_json_path = os.path.join(job_artifacts_root, "results_bundle.json")
             with open(bundle_json_path, "w", encoding="utf-8") as _bf:
-                json.dump(_jsonsafe_results(results_payload), _bf, default=str)
+                json.dump(jsonsafe_payload, _bf, default=str)
             output_paths.append(bundle_json_path)
         except Exception as exc:
             _log_fusion("WARN", f"Could not write results bundle JSON: {exc}")

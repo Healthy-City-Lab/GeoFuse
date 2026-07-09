@@ -244,14 +244,57 @@ def _render_stage_ledger(rec) -> None:
         "error",
     }
     with st.expander(f"Stages ({done_count}/{total})", expanded=expanded):
+        # Group multi-outcome ledgers by their "<label>::" key prefix. Finished
+        # or not-yet-started outcomes collapse to one summary line and only the
+        # active outcome shows per-stage detail — a 10-outcome run renders a
+        # handful of lines per tick instead of ~110, which is what makes the
+        # foreground monitor cheap.
+        groups: dict[str | None, list] = {}
+        order: list[str | None] = []
         for s in stages:
-            icon = _STAGE_ICONS.get(s.get("status", "pending"), "⬜")
-            label = s.get("label") or s.get("key", "")
-            msg = s.get("message") or ""
-            line = f"{icon} {label}"
-            if msg:
-                line += f" — _{msg}_"
-            st.markdown(line)
+            key = s.get("key", "")
+            label = key.split("::", 1)[0] if "::" in key else None
+            if label not in groups:
+                groups[label] = []
+                order.append(label)
+            groups[label].append(s)
+
+        multi = any(label is not None for label in order)
+        for label in order:
+            grp = groups[label]
+            if not multi:
+                for s in grp:
+                    _render_stage_line(s)
+                continue
+            g_done = sum(1 for s in grp if s.get("status") in _STAGE_FINISHED)
+            g_total = len(grp)
+            g_running = any(s.get("status") == "running" for s in grp)
+            g_active = g_running or (0 < g_done < g_total)
+            if not g_active:
+                icon = "✅" if g_done == g_total else "⬜"
+                st.markdown(f"{icon} **{label}** — {g_done}/{g_total} stages")
+            else:
+                st.markdown(f"**{label}** — {g_done}/{g_total} stages")
+                for s in grp:
+                    _render_stage_line(s)
+
+
+def _render_stage_line(s: dict) -> None:
+    """Render one ledger stage as an icon + label (+ optional message)."""
+    icon = _STAGE_ICONS.get(s.get("status", "pending"), "⬜")
+    label = s.get("label") or s.get("key", "")
+    msg = s.get("message") or ""
+    line = f"{icon} {label}"
+    if msg:
+        line += f" — _{msg}_"
+    st.markdown(line)
+
+
+# Cache the ANSI→HTML conversion of a job's log tail so the per-second-ish
+# fragment rerun doesn't re-run the regex over ~100 lines every tick. Keyed on
+# (job id, line count, last line) — the tail only grows, so that triple changes
+# exactly when the rendered HTML would. One entry per job (process-wide).
+_LOG_HTML_CACHE: dict[str, tuple[tuple[int, str], str]] = {}
 
 
 def _render_logs(rec_id: str) -> None:
@@ -260,7 +303,12 @@ def _render_logs(rec_id: str) -> None:
     if not lines:
         st.caption("(no log output captured yet)")
         return
-    st.markdown(ansi_log_lines_to_html(lines), unsafe_allow_html=True)
+    cache_key = (len(lines), lines[-1])
+    cached = _LOG_HTML_CACHE.get(rec_id)
+    if cached is None or cached[0] != cache_key:
+        cached = (cache_key, ansi_log_lines_to_html(lines))
+        _LOG_HTML_CACHE[rec_id] = cached
+    st.markdown(cached[1], unsafe_allow_html=True)
 
 
 def _render_job_card(rec, store) -> None:
@@ -383,12 +431,14 @@ def render_sidebar_job_monitor() -> None:
     """Render the all-jobs monitor inside ``st.sidebar``.
 
     Pulls every record from the shared :class:`JobStore` and renders one
-    card per job. The fragment reruns once per second to pick up
-    in-flight progress updates without forcing a full page rerun.
+    card per job. The fragment reruns every two seconds to pick up in-flight
+    progress updates without forcing a full page rerun — 2 s (rather than 1 s)
+    halves the foreground render cost that competes with running jobs for the
+    GIL, while staying responsive enough for a progress monitor.
     """
     store = get_job_store()
 
-    @st.fragment(run_every=1)
+    @st.fragment(run_every=2)
     def _fragment():
         st.header("Job Monitor")
 

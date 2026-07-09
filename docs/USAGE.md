@@ -19,7 +19,7 @@ streamlit run ui/app.py
 | **HPC Monitoring** 🚧 | *Work in progress (incomplete).* Track HPC CLI jobs by Job ID. Interactive jobs are tracked in the sidebar Job Monitor instead. |
 
 > [!NOTE]
-> Jobs survive a browser refresh. Progress is tracked in the **sidebar Job Monitor**, visible from every tab, for all job types (GVI, NDVI, Fusion). GVI runs in a separate process so the UI stays responsive; NDVI and Fusion run inside the Streamlit process. Multiple study areas with different settings can run in parallel.
+> Jobs survive a browser refresh. Progress is tracked in the **sidebar Job Monitor**, visible from every tab, for all job types (GVI, NDVI, Fusion). GVI, NDVI, and Fusion each run in a separate process so the UI stays responsive and a running job isn't slowed down by keeping the browser tab in the foreground. Multiple study areas with different settings can run in parallel.
 
 ### Typical workflow
 
