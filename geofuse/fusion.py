@@ -5794,6 +5794,12 @@ class MetricFusionEngine:
             # The df-selected smooth so downstream bootstrap / permutation CIs can
             # condition on the same spatial adjustment the score used.
             result["spatial_basis"] = test_sb
+            # Longitudinal keys so the held-out CI can cluster-resample entities
+            # (and refit the MixedLM per replicate). ``None`` in cross-sectional
+            # mode; the OLS reporting path ignores them.
+            if self.is_longitudinal:
+                result["entity_id"] = test_entity_id
+                result["years_since_baseline"] = test_ysb
 
         self._evaluate_test_cache[memo_key] = result
         while len(self._evaluate_test_cache) > 256:
@@ -5945,6 +5951,13 @@ class MetricFusionEngine:
         between full and partial residual scoring based on whether covariates
         are supplied.
 
+        Longitudinal runs resample whole entities (cluster bootstrap) so the
+        panel correlation isn't broken: an OLS-metric run passes ``groups`` to
+        :func:`statistical_testing.bootstrap_score_ci`, while a ``mixedlm_*``
+        metric routes to :func:`mixed_effects_scoring.cluster_bootstrap_metric_ci`,
+        which refits the mixed model per (entity-relabelled) replicate at a
+        capped replicate count.
+
         Returns a dict with ``observed``, ``mean``, ``lower``, ``upper``,
         ``ci_level``, ``method``, ``n``.
         """
@@ -5955,6 +5968,30 @@ class MetricFusionEngine:
         )
         target = np.asarray(res.get("targets"), dtype=np.float64)
         prediction = np.asarray(res.get("predictions"), dtype=np.float64)
+
+        # Longitudinal MixedLM metric → cluster (entity) bootstrap that refits
+        # the mixed model per replicate (resampling rows independently would
+        # break the within-entity correlation). The refit is expensive, so the
+        # replicate count is capped well below the OLS metrics' thousands.
+        if self.is_longitudinal and metric in mixed_effects_scoring.MIXEDLM_METRICS:
+            spec = self.longitudinal_spec
+            assert spec is not None
+            return mixed_effects_scoring.cluster_bootstrap_metric_ci(
+                metric,
+                target,
+                prediction,
+                res.get("entity_id"),
+                res.get("years_since_baseline"),
+                covariates=res.get("covariates"),
+                include_time_fixed=spec.include_time_fixed_effect,
+                random_slope=spec.random_slope_time,
+                spatial_basis=res.get("spatial_basis"),
+                spatial_method=self.spatial_adjust_method,
+                n_bootstrap=min(int(n_bootstrap), 300),
+                ci_level=float(ci_level),
+                seed=int(seed),
+            )
+
         test_cov = res.get("covariates")
         cov_mat = (
             np.asarray(test_cov, dtype=np.float64) if test_cov is not None else None
@@ -6001,6 +6038,13 @@ class MetricFusionEngine:
                 )
                 return float(score_out)  # type: ignore[arg-type]
 
+        # OLS-metric longitudinal runs still have panel-correlated (entity, wave)
+        # rows, so resample whole entities (cluster bootstrap) rather than rows;
+        # cross-sectional runs pass ``groups=None`` and keep the row bootstrap.
+        groups = None
+        if self.is_longitudinal and res.get("entity_id") is not None:
+            groups = np.asarray(res.get("entity_id"))
+
         ci = _stats_mod.bootstrap_score_ci(
             target,
             prediction,
@@ -6015,6 +6059,7 @@ class MetricFusionEngine:
                 if metric == "partial_distance_corr"
                 else None
             ),
+            groups=groups,
         )
         ci["n"] = n
         return ci

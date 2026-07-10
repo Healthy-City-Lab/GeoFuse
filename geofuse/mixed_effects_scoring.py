@@ -285,6 +285,7 @@ def score_mixedlm(
     return_all: bool = False,
     spatial_basis: np.ndarray | None = None,
     spatial_method: str = "none",
+    nan_on_fail: bool = False,
 ) -> float | tuple[float, float] | dict[str, float]:
     """Score the greenery fixed effect in a mixed-effects linear model.
 
@@ -313,11 +314,25 @@ def score_mixedlm(
         ``ks_aic`` the smooth enters the model as extra fixed effects; with
         ``spatial_plus`` the greenery is additionally residualized on the smooth
         before fitting. ``none`` (or no basis) leaves the model unchanged.
+    nan_on_fail
+        Return ``NaN`` instead of the degenerate ``0.0`` when the model can't be
+        fit or the input is degenerate. Off by default (a bad trial fails soft to
+        ``0.0`` so Optuna avoids it); the cluster bootstrap turns it on so a
+        non-converged replicate is dropped rather than counted as a zero effect.
     """
     if metric not in MIXEDLM_METRICS:
         raise ValueError(
             f"Unknown metric {metric!r}; expected one of {sorted(MIXEDLM_METRICS)}."
         )
+
+    def _degenerate():
+        if return_all:
+            return {
+                m: (float("nan") if nan_on_fail else _DEGENERATE[m])
+                for m in MIXEDLM_METRICS
+            }
+        s = float("nan") if nan_on_fail else _DEGENERATE[metric]
+        return (s, float("nan") if nan_on_fail else 1.0) if return_pvalue else s
 
     y = np.asarray(outcome, dtype=np.float64)
     g = np.asarray(greenery, dtype=np.float64)
@@ -351,10 +366,7 @@ def score_mixedlm(
         or float(np.var(y)) == 0
         or float(np.var(g)) == 0
     ):
-        if return_all:
-            return {m: _DEGENERATE[m] for m in MIXEDLM_METRICS}
-        s = _DEGENERATE[metric]
-        return (s, 1.0) if return_pvalue else s
+        return _degenerate()
 
     X_full, g_col = _build_fixed_design(
         g,
@@ -366,10 +378,7 @@ def score_mixedlm(
     exog_re = _build_re_design(t, random_slope=random_slope)
     result_full = _fit_mixedlm(y, X_full, eids, exog_re)
     if result_full is None:
-        if return_all:
-            return {m: _DEGENERATE[m] for m in MIXEDLM_METRICS}
-        s = _DEGENERATE[metric]
-        return (s, 1.0) if return_pvalue else s
+        return _degenerate()
 
     # Optional null refit for the LR statistic.
     result_null = None
@@ -382,6 +391,11 @@ def score_mixedlm(
             include_greenery=False,
         )
         result_null = _fit_mixedlm(y, X_null, eids, exog_re)
+        # A failed null refit would make the LR statistic collapse to 0.0,
+        # indistinguishable from a genuinely tiny LR. For a single-metric LR
+        # request treat that as a fit failure so the bootstrap can drop it.
+        if metric == "mixedlm_lr" and not return_all and result_null is None:
+            return _degenerate()
 
     all_metrics = _compute_all_metrics(
         result_full, X_full, g_col, exog_re, result_null=result_null
@@ -646,3 +660,148 @@ def covariate_impact_mixedlm(
         "cgi_coef": float(fe[g_col]),
         "cgi_std_err": float(bse[g_col]) if g_col < len(bse) else float("nan"),
     }
+
+
+# ---------------------------------------------------------------------------
+# Cluster (entity) bootstrap CI for a mixedlm_* metric
+# ---------------------------------------------------------------------------
+
+
+def cluster_bootstrap_metric_ci(
+    metric: str,
+    outcome: np.ndarray,
+    greenery: np.ndarray,
+    entity_id: np.ndarray,
+    years_since_baseline: np.ndarray,
+    covariates: np.ndarray | None = None,
+    *,
+    include_time_fixed: bool = True,
+    random_slope: bool = True,
+    spatial_basis: np.ndarray | None = None,
+    spatial_method: str = "none",
+    n_bootstrap: int = 300,
+    ci_level: float = 0.95,
+    seed: int = 42,
+) -> dict:
+    """Cluster (entity) bootstrap percentile CI for a ``mixedlm_*`` metric.
+
+    Resamples whole entities with replacement and **relabels each drawn entity
+    with a fresh group id** — a doubled entity becomes two independent groups,
+    which is required for a valid multilevel cluster bootstrap — then refits the
+    mixed model per replicate via :func:`score_mixedlm` and takes the percentile
+    CI on the metric. Resampling ``(entity, wave)`` rows independently instead
+    would destroy the within-entity correlation and understate the interval.
+
+    The point estimate (``observed``) and, for the ``tstat`` / ``coef`` metrics,
+    the greenery fixed-effect Wald ``pvalue`` come from the single full-data fit.
+    Returns a dict shaped like :func:`statistical_testing.bootstrap_score_ci`
+    (``observed``, ``mean``, ``lower``, ``upper``, ``ci_level``, ``method``,
+    ``n``) plus ``n_boot`` and (when available) ``pvalue``.
+
+    ``n_bootstrap`` is a per-replicate model refit, so it is deliberately modest
+    (a few hundred) rather than the thousands the O(1) OLS metrics use. A refit
+    that fails to converge returns the metric's degenerate value (``0.0``) and so
+    contributes to the distribution; with a well-powered test panel this is rare.
+    """
+    if metric not in MIXEDLM_METRICS:
+        raise ValueError(
+            f"cluster_bootstrap_metric_ci expects a mixedlm_* metric; got {metric!r}."
+        )
+
+    y = np.asarray(outcome, dtype=np.float64).ravel()
+    g = np.asarray(greenery, dtype=np.float64).ravel()
+    t = np.asarray(years_since_baseline, dtype=np.float64).ravel()
+    eid = np.asarray(entity_id)
+    cov = _coerce_2d(covariates)
+    sb = _coerce_2d(spatial_basis) if spatial_method != "none" else None
+
+    # Drop non-finite rows up front so the resampled group-row indices are valid.
+    mask = (
+        np.isfinite(y)
+        & np.isfinite(g)
+        & np.isfinite(t)
+        & ~_entity_missing_mask(eid)
+    )
+    if cov is not None:
+        mask &= np.isfinite(cov).all(axis=1)
+    if sb is not None:
+        mask &= np.isfinite(sb).all(axis=1)
+    y, g, t, eid = y[mask], g[mask], t[mask], eid[mask]
+    cov = None if cov is None else cov[mask]
+    sb = None if sb is None else sb[mask]
+
+    def _score(yy, gg, ee, tt, cc, ss, *, return_pvalue=False, nan_on_fail=False):
+        return score_mixedlm(
+            metric,
+            yy,
+            gg,
+            entity_id=ee,
+            years_since_baseline=tt,
+            covariates=cc,
+            include_time_fixed=include_time_fixed,
+            random_slope=random_slope,
+            return_pvalue=return_pvalue,
+            spatial_basis=ss,
+            spatial_method=spatial_method,
+            nan_on_fail=nan_on_fail,
+        )
+
+    result: dict = {
+        "observed": float("nan"),
+        "mean": float("nan"),
+        "lower": float("nan"),
+        "upper": float("nan"),
+        "ci_level": float(ci_level),
+        "method": "cluster_bootstrap",
+        "n": int(len(y)),
+    }
+
+    if metric in HAS_PVALUE:
+        obs, pval = _score(y, g, eid, t, cov, sb, return_pvalue=True)  # type: ignore[misc]
+        result["observed"] = float(obs)
+        result["pvalue"] = float(pval)
+    else:
+        result["observed"] = float(_score(y, g, eid, t, cov, sb))
+
+    uniq, inv = np.unique(eid, return_inverse=True)
+    n_groups = len(uniq)
+    if n_groups < 2 or len(y) < _MIN_ROWS:
+        return result
+    group_rows = [np.where(inv == k)[0] for k in range(n_groups)]
+
+    rng = np.random.default_rng(int(seed))
+    boot = np.empty(int(n_bootstrap), dtype=np.float64)
+    for i in range(int(n_bootstrap)):
+        draw = rng.integers(0, n_groups, size=n_groups)
+        idx = np.concatenate([group_rows[k] for k in draw])
+        # Fresh per-slot group id so a repeated entity forms independent groups.
+        new_eid = np.concatenate(
+            [
+                np.full(len(group_rows[k]), slot, dtype=np.int64)
+                for slot, k in enumerate(draw)
+            ]
+        )
+        try:
+            boot[i] = float(
+                _score(
+                    y[idx],
+                    g[idx],
+                    new_eid,
+                    t[idx],
+                    None if cov is None else cov[idx],
+                    None if sb is None else sb[idx],
+                    nan_on_fail=True,
+                )
+            )
+        except Exception:
+            boot[i] = np.nan
+
+    valid = boot[np.isfinite(boot)]
+    if len(valid) == 0:
+        return result
+    alpha = (1.0 - float(ci_level)) / 2.0
+    result["mean"] = float(np.mean(valid))
+    result["lower"] = float(np.quantile(valid, alpha))
+    result["upper"] = float(np.quantile(valid, 1.0 - alpha))
+    result["n_boot"] = int(len(valid))
+    return result
