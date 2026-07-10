@@ -2029,20 +2029,34 @@ def _render_covariate_impact(results_view: dict, metric_name: str) -> None:
         return
 
     st.divider()
+    is_mixedlm = impact.get("model") == "mixedlm"
     st.markdown("**Covariate impact (CGI study)**")
-    st.caption(
-        "Two OLS models fit on the full dataset using the stability-selected "
-        "params: **Full** = `target ~ CGI + covariates`, **CGI-only** = "
-        "`target ~ CGI`. Coefficients show each covariate's effect direction "
-        "and magnitude in the full model; partial R² is the variance only "
-        "that covariate explains (drop in R² when it's removed from Full)."
-    )
+    if is_mixedlm:
+        st.caption(
+            "Two mixed-effects models fit on the full dataset using the "
+            "stability-selected params: **Full** = "
+            "`target ~ CGI + covariates [+ time] + (RE | entity)`, **CGI-only** = "
+            "`target ~ CGI [+ time] + (RE | entity)`. Standard errors and Wald "
+            "p-values come from the mixed model, so they account for the "
+            "within-entity correlation of the repeated measures. R² is the "
+            "Nakagawa marginal R² (fixed-effects variance share); partial R² is "
+            "the drop when a covariate is removed from Full."
+        )
+    else:
+        st.caption(
+            "Two OLS models fit on the full dataset using the stability-selected "
+            "params: **Full** = `target ~ CGI + covariates`, **CGI-only** = "
+            "`target ~ CGI`. Coefficients show each covariate's effect direction "
+            "and magnitude in the full model; partial R² is the variance only "
+            "that covariate explains (drop in R² when it's removed from Full)."
+        )
 
+    _r2_label = "Marginal R²" if is_mixedlm else "R²"
     summary_cols = st.columns(3)
     with summary_cols[0]:
-        st.metric("Full model R²", f"{impact.get('r2_full', 0):.4f}")
+        st.metric(f"Full model {_r2_label}", f"{impact.get('r2_full', 0):.4f}")
     with summary_cols[1]:
-        st.metric("CGI-only R²", f"{impact.get('r2_cgi_only', 0):.4f}")
+        st.metric(f"CGI-only {_r2_label}", f"{impact.get('r2_cgi_only', 0):.4f}")
     with summary_cols[2]:
         st.metric(
             "Lift from covariates",

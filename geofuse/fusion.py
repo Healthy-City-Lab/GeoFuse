@@ -5009,6 +5009,74 @@ class MetricFusionEngine:
             return lo
         return trial.suggest_int("ndvi_radius", lo, hi, step=step)
 
+    def _metric_has_pvalue(self, metric: str) -> bool:
+        """True when scoring ``metric`` yields a usable parametric p-value.
+
+        Only the longitudinal MixedLM ``tstat`` / ``coef`` metrics carry a Wald
+        p-value; the cross-sectional OLS metrics do not (their robustness comes
+        from stability selection + bootstrap CIs, not a per-trial p-gate).
+        """
+        return self.is_longitudinal and metric in mixed_effects_scoring.HAS_PVALUE
+
+    def _score_greenery(
+        self,
+        metric: str,
+        target: "np.ndarray",
+        composite: "np.ndarray",
+        *,
+        covariates: "np.ndarray | None" = None,
+        spatial_basis: "np.ndarray | None" = None,
+        entity_id: "np.ndarray | None" = None,
+        years_since_baseline: "np.ndarray | None" = None,
+        return_pvalue: bool = False,
+        return_all: bool = False,
+    ):
+        """Single scoring seam: MixedLM (longitudinal) or OLS (cross-sectional).
+
+        Routes to :func:`mixed_effects_scoring.score_mixedlm` when the engine is
+        in longitudinal mode and ``metric`` is a ``mixedlm_*`` metric, otherwise
+        to :func:`objective_scoring.score`. Every scoring call site — the
+        objective, the held-out evaluation, and the reporting helpers — goes
+        through here so the two modes cannot drift apart: a change to the
+        cross-sectional scorer (residualization, spatial handling, caches)
+        applies to the longitudinal OLS-metric path for free, and the MixedLM
+        branch is the one isolated place the panel model lives.
+
+        ``entity_id`` / ``years_since_baseline`` are consumed only by the MixedLM
+        branch; the OLS branch ignores them (they are ``None`` in cross-sectional
+        mode). ``return_all`` returns the four-metric MixedLM dict and is a no-op
+        on the OLS path.
+        """
+        if self.is_longitudinal and metric in mixed_effects_scoring.MIXEDLM_METRICS:
+            spec = self.longitudinal_spec
+            assert spec is not None  # guaranteed by is_longitudinal
+            return mixed_effects_scoring.score_mixedlm(
+                metric,
+                target,
+                composite,
+                entity_id=entity_id,
+                years_since_baseline=years_since_baseline,
+                covariates=covariates,
+                include_time_fixed=spec.include_time_fixed_effect,
+                random_slope=spec.random_slope_time,
+                return_pvalue=return_pvalue,
+                return_all=return_all,
+                spatial_basis=spatial_basis,
+                spatial_method=self.spatial_adjust_method,
+            )
+        return objective_scoring.score(
+            metric,
+            target,
+            composite,
+            covariates=covariates,
+            return_pvalue=return_pvalue,
+            spatial_basis=spatial_basis,
+            spatial_method=self.spatial_adjust_method,
+            residualize_method=self.residualize_method,
+            pdcor_cache=self._pdcor_cache,
+            spline_cache=self._spline_basis_cache,
+        )
+
     def _objective(self, trial: optuna.Trial, metric: str) -> float:
         """
         Optuna objective function with k-fold CV.
@@ -5374,79 +5442,33 @@ class MetricFusionEngine:
                 val_coords, val_targets_arr, val_cov, val_composite
             )
 
-            # ─── Score: MixedLM (longitudinal) or OLS partial-corr ────────────
-            # Three modes route through this fork:
-            #   1. Cross-sectional (no longitudinal_spec) → OLS scorer.
-            #   2. Mixed-effects (spec + ``mixedlm_*`` scoring_metric) →
-            #      MixedLM scorer with per-entity random effects.
-            #   3. Year-aware cross-sectional (spec + cross-sectional
-            #      scoring_metric) → OLS scorer, ignoring entity_id /
-            #      years_since_baseline. The spec exists purely so the
-            #      pre-aggregation cache can pick the right metric file per
-            #      year; the model has no temporal predictor.
-            use_mixedlm = (
-                self.is_longitudinal and metric in mixed_effects_scoring.MIXEDLM_METRICS
+            # ─── Score via the single ``_score_greenery`` seam ────────────────
+            # Three modes collapse into it: cross-sectional OLS, mixed-effects
+            # MixedLM (per-entity random effects), and year-aware cross-sectional
+            # (spec present but an OLS scoring metric — the OLS scorer ignores
+            # entity_id / years_since_baseline; the spec only routes the right
+            # metric file per year through the pre-aggregation cache).
+            wants_pval = self._metric_has_pvalue(metric)
+            train_out = self._score_greenery(
+                metric,
+                train_targets_arr,
+                train_composite,
+                covariates=train_cov,
+                spatial_basis=train_sb,
+                entity_id=train_entity_id,
+                years_since_baseline=train_ysb,
+                return_pvalue=wants_pval,
             )
-            if use_mixedlm:
-                spec = self.longitudinal_spec
-                assert spec is not None  # guaranteed by is_longitudinal
-                wants_pval = metric in mixed_effects_scoring.HAS_PVALUE
-                train_out = mixed_effects_scoring.score_mixedlm(
-                    metric,
-                    train_targets_arr,
-                    train_composite,
-                    entity_id=train_entity_id,
-                    years_since_baseline=train_ysb,
-                    covariates=train_cov,
-                    include_time_fixed=spec.include_time_fixed_effect,
-                    random_slope=spec.random_slope_time,
-                    return_pvalue=wants_pval,
-                    spatial_basis=train_sb,
-                    spatial_method=self.spatial_adjust_method,
-                )
-                val_out = mixed_effects_scoring.score_mixedlm(
-                    metric,
-                    val_targets_arr,
-                    val_composite,
-                    entity_id=val_entity_id,
-                    years_since_baseline=val_ysb,
-                    covariates=val_cov,
-                    include_time_fixed=spec.include_time_fixed_effect,
-                    random_slope=spec.random_slope_time,
-                    return_pvalue=wants_pval,
-                    spatial_basis=val_sb,
-                    spatial_method=self.spatial_adjust_method,
-                )
-            else:
-                # OLS path: covariate-aware distance-correlation / partial rank
-                # correlation / incremental-R² / normalized-RMSE / MI scorer.
-                # None of these expose a usable p-value (robustness comes from
-                # stability selection, not a per-trial p-gate).
-                wants_pval = False
-                train_out = objective_scoring.score(
-                    metric,
-                    train_targets_arr,
-                    train_composite,
-                    covariates=train_cov,
-                    return_pvalue=wants_pval,
-                    spatial_basis=train_sb,
-                    spatial_method=self.spatial_adjust_method,
-                    residualize_method=self.residualize_method,
-                    pdcor_cache=self._pdcor_cache,
-                    spline_cache=self._spline_basis_cache,
-                )
-                val_out = objective_scoring.score(
-                    metric,
-                    val_targets_arr,
-                    val_composite,
-                    covariates=val_cov,
-                    return_pvalue=wants_pval,
-                    spatial_basis=val_sb,
-                    spatial_method=self.spatial_adjust_method,
-                    residualize_method=self.residualize_method,
-                    pdcor_cache=self._pdcor_cache,
-                    spline_cache=self._spline_basis_cache,
-                )
+            val_out = self._score_greenery(
+                metric,
+                val_targets_arr,
+                val_composite,
+                covariates=val_cov,
+                spatial_basis=val_sb,
+                entity_id=val_entity_id,
+                years_since_baseline=val_ysb,
+                return_pvalue=wants_pval,
+            )
 
             if wants_pval:
                 # return_pvalue=True returns (score, pvalue); type cast is for
@@ -5483,9 +5505,7 @@ class MetricFusionEngine:
         # p-value bookkeeping: only the longitudinal MixedLM tstat/coef metrics
         # carry a genuine Wald p-value. Recorded as user_attrs so the post-hoc
         # reporting can read them per trial.
-        produced_pvals = self.is_longitudinal and metric in (
-            mixed_effects_scoring.HAS_PVALUE
-        )
+        produced_pvals = self._metric_has_pvalue(metric)
         if produced_pvals:
             trial.set_user_attr("train_pvalue_mean", np.mean(fold_train_pvals))
             trial.set_user_attr("val_pvalue_mean", np.mean(fold_val_pvals))
@@ -5705,67 +5725,41 @@ class MetricFusionEngine:
             test_coords, test_targets, test_cov, test_composite
         )
 
-        # ─── Score: MixedLM (longitudinal) or OLS partial-corr ────────────
-        # Same three-mode fork as ``_objective``: year-aware cross-sectional
-        # studies sit on a ``LongitudinalSpec`` whose ``scoring_metric`` is
-        # one of the OLS options, and route here through the ``else`` arm.
+        # ─── Score via the single ``_score_greenery`` seam ────────────────
+        # Same routing as ``_objective``: MixedLM for a longitudinal mixedlm_*
+        # metric, OLS otherwise (a year-aware cross-sectional study sits on a
+        # spec whose scoring_metric is an OLS option and takes the OLS path).
         mixedlm_all: dict[str, float] | None = None
-        use_mixedlm = (
-            self.is_longitudinal and metric in mixed_effects_scoring.MIXEDLM_METRICS
-        )
-        if use_mixedlm:
-            spec = self.longitudinal_spec
-            assert spec is not None
-            wants_pval = metric in mixed_effects_scoring.HAS_PVALUE
-            if return_all_mixedlm:
-                mixedlm_all = mixed_effects_scoring.score_mixedlm(  # type: ignore[assignment]
-                    metric,
-                    test_targets,
-                    test_composite,
-                    entity_id=test_entity_id,
-                    years_since_baseline=test_ysb,
-                    covariates=test_cov,
-                    include_time_fixed=spec.include_time_fixed_effect,
-                    random_slope=spec.random_slope_time,
-                    return_all=True,
-                    spatial_basis=test_sb,
-                    spatial_method=self.spatial_adjust_method,
-                )
-                # Surface the requested metric's value alongside the dict so
-                # ``test_score`` still reflects the engine's active scoring
-                # metric for downstream code that inspects it.
-                s = float(mixedlm_all.get(metric, 0.0))  # type: ignore[union-attr]
-                score_out = (s, 1.0) if wants_pval else s
-            else:
-                score_out = mixed_effects_scoring.score_mixedlm(
-                    metric,
-                    test_targets,
-                    test_composite,
-                    entity_id=test_entity_id,
-                    years_since_baseline=test_ysb,
-                    covariates=test_cov,
-                    include_time_fixed=spec.include_time_fixed_effect,
-                    random_slope=spec.random_slope_time,
-                    return_pvalue=wants_pval,
-                    spatial_basis=test_sb,
-                    spatial_method=self.spatial_adjust_method,
-                )
-        else:
-            # OLS scoring (distance correlation / partial rank corr / R² /
-            # normalized RMSE / MI). No usable p-value — robustness is reported
-            # via the stability-selection OOB distribution + test-set CI.
-            wants_pval = False
-            score_out = objective_scoring.score(
+        wants_pval = self._metric_has_pvalue(metric)
+        if (
+            return_all_mixedlm
+            and self.is_longitudinal
+            and metric in mixed_effects_scoring.MIXEDLM_METRICS
+        ):
+            mixedlm_all = self._score_greenery(  # type: ignore[assignment]
                 metric,
                 test_targets,
                 test_composite,
                 covariates=test_cov,
-                return_pvalue=wants_pval,
                 spatial_basis=test_sb,
-                spatial_method=self.spatial_adjust_method,
-                residualize_method=self.residualize_method,
-                pdcor_cache=self._pdcor_cache,
-                spline_cache=self._spline_basis_cache,
+                entity_id=test_entity_id,
+                years_since_baseline=test_ysb,
+                return_all=True,
+            )
+            # Surface the requested metric's value alongside the dict so
+            # ``test_score`` still reflects the engine's active scoring metric.
+            s = float(mixedlm_all.get(metric, 0.0))  # type: ignore[union-attr]
+            score_out = (s, 1.0) if wants_pval else s
+        else:
+            score_out = self._score_greenery(
+                metric,
+                test_targets,
+                test_composite,
+                covariates=test_cov,
+                spatial_basis=test_sb,
+                entity_id=test_entity_id,
+                years_since_baseline=test_ysb,
+                return_pvalue=wants_pval,
             )
         if wants_pval:
             test_score, test_pval = score_out  # type: ignore[misc]
@@ -6921,12 +6915,56 @@ class MetricFusionEngine:
             else:
                 cov_mat = full[cov_cols].to_numpy(dtype=np.float64)
 
+            # Longitudinal keys aligned to the collapsed frame, so the
+            # mixed-effects branch below can fit a panel model instead of OLS.
+            lon_entity_id = lon_ysb = None
+            if self.is_longitudinal:
+                if "polygon_id" in df.columns:
+                    lon_keys = (
+                        full.groupby("polygon_id", sort=False)[
+                            ["entity_id", "years_since_baseline"]
+                        ]
+                        .first()
+                        .reindex(df["polygon_id"].values)
+                    )
+                    lon_entity_id = lon_keys["entity_id"].to_numpy()
+                    lon_ysb = lon_keys["years_since_baseline"].to_numpy(dtype=np.float64)
+                elif {"entity_id", "years_since_baseline"} <= set(df.columns):
+                    lon_entity_id = df["entity_id"].to_numpy()
+                    lon_ysb = df["years_since_baseline"].to_numpy(dtype=np.float64)
+
             mask = ~(
                 np.isnan(target) | np.isnan(composite) | np.isnan(cov_mat).any(axis=1)
             )
             target = target[mask]
             composite = composite[mask]
             cov_mat = cov_mat[mask]
+            if lon_entity_id is not None:
+                lon_entity_id = lon_entity_id[mask]
+                lon_ysb = lon_ysb[mask]
+
+            # Panel data: OLS standard errors are anticonservative because the
+            # (entity, wave) rows are correlated within entity. Fit the same
+            # mixed model the scorer uses so the covariate table's coefficients
+            # and Wald p-values account for the random effects.
+            if (
+                self.is_longitudinal
+                and metric in mixed_effects_scoring.MIXEDLM_METRICS
+                and lon_entity_id is not None
+            ):
+                spec = self.longitudinal_spec
+                assert spec is not None
+                return mixed_effects_scoring.covariate_impact_mixedlm(
+                    target,
+                    composite,
+                    lon_entity_id,
+                    lon_ysb,
+                    cov_mat,
+                    list(cov_cols),
+                    include_time_fixed=spec.include_time_fixed_effect,
+                    random_slope=spec.random_slope_time,
+                )
+
             if target.size < len(cov_cols) + 3:
                 return None
 

@@ -504,3 +504,145 @@ def compare_models_aic_bic_mixedlm(
         "n": int(len(y)),
         "verdict": _verdict_from_delta_bic(delta_bic),
     }
+
+
+# ---------------------------------------------------------------------------
+# Covariate impact — mixed-effects analogue of the OLS covariate table
+# ---------------------------------------------------------------------------
+
+
+def _marginal_r2_from_fit(result, X: np.ndarray, exog_re: np.ndarray) -> float:
+    """Nakagawa marginal R² of a fitted MixedLM: fixed-effects variance share.
+
+    ``var(Xβ) / (var(Xβ) + random-effects variance + residual variance)``, using
+    the same random-effects variance approximation as :func:`_compute_all_metrics`
+    (exact for a random intercept, approximate under a random slope).
+    """
+    fe = _as_array(result.fe_params)
+    var_fe = float(np.var(X @ fe, ddof=0))
+    sigma2_resid = float(result.scale)
+    re_var = 0.0
+    cov_re = getattr(result, "cov_re", None)
+    if cov_re is not None:
+        cov_re_mat = np.asarray(cov_re)
+        for i in range(cov_re_mat.shape[0]):
+            re_var += float(cov_re_mat[i, i]) * float(np.mean(exog_re[:, i] ** 2))
+    total = var_fe + re_var + sigma2_resid
+    return var_fe / total if total > 0 else 0.0
+
+
+def covariate_impact_mixedlm(
+    outcome: np.ndarray,
+    greenery: np.ndarray,
+    entity_id: np.ndarray,
+    years_since_baseline: np.ndarray,
+    covariates: np.ndarray,
+    covariate_names: list[str],
+    *,
+    include_time_fixed: bool = True,
+    random_slope: bool = True,
+) -> dict | None:
+    """Mixed-effects analogue of :meth:`MetricFusionEngine.compute_covariate_impact`.
+
+    Fits ``outcome ~ greenery + covariates [+ time] + (RE | entity)`` and reports
+    each covariate's **fixed-effect** coefficient, standard error, Wald t / p, and
+    marginal-R² contribution (drop-one refit), plus the greenery coefficient and
+    the full / greenery-only marginal R². Because the standard errors come from
+    the mixed model, they account for the within-entity correlation that makes a
+    plain OLS covariate table anticonservative on panel data.
+
+    Returns the same dict shape the OLS path returns (with an extra
+    ``"model": "mixedlm"`` tag), or ``None`` on a fit failure / too-few-rows so
+    the caller can fall back gracefully.
+    """
+    cov = _coerce_2d(covariates)
+    if cov is None or cov.shape[1] == 0 or not covariate_names:
+        return None
+
+    y = np.asarray(outcome, dtype=np.float64).ravel()
+    g = np.asarray(greenery, dtype=np.float64).ravel()
+    t = np.asarray(years_since_baseline, dtype=np.float64).ravel()
+    y, g, eids, t, cov = _drop_nan(y, g, entity_id, t, cov)
+
+    n_groups = len(np.unique(eids)) if len(eids) else 0
+    if (
+        len(y) < max(_MIN_ROWS, len(covariate_names) + 3)
+        or n_groups < 2
+        or float(np.var(y)) == 0
+        or float(np.var(g)) == 0
+    ):
+        return None
+
+    exog_re = _build_re_design(t, random_slope=random_slope)
+
+    # Full model: greenery + covariates [+ time]. Column order from
+    # _build_fixed_design → [intercept, greenery, covariates..., time].
+    X_full, g_col = _build_fixed_design(
+        g, cov, t, include_time_fixed=include_time_fixed, include_greenery=True
+    )
+    full = _fit_mixedlm(y, X_full, eids, exog_re)
+    if full is None:
+        return None
+
+    # Greenery-only model (no covariates) for the R² lift.
+    X_cgi, _ = _build_fixed_design(
+        g, None, t, include_time_fixed=include_time_fixed, include_greenery=True
+    )
+    cgi_only = _fit_mixedlm(y, X_cgi, eids, exog_re)
+
+    fe = _as_array(full.fe_params)
+    bse = _as_array(full.bse_fe)
+    try:
+        pvals = _as_array(full.pvalues)
+    except Exception:
+        pvals = np.full(len(fe), np.nan)
+
+    r2_full = _marginal_r2_from_fit(full, X_full, exog_re)
+    r2_cgi_only = (
+        _marginal_r2_from_fit(cgi_only, X_cgi, exog_re) if cgi_only is not None else 0.0
+    )
+
+    n_cov = cov.shape[1]
+    per_cov: list[dict] = []
+    for i, name in enumerate(covariate_names[:n_cov]):
+        slot = 2 + i  # [intercept(0), greenery(1), covariate_i(2+i), ...]
+        coef = float(fe[slot])
+        se = float(bse[slot]) if slot < len(bse) else float("nan")
+        pval = float(pvals[slot]) if slot < len(pvals) else float("nan")
+        t_stat = coef / se if np.isfinite(se) and se > 0 else float("nan")
+
+        # Drop this covariate and refit for its marginal-R² contribution.
+        cov_minus = np.delete(cov, i, axis=1)
+        cov_minus = cov_minus if cov_minus.shape[1] > 0 else None
+        X_minus, _ = _build_fixed_design(
+            g, cov_minus, t, include_time_fixed=include_time_fixed, include_greenery=True
+        )
+        refit = _fit_mixedlm(y, X_minus, eids, exog_re)
+        r2_minus = (
+            _marginal_r2_from_fit(refit, X_minus, exog_re) if refit is not None else r2_full
+        )
+        partial_r2 = max(0.0, r2_full - r2_minus)
+
+        direction = "positive" if coef > 0 else "negative" if coef < 0 else "—"
+        per_cov.append(
+            {
+                "covariate": name,
+                "coef": coef,
+                "std_err": se,
+                "t_stat": float(t_stat),
+                "pvalue": pval,
+                "direction": direction,
+                "partial_r2": float(partial_r2),
+            }
+        )
+
+    return {
+        "model": "mixedlm",
+        "n": int(len(y)),
+        "r2_full": float(r2_full),
+        "r2_cgi_only": float(r2_cgi_only),
+        "r2_lift_from_covariates": float(r2_full - r2_cgi_only),
+        "per_covariate": per_cov,
+        "cgi_coef": float(fe[g_col]),
+        "cgi_std_err": float(bse[g_col]) if g_col < len(bse) else float("nan"),
+    }
