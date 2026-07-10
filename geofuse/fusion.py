@@ -6285,7 +6285,8 @@ class MetricFusionEngine:
                     .reindex(df["polygon_id"].values)
                 )
                 cov_mat = cov_per_poly.to_numpy(dtype=np.float64)
-            # Cross-sectional metrics no longer expose a usable p-value.
+            # In-sample slices carry no p-value (the params were tuned on this
+            # pool); the honest p comes from the held-out test elsewhere.
             wants_pval = False
 
             # Spatial smooth for the partial (adjusted) score; the raw score
@@ -6293,21 +6294,22 @@ class MetricFusionEngine:
             sb = self._spatial_basis_columns(
                 self._whole_data_coords(df), target, cov_mat, composite
             )
+            # Longitudinal keys for the MixedLM branch of the scoring seam
+            # (``None`` in cross-sectional mode, ignored by the OLS scorer).
+            lon_eid, lon_ysb = self._whole_data_longitudinal_keys(df)
 
             def _do(
                 cov: np.ndarray | None, spat: np.ndarray | None
             ) -> tuple[float | None, float | None]:
-                out = objective_scoring.score(
+                out = self._score_greenery(
                     metric,
                     target,
                     composite,
                     covariates=cov,
-                    return_pvalue=wants_pval,
                     spatial_basis=spat,
-                    spatial_method=self.spatial_adjust_method,
-                    residualize_method=self.residualize_method,
-                    pdcor_cache=self._pdcor_cache,
-                    spline_cache=self._spline_basis_cache,
+                    entity_id=lon_eid,
+                    years_since_baseline=lon_ysb,
+                    return_pvalue=wants_pval,
                 )
                 if wants_pval:
                     s, p = out  # type: ignore[misc]
@@ -6375,6 +6377,42 @@ class MetricFusionEngine:
         else:
             coords = full[["_cx", "_cy"]].reindex(df.index)
         return coords.to_numpy(dtype=np.float64)
+
+    def _whole_data_longitudinal_keys(
+        self, df: "pd.DataFrame"
+    ) -> "tuple[np.ndarray | None, np.ndarray | None]":
+        """Per-row ``(entity_id, years_since_baseline)`` for a collapsed frame.
+
+        Mirrors :meth:`_whole_data_covariates` for the mixed-effects scorer: reads
+        the longitudinal keys directly from a row-keyed frame, or looks them up by
+        ``polygon_id`` from the train+val+test union for a polygon-collapsed
+        ``apply_fusion`` frame. Returns ``(None, None)`` in cross-sectional mode or
+        when the keys are absent, so the OLS scoring path is unaffected.
+        """
+        if not self.is_longitudinal:
+            return None, None
+        keys = ["entity_id", "years_since_baseline"]
+        if set(keys) <= set(df.columns):
+            return (
+                df["entity_id"].to_numpy(),
+                df["years_since_baseline"].to_numpy(dtype=np.float64),
+            )
+        full = self._full_data_frame()
+        if (
+            full is None
+            or "polygon_id" not in df.columns
+            or not set(keys) <= set(full.columns)
+        ):
+            return None, None
+        lk = (
+            full.groupby("polygon_id", sort=False)[keys]
+            .first()
+            .reindex(df["polygon_id"].values)
+        )
+        return (
+            lk["entity_id"].to_numpy(),
+            lk["years_since_baseline"].to_numpy(dtype=np.float64),
+        )
 
     def _augment_cov_with_spatial(
         self,
@@ -6823,27 +6861,28 @@ class MetricFusionEngine:
                     .reindex(df["polygon_id"].values)
                 )
                 cov = cov_per_poly.to_numpy(dtype=np.float64)
-            # Cross-sectional metrics no longer expose a usable p-value.
+            # In-sample slice carries no p-value; the held-out test does.
             wants_pval = False
 
             sb = self._spatial_basis_columns(
                 self._whole_data_coords(df), target, cov, composite
             )
+            # Longitudinal keys for the MixedLM branch of the scoring seam
+            # (``None`` in cross-sectional mode, ignored by the OLS scorer).
+            lon_eid, lon_ysb = self._whole_data_longitudinal_keys(df)
 
             def _full_score(
                 c: np.ndarray | None, spat: np.ndarray | None
             ) -> tuple[float | None, float | None]:
-                s_out = objective_scoring.score(
+                s_out = self._score_greenery(
                     metric,
                     target,
                     composite,
                     covariates=c,
-                    return_pvalue=wants_pval,
                     spatial_basis=spat,
-                    spatial_method=self.spatial_adjust_method,
-                    residualize_method=self.residualize_method,
-                    pdcor_cache=self._pdcor_cache,
-                    spline_cache=self._spline_basis_cache,
+                    entity_id=lon_eid,
+                    years_since_baseline=lon_ysb,
+                    return_pvalue=wants_pval,
                 )
                 if wants_pval:
                     s, p = s_out  # type: ignore[misc]
