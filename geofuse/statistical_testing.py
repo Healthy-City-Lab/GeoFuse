@@ -198,6 +198,7 @@ def bootstrap_score_ci(
     seed: int = 42,
     covariates: np.ndarray | None = None,
     replicate_scorer_factory=None,
+    groups: np.ndarray | None = None,
 ) -> dict:
     """Bootstrap CI on ``score_fn(target, prediction)``.
 
@@ -238,6 +239,13 @@ def bootstrap_score_ci(
             precomputed distance matrices per resample. The observed score
             always comes from ``score_fn``. A ``None`` return keeps the generic
             path.
+        groups: optional ``(n,)`` cluster label per row. When supplied the
+            bootstrap resamples **whole groups** with replacement (concatenating
+            each drawn group's rows) instead of individual rows, and the BCa
+            jackknife leaves one whole group out at a time. This is the correct
+            resample for panel data (repeated measures per entity): resampling
+            rows independently would break the within-group correlation and make
+            the CI too narrow. ``None`` keeps the row-level bootstrap (unchanged).
 
     Returns:
         Dict with ``observed``, ``mean``, ``lower``, ``upper``, ``ci_level``,
@@ -259,6 +267,15 @@ def bootstrap_score_ci(
                 f"got {cov_arr.shape[0]} vs {t.shape[0]}."
             )
 
+    grp_arr: np.ndarray | None = None
+    if groups is not None:
+        grp_arr = np.asarray(groups)
+        if grp_arr.shape[0] != t.shape[0]:
+            raise ValueError(
+                "groups length must match target/prediction length; "
+                f"got {grp_arr.shape[0]} vs {t.shape[0]}."
+            )
+
     mask = ~(np.isnan(t) | np.isnan(p))
     if cov_arr is not None:
         mask &= np.isfinite(cov_arr).all(axis=1)
@@ -266,6 +283,14 @@ def bootstrap_score_ci(
     p = p[mask]
     if cov_arr is not None:
         cov_arr = cov_arr[mask]
+
+    # Row-index lists per group (into the masked arrays) for cluster resampling.
+    group_row_indices: list[np.ndarray] | None = None
+    if grp_arr is not None:
+        grp_arr = grp_arr[mask]
+        _uniq, inv = np.unique(grp_arr, return_inverse=True)
+        group_row_indices = [np.where(inv == g)[0] for g in range(len(_uniq))]
+
     if len(t) < 3:
         return {
             "observed": float("nan"),
@@ -297,11 +322,22 @@ def bootstrap_score_ci(
     rng = np.random.default_rng(seed)
     n = len(t)
     scores = np.empty(n_bootstrap, dtype=np.float64)
-    # One batched draw is bit-identical to per-replicate ``integers`` (row-major
-    # fill) but skips the per-iteration RNG-call overhead.
-    boot_idx = rng.integers(0, n, size=(n_bootstrap, n))
+    if group_row_indices is None:
+        # One batched draw is bit-identical to per-replicate ``integers``
+        # (row-major fill) but skips the per-iteration RNG-call overhead.
+        boot_idx = rng.integers(0, n, size=(n_bootstrap, n))
+        boot_groups = None
+    else:
+        # Cluster bootstrap: resample whole groups with replacement, then
+        # concatenate their rows into each replicate's index vector.
+        n_groups = len(group_row_indices)
+        boot_idx = None
+        boot_groups = rng.integers(0, n_groups, size=(n_bootstrap, n_groups))
     for i in range(n_bootstrap):
-        idx = boot_idx[i]
+        if group_row_indices is None:
+            idx = boot_idx[i]
+        else:
+            idx = np.concatenate([group_row_indices[g] for g in boot_groups[i]])
         try:
             if replicate_scorer is not None:
                 scores[i] = replicate_scorer(idx)
@@ -340,11 +376,18 @@ def bootstrap_score_ci(
         # under-covers when the score is skewed (correlation near ±1, etc.).
         # Leave-one-out via a toggled boolean mask — same keep-set as
         # ``np.delete`` per i, without rebuilding an index array each pass.
-        jack_scores = np.empty(n, dtype=np.float64)
+        # Under cluster resampling the unit dropped is a whole group (the
+        # matching cluster jackknife), so both moments track the group design.
+        jack_units = (
+            group_row_indices if group_row_indices is not None else None
+        )
+        jack_n = n if jack_units is None else len(jack_units)
+        jack_scores = np.empty(jack_n, dtype=np.float64)
         base_idx = np.arange(n)
         keep_mask = np.ones(n, dtype=bool)
-        for i in range(n):
-            keep_mask[i] = False
+        for i in range(jack_n):
+            drop = np.array([i]) if jack_units is None else jack_units[i]
+            keep_mask[drop] = False
             keep = base_idx[keep_mask]
             try:
                 if replicate_scorer is not None:
@@ -353,7 +396,7 @@ def bootstrap_score_ci(
                     jack_scores[i] = _score(t[keep], p[keep], keep)
             except Exception:
                 jack_scores[i] = np.nan
-            keep_mask[i] = True
+            keep_mask[drop] = True
         jack_valid = jack_scores[~np.isnan(jack_scores)]
         if len(jack_valid) >= 2:
             jack_mean = float(np.mean(jack_valid))
