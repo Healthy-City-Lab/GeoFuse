@@ -143,6 +143,12 @@ class LongitudinalSpec:
     random_slope_time: bool = True
     scoring_metric: str = DEFAULT_MIXEDLM_METRIC
     derive_wave_from_date: bool = False
+    # Optional post-hoc exposure-decline terms (greenery × time), reported on the
+    # winning composite. ``decline_average_exposure`` adds the between-person
+    # (person-mean) term; ``decline_exposure_change`` the within-person
+    # (deviation) term. The overall greenery × time term is always reported.
+    decline_average_exposure: bool = False
+    decline_exposure_change: bool = False
 
     def to_payload(self) -> dict:
         """Serialise to a plain-dict payload (for ``rec.params`` / restart)."""
@@ -160,6 +166,8 @@ class LongitudinalSpec:
             "random_slope_time": self.random_slope_time,
             "scoring_metric": self.scoring_metric,
             "derive_wave_from_date": self.derive_wave_from_date,
+            "decline_average_exposure": self.decline_average_exposure,
+            "decline_exposure_change": self.decline_exposure_change,
         }
 
     @classmethod
@@ -182,6 +190,8 @@ class LongitudinalSpec:
             random_slope_time=bool(payload.get("random_slope_time", True)),
             scoring_metric=payload.get("scoring_metric", DEFAULT_MIXEDLM_METRIC),
             derive_wave_from_date=bool(payload.get("derive_wave_from_date", False)),
+            decline_average_exposure=bool(payload.get("decline_average_exposure", False)),
+            decline_exposure_change=bool(payload.get("decline_exposure_change", False)),
         )
 
 

@@ -7134,6 +7134,54 @@ class MetricFusionEngine:
             logger.warning(f"compute_covariate_impact failed: {exc}")
             return None
 
+    def compute_decline_terms(self, params: dict) -> dict | None:
+        """Greenery × time decline terms on the winning composite (longitudinal).
+
+        Reports the overall greenery × time slope and, per the spec's decline
+        knobs, the between-person (average-exposure) and within-person
+        (exposure-change) slopes. ``None`` for cross-sectional runs, a non-MixedLM
+        scoring metric, or when the mixed model cannot be fit.
+        """
+        if not self.is_longitudinal:
+            return None
+        spec = self.longitudinal_spec
+        assert spec is not None
+        if spec.scoring_metric not in mixed_effects_scoring.MIXEDLM_METRICS:
+            return None
+        try:
+            df = self.apply_fusion(weights=dict(params))
+            target = np.asarray(df["target"].values, dtype=np.float64)
+            composite = np.asarray(df["composite"].values, dtype=np.float64)
+            eid, ysb = self._whole_data_longitudinal_keys(df)
+            if eid is None:
+                return None
+            cov_cols = list(self.covariate_columns or [])
+            cov = None
+            if cov_cols:
+                full = self._full_data_frame()
+                if full is not None and "polygon_id" in df.columns:
+                    cov = (
+                        full.groupby("polygon_id", sort=False)[cov_cols]
+                        .first()
+                        .reindex(df["polygon_id"].values)
+                        .to_numpy(dtype=np.float64)
+                    )
+                elif set(cov_cols) <= set(df.columns):
+                    cov = df[cov_cols].to_numpy(dtype=np.float64)
+            return mixed_effects_scoring.decline_terms_mixedlm(
+                target,
+                composite,
+                eid,
+                ysb,
+                cov,
+                random_slope=spec.random_slope_time,
+                want_between=bool(spec.decline_average_exposure),
+                want_within=bool(spec.decline_exposure_change),
+            )
+        except Exception as exc:
+            logger.warning(f"compute_decline_terms failed: {exc}")
+            return None
+
     def bootstrap_stability_selection(
         self,
         metric: str,

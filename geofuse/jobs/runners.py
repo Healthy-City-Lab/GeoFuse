@@ -994,6 +994,13 @@ def _write_fusion_outputs(
             [dict(r) for r in covariate_impact["per_covariate"]],
         )
 
+    # ── decline_terms.csv (longitudinal exposure × time) ──────────────
+    decline_terms = (cgi_bundle or {}).get("decline_terms") or None
+    if decline_terms and decline_terms.get("terms"):
+        _emit_csv(
+            f"decline_terms{sfx}.csv", [dict(r) for r in decline_terms["terms"]]
+        )
+
     # ── results_summary.json (master manifest) ────────────────────────
     studies_manifest: dict[str, dict] = {}
     for key, disp, b in studies:
@@ -1053,6 +1060,7 @@ def _write_fusion_outputs(
         "studies": studies_manifest,
         "cgi_vs_standalone_aic_bic": aic_bic,
         "covariate_impact": cov_summary,
+        "decline_terms": (cgi_bundle or {}).get("decline_terms"),
         "collinearity": collinearity_report,
     }
     _emit_json(f"results_summary{sfx}.json", manifest)
@@ -2563,6 +2571,21 @@ def run_fusion(
                     f"[{label}] Covariate impact computation failed: {exc}",
                 )
 
+            # Longitudinal exposure–decline terms (greenery × time) on the
+            # winning composite — the overall slope plus the optional
+            # between/within decomposition selected in the spec.
+            decline_terms: dict | None = None
+            if longitudinal_spec is not None:
+                try:
+                    decline_terms = engine.compute_decline_terms(
+                        params=averaged_params or best_params
+                    )
+                except Exception as exc:
+                    _log_fusion(
+                        "WARN",
+                        f"[{label}] Decline-terms computation failed: {exc}",
+                    )
+
             bundle = {
                 "best_params": best_params,
                 "averaged_params": averaged_params,
@@ -2574,6 +2597,7 @@ def run_fusion(
                 "test_results": test_results,
                 "subset_scores": cgi_subset_scores,
                 "covariate_impact": covariate_impact,
+                "decline_terms": decline_terms,
                 "target_feature": target_feature,
                 # Run details persisted so the results panel survives a disk
                 # reload (when the live engine is gone): user-facing covariate

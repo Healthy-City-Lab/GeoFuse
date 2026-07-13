@@ -999,6 +999,8 @@ def _render_optimization_setup_panel(
         "cross_sectional_date_on": False,
         "mixedlm_random_slope": True,
         "mixedlm_time_fixed": True,
+        "decline_average_exposure": False,
+        "decline_exposure_change": False,
     }
 
     entries = list(target_file_entries or [])
@@ -1555,6 +1557,8 @@ def _render_study_details_panel(
     # ── Longitudinal-only mixed-effects toggles ─────────────────────────
     mixedlm_random_slope = True
     mixedlm_time_fixed = True
+    decline_average_exposure = False
+    decline_exposure_change = False
     if is_longitudinal:
         mc1, mc2 = st.columns(2)
         with mc1:
@@ -1570,6 +1574,34 @@ def _render_study_details_panel(
                 value=bool(st.session_state.get("fusion_lon_include_time_fixed", True)),
                 key="fusion_lon_include_time_fixed",
                 help="Adds `+ years_since_baseline` to the fixed-effect design.",
+            )
+        st.caption(
+            "Exposure–change over time (reported alongside the overall "
+            "greenspace × time effect):"
+        )
+        dc1, dc2 = st.columns(2)
+        with dc1:
+            decline_average_exposure = st.checkbox(
+                "Average exposure effect",
+                value=bool(st.session_state.get("fusion_lon_decline_between", False)),
+                key="fusion_lon_decline_between",
+                help=(
+                    "Adds a between-person term: does a higher *average* exposure "
+                    "track a slower change in the outcome over time? "
+                    "(person-mean greenspace × time)."
+                ),
+            )
+        with dc2:
+            decline_exposure_change = st.checkbox(
+                "Exposure-change effect",
+                value=bool(st.session_state.get("fusion_lon_decline_within", False)),
+                key="fusion_lon_decline_within",
+                help=(
+                    "Adds a within-person term: does *increasing* exposure over "
+                    "time track a slower change in the outcome? "
+                    "(deviation from person-mean greenspace × time). Needs "
+                    "per-wave greenery that varies over time."
+                ),
             )
 
     # ── Resume + standalones ────────────────────────────────────────────
@@ -1852,6 +1884,8 @@ def _render_study_details_panel(
         "n_bins": int(n_bins),
         "mixedlm_random_slope": bool(mixedlm_random_slope),
         "mixedlm_time_fixed": bool(mixedlm_time_fixed),
+        "decline_average_exposure": bool(decline_average_exposure),
+        "decline_exposure_change": bool(decline_exposure_change),
         "resume_existing_study": bool(resume_existing_study),
         "run_standalones": bool(run_standalones),
         "cgi_grid_spacing_m": int(cgi_grid_spacing_m),
@@ -2020,6 +2054,48 @@ def _render_collinearity_report(results_view: dict) -> None:
                     f"VIFs before: {[round(float(v), 2) for v in before]} → "
                     f"after: {[round(float(v), 2) for v in after]}"
                 )
+
+
+_DECLINE_TERM_LABELS = {
+    "overall": "Greenspace × time (overall)",
+    "between": "Average exposure × time (between-person)",
+    "within": "Exposure change × time (within-person)",
+}
+
+
+def _render_decline_terms(results_view: dict) -> None:
+    """Longitudinal exposure–decline terms: does greenspace track the outcome's
+    rate of change (overall, and the average / change decomposition)."""
+    dt = results_view.get("decline_terms")
+    if not dt or not dt.get("terms"):
+        return
+
+    st.divider()
+    st.markdown("**Greenspace and rate of change over time**")
+    st.caption(
+        "Greenspace × time slopes on the winning composite. A term ≠ 0 means "
+        "greenspace tracks how fast the outcome changes; the sign follows the "
+        "outcome's scale. Between-person = higher *average* exposure; "
+        "within-person = *increasing* exposure over time."
+    )
+    rows = []
+    for term in dt["terms"]:
+        rows.append(
+            {
+                "term": _DECLINE_TERM_LABELS.get(term["key"], term["key"]),
+                "coef": term.get("coef"),
+                "std_err": term.get("std_err"),
+                "t_stat": term.get("t_stat"),
+                "pvalue": term.get("pvalue"),
+                "direction": term.get("direction"),
+            }
+        )
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    if dt.get("within_estimable") is False:
+        st.caption(
+            "_Within-person term not estimable — the greenspace exposure does "
+            "not vary over time (use per-wave greenery files to enable it)._"
+        )
 
 
 def _render_covariate_impact(results_view: dict, metric_name: str) -> None:
@@ -3400,6 +3476,9 @@ def _render_fusion_results_body(output_dir: str) -> None:
     # ── Covariate impact panel ────────────────────────────────────────
     _render_covariate_impact(results_view, metric_name)
 
+    # ── Longitudinal exposure–decline terms ───────────────────────────
+    _render_decline_terms(results_view)
+
     # ── Composite map viewer ──────────────────────────────────────────
     _render_composite_map_viewer(results_view, engine)
 
@@ -3929,6 +4008,8 @@ def render(output_dir: str) -> None:
     run_standalones = study_state["run_standalones"]
     lon_random_slope = study_state["mixedlm_random_slope"]
     lon_include_time_fixed = study_state["mixedlm_time_fixed"]
+    lon_decline_between = study_state.get("decline_average_exposure", False)
+    lon_decline_within = study_state.get("decline_exposure_change", False)
     cgi_grid_spacing_m_param = study_state.get("cgi_grid_spacing_m")
     whole_grid_scaling_param = bool(study_state.get("whole_grid_scaling", False))
     area_balanced_split_param = bool(study_state.get("area_balanced_split", False))
@@ -4135,6 +4216,8 @@ def render(output_dir: str) -> None:
                     scoring_metric=objective_metric,
                     include_time_fixed_effect=lon_include_time_fixed,
                     random_slope_time=lon_random_slope,
+                    decline_average_exposure=bool(lon_decline_between),
+                    decline_exposure_change=bool(lon_decline_within),
                     derive_wave_from_date=False,
                 )
                 spec_errs += _validate_lon_spec(spec)

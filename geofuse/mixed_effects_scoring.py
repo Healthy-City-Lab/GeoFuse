@@ -805,3 +805,129 @@ def cluster_bootstrap_metric_ci(
     result["upper"] = float(np.quantile(valid, 1.0 - alpha))
     result["n_boot"] = int(len(valid))
     return result
+
+
+# ---------------------------------------------------------------------------
+# Exposure-decline terms (greenery × time)
+# ---------------------------------------------------------------------------
+
+
+def _fit_terms(y, cols, eids, exog_re):
+    """Fit ``y ~ intercept + cols`` (MixedLM) → {name: (coef, se, pvalue)} or None."""
+    X = np.column_stack([np.ones(len(y))] + [c[1] for c in cols])
+    res = _fit_mixedlm(y, X, eids, exog_re)
+    if res is None:
+        return None
+    fe, bse = _as_array(res.fe_params), _as_array(res.bse_fe)
+    try:
+        pv = _as_array(res.pvalues)
+    except Exception:
+        pv = np.full(len(fe), np.nan)
+    names = ["intercept"] + [c[0] for c in cols]
+    return {
+        nm: (
+            float(fe[i]),
+            float(bse[i]) if i < len(bse) else float("nan"),
+            float(pv[i]) if i < len(pv) else float("nan"),
+        )
+        for i, nm in enumerate(names)
+    }
+
+
+def decline_terms_mixedlm(
+    outcome: np.ndarray,
+    greenery: np.ndarray,
+    entity_id: np.ndarray,
+    years_since_baseline: np.ndarray,
+    covariates: np.ndarray | None = None,
+    *,
+    random_slope: bool = True,
+    want_between: bool = False,
+    want_within: bool = False,
+) -> dict | None:
+    """Greenery × time terms testing whether exposure is linked to the outcome's
+    rate of change.
+
+    Always reports the **overall** greenery × time slope. With ``want_between`` /
+    ``want_within`` it additionally fits a within-between decomposition and
+    reports the **average-exposure** (person-mean × time) and **exposure-change**
+    (within-person deviation × time) slopes, each controlling for the other.
+    Returns ``{"n", "within_estimable", "terms": [{key, coef, std_err, t_stat,
+    pvalue, direction}]}`` or ``None`` on a fit failure / too little data.
+    """
+    y = np.asarray(outcome, dtype=np.float64).ravel()
+    g = np.asarray(greenery, dtype=np.float64).ravel()
+    t = np.asarray(years_since_baseline, dtype=np.float64).ravel()
+    cov = _coerce_2d(covariates)
+    y, g, eids, t, cov = _drop_nan(y, g, entity_id, t, cov)
+    if len(y) < _MIN_ROWS or len(np.unique(eids)) < 2 or float(np.var(y)) == 0:
+        return None
+
+    cov_cols = [] if cov is None else [(f"cov{j}", cov[:, j]) for j in range(cov.shape[1])]
+    exog_re = _build_re_design(t, random_slope=random_slope)
+
+    # Person-mean (between) and deviation (within) exposure.
+    order = np.argsort(eids, kind="stable")
+    gmean = np.empty_like(g)
+    _, first_idx, counts = np.unique(eids[order], return_index=True, return_counts=True)
+    sums = np.add.reduceat(g[order], first_idx)
+    means = sums / counts
+    gmean[order] = np.repeat(means, counts)
+    gdev = g - gmean
+    within_estimable = float(np.var(gdev)) > 0
+
+    def _row(key, entry):
+        coef, se, pval = entry
+        tstat = coef / se if np.isfinite(se) and se > 0 else float("nan")
+        direction = "positive" if coef > 0 else "negative" if coef < 0 else "—"
+        return {
+            "key": key,
+            "coef": coef,
+            "std_err": se,
+            "t_stat": float(tstat),
+            "pvalue": pval,
+            "direction": direction,
+        }
+
+    terms: list[dict] = []
+    # Overall greenery × time (always).
+    pooled = _fit_terms(
+        y,
+        [("greenery", g)] + cov_cols + [("time", t), ("greenery_x_time", g * t)],
+        eids,
+        exog_re,
+    )
+    if pooled is None:
+        return None
+    terms.append(_row("overall", pooled["greenery_x_time"]))
+
+    # Within-between decomposition for the average / change slopes.
+    if want_between or want_within:
+        cols = [("g_between", gmean)]
+        if within_estimable:
+            cols.append(("g_within", gdev))
+        cols += cov_cols + [("time", t)]
+        if want_between:
+            cols.append(("between_x_time", gmean * t))
+        if want_within and within_estimable:
+            cols.append(("within_x_time", gdev * t))
+        decomposed = _fit_terms(y, cols, eids, exog_re)
+        if decomposed is not None:
+            if want_between and "between_x_time" in decomposed:
+                terms.append(_row("between", decomposed["between_x_time"]))
+            if want_within:
+                if within_estimable and "within_x_time" in decomposed:
+                    terms.append(_row("within", decomposed["within_x_time"]))
+                else:
+                    terms.append(
+                        {
+                            "key": "within",
+                            "coef": float("nan"),
+                            "std_err": float("nan"),
+                            "t_stat": float("nan"),
+                            "pvalue": float("nan"),
+                            "direction": "—",
+                        }
+                    )
+
+    return {"n": int(len(y)), "within_estimable": bool(within_estimable), "terms": terms}
