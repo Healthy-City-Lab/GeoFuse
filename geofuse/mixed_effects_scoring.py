@@ -63,6 +63,15 @@ HIGHER_IS_BETTER: frozenset[str] = MIXEDLM_METRICS
 # Metrics that produce a p-value (the greenery fixed-effect Wald test).
 HAS_PVALUE: frozenset[str] = frozenset({"mixedlm_tstat", "mixedlm_coef"})
 
+# Which model term the metric is computed on (what the search optimises the CGI
+# for). ``level`` is the greenery main effect (association with the outcome
+# level); the ``decline_*`` targets score a greenery × time slope — overall,
+# between-person (person-mean × time), or within-person (deviation × time).
+ASSOCIATION_TARGETS: frozenset[str] = frozenset(
+    {"level", "decline_overall", "decline_average", "decline_change"}
+)
+DEFAULT_ASSOCIATION_TARGET: str = "level"
+
 _DEGENERATE: dict[str, float] = {
     "mixedlm_tstat": 0.0,
     "mixedlm_marginal_r2": 0.0,
@@ -161,6 +170,93 @@ def _build_re_design(
     if random_slope:
         parts.append(years_since_baseline.reshape(-1, 1))
     return np.hstack(parts)
+
+
+def _within_between(
+    g: np.ndarray, eids: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, bool]:
+    """Person-mean (between) and deviation-from-mean (within) of ``g``.
+
+    Returns ``(mean, deviation, within_varies)``. ``within_varies`` is False when
+    the exposure is constant within every entity (no over-time variation).
+    """
+    order = np.argsort(eids, kind="stable")
+    _uniq, first_idx, counts = np.unique(
+        eids[order], return_index=True, return_counts=True
+    )
+    means = np.add.reduceat(g[order], first_idx) / counts
+    gmean = np.empty_like(g)
+    gmean[order] = np.repeat(means, counts)
+    gdev = g - gmean
+    return gmean, gdev, bool(float(np.var(gdev)) > 0)
+
+
+def _build_target_design(
+    g: np.ndarray,
+    cov: np.ndarray | None,
+    t: np.ndarray,
+    eids: np.ndarray,
+    *,
+    target: str,
+    include_time_fixed: bool,
+    include_target: bool,
+):
+    """Fixed design + scored-column index for the requested association target.
+
+    ``level`` reproduces the greenery main-effect design exactly. The
+    ``decline_*`` targets add a greenery × time slope (overall, or the
+    between/within decomposition) and score its coefficient; time is always a
+    fixed effect there. ``include_target=False`` drops the scored term (the LR
+    null). Returns ``(X, target_col)`` or ``None`` when the target is not
+    estimable (a within-person slope with no over-time exposure variation).
+    """
+    if target == "level":
+        return _build_fixed_design(
+            g,
+            cov,
+            t,
+            include_time_fixed=include_time_fixed,
+            include_greenery=include_target,
+        )
+
+    n = len(g)
+    named: list[tuple[str, np.ndarray]] = [("intercept", np.ones(n))]
+
+    def _add_cov() -> None:
+        if cov is not None and cov.shape[1] > 0:
+            for j in range(cov.shape[1]):
+                named.append((f"cov{j}", cov[:, j]))
+
+    if target == "decline_overall":
+        named.append(("greenery", g))
+        _add_cov()
+        named.append(("time", t))
+        if include_target:
+            named.append(("__target__", g * t))
+    else:
+        gmean, gdev, within_ok = _within_between(g, eids)
+        if target == "decline_change" and not within_ok:
+            return None
+        named.append(("g_between", gmean))
+        if within_ok:
+            named.append(("g_within", gdev))
+        _add_cov()
+        named.append(("time", t))
+        if target == "decline_average":
+            if include_target:
+                named.append(("__target__", gmean * t))
+            if within_ok:
+                named.append(("g_within_x_time", gdev * t))
+        else:  # decline_change (within_ok is True here)
+            named.append(("g_between_x_time", gmean * t))
+            if include_target:
+                named.append(("__target__", gdev * t))
+
+    X = np.column_stack([c[1] for c in named])
+    target_col = next(
+        (i for i, (nm, _) in enumerate(named) if nm == "__target__"), -1
+    )
+    return X, target_col
 
 
 def _fit_mixedlm(
@@ -286,8 +382,9 @@ def score_mixedlm(
     spatial_basis: np.ndarray | None = None,
     spatial_method: str = "none",
     nan_on_fail: bool = False,
+    target: str = DEFAULT_ASSOCIATION_TARGET,
 ) -> float | tuple[float, float] | dict[str, float]:
-    """Score the greenery fixed effect in a mixed-effects linear model.
+    """Score a greenery model term in a mixed-effects linear model.
 
     Parameters
     ----------
@@ -319,10 +416,18 @@ def score_mixedlm(
         fit or the input is degenerate. Off by default (a bad trial fails soft to
         ``0.0`` so Optuna avoids it); the cluster bootstrap turns it on so a
         non-converged replicate is dropped rather than counted as a zero effect.
+    target
+        Which greenery term the metric scores — one of :data:`ASSOCIATION_TARGETS`.
+        ``level`` (default) is the main-effect association; the ``decline_*``
+        targets score a greenery × time slope (overall / between / within).
     """
     if metric not in MIXEDLM_METRICS:
         raise ValueError(
             f"Unknown metric {metric!r}; expected one of {sorted(MIXEDLM_METRICS)}."
+        )
+    if target not in ASSOCIATION_TARGETS:
+        raise ValueError(
+            f"Unknown target {target!r}; expected one of {sorted(ASSOCIATION_TARGETS)}."
         )
 
     def _degenerate():
@@ -368,29 +473,29 @@ def score_mixedlm(
     ):
         return _degenerate()
 
-    X_full, g_col = _build_fixed_design(
-        g,
-        cov,
-        t,
-        include_time_fixed=include_time_fixed,
-        include_greenery=True,
+    built = _build_target_design(
+        g, cov, t, eids, target=target, include_time_fixed=include_time_fixed,
+        include_target=True,
     )
+    if built is None:  # e.g. a within-person slope with no over-time variation
+        return _degenerate()
+    X_full, g_col = built
     exog_re = _build_re_design(t, random_slope=random_slope)
     result_full = _fit_mixedlm(y, X_full, eids, exog_re)
     if result_full is None:
         return _degenerate()
 
-    # Optional null refit for the LR statistic.
+    # Optional null refit for the LR statistic (drops the scored term only).
     result_null = None
     if metric == "mixedlm_lr" or return_all:
-        X_null, _ = _build_fixed_design(
-            g,
-            cov,
-            t,
-            include_time_fixed=include_time_fixed,
-            include_greenery=False,
+        null_built = _build_target_design(
+            g, cov, t, eids, target=target,
+            include_time_fixed=include_time_fixed, include_target=False,
         )
-        result_null = _fit_mixedlm(y, X_null, eids, exog_re)
+        X_null = null_built[0] if null_built is not None else None
+        result_null = (
+            _fit_mixedlm(y, X_null, eids, exog_re) if X_null is not None else None
+        )
         # A failed null refit would make the LR statistic collapse to 0.0,
         # indistinguishable from a genuinely tiny LR. For a single-metric LR
         # request treat that as a fit failure so the bootstrap can drop it.
@@ -682,6 +787,7 @@ def cluster_bootstrap_metric_ci(
     n_bootstrap: int = 300,
     ci_level: float = 0.95,
     seed: int = 42,
+    target: str = DEFAULT_ASSOCIATION_TARGET,
 ) -> dict:
     """Cluster (entity) bootstrap percentile CI for a ``mixedlm_*`` metric.
 
@@ -744,6 +850,7 @@ def cluster_bootstrap_metric_ci(
             spatial_basis=ss,
             spatial_method=spatial_method,
             nan_on_fail=nan_on_fail,
+            target=target,
         )
 
     result: dict = {
@@ -867,14 +974,7 @@ def decline_terms_mixedlm(
     exog_re = _build_re_design(t, random_slope=random_slope)
 
     # Person-mean (between) and deviation (within) exposure.
-    order = np.argsort(eids, kind="stable")
-    gmean = np.empty_like(g)
-    _, first_idx, counts = np.unique(eids[order], return_index=True, return_counts=True)
-    sums = np.add.reduceat(g[order], first_idx)
-    means = sums / counts
-    gmean[order] = np.repeat(means, counts)
-    gdev = g - gmean
-    within_estimable = float(np.var(gdev)) > 0
+    gmean, gdev, within_estimable = _within_between(g, eids)
 
     def _row(key, entry):
         coef, se, pval = entry

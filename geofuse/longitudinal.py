@@ -77,6 +77,18 @@ SUPPORTED_SCORING_METRICS: tuple[str, ...] = MIXEDLM_METRICS + CROSS_SECTIONAL_M
 # year-to-year only if the user re-runs GVI with new street-view imagery.
 GREENERY_CHANNELS: tuple[str, ...] = ("veg", "terrain", "ndvi")
 
+# Which model term the search optimises the CGI for (see
+# :data:`geofuse.mixed_effects_scoring.ASSOCIATION_TARGETS`). ``level`` is the
+# greenery main-effect association; the ``decline_*`` targets score a greenery ×
+# time slope. Kept here so the spec validates without importing the scorer.
+ASSOCIATION_TARGETS: tuple[str, ...] = (
+    "level",
+    "decline_overall",
+    "decline_average",
+    "decline_change",
+)
+DEFAULT_ASSOCIATION_TARGET = "level"
+
 IntakeMode = Literal["long", "wide"]
 
 
@@ -143,6 +155,9 @@ class LongitudinalSpec:
     random_slope_time: bool = True
     scoring_metric: str = DEFAULT_MIXEDLM_METRIC
     derive_wave_from_date: bool = False
+    # Which greenery term the search optimises the CGI for (one of
+    # ``ASSOCIATION_TARGETS``): the level association or a greenery × time slope.
+    association_target: str = DEFAULT_ASSOCIATION_TARGET
     # Optional post-hoc exposure-decline terms (greenery × time), reported on the
     # winning composite. ``decline_average_exposure`` adds the between-person
     # (person-mean) term; ``decline_exposure_change`` the within-person
@@ -166,6 +181,7 @@ class LongitudinalSpec:
             "random_slope_time": self.random_slope_time,
             "scoring_metric": self.scoring_metric,
             "derive_wave_from_date": self.derive_wave_from_date,
+            "association_target": self.association_target,
             "decline_average_exposure": self.decline_average_exposure,
             "decline_exposure_change": self.decline_exposure_change,
         }
@@ -190,6 +206,9 @@ class LongitudinalSpec:
             random_slope_time=bool(payload.get("random_slope_time", True)),
             scoring_metric=payload.get("scoring_metric", DEFAULT_MIXEDLM_METRIC),
             derive_wave_from_date=bool(payload.get("derive_wave_from_date", False)),
+            association_target=payload.get(
+                "association_target", DEFAULT_ASSOCIATION_TARGET
+            ),
             decline_average_exposure=bool(payload.get("decline_average_exposure", False)),
             decline_exposure_change=bool(payload.get("decline_exposure_change", False)),
         )
@@ -223,6 +242,16 @@ def validate_spec(spec: LongitudinalSpec) -> list[str]:
         errs.append(
             f"scoring_metric must be one of {SUPPORTED_SCORING_METRICS}, "
             f"got {spec.scoring_metric!r}."
+        )
+    if spec.association_target not in ASSOCIATION_TARGETS:
+        errs.append(
+            f"association_target must be one of {ASSOCIATION_TARGETS}, "
+            f"got {spec.association_target!r}."
+        )
+    if spec.association_target != "level" and spec.scoring_metric not in MIXEDLM_METRICS:
+        errs.append(
+            "association_target only applies to a mixed-effects scoring_metric; "
+            f"got target {spec.association_target!r} with metric {spec.scoring_metric!r}."
         )
     for ch in GREENERY_CHANNELS:
         per_wave = spec.greenery_files.get(ch, {})

@@ -352,10 +352,12 @@ def _fusion_restart_summary_lines(p: dict) -> list[str]:
             if derived
             else f"`{lon_payload.get('intake_mode')}` intake"
         )
+        _tgt = lon_payload.get("association_target", "level")
         lines.append(
             f"**Year/wave-aware:** {descriptor}, "
             f"waves={lon_payload.get('wave_labels')}, "
             f"scoring=`{lon_payload.get('scoring_metric')}`"
+            + (f", fit-to=`{_tgt}`" if _tgt and _tgt != "level" else "")
         )
     cgi_grid = p.get("cgi_grid_spacing_m")
     if cgi_grid is not None:
@@ -999,6 +1001,7 @@ def _render_optimization_setup_panel(
         "cross_sectional_date_on": False,
         "mixedlm_random_slope": True,
         "mixedlm_time_fixed": True,
+        "association_target": "level",
         "decline_average_exposure": False,
         "decline_exposure_change": False,
     }
@@ -1557,9 +1560,35 @@ def _render_study_details_panel(
     # ── Longitudinal-only mixed-effects toggles ─────────────────────────
     mixedlm_random_slope = True
     mixedlm_time_fixed = True
+    association_target = "level"
     decline_average_exposure = False
     decline_exposure_change = False
     if is_longitudinal:
+        _target_keys = ["level", "decline_overall", "decline_average", "decline_change"]
+        _target_labels = {
+            "level": "Level — overall association",
+            "decline_overall": "Decline — greenspace × time",
+            "decline_average": "Decline — average exposure",
+            "decline_change": "Decline — exposure change",
+        }
+        _tgt_default = st.session_state.get("fusion_lon_assoc_target", "level")
+        association_target = st.selectbox(
+            "Fit the greenspace formula to",
+            options=_target_keys,
+            index=(
+                _target_keys.index(_tgt_default) if _tgt_default in _target_keys else 0
+            ),
+            format_func=lambda k: _target_labels[k],
+            key="fusion_lon_assoc_target",
+            help=(
+                "What the search tunes the greenspace formula to detect. "
+                "**Level** = association with the outcome itself. **Decline** = "
+                "association with the outcome's rate of change over time — overall "
+                "(greenspace × time), or the between-person (average exposure) / "
+                "within-person (exposure change) part. The objective metric below "
+                "is then computed on the chosen term."
+            ),
+        )
         mc1, mc2 = st.columns(2)
         with mc1:
             mixedlm_random_slope = st.checkbox(
@@ -1884,6 +1913,7 @@ def _render_study_details_panel(
         "n_bins": int(n_bins),
         "mixedlm_random_slope": bool(mixedlm_random_slope),
         "mixedlm_time_fixed": bool(mixedlm_time_fixed),
+        "association_target": str(association_target),
         "decline_average_exposure": bool(decline_average_exposure),
         "decline_exposure_change": bool(decline_exposure_change),
         "resume_existing_study": bool(resume_existing_study),
@@ -4010,6 +4040,7 @@ def render(output_dir: str) -> None:
     lon_include_time_fixed = study_state["mixedlm_time_fixed"]
     lon_decline_between = study_state.get("decline_average_exposure", False)
     lon_decline_within = study_state.get("decline_exposure_change", False)
+    lon_association_target = study_state.get("association_target", "level")
     cgi_grid_spacing_m_param = study_state.get("cgi_grid_spacing_m")
     whole_grid_scaling_param = bool(study_state.get("whole_grid_scaling", False))
     area_balanced_split_param = bool(study_state.get("area_balanced_split", False))
@@ -4216,6 +4247,7 @@ def render(output_dir: str) -> None:
                     scoring_metric=objective_metric,
                     include_time_fixed_effect=lon_include_time_fixed,
                     random_slope_time=lon_random_slope,
+                    association_target=str(lon_association_target),
                     decline_average_exposure=bool(lon_decline_between),
                     decline_exposure_change=bool(lon_decline_within),
                     derive_wave_from_date=False,

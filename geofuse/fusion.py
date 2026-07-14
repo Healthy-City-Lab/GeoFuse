@@ -5063,6 +5063,7 @@ class MetricFusionEngine:
                 return_all=return_all,
                 spatial_basis=spatial_basis,
                 spatial_method=self.spatial_adjust_method,
+                target=spec.association_target,
             )
         return objective_scoring.score(
             metric,
@@ -5990,6 +5991,7 @@ class MetricFusionEngine:
                 n_bootstrap=min(int(n_bootstrap), 300),
                 ci_level=float(ci_level),
                 seed=int(seed),
+                target=spec.association_target,
             )
 
         test_cov = res.get("covariates")
