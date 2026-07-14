@@ -32,22 +32,23 @@ from geofuse.crs_utils import (
 )
 from geofuse.vector_io import geometry_sha256
 
+_MONTH_NAMES = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+]
+
 # ---------------------------------------------------------------------------
 # Tab render entry point
 # ---------------------------------------------------------------------------
 
 
-def _ndvi_scan_outputs(output_dir: str) -> dict[str, dict]:
-    """Discover NDVI result files and return ``{base_name: dataset_dict}``.
-
-    Pure function — no Streamlit calls — so it can run safely in a background
-    thread while workers keep processing.
-    """
+def _ndvi_scan_dir(directory: str) -> dict[str, dict]:
+    """Discover NDVI ``*_ndvi.*`` result sets directly inside ``directory``."""
     from rasterio.warp import transform_bounds
 
     base_names: set[str] = set()
     for pat in ("*_ndvi.tif", "*_ndvi.tiff", "*_ndvi.geojson", "*_ndvi.gpkg"):
-        for p in glob.glob(os.path.join(output_dir, pat)):
+        for p in glob.glob(os.path.join(directory, pat)):
             stem = os.path.basename(p).rsplit(".", 1)[0]
             base_names.add(stem.removesuffix("_ndvi"))
 
@@ -55,14 +56,14 @@ def _ndvi_scan_outputs(output_dir: str) -> dict[str, dict]:
     for base_name in sorted(base_names):
         tif_path = next(
             (
-                os.path.join(output_dir, f"{base_name}_ndvi{ext}")
+                os.path.join(directory, f"{base_name}_ndvi{ext}")
                 for ext in (".tif", ".tiff")
-                if os.path.isfile(os.path.join(output_dir, f"{base_name}_ndvi{ext}"))
+                if os.path.isfile(os.path.join(directory, f"{base_name}_ndvi{ext}"))
             ),
             None,
         )
-        gpkg_path = os.path.join(output_dir, f"{base_name}_ndvi.gpkg")
-        geojson_path = os.path.join(output_dir, f"{base_name}_ndvi.geojson")
+        gpkg_path = os.path.join(directory, f"{base_name}_ndvi.gpkg")
+        geojson_path = os.path.join(directory, f"{base_name}_ndvi.geojson")
 
         try:
             meta: dict | None = None
@@ -104,9 +105,24 @@ def _ndvi_scan_outputs(output_dir: str) -> dict[str, dict]:
                 "results": results_gdf,
                 "meta": meta,
                 "type": "restored",
+                "tif_path": tif_path,
             }
         except Exception as e:
             print(f"Error loading {base_name}: {e}")
+    return found
+
+
+def _ndvi_scan_outputs(output_dir: str) -> dict[str, dict]:
+    """Discover NDVI result sets, including per-year files in temporal folders.
+
+    Scans ``output_dir`` itself plus every ``*_temporal_ndvi/`` job folder
+    produced by the per-year (date-column) mode, so each year appears as its
+    own selectable result. Pure function — no Streamlit calls.
+    """
+    found = _ndvi_scan_dir(output_dir)
+    for folder in glob.glob(os.path.join(output_dir, "*_temporal_ndvi")):
+        if os.path.isdir(folder):
+            found.update(_ndvi_scan_dir(folder))
     return found
 
 
@@ -126,9 +142,16 @@ def _ndvi_restart_summary_lines(p: dict) -> list[str]:
             f"(±{p.get('window_days', '?')} d)"
         )
     elif mode == "column":
+        sm = p.get("season_start_month")
+        em = p.get("season_end_month")
+        season = (
+            f"{_MONTH_NAMES[sm - 1]}–{_MONTH_NAMES[em - 1]}"
+            if sm and em
+            else "?"
+        )
         lines.append(
-            f"**Date column:** `{p.get('date_column', '?')}` "
-            f"(±{p.get('window_days', '?')} d)"
+            f"**Year column:** `{p.get('date_column', '?')}` "
+            f"(per year, {season})"
         )
     lines.append(
         f"**Cloud max:** {p.get('cloud_pct', '?')}% · "
@@ -152,7 +175,7 @@ def _render_ndvi_restart_panel(store, executor, output_dir) -> None:
     rec = store.get(job_id)
     if rec is None:
         return
-    if rec.type == "gvi":
+    if rec.type in ("gvi", "gvi_column"):
         st.info(
             "A restart is pending for a GVI job. Switch to the **GVI "
             "Sourcing** tab to complete it."
@@ -214,12 +237,12 @@ def _render_ndvi_restart_panel(store, executor, output_dir) -> None:
                 **common,
             )
         else:  # ndvi_column
-            # Per-cluster tiles only apply to the single-range path (column
-            # mode produces per-date outputs already).
             executor.submit_ndvi_column_subprocess(
                 record,
                 date_column=str(p.get("date_column", "")),
-                window_days=int(p.get("window_days", 30)),
+                season_start_month=int(p.get("season_start_month", 6)),
+                season_end_month=int(p.get("season_end_month", 9)),
+                save_cluster_tiles=bool(p.get("save_cluster_tiles", False)),
                 **common,
             )
 
@@ -382,7 +405,8 @@ def _render_ndvi_date_config() -> None:
                     "ranges": [(date(2023, 6, 1), date(2023, 9, 30))],
                     "specific_dates": [date(2023, 7, 15)],
                     "window_days_specific": 30,
-                    "window_days_column": 30,
+                    "season_start_month": 6,
+                    "season_end_month": 9,
                 }
             cfg = st.session_state.ndvi_date_configs[fname]
             # Migrate old single-mode format
@@ -394,7 +418,8 @@ def _render_ndvi_date_config() -> None:
                 cfg.setdefault("ranges", [(date(2023, 6, 1), date(2023, 9, 30))])
                 cfg.setdefault("specific_dates", [date(2023, 7, 15)])
                 cfg["window_days_specific"] = cfg.pop("window_days", 30)
-                cfg.setdefault("window_days_column", 30)
+                cfg.setdefault("season_start_month", 6)
+                cfg.setdefault("season_end_month", 9)
 
             today = date.today()
 
@@ -535,26 +560,47 @@ def _render_ndvi_date_config() -> None:
                 if use_column:
                     if use_ranges or use_specific:
                         st.divider()
-                    st.markdown("**Attribute Column**")
+                    st.markdown("**Attribute Column (per-year)**")
                     attr_cols = [c for c in d["raw"].columns if c.lower() != "geometry"]
                     if attr_cols:
-                        col_sel = st.selectbox(
-                            "Date attribute column",
+                        st.selectbox(
+                            "Year / date attribute column",
                             attr_cols,
                             key=f"ndvi_col_{fname}",
                             help=(
-                                "Per-feature dates from this column; composite uses "
-                                "the window below. Produces one merged output for the layer."
+                                "Features are split by the year in this column. Each "
+                                "year is processed as its own NDVI job over only that "
+                                "year's features, into a per-job folder. A shared CRS "
+                                "(chosen from the whole layer) keeps every year aligned."
                             ),
                         )
-                        cfg["window_days_column"] = st.number_input(
-                            "Composite window (± days)",
-                            min_value=7,
-                            max_value=180,
-                            value=cfg.get("window_days_column", 30),
-                            key=f"ndvi_win_c_{fname}",
-                            help="± day window around each feature date for the Earth Engine composite.",
+                        st.caption(
+                            "Growing-season months composited for each year — pick "
+                            "the same months every year for a consistent longitudinal "
+                            "comparison."
                         )
+                        mc1, mc2 = st.columns(2)
+                        cfg["season_start_month"] = mc1.selectbox(
+                            "Season start month",
+                            list(range(1, 13)),
+                            index=cfg.get("season_start_month", 6) - 1,
+                            format_func=lambda m: _MONTH_NAMES[m - 1],
+                            key=f"ndvi_seas_start_{fname}",
+                        )
+                        cfg["season_end_month"] = mc2.selectbox(
+                            "Season end month",
+                            list(range(1, 13)),
+                            index=cfg.get("season_end_month", 9) - 1,
+                            format_func=lambda m: _MONTH_NAMES[m - 1],
+                            key=f"ndvi_seas_end_{fname}",
+                        )
+                        if cfg["season_start_month"] > cfg["season_end_month"]:
+                            st.markdown(
+                                '<p style="color:#ff4b4b;font-size:0.78em;'
+                                'margin:0;">⚠ Start month must be on or before '
+                                "the end month.</p>",
+                                unsafe_allow_html=True,
+                            )
                     else:
                         st.warning("No attribute columns found in this file.")
 
@@ -852,15 +898,27 @@ def render(output_dir: str) -> None:
                         )
                         jobs_started += 1
 
-                # --- Attribute Column job ---
+                # --- Attribute Column (per-year) job ---
                 if use_column:
                     date_col = st.session_state.get(f"ndvi_col_{fname}")
-                    window_days = st.session_state.get(
-                        f"ndvi_win_c_{fname}",
-                        cfg.get("window_days_column", 30),
+                    season_start = int(
+                        st.session_state.get(
+                            f"ndvi_seas_start_{fname}",
+                            cfg.get("season_start_month", 6),
+                        )
+                    )
+                    season_end = int(
+                        st.session_state.get(
+                            f"ndvi_seas_end_{fname}", cfg.get("season_end_month", 9)
+                        )
                     )
                     if not date_col:
                         validation_errors.append(f"{fname}: No date column selected.")
+                    elif season_start > season_end:
+                        validation_errors.append(
+                            f"{fname}: Season start month must be on or before "
+                            "the end month."
+                        )
                     else:
                         record = store.submit(
                             type="ndvi_column",
@@ -871,13 +929,15 @@ def render(output_dir: str) -> None:
                                 "input_fingerprint": ds_fp,
                                 "mode": "column",
                                 "date_column": date_col,
-                                "window_days": window_days,
+                                "season_start_month": season_start,
+                                "season_end_month": season_end,
                                 "cloud_pct": cloud_pct,
                                 "resolution": resolution,
                                 "buffer_m": buffer_m,
                                 "save_geotiff": save_gt,
                                 "save_gpkg": save_gp,
                                 "save_geojson": save_gj,
+                                "save_cluster_tiles": save_ct,
                                 "geometry_sha256": geometry_sha256(d["raw"]),
                             },
                         )
@@ -886,7 +946,8 @@ def render(output_dir: str) -> None:
                             fname=fname,
                             dataset_data=d,
                             date_column=date_col,
-                            window_days=window_days,
+                            season_start_month=season_start,
+                            season_end_month=season_end,
                             cloud_pct=cloud_pct,
                             resolution=resolution,
                             buffer_m=buffer_m,
@@ -894,6 +955,7 @@ def render(output_dir: str) -> None:
                             save_geotiff=save_gt,
                             save_gpkg=save_gp,
                             save_geojson=save_gj,
+                            save_cluster_tiles=save_ct,
                         )
                         jobs_started += 1
 
@@ -1020,9 +1082,11 @@ def render(output_dir: str) -> None:
                     continue
                 ds = st.session_state.ndvi_datasets[ds_name]
 
-                tif_path = os.path.join(output_dir, f"{ds_name}_ndvi.tif")
+                tif_path = ds.get("tif_path") or os.path.join(
+                    output_dir, f"{ds_name}_ndvi.tif"
+                )
                 rendered_from_tif = False
-                if os.path.exists(tif_path):
+                if tif_path and os.path.exists(tif_path):
                     try:
                         # ``extra_nodata_values=(0,)`` because the NDVI
                         # pipeline writes 0 as an undeclared sentinel at the
@@ -1132,8 +1196,11 @@ def render(output_dir: str) -> None:
             for ds_name in search_targets:
                 if ds_name not in st.session_state.ndvi_datasets:
                     continue
-                tif_path = os.path.join(output_dir, f"{ds_name}_ndvi.tif")
-                if os.path.exists(tif_path):
+                ds_entry = st.session_state.ndvi_datasets[ds_name]
+                tif_path = ds_entry.get("tif_path") or os.path.join(
+                    output_dir, f"{ds_name}_ndvi.tif"
+                )
+                if tif_path and os.path.exists(tif_path):
                     with rasterio.open(tif_path) as src:
                         try:
                             r, c = src.index(lon, lat)

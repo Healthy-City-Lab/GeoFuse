@@ -23,8 +23,8 @@ streamlit run ui/app.py
 
 ### Typical workflow
 
-1. **NDVI tab** — upload a study area, set a date range, pick output formats (GeoTIFF default), run.
-2. **GVI tab** — upload the same study area, set grid resolution + buffer, pick output formats (GeoPackage default), generate grids, run.
+1. **NDVI tab** — upload a study area, set a date range, pick output formats (GeoTIFF default), run. For year-by-year data, use **Attribute Column (per-year)**: pick the year/date column and the growing-season months, and each year is processed as its own aligned NDVI raster into a `{name}_temporal_ndvi/` folder.
+2. **GVI tab** — upload the same study area, set grid resolution + buffer, pick output formats (GeoPackage default), generate grids, run. To match a past year, enable **Target a specific capture year** and set the year; add **Limit maximum year difference** to skip points with no capture close enough. The chosen capture date appears in the `pano_date` output column and the sample-point tooltips. For year-by-year data, enable **Use a year/date column (per-year runs)** and pick the column — each year runs separately (target year = that year) into a `{name}_temporal_gvi/` folder, all sharing one CRS.
 3. **Fusion tab** — upload an outcome target — a vector (GeoJSON, Shapefile, or GeoPackage) or raster (GeoTIFF) layer — plus the GVI + NDVI files from steps 1–2, choose a run mode and objective, and run the optimization.
 4. Inspect the composite weights, statistics, and maps; export results.
 

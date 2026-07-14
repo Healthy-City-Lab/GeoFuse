@@ -87,7 +87,8 @@ def run_ndvi_column_child(
     fname: str,
     dataset_data: dict,
     date_column: str,
-    window_days: int,
+    season_start_month: int,
+    season_end_month: int,
     cloud_pct: int,
     resolution: int,
     buffer_m: int,
@@ -95,10 +96,13 @@ def run_ndvi_column_child(
     save_geotiff: bool,
     save_geojson: bool,
     save_gpkg: bool,
+    save_cluster_tiles: bool,
+    satellite: str,
+    coverage_rescue: bool,
     event_queue,
     cancel_event,
 ) -> None:
-    """Subprocess entry point for ``run_ndvi_column`` (per-feature dates)."""
+    """Subprocess entry point for ``run_ndvi_column`` (one raster per year)."""
     try:
         route_engine_logging_to_queue(job_id, event_queue)
 
@@ -110,7 +114,8 @@ def run_ndvi_column_child(
             fname=fname,
             dataset_data=dataset_data,
             date_column=date_column,
-            window_days=window_days,
+            season_start_month=season_start_month,
+            season_end_month=season_end_month,
             cloud_pct=cloud_pct,
             resolution=resolution,
             buffer_m=buffer_m,
@@ -118,6 +123,9 @@ def run_ndvi_column_child(
             save_geotiff=save_geotiff,
             save_geojson=save_geojson,
             save_gpkg=save_gpkg,
+            save_cluster_tiles=save_cluster_tiles,
+            satellite=satellite,
+            coverage_rescue=coverage_rescue,
         )
         event_queue.put((MSG_COMPLETE, list(result.get("output_paths") or [])))
 

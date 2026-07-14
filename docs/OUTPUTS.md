@@ -7,7 +7,7 @@ All outputs are written under `output_results/` by default.
 Every raster and vector output — GeoTIFFs, GeoPackages, per-cluster tiles, and the fusion composite — ships in the **engine-selected planar CRS** (UTM, Lambert Conformal Conic, or Polar Stereographic, chosen from the input geometry). Cells stay square in metres, index values never pass through a resampler, and downstream tools read the embedded CRS automatically. The exact CRS for a run is recorded in its `_gvi.json` / `_ndvi.json` sidecar.
 
 > [!NOTE]
-> **GeoJSON is the one exception.** `*_gvi.geojson`, `*_ndvi.geojson`, and `*_temporal_ndvi.geojson` are reprojected to **EPSG:4326** (lon/lat) at write time, because the format has no reliable CRS metadata. Use GeoPackage for analysis in the planar CRS.
+> **GeoJSON is the one exception.** `*_gvi.geojson` and `*_ndvi.geojson` (including the per-year files inside `*_temporal_gvi/` and `*_temporal_ndvi/` folders) are reprojected to **EPSG:4326** (lon/lat) at write time, because the format has no reliable CRS metadata. Use GeoPackage for analysis in the planar CRS.
 
 ---
 
@@ -24,6 +24,7 @@ GeoPackage (layer `gvi_samples`) of sampled points in the planar CRS:
 | `gvi_veg` | Green View Index — vegetation (%) |
 | `gvi_ter` | Green View Index — terrain (%) |
 | `pano_id` | Source Street View panorama ID |
+| `pano_date` | Capture date of the panorama used (`YYYY-MM`) |
 | `lat`, `lon` | Geographic coordinates of the panorama |
 | `row`, `col` | Position on the shared anchored grid |
 | `cluster_id` | Spatial cluster the point belongs to |
@@ -41,6 +42,10 @@ One dense GeoTIFF per spatial cluster, plus a `tiles_index.json` locating each t
 ### `[name]_gvi.geojson` — optional (GeoJSON on)
 
 The same points reprojected to EPSG:4326 for web-map tools.
+
+### `[name]_temporal_gvi/` — per-year mode (year/date column)
+
+When you run GVI with a year/date column, the layer is split by year and each year is processed as its own GVI job into this folder: `{name}_{year}_gvi.gpkg` (+ optional `.geojson`, `_gvi_tiles/`, and `_gvi.json` sidecar) per year. Every year is measured at the Street View capture nearest that year and shares one planar CRS chosen from the whole layer, so the years align pixel-for-pixel. The capture date used sits in each file's `pano_date` column.
 
 ### Optional debug outputs
 
@@ -70,7 +75,6 @@ Per-pixel point data. The GeoPackage is in the planar CRS and loads far faster a
 | Field | Description |
 | --- | --- |
 | `NDVI` | Normalized Difference Vegetation Index (−1 to 1) |
-| `ndvi_date` | Source date (attribute-column mode only) |
 
 ### `[name]_ndvi_tiles/` — optional (Per-cluster tiles)
 
@@ -91,6 +95,10 @@ Lets fusion and custom tools introspect a raster without re-running Earth Engine
 | `n_clusters` / `tiles_total` / `tiles_succeeded` / `tiles_failed` / `tiles_resumed` | How the input decomposed and how tiling went |
 | `failed_tile_refs` | Tiles that exhausted retries (appear as NaN gaps), for auditing |
 | `distortion` | Max relative map distortion across the extent |
+
+### `[name]_temporal_ndvi/` — per-year mode (year/date column)
+
+When you run NDVI with a year/date column, the layer is split by year and each year is processed as its own NDVI job into this folder: `{name}_{year}_ndvi.tif` (+ optional GeoPackage/GeoJSON/tiles and `_ndvi.json` sidecar) per year. Each year is composited over the same growing-season months you choose (e.g. June–September) of that year, and every year shares one planar CRS chosen from the whole layer, so the years align pixel-for-pixel.
 
 ---
 

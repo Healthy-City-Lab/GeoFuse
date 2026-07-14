@@ -80,6 +80,15 @@ from .vision import DeepLabSegmenter, get_best_device
 
 _log = get_logger("GVI")
 
+
+def _format_pano_date(date: tuple[int, int] | None) -> str | None:
+    """Render a ``(year, month)`` capture date as ``"YYYY-MM"``, or ``None``."""
+    try:
+        year, month = date
+        return f"{int(year):04d}-{int(month):02d}"
+    except (TypeError, ValueError):
+        return None
+
 # Search radius (metres) for find_panorama_async around each grid point.
 _SEARCH_RADIUS_M = 50.0
 # Zoom level for tile downloads: 0 = lowest, 5 = highest. zoom=1 is a 2×1
@@ -160,6 +169,8 @@ class GVIEngine:
         failed_panos: set,
         cancel_callback: Callable[..., bool] | None,
         gpu_lock: asyncio.Lock,
+        target_year: int | None,
+        max_year_diff: int | None,
     ) -> dict:
         idx = pt["orig_index"]
         lat, lon = pt["lat"], pt["lon"]
@@ -199,7 +210,30 @@ class GVIEngine:
             _log("WARN", f"  Point {idx}: no panoramas within {_SEARCH_RADIUS_M:.0f} m")
             return self._empty_result(pt, search_lat, search_lon)
 
-        pid = pano.id
+        # Pick which dated capture to use. Without a target year we keep the
+        # panorama the search returned (the most recent coverage).
+        download_pano = pano
+        pano_date = getattr(pano, "date", None)
+        if target_year is not None:
+            capture = pano.select_capture(target_year, max_year_diff)
+            if capture is None:
+                _log(
+                    "WARN",
+                    f"  Point {idx}: no capture within "
+                    f"{max_year_diff} yr of {target_year} "
+                    f"(available: {[c.year for c in pano.captures]})",
+                )
+                return self._empty_result(pt, search_lat, search_lon)
+            if capture.id != pano.id:
+                download_pano = pano.clone_for_capture(capture)
+            pano_date = (
+                (capture.year, capture.month)
+                if capture.year is not None and capture.month is not None
+                else None
+            )
+
+        pid = download_pano.id
+        pano_date_str = _format_pano_date(pano_date)
         short = pid[:12]
 
         # 2. Cache lookups (run-local fail set + persistent success cache)
@@ -215,7 +249,13 @@ class GVIEngine:
                 f"ter={cached['ter']:.3f}",
             )
             return self._make_result(
-                pt, search_lat, search_lon, cached["veg"], cached["ter"], pid
+                pt,
+                search_lat,
+                search_lon,
+                cached["veg"],
+                cached["ter"],
+                pid,
+                pano_date_str,
             )
 
         # 3. Download tiles — no lock. All workers can fetch tiles in parallel
@@ -223,7 +263,7 @@ class GVIEngine:
         _log("INFO", f"  Downloading {short}… (zoom={_DOWNLOAD_ZOOM})")
         try:
             raw_image = await asyncio.wait_for(
-                gsv.get_panorama_async(pano, session, zoom=_DOWNLOAD_ZOOM),
+                gsv.get_panorama_async(download_pano, session, zoom=_DOWNLOAD_ZOOM),
                 timeout=_DOWNLOAD_TIMEOUT_S,
             )
         except TimeoutError:
@@ -294,7 +334,13 @@ class GVIEngine:
                     f"veg={cached['veg']:.3f} ter={cached['ter']:.3f}",
                 )
                 return self._make_result(
-                    pt, search_lat, search_lon, cached["veg"], cached["ter"], pid
+                    pt,
+                    search_lat,
+                    search_lon,
+                    cached["veg"],
+                    cached["ter"],
+                    pid,
+                    pano_date_str,
                 )
 
             _log("INFO", f"  Running segmentation for {short}…")
@@ -361,7 +407,9 @@ class GVIEngine:
                         f"  Failed to save mask {short}…: " f"{type(e).__name__}: {e}",
                     )
 
-        return self._make_result(pt, search_lat, search_lon, val_veg, val_ter, pid)
+        return self._make_result(
+            pt, search_lat, search_lon, val_veg, val_ter, pid, pano_date_str
+        )
 
     @staticmethod
     def _empty_result(pt: dict, search_lat: float, search_lon: float) -> dict:
@@ -371,6 +419,7 @@ class GVIEngine:
             "gvi_veg": None,
             "gvi_ter": None,
             "pano_id": None,
+            "pano_date": None,
             "lat": search_lat,
             "lon": search_lon,
             "row": pt["row"],
@@ -380,7 +429,13 @@ class GVIEngine:
 
     @staticmethod
     def _make_result(
-        pt: dict, search_lat: float, search_lon: float, val_veg, val_ter, pid: str
+        pt: dict,
+        search_lat: float,
+        search_lon: float,
+        val_veg,
+        val_ter,
+        pid: str,
+        pano_date: str | None = None,
     ) -> dict:
         return {
             "orig_index": pt["orig_index"],
@@ -388,6 +443,7 @@ class GVIEngine:
             "gvi_veg": float(val_veg) if val_veg is not None else None,
             "gvi_ter": float(val_ter) if val_ter is not None else None,
             "pano_id": pid,
+            "pano_date": pano_date,
             "lat": search_lat,
             "lon": search_lon,
             "row": pt["row"],
@@ -408,6 +464,8 @@ class GVIEngine:
         progress_callback: Callable | None,
         result_callback: Callable | None,
         cancel_callback: Callable | None,
+        target_year: int | None,
+        max_year_diff: int | None,
     ) -> None:
         # Run-local set: tracks panos that already failed in *this* run.
         # Never written to pano_cache (which is the persistent session cache).
@@ -447,6 +505,8 @@ class GVIEngine:
                             failed_panos,
                             cancel_callback,
                             gpu_lock,
+                            target_year,
+                            max_year_diff,
                         )
                     except asyncio.CancelledError:
                         return
@@ -508,8 +568,20 @@ class GVIEngine:
         result_callback=None,
         cancel_callback=None,
         start_index=0,
+        target_year=None,
+        max_year_diff=None,
     ):
         _log("INFO", f"Starting Analysis (Resume Index: {start_index})...")
+        if target_year is not None:
+            _log(
+                "INFO",
+                f"Target capture year: {target_year}"
+                + (
+                    f" (±{max_year_diff} yr max)"
+                    if max_year_diff is not None
+                    else " (closest available)"
+                ),
+            )
         os.makedirs(folder, exist_ok=True)
         if save_panos:
             os.makedirs(os.path.join(folder, "images"), exist_ok=True)
@@ -600,6 +672,8 @@ class GVIEngine:
                 progress_callback=_progress_cb,
                 result_callback=result_callback,
                 cancel_callback=cancel_callback,
+                target_year=target_year,
+                max_year_diff=max_year_diff,
             )
         )
 

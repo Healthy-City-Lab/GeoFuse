@@ -35,6 +35,7 @@ _EMOJI = {
     "ndvi": "🛰️",
     "ndvi_column": "🛰️",
     "gvi": "🌳",
+    "gvi_column": "🌳",
 }
 _TERMINAL_LABELS = {
     "completed": "✅ Completed",
@@ -43,7 +44,7 @@ _TERMINAL_LABELS = {
     "error": "❌ Error",
 }
 
-_RESTART_ELIGIBLE_TYPES = {"gvi", "ndvi", "ndvi_column", "fusion"}
+_RESTART_ELIGIBLE_TYPES = {"gvi", "gvi_column", "ndvi", "ndvi_column", "fusion"}
 _RESTART_ELIGIBLE_STATUSES = {"interrupted", "cancelled", "error"}
 
 
@@ -139,9 +140,15 @@ def _fmt_timestamp(iso: str) -> str:
 def _render_details(rec) -> None:
     """Key/value summary of job parameters inside the Details expander."""
     p = rec.params or {}
-    if rec.type == "gvi":
+    if rec.type in ("gvi", "gvi_column"):
         st.write(f"**Grid step:** {p.get('step', '?')} m")
         st.write(f"**Buffer:** {p.get('buffer', '?')} m")
+        if rec.type == "gvi_column":
+            max_diff = p.get("max_year_diff")
+            st.write(
+                f"**Per year** from column `{p.get('date_column', '?')}`"
+                + (f" (±{max_diff} yr max)" if max_diff is not None else "")
+            )
         st.write(
             f"**Save panos / masks:** "
             f"{bool(p.get('save_panos'))} / {bool(p.get('save_masks'))}"
@@ -166,9 +173,12 @@ def _render_details(rec) -> None:
                 f"(window ±{p.get('window_days', '?')} d)"
             )
         elif mode == "column":
+            sm = p.get("season_start_month")
+            em = p.get("season_end_month")
+            season = f"months {sm}–{em}" if sm and em else "?"
             st.write(
-                f"**Date column:** {p.get('date_column', '?')} "
-                f"(window ±{p.get('window_days', '?')} d)"
+                f"**Year column:** {p.get('date_column', '?')} "
+                f"(per year, {season})"
             )
         st.write(f"**Cloud max:** {p.get('cloud_pct', '?')}%")
         st.write(f"**Resolution:** {p.get('resolution', '?')} m")

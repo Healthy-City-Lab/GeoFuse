@@ -438,6 +438,18 @@ class NDVIEngine:
             root = tile_cache_dir if tile_cache_dir is not None else _TILE_CACHE_ROOT
             self.tile_cache = NdviTileCache(root, max_bytes=tile_cache_max_bytes)
 
+    @staticmethod
+    def compute_export_crs(gdf: gpd.GeoDataFrame):
+        """Select the export CRS for a geometry once, for reuse across runs.
+
+        Returns the same ``(ee_string, crs_obj, distortion, choice_name)``
+        tuple :meth:`download_and_process` computes internally. Pass it back in
+        via ``crs_override`` so several downloads (e.g. per-year slices) share
+        one CRS and snap to the same global pixel grid.
+        """
+        geom_wgs84 = reproject_geodataframe_to_wgs84(gdf)
+        return _select_export_crs(geom_wgs84)
+
     def prep_ndvi(self, img):
         scale = 0.0001
         red = img.select("B4").multiply(scale)
@@ -742,6 +754,7 @@ class NDVIEngine:
         write_cluster_tiles: bool = False,
         satellite: str = "auto",
         coverage_rescue: bool = True,
+        crs_override=None,
     ):
         """
         Download and process NDVI data with automatic tiling for large areas.
@@ -806,10 +819,15 @@ class NDVIEngine:
             aoi = shapely_to_ee_geometry(geom_for_ee_gdf.geometry.iloc[0])
 
         # 2. Pick an EE export CRS so pixels are rasterised in true ground
-        # metres regardless of latitude.
-        export_crs, grid_crs, export_distortion, export_crs_name = _select_export_crs(
-            geom_for_crs
-        )
+        # metres regardless of latitude. A caller running several downloads
+        # that must align (per-year slices of one dataset) passes a shared
+        # ``crs_override`` so every export snaps to the same global grid.
+        if crs_override is not None:
+            export_crs, grid_crs, export_distortion, export_crs_name = crs_override
+        else:
+            export_crs, grid_crs, export_distortion, export_crs_name = (
+                _select_export_crs(geom_for_crs)
+            )
 
         # Global snap grid for every EE export in this run. Anchoring the
         # transform at (0, 0) in the planar CRS means adjacent tiles share

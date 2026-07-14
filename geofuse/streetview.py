@@ -36,7 +36,7 @@ import io
 import itertools
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
 
@@ -65,18 +65,93 @@ class Tile:
 
 
 @dataclass
+class PanoCapture:
+    """One capture (panorama id + capture date) available at a location.
+
+    Google Street View re-photographs the same spot over the years; each
+    pass is a distinct panorama with its own id and ``(year, month)``.
+    ``year`` / ``month`` are ``None`` only when the date could not be parsed.
+    """
+
+    id: str
+    year: int | None
+    month: int | None
+
+
+@dataclass
 class StreetViewPanorama:
-    """Minimal Street View panorama metadata: ID, location, image grid."""
+    """Minimal Street View panorama metadata: ID, location, image grid.
+
+    ``date`` is this panorama's own ``(year, month)`` capture date, and
+    ``captures`` lists every capture available at this location (this
+    panorama plus its historical passes), newest first.
+    """
 
     id: str
     lat: float
     lon: float
     tile_size: Size
     image_sizes: list[Size]
+    date: tuple[int, int] | None = None
+    captures: list[PanoCapture] = field(default_factory=list)
 
     @property
     def is_third_party(self) -> bool:
         return is_third_party_panoid(self.id)
+
+    def select_capture(
+        self, target_year: int, max_year_diff: int | None = None
+    ) -> PanoCapture | None:
+        """Pick the capture closest to ``target_year``.
+
+        When ``max_year_diff`` is given, captures further than that many years
+        from the target are filtered out first; if none survive the filter,
+        returns ``None``. Ties resolve to the most recent capture.
+        """
+        caps = self.captures
+        if not caps:
+            # No temporal metadata was parsed. A hard window can't be
+            # verified against an unknown date, so decline it; otherwise fall
+            # back to this panorama itself.
+            if max_year_diff is not None:
+                return None
+            if self.date is not None:
+                return PanoCapture(self.id, self.date[0], self.date[1])
+            return PanoCapture(self.id, None, None)
+
+        candidates = caps
+        if max_year_diff is not None:
+            candidates = [
+                c
+                for c in caps
+                if c.year is not None and abs(c.year - target_year) <= max_year_diff
+            ]
+        if not candidates:
+            return None
+        return min(
+            candidates,
+            key=lambda c: (abs(c.year - target_year), -c.year, -(c.month or 0)),
+        )
+
+    def clone_for_capture(self, capture: PanoCapture) -> StreetViewPanorama:
+        """A downloadable panorama for ``capture`` reusing this pano's tiling.
+
+        Street View panoramas share one tiling scheme (512-px tiles, fixed
+        power-of-two image sizes per zoom), so a historical capture downloads
+        through the same tile endpoint with the current pano's geometry.
+        """
+        return StreetViewPanorama(
+            id=capture.id,
+            lat=self.lat,
+            lon=self.lon,
+            tile_size=self.tile_size,
+            image_sizes=self.image_sizes,
+            date=(
+                (capture.year, capture.month)
+                if capture.year is not None and capture.month is not None
+                else None
+            ),
+        )
 
 
 def is_third_party_panoid(panoid: str) -> bool:
@@ -204,6 +279,58 @@ def _parse_radius_response(response: list) -> StreetViewPanorama | None:
         return None
 
 
+def _parse_date(raw) -> tuple[int, int] | None:
+    """Parse a ``[year, month, …]`` date list into ``(year, month)``."""
+    try:
+        return int(raw[0]), int(raw[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def _parse_captures(
+    msg, current_id: str, current_date: tuple[int, int] | None
+) -> list[PanoCapture]:
+    """Every capture at this location: the current pano plus historical passes.
+
+    The current pano's date lives at ``msg[6][7]``; the historical timeline at
+    ``msg[5][0][8]`` is a list of ``[index_into_pano_array, [year, month], …]``
+    where the index points into the panorama array at ``msg[5][0][3][0]``.
+    Returns captures newest-first, de-duplicated by panorama id.
+    """
+    captures: list[PanoCapture] = []
+    if current_date is not None:
+        captures.append(PanoCapture(current_id, current_date[0], current_date[1]))
+
+    try:
+        panos = msg[5][0][3][0]
+        timeline = msg[5][0][8]
+    except (IndexError, TypeError):
+        panos = timeline = None
+
+    if isinstance(timeline, list) and isinstance(panos, list):
+        for entry in timeline:
+            try:
+                idx = entry[0]
+                date = _parse_date(entry[1])
+                pid = panos[idx][0][1]
+            except (IndexError, TypeError):
+                continue
+            if date is None:
+                continue
+            captures.append(PanoCapture(pid, date[0], date[1]))
+
+    seen: set[str] = set()
+    unique: list[PanoCapture] = []
+    for c in sorted(
+        captures, key=lambda c: (c.year or 0, c.month or 0), reverse=True
+    ):
+        if c.id in seen:
+            continue
+        seen.add(c.id)
+        unique.append(c)
+    return unique
+
+
 def _parse_pano_message(msg) -> StreetViewPanorama:
     """Pull the minimum fields needed for tile download from the protobuf-as-list."""
     panoid = msg[1][1]
@@ -212,12 +339,18 @@ def _parse_pano_message(msg) -> StreetViewPanorama:
     tile_size = Size(msg[2][3][1][0], msg[2][3][1][1])
     lat = msg[5][0][1][0][2]
     lon = msg[5][0][1][0][3]
+    try:
+        date = _parse_date(msg[6][7])
+    except (IndexError, TypeError):
+        date = None
     return StreetViewPanorama(
         id=panoid,
         lat=lat,
         lon=lon,
         tile_size=tile_size,
         image_sizes=image_sizes,
+        date=date,
+        captures=_parse_captures(msg, panoid, date),
     )
 
 

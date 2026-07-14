@@ -92,3 +92,56 @@ def run_gvi_child(
             )
         except Exception:
             pass
+
+
+def run_gvi_column_child(
+    job_id: str,
+    fname: str,
+    dataset_data: dict,
+    date_column: str,
+    init_args: dict,
+    run_args: dict,
+    output_dir: str,
+    save_geotiff: bool,
+    save_geojson: bool,
+    save_gpkg: bool,
+    pano_cache_db_path: str,
+    event_queue,
+    cancel_event,
+) -> None:
+    """Entry point for the per-year GVI column job. See :func:`run_gvi_child`."""
+    try:
+        route_engine_logging_to_queue(job_id, event_queue)
+
+        from geofuse.jobs.runners import run_gvi_column
+        from geofuse.persistence.pano_cache import PanoCache
+
+        pano_cache = PanoCache(pano_cache_db_path)
+        dataset_data["cache_ref"] = pano_cache
+
+        ctx = SubprocJobContext(job_id, event_queue, cancel_event)
+        gpu_lock = threading.Lock()
+
+        result = run_gvi_column(
+            ctx,
+            fname=fname,
+            dataset_data=dataset_data,
+            date_column=date_column,
+            init_args=init_args,
+            run_args=run_args,
+            output_dir=output_dir,
+            save_geotiff=save_geotiff,
+            save_geojson=save_geojson,
+            save_gpkg=save_gpkg,
+            gpu_lock=gpu_lock,
+        )
+
+        event_queue.put((MSG_COMPLETE, list(result.get("output_paths") or [])))
+
+    except BaseException as exc:  # noqa: BLE001 — surface ANY failure to parent
+        try:
+            event_queue.put(
+                (MSG_ERROR, f"{type(exc).__name__}: {exc}", traceback.format_exc())
+            )
+        except Exception:
+            pass

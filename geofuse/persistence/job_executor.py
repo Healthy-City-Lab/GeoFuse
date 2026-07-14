@@ -435,7 +435,8 @@ class JobExecutor:
         fname: str,
         dataset_data: dict,
         date_column: str,
-        window_days: int,
+        season_start_month: int,
+        season_end_month: int,
         cloud_pct: int,
         resolution: int,
         buffer_m: int,
@@ -443,8 +444,11 @@ class JobExecutor:
         save_geotiff: bool,
         save_geojson: bool,
         save_gpkg: bool,
+        save_cluster_tiles: bool = False,
+        satellite: str = "auto",
+        coverage_rescue: bool = True,
     ) -> Future:
-        """Run an NDVI per-feature-date job in a fresh subprocess."""
+        """Run a per-year NDVI (date-column) job in a fresh subprocess."""
         from geofuse.jobs.ndvi_subprocess import run_ndvi_column_child
 
         shippable = _trim_ndvi_dataset_for_subprocess(dataset_data)
@@ -456,7 +460,8 @@ class JobExecutor:
                 fname=fname,
                 dataset_data=shippable,
                 date_column=date_column,
-                window_days=window_days,
+                season_start_month=season_start_month,
+                season_end_month=season_end_month,
                 cloud_pct=cloud_pct,
                 resolution=resolution,
                 buffer_m=buffer_m,
@@ -464,8 +469,49 @@ class JobExecutor:
                 save_geotiff=save_geotiff,
                 save_geojson=save_geojson,
                 save_gpkg=save_gpkg,
+                save_cluster_tiles=save_cluster_tiles,
+                satellite=satellite,
+                coverage_rescue=coverage_rescue,
             ),
             process_name=f"ndvi-col-child-{record.id}",
+        )
+
+    def submit_gvi_column_subprocess(
+        self,
+        record: JobRecord,
+        *,
+        fname: str,
+        dataset_data: dict,
+        date_column: str,
+        init_args: dict,
+        run_args: dict,
+        output_dir: str,
+        save_geotiff: bool,
+        save_geojson: bool,
+        save_gpkg: bool,
+        pano_cache_db_path: str,
+    ) -> Future:
+        """Run a per-year GVI (date-column) job in a fresh subprocess."""
+        from geofuse.jobs.gvi_subprocess import run_gvi_column_child
+
+        shippable = {k: v for k, v in dataset_data.items() if k != "cache_ref"}
+        return self.submit_subprocess_job(
+            record,
+            run_gvi_column_child,
+            dict(
+                job_id=record.id,
+                fname=fname,
+                dataset_data=shippable,
+                date_column=date_column,
+                init_args=init_args,
+                run_args=run_args,
+                output_dir=output_dir,
+                save_geotiff=save_geotiff,
+                save_geojson=save_geojson,
+                save_gpkg=save_gpkg,
+                pano_cache_db_path=pano_cache_db_path,
+            ),
+            process_name=f"gvi-col-child-{record.id}",
         )
 
     def shutdown(self, wait: bool = True) -> None:

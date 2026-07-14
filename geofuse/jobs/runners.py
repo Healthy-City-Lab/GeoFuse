@@ -151,6 +151,8 @@ def run_gvi(
         result_callback=on_result,
         cancel_callback=check_cancel,
         start_index=start_idx,
+        target_year=run_args.get("target_year"),
+        max_year_diff=run_args.get("max_year_diff"),
     )
 
     if ctx.is_cancelled():
@@ -158,18 +160,44 @@ def run_gvi(
 
     ctx.progress(value=1.0, status_text="Writing outputs")
 
-    res_df = gpd.GeoDataFrame(
-        dataset_data["accumulated"], crs=dataset_data["processed"].crs
+    output_paths, res_df = _write_gvi_outputs(
+        accumulated=dataset_data["accumulated"],
+        processed_crs=dataset_data["processed"].crs,
+        meta=dataset_data.get("meta") or {},
+        out_name=os.path.splitext(fname)[0],
+        output_dir=output_dir,
+        save_gpkg=save_gpkg,
+        save_geotiff=save_geotiff,
+        save_geojson=save_geojson,
     )
+    dataset_data["results"] = res_df
+    return {"output_paths": output_paths}
+
+
+def _write_gvi_outputs(
+    *,
+    accumulated: list,
+    processed_crs,
+    meta: dict,
+    out_name: str,
+    output_dir: str,
+    save_gpkg: bool,
+    save_geotiff: bool,
+    save_geojson: bool,
+) -> tuple[list[str], gpd.GeoDataFrame]:
+    """Write a GVI result set (GeoPackage / GeoJSON / per-cluster GeoTIFF).
+
+    Shared by :func:`run_gvi` and :func:`run_gvi_column`; returns the written
+    paths and the result GeoDataFrame (reprojected to the grid's planar CRS).
+    """
+    res_df = gpd.GeoDataFrame(accumulated, crs=processed_crs)
     if "orig_index" in res_df.columns:
         res_df.set_index("orig_index", inplace=True)
         res_df.index.name = None
     if res_df.crs is None:
         res_df = res_df.set_crs("EPSG:4326")
 
-    out_name = os.path.splitext(fname)[0]
     output_paths: list[str] = []
-    meta = dataset_data.get("meta") or {}
     grid_crs_wkt = meta.get("grid_crs_wkt")
     clusters = meta.get("clusters") or []
 
@@ -179,7 +207,6 @@ def run_gvi(
     # (direct API callers with point inputs + buffer=0).
     if grid_crs_wkt:
         res_df = res_df.to_crs(grid_crs_wkt)
-    dataset_data["results"] = res_df
 
     if save_gpkg:
         gpkg_path = os.path.join(output_dir, f"{out_name}_gvi.gpkg")
@@ -294,6 +321,143 @@ def run_gvi(
                 indent=2,
             )
 
+    return output_paths, res_df
+
+
+def run_gvi_column(
+    ctx: JobContext,
+    *,
+    fname: str,
+    dataset_data: dict,
+    date_column: str,
+    init_args: dict,
+    run_args: dict,
+    output_dir: str,
+    save_geotiff: bool,
+    save_geojson: bool,
+    gpu_lock: threading.Lock,
+    save_gpkg: bool = True,
+) -> dict:
+    """Run one GVI analysis per year present in ``date_column``.
+
+    The input is split by year; each year is processed as a standalone GVI job
+    over only that year's features, with ``target_year`` set to that year so
+    every sampling point uses the Street View capture nearest it. The grid CRS
+    is chosen once from the whole dataset — before the split — so all years'
+    grids share one planar CRS and align. Results land in a
+    ``{name}_temporal_gvi/`` folder, one set of files per year.
+    """
+    from geofuse.core import generate_clustered_grid
+    from geofuse.crs_utils import select_grid_crs_with_warning
+    from geofuse.longitudinal import parse_date_column
+
+    raw = dataset_data["raw"]
+    gdf_4326 = (
+        raw
+        if raw.crs is not None and raw.crs.is_geographic
+        else raw.to_crs("EPSG:4326")
+    ).copy()
+    parsed = parse_date_column(gdf_4326[date_column])
+    gdf_4326["_year"] = parsed.dt.year
+    gdf_4326 = gdf_4326.dropna(subset=["_year"])
+    if gdf_4326.empty:
+        raise ValueError(
+            f"No valid years could be parsed from column '{date_column}'."
+        )
+    gdf_4326["_year"] = gdf_4326["_year"].astype(int)
+
+    unique_years = sorted(gdf_4326["_year"].unique())
+    n_years = len(unique_years)
+
+    # Grid CRS chosen once from the whole dataset so every per-year grid aligns.
+    grid_crs, _distortion, _choice = select_grid_crs_with_warning(
+        gdf_4326, _log_gvi, role="Grid CRS"
+    )
+
+    base_name = os.path.splitext(fname)[0]
+    job_folder = os.path.join(output_dir, f"{base_name}_temporal_gvi")
+    os.makedirs(job_folder, exist_ok=True)
+
+    ctx.progress(status_text="Waiting for GPU...")
+    with gpu_lock:
+        if ctx.is_cancelled():
+            return {"output_paths": []}
+        ctx.progress(status_text="Initializing...")
+        engine = _get_gvi_engine(init_args["model_path"], init_args.get("api_key"))
+
+    step = run_args["step"]
+    buffer_m = float(run_args.get("buffer", 0) or 0)
+    max_year_diff = run_args.get("max_year_diff")
+    output_paths: list[str] = [job_folder]
+
+    def check_cancel() -> bool:
+        return ctx.is_cancelled()
+
+    for idx, year in enumerate(unique_years):
+        if ctx.is_cancelled():
+            return {"output_paths": output_paths}
+
+        year_gdf = gdf_4326[gdf_4326["_year"] == year].drop(columns=["_year"])
+        is_poly = year_gdf.geometry.iloc[0].geom_type in ("Polygon", "MultiPolygon")
+        if is_poly or buffer_m > 0:
+            pts, meta = generate_clustered_grid(
+                year_gdf, buffer_m=buffer_m, step_m=float(step), grid_crs=grid_crs
+            )
+        else:
+            pts, meta = year_gdf.copy(), None
+
+        base = idx / max(n_years, 1)
+        span = 1.0 / max(n_years, 1)
+
+        def on_progress(curr: int, total: int, _b=base, _s=span, _y=year) -> None:
+            if total <= 0:
+                return
+            ctx.progress(
+                value=min(_b + _s * (curr / total), 1.0),
+                status_text=f"Year {_y} ({curr}/{total})",
+            )
+            ctx.heartbeat()
+
+        accumulated: list = []
+        results_lock = threading.Lock()
+
+        def on_result(res, _acc=accumulated, _lock=results_lock) -> None:
+            with _lock:
+                _acc.append(res)
+
+        ctx.progress(status_text=f"Processing year {idx + 1}/{n_years}: {year}")
+        engine.run_analysis(
+            pts,
+            step=step,
+            folder=job_folder,
+            save_panos=run_args["save_panos"],
+            save_masks=run_args["save_masks"],
+            external_cache=dataset_data["cache_ref"],
+            progress_callback=on_progress,
+            result_callback=on_result,
+            cancel_callback=check_cancel,
+            target_year=int(year),
+            max_year_diff=max_year_diff,
+        )
+        if ctx.is_cancelled():
+            return {"output_paths": output_paths}
+        if not accumulated:
+            _log_gvi("WARN", f"Year {year}: no results produced.")
+            continue
+
+        paths, _res_df = _write_gvi_outputs(
+            accumulated=accumulated,
+            processed_crs=pts.crs,
+            meta=meta or {},
+            out_name=f"{base_name}_{year}",
+            output_dir=job_folder,
+            save_gpkg=save_gpkg,
+            save_geotiff=save_geotiff,
+            save_geojson=save_geojson,
+        )
+        output_paths.extend(paths)
+
+    ctx.progress(value=1.0, status_text="Completed")
     return {"output_paths": output_paths}
 
 
@@ -411,7 +575,8 @@ def run_ndvi_column(
     fname: str,
     dataset_data: dict,
     date_column: str,
-    window_days: int,
+    season_start_month: int,
+    season_end_month: int,
     cloud_pct: int,
     resolution: int,
     buffer_m: int,
@@ -419,104 +584,109 @@ def run_ndvi_column(
     save_geotiff: bool,
     save_geojson: bool,
     save_gpkg: bool = False,
+    save_cluster_tiles: bool = False,
+    satellite: str = "auto",
+    coverage_rescue: bool = True,
 ) -> dict:
-    """Run NDVI extraction per feature using a date column."""
+    """Run one NDVI raster per year present in ``date_column``.
+
+    The input is split by year; each year is processed as a standalone NDVI
+    job over only that year's features, composited across the growing-season
+    months ``[season_start_month, season_end_month]`` of that year. The export
+    CRS is chosen once from the whole dataset — before the split — so every
+    year's raster snaps to the same global pixel grid and the outputs align.
+    Results land in a ``{name}_temporal_ndvi/`` folder, one set of files per
+    year (``{name}_{year}_ndvi.tif`` plus optional GeoPackage/GeoJSON).
+    """
+    import calendar
+
     from geofuse.crs_utils import buffer_gdf_union_metres
+    from geofuse.longitudinal import parse_date_column
 
     gdf = dataset_data["raw"].copy()
-    gdf["_parsed_date"] = pd.to_datetime(gdf[date_column], errors="coerce")
-    gdf = gdf.dropna(subset=["_parsed_date"])
+    parsed = parse_date_column(gdf[date_column])
+    gdf["_year"] = parsed.dt.year
+    gdf = gdf.dropna(subset=["_year"])
     if gdf.empty:
-        raise ValueError("No valid dates found in the selected column.")
+        raise ValueError(
+            f"No valid years could be parsed from column '{date_column}'."
+        )
+    gdf["_year"] = gdf["_year"].astype(int)
 
-    unique_dates = sorted(gdf["_parsed_date"].dt.date.unique())
-    n_dates = len(unique_dates)
+    unique_years = sorted(gdf["_year"].unique())
+    n_years = len(unique_years)
+
+    # CRS chosen once from the whole dataset so every per-year raster aligns.
+    crs_override = NDVIEngine.compute_export_crs(gdf)
+
+    base_name = os.path.splitext(fname)[0]
+    job_folder = os.path.join(output_dir, f"{base_name}_temporal_ndvi")
+    os.makedirs(job_folder, exist_ok=True)
+
     engine = NDVIEngine()
-    base_extent = gpd.GeoDataFrame(
-        {"geometry": [gdf.geometry.union_all()]}, crs=gdf.crs
-    )
-    full_extent = buffer_gdf_union_metres(base_extent, buffer_m)
-    all_results: list[gpd.GeoDataFrame] = []
-    output_paths: list[str] = []
-    base_name = fname.replace(".geojson", "")
+    output_paths: list[str] = [job_folder]
 
-    for idx, target_date in enumerate(unique_dates):
+    def check_cancel() -> bool:
+        return ctx.is_cancelled()
+
+    for idx, year in enumerate(unique_years):
         if ctx.is_cancelled():
             return {"output_paths": output_paths}
 
-        start_d = target_date - timedelta(days=window_days)
-        end_d = target_date + timedelta(days=window_days)
-        date_str = target_date.strftime("%Y%m%d")
-        tmp_name = f"{base_name}_{date_str}_tmp"
+        year_gdf = gdf[gdf["_year"] == year].drop(columns=["_year"])
+        geometry = buffer_gdf_union_metres(year_gdf, buffer_m)
 
-        ctx.progress(status_text=f"Processing date {idx + 1}/{n_dates}: {target_date}")
+        start_d = f"{year:04d}-{season_start_month:02d}-01"
+        last_day = calendar.monthrange(int(year), int(season_end_month))[1]
+        end_d = f"{year:04d}-{season_end_month:02d}-{last_day:02d}"
+        output_name = f"{base_name}_{year}"
 
-        span = 1.0 / max(n_dates, 1)
-        base = idx / max(n_dates, 1)
+        ctx.progress(
+            status_text=f"Processing year {idx + 1}/{n_years}: {year} "
+            f"({start_d} → {end_d})"
+        )
+        span = 1.0 / max(n_years, 1)
+        base = idx / max(n_years, 1)
         on_progress = _ndvi_on_progress_factory(ctx, base_offset=base, span=span)
 
-        def check_cancel() -> bool:
-            return ctx.is_cancelled()
-
         result = engine.download_and_process(
-            geometry=full_extent,
-            start_date=start_d.isoformat(),
-            end_date=end_d.isoformat(),
-            output_name=tmp_name,
+            geometry=geometry,
+            start_date=start_d,
+            end_date=end_d,
+            output_name=output_name,
             cloud_max=cloud_pct,
             resolution=resolution,
-            folder=output_dir,
+            folder=job_folder,
             cancel_callback=check_cancel,
             ndvi_progress_callback=on_progress,
-            write_geotiff=True,
-            write_geojson=False,
+            write_geotiff=save_geotiff,
+            write_geojson=save_geojson,
+            write_geopackage=save_gpkg,
+            write_cluster_tiles=save_cluster_tiles,
+            satellite=satellite,
+            coverage_rescue=coverage_rescue,
+            crs_override=crs_override,
         )
         if result.get("status") == "cancelled":
             return {"output_paths": output_paths}
         if result.get("status") != "success":
             _log_ndvi(
-                "WARN", f"Column run for {target_date} failed: {result.get('message')}"
+                "WARN", f"Year {year} failed: {result.get('message')}"
             )
             continue
 
-        tif_path = os.path.join(output_dir, f"{tmp_name}_ndvi.tif")
-        if not os.path.exists(tif_path):
-            continue
-
-        # Delegate the exact-pixel sample to the shared helper — it
-        # handles the planar-CRS reprojection, nodata sentinel, and
-        # NaN filtering uniformly with every other raster consumer.
-        date_gdf = gdf[gdf["_parsed_date"].dt.date == target_date].copy()
-        out = sample_raster_at_features(
-            tif_path,
-            date_gdf,
-            band=1,
-            radius_m=0.0,
-            stat="mean",
-            value_column="NDVI",
-        )
-        out["ndvi_date"] = target_date.isoformat()
-        all_results.append(out)
-
-        if not save_geotiff and os.path.isfile(tif_path):
-            os.remove(tif_path)
-        elif save_geotiff:
-            output_paths.append(tif_path)
-
-    if all_results:
-        merged = gpd.GeoDataFrame(
-            pd.concat(all_results, ignore_index=True), crs=all_results[0].crs
-        )
-        merged = merged.drop(columns=["_parsed_date"], errors="ignore")
-        if save_geojson:
-            gj_path = os.path.join(output_dir, f"{base_name}_temporal_ndvi.geojson")
-            reproject_geodataframe_to_wgs84(merged).to_file(gj_path, driver="GeoJSON")
-            output_paths.append(gj_path)
-        if save_gpkg:
-            gpkg_path = os.path.join(output_dir, f"{base_name}_temporal_ndvi.gpkg")
-            merged.to_file(gpkg_path, driver="GPKG", layer="ndvi_samples")
-            output_paths.append(gpkg_path)
-        dataset_data["results"] = merged
+        for suffix, enabled in (
+            ("_ndvi.tif", save_geotiff),
+            ("_ndvi.gpkg", save_gpkg),
+            ("_ndvi.geojson", save_geojson),
+            ("_ndvi.json", True),
+        ):
+            p = os.path.join(job_folder, f"{output_name}{suffix}")
+            if enabled and os.path.exists(p):
+                output_paths.append(p)
+        tiles_dir = os.path.join(job_folder, f"{output_name}_ndvi_tiles")
+        if save_cluster_tiles and os.path.isdir(tiles_dir):
+            output_paths.append(tiles_dir)
 
     ctx.progress(value=1.0, status_text="Completed")
     return {"output_paths": output_paths}

@@ -157,6 +157,7 @@ def generate_clustered_grid(
     buffer_m: float,
     step_m: float,
     anchor: tuple[float, float] = (0.0, 0.0),
+    grid_crs=None,
 ):
     """Cluster-aware anchored sampling grid for nation-scale point inputs.
 
@@ -165,6 +166,10 @@ def generate_clustered_grid(
     grid per cluster snapped to a single global anchor in the planar CRS.
     Sample points across all clusters land on one unified grid so no
     resampling is needed if downstream code rasterizes the output.
+
+    Pass ``grid_crs`` to skip CRS auto-selection and force a specific planar
+    CRS — used when several subsets (e.g. per-year slices of one dataset)
+    must share one CRS so their grids and rasters align pixel-for-pixel.
 
     Returns ``(GeoDataFrame, meta)``:
       * GeoDataFrame columns ``row, col, x, y, cluster_id`` and Point geometry
@@ -176,9 +181,12 @@ def generate_clustered_grid(
         entry per cluster: bounds, height, width, transform — used by the
         per-cluster GeoTIFF writer).
     """
-    grid_crs, distortion, choice_name = select_grid_crs_with_warning(
-        gdf_4326, _log_core, role="Grid CRS"
-    )
+    if grid_crs is not None:
+        distortion, choice_name = 0.0, "forced"
+    else:
+        grid_crs, distortion, choice_name = select_grid_crs_with_warning(
+            gdf_4326, _log_core, role="Grid CRS"
+        )
     gdf_m = gdf_4326.to_crs(grid_crs)
     buffered = gdf_m.geometry.union_all()
     if buffer_m > 0:
