@@ -21,6 +21,12 @@ streamlit run ui/app.py
 > [!NOTE]
 > Jobs survive a browser refresh. Progress is tracked in the **sidebar Job Monitor**, visible from every tab, for all job types (GVI, NDVI, Fusion). GVI, NDVI, and Fusion each run in a separate process so the UI stays responsive and a running job isn't slowed down by keeping the browser tab in the foreground. Multiple study areas with different settings can run in parallel.
 
+### Combining multiple files (NDVI & GVI)
+
+Both tabs run each uploaded file as its own job by default. To combine files, set **File handling** to **Merge into groups**, then **drag files between groups** (use **➕ Add group** to make more, rename a group in its box, 🗑 to remove one). Files in the same group are concatenated into one layer (reprojected to a common CRS) and run as a single job, with the group's own date settings. This is the way to make one output for a year that is split across files (e.g. survey waves where 2020 falls in wave 1 for some records and wave 2 for others). Merged outputs are named from the group; leave files in separate groups to keep one job per file.
+
+Merged jobs record all of their source files. If such a job is interrupted, the restart panel checks every source file: when they're all still on disk unchanged it offers a **quiet Re-run** (no re-upload); otherwise it asks you to re-upload the group's files. (Drag-and-drop grouping uses the `streamlit-sortables` package — it's in the environment installer; if absent, the tab falls back to an editable group table.)
+
 ### Typical workflow
 
 1. **NDVI tab** — upload a study area, set a date range, pick output formats (GeoTIFF default), run. For year-by-year data, use **Attribute Column (per-year)**: pick the year/date column and the growing-season months, and each year is processed as its own aligned NDVI raster into a `{name}_temporal_ndvi/` folder.

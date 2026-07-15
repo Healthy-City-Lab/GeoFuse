@@ -140,6 +140,9 @@ def _fmt_timestamp(iso: str) -> str:
 def _render_details(rec) -> None:
     """Key/value summary of job parameters inside the Details expander."""
     p = rec.params or {}
+    if p.get("merged"):
+        srcs = p.get("source_files") or []
+        st.write(f"**Merged from {len(srcs)} files:** {', '.join(srcs)}")
     if rec.type in ("gvi", "gvi_column"):
         st.write(f"**Grid step:** {p.get('step', '?')} m")
         st.write(f"**Buffer:** {p.get('buffer', '?')} m")

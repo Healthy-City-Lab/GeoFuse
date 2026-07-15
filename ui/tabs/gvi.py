@@ -16,7 +16,12 @@ from helpers import (
     file_size_mtime_fingerprint,
     generate_clustered_grid,
     load_vector_paths,
+    load_vector_upload_sessions,
+    merge_gdfs_wgs84,
+    path_drift_status,
+    render_file_grouping_controls,
     render_job_restart_panel,
+    sanitize_name_for_file,
 )
 from map_preview import (
     add_black_point_layer,
@@ -268,6 +273,213 @@ def _gvi_restart_summary_lines(p: dict) -> list[str]:
     ]
 
 
+def _gvi_resubmit_from_params(
+    store, executor, pano_cache, output_dir, rec_id, p, raw, api_key
+):
+    """Resubmit a GVI job from stored params + a (re)merged layer.
+
+    Shared by the merged-job restart flow: ``p`` carries the original grid
+    step / buffer / date settings; ``raw`` is the freshly merged layer. Column
+    jobs go back through the per-year runner; recent/specific-year jobs get a
+    fresh sampling grid.
+    """
+    out_fname = p["fname"]
+    model_path = p.get("model_path")
+    step = int(p.get("step", 50))
+    buffer_m = int(p.get("buffer", 0))
+    max_year_diff = p.get("max_year_diff")
+    save_gp = bool(p.get("save_gpkg", True))
+    save_gt = bool(p.get("save_geotiff"))
+    save_gj = bool(p.get("save_geojson"))
+    save_panos = bool(p.get("save_panos"))
+    save_masks = bool(p.get("save_masks"))
+
+    gtype = (
+        "poly"
+        if raw.geometry.iloc[0].geom_type in ("Polygon", "MultiPolygon")
+        else "point"
+    )
+    base_dataset = {
+        "raw": raw,
+        "type": gtype,
+        "processed": None,
+        "meta": None,
+        "accumulated": [],
+        "results": None,
+        "cache_ref": pano_cache,
+    }
+
+    new_params = dict(p)
+    new_params["geometry_sha256"] = geometry_sha256(raw)
+    new_params["restart_of"] = rec_id
+    new_params["has_api_key"] = api_key is not None
+    new_params["source_fingerprints"] = [
+        file_size_mtime_fingerprint(x) for x in (p.get("source_paths") or [])
+    ]
+
+    init_args = {"model_path": model_path, "api_key": api_key}
+    if p.get("mode") == "column":
+        record = store.submit(
+            type="gvi_column", name=os.path.splitext(out_fname)[0], params=new_params
+        )
+        executor.submit_gvi_column_subprocess(
+            record,
+            fname=out_fname,
+            dataset_data=base_dataset,
+            date_column=p["date_column"],
+            init_args=init_args,
+            run_args={
+                "step": step,
+                "buffer": buffer_m,
+                "save_panos": save_panos,
+                "save_masks": save_masks,
+                "max_year_diff": max_year_diff,
+            },
+            output_dir=output_dir,
+            save_gpkg=save_gp,
+            save_geotiff=save_gt,
+            save_geojson=save_gj,
+            pano_cache_db_path=pano_cache.db_path,
+        )
+    else:
+        proc, gmeta = _gvi_prepare_processed(raw, gtype, buffer_m, step)
+        base_dataset["processed"] = proc
+        base_dataset["meta"] = gmeta
+        record = store.submit(
+            type="gvi", name=os.path.splitext(out_fname)[0], params=new_params
+        )
+        executor.submit_gvi_subprocess(
+            record,
+            fname=out_fname,
+            dataset_data=base_dataset,
+            init_args=init_args,
+            run_args={
+                "step": step,
+                "save_panos": save_panos,
+                "save_masks": save_masks,
+                "target_year": p.get("target_year"),
+                "max_year_diff": max_year_diff,
+            },
+            output_dir=output_dir,
+            save_gpkg=save_gp,
+            save_geotiff=save_gt,
+            save_geojson=save_gj,
+            pano_cache_db_path=pano_cache.db_path,
+        )
+    return record
+
+
+_GVI_RESTART_ACCEPT = ["geojson", "json", "gpkg", "shp", "dbf", "shx", "prj", "cpg", "zip"]
+
+
+def _render_gvi_merged_restart(store, executor, pano_cache, output_dir, rec, p) -> None:
+    """Multi-file restart for a merged GVI job — quiet re-run when every source
+    file is still on disk unchanged, otherwise a group re-upload."""
+    sources = p.get("source_files") or []
+    paths = p.get("source_paths") or []
+    fps = p.get("source_fingerprints") or []
+    had_api_key = bool(p.get("has_api_key"))
+
+    with st.expander(f"↻ Restart merged job: {rec.name or rec.id}", expanded=True):
+        for line in _gvi_restart_summary_lines(p):
+            st.write(line)
+
+        statuses = [
+            (fn, pth, path_drift_status(pth, fp))
+            for fn, pth, fp in zip(sources, paths, fps)
+        ]
+        all_ok = bool(paths) and all(s == "ok" for _, _, s in statuses)
+
+        api_key = None
+        if had_api_key:
+            st.caption("Original job used the Street View API — re-supply the key.")
+            api_key = (
+                st.text_input(
+                    "Street View API Key",
+                    type="password",
+                    autocomplete="off",
+                    key=f"gmr_apikey_{rec.id}",
+                )
+                or None
+            )
+
+        _labels = {
+            "ok": "✓ on disk",
+            "missing": "✗ missing",
+            "modified": "⚠ changed",
+            "no-path": "? no recorded path",
+        }
+        for fn, _pth, s in statuses:
+            st.write(f"• `{fn}` — {_labels.get(s, s)}")
+
+        if all_ok:
+            st.success("✓ All source files verified — no re-upload needed.")
+            c1, c2 = st.columns(2)
+            if c1.button(
+                "Cancel restart", key=f"gmr_cancel_{rec.id}", width="stretch"
+            ):
+                st.session_state[RESTART_SESSION_KEY] = None
+                st.rerun()
+            if c2.button(
+                "Re-run", type="primary", key=f"gmr_run_{rec.id}", width="stretch"
+            ):
+                try:
+                    gdfs = [g for _, g in load_vector_paths(paths)]
+                    raw = merge_gdfs_wgs84(gdfs)
+                    _gvi_resubmit_from_params(
+                        store, executor, pano_cache, output_dir, rec.id, p, raw, api_key
+                    )
+                except Exception as e:
+                    st.error(f"Re-submission failed: {e}")
+                    return
+                st.session_state[RESTART_SESSION_KEY] = None
+                st.success("Restart submitted. Monitor progress in the sidebar.")
+                st.rerun()
+            return
+
+        st.warning(
+            "Some source files moved or changed. Re-upload the original files "
+            "for this group to restart."
+        )
+        uploads = st.file_uploader(
+            "Re-upload the group's files",
+            accept_multiple_files=True,
+            type=_GVI_RESTART_ACCEPT,
+            key=f"gmr_up_{rec.id}",
+        )
+        if not uploads:
+            st.info("Select the group's original files to continue.")
+            return
+        try:
+            loaded = load_vector_upload_sessions(uploads)
+            raw = merge_gdfs_wgs84([g for _, g in loaded])
+        except Exception as e:
+            st.error(f"Failed to read uploaded files: {e}")
+            return
+        if p.get("geometry_sha256") and geometry_sha256(raw) != p["geometry_sha256"]:
+            st.warning(
+                "The combined geometry differs from the original job (different "
+                "files, contents, or order). Re-running will process this new "
+                "merge."
+            )
+        if st.button(
+            "Verify & re-run",
+            type="primary",
+            key=f"gmr_up_run_{rec.id}",
+            width="stretch",
+        ):
+            try:
+                _gvi_resubmit_from_params(
+                    store, executor, pano_cache, output_dir, rec.id, p, raw, api_key
+                )
+            except Exception as e:
+                st.error(f"Re-submission failed: {e}")
+                return
+            st.session_state[RESTART_SESSION_KEY] = None
+            st.success("Restart submitted. Monitor progress in the sidebar.")
+            st.rerun()
+
+
 def _render_gvi_restart_panel(
     store, executor, pano_cache, output_dir, parent_dir
 ) -> None:
@@ -294,6 +506,9 @@ def _render_gvi_restart_panel(
         return
 
     p = rec.params or {}
+    if p.get("merged"):
+        _render_gvi_merged_restart(store, executor, pano_cache, output_dir, rec, p)
+        return
     is_column = rec.type == "gvi_column"
     had_api_key = bool(p.get("has_api_key"))
 
@@ -432,34 +647,6 @@ def _render_gvi_restart_panel(
     )
 
 
-def _gvi_materialize_grids_if_missing(
-    gvi_buffer: int, gvi_res: int, skip_fnames: set | None = None
-) -> None:
-    """Set ``processed`` / ``meta`` for datasets that still need a grid.
-
-    ``skip_fnames`` are left untouched — per-year column jobs build their own
-    grids inside the runner, so pre-materializing the whole layer is wasted.
-    """
-    skip = skip_fnames or set()
-    gc.collect()
-    for fname, d in st.session_state.datasets.items():
-        if d.get("type") == "restored" or fname in skip:
-            continue
-        if d.get("processed") is not None:
-            continue
-        if _gvi_dataset_uses_raster_grid(d, gvi_buffer):
-            pts, meta = generate_clustered_grid(
-                d["raw"], buffer_m=float(gvi_buffer), step_m=float(gvi_res)
-            )
-            d["processed"] = pts
-            d["meta"] = meta
-        else:
-            d["processed"] = d["raw"].copy()
-            d["meta"] = None
-        d["accumulated"] = []
-        d["results"] = None
-
-
 # ---------------------------------------------------------------------------
 # Capture-date configuration (per-file), mirroring the NDVI tab's layout
 # ---------------------------------------------------------------------------
@@ -468,6 +655,83 @@ _GVI_MODE_RECENT = "Most recent capture"
 _GVI_MODE_YEAR = "A specific year"
 _GVI_MODE_COLUMN = "Per year from a column"
 _GVI_MODES = [_GVI_MODE_RECENT, _GVI_MODE_YEAR, _GVI_MODE_COLUMN]
+
+
+def _gvi_input_datasets() -> dict:
+    return {
+        k: v
+        for k, v in st.session_state.datasets.items()
+        if v.get("type") != "restored"
+    }
+
+
+def _gvi_units() -> list[dict]:
+    """Job units to configure and run.
+
+    Separate mode → one unit per uploaded file. Merge mode → one unit per
+    group name, with that group's files concatenated (EPSG:4326) into a single
+    merged layer. Each unit: ``{key, raw, type, merged, sources, dataset}``
+    (``dataset`` is the live per-file registry entry for separate units, or
+    ``None`` for merged ones).
+    """
+    input_ds = _gvi_input_datasets()
+    if st.session_state.get("gvi_run_mode") != "merge" or len(input_ds) < 2:
+        return [
+            {
+                "key": fn,
+                "raw": d["raw"],
+                "type": d.get("type", "point"),
+                "merged": False,
+                "sources": [fn],
+                "dataset": d,
+            }
+            for fn, d in input_ds.items()
+        ]
+
+    groups: dict[str, list[str]] = {}
+    for fn in input_ds:
+        g = st.session_state.gvi_file_groups.get(fn) or "Group 1"
+        groups.setdefault(g, []).append(fn)
+
+    cache = st.session_state.setdefault("_gvi_merge_cache", {})
+    units: list[dict] = []
+    for g, fns in groups.items():
+        ck = tuple(sorted(fns))
+        merged = cache.get(ck)
+        if merged is None:
+            merged = merge_gdfs_wgs84([input_ds[f]["raw"] for f in fns])
+            cache[ck] = merged
+        gtype = (
+            "poly"
+            if any(input_ds[f].get("type") == "poly" for f in fns)
+            else "point"
+        )
+        units.append(
+            {
+                "key": g,
+                "raw": merged,
+                "type": gtype,
+                "merged": True,
+                "sources": fns,
+                "dataset": None,
+            }
+        )
+    return units
+
+
+def _gvi_prepare_processed(raw, gtype: str, buffer_m: int, res: int):
+    """Return ``(processed_points, meta)`` for a raw layer in recent/year mode.
+
+    Polygons (or points with a buffer) get a clustered sampling grid; bare
+    points are used as-is. Mirrors the per-file grid materialization for merged
+    units, whose grids aren't pre-generated by the Generate-grids button.
+    """
+    uses_grid = gtype == "poly" or (gtype == "point" and buffer_m > 0)
+    if uses_grid:
+        return generate_clustered_grid(
+            raw, buffer_m=float(buffer_m), step_m=float(res)
+        )
+    return raw.copy(), None
 
 
 def _gvi_discover_years(gdf, col: str) -> list[str]:
@@ -486,19 +750,22 @@ def _render_gvi_date_config() -> None:
     """Per-file capture-date configuration in its own section, one expander per
     layer — mirrors the NDVI tab's Date Configuration. In a fragment so a mode
     switch or column pick reruns only this section, not the settings + map."""
-    input_ds = {
-        k: v
-        for k, v in st.session_state.datasets.items()
-        if v.get("type") != "restored"
-    }
-    if not input_ds:
+    units = _gvi_units()
+    if not units:
         return
 
     st.markdown("**Capture Date Configuration**")
     this_year = date.today().year
-    for fname, d in input_ds.items():
+    for unit in units:
+        key = unit["key"]
+        raw = unit["raw"]
+        title = (
+            f"{key}  ·  {len(unit['sources'])} files merged"
+            if unit["merged"]
+            else key
+        )
         cfg = st.session_state.gvi_date_configs.setdefault(
-            fname,
+            key,
             {
                 "mode": _GVI_MODE_RECENT,
                 "target_year": this_year,
@@ -507,12 +774,12 @@ def _render_gvi_date_config() -> None:
                 "max_diff": 2,
             },
         )
-        with st.expander(fname, expanded=True):
+        with st.expander(title, expanded=True):
             cfg["mode"] = st.radio(
                 "Which capture to segment",
                 _GVI_MODES,
                 index=_GVI_MODES.index(cfg.get("mode", _GVI_MODE_RECENT)),
-                key=f"gvi_mode_{fname}",
+                key=f"gvi_mode_{key}",
                 horizontal=True,
                 help=(
                     "Most recent → newest Street View coverage. A specific year → "
@@ -531,23 +798,21 @@ def _render_gvi_date_config() -> None:
                         max_value=this_year,
                         value=int(cfg.get("target_year", this_year)),
                         step=1,
-                        key=f"gvi_year_{fname}",
+                        key=f"gvi_year_{key}",
                     )
                 )
             elif mode == _GVI_MODE_COLUMN:
-                attr_cols = [
-                    c for c in d["raw"].columns if c.lower() != "geometry"
-                ]
+                attr_cols = [c for c in raw.columns if c.lower() != "geometry"]
                 if attr_cols:
                     stored = cfg.get("date_column")
                     cfg["date_column"] = st.selectbox(
                         "Year / date column",
                         attr_cols,
                         index=attr_cols.index(stored) if stored in attr_cols else 0,
-                        key=f"gvi_col_{fname}",
+                        key=f"gvi_col_{key}",
                         help="Accepts ISO dates, year+month, year-only, or numeric years.",
                     )
-                    years = _gvi_discover_years(d["raw"], cfg["date_column"])
+                    years = _gvi_discover_years(raw, cfg["date_column"])
                     if years:
                         st.caption(
                             "Years found: " + ", ".join(f"`{y}`" for y in years)
@@ -556,13 +821,13 @@ def _render_gvi_date_config() -> None:
                         st.warning("No parseable years in the selected column.")
                 else:
                     cfg["date_column"] = None
-                    st.warning("No attribute columns found in this file.")
+                    st.warning("No attribute columns found in this layer.")
 
             if mode in (_GVI_MODE_YEAR, _GVI_MODE_COLUMN):
                 cfg["use_max_diff"] = st.checkbox(
                     "Limit maximum year difference",
                     value=bool(cfg.get("use_max_diff", False)),
-                    key=f"gvi_usemd_{fname}",
+                    key=f"gvi_usemd_{key}",
                     help=(
                         "Only accept a capture within this many years of the "
                         "target; points with none in the window are left empty."
@@ -576,7 +841,7 @@ def _render_gvi_date_config() -> None:
                             max_value=20,
                             value=int(cfg.get("max_diff", 2)),
                             step=1,
-                            key=f"gvi_md_{fname}",
+                            key=f"gvi_md_{key}",
                         )
                     )
 
@@ -726,6 +991,8 @@ def render(output_dir: str, parent_dir: str) -> None:
         st.session_state.gvi_inspector_select = None
     if "gvi_date_configs" not in st.session_state:
         st.session_state.gvi_date_configs = {}
+    if "gvi_file_groups" not in st.session_state:
+        st.session_state.gvi_file_groups = {}
 
     # JobStore + executor + PanoCache are process-level singletons (see ui/services.py).
     from job_panel import render_sidebar_job_monitor
@@ -762,6 +1029,7 @@ def render(output_dir: str, parent_dir: str) -> None:
         sig_prev = st.session_state.get("_gvi_prev_upload_sig")
         if sig_prev is not None and sig_new is not None and sig_prev != sig_new:
             _gvi_discard_heavy_dataset_fields()
+            st.session_state.pop("_gvi_merge_cache", None)
         st.session_state._gvi_prev_upload_sig = sig_new
 
         current_names = [os.path.basename(p) for p in valid_paths]
@@ -804,6 +1072,21 @@ def render(output_dir: str, parent_dir: str) -> None:
             if st.session_state.datasets[k].get("type") != "restored":
                 del st.session_state.datasets[k]
         gc.collect()
+
+    # File handling: run each file as its own job, or merge files that share a
+    # group name into one job (so a year split across files yields one output).
+    gvi_input_fnames = list(_gvi_input_datasets().keys())
+    st.session_state.gvi_run_mode = render_file_grouping_controls(
+        gvi_input_fnames,
+        run_mode_key="gvi_run_mode_radio",
+        groups_key="gvi_file_groups",
+        help_text=(
+            "Separate runs each uploaded study area as its own GVI job. Merge "
+            "combines files that share a Group name into one job (concatenated "
+            "in one CRS), so a year split across several files yields a single "
+            "output. Configure each group's capture dates below."
+        ),
+    )
 
     # Settings + map and the per-file date config are each isolated in a
     # fragment, so a slider or mode edit reruns only its own section (matching
@@ -918,19 +1201,6 @@ def render(output_dir: str, parent_dir: str) -> None:
             gc.collect()
             st.rerun()
 
-    if run:
-        gvi_out_ok_form = (
-            st.session_state.get("gvi_out_gpkg", True)
-            or st.session_state.get("gvi_out_geotiff", False)
-            or st.session_state.get("gvi_out_geojson", False)
-        )
-        if gvi_out_ok_form and st.session_state.datasets:
-            with run_action_spinner:
-                with st.spinner("​"):
-                    _gvi_materialize_grids_if_missing(
-                        gvi_buffer_for_gen, gvi_res_for_gen, skip_fnames=column_fnames
-                    )
-
     gvi_buffer = int(st.session_state.get("gvi_buffer", 0))
     gvi_res = int(st.session_state.get("gvi_res", 50))
     gvi_out_ok = (
@@ -976,16 +1246,17 @@ def render(output_dir: str, parent_dir: str) -> None:
                     p.get("has_api_key"),
                 )
 
-            # basename -> absolute path map so each submitted job records
-            # the on-disk location of its study area for silent-restart.
+            # basename -> absolute path map so each (separate) job records the
+            # on-disk location of its study area for silent-restart.
             path_by_basename = {os.path.basename(p): p for p in valid_paths}
 
-            for fname, d in st.session_state.datasets.items():
-                if d.get("type") == "restored":
-                    continue
+            for unit in _gvi_units():
+                key = unit["key"]
+                raw = unit["raw"]
+                gtype = unit["type"]
+                merged = unit["merged"]
 
-                ds_path = path_by_basename.get(fname)
-                cfg = st.session_state.gvi_date_configs.get(fname, {})
+                cfg = st.session_state.gvi_date_configs.get(key, {})
                 mode_cfg = cfg.get("mode", _GVI_MODE_RECENT)
                 date_col = (
                     cfg.get("date_column") if mode_cfg == _GVI_MODE_COLUMN else None
@@ -1001,36 +1272,66 @@ def render(output_dir: str, parent_dir: str) -> None:
                     else None
                 )
 
+                # A merged group has no single source file: name outputs from
+                # the group and ship the concatenated layer as a fresh dataset.
+                # Record each source file's path + fingerprint so restart can
+                # verify the whole group and re-run quietly.
+                if merged:
+                    out_fname = f"{sanitize_name_for_file(key)}.gpkg"
+                    ds_path = None
+                    base_dataset = {
+                        "raw": raw,
+                        "type": gtype,
+                        "processed": None,
+                        "meta": None,
+                        "accumulated": [],
+                        "results": None,
+                    }
+                    src_paths = [path_by_basename.get(fn) for fn in unit["sources"]]
+                    src_fps = [file_size_mtime_fingerprint(p) for p in src_paths]
+                else:
+                    out_fname = key
+                    ds_path = path_by_basename.get(key)
+                    base_dataset = unit["dataset"]
+                    src_paths, src_fps = [], []
+                base_dataset["cache_ref"] = pano_cache
+
+                common_params = {
+                    "fname": out_fname,
+                    "input_path": ds_path,
+                    "input_fingerprint": file_size_mtime_fingerprint(ds_path),
+                    "step": gvi_res,
+                    "buffer": gvi_buffer,
+                    "save_panos": save_debug,
+                    "save_masks": save_debug,
+                    "save_gpkg": save_gp,
+                    "save_geotiff": save_gt,
+                    "save_geojson": save_gj,
+                    "max_year_diff": max_year_diff,
+                    "model_path": model_path,
+                    "has_api_key": api_key is not None,
+                    "geometry_sha256": geometry_sha256(raw),
+                    "merged": merged,
+                    "group_name": key if merged else None,
+                    "source_files": list(unit["sources"]),
+                    "source_paths": src_paths,
+                    "source_fingerprints": src_fps,
+                }
+
                 # --- Per-year date-column job ---
                 if mode_cfg == _GVI_MODE_COLUMN and date_col:
-                    d["cache_ref"] = pano_cache
-                    col_params = {
-                        "fname": fname,
-                        "input_path": ds_path,
-                        "input_fingerprint": file_size_mtime_fingerprint(ds_path),
-                        "mode": "column",
-                        "step": gvi_res,
-                        "buffer": gvi_buffer,
-                        "date_column": date_col,
-                        "save_panos": save_debug,
-                        "save_masks": save_debug,
-                        "save_gpkg": save_gp,
-                        "save_geotiff": save_gt,
-                        "save_geojson": save_gj,
-                        "max_year_diff": max_year_diff,
-                        "model_path": model_path,
-                        "has_api_key": api_key is not None,
-                        "geometry_sha256": geometry_sha256(d["raw"]),
-                    }
+                    col_params = dict(
+                        common_params, mode="column", date_column=date_col
+                    )
                     record = store.submit(
                         type="gvi_column",
-                        name=os.path.splitext(fname)[0],
+                        name=os.path.splitext(out_fname)[0],
                         params=col_params,
                     )
                     executor.submit_gvi_column_subprocess(
                         record,
-                        fname=fname,
-                        dataset_data=d,
+                        fname=out_fname,
+                        dataset_data=base_dataset,
                         date_column=date_col,
                         init_args={"model_path": model_path, "api_key": api_key},
                         run_args={
@@ -1049,26 +1350,20 @@ def render(output_dir: str, parent_dir: str) -> None:
                     started = True
                     continue
                 elif mode_cfg == _GVI_MODE_COLUMN and not date_col:
-                    st.warning(f"{fname}: no year/date column selected — skipped.")
+                    st.warning(f"{key}: no year/date column selected — skipped.")
                     continue
 
-                job_params = {
-                    "fname": fname,
-                    "input_path": ds_path,
-                    "input_fingerprint": file_size_mtime_fingerprint(ds_path),
-                    "step": gvi_res,
-                    "buffer": gvi_buffer,
-                    "save_panos": save_debug,
-                    "save_masks": save_debug,
-                    "save_gpkg": save_gp,
-                    "save_geotiff": save_gt,
-                    "save_geojson": save_gj,
-                    "target_year": target_year,
-                    "max_year_diff": max_year_diff,
-                    "model_path": model_path,
-                    "has_api_key": api_key is not None,
-                    "geometry_sha256": geometry_sha256(d["raw"]),
-                }
+                # --- Recent / specific-year job (needs a sampling grid) ---
+                if base_dataset.get("processed") is None:
+                    with run_action_spinner:
+                        with st.spinner("​"):
+                            proc, gmeta = _gvi_prepare_processed(
+                                raw, gtype, gvi_buffer, gvi_res
+                            )
+                    base_dataset["processed"] = proc
+                    base_dataset["meta"] = gmeta
+
+                job_params = dict(common_params, target_year=target_year)
                 sig = _gvi_signature(job_params)
 
                 # Skip only if an identical submission is still active.
@@ -1080,17 +1375,15 @@ def render(output_dir: str, parent_dir: str) -> None:
                 if duplicate:
                     continue
 
-                d["cache_ref"] = pano_cache
-
                 record = store.submit(
                     type="gvi",
-                    name=os.path.splitext(fname)[0],
+                    name=os.path.splitext(out_fname)[0],
                     params=job_params,
                 )
                 executor.submit_gvi_subprocess(
                     record,
-                    fname=fname,
-                    dataset_data=d,
+                    fname=out_fname,
+                    dataset_data=base_dataset,
                     init_args={"model_path": model_path, "api_key": api_key},
                     run_args={
                         "step": gvi_res,

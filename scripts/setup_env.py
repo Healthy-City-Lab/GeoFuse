@@ -47,6 +47,7 @@ PIP_PACKAGES = [
     # UI / Web
     "streamlit==1.52.1",
     "streamlit-folium==0.25.3",
+    "streamlit-sortables==0.3.1",
     "folium==0.20.0",
     # Earth Engine & Geospatial APIs
     "geemap==0.36.6",
