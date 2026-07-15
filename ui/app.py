@@ -32,6 +32,7 @@ if __name__ == "__main__":
 
     # --- 4. UI IMPORTS (after geofuse to preserve DLL order on Windows) ---
     import streamlit as st  # noqa: E402
+    from cache_manager import render_cache_manager  # noqa: E402
     from chrome import inject_chrome  # noqa: E402
     from resource_monitor import render_resource_monitor  # noqa: E402
     from services import get_job_executor, get_job_store  # noqa: E402, F401
@@ -68,6 +69,11 @@ if __name__ == "__main__":
 
     with tab_job:
         job_monitor.render(output_dir)
+
+    # Cache management lives in the sidebar and is rendered here (not inside a
+    # tab) so it is reachable from every tab — the job monitor is only mounted
+    # by the GVI tab.
+    render_cache_manager(output_dir)
 
     # Floating bottom-right resource monitor (CPU/RAM/GPU/Network).
     # Rendered outside any tab so it stays visible everywhere; uses

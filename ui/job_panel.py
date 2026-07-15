@@ -180,8 +180,7 @@ def _render_details(rec) -> None:
             em = p.get("season_end_month")
             season = f"months {sm}–{em}" if sm and em else "?"
             st.write(
-                f"**Year column:** {p.get('date_column', '?')} "
-                f"(per year, {season})"
+                f"**Year column:** {p.get('date_column', '?')} " f"(per year, {season})"
             )
         st.write(f"**Cloud max:** {p.get('cloud_pct', '?')}%")
         st.write(f"**Resolution:** {p.get('resolution', '?')} m")
@@ -334,9 +333,24 @@ def _render_job_card(rec, store) -> None:
 
         if rec.status in _TERMINAL:
             label = _TERMINAL_LABELS.get(rec.status, rec.status.capitalize())
+        elif rec.pause_event.is_set():
+            label = f"⏸️ Paused — {rec.status_text or 'holding'}"
         else:
             label = rec.status_text or rec.status.capitalize()
         st.caption(label)
+
+        # Workload scale: how many points in total, and how they split by year.
+        total_points = rec.extra.get("total_points")
+        if total_points:
+            st.caption(f"**{int(total_points):,}** sampling points total")
+            breakdown = rec.extra.get("point_breakdown") or []
+            if len(breakdown) > 1:
+                st.caption(
+                    "Per year — "
+                    + " · ".join(
+                        f"**{b['label']}**: {int(b['points']):,}" for b in breakdown
+                    )
+                )
 
         bracket = rec.extra.get("ndvi_tile_bracket")
         if rec.type in ("ndvi", "ndvi_column") and bracket:
@@ -403,18 +417,45 @@ def _render_job_card(rec, store) -> None:
                 st.code(error_detail or rec.error)
 
         if rec.status in _ACTIVE:
-            st.button(
-                "Cancel",
-                key=f"cancel_{rec.id}",
-                on_click=store.request_cancel,
-                args=(rec.id,),
-            )
+            pause_col, cancel_col = st.columns(2, gap="small")
+            paused = rec.pause_event.is_set()
+            with pause_col:
+                if paused:
+                    st.button(
+                        "Resume",
+                        key=f"resume_{rec.id}",
+                        on_click=store.request_resume,
+                        args=(rec.id,),
+                        width="stretch",
+                        type="primary",
+                        help="Continue from where it paused — nothing queued is lost.",
+                    )
+                else:
+                    st.button(
+                        "Pause",
+                        key=f"pause_{rec.id}",
+                        on_click=store.request_pause,
+                        args=(rec.id,),
+                        width="stretch",
+                        help=(
+                            "Hold at the next safe point. Work already queued is "
+                            "kept and continues on resume."
+                        ),
+                    )
+            with cancel_col:
+                st.button(
+                    "Cancel",
+                    key=f"cancel_{rec.id}",
+                    on_click=store.request_cancel,
+                    args=(rec.id,),
+                    width="stretch",
+                )
         else:
             restart_eligible = (
                 rec.type in _RESTART_ELIGIBLE_TYPES
                 and rec.status in _RESTART_ELIGIBLE_STATUSES
             )
-            btn_cols = st.columns(2, gap="medium")
+            btn_cols = st.columns(2, gap="small")
             if restart_eligible:
                 restart_col, dismiss_col = btn_cols[0], btn_cols[1]
             else:

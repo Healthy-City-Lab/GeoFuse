@@ -39,6 +39,7 @@ def run_ndvi_child(
     coverage_rescue: bool,
     event_queue,
     cancel_event,
+    pause_event=None,
 ) -> None:
     """Subprocess entry point for ``run_ndvi`` (single date range).
 
@@ -52,7 +53,7 @@ def run_ndvi_child(
 
         from geofuse.jobs.runners import run_ndvi
 
-        ctx = SubprocJobContext(job_id, event_queue, cancel_event)
+        ctx = SubprocJobContext(job_id, event_queue, cancel_event, pause_event)
         result = run_ndvi(
             ctx,
             fname=fname,
@@ -101,6 +102,7 @@ def run_ndvi_column_child(
     coverage_rescue: bool,
     event_queue,
     cancel_event,
+    pause_event=None,
 ) -> None:
     """Subprocess entry point for ``run_ndvi_column`` (one raster per year)."""
     try:
@@ -108,7 +110,7 @@ def run_ndvi_column_child(
 
         from geofuse.jobs.runners import run_ndvi_column
 
-        ctx = SubprocJobContext(job_id, event_queue, cancel_event)
+        ctx = SubprocJobContext(job_id, event_queue, cancel_event, pause_event)
         result = run_ndvi_column(
             ctx,
             fname=fname,

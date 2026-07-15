@@ -47,6 +47,25 @@ from PIL import Image
 # ── Dataclasses ─────────────────────────────────────────────────────────────
 
 
+class RateLimitedError(RuntimeError):
+    """Google pushed back on the request rate (HTTP 429 / 403).
+
+    Raised instead of returning a parsed result so callers can back off and
+    **retry**. Without this the search endpoint's throttle response would fall
+    through the JSONP repair as an empty list and be indistinguishable from
+    "no panorama here" — silently turning throttling into missing data.
+    """
+
+    def __init__(self, status: int, url: str = "") -> None:
+        super().__init__(f"rate limited: HTTP {status}")
+        self.status = status
+        self.url = url
+
+
+#: Statuses that mean "you are being throttled", not "no data".
+_RATE_LIMIT_STATUSES = frozenset({403, 429, 503})
+
+
 @dataclass
 class Size:
     """A 2-D size in pixels."""
@@ -362,10 +381,16 @@ def find_panorama(
     search_third_party: bool = False,
     session: requests.Session | None = None,
 ) -> StreetViewPanorama | None:
-    """Search for the nearest Street View panorama within ``radius`` metres."""
+    """Search for the nearest Street View panorama within ``radius`` metres.
+
+    Raises :class:`RateLimitedError` when the endpoint throttles, so a caller
+    can back off instead of mistaking the throttle body for "no coverage".
+    """
     url = _build_find_panorama_url(lat, lon, radius, locale, search_third_party)
     requester = session if session is not None else requests
-    resp = requester.get(url)
+    resp = requester.get(url, headers=_TILE_HEADERS)
+    if resp.status_code in _RATE_LIMIT_STATUSES:
+        raise RateLimitedError(resp.status_code, url)
     return _parse_radius_response(json.loads(_repair_jsonp(resp.text)))
 
 
@@ -377,9 +402,15 @@ async def find_panorama_async(
     locale: str = "en",
     search_third_party: bool = False,
 ) -> StreetViewPanorama | None:
-    """Async variant of :func:`find_panorama`."""
+    """Async variant of :func:`find_panorama`.
+
+    Raises :class:`RateLimitedError` on throttle statuses — see
+    :func:`find_panorama` for why that distinction matters.
+    """
     url = _build_find_panorama_url(lat, lon, radius, locale, search_third_party)
-    async with session.get(url) as resp:
+    async with session.get(url, headers=_TILE_HEADERS) as resp:
+        if resp.status in _RATE_LIMIT_STATUSES:
+            raise RateLimitedError(resp.status, url)
         text = await resp.text()
     return _parse_radius_response(json.loads(_repair_jsonp(text)))
 
@@ -446,6 +477,8 @@ def get_panorama(
         size = pano.image_sizes[_validate_zoom(pano, zoom)]
         url = _THIRD_PARTY_URL.format(w=size.x, h=size.y, panoid=pano.id)
         resp = requester.get(url, headers=_TILE_HEADERS)
+        if resp.status_code in _RATE_LIMIT_STATUSES:
+            raise RateLimitedError(resp.status_code, url)
         resp.raise_for_status()
         return Image.open(io.BytesIO(resp.content))
 
@@ -455,6 +488,8 @@ def get_panorama(
     tile_data: dict = {}
     for t in tile_list:
         resp = requester.get(t.url, headers=_TILE_HEADERS)
+        if resp.status_code in _RATE_LIMIT_STATUSES:
+            raise RateLimitedError(resp.status_code, t.url)
         resp.raise_for_status()
         tile_data[(t.x, t.y)] = resp.content
 
@@ -477,6 +512,8 @@ async def get_panorama_async(
         size = pano.image_sizes[_validate_zoom(pano, zoom)]
         url = _THIRD_PARTY_URL.format(w=size.x, h=size.y, panoid=pano.id)
         async with session.get(url, headers=_TILE_HEADERS) as resp:
+            if resp.status in _RATE_LIMIT_STATUSES:
+                raise RateLimitedError(resp.status, url)
             resp.raise_for_status()
             return Image.open(io.BytesIO(await resp.read()))
 
@@ -485,6 +522,8 @@ async def get_panorama_async(
 
     async def _fetch(t: Tile) -> tuple[int, int, bytes]:
         async with session.get(t.url, headers=_TILE_HEADERS) as resp:
+            if resp.status in _RATE_LIMIT_STATUSES:
+                raise RateLimitedError(resp.status, t.url)
             resp.raise_for_status()
             return t.x, t.y, await resp.read()
 

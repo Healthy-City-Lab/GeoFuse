@@ -40,6 +40,7 @@ def run_gvi_child(
     pano_cache_db_path: str,
     event_queue,
     cancel_event,
+    pause_event=None,
 ) -> None:
     """Entry point invoked by ``multiprocessing.Process(target=...)``.
 
@@ -67,7 +68,7 @@ def run_gvi_child(
         pano_cache = PanoCache(pano_cache_db_path)
         dataset_data["cache_ref"] = pano_cache
 
-        ctx = SubprocJobContext(job_id, event_queue, cancel_event)
+        ctx = SubprocJobContext(job_id, event_queue, cancel_event, pause_event)
         gpu_lock = threading.Lock()  # per-process; the parent's lock doesn't apply here
 
         result = run_gvi(
@@ -108,6 +109,7 @@ def run_gvi_column_child(
     pano_cache_db_path: str,
     event_queue,
     cancel_event,
+    pause_event=None,
 ) -> None:
     """Entry point for the per-year GVI column job. See :func:`run_gvi_child`."""
     try:
@@ -119,7 +121,7 @@ def run_gvi_column_child(
         pano_cache = PanoCache(pano_cache_db_path)
         dataset_data["cache_ref"] = pano_cache
 
-        ctx = SubprocJobContext(job_id, event_queue, cancel_event)
+        ctx = SubprocJobContext(job_id, event_queue, cancel_event, pause_event)
         gpu_lock = threading.Lock()
 
         result = run_gvi_column(

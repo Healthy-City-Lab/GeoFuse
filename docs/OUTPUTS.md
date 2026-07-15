@@ -21,13 +21,15 @@ GeoPackage (layer `gvi_samples`) of sampled points in the planar CRS:
 
 | Field | Description |
 | --- | --- |
-| `gvi_veg` | Green View Index — vegetation (%) |
-| `gvi_ter` | Green View Index — terrain (%) |
+| `gvi_veg` | Green View Index — **vegetation only** (Cityscapes class 8), as a fraction of panorama pixels |
+| `gvi_ter` | Green View Index — **terrain only** (Cityscapes class 9), as a fraction of panorama pixels |
 | `pano_id` | Source Street View panorama ID |
 | `pano_date` | Capture date of the panorama used (`YYYY-MM`) |
 | `lat`, `lon` | Geographic coordinates of the panorama |
 | `row`, `col` | Position on the shared anchored grid |
 | `cluster_id` | Spatial cluster the point belongs to |
+
+`gvi_veg` and `gvi_ter` are **independent, non-overlapping** classes — add them if you want a combined vegetation+terrain index.
 
 Recommended for large or scattered study areas: sparse on disk and free of the empty cells that dominate a single bbox-wide raster.
 

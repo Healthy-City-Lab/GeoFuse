@@ -52,9 +52,25 @@ class JobContext:
     job_id: str
     store: JobStore
     cancel_event: threading.Event
+    pause_event: threading.Event | None = None
 
     def is_cancelled(self) -> bool:
         return self.cancel_event.is_set()
+
+    def is_paused(self) -> bool:
+        return bool(self.pause_event is not None and self.pause_event.is_set())
+
+    def wait_while_paused(self, poll_s: float = 0.25) -> None:
+        """Block at a safe point while the job is paused.
+
+        Returns as soon as the job is resumed or cancelled, so nothing already
+        queued is dropped — the caller simply continues with the next item.
+        """
+        if self.pause_event is None:
+            return
+        while self.pause_event.is_set() and not self.cancel_event.is_set():
+            self.heartbeat()
+            time.sleep(poll_s)
 
     def progress(
         self,
@@ -116,6 +132,7 @@ class JobExecutor:
             job_id=record.id,
             store=self._store,
             cancel_event=record.cancel_event,
+            pause_event=record.pause_event,
         )
 
         def _wrapped():
@@ -206,10 +223,12 @@ class JobExecutor:
         mp_ctx = mp.get_context("spawn")
         event_queue = mp_ctx.Queue()
         cancel_event = mp_ctx.Event()
+        pause_event = mp_ctx.Event()
 
         proc_kwargs = dict(child_kwargs)
         proc_kwargs["event_queue"] = event_queue
         proc_kwargs["cancel_event"] = cancel_event
+        proc_kwargs["pause_event"] = pause_event
 
         proc = mp_ctx.Process(
             target=child_fn,
@@ -219,6 +238,7 @@ class JobExecutor:
         )
 
         parent_cancel = record.cancel_event
+        parent_pause = record.pause_event
 
         def _watcher() -> None:
             bind_job_log_buffer(record.id)
@@ -229,6 +249,12 @@ class JobExecutor:
 
             def _cancel_bridge() -> None:
                 while not bridge_stop.is_set():
+                    # Pause can toggle both ways, so mirror it continuously
+                    # rather than latching like cancel.
+                    if parent_pause.is_set():
+                        pause_event.set()
+                    else:
+                        pause_event.clear()
                     if parent_cancel.is_set():
                         cancel_event.set()
                         return

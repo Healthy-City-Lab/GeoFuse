@@ -30,6 +30,7 @@ def run_fusion_child(
     run_kwargs: dict,
     event_queue,
     cancel_event,
+    pause_event=None,
 ) -> None:
     """Entry point invoked by ``multiprocessing.Process(target=...)``.
 
@@ -48,7 +49,7 @@ def run_fusion_child(
 
         from geofuse.jobs.runners import run_fusion
 
-        ctx = SubprocJobContext(job_id, event_queue, cancel_event)
+        ctx = SubprocJobContext(job_id, event_queue, cancel_event, pause_event)
         result = run_fusion(ctx, **run_kwargs)
 
         event_queue.put((MSG_COMPLETE, list((result or {}).get("output_paths") or [])))

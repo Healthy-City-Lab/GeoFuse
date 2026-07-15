@@ -138,7 +138,17 @@ def run_gvi(
     def check_cancel() -> bool:
         return ctx.is_cancelled()
 
-    ctx.progress(status_text="Running")
+    def check_pause() -> bool:
+        return bool(getattr(ctx, "is_paused", lambda: False)())
+
+    # Publish the workload up front so the monitor can show scale / ETA.
+    n_points = len(dataset_data["processed"])
+    ctx.progress(
+        status_text=f"Running — {n_points:,} sampling points",
+        total_points=n_points,
+        point_breakdown=[{"label": "all", "points": n_points}],
+    )
+    _log_gvi("INFO", f"Total sampling points to process: {n_points:,}")
 
     engine.run_analysis(
         dataset_data["processed"],
@@ -153,6 +163,7 @@ def run_gvi(
         start_index=start_idx,
         target_year=run_args.get("target_year"),
         max_year_diff=run_args.get("max_year_diff"),
+        pause_callback=check_pause,
     )
 
     if ctx.is_cancelled():
@@ -393,10 +404,17 @@ def run_gvi_column(
     def check_cancel() -> bool:
         return ctx.is_cancelled()
 
-    for idx, year in enumerate(unique_years):
+    def check_pause() -> bool:
+        return bool(getattr(ctx, "is_paused", lambda: False)())
+
+    # Build every year's sampling grid up front so the monitor can report the
+    # true total workload (and the per-year split) before any downloading
+    # starts — otherwise the scale of the run is only known at the very end.
+    ctx.progress(status_text=f"Generating sampling grids for {n_years} year(s)...")
+    plans: list[tuple[int, object, object]] = []
+    for year in unique_years:
         if ctx.is_cancelled():
             return {"output_paths": output_paths}
-
         year_gdf = gdf_4326[gdf_4326["_year"] == year].drop(columns=["_year"])
         is_poly = year_gdf.geometry.iloc[0].geom_type in ("Polygon", "MultiPolygon")
         if is_poly or buffer_m > 0:
@@ -405,16 +423,41 @@ def run_gvi_column(
             )
         else:
             pts, meta = year_gdf.copy(), None
+        plans.append((year, pts, meta))
+        ctx.progress(
+            status_text=f"Generated grid for {year}: {len(pts):,} points"
+        )
+        ctx.heartbeat()
 
-        base = idx / max(n_years, 1)
-        span = 1.0 / max(n_years, 1)
+    breakdown = [{"label": str(y), "points": int(len(p))} for y, p, _ in plans]
+    total_points = sum(b["points"] for b in breakdown)
+    ctx.progress(
+        status_text=f"Running — {total_points:,} points across {n_years} year(s)",
+        total_points=total_points,
+        point_breakdown=breakdown,
+    )
+    _log_gvi(
+        "INFO",
+        f"Total sampling points: {total_points:,} across {n_years} year(s) — "
+        + ", ".join(f"{b['label']}: {b['points']:,}" for b in breakdown),
+    )
 
-        def on_progress(curr: int, total: int, _b=base, _s=span, _y=year) -> None:
-            if total <= 0:
+    done_points = 0
+    for idx, (year, pts, meta) in enumerate(plans):
+        if ctx.is_cancelled():
+            return {"output_paths": output_paths}
+
+        # Weight the bar by real point counts, so a year with 10x the points
+        # takes 10x the bar — a far better ETA than equal-weighting years.
+        base_done = done_points
+
+        def on_progress(curr: int, total: int, _b=base_done, _y=year) -> None:
+            if total <= 0 or total_points <= 0:
                 return
             ctx.progress(
-                value=min(_b + _s * (curr / total), 1.0),
-                status_text=f"Year {_y} ({curr}/{total})",
+                value=min((_b + curr) / total_points, 1.0),
+                status_text=f"Year {_y} ({curr:,}/{total:,}) — "
+                f"{_b + curr:,}/{total_points:,} overall",
             )
             ctx.heartbeat()
 
@@ -425,7 +468,10 @@ def run_gvi_column(
             with _lock:
                 _acc.append(res)
 
-        ctx.progress(status_text=f"Processing year {idx + 1}/{n_years}: {year}")
+        ctx.progress(
+            status_text=f"Processing year {idx + 1}/{n_years}: {year} "
+            f"({len(pts):,} points)"
+        )
         engine.run_analysis(
             pts,
             step=step,
@@ -438,7 +484,9 @@ def run_gvi_column(
             cancel_callback=check_cancel,
             target_year=int(year),
             max_year_diff=max_year_diff,
+            pause_callback=check_pause,
         )
+        done_points += len(pts)
         if ctx.is_cancelled():
             return {"output_paths": output_paths}
         if not accumulated:
@@ -523,6 +571,10 @@ def run_ndvi(
     on_progress = _ndvi_on_progress_factory(ctx)
 
     def check_cancel() -> bool:
+        # The engine polls this at safe points (between tiles, around retries),
+        # so blocking here pauses the download without dropping queued tiles.
+        if hasattr(ctx, "wait_while_paused"):
+            ctx.wait_while_paused()
         return ctx.is_cancelled()
 
     result = engine.download_and_process(
@@ -627,9 +679,19 @@ def run_ndvi_column(
     output_paths: list[str] = [job_folder]
 
     def check_cancel() -> bool:
+        # Blocking here pauses the Earth Engine download at a tile boundary;
+        # queued tiles are untouched and resume where they left off.
+        if hasattr(ctx, "wait_while_paused"):
+            ctx.wait_while_paused()
         return ctx.is_cancelled()
 
     for idx, year in enumerate(unique_years):
+        if ctx.is_cancelled():
+            return {"output_paths": output_paths}
+        # Safe pause point: hold between years so a resume continues with the
+        # next year rather than dropping it.
+        if hasattr(ctx, "wait_while_paused"):
+            ctx.wait_while_paused()
         if ctx.is_cancelled():
             return {"output_paths": output_paths}
 
@@ -1906,6 +1968,11 @@ def run_fusion(
                 ctx.heartbeat()
 
             def cancel_check():
+                # Every fusion stage polls this, so blocking here holds the
+                # run at a stage boundary; the Optuna study, caches, and
+                # ledger are untouched and a resume continues from there.
+                if hasattr(ctx, "wait_while_paused"):
+                    ctx.wait_while_paused()
                 return ctx.is_cancelled()
 
             stage(skey("load_metrics"), RUNNING)

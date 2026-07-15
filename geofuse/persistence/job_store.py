@@ -58,6 +58,12 @@ class JobRecord:
     cancel_event: threading.Event = field(
         default_factory=threading.Event, repr=False, compare=False
     )
+    # Set while the job is paused. Workers block at safe points until it
+    # clears, so nothing queued is dropped. Runtime-only: a process restart
+    # reconciles running jobs to 'interrupted' anyway.
+    pause_event: threading.Event = field(
+        default_factory=threading.Event, repr=False, compare=False
+    )
     extra: dict = field(default_factory=dict, repr=False, compare=False)
     _dirty: bool = field(default=False, repr=False, compare=False)
 
@@ -243,6 +249,35 @@ class JobStore:
         with self._lock:
             rec = self._records.get(job_id)
             return bool(rec and rec.cancel_event.is_set())
+
+    # ------------------------------------------------------------------
+    # Pause / resume
+    # ------------------------------------------------------------------
+
+    def request_pause(self, job_id: str) -> None:
+        """Ask a running job to hold at its next safe point."""
+        with self._lock:
+            rec = self._records.get(job_id)
+            if rec is None:
+                return
+            rec.pause_event.set()
+            rec.status_text = "Paused"
+            rec._dirty = True
+
+    def request_resume(self, job_id: str) -> None:
+        """Release a paused job; queued work continues where it left off."""
+        with self._lock:
+            rec = self._records.get(job_id)
+            if rec is None:
+                return
+            rec.pause_event.clear()
+            rec.status_text = "Resuming..."
+            rec._dirty = True
+
+    def is_pause_requested(self, job_id: str) -> bool:
+        with self._lock:
+            rec = self._records.get(job_id)
+            return bool(rec and rec.pause_event.is_set())
 
     # ------------------------------------------------------------------
     # Reads (return snapshots; safe to use without holding the lock)

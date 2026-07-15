@@ -92,21 +92,112 @@ def _format_pano_date(date: tuple[int, int] | None) -> str | None:
 # Search radius (metres) for find_panorama_async around each grid point.
 _SEARCH_RADIUS_M = 50.0
 # Zoom level for tile downloads: 0 = lowest, 5 = highest. zoom=1 is a 2×1
-# tile grid (~1664×832 px) — plenty of resolution for segmentation, fast to fetch.
+# tile grid — plenty of resolution for segmentation, fast to fetch.
 _DOWNLOAD_ZOOM = 1
+# Width the panorama is normalised to before segmentation. Kept equal to the
+# native width of a zoom=1 download (1024×512) so the image is never upscaled:
+# upscaling to 1920 cost ~3.5x the GPU compute (measured 8.1 -> 35.2 img/s)
+# without adding any information the download didn't already contain. Height is
+# always width/2 (equirectangular), so the model input shape stays constant —
+# which is what makes ``cudnn.benchmark`` in vision.py worthwhile.
+_SEGMENT_WIDTH = 1024
 # Hard timeout per panorama download (covers all tile fetches together).
 _DOWNLOAD_TIMEOUT_S = 20.0
 # Sliding window of points that may have their **panorama-search HTTP call**
-# in flight at the same time. Small enough not to rate-limit Google's
-# SingleImageSearch endpoint or oversubscribe local sockets; large enough
-# that one task's TCP/TLS reconnect cost is hidden by others' in-flight
-# requests. The heavy download+GPU stretch still serializes — see the
-# inner lock built in _run_analysis_async — so cache-miss throughput is
-# unchanged while cache-hit / no-pano points fly through concurrently.
-_MAX_CONCURRENT_POINTS = 4
+# in flight at the same time. Large enough that one task's TCP/TLS reconnect
+# cost is hidden by others' in-flight requests. The adaptive throttle below
+# scales the *effective* request rate down automatically if Google starts
+# pushing back, so this is a ceiling rather than a fixed rate.
+_MAX_CONCURRENT_POINTS = 6
 # Periodic ``torch.cuda.empty_cache()`` cadence (per-worker completions).
 # Defensive against PyTorch allocator fragmentation over million-point runs.
 _EMPTY_CACHE_EVERY_N = 200
+
+# ── Adaptive rate-limit handling ────────────────────────────────────────────
+# Google's endpoints are unofficial and throttle by IP with no published quota,
+# so the safe design is to *detect* push-back and back off rather than guess a
+# fixed rate. Backoff grows exponentially per consecutive throttle event and
+# decays again after a clean streak.
+_RL_BACKOFF_START_S = 1.0
+_RL_BACKOFF_MAX_S = 60.0
+_RL_DELAY_MAX_S = 5.0
+_RL_RECOVER_AFTER_OK = 40
+# How many times a single point retries through throttling before giving up.
+# Without this a throttled point is silently dropped as "no panorama".
+_RL_MAX_RETRIES = 4
+
+
+class AdaptiveThrottle:
+    """Detects Google rate-limiting and automatically slows the whole run down.
+
+    Two mechanisms, both shared by every worker in a run:
+
+    * **Gate** — on a throttle event every worker is held for an exponentially
+      growing backoff, so we stop hammering an endpoint that is already
+      pushing back.
+    * **Spacing** — a per-request delay that ramps up with repeated throttling
+      and decays after a clean streak. This lowers the sustained request rate
+      without resizing the worker pool, so no queued point is lost.
+
+    The engine treats a throttle as *retryable*, not as "no coverage" — which
+    matters because the search endpoint answers a 429 with a body that would
+    otherwise parse as an empty result and silently drop the point.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._delay = 0.0
+        self._backoff = _RL_BACKOFF_START_S
+        self._gate_until = 0.0
+        self._ok_streak = 0
+        self.trips = 0
+
+    async def before_request(self) -> None:
+        """Wait out any active backoff, then apply the current spacing."""
+        while True:
+            async with self._lock:
+                wait = self._gate_until - asyncio.get_running_loop().time()
+                delay = self._delay
+            if wait > 0:
+                await asyncio.sleep(min(wait, 1.0))
+                continue
+            if delay:
+                await asyncio.sleep(delay)
+            return
+
+    async def record_throttle(self, status: int | None = None) -> None:
+        """A request was rate-limited: close the gate and widen the spacing."""
+        async with self._lock:
+            self.trips += 1
+            self._ok_streak = 0
+            now = asyncio.get_running_loop().time()
+            # Only escalate if we're not already inside a backoff window, so a
+            # burst of concurrent 429s counts as one event rather than six.
+            if now >= self._gate_until:
+                self._gate_until = now + self._backoff
+                self._delay = min(max(self._delay * 2.0, 0.25), _RL_DELAY_MAX_S)
+                _log(
+                    "WARN",
+                    f"Rate limited (HTTP {status}) — backing off "
+                    f"{self._backoff:.0f}s, spacing requests {self._delay:.2f}s "
+                    f"(event #{self.trips})",
+                )
+                self._backoff = min(self._backoff * 2.0, _RL_BACKOFF_MAX_S)
+
+    async def record_success(self) -> None:
+        """A clean response: decay the spacing after a sustained good streak."""
+        async with self._lock:
+            self._ok_streak += 1
+            if self._ok_streak >= _RL_RECOVER_AFTER_OK and self._delay > 0:
+                self._ok_streak = 0
+                self._delay = max(self._delay / 2.0, 0.0)
+                if self._delay < 0.05:
+                    self._delay = 0.0
+                self._backoff = max(self._backoff / 2.0, _RL_BACKOFF_START_S)
+                _log(
+                    "INFO",
+                    f"Rate limit easing — spacing now {self._delay:.2f}s",
+                )
 
 
 class GVIEngine:
@@ -121,7 +212,7 @@ class GVIEngine:
         self.segmenter = DeepLabSegmenter(ckpt_path=model_path, device=str(self.device))
         _log("OK", "Model Ready.")
 
-    def _preprocess_image(self, img, target_width=1920):
+    def _preprocess_image(self, img, target_width=_SEGMENT_WIDTH):
         if img is None:
             return None
 
@@ -171,6 +262,7 @@ class GVIEngine:
         gpu_lock: asyncio.Lock,
         target_year: int | None,
         max_year_diff: int | None,
+        throttle: "AdaptiveThrottle | None" = None,
     ) -> dict:
         idx = pt["orig_index"]
         lat, lon = pt["lat"], pt["lon"]
@@ -190,14 +282,38 @@ class GVIEngine:
 
         _log("INFO", f"Point {idx} @ ({search_lat:.5f}, {search_lon:.5f})")
 
-        # 1. Search for the nearest panorama
+        # 1. Search for the nearest panorama. Throttling is retried (with the
+        # shared backoff) rather than treated as "no coverage" — otherwise
+        # rate limiting silently turns into missing sample points.
+        pano = _RL_SENTINEL = object()
         try:
-            pano = await gsv.find_panorama_async(
-                search_lat,
-                search_lon,
-                session,
-                radius=_SEARCH_RADIUS_M,
-            )
+            for attempt in range(_RL_MAX_RETRIES):
+                if throttle is not None:
+                    await throttle.before_request()
+                try:
+                    pano = await gsv.find_panorama_async(
+                        search_lat,
+                        search_lon,
+                        session,
+                        radius=_SEARCH_RADIUS_M,
+                    )
+                    if throttle is not None:
+                        await throttle.record_success()
+                    break
+                except gsv.RateLimitedError as rl:
+                    if throttle is not None:
+                        await throttle.record_throttle(rl.status)
+                    if cancel_callback and cancel_callback():
+                        return self._empty_result(pt, search_lat, search_lon)
+                    if attempt == _RL_MAX_RETRIES - 1:
+                        _log(
+                            "ERROR",
+                            f"  Point {idx}: still rate limited after "
+                            f"{_RL_MAX_RETRIES} attempts — leaving unsampled",
+                        )
+                        return self._empty_result(pt, search_lat, search_lon)
+            if pano is _RL_SENTINEL:
+                return self._empty_result(pt, search_lat, search_lon)
         except Exception as e:
             _log(
                 "ERROR",
@@ -260,26 +376,57 @@ class GVIEngine:
 
         # 3. Download tiles — no lock. All workers can fetch tiles in parallel
         # (separate aiohttp keep-alive connections share the session pool).
+        # A throttled tile fetch surfaces as ClientResponseError from
+        # raise_for_status(); treat those statuses as retryable, never as a
+        # permanently-failed panorama.
         _log("INFO", f"  Downloading {short}… (zoom={_DOWNLOAD_ZOOM})")
-        try:
-            raw_image = await asyncio.wait_for(
-                gsv.get_panorama_async(download_pano, session, zoom=_DOWNLOAD_ZOOM),
-                timeout=_DOWNLOAD_TIMEOUT_S,
-            )
-        except TimeoutError:
-            _log(
-                "ERROR",
-                f"  Timeout (>{_DOWNLOAD_TIMEOUT_S:.0f}s) downloading "
-                f"{short}… — marking failed",
-            )
-            failed_panos.add(pid)
-            return self._empty_result(pt, search_lat, search_lon)
-        except Exception as e:
-            _log(
-                "ERROR",
-                f"  Download error for {short}…: " f"{type(e).__name__}: {e}",
-            )
-            failed_panos.add(pid)
+        raw_image = None
+        for attempt in range(_RL_MAX_RETRIES):
+            if throttle is not None:
+                await throttle.before_request()
+            try:
+                raw_image = await asyncio.wait_for(
+                    gsv.get_panorama_async(download_pano, session, zoom=_DOWNLOAD_ZOOM),
+                    timeout=_DOWNLOAD_TIMEOUT_S,
+                )
+                if throttle is not None:
+                    await throttle.record_success()
+                break
+            except TimeoutError:
+                _log(
+                    "ERROR",
+                    f"  Timeout (>{_DOWNLOAD_TIMEOUT_S:.0f}s) downloading "
+                    f"{short}… — marking failed",
+                )
+                failed_panos.add(pid)
+                return self._empty_result(pt, search_lat, search_lon)
+            except Exception as e:
+                status = getattr(e, "status", None)
+                throttled = isinstance(e, gsv.RateLimitedError) or (
+                    status in gsv._RATE_LIMIT_STATUSES
+                )
+                if not throttled:
+                    _log(
+                        "ERROR",
+                        f"  Download error for {short}…: "
+                        f"{type(e).__name__}: {e}",
+                    )
+                    failed_panos.add(pid)
+                    return self._empty_result(pt, search_lat, search_lon)
+                if throttle is not None:
+                    await throttle.record_throttle(status)
+                if cancel_callback and cancel_callback():
+                    return self._empty_result(pt, search_lat, search_lon)
+                if attempt == _RL_MAX_RETRIES - 1:
+                    _log(
+                        "ERROR",
+                        f"  {short}…: still rate limited after "
+                        f"{_RL_MAX_RETRIES} attempts — leaving unsampled",
+                    )
+                    # Deliberately NOT added to failed_panos: throttling is
+                    # transient, so a later run should retry this panorama.
+                    return self._empty_result(pt, search_lat, search_lon)
+        if raw_image is None:
             return self._empty_result(pt, search_lat, search_lon)
 
         if cancel_callback and cancel_callback():
@@ -356,7 +503,10 @@ class GVIEngine:
                 return self._empty_result(pt, search_lat, search_lon)
 
             metrics = self.segmenter.calculate_gvi_from_mask(mask)
-            val_veg = metrics.get("GVI_Total", 0.0)
+            # gvi_veg is vegetation only (Cityscapes class 8). Terrain (class 9)
+            # is reported separately as gvi_ter, so the two bands stay
+            # independent — sum them downstream if a combined index is wanted.
+            val_veg = metrics.get("GVI_Vegetation", 0.0)
             val_ter = metrics.get("GVI_Terrain", 0.0)
             pano_cache[pid] = {"veg": val_veg, "ter": val_ter}
 
@@ -466,11 +616,15 @@ class GVIEngine:
         cancel_callback: Callable | None,
         target_year: int | None,
         max_year_diff: int | None,
+        pause_callback: Callable[[], bool] | None = None,
     ) -> None:
         # Run-local set: tracks panos that already failed in *this* run.
         # Never written to pano_cache (which is the persistent session cache).
         failed_panos: set[str] = set()
         completed = 0
+        # One throttle shared by every worker: a 429 seen by any point slows
+        # the whole run down, and recovery is likewise global.
+        throttle = AdaptiveThrottle()
 
         # Fixed worker pool: exactly _MAX_CONCURRENT_POINTS workers pull
         # points from a shared queue. ``gpu_lock`` serializes only the GPU
@@ -489,6 +643,13 @@ class GVIEngine:
                 while True:
                     if cancel_callback and cancel_callback():
                         return
+                    # Hold here while paused. Points stay in the queue, so a
+                    # resume picks up exactly where we left off — nothing in
+                    # flight is dropped and nothing queued is skipped.
+                    while pause_callback and pause_callback():
+                        if cancel_callback and cancel_callback():
+                            return
+                        await asyncio.sleep(0.25)
                     try:
                         pt = queue.get_nowait()
                     except asyncio.QueueEmpty:
@@ -507,6 +668,7 @@ class GVIEngine:
                             gpu_lock,
                             target_year,
                             max_year_diff,
+                            throttle,
                         )
                     except asyncio.CancelledError:
                         return
@@ -570,6 +732,7 @@ class GVIEngine:
         start_index=0,
         target_year=None,
         max_year_diff=None,
+        pause_callback=None,
     ):
         _log("INFO", f"Starting Analysis (Resume Index: {start_index})...")
         if target_year is not None:
@@ -674,6 +837,7 @@ class GVIEngine:
                 cancel_callback=cancel_callback,
                 target_year=target_year,
                 max_year_diff=max_year_diff,
+                pause_callback=pause_callback,
             )
         )
 

@@ -25,6 +25,8 @@ parent. The first element is a string tag from the ``MSG_*`` constants:
 
 from __future__ import annotations
 
+import time
+
 # Message tags (kept as short strings for legibility in queue dumps / logs)
 MSG_PROGRESS = "progress"
 MSG_HEARTBEAT = "heartbeat"
@@ -46,10 +48,11 @@ class SubprocJobContext:
     thread on the parent side can apply them to the real ``JobStore``.
     """
 
-    def __init__(self, job_id, event_queue, cancel_event) -> None:
+    def __init__(self, job_id, event_queue, cancel_event, pause_event=None) -> None:
         self.job_id = job_id
         self._queue = event_queue
         self._cancel_event = cancel_event
+        self._pause_event = pause_event
 
     def progress(
         self, value: float | None = None, status_text: str | None = None, **extras
@@ -68,6 +71,21 @@ class SubprocJobContext:
 
     def is_cancelled(self) -> bool:
         return bool(self._cancel_event.is_set())
+
+    def is_paused(self) -> bool:
+        return bool(self._pause_event is not None and self._pause_event.is_set())
+
+    def wait_while_paused(self, poll_s: float = 0.25) -> None:
+        """Block at a safe point while the job is paused.
+
+        Returns once resumed or cancelled. Work already queued is untouched,
+        so the caller resumes with the next item and nothing is skipped.
+        """
+        if self._pause_event is None:
+            return
+        while self._pause_event.is_set() and not self._cancel_event.is_set():
+            self.heartbeat()
+            time.sleep(poll_s)
 
 
 class _QueueStreamWriter:
