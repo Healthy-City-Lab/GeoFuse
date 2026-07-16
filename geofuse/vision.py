@@ -62,14 +62,9 @@ class DeepLabSegmenter:
         self.device = get_best_device(device)
         _log("INFO", f"Using device: {self.device}")
 
-        # Every input is normalised to one fixed shape upstream (see
-        # ``_SEGMENT_WIDTH`` in gvi.py — currently 1024x512, the native size of
-        # a zoom=1 download), so cuDNN can tune once and reuse the chosen
-        # algorithm. That constant shape is what makes this worthwhile: with
-        # varying input sizes cudnn.benchmark re-tunes per new shape and costs
-        # more than it saves.
+        # cudnn.benchmark stays OFF on purpose.
         if self.device.type == "cuda":
-            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.benchmark = False
 
         # 1. Resolve Model Path
         if ckpt_path is None:
@@ -159,8 +154,7 @@ class DeepLabSegmenter:
 
         # 6. Setup Transforms
         # No Resize here: callers normalise the panorama to one fixed size
-        # first (``_SEGMENT_WIDTH`` in gvi.py), which is what keeps the model
-        # input shape constant for cudnn.benchmark.
+        # first (``_SEGMENT_WIDTH`` in gvi.py).
         self.transform = T.Compose(
             [
                 T.ToTensor(),
