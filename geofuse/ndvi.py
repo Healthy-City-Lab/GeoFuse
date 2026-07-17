@@ -30,7 +30,7 @@ from .ee_utils import (
     shapely_to_ee_geometry,
     shrink_gdf_for_ee,
 )
-from .jobs import progress_interval_s, retry_with_backoff
+from .jobs import NDVI_PROGRESS_MIN_TILES, ProgressThrottle, retry_with_backoff
 from .logger import attach_external_logger, get_logger
 from .persistence.ndvi_tile_cache import DEFAULT_MAX_BYTES, NdviTileCache
 from .vector_io import geometry_sha256
@@ -386,11 +386,31 @@ class NDVIEngine:
     #: ranges that end before this. Diagnostics also reference it.
     S2_COLLECTION_START = "2017-03-28"
 
-    #: Merged Landsat 8/9 Collection 2 Tier 1 Level-2 source for the
-    #: pre-Sentinel-2 fallback. LC08 covers 2013-04+, LC09 covers 2021-10+;
-    #: combined as a single ee.ImageCollection at query time.
+    #: Landsat Collection 2 Tier 1 Level-2 sources for the pre-Sentinel-2
+    #: fallback, spanning every Landsat era so any historical date range finds
+    #: a sensor: LT05 (TM) 1984 → 2012-05, LE07 (ETM+) 1999 → present, LC08
+    #: (OLI) 2013-04+, LC09 2021-10+. They are merged era-aware at query time
+    #: (see :meth:`get_collection_landsat`) — Earth Engine keeps only the
+    #: sensors whose acquisitions overlap the requested window.
+    LANDSAT5_COLLECTION_ID = "LANDSAT/LT05/C02/T1_L2"
+    LANDSAT7_COLLECTION_ID = "LANDSAT/LE07/C02/T1_L2"
     LANDSAT8_COLLECTION_ID = "LANDSAT/LC08/C02/T1_L2"
     LANDSAT9_COLLECTION_ID = "LANDSAT/LC09/C02/T1_L2"
+
+    #: Stable label for the merged Landsat source, recorded in the sidecar
+    #: metadata and mixed into the tile-cache resume key.
+    LANDSAT_MERGED_LABEL = "LANDSAT/LT05+LE07+LC08+LC09/C02/T1_L2"
+
+    #: Roy et al. (2016) RMA coefficients that put ETM+ surface reflectance on
+    #: the OLI (Landsat 8) scale as ``OLI ≈ slope · ETM+ + intercept``, so
+    #: pre-2013 TM/ETM+ NDVI is comparable to the LC08/LC09 (and, loosely,
+    #: Sentinel-2) years. RMA (not OLS) is the harmonization-appropriate fit —
+    #: it is symmetric and preserves the direction (OLI NDVI reads slightly
+    #: higher than ETM+ over vegetation). Only the red/NIR bands NDVI uses are
+    #: kept; ``(slope, intercept)`` in reflectance units. Applied to Landsat 5
+    #: TM as well — spectrally near-identical to ETM+, with no separate
+    #: published TM→OLI set.
+    _ETM_TO_OLI = {"red": (0.9825, -0.0022), "nir": (1.0073, -0.0021)}
 
     def __init__(
         self,
@@ -499,17 +519,84 @@ class NDVIEngine:
         )
         return ndvi.updateMask(cloudy.eq(0)).copyProperties(img, img.propertyNames())
 
-    def get_collection_landsat(self, aoi, start_date, end_date, cloud_max=10):
-        """Merged LC08 + LC09 collection with the same shape as
-        :meth:`get_collection` for Sentinel-2."""
-        lc8 = ee.ImageCollection(self.LANDSAT8_COLLECTION_ID).filterBounds(aoi)
-        lc9 = ee.ImageCollection(self.LANDSAT9_COLLECTION_ID).filterBounds(aoi)
-        merged = lc8.merge(lc9)
-        return (
-            merged.filterDate(start_date, end_date)
-            .filter(ee.Filter.lt("CLOUD_COVER", cloud_max))
-            .map(self.prep_ndvi_landsat)
+    def prep_ndvi_landsat_tm(self, img):
+        """NDVI from Landsat 5 TM / 7 ETM+ Collection 2 Level-2, harmonized to
+        the OLI scale.
+
+        TM/ETM+ carry red/NIR as ``SR_B3`` / ``SR_B4`` (vs OLI's ``SR_B4`` /
+        ``SR_B5``). Reflectance is C2 L2-scaled (``DN * 0.0000275 - 0.2``),
+        then Roy et al. (2016) coefficients (:data:`_ETM_TO_OLI`) put it on the
+        Landsat 8 scale so the NDVI lines up with the LC08/LC09 years. Cloud /
+        shadow / snow are masked with the same ``QA_PIXEL`` bitmask and the
+        output band name (``NDVI``) matches :meth:`prep_ndvi_landsat`, so
+        downstream code stays collection-agnostic.
+        """
+        scale = 0.0000275
+        offset = -0.2
+        red = img.select("SR_B3").multiply(scale).add(offset)
+        nir = img.select("SR_B4").multiply(scale).add(offset)
+        rs, ri = self._ETM_TO_OLI["red"]
+        ns, ni = self._ETM_TO_OLI["nir"]
+        red = red.multiply(rs).add(ri)
+        nir = nir.multiply(ns).add(ni)
+        ndvi = nir.subtract(red).divide(nir.add(red)).rename("NDVI")
+        qa = img.select("QA_PIXEL")
+        # Bit 3 = cloud, bit 4 = cloud shadow, bit 5 = snow.
+        cloudy = (
+            qa.bitwiseAnd(1 << 3).Or(qa.bitwiseAnd(1 << 4)).Or(qa.bitwiseAnd(1 << 5))
         )
+        return ndvi.updateMask(cloudy.eq(0)).copyProperties(img, img.propertyNames())
+
+    def _landsat_sensor_preps(self):
+        """``(collection_id, prep_fn)`` for each Landsat sensor, old → new.
+
+        TM/ETM+ go through the harmonized :meth:`prep_ndvi_landsat_tm`; OLI
+        (8/9) is already the reference scale so it uses :meth:`prep_ndvi_landsat`.
+        """
+        return (
+            (self.LANDSAT5_COLLECTION_ID, self.prep_ndvi_landsat_tm),
+            (self.LANDSAT7_COLLECTION_ID, self.prep_ndvi_landsat_tm),
+            (self.LANDSAT8_COLLECTION_ID, self.prep_ndvi_landsat),
+            (self.LANDSAT9_COLLECTION_ID, self.prep_ndvi_landsat),
+        )
+
+    def get_collection_landsat(self, aoi, start_date, end_date, cloud_max=10):
+        """Era-aware merged Landsat NDVI collection (L5/L7/L8/L9).
+
+        Each sensor is filtered, cloud-screened, and mapped to a common
+        ``NDVI`` band *before* merging — TM/ETM+ and OLI have different band
+        layouts, so they can only be combined once normalized. Earth Engine
+        keeps only the sensors whose acquisitions fall in the date range, so a
+        1990s query composes from TM, a 2012 query from ETM+, and a 2015 query
+        from OLI, all through the same call. Same output shape as
+        :meth:`get_collection` for Sentinel-2.
+        """
+        merged = None
+        for cid, prep in self._landsat_sensor_preps():
+            col = (
+                ee.ImageCollection(cid)
+                .filterBounds(aoi)
+                .filterDate(start_date, end_date)
+                .filter(ee.Filter.lt("CLOUD_COVER", cloud_max))
+                .map(prep)
+            )
+            merged = col if merged is None else merged.merge(col)
+        return merged
+
+    def _landsat_base(self, aoi, start_date, end_date):
+        """Raw (un-prepped) merged Landsat collection over the date range.
+
+        Used only to *count* acquisitions when distinguishing "no images in
+        range" from "all images cloud-filtered", so heterogeneous bands across
+        sensors are fine — nothing reads pixels here.
+        """
+        merged = None
+        for cid, _prep in self._landsat_sensor_preps():
+            col = ee.ImageCollection(cid).filterBounds(aoi).filterDate(
+                start_date, end_date
+            )
+            merged = col if merged is None else merged.merge(col)
+        return merged
 
     def _pick_satellite(self, start_date: str, end_date: str, satellite: str) -> str:
         """Resolve ``satellite='auto'`` → ``'sentinel2'`` or ``'landsat'``.
@@ -843,19 +930,27 @@ class NDVIEngine:
             str(start_date), str(end_date), satellite
         )
         if chosen_satellite == "landsat":
-            ee_collection_id = (
-                f"{self.LANDSAT8_COLLECTION_ID}+{self.LANDSAT9_COLLECTION_ID}"
-            )
+            ee_collection_id = self.LANDSAT_MERGED_LABEL
 
             def _get_col(s, e, cmax):
                 return self.get_collection_landsat(aoi, s, e, cmax)
 
             def _get_base(s, e):
-                lc8 = ee.ImageCollection(self.LANDSAT8_COLLECTION_ID).filterBounds(aoi)
-                lc9 = ee.ImageCollection(self.LANDSAT9_COLLECTION_ID).filterBounds(aoi)
-                return lc8.merge(lc9).filterDate(s, e)
+                return self._landsat_base(aoi, s, e)
 
             cloud_field = "CLOUD_COVER"
+
+            # Landsat 5 TM imaging ended ~2012-05 and Landsat 8 began
+            # ~2013-04, so a window in between is served by Landsat 7 ETM+
+            # alone — whose SLC-off striping (since 2003) leaves ~22% gaps a
+            # seasonal median can't fully fill.
+            if str(start_date) < "2013-04-11" and str(end_date) > "2012-05-05":
+                _log(
+                    "WARN",
+                    "Date range lies in the Landsat-7-only era "
+                    "(2012-05 → 2013-04): expect SLC-off striping gaps in the "
+                    "NDVI composite.",
+                )
         else:
             ee_collection_id = self.EE_COLLECTION_ID
 
@@ -1579,20 +1674,16 @@ class NDVIEngine:
             # Parallel tile downloads. Each worker handles one tile end-to-end
             # (Earth Engine export → reproject to WGS84). The ThreadPoolExecutor
             # caps concurrency at ``_MAX_CONCURRENT_TILES`` so we don't saturate
-            # local sockets or oversubscribe EE per-user. Heartbeat emits are
-            # throttled by the shared :func:`progress_interval_s` so the UI
+            # local sockets or oversubscribe EE per-user. Progress emits are
+            # throttled to every :data:`NDVI_PROGRESS_MIN_TILES` tiles so the UI
             # bracket stays responsive without slamming the JobStore lock on
             # big runs.
             done_count = n_resumed
-            last_emit_t = {"v": time.monotonic()}
-            interval_s = progress_interval_s(n_tiles)
+            _tile_throttle = ProgressThrottle(min_items=NDVI_PROGRESS_MIN_TILES)
 
             def _emit_progress(k: int) -> None:
-                now = time.monotonic()
-                is_final = k >= n_tiles
-                if not is_final and now - last_emit_t["v"] < interval_s:
+                if not _tile_throttle.should_emit(k, final=k >= n_tiles):
                     return
-                last_emit_t["v"] = now
                 _emit_ndvi_progress(
                     ndvi_progress_callback,
                     sub_progress=0.70 * k / n_tiles if n_tiles else 0.0,

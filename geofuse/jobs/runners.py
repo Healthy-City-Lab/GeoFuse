@@ -36,7 +36,11 @@ from geofuse.crs_utils import (
     reproject_geodataframe_to_wgs84,
 )
 from geofuse.gvi import GVIEngine
-from geofuse.jobs import progress_interval_s
+from geofuse.jobs import (
+    GVI_PROGRESS_MIN_ITEMS,
+    GVI_PROGRESS_MIN_SECONDS,
+    ProgressThrottle,
+)
 from geofuse.jobs.stage_ledger import DONE, RUNNING, SKIPPED, StageLedger
 from geofuse.logger import get_logger
 from geofuse.longitudinal import (
@@ -112,19 +116,18 @@ def run_gvi(
     start_idx = len(current_accumulated)
     results_lock = threading.Lock()
 
-    # Throttle progress callbacks via the shared :func:`progress_interval_s`
-    # so the JobStore lock stays cheap on big runs. The final point always
+    # Throttle progress so the JobStore lock stays cheap on big runs: emit at
+    # the slower of every 500 images / every 15 s. The final point always
     # emits so the bar reaches 100 %.
-    _last_progress_t = {"v": 0.0}
+    _throttle = ProgressThrottle(
+        min_items=GVI_PROGRESS_MIN_ITEMS, min_seconds=GVI_PROGRESS_MIN_SECONDS
+    )
 
     def on_progress(curr: int, total: int) -> None:
         if total <= 0:
             return
-        if curr < total:
-            now = time.monotonic()
-            if now - _last_progress_t["v"] < progress_interval_s(total):
-                return
-        _last_progress_t["v"] = time.monotonic()
+        if not _throttle.should_emit(curr, final=curr >= total):
+            return
         ctx.progress(
             value=min(curr / total, 1.0),
             status_text=f"Processing ({curr}/{total})",
@@ -442,6 +445,13 @@ def run_gvi_column(
         + ", ".join(f"{b['label']}: {b['points']:,}" for b in breakdown),
     )
 
+    # One throttle across all years, keyed on the overall point count, so the
+    # cadence is the slower of every 500 images / every 15 s regardless of how
+    # the work is split by year.
+    _throttle = ProgressThrottle(
+        min_items=GVI_PROGRESS_MIN_ITEMS, min_seconds=GVI_PROGRESS_MIN_SECONDS
+    )
+
     done_points = 0
     for idx, (year, pts, meta) in enumerate(plans):
         if ctx.is_cancelled():
@@ -454,10 +464,13 @@ def run_gvi_column(
         def on_progress(curr: int, total: int, _b=base_done, _y=year) -> None:
             if total <= 0 or total_points <= 0:
                 return
+            overall = _b + curr
+            if not _throttle.should_emit(overall, final=overall >= total_points):
+                return
             ctx.progress(
-                value=min((_b + curr) / total_points, 1.0),
+                value=min(overall / total_points, 1.0),
                 status_text=f"Year {_y} ({curr:,}/{total:,}) — "
-                f"{_b + curr:,}/{total_points:,} overall",
+                f"{overall:,}/{total_points:,} overall",
             )
             ctx.heartbeat()
 

@@ -26,6 +26,7 @@ from services import (
     open_path_in_default_editor,
 )
 
+from geofuse.jobs import job_ui_refresh_s
 from geofuse.logger import get_job_log_lines, get_job_log_path
 
 _ACTIVE = {"queued", "running"}
@@ -485,14 +486,18 @@ def render_sidebar_job_monitor() -> None:
     """Render the all-jobs monitor inside ``st.sidebar``.
 
     Pulls every record from the shared :class:`JobStore` and renders one
-    card per job. The fragment reruns every two seconds to pick up in-flight
-    progress updates without forcing a full page rerun — 2 s (rather than 1 s)
-    halves the foreground render cost that competes with running jobs for the
-    GIL, while staying responsive enough for a progress monitor.
+    card per job. Each rerun re-renders every card (regex over each job's log
+    tail included), so this foreground work competes with running jobs when the
+    tab is visible. The refresh interval therefore matches the active engines'
+    backend cadence via :func:`job_ui_refresh_s` — e.g. 15 s while only a GVI
+    job runs, faster when a more frequent engine is active — so the monitor
+    never refreshes faster than there is progress to show.
     """
     store = get_job_store()
+    active_types = {r.type for r in store.list_all() if r.status in _ACTIVE}
+    refresh_s = job_ui_refresh_s(active_types)
 
-    @st.fragment(run_every=2)
+    @st.fragment(run_every=refresh_s)
     def _fragment():
         st.header("Job Monitor")
 

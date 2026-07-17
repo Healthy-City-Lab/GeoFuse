@@ -599,6 +599,17 @@ def _render_ndvi_settings_map() -> None:
     _ndvi_size_hint(int(buffer_m), int(st.session_state.get("ndvi_res", 10)))
 
 
+def _ndvi_discover_years(gdf, col: str) -> list[str]:
+    """Unique years in ``col`` as sorted string labels (fusion-style preview)."""
+    try:
+        from geofuse.longitudinal import parse_date_column
+
+        years = parse_date_column(gdf[col]).dt.year.dropna().astype(int).unique()
+        return [str(y) for y in sorted(years)]
+    except Exception:
+        return []
+
+
 @st.fragment
 def _render_ndvi_date_config() -> None:
     """Per-dataset date configuration. In a fragment so add/remove-date buttons
@@ -780,7 +791,7 @@ def _render_ndvi_date_config() -> None:
                     st.markdown("**Attribute Column (per-year)**")
                     attr_cols = [c for c in d["raw"].columns if c.lower() != "geometry"]
                     if attr_cols:
-                        st.selectbox(
+                        selected_col = st.selectbox(
                             "Year / date attribute column",
                             attr_cols,
                             key=f"ndvi_col_{fname}",
@@ -791,6 +802,15 @@ def _render_ndvi_date_config() -> None:
                                 "(chosen from the whole layer) keeps every year aligned."
                             ),
                         )
+                        years = _ndvi_discover_years(d["raw"], selected_col)
+                        if years:
+                            st.caption(
+                                "Years found: " + ", ".join(f"`{y}`" for y in years)
+                            )
+                        else:
+                            st.warning(
+                                "No parseable years in the selected column."
+                            )
                         st.caption(
                             "Growing-season months composited for each year — pick "
                             "the same months every year for a consistent longitudinal "

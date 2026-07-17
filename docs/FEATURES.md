@@ -26,7 +26,7 @@ The **Green View Index** estimates how much greenery a person sees at street lev
 
 The **Normalized Difference Vegetation Index** measures greenery from above, from satellite imagery.
 
-- **Earth Engine integration.** Fetches cloud-masked **Sentinel-2** or **Landsat 8/9** imagery for any study area. `auto` mode picks Sentinel-2 from 2017 onward and Landsat for earlier dates; the choice is recorded.
+- **Earth Engine integration.** Fetches cloud-masked **Sentinel-2** or **Landsat** imagery for any study area. `auto` mode picks Sentinel-2 from 2017 onward and Landsat for earlier dates; the Landsat path spans every era (5/7/8/9), with the pre-2013 TM/ETM+ sensors harmonized to the Landsat-8 scale so values stay comparable across years. The choice is recorded.
 - **Flexible date modes** (mix freely):
   - **Date range(s)** — one composite per range.
   - **Specific date(s)** — a composite from a ± window around each date.
