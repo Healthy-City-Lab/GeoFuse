@@ -102,11 +102,18 @@ _DOWNLOAD_ZOOM = 1
 _SEGMENT_WIDTH = 1024
 # Hard timeout per panorama download (covers all tile fetches together).
 _DOWNLOAD_TIMEOUT_S = 20.0
-# Sliding window of points that may have their **panorama-search HTTP call**
-# in flight at the same time. Large enough that one task's TCP/TLS reconnect
-# cost is hidden by others' in-flight requests. The adaptive throttle below
-# scales the *effective* request rate down automatically if Google starts
-# pushing back, so this is a ceiling rather than a fixed rate.
+# The analysis runs as two stages with independent concurrency (see
+# ``_run_analysis_async``):
+#   * search stage — resolves every point's nearest panorama. These calls are
+#     light and highly parallel, so a wide window keeps misses and cache hits
+#     (which never touch the GPU) flowing without waiting behind downloads.
+#   * segment stage — downloads a panorama, preprocesses it and runs the GPU
+#     forward. The GPU is serialised by a lock, so a small pool is enough;
+#     more would only queue at the lock.
+# Both stages share the adaptive throttle below, which scales the *effective*
+# request rate down automatically if Google starts pushing back, so these are
+# ceilings rather than fixed rates.
+_SEARCH_CONCURRENCY = 48
 _MAX_CONCURRENT_POINTS = 6
 # Periodic ``torch.cuda.empty_cache()`` cadence (per-worker completions).
 # Defensive against PyTorch allocator fragmentation over million-point runs.
@@ -261,22 +268,32 @@ class GVIEngine:
         target_height = int(target_width / 2)
         return img_cropped.resize((target_width, target_height), Image.BILINEAR)
 
-    async def _process_one_point_async(
+    async def _search_and_resolve(
         self,
         pt: dict,
         session: aiohttp.ClientSession,
         gdf: gpd.GeoDataFrame,
-        folder: str,
-        save_panos: bool,
-        save_masks: bool,
-        pano_cache: dict,
         failed_panos: set,
+        pano_cache: dict,
         cancel_callback: Callable[..., bool] | None,
-        gpu_lock: asyncio.Lock,
         target_year: int | None,
         max_year_diff: int | None,
         throttle: "AdaptiveThrottle | None" = None,
-    ) -> dict:
+    ) -> tuple:
+        """Stage 1: resolve a point to a panorama (search + cache lookup).
+
+        Returns one of:
+
+        * ``("done", result_dict)`` -- the point is fully resolved here: a CRS
+          failure, a miss (no coverage), a capture-year miss, a pano that
+          already failed this run, or a cache hit.
+        * ``("segment", download_pano, pid, pano_date_str, search_lat,
+          search_lon)`` -- the panorama exists and is not cached, so it needs
+          downloading and segmentation in stage 2.
+
+        Every request goes through the shared :class:`AdaptiveThrottle`, and a
+        rate-limited search is retried rather than mistaken for "no coverage".
+        """
         idx = pt["orig_index"]
         lat, lon = pt["lat"], pt["lon"]
         search_lat, search_lon = lat, lon
@@ -291,12 +308,12 @@ class GVIEngine:
                 search_lat, search_lon = p_geo.y, p_geo.x
             except Exception as e:
                 _log("ERROR", f"Point {idx}: CRS transform failed — {e}")
-                return self._empty_result(pt, lat, lon)
+                return ("done", self._empty_result(pt, lat, lon))
 
         _log("INFO", f"Point {idx} @ ({search_lat:.5f}, {search_lon:.5f})")
 
-        # 1. Search for the nearest panorama. Throttling is retried (with the
-        # shared backoff) rather than treated as "no coverage" — otherwise
+        # Search for the nearest panorama. Throttling is retried (with the
+        # shared backoff) rather than treated as "no coverage" -- otherwise
         # rate limiting silently turns into missing sample points.
         pano = _RL_SENTINEL = object()
         try:
@@ -317,27 +334,33 @@ class GVIEngine:
                     if throttle is not None:
                         await throttle.record_throttle(rl.status)
                     if cancel_callback and cancel_callback():
-                        return self._empty_result(pt, search_lat, search_lon)
+                        return ("done", self._empty_result(pt, search_lat, search_lon))
                     if attempt == _RL_MAX_RETRIES - 1:
                         _log(
                             "ERROR",
                             f"  Point {idx}: still rate limited after "
                             f"{_RL_MAX_RETRIES} attempts — leaving unsampled",
                         )
-                        return self._empty_result(pt, search_lat, search_lon)
+                        return (
+                            "done",
+                            self._empty_result(pt, search_lat, search_lon),
+                        )
             if pano is _RL_SENTINEL:
-                return self._empty_result(pt, search_lat, search_lon)
+                return ("done", self._empty_result(pt, search_lat, search_lon))
         except Exception as e:
             _log(
                 "ERROR",
                 f"  Point {idx}: find_panorama_async raised — "
                 f"{type(e).__name__}: {e}",
             )
-            return self._empty_result(pt, search_lat, search_lon)
+            return ("done", self._empty_result(pt, search_lat, search_lon))
 
         if pano is None:
-            _log("WARN", f"  Point {idx}: no panoramas within {_SEARCH_RADIUS_M:.0f} m")
-            return self._empty_result(pt, search_lat, search_lon)
+            _log(
+                "WARN",
+                f"  Point {idx}: no panoramas within {_SEARCH_RADIUS_M:.0f} m",
+            )
+            return ("done", self._empty_result(pt, search_lat, search_lon))
 
         # Pick which dated capture to use. Without a target year we keep the
         # panorama the search returned (the most recent coverage).
@@ -352,7 +375,7 @@ class GVIEngine:
                     f"{max_year_diff} yr of {target_year} "
                     f"(available: {[c.year for c in pano.captures]})",
                 )
-                return self._empty_result(pt, search_lat, search_lon)
+                return ("done", self._empty_result(pt, search_lat, search_lon))
             if capture.id != pano.id:
                 download_pano = pano.clone_for_capture(capture)
             pano_date = (
@@ -365,10 +388,10 @@ class GVIEngine:
         pano_date_str = _format_pano_date(pano_date)
         short = pid[:12]
 
-        # 2. Cache lookups (run-local fail set + persistent success cache)
+        # Cache lookups (run-local fail set + persistent success cache)
         if pid in failed_panos:
             _log("WARN", f"  Skipping {short}… (failed earlier this run)")
-            return self._empty_result(pt, search_lat, search_lon)
+            return ("done", self._empty_result(pt, search_lat, search_lon))
 
         if pid in pano_cache:
             cached = pano_cache[pid]
@@ -377,17 +400,50 @@ class GVIEngine:
                 f"  Cache hit {short}… → veg={cached['veg']:.3f} "
                 f"ter={cached['ter']:.3f}",
             )
-            return self._make_result(
-                pt,
-                search_lat,
-                search_lon,
-                cached["veg"],
-                cached["ter"],
-                pid,
-                pano_date_str,
+            return (
+                "done",
+                self._make_result(
+                    pt,
+                    search_lat,
+                    search_lon,
+                    cached["veg"],
+                    cached["ter"],
+                    pid,
+                    pano_date_str,
+                ),
             )
 
-        # 3. Download tiles — no lock. All workers can fetch tiles in parallel
+        return ("segment", download_pano, pid, pano_date_str, search_lat, search_lon)
+
+    async def _segment_resolved(
+        self,
+        pt: dict,
+        download_pano,
+        pid: str,
+        pano_date_str: str | None,
+        search_lat: float,
+        search_lon: float,
+        session: aiohttp.ClientSession,
+        folder: str,
+        save_panos: bool,
+        save_masks: bool,
+        pano_cache: dict,
+        failed_panos: set,
+        cancel_callback: Callable[..., bool] | None,
+        gpu_lock: asyncio.Lock,
+        throttle: "AdaptiveThrottle | None" = None,
+    ) -> dict:
+        """Stage 2: download the resolved panorama, segment it, cache the value.
+
+        Only called for panoramas that stage 1 found present and uncached. The
+        GPU forward is serialised by ``gpu_lock``; downloads and CPU
+        preprocessing run in parallel across the segment-stage pool.
+        """
+        short = pid[:12]
+        if cancel_callback and cancel_callback():
+            return self._empty_result(pt, search_lat, search_lon)
+
+        # Download tiles -- no lock. All workers can fetch tiles in parallel
         # (separate aiohttp keep-alive connections share the session pool).
         # A throttled tile fetch surfaces as ClientResponseError from
         # raise_for_status(); treat those statuses as retryable, never as a
@@ -453,10 +509,9 @@ class GVIEngine:
 
         # Preprocess in the executor, never inline. Every worker here is a
         # coroutine on the *same* event-loop thread, so calling this directly
-        # would block all of them for the duration (~6 ms/point) and add
-        # latency to every in-flight network callback. numpy and PIL release
-        # the GIL, so a thread genuinely parallelises this. Measured over 4000
-        # points: 41.9 -> 49.8 pts/s (+19%) with GPU feed rising ~53% -> ~65%.
+        # would block all of them for the duration and add latency to every
+        # in-flight network callback. numpy and PIL release the GIL, so a
+        # thread genuinely parallelises this.
         loop = asyncio.get_running_loop()
         img = await loop.run_in_executor(None, self._preprocess_image, raw_image)
         try:
@@ -483,12 +538,12 @@ class GVIEngine:
             )
             return self._empty_result(pt, search_lat, search_lon)
 
-        # 4. GPU inference — serialised so one image is on the device at a
-        # time. While this lock is held by one task, others can download
-        # tiles or preprocess in parallel.
+        # GPU inference -- serialised so one image is on the device at a
+        # time. While this lock is held by one task, others can download tiles
+        # or preprocess in parallel.
         async with gpu_lock:
-            # Another worker may have written the cache for this pano while
-            # we were queued at the GPU lock; skip the forward in that case.
+            # Another worker may have written the cache for this pano while we
+            # were queued at the GPU lock; skip the forward in that case.
             if pid in pano_cache:
                 cached = pano_cache[pid]
                 _log(
@@ -514,21 +569,22 @@ class GVIEngine:
             except Exception as e:
                 _log(
                     "ERROR",
-                    f"  GPU inference failed for {short}…: " f"{type(e).__name__}: {e}",
+                    f"  GPU inference failed for {short}…: "
+                    f"{type(e).__name__}: {e}",
                 )
                 return self._empty_result(pt, search_lat, search_lon)
 
             metrics = self.segmenter.calculate_gvi_from_mask(mask)
             # gvi_veg is vegetation only (Cityscapes class 8). Terrain (class 9)
             # is reported separately as gvi_ter, so the two bands stay
-            # independent — sum them downstream if a combined index is wanted.
+            # independent -- sum them downstream if a combined index is wanted.
             val_veg = metrics.get("GVI_Vegetation", 0.0)
             val_ter = metrics.get("GVI_Terrain", 0.0)
             pano_cache[pid] = {"veg": val_veg, "ter": val_ter}
 
             _log("OK", f"  GVI {short}… → veg={val_veg:.3f}  ter={val_ter:.3f}")
 
-        # 5. Optional disk artefacts
+        # Optional disk artefacts
         if save_panos:
             p_path = os.path.join(folder, "images", f"{pid}.jpg")
             if not os.path.exists(p_path):
@@ -565,12 +621,13 @@ class GVIEngine:
                         _log(
                             "WARN",
                             f"  Mask type '{type(mask).__name__}' "
-                            f"not handled — skipping save",
+                            f"not handled -- skipping save",
                         )
                 except Exception as e:
                     _log(
                         "ERROR",
-                        f"  Failed to save mask {short}…: " f"{type(e).__name__}: {e}",
+                        f"  Failed to save mask {short}…: "
+                        f"{type(e).__name__}: {e}",
                     )
 
         return self._make_result(
@@ -638,43 +695,127 @@ class GVIEngine:
         # Never written to pano_cache (which is the persistent session cache).
         failed_panos: set[str] = set()
         completed = 0
-        # One throttle shared by every worker: a 429 seen by any point slows
-        # the whole run down, and recovery is likewise global.
+        # One throttle shared by every worker in both stages: a 429 seen by any
+        # request slows the whole run down, and recovery is likewise global.
         throttle = AdaptiveThrottle()
-
-        # Fixed worker pool: exactly _MAX_CONCURRENT_POINTS workers pull
-        # points from a shared queue. ``gpu_lock`` serializes only the GPU
-        # forward pass; downloads and CPU preprocessing run in parallel.
         gpu_lock = asyncio.Lock()
-        queue: asyncio.Queue = asyncio.Queue()
+
+        # Two-stage pipeline. The search stage resolves every point (misses and
+        # cache hits finish there); only panoramas that are present *and*
+        # uncached flow to the segment stage, which downloads and runs the GPU.
+        # Decoupling the two lets the light, highly-parallel search run at
+        # ``_SEARCH_CONCURRENCY`` while the GPU-bound segment stage stays small.
+        search_q: asyncio.Queue = asyncio.Queue()
         for pt in points_to_process:
-            queue.put_nowait(pt)
+            search_q.put_nowait(pt)
+        segment_q: asyncio.Queue = asyncio.Queue()
+        _SEG_SENTINEL = object()
+
+        # In-flight dedup: many neighbouring grid points resolve to the *same*
+        # panorama. The first to reach an uncached pano enqueues it; the rest
+        # register as waiters and are answered from the cache the moment that
+        # one segmentation completes -- so each panorama downloads and runs the
+        # GPU exactly once, no matter how many points share it.
+        pending: dict[str, list] = {}
 
         completed_lock = asyncio.Lock()
+        segmented = 0
+        segmented_lock = asyncio.Lock()
+
+        async def _emit(result: dict) -> None:
+            nonlocal completed
+            if result_callback:
+                result_callback(result)
+            async with completed_lock:
+                completed += 1
+                curr = completed
+            if progress_callback:
+                progress_callback(start_index + curr, total_points)
+
+        async def _wait_while_paused() -> None:
+            # Hold at a safe point while paused. Nothing queued is dropped, so
+            # a resume picks up exactly where we left off.
+            while pause_callback and pause_callback():
+                if cancel_callback and cancel_callback():
+                    return
+                await asyncio.sleep(0.25)
 
         async with aiohttp.ClientSession() as session:
 
-            async def _worker() -> None:
-                nonlocal completed
+            async def _search_worker() -> None:
                 while True:
                     if cancel_callback and cancel_callback():
                         return
-                    # Hold here while paused. Points stay in the queue, so a
-                    # resume picks up exactly where we left off — nothing in
-                    # flight is dropped and nothing queued is skipped.
-                    while pause_callback and pause_callback():
-                        if cancel_callback and cancel_callback():
-                            return
-                        await asyncio.sleep(0.25)
+                    await _wait_while_paused()
+                    if cancel_callback and cancel_callback():
+                        return
                     try:
-                        pt = queue.get_nowait()
+                        pt = search_q.get_nowait()
                     except asyncio.QueueEmpty:
                         return
                     try:
-                        res = await self._process_one_point_async(
+                        outcome = await self._search_and_resolve(
                             pt,
                             session,
                             gdf,
+                            failed_panos,
+                            pano_cache,
+                            cancel_callback,
+                            target_year,
+                            max_year_diff,
+                            throttle,
+                        )
+                    except asyncio.CancelledError:
+                        return
+                    if outcome[0] == "done":
+                        await _emit(outcome[1])
+                        continue
+                    # ("segment", download_pano, pid, pano_date_str, slat, slon)
+                    _, download_pano, pid, pano_date_str, slat, slon = outcome
+                    # The membership tests and the mutation below have no await
+                    # between them, so two workers can never both enqueue the
+                    # same pid -- one downloads it, the rest wait on the result.
+                    if pid in pano_cache:
+                        cached = pano_cache[pid]
+                        await _emit(
+                            self._make_result(
+                                pt,
+                                slat,
+                                slon,
+                                cached["veg"],
+                                cached["ter"],
+                                pid,
+                                pano_date_str,
+                            )
+                        )
+                    elif pid in pending:
+                        pending[pid].append((pt, slat, slon, pano_date_str))
+                    else:
+                        pending[pid] = []
+                        await segment_q.put(
+                            (pt, download_pano, pid, pano_date_str, slat, slon)
+                        )
+
+            async def _segment_worker() -> None:
+                nonlocal segmented
+                while True:
+                    item = await segment_q.get()
+                    if item is _SEG_SENTINEL:
+                        return
+                    pt, download_pano, pid, pano_date_str, slat, slon = item
+                    if cancel_callback and cancel_callback():
+                        pending.pop(pid, None)
+                        return
+                    await _wait_while_paused()
+                    try:
+                        result = await self._segment_resolved(
+                            pt,
+                            download_pano,
+                            pid,
+                            pano_date_str,
+                            slat,
+                            slon,
+                            session,
                             folder,
                             save_panos,
                             save_masks,
@@ -682,23 +823,36 @@ class GVIEngine:
                             failed_panos,
                             cancel_callback,
                             gpu_lock,
-                            target_year,
-                            max_year_diff,
                             throttle,
                         )
                     except asyncio.CancelledError:
                         return
-                    if result_callback:
-                        result_callback(res)
-                    async with completed_lock:
-                        completed += 1
-                        curr = completed
-                    if progress_callback:
-                        progress_callback(start_index + curr, total_points)
+                    await _emit(result)
+                    # Answer every point that was waiting on this same panorama
+                    # with the value this segmentation produced. The values come
+                    # from the primary's own result, never re-read from the
+                    # cache, so dedup stays correct even when the cache is a
+                    # no-op store (and a failed download makes every waiter a
+                    # miss too, matching the primary).
+                    waiters = pending.pop(pid, [])
+                    res_veg = result.get("gvi_veg")
+                    res_ter = result.get("gvi_ter")
+                    for wpt, wlat, wlon, wdate in waiters:
+                        if res_veg is not None:
+                            await _emit(
+                                self._make_result(
+                                    wpt, wlat, wlon, res_veg, res_ter, pid, wdate
+                                )
+                            )
+                        else:
+                            await _emit(self._empty_result(wpt, wlat, wlon))
                     # Defensive: release cached blocks back to the device
                     # periodically so long-running jobs don't accumulate
                     # allocator fragmentation.
-                    if curr % _EMPTY_CACHE_EVERY_N == 0 and self.device.type == "cuda":
+                    async with segmented_lock:
+                        segmented += 1
+                        do_empty = segmented % _EMPTY_CACHE_EVERY_N == 0
+                    if do_empty and self.device.type == "cuda":
                         try:
                             import torch
 
@@ -706,8 +860,13 @@ class GVIEngine:
                         except Exception:
                             pass
 
-            workers: list[asyncio.Task] = [
-                asyncio.create_task(_worker()) for _ in range(_MAX_CONCURRENT_POINTS)
+            searchers = [
+                asyncio.create_task(_search_worker())
+                for _ in range(_SEARCH_CONCURRENCY)
+            ]
+            segmenters = [
+                asyncio.create_task(_segment_worker())
+                for _ in range(_MAX_CONCURRENT_POINTS)
             ]
 
             # Watcher: cancels every worker on user cancel.
@@ -715,7 +874,7 @@ class GVIEngine:
                 while True:
                     await asyncio.sleep(0.25)
                     if cancel_callback and cancel_callback():
-                        for t in workers:
+                        for t in (*searchers, *segmenters):
                             if not t.done():
                                 t.cancel()
                         return
@@ -723,7 +882,12 @@ class GVIEngine:
             watcher = asyncio.create_task(_cancel_watcher())
 
             try:
-                await asyncio.gather(*workers, return_exceptions=True)
+                # Drain the search stage, then signal the segment stage to stop
+                # once its queue empties.
+                await asyncio.gather(*searchers, return_exceptions=True)
+                for _ in segmenters:
+                    segment_q.put_nowait(_SEG_SENTINEL)
+                await asyncio.gather(*segmenters, return_exceptions=True)
             finally:
                 watcher.cancel()
                 try:
