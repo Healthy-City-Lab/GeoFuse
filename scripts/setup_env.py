@@ -19,10 +19,21 @@ CONDA_PACKAGES = [
     "liblapack=*=*openblas",
     "numpy=2.4.6",
     "scipy=1.17.1",
-    "gdal=3.12.0",
-    "geopandas=1.1.1",
+    "gdal=3.12.3",
+    "geopandas=1.1.4",
     "statsmodels=0.14.6",
     "cmaes=0.13.0",
+    # Async HTTP — used by the in-house geofuse.streetview client (GVIEngine)
+    "aiohttp=3.12.15",
+    # Geospatial native stack
+    "rasterio=1.5.0",
+    "shapely=2.1.2",
+    "fiona=1.10.1",
+    # numpy/BLAS-linked C extensions
+    "matplotlib=3.10.8",
+    "scikit-learn=1.6.0",
+    "pillow=12.0.0",
+    "tqdm=4.67.1",
 ]
 
 # 2. PYTORCH
@@ -30,15 +41,7 @@ PYTORCH_VERSION = "torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0"
 
 # 3. PIP PACKAGES
 PIP_PACKAGES = [
-    # Geospatial
-    "rasterio==1.4.4",
-    "shapely==2.1.2",
-    "fiona==1.10.1",
     # Data Science
-    "matplotlib==3.10.8",
-    "scikit-learn==1.6.0",
-    "tqdm==4.67.1",
-    "pillow==12.0.0",
     "optuna==4.6.0",
     "skrebate==0.62",
     # Partial distance correlation (default objective) + spline residualization
@@ -52,8 +55,6 @@ PIP_PACKAGES = [
     # Earth Engine & Geospatial APIs
     "geemap==0.36.6",
     "earthengine-api==1.7.4",
-    # Async HTTP — used by the in-house geofuse.streetview client (GVIEngine)
-    "aiohttp==3.9.5",
     # Utility
     "isort==7.0.0",
     # Dev tooling — must match the version pinned in .github/workflows/code-quality.yml
