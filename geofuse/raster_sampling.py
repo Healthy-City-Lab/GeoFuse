@@ -64,6 +64,11 @@ class LazyRasterArray:
             self.dtype = np.dtype(src.dtypes[self.band - 1])
             self.nodata = src.nodata
         self._local = threading.local()
+        # Every handle any thread opens, so ``close_all`` can release the file
+        # deterministically instead of waiting for each worker thread to be
+        # collected — Windows keeps the lock until then.
+        self._handles: list = []
+        self._handles_lock = threading.Lock()
 
     @property
     def ndim(self) -> int:
@@ -74,6 +79,8 @@ class LazyRasterArray:
         if src is None or src.closed:
             src = rasterio.open(self.path)
             self._local.src = src
+            with self._handles_lock:
+                self._handles.append(src)
         return src
 
     def __getitem__(self, key):
@@ -100,6 +107,18 @@ class LazyRasterArray:
         if src is not None and not src.closed:
             src.close()
             self._local.src = None
+
+    def close_all(self) -> None:
+        """Close every handle opened for this raster, on any thread."""
+        with self._handles_lock:
+            handles, self._handles = self._handles, []
+        for src in handles:
+            try:
+                if not src.closed:
+                    src.close()
+            except Exception:
+                pass
+        self._local = threading.local()
 
 
 _STAT_FUNCS: dict[str, Callable[[np.ndarray], float]] = {

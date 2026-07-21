@@ -933,6 +933,31 @@ def _discover_years_from_date_column(gdf: gpd.GeoDataFrame, date_col: str) -> li
     return [str(y) for y in years]
 
 
+def _cached_years_for_file(path: str, date_col: str) -> list[str]:
+    """Years present in ``path``'s date column, memoized per (path, mtime, col).
+
+    The wide-mode panel re-renders on every interaction; without this the
+    per-wave files would be re-read from disk each time just to list years.
+    """
+    if not path or not date_col or not os.path.isfile(path):
+        return []
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return []
+    store = st.session_state.setdefault("_fusion_year_cache", {})
+    key = (path, mtime, date_col)
+    hit = store.get(key)
+    if hit is not None:
+        return list(hit)
+    try:
+        years = _discover_years_from_date_column(_read_vector_for_ui(path), date_col)
+    except Exception:
+        years = []
+    store[key] = list(years)
+    return list(years)
+
+
 def _render_optimization_setup_panel(
     preview_gdf: gpd.GeoDataFrame | None,
     target_outcome_columns: list[str],
@@ -1004,6 +1029,9 @@ def _render_optimization_setup_panel(
         "association_target": "level",
         "decline_average_exposure": False,
         "decline_exposure_change": False,
+        # True when greenery files are assigned per calendar year rather than
+        # per wave file; rows then route by their own measurement date.
+        "assign_by_year": False,
     }
 
     entries = list(target_file_entries or [])
@@ -1061,6 +1089,24 @@ def _render_optimization_setup_panel(
     state["intake_mode"] = intake_mode
     st.caption(f"Intake mode: **{intake_mode}** ")
 
+    assign_mode = st.radio(
+        "Assign greenery files per",
+        options=["Measurement year", "Wave file"],
+        index=0,
+        horizontal=True,
+        key="fusion_lon_assign_mode",
+        help=(
+            "**Measurement year** — greenery is assigned to the calendar years "
+            "found in the date column, and every observation reads the file for "
+            "the year it was actually measured (works even when one wave file "
+            "spans a year boundary). **Wave file** — one greenery file per wave, "
+            "the previous behaviour; use it when an entity has two measurements "
+            "in the same calendar year."
+        ),
+    )
+    assign_by_year = assign_mode == "Measurement year"
+    state["assign_by_year"] = assign_by_year
+
     if intake_mode == "long":
         if preview_gdf is None:
             st.info("Upload a target file first to populate the column pickers.")
@@ -1086,6 +1132,22 @@ def _render_optimization_setup_panel(
                 )
             else:
                 st.warning("No date-parseable columns found in the target.")
+        if assign_by_year:
+            # Years drive the greenery assignment; the wave column is not
+            # needed (intake derives each row's wave from its date).
+            if state["date_col"]:
+                years = _discover_years_from_date_column(
+                    preview_gdf, state["date_col"]
+                )
+                state["discovered_waves"] = years
+                if years:
+                    st.caption(
+                        "Discovered years: " + ", ".join(f"`{y}`" for y in years)
+                    )
+                else:
+                    st.warning("No parseable dates in the selected column.")
+            return state
+
         wave_candidates = [
             c
             for c in all_cols
@@ -1179,12 +1241,31 @@ def _render_optimization_setup_panel(
                 )
 
     state["wide_files"] = wide_files
-    state["discovered_waves"] = [f["wave_label"] for f in wide_files]
-    if state["discovered_waves"]:
-        st.caption(
-            "Discovered waves: "
-            + ", ".join(f"`{w}`" for w in state["discovered_waves"])
-        )
+    if assign_by_year:
+        # Union of the calendar years across every file's own date column: a
+        # file that straddles a year boundary contributes both of its years.
+        year_set: set[str] = set()
+        for wf in wide_files:
+            year_set.update(_cached_years_for_file(wf["path"], wf["date_col"]))
+        state["discovered_waves"] = sorted(year_set)
+        if state["discovered_waves"]:
+            st.caption(
+                "Discovered years across all files: "
+                + ", ".join(f"`{y}`" for y in state["discovered_waves"])
+            )
+        elif wide_files:
+            st.warning(
+                "No parseable dates found in the selected date columns — pick "
+                "a date column for each file, or switch to per-wave-file "
+                "assignment."
+            )
+    else:
+        state["discovered_waves"] = [f["wave_label"] for f in wide_files]
+        if state["discovered_waves"]:
+            st.caption(
+                "Discovered waves: "
+                + ", ".join(f"`{w}`" for w in state["discovered_waves"])
+            )
     return state
 
 
@@ -1193,6 +1274,65 @@ _FUSION_METRIC_CHANNELS: tuple[tuple[str, str, str], ...] = (
     ("ndvi", "🛰️ NDVI", "ndvi"),
     ("gvi", "🌿 GVI", "gvi"),
 )
+
+_UNASSIGNED_HEADER = "Unassigned"
+
+
+def _render_year_assignment_sortable(
+    ch_short: str,
+    ch_label: str,
+    file_paths: list[str],
+    waves: list[str],
+) -> dict[str, list[str]] | None:
+    """Drag years onto files. Returns ``{path: [wave, ...]}`` or ``None``.
+
+    Years are the draggable items and files are the containers, so a year can
+    sit in exactly one place: assign-once coverage is structural rather than
+    validated after the fact. ``None`` means the component is unavailable and
+    the caller should fall back to the multiselect grid.
+    """
+    try:
+        from streamlit_sortables import sort_items
+    except Exception:
+        return None
+
+    state_key = f"fusion_{ch_short}_year_assign"
+    stored: dict[str, list[str]] = dict(st.session_state.get(state_key, {}))
+    # Drop files and years that have since disappeared, so a stale assignment
+    # can't resurrect a removed row or an outdated year.
+    stored = {p: [w for w in ws if w in waves] for p, ws in stored.items() if p in file_paths}
+    claimed = {w for ws in stored.values() for w in ws}
+    unassigned = [w for w in waves if w not in claimed]
+
+    # Headers are numbered so two files with the same basename stay distinct.
+    containers = [{"header": _UNASSIGNED_HEADER, "items": unassigned}]
+    for i, p in enumerate(file_paths, start=1):
+        containers.append(
+            {"header": f"{i}. {os.path.basename(p)}", "items": stored.get(p, [])}
+        )
+
+    # Remount when the file list or year set changes: a custom component keyed
+    # on a stable key misbehaves when its item set shifts underneath it.
+    sig = abs(hash((tuple(file_paths), tuple(waves)))) % (10**9)
+    st.caption(
+        f"Drag each year onto the {ch_label} file that covers it. "
+        "Years left in **Unassigned** block submission."
+    )
+    for i, p in enumerate(file_paths, start=1):
+        st.caption(f"{i}. `{os.path.basename(p)}` — {p}")
+    result = sort_items(
+        containers,
+        multi_containers=True,
+        key=f"fusion_{ch_short}_sort_{sig}",
+    )
+
+    assignment: dict[str, list[str]] = {}
+    for idx, bucket in enumerate(result):
+        if idx == 0:  # the Unassigned pool
+            continue
+        assignment[file_paths[idx - 1]] = list(bucket.get("items", []))
+    st.session_state[state_key] = assignment
+    return assignment
 
 
 def _render_metric_assignment_panel(
@@ -1288,6 +1428,19 @@ def _render_metric_assignment_panel(
                 for j in range(n_files)
             }
 
+            # Drag-and-drop assignment: years are items, files are containers,
+            # so each year lands on exactly one file by construction.
+            picked_paths: list[str] = []
+            for i in range(n_files):
+                p = st.session_state.get(f"fusion_{ch_short}_path_{i}")
+                if isinstance(p, str) and p and os.path.isfile(p):
+                    picked_paths.append(p)
+            sortable_assignment: dict[str, list[str]] | None = None
+            if year_aware and discovered_waves and picked_paths:
+                sortable_assignment = _render_year_assignment_sortable(
+                    ch_short, ch_label, picked_paths, list(discovered_waves)
+                )
+
             channel_files: list[tuple[str, list]] = []
             for i in range(n_files):
                 col_up, col_rm = st.columns([5, 1])
@@ -1314,7 +1467,10 @@ def _render_metric_assignment_panel(
                     st.error(f"Path no longer exists: `{file_path}`")
                     file_path = None
                 assigned: list = []
-                if year_aware and discovered_waves:
+                if sortable_assignment is not None:
+                    if file_path:
+                        assigned = list(sortable_assignment.get(file_path, []))
+                elif year_aware and discovered_waves:
                     my_current = set(sibling_assignments.get(i, []))
                     taken_by_others = set().union(
                         *(
@@ -4236,6 +4392,13 @@ def render(output_dir: str) -> None:
                     date_col_eff = opt_state["date_col"] or ""
                     wave_col_eff = opt_state["wave_col"]
 
+                # Year-keyed assignment: wave labels are the calendar years and
+                # each row's wave comes from its own measurement date, so no
+                # wave column is consulted.
+                assign_by_year = bool(opt_state.get("assign_by_year"))
+                if assign_by_year:
+                    wave_col_eff = None
+
                 spec = _LonSpec(
                     intake_mode=intake,  # type: ignore[arg-type]
                     entity_id_col=entity_id_col,
@@ -4250,7 +4413,7 @@ def render(output_dir: str) -> None:
                     association_target=str(lon_association_target),
                     decline_average_exposure=bool(lon_decline_between),
                     decline_exposure_change=bool(lon_decline_within),
-                    derive_wave_from_date=False,
+                    derive_wave_from_date=assign_by_year,
                 )
                 spec_errs += _validate_lon_spec(spec)
                 if spec_errs:

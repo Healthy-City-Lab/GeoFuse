@@ -229,15 +229,33 @@ def validate_spec(spec: LongitudinalSpec) -> list[str]:
         errs.append("wave_labels must contain at least one wave.")
     if len(set(spec.wave_labels)) != len(spec.wave_labels):
         errs.append("wave_labels contains duplicates.")
-    if spec.intake_mode == "long" and not spec.wave_col:
-        errs.append("wave_col is required when intake_mode == 'long'.")
+    if (
+        spec.intake_mode == "long"
+        and not spec.wave_col
+        and not spec.derive_wave_from_date
+    ):
+        errs.append(
+            "wave_col is required when intake_mode == 'long' unless "
+            "derive_wave_from_date is set."
+        )
     if spec.intake_mode == "wide":
-        missing_t = [w for w in spec.wave_labels if w not in spec.target_files_per_wave]
-        if missing_t:
+        if not spec.target_files_per_wave:
             errs.append(
-                "target_files_per_wave is missing entries for waves "
-                f"{missing_t} (required when intake_mode == 'wide')."
+                "target_files_per_wave is required when intake_mode == 'wide'."
             )
+        elif not spec.derive_wave_from_date:
+            # Wave-keyed intake: one target file per wave label. Under
+            # year-keyed waves the files are keyed by their own label instead
+            # and a row's wave comes from its measurement date, so the
+            # per-wave completeness check does not apply.
+            missing_t = [
+                w for w in spec.wave_labels if w not in spec.target_files_per_wave
+            ]
+            if missing_t:
+                errs.append(
+                    "target_files_per_wave is missing entries for waves "
+                    f"{missing_t} (required when intake_mode == 'wide')."
+                )
     if spec.scoring_metric not in SUPPORTED_SCORING_METRICS:
         errs.append(
             f"scoring_metric must be one of {SUPPORTED_SCORING_METRICS}, "
@@ -358,6 +376,13 @@ def build_long_format(
         sample = (
             frame.loc[dup_mask, [spec.entity_id_col, "wave"]].head(5).to_dict("records")
         )
+        if spec.derive_wave_from_date:
+            raise ValueError(
+                "Two measurements of the same entity fall in the same calendar "
+                f"year — first few: {sample}. Year-keyed greenery assignment "
+                "needs at most one observation per entity per year; switch the "
+                "assignment mode to per wave file, or split the affected years."
+            )
         raise ValueError(
             f"Duplicate (entity_id, wave) rows detected — first few: {sample}. "
             "Each (entity, wave) must appear exactly once across the longitudinal "
@@ -405,18 +430,34 @@ def parse_date_column(s: pd.Series) -> pd.Series:
     return pd.to_datetime(s.astype(str), errors="coerce")
 
 
+def wave_labels_from_dates(parsed_dates: pd.Series) -> pd.Series:
+    """Calendar-year wave labels from an already-parsed date column.
+
+    Year-keyed waves route each observation's greenery lookup by the year it
+    was actually measured, so a file that spans a year boundary still sends
+    each row to the right source. Unparseable dates become ``"<NA>"`` and are
+    dropped by the wave filter in :func:`build_long_format`.
+    """
+    return parsed_dates.dt.year.astype("Int64").astype(str)
+
+
 def _prepare_long_input(
     gdf: gpd.GeoDataFrame,
     spec: LongitudinalSpec,
     outcome_col: str,
     cov_cols: list[str],
 ) -> gpd.GeoDataFrame:
-    required = {spec.entity_id_col, spec.wave_col, spec.date_col, outcome_col}
+    required = {spec.entity_id_col, spec.date_col, outcome_col}
+    if not spec.derive_wave_from_date:
+        required.add(spec.wave_col)
     _assert_columns_present(gdf, required, "long-format target")
     _assert_columns_present(gdf, set(cov_cols), "long-format target (covariates)")
     out = gdf.copy()
-    out["wave"] = out[spec.wave_col].astype(str)
     out[spec.date_col] = parse_date_column(out[spec.date_col])
+    if spec.derive_wave_from_date:
+        out["wave"] = wave_labels_from_dates(out[spec.date_col])
+    else:
+        out["wave"] = out[spec.wave_col].astype(str)
     return out
 
 
@@ -440,8 +481,14 @@ def _prepare_wide_input(
             frame, set(cov_cols), f"wave {wave_label!r} target (covariates)"
         )
         copy = frame.copy()
-        copy["wave"] = wave_label
         copy[spec.date_col] = parse_date_column(copy[spec.date_col])
+        if spec.derive_wave_from_date:
+            # The file is a container, not a wave: each row is tagged with the
+            # calendar year it was measured, so greenery routing follows the
+            # measurement even when one file spans a year boundary.
+            copy["wave"] = wave_labels_from_dates(copy[spec.date_col])
+        else:
+            copy["wave"] = wave_label
         tagged.append(copy)
 
     # Concatenate; pandas preserves the union of columns. Use the first

@@ -266,74 +266,92 @@ def precompute_raster_ring_values(
 ) -> list[list[np.ndarray]]:
     """Bin each point's raster neighbourhood into concentric annuli (per radius).
 
-    One pass per point: squared pixel distances are binned into every annulus
-    with a single ``searchsorted`` + stable sort, instead of one boolean ring
-    mask over the whole window per radius (and no per-pixel ``sqrt``).
+    Footprints come from the same buffered discs the pre-aggregation cache
+    reduces over: the point is buffered in a projected (metres) CRS, the buffer
+    is reprojected into the raster's CRS, and one nested-ring rasterization
+    assigns every pixel the index of the smallest disc that touches it. Annulus
+    *i* is then the pixels whose index is exactly *i*, so concatenating rings
+    ``0..i`` reproduces disc *i* exactly.
     """
+    from . import preaggregation
+
     n_pts = len(points_gdf)
     n_rings = len(radii_m)
     _empty = np.array([], dtype=np.float64)
     ring_values: list[list[np.ndarray]] = [
         [_empty] * n_rings for _ in range(n_pts)
     ]
+    if n_pts == 0 or n_rings == 0:
+        return ring_values
 
     metric_array = metric_dict["data"]
     transform = metric_dict["transform"]
     metric_crs = metric_dict["crs"]
-    points_metric_crs = points_gdf.to_crs(metric_crs)
 
-    pixel_size = abs(transform.a)
-    if metric_crs.is_geographic:
-        pixel_size_meters = pixel_size * 111320
+    # Buffer in a projected CRS so the radii are metres, then reproject the
+    # buffers (never the raster) into the raster's own CRS.
+    from .crs_utils import crs_uses_metre_axes, estimate_metre_projected_crs_for_gdf
+
+    if points_gdf.crs is not None and crs_uses_metre_axes(points_gdf.crs):
+        buffer_crs = points_gdf.crs
     else:
-        pixel_size_meters = pixel_size
+        buffer_crs = estimate_metre_projected_crs_for_gdf(points_gdf)
+    pts_buf_crs = points_gdf.to_crs(buffer_crs)
+    if str(buffer_crs) != str(metric_crs):
+        from pyproj import Transformer as _Transformer
 
-    max_r_m = float(radii_m[-1])
-    max_r_px = int(max_r_m / pixel_size_meters)
-    max_r_px = max(1, min(max_r_px, 10000))
+        xy_fn = _Transformer.from_crs(buffer_crs, metric_crs, always_xy=True).transform
+    else:
+        xy_fn = None
 
-    idx_to_pos = {idx: pos for pos, idx in enumerate(points_gdf.index)}
-    # Squared ring edges in squared-pixel units, so per-pixel distances stay
-    # squared end to end.
-    radii2_px = (np.asarray(radii_m, dtype=np.float64) / pixel_size_meters) ** 2
+    radii_list = [float(r) for r in np.asarray(radii_m, dtype=np.float64)]
+    templates = preaggregation.origin_circle_templates(radii_list)
 
-    # Positional loop over pre-extracted coordinates (skips iterrows' per-row
-    # Series construction).
-    _xs = points_metric_crs.geometry.x.to_numpy()
-    _ys = points_metric_crs.geometry.y.to_numpy()
-    for idx, _px, _py in zip(points_metric_crs.index, _xs, _ys):
-        pos = idx_to_pos[idx]
-        row, col = rowcol(transform, _px, _py)
+    from rasterio.transform import rowcol as _rowcol
+    from rasterio.windows import Window as _Window
+    from rasterio.windows import transform as _window_transform
 
-        rmin = max(row - max_r_px, 0)
-        rmax = min(row + max_r_px + 1, metric_array.shape[0])
-        cmin = max(col - max_r_px, 0)
-        cmax = min(col + max_r_px + 1, metric_array.shape[1])
+    h, w = int(metric_array.shape[0]), int(metric_array.shape[1])
+    for pos, geom in enumerate(pts_buf_crs.geometry.to_numpy()):
+        if geom is None or geom.is_empty:
+            continue
+        discs = [preaggregation.buffer_at(geom, r, templates) for r in radii_list]
+        discs = preaggregation.reproject_geoms(discs, xy_fn)
+        largest = discs[-1]
+        if largest is None or largest.is_empty:
+            continue
+        minx, miny, maxx, maxy = largest.bounds
+        r1, c1 = _rowcol(transform, minx, maxy)
+        r2, c2 = _rowcol(transform, maxx, miny)
+        rmin = max(0, min(int(r1), int(r2)))
+        rmax = min(h, max(int(r1), int(r2)) + 1)
+        cmin = max(0, min(int(c1), int(c2)))
+        cmax = min(w, max(int(c1), int(c2)) + 1)
         if rmin >= rmax or cmin >= cmax:
             continue
 
         window = metric_array[rmin:rmax, cmin:cmax]
-        rr = np.arange(rmin, rmax, dtype=np.float64)[:, None]
-        cc = np.arange(cmin, cmax, dtype=np.float64)[None, :]
-        dr = rr - float(row)
-        dc = cc - float(col)
-        d2 = dr * dr + dc * dc
-
-        if hasattr(window, "mask"):
-            base_valid = ~np.ma.getmaskarray(window)
-            data = np.ma.getdata(window)
-        else:
-            base_valid = np.ones(window.shape, dtype=bool)
-            data = window
-
-        flat_valid = np.asarray(base_valid).ravel()
-        _bin_into_rings(
-            ring_values[pos],
-            d2.ravel()[flat_valid],
-            np.asarray(data, dtype=np.float64).ravel()[flat_valid],
-            radii2_px,
-            n_rings,
+        data = np.asarray(np.ma.getdata(window), dtype=np.float64)
+        base_valid = ~np.ma.getmaskarray(window) & ~np.isnan(data)
+        if not base_valid.any():
+            continue
+        win_transform = _window_transform(
+            _Window(cmin, rmin, cmax - cmin, rmax - rmin), transform
         )
+        ring = preaggregation.ring_index_grid(discs, window.shape, win_transform)
+        if ring is None:
+            continue
+        idx = ring[base_valid]
+        vals = data[base_valid]
+        order = np.argsort(idx, kind="stable")
+        idx_sorted = idx[order]
+        vals_sorted = vals[order]
+        bounds = np.searchsorted(idx_sorted, np.arange(n_rings + 1), side="left")
+        row_out = ring_values[pos]
+        for k in range(n_rings):
+            lo, hi = int(bounds[k]), int(bounds[k + 1])
+            if hi > lo:
+                row_out[k] = vals_sorted[lo:hi]
 
     return ring_values
 

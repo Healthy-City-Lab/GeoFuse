@@ -19,15 +19,17 @@ surrogate scorers built on it. Results match the stock ``dcor`` estimator to
 
 from __future__ import annotations
 
+import hashlib
 from collections import OrderedDict
 from typing import Callable
 
 import numpy as np
 
 # Entity counts above this skip the cached paths and fall back to the stock
-# ``dcor`` estimator: one cached float32 side matrix is n²·4 bytes (400 MB at
-# n = 10,000), and the side cache can hold a few of them at once.
-MAX_CACHE_N: int = 10_000
+# ``dcor`` estimator. One cached side entry holds two float32 n² matrices
+# (137 MB each at n = 6,000) and the cache keeps several entries, so this cap
+# bounds the estimator's resident footprint near 1 GB.
+MAX_CACHE_N: int = 6_000
 
 # Live side entries kept per cache dict — one per actively scored subset
 # (in-bag + OOB during the bootstrap; test / all during reporting).
@@ -53,8 +55,10 @@ def u_center(D: np.ndarray) -> np.ndarray:
         Ã_ij = D_ij − r_i/(n−2) − r_j/(n−2) + g/((n−1)(n−2)),   Ã_ii = 0
     """
     n = D.shape[0]
-    r = D.sum(axis=0, dtype=np.float64) / (n - 2)
-    g = float(D.sum(dtype=np.float64)) / ((n - 1) * (n - 2))
+    col_sums = D.sum(axis=0, dtype=np.float64)
+    r = col_sums / (n - 2)
+    # The grand sum is the column sums' total, so it needs no second full pass.
+    g = float(col_sums.sum()) / ((n - 1) * (n - 2))
     r = r.astype(D.dtype, copy=False)
     D -= r[None, :]
     D -= r[:, None]
@@ -99,17 +103,22 @@ def _pdcor_from_products(
     return float((r_xy - r_xz * r_yz) / denom)
 
 
-def _side_fingerprint(y: np.ndarray, z: np.ndarray | None) -> tuple:
-    """Cheap content key for one (fixed-vector, conditioning-matrix) pair."""
-    ya = np.asarray(y, dtype=np.float64).ravel()
-    parts: list = [int(ya.shape[0]), float(np.nansum(ya)), float(np.nansum(ya * ya))]
-    if z is None:
-        parts += [0, 0.0, 0.0]
-    else:
-        za = np.asarray(z, dtype=np.float64)
-        n_cols = int(za.shape[1]) if za.ndim == 2 else 1
-        parts += [n_cols, float(np.nansum(za)), float(np.nansum(za * za))]
-    return tuple(parts)
+def _side_fingerprint(y: np.ndarray, z: np.ndarray | None) -> bytes:
+    """Content key for one (fixed-vector, conditioning-matrix) pair.
+
+    Digests the raw bytes rather than moment sums so a permutation of the same
+    values — a different resample of one subset — cannot collide onto a cached
+    side matrix.
+    """
+    h = hashlib.blake2b(digest_size=16)
+    for arr in (y, z):
+        if arr is None:
+            h.update(b"\x00")
+            continue
+        a = np.ascontiguousarray(np.asarray(arr, dtype=np.float64))
+        h.update(repr(a.shape).encode())
+        h.update(a.tobytes())
+    return h.digest()
 
 
 class PdcorSideCache:

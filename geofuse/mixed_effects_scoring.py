@@ -48,6 +48,7 @@ from __future__ import annotations
 import warnings
 
 import numpy as np
+import pandas as pd
 
 MIXEDLM_METRICS: frozenset[str] = frozenset(
     {"mixedlm_tstat", "mixedlm_marginal_r2", "mixedlm_lr", "mixedlm_coef"}
@@ -95,17 +96,8 @@ def _coerce_2d(x: np.ndarray | None) -> np.ndarray | None:
 
 
 def _entity_missing_mask(arr: np.ndarray) -> np.ndarray:
-    """True where the entity-id entry is None / NaN. Object-array safe."""
-    out = np.zeros(len(arr), dtype=bool)
-    for i, v in enumerate(arr):
-        if v is None:
-            out[i] = True
-            continue
-        try:
-            out[i] = bool(np.isnan(v))
-        except (TypeError, ValueError):
-            out[i] = False
-    return out
+    """True where the entity-id entry is None / NaN / NaT. Object-array safe."""
+    return np.asarray(pd.isna(np.asarray(arr)), dtype=bool)
 
 
 def _drop_nan(

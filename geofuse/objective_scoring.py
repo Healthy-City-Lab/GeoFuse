@@ -54,6 +54,7 @@ baseline.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import warnings
 
@@ -177,14 +178,15 @@ def _expand_covariate_basis(
     """
     if X is None or method != "spline" or X.shape[1] == 0:
         return X
-    cache_key: tuple | None = None
+    cache_key: bytes | None = None
     if cache is not None:
-        cache_key = (
-            int(X.shape[0]),
-            int(X.shape[1]),
-            float(np.nansum(X)),
-            float(np.nansum(X * X)),
-        )
+        # Byte digest, not moment sums: a resampled covariate matrix holding the
+        # same values in a different order must not hit another subset's basis.
+        _x = np.ascontiguousarray(np.asarray(X, dtype=np.float64))
+        _h = hashlib.blake2b(digest_size=16)
+        _h.update(repr(_x.shape).encode())
+        _h.update(_x.tobytes())
+        cache_key = _h.digest()
         hit = cache.get(cache_key)
         if hit is not None:
             return hit

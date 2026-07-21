@@ -55,11 +55,13 @@ import numpy as np
 
 from .persistence.sqlite_utils import open_wal_connection
 
-# Bumped from 1 in the wave-axis extension: every per-channel table now has a
-# ``wave`` PK column and per-entity completion is tracked per (channel, wave).
-# Caches built under the previous schema fail the fingerprint check and are
-# reset on the next run.
-SCHEMA_VERSION = 2
+# Version 2 added the ``wave`` PK column and per-(channel, wave) completion
+# tracking. Version 3 moved raster aggregation onto buffered discs reprojected
+# into the raster CRS for every entity type; stored raster stats from earlier
+# versions came from pixel-grid distance math and are not comparable, so they
+# are reset rather than reused. Caches built under an older schema fail the
+# fingerprint check and are rebuilt on the next run.
+SCHEMA_VERSION = 3
 
 # Cross-sectional callers use this single implicit wave; longitudinal callers
 # pass an explicit ordered tuple of wave labels to the constructor.
@@ -73,10 +75,12 @@ STAT_COLUMNS: tuple[str, ...] = ("mean",) + tuple(f"p{p}" for p in PERCENTILES)
 CHANNELS: tuple[str, ...] = ("veg", "terrain", "ndvi")
 
 _N_STATS = len(STAT_COLUMNS)
-# Bound on the in-memory column cache (each entry is one float column for all
-# entities at one (channel, radius, stat)). Keeps repeated trial lookups cheap
-# without unbounded growth.
+# Bounds on the in-memory column cache (each entry is one id + value column for
+# all entities at one (channel, wave, radius, stat)). The entry count keeps
+# repeated trial lookups cheap; the byte ceiling is what actually binds on a
+# large per-pixel grid, where a single column runs to megabytes.
 _COLUMN_CACHE_MAX = 1024
+_COLUMN_CACHE_MAX_BYTES = 256 * 1024 * 1024
 
 
 def compute_all_stats(values: np.ndarray) -> np.ndarray:
@@ -109,6 +113,182 @@ def stat_to_column(stat: str, percentile: int | None) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Buffered-disc construction and raster reduction
+# ---------------------------------------------------------------------------
+#
+# Every raster aggregation in this module follows one rule: buffer the entity in
+# the projected (metres) grid CRS, reproject the *buffer* into the raster's
+# native CRS, and reduce the pixels it touches. The raster is never reprojected
+# and no degree-to-metre conversion factor is involved, so the sampled footprint
+# is a true metric disc for any raster CRS and any entity geometry type.
+
+# Circle approximation for every buffered disc built here. One shared value so
+# all paths reduce over the identical reference geometry.
+BUFFER_QUAD_SEGS: int = 32
+
+
+def origin_circle_templates(radii_eff: Any) -> dict:
+    """Origin-centred buffer polygons, one per distinct effective radius.
+
+    Point entities translate these instead of re-buffering: shapely lays a
+    buffer's vertices out as centre + r·(cos θ, sin θ) over a fixed θ sequence,
+    so a translated template is vertex-identical to buffering the point itself.
+    """
+    from shapely.geometry import Point as _Point
+
+    return {
+        float(r): _Point(0.0, 0.0).buffer(float(r), quad_segs=BUFFER_QUAD_SEGS)
+        for r in {float(x) for x in radii_eff}
+        if float(r) > 0.0
+    }
+
+
+def buffer_at(entity: Any, radius_eff: float, templates: dict | None = None) -> Any:
+    """Buffer one entity at one effective radius, in the entity's own CRS."""
+    r = float(radius_eff)
+    if r <= 0.0:
+        return entity
+    if templates is not None and entity.geom_type == "Point":
+        from shapely.affinity import translate as _translate
+
+        tpl = templates.get(r)
+        if tpl is not None:
+            return _translate(tpl, entity.x, entity.y)
+    return entity.buffer(r, quad_segs=BUFFER_QUAD_SEGS)
+
+
+def reproject_geoms(geoms: list, xy_fn: Any) -> list:
+    """Reproject a list of geometries with a single transformer call.
+
+    ``shapely.transform`` over an array hands the transformation every
+    coordinate at once, so one pyproj call covers the whole list regardless of
+    geometry structure (holes and multi-parts included).
+    """
+    if xy_fn is None:
+        return list(geoms)
+    import shapely as _shapely
+
+    arr = np.empty(len(geoms), dtype=object)
+    arr[:] = geoms
+
+    def _tf(coords: np.ndarray) -> np.ndarray:
+        x, y = xy_fn(coords[:, 0], coords[:, 1])
+        return np.column_stack(
+            [np.asarray(x, dtype=np.float64), np.asarray(y, dtype=np.float64)]
+        )
+
+    return list(_shapely.transform(arr, _tf))
+
+
+def ring_index_grid(discs: list, out_shape: tuple, win_transform: Any) -> np.ndarray | None:
+    """Per-pixel index of the smallest disc touching it (``len(discs)`` = none).
+
+    ``discs`` must be ordered by ascending radius, which makes them strictly
+    nested: a pixel touched by a smaller disc is necessarily touched by every
+    larger one. Burning them largest-first in a single ``rasterize`` pass
+    therefore leaves each pixel holding its smallest touching disc, and every
+    per-radius mask is recovered as ``grid <= i`` — identical to masking each
+    disc separately, with one rasterization instead of one per radius.
+    """
+    from rasterio.features import rasterize
+
+    n = len(discs)
+    shapes = [
+        (g, i)
+        for i, g in reversed(list(enumerate(discs)))
+        if g is not None and not g.is_empty
+    ]
+    if not shapes:
+        return None
+    try:
+        return rasterize(
+            shapes,
+            out_shape=out_shape,
+            transform=win_transform,
+            fill=n,
+            all_touched=True,
+            dtype=np.int32,
+        )
+    except Exception:
+        return None
+
+
+def stats_from_ring_grid(
+    values: np.ndarray, ring_index: np.ndarray, n_radii: int
+) -> np.ndarray:
+    """Per-radius stats from ring indices, via one sort plus prefix slices.
+
+    ``values`` and ``ring_index`` are the window's valid pixels, flattened and
+    aligned. Disc *i* is every pixel whose ring index is ``<= i``, so sorting
+    once by ring index makes each disc a prefix of the sorted values.
+    """
+    out = np.full((n_radii, _N_STATS), np.nan, dtype=np.float32)
+    if values.size == 0:
+        return out
+    order = np.argsort(ring_index, kind="stable")
+    rings_sorted = ring_index[order]
+    vals_sorted = values[order]
+    ends = np.searchsorted(rings_sorted, np.arange(n_radii), side="right")
+    for i in range(n_radii):
+        end = int(ends[i])
+        if end > 0:
+            out[i, :] = compute_all_stats(vals_sorted[:end])
+    return out
+
+
+def raster_disc_stats(
+    discs_grid_crs: list,
+    metric_array: Any,
+    raster_transform: Any,
+    *,
+    xy_fn: Any = None,
+) -> np.ndarray:
+    """Per-radius stats for one entity's nested discs against a raster metric.
+
+    ``discs_grid_crs`` are ascending-radius buffers in the projected grid CRS;
+    they are reprojected into the raster's CRS in one call, the largest one
+    sizes a single windowed read, and every radius is reduced from one ring
+    grid over that window.
+    """
+    from rasterio.transform import rowcol
+    from rasterio.windows import Window
+    from rasterio.windows import transform as window_transform
+
+    n_radii = len(discs_grid_crs)
+    out = np.full((n_radii, _N_STATS), np.nan, dtype=np.float32)
+    if n_radii == 0:
+        return out
+    discs = reproject_geoms(discs_grid_crs, xy_fn)
+    largest = discs[-1]
+    if largest is None or largest.is_empty:
+        return out
+
+    h, w = metric_array.shape
+    minx, miny, maxx, maxy = largest.bounds
+    r1, c1 = rowcol(raster_transform, minx, maxy)
+    r2, c2 = rowcol(raster_transform, maxx, miny)
+    rmin = max(0, min(int(r1), int(r2)))
+    rmax = min(h, max(int(r1), int(r2)) + 1)
+    cmin = max(0, min(int(c1), int(c2)))
+    cmax = min(w, max(int(c1), int(c2)) + 1)
+    if rmin >= rmax or cmin >= cmax:
+        return out
+
+    window = metric_array[rmin:rmax, cmin:cmax]
+    data = np.asarray(np.ma.getdata(window), dtype=np.float64)
+    base_valid = ~np.ma.getmaskarray(window) & ~np.isnan(data)
+    if not base_valid.any():
+        return out
+    win_transform = window_transform(
+        Window(cmin, rmin, cmax - cmin, rmax - rmin), raster_transform
+    )
+    ring = ring_index_grid(discs, window.shape, win_transform)
+    if ring is None:
+        return out
+    return stats_from_ring_grid(data[base_valid], ring[base_valid], n_radii)
+
+
+# ---------------------------------------------------------------------------
 # Format-aware per-batch aggregation
 # ---------------------------------------------------------------------------
 
@@ -134,11 +314,19 @@ def build_vector_index(metric_gdf, metric_crs, value_col: str):
 def vector_batch_stats(
     tree: Any, values: np.ndarray, batch_xy: np.ndarray, radii_m: tuple[int, ...]
 ) -> np.ndarray:
-    """Per-point disk stats from a vector metric: ``[n_points, n_radii, n_stats]``."""
+    """Per-point disk stats from a vector metric: ``[n_points, n_radii, n_stats]``.
+
+    The radii are ascending, so each point's neighbourhood is sorted by
+    distance once and every radius reduces a prefix of it — the same membership
+    a per-radius distance mask selects, without re-scanning the full
+    max-radius neighbourhood once per radius.
+    """
     n = len(batch_xy)
-    out = np.full((n, len(radii_m), _N_STATS), np.nan, dtype=np.float32)
+    n_radii = len(radii_m)
+    out = np.full((n, n_radii, _N_STATS), np.nan, dtype=np.float32)
     if n == 0:
         return out
+    radii_arr = np.asarray(radii_m, dtype=np.float64)
     idx_arr, dist_arr = tree.query_radius(
         batch_xy, r=float(radii_m[-1]), return_distance=True
     )
@@ -146,12 +334,15 @@ def vector_batch_stats(
         neigh = idx_arr[b]
         if len(neigh) == 0:
             continue
-        v_all = values[neigh]
         d_all = dist_arr[b]
-        for ri, r in enumerate(radii_m):
-            mask = d_all <= r
-            if mask.any():
-                out[b, ri, :] = compute_all_stats(v_all[mask])
+        order = np.argsort(d_all, kind="stable")
+        d_sorted = d_all[order]
+        v_sorted = values[neigh][order]
+        ends = np.searchsorted(d_sorted, radii_arr, side="right")
+        for ri in range(n_radii):
+            end = int(ends[ri])
+            if end > 0:
+                out[b, ri, :] = compute_all_stats(v_sorted[:end])
     return out
 
 
@@ -341,12 +532,6 @@ def batch_geometry_stats(
     if n == 0:
         return output
 
-    from rasterio.features import geometry_mask
-    from rasterio.transform import rowcol
-    from rasterio.windows import Window
-    from rasterio.windows import transform as window_transform
-    from shapely.ops import transform as shapely_transform
-
     # Pre-resolve per-channel data references once (avoids repeated dict
     # lookups in the hot inner loop). For both vector and raster channels,
     # ``xy_fn`` is the (x, y) reprojection from grid CRS to the metric's
@@ -397,6 +582,12 @@ def batch_geometry_stats(
                 }
             )
 
+    # Origin-centred circle templates covering every effective radius any
+    # channel asks for, so Point entities translate instead of re-buffering.
+    templates = origin_circle_templates(
+        [float(r) + m["cell"] for m in resolved for r in m["radii"]]
+    )
+
     for entity_idx, entity in enumerate(entity_geoms_in_grid_crs):
         # Cancellation check fires once per entity (not per channel /
         # radius — the cost would dominate otherwise). For typical
@@ -408,93 +599,57 @@ def batch_geometry_stats(
             continue
         # Per-entity buffer cache keyed by effective buffer distance in
         # the grid CRS. Two channels sharing the same effective radius
-        # reuse one shapely buffer call.
+        # reuse one buffered geometry.
         buffer_cache: dict = {}
+
+        def _disc(r_eff: float, _entity=entity, _cache=buffer_cache):
+            g = _cache.get(r_eff)
+            if g is None:
+                g = buffer_at(_entity, r_eff, templates)
+                _cache[r_eff] = g
+            return g
 
         for meta in resolved:
             ch = meta["name"]
             radii = meta["radii"]
             cell = meta["cell"]
             kind = meta["kind"]
+            eff_radii = [float(r) + cell for r in radii]
+            discs = [_disc(r_eff) for r_eff in eff_radii]
 
-            for r_idx, r in enumerate(radii):
-                r_eff = float(r) + cell
+            if kind == "raster":
+                output[ch][entity_idx, :, :] = raster_disc_stats(
+                    discs,
+                    meta["array"],
+                    meta["raster_transform"],
+                    xy_fn=meta["xy_fn"],
+                )
+                continue
 
-                buf_grid = buffer_cache.get(r_eff)
-                if buf_grid is None:
-                    buf_grid = entity if r_eff == 0.0 else entity.buffer(r_eff)
-                    buffer_cache[r_eff] = buf_grid
-
-                if kind == "vector":
-                    sindex = meta["sindex"]
-                    values = meta["values"]
-                    xy_fn = meta["xy_fn"]
-                    buf_for_query = (
-                        shapely_transform(xy_fn, buf_grid) if xy_fn else buf_grid
+            sindex = meta["sindex"]
+            values = meta["values"]
+            discs_metric = reproject_geoms(discs, meta["xy_fn"])
+            for r_idx, buf_for_query in enumerate(discs_metric):
+                try:
+                    hits = np.asarray(
+                        sindex.query(buf_for_query, predicate="intersects"),
+                        dtype=np.int64,
                     )
-                    try:
-                        hits = np.asarray(
-                            sindex.query(buf_for_query, predicate="intersects"),
-                            dtype=np.int64,
-                        )
-                    except TypeError:
-                        hits = np.asarray(
-                            list(sindex.intersection(buf_for_query.bounds)),
-                            dtype=np.int64,
-                        )
-                        if len(hits):
-                            geoms = meta["gdf"].geometry.iloc[hits]
-                            keep = geoms.intersects(buf_for_query).to_numpy()
-                            hits = hits[keep]
-                    if len(hits) == 0:
-                        continue
-                    vals = values[hits]
-                    valid = ~np.isnan(vals)
-                    if valid.any():
-                        output[ch][entity_idx, r_idx, :] = compute_all_stats(
-                            vals[valid]
-                        )
-                else:  # raster
-                    xy_fn = meta["xy_fn"]
-                    buf_in_raster = (
-                        shapely_transform(xy_fn, buf_grid) if xy_fn else buf_grid
+                except TypeError:
+                    hits = np.asarray(
+                        list(sindex.intersection(buf_for_query.bounds)),
+                        dtype=np.int64,
                     )
-                    array = meta["array"]
-                    raster_transform = meta["raster_transform"]
-                    h, w = meta["shape"]
-                    minx, miny, maxx, maxy = buf_in_raster.bounds
-                    r1, c1 = rowcol(raster_transform, minx, maxy)
-                    r2, c2 = rowcol(raster_transform, maxx, miny)
-                    rmin = max(0, min(int(r1), int(r2)))
-                    rmax = min(h, max(int(r1), int(r2)) + 1)
-                    cmin = max(0, min(int(c1), int(c2)))
-                    cmax = min(w, max(int(c1), int(c2)) + 1)
-                    if rmin >= rmax or cmin >= cmax:
-                        continue
-                    window = array[rmin:rmax, cmin:cmax]
-                    win_transform = window_transform(
-                        Window(cmin, rmin, cmax - cmin, rmax - rmin),
-                        raster_transform,
-                    )
-                    data = np.asarray(np.ma.getdata(window), dtype=np.float64)
-                    base_valid = ~np.ma.getmaskarray(window) & ~np.isnan(data)
-                    if not base_valid.any():
-                        continue
-                    try:
-                        mask_inside = geometry_mask(
-                            [buf_in_raster],
-                            out_shape=window.shape,
-                            transform=win_transform,
-                            invert=True,
-                            all_touched=True,
-                        )
-                    except Exception:
-                        continue
-                    combined = base_valid & mask_inside
-                    if combined.any():
-                        output[ch][entity_idx, r_idx, :] = compute_all_stats(
-                            data[combined]
-                        )
+                    if len(hits):
+                        geoms = meta["gdf"].geometry.iloc[hits]
+                        keep = geoms.intersects(buf_for_query).to_numpy()
+                        hits = hits[keep]
+                if len(hits) == 0:
+                    continue
+                vals = values[hits]
+                valid = ~np.isnan(vals)
+                if valid.any():
+                    output[ch][entity_idx, r_idx, :] = compute_all_stats(vals[valid])
 
     return output
 
@@ -524,133 +679,31 @@ def raster_batch_geometry_stats(
     to the raster's CRS before the mask op, while the raster itself
     stays in its native CRS (no expensive raster reprojection).
     """
-    from rasterio.features import geometry_mask
-    from rasterio.transform import rowcol
-    from rasterio.windows import Window
-    from rasterio.windows import transform as window_transform
-    from shapely.ops import transform as shapely_transform
-
     n = len(entity_geoms_buffer_crs)
     out = np.full((n, len(radii_m), _N_STATS), np.nan, dtype=np.float32)
     if n == 0:
         return out
 
-    h, w = metric_array.shape
-    max_r = int(max(radii_m))
-
     if to_raster_crs is None:
-
-        def _to_raster(geom):
-            return geom
-
+        xy_fn = None
+    elif hasattr(to_raster_crs, "transform"):
+        xy_fn = to_raster_crs.transform
+    elif callable(to_raster_crs):
+        xy_fn = to_raster_crs
     else:
-        if hasattr(to_raster_crs, "transform"):
-            xy_fn = to_raster_crs.transform
-        elif callable(to_raster_crs):
-            xy_fn = to_raster_crs
-        else:
-            raise TypeError(
-                "to_raster_crs must be a pyproj.Transformer or callable; "
-                f"got {type(to_raster_crs).__name__}."
-            )
+        raise TypeError(
+            "to_raster_crs must be a pyproj.Transformer or callable; "
+            f"got {type(to_raster_crs).__name__}."
+        )
 
-        def _to_raster(geom):
-            # ``xy_fn`` is a pyproj-style ``(x, y) -> (x', y')`` (or
-            # 3-arg with ``z``); shapely.ops.transform handles both
-            # arities. Type checkers can't see this, so silence them.
-            return shapely_transform(xy_fn, geom)  # type: ignore[arg-type]
-
+    templates = origin_circle_templates(radii_m)
     for ei, ent_geom in enumerate(entity_geoms_buffer_crs):
         if ent_geom is None or ent_geom.is_empty:
             continue
-        big_buf = ent_geom if max_r == 0 else ent_geom.buffer(float(max_r))
-        big_buf_raster = _to_raster(big_buf)
-        minx, miny, maxx, maxy = big_buf_raster.bounds
-        r1, c1 = rowcol(raster_transform, minx, maxy)
-        r2, c2 = rowcol(raster_transform, maxx, miny)
-        rmin = max(0, min(int(r1), int(r2)))
-        rmax = min(h, max(int(r1), int(r2)) + 1)
-        cmin = max(0, min(int(c1), int(c2)))
-        cmax = min(w, max(int(c1), int(c2)) + 1)
-        if rmin >= rmax or cmin >= cmax:
-            continue
-
-        window = metric_array[rmin:rmax, cmin:cmax]
-        win_transform = window_transform(
-            Window(cmin, rmin, cmax - cmin, rmax - rmin), raster_transform
+        discs = [buffer_at(ent_geom, float(r), templates) for r in radii_m]
+        out[ei, :, :] = raster_disc_stats(
+            discs, metric_array, raster_transform, xy_fn=xy_fn
         )
-        data = np.asarray(np.ma.getdata(window), dtype=np.float64)
-        base_valid = ~np.ma.getmaskarray(window) & ~np.isnan(data)
-        if not base_valid.any():
-            continue
-
-        for ri, r in enumerate(radii_m):
-            buf_geom = ent_geom if r == 0 else ent_geom.buffer(float(r))
-            buf_geom_raster = _to_raster(buf_geom)
-            try:
-                mask_inside = geometry_mask(
-                    [buf_geom_raster],
-                    out_shape=window.shape,
-                    transform=win_transform,
-                    invert=True,
-                    all_touched=True,
-                )
-            except Exception:
-                continue
-            combined = base_valid & mask_inside
-            if combined.any():
-                out[ei, ri, :] = compute_all_stats(data[combined])
-    return out
-
-
-def raster_pixel_size_m(transform, is_geographic: bool) -> float:
-    """Approximate pixel size in metres (geographic CRS uses a coarse factor)."""
-    px = abs(transform.a)
-    return px * 111320.0 if is_geographic else px
-
-
-def raster_batch_stats(
-    metric_array: np.ndarray,
-    transform: Any,
-    pixel_size_m: float,
-    batch_xy_raster_crs: np.ndarray,
-    radii_m: tuple[int, ...],
-) -> np.ndarray:
-    """Per-point disk stats from a raster metric via windowed reads."""
-    from rasterio.transform import rowcol
-
-    n = len(batch_xy_raster_crs)
-    out = np.full((n, len(radii_m), _N_STATS), np.nan, dtype=np.float32)
-    if n == 0:
-        return out
-
-    h, w = metric_array.shape
-    max_r_px = max(1, min(int(float(radii_m[-1]) / pixel_size_m), 10000))
-
-    for i in range(n):
-        x, y = batch_xy_raster_crs[i]
-        row, col = rowcol(transform, x, y)
-        rmin = max(row - max_r_px, 0)
-        rmax = min(row + max_r_px + 1, h)
-        cmin = max(col - max_r_px, 0)
-        cmax = min(col + max_r_px + 1, w)
-        if rmin >= rmax or cmin >= cmax:
-            continue
-
-        # ``metric_array`` may be an in-memory masked array or a LazyRasterArray
-        # (windowed disk read); both return a masked window here.
-        window = metric_array[rmin:rmax, cmin:cmax]
-        rr = np.arange(rmin, rmax, dtype=np.float64)[:, None]
-        cc = np.arange(cmin, cmax, dtype=np.float64)[None, :]
-        dist_m = np.sqrt((rr - row) ** 2 + (cc - col) ** 2) * pixel_size_m
-
-        data = np.asarray(np.ma.getdata(window), dtype=np.float64)
-        base_valid = ~np.ma.getmaskarray(window) & ~np.isnan(data)
-
-        for ri, r in enumerate(radii_m):
-            mask = base_valid & (dist_m <= r)
-            if mask.any():
-                out[i, ri, :] = compute_all_stats(data[mask])
     return out
 
 
@@ -686,6 +739,7 @@ class PreAggregationCache:
         self._conn = open_wal_connection(db_path)
         self._lock = threading.Lock()
         self._col_cache: OrderedDict[tuple, Any] = OrderedDict()
+        self._col_cache_bytes: int = 0
         # Memoized searchsorted positions per (requested-ids, channel, wave):
         # the fusion optimizer re-reads the same fold row set for every trial
         # and every (radius, stat) column of a channel wave shares one sorted
@@ -791,6 +845,7 @@ class PreAggregationCache:
             self._conn.execute("DELETE FROM done_channel_wave_entity")
             self._conn.execute("DELETE FROM meta")
             self._col_cache.clear()
+            self._col_cache_bytes = 0
             self._indexer_cache.clear()
             # Restore identity alias map; aliases get re-registered by the
             # runner during the new build.
@@ -850,6 +905,7 @@ class PreAggregationCache:
                 json.dumps({k: v for k, v in merged.items() if v}),
             )
             self._col_cache.clear()
+            self._col_cache_bytes = 0
 
     # -- resume ----------------------------------------------------------------
     def pending_entities_for(
@@ -972,7 +1028,11 @@ class PreAggregationCache:
             # (channel, wave) — a write changes the stored entity-id set.
             for key in list(self._col_cache.keys()):
                 if key[0] == channel and key[1] == rep:
-                    self._col_cache.pop(key, None)
+                    dropped = self._col_cache.pop(key, None)
+                    if dropped is not None:
+                        self._col_cache_bytes -= int(dropped[0].nbytes) + int(
+                            dropped[1].nbytes
+                        )
             for key in list(self._indexer_cache.keys()):
                 if key[0] == channel and key[1] == rep:
                     self._indexer_cache.pop(key, None)
@@ -1037,8 +1097,15 @@ class PreAggregationCache:
                 order = np.argsort(ids, kind="stable")
                 entry = (ids[order], vals[order])
                 self._col_cache[key] = entry
-                if len(self._col_cache) > _COLUMN_CACHE_MAX:
-                    self._col_cache.popitem(last=False)
+                self._col_cache_bytes += int(ids.nbytes) + int(vals.nbytes)
+                while self._col_cache and (
+                    len(self._col_cache) > _COLUMN_CACHE_MAX
+                    or self._col_cache_bytes > _COLUMN_CACHE_MAX_BYTES
+                ):
+                    _, evicted = self._col_cache.popitem(last=False)
+                    self._col_cache_bytes -= int(evicted[0].nbytes) + int(
+                        evicted[1].nbytes
+                    )
             else:
                 self._col_cache.move_to_end(key)
             sorted_ids, sorted_vals = entry
@@ -1049,30 +1116,27 @@ class PreAggregationCache:
             return out
 
         # Row indexer: positions of ``req`` inside the channel wave's sorted
-        # entity ids. Keyed on a content fingerprint of both id vectors so a
-        # repeated fold read (every trial) skips the searchsorted pass.
-        ikey = (
-            channel,
-            rep,
-            int(req.shape[0]),
-            int(req[0]) if req.size else -1,
-            int(req[-1]) if req.size else -1,
-            int(req.sum()) if req.size else 0,
-            int(sorted_ids.shape[0]),
-            int(sorted_ids[0]),
-            int(sorted_ids[-1]),
-        )
+        # entity ids. Callers re-read one fold's id vector for every trial and
+        # every (radius, stat) cell, so the entry is keyed on that array's
+        # identity and holds a reference to it — pinning the object means the
+        # id cannot be reused by a different array while the entry lives, and
+        # the stored array is re-checked on every hit.
+        ikey = (channel, rep, id(req))
+        indexer = None
         with self._lock:
-            indexer = self._indexer_cache.get(ikey)
-            if indexer is not None:
-                self._indexer_cache.move_to_end(ikey)
+            entry_idx = self._indexer_cache.get(ikey)
+            if entry_idx is not None:
+                held_req, held_ids, pos_clip, valid = entry_idx
+                if held_req is req and held_ids is sorted_ids:
+                    self._indexer_cache.move_to_end(ikey)
+                    indexer = (pos_clip, valid)
         if indexer is None:
             pos = np.searchsorted(sorted_ids, req)
             pos_clip = np.clip(pos, 0, sorted_ids.size - 1)
             valid = sorted_ids[pos_clip] == req
             indexer = (pos_clip, valid)
             with self._lock:
-                self._indexer_cache[ikey] = indexer
+                self._indexer_cache[ikey] = (req, sorted_ids, pos_clip, valid)
                 while len(self._indexer_cache) > 64:
                     self._indexer_cache.popitem(last=False)
         pos_clip, valid = indexer

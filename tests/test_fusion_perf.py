@@ -299,12 +299,14 @@ class TestSpatialDfFastPath(unittest.TestCase):
 
 
 class TestRingBinning(unittest.TestCase):
-    def test_raster_ring_values_match_per_ring_masks(self):
+    def test_raster_ring_values_match_buffered_disc_masks(self):
+        """Annuli partition the same buffered discs the cache reduces over."""
         import geopandas as gpd
+        from rasterio.features import geometry_mask
         from rasterio.transform import from_origin
         from shapely.geometry import Point
 
-        from geofuse import metric_sampling
+        from geofuse import metric_sampling, preaggregation
 
         rng = np.random.default_rng(61)
         h = w = 60
@@ -321,19 +323,22 @@ class TestRingBinning(unittest.TestCase):
         radii = np.array([5, 10, 15], dtype=np.int64)
         rows = metric_sampling.precompute_raster_ring_values(metric, pts, radii)
 
-        # Reference: legacy per-ring boolean masks over the same window.
-        from rasterio.transform import rowcol
-
         for pos, pt in enumerate(pts.geometry):
-            row, col = rowcol(transform, pt.x, pt.y)
-            rr = np.arange(h, dtype=np.float64)[:, None]
-            cc = np.arange(w, dtype=np.float64)[None, :]
-            dist = np.sqrt((rr - row) ** 2 + (cc - col) ** 2)
             for k, outer in enumerate(radii):
-                inner = 0 if k == 0 else radii[k - 1]
-                mask = (dist <= outer) if k == 0 else ((dist <= outer) & (dist > inner))
+                # Reference disc: the entity buffered at this radius, masked
+                # with the raster semantic used throughout (all_touched).
+                disc = preaggregation.buffer_at(pt, float(outer))
+                mask = geometry_mask(
+                    [disc],
+                    out_shape=(h, w),
+                    transform=transform,
+                    invert=True,
+                    all_touched=True,
+                )
                 expected = np.sort(data[mask])
-                np.testing.assert_allclose(np.sort(rows[pos][k]), expected)
+                # Rings 0..k concatenated must reproduce disc k exactly.
+                got = np.sort(np.concatenate(rows[pos][: k + 1]))
+                np.testing.assert_allclose(got, expected)
 
     def test_vector_point_ring_values_match_distance_reference(self):
         import geopandas as gpd

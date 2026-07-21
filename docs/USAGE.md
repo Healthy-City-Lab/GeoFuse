@@ -56,7 +56,7 @@ The form reads top-to-bottom in the order you reason about a run:
 2. **Optimization Setup** — pick the **Run mode**:
    - **Cross-sectional** — optionally enable **Date column available?** to route each entity to a year-matched greenery file (the year is only a file key, never a regression input).
    - **Mixed-effects (longitudinal)** — for repeated measures; a date column is required.
-3. **Metric File Assignment** — per channel (NDVI, then GVI), set the buffer ladder (min / max / step in metres) and upload one or more files. When years/waves are in play, tag each file with the year(s)/wave(s) it covers; coverage is validated on submit.
+3. **Metric File Assignment** — per channel (NDVI, then GVI), set the buffer ladder (min / max / step in metres) and upload one or more files. When years/waves are in play, drag each year/wave chip onto the file that covers it (chips start in an **Unassigned** pool; a chip can sit on only one file). Anything left unassigned blocks submission.
 4. **Study Details** — CGI formula (`weighted_average` or `synergy`), covariates to control for, the **objective metric**, an optional **spatial-confounding adjustment** (KS-AIC / Spatial+), the **test-set size**, the **stability-selection** knobs, the **per-pixel CGI grid pixel size**, the **[0, 1] composite scaling** toggle, and the **standalone single-metric** option.
 5. **🚀 Run Fusion Optimization.**
 

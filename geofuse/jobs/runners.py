@@ -56,7 +56,6 @@ from geofuse.mixedlm_postscore import (
 from geofuse.ndvi import NDVIEngine
 from geofuse import pdcor as _pdcor_mod
 from geofuse.persistence.job_executor import JobContext
-from geofuse.raster_sampling import sample_raster_at_features
 from geofuse.vision import get_best_device
 
 _log_gvi = get_logger("GVI")
@@ -996,18 +995,17 @@ def _load_longitudinal_metric_file(path: str, channel: str) -> Any:
                 arr = src.read(band)
                 transform = src.transform
                 crs = src.crs
-                h, w = arr.shape
-                rows_i, cols_i = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")
-                xs, ys = xy(
-                    transform, rows_i.flatten(), cols_i.flatten(), offset="center"
-                )
-                vals = arr.flatten()
-                mask = ~np.isnan(vals)
+                w = int(arr.shape[1])
+                # Coordinates only for the pixels that survive the NaN filter —
+                # materializing one geometry per grid cell first does not scale.
+                vals = arr.ravel()
+                keep = np.flatnonzero(~np.isnan(vals))
+                rows_i = (keep // w).astype(np.int64)
+                cols_i = (keep % w).astype(np.int64)
+                xs, ys = xy(transform, rows_i, cols_i, offset="center")
                 gdf = gpd.GeoDataFrame(
-                    {channel: vals[mask]},
-                    geometry=gpd.points_from_xy(
-                        np.asarray(xs)[mask], np.asarray(ys)[mask]
-                    ),
+                    {channel: vals[keep]},
+                    geometry=gpd.points_from_xy(np.asarray(xs), np.asarray(ys)),
                     crs=crs,
                 )
                 gdf.attrs["metric_column"] = channel
@@ -2045,15 +2043,20 @@ def run_fusion(
                     value=prog_ledger(),
                     status_text=f"{prefix}Loading per-wave files...",
                 )
-                # Year-aware cross-sectional
-                if longitudinal_spec.derive_wave_from_date:
+                # Year-aware cross-sectional: the target has no entity column of
+                # its own, so each row becomes its own entity and its wave is
+                # the year it was measured. A genuine longitudinal target
+                # already carries the entity column and derives its own wave
+                # labels during intake, so it is left untouched here.
+                _needs_synthetic_entity = (
+                    longitudinal_spec.derive_wave_from_date
+                    and engine.target_gdf is not None
+                    and longitudinal_spec.entity_id_col not in engine.target_gdf.columns
+                )
+                if _needs_synthetic_entity:
                     from geofuse.longitudinal import parse_date_column as _parse_date
 
                     tgdf = engine.target_gdf
-                    if tgdf is None:
-                        raise RuntimeError(
-                            "derive_wave_from_date requires load_target() to have run."
-                        )
                     date_col = longitudinal_spec.date_col
                     if date_col not in tgdf.columns:
                         raise ValueError(
@@ -2074,9 +2077,13 @@ def run_fusion(
                         "cross-sectional run.",
                     )
                 if longitudinal_spec.intake_mode == "wide":
+                    # Iterate the file map, not the wave list: under year-keyed
+                    # waves a file is a container whose rows carry their own
+                    # wave, so its label is only a log/provenance string.
                     wide_frames: list[tuple[str, gpd.GeoDataFrame]] = []
-                    for wave_label in longitudinal_spec.wave_labels:
-                        wpath = longitudinal_spec.target_files_per_wave[wave_label]
+                    for wave_label, wpath in (
+                        longitudinal_spec.target_files_per_wave.items()
+                    ):
                         wide_frames.append((wave_label, gpd.read_file(wpath)))
                     engine.set_longitudinal_wave_frames(wide_frames)
                     _log_fusion(
@@ -2084,10 +2091,21 @@ def run_fusion(
                         f"[{label}] Loaded {len(wide_frames)} per-wave target "
                         "files (wide intake).",
                     )
+                # One read per distinct (path, channel): a file assigned to
+                # several waves is loaded once and shared. The engine treats
+                # metric sources as read-only, and the shared object also lets
+                # the cache's fingerprint grouping collapse those waves into a
+                # single compute pass.
+                loaded_metrics: dict[tuple[str, str], Any] = {}
                 for ch in GREENERY_CHANNELS:
                     per_wave: dict[str, Any] = {}
                     for wave_label, fp in longitudinal_spec.greenery_files[ch].items():
-                        per_wave[wave_label] = _load_longitudinal_metric_file(fp, ch)
+                        cache_key = (fp, ch)
+                        src_obj = loaded_metrics.get(cache_key)
+                        if src_obj is None:
+                            src_obj = _load_longitudinal_metric_file(fp, ch)
+                            loaded_metrics[cache_key] = src_obj
+                        per_wave[wave_label] = src_obj
                     engine.set_longitudinal_metric_data(ch, per_wave)
                     n_unique = len({id(v) for v in per_wave.values()})
                     _log_fusion(

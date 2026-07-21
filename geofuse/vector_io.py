@@ -64,12 +64,17 @@ def geometry_sha256(gdf: gpd.GeoDataFrame) -> str:
     h = hashlib.sha256()
     # str(crs) covers EPSG codes and full WKT; falls back to "None" when unset.
     h.update(f"crs:{gdf.crs}\n".encode())
-    # Sort by index so row order can't change the hash.
-    for _, geom in gdf.geometry.sort_index().items():
-        if geom is None or geom.is_empty:
+    # Sort by index so row order can't change the hash. WKB is produced for the
+    # whole column in one pass; the per-feature framing below is unchanged, so
+    # digests still match those written by earlier runs.
+    geoms = gdf.geometry.sort_index()
+    wkbs = geoms.to_wkb()
+    empties = (geoms.is_empty | geoms.isna()).to_numpy()
+    for wkb, is_empty in zip(wkbs, empties):
+        if is_empty or wkb is None:
             h.update(b"\x00")
             continue
-        h.update(geom.wkb)
+        h.update(wkb)
         h.update(b"\x1e")  # record separator
     return h.hexdigest()
 
