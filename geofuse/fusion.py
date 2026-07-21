@@ -9,7 +9,7 @@ import hashlib
 import logging
 import os
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -46,7 +46,14 @@ from .crs_utils import (
 )
 from .logger import attach_external_logger, get_logger
 from .raster_sampling import LAZY_RASTER_THRESHOLD_BYTES, LazyRasterArray
-from .vector_io import geometry_sha256, target_path_is_raster
+from . import metric_columns
+from .vector_io import (
+    geometry_sha256,
+    match_column_alias,
+    read_vector_aliased_column,
+    read_vector_subset,
+    target_path_is_raster,
+)
 
 logger = logging.getLogger(__name__)
 _log = get_logger("FUSION")
@@ -507,6 +514,22 @@ class MetricFusionEngine:
         "years_since_baseline",
     )
 
+    def _longitudinal_intake_columns(self) -> list[str] | None:
+        """Columns worth reading from the target file, or ``None`` to read all.
+
+        Longitudinal intake replaces ``target_gdf`` with the projected long
+        frame, so any column outside this set is read and then discarded.
+        Cross-sectional mode returns ``None``: its target frame is consumed
+        directly and carries columns this engine does not enumerate.
+        """
+        if not self.is_longitudinal:
+            return None
+        return longitudinal.target_intake_columns(
+            self.longitudinal_spec,
+            self.target_feature,
+            self.covariate_columns or (),
+        )
+
     def _longitudinal_extra_cols(self) -> tuple[str, ...]:
         """Extra DataFrame columns carried through every prep path in long mode."""
         return self._LONGITUDINAL_EXTRA_COLS if self.is_longitudinal else ()
@@ -581,17 +604,25 @@ class MetricFusionEngine:
         logger.info(f"Loading target file: {self.target_file}")
 
         if self.is_points:
-            read_kwargs: dict = {}
+            layer = None
             if self.target_layer is not None and Path(
                 self.target_file
             ).suffix.lower() in (
                 ".gpkg",
                 ".zip",
             ):
-                read_kwargs["layer"] = self.target_layer
-            self.target_gdf = reproject_geodataframe_to_wgs84(
-                gpd.read_file(self.target_file, **read_kwargs)
-            )
+                layer = self.target_layer
+            keep_cols = self._longitudinal_intake_columns()
+            if keep_cols is None:
+                raw = gpd.read_file(
+                    self.target_file, **({} if layer is None else {"layer": layer})
+                )
+            else:
+                # Longitudinal intake projects the frame down to these columns
+                # anyway; skipping the rest keeps a wide cohort file's unused
+                # survey columns out of memory instead of loading then dropping.
+                raw = read_vector_subset(self.target_file, keep_cols, layer=layer)
+            self.target_gdf = reproject_geodataframe_to_wgs84(raw)
 
             # Validate feature exists
             if (
@@ -900,9 +931,6 @@ class MetricFusionEngine:
                 logger.debug(f"Failed to load as multi-band GVI: {e}")
                 return False
 
-        _VEG_COLUMN_ALIASES = ("gvi_veg", "gvi", "veg", "vegetation")
-        _TER_COLUMN_ALIASES = ("gvi_ter", "gvi_terrain", "terrain")
-
         def load_combined_gvi_vector(filepath: str) -> bool:
             """Split a single GVI vector file carrying both veg + terrain columns.
 
@@ -918,13 +946,8 @@ class MetricFusionEngine:
             except Exception as exc:
                 logger.debug(f"Failed to read combined GVI vector: {exc}")
                 return False
-            lowered = {c.lower(): c for c in gdf.columns}
-            veg_col = next(
-                (lowered[a] for a in _VEG_COLUMN_ALIASES if a in lowered), None
-            )
-            ter_col = next(
-                (lowered[a] for a in _TER_COLUMN_ALIASES if a in lowered), None
-            )
+            veg_col = match_column_alias(gdf.columns, metric_columns.VEG_COLUMNS)
+            ter_col = match_column_alias(gdf.columns, metric_columns.TERRAIN_COLUMNS)
             if not (veg_col and ter_col):
                 return False
             if gdf.crs is None:
@@ -958,9 +981,9 @@ class MetricFusionEngine:
             if load_multiband_gvi(veg_file):
                 pass
             else:
-                self.veg_data = self._load_metric_file(veg_file)
+                self.veg_data = self._load_metric_file(veg_file, "veg")
                 if terrain_file and os.path.exists(terrain_file):
-                    self.terrain_data = self._load_metric_file(terrain_file)
+                    self.terrain_data = self._load_metric_file(terrain_file, "terrain")
                 elif not terrain_file or not os.path.exists(terrain_file):
                     logger.warning(
                         "Veg file provided but terrain file missing. Auto-downloading terrain..."
@@ -971,7 +994,7 @@ class MetricFusionEngine:
                         progress_callback=progress_callback,
                         cancel_callback=cancel_callback,
                     )
-                    self.terrain_data = self._load_metric_file(terrain_file)
+                    self.terrain_data = self._load_metric_file(terrain_file, "terrain")
         # Check if uploaded veg_file is a combined GVI vector
         # (single GeoPackage / GeoJSON with both ``gvi_veg`` and ``gvi_ter``
         # columns — the default shape produced by ``geofuse.gvi``).
@@ -994,8 +1017,8 @@ class MetricFusionEngine:
                     progress_callback=progress_callback,
                     cancel_callback=cancel_callback,
                 )
-                self.veg_data = self._load_metric_file(veg_file)
-                self.terrain_data = self._load_metric_file(terrain_file)
+                self.veg_data = self._load_metric_file(veg_file, "veg")
+                self.terrain_data = self._load_metric_file(terrain_file, "terrain")
         # Load separate veg/terrain files if provided
         elif (
             veg_file
@@ -1004,8 +1027,8 @@ class MetricFusionEngine:
             and os.path.exists(terrain_file)
         ):
             logger.info("Loading separate veg and terrain files...")
-            self.veg_data = self._load_metric_file(veg_file)
-            self.terrain_data = self._load_metric_file(terrain_file)
+            self.veg_data = self._load_metric_file(veg_file, "veg")
+            self.terrain_data = self._load_metric_file(terrain_file, "terrain")
         # Auto-download if nothing provided
         elif (not veg_file or not os.path.exists(veg_file)) and (
             not terrain_file or not os.path.exists(terrain_file)
@@ -1017,16 +1040,16 @@ class MetricFusionEngine:
                 progress_callback=progress_callback,
                 cancel_callback=cancel_callback,
             )
-            self.veg_data = self._load_metric_file(veg_file)
-            self.terrain_data = self._load_metric_file(terrain_file)
+            self.veg_data = self._load_metric_file(veg_file, "veg")
+            self.terrain_data = self._load_metric_file(terrain_file, "terrain")
         else:
             # Partial files provided - try to load what we have
             if veg_file and os.path.exists(veg_file):
                 logger.info(f"Loading vegetation from: {veg_file}")
-                self.veg_data = self._load_metric_file(veg_file)
+                self.veg_data = self._load_metric_file(veg_file, "veg")
             if terrain_file and os.path.exists(terrain_file):
                 logger.info(f"Loading terrain from: {terrain_file}")
-                self.terrain_data = self._load_metric_file(terrain_file)
+                self.terrain_data = self._load_metric_file(terrain_file, "terrain")
 
         # Validate that we have both veg and terrain data
         if self.veg_data is None or self.terrain_data is None:
@@ -1047,7 +1070,7 @@ class MetricFusionEngine:
         if ndvi_file and os.path.exists(ndvi_file) and not force_download:
             logger.info(f"Loading NDVI from: {ndvi_file}")
             self._validate_metric_bounds(ndvi_file)
-            self.ndvi_data = self._load_metric_file(ndvi_file)
+            self.ndvi_data = self._load_metric_file(ndvi_file, "ndvi")
         else:
             if force_download:
                 logger.info("Force download enabled. Skipping cache check for NDVI...")
@@ -1063,7 +1086,7 @@ class MetricFusionEngine:
             )
             if cancel_callback and cancel_callback():
                 return
-            self.ndvi_data = self._load_metric_file(ndvi_file)
+            self.ndvi_data = self._load_metric_file(ndvi_file, "ndvi")
 
         # Pre-crop every metric source to the target's buffered extent
         # (target.bounds + buffer_meters, which is max(GVI, NDVI) buffer).
@@ -1167,8 +1190,10 @@ class MetricFusionEngine:
             )
         return False
 
-    def _load_metric_file(self, filepath: str) -> gpd.GeoDataFrame | dict:
-        """Load metric from GeoJSON or GeoTIFF."""
+    def _load_metric_file(
+        self, filepath: str, channel: str
+    ) -> gpd.GeoDataFrame | dict:
+        """Load one channel's metric from GeoJSON or GeoTIFF."""
         if filepath.endswith((".tif", ".tiff")):
             with rasterio.open(filepath) as src:
                 transform, crs, bounds = src.transform, src.crs, src.bounds
@@ -1194,44 +1219,16 @@ class MetricFusionEngine:
                 "bounds": bounds,
             }
         else:
-            gdf = gpd.read_file(filepath)
+            # Only the channel's own column is sampled, so the rest of the
+            # file's schema never needs to reach memory.
+            gdf, metric_col = read_vector_aliased_column(
+                filepath,
+                metric_columns.channel_columns(channel),
+                description=f"{channel} metric value",
+            )
             if gdf.crs is None:
                 gdf.set_crs("EPSG:4326", inplace=True)
             gdf = normalize_geographic_gdf_to_wgs84(gdf)
-
-            # Detect metric column - look for common naming patterns
-            metric_col = None
-            for col in gdf.columns:
-                col_lower = col.lower()
-                if col_lower in [
-                    "gvi",
-                    "gvi_veg",
-                    "veg",
-                    "vegetation",
-                    "terrain",
-                    "gvi_ter",
-                    "ndvi",
-                    "value",
-                    "metric",
-                ]:
-                    metric_col = col
-                    break
-
-            if metric_col is None:
-                # Try to find first numeric column (excluding index columns)
-                numeric_cols = gdf.select_dtypes(include=[np.number]).columns.tolist()
-                numeric_cols = [
-                    c
-                    for c in numeric_cols
-                    if c not in ["index", "index_right", "index_left"]
-                ]
-                if numeric_cols:
-                    metric_col = numeric_cols[0]
-                    logger.info(
-                        f"Using '{metric_col}' as metric column from {filepath}"
-                    )
-
-            # Store the metric column name for later use
             gdf.attrs["metric_column"] = metric_col
             return gdf
 
@@ -2225,21 +2222,10 @@ class MetricFusionEngine:
         )
 
     @staticmethod
-    def _metric_value_column(metric_gdf: gpd.GeoDataFrame, default_col: str) -> str:
-        col = metric_gdf.attrs.get("metric_column")
-        if not col or col not in metric_gdf.columns:
-            for c in (default_col, "value"):
-                if c in metric_gdf.columns:
-                    col = c
-                    break
-        if not col:
-            raise ValueError(
-                "Pre-aggregation: cannot find value column in metric "
-                f"(columns: {list(metric_gdf.columns)})."
-            )
-        return col
+    def _metric_value_column(metric_gdf: gpd.GeoDataFrame, channel: str) -> str:
+        return metric_sampling.vector_metric_column(metric_gdf, channel)
 
-    def _metric_fingerprint(self, metric, default_col: str) -> str:
+    def _metric_fingerprint(self, metric, channel: str) -> str:
         """Cheap, deterministic identity for a loaded metric (vector or raster)."""
         if isinstance(metric, dict):  # raster
             arr = metric["data"]
@@ -2255,7 +2241,7 @@ class MetricFusionEngine:
             sample = np.ascontiguousarray(data[::17, ::17]).tobytes()
             digest = hashlib.sha256(sample).hexdigest()[:16]
             return f"ras:{data.shape}:{tuple(metric['bounds'])}:{data.dtype}:{digest}"
-        col = self._metric_value_column(metric, default_col)
+        col = self._metric_value_column(metric, channel)
         vals = np.ascontiguousarray(metric[col].to_numpy(dtype=np.float64))
         digest = hashlib.sha256(vals.tobytes()).hexdigest()[:16]
         return f"vec:{len(metric)}:{tuple(metric.total_bounds)}:{col}:{digest}"
@@ -2408,15 +2394,14 @@ class MetricFusionEngine:
             else self.target_gdf
         )
         n_points = len(preaggr_gdf)
-        defaults = {"veg": "veg", "terrain": "terrain", "ndvi": "NDVI"}
 
         # ---- Fingerprint + cache file (per data-config; reused across runs) ----
         fp_src = "|".join(
             [
                 f"geom:{geometry_sha256(preaggr_gdf)}",
-                self._metric_fingerprint(self.veg_data, defaults["veg"]),
-                self._metric_fingerprint(self.terrain_data, defaults["terrain"]),
-                self._metric_fingerprint(self.ndvi_data, defaults["ndvi"]),
+                self._metric_fingerprint(self.veg_data, "veg"),
+                self._metric_fingerprint(self.terrain_data, "terrain"),
+                self._metric_fingerprint(self.ndvi_data, "ndvi"),
                 f"gvi:{gvi_radii}",
                 f"ndvi:{ndvi_radii}",
                 f"stats:{preaggregation.STAT_COLUMNS}",
@@ -2529,7 +2514,7 @@ class MetricFusionEngine:
                     }
                 )
             else:  # vector points / lines / polygons
-                col = self._metric_value_column(metric, defaults[ch])
+                col = self._metric_value_column(metric, ch)
                 if all_points:
                     # Point fast path: BallTree distance queries need a
                     # projected CRS; the metric is reprojected to the
@@ -2758,7 +2743,6 @@ class MetricFusionEngine:
             else self.target_gdf
         )
         n_points = len(preaggr_gdf)
-        defaults = {"veg": "veg", "terrain": "terrain", "ndvi": "NDVI"}
 
         # Per-(channel, wave) source identity contributes to the fingerprint
         # so changing any wave's file invalidates the cache.
@@ -2767,7 +2751,7 @@ class MetricFusionEngine:
             for wave_label in spec.wave_labels:
                 src = self._longitudinal_metric_data[ch][wave_label]
                 fp_parts.append(
-                    f"{ch}@{wave_label}:" + self._metric_fingerprint(src, defaults[ch])
+                    f"{ch}@{wave_label}:" + self._metric_fingerprint(src, ch)
                 )
         fp_parts.append(f"gvi:{gvi_radii}")
         fp_parts.append(f"ndvi:{ndvi_radii}")
@@ -2872,7 +2856,7 @@ class MetricFusionEngine:
             per_wave = self._longitudinal_metric_data[ch]
             groups: dict[str, list[str]] = {}
             for wave_label in spec.wave_labels:
-                key = self._metric_fingerprint(per_wave[wave_label], defaults[ch])
+                key = self._metric_fingerprint(per_wave[wave_label], ch)
                 groups.setdefault(key, []).append(wave_label)
 
             alias_map: dict[int, int] = {}
@@ -2929,7 +2913,7 @@ class MetricFusionEngine:
                     )
                 kind = "raster_geometry"
             else:
-                col = self._metric_value_column(src, defaults[ch])
+                col = self._metric_value_column(src, ch)
                 if all_points:
                     tree, vals = preaggregation.build_vector_index(src, utm_crs, col)
                     kind = "vector_point"
@@ -3314,24 +3298,22 @@ class MetricFusionEngine:
 
         # Coverage probe: nearest-feature sample at each pixel using the
         # channel's max radius. The values feed only the NaN-filtering dropna
-        # gate; per-trial channel values come from the cache.
-        _log(
-            "INFO",
-            "Probing initial veg / terrain / NDVI coverage at pixel centroids "
-            "(used only for NaN-filtering and feature normalisation)...",
+        # gate; per-trial channel values come from the cache. Rows map 1:1 onto
+        # the probe frame here (one row per polygon pixel already).
+        probe_cols = self._probe_channel_coverage(
+            entity_gdf[["geometry"]].copy(),
+            np.arange(len(entity_gdf), dtype=np.int64),
+            entity_gdf,
         )
-        probe_gdf = entity_gdf[["geometry"]].copy()
-        probe_gdf = self._sample_metrics_at_points(probe_gdf)
 
         fusion_df = pd.DataFrame(
             {
                 "polygon_id": entity_gdf["polygon_id"].values,
                 "target": entity_gdf["target"].values,
-                # Probe channels only feed the NaN-coverage gate and the
-                # channel-scale bounds — float32 halves the pixel-frame cost.
-                "veg": np.asarray(probe_gdf["veg"].values, dtype=np.float32),
-                "terrain": np.asarray(probe_gdf["terrain"].values, dtype=np.float32),
-                "ndvi": np.asarray(probe_gdf["ndvi"].values, dtype=np.float32),
+                # float32 halves the pixel-frame cost.
+                "veg": probe_cols["veg"],
+                "terrain": probe_cols["terrain"],
+                "ndvi": probe_cols["ndvi"],
             },
             index=entity_gdf.index,
         )
@@ -3596,28 +3578,18 @@ class MetricFusionEngine:
 
         self.target_gdf = entity_gdf.copy()
 
-        # Coverage probe — sample each unique pixel once (used only for NaN-
-        # filtering; per-trial channel values come from the cache), then map
-        # the per-pixel values onto the duplicated catchment rows.
-        _log(
-            "INFO",
-            f"Probing veg / terrain / NDVI coverage at {len(pixels):,} unique "
-            "pixel centroids...",
-        )
-        probe_unique = self._sample_metrics_at_points(pixels[["geometry"]].copy())
-        veg_u = probe_unique["veg"].to_numpy()
-        terrain_u = probe_unique["terrain"].to_numpy()
-        ndvi_u = probe_unique["ndvi"].to_numpy()
+        # Coverage probe — used only for NaN-filtering and the channel-scale
+        # bounds; per-trial channel values come from the cache.
+        probe_cols = self._probe_channel_coverage(pixels, pix_idx, entity_gdf)
 
         fusion_df = pd.DataFrame(
             {
                 "polygon_id": entity_gdf["polygon_id"].values,
                 "target": entity_gdf["target"].values,
-                # Probe channels only feed the NaN-coverage gate and the
-                # channel-scale bounds — float32 halves the pixel-frame cost.
-                "veg": np.asarray(veg_u, dtype=np.float32)[pix_idx],
-                "terrain": np.asarray(terrain_u, dtype=np.float32)[pix_idx],
-                "ndvi": np.asarray(ndvi_u, dtype=np.float32)[pix_idx],
+                # float32 halves the pixel-frame cost.
+                "veg": probe_cols["veg"],
+                "terrain": probe_cols["terrain"],
+                "ndvi": probe_cols["ndvi"],
                 "_catchment_dist": entity_gdf["_catchment_dist"].values,
             },
             index=entity_gdf.index,
@@ -4138,8 +4110,106 @@ class MetricFusionEngine:
                 arr[valid] = (arr[valid] - dt(lo)) / dt(hi - lo)
         return arr
 
+    def _probe_channel_coverage(
+        self,
+        pixels: gpd.GeoDataFrame,
+        pix_idx: np.ndarray,
+        entity_gdf: gpd.GeoDataFrame,
+    ) -> dict[str, np.ndarray]:
+        """Per-catchment-row veg / terrain / NDVI values for the coverage gate.
+
+        Cross-sectional runs probe every unique pixel once against the single
+        metric source per channel.
+
+        Longitudinal runs probe per wave: a row's coverage is decided by the
+        metric files of the wave it was measured in. Probing every wave against
+        one representative wave's source would gate the whole study on that
+        wave's extent, discarding observations whose own wave covers them
+        perfectly well.
+        """
+        n_rows = len(entity_gdf)
+        per_wave = self._longitudinal_metric_data
+        waves = (
+            entity_gdf["wave"].astype(str).to_numpy()
+            if (per_wave and "wave" in entity_gdf.columns)
+            else None
+        )
+
+        if waves is None:
+            _log(
+                "INFO",
+                f"Probing veg / terrain / NDVI coverage at {len(pixels):,} "
+                "unique pixel centroids...",
+            )
+            probe = self._sample_metrics_at_points(pixels[["geometry"]].copy())
+            return {
+                ch: np.asarray(probe[ch].to_numpy(), dtype=np.float32)[pix_idx]
+                for ch in ("veg", "terrain", "ndvi")
+            }
+
+        channels = ("veg", "terrain", "ndvi")
+        out = {ch: np.full(n_rows, np.nan, dtype=np.float32) for ch in channels}
+
+        # Waves whose three sources are the same loaded objects are probed
+        # once together: the runner shares one object across waves that reuse
+        # a file, so probing them separately would repeat identical work.
+        groups: dict[tuple[int, ...], list[str]] = {}
+        for wave in dict.fromkeys(waves.tolist()):
+            key = tuple(id(per_wave.get(ch, {}).get(wave)) for ch in channels)
+            groups.setdefault(key, []).append(wave)
+
+        probed_total = 0
+        n_waves = len(dict.fromkeys(waves.tolist()))
+        _log(
+            "INFO",
+            f"Probing veg / terrain / NDVI coverage across {len(pixels):,} "
+            f"unique pixel centroids — {len(groups)} distinct source set(s) "
+            f"over {n_waves} wave(s).",
+        )
+        for group_waves in groups.values():
+            row_mask = (
+                waves == group_waves[0]
+                if len(group_waves) == 1
+                else np.isin(waves, group_waves)
+            )
+            group_pix = np.unique(pix_idx[row_mask])
+            if group_pix.size == 0:
+                continue
+            sources = {
+                ch: per_wave.get(ch, {}).get(group_waves[0]) for ch in channels
+            }
+            probe = self._sample_metrics_at_points(
+                pixels.iloc[group_pix][["geometry"]].copy(), sources, quiet=True
+            )
+            # Position of each row's pixel within ``group_pix``, mapping the
+            # probe result back onto this group's catchment rows.
+            slot = np.searchsorted(group_pix, pix_idx[row_mask])
+            probed_total += int(group_pix.size)
+            counts = {}
+            for ch in channels:
+                vals = np.asarray(probe[ch].to_numpy(), dtype=np.float32)
+                out[ch][row_mask] = vals[slot]
+                counts[ch] = int(np.isfinite(vals).sum())
+            label = (
+                group_waves[0]
+                if len(group_waves) == 1
+                else f"{group_waves[0]}..{group_waves[-1]} ({len(group_waves)} waves)"
+            )
+            _log(
+                "OK" if any(counts.values()) else "WARN",
+                f"  wave {label}: {group_pix.size:,} pixel(s) probed — valid "
+                f"veg={counts['veg']:,} terrain={counts['terrain']:,} "
+                f"ndvi={counts['ndvi']:,}",
+            )
+        _log("INFO", f"Coverage probe sampled {probed_total:,} (pixel, wave-group) pairs.")
+        return out
+
     def _sample_metrics_at_points(
-        self, points_gdf: gpd.GeoDataFrame
+        self,
+        points_gdf: gpd.GeoDataFrame,
+        sources: Mapping[str, Any] | None = None,
+        *,
+        quiet: bool = False,
     ) -> gpd.GeoDataFrame:
         """
         Sample vegetation, terrain, and NDVI metrics at point locations.
@@ -4149,118 +4219,63 @@ class MetricFusionEngine:
 
         Args:
             points_gdf: GeoDataFrame with point geometries to sample at
+            sources: channel → metric source to sample against. Defaults to the
+                engine's cross-sectional ``veg_data`` / ``terrain_data`` /
+                ``ndvi_data``. Longitudinal callers pass one wave's sources so
+                each observation is probed against the metrics of its own wave.
+            quiet: suppress the per-channel log lines (used when sampling is
+                repeated once per wave, which would otherwise flood the log)
 
         Returns:
             GeoDataFrame with added columns: veg, terrain, ndvi
         """
-        points_gdf["veg"] = np.nan
-        points_gdf["terrain"] = np.nan
-        points_gdf["ndvi"] = np.nan
+        src = {
+            "veg": self.veg_data,
+            "terrain": self.terrain_data,
+            "ndvi": self.ndvi_data,
+            **(dict(sources) if sources else {}),
+        }
+        radius = {
+            "veg": self.gvi_buffer_max_m,
+            "terrain": self.gvi_buffer_max_m,
+            "ndvi": self.ndvi_buffer_max_m,
+        }
+        label = {"veg": "Veg", "terrain": "Terrain", "ndvi": "NDVI"}
 
-        # Sample Vegetation
-        if isinstance(self.veg_data, dict):  # Raster
-            points_in_veg_crs = points_gdf.to_crs(self.veg_data["crs"])
-            points_gdf["veg"] = metric_sampling.sample_raster_values(
-                points_in_veg_crs, self.veg_data
+        for channel in ("veg", "terrain", "ndvi"):
+            points_gdf[channel] = np.nan
+            data = src[channel]
+            if data is None:
+                continue
+            if isinstance(data, dict):  # Raster
+                points_gdf[channel] = metric_sampling.sample_raster_values(
+                    points_gdf.to_crs(data["crs"]), data
+                )
+                continue
+            # Vector
+            col = metric_sampling.vector_metric_column(data, channel)
+            if not quiet:
+                _log(
+                    "INFO",
+                    f"{label[channel]} data: {len(data)} features, "
+                    f"columns: {data.columns.tolist()}",
+                )
+                _log("INFO", f"Using {channel} column: '{col}'")
+                _log(
+                    "INFO",
+                    f"Nearest-feature max distance ({channel}): "
+                    f"{radius[channel]} m",
+                )
+            points_gdf[channel] = metric_sampling.nearest_metric_join(
+                points_gdf, data, col, radius[channel]
             )
-        else:  # GeoDataFrame
-            # Detect metric column
-            veg_col = self.veg_data.attrs.get("metric_column", "gvi")
-            if veg_col not in self.veg_data.columns:
-                # Fallback to common patterns
-                for col in ["gvi", "gvi_veg", "veg", "GVI", "value"]:
-                    if col in self.veg_data.columns:
-                        veg_col = col
-                        break
-
-            _log(
-                "INFO",
-                f"Veg data: {len(self.veg_data)} features, "
-                f"columns: {self.veg_data.columns.tolist()}",
-            )
-            _log("INFO", f"Using veg column: '{veg_col}'")
-            _log(
-                "INFO",
-                f"Nearest-feature max distance (veg): {self.gvi_buffer_max_m} m",
-            )
-
-            points_gdf["veg"] = metric_sampling.nearest_metric_join(
-                points_gdf, self.veg_data, veg_col, self.gvi_buffer_max_m
-            )
-
-            veg_valid = points_gdf["veg"].notna().sum()
-            _log(
-                "OK" if veg_valid else "WARN",
-                f"Veg sampling: {veg_valid}/{len(points_gdf)} points have valid values",
-            )
-
-        # Sample Terrain
-        if isinstance(self.terrain_data, dict):  # Raster
-            points_in_terrain_crs = points_gdf.to_crs(self.terrain_data["crs"])
-            points_gdf["terrain"] = metric_sampling.sample_raster_values(
-                points_in_terrain_crs, self.terrain_data
-            )
-        else:  # GeoDataFrame
-            # Detect metric column
-            terrain_col = self.terrain_data.attrs.get("metric_column", "terrain")
-            if terrain_col not in self.terrain_data.columns:
-                # Fallback to common patterns
-                for col in ["terrain", "gvi_ter", "NDVI", "ndvi", "value"]:
-                    if col in self.terrain_data.columns:
-                        terrain_col = col
-                        break
-
-            _log(
-                "INFO",
-                f"Terrain data: {len(self.terrain_data)} features, "
-                f"columns: {self.terrain_data.columns.tolist()}",
-            )
-            _log("INFO", f"Using terrain column: '{terrain_col}'")
-
-            points_gdf["terrain"] = metric_sampling.nearest_metric_join(
-                points_gdf, self.terrain_data, terrain_col, self.gvi_buffer_max_m
-            )
-
-            terrain_valid = points_gdf["terrain"].notna().sum()
-            _log(
-                "OK" if terrain_valid else "WARN",
-                f"Terrain sampling: {terrain_valid}/{len(points_gdf)} "
-                "points have valid values",
-            )
-
-        # Sample NDVI
-        points_gdf["ndvi"] = np.nan
-        if isinstance(self.ndvi_data, dict):  # Raster
-            points_in_ndvi_crs = points_gdf.to_crs(self.ndvi_data["crs"])
-            points_gdf["ndvi"] = metric_sampling.sample_raster_values(
-                points_in_ndvi_crs, self.ndvi_data
-            )
-        else:  # GeoDataFrame
-            # Detect metric column
-            ndvi_col = self.ndvi_data.attrs.get("metric_column", "NDVI")
-            if ndvi_col not in self.ndvi_data.columns:
-                # Fallback to common patterns
-                for col in ["NDVI", "ndvi", "value"]:
-                    if col in self.ndvi_data.columns:
-                        ndvi_col = col
-                        break
-
-            _log(
-                "INFO",
-                f"NDVI data: {len(self.ndvi_data)} features, "
-                f"columns: {self.ndvi_data.columns.tolist()}",
-            )
-            _log("INFO", f"Using NDVI column: '{ndvi_col}'")
-
-            points_gdf["ndvi"] = metric_sampling.nearest_metric_join(
-                points_gdf, self.ndvi_data, ndvi_col, self.ndvi_buffer_max_m
-            )
-
-            ndvi_valid = points_gdf["ndvi"].notna().sum()
-            _log(
-                "OK" if ndvi_valid else "WARN",
-                f"NDVI sampling: {ndvi_valid}/{len(points_gdf)} points have valid values",
-            )
+            if not quiet:
+                valid = int(points_gdf[channel].notna().sum())
+                _log(
+                    "OK" if valid else "WARN",
+                    f"{label[channel]} sampling: {valid}/{len(points_gdf)} "
+                    "points have valid values",
+                )
 
         return points_gdf
 

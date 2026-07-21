@@ -50,13 +50,18 @@ from geofuse.longitudinal import MIXEDLM_METRICS as _LON_MIXEDLM_METRICS
 from geofuse.longitudinal import (
     LongitudinalSpec,
 )
+from geofuse.longitudinal import (
+    target_intake_columns as _longitudinal_target_intake_columns,
+)
 from geofuse.mixedlm_postscore import (
     compute_post_metrics as _compute_mixedlm_post_metrics,
 )
 from geofuse.ndvi import NDVIEngine
 from geofuse import pdcor as _pdcor_mod
 from geofuse.persistence.job_executor import JobContext
+from geofuse import metric_columns
 from geofuse.raster_sampling import LAZY_RASTER_THRESHOLD_BYTES, LazyRasterArray
+from geofuse.vector_io import read_vector_aliased_column, read_vector_subset
 from geofuse.vision import get_best_device
 
 _log_gvi = get_logger("GVI")
@@ -973,13 +978,6 @@ _FUSION_MIXEDLM_POSTSCORE_STAGE: tuple[str, str] = (
 )
 
 
-_LONGITUDINAL_COLUMN_ALIASES = {
-    "veg": ("gvi_veg", "gvi", "veg", "vegetation", "value"),
-    "terrain": ("gvi_ter", "gvi_terrain", "terrain", "value"),
-    "ndvi": ("ndvi", "value"),
-}
-
-
 def _load_longitudinal_metric_file(path: str, channel: str) -> Any:
     """Read one per-wave metric file into the layout the engine expects.
 
@@ -1043,17 +1041,15 @@ def _load_longitudinal_metric_file(path: str, channel: str) -> Any:
                 f"in-memory threshold; reading windows lazily from {path}",
             )
         return {"data": data, **meta}
-    # Vector formats (GPKG / GeoJSON / shapefile / zip)
-    gdf = gpd.read_file(path)
-    aliases = _LONGITUDINAL_COLUMN_ALIASES[channel]
-    lowered = {str(c).lower(): c for c in gdf.columns}
-    col = next((lowered[a] for a in aliases if a in lowered), None)
-    if col is None:
-        raise ValueError(
-            f"Cannot find metric value column in {path} for channel {channel!r}. "
-            f"Expected one of {list(aliases)}; got columns "
-            f"{list(gdf.columns)}."
-        )
+    # Vector formats (GPKG / GeoJSON / shapefile / zip). Only the value column
+    # and geometry are sampled; the rest of a GVI file's schema (panorama id,
+    # capture date, lat/lon, grid row/col, cluster) would otherwise cost
+    # several hundred MB per wave.
+    gdf, col = read_vector_aliased_column(
+        path,
+        metric_columns.channel_columns(channel),
+        description=f"{channel} metric value",
+    )
     gdf = gdf.dropna(subset=[col])
     gdf.attrs["metric_column"] = col
     return gdf
@@ -2103,15 +2099,20 @@ def run_fusion(
                     # waves a file is a container whose rows carry their own
                     # wave, so its label is only a log/provenance string.
                     wide_frames: list[tuple[str, gpd.GeoDataFrame]] = []
+                    keep_cols = _longitudinal_target_intake_columns(
+                        longitudinal_spec, target_feature, outcome_covs
+                    )
                     for wave_label, wpath in (
                         longitudinal_spec.target_files_per_wave.items()
                     ):
-                        wide_frames.append((wave_label, gpd.read_file(wpath)))
+                        wide_frames.append(
+                            (wave_label, read_vector_subset(wpath, keep_cols))
+                        )
                     engine.set_longitudinal_wave_frames(wide_frames)
                     _log_fusion(
                         "INFO",
                         f"[{label}] Loaded {len(wide_frames)} per-wave target "
-                        "files (wide intake).",
+                        f"files (wide intake), keeping columns {keep_cols}.",
                     )
                 # One read per distinct (path, channel): a file assigned to
                 # several waves is loaded once and shared. The engine treats

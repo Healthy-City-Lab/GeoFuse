@@ -303,6 +303,30 @@ def describe_file_reuse(spec: LongitudinalSpec) -> dict[str, bool]:
     return out
 
 
+def target_intake_columns(
+    spec: LongitudinalSpec,
+    outcome_col: str | None,
+    covariate_cols: Iterable[str] = (),
+) -> list[str]:
+    """Non-geometry columns :func:`build_long_format` reads from a target frame.
+
+    The union of what intake consumes (entity id, date, wave label) and what
+    :func:`_project_columns` keeps (outcome, covariates). Any other column in
+    the user's file is discarded by intake, so a reader may skip it entirely
+    rather than materialize a cohort file's full survey schema.
+    """
+    cols = [spec.entity_id_col, spec.date_col, outcome_col, *covariate_cols]
+    if not spec.derive_wave_from_date:
+        cols.append(spec.wave_col)
+    seen: set[str] = set()
+    out: list[str] = []
+    for c in cols:
+        if c and c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
 def build_long_format(
     spec: LongitudinalSpec,
     target_input: gpd.GeoDataFrame | Sequence[tuple[str, gpd.GeoDataFrame]],

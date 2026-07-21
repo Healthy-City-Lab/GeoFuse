@@ -22,6 +22,8 @@ import pandas as pd
 import rasterio
 from rasterio.transform import rowcol
 
+from . import metric_columns
+
 
 def nearest_metric_join(
     points_gdf: gpd.GeoDataFrame,
@@ -199,29 +201,15 @@ def aggregate_disk_from_rings(
 
 
 def vector_metric_column(metric_data: gpd.GeoDataFrame, channel: str) -> str:
-    """Resolve the numeric value column of a vector metric for ``channel``."""
+    """Resolve the numeric value column of a vector metric for ``channel``.
+
+    Honours the ``metric_column`` hint a loader may have recorded, otherwise
+    resolves strictly against the channel's own column names.
+    """
     metric_col = metric_data.attrs.get("metric_column")
     if metric_col and metric_col in metric_data.columns:
-        return metric_col
-    if channel == "veg":
-        for col in ["veg", "gvi_veg", "gvi", "GVI", "value"]:
-            if col in metric_data.columns:
-                return col
-    elif channel == "terrain":
-        for col in ["terrain", "gvi_ter", "NDVI", "ndvi", "value"]:
-            if col in metric_data.columns:
-                return col
-    else:
-        for col in ["NDVI", "ndvi", "value"]:
-            if col in metric_data.columns:
-                return col
-    numeric_cols = metric_data.select_dtypes(include=[np.number]).columns.tolist()
-    numeric_cols = [
-        c for c in numeric_cols if c not in ["index_right", "index_left", "index"]
-    ]
-    if numeric_cols:
-        return numeric_cols[0]
-    raise ValueError(f"No numeric metric column for channel={channel}")
+        return str(metric_col)
+    return metric_columns.resolve_channel_column(metric_data.columns, channel)
 
 
 def _bin_into_rings(
