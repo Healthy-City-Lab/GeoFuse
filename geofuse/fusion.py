@@ -45,16 +45,11 @@ from .crs_utils import (
     select_grid_crs_with_warning,
 )
 from .logger import attach_external_logger, get_logger
-from .raster_sampling import LazyRasterArray
+from .raster_sampling import LAZY_RASTER_THRESHOLD_BYTES, LazyRasterArray
 from .vector_io import geometry_sha256, target_path_is_raster
 
 logger = logging.getLogger(__name__)
 _log = get_logger("FUSION")
-
-# Metric rasters larger than this (uncompressed band bytes) are read lazily in
-# windows from disk instead of loaded whole — keeps national-scale rasters off
-# the heap. Smaller rasters stay in RAM (faster per-point reads).
-_LAZY_RASTER_THRESHOLD_BYTES = 256 * 1024 * 1024
 
 # Files whose buffered-extent shortfall has already been reported this process,
 # keyed by (abspath, rounded bounds). A cached NDVI file's sub-pixel shortfall
@@ -1181,7 +1176,7 @@ class MetricFusionEngine:
                 est_bytes = src.width * src.height * itemsize
                 data = (
                     src.read(1, masked=True)
-                    if est_bytes <= _LAZY_RASTER_THRESHOLD_BYTES
+                    if est_bytes <= LAZY_RASTER_THRESHOLD_BYTES
                     else None
                 )
             if data is None:

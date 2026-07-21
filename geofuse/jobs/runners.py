@@ -56,6 +56,7 @@ from geofuse.mixedlm_postscore import (
 from geofuse.ndvi import NDVIEngine
 from geofuse import pdcor as _pdcor_mod
 from geofuse.persistence.job_executor import JobContext
+from geofuse.raster_sampling import LAZY_RASTER_THRESHOLD_BYTES, LazyRasterArray
 from geofuse.vision import get_best_device
 
 _log_gvi = get_logger("GVI")
@@ -1017,15 +1018,31 @@ def _load_longitudinal_metric_file(path: str, channel: str) -> Any:
                 )
                 gdf.attrs["metric_column"] = channel
                 return gdf
-            data = src.read(1, masked=True)
-            return {
-                "data": data,
+            itemsize = np.dtype(src.dtypes[0]).itemsize
+            est_bytes = src.width * src.height * itemsize
+            data = (
+                src.read(1, masked=True)
+                if est_bytes <= LAZY_RASTER_THRESHOLD_BYTES
+                else None
+            )
+            meta = {
                 "transform": src.transform,
                 "crs": src.crs,
                 "bounds": src.bounds,
                 "width": src.width,
                 "height": src.height,
             }
+        if data is None:
+            # A wave raster spanning widely separated study sites covers a huge
+            # extent at metric resolution but is almost entirely nodata; the
+            # dense band would not fit in RAM. Sample windows from disk instead.
+            data = LazyRasterArray(path, band=1)
+            _log_fusion(
+                "INFO",
+                f"Wave raster ~{est_bytes / (1024**3):.1f} GiB exceeds the "
+                f"in-memory threshold; reading windows lazily from {path}",
+            )
+        return {"data": data, **meta}
     # Vector formats (GPKG / GeoJSON / shapefile / zip)
     gdf = gpd.read_file(path)
     aliases = _LONGITUDINAL_COLUMN_ALIASES[channel]

@@ -37,6 +37,11 @@ from shapely.geometry import Point
 
 from .crs_utils import metres_per_degree_at_lat
 
+# Metric rasters larger than this (uncompressed band bytes) are read lazily in
+# windows from disk instead of loaded whole — keeps national-scale rasters off
+# the heap. Smaller rasters stay in RAM (faster per-point reads).
+LAZY_RASTER_THRESHOLD_BYTES = 256 * 1024 * 1024
+
 
 class LazyRasterArray:
     """A 2D, array-like view over one raster band that reads windows from disk.
