@@ -1278,59 +1278,112 @@ _FUSION_METRIC_CHANNELS: tuple[tuple[str, str, str], ...] = (
 _UNASSIGNED_HEADER = "Unassigned"
 
 
-def _render_year_assignment_sortable(
+def _container_headers(file_paths: list[str]) -> list[str]:
+    """Display name per file — basename, disambiguated only when it repeats.
+
+    The chip list above already carries the full path as a tooltip, so the
+    header stays short; two files sharing a basename get their parent folder
+    prefixed so the drop targets remain tellable apart.
+    """
+    bases = [os.path.basename(p) for p in file_paths]
+    dupes = {b for b in bases if bases.count(b) > 1}
+    out: list[str] = []
+    for p, b in zip(file_paths, bases):
+        if b in dupes:
+            parent = os.path.basename(os.path.dirname(p)) or os.path.dirname(p)
+            out.append(f"{parent}/{b}" if parent else b)
+        else:
+            out.append(b)
+    return out
+
+
+def _render_coverage_chips(covered: dict[str, int], waves: list[str]) -> None:
+    """One chip per year/wave: the label plus an assigned/unassigned emoji.
+
+    Each chip is a single ``nowrap`` unit so a label can never end up on a
+    different line from its own status marker.
+    """
+    chips = []
+    for w in waves:
+        n = int(covered.get(w, 0))
+        mark = "✅" if n == 1 else ("❌" if n == 0 else "⚠️")
+        chips.append(
+            "<span style='display:inline-block;white-space:nowrap;"
+            "padding:2px 8px;margin:2px 6px 2px 0;border-radius:10px;"
+            "border:1px solid rgba(128,128,128,0.35);font-size:0.85em;'>"
+            f"{w}&nbsp;{mark}</span>"
+        )
+    st.markdown("".join(chips), unsafe_allow_html=True)
+
+
+def _render_year_assignment(
     ch_short: str,
-    ch_label: str,
     file_paths: list[str],
     waves: list[str],
-) -> dict[str, list[str]] | None:
-    """Drag years onto files. Returns ``{path: [wave, ...]}`` or ``None``.
+) -> dict[str, list[str]]:
+    """Assign years/waves to files. Returns ``{path: [wave, ...]}``.
 
-    Years are the draggable items and files are the containers, so a year can
-    sit in exactly one place: assign-once coverage is structural rather than
-    validated after the fact. ``None`` means the component is unavailable and
-    the caller should fall back to the multiselect grid.
+    Drag-and-drop when the sortables component is available: years are the
+    items and files are the containers, so a year can sit in exactly one place
+    and assign-once coverage is structural rather than validated afterwards.
+    Falls back to one multiselect per file (options hidden once another file
+    claims them) when the component is missing.
     """
-    try:
-        from streamlit_sortables import sort_items
-    except Exception:
-        return None
-
     state_key = f"fusion_{ch_short}_year_assign"
     stored: dict[str, list[str]] = dict(st.session_state.get(state_key, {}))
     # Drop files and years that have since disappeared, so a stale assignment
-    # can't resurrect a removed row or an outdated year.
-    stored = {p: [w for w in ws if w in waves] for p, ws in stored.items() if p in file_paths}
-    claimed = {w for ws in stored.values() for w in ws}
-    unassigned = [w for w in waves if w not in claimed]
+    # can't resurrect a removed file or an outdated year.
+    stored = {
+        p: [w for w in ws if w in waves]
+        for p, ws in stored.items()
+        if p in file_paths
+    }
+    headers = _container_headers(file_paths)
 
-    # Headers are numbered so two files with the same basename stay distinct.
-    containers = [{"header": _UNASSIGNED_HEADER, "items": unassigned}]
-    for i, p in enumerate(file_paths, start=1):
-        containers.append(
-            {"header": f"{i}. {os.path.basename(p)}", "items": stored.get(p, [])}
+    try:
+        from streamlit_sortables import sort_items
+    except Exception:
+        sort_items = None  # type: ignore[assignment]
+
+    if sort_items is not None:
+        claimed = {w for ws in stored.values() for w in ws}
+        containers = [
+            {"header": _UNASSIGNED_HEADER, "items": [w for w in waves if w not in claimed]}
+        ]
+        for p, head in zip(file_paths, headers):
+            containers.append({"header": head, "items": stored.get(p, [])})
+
+        # Remount when the file list or year set changes: a custom component
+        # keyed on a stable key misbehaves when its item set shifts underneath.
+        sig = abs(hash((tuple(file_paths), tuple(waves)))) % (10**9)
+        result = sort_items(
+            containers,
+            multi_containers=True,
+            key=f"fusion_{ch_short}_sort_{sig}",
         )
+        assignment = {
+            file_paths[idx - 1]: list(bucket.get("items", []))
+            for idx, bucket in enumerate(result)
+            if idx > 0
+        }
+        st.session_state[state_key] = assignment
+        return assignment
 
-    # Remount when the file list or year set changes: a custom component keyed
-    # on a stable key misbehaves when its item set shifts underneath it.
-    sig = abs(hash((tuple(file_paths), tuple(waves)))) % (10**9)
-    st.caption(
-        f"Drag each year onto the {ch_label} file that covers it. "
-        "Years left in **Unassigned** block submission."
-    )
-    for i, p in enumerate(file_paths, start=1):
-        st.caption(f"{i}. `{os.path.basename(p)}` — {p}")
-    result = sort_items(
-        containers,
-        multi_containers=True,
-        key=f"fusion_{ch_short}_sort_{sig}",
-    )
+    # Fallback: one multiselect per file, each hiding years another file took.
+    from file_picker import path_to_widget_id
 
-    assignment: dict[str, list[str]] = {}
-    for idx, bucket in enumerate(result):
-        if idx == 0:  # the Unassigned pool
-            continue
-        assignment[file_paths[idx - 1]] = list(bucket.get("items", []))
+    assignment = {}
+    for p, head in zip(file_paths, headers):
+        taken = {w for q, ws in stored.items() if q != p for w in ws}
+        options = [w for w in waves if w not in taken]
+        wkey = f"fusion_{ch_short}_assign__{path_to_widget_id(p)}"
+        if wkey in st.session_state:
+            st.session_state[wkey] = [
+                w for w in st.session_state[wkey] if w in options
+            ]
+        picked = st.multiselect(head, options=options, key=wkey)
+        assignment[p] = list(picked)
+        stored[p] = list(picked)
     st.session_state[state_key] = assignment
     return assignment
 
@@ -1416,105 +1469,38 @@ def _render_metric_assignment_panel(
             state[f"{ch_key}_buffer_max"] = int(bmax)
             state[f"{ch_key}_buffer_step"] = int(bstep)
 
-            # Files repeater
-            count_key = f"fusion_{ch_short}_file_count"
-            if count_key not in st.session_state:
-                st.session_state[count_key] = 1
-            n_files = st.session_state[count_key]
-            from file_picker import FT_VECTOR_OR_RASTER, pick_file_path
+            # One dialog, any number of files: each pick appends to the kept
+            # list and renders as its own chip (basename shown, full path as
+            # the chip's tooltip).
+            from file_picker import FT_VECTOR_OR_RASTER, pick_multiple_paths
 
-            sibling_assignments: dict[int, list] = {
-                j: list(st.session_state.get(f"fusion_{ch_short}_assign_{j}", []))
-                for j in range(n_files)
-            }
+            picked_paths = [
+                p
+                for p in pick_multiple_paths(
+                    f"{ch_label} files",
+                    key=f"fusion_{ch_short}_paths",
+                    file_types=FT_VECTOR_OR_RASTER,
+                    help_text=(
+                        "Pick one or more GeoTIFF / vector metric files from "
+                        "disk — select several at once in the dialog. The path "
+                        "picker bypasses Streamlit's upload limit so "
+                        "national-scale rasters are supported directly."
+                    ),
+                )
+                if os.path.isfile(p)
+            ]
 
-            # Drag-and-drop assignment: years are items, files are containers,
-            # so each year lands on exactly one file by construction.
-            picked_paths: list[str] = []
-            for i in range(n_files):
-                p = st.session_state.get(f"fusion_{ch_short}_path_{i}")
-                if isinstance(p, str) and p and os.path.isfile(p):
-                    picked_paths.append(p)
-            sortable_assignment: dict[str, list[str]] | None = None
+            # Year/wave assignment: years are the draggable items and files are
+            # the drop targets, so each year lands on exactly one file.
+            assignment: dict[str, list[str]] = {}
             if year_aware and discovered_waves and picked_paths:
-                sortable_assignment = _render_year_assignment_sortable(
-                    ch_short, ch_label, picked_paths, list(discovered_waves)
+                assignment = _render_year_assignment(
+                    ch_short, picked_paths, list(discovered_waves)
                 )
 
-            channel_files: list[tuple[str, list]] = []
-            for i in range(n_files):
-                col_up, col_rm = st.columns([5, 1])
-                with col_up:
-                    file_path = pick_file_path(
-                        f"{ch_label} file {i + 1}",
-                        key=f"fusion_{ch_short}_path_{i}",
-                        file_types=FT_VECTOR_OR_RASTER,
-                        help_text=(
-                            "Pick a GeoTIFF or vector metric file from disk. "
-                            "The path picker bypasses Streamlit's upload limit "
-                            "so national-scale rasters are supported directly."
-                        ),
-                    )
-                with col_rm:
-                    if i > 0 and st.button(
-                        "❌",
-                        key=f"fusion_{ch_short}_rm_{i}",
-                        help=f"Remove this {ch_short.upper()} file row",
-                    ):
-                        st.session_state[count_key] -= 1
-                        st.rerun()
-                if file_path and not os.path.isfile(file_path):
-                    st.error(f"Path no longer exists: `{file_path}`")
-                    file_path = None
-                assigned: list = []
-                if sortable_assignment is not None:
-                    if file_path:
-                        assigned = list(sortable_assignment.get(file_path, []))
-                elif year_aware and discovered_waves:
-                    my_current = set(sibling_assignments.get(i, []))
-                    taken_by_others = set().union(
-                        *(
-                            set(waves)
-                            for j, waves in sibling_assignments.items()
-                            if j != i
-                        )
-                    )
-                    visible_options = [
-                        w
-                        for w in discovered_waves
-                        if w not in taken_by_others or w in my_current
-                    ]
-                    assign_key = f"fusion_{ch_short}_assign_{i}"
-                    # Stale session_state can hold a wave that's no longer
-                    # in the visible options (sibling claimed it last run).
-                    # Prune those before rendering so Streamlit doesn't
-                    # error on the invalid value.
-                    if assign_key in st.session_state:
-                        st.session_state[assign_key] = [
-                            w
-                            for w in st.session_state[assign_key]
-                            if w in visible_options
-                        ]
-                    assigned = st.multiselect(
-                        f"{ch_label} file {i + 1} — applies to year(s) / wave(s)",
-                        options=visible_options,
-                        key=assign_key,
-                        help="Years already assigned to another file are hidden.",
-                    )
-                    # Update the snapshot so the NEXT row's option list
-                    # reflects this row's freshly-rendered selection
-                    # (otherwise late rows lag by one rerun).
-                    sibling_assignments[i] = list(assigned)
-                if file_path:
-                    channel_files.append((file_path, assigned))
-
-            if st.button(
-                f"+ Add another {ch_short.upper()} file",
-                key=f"fusion_{ch_short}_add",
-            ):
-                st.session_state[count_key] += 1
-                st.rerun()
-
+            channel_files: list[tuple[str, list]] = [
+                (p, list(assignment.get(p, []))) for p in picked_paths
+            ]
             state[f"{ch_key}_files"] = channel_files
 
             # Coverage check + caption.
@@ -1526,16 +1512,7 @@ def _render_metric_assignment_panel(
                             covered[w] += 1
                 missing = [w for w, n in covered.items() if n == 0]
                 duplicates = [w for w, n in covered.items() if n > 1]
-                bits = []
-                for w in discovered_waves:
-                    n = covered.get(w, 0)
-                    if n == 1:
-                        bits.append(f"`{w}` ✓")
-                    elif n == 0:
-                        bits.append(f"`{w}` ❌ unassigned")
-                    else:
-                        bits.append(f"`{w}` ⚠️ ×{n}")
-                st.caption("Coverage: " + "  ".join(bits))
+                _render_coverage_chips(covered, discovered_waves)
                 if missing:
                     state["coverage_complete"] = False
                     state["coverage_errors"].append(

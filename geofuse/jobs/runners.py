@@ -972,6 +972,13 @@ _FUSION_MIXEDLM_POSTSCORE_STAGE: tuple[str, str] = (
 )
 
 
+_LONGITUDINAL_COLUMN_ALIASES = {
+    "veg": ("gvi_veg", "gvi", "veg", "vegetation", "value"),
+    "terrain": ("gvi_ter", "gvi_terrain", "terrain", "value"),
+    "ndvi": ("ndvi", "value"),
+}
+
+
 def _load_longitudinal_metric_file(path: str, channel: str) -> Any:
     """Read one per-wave metric file into the layout the engine expects.
 
@@ -1021,18 +1028,16 @@ def _load_longitudinal_metric_file(path: str, channel: str) -> Any:
             }
     # Vector formats (GPKG / GeoJSON / shapefile / zip)
     gdf = gpd.read_file(path)
-    default_col = {"veg": "veg", "terrain": "terrain", "ndvi": "NDVI"}[channel]
-    col = (
-        default_col
-        if default_col in gdf.columns
-        else ("value" if "value" in gdf.columns else None)
-    )
+    aliases = _LONGITUDINAL_COLUMN_ALIASES[channel]
+    lowered = {str(c).lower(): c for c in gdf.columns}
+    col = next((lowered[a] for a in aliases if a in lowered), None)
     if col is None:
         raise ValueError(
             f"Cannot find metric value column in {path} for channel {channel!r}. "
-            f"Expected one of [{default_col!r}, 'value']; got columns "
+            f"Expected one of {list(aliases)}; got columns "
             f"{list(gdf.columns)}."
         )
+    gdf = gdf.dropna(subset=[col])
     gdf.attrs["metric_column"] = col
     return gdf
 
