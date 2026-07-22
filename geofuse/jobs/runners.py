@@ -2114,27 +2114,27 @@ def run_fusion(
                         f"[{label}] Loaded {len(wide_frames)} per-wave target "
                         f"files (wide intake), keeping columns {keep_cols}.",
                     )
-                # One read per distinct (path, channel): a file assigned to
-                # several waves is loaded once and shared. The engine treats
-                # metric sources as read-only, and the shared object also lets
-                # the cache's fingerprint grouping collapse those waves into a
-                # single compute pass.
-                loaded_metrics: dict[tuple[str, str], Any] = {}
+                    # The engine owns them now and concatenates them into one
+                    # long frame; holding a second reference here would keep
+                    # the per-file copies alive for the whole run.
+                    del wide_frames
+                # Register the file paths only. The engine opens one temporal
+                # key's files when it needs them and frees them before the
+                # next, so a study with many keys never holds every metric
+                # file at once.
+                engine.set_longitudinal_metric_sources(
+                    {ch: dict(longitudinal_spec.greenery_files[ch])
+                     for ch in GREENERY_CHANNELS},
+                    _load_longitudinal_metric_file,
+                )
+                key_noun = "year" if longitudinal_spec.derive_wave_from_date else "wave"
                 for ch in GREENERY_CHANNELS:
-                    per_wave: dict[str, Any] = {}
-                    for wave_label, fp in longitudinal_spec.greenery_files[ch].items():
-                        cache_key = (fp, ch)
-                        src_obj = loaded_metrics.get(cache_key)
-                        if src_obj is None:
-                            src_obj = _load_longitudinal_metric_file(fp, ch)
-                            loaded_metrics[cache_key] = src_obj
-                        per_wave[wave_label] = src_obj
-                    engine.set_longitudinal_metric_data(ch, per_wave)
-                    n_unique = len({id(v) for v in per_wave.values()})
+                    files = longitudinal_spec.greenery_files[ch]
+                    n_unique = len(set(files.values()))
                     _log_fusion(
                         "INFO",
-                        f"[{label}] Loaded {ch}: {len(per_wave)} wave(s), "
-                        f"{n_unique} unique source(s).",
+                        f"[{label}] Registered {ch}: {len(files)} {key_noun}(s), "
+                        f"{n_unique} distinct file(s) — opened on demand.",
                     )
                 stage(skey("prepare_longitudinal"), DONE)
                 if ctx.is_cancelled():

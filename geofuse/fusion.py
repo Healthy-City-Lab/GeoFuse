@@ -46,7 +46,7 @@ from .crs_utils import (
 )
 from .logger import attach_external_logger, get_logger
 from .raster_sampling import LAZY_RASTER_THRESHOLD_BYTES, LazyRasterArray
-from . import metric_columns
+from . import metric_columns, metric_sources
 from .vector_io import (
     geometry_sha256,
     match_column_alias,
@@ -416,12 +416,11 @@ class MetricFusionEngine:
         # ``load_target`` exactly as in cross-sectional mode and converts it
         # to long format inside ``prepare_fusion_data``.
         self._longitudinal_wave_frames: list[tuple[str, gpd.GeoDataFrame]] | None = None
-        # Per-wave metric sources for the mixed-effects mode. Populated by
-        # ``set_longitudinal_metric_data`` before ``precompute_aggregations``.
-        # Outer dict: channel → wave_label → metric source (GeoDataFrame for
-        # vector channels, raster-dict for raster channels — same layout
-        # ``load_metrics`` produces). Cross-sectional runs leave this ``None``.
-        self._longitudinal_metric_data: dict[str, dict[str, Any]] | None = None
+        # Per-temporal-key metric sources for the mixed-effects mode. Populated
+        # by ``set_longitudinal_metric_sources`` (paths, loaded on demand) or
+        # ``set_longitudinal_metric_data`` (already-loaded objects) before
+        # ``precompute_aggregations``. Cross-sectional runs leave this ``None``.
+        self._metric_sources: metric_sources.LongitudinalMetricSources | None = None
 
         if self.is_longitudinal and self.is_raster:
             raise ValueError(
@@ -438,21 +437,67 @@ class MetricFusionEngine:
         """True when a :class:`LongitudinalSpec` was provided at construction."""
         return self.longitudinal_spec is not None
 
+    def _temporal_key_noun(self) -> str:
+        """What one temporal key represents, for logs and messages.
+
+        The spec's ``derive_wave_from_date`` decides this: with it on, a row's
+        key is the calendar year it was measured in (so the same year can be a
+        baseline for one participant and a follow-up for another); with it off,
+        the key is the wave label the file was supplied under.
+        """
+        spec = self.longitudinal_spec
+        if spec is not None and spec.derive_wave_from_date:
+            return "year"
+        return "wave"
+
+    def _validate_temporal_coverage(self, per_key: Mapping[str, Any]) -> None:
+        """Every temporal key in the spec must have an entry."""
+        spec = self.longitudinal_spec
+        assert spec is not None
+        missing = [w for w in spec.wave_labels if w not in per_key]
+        if missing:
+            raise ValueError(
+                f"metric sources are missing entries for waves: {missing}."
+            )
+
+    def set_longitudinal_metric_sources(
+        self,
+        paths: Mapping[str, Mapping[str, str]],
+        loader: Callable[[str, str], Any],
+    ) -> None:
+        """Register per-temporal-key metric *file paths*, loaded on demand.
+
+        ``paths`` maps ``channel -> temporal key -> file path``, where the
+        temporal key is the measurement year when the spec derives waves from
+        dates, and the wave label otherwise. Nothing is read here: the engine
+        loads one key's files when it needs them and releases them before
+        moving to the next, so a study with many waves never holds more than
+        one key's metrics in memory.
+        """
+        if not self.is_longitudinal:
+            raise RuntimeError(
+                "set_longitudinal_metric_sources() requires longitudinal_spec "
+                "to be set."
+            )
+        for channel in longitudinal.GREENERY_CHANNELS:
+            if channel not in paths:
+                raise ValueError(f"metric source paths are missing {channel!r}.")
+            self._validate_temporal_coverage(paths[channel])
+        self._metric_sources = metric_sources.LongitudinalMetricSources(
+            paths, loader
+        )
+
     def set_longitudinal_metric_data(
         self,
         channel: str,
         per_wave_data: dict[str, Any],
     ) -> None:
-        """Inject pre-loaded per-wave metric data for one greenery channel.
+        """Inject already-loaded per-temporal-key metric data for one channel.
 
-        Cross-sectional callers populate ``self.veg_data`` / ``self.terrain_data``
-        / ``self.ndvi_data`` via :meth:`load_metrics`. Mixed-effects callers
-        instead supply one metric source per wave for each channel (the runner
-        resolves each wave's file path against loaded results / uploads /
-        auto-download and hands the result here). ``per_wave_data`` maps every
-        wave label in the spec to either a ``GeoDataFrame`` (vector metric) or
-        the raster-dict layout ``load_metrics`` produces; the cache build then
-        consults the right per-wave source for each ``(entity_id, wave)`` row.
+        The streaming path (:meth:`set_longitudinal_metric_sources`) is what
+        the runner uses; this variant keeps callers that already hold every
+        source in memory working, and is convenient in tests. Sources passed
+        here are owned by the caller and never released by the engine.
         """
         if not self.is_longitudinal:
             raise RuntimeError(
@@ -463,27 +508,16 @@ class MetricFusionEngine:
                 f"Unknown channel {channel!r}; expected one of "
                 f"{longitudinal.GREENERY_CHANNELS}."
             )
-        spec = self.longitudinal_spec
-        assert spec is not None
-        missing = [w for w in spec.wave_labels if w not in per_wave_data]
-        if missing:
-            raise ValueError(
-                f"per_wave_data is missing entries for {channel!r} waves: {missing}."
-            )
-        if self._longitudinal_metric_data is None:
-            self._longitudinal_metric_data = {}
-        self._longitudinal_metric_data[channel] = dict(per_wave_data)
-        # Mirror to the cross-sectional attribute so any code path that
-        # still checks ``self.<channel>_data is None`` (e.g. the
-        # pre-aggregation entry guard) passes. The actual per-wave source
-        # is consulted via ``_longitudinal_metric_data``.
-        rep_source = per_wave_data[spec.wave_labels[0]]
-        if channel == "veg":
-            self.veg_data = rep_source
-        elif channel == "terrain":
-            self.terrain_data = rep_source
-        elif channel == "ndvi":
-            self.ndvi_data = rep_source
+        self._validate_temporal_coverage(per_wave_data)
+        existing = {}
+        if isinstance(self._metric_sources, metric_sources.PreloadedMetricSources):
+            existing = {
+                ch: {k: self._metric_sources.get(ch, k)
+                     for k in self._metric_sources.keys_for(ch)}
+                for ch in self._metric_sources.channels
+            }
+        existing[channel] = dict(per_wave_data)
+        self._metric_sources = metric_sources.PreloadedMetricSources(existing)
 
     def set_longitudinal_wave_frames(
         self, frames: list[tuple[str, gpd.GeoDataFrame]]
@@ -575,6 +609,12 @@ class MetricFusionEngine:
             outcome_col=outcome_col,
             covariate_cols=self.covariate_columns,
         )
+        # The per-file frames have been concatenated into ``long_gdf``; drop
+        # the engine's reference so their memory is reclaimed rather than held
+        # alongside the combined frame for the rest of the run.
+        target_input = None
+        self._longitudinal_wave_frames = None
+
         dropped = long_gdf.attrs.get("dropped_rows", {})
         if dropped:
             _log(
@@ -2703,19 +2743,21 @@ class MetricFusionEngine:
     ) -> bool:
         """Wave-aware variant of :meth:`precompute_aggregations`.
 
-        For each greenery channel the runner has already loaded a per-wave
-        metric source into ``self._longitudinal_metric_data[channel]``. This
-        method:
+        The runner registers one metric file per channel per temporal key
+        (measurement year, or wave label when waves are not date-derived).
+        This method:
 
-        - Groups waves by file fingerprint so identical-file waves share a
-          single compute pass (a static channel that reuses one file across
-          all waves only gets computed once).
-        - Registers wave aliases on the cache so every aliased wave's lookup
-          resolves to the same representative-wave storage.
-        - For each ``(channel, representative_wave)`` group, computes stats
-          for the entities whose row in the long-format target falls in any
-          wave of that group, and writes them to the cache under the
-          representative wave index.
+        - Groups temporal keys by which file they resolve to, so keys sharing
+          a file share a single compute pass (a static channel that reuses one
+          file across every key is computed once).
+        - Registers key aliases on the cache so every aliased key's lookup
+          resolves to the same representative-key storage. Stored rows stay
+          keyed by ``(entity, temporal key)``; aliasing only decides which
+          key's computation is reused, never which key's values are returned.
+        - For each ``(channel, representative key)`` group, computes stats for
+          the entities whose long-format rows fall in any key of that group,
+          writes them to the cache, then releases that group's file before
+          opening the next.
         """
         spec = self.longitudinal_spec
         assert spec is not None
@@ -2724,13 +2766,14 @@ class MetricFusionEngine:
                 "Pre-aggregation requires sample points; call prepare_fusion_data() "
                 "first."
             )
-        if self._longitudinal_metric_data is None or not all(
-            ch in self._longitudinal_metric_data
-            for ch in longitudinal.GREENERY_CHANNELS
+        provider = self._metric_sources
+        if provider is None or not all(
+            provider.has_channel(ch) for ch in longitudinal.GREENERY_CHANNELS
         ):
             raise ValueError(
-                "Longitudinal pre-aggregation requires per-wave metric data for "
-                "every channel; call set_longitudinal_metric_data() first."
+                "Longitudinal pre-aggregation requires per-wave metric sources "
+                "for every channel; call set_longitudinal_metric_sources() (or "
+                "set_longitudinal_metric_data()) first."
             )
 
         gvi_radii, ndvi_radii = self._preaggr_radii()
@@ -2744,14 +2787,15 @@ class MetricFusionEngine:
         )
         n_points = len(preaggr_gdf)
 
-        # Per-(channel, wave) source identity contributes to the fingerprint
-        # so changing any wave's file invalidates the cache.
+        # Per-(channel, temporal key) source identity contributes to the
+        # fingerprint so changing any key's file invalidates the cache. Taken
+        # from the file's path/size/mtime, not its contents, so fingerprinting
+        # does not have to open every file up front.
         fp_parts: list[str] = [f"geom:{geometry_sha256(preaggr_gdf)}"]
         for ch in longitudinal.GREENERY_CHANNELS:
             for wave_label in spec.wave_labels:
-                src = self._longitudinal_metric_data[ch][wave_label]
                 fp_parts.append(
-                    f"{ch}@{wave_label}:" + self._metric_fingerprint(src, ch)
+                    f"{ch}@{wave_label}:" + provider.identity(ch, wave_label)
                 )
         fp_parts.append(f"gvi:{gvi_radii}")
         fp_parts.append(f"ndvi:{ndvi_radii}")
@@ -2849,33 +2893,30 @@ class MetricFusionEngine:
         # data per group.
         processed = 0
         total_jobs = 0
-        plan: list[tuple[str, int, list[str], Any]] = (
-            []
-        )  # (channel, rep_wave_index, wave_labels_in_group, source)
+        # (channel, rep_key_index, temporal_keys_in_group, rep_key_label). The
+        # source itself is loaded inside the compute loop and released after,
+        # so the plan never pins every file in memory.
+        plan: list[tuple[str, int, list[str], str]] = []
         for ch in longitudinal.GREENERY_CHANNELS:
-            per_wave = self._longitudinal_metric_data[ch]
-            groups: dict[str, list[str]] = {}
-            for wave_label in spec.wave_labels:
-                key = self._metric_fingerprint(per_wave[wave_label], ch)
-                groups.setdefault(key, []).append(wave_label)
+            groups = provider.group_keys_by_identity(ch, spec.wave_labels)
 
             alias_map: dict[int, int] = {}
-            for group_waves in groups.values():
-                rep_label = group_waves[0]
+            for group_keys in groups.values():
+                rep_label = group_keys[0]
                 rep_idx = wave_index_of[rep_label]
-                for w in group_waves:
+                for w in group_keys:
                     alias_map[wave_index_of[w]] = rep_idx
-                plan.append((ch, rep_idx, group_waves, per_wave[rep_label]))
+                plan.append((ch, rep_idx, group_keys, rep_label))
             cache.register_wave_aliases(ch, alias_map)
             _log(
                 "INFO",
                 f"  {ch}: {len(groups)} unique file(s) across "
-                f"{len(spec.wave_labels)} wave(s) — "
+                f"{len(spec.wave_labels)} {self._temporal_key_noun()}(s) — "
                 f"{'static' if len(groups) == 1 else 'time-varying'}.",
             )
 
         # Pre-count the total work for the progress bar.
-        for ch, rep_idx, group_waves, _src in plan:
+        for ch, rep_idx, group_waves, _rep_label in plan:
             pending = cache.pending_entities_for(
                 ch, rep_idx, _eids_for_group(group_waves).tolist()
             )
@@ -2884,7 +2925,10 @@ class MetricFusionEngine:
             progress_callback(0, total_jobs)
 
         cancelled = False
-        for ch, rep_idx, group_waves, src in plan:
+        for ch, rep_idx, group_waves, rep_label in plan:
+            # Free the previous group's files before opening this group's, so
+            # only one (channel, temporal key) source is ever resident.
+            provider.release()
             if cancel_callback is not None and cancel_callback():
                 cancelled = True
                 break
@@ -2893,6 +2937,12 @@ class MetricFusionEngine:
             if not pending:
                 continue
 
+            src = provider.get(ch, rep_label)
+            _log(
+                "INFO",
+                f"  {ch} @ {self._temporal_key_noun()} "
+                f"{'/'.join(group_waves)}: {len(pending):,} entity(ies) to compute.",
+            )
             radii = cache.radii_for(ch)
             raster_array = transform = None
             tree = vals = None
@@ -3018,6 +3068,10 @@ class MetricFusionEngine:
                                 in_flight.add(ex.submit(_compute_one, nb))
             if cancelled:
                 break
+
+        # Nothing downstream reads the metric files again: per-trial values
+        # come from the cache.
+        provider.release()
 
         if cancelled:
             _log("WARN", "Longitudinal pre-aggregation cancelled (resumable).")
@@ -4128,10 +4182,10 @@ class MetricFusionEngine:
         perfectly well.
         """
         n_rows = len(entity_gdf)
-        per_wave = self._longitudinal_metric_data
+        provider = self._metric_sources
         waves = (
             entity_gdf["wave"].astype(str).to_numpy()
-            if (per_wave and "wave" in entity_gdf.columns)
+            if (provider is not None and "wave" in entity_gdf.columns)
             else None
         )
 
@@ -4147,61 +4201,68 @@ class MetricFusionEngine:
                 for ch in ("veg", "terrain", "ndvi")
             }
 
-        channels = ("veg", "terrain", "ndvi")
+        channels = longitudinal.GREENERY_CHANNELS
         out = {ch: np.full(n_rows, np.nan, dtype=np.float32) for ch in channels}
 
-        # Waves whose three sources are the same loaded objects are probed
-        # once together: the runner shares one object across waves that reuse
-        # a file, so probing them separately would repeat identical work.
-        groups: dict[tuple[int, ...], list[str]] = {}
-        for wave in dict.fromkeys(waves.tolist()):
-            key = tuple(id(per_wave.get(ch, {}).get(wave)) for ch in channels)
-            groups.setdefault(key, []).append(wave)
+        # Temporal keys resolving to the same files across all three channels
+        # are probed once together, so a channel that reuses one file across
+        # keys is not re-read per key.
+        present_keys = list(dict.fromkeys(waves.tolist()))
+        groups: dict[tuple[str, ...], list[str]] = {}
+        for key in present_keys:
+            ident = tuple(provider.identity(ch, key) for ch in channels)
+            groups.setdefault(ident, []).append(key)
 
         probed_total = 0
-        n_waves = len(dict.fromkeys(waves.tolist()))
         _log(
             "INFO",
             f"Probing veg / terrain / NDVI coverage across {len(pixels):,} "
-            f"unique pixel centroids — {len(groups)} distinct source set(s) "
-            f"over {n_waves} wave(s).",
+            f"unique pixel centroids — {len(groups)} distinct file set(s) "
+            f"over {len(present_keys)} {self._temporal_key_noun()}(s).",
         )
-        for group_waves in groups.values():
+        for group_keys in groups.values():
             row_mask = (
-                waves == group_waves[0]
-                if len(group_waves) == 1
-                else np.isin(waves, group_waves)
+                waves == group_keys[0]
+                if len(group_keys) == 1
+                else np.isin(waves, group_keys)
             )
             group_pix = np.unique(pix_idx[row_mask])
             if group_pix.size == 0:
                 continue
-            sources = {
-                ch: per_wave.get(ch, {}).get(group_waves[0]) for ch in channels
-            }
-            probe = self._sample_metrics_at_points(
-                pixels.iloc[group_pix][["geometry"]].copy(), sources, quiet=True
-            )
-            # Position of each row's pixel within ``group_pix``, mapping the
-            # probe result back onto this group's catchment rows.
-            slot = np.searchsorted(group_pix, pix_idx[row_mask])
+            try:
+                sources = provider.get_all(group_keys[0], channels)
+                probe = self._sample_metrics_at_points(
+                    pixels.iloc[group_pix][["geometry"]].copy(), sources, quiet=True
+                )
+                counts = {}
+                for ch in channels:
+                    vals = np.asarray(probe[ch].to_numpy(), dtype=np.float32)
+                    # Position of each row's pixel within ``group_pix``, mapping
+                    # the probe result back onto this group's catchment rows.
+                    out[ch][row_mask] = vals[
+                        np.searchsorted(group_pix, pix_idx[row_mask])
+                    ]
+                    counts[ch] = int(np.isfinite(vals).sum())
+            finally:
+                # Free this key's files before the next one is opened.
+                provider.release()
             probed_total += int(group_pix.size)
-            counts = {}
-            for ch in channels:
-                vals = np.asarray(probe[ch].to_numpy(), dtype=np.float32)
-                out[ch][row_mask] = vals[slot]
-                counts[ch] = int(np.isfinite(vals).sum())
             label = (
-                group_waves[0]
-                if len(group_waves) == 1
-                else f"{group_waves[0]}..{group_waves[-1]} ({len(group_waves)} waves)"
+                group_keys[0]
+                if len(group_keys) == 1
+                else f"{group_keys[0]}..{group_keys[-1]} ({len(group_keys)} keys)"
             )
             _log(
                 "OK" if any(counts.values()) else "WARN",
-                f"  wave {label}: {group_pix.size:,} pixel(s) probed — valid "
-                f"veg={counts['veg']:,} terrain={counts['terrain']:,} "
-                f"ndvi={counts['ndvi']:,}",
+                f"  {self._temporal_key_noun()} {label}: {group_pix.size:,} "
+                f"pixel(s) probed — valid veg={counts['veg']:,} "
+                f"terrain={counts['terrain']:,} ndvi={counts['ndvi']:,}",
             )
-        _log("INFO", f"Coverage probe sampled {probed_total:,} (pixel, wave-group) pairs.")
+        _log(
+            "INFO",
+            f"Coverage probe sampled {probed_total:,} "
+            f"(pixel, {self._temporal_key_noun()}) pairs.",
+        )
         return out
 
     def _sample_metrics_at_points(

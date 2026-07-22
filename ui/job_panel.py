@@ -46,7 +46,7 @@ _TERMINAL_LABELS = {
 }
 
 _RESTART_ELIGIBLE_TYPES = {"gvi", "gvi_column", "ndvi", "ndvi_column", "fusion"}
-_RESTART_ELIGIBLE_STATUSES = {"interrupted", "cancelled", "error"}
+_RESTART_ELIGIBLE_STATUSES = {"interrupted", "cancelled", "error", "completed"}
 
 
 def _fusion_results_bundle_path(rec) -> str | None:
@@ -467,7 +467,12 @@ def _render_job_card(rec, store) -> None:
                         "🔄",
                         key=f"restart_{rec.id}",
                         width="stretch",
-                        help="Restart — re-upload the original input geometry.",
+                        help=(
+                            "Re-run — reuse the finished result or recalculate "
+                            "from scratch."
+                            if rec.status == "completed"
+                            else "Restart — resume from where this job stopped."
+                        ),
                     ):
                         st.session_state[RESTART_SESSION_KEY] = rec.id
                         st.rerun()

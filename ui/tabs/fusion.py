@@ -385,6 +385,43 @@ def _fusion_restart_summary_lines(p: dict) -> list[str]:
     return lines
 
 
+def _fusion_preaggr_cache_files(p: dict, output_dir: str) -> list[str]:
+    """Pre-aggregation cache files belonging to this job's target.
+
+    The cache filename is ``preaggr-<target stem>-<config hash>.sqlite``, and
+    the hash is only known inside the engine, so every cache built from this
+    target is matched. Output files and result artefacts are never included —
+    this only covers recomputable intermediates.
+    """
+    target_path = p.get("target_path") or ""
+    stem = os.path.splitext(os.path.basename(str(target_path)))[0]
+    if not stem:
+        return []
+    preaggr_dir = os.path.join(output_dir, "fusion_cache", "preaggr")
+    if not os.path.isdir(preaggr_dir):
+        return []
+    return sorted(
+        os.path.join(preaggr_dir, n)
+        for n in os.listdir(preaggr_dir)
+        if n.startswith(f"preaggr-{stem}-") and n.endswith(".sqlite")
+    )
+
+
+def _purge_fusion_preaggr_cache(paths: list[str]) -> tuple[int, int]:
+    """Delete the given cache files; returns ``(removed, bytes_freed)``."""
+    removed = 0
+    freed = 0
+    for path in paths:
+        try:
+            size = os.path.getsize(path)
+            os.remove(path)
+            removed += 1
+            freed += size
+        except OSError:
+            continue
+    return removed, freed
+
+
 def _submit_fusion_restart(
     store,
     executor,
@@ -394,21 +431,27 @@ def _submit_fusion_restart(
     output_dir: str,
     veg_path: str | None,
     ndvi_path: str | None,
+    *,
+    resume: bool = True,
 ) -> None:
-    """Resubmit a fusion job with identical params; on-disk caches resume.
+    """Resubmit a fusion job with identical params.
 
-    The Optuna study (by ``study_name``), the per-job pre-aggregation cache (by
-    fingerprint), and the metric-download cache are all content-addressed, so a
-    same-config resubmit picks up where the previous run left off — the new job
-    just walks the stage ledger, with stages whose underlying caches are
-    populated completing near-instantly.
+    With ``resume`` (the default, and what a stopped job wants) the Optuna
+    study, the per-job pre-aggregation cache, and the metric-download cache are
+    all content-addressed, so the resubmit picks up where the previous run left
+    off — stages whose caches are populated complete near-instantly.
+
+    With ``resume=False`` the run starts a fresh study namespace, so the search
+    is performed again rather than continuing a study that already met its
+    trial budget. This is what a *completed* job needs in order to actually
+    recompute rather than finish instantly with the previous answer.
     """
     if _MetricFusionEngine is None:
         raise RuntimeError("MetricFusionEngine is unavailable; cannot restart.")
 
     new_params = dict(p)
     new_params["restart_of"] = rec.id
-    new_params["resume_existing_study"] = True
+    new_params["resume_existing_study"] = bool(resume)
 
     is_vector = bool(p.get("is_vector_target"))
     outcome_columns = list(p.get("outcome_columns") or [])
@@ -438,7 +481,7 @@ def _submit_fusion_restart(
     run_config = {
         k: p.get(k, _restart_defaults.get(k)) for k in _FUSION_RUN_CONFIG_KEYS
     }
-    run_config["resume_existing_study"] = True
+    run_config["resume_existing_study"] = bool(resume)
 
     new_rec = store.submit(type="fusion", name=rec.name, params=new_params)
     executor.submit_fusion_subprocess(
@@ -476,7 +519,9 @@ def _render_fusion_restart_panel(store, executor, output_dir: str) -> bool:
     is_vector = bool(p.get("is_vector_target"))
     expected_hash = p.get("geometry_sha256")
 
-    with st.expander(f"↻ Restart fusion job: {rec.name or rec.id}", expanded=True):
+    completed = rec.status == "completed"
+    title = "Re-run" if completed else "Restart"
+    with st.expander(f"↻ {title} fusion job: {rec.name or rec.id}", expanded=True):
         st.caption(
             "The Optuna study, pre-aggregation cache, and metric downloads "
             "are all content-addressed, so a same-config restart resumes "
@@ -485,6 +530,60 @@ def _render_fusion_restart_panel(store, executor, output_dir: str) -> bool:
         )
         for line in _fusion_restart_summary_lines(p):
             st.write(line)
+
+        # A finished job has already met its trial budget, so resuming its
+        # study would add no trials and return the previous answer. Make the
+        # choice explicit rather than defaulting to a run that does nothing.
+        resume = True
+        cache_files: list[str] = []
+        if completed:
+            st.divider()
+            mode = st.radio(
+                "This job already completed. What should the re-run do?",
+                options=("recalculate", "reproduce"),
+                format_func=lambda m: (
+                    "Recalculate — clear this target's pre-aggregation cache "
+                    "and search again"
+                    if m == "recalculate"
+                    else "Reproduce — reuse the finished study and regenerate "
+                    "outputs"
+                ),
+                key=f"f_restart_mode_{rec.id}",
+                horizontal=False,
+            )
+            resume = mode == "reproduce"
+            cache_files = (
+                _fusion_preaggr_cache_files(p, output_dir)
+                if mode == "recalculate"
+                else []
+            )
+            if mode == "recalculate":
+                if cache_files:
+                    total = sum(
+                        os.path.getsize(f) for f in cache_files if os.path.isfile(f)
+                    )
+                    st.warning(
+                        f"Will delete {len(cache_files)} pre-aggregation cache "
+                        f"file(s) ({total / 1024**2:.0f} MB) and rebuild them:"
+                    )
+                    for f in cache_files:
+                        st.caption(f"• `{os.path.basename(f)}`")
+                else:
+                    st.info(
+                        "No pre-aggregation cache found for this target — it "
+                        "will be built from scratch."
+                    )
+                st.caption(
+                    "Outputs and result artefacts from the previous run are "
+                    "left untouched; the new run writes to its own job folder."
+                )
+            else:
+                st.info(
+                    "Reuses the completed study, so the numbers will match the "
+                    "previous run. Pick **Recalculate** if you want the search "
+                    "performed again."
+                )
+            st.divider()
 
         # Silent-restart fast path: every recorded input file is still at
         # its original absolute path with the same fingerprint. Skip every
@@ -518,6 +617,12 @@ def _render_fusion_restart_panel(store, executor, output_dir: str) -> bool:
                     width="stretch",
                 ):
                     try:
+                        if cache_files:
+                            n, freed = _purge_fusion_preaggr_cache(cache_files)
+                            st.info(
+                                f"Cleared {n} cache file(s), freed "
+                                f"{freed / 1024**2:.0f} MB."
+                            )
                         _submit_fusion_restart(
                             store,
                             executor,
@@ -527,12 +632,13 @@ def _render_fusion_restart_panel(store, executor, output_dir: str) -> bool:
                             output_dir,
                             p.get("gvi_path"),
                             p.get("ndvi_path"),
+                            resume=resume,
                         )
                     except Exception as e:
                         st.error(f"Re-submission failed: {e}")
                         return True
                     st.session_state[RESTART_SESSION_KEY] = None
-                    st.success("Restart submitted. Monitor progress in the sidebar.")
+                    st.success("Re-run submitted. Monitor progress in the sidebar.")
                     st.rerun()
             return True
 
@@ -772,6 +878,11 @@ def _render_fusion_restart_panel(store, executor, output_dir: str) -> bool:
             if lon_payload_for_submit is not None:
                 p_for_submit["longitudinal_spec_payload"] = lon_payload_for_submit
             try:
+                if cache_files:
+                    n, freed = _purge_fusion_preaggr_cache(cache_files)
+                    st.info(
+                        f"Cleared {n} cache file(s), freed {freed / 1024**2:.0f} MB."
+                    )
                 _submit_fusion_restart(
                     store,
                     executor,
@@ -781,6 +892,7 @@ def _render_fusion_restart_panel(store, executor, output_dir: str) -> bool:
                     output_dir,
                     veg_path_re,
                     ndvi_path_re,
+                    resume=resume,
                 )
             except Exception as e:
                 st.error(f"Re-submission failed: {e}")
