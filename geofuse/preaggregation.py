@@ -9,11 +9,23 @@ written to a SQLite database so that each Optuna trial reads a single
 of recomputing circular-buffer aggregations — and so the work survives cancels
 and crashes and is reused by later runs with the same inputs.
 
-Schema (one table per channel)::
+Storage. The bulk stat values live in dense per-``(channel, representative
+wave)`` ``numpy.memmap`` files — shape ``(n_entities, n_radii, n_stats)``,
+``float32``, ``NaN`` for an entity with no imagery in range. A dense array is
+the natural container for a write-once / load-all payload: writes are a
+``memcpy`` by entity ordinal and the load is an ``mmap``, not a parse, so the
+on-disk size tracks the actual float32 footprint (no per-row key overhead).
+Entity id ↔ ordinal is fixed once at build start and stored in a sidecar.
 
-    <channel>(wave INTEGER, radius INTEGER, entity_id INTEGER,
-              mean REAL, p10 REAL, p20 REAL, ..., p90 REAL,
-              PRIMARY KEY (wave, radius, entity_id))
+A small SQLite database alongside the memmaps keeps only the bookkeeping: a
+``meta`` key/value table (fingerprint, ladders, stats, wave labels + aliases,
+schema version, completion, coverage signature) and ``done_channel_wave_entity``
+(which entities are fully written per ``(channel, wave)``), so a resumed build
+skips finished entities. Both tables are tiny next to the value payload.
+
+Values are greenery fractions rounded to four decimals. A complete cache is
+loaded into an in-memory structure at engine start
+(:mod:`geofuse.preaggr_memory`); per-trial lookups then read RAM, not disk.
 
 Cross-sectional callers use a single implicit wave (index 0) and do not need
 to pass wave info: ``write_batch`` and ``lookup`` default to that wave so
@@ -29,68 +41,66 @@ wave's rows are computed and written, and lookups for aliased waves
 transparently resolve to the representative.
 
 A ``meta`` key/value table records the data-config fingerprint, the radius
-ladders, the stat set, the wave labels + aliases, the entity count, the
-schema version, and a completion flag. A ``done_channel_wave_entity`` table
-records which entities are fully written per ``(channel, wave)``, so a
-resumed build skips them.
-
-Layout choice: ``wave`` and ``radius`` are *row* keys (not columns) so the
-column count per channel table stays at 12 regardless of how fine the radius
-ladder or how many waves there are — this avoids SQLite's per-table column
-cap on national-scale ladders while keeping ``WHERE wave = ? AND radius = ?``
-scans fast via the clustered primary key.
-
 The aggregation math is format-aware: vector (point) metrics use a ``BallTree``
 radius query; raster metrics use per-entity windowed reads with a circular mask.
 """
 
 from __future__ import annotations
 
+import gc
+import hashlib
 import json
+import os
 import threading
-from collections import OrderedDict
 from typing import Any
 
 import numpy as np
 
 from .persistence.sqlite_utils import open_wal_connection
 
+# Bumped when the on-disk greenery-cache layout changes so stale files are
+# ignored rather than mis-read.
+GREENERY_SCHEMA_VERSION = 1
+
 # Version 2 added the ``wave`` PK column and per-(channel, wave) completion
 # tracking. Version 3 moved raster aggregation onto buffered discs reprojected
-# into the raster CRS for every entity type; stored raster stats from earlier
-# versions came from pixel-grid distance math and are not comparable, so they
-# are reset rather than reused. Caches built under an older schema fail the
-# fingerprint check and are rebuilt on the next run.
-SCHEMA_VERSION = 3
+# into the raster CRS for every entity type. Version 5 moved the bulk stat
+# values from per-channel SQLite tables into dense per-(channel, wave) memmaps,
+# leaving only meta + completion tracking in SQLite. Stored stats from earlier
+# versions live in an incompatible layout, so they are reset rather than reused.
+# Caches built under an older schema fail the fingerprint check and rebuild.
+SCHEMA_VERSION = 5
 
 # Cross-sectional callers use this single implicit wave; longitudinal callers
 # pass an explicit ordered tuple of wave labels to the constructor.
 DEFAULT_WAVE_LABELS: tuple[str, ...] = ("",)
 DEFAULT_WAVE_INDEX = 0
 
-# Aggregation statistics stored per (entity, radius). ``mean`` plus the deciles
-# p10..p90; ``median`` is served from ``p50``.
-PERCENTILES: tuple[int, ...] = (10, 20, 30, 40, 50, 60, 70, 80, 90)
+# Aggregation statistics stored per (entity, radius): ``mean`` plus a compact
+# percentile set (p10, p25, p75, p90 and p50 for the median). The full decile
+# grid was mostly redundant for the search; this trims storage and the in-RAM
+# footprint. ``median`` is served from ``p50``.
+PERCENTILES: tuple[int, ...] = (10, 25, 50, 75, 90)
 STAT_COLUMNS: tuple[str, ...] = ("mean",) + tuple(f"p{p}" for p in PERCENTILES)
 CHANNELS: tuple[str, ...] = ("veg", "terrain", "ndvi")
 
 _N_STATS = len(STAT_COLUMNS)
-# Bounds on the in-memory column cache (each entry is one id + value column for
-# all entities at one (channel, wave, radius, stat)). The entry count keeps
-# repeated trial lookups cheap; the byte ceiling is what actually binds on a
-# large per-pixel grid, where a single column runs to megabytes.
-_COLUMN_CACHE_MAX = 1024
-_COLUMN_CACHE_MAX_BYTES = 256 * 1024 * 1024
+# Greenery metrics (GVI/NDVI) are fractions; four decimals is the useful
+# resolution, so stored values are rounded there. This drops noise digits (so
+# the on-disk REAL and the in-RAM float32 both represent the value cleanly) and
+# makes the cache marginally more compressible.
+_STORE_DECIMALS = 4
 
 
 def compute_all_stats(values: np.ndarray) -> np.ndarray:
-    """Return ``[mean, p10, p20, ..., p90]`` as float32; all-NaN if empty."""
+    """Return ``[mean, p10, p25, p50, p75, p90]`` as float32, rounded to four
+    decimals; all-NaN if empty."""
     if values.size == 0:
         return np.full(_N_STATS, np.nan, dtype=np.float32)
     out = np.empty(_N_STATS, dtype=np.float32)
     out[0] = float(values.mean())
     out[1:] = np.percentile(values, PERCENTILES)
-    return out
+    return np.round(out, _STORE_DECIMALS)
 
 
 def stat_to_column(stat: str, percentile: int | None) -> str | None:
@@ -309,6 +319,76 @@ def build_vector_index(metric_gdf, metric_crs, value_col: str):
         np.float64
     )
     return BallTree(xy), m[value_col].to_numpy(dtype=np.float32)
+
+
+def build_vector_index_multi(metric_gdf, metric_crs, value_cols: list[str]):
+    """Build one ``BallTree`` shared by several value columns of one metric.
+
+    ``veg`` and ``terrain`` are two attribute columns of the same GVI points,
+    so their geometry — and the expensive ``query_radius`` over it — is
+    identical. Indexing once over the rows valid in *every* requested column
+    lets a single query serve all of them. Returns ``(tree, {col: values})``
+    with each column's values aligned to the tree's points. Raises if the
+    shared valid set is empty.
+    """
+    from sklearn.neighbors import BallTree
+
+    m = metric_gdf.to_crs(metric_crs)
+    mask = np.ones(len(m), dtype=bool)
+    for col in value_cols:
+        mask &= m[col].notna().to_numpy()
+    m = m[mask]
+    if len(m) == 0:
+        raise ValueError(
+            f"pre-aggregation: no rows with all of {value_cols} present"
+        )
+    xy = np.column_stack([m.geometry.x.to_numpy(), m.geometry.y.to_numpy()]).astype(
+        np.float64
+    )
+    values = {col: m[col].to_numpy(dtype=np.float32) for col in value_cols}
+    return BallTree(xy), values
+
+
+def vector_batch_stats_multi(
+    tree: Any,
+    values_by_col: dict[str, np.ndarray],
+    batch_xy: np.ndarray,
+    radii_m: tuple[int, ...],
+) -> dict[str, np.ndarray]:
+    """Per-column disk stats sharing one radius query: ``{col: [n, n_radii,
+    n_stats]}``.
+
+    One ``query_radius`` at the max radius and one distance sort per point
+    serve every column — each column reduces the same ascending-radius
+    prefixes over its own values, so the expensive neighbourhood work is done
+    once for ``veg`` and ``terrain`` together.
+    """
+    cols = list(values_by_col)
+    n = len(batch_xy)
+    n_radii = len(radii_m)
+    out = {c: np.full((n, n_radii, _N_STATS), np.nan, dtype=np.float32) for c in cols}
+    if n == 0:
+        return out
+    radii_arr = np.asarray(radii_m, dtype=np.float64)
+    idx_arr, dist_arr = tree.query_radius(
+        batch_xy, r=float(radii_m[-1]), return_distance=True
+    )
+    for b in range(n):
+        neigh = idx_arr[b]
+        if len(neigh) == 0:
+            continue
+        order = np.argsort(dist_arr[b], kind="stable")
+        d_sorted = dist_arr[b][order]
+        neigh_sorted = neigh[order]
+        ends = np.searchsorted(d_sorted, radii_arr, side="right")
+        for c in cols:
+            v_sorted = values_by_col[c][neigh_sorted]
+            col_out = out[c]
+            for ri in range(n_radii):
+                end = int(ends[ri])
+                if end > 0:
+                    col_out[b, ri, :] = compute_all_stats(v_sorted[:end])
+    return out
 
 
 def vector_batch_stats(
@@ -712,8 +792,272 @@ def raster_batch_geometry_stats(
 # ---------------------------------------------------------------------------
 
 
+class GreeneryCache:
+    """Reusable per-year greenery pre-aggregation store, resident in RAM.
+
+    Each cache **unit** is one compact ``.npz`` in ``<cache_dir>/greenery/``
+    holding the veg / terrain / ndvi stat arrays for the pixels a run
+    references, keyed by a **stable global pixel id** (it encodes the pixel's
+    grid row/col, so the same physical pixel has the same id in every job).
+
+    A unit is identified by ``cfg_key = hash(veg/terrain/ndvi file identity,
+    grid spacing, metric CRS, stat set)`` — nothing about the target — so the
+    same greenery + grid is reused across jobs that change only the outcome,
+    covariates, or target file. Years that resolve to the same greenery files
+    share one unit automatically (dedup). The radius ladder lives *inside* the
+    file rather than in the key, so a unit built to a wider ladder is reused for
+    a job needing a subset of radii; a job needing a wider ladder rebuilds it.
+
+    Storage is compact — only the referenced pixels, no NaN padding — and the
+    whole unit is loaded into RAM once, so per-trial lookups are pure gathers
+    shared read-only across worker threads.
+    """
+
+    _CHANNELS = ("veg", "terrain", "ndvi")
+
+    def __init__(
+        self,
+        cache_dir: str,
+        *,
+        spacing_m: float,
+        crs_key: str,
+        stats: tuple[str, ...] = STAT_COLUMNS,
+    ) -> None:
+        self.dir = os.path.join(cache_dir, "greenery")
+        os.makedirs(self.dir, exist_ok=True)
+        self.spacing_m = float(spacing_m)
+        self.crs_key = str(crs_key)
+        self.stats = tuple(stats)
+        self._stat_index = {s: i for i, s in enumerate(self.stats)}
+        # cfg_key -> resident unit dict; wave_index -> cfg_key for lookups.
+        self._units: dict[str, dict] = {}
+        self._wave_unit: dict[int, str] = {}
+        self.n_bytes = 0
+
+    # ---------------------------------------------------------------- identity
+    def unit_key(self, veg_id: str, terrain_id: str, ndvi_id: str) -> str:
+        """Stable id for the greenery-file set + grid config (not the target)."""
+        raw = "|".join(
+            [
+                str(veg_id),
+                str(terrain_id),
+                str(ndvi_id),
+                f"sp={self.spacing_m:.6f}",
+                f"crs={self.crs_key}",
+                f"stats={','.join(self.stats)}",
+                f"schema={GREENERY_SCHEMA_VERSION}",
+            ]
+        )
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+    def _path(self, cfg_key: str) -> str:
+        return os.path.join(self.dir, f"greenery-{cfg_key}.npz")
+
+    def bind_wave(self, wave_index: int, cfg_key: str) -> None:
+        """Route lookups for ``wave_index`` to the unit ``cfg_key``."""
+        self._wave_unit[int(wave_index)] = cfg_key
+
+    def is_resident(self, cfg_key: str) -> bool:
+        return cfg_key in self._units
+
+    # ----------------------------------------------------------- reuse / build
+    def open_unit(
+        self,
+        cfg_key: str,
+        *,
+        gvi_radii: tuple[int, ...],
+        ndvi_radii: tuple[int, ...],
+        required_ids: np.ndarray,
+    ) -> tuple[tuple[int, ...], tuple[int, ...], np.ndarray]:
+        """Load a reusable file if one covers the job's radii, else start fresh.
+
+        Returns ``(effective_gvi_radii, effective_ndvi_radii, missing_ids)``:
+        the ladder that new pixels must be computed at (the file's, when reused,
+        so the unit stays uniform) and the referenced ids not yet stored.
+        """
+        gvi_radii = tuple(int(r) for r in gvi_radii)
+        ndvi_radii = tuple(int(r) for r in ndvi_radii)
+        required = np.asarray(required_ids, dtype=np.int64)
+
+        if cfg_key not in self._units:
+            loaded = self._try_load(self._path(cfg_key), gvi_radii, ndvi_radii)
+            if loaded is not None:
+                self._units[cfg_key] = loaded
+        unit = self._units.get(cfg_key)
+        if unit is not None:
+            missing = self._setdiff(required, unit["ids"])
+            return unit["gvi_radii"], unit["ndvi_radii"], missing
+
+        # No reusable file: build at the job's ladder.
+        self._units[cfg_key] = {
+            "ids": np.empty(0, np.int64),
+            "veg": np.empty((0, len(gvi_radii), len(self.stats)), np.float32),
+            "terrain": np.empty((0, len(gvi_radii), len(self.stats)), np.float32),
+            "ndvi": np.empty((0, len(ndvi_radii), len(self.stats)), np.float32),
+            "gvi_radii": gvi_radii,
+            "ndvi_radii": ndvi_radii,
+            "dirty": False,
+        }
+        return gvi_radii, ndvi_radii, required
+
+    def _try_load(
+        self, path: str, job_gvi: tuple[int, ...], job_ndvi: tuple[int, ...]
+    ) -> dict | None:
+        if not os.path.isfile(path):
+            return None
+        try:
+            with np.load(path, allow_pickle=False) as z:
+                meta = json.loads(str(z["meta"]))
+                if (
+                    meta.get("schema") != GREENERY_SCHEMA_VERSION
+                    or meta.get("stats") != list(self.stats)
+                    or str(meta.get("crs")) != self.crs_key
+                    or abs(float(meta.get("spacing", -1)) - self.spacing_m) > 1e-9
+                ):
+                    return None
+                fgvi = tuple(int(r) for r in meta["gvi_radii"])
+                fndvi = tuple(int(r) for r in meta["ndvi_radii"])
+                # The stored ladder must cover the job's requested radii.
+                if not (set(job_gvi) <= set(fgvi) and set(job_ndvi) <= set(fndvi)):
+                    return None
+                ids = np.ascontiguousarray(z["ids"], dtype=np.int64)
+                veg = np.ascontiguousarray(z["veg"], dtype=np.float32)
+                terrain = np.ascontiguousarray(z["terrain"], dtype=np.float32)
+                ndvi = np.ascontiguousarray(z["ndvi"], dtype=np.float32)
+        except Exception:
+            return None
+        unit = {
+            "ids": ids,
+            "veg": veg,
+            "terrain": terrain,
+            "ndvi": ndvi,
+            "gvi_radii": fgvi,
+            "ndvi_radii": fndvi,
+            "dirty": False,
+        }
+        self._account(unit)
+        return unit
+
+    def commit_unit(
+        self,
+        cfg_key: str,
+        new_ids: np.ndarray,
+        veg: np.ndarray,
+        terrain: np.ndarray,
+        ndvi: np.ndarray,
+        *,
+        persist: bool = True,
+    ) -> None:
+        """Merge freshly-computed pixels into the unit, keep it sorted by id,
+        and (optionally) write it to disk atomically."""
+        unit = self._units[cfg_key]
+        new_ids = np.asarray(new_ids, dtype=np.int64)
+        if new_ids.size:
+            unit["ids"] = np.concatenate([unit["ids"], new_ids])
+            unit["veg"] = np.concatenate(
+                [unit["veg"], np.asarray(veg, np.float32)], axis=0
+            )
+            unit["terrain"] = np.concatenate(
+                [unit["terrain"], np.asarray(terrain, np.float32)], axis=0
+            )
+            unit["ndvi"] = np.concatenate(
+                [unit["ndvi"], np.asarray(ndvi, np.float32)], axis=0
+            )
+            order = np.argsort(unit["ids"], kind="stable")
+            unit["ids"] = np.ascontiguousarray(unit["ids"][order])
+            for ch in self._CHANNELS:
+                unit[ch] = np.ascontiguousarray(unit[ch][order])
+            unit["dirty"] = True
+        if persist and unit.get("dirty"):
+            self._persist(cfg_key)
+            unit["dirty"] = False
+        self._account(unit)
+
+    def _persist(self, cfg_key: str) -> None:
+        unit = self._units[cfg_key]
+        meta = {
+            "schema": GREENERY_SCHEMA_VERSION,
+            "gvi_radii": list(unit["gvi_radii"]),
+            "ndvi_radii": list(unit["ndvi_radii"]),
+            "stats": list(self.stats),
+            "spacing": self.spacing_m,
+            "crs": self.crs_key,
+        }
+        path = self._path(cfg_key)
+        tmp = path + ".tmp"
+        np.savez(
+            tmp,
+            ids=unit["ids"],
+            veg=unit["veg"],
+            terrain=unit["terrain"],
+            ndvi=unit["ndvi"],
+            meta=np.array(json.dumps(meta)),
+        )
+        os.replace(tmp + ".npz", path)
+
+    # ------------------------------------------------------------------ lookup
+    def lookup(
+        self,
+        entity_ids: np.ndarray,
+        channel: str,
+        radius: int,
+        column: str,
+        *,
+        wave_index: int = DEFAULT_WAVE_INDEX,
+    ) -> np.ndarray | None:
+        """float32 values for ``entity_ids`` at one cell, or ``None`` if the
+        cell is not stored (caller falls back). Missing ids come back NaN."""
+        cfg = self._wave_unit.get(int(wave_index))
+        unit = self._units.get(cfg) if cfg is not None else None
+        if unit is None or channel not in self._CHANNELS:
+            return None
+        col_idx = self._stat_index.get(column)
+        if col_idx is None:
+            return None
+        ladder = unit["ndvi_radii"] if channel == "ndvi" else unit["gvi_radii"]
+        try:
+            r_idx = ladder.index(int(radius))
+        except ValueError:
+            return None
+        ids = unit["ids"]
+        req = np.asarray(entity_ids).astype(np.int64, copy=False)
+        out = np.full(req.shape[0], np.nan, dtype=np.float32)
+        if not ids.size:
+            return out
+        pos = np.clip(np.searchsorted(ids, req), 0, ids.size - 1)
+        valid = ids[pos] == req
+        out[valid] = unit[channel][pos[valid], r_idx, col_idx]
+        return out
+
+    def resident_ids(self, wave_index: int) -> np.ndarray | None:
+        cfg = self._wave_unit.get(int(wave_index))
+        unit = self._units.get(cfg) if cfg is not None else None
+        return None if unit is None else unit["ids"]
+
+    # -------------------------------------------------------------- utilities
+    @staticmethod
+    def _setdiff(required: np.ndarray, present: np.ndarray) -> np.ndarray:
+        if present.size == 0:
+            return required
+        return required[~np.isin(required, present)]
+
+    def _account(self, unit: dict) -> None:
+        self.n_bytes = sum(
+            u["ids"].nbytes + sum(u[c].nbytes for c in self._CHANNELS)
+            for u in self._units.values()
+        )
+
+    def close(self) -> None:
+        self._units.clear()
+        self._wave_unit.clear()
+        self.n_bytes = 0
+        gc.collect()
+
+
 class PreAggregationCache:
-    """SQLite-backed per-job pre-aggregation table with resume + fast lookup."""
+    """Per-job pre-aggregation store: dense ``float32`` memmaps hold the stat
+    values, a small SQLite database holds resume + meta, and lookup is an
+    id-keyed gather into the memmap."""
 
     def __init__(
         self,
@@ -738,19 +1082,100 @@ class PreAggregationCache:
         }
         self._conn = open_wal_connection(db_path)
         self._lock = threading.Lock()
-        self._col_cache: OrderedDict[tuple, Any] = OrderedDict()
-        self._col_cache_bytes: int = 0
-        # Memoized searchsorted positions per (requested-ids, channel, wave):
-        # the fusion optimizer re-reads the same fold row set for every trial
-        # and every (radius, stat) column of a channel wave shares one sorted
-        # entity-id vector, so the indexer is computed once per fold subset.
-        self._indexer_cache: OrderedDict[tuple, Any] = OrderedDict()
+        # Open value memmaps keyed by (channel, representative wave), plus the
+        # fixed entity-id ↔ ordinal map that indexes their first axis.
+        self._arrays: dict[tuple[str, int], np.memmap] = {}
+        self._entity_ids: np.ndarray | None = None
+        self._id_order: np.ndarray | None = None
+        self._sorted_ids: np.ndarray | None = None
+        self._n_entities: int = 0
         self._ensure_schema()
         self._restore_aliases_from_meta()
+        self._load_entity_ids()
 
     # -- channel/radius helpers ------------------------------------------------
     def radii_for(self, channel: str) -> tuple[int, ...]:
         return self.ndvi_radii if channel == "ndvi" else self.gvi_radii
+
+    # -- dense value storage (memmap) -----------------------------------------
+    def _ids_path(self) -> str:
+        return f"{self.db_path}.ids.npy"
+
+    def _array_path(self, channel: str, rep: int) -> str:
+        return f"{self.db_path}.{channel}.w{int(rep)}.f32"
+
+    def _load_entity_ids(self) -> None:
+        path = self._ids_path()
+        if os.path.isfile(path):
+            try:
+                self._set_entity_ids(np.load(path))
+            except Exception:
+                pass
+
+    def _set_entity_ids(self, ids: np.ndarray) -> None:
+        ids = np.asarray(ids, dtype=np.int64)
+        self._entity_ids = ids
+        self._n_entities = int(ids.shape[0])
+        # Sorted view + its permutation: a requested id searchsorts into the
+        # sorted ids, and the permutation maps that position back to the row
+        # ordinal in the dense array.
+        self._id_order = np.argsort(ids, kind="stable")
+        self._sorted_ids = ids[self._id_order]
+
+    def _ords_for(self, req: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Dense-array row ordinals for ``req`` ids, plus an ``in-grid`` mask."""
+        req = np.asarray(req, dtype=np.int64)
+        if self._sorted_ids is None or self._sorted_ids.size == 0:
+            return (
+                np.zeros(req.shape[0], np.int64),
+                np.zeros(req.shape[0], dtype=bool),
+            )
+        pos = np.searchsorted(self._sorted_ids, req)
+        pos = np.clip(pos, 0, self._sorted_ids.size - 1)
+        valid = self._sorted_ids[pos] == req
+        assert self._id_order is not None
+        return self._id_order[pos], valid
+
+    def _get_array(
+        self, channel: str, rep: int, *, create: bool = False
+    ) -> "np.memmap | None":
+        """The dense ``(n_entities, n_radii, n_stats)`` memmap for the cell.
+
+        Returns ``None`` when the file does not exist and ``create`` is false
+        (the cell was never written). A freshly created array is NaN-filled so
+        an entity with no imagery in range reads back NaN, not 0.
+        """
+        key = (channel, int(rep))
+        arr = self._arrays.get(key)
+        if arr is not None:
+            return arr
+        path = self._array_path(channel, int(rep))
+        shape = (self._n_entities, len(self.radii_for(channel)), _N_STATS)
+        if os.path.isfile(path):
+            arr = np.memmap(path, dtype=np.float32, mode="r+", shape=shape)
+        elif create and self._n_entities > 0:
+            arr = np.memmap(path, dtype=np.float32, mode="w+", shape=shape)
+            arr[:] = np.nan
+            arr.flush()
+        else:
+            return None
+        self._arrays[key] = arr
+        return arr
+
+    def read_dense(
+        self, channel: str, wave_index: int = DEFAULT_WAVE_INDEX
+    ) -> "tuple[np.ndarray, np.memmap] | None":
+        """``(entity_ids, values)`` for a whole ``(channel, wave)`` cell.
+
+        ``entity_ids`` are in dense-array row order; ``values`` is the memmap
+        itself (shape ``(n, n_radii, n_stats)``). ``None`` if never written.
+        Used by :mod:`geofuse.preaggr_memory` to mirror the store into RAM.
+        """
+        rep = self.resolve_wave(channel, wave_index)
+        arr = self._get_array(channel, rep)
+        if arr is None or self._entity_ids is None:
+            return None
+        return self._entity_ids, arr
 
     def wave_index_of(self, wave_label: str) -> int:
         try:
@@ -776,16 +1201,10 @@ class PreAggregationCache:
 
     # -- schema / meta ---------------------------------------------------------
     def _ensure_schema(self) -> None:
+        # Only the bookkeeping lives in SQLite now — the stat values are in the
+        # per-(channel, wave) memmaps.
         with self._lock:
             cur = self._conn
-            stat_cols = ", ".join(f"{c} REAL" for c in STAT_COLUMNS)
-            for ch in CHANNELS:
-                cur.execute(
-                    f"CREATE TABLE IF NOT EXISTS {ch} ("
-                    f"wave INTEGER NOT NULL, "
-                    f"radius INTEGER NOT NULL, entity_id INTEGER NOT NULL, "
-                    f"{stat_cols}, PRIMARY KEY (wave, radius, entity_id))"
-                )
             cur.execute(
                 "CREATE TABLE IF NOT EXISTS done_channel_wave_entity ("
                 "channel TEXT NOT NULL, wave INTEGER NOT NULL, "
@@ -837,23 +1256,62 @@ class PreAggregationCache:
     def is_complete(self) -> bool:
         return self.matches_fingerprint() and self._get_meta("complete") == "1"
 
-    def reset(self) -> None:
-        """Drop all rows + meta (used when the fingerprint changed)."""
+    def coverage_signature(self) -> str | None:
+        """Grid+config signature identifying which (pixel, wave) ids this cache
+        holds — used to reuse its coverage in the pre-aggregation gate. Set at
+        build time; independent of the referenced-pixel subset, so it can be
+        matched before the gate runs. ``None`` if never stored."""
+        return self._get_meta("coverage_signature")
+
+    def set_coverage_signature(self, signature: str) -> None:
         with self._lock:
-            for ch in CHANNELS:
-                self._conn.execute(f"DELETE FROM {ch}")
+            self._set_meta("coverage_signature", str(signature))
+            self._conn.commit()
+
+    def reset(self) -> None:
+        """Drop all values + meta (used when the fingerprint changed)."""
+        with self._lock:
             self._conn.execute("DELETE FROM done_channel_wave_entity")
             self._conn.execute("DELETE FROM meta")
-            self._col_cache.clear()
-            self._col_cache_bytes = 0
-            self._indexer_cache.clear()
+            # Release and delete every dense memmap plus the ordinal map.
+            for arr in self._arrays.values():
+                try:
+                    arr.flush()
+                except Exception:
+                    pass
+            self._arrays.clear()
+            for ch in CHANNELS:
+                for rep in range(len(self.wave_labels)):
+                    p = self._array_path(ch, rep)
+                    if os.path.isfile(p):
+                        try:
+                            os.remove(p)
+                        except OSError:
+                            pass
+            if os.path.isfile(self._ids_path()):
+                try:
+                    os.remove(self._ids_path())
+                except OSError:
+                    pass
+            self._entity_ids = None
+            self._id_order = None
+            self._sorted_ids = None
+            self._n_entities = 0
             # Restore identity alias map; aliases get re-registered by the
             # runner during the new build.
             self._wave_alias = {
                 (ch, i): i for ch in CHANNELS for i in range(len(self.wave_labels))
             }
 
-    def write_header(self, n_entities: int) -> None:
+    def write_header(self, entity_ids: Any) -> None:
+        """Record the build config and fix the entity id ↔ ordinal map.
+
+        ``entity_ids`` is the full ordered set of grid entity ids the dense
+        arrays are indexed by; every later write and lookup maps ids to rows
+        through it. A resume keeps the order already on disk so existing rows
+        stay addressable.
+        """
+        ids = np.asarray(entity_ids, dtype=np.int64)
         with self._lock:
             self._set_meta("schema_version", str(SCHEMA_VERSION))
             self._set_meta("fingerprint", self.fingerprint)
@@ -862,9 +1320,14 @@ class PreAggregationCache:
             self._set_meta("stat_columns", json.dumps(list(STAT_COLUMNS)))
             self._set_meta("percentiles", json.dumps(list(PERCENTILES)))
             self._set_meta("wave_labels", json.dumps(list(self.wave_labels)))
-            self._set_meta("n_entities", str(int(n_entities)))
+            self._set_meta("n_entities", str(int(ids.shape[0])))
             if self._get_meta("complete") is None:
                 self._set_meta("complete", "0")
+            # Keep any ordinal map already loaded from disk (resume); otherwise
+            # fix it now from the passed ids and persist it.
+            if self._entity_ids is None:
+                self._set_entity_ids(ids)
+                np.save(self._ids_path(), self._entity_ids)
 
     def mark_complete(self) -> None:
         with self._lock:
@@ -904,8 +1367,6 @@ class PreAggregationCache:
                 "wave_aliases",
                 json.dumps({k: v for k, v in merged.items() if v}),
             )
-            self._col_cache.clear()
-            self._col_cache_bytes = 0
 
     # -- resume ----------------------------------------------------------------
     def pending_entities_for(
@@ -992,50 +1453,34 @@ class PreAggregationCache:
             raise ValueError(
                 f"Unknown channel {channel!r}; expected one of {CHANNELS}."
             )
+        if self._entity_ids is None:
+            raise RuntimeError(
+                "write_channel_wave_batch called before write_header fixed the "
+                "entity ordinal map."
+            )
         rep = self.resolve_wave(channel, wave_index)
-        radii = self.radii_for(channel)
-        placeholders = ", ".join(["?"] * (3 + _N_STATS))
-        rows = []
-        for b, eid in enumerate(entity_ids):
-            for ri, r in enumerate(radii):
-                rows.append(
-                    (
-                        int(rep),
-                        int(r),
-                        int(eid),
-                        *(float(v) for v in stats[b, ri, :]),
-                    )
-                )
+        eids = np.asarray(entity_ids, dtype=np.int64)
+        vals = np.asarray(stats, dtype=np.float32)
+        ords, valid = self._ords_for(eids)
         with self._lock:
+            arr = self._get_array(channel, rep, create=True)
+            assert arr is not None
+            if valid.any():
+                arr[ords[valid]] = vals[valid]
+            # Flush the values before recording completion, so a crash can
+            # never leave an entity marked done with unwritten stats behind it.
+            arr.flush()
             self._conn.execute("BEGIN")
             try:
                 self._conn.executemany(
-                    f"INSERT OR REPLACE INTO {channel} "
-                    f"(wave, radius, entity_id, {', '.join(STAT_COLUMNS)}) "
-                    f"VALUES ({placeholders})",
-                    rows,
-                )
-                self._conn.executemany(
                     "INSERT OR IGNORE INTO done_channel_wave_entity "
                     "(channel, wave, entity_id) VALUES (?, ?, ?)",
-                    [(channel, int(rep), int(e)) for e in entity_ids],
+                    [(channel, int(rep), int(e)) for e in eids[valid]],
                 )
                 self._conn.execute("COMMIT")
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
-            # Invalidate any cached column reads / row indexers for this
-            # (channel, wave) — a write changes the stored entity-id set.
-            for key in list(self._col_cache.keys()):
-                if key[0] == channel and key[1] == rep:
-                    dropped = self._col_cache.pop(key, None)
-                    if dropped is not None:
-                        self._col_cache_bytes -= int(dropped[0].nbytes) + int(
-                            dropped[1].nbytes
-                        )
-            for key in list(self._indexer_cache.keys()):
-                if key[0] == channel and key[1] == rep:
-                    self._indexer_cache.pop(key, None)
 
     def write_batch(
         self, entity_ids: list[int], channel_stats: dict[str, np.ndarray]
@@ -1065,85 +1510,40 @@ class PreAggregationCache:
 
         ``wave_index`` defaults to 0 so cross-sectional callers can omit it.
         Aliased waves resolve to their representative transparently. Returns
-        ``None`` when the channel/column/radius is not stored (caller falls
-        back). Missing entities come back as NaN. A small LRU caches the full
-        column per ``(channel, wave, radius, column)`` so repeated trial
-        lookups avoid re-querying SQLite.
+        ``None`` when the ``(channel, wave)`` cell was never written (caller
+        falls back). An in-grid entity with no imagery in range comes back as
+        NaN; an id absent from the grid also comes back as NaN.
         """
         if channel not in CHANNELS or column not in STAT_COLUMNS:
             return None
         radius = int(radius)
-        if radius not in self.radii_for(channel):
+        radii = self.radii_for(channel)
+        if radius not in radii:
             return None
         rep = self.resolve_wave(channel, wave_index)
-
-        key = (channel, rep, radius, column)
         with self._lock:
-            entry = self._col_cache.get(key)
-            if entry is None:
-                rows = self._conn.execute(
-                    f"SELECT entity_id, {column} FROM {channel} "
-                    f"WHERE wave = ? AND radius = ?",
-                    (int(rep), radius),
-                ).fetchall()
-                if not rows:
-                    return None
-                ids = np.fromiter((r[0] for r in rows), dtype=np.int64, count=len(rows))
-                vals = np.fromiter(
-                    (np.nan if r[1] is None else r[1] for r in rows),
-                    dtype=np.float32,
-                    count=len(rows),
-                )
-                order = np.argsort(ids, kind="stable")
-                entry = (ids[order], vals[order])
-                self._col_cache[key] = entry
-                self._col_cache_bytes += int(ids.nbytes) + int(vals.nbytes)
-                while self._col_cache and (
-                    len(self._col_cache) > _COLUMN_CACHE_MAX
-                    or self._col_cache_bytes > _COLUMN_CACHE_MAX_BYTES
-                ):
-                    _, evicted = self._col_cache.popitem(last=False)
-                    self._col_cache_bytes -= int(evicted[0].nbytes) + int(
-                        evicted[1].nbytes
-                    )
-            else:
-                self._col_cache.move_to_end(key)
-            sorted_ids, sorted_vals = entry
+            arr = self._get_array(channel, rep)
+        if arr is None:
+            return None
+        ridx = radii.index(radius)
+        cidx = STAT_COLUMNS.index(column)
 
         req = np.asarray(entity_ids).astype(np.int64, copy=False)
         out = np.full(req.shape[0], np.nan, dtype=np.float32)
-        if not sorted_ids.size:
+        if self._sorted_ids is None or not self._sorted_ids.size:
             return out
-
-        # Row indexer: positions of ``req`` inside the channel wave's sorted
-        # entity ids. Callers re-read one fold's id vector for every trial and
-        # every (radius, stat) cell, so the entry is keyed on that array's
-        # identity and holds a reference to it — pinning the object means the
-        # id cannot be reused by a different array while the entry lives, and
-        # the stored array is re-checked on every hit.
-        ikey = (channel, rep, id(req))
-        indexer = None
-        with self._lock:
-            entry_idx = self._indexer_cache.get(ikey)
-            if entry_idx is not None:
-                held_req, held_ids, pos_clip, valid = entry_idx
-                if held_req is req and held_ids is sorted_ids:
-                    self._indexer_cache.move_to_end(ikey)
-                    indexer = (pos_clip, valid)
-        if indexer is None:
-            pos = np.searchsorted(sorted_ids, req)
-            pos_clip = np.clip(pos, 0, sorted_ids.size - 1)
-            valid = sorted_ids[pos_clip] == req
-            indexer = (pos_clip, valid)
-            with self._lock:
-                self._indexer_cache[ikey] = (req, sorted_ids, pos_clip, valid)
-                while len(self._indexer_cache) > 64:
-                    self._indexer_cache.popitem(last=False)
-        pos_clip, valid = indexer
-        out[valid] = sorted_vals[pos_clip[valid]]
+        ords, valid = self._ords_for(req)
+        if valid.any():
+            out[valid] = np.asarray(arr[ords[valid], ridx, cidx], dtype=np.float32)
         return out
 
     def close(self) -> None:
+        for arr in self._arrays.values():
+            try:
+                arr.flush()
+            except Exception:
+                pass
+        self._arrays.clear()
         try:
             self._conn.close()
         except Exception:

@@ -1383,6 +1383,7 @@ class NDVIEngine:
                     nodata=-9999,
                     build_overviews=False,
                     compress=True,
+                    dst_dtype="float32",
                 )
             except Exception as e:
                 _log("WARN", f"Cluster {cid} mosaic failed: {e}")
@@ -1578,6 +1579,7 @@ class NDVIEngine:
                     nodata=-9999,
                     build_overviews=False,
                     compress=True,
+                    dst_dtype="float32",
                 )
             except Exception:
                 if os.path.exists(out_path):
@@ -1798,6 +1800,7 @@ class NDVIEngine:
                     progress_cb=_mosaic_progress,
                     build_overviews=False,
                     compress=True,
+                    dst_dtype="float32",
                 )
 
                 _emit_ndvi_progress(

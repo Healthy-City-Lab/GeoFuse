@@ -45,10 +45,13 @@ degenerate value ``0.0`` so a bad trial fails soft instead of crashing.
 
 from __future__ import annotations
 
+import logging
 import warnings
 
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 MIXEDLM_METRICS: frozenset[str] = frozenset(
     {"mixedlm_tstat", "mixedlm_marginal_r2", "mixedlm_lr", "mixedlm_coef"}
@@ -63,6 +66,12 @@ HIGHER_IS_BETTER: frozenset[str] = MIXEDLM_METRICS
 
 # Metrics that produce a p-value (the greenery fixed-effect Wald test).
 HAS_PVALUE: frozenset[str] = frozenset({"mixedlm_tstat", "mixedlm_coef"})
+
+# Metrics the fast fixed-V GLS search scorer produces directly from one GLS
+# solve (the greenery coefficient and its Wald t). The variance-decomposition
+# metrics (marginal_r2, lr) need the full likelihood machinery, so a search on
+# those falls back to the exact per-trial fit.
+FAST_SEARCH_METRICS: frozenset[str] = frozenset({"mixedlm_tstat", "mixedlm_coef"})
 
 # Which model term the metric is computed on (what the search optimises the CGI
 # for). ``level`` is the greenery main effect (association with the outcome
@@ -334,6 +343,12 @@ def _compute_all_metrics(
 
     total_var = var_fe_full + re_var + sigma2_resid
     marginal_r2 = (var_fe_full - var_fe_no_g) / total_var if total_var > 0 else 0.0
+    # A proportion of variance explained can't be negative; tiny negatives are
+    # floating-point noise around zero, but a large one signals a real problem.
+    if marginal_r2 < 0.0:
+        if marginal_r2 < -1e-6:
+            logger.debug("marginal_r2 came back at %.3e; clamping to 0", marginal_r2)
+        marginal_r2 = 0.0
 
     lr_stat = 0.0
     if result_null is not None:
@@ -512,6 +527,321 @@ def score_mixedlm(
 
     score = all_metrics[metric]
     return (score, pval) if return_pvalue else score
+
+
+# ---------------------------------------------------------------------------
+# Fast fixed-V GLS search scorer (ranking only; reports use the exact fit)
+# ---------------------------------------------------------------------------
+#
+# The exact per-trial MixedLM fit re-estimates the whole variance-component
+# model on every trial when only the greenery column changes. Because the
+# random-effects covariance ``D`` and residual variance ``σ²`` are driven by
+# the outcome's within-entity structure — not by which greenery column is in
+# the design — they are estimated **once per fold** and reused, reducing each
+# trial to a GLS solve. This is a score-test / one-step estimator used only to
+# **rank** trials; every reported number is an exact MixedLM refit.
+#
+# Marginal covariance is block-diagonal by entity, ``V_i = Z_i D Z_i' + σ² I``
+# (blocks ``k×k`` with ``k`` the entity's observation count, typically 2-3).
+# Entities are bucketed by ``k``; each bucket's inverses are one batched
+# ``np.linalg.inv``; ``X'V^-1X`` / ``X'V^-1y`` accumulate with ``np.einsum``.
+#
+# Base-component estimators (``search_scoring_method``):
+#   ``mom``      — closed-form method of moments (fastest).
+#   ``mom_em1``  — MoM + 1 EM refinement step.
+#   ``mom_em3``  — MoM + 3 EM refinement steps (near-REML fidelity; default).
+#   ``reml``     — exact statsmodels REML fit of the base model.
+# (The engine's ``"exact"`` scoring option bypasses this module entirely and
+# fits a full MixedLM per trial via :func:`score_mixedlm`.)
+
+# Fast-scorer component methods that use the fixed-V GLS path (i.e. not the
+# per-trial exact fit).
+FAST_COMPONENT_METHODS: frozenset[str] = frozenset(
+    {"mom", "mom_em1", "mom_em3", "reml"}
+)
+_EM_STEPS: dict[str, int] = {"mom": 0, "mom_em1": 1, "mom_em3": 3}
+
+
+def _entity_blocks(eids: np.ndarray) -> dict[int, np.ndarray]:
+    """Row indices grouped by entity, bucketed by observation count ``k``.
+
+    Returns ``{k: idx}`` where ``idx`` is ``(m_k, k)`` — one row per entity,
+    its ``k`` observations. Same-``k`` entities share a stacked shape so their
+    covariance blocks invert in one batched call.
+    """
+    order = np.argsort(eids, kind="stable")
+    _u, first, counts = np.unique(eids[order], return_index=True, return_counts=True)
+    by_k: dict[int, list[np.ndarray]] = {}
+    for f, c in zip(first, counts):
+        by_k.setdefault(int(c), []).append(order[f : f + c])
+    return {k: np.asarray(v, dtype=np.int64) for k, v in by_k.items()}
+
+
+def _mom_components(
+    y: np.ndarray, Xb: np.ndarray, Z: np.ndarray, blocks: dict[int, np.ndarray]
+) -> tuple[np.ndarray, float]:
+    """Method-of-moments ``(D, σ²)`` from OLS residual products.
+
+    ``E[r_ij r_ik] = z_ij' D z_ik + σ² 1{j=k}``. Regressing the within-entity
+    residual products on that design gives ``D``'s unique entries and ``σ²`` in
+    one least-squares solve; ``D`` is projected to the nearest PSD matrix.
+    """
+    r_dim = Z.shape[1]
+    beta, *_ = np.linalg.lstsq(Xb, y, rcond=None)
+    resid = y - Xb @ beta
+    pairs = [(a, b) for a in range(r_dim) for b in range(a, r_dim)]
+    A_rows: list[np.ndarray] = []
+    b_rows: list[np.ndarray] = []
+    for k, gi in blocks.items():
+        rr = resid[gi]
+        Zi = Z[gi]
+        prod = np.einsum("ej,el->ejl", rr, rr).reshape(-1)
+        feats = []
+        for a, b in pairs:
+            za_zb = Zi[:, :, a][:, :, None] * Zi[:, :, b][:, None, :]
+            if a != b:
+                za_zb = za_zb + Zi[:, :, b][:, :, None] * Zi[:, :, a][:, None, :]
+            feats.append(za_zb.reshape(-1))
+        feats.append(np.broadcast_to(np.eye(k), (len(gi), k, k)).reshape(-1))
+        A_rows.append(np.column_stack(feats))
+        b_rows.append(prod)
+    coef, *_ = np.linalg.lstsq(np.vstack(A_rows), np.concatenate(b_rows), rcond=None)
+    D = np.zeros((r_dim, r_dim))
+    for (a, b), c in zip(pairs, coef[:-1]):
+        D[a, b] = D[b, a] = c
+    w, V = np.linalg.eigh(D)
+    D = V @ np.diag(np.clip(w, 1e-9, None)) @ V.T
+    return D, max(float(coef[-1]), 1e-9)
+
+
+def _block_vinv(
+    Z: np.ndarray, blocks: dict[int, np.ndarray], D: np.ndarray, s2: float
+) -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Per-bucket ``(row_index, Z_bucket, V^-1)`` for the given components."""
+    out = {}
+    for k, gi in blocks.items():
+        Zi = Z[gi]
+        Vi = np.einsum("mka,ab,mlb->mkl", Zi, D, Zi) + s2 * np.eye(k)
+        out[k] = (gi, Zi, np.linalg.inv(Vi))
+    return out
+
+
+def _gls_fixed_effects(
+    y: np.ndarray,
+    X: np.ndarray,
+    vinv: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]],
+) -> tuple[np.ndarray, np.ndarray]:
+    """GLS fixed-effect estimates ``beta`` and their standard errors."""
+    p = X.shape[1]
+    A = np.zeros((p, p))
+    b = np.zeros(p)
+    for _k, (gi, _Zi, Vv) in vinv.items():
+        Xi = X[gi]
+        yi = y[gi]
+        A += np.einsum("mka,mkl,mlb->ab", Xi, Vv, Xi)
+        b += np.einsum("mka,mkl,ml->a", Xi, Vv, yi)
+    A_inv = np.linalg.inv(A)
+    return A_inv @ b, np.sqrt(np.clip(np.diag(A_inv), 0.0, None))
+
+
+def _em_step(
+    y: np.ndarray,
+    Xb: np.ndarray,
+    Z: np.ndarray,
+    blocks: dict[int, np.ndarray],
+    D: np.ndarray,
+    s2: float,
+) -> tuple[np.ndarray, float]:
+    """One EM update of ``(D, σ²)`` (Laird-Ware), given the base design."""
+    vinv = _block_vinv(Z, blocks, D, s2)
+    beta, _ = _gls_fixed_effects(y, Xb, vinv)
+    rfull = y - Xb @ beta
+    r_dim = Z.shape[1]
+    Dacc = np.zeros((r_dim, r_dim))
+    ete = 0.0
+    tr = 0.0
+    m_tot = 0
+    n_tot = 0
+    for k, (gi, Zi, Vv) in vinv.items():
+        m = len(gi)
+        m_tot += m
+        n_tot += m * k
+        ri = rfull[gi]
+        ztv = np.einsum("mka,mkl->mal", Zi, Vv)
+        bpost = np.einsum("ab,mbl,ml->ma", D, ztv, ri)
+        M = np.einsum("mka,mkl,mlb->mab", Zi, Vv, Zi)
+        Vb = D[None] - np.einsum("ac,mcd,db->mab", D, M, D)
+        Dacc += np.einsum("ma,mb->ab", bpost, bpost) + Vb.sum(0)
+        e = ri - np.einsum("mka,ma->mk", Zi, bpost)
+        ete += float(np.sum(e**2))
+        tr += float(np.einsum("mka,mab,mkb->m", Zi, Vb, Zi).sum())
+    return Dacc / m_tot, max((ete + tr) / n_tot, 1e-9)
+
+
+def _reml_base_components(
+    y: np.ndarray, Xb: np.ndarray, eids: np.ndarray, Z: np.ndarray
+) -> tuple[np.ndarray, float]:
+    from statsmodels.regression.mixed_linear_model import MixedLM
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        res = MixedLM(endog=y, exog=Xb, groups=eids, exog_re=Z).fit(
+            method="lbfgs", reml=True
+        )
+    if not getattr(res, "converged", True):
+        raise RuntimeError("REML base fit did not converge")
+    return np.atleast_2d(np.asarray(res.cov_re)), float(res.scale)
+
+
+def _estimate_components(
+    y: np.ndarray,
+    Xb: np.ndarray,
+    eids: np.ndarray,
+    Z: np.ndarray,
+    blocks: dict[int, np.ndarray],
+    method: str,
+) -> tuple[np.ndarray, float]:
+    """Estimate ``(D, σ²)`` for one fold by the requested method."""
+    if method == "reml":
+        return _reml_base_components(y, Xb, eids, Z)
+    if method not in _EM_STEPS:
+        raise ValueError(f"Unknown component method {method!r}.")
+    D, s2 = _mom_components(y, Xb, Z, blocks)
+    for _ in range(_EM_STEPS[method]):
+        D, s2 = _em_step(y, Xb, Z, blocks, D, s2)
+    return D, s2
+
+
+def _fast_greenery_tstat(
+    y: np.ndarray,
+    X_full: np.ndarray,
+    Z: np.ndarray,
+    eids: np.ndarray,
+    D: np.ndarray,
+    s2: float,
+    target_col: int,
+) -> tuple[float, float]:
+    """Greenery ``(|t|, coef)`` via fixed-``V`` GLS on this trial's rows.
+
+    The block structure and inverses are rebuilt from this trial's rows, so
+    NaN-dropped trials are handled naturally.
+    """
+    blocks = _entity_blocks(eids)
+    vinv = _block_vinv(Z, blocks, D, s2)
+    beta, se = _gls_fixed_effects(y, X_full, vinv)
+    coef = float(beta[target_col])
+    s = float(se[target_col])
+    return (abs(coef / s) if s > 0 else 0.0), coef
+
+
+def estimate_fold_components(
+    outcome: np.ndarray,
+    covariates: np.ndarray | None,
+    years_since_baseline: np.ndarray,
+    entity_id: np.ndarray,
+    *,
+    method: str,
+    include_time_fixed: bool,
+    random_slope: bool,
+    target: str = DEFAULT_ASSOCIATION_TARGET,
+) -> tuple[np.ndarray, float] | None:
+    """Per-fold random-effects covariance ``D`` and residual variance ``σ²``.
+
+    Estimated once per fold from the greenery-free base model and reused by
+    every trial's :func:`score_mixedlm_fast`. Returns ``None`` when the fold is
+    degenerate or estimation fails (caller falls back to the exact per-trial
+    fit). ``method`` is one of :data:`FAST_COMPONENT_METHODS`.
+    """
+    y = np.asarray(outcome, dtype=np.float64)
+    t = np.asarray(years_since_baseline, dtype=np.float64)
+    cov = _coerce_2d(covariates)
+    # NaN-mask on the base inputs only (greenery excluded here).
+    g0 = np.zeros_like(y)
+    y, _g, eids, t, cov = _drop_nan(y, g0, entity_id, t, cov)
+    if len(y) < _MIN_ROWS or len(np.unique(eids)) < 2 or float(np.var(y)) == 0:
+        return None
+    base = _build_target_design(
+        _g, cov, t, eids, target=target,
+        include_time_fixed=include_time_fixed, include_target=False,
+    )
+    if base is None:
+        return None
+    X_base = base[0]
+    Z = _build_re_design(t, random_slope=random_slope)
+    try:
+        blocks = _entity_blocks(eids)
+        return _estimate_components(y, X_base, eids, Z, blocks, method)
+    except Exception:
+        return None
+
+
+def score_mixedlm_fast(
+    metric: str,
+    outcome: np.ndarray,
+    greenery: np.ndarray,
+    entity_id: np.ndarray,
+    years_since_baseline: np.ndarray,
+    covariates: np.ndarray | None,
+    *,
+    components: tuple[np.ndarray, float],
+    include_time_fixed: bool = True,
+    random_slope: bool = True,
+    return_pvalue: bool = False,
+    target: str = DEFAULT_ASSOCIATION_TARGET,
+    nan_on_fail: bool = False,
+):
+    """Fast greenery score for one trial via fixed-``V`` GLS.
+
+    Mirrors :func:`score_mixedlm`'s NaN masking and design, but reuses the
+    per-fold ``components`` (from :func:`estimate_fold_components`) and solves a
+    single GLS instead of fitting a ``MixedLM``. Supports the
+    :data:`FAST_SEARCH_METRICS` (``mixedlm_tstat`` / ``mixedlm_coef``); other
+    metrics must use the exact scorer. Spatial-confounding smooths are not
+    handled here — the caller uses the exact path when a smooth is active.
+    """
+
+    def _degenerate():
+        s = float("nan") if nan_on_fail else _DEGENERATE[metric]
+        return (s, float("nan") if nan_on_fail else 1.0) if return_pvalue else s
+
+    if metric not in FAST_SEARCH_METRICS:
+        return _degenerate()
+    D, s2 = components
+    y = np.asarray(outcome, dtype=np.float64)
+    g = np.asarray(greenery, dtype=np.float64)
+    t = np.asarray(years_since_baseline, dtype=np.float64)
+    cov = _coerce_2d(covariates)
+    y, g, eids, t, cov = _drop_nan(y, g, entity_id, t, cov)
+    if (
+        len(y) < _MIN_ROWS
+        or len(np.unique(eids)) < 2
+        or float(np.var(y)) == 0
+        or float(np.var(g)) == 0
+    ):
+        return _degenerate()
+    built = _build_target_design(
+        g, cov, t, eids, target=target,
+        include_time_fixed=include_time_fixed, include_target=True,
+    )
+    if built is None:
+        return _degenerate()
+    X_full, target_col = built
+    if target_col < 0:
+        return _degenerate()
+    Z = _build_re_design(t, random_slope=random_slope)
+    try:
+        tstat, coef = _fast_greenery_tstat(y, X_full, Z, eids, D, s2, target_col)
+    except Exception:
+        return _degenerate()
+    if not np.isfinite(tstat):
+        return _degenerate()
+    score = coef if metric == "mixedlm_coef" else tstat
+    if return_pvalue:
+        from scipy import stats as _sstats
+
+        pval = float(2.0 * _sstats.norm.sf(abs(tstat)))
+        return score, (pval if np.isfinite(pval) else 1.0)
+    return score
 
 
 # ---------------------------------------------------------------------------
@@ -853,14 +1183,27 @@ def cluster_bootstrap_metric_ci(
         "ci_level": float(ci_level),
         "method": "cluster_bootstrap",
         "n": int(len(y)),
+        "status": "ok",
     }
 
+    # The observed point estimate uses ``nan_on_fail=True`` so a non-converged
+    # or degenerate full-data fit surfaces as NaN, not a spurious ``0.0`` — the
+    # bootstrap replicates already do this, so both halves now agree.
     if metric in HAS_PVALUE:
-        obs, pval = _score(y, g, eid, t, cov, sb, return_pvalue=True)  # type: ignore[misc]
+        obs, pval = _score(  # type: ignore[misc]
+            y, g, eid, t, cov, sb, return_pvalue=True, nan_on_fail=True
+        )
         result["observed"] = float(obs)
         result["pvalue"] = float(pval)
     else:
-        result["observed"] = float(_score(y, g, eid, t, cov, sb))
+        result["observed"] = float(_score(y, g, eid, t, cov, sb, nan_on_fail=True))
+
+    # A failed observed fit has no point estimate, so emit no CI — reporting a
+    # bootstrap interval around a missing estimate is what produced CIs that
+    # excluded their own ``0.0`` point.
+    if not np.isfinite(result["observed"]):
+        result["status"] = "fit_failed"
+        return result
 
     uniq, inv = np.unique(eid, return_inverse=True)
     n_groups = len(uniq)

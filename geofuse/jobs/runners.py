@@ -1032,8 +1032,8 @@ def _load_longitudinal_metric_file(path: str, channel: str) -> Any:
             }
         if data is None:
             # A wave raster spanning widely separated study sites covers a huge
-            # extent at metric resolution but is almost entirely nodata; the
-            # dense band would not fit in RAM. Sample windows from disk instead.
+            # extent at metric resolution; the dense band would not fit in RAM.
+            # Sample windows from disk instead.
             data = LazyRasterArray(path, band=1)
             _log_fusion(
                 "INFO",
@@ -1271,11 +1271,21 @@ def _write_fusion_outputs(
             "display": disp,
             "channel": b.get("channel", "cgi"),
             "params": _clean_params(b.get("averaged_params") or b.get("best_params")),
-            "test_score": _f(tr.get("test_score")),
+            # A held-out mixed model that didn't converge has no honest score:
+            # report ``None``, not the degenerate 0.0 the scorer returns.
+            "test_score": (
+                None
+                if _ci(b).get("status") == "fit_failed"
+                else _f(tr.get("test_score"))
+            ),
             "test_ci": {
                 "lower": _f(_ci(b).get("lower")),
                 "upper": _f(_ci(b).get("upper")),
                 "method": _ci(b).get("method", "percentile"),
+                # "fit_failed" when the held-out mixed model did not converge —
+                # distinguishes a genuine null from a non-fit, so a 0.0 with a
+                # CI that excludes it is never reported as a real result.
+                "status": _ci(b).get("status", "ok"),
             },
             "direction": (
                 int(b["direction_sign"])
@@ -1641,6 +1651,7 @@ def run_fusion(
     spatial_adjust_max_df: int = 10,
     spatial_adjust_eps_m: float | None = None,
     residualize_method: str = "linear",
+    search_scoring_method: str = "mom_em3",
     n_bootstraps: int = 20,
     n_trials_per_bootstrap: int = 50,
     weight_bin_pct: int = 10,
@@ -1650,7 +1661,7 @@ def run_fusion(
     spatial_split: bool = False,
     spatial_block_size_m: float | None = None,
     n_spatial_blocks: int | None = None,
-    check_collinearity: bool = False,
+    check_collinearity: bool = True,
     vif_threshold: float = 10.0,
     report_ci_bootstrap: int | None = None,
     report_effects_bootstrap: int = 2000,
@@ -1762,6 +1773,7 @@ def run_fusion(
         run_config_record: dict[str, Any] = {
             "objective_metric": objective_metric,
             "residualize_method": str(residualize_method),
+            "search_scoring_method": str(search_scoring_method),
             "cgi_formula": cgi_formula,
             "covariate_columns": list(covariate_columns or []),
             "standalone_channels": list(standalones),
@@ -1944,6 +1956,7 @@ def run_fusion(
                 spatial_adjust_max_df=spatial_adjust_max_df,
                 spatial_adjust_eps_m=spatial_adjust_eps_m,
                 residualize_method=residualize_method,
+                search_scoring_method=search_scoring_method,
             )
 
             ctx.progress(
@@ -2192,6 +2205,31 @@ def run_fusion(
             if not completed or ctx.is_cancelled():
                 return {"output_paths": output_paths}
             stage(skey("preaggregate"), DONE)
+
+            # Pre-flight data sanity: an outcome or covariate whose SD dwarfs
+            # its inter-percentile spread is almost certainly corrupted
+            # (uncleaned sentinels, a units mix-up). Warn loudly so a bad input
+            # is caught before hours of fitting, but don't refuse — the user
+            # cleans inputs outside the toolbox and may know better.
+            try:
+                dispersion = engine.check_covariate_dispersion()
+                if dispersion["flagged"]:
+                    by_col = {c["column"]: c for c in dispersion["columns"]}
+                    detail = "; ".join(
+                        f"{c} (std={by_col[c]['std']:.3g} vs "
+                        f"p90−p10={by_col[c]['spread']:.3g})"
+                        for c in dispersion["flagged"]
+                    )
+                    _log_fusion(
+                        "WARN",
+                        f"[{label}] Data sanity: {len(dispersion['flagged'])} "
+                        f"column(s) have a standard deviation more than "
+                        f"{dispersion['spread_ratio']:.0f}× their p90−p10 spread — "
+                        f"likely corrupted input. Verify before trusting results: "
+                        f"{detail}.",
+                    )
+            except Exception as exc:
+                _log_fusion("WARN", f"[{label}] Dispersion sanity check failed: {exc}.")
 
             # Optional iterative-VIF collinearity check on the CGI grid
             # pixel values. Disabled channels get pinned to weight 0 in

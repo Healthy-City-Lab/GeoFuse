@@ -8,6 +8,7 @@ weighted combinations of NDVI and GVI metrics against target outcomes.
 import hashlib
 import logging
 import os
+import time
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -108,6 +109,7 @@ class MetricFusionEngine:
         spatial_adjust_max_df: int = 10,
         spatial_adjust_eps_m: float | None = None,
         residualize_method: str = "linear",
+        search_scoring_method: str = "mom_em3",
     ):
         """
         Initialize the fusion engine.
@@ -279,6 +281,13 @@ class MetricFusionEngine:
             )
         self.residualize_method: str = res_method
 
+        # Longitudinal search scorer. ``mom_em3`` (default) / ``mom_em1`` /
+        # ``mom`` / ``reml`` estimate the per-fold variance components for the
+        # fast fixed-V GLS trial scorer (see ``mixed_effects_scoring``);
+        # ``exact`` bypasses it and fits a full MixedLM per trial (the original
+        # behaviour). Reports always use the exact MixedLM refit regardless.
+        self.search_scoring_method: str = str(search_scoring_method)
+
         # Longitudinal / mixed-effects spec. ``None`` keeps the engine in
         # cross-sectional mode (no behaviour change). When set, every code
         # path that today threads a single per-entity row through Optuna
@@ -374,12 +383,27 @@ class MetricFusionEngine:
         # on it so an entry can never be served for a different row set.
         self._split_generation: int = 0
 
+        # Trial-level parallelism for the stability search. Each bootstrap's
+        # trials run in this many threads inside ``study.optimize(n_jobs=...)``,
+        # sharing the RAM-resident pre-aggregation (``_preaggr_mem``) read-only
+        # — so lookups are lock-free array gathers and the numpy/GLS work
+        # releases the GIL. Applied only on the longitudinal fast-GLS path where
+        # the per-fold caches take idempotent writes; the exact-fit and
+        # cross-sectional paths keep OrderedDict scoring caches whose LRU
+        # eviction is not thread-safe, so they run single-threaded (see
+        # ``_search_n_jobs``). Starting point: 4 workers.
+        self._search_workers: int = max(1, min((os.cpu_count() or 1), 4))
+
         # Spatial pre-aggregation (mandatory; built by precompute_aggregations()).
         # Backed by an on-disk SQLite cache (geofuse/preaggregation.py) so the
         # per-(entity, radius) stat table survives cancels/crashes and is reused
         # across runs.
         self._preaggregation_done: bool = False
         self._preaggr_cache: preaggregation.PreAggregationCache | None = None
+        # RAM-resident mirror of the complete cache (geofuse/preaggr_memory.py);
+        # every per-trial lookup reads this instead of SQLite. Loaded once at
+        # engine start; shared read-only across worker threads.
+        self._preaggr_mem = None
         # Unique-pixel source for the pre-aggregation cache. Point/line targets
         # duplicate each catchment pixel per overlapping entity for scoring, but
         # a pixel's per-radius stats are identical across those duplicates, so
@@ -402,6 +426,9 @@ class MetricFusionEngine:
         # the check wasn't requested). Stored so the runner can hand it to
         # the results UI without re-running the analysis.
         self._collinearity_report: dict | None = None
+        # Outcome / covariate dispersion sanity report from the most recent
+        # pre-flight check (or ``None`` if it hasn't run yet).
+        self._dispersion_report: dict | None = None
 
         # Vector vs raster (``is_points`` kept for backward compatibility = vector target)
         self.is_raster = target_path_is_raster(target_file)
@@ -1892,6 +1919,26 @@ class MetricFusionEngine:
             return 0.0
         return float(n_pts) * float(per_point) * 8.0
 
+    def _search_n_jobs(self, metric: str) -> int:
+        """Thread count for ``study.optimize`` — parallel only where it's safe.
+
+        Trial-level parallelism is enabled only when the longitudinal fast-GLS
+        scorer is active for this metric: there, all trials of a bootstrap share
+        one fold, so the per-fold caches (fold statics, fast components, the
+        lock-protected pre-aggregation cache) take idempotent writes and the
+        numpy GLS releases the GIL. The exact-fit path and the cross-sectional
+        OLS/pdcor path use OrderedDict scoring caches whose LRU eviction races
+        under threads, so they stay single-threaded.
+        """
+        fast_active = (
+            self.is_longitudinal
+            and metric in mixed_effects_scoring.FAST_SEARCH_METRICS
+            and self.search_scoring_method
+            in mixed_effects_scoring.FAST_COMPONENT_METHODS
+            and self.spatial_adjust_method == "none"
+        )
+        return max(1, int(self._search_workers)) if fast_active else 1
+
     def _clear_ring_caches(self) -> None:
         self._ring_raster_cache.clear()
         self._ring_vector_cache.clear()
@@ -2166,8 +2213,12 @@ class MetricFusionEngine:
                 self._expand_categorical_covariates()
 
         # Only the point/line per-pixel path dedups the cache to unique pixels;
-        # reset here so a re-prepared study can't inherit a stale source.
+        # reset here so a re-prepared study can't inherit a stale source. The
+        # RAM mirror is dropped too so precompute reloads it for the new run.
         self._preaggr_entity_gdf = None
+        if self._preaggr_mem is not None:
+            self._preaggr_mem.close()
+            self._preaggr_mem = None
         if self.is_polygon_target:
             _log("INFO", "Target type: POLYGON (per-pixel CGI)")
             df = self._prepare_polygon_fusion()
@@ -2182,7 +2233,54 @@ class MetricFusionEngine:
                 else self._prepare_raster_fusion()
             )
         self._compute_channel_scale(df)
+        # RAM management: narrow the resident per-pixel frames' dtypes (wave
+        # string -> category, 64-bit -> 32-bit) before the search + the RAM
+        # cache load. On a 36M-row per-pixel panel this frees several GB.
+        df = self._downcast_fusion_dtypes(df)
+        self._downcast_target_gdf_dtypes()
+        import gc as _gc
+
+        _gc.collect()
         return df
+
+    @staticmethod
+    def _downcast_fusion_dtypes(df: "pd.DataFrame") -> "pd.DataFrame":
+        """Narrow a fusion/panel frame's column dtypes in place-ish.
+
+        ``wave`` (year strings) -> category; float64 -> float32; int64 -> the
+        smallest signed int that holds the column. Geometry and already-narrow
+        columns are left untouched. Returns the same frame.
+        """
+        if df is None or len(df) == 0:
+            return df
+        for col in df.columns:
+            if col == "geometry":
+                continue
+            try:
+                s = df[col]
+                dt = s.dtype
+                if col == "wave" and dt == object:
+                    df[col] = s.astype("category")
+                elif dt == np.float64:
+                    df[col] = s.astype(np.float32)
+                elif dt == np.int64:
+                    lo, hi = int(s.min()), int(s.max())
+                    for t in (np.int16, np.int32):
+                        if np.iinfo(t).min <= lo and hi <= np.iinfo(t).max:
+                            df[col] = s.astype(t)
+                            break
+            except Exception:
+                continue  # leave the column as-is on any edge case
+        return df
+
+    def _downcast_target_gdf_dtypes(self) -> None:
+        """Apply the same narrowing to the resident ``target_gdf`` (and the
+        unique-pixel source), which the search keeps in memory alongside the
+        RAM cache."""
+        if self.target_gdf is not None:
+            self._downcast_fusion_dtypes(self.target_gdf)
+        if self._preaggr_entity_gdf is not None:
+            self._downcast_fusion_dtypes(self._preaggr_entity_gdf)
 
     def _compute_channel_scale(self, fusion_df: pd.DataFrame) -> None:
         """Fix per-channel [0, 1] min-max bounds from the predictor distribution.
@@ -2385,6 +2483,76 @@ class MetricFusionEngine:
             )
         return self._collinearity_report
 
+    def check_covariate_dispersion(
+        self,
+        *,
+        data: "pd.DataFrame | None" = None,
+        spread_ratio: float = 20.0,
+    ) -> dict:
+        """Flag outcome / covariate columns whose spread looks corrupted.
+
+        For the outcome and each covariate column, compares the standard
+        deviation against the robust inter-percentile spread ``p90 - p10``.
+        A column where ``std > spread_ratio × (p90 - p10)`` has a bulk that
+        sits in a narrow band while a handful of extreme values (uncleaned
+        sentinels, a units mix-up, a decimal-point error) blow up the SD — the
+        signature of an input that will produce meaningless standard errors.
+
+        Returns a report dict with a per-column table and a ``flagged`` list.
+        Does not raise or drop anything: the caller decides how loudly to warn.
+        """
+        if data is not None:
+            df = data
+        elif self.target_gdf is not None:
+            df = self.target_gdf
+        else:
+            frames = [
+                f
+                for f in (self.train_val_data, self.test_data)
+                if f is not None
+            ]
+            df = pd.concat(frames, ignore_index=False) if frames else None
+        if df is None:
+            return {"columns": [], "flagged": [], "spread_ratio": float(spread_ratio)}
+
+        cols = [self.target_feature, *self.covariate_columns]
+        seen: set[str] = set()
+        table: list[dict] = []
+        flagged: list[str] = []
+        for col in cols:
+            if not col or col in seen or col not in df.columns:
+                continue
+            seen.add(col)
+            vals = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=np.float64)
+            vals = vals[np.isfinite(vals)]
+            if vals.size < 2:
+                continue
+            std = float(np.std(vals, ddof=0))
+            p10, p90 = (float(x) for x in np.percentile(vals, [10, 90]))
+            spread = p90 - p10
+            is_outcome = col == self.target_feature
+            bad = std > spread_ratio * spread
+            entry = {
+                "column": col,
+                "role": "outcome" if is_outcome else "covariate",
+                "std": std,
+                "p10": p10,
+                "p90": p90,
+                "spread": spread,
+                "flagged": bool(bad),
+            }
+            table.append(entry)
+            if bad:
+                flagged.append(col)
+
+        report = {
+            "columns": table,
+            "flagged": flagged,
+            "spread_ratio": float(spread_ratio),
+        }
+        self._dispersion_report = report
+        return report
+
     def precompute_aggregations(
         self,
         progress_callback: Callable[[int, int], None] | None = None,
@@ -2474,7 +2642,7 @@ class MetricFusionEngine:
 
         if not cache.matches_fingerprint():
             cache.reset()
-        cache.write_header(n_points)
+        cache.write_header(np.asarray(preaggr_gdf.index, dtype=np.int64))
 
         _log(
             "INFO",
@@ -2730,6 +2898,14 @@ class MetricFusionEngine:
             return False
 
         cache.mark_complete()
+        # Record the grid+config coverage signature so a later run's coverage
+        # gate can reuse this cache's (pixel, wave) coverage without re-sampling.
+        try:
+            sig = self._coverage_signature()
+            if sig is not None:
+                cache.set_coverage_signature(sig)
+        except Exception:
+            pass
         self._preaggr_cache = cache
         self._preaggregation_done = True
         _log("OK", f"Pre-aggregation complete for {n_points:,} entities.")
@@ -2825,15 +3001,26 @@ class MetricFusionEngine:
                 f"Reusing longitudinal pre-aggregation cache "
                 f"({n_points:,} rows): {db_path}",
             )
+            # Backfill the coverage signature onto an already-complete cache so
+            # the next run's coverage gate can reuse it (older caches predate it).
+            try:
+                if cache.coverage_signature() is None:
+                    sig = self._coverage_signature()
+                    if sig is not None:
+                        cache.set_coverage_signature(sig)
+            except Exception:
+                pass
             self._preaggr_cache = cache
             self._preaggregation_done = True
+            # Reused cache: load it straight into RAM for the search.
+            self._ensure_memory_loaded()
             if progress_callback is not None:
                 progress_callback(n_points, n_points)
             return True
 
         if not cache.matches_fingerprint():
             cache.reset()
-        cache.write_header(n_points)
+        cache.write_header(np.asarray(preaggr_gdf.index, dtype=np.int64))
 
         _log(
             "INFO",
@@ -2925,6 +3112,15 @@ class MetricFusionEngine:
             progress_callback(0, total_jobs)
 
         cancelled = False
+        # Per-stage wall-clock accounting so a slow build is attributable
+        # (raster reads vs vector queries vs the SQLite write) in the log.
+        stage_secs = {"vector_agg": 0.0, "raster_agg": 0.0, "sqlite_write": 0.0}
+        build_t0 = time.perf_counter()
+        # Index plan entries so a veg pass can find its terrain twin (same rep
+        # and temporal group) and co-process both from one shared BallTree.
+        plan_rep_label = {(c, ri, tuple(gw)): rl for (c, ri, gw, rl) in plan}
+        done_shared: set[tuple] = set()
+
         for ch, rep_idx, group_waves, rep_label in plan:
             # Free the previous group's files before opening this group's, so
             # only one (channel, temporal key) source is ever resident.
@@ -2932,23 +3128,23 @@ class MetricFusionEngine:
             if cancel_callback is not None and cancel_callback():
                 cancelled = True
                 break
-            group_eids = _eids_for_group(group_waves).tolist()
-            pending = cache.pending_entities_for(ch, rep_idx, group_eids)
-            if not pending:
-                continue
+            gw_key = tuple(group_waves)
+            if (ch, rep_idx, gw_key) in done_shared:
+                continue  # already written alongside its shared veg twin
 
-            src = provider.get(ch, rep_label)
-            _log(
-                "INFO",
-                f"  {ch} @ {self._temporal_key_noun()} "
-                f"{'/'.join(group_waves)}: {len(pending):,} entity(ies) to compute.",
-            )
             radii = cache.radii_for(ch)
             raster_array = transform = None
             tree = vals = None
+            vals_by_col: dict[str, np.ndarray] | None = None
             metric_utm = None
             col = ""
             utm_to_raster_lon = None
+            cell_buffer_lon = 0.0
+            # Channels written this pass → their representative wave. A shared
+            # veg/terrain pass writes both from one query.
+            write_targets: dict[str, int] = {ch: rep_idx}
+
+            src = provider.get(ch, rep_label)
             if isinstance(src, dict):  # raster source
                 # Raster metrics always sample through buffered discs
                 # reprojected into the raster's CRS, whatever the entity
@@ -2962,58 +3158,161 @@ class MetricFusionEngine:
                         utm_crs, src["crs"], always_xy=True
                     )
                 kind = "raster_geometry"
-            else:
+            elif all_points:
                 col = self._metric_value_column(src, ch)
-                if all_points:
+                twin_label = (
+                    plan_rep_label.get(("terrain", rep_idx, gw_key))
+                    if ch == "veg"
+                    else None
+                )
+                same_file = False
+                if twin_label is not None:
+                    try:
+                        vpath = provider.path("veg", rep_label)
+                        same_file = (
+                            vpath is not None
+                            and vpath == provider.path("terrain", twin_label)
+                        )
+                    except Exception:
+                        same_file = False
+                shared = False
+                if same_file:
+                    # veg and terrain are two columns of one GVI file → one
+                    # BallTree over the shared point geometry, one radius query
+                    # reduced over each column.
+                    src_t = provider.get("terrain", twin_label)
+                    col_t = self._metric_value_column(src_t, "terrain")
+                    v_utm = src.to_crs(utm_crs)
+                    v_utm = v_utm[v_utm[col].notna()].reset_index(drop=True)
+                    t_utm = src_t.to_crs(utm_crs)
+                    t_utm = t_utm[t_utm[col_t].notna()].reset_index(drop=True)
+                    vx = v_utm.geometry.x.to_numpy()
+                    vy = v_utm.geometry.y.to_numpy()
+                    tx = t_utm.geometry.x.to_numpy()
+                    ty = t_utm.geometry.y.to_numpy()
+                    if (
+                        len(vx) == len(tx)
+                        and len(vx) > 0
+                        and np.array_equal(vx, tx)
+                        and np.array_equal(vy, ty)
+                    ):
+                        from sklearn.neighbors import BallTree
+
+                        tree = BallTree(
+                            np.column_stack([vx, vy]).astype(np.float64)
+                        )
+                        vals_by_col = {
+                            "veg": v_utm[col].to_numpy(dtype=np.float32),
+                            "terrain": t_utm[col_t].to_numpy(dtype=np.float32),
+                        }
+                        write_targets["terrain"] = rep_idx
+                        done_shared.add(("terrain", rep_idx, gw_key))
+                        shared = True
+                        _log(
+                            "INFO",
+                            f"  veg+terrain @ {self._temporal_key_noun()} "
+                            f"{'/'.join(group_waves)}: shared BallTree over "
+                            f"{len(vx):,} points (one radius query for both).",
+                        )
+                if shared:
+                    kind = "vector_point_shared"
+                else:
                     tree, vals = preaggregation.build_vector_index(src, utm_crs, col)
                     kind = "vector_point"
-                else:
-                    metric_utm = src.to_crs(utm_crs)
-                    metric_utm = metric_utm[metric_utm[col].notna()].reset_index(
-                        drop=True
-                    )
-                    cell_buffer_lon = preaggregation.metric_cell_buffer_m(metric_utm)
-                    _log(
-                        "INFO",
-                        f"  {ch}: vector metric detected — cell-buffer = "
-                        f"{cell_buffer_lon:.1f} m (sqrt(2)/2 × detected grid spacing).",
-                    )
-                    kind = "vector_geometry"
+            else:
+                col = self._metric_value_column(src, ch)
+                metric_utm = src.to_crs(utm_crs)
+                metric_utm = metric_utm[metric_utm[col].notna()].reset_index(drop=True)
+                cell_buffer_lon = preaggregation.metric_cell_buffer_m(metric_utm)
+                _log(
+                    "INFO",
+                    f"  {ch}: vector metric detected — cell-buffer = "
+                    f"{cell_buffer_lon:.1f} m (sqrt(2)/2 × detected grid spacing).",
+                )
+                kind = "vector_geometry"
+
+            # Pending is the union of the channels written this pass (identical
+            # for a fresh build; a union only differs on an interrupted resume).
+            group_eids = _eids_for_group(group_waves).tolist()
+            pending = sorted(
+                {
+                    int(e)
+                    for c, r in write_targets.items()
+                    for e in cache.pending_entities_for(c, r, group_eids)
+                }
+            )
+            if not pending:
+                continue
+            _log(
+                "INFO",
+                f"  {'+'.join(write_targets)} @ {self._temporal_key_noun()} "
+                f"{'/'.join(group_waves)}: {len(pending):,} entity(ies) to compute.",
+            )
 
             # Geometry-path batches stay small so the between-batch cancel
             # check fires often; the vectorised BallTree path can stay large.
-            batch_size = 1024 if kind == "vector_point" else 128
+            batch_size = (
+                1024 if kind in ("vector_point", "vector_point_shared") else 128
+            )
             batches = [
                 pending[i : i + batch_size] for i in range(0, len(pending), batch_size)
             ]
 
-            def _compute_one(bids: list[int]):
+            agg_stage = "raster_agg" if kind == "raster_geometry" else "vector_agg"
+
+            def _compute_one(
+                bids: list[int],
+                *,
+                kind=kind,
+                tree=tree,
+                vals=vals,
+                vals_by_col=vals_by_col,
+                radii=radii,
+                col=col,
+                metric_utm=metric_utm,
+                cell_buffer_lon=cell_buffer_lon,
+                raster_array=raster_array,
+                transform=transform,
+                utm_to_raster_lon=utm_to_raster_lon,
+                ch=ch,
+            ):
                 bpos = np.fromiter(
                     (pos_of[int(e)] for e in bids), dtype=np.int64, count=len(bids)
                 )
-                if kind == "vector_point":
-                    stats = preaggregation.vector_batch_stats(
-                        tree, vals, point_xy_utm[bpos], radii
+                t0 = time.perf_counter()
+                if kind == "vector_point_shared":
+                    stats_map = preaggregation.vector_batch_stats_multi(
+                        tree, vals_by_col, point_xy_utm[bpos], radii
                     )
+                elif kind == "vector_point":
+                    stats_map = {
+                        ch: preaggregation.vector_batch_stats(
+                            tree, vals, point_xy_utm[bpos], radii
+                        )
+                    }
                 elif kind == "vector_geometry":
                     batch_geoms = [entity_geoms_utm[i] for i in bpos]
-                    stats = preaggregation.vector_batch_geometry_stats(
-                        metric_utm,
-                        col,
-                        batch_geoms,
-                        radii,
-                        cell_buffer_m=cell_buffer_lon,
-                    )
+                    stats_map = {
+                        ch: preaggregation.vector_batch_geometry_stats(
+                            metric_utm,
+                            col,
+                            batch_geoms,
+                            radii,
+                            cell_buffer_m=cell_buffer_lon,
+                        )
+                    }
                 else:  # raster_geometry
                     batch_geoms = [entity_geoms_utm[i] for i in bpos]
-                    stats = preaggregation.raster_batch_geometry_stats(
-                        raster_array,
-                        transform,
-                        batch_geoms,
-                        radii,
-                        to_raster_crs=utm_to_raster_lon,
-                    )
-                return bids, stats
+                    stats_map = {
+                        ch: preaggregation.raster_batch_geometry_stats(
+                            raster_array,
+                            transform,
+                            batch_geoms,
+                            radii,
+                            to_raster_crs=utm_to_raster_lon,
+                        )
+                    }
+                return bids, stats_map, time.perf_counter() - t0
 
             workers = (
                 max(1, min((os.cpu_count() or 2), 8))
@@ -3022,12 +3321,23 @@ class MetricFusionEngine:
             )
             workers = max(1, min(workers, len(batches) or 1))
 
-            def _on_done(bids: list[int], stats: np.ndarray) -> None:
+            def _on_done(
+                bids: list[int],
+                stats_map: dict[str, np.ndarray],
+                agg_secs: float,
+                *,
+                agg_stage=agg_stage,
+                write_targets=dict(write_targets),
+            ) -> None:
                 nonlocal processed
-                cache.write_channel_wave_batch(ch, rep_idx, bids, stats)
-                processed += len(bids)
+                stage_secs[agg_stage] += agg_secs
+                tw = time.perf_counter()
+                for c, r in write_targets.items():
+                    cache.write_channel_wave_batch(c, r, bids, stats_map[c])
+                stage_secs["sqlite_write"] += time.perf_counter() - tw
+                processed += len(bids) * len(write_targets)
                 if progress_callback is not None and total_jobs > 0:
-                    progress_callback(processed, total_jobs)
+                    progress_callback(min(processed, total_jobs), total_jobs)
 
             if workers == 1:
                 for bids in batches:
@@ -3082,11 +3392,54 @@ class MetricFusionEngine:
         cache.mark_complete()
         self._preaggr_cache = cache
         self._preaggregation_done = True
+        total_build = time.perf_counter() - build_t0
+        tracked = sum(stage_secs.values())
         _log(
             "OK",
-            f"Longitudinal pre-aggregation complete for {n_points:,} entities.",
+            f"Longitudinal pre-aggregation complete for {n_points:,} entities "
+            f"in {total_build:.0f}s — vector agg {stage_secs['vector_agg']:.0f}s, "
+            f"raster agg {stage_secs['raster_agg']:.0f}s, SQLite write "
+            f"{stage_secs['sqlite_write']:.0f}s, other {total_build - tracked:.0f}s "
+            "(index build / probe / scheduling).",
         )
+        # Load the freshly-built cache into RAM now, so the search reads memory
+        # from the first trial (build or reuse both end up resident).
+        self._ensure_memory_loaded()
         return True
+
+    def _ensure_memory_loaded(self):
+        """Return the RAM-resident pre-aggregation, loading it on first use.
+
+        The whole complete cache is mirrored into RAM once so every trial's
+        lookups are pure array gathers, shared read-only across worker threads.
+        Loaded eagerly by ``precompute_aggregations`` at engine start (whether
+        the cache was freshly built or reused); this lazy guard is the safety
+        net. Returns ``None`` if there is no complete cache to load.
+        """
+        if self._preaggr_mem is not None:
+            return self._preaggr_mem
+        cache = self._preaggr_cache
+        if cache is None or not self._preaggregation_done:
+            return None
+        try:
+            import gc
+
+            from . import preaggr_memory
+
+            _log("INFO", "Loading pre-aggregation cache into memory...")
+            t0 = time.perf_counter()
+            self._preaggr_mem = preaggr_memory.InMemoryPreAggregation.from_cache(cache)
+            gc.collect()
+            _log(
+                "OK",
+                f"Pre-aggregation resident in RAM "
+                f"({self._preaggr_mem.n_bytes / 2**30:.2f} GB, float32) — "
+                f"RAM load {time.perf_counter() - t0:.0f}s.",
+            )
+        except Exception as exc:  # fall back to on-disk lookups
+            logger.warning(f"In-memory pre-aggregation load failed: {exc}")
+            self._preaggr_mem = None
+        return self._preaggr_mem
 
     def _lookup_preaggregation(
         self,
@@ -3106,8 +3459,13 @@ class MetricFusionEngine:
         ``None`` (cross-sectional mode) the cache returns the single
         implicit wave 0 for all entities.
         """
-        cache = self._preaggr_cache
-        if cache is None or not self._preaggregation_done:
+        if not self._preaggregation_done:
+            return None
+        # Prefer the RAM-resident structure (loaded at engine start); every
+        # per-trial gather then avoids SQLite entirely. Falls back to the disk
+        # cache only if the RAM load hasn't happened.
+        source = self._ensure_memory_loaded() or self._preaggr_cache
+        if source is None:
             return None
         column = preaggregation.stat_to_column(stat, percentile)
         if column is None:
@@ -3115,16 +3473,14 @@ class MetricFusionEngine:
         ids = np.asarray(point_indices)
         radius = int(round(radius_m))
         if wave_indices is None:
-            return cache.lookup(ids, channel, radius, column)
+            return source.lookup(ids, channel, radius, column)
 
         waves = np.asarray(wave_indices)
         out = np.full(ids.shape[0], np.nan, dtype=np.float32)
-        # Per-wave grouped reads: each wave maps to one cache column, so
-        # repeated entity reads within a wave benefit from the cache's
-        # column LRU.
+        # Per-wave grouped reads: each wave maps to one stored cell.
         for w in np.unique(waves):
             mask = waves == w
-            sub = cache.lookup(ids[mask], channel, radius, column, wave_index=int(w))
+            sub = source.lookup(ids[mask], channel, radius, column, wave_index=int(w))
             if sub is None:
                 # An off-grid (channel, wave, radius, column) cell — caller
                 # falls back to the ring/buffer aggregation path.
@@ -3529,6 +3885,14 @@ class MetricFusionEngine:
         g_x = np.concatenate(x_parts)
         g_y = np.concatenate(y_parts)
 
+        # Stable global pixel id: the pixel's global lattice (row, col) packed
+        # into one int64. Anchored at the CRS origin, so the same physical
+        # pixel gets the same id in any job — this is what the greenery cache
+        # keys on, making it reusable across targets/outcomes/covariates.
+        g_pid = (g_row.astype(np.int64) << np.int64(32)) | (
+            g_col.astype(np.int64) & np.int64(0xFFFFFFFF)
+        )
+
         # Local raster indices span only the populated cells' global extent.
         col_origin = int(g_col.min())
         row_origin = int(g_row.min())
@@ -3540,6 +3904,7 @@ class MetricFusionEngine:
             {
                 "_grid_row": (g_row - row_origin).astype(np.int32),
                 "_grid_col": (g_col - col_origin).astype(np.int32),
+                "_global_pid": g_pid,
             },
             geometry=gpd.points_from_xy(g_x, g_y),
             crs=grid_crs,
@@ -3599,6 +3964,7 @@ class MetricFusionEngine:
         pixel_geom = pixels.geometry.to_numpy()
         pixel_row = pixels["_grid_row"].to_numpy()
         pixel_col = pixels["_grid_col"].to_numpy()
+        pixel_pid = pixels["_global_pid"].to_numpy()
 
         # ``polygon_id`` = the entity/observation index; each (entity, wave)
         # row in longitudinal mode is already its own observation, so the
@@ -3615,6 +3981,9 @@ class MetricFusionEngine:
                 # pre-aggregation cache stores one row per pixel; scoring rows
                 # resolve their pixel's stats through this id at lookup time.
                 "_preaggr_id": pix_idx.astype(np.int64),
+                # Stable global pixel id (grid row/col packed); the greenery
+                # cache keys on this so it is reusable across jobs.
+                "_global_pid": pixel_pid[pix_idx],
             },
             geometry=pixel_geom[pix_idx],
             crs=grid_crs,
@@ -3634,7 +4003,13 @@ class MetricFusionEngine:
 
         # Coverage probe — used only for NaN-filtering and the channel-scale
         # bounds; per-trial channel values come from the cache.
+        _probe_t0 = time.perf_counter()
         probe_cols = self._probe_channel_coverage(pixels, pix_idx, entity_gdf)
+        _log(
+            "INFO",
+            f"Coverage probe: {len(entity_gdf):,} pixel rows in "
+            f"{time.perf_counter() - _probe_t0:.0f}s.",
+        )
 
         fusion_df = pd.DataFrame(
             {
@@ -4164,6 +4539,118 @@ class MetricFusionEngine:
                 arr[valid] = (arr[valid] - dt(lo)) / dt(hi - lo)
         return arr
 
+    def _coverage_signature(self) -> str | None:
+        """Grid + config + greenery-file identity for cache-coverage reuse.
+
+        Independent of the referenced-pixel subset (which is the coverage gate's
+        own output), so it can be matched *before* the gate runs. ``None`` unless
+        the longitudinal grid + metric sources are ready. Two runs sharing this
+        signature address the same ``(pixel, wave)`` ids with the same greenery
+        values, so one's cached coverage is valid for the other.
+        """
+        spec = self.longitudinal_spec
+        if (
+            not self.is_longitudinal
+            or spec is None
+            or self._metric_sources is None
+            or getattr(self, "_entity_grid_transform", None) is None
+        ):
+            return None
+        gvi_radii, ndvi_radii = self._preaggr_radii()
+        parts = [
+            f"grid:{tuple(self._entity_grid_transform)[:6]}",
+            f"shape:{self._entity_grid_shape}",
+            f"crs:{self._entity_grid_crs}",
+            f"gvi:{gvi_radii}",
+            f"ndvi:{ndvi_radii}",
+            f"stats:{preaggregation.STAT_COLUMNS}",
+            f"waves:{list(spec.wave_labels)}",
+        ]
+        for ch in longitudinal.GREENERY_CHANNELS:
+            for w in spec.wave_labels:
+                parts.append(f"{ch}@{w}:{self._metric_sources.identity(ch, w)}")
+        return hashlib.sha256("|".join(parts).encode()).hexdigest()
+
+    def _attach_cache_for_coverage(self) -> bool:
+        """Attach a complete cache whose coverage signature matches this run, so
+        the coverage gate reads from it instead of re-sampling every greenery
+        file. Safe: only a signature-matched, complete cache is used, and any
+        mismatch simply leaves the sampler in place. Returns True if attached.
+        """
+        if self._preaggregation_done and self._preaggr_cache is not None:
+            return True
+        sig = self._coverage_signature()
+        if sig is None:
+            return False
+        preaggr_dir = os.path.join(self.cache_dir, "preaggr")
+        if not os.path.isdir(preaggr_dir):
+            return False
+        base = os.path.splitext(os.path.basename(self.target_file))[0]
+        gvi_radii, ndvi_radii = self._preaggr_radii()
+        spec = self.longitudinal_spec
+        for name in sorted(os.listdir(preaggr_dir)):
+            if not (name.startswith(f"preaggr-{base}-") and name.endswith(".sqlite")):
+                continue
+            path = os.path.join(preaggr_dir, name)
+            try:
+                cache = preaggregation.PreAggregationCache(
+                    path, gvi_radii=gvi_radii, ndvi_radii=ndvi_radii,
+                    fingerprint="coverage-probe",
+                    wave_labels=spec.wave_labels if spec else (),
+                )
+                if (
+                    cache._get_meta("complete") == "1"
+                    and cache.coverage_signature() == sig
+                ):
+                    # Attach only for the coverage read; precompute_aggregations
+                    # still resolves and validates the scoring cache normally.
+                    self._preaggr_cache = cache
+                    _log(
+                        "OK",
+                        f"Coverage gate: reusing cached coverage from {name} "
+                        "(skipping the per-wave re-sample).",
+                    )
+                    return True
+                cache.close()
+            except Exception:
+                continue
+        return False
+
+    def _coverage_from_cache(
+        self, entity_gdf: gpd.GeoDataFrame
+    ) -> dict[str, np.ndarray] | None:
+        """Per-row veg / terrain / NDVI values read from the attached cache.
+
+        Returns the cached max-radius mean per ``(pixel, wave)`` row (NaN where
+        no greenery is within range — exactly the coverage the sampler would
+        find). ``None`` on any missing cell, so the caller falls back to
+        sampling.
+        """
+        cache = self._preaggr_cache
+        spec = self.longitudinal_spec
+        if cache is None or spec is None or "_preaggr_id" not in entity_gdf.columns:
+            return None
+        gvi_radii, ndvi_radii = self._preaggr_radii()
+        wave_index_of = {w: i for i, w in enumerate(spec.wave_labels)}
+        ids = np.ascontiguousarray(entity_gdf["_preaggr_id"].to_numpy(), dtype=np.int64)
+        waves = entity_gdf["wave"].astype(str).to_numpy()
+        try:
+            widx = np.array([wave_index_of[w] for w in waves], dtype=np.int64)
+        except KeyError:
+            return None
+        out: dict[str, np.ndarray] = {}
+        for ch in longitudinal.GREENERY_CHANNELS:
+            radius = int((ndvi_radii if ch == "ndvi" else gvi_radii)[-1])
+            col = np.full(len(ids), np.nan, dtype=np.float32)
+            for w in np.unique(widx):
+                m = widx == w
+                vals = cache.lookup(ids[m], ch, radius, "mean", wave_index=int(w))
+                if vals is None:
+                    return None
+                col[m] = vals
+            out[ch] = col
+        return out
+
     def _probe_channel_coverage(
         self,
         pixels: gpd.GeoDataFrame,
@@ -4188,6 +4675,19 @@ class MetricFusionEngine:
             if (provider is not None and "wave" in entity_gdf.columns)
             else None
         )
+
+        # Coverage from a reusable cache (skips the per-wave re-sample) — only
+        # when a signature-matched complete cache is available; falls back to
+        # sampling on any miss.
+        if waves is not None and self._attach_cache_for_coverage():
+            cached = self._coverage_from_cache(entity_gdf)
+            if cached is not None:
+                _log(
+                    "OK",
+                    f"Coverage gate: derived veg / terrain / NDVI coverage for "
+                    f"{n_rows:,} rows from the pre-aggregation cache.",
+                )
+                return cached
 
         if waves is None:
             _log(
@@ -4927,6 +5427,40 @@ class MetricFusionEngine:
         """
         return self.is_longitudinal and metric in mixed_effects_scoring.HAS_PVALUE
 
+    def _fold_fast_components(self, static: dict):
+        """Per-fold ``(D, σ²)`` for the fast search scorer, cached on the static.
+
+        Returns ``None`` (caller uses the exact per-trial fit) when the engine
+        is not longitudinal, a spatial smooth is active, the fold lacks entity /
+        time keys, or estimation fails. Computed once per fold subset and reused
+        by every trial of that fold — the whole point of the fast path.
+        """
+        if "fast_components" in static:
+            return static["fast_components"]
+        comp = None
+        spec = self.longitudinal_spec
+        if (
+            self.is_longitudinal
+            and spec is not None
+            and self.search_scoring_method
+            in mixed_effects_scoring.FAST_COMPONENT_METHODS
+            and self.spatial_adjust_method == "none"
+            and static.get("entity_id") is not None
+            and static.get("ysb") is not None
+        ):
+            comp = mixed_effects_scoring.estimate_fold_components(
+                static["target"],
+                static.get("cov"),
+                static["ysb"],
+                static["entity_id"],
+                method=self.search_scoring_method,
+                include_time_fixed=spec.include_time_fixed_effect,
+                random_slope=spec.random_slope_time,
+                target=spec.association_target,
+            )
+        static["fast_components"] = comp
+        return comp
+
     def _score_greenery(
         self,
         metric: str,
@@ -4939,6 +5473,7 @@ class MetricFusionEngine:
         years_since_baseline: "np.ndarray | None" = None,
         return_pvalue: bool = False,
         return_all: bool = False,
+        fast_components: "tuple[np.ndarray, float] | None" = None,
     ):
         """Single scoring seam: MixedLM (longitudinal) or OLS (cross-sectional).
 
@@ -4959,6 +5494,29 @@ class MetricFusionEngine:
         if self.is_longitudinal and metric in mixed_effects_scoring.MIXEDLM_METRICS:
             spec = self.longitudinal_spec
             assert spec is not None  # guaranteed by is_longitudinal
+            # Fast fixed-V GLS path for the trial search: reuse the per-fold
+            # variance components, one GLS per trial instead of a MixedLM fit.
+            # Only for the ranking metrics, with no spatial smooth, and never
+            # for the exact reporting calls (return_all / no components).
+            if (
+                fast_components is not None
+                and not return_all
+                and metric in mixed_effects_scoring.FAST_SEARCH_METRICS
+                and self.spatial_adjust_method == "none"
+            ):
+                return mixed_effects_scoring.score_mixedlm_fast(
+                    metric,
+                    target,
+                    composite,
+                    entity_id=entity_id,
+                    years_since_baseline=years_since_baseline,
+                    covariates=covariates,
+                    components=fast_components,
+                    include_time_fixed=spec.include_time_fixed_effect,
+                    random_slope=spec.random_slope_time,
+                    return_pvalue=return_pvalue,
+                    target=spec.association_target,
+                )
             return mixed_effects_scoring.score_mixedlm(
                 metric,
                 target,
@@ -5381,6 +5939,17 @@ class MetricFusionEngine:
             # entity_id / years_since_baseline; the spec only routes the right
             # metric file per year through the pre-aggregation cache).
             wants_pval = self._metric_has_pvalue(metric)
+            # Fast fixed-V GLS scoring for the search: one variance-component
+            # estimate per fold subset, reused across trials. Only for the
+            # ranking metrics with no spatial smooth; ``None`` elsewhere makes
+            # ``_score_greenery`` take the exact per-trial fit.
+            wants_fast = (
+                self.is_longitudinal
+                and metric in mixed_effects_scoring.FAST_SEARCH_METRICS
+                and self.spatial_adjust_method == "none"
+            )
+            train_fc = self._fold_fast_components(train_static) if wants_fast else None
+            val_fc = self._fold_fast_components(val_static) if wants_fast else None
             train_out = self._score_greenery(
                 metric,
                 train_targets_arr,
@@ -5390,6 +5959,7 @@ class MetricFusionEngine:
                 entity_id=train_entity_id,
                 years_since_baseline=train_ysb,
                 return_pvalue=wants_pval,
+                fast_components=train_fc,
             )
             val_out = self._score_greenery(
                 metric,
@@ -5400,6 +5970,7 @@ class MetricFusionEngine:
                 entity_id=val_entity_id,
                 years_since_baseline=val_ysb,
                 return_pvalue=wants_pval,
+                fast_components=val_fc,
             )
 
             if wants_pval:
@@ -7562,6 +8133,7 @@ class MetricFusionEngine:
                     study.optimize(
                         lambda t: self._objective(t, metric),
                         n_trials=n_trials_b,
+                        n_jobs=self._search_n_jobs(metric),
                         show_progress_bar=False,
                         catch=(Exception,),
                         callbacks=[_trial_progress],

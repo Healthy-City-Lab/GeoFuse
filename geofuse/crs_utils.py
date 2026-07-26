@@ -161,6 +161,7 @@ def stream_mosaic_to_geotiff(
     progress_cb: Callable[[int, int], None] | None = None,
     build_overviews: bool = True,
     compress: bool = True,
+    dst_dtype: str | None = None,
 ) -> int:
     """Stream-mosaic same-CRS GeoTIFF tiles into one output via windowed writes.
 
@@ -180,6 +181,10 @@ def stream_mosaic_to_geotiff(
     once and deleted (e.g. the planar mosaic feeding a WGS84 reproject).
     Skipping DEFLATE saves write time and lets the downstream reader scan
     the file without per-block decompression.
+
+    ``dst_dtype`` overrides the output pixel type (default: inherit the first
+    tile's). NDVI in ``[-1, 1]`` carries no precision past ``float32``, so
+    forcing ``"float32"`` halves the on-disk size and every tile decompress.
     """
     if not tile_paths:
         raise ValueError("stream_mosaic_to_geotiff: tile_paths is empty.")
@@ -199,6 +204,7 @@ def stream_mosaic_to_geotiff(
             )
 
     ref = tile_profiles[0]
+    out_dtype = dst_dtype or ref["dtype"]
     union_left = min(p["bounds"].left for p in tile_profiles)
     union_bottom = min(p["bounds"].bottom for p in tile_profiles)
     union_right = max(p["bounds"].right for p in tile_profiles)
@@ -217,13 +223,13 @@ def stream_mosaic_to_geotiff(
         "height": out_height,
         "width": out_width,
         "count": ref["count"],
-        "dtype": ref["dtype"],
+        "dtype": out_dtype,
         "crs": ref["crs"],
         "transform": out_transform,
         "nodata": nodata,
     }
     if compress:
-        dst_profile.update(default_geotiff_creation_options(ref["dtype"], sparse=True))
+        dst_profile.update(default_geotiff_creation_options(out_dtype, sparse=True))
     else:
         dst_profile.update(
             {
@@ -254,7 +260,7 @@ def stream_mosaic_to_geotiff(
                     dst_arr = np.full(
                         (win.height, win.width),
                         fill_value=nodata,
-                        dtype=src.dtypes[band - 1],
+                        dtype=out_dtype,
                     )
                     reproject(
                         source=rasterio.band(src, band),

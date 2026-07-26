@@ -133,6 +133,12 @@ output_results/fusion/<YYYYMMDDTHHMMSS>__<short_job_id>/
 - Multi-outcome runs suffix each basename with `__<outcome>`.
 - `run_config.json` captures the full configuration, which is replayed verbatim on restart.
 
+### How to read the scores
+
+- **Only the held-out `test` split carries a p-value.** The `train`, `val`, and `all` (whole-data) p-values are deliberately left empty (`None`). The winning parameters were chosen by maximising the objective on those same slices, so an in-sample Wald p-value would be a selective-inference artefact — it would look significant because the params were tuned to make it so, not because the effect generalizes. The `val` figure is a bootstrap median with no single fit behind it, so it has no p-value either. Read the `test` split for the honest, generalizable result; read `all` only as an optimistic, descriptive summary.
+- **A failed fit is reported as `fit_failed`, never as `0.0`.** When the held-out mixed model does not converge, `results_summary.json` records `test_ci.status = "fit_failed"` (with no confidence bounds and a null `test_score`), and the UI shows a "fit failed" badge. This distinguishes a genuine null effect from a model that never fit — a `0.0` score paired with a confidence interval that excludes it would otherwise be ambiguous.
+- **`mixedlm_metrics*.csv`** carries one row per (pool, trial) plus per-pool summary rows (`__mean__` / `__ci_lo__` / `__ci_hi__`). Each pool's trial count is in its own `n_trials` column, so the metric columns hold only metric values — aggregating `mixedlm_marginal_r2` over the file never picks up a stray count. `mixedlm_marginal_r2` is a proportion of variance explained and is clamped to `[0, 1]`.
+
 ### Reusable caches (`output_results/fusion_cache/`)
 
 Reused automatically across runs with identical inputs:

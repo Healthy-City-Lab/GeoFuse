@@ -469,6 +469,7 @@ def _submit_fusion_restart(
         "spatial_adjust_eps_m": None,
         "covariate_types": {},
         "residualize_method": "linear",
+        "search_scoring_method": "mom_em3",
     }
     missing = [
         k for k in _FUSION_RUN_CONFIG_KEYS if k not in p and k not in _restart_defaults
@@ -961,6 +962,7 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "test_size",
     "objective_metric",
     "residualize_method",
+    "search_scoring_method",
     "ndvi_start_date",
     "ndvi_end_date",
     "ndvi_project_id",
@@ -1808,6 +1810,7 @@ def _render_study_details_panel(
     association_target = "level"
     decline_average_exposure = False
     decline_exposure_change = False
+    search_scoring_method = "mom_em3"
     if is_longitudinal:
         _target_keys = ["level", "decline_overall", "decline_average", "decline_change"]
         _target_labels = {
@@ -1877,6 +1880,32 @@ def _render_study_details_panel(
                     "per-wave greenery that varies over time."
                 ),
             )
+        _ssm_keys = ["mom_em3", "mom_em1", "mom", "exact"]
+        _ssm_labels = {
+            "mom_em3": "Method of Moments + 3 EM steps",
+            "mom_em1": "Method of Moments + 1 EM step",
+            "mom": "Method of Moments",
+            "exact": "Exact Mixed Linear Model (per trial)",
+        }
+        _ssm_default = st.session_state.get("fusion_search_scoring_method", "mom_em3")
+        search_scoring_method = st.selectbox(
+            "Trial scoring method",
+            options=_ssm_keys,
+            index=_ssm_keys.index(_ssm_default) if _ssm_default in _ssm_keys else 0,
+            format_func=lambda k: _ssm_labels[k],
+            key="fusion_search_scoring_method",
+            help=(
+                "How each trial's mixed-model variance components are estimated "
+                "while searching. Method of Moments is the fastest; adding "
+                "Expectation-Maximization steps refines the estimate toward the "
+                "full model at a small extra cost. More steps mean closer "
+                "agreement with the exact fit and less trial-score inflation; "
+                "fewer steps are faster. Exact Mixed Linear Model fits the full "
+                "model on every trial — most faithful but far slower. The "
+                "winning configuration is always re-fit exactly for the "
+                "reported results."
+            ),
+        )
 
     # ── Resume + standalones ────────────────────────────────────────────
     col_r1, col_r2 = st.columns(2)
@@ -1903,7 +1932,7 @@ def _render_study_details_panel(
     with col_c1:
         check_collinearity = st.checkbox(
             "Check channel collinearity (iterative VIF)",
-            value=bool(st.session_state.get("fusion_check_collinearity", False)),
+            value=bool(st.session_state.get("fusion_check_collinearity", True)),
             key="fusion_check_collinearity",
             help=(
                 "Iteratively drop the highest-VIF channel until all remaining "
@@ -2029,7 +2058,7 @@ def _render_study_details_panel(
         st.markdown("**Per-pixel CGI scoring**")
         cgi_grid_spacing_m = st.select_slider(
             "CGI grid pixel size (m)",
-            options=list(range(25, 525, 25)),
+            options=list(range(10, 510, 10)),
             value=int(st.session_state.get("fusion_cgi_grid_spacing_m", 50)),
             key="fusion_cgi_grid_spacing_m",
             help=(
@@ -2154,6 +2183,7 @@ def _render_study_details_panel(
         "covariate_types": dict(covariate_types or {}),
         "objective_metric": objective_metric,
         "residualize_method": str(residualize_method),
+        "search_scoring_method": str(search_scoring_method),
         "test_size": float(test_size),
         "n_bins": int(n_bins),
         "mixedlm_random_slope": bool(mixedlm_random_slope),
@@ -3050,6 +3080,7 @@ def _render_results_headline(results_view: dict, metric_name: str) -> None:
     # 1) Held-out test effect — the headline (params never saw this split).
     #    The whole-data (all) figure is folded into the tooltip as descriptive,
     #    in-sample context so it isn't read as an independent result.
+    fit_failed = test_ci.get("status") == "fit_failed"
     with cols[0]:
         t_score = _f(test_eff.get("score"))
         if t_score is None:
@@ -3076,7 +3107,17 @@ def _render_results_headline(results_view: dict, metric_name: str) -> None:
             else "—"
         )
         p_str = f"; permutation p={t_p:.3g}" if t_p is not None else ""
-        if t_score is not None:
+        if fit_failed:
+            st.metric(
+                f"Held-out test {metric_name}",
+                "fit failed",
+                help=(
+                    "The held-out mixed model did not converge on the test split, "
+                    "so there is no honest effect estimate — this is a non-fit, not "
+                    f"a zero effect.{all_str}"
+                ),
+            )
+        elif t_score is not None:
             st.metric(
                 f"Held-out test {metric_name}",
                 f"{t_score:.4f}",
@@ -3094,7 +3135,13 @@ def _render_results_headline(results_view: dict, metric_name: str) -> None:
         t_score = _f(test_eff.get("score"))
         if t_score is None:
             t_score = _f(test_ci.get("observed"))
-        if p is not None:
+        if fit_failed:
+            st.metric(
+                "Held-out significance",
+                "—",
+                help="No significance — the held-out mixed model did not converge.",
+            )
+        elif p is not None:
             st.metric(
                 "Held-out significance (p-value)",
                 f"p = {p:.3g}",
@@ -3231,24 +3278,34 @@ def _render_study_detail(
     # ── Tiles: test score + CI · direction · n ────────────────────────
     tile_cols = st.columns(3)
     with tile_cols[0]:
-        obs = test_ci.get("observed")
-        if obs is None:
-            obs = test_res.get("test_score")
-        lo, hi = test_ci.get("lower"), test_ci.get("upper")
-        if obs is not None:
-            ci_str = (
-                f"95% CI [{float(lo):.4f}, {float(hi):.4f}]"
-                if lo is not None and hi is not None
-                else "no CI"
-            )
+        if test_ci.get("status") == "fit_failed":
             st.metric(
                 f"Test {metric_name}",
-                f"{float(obs):.4f}",
-                delta=ci_str,
+                "fit failed",
+                delta="model did not converge",
                 delta_color="off",
+                help="The held-out mixed model did not converge — a non-fit, "
+                "not a zero effect.",
             )
         else:
-            st.metric(f"Test {metric_name}", "—")
+            obs = test_ci.get("observed")
+            if obs is None:
+                obs = test_res.get("test_score")
+            lo, hi = test_ci.get("lower"), test_ci.get("upper")
+            if obs is not None:
+                ci_str = (
+                    f"95% CI [{float(lo):.4f}, {float(hi):.4f}]"
+                    if lo is not None and hi is not None
+                    else "no CI"
+                )
+                st.metric(
+                    f"Test {metric_name}",
+                    f"{float(obs):.4f}",
+                    delta=ci_str,
+                    delta_color="off",
+                )
+            else:
+                st.metric(f"Test {metric_name}", "—")
     with tile_cols[1]:
         st.metric("Direction", _direction_badge(study_view.get("direction_sign")))
     with tile_cols[2]:
@@ -4291,6 +4348,9 @@ def render(output_dir: str) -> None:
     area_balanced_split_param = bool(study_state.get("area_balanced_split", False))
     normalize_channels_param = bool(study_state.get("normalize_channels", False))
     residualize_method_param = str(study_state.get("residualize_method", "linear"))
+    search_scoring_method_param = str(
+        study_state.get("search_scoring_method", "mom_em3")
+    )
     spatial_adjust_method_param = str(study_state.get("spatial_adjust_method", "none"))
     spatial_adjust_max_df_param = int(study_state.get("spatial_adjust_max_df", 10))
     spatial_adjust_eps_m_param = study_state.get("spatial_adjust_eps_m")
@@ -4640,6 +4700,7 @@ def render(output_dir: str) -> None:
                 "test_size": float(test_size),
                 "objective_metric": objective_metric,
                 "residualize_method": residualize_method_param,
+                "search_scoring_method": search_scoring_method_param,
                 "ndvi_start_date": ndvi_auto_start.isoformat(),
                 "ndvi_end_date": ndvi_auto_end.isoformat(),
                 "ndvi_project_id": None,

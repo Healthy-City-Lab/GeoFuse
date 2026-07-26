@@ -12,11 +12,12 @@ search records on its winning-params dict, so no Optuna study is needed.
 
 Output schema (``<study_results>/mixedlm_metrics.csv``)::
 
-    pool, trial_id, mixedlm_tstat, mixedlm_marginal_r2, mixedlm_lr, mixedlm_coef
+    pool, trial_id, mixedlm_tstat, mixedlm_marginal_r2, mixedlm_lr, mixedlm_coef, n_trials
 
 with one row per (pool, trial) plus one summary row per (pool, summary kind)
-where ``trial_id`` carries ``__mean__`` / ``__ci_lo__`` / ``__ci_hi__`` /
-``__n__``.
+where ``trial_id`` carries ``__mean__`` / ``__ci_lo__`` / ``__ci_hi__``. The
+pool's trial count lives in its own ``n_trials`` column so the metric columns
+hold only metric values.
 """
 
 from __future__ import annotations
@@ -78,7 +79,6 @@ def _pool_summary_rows(
         }
         rows.append(_summary("__ci_lo__", qlo))
         rows.append(_summary("__ci_hi__", qhi))
-    rows.append(_summary("__n__", {m: float(n) for m in metrics}))
     return rows
 
 
@@ -141,6 +141,7 @@ def compute_post_metrics(
 
     metric = engine.longitudinal_spec.scoring_metric
     rows: list[dict[str, Any]] = []
+    pool_counts: dict[str, int] = {}
     for pool_name, items in pools:
         per_trial_values: list[dict[str, float]] = []
         for idx, entry in enumerate(items):
@@ -173,6 +174,7 @@ def compute_post_metrics(
                         for m in mixed_effects_scoring.MIXEDLM_METRICS
                     }
                 )
+        pool_counts[pool_name] = len(per_trial_values)
         # Only summarise pools with more than one entry (the ``final`` pool
         # is a single point estimate by design — no spread).
         if len(per_trial_values) > 1:
@@ -184,12 +186,21 @@ def compute_post_metrics(
 
     os.makedirs(output_dir, exist_ok=True)
     csv_path = os.path.join(output_dir, csv_basename)
-    fields = ["pool", "trial_id"] + sorted(mixed_effects_scoring.MIXEDLM_METRICS)
+    # ``n_trials`` is its own column (repeated per row for its pool) so the
+    # metric columns hold only metric values — a downstream ``.describe()`` on
+    # ``marginal_r2`` no longer sees a trial count masquerading as a proportion.
+    fields = (
+        ["pool", "trial_id"]
+        + sorted(mixed_effects_scoring.MIXEDLM_METRICS)
+        + ["n_trials"]
+    )
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         for r in rows:
-            w.writerow({k: r.get(k, "") for k in fields})
+            row = {k: r.get(k, "") for k in fields}
+            row["n_trials"] = pool_counts.get(r.get("pool"), "")
+            w.writerow(row)
 
     _say("OK", f"Post-hoc MixedLM metrics written: {csv_path}")
     return csv_path
