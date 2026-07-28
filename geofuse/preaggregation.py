@@ -1,46 +1,21 @@
-"""Persisted, resumable pre-aggregation cache for the fusion optimizer.
+"""Reusable greenery pre-aggregation for the fusion optimizer.
 
-Before optimization, every sample entity's metric values are aggregated across
-every buffer radius in the ladder and every aggregation statistic (mean +
-p10..p90 in 10 % steps), for each channel (``veg``, ``terrain``, ``ndvi``)
-and — in longitudinal / mixed-effects mode — every wave. The results are
-written to a SQLite database so that each Optuna trial reads a single
-``(channel, wave, radius, stat)`` column via a fast indexed ``SELECT`` instead
-of recomputing circular-buffer aggregations — and so the work survives cancels
-and crashes and is reused by later runs with the same inputs.
+Before optimization, every sample pixel's metric values are aggregated across
+every buffer radius in the ladder and every aggregation statistic (mean plus a
+compact percentile set) for each channel (``veg``, ``terrain``, ``ndvi``), so
+each Optuna trial reads a stored value instead of recomputing circular-buffer
+aggregations — and the work survives cancels/crashes and is reused by later
+runs with the same inputs.
 
-Storage. The bulk stat values live in dense per-``(channel, representative
-wave)`` ``numpy.memmap`` files — shape ``(n_entities, n_radii, n_stats)``,
-``float32``, ``NaN`` for an entity with no imagery in range. A dense array is
-the natural container for a write-once / load-all payload: writes are a
-``memcpy`` by entity ordinal and the load is an ``mmap``, not a parse, so the
-on-disk size tracks the actual float32 footprint (no per-row key overhead).
-Entity id ↔ ordinal is fixed once at build start and stored in a sidecar.
+The store is :class:`GreeneryCache`: one compact ``.npz`` per greenery-file set
+in ``<cache_dir>/greenery/``, keyed on ``(greenery-file identity, grid spacing,
+metric CRS, stat set)`` — *not* the target — so a cache is reused across jobs
+that change only the outcome, covariates, or target file. Pixels are keyed by a
+stable global id (grid row/col), the radius ladder lives inside the file so a
+wider cache serves a narrower job, and the whole unit loads into RAM once for
+lock-free per-trial gathers. Longitudinal and cross-sectional runs share the
+store and this module's aggregation functions; only the modelling differs.
 
-A small SQLite database alongside the memmaps keeps only the bookkeeping: a
-``meta`` key/value table (fingerprint, ladders, stats, wave labels + aliases,
-schema version, completion, coverage signature) and ``done_channel_wave_entity``
-(which entities are fully written per ``(channel, wave)``), so a resumed build
-skips finished entities. Both tables are tiny next to the value payload.
-
-Values are greenery fractions rounded to four decimals. A complete cache is
-loaded into an in-memory structure at engine start
-(:mod:`geofuse.preaggr_memory`); per-trial lookups then read RAM, not disk.
-
-Cross-sectional callers use a single implicit wave (index 0) and do not need
-to pass wave info: ``write_batch`` and ``lookup`` default to that wave so
-the legacy fusion code is unchanged. Longitudinal callers supply explicit
-``wave_labels`` to the constructor and use ``write_channel_wave_batch`` /
-``lookup(..., wave_index=...)`` / ``pending_entities_for(...)``.
-
-Static-channel dedup: when a longitudinal run reuses one greenery file across
-multiple waves for a channel, the runner calls
-:meth:`PreAggregationCache.register_wave_aliases` to declare that those wave
-indices share storage with a representative wave; only the representative
-wave's rows are computed and written, and lookups for aliased waves
-transparently resolve to the representative.
-
-A ``meta`` key/value table records the data-config fingerprint, the radius
 The aggregation math is format-aware: vector (point) metrics use a ``BallTree``
 radius query; raster metrics use per-entity windowed reads with a circular mask.
 """
@@ -51,29 +26,16 @@ import gc
 import hashlib
 import json
 import os
-import threading
 from typing import Any
 
 import numpy as np
-
-from .persistence.sqlite_utils import open_wal_connection
 
 # Bumped when the on-disk greenery-cache layout changes so stale files are
 # ignored rather than mis-read.
 GREENERY_SCHEMA_VERSION = 1
 
-# Version 2 added the ``wave`` PK column and per-(channel, wave) completion
-# tracking. Version 3 moved raster aggregation onto buffered discs reprojected
-# into the raster CRS for every entity type. Version 5 moved the bulk stat
-# values from per-channel SQLite tables into dense per-(channel, wave) memmaps,
-# leaving only meta + completion tracking in SQLite. Stored stats from earlier
-# versions live in an incompatible layout, so they are reset rather than reused.
-# Caches built under an older schema fail the fingerprint check and rebuild.
-SCHEMA_VERSION = 5
-
 # Cross-sectional callers use this single implicit wave; longitudinal callers
 # pass an explicit ordered tuple of wave labels to the constructor.
-DEFAULT_WAVE_LABELS: tuple[str, ...] = ("",)
 DEFAULT_WAVE_INDEX = 0
 
 # Aggregation statistics stored per (entity, radius): ``mean`` plus a compact
@@ -875,66 +837,88 @@ class GreeneryCache:
         the ladder that new pixels must be computed at (the file's, when reused,
         so the unit stays uniform) and the referenced ids not yet stored.
         """
-        gvi_radii = tuple(int(r) for r in gvi_radii)
-        ndvi_radii = tuple(int(r) for r in ndvi_radii)
+        job_gvi = tuple(int(r) for r in gvi_radii)
+        job_ndvi = tuple(int(r) for r in ndvi_radii)
         required = np.asarray(required_ids, dtype=np.int64)
 
         if cfg_key not in self._units:
-            loaded = self._try_load(self._path(cfg_key), gvi_radii, ndvi_radii)
-            if loaded is not None:
-                self._units[cfg_key] = loaded
-        unit = self._units.get(cfg_key)
-        if unit is not None:
-            missing = self._setdiff(required, unit["ids"])
-            return unit["gvi_radii"], unit["ndvi_radii"], missing
+            stored = self._peek_ladder(cfg_key)
+            if (
+                stored is not None
+                and set(job_gvi) <= set(stored[0])
+                and set(job_ndvi) <= set(stored[1])
+            ):
+                # The file's ladder already covers the requested radii — reuse
+                # it (radii-subset reuse) and load its pixels into RAM.
+                self._units[cfg_key] = self._load(cfg_key)
+            else:
+                # No file, or a wider radius is needed: build at the union of
+                # the stored and requested ladders so a file's ladder only ever
+                # grows and later subset jobs keep reusing it.
+                if stored is not None:
+                    eff_gvi = tuple(sorted(set(job_gvi) | set(stored[0])))
+                    eff_ndvi = tuple(sorted(set(job_ndvi) | set(stored[1])))
+                else:
+                    eff_gvi, eff_ndvi = tuple(sorted(job_gvi)), tuple(sorted(job_ndvi))
+                self._units[cfg_key] = {
+                    "ids": np.empty(0, np.int64),
+                    "veg": np.empty((0, len(eff_gvi), len(self.stats)), np.float32),
+                    "terrain": np.empty(
+                        (0, len(eff_gvi), len(self.stats)), np.float32
+                    ),
+                    "ndvi": np.empty((0, len(eff_ndvi), len(self.stats)), np.float32),
+                    "gvi_radii": eff_gvi,
+                    "ndvi_radii": eff_ndvi,
+                    "dirty": False,
+                }
+        unit = self._units[cfg_key]
+        missing = self._setdiff(required, unit["ids"])
+        return unit["gvi_radii"], unit["ndvi_radii"], missing
 
-        # No reusable file: build at the job's ladder.
-        self._units[cfg_key] = {
-            "ids": np.empty(0, np.int64),
-            "veg": np.empty((0, len(gvi_radii), len(self.stats)), np.float32),
-            "terrain": np.empty((0, len(gvi_radii), len(self.stats)), np.float32),
-            "ndvi": np.empty((0, len(ndvi_radii), len(self.stats)), np.float32),
-            "gvi_radii": gvi_radii,
-            "ndvi_radii": ndvi_radii,
-            "dirty": False,
-        }
-        return gvi_radii, ndvi_radii, required
+    def _config_ok(self, meta: dict) -> bool:
+        return (
+            meta.get("schema") == GREENERY_SCHEMA_VERSION
+            and meta.get("stats") == list(self.stats)
+            and str(meta.get("crs")) == self.crs_key
+            and abs(float(meta.get("spacing", -1)) - self.spacing_m) <= 1e-9
+        )
 
-    def _try_load(
-        self, path: str, job_gvi: tuple[int, ...], job_ndvi: tuple[int, ...]
-    ) -> dict | None:
+    def _peek_ladder(
+        self, cfg_key: str
+    ) -> tuple[tuple[int, ...], tuple[int, ...]] | None:
+        """The stored ``(gvi_radii, ndvi_radii)`` of a matching file, cheaply.
+
+        Reads only the metadata entry of the ``.npz`` (not the arrays), so the
+        reuse decision — does this file's ladder cover the job? — is made before
+        loading anything. ``None`` when no compatible file exists.
+        """
+        path = self._path(cfg_key)
         if not os.path.isfile(path):
             return None
         try:
             with np.load(path, allow_pickle=False) as z:
                 meta = json.loads(str(z["meta"]))
-                if (
-                    meta.get("schema") != GREENERY_SCHEMA_VERSION
-                    or meta.get("stats") != list(self.stats)
-                    or str(meta.get("crs")) != self.crs_key
-                    or abs(float(meta.get("spacing", -1)) - self.spacing_m) > 1e-9
-                ):
-                    return None
-                fgvi = tuple(int(r) for r in meta["gvi_radii"])
-                fndvi = tuple(int(r) for r in meta["ndvi_radii"])
-                # The stored ladder must cover the job's requested radii.
-                if not (set(job_gvi) <= set(fgvi) and set(job_ndvi) <= set(fndvi)):
-                    return None
-                ids = np.ascontiguousarray(z["ids"], dtype=np.int64)
-                veg = np.ascontiguousarray(z["veg"], dtype=np.float32)
-                terrain = np.ascontiguousarray(z["terrain"], dtype=np.float32)
-                ndvi = np.ascontiguousarray(z["ndvi"], dtype=np.float32)
+            if not self._config_ok(meta):
+                return None
+            return (
+                tuple(int(r) for r in meta["gvi_radii"]),
+                tuple(int(r) for r in meta["ndvi_radii"]),
+            )
         except Exception:
             return None
-        unit = {
-            "ids": ids,
-            "veg": veg,
-            "terrain": terrain,
-            "ndvi": ndvi,
-            "gvi_radii": fgvi,
-            "ndvi_radii": fndvi,
-            "dirty": False,
-        }
+
+    def _load(self, cfg_key: str) -> dict:
+        with np.load(self._path(cfg_key), allow_pickle=False) as z:
+            meta = json.loads(str(z["meta"]))
+            unit = {
+                "ids": np.ascontiguousarray(z["ids"], dtype=np.int64),
+                "veg": np.ascontiguousarray(z["veg"], dtype=np.float32),
+                "terrain": np.ascontiguousarray(z["terrain"], dtype=np.float32),
+                "ndvi": np.ascontiguousarray(z["ndvi"], dtype=np.float32),
+                "gvi_radii": tuple(int(r) for r in meta["gvi_radii"]),
+                "ndvi_radii": tuple(int(r) for r in meta["ndvi_radii"]),
+                "dirty": False,
+            }
         self._account(unit)
         return unit
 
@@ -1052,499 +1036,3 @@ class GreeneryCache:
         self._wave_unit.clear()
         self.n_bytes = 0
         gc.collect()
-
-
-class PreAggregationCache:
-    """Per-job pre-aggregation store: dense ``float32`` memmaps hold the stat
-    values, a small SQLite database holds resume + meta, and lookup is an
-    id-keyed gather into the memmap."""
-
-    def __init__(
-        self,
-        db_path: str,
-        *,
-        gvi_radii: tuple[int, ...],
-        ndvi_radii: tuple[int, ...],
-        fingerprint: str,
-        wave_labels: tuple[str, ...] = DEFAULT_WAVE_LABELS,
-    ) -> None:
-        self.db_path = db_path
-        self.gvi_radii = tuple(int(r) for r in gvi_radii)
-        self.ndvi_radii = tuple(int(r) for r in ndvi_radii)
-        self.fingerprint = fingerprint
-        self.wave_labels = tuple(wave_labels) or DEFAULT_WAVE_LABELS
-        self._wave_index = {w: i for i, w in enumerate(self.wave_labels)}
-        # Identity mapping by default — every wave is its own representative.
-        # ``register_wave_aliases`` overwrites entries when a channel reuses a
-        # file across multiple waves so only the representative is stored.
-        self._wave_alias: dict[tuple[str, int], int] = {
-            (ch, i): i for ch in CHANNELS for i in range(len(self.wave_labels))
-        }
-        self._conn = open_wal_connection(db_path)
-        self._lock = threading.Lock()
-        # Open value memmaps keyed by (channel, representative wave), plus the
-        # fixed entity-id ↔ ordinal map that indexes their first axis.
-        self._arrays: dict[tuple[str, int], np.memmap] = {}
-        self._entity_ids: np.ndarray | None = None
-        self._id_order: np.ndarray | None = None
-        self._sorted_ids: np.ndarray | None = None
-        self._n_entities: int = 0
-        self._ensure_schema()
-        self._restore_aliases_from_meta()
-        self._load_entity_ids()
-
-    # -- channel/radius helpers ------------------------------------------------
-    def radii_for(self, channel: str) -> tuple[int, ...]:
-        return self.ndvi_radii if channel == "ndvi" else self.gvi_radii
-
-    # -- dense value storage (memmap) -----------------------------------------
-    def _ids_path(self) -> str:
-        return f"{self.db_path}.ids.npy"
-
-    def _array_path(self, channel: str, rep: int) -> str:
-        return f"{self.db_path}.{channel}.w{int(rep)}.f32"
-
-    def _load_entity_ids(self) -> None:
-        path = self._ids_path()
-        if os.path.isfile(path):
-            try:
-                self._set_entity_ids(np.load(path))
-            except Exception:
-                pass
-
-    def _set_entity_ids(self, ids: np.ndarray) -> None:
-        ids = np.asarray(ids, dtype=np.int64)
-        self._entity_ids = ids
-        self._n_entities = int(ids.shape[0])
-        # Sorted view + its permutation: a requested id searchsorts into the
-        # sorted ids, and the permutation maps that position back to the row
-        # ordinal in the dense array.
-        self._id_order = np.argsort(ids, kind="stable")
-        self._sorted_ids = ids[self._id_order]
-
-    def _ords_for(self, req: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Dense-array row ordinals for ``req`` ids, plus an ``in-grid`` mask."""
-        req = np.asarray(req, dtype=np.int64)
-        if self._sorted_ids is None or self._sorted_ids.size == 0:
-            return (
-                np.zeros(req.shape[0], np.int64),
-                np.zeros(req.shape[0], dtype=bool),
-            )
-        pos = np.searchsorted(self._sorted_ids, req)
-        pos = np.clip(pos, 0, self._sorted_ids.size - 1)
-        valid = self._sorted_ids[pos] == req
-        assert self._id_order is not None
-        return self._id_order[pos], valid
-
-    def _get_array(
-        self, channel: str, rep: int, *, create: bool = False
-    ) -> "np.memmap | None":
-        """The dense ``(n_entities, n_radii, n_stats)`` memmap for the cell.
-
-        Returns ``None`` when the file does not exist and ``create`` is false
-        (the cell was never written). A freshly created array is NaN-filled so
-        an entity with no imagery in range reads back NaN, not 0.
-        """
-        key = (channel, int(rep))
-        arr = self._arrays.get(key)
-        if arr is not None:
-            return arr
-        path = self._array_path(channel, int(rep))
-        shape = (self._n_entities, len(self.radii_for(channel)), _N_STATS)
-        if os.path.isfile(path):
-            arr = np.memmap(path, dtype=np.float32, mode="r+", shape=shape)
-        elif create and self._n_entities > 0:
-            arr = np.memmap(path, dtype=np.float32, mode="w+", shape=shape)
-            arr[:] = np.nan
-            arr.flush()
-        else:
-            return None
-        self._arrays[key] = arr
-        return arr
-
-    def read_dense(
-        self, channel: str, wave_index: int = DEFAULT_WAVE_INDEX
-    ) -> "tuple[np.ndarray, np.memmap] | None":
-        """``(entity_ids, values)`` for a whole ``(channel, wave)`` cell.
-
-        ``entity_ids`` are in dense-array row order; ``values`` is the memmap
-        itself (shape ``(n, n_radii, n_stats)``). ``None`` if never written.
-        Used by :mod:`geofuse.preaggr_memory` to mirror the store into RAM.
-        """
-        rep = self.resolve_wave(channel, wave_index)
-        arr = self._get_array(channel, rep)
-        if arr is None or self._entity_ids is None:
-            return None
-        return self._entity_ids, arr
-
-    def wave_index_of(self, wave_label: str) -> int:
-        try:
-            return self._wave_index[wave_label]
-        except KeyError as exc:
-            raise KeyError(
-                f"Unknown wave label {wave_label!r}; cache was built with "
-                f"wave_labels={list(self.wave_labels)}."
-            ) from exc
-
-    def resolve_wave(self, channel: str, wave_index: int) -> int:
-        """Return the representative wave index for ``(channel, wave_index)``."""
-        return self._wave_alias.get((channel, int(wave_index)), int(wave_index))
-
-    def representative_waves_for(self, channel: str) -> tuple[int, ...]:
-        """Distinct representative wave indices for ``channel`` in label order."""
-        seen: list[int] = []
-        for i in range(len(self.wave_labels)):
-            rep = self.resolve_wave(channel, i)
-            if rep not in seen:
-                seen.append(rep)
-        return tuple(seen)
-
-    # -- schema / meta ---------------------------------------------------------
-    def _ensure_schema(self) -> None:
-        # Only the bookkeeping lives in SQLite now — the stat values are in the
-        # per-(channel, wave) memmaps.
-        with self._lock:
-            cur = self._conn
-            cur.execute(
-                "CREATE TABLE IF NOT EXISTS done_channel_wave_entity ("
-                "channel TEXT NOT NULL, wave INTEGER NOT NULL, "
-                "entity_id INTEGER NOT NULL, "
-                "PRIMARY KEY (channel, wave, entity_id))"
-            )
-            cur.execute(
-                "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)"
-            )
-
-    def _restore_aliases_from_meta(self) -> None:
-        raw = self._get_meta("wave_aliases")
-        if not raw:
-            return
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError:
-            return
-        for ch, alias_map in payload.items():
-            if ch not in CHANNELS:
-                continue
-            for w_str, rep in alias_map.items():
-                self._wave_alias[(ch, int(w_str))] = int(rep)
-
-    def _get_meta(self, key: str) -> str | None:
-        row = self._conn.execute(
-            "SELECT value FROM meta WHERE key = ?", (key,)
-        ).fetchone()
-        return row[0] if row else None
-
-    def _set_meta(self, key: str, value: str) -> None:
-        self._conn.execute(
-            "INSERT INTO meta(key, value) VALUES(?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (key, value),
-        )
-
-    def matches_fingerprint(self) -> bool:
-        """True if a prior build's fingerprint + ladders + stats match this config."""
-        return (
-            self._get_meta("schema_version") == str(SCHEMA_VERSION)
-            and self._get_meta("fingerprint") == self.fingerprint
-            and self._get_meta("gvi_radii") == json.dumps(list(self.gvi_radii))
-            and self._get_meta("ndvi_radii") == json.dumps(list(self.ndvi_radii))
-            and self._get_meta("stat_columns") == json.dumps(list(STAT_COLUMNS))
-            and self._get_meta("wave_labels") == json.dumps(list(self.wave_labels))
-        )
-
-    def is_complete(self) -> bool:
-        return self.matches_fingerprint() and self._get_meta("complete") == "1"
-
-    def coverage_signature(self) -> str | None:
-        """Grid+config signature identifying which (pixel, wave) ids this cache
-        holds — used to reuse its coverage in the pre-aggregation gate. Set at
-        build time; independent of the referenced-pixel subset, so it can be
-        matched before the gate runs. ``None`` if never stored."""
-        return self._get_meta("coverage_signature")
-
-    def set_coverage_signature(self, signature: str) -> None:
-        with self._lock:
-            self._set_meta("coverage_signature", str(signature))
-            self._conn.commit()
-
-    def reset(self) -> None:
-        """Drop all values + meta (used when the fingerprint changed)."""
-        with self._lock:
-            self._conn.execute("DELETE FROM done_channel_wave_entity")
-            self._conn.execute("DELETE FROM meta")
-            # Release and delete every dense memmap plus the ordinal map.
-            for arr in self._arrays.values():
-                try:
-                    arr.flush()
-                except Exception:
-                    pass
-            self._arrays.clear()
-            for ch in CHANNELS:
-                for rep in range(len(self.wave_labels)):
-                    p = self._array_path(ch, rep)
-                    if os.path.isfile(p):
-                        try:
-                            os.remove(p)
-                        except OSError:
-                            pass
-            if os.path.isfile(self._ids_path()):
-                try:
-                    os.remove(self._ids_path())
-                except OSError:
-                    pass
-            self._entity_ids = None
-            self._id_order = None
-            self._sorted_ids = None
-            self._n_entities = 0
-            # Restore identity alias map; aliases get re-registered by the
-            # runner during the new build.
-            self._wave_alias = {
-                (ch, i): i for ch in CHANNELS for i in range(len(self.wave_labels))
-            }
-
-    def write_header(self, entity_ids: Any) -> None:
-        """Record the build config and fix the entity id ↔ ordinal map.
-
-        ``entity_ids`` is the full ordered set of grid entity ids the dense
-        arrays are indexed by; every later write and lookup maps ids to rows
-        through it. A resume keeps the order already on disk so existing rows
-        stay addressable.
-        """
-        ids = np.asarray(entity_ids, dtype=np.int64)
-        with self._lock:
-            self._set_meta("schema_version", str(SCHEMA_VERSION))
-            self._set_meta("fingerprint", self.fingerprint)
-            self._set_meta("gvi_radii", json.dumps(list(self.gvi_radii)))
-            self._set_meta("ndvi_radii", json.dumps(list(self.ndvi_radii)))
-            self._set_meta("stat_columns", json.dumps(list(STAT_COLUMNS)))
-            self._set_meta("percentiles", json.dumps(list(PERCENTILES)))
-            self._set_meta("wave_labels", json.dumps(list(self.wave_labels)))
-            self._set_meta("n_entities", str(int(ids.shape[0])))
-            if self._get_meta("complete") is None:
-                self._set_meta("complete", "0")
-            # Keep any ordinal map already loaded from disk (resume); otherwise
-            # fix it now from the passed ids and persist it.
-            if self._entity_ids is None:
-                self._set_entity_ids(ids)
-                np.save(self._ids_path(), self._entity_ids)
-
-    def mark_complete(self) -> None:
-        with self._lock:
-            self._set_meta("complete", "1")
-
-    # -- wave aliases ----------------------------------------------------------
-    def register_wave_aliases(self, channel: str, alias_map: dict[int, int]) -> None:
-        """Declare that some wave indices for ``channel`` share storage.
-
-        ``alias_map`` maps each wave index to its representative wave index;
-        the representative is one of the entries (typically the lowest wave
-        index of each unique-file group). The runner calls this once per
-        channel after grouping waves by file fingerprint so only the
-        representative wave is computed and persisted; lookups for aliased
-        waves resolve through this mapping. Persisted to ``meta`` so resume
-        across a process restart sees the same grouping.
-        """
-        if channel not in CHANNELS:
-            raise ValueError(
-                f"Unknown channel {channel!r}; expected one of {CHANNELS}."
-            )
-        n = len(self.wave_labels)
-        for w, rep in alias_map.items():
-            if not (0 <= int(w) < n) or not (0 <= int(rep) < n):
-                raise ValueError(
-                    f"alias entry {(w, rep)} out of range for "
-                    f"wave_labels={list(self.wave_labels)}."
-                )
-            self._wave_alias[(channel, int(w))] = int(rep)
-        # Persist the merged alias map (across all channels) to meta.
-        merged: dict[str, dict[str, int]] = {ch: {} for ch in CHANNELS}
-        for (ch, w), rep in self._wave_alias.items():
-            if w != rep:
-                merged[ch][str(w)] = rep
-        with self._lock:
-            self._set_meta(
-                "wave_aliases",
-                json.dumps({k: v for k, v in merged.items() if v}),
-            )
-
-    # -- resume ----------------------------------------------------------------
-    def pending_entities_for(
-        self, channel: str, wave_index: int, entity_ids: list[int]
-    ) -> list[int]:
-        """Subset of ``entity_ids`` not yet written for ``(channel, wave)``.
-
-        Wave aliases are resolved first — aliased waves share completion
-        rows with their representative, so a static-channel build never
-        recomputes the same stats per wave.
-        """
-        rep = self.resolve_wave(channel, wave_index)
-        done = {
-            int(r[0])
-            for r in self._conn.execute(
-                "SELECT entity_id FROM done_channel_wave_entity "
-                "WHERE channel = ? AND wave = ?",
-                (channel, int(rep)),
-            ).fetchall()
-        }
-        return [e for e in entity_ids if int(e) not in done]
-
-    def pending_entities(self, entity_ids: list[int]) -> list[int]:
-        """Entities not yet fully written across every (channel, representative wave).
-
-        Legacy / cross-sectional convenience: an entity is "fully done" iff it
-        appears in ``done_channel_wave_entity`` for every required
-        ``(channel, representative_wave)`` pair. For a single-wave
-        cross-sectional cache this is exactly "done across all three
-        channels at wave 0" — the previous semantics.
-        """
-        required: list[tuple[str, int]] = []
-        for ch in CHANNELS:
-            for rep in self.representative_waves_for(ch):
-                required.append((ch, rep))
-        if not required:
-            return list(entity_ids)
-        # Build per-(channel, wave) done sets and intersect.
-        done_per: list[set[int]] = []
-        for ch, rep in required:
-            rows = self._conn.execute(
-                "SELECT entity_id FROM done_channel_wave_entity "
-                "WHERE channel = ? AND wave = ?",
-                (ch, int(rep)),
-            ).fetchall()
-            done_per.append({int(r[0]) for r in rows})
-        fully_done: set[int] = set.intersection(*done_per) if done_per else set()
-        return [e for e in entity_ids if int(e) not in fully_done]
-
-    def done_count(self) -> int:
-        """Count of entities fully done across every required (channel, wave)."""
-        required: list[tuple[str, int]] = []
-        for ch in CHANNELS:
-            for rep in self.representative_waves_for(ch):
-                required.append((ch, rep))
-        if not required:
-            return 0
-        done_per: list[set[int]] = []
-        for ch, rep in required:
-            rows = self._conn.execute(
-                "SELECT entity_id FROM done_channel_wave_entity "
-                "WHERE channel = ? AND wave = ?",
-                (ch, int(rep)),
-            ).fetchall()
-            done_per.append({int(r[0]) for r in rows})
-        return len(set.intersection(*done_per)) if done_per else 0
-
-    # -- write -----------------------------------------------------------------
-    def write_channel_wave_batch(
-        self,
-        channel: str,
-        wave_index: int,
-        entity_ids: list[int],
-        stats: np.ndarray,
-    ) -> None:
-        """Persist one channel × one wave's stats batch transactionally.
-
-        ``stats`` has shape ``[len(entity_ids), n_radii, n_stats]`` where
-        ``n_radii`` matches :meth:`radii_for`. The write is recorded against
-        the representative wave for ``(channel, wave_index)`` so aliased
-        waves transparently share storage.
-        """
-        if channel not in CHANNELS:
-            raise ValueError(
-                f"Unknown channel {channel!r}; expected one of {CHANNELS}."
-            )
-        if self._entity_ids is None:
-            raise RuntimeError(
-                "write_channel_wave_batch called before write_header fixed the "
-                "entity ordinal map."
-            )
-        rep = self.resolve_wave(channel, wave_index)
-        eids = np.asarray(entity_ids, dtype=np.int64)
-        vals = np.asarray(stats, dtype=np.float32)
-        ords, valid = self._ords_for(eids)
-        with self._lock:
-            arr = self._get_array(channel, rep, create=True)
-            assert arr is not None
-            if valid.any():
-                arr[ords[valid]] = vals[valid]
-            # Flush the values before recording completion, so a crash can
-            # never leave an entity marked done with unwritten stats behind it.
-            arr.flush()
-            self._conn.execute("BEGIN")
-            try:
-                self._conn.executemany(
-                    "INSERT OR IGNORE INTO done_channel_wave_entity "
-                    "(channel, wave, entity_id) VALUES (?, ?, ?)",
-                    [(channel, int(rep), int(e)) for e in eids[valid]],
-                )
-                self._conn.execute("COMMIT")
-            except Exception:
-                self._conn.execute("ROLLBACK")
-                raise
-
-    def write_batch(
-        self, entity_ids: list[int], channel_stats: dict[str, np.ndarray]
-    ) -> None:
-        """Legacy convenience — writes every channel at the default wave (0).
-
-        Kept for cross-sectional callers that compute all channels in one
-        per-entity batch. Longitudinal callers use
-        :meth:`write_channel_wave_batch` directly.
-        """
-        for ch in CHANNELS:
-            self.write_channel_wave_batch(
-                ch, DEFAULT_WAVE_INDEX, entity_ids, channel_stats[ch]
-            )
-
-    # -- read ------------------------------------------------------------------
-    def lookup(
-        self,
-        entity_ids: np.ndarray,
-        channel: str,
-        radius: int,
-        column: str,
-        *,
-        wave_index: int = DEFAULT_WAVE_INDEX,
-    ) -> np.ndarray | None:
-        """Return float32 values for ``entity_ids`` at the given cell.
-
-        ``wave_index`` defaults to 0 so cross-sectional callers can omit it.
-        Aliased waves resolve to their representative transparently. Returns
-        ``None`` when the ``(channel, wave)`` cell was never written (caller
-        falls back). An in-grid entity with no imagery in range comes back as
-        NaN; an id absent from the grid also comes back as NaN.
-        """
-        if channel not in CHANNELS or column not in STAT_COLUMNS:
-            return None
-        radius = int(radius)
-        radii = self.radii_for(channel)
-        if radius not in radii:
-            return None
-        rep = self.resolve_wave(channel, wave_index)
-        with self._lock:
-            arr = self._get_array(channel, rep)
-        if arr is None:
-            return None
-        ridx = radii.index(radius)
-        cidx = STAT_COLUMNS.index(column)
-
-        req = np.asarray(entity_ids).astype(np.int64, copy=False)
-        out = np.full(req.shape[0], np.nan, dtype=np.float32)
-        if self._sorted_ids is None or not self._sorted_ids.size:
-            return out
-        ords, valid = self._ords_for(req)
-        if valid.any():
-            out[valid] = np.asarray(arr[ords[valid], ridx, cidx], dtype=np.float32)
-        return out
-
-    def close(self) -> None:
-        for arr in self._arrays.values():
-            try:
-                arr.flush()
-            except Exception:
-                pass
-        self._arrays.clear()
-        try:
-            self._conn.close()
-        except Exception:
-            pass

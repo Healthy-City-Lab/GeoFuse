@@ -386,24 +386,21 @@ def _fusion_restart_summary_lines(p: dict) -> list[str]:
 
 
 def _fusion_preaggr_cache_files(p: dict, output_dir: str) -> list[str]:
-    """Pre-aggregation cache files belonging to this job's target.
+    """Reusable greenery pre-aggregation cache files.
 
-    The cache filename is ``preaggr-<target stem>-<config hash>.sqlite``, and
-    the hash is only known inside the engine, so every cache built from this
-    target is matched. Output files and result artefacts are never included —
-    this only covers recomputable intermediates.
+    The greenery cache is keyed on the greenery-file set + grid, not the target,
+    so it is shared across jobs and cannot be attributed to one target. Every
+    ``greenery-*.npz`` unit is listed — clearing them frees recomputable
+    intermediates (they rebuild on the next run). Output files and result
+    artefacts are never included.
     """
-    target_path = p.get("target_path") or ""
-    stem = os.path.splitext(os.path.basename(str(target_path)))[0]
-    if not stem:
-        return []
-    preaggr_dir = os.path.join(output_dir, "fusion_cache", "preaggr")
-    if not os.path.isdir(preaggr_dir):
+    greenery_dir = os.path.join(output_dir, "fusion_cache", "greenery")
+    if not os.path.isdir(greenery_dir):
         return []
     return sorted(
-        os.path.join(preaggr_dir, n)
-        for n in os.listdir(preaggr_dir)
-        if n.startswith(f"preaggr-{stem}-") and n.endswith(".sqlite")
+        os.path.join(greenery_dir, n)
+        for n in os.listdir(greenery_dir)
+        if n.startswith("greenery-") and n.endswith(".npz")
     )
 
 
