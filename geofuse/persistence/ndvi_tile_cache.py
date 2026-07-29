@@ -59,9 +59,9 @@ class NdviTileCache:
         with self._lock:
             self._conn.executescript(self._SCHEMA)
 
-    # ------------------------------------------------------------------
+    # ────────────────────────────────────────────────────────────
     # Engine API
-    # ------------------------------------------------------------------
+    # ────────────────────────────────────────────────────────────
 
     def workspace_dir(self, resume_key: str) -> str:
         """Per-key tile directory; creates the parent on first call.

@@ -12,9 +12,9 @@ from .logger import get_logger
 _log = get_logger("GVI")
 
 
-# ---------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # DEVICE SELECTION UTILITY
-# ---------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 def get_best_device(preferred_device=None):
     """
     Select best available device prioritizing: CUDA > MPS > CPU
@@ -41,9 +41,9 @@ def get_best_device(preferred_device=None):
         return torch.device("cpu")
 
 
-# ---------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # PATH CONFIGURATION
-# ---------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 current_dir = os.path.dirname(os.path.abspath(__file__))
 dl_core_path = os.path.join(current_dir, "dl_core")
 

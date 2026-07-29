@@ -137,7 +137,7 @@ class LongitudinalSpec:
         If true, the random-effects structure is
         ``(1 + years_since_baseline | entity_id)`` (random intercept + random
         slope on time). If false, ``(1 | entity_id)`` (random intercept
-        only). Default: true (per user 2026-05-28).
+        only). Default: true.
     scoring_metric
         One of :data:`MIXEDLM_METRICS`; the metric Optuna optimizes per
         trial. The other three are computed post-hoc on robust + top-20% +
@@ -151,6 +151,13 @@ class LongitudinalSpec:
     date_col: str = "measurement_date"
     greenery_files: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
     target_files_per_wave: Mapping[str, str] = field(default_factory=dict)
+    # Wide mode only: the entity / date column picked for each wave file, as
+    # ``{wave_label: {"entity_col": ..., "date_col": ...}}``. Intake uses the
+    # canonical ``entity_id_col`` / ``date_col``; this records what the user
+    # chose per file so the setup form can be restored exactly.
+    target_columns_per_wave: Mapping[str, Mapping[str, str]] = field(
+        default_factory=dict
+    )
     include_time_fixed_effect: bool = True
     random_slope_time: bool = True
     scoring_metric: str = DEFAULT_MIXEDLM_METRIC
@@ -164,6 +171,13 @@ class LongitudinalSpec:
     # (deviation) term. The overall greenery × time term is always reported.
     decline_average_exposure: bool = False
     decline_exposure_change: bool = False
+    # Wave indicators as fixed effects. Per-wave greenery files mean the
+    # exposure carries the layer's vintage, which tracks calendar time; without
+    # these the drift lands on the greenery × time terms.
+    include_wave_fixed_effects: bool = True
+    # Column holding a neighbourhood / site id. Entered as fixed effects so the
+    # area level a person-only random effect leaves out is accounted for.
+    area_id_col: str | None = None
 
     def to_payload(self) -> dict:
         """Serialise to a plain-dict payload (for ``rec.params`` / restart)."""
@@ -177,6 +191,9 @@ class LongitudinalSpec:
                 ch: dict(per_wave) for ch, per_wave in self.greenery_files.items()
             },
             "target_files_per_wave": dict(self.target_files_per_wave),
+            "target_columns_per_wave": {
+                w: dict(cols) for w, cols in self.target_columns_per_wave.items()
+            },
             "include_time_fixed_effect": self.include_time_fixed_effect,
             "random_slope_time": self.random_slope_time,
             "scoring_metric": self.scoring_metric,
@@ -184,6 +201,8 @@ class LongitudinalSpec:
             "association_target": self.association_target,
             "decline_average_exposure": self.decline_average_exposure,
             "decline_exposure_change": self.decline_exposure_change,
+            "include_wave_fixed_effects": self.include_wave_fixed_effects,
+            "area_id_col": self.area_id_col,
         }
 
     @classmethod
@@ -200,6 +219,10 @@ class LongitudinalSpec:
                 for ch, per_wave in (payload.get("greenery_files") or {}).items()
             },
             target_files_per_wave=dict(payload.get("target_files_per_wave") or {}),
+            target_columns_per_wave={
+                w: dict(cols)
+                for w, cols in (payload.get("target_columns_per_wave") or {}).items()
+            },
             include_time_fixed_effect=bool(
                 payload.get("include_time_fixed_effect", True)
             ),
@@ -211,6 +234,10 @@ class LongitudinalSpec:
             ),
             decline_average_exposure=bool(payload.get("decline_average_exposure", False)),
             decline_exposure_change=bool(payload.get("decline_exposure_change", False)),
+            include_wave_fixed_effects=bool(
+                payload.get("include_wave_fixed_effects", True)
+            ),
+            area_id_col=payload.get("area_id_col") or None,
         )
 
 
@@ -318,6 +345,8 @@ def target_intake_columns(
     cols = [spec.entity_id_col, spec.date_col, outcome_col, *covariate_cols]
     if not spec.derive_wave_from_date:
         cols.append(spec.wave_col)
+    if spec.area_id_col:
+        cols.append(spec.area_id_col)
     seen: set[str] = set()
     out: list[str] = []
     for c in cols:
@@ -580,6 +609,8 @@ def _project_columns(
         *cov_cols,
         "geometry",
     ]
+    if spec.area_id_col and spec.area_id_col in frame.columns:
+        cols.insert(2, spec.area_id_col)
     # Deduplicate while preserving order (entity_id_col may appear if a
     # covariate accidentally points at it).
     seen: set[str] = set()

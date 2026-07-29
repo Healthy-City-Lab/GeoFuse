@@ -92,6 +92,23 @@ _DEGENERATE: dict[str, float] = {
 # Below this many post-NaN rows a MixedLM fit is unreliable; return degenerate.
 _MIN_ROWS = 6
 
+# Within-entity exposure variance below this is treated as no variation at all.
+_WITHIN_VAR_ABS_TOL = 1e-12
+_WITHIN_VAR_REL_TOL = 1e-10
+
+
+def format_pvalue(p: object) -> str:
+    """Readable p-value. Underflow to 0.0 is a limit, not an exact zero."""
+    try:
+        val = float(p)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return "—"
+    if not np.isfinite(val):
+        return "—"
+    if val <= 0.0:
+        return "< 1e-300"
+    return f"{val:.1e}" if val < 1e-4 else f"{val:.4f}"
+
 
 def _coerce_2d(x: np.ndarray | None) -> np.ndarray | None:
     if x is None:
@@ -109,31 +126,63 @@ def _entity_missing_mask(arr: np.ndarray) -> np.ndarray:
     return np.asarray(pd.isna(np.asarray(arr)), dtype=bool)
 
 
-def _drop_nan(
+def _finite_mask(
     outcome: np.ndarray,
     greenery: np.ndarray,
     entity_id: np.ndarray,
     years_since_baseline: np.ndarray,
     covariates: np.ndarray | None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
-    eids = np.asarray(entity_id)
+) -> np.ndarray:
+    """Rows usable by a fit: finite everywhere and carrying an entity id."""
     mask = (
         np.isfinite(outcome)
         & np.isfinite(greenery)
         & np.isfinite(years_since_baseline)
-        & ~_entity_missing_mask(eids)
+        & ~_entity_missing_mask(np.asarray(entity_id))
     )
     if covariates is not None:
         mask &= np.isfinite(covariates).all(axis=1)
-    if mask.all():
-        return outcome, greenery, eids, years_since_baseline, covariates
-    return (
-        outcome[mask],
-        greenery[mask],
-        eids[mask],
-        years_since_baseline[mask],
-        None if covariates is None else covariates[mask],
-    )
+    return mask
+
+
+def _group_dummies(labels: np.ndarray | None, n_rows: int) -> np.ndarray | None:
+    """Drop-first indicator columns for a grouping label. ``None`` if unusable."""
+    if labels is None:
+        return None
+    arr = np.asarray(labels)
+    if len(arr) != n_rows:
+        return None
+    levels = [lv for lv in pd.unique(arr) if not pd.isna(lv)]
+    if len(levels) < 2:
+        return None
+    levels = sorted(levels, key=str)[1:]
+    return np.column_stack([(arr == lv).astype(np.float64) for lv in levels])
+
+
+def _time_spanned_by(t: np.ndarray, dummies: np.ndarray | None) -> bool:
+    """True when continuous time adds nothing beyond ``dummies`` + intercept.
+
+    Wave dummies plus a continuous time term are collinear whenever every wave
+    was measured at one instant; entering both would be rank-deficient.
+    """
+    if dummies is None or dummies.shape[1] == 0:
+        return False
+    design = np.column_stack([np.ones(len(t)), dummies])
+    beta, *_ = np.linalg.lstsq(design, t, rcond=None)
+    resid = t - design @ beta
+    return float(np.var(resid)) <= 1e-10 * max(float(np.var(t)), 1e-12)
+
+
+def _stack_period_terms(
+    cov: np.ndarray | None,
+    wave_dummies: np.ndarray | None,
+    area_dummies: np.ndarray | None,
+) -> np.ndarray | None:
+    """Append wave / area indicators to the covariate block."""
+    parts = [p for p in (cov, wave_dummies, area_dummies) if p is not None]
+    if not parts:
+        return None
+    return np.hstack(parts) if len(parts) > 1 else parts[0]
 
 
 def _build_fixed_design(
@@ -189,7 +238,11 @@ def _within_between(
     gmean = np.empty_like(g)
     gmean[order] = np.repeat(means, counts)
     gdev = g - gmean
-    return gmean, gdev, bool(float(np.var(gdev)) > 0)
+    # ── Estimability ────────────────────────────────────────────
+    # A time-invariant exposure leaves float dust, not zero, so the threshold is
+    # relative to the exposure's own scale.
+    tol = max(_WITHIN_VAR_ABS_TOL, _WITHIN_VAR_REL_TOL * float(np.var(g)))
+    return gmean, gdev, bool(float(np.var(gdev)) > tol)
 
 
 def _build_target_design(
@@ -311,49 +364,37 @@ def _compute_all_metrics(
     greenery_col: int,
     exog_re: np.ndarray,
     result_null=None,
+    X_null: np.ndarray | None = None,
+    result_full_ml=None,
+    result_null_ml=None,
 ) -> dict[str, float]:
-    """Extract all four metric values from the (already fitted) full result."""
+    """Extract all four metric values from the (already fitted) results.
+
+    ``result_null`` / ``X_null`` are the REML refit without the scored term, used
+    for the drop-one marginal R². ``result_full_ml`` / ``result_null_ml`` are the
+    ML pair used for the likelihood ratio.
+    """
     fe = _as_array(result_full.fe_params)
     bse = _as_array(result_full.bse_fe)
     coef = float(fe[greenery_col])
     se = float(bse[greenery_col])
     tstat = abs(coef / se) if se > 0 else 0.0
 
-    # Marginal R² (Nakagawa-style) — greenery's variance contribution as a
-    # share of total variance. Total variance = fixed-effects variance +
-    # random-effects variance contribution + residual variance.
-    yhat_full = X_full @ fe
-    var_fe_full = float(np.var(yhat_full, ddof=0))
-    fe_zero_g = fe.copy()
-    fe_zero_g[greenery_col] = 0.0
-    yhat_no_g = X_full @ fe_zero_g
-    var_fe_no_g = float(np.var(yhat_no_g, ddof=0))
+    # ── Marginal R2 ─────────────────────────────────────────────
+    # Greenery's share of total variance, as the drop in Nakagawa marginal R²
+    # when the term leaves the design. Differencing var(Xb) within one fit
+    # instead would go negative whenever greenery correlates with a covariate.
+    marginal_r2 = 0.0
+    if result_null is not None and X_null is not None:
+        r2_full = _marginal_r2_from_fit(result_full, X_full, exog_re)
+        r2_null = _marginal_r2_from_fit(result_null, X_null, exog_re)
+        marginal_r2 = max(0.0, r2_full - r2_null)
 
-    sigma2_resid = float(result_full.scale)
-    re_var = 0.0
-    cov_re = getattr(result_full, "cov_re", None)
-    if cov_re is not None:
-        cov_re_mat = np.asarray(cov_re)
-        # Approximate the random-effects variance contribution as
-        # sum_i cov_re[i,i] · E[Z_i²]. This is the standard Nakagawa
-        # approximation for a (1 + time | entity) structure and is exact
-        # for random-intercept-only models.
-        for i in range(cov_re_mat.shape[0]):
-            re_var += float(cov_re_mat[i, i]) * float(np.mean(exog_re[:, i] ** 2))
-
-    total_var = var_fe_full + re_var + sigma2_resid
-    marginal_r2 = (var_fe_full - var_fe_no_g) / total_var if total_var > 0 else 0.0
-    # A proportion of variance explained can't be negative; tiny negatives are
-    # floating-point noise around zero, but a large one signals a real problem.
-    if marginal_r2 < 0.0:
-        if marginal_r2 < -1e-6:
-            logger.debug("marginal_r2 came back at %.3e; clamping to 0", marginal_r2)
-        marginal_r2 = 0.0
-
+    # ── Likelihood ratio ────────────────────────────────────────
     lr_stat = 0.0
-    if result_null is not None:
+    if result_full_ml is not None and result_null_ml is not None:
         try:
-            lr_stat = 2.0 * (float(result_full.llf) - float(result_null.llf))
+            lr_stat = 2.0 * (float(result_full_ml.llf) - float(result_null_ml.llf))
             if not np.isfinite(lr_stat) or lr_stat < 0.0:
                 lr_stat = 0.0
         except Exception:
@@ -390,6 +431,8 @@ def score_mixedlm(
     spatial_method: str = "none",
     nan_on_fail: bool = False,
     target: str = DEFAULT_ASSOCIATION_TARGET,
+    wave_index: np.ndarray | None = None,
+    area_id: np.ndarray | None = None,
 ) -> float | tuple[float, float] | dict[str, float]:
     """Score a greenery model term in a mixed-effects linear model.
 
@@ -427,6 +470,12 @@ def score_mixedlm(
         Which greenery term the metric scores — one of :data:`ASSOCIATION_TARGETS`.
         ``level`` (default) is the main-effect association; the ``decline_*``
         targets score a greenery × time slope (overall / between / within).
+    wave_index, area_id
+        Optional per-row wave and area labels, entered as drop-first fixed
+        effects. Wave indicators absorb period effects — retest gains, exposure
+        vintage — that would otherwise load onto a greenery × time term. Area
+        indicators absorb the neighbourhood level a person-only random effect
+        leaves unmodelled.
     """
     if metric not in MIXEDLM_METRICS:
         raise ValueError(
@@ -455,7 +504,12 @@ def score_mixedlm(
     # Combine covariates and the smooth for joint NaN masking, then split back.
     n_cov = 0 if cov is None else cov.shape[1]
     combined = cov if sb is None else (sb if cov is None else np.hstack([cov, sb]))
-    y, g, eids, t, combined = _drop_nan(y, g, entity_id, t, combined)
+    mask = _finite_mask(y, g, entity_id, t, combined)
+    eids = np.asarray(entity_id)[mask]
+    y, g, t = y[mask], g[mask], t[mask]
+    combined = None if combined is None else combined[mask]
+    wave_lbl = None if wave_index is None else np.asarray(wave_index)[mask]
+    area_lbl = None if area_id is None else np.asarray(area_id)[mask]
     if sb is None:
         cov = combined
     elif combined is None:
@@ -480,8 +534,13 @@ def score_mixedlm(
     ):
         return _degenerate()
 
+    # ── Period / area fixed effects ─────────────────────────────
+    wave_d = _group_dummies(wave_lbl, len(y))
+    cov = _stack_period_terms(cov, wave_d, _group_dummies(area_lbl, len(y)))
+    time_fixed = include_time_fixed and not _time_spanned_by(t, wave_d)
+
     built = _build_target_design(
-        g, cov, t, eids, target=target, include_time_fixed=include_time_fixed,
+        g, cov, t, eids, target=target, include_time_fixed=time_fixed,
         include_target=True,
     )
     if built is None:  # e.g. a within-person slope with no over-time variation
@@ -492,25 +551,45 @@ def score_mixedlm(
     if result_full is None:
         return _degenerate()
 
-    # Optional null refit for the LR statistic (drops the scored term only).
+    # ── Null refits ─────────────────────────────────────────────
+    # The null design drops the scored term only. Marginal R2 needs it under
+    # REML (variance components); the LR needs BOTH sides under ML, because REML
+    # likelihoods are not comparable across different fixed-effects designs.
+    need_lr = metric == "mixedlm_lr" or return_all
+    need_r2 = metric == "mixedlm_marginal_r2" or return_all
     result_null = None
-    if metric == "mixedlm_lr" or return_all:
+    result_full_ml = None
+    X_null = None
+    if need_lr or need_r2:
         null_built = _build_target_design(
             g, cov, t, eids, target=target,
-            include_time_fixed=include_time_fixed, include_target=False,
+            include_time_fixed=time_fixed, include_target=False,
         )
         X_null = null_built[0] if null_built is not None else None
-        result_null = (
-            _fit_mixedlm(y, X_null, eids, exog_re) if X_null is not None else None
-        )
-        # A failed null refit would make the LR statistic collapse to 0.0,
-        # indistinguishable from a genuinely tiny LR. For a single-metric LR
-        # request treat that as a fit failure so the bootstrap can drop it.
-        if metric == "mixedlm_lr" and not return_all and result_null is None:
+    if need_r2 and X_null is not None:
+        result_null = _fit_mixedlm(y, X_null, eids, exog_re)
+    if need_lr and X_null is not None:
+        result_full_ml = _fit_mixedlm(y, X_full, eids, exog_re, reml=False)
+        result_null_ml = _fit_mixedlm(y, X_null, eids, exog_re, reml=False)
+    else:
+        result_null_ml = None
+    # A failed refit would collapse the metric to 0.0, indistinguishable from a
+    # genuinely tiny value, so a single-metric request fails instead.
+    if not return_all:
+        if metric == "mixedlm_lr" and (result_full_ml is None or result_null_ml is None):
+            return _degenerate()
+        if metric == "mixedlm_marginal_r2" and result_null is None:
             return _degenerate()
 
     all_metrics = _compute_all_metrics(
-        result_full, X_full, g_col, exog_re, result_null=result_null
+        result_full,
+        X_full,
+        g_col,
+        exog_re,
+        result_null=result_null,
+        X_null=X_null,
+        result_full_ml=result_full_ml,
+        result_null_ml=result_null_ml,
     )
     if return_all:
         return all_metrics
@@ -529,9 +608,9 @@ def score_mixedlm(
     return (score, pval) if return_pvalue else score
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Fast fixed-V GLS search scorer (ranking only; reports use the exact fit)
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 #
 # The exact per-trial MixedLM fit re-estimates the whole variance-component
 # model on every trial when only the greenery column changes. Because the
@@ -744,6 +823,8 @@ def estimate_fold_components(
     include_time_fixed: bool,
     random_slope: bool,
     target: str = DEFAULT_ASSOCIATION_TARGET,
+    wave_index: np.ndarray | None = None,
+    area_id: np.ndarray | None = None,
 ) -> tuple[np.ndarray, float] | None:
     """Per-fold random-effects covariance ``D`` and residual variance ``σ²``.
 
@@ -757,7 +838,19 @@ def estimate_fold_components(
     cov = _coerce_2d(covariates)
     # NaN-mask on the base inputs only (greenery excluded here).
     g0 = np.zeros_like(y)
-    y, _g, eids, t, cov = _drop_nan(y, g0, entity_id, t, cov)
+    mask = _finite_mask(y, g0, entity_id, t, cov)
+    eids = np.asarray(entity_id)[mask]
+    y, _g, t = y[mask], g0[mask], t[mask]
+    cov = None if cov is None else cov[mask]
+    wave_d = _group_dummies(
+        None if wave_index is None else np.asarray(wave_index)[mask], len(y)
+    )
+    cov = _stack_period_terms(
+        cov, wave_d, _group_dummies(
+            None if area_id is None else np.asarray(area_id)[mask], len(y)
+        )
+    )
+    include_time_fixed = include_time_fixed and not _time_spanned_by(t, wave_d)
     if len(y) < _MIN_ROWS or len(np.unique(eids)) < 2 or float(np.var(y)) == 0:
         return None
     base = _build_target_design(
@@ -789,6 +882,8 @@ def score_mixedlm_fast(
     return_pvalue: bool = False,
     target: str = DEFAULT_ASSOCIATION_TARGET,
     nan_on_fail: bool = False,
+    wave_index: np.ndarray | None = None,
+    area_id: np.ndarray | None = None,
 ):
     """Fast greenery score for one trial via fixed-``V`` GLS.
 
@@ -811,7 +906,10 @@ def score_mixedlm_fast(
     g = np.asarray(greenery, dtype=np.float64)
     t = np.asarray(years_since_baseline, dtype=np.float64)
     cov = _coerce_2d(covariates)
-    y, g, eids, t, cov = _drop_nan(y, g, entity_id, t, cov)
+    mask = _finite_mask(y, g, entity_id, t, cov)
+    eids = np.asarray(entity_id)[mask]
+    y, g, t = y[mask], g[mask], t[mask]
+    cov = None if cov is None else cov[mask]
     if (
         len(y) < _MIN_ROWS
         or len(np.unique(eids)) < 2
@@ -819,6 +917,15 @@ def score_mixedlm_fast(
         or float(np.var(g)) == 0
     ):
         return _degenerate()
+    wave_d = _group_dummies(
+        None if wave_index is None else np.asarray(wave_index)[mask], len(y)
+    )
+    cov = _stack_period_terms(
+        cov, wave_d, _group_dummies(
+            None if area_id is None else np.asarray(area_id)[mask], len(y)
+        )
+    )
+    include_time_fixed = include_time_fixed and not _time_spanned_by(t, wave_d)
     built = _build_target_design(
         g, cov, t, eids, target=target,
         include_time_fixed=include_time_fixed, include_target=True,
@@ -844,9 +951,9 @@ def score_mixedlm_fast(
     return score
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Penalized model comparison (CGI vs best standalone channel) — longitudinal
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 
 def compare_models_aic_bic_mixedlm(
@@ -860,6 +967,8 @@ def compare_models_aic_bic_mixedlm(
     *,
     include_time_fixed: bool = True,
     random_slope: bool = True,
+    wave_index: np.ndarray | None = None,
+    area_id: np.ndarray | None = None,
 ) -> dict:
     """AIC/BIC comparison of a full multi-channel MixedLM vs the best single channel.
 
@@ -904,6 +1013,16 @@ def compare_models_aic_bic_mixedlm(
     if len(y) < _MIN_ROWS or len(np.unique(eids)) < 2:
         return {**fail, "reason": "too few rows / entities for a MixedLM comparison"}
 
+    wave_d = _group_dummies(
+        None if wave_index is None else np.asarray(wave_index)[mask], len(y)
+    )
+    cov = _stack_period_terms(
+        cov, wave_d, _group_dummies(
+            None if area_id is None else np.asarray(area_id)[mask], len(y)
+        )
+    )
+    include_time_fixed = include_time_fixed and not _time_spanned_by(t, wave_d)
+
     def _fixed(cols: np.ndarray) -> np.ndarray:
         parts: list[np.ndarray] = [np.ones((len(y), 1)), cols]
         if cov is not None and cov.shape[1] > 0:
@@ -947,9 +1066,9 @@ def compare_models_aic_bic_mixedlm(
     }
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Covariate impact — mixed-effects analogue of the OLS covariate table
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 
 def _marginal_r2_from_fit(result, X: np.ndarray, exog_re: np.ndarray) -> float:
@@ -982,6 +1101,8 @@ def covariate_impact_mixedlm(
     *,
     include_time_fixed: bool = True,
     random_slope: bool = True,
+    wave_index: np.ndarray | None = None,
+    area_id: np.ndarray | None = None,
 ) -> dict | None:
     """Mixed-effects analogue of :meth:`MetricFusionEngine.compute_covariate_impact`.
 
@@ -1003,7 +1124,9 @@ def covariate_impact_mixedlm(
     y = np.asarray(outcome, dtype=np.float64).ravel()
     g = np.asarray(greenery, dtype=np.float64).ravel()
     t = np.asarray(years_since_baseline, dtype=np.float64).ravel()
-    y, g, eids, t, cov = _drop_nan(y, g, entity_id, t, cov)
+    mask = _finite_mask(y, g, entity_id, t, cov)
+    eids = np.asarray(entity_id)[mask]
+    y, g, t, cov = y[mask], g[mask], t[mask], cov[mask]
 
     n_groups = len(np.unique(eids)) if len(eids) else 0
     if (
@@ -1016,18 +1139,35 @@ def covariate_impact_mixedlm(
 
     exog_re = _build_re_design(t, random_slope=random_slope)
 
+    # Period / area indicators ride behind the user covariates so the per-
+    # covariate slot arithmetic below is unaffected.
+    n_cov = cov.shape[1]
+    wave_d = _group_dummies(
+        None if wave_index is None else np.asarray(wave_index)[mask], len(y)
+    )
+    area_d = _group_dummies(
+        None if area_id is None else np.asarray(area_id)[mask], len(y)
+    )
+    cov_aug = _stack_period_terms(cov, wave_d, area_d)
+    include_time_fixed = include_time_fixed and not _time_spanned_by(t, wave_d)
+
     # Full model: greenery + covariates [+ time]. Column order from
     # _build_fixed_design → [intercept, greenery, covariates..., time].
     X_full, g_col = _build_fixed_design(
-        g, cov, t, include_time_fixed=include_time_fixed, include_greenery=True
+        g, cov_aug, t, include_time_fixed=include_time_fixed, include_greenery=True
     )
     full = _fit_mixedlm(y, X_full, eids, exog_re)
     if full is None:
         return None
 
-    # Greenery-only model (no covariates) for the R² lift.
+    # Greenery-only model for the R² lift. Period / area terms stay in so the
+    # lift is attributable to the user's covariates alone.
     X_cgi, _ = _build_fixed_design(
-        g, None, t, include_time_fixed=include_time_fixed, include_greenery=True
+        g,
+        _stack_period_terms(None, wave_d, area_d),
+        t,
+        include_time_fixed=include_time_fixed,
+        include_greenery=True,
     )
     cgi_only = _fit_mixedlm(y, X_cgi, eids, exog_re)
 
@@ -1043,7 +1183,6 @@ def covariate_impact_mixedlm(
         _marginal_r2_from_fit(cgi_only, X_cgi, exog_re) if cgi_only is not None else 0.0
     )
 
-    n_cov = cov.shape[1]
     per_cov: list[dict] = []
     for i, name in enumerate(covariate_names[:n_cov]):
         slot = 2 + i  # [intercept(0), greenery(1), covariate_i(2+i), ...]
@@ -1055,6 +1194,7 @@ def covariate_impact_mixedlm(
         # Drop this covariate and refit for its marginal-R² contribution.
         cov_minus = np.delete(cov, i, axis=1)
         cov_minus = cov_minus if cov_minus.shape[1] > 0 else None
+        cov_minus = _stack_period_terms(cov_minus, wave_d, area_d)
         X_minus, _ = _build_fixed_design(
             g, cov_minus, t, include_time_fixed=include_time_fixed, include_greenery=True
         )
@@ -1072,6 +1212,7 @@ def covariate_impact_mixedlm(
                 "std_err": se,
                 "t_stat": float(t_stat),
                 "pvalue": pval,
+                "p_display": format_pvalue(pval),
                 "direction": direction,
                 "partial_r2": float(partial_r2),
             }
@@ -1089,9 +1230,9 @@ def covariate_impact_mixedlm(
     }
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Cluster (entity) bootstrap CI for a mixedlm_* metric
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 
 def cluster_bootstrap_metric_ci(
@@ -1110,6 +1251,8 @@ def cluster_bootstrap_metric_ci(
     ci_level: float = 0.95,
     seed: int = 42,
     target: str = DEFAULT_ASSOCIATION_TARGET,
+    wave_index: np.ndarray | None = None,
+    area_id: np.ndarray | None = None,
 ) -> dict:
     """Cluster (entity) bootstrap percentile CI for a ``mixedlm_*`` metric.
 
@@ -1157,8 +1300,13 @@ def cluster_bootstrap_metric_ci(
     y, g, t, eid = y[mask], g[mask], t[mask], eid[mask]
     cov = None if cov is None else cov[mask]
     sb = None if sb is None else sb[mask]
+    wave = None if wave_index is None else np.asarray(wave_index)[mask]
+    area = None if area_id is None else np.asarray(area_id)[mask]
 
-    def _score(yy, gg, ee, tt, cc, ss, *, return_pvalue=False, nan_on_fail=False):
+    def _score(
+        yy, gg, ee, tt, cc, ss, wv=None, ar=None, *,
+        return_pvalue=False, nan_on_fail=False,
+    ):
         return score_mixedlm(
             metric,
             yy,
@@ -1173,6 +1321,8 @@ def cluster_bootstrap_metric_ci(
             spatial_method=spatial_method,
             nan_on_fail=nan_on_fail,
             target=target,
+            wave_index=wv,
+            area_id=ar,
         )
 
     result: dict = {
@@ -1191,16 +1341,16 @@ def cluster_bootstrap_metric_ci(
     # bootstrap replicates already do this, so both halves now agree.
     if metric in HAS_PVALUE:
         obs, pval = _score(  # type: ignore[misc]
-            y, g, eid, t, cov, sb, return_pvalue=True, nan_on_fail=True
+            y, g, eid, t, cov, sb, wave, area, return_pvalue=True, nan_on_fail=True
         )
         result["observed"] = float(obs)
         result["pvalue"] = float(pval)
     else:
-        result["observed"] = float(_score(y, g, eid, t, cov, sb, nan_on_fail=True))
+        result["observed"] = float(
+            _score(y, g, eid, t, cov, sb, wave, area, nan_on_fail=True)
+        )
 
-    # A failed observed fit has no point estimate, so emit no CI — reporting a
-    # bootstrap interval around a missing estimate is what produced CIs that
-    # excluded their own ``0.0`` point.
+    # No point estimate means no interval to report around it.
     if not np.isfinite(result["observed"]):
         result["status"] = "fit_failed"
         return result
@@ -1232,6 +1382,8 @@ def cluster_bootstrap_metric_ci(
                     t[idx],
                     None if cov is None else cov[idx],
                     None if sb is None else sb[idx],
+                    None if wave is None else wave[idx],
+                    None if area is None else area[idx],
                     nan_on_fail=True,
                 )
             )
@@ -1249,9 +1401,9 @@ def cluster_bootstrap_metric_ci(
     return result
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Exposure-decline terms (greenery × time)
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 
 def _fit_terms(y, cols, eids, exog_re):
@@ -1286,6 +1438,8 @@ def decline_terms_mixedlm(
     random_slope: bool = True,
     want_between: bool = False,
     want_within: bool = False,
+    wave_index: np.ndarray | None = None,
+    area_id: np.ndarray | None = None,
 ) -> dict | None:
     """Greenery × time terms testing whether exposure is linked to the outcome's
     rate of change.
@@ -1294,6 +1448,9 @@ def decline_terms_mixedlm(
     ``want_within`` it additionally fits a within-between decomposition and
     reports the **average-exposure** (person-mean × time) and **exposure-change**
     (within-person deviation × time) slopes, each controlling for the other.
+    ``wave_index`` / ``area_id`` enter as drop-first fixed effects — see
+    :func:`score_mixedlm`.
+
     Returns ``{"n", "within_estimable", "terms": [{key, coef, std_err, t_stat,
     pvalue, direction}]}`` or ``None`` on a fit failure / too little data.
     """
@@ -1301,7 +1458,17 @@ def decline_terms_mixedlm(
     g = np.asarray(greenery, dtype=np.float64).ravel()
     t = np.asarray(years_since_baseline, dtype=np.float64).ravel()
     cov = _coerce_2d(covariates)
-    y, g, eids, t, cov = _drop_nan(y, g, entity_id, t, cov)
+    mask = _finite_mask(y, g, entity_id, t, cov)
+    eids = np.asarray(entity_id)[mask]
+    y, g, t = y[mask], g[mask], t[mask]
+    cov = None if cov is None else cov[mask]
+    wave_d = _group_dummies(
+        None if wave_index is None else np.asarray(wave_index)[mask], len(y)
+    )
+    area_d = _group_dummies(
+        None if area_id is None else np.asarray(area_id)[mask], len(y)
+    )
+    cov = _stack_period_terms(cov, wave_d, area_d)
     if len(y) < _MIN_ROWS or len(np.unique(eids)) < 2 or float(np.var(y)) == 0:
         return None
 
@@ -1321,14 +1488,18 @@ def decline_terms_mixedlm(
             "std_err": se,
             "t_stat": float(tstat),
             "pvalue": pval,
+            "p_display": format_pvalue(pval),
             "direction": direction,
         }
+
+    # Wave dummies can already span continuous time; entering both is singular.
+    time_cols = [] if _time_spanned_by(t, wave_d) else [("time", t)]
 
     terms: list[dict] = []
     # Overall greenery × time (always).
     pooled = _fit_terms(
         y,
-        [("greenery", g)] + cov_cols + [("time", t), ("greenery_x_time", g * t)],
+        [("greenery", g)] + cov_cols + time_cols + [("greenery_x_time", g * t)],
         eids,
         exog_re,
     )
@@ -1341,28 +1512,96 @@ def decline_terms_mixedlm(
         cols = [("g_between", gmean)]
         if within_estimable:
             cols.append(("g_within", gdev))
-        cols += cov_cols + [("time", t)]
+        cols += cov_cols + time_cols
         if want_between:
             cols.append(("between_x_time", gmean * t))
         if want_within and within_estimable:
             cols.append(("within_x_time", gdev * t))
         decomposed = _fit_terms(y, cols, eids, exog_re)
-        if decomposed is not None:
-            if want_between and "between_x_time" in decomposed:
-                terms.append(_row("between", decomposed["between_x_time"]))
-            if want_within:
-                if within_estimable and "within_x_time" in decomposed:
-                    terms.append(_row("within", decomposed["within_x_time"]))
-                else:
-                    terms.append(
-                        {
-                            "key": "within",
-                            "coef": float("nan"),
-                            "std_err": float("nan"),
-                            "t_stat": float("nan"),
-                            "pvalue": float("nan"),
-                            "direction": "—",
-                        }
-                    )
+
+        def _unestimable(key: str) -> dict:
+            return {
+                "key": key,
+                "coef": float("nan"),
+                "std_err": float("nan"),
+                "t_stat": float("nan"),
+                "pvalue": float("nan"),
+                "p_display": "—",
+                "direction": "—",
+            }
+
+        # A requested term always gets a row. A singular decomposition — the
+        # exposure deviation being a deterministic function of the wave, say —
+        # is reported as unestimable rather than omitted.
+        if want_between:
+            terms.append(
+                _row("between", decomposed["between_x_time"])
+                if decomposed and "between_x_time" in decomposed
+                else _unestimable("between")
+            )
+        if want_within:
+            terms.append(
+                _row("within", decomposed["within_x_time"])
+                if decomposed and within_estimable and "within_x_time" in decomposed
+                else _unestimable("within")
+            )
 
     return {"n": int(len(y)), "within_estimable": bool(within_estimable), "terms": terms}
+
+
+# ────────────────────────────────────────────────────────────────────
+# Period-confounding diagnostic
+# ────────────────────────────────────────────────────────────────────
+
+# Above this |correlation| the within-person exposure change is mostly a
+# function of when the person was measured, not of where they live.
+PERIOD_CONFOUNDING_THRESHOLD: float = 0.2
+
+
+def placebo_exposure(greenery: np.ndarray, wave_index: np.ndarray) -> np.ndarray:
+    """Exposure replaced by its per-wave mean — same period structure, no spatial
+    content. A greenery × time term that survives this substitution is measuring
+    the wave, not the neighbourhood."""
+    g = np.asarray(greenery, dtype=np.float64).ravel()
+    return (
+        pd.Series(g).groupby(np.asarray(wave_index)).transform("mean").to_numpy()
+    )
+
+
+def period_confounding_report(
+    greenery: np.ndarray,
+    entity_id: np.ndarray,
+    years_since_baseline: np.ndarray,
+    wave_index: np.ndarray | None = None,
+) -> dict:
+    """How much of the within-person exposure change is period drift.
+
+    Returns the within-person correlation between the exposure deviation and the
+    time deviation, the per-wave mean exposure, whether any entity moves in
+    exposure space at all, and a ``confounded`` verdict.
+    """
+    g = np.asarray(greenery, dtype=np.float64).ravel()
+    t = np.asarray(years_since_baseline, dtype=np.float64).ravel()
+    eids = np.asarray(entity_id)
+    ok = np.isfinite(g) & np.isfinite(t) & ~_entity_missing_mask(eids)
+    g, t, eids = g[ok], t[ok], eids[ok]
+    out: dict = {"n": int(len(g)), "within_time_corr": None, "confounded": False}
+    if len(g) < _MIN_ROWS:
+        return out
+
+    _gmean, gdev, estimable = _within_between(g, eids)
+    out["within_estimable"] = bool(estimable)
+    tser = pd.Series(t).groupby(eids).transform("mean").to_numpy()
+    tdev = t - tser
+    if estimable and float(np.var(tdev)) > 0:
+        r = float(np.corrcoef(gdev, tdev)[0, 1])
+        if np.isfinite(r):
+            out["within_time_corr"] = r
+            out["confounded"] = abs(r) >= PERIOD_CONFOUNDING_THRESHOLD
+    if wave_index is not None:
+        wv = np.asarray(wave_index)[ok]
+        means = pd.Series(g).groupby(wv).mean()
+        out["per_wave_mean_exposure"] = {
+            str(k): float(v) for k, v in means.sort_index().items()
+        }
+    return out

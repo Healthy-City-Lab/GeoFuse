@@ -34,6 +34,12 @@ Merged jobs record all of their source files. If such a job is interrupted, the 
 3. **Fusion tab** — upload an outcome target — a vector (GeoJSON, Shapefile, or GeoPackage) or raster (GeoTIFF) layer — plus the GVI + NDVI files from steps 1–2, choose a run mode and objective, and run the optimization.
 4. Inspect the composite weights, statistics, and maps; export results.
 
+### Re-running a finished job
+
+Click **🔄** on a completed job and confirm on the job card itself. The setup form comes up filled in from that job — run mode, target and metric files with their year assignment, outcome, covariates, standalone studies, buffer ladders and every search setting. Nothing is submitted until you press the usual run button, so any setting can be changed on the way. A file that has since moved or been deleted is flagged in its own picker entry; a file that merely changed is used as it now stands. Tick **Clear this target's pre-aggregation cache first** when the metric files changed at the same path.
+
+Jobs recorded before a given setting existed cannot seed it, and that setting keeps its default. This applies to the per-file year column, which older records did not store.
+
 ### Resuming after a crash or restart
 
 If Streamlit (or the machine) restarts mid-job, the affected jobs reload as **Interrupted**. To resume, return to the originating tab and re-upload the **same** study area file. A restart panel appears with **Resume Job** / **Discard**; resume continues from where it stopped (processed points and cached data are skipped). The re-uploaded file is hash-verified, so a mismatched file is refused.
@@ -56,8 +62,9 @@ The form reads top-to-bottom in the order you reason about a run:
 2. **Optimization Setup** — pick the **Run mode**:
    - **Cross-sectional** — optionally enable **Date column available?** to route each entity to a year-matched greenery file (the year is only a file key, never a regression input).
    - **Mixed-effects (longitudinal)** — for repeated measures; a date column is required.
-3. **Metric File Assignment** — per channel (NDVI, then GVI), set the buffer ladder (min / max / step in metres) and upload one or more files. When years/waves are in play, drag each year/wave chip onto the file that covers it (chips start in an **Unassigned** pool; a chip can sit on only one file). Anything left unassigned blocks submission.
-4. **Study Details** — CGI formula (`weighted_average` or `synergy`), covariates to control for, the **objective metric**, an optional **spatial-confounding adjustment** (KS-AIC / Spatial+), the **test-set size**, the **stability-selection** knobs, the **per-pixel CGI grid pixel size**, the **[0, 1] composite scaling** toggle, and the **standalone single-metric** option.
+3. **Metric File Assignment** — per channel (NDVI, then GVI), set the buffer ladder (min / max / step in metres) and upload one or more files. When years/waves are in play, pick the covering file for each year from its own compact picker; a year can point at only one file. Flip **Drag and drop** to move year chips onto files instead. Anything left unassigned blocks submission.
+4. **Study Details** — CGI formula (`weighted_average` or `synergy`), covariates to control for, the **objective metric**, an optional **spatial-confounding adjustment** (KS-AIC / Spatial+), the **test-set size**, the **stability-selection** knobs, the **per-pixel CGI grid pixel size**, the **[0, 1] composite scaling** toggle, and the **standalone single-metric** option. Longitudinal runs add **wave fixed effects** (on by default) and an optional **neighbourhood / site column**.
+   - Covariates listed under **Categorical** are one-hot encoded and counted as covariates automatically — there is no need to add them to both lists.
 5. **🚀 Run Fusion Optimization.**
 
 > [!NOTE]
@@ -67,7 +74,7 @@ The form reads top-to-bottom in the order you reason about a run:
 
 After a job completes — or when you click **Load results** on a completed job — the panel renders top-to-bottom:
 
-- **Headline** — held-out test score + 95 % CI, the greenery↔outcome direction, and (when standalones ran) the CGI-vs-best-standalone AIC/BIC verdict.
+- **Headline** — held-out test score + 95 % CI, the held-out significance (labelled with the test it actually is — permutation for cross-sectional objectives, Wald for mixed-effects), the greenery↔outcome direction, and (when standalones ran) the CGI-vs-best-standalone verdicts.
 - **Study detail** — pick a study (CGI or a standalone) to see its score, selected weights / radii / aggregators, per-subset scores, final parameters, and stability diagnostics.
 - **CGI vs standalone** — score comparison plus the penalized model verdict (when standalones ran).
 - **Channel collinearity** — VIF report, when requested.

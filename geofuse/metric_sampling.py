@@ -33,15 +33,11 @@ def nearest_metric_join(
 ) -> pd.Series:
     """Nearest-neighbour join in a metric CRS, returning one value per source row.
 
-    ``gpd.sjoin_nearest`` has two pitfalls that produced
-    ``ValueError: cannot reindex on an axis with duplicate labels`` in fusion:
+    Works around two ``gpd.sjoin_nearest`` pitfalls:
 
-    1. Run in EPSG:4326 (degrees), the ``max_distance`` parameter is interpreted
-       in *degrees* rather than metres — effectively unbounded.
-    2. When multiple right-hand features are exactly equidistant from a source
-       point, the join returns *multiple rows for the same source index*. The
-       subsequent column assignment then fails because pandas cannot reindex
-       onto a duplicated axis.
+    1. In EPSG:4326 ``max_distance`` is read in degrees, not metres.
+    2. Equidistant right-hand features yield several rows per source index,
+       which breaks the follow-up column assignment.
 
     This helper reprojects both sides to a common UTM CRS so ``max_distance_m``
     is honoured, then drops duplicate left-index rows by keeping the first

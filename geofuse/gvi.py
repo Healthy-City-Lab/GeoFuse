@@ -122,7 +122,7 @@ _EMPTY_CACHE_EVERY_N = 200
 # find the padding edges, never to sample colour, so a coarse step is safe.
 _SCAN_STEP = 4
 
-# ── Adaptive rate-limit handling ────────────────────────────────────────────
+# ── Adaptive rate-limit handling ────────────────────────────────────
 # Google's endpoints are unofficial and throttle by IP with no published quota,
 # so the safe design is to *detect* push-back and back off rather than guess a
 # fixed rate. Backoff grows exponentially per consecutive throttle event and

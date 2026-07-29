@@ -3,6 +3,7 @@ import glob
 import html
 import io
 import os
+import re
 from datetime import date, datetime
 from pathlib import Path
 
@@ -19,7 +20,6 @@ from helpers import (
     RESTART_SESSION_KEY,
     file_size_mtime_fingerprint,
     materialize_uploaded_dataset,
-    path_drift_status,
     sanitize_gdf_attributes_for_json,
 )
 from jinja2 import Template
@@ -34,6 +34,7 @@ except ImportError:
     _MetricFusionEngine = None
 
 from geofuse import cgi_formulas as _cgi_formulas
+from geofuse import mixed_effects_scoring as _mes
 from geofuse.crs_utils import buffer_gdf_union_metres, reproject_geodataframe_to_wgs84
 from geofuse.vector_io import (
     geometry_sha256,
@@ -248,9 +249,9 @@ def _add_outcome_geometry_preview(
     return ok
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Metric-file helpers
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 
 def _scan_metric_files(output_dir: str, suffix: str) -> list:
@@ -314,75 +315,9 @@ def _check_coverage(metric_path: str, buffered_gdf: "gpd.GeoDataFrame") -> bool:
         return False
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Restart workflow
-# ---------------------------------------------------------------------------
-
-
-def _fusion_restart_summary_lines(p: dict) -> list[str]:
-    """Read-only summary of the original job's config shown above the re-run form."""
-    covs = p.get("covariate_columns") or []
-    standalones = p.get("standalone_channels") or []
-    lon_payload = p.get("longitudinal_spec_payload") or None
-    _max_pfer = float(p.get("max_pfer", 1.0) or 0.0)
-    _max_pfer_lbl = "off" if _max_pfer <= 0 else f"{_max_pfer:g}"
-    lines = [
-        f"**Target:** `{p.get('target_display_name', '?')}`",
-        f"**Outcomes:** {', '.join(p.get('outcome_columns') or []) or '—'}",
-        f"**CGI formula:** `{p.get('cgi_formula') or 'weighted_average'}`",
-        f"**Covariates:** {', '.join(covs) if covs else '—'}",
-        f"**Standalone metrics:** "
-        f"{', '.join(_CHANNEL_DISPLAY.get(s, s) for s in standalones) if standalones else '—'}",
-        f"**Objective:** `{p.get('objective_metric', '?')}` "
-        f"(residualize: `{p.get('residualize_method', 'linear')}`) · "
-        f"**Test set:** {float(p.get('test_size', 0.0) or 0.0) * 100:.0f}%",
-        f"**Stability selection:** {p.get('n_bootstraps', '?')} bootstraps × "
-        f"{p.get('n_trials_per_bootstrap', '?')} trials "
-        f"({p.get('weight_bin_pct', 10)}% cells · min {p.get('min_cell_count', '?')}"
-        f"/cell · max PFER {_max_pfer_lbl})",
-        f"**GVI buffers (m):** {p.get('gvi_buffer_min_m', '?')} – "
-        f"{p.get('gvi_buffer_max_m', '?')} (step {p.get('gvi_buffer_step_m', '?')})",
-        f"**NDVI buffers (m):** {p.get('ndvi_buffer_min_m', '?')} – "
-        f"{p.get('ndvi_buffer_max_m', '?')} (step {p.get('ndvi_buffer_step_m', '?')})",
-    ]
-    if lon_payload:
-        derived = lon_payload.get("derive_wave_from_date")
-        descriptor = (
-            "year-aware cross-sectional (OLS scorer)"
-            if derived
-            else f"`{lon_payload.get('intake_mode')}` intake"
-        )
-        _tgt = lon_payload.get("association_target", "level")
-        lines.append(
-            f"**Year/wave-aware:** {descriptor}, "
-            f"waves={lon_payload.get('wave_labels')}, "
-            f"scoring=`{lon_payload.get('scoring_metric')}`"
-            + (f", fit-to=`{_tgt}`" if _tgt and _tgt != "level" else "")
-        )
-    cgi_grid = p.get("cgi_grid_spacing_m")
-    if cgi_grid is not None:
-        scaling_scope = "whole-grid" if p.get("whole_grid_scaling") else "per-fold"
-        split_kind = (
-            "area-balanced" if p.get("area_balanced_split") else "count-balanced"
-        )
-        chan_norm = "normalized" if p.get("normalize_channels") else "raw"
-        lines.append(
-            f"**Polygon scoring:** per-pixel CGI · pixel size "
-            f"{cgi_grid} m · {scaling_scope} scaling · {split_kind} split · "
-            f"{chan_norm} channels"
-        )
-    sa_method = p.get("spatial_adjust_method", "none")
-    if sa_method and sa_method != "none":
-        sa_label = {"ks_aic": "KS-AIC", "spatial_plus": "Spatial+"}.get(
-            sa_method, sa_method
-        )
-        sa_eps = p.get("spatial_adjust_eps_m")
-        lines.append(
-            f"**Spatial confounding:** {sa_label} · max df "
-            f"{p.get('spatial_adjust_max_df', 10)} · "
-            f"eps {'auto' if sa_eps is None else f'{sa_eps:g} m'}"
-        )
-    return lines
+# ────────────────────────────────────────────────────────────────────
 
 
 def _fusion_preaggr_cache_files(p: dict, output_dir: str) -> list[str]:
@@ -419,491 +354,29 @@ def _purge_fusion_preaggr_cache(paths: list[str]) -> tuple[int, int]:
     return removed, freed
 
 
-def _submit_fusion_restart(
-    store,
-    executor,
-    rec,
-    p: dict,
-    target_mat,
-    output_dir: str,
-    veg_path: str | None,
-    ndvi_path: str | None,
-    *,
-    resume: bool = True,
-) -> None:
-    """Resubmit a fusion job with identical params.
+def _consume_fusion_restart(store) -> None:
+    """Seed the setup form when a re-run was confirmed in the job monitor.
 
-    With ``resume`` (the default, and what a stopped job wants) the Optuna
-    study, the per-job pre-aggregation cache, and the metric-download cache are
-    all content-addressed, so the resubmit picks up where the previous run left
-    off — stages whose caches are populated complete near-instantly.
-
-    With ``resume=False`` the run starts a fresh study namespace, so the search
-    is performed again rather than continuing a study that already met its
-    trial budget. This is what a *completed* job needs in order to actually
-    recompute rather than finish instantly with the previous answer.
-    """
-    if _MetricFusionEngine is None:
-        raise RuntimeError("MetricFusionEngine is unavailable; cannot restart.")
-
-    new_params = dict(p)
-    new_params["restart_of"] = rec.id
-    new_params["resume_existing_study"] = bool(resume)
-
-    is_vector = bool(p.get("is_vector_target"))
-    outcome_columns = list(p.get("outcome_columns") or [])
-    job_target_band = int(p.get("target_band", 1))
-
-    # Replay the recorded run configuration verbatim — no per-key defaults, so
-    # a restart reproduces the original run exactly. A missing key means the
-    # job was recorded by an older build; fail loudly rather than silently
-    # substitute a default. The spatial-confounding keys are exempt: jobs
-    # recorded before they existed replay with the adjustment off (which is what
-    # those runs used), so old jobs still restart.
-    _restart_defaults = {
-        "spatial_adjust_method": "none",
-        "spatial_adjust_max_df": 10,
-        "spatial_adjust_eps_m": None,
-        "covariate_types": {},
-        "residualize_method": "linear",
-        "search_scoring_method": "mom_em3",
-    }
-    missing = [
-        k for k in _FUSION_RUN_CONFIG_KEYS if k not in p and k not in _restart_defaults
-    ]
-    if missing:
-        raise RuntimeError(
-            f"Cannot restart: the stored job is missing settings {missing}. "
-            "Re-run it fresh from the form instead."
-        )
-    run_config = {
-        k: p.get(k, _restart_defaults.get(k)) for k in _FUSION_RUN_CONFIG_KEYS
-    }
-    run_config["resume_existing_study"] = bool(resume)
-
-    new_rec = store.submit(type="fusion", name=rec.name, params=new_params)
-    executor.submit_fusion_subprocess(
-        new_rec,
-        dict(
-            target_path=target_mat.path,
-            target_features_geojson=(tuple(outcome_columns) if is_vector else ()),
-            target_band=job_target_band if not is_vector else 1,
-            target_layer=p.get("target_layer") if is_vector else None,
-            target_cleanup_dir=target_mat.cleanup_dir,
-            target_cleanup_file=target_mat.cleanup_file,
-            veg_path=veg_path,
-            ndvi_path=ndvi_path,
-            output_dir=output_dir,
-            **run_config,
-        ),
-    )
-
-
-def _render_fusion_restart_panel(store, executor, output_dir: str) -> bool:
-    """Restart workflow for a stopped fusion job.
-
-    Returns True when the panel handled the active restart session — the caller
-    should ``return`` and skip the rest of the tab so the user finishes the
-    restart flow before submitting anything else.
+    The confirmation happens on the job card itself, so by the time the key
+    arrives here the user has already said yes: seed and let the normal flow
+    render the pre-filled form. The toast is the only acknowledgement — the
+    filled form speaks for itself.
     """
     job_id = st.session_state.get(RESTART_SESSION_KEY)
     if not job_id:
-        return False
+        return
     rec = store.get(job_id)
     if rec is None or rec.type != "fusion":
-        return False
+        return
 
-    p = rec.params or {}
-    is_vector = bool(p.get("is_vector_target"))
-    expected_hash = p.get("geometry_sha256")
-
-    completed = rec.status == "completed"
-    title = "Re-run" if completed else "Restart"
-    with st.expander(f"↻ {title} fusion job: {rec.name or rec.id}", expanded=True):
-        st.caption(
-            "The Optuna study, pre-aggregation cache, and metric downloads "
-            "are all content-addressed, so a same-config restart resumes "
-            "where the previous run stopped. Files that still match the "
-            "recorded fingerprint don't need to be re-supplied."
-        )
-        for line in _fusion_restart_summary_lines(p):
-            st.write(line)
-
-        # A finished job has already met its trial budget, so resuming its
-        # study would add no trials and return the previous answer. Make the
-        # choice explicit rather than defaulting to a run that does nothing.
-        resume = True
-        cache_files: list[str] = []
-        if completed:
-            st.divider()
-            mode = st.radio(
-                "This job already completed. What should the re-run do?",
-                options=("recalculate", "reproduce"),
-                format_func=lambda m: (
-                    "Recalculate — clear this target's pre-aggregation cache "
-                    "and search again"
-                    if m == "recalculate"
-                    else "Reproduce — reuse the finished study and regenerate "
-                    "outputs"
-                ),
-                key=f"f_restart_mode_{rec.id}",
-                horizontal=False,
-            )
-            resume = mode == "reproduce"
-            cache_files = (
-                _fusion_preaggr_cache_files(p, output_dir)
-                if mode == "recalculate"
-                else []
-            )
-            if mode == "recalculate":
-                if cache_files:
-                    total = sum(
-                        os.path.getsize(f) for f in cache_files if os.path.isfile(f)
-                    )
-                    st.warning(
-                        f"Will delete {len(cache_files)} pre-aggregation cache "
-                        f"file(s) ({total / 1024**2:.0f} MB) and rebuild them:"
-                    )
-                    for f in cache_files:
-                        st.caption(f"• `{os.path.basename(f)}`")
-                else:
-                    st.info(
-                        "No pre-aggregation cache found for this target — it "
-                        "will be built from scratch."
-                    )
-                st.caption(
-                    "Outputs and result artefacts from the previous run are "
-                    "left untouched; the new run writes to its own job folder."
-                )
-            else:
-                st.info(
-                    "Reuses the completed study, so the numbers will match the "
-                    "previous run. Pick **Recalculate** if you want the search "
-                    "performed again."
-                )
-            st.divider()
-
-        # Silent-restart fast path: every recorded input file is still at
-        # its original absolute path with the same fingerprint. Skip every
-        # uploader and rerun directly from the stored paths.
-        rec_target_path = p.get("target_path")
-        rec_target_fp = p.get("target_fingerprint", "")
-        if (
-            rec_target_path
-            and path_drift_status(rec_target_path, rec_target_fp) == "ok"
-        ):
-            st.success(
-                f"✓ Target verified at `{rec_target_path}` — no re-upload " "needed."
-            )
-            from file_picker import path_to_dataset
-
-            target_mat = path_to_dataset(rec_target_path)
-            cancel_col, rerun_col = st.columns([1, 1])
-            with cancel_col:
-                if st.button(
-                    "Cancel restart",
-                    key=f"f_restart_cancel_silent_{rec.id}",
-                    width="stretch",
-                ):
-                    st.session_state[RESTART_SESSION_KEY] = None
-                    st.rerun()
-            with rerun_col:
-                if st.button(
-                    "Re-run",
-                    type="primary",
-                    key=f"f_restart_confirm_silent_{rec.id}",
-                    width="stretch",
-                ):
-                    try:
-                        if cache_files:
-                            n, freed = _purge_fusion_preaggr_cache(cache_files)
-                            st.info(
-                                f"Cleared {n} cache file(s), freed "
-                                f"{freed / 1024**2:.0f} MB."
-                            )
-                        _submit_fusion_restart(
-                            store,
-                            executor,
-                            rec,
-                            p,
-                            target_mat,
-                            output_dir,
-                            p.get("gvi_path"),
-                            p.get("ndvi_path"),
-                            resume=resume,
-                        )
-                    except Exception as e:
-                        st.error(f"Re-submission failed: {e}")
-                        return True
-                    st.session_state[RESTART_SESSION_KEY] = None
-                    st.success("Re-run submitted. Monitor progress in the sidebar.")
-                    st.rerun()
-            return True
-
-        target_uploads = st.file_uploader(
-            f"Re-upload target (original: `{p.get('target_display_name', '?')}`)",
-            accept_multiple_files=True,
-            type=FUSION_TARGET_UPLOAD_TYPES,
-            key=f"f_restart_target_{rec.id}",
-        )
-        if not target_uploads:
-            st.info("Select the original target file(s) to continue.")
-            return True
-
-        try:
-            target_mat = materialize_uploaded_dataset(target_uploads)
-        except ValueError as e:
-            st.error(str(e))
-            return True
-
-        if is_vector:
-            try:
-                rv_kwargs: dict = {}
-                target_layer = p.get("target_layer")
-                if target_layer is not None and Path(
-                    target_mat.path
-                ).suffix.lower() in (
-                    ".gpkg",
-                    ".zip",
-                ):
-                    rv_kwargs["layer"] = target_layer
-                gdf_re = read_vector_path(target_mat.path, **rv_kwargs)
-            except Exception as e:
-                st.error(f"Failed to read target: {e}")
-                return True
-            actual_hash = geometry_sha256(gdf_re)
-            if expected_hash:
-                if actual_hash != expected_hash:
-                    st.error(
-                        "Hash mismatch — uploaded target is not the original.\n\n"
-                        f"  Expected: `{expected_hash[:16]}…`\n"
-                        f"  Got:      `{actual_hash[:16]}…`"
-                    )
-                    return True
-                st.success("Target geometry verified against the original.")
-            else:
-                st.toast(
-                    "Original geometry hash was not recorded — skipping verification.",
-                    icon="⚠️",
-                )
-        else:
-            st.toast("Raster target — content hash not verified.", icon="ℹ️")
-
-        # Re-resolve metric files. The drift fast path reuses the original
-        # absolute paths when their size+mtime still match; otherwise the
-        # user re-uploads. Loaded-results / auto-download metric modes were
-        # removed from the submission UI, so the only fallback path is
-        # re-upload.
-        veg_path_re: str | None = None
-        ndvi_path_re: str | None = None
-
-        rec_gvi_path = p.get("gvi_path")
-        rec_gvi_fp = p.get("gvi_fingerprint", "")
-        rec_ndvi_path = p.get("ndvi_path")
-        rec_ndvi_fp = p.get("ndvi_fingerprint", "")
-
-        col_g, col_n = st.columns(2)
-        with col_g:
-            if rec_gvi_path and path_drift_status(rec_gvi_path, rec_gvi_fp) == "ok":
-                veg_path_re = rec_gvi_path
-                st.success(
-                    f"✓ Reusing GVI file from original path: "
-                    f"`{os.path.basename(rec_gvi_path)}`"
-                )
-            else:
-                gvi_up = st.file_uploader(
-                    "🌿 GVI File",
-                    accept_multiple_files=True,
-                    type=FUSION_TARGET_UPLOAD_TYPES,
-                    key=f"f_restart_gvi_{rec.id}",
-                )
-                if gvi_up:
-                    try:
-                        veg_path_re = materialize_uploaded_dataset(gvi_up).path
-                    except ValueError as e:
-                        st.error(f"GVI: {e}")
-                        return True
-        with col_n:
-            if rec_ndvi_path and path_drift_status(rec_ndvi_path, rec_ndvi_fp) == "ok":
-                ndvi_path_re = rec_ndvi_path
-                st.success(
-                    f"✓ Reusing NDVI file from original path: "
-                    f"`{os.path.basename(rec_ndvi_path)}`"
-                )
-            else:
-                ndvi_up = st.file_uploader(
-                    "🛰️ NDVI File",
-                    accept_multiple_files=True,
-                    type=FUSION_TARGET_UPLOAD_TYPES,
-                    key=f"f_restart_ndvi_{rec.id}",
-                )
-                if ndvi_up:
-                    try:
-                        ndvi_path_re = materialize_uploaded_dataset(ndvi_up).path
-                    except ValueError as e:
-                        st.error(f"NDVI: {e}")
-                        return True
-
-        # Mixed-effects restart: validate every per-wave file path against the
-        # fingerprint recorded at submit time and prompt the user to re-supply
-        # any that have moved or changed. Resubmit blocks until all drift is
-        # resolved so the cache can't index against stale-content files.
-        lon_payload = p.get("longitudinal_spec_payload") or None
-        lon_payload_for_submit = lon_payload
-        lon_restart_blocked = False
-        if lon_payload:
-            stored_fps = lon_payload.get("__file_fingerprints__") or {}
-            wave_labels = list(lon_payload.get("wave_labels") or [])
-            target_files = dict(lon_payload.get("target_files_per_wave") or {})
-            greenery_files = {
-                ch: dict(per_wave or {})
-                for ch, per_wave in (lon_payload.get("greenery_files") or {}).items()
-            }
-
-            def _drift_status(path: str, expected_fp: str) -> str:
-                if not path:
-                    return "no-path"
-                if not os.path.isfile(path):
-                    return "missing"
-                if expected_fp and file_size_mtime_fingerprint(path) != expected_fp:
-                    return "modified"
-                return "ok"
-
-            # Walk every (group, wave) entry once to discover drift.
-            groups: list[tuple[str, str, dict[str, str]]] = []
-            if lon_payload.get("intake_mode") == "wide":
-                groups.append(("target", "Per-wave target files", target_files))
-            for ch_key, ch_lbl in (
-                ("veg", "Vegetation per-wave files"),
-                ("terrain", "Terrain per-wave files"),
-                ("ndvi", "NDVI per-wave files"),
-            ):
-                groups.append((ch_key, ch_lbl, greenery_files.get(ch_key) or {}))
-
-            drift_items: list[tuple[str, str, str, str, str]] = []
-            for group_key, lbl, files in groups:
-                exp_group = stored_fps.get(group_key) or {}
-                for wave in wave_labels:
-                    path = files.get(wave) or ""
-                    status = _drift_status(path, exp_group.get(wave, ""))
-                    if status != "ok":
-                        drift_items.append((group_key, lbl, wave, path, status))
-
-            if drift_items:
-                st.markdown("**Mixed-effects: per-wave files need to be re-supplied**")
-                st.caption(
-                    "Each entry below either moved, was edited, or never "
-                    "existed at the recorded path. Paste the current absolute "
-                    "path to resolve. The restart is blocked until every drift "
-                    "is fixed."
-                )
-                resolved_overrides: dict[tuple[str, str], str] = {}
-                all_resolved = True
-                for group_key, lbl, wave, orig_path, status in drift_items:
-                    status_icon = (
-                        "❌"
-                        if status == "missing"
-                        else "⚠️" if status == "modified" else "•"
-                    )
-                    key_id = f"f_restart_lon_{group_key}_{wave}_{rec.id}"
-                    new_path = st.text_input(
-                        f"{status_icon} {lbl} — wave `{wave}` ({status})",
-                        value=orig_path,
-                        key=key_id,
-                        help=(
-                            f"Original path: `{orig_path or '(none)'}`. "
-                            "Paste an absolute path to the replacement file."
-                        ),
-                    )
-                    if new_path and os.path.isfile(new_path):
-                        resolved_overrides[(group_key, wave)] = new_path
-                    else:
-                        all_resolved = False
-
-                if not all_resolved:
-                    st.warning("Resolve every drifted file above before re-running.")
-                    lon_restart_blocked = True
-                else:
-                    # Build a fresh payload with updated paths + fingerprints
-                    # for the storage layer's next restart cycle.
-                    updated_payload = dict(lon_payload)
-                    new_target_files = dict(target_files)
-                    new_greenery_files = {
-                        ch: dict(per_wave) for ch, per_wave in greenery_files.items()
-                    }
-                    for (gk, wv), new_p in resolved_overrides.items():
-                        if gk == "target":
-                            new_target_files[wv] = new_p
-                        else:
-                            new_greenery_files.setdefault(gk, {})[wv] = new_p
-                    updated_payload["target_files_per_wave"] = new_target_files
-                    updated_payload["greenery_files"] = new_greenery_files
-                    new_fps = {
-                        gk: dict(stored_fps.get(gk) or {})
-                        for gk in ("target", "veg", "terrain", "ndvi")
-                    }
-                    for (gk, wv), new_p in resolved_overrides.items():
-                        new_fps.setdefault(gk, {})[wv] = file_size_mtime_fingerprint(
-                            new_p
-                        )
-                    updated_payload["__file_fingerprints__"] = new_fps
-                    lon_payload_for_submit = updated_payload
-                    st.success(f"All {len(drift_items)} drifted file(s) resolved.")
-            else:
-                st.success("Mixed-effects per-wave files verified.")
-
-        cancel_col, rerun_col = st.columns([1, 1])
-        with cancel_col:
-            if st.button(
-                "Cancel restart",
-                key=f"f_restart_cancel_{rec.id}",
-                width="stretch",
-            ):
-                st.session_state[RESTART_SESSION_KEY] = None
-                st.rerun()
-        with rerun_col:
-            rerun_clicked = st.button(
-                "Verify & re-run",
-                type="primary",
-                key=f"f_restart_confirm_{rec.id}",
-                disabled=lon_restart_blocked,
-                width="stretch",
-            )
-        if rerun_clicked:
-            # Substitute the validated payload into ``p`` so the existing
-            # ``_submit_fusion_restart`` path picks it up via ``p.get(...)``.
-            p_for_submit = dict(p)
-            if lon_payload_for_submit is not None:
-                p_for_submit["longitudinal_spec_payload"] = lon_payload_for_submit
-            try:
-                if cache_files:
-                    n, freed = _purge_fusion_preaggr_cache(cache_files)
-                    st.info(
-                        f"Cleared {n} cache file(s), freed {freed / 1024**2:.0f} MB."
-                    )
-                _submit_fusion_restart(
-                    store,
-                    executor,
-                    rec,
-                    p_for_submit,
-                    target_mat,
-                    output_dir,
-                    veg_path_re,
-                    ndvi_path_re,
-                    resume=resume,
-                )
-            except Exception as e:
-                st.error(f"Re-submission failed: {e}")
-                return True
-            st.session_state[RESTART_SESSION_KEY] = None
-            st.success("Restart submitted. Monitor progress in the sidebar.")
-            st.rerun()
-    return True
+    st.session_state[RESTART_SESSION_KEY] = None
+    _seed_fusion_form(rec.params or {})
+    st.toast(f"Loaded settings from job {rec.name or rec.id}.", icon="🔄")
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Section panels (new layout)
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 # Public set of cross-sectional objective metrics offered by the OLS scorer
 # (covariate-aware distance correlation / partial rank correlation /
@@ -990,6 +463,238 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "check_collinearity",
     "vif_threshold",
 )
+
+# Recorded param -> form widget key. Re-run seeds these so the normal setup
+# form comes up filled in; anything not listed keeps its own default.
+_FUSION_PARAM_TO_WIDGET: dict[str, str] = {
+    "cgi_formula": "fusion_cgi_formula",
+    "objective_metric": "fusion_objective_metric",
+    "residualize_method": "fusion_residualize_method",
+    "search_scoring_method": "fusion_search_scoring_method",
+    "test_size": "fusion_test_size",
+    "n_bins": "fusion_stratification_bins",
+    "n_bootstraps": "fusion_n_bootstraps",
+    "n_trials_per_bootstrap": "fusion_n_trials_per_bootstrap",
+    "weight_bin_pct": "fusion_weight_bin_pct",
+    "max_pfer": "fusion_max_pfer",
+    "check_collinearity": "fusion_check_collinearity",
+    "vif_threshold": "fusion_vif_threshold",
+    "cgi_grid_spacing_m": "fusion_cgi_grid_spacing_m",
+    "whole_grid_scaling": "fusion_whole_grid_scaling",
+    "area_balanced_split": "fusion_area_balanced_split",
+    "normalize_channels": "fusion_normalize_channels",
+    "spatial_split": "fusion_spatial_split",
+    "spatial_block_size_m": "fusion_spatial_block_size_m",
+    "spatial_adjust_method": "fusion_spatial_adjust_method",
+    "spatial_adjust_max_df": "fusion_spatial_adjust_max_df",
+    "spatial_adjust_eps_m": "fusion_spatial_adjust_eps_m",
+    "resume_existing_study": "fusion_resume_study",
+    "multi_objective_requested": "fusion_multi_objective_run",
+    "gvi_buffer_min_m": "fusion_gvi_buffer_min",
+    "gvi_buffer_max_m": "fusion_gvi_buffer_max",
+    "gvi_buffer_step_m": "fusion_gvi_buffer_step",
+    "ndvi_buffer_min_m": "fusion_ndvi_buffer_min",
+    "ndvi_buffer_max_m": "fusion_ndvi_buffer_max",
+    "ndvi_buffer_step_m": "fusion_ndvi_buffer_step",
+}
+
+# Widgets that are integer-typed ``st.number_input`` / slider controls; the
+# recorded params hold floats, and Streamlit refuses a float value on an
+# int widget.
+_FUSION_SEED_INT_WIDGETS: frozenset[str] = frozenset(
+    {
+        "fusion_gvi_buffer_min",
+        "fusion_gvi_buffer_max",
+        "fusion_gvi_buffer_step",
+        "fusion_ndvi_buffer_min",
+        "fusion_ndvi_buffer_max",
+        "fusion_ndvi_buffer_step",
+        "fusion_stratification_bins",
+        "fusion_n_bootstraps",
+        "fusion_n_trials_per_bootstrap",
+        "fusion_weight_bin_pct",
+        "fusion_cgi_grid_spacing_m",
+        "fusion_spatial_block_size_m",
+        "fusion_spatial_adjust_max_df",
+        "fusion_spatial_adjust_eps_m",
+    }
+)
+
+# Longitudinal spec field -> form widget key.
+_FUSION_LON_TO_WIDGET: dict[str, str] = {
+    "entity_id_col": "fusion_lon_entity_id_col",
+    "wave_col": "fusion_lon_wave_col",
+    "date_col": "fusion_lon_date_col",
+    "association_target": "fusion_lon_assoc_target",
+    "random_slope_time": "fusion_lon_random_slope",
+    "include_time_fixed_effect": "fusion_lon_include_time_fixed",
+    "include_wave_fixed_effects": "fusion_lon_wave_fe",
+    "decline_average_exposure": "fusion_lon_decline_between",
+    "decline_exposure_change": "fusion_lon_decline_within",
+}
+
+
+def _seed_fusion_form(p: dict) -> None:
+    """Copy a finished job's settings into the form's session state.
+
+    Re-run is a pre-filled form, not a replay: the user lands on the normal
+    setup with everything from the original job already in place and submits
+    with the usual button, tweaking whatever they want on the way.
+    """
+    for param, widget in _FUSION_PARAM_TO_WIDGET.items():
+        if p.get(param) is not None:
+            val = p[param]
+            if widget in _FUSION_SEED_INT_WIDGETS:
+                val = int(val)
+            st.session_state[widget] = val
+    st.session_state["fusion_run_standalones"] = bool(p.get("standalone_channels"))
+
+    types = dict(p.get("covariate_types") or {})
+    cols = list(p.get("covariate_columns") or [])
+    cat = [c for c in cols if str(types.get(c, "")).lower() == "categorical"]
+    # Categorical membership implies covariate membership, so the numeric list
+    # holds only what isn't tagged.
+    st.session_state["fusion_covariate_columns"] = [c for c in cols if c not in cat]
+    st.session_state["fusion_covariate_categorical"] = cat
+
+    lon = p.get("longitudinal_spec_payload") or {}
+    is_longitudinal = bool(lon) and str(
+        lon.get("scoring_metric", "")
+    ).startswith("mixedlm")
+    st.session_state["fusion_run_mode"] = (
+        _FUSION_RUN_MODE_LON if is_longitudinal else _FUSION_RUN_MODE_CROSS
+    )
+    for field, widget in _FUSION_LON_TO_WIDGET.items():
+        if lon.get(field) is not None:
+            st.session_state[widget] = lon[field]
+    st.session_state["fusion_lon_area_col"] = lon.get("area_id_col") or "(none)"
+
+    # ── Wave / year source ──────────────────────────────────────
+    # Greenery is keyed either to the calendar years found in the date column
+    # or to an explicit wave column, and each intake mode reads that choice
+    # from a different widget.
+    by_year = bool(lon.get("derive_wave_from_date"))
+    if lon:
+        st.session_state["fusion_lon_assign_mode"] = (
+            _FUSION_ASSIGN_BY_YEAR if by_year else _FUSION_ASSIGN_BY_WAVE
+        )
+    if not is_longitudinal:
+        # A cross-sectional run only carries a spec when it routes greenery by
+        # measurement year; without one the date control stays off.
+        st.session_state["fusion_cross_date_on"] = bool(lon)
+        if lon.get("date_col"):
+            st.session_state["fusion_cross_date_col"] = lon["date_col"]
+
+    # Wide intake picks the entity / date column per file, so those widgets are
+    # keyed by path. Files whose own choice was not recorded fall back to the
+    # canonical pair the spec carries.
+    from file_picker import path_to_widget_id
+
+    per_file_cols = lon.get("target_columns_per_wave") or {}
+    for wave, path in (lon.get("target_files_per_wave") or {}).items():
+        cols = per_file_cols.get(wave) or {}
+        wid = path_to_widget_id(path)
+        entity_col = cols.get("entity_col") or lon.get("entity_id_col")
+        date_col = cols.get("date_col") or lon.get("date_col")
+        if entity_col:
+            st.session_state[f"fusion_lon_wide_entity__{wid}"] = entity_col
+        if date_col:
+            st.session_state[f"fusion_lon_wide_date__{wid}"] = date_col
+
+    # ── Metric files + their year assignment ────────────────────
+    # Longitudinal runs record the greenery sources per (channel, wave), not
+    # as the single ``gvi_path`` / ``ndvi_path`` a cross-sectional run uses, so
+    # the pickers are rebuilt from that map. Veg and terrain share one GVI file.
+    waves = list(lon.get("wave_labels") or [])
+    for short, channels in (("gvi", ("veg", "terrain")), ("ndvi", ("ndvi",))):
+        by_path: dict[str, list[str]] = {}
+        for ch in channels:
+            for wave, path in (lon.get("greenery_files") or {}).get(ch, {}).items():
+                if wave not in by_path.setdefault(path, []):
+                    by_path[path].append(wave)
+        if not by_path:
+            continue
+        order = sorted(by_path, key=lambda p_: waves.index(by_path[p_][0])
+                       if by_path[p_] and by_path[p_][0] in waves else 0)
+        st.session_state[f"fusion_{short}_paths"] = order
+        st.session_state[f"fusion_{short}_year_assign"] = {
+            path: [w for w in waves if w in by_path[path]] or by_path[path]
+            for path in order
+        }
+
+    # Cross-sectional runs carry one file per channel instead.
+    for short, key in (("gvi", "gvi_path"), ("ndvi", "ndvi_path")):
+        if not st.session_state.get(f"fusion_{short}_paths") and p.get(key):
+            st.session_state[f"fusion_{short}_paths"] = [p[key]]
+
+    # ── Target files ────────────────────────────────────────────
+    # Wide intake has one target file per wave, keyed by its own labels (which
+    # need not be the greenery wave labels). Recorded in picker order, so the
+    # first stays the baseline. ``target_path`` alone is just that baseline.
+    per_wave_targets = lon.get("target_files_per_wave") or {}
+    if per_wave_targets:
+        st.session_state["fusion_target_paths"] = list(per_wave_targets.values())
+        # The picker's per-file label inputs carry the wave labels, so custom
+        # labels must round-trip too (they key ``target_files_per_wave``).
+        for wave, path in per_wave_targets.items():
+            st.session_state[
+                f"fusion_target_paths__label__{path_to_widget_id(path)}"
+            ] = str(wave)
+    elif p.get("target_path"):
+        st.session_state["fusion_target_paths"] = [p["target_path"]]
+
+    # ── Outcome columns ─────────────────────────────────────────
+    # The target picker clears this list whenever the first file's signature
+    # differs from the one it last saw, so the signature is seeded alongside
+    # it — read from the picker's own first entry, which is what that check
+    # compares against, rather than from the recorded baseline path.
+    outcomes = list(p.get("outcome_columns") or [])
+    picked = st.session_state.get("fusion_target_paths") or []
+    if outcomes:
+        st.session_state["fusion_outcome_columns"] = outcomes
+        if picked and os.path.isfile(picked[0]):
+            st.session_state["fusion_target_upload_sig"] = (
+                picked[0],
+                os.path.getsize(picked[0]),
+            )
+
+
+def _keep_valid(key: str, options, *, multi: bool = False) -> None:
+    """Drop a held selection the current options no longer offer.
+
+    Seeded and pinned values outlive the file they came from, and a widget
+    handed a value outside its options either raises or silently reports a
+    column that isn't there. A single-select drops its key entirely so the
+    caller's default can take over; a multiselect keeps whatever still fits.
+    """
+    if key not in st.session_state:
+        return
+    val = st.session_state[key]
+    if multi:
+        st.session_state[key] = [v for v in (val or []) if v in options]
+    elif val not in options:
+        del st.session_state[key]
+
+
+def _default(key: str, value, options=None, *, multi: bool = False):
+    """Set a widget's first-run value, then let session state own it.
+
+    Passing ``value=`` / ``index=`` alongside a ``key`` whose state was written
+    through the session-state API makes Streamlit render a warning box into the
+    layout, and the argument is ignored anyway. Seeding the key beforehand says
+    the same thing without either problem.
+
+    Pass ``options`` for a picker whose choices come from the data: stale picks
+    are pruned first so the default fills the gap they leave, never the other
+    way round. An emptied multiselect is left empty — deselecting everything is
+    a choice. Returns the value in force.
+    """
+    if options is not None:
+        _keep_valid(key, options, multi=multi)
+    if key not in st.session_state:
+        st.session_state[key] = value
+    return st.session_state[key]
+
 
 # Run-mode placeholder is encoded as None in session-state so the rest of the
 # form stays hidden until the user picks a mode (no default).
@@ -1138,6 +843,8 @@ def _render_optimization_setup_panel(
         "mixedlm_random_slope": True,
         "mixedlm_time_fixed": True,
         "association_target": "level",
+        "include_wave_fixed_effects": True,
+        "area_id_col": None,
         "decline_average_exposure": False,
         "decline_exposure_change": False,
         # True when greenery files are assigned per calendar year rather than
@@ -1156,10 +863,10 @@ def _render_optimization_setup_panel(
                 f"{n_files - 1} file(s) will be ignored — switch to "
                 f"mixed-effects (longitudinal) to use all of them."
             )
-        # ── Cross-sectional ──────────────────────────────────────────────
+        # ── Cross-sectional ─────────────────────────────────
+        _default("fusion_cross_date_on", False)
         date_on = st.checkbox(
             "Date column available?",
-            value=False,
             key="fusion_cross_date_on",
             help="Enables per-year greenery-file routing. The date column never enters the regression.",
         )
@@ -1171,6 +878,7 @@ def _render_optimization_setup_panel(
                     "Turn the toggle off, or pick a target with a date column."
                 )
             else:
+                _keep_valid("fusion_cross_date_col", date_candidates)
                 date_col = st.selectbox(
                     "Date column",
                     options=date_candidates,
@@ -1189,7 +897,7 @@ def _render_optimization_setup_panel(
                         st.warning("No parseable dates in the selected column.")
         return state
 
-    # ── Longitudinal ────────────────────────────────────────────────────
+    # ── Longitudinal ────────────────────────────────────────────
     # Intake mode is auto-selected from how many files are in Section 1:
     # one file ⇒ long format (single table with a wave column), two or
     # more ⇒ wide format (one file per wave, joined on the entity id).
@@ -1200,10 +908,11 @@ def _render_optimization_setup_panel(
     state["intake_mode"] = intake_mode
     st.caption(f"Intake mode: **{intake_mode}** ")
 
+    _assign_opts = [_FUSION_ASSIGN_BY_YEAR, _FUSION_ASSIGN_BY_WAVE]
+    _default("fusion_lon_assign_mode", _FUSION_ASSIGN_BY_YEAR, _assign_opts)
     assign_mode = st.radio(
         "Assign greenery files per",
-        options=["Measurement year", "Wave file"],
-        index=0,
+        options=_assign_opts,
         horizontal=True,
         key="fusion_lon_assign_mode",
         help=(
@@ -1215,7 +924,7 @@ def _render_optimization_setup_panel(
             "in the same calendar year."
         ),
     )
-    assign_by_year = assign_mode == "Measurement year"
+    assign_by_year = assign_mode == _FUSION_ASSIGN_BY_YEAR
     state["assign_by_year"] = assign_by_year
 
     if intake_mode == "long":
@@ -1225,6 +934,7 @@ def _render_optimization_setup_panel(
         lc1, lc2 = st.columns(2)
         with lc1:
             if id_candidates:
+                _keep_valid("fusion_lon_entity_id_col", id_candidates)
                 state["entity_id_col"] = st.selectbox(
                     "Entity ID column",
                     options=id_candidates,
@@ -1235,6 +945,7 @@ def _render_optimization_setup_panel(
                 st.warning("No candidate ID columns found in the target.")
         with lc2:
             if date_candidates:
+                _keep_valid("fusion_lon_date_col", date_candidates)
                 state["date_col"] = st.selectbox(
                     "Date column",
                     options=date_candidates,
@@ -1266,6 +977,7 @@ def _render_optimization_setup_panel(
             and c not in target_outcome_columns
         ]
         if wave_candidates:
+            _keep_valid("fusion_lon_wave_col", wave_candidates)
             state["wave_col"] = st.selectbox(
                 "Wave column",
                 options=wave_candidates,
@@ -1285,7 +997,7 @@ def _render_optimization_setup_panel(
             st.warning("No candidate wave columns found in the target.")
         return state
 
-    # ── Wide / multi-file intake ────────────────────────────────────────
+    # ── Wide / multi-file intake ────────────────────────────────
     if not entries:
         st.warning(
             "Pick two or more target files in Section 1 to populate the "
@@ -1328,6 +1040,7 @@ def _render_optimization_setup_panel(
                 continue
             ec1, ec2 = st.columns(2)
             with ec1:
+                _keep_valid(f"fusion_lon_wide_entity__{wid}", file_cols or ["—"])
                 entity_col = st.selectbox(
                     "Entity ID column",
                     options=file_cols or ["—"],
@@ -1335,6 +1048,7 @@ def _render_optimization_setup_panel(
                     disabled=not file_cols,
                 )
             with ec2:
+                _keep_valid(f"fusion_lon_wide_date__{wid}", file_date_cands or ["—"])
                 date_col = st.selectbox(
                     "Date column",
                     options=file_date_cands or ["—"],
@@ -1388,6 +1102,11 @@ _FUSION_METRIC_CHANNELS: tuple[tuple[str, str, str], ...] = (
 
 _UNASSIGNED_HEADER = "Unassigned"
 
+# Greenery is keyed either to the calendar years in the date column or to
+# an explicit wave column.
+_FUSION_ASSIGN_BY_YEAR = "Measurement year"
+_FUSION_ASSIGN_BY_WAVE = "Wave file"
+
 
 def _container_headers(file_paths: list[str]) -> list[str]:
     """Display name per file — basename, disambiguated only when it repeats.
@@ -1427,18 +1146,142 @@ def _render_coverage_chips(covered: dict[str, int], waves: list[str]) -> None:
     st.markdown("".join(chips), unsafe_allow_html=True)
 
 
+
+# Drop zones are laid out as a responsive grid inside the component, so a
+# decade of waves across several files stays on a couple of rows instead of one
+# full-width row per file. Headers wrap rather than truncate — the whole point
+# is knowing which file a year is being dropped onto.
+_SORTABLE_STYLE = """
+.sortable-component {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+    gap: 0.5rem;
+    align-items: start;
+}
+.sortable-container {
+    background: rgba(128, 128, 128, 0.07);
+    border: 1px solid rgba(128, 128, 128, 0.28);
+    border-radius: 8px;
+    padding: 0.35rem 0.45rem 0.5rem;
+    min-width: 0;
+}
+.sortable-container:first-child {
+    border-style: dashed;
+    border-color: rgba(214, 122, 39, 0.75);
+}
+.sortable-container-header {
+    font-size: 0.78rem;
+    font-weight: 600;
+    line-height: 1.25;
+    padding: 0.15rem 0.1rem 0.35rem;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    border-bottom: 1px solid rgba(128, 128, 128, 0.25);
+    margin-bottom: 0.35rem;
+}
+.sortable-container-body {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem;
+    min-height: 2.1rem;
+}
+.sortable-item {
+    font-size: 0.78rem;
+    padding: 0.1rem 0.45rem;
+    margin: 0;
+    border-radius: 5px;
+}
+"""
+
+
+def _match_waves_to_filenames(
+    file_paths: list[str], waves: list[str]
+) -> dict[str, str]:
+    """``{path: wave}`` for filenames that name exactly one wave, unambiguously.
+
+    A wave is matched only when its label appears in the filename bounded by
+    non-alphanumerics, so ``2011`` does not match inside ``20115``. The pairing
+    has to be one-to-one in both directions: a filename naming several waves is
+    ambiguous, and a wave named by several filenames is too. Everything else is
+    left for the user to drag.
+    """
+    hits: dict[str, list[str]] = {}
+    for path in file_paths:
+        stem = os.path.basename(path)
+        found = [
+            w
+            for w in waves
+            if re.search(rf"(?<![0-9A-Za-z]){re.escape(str(w))}(?![0-9A-Za-z])", stem)
+        ]
+        if len(found) == 1:
+            hits[path] = found[0]
+
+    claims: dict[str, list[str]] = {}
+    for path, wave in hits.items():
+        claims.setdefault(wave, []).append(path)
+    return {
+        path: wave for path, wave in hits.items() if len(claims[wave]) == 1
+    }
+
+
+def _autofill_year_assignment(
+    file_paths: list[str], waves: list[str], stored: dict[str, list[str]]
+) -> dict[str, list[str]]:
+    """Fill unambiguous filename matches into an assignment, in place.
+
+    Only files with nothing assigned yet are touched, and only with a wave no
+    other file already holds — a choice the user made by hand always wins.
+    """
+    taken = {w for ws in stored.values() for w in ws}
+    for path, wave in _match_waves_to_filenames(file_paths, waves).items():
+        if stored.get(path) or wave in taken:
+            continue
+        stored[path] = [wave]
+        taken.add(wave)
+    return stored
+
+
+def _render_year_fallback(
+    ch_short: str,
+    file_paths: list[str],
+    waves: list[str],
+    headers: list[str],
+    stored: dict[str, list[str]],
+    state_key: str,
+) -> dict[str, list[str]]:
+    """One multiselect per file, used when the sortables component is missing.
+
+    Each file's options hide the years another file already claimed, so the
+    assign-once rule still holds.
+    """
+    from file_picker import path_to_widget_id
+
+    assignment: dict[str, list[str]] = {}
+    for path, head in zip(file_paths, headers):
+        taken = {w for q, ws in stored.items() if q != path for w in ws}
+        options = [w for w in waves if w not in taken]
+        wkey = f"fusion_{ch_short}_assign__{path_to_widget_id(path)}"
+        if wkey in st.session_state:
+            st.session_state[wkey] = [
+                w for w in st.session_state[wkey] if w in options
+            ]
+        picked = st.multiselect(head, options=options, key=wkey)
+        assignment[path] = list(picked)
+        stored[path] = list(picked)
+    st.session_state[state_key] = assignment
+    return assignment
+
+
 def _render_year_assignment(
     ch_short: str,
     file_paths: list[str],
     waves: list[str],
 ) -> dict[str, list[str]]:
-    """Assign years/waves to files. Returns ``{path: [wave, ...]}``.
+    """Assign years/waves to files by dragging. Returns ``{path: [wave, ...]}``.
 
-    Drag-and-drop when the sortables component is available: years are the
-    items and files are the containers, so a year can sit in exactly one place
-    and assign-once coverage is structural rather than validated afterwards.
-    Falls back to one multiselect per file (options hidden once another file
-    claims them) when the component is missing.
+    Years are the draggable items and files are the drop zones, so a year can
+    sit in exactly one place and assign-once coverage is structural rather than
+    validated afterwards.
     """
     state_key = f"fusion_{ch_short}_year_assign"
     stored: dict[str, list[str]] = dict(st.session_state.get(state_key, {}))
@@ -1449,53 +1292,50 @@ def _render_year_assignment(
         for p, ws in stored.items()
         if p in file_paths
     }
+    # A newly added file whose name names exactly one year is assigned for the
+    # user; anything ambiguous stays in the unassigned pool.
+    stored = _autofill_year_assignment(file_paths, waves, stored)
     headers = _container_headers(file_paths)
 
     try:
         from streamlit_sortables import sort_items
     except Exception:
-        sort_items = None  # type: ignore[assignment]
-
-    if sort_items is not None:
-        claimed = {w for ws in stored.values() for w in ws}
-        containers = [
-            {"header": _UNASSIGNED_HEADER, "items": [w for w in waves if w not in claimed]}
-        ]
-        for p, head in zip(file_paths, headers):
-            containers.append({"header": head, "items": stored.get(p, [])})
-
-        # Remount when the file list or year set changes: a custom component
-        # keyed on a stable key misbehaves when its item set shifts underneath.
-        sig = abs(hash((tuple(file_paths), tuple(waves)))) % (10**9)
-        result = sort_items(
-            containers,
-            multi_containers=True,
-            key=f"fusion_{ch_short}_sort_{sig}",
+        return _render_year_fallback(
+            ch_short, file_paths, waves, headers, stored, state_key
         )
-        assignment = {
-            file_paths[idx - 1]: list(bucket.get("items", []))
-            for idx, bucket in enumerate(result)
-            if idx > 0
+
+    claimed = {w for ws in stored.values() for w in ws}
+    containers = [
+        {
+            "header": f"{_UNASSIGNED_HEADER} — drag onto a file",
+            "items": [w for w in waves if w not in claimed],
         }
-        st.session_state[state_key] = assignment
-        return assignment
+    ]
+    for idx, (path, head) in enumerate(zip(file_paths, headers), start=1):
+        containers.append({"header": f"{idx}. {head}", "items": stored.get(path, [])})
 
-    # Fallback: one multiselect per file, each hiding years another file took.
-    from file_picker import path_to_widget_id
-
-    assignment = {}
-    for p, head in zip(file_paths, headers):
-        taken = {w for q, ws in stored.items() if q != p for w in ws}
-        options = [w for w in waves if w not in taken]
-        wkey = f"fusion_{ch_short}_assign__{path_to_widget_id(p)}"
-        if wkey in st.session_state:
-            st.session_state[wkey] = [
-                w for w in st.session_state[wkey] if w in options
-            ]
-        picked = st.multiselect(head, options=options, key=wkey)
-        assignment[p] = list(picked)
-        stored[p] = list(picked)
+    # Remount when the file list or year set changes: a custom component keyed
+    # on a stable key misbehaves when its item set shifts underneath.
+    sig = abs(hash((tuple(file_paths), tuple(waves)))) % (10**9)
+    result = sort_items(
+        containers,
+        multi_containers=True,
+        custom_style=_SORTABLE_STYLE,
+        key=f"fusion_{ch_short}_sort_{sig}",
+    )
+    assignment = {
+        file_paths[idx - 1]: list(bucket.get("items", []))
+        for idx, bucket in enumerate(result)
+        if idx > 0
+    }
     st.session_state[state_key] = assignment
+
+    # The zone headers carry the file name; the full path only fits here.
+    with st.expander(f"Full paths ({len(file_paths)} file(s))", expanded=False):
+        for idx, path in enumerate(file_paths, start=1):
+            years = assignment.get(path) or []
+            span = f"{years[0]}–{years[-1]}" if len(years) > 1 else (years[0] if years else "—")
+            st.caption(f"**{idx}.** `{path}` · {len(years)} year(s): {span}")
     return assignment
 
 
@@ -1539,15 +1379,15 @@ def _render_metric_assignment_panel(
     for ch_key, ch_label, ch_short in _FUSION_METRIC_CHANNELS:
         st.markdown(f"#### {ch_label}")
         with st.container(border=True):
+            _default(f"fusion_{ch_short}_buffer_min", 100)
+            _default(f"fusion_{ch_short}_buffer_max", 1000)
+            _default(f"fusion_{ch_short}_buffer_step", 100)
             bcol1, bcol2, bcol3 = st.columns(3)
             with bcol1:
                 bmin = st.number_input(
                     f"{ch_short.upper()} minimum buffer",
                     min_value=50,
                     max_value=4900,
-                    value=int(
-                        st.session_state.get(f"fusion_{ch_short}_buffer_min", 100)
-                    ),
                     step=50,
                     key=f"fusion_{ch_short}_buffer_min",
                     help=f"Smallest {ch_short.upper()} radius (m) searched by Optuna.",
@@ -1557,9 +1397,6 @@ def _render_metric_assignment_panel(
                     f"{ch_short.upper()} maximum buffer",
                     min_value=100,
                     max_value=5000,
-                    value=int(
-                        st.session_state.get(f"fusion_{ch_short}_buffer_max", 1000)
-                    ),
                     step=50,
                     key=f"fusion_{ch_short}_buffer_max",
                     help=f"Largest {ch_short.upper()} radius (m). Extent padding uses the max.",
@@ -1569,9 +1406,6 @@ def _render_metric_assignment_panel(
                     f"{ch_short.upper()} buffer step",
                     min_value=10,
                     max_value=500,
-                    value=int(
-                        st.session_state.get(f"fusion_{ch_short}_buffer_step", 100)
-                    ),
                     step=10,
                     key=f"fusion_{ch_short}_buffer_step",
                     help="Radius discretisation (m).",
@@ -1660,13 +1494,13 @@ def _render_study_details_panel(
     """
     st.subheader("Study Details")
 
-    # ── Row 1: CGI formula + covariates ──────────────────────────────────
+    # ── Row 1: CGI formula + covariates ─────────────────────────
     col_cgi1, col_cgi2 = st.columns([1, 2])
     with col_cgi1:
+        _default("fusion_cgi_formula", "weighted_average")
         cgi_formula = st.selectbox(
             "CGI Formula",
             options=["weighted_average", "synergy"],
-            index=0,
             help=(
                 "**weighted_average** — three weights on Vegetation / "
                 "Terrain / NDVI summing to 100. "
@@ -1678,10 +1512,10 @@ def _render_study_details_panel(
     with col_cgi2:
         categorical_candidates = list(categorical_candidates or [])
         if available_covariates:
-            covariate_columns = st.multiselect(
+            _keep_valid("fusion_covariate_columns", available_covariates, multi=True)
+            numeric_pick = st.multiselect(
                 "Covariates (control variables)",
                 options=available_covariates,
-                default=st.session_state.get("fusion_covariate_columns", []),
                 key="fusion_covariate_columns",
                 help=(
                     "Attribute columns to control for. With covariates the "
@@ -1689,31 +1523,38 @@ def _render_study_details_panel(
                     "`mutual_info` ignores covariates."
                 ),
             )
-            # Per-column type tag, form-safe: a second multiselect marks which
-            # covariates are categorical (one-hot encoded). Options are the full
-            # static column list so it doesn't depend on the selection above;
-            # non-numeric columns are pre-marked. Only the marks on the chosen
-            # covariates are used.
-            cat_default = st.session_state.get(
-                "fusion_covariate_categorical", categorical_candidates
+            # Options are the full static column list, so this doesn't depend on
+            # the selection above and stays form-safe.
+            detected = ", ".join(categorical_candidates[:8]) or "none"
+            _keep_valid(
+                "fusion_covariate_categorical", available_covariates, multi=True
             )
             categorical_pick = st.multiselect(
-                "…treat as categorical (one-hot encoded)",
+                "Categorical covariates (one-hot encoded)",
                 options=available_covariates,
-                default=[c for c in cat_default if c in available_covariates],
                 key="fusion_covariate_categorical",
                 help=(
-                    "Covariates here are one-hot encoded (drop-first) and entered "
-                    "as dummy controls; the rest are used as numeric values. "
-                    "Non-numeric columns are pre-selected. Tag a numeric-coded "
-                    "category (e.g. an SES band stored as 1–5) here too."
+                    "One-hot encoded (drop-first) and entered as dummy controls. "
+                    "Listing a column here is enough — it does not also need to "
+                    "be in the covariate list. Tag numeric-coded categories "
+                    "(e.g. an education band stored as 1–6) here too. "
+                    f"Detected as non-numeric: {detected}."
                 ),
             )
-            cat_set = set(categorical_pick)
+            cat_set = set(categorical_pick) & set(available_covariates)
+            covariate_columns = sorted(set(numeric_pick) | cat_set)
             covariate_types = {
                 c: ("categorical" if c in cat_set else "numeric")
                 for c in covariate_columns
             }
+            if covariate_columns:
+                st.caption(
+                    "Fitting: "
+                    + ", ".join(
+                        f"`{c}`" + (" (categorical)" if c in cat_set else "")
+                        for c in covariate_columns
+                    )
+                )
         else:
             covariate_columns = []
             covariate_types = {}
@@ -1722,7 +1563,7 @@ def _render_study_details_panel(
                 "(raster target or no spare columns)._"
             )
 
-    # ── Objective metric + test split + stratification bins ─────────────
+    # ── Objective metric + test split + stratification bins ─────
     metric_options = list(_MIXEDLM_METRICS if is_longitudinal else _CROSS_METRICS)
     default_metric = metric_options[0]
     prior = st.session_state.get("fusion_objective_metric")
@@ -1744,11 +1585,11 @@ def _render_study_details_panel(
             ),
         )
     with col_o2:
+        _default("fusion_test_size", 0.25)
         test_size = st.slider(
             "Test set size",
             min_value=0.1,
             max_value=0.5,
-            value=float(st.session_state.get("fusion_test_size", 0.25)),
             step=0.05,
             key="fusion_test_size",
             help=(
@@ -1757,11 +1598,11 @@ def _render_study_details_panel(
             ),
         )
     with col_o3:
+        _default("fusion_stratification_bins", 5)
         n_bins = st.number_input(
             "Stratification bins",
             min_value=3,
             max_value=10,
-            value=int(st.session_state.get("fusion_stratification_bins", 5)),
             key="fusion_stratification_bins",
             help="Quantile bins for the stratified train / test split.",
         )
@@ -1771,7 +1612,7 @@ def _render_study_details_panel(
         "(resampled by stability selection)._"
     )
 
-    # ── Covariate residualization (cross-sectional metrics) ─────────────
+    # ── Covariate residualization (cross-sectional metrics) ─────
     residualize_method = "linear"
     if not is_longitudinal:
         _res_ignored = objective_metric in _RESIDUALIZE_IGNORED_METRICS
@@ -1783,6 +1624,7 @@ def _render_study_details_panel(
             "covariate may relate to the outcome nonlinearly); linear is faster "
             "and assumes covariate effects are linear."
         )
+        _default("fusion_residualize_method", "linear")
         residualize_method = st.selectbox(
             "Covariate residualization",
             options=["linear", "spline"],
@@ -1790,9 +1632,6 @@ def _render_study_details_panel(
                 "linear": "Linear",
                 "spline": "Spline (natural cubic)",
             }[m],
-            index=["linear", "spline"].index(
-                st.session_state.get("fusion_residualize_method", "linear")
-            ),
             key="fusion_residualize_method",
             disabled=_res_ignored,
             help=(
@@ -1801,12 +1640,14 @@ def _render_study_details_panel(
             ),
         )
 
-    # ── Longitudinal-only mixed-effects toggles ─────────────────────────
+    # ── Longitudinal-only mixed-effects toggles ─────────────────
     mixedlm_random_slope = True
     mixedlm_time_fixed = True
     association_target = "level"
     decline_average_exposure = False
     decline_exposure_change = False
+    include_wave_fixed_effects = True
+    area_id_col = None
     search_scoring_method = "mom_em3"
     if is_longitudinal:
         _target_keys = ["level", "decline_overall", "decline_average", "decline_change"]
@@ -1816,13 +1657,10 @@ def _render_study_details_panel(
             "decline_average": "Decline — average exposure",
             "decline_change": "Decline — exposure change",
         }
-        _tgt_default = st.session_state.get("fusion_lon_assoc_target", "level")
+        _default("fusion_lon_assoc_target", "level", _target_keys)
         association_target = st.selectbox(
             "Fit the greenspace formula to",
             options=_target_keys,
-            index=(
-                _target_keys.index(_tgt_default) if _tgt_default in _target_keys else 0
-            ),
             format_func=lambda k: _target_labels[k],
             key="fusion_lon_assoc_target",
             help=(
@@ -1834,30 +1672,61 @@ def _render_study_details_panel(
                 "is then computed on the chosen term."
             ),
         )
+        _default("fusion_lon_random_slope", True)
+        _default("fusion_lon_include_time_fixed", True)
+        _default("fusion_lon_wave_fe", True)
         mc1, mc2 = st.columns(2)
         with mc1:
             mixedlm_random_slope = st.checkbox(
                 "Random slope on time per entity",
-                value=bool(st.session_state.get("fusion_lon_random_slope", True)),
                 key="fusion_lon_random_slope",
                 help="Switches RE structure to `(1 + years_since_baseline | entity)`.",
             )
         with mc2:
             mixedlm_time_fixed = st.checkbox(
                 "Include `years_since_baseline` as fixed effect",
-                value=bool(st.session_state.get("fusion_lon_include_time_fixed", True)),
                 key="fusion_lon_include_time_fixed",
                 help="Adds `+ years_since_baseline` to the fixed-effect design.",
             )
+        wc1, wc2 = st.columns(2)
+        with wc1:
+            include_wave_fixed_effects = st.checkbox(
+                "Wave fixed effects",
+                key="fusion_lon_wave_fe",
+                help=(
+                    "Adds one indicator per wave. Per-wave greenery layers differ "
+                    "for reasons unrelated to anyone's neighbourhood — a different "
+                    "satellite, a different compositing window — and that drift "
+                    "tracks calendar time, so without these it lands on the "
+                    "greenspace × time terms. Leave on unless you have a reason."
+                ),
+            )
+        with wc2:
+            _area_opts = ["(none)"] + list(available_covariates or [])
+            _keep_valid("fusion_lon_area_col", _area_opts)
+            area_id_col = st.selectbox(
+                "Neighbourhood / site column",
+                options=_area_opts,
+                key="fusion_lon_area_col",
+                help=(
+                    "Groups people who share a neighbourhood (FSA, census "
+                    "subdivision, site). Entered as fixed effects. Greenspace is "
+                    "an area attribute, so neighbours share almost the same "
+                    "exposure; without this the greenspace term's standard error "
+                    "is far too small."
+                ),
+            )
+            area_id_col = None if area_id_col == "(none)" else area_id_col
         st.caption(
             "Exposure–change over time (reported alongside the overall "
             "greenspace × time effect):"
         )
+        _default("fusion_lon_decline_between", False)
+        _default("fusion_lon_decline_within", False)
         dc1, dc2 = st.columns(2)
         with dc1:
             decline_average_exposure = st.checkbox(
                 "Average exposure effect",
-                value=bool(st.session_state.get("fusion_lon_decline_between", False)),
                 key="fusion_lon_decline_between",
                 help=(
                     "Adds a between-person term: does a higher *average* exposure "
@@ -1868,7 +1737,6 @@ def _render_study_details_panel(
         with dc2:
             decline_exposure_change = st.checkbox(
                 "Exposure-change effect",
-                value=bool(st.session_state.get("fusion_lon_decline_within", False)),
                 key="fusion_lon_decline_within",
                 help=(
                     "Adds a within-person term: does *increasing* exposure over "
@@ -1884,11 +1752,10 @@ def _render_study_details_panel(
             "mom": "Method of Moments",
             "exact": "Exact Mixed Linear Model (per trial)",
         }
-        _ssm_default = st.session_state.get("fusion_search_scoring_method", "mom_em3")
+        _default("fusion_search_scoring_method", "mom_em3", _ssm_keys)
         search_scoring_method = st.selectbox(
             "Trial scoring method",
             options=_ssm_keys,
-            index=_ssm_keys.index(_ssm_default) if _ssm_default in _ssm_keys else 0,
             format_func=lambda k: _ssm_labels[k],
             key="fusion_search_scoring_method",
             help=(
@@ -1904,32 +1771,47 @@ def _render_study_details_panel(
             ),
         )
 
-    # ── Resume + standalones ────────────────────────────────────────────
+    # ── Resume + standalones ────────────────────────────────────
+    _default("fusion_resume_study", True)
+    _default("fusion_clear_preaggr", False)
+    _default("fusion_run_standalones", False)
     col_r1, col_r2 = st.columns(2)
     with col_r1:
         resume_existing_study = st.checkbox(
             "Resume previous study if exists",
-            value=bool(st.session_state.get("fusion_resume_study", True)),
             key="fusion_resume_study",
-            help="Reuses the existing SQLite study and runs only remaining trials.",
+            help=(
+                "Reuses the existing SQLite study and runs only remaining trials. "
+                "A finished study has already met its budget, so re-running with "
+                "this on reproduces the previous answer rather than searching "
+                "again."
+            ),
+        )
+        clear_preaggr_cache = st.checkbox(
+            "Clear this target's pre-aggregation cache first",
+            key="fusion_clear_preaggr",
+            help=(
+                "Rebuilds the per-(entity, radius) cache from scratch. Needed "
+                "only when the underlying metric files changed at the same path."
+            ),
         )
     with col_r2:
         run_standalones = st.checkbox(
             "Also optimize each metric on its own (NDVI / Vegetation / Terrain)",
-            value=bool(st.session_state.get("fusion_run_standalones", False)),
             key="fusion_run_standalones",
             help="Adds three single-metric Optuna studies alongside the combined CGI run.",
         )
 
-    # ── Channel collinearity check (iterative VIF) ──────────────────────
+    # ── Channel collinearity check (iterative VIF) ──────────────
     # Runs after pre-aggregation, before optimization. Drops channels
     # whose pixel-level values are redundant with the others (high VIF).
     # Dropped channels get pinned to weight 0 in every subsequent trial.
+    _default("fusion_check_collinearity", True)
+    _default("fusion_vif_threshold", 10.0)
     col_c1, col_c2 = st.columns([2, 1])
     with col_c1:
         check_collinearity = st.checkbox(
             "Check channel collinearity (iterative VIF)",
-            value=bool(st.session_state.get("fusion_check_collinearity", True)),
             key="fusion_check_collinearity",
             help=(
                 "Iteratively drop the highest-VIF channel until all remaining "
@@ -1941,7 +1823,6 @@ def _render_study_details_panel(
             "VIF threshold",
             min_value=2.0,
             max_value=100.0,
-            value=float(st.session_state.get("fusion_vif_threshold", 10.0)),
             step=1.0,
             key="fusion_vif_threshold",
             disabled=not check_collinearity,
@@ -1951,7 +1832,7 @@ def _render_study_details_panel(
             ),
         )
 
-    # ── Stability selection ─────────────────────────────────────────────
+    # ── Stability selection ─────────────────────────────────────
     # Tuning is bootstrap stability selection: B random-sampler studies on
     # resamples of the train+val pool, scored on out-of-bag rows. The channel
     # mix is chosen by automated threshold calibration (Bodinier) — the
@@ -1963,16 +1844,18 @@ def _render_study_details_panel(
         "K + threshold π maximize the stability score, with a reported PFER "
         "bound). Set the resampling effort and the PFER cap here."
     )
+    _default(
+        "fusion_weight_bin_pct",
+        int(_cgi_formulas.WEIGHT_BIN_PCT),
+        [5, 10, 20, 25, 50],
+    )
+    _default("fusion_n_bootstraps", 30)
+    _default("fusion_n_trials_per_bootstrap", 150)
     col_s0, col_s1, col_s2 = st.columns(3)
     with col_s0:
         weight_bin_pct_ui = st.select_slider(
             "Weight cell size (%)",
             options=[5, 10, 20, 25, 50],
-            value=int(
-                st.session_state.get(
-                    "fusion_weight_bin_pct", _cgi_formulas.WEIGHT_BIN_PCT
-                )
-            ),
             key="fusion_weight_bin_pct",
             help=(
                 "Bin width for the channel-mix weight cells the stability "
@@ -1986,7 +1869,6 @@ def _render_study_details_panel(
             "Bootstraps (B)",
             min_value=5,
             max_value=200,
-            value=int(st.session_state.get("fusion_n_bootstraps", 30)),
             step=5,
             key="fusion_n_bootstraps",
             help=(
@@ -1999,7 +1881,6 @@ def _render_study_details_panel(
             "Trials per bootstrap",
             min_value=100,
             max_value=800,
-            value=int(st.session_state.get("fusion_n_trials_per_bootstrap", 150)),
             step=10,
             key="fusion_n_trials_per_bootstrap",
             help=(
@@ -2019,11 +1900,11 @@ def _render_study_details_panel(
         "ranking is reproducible across resamples; raise the trial count or the "
         "cell size if this is low."
     )
+    _default("fusion_max_pfer", 1.0)
     max_pfer_ui = st.number_input(
         "Max PFER (approx.)",
         min_value=0.0,
         max_value=50.0,
-        value=float(st.session_state.get("fusion_max_pfer", 1.0)),
         step=0.5,
         key="fusion_max_pfer",
         help=(
@@ -2034,13 +1915,12 @@ def _render_study_details_panel(
             "0 = no cap."
         ),
     )
-    # Retained internals (no longer user-tuned): the radius sub-cell still
-    # needs a minimum trial count, and q_worst is reported as a secondary
-    # diagnostic at this quantile.
+    # ── Internals ───────────────────────────────────────────────
+    # Minimum trials per radius sub-cell, and the quantile q_worst reports at.
     min_cell_count_ui = 3
     worst_quantile_ui = 0.10
 
-    # ── Per-pixel CGI scoring (vector targets) ──────────────────────────
+    # ── Per-pixel CGI scoring (vector targets) ──────────────────
     cgi_grid_spacing_m = 50
     whole_grid_scaling = True
     area_balanced_split = True
@@ -2053,10 +1933,15 @@ def _render_study_details_panel(
     spatial_adjust_eps_m: float | None = None
     if is_vector_target:
         st.markdown("**Per-pixel CGI scoring**")
+        _default("fusion_cgi_grid_spacing_m", 50, list(range(10, 510, 10)))
+        _default("fusion_whole_grid_scaling", True)
+        _default("fusion_normalize_channels", True)
+        _default("fusion_area_balanced_split", True)
+        _default("fusion_spatial_split", True)
+        _default("fusion_spatial_block_size_m", 0)
         cgi_grid_spacing_m = st.select_slider(
             "CGI grid pixel size (m)",
             options=list(range(10, 510, 10)),
-            value=int(st.session_state.get("fusion_cgi_grid_spacing_m", 50)),
             key="fusion_cgi_grid_spacing_m",
             help=(
                 "Per-pixel CGI grid spacing. Smaller = higher fidelity and a bigger cache."
@@ -2064,13 +1949,11 @@ def _render_study_details_panel(
         )
         whole_grid_scaling = st.checkbox(
             "Scale composite map to [0, 1]",
-            value=bool(st.session_state.get("fusion_whole_grid_scaling", True)),
             key="fusion_whole_grid_scaling",
             help="Min-max normalise the optimized greenery map to [0, 1] over the whole grid.",
         )
         normalize_channels = st.checkbox(
             "Normalize channels before fusion",
-            value=bool(st.session_state.get("fusion_normalize_channels", True)),
             key="fusion_normalize_channels",
             help=(
                 "Scale each channel to [0, 1] before combining, so CGI weights "
@@ -2081,14 +1964,12 @@ def _render_study_details_panel(
         if is_polygon_target:
             area_balanced_split = st.checkbox(
                 "Area-balanced stratified split",
-                value=bool(st.session_state.get("fusion_area_balanced_split", True)),
                 key="fusion_area_balanced_split",
                 help="Balance polygon area (not count) across train / val / test within each quartile.",
             )
 
         spatial_split = st.checkbox(
             "Spatial block validation",
-            value=bool(st.session_state.get("fusion_spatial_split", True)),
             key="fusion_spatial_split",
             help=(
                 "Hold out whole spatial blocks (and resample blocks during "
@@ -2101,7 +1982,6 @@ def _render_study_details_panel(
             block_size_ui = st.number_input(
                 "Spatial block size (m, 0 = auto)",
                 min_value=0,
-                value=int(st.session_state.get("fusion_spatial_block_size_m", 0)),
                 step=100,
                 key="fusion_spatial_block_size_m",
                 help=(
@@ -2114,22 +1994,17 @@ def _render_study_details_panel(
                 float(block_size_ui) if block_size_ui and block_size_ui > 0 else None
             )
 
-        # ── Spatial-confounding adjustment ──────────────────────────────
+        # ── Spatial-confounding adjustment ──────────────────
         _spatial_adjust_labels = {
             "none": "Off (control listed covariates only)",
             "ks_aic": "KS-AIC (recommended)",
             "spatial_plus": "Spatial+ (df-Spatial+)",
         }
         _spatial_adjust_keys = ["none", "ks_aic", "spatial_plus"]
-        _sa_default = st.session_state.get("fusion_spatial_adjust_method", "none")
+        _default("fusion_spatial_adjust_method", "none", _spatial_adjust_keys)
         spatial_adjust_method = st.selectbox(
             "Spatial-confounding adjustment",
             options=_spatial_adjust_keys,
-            index=(
-                _spatial_adjust_keys.index(_sa_default)
-                if _sa_default in _spatial_adjust_keys
-                else 0
-            ),
             format_func=lambda k: _spatial_adjust_labels[k],
             key="fusion_spatial_adjust_method",
             help=(
@@ -2143,15 +2018,14 @@ def _render_study_details_panel(
             ),
         )
         if spatial_adjust_method != "none":
+            _default("fusion_spatial_adjust_max_df", 10)
+            _default("fusion_spatial_adjust_eps_m", 0)
             with st.expander("Spatial adjustment — advanced", expanded=False):
                 spatial_adjust_max_df = int(
                     st.number_input(
                         "Max spatial df per cluster",
                         min_value=1,
                         max_value=50,
-                        value=int(
-                            st.session_state.get("fusion_spatial_adjust_max_df", 10)
-                        ),
                         step=1,
                         key="fusion_spatial_adjust_max_df",
                         help=(
@@ -2163,7 +2037,6 @@ def _render_study_details_panel(
                 eps_ui = st.number_input(
                     "Cluster gap eps (m, 0 = auto)",
                     min_value=0,
-                    value=int(st.session_state.get("fusion_spatial_adjust_eps_m", 0)),
                     step=100,
                     key="fusion_spatial_adjust_eps_m",
                     help=(
@@ -2186,6 +2059,8 @@ def _render_study_details_panel(
         "mixedlm_random_slope": bool(mixedlm_random_slope),
         "mixedlm_time_fixed": bool(mixedlm_time_fixed),
         "association_target": str(association_target),
+        "include_wave_fixed_effects": bool(include_wave_fixed_effects),
+        "area_id_col": area_id_col,
         "decline_average_exposure": bool(decline_average_exposure),
         "decline_exposure_change": bool(decline_exposure_change),
         "resume_existing_study": bool(resume_existing_study),
@@ -2211,9 +2086,23 @@ def _render_study_details_panel(
     }
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Tab render entry point
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
+
+
+def _clear_fusion_results_cb() -> None:
+    """Unload the loaded results (button callback — never aborts the run)."""
+    st.session_state.fusion_engine = None
+    st.session_state.fusion_results = None
+    st.session_state.fusion_engines_by_target = {}
+
+
+def _remove_fusion_outcome_cb(idx: int) -> None:
+    """Drop one outcome column (button callback — never aborts the run)."""
+    cols = st.session_state.get("fusion_outcome_columns") or []
+    if 0 <= idx < len(cols):
+        cols.pop(idx)
 
 
 def _render_fusion_results_section(output_dir: str) -> None:
@@ -2358,6 +2247,13 @@ def _render_collinearity_report(results_view: dict) -> None:
                 )
 
 
+_TERM_COLUMN_CONFIG = {
+    "coef": st.column_config.NumberColumn("coef", format="%.4f"),
+    "std_err": st.column_config.NumberColumn("SE", format="%.4f"),
+    "t_stat": st.column_config.NumberColumn("t", format="%.2f"),
+    "partial_r2": st.column_config.NumberColumn("partial R²", format="%.4f"),
+}
+
 _DECLINE_TERM_LABELS = {
     "overall": "Greenspace × time (overall)",
     "between": "Average exposure × time (between-person)",
@@ -2388,16 +2284,88 @@ def _render_decline_terms(results_view: dict) -> None:
                 "coef": term.get("coef"),
                 "std_err": term.get("std_err"),
                 "t_stat": term.get("t_stat"),
-                "pvalue": term.get("pvalue"),
+                "p": term.get("p_display"),
                 "direction": term.get("direction"),
             }
         )
-    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    st.dataframe(
+        pd.DataFrame(rows),
+        width="stretch",
+        hide_index=True,
+        column_config=_TERM_COLUMN_CONFIG,
+    )
     if dt.get("within_estimable") is False:
         st.caption(
             "_Within-person term not estimable — the greenspace exposure does "
             "not vary over time (use per-wave greenery files to enable it)._"
         )
+    _render_period_confounding(dt)
+
+
+def _render_period_confounding(dt: dict) -> None:
+    """Whether the greenspace × time terms are measuring exposure or vintage.
+
+    Per-wave greenery layers change between waves for reasons that have nothing
+    to do with anyone's neighbourhood — a different satellite, a different
+    compositing window. That drift tracks calendar time, so it lands on a
+    greenspace × time slope. The placebo replaces the exposure with its per-wave
+    mean, keeping the period structure and discarding every spatial difference:
+    a real effect collapses, an artefact survives.
+    """
+    diag = dt.get("period_diagnostic") or {}
+    placebo = dt.get("placebo_terms") or []
+    r = diag.get("within_time_corr")
+    if r is None and not placebo:
+        return
+
+    with st.expander("Is this exposure, or exposure vintage?", expanded=bool(diag.get("confounded"))):
+        if r is not None:
+            st.metric(
+                "Within-person corr(exposure change, time)",
+                f"{float(r):+.3f}",
+                help=(
+                    "Near zero means exposure change is unrelated to when a "
+                    "person was measured. Far from zero means the exposure is "
+                    "largely a function of measurement timing, and the "
+                    "greenspace × time terms cannot separate the two."
+                ),
+            )
+        if diag.get("confounded"):
+            st.warning(
+                "The within-person exposure change is largely explained by "
+                "**when** each person was measured, not by where they live. "
+                "Treat the within-person term as uninterpretable unless the "
+                "per-wave layers are harmonised to a common sensor and season."
+            )
+        if placebo:
+            st.markdown("**Placebo — exposure replaced by its per-wave mean**")
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "term": _DECLINE_TERM_LABELS.get(x["key"], x["key"]),
+                            "coef": x.get("coef"),
+                            "t_stat": x.get("t_stat"),
+                            "p": x.get("p_display"),
+                        }
+                        for x in placebo
+                    ]
+                ),
+                width="stretch",
+                hide_index=True,
+                column_config=_TERM_COLUMN_CONFIG,
+            )
+            st.caption(
+                "This exposure carries no spatial information at all. Any term "
+                "here that matches the real one above is measuring the wave, "
+                "not the neighbourhood."
+            )
+        per_wave = diag.get("per_wave_mean_exposure") or {}
+        if per_wave:
+            st.caption(
+                "Mean composite by wave: "
+                + " · ".join(f"{k}: {v:.3f}" for k, v in per_wave.items())
+            )
 
 
 def _render_covariate_impact(results_view: dict, metric_name: str) -> None:
@@ -2451,11 +2419,16 @@ def _render_covariate_impact(results_view: dict, metric_name: str) -> None:
         return
 
     df = pd.DataFrame(rows)
+    if "p_display" not in df.columns:
+        df["p_display"] = df["pvalue"].map(_mes.format_pvalue)
+    df = df.rename(columns={"p_display": "p"})
     df = df[
-        ["covariate", "direction", "coef", "std_err", "t_stat", "pvalue", "partial_r2"]
+        ["covariate", "direction", "coef", "std_err", "t_stat", "p", "partial_r2"]
     ]
     df = df.sort_values("partial_r2", ascending=False).reset_index(drop=True)
-    st.dataframe(df, width="stretch")
+    st.dataframe(
+        df, width="stretch", hide_index=True, column_config=_TERM_COLUMN_CONFIG
+    )
 
     try:
         import plotly.express as _px
@@ -2478,6 +2451,14 @@ def _render_covariate_impact(results_view: dict, metric_name: str) -> None:
         st.plotly_chart(fig, width="stretch")
     except Exception:
         pass
+
+
+# Longest edge of a decimated preview read. The figure is 4.5 in at 140 dpi, so
+# ~630 px on screen; anything beyond this is discarded by the renderer anyway.
+_MAP_PREVIEW_MAX_EDGE = 2000
+# Above this cell count even a decimated read walks too many blocks to be worth
+# blocking the page for.
+_MAP_PREVIEW_CELL_LIMIT = 4_000_000_000
 
 
 def _render_composite_map_viewer(results_view: dict, engine) -> None:
@@ -2517,11 +2498,11 @@ def _render_composite_map_viewer(results_view: dict, engine) -> None:
     )
 
     label_to_path = {label: path for label, path in composite_options}
-    default_pick = [composite_options[0][0]]
+    _labels = [label for label, _ in composite_options]
+    _default("fusion_map_picks", [_labels[0]], _labels, multi=True)
     picks = st.multiselect(
         "Studies to plot",
-        options=[label for label, _ in composite_options],
-        default=default_pick,
+        options=_labels,
         key="fusion_map_picks",
     )
 
@@ -2534,15 +2515,40 @@ def _render_composite_map_viewer(results_view: dict, engine) -> None:
         st.warning("rasterio not available; cannot render maps.")
         return
 
-    # Read each composite TIFF + the target geometries once.
+    # Read each composite TIFF + the target geometries once, decimated. A
+    # catchment grid over distant clusters can be gigapixel-sized and almost
+    # entirely nodata; a full-resolution read would exhaust memory for a preview
+    # that is only a few hundred pixels wide on screen.
     composites: list[tuple[str, np.ndarray, Any, Any]] = []
     common_crs = None
     for label in picks:
         path = label_to_path[label]
         try:
             with rasterio.open(path) as src:
-                arr = src.read(1, masked=True)
-                composites.append((label, arr, src.transform, src.crs))
+                if src.width * src.height > _MAP_PREVIEW_CELL_LIMIT:
+                    st.info(
+                        f"**{label}** is {src.width:,} × {src.height:,} cells — "
+                        "too large to preview here. Download it below and open "
+                        "it in QGIS."
+                    )
+                    continue
+                scale = max(
+                    1.0,
+                    max(src.width, src.height) / _MAP_PREVIEW_MAX_EDGE,
+                )
+                out_h = max(1, int(src.height / scale))
+                out_w = max(1, int(src.width / scale))
+                arr = src.read(
+                    1,
+                    masked=True,
+                    out_shape=(out_h, out_w),
+                    resampling=rasterio.enums.Resampling.average,
+                )
+                # The transform has to describe the decimated grid, not the
+                # native one, or the extent is wrong.
+                composites.append(
+                    (label, arr, src.transform * src.transform.scale(scale, scale), src.crs)
+                )
                 if common_crs is None:
                     common_crs = src.crs
         except Exception as exc:
@@ -2585,7 +2591,7 @@ def _render_composite_map_viewer(results_view: dict, engine) -> None:
     flat_axes = np.atleast_1d(axes).ravel().tolist()
 
     panel_idx = 0
-    # ── Target panel ─────────────────────────────────────────────────
+    # ── Target panel ────────────────────────────────────────────
     if target_gdf is not None and target_feature is not None:
         ax = flat_axes[panel_idx]
         panel_idx += 1
@@ -2614,7 +2620,7 @@ def _render_composite_map_viewer(results_view: dict, engine) -> None:
         ax.set_yticks([])
         ax.set_aspect("equal")
 
-    # ── Composite panels (shared colorbar at [0, 1]) ─────────────────
+    # ── Composite panels (shared colorbar at [0, 1]) ────────────
     last_im = None
     for label, arr, transform, crs in composites:
         ax = flat_axes[panel_idx]
@@ -2720,7 +2726,7 @@ def _render_stability_diagnostics(summary: dict, metric_name: str) -> None:
     higher_is_better = bool(summary.get("higher_is_better", True))
     worst_q = float(summary.get("worst_quantile") or 0.10)
 
-    # ── Automated threshold calibration (Bodinier) ────────────────────
+    # ── Automated threshold calibration (Bodinier) ──────────────
     if summary.get("selection_threshold") is not None:
         c1, c2, c3, c4 = st.columns(4)
         with c1:
@@ -2810,7 +2816,7 @@ def _render_stability_diagnostics(summary: dict, metric_name: str) -> None:
     )
     st.caption(direction_msg)
 
-    # ── Top cells ranking ─────────────────────────────────────────────
+    # ── Top cells ranking ───────────────────────────────────────
     if cell_stats:
         st.markdown("**Top weight cells (ranked by selection probability)**")
         rows: list[dict] = []
@@ -2843,7 +2849,7 @@ def _render_stability_diagnostics(summary: dict, metric_name: str) -> None:
             "similar runners-up is more credible than an isolated winner."
         )
 
-    # ── Stage-2 radius sub-cells (within the winning weight cell) ─────
+    # ── Stage-2 radius sub-cells (winning weight cell) ──────────
     radius_stats = summary.get("radius_cell_stats") or []
     if radius_stats:
         bin_m = summary.get("radius_bin_m")
@@ -2880,7 +2886,7 @@ def _render_stability_diagnostics(summary: dict, metric_name: str) -> None:
             "configuration rather than a mean across disagreeing trials."
         )
 
-    # ── Winning cell OOB distribution ─────────────────────────────────
+    # ── Winning cell OOB distribution ───────────────────────────
     if oob_scores and len(oob_scores) >= 3:
         st.markdown("**Winning-cell OOB score distribution**")
         df_oob = _pd.DataFrame({f"OOB {metric_name}": list(oob_scores)})
@@ -2920,7 +2926,7 @@ def _render_stability_diagnostics(summary: dict, metric_name: str) -> None:
             "the picked weights performed across bootstrap resamples."
         )
 
-    # ── Per-bootstrap leaderboard ─────────────────────────────────────
+    # ── Per-bootstrap leaderboard ───────────────────────────────
     if per_bs:
         st.markdown("**Per-bootstrap leaderboard** (one row per resample)")
         rows = []
@@ -2951,7 +2957,7 @@ def _render_stability_diagnostics(summary: dict, metric_name: str) -> None:
             "many bootstraps, that's strong evidence the winner is stable."
         )
 
-    # ── Per-trial history (the stability analogue of an Optuna trial log) ──
+    # ── Per-trial history (stability's Optuna trial log) ────────
     history = summary.get("trial_history") or []
     if history and len(history) >= 5:
         with st.expander(f"Trial history ({len(history)} trials across all resamples)"):
@@ -3047,6 +3053,20 @@ def _render_stability_diagnostics(summary: dict, metric_name: str) -> None:
             )
 
 
+_P_KIND_LABEL = {"permutation": "permutation p", "wald": "Wald p"}
+_P_KIND_HELP = {
+    "permutation": (
+        "Permutation p-value (Freedman–Lane when covariates are controlled)."
+    ),
+    "wald": (
+        "Wald p-value for the greenery fixed effect from the mixed model fit on "
+        "this split. Mixed-effects objectives have no permutation analogue — a "
+        "surrogate would have to be resampled and refit per entity, which the "
+        "cluster bootstrap already covers."
+    ),
+}
+
+
 def _render_results_headline(results_view: dict, metric_name: str) -> None:
     """At-a-glance CGI bottom line: the held-out test greenery effect (headline,
     with the whole-data figure in its tooltip), the held-out significance check,
@@ -3103,7 +3123,22 @@ def _render_results_headline(results_view: dict, metric_name: str) -> None:
             if t_lo is not None and t_hi is not None
             else "—"
         )
-        p_str = f"; permutation p={t_p:.3g}" if t_p is not None else ""
+        p_str = (
+            f"; {_P_KIND_LABEL.get(test_eff.get('p_kind'), 'p')}={t_p:.3g}"
+            if t_p is not None
+            else ""
+        )
+        # |t| is folded at zero, so its interval is not a significance
+        # statement. The signed coefficient's interval is the one that can
+        # straddle zero.
+        s_score = _f(test_eff.get("signed_score"))
+        s_lo, s_hi = _f(test_eff.get("signed_lower")), _f(test_eff.get("signed_upper"))
+        if s_score is not None and s_lo is not None and s_hi is not None:
+            all_str += (
+                f" Signed greenery coefficient: {s_score:.4f} "
+                f"[{s_lo:.4f}, {s_hi:.4f}] — read this interval, not the |t| one, "
+                "for direction and significance."
+            )
         if fit_failed:
             st.metric(
                 f"Held-out test {metric_name}",
@@ -3126,9 +3161,12 @@ def _render_results_headline(results_view: dict, metric_name: str) -> None:
         else:
             st.metric(f"Held-out test {metric_name}", "—", help=all_str or None)
 
-    # 2) Held-out significance — permutation p on the untouched test split.
+    # 2) Held-out significance on the untouched test split.
     with cols[1]:
         p = _f(test_eff.get("p_value"))
+        p_kind = test_eff.get("p_kind")
+        if p is None:
+            p, p_kind = _f(test_ci.get("pvalue")), "wald"
         t_score = _f(test_eff.get("score"))
         if t_score is None:
             t_score = _f(test_ci.get("observed"))
@@ -3140,12 +3178,12 @@ def _render_results_headline(results_view: dict, metric_name: str) -> None:
             )
         elif p is not None:
             st.metric(
-                "Held-out significance (p-value)",
+                f"Held-out significance ({_P_KIND_LABEL.get(p_kind, 'p-value')})",
                 f"p = {p:.3g}",
                 help=(
-                    "Permutation p-value on the untouched test split "
-                    "(Freedman–Lane when covariates are controlled) — the honest "
-                    "generalizability check (the params never saw it)."
+                    _P_KIND_HELP.get(p_kind, "")
+                    + " The honest generalizability check — the params never saw "
+                    "this split."
                 ),
             )
         elif t_score is not None:
@@ -3272,7 +3310,7 @@ def _render_study_detail(
     has_covariates = bool(covariates_used)
     is_cgi = study_key == "cgi"
 
-    # ── Tiles: test score + CI · direction · n ────────────────────────
+    # ── Tiles: test score + CI · direction · n ──────────────────
     tile_cols = st.columns(3)
     with tile_cols[0]:
         if test_ci.get("status") == "fit_failed":
@@ -3309,7 +3347,7 @@ def _render_study_detail(
         test_n = (subset_scores.get("test") or {}).get("n")
         st.metric("Test entities (n)", f"{int(test_n)}" if test_n else "—")
 
-    # ── Winning params ────────────────────────────────────────────────
+    # ── Winning params ──────────────────────────────────────────
     if is_cgi:
         if formula.name == _cgi_formulas.WEIGHTED_AVERAGE:
             st.markdown("**Weights (stability-selected)**")
@@ -3398,18 +3436,32 @@ def _render_study_detail(
                 _agg_label(final_params.get(stat_key), final_params.get(pct_key)),
             )
 
-    # ── Per-subset scores ─────────────────────────────────────────────
+    # ── Per-subset scores ───────────────────────────────────────
     if subset_scores:
         # Bootstrap CIs + held-out permutation p-value. The in-pool slice
         # carries the train+val CI only (no permutation p: the params were
         # selected on this pool, so a permutation test there is in-sample and
         # optimistic). Test + all carry both CI and the held-out p.
         effects = study_view.get("cgi_effects") or {}
+        _tci = test_res.get("test_ci") or {}
+        # A MixedLM run without an effects block still has the held-out cluster
+        # bootstrap, which carries the same interval and a Wald p.
+        _test_fallback = (
+            {
+                "lower": _tci.get("lower"),
+                "upper": _tci.get("upper"),
+                "p_value": _tci.get("pvalue"),
+                "p_kind": "wald",
+            }
+            if _tci.get("status") == "ok"
+            else None
+        )
         eff_for = {
             "train": effects.get("train_val"),
-            "test": effects.get("test"),
+            "test": effects.get("test") or _test_fallback,
             "all": effects.get("all"),
         }
+        p_col = _P_KIND_LABEL.get((eff_for["test"] or {}).get("p_kind"), "p-value")
         # Friendly labels — there is no train→fit→validate step. The displayed
         # slices are the cross-resample bootstrap signal, the untouched held-out
         # test, and the whole dataset.
@@ -3449,7 +3501,7 @@ def _render_study_detail(
             eff = eff_for.get(subset)
             row["95% CI"] = _fmt_ci(eff)
             p_val = (eff or {}).get("p_value")
-            row["p (perm)"] = f"{float(p_val):.3g}" if p_val is not None else None
+            row[p_col] = f"{float(p_val):.3g}" if p_val is not None else None
             row["n"] = block.get("n")
             rows.append(row)
         if rows:
@@ -3461,9 +3513,9 @@ def _render_study_detail(
                 "the complementary-half resamples (the cross-resample signal) · "
                 "**Held-out test** = untouched test split the params never saw "
                 "(the headline) · **All** = every entity (in-sample, descriptive). "
-                "95% CIs are percentile bootstrap; `p (perm)` is the permutation "
-                "p-value on the held-out test only (the params were tuned on the "
-                "rest, so an all-slice p-value would double-dip)."
+                f"95% CIs are percentile bootstrap; `{p_col}` is reported on the "
+                "held-out test only (the params were tuned on the rest, so an "
+                "all-slice p-value would double-dip)."
             )
             if has_covariates:
                 cap += (
@@ -3472,11 +3524,11 @@ def _render_study_detail(
                 )
             st.caption(cap)
 
-    # ── Final params JSON ─────────────────────────────────────────────
+    # ── Final params JSON ───────────────────────────────────────
     with st.expander("Final parameters (composite is built from these)"):
         st.json(final_params)
 
-    # ── Stability-selection diagnostics ───────────────────────────────
+    # ── Stability-selection diagnostics ─────────────────────────
     _render_stability_diagnostics(summary, metric_name)
 
 
@@ -3495,16 +3547,16 @@ def _render_cross_study_comparison(results_view: dict, metric_name: str) -> None
         if b:
             studies.append((ch, f"{_CHANNEL_DISPLAY.get(ch, ch)} (standalone)", b))
 
-    # ── Score bars (bootstraps + all) ─────────────────────────────────
+    # ── Score bars (bootstraps + all) ───────────────────────────
     _subset_label = {
         "val": "Bootstraps",
         "test": "Held-out test",
         "all": "All",
     }
+    _default("fusion_compare_subsets", ["val", "all"])
     subset_picks = st.multiselect(
         "Subsets to compare",
         options=["val", "test", "all"],
-        default=["val", "all"],
         format_func=lambda s: _subset_label.get(s, s),
         key="fusion_compare_subsets",
         help="Each study's stability-selected params, scored on each subset.",
@@ -3549,7 +3601,7 @@ def _render_cross_study_comparison(results_view: dict, metric_name: str) -> None
         with st.expander("Show exact values"):
             st.dataframe(df, width="stretch")
 
-    # ── Paired objective difference vs each standalone (Holm-corrected) ──
+    # ── Paired objective difference (Holm-corrected) ────────────
     fam = results_view.get("cgi_vs_standalone_paired_family") or []
     if fam:
         st.markdown("**Paired objective difference (CGI − standalone)**")
@@ -3584,7 +3636,7 @@ def _render_cross_study_comparison(results_view: dict, metric_name: str) -> None
             "the p-values accordingly."
         )
 
-    # ── AIC/BIC verdict detail ────────────────────────────────────────
+    # ── AIC/BIC verdict detail ──────────────────────────────────
     aic_bic = results_view.get("cgi_vs_standalone_aic_bic") or None
     if aic_bic and aic_bic.get("ok"):
         st.markdown("**Penalized model comparison (AIC / BIC)**")
@@ -3675,16 +3727,13 @@ def _render_fusion_results_body(output_dir: str) -> None:
     with head_col:
         st.subheader("Optimization Results")
     with clear_col:
-        if st.button(
+        st.button(
             "Clear",
             key="fusion_results_clear",
             width="stretch",
             help="Unload these results from the panel (does not delete files).",
-        ):
-            st.session_state.fusion_engine = None
-            st.session_state.fusion_results = None
-            st.session_state.fusion_engines_by_target = {}
-            st.rerun()
+            on_click=_clear_fusion_results_cb,
+        )
 
     results = st.session_state.fusion_results
     if results.get("mode") == "multi":
@@ -3736,7 +3785,7 @@ def _render_fusion_results_body(output_dir: str) -> None:
         kind = "categorical" if str(cov_types.get(c)).lower() == "categorical" else None
         return f"`{c}`" + (f" _({kind})_" if kind else "")
 
-    # ── Headline ──────────────────────────────────────────────────────
+    # ── Headline ────────────────────────────────────────────────
     _render_results_headline(results_view, metric_name)
     if target_name or outcome_name:
         bits = []
@@ -3765,7 +3814,7 @@ def _render_fusion_results_body(output_dir: str) -> None:
         st.caption(f"📁 Job artifacts: `{artifacts_dir}`")
     st.divider()
 
-    # ── Study selector + per-study detail ─────────────────────────────
+    # ── Study selector + per-study detail ───────────────────────
     standalones = results_view.get("standalones") or {}
     study_options: list[tuple[str, str]] = [("cgi", "CGI (combined)")]
     for ch in ("veg", "terrain", "ndvi"):
@@ -3796,22 +3845,22 @@ def _render_fusion_results_body(output_dir: str) -> None:
         "switches the per-study detail)._"
     )
 
-    # ── Cross-study comparison (CGI vs standalones) ───────────────────
+    # ── Cross-study comparison (CGI vs standalones) ─────────────
     _render_cross_study_comparison(results_view, metric_name)
 
-    # ── Channel collinearity report ───────────────────────────────────
+    # ── Channel collinearity report ─────────────────────────────
     _render_collinearity_report(results_view)
 
-    # ── Covariate impact panel ────────────────────────────────────────
+    # ── Covariate impact panel ──────────────────────────────────
     _render_covariate_impact(results_view, metric_name)
 
-    # ── Longitudinal exposure–decline terms ───────────────────────────
+    # ── Longitudinal exposure–decline terms ─────────────────────
     _render_decline_terms(results_view)
 
-    # ── Composite map viewer ──────────────────────────────────────────
+    # ── Composite map viewer ────────────────────────────────────
     _render_composite_map_viewer(results_view, engine)
 
-    # ── Mixed-effects post-hoc metrics CSV viewer ─────────────────────
+    # ── Mixed-effects post-hoc metrics CSV viewer ───────────────
     try:
         bundle_artifacts = results_view.get("artifacts_dir")
         if bundle_artifacts:
@@ -3866,7 +3915,7 @@ def _render_fusion_results_body(output_dir: str) -> None:
     except Exception as _exc:  # pragma: no cover -- UI-only guard
         st.warning(f"Could not read mixedlm_metrics CSVs: {_exc}")
 
-    # ── On-disk artifact index ────────────────────────────────────────
+    # ── On-disk artifact index ──────────────────────────────────
     _render_artifact_index(results_view)
 
 
@@ -3923,13 +3972,20 @@ def _render_target_preview(
         elif is_raster_target:
             with rasterio.open(tmp_target_path) as src:
                 n_bands_preview = src.count
+            # Starts on the outcome band, then follows its own selection.
+            # Clamped in case a later raster has fewer bands.
+            _n_bands = max(1, n_bands_preview)
+            _default(
+                "fusion_preview_raster_band",
+                min(int(st.session_state.get("fusion_target_band", 1)), _n_bands),
+            )
+            st.session_state["fusion_preview_raster_band"] = min(
+                int(st.session_state["fusion_preview_raster_band"]), _n_bands
+            )
             preview_band = st.number_input(
                 "Preview band",
                 min_value=1,
-                max_value=max(1, n_bands_preview),
-                value=min(
-                    int(st.session_state.get("fusion_target_band", 1)), n_bands_preview
-                ),
+                max_value=_n_bands,
                 help="Band shown on the map (can differ from the outcome band on the left).",
                 key="fusion_preview_raster_band",
             )
@@ -4001,15 +4057,11 @@ def render(output_dir: str) -> None:
         st.error("MetricFusionEngine module not found in geofuse/fusion.py")
         return
 
-    # Surface the restart workflow if the user clicked ↻ on a fusion job in the
-    # sidebar monitor. The panel takes over the tab until cancelled or
-    # confirmed — same pattern as the GVI / NDVI tabs.
-    from services import get_job_executor, get_job_store
+    # A re-run confirmed on a job card in the sidebar monitor lands here:
+    # seed the form before any of its widgets instantiate.
+    from services import get_job_store
 
-    _restart_store = get_job_store()
-    _restart_executor = get_job_executor()
-    if _render_fusion_restart_panel(_restart_store, _restart_executor, output_dir):
-        return
+    _consume_fusion_restart(get_job_store())
 
     if "fusion_engine" not in st.session_state:
         st.session_state.fusion_engine = None
@@ -4020,14 +4072,8 @@ def render(output_dir: str) -> None:
     if "fusion_engines_by_target" not in st.session_state:
         st.session_state.fusion_engines_by_target = {}
 
-    # =========================================================================
-    # Loaded-results overview
-    # =========================================================================
-    # Render the results section first so it survives the configuration-UI
-    # early returns below. The user loads a completed job's bundle via the
-    # **Load results** button in the sidebar Job Monitor; once loaded, this
-    # block keeps showing it across page refreshes and across changes to
-    # the configuration form below.
+    # ── Loaded-results overview ─────────────────────────────────
+    # Rendered first so it survives the configuration early-returns below.
     _render_fusion_results_section(output_dir)
 
     # =========================================================================
@@ -4089,6 +4135,7 @@ def render(output_dir: str) -> None:
                             except Exception:
                                 layers = []
                         if len(layers) > 1:
+                            _keep_valid("fusion_target_gpkg_layer", layers)
                             target_layer_for_engine = st.selectbox(
                                 "Target layer",
                                 options=layers,
@@ -4127,13 +4174,13 @@ def render(output_dir: str) -> None:
                                 with row_l:
                                     st.text(f"Outcome {i + 1}: {col}")
                                 with row_r:
-                                    if st.button(
+                                    st.button(
                                         "❌",
                                         key=f"fusion_outcome_remove_{i}",
                                         help="Remove this outcome column",
-                                    ):
-                                        st.session_state.fusion_outcome_columns.pop(i)
-                                        st.rerun()
+                                        on_click=_remove_fusion_outcome_cb,
+                                        args=(i,),
+                                    )
 
                         remaining = [
                             c
@@ -4157,9 +4204,9 @@ def render(output_dir: str) -> None:
                             st.session_state.fusion_outcome_columns
                         )
                         if len(target_outcome_columns) > 1:
+                            _default("fusion_multi_objective_run", False)
                             multi_objective_requested = st.checkbox(
                                 "Multi-objective optimization run",
-                                value=False,
                                 help="Joint multi-objective optimization (currently runs sequentially).",
                                 key="fusion_multi_objective_run",
                             )
@@ -4176,14 +4223,14 @@ def render(output_dir: str) -> None:
                         with rasterio.open(tmp_target_path) as src:
                             n_bands = src.count
                         st.info(f"🗺️ Detected: **GeoTIFF** with {n_bands} band(s)")
+                        _default("fusion_target_band", 1)
+                        st.session_state["fusion_target_band"] = min(
+                            int(st.session_state["fusion_target_band"]), n_bands
+                        )
                         target_band = st.number_input(
                             "Outcome band",
                             min_value=1,
                             max_value=n_bands,
-                            value=min(
-                                int(st.session_state.get("fusion_target_band", 1)),
-                                n_bands,
-                            ),
                             help="Raster band used as the outcome surface.",
                             key="fusion_target_band",
                         )
@@ -4239,8 +4286,7 @@ def render(output_dir: str) -> None:
     ndvi_buffer_step_m = metric_state["ndvi_buffer_step"]
     buffer_extent_m = float(max(gvi_buffer_max_m, ndvi_buffer_max_m))
 
-    # Auto-download mode is no longer exposed; defaults reproduce the
-    # legacy non-Auto-Download path.
+    # ── Metric-download defaults ────────────────────────────────
     ndvi_auto_start = date(2023, 6, 1)
     ndvi_auto_end = date(2023, 9, 30)
     cache_metrics = False
@@ -4340,6 +4386,8 @@ def render(output_dir: str) -> None:
     lon_decline_between = study_state.get("decline_average_exposure", False)
     lon_decline_within = study_state.get("decline_exposure_change", False)
     lon_association_target = study_state.get("association_target", "level")
+    lon_wave_fe = study_state.get("include_wave_fixed_effects", True)
+    lon_area_col = study_state.get("area_id_col") or None
     cgi_grid_spacing_m_param = study_state.get("cgi_grid_spacing_m")
     whole_grid_scaling_param = bool(study_state.get("whole_grid_scaling", False))
     area_balanced_split_param = bool(study_state.get("area_balanced_split", False))
@@ -4438,14 +4486,15 @@ def render(output_dir: str) -> None:
                     )
     with col_run3:
         if st.session_state.fusion_results:
-            if st.button("🔄 Reset", width="stretch", key="fusion_reset"):
-                st.session_state.fusion_engine = None
-                st.session_state.fusion_results = None
-                st.session_state.fusion_engines_by_target = {}
-                st.rerun()
+            st.button(
+                "🔄 Reset",
+                width="stretch",
+                key="fusion_reset",
+                on_click=_clear_fusion_results_cb,
+            )
 
     if fusion_run_clicked:
-        # ── Basic validation ─────────────────────────────────────────────
+        # ── Basic validation ────────────────────────────────
         if not target_picked_path or not tmp_target_path:
             st.error("❌ Please upload a target file")
         elif is_vector_target and not target_outcome_columns:
@@ -4462,7 +4511,7 @@ def render(output_dir: str) -> None:
             for _err in metric_state["coverage_errors"]:
                 st.error(f"❌ {_err}")
         else:
-            # ── Build LongitudinalSpec (or None) ─────────────────────────
+            # ── Build LongitudinalSpec (or None) ────────
             from geofuse.longitudinal import LongitudinalSpec as _LonSpec
             from geofuse.longitudinal import validate_spec as _validate_lon_spec
 
@@ -4525,10 +4574,20 @@ def render(output_dir: str) -> None:
                         target_files_per_wave = {
                             wf["wave_label"]: wf["path"] for wf in wide_files
                         }
+                        # Intake uses the canonical pair; keeping each file's
+                        # own choice lets the setup form be restored exactly.
+                        target_columns_per_wave = {
+                            wf["wave_label"]: {
+                                "entity_col": wf["entity_col"],
+                                "date_col": wf["date_col"],
+                            }
+                            for wf in wide_files
+                        }
                         entity_id_col = canonical_entity
                         date_col_eff = canonical_date
                     else:
                         target_files_per_wave = {}
+                        target_columns_per_wave = {}
                         entity_id_col = ""
                         date_col_eff = ""
                     wave_col_eff: str | None = None
@@ -4553,10 +4612,13 @@ def render(output_dir: str) -> None:
                     date_col=date_col_eff or "measurement_date",
                     greenery_files=greenery_files,
                     target_files_per_wave=target_files_per_wave,
+                    target_columns_per_wave=target_columns_per_wave,
                     scoring_metric=objective_metric,
                     include_time_fixed_effect=lon_include_time_fixed,
                     random_slope_time=lon_random_slope,
                     association_target=str(lon_association_target),
+                    include_wave_fixed_effects=bool(lon_wave_fe),
+                    area_id_col=lon_area_col,
                     decline_average_exposure=bool(lon_decline_between),
                     decline_exposure_change=bool(lon_decline_within),
                     derive_wave_from_date=assign_by_year,
@@ -4609,7 +4671,7 @@ def render(output_dir: str) -> None:
                 if metric_state["ndvi_files"]:
                     ndvi_path = metric_state["ndvi_files"][0][0]
 
-            # ── Configuration summary ───────────────────────────────────
+            # ── Configuration summary ───────────────────
             fusion_multi_objective = (
                 multi_objective_requested
                 if is_vector_target and len(target_outcome_columns) > 1
@@ -4678,10 +4740,10 @@ def render(output_dir: str) -> None:
             )
 
             # Canonical run configuration — every ``run_fusion`` setting that
-            # isn't a file path or runtime object. Recorded verbatim and
-            # replayed verbatim on restart (see ``_FUSION_RUN_CONFIG_KEYS`` /
-            # ``_submit_fusion_restart``) so a re-run can never silently fall
-            # back to a default for a forgotten setting.
+            # isn't a file path or runtime object. Recorded verbatim and seeded
+            # back into the form on re-run (see ``_FUSION_RUN_CONFIG_KEYS`` /
+            # ``_seed_fusion_form``) so a re-run can never silently fall back
+            # to a default for a forgotten setting.
             run_config = {
                 "buffer_meters": float(buffer_extent_m),
                 "gvi_buffer_min_m": float(gvi_buffer_min_m),
@@ -4763,6 +4825,14 @@ def render(output_dir: str) -> None:
                     "job whose settings wouldn't round-trip on restart."
                 )
 
+            if st.session_state.get("fusion_clear_preaggr"):
+                stale = _fusion_preaggr_cache_files(
+                    {"target_path": tmp_target_path, **run_config}, output_dir
+                )
+                if stale:
+                    n, freed = _purge_fusion_preaggr_cache(stale)
+                    st.info(f"Cleared {n} cache file(s), freed {freed / 1024**2:.0f} MB.")
+
             fusion_record = store.submit(
                 type="fusion",
                 name=os.path.splitext(target_display_name)[0],
@@ -4840,8 +4910,4 @@ def render(output_dir: str) -> None:
             )
 
             st.success("✅ Fusion job started! Check sidebar for progress.")
-    # Result-loading is explicit — use the **Load results** button on a
-    # completed job card in the sidebar Job Monitor to populate the
-    # results panel. The previous auto-load-first-terminal-job behaviour
-    # was removed at the user's request so they can choose which run to
-    # inspect (or none at all).
+    # Results load on demand, from the **Load results** button on a job card.

@@ -83,9 +83,9 @@ def _ndvi_units() -> list[dict]:
         )
     return units
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Tab render entry point
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 
 def _ndvi_scan_dir(directory: str) -> dict[str, dict]:
@@ -675,7 +675,7 @@ def _render_ndvi_date_config() -> None:
                 if not any([use_ranges, use_specific, use_column]):
                     st.warning("Select at least one date mode.")
 
-                # ── Date Range(s) ─────────────────────────────────────────
+                # ── Date Range(s) ───────────────────
                 if use_ranges:
                     st.markdown("**Date Range(s)**")
                     remove_idx = None
@@ -740,7 +740,7 @@ def _render_ndvi_date_config() -> None:
                         cfg["ranges"].append((date(today.year, 1, 1), today))
                         st.rerun(scope="fragment")
 
-                # ── Specific Date(s) ──────────────────────────────────────
+                # ── Specific Date(s) ────────────────
                 if use_specific:
                     if use_ranges:
                         st.divider()
@@ -784,7 +784,7 @@ def _render_ndvi_date_config() -> None:
                         cfg["specific_dates"].append(today)
                         st.rerun(scope="fragment")
 
-                # ── Attribute Column ──────────────────────────────────────
+                # ── Attribute Column ────────────────
                 if use_column:
                     if use_ranges or use_specific:
                         st.divider()

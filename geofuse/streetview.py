@@ -44,7 +44,7 @@ import aiohttp
 import requests
 from PIL import Image
 
-# ── Dataclasses ─────────────────────────────────────────────────────────────
+# ── Dataclasses ─────────────────────────────────────────────────────
 
 
 class RateLimitedError(RuntimeError):
@@ -178,7 +178,7 @@ def is_third_party_panoid(panoid: str) -> bool:
     return panoid.startswith("CIHM0og") or len(panoid) > 22
 
 
-# ── URL-encoded protobuf encoder (Google Maps' RPC format) ──────────────────
+# ── URL-encoded protobuf encoder (Google Maps' RPC format) ──────────
 
 
 class _PbType(Enum):
@@ -248,7 +248,7 @@ def _to_protobuf_url(fields: dict) -> str:
     return _to_pb_url(fields)[1]
 
 
-# ── API: find panorama by radius (SingleImageSearch) ────────────────────────
+# ── API: find panorama by radius (SingleImageSearch) ────────────────
 
 
 def _build_find_panorama_url(
@@ -415,7 +415,7 @@ async def find_panorama_async(
     return _parse_radius_response(json.loads(_repair_jsonp(text)))
 
 
-# ── API: download panorama image ────────────────────────────────────────────
+# ── API: download panorama image ────────────────────────────────────
 
 
 _TILE_URL = (

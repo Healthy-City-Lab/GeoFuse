@@ -186,9 +186,8 @@ def compute_post_metrics(
 
     os.makedirs(output_dir, exist_ok=True)
     csv_path = os.path.join(output_dir, csv_basename)
-    # ``n_trials`` is its own column (repeated per row for its pool) so the
-    # metric columns hold only metric values — a downstream ``.describe()`` on
-    # ``marginal_r2`` no longer sees a trial count masquerading as a proportion.
+    # ``n_trials`` is its own column so the metric columns hold only metric
+    # values.
     fields = (
         ["pool", "trial_id"]
         + sorted(mixed_effects_scoring.MIXEDLM_METRICS)

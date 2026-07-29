@@ -84,9 +84,9 @@ def stat_to_column(stat: str, percentile: int | None) -> str | None:
     return None
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Buffered-disc construction and raster reduction
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 #
 # Every raster aggregation in this module follows one rule: buffer the entity in
 # the projected (metres) grid CRS, reproject the *buffer* into the raster's
@@ -260,9 +260,9 @@ def raster_disc_stats(
     return stats_from_ring_grid(data[base_valid], ring[base_valid], n_radii)
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Format-aware per-batch aggregation
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 
 def build_vector_index(metric_gdf, metric_crs, value_col: str):
@@ -749,9 +749,9 @@ def raster_batch_geometry_stats(
     return out
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # SQLite cache
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 
 class GreeneryCache:

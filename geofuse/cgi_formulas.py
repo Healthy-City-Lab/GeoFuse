@@ -65,9 +65,9 @@ from functools import cache
 import numpy as np
 import optuna
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Public formula names + parameter spaces
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 WEIGHTED_AVERAGE = "weighted_average"
 SYNERGY = "synergy"
@@ -92,9 +92,9 @@ _CLAMP_LO = 0.0
 _CLAMP_HI = 1.0
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Formula descriptor
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 # Mapping from canonical channel name to its 1-D values array for one batch of
 # samples. The engine builds these from its per-fold MinMaxScaler-normalised
@@ -125,9 +125,9 @@ class CGIFormula:
         return self.main_weight_keys + self.interaction_weight_keys
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Cell binning (stability-selection aggregation)
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 # Bucket width for the weight-cell key used by bootstrap stability selection.
 # Trials are recorded at 5 % resolution (:data:`WEIGHT_STEP_PCT`); for cell
@@ -265,9 +265,9 @@ def radius_cell_key(
     return tuple(parts)
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Symmetric Dirichlet(1,…,1) sampling (uniform on the simplex)
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 # Floor for the raw uniform draws so ``-log(u)`` stays finite and the
 # normalising sum is never zero. The symmetric upper clamp keeps every key's
@@ -346,9 +346,9 @@ def _suggest_simplex_weights_dirichlet(
     return out
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # weighted_average formula
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 _WA_WEIGHT_KEYS: tuple[str, ...] = ("ndvi_weight", "veg_weight", "terrain_weight")
 _WA_KEY_TO_CHANNEL: dict[str, str] = {
@@ -427,9 +427,9 @@ def _wa_channel_active(params: dict) -> dict[str, bool]:
     }
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # synergy formula
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 # Key ordering is informational only — the symmetric Dirichlet sampler treats
 # every key identically, so the (main NDVI / Veg / Ter, then pairwise NV / NT
@@ -580,9 +580,9 @@ def _synergy_channel_active(params: dict) -> dict[str, bool]:
     }
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Registry + public API
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 _REGISTRY: dict[str, CGIFormula] = {
     WEIGHTED_AVERAGE: CGIFormula(

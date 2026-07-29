@@ -331,9 +331,9 @@ class JobExecutor:
             self._futures[record.id] = future
         return future
 
-    # ------------------------------------------------------------------
+    # ────────────────────────────────────────────────────────────
     # Engine-specific convenience wrappers around :meth:`submit_subprocess_job`.
-    # ------------------------------------------------------------------
+    # ────────────────────────────────────────────────────────────
 
     def submit_gvi_subprocess(
         self,

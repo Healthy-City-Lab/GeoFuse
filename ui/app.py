@@ -50,6 +50,13 @@ if __name__ == "__main__":
     # iframe that relocates tabs / brand / sidebar control. See ui/chrome.py.
     inject_chrome()
 
+    # Re-assert the Fusion form's widget state before anything renders so a
+    # rerun aborted mid-script (st.rerun in a picker, an exception in an
+    # earlier tab) can never wipe the half-filled form.
+    from helpers import pin_fusion_form_state
+
+    pin_fusion_form_state()
+
     tab_ndvi, tab_gvi, tab_fusion, tab_job = st.tabs(
         ["NDVI", "GVI", "Fusion & Optimization", "HPC Monitoring"]
     )

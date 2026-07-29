@@ -121,66 +121,49 @@ button.gf-tab-muted[aria-selected="true"] {
 	color: #6d6d6d !important;
 }
 
-/* Give the tab bar enough vertical room for the taller brand text */
-div[data-testid="stTabs"] [data-baseweb="tab-list"] {
-	padding-top: 6px;
-	padding-bottom: 4px;
-}
-
-/* --- Tab list relocated into the top app toolbar -------------------- */
-/* The JS in chrome.js moves [data-baseweb="tab-list"] into stToolbar so
-   tabs render in the same row as Deploy / overflow menu, freeing the
-   page header for content. */
-[data-testid="stToolbar"] {
-	display: flex !important;
-	align-items: center !important;
-	gap: 0.5rem !important;
-	padding-left: 0.9rem !important;
-	max-width: none !important;
-	width: 100% !important;
-}
-/* Streamlit's toolbar uses a nested wrapper; let the left slot (where we
-   drop the tab list) flex to fill the space before Deploy/overflow. */
-[data-testid="stToolbar"] > div {
-	display: flex !important;
-	align-items: center !important;
-	width: 100% !important;
-	gap: 0.5rem;
-}
-[data-testid="stToolbar"] > div > div:first-child {
-	flex: 1 1 auto !important;
-	min-width: 0 !important;
-}
-[data-testid="stToolbar"] [data-baseweb="tab-list"] {
-	flex: 1 1 auto;
+/* --- Tab strip ------------------------------------------------------ */
+/* The strip stays inside stTabs where React renders it and is pinned to the
+   top of the content column, sharing the band with the toolbar's
+   Deploy/overflow controls. Relocating the node into the toolbar detaches it
+   from React and resets the selected tab on every rerun. */
+div[data-testid="stTabs"] > [data-baseweb="tab-list"] {
+	position: sticky;
+	top: 0;
+	z-index: 60;
+	background: var(--background-color, #ffffff);
 	border-bottom: none !important;
-	padding: 0 !important;
-	margin: 0 !important;
 	align-items: center !important;
+	gap: 0.15rem;
 	min-height: 0 !important;
 	height: auto !important;
-	gap: 0.15rem;
+	padding: 4px 0 3px !important;
+	margin: 0 !important;
 	overflow-x: auto;
 	/* Firefox-only scrollbar slimming; ignored elsewhere. */
 	scrollbar-width: thin;
 }
-[data-testid="stToolbar"] [data-baseweb="tab-list"] button[role="tab"] {
+div[data-testid="stTabs"] > [data-baseweb="tab-list"] button[role="tab"] {
 	padding: 0 0.6rem !important;
 	height: 2rem !important;
 	min-height: 0 !important;
 	font-size: 0.9rem !important;
 }
-/* Brand label fits inside a 36-40px toolbar; trim the larger page-level styling. */
-[data-testid="stToolbar"] .gf-brand {
+div[data-testid="stTabs"] .gf-brand {
 	font-size: 1.05rem !important;
 	padding-right: 0.6rem !important;
 	margin-right: 0.3rem !important;
 	line-height: 1 !important;
 }
-/* Remove the empty placeholder strip stTabs leaves behind once the
-   tab-list is moved out (the tab-panel is still its child). */
 div[data-testid="stTabs"] {
 	margin-top: 0 !important;
+}
+
+/* Keep the toolbar clear of the strip; only its own controls sit there now. */
+[data-testid="stToolbar"] {
+	display: flex !important;
+	align-items: center !important;
+	gap: 0.5rem !important;
+	padding-left: 0.9rem !important;
 }
 
 /* --- Sidebar toggle living inside the toolbar ----------------------- */

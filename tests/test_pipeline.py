@@ -5,9 +5,9 @@ import tempfile
 import unittest
 import warnings
 
-# -------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # CRITICAL IMPORT ORDER FIX FOR WINDOWS
-# -------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from unittest.mock import AsyncMock, MagicMock, patch
 

@@ -15,9 +15,9 @@ from typing import TypeVar
 T = TypeVar("T")
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Per-engine progress cadence
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 #
 # Each engine emits progress at its own rhythm so the JobStore lock and the
 # parent event queue aren't slammed on million-item runs, while the UI still

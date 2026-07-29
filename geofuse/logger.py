@@ -192,9 +192,9 @@ def get_logger(engine: str):
     return log
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # External-library log routing (Earth Engine, urllib3, optuna, …)
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 #
 # Third-party packages emit their own diagnostics through stdlib ``logging``.
 # Without intervention these bubble up to the root logger and print on the

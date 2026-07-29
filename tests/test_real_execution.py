@@ -11,7 +11,7 @@ from geofuse.gvi import GVIEngine
 from geofuse.ndvi import NDVIEngine
 from geofuse.vision import get_best_device
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Manual integration tests — run directly with `python tests/test_real_execution.py`
 # These require network access (Google Street View tile servers + Google
 # Earth Engine) and a GPU. They are not included in the automated CI suite.
@@ -19,7 +19,7 @@ from geofuse.vision import get_best_device
 # Street View access uses GeoFuse's in-house scraper
 # Earth Engine needs a one-time ``earthengine authenticate`` on
 # the host. The NDVI test skips cleanly when EE is not authenticated.
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 
 def _print_skip(label: str, reason: str) -> None:

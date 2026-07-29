@@ -647,9 +647,9 @@ def _render_gvi_restart_panel(
     )
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Capture-date configuration (per-file), mirroring the NDVI tab's layout
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 _GVI_MODE_RECENT = "Most recent capture"
 _GVI_MODE_YEAR = "A specific year"
@@ -967,18 +967,18 @@ def _render_gvi_settings_map() -> None:
     )
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Live dataset registry (per-session, in addition to the process-level store)
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 #
 # Job records persisted in SQLite carry only JSON-serializable parameters.
 # The live GeoDataFrames they operate on stay in ``st.session_state.datasets``
 # (per-session) and are looked up by ``fname`` from ``record.params``.
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Tab render entry point
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 
 def render(output_dir: str, parent_dir: str) -> None:

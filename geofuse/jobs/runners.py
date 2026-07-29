@@ -68,9 +68,9 @@ _log_gvi = get_logger("GVI")
 _log_ndvi = get_logger("NDVI")
 _log_fusion = get_logger("FUSION")
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # GVI engine cache (replaces @st.cache_resource _get_gvi_engine)
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 _engine_lock = threading.Lock()
 _engine_cache: dict[tuple[str, str | None], GVIEngine] = {}
@@ -90,9 +90,9 @@ def _get_gvi_engine(model_path: str, api_key: str | None) -> GVIEngine:
         return engine
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # GVI runner
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 
 def run_gvi(
@@ -527,9 +527,9 @@ def run_gvi_column(
     return {"output_paths": output_paths}
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # NDVI runners
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 
 def _ndvi_on_progress_factory(
@@ -772,9 +772,9 @@ def run_ndvi_column(
     return {"output_paths": output_paths}
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Fusion runner
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 
 _STUDY_NAME_UNSAFE = re.compile(r"[^A-Za-z0-9_.-]+")
@@ -892,23 +892,14 @@ def _fusion_config_fingerprint(
     return _hl.sha256(payload.encode()).hexdigest()[:8]
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Fusion pipeline / stage-ledger helpers
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 
-# Ordered pipeline steps a fusion run moves through per target outcome. The
-# staged-resume ledger (geofuse.jobs.stage_ledger) records each so the monitor
-# shows where a run is and a stopped job reports where it left off. Resume itself
-# is content-addressed (metric cache, pre-aggregation cache), so re-running the
-# same job reuses/resumes each on-disk artifact transparently — the ledger is
-# the visibility layer over that durability. The heavy stages map one-to-one
-# onto real work: ``optimize`` is the bootstrap stability search (the dominant
-# compute, and where the "k/N trials" sub-bar lives), ``evaluate`` scores the
-# winning weights once on the held-out test set (fast), and ``report_stats``
-# runs the replicate statistics — test-set bootstrap CIs, effect sizes, and
-# permutation tests — that form the long tail users otherwise misread as
-# "evaluating".
+# Ordered pipeline steps per target outcome, recorded by the stage ledger so
+# the monitor can show where a run is. ``optimize`` is the stability search and
+# dominates the runtime; ``report_stats`` is the replicate-statistics tail.
 _FUSION_STAGE_STEPS: tuple[tuple[str, str], ...] = (
     ("load_target", "Load target"),
     ("load_metrics", "Load metric maps"),
@@ -1165,11 +1156,11 @@ def _write_fusion_outputs(
         except Exception as exc:  # pragma: no cover - disk-IO guard
             log("WARN", f"[{label}] Could not write {name}: {exc}")
 
-    # ── run_config.json (fidelity record) ─────────────────────────────
+    # ── run_config.json (fidelity record) ───────────────────────
     if run_config_record is not None:
         _emit_json(f"run_config{sfx}.json", run_config_record)
 
-    # ── test_scores.csv ───────────────────────────────────────────────
+    # ── test_scores.csv ─────────────────────────────────────────
     test_rows: list[dict] = []
     for key, _disp, b in studies:
         tr = b.get("test_results") or {}
@@ -1190,7 +1181,7 @@ def _write_fusion_outputs(
         )
     _emit_csv(f"test_scores{sfx}.csv", test_rows)
 
-    # ── scores.csv (every subset) ─────────────────────────────────────
+    # ── scores.csv (every subset) ───────────────────────────────
     score_rows: list[dict] = []
     for key, _disp, b in studies:
         subsets = b.get("subset_scores") or {}
@@ -1210,7 +1201,7 @@ def _write_fusion_outputs(
             )
     _emit_csv(f"scores{sfx}.csv", score_rows)
 
-    # ── parameters.csv (long form) ────────────────────────────────────
+    # ── parameters.csv (long form) ──────────────────────────────
     param_rows: list[dict] = []
     for key, _disp, b in studies:
         params = _clean_params(b.get("averaged_params") or b.get("best_params"))
@@ -1218,7 +1209,7 @@ def _write_fusion_outputs(
             param_rows.append({"study": key, "param": pname, "value": pval})
     _emit_csv(f"parameters{sfx}.csv", param_rows)
 
-    # ── stability_cells.csv + stability_bootstraps.csv ────────────────
+    # ── stability_cells.csv + stability_bootstraps.csv ──────────
     cell_rows: list[dict] = []
     bs_rows: list[dict] = []
     for key, _disp, b in studies:
@@ -1248,21 +1239,21 @@ def _write_fusion_outputs(
     _emit_csv(f"stability_cells{sfx}.csv", cell_rows)
     _emit_csv(f"stability_bootstraps{sfx}.csv", bs_rows)
 
-    # ── covariate_impact.csv ──────────────────────────────────────────
+    # ── covariate_impact.csv ────────────────────────────────────
     if covariate_impact and covariate_impact.get("per_covariate"):
         _emit_csv(
             f"covariate_impact{sfx}.csv",
             [dict(r) for r in covariate_impact["per_covariate"]],
         )
 
-    # ── decline_terms.csv (longitudinal exposure × time) ──────────────
+    # ── decline_terms.csv (longitudinal exposure × time) ────────
     decline_terms = (cgi_bundle or {}).get("decline_terms") or None
     if decline_terms and decline_terms.get("terms"):
         _emit_csv(
             f"decline_terms{sfx}.csv", [dict(r) for r in decline_terms["terms"]]
         )
 
-    # ── results_summary.json (master manifest) ────────────────────────
+    # ── results_summary.json (master manifest) ──────────────────
     studies_manifest: dict[str, dict] = {}
     for key, disp, b in studies:
         tr = b.get("test_results") or {}
@@ -1336,7 +1327,7 @@ def _write_fusion_outputs(
     }
     _emit_json(f"results_summary{sfx}.json", manifest)
 
-    # ── aic_bic.json + collinearity.json (standalone copies) ──────────
+    # ── aic_bic.json + collinearity.json (standalone copies) ────
     if aic_bic is not None:
         _emit_json(f"aic_bic{sfx}.json", aic_bic)
     if collinearity_report:
@@ -1472,6 +1463,7 @@ def _direction_sign(engine: Any, params: dict, metric: str) -> int:
     Distance correlation is unsigned, so the report needs a separate direction
     indicator. Returns ``+1`` (neutral) on any failure.
     """
+    from .. import mixed_effects_scoring as _me
     from .. import objective_scoring as _scoring
 
     try:
@@ -1481,6 +1473,29 @@ def _direction_sign(engine: Any, params: dict, metric: str) -> int:
         target = np.asarray(res.get("targets"), dtype=np.float64)
         pred = np.asarray(res.get("predictions"), dtype=np.float64)
         cov = res.get("covariates")
+        # A MixedLM objective's direction is the sign of its own greenery
+        # coefficient; a pooled rank correlation would ignore the panel and can
+        # disagree with the model being reported.
+        if (
+            getattr(engine, "is_longitudinal", False)
+            and metric in _me.MIXEDLM_METRICS
+            and res.get("entity_id") is not None
+        ):
+            spec = engine.longitudinal_spec
+            coef = _me.score_mixedlm(
+                "mixedlm_coef",
+                target,
+                pred,
+                res.get("entity_id"),
+                res.get("years_since_baseline"),
+                covariates=cov,
+                include_time_fixed=engine._effective_time_fixed(spec),
+                random_slope=spec.random_slope_time,
+                spatial_basis=res.get("spatial_basis"),
+                spatial_method=engine.spatial_adjust_method,
+                target=spec.association_target,
+            )
+            return 1 if float(coef) >= 0 else -1
         return int(
             _scoring.relationship_sign(
                 target,
@@ -2422,7 +2437,7 @@ def run_fusion(
             # calibration is free to grow the selection size K.
             max_pfer_arg = None if float(max_pfer) <= 0 else float(max_pfer)
 
-            # ── Stability selection: the dominant compute ──
+            # ── Stability selection (dominant compute) ──
             # Headline params: the stability-selection winning weight cell on
             # the full train+val pool (params averaged within the cell). The
             # "CGI: k/N trials" sub-bar and the running-stage fraction both live
@@ -2459,7 +2474,7 @@ def run_fusion(
                 return {"output_paths": output_paths}
             stage(skey("optimize"), DONE)
 
-            # ── Score the held-out test set: fast, the honest "evaluate" ──
+            # ── Score the held-out test set ─────────────
             stage(skey("evaluate"), RUNNING)
             ctx.progress(
                 value=prog_ledger(),
@@ -2470,7 +2485,7 @@ def run_fusion(
             )
             stage(skey("evaluate"), DONE)
 
-            # ── Replicate statistics: the long tail ──
+            # ── Replicate statistics: the long tail ─────
             # Test-set percentile bootstrap CI, relationship direction, and the
             # held-out effect sizes / permutation p-value — thousands of
             # replicates, named for what it is instead of hiding under
@@ -2543,15 +2558,10 @@ def run_fusion(
             composite_df = engine.apply_fusion()
             stage(skey("apply"), DONE)
 
-            # ── Post-hoc multi-metric reporting (MixedLM scoring only) ──
-            # Re-score every robust + top-20% trial + the averaged-composite
-            # parameters on the test set with all four mixedlm_* metrics so
-            # the user can compare metric agreement across the trial pool.
-            # The CSV basename includes the outcome label so multi-outcome
-            # runs don't overwrite each other. Skipped when the
-            # longitudinal spec is acting only as a per-year file-routing
-            # key with an OLS scorer — there are no MixedLM metrics to
-            # report.
+            # ── Post-hoc multi-metric reporting ─────────
+            # Re-score the trial pool on the test set with all four mixedlm_*
+            # metrics, so metric agreement is visible. Skipped when the spec is
+            # only routing files per year and the scorer is OLS.
             if mixedlm_postscore_enabled:
                 stage(skey("mixedlm_postscore"), RUNNING)
                 ctx.progress(
@@ -2581,14 +2591,10 @@ def run_fusion(
                     )
                 stage(skey("mixedlm_postscore"), DONE)
 
-            # ── Standalone single-metric stability searches ─────────────────
-            # One bootstrap stability search per enabled channel, reusing the
-            # same engine, the already-built per-(entity, radius) cache, and the
-            # train+val/test split.
-            #
-            # Each search overwrites ``engine.best_params`` /
-            # ``engine._active_greenery_channel`` with the standalone's, so we
-            # snapshot the CGI state up front and restore it after the loop.
+            # ── Standalone stability searches ───────────
+            # One search per channel, reusing the engine, its cache and split.
+            # Each overwrites the engine's active channel and best params, so
+            # snapshot the CGI state here and restore it after the loop.
             cgi_best_value = float(
                 headline_params.get("__cell_q_worst__", float("nan"))
             )
@@ -2759,7 +2765,7 @@ def run_fusion(
                 engine.best_params = cgi_best_params
                 engine._active_greenery_channel = "cgi"
 
-            # ── AIC/BIC: is CGI justified over the best standalone channel? ──
+            # ── AIC/BIC vs the best standalone ──────────
             cgi_vs_standalone_aic_bic: dict | None = None
             if standalones:
                 cgi_vs_standalone_aic_bic = _compare_cgi_vs_standalone(
@@ -2845,7 +2851,7 @@ def run_fusion(
                     f"Holm p={cgi_vs_standalone_paired.get('p_value_holm')}.",
                 )
 
-            # ── Composite GeoTIFF (raster write) ──
+            # ── Composite GeoTIFF (raster write) ────────
             # Runs after the standalone stages so they can advance the ledger
             # first. Failures here don't kill the run — the composite_df is
             # already captured in ``bundle``.

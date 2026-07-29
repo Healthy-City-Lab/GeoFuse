@@ -372,7 +372,7 @@ def load_vector_upload_sessions(
     return results
 
 
-# ─── File merging / grouping ────────────────────────────────────────
+# ── File merging / grouping ─────────────────────────────────────────
 
 
 def sanitize_name_for_file(name: str) -> str:
@@ -577,7 +577,55 @@ def render_file_grouping_controls(
     return "merge"
 
 
-# ─── Job Restart Workflow ───────────────────────────────────────────
+# ── Form-state pinning ──────────────────────────────────────────────
+
+# Streamlit drops a widget's session-state entry at the end of any run in
+# which the widget did not render — including runs aborted mid-script by
+# ``st.rerun()`` or an exception before the form. Re-asserting the values
+# at the top of every run marks them as fresh API state, which the cleanup
+# pass never removes. Button and custom-component keys must not be
+# API-assigned, so they are skipped.
+_PIN_SKIP_EXACT: frozenset[str] = frozenset(
+    {
+        "fusion_results_clear",
+        "fusion_form_run_submit",
+        "fusion_export",
+        "fusion_reset",
+        "fusion_preview_map",
+    }
+)
+_PIN_SKIP_SUBSTRINGS: tuple[str, ...] = (
+    "outcome_remove_",
+    "__btn",
+    "__up__",
+    "__dn__",
+    "__rm",
+    "_sort_",
+)
+
+
+def pin_skips_key(key: str) -> bool:
+    """True when ``key`` must not be re-asserted (button / component state)."""
+    return key in _PIN_SKIP_EXACT or any(s in key for s in _PIN_SKIP_SUBSTRINGS)
+
+
+def pin_fusion_form_state() -> None:
+    """Keep the Fusion form's widget state alive across every rerun.
+
+    Call once at the very top of the main script, before any tab renders,
+    so the re-assertion happens even on runs that abort later.
+    """
+    import streamlit as st  # local import keeps helpers.py importable headless
+
+    for key in list(st.session_state.keys()):
+        if not isinstance(key, str) or not key.startswith("fusion_"):
+            continue
+        if pin_skips_key(key):
+            continue
+        st.session_state[key] = st.session_state[key]
+
+
+# ── Job Restart Workflow ────────────────────────────────────────────
 
 RESTART_SESSION_KEY = "_restart_job_id"
 

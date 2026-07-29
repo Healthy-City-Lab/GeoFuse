@@ -110,13 +110,62 @@ def _open_tk_picker(
             pass
 
 
-def _render_path_chip(path: str, *, key: str) -> bool:
+# All picker buttons mutate state via ``on_click`` callbacks (which run
+# before the script body) instead of ``st.rerun()`` mid-script — an aborted
+# run makes Streamlit drop the session state of every widget further down
+# the page that didn't get to render.
+
+
+def _browse_cb(
+    key: str,
+    title: str,
+    file_types: Sequence[tuple[str, str]],
+    initial_dir: str | None,
+    multi: bool,
+) -> None:
+    """Open the OS dialog and store the selection under ``key``."""
+    picked = _open_tk_picker(
+        title, file_types=file_types, initial_dir=initial_dir, multi=multi
+    )
+    if not picked:
+        return
+    if multi:
+        existing = list(st.session_state.get(key) or [])
+        for new_path in picked:
+            if new_path and new_path not in existing:
+                existing.append(new_path)
+        st.session_state[key] = existing
+    else:
+        st.session_state[key] = picked[0]
+
+
+def _clear_path_cb(key: str) -> None:
+    st.session_state.pop(key, None)
+
+
+def _remove_path_cb(key: str, path: str) -> None:
+    st.session_state[key] = [
+        p for p in (st.session_state.get(key) or []) if p != path
+    ]
+
+
+def _move_path_cb(key: str, path: str, delta: int) -> None:
+    lst = list(st.session_state.get(key) or [])
+    if path not in lst:
+        return
+    i = lst.index(path)
+    j = i + delta
+    if 0 <= j < len(lst):
+        lst[i], lst[j] = lst[j], lst[i]
+        st.session_state[key] = lst
+
+
+def _render_path_chip(path: str, *, key: str, on_remove, args: tuple) -> None:
     """Render one bordered chip for ``path`` with a red ✕ remove button.
 
-    Returns ``True`` when the user clicked the remove button so the caller
-    can drop the entry from its session-state list and trigger a rerun.
     The chip shows the basename in bold (with the full absolute path as a
     native hover tooltip via ``help=``) and reports missing files inline.
+    ``on_remove`` runs as the ✕ button's callback.
     """
     with st.container(border=True):
         row_main, row_rm = st.columns([10, 1])
@@ -127,13 +176,13 @@ def _render_path_chip(path: str, *, key: str) -> bool:
             else:
                 st.warning(f"⚠️ **{base}** — file no longer exists at `{path}`")
         with row_rm:
-            return bool(
-                st.button(
-                    "❌",
-                    key=key,
-                    help="Remove this file",
-                    width="stretch",
-                )
+            st.button(
+                "❌",
+                key=key,
+                help="Remove this file",
+                width="stretch",
+                on_click=on_remove,
+                args=args,
             )
 
 
@@ -152,23 +201,19 @@ def pick_file_path(
     path; the chip with a ✕ remove button renders **below** the button row
     so the layout stays tight. Returns the current selection or ``None``.
     """
-    if st.button(
+    st.button(
         f"📂 {label}",
         key=f"{key}__btn",
         help=help_text,
-    ):
-        picked = _open_tk_picker(
-            label, file_types=file_types, initial_dir=initial_dir, multi=False
-        )
-        if picked:
-            st.session_state[key] = picked[0]
-            st.rerun()
+        on_click=_browse_cb,
+        args=(key, label, file_types, initial_dir, False),
+    )
 
     current = st.session_state.get(key) or None
     if current:
-        if _render_path_chip(current, key=f"{key}__rm"):
-            st.session_state.pop(key, None)
-            st.rerun()
+        _render_path_chip(
+            current, key=f"{key}__rm", on_remove=_clear_path_cb, args=(key,)
+        )
     return current
 
 
@@ -187,38 +232,19 @@ def pick_multiple_paths(
     Each kept path renders as its own bordered chip below the button with
     a red ✕ remove button beside it; clicking ✕ drops just that entry.
     """
-    if st.button(
+    st.button(
         f"📂 {label}",
         key=f"{key}__btn",
         help=help_text,
-    ):
-        picked = _open_tk_picker(
-            label, file_types=file_types, initial_dir=initial_dir, multi=True
-        )
-        if picked:
-            existing = list(st.session_state.get(key) or [])
-            for new_path in picked:
-                if new_path and new_path not in existing:
-                    existing.append(new_path)
-            st.session_state[key] = existing
-            st.rerun()
+        on_click=_browse_cb,
+        args=(key, label, file_types, initial_dir, True),
+    )
 
     current: list[str] = list(st.session_state.get(key) or [])
-    if not current:
-        return current
-
-    # Build a removal list rather than mutating during the render loop —
-    # Streamlit reruns on each button press so we'd otherwise drop one item
-    # per click instead of just the one the user actually clicked.
-    to_remove: list[int] = []
     for idx, p in enumerate(current):
-        if _render_path_chip(p, key=f"{key}__rm_{idx}"):
-            to_remove.append(idx)
-    if to_remove:
-        st.session_state[key] = [
-            p for i, p in enumerate(current) if i not in set(to_remove)
-        ]
-        st.rerun()
+        _render_path_chip(
+            p, key=f"{key}__rm_{idx}", on_remove=_remove_path_cb, args=(key, p)
+        )
     return current
 
 
@@ -250,29 +276,18 @@ def pick_ordered_files(
     order reflects the user's reordering — the first entry is treated as
     the baseline by callers.
     """
-    if st.button(
+    st.button(
         f"📂 {label}",
         key=f"{key}__btn",
         help=help_text,
-    ):
-        picked = _open_tk_picker(
-            label, file_types=file_types, initial_dir=initial_dir, multi=True
-        )
-        if picked:
-            existing = list(st.session_state.get(key) or [])
-            for new_path in picked:
-                if new_path and new_path not in existing:
-                    existing.append(new_path)
-            st.session_state[key] = existing
-            st.rerun()
+        on_click=_browse_cb,
+        args=(key, label, file_types, initial_dir, True),
+    )
 
     current: list[str] = list(st.session_state.get(key) or [])
     if not current:
         return []
 
-    move_up: int | None = None
-    move_down: int | None = None
-    to_remove: int | None = None
     for idx, path in enumerate(current):
         wid = path_to_widget_id(path)
         label_widget_key = f"{key}__label__{wid}"
@@ -289,31 +304,34 @@ def pick_ordered_files(
             with c_idx:
                 st.markdown(f"**#{idx + 1}**", help=f"{path}")
             with c_up:
-                if st.button(
+                st.button(
                     "▲",
                     key=f"{key}__up__{wid}",
                     help="Move up",
                     width="stretch",
                     disabled=(idx == 0),
-                ):
-                    move_up = idx
+                    on_click=_move_path_cb,
+                    args=(key, path, -1),
+                )
             with c_dn:
-                if st.button(
+                st.button(
                     "▼",
                     key=f"{key}__dn__{wid}",
                     help="Move down",
                     width="stretch",
                     disabled=(idx == len(current) - 1),
-                ):
-                    move_down = idx
+                    on_click=_move_path_cb,
+                    args=(key, path, 1),
+                )
             with c_rm:
-                if st.button(
+                st.button(
                     "❌",
                     key=f"{key}__rm__{wid}",
                     help="Remove this file",
                     width="stretch",
-                ):
-                    to_remove = idx
+                    on_click=_remove_path_cb,
+                    args=(key, path),
+                )
             if missing:
                 st.warning(f"⚠️ File no longer exists at `{path}`")
             st.text_input(
@@ -323,26 +341,6 @@ def pick_ordered_files(
                 help=f"{base}\n\n{path}",
                 placeholder=base,
             )
-    if to_remove is not None:
-        new_list = [p for i, p in enumerate(current) if i != to_remove]
-        st.session_state[key] = new_list
-        st.rerun()
-    if move_up is not None and move_up > 0:
-        new_list = list(current)
-        new_list[move_up - 1], new_list[move_up] = (
-            new_list[move_up],
-            new_list[move_up - 1],
-        )
-        st.session_state[key] = new_list
-        st.rerun()
-    if move_down is not None and move_down < len(current) - 1:
-        new_list = list(current)
-        new_list[move_down + 1], new_list[move_down] = (
-            new_list[move_down],
-            new_list[move_down + 1],
-        )
-        st.session_state[key] = new_list
-        st.rerun()
 
     out: list[dict] = []
     for path in current:

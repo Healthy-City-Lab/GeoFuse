@@ -246,6 +246,11 @@ class MetricFusionEngine:
         }
         self._covariate_columns_user: list[str] = list(self.covariate_columns)
         self._covariate_dummy_map: dict[str, list[str]] = {}
+        # Expanded user covariates, and the wave / area indicators that follow
+        # them. Reporting names only the former; both are fitted.
+        self._user_covariate_columns: list[str] = list(self.covariate_columns)
+        self._period_control_columns: list[str] = []
+        self._time_fixed_effect_dropped: bool = False
         self._covariates_expanded: bool = False
 
         # Spatial-confounding adjustment. ``none`` keeps the plain covariate-
@@ -384,15 +389,9 @@ class MetricFusionEngine:
         # on it so an entry can never be served for a different row set.
         self._split_generation: int = 0
 
-        # Trial-level parallelism for the stability search. Each bootstrap's
-        # trials run in this many threads inside ``study.optimize(n_jobs=...)``,
-        # sharing the RAM-resident pre-aggregation (``_preaggr_mem``) read-only
-        # — so lookups are lock-free array gathers and the numpy/GLS work
-        # releases the GIL. Applied only on the longitudinal fast-GLS path where
-        # the per-fold caches take idempotent writes; the exact-fit and
-        # cross-sectional paths keep OrderedDict scoring caches whose LRU
-        # eviction is not thread-safe, so they run single-threaded (see
-        # ``_search_n_jobs``). Starting point: 4 workers.
+        # Trial threads for the stability search. Only the longitudinal
+        # fast-GLS path uses them: the other paths keep LRU scoring caches that
+        # are not thread-safe (see ``_search_n_jobs``).
         self._search_workers: int = max(1, min((os.cpu_count() or 1), 4))
 
         # Spatial pre-aggregation (mandatory; built by precompute_aggregations()).
@@ -458,9 +457,9 @@ class MetricFusionEngine:
                 "raster targets have no entity-id attribute column."
             )
 
-    # ------------------------------------------------------------------
+    # ────────────────────────────────────────────────────────────
     # Longitudinal mode — entry points + helpers
-    # ------------------------------------------------------------------
+    # ────────────────────────────────────────────────────────────
 
     @property
     def is_longitudinal(self) -> bool:
@@ -1996,7 +1995,7 @@ class MetricFusionEngine:
         Otherwise falls back to the ring cache (or the direct circular buffer
         path) — same behaviour as before.
         """
-        # ── Fast path: pre-aggregation lookup table ──────────────────────────
+        # ── Fast path: pre-aggregation lookup table ─────────
         if getattr(self, "_preaggregation_done", False):
             attrs = getattr(points_gdf, "attrs", None) or {}
             wave_indices = attrs.get("_gf_wave_idx")
@@ -2339,18 +2338,10 @@ class MetricFusionEngine:
 
         return _scale(veg, "veg"), _scale(terrain, "terrain"), _scale(ndvi, "ndvi")
 
-    # ------------------------------------------------------------------
-    # Spatial pre-aggregation (mandatory; on-disk SQLite cache)
-    # ------------------------------------------------------------------
-    #
-    # ``precompute_aggregations()`` builds a per-(entity, radius) table of
-    # (mean, p10..p90) for every channel and persists it via
-    # ``geofuse/preaggregation.py`` so the table survives cancels/crashes and is
-    # reused across runs. ``_aggregate_with_ring_cache`` short-circuits to a
-    # single column read when the trial's (radius, stat) maps onto the stored
-    # grid; off-grid percentiles fall back to the lazy ring cache.
-    # Trial-suggested percentiles are constrained to this 10 % grid so every
-    # trial maps to a stored column.
+    # ────────────────────────────────────────────────────────────
+    # ── Pre-aggregation grid ────────────────────────────────────
+    # Trial percentiles are snapped to this grid so every trial maps onto a
+    # stored column of the per-(entity, radius) cache.
     _PREAGGR_PERCENTILES = preaggregation.PERCENTILES
 
     def _preaggr_radii(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -3225,9 +3216,9 @@ class MetricFusionEngine:
             out[mask] = sub
         return out
 
-    # ------------------------------------------------------------------
+    # ────────────────────────────────────────────────────────────
     # Polygon-target areal aggregation
-    # ------------------------------------------------------------------
+    # ────────────────────────────────────────────────────────────
 
     def _prepare_polygon_fusion(self) -> pd.DataFrame:
         """Build a per-pixel dataset for polygon targets.
@@ -3817,9 +3808,9 @@ class MetricFusionEngine:
         )
         return result
 
-    # ------------------------------------------------------------------
+    # ────────────────────────────────────────────────────────────
     # Per-pixel CGI → per-entity collapse (shared by every scoring path)
-    # ------------------------------------------------------------------
+    # ────────────────────────────────────────────────────────────
     def _catchment_radius(
         self, veg_radius: float, terrain_radius: float, ndvi_radius: float
     ) -> float:
@@ -3981,6 +3972,8 @@ class MetricFusionEngine:
                 st["ysb"] = np.asarray(
                     data["years_since_baseline"].values, dtype=np.float64
                 )[first_idx]
+                if "wave" in data.columns:
+                    st["wave"] = np.asarray(data["wave"].values)[first_idx]
         else:
             st["target"] = data["target"].values
             st["cov"] = (
@@ -3992,6 +3985,8 @@ class MetricFusionEngine:
             if self.is_longitudinal:
                 st["entity_id"] = data["entity_id"].values
                 st["ysb"] = data["years_since_baseline"].values
+                if "wave" in data.columns:
+                    st["wave"] = np.asarray(data["wave"].values)
 
         # Aggregation input: geometry-free on the pre-aggregation fast path
         # (the cache needs only row ids + wave), full geometry rows otherwise.
@@ -4106,7 +4101,9 @@ class MetricFusionEngine:
                 merged = pd.concat(new_frames, axis=1)
                 for dcol in merged.columns:
                     gdf[dcol] = merged[dcol].to_numpy()
-            self.covariate_columns = list(dict.fromkeys(expanded))
+            self._user_covariate_columns = list(dict.fromkeys(expanded))
+            period = self._expand_period_controls(gdf)
+            self.covariate_columns = self._user_covariate_columns + period
             self._covariates_expanded = True
 
         non_numeric = [
@@ -4120,6 +4117,62 @@ class MetricFusionEngine:
                 f"based scorers; got non-numeric: {non_numeric}. Tag them as "
                 "categorical to one-hot encode instead."
             )
+
+    def _expand_period_controls(self, gdf: "gpd.GeoDataFrame") -> list[str]:
+        """One-hot the wave and area groupings into extra control columns.
+
+        These ride at the end of ``covariate_columns`` so every scoring path
+        picks them up as ordinary fixed effects, while the reporting layer —
+        which names only ``_user_covariate_columns`` — leaves them out of the
+        per-covariate table.
+
+        Wave indicators absorb period effects: with per-wave greenery files the
+        exposure carries the layer's vintage, which tracks calendar time and
+        would otherwise land on the greenery × time terms. Area indicators
+        absorb the neighbourhood level, which a person-only random effect does
+        not represent — an exposure shared across neighbours makes the greenery
+        term's standard error far too small without it.
+        """
+        self._period_control_columns = []
+        spec = self.longitudinal_spec
+        if not self.is_longitudinal or spec is None:
+            return []
+
+        sources: list[str] = []
+        if spec.include_wave_fixed_effects and "wave" in gdf.columns:
+            sources.append("wave")
+        if spec.area_id_col and spec.area_id_col in gdf.columns:
+            sources.append(spec.area_id_col)
+
+        out: list[str] = []
+        for col in sources:
+            dummies = pd.get_dummies(
+                gdf[col], prefix=col, prefix_sep="=", drop_first=True, dummy_na=False
+            ).astype(np.float64)
+            if dummies.shape[1] == 0:
+                _log("WARN", f"'{col}' has <2 levels; no fixed effects added.")
+                continue
+            for dcol in dummies.columns:
+                gdf[dcol] = dummies[dcol].to_numpy()
+            out.extend(dummies.columns)
+            _log("INFO", f"Added {dummies.shape[1]} fixed effect(s) for '{col}'.")
+
+        self._period_control_columns = out
+        # Wave indicators can already span continuous time; keeping both would
+        # be rank-deficient.
+        if out and "wave" in sources and "years_since_baseline" in gdf.columns:
+            t = gdf["years_since_baseline"].to_numpy(dtype=np.float64)
+            wave_cols = [c for c in out if c.startswith("wave=")]
+            if wave_cols and mixed_effects_scoring._time_spanned_by(
+                t, gdf[wave_cols].to_numpy(dtype=np.float64)
+            ):
+                self._time_fixed_effect_dropped = True
+                _log(
+                    "INFO",
+                    "Continuous time is spanned by the wave indicators; "
+                    "dropping the time fixed effect.",
+                )
+        return out
 
     def _attach_entity_coords(
         self, fusion_df: pd.DataFrame, src_gdf: "gpd.GeoDataFrame"
@@ -4862,7 +4915,7 @@ class MetricFusionEngine:
             group_col, group_label, group_agg = "polygon_id", "polygon", "first"
 
         if group_col is not None:
-            # ── Group-level stratified split ──────────────────────────────
+            # ── Group-level stratified split ────────────
             # Stratify on the per-group outcome so the distribution stays
             # balanced across train / val / test, and all rows of a group
             # stay together to avoid leakage.
@@ -5047,7 +5100,7 @@ class MetricFusionEngine:
             self._spatial_adjust_summary = None
             return
 
-        # ── Row-level (point / raster) split ────────────────────────────────
+        # ── Row-level (point / raster) split ────────────────
         # Step 3: Create stratification bins based on target values
         logger.info("Step 3/4: Binning target values for stratified sampling...")
         fusion_df["target_bin"] = pd.qcut(
@@ -5093,6 +5146,11 @@ class MetricFusionEngine:
             return lo
         return trial.suggest_int("ndvi_radius", lo, hi, step=step)
 
+    def _effective_time_fixed(self, spec) -> bool:
+        """The spec's time fixed effect, minus the case where wave indicators
+        already span it (entering both would be rank-deficient)."""
+        return bool(spec.include_time_fixed_effect) and not self._time_fixed_effect_dropped
+
     def _metric_has_pvalue(self, metric: str) -> bool:
         """True when scoring ``metric`` yields a usable parametric p-value.
 
@@ -5129,7 +5187,7 @@ class MetricFusionEngine:
                 static["ysb"],
                 static["entity_id"],
                 method=self.search_scoring_method,
-                include_time_fixed=spec.include_time_fixed_effect,
+                include_time_fixed=self._effective_time_fixed(spec),
                 random_slope=spec.random_slope_time,
                 target=spec.association_target,
             )
@@ -5187,7 +5245,7 @@ class MetricFusionEngine:
                     years_since_baseline=years_since_baseline,
                     covariates=covariates,
                     components=fast_components,
-                    include_time_fixed=spec.include_time_fixed_effect,
+                    include_time_fixed=self._effective_time_fixed(spec),
                     random_slope=spec.random_slope_time,
                     return_pvalue=return_pvalue,
                     target=spec.association_target,
@@ -5199,7 +5257,7 @@ class MetricFusionEngine:
                 entity_id=entity_id,
                 years_since_baseline=years_since_baseline,
                 covariates=covariates,
-                include_time_fixed=spec.include_time_fixed_effect,
+                include_time_fixed=self._effective_time_fixed(spec),
                 random_slope=spec.random_slope_time,
                 return_pvalue=return_pvalue,
                 return_all=return_all,
@@ -5250,7 +5308,7 @@ class MetricFusionEngine:
                 f"NDVI radius search {ndvi_lo}–{ndvi_hi} m (step {ndvi_st})"
             )
 
-        # ─── Suggest formula parameters (weights + powers) ────────────────────
+        # ── Suggest formula parameters (weights + powers) ───
         # In ``cgi`` mode the formula's ``suggest_params`` bakes the weight-sum
         # / power constraints into the search space (sequential conditional
         # allocation on the simplex), and ``channel_active`` drives the
@@ -5284,7 +5342,7 @@ class MetricFusionEngine:
         preaggr_on = getattr(self, "_preaggregation_done", False)
         pct_grid = list(self._PREAGGR_PERCENTILES)
 
-        # ─── Suggest Streetview Parameters (SHARED for veg + terrain) ─────────
+        # ── Streetview params (shared: veg + terrain) ───────
         # Only suggest if either veg or terrain channel contributes. The
         # gating mirrors the legacy weighted-average ``weight > 0`` skip so an
         # all-NDVI trial doesn't burn search dimensions on unused street-view
@@ -5322,7 +5380,7 @@ class MetricFusionEngine:
             veg_radius = gvi_cap
             terrain_radius = gvi_cap
 
-        # ─── Suggest NDVI Parameters (separate) ────────────────────────────────
+        # ── Suggest NDVI Parameters (separate) ──────────────
         if channel_active["ndvi"]:
             ndvi_radius = self._suggest_ndvi_radius(trial)
             ndvi_stat = trial.suggest_categorical(
@@ -5342,7 +5400,7 @@ class MetricFusionEngine:
             ndvi_stat = "mean"
             ndvi_percentile = 50
 
-        # ─── Evaluate Across All CV Folds ─────────────────────────────────────
+        # ── Evaluate Across All CV Folds ────────────────────
         fold_train_scores = []
         fold_val_scores = []
         fold_train_pvals = []
@@ -5364,7 +5422,7 @@ class MetricFusionEngine:
             if not any(channel_active.values()):
                 return -np.inf if metric != "nrmse" else np.inf
 
-            # ─── Apply Dynamic Radius and Aggregation ─────────────────────────────
+            # ── Apply Dynamic Radius and Aggregation ────
             # Both points and rasters use the same circular buffer aggregation
             # For rasters, _prepare_raster_fusion() converted pixels to points at centers.
             # Points slices, collapse codes, and every per-entity constant are
@@ -5559,10 +5617,9 @@ class MetricFusionEngine:
             # against the per-polygon outcome. In longitudinal+polygon mode
             # polygon_id was set to f"{entity}|{wave}" by
             # _prepare_polygon_fusion so the collapse produces one row per
-            # (entity, wave) — the exact shape the MixedLM scorer wants.
-            # Catchment collapse: polygons average every in-footprint pixel
-            # (mask None); point/line entities average only the pixels within
-            # this trial's catchment radius (+ each entity's nearest pixel).
+            # (entity, wave) — the shape the MixedLM scorer wants. Polygons
+            # average every in-footprint pixel; point/line entities average
+            # only those inside this trial's catchment radius.
             if train_static["has_pid"]:
                 catchment_r = self._catchment_radius(
                     veg_radius, terrain_radius, ndvi_radius
@@ -5607,7 +5664,7 @@ class MetricFusionEngine:
                 val_coords, val_targets_arr, val_cov, val_composite
             )
 
-            # ─── Score via the single ``_score_greenery`` seam ────────────────
+            # ── Score via the ``_score_greenery`` seam ──
             # Three modes collapse into it: cross-sectional OLS, mixed-effects
             # MixedLM (per-entity random effects), and year-aware cross-sectional
             # (spec present but an OLS scoring metric — the OLS scorer ignores
@@ -5668,7 +5725,7 @@ class MetricFusionEngine:
         if not fold_val_scores:
             return -np.inf if metric != "nrmse" else np.inf
 
-        # ─── Store Aggregate Statistics ────────────────────────────────────────
+        # ── Store Aggregate Statistics ──────────────────────
         avg_train_score = np.mean(fold_train_scores)
         avg_val_score = np.mean(fold_val_scores)
         std_val_score = np.std(fold_val_scores)
@@ -5903,7 +5960,7 @@ class MetricFusionEngine:
             test_coords, test_targets, test_cov, test_composite
         )
 
-        # ─── Score via the single ``_score_greenery`` seam ────────────────
+        # ── Score via the ``_score_greenery`` seam ──────────
         # Same routing as ``_objective``: MixedLM for a longitudinal mixedlm_*
         # metric, OLS otherwise (a year-aware cross-sectional study sits on a
         # spec whose scoring_metric is an OLS option and takes the OLS path).
@@ -5978,6 +6035,7 @@ class MetricFusionEngine:
             if self.is_longitudinal:
                 result["entity_id"] = test_entity_id
                 result["years_since_baseline"] = test_ysb
+                result["wave"] = test_static.get("wave")
 
         self._evaluate_test_cache[memo_key] = result
         while len(self._evaluate_test_cache) > 256:
@@ -6161,7 +6219,7 @@ class MetricFusionEngine:
                 res.get("entity_id"),
                 res.get("years_since_baseline"),
                 covariates=res.get("covariates"),
-                include_time_fixed=spec.include_time_fixed_effect,
+                include_time_fixed=self._effective_time_fixed(spec),
                 random_slope=spec.random_slope_time,
                 spatial_basis=res.get("spatial_basis"),
                 spatial_method=self.spatial_adjust_method,
@@ -6712,6 +6770,10 @@ class MetricFusionEngine:
         it doesn't support (e.g. longitudinal MixedLM metrics, scored elsewhere).
         """
         if metric not in objective_scoring.SUPPORTED_METRICS:
+            if self.is_longitudinal and metric in mixed_effects_scoring.MIXEDLM_METRICS:
+                return self._evaluate_effects_mixedlm(
+                    params, metric, n_bootstrap=n_bootstrap, ci_level=ci_level, seed=seed
+                )
             return {}
         from . import statistical_testing as _stats_mod
 
@@ -6750,6 +6812,7 @@ class MetricFusionEngine:
                 "lower": None,
                 "upper": None,
                 "p_value": None,
+                "p_kind": "permutation" if do_perm else None,
                 "n": None,
             }
             if t_arr is None or c_arr is None or len(t_arr) < 3:
@@ -6872,6 +6935,253 @@ class MetricFusionEngine:
 
         return results
 
+    # Whole-data slices refit a mixed model per bootstrap replicate, so their
+    # replicate count is capped well below the O(1) OLS metrics' thousands.
+    _MIXEDLM_REPORT_BOOTSTRAP_CAP = 200
+
+    def _evaluate_effects_mixedlm(
+        self,
+        params: dict,
+        metric: str,
+        *,
+        n_bootstrap: int,
+        ci_level: float,
+        seed: int,
+    ) -> dict[str, dict]:
+        """Per-subset effects for a longitudinal MixedLM objective.
+
+        Each slice gets a cluster (entity) bootstrap percentile CI; the held-out
+        ``test`` slice also carries the greenery fixed effect's Wald p. There is
+        no permutation analogue here — a Freedman–Lane surrogate would have to be
+        resampled and refit at the entity level, which the cluster bootstrap
+        already covers — so every block is tagged ``p_kind="wald"``.
+        """
+        spec = self.longitudinal_spec
+        assert spec is not None
+        n_boot = max(50, min(int(n_bootstrap), self._MIXEDLM_REPORT_BOOTSTRAP_CAP))
+        signed = "mixedlm_coef"
+
+        def _block(y, g, eid, t, cov, sb, wave, sub_seed) -> dict:
+            def _ci(m):
+                return mixed_effects_scoring.cluster_bootstrap_metric_ci(
+                    m,
+                    y,
+                    g,
+                    eid,
+                    t,
+                    covariates=cov,
+                    include_time_fixed=self._effective_time_fixed(spec),
+                    random_slope=spec.random_slope_time,
+                    spatial_basis=sb,
+                    spatial_method=self.spatial_adjust_method,
+                    n_bootstrap=n_boot,
+                    ci_level=ci_level,
+                    seed=int(sub_seed),
+                    target=spec.association_target,
+                    wave_index=wave,
+                )
+
+            r = _ci(metric)
+            out = {
+                "score": r.get("observed"),
+                "lower": r.get("lower"),
+                "upper": r.get("upper"),
+                "p_value": r.get("pvalue"),
+                "p_kind": "wald",
+                "n": r.get("n"),
+                "status": r.get("status"),
+            }
+            # |t| is folded, so its interval can never straddle zero. The signed
+            # coefficient's interval is the one that can.
+            if metric == "mixedlm_tstat":
+                rc = _ci(signed)
+                out["signed_score"] = rc.get("observed")
+                out["signed_lower"] = rc.get("lower")
+                out["signed_upper"] = rc.get("upper")
+            return out
+
+        results: dict[str, dict] = {}
+        df_full = None
+        try:
+            df_full = self.apply_fusion(weights=dict(params))
+            t_all = np.asarray(df_full["target"].values, dtype=np.float64)
+            c_all = np.asarray(df_full["composite"].values, dtype=np.float64)
+            eid, ysb = self._whole_data_longitudinal_keys(df_full)
+            if eid is not None:
+                cov_all, n_cov = self._augment_cov_with_spatial(
+                    df_full, t_all, c_all, self._whole_data_covariates(df_full)
+                )
+                cov_part, sb_part = self._split_control_matrix(cov_all, n_cov)
+                results["all"] = _block(
+                    t_all, c_all, eid, ysb, cov_part, sb_part,
+                    self._whole_data_wave_labels(df_full), seed,
+                )
+        except Exception as exc:
+            logger.warning(f"evaluate_effects: whole-data scoring failed: {exc}")
+
+        try:
+            if self.test_data is not None and len(self.test_data) > 0:
+                tr = self.evaluate_on_test(
+                    params=dict(params), metric=metric, return_predictions=True
+                )
+                if tr.get("entity_id") is not None:
+                    results["test"] = _block(
+                        np.asarray(tr.get("targets"), dtype=np.float64),
+                        np.asarray(tr.get("predictions"), dtype=np.float64),
+                        tr.get("entity_id"),
+                        tr.get("years_since_baseline"),
+                        tr.get("covariates"),
+                        tr.get("spatial_basis"),
+                        tr.get("wave"),
+                        seed + 101,
+                    )
+        except Exception as exc:
+            logger.warning(f"evaluate_effects: test scoring failed: {exc}")
+
+        try:
+            if (
+                self.train_val_data is not None
+                and df_full is not None
+                and "polygon_id" in df_full.columns
+            ):
+                pids = set(self.train_val_data["polygon_id"].unique().tolist())
+                sub = df_full[df_full["polygon_id"].isin(pids)]
+                eid, ysb = self._whole_data_longitudinal_keys(sub)
+                if eid is not None:
+                    t_tv = np.asarray(sub["target"].values, dtype=np.float64)
+                    c_tv = np.asarray(sub["composite"].values, dtype=np.float64)
+                    cov_tv, n_cov = self._augment_cov_with_spatial(
+                        sub, t_tv, c_tv, self._whole_data_covariates(sub)
+                    )
+                    cov_part, sb_part = self._split_control_matrix(cov_tv, n_cov)
+                    results["train_val"] = _block(
+                        t_tv, c_tv, eid, ysb, cov_part, sb_part,
+                        self._whole_data_wave_labels(sub), seed + 202,
+                    )
+        except Exception as exc:
+            logger.warning(f"evaluate_effects: train_val scoring failed: {exc}")
+
+        return results
+
+    def _paired_difference_mixedlm(
+        self,
+        cgi_params: dict,
+        standalone_params: dict,
+        standalone_channel: str,
+        metric: str,
+        *,
+        n_bootstrap: int,
+        ci_level: float,
+        seed: int,
+    ) -> dict | None:
+        """Whole-data paired difference for a MixedLM objective.
+
+        Resamples **whole entities** and refits both mixed models on each
+        resample. A row bootstrap would break the within-entity correlation the
+        panel model exists to represent.
+        """
+        spec = self.longitudinal_spec
+        assert spec is not None
+        prev_ch = self._active_greenery_channel
+        try:
+            self._active_greenery_channel = "cgi"
+            df_cgi = self.apply_fusion(weights=dict(cgi_params))
+            self._active_greenery_channel = standalone_channel
+            df_std = self.apply_fusion(weights=dict(standalone_params))
+        except Exception as exc:
+            logger.warning(f"paired difference: composite build failed: {exc}")
+            return None
+        finally:
+            self._active_greenery_channel = prev_ch
+
+        if "polygon_id" not in df_cgi.columns or "polygon_id" not in df_std.columns:
+            return None
+        merged = df_cgi[["polygon_id", "target", "composite"]].merge(
+            df_std[["polygon_id", "composite"]],
+            on="polygon_id",
+            suffixes=("_cgi", "_std"),
+        )
+        eid, ysb = self._whole_data_longitudinal_keys(merged)
+        if eid is None:
+            return None
+        wave = self._whole_data_wave_labels(merged)
+        cov = self._whole_data_covariates(merged)
+        y = merged["target"].to_numpy(dtype=np.float64)
+        g_cgi = merged["composite_cgi"].to_numpy(dtype=np.float64)
+        g_std = merged["composite_std"].to_numpy(dtype=np.float64)
+
+        def _score(yy, gg, ee, tt, cc, wv) -> float:
+            return float(
+                mixed_effects_scoring.score_mixedlm(
+                    metric,
+                    yy,
+                    gg,
+                    ee,
+                    tt,
+                    covariates=cc,
+                    include_time_fixed=self._effective_time_fixed(spec),
+                    random_slope=spec.random_slope_time,
+                    target=spec.association_target,
+                    wave_index=wv,
+                    nan_on_fail=True,
+                )
+            )
+
+        obs_cgi = _score(y, g_cgi, eid, ysb, cov, wave)
+        obs_std = _score(y, g_std, eid, ysb, cov, wave)
+        if not (np.isfinite(obs_cgi) and np.isfinite(obs_std)):
+            return None
+        obs_diff = obs_cgi - obs_std  # every mixedlm_* metric is higher-is-better
+
+        uniq, inv = np.unique(eid, return_inverse=True)
+        if len(uniq) < 2:
+            return None
+        group_rows = [np.where(inv == k)[0] for k in range(len(uniq))]
+        rng = np.random.default_rng(int(seed))
+        n_boot = max(50, min(int(n_bootstrap), self._MIXEDLM_REPORT_BOOTSTRAP_CAP))
+        diffs = np.empty(n_boot, dtype=np.float64)
+        for i in range(n_boot):
+            draw = rng.integers(0, len(uniq), size=len(uniq))
+            idx = np.concatenate([group_rows[k] for k in draw])
+            # A repeated entity has to form independent groups.
+            new_eid = np.concatenate(
+                [
+                    np.full(len(group_rows[k]), slot, dtype=np.int64)
+                    for slot, k in enumerate(draw)
+                ]
+            )
+            try:
+                sc = _score(
+                    y[idx], g_cgi[idx], new_eid, ysb[idx],
+                    None if cov is None else cov[idx],
+                    None if wave is None else wave[idx],
+                )
+                ss = _score(
+                    y[idx], g_std[idx], new_eid, ysb[idx],
+                    None if cov is None else cov[idx],
+                    None if wave is None else wave[idx],
+                )
+                diffs[i] = sc - ss
+            except Exception:
+                diffs[i] = np.nan
+
+        valid = diffs[np.isfinite(diffs)]
+        if len(valid) == 0:
+            return None
+        alpha = (1.0 - ci_level) / 2.0
+        return {
+            "observed_diff": float(obs_diff),
+            "lower": float(np.quantile(valid, alpha)),
+            "upper": float(np.quantile(valid, 1.0 - alpha)),
+            "p_value": float((np.sum(valid <= 0.0) + 1) / (len(valid) + 1)),
+            "cgi_score": float(obs_cgi),
+            "standalone_score": float(obs_std),
+            "standalone_channel": standalone_channel,
+            "n": int(len(y)),
+            "n_boot": int(len(valid)),
+            "favors_cgi": bool(obs_diff > 0),
+        }
+
     def paired_objective_difference(
         self,
         cgi_params: dict,
@@ -6897,6 +7207,16 @@ class MetricFusionEngine:
         with difference ≤ 0).
         """
         if metric not in objective_scoring.SUPPORTED_METRICS:
+            if self.is_longitudinal and metric in mixed_effects_scoring.MIXEDLM_METRICS:
+                return self._paired_difference_mixedlm(
+                    cgi_params,
+                    standalone_params,
+                    standalone_channel,
+                    metric,
+                    n_bootstrap=n_bootstrap,
+                    ci_level=ci_level,
+                    seed=seed,
+                )
             return None
         prev_ch = self._active_greenery_channel
         try:
@@ -7100,7 +7420,7 @@ class MetricFusionEngine:
             "n": train_val_n,
         }
 
-        # ── test: fresh evaluate_on_test with these params ────────────
+        # ── test: fresh evaluate_on_test with these params ──
         # ``evaluate_on_test`` returns the partial (covariate-adjusted)
         # score that the optimizer optimized; the raw equivalent is
         # produced by ``_score_data_subset`` on the test slice.
@@ -7139,7 +7459,7 @@ class MetricFusionEngine:
                 "n": None,
             }
 
-        # ── all: composite on every entity (full dataset) ─────────────
+        # ── all: composite on every entity (full dataset) ───
         try:
             df = self.apply_fusion(weights=dict(params))
             target = np.asarray(df["target"].values, dtype=np.float64)
@@ -7286,14 +7606,16 @@ class MetricFusionEngine:
             ):
                 spec = self.longitudinal_spec
                 assert spec is not None
+                # Names cover the user's covariates only; the period / area
+                # indicators trailing them stay unnamed controls.
                 return mixed_effects_scoring.covariate_impact_mixedlm(
                     target,
                     composite,
                     lon_entity_id,
                     lon_ysb,
                     cov_mat,
-                    list(cov_cols),
-                    include_time_fixed=spec.include_time_fixed_effect,
+                    [c for c in cov_cols if c in set(self._user_covariate_columns)],
+                    include_time_fixed=self._effective_time_fixed(spec),
                     random_slope=spec.random_slope_time,
                 )
 
@@ -7416,7 +7738,7 @@ class MetricFusionEngine:
                     )
                 elif set(cov_cols) <= set(df.columns):
                     cov = df[cov_cols].to_numpy(dtype=np.float64)
-            return mixed_effects_scoring.decline_terms_mixedlm(
+            out = mixed_effects_scoring.decline_terms_mixedlm(
                 target,
                 composite,
                 eid,
@@ -7426,9 +7748,49 @@ class MetricFusionEngine:
                 want_between=bool(spec.decline_average_exposure),
                 want_within=bool(spec.decline_exposure_change),
             )
+            if out is None:
+                return None
+
+            # ── Period-confounding checks ───────────────
+            # A greenery × time slope is only about greenery if it survives an
+            # exposure with no spatial content. The placebo holds each wave's
+            # mean exposure, so it carries the period structure and nothing else.
+            wave = self._whole_data_wave_labels(df)
+            out["period_diagnostic"] = mixed_effects_scoring.period_confounding_report(
+                composite, eid, ysb, wave_index=wave
+            )
+            if wave is not None:
+                placebo = mixed_effects_scoring.decline_terms_mixedlm(
+                    target,
+                    mixed_effects_scoring.placebo_exposure(composite, wave),
+                    eid,
+                    ysb,
+                    cov,
+                    random_slope=spec.random_slope_time,
+                    want_between=bool(spec.decline_average_exposure),
+                    want_within=bool(spec.decline_exposure_change),
+                )
+                out["placebo_terms"] = (placebo or {}).get("terms") or []
+            return out
         except Exception as exc:
             logger.warning(f"compute_decline_terms failed: {exc}")
             return None
+
+    def _whole_data_wave_labels(self, df: "pd.DataFrame") -> "np.ndarray | None":
+        """Per-row wave label for a collapsed frame, or ``None`` when absent."""
+        if not self.is_longitudinal:
+            return None
+        if "wave" in df.columns:
+            return df["wave"].to_numpy()
+        full = self._full_data_frame()
+        if full is None or "polygon_id" not in df.columns or "wave" not in full.columns:
+            return None
+        return (
+            full.groupby("polygon_id", sort=False)["wave"]
+            .first()
+            .reindex(df["polygon_id"].values)
+            .to_numpy()
+        )
 
     def bootstrap_stability_selection(
         self,
@@ -7673,13 +8035,11 @@ class MetricFusionEngine:
 
         try:
             rng = np.random.default_rng(int(seed))
-            # Complementary-pairs subsampling (Shah & Samworth 2013): each pair
-            # partitions the sampling units into halves A | B; each half is an
-            # in-bag scored on its complement, giving two ~50%-OOB subsamples.
-            # This is the ⌊n/2⌋ scheme the Meinshausen–Bühlmann PFER bound
-            # assumes, so the reported bound is rigorous rather than the
-            # approximation bootstrap resampling gives. Whole blocks are split
-            # when spatial resampling is on so each OOB half is out-of-region.
+            # Complementary-pairs subsampling (Shah & Samworth 2013): each
+            # pair splits the units into halves scored on each other. This is
+            # the ⌊n/2⌋ scheme the Meinshausen–Bühlmann PFER bound assumes.
+            # Spatial resampling splits whole blocks, so each half is
+            # out-of-region.
             n_pairs = max(1, int(round(int(n_bootstraps) / 2)))
             subsamples: list[tuple[np.ndarray, np.ndarray]] = []
             for _pair in range(n_pairs):
@@ -7933,7 +8293,7 @@ class MetricFusionEngine:
                 "covariate / target NaN coverage on OOB rows."
             )
 
-        # ── Per-cell aggregation ─────────────────────────────────────────
+        # ── Per-cell aggregation ────────────────────────────
         from . import statistical_testing as _stats_mod
 
         cells: dict[tuple, list[dict]] = {}
@@ -7949,7 +8309,7 @@ class MetricFusionEngine:
                 return float(np.quantile(scores, worst_quantile))
             return float(np.quantile(scores, 1.0 - worst_quantile))
 
-        # ── Automated threshold calibration (stage 1: channel mix) ────────
+        # ── Threshold calibration (stage 1: channel mix) ────
         # Rank cells within each bootstrap by their best out-of-bag score, then
         # calibrate the selection size K and threshold π by maximizing the
         # stability score (Bodinier et al.) — no hand-set threshold. The
@@ -8032,7 +8392,7 @@ class MetricFusionEngine:
                 key=lambda c: c["q_worst"] if higher_is_better else -c["q_worst"],
             )
 
-        # ── Stage 2: spatial tuning within the winning weight cell ────────
+        # ── Stage 2: spatial tuning in the winning cell ─────
         # The weight cell fixes the channel mix; now stability-select the
         # radii the same way — re-bin the cell's trials by a coarse radius
         # key (active channels only) and pick the radius sub-cell with the
@@ -8101,7 +8461,7 @@ class MetricFusionEngine:
             key=lambda c: c["q_worst"] if higher_is_better else -c["q_worst"],
         )
 
-        # ── Average params within the winning radius sub-cell ─────────────
+        # ── Average params in the winning radius sub-cell ───
         # Snap + renormalize the winners' weights to canonical integer steps so
         # downstream code (composite generation, apply path) consumes them
         # directly. ``formula`` was resolved up front (see above).
@@ -8277,15 +8637,9 @@ class MetricFusionEngine:
             }
             for c in ranked_radius[:10]
         ]
-        # Diagnostics for the results UI: top-10 ranked cells (so the user
-        # can see whether the winner is alone or part of a tight cluster of
-        # similar regions) and the winner's OOB-score distribution (for a
-        # histogram showing q_worst → median → max). These live under ``__``
-        # keys so the "Final params" panel still strips them out, but the
-        # raw bundle in the runner preserves them.
-        # The stability cell keys on the main-component weights only (see
-        # ``cgi_formulas.weight_cell_key``), so map the cell tuple back through
-        # the main weight keys when reconstructing each cell's representative mix.
+        # Diagnostics for the results UI, under ``__`` keys so the "Final
+        # params" panel strips them out. The cell keys on the main-component
+        # weights only, so map the tuple back through those keys.
         cell_weight_keys = formula.main_weight_keys
         # Rank the diagnostics table by the decision criterion — calibrated
         # selection probability, with worst-quantile OOB breaking ties — so the
@@ -8684,6 +9038,11 @@ class MetricFusionEngine:
         clean_params = {k: v for k, v in final_params.items() if not k.startswith("__")}
         provenance = {
             "selection_method": "bootstrap_stability_selection",
+            # Grid geometry, so a viewer can size its read before opening the
+            # file. A catchment grid over distant clusters is mostly nodata.
+            "raster_width": int(width),
+            "raster_height": int(height),
+            "raster_valid_cells": int(len(vals_arr)),
             "cell_q_worst": final_params.get("__cell_q_worst__"),
             "cell_median": final_params.get("__cell_median__"),
             "cell_count": final_params.get("__cell_count__"),

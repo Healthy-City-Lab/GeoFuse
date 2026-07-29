@@ -177,9 +177,9 @@ def partial_distance_correlation_cached(
     return _pdcor_from_products(side.bb, aa, side.cc, ab, side.bc, ac)
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Replicate scorers for the reporting bootstrap / permutation passes
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 
 class _ReplicateScorer:

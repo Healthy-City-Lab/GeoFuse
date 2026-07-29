@@ -48,6 +48,30 @@ _TERMINAL_LABELS = {
 _RESTART_ELIGIBLE_TYPES = {"gvi", "gvi_column", "ndvi", "ndvi_column", "fusion"}
 _RESTART_ELIGIBLE_STATUSES = {"interrupted", "cancelled", "error", "completed"}
 
+# Job id whose re-run is awaiting confirmation on its own card.
+_RESTART_ARM_KEY = "_restart_arm_job_id"
+
+
+def _render_restart_confirm(rec) -> None:
+    """In-card confirmation for a re-run, mirroring the cache-purge prompt."""
+    if rec.type == "fusion":
+        st.info(
+            "Load this job's settings into the Fusion setup form? Anything "
+            "already filled in there is replaced."
+        )
+    else:
+        st.warning(f"Restart **{rec.name or rec.id}** with its original settings?")
+    c1, c2 = st.columns(2)
+    if c1.button(
+        "Yes, re-run", key=f"restart_yes_{rec.id}", type="primary", width="stretch"
+    ):
+        st.session_state[RESTART_SESSION_KEY] = rec.id
+        st.session_state.pop(_RESTART_ARM_KEY, None)
+        st.rerun(scope="app")
+    if c2.button("Cancel", key=f"restart_no_{rec.id}", width="stretch"):
+        st.session_state.pop(_RESTART_ARM_KEY, None)
+        st.rerun(scope="app")
+
 
 def _fusion_results_bundle_path(rec) -> str | None:
     """Path to the job's on-disk ``results_bundle.json`` if one exists."""
@@ -468,14 +492,14 @@ def _render_job_card(rec, store) -> None:
                         key=f"restart_{rec.id}",
                         width="stretch",
                         help=(
-                            "Re-run — reuse the finished result or recalculate "
-                            "from scratch."
-                            if rec.status == "completed"
+                            "Re-run — load this job's settings into the setup "
+                            "form."
+                            if rec.type == "fusion"
                             else "Restart — resume from where this job stopped."
                         ),
                     ):
-                        st.session_state[RESTART_SESSION_KEY] = rec.id
-                        st.rerun()
+                        st.session_state[_RESTART_ARM_KEY] = rec.id
+                        st.rerun(scope="app")
             with dismiss_col:
                 st.button(
                     "🗑️",
@@ -485,6 +509,9 @@ def _render_job_card(rec, store) -> None:
                     args=(rec.id,),
                     help="Dismiss — remove this job from history.",
                 )
+
+            if st.session_state.get(_RESTART_ARM_KEY) == rec.id:
+                _render_restart_confirm(rec)
 
 
 def render_sidebar_job_monitor() -> None:

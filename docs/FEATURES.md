@@ -76,13 +76,17 @@ This is the analytical core: it learns how to combine GVI (vegetation + terrain)
 ### Longitudinal and multi-year data
 
 - **Mixed-effects (longitudinal) mode.** When entities are measured at several time points, each trial is scored with a linear mixed model (`statsmodels.MixedLM`) that accounts for within-entity correlation over time. Four scorers are available (t-statistic by default); all four are also reported post-hoc on the winning composite.
+- **Wave fixed effects (on by default).** Per-wave greenery layers differ for reasons unrelated to anyone's neighbourhood — a different satellite, a different compositing window — and that drift tracks calendar time, so without an indicator per wave it lands on the greenspace × time terms. Turn it off only when the per-wave layers are known to be harmonised.
+- **Neighbourhood grouping.** Point a column at the area people share (FSA, census subdivision, site) and it enters as fixed effects. Greenspace is an area attribute, so neighbours have almost the same exposure; a person-level random effect alone leaves that level unmodelled and the greenspace term's standard error far too small.
+- **Period-confounding check.** The report states how strongly within-person exposure change tracks *when* each person was measured, and repeats the greenspace × time terms with the exposure replaced by its per-wave mean. That placebo carries the period structure and no spatial information at all: a term it reproduces was measuring the wave, not the neighbourhood.
 - **Year-aware cross-sectional mode.** For a cohort sampled across different years, route each entity to its year-matched greenery file. The cross-sectional scorer is unchanged — the year is only a file-routing key, never a regression input.
 
 ### Outputs and reproducibility
 
 - **Composite map.** A grid-aligned GeoTIFF of the winning composite (plus one per standalone). A whole-grid **[0, 1] scaling** toggle controls normalization of the written/rendered map.
 - **Everything on disk, per run.** Each run writes to its own timestamped folder so reruns never overwrite earlier results. Alongside the composite rasters, a `study_results/` folder holds a machine-readable manifest, tidy CSVs (test scores, subset scores, parameters, stability diagnostics, covariate impact), and a full settings snapshot. See [OUTPUTS.md](OUTPUTS.md).
-- **Faithful restarts.** A run records its exact configuration and replays it verbatim on restart. Per-job caches (metric alignment, pre-aggregation, the search study) are keyed by a fingerprint of the settings, so an identical re-run resumes while any change starts fresh.
+- **Re-run from a filled form.** Re-running a job loads its recorded settings into the setup form rather than replaying them, so a minor tweak costs one edit instead of a rebuild from scratch. The re-run is confirmed on the job card, not in the tab. Per-job caches (metric alignment, pre-aggregation, the search study) are keyed by a fingerprint of the settings, so an unchanged config resumes while any change starts fresh.
+- **The form keeps what you typed.** Picking files, dragging years, or an error elsewhere in the app never empties a half-filled setup form.
 - **Load results any time.** Completed jobs can rehydrate the results panel from disk, independent of the configuration form.
 
 ---

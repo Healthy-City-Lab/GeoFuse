@@ -16,9 +16,9 @@ from __future__ import annotations
 
 import numpy as np
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Multicollinearity diagnostics
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 
 def pairwise_pearson_matrix(X: np.ndarray) -> np.ndarray:
@@ -182,9 +182,9 @@ def iterative_vif_reduction(
     }
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Bootstrap CI
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 
 def bootstrap_score_ci(
@@ -370,14 +370,10 @@ def bootstrap_score_ci(
         prop_below = min(max(prop_below, 1e-6), 1.0 - 1e-6)
         z0 = float(_scistats.norm.ppf(prop_below))
 
-        # Acceleration: jackknife estimate of the score's skewness.
-        # Captures how the variance of the score depends on the data —
-        # without it, BCa collapses to a bias-corrected interval that
-        # under-covers when the score is skewed (correlation near ±1, etc.).
-        # Leave-one-out via a toggled boolean mask — same keep-set as
-        # ``np.delete`` per i, without rebuilding an index array each pass.
-        # Under cluster resampling the unit dropped is a whole group (the
-        # matching cluster jackknife), so both moments track the group design.
+        # Acceleration: jackknife estimate of the score's skewness, without
+        # which BCa under-covers on a skewed score. Leave-one-out uses a toggled
+        # boolean mask; under cluster resampling the unit dropped is a whole
+        # group, matching the resampling design.
         jack_units = (
             group_row_indices if group_row_indices is not None else None
         )
@@ -436,9 +432,9 @@ def bootstrap_score_ci(
     }
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Permutation significance
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 
 def permutation_pvalue(
@@ -569,9 +565,9 @@ def permutation_pvalue(
     }
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Multiple-comparison correction
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 
 def holm_bonferroni(pvalues) -> list[float]:
@@ -599,9 +595,9 @@ def holm_bonferroni(pvalues) -> list[float]:
     return out
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Stability-selection threshold calibration (Bodinier et al., 2023)
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 
 def calibrate_stability_selection(
@@ -707,7 +703,9 @@ def calibrate_stability_selection(
             ):
                 best = cand
     if best is not None:
-        best["pfer_controlled"] = True
+        # With no cap in force the bound is whatever the optimum happens to be,
+        # which can be as large as the candidate count — not error control.
+        best["pfer_controlled"] = max_pfer is not None
         return best
     if best_any is None:
         return None

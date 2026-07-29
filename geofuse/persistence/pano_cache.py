@@ -53,9 +53,9 @@ class PanoCache:
         self._mem: dict[str, tuple[float, float]] = {}
         self._mem_loaded = False
 
-    # ------------------------------------------------------------------
+    # ────────────────────────────────────────────────────────────
     # Preload — bulk-load every row into the overlay in one SELECT.
-    # ------------------------------------------------------------------
+    # ────────────────────────────────────────────────────────────
 
     def preload(self) -> int:
         """Load every pano row into the in-memory overlay. Idempotent."""
@@ -67,9 +67,9 @@ class PanoCache:
             self._mem_loaded = True
             return len(self._mem)
 
-    # ------------------------------------------------------------------
+    # ────────────────────────────────────────────────────────────
     # Dict protocol used by GVIEngine._process_one_point_async
-    # ------------------------------------------------------------------
+    # ────────────────────────────────────────────────────────────
 
     def __contains__(self, pid: str) -> bool:
         if not self._mem_loaded:
@@ -104,9 +104,9 @@ class PanoCache:
             row = self._conn.execute("SELECT COUNT(*) FROM panos").fetchone()
         return int(row[0]) if row else 0
 
-    # ------------------------------------------------------------------
+    # ────────────────────────────────────────────────────────────
     # Optional helpers
-    # ------------------------------------------------------------------
+    # ────────────────────────────────────────────────────────────
 
     def get(self, pid: str, default=None):
         try:
