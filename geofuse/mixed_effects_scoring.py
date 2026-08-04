@@ -51,6 +51,8 @@ import warnings
 import numpy as np
 import pandas as pd
 
+from . import parallel
+
 logger = logging.getLogger(__name__)
 
 MIXEDLM_METRICS: frozenset[str] = frozenset(
@@ -313,25 +315,41 @@ def _build_target_design(
     return X, target_col
 
 
-def _fit_mixedlm(
-    outcome: np.ndarray,
-    X: np.ndarray,
-    groups: np.ndarray,
-    exog_re: np.ndarray,
-    *,
-    reml: bool = True,
-):
-    """Fit a MixedLM with lbfgs, swallowing fit failures.
+class _RescaledFit:
+    """A fit on a column-scaled design, presented in the original units.
 
-    Returns the fitted result or ``None`` if anything went wrong (singular
-    design, non-convergence, numerical failure). Callers map ``None`` to
-    the metric's degenerate score so a bad trial doesn't kill the study.
+    Scaling the fixed-effects columns is a reparameterization, not a different
+    model: the fitted values, the residual ``scale``, the variance components,
+    the t-statistics and the ML log-likelihood are all unchanged — only the
+    conditioning of the optimizer's problem is. The coefficients and their
+    standard errors come back divided by the scale, so dividing by it again
+    restores the caller's units.
 
-    ``reml=True`` (default) is the right estimator for variance components and
-    for the scoring metrics. AIC/BIC comparisons across models with **different
-    fixed effects** must pass ``reml=False`` — REML likelihoods aren't
-    comparable when the fixed-effects design changes.
+    The one quantity that does move is the **REML** log-likelihood, whose
+    ``log|X'V⁻¹X|`` term depends on the design's parameterization. That only
+    matters for a likelihood compared across designs, and every such comparison
+    here (the LR metric, the AIC/BIC model comparison) fits under ML.
     """
+
+    def __init__(self, result, scale: np.ndarray):
+        self._result = result
+        self.fe_params = _as_array(result.fe_params) / scale
+        self.bse_fe = _as_array(result.bse_fe) / scale
+        self.pvalues = _as_array(result.pvalues)
+
+    def __getattr__(self, name):
+        return getattr(self._result, name)
+
+
+def _column_scales(X: np.ndarray) -> np.ndarray:
+    """Per-column divisors that bring every design column to a peak of one."""
+    scales = np.max(np.abs(X), axis=0)
+    scales[~np.isfinite(scales) | (scales <= 0)] = 1.0
+    return scales
+
+
+def _fit_mixedlm_once(outcome, X, groups, exog_re, *, reml: bool):
+    """One MixedLM fit attempt; ``None`` on any failure or non-convergence."""
     from statsmodels.regression.mixed_linear_model import MixedLM
 
     try:
@@ -351,6 +369,42 @@ def _fit_mixedlm(
         # inputs (LinAlgError, ValueError, OverflowError, ...). Catch them
         # all so per-trial bad data fails soft.
         return None
+
+
+def _fit_mixedlm(
+    outcome: np.ndarray,
+    X: np.ndarray,
+    groups: np.ndarray,
+    exog_re: np.ndarray,
+    *,
+    reml: bool = True,
+):
+    """Fit a MixedLM with lbfgs, swallowing fit failures.
+
+    Returns the fitted result or ``None`` if anything went wrong (singular
+    design, non-convergence, numerical failure). Callers map ``None`` to
+    the metric's degenerate score so a bad trial doesn't kill the study.
+
+    A design whose columns span wildly different magnitudes — a greenery index
+    in [0, 1] next to indicator columns and a time term in years — can stall
+    lbfgs even though the model is perfectly identified, so a failed fit is
+    retried on the column-scaled design and reported back in the caller's units
+    via :class:`_RescaledFit`. A genuinely rank-deficient design still fails.
+
+    ``reml=True`` (default) is the right estimator for variance components and
+    for the scoring metrics. AIC/BIC comparisons across models with **different
+    fixed effects** must pass ``reml=False`` — REML likelihoods aren't
+    comparable when the fixed-effects design changes.
+    """
+    result = _fit_mixedlm_once(outcome, X, groups, exog_re, reml=reml)
+    if result is not None:
+        return result
+
+    scales = _column_scales(X)
+    if np.allclose(scales, 1.0):
+        return None
+    scaled = _fit_mixedlm_once(outcome, X / scales, groups, exog_re, reml=reml)
+    return None if scaled is None else _RescaledFit(scaled, scales)
 
 
 def _as_array(x) -> np.ndarray:
@@ -1253,6 +1307,7 @@ def cluster_bootstrap_metric_ci(
     target: str = DEFAULT_ASSOCIATION_TARGET,
     wave_index: np.ndarray | None = None,
     area_id: np.ndarray | None = None,
+    workers: int | None = None,
 ) -> dict:
     """Cluster (entity) bootstrap percentile CI for a ``mixedlm_*`` metric.
 
@@ -1273,6 +1328,10 @@ def cluster_bootstrap_metric_ci(
     (a few hundred) rather than the thousands the O(1) OLS metrics use. A refit
     that fails to converge returns the metric's degenerate value (``0.0``) and so
     contributes to the distribution; with a well-powered test panel this is rare.
+
+    The refits run on a thread pool sized for the host; ``workers=1`` forces the
+    serial path. Replicates are drawn before any of them are fitted, so the
+    result does not depend on the pool size.
     """
     if metric not in MIXEDLM_METRICS:
         raise ValueError(
@@ -1361,10 +1420,14 @@ def cluster_bootstrap_metric_ci(
         return result
     group_rows = [np.where(inv == k)[0] for k in range(n_groups)]
 
+    # Draw every replicate up front, in order, from the one generator: the
+    # resamples are then identical to a serial run no matter how the refits are
+    # scheduled. Only the refits — which is where the seconds go — run in
+    # parallel.
     rng = np.random.default_rng(int(seed))
-    boot = np.empty(int(n_bootstrap), dtype=np.float64)
-    for i in range(int(n_bootstrap)):
-        draw = rng.integers(0, n_groups, size=n_groups)
+    draws = [rng.integers(0, n_groups, size=n_groups) for _ in range(int(n_bootstrap))]
+
+    def _replicate(draw: np.ndarray) -> float:
         idx = np.concatenate([group_rows[k] for k in draw])
         # Fresh per-slot group id so a repeated entity forms independent groups.
         new_eid = np.concatenate(
@@ -1374,7 +1437,7 @@ def cluster_bootstrap_metric_ci(
             ]
         )
         try:
-            boot[i] = float(
+            return float(
                 _score(
                     y[idx],
                     g[idx],
@@ -1388,7 +1451,25 @@ def cluster_bootstrap_metric_ci(
                 )
             )
         except Exception:
-            boot[i] = np.nan
+            return float("nan")
+
+    # Serial by default. Threading these refits is measurably *slower* — a
+    # statsmodels MixedLM fit is dominated by Python-level optimiser work that
+    # holds the GIL, and 2 threads came in at 0.62x of serial on a 3,600-row
+    # panel. A process pool does help (~2.5x, plateauing past 4 workers) but
+    # every spawned worker re-imports torch via ``geofuse/__init__``, which
+    # exhausted the Windows paging file at 24 processes. Callers can still pass
+    # ``workers`` explicitly once that import is made lazy.
+    n_workers = int(workers or 1)
+    if n_workers <= 1:
+        boot = np.array([_replicate(d) for d in draws], dtype=np.float64)
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            boot = np.fromiter(
+                ex.map(_replicate, draws), dtype=np.float64, count=len(draws)
+            )
 
     valid = boot[np.isfinite(boot)]
     if len(valid) == 0:

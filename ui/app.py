@@ -20,7 +20,7 @@ if __name__ == "__main__":
 
     os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-    # --- 3. LOAD GEOFUSE (forces torch DLL load on Windows before GDAL stack) ---
+    # --- 3. LOAD GEOFUSE (GDAL stack first; torch follows via geofuse.vision) ---
     from geofuse.gvi import GVIEngine  # noqa: F401, E402
     from geofuse.ndvi import NDVIEngine  # noqa: F401, E402
     from geofuse.vision import get_best_device  # noqa: F401, E402

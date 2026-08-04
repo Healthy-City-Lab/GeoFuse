@@ -1354,6 +1354,33 @@ def _fusion_stage_key(label: str, step: str, *, multi: bool) -> str:
     return f"{label}::{step}" if multi else step
 
 
+def _log_stage_timing(ledger: StageLedger, log: Any) -> None:
+    """Log where the run spent its wall clock, longest stage first.
+
+    Written at the end of a run so tuning decisions rest on this machine's own
+    numbers: stage costs shift with core count, disk speed, and how much of the
+    greenery cache was reusable, so a breakdown measured elsewhere does not
+    transfer.
+    """
+    rows = ledger.timing_report()
+    if not rows:
+        return
+    total = sum(r[2] for r in rows)
+    log("INFO", "====== STAGE WALL-CLOCK BREAKDOWN ======")
+    log(
+        "INFO",
+        f"  accounted {total / 60:.1f} min across {len(rows)} timed stage(s) "
+        f"on {os.cpu_count() or '?'} logical core(s).",
+    )
+    for key, label, secs, share in rows:
+        if share < 0.005 and secs < 30:
+            continue
+        log(
+            "INFO",
+            f"  {share * 100:5.1f}%  {secs / 60:8.1f} min  {label} ({key})",
+        )
+
+
 def _build_fusion_ledger(
     labels: list[str],
     *,
@@ -3033,6 +3060,8 @@ def run_fusion(
             output_paths.append(bundle_json_path)
         except Exception as exc:
             _log_fusion("WARN", f"Could not write results bundle JSON: {exc}")
+
+        _log_stage_timing(ledger, _log_fusion)
 
         ctx.progress(value=1.0, status_text="Completed")
         return {"output_paths": output_paths}

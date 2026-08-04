@@ -316,12 +316,37 @@ def _render_stage_ledger(rec) -> None:
                     _render_stage_line(s)
 
 
+def _stage_duration_label(s: dict) -> str:
+    """Compact elapsed time for a stage, or "" when it was never timed.
+
+    A running stage counts up to now; records written before stages carried
+    timestamps have none, and simply show nothing.
+    """
+    start = s.get("started_at")
+    if start is None:
+        return ""
+    end = s.get("ended_at")
+    if end is None:
+        if s.get("status") != "running":
+            return ""
+        end = datetime.now(UTC).timestamp()
+    secs = max(0.0, float(end) - float(start))
+    if secs < 90:
+        return f"{secs:.0f}s"
+    if secs < 5400:
+        return f"{secs / 60:.1f}m"
+    return f"{secs / 3600:.1f}h"
+
+
 def _render_stage_line(s: dict) -> None:
-    """Render one ledger stage as an icon + label (+ optional message)."""
+    """Render one ledger stage as an icon + label (+ elapsed, + message)."""
     icon = _STAGE_ICONS.get(s.get("status", "pending"), "⬜")
     label = s.get("label") or s.get("key", "")
     msg = s.get("message") or ""
     line = f"{icon} {label}"
+    took = _stage_duration_label(s)
+    if took:
+        line += f" · `{took}`"
     if msg:
         line += f" — _{msg}_"
     st.markdown(line)

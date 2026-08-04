@@ -30,6 +30,7 @@ from . import (
     metric_sampling,
     mixed_effects_scoring,
     objective_scoring,
+    parallel,
     pdcor,
     preaggregation,
     spatial_basis,
@@ -65,6 +66,57 @@ _log = get_logger("FUSION")
 # is permanent, so without this the multi-outcome loop (a fresh engine per
 # outcome) and every repeated run would re-emit the same warning.
 _WARNED_METRIC_BOUNDS: set[tuple] = set()
+
+
+def _finite_or_none(value) -> float | None:
+    """``float(value)`` when it is finite, else ``None``.
+
+    Reporting payloads travel to JSON and to the results UI, where a ``NaN``
+    renders as the literal text "nan"; ``None`` is the only value both layers
+    read as "not available".
+    """
+    try:
+        fv = float(value)
+    except (TypeError, ValueError):
+        return None
+    return fv if np.isfinite(fv) else None
+
+
+def _log_parallel_efficiency(
+    log,
+    phase: str,
+    *,
+    wall_s: float,
+    busy_s: float,
+    workers: int,
+) -> None:
+    """Report a phase's achieved concurrency against what the machine offers.
+
+    ``busy_s`` is summed worker time, so ``busy_s / wall_s`` is the average
+    number of workers actually running. Comparing that to ``workers`` says
+    whether the pool is saturated, and comparing ``workers`` to the core count
+    says whether the pool itself is the ceiling — the two questions that decide
+    whether raising the worker count would buy anything on *this* host.
+    """
+    if wall_s <= 0 or busy_s <= 0:
+        return
+    cores = os.cpu_count() or 0
+    achieved = busy_s / wall_s
+    saturation = achieved / workers if workers else 0.0
+    parts = [
+        f"{phase}: {achieved:.1f} of {workers} worker(s) busy on average "
+        f"({saturation * 100:.0f}% pool saturation)"
+    ]
+    if cores:
+        parts.append(f"{achieved / cores * 100:.0f}% of {cores} logical core(s)")
+        if saturation >= 0.85 and workers < cores:
+            parts.append(
+                f"pool-bound — the cap, not the work, is the limit "
+                f"({cores - workers} core(s) idle)"
+            )
+        elif saturation < 0.6:
+            parts.append("work-bound — raising the cap would not help")
+    log("INFO", "  " + " · ".join(parts) + ".")
 
 
 class MetricFusionEngine:
@@ -250,6 +302,7 @@ class MetricFusionEngine:
         # them. Reporting names only the former; both are fitted.
         self._user_covariate_columns: list[str] = list(self.covariate_columns)
         self._period_control_columns: list[str] = []
+        self._wave_control_columns: list[str] = []
         self._time_fixed_effect_dropped: bool = False
         self._covariates_expanded: bool = False
 
@@ -357,6 +410,10 @@ class MetricFusionEngine:
         self.best_params = None
         self.scaler = None
 
+        # Per-trial objective durations, appended by every search thread and
+        # summed into the phase's achieved-concurrency figure.
+        self._objective_secs: list[float] = []
+
         # Donut / ring cache: per-point annulus samples keyed by fold subset + indices
         self._ring_raster_cache: dict = {}
         self._ring_vector_cache: dict = {}
@@ -392,7 +449,7 @@ class MetricFusionEngine:
         # Trial threads for the stability search. Only the longitudinal
         # fast-GLS path uses them: the other paths keep LRU scoring caches that
         # are not thread-safe (see ``_search_n_jobs``).
-        self._search_workers: int = max(1, min((os.cpu_count() or 1), 4))
+        self._search_workers: int = parallel.worker_count()
 
         # Spatial pre-aggregation (mandatory; built by precompute_aggregations()).
         # Backed by an on-disk SQLite cache (geofuse/preaggregation.py) so the
@@ -2668,9 +2725,7 @@ class MetricFusionEngine:
                 count=len(missing),
             )
             workers = (
-                max(1, min((os.cpu_count() or 2), 8))
-                if max_workers is None
-                else max_workers
+                parallel.worker_count() if max_workers is None else max_workers
             )
             wk = max(1, min(workers, len(pos) // 128 + 1))
             stage_secs = {"vector_agg": 0.0, "raster_agg": 0.0}
@@ -3025,9 +3080,7 @@ class MetricFusionEngine:
             progress_callback(0, max(total_missing, 1))
 
         workers = (
-            max(1, min((os.cpu_count() or 2), 8))
-            if max_workers is None
-            else max_workers
+            parallel.worker_count() if max_workers is None else max_workers
         )
         stage_secs = {"vector_agg": 0.0, "raster_agg": 0.0}
         build_t0 = time.perf_counter()
@@ -3108,6 +3161,13 @@ class MetricFusionEngine:
             f"{total_build:.0f}s — vector agg {stage_secs['vector_agg']:.0f}s, "
             f"raster agg {stage_secs['raster_agg']:.0f}s. "
             f"Resident {cache.n_bytes / 2**30:.2f} GB (float32).",
+        )
+        _log_parallel_efficiency(
+            _log,
+            "pre-aggregation",
+            wall_s=total_build,
+            busy_s=stage_secs["vector_agg"] + stage_secs["raster_agg"],
+            workers=workers,
         )
         return True
 
@@ -4134,6 +4194,7 @@ class MetricFusionEngine:
         term's standard error far too small without it.
         """
         self._period_control_columns = []
+        self._wave_control_columns = []
         spec = self.longitudinal_spec
         if not self.is_longitudinal or spec is None:
             return []
@@ -4155,6 +4216,8 @@ class MetricFusionEngine:
             for dcol in dummies.columns:
                 gdf[dcol] = dummies[dcol].to_numpy()
             out.extend(dummies.columns)
+            if col == "wave":
+                self._wave_control_columns = list(dummies.columns)
             _log("INFO", f"Added {dummies.shape[1]} fixed effect(s) for '{col}'.")
 
         self._period_control_columns = out
@@ -5206,6 +5269,7 @@ class MetricFusionEngine:
         years_since_baseline: "np.ndarray | None" = None,
         return_pvalue: bool = False,
         return_all: bool = False,
+        nan_on_fail: bool = False,
         fast_components: "tuple[np.ndarray, float] | None" = None,
     ):
         """Single scoring seam: MixedLM (longitudinal) or OLS (cross-sectional).
@@ -5223,6 +5287,12 @@ class MetricFusionEngine:
         branch; the OLS branch ignores them (they are ``None`` in cross-sectional
         mode). ``return_all`` returns the four-metric MixedLM dict and is a no-op
         on the OLS path.
+
+        ``nan_on_fail`` makes the MixedLM branch return ``NaN`` instead of the
+        degenerate ``0.0`` when the model can't be fit, so reporting can tell a
+        non-fit from a genuine null. The search leaves it off (a bad trial should
+        rank last, not poison the pool) and the OLS path ignores it — the OLS
+        scorers have no non-convergence mode.
         """
         if self.is_longitudinal and metric in mixed_effects_scoring.MIXEDLM_METRICS:
             spec = self.longitudinal_spec
@@ -5248,6 +5318,7 @@ class MetricFusionEngine:
                     include_time_fixed=self._effective_time_fixed(spec),
                     random_slope=spec.random_slope_time,
                     return_pvalue=return_pvalue,
+                    nan_on_fail=nan_on_fail,
                     target=spec.association_target,
                 )
             return mixed_effects_scoring.score_mixedlm(
@@ -5261,6 +5332,7 @@ class MetricFusionEngine:
                 random_slope=spec.random_slope_time,
                 return_pvalue=return_pvalue,
                 return_all=return_all,
+                nan_on_fail=nan_on_fail,
                 spatial_basis=spatial_basis,
                 spatial_method=self.spatial_adjust_method,
                 target=spec.association_target,
@@ -5279,8 +5351,7 @@ class MetricFusionEngine:
         )
 
     def _objective(self, trial: optuna.Trial, metric: str) -> float:
-        """
-        Optuna objective function with k-fold CV.
+        """Optuna objective with k-fold CV, timed for the concurrency report.
 
         Weight search matches CGI.ipynb (ndvi / veg / terrain summing to 100).
         Radii use separate GVI and NDVI buffer ladders (min / max / step metres)
@@ -5288,6 +5359,15 @@ class MetricFusionEngine:
         Street-view aggregation parameters are shared for veg and terrain; NDVI
         uses separate stat / percentile choices.
         """
+        _t0 = time.perf_counter()
+        try:
+            return self._objective_inner(trial, metric)
+        finally:
+            # ``list.append`` is atomic under the GIL, so trials on the thread
+            # pool accumulate without a lock; summing these gives worker-seconds.
+            self._objective_secs.append(time.perf_counter() - _t0)
+
+    def _objective_inner(self, trial: optuna.Trial, metric: str) -> float:
         gvi_cap = int(round(self.gvi_buffer_max_m))
         ndvi_cap = int(round(self.ndvi_buffer_max_m))
 
@@ -6207,8 +6287,7 @@ class MetricFusionEngine:
 
         # Longitudinal MixedLM metric → cluster (entity) bootstrap that refits
         # the mixed model per replicate (resampling rows independently would
-        # break the within-entity correlation). The refit is expensive, so the
-        # replicate count is capped well below the OLS metrics' thousands.
+        # break the within-entity correlation).
         if self.is_longitudinal and metric in mixed_effects_scoring.MIXEDLM_METRICS:
             spec = self.longitudinal_spec
             assert spec is not None
@@ -6223,7 +6302,9 @@ class MetricFusionEngine:
                 random_slope=spec.random_slope_time,
                 spatial_basis=res.get("spatial_basis"),
                 spatial_method=self.spatial_adjust_method,
-                n_bootstrap=min(int(n_bootstrap), 300),
+                n_bootstrap=min(
+                    int(n_bootstrap), self._MIXEDLM_TEST_CI_BOOTSTRAP_CAP
+                ),
                 ci_level=float(ci_level),
                 seed=int(seed),
                 target=spec.association_target,
@@ -6543,11 +6624,20 @@ class MetricFusionEngine:
         * ``score_raw`` — what does CGI predict on its own? Answers "how
           predictive is the composite without controls?"
 
-        Returns ``{"score", "score_raw", "pvalue", "pvalue_raw"}``.
+        Returns ``{"score", "score_raw", "pvalue", "pvalue_raw", "fit_failed"}``.
         ``score_raw`` collapses to ``score`` when no covariates are
-        configured (they're the same number in that case).
+        configured (they're the same number in that case). A longitudinal mixed
+        model that doesn't converge yields ``None`` and ``fit_failed=True``
+        rather than the scorer's degenerate ``0.0``, which reads as a genuine
+        null effect everywhere downstream.
         """
-        empty = {"score": None, "score_raw": None, "pvalue": None, "pvalue_raw": None}
+        empty = {
+            "score": None,
+            "score_raw": None,
+            "pvalue": None,
+            "pvalue_raw": None,
+            "fit_failed": False,
+        }
         if data is None or len(data) == 0:
             return empty
         try:
@@ -6599,11 +6689,12 @@ class MetricFusionEngine:
                     entity_id=lon_eid,
                     years_since_baseline=lon_ysb,
                     return_pvalue=wants_pval,
+                    nan_on_fail=True,
                 )
                 if wants_pval:
                     s, p = out  # type: ignore[misc]
-                    return float(s), float(p)
-                return float(out), None  # type: ignore[arg-type]
+                    return _finite_or_none(s), _finite_or_none(p)
+                return _finite_or_none(out), None  # type: ignore[arg-type]
 
             partial_s, partial_p = _do(cov_mat, sb)
             raw_s, raw_p = (
@@ -6616,6 +6707,7 @@ class MetricFusionEngine:
                 "score_raw": raw_s,
                 "pvalue": partial_p,
                 "pvalue_raw": raw_p,
+                "fit_failed": partial_s is None,
             }
         except Exception as exc:
             logger.warning(f"_score_data_subset failed: {exc}")
@@ -6935,9 +7027,15 @@ class MetricFusionEngine:
 
         return results
 
-    # Whole-data slices refit a mixed model per bootstrap replicate, so their
-    # replicate count is capped well below the O(1) OLS metrics' thousands.
-    _MIXEDLM_REPORT_BOOTSTRAP_CAP = 200
+    # A MixedLM replicate is a full model refit, not the O(1) recomputation the
+    # OLS metrics bootstrap, so the caller's thousands are clamped to these.
+    # Reporting spends the bulk of a longitudinal run here: the effects cap
+    # applies per metric per slice (|t| and the signed coefficient, over all /
+    # test / train_val), and the test-CI cap once per study including each
+    # standalone. Percentile bounds get lumpier as these fall — at 100
+    # replicates the 2.5% bound sits between the 2nd and 3rd order statistic.
+    _MIXEDLM_REPORT_BOOTSTRAP_CAP = 100
+    _MIXEDLM_TEST_CI_BOOTSTRAP_CAP = 150
 
     def _evaluate_effects_mixedlm(
         self,
@@ -6989,6 +7087,9 @@ class MetricFusionEngine:
                 "p_value": r.get("pvalue"),
                 "p_kind": "wald",
                 "n": r.get("n"),
+                # Replicates that actually converged. These bounds come from a
+                # capped, modest count, so the reader needs to see it.
+                "n_boot": r.get("n_boot"),
                 "status": r.get("status"),
             }
             # |t| is folded, so its interval can never straddle zero. The signed
@@ -7014,7 +7115,7 @@ class MetricFusionEngine:
                 cov_part, sb_part = self._split_control_matrix(cov_all, n_cov)
                 results["all"] = _block(
                     t_all, c_all, eid, ysb, cov_part, sb_part,
-                    self._whole_data_wave_labels(df_full), seed,
+                    self._wave_labels_for_scoring(df_full), seed,
                 )
         except Exception as exc:
             logger.warning(f"evaluate_effects: whole-data scoring failed: {exc}")
@@ -7032,7 +7133,7 @@ class MetricFusionEngine:
                         tr.get("years_since_baseline"),
                         tr.get("covariates"),
                         tr.get("spatial_basis"),
-                        tr.get("wave"),
+                        self._wave_labels_for_scoring_array(tr.get("wave")),
                         seed + 101,
                     )
         except Exception as exc:
@@ -7056,7 +7157,7 @@ class MetricFusionEngine:
                     cov_part, sb_part = self._split_control_matrix(cov_tv, n_cov)
                     results["train_val"] = _block(
                         t_tv, c_tv, eid, ysb, cov_part, sb_part,
-                        self._whole_data_wave_labels(sub), seed + 202,
+                        self._wave_labels_for_scoring(sub), seed + 202,
                     )
         except Exception as exc:
             logger.warning(f"evaluate_effects: train_val scoring failed: {exc}")
@@ -7095,6 +7196,10 @@ class MetricFusionEngine:
             self._active_greenery_channel = prev_ch
 
         if "polygon_id" not in df_cgi.columns or "polygon_id" not in df_std.columns:
+            logger.warning(
+                f"paired difference ({standalone_channel}): composites are not "
+                "entity-keyed, so CGI and the standalone cannot be paired."
+            )
             return None
         merged = df_cgi[["polygon_id", "target", "composite"]].merge(
             df_std[["polygon_id", "composite"]],
@@ -7103,8 +7208,12 @@ class MetricFusionEngine:
         )
         eid, ysb = self._whole_data_longitudinal_keys(merged)
         if eid is None:
+            logger.warning(
+                f"paired difference ({standalone_channel}): no longitudinal keys "
+                "on the merged frame."
+            )
             return None
-        wave = self._whole_data_wave_labels(merged)
+        wave = self._wave_labels_for_scoring(merged)
         cov = self._whole_data_covariates(merged)
         y = merged["target"].to_numpy(dtype=np.float64)
         g_cgi = merged["composite_cgi"].to_numpy(dtype=np.float64)
@@ -7130,11 +7239,25 @@ class MetricFusionEngine:
         obs_cgi = _score(y, g_cgi, eid, ysb, cov, wave)
         obs_std = _score(y, g_std, eid, ysb, cov, wave)
         if not (np.isfinite(obs_cgi) and np.isfinite(obs_std)):
+            which = ", ".join(
+                nm
+                for nm, v in (("CGI", obs_cgi), (standalone_channel, obs_std))
+                if not np.isfinite(v)
+            )
+            logger.warning(
+                f"paired difference ({standalone_channel}): the whole-data mixed "
+                f"model did not fit for {which}, so there is no difference to "
+                "bootstrap."
+            )
             return None
         obs_diff = obs_cgi - obs_std  # every mixedlm_* metric is higher-is-better
 
         uniq, inv = np.unique(eid, return_inverse=True)
         if len(uniq) < 2:
+            logger.warning(
+                f"paired difference ({standalone_channel}): fewer than two "
+                "entities to resample."
+            )
             return None
         group_rows = [np.where(inv == k)[0] for k in range(len(uniq))]
         rng = np.random.default_rng(int(seed))
@@ -7167,6 +7290,10 @@ class MetricFusionEngine:
 
         valid = diffs[np.isfinite(diffs)]
         if len(valid) == 0:
+            logger.warning(
+                f"paired difference ({standalone_channel}): no bootstrap replicate "
+                f"fit ({n_boot} attempted), so the interval has no support."
+            )
             return None
         alpha = (1.0 - ci_level) / 2.0
         return {
@@ -7434,17 +7561,21 @@ class MetricFusionEngine:
             test_both = self._score_data_subset(
                 data=self.test_data, params=params, metric=metric
             )
+            # ``evaluate_on_test`` fails soft to the metric's degenerate value,
+            # which for a mixed model is a 0.0 indistinguishable from a real
+            # null. The nan-on-fail rescore of the same slice says which it is.
+            fit_failed = bool(test_both.get("fit_failed"))
             out["test"] = {
                 "score": (
-                    float(test_result["test_score"])
-                    if test_result.get("test_score") is not None
-                    else None
+                    None
+                    if fit_failed
+                    else _finite_or_none(test_result.get("test_score"))
                 ),
                 "score_raw": test_both.get("score_raw"),
                 "pvalue": (
-                    float(test_result["test_pvalue"])
-                    if test_result.get("test_pvalue") is not None
-                    else None
+                    None
+                    if fit_failed
+                    else _finite_or_none(test_result.get("test_pvalue"))
                 ),
                 "pvalue_raw": test_both.get("pvalue_raw"),
                 "n": test_n,
@@ -7496,11 +7627,12 @@ class MetricFusionEngine:
                     entity_id=lon_eid,
                     years_since_baseline=lon_ysb,
                     return_pvalue=wants_pval,
+                    nan_on_fail=True,
                 )
                 if wants_pval:
                     s, p = s_out  # type: ignore[misc]
-                    return float(s), float(p)
-                return float(s_out), None  # type: ignore[arg-type]
+                    return _finite_or_none(s), _finite_or_none(p)
+                return _finite_or_none(s_out), None  # type: ignore[arg-type]
 
             partial_s, partial_p = _full_score(cov, sb)
             raw_s, raw_p = (
@@ -7776,6 +7908,25 @@ class MetricFusionEngine:
             logger.warning(f"compute_decline_terms failed: {exc}")
             return None
 
+    def _wave_labels_for_scoring(self, df: "pd.DataFrame") -> "np.ndarray | None":
+        """Wave labels to hand the mixed-effects scorer as period fixed effects.
+
+        ``None`` once :meth:`_expand_period_controls` has folded the wave
+        indicators into ``covariate_columns``: every control matrix built from
+        those columns already carries them, and the scorer one-hots
+        ``wave_index`` into the *same* drop-first indicators, so passing both
+        makes the fixed-effects design exactly singular and the fit fails.
+        """
+        if self._wave_control_columns:
+            return None
+        return self._whole_data_wave_labels(df)
+
+    def _wave_labels_for_scoring_array(
+        self, wave: "np.ndarray | None"
+    ) -> "np.ndarray | None":
+        """:meth:`_wave_labels_for_scoring` for labels already in hand."""
+        return None if self._wave_control_columns else wave
+
     def _whole_data_wave_labels(self, df: "pd.DataFrame") -> "np.ndarray | None":
         """Per-row wave label for a collapsed frame, or ``None`` when absent."""
         if not self.is_longitudinal:
@@ -8032,6 +8183,11 @@ class MetricFusionEngine:
             "trials_seed_excluded": 0,
             "trials_kept": 0,
         }
+        # Search cost, accumulated across the sequential bootstrap loop so the
+        # phase can report its own concurrency at the end.
+        search_secs = 0.0
+        search_trials = 0
+        search_jobs = 1
 
         try:
             rng = np.random.default_rng(int(seed))
@@ -8164,11 +8320,13 @@ class MetricFusionEngine:
                     except Exception:
                         pass
 
+                _search_jobs = self._search_n_jobs(metric)
+                _search_t0 = time.perf_counter()
                 try:
                     study.optimize(
                         lambda t: self._objective(t, metric),
                         n_trials=n_trials_b,
-                        n_jobs=self._search_n_jobs(metric),
+                        n_jobs=_search_jobs,
                         show_progress_bar=False,
                         catch=(Exception,),
                         callbacks=[_trial_progress],
@@ -8177,6 +8335,10 @@ class MetricFusionEngine:
                     # Catastrophic study failure — skip this subsample and
                     # continue rather than aborting the whole selection.
                     continue
+                finally:
+                    search_secs += time.perf_counter() - _search_t0
+                    search_trials += n_trials_b
+                    search_jobs = _search_jobs
 
                 # Extract per-trial (params, val_score). ``_objective`` puts
                 # the mean val score into ``user_attrs["val_score_mean"]`` and
@@ -8272,6 +8434,26 @@ class MetricFusionEngine:
             # the pdcor sides) have no future hits — release them now.
             self._clear_scoring_caches()
             self._clear_ring_caches()
+            if search_secs > 0 and search_trials:
+                _log(
+                    "INFO",
+                    f"Stability search: {search_trials:,} trial(s) over "
+                    f"{diag['bootstraps_attempted']} sequential bootstrap(s) in "
+                    f"{search_secs:.0f}s "
+                    f"({search_secs / search_trials * 1000:.1f} ms/trial, "
+                    f"n_jobs={search_jobs}).",
+                )
+                # Summed in-objective time across threads: divided by the phase's
+                # wall clock it gives the average number of workers actually
+                # running, which is measured rather than assumed.
+                _log_parallel_efficiency(
+                    _log,
+                    "stability search",
+                    wall_s=search_secs,
+                    busy_s=float(sum(self._objective_secs)),
+                    workers=search_jobs,
+                )
+            self._objective_secs.clear()
 
         if not records:
             raise RuntimeError(

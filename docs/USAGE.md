@@ -48,6 +48,16 @@ If Streamlit (or the machine) restarts mid-job, the affected jobs reload as **In
 
 Each job writes a full log to `logs/jobs/<job_id>.log`. The job-monitor expander has an **Open log file** button; the in-UI view keeps only the last 100 lines, but the file on disk is complete.
 
+### Where the time went, and how many cores were used
+
+Every fusion run ends with a **stage wall-clock breakdown** in its log — each stage's minutes and share, longest first — and the job-monitor stage list shows the same durations live. Parallel phases additionally log how many workers were actually busy, whether the pool or the work was the limit, and how many cores sat idle.
+
+Pool sizes come from the host's core count — about a third of it, because each task is already multi-threaded inside numpy, and a wider pool oversubscribes the cores rather than going faster. Set `GEOFUSE_WORKERS` to override when the machine is shared or when you want to test a different width:
+
+```bash
+GEOFUSE_WORKERS=8 streamlit run ui/app.py     # cap every pool at 8 threads
+```
+
 ### National-scale study areas (GVI)
 
 For widely scattered inputs, the engine automatically clusters the features and builds one sampling grid per cluster on a shared reference — no special mode, just upload the file. The chosen projected CRS and estimated distortion appear in the job log.

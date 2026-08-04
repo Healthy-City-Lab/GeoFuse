@@ -2,6 +2,7 @@ import base64
 import glob
 import html
 import io
+import math
 import os
 import re
 from datetime import date, datetime
@@ -3053,6 +3054,35 @@ def _render_stability_diagnostics(summary: dict, metric_name: str) -> None:
             )
 
 
+def _num(x) -> float | None:
+    """``float(x)`` when it is a real number, else ``None``.
+
+    Every reporting block can carry ``NaN`` where a model didn't fit; formatting
+    one prints the literal "nan" into a metric tile, so non-finite values are
+    funnelled to ``None`` and rendered as "—" like any other missing value.
+    """
+    try:
+        fx = float(x)
+    except (TypeError, ValueError):
+        return None
+    return fx if math.isfinite(fx) else None
+
+
+def _usable_effect(block: dict | None) -> dict | None:
+    """An effects block, or ``None`` when it carries no usable numbers.
+
+    A block whose model didn't fit still arrives fully shaped, with ``NaN`` in
+    every slot and ``status="fit_failed"``. Treating it as absent lets the
+    caller fall back to whichever estimate did work.
+    """
+    if not block:
+        return None
+    if str(block.get("status") or "").lower() == "fit_failed":
+        return None
+    keys = ("score", "lower", "upper", "p_value")
+    return block if any(_num(block.get(k)) is not None for k in keys) else None
+
+
 _P_KIND_LABEL = {"permutation": "permutation p", "wald": "Wald p"}
 _P_KIND_HELP = {
     "permutation": (
@@ -3074,18 +3104,17 @@ def _render_results_headline(results_view: dict, metric_name: str) -> None:
     sub-answers — the paired objective difference and the AIC/BIC
     penalized-model comparison."""
     effects = results_view.get("cgi_effects") or {}
-    all_eff = effects.get("all") or {}
-    test_eff = effects.get("test") or {}
+    # A block whose mixed model didn't fit is all-NaN; drop it here so the
+    # tiles below fall through to the held-out cluster bootstrap, which is an
+    # independent fit of the same effect and often succeeds where it didn't.
+    all_eff = _usable_effect(effects.get("all")) or {}
+    test_eff = _usable_effect(effects.get("test")) or {}
     test_ci = (results_view.get("test_results") or {}).get("test_ci") or {}
     direction = results_view.get("direction_sign")
     aic_bic = results_view.get("cgi_vs_standalone_aic_bic") or None
     paired = results_view.get("cgi_vs_standalone_paired") or None
-
-    def _f(x):
-        try:
-            return float(x)
-        except (TypeError, ValueError):
-            return None
+    has_standalones = bool(results_view.get("standalones"))
+    _f = _num
 
     # Rows of two so the metric labels have room to breathe — narrow columns
     # clip every label with "…" in a narrow window. The CGI-vs-standalone
@@ -3123,6 +3152,11 @@ def _render_results_headline(results_view: dict, metric_name: str) -> None:
             if t_lo is not None and t_hi is not None
             else "—"
         )
+        # A mixed-effects interval comes from a capped, modest replicate count
+        # (each one is a full refit), so the count belongs beside the bounds.
+        n_boot = test_ci.get("n_boot") or test_eff.get("n_boot")
+        if n_boot:
+            ci_str += f" from {int(n_boot):,} replicates"
         p_str = (
             f"; {_P_KIND_LABEL.get(test_eff.get('p_kind'), 'p')}={t_p:.3g}"
             if t_p is not None
@@ -3231,6 +3265,21 @@ def _render_results_headline(results_view: dict, metric_name: str) -> None:
             else:
                 help_txt = "Comparison unavailable."
             st.metric("CGI vs standalone — objective (all)", verdict, help=help_txt)
+        elif has_standalones:
+            # Standalones ran but the paired bootstrap produced nothing — the
+            # whole-data model didn't fit for one of the two composites. Say so
+            # instead of implying the studies were never enabled.
+            st.metric(
+                "CGI vs standalone — objective (all)",
+                "unavailable",
+                help=(
+                    "The paired whole-data comparison could not be computed — "
+                    "the mixed model did not fit for CGI or for the standalone "
+                    "composite on the full dataset. See the job log for which "
+                    "channel failed; the AIC/BIC comparison beside this tile is "
+                    "the independent second opinion."
+                ),
+            )
         else:
             st.metric(
                 "CGI vs standalone — objective (all)",
@@ -3323,19 +3372,19 @@ def _render_study_detail(
                 "not a zero effect.",
             )
         else:
-            obs = test_ci.get("observed")
+            obs = _num(test_ci.get("observed"))
             if obs is None:
-                obs = test_res.get("test_score")
-            lo, hi = test_ci.get("lower"), test_ci.get("upper")
+                obs = _num(test_res.get("test_score"))
+            lo, hi = _num(test_ci.get("lower")), _num(test_ci.get("upper"))
             if obs is not None:
                 ci_str = (
-                    f"95% CI [{float(lo):.4f}, {float(hi):.4f}]"
+                    f"95% CI [{lo:.4f}, {hi:.4f}]"
                     if lo is not None and hi is not None
                     else "no CI"
                 )
                 st.metric(
                     f"Test {metric_name}",
-                    f"{float(obs):.4f}",
+                    f"{obs:.4f}",
                     delta=ci_str,
                     delta_color="off",
                 )
@@ -3444,7 +3493,8 @@ def _render_study_detail(
         # optimistic). Test + all carry both CI and the held-out p.
         effects = study_view.get("cgi_effects") or {}
         _tci = test_res.get("test_ci") or {}
-        # A MixedLM run without an effects block still has the held-out cluster
+        # A run without a usable effects block — none computed, or the model
+        # didn't fit and left an all-NaN one — still has the held-out cluster
         # bootstrap, which carries the same interval and a Wald p.
         _test_fallback = (
             {
@@ -3457,9 +3507,9 @@ def _render_study_detail(
             else None
         )
         eff_for = {
-            "train": effects.get("train_val"),
-            "test": effects.get("test") or _test_fallback,
-            "all": effects.get("all"),
+            "train": _usable_effect(effects.get("train_val")),
+            "test": _usable_effect(effects.get("test")) or _test_fallback,
+            "all": _usable_effect(effects.get("all")),
         }
         p_col = _P_KIND_LABEL.get((eff_for["test"] or {}).get("p_kind"), "p-value")
         # Friendly labels — there is no train→fit→validate step. The displayed
@@ -3474,13 +3524,10 @@ def _render_study_detail(
         def _fmt_ci(block: dict | None) -> str | None:
             if not block:
                 return None
-            lo, hi = block.get("lower"), block.get("upper")
+            lo, hi = _num(block.get("lower")), _num(block.get("upper"))
             if lo is None or hi is None:
                 return None
-            try:
-                return f"[{float(lo):.4f}, {float(hi):.4f}]"
-            except (TypeError, ValueError):
-                return None
+            return f"[{lo:.4f}, {hi:.4f}]"
 
         st.markdown("**Scores by data subset**")
         rows: list[dict] = []
@@ -3488,20 +3535,18 @@ def _render_study_detail(
             block = subset_scores.get(subset) or {}
             if not block:
                 continue
-            score = block.get("score")
-            raw = block.get("score_raw")
+            score = _num(block.get("score"))
+            raw = _num(block.get("score_raw"))
             row = {
                 "Subset": subset_label.get(subset, subset),
-                metric_name: round(float(score), 4) if score is not None else None,
+                metric_name: round(score, 4) if score is not None else None,
             }
             if has_covariates:
-                row[f"{metric_name} (raw)"] = (
-                    round(float(raw), 4) if raw is not None else None
-                )
+                row[f"{metric_name} (raw)"] = round(raw, 4) if raw is not None else None
             eff = eff_for.get(subset)
             row["95% CI"] = _fmt_ci(eff)
-            p_val = (eff or {}).get("p_value")
-            row[p_col] = f"{float(p_val):.3g}" if p_val is not None else None
+            p_val = _num((eff or {}).get("p_value"))
+            row[p_col] = f"{p_val:.3g}" if p_val is not None else None
             row["n"] = block.get("n")
             rows.append(row)
         if rows:
@@ -3521,6 +3566,11 @@ def _render_study_detail(
                 cap += (
                     " The metric column is covariate-adjusted (partial); "
                     "`(raw)` is the unadjusted correlation."
+                )
+            if any(r.get(metric_name) is None for r in rows):
+                cap += (
+                    " A blank score is a slice where the mixed model did not "
+                    "fit — a non-fit, not a zero effect."
                 )
             st.caption(cap)
 
@@ -3563,22 +3613,16 @@ def _render_cross_study_comparison(results_view: dict, metric_name: str) -> None
     )
     if subset_picks:
         rows: list[dict] = []
+        missing: list[str] = []
         for _key, disp, b in studies:
             subs = b.get("subset_scores") or {}
             for subset in subset_picks:
                 block = subs.get(subset) or {}
-                val = block.get("score")
-                try:
-                    fval = float(val) if val is not None else None
-                except (TypeError, ValueError):
-                    fval = None
-                rows.append(
-                    {
-                        "Study": disp,
-                        "Subset": _subset_label.get(subset, subset),
-                        metric_name: fval,
-                    }
-                )
+                fval = _num(block.get("score"))
+                label = _subset_label.get(subset, subset)
+                if fval is None:
+                    missing.append(f"{disp} · {label}")
+                rows.append({"Study": disp, "Subset": label, metric_name: fval})
         df = pd.DataFrame(rows)
         try:
             import plotly.express as _px
@@ -3597,6 +3641,14 @@ def _render_cross_study_comparison(results_view: dict, metric_name: str) -> None
             st.bar_chart(
                 df.pivot(index="Study", columns="Subset", values=metric_name),
                 width="stretch",
+            )
+        if missing:
+            # A study×subset with no bar is a model that didn't fit, which is
+            # not the same statement as a bar sitting at zero.
+            st.caption(
+                "No bar for " + ", ".join(f"**{m}**" for m in missing) + " — the "
+                "mixed model did not fit on that slice, so there is no score to "
+                "plot (a non-fit, not a zero effect)."
             )
         with st.expander("Show exact values"):
             st.dataframe(df, width="stretch")
@@ -3873,42 +3925,54 @@ def _render_fusion_results_body(output_dir: str) -> None:
             else None
         )
 
-        def _match_outcome(fname: str) -> bool:
-            if _active_label is None:
-                return f"__{_active_label}" not in fname
-            return f"__{_active_label}" in fname
+        # Filenames are ``mixedlm_metrics[__<outcome>][__<channel>].csv``: the
+        # bare name is the CGI study, a channel suffix is that standalone's, and
+        # a multi-outcome run puts the outcome label first. Splitting on "__"
+        # recovers which study a file belongs to instead of pattern-replacing
+        # the prefix, which labelled every standalone "CGI <channel>".
+        def _study_of(fname: str) -> tuple[str, str] | None:
+            parts = fname[: -len(".csv")].split("__")
+            if parts[0] != "mixedlm_metrics":
+                return None
+            rest = parts[1:]
+            channel = rest[-1] if rest and rest[-1] in _CHANNEL_DISPLAY else None
+            outcome = "__".join(rest[: -1 if channel else None]) or None
+            if _active_label is not None and outcome != _active_label:
+                return None
+            if _active_label is None and outcome is not None:
+                return None
+            if channel is None:
+                return "cgi", "CGI (combined)"
+            return channel, f"{_CHANNEL_DISPLAY[channel]} (standalone)"
 
-        _csv_paths: list[str] = []
+        _csv_entries: list[tuple[str, str, str]] = []
         if os.path.isdir(_study_root):
             for _fn in sorted(os.listdir(_study_root)):
                 if not _fn.startswith("mixedlm_metrics") or not _fn.endswith(".csv"):
                     continue
-                if not _match_outcome(_fn):
+                _study = _study_of(_fn)
+                if _study is None:
                     continue
-                _csv_paths.append(os.path.join(_study_root, _fn))
+                _csv_entries.append(
+                    (_study[0], _study[1], os.path.join(_study_root, _fn))
+                )
 
-        if _csv_paths:
+        # CGI first, then the channels in their canonical order.
+        _order = {"cgi": 0, "veg": 1, "terrain": 2, "ndvi": 3}
+        _csv_entries.sort(key=lambda e: _order.get(e[0], 99))
+
+        if _csv_entries:
             st.divider()
             st.markdown("**Mixed-effects: all metrics across trial pools**")
             st.caption(
-                "Each pool's per-trial rows are followed by "
-                "`__mean__`, `__ci_lo__`, `__ci_hi__`, and `__n__` "
+                "One tab per study — the combined CGI composite and each "
+                "standalone single-channel study. Each pool's per-trial rows are "
+                "followed by `__mean__`, `__ci_lo__`, `__ci_hi__`, and `__n__` "
                 "summary rows."
             )
 
-            def _tab_label(path: str) -> str:
-                base = os.path.basename(path).replace(".csv", "")
-                if _active_label:
-                    base = base.replace(
-                        f"mixedlm_metrics__{_active_label}", "CGI"
-                    ).replace(f"__{_active_label}__", "__")
-                else:
-                    base = base.replace("mixedlm_metrics", "CGI")
-                return base.replace("__", " ").strip() or "CGI"
-
-            _tab_labels = [_tab_label(p) for p in _csv_paths]
-            _tabs = st.tabs(_tab_labels)
-            for _tab, _path in zip(_tabs, _csv_paths):
+            _tabs = st.tabs([disp for _, disp, _ in _csv_entries])
+            for _tab, (_, _, _path) in zip(_tabs, _csv_entries):
                 with _tab:
                     st.caption(f"Source: `{_path}`")
                     st.dataframe(pd.read_csv(_path), width="stretch")
