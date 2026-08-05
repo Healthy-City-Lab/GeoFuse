@@ -25,6 +25,9 @@ parent. The first element is a string tag from the ``MSG_*`` constants:
 
 from __future__ import annotations
 
+import multiprocessing as mp
+import os
+import threading
 import time
 
 # Message tags (kept as short strings for legibility in queue dumps / logs)
@@ -35,6 +38,44 @@ MSG_STAGE_LEDGER = "stage_ledger"
 MSG_LOG = "log"
 MSG_COMPLETE = "complete"
 MSG_ERROR = "error"
+
+# Name of the daemon thread installed by :func:`exit_with_parent`.
+_PARENT_GUARD_THREAD = "parent-exit-guard"
+
+
+def exit_with_parent() -> None:
+    """Bind this child's lifetime to its parent's.
+
+    A child outlives its parent whenever the parent goes away without running
+    its own shutdown — a force-kill from Task Manager, a closed terminal, a
+    crash. Nothing reaps it afterwards, so an engine child holding tens of
+    gigabytes stays resident, and its commit charge stays against the page
+    file, until the machine reboots.
+
+    ``parent_process().join()`` waits on the sentinel handle the spawn child
+    already owns and returns the moment the parent goes, however it goes. The
+    wait runs on its own daemon thread, so it still fires while the main
+    thread sits inside a long uninterruptible call (a BLAS solve, a
+    ``statsmodels`` refit). ``os._exit`` skips interpreter teardown on
+    purpose: the parent that would have received a clean shutdown is already
+    gone, and the artifacts on disk are whatever the last completed stage
+    wrote.
+
+    Idempotent per process and a no-op when there is no parent (a child run
+    directly, or in-process tests).
+    """
+    parent = mp.parent_process()
+    if parent is None:
+        return
+    for t in threading.enumerate():
+        if t.name == _PARENT_GUARD_THREAD:
+            return
+
+    def _wait() -> None:
+        parent.join()
+        os._exit(1)
+
+    threading.Thread(target=_wait, daemon=True, name=_PARENT_GUARD_THREAD).start()
 
 
 class SubprocJobContext:

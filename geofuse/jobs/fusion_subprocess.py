@@ -21,6 +21,7 @@ from .subprocess_runner import (
     MSG_COMPLETE,
     MSG_ERROR,
     SubprocJobContext,
+    exit_with_parent,
     route_engine_logging_to_queue,
 )
 
@@ -43,6 +44,8 @@ def run_fusion_child(
     turned into an ``MSG_ERROR`` so the parent can apply it to the JobStore.
     """
     try:
+        exit_with_parent()
+
         # Route engine log lines + stdout/stderr into the parent queue before
         # the runner imports anything that might cache a logger closure.
         route_engine_logging_to_queue(job_id, event_queue)

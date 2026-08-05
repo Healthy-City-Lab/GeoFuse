@@ -23,6 +23,7 @@ from .subprocess_runner import (  # noqa: F401 — re-exported for back-compat
     MSG_ERROR,
     SubprocJobContext,
     drain_events_until_done,
+    exit_with_parent,
     route_engine_logging_to_queue,
 )
 
@@ -52,6 +53,8 @@ def run_gvi_child(
     can apply them to the JobStore.
     """
     try:
+        exit_with_parent()
+
         # Route engine log lines into the parent queue *before* the runner
         # imports anything that might cache a logger closure.
         route_engine_logging_to_queue(job_id, event_queue)
@@ -113,6 +116,7 @@ def run_gvi_column_child(
 ) -> None:
     """Entry point for the per-year GVI column job. See :func:`run_gvi_child`."""
     try:
+        exit_with_parent()
         route_engine_logging_to_queue(job_id, event_queue)
 
         from geofuse.jobs.runners import run_gvi_column

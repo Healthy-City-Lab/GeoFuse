@@ -16,6 +16,7 @@ from .subprocess_runner import (
     MSG_COMPLETE,
     MSG_ERROR,
     SubprocJobContext,
+    exit_with_parent,
     route_engine_logging_to_queue,
 )
 
@@ -49,6 +50,7 @@ def run_ndvi_child(
     them to the JobStore.
     """
     try:
+        exit_with_parent()
         route_engine_logging_to_queue(job_id, event_queue)
 
         from geofuse.jobs.runners import run_ndvi
@@ -106,6 +108,7 @@ def run_ndvi_column_child(
 ) -> None:
     """Subprocess entry point for ``run_ndvi_column`` (one raster per year)."""
     try:
+        exit_with_parent()
         route_engine_logging_to_queue(job_id, event_queue)
 
         from geofuse.jobs.runners import run_ndvi_column
