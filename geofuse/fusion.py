@@ -26,7 +26,9 @@ from sklearn.model_selection import train_test_split
 
 from . import (
     JobCancelled,
+    binary_longitudinal,
     cgi_formulas,
+    exposure_response,
     longitudinal,
     metric_sampling,
     mixed_effects_scoring,
@@ -5222,10 +5224,16 @@ class MetricFusionEngine:
     def _metric_has_pvalue(self, metric: str) -> bool:
         """True when scoring ``metric`` yields a usable parametric p-value.
 
-        Only the longitudinal MixedLM ``tstat`` / ``coef`` metrics carry a Wald
-        p-value; the cross-sectional OLS metrics do not (their robustness comes
-        from stability selection + bootstrap CIs, not a per-trial p-gate).
+        The longitudinal MixedLM ``tstat`` / ``coef`` metrics and both GEE
+        logistic metrics carry a Wald p-value; the cross-sectional OLS metrics
+        do not (their robustness comes from stability selection + bootstrap CIs,
+        not a per-trial p-gate). The cross-sectional logistic metrics do produce
+        one, and it is reported for consistency with the panel path.
         """
+        if metric in objective_scoring.BINARY_ONLY_METRICS:
+            return True
+        if self.is_longitudinal and metric in longitudinal.GEE_LOGIT_METRICS:
+            return True
         return self.is_longitudinal and metric in mixed_effects_scoring.HAS_PVALUE
 
     def _fold_fast_components(self, static: dict):
@@ -5262,6 +5270,30 @@ class MetricFusionEngine:
         static["fast_components"] = comp
         return comp
 
+    def _fold_gee_baseline(self, static: dict):
+        """Per-fold covariates-only GEE fit for the fast binary panel scorer.
+
+        The binary analogue of :meth:`_fold_fast_components`: the null model's
+        fitted probabilities, working weights and exchangeable correlation are
+        properties of the outcome and covariates, so they are estimated once per
+        fold and every trial takes one Newton step from them. ``None`` sends the
+        caller to the exact per-trial GEE fit.
+        """
+        if "gee_baseline" in static:
+            return static["gee_baseline"]
+        baseline = None
+        if (
+            self.is_longitudinal
+            and self.search_scoring_method != "exact"
+            and self.spatial_adjust_method == "none"
+            and static.get("entity_id") is not None
+        ):
+            baseline = binary_longitudinal.estimate_fold_baseline(
+                static["target"], static["entity_id"], static.get("cov")
+            )
+        static["gee_baseline"] = baseline
+        return baseline
+
     def _score_greenery(
         self,
         metric: str,
@@ -5275,7 +5307,7 @@ class MetricFusionEngine:
         return_pvalue: bool = False,
         return_all: bool = False,
         nan_on_fail: bool = False,
-        fast_components: "tuple[np.ndarray, float] | None" = None,
+        fast_components: "tuple[np.ndarray, float] | object | None" = None,
     ):
         """Single scoring seam: MixedLM (longitudinal) or OLS (cross-sectional).
 
@@ -5299,6 +5331,32 @@ class MetricFusionEngine:
         rank last, not poison the pool) and the OLS path ignores it — the OLS
         scorers have no non-convergence mode.
         """
+        if self.is_longitudinal and metric in longitudinal.GEE_LOGIT_METRICS:
+            # Binary outcome on a panel: GEE with an exchangeable working
+            # correlation clustered on the entity. ``fast_components`` carries a
+            # GEEFoldBaseline here (the search path); its absence, or an exact
+            # reporting call, takes the full refit.
+            if (
+                isinstance(fast_components, binary_longitudinal.GEEFoldBaseline)
+                and not return_all
+            ):
+                return binary_longitudinal.score_gee_logit_fast(
+                    metric,
+                    composite,
+                    fast_components,
+                    return_all=return_all,
+                    return_pvalue=return_pvalue,
+                )
+            return binary_longitudinal.score_gee_logit(
+                metric,
+                target,
+                composite,
+                entity_id,
+                covariates,
+                return_all=return_all,
+                return_pvalue=return_pvalue,
+            )
+
         if self.is_longitudinal and metric in mixed_effects_scoring.MIXEDLM_METRICS:
             spec = self.longitudinal_spec
             assert spec is not None  # guaranteed by is_longitudinal
@@ -5771,8 +5829,17 @@ class MetricFusionEngine:
                 and metric in mixed_effects_scoring.FAST_SEARCH_METRICS
                 and self.spatial_adjust_method == "none"
             )
-            train_fc = self._fold_fast_components(train_static) if wants_fast else None
-            val_fc = self._fold_fast_components(val_static) if wants_fast else None
+            wants_gee_fast = (
+                self.is_longitudinal and metric in longitudinal.GEE_LOGIT_METRICS
+            )
+            if wants_gee_fast:
+                train_fc = self._fold_gee_baseline(train_static)
+                val_fc = self._fold_gee_baseline(val_static)
+            else:
+                train_fc = (
+                    self._fold_fast_components(train_static) if wants_fast else None
+                )
+                val_fc = self._fold_fast_components(val_static) if wants_fast else None
             train_out = self._score_greenery(
                 metric,
                 train_targets_arr,
@@ -7932,6 +7999,108 @@ class MetricFusionEngine:
         except Exception as exc:
             logger.warning(f"compute_decline_terms failed: {exc}")
             return None
+
+    def compute_exposure_response(
+        self, params: dict, *, iqr: float | None = None
+    ) -> dict | None:
+        """Per-IQR effect, quartile contrasts and a spline non-linearity test.
+
+        Run once on the winning composite, this is the shape the greenspace
+        literature reports its findings in: an effect per interquartile-range
+        increase, a gradient across exposure quartiles against the lowest, and a
+        test of whether the straight line the search optimised is the right
+        functional form.
+
+        The fitter matches the study design — logistic (or GEE logistic on a
+        panel) for a binary outcome, OLS or MixedLM otherwise — so the standard
+        errors in these tables are the same kind as the headline estimate's.
+        Pass ``iqr`` to pin the scaling constant, e.g.
+        ``exposure_response.CLSA_NDVI_IQR`` when the point is to land on a
+        published NDVI number.
+        """
+        try:
+            df = self.apply_fusion(weights=dict(params))
+            target = np.asarray(df["target"].values, dtype=np.float64)
+            composite = np.asarray(df["composite"].values, dtype=np.float64)
+            cov = self._reporting_covariate_matrix(df)
+
+            entity_id = None
+            if self.is_longitudinal:
+                entity_id, _ysb = self._whole_data_longitudinal_keys(df)
+
+            binary = binary_longitudinal.is_binary(target)
+            coding = binary_longitudinal.describe_coding(target) if binary else None
+            if coding and coding["suspicious"]:
+                _log(
+                    "WARN",
+                    f"Binary outcome is coded "
+                    f"{{{coding['reference_level']:g}, {coding['modelled_level']:g}}}, "
+                    f"not {{0, 1}}. The logistic models treat "
+                    f"{coding['modelled_level']:g} as the event — confirm that is "
+                    "the affirmative level, or every odds ratio is inverted.",
+                )
+            if binary and entity_id is not None:
+                fitter = binary_longitudinal.make_gee_logit_fitter(target, entity_id)
+                design = "gee_logit"
+            elif binary:
+                fitter = binary_longitudinal.make_logit_fitter(target)
+                design = "logit"
+            else:
+                fitter = exposure_response.make_ols_fitter(target)
+                design = "ols"
+
+            # Headline per-unit effect, from the same model family, so the
+            # per-IQR rescale below is a change of units and nothing else.
+            base_cols = [np.ones(len(target)), composite]
+            base_names = ["intercept", "greenery"]
+            if cov is not None and cov.size:
+                for j in range(cov.shape[1]):
+                    base_cols.append(cov[:, j])
+                    base_names.append(f"cov{j}")
+            fitted = fitter(np.column_stack(base_cols), base_names)
+            per_iqr = None
+            if fitted is not None:
+                coef, se, _p = fitted["greenery"]
+                per_iqr = exposure_response.iqr_scaled_effect(
+                    coef, se, composite, iqr=iqr, logistic=binary
+                )
+
+            return {
+                "design": design,
+                "binary_outcome": bool(binary),
+                "coding": coding,
+                "per_iqr": per_iqr,
+                "quartiles": exposure_response.quartile_terms(
+                    composite, fitter, cov, logistic=binary
+                ),
+                "nonlinearity": exposure_response.spline_nonlinearity_test(
+                    composite, fitter, cov
+                ),
+            }
+        except Exception as exc:
+            logger.warning(f"compute_exposure_response failed: {exc}")
+            return None
+
+    def _reporting_covariate_matrix(self, df: "pd.DataFrame"):
+        """Covariate matrix aligned to an ``apply_fusion`` frame, or ``None``.
+
+        Shared by the decline-term and exposure-response reports so both
+        condition on exactly the same controls the objective did.
+        """
+        cov_cols = list(self.covariate_columns or [])
+        if not cov_cols:
+            return None
+        full = self._full_data_frame()
+        if full is not None and "polygon_id" in df.columns:
+            return (
+                full.groupby("polygon_id", sort=False)[cov_cols]
+                .first()
+                .reindex(df["polygon_id"].values)
+                .to_numpy(dtype=np.float64)
+            )
+        if set(cov_cols) <= set(df.columns):
+            return df[cov_cols].to_numpy(dtype=np.float64)
+        return None
 
     def _wave_labels_for_scoring(self, df: "pd.DataFrame") -> "np.ndarray | None":
         """Wave labels to hand the mixed-effects scorer as period fixed effects.

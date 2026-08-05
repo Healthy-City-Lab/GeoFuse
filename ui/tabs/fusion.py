@@ -389,6 +389,8 @@ _CROSS_METRICS: tuple[str, ...] = (
     "r2",
     "nrmse",
     "mutual_info",
+    "logit_tstat",
+    "logit_coef",
 )
 # Friendly labels for the objective-metric picker.
 _CROSS_METRIC_LABELS: dict[str, str] = {
@@ -398,7 +400,20 @@ _CROSS_METRIC_LABELS: dict[str, str] = {
     "r2": "Incremental R²",
     "nrmse": "Normalized RMSE (lower is better)",
     "mutual_info": "Mutual information (ignores covariates)",
+    "logit_tstat": "Logistic Wald |z| (binary outcome)",
+    "logit_coef": "Logistic log-odds ratio (binary outcome)",
+    "mixedlm_tstat": "Mixed-effects |t| (panel)",
+    "mixedlm_marginal_r2": "Mixed-effects marginal R² (panel)",
+    "mixedlm_lr": "Mixed-effects likelihood ratio (panel)",
+    "mixedlm_coef": "Mixed-effects coefficient (panel)",
+    "gee_logit_tstat": "GEE logistic Wald |z| (binary panel)",
+    "gee_logit_coef": "GEE logistic log-odds ratio (binary panel)",
 }
+# Metrics that require a two-valued outcome. Mirror of
+# ``objective_scoring.BINARY_ONLY_METRICS`` plus the GEE panel pair.
+_BINARY_ONLY_METRICS: frozenset[str] = frozenset(
+    {"logit_tstat", "logit_coef", "gee_logit_tstat", "gee_logit_coef"}
+)
 # Metrics that condition on covariates intrinsically, so the residualization
 # picker doesn't apply. Mirror of ``objective_scoring.RESIDUALIZE_IGNORED``.
 _RESIDUALIZE_IGNORED_METRICS: frozenset[str] = frozenset(
@@ -411,6 +426,10 @@ _MIXEDLM_METRICS: tuple[str, ...] = (
     "mixedlm_marginal_r2",
     "mixedlm_lr",
     "mixedlm_coef",
+    # Binary outcomes on a panel: MixedLM is Gaussian-only, so these route to
+    # GEE with an exchangeable working correlation clustered on the entity.
+    "gee_logit_tstat",
+    "gee_logit_coef",
 )
 
 # Authoritative list of every ``run_fusion`` setting that isn't a file path or
@@ -1582,9 +1601,16 @@ def _render_study_details_panel(
                 "Quantity each stability-selection trial scores on its "
                 "out-of-bag rows (maximised; nrmse minimised). "
                 "**Partial distance correlation** (default) captures linear and "
-                "nonlinear association and conditions on covariates nonlinearly."
+                "nonlinear association and conditions on covariates nonlinearly. "
+                "The logistic and GEE-logistic options require a two-valued "
+                "outcome and report a log-odds ratio."
             ),
         )
+        if objective_metric in _BINARY_ONLY_METRICS:
+            st.caption(
+                ":orange[Requires a two-valued outcome column.] "
+                "A continuous outcome scores zero on every trial."
+            )
     with col_o2:
         _default("fusion_test_size", 0.25)
         test_size = st.slider(

@@ -1114,6 +1114,11 @@ def _write_fusion_outputs(
     - ``stability_cells.csv`` — the ranked weight cells per study.
     - ``stability_bootstraps.csv`` — the per-bootstrap leaderboard per study.
     - ``covariate_impact.csv`` — per-covariate effects (when covariates set).
+    - ``decline_terms.csv`` — greenery × time slopes (longitudinal runs).
+    - ``exposure_response.csv`` — the per-IQR effect, the quantile gradient
+      against the lowest group with its test for trend, and the spline test of
+      departure from linearity, in the form the greenspace literature reports.
+    - ``exposure_response_curve.csv`` — the fitted spline curve, ready to plot.
     """
     import json
 
@@ -1253,6 +1258,111 @@ def _write_fusion_outputs(
         _emit_csv(
             f"decline_terms{sfx}.csv", [dict(r) for r in decline_terms["terms"]]
         )
+
+    # ── exposure_response.csv (per-IQR, quartiles, non-linearity) ─
+    # One tidy table rather than three files: the rows are all statements
+    # about the same fitted exposure–response, and a reader comparing them
+    # against a published table wants them side by side.
+    er_report = (cgi_bundle or {}).get("exposure_response") or None
+    if er_report:
+        er_rows: list[dict] = []
+        design = er_report.get("design")
+        coding = er_report.get("coding") or {}
+        if coding:
+            # Which level the logistic models called the event. Carried in the
+            # table because a 1=Yes/2=No survey column inverts every odds ratio
+            # below without changing anything else about how they look.
+            er_rows.append(
+                {
+                    "term": "modelled_event_level",
+                    "design": design,
+                    "detail": (
+                        f"event={_f(coding.get('modelled_level'))} vs "
+                        f"reference={_f(coding.get('reference_level'))}"
+                        + ("  CHECK CODEBOOK" if coding.get("suspicious") else "")
+                    ),
+                    "estimate": None, "std_error": None,
+                    "ci_low": None, "ci_high": None,
+                    "odds_ratio": None, "or_ci_low": None, "or_ci_high": None,
+                    "p_value": None,
+                }
+            )
+        per_iqr = er_report.get("per_iqr") or {}
+        if per_iqr.get("estimate") is not None:
+            er_rows.append(
+                {
+                    "term": "per_iqr",
+                    "design": design,
+                    "detail": f"IQR={_f(per_iqr.get('iqr'))}",
+                    "estimate": _f(per_iqr.get("estimate")),
+                    "std_error": _f(per_iqr.get("std_error")),
+                    "ci_low": _f(per_iqr.get("ci_low")),
+                    "ci_high": _f(per_iqr.get("ci_high")),
+                    "odds_ratio": _f(per_iqr.get("odds_ratio")),
+                    "or_ci_low": _f(per_iqr.get("or_ci_low")),
+                    "or_ci_high": _f(per_iqr.get("or_ci_high")),
+                    "p_value": None,
+                }
+            )
+        quartiles = er_report.get("quartiles") or {}
+        for row in quartiles.get("contrasts") or []:
+            er_rows.append(
+                {
+                    "term": f"quantile_{row.get('group')}",
+                    "design": design,
+                    "detail": (
+                        f"vs group {quartiles.get('reference_group')}, "
+                        f"n={row.get('n')}"
+                    ),
+                    "estimate": _f(row.get("coef")),
+                    "std_error": _f(row.get("std_error")),
+                    "ci_low": None,
+                    "ci_high": None,
+                    "odds_ratio": _f(row.get("odds_ratio")),
+                    "or_ci_low": _f(row.get("or_ci_low")),
+                    "or_ci_high": _f(row.get("or_ci_high")),
+                    "p_value": _f(row.get("p_value")),
+                }
+            )
+        if quartiles.get("trend_p") is not None:
+            er_rows.append(
+                {
+                    "term": "quantile_trend",
+                    "design": design,
+                    "detail": f"{quartiles.get('n_groups')} groups",
+                    "estimate": None, "std_error": None,
+                    "ci_low": None, "ci_high": None,
+                    "odds_ratio": None, "or_ci_low": None, "or_ci_high": None,
+                    "p_value": _f(quartiles.get("trend_p")),
+                }
+            )
+        nonlinear = er_report.get("nonlinearity") or {}
+        if nonlinear.get("nonlinearity_p") is not None:
+            er_rows.append(
+                {
+                    "term": "nonlinearity_wald",
+                    "design": design,
+                    "detail": (
+                        f"spline df={nonlinear.get('df')}, "
+                        f"chi2={_f(nonlinear.get('wald_chi2'))} on "
+                        f"{nonlinear.get('wald_df')} df"
+                    ),
+                    "estimate": _f(nonlinear.get("linear_coef")),
+                    "std_error": None, "ci_low": None, "ci_high": None,
+                    "odds_ratio": None, "or_ci_low": None, "or_ci_high": None,
+                    "p_value": _f(nonlinear.get("nonlinearity_p")),
+                }
+            )
+        _emit_csv(f"exposure_response{sfx}.csv", er_rows)
+        curve = (nonlinear or {}).get("curve")
+        if curve:
+            _emit_csv(
+                f"exposure_response_curve{sfx}.csv",
+                [
+                    {"exposure": x, "effect": y}
+                    for x, y in zip(curve["exposure"], curve["effect"])
+                ],
+            )
 
     # ── results_summary.json (master manifest) ──────────────────
     studies_manifest: dict[str, dict] = {}
@@ -1710,6 +1820,7 @@ def run_fusion(
     report_effects_bootstrap: int = 2000,
     report_effects_permutations: int = 1000,
     report_paired_bootstrap: int = 2000,
+    exposure_iqr: float | None = None,
 ) -> dict:
     """Run a fusion job: stability-selection tuning + held-out test scoring.
 
@@ -1849,6 +1960,7 @@ def run_fusion(
             "report_ci_bootstrap": int(report_ci_n),
             "report_effects_bootstrap": int(report_effects_bootstrap),
             "report_effects_permutations": int(report_effects_permutations),
+            "exposure_iqr": exposure_iqr,
             "report_paired_bootstrap": int(report_paired_bootstrap),
             "cache_metrics": bool(cache_metrics),
             "resume_existing_study": bool(resume_existing_study),
@@ -2954,6 +3066,23 @@ def run_fusion(
                         f"[{label}] Decline-terms computation failed: {exc}",
                     )
 
+            # Exposure–response shapes on the winning composite: the effect per
+            # interquartile-range increase, the quartile gradient against the
+            # lowest group, and a spline test of whether the linear form the
+            # search assumed is right. This is the form the greenspace
+            # literature reports, so it is what a replication is read against.
+            exposure_response_report: dict | None = None
+            try:
+                exposure_response_report = engine.compute_exposure_response(
+                    params=averaged_params or best_params,
+                    iqr=exposure_iqr,
+                )
+            except Exception as exc:
+                _log_fusion(
+                    "WARN",
+                    f"[{label}] Exposure-response computation failed: {exc}",
+                )
+
             bundle = {
                 "best_params": best_params,
                 "averaged_params": averaged_params,
@@ -2966,6 +3095,7 @@ def run_fusion(
                 "subset_scores": cgi_subset_scores,
                 "covariate_impact": covariate_impact,
                 "decline_terms": decline_terms,
+                "exposure_response": exposure_response_report,
                 "target_feature": target_feature,
                 # Run details persisted so the results panel survives a disk
                 # reload (when the live engine is gone): user-facing covariate

@@ -80,8 +80,27 @@ def _warn_once(key: str, message: str) -> None:
 # Public set of metric names this module knows how to score; engine-level
 # validation should compare against it before calling :func:`score`.
 SUPPORTED_METRICS: frozenset[str] = frozenset(
-    {"partial_distance_corr", "distance_corr", "spearman", "r2", "nrmse", "mutual_info"}
+    {
+        "partial_distance_corr",
+        "distance_corr",
+        "spearman",
+        "r2",
+        "nrmse",
+        "mutual_info",
+        # Binary outcomes: logistic regression of a 0/1 target on the composite
+        # plus covariates. A Gaussian fit to a dichotomous column is a linear
+        # probability model whose standard errors are wrong in a known
+        # direction, so the greenspace literature's dichotomised outcomes get
+        # their own scorer. See :mod:`geofuse.binary_longitudinal`.
+        "logit_tstat",
+        "logit_coef",
+    }
 )
+
+# Metrics that require the target to hold exactly two distinct values. Selected
+# on a continuous outcome they return the degenerate score, so the UI and the
+# runner check this set before offering them.
+BINARY_ONLY_METRICS: frozenset[str] = frozenset({"logit_tstat", "logit_coef"})
 
 # The default cross-sectional objective: partial distance correlation captures
 # linear and nonlinear association while conditioning on covariates nonlinearly.
@@ -91,7 +110,14 @@ DEFAULT_METRIC: str = "partial_distance_corr"
 # needs a uniform direction for ranking. ``nrmse`` is the only one where lower
 # is better.
 HIGHER_IS_BETTER: frozenset[str] = frozenset(
-    {"partial_distance_corr", "distance_corr", "spearman", "r2", "mutual_info"}
+    {
+        "partial_distance_corr",
+        "distance_corr",
+        "spearman",
+        "r2",
+        "mutual_info",
+        "logit_tstat",
+    }
 )
 
 # Metrics for which the covariate-adjusted score *ignores* covariates. The UI
@@ -124,6 +150,8 @@ _DEGENERATE_SCORE: dict[str, float] = {
     "r2": 0.0,
     "nrmse": float("inf"),
     "mutual_info": 0.0,
+    "logit_tstat": 0.0,
+    "logit_coef": 0.0,
 }
 
 
@@ -527,6 +555,17 @@ def score(
             z = _stack(cov, sb)
             s = partial_distance_correlation(t, c, z, cache=pdcor_cache)
             return (s, 1.0) if return_pvalue else s
+
+        if metric in BINARY_ONLY_METRICS:
+            # Logistic regression enters covariates and the spatial smooth as
+            # design columns rather than residualizing on them: for a non-linear
+            # link, adjusting the outcome and the exposure separately is not the
+            # same model as conditioning inside one fit.
+            from . import binary_longitudinal
+
+            return binary_longitudinal.score_logit(
+                metric, t, c, _stack(cov, sb), return_pvalue=return_pvalue
+            )
 
         # Covariate basis for the residualizing metrics (spline-expanded when
         # asked). Deliberately below the pdcor branch — that metric (and

@@ -70,7 +70,17 @@ CROSS_SECTIONAL_METRICS: tuple[str, ...] = (
     "rmse",
     "mutual_info",
 )
-SUPPORTED_SCORING_METRICS: tuple[str, ...] = MIXEDLM_METRICS + CROSS_SECTIONAL_METRICS
+
+# Binary-outcome panel metrics. ``MixedLM`` is Gaussian-only, so a dichotomous
+# outcome (a CES-D screen, a diagnosis) goes through GEE with an exchangeable
+# working correlation clustered on the entity — a population-averaged log-odds
+# ratio with cluster-robust standard errors. See
+# :mod:`geofuse.binary_longitudinal`.
+GEE_LOGIT_METRICS: tuple[str, ...] = ("gee_logit_tstat", "gee_logit_coef")
+
+SUPPORTED_SCORING_METRICS: tuple[str, ...] = (
+    MIXEDLM_METRICS + GEE_LOGIT_METRICS + CROSS_SECTIONAL_METRICS
+)
 
 # Channels that participate in the per-wave greenery file assignment. Terrain
 # is GVI Cityscapes class 9 (horizontal flat greenery), not DEM; it varies
