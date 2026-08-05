@@ -25,6 +25,7 @@ from shapely.geometry import box
 from sklearn.model_selection import train_test_split
 
 from . import (
+    JobCancelled,
     cgi_formulas,
     longitudinal,
     metric_sampling,
@@ -4512,6 +4513,10 @@ class MetricFusionEngine:
             f"over {len(present_keys)} {self._temporal_key_noun()}(s).",
         )
         for group_keys in groups.values():
+            # One file set per iteration, so cancel lands within a single
+            # wave's probe rather than after the whole ladder.
+            if self._cancel_callback is not None and self._cancel_callback():
+                raise JobCancelled("Coverage probe cancelled by user.")
             row_mask = (
                 waves == group_keys[0]
                 if len(group_keys) == 1
@@ -5359,6 +5364,12 @@ class MetricFusionEngine:
         Street-view aggregation parameters are shared for veg and terrain; NDVI
         uses separate stat / percentile choices.
         """
+        # A cancelled job stops paying for trials it will never report. The
+        # study-level callback stops the sampler from queueing more; this
+        # prunes the ones already dispatched to the pool.
+        if self._cancel_callback is not None and self._cancel_callback():
+            raise optuna.TrialPruned("Cancelled by user")
+
         _t0 = time.perf_counter()
         try:
             return self._objective_inner(trial, metric)
@@ -6385,6 +6396,7 @@ class MetricFusionEngine:
                 else None
             ),
             groups=groups,
+            cancel_callback=self._cancel_callback,
         )
         ci["n"] = n
         return ci
@@ -6921,6 +6933,7 @@ class MetricFusionEngine:
                     seed=int(sub_seed),
                     covariates=cov,
                     replicate_scorer_factory=rep_factory,
+                    cancel_callback=self._cancel_callback,
                 )
                 out["score"] = ci.get("observed")
                 out["lower"] = ci.get("lower")
@@ -6938,6 +6951,7 @@ class MetricFusionEngine:
                         seed=int(sub_seed) + 7,
                         covariates=cov,
                         surrogate_scorer_factory=sur_factory,
+                        cancel_callback=self._cancel_callback,
                     )
                     out["p_value"] = perm.get("p_value")
                     if out["score"] is None:
@@ -7035,6 +7049,11 @@ class MetricFusionEngine:
     # standalone. Percentile bounds get lumpier as these fall — at 100
     # replicates the 2.5% bound sits between the 2nd and 3rd order statistic.
     _MIXEDLM_REPORT_BOOTSTRAP_CAP = 100
+
+    # Replicate stride between cancel polls in the paired bootstrap. Each
+    # replicate is a MixedLM refit, so a far shorter stride than the array
+    # scorers in ``statistical_testing`` still costs nothing measurable.
+    _PAIRED_CANCEL_POLL_EVERY = 16
     _MIXEDLM_TEST_CI_BOOTSTRAP_CAP = 150
 
     def _evaluate_effects_mixedlm(
@@ -7264,6 +7283,12 @@ class MetricFusionEngine:
         n_boot = max(50, min(int(n_bootstrap), self._MIXEDLM_REPORT_BOOTSTRAP_CAP))
         diffs = np.empty(n_boot, dtype=np.float64)
         for i in range(n_boot):
+            if (
+                self._cancel_callback is not None
+                and i % self._PAIRED_CANCEL_POLL_EVERY == 0
+                and self._cancel_callback()
+            ):
+                raise JobCancelled("Paired bootstrap cancelled by user.")
             draw = rng.integers(0, len(uniq), size=len(uniq))
             idx = np.concatenate([group_rows[k] for k in draw])
             # A repeated entity has to form independent groups.
@@ -8320,6 +8345,17 @@ class MetricFusionEngine:
                     except Exception:
                         pass
 
+                def _stop_if_cancelled(_study, _trial):
+                    """End this subsample's study as soon as cancel is seen.
+
+                    ``optimize`` is otherwise uninterruptible for the whole
+                    ``n_trials_per_bootstrap`` budget, which is the difference
+                    between a cancel that lands in seconds and one that lands
+                    a bootstrap later.
+                    """
+                    if cancel_callback is not None and cancel_callback():
+                        _study.stop()
+
                 _search_jobs = self._search_n_jobs(metric)
                 _search_t0 = time.perf_counter()
                 try:
@@ -8329,7 +8365,7 @@ class MetricFusionEngine:
                         n_jobs=_search_jobs,
                         show_progress_bar=False,
                         catch=(Exception,),
-                        callbacks=[_trial_progress],
+                        callbacks=[_trial_progress, _stop_if_cancelled],
                     )
                 except Exception:
                     # Catastrophic study failure — skip this subsample and

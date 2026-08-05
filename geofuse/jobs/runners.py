@@ -30,6 +30,7 @@ import numpy as np
 import pandas as pd
 import rasterio
 
+from geofuse import JobCancelled
 from geofuse.crs_utils import (
     default_geotiff_creation_options,
     raster_geographic_bounds,
@@ -2059,6 +2060,11 @@ def run_fusion(
                     ctx.wait_while_paused()
                 return ctx.is_cancelled()
 
+            # Give the engine the same predicate so its inner loops (coverage
+            # probe, Optuna study, reporting resamples) can answer a cancel
+            # without waiting for the next stage boundary.
+            engine._cancel_callback = cancel_check
+
             stage(skey("load_metrics"), RUNNING)
             if longitudinal_spec is None:
                 if shared_metric_data is None:
@@ -3065,6 +3071,14 @@ def run_fusion(
 
         ctx.progress(value=1.0, status_text="Completed")
         return {"output_paths": output_paths}
+
+    except JobCancelled:
+        # An engine loop answered the cancel mid-stage. Whatever earlier stages
+        # wrote is already on disk and in the ledger, so this returns the way
+        # the stage-boundary cancels do; the executor reads the cancel flag and
+        # files the job as cancelled rather than failed.
+        _log_fusion("WARN", "Fusion job cancelled by user.")
+        return {"output_paths": []}
 
     finally:
         if target_cleanup_dir:

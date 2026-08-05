@@ -20,6 +20,17 @@ if os.name == "nt" and os.environ.get("GEOFUSE_TORCH_PRELOAD") == "1":
         pass
 
 
+class JobCancelled(BaseException):
+    """Raised by an engine loop that saw the job's cancel flag.
+
+    Derived from ``BaseException``, not ``Exception``, for the same reason
+    ``KeyboardInterrupt`` is: the engine and runner wrap most work in
+    ``except Exception`` blocks that log a warning and carry on with a
+    degraded result. A cancel must travel through those untouched and reach
+    the runner's own handler, which ends the run.
+    """
+
+
 def is_ready():
     """Return True if CUDA is available (False if torch is missing)."""
     try:

@@ -16,6 +16,14 @@ from __future__ import annotations
 
 import numpy as np
 
+from geofuse import JobCancelled
+
+# Replicate stride between ``cancel_callback`` polls. The resample loops here
+# run tens of thousands of iterations, so polling every one would show up in
+# the timings; this keeps cancel latency to a fraction of a second on any
+# replicate cheap enough to be worth running.
+_CANCEL_POLL_EVERY = 64
+
 # ────────────────────────────────────────────────────────────────────
 # Multicollinearity diagnostics
 # ────────────────────────────────────────────────────────────────────
@@ -199,6 +207,7 @@ def bootstrap_score_ci(
     covariates: np.ndarray | None = None,
     replicate_scorer_factory=None,
     groups: np.ndarray | None = None,
+    cancel_callback=None,
 ) -> dict:
     """Bootstrap CI on ``score_fn(target, prediction)``.
 
@@ -334,6 +343,9 @@ def bootstrap_score_ci(
         boot_idx = None
         boot_groups = rng.integers(0, n_groups, size=(n_bootstrap, n_groups))
     for i in range(n_bootstrap):
+        if cancel_callback is not None and i % _CANCEL_POLL_EVERY == 0:
+            if cancel_callback():
+                raise JobCancelled("Bootstrap CI cancelled by user.")
         if group_row_indices is None:
             idx = boot_idx[i]
         else:
@@ -447,6 +459,7 @@ def permutation_pvalue(
     seed: int = 42,
     covariates: np.ndarray | None = None,
     surrogate_scorer_factory=None,
+    cancel_callback=None,
 ) -> dict:
     """One-sided permutation p-value for ``score_fn(target, prediction)``.
 
@@ -541,6 +554,9 @@ def permutation_pvalue(
     rng = np.random.default_rng(seed)
     null = np.empty(int(n_perm), dtype=np.float64)
     for i in range(int(n_perm)):
+        if cancel_callback is not None and i % _CANCEL_POLL_EVERY == 0:
+            if cancel_callback():
+                raise JobCancelled("Permutation test cancelled by user.")
         idx = rng.permutation(n)
         try:
             null[i] = _perm_score(idx)
