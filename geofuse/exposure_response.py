@@ -287,6 +287,210 @@ def _natural_cubic_basis(x: np.ndarray, df: int = SPLINE_DF) -> np.ndarray | Non
     return basis if basis.ndim == 2 and basis.shape[1] >= 2 else None
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Effect modification
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _simple_slope(
+    fitted: dict, names: Sequence[str], main: str, products: Sequence[tuple[str, float]]
+):
+    """Greenery slope at one moderator level, with its standard error.
+
+    The slope is ``b_main + sum(w * b_product)``; its variance needs the full
+    coefficient covariance, not just the standard errors, because the main and
+    product terms are correlated by construction. Returns ``None`` when the
+    fitter did not supply a covariance matrix.
+    """
+    cov_entry = fitted.get(COV_KEY)
+    if cov_entry is None:
+        return None
+    order, cov_matrix = cov_entry
+    cov_matrix = np.asarray(cov_matrix, dtype=np.float64)
+
+    contrast = np.zeros(len(order))
+    contrast[order.index(main)] = 1.0
+    for term, weight in products:
+        contrast[order.index(term)] += weight
+
+    beta = np.array([fitted[nm][0] for nm in order], dtype=np.float64)
+    estimate = float(contrast @ beta)
+    variance = float(contrast @ cov_matrix @ contrast)
+    return estimate, float(np.sqrt(max(variance, 0.0)))
+
+
+def moderation_terms(
+    exposure: np.ndarray,
+    moderator: np.ndarray,
+    fitter: Fitter,
+    covariates: np.ndarray | None = None,
+    *,
+    categorical: bool = False,
+    logistic: bool = False,
+    moderator_name: str = "moderator",
+) -> dict | None:
+    """Test whether the greenery effect differs across levels of *moderator*.
+
+    Fits ``outcome ~ greenery + moderator + greenery x moderator + covariates``
+    and reports three things, which is what the greenspace papers report when
+    they claim moderation:
+
+    * the **interaction** coefficients and a joint Wald test over them — the
+      formal "does the effect differ" question;
+    * **simple slopes**, the greenery effect evaluated at each level of a
+      categorical moderator, or at mean-SD / mean / mean+SD of a continuous
+      one, each with a standard error that accounts for the correlation
+      between the main and product terms;
+    * the **main effect**, which after centring is the greenery slope at the
+      average moderator value rather than at a meaningless zero.
+
+    A continuous moderator is mean-centred so the greenery main effect stays
+    interpretable. A categorical one is expanded drop-first, so the main effect
+    is the slope in the reference level.
+
+    This is a reporting-stage analysis run on the winning composite; the search
+    still optimises the greenery association, exactly as the source papers fit
+    one pre-specified model rather than tuning against the interaction.
+    """
+    from scipy import stats
+
+    g = np.asarray(exposure, dtype=np.float64)
+    m_raw = np.asarray(moderator, dtype=np.float64)
+    n = len(g)
+    finite = np.isfinite(g) & np.isfinite(m_raw)
+    if finite.sum() < 20:
+        return None
+
+    columns: list[np.ndarray] = [np.ones(n), g]
+    names: list[str] = ["intercept", "greenery"]
+    products: list[tuple[str, float]] = []
+    levels: list[float] = []
+
+    if categorical:
+        levels = sorted(np.unique(m_raw[np.isfinite(m_raw)]).tolist())
+        if len(levels) < 2 or len(levels) > 12:
+            return None
+        reference = levels[0]
+        for i, lv in enumerate(levels[1:], start=1):
+            indicator = (m_raw == lv).astype(np.float64)
+            columns.append(indicator)
+            names.append(f"mod_{i}")
+            columns.append(indicator * g)
+            names.append(f"greenery_x_mod_{i}")
+        centre = float(reference)
+    else:
+        centre = float(np.nanmean(m_raw[np.isfinite(m_raw)]))
+        centred = m_raw - centre
+        columns.append(centred)
+        names.append("mod")
+        columns.append(centred * g)
+        names.append("greenery_x_mod")
+
+    if covariates is not None and np.size(covariates):
+        cov = np.asarray(covariates, dtype=np.float64).reshape(n, -1)
+        for j in range(cov.shape[1]):
+            columns.append(cov[:, j])
+            names.append(f"cov{j}")
+
+    design = np.column_stack(columns)
+    mask = np.isfinite(design).all(axis=1)
+    if mask.sum() < 20:
+        return None
+    fitted = fitter(design, names)
+    if fitted is None:
+        return None
+
+    interaction_names = [nm for nm in names if nm.startswith("greenery_x_mod")]
+    beta_int = np.array([fitted[nm][0] for nm in interaction_names])
+
+    # Joint Wald test across every interaction term — the single "is there
+    # moderation" number. For a two-level moderator this is the square of the
+    # one interaction's z.
+    stat, dof = float("nan"), len(interaction_names)
+    cov_entry = fitted.get(COV_KEY)
+    if cov_entry is not None:
+        order, cov_matrix = cov_entry
+        idx = [order.index(nm) for nm in interaction_names]
+        sub = np.asarray(cov_matrix)[np.ix_(idx, idx)]
+        try:
+            stat = float(beta_int @ np.linalg.solve(sub, beta_int))
+        except np.linalg.LinAlgError:
+            stat = float(beta_int @ np.linalg.pinv(sub) @ beta_int)
+    interaction_p = (
+        float(stats.chi2.sf(stat, dof)) if np.isfinite(stat) else float("nan")
+    )
+
+    # ── Simple slopes ────────────────────────────────────────────
+    slopes: list[dict] = []
+
+    def _record(label: str, value, products_at: list[tuple[str, float]], count):
+        got = _simple_slope(fitted, names, "greenery", products_at)
+        if got is None:
+            return
+        est, se = got
+        z = est / se if se > 0 else 0.0
+        row = {
+            "level": label,
+            "moderator_value": value,
+            "n": count,
+            "slope": est,
+            "std_error": se,
+            "z": z,
+            "p_value": float(2.0 * stats.norm.sf(abs(z))),
+            "ci_low": est - 1.959964 * se,
+            "ci_high": est + 1.959964 * se,
+        }
+        if logistic:
+            row["odds_ratio"] = float(np.exp(est))
+            row["or_ci_low"] = float(np.exp(row["ci_low"]))
+            row["or_ci_high"] = float(np.exp(row["ci_high"]))
+        slopes.append(row)
+
+    if categorical:
+        _record(
+            f"{moderator_name}={levels[0]:g} (reference)",
+            float(levels[0]),
+            [],
+            int((m_raw == levels[0]).sum()),
+        )
+        for i, lv in enumerate(levels[1:], start=1):
+            _record(
+                f"{moderator_name}={lv:g}",
+                float(lv),
+                [(f"greenery_x_mod_{i}", 1.0)],
+                int((m_raw == lv).sum()),
+            )
+    else:
+        sd = float(np.nanstd(m_raw[np.isfinite(m_raw)]))
+        for label, offset in (("mean - 1 SD", -sd), ("mean", 0.0), ("mean + 1 SD", sd)):
+            _record(
+                f"{moderator_name} {label}",
+                centre + offset,
+                [("greenery_x_mod", offset)],
+                int(finite.sum()),
+            )
+
+    return {
+        "moderator": moderator_name,
+        "categorical": bool(categorical),
+        "centred_at": centre,
+        "n": int(mask.sum()),
+        "interaction_wald_chi2": stat,
+        "interaction_df": dof,
+        "interaction_p": interaction_p,
+        "interaction_terms": [
+            {
+                "term": nm,
+                "coef": fitted[nm][0],
+                "std_error": fitted[nm][1],
+                "p_value": fitted[nm][2],
+            }
+            for nm in interaction_names
+        ],
+        "simple_slopes": slopes,
+    }
+
+
 def _orthogonalise(block: np.ndarray, against: np.ndarray, tol: float = 1e-8):
     """Columns of *block* with the span of *against* projected out.
 

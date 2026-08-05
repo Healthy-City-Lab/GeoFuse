@@ -261,3 +261,179 @@ class TestEngineRouting(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestSelectionGranularity(unittest.TestCase):
+    """The three-stage weight/radius/weight ladder and its defaults."""
+
+    def test_default_bins_are_coarse_enough_to_be_selectable(self):
+        from geofuse import cgi_formulas as cf
+
+        self.assertEqual(cf.WEIGHT_BIN_PCT, 20)
+        self.assertLess(cf.WEIGHT_REFINE_BIN_PCT, cf.WEIGHT_BIN_PCT)
+        # The audit's measured threshold: at 66 cells a strong planted signal
+        # is recovered 0 % of the time, at 21 cells it is recovered always.
+        self.assertLessEqual(cf.weight_cell_count("weighted_average"), 21)
+        self.assertLessEqual(cf.weight_cell_count("synergy"), 56)
+
+    def test_refinement_selects_a_subset_of_the_coarse_cell(self):
+        """The invariant that makes stage 3 safe.
+
+        Cell *labels* do not nest across bin widths — ``_snap_weight_buckets``
+        rounds to nearest, so a 10 % and a 20 % grid have unaligned boundaries.
+        What has to hold is the membership property: re-binning the trials that
+        are already inside the winning coarse cell partitions exactly those
+        trials, so the refined winner is a subset of them and the final weights
+        stay a convex combination of trials the coarse cell contained.
+        """
+        from geofuse import cgi_formulas as cf
+
+        rng = np.random.default_rng(0)
+        trials = []
+        for _ in range(4000):
+            w = rng.integers(0, 21, 3) * 5
+            trials.append(
+                {
+                    "veg_weight": int(w[0]),
+                    "terrain_weight": int(w[1]),
+                    "ndvi_weight": int(w[2]),
+                }
+            )
+        by_coarse: dict[tuple, list] = {}
+        for t in trials:
+            by_coarse.setdefault(
+                cf.weight_cell_key("weighted_average", t, 20), []
+            ).append(t)
+
+        # Take the busiest coarse cell and re-bin only its members.
+        members = max(by_coarse.values(), key=len)
+        fine: dict[tuple, list] = {}
+        for t in members:
+            fine.setdefault(cf.weight_cell_key("weighted_average", t, 10), []).append(t)
+
+        self.assertEqual(sum(len(v) for v in fine.values()), len(members))
+        for group in fine.values():
+            for t in group:
+                self.assertIn(t, members)
+
+    def test_a_coarse_cell_really_does_contain_several_fine_cells(self):
+        """Otherwise stage 3 would be a no-op and the coarsening a pure loss."""
+        from collections import Counter
+
+        from geofuse import cgi_formulas as cf
+
+        rng = np.random.default_rng(1)
+        by_coarse: dict[tuple, set] = {}
+        for _ in range(2000):
+            w = rng.integers(0, 21, 3) * 5
+            params = {
+                "veg_weight": int(w[0]),
+                "terrain_weight": int(w[1]),
+                "ndvi_weight": int(w[2]),
+            }
+            by_coarse.setdefault(
+                cf.weight_cell_key("weighted_average", params, 20), set()
+            ).add(cf.weight_cell_key("weighted_average", params, 10))
+        counts = Counter(len(v) for v in by_coarse.values())
+        self.assertGreater(max(counts), 1)
+        self.assertGreaterEqual(max(len(v) for v in by_coarse.values()), 4)
+
+
+class TestModeration(unittest.TestCase):
+    """Effect modification: the interaction test and the simple slopes."""
+
+    @staticmethod
+    def _categorical(seed=0, slopes=(-0.2, -0.5, -0.9), n=9000):
+        rng = np.random.default_rng(seed)
+        cov = rng.normal(size=(n, 3))
+        g = rng.normal(size=n)
+        m = rng.integers(0, len(slopes), n).astype(float)
+        truth = np.array([slopes[int(v)] for v in m])
+        y = truth * g + 0.3 * m + cov @ np.array([0.4, -0.2, 0.1]) + rng.normal(size=n)
+        return y, g, m, cov
+
+    def test_simple_slopes_match_separate_stratified_fits(self):
+        """The claim that makes this worth having over running three jobs."""
+        y, g, m, cov = self._categorical()
+        out = er.moderation_terms(
+            g, m, er.make_ols_fitter(y), cov, categorical=True, moderator_name="M"
+        )
+        self.assertIsNotNone(out)
+        by_level = {r["moderator_value"]: r["slope"] for r in out["simple_slopes"]}
+        for level in (0.0, 1.0, 2.0):
+            mask = m == level
+            fit = er.make_ols_fitter(y[mask])(
+                np.column_stack([np.ones(int(mask.sum())), g[mask], cov[mask]]),
+                ["intercept", "greenery", "c0", "c1", "c2"],
+            )
+            self.assertAlmostEqual(by_level[level], fit["greenery"][0], places=2)
+
+    def test_recovers_known_slopes(self):
+        slopes = (-0.2, -0.5, -0.9)
+        y, g, m, cov = self._categorical(slopes=slopes)
+        out = er.moderation_terms(
+            g, m, er.make_ols_fitter(y), cov, categorical=True, moderator_name="M"
+        )
+        for row in out["simple_slopes"]:
+            self.assertAlmostEqual(
+                row["slope"], slopes[int(row["moderator_value"])], delta=0.05
+            )
+        self.assertLess(out["interaction_p"], 1e-10)
+
+    def test_does_not_fire_when_the_slope_is_constant(self):
+        rng = np.random.default_rng(3)
+        n = 9000
+        cov = rng.normal(size=(n, 3))
+        g = rng.normal(size=n)
+        m = rng.integers(0, 3, n).astype(float)
+        y = -0.5 * g + 0.3 * m + cov @ np.array([0.4, -0.2, 0.1]) + rng.normal(size=n)
+        out = er.moderation_terms(
+            g, m, er.make_ols_fitter(y), cov, categorical=True, moderator_name="M"
+        )
+        self.assertGreater(out["interaction_p"], 0.01)
+
+    def test_continuous_moderator_is_centred_and_read_at_one_sd(self):
+        rng = np.random.default_rng(4)
+        n = 9000
+        g = rng.normal(size=n)
+        m = rng.normal(size=n)
+        y = (-0.5 - 0.4 * m) * g + 0.2 * m + rng.normal(size=n)
+        out = er.moderation_terms(
+            g, m, er.make_ols_fitter(y), None, categorical=False, moderator_name="Mc"
+        )
+        self.assertFalse(out["categorical"])
+        self.assertAlmostEqual(out["centred_at"], float(np.mean(m)), places=6)
+        self.assertEqual(len(out["simple_slopes"]), 3)
+        for row in out["simple_slopes"]:
+            expected = -0.5 - 0.4 * row["moderator_value"]
+            self.assertAlmostEqual(row["slope"], expected, delta=0.05)
+
+    def test_binary_outcome_reports_odds_ratios(self):
+        rng = np.random.default_rng(5)
+        n = 12000
+        g = rng.normal(size=n)
+        m = rng.integers(0, 2, n).astype(float)
+        eta = (-0.3 - 0.6 * m) * g + 0.2 * m
+        y = (rng.uniform(size=n) < 1.0 / (1.0 + np.exp(-eta))).astype(float)
+        out = er.moderation_terms(
+            g, m, bl.make_logit_fitter(y), None,
+            categorical=True, logistic=True, moderator_name="sex",
+        )
+        self.assertIsNotNone(out)
+        for row in out["simple_slopes"]:
+            self.assertIn("odds_ratio", row)
+            self.assertAlmostEqual(
+                row["odds_ratio"], float(np.exp(row["slope"])), places=6
+            )
+        self.assertLess(out["interaction_p"], 0.01)
+
+    def test_single_level_moderator_is_declined(self):
+        rng = np.random.default_rng(6)
+        n = 500
+        g = rng.normal(size=n)
+        self.assertIsNone(
+            er.moderation_terms(
+                g, np.ones(n), er.make_ols_fitter(g + rng.normal(size=n)),
+                None, categorical=True,
+            )
+        )

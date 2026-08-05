@@ -126,6 +126,7 @@ output_results/fusion/<YYYYMMDDTHHMMSS>__<short_job_id>/
     ├── decline_terms.csv               ← greenspace × time terms (longitudinal mode)
     ├── exposure_response.csv           ← per-IQR effect, quantile gradient, non-linearity test
     ├── exposure_response_curve.csv     ← fitted spline curve, ready to plot
+    ├── moderation.csv                  ← effect modification: interaction test + simple slopes
     ├── aic_bic.json                    ← CGI-vs-standalone verdict (if standalones ran)
     ├── collinearity.json               ← VIF report (if requested)
     ├── mixedlm_metrics*.csv            ← four MixedLM metrics (longitudinal mode)
@@ -144,6 +145,7 @@ output_results/fusion/<YYYYMMDDTHHMMSS>__<short_job_id>/
 - **Mixed-effects objectives report a Wald p, not a permutation p.** The greenery fixed effect's Wald test comes from the fit itself; a permutation analogue would have to be resampled and refit per entity, which the cluster bootstrap already covers. The report labels which one it is rather than assuming.
 - **`mixedlm_tstat` intervals are folded.** The metric is `|t|`, so its confidence interval sits above zero by construction and is not a significance statement. The signed greenery coefficient and its interval are reported alongside — that is the one that can straddle zero.
 - **`exposure_response.csv`** restates the winning composite's effect in the shapes the greenspace literature publishes: the effect per interquartile-range increase (with an odds ratio when the outcome is binary), the gradient across exposure quantiles against the lowest group plus a test for trend, and a joint Wald test of departure from linearity from an orthogonalised spline. A `modelled_event_level` row records which of a binary outcome's two values was treated as the event — a survey column coded `1=Yes, 2=No` inverts every odds ratio in the table, and this is where that shows up. **`exposure_response_curve.csv`** is the fitted curve over the exposure range, centred at the median.
+- **`moderation.csv`** answers "is the greenery effect different for different people". One `simple_slope` row per moderator level (the greenery effect *within* that group, with its own CI and — for a binary outcome — odds ratio), one `interaction` row per product term, and one `interaction_joint_test` row carrying the single p-value for "does the effect differ at all". Selecting a column as an effect modifier does **not** adjust for it; list it as a covariate too if you want both.
 - **`decline_terms.csv`** holds the greenspace × time slopes: `overall`, plus the between-person (average exposure) and within-person (exposure change) decomposition when requested. A term that is not estimable — a within-person slope where the exposure never varies over time — is reported as `NaN`, never as a fitted value.
 
 ### Reusable caches (`output_results/fusion_cache/`)

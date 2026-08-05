@@ -1354,6 +1354,62 @@ def _write_fusion_outputs(
                 }
             )
         _emit_csv(f"exposure_response{sfx}.csv", er_rows)
+
+    # ── moderation.csv (effect modification) ────────────────────
+    # One row per simple slope plus one per interaction term, so a reader can
+    # see both "does it differ" and "what is the effect in each group" without
+    # opening two files.
+    moderation = (cgi_bundle or {}).get("moderation") or []
+    if moderation:
+        mod_rows: list[dict] = []
+        for block in moderation:
+            name = block.get("moderator")
+            for row in block.get("simple_slopes") or []:
+                mod_rows.append(
+                    {
+                        "moderator": name,
+                        "row_type": "simple_slope",
+                        "level": row.get("level"),
+                        "moderator_value": _f(row.get("moderator_value")),
+                        "n": row.get("n"),
+                        "estimate": _f(row.get("slope")),
+                        "std_error": _f(row.get("std_error")),
+                        "ci_low": _f(row.get("ci_low")),
+                        "ci_high": _f(row.get("ci_high")),
+                        "odds_ratio": _f(row.get("odds_ratio")),
+                        "p_value": _f(row.get("p_value")),
+                    }
+                )
+            for row in block.get("interaction_terms") or []:
+                mod_rows.append(
+                    {
+                        "moderator": name,
+                        "row_type": "interaction",
+                        "level": row.get("term"),
+                        "moderator_value": None,
+                        "n": block.get("n"),
+                        "estimate": _f(row.get("coef")),
+                        "std_error": _f(row.get("std_error")),
+                        "ci_low": None, "ci_high": None, "odds_ratio": None,
+                        "p_value": _f(row.get("p_value")),
+                    }
+                )
+            mod_rows.append(
+                {
+                    "moderator": name,
+                    "row_type": "interaction_joint_test",
+                    "level": (
+                        f"chi2={_f(block.get('interaction_wald_chi2'))} on "
+                        f"{block.get('interaction_df')} df"
+                    ),
+                    "moderator_value": _f(block.get("centred_at")),
+                    "n": block.get("n"),
+                    "estimate": None, "std_error": None,
+                    "ci_low": None, "ci_high": None, "odds_ratio": None,
+                    "p_value": _f(block.get("interaction_p")),
+                }
+            )
+        _emit_csv(f"moderation{sfx}.csv", mod_rows)
         curve = (nonlinear or {}).get("curve")
         if curve:
             _emit_csv(
@@ -1807,7 +1863,8 @@ def run_fusion(
     search_scoring_method: str = "mom_em3",
     n_bootstraps: int = 20,
     n_trials_per_bootstrap: int = 50,
-    weight_bin_pct: int = 10,
+    weight_bin_pct: int = 20,
+    weight_refine_bin_pct: int | None = None,
     min_cell_count: int = 3,
     worst_quantile: float = 0.10,
     max_pfer: float = 1.0,
@@ -1821,6 +1878,7 @@ def run_fusion(
     report_effects_permutations: int = 1000,
     report_paired_bootstrap: int = 2000,
     exposure_iqr: float | None = None,
+    moderator_columns: list[str] | None = None,
 ) -> dict:
     """Run a fusion job: stability-selection tuning + held-out test scoring.
 
@@ -1936,6 +1994,7 @@ def run_fusion(
             "n_bootstraps": int(n_bootstraps),
             "n_trials_per_bootstrap": int(n_trials_per_bootstrap),
             "weight_bin_pct": int(weight_bin_pct),
+            "weight_refine_bin_pct": weight_refine_bin_pct,
             "min_cell_count": int(min_cell_count),
             "worst_quantile": float(worst_quantile),
             "max_pfer": float(max_pfer),
@@ -1961,6 +2020,7 @@ def run_fusion(
             "report_effects_bootstrap": int(report_effects_bootstrap),
             "report_effects_permutations": int(report_effects_permutations),
             "exposure_iqr": exposure_iqr,
+            "moderator_columns": list(moderator_columns or []),
             "report_paired_bootstrap": int(report_paired_bootstrap),
             "cache_metrics": bool(cache_metrics),
             "resume_existing_study": bool(resume_existing_study),
@@ -2600,6 +2660,7 @@ def run_fusion(
                 n_bootstraps=int(n_bootstraps),
                 n_trials_per_bootstrap=cgi_trials_per_bootstrap,
                 weight_bin_pct=int(weight_bin_pct),
+                weight_refine_bin_pct=weight_refine_bin_pct,
                 min_cell_count=int(min_cell_count),
                 worst_quantile=float(worst_quantile),
                 max_pfer=max_pfer_arg,
@@ -2770,6 +2831,7 @@ def run_fusion(
                     n_bootstraps=int(n_bootstraps),
                     n_trials_per_bootstrap=int(standalone_trials_per_bootstrap),
                     weight_bin_pct=int(weight_bin_pct),
+                    weight_refine_bin_pct=weight_refine_bin_pct,
                     min_cell_count=int(min_cell_count),
                     worst_quantile=float(worst_quantile),
                     max_pfer=max_pfer_arg,
@@ -3083,6 +3145,22 @@ def run_fusion(
                     f"[{label}] Exposure-response computation failed: {exc}",
                 )
 
+            # Effect modification: does the greenery association differ across
+            # levels of a moderator. Reporting-stage, like the exposure-response
+            # shapes — the search still optimises the greenery association, as
+            # the source papers fit one pre-specified model.
+            moderation_report: list[dict] = []
+            try:
+                moderation_report = engine.compute_moderation(
+                    params=averaged_params or best_params,
+                    moderator_columns=moderator_columns,
+                )
+            except Exception as exc:
+                _log_fusion(
+                    "WARN",
+                    f"[{label}] Moderation computation failed: {exc}",
+                )
+
             bundle = {
                 "best_params": best_params,
                 "averaged_params": averaged_params,
@@ -3096,6 +3174,7 @@ def run_fusion(
                 "covariate_impact": covariate_impact,
                 "decline_terms": decline_terms,
                 "exposure_response": exposure_response_report,
+                "moderation": moderation_report,
                 "target_feature": target_feature,
                 # Run details persisted so the results panel survives a disk
                 # reload (when the live engine is gone): user-facing covariate

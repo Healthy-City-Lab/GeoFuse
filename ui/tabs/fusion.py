@@ -462,6 +462,7 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "cgi_formula",
     "covariate_columns",
     "covariate_types",
+    "moderator_columns",
     "standalone_channels",
     "longitudinal_spec_payload",
     "cgi_grid_spacing_m",
@@ -477,6 +478,7 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "n_bootstraps",
     "n_trials_per_bootstrap",
     "weight_bin_pct",
+    "weight_refine_bin_pct",
     "min_cell_count",
     "worst_quantile",
     "max_pfer",
@@ -496,6 +498,7 @@ _FUSION_PARAM_TO_WIDGET: dict[str, str] = {
     "n_bootstraps": "fusion_n_bootstraps",
     "n_trials_per_bootstrap": "fusion_n_trials_per_bootstrap",
     "weight_bin_pct": "fusion_weight_bin_pct",
+    "weight_refine_bin_pct": "fusion_weight_refine_bin_pct",
     "max_pfer": "fusion_max_pfer",
     "check_collinearity": "fusion_check_collinearity",
     "vif_threshold": "fusion_vif_threshold",
@@ -1567,6 +1570,29 @@ def _render_study_details_panel(
                 c: ("categorical" if c in cat_set else "numeric")
                 for c in covariate_columns
             }
+
+            _keep_valid("fusion_moderator_columns", available_covariates, multi=True)
+            moderator_columns = st.multiselect(
+                "Effect modifiers (moderators)",
+                options=available_covariates,
+                key="fusion_moderator_columns",
+                help=(
+                    "Tested for **moderation**, not adjustment: each one gets "
+                    "its own `greenery x modifier` model on the winning "
+                    "composite, reporting the interaction test plus the "
+                    "greenery effect at every level of the modifier. Adding a "
+                    "column here does not adjust for it — list it as a "
+                    "covariate too if you also want it controlled elsewhere. "
+                    "Tag it above as categorical to contrast its levels; "
+                    "otherwise it is centred and read at mean +/- 1 SD."
+                ),
+            )
+            if moderator_columns:
+                st.caption(
+                    "Moderation reported for: "
+                    + ", ".join(f"`{m}`" for m in moderator_columns)
+                    + " → `moderation.csv`"
+                )
             if covariate_columns:
                 st.caption(
                     "Fitting: "
@@ -1578,6 +1604,7 @@ def _render_study_details_panel(
         else:
             covariate_columns = []
             covariate_types = {}
+            moderator_columns = []
             st.caption(
                 "_No attribute columns available for covariates "
                 "(raster target or no spare columns)._"
@@ -1888,9 +1915,37 @@ def _render_study_details_panel(
                 "Bin width for the channel-mix weight cells the stability "
                 "selection ranks. Wider cells → fewer, coarser cells (a good "
                 "region fragments less and each cell collects more trials); "
-                "narrower cells → finer resolution but many more cells to cover."
+                "narrower cells → finer resolution but many more cells to "
+                "cover. **20 % is the default**: below that, neighbouring "
+                "cells are near-identical composites and the vote splits "
+                "across them so nothing is ever declared stable. The finer "
+                "resolution is recovered by the refinement stage below."
             ),
         )
+        _refine_options = [o for o in (5, 10, 20, 25) if o < int(weight_bin_pct_ui)]
+        if _refine_options:
+            _default(
+                "fusion_weight_refine_bin_pct",
+                min(_refine_options, key=lambda o: abs(o - _cgi_formulas.WEIGHT_REFINE_BIN_PCT)),
+                _refine_options,
+            )
+            weight_refine_bin_pct_ui = st.select_slider(
+                "Refinement cell size (%)",
+                options=_refine_options,
+                key="fusion_weight_refine_bin_pct",
+                help=(
+                    "Third selection stage. After the channel mix and the "
+                    "spatial scale are settled, the surviving trials are "
+                    "re-binned at this width and the best sub-cell by median "
+                    "out-of-bag score is kept — so the final weights come from "
+                    "trials that agree, not from an average across the whole "
+                    "coarse cell."
+                ),
+            )
+        else:
+            weight_refine_bin_pct_ui = None
+            st.caption("_Refinement needs a cell size above 5 %._")
+
     with col_s1:
         n_bootstraps_ui = st.number_input(
             "Bootstraps (B)",
@@ -2078,6 +2133,7 @@ def _render_study_details_panel(
         "cgi_formula": cgi_formula,
         "covariate_columns": list(covariate_columns or []),
         "covariate_types": dict(covariate_types or {}),
+        "moderator_columns": list(moderator_columns or []),
         "objective_metric": objective_metric,
         "residualize_method": str(residualize_method),
         "search_scoring_method": str(search_scoring_method),
@@ -2105,6 +2161,11 @@ def _render_study_details_panel(
         "n_bootstraps": int(n_bootstraps_ui),
         "n_trials_per_bootstrap": int(n_trials_per_bootstrap_ui),
         "weight_bin_pct": int(weight_bin_pct_ui),
+        "weight_refine_bin_pct": (
+            int(weight_refine_bin_pct_ui)
+            if weight_refine_bin_pct_ui is not None
+            else None
+        ),
         "min_cell_count": int(min_cell_count_ui),
         "worst_quantile": float(worst_quantile_ui),
         "max_pfer": float(max_pfer_ui),
@@ -4466,6 +4527,7 @@ def render(output_dir: str) -> None:
     cgi_formula = study_state["cgi_formula"]
     covariate_columns = study_state["covariate_columns"]
     covariate_types = study_state.get("covariate_types") or {}
+    moderator_columns_param = list(study_state.get("moderator_columns") or [])
     objective_metric = study_state["objective_metric"]
     test_size = study_state["test_size"]
     n_bins = study_state["n_bins"]
@@ -4497,6 +4559,7 @@ def render(output_dir: str) -> None:
     weight_bin_pct_param = int(
         study_state.get("weight_bin_pct", _cgi_formulas.WEIGHT_BIN_PCT)
     )
+    weight_refine_bin_pct_param = study_state.get("weight_refine_bin_pct")
     min_cell_count_param = int(study_state.get("min_cell_count", 3))
     worst_quantile_param = float(study_state.get("worst_quantile", 0.10))
     max_pfer_param = float(study_state.get("max_pfer", 1.0))
@@ -4859,6 +4922,7 @@ def render(output_dir: str) -> None:
                 "cgi_formula": cgi_formula,
                 "covariate_columns": list(covariate_columns or []),
                 "covariate_types": dict(covariate_types or {}),
+                "moderator_columns": list(moderator_columns_param),
                 "standalone_channels": (
                     ["veg", "terrain", "ndvi"] if run_standalones else []
                 ),
@@ -4902,6 +4966,7 @@ def render(output_dir: str) -> None:
                 "n_bootstraps": int(n_bootstraps_param),
                 "n_trials_per_bootstrap": int(n_trials_per_bootstrap_param),
                 "weight_bin_pct": int(weight_bin_pct_param),
+                "weight_refine_bin_pct": weight_refine_bin_pct_param,
                 "min_cell_count": int(min_cell_count_param),
                 "worst_quantile": float(worst_quantile_param),
                 "max_pfer": float(max_pfer_param),

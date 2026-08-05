@@ -8081,13 +8081,104 @@ class MetricFusionEngine:
             logger.warning(f"compute_exposure_response failed: {exc}")
             return None
 
-    def _reporting_covariate_matrix(self, df: "pd.DataFrame"):
+    def compute_moderation(
+        self, params: dict, moderator_columns: "list[str] | None"
+    ) -> list[dict]:
+        """Effect modification of the greenery association, one entry per moderator.
+
+        Fits ``outcome ~ greenery + M + greenery x M + covariates`` on the
+        winning composite and reports the interaction test plus the greenery
+        slope at each level of ``M`` — the analysis the greenspace papers run
+        when they claim an effect differs by sex, income or social standing.
+
+        The moderator is removed from the covariate matrix first: the model
+        enters its main effect explicitly, so leaving it in the controls too
+        would make the design collinear. Categorical moderators are detected
+        from ``covariate_types``, falling back to a distinct-value count.
+        """
+        moderators = [m for m in (moderator_columns or []) if m]
+        if not moderators:
+            return []
+        out: list[dict] = []
+        try:
+            df = self.apply_fusion(weights=dict(params))
+            target = np.asarray(df["target"].values, dtype=np.float64)
+            composite = np.asarray(df["composite"].values, dtype=np.float64)
+            entity_id = None
+            if self.is_longitudinal:
+                entity_id, _ysb = self._whole_data_longitudinal_keys(df)
+
+            binary = binary_longitudinal.is_binary(target)
+            if binary and entity_id is not None:
+                fitter = binary_longitudinal.make_gee_logit_fitter(target, entity_id)
+            elif binary:
+                fitter = binary_longitudinal.make_logit_fitter(target)
+            else:
+                fitter = exposure_response.make_ols_fitter(target)
+
+            for name in moderators:
+                values = self._reporting_raw_column(df, name)
+                if values is None:
+                    _log("WARN", f"Moderator '{name}' not found; skipping.")
+                    continue
+                declared = self.covariate_types.get(name)
+                n_levels = int(np.unique(values[np.isfinite(values)]).size)
+                categorical = (
+                    declared == "categorical" if declared else n_levels <= 12
+                )
+                cov = self._reporting_covariate_matrix(df, exclude=[name])
+                result = exposure_response.moderation_terms(
+                    composite,
+                    values,
+                    fitter,
+                    cov,
+                    categorical=categorical,
+                    logistic=binary,
+                    moderator_name=name,
+                )
+                if result is None:
+                    _log(
+                        "WARN",
+                        f"Moderation analysis for '{name}' could not be fit "
+                        "(too few rows, or a moderator with one level).",
+                    )
+                    continue
+                out.append(result)
+        except Exception as exc:
+            logger.warning(f"compute_moderation failed: {exc}")
+        return out
+
+    def _reporting_raw_column(self, df: "pd.DataFrame", name: str):
+        """One un-expanded attribute column aligned to an ``apply_fusion`` frame."""
+        full = self._full_data_frame()
+        if full is not None and "polygon_id" in df.columns and name in full.columns:
+            series = (
+                full.groupby("polygon_id", sort=False)[name]
+                .first()
+                .reindex(df["polygon_id"].values)
+            )
+            return pd.to_numeric(series, errors="coerce").to_numpy(dtype=np.float64)
+        if name in df.columns:
+            return pd.to_numeric(df[name], errors="coerce").to_numpy(dtype=np.float64)
+        return None
+
+    def _reporting_covariate_matrix(
+        self, df: "pd.DataFrame", exclude: "list[str] | None" = None
+    ):
         """Covariate matrix aligned to an ``apply_fusion`` frame, or ``None``.
 
-        Shared by the decline-term and exposure-response reports so both
-        condition on exactly the same controls the objective did.
+        Shared by the decline-term, exposure-response and moderation reports so
+        all three condition on exactly the same controls the objective did.
+
+        ``exclude`` drops columns by their **user-facing** name, taking their
+        dummy expansions with them — used by the moderation report, which
+        enters the moderator's main effect itself and would otherwise hand the
+        fitter the same information twice.
         """
         cov_cols = list(self.covariate_columns or [])
+        for name in exclude or []:
+            drop = set(self._covariate_dummy_map.get(name, [])) | {name}
+            cov_cols = [c for c in cov_cols if c not in drop]
         if not cov_cols:
             return None
         full = self._full_data_frame()
@@ -8143,7 +8234,8 @@ class MetricFusionEngine:
         *,
         n_bootstraps: int = 20,
         n_trials_per_bootstrap: int = 50,
-        weight_bin_pct: int = 10,
+        weight_bin_pct: int = cgi_formulas.WEIGHT_BIN_PCT,
+        weight_refine_bin_pct: int | None = None,
         top_percent_per_bootstrap: float = 0.2,
         min_cell_count: int = 3,
         worst_quantile: float = 0.10,
@@ -8210,17 +8302,27 @@ class MetricFusionEngine:
                 count of complementary pairs). 20–50 typical.
             n_trials_per_bootstrap: QMC trials inside each subsample.
                 30–100 typical.
-            weight_bin_pct: Cell width for weight binning. 10 % bins yield
-                ~78 valid simplex cells for the weighted-average formula.
+            weight_bin_pct: Cell width for the first stage's weight binning.
+                20 % gives 21 cells for the weighted-average formula and 56 for
+                synergy; 10 % gives 66 and 286, which is fine enough that
+                selection frequency splits across near-identical neighbours and
+                nothing is ever declared stable.
+            weight_refine_bin_pct: Cell width for the third stage, which re-bins
+                the winning radius sub-cell's trials to pick a narrower weight
+                mix. ``None`` uses ``cgi_formulas.WEIGHT_REFINE_BIN_PCT``; a
+                value at or above ``weight_bin_pct`` disables the stage and
+                averages the coarse cell as before.
             top_percent_per_bootstrap: Fraction of each bootstrap's trials
                 considered "selected" for the selection-probability sidecar.
             min_cell_count: A cell is eligible only when at least this many
                 trials landed in it across all bootstraps. Prevents a
-                single-trial outlier cell from claiming "best".
+                single-trial outlier cell from claiming "best". Also gates the
+                refinement stage.
             worst_quantile: 0.10 → 10th percentile worst-case score for
                 higher-is-better metrics; 90th percentile for lower-is-
-                better. Tighter (e.g. 0.05) penalises rare-bad-luck cells
-                harder; looser (e.g. 0.25) tolerates more bad-luck draws.
+                better. Reported on every cell as a robustness read; the
+                **median** is what ranks them, since the question is typical
+                held-out performance rather than worst-case.
             max_pfer: Upper bound on the (approximate) per-family error rate
                 the calibration is allowed to accept. Configs whose PFER bound
                 ``K² / ((2π−1)·N)`` exceeds this are excluded, capping the
@@ -8752,15 +8854,18 @@ class MetricFusionEngine:
             candidates = [c for c in cell_stats if c["cell"] in stable_cells]
             if not candidates:
                 candidates = cell_stats
-            # Most consistently selected cell; ties broken by worst-quantile
-            # OOB score so that, when selection probability saturates (every
-            # stable cell at 1.0), the winner is the most robust rather than
-            # the best typical-case cell.
+            # Most consistently selected cell; ties broken by the cell's median
+            # OOB score. Median, not the worst quantile: the question this
+            # study asks is which composite predicts better on typical held-out
+            # data, and the worst decile answers a maximin question instead.
+            # It is also count-invariant, so a cell that happened to draw more
+            # trials gets no advantage. ``q_worst`` is still recorded on every
+            # cell and reported as a robustness read.
             best = max(
                 candidates,
                 key=lambda c: (
                     c["selection_probability"],
-                    c["q_worst"] if higher_is_better else -c["q_worst"],
+                    c["median"] if higher_is_better else -c["median"],
                 ),
             )
             _log(
@@ -8772,11 +8877,11 @@ class MetricFusionEngine:
             )
         else:
             # Too few candidate cells / resamples to calibrate (e.g. a
-            # standalone's single weight cell) — fall back to the best
-            # worst-quantile cell.
+            # standalone's single weight cell) — fall back to the best median
+            # cell.
             best = max(
                 cell_stats,
-                key=lambda c: c["q_worst"] if higher_is_better else -c["q_worst"],
+                key=lambda c: c["median"] if higher_is_better else -c["median"],
             )
 
         # ── Stage 2: spatial tuning in the winning cell ─────
@@ -8845,14 +8950,82 @@ class MetricFusionEngine:
             radius_stats = [_radius_stat(rk, rs) for rk, rs in radius_cells.items()]
         radius_best = max(
             radius_stats,
-            key=lambda c: c["q_worst"] if higher_is_better else -c["q_worst"],
+            key=lambda c: c["median"] if higher_is_better else -c["median"],
         )
 
         # ── Average params in the winning radius sub-cell ───
+        # ── Stage 3: weight refinement at the chosen scale ──
+        # The coarse cell fixed the channel mix and the radius sub-cell fixed
+        # the spatial scale. Both were decided at 20 % weight resolution, so
+        # the surviving trials still disagree about the mix by up to a whole
+        # bucket. Re-bin them at ``weight_refine_bin_pct`` and take the best
+        # fine sub-cell by median, instead of averaging across the coarse cell
+        # and landing on a mix no trial actually validated.
+        #
+        # Ordering matters and is deliberate: mix, then scale, then mix again.
+        # Refining the weights before the radius is settled would tune them
+        # against a spatial scale that is about to change.
+        #
+        # Note the fine keys do not nest inside the coarse ones —
+        # ``_snap_weight_buckets`` rounds to nearest, so the two grids have
+        # unaligned boundaries. That is fine here because the re-binning is
+        # applied to trials that are *already* members of the winning coarse
+        # cell, so the refined set is a subset of them and the averaged weights
+        # stay inside their convex hull. Do not reuse these keys as a
+        # hierarchy elsewhere.
+        refine_bin = int(
+            weight_refine_bin_pct
+            if weight_refine_bin_pct is not None
+            else cgi_formulas.WEIGHT_REFINE_BIN_PCT
+        )
+        winners = radius_best["records"]
+        refine_stats: list[dict] = []
+        if 0 < refine_bin < int(weight_bin_pct):
+            fine_cells: dict[tuple, list[dict]] = {}
+            for r in winners:
+                fk = cgi_formulas.weight_cell_key(
+                    self.cgi_formula, r["params"], refine_bin
+                )
+                fine_cells.setdefault(fk, []).append(r)
+            refine_stats = [
+                {
+                    "cell": fk,
+                    "count": len(rs),
+                    "median": float(np.median([r["oob_score"] for r in rs])),
+                    "q_worst": _q_worst([r["oob_score"] for r in rs]),
+                    "records": rs,
+                }
+                for fk, rs in fine_cells.items()
+            ]
+            # Only accept the refinement when a sub-cell has enough trials to
+            # rank on. Below that its median is a draw-noise artefact and the
+            # coarse cell's average is the safer answer.
+            eligible = [c for c in refine_stats if c["count"] >= int(min_cell_count)]
+            if len(fine_cells) > 1 and eligible:
+                refine_best = max(
+                    eligible,
+                    key=lambda c: c["median"] if higher_is_better else -c["median"],
+                )
+                _log(
+                    "INFO",
+                    f"Weight refinement: {len(fine_cells)} sub-cells at "
+                    f"{refine_bin}% inside the winning {weight_bin_pct}% cell; "
+                    f"kept {refine_best['count']} of {len(winners)} trials "
+                    f"(median {refine_best['median']:.4f} vs "
+                    f"{radius_best['median']:.4f} across the whole cell).",
+                )
+                winners = refine_best["records"]
+            elif len(fine_cells) > 1:
+                _log(
+                    "INFO",
+                    f"Weight refinement skipped: no {refine_bin}% sub-cell "
+                    f"reached min_cell_count={min_cell_count}; averaging the "
+                    f"{len(winners)} trials of the coarse cell instead.",
+                )
+
         # Snap + renormalize the winners' weights to canonical integer steps so
         # downstream code (composite generation, apply path) consumes them
         # directly. ``formula`` was resolved up front (see above).
-        winners = radius_best["records"]
 
         def _mean_int(name: str, default: int) -> int:
             vals = [int(r["params"].get(name, default)) for r in winners]
@@ -8977,6 +9150,12 @@ class MetricFusionEngine:
         final_params["__cell_q_worst__"] = float(best["q_worst"])
         final_params["__cell_count__"] = int(best["count"])
         final_params["__cell_median__"] = float(best["median"])
+        final_params["__weight_bin_pct__"] = int(weight_bin_pct)
+        final_params["__weight_refine_bin_pct__"] = int(refine_bin)
+        final_params["__refine_cell_count__"] = int(len(winners))
+        final_params["__refine_applied__"] = bool(
+            refine_stats and len(winners) < len(radius_best["records"])
+        )
         final_params["__cell_selection_probability__"] = float(
             best["selection_probability"]
         )

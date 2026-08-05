@@ -69,6 +69,12 @@ CROSS_SECTIONAL_METRICS: tuple[str, ...] = (
     "r2",
     "rmse",
     "mutual_info",
+    # Binary outcome, single measurement per entity: plain logistic regression.
+    # A year-keyed cross-sectional study with a dichotomous outcome is exactly
+    # the design of the published CLSA greenspace papers, so it has to be
+    # expressible without dragging in the panel machinery.
+    "logit_tstat",
+    "logit_coef",
 )
 
 # Binary-outcome panel metrics. ``MixedLM`` is Gaussian-only, so a dichotomous

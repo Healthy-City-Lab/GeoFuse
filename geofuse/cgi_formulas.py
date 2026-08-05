@@ -130,10 +130,23 @@ class CGIFormula:
 # ────────────────────────────────────────────────────────────────────
 
 # Bucket width for the weight-cell key used by bootstrap stability selection.
-# Trials are recorded at 5 % resolution (:data:`WEIGHT_STEP_PCT`); for cell
-# aggregation we coarsen to 10 % buckets so each cell collects enough OOB
-# scores across bootstraps to produce a meaningful worst-quantile estimate.
-WEIGHT_BIN_PCT: int = 10
+# Trials are recorded at 5 % resolution (:data:`WEIGHT_STEP_PCT`); cell
+# aggregation coarsens to 20 % buckets.
+#
+# 20, not 10, because adjacent cells are near-identical composites and
+# stability selection splits its vote across them: at 10 % the weighted-average
+# formula has 66 cells and `docs/STABILITY_SELECTION_AUDIT.md` measures **0 %
+# recovery of a strong planted signal**, unchanged by 25x the compute; at 20 %
+# there are 21 cells and recovery is 100 % with the PFER bound still under 1.
+# The finer resolution is not lost — it moves to the refinement stage, which
+# re-bins the winning cell's trials at :data:`WEIGHT_REFINE_BIN_PCT`.
+WEIGHT_BIN_PCT: int = 20
+
+# Bucket width for the third selection stage, which re-bins the trials inside
+# the winning (weight cell x radius sub-cell) to pick a narrower weight mix.
+# The coarse stage decides the channel mix, the radius stage decides the
+# spatial scale, and this one recovers the resolution the coarse stage gave up.
+WEIGHT_REFINE_BIN_PCT: int = 10
 
 
 def bin_weight(value: int | float, bin_pct: int = WEIGHT_BIN_PCT) -> int:
