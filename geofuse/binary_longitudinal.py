@@ -162,6 +162,24 @@ def _design(greenery: np.ndarray | None, covariates: np.ndarray | None, n: int):
     return np.column_stack(cols), idx
 
 
+def _column_scales(X: np.ndarray) -> np.ndarray:
+    """Per-column scale factors that put a design on comparable magnitudes.
+
+    The estimating equations are solved through normal equations, whose
+    condition number goes as the square of the design's. A covariate measured
+    in units a billion times another's therefore loses roughly twice as many
+    digits as it should, and the solve returns confident nonsense rather than
+    failing. Scaling here — and unscaling the coefficients afterwards — makes
+    the result invariant to the units a covariate happens to arrive in, which
+    is what a user is entitled to assume.
+
+    Constant columns (the intercept) and all-zero columns keep a scale of 1.
+    """
+    scales = np.max(np.abs(X), axis=0)
+    scales[~np.isfinite(scales) | (scales <= 0)] = 1.0
+    return scales
+
+
 def _irls(y: np.ndarray, X: np.ndarray, beta0: np.ndarray | None = None):
     """Plain logistic IRLS. Returns ``(beta, mu)`` or ``None`` if it diverges."""
     n, p = X.shape
@@ -369,16 +387,22 @@ def _fit_gee_logit(
     estimating equations, alternating with a moment update of the working
     correlation — the standard Liang–Zeger loop, with every step vectorised
     through :func:`_accumulate`.
+
+    The design is solved column-scaled and reported back in the caller's units,
+    so a covariate's measurement unit cannot change the answer.
     """
-    start = _irls(y, X)
+    scales = _column_scales(X)
+    Xs = X / scales
+
+    start = _irls(y, Xs)
     if start is None:
         return None
     beta = start[0]
     alpha = 0.0
     for _ in range(max_iter):
-        mu = _clip_mu(1.0 / (1.0 + np.exp(-(X @ beta))))
-        alpha = _alpha_from_residuals(y, mu, layout, X.shape[1])
-        bread, score, _ = _accumulate(X, mu * (1.0 - mu), y - mu, layout, alpha)
+        mu = _clip_mu(1.0 / (1.0 + np.exp(-(Xs @ beta))))
+        alpha = _alpha_from_residuals(y, mu, layout, Xs.shape[1])
+        bread, score, _ = _accumulate(Xs, mu * (1.0 - mu), y - mu, layout, alpha)
         try:
             step = np.linalg.solve(bread, score)
         except np.linalg.LinAlgError:
@@ -388,14 +412,17 @@ def _fit_gee_logit(
         beta = beta + step
         if np.max(np.abs(step)) < tol:
             break
-    mu = _clip_mu(1.0 / (1.0 + np.exp(-(X @ beta))))
-    alpha = _alpha_from_residuals(y, mu, layout, X.shape[1])
-    bread, _score, meat = _accumulate(X, mu * (1.0 - mu), y - mu, layout, alpha)
+    mu = _clip_mu(1.0 / (1.0 + np.exp(-(Xs @ beta))))
+    alpha = _alpha_from_residuals(y, mu, layout, Xs.shape[1])
+    bread, _score, meat = _accumulate(Xs, mu * (1.0 - mu), y - mu, layout, alpha)
     try:
         bread_inv = np.linalg.pinv(bread)
     except np.linalg.LinAlgError:
         return None
-    return beta, mu, alpha, bread_inv @ meat @ bread_inv
+    cov_scaled = bread_inv @ meat @ bread_inv
+    # Back to the caller's units: a coefficient divides by its column's scale,
+    # and a covariance entry by the product of the two columns' scales.
+    return beta / scales, mu, alpha, cov_scaled / np.outer(scales, scales)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -492,15 +519,19 @@ def score_gee_logit_fast(
     # which is exactly the hypothesis the score is evaluated under.
     beta0 = np.insert(baseline.beta_null, gi, 0.0)
 
+    # Solved column-scaled, like the exact fit, so a covariate's units cannot
+    # change the score. ``beta0`` is in the caller's units, so it scales up on
+    # the way in and the step scales back down on the way out.
+    scales = _column_scales(X)
     bread, score, meat = _accumulate(
-        X, baseline.var, baseline.resid, baseline.layout, baseline.alpha
+        X / scales, baseline.var, baseline.resid, baseline.layout, baseline.alpha
     )
     try:
         bread_inv = np.linalg.pinv(bread)
     except np.linalg.LinAlgError:
         return _degenerate(metric, return_all, return_pvalue)
-    coef = float(beta0[gi] + (bread_inv @ score)[gi])
-    cov_beta = bread_inv @ meat @ bread_inv
+    coef = float(beta0[gi] + (bread_inv @ score)[gi] / scales[gi])
+    cov_beta = (bread_inv @ meat @ bread_inv) / np.outer(scales, scales)
     se = float(np.sqrt(max(cov_beta[gi, gi], 0.0)))
     z = abs(coef / se) if se > 0 else 0.0
     pval = float(2.0 * stats.norm.sf(z))

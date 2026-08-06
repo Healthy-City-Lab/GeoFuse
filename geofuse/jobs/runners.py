@@ -1757,7 +1757,16 @@ def _compare_cgi_vs_standalone(
     target = design["target"]
     cov = design["covariates"]
     try:
-        if longitudinal and design.get("entity_id") is not None:
+        # Route on the *metric*, not merely on a spec being present — the same
+        # rule ``_score_greenery`` uses. A year-aware cross-sectional run
+        # carries a longitudinal spec (to assign a greenery file per
+        # measurement year) but scores with OLS, and its entity ids are
+        # synthesised one-per-row. Handing that to a per-entity random
+        # intercept asks it to separate between- from within-entity variance
+        # from singleton groups, which is unidentified and simply fails to
+        # converge — taking the CGI-vs-standalone verdict down with it.
+        panel_metric = metric in _me.MIXEDLM_METRICS
+        if longitudinal and panel_metric and design.get("entity_id") is not None:
             return _me.compare_models_aic_bic_mixedlm(
                 target,
                 X,

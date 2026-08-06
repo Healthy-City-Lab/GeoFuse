@@ -437,3 +437,113 @@ class TestModeration(unittest.TestCase):
                 None, categorical=True,
             )
         )
+
+
+class TestIncrementalR2(unittest.TestCase):
+    """``r2`` must measure association, not agreement of scales."""
+
+    def test_uncontrolled_r2_is_a_fitted_regression_not_an_identity_score(self):
+        """The defect that made an unadjusted score read as -1.06.
+
+        A composite on [0, 1] against a CES-D score on [0, 30] scored as a
+        direct prediction returns a large negative number describing the scale
+        gap. Scored as a fitted regression it returns the association.
+        """
+        rng = np.random.default_rng(0)
+        n = 5000
+        outcome = rng.gamma(2, 2.5, n)              # 0-30-ish, like CES-D-10
+        composite = rng.uniform(0, 1, n) + 0.02 * outcome   # 0-1 greenery index
+        s = osc.score("r2", outcome, composite)
+        self.assertGreaterEqual(s, 0.0)
+        self.assertLess(s, 1.0)
+        # It must track the genuine explained variance, not the scale offset.
+        X = np.column_stack([np.ones(n), composite])
+        beta, *_ = np.linalg.lstsq(X, outcome, rcond=None)
+        resid = outcome - X @ beta
+        expected = 1.0 - resid @ resid / float(((outcome - outcome.mean()) ** 2).sum())
+        self.assertAlmostEqual(s, expected, places=10)
+
+    def test_shifting_the_composite_scale_leaves_the_score_alone(self):
+        """R² of a fitted regression is invariant to affine rescaling."""
+        rng = np.random.default_rng(1)
+        n = 3000
+        outcome = rng.normal(10, 4, n)
+        composite = rng.uniform(0, 1, n) + 0.05 * outcome
+        base = osc.score("r2", outcome, composite)
+        for scale, shift in ((30.0, 0.0), (1.0, 100.0), (0.01, -5.0)):
+            self.assertAlmostEqual(
+                osc.score("r2", outcome, composite * scale + shift), base, places=8
+            )
+
+    def test_incremental_over_covariates_is_still_incremental(self):
+        rng = np.random.default_rng(2)
+        n = 4000
+        cov = rng.normal(size=(n, 3))
+        composite = rng.normal(size=n)
+        outcome = cov @ np.array([1.0, -0.5, 0.25]) + 0.3 * composite + rng.normal(size=n)
+        full = osc.score("r2", outcome, composite, cov)
+        alone = osc.score("r2", outcome, composite)
+        # Adjusting for covariates that carry most of the variance leaves the
+        # greenery term a smaller share than it claims on its own.
+        self.assertGreater(alone, full)
+        self.assertGreater(full, 0.0)
+
+
+class TestScaleInvariance(unittest.TestCase):
+    """A covariate's measurement unit must not change any answer.
+
+    Not a style preference: the estimating equations go through normal
+    equations, whose condition number is the square of the design's. Before the
+    designs were column-scaled, a covariate a billion times another's returned
+    ``|z| = 2e20`` — confidently wrong rather than failing.
+    """
+
+    def test_gee_is_invariant_to_covariate_units(self):
+        y, g, eid, cov = make_panel(n_entities=800, seed=0, beta_g=0.30)
+        base_z = bl.score_gee_logit("gee_logit_tstat", y, g, eid, cov)
+        base_coef = bl.score_gee_logit("gee_logit_coef", y, g, eid, cov)
+        for scale in (1e3, 1e6, 1e9, 1e12):
+            rescaled = cov.copy()
+            rescaled[:, 0] *= scale
+            self.assertAlmostEqual(
+                bl.score_gee_logit("gee_logit_tstat", y, g, eid, rescaled),
+                base_z, places=6, msg=f"|z| moved at scale {scale:g}",
+            )
+            self.assertAlmostEqual(
+                bl.score_gee_logit("gee_logit_coef", y, g, eid, rescaled),
+                base_coef, places=6, msg=f"coef moved at scale {scale:g}",
+            )
+
+    def test_fast_scorer_is_invariant_to_covariate_units(self):
+        y, g, eid, cov = make_panel(n_entities=800, seed=1, beta_g=0.30)
+        baseline = bl.estimate_fold_baseline(y, eid, cov)
+        base_z = bl.score_gee_logit_fast("gee_logit_tstat", g, baseline)
+        for scale in (1e3, 1e9):
+            rescaled = cov.copy()
+            rescaled[:, 0] *= scale
+            shifted = bl.estimate_fold_baseline(y, eid, rescaled)
+            self.assertAlmostEqual(
+                bl.score_gee_logit_fast("gee_logit_tstat", g, shifted),
+                base_z, places=6,
+            )
+
+    def test_cross_sectional_metrics_are_invariant(self):
+        """Why normalising the inputs is not required for the OLS-based path."""
+        rng = np.random.default_rng(2)
+        n = 3000
+        cov = rng.normal(size=(n, 3))
+        g = rng.uniform(0, 1, n)
+        y = 5.0 + 3.0 * g + cov @ np.array([1.0, -0.5, 0.25]) + rng.normal(size=n)
+
+        def minmax(a):
+            a = np.asarray(a, dtype=float)
+            lo, hi = a.min(axis=0), a.max(axis=0)
+            return (a - lo) / np.where(hi - lo == 0, 1, hi - lo)
+
+        for metric in ("r2", "distance_corr", "nrmse", "mutual_info"):
+            self.assertAlmostEqual(
+                osc.score(metric, y, g, cov),
+                osc.score(metric, minmax(y), minmax(g), minmax(cov)),
+                places=8,
+                msg=f"{metric} is not scale-invariant",
+            )

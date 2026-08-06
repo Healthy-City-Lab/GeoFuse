@@ -62,7 +62,7 @@ import warnings
 import numpy as np
 import pandas as pd
 from scipy.stats import ConstantInputWarning, pearsonr, rankdata
-from sklearn.metrics import mutual_info_score, r2_score
+from sklearn.metrics import mutual_info_score
 
 from . import pdcor
 
@@ -617,15 +617,18 @@ def score(
         if metric == "r2":
             # Incremental R² with the spatial smooth folded into the control
             # design (both methods condition the outcome on cov + smooth).
+            #
+            # With no controls this is the R² of ``target ~ cgi`` — a *fitted*
+            # regression, not ``r2_score(target, cgi)``. The latter scores the
+            # composite as if it were already a prediction of the outcome, so a
+            # greenery index on [0, 1] against a CES-D score on [0, 30] returns
+            # a large negative number that measures the scale gap and nothing
+            # about the association. Both forms agree when the two happen to
+            # share a scale; only this one is meaningful when they do not.
             ctrl = _stack(cov_res, sb)
-            if ctrl is None:
-                # Legacy path: r2 of cgi treated as a direct prediction of
-                # target — preserves the previous engine behaviour exactly.
-                s = float(r2_score(t, c))
-            else:
-                X_red = ctrl
-                X_full = np.column_stack([ctrl, c])
-                s = _ols_r2(t, X_full) - _ols_r2(t, X_red)
+            X_red = ctrl
+            X_full = c.reshape(-1, 1) if ctrl is None else np.column_stack([ctrl, c])
+            s = _ols_r2(t, X_full) - _ols_r2(t, X_red)
             if np.isnan(s):
                 s = 0.0
             return (s, 1.0) if return_pvalue else s
