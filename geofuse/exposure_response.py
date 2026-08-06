@@ -506,13 +506,17 @@ def _orthogonalise(block: np.ndarray, against: np.ndarray, tol: float = 1e-8):
     return residual[:, keep], keep
 
 
+# Points on the reported exposure-response curve, spanning the 1st-99th
+# percentile of the exposure.
+_CURVE_POINTS: int = 50
+
+
 def spline_nonlinearity_test(
     exposure: np.ndarray,
     fitter: Fitter,
     covariates: np.ndarray | None = None,
     *,
     df: int = SPLINE_DF,
-    n_curve_points: int = 50,
 ) -> dict | None:
     """Restricted cubic spline on the exposure, tested against the straight line.
 
@@ -587,7 +591,7 @@ def spline_nonlinearity_test(
     # grid. The grid rows are appended to the data before building the basis so
     # the knot placement is identical, then orthogonalised the same way.
     curve = None
-    grid = np.linspace(np.nanpercentile(x, 1), np.nanpercentile(x, 99), n_curve_points)
+    grid = np.linspace(np.nanpercentile(x, 1), np.nanpercentile(x, 99), _CURVE_POINTS)
     joint = _natural_cubic_basis(np.concatenate([x, grid]), df)
     if joint is not None and joint.shape[1] == basis.shape[1]:
         joint_linear = np.column_stack(

@@ -27,40 +27,6 @@ _RASTER_INSIDE = 1
 _RASTER_OUTSIDE = 0
 
 
-class JobTracker:
-    """Handles logging for HPC and status updates for the Web UI."""
-
-    def __init__(self, job_id, log_dir="logs"):
-        self.job_id = job_id
-        self.status_file = os.path.join(log_dir, f"{job_id}_status.json")
-        self.log_file = os.path.join(log_dir, f"{job_id}.txt")
-
-        logging.basicConfig(
-            filename=self.log_file,
-            level=logging.INFO,
-            format="%(asctime)s - %(message)s",
-        )
-
-    def update(self, stage, percent, metrics=None):
-        status = {
-            "job_id": self.job_id,
-            "stage": stage,
-            "progress": percent,
-            "metrics": metrics or {},
-        }
-        with open(self.status_file, "w") as f:
-            json.dump(status, f)
-        logging.info(f"{stage}: {percent}% - {metrics}")
-
-
-def load_geometry(input_path):
-    """Load Shapefile/GeoJSON and return features in EPSG:4326 (lon/lat as x, y)."""
-    gdf = gpd.read_file(input_path)
-    if gdf.crs is None:
-        raise ValueError("Input geometry missing CRS.")
-    return reproject_geodataframe_to_wgs84(gdf)
-
-
 def _geometry_union_all(geoms: gpd.GeoSeries):
     if hasattr(geoms, "union_all"):
         return geoms.union_all()

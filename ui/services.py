@@ -22,8 +22,7 @@ import streamlit as st
 
 from geofuse.persistence.job_executor import JobExecutor
 from geofuse.persistence.job_store import JobStore
-from geofuse.persistence.ndvi_tile_cache import NdviTileCache
-from geofuse.persistence.pano_cache import PanoCache
+from geofuse.persistence.caches import NdviTileCache, PanoCache
 
 # Colours mirror geofuse.logger._ANSI. We don't import them so that this
 # converter has no dependency on the engine side beyond strings on the wire.

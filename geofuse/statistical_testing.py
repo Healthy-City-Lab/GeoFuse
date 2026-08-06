@@ -616,11 +616,15 @@ def holm_bonferroni(pvalues) -> list[float]:
 # ────────────────────────────────────────────────────────────────────
 
 
+# Selection-probability floor for the Bodinier threshold search: a cell must be
+# picked in more than half the resamples to be a candidate at all.
+_PI_MIN: float = 0.5
+
+
 def calibrate_stability_selection(
     per_resample_rankings: list,
     n_candidates: int,
     *,
-    pi_min: float = 0.5,
     max_pfer: float | None = 1.0,
 ) -> dict | None:
     """Automated calibration of the stability-selection threshold.
@@ -681,7 +685,7 @@ def calibrate_stability_selection(
         # contribute a 0, i.e. stably excluded under the null).
         h_vals = np.array(list(counts.values()), dtype=np.int64)
         gamma = min(1.0, K / N)
-        realized = sorted({h / B for h in h_vals if h / B > pi_min})
+        realized = sorted({h / B for h in h_vals if h / B > _PI_MIN})
         for pi in realized:
             hi = math.ceil(pi * B)
             lo = math.floor((1.0 - pi) * B)

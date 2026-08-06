@@ -330,22 +330,6 @@ def validate_spec(spec: LongitudinalSpec) -> list[str]:
     return errs
 
 
-def describe_file_reuse(spec: LongitudinalSpec) -> dict[str, bool]:
-    """Map ``channel -> True`` when every wave shares one file for that channel.
-
-    The UI uses this to surface a non-blocking warning ("vegetation has no
-    longitudinal variation — only between-entity contrast will inform that
-    channel"). Returns ``True`` for channels with exactly one distinct file
-    across all waves (including the degenerate one-wave case).
-    """
-    out: dict[str, bool] = {}
-    for ch in GREENERY_CHANNELS:
-        per_wave = spec.greenery_files.get(ch, {})
-        distinct = {per_wave[w] for w in spec.wave_labels if w in per_wave}
-        out[ch] = len(distinct) <= 1
-    return out
-
-
 def target_intake_columns(
     spec: LongitudinalSpec,
     outcome_col: str | None,

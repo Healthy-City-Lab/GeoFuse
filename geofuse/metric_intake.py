@@ -1,25 +1,96 @@
-"""On-demand access to the per-temporal-key greenery metric files.
+"""Where a metric value comes from: which column, and which file.
 
-A longitudinal study has one greenery file per channel per temporal key (the
-measurement year, or the wave label when waves are not date-derived). Holding
-every one of them open at once costs hundreds of megabytes per file; a study
-with a decade of waves does not fit in memory that way.
+Two questions the fusion engine asks of every greenery metric, answered here
+because they are the same question at two scales.
 
+**Which column holds a channel.** Resolution is rigid: a channel is recognised
+only by the names listed for it, and no name is shared between channels. There
+is no generic fallback and no "first numeric column" guess. The strictness is
+what makes a combined file safe to read — a GVI file carries vegetation and
+terrain together, so a generically named column (``value``, or a bare ``gvi``)
+cannot say which channel it holds, and accepting one would let a terrain column
+be read as vegetation. A file must name its columns explicitly to be read.
+
+**Which file serves a temporal key.** A longitudinal study has one greenery
+file per channel per temporal key (the measurement year, or the wave label when
+waves are not date-derived). Holding every one open at once costs hundreds of
+megabytes per file; a decade of waves does not fit that way.
 :class:`LongitudinalMetricSources` resolves ``(channel, key) -> source`` by
-loading from disk on demand and keeps only what the caller currently holds, so
-a pass over the keys never has more than one key's files resident. Callers load
-the sources for one key, use them, then :meth:`release` before moving on.
-
-File identity (:meth:`identity`) is derived from the path plus its size and
-mtime, so grouping keys that share a file — and fingerprinting the cache —
-never require reading the file itself.
+loading on demand and keeps only what the caller currently holds: callers load
+one key's sources, use them, then ``release()`` before moving on. File identity
+(``identity``) is path plus size plus mtime, so fingerprinting never requires
+reading the file.
 """
 
 from __future__ import annotations
 
-import os
+from .vector_io import match_column_alias
 from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
+import os
+
+
+VEG_COLUMNS: tuple[str, ...] = ("gvi_veg", "veg")
+
+# Terrain-only GVI, the independent Cityscapes class written alongside ``veg``.
+TERRAIN_COLUMNS: tuple[str, ...] = ("gvi_ter", "terrain")
+
+# NDVI, as NDVIEngine names its vector chunks and raster band.
+NDVI_COLUMNS: tuple[str, ...] = ("ndvi",)
+
+CHANNEL_COLUMNS: Mapping[str, tuple[str, ...]] = {
+    "veg": VEG_COLUMNS,
+    "terrain": TERRAIN_COLUMNS,
+    "ndvi": NDVI_COLUMNS,
+}
+
+
+def _assert_channels_disjoint() -> None:
+    """Guard the invariant the rest of this module's strictness rests on."""
+    seen: dict[str, str] = {}
+    for channel, names in CHANNEL_COLUMNS.items():
+        for name in names:
+            key = name.lower()
+            if key in seen:
+                raise RuntimeError(
+                    f"Greenery column alias {name!r} is claimed by both "
+                    f"{seen[key]!r} and {channel!r}; channels must stay "
+                    "distinguishable."
+                )
+            seen[key] = channel
+
+
+_assert_channels_disjoint()
+
+
+def channel_columns(channel: str) -> tuple[str, ...]:
+    """Accepted column names for *channel*, in resolution order."""
+    try:
+        return CHANNEL_COLUMNS[channel]
+    except KeyError:
+        raise ValueError(
+            f"Unknown greenery channel {channel!r}; expected one of "
+            f"{list(CHANNEL_COLUMNS)}."
+        ) from None
+
+
+def resolve_channel_column(columns: Iterable[str], channel: str) -> str:
+    """The column in *columns* holding *channel*'s values.
+
+    Matches case-insensitively against :func:`channel_columns`. Raises
+    ``ValueError`` naming the accepted spellings when none is present, rather
+    than falling back to a column that may belong to another channel.
+    """
+    names = channel_columns(channel)
+    available = [str(c) for c in columns]
+    col = match_column_alias(available, names)
+    if col is None:
+        raise ValueError(
+            f"No {channel!r} column found. Expected one of {list(names)}; got "
+            f"{available}."
+        )
+    return col
 
 
 class LongitudinalMetricSources:
@@ -74,19 +145,6 @@ class LongitudinalMetricSources:
             self._identity_cache[path] = cached
         return cached
 
-    def group_keys_by_identity(
-        self, channel: str, keys: Iterable[str]
-    ) -> dict[str, list[str]]:
-        """Temporal keys of *channel* bucketed by the file they resolve to.
-
-        Keys in one bucket read the same file, so whatever is computed from it
-        holds for all of them.
-        """
-        groups: dict[str, list[str]] = {}
-        for key in keys:
-            groups.setdefault(self.identity(channel, key), []).append(str(key))
-        return groups
-
     # ------------------------------------------------------------- retrieval
 
     def get(self, channel: str, key: str) -> Any:
@@ -122,45 +180,6 @@ class LongitudinalMetricSources:
 
     def __exit__(self, *_exc: object) -> None:
         self.release()
-
-
-class PreloadedMetricSources(LongitudinalMetricSources):
-    """Adapter for callers that already hold every source in memory.
-
-    Keeps the same interface so the engine has one code path, but never loads
-    or frees anything: :meth:`release` is a no-op because the caller, not this
-    object, owns the sources.
-    """
-
-    def __init__(self, data: Mapping[str, Mapping[str, Any]]) -> None:
-        super().__init__({}, lambda _p, _c: None)
-        self._data: dict[str, dict[str, Any]] = {
-            str(ch): dict(per_key) for ch, per_key in data.items()
-        }
-        self._paths = {ch: {} for ch in self._data}
-
-    @property
-    def channels(self) -> list[str]:
-        return list(self._data)
-
-    def keys_for(self, channel: str) -> list[str]:
-        return list(self._data.get(channel, {}))
-
-    def has_channel(self, channel: str) -> bool:
-        return channel in self._data
-
-    def path(self, channel: str, key: str) -> str | None:
-        return None
-
-    def identity(self, channel: str, key: str) -> str:
-        src = self._data.get(channel, {}).get(key)
-        return f"{channel}@obj:{id(src)}"
-
-    def get(self, channel: str, key: str) -> Any:
-        return self._data.get(channel, {}).get(key)
-
-    def release(self) -> None:
-        return None
 
 
 def _close_source(src: Any) -> None:

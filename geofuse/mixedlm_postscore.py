@@ -82,13 +82,17 @@ def _pool_summary_rows(
     return rows
 
 
+# Trials re-scored per pool, highest out-of-bag score first, to bound the
+# MixedLM fits; and the file the per-trial rows land in.
+_MAX_TRIALS: int = 200
+_CSV_BASENAME: str = "mixedlm_metrics.csv"
+
+
 def compute_post_metrics(
     engine,
     output_dir: str,
     *,
     winning_params: dict,
-    max_trials: int = 200,
-    csv_basename: str = "mixedlm_metrics.csv",
     log: Any = None,
 ) -> str | None:
     """Re-score the stability winner's trials + the final composite on the
@@ -100,7 +104,7 @@ def compute_post_metrics(
     * ``winning_cell`` — every trial whose snapped weight cell matches the
       selected channel mix, reconstructed from the per-trial
       ``__trial_history__`` the stability search recorded. Capped at
-      ``max_trials`` (highest out-of-bag score first) to bound MixedLM fits.
+      :data:`_MAX_TRIALS` (highest out-of-bag score first) to bound MixedLM fits.
     * ``final`` — the averaged winning parameters the composite was built from.
 
     No-op (returns ``None``) for cross-sectional runs, when there's no test
@@ -130,8 +134,8 @@ def compute_post_metrics(
         ),
         reverse=higher,
     )
-    if max_trials and len(cell_rows) > max_trials:
-        cell_rows = cell_rows[:max_trials]
+    if len(cell_rows) > _MAX_TRIALS:
+        cell_rows = cell_rows[:_MAX_TRIALS]
 
     final_clean = {k: v for k, v in winning_params.items() if not k.startswith("__")}
 
@@ -185,7 +189,7 @@ def compute_post_metrics(
         return None
 
     os.makedirs(output_dir, exist_ok=True)
-    csv_path = os.path.join(output_dir, csv_basename)
+    csv_path = os.path.join(output_dir, _CSV_BASENAME)
     # ``n_trials`` is its own column so the metric columns hold only metric
     # values.
     fields = (

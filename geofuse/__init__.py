@@ -29,13 +29,3 @@ class JobCancelled(BaseException):
     degraded result. A cancel must travel through those untouched and reach
     the runner's own handler, which ends the run.
     """
-
-
-def is_ready():
-    """Return True if CUDA is available (False if torch is missing)."""
-    try:
-        import torch
-
-        return torch.cuda.is_available()
-    except ImportError:
-        return False

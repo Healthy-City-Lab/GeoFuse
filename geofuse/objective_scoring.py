@@ -105,8 +105,6 @@ BINARY_ONLY_METRICS: frozenset[str] = frozenset({"logit_tstat", "logit_coef"})
 
 # The default cross-sectional objective: partial distance correlation captures
 # linear and nonlinear association while conditioning on covariates nonlinearly.
-DEFAULT_METRIC: str = "partial_distance_corr"
-
 # Metrics whose return value is "higher is better" — useful when the caller
 # needs a uniform direction for ranking. ``nrmse`` is the only one where lower
 # is better.

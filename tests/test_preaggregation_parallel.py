@@ -312,12 +312,12 @@ class TestSpawnSurvivesAStaleMainModule(unittest.TestCase):
             main.__spec__ = previous_spec
 
     def test_pool_still_runs(self):
-        from geofuse import metric_columns
+        from geofuse import metric_intake
 
         with self._dangling_main():
             results = []
             completed = parallel.map_batches(
-                metric_columns.channel_columns,
+                metric_intake.channel_columns,
                 [("veg",), ("ndvi",)],
                 workers=2,
                 on_result=results.append,

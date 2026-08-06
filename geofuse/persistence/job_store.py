@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from geofuse.logger import drop_job_log_buffer
-from geofuse.persistence.sqlite_utils import open_wal_connection
+from geofuse.persistence.caches import open_wal_connection
 
 _TERMINAL_STATUSES: frozenset[str] = frozenset(
     {"completed", "error", "cancelled", "interrupted"}
@@ -245,11 +245,6 @@ class JobStore:
                 return
             rec.cancel_event.set()
 
-    def is_cancel_requested(self, job_id: str) -> bool:
-        with self._lock:
-            rec = self._records.get(job_id)
-            return bool(rec and rec.cancel_event.is_set())
-
     # ────────────────────────────────────────────────────────────
     # Pause / resume
     # ────────────────────────────────────────────────────────────
@@ -274,11 +269,6 @@ class JobStore:
             rec.status_text = "Resuming..."
             rec._dirty = True
 
-    def is_pause_requested(self, job_id: str) -> bool:
-        with self._lock:
-            rec = self._records.get(job_id)
-            return bool(rec and rec.pause_event.is_set())
-
     # ────────────────────────────────────────────────────────────
     # Reads (return snapshots; safe to use without holding the lock)
     # ────────────────────────────────────────────────────────────
@@ -294,10 +284,6 @@ class JobStore:
     def list_active(self) -> list[JobRecord]:
         with self._lock:
             return [r for r in self._records.values() if r.status in _ACTIVE_STATUSES]
-
-    def list_terminal(self) -> list[JobRecord]:
-        with self._lock:
-            return [r for r in self._records.values() if r.status in _TERMINAL_STATUSES]
 
     def health(self, stuck_after_s: float = 30.0) -> dict:
         """Snapshot for the sidebar badge."""
@@ -350,11 +336,6 @@ class JobStore:
     # ────────────────────────────────────────────────────────────
     # Cleanup
     # ────────────────────────────────────────────────────────────
-
-    def dismiss(self, job_id: str) -> None:
-        """Drop from in-memory view. SQLite row stays for history."""
-        with self._lock:
-            self._records.pop(job_id, None)
 
     def purge(self, job_id: str) -> None:
         """Remove from both in-memory and SQLite, plus drop the log buffer."""

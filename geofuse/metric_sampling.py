@@ -22,7 +22,7 @@ import pandas as pd
 import rasterio
 from rasterio.transform import rowcol
 
-from . import metric_columns
+from . import metric_intake
 
 
 def nearest_metric_join_multi(
@@ -228,7 +228,7 @@ def vector_metric_column(metric_data: gpd.GeoDataFrame, channel: str) -> str:
     metric_col = metric_data.attrs.get("metric_column")
     if metric_col and metric_col in metric_data.columns:
         return str(metric_col)
-    return metric_columns.resolve_channel_column(metric_data.columns, channel)
+    return metric_intake.resolve_channel_column(metric_data.columns, channel)
 
 
 def _bin_into_rings(

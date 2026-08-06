@@ -45,8 +45,6 @@ DEFAULT_WAVE_INDEX = 0
 # footprint. ``median`` is served from ``p50``.
 PERCENTILES: tuple[int, ...] = (10, 25, 50, 75, 90)
 STAT_COLUMNS: tuple[str, ...] = ("mean",) + tuple(f"p{p}" for p in PERCENTILES)
-CHANNELS: tuple[str, ...] = ("veg", "terrain", "ndvi")
-
 _N_STATS = len(STAT_COLUMNS)
 # Greenery metrics (GVI/NDVI) are fractions; four decimals is the useful
 # resolution, so stored values are rounded there. This drops noise digits (so
@@ -552,175 +550,6 @@ def vector_batch_geometry_stats(
             if valid.any():
                 out[ei, ri, :] = compute_all_stats(vals[valid])
     return out
-
-
-def batch_geometry_stats(
-    entity_geoms_in_grid_crs: list,
-    channels_meta: list,
-    *,
-    cancel_check: Any = None,
-) -> dict | None:
-    """Per-channel pre-aggregation stats over ``entity.buffer(R)`` for a batch.
-
-    Returns ``{channel_name: ndarray[n_entities, n_radii, n_stats]}``, or
-    ``None`` if ``cancel_check`` (an optional zero-arg callable) starts
-    returning truthy mid-batch — the caller treats ``None`` as "this
-    batch was abandoned" and skips the write; the next resume picks the
-    same entities up because they're still in the pending list.
-
-    Loop structure (per the user-facing semantic that buffering is the
-    expensive bit): for each entity, walk channels and their radii; cache
-    each unique buffered geometry per ``(entity, effective_radius)`` so
-    channels that share a radius — e.g. raster channels with the same R,
-    or vector channels with the same ``cell_buffer_m`` — reuse one
-    buffered polygon instead of rebuilding it per channel.
-
-    ``entity_geoms_in_grid_crs`` are the entity geometries in the
-    pre-aggregation grid CRS (a projected metres CRS picked by
-    :func:`geofuse.crs_utils.select_grid_crs`). Each ``channels_meta``
-    entry is a dict with:
-
-      - ``name``: ``"veg"`` / ``"terrain"`` / ``"ndvi"`` (cache key).
-      - ``kind``: ``"vector"`` or ``"raster"``.
-      - ``radii``: tuple of radii (metres) to aggregate over.
-      - ``cell_buffer_m``: extra buffer to add for vector metrics so
-        cells touching the entity are counted (raster-equivalent
-        semantic); ignored / 0 for raster channels.
-      - Vector channels: ``gdf`` (in grid CRS), ``col``, ``sindex``,
-        ``values`` (numpy float32 aligned with the gdf rows).
-      - Raster channels: ``array``, ``raster_transform``, optionally
-        ``to_raster_crs`` (a :class:`pyproj.Transformer` reprojecting
-        the buffer from grid CRS to the raster's CRS — leave ``None``
-        when they already match).
-    """
-    n = len(entity_geoms_in_grid_crs)
-    output = {
-        m["name"]: np.full((n, len(m["radii"]), _N_STATS), np.nan, dtype=np.float32)
-        for m in channels_meta
-    }
-    if n == 0:
-        return output
-
-    # Pre-resolve per-channel data references once (avoids repeated dict
-    # lookups in the hot inner loop). For both vector and raster channels,
-    # ``xy_fn`` is the (x, y) reprojection from grid CRS to the metric's
-    # native CRS — ``None`` when the metric is already in the grid CRS.
-    resolved: list = []
-    for meta in channels_meta:
-        kind = meta["kind"]
-        if kind == "vector":
-            transformer = meta.get("to_metric_crs")
-            xy_fn = None
-            if transformer is not None:
-                xy_fn = (
-                    transformer.transform
-                    if hasattr(transformer, "transform")
-                    else transformer
-                )
-            resolved.append(
-                {
-                    "name": meta["name"],
-                    "kind": "vector",
-                    "radii": meta["radii"],
-                    "cell": float(meta.get("cell_buffer_m", 0.0)),
-                    "sindex": meta["sindex"],
-                    "gdf": meta["gdf"],
-                    "values": meta["values"],
-                    "xy_fn": xy_fn,
-                }
-            )
-        else:
-            transformer = meta.get("to_raster_crs")
-            xy_fn = None
-            if transformer is not None:
-                xy_fn = (
-                    transformer.transform
-                    if hasattr(transformer, "transform")
-                    else transformer
-                )
-            resolved.append(
-                {
-                    "name": meta["name"],
-                    "kind": "raster",
-                    "radii": meta["radii"],
-                    "cell": 0.0,
-                    "array": meta["array"],
-                    "raster_transform": meta["raster_transform"],
-                    "xy_fn": xy_fn,
-                    "shape": meta["array"].shape,
-                }
-            )
-
-    # Origin-centred circle templates covering every effective radius any
-    # channel asks for, so Point entities translate instead of re-buffering.
-    templates = origin_circle_templates(
-        [float(r) + m["cell"] for m in resolved for r in m["radii"]]
-    )
-
-    for entity_idx, entity in enumerate(entity_geoms_in_grid_crs):
-        # Cancellation check fires once per entity (not per channel /
-        # radius — the cost would dominate otherwise). For typical
-        # entity counts of 10²–10⁴ this gives ms-to-sub-second cancel
-        # latency without measurable per-call overhead.
-        if cancel_check is not None and cancel_check():
-            return None
-        if entity is None or entity.is_empty:
-            continue
-        # Per-entity buffer cache keyed by effective buffer distance in
-        # the grid CRS. Two channels sharing the same effective radius
-        # reuse one buffered geometry.
-        buffer_cache: dict = {}
-
-        def _disc(r_eff: float, _entity=entity, _cache=buffer_cache):
-            g = _cache.get(r_eff)
-            if g is None:
-                g = buffer_at(_entity, r_eff, templates)
-                _cache[r_eff] = g
-            return g
-
-        for meta in resolved:
-            ch = meta["name"]
-            radii = meta["radii"]
-            cell = meta["cell"]
-            kind = meta["kind"]
-            eff_radii = [float(r) + cell for r in radii]
-            discs = [_disc(r_eff) for r_eff in eff_radii]
-
-            if kind == "raster":
-                output[ch][entity_idx, :, :] = raster_disc_stats(
-                    discs,
-                    meta["array"],
-                    meta["raster_transform"],
-                    xy_fn=meta["xy_fn"],
-                )
-                continue
-
-            sindex = meta["sindex"]
-            values = meta["values"]
-            discs_metric = reproject_geoms(discs, meta["xy_fn"])
-            for r_idx, buf_for_query in enumerate(discs_metric):
-                try:
-                    hits = np.asarray(
-                        sindex.query(buf_for_query, predicate="intersects"),
-                        dtype=np.int64,
-                    )
-                except TypeError:
-                    hits = np.asarray(
-                        list(sindex.intersection(buf_for_query.bounds)),
-                        dtype=np.int64,
-                    )
-                    if len(hits):
-                        geoms = meta["gdf"].geometry.iloc[hits]
-                        keep = geoms.intersects(buf_for_query).to_numpy()
-                        hits = hits[keep]
-                if len(hits) == 0:
-                    continue
-                vals = values[hits]
-                valid = ~np.isnan(vals)
-                if valid.any():
-                    output[ch][entity_idx, r_idx, :] = compute_all_stats(vals[valid])
-
-    return output
 
 
 def raster_batch_geometry_stats(
@@ -1304,11 +1133,6 @@ class GreeneryCache:
         if plan is None:
             return None
         return self.gather(plan, channel, radius, column)
-
-    def resident_ids(self, wave_index: int) -> np.ndarray | None:
-        cfg = self._wave_unit.get(int(wave_index))
-        unit = self._units.get(cfg) if cfg is not None else None
-        return None if unit is None else unit["ids"]
 
     # -------------------------------------------------------------- utilities
     @staticmethod

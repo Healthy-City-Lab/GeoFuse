@@ -70,8 +70,6 @@ logger = logging.getLogger(__name__)
 GEE_LOGIT_METRICS: tuple[str, ...] = ("gee_logit_tstat", "gee_logit_coef")
 
 #: Metric names for a binary outcome on the single-wave path.
-LOGIT_METRICS: tuple[str, ...] = ("logit_tstat", "logit_coef")
-
 #: Score returned for a degenerate input, so a bad trial fails soft rather than
 #: aborting the study — the same convention the Gaussian scorer uses.
 _DEGENERATE: dict[str, float] = {

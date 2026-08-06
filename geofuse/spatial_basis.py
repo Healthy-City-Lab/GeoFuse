@@ -48,6 +48,10 @@ from sklearn.neighbors import NearestNeighbors
 # neighbour chains; a void wider than the local k-NN reach severs the graph.
 _DEFAULT_KNN: int = 10
 
+# Upper bound on knots per component, before the df-many coarsest eigenvectors
+# are taken. Caps the O(k^3) energy-matrix eigendecomposition on dense areas.
+_KNOT_CAP: int = 150
+
 
 def _tps_eta(r: np.ndarray) -> np.ndarray:
     """Thin-plate radial kernel ``r² log r`` in 2-D, with ``η(0) = 0``."""
@@ -215,26 +219,19 @@ class SpatialBasis:
 
 
 def build_block_basis(
-    xy: np.ndarray,
-    *,
-    max_df: int = 10,
-    eps: float | None = None,
-    knn: int = _DEFAULT_KNN,
-    knot_cap: int = 150,
-    family: str = "tprs",
+    xy: np.ndarray, *, max_df: int = 10, eps: float | None = None
 ) -> SpatialBasis:
     """Assemble the per-component block-diagonal spatial basis for ``xy``.
 
-    ``xy`` is an ``[n, 2]`` array of entity coordinates in a metre CRS. ``max_df``
-    bounds the radial functions per component. ``family`` selects the basis
-    family; only ``"tprs"`` (thin-plate regression spline) is implemented.
+    ``xy`` is an ``[n, 2]`` array of entity coordinates in a metre CRS.
+    ``max_df`` bounds the radial functions per component; ``eps`` is forwarded
+    to :func:`connected_components`. The basis is a thin-plate regression
+    spline, with knots capped at :data:`_KNOT_CAP`.
 
     Non-finite rows contribute no spatial columns (they fall back to covariate
     control). Returns a :class:`SpatialBasis`; ``has_spatial`` is ``False`` when
     the geometry is degenerate (all coincident / too few points).
     """
-    if family != "tprs":
-        raise ValueError(f"Unknown spatial basis family '{family}'.")
     xy = np.asarray(xy, dtype=np.float64)
     if xy.ndim != 2 or xy.shape[1] != 2:
         raise ValueError(f"xy must be [n, 2]; got shape {xy.shape}.")
@@ -258,7 +255,7 @@ def build_block_basis(
         return base
 
     labels = np.full(n, -1, dtype=np.int64)
-    lab_f, eps_used = connected_components(xy[finite], eps=eps, k=knn)
+    lab_f, eps_used = connected_components(xy[finite], eps=eps)
     labels[finite] = lab_f
 
     n_comp = int(lab_f.max()) + 1 if len(lab_f) else 0
@@ -281,7 +278,9 @@ def build_block_basis(
             ind = np.zeros(n, dtype=np.float64)
             ind[idx] = 1.0
             intercept_cols.append(ind)
-        lin_c, phi_c = _component_columns(xy[idx], max_df=max_df, knot_cap=knot_cap)
+        lin_c, phi_c = _component_columns(
+            xy[idx], max_df=max_df, knot_cap=_KNOT_CAP
+        )
         knots_per_component.append(int(phi_c.shape[1]))
         for j in range(lin_c.shape[1]):
             col = np.zeros(n, dtype=np.float64)

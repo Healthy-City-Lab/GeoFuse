@@ -32,7 +32,7 @@ from .ee_utils import (
 )
 from .jobs import NDVI_PROGRESS_MIN_TILES, ProgressThrottle, retry_with_backoff
 from .logger import attach_external_logger, get_logger
-from .persistence.ndvi_tile_cache import DEFAULT_MAX_BYTES, NdviTileCache
+from .persistence.caches import DEFAULT_MAX_BYTES, NdviTileCache
 from .vector_io import geometry_sha256
 
 _log = get_logger("NDVI")

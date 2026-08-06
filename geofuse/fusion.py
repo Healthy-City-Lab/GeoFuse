@@ -52,7 +52,8 @@ from .crs_utils import (
 )
 from .logger import attach_external_logger, get_logger
 from .raster_sampling import LAZY_RASTER_THRESHOLD_BYTES, LazyRasterArray
-from . import metric_columns, metric_sources
+from . import fusion_helpers as _helpers
+from . import metric_intake
 from .vector_io import (
     geometry_sha256,
     match_column_alias,
@@ -506,10 +507,10 @@ class MetricFusionEngine:
         # to long format inside ``prepare_fusion_data``.
         self._longitudinal_wave_frames: list[tuple[str, gpd.GeoDataFrame]] | None = None
         # Per-temporal-key metric sources for the mixed-effects mode. Populated
-        # by ``set_longitudinal_metric_sources`` (paths, loaded on demand) or
-        # ``set_longitudinal_metric_data`` (already-loaded objects) before
-        # ``precompute_aggregations``. Cross-sectional runs leave this ``None``.
-        self._metric_sources: metric_sources.LongitudinalMetricSources | None = None
+        # by ``set_longitudinal_metric_sources`` (paths, loaded on demand)
+        # before ``precompute_aggregations``. Cross-sectional runs leave this
+        # ``None``.
+        self._metric_sources: metric_intake.LongitudinalMetricSources | None = None
 
         if self.is_longitudinal and self.is_raster:
             raise ValueError(
@@ -572,41 +573,9 @@ class MetricFusionEngine:
             if channel not in paths:
                 raise ValueError(f"metric source paths are missing {channel!r}.")
             self._validate_temporal_coverage(paths[channel])
-        self._metric_sources = metric_sources.LongitudinalMetricSources(
+        self._metric_sources = metric_intake.LongitudinalMetricSources(
             paths, loader
         )
-
-    def set_longitudinal_metric_data(
-        self,
-        channel: str,
-        per_wave_data: dict[str, Any],
-    ) -> None:
-        """Inject already-loaded per-temporal-key metric data for one channel.
-
-        The streaming path (:meth:`set_longitudinal_metric_sources`) is what
-        the runner uses; this variant keeps callers that already hold every
-        source in memory working, and is convenient in tests. Sources passed
-        here are owned by the caller and never released by the engine.
-        """
-        if not self.is_longitudinal:
-            raise RuntimeError(
-                "set_longitudinal_metric_data() requires longitudinal_spec to be set."
-            )
-        if channel not in longitudinal.GREENERY_CHANNELS:
-            raise ValueError(
-                f"Unknown channel {channel!r}; expected one of "
-                f"{longitudinal.GREENERY_CHANNELS}."
-            )
-        self._validate_temporal_coverage(per_wave_data)
-        existing = {}
-        if isinstance(self._metric_sources, metric_sources.PreloadedMetricSources):
-            existing = {
-                ch: {k: self._metric_sources.get(ch, k)
-                     for k in self._metric_sources.keys_for(ch)}
-                for ch in self._metric_sources.channels
-            }
-        existing[channel] = dict(per_wave_data)
-        self._metric_sources = metric_sources.PreloadedMetricSources(existing)
 
     def set_longitudinal_wave_frames(
         self, frames: list[tuple[str, gpd.GeoDataFrame]]
@@ -1075,8 +1044,8 @@ class MetricFusionEngine:
             except Exception as exc:
                 logger.debug(f"Failed to read combined GVI vector: {exc}")
                 return False
-            veg_col = match_column_alias(gdf.columns, metric_columns.VEG_COLUMNS)
-            ter_col = match_column_alias(gdf.columns, metric_columns.TERRAIN_COLUMNS)
+            veg_col = match_column_alias(gdf.columns, metric_intake.VEG_COLUMNS)
+            ter_col = match_column_alias(gdf.columns, metric_intake.TERRAIN_COLUMNS)
             if not (veg_col and ter_col):
                 return False
             if gdf.crs is None:
@@ -1110,9 +1079,9 @@ class MetricFusionEngine:
             if load_multiband_gvi(veg_file):
                 pass
             else:
-                self.veg_data = self._load_metric_file(veg_file, "veg")
+                self.veg_data = _helpers.load_metric_file(veg_file, "veg")
                 if terrain_file and os.path.exists(terrain_file):
-                    self.terrain_data = self._load_metric_file(terrain_file, "terrain")
+                    self.terrain_data = _helpers.load_metric_file(terrain_file, "terrain")
                 elif not terrain_file or not os.path.exists(terrain_file):
                     logger.warning(
                         "Veg file provided but terrain file missing. Auto-downloading terrain..."
@@ -1123,7 +1092,7 @@ class MetricFusionEngine:
                         progress_callback=progress_callback,
                         cancel_callback=cancel_callback,
                     )
-                    self.terrain_data = self._load_metric_file(terrain_file, "terrain")
+                    self.terrain_data = _helpers.load_metric_file(terrain_file, "terrain")
         # Check if uploaded veg_file is a combined GVI vector
         # (single GeoPackage / GeoJSON with both ``gvi_veg`` and ``gvi_ter``
         # columns — the default shape produced by ``geofuse.gvi``).
@@ -1146,8 +1115,8 @@ class MetricFusionEngine:
                     progress_callback=progress_callback,
                     cancel_callback=cancel_callback,
                 )
-                self.veg_data = self._load_metric_file(veg_file, "veg")
-                self.terrain_data = self._load_metric_file(terrain_file, "terrain")
+                self.veg_data = _helpers.load_metric_file(veg_file, "veg")
+                self.terrain_data = _helpers.load_metric_file(terrain_file, "terrain")
         # Load separate veg/terrain files if provided
         elif (
             veg_file
@@ -1156,8 +1125,8 @@ class MetricFusionEngine:
             and os.path.exists(terrain_file)
         ):
             logger.info("Loading separate veg and terrain files...")
-            self.veg_data = self._load_metric_file(veg_file, "veg")
-            self.terrain_data = self._load_metric_file(terrain_file, "terrain")
+            self.veg_data = _helpers.load_metric_file(veg_file, "veg")
+            self.terrain_data = _helpers.load_metric_file(terrain_file, "terrain")
         # Auto-download if nothing provided
         elif (not veg_file or not os.path.exists(veg_file)) and (
             not terrain_file or not os.path.exists(terrain_file)
@@ -1169,16 +1138,16 @@ class MetricFusionEngine:
                 progress_callback=progress_callback,
                 cancel_callback=cancel_callback,
             )
-            self.veg_data = self._load_metric_file(veg_file, "veg")
-            self.terrain_data = self._load_metric_file(terrain_file, "terrain")
+            self.veg_data = _helpers.load_metric_file(veg_file, "veg")
+            self.terrain_data = _helpers.load_metric_file(terrain_file, "terrain")
         else:
             # Partial files provided - try to load what we have
             if veg_file and os.path.exists(veg_file):
                 logger.info(f"Loading vegetation from: {veg_file}")
-                self.veg_data = self._load_metric_file(veg_file, "veg")
+                self.veg_data = _helpers.load_metric_file(veg_file, "veg")
             if terrain_file and os.path.exists(terrain_file):
                 logger.info(f"Loading terrain from: {terrain_file}")
-                self.terrain_data = self._load_metric_file(terrain_file, "terrain")
+                self.terrain_data = _helpers.load_metric_file(terrain_file, "terrain")
 
         # Validate that we have both veg and terrain data
         if self.veg_data is None or self.terrain_data is None:
@@ -1199,7 +1168,7 @@ class MetricFusionEngine:
         if ndvi_file and os.path.exists(ndvi_file) and not force_download:
             logger.info(f"Loading NDVI from: {ndvi_file}")
             self._validate_metric_bounds(ndvi_file)
-            self.ndvi_data = self._load_metric_file(ndvi_file, "ndvi")
+            self.ndvi_data = _helpers.load_metric_file(ndvi_file, "ndvi")
         else:
             if force_download:
                 logger.info("Force download enabled. Skipping cache check for NDVI...")
@@ -1215,7 +1184,7 @@ class MetricFusionEngine:
             )
             if cancel_callback and cancel_callback():
                 return
-            self.ndvi_data = self._load_metric_file(ndvi_file, "ndvi")
+            self.ndvi_data = _helpers.load_metric_file(ndvi_file, "ndvi")
 
         # Pre-crop every metric source to the target's buffered extent
         # (target.bounds + buffer_meters, which is max(GVI, NDVI) buffer).
@@ -1319,48 +1288,6 @@ class MetricFusionEngine:
             )
         return False
 
-    def _load_metric_file(
-        self, filepath: str, channel: str
-    ) -> gpd.GeoDataFrame | dict:
-        """Load one channel's metric from GeoJSON or GeoTIFF."""
-        if filepath.endswith((".tif", ".tiff")):
-            with rasterio.open(filepath) as src:
-                transform, crs, bounds = src.transform, src.crs, src.bounds
-                itemsize = np.dtype(src.dtypes[0]).itemsize
-                est_bytes = src.width * src.height * itemsize
-                data = (
-                    src.read(1, masked=True)
-                    if est_bytes <= LAZY_RASTER_THRESHOLD_BYTES
-                    else None
-                )
-            if data is None:
-                # Too large to hold in RAM (national-scale): read windows from
-                # disk on demand instead. Each thread gets its own handle.
-                data = LazyRasterArray(filepath, band=1)
-                logger.info(
-                    f"Metric raster ~{est_bytes / (1024**2):.0f} MB exceeds the "
-                    f"in-memory threshold; reading windows lazily from {filepath}"
-                )
-            return {
-                "data": data,
-                "transform": transform,
-                "crs": crs,
-                "bounds": bounds,
-            }
-        else:
-            # Only the channel's own column is sampled, so the rest of the
-            # file's schema never needs to reach memory.
-            gdf, metric_col = read_vector_aliased_column(
-                filepath,
-                metric_columns.channel_columns(channel),
-                description=f"{channel} metric value",
-            )
-            if gdf.crs is None:
-                gdf.set_crs("EPSG:4326", inplace=True)
-            gdf = normalize_geographic_gdf_to_wgs84(gdf)
-            gdf.attrs["metric_column"] = metric_col
-            return gdf
-
     def _get_cache_filename(self, metric_type: str, extension: str = ".geojson") -> str:
         """Generate deterministic cache filename based on target file and boundary."""
 
@@ -1453,16 +1380,6 @@ class MetricFusionEngine:
             for i, band_data in enumerate(bands, 1):
                 dst.write(band_data, i)
                 dst.set_band_description(i, value_cols[i - 1])
-
-    def _cache_metric(self, source_file: str, metric_type: str) -> None:
-        """Cache metric file with standardized naming."""
-        import shutil
-
-        ext = os.path.splitext(source_file)[1]
-        cache_path = self._get_cache_filename(metric_type, ext)
-
-        shutil.copy(source_file, cache_path)
-        logger.info(f"Cached {metric_type} to: {cache_path}")
 
     def _auto_download_gvi_both(
         self,
@@ -1723,211 +1640,6 @@ class MetricFusionEngine:
         logger.info(f"NDVI downloaded: {result['tif']}")
         return result["tif"]
 
-    def _apply_circular_buffer_aggregation(
-        self,
-        points_gdf: gpd.GeoDataFrame,
-        metric_data: gpd.GeoDataFrame | dict,
-        radius_meters: float,
-        stat: str,
-        percentile: int = 50,
-    ) -> np.ndarray:
-        """
-        Apply circular buffer aggregation to sample metric at point locations.
-
-        This matches CGI.ipynb calculate_gm() logic:
-        - Creates circular buffer around each point
-        - Samples all metric values within buffer
-        - Aggregates using specified statistic (mean/median/percentile)
-
-        Args:
-            points_gdf: GeoDataFrame with point geometries
-            metric_data: Raster dict or vector GeoDataFrame to sample from
-            radius_meters: Buffer radius in meters
-            stat: Aggregation function ('mean', 'median', 'percentile')
-            percentile: Percentile value if stat='percentile'
-
-        Returns:
-            Array of aggregated metric values for each point
-        """
-        result = np.full(len(points_gdf), np.nan)
-
-        # Create mapping from original index to position for correct array indexing
-        idx_to_pos = {idx: pos for pos, idx in enumerate(points_gdf.index)}
-
-        if isinstance(metric_data, dict):  # Raster
-            metric_array = metric_data["data"]
-            transform = metric_data["transform"]
-            metric_crs = metric_data["crs"]
-
-            # Same footprint the pre-aggregation cache reduces over: buffer the
-            # entity in a projected (metres) CRS and reproject the buffer into
-            # the raster's CRS, so the sampled disc is metrically true whatever
-            # the raster's CRS.
-            from rasterio.windows import Window as _Window
-            from rasterio.windows import transform as _window_transform
-
-            if points_gdf.crs is not None and crs_uses_metre_axes(points_gdf.crs):
-                buffer_crs = points_gdf.crs
-            else:
-                buffer_crs = estimate_metre_projected_crs_for_gdf(points_gdf)
-            pts_buf_crs = points_gdf.to_crs(buffer_crs)
-            if str(buffer_crs) != str(metric_crs):
-                from pyproj import Transformer as _Transformer
-
-                xy_fn = _Transformer.from_crs(
-                    buffer_crs, metric_crs, always_xy=True
-                ).transform
-            else:
-                xy_fn = None
-
-            templates = preaggregation.origin_circle_templates([float(radius_meters)])
-            h, w = int(metric_array.shape[0]), int(metric_array.shape[1])
-            for idx, geom in zip(
-                pts_buf_crs.index, pts_buf_crs.geometry.to_numpy()
-            ):
-                if geom is None or geom.is_empty:
-                    continue
-                disc = preaggregation.reproject_geoms(
-                    [preaggregation.buffer_at(geom, float(radius_meters), templates)],
-                    xy_fn,
-                )[0]
-                if disc is None or disc.is_empty:
-                    continue
-                minx, miny, maxx, maxy = disc.bounds
-                r1, c1 = rowcol(transform, minx, maxy)
-                r2, c2 = rowcol(transform, maxx, miny)
-                rmin = max(0, min(int(r1), int(r2)))
-                rmax = min(h, max(int(r1), int(r2)) + 1)
-                cmin = max(0, min(int(c1), int(c2)))
-                cmax = min(w, max(int(c1), int(c2)) + 1)
-                if rmin >= rmax or cmin >= cmax:
-                    continue
-
-                window = metric_array[rmin:rmax, cmin:cmax]
-                data = np.asarray(np.ma.getdata(window), dtype=np.float64)
-                base_valid = ~np.ma.getmaskarray(window) & ~np.isnan(data)
-                if not base_valid.any():
-                    continue
-                win_transform = _window_transform(
-                    _Window(cmin, rmin, cmax - cmin, rmax - rmin), transform
-                )
-                ring = preaggregation.ring_index_grid(
-                    [disc], window.shape, win_transform
-                )
-                if ring is None:
-                    continue
-                values = data[base_valid & (ring == 0)]
-
-                if len(values) > 0:
-                    pos = idx_to_pos[idx]
-                    if stat == "mean":
-                        result[pos] = np.mean(values)
-                    elif stat == "median":
-                        result[pos] = np.median(values)
-                    elif stat == "percentile":
-                        result[pos] = np.percentile(values, percentile)
-
-        else:  # Vector GeoDataFrame
-            # For vector data, use spatial join with buffered points
-            # Convert both to a common metric CRS for accurate buffering
-
-            # Determine appropriate UTM zone from point data
-            # Convert to WGS84 first to get proper geographic coordinates (lon/lat in degrees)
-            points_wgs84 = points_gdf.to_crs("EPSG:4326")
-            centroid = points_wgs84.geometry.union_all().centroid
-            lon = centroid.x
-            lat = centroid.y
-
-            # Validate we actually have geographic coordinates (lon should be -180 to 180)
-            if not (-180 <= lon <= 180):
-                raise ValueError(
-                    f"Invalid longitude {lon} after WGS84 conversion. "
-                    f"Input CRS was {points_gdf.crs}, conversion may have failed."
-                )
-
-            # Calculate UTM zone from geographic coordinates
-            utm_zone = int((lon + 180) / 6) + 1
-            # Determine hemisphere
-            if lat >= 0:
-                utm_crs = f"EPSG:326{utm_zone:02d}"  # Northern hemisphere
-            else:
-                utm_crs = f"EPSG:327{utm_zone:02d}"  # Southern hemisphere
-
-            # Convert to UTM for buffering
-            points_utm = points_gdf.to_crs(utm_crs)
-            metric_utm = metric_data.to_crs(utm_crs)
-
-            # Create buffers in UTM (meters)
-            points_buffered = points_utm.copy()
-            points_buffered["geometry"] = points_utm.buffer(radius_meters)
-
-            # Spatial join to find metrics within buffers
-            joined = gpd.sjoin(
-                points_buffered, metric_utm, how="left", predicate="intersects"
-            )
-
-            # Detect metric column
-            metric_col = metric_data.attrs.get("metric_column")
-            if metric_col is None or metric_col not in metric_data.columns:
-                numeric_cols = metric_data.select_dtypes(
-                    include=[np.number]
-                ).columns.tolist()
-                # Filter out geometry-related columns
-                numeric_cols = [
-                    c
-                    for c in numeric_cols
-                    if c not in ["index_right", "index_left", "index"]
-                ]
-                if numeric_cols:
-                    metric_col = numeric_cols[0]
-                else:
-                    logger.warning(
-                        f"No numeric columns found in metric data. Columns: {metric_data.columns.tolist()}"
-                    )
-                    return result  # Return all NaN
-
-            logger.info(
-                f"Buffer aggregation using column '{metric_col}' from {metric_data.columns.tolist()}, radius={radius_meters}m, stat={stat}"
-            )
-
-            # Check if any data was joined
-            non_null_joins = (
-                joined[metric_col].notna().sum() if metric_col in joined.columns else 0
-            )
-            logger.info(
-                f"Spatial join: {len(joined)} total rows, {non_null_joins} with valid metric values"
-            )
-
-            logger.debug(
-                f"Using metric column: {metric_col} from {metric_data.columns.tolist()}"
-            )
-            logger.debug(
-                f"Joined shape: {joined.shape}, Points shape: {len(points_gdf)}"
-            )
-
-            # Aggregate by original point index — one vectorized groupby over the
-            # joined frame instead of a per-point boolean scan (which was O(n²)).
-            if metric_col in joined.columns:
-                grouped = joined[metric_col].dropna().groupby(level=0)
-                if stat == "median":
-                    agg = grouped.median()
-                elif stat == "percentile":
-                    agg = grouped.quantile(percentile / 100.0)
-                else:
-                    agg = grouped.mean()
-                for idx, val in agg.items():
-                    pos = idx_to_pos.get(idx)
-                    if pos is not None:
-                        result[pos] = val
-
-            # Log summary of results
-            valid_count = np.sum(~np.isnan(result))
-            logger.info(
-                f"Buffer aggregation result: {valid_count}/{len(result)} points have valid values"
-            )
-
-        return result
-
     def _ring_cache_bytes_estimate(
         self,
         points_gdf: gpd.GeoDataFrame,
@@ -2105,14 +1817,14 @@ class MetricFusionEngine:
             or subset is None
             or len(points_gdf) > self._max_points_ring_cache
         ):
-            return self._apply_circular_buffer_aggregation(
+            return _helpers.apply_circular_buffer_aggregation(
                 points_gdf, metric_data, radius_m, stat, percentile
             )
 
         gvi = channel in ("veg", "terrain")
         radii = self._outer_radii_metres(gvi=gvi)
         if radii.size == 0:
-            return self._apply_circular_buffer_aggregation(
+            return _helpers.apply_circular_buffer_aggregation(
                 points_gdf, metric_data, radius_m, stat, percentile
             )
 
@@ -2123,7 +1835,7 @@ class MetricFusionEngine:
         if self._ring_cache_bytes_estimate(points_gdf, metric_data, float(radii[-1])) > (
             self._max_ring_cache_bytes
         ):
-            return self._apply_circular_buffer_aggregation(
+            return _helpers.apply_circular_buffer_aggregation(
                 points_gdf, metric_data, radius_m, stat, percentile
             )
 
@@ -2155,7 +1867,7 @@ class MetricFusionEngine:
                 )
             except Exception as e:
                 logger.warning(f"Ring cache build failed ({channel}): {e}")
-                return self._apply_circular_buffer_aggregation(
+                return _helpers.apply_circular_buffer_aggregation(
                     points_gdf, metric_data, radius_m, stat, percentile
                 )
 
@@ -2225,31 +1937,6 @@ class MetricFusionEngine:
             False,
         )
 
-    @staticmethod
-    def _align_channel_axes(
-        arrays: list[tuple[np.ndarray, bool]], static: dict, n_rows: int
-    ) -> list[np.ndarray]:
-        """Put every channel on one axis, expanding deduplicated ones if needed.
-
-        All three channels normally resolve the same way, but an off-grid cell
-        can send one of them down the row-wise fallback; expanding the others
-        keeps the composite's inputs row-aligned.
-        """
-        if not arrays:
-            return []
-        if all(on_uniq for _, on_uniq in arrays):
-            return [a for a, _ in arrays]
-        inverse = static.get("uniq_inverse")
-        out: list[np.ndarray] = []
-        for arr, on_uniq in arrays:
-            if on_uniq and inverse is not None:
-                out.append(np.asarray(arr)[inverse])
-            elif on_uniq:
-                out.append(np.full(n_rows, np.nan, dtype=np.float32))
-            else:
-                out.append(arr)
-        return out
-
     def prepare_fusion_data(self) -> pd.DataFrame:
         """
         Align vegetation, terrain, NDVI, and target data into a single DataFrame.
@@ -2313,41 +2000,11 @@ class MetricFusionEngine:
         # RAM management: narrow the resident per-pixel frames' dtypes (wave
         # string -> category, 64-bit -> 32-bit) before the search + the RAM
         # cache load. On a 36M-row per-pixel panel this frees several GB.
-        df = self._downcast_fusion_dtypes(df)
+        df = _helpers.downcast_fusion_dtypes(df)
         self._downcast_target_gdf_dtypes()
         import gc as _gc
 
         _gc.collect()
-        return df
-
-    @staticmethod
-    def _downcast_fusion_dtypes(df: "pd.DataFrame") -> "pd.DataFrame":
-        """Narrow a fusion/panel frame's column dtypes in place-ish.
-
-        ``wave`` (year strings) -> category; float64 -> float32; int64 -> the
-        smallest signed int that holds the column. Geometry and already-narrow
-        columns are left untouched. Returns the same frame.
-        """
-        if df is None or len(df) == 0:
-            return df
-        for col in df.columns:
-            if col == "geometry":
-                continue
-            try:
-                s = df[col]
-                dt = s.dtype
-                if col == "wave" and dt == object:
-                    df[col] = s.astype("category")
-                elif dt == np.float64:
-                    df[col] = s.astype(np.float32)
-                elif dt == np.int64:
-                    lo, hi = int(s.min()), int(s.max())
-                    for t in (np.int16, np.int32):
-                        if np.iinfo(t).min <= lo and hi <= np.iinfo(t).max:
-                            df[col] = s.astype(t)
-                            break
-            except Exception:
-                continue  # leave the column as-is on any edge case
         return df
 
     def _downcast_target_gdf_dtypes(self) -> None:
@@ -2355,9 +2012,9 @@ class MetricFusionEngine:
         unique-pixel source), which the search keeps in memory alongside the
         RAM cache."""
         if self.target_gdf is not None:
-            self._downcast_fusion_dtypes(self.target_gdf)
+            _helpers.downcast_fusion_dtypes(self.target_gdf)
         if self._preaggr_entity_gdf is not None:
-            self._downcast_fusion_dtypes(self._preaggr_entity_gdf)
+            _helpers.downcast_fusion_dtypes(self._preaggr_entity_gdf)
 
     def _compute_channel_scale(self, fusion_df: pd.DataFrame) -> None:
         """Fix per-channel [0, 1] min-max bounds from the predictor distribution.
@@ -2428,10 +2085,6 @@ class MetricFusionEngine:
             tuple(range(ndvi_lo, ndvi_hi + 1, ndvi_st)),
         )
 
-    @staticmethod
-    def _metric_value_column(metric_gdf: gpd.GeoDataFrame, channel: str) -> str:
-        return metric_sampling.vector_metric_column(metric_gdf, channel)
-
     def _metric_fingerprint(self, metric, channel: str) -> str:
         """Cheap, deterministic identity for a loaded metric (vector or raster)."""
         if isinstance(metric, dict):  # raster
@@ -2448,7 +2101,7 @@ class MetricFusionEngine:
             sample = np.ascontiguousarray(data[::17, ::17]).tobytes()
             digest = hashlib.sha256(sample).hexdigest()[:16]
             return f"ras:{data.shape}:{tuple(metric['bounds'])}:{data.dtype}:{digest}"
-        col = self._metric_value_column(metric, channel)
+        col = _helpers.metric_value_column(metric, channel)
         vals = np.ascontiguousarray(metric[col].to_numpy(dtype=np.float64))
         digest = hashlib.sha256(vals.tobytes()).hexdigest()[:16]
         return f"vec:{len(metric)}:{tuple(metric.total_bounds)}:{col}:{digest}"
@@ -2680,7 +2333,7 @@ class MetricFusionEngine:
         )
         n_points = len(preaggr_gdf)
 
-        utm_crs = self._grid_metric_crs(preaggr_gdf, _log)
+        utm_crs = _helpers.grid_metric_crs(preaggr_gdf, _log)
         crs_key = str(utm_crs.to_epsg() or utm_crs.to_wkt())
         cache = preaggregation.GreeneryCache(
             self.cache_dir,
@@ -2813,7 +2466,7 @@ class MetricFusionEngine:
         """
         if isinstance(src, dict):  # raster source
             return ("raster", src["data"], src["transform"], src["crs"])
-        col = self._metric_value_column(src, channel)
+        col = _helpers.metric_value_column(src, channel)
         metric = src.to_crs(utm_crs)
         metric = metric[metric[col].notna()]
         if not all_points:
@@ -2965,44 +2618,6 @@ class MetricFusionEngine:
             return None
         return veg_out, ter_out, ndvi_out
 
-    def _resolved_state(
-        self,
-        preps: dict,
-        shared_xy: np.ndarray | None,
-        *,
-        gvi_radii: tuple[int, ...],
-        ndvi_radii: tuple[int, ...],
-        utm_crs: Any,
-    ) -> dict:
-        """In-process aggregator state for :func:`preaggregation.aggregate_entity_batch`."""
-        from sklearn.neighbors import BallTree
-
-        def _aggregator(prep: tuple) -> tuple:
-            if prep[0] == "raster":
-                to_raster = None
-                if str(prep[3]) != str(utm_crs):
-                    from pyproj import Transformer
-
-                    to_raster = Transformer.from_crs(
-                        utm_crs, prep[3], always_xy=True
-                    ).transform
-                return ("raster", prep[1], prep[2], to_raster)
-            if prep[0] == "point":
-                return ("point", BallTree(prep[1]), prep[2])
-            return prep
-
-        state = {"gvi_radii": gvi_radii, "ndvi_radii": ndvi_radii}
-        if shared_xy is not None:
-            state["gvi_shared"] = (
-                BallTree(shared_xy),
-                {"veg": preps["veg"][2], "terrain": preps["terrain"][2]},
-            )
-        else:
-            state["veg"] = _aggregator(preps["veg"])
-            state["terrain"] = _aggregator(preps["terrain"])
-        state["ndvi"] = _aggregator(preps["ndvi"])
-        return state
-
     def _aggregate_in_threads(
         self,
         positions: np.ndarray,
@@ -3022,7 +2637,7 @@ class MetricFusionEngine:
         """Run the batches in this process. ``False`` if cancelled."""
         from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
-        state = self._resolved_state(
+        state = _helpers.resolved_state(
             preps,
             shared_xy,
             gvi_radii=gvi_radii,
@@ -3097,7 +2712,7 @@ class MetricFusionEngine:
 
         share_dir = tempfile.mkdtemp(prefix="preaggr-", dir=self.cache_dir)
         try:
-            spec = self._pool_spec(
+            spec = _helpers.pool_spec(
                 positions,
                 preps=preps,
                 shared_xy=shared_xy,
@@ -3137,74 +2752,6 @@ class MetricFusionEngine:
             preaggregation.worker_release()
             shutil.rmtree(share_dir, ignore_errors=True)
 
-    def _pool_spec(
-        self,
-        positions: np.ndarray,
-        *,
-        preps: dict,
-        shared_xy: np.ndarray | None,
-        gvi_radii: tuple[int, ...],
-        ndvi_radii: tuple[int, ...],
-        utm_crs: Any,
-        point_xy_utm: np.ndarray,
-        share_dir: str,
-    ) -> dict:
-        """Describe the whole job to a worker, publishing its bulk arrays."""
-        crs_key = str(utm_crs)
-
-        def _channel_spec(name: str, prep: tuple) -> dict:
-            if prep[0] == "raster":
-                array = prep[1]
-                common = {
-                    "transform": prep[2],
-                    "from_crs": crs_key,
-                    "to_crs": str(prep[3]),
-                }
-                path = getattr(array, "path", None)
-                if path is not None:
-                    # Already a windowed reader over a file; the worker opens
-                    # its own handle rather than sharing this one, since GDAL
-                    # datasets are not safe across processes.
-                    return {
-                        "kind": "raster",
-                        "path": path,
-                        "band": getattr(array, "band", 1),
-                        **common,
-                    }
-                return {
-                    "kind": "raster_array",
-                    "path": parallel.publish_array(
-                        share_dir,
-                        f"{name}-raster",
-                        np.ma.filled(array, np.nan)
-                        if np.issubdtype(array.dtype, np.floating)
-                        else np.ma.filled(array.astype(np.float32), np.nan),
-                    ),
-                    **common,
-                }
-            spec = {
-                "kind": "points",
-                "values": parallel.publish_array(share_dir, f"{name}-values", prep[2]),
-            }
-            if shared_xy is not None and name in ("veg", "terrain"):
-                spec["shared"] = True
-            else:
-                spec["xy"] = parallel.publish_array(share_dir, f"{name}-xy", prep[1])
-            return spec
-
-        spec = {
-            "entity_xy": parallel.publish_array(
-                share_dir, "entity-xy", point_xy_utm[positions]
-            ),
-            "gvi_radii": tuple(gvi_radii),
-            "ndvi_radii": tuple(ndvi_radii),
-            "channels": {n: _channel_spec(n, p) for n, p in preps.items()},
-        }
-        if shared_xy is not None:
-            spec["gvi_shared_xy"] = parallel.publish_array(
-                share_dir, "gvi-shared-xy", shared_xy
-            )
-        return spec
     def _precompute_aggregations_longitudinal(
         self,
         progress_callback: Callable[[int, int], None] | None = None,
@@ -3243,7 +2790,7 @@ class MetricFusionEngine:
             raise ValueError(
                 "Longitudinal pre-aggregation requires per-wave metric sources "
                 "for every channel; call set_longitudinal_metric_sources() (or "
-                "set_longitudinal_metric_data()) first."
+                "set_longitudinal_metric_sources()) first."
             )
 
         gvi_radii, ndvi_radii = self._preaggr_radii()
@@ -3258,7 +2805,7 @@ class MetricFusionEngine:
 
         # Reuse the grid's metric CRS (the pixels are already in it) so the
         # cache key is stable between the coverage probe and this build.
-        utm_crs = self._grid_metric_crs(preaggr_gdf, _log)
+        utm_crs = _helpers.grid_metric_crs(preaggr_gdf, _log)
         crs_key = str(utm_crs.to_epsg() or utm_crs.to_wkt())
         cache = preaggregation.GreeneryCache(
             self.cache_dir,
@@ -3436,21 +2983,6 @@ class MetricFusionEngine:
             workers=int(stage_secs.get("workers", 1)),
         )
         return True
-
-    def _grid_metric_crs(self, preaggr_gdf: "gpd.GeoDataFrame", log) -> Any:
-        """The metric CRS the pre-aggregation samples in.
-
-        For a gridded (point / polygon) target the pixels are already built in
-        the grid's metric CRS, so that same CRS is reused — this keeps the
-        greenery-cache key identical between the coverage probe and the build.
-        A raster target has no grid, so a distortion-minimising CRS is picked.
-        """
-        if preaggr_gdf.crs is not None and "_global_pid" in preaggr_gdf.columns:
-            return preaggr_gdf.crs
-        crs, _dist, _name = select_grid_crs_with_warning(
-            preaggr_gdf, log, role="Pre-aggregation CRS"
-        )
-        return crs
 
     def _build_pid_translation(self) -> None:
         """Cache the ``_preaggr_id`` → ``_global_pid`` map for lookups.
@@ -4149,44 +3681,6 @@ class MetricFusionEngine:
     # ────────────────────────────────────────────────────────────
     # Per-pixel CGI → per-entity collapse (shared by every scoring path)
     # ────────────────────────────────────────────────────────────
-    def _catchment_radius(
-        self, veg_radius: float, terrain_radius: float, ndvi_radius: float
-    ) -> float:
-        """Per-trial catchment radius for the point/line collapse.
-
-        The active channel's radius for a standalone study (only that channel
-        contributes to the score), or the largest of the three for the
-        combined CGI run (every channel feeds the per-pixel composite).
-        """
-        ch = getattr(self, "_active_greenery_channel", "cgi") or "cgi"
-        if ch == "veg":
-            return float(veg_radius)
-        if ch == "terrain":
-            return float(terrain_radius)
-        if ch == "ndvi":
-            return float(ndvi_radius)
-        return float(max(veg_radius, terrain_radius, ndvi_radius))
-
-    def _entity_collapse_mask(
-        self, data: pd.DataFrame, catchment_radius: float | None
-    ) -> np.ndarray | None:
-        """Row mask for the per-trial catchment collapse, or ``None``.
-
-        Returns ``None`` for polygon / raster targets (no radius mask — every
-        in-footprint pixel contributes, the original behavior). For point /
-        line targets, keeps pixels within ``catchment_radius`` of their
-        entity plus each entity's nearest pixel, so no entity drops out at
-        small radii.
-        """
-        if "_catchment_dist" not in data.columns or catchment_radius is None:
-            return None
-        dist = data["_catchment_dist"].to_numpy(dtype=np.float64)
-        if "_is_nearest" in data.columns:
-            near = data["_is_nearest"].to_numpy(dtype=bool)
-        else:
-            near = np.zeros(len(data), dtype=bool)
-        return (dist <= float(catchment_radius)) | near
-
     @staticmethod
     def _collapse_to_entities(
         values: np.ndarray,
@@ -4555,28 +4049,6 @@ class MetricFusionEngine:
         fusion_df["_cy"] = cy
         return fusion_df
 
-    @staticmethod
-    def _spatial_cache_key(
-        coords_xy: np.ndarray, target: np.ndarray, cov: np.ndarray | None
-    ) -> bytes:
-        """Content fingerprint of a scored split for memoizing its spatial basis.
-
-        Keyed on the coordinates and outcome (both stable across Optuna trials)
-        so studies sharing a fold reuse the basis, while bootstrap resamples —
-        which change row membership — get a fresh one without manual cache
-        invalidation. Digests the raw bytes so two splits holding the same
-        values in a different order cannot share an entry.
-        """
-        h = hashlib.blake2b(digest_size=16)
-        for arr in (coords_xy, target, cov):
-            if arr is None:
-                h.update(b"\x00")
-                continue
-            a = np.ascontiguousarray(np.asarray(arr, dtype=np.float64))
-            h.update(repr(a.shape).encode())
-            h.update(a.tobytes())
-        return h.digest()
-
     def _spatial_basis_columns(
         self,
         coords_xy: np.ndarray | None,
@@ -4596,7 +4068,7 @@ class MetricFusionEngine:
         if self.spatial_adjust_method == "none" or coords_xy is None:
             return None
         coords_xy = np.asarray(coords_xy, dtype=np.float64)
-        cache_key = self._spatial_cache_key(coords_xy, target, cov)
+        cache_key = _helpers.spatial_cache_key(coords_xy, target, cov)
         entry = self._spatial_basis_cache.get(cache_key)
         if entry is None:
             basis = spatial_basis.build_block_basis(
@@ -4671,17 +4143,6 @@ class MetricFusionEngine:
                 arr[valid] = (arr[valid] - dt(lo)) / dt(hi - lo)
         return arr
 
-    def _attach_cache_for_coverage(self, entity_gdf: gpd.GeoDataFrame) -> bool:
-        """Reserved: derive the coverage gate from a reusable greenery cache.
-
-        Disabled for now. The coverage sampler reports the nearest-feature
-        value while the cache stores the max-radius mean, so reading coverage
-        from the cache would shift the channel-normalisation bounds between a
-        fresh run and a reuse run. Re-enabling it requires computing the
-        channel scale from cache statistics on both paths.
-        """
-        return False
-
     def _coverage_from_cache(
         self, entity_gdf: gpd.GeoDataFrame
     ) -> dict[str, np.ndarray] | None:
@@ -4748,7 +4209,7 @@ class MetricFusionEngine:
         # Coverage from a reusable cache (skips the per-wave re-sample) — only
         # when a signature-matched complete cache is available; falls back to
         # sampling on any miss.
-        if waves is not None and self._attach_cache_for_coverage(entity_gdf):
+        if waves is not None and _helpers.attach_cache_for_coverage(entity_gdf):
             cached = self._coverage_from_cache(entity_gdf)
             if cached is not None:
                 _log(
@@ -5071,57 +4532,6 @@ class MetricFusionEngine:
             )
         )
 
-    @staticmethod
-    def _area_balanced_split_within_bin(
-        bin_df: pd.DataFrame,
-        area_col: str,
-        target_fractions: dict[str, float],
-        random_state: int,
-    ) -> dict[str, list]:
-        """Allocate one outcome bin's polygons to splits with greedy area balance.
-
-        Shuffles the polygons inside the bin, then for each one picks the
-        split with the largest remaining area deficit (in fraction-of-bin
-        units). Returns a dict mapping split name to a list of polygon
-        row indices.
-        """
-        if len(bin_df) == 0:
-            return {name: [] for name in target_fractions}
-        total_area = float(bin_df[area_col].sum())
-        if total_area <= 0:
-            # Fall back to count-balanced when areas are missing.
-            rng = np.random.default_rng(random_state)
-            shuffled = rng.permutation(bin_df.index.to_numpy())
-            n = len(shuffled)
-            order = list(target_fractions)
-            counts = {name: int(round(target_fractions[name] * n)) for name in order}
-            # Reconcile rounding to total n.
-            diff = n - sum(counts.values())
-            counts[order[0]] += diff
-            out: dict[str, list] = {name: [] for name in order}
-            i = 0
-            for name in order:
-                out[name] = list(shuffled[i : i + counts[name]])
-                i += counts[name]
-            return out
-
-        rng = np.random.default_rng(random_state)
-        shuffled = rng.permutation(bin_df.index.to_numpy())
-        target_area = {
-            name: target_fractions[name] * total_area for name in target_fractions
-        }
-        used_area = dict.fromkeys(target_fractions, 0.0)
-        assignments: dict[str, list] = {name: [] for name in target_fractions}
-        for idx in shuffled:
-            area = float(bin_df.at[idx, area_col])
-            deficits = {
-                name: target_area[name] - used_area[name] for name in target_fractions
-            }
-            choice = max(deficits, key=deficits.get)
-            assignments[choice].append(idx)
-            used_area[choice] += area
-        return assignments
-
     def _area_balanced_polygon_split(
         self,
         poly_df: pd.DataFrame,
@@ -5140,7 +4550,7 @@ class MetricFusionEngine:
         poly_df["_area_km2"] = self._polygon_areas_km2(poly_df[group_col]).to_numpy()
         per_bin_assignments: dict[str, list] = {name: [] for name in target_fractions}
         for bin_value, bin_df in poly_df.groupby("target_bin", sort=False):
-            alloc = self._area_balanced_split_within_bin(
+            alloc = _helpers.area_balanced_split_within_bin(
                 bin_df,
                 "_area_km2",
                 target_fractions,
@@ -5236,26 +4646,6 @@ class MetricFusionEngine:
             return None
         block_by_group = dict(zip(agg.index.to_numpy(), block_ids.tolist()))
         return block_by_group, info
-
-    @staticmethod
-    def _stripe_to_test_blocks(
-        ordered_blocks: np.ndarray, test_fraction: float, rng: np.random.Generator
-    ) -> set:
-        """Pick ~``test_fraction`` of blocks, spread evenly across their order.
-
-        ``ordered_blocks`` is the space-filling block sequence; selecting evenly
-        spaced positions (with a seed-jittered start) spreads the held-out
-        blocks across the full extent rather than into one contiguous corner.
-        """
-        n = len(ordered_blocks)
-        if n == 0:
-            return set()
-        n_pick = max(1, int(round(test_fraction * n)))
-        n_pick = min(n_pick, n)
-        step = n / n_pick
-        start = int(rng.integers(0, max(1, int(np.floor(step)))))
-        idxs = (np.floor(np.arange(n_pick) * step).astype(int) + start) % n
-        return set(ordered_blocks[np.unique(idxs)].tolist())
 
     def split_data(
         self,
@@ -5420,7 +4810,7 @@ class MetricFusionEngine:
                 # train and test.
                 rng_sp = np.random.default_rng(random_state)
                 ordered_blocks = np.sort(poly_df["_block"].unique())
-                test_blocks = self._stripe_to_test_blocks(
+                test_blocks = _helpers.stripe_to_test_blocks(
                     ordered_blocks, test_size, rng_sp
                 )
                 test_mask = poly_df["_block"].isin(test_blocks)
@@ -6000,10 +5390,10 @@ class MetricFusionEngine:
             ]
             train_on_uniq = all(u for _, u in train_parts)
             val_on_uniq = all(u for _, u in val_parts)
-            train_veg, train_terrain, train_ndvi = self._align_channel_axes(
+            train_veg, train_terrain, train_ndvi = _helpers.align_channel_axes(
                 train_parts, train_static, len(train_points)
             )
-            val_veg, val_terrain, val_ndvi = self._align_channel_axes(
+            val_veg, val_terrain, val_ndvi = _helpers.align_channel_axes(
                 val_parts, val_static, len(val_points)
             )
 
@@ -6106,11 +5496,14 @@ class MetricFusionEngine:
             # average every in-footprint pixel; point/line entities average
             # only those inside this trial's catchment radius.
             if train_static["has_pid"]:
-                catchment_r = self._catchment_radius(
-                    veg_radius, terrain_radius, ndvi_radius
+                catchment_r = _helpers.catchment_radius(
+                    veg_radius,
+                    terrain_radius,
+                    ndvi_radius,
+                    self._active_greenery_channel,
                 )
-                train_mask = self._entity_collapse_mask(train_data, catchment_r)
-                val_mask = self._entity_collapse_mask(val_data, catchment_r)
+                train_mask = _helpers.entity_collapse_mask(train_data, catchment_r)
+                val_mask = _helpers.entity_collapse_mask(val_data, catchment_r)
                 train_composite = self._collapse_mean_from_codes(
                     train_composite,
                     train_static["codes"],
@@ -6296,7 +5689,7 @@ class MetricFusionEngine:
         # Invalidated by split_data. Shallow-copied on return so callers that
         # attach keys (e.g. ``test_ci``) don't mutate the cached entry.
         memo_key = (
-            self._fusion_param_key(self._active_greenery_channel, params),
+            _helpers.fusion_param_key(self._active_greenery_channel, params),
             metric,
             bool(return_predictions),
             bool(return_all_mixedlm),
@@ -6439,10 +5832,13 @@ class MetricFusionEngine:
         # on f"{entity}|{wave}" so the result is one row per (entity, wave) —
         # the shape the MixedLM scorer expects.
         if test_static["has_pid"]:
-            catchment_r = self._catchment_radius(
-                veg_radius, terrain_radius, ndvi_radius
+            catchment_r = _helpers.catchment_radius(
+                veg_radius,
+                terrain_radius,
+                ndvi_radius,
+                self._active_greenery_channel,
             )
-            test_mask = self._entity_collapse_mask(self.test_data, catchment_r)
+            test_mask = _helpers.entity_collapse_mask(self.test_data, catchment_r)
             test_composite = self._collapse_mean_from_codes(
                 test_composite,
                 test_static["codes"],
@@ -6619,10 +6015,13 @@ class MetricFusionEngine:
             pid = data["polygon_id"].values
             # Full 3-channel design → catchment = max of the three radii for
             # point/line targets (mask None for polygons).
-            catchment_r = self._catchment_radius(
-                veg_radius, terrain_radius, ndvi_radius
+            catchment_r = _helpers.catchment_radius(
+                veg_radius,
+                terrain_radius,
+                ndvi_radius,
+                self._active_greenery_channel,
             )
-            mask = self._entity_collapse_mask(data, catchment_r)
+            mask = _helpers.entity_collapse_mask(data, catchment_r)
             veg = self._collapse_to_entities(veg, pid, mask, "mean")
             terrain = self._collapse_to_entities(terrain, pid, mask, "mean")
             ndvi = self._collapse_to_entities(ndvi, pid, mask, "mean")
@@ -6762,7 +6161,7 @@ class MetricFusionEngine:
             def _score_fn(
                 t_arr: np.ndarray, p_arr: np.ndarray, c_arr: np.ndarray
             ) -> float:
-                cov_part, sb_part = self._split_control_matrix(c_arr, n_cov_cols)
+                cov_part, sb_part = _helpers.split_control_matrix(c_arr, n_cov_cols)
                 score_out = objective_scoring.score(
                     metric,
                     t_arr,
@@ -6804,27 +6203,6 @@ class MetricFusionEngine:
         ci["n"] = n
         return ci
 
-    def build_test_prediction_column(self, params: dict, metric: str) -> dict:
-        """Convenience: return the per-test-entity (composite, target) arrays.
-
-        The nested-CV runner aggregates these across outer folds to form the
-        outer-CV-averaged prediction column used for the headline polygon-level
-        bootstrap CI.
-        """
-        res = self.evaluate_on_test(
-            params=params, metric=metric, return_predictions=True
-        )
-        return {
-            "predictions": np.asarray(res.get("predictions"), dtype=np.float64),
-            "targets": np.asarray(res.get("targets"), dtype=np.float64),
-            "test_score": float(res.get("test_score", float("nan"))),
-            "test_pvalue": (
-                float(res["test_pvalue"])
-                if res.get("test_pvalue") is not None
-                else None
-            ),
-        }
-
     def _full_data_frame(self) -> "pd.DataFrame | None":
         """train+val+test union frame, concatenated once and cached.
 
@@ -6835,16 +6213,6 @@ class MetricFusionEngine:
             parts = [d for d in (self.train_val_data, self.test_data) if d is not None]
             self._full_data_cache = pd.concat(parts) if parts else None
         return self._full_data_cache
-
-    @staticmethod
-    def _fusion_param_key(channel_mode: str, weights: dict) -> tuple:
-        """Hashable key over the params that determine the composite."""
-        items = tuple(
-            sorted(
-                (str(k), v) for k, v in weights.items() if not str(k).startswith("__")
-            )
-        )
-        return (channel_mode, items)
 
     def apply_fusion(self, weights: dict | None = None) -> pd.DataFrame:
         """
@@ -6870,7 +6238,7 @@ class MetricFusionEngine:
                 )
             weights = self.best_params
 
-        cache_key = self._fusion_param_key(self._active_greenery_channel, weights)
+        cache_key = _helpers.fusion_param_key(self._active_greenery_channel, weights)
         cached = self._apply_fusion_cache
         if cached is not None and cached[0] == cache_key:
             return cached[1]
@@ -6997,10 +6365,13 @@ class MetricFusionEngine:
         # trial's catchment radius for point/line targets), matching what the
         # optimizer scored against the per-entity outcome.
         if "polygon_id" in result_df.columns:
-            catchment_r = self._catchment_radius(
-                veg_radius, terrain_radius, ndvi_radius
+            catchment_r = _helpers.catchment_radius(
+                veg_radius,
+                terrain_radius,
+                ndvi_radius,
+                self._active_greenery_channel,
             )
-            mask = self._entity_collapse_mask(result_df, catchment_r)
+            mask = _helpers.entity_collapse_mask(result_df, catchment_r)
             masked_df = result_df if mask is None else result_df[mask]
             poly_df = (
                 masked_df.groupby("polygon_id", sort=False)
@@ -7210,24 +6581,6 @@ class MetricFusionEngine:
             lk["years_since_baseline"].to_numpy(dtype=np.float64),
         )
 
-    @staticmethod
-    def _split_control_matrix(
-        c_arr: np.ndarray | None, n_cov_cols: int
-    ) -> tuple[np.ndarray | None, np.ndarray | None]:
-        """Split a resampled ``[covariates | smooth]`` matrix into its two parts.
-
-        The reporting resamplers draw rows of one control matrix so covariates
-        and smooth stay row-aligned with the observation; the scorer wants them
-        separately (it residualizes the exposure on the smooth alone under
-        ``spatial_plus``, and expands only the covariates into the
-        residualization basis).
-        """
-        if c_arr is None:
-            return None, None
-        cov_part = c_arr[:, :n_cov_cols] if n_cov_cols else None
-        sb_part = c_arr[:, n_cov_cols:] if c_arr.shape[1] > n_cov_cols else None
-        return cov_part, sb_part
-
     def _augment_cov_with_spatial(
         self,
         df: "pd.DataFrame",
@@ -7290,7 +6643,7 @@ class MetricFusionEngine:
             """Scorer over a resampled ``[covariates | smooth]`` control matrix."""
 
             def _score_fn(t_arr, c_arr, cov=None):
-                cov_part, sb_part = self._split_control_matrix(cov, n_cov_cols)
+                cov_part, sb_part = _helpers.split_control_matrix(cov, n_cov_cols)
                 return objective_scoring.score(
                     metric,
                     t_arr,
@@ -7534,7 +6887,7 @@ class MetricFusionEngine:
                 cov_all, n_cov = self._augment_cov_with_spatial(
                     df_full, t_all, c_all, self._whole_data_covariates(df_full)
                 )
-                cov_part, sb_part = self._split_control_matrix(cov_all, n_cov)
+                cov_part, sb_part = _helpers.split_control_matrix(cov_all, n_cov)
                 results["all"] = _block(
                     t_all, c_all, eid, ysb, cov_part, sb_part,
                     self._wave_labels_for_scoring(df_full), seed,
@@ -7576,7 +6929,7 @@ class MetricFusionEngine:
                     cov_tv, n_cov = self._augment_cov_with_spatial(
                         sub, t_tv, c_tv, self._whole_data_covariates(sub)
                     )
-                    cov_part, sb_part = self._split_control_matrix(cov_tv, n_cov)
+                    cov_part, sb_part = _helpers.split_control_matrix(cov_tv, n_cov)
                     results["train_val"] = _block(
                         t_tv, c_tv, eid, ysb, cov_part, sb_part,
                         self._wave_labels_for_scoring(sub), seed + 202,
@@ -7837,7 +7190,7 @@ class MetricFusionEngine:
         sign = 1.0 if higher else -1.0
 
         def _score(t_arr, c_arr, cov_arr):
-            cov_part, sb_part = self._split_control_matrix(cov_arr, n_cov_cols)
+            cov_part, sb_part = _helpers.split_control_matrix(cov_arr, n_cov_cols)
             return float(
                 objective_scoring.score(
                     metric,
@@ -9362,10 +8715,6 @@ class MetricFusionEngine:
         # Snap + renormalize the winners' weights to canonical integer steps so
         # downstream code (composite generation, apply path) consumes them
         # directly. ``formula`` was resolved up front (see above).
-
-        def _mean_int(name: str, default: int) -> int:
-            vals = [int(r["params"].get(name, default)) for r in winners]
-            return int(round(float(np.mean(vals)))) if vals else int(default)
 
         def _mode_str(name: str, default: str) -> str:
             vals = [r["params"].get(name, default) for r in winners]

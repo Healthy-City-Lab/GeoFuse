@@ -539,25 +539,3 @@ async def get_panorama_async(
     )
 
 
-def download_panorama(
-    pano: StreetViewPanorama,
-    path: str,
-    zoom: int = 5,
-    pil_args: dict | None = None,
-    session: requests.Session | None = None,
-) -> None:
-    """Synchronously download a panorama and save it to ``path``."""
-    image = get_panorama(pano, zoom=zoom, session=session)
-    image.save(path, **(pil_args or {}))
-
-
-async def download_panorama_async(
-    pano: StreetViewPanorama,
-    path: str,
-    session: aiohttp.ClientSession,
-    zoom: int = 5,
-    pil_args: dict | None = None,
-) -> None:
-    """Async variant of :func:`download_panorama`."""
-    image = await get_panorama_async(pano, session, zoom=zoom)
-    image.save(path, **(pil_args or {}))

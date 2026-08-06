@@ -122,16 +122,6 @@ class StageLedger:
     def get(self, key: str) -> Stage | None:
         return self._by_key.get(key)
 
-    def is_finished(self, key: str) -> bool:
-        s = self._by_key.get(key)
-        return bool(s and s.status in _FINISHED)
-
-    def first_unfinished(self) -> Stage | None:
-        for s in self._stages:
-            if s.status not in _FINISHED:
-                return s
-        return None
-
     def all_finished(self) -> bool:
         return all(s.status in _FINISHED for s in self._stages)
 

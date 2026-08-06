@@ -98,13 +98,16 @@ class ProgressThrottle:
         return False
 
 
+# Backoff growth per attempt, and the ± fraction applied to each delay.
+_RETRY_FACTOR = 1.5
+_RETRY_JITTER = 0.25
+
+
 def retry_with_backoff(
     fn: Callable[[], T],
     *,
     attempts: int = 3,
     base_delay: float = 2.0,
-    factor: float = 1.5,
-    jitter: float = 0.25,
     cancel_callback: Callable[[], bool] | None = None,
     log_fn: Callable[[str, str], None] | None = None,
     label: str = "operation",
@@ -125,9 +128,10 @@ def retry_with_backoff(
     surfacing.
 
     ``non_retryable`` names exception types that are deterministic rather
-    than transient (e.g. an Earth Engine "memory limit exceeded" rejection
-    that will fail identically every attempt): they re-raise immediately so
-    the caller can take a different path instead of burning the retry budget.
+    than transient (an Earth Engine "compute too large" rejection fails
+    identically every attempt): they re-raise immediately so the caller can
+    take a different path — NDVI subdivides the tile — instead of burning
+    the retry budget on a result that cannot change.
 
     Used by NDVI per-tile downloads (flaky EE / network) and is a good fit
     for any other network-bound worker that wants the same "transient
@@ -146,7 +150,7 @@ def retry_with_backoff(
                 break
             # ±jitter so concurrent workers don't retry in lockstep and
             # restampede the upstream service.
-            jittered = delay * (1.0 + random.uniform(-jitter, jitter))
+            jittered = delay * (1.0 + random.uniform(-_RETRY_JITTER, _RETRY_JITTER))
             if log_fn is not None:
                 log_fn(
                     "WARN",
@@ -163,7 +167,7 @@ def retry_with_backoff(
                 slept += step
             if cancel_callback and cancel_callback():
                 break
-            delay *= factor
+            delay *= _RETRY_FACTOR
     if last_exc is not None:
         raise last_exc
     raise RuntimeError(f"{label} failed but no exception captured.")
