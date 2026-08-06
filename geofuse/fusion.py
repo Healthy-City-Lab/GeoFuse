@@ -2727,12 +2727,9 @@ class MetricFusionEngine:
                 dtype=np.int64,
                 count=len(missing),
             )
-            workers = (
-                parallel.worker_count() if max_workers is None else max_workers
-            )
-            wk = max(1, min(workers, len(pos) // 128 + 1))
             stage_secs = {"vector_agg": 0.0, "raster_agg": 0.0}
             build_t0 = time.perf_counter()
+            total = max(len(missing), 1)
             result = self._aggregate_pixel_channels(
                 pos,
                 veg_src=self.veg_data,
@@ -2745,9 +2742,14 @@ class MetricFusionEngine:
                 all_points=all_points,
                 point_xy_utm=point_xy_utm,
                 entity_geoms_utm=entity_geoms_utm,
-                workers=wk,
+                max_workers=max_workers,
                 cancel_callback=cancel_callback,
                 stage_secs=stage_secs,
+                progress_callback=(
+                    None
+                    if progress_callback is None
+                    else lambda done: progress_callback(done, total)
+                ),
             )
             if result is None:
                 _log("WARN", "Pre-aggregation cancelled (resumable).")
@@ -2755,13 +2757,21 @@ class MetricFusionEngine:
                 return False
             cache.commit_unit(cfg_key, missing, *result)
             if progress_callback is not None:
-                progress_callback(len(missing), max(len(missing), 1))
+                progress_callback(len(missing), total)
+            build_secs = time.perf_counter() - build_t0
             _log(
                 "OK",
                 f"Pre-aggregation: built {len(missing):,} pixel(s) in "
-                f"{time.perf_counter() - build_t0:.0f}s — vector "
+                f"{build_secs:.0f}s — vector "
                 f"{stage_secs['vector_agg']:.0f}s, raster "
                 f"{stage_secs['raster_agg']:.0f}s.",
+            )
+            _log_parallel_efficiency(
+                _log,
+                "pre-aggregation",
+                wall_s=build_secs,
+                busy_s=stage_secs["vector_agg"] + stage_secs["raster_agg"],
+                workers=int(stage_secs.get("workers", 1)),
             )
 
         self._preaggr_cache = cache
@@ -2774,6 +2784,56 @@ class MetricFusionEngine:
             f"(resident {cache.n_bytes / 2**30:.2f} GB).",
         )
         return True
+
+    def _prep_channel_source(
+        self, src: Any, channel: str, utm_crs: Any, all_points: bool
+    ) -> tuple:
+        """Normalise one channel's metric into the form both run paths consume.
+
+        Returns one of:
+
+        * ``("raster", array_or_lazy, transform, raster_crs)``
+        * ``("point", xy, values)`` — coordinates and values in ``utm_crs``
+        * ``("geom", gdf, value_column, cell_buffer_m)``
+
+        The point form stops short of the ``BallTree``: the in-process path
+        builds one here, while the pool publishes the coordinates and lets each
+        worker build its own, so no tree ever crosses the pickle channel.
+        """
+        if isinstance(src, dict):  # raster source
+            return ("raster", src["data"], src["transform"], src["crs"])
+        col = self._metric_value_column(src, channel)
+        metric = src.to_crs(utm_crs)
+        metric = metric[metric[col].notna()]
+        if not all_points:
+            metric = metric.reset_index(drop=True)
+            return (
+                "geom",
+                metric,
+                col,
+                preaggregation.metric_cell_buffer_m(metric),
+            )
+        if len(metric) == 0:
+            raise ValueError(f"pre-aggregation: metric column '{col}' is all-NaN")
+        xy = np.column_stack(
+            [metric.geometry.x.to_numpy(), metric.geometry.y.to_numpy()]
+        ).astype(np.float64)
+        return ("point", xy, metric[col].to_numpy(dtype=np.float32))
+
+    @staticmethod
+    def _shared_gvi_geometry(veg_prep: tuple, ter_prep: tuple) -> np.ndarray | None:
+        """The coordinates veg and terrain share, or ``None`` if they differ.
+
+        ``veg`` and ``terrain`` are usually two attribute columns of the same
+        GVI point layer, so their geometry — and the radius query over it — is
+        identical and one query can serve both.
+        """
+        if veg_prep[0] != "point" or ter_prep[0] != "point":
+            return None
+        veg_xy, ter_xy = veg_prep[1], ter_prep[1]
+        if len(veg_xy) == 0 or not np.array_equal(veg_xy, ter_xy):
+            return None
+        return veg_xy
 
     def _aggregate_pixel_channels(
         self,
@@ -2789,9 +2849,10 @@ class MetricFusionEngine:
         all_points: bool,
         point_xy_utm: np.ndarray,
         entity_geoms_utm: list,
-        workers: int,
+        max_workers: int | None,
         cancel_callback: Callable[[], bool] | None,
         stage_secs: dict[str, float],
+        progress_callback: Callable[[int], None] | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
         """Compute veg / terrain / ndvi stats for the pixels at ``positions``.
 
@@ -2801,9 +2862,19 @@ class MetricFusionEngine:
         point layers with identical geometry, one ``BallTree`` and one radius
         query serve both. Returns the three ``[n_positions, n_radii, n_stats]``
         arrays, or ``None`` if cancelled.
-        """
-        from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
+        The batches run in worker **processes** whenever the entities are points
+        — which is every gridded target, so every per-pixel CGI run. The work is
+        a long chain of small numpy calls per entity and therefore GIL-bound, so
+        threads leave the machine idle where processes do not (measurements in
+        :mod:`geofuse.parallel`). Entity geometry that is not points keeps the
+        in-process path, since its channels are backed by spatial indexes that
+        would have to be pickled rather than rebuilt.
+
+        ``progress_callback`` receives the running count of finished entities.
+        The pool size actually used is recorded as ``stage_secs["workers"]`` for
+        the caller's parallel-efficiency log.
+        """
         n = len(positions)
         nstats = len(preaggregation.STAT_COLUMNS)
         veg_out = np.full((n, len(gvi_radii), nstats), np.nan, dtype=np.float32)
@@ -2812,140 +2883,317 @@ class MetricFusionEngine:
         if n == 0:
             return veg_out, ter_out, ndvi_out
 
-        def _prep(src: Any, channel: str):
-            """A per-channel aggregator: ('raster'|'point'|'geom', payload...)."""
-            if isinstance(src, dict):  # raster source
-                to_raster = None
-                if str(src["crs"]) != str(utm_crs):
-                    from pyproj import Transformer as _T
+        preps = {
+            "veg": self._prep_channel_source(veg_src, "veg", utm_crs, all_points),
+            "terrain": self._prep_channel_source(
+                terrain_src, "terrain", utm_crs, all_points
+            ),
+            "ndvi": self._prep_channel_source(ndvi_src, "ndvi", utm_crs, all_points),
+        }
+        shared_xy = (
+            self._shared_gvi_geometry(preps["veg"], preps["terrain"])
+            if shared_gvi and all_points
+            else None
+        )
 
-                    to_raster = _T.from_crs(utm_crs, src["crs"], always_xy=True)
-                return ("raster", src["data"], src["transform"], to_raster)
-            col = self._metric_value_column(src, channel)
-            if all_points:
-                tree, vals = preaggregation.build_vector_index(src, utm_crs, col)
-                return ("point", tree, vals)
-            m = src.to_crs(utm_crs)
-            m = m[m[col].notna()].reset_index(drop=True)
-            return ("geom", m, col, preaggregation.metric_cell_buffer_m(m))
-
-        # Shared veg+terrain aggregator when both are matching point layers.
-        gvi_shared = None
-        veg_agg = ter_agg = None
-        if (
-            shared_gvi
-            and all_points
-            and not isinstance(veg_src, dict)
-            and not isinstance(terrain_src, dict)
-        ):
-            veg_col = self._metric_value_column(veg_src, "veg")
-            ter_col = self._metric_value_column(terrain_src, "terrain")
-            v_utm = veg_src.to_crs(utm_crs)
-            v_utm = v_utm[v_utm[veg_col].notna()].reset_index(drop=True)
-            t_utm = terrain_src.to_crs(utm_crs)
-            t_utm = t_utm[t_utm[ter_col].notna()].reset_index(drop=True)
-            vx, vy = v_utm.geometry.x.to_numpy(), v_utm.geometry.y.to_numpy()
-            tx, ty = t_utm.geometry.x.to_numpy(), t_utm.geometry.y.to_numpy()
-            if (
-                len(vx) == len(tx)
-                and len(vx) > 0
-                and np.array_equal(vx, tx)
-                and np.array_equal(vy, ty)
-            ):
-                from sklearn.neighbors import BallTree
-
-                gvi_shared = (
-                    BallTree(np.column_stack([vx, vy]).astype(np.float64)),
-                    {
-                        "veg": v_utm[veg_col].to_numpy(np.float32),
-                        "terrain": t_utm[ter_col].to_numpy(np.float32),
-                    },
-                )
-        if gvi_shared is None:
-            veg_agg = _prep(veg_src, "veg")
-            ter_agg = _prep(terrain_src, "terrain")
-        ndvi_agg = _prep(ndvi_src, "ndvi")
-
-        def _channel(agg, bpos, radii):
-            kind = agg[0]
-            if kind == "point":
-                return preaggregation.vector_batch_stats(
-                    agg[1], agg[2], point_xy_utm[bpos], radii
-                )
-            geoms = [entity_geoms_utm[i] for i in bpos]
-            if kind == "geom":
-                return preaggregation.vector_batch_geometry_stats(
-                    agg[1], agg[2], geoms, radii, cell_buffer_m=agg[3]
-                )
-            return preaggregation.raster_batch_geometry_stats(
-                agg[1], agg[2], geoms, radii, to_raster_crs=agg[3]
-            )
-
-        # Batches: raster/geometry channels poll per entity and are the slow
-        # path, so keep batches small unless every channel is a point layer.
-        pure_points = gvi_shared is not None and ndvi_agg[0] == "point"
+        # Raster and geometry channels poll per entity and are the slow path, so
+        # keep batches small unless every channel is a point layer.
+        pure_points = shared_xy is not None and preps["ndvi"][0] == "point"
         batch_size = 1024 if pure_points else 128
         bounds = list(range(0, n, batch_size)) + [n]
         batches = [(bounds[i], bounds[i + 1]) for i in range(len(bounds) - 1)]
 
-        def _compute(lo: int, hi: int):
-            bpos = positions[lo:hi]
-            t0 = time.perf_counter()
-            if gvi_shared is not None:
-                m = preaggregation.vector_batch_stats_multi(
-                    gvi_shared[0], gvi_shared[1], point_xy_utm[bpos], gvi_radii
-                )
-                veg_b, ter_b = m["veg"], m["terrain"]
-            else:
-                veg_b = _channel(veg_agg, bpos, gvi_radii)
-                ter_b = _channel(ter_agg, bpos, gvi_radii)
-            t1 = time.perf_counter()
-            ndvi_b = _channel(ndvi_agg, bpos, ndvi_radii)
-            t2 = time.perf_counter()
-            return lo, hi, veg_b, ter_b, ndvi_b, (t1 - t0), (t2 - t1)
+        done_entities = 0
 
         def _store(res) -> None:
+            nonlocal done_entities
             lo, hi, veg_b, ter_b, ndvi_b, vsec, rsec = res
             veg_out[lo:hi] = veg_b
             ter_out[lo:hi] = ter_b
             ndvi_out[lo:hi] = ndvi_b
             stage_secs["vector_agg"] += vsec
             stage_secs["raster_agg"] += rsec
+            done_entities += hi - lo
+            if progress_callback is not None:
+                progress_callback(done_entities)
 
-        cancelled = False
-        if workers == 1:
-            for lo, hi in batches:
-                if cancel_callback is not None and cancel_callback():
-                    cancelled = True
-                    break
-                _store(_compute(lo, hi))
+        if all_points:
+            workers = parallel.process_worker_count(len(batches), cap=max_workers)
+            stage_secs["workers"] = float(workers)
+            finished = self._aggregate_in_processes(
+                positions,
+                preps=preps,
+                shared_xy=shared_xy,
+                gvi_radii=gvi_radii,
+                ndvi_radii=ndvi_radii,
+                utm_crs=utm_crs,
+                point_xy_utm=point_xy_utm,
+                batches=batches,
+                workers=workers,
+                cancel_callback=cancel_callback,
+                on_result=_store,
+            )
         else:
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                it = iter(batches)
-                in_flight = {
-                    ex.submit(_compute, *b)
-                    for b in (
-                        next(it, None) for _ in range(min(2 * workers, len(batches)))
-                    )
-                    if b is not None
-                }
-                while in_flight:
-                    if cancel_callback is not None and cancel_callback():
-                        cancelled = True
-                        for fut in in_flight:
-                            fut.cancel()
-                        break
-                    done, in_flight = wait(
-                        in_flight, timeout=0.5, return_when=FIRST_COMPLETED
-                    )
-                    for fut in done:
-                        _store(fut.result())
-                        nb = next(it, None)
-                        if nb is not None:
-                            in_flight.add(ex.submit(_compute, *nb))
-        if cancelled:
+            workers = parallel.workers_for(len(batches), cap=max_workers)
+            stage_secs["workers"] = float(workers)
+            finished = self._aggregate_in_threads(
+                positions,
+                preps=preps,
+                shared_xy=shared_xy,
+                gvi_radii=gvi_radii,
+                ndvi_radii=ndvi_radii,
+                utm_crs=utm_crs,
+                point_xy_utm=point_xy_utm,
+                entity_geoms_utm=entity_geoms_utm,
+                batches=batches,
+                workers=workers,
+                cancel_callback=cancel_callback,
+                on_result=_store,
+            )
+        if not finished:
             return None
         return veg_out, ter_out, ndvi_out
+
+    def _resolved_state(
+        self,
+        preps: dict,
+        shared_xy: np.ndarray | None,
+        *,
+        gvi_radii: tuple[int, ...],
+        ndvi_radii: tuple[int, ...],
+        utm_crs: Any,
+    ) -> dict:
+        """In-process aggregator state for :func:`preaggregation.aggregate_entity_batch`."""
+        from sklearn.neighbors import BallTree
+
+        def _aggregator(prep: tuple) -> tuple:
+            if prep[0] == "raster":
+                to_raster = None
+                if str(prep[3]) != str(utm_crs):
+                    from pyproj import Transformer
+
+                    to_raster = Transformer.from_crs(
+                        utm_crs, prep[3], always_xy=True
+                    ).transform
+                return ("raster", prep[1], prep[2], to_raster)
+            if prep[0] == "point":
+                return ("point", BallTree(prep[1]), prep[2])
+            return prep
+
+        state = {"gvi_radii": gvi_radii, "ndvi_radii": ndvi_radii}
+        if shared_xy is not None:
+            state["gvi_shared"] = (
+                BallTree(shared_xy),
+                {"veg": preps["veg"][2], "terrain": preps["terrain"][2]},
+            )
+        else:
+            state["veg"] = _aggregator(preps["veg"])
+            state["terrain"] = _aggregator(preps["terrain"])
+        state["ndvi"] = _aggregator(preps["ndvi"])
+        return state
+
+    def _aggregate_in_threads(
+        self,
+        positions: np.ndarray,
+        *,
+        preps: dict,
+        shared_xy: np.ndarray | None,
+        gvi_radii: tuple[int, ...],
+        ndvi_radii: tuple[int, ...],
+        utm_crs: Any,
+        point_xy_utm: np.ndarray,
+        entity_geoms_utm: list,
+        batches: list,
+        workers: int,
+        cancel_callback: Callable[[], bool] | None,
+        on_result: Callable[[Any], None],
+    ) -> bool:
+        """Run the batches in this process. ``False`` if cancelled."""
+        from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+        state = self._resolved_state(
+            preps,
+            shared_xy,
+            gvi_radii=gvi_radii,
+            ndvi_radii=ndvi_radii,
+            utm_crs=utm_crs,
+        )
+
+        def _compute(lo: int, hi: int):
+            bpos = positions[lo:hi]
+            xy = point_xy_utm[bpos] if len(point_xy_utm) else None
+            geoms = [entity_geoms_utm[i] for i in bpos]
+            veg_b, ter_b, ndvi_b, vsec, rsec = preaggregation.aggregate_entity_batch(
+                state, point_xy=xy, geoms=geoms
+            )
+            return lo, hi, veg_b, ter_b, ndvi_b, vsec, rsec
+
+        if workers <= 1:
+            for lo, hi in batches:
+                if cancel_callback is not None and cancel_callback():
+                    return False
+                on_result(_compute(lo, hi))
+            return True
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            it = iter(batches)
+            in_flight = {
+                ex.submit(_compute, *b)
+                for b in (
+                    next(it, None) for _ in range(min(2 * workers, len(batches)))
+                )
+                if b is not None
+            }
+            while in_flight:
+                if cancel_callback is not None and cancel_callback():
+                    for fut in in_flight:
+                        fut.cancel()
+                    return False
+                done, in_flight = wait(
+                    in_flight, timeout=0.5, return_when=FIRST_COMPLETED
+                )
+                for fut in done:
+                    on_result(fut.result())
+                    nb = next(it, None)
+                    if nb is not None:
+                        in_flight.add(ex.submit(_compute, *nb))
+        return True
+
+    def _aggregate_in_processes(
+        self,
+        positions: np.ndarray,
+        *,
+        preps: dict,
+        shared_xy: np.ndarray | None,
+        gvi_radii: tuple[int, ...],
+        ndvi_radii: tuple[int, ...],
+        utm_crs: Any,
+        point_xy_utm: np.ndarray,
+        batches: list,
+        workers: int,
+        cancel_callback: Callable[[], bool] | None,
+        on_result: Callable[[Any], None],
+    ) -> bool:
+        """Run the batches across worker processes. ``False`` if cancelled.
+
+        Publishes every bulk array once into a scratch directory that the
+        workers memory-map, so widening the pool costs no extra transfer and no
+        extra copy of the metric in RAM. Falls back to the in-process path if a
+        channel cannot be described to a worker.
+        """
+        import shutil
+        import tempfile
+
+        share_dir = tempfile.mkdtemp(prefix="preaggr-", dir=self.cache_dir)
+        try:
+            spec = self._pool_spec(
+                positions,
+                preps=preps,
+                shared_xy=shared_xy,
+                gvi_radii=gvi_radii,
+                ndvi_radii=ndvi_radii,
+                utm_crs=utm_crs,
+                point_xy_utm=point_xy_utm,
+                share_dir=share_dir,
+            )
+            # Say which limit set the width, so a pool that is narrower than the
+            # machine reads as a deliberate choice rather than a mystery.
+            by_memory = parallel.memory_worker_cap()
+            headroom = parallel.available_memory_bytes()
+            limit = "cores"
+            if by_memory is not None and by_memory <= workers:
+                limit = f"free memory ({headroom / 2**30:.1f} GB)"
+            elif workers >= len(batches):
+                limit = "batches available"
+            _log(
+                "INFO",
+                f"    aggregating {len(positions):,} pixel(s) across "
+                f"{workers} worker process(es) — limited by {limit}.",
+            )
+            return parallel.map_batches(
+                preaggregation.worker_aggregate,
+                batches,
+                workers=workers,
+                initializer=preaggregation.worker_init,
+                initargs=(spec,),
+                on_result=on_result,
+                cancel_check=cancel_callback,
+            )
+        finally:
+            # A single-worker pool runs the initializer here rather than in a
+            # child, so the scratch files stay mapped into *this* process until
+            # that state is dropped — and Windows will not delete a mapped file.
+            preaggregation.worker_release()
+            shutil.rmtree(share_dir, ignore_errors=True)
+
+    def _pool_spec(
+        self,
+        positions: np.ndarray,
+        *,
+        preps: dict,
+        shared_xy: np.ndarray | None,
+        gvi_radii: tuple[int, ...],
+        ndvi_radii: tuple[int, ...],
+        utm_crs: Any,
+        point_xy_utm: np.ndarray,
+        share_dir: str,
+    ) -> dict:
+        """Describe the whole job to a worker, publishing its bulk arrays."""
+        crs_key = str(utm_crs)
+
+        def _channel_spec(name: str, prep: tuple) -> dict:
+            if prep[0] == "raster":
+                array = prep[1]
+                common = {
+                    "transform": prep[2],
+                    "from_crs": crs_key,
+                    "to_crs": str(prep[3]),
+                }
+                path = getattr(array, "path", None)
+                if path is not None:
+                    # Already a windowed reader over a file; the worker opens
+                    # its own handle rather than sharing this one, since GDAL
+                    # datasets are not safe across processes.
+                    return {
+                        "kind": "raster",
+                        "path": path,
+                        "band": getattr(array, "band", 1),
+                        **common,
+                    }
+                return {
+                    "kind": "raster_array",
+                    "path": parallel.publish_array(
+                        share_dir,
+                        f"{name}-raster",
+                        np.ma.filled(array, np.nan)
+                        if np.issubdtype(array.dtype, np.floating)
+                        else np.ma.filled(array.astype(np.float32), np.nan),
+                    ),
+                    **common,
+                }
+            spec = {
+                "kind": "points",
+                "values": parallel.publish_array(share_dir, f"{name}-values", prep[2]),
+            }
+            if shared_xy is not None and name in ("veg", "terrain"):
+                spec["shared"] = True
+            else:
+                spec["xy"] = parallel.publish_array(share_dir, f"{name}-xy", prep[1])
+            return spec
+
+        spec = {
+            "entity_xy": parallel.publish_array(
+                share_dir, "entity-xy", point_xy_utm[positions]
+            ),
+            "gvi_radii": tuple(gvi_radii),
+            "ndvi_radii": tuple(ndvi_radii),
+            "channels": {n: _channel_spec(n, p) for n, p in preps.items()},
+        }
+        if shared_xy is not None:
+            spec["gvi_shared_xy"] = parallel.publish_array(
+                share_dir, "gvi-shared-xy", shared_xy
+            )
+        return spec
     def _precompute_aggregations_longitudinal(
         self,
         progress_callback: Callable[[int, int], None] | None = None,
@@ -3082,9 +3330,6 @@ class MetricFusionEngine:
         if progress_callback is not None:
             progress_callback(0, max(total_missing, 1))
 
-        workers = (
-            parallel.worker_count() if max_workers is None else max_workers
-        )
         stage_secs = {"vector_agg": 0.0, "raster_agg": 0.0}
         build_t0 = time.perf_counter()
         processed = 0
@@ -3117,7 +3362,7 @@ class MetricFusionEngine:
                 dtype=np.int64,
                 count=len(missing),
             )
-            wk = max(1, min(workers, len(pos) // 128 + 1))
+            unit_base = processed
             result = self._aggregate_pixel_channels(
                 pos,
                 veg_src=veg_src,
@@ -3130,9 +3375,16 @@ class MetricFusionEngine:
                 all_points=all_points,
                 point_xy_utm=point_xy_utm,
                 entity_geoms_utm=entity_geoms_utm,
-                workers=wk,
+                max_workers=max_workers,
                 cancel_callback=cancel_callback,
                 stage_secs=stage_secs,
+                progress_callback=(
+                    None
+                    if progress_callback is None
+                    else lambda done: progress_callback(
+                        min(unit_base + done, total_missing), max(total_missing, 1)
+                    )
+                ),
             )
             if result is None:
                 cancelled = True
@@ -3170,7 +3422,7 @@ class MetricFusionEngine:
             "pre-aggregation",
             wall_s=total_build,
             busy_s=stage_secs["vector_agg"] + stage_secs["raster_agg"],
-            workers=workers,
+            workers=int(stage_secs.get("workers", 1)),
         )
         return True
 

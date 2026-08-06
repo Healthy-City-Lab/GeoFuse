@@ -26,6 +26,7 @@ import gc
 import hashlib
 import json
 import os
+import time
 from typing import Any
 
 import numpy as np
@@ -54,15 +55,103 @@ _N_STATS = len(STAT_COLUMNS)
 _STORE_DECIMALS = 4
 
 
+# The percentile grid as fractions, and the interpolation ``np.percentile``
+# applies between the two order statistics a fractional rank falls between.
+# Both are reproduced here rather than called through ``np.percentile`` because
+# that function's fixed per-call cost — argument validation, ``_ureduce``, and
+# a ``np.unique`` over its own index list — dominated the pre-aggregation build:
+# it is invoked once per (entity, radius, channel), tens of millions of times,
+# on samples of a few thousand values each. Selecting the order statistics
+# directly is exact against ``np.percentile`` and measured ~2x faster.
+_PCT_FRACTIONS = np.asarray(PERCENTILES, dtype=np.float64) / 100.0
+
+
+def _percentile_ranks(n: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``(lower, upper, weight)`` — the ranks each percentile sits between."""
+    virtual = _PCT_FRACTIONS * (n - 1)
+    lower = virtual.astype(np.intp)
+    return lower, np.minimum(lower + 1, n - 1), virtual - lower
+
+
+def _interpolate(lower: np.ndarray, upper: np.ndarray, weight: np.ndarray) -> np.ndarray:
+    """Blend two order statistics the way ``np.percentile``'s default does."""
+    span = upper - lower
+    return np.where(
+        weight < 0.5, lower + span * weight, upper - span * (1.0 - weight)
+    )
+
+
 def compute_all_stats(values: np.ndarray) -> np.ndarray:
     """Return ``[mean, p10, p25, p50, p75, p90]`` as float32, rounded to four
     decimals; all-NaN if empty."""
-    if values.size == 0:
+    n = values.size
+    if n == 0:
         return np.full(_N_STATS, np.nan, dtype=np.float32)
     out = np.empty(_N_STATS, dtype=np.float32)
     out[0] = float(values.mean())
-    out[1:] = np.percentile(values, PERCENTILES)
+    if n == 1:
+        out[1:] = values[0]
+    else:
+        lower, upper, weight = _percentile_ranks(n)
+        # Partitioning about the extremes as well as the wanted ranks puts the
+        # maximum last, so one look there settles whether the sample holds a
+        # NaN — the same test, and the same all-NaN answer, as ``np.percentile``.
+        ranked = np.partition(values, np.concatenate(([0, -1], lower, upper)))
+        out[1:] = (
+            np.nan
+            if np.isnan(ranked[-1])
+            else _interpolate(ranked[lower], ranked[upper], weight)
+        )
     return np.round(out, _STORE_DECIMALS)
+
+
+def prefix_stats(values: np.ndarray, ends: np.ndarray) -> np.ndarray:
+    """Stats for every nested prefix of ``values``: ``[len(ends), n_stats]``.
+
+    ``ends`` is ascending and prefix *i* is ``values[:ends[i]]`` — the shape a
+    radius ladder always takes once a neighbourhood is ordered by distance (or
+    by ring), since a smaller disc's members are a prefix of a larger one's.
+    Two consequences of that nesting are used here instead of reducing each
+    radius from scratch:
+
+    * every prefix mean is a slice of one cumulative sum, and
+    * a prefix's sorted form is the previous prefix's sorted form merged with
+      the block the radius added, so a stable sort over the concatenation
+      absorbs the new block in a linear pass rather than re-sorting the whole.
+
+    Values must be finite; the callers filter NaN out when they build the
+    neighbourhood. (A NaN would sort last and leave the lower percentiles
+    reading as if it weren't there.)
+    """
+    ends = np.asarray(ends, dtype=np.intp)
+    out = np.full((ends.size, _N_STATS), np.nan, dtype=np.float32)
+    filled = ends > 0
+    if values.size == 0 or not filled.any():
+        return out
+
+    running_total = np.cumsum(values, dtype=np.float64)
+    out[filled, 0] = running_total[ends[filled] - 1] / ends[filled]
+
+    ranked = np.empty(0, dtype=values.dtype)
+    grown = 0
+    for i in range(ends.size):
+        n = int(ends[i])
+        if n == 0:
+            continue
+        if n > grown:
+            block = np.sort(values[grown:n])
+            ranked = (
+                block
+                if ranked.size == 0
+                else np.sort(np.concatenate((ranked, block)), kind="stable")
+            )
+            grown = n
+        if n == 1:
+            out[i, 1:] = ranked[0]
+            continue
+        lower, upper, weight = _percentile_ranks(n)
+        out[i, 1:] = _interpolate(ranked[lower], ranked[upper], weight)
+    return np.round(out, _STORE_DECIMALS, out=out)
 
 
 def stat_to_column(stat: str, percentile: int | None) -> str | None:
@@ -194,18 +283,12 @@ def stats_from_ring_grid(
     aligned. Disc *i* is every pixel whose ring index is ``<= i``, so sorting
     once by ring index makes each disc a prefix of the sorted values.
     """
-    out = np.full((n_radii, _N_STATS), np.nan, dtype=np.float32)
     if values.size == 0:
-        return out
+        return np.full((n_radii, _N_STATS), np.nan, dtype=np.float32)
     order = np.argsort(ring_index, kind="stable")
     rings_sorted = ring_index[order]
-    vals_sorted = values[order]
     ends = np.searchsorted(rings_sorted, np.arange(n_radii), side="right")
-    for i in range(n_radii):
-        end = int(ends[i])
-        if end > 0:
-            out[i, :] = compute_all_stats(vals_sorted[:end])
-    return out
+    return prefix_stats(values[order], ends)
 
 
 def raster_disc_stats(
@@ -265,52 +348,6 @@ def raster_disc_stats(
 # ────────────────────────────────────────────────────────────────────
 
 
-def build_vector_index(metric_gdf, metric_crs, value_col: str):
-    """Build a ``BallTree`` over a point metric in ``metric_crs``.
-
-    Returns ``(tree, values)`` where ``values`` are the metric values aligned
-    with the tree's points. Raises if the value column has no non-NaN features.
-    """
-    from sklearn.neighbors import BallTree
-
-    m = metric_gdf.to_crs(metric_crs)
-    m = m[m[value_col].notna()]
-    if len(m) == 0:
-        raise ValueError(f"pre-aggregation: metric column '{value_col}' is all-NaN")
-    xy = np.column_stack([m.geometry.x.to_numpy(), m.geometry.y.to_numpy()]).astype(
-        np.float64
-    )
-    return BallTree(xy), m[value_col].to_numpy(dtype=np.float32)
-
-
-def build_vector_index_multi(metric_gdf, metric_crs, value_cols: list[str]):
-    """Build one ``BallTree`` shared by several value columns of one metric.
-
-    ``veg`` and ``terrain`` are two attribute columns of the same GVI points,
-    so their geometry — and the expensive ``query_radius`` over it — is
-    identical. Indexing once over the rows valid in *every* requested column
-    lets a single query serve all of them. Returns ``(tree, {col: values})``
-    with each column's values aligned to the tree's points. Raises if the
-    shared valid set is empty.
-    """
-    from sklearn.neighbors import BallTree
-
-    m = metric_gdf.to_crs(metric_crs)
-    mask = np.ones(len(m), dtype=bool)
-    for col in value_cols:
-        mask &= m[col].notna().to_numpy()
-    m = m[mask]
-    if len(m) == 0:
-        raise ValueError(
-            f"pre-aggregation: no rows with all of {value_cols} present"
-        )
-    xy = np.column_stack([m.geometry.x.to_numpy(), m.geometry.y.to_numpy()]).astype(
-        np.float64
-    )
-    values = {col: m[col].to_numpy(dtype=np.float32) for col in value_cols}
-    return BallTree(xy), values
-
-
 def vector_batch_stats_multi(
     tree: Any,
     values_by_col: dict[str, np.ndarray],
@@ -344,12 +381,7 @@ def vector_batch_stats_multi(
         neigh_sorted = neigh[order]
         ends = np.searchsorted(d_sorted, radii_arr, side="right")
         for c in cols:
-            v_sorted = values_by_col[c][neigh_sorted]
-            col_out = out[c]
-            for ri in range(n_radii):
-                end = int(ends[ri])
-                if end > 0:
-                    col_out[b, ri, :] = compute_all_stats(v_sorted[:end])
+            out[c][b] = prefix_stats(values_by_col[c][neigh_sorted], ends)
     return out
 
 
@@ -378,13 +410,8 @@ def vector_batch_stats(
             continue
         d_all = dist_arr[b]
         order = np.argsort(d_all, kind="stable")
-        d_sorted = d_all[order]
-        v_sorted = values[neigh][order]
-        ends = np.searchsorted(d_sorted, radii_arr, side="right")
-        for ri in range(n_radii):
-            end = int(ends[ri])
-            if end > 0:
-                out[b, ri, :] = compute_all_stats(v_sorted[:end])
+        ends = np.searchsorted(d_all[order], radii_arr, side="right")
+        out[b] = prefix_stats(values[neigh][order], ends)
     return out
 
 
@@ -747,6 +774,199 @@ def raster_batch_geometry_stats(
             discs, metric_array, raster_transform, xy_fn=xy_fn
         )
     return out
+
+
+# ────────────────────────────────────────────────────────────────────
+# Batch aggregation across all three channels
+# ────────────────────────────────────────────────────────────────────
+#
+# One batch of entities reduced against veg, terrain and NDVI. The channels are
+# described by an *aggregator* — a small tuple naming how that channel is
+# sampled and holding whatever it is sampled through:
+#
+#   ("point",  BallTree, values)                 a point metric, entity is a point
+#   ("geom",   gdf, value_column, cell_buffer)   a point metric, entity is a shape
+#   ("raster", array, transform, xy_fn)          a raster metric, any entity
+#
+# ``aggregate_entity_batch`` is the single implementation of a batch, shared by
+# the in-process path and by the pool workers below, so the two can never drift.
+
+
+def channel_batch_stats(
+    aggregator: tuple,
+    radii_m: tuple[int, ...],
+    *,
+    point_xy: np.ndarray | None = None,
+    geoms: list | None = None,
+) -> np.ndarray:
+    """Reduce one batch against one channel: ``[n_entities, n_radii, n_stats]``."""
+    kind = aggregator[0]
+    if kind == "point":
+        return vector_batch_stats(aggregator[1], aggregator[2], point_xy, radii_m)
+    if kind == "geom":
+        return vector_batch_geometry_stats(
+            aggregator[1], aggregator[2], geoms, radii_m, cell_buffer_m=aggregator[3]
+        )
+    return raster_batch_geometry_stats(
+        aggregator[1], aggregator[2], geoms, radii_m, to_raster_crs=aggregator[3]
+    )
+
+
+def aggregate_entity_batch(
+    state: dict,
+    *,
+    point_xy: np.ndarray | None = None,
+    geoms: list | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
+    """Aggregate one batch of entities across all three channels.
+
+    ``state`` carries the resolved aggregators: ``veg`` / ``terrain`` / ``ndvi``
+    plus the two radius ladders, and optionally ``gvi_shared`` — a
+    ``(BallTree, {"veg": values, "terrain": values})`` pair used when veg and
+    terrain are two attribute columns of one point layer, so a single radius
+    query serves both instead of walking the same neighbourhood twice.
+
+    Returns the three stat arrays plus the seconds spent on the GVI channels
+    and on NDVI, which the caller accumulates for the parallel-efficiency log.
+    """
+    started = time.perf_counter()
+    shared = state.get("gvi_shared")
+    gvi_radii = state["gvi_radii"]
+    if shared is not None:
+        both = vector_batch_stats_multi(shared[0], shared[1], point_xy, gvi_radii)
+        veg, terrain = both["veg"], both["terrain"]
+    else:
+        veg = channel_batch_stats(
+            state["veg"], gvi_radii, point_xy=point_xy, geoms=geoms
+        )
+        terrain = channel_batch_stats(
+            state["terrain"], gvi_radii, point_xy=point_xy, geoms=geoms
+        )
+    gvi_done = time.perf_counter()
+    ndvi = channel_batch_stats(
+        state["ndvi"], state["ndvi_radii"], point_xy=point_xy, geoms=geoms
+    )
+    return veg, terrain, ndvi, gvi_done - started, time.perf_counter() - gvi_done
+
+
+# ────────────────────────────────────────────────────────────────────
+# Process-pool workers
+# ────────────────────────────────────────────────────────────────────
+#
+# Aggregation is a long chain of small numpy calls per entity, so it is bound by
+# the GIL rather than by the CPU or the disk and a thread pool cannot speed it
+# up (see :mod:`geofuse.parallel`). These workers run the same batches in their
+# own interpreters instead.
+#
+# Nothing bulky crosses the pickle channel. The parent publishes the entity
+# coordinates and each point metric's coordinates and values as ``.npy`` files;
+# every worker memory-maps them, so one copy of the pages serves the whole pool.
+# Raster channels carry only a path, which the worker opens for itself. A task
+# is a pair of indices and its result is the reduced stats for that slice.
+
+# This worker's resident state, built once by :func:`worker_init`.
+_WORKER_STATE: dict = {}
+
+
+def _transformer(from_crs: str | None, to_crs: str | None) -> Any:
+    """The (x, y) reprojection between two CRS descriptions, or ``None``."""
+    if not from_crs or not to_crs or from_crs == to_crs:
+        return None
+    from pyproj import Transformer
+
+    return Transformer.from_crs(from_crs, to_crs, always_xy=True).transform
+
+
+def _build_aggregator(spec: dict, shared_xy: Any) -> tuple:
+    """Rebuild one channel's aggregator in a worker from its description."""
+    from .parallel import attach_array
+
+    if spec["kind"] == "raster":
+        from .raster_sampling import LazyRasterArray
+
+        array = LazyRasterArray(spec["path"], band=spec.get("band", 1))
+        return (
+            "raster",
+            array,
+            spec["transform"],
+            _transformer(spec.get("from_crs"), spec.get("to_crs")),
+        )
+    if spec["kind"] == "raster_array":
+        return (
+            "raster",
+            attach_array(spec["path"]),
+            spec["transform"],
+            _transformer(spec.get("from_crs"), spec.get("to_crs")),
+        )
+    from sklearn.neighbors import BallTree
+
+    xy = shared_xy if spec.get("shared") else np.asarray(attach_array(spec["xy"]))
+    return ("point", BallTree(xy), attach_array(spec["values"]))
+
+
+def worker_init(spec: dict) -> None:
+    """Pool initializer: attach the shared arrays and build this worker's state.
+
+    Runs once per worker. The BallTree over a point metric is rebuilt here
+    rather than pickled in — it is derived data, and rebuilding it from mapped
+    coordinates measured cheaper than shipping a copy to every worker.
+    """
+    from sklearn.neighbors import BallTree
+
+    from .parallel import attach_array
+
+    _WORKER_STATE.clear()
+    state: dict = {
+        "entity_xy": attach_array(spec["entity_xy"]),
+        "gvi_radii": tuple(spec["gvi_radii"]),
+        "ndvi_radii": tuple(spec["ndvi_radii"]),
+    }
+    shared_xy = None
+    if spec.get("gvi_shared_xy"):
+        shared_xy = np.asarray(attach_array(spec["gvi_shared_xy"]))
+        state["gvi_shared"] = (
+            BallTree(shared_xy),
+            {
+                "veg": attach_array(spec["channels"]["veg"]["values"]),
+                "terrain": attach_array(spec["channels"]["terrain"]["values"]),
+            },
+        )
+    for name, chan in spec["channels"].items():
+        if shared_xy is not None and name in ("veg", "terrain"):
+            continue
+        state[name] = _build_aggregator(chan, shared_xy)
+    _WORKER_STATE.update(state)
+
+
+def worker_release() -> None:
+    """Drop this process's worker state, releasing the mapped scratch files.
+
+    Windows refuses to delete a file that is still mapped or open, so the
+    raster handles are closed explicitly rather than left to collection.
+    """
+    for value in _WORKER_STATE.values():
+        for part in value if isinstance(value, tuple) else ():
+            close_all = getattr(part, "close_all", None)
+            if close_all is not None:
+                close_all()
+    _WORKER_STATE.clear()
+    gc.collect()
+
+
+def worker_aggregate(lo: int, hi: int) -> tuple:
+    """Aggregate the entity slice ``[lo, hi)`` with this worker's state."""
+    import shapely
+
+    state = _WORKER_STATE
+    xy = np.asarray(state["entity_xy"][lo:hi], dtype=np.float64)
+    # Raster channels reduce over buffered geometry; the entities in this path
+    # are grid-pixel centroids, so their points are rebuilt from the mapped
+    # coordinates instead of travelling with the task.
+    geoms = list(shapely.points(xy))
+    veg, terrain, ndvi, gvi_s, ndvi_s = aggregate_entity_batch(
+        state, point_xy=xy, geoms=geoms
+    )
+    return lo, hi, veg, terrain, ndvi, gvi_s, ndvi_s
 
 
 # ────────────────────────────────────────────────────────────────────

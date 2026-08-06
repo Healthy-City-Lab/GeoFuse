@@ -52,10 +52,23 @@ Each job writes a full log to `logs/jobs/<job_id>.log`. The job-monitor expander
 
 Every fusion run ends with a **stage wall-clock breakdown** in its log — each stage's minutes and share, longest first — and the job-monitor stage list shows the same durations live. Parallel phases additionally log how many workers were actually busy, whether the pool or the work was the limit, and how many cores sat idle.
 
-Pool sizes come from the host's core count — about a third of it, because each task is already multi-threaded inside numpy, and a wider pool oversubscribes the cores rather than going faster. Set `GEOFUSE_WORKERS` to override when the machine is shared or when you want to test a different width:
+Pool sizes come from the host's core count, and the share depends on what the phase is waiting for:
+
+- **Thread pools** (the stability search, the scorers) take about a *third* of the cores. Each task is already multi-threaded inside numpy, so a wider pool oversubscribes the cores rather than going faster.
+- **Process pools** (the greenery pre-aggregation build) take about *two thirds*. That work is a long chain of small numpy calls per pixel, which spend most of their time holding the interpreter lock, so threads leave the machine idle no matter how many you open — worker processes each bring their own interpreter, and every worker is pinned to a single numpy thread so the shares don't compound.
+
+The process pool is bounded by **memory** as well as by cores, because every worker is a fresh interpreter. Each run logs which limit set the width:
+
+```text
+aggregating 994,539 pixel(s) across 12 worker process(es) — limited by free memory (9.4 GB).
+```
+
+`limited by cores` means the machine is fully used. `limited by free memory` means closing other applications (or enlarging the Windows page file) would widen the pool and speed the stage up. If the pool is at full width but the *busy* worker count is far lower, the pool is not the limit — check whether the metric files sit on a slow or networked drive.
+
+Set `GEOFUSE_WORKERS` to override either width when the machine is shared or when you want to test a different one:
 
 ```bash
-GEOFUSE_WORKERS=8 streamlit run ui/app.py     # cap every pool at 8 threads
+GEOFUSE_WORKERS=8 streamlit run ui/app.py     # cap every pool at 8 workers
 ```
 
 ### National-scale study areas (GVI)
