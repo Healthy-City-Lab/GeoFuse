@@ -25,13 +25,13 @@ from rasterio.transform import rowcol
 from . import metric_columns
 
 
-def nearest_metric_join(
+def nearest_metric_join_multi(
     points_gdf: gpd.GeoDataFrame,
     metric_gdf: gpd.GeoDataFrame,
-    value_col: str,
+    value_cols: list[str],
     max_distance_m: float,
-) -> pd.Series:
-    """Nearest-neighbour join in a metric CRS, returning one value per source row.
+) -> dict[str, pd.Series]:
+    """Nearest-neighbour join returning several of the metric's columns at once.
 
     Works around two ``gpd.sjoin_nearest`` pitfalls:
 
@@ -41,12 +41,17 @@ def nearest_metric_join(
 
     This helper reprojects both sides to a common UTM CRS so ``max_distance_m``
     is honoured, then drops duplicate left-index rows by keeping the first
-    match. The returned series is reindexed onto ``points_gdf.index`` so a
+    match. Each returned series is reindexed onto ``points_gdf.index`` so a
     simple ``points_gdf[col] = result`` assignment is always safe.
+
+    Several columns share one join because the join is the expensive half and
+    it depends only on geometry: ``veg`` and ``terrain`` are two attribute
+    columns of the same street-view points, so asking for them together costs
+    what one of them used to.
     """
     metric_crs = points_gdf.estimate_utm_crs()
     pts_m = points_gdf[["geometry"]].to_crs(metric_crs)
-    src_m = metric_gdf[["geometry", value_col]].to_crs(metric_crs)
+    src_m = metric_gdf[["geometry", *value_cols]].to_crs(metric_crs)
     joined = gpd.sjoin_nearest(
         pts_m,
         src_m,
@@ -55,8 +60,26 @@ def nearest_metric_join(
     )
     # Collapse ties: keep the first match per source row.
     joined = joined[~joined.index.duplicated(keep="first")]
-    col = value_col if value_col in joined.columns else f"{value_col}_right"
-    return joined[col].reindex(points_gdf.index)
+    out: dict[str, pd.Series] = {}
+    for value_col in value_cols:
+        col = value_col if value_col in joined.columns else f"{value_col}_right"
+        out[value_col] = joined[col].reindex(points_gdf.index)
+    return out
+
+
+def nearest_metric_join(
+    points_gdf: gpd.GeoDataFrame,
+    metric_gdf: gpd.GeoDataFrame,
+    value_col: str,
+    max_distance_m: float,
+) -> pd.Series:
+    """Nearest-neighbour join in a metric CRS, returning one value per source row.
+
+    Single-column form of :func:`nearest_metric_join_multi`.
+    """
+    return nearest_metric_join_multi(
+        points_gdf, metric_gdf, [value_col], max_distance_m
+    )[value_col]
 
 
 def sample_raster_values(

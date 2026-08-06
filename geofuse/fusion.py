@@ -1982,24 +1982,30 @@ class MetricFusionEngine:
         return float(n_pts) * float(per_point) * 8.0
 
     def _search_n_jobs(self, metric: str) -> int:
-        """Thread count for ``study.optimize`` — parallel only where it's safe.
+        """Thread count for ``study.optimize``.
 
-        Trial-level parallelism is enabled only when the longitudinal fast-GLS
-        scorer is active for this metric: there, all trials of a bootstrap share
-        one fold, so the per-fold caches (fold statics, fast components, the
-        lock-protected pre-aggregation cache) take idempotent writes and the
-        numpy GLS releases the GIL. The exact-fit path and the cross-sectional
-        OLS/pdcor path use OrderedDict scoring caches whose LRU eviction races
-        under threads, so they stay single-threaded.
+        Every metric runs its trials in parallel. All trials of a bootstrap
+        share one fold, so the per-fold state they touch — fold statics, the
+        pre-aggregation lookup plan, ring caches, fast components — takes
+        idempotent writes: two threads may build the same entry, but neither
+        can observe a wrong one. The two scoring caches that were *not* safe
+        (:mod:`geofuse.pdcor`'s side cache and the spline-basis cache) evicted
+        by walking their own iterator while another thread inserted; both now
+        guard that bookkeeping with a lock and keep the expensive build outside
+        it, which is what lifted the restriction to the fast-GLS metrics.
+
+        An exact ``statsmodels`` MixedLM refit stays the exception: it is
+        dominated by Python-level optimiser work holding the GIL, and threading
+        it measured 0.62x of serial, so it is left alone.
         """
-        fast_active = (
+        exact_refit = (
             self.is_longitudinal
-            and metric in mixed_effects_scoring.FAST_SEARCH_METRICS
-            and self.search_scoring_method
-            in mixed_effects_scoring.FAST_COMPONENT_METHODS
-            and self.spatial_adjust_method == "none"
+            and metric not in mixed_effects_scoring.FAST_SEARCH_METRICS
+            and metric in mixed_effects_scoring.MIXEDLM_METRICS
         )
-        return max(1, int(self._search_workers)) if fast_active else 1
+        if exact_refit:
+            return 1
+        return max(1, int(self._search_workers))
 
     def _clear_ring_caches(self) -> None:
         self._ring_raster_cache.clear()
@@ -2190,16 +2196,21 @@ class MetricFusionEngine:
         """
         uniq_ids = static.get("uniq_lookup_ids")
         if uniq_ids is not None and getattr(self, "_preaggregation_done", False):
-            looked_up = self._lookup_preaggregation(
-                uniq_ids,
-                channel,
-                radius_m,
-                stat,
-                percentile,
-                wave_indices=static.get("uniq_wave_idx"),
-            )
-            if looked_up is not None:
-                return looked_up, True
+            # The fold's row → cache-row resolution is the same for every trial,
+            # so it is built once and held on the fold's static dict; a trial
+            # then only reads its own (radius, stat) cell out of it.
+            source = self._ensure_memory_loaded() or self._preaggr_cache
+            column = preaggregation.stat_to_column(stat, percentile)
+            if source is not None and column is not None:
+                plan = self._preaggr_plan(
+                    source, uniq_ids, static.get("uniq_wave_idx"), static
+                )
+                if plan is not None:
+                    looked_up = source.gather(
+                        plan, channel, int(round(radius_m)), column
+                    )
+                    if looked_up is not None:
+                        return looked_up, True
         return (
             self._aggregate_with_ring_cache(
                 static["points"],
@@ -3507,29 +3518,41 @@ class MetricFusionEngine:
         column = preaggregation.stat_to_column(stat, percentile)
         if column is None:
             return None
+        plan = self._preaggr_plan(source, point_indices, wave_indices)
+        if plan is None:
+            return None
+        # ``None`` here means an off-grid (channel, wave, radius, column) cell —
+        # the caller falls back to the ring/buffer aggregation path.
+        return source.gather(plan, channel, int(round(radius_m)), column)
+
+    def _preaggr_plan(
+        self,
+        source: "preaggregation.GreeneryCache",
+        point_indices: np.ndarray,
+        wave_indices: np.ndarray | None,
+        store: dict | None = None,
+    ) -> dict | None:
+        """Where a fixed set of scoring rows lives in the greenery cache.
+
+        Independent of anything a trial chooses, so ``store`` (a fold's static
+        dict) holds it for the whole search: resolving it costs a binary search
+        over every row, and repeating that per trial dominated the search.
+        """
+        if store is not None:
+            cached = store.get("_preaggr_plan")
+            if cached is not None:
+                return cached
         # Scoring rows carry the frame-local ``_preaggr_id``; the greenery cache
-        # keys on the stable global pixel id, so translate before the gather.
+        # keys on the stable global pixel id, so translate before resolving.
         ids = np.asarray(point_indices, dtype=np.int64)
         tr = self._preaggr_pid_translate
-        if tr is not None and isinstance(source, preaggregation.GreeneryCache):
+        if tr is not None:
             safe = (ids >= 0) & (ids < tr.shape[0])
             ids = np.where(safe, tr[np.clip(ids, 0, tr.shape[0] - 1)], ids)
-        radius = int(round(radius_m))
-        if wave_indices is None:
-            return source.lookup(ids, channel, radius, column)
-
-        waves = np.asarray(wave_indices)
-        out = np.full(ids.shape[0], np.nan, dtype=np.float32)
-        # Per-wave grouped reads: each wave maps to one stored cell.
-        for w in np.unique(waves):
-            mask = waves == w
-            sub = source.lookup(ids[mask], channel, radius, column, wave_index=int(w))
-            if sub is None:
-                # An off-grid (channel, wave, radius, column) cell — caller
-                # falls back to the ring/buffer aggregation path.
-                return None
-            out[mask] = sub
-        return out
+        plan = source.build_plan(ids, wave_indices)
+        if store is not None and plan is not None:
+            store["_preaggr_plan"] = plan
+        return plan
 
     # ────────────────────────────────────────────────────────────
     # Polygon-target areal aggregation
@@ -4815,6 +4838,44 @@ class MetricFusionEngine:
         )
         return out
 
+    @staticmethod
+    def _shared_gvi_layer(veg_src: Any, terrain_src: Any) -> tuple[Any, dict] | None:
+        """One point layer carrying both GVI channels, when they share geometry.
+
+        Returns ``(layer, {channel: column})``, or ``None`` when either side is
+        a raster or their point geometry differs — then each channel is sampled
+        on its own, as before. The two channels arrive as separate frames read
+        from the same file, so the shared layer is assembled here by borrowing
+        terrain's column onto veg's frame (positionally: identical coordinates
+        in identical order is exactly what was just verified).
+        """
+        if veg_src is None or terrain_src is None:
+            return None
+        if isinstance(veg_src, dict) or isinstance(terrain_src, dict):
+            return None
+        try:
+            if len(veg_src) != len(terrain_src) or len(veg_src) == 0:
+                return None
+            if veg_src.crs != terrain_src.crs:
+                return None
+            vx = veg_src.geometry.x.to_numpy()
+            tx = terrain_src.geometry.x.to_numpy()
+            if not np.array_equal(vx, tx):
+                return None
+            if not np.array_equal(
+                veg_src.geometry.y.to_numpy(), terrain_src.geometry.y.to_numpy()
+            ):
+                return None
+            veg_col = metric_sampling.vector_metric_column(veg_src, "veg")
+            ter_col = metric_sampling.vector_metric_column(terrain_src, "terrain")
+        except Exception:
+            return None
+        if veg_col == ter_col:
+            return None
+        layer = veg_src[["geometry", veg_col]].copy()
+        layer[ter_col] = terrain_src[ter_col].to_numpy()
+        return layer, {"veg": veg_col, "terrain": ter_col}
+
     def _sample_metrics_at_points(
         self,
         points_gdf: gpd.GeoDataFrame,
@@ -4853,10 +4914,33 @@ class MetricFusionEngine:
         }
         label = {"veg": "Veg", "terrain": "Terrain", "ndvi": "NDVI"}
 
+        # ``veg`` and ``terrain`` are normally two attribute columns of the same
+        # street-view points, and the nearest-feature join — the expensive half —
+        # depends only on geometry. Joining once serves both. It runs before the
+        # loop because the loop blanks each channel as it reaches it, which would
+        # wipe a value written during another channel's turn.
+        shared_gvi = self._shared_gvi_layer(src.get("veg"), src.get("terrain"))
+        shared_values: dict[str, Any] = {}
+        if shared_gvi is not None:
+            layer, cols = shared_gvi
+            joined = metric_sampling.nearest_metric_join_multi(
+                points_gdf, layer, list(cols.values()), radius["veg"]
+            )
+            shared_values = {ch: joined[col] for ch, col in cols.items()}
+            if not quiet:
+                _log(
+                    "INFO",
+                    f"Veg + Terrain sampled from one nearest-feature join "
+                    f"({len(layer):,} features).",
+                )
+
         for channel in ("veg", "terrain", "ndvi"):
             points_gdf[channel] = np.nan
             data = src[channel]
             if data is None:
+                continue
+            if channel in shared_values:
+                points_gdf[channel] = shared_values[channel]
                 continue
             if isinstance(data, dict):  # Raster
                 points_gdf[channel] = metric_sampling.sample_raster_values(

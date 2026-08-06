@@ -1490,6 +1490,11 @@ def _write_fusion_outputs(
         "cgi_vs_standalone_aic_bic": aic_bic,
         "covariate_impact": cov_summary,
         "decline_terms": (cgi_bundle or {}).get("decline_terms"),
+        # Carried in the manifest, not only in their CSVs: the results panel
+        # reads this file when the live engine is gone, so anything absent here
+        # silently disappears from a reloaded job.
+        "exposure_response": (cgi_bundle or {}).get("exposure_response"),
+        "moderation": (cgi_bundle or {}).get("moderation") or [],
         "collinearity": collinearity_report,
     }
     _emit_json(f"results_summary{sfx}.json", manifest)

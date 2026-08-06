@@ -49,6 +49,7 @@ def _params(**over) -> dict:
         "ndvi_buffer_step_m": 50.0,
         "covariate_columns": ["age", "sex"],
         "covariate_types": {"age": "numeric", "sex": "categorical"},
+        "moderator_columns": ["income"],
         "longitudinal_spec_payload": {
             "scoring_metric": "mixedlm_tstat",
             "intake_mode": "wide",
@@ -178,6 +179,68 @@ class TestSeeder(unittest.TestCase):
             self.state["fusion_target_upload_sig"], (first, 4)
         )
         self.assertEqual(self.state["fusion_outcome_columns"], ["SCORE"])
+
+
+class TestEveryRecordedSettingIsRestored(unittest.TestCase):
+    """A setting that is recorded but never seeded back is silently dropped.
+
+    That is not a visible failure — the re-run form simply comes up without it
+    and the job runs with a default. Effect modifiers hit exactly this: they
+    reached ``_FUSION_RUN_CONFIG_KEYS`` and the submit payload, but nothing
+    wrote them back into their widget.
+    """
+
+    def setUp(self):
+        self.state = _StubState()
+        from tabs import fusion
+
+        # Restored in tearDown: replacing the module-level session_state
+        # without putting it back leaks into the AppTest-based cases, which
+        # need the real Streamlit one.
+        self._saved = (st.session_state, fusion.st.session_state)
+        st.session_state = self.state
+        fusion.st.session_state = self.state
+        self.fusion = fusion
+
+    def tearDown(self):
+        st.session_state, self.fusion.st.session_state = self._saved
+
+    def test_moderator_columns_survive_a_re_run(self):
+        self.fusion._seed_fusion_form(_params())
+        self.assertEqual(self.state["fusion_moderator_columns"], ["income"])
+
+    def test_moderators_are_independent_of_the_covariate_lists(self):
+        """A moderator need not be a covariate, so it cannot be derived."""
+        self.fusion._seed_fusion_form(_params())
+        self.assertNotIn("income", self.state["fusion_covariate_columns"])
+        self.assertNotIn("income", self.state["fusion_covariate_categorical"])
+        self.assertIn("income", self.state["fusion_moderator_columns"])
+
+    def test_absent_moderators_seed_an_empty_list_not_a_stale_one(self):
+        self.state["fusion_moderator_columns"] = ["left", "over"]
+        self.fusion._seed_fusion_form(_params(moderator_columns=[]))
+        self.assertEqual(self.state["fusion_moderator_columns"], [])
+
+    def test_recorded_config_keys_reach_a_widget_or_a_named_handler(self):
+        """Every key in the recorded config must have a restore route.
+
+        Keys handled by bespoke code in ``_seed_fusion_form`` are listed here
+        explicitly; anything else has to be in the widget map, or it round-trips
+        into the job record and out of the form.
+        """
+        handled = {
+            "covariate_columns", "covariate_types", "moderator_columns",
+            "standalone_channels", "longitudinal_spec_payload",
+            "target_display_name", "ndvi_start_date", "ndvi_end_date",
+            "ndvi_project_id", "cache_metrics", "buffer_meters",
+            "ndvi_resolution_m", "gvi_grid_spacing_m", "n_spatial_blocks",
+            "min_cell_count", "worst_quantile",
+        }
+        missing = [
+            k for k in self.fusion._FUSION_RUN_CONFIG_KEYS
+            if k not in self.fusion._FUSION_PARAM_TO_WIDGET and k not in handled
+        ]
+        self.assertEqual(missing, [], f"recorded but never restored: {missing}")
 
 
 class TestStaleOptionGuard(unittest.TestCase):

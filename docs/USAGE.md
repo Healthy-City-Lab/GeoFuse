@@ -57,6 +57,8 @@ Pool sizes come from the host's core count, and the share depends on what the ph
 - **Thread pools** (the stability search, the scorers) take about a *third* of the cores. Each task is already multi-threaded inside numpy, so a wider pool oversubscribes the cores rather than going faster.
 - **Process pools** (the greenery pre-aggregation build) take about *two thirds*. That work is a long chain of small numpy calls per pixel, which spend most of their time holding the interpreter lock, so threads leave the machine idle no matter how many you open — worker processes each bring their own interpreter, and every worker is pinned to a single numpy thread so the shares don't compound.
 
+**Trials run in parallel for every objective metric.** The one exception is an exact `statsmodels` MixedLM refit (`mixedlm_lr`, `mixedlm_marginal_r2`), which is dominated by Python-level optimiser work holding the interpreter lock — threading it measured 0.62x of serial, so it is deliberately left sequential.
+
 The process pool is bounded by **memory** as well as by cores, because every worker is a fresh interpreter. Each run logs which limit set the width:
 
 ```text

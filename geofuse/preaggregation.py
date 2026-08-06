@@ -1200,6 +1200,91 @@ class GreeneryCache:
         os.replace(tmp + ".npz", path)
 
     # ------------------------------------------------------------------ lookup
+    #
+    # A lookup is two steps: find each requested id's row in its wave's unit,
+    # then read one (radius, stat) cell out of that row. Only the second step
+    # depends on what a trial chose — the first is a binary search over a
+    # million-odd ids and costs far more. :meth:`build_plan` does the first once
+    # for a fixed set of ids and :meth:`gather` repeats only the second, which
+    # is what stops a search from spending most of its time re-deriving row
+    # numbers it already knows. :meth:`lookup` is the one-shot form.
+
+    def build_plan(
+        self,
+        entity_ids: np.ndarray,
+        wave_indices: np.ndarray | None = None,
+        *,
+        wave_index: int = DEFAULT_WAVE_INDEX,
+    ) -> dict | None:
+        """Resolve where each id lives — the trial-invariant half of a lookup.
+
+        ``wave_indices`` gives each id its own wave; without it every id is read
+        from ``wave_index``'s unit. Returns ``{"n": rows, "groups": [(cfg_key,
+        source_rows, slots), ...]}``, one group per wave that resolves to a
+        unit, or ``None`` when a requested wave has no unit bound. Ids that are
+        not stored are simply absent from the groups, so :meth:`gather` leaves
+        them NaN.
+        """
+        requested = np.asarray(entity_ids).astype(np.int64, copy=False)
+        n = int(requested.shape[0])
+        if wave_indices is None:
+            waves: list[tuple[int, np.ndarray | None]] = [(int(wave_index), None)]
+        else:
+            wv = np.asarray(wave_indices)
+            waves = [(int(w), np.flatnonzero(wv == w)) for w in np.unique(wv)]
+
+        groups: list[tuple[str, np.ndarray, np.ndarray]] = []
+        for wave, slots in waves:
+            cfg = self._wave_unit.get(int(wave))
+            unit = self._units.get(cfg) if cfg is not None else None
+            if unit is None:
+                return None
+            ids = unit["ids"]
+            req = requested if slots is None else requested[slots]
+            if not ids.size or not req.size:
+                continue
+            pos = np.searchsorted(ids, req)
+            np.clip(pos, 0, ids.size - 1, out=pos)
+            hit = ids[pos] == req
+            if not hit.any():
+                continue
+            groups.append(
+                (
+                    cfg,
+                    np.ascontiguousarray(pos[hit]),
+                    np.ascontiguousarray(
+                        np.flatnonzero(hit) if slots is None else slots[hit]
+                    ),
+                )
+            )
+        return {"n": n, "groups": groups}
+
+    def gather(
+        self, plan: dict, channel: str, radius: int, column: str
+    ) -> np.ndarray | None:
+        """Read one ``(channel, radius, column)`` cell for a prepared plan.
+
+        ``None`` when the cell is not on the stored grid, so the caller falls
+        back exactly as it would from :meth:`lookup`.
+        """
+        if channel not in self._CHANNELS:
+            return None
+        col_idx = self._stat_index.get(column)
+        if col_idx is None:
+            return None
+        out = np.full(int(plan["n"]), np.nan, dtype=np.float32)
+        for cfg, rows, slots in plan["groups"]:
+            unit = self._units.get(cfg)
+            if unit is None:
+                return None
+            ladder = unit["ndvi_radii"] if channel == "ndvi" else unit["gvi_radii"]
+            try:
+                r_idx = ladder.index(int(radius))
+            except ValueError:
+                return None
+            out[slots] = unit[channel][rows, r_idx, col_idx]
+        return out
+
     def lookup(
         self,
         entity_ids: np.ndarray,
@@ -1210,28 +1295,15 @@ class GreeneryCache:
         wave_index: int = DEFAULT_WAVE_INDEX,
     ) -> np.ndarray | None:
         """float32 values for ``entity_ids`` at one cell, or ``None`` if the
-        cell is not stored (caller falls back). Missing ids come back NaN."""
-        cfg = self._wave_unit.get(int(wave_index))
-        unit = self._units.get(cfg) if cfg is not None else None
-        if unit is None or channel not in self._CHANNELS:
+        cell is not stored (caller falls back). Missing ids come back NaN.
+
+        The one-shot form: callers that read the same ids at many cells should
+        hold a :meth:`build_plan` result and :meth:`gather` from it instead.
+        """
+        plan = self.build_plan(entity_ids, wave_index=wave_index)
+        if plan is None:
             return None
-        col_idx = self._stat_index.get(column)
-        if col_idx is None:
-            return None
-        ladder = unit["ndvi_radii"] if channel == "ndvi" else unit["gvi_radii"]
-        try:
-            r_idx = ladder.index(int(radius))
-        except ValueError:
-            return None
-        ids = unit["ids"]
-        req = np.asarray(entity_ids).astype(np.int64, copy=False)
-        out = np.full(req.shape[0], np.nan, dtype=np.float32)
-        if not ids.size:
-            return out
-        pos = np.clip(np.searchsorted(ids, req), 0, ids.size - 1)
-        valid = ids[pos] == req
-        out[valid] = unit[channel][pos[valid], r_idx, col_idx]
-        return out
+        return self.gather(plan, channel, radius, column)
 
     def resident_ids(self, wave_index: int) -> np.ndarray | None:
         cfg = self._wave_unit.get(int(wave_index))

@@ -233,6 +233,11 @@ def _render_details(rec) -> None:
         st.write(
             f"**Covariates:** {', '.join(_cov_disp(c) for c in covs) if covs else '—'}"
         )
+        mods = p.get("moderator_columns") or []
+        st.write(
+            f"**Effect modifiers:** "
+            f"{', '.join(f'`{m}`' for m in mods) if mods else '—'}"
+        )
         standalones = p.get("standalone_channels") or []
         _ch_disp = {"veg": "Vegetation", "terrain": "Terrain", "ndvi": "NDVI"}
         st.write(

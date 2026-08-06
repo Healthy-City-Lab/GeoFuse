@@ -346,6 +346,118 @@ class TestSpawnSurvivesAStaleMainModule(unittest.TestCase):
                 main.__file__ = previous
 
 
+def make_cache(tmpdir, *, n_pixels=500, n_waves=3, radii=(100, 200, 300)):
+    """A cache with distinct per-wave units, as a longitudinal run produces."""
+    rng = np.random.default_rng(3)
+    cache = preaggregation.GreeneryCache(tmpdir, spacing_m=40.0, crs_key="EPSG:32617")
+    ids = np.sort(rng.choice(20_000, n_pixels, replace=False)).astype(np.int64)
+    n_stats = len(preaggregation.STAT_COLUMNS)
+    for wave in range(n_waves):
+        cfg = f"unit-{wave}"
+        cache._units[cfg] = {
+            "ids": ids,
+            "veg": rng.random((n_pixels, len(radii), n_stats)).astype(np.float32),
+            "terrain": rng.random((n_pixels, len(radii), n_stats)).astype(np.float32),
+            "ndvi": rng.random((n_pixels, len(radii), n_stats)).astype(np.float32),
+            "gvi_radii": tuple(radii),
+            "ndvi_radii": tuple(radii),
+            "dirty": False,
+        }
+        cache.bind_wave(wave, cfg)
+    return cache, ids
+
+
+class TestLookupPlan(unittest.TestCase):
+    """Resolving rows once per fold must not change a single stored value.
+
+    A trial only varies (channel, radius, stat); which cache row each scoring
+    row maps to does not. Splitting the two lets the search skip a binary
+    search over every row on every trial, so the split has to be exact.
+    """
+
+    def _one_shot(self, cache, ids, channel, radius, column, waves):
+        """The previous behaviour: one searchsorted per wave, per call."""
+        out = np.full(ids.shape[0], np.nan, dtype=np.float32)
+        for wave in np.unique(waves):
+            mask = waves == wave
+            sub = cache.lookup(
+                ids[mask], channel, radius, column, wave_index=int(wave)
+            )
+            if sub is None:
+                return None
+            out[mask] = sub
+        return out
+
+    def test_gather_matches_the_one_shot_lookup(self):
+        with scenario_dir() as tmpdir:
+            cache, ids = make_cache(tmpdir)
+            rng = np.random.default_rng(5)
+            # A mix of stored ids and ids the cache has never seen.
+            req = np.concatenate(
+                [rng.choice(ids, 400), rng.integers(500_000, 600_000, 120)]
+            )
+            waves = rng.integers(0, 3, req.size).astype(np.int64)
+            plan = cache.build_plan(req, waves)
+            self.assertIsNotNone(plan)
+            for channel in ("veg", "terrain", "ndvi"):
+                for radius in (100, 200, 300):
+                    for column in preaggregation.STAT_COLUMNS:
+                        expected = self._one_shot(
+                            cache, req, channel, radius, column, waves
+                        )
+                        np.testing.assert_array_equal(
+                            expected,
+                            cache.gather(plan, channel, radius, column),
+                            err_msg=f"{channel} r={radius} {column}",
+                        )
+
+    def test_unstored_ids_stay_nan(self):
+        with scenario_dir() as tmpdir:
+            cache, _ = make_cache(tmpdir)
+            req = np.array([500_001, 500_002, 500_003], dtype=np.int64)
+            plan = cache.build_plan(req, np.zeros(3, dtype=np.int64))
+            got = cache.gather(plan, "veg", 100, "mean")
+            self.assertTrue(np.isnan(got).all())
+
+    def test_off_grid_cell_signals_fallback(self):
+        with scenario_dir() as tmpdir:
+            cache, ids = make_cache(tmpdir)
+            plan = cache.build_plan(ids[:50], np.zeros(50, dtype=np.int64))
+            self.assertIsNone(cache.gather(plan, "veg", 12_345, "mean"))
+            self.assertIsNone(cache.gather(plan, "veg", 100, "p99"))
+            self.assertIsNone(cache.gather(plan, "nope", 100, "mean"))
+
+    def test_an_unbound_wave_signals_fallback(self):
+        with scenario_dir() as tmpdir:
+            cache, ids = make_cache(tmpdir, n_waves=2)
+            waves = np.full(ids[:20].size, 7, dtype=np.int64)  # never bound
+            self.assertIsNone(cache.build_plan(ids[:20], waves))
+
+    def test_single_wave_form_matches_the_per_row_form(self):
+        with scenario_dir() as tmpdir:
+            cache, ids = make_cache(tmpdir)
+            req = ids[:200]
+            per_row = cache.build_plan(req, np.ones(req.size, dtype=np.int64))
+            single = cache.build_plan(req, wave_index=1)
+            np.testing.assert_array_equal(
+                cache.gather(per_row, "ndvi", 200, "p50"),
+                cache.gather(single, "ndvi", 200, "p50"),
+            )
+
+    def test_row_order_is_preserved_across_interleaved_waves(self):
+        with scenario_dir() as tmpdir:
+            cache, ids = make_cache(tmpdir)
+            req = np.repeat(ids[:60], 3)
+            waves = np.tile(np.array([0, 1, 2], dtype=np.int64), 60)
+            plan = cache.build_plan(req, waves)
+            got = cache.gather(plan, "veg", 300, "mean")
+            for i in range(req.size):
+                one = cache.lookup(
+                    req[i : i + 1], "veg", 300, "mean", wave_index=int(waves[i])
+                )
+                self.assertEqual(np.float32(got[i]), np.float32(one[0]))
+
+
 def report_blas_env(_ignored):
     """Worker-side probe: what the thread limits look like inside a pool."""
     return {var: os.environ.get(var) for var in parallel._PINNED_THREAD_VARS}

@@ -20,6 +20,7 @@ surrogate scorers built on it. Results match the stock ``dcor`` estimator to
 from __future__ import annotations
 
 import hashlib
+import threading
 from collections import OrderedDict
 from typing import Callable
 
@@ -139,18 +140,33 @@ class PdcorSideCache:
             self.bc = u_dot(self.B, self.C)
 
 
+# The search runs trials on a thread pool, so the recency bookkeeping below is
+# shared mutable state: an interleaved ``move_to_end`` and ``popitem`` can touch
+# a key the other thread has already evicted. Only the bookkeeping is guarded —
+# building an entry is the expensive part and happens outside the lock, so two
+# threads racing on the same cold key duplicate that work rather than serialise
+# on it.
+_CACHE_LOCK = threading.Lock()
+
+
 def _get_side(
     cache: "OrderedDict[tuple, PdcorSideCache]", y: np.ndarray, z: np.ndarray | None
 ) -> PdcorSideCache:
     key = _side_fingerprint(y, z)
-    entry = cache.get(key)
-    if entry is None:
-        entry = PdcorSideCache(y, z)
+    with _CACHE_LOCK:
+        entry = cache.get(key)
+        if entry is not None:
+            cache.move_to_end(key)
+            return entry
+    entry = PdcorSideCache(y, z)
+    with _CACHE_LOCK:
+        existing = cache.get(key)
+        if existing is not None:
+            cache.move_to_end(key)
+            return existing
         cache[key] = entry
         while len(cache) > _MAX_SIDE_ENTRIES:
             cache.popitem(last=False)
-    else:
-        cache.move_to_end(key)
     return entry
 
 

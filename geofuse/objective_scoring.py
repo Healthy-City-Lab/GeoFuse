@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import threading
 import warnings
 
 import numpy as np
@@ -188,6 +189,11 @@ def _residualize(y: np.ndarray, X: np.ndarray | None) -> np.ndarray:
 _SPLINE_MIN_UNIQUE: int = 7
 _SPLINE_DF: int = 4
 
+# Bases held per scored subset, and the lock that keeps the trim safe while
+# trials run in parallel.
+_SPLINE_CACHE_MAX: int = 8
+_SPLINE_CACHE_LOCK = threading.Lock()
+
 
 def _expand_covariate_basis(
     X: np.ndarray | None, method: str, cache: dict | None = None
@@ -242,9 +248,14 @@ def _expand_covariate_basis(
             cols.append(col.reshape(-1, 1))
     expanded = np.column_stack(cols)
     if cache is not None and cache_key is not None:
-        cache[cache_key] = expanded
-        while len(cache) > 8:
-            cache.pop(next(iter(cache)))
+        # Trials run on a thread pool, and trimming by "drop whatever iteration
+        # yields first" is not safe against a concurrent insert — the iterator
+        # can outlive the key it selected. Guard the trim; the patsy expansion
+        # above is the expensive part and stays outside the lock.
+        with _SPLINE_CACHE_LOCK:
+            cache[cache_key] = expanded
+            while len(cache) > _SPLINE_CACHE_MAX:
+                cache.pop(next(iter(cache)))
     return expanded
 
 

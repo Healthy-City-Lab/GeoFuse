@@ -579,6 +579,11 @@ def _seed_fusion_form(p: dict) -> None:
     # holds only what isn't tagged.
     st.session_state["fusion_covariate_columns"] = [c for c in cols if c not in cat]
     st.session_state["fusion_covariate_categorical"] = cat
+    # Effect modifiers are their own list — a moderator need not be a covariate,
+    # so it cannot be recovered from the two lists above.
+    st.session_state["fusion_moderator_columns"] = list(
+        p.get("moderator_columns") or []
+    )
 
     lon = p.get("longitudinal_spec_payload") or {}
     is_longitudinal = bool(lon) and str(
