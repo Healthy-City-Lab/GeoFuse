@@ -9,25 +9,96 @@ from __future__ import annotations
 
 import random
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import TypeVar
 
 T = TypeVar("T")
 
 
-def progress_interval_s(total: int) -> float:
-    """Heartbeat cadence (seconds) scaled to job size.
+# ────────────────────────────────────────────────────────────────────
+# Per-engine progress cadence
+# ────────────────────────────────────────────────────────────────────
+#
+# Each engine emits progress at its own rhythm so the JobStore lock and the
+# parent event queue aren't slammed on million-item runs, while the UI still
+# feels live. The backend cadence (:class:`ProgressThrottle`) and the UI
+# fragment refresh (:func:`job_ui_refresh_s`) read the same constants so the
+# two never drift apart.
 
-    Long-running engines and runners use this to throttle progress callbacks
-    so the ``JobStore`` lock stays cheap on big jobs (and the UI doesn't get
-    flooded with status updates). Shape: 2 s up to ~200 items, then +1 s per
-    100 items, capped at 10 s. ``total`` is the aggregate work count —
-    panoramas for GVI, tiles for NDVI, anything iterable.
+# GVI: emit only once BOTH thresholds are met — the slower of "500 images" and
+# "15 seconds" governs. Bursts of cheap misses can't flood the store, and a
+# genuinely slow stretch still updates every 500 images.
+GVI_PROGRESS_MIN_ITEMS = 500
+GVI_PROGRESS_MIN_SECONDS = 15.0
 
-    Callers should always emit the final tick regardless of the interval so
-    the bar reaches 100 %.
+# NDVI: emit every 2 downloaded tiles. Purely count-based — tiles are coarse
+# and comparatively slow, so there's no need for a time floor.
+NDVI_PROGRESS_MIN_TILES = 2
+
+# UI fragment refresh (seconds) per job type. The monitor renders every job in
+# one fragment, so the active jobs' fastest requirement sets the shared rate
+# (see :func:`job_ui_refresh_s`). GVI matches its 15 s backend floor; NDVI and
+# fusion keep the responsive default.
+_DEFAULT_UI_REFRESH_S = 2.0
+_UI_REFRESH_S: dict[str, float] = {
+    "gvi": GVI_PROGRESS_MIN_SECONDS,
+    "gvi_column": GVI_PROGRESS_MIN_SECONDS,
+    "ndvi": _DEFAULT_UI_REFRESH_S,
+    "ndvi_column": _DEFAULT_UI_REFRESH_S,
+    "fusion": _DEFAULT_UI_REFRESH_S,
+}
+
+
+def job_ui_refresh_s(active_types: Iterable[str]) -> float:
+    """Fragment refresh interval (s) for a set of in-flight job types.
+
+    The job monitor renders all jobs in a single fragment, so it must refresh
+    fast enough for the most demanding active engine: the result is the
+    minimum per-type interval across ``active_types``. With no active jobs (or
+    only unknown types) it falls back to the default so a freshly-submitted job
+    still appears promptly.
     """
-    return float(min(10, max(2, total // 100)))
+    intervals = [_UI_REFRESH_S.get(t, _DEFAULT_UI_REFRESH_S) for t in active_types]
+    return min(intervals) if intervals else _DEFAULT_UI_REFRESH_S
+
+
+class ProgressThrottle:
+    """Rate-limit progress emission by item count and/or elapsed time.
+
+    ``should_emit(count)`` returns ``True`` only when **both** thresholds are
+    satisfied since the last emit — i.e. the slower of the two governs. Set
+    ``min_seconds=0`` for a purely count-based cadence, or ``min_items=1`` for
+    a purely time-based one. A ``final=True`` call always emits (and resets),
+    so callers can force the terminal 100 % tick.
+
+    One instance is stateful and not thread-safe; create it per run and call it
+    from a single progress thread.
+    """
+
+    def __init__(self, min_items: int = 1, min_seconds: float = 0.0) -> None:
+        self._min_items = max(1, int(min_items))
+        self._min_seconds = float(min_seconds)
+        self._last_count = 0
+        self._last_t = time.monotonic()
+
+    def should_emit(self, count: int, *, final: bool = False) -> bool:
+        now = time.monotonic()
+        if final:
+            self._last_count = count
+            self._last_t = now
+            return True
+        items_ok = (count - self._last_count) >= self._min_items
+        time_ok = (now - self._last_t) >= self._min_seconds
+        if items_ok and time_ok:
+            self._last_count = count
+            self._last_t = now
+            return True
+        return False
+
+
+# Backoff growth per attempt, and the ± fraction applied to each delay.
+_RETRY_FACTOR = 1.5
+_RETRY_JITTER = 0.25
 
 
 def retry_with_backoff(
@@ -35,8 +106,6 @@ def retry_with_backoff(
     *,
     attempts: int = 3,
     base_delay: float = 2.0,
-    factor: float = 1.5,
-    jitter: float = 0.25,
     cancel_callback: Callable[[], bool] | None = None,
     log_fn: Callable[[str, str], None] | None = None,
     label: str = "operation",
@@ -57,9 +126,10 @@ def retry_with_backoff(
     surfacing.
 
     ``non_retryable`` names exception types that are deterministic rather
-    than transient (e.g. an Earth Engine "memory limit exceeded" rejection
-    that will fail identically every attempt): they re-raise immediately so
-    the caller can take a different path instead of burning the retry budget.
+    than transient (an Earth Engine "compute too large" rejection fails
+    identically every attempt): they re-raise immediately so the caller can
+    take a different path — NDVI subdivides the tile — instead of burning
+    the retry budget on a result that cannot change.
 
     Used by NDVI per-tile downloads (flaky EE / network) and is a good fit
     for any other network-bound worker that wants the same "transient
@@ -78,7 +148,7 @@ def retry_with_backoff(
                 break
             # ±jitter so concurrent workers don't retry in lockstep and
             # restampede the upstream service.
-            jittered = delay * (1.0 + random.uniform(-jitter, jitter))
+            jittered = delay * (1.0 + random.uniform(-_RETRY_JITTER, _RETRY_JITTER))
             if log_fn is not None:
                 log_fn(
                     "WARN",
@@ -95,7 +165,7 @@ def retry_with_backoff(
                 slept += step
             if cancel_callback and cancel_callback():
                 break
-            delay *= factor
+            delay *= _RETRY_FACTOR
     if last_exc is not None:
         raise last_exc
     raise RuntimeError(f"{label} failed but no exception captured.")

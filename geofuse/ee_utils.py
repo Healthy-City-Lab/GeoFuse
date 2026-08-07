@@ -55,11 +55,7 @@ EE_REQUEST_BUDGET_BYTES = (
 )
 
 
-def shrink_gdf_for_ee(
-    gdf: gpd.GeoDataFrame,
-    *,
-    budget_bytes: int = EE_REQUEST_BUDGET_BYTES,
-) -> gpd.GeoDataFrame:
+def shrink_gdf_for_ee(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """Return a GeoDataFrame whose GeoJSON serialisation fits the EE budget.
 
     Pass-through when the input already fits.  Otherwise simplify the
@@ -77,7 +73,7 @@ def shrink_gdf_for_ee(
         return len(g.to_json().encode("utf-8"))
 
     n0 = _size_bytes(gdf)
-    if n0 <= budget_bytes:
+    if n0 <= EE_REQUEST_BUDGET_BYTES:
         return gdf
 
     # 1 deg ≈ 111 km at most latitudes, so 5e-5 deg ≈ 5.5 m.
@@ -87,7 +83,7 @@ def shrink_gdf_for_ee(
         simp = cur.copy()
         simp.geometry = cur.geometry.simplify(tol_deg, preserve_topology=True)
         n = _size_bytes(simp)
-        if n <= budget_bytes:
+        if n <= EE_REQUEST_BUDGET_BYTES:
             _log(
                 "WARN",
                 f"Input geometry was {n0 / 1e6:.1f} MB serialised, exceeding "

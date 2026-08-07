@@ -83,6 +83,25 @@ The segmentation model runs out of VRAM during batch processing.
 
 ---
 
+## `RuntimeError: main thread is not in main loop` when browsing for a file
+
+Tk requires the thread that owns its interpreter to be the process's main
+thread. Streamlit runs the script body — and every `on_click` callback — on a
+per-rerun ScriptRunner thread, so a `tkinter` dialog opened in-process fails as
+soon as any Tk state outlives the thread that created it.
+
+The dialog therefore runs in a **child process** (`ui/file_picker_child.py`),
+launched per click and gone before the next rerun. If you still see this error,
+the app is running an older copy of `ui/file_picker.py` — restart Streamlit so
+the module is re-imported.
+
+Related: if the picker reports *"The native file dialog could not open"* and
+offers a path box instead, that is not this bug. The dialog opens on the machine
+running the Streamlit **server**, so it cannot appear when the server is remote
+and the browser is elsewhere. Paste the server-side absolute path into the box.
+
+---
+
 ## GVI Job Shows as "Interrupted" After a Streamlit Restart
 
 The job was running when Streamlit (or the machine) restarted. The job state was saved but the worker process was killed.

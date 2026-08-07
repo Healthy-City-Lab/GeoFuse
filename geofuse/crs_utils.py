@@ -8,7 +8,6 @@ which matches Leaflet/Folium and ``generate_raster_grid`` in ``geofuse.core``.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 
 import geopandas as gpd
@@ -16,14 +15,10 @@ import numpy as np
 import rasterio
 from pyproj import CRS as PyProjCRS
 from pyproj import Geod, Transformer
-from rasterio.transform import array_bounds, from_bounds
+from rasterio.transform import from_bounds
 from rasterio.warp import (
     Resampling,
-    calculate_default_transform,
     reproject,
-)
-from rasterio.warp import transform as rio_warp_transform
-from rasterio.warp import (
     transform_bounds,
 )
 from rasterio.windows import from_bounds as window_from_bounds
@@ -161,6 +156,7 @@ def stream_mosaic_to_geotiff(
     progress_cb: Callable[[int, int], None] | None = None,
     build_overviews: bool = True,
     compress: bool = True,
+    dst_dtype: str | None = None,
 ) -> int:
     """Stream-mosaic same-CRS GeoTIFF tiles into one output via windowed writes.
 
@@ -180,6 +176,10 @@ def stream_mosaic_to_geotiff(
     once and deleted (e.g. the planar mosaic feeding a WGS84 reproject).
     Skipping DEFLATE saves write time and lets the downstream reader scan
     the file without per-block decompression.
+
+    ``dst_dtype`` overrides the output pixel type (default: inherit the first
+    tile's). NDVI in ``[-1, 1]`` carries no precision past ``float32``, so
+    forcing ``"float32"`` halves the on-disk size and every tile decompress.
     """
     if not tile_paths:
         raise ValueError("stream_mosaic_to_geotiff: tile_paths is empty.")
@@ -199,6 +199,7 @@ def stream_mosaic_to_geotiff(
             )
 
     ref = tile_profiles[0]
+    out_dtype = dst_dtype or ref["dtype"]
     union_left = min(p["bounds"].left for p in tile_profiles)
     union_bottom = min(p["bounds"].bottom for p in tile_profiles)
     union_right = max(p["bounds"].right for p in tile_profiles)
@@ -217,13 +218,13 @@ def stream_mosaic_to_geotiff(
         "height": out_height,
         "width": out_width,
         "count": ref["count"],
-        "dtype": ref["dtype"],
+        "dtype": out_dtype,
         "crs": ref["crs"],
         "transform": out_transform,
         "nodata": nodata,
     }
     if compress:
-        dst_profile.update(default_geotiff_creation_options(ref["dtype"], sparse=True))
+        dst_profile.update(default_geotiff_creation_options(out_dtype, sparse=True))
     else:
         dst_profile.update(
             {
@@ -254,7 +255,7 @@ def stream_mosaic_to_geotiff(
                     dst_arr = np.full(
                         (win.height, win.width),
                         fill_value=nodata,
-                        dtype=src.dtypes[band - 1],
+                        dtype=out_dtype,
                     )
                     reproject(
                         source=rasterio.band(src, band),
@@ -282,109 +283,6 @@ def stream_mosaic_to_geotiff(
             # Overview build is non-fatal — the base raster is still valid.
             pass
     return written
-
-
-def reproject_raster_to_wgs84(
-    src_path: str,
-    dst_path: str,
-    *,
-    target_resolution_m: float,
-    resampling: Resampling = Resampling.bilinear,
-    src_nodata: float | None = None,
-    dst_nodata: float | None = None,
-    num_threads: int | None = None,
-    block_size: int = 512,
-    warp_mem_limit_mb: int = 2048,
-    gdal_cachemax_mb: int = 2048,
-) -> None:
-    """Reproject a planar-CRS GeoTIFF to EPSG:4326 in a single GDAL warp call.
-
-    Drives the same warp kernel that ``gdalwarp`` / QGIS use, in-process
-    and end-to-end: one :func:`rasterio.warp.reproject` call per band with
-    ``source=rasterio.band(src, b)`` and ``destination=rasterio.band(dst, b)``.
-    GDAL streams blocks internally on ``num_threads`` worker threads,
-    ``SPARSE_OK=TRUE`` keeps fully-nodata blocks off disk, and
-    ``src_nodata`` / ``dst_nodata`` propagate through the resampler so
-    bilinear does not bleed the sentinel into edge pixels.
-
-    No overview pyramids are built. For float-nodata sparse rasters
-    GDAL's overview builder reads sparse blocks as nodata, which the
-    `average` resampler then mixes with valid pixels to produce
-    misleading level-0 values, and the pass adds tens of minutes to
-    national-scale runs. Call :func:`build_internal_overviews` on the
-    finished file if a specific consumer needs them.
-
-    Defaults to bilinear resampling — appropriate for continuous bands
-    like NDVI. Pass ``resampling=Resampling.nearest`` for QA /
-    classification bands.
-
-    Geometry note: pixels end up roughly square in **ground metres** at
-    the centroid latitude (``res_*_deg = target_resolution_m /
-    m_per_deg_*``). EPSG:4326 is a geographic CRS so the corresponding
-    **degree** resolution is rectangular — one degree of longitude is
-    ``cos(lat)`` shorter than one degree of latitude, so the lon/lat
-    degree-per-pixel ratio sits at ~1.3-1.7 at mid-latitudes. QGIS
-    displays pixel size as ``degrees × 111139`` without the cos-lat
-    correction, which reads as "wider in EW than NS" even though the
-    on-ground spacing is square at the centroid.
-    """
-    if num_threads is None:
-        num_threads = max(1, os.cpu_count() or 1)
-
-    with rasterio.Env(GDAL_CACHEMAX=int(gdal_cachemax_mb)):
-        with rasterio.open(src_path) as src:
-            left, bottom, right, top = array_bounds(
-                src.height, src.width, src.transform
-            )
-            cx, cy = (left + right) / 2, (bottom + top) / 2
-            transformed = rio_warp_transform(src.crs, WGS84_EPSG, [cx], [cy])
-            avg_lat = transformed[1][0]
-
-            m_per_deg_lon, m_per_deg_lat = metres_per_degree_at_lat(avg_lat)
-            res_x_deg = target_resolution_m / m_per_deg_lon
-            res_y_deg = target_resolution_m / m_per_deg_lat
-
-            dst_transform, width, height = calculate_default_transform(
-                src.crs,
-                WGS84_EPSG,
-                src.width,
-                src.height,
-                *src.bounds,
-                resolution=(res_x_deg, res_y_deg),
-            )
-            assert width is not None and height is not None
-            width = int(width)
-            height = int(height)
-
-            dst_kwargs = src.meta.copy()
-            dst_kwargs.update(
-                {
-                    "crs": WGS84_EPSG,
-                    "transform": dst_transform,
-                    "width": width,
-                    "height": height,
-                }
-            )
-            if dst_nodata is not None:
-                dst_kwargs["nodata"] = dst_nodata
-            dst_kwargs.update(
-                default_geotiff_creation_options(src.dtypes[0], sparse=True)
-            )
-            dst_kwargs["blockxsize"] = block_size
-            dst_kwargs["blockysize"] = block_size
-            dst_kwargs["NUM_THREADS"] = str(num_threads)
-
-            with rasterio.open(dst_path, "w", **dst_kwargs) as dst:
-                for b in range(1, src.count + 1):
-                    reproject(
-                        source=rasterio.band(src, b),
-                        destination=rasterio.band(dst, b),
-                        resampling=resampling,
-                        src_nodata=src_nodata,
-                        dst_nodata=dst_nodata,
-                        num_threads=num_threads,
-                        warp_mem_limit=warp_mem_limit_mb,
-                    )
 
 
 def _raise_if_geographic_coords_outside_degree_range(gdf: gpd.GeoDataFrame) -> None:

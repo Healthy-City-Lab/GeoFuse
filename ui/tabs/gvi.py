@@ -1,6 +1,7 @@
 import gc
 import glob
 import os
+from datetime import date
 
 import folium
 import geopandas as gpd
@@ -15,7 +16,12 @@ from helpers import (
     file_size_mtime_fingerprint,
     generate_clustered_grid,
     load_vector_paths,
+    load_vector_upload_sessions,
+    merge_gdfs_wgs84,
+    path_drift_status,
+    render_file_grouping_controls,
     render_job_restart_panel,
+    sanitize_name_for_file,
 )
 from map_preview import (
     add_black_point_layer,
@@ -83,11 +89,21 @@ def _gvi_discard_heavy_dataset_fields() -> None:
 
 
 def _gvi_scan_outputs(output_dir: str) -> dict[str, dict]:
-    """Discover GVI result files and return ``{base_name: dataset_dict}``.
+    """Discover GVI result sets, including per-year files in temporal folders.
 
-    Pure function — no Streamlit calls — so it can run safely in a background
-    thread while workers keep processing.
+    Scans ``output_dir`` itself plus every ``*_temporal_gvi/`` job folder
+    produced by the per-year (date-column) mode, so each year appears as its
+    own selectable result. Pure function — no Streamlit calls.
     """
+    found = _gvi_scan_dir(output_dir)
+    for folder in glob.glob(os.path.join(output_dir, "*_temporal_gvi")):
+        if os.path.isdir(folder):
+            found.update(_gvi_scan_dir(folder))
+    return found
+
+
+def _gvi_scan_dir(output_dir: str) -> dict[str, dict]:
+    """Discover GVI ``*_gvi.*`` result sets directly inside ``output_dir``."""
     import json as _json
 
     from rasterio.warp import transform_bounds
@@ -232,14 +248,242 @@ def _gvi_size_hint(buffer_m: int, step_m: int) -> None:
 
 
 def _gvi_restart_summary_lines(p: dict) -> list[str]:
+    max_diff = p.get("max_year_diff")
+    window = f" (±{max_diff} yr max)" if max_diff is not None else ""
+    if p.get("mode") == "column":
+        year_line = f"**Per year** from column `{p.get('date_column', '?')}`{window}"
+    else:
+        target_year = p.get("target_year")
+        if target_year is None:
+            year_line = "**Target year:** most recent capture"
+        else:
+            year_line = f"**Target year:** {target_year}" + (
+                window or " (closest available)"
+            )
     return [
         f"**Original file:** `{p.get('fname', '?')}`",
         f"**Grid step:** {p.get('step', '?')} m · **Buffer:** {p.get('buffer', '?')} m",
+        year_line,
         f"**Outputs:** GeoPackage={bool(p.get('save_gpkg', True))} · "
         f"GeoTIFF={bool(p.get('save_geotiff'))} · "
         f"GeoJSON={bool(p.get('save_geojson'))}",
         f"**Save panos / masks:** {bool(p.get('save_panos'))} / {bool(p.get('save_masks'))}",
     ]
+
+
+def _gvi_resubmit_from_params(
+    store, executor, pano_cache, output_dir, rec_id, p, raw, api_key
+):
+    """Resubmit a GVI job from stored params + a (re)merged layer.
+
+    Shared by the merged-job restart flow: ``p`` carries the original grid
+    step / buffer / date settings; ``raw`` is the freshly merged layer. Column
+    jobs go back through the per-year runner; recent/specific-year jobs get a
+    fresh sampling grid.
+    """
+    out_fname = p["fname"]
+    model_path = p.get("model_path")
+    step = int(p.get("step", 50))
+    buffer_m = int(p.get("buffer", 0))
+    max_year_diff = p.get("max_year_diff")
+    save_gp = bool(p.get("save_gpkg", True))
+    save_gt = bool(p.get("save_geotiff"))
+    save_gj = bool(p.get("save_geojson"))
+    save_panos = bool(p.get("save_panos"))
+    save_masks = bool(p.get("save_masks"))
+
+    gtype = (
+        "poly"
+        if raw.geometry.iloc[0].geom_type in ("Polygon", "MultiPolygon")
+        else "point"
+    )
+    base_dataset = {
+        "raw": raw,
+        "type": gtype,
+        "processed": None,
+        "meta": None,
+        "accumulated": [],
+        "results": None,
+        "cache_ref": pano_cache,
+    }
+
+    new_params = dict(p)
+    new_params["geometry_sha256"] = geometry_sha256(raw)
+    new_params["restart_of"] = rec_id
+    new_params["has_api_key"] = api_key is not None
+    new_params["source_fingerprints"] = [
+        file_size_mtime_fingerprint(x) for x in (p.get("source_paths") or [])
+    ]
+
+    init_args = {"model_path": model_path, "api_key": api_key}
+    if p.get("mode") == "column":
+        record = store.submit(
+            type="gvi_column", name=os.path.splitext(out_fname)[0], params=new_params
+        )
+        executor.submit_gvi_column_subprocess(
+            record,
+            fname=out_fname,
+            dataset_data=base_dataset,
+            date_column=p["date_column"],
+            init_args=init_args,
+            run_args={
+                "step": step,
+                "buffer": buffer_m,
+                "save_panos": save_panos,
+                "save_masks": save_masks,
+                "max_year_diff": max_year_diff,
+            },
+            output_dir=output_dir,
+            save_gpkg=save_gp,
+            save_geotiff=save_gt,
+            save_geojson=save_gj,
+            pano_cache_db_path=pano_cache.db_path,
+        )
+    else:
+        proc, gmeta = _gvi_prepare_processed(raw, gtype, buffer_m, step)
+        base_dataset["processed"] = proc
+        base_dataset["meta"] = gmeta
+        record = store.submit(
+            type="gvi", name=os.path.splitext(out_fname)[0], params=new_params
+        )
+        executor.submit_gvi_subprocess(
+            record,
+            fname=out_fname,
+            dataset_data=base_dataset,
+            init_args=init_args,
+            run_args={
+                "step": step,
+                "save_panos": save_panos,
+                "save_masks": save_masks,
+                "target_year": p.get("target_year"),
+                "max_year_diff": max_year_diff,
+            },
+            output_dir=output_dir,
+            save_gpkg=save_gp,
+            save_geotiff=save_gt,
+            save_geojson=save_gj,
+            pano_cache_db_path=pano_cache.db_path,
+        )
+    return record
+
+
+_GVI_RESTART_ACCEPT = [
+    "geojson",
+    "json",
+    "gpkg",
+    "shp",
+    "dbf",
+    "shx",
+    "prj",
+    "cpg",
+    "zip",
+]
+
+
+def _render_gvi_merged_restart(store, executor, pano_cache, output_dir, rec, p) -> None:
+    """Multi-file restart for a merged GVI job — quiet re-run when every source
+    file is still on disk unchanged, otherwise a group re-upload."""
+    sources = p.get("source_files") or []
+    paths = p.get("source_paths") or []
+    fps = p.get("source_fingerprints") or []
+    had_api_key = bool(p.get("has_api_key"))
+
+    with st.expander(f"↻ Restart merged job: {rec.name or rec.id}", expanded=True):
+        for line in _gvi_restart_summary_lines(p):
+            st.write(line)
+
+        statuses = [
+            (fn, pth, path_drift_status(pth, fp))
+            for fn, pth, fp in zip(sources, paths, fps)
+        ]
+        all_ok = bool(paths) and all(s == "ok" for _, _, s in statuses)
+
+        api_key = None
+        if had_api_key:
+            st.caption("Original job used the Street View API — re-supply the key.")
+            api_key = (
+                st.text_input(
+                    "Street View API Key",
+                    type="password",
+                    autocomplete="off",
+                    key=f"gmr_apikey_{rec.id}",
+                )
+                or None
+            )
+
+        _labels = {
+            "ok": "✓ on disk",
+            "missing": "✗ missing",
+            "modified": "⚠ changed",
+            "no-path": "? no recorded path",
+        }
+        for fn, _pth, s in statuses:
+            st.write(f"• `{fn}` — {_labels.get(s, s)}")
+
+        if all_ok:
+            st.success("✓ All source files verified — no re-upload needed.")
+            c1, c2 = st.columns(2)
+            if c1.button("Cancel restart", key=f"gmr_cancel_{rec.id}", width="stretch"):
+                st.session_state[RESTART_SESSION_KEY] = None
+                st.rerun()
+            if c2.button(
+                "Re-run", type="primary", key=f"gmr_run_{rec.id}", width="stretch"
+            ):
+                try:
+                    gdfs = [g for _, g in load_vector_paths(paths)]
+                    raw = merge_gdfs_wgs84(gdfs)
+                    _gvi_resubmit_from_params(
+                        store, executor, pano_cache, output_dir, rec.id, p, raw, api_key
+                    )
+                except Exception as e:
+                    st.error(f"Re-submission failed: {e}")
+                    return
+                st.session_state[RESTART_SESSION_KEY] = None
+                st.success("Restart submitted. Monitor progress in the sidebar.")
+                st.rerun()
+            return
+
+        st.warning(
+            "Some source files moved or changed. Re-upload the original files "
+            "for this group to restart."
+        )
+        uploads = st.file_uploader(
+            "Re-upload the group's files",
+            accept_multiple_files=True,
+            type=_GVI_RESTART_ACCEPT,
+            key=f"gmr_up_{rec.id}",
+        )
+        if not uploads:
+            st.info("Select the group's original files to continue.")
+            return
+        try:
+            loaded = load_vector_upload_sessions(uploads)
+            raw = merge_gdfs_wgs84([g for _, g in loaded])
+        except Exception as e:
+            st.error(f"Failed to read uploaded files: {e}")
+            return
+        if p.get("geometry_sha256") and geometry_sha256(raw) != p["geometry_sha256"]:
+            st.warning(
+                "The combined geometry differs from the original job (different "
+                "files, contents, or order). Re-running will process this new "
+                "merge."
+            )
+        if st.button(
+            "Verify & re-run",
+            type="primary",
+            key=f"gmr_up_run_{rec.id}",
+            width="stretch",
+        ):
+            try:
+                _gvi_resubmit_from_params(
+                    store, executor, pano_cache, output_dir, rec.id, p, raw, api_key
+                )
+            except Exception as e:
+                st.error(f"Re-submission failed: {e}")
+                return
+            st.session_state[RESTART_SESSION_KEY] = None
+            st.success("Restart submitted. Monitor progress in the sidebar.")
+            st.rerun()
 
 
 def _render_gvi_restart_panel(
@@ -264,10 +508,14 @@ def _render_gvi_restart_panel(
             "Fusion** tab to complete it."
         )
         return
-    if rec.type != "gvi":
+    if rec.type not in ("gvi", "gvi_column"):
         return
 
     p = rec.params or {}
+    if p.get("merged"):
+        _render_gvi_merged_restart(store, executor, pano_cache, output_dir, rec, p)
+        return
+    is_column = rec.type == "gvi_column"
     had_api_key = bool(p.get("has_api_key"))
 
     def _extra_inputs() -> dict:
@@ -307,21 +555,8 @@ def _render_gvi_restart_panel(
             "type": gtype,
         }
 
-        # Materialize the sampling grid using the *original* step/buffer
-        # rather than the form's current values, so the restart is faithful.
         step_m = int(p.get("step", 50))
         buffer_m = int(p.get("buffer", 0))
-        if _gvi_dataset_uses_raster_grid(st.session_state.datasets[fname], buffer_m):
-            pts, meta = generate_clustered_grid(
-                gdf, buffer_m=float(buffer_m), step_m=float(step_m)
-            )
-            st.session_state.datasets[fname]["processed"] = pts
-            st.session_state.datasets[fname]["meta"] = meta
-        else:
-            st.session_state.datasets[fname]["processed"] = gdf.copy()
-
-        st.session_state.datasets[fname]["cache_ref"] = pano_cache
-
         model_path = p.get("model_path") or os.path.join(
             parent_dir, "geofuse", "model", "best_model.pth"
         )
@@ -332,6 +567,48 @@ def _render_gvi_restart_panel(
         new_params["restart_of"] = rec.id
         new_params["has_api_key"] = api_key is not None
         new_params["fname"] = fname
+
+        st.session_state.datasets[fname]["cache_ref"] = pano_cache
+
+        # Per-year column mode builds its grids inside the runner, so restart
+        # only needs to re-stage the raw layer and resubmit the column job.
+        if is_column:
+            record = store.submit(
+                type="gvi_column",
+                name=os.path.splitext(fname)[0],
+                params=new_params,
+            )
+            executor.submit_gvi_column_subprocess(
+                record,
+                fname=fname,
+                dataset_data=st.session_state.datasets[fname],
+                date_column=str(p.get("date_column", "")),
+                init_args={"model_path": model_path, "api_key": api_key},
+                run_args={
+                    "step": step_m,
+                    "buffer": buffer_m,
+                    "save_panos": bool(p.get("save_panos")),
+                    "save_masks": bool(p.get("save_masks")),
+                    "max_year_diff": p.get("max_year_diff"),
+                },
+                output_dir=output_dir,
+                save_gpkg=bool(p.get("save_gpkg", True)),
+                save_geotiff=bool(p.get("save_geotiff")),
+                save_geojson=bool(p.get("save_geojson")),
+                pano_cache_db_path=pano_cache.db_path,
+            )
+            return
+
+        # Materialize the sampling grid using the *original* step/buffer
+        # rather than the form's current values, so the restart is faithful.
+        if _gvi_dataset_uses_raster_grid(st.session_state.datasets[fname], buffer_m):
+            pts, meta = generate_clustered_grid(
+                gdf, buffer_m=float(buffer_m), step_m=float(step_m)
+            )
+            st.session_state.datasets[fname]["processed"] = pts
+            st.session_state.datasets[fname]["meta"] = meta
+        else:
+            st.session_state.datasets[fname]["processed"] = gdf.copy()
 
         record = store.submit(
             type="gvi",
@@ -347,6 +624,8 @@ def _render_gvi_restart_panel(
                 "step": step_m,
                 "save_panos": bool(p.get("save_panos")),
                 "save_masks": bool(p.get("save_masks")),
+                "target_year": p.get("target_year"),
+                "max_year_diff": p.get("max_year_diff"),
             },
             output_dir=output_dir,
             save_gpkg=bool(p.get("save_gpkg", True)),
@@ -374,39 +653,330 @@ def _render_gvi_restart_panel(
     )
 
 
-def _gvi_materialize_grids_if_missing(gvi_buffer: int, gvi_res: int) -> None:
-    """Set ``processed`` / ``meta`` for datasets that still need a grid."""
-    gc.collect()
-    for d in st.session_state.datasets.values():
-        if d.get("type") == "restored":
-            continue
-        if d.get("processed") is not None:
-            continue
-        if _gvi_dataset_uses_raster_grid(d, gvi_buffer):
-            pts, meta = generate_clustered_grid(
-                d["raw"], buffer_m=float(gvi_buffer), step_m=float(gvi_res)
+# ────────────────────────────────────────────────────────────────────
+# Capture-date configuration (per-file), mirroring the NDVI tab's layout
+# ────────────────────────────────────────────────────────────────────
+
+_GVI_MODE_RECENT = "Most recent capture"
+_GVI_MODE_YEAR = "A specific year"
+_GVI_MODE_COLUMN = "Per year from a column"
+_GVI_MODES = [_GVI_MODE_RECENT, _GVI_MODE_YEAR, _GVI_MODE_COLUMN]
+
+
+def _gvi_input_datasets() -> dict:
+    return {
+        k: v
+        for k, v in st.session_state.datasets.items()
+        if v.get("type") != "restored"
+    }
+
+
+def _gvi_units() -> list[dict]:
+    """Job units to configure and run.
+
+    Separate mode → one unit per uploaded file. Merge mode → one unit per
+    group name, with that group's files concatenated (EPSG:4326) into a single
+    merged layer. Each unit: ``{key, raw, type, merged, sources, dataset}``
+    (``dataset`` is the live per-file registry entry for separate units, or
+    ``None`` for merged ones).
+    """
+    input_ds = _gvi_input_datasets()
+    if st.session_state.get("gvi_run_mode") != "merge" or len(input_ds) < 2:
+        return [
+            {
+                "key": fn,
+                "raw": d["raw"],
+                "type": d.get("type", "point"),
+                "merged": False,
+                "sources": [fn],
+                "dataset": d,
+            }
+            for fn, d in input_ds.items()
+        ]
+
+    groups: dict[str, list[str]] = {}
+    for fn in input_ds:
+        g = st.session_state.gvi_file_groups.get(fn) or "Group 1"
+        groups.setdefault(g, []).append(fn)
+
+    cache = st.session_state.setdefault("_gvi_merge_cache", {})
+    units: list[dict] = []
+    for g, fns in groups.items():
+        ck = tuple(sorted(fns))
+        merged = cache.get(ck)
+        if merged is None:
+            merged = merge_gdfs_wgs84([input_ds[f]["raw"] for f in fns])
+            cache[ck] = merged
+        gtype = (
+            "poly" if any(input_ds[f].get("type") == "poly" for f in fns) else "point"
+        )
+        units.append(
+            {
+                "key": g,
+                "raw": merged,
+                "type": gtype,
+                "merged": True,
+                "sources": fns,
+                "dataset": None,
+            }
+        )
+    return units
+
+
+def _gvi_prepare_processed(raw, gtype: str, buffer_m: int, res: int):
+    """Return ``(processed_points, meta)`` for a raw layer in recent/year mode.
+
+    Polygons (or points with a buffer) get a clustered sampling grid; bare
+    points are used as-is. Mirrors the per-file grid materialization for merged
+    units, whose grids aren't pre-generated by the Generate-grids button.
+    """
+    uses_grid = gtype == "poly" or (gtype == "point" and buffer_m > 0)
+    if uses_grid:
+        return generate_clustered_grid(raw, buffer_m=float(buffer_m), step_m=float(res))
+    return raw.copy(), None
+
+
+def _gvi_discover_years(gdf, col: str) -> list[str]:
+    """Unique years in ``col`` as sorted string labels (fusion-style preview)."""
+    try:
+        from geofuse.longitudinal import parse_date_column
+
+        years = parse_date_column(gdf[col]).dt.year.dropna().astype(int).unique()
+        return [str(y) for y in sorted(years)]
+    except Exception:
+        return []
+
+
+@st.fragment
+def _render_gvi_date_config() -> None:
+    """Per-file capture-date configuration in its own section, one expander per
+    layer — mirrors the NDVI tab's Date Configuration. In a fragment so a mode
+    switch or column pick reruns only this section, not the settings + map."""
+    units = _gvi_units()
+    if not units:
+        return
+
+    st.markdown("**Capture Date Configuration**")
+    this_year = date.today().year
+    for unit in units:
+        key = unit["key"]
+        raw = unit["raw"]
+        title = (
+            f"{key}  ·  {len(unit['sources'])} files merged" if unit["merged"] else key
+        )
+        cfg = st.session_state.gvi_date_configs.setdefault(
+            key,
+            {
+                "mode": _GVI_MODE_RECENT,
+                "target_year": this_year,
+                "date_column": None,
+                "use_max_diff": False,
+                "max_diff": 2,
+            },
+        )
+        with st.expander(title, expanded=True):
+            cfg["mode"] = st.radio(
+                "Which capture to segment",
+                _GVI_MODES,
+                index=_GVI_MODES.index(cfg.get("mode", _GVI_MODE_RECENT)),
+                key=f"gvi_mode_{key}",
+                horizontal=True,
+                help=(
+                    "Most recent → newest Street View coverage. A specific year → "
+                    "the historical capture closest to a year. Per year from a "
+                    "column → split the layer by a year column and run each year "
+                    "separately into a per-job folder."
+                ),
             )
-            d["processed"] = pts
-            d["meta"] = meta
-        else:
-            d["processed"] = d["raw"].copy()
-            d["meta"] = None
-        d["accumulated"] = []
-        d["results"] = None
+            mode = cfg["mode"]
+
+            if mode == _GVI_MODE_YEAR:
+                cfg["target_year"] = int(
+                    st.number_input(
+                        "Target year",
+                        min_value=2007,
+                        max_value=this_year,
+                        value=int(cfg.get("target_year", this_year)),
+                        step=1,
+                        key=f"gvi_year_{key}",
+                    )
+                )
+            elif mode == _GVI_MODE_COLUMN:
+                attr_cols = [c for c in raw.columns if c.lower() != "geometry"]
+                if attr_cols:
+                    stored = cfg.get("date_column")
+                    cfg["date_column"] = st.selectbox(
+                        "Year / date column",
+                        attr_cols,
+                        index=attr_cols.index(stored) if stored in attr_cols else 0,
+                        key=f"gvi_col_{key}",
+                        help="Accepts ISO dates, year+month, year-only, or numeric years.",
+                    )
+                    years = _gvi_discover_years(raw, cfg["date_column"])
+                    if years:
+                        st.caption("Years found: " + ", ".join(f"`{y}`" for y in years))
+                    else:
+                        st.warning("No parseable years in the selected column.")
+                else:
+                    cfg["date_column"] = None
+                    st.warning("No attribute columns found in this layer.")
+
+            if mode in (_GVI_MODE_YEAR, _GVI_MODE_COLUMN):
+                cfg["use_max_diff"] = st.checkbox(
+                    "Limit maximum year difference",
+                    value=bool(cfg.get("use_max_diff", False)),
+                    key=f"gvi_usemd_{key}",
+                    help=(
+                        "Only accept a capture within this many years of the "
+                        "target; points with none in the window are left empty."
+                    ),
+                )
+                if cfg["use_max_diff"]:
+                    cfg["max_diff"] = int(
+                        st.number_input(
+                            "Max acceptable difference (years)",
+                            min_value=0,
+                            max_value=20,
+                            value=int(cfg.get("max_diff", 2)),
+                            step=1,
+                            key=f"gvi_md_{key}",
+                        )
+                    )
 
 
-# ---------------------------------------------------------------------------
+@st.fragment
+def _render_gvi_settings_map() -> None:
+    """Download settings + study-area map. In a fragment so slider/toggle edits
+    rerun only this section and the values stay live in session_state (no
+    separate Apply step before Run) — mirrors the NDVI tab."""
+    gvi_buf_preview = int(st.session_state.get("gvi_buffer", 0))
+    fc_gvi_l, fc_gvi_r = st.columns(2)
+    with fc_gvi_l:
+        with st.container(border=True):
+            st.radio(
+                "Download Mode",
+                ["Package (Scraper)", "API (Street View)"],
+                horizontal=True,
+                key="gvi_download_mode",
+                help="Google Street View scraper (no key) or the official API.",
+            )
+            if st.session_state.get("gvi_download_mode") == "API (Street View)":
+                st.text_input(
+                    "Street View API Key",
+                    type="password",
+                    autocomplete="off",
+                    help="Optional Google Street View key; falls back to built-in access if empty.",
+                    key="gvi_google_api_key",
+                )
+            st.slider(
+                "Grid Resolution (m)",
+                min_value=20,
+                max_value=500,
+                value=50,
+                step=5,
+                key="gvi_res",
+                help="Spacing for sampling points in the generated grid (metres).",
+            )
+            st.slider(
+                "Download Buffer (m)",
+                min_value=0,
+                max_value=2000,
+                value=0,
+                step=50,
+                key="gvi_buffer",
+                help=(
+                    "Expand the study area outward by this distance (metres) before "
+                    "building the sampling grid."
+                ),
+            )
+            st.checkbox(
+                "Save Raw Images & Masks",
+                value=False,
+                key="gvi_save_debug",
+                help="Keep downloaded panoramas and segmentation masks under the output folder.",
+            )
+            st.checkbox(
+                "Show Sampling Grid on Map",
+                value=False,
+                key="gvi_preview_sampling_grid",
+                help=(
+                    "Draw generated sampling grid points on the preview map. Turn "
+                    "off for large grids to keep the browser responsive."
+                ),
+            )
+    with fc_gvi_r:
+        st.subheader("Study Area Preview")
+        show_sampling_grid = st.session_state.get("gvi_preview_sampling_grid", False)
+        m_input = folium.Map(location=[51.0447, -114.0719], zoom_start=11)
+        all_bounds = []
+        for fname, d in st.session_state.datasets.items():
+            if d.get("type") == "restored":
+                continue
+            if d.get("raw") is not None:
+                add_study_area_layers(
+                    m_input,
+                    d["raw"],
+                    study_name=f"{fname} (study area)",
+                    buffer_m=gvi_buf_preview,
+                    buffer_name=f"{fname} (buffer)",
+                )
+                all_bounds.append(d["raw"].total_bounds)
+                if gvi_buf_preview > 0:
+                    all_bounds.append(
+                        apply_buffer_m(d["raw"], gvi_buf_preview).total_bounds
+                    )
+            if (
+                show_sampling_grid
+                and d.get("processed") is not None
+                and not d["processed"].empty
+                and d.get("meta") is not None
+            ):
+                add_uniform_point_layer(
+                    m_input,
+                    d["processed"],
+                    tooltip_fields=[],
+                    tooltip_aliases=[],
+                    geojson_marker=folium.Circle(
+                        radius=3,
+                        color="#4a148c",
+                        weight=1,
+                        fill=True,
+                        fill_opacity=0.85,
+                    ),
+                    cluster_threshold=0,
+                    cluster_circle_radius=5,
+                    cluster_color="#4a148c",
+                    cluster_fill_color="#9c27b0",
+                    cluster_fill_opacity=0.82,
+                    layer_name=f"{fname} sampling grid",
+                )
+        if all_bounds:
+            min_x = min([b[0] for b in all_bounds])
+            min_y = min([b[1] for b in all_bounds])
+            max_x = max([b[2] for b in all_bounds])
+            max_y = max([b[3] for b in all_bounds])
+            m_input.fit_bounds([[min_y, min_x], [max_y, max_x]])
+        st_folium(
+            m_input, width="100%", height=500, key="map_input", returned_objects=[]
+        )
+    _gvi_size_hint(
+        int(st.session_state.get("gvi_buffer", 0)),
+        int(st.session_state.get("gvi_res", 50)),
+    )
+
+
+# ────────────────────────────────────────────────────────────────────
 # Live dataset registry (per-session, in addition to the process-level store)
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 #
 # Job records persisted in SQLite carry only JSON-serializable parameters.
 # The live GeoDataFrames they operate on stay in ``st.session_state.datasets``
 # (per-session) and are looked up by ``fname`` from ``record.params``.
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Tab render entry point
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 
 def render(output_dir: str, parent_dir: str) -> None:
@@ -417,6 +987,10 @@ def render(output_dir: str, parent_dir: str) -> None:
         st.session_state.datasets = {}
     if "gvi_inspector_select" not in st.session_state:
         st.session_state.gvi_inspector_select = None
+    if "gvi_date_configs" not in st.session_state:
+        st.session_state.gvi_date_configs = {}
+    if "gvi_file_groups" not in st.session_state:
+        st.session_state.gvi_file_groups = {}
 
     # JobStore + executor + PanoCache are process-level singletons (see ui/services.py).
     from job_panel import render_sidebar_job_monitor
@@ -453,6 +1027,7 @@ def render(output_dir: str, parent_dir: str) -> None:
         sig_prev = st.session_state.get("_gvi_prev_upload_sig")
         if sig_prev is not None and sig_new is not None and sig_prev != sig_new:
             _gvi_discard_heavy_dataset_fields()
+            st.session_state.pop("_gvi_merge_cache", None)
         st.session_state._gvi_prev_upload_sig = sig_new
 
         current_names = [os.path.basename(p) for p in valid_paths]
@@ -496,249 +1071,133 @@ def render(output_dir: str, parent_dir: str) -> None:
                 del st.session_state.datasets[k]
         gc.collect()
 
-    # border=False so the job-setup section reads as flat sections (matching the
-    # NDVI tab); the form still batches the settings and submits on Run.
-    with st.form("gvi_job_form", border=False):
-        gvi_buf_preview = int(st.session_state.get("gvi_buffer", 0))
-        fc_gvi_l, fc_gvi_r = st.columns(2)
-        with fc_gvi_l:
-            with st.container(border=True):
-                st.radio(
-                    "Download Mode",
-                    ["Package (Scraper)", "API (Street View)"],
-                    horizontal=True,
-                    key="gvi_download_mode",
-                    help=(
-                        "Grid spacing, download buffer, and debug export apply when you "
-                        "press Generate Sampling Grids or Run below. The study-area "
-                        "preview map does not update from these controls until you run "
-                        "one of those actions."
-                    ),
-                )
-                mode_sel = st.session_state.get(
-                    "gvi_download_mode", "Package (Scraper)"
-                )
-                if mode_sel == "API (Street View)":
-                    st.text_input(
-                        "Street View API Key",
-                        type="password",
-                        autocomplete="off",
-                        help="Optional Google Street View key; falls back to built-in access if empty.",
-                        key="gvi_google_api_key",
-                    )
+    # File handling: run each file as its own job, or merge files that share a
+    # group name into one job (so a year split across files yields one output).
+    gvi_input_fnames = list(_gvi_input_datasets().keys())
+    st.session_state.gvi_run_mode = render_file_grouping_controls(
+        gvi_input_fnames,
+        run_mode_key="gvi_run_mode_radio",
+        groups_key="gvi_file_groups",
+        help_text=(
+            "Separate runs each uploaded study area as its own GVI job. Merge "
+            "combines files that share a Group name into one job (concatenated "
+            "in one CRS), so a year split across several files yields a single "
+            "output. Configure each group's capture dates below."
+        ),
+    )
 
-                st.slider(
-                    "Grid Resolution (m)",
-                    min_value=20,
-                    max_value=500,
-                    value=50,
-                    step=5,
-                    key="gvi_res",
-                    help="Spacing for sampling points in the generated grid (metres).",
-                )
-                st.slider(
-                    "Download Buffer (m)",
-                    min_value=0,
-                    max_value=2000,
-                    value=0,
-                    step=50,
-                    key="gvi_buffer",
-                    help=(
-                        "Expand the study area outward by this distance (metres) before "
-                        "building the sampling grid."
-                    ),
-                )
-                st.checkbox(
-                    "Save Raw Images & Masks",
-                    value=False,
-                    key="gvi_save_debug",
-                    help="Keep downloaded panoramas and segmentation masks under the output folder.",
-                )
+    # Settings + map and the per-file date config are each isolated in a
+    # fragment, so a slider or mode edit reruns only its own section (matching
+    # the NDVI tab). Settings stay live in session_state, so Run always uses the
+    # current values.
+    _render_gvi_settings_map()
 
-        with fc_gvi_r:
-            st.subheader("Study Area Preview")
-            show_sampling_grid = st.session_state.get(
-                "gvi_preview_sampling_grid", False
-            )
-            m_input = folium.Map(location=[51.0447, -114.0719], zoom_start=11)
+    _render_gvi_date_config()
 
-            all_bounds = []
-            for fname, d in st.session_state.datasets.items():
-                if d.get("type") == "restored":
-                    continue
-                if d.get("raw") is not None:
-                    add_study_area_layers(
-                        m_input,
-                        d["raw"],
-                        study_name=f"{fname} (study area)",
-                        buffer_m=gvi_buf_preview,
-                        buffer_name=f"{fname} (buffer)",
-                    )
-                    all_bounds.append(d["raw"].total_bounds)
-                    if gvi_buf_preview > 0:
-                        all_bounds.append(
-                            apply_buffer_m(d["raw"], gvi_buf_preview).total_bounds
-                        )
-                if (
-                    show_sampling_grid
-                    and d.get("processed") is not None
-                    and not d["processed"].empty
-                ):
-                    if d.get("meta") is not None:
-                        add_uniform_point_layer(
-                            m_input,
-                            d["processed"],
-                            tooltip_fields=[],
-                            tooltip_aliases=[],
-                            geojson_marker=folium.Circle(
-                                radius=3,
-                                color="#4a148c",
-                                weight=1,
-                                fill=True,
-                                fill_opacity=0.85,
-                            ),
-                            cluster_threshold=0,
-                            cluster_circle_radius=5,
-                            cluster_color="#4a148c",
-                            cluster_fill_color="#9c27b0",
-                            cluster_fill_opacity=0.82,
-                            layer_name=f"{fname} sampling grid",
-                        )
-
-            if all_bounds:
-                min_x = min([b[0] for b in all_bounds])
-                min_y = min([b[1] for b in all_bounds])
-                max_x = max([b[2] for b in all_bounds])
-                max_y = max([b[3] for b in all_bounds])
-                m_input.fit_bounds([[min_y, min_x], [max_y, max_x]])
-
-            st_folium(
-                m_input, width="100%", height=500, key="map_input", returned_objects=[]
-            )
-
-        _gvi_size_hint(
-            int(st.session_state.get("gvi_buffer", 0)),
-            int(st.session_state.get("gvi_res", 50)),
-        )
-
-        oc_gvi_a, oc_gvi_b, oc_gvi_c = st.columns(3)
-        with oc_gvi_a:
-            st.checkbox(
-                "Save GeoPackage",
-                value=True,
-                key="gvi_out_gpkg",
-                help=(
-                    "Recommended. Single-file vector samples (EPSG:4326) "
-                    "readable by every modern GIS. Scales to country-scale "
-                    "runs and supports sparse cluster layouts without voids."
-                ),
-            )
-        with oc_gvi_b:
-            st.checkbox(
-                "Save GeoTIFF (per-cluster tiles)",
-                value=False,
-                key="gvi_out_geotiff",
-                help=(
-                    "Optional. Writes one GeoTIFF tile per buffered cluster "
-                    "into a *_gvi_tiles/ folder, in the auto-selected planar "
-                    "CRS (no resampling). Skipped if no clusters are defined."
-                ),
-            )
-        with oc_gvi_c:
-            st.checkbox(
-                "Save GeoJSON",
-                value=False,
-                key="gvi_out_geojson",
-                help=(
-                    "Compatibility option only. Slow to read past ~100k "
-                    "points; prefer GeoPackage for large national runs."
-                ),
-            )
-
+    oc_gvi_a, oc_gvi_b, oc_gvi_c = st.columns(3)
+    with oc_gvi_a:
         st.checkbox(
-            "Show Sampling Grid on Map",
-            value=False,
-            key="gvi_preview_sampling_grid",
+            "Save GeoPackage",
+            value=True,
+            key="gvi_out_gpkg",
             help=(
-                "Draw generated sampling grid points on the preview map. Turn off for large "
-                "grids to keep the browser responsive."
+                "Recommended. Single-file vector samples (EPSG:4326) "
+                "readable by every modern GIS. Scales to country-scale "
+                "runs and supports sparse cluster layouts without voids."
             ),
         )
-        gen_row_l, gen_row_r = st.columns([11, 1])
-        with gen_row_l:
-            gen = st.form_submit_button(
-                "Generate Sampling Grids",
-                width="stretch",
-                key="gvi_gen_sampling_grids",
-            )
-        with gen_row_r:
-            gen_action_spinner = st.empty()
-        run_row_l, run_row_r = st.columns([11, 1])
-        with run_row_l:
-            run = st.form_submit_button(
-                "🚀 Run GVI Analysis",
-                type="primary",
-                width="stretch",
-                key="gvi_run_analysis",
-            )
-        with run_row_r:
-            run_action_spinner = st.empty()
+    with oc_gvi_b:
+        st.checkbox(
+            "Save GeoTIFF (per-cluster tiles)",
+            value=False,
+            key="gvi_out_geotiff",
+            help=(
+                "Optional. Writes one GeoTIFF tile per buffered cluster "
+                "into a *_gvi_tiles/ folder, in the auto-selected planar "
+                "CRS (no resampling). Skipped if no clusters are defined."
+            ),
+        )
+    with oc_gvi_c:
+        st.checkbox(
+            "Save GeoJSON",
+            value=False,
+            key="gvi_out_geojson",
+            help=(
+                "Compatibility option only. Slow to read past ~100k "
+                "points; prefer GeoPackage for large national runs."
+            ),
+        )
 
-        gvi_buffer_for_gen = int(st.session_state.get("gvi_buffer", 0))
-        gvi_res_for_gen = int(st.session_state.get("gvi_res", 50))
+    gen_row_l, gen_row_r = st.columns([11, 1])
+    with gen_row_l:
+        gen = st.button(
+            "Generate Sampling Grids",
+            width="stretch",
+            key="gvi_gen_sampling_grids",
+        )
+    with gen_row_r:
+        gen_action_spinner = st.empty()
+    run_row_l, run_row_r = st.columns([11, 1])
+    with run_row_l:
+        run = st.button(
+            "🚀 Run GVI Analysis",
+            type="primary",
+            width="stretch",
+            key="gvi_run_analysis",
+        )
+    with run_row_r:
+        run_action_spinner = st.empty()
 
-        if gen:
-            if not st.session_state.datasets:
-                st.warning("Upload at least one study area first.")
-            else:
-                _gvi_discard_heavy_dataset_fields()
-                distortion_msgs: list[str] = []
-                with gen_action_spinner:
-                    with st.spinner("\u200b"):
-                        for fname_g, d in st.session_state.datasets.items():
-                            if d.get("type") == "restored":
-                                continue
-                            if _gvi_dataset_uses_raster_grid(d, gvi_buffer_for_gen):
-                                pts, meta = generate_clustered_grid(
-                                    d["raw"],
-                                    buffer_m=float(gvi_buffer_for_gen),
-                                    step_m=float(gvi_res_for_gen),
+    gvi_buffer_for_gen = int(st.session_state.get("gvi_buffer", 0))
+    gvi_res_for_gen = int(st.session_state.get("gvi_res", 50))
+
+    # Files configured for per-year column mode build their grids inside the
+    # runner, so they are excluded from any whole-layer grid materialization.
+    column_fnames = {
+        fname
+        for fname, cfg in st.session_state.gvi_date_configs.items()
+        if cfg.get("mode") == _GVI_MODE_COLUMN
+    }
+
+    if gen:
+        if not st.session_state.datasets:
+            st.warning("Upload at least one study area first.")
+        else:
+            _gvi_discard_heavy_dataset_fields()
+            distortion_msgs: list[str] = []
+            with gen_action_spinner:
+                with st.spinner("​"):
+                    for fname_g, d in st.session_state.datasets.items():
+                        if d.get("type") == "restored" or fname_g in column_fnames:
+                            continue
+                        if _gvi_dataset_uses_raster_grid(d, gvi_buffer_for_gen):
+                            pts, meta = generate_clustered_grid(
+                                d["raw"],
+                                buffer_m=float(gvi_buffer_for_gen),
+                                step_m=float(gvi_res_for_gen),
+                            )
+                            d["processed"] = pts
+                            d["meta"] = meta
+                            dist = float(meta.get("distortion", 0.0) or 0.0)
+                            if dist > 0.02:
+                                distortion_msgs.append(
+                                    f"{fname_g}: planar CRS "
+                                    f"{meta.get('choice_name', '?')} — "
+                                    f"distortion ~{dist * 100:.1f}% across "
+                                    f"the extent. Outputs stay in WGS84; "
+                                    f"distances may drift across far-apart "
+                                    f"clusters."
                                 )
-                                d["processed"] = pts
-                                d["meta"] = meta
-                                dist = float(meta.get("distortion", 0.0) or 0.0)
-                                if dist > 0.02:
-                                    distortion_msgs.append(
-                                        f"{fname_g}: planar CRS "
-                                        f"{meta.get('choice_name', '?')} \u2014 "
-                                        f"distortion ~{dist * 100:.1f}% across "
-                                        f"the extent. Outputs stay in WGS84; "
-                                        f"distances may drift across far-apart "
-                                        f"clusters."
-                                    )
-                            else:
-                                d["processed"] = d["raw"].copy()
-                                d["meta"] = None
-                            d["accumulated"] = []
-                            d["results"] = None
-                for msg in distortion_msgs:
-                    st.warning(msg)
-                st.success("Grids generated!")
-                gc.collect()
-                st.rerun()
-
-        elif run:
-            gvi_out_ok_form = (
-                st.session_state.get("gvi_out_gpkg", True)
-                or st.session_state.get("gvi_out_geotiff", False)
-                or st.session_state.get("gvi_out_geojson", False)
-            )
-            if gvi_out_ok_form and st.session_state.datasets:
-                with run_action_spinner:
-                    with st.spinner("\u200b"):
-                        _gvi_materialize_grids_if_missing(
-                            gvi_buffer_for_gen, gvi_res_for_gen
-                        )
+                        else:
+                            d["processed"] = d["raw"].copy()
+                            d["meta"] = None
+                        d["accumulated"] = []
+                        d["results"] = None
+            for msg in distortion_msgs:
+                st.warning(msg)
+            st.success("Grids generated!")
+            gc.collect()
+            st.rerun()
 
     gvi_buffer = int(st.session_state.get("gvi_buffer", 0))
     gvi_res = int(st.session_state.get("gvi_res", 50))
@@ -780,20 +1239,63 @@ def render(output_dir: str, parent_dir: str) -> None:
                     p.get("save_gpkg"),
                     p.get("save_geotiff"),
                     p.get("save_geojson"),
+                    p.get("target_year"),
+                    p.get("max_year_diff"),
                     p.get("has_api_key"),
                 )
 
-            # basename -> absolute path map so each submitted job records
-            # the on-disk location of its study area for silent-restart.
+            # basename -> absolute path map so each (separate) job records the
+            # on-disk location of its study area for silent-restart.
             path_by_basename = {os.path.basename(p): p for p in valid_paths}
 
-            for fname, d in st.session_state.datasets.items():
-                if d.get("type") == "restored":
-                    continue
+            for unit in _gvi_units():
+                key = unit["key"]
+                raw = unit["raw"]
+                gtype = unit["type"]
+                merged = unit["merged"]
 
-                ds_path = path_by_basename.get(fname)
-                job_params = {
-                    "fname": fname,
+                cfg = st.session_state.gvi_date_configs.get(key, {})
+                mode_cfg = cfg.get("mode", _GVI_MODE_RECENT)
+                date_col = (
+                    cfg.get("date_column") if mode_cfg == _GVI_MODE_COLUMN else None
+                )
+                target_year = (
+                    int(cfg["target_year"]) if mode_cfg == _GVI_MODE_YEAR else None
+                )
+                # The max-year-difference window only applies once a year is
+                # targeted (specific-year or column mode).
+                max_year_diff = (
+                    int(cfg["max_diff"])
+                    if cfg.get("use_max_diff") and mode_cfg != _GVI_MODE_RECENT
+                    else None
+                )
+
+                # A merged group has no single source file: name outputs from
+                # the group and ship the concatenated layer as a fresh dataset.
+                # Record each source file's path + fingerprint so restart can
+                # verify the whole group and re-run quietly.
+                if merged:
+                    out_fname = f"{sanitize_name_for_file(key)}.gpkg"
+                    ds_path = None
+                    base_dataset = {
+                        "raw": raw,
+                        "type": gtype,
+                        "processed": None,
+                        "meta": None,
+                        "accumulated": [],
+                        "results": None,
+                    }
+                    src_paths = [path_by_basename.get(fn) for fn in unit["sources"]]
+                    src_fps = [file_size_mtime_fingerprint(p) for p in src_paths]
+                else:
+                    out_fname = key
+                    ds_path = path_by_basename.get(key)
+                    base_dataset = unit["dataset"]
+                    src_paths, src_fps = [], []
+                base_dataset["cache_ref"] = pano_cache
+
+                common_params = {
+                    "fname": out_fname,
                     "input_path": ds_path,
                     "input_fingerprint": file_size_mtime_fingerprint(ds_path),
                     "step": gvi_res,
@@ -803,10 +1305,63 @@ def render(output_dir: str, parent_dir: str) -> None:
                     "save_gpkg": save_gp,
                     "save_geotiff": save_gt,
                     "save_geojson": save_gj,
+                    "max_year_diff": max_year_diff,
                     "model_path": model_path,
                     "has_api_key": api_key is not None,
-                    "geometry_sha256": geometry_sha256(d["raw"]),
+                    "geometry_sha256": geometry_sha256(raw),
+                    "merged": merged,
+                    "group_name": key if merged else None,
+                    "source_files": list(unit["sources"]),
+                    "source_paths": src_paths,
+                    "source_fingerprints": src_fps,
                 }
+
+                # --- Per-year date-column job ---
+                if mode_cfg == _GVI_MODE_COLUMN and date_col:
+                    col_params = dict(
+                        common_params, mode="column", date_column=date_col
+                    )
+                    record = store.submit(
+                        type="gvi_column",
+                        name=os.path.splitext(out_fname)[0],
+                        params=col_params,
+                    )
+                    executor.submit_gvi_column_subprocess(
+                        record,
+                        fname=out_fname,
+                        dataset_data=base_dataset,
+                        date_column=date_col,
+                        init_args={"model_path": model_path, "api_key": api_key},
+                        run_args={
+                            "step": gvi_res,
+                            "buffer": gvi_buffer,
+                            "save_panos": save_debug,
+                            "save_masks": save_debug,
+                            "max_year_diff": max_year_diff,
+                        },
+                        output_dir=output_dir,
+                        save_gpkg=save_gp,
+                        save_geotiff=save_gt,
+                        save_geojson=save_gj,
+                        pano_cache_db_path=pano_cache.db_path,
+                    )
+                    started = True
+                    continue
+                elif mode_cfg == _GVI_MODE_COLUMN and not date_col:
+                    st.warning(f"{key}: no year/date column selected — skipped.")
+                    continue
+
+                # --- Recent / specific-year job (needs a sampling grid) ---
+                if base_dataset.get("processed") is None:
+                    with run_action_spinner:
+                        with st.spinner("​"):
+                            proc, gmeta = _gvi_prepare_processed(
+                                raw, gtype, gvi_buffer, gvi_res
+                            )
+                    base_dataset["processed"] = proc
+                    base_dataset["meta"] = gmeta
+
+                job_params = dict(common_params, target_year=target_year)
                 sig = _gvi_signature(job_params)
 
                 # Skip only if an identical submission is still active.
@@ -818,22 +1373,22 @@ def render(output_dir: str, parent_dir: str) -> None:
                 if duplicate:
                     continue
 
-                d["cache_ref"] = pano_cache
-
                 record = store.submit(
                     type="gvi",
-                    name=os.path.splitext(fname)[0],
+                    name=os.path.splitext(out_fname)[0],
                     params=job_params,
                 )
                 executor.submit_gvi_subprocess(
                     record,
-                    fname=fname,
-                    dataset_data=d,
+                    fname=out_fname,
+                    dataset_data=base_dataset,
                     init_args={"model_path": model_path, "api_key": api_key},
                     run_args={
                         "step": gvi_res,
                         "save_panos": save_debug,
                         "save_masks": save_debug,
+                        "target_year": target_year,
+                        "max_year_diff": max_year_diff,
                     },
                     output_dir=output_dir,
                     save_gpkg=save_gp,
@@ -1094,11 +1649,17 @@ def render(output_dir: str, parent_dir: str) -> None:
                             gdf_viz["gvi_ter"] = gdf_viz["gvi_ter"].round(4)
 
                         valid_pts = gdf_viz.dropna(subset=["gvi_veg"])
+                        has_date = "pano_date" in valid_pts.columns
+                        tooltip_fields = ["gvi_veg", "gvi_ter"]
+                        tooltip_aliases = ["Veg Index:", "Ter Index:"]
+                        if has_date:
+                            tooltip_fields.append("pano_date")
+                            tooltip_aliases.append("Capture:")
                         add_uniform_point_layer(
                             m_result,
                             valid_pts,
-                            tooltip_fields=["gvi_veg", "gvi_ter"],
-                            tooltip_aliases=["Veg Index:", "Ter Index:"],
+                            tooltip_fields=tooltip_fields,
+                            tooltip_aliases=tooltip_aliases,
                             geojson_marker=folium.Circle(
                                 radius=20,
                                 fill_color="green",

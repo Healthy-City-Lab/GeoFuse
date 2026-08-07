@@ -1,10 +1,10 @@
-"""Thread-pool executor that runs ``geofuse.jobs.runners`` callables.
+"""Executor that runs ``geofuse.jobs.runners`` callables in child processes.
 
-The executor owns a single process-level GPU lock (replaces the
-``@st.cache_resource`` lock that previously lived in ``ui/tabs/gvi.py``).
-``submit_runner`` wraps a runner callable so the surrounding
-``JobStore.transition(...)`` calls happen automatically — runners only call
-``ctx.progress(...)``, ``ctx.heartbeat()``, ``ctx.is_cancelled()``.
+Every engine submits through :meth:`submit_subprocess_job` — GVI, NDVI and
+fusion each have a thin wrapper (``submit_gvi_subprocess`` and friends) that
+names the child entry point. The executor owns a single process-level GPU lock
+and drives the surrounding ``JobStore.transition(...)`` calls, so runners only
+call ``ctx.progress(...)``, ``ctx.heartbeat()``, ``ctx.is_cancelled()``.
 """
 
 from __future__ import annotations
@@ -16,7 +16,6 @@ import traceback
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any
 
 from geofuse.logger import bind_job_log_buffer, unbind_job_log_buffer
 from geofuse.persistence.job_store import JobRecord, JobStore
@@ -52,9 +51,25 @@ class JobContext:
     job_id: str
     store: JobStore
     cancel_event: threading.Event
+    pause_event: threading.Event | None = None
 
     def is_cancelled(self) -> bool:
         return self.cancel_event.is_set()
+
+    def is_paused(self) -> bool:
+        return bool(self.pause_event is not None and self.pause_event.is_set())
+
+    def wait_while_paused(self, poll_s: float = 0.25) -> None:
+        """Block at a safe point while the job is paused.
+
+        Returns as soon as the job is resumed or cancelled, so nothing already
+        queued is dropped — the caller simply continues with the next item.
+        """
+        if self.pause_event is None:
+            return
+        while self.pause_event.is_set() and not self.cancel_event.is_set():
+            self.heartbeat()
+            time.sleep(poll_s)
 
     def progress(
         self,
@@ -79,7 +94,12 @@ class JobContext:
 
 
 class JobExecutor:
-    """ThreadPoolExecutor that runs runners with a shared GPU lock."""
+    """Runs each job in a child process, watched from a thread pool.
+
+    The pool holds one watcher thread per running job — it drains the child's
+    message queue and drives the store transitions; the engine work itself
+    happens in the child. A shared GPU lock serialises the jobs that need it.
+    """
 
     def __init__(self, store: JobStore, max_workers: int = 4):
         self._store = store
@@ -98,74 +118,6 @@ class JobExecutor:
     @property
     def store(self) -> JobStore:
         return self._store
-
-    def submit_runner(
-        self,
-        record: JobRecord,
-        runner_fn: Callable[..., Any],
-        *args,
-        **kwargs,
-    ) -> Future:
-        """Submit ``runner_fn(ctx, *args, **kwargs)`` to the pool.
-
-        The executor transitions the record to ``running`` on entry and to
-        ``completed`` / ``error`` / ``cancelled`` on exit. Runners only need
-        to use ``ctx`` for progress and cancellation.
-        """
-        ctx = JobContext(
-            job_id=record.id,
-            store=self._store,
-            cancel_event=record.cancel_event,
-        )
-
-        def _wrapped():
-            # Bind this worker thread's _log(...) calls into the job's ring
-            # buffer so the sidebar monitor can display per-job logs.
-            bind_job_log_buffer(record.id)
-            self._store.transition(record.id, "running")
-            try:
-                result = runner_fn(ctx, *args, **kwargs)
-            except InterruptedError:
-                # Treated as a cancellation signal — workers raise this when
-                # they're aborted between steps (e.g. NDVI tile loop seeing
-                # cancel_callback() return True mid-download).
-                logger.info("Job %s (%s) cancelled by user.", record.id, record.type)
-                self._store.transition(record.id, "cancelled")
-                return
-            except Exception as exc:  # noqa: BLE001 — workers surface any error
-                logger.exception("Job %s (%s) failed", record.id, record.type)
-                self._store.transition(
-                    record.id,
-                    "error",
-                    error=f"{type(exc).__name__}: {exc}",
-                )
-                rec = self._store.get(record.id)
-                if rec is not None:
-                    rec.extra["error_detail"] = traceback.format_exc()
-                return
-            finally:
-                unbind_job_log_buffer()
-                with self._lock:
-                    self._futures.pop(record.id, None)
-
-            # Runner returned normally — decide terminal status.
-            if ctx.is_cancelled():
-                self._store.transition(record.id, "cancelled")
-                return
-
-            outputs = None
-            if isinstance(result, dict):
-                outputs = result.get("output_paths")
-            self._store.transition(
-                record.id,
-                "completed",
-                output_paths=outputs,
-            )
-
-        future = self._pool.submit(_wrapped)
-        with self._lock:
-            self._futures[record.id] = future
-        return future
 
     def submit_subprocess_job(
         self,
@@ -206,10 +158,12 @@ class JobExecutor:
         mp_ctx = mp.get_context("spawn")
         event_queue = mp_ctx.Queue()
         cancel_event = mp_ctx.Event()
+        pause_event = mp_ctx.Event()
 
         proc_kwargs = dict(child_kwargs)
         proc_kwargs["event_queue"] = event_queue
         proc_kwargs["cancel_event"] = cancel_event
+        proc_kwargs["pause_event"] = pause_event
 
         proc = mp_ctx.Process(
             target=child_fn,
@@ -219,6 +173,7 @@ class JobExecutor:
         )
 
         parent_cancel = record.cancel_event
+        parent_pause = record.pause_event
 
         def _watcher() -> None:
             bind_job_log_buffer(record.id)
@@ -229,6 +184,12 @@ class JobExecutor:
 
             def _cancel_bridge() -> None:
                 while not bridge_stop.is_set():
+                    # Pause can toggle both ways, so mirror it continuously
+                    # rather than latching like cancel.
+                    if parent_pause.is_set():
+                        pause_event.set()
+                    else:
+                        pause_event.clear()
                     if parent_cancel.is_set():
                         cancel_event.set()
                         return
@@ -305,9 +266,9 @@ class JobExecutor:
             self._futures[record.id] = future
         return future
 
-    # ------------------------------------------------------------------
+    # ────────────────────────────────────────────────────────────
     # Engine-specific convenience wrappers around :meth:`submit_subprocess_job`.
-    # ------------------------------------------------------------------
+    # ────────────────────────────────────────────────────────────
 
     def submit_gvi_subprocess(
         self,
@@ -324,7 +285,7 @@ class JobExecutor:
         pano_cache_db_path: str,
     ) -> Future:
         """Run a GVI job in a fresh subprocess. See :meth:`submit_subprocess_job`."""
-        from geofuse.jobs.gvi_subprocess import run_gvi_child
+        from geofuse.jobs.subprocess_runner import run_gvi_child
 
         # Strip the parent-only PanoCache before pickling; the child reopens
         # its own from ``pano_cache_db_path``.
@@ -346,6 +307,30 @@ class JobExecutor:
                 pano_cache_db_path=pano_cache_db_path,
             ),
             process_name=f"gvi-child-{record.id}",
+        )
+
+    def submit_fusion_subprocess(
+        self,
+        record: JobRecord,
+        run_kwargs: dict,
+    ) -> Future:
+        """Run a fusion job in a fresh subprocess. See :meth:`submit_subprocess_job`.
+
+        Isolates the GIL-bound stability-selection search + reporting from the
+        Streamlit render loop. All of ``run_fusion``'s arguments are
+        JSON-persisted run config, so ``run_kwargs`` pickles cleanly across the
+        spawn boundary now that the engine class is imported inside the runner
+        rather than passed in. Stage-ledger updates ride the wire protocol's
+        ``MSG_STAGE_LEDGER`` message; ``cancel_check`` works unchanged via the
+        bridged ``mp.Event``.
+        """
+        from geofuse.jobs.subprocess_runner import run_fusion_child
+
+        return self.submit_subprocess_job(
+            record,
+            run_fusion_child,
+            dict(job_id=record.id, run_kwargs=run_kwargs),
+            process_name=f"fusion-child-{record.id}",
         )
 
     def submit_ndvi_subprocess(
@@ -374,7 +359,7 @@ class JobExecutor:
         Streamlit GIL. See :meth:`submit_subprocess_job` for the watcher
         contract.
         """
-        from geofuse.jobs.ndvi_subprocess import run_ndvi_child
+        from geofuse.jobs.subprocess_runner import run_ndvi_child
 
         # The child only needs the raw study-area GeoDataFrame. Stripping the
         # stale ``results`` / ``meta`` from a prior scan avoids pickling
@@ -411,7 +396,8 @@ class JobExecutor:
         fname: str,
         dataset_data: dict,
         date_column: str,
-        window_days: int,
+        season_start_month: int,
+        season_end_month: int,
         cloud_pct: int,
         resolution: int,
         buffer_m: int,
@@ -419,9 +405,12 @@ class JobExecutor:
         save_geotiff: bool,
         save_geojson: bool,
         save_gpkg: bool,
+        save_cluster_tiles: bool = False,
+        satellite: str = "auto",
+        coverage_rescue: bool = True,
     ) -> Future:
-        """Run an NDVI per-feature-date job in a fresh subprocess."""
-        from geofuse.jobs.ndvi_subprocess import run_ndvi_column_child
+        """Run a per-year NDVI (date-column) job in a fresh subprocess."""
+        from geofuse.jobs.subprocess_runner import run_ndvi_column_child
 
         shippable = _trim_ndvi_dataset_for_subprocess(dataset_data)
         return self.submit_subprocess_job(
@@ -432,7 +421,8 @@ class JobExecutor:
                 fname=fname,
                 dataset_data=shippable,
                 date_column=date_column,
-                window_days=window_days,
+                season_start_month=season_start_month,
+                season_end_month=season_end_month,
                 cloud_pct=cloud_pct,
                 resolution=resolution,
                 buffer_m=buffer_m,
@@ -440,8 +430,49 @@ class JobExecutor:
                 save_geotiff=save_geotiff,
                 save_geojson=save_geojson,
                 save_gpkg=save_gpkg,
+                save_cluster_tiles=save_cluster_tiles,
+                satellite=satellite,
+                coverage_rescue=coverage_rescue,
             ),
             process_name=f"ndvi-col-child-{record.id}",
+        )
+
+    def submit_gvi_column_subprocess(
+        self,
+        record: JobRecord,
+        *,
+        fname: str,
+        dataset_data: dict,
+        date_column: str,
+        init_args: dict,
+        run_args: dict,
+        output_dir: str,
+        save_geotiff: bool,
+        save_geojson: bool,
+        save_gpkg: bool,
+        pano_cache_db_path: str,
+    ) -> Future:
+        """Run a per-year GVI (date-column) job in a fresh subprocess."""
+        from geofuse.jobs.subprocess_runner import run_gvi_column_child
+
+        shippable = {k: v for k, v in dataset_data.items() if k != "cache_ref"}
+        return self.submit_subprocess_job(
+            record,
+            run_gvi_column_child,
+            dict(
+                job_id=record.id,
+                fname=fname,
+                dataset_data=shippable,
+                date_column=date_column,
+                init_args=init_args,
+                run_args=run_args,
+                output_dir=output_dir,
+                save_geotiff=save_geotiff,
+                save_geojson=save_geojson,
+                save_gpkg=save_gpkg,
+                pano_cache_db_path=pano_cache_db_path,
+            ),
+            process_name=f"gvi-col-child-{record.id}",
         )
 
     def shutdown(self, wait: bool = True) -> None:

@@ -65,9 +65,9 @@ from functools import cache
 import numpy as np
 import optuna
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Public formula names + parameter spaces
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 WEIGHTED_AVERAGE = "weighted_average"
 SYNERGY = "synergy"
@@ -92,9 +92,9 @@ _CLAMP_LO = 0.0
 _CLAMP_HI = 1.0
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Formula descriptor
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 # Mapping from canonical channel name to its 1-D values array for one batch of
 # samples. The engine builds these from its per-fold MinMaxScaler-normalised
@@ -125,15 +125,28 @@ class CGIFormula:
         return self.main_weight_keys + self.interaction_weight_keys
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Cell binning (stability-selection aggregation)
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 # Bucket width for the weight-cell key used by bootstrap stability selection.
-# Trials are recorded at 5 % resolution (:data:`WEIGHT_STEP_PCT`); for cell
-# aggregation we coarsen to 10 % buckets so each cell collects enough OOB
-# scores across bootstraps to produce a meaningful worst-quantile estimate.
-WEIGHT_BIN_PCT: int = 10
+# Trials are recorded at 5 % resolution (:data:`WEIGHT_STEP_PCT`); cell
+# aggregation coarsens to 20 % buckets.
+#
+# 20, not 10, because adjacent cells are near-identical composites and
+# stability selection splits its vote across them: at 10 % the weighted-average
+# formula has 66 cells and `docs/STABILITY_SELECTION_AUDIT.md` measures **0 %
+# recovery of a strong planted signal**, unchanged by 25x the compute; at 20 %
+# there are 21 cells and recovery is 100 % with the PFER bound still under 1.
+# The finer resolution is not lost — it moves to the refinement stage, which
+# re-bins the winning cell's trials at :data:`WEIGHT_REFINE_BIN_PCT`.
+WEIGHT_BIN_PCT: int = 20
+
+# Bucket width for the third selection stage, which re-bins the trials inside
+# the winning (weight cell x radius sub-cell) to pick a narrower weight mix.
+# The coarse stage decides the channel mix, the radius stage decides the
+# spatial scale, and this one recovers the resolution the coarse stage gave up.
+WEIGHT_REFINE_BIN_PCT: int = 10
 
 
 def bin_weight(value: int | float, bin_pct: int = WEIGHT_BIN_PCT) -> int:
@@ -265,9 +278,9 @@ def radius_cell_key(
     return tuple(parts)
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Symmetric Dirichlet(1,…,1) sampling (uniform on the simplex)
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 # Floor for the raw uniform draws so ``-log(u)`` stays finite and the
 # normalising sum is never zero. The symmetric upper clamp keeps every key's
@@ -346,9 +359,9 @@ def _suggest_simplex_weights_dirichlet(
     return out
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # weighted_average formula
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 _WA_WEIGHT_KEYS: tuple[str, ...] = ("ndvi_weight", "veg_weight", "terrain_weight")
 _WA_KEY_TO_CHANNEL: dict[str, str] = {
@@ -387,17 +400,36 @@ def _suggest_weighted_average(
     return out
 
 
+def _component_dtype(components: ComponentDict) -> np.dtype:
+    """Working float dtype: float32 stays float32, everything else float64.
+
+    The per-pixel trial path feeds float32 channel arrays (halving the
+    bandwidth of the power/product math); reporting paths keep float64.
+    """
+    return np.result_type(
+        np.asarray(components["veg"]).dtype,
+        np.asarray(components["terrain"]).dtype,
+        np.asarray(components["ndvi"]).dtype,
+        np.float32,
+    )
+
+
 def _compute_weighted_average(params: dict, components: ComponentDict) -> np.ndarray:
-    veg = np.asarray(components["veg"], dtype=np.float64)
-    ter = np.asarray(components["terrain"], dtype=np.float64)
-    ndvi = np.asarray(components["ndvi"], dtype=np.float64)
+    dt = _component_dtype(components)
+    veg = np.asarray(components["veg"], dtype=dt)
+    ter = np.asarray(components["terrain"], dtype=dt)
+    ndvi = np.asarray(components["ndvi"], dtype=dt)
     wv = float(params.get("veg_weight", 0))
     wt = float(params.get("terrain_weight", 0))
     wn = float(params.get("ndvi_weight", 0))
     total = wv + wt + wn
     if total <= 0:
-        return np.full_like(veg, np.nan, dtype=np.float64)
-    return (wv / total) * veg + (wt / total) * ter + (wn / total) * ndvi
+        return np.full_like(veg, np.nan, dtype=dt)
+    return (
+        dt.type(wv / total) * veg
+        + dt.type(wt / total) * ter
+        + dt.type(wn / total) * ndvi
+    )
 
 
 def _wa_channel_active(params: dict) -> dict[str, bool]:
@@ -408,9 +440,9 @@ def _wa_channel_active(params: dict) -> dict[str, bool]:
     }
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # synergy formula
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 # Key ordering is informational only — the symmetric Dirichlet sampler treats
 # every key identically, so the (main NDVI / Veg / Ter, then pairwise NV / NT
@@ -481,9 +513,10 @@ def _suggest_synergy(
 
 
 def _compute_synergy(params: dict, components: ComponentDict) -> np.ndarray:
-    veg = np.asarray(components["veg"], dtype=np.float64)
-    ter = np.asarray(components["terrain"], dtype=np.float64)
-    ndvi = np.asarray(components["ndvi"], dtype=np.float64)
+    dt = _component_dtype(components)
+    veg = np.asarray(components["veg"], dtype=dt)
+    ter = np.asarray(components["terrain"], dtype=dt)
+    ndvi = np.asarray(components["ndvi"], dtype=dt)
 
     # Channels arrive min-max normalised to [0, 1]; clamp away any float
     # roundoff so a 0.4 power doesn't produce NaN on a slightly-negative input.
@@ -513,17 +546,17 @@ def _compute_synergy(params: dict, components: ComponentDict) -> np.ndarray:
     # ``_compute_weighted_average``.
     total = wN + wV + wT + wNV + wNT + wTV + wNVT
     if total <= 0:
-        return np.full_like(veg, np.nan, dtype=np.float64)
-    inv = 1.0 / total
+        return np.full_like(veg, np.nan, dtype=dt)
+    inv = dt.type(1.0 / total)
 
     return inv * (
-        wN * main_n
-        + wV * main_v
-        + wT * main_t
-        + wNV * ndvi * veg
-        + wNT * ndvi * ter
-        + wTV * ter * veg
-        + wNVT * ndvi * veg * ter
+        dt.type(wN) * main_n
+        + dt.type(wV) * main_v
+        + dt.type(wT) * main_t
+        + dt.type(wNV) * ndvi * veg
+        + dt.type(wNT) * ndvi * ter
+        + dt.type(wTV) * ter * veg
+        + dt.type(wNVT) * ndvi * veg * ter
     )
 
 
@@ -560,9 +593,9 @@ def _synergy_channel_active(params: dict) -> dict[str, bool]:
     }
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Registry + public API
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 _REGISTRY: dict[str, CGIFormula] = {
     WEIGHTED_AVERAGE: CGIFormula(

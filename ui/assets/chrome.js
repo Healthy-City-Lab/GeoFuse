@@ -18,43 +18,6 @@
 (function () {
 	var d = window.parent.document;
 
-	function moveTabsToToolbar() {
-		var toolbar = d.querySelector("[data-testid='stToolbar']");
-		if (!toolbar) return;
-
-		var allTabLists = d.querySelectorAll("[data-baseweb='tab-list']");
-		if (allTabLists.length === 0) return;
-
-		// Prefer a tab-list that lives outside the toolbar — it is the one
-		// React just rendered. The stale copy we moved on a prior run is
-		// already inside the toolbar but is now orphaned from React's vDOM,
-		// so React created a new one in the main body instead of updating it.
-		var fresh = null;
-		for (var i = 0; i < allTabLists.length; i++) {
-			if (!toolbar.contains(allTabLists[i])) {
-				fresh = allTabLists[i];
-				break;
-			}
-		}
-		if (!fresh) return; // all tab-lists already in toolbar — nothing to do
-
-		// Remove stale copies left behind in the toolbar by a prior rerun.
-		for (var j = 0; j < allTabLists.length; j++) {
-			if (toolbar.contains(allTabLists[j])) {
-				allTabLists[j].remove();
-			}
-		}
-
-		var inner = toolbar.firstElementChild;
-		if (!inner) return;
-		var leftSlot = inner.firstElementChild;
-		if (leftSlot) {
-			leftSlot.appendChild(fresh);
-		} else {
-			inner.insertBefore(fresh, inner.firstChild);
-		}
-	}
-
 	function toggleSidebar() {
 		d.body.classList.toggle("gf-sb-hidden");
 		// Streamlit recomputes some widget sizes on window resize. Triggering
@@ -78,8 +41,8 @@
 	}
 
 	function placeFloater() {
-		// Slot the toggle as the first child of the toolbar's left slot so
-		// it sits to the left of the GeoFuse brand label and tabs.
+		// First child of the toolbar's left slot. Safe to move: this div is our
+		// own markup and holds no React state.
 		var toolbar = d.querySelector("[data-testid='stToolbar']");
 		var inner = toolbar && toolbar.firstElementChild;
 		var leftSlot = inner && inner.firstElementChild;
@@ -147,28 +110,26 @@
 		}, true);
 	}
 
+	// The tab list stays where React renders it. Moving it orphans the node
+	// from React's vDOM, so the next rerender builds a fresh one -- resetting
+	// the selection to the first tab. CSS places it instead; see chrome.css.
+	function findTabList() {
+		return d.querySelector("div[data-testid='stTabs'] [data-baseweb='tab-list']");
+	}
+
 	function injectBrand() {
-		// Scope to the toolbar so we inject into the moved tab-list, not a
-		// stale orphan or the pre-move copy in the main body.
-		var toolbar = d.querySelector("[data-testid='stToolbar']");
-		var tabList = toolbar && toolbar.querySelector("[data-baseweb='tab-list']");
-		if (!tabList) {
-			setTimeout(injectBrand, 200);
-			return;
-		}
-		if (tabList.querySelector(".gf-brand")) return;
+		var list = findTabList();
+		if (!list || list.querySelector(".gf-brand")) return;
 		var span = d.createElement("span");
 		span.className = "gf-brand";
 		span.textContent = "GeoFuse";
-		tabList.insertBefore(span, tabList.firstChild);
+		list.insertBefore(span, list.firstChild);
 	}
 
 	function markMutedTab() {
-		// Scope to the toolbar for the same reason as injectBrand.
-		var toolbar = d.querySelector("[data-testid='stToolbar']");
-		var tabList = toolbar && toolbar.querySelector("[data-baseweb='tab-list']");
-		if (!tabList) return;
-		var tabs = tabList.querySelectorAll("button[role='tab']");
+		var list = findTabList();
+		if (!list) return;
+		var tabs = list.querySelectorAll("button[role='tab']");
 		for (var i = 0; i < tabs.length; i++) {
 			tabs[i].classList.remove("gf-tab-muted");
 		}
@@ -178,9 +139,7 @@
 	}
 
 	function apply() {
-		moveTabsToToolbar();
-		var toolbar = d.querySelector("[data-testid='stToolbar']");
-		if (!toolbar || !toolbar.querySelector("[data-baseweb='tab-list'] .gf-brand")) injectBrand();
+		injectBrand();
 		markMutedTab();
 		ensureFloaterButton();
 		placeFloater();

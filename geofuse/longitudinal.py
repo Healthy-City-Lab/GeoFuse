@@ -69,13 +69,41 @@ CROSS_SECTIONAL_METRICS: tuple[str, ...] = (
     "r2",
     "rmse",
     "mutual_info",
+    # Binary outcome, single measurement per entity: plain logistic regression.
+    # A year-keyed cross-sectional study with a dichotomous outcome is exactly
+    # the design of the published CLSA greenspace papers, so it has to be
+    # expressible without dragging in the panel machinery.
+    "logit_tstat",
+    "logit_coef",
 )
-SUPPORTED_SCORING_METRICS: tuple[str, ...] = MIXEDLM_METRICS + CROSS_SECTIONAL_METRICS
+
+# Binary-outcome panel metrics. ``MixedLM`` is Gaussian-only, so a dichotomous
+# outcome (a CES-D screen, a diagnosis) goes through GEE with an exchangeable
+# working correlation clustered on the entity — a population-averaged log-odds
+# ratio with cluster-robust standard errors. See
+# :mod:`geofuse.binary_longitudinal`.
+GEE_LOGIT_METRICS: tuple[str, ...] = ("gee_logit_tstat", "gee_logit_coef")
+
+SUPPORTED_SCORING_METRICS: tuple[str, ...] = (
+    MIXEDLM_METRICS + GEE_LOGIT_METRICS + CROSS_SECTIONAL_METRICS
+)
 
 # Channels that participate in the per-wave greenery file assignment. Terrain
 # is GVI Cityscapes class 9 (horizontal flat greenery), not DEM; it varies
 # year-to-year only if the user re-runs GVI with new street-view imagery.
 GREENERY_CHANNELS: tuple[str, ...] = ("veg", "terrain", "ndvi")
+
+# Which model term the search optimises the CGI for (see
+# :data:`geofuse.mixed_effects_scoring.ASSOCIATION_TARGETS`). ``level`` is the
+# greenery main-effect association; the ``decline_*`` targets score a greenery ×
+# time slope. Kept here so the spec validates without importing the scorer.
+ASSOCIATION_TARGETS: tuple[str, ...] = (
+    "level",
+    "decline_overall",
+    "decline_average",
+    "decline_change",
+)
+DEFAULT_ASSOCIATION_TARGET = "level"
 
 IntakeMode = Literal["long", "wide"]
 
@@ -125,7 +153,7 @@ class LongitudinalSpec:
         If true, the random-effects structure is
         ``(1 + years_since_baseline | entity_id)`` (random intercept + random
         slope on time). If false, ``(1 | entity_id)`` (random intercept
-        only). Default: true (per user 2026-05-28).
+        only). Default: true.
     scoring_metric
         One of :data:`MIXEDLM_METRICS`; the metric Optuna optimizes per
         trial. The other three are computed post-hoc on robust + top-20% +
@@ -139,10 +167,33 @@ class LongitudinalSpec:
     date_col: str = "measurement_date"
     greenery_files: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
     target_files_per_wave: Mapping[str, str] = field(default_factory=dict)
+    # Wide mode only: the entity / date column picked for each wave file, as
+    # ``{wave_label: {"entity_col": ..., "date_col": ...}}``. Intake uses the
+    # canonical ``entity_id_col`` / ``date_col``; this records what the user
+    # chose per file so the setup form can be restored exactly.
+    target_columns_per_wave: Mapping[str, Mapping[str, str]] = field(
+        default_factory=dict
+    )
     include_time_fixed_effect: bool = True
     random_slope_time: bool = True
     scoring_metric: str = DEFAULT_MIXEDLM_METRIC
     derive_wave_from_date: bool = False
+    # Which greenery term the search optimises the CGI for (one of
+    # ``ASSOCIATION_TARGETS``): the level association or a greenery × time slope.
+    association_target: str = DEFAULT_ASSOCIATION_TARGET
+    # Optional post-hoc exposure-decline terms (greenery × time), reported on the
+    # winning composite. ``decline_average_exposure`` adds the between-person
+    # (person-mean) term; ``decline_exposure_change`` the within-person
+    # (deviation) term. The overall greenery × time term is always reported.
+    decline_average_exposure: bool = False
+    decline_exposure_change: bool = False
+    # Wave indicators as fixed effects. Per-wave greenery files mean the
+    # exposure carries the layer's vintage, which tracks calendar time; without
+    # these the drift lands on the greenery × time terms.
+    include_wave_fixed_effects: bool = True
+    # Column holding a neighbourhood / site id. Entered as fixed effects so the
+    # area level a person-only random effect leaves out is accounted for.
+    area_id_col: str | None = None
 
     def to_payload(self) -> dict:
         """Serialise to a plain-dict payload (for ``rec.params`` / restart)."""
@@ -156,10 +207,18 @@ class LongitudinalSpec:
                 ch: dict(per_wave) for ch, per_wave in self.greenery_files.items()
             },
             "target_files_per_wave": dict(self.target_files_per_wave),
+            "target_columns_per_wave": {
+                w: dict(cols) for w, cols in self.target_columns_per_wave.items()
+            },
             "include_time_fixed_effect": self.include_time_fixed_effect,
             "random_slope_time": self.random_slope_time,
             "scoring_metric": self.scoring_metric,
             "derive_wave_from_date": self.derive_wave_from_date,
+            "association_target": self.association_target,
+            "decline_average_exposure": self.decline_average_exposure,
+            "decline_exposure_change": self.decline_exposure_change,
+            "include_wave_fixed_effects": self.include_wave_fixed_effects,
+            "area_id_col": self.area_id_col,
         }
 
     @classmethod
@@ -176,12 +235,27 @@ class LongitudinalSpec:
                 for ch, per_wave in (payload.get("greenery_files") or {}).items()
             },
             target_files_per_wave=dict(payload.get("target_files_per_wave") or {}),
+            target_columns_per_wave={
+                w: dict(cols)
+                for w, cols in (payload.get("target_columns_per_wave") or {}).items()
+            },
             include_time_fixed_effect=bool(
                 payload.get("include_time_fixed_effect", True)
             ),
             random_slope_time=bool(payload.get("random_slope_time", True)),
             scoring_metric=payload.get("scoring_metric", DEFAULT_MIXEDLM_METRIC),
             derive_wave_from_date=bool(payload.get("derive_wave_from_date", False)),
+            association_target=payload.get(
+                "association_target", DEFAULT_ASSOCIATION_TARGET
+            ),
+            decline_average_exposure=bool(
+                payload.get("decline_average_exposure", False)
+            ),
+            decline_exposure_change=bool(payload.get("decline_exposure_change", False)),
+            include_wave_fixed_effects=bool(
+                payload.get("include_wave_fixed_effects", True)
+            ),
+            area_id_col=payload.get("area_id_col") or None,
         )
 
 
@@ -200,19 +274,48 @@ def validate_spec(spec: LongitudinalSpec) -> list[str]:
         errs.append("wave_labels must contain at least one wave.")
     if len(set(spec.wave_labels)) != len(spec.wave_labels):
         errs.append("wave_labels contains duplicates.")
-    if spec.intake_mode == "long" and not spec.wave_col:
-        errs.append("wave_col is required when intake_mode == 'long'.")
+    if (
+        spec.intake_mode == "long"
+        and not spec.wave_col
+        and not spec.derive_wave_from_date
+    ):
+        errs.append(
+            "wave_col is required when intake_mode == 'long' unless "
+            "derive_wave_from_date is set."
+        )
     if spec.intake_mode == "wide":
-        missing_t = [w for w in spec.wave_labels if w not in spec.target_files_per_wave]
-        if missing_t:
-            errs.append(
-                "target_files_per_wave is missing entries for waves "
-                f"{missing_t} (required when intake_mode == 'wide')."
-            )
+        if not spec.target_files_per_wave:
+            errs.append("target_files_per_wave is required when intake_mode == 'wide'.")
+        elif not spec.derive_wave_from_date:
+            # Wave-keyed intake: one target file per wave label. Under
+            # year-keyed waves the files are keyed by their own label instead
+            # and a row's wave comes from its measurement date, so the
+            # per-wave completeness check does not apply.
+            missing_t = [
+                w for w in spec.wave_labels if w not in spec.target_files_per_wave
+            ]
+            if missing_t:
+                errs.append(
+                    "target_files_per_wave is missing entries for waves "
+                    f"{missing_t} (required when intake_mode == 'wide')."
+                )
     if spec.scoring_metric not in SUPPORTED_SCORING_METRICS:
         errs.append(
             f"scoring_metric must be one of {SUPPORTED_SCORING_METRICS}, "
             f"got {spec.scoring_metric!r}."
+        )
+    if spec.association_target not in ASSOCIATION_TARGETS:
+        errs.append(
+            f"association_target must be one of {ASSOCIATION_TARGETS}, "
+            f"got {spec.association_target!r}."
+        )
+    if (
+        spec.association_target != "level"
+        and spec.scoring_metric not in MIXEDLM_METRICS
+    ):
+        errs.append(
+            "association_target only applies to a mixed-effects scoring_metric; "
+            f"got target {spec.association_target!r} with metric {spec.scoring_metric!r}."
         )
     for ch in GREENERY_CHANNELS:
         per_wave = spec.greenery_files.get(ch, {})
@@ -230,19 +333,29 @@ def validate_spec(spec: LongitudinalSpec) -> list[str]:
     return errs
 
 
-def describe_file_reuse(spec: LongitudinalSpec) -> dict[str, bool]:
-    """Map ``channel -> True`` when every wave shares one file for that channel.
+def target_intake_columns(
+    spec: LongitudinalSpec,
+    outcome_col: str | None,
+    covariate_cols: Iterable[str] = (),
+) -> list[str]:
+    """Non-geometry columns :func:`build_long_format` reads from a target frame.
 
-    The UI uses this to surface a non-blocking warning ("vegetation has no
-    longitudinal variation — only between-entity contrast will inform that
-    channel"). Returns ``True`` for channels with exactly one distinct file
-    across all waves (including the degenerate one-wave case).
+    The union of what intake consumes (entity id, date, wave label) and what
+    :func:`_project_columns` keeps (outcome, covariates). Any other column in
+    the user's file is discarded by intake, so a reader may skip it entirely
+    rather than materialize a cohort file's full survey schema.
     """
-    out: dict[str, bool] = {}
-    for ch in GREENERY_CHANNELS:
-        per_wave = spec.greenery_files.get(ch, {})
-        distinct = {per_wave[w] for w in spec.wave_labels if w in per_wave}
-        out[ch] = len(distinct) <= 1
+    cols = [spec.entity_id_col, spec.date_col, outcome_col, *covariate_cols]
+    if not spec.derive_wave_from_date:
+        cols.append(spec.wave_col)
+    if spec.area_id_col:
+        cols.append(spec.area_id_col)
+    seen: set[str] = set()
+    out: list[str] = []
+    for c in cols:
+        if c and c not in seen:
+            seen.add(c)
+            out.append(c)
     return out
 
 
@@ -319,6 +432,13 @@ def build_long_format(
         sample = (
             frame.loc[dup_mask, [spec.entity_id_col, "wave"]].head(5).to_dict("records")
         )
+        if spec.derive_wave_from_date:
+            raise ValueError(
+                "Two measurements of the same entity fall in the same calendar "
+                f"year — first few: {sample}. Year-keyed greenery assignment "
+                "needs at most one observation per entity per year; switch the "
+                "assignment mode to per wave file, or split the affected years."
+            )
         raise ValueError(
             f"Duplicate (entity_id, wave) rows detected — first few: {sample}. "
             "Each (entity, wave) must appear exactly once across the longitudinal "
@@ -366,18 +486,34 @@ def parse_date_column(s: pd.Series) -> pd.Series:
     return pd.to_datetime(s.astype(str), errors="coerce")
 
 
+def wave_labels_from_dates(parsed_dates: pd.Series) -> pd.Series:
+    """Calendar-year wave labels from an already-parsed date column.
+
+    Year-keyed waves route each observation's greenery lookup by the year it
+    was actually measured, so a file that spans a year boundary still sends
+    each row to the right source. Unparseable dates become ``"<NA>"`` and are
+    dropped by the wave filter in :func:`build_long_format`.
+    """
+    return parsed_dates.dt.year.astype("Int64").astype(str)
+
+
 def _prepare_long_input(
     gdf: gpd.GeoDataFrame,
     spec: LongitudinalSpec,
     outcome_col: str,
     cov_cols: list[str],
 ) -> gpd.GeoDataFrame:
-    required = {spec.entity_id_col, spec.wave_col, spec.date_col, outcome_col}
+    required = {spec.entity_id_col, spec.date_col, outcome_col}
+    if not spec.derive_wave_from_date:
+        required.add(spec.wave_col)
     _assert_columns_present(gdf, required, "long-format target")
     _assert_columns_present(gdf, set(cov_cols), "long-format target (covariates)")
     out = gdf.copy()
-    out["wave"] = out[spec.wave_col].astype(str)
     out[spec.date_col] = parse_date_column(out[spec.date_col])
+    if spec.derive_wave_from_date:
+        out["wave"] = wave_labels_from_dates(out[spec.date_col])
+    else:
+        out["wave"] = out[spec.wave_col].astype(str)
     return out
 
 
@@ -401,8 +537,14 @@ def _prepare_wide_input(
             frame, set(cov_cols), f"wave {wave_label!r} target (covariates)"
         )
         copy = frame.copy()
-        copy["wave"] = wave_label
         copy[spec.date_col] = parse_date_column(copy[spec.date_col])
+        if spec.derive_wave_from_date:
+            # The file is a container, not a wave: each row is tagged with the
+            # calendar year it was measured, so greenery routing follows the
+            # measurement even when one file spans a year boundary.
+            copy["wave"] = wave_labels_from_dates(copy[spec.date_col])
+        else:
+            copy["wave"] = wave_label
         tagged.append(copy)
 
     # Concatenate; pandas preserves the union of columns. Use the first
@@ -470,6 +612,8 @@ def _project_columns(
         *cov_cols,
         "geometry",
     ]
+    if spec.area_id_col and spec.area_id_col in frame.columns:
+        cols.insert(2, spec.area_id_col)
     # Deduplicate while preserving order (entity_id_col may appear if a
     # covariate accidentally points at it).
     seen: set[str] = set()

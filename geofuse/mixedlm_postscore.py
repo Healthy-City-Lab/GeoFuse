@@ -12,11 +12,12 @@ search records on its winning-params dict, so no Optuna study is needed.
 
 Output schema (``<study_results>/mixedlm_metrics.csv``)::
 
-    pool, trial_id, mixedlm_tstat, mixedlm_marginal_r2, mixedlm_lr, mixedlm_coef
+    pool, trial_id, mixedlm_tstat, mixedlm_marginal_r2, mixedlm_lr, mixedlm_coef, n_trials
 
 with one row per (pool, trial) plus one summary row per (pool, summary kind)
-where ``trial_id`` carries ``__mean__`` / ``__ci_lo__`` / ``__ci_hi__`` /
-``__n__``.
+where ``trial_id`` carries ``__mean__`` / ``__ci_lo__`` / ``__ci_hi__``. The
+pool's trial count lives in its own ``n_trials`` column so the metric columns
+hold only metric values.
 """
 
 from __future__ import annotations
@@ -78,8 +79,13 @@ def _pool_summary_rows(
         }
         rows.append(_summary("__ci_lo__", qlo))
         rows.append(_summary("__ci_hi__", qhi))
-    rows.append(_summary("__n__", {m: float(n) for m in metrics}))
     return rows
+
+
+# Trials re-scored per pool, highest out-of-bag score first, to bound the
+# MixedLM fits; and the file the per-trial rows land in.
+_MAX_TRIALS: int = 200
+_CSV_BASENAME: str = "mixedlm_metrics.csv"
 
 
 def compute_post_metrics(
@@ -87,8 +93,6 @@ def compute_post_metrics(
     output_dir: str,
     *,
     winning_params: dict,
-    max_trials: int = 200,
-    csv_basename: str = "mixedlm_metrics.csv",
     log: Any = None,
 ) -> str | None:
     """Re-score the stability winner's trials + the final composite on the
@@ -100,7 +104,7 @@ def compute_post_metrics(
     * ``winning_cell`` — every trial whose snapped weight cell matches the
       selected channel mix, reconstructed from the per-trial
       ``__trial_history__`` the stability search recorded. Capped at
-      ``max_trials`` (highest out-of-bag score first) to bound MixedLM fits.
+      :data:`_MAX_TRIALS` (highest out-of-bag score first) to bound MixedLM fits.
     * ``final`` — the averaged winning parameters the composite was built from.
 
     No-op (returns ``None``) for cross-sectional runs, when there's no test
@@ -130,8 +134,8 @@ def compute_post_metrics(
         ),
         reverse=higher,
     )
-    if max_trials and len(cell_rows) > max_trials:
-        cell_rows = cell_rows[:max_trials]
+    if len(cell_rows) > _MAX_TRIALS:
+        cell_rows = cell_rows[:_MAX_TRIALS]
 
     final_clean = {k: v for k, v in winning_params.items() if not k.startswith("__")}
 
@@ -141,6 +145,7 @@ def compute_post_metrics(
 
     metric = engine.longitudinal_spec.scoring_metric
     rows: list[dict[str, Any]] = []
+    pool_counts: dict[str, int] = {}
     for pool_name, items in pools:
         per_trial_values: list[dict[str, float]] = []
         for idx, entry in enumerate(items):
@@ -173,6 +178,7 @@ def compute_post_metrics(
                         for m in mixed_effects_scoring.MIXEDLM_METRICS
                     }
                 )
+        pool_counts[pool_name] = len(per_trial_values)
         # Only summarise pools with more than one entry (the ``final`` pool
         # is a single point estimate by design — no spread).
         if len(per_trial_values) > 1:
@@ -183,13 +189,21 @@ def compute_post_metrics(
         return None
 
     os.makedirs(output_dir, exist_ok=True)
-    csv_path = os.path.join(output_dir, csv_basename)
-    fields = ["pool", "trial_id"] + sorted(mixed_effects_scoring.MIXEDLM_METRICS)
+    csv_path = os.path.join(output_dir, _CSV_BASENAME)
+    # ``n_trials`` is its own column so the metric columns hold only metric
+    # values.
+    fields = (
+        ["pool", "trial_id"]
+        + sorted(mixed_effects_scoring.MIXEDLM_METRICS)
+        + ["n_trials"]
+    )
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         for r in rows:
-            w.writerow({k: r.get(k, "") for k in fields})
+            row = {k: r.get(k, "") for k in fields}
+            row["n_trials"] = pool_counts.get(r.get("pool"), "")
+            w.writerow(row)
 
     _say("OK", f"Post-hoc MixedLM metrics written: {csv_path}")
     return csv_path

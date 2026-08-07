@@ -48,6 +48,10 @@ from sklearn.neighbors import NearestNeighbors
 # neighbour chains; a void wider than the local k-NN reach severs the graph.
 _DEFAULT_KNN: int = 10
 
+# Upper bound on knots per component, before the df-many coarsest eigenvectors
+# are taken. Caps the O(k^3) energy-matrix eigendecomposition on dense areas.
+_KNOT_CAP: int = 150
+
 
 def _tps_eta(r: np.ndarray) -> np.ndarray:
     """Thin-plate radial kernel ``r² log r`` in 2-D, with ``η(0) = 0``."""
@@ -215,26 +219,19 @@ class SpatialBasis:
 
 
 def build_block_basis(
-    xy: np.ndarray,
-    *,
-    max_df: int = 10,
-    eps: float | None = None,
-    knn: int = _DEFAULT_KNN,
-    knot_cap: int = 150,
-    family: str = "tprs",
+    xy: np.ndarray, *, max_df: int = 10, eps: float | None = None
 ) -> SpatialBasis:
     """Assemble the per-component block-diagonal spatial basis for ``xy``.
 
-    ``xy`` is an ``[n, 2]`` array of entity coordinates in a metre CRS. ``max_df``
-    bounds the radial functions per component. ``family`` selects the basis
-    family; only ``"tprs"`` (thin-plate regression spline) is implemented.
+    ``xy`` is an ``[n, 2]`` array of entity coordinates in a metre CRS.
+    ``max_df`` bounds the radial functions per component; ``eps`` is forwarded
+    to :func:`connected_components`. The basis is a thin-plate regression
+    spline, with knots capped at :data:`_KNOT_CAP`.
 
     Non-finite rows contribute no spatial columns (they fall back to covariate
     control). Returns a :class:`SpatialBasis`; ``has_spatial`` is ``False`` when
     the geometry is degenerate (all coincident / too few points).
     """
-    if family != "tprs":
-        raise ValueError(f"Unknown spatial basis family '{family}'.")
     xy = np.asarray(xy, dtype=np.float64)
     if xy.ndim != 2 or xy.shape[1] != 2:
         raise ValueError(f"xy must be [n, 2]; got shape {xy.shape}.")
@@ -258,7 +255,7 @@ def build_block_basis(
         return base
 
     labels = np.full(n, -1, dtype=np.int64)
-    lab_f, eps_used = connected_components(xy[finite], eps=eps, k=knn)
+    lab_f, eps_used = connected_components(xy[finite], eps=eps)
     labels[finite] = lab_f
 
     n_comp = int(lab_f.max()) + 1 if len(lab_f) else 0
@@ -281,7 +278,7 @@ def build_block_basis(
             ind = np.zeros(n, dtype=np.float64)
             ind[idx] = 1.0
             intercept_cols.append(ind)
-        lin_c, phi_c = _component_columns(xy[idx], max_df=max_df, knot_cap=knot_cap)
+        lin_c, phi_c = _component_columns(xy[idx], max_df=max_df, knot_cap=_KNOT_CAP)
         knots_per_component.append(int(phi_c.shape[1]))
         for j in range(lin_c.shape[1]):
             col = np.zeros(n, dtype=np.float64)
@@ -385,5 +382,104 @@ def select_df_aic(
             best_ic = ic
             best_df = df
             best_cols = spatial
+
+    return best_df, best_cols
+
+
+@dataclass
+class DfSelectionPrecompute:
+    """Precomputed nested-QR structures for repeated df selection on one basis.
+
+    The candidate designs are nested in df (linear columns first, then radial
+    columns in resolution order), so one economy QR of the full-df design
+    ``[1, linear, radial(rank-ordered)]`` yields every candidate's RSS as a
+    prefix of ``‖Qᵀy‖²`` — the per-call df search becomes a single matvec
+    instead of ``max_df + 1`` least-squares fits.
+
+    ``k_of_df[df]`` is the column count in ``Q`` (intercept included) at that
+    df level; ``designs[df]`` is the spatial design (no intercept) returned to
+    the caller — same column *span* as ``SpatialBasis.design(df)``.
+    """
+
+    Q: np.ndarray
+    k_of_df: np.ndarray
+    designs: list
+
+
+def precompute_df_selection(basis: SpatialBasis) -> DfSelectionPrecompute | None:
+    """Build the nested-QR precompute for ``select_df_aic_fast``, or ``None``."""
+    if not basis.has_spatial:
+        return None
+    order = np.argsort(basis.radial_rank, kind="stable")
+    radial_sorted = basis.radial[:, order]
+    sorted_ranks = basis.radial_rank[order]
+    n_linear = basis.linear.shape[1]
+
+    M = np.column_stack([np.ones(basis.n), basis.linear, radial_sorted])
+    Q, _r = np.linalg.qr(M, mode="reduced")
+
+    k_of_df = np.empty(basis.max_df + 1, dtype=np.int64)
+    designs: list = []
+    for df in range(basis.max_df + 1):
+        n_radial = int(np.searchsorted(sorted_ranks, df, side="left"))
+        k_of_df[df] = 1 + n_linear + n_radial
+        parts = []
+        if n_linear:
+            parts.append(basis.linear)
+        if n_radial:
+            parts.append(radial_sorted[:, :n_radial])
+        designs.append(np.column_stack(parts) if parts else None)
+    return DfSelectionPrecompute(Q=Q, k_of_df=k_of_df, designs=designs)
+
+
+def select_df_aic_fast(
+    y: np.ndarray,
+    basis: SpatialBasis,
+    pre: DfSelectionPrecompute | None,
+    *,
+    criterion: str = "aic",
+) -> tuple[int | None, np.ndarray | None]:
+    """Covariate-free :func:`select_df_aic` via the nested-QR precompute.
+
+    Matches ``select_df_aic(y, basis, None)`` (same RSS, hence the same
+    information criterion and the same selected df) at one ``Qᵀy`` matvec per
+    call. Returned columns span the same space as ``basis.design(df)`` — the
+    downstream residualization is order-invariant. Falls back to the exact
+    legacy search when the precompute is missing or ``y`` has non-finite rows
+    (the legacy path drops those rows for the criterion fits).
+    """
+    y = np.asarray(y, dtype=np.float64).ravel()
+    if pre is None or not np.isfinite(y).all():
+        return select_df_aic(y, basis, None, criterion=criterion)
+    n = len(y)
+    if n < 4:
+        return None, None
+
+    yy = float(y @ y)
+    proj = pre.Q.T @ y
+    cum = np.cumsum(proj * proj)
+
+    def _ic(rss: float, k_cols: int) -> float:
+        if rss <= 0:
+            rss = 1e-300
+        k = k_cols + 1  # params + variance, matching _ols_info_criterion
+        loglik = -0.5 * n * (np.log(2 * np.pi) + np.log(rss / n) + 1.0)
+        if criterion == "bic":
+            return float(np.log(n) * k - 2.0 * loglik)
+        return float(2.0 * k - 2.0 * loglik)
+
+    best_df: int | None = None
+    best_cols: np.ndarray | None = None
+    best_ic = _ic(yy - float(cum[0]), 1)  # baseline: intercept only
+
+    for df in range(len(pre.k_of_df)):
+        k_cols = int(pre.k_of_df[df])
+        if k_cols <= 1:  # no spatial columns at this level
+            continue
+        ic = _ic(yy - float(cum[k_cols - 1]), k_cols)
+        if ic < best_ic:
+            best_ic = ic
+            best_df = df
+            best_cols = pre.designs[df]
 
     return best_df, best_cols

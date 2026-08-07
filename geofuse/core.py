@@ -1,7 +1,3 @@
-import json
-import logging
-import os
-
 import geopandas as gpd
 import numpy as np
 import pandas as pd
@@ -15,7 +11,6 @@ from shapely.strtree import STRtree
 from .crs_utils import (
     WGS84_EPSG,
     metres_per_degree_at_lat,
-    reproject_geodataframe_to_wgs84,
     select_grid_crs_with_warning,
 )
 from .logger import get_logger
@@ -25,40 +20,6 @@ _log_core = get_logger("GVI")
 # Inside-buffer vs outside-buffer in the raster mask (any value other than *fill* works).
 _RASTER_INSIDE = 1
 _RASTER_OUTSIDE = 0
-
-
-class JobTracker:
-    """Handles logging for HPC and status updates for the Web UI."""
-
-    def __init__(self, job_id, log_dir="logs"):
-        self.job_id = job_id
-        self.status_file = os.path.join(log_dir, f"{job_id}_status.json")
-        self.log_file = os.path.join(log_dir, f"{job_id}.txt")
-
-        logging.basicConfig(
-            filename=self.log_file,
-            level=logging.INFO,
-            format="%(asctime)s - %(message)s",
-        )
-
-    def update(self, stage, percent, metrics=None):
-        status = {
-            "job_id": self.job_id,
-            "stage": stage,
-            "progress": percent,
-            "metrics": metrics or {},
-        }
-        with open(self.status_file, "w") as f:
-            json.dump(status, f)
-        logging.info(f"{stage}: {percent}% - {metrics}")
-
-
-def load_geometry(input_path):
-    """Load Shapefile/GeoJSON and return features in EPSG:4326 (lon/lat as x, y)."""
-    gdf = gpd.read_file(input_path)
-    if gdf.crs is None:
-        raise ValueError("Input geometry missing CRS.")
-    return reproject_geodataframe_to_wgs84(gdf)
 
 
 def _geometry_union_all(geoms: gpd.GeoSeries):
@@ -157,6 +118,7 @@ def generate_clustered_grid(
     buffer_m: float,
     step_m: float,
     anchor: tuple[float, float] = (0.0, 0.0),
+    grid_crs=None,
 ):
     """Cluster-aware anchored sampling grid for nation-scale point inputs.
 
@@ -165,6 +127,10 @@ def generate_clustered_grid(
     grid per cluster snapped to a single global anchor in the planar CRS.
     Sample points across all clusters land on one unified grid so no
     resampling is needed if downstream code rasterizes the output.
+
+    Pass ``grid_crs`` to skip CRS auto-selection and force a specific planar
+    CRS — used when several subsets (e.g. per-year slices of one dataset)
+    must share one CRS so their grids and rasters align pixel-for-pixel.
 
     Returns ``(GeoDataFrame, meta)``:
       * GeoDataFrame columns ``row, col, x, y, cluster_id`` and Point geometry
@@ -176,9 +142,12 @@ def generate_clustered_grid(
         entry per cluster: bounds, height, width, transform — used by the
         per-cluster GeoTIFF writer).
     """
-    grid_crs, distortion, choice_name = select_grid_crs_with_warning(
-        gdf_4326, _log_core, role="Grid CRS"
-    )
+    if grid_crs is not None:
+        distortion, choice_name = 0.0, "forced"
+    else:
+        grid_crs, distortion, choice_name = select_grid_crs_with_warning(
+            gdf_4326, _log_core, role="Grid CRS"
+        )
     gdf_m = gdf_4326.to_crs(grid_crs)
     buffered = gdf_m.geometry.union_all()
     if buffer_m > 0:

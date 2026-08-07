@@ -16,16 +16,27 @@ read from that path lazily — only when preview, sampling, or compute
 actually needs the bytes — and a job's recorded path + hash can be
 re-verified on restart without ever re-uploading.
 
-Caveat: tkinter dialogs open on the machine running the Streamlit server.
-This is fine for the local UI and HPC-node CLI workflows; it doesn't work
-when the server is remote with the browser elsewhere. The Streamlit
-``st.file_uploader`` is still available via :func:`fallback_uploader_to_path`
-for that deployment shape.
+The dialog runs in a **child process** (``file_picker_child.py``), not in the
+Streamlit worker. Tk wants to own the main thread of its interpreter, and
+Streamlit runs the script body and every ``on_click`` callback on a
+per-rerun ScriptRunner thread — an in-process dialog raises
+``RuntimeError: main thread is not in main loop`` as soon as any Tk state
+outlives the thread that created it. One subprocess per click costs a few
+hundred milliseconds on a user-initiated action and removes the failure mode
+entirely.
+
+Caveat: the dialog opens on the machine running the Streamlit server. That is
+right for the local UI and HPC-node workflows and wrong when the server is
+remote with the browser elsewhere. In that case the picker reports itself
+unavailable and the button grows a "paste a full path" box instead of raising;
+:func:`fallback_uploader_to_path` remains for deployments that want the
+browser-side upload flow.
 """
 
 from __future__ import annotations
 
 import os
+import sys
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -71,6 +82,19 @@ class PickedDataset:
     cleanup_file: None = None
 
 
+class PickerUnavailable(RuntimeError):
+    """The native dialog could not be opened on this machine."""
+
+
+#: Where the manual-path fallback stores its "why did the dialog fail" note.
+_PICKER_ERROR_KEY = "__file_picker_error__"
+
+#: Ceiling on how long the dialog may stay open. Generous — the user is
+#: browsing a filesystem — but bounded, so a child that somehow never draws a
+#: window cannot wedge the Streamlit worker thread forever.
+_PICKER_TIMEOUT_S = 600
+
+
 def _open_tk_picker(
     title: str,
     *,
@@ -78,45 +102,195 @@ def _open_tk_picker(
     initial_dir: str | None,
     multi: bool,
 ) -> tuple[str, ...]:
-    """Open the native OS file dialog and return the chosen paths.
+    """Open the native OS file dialog in a child process; return the paths.
 
-    Imports tkinter lazily so a headless / remote deployment that never
-    triggers the picker doesn't pay tkinter's import cost. The dialog is
-    pinned topmost so it doesn't disappear behind the browser window.
+    The dialog runs out-of-process deliberately. Tk wants to own the main
+    thread of whatever interpreter it lives in, and Streamlit runs both the
+    script body and every ``on_click`` callback on a per-rerun ScriptRunner
+    thread — so an in-process dialog raises ``RuntimeError: main thread is not
+    in main loop`` the moment any Tk state survives the thread that made it.
+    A child process has its own main thread and is gone before the next rerun.
+
+    Raises :class:`PickerUnavailable` when there is no usable dialog (headless
+    server, no Tk build, user's session has no display); callers fall back to
+    typing a path.
     """
-    from tkinter import Tk, filedialog
+    import json
+    import subprocess
+    import tempfile
 
-    root = Tk()
+    child = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "file_picker_child.py"
+    )
+    if not os.path.isfile(child):
+        raise PickerUnavailable(f"picker helper is missing at {child}")
+
+    request = {
+        "title": title,
+        "file_types": [list(ft) for ft in file_types],
+        "initial_dir": initial_dir or os.path.expanduser("~"),
+        "multi": bool(multi),
+    }
+    tmp = tempfile.NamedTemporaryFile(
+        "w", suffix=".json", delete=False, encoding="utf-8"
+    )
     try:
-        root.withdraw()
-        root.wm_attributes("-topmost", True)
-        if multi:
-            picked = filedialog.askopenfilenames(
-                title=title,
-                initialdir=initial_dir or os.path.expanduser("~"),
-                filetypes=list(file_types),
+        json.dump(request, tmp)
+        tmp.close()
+        # CREATE_NO_WINDOW keeps a console from flashing up behind the dialog
+        # on Windows; the dialog itself is a GUI window and still appears.
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            proc = subprocess.run(
+                [sys.executable, child, tmp.name],
+                capture_output=True,
+                text=True,
+                timeout=_PICKER_TIMEOUT_S,
+                creationflags=creationflags,
             )
-            return tuple(picked) if picked else ()
-        single = filedialog.askopenfilename(
-            title=title,
-            initialdir=initial_dir or os.path.expanduser("~"),
-            filetypes=list(file_types),
-        )
-        return (single,) if single else ()
+        except subprocess.TimeoutExpired as exc:
+            raise PickerUnavailable(
+                f"the file dialog did not close within {_PICKER_TIMEOUT_S}s"
+            ) from exc
+        except OSError as exc:
+            raise PickerUnavailable(f"could not start the file dialog: {exc}") from exc
     finally:
         try:
-            root.destroy()
-        except Exception:
+            os.unlink(tmp.name)
+        except OSError:
             pass
 
+    lines = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()]
+    if not lines:
+        detail = (proc.stderr or "").strip().splitlines()
+        raise PickerUnavailable(
+            detail[-1] if detail else "the file dialog produced no output"
+        )
+    try:
+        payload = json.loads(lines[-1])
+    except json.JSONDecodeError as exc:
+        raise PickerUnavailable(
+            f"unreadable response from the file dialog: {exc}"
+        ) from exc
 
-def _render_path_chip(path: str, *, key: str) -> bool:
+    if isinstance(payload, dict) and payload.get("error"):
+        raise PickerUnavailable(str(payload["error"]))
+    if not isinstance(payload, list):
+        raise PickerUnavailable("unexpected response from the file dialog")
+    return tuple(str(p) for p in payload if p)
+
+
+# All picker buttons mutate state via ``on_click`` callbacks (which run
+# before the script body) instead of ``st.rerun()`` mid-script — an aborted
+# run makes Streamlit drop the session state of every widget further down
+# the page that didn't get to render.
+
+
+def _browse_cb(
+    key: str,
+    title: str,
+    file_types: Sequence[tuple[str, str]],
+    initial_dir: str | None,
+    multi: bool,
+) -> None:
+    """Open the OS dialog and store the selection under ``key``.
+
+    A dialog that cannot open is a normal condition on a remote or headless
+    server, not a bug — it records the reason and lets the caller offer the
+    manual path box, rather than tearing the page down with a traceback.
+    """
+    st.session_state.pop(_PICKER_ERROR_KEY, None)
+    try:
+        picked = _open_tk_picker(
+            title, file_types=file_types, initial_dir=initial_dir, multi=multi
+        )
+    except PickerUnavailable as exc:
+        st.session_state[_PICKER_ERROR_KEY] = str(exc)
+        return
+    if not picked:
+        return
+    if multi:
+        existing = list(st.session_state.get(key) or [])
+        for new_path in picked:
+            if new_path and new_path not in existing:
+                existing.append(new_path)
+        st.session_state[key] = existing
+    else:
+        st.session_state[key] = picked[0]
+
+
+def _clear_path_cb(key: str) -> None:
+    st.session_state.pop(key, None)
+
+
+def _manual_path_cb(key: str, widget_key: str, multi: bool) -> None:
+    """Accept a typed path as if it had come from the dialog."""
+    raw = (st.session_state.get(widget_key) or "").strip().strip('"')
+    if not raw:
+        return
+    if multi:
+        existing = list(st.session_state.get(key) or [])
+        if raw not in existing:
+            existing.append(raw)
+        st.session_state[key] = existing
+    else:
+        st.session_state[key] = raw
+    st.session_state[widget_key] = ""
+
+
+def _render_manual_fallback(key: str, *, widget_key: str, multi: bool) -> None:
+    """Path text box shown only after the native dialog has failed.
+
+    Kept out of the way until it is needed: on a normal local run the dialog
+    works and an always-visible path box is just clutter.
+    """
+    reason = st.session_state.get(_PICKER_ERROR_KEY)
+    if not reason:
+        return
+    st.warning(
+        f"The native file dialog could not open ({reason}). "
+        "Paste a full path instead — this happens when the app is served "
+        "from a machine other than the one you are browsing from."
+    )
+    col_in, col_add = st.columns([5, 1])
+    with col_in:
+        st.text_input(
+            "Full path to the file",
+            key=widget_key,
+            label_visibility="collapsed",
+            placeholder=r"C:\path\to\file.gpkg",
+        )
+    with col_add:
+        st.button(
+            "Add",
+            key=f"{widget_key}__add",
+            width="stretch",
+            on_click=_manual_path_cb,
+            args=(key, widget_key, multi),
+        )
+
+
+def _remove_path_cb(key: str, path: str) -> None:
+    st.session_state[key] = [p for p in (st.session_state.get(key) or []) if p != path]
+
+
+def _move_path_cb(key: str, path: str, delta: int) -> None:
+    lst = list(st.session_state.get(key) or [])
+    if path not in lst:
+        return
+    i = lst.index(path)
+    j = i + delta
+    if 0 <= j < len(lst):
+        lst[i], lst[j] = lst[j], lst[i]
+        st.session_state[key] = lst
+
+
+def _render_path_chip(path: str, *, key: str, on_remove, args: tuple) -> None:
     """Render one bordered chip for ``path`` with a red ✕ remove button.
 
-    Returns ``True`` when the user clicked the remove button so the caller
-    can drop the entry from its session-state list and trigger a rerun.
     The chip shows the basename in bold (with the full absolute path as a
     native hover tooltip via ``help=``) and reports missing files inline.
+    ``on_remove`` runs as the ✕ button's callback.
     """
     with st.container(border=True):
         row_main, row_rm = st.columns([10, 1])
@@ -127,13 +301,13 @@ def _render_path_chip(path: str, *, key: str) -> bool:
             else:
                 st.warning(f"⚠️ **{base}** — file no longer exists at `{path}`")
         with row_rm:
-            return bool(
-                st.button(
-                    "❌",
-                    key=key,
-                    help="Remove this file",
-                    width="stretch",
-                )
+            st.button(
+                "❌",
+                key=key,
+                help="Remove this file",
+                width="stretch",
+                on_click=on_remove,
+                args=args,
             )
 
 
@@ -152,23 +326,20 @@ def pick_file_path(
     path; the chip with a ✕ remove button renders **below** the button row
     so the layout stays tight. Returns the current selection or ``None``.
     """
-    if st.button(
+    st.button(
         f"📂 {label}",
         key=f"{key}__btn",
         help=help_text,
-    ):
-        picked = _open_tk_picker(
-            label, file_types=file_types, initial_dir=initial_dir, multi=False
-        )
-        if picked:
-            st.session_state[key] = picked[0]
-            st.rerun()
+        on_click=_browse_cb,
+        args=(key, label, file_types, initial_dir, False),
+    )
+    _render_manual_fallback(key, widget_key=f"{key}__manual", multi=False)
 
     current = st.session_state.get(key) or None
     if current:
-        if _render_path_chip(current, key=f"{key}__rm"):
-            st.session_state.pop(key, None)
-            st.rerun()
+        _render_path_chip(
+            current, key=f"{key}__rm", on_remove=_clear_path_cb, args=(key,)
+        )
     return current
 
 
@@ -187,38 +358,20 @@ def pick_multiple_paths(
     Each kept path renders as its own bordered chip below the button with
     a red ✕ remove button beside it; clicking ✕ drops just that entry.
     """
-    if st.button(
+    st.button(
         f"📂 {label}",
         key=f"{key}__btn",
         help=help_text,
-    ):
-        picked = _open_tk_picker(
-            label, file_types=file_types, initial_dir=initial_dir, multi=True
-        )
-        if picked:
-            existing = list(st.session_state.get(key) or [])
-            for new_path in picked:
-                if new_path and new_path not in existing:
-                    existing.append(new_path)
-            st.session_state[key] = existing
-            st.rerun()
+        on_click=_browse_cb,
+        args=(key, label, file_types, initial_dir, True),
+    )
+    _render_manual_fallback(key, widget_key=f"{key}__manual", multi=True)
 
     current: list[str] = list(st.session_state.get(key) or [])
-    if not current:
-        return current
-
-    # Build a removal list rather than mutating during the render loop —
-    # Streamlit reruns on each button press so we'd otherwise drop one item
-    # per click instead of just the one the user actually clicked.
-    to_remove: list[int] = []
     for idx, p in enumerate(current):
-        if _render_path_chip(p, key=f"{key}__rm_{idx}"):
-            to_remove.append(idx)
-    if to_remove:
-        st.session_state[key] = [
-            p for i, p in enumerate(current) if i not in set(to_remove)
-        ]
-        st.rerun()
+        _render_path_chip(
+            p, key=f"{key}__rm_{idx}", on_remove=_remove_path_cb, args=(key, p)
+        )
     return current
 
 
@@ -250,29 +403,19 @@ def pick_ordered_files(
     order reflects the user's reordering — the first entry is treated as
     the baseline by callers.
     """
-    if st.button(
+    st.button(
         f"📂 {label}",
         key=f"{key}__btn",
         help=help_text,
-    ):
-        picked = _open_tk_picker(
-            label, file_types=file_types, initial_dir=initial_dir, multi=True
-        )
-        if picked:
-            existing = list(st.session_state.get(key) or [])
-            for new_path in picked:
-                if new_path and new_path not in existing:
-                    existing.append(new_path)
-            st.session_state[key] = existing
-            st.rerun()
+        on_click=_browse_cb,
+        args=(key, label, file_types, initial_dir, True),
+    )
+    _render_manual_fallback(key, widget_key=f"{key}__manual", multi=True)
 
     current: list[str] = list(st.session_state.get(key) or [])
     if not current:
         return []
 
-    move_up: int | None = None
-    move_down: int | None = None
-    to_remove: int | None = None
     for idx, path in enumerate(current):
         wid = path_to_widget_id(path)
         label_widget_key = f"{key}__label__{wid}"
@@ -289,31 +432,34 @@ def pick_ordered_files(
             with c_idx:
                 st.markdown(f"**#{idx + 1}**", help=f"{path}")
             with c_up:
-                if st.button(
+                st.button(
                     "▲",
                     key=f"{key}__up__{wid}",
                     help="Move up",
                     width="stretch",
                     disabled=(idx == 0),
-                ):
-                    move_up = idx
+                    on_click=_move_path_cb,
+                    args=(key, path, -1),
+                )
             with c_dn:
-                if st.button(
+                st.button(
                     "▼",
                     key=f"{key}__dn__{wid}",
                     help="Move down",
                     width="stretch",
                     disabled=(idx == len(current) - 1),
-                ):
-                    move_down = idx
+                    on_click=_move_path_cb,
+                    args=(key, path, 1),
+                )
             with c_rm:
-                if st.button(
+                st.button(
                     "❌",
                     key=f"{key}__rm__{wid}",
                     help="Remove this file",
                     width="stretch",
-                ):
-                    to_remove = idx
+                    on_click=_remove_path_cb,
+                    args=(key, path),
+                )
             if missing:
                 st.warning(f"⚠️ File no longer exists at `{path}`")
             st.text_input(
@@ -323,26 +469,6 @@ def pick_ordered_files(
                 help=f"{base}\n\n{path}",
                 placeholder=base,
             )
-    if to_remove is not None:
-        new_list = [p for i, p in enumerate(current) if i != to_remove]
-        st.session_state[key] = new_list
-        st.rerun()
-    if move_up is not None and move_up > 0:
-        new_list = list(current)
-        new_list[move_up - 1], new_list[move_up] = (
-            new_list[move_up],
-            new_list[move_up - 1],
-        )
-        st.session_state[key] = new_list
-        st.rerun()
-    if move_down is not None and move_down < len(current) - 1:
-        new_list = list(current)
-        new_list[move_down + 1], new_list[move_down] = (
-            new_list[move_down],
-            new_list[move_down + 1],
-        )
-        st.session_state[key] = new_list
-        st.rerun()
 
     out: list[dict] = []
     for path in current:

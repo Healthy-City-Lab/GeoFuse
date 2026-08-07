@@ -26,6 +26,7 @@ from services import (
     open_path_in_default_editor,
 )
 
+from geofuse.jobs import job_ui_refresh_s
 from geofuse.logger import get_job_log_lines, get_job_log_path
 
 _ACTIVE = {"queued", "running"}
@@ -35,6 +36,7 @@ _EMOJI = {
     "ndvi": "🛰️",
     "ndvi_column": "🛰️",
     "gvi": "🌳",
+    "gvi_column": "🌳",
 }
 _TERMINAL_LABELS = {
     "completed": "✅ Completed",
@@ -43,8 +45,32 @@ _TERMINAL_LABELS = {
     "error": "❌ Error",
 }
 
-_RESTART_ELIGIBLE_TYPES = {"gvi", "ndvi", "ndvi_column", "fusion"}
-_RESTART_ELIGIBLE_STATUSES = {"interrupted", "cancelled", "error"}
+_RESTART_ELIGIBLE_TYPES = {"gvi", "gvi_column", "ndvi", "ndvi_column", "fusion"}
+_RESTART_ELIGIBLE_STATUSES = {"interrupted", "cancelled", "error", "completed"}
+
+# Job id whose re-run is awaiting confirmation on its own card.
+_RESTART_ARM_KEY = "_restart_arm_job_id"
+
+
+def _render_restart_confirm(rec) -> None:
+    """In-card confirmation for a re-run, mirroring the cache-purge prompt."""
+    if rec.type == "fusion":
+        st.info(
+            "Load this job's settings into the Fusion setup form? Anything "
+            "already filled in there is replaced."
+        )
+    else:
+        st.warning(f"Restart **{rec.name or rec.id}** with its original settings?")
+    c1, c2 = st.columns(2)
+    if c1.button(
+        "Yes, re-run", key=f"restart_yes_{rec.id}", type="primary", width="stretch"
+    ):
+        st.session_state[RESTART_SESSION_KEY] = rec.id
+        st.session_state.pop(_RESTART_ARM_KEY, None)
+        st.rerun(scope="app")
+    if c2.button("Cancel", key=f"restart_no_{rec.id}", width="stretch"):
+        st.session_state.pop(_RESTART_ARM_KEY, None)
+        st.rerun(scope="app")
 
 
 def _fusion_results_bundle_path(rec) -> str | None:
@@ -139,9 +165,18 @@ def _fmt_timestamp(iso: str) -> str:
 def _render_details(rec) -> None:
     """Key/value summary of job parameters inside the Details expander."""
     p = rec.params or {}
-    if rec.type == "gvi":
+    if p.get("merged"):
+        srcs = p.get("source_files") or []
+        st.write(f"**Merged from {len(srcs)} files:** {', '.join(srcs)}")
+    if rec.type in ("gvi", "gvi_column"):
         st.write(f"**Grid step:** {p.get('step', '?')} m")
         st.write(f"**Buffer:** {p.get('buffer', '?')} m")
+        if rec.type == "gvi_column":
+            max_diff = p.get("max_year_diff")
+            st.write(
+                f"**Per year** from column `{p.get('date_column', '?')}`"
+                + (f" (±{max_diff} yr max)" if max_diff is not None else "")
+            )
         st.write(
             f"**Save panos / masks:** "
             f"{bool(p.get('save_panos'))} / {bool(p.get('save_masks'))}"
@@ -166,9 +201,11 @@ def _render_details(rec) -> None:
                 f"(window ±{p.get('window_days', '?')} d)"
             )
         elif mode == "column":
+            sm = p.get("season_start_month")
+            em = p.get("season_end_month")
+            season = f"months {sm}–{em}" if sm and em else "?"
             st.write(
-                f"**Date column:** {p.get('date_column', '?')} "
-                f"(window ±{p.get('window_days', '?')} d)"
+                f"**Year column:** {p.get('date_column', '?')} " f"(per year, {season})"
             )
         st.write(f"**Cloud max:** {p.get('cloud_pct', '?')}%")
         st.write(f"**Resolution:** {p.get('resolution', '?')} m")
@@ -195,6 +232,11 @@ def _render_details(rec) -> None:
 
         st.write(
             f"**Covariates:** {', '.join(_cov_disp(c) for c in covs) if covs else '—'}"
+        )
+        mods = p.get("moderator_columns") or []
+        st.write(
+            f"**Effect modifiers:** "
+            f"{', '.join(f'`{m}`' for m in mods) if mods else '—'}"
         )
         standalones = p.get("standalone_channels") or []
         _ch_disp = {"veg": "Vegetation", "terrain": "Terrain", "ndvi": "NDVI"}
@@ -244,14 +286,82 @@ def _render_stage_ledger(rec) -> None:
         "error",
     }
     with st.expander(f"Stages ({done_count}/{total})", expanded=expanded):
+        # Group multi-outcome ledgers by their "<label>::" key prefix. Finished
+        # or not-yet-started outcomes collapse to one summary line and only the
+        # active outcome shows per-stage detail — a 10-outcome run renders a
+        # handful of lines per tick instead of ~110, which is what makes the
+        # foreground monitor cheap.
+        groups: dict[str | None, list] = {}
+        order: list[str | None] = []
         for s in stages:
-            icon = _STAGE_ICONS.get(s.get("status", "pending"), "⬜")
-            label = s.get("label") or s.get("key", "")
-            msg = s.get("message") or ""
-            line = f"{icon} {label}"
-            if msg:
-                line += f" — _{msg}_"
-            st.markdown(line)
+            key = s.get("key", "")
+            label = key.split("::", 1)[0] if "::" in key else None
+            if label not in groups:
+                groups[label] = []
+                order.append(label)
+            groups[label].append(s)
+
+        multi = any(label is not None for label in order)
+        for label in order:
+            grp = groups[label]
+            if not multi:
+                for s in grp:
+                    _render_stage_line(s)
+                continue
+            g_done = sum(1 for s in grp if s.get("status") in _STAGE_FINISHED)
+            g_total = len(grp)
+            g_running = any(s.get("status") == "running" for s in grp)
+            g_active = g_running or (0 < g_done < g_total)
+            if not g_active:
+                icon = "✅" if g_done == g_total else "⬜"
+                st.markdown(f"{icon} **{label}** — {g_done}/{g_total} stages")
+            else:
+                st.markdown(f"**{label}** — {g_done}/{g_total} stages")
+                for s in grp:
+                    _render_stage_line(s)
+
+
+def _stage_duration_label(s: dict) -> str:
+    """Compact elapsed time for a stage, or "" when it was never timed.
+
+    A running stage counts up to now; records written before stages carried
+    timestamps have none, and simply show nothing.
+    """
+    start = s.get("started_at")
+    if start is None:
+        return ""
+    end = s.get("ended_at")
+    if end is None:
+        if s.get("status") != "running":
+            return ""
+        end = datetime.now(UTC).timestamp()
+    secs = max(0.0, float(end) - float(start))
+    if secs < 90:
+        return f"{secs:.0f}s"
+    if secs < 5400:
+        return f"{secs / 60:.1f}m"
+    return f"{secs / 3600:.1f}h"
+
+
+def _render_stage_line(s: dict) -> None:
+    """Render one ledger stage as an icon + label (+ elapsed, + message)."""
+    icon = _STAGE_ICONS.get(s.get("status", "pending"), "⬜")
+    label = s.get("label") or s.get("key", "")
+    msg = s.get("message") or ""
+    line = f"{icon} {label}"
+    took = _stage_duration_label(s)
+    if took:
+        line += f" · `{took}`"
+    if msg:
+        line += f" — _{msg}_"
+    st.markdown(line)
+
+
+# Cache the ANSI→HTML conversion of a job's log tail so the per-second-ish
+# fragment rerun doesn't re-run the regex over ~100 lines every tick. Keyed on
+# (job id, line count, last line) — the tail only grows, so that triple changes
+# exactly when the rendered HTML would. One entry per job (process-wide).
+_LOG_HTML_CACHE: dict[str, tuple[tuple[int, str], str]] = {}
 
 
 def _render_logs(rec_id: str) -> None:
@@ -260,7 +370,12 @@ def _render_logs(rec_id: str) -> None:
     if not lines:
         st.caption("(no log output captured yet)")
         return
-    st.markdown(ansi_log_lines_to_html(lines), unsafe_allow_html=True)
+    cache_key = (len(lines), lines[-1])
+    cached = _LOG_HTML_CACHE.get(rec_id)
+    if cached is None or cached[0] != cache_key:
+        cached = (cache_key, ansi_log_lines_to_html(lines))
+        _LOG_HTML_CACHE[rec_id] = cached
+    st.markdown(cached[1], unsafe_allow_html=True)
 
 
 def _render_job_card(rec, store) -> None:
@@ -273,9 +388,24 @@ def _render_job_card(rec, store) -> None:
 
         if rec.status in _TERMINAL:
             label = _TERMINAL_LABELS.get(rec.status, rec.status.capitalize())
+        elif rec.pause_event.is_set():
+            label = f"⏸️ Paused — {rec.status_text or 'holding'}"
         else:
             label = rec.status_text or rec.status.capitalize()
         st.caption(label)
+
+        # Workload scale: how many points in total, and how they split by year.
+        total_points = rec.extra.get("total_points")
+        if total_points:
+            st.caption(f"**{int(total_points):,}** sampling points total")
+            breakdown = rec.extra.get("point_breakdown") or []
+            if len(breakdown) > 1:
+                st.caption(
+                    "Per year — "
+                    + " · ".join(
+                        f"**{b['label']}**: {int(b['points']):,}" for b in breakdown
+                    )
+                )
 
         bracket = rec.extra.get("ndvi_tile_bracket")
         if rec.type in ("ndvi", "ndvi_column") and bracket:
@@ -342,18 +472,45 @@ def _render_job_card(rec, store) -> None:
                 st.code(error_detail or rec.error)
 
         if rec.status in _ACTIVE:
-            st.button(
-                "Cancel",
-                key=f"cancel_{rec.id}",
-                on_click=store.request_cancel,
-                args=(rec.id,),
-            )
+            pause_col, cancel_col = st.columns(2, gap="small")
+            paused = rec.pause_event.is_set()
+            with pause_col:
+                if paused:
+                    st.button(
+                        "Resume",
+                        key=f"resume_{rec.id}",
+                        on_click=store.request_resume,
+                        args=(rec.id,),
+                        width="stretch",
+                        type="primary",
+                        help="Continue from where it paused — nothing queued is lost.",
+                    )
+                else:
+                    st.button(
+                        "Pause",
+                        key=f"pause_{rec.id}",
+                        on_click=store.request_pause,
+                        args=(rec.id,),
+                        width="stretch",
+                        help=(
+                            "Hold at the next safe point. Work already queued is "
+                            "kept and continues on resume."
+                        ),
+                    )
+            with cancel_col:
+                st.button(
+                    "Cancel",
+                    key=f"cancel_{rec.id}",
+                    on_click=store.request_cancel,
+                    args=(rec.id,),
+                    width="stretch",
+                )
         else:
             restart_eligible = (
                 rec.type in _RESTART_ELIGIBLE_TYPES
                 and rec.status in _RESTART_ELIGIBLE_STATUSES
             )
-            btn_cols = st.columns(2, gap="medium")
+            btn_cols = st.columns(2, gap="small")
             if restart_eligible:
                 restart_col, dismiss_col = btn_cols[0], btn_cols[1]
             else:
@@ -364,10 +521,14 @@ def _render_job_card(rec, store) -> None:
                         "🔄",
                         key=f"restart_{rec.id}",
                         width="stretch",
-                        help="Restart — re-upload the original input geometry.",
+                        help=(
+                            "Re-run — load this job's settings into the setup " "form."
+                            if rec.type == "fusion"
+                            else "Restart — resume from where this job stopped."
+                        ),
                     ):
-                        st.session_state[RESTART_SESSION_KEY] = rec.id
-                        st.rerun()
+                        st.session_state[_RESTART_ARM_KEY] = rec.id
+                        st.rerun(scope="app")
             with dismiss_col:
                 st.button(
                     "🗑️",
@@ -378,17 +539,26 @@ def _render_job_card(rec, store) -> None:
                     help="Dismiss — remove this job from history.",
                 )
 
+            if st.session_state.get(_RESTART_ARM_KEY) == rec.id:
+                _render_restart_confirm(rec)
+
 
 def render_sidebar_job_monitor() -> None:
     """Render the all-jobs monitor inside ``st.sidebar``.
 
     Pulls every record from the shared :class:`JobStore` and renders one
-    card per job. The fragment reruns once per second to pick up
-    in-flight progress updates without forcing a full page rerun.
+    card per job. Each rerun re-renders every card (regex over each job's log
+    tail included), so this foreground work competes with running jobs when the
+    tab is visible. The refresh interval therefore matches the active engines'
+    backend cadence via :func:`job_ui_refresh_s` — e.g. 15 s while only a GVI
+    job runs, faster when a more frequent engine is active — so the monitor
+    never refreshes faster than there is progress to show.
     """
     store = get_job_store()
+    active_types = {r.type for r in store.list_all() if r.status in _ACTIVE}
+    refresh_s = job_ui_refresh_s(active_types)
 
-    @st.fragment(run_every=1)
+    @st.fragment(run_every=refresh_s)
     def _fragment():
         st.header("Job Monitor")
 

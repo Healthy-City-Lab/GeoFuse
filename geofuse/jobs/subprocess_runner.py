@@ -1,36 +1,75 @@
-"""Shared scaffold for engines that run inside a ``multiprocessing.spawn`` child.
+"""Subprocess scaffold and the per-engine child entry points.
 
-GVI and NDVI both isolate their long-running work in a separate Python process
-so EE downloads / zip decode / GPU inference don't share the GIL with the
-Streamlit UI. Both engines speak the same wire protocol on the parent ↔ child
-``mp.Queue`` and use the same per-job logger replumbing trick, so all that
-shared infrastructure lives here. The per-engine modules
-(:mod:`geofuse.jobs.gvi_subprocess`, :mod:`geofuse.jobs.ndvi_subprocess`)
-only define the child entry point and any engine-specific setup (e.g.
-re-opening a cross-process SQLite cache).
+Every engine job runs in a fresh ``multiprocessing.spawn`` process. This module
+holds both halves of that arrangement, because they are one protocol:
 
-Message protocol
-----------------
-The child pushes tuples onto a ``multiprocessing.Queue`` provided by the
-parent. The first element is a string tag from the ``MSG_*`` constants:
+* the scaffold — the ``MSG_*`` message vocabulary, :class:`SubprocJobContext`
+  (the child's stand-in for ``JobContext``), stdout/stderr and engine-log
+  routing into the event queue, :func:`exit_with_parent`, and
+  :func:`drain_events_until_done`, which the parent's watcher thread runs;
+* the child entry points — ``run_gvi_child``, ``run_gvi_column_child``,
+  ``run_ndvi_child``, ``run_ndvi_column_child``, ``run_fusion_child`` — each a
+  thin adapter that rebuilds the context in the child and calls the matching
+  ``geofuse.jobs.runners`` callable.
 
-    (MSG_PROGRESS,  value: float | None, status_text: str | None, extras: dict)
-    (MSG_HEARTBEAT,)
-    (MSG_SET_EXTRA, extras: dict)
-    (MSG_LOG,       colored_line: str,  plain_line: str)
-    (MSG_COMPLETE,  output_paths: list[str])
-    (MSG_ERROR,     short_msg: str,     traceback_text: str)
+The entry points keep their engine imports *inside* the function body: this
+module is imported in every pre-aggregation worker (for ``exit_with_parent``),
+and those workers must not pay for torch or GDAL.
 """
 
 from __future__ import annotations
 
-# Message tags (kept as short strings for legibility in queue dumps / logs)
+import multiprocessing as mp
+import os
+import threading
+import time
+import traceback
+
 MSG_PROGRESS = "progress"
 MSG_HEARTBEAT = "heartbeat"
 MSG_SET_EXTRA = "set_extra"
+MSG_STAGE_LEDGER = "stage_ledger"
 MSG_LOG = "log"
 MSG_COMPLETE = "complete"
 MSG_ERROR = "error"
+
+# Name of the daemon thread installed by :func:`exit_with_parent`.
+_PARENT_GUARD_THREAD = "parent-exit-guard"
+
+
+def exit_with_parent() -> None:
+    """Bind this child's lifetime to its parent's.
+
+    A child outlives its parent whenever the parent goes away without running
+    its own shutdown — a force-kill from Task Manager, a closed terminal, a
+    crash. Nothing reaps it afterwards, so an engine child holding tens of
+    gigabytes stays resident, and its commit charge stays against the page
+    file, until the machine reboots.
+
+    ``parent_process().join()`` waits on the sentinel handle the spawn child
+    already owns and returns the moment the parent goes, however it goes. The
+    wait runs on its own daemon thread, so it still fires while the main
+    thread sits inside a long uninterruptible call (a BLAS solve, a
+    ``statsmodels`` refit). ``os._exit`` skips interpreter teardown on
+    purpose: the parent that would have received a clean shutdown is already
+    gone, and the artifacts on disk are whatever the last completed stage
+    wrote.
+
+    Idempotent per process and a no-op when there is no parent (a child run
+    directly, or in-process tests).
+    """
+    parent = mp.parent_process()
+    if parent is None:
+        return
+    for t in threading.enumerate():
+        if t.name == _PARENT_GUARD_THREAD:
+            return
+
+    def _wait() -> None:
+        parent.join()
+        os._exit(1)
+
+    threading.Thread(target=_wait, daemon=True, name=_PARENT_GUARD_THREAD).start()
 
 
 class SubprocJobContext:
@@ -44,10 +83,11 @@ class SubprocJobContext:
     thread on the parent side can apply them to the real ``JobStore``.
     """
 
-    def __init__(self, job_id, event_queue, cancel_event) -> None:
+    def __init__(self, job_id, event_queue, cancel_event, pause_event=None) -> None:
         self.job_id = job_id
         self._queue = event_queue
         self._cancel_event = cancel_event
+        self._pause_event = pause_event
 
     def progress(
         self, value: float | None = None, status_text: str | None = None, **extras
@@ -60,8 +100,27 @@ class SubprocJobContext:
     def set_extra(self, **extras) -> None:
         self._queue.put((MSG_SET_EXTRA, dict(extras)))
 
+    def update_stage_ledger(self, ledger: dict) -> None:
+        """Forward the staged-resume ledger to the parent (see stage_ledger)."""
+        self._queue.put((MSG_STAGE_LEDGER, ledger))
+
     def is_cancelled(self) -> bool:
         return bool(self._cancel_event.is_set())
+
+    def is_paused(self) -> bool:
+        return bool(self._pause_event is not None and self._pause_event.is_set())
+
+    def wait_while_paused(self, poll_s: float = 0.25) -> None:
+        """Block at a safe point while the job is paused.
+
+        Returns once resumed or cancelled. Work already queued is untouched,
+        so the caller resumes with the next item and nothing is skipped.
+        """
+        if self._pause_event is None:
+            return
+        while self._pause_event.is_set() and not self._cancel_event.is_set():
+            self.heartbeat()
+            time.sleep(poll_s)
 
 
 class _QueueStreamWriter:
@@ -221,6 +280,7 @@ def drain_events_until_done(
 
     Dispatches each message to its parent-side effect:
       * ``MSG_PROGRESS`` / ``MSG_SET_EXTRA`` → ``store.update_progress(...)``
+      * ``MSG_STAGE_LEDGER``                 → ``store.update_stage_ledger(...)``
       * ``MSG_HEARTBEAT``                    → ``store.heartbeat(...)``
       * ``MSG_LOG``                          → forward the pre-formatted line
         into :data:`geofuse.logger._log_queue` so the same listener thread
@@ -278,6 +338,9 @@ def drain_events_until_done(
             _, extras = item
             if extras:
                 store.update_progress(job_id, **extras)
+        elif tag == MSG_STAGE_LEDGER:
+            _, ledger = item
+            store.update_stage_ledger(job_id, ledger)
         elif tag == MSG_LOG:
             _, colored, plain = item
             try:
@@ -289,3 +352,290 @@ def drain_events_until_done(
         elif tag == MSG_ERROR:
             return ("error", (item[1], item[2]))
         # Unknown tags are silently ignored — forward-compatibility hook.
+
+
+def run_gvi_child(
+    job_id: str,
+    fname: str,
+    dataset_data: dict,
+    init_args: dict,
+    run_args: dict,
+    output_dir: str,
+    save_geotiff: bool,
+    save_geojson: bool,
+    save_gpkg: bool,
+    pano_cache_db_path: str,
+    event_queue,
+    cancel_event,
+    pause_event=None,
+) -> None:
+    """Entry point invoked by ``multiprocessing.Process(target=...)``.
+
+    Imports heavy dependencies (torch, gvi engine) lazily so module-level
+    import of this file stays cheap. Runs the standard
+    :func:`geofuse.jobs.runners.run_gvi` against a :class:`SubprocJobContext`
+    so all progress / log / completion events flow through ``event_queue``.
+    Errors are caught and turned into ``MSG_ERROR`` messages so the parent
+    can apply them to the JobStore.
+    """
+    try:
+        exit_with_parent()
+
+        # Route engine log lines into the parent queue *before* the runner
+        # imports anything that might cache a logger closure.
+        route_engine_logging_to_queue(job_id, event_queue)
+
+        # Lazy: keep these out of module import path. The child re-imports
+        # the modules under spawn anyway; doing it here makes failures more
+        # local and lets us send them up as MSG_ERROR.
+        from geofuse.jobs.runners import run_gvi
+        from geofuse.persistence.caches import PanoCache
+
+        # The parent's PanoCache instance can't cross process boundaries, but
+        # the SQLite file behind it can. Open a fresh cache on the same path
+        # — WAL mode handles cross-process concurrency safely.
+        pano_cache = PanoCache(pano_cache_db_path)
+        dataset_data["cache_ref"] = pano_cache
+
+        ctx = SubprocJobContext(job_id, event_queue, cancel_event, pause_event)
+        gpu_lock = threading.Lock()  # per-process; the parent's lock doesn't apply here
+
+        result = run_gvi(
+            ctx,
+            fname=fname,
+            dataset_data=dataset_data,
+            init_args=init_args,
+            run_args=run_args,
+            output_dir=output_dir,
+            save_geotiff=save_geotiff,
+            save_geojson=save_geojson,
+            save_gpkg=save_gpkg,
+            gpu_lock=gpu_lock,
+        )
+
+        event_queue.put((MSG_COMPLETE, list(result.get("output_paths") or [])))
+
+    except BaseException as exc:  # noqa: BLE001 — surface ANY failure to parent
+        try:
+            event_queue.put(
+                (MSG_ERROR, f"{type(exc).__name__}: {exc}", traceback.format_exc())
+            )
+        except Exception:
+            pass
+
+
+def run_gvi_column_child(
+    job_id: str,
+    fname: str,
+    dataset_data: dict,
+    date_column: str,
+    init_args: dict,
+    run_args: dict,
+    output_dir: str,
+    save_geotiff: bool,
+    save_geojson: bool,
+    save_gpkg: bool,
+    pano_cache_db_path: str,
+    event_queue,
+    cancel_event,
+    pause_event=None,
+) -> None:
+    """Entry point for the per-year GVI column job. See :func:`run_gvi_child`."""
+    try:
+        exit_with_parent()
+        route_engine_logging_to_queue(job_id, event_queue)
+
+        from geofuse.jobs.runners import run_gvi_column
+        from geofuse.persistence.caches import PanoCache
+
+        pano_cache = PanoCache(pano_cache_db_path)
+        dataset_data["cache_ref"] = pano_cache
+
+        ctx = SubprocJobContext(job_id, event_queue, cancel_event, pause_event)
+        gpu_lock = threading.Lock()
+
+        result = run_gvi_column(
+            ctx,
+            fname=fname,
+            dataset_data=dataset_data,
+            date_column=date_column,
+            init_args=init_args,
+            run_args=run_args,
+            output_dir=output_dir,
+            save_geotiff=save_geotiff,
+            save_geojson=save_geojson,
+            save_gpkg=save_gpkg,
+            gpu_lock=gpu_lock,
+        )
+
+        event_queue.put((MSG_COMPLETE, list(result.get("output_paths") or [])))
+
+    except BaseException as exc:  # noqa: BLE001 — surface ANY failure to parent
+        try:
+            event_queue.put(
+                (MSG_ERROR, f"{type(exc).__name__}: {exc}", traceback.format_exc())
+            )
+        except Exception:
+            pass
+
+
+def run_ndvi_child(
+    job_id: str,
+    fname: str,
+    dataset_data: dict,
+    start_date: str,
+    end_date: str,
+    cloud_pct: int,
+    resolution: int,
+    buffer_m: int,
+    output_name: str,
+    output_dir: str,
+    save_geotiff: bool,
+    save_geojson: bool,
+    save_gpkg: bool,
+    save_cluster_tiles: bool,
+    satellite: str,
+    coverage_rescue: bool,
+    event_queue,
+    cancel_event,
+    pause_event=None,
+) -> None:
+    """Subprocess entry point for ``run_ndvi`` (single date range).
+
+    Imports the engine + runner lazily so the child's spawn path stays as
+    light as possible. All progress / log / completion events flow through
+    ``event_queue``; failures land as ``MSG_ERROR`` so the parent can apply
+    them to the JobStore.
+    """
+    try:
+        exit_with_parent()
+        route_engine_logging_to_queue(job_id, event_queue)
+
+        from geofuse.jobs.runners import run_ndvi
+
+        ctx = SubprocJobContext(job_id, event_queue, cancel_event, pause_event)
+        result = run_ndvi(
+            ctx,
+            fname=fname,
+            dataset_data=dataset_data,
+            start_date=start_date,
+            end_date=end_date,
+            cloud_pct=cloud_pct,
+            resolution=resolution,
+            buffer_m=buffer_m,
+            output_name=output_name,
+            output_dir=output_dir,
+            save_geotiff=save_geotiff,
+            save_geojson=save_geojson,
+            save_gpkg=save_gpkg,
+            save_cluster_tiles=save_cluster_tiles,
+            satellite=satellite,
+            coverage_rescue=coverage_rescue,
+        )
+        event_queue.put((MSG_COMPLETE, list(result.get("output_paths") or [])))
+
+    except BaseException as exc:  # noqa: BLE001
+        try:
+            event_queue.put(
+                (MSG_ERROR, f"{type(exc).__name__}: {exc}", traceback.format_exc())
+            )
+        except Exception:
+            pass
+
+
+def run_ndvi_column_child(
+    job_id: str,
+    fname: str,
+    dataset_data: dict,
+    date_column: str,
+    season_start_month: int,
+    season_end_month: int,
+    cloud_pct: int,
+    resolution: int,
+    buffer_m: int,
+    output_dir: str,
+    save_geotiff: bool,
+    save_geojson: bool,
+    save_gpkg: bool,
+    save_cluster_tiles: bool,
+    satellite: str,
+    coverage_rescue: bool,
+    event_queue,
+    cancel_event,
+    pause_event=None,
+) -> None:
+    """Subprocess entry point for ``run_ndvi_column`` (one raster per year)."""
+    try:
+        exit_with_parent()
+        route_engine_logging_to_queue(job_id, event_queue)
+
+        from geofuse.jobs.runners import run_ndvi_column
+
+        ctx = SubprocJobContext(job_id, event_queue, cancel_event, pause_event)
+        result = run_ndvi_column(
+            ctx,
+            fname=fname,
+            dataset_data=dataset_data,
+            date_column=date_column,
+            season_start_month=season_start_month,
+            season_end_month=season_end_month,
+            cloud_pct=cloud_pct,
+            resolution=resolution,
+            buffer_m=buffer_m,
+            output_dir=output_dir,
+            save_geotiff=save_geotiff,
+            save_geojson=save_geojson,
+            save_gpkg=save_gpkg,
+            save_cluster_tiles=save_cluster_tiles,
+            satellite=satellite,
+            coverage_rescue=coverage_rescue,
+        )
+        event_queue.put((MSG_COMPLETE, list(result.get("output_paths") or [])))
+
+    except BaseException as exc:  # noqa: BLE001
+        try:
+            event_queue.put(
+                (MSG_ERROR, f"{type(exc).__name__}: {exc}", traceback.format_exc())
+            )
+        except Exception:
+            pass
+
+
+def run_fusion_child(
+    job_id: str,
+    run_kwargs: dict,
+    event_queue,
+    cancel_event,
+    pause_event=None,
+) -> None:
+    """Entry point invoked by ``multiprocessing.Process(target=...)``.
+
+    Reroutes engine logs + stdout/stderr into the per-job log, then runs the
+    standard :func:`geofuse.jobs.runners.run_fusion` against a
+    :class:`SubprocJobContext` so progress / stage-ledger / log / completion
+    events flow through ``event_queue``. The fusion engine class is imported by
+    the runner itself, so nothing unpicklable has to cross the spawn boundary —
+    ``run_kwargs`` is the JSON-persisted run config. Any failure is caught and
+    turned into an ``MSG_ERROR`` so the parent can apply it to the JobStore.
+    """
+    try:
+        exit_with_parent()
+
+        # Route engine log lines + stdout/stderr into the parent queue before
+        # the runner imports anything that might cache a logger closure.
+        route_engine_logging_to_queue(job_id, event_queue)
+
+        from geofuse.jobs.runners import run_fusion
+
+        ctx = SubprocJobContext(job_id, event_queue, cancel_event, pause_event)
+        result = run_fusion(ctx, **run_kwargs)
+
+        event_queue.put((MSG_COMPLETE, list((result or {}).get("output_paths") or [])))
+
+    except BaseException as exc:  # noqa: BLE001 — surface ANY failure to parent
+        try:
+            event_queue.put(
+                (MSG_ERROR, f"{type(exc).__name__}: {exc}", traceback.format_exc())
+            )
+        except Exception:
+            pass

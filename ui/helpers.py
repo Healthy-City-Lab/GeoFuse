@@ -372,7 +372,260 @@ def load_vector_upload_sessions(
     return results
 
 
-# ─── Job Restart Workflow ───────────────────────────────────────────
+# ── File merging / grouping ─────────────────────────────────────────
+
+
+def sanitize_name_for_file(name: str) -> str:
+    """Make an arbitrary group name safe to use as an output filename stem."""
+    cleaned = "".join(c if (c.isalnum() or c in "-_ .") else "_" for c in str(name))
+    cleaned = cleaned.strip().replace(" ", "_").replace(".", "_")
+    return cleaned or "group"
+
+
+def merge_gdfs_wgs84(gdfs: Sequence[gpd.GeoDataFrame]) -> gpd.GeoDataFrame:
+    """Concatenate several vector layers into one GeoDataFrame in EPSG:4326.
+
+    Each input is reprojected to WGS84 first so layers in different CRSs
+    combine cleanly; the column set is the union across inputs (missing values
+    become NaN). Used to merge several uploaded files into a single job so,
+    e.g., every 2020 measurement across survey waves lands in one per-year
+    output.
+    """
+    from geofuse.crs_utils import reproject_geodataframe_to_wgs84
+
+    frames: list[gpd.GeoDataFrame] = []
+    for g in gdfs:
+        if g is None or len(g) == 0:
+            continue
+        gg = (
+            reproject_geodataframe_to_wgs84(g)
+            if g.crs is not None
+            else g.set_crs("EPSG:4326")
+        )
+        frames.append(gg)
+    if not frames:
+        return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+    return gpd.GeoDataFrame(pd.concat(frames, ignore_index=True), crs="EPSG:4326")
+
+
+def _grouping_fallback_table(input_fnames, groups, groups_key) -> None:
+    """Data-editor grouping used when the drag/drop component is unavailable."""
+    import streamlit as st
+
+    editor_df = pd.DataFrame(
+        {"File": list(input_fnames), "Group": [groups[f] for f in input_fnames]}
+    )
+    edited = st.data_editor(
+        editor_df,
+        hide_index=True,
+        use_container_width=True,
+        disabled=["File"],
+        column_config={
+            "Group": st.column_config.TextColumn(
+                "Group",
+                help="Files with the same Group name are merged into one job.",
+            )
+        },
+        key=f"{groups_key}_editor",
+    )
+    for _, row in edited.iterrows():
+        groups[str(row["File"])] = str(row["Group"]).strip() or "Group 1"
+
+
+def render_file_grouping_controls(
+    input_fnames: Sequence[str],
+    *,
+    run_mode_key: str,
+    groups_key: str,
+    help_text: str | None = None,
+) -> str:
+    """Render the Separate/Merge control and a drag-and-drop group organiser.
+
+    Returns ``"separate"`` or ``"merge"``. In merge mode,
+    ``st.session_state[groups_key]`` is updated to ``{fname: group_name}``:
+    files dragged into the same group are merged into one job by the caller.
+    You can add, rename, and remove groups. Falls back to an editable table if
+    the ``streamlit-sortables`` component isn't installed. Renders nothing and
+    returns ``"separate"`` for fewer than two files.
+    """
+    import streamlit as st
+
+    input_fnames = list(input_fnames)
+    if groups_key not in st.session_state:
+        st.session_state[groups_key] = {}
+    groups = st.session_state[groups_key]
+
+    if len(input_fnames) < 2:
+        # A single file is always its own job; keep the mapping tidy.
+        for fn in list(groups):
+            if fn not in input_fnames:
+                groups.pop(fn, None)
+        return "separate"
+
+    mode_label = st.radio(
+        "File handling",
+        ["Separate — one job per file", "Merge into groups"],
+        horizontal=True,
+        key=run_mode_key,
+        help=help_text
+        or (
+            "Separate runs each uploaded file as its own job. Merge combines "
+            "files dragged into the same group into a single job — handy when "
+            "the same year is split across several files (e.g. survey waves)."
+        ),
+    )
+    if not str(mode_label).startswith("Merge"):
+        return "separate"
+
+    # --- Group list (names) with add / rename / remove ---
+    names_key = f"{groups_key}__names"
+    names = st.session_state.get(names_key) or ["Group 1"]
+
+    add_col, cnt_col = st.columns([1, 3])
+    with add_col:
+        if st.button("➕ Add group", key=f"{groups_key}_add", width="stretch"):
+            names = names + [f"Group {len(names) + 1}"]
+            st.session_state[names_key] = names
+            st.rerun()
+    with cnt_col:
+        st.caption(
+            "Rename a group in its box; drag files between groups below. "
+            "Files in the same group are merged into one job."
+        )
+
+    name_cols = st.columns(len(names))
+    remove_idx = None
+    new_names: list[str] = []
+    for i, nm in enumerate(names):
+        with name_cols[i]:
+            edited = st.text_input(
+                f"Group {i + 1} name",
+                value=nm,
+                key=f"{groups_key}_name_{i}",
+                label_visibility="collapsed",
+            )
+            new_names.append((edited or "").strip() or f"Group {i + 1}")
+            if len(names) > 1 and st.button(
+                "🗑", key=f"{groups_key}_rm_{i}", help="Remove this group"
+            ):
+                remove_idx = i
+
+    # De-duplicate names so each group maps to a distinct output.
+    seen: dict[str, int] = {}
+    deduped: list[str] = []
+    for nm in new_names:
+        if nm in seen:
+            seen[nm] += 1
+            nm = f"{nm} ({seen[nm]})"
+        else:
+            seen[nm] = 0
+        deduped.append(nm)
+    names = deduped
+    st.session_state[names_key] = names
+
+    if remove_idx is not None:
+        removed = names.pop(remove_idx)
+        st.session_state[names_key] = names
+        for fn, g in list(groups.items()):
+            if g == removed:
+                groups[fn] = names[0]
+        # Clear per-group name widgets so they re-init cleanly after the shift.
+        for i in range(len(names) + 1):
+            st.session_state.pop(f"{groups_key}_name_{i}", None)
+        st.rerun()
+
+    # Reconcile assignments: drop removed files, default new ones to group 1.
+    for fn in list(groups):
+        if fn not in input_fnames:
+            groups.pop(fn, None)
+    for fn in input_fnames:
+        if groups.get(fn) not in names:
+            groups[fn] = names[0]
+
+    buckets = [
+        {"header": nm, "items": [fn for fn in input_fnames if groups.get(fn) == nm]}
+        for nm in names
+    ]
+
+    try:
+        from streamlit_sortables import sort_items
+
+        # Key on the group structure so add/rename/remove remount cleanly with
+        # the authoritative buckets, while plain drags keep a stable key.
+        sort_key = f"{groups_key}_sort_" + "|".join(names)
+        result = sort_items(
+            buckets,
+            multi_containers=True,
+            direction="horizontal",
+            key=sort_key,
+        )
+        moved: dict[str, str] = {}
+        for b in result or []:
+            for it in b.get("items", []):
+                moved[str(it)] = b.get("header")
+        for fn in input_fnames:
+            groups[fn] = moved.get(fn, groups.get(fn, names[0]))
+    except Exception:
+        st.caption(
+            "Drag-and-drop grouping needs the `streamlit-sortables` package "
+            "(add it and restart). Using an editable table instead."
+        )
+        _grouping_fallback_table(input_fnames, groups, groups_key)
+
+    n_used = len({groups[fn] for fn in input_fnames})
+    st.caption(f"→ {n_used} job(s) (configure each group's dates below).")
+    return "merge"
+
+
+# ── Form-state pinning ──────────────────────────────────────────────
+
+# Streamlit drops a widget's session-state entry at the end of any run in
+# which the widget did not render — including runs aborted mid-script by
+# ``st.rerun()`` or an exception before the form. Re-asserting the values
+# at the top of every run marks them as fresh API state, which the cleanup
+# pass never removes. Button and custom-component keys must not be
+# API-assigned, so they are skipped.
+_PIN_SKIP_EXACT: frozenset[str] = frozenset(
+    {
+        "fusion_results_clear",
+        "fusion_form_run_submit",
+        "fusion_export",
+        "fusion_reset",
+        "fusion_preview_map",
+    }
+)
+_PIN_SKIP_SUBSTRINGS: tuple[str, ...] = (
+    "outcome_remove_",
+    "__btn",
+    "__up__",
+    "__dn__",
+    "__rm",
+    "_sort_",
+)
+
+
+def pin_skips_key(key: str) -> bool:
+    """True when ``key`` must not be re-asserted (button / component state)."""
+    return key in _PIN_SKIP_EXACT or any(s in key for s in _PIN_SKIP_SUBSTRINGS)
+
+
+def pin_fusion_form_state() -> None:
+    """Keep the Fusion form's widget state alive across every rerun.
+
+    Call once at the very top of the main script, before any tab renders,
+    so the re-assertion happens even on runs that abort later.
+    """
+    import streamlit as st  # local import keeps helpers.py importable headless
+
+    for key in list(st.session_state.keys()):
+        if not isinstance(key, str) or not key.startswith("fusion_"):
+            continue
+        if pin_skips_key(key):
+            continue
+        st.session_state[key] = st.session_state[key]
+
+
+# ── Job Restart Workflow ────────────────────────────────────────────
 
 RESTART_SESSION_KEY = "_restart_job_id"
 

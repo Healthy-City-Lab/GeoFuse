@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from geofuse.logger import drop_job_log_buffer
-from geofuse.persistence.sqlite_utils import open_wal_connection
+from geofuse.persistence.caches import open_wal_connection
 
 _TERMINAL_STATUSES: frozenset[str] = frozenset(
     {"completed", "error", "cancelled", "interrupted"}
@@ -56,6 +56,12 @@ class JobRecord:
 
     # Runtime-only — never persisted.
     cancel_event: threading.Event = field(
+        default_factory=threading.Event, repr=False, compare=False
+    )
+    # Set while the job is paused. Workers block at safe points until it
+    # clears, so nothing queued is dropped. Runtime-only: a process restart
+    # reconciles running jobs to 'interrupted' anyway.
+    pause_event: threading.Event = field(
         default_factory=threading.Event, repr=False, compare=False
     )
     extra: dict = field(default_factory=dict, repr=False, compare=False)
@@ -128,9 +134,9 @@ class JobStore:
         )
         self._heartbeat.start()
 
-    # ------------------------------------------------------------------
+    # ────────────────────────────────────────────────────────────
     # Lifecycle
-    # ------------------------------------------------------------------
+    # ────────────────────────────────────────────────────────────
 
     def submit(self, type: str, params: dict, name: str = "") -> JobRecord:
         """Create a new ``queued`` job, persist it, return the live record."""
@@ -179,9 +185,9 @@ class JobStore:
             rec._dirty = False
             self._write_row(rec)
 
-    # ------------------------------------------------------------------
+    # ────────────────────────────────────────────────────────────
     # Hot path (no disk I/O)
-    # ------------------------------------------------------------------
+    # ────────────────────────────────────────────────────────────
 
     def update_progress(
         self,
@@ -228,9 +234,9 @@ class JobStore:
             rec.updated_at = _utc_now_iso()
             rec._dirty = True
 
-    # ------------------------------------------------------------------
+    # ────────────────────────────────────────────────────────────
     # Cancellation
-    # ------------------------------------------------------------------
+    # ────────────────────────────────────────────────────────────
 
     def request_cancel(self, job_id: str) -> None:
         with self._lock:
@@ -239,14 +245,33 @@ class JobStore:
                 return
             rec.cancel_event.set()
 
-    def is_cancel_requested(self, job_id: str) -> bool:
+    # ────────────────────────────────────────────────────────────
+    # Pause / resume
+    # ────────────────────────────────────────────────────────────
+
+    def request_pause(self, job_id: str) -> None:
+        """Ask a running job to hold at its next safe point."""
         with self._lock:
             rec = self._records.get(job_id)
-            return bool(rec and rec.cancel_event.is_set())
+            if rec is None:
+                return
+            rec.pause_event.set()
+            rec.status_text = "Paused"
+            rec._dirty = True
 
-    # ------------------------------------------------------------------
+    def request_resume(self, job_id: str) -> None:
+        """Release a paused job; queued work continues where it left off."""
+        with self._lock:
+            rec = self._records.get(job_id)
+            if rec is None:
+                return
+            rec.pause_event.clear()
+            rec.status_text = "Resuming..."
+            rec._dirty = True
+
+    # ────────────────────────────────────────────────────────────
     # Reads (return snapshots; safe to use without holding the lock)
-    # ------------------------------------------------------------------
+    # ────────────────────────────────────────────────────────────
 
     def get(self, job_id: str) -> JobRecord | None:
         with self._lock:
@@ -259,10 +284,6 @@ class JobStore:
     def list_active(self) -> list[JobRecord]:
         with self._lock:
             return [r for r in self._records.values() if r.status in _ACTIVE_STATUSES]
-
-    def list_terminal(self) -> list[JobRecord]:
-        with self._lock:
-            return [r for r in self._records.values() if r.status in _TERMINAL_STATUSES]
 
     def health(self, stuck_after_s: float = 30.0) -> dict:
         """Snapshot for the sidebar badge."""
@@ -312,14 +333,9 @@ class JobStore:
             "oldest_running_age_s": oldest_running_s,
         }
 
-    # ------------------------------------------------------------------
+    # ────────────────────────────────────────────────────────────
     # Cleanup
-    # ------------------------------------------------------------------
-
-    def dismiss(self, job_id: str) -> None:
-        """Drop from in-memory view. SQLite row stays for history."""
-        with self._lock:
-            self._records.pop(job_id, None)
+    # ────────────────────────────────────────────────────────────
 
     def purge(self, job_id: str) -> None:
         """Remove from both in-memory and SQLite, plus drop the log buffer."""
@@ -335,9 +351,9 @@ class JobStore:
         except RuntimeError:
             pass
 
-    # ------------------------------------------------------------------
+    # ────────────────────────────────────────────────────────────
     # Internals
-    # ------------------------------------------------------------------
+    # ────────────────────────────────────────────────────────────
 
     def _write_row(self, rec: JobRecord) -> None:
         """Caller must hold ``self._lock``."""

@@ -16,9 +16,17 @@ from __future__ import annotations
 
 import numpy as np
 
-# ---------------------------------------------------------------------------
+from geofuse import JobCancelled
+
+# Replicate stride between ``cancel_callback`` polls. The resample loops here
+# run tens of thousands of iterations, so polling every one would show up in
+# the timings; this keeps cancel latency to a fraction of a second on any
+# replicate cheap enough to be worth running.
+_CANCEL_POLL_EVERY = 64
+
+# ────────────────────────────────────────────────────────────────────
 # Multicollinearity diagnostics
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 
 def pairwise_pearson_matrix(X: np.ndarray) -> np.ndarray:
@@ -182,9 +190,9 @@ def iterative_vif_reduction(
     }
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Bootstrap CI
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 
 def bootstrap_score_ci(
@@ -197,6 +205,9 @@ def bootstrap_score_ci(
     method: str = "BCa",
     seed: int = 42,
     covariates: np.ndarray | None = None,
+    replicate_scorer_factory=None,
+    groups: np.ndarray | None = None,
+    cancel_callback=None,
 ) -> dict:
     """Bootstrap CI on ``score_fn(target, prediction)``.
 
@@ -229,6 +240,21 @@ def bootstrap_score_ci(
             every bootstrap iteration so the partial-correlation interpretation
             is preserved (covariates are a property of the observation, not the
             score). ``score_fn`` must accept the 3-arg form when this is set.
+        replicate_scorer_factory: optional
+            ``(t, p, cov) -> (callable(idx) -> float) | None`` called once with
+            the NaN-masked arrays. When it returns a scorer, every replicate
+            (and the BCa jackknife) is scored via ``scorer(index_vector)``
+            instead of ``score_fn`` — the O(n²) metrics use this to reuse
+            precomputed distance matrices per resample. The observed score
+            always comes from ``score_fn``. A ``None`` return keeps the generic
+            path.
+        groups: optional ``(n,)`` cluster label per row. When supplied the
+            bootstrap resamples **whole groups** with replacement (concatenating
+            each drawn group's rows) instead of individual rows, and the BCa
+            jackknife leaves one whole group out at a time. This is the correct
+            resample for panel data (repeated measures per entity): resampling
+            rows independently would break the within-group correlation and make
+            the CI too narrow. ``None`` keeps the row-level bootstrap (unchanged).
 
     Returns:
         Dict with ``observed``, ``mean``, ``lower``, ``upper``, ``ci_level``,
@@ -250,6 +276,15 @@ def bootstrap_score_ci(
                 f"got {cov_arr.shape[0]} vs {t.shape[0]}."
             )
 
+    grp_arr: np.ndarray | None = None
+    if groups is not None:
+        grp_arr = np.asarray(groups)
+        if grp_arr.shape[0] != t.shape[0]:
+            raise ValueError(
+                "groups length must match target/prediction length; "
+                f"got {grp_arr.shape[0]} vs {t.shape[0]}."
+            )
+
     mask = ~(np.isnan(t) | np.isnan(p))
     if cov_arr is not None:
         mask &= np.isfinite(cov_arr).all(axis=1)
@@ -257,6 +292,14 @@ def bootstrap_score_ci(
     p = p[mask]
     if cov_arr is not None:
         cov_arr = cov_arr[mask]
+
+    # Row-index lists per group (into the masked arrays) for cluster resampling.
+    group_row_indices: list[np.ndarray] | None = None
+    if grp_arr is not None:
+        grp_arr = grp_arr[mask]
+        _uniq, inv = np.unique(grp_arr, return_inverse=True)
+        group_row_indices = [np.where(inv == g)[0] for g in range(len(_uniq))]
+
     if len(t) < 3:
         return {
             "observed": float("nan"),
@@ -276,16 +319,42 @@ def bootstrap_score_ci(
         return float(score_fn(target_arr, pred_arr, sub))
 
     observed = _score(t, p, None)
+
+    # Optional index-vector fast path (precomputed distance matrices etc.).
+    replicate_scorer = None
+    if replicate_scorer_factory is not None:
+        try:
+            replicate_scorer = replicate_scorer_factory(t, p, cov_arr)
+        except Exception:
+            replicate_scorer = None
+
     rng = np.random.default_rng(seed)
     n = len(t)
     scores = np.empty(n_bootstrap, dtype=np.float64)
-    # One batched draw is bit-identical to per-replicate ``integers`` (row-major
-    # fill) but skips the per-iteration RNG-call overhead.
-    boot_idx = rng.integers(0, n, size=(n_bootstrap, n))
+    if group_row_indices is None:
+        # One batched draw is bit-identical to per-replicate ``integers``
+        # (row-major fill) but skips the per-iteration RNG-call overhead.
+        boot_idx = rng.integers(0, n, size=(n_bootstrap, n))
+        boot_groups = None
+    else:
+        # Cluster bootstrap: resample whole groups with replacement, then
+        # concatenate their rows into each replicate's index vector.
+        n_groups = len(group_row_indices)
+        boot_idx = None
+        boot_groups = rng.integers(0, n_groups, size=(n_bootstrap, n_groups))
     for i in range(n_bootstrap):
-        idx = boot_idx[i]
+        if cancel_callback is not None and i % _CANCEL_POLL_EVERY == 0:
+            if cancel_callback():
+                raise JobCancelled("Bootstrap CI cancelled by user.")
+        if group_row_indices is None:
+            idx = boot_idx[i]
+        else:
+            idx = np.concatenate([group_row_indices[g] for g in boot_groups[i]])
         try:
-            scores[i] = _score(t[idx], p[idx], idx)
+            if replicate_scorer is not None:
+                scores[i] = replicate_scorer(idx)
+            else:
+                scores[i] = _score(t[idx], p[idx], idx)
         except Exception:
             scores[i] = np.nan
 
@@ -313,23 +382,27 @@ def bootstrap_score_ci(
         prop_below = min(max(prop_below, 1e-6), 1.0 - 1e-6)
         z0 = float(_scistats.norm.ppf(prop_below))
 
-        # Acceleration: jackknife estimate of the score's skewness.
-        # Captures how the variance of the score depends on the data —
-        # without it, BCa collapses to a bias-corrected interval that
-        # under-covers when the score is skewed (correlation near ±1, etc.).
-        # Leave-one-out via a toggled boolean mask — same keep-set as
-        # ``np.delete`` per i, without rebuilding an index array each pass.
-        jack_scores = np.empty(n, dtype=np.float64)
+        # Acceleration: jackknife estimate of the score's skewness, without
+        # which BCa under-covers on a skewed score. Leave-one-out uses a toggled
+        # boolean mask; under cluster resampling the unit dropped is a whole
+        # group, matching the resampling design.
+        jack_units = group_row_indices if group_row_indices is not None else None
+        jack_n = n if jack_units is None else len(jack_units)
+        jack_scores = np.empty(jack_n, dtype=np.float64)
         base_idx = np.arange(n)
         keep_mask = np.ones(n, dtype=bool)
-        for i in range(n):
-            keep_mask[i] = False
+        for i in range(jack_n):
+            drop = np.array([i]) if jack_units is None else jack_units[i]
+            keep_mask[drop] = False
             keep = base_idx[keep_mask]
             try:
-                jack_scores[i] = _score(t[keep], p[keep], keep)
+                if replicate_scorer is not None:
+                    jack_scores[i] = replicate_scorer(keep)
+                else:
+                    jack_scores[i] = _score(t[keep], p[keep], keep)
             except Exception:
                 jack_scores[i] = np.nan
-            keep_mask[i] = True
+            keep_mask[drop] = True
         jack_valid = jack_scores[~np.isnan(jack_scores)]
         if len(jack_valid) >= 2:
             jack_mean = float(np.mean(jack_valid))
@@ -369,9 +442,9 @@ def bootstrap_score_ci(
     }
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Permutation significance
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 
 def permutation_pvalue(
@@ -383,6 +456,8 @@ def permutation_pvalue(
     n_perm: int = 2000,
     seed: int = 42,
     covariates: np.ndarray | None = None,
+    surrogate_scorer_factory=None,
+    cancel_callback=None,
 ) -> dict:
     """One-sided permutation p-value for ``score_fn(target, prediction)``.
 
@@ -397,6 +472,14 @@ def permutation_pvalue(
     so for metrics that condition on covariates nonlinearly it is an
     approximation. ``higher_is_better`` sets the tail; the report is the add-one
     smoothed fraction of null scores at least as extreme as the observed one.
+
+    ``surrogate_scorer_factory`` (optional, covariate case only):
+    ``(p, cov) -> (callable(t_star) -> float) | None`` called once with the
+    NaN-masked arrays. When it returns a scorer, each Freedman–Lane replicate
+    is scored via ``scorer(surrogate_target)`` — the prediction and covariate
+    sides stay fixed across all permutations, so the O(n²) metrics reuse their
+    precomputed U-centered matrices. The observed score always comes from
+    ``score_fn``; ``None`` keeps the generic path.
 
     Returns a dict with ``observed``, ``p_value``, ``n_perm`` (effective),
     ``null_mean``, and ``higher_is_better``.
@@ -448,12 +531,30 @@ def permutation_pvalue(
         t_fit = Xc @ beta
         t_res = t - t_fit
 
-        def _perm_score(idx: np.ndarray) -> float:
-            return float(score_fn(t_fit + t_res[idx], p, cov_arr))
+        surrogate_scorer = None
+        if surrogate_scorer_factory is not None:
+            try:
+                surrogate_scorer = surrogate_scorer_factory(p, cov_arr)
+            except Exception:
+                surrogate_scorer = None
+
+        if surrogate_scorer is not None:
+            _fast_scorer = surrogate_scorer
+
+            def _perm_score(idx: np.ndarray) -> float:
+                return float(_fast_scorer(t_fit + t_res[idx]))
+
+        else:
+
+            def _perm_score(idx: np.ndarray) -> float:
+                return float(score_fn(t_fit + t_res[idx], p, cov_arr))
 
     rng = np.random.default_rng(seed)
     null = np.empty(int(n_perm), dtype=np.float64)
     for i in range(int(n_perm)):
+        if cancel_callback is not None and i % _CANCEL_POLL_EVERY == 0:
+            if cancel_callback():
+                raise JobCancelled("Permutation test cancelled by user.")
         idx = rng.permutation(n)
         try:
             null[i] = _perm_score(idx)
@@ -478,9 +579,9 @@ def permutation_pvalue(
     }
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Multiple-comparison correction
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 
 def holm_bonferroni(pvalues) -> list[float]:
@@ -508,16 +609,20 @@ def holm_bonferroni(pvalues) -> list[float]:
     return out
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Stability-selection threshold calibration (Bodinier et al., 2023)
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
+
+
+# Selection-probability floor for the Bodinier threshold search: a cell must be
+# picked in more than half the resamples to be a candidate at all.
+_PI_MIN: float = 0.5
 
 
 def calibrate_stability_selection(
     per_resample_rankings: list,
     n_candidates: int,
     *,
-    pi_min: float = 0.5,
     max_pfer: float | None = 1.0,
 ) -> dict | None:
     """Automated calibration of the stability-selection threshold.
@@ -578,7 +683,7 @@ def calibrate_stability_selection(
         # contribute a 0, i.e. stably excluded under the null).
         h_vals = np.array(list(counts.values()), dtype=np.int64)
         gamma = min(1.0, K / N)
-        realized = sorted({h / B for h in h_vals if h / B > pi_min})
+        realized = sorted({h / B for h in h_vals if h / B > _PI_MIN})
         for pi in realized:
             hi = math.ceil(pi * B)
             lo = math.floor((1.0 - pi) * B)
@@ -616,7 +721,9 @@ def calibrate_stability_selection(
             ):
                 best = cand
     if best is not None:
-        best["pfer_controlled"] = True
+        # With no cap in force the bound is whatever the optimum happens to be,
+        # which can be as large as the candidate count — not error control.
+        best["pfer_controlled"] = max_pfer is not None
         return best
     if best_any is None:
         return None

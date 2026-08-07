@@ -22,22 +22,39 @@ import shutil
 import threading
 import time
 from collections.abc import Mapping
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any
 
 import geopandas as gpd
 import numpy as np
-import pandas as pd
 import rasterio
 
+from geofuse import JobCancelled, metric_intake
+from geofuse import pdcor as _pdcor_mod
 from geofuse.crs_utils import (
     default_geotiff_creation_options,
     raster_geographic_bounds,
     reproject_geodataframe_to_wgs84,
 )
 from geofuse.gvi import GVIEngine
-from geofuse.jobs import progress_interval_s
-from geofuse.jobs.stage_ledger import DONE, RUNNING, StageLedger
+from geofuse.jobs import (
+    GVI_PROGRESS_MIN_ITEMS,
+    GVI_PROGRESS_MIN_SECONDS,
+    ProgressThrottle,
+)
+from geofuse.jobs.fusion_outputs import (
+    _STANDALONE_CHANNEL_LABELS,
+    _build_fusion_ledger,
+    _compare_cgi_vs_standalone,
+    _direction_sign,
+    _fusion_stage_key,
+    _fusion_stage_weight,
+    _jsonsafe_results,
+    _log_stage_timing,
+    _stability_summary,
+    _write_fusion_outputs,
+)
+from geofuse.jobs.stage_ledger import DONE, RUNNING, SKIPPED
 from geofuse.logger import get_logger
 from geofuse.longitudinal import (
     GREENERY_CHANNELS,
@@ -46,21 +63,25 @@ from geofuse.longitudinal import MIXEDLM_METRICS as _LON_MIXEDLM_METRICS
 from geofuse.longitudinal import (
     LongitudinalSpec,
 )
+from geofuse.longitudinal import (
+    target_intake_columns as _longitudinal_target_intake_columns,
+)
 from geofuse.mixedlm_postscore import (
     compute_post_metrics as _compute_mixedlm_post_metrics,
 )
 from geofuse.ndvi import NDVIEngine
 from geofuse.persistence.job_executor import JobContext
-from geofuse.raster_sampling import sample_raster_at_features
+from geofuse.raster_sampling import LAZY_RASTER_THRESHOLD_BYTES, LazyRasterArray
+from geofuse.vector_io import read_vector_aliased_column, read_vector_subset
 from geofuse.vision import get_best_device
 
 _log_gvi = get_logger("GVI")
 _log_ndvi = get_logger("NDVI")
 _log_fusion = get_logger("FUSION")
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # GVI engine cache (replaces @st.cache_resource _get_gvi_engine)
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 _engine_lock = threading.Lock()
 _engine_cache: dict[tuple[str, str | None], GVIEngine] = {}
@@ -80,9 +101,9 @@ def _get_gvi_engine(model_path: str, api_key: str | None) -> GVIEngine:
         return engine
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # GVI runner
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 
 def run_gvi(
@@ -111,19 +132,18 @@ def run_gvi(
     start_idx = len(current_accumulated)
     results_lock = threading.Lock()
 
-    # Throttle progress callbacks via the shared :func:`progress_interval_s`
-    # so the JobStore lock stays cheap on big runs. The final point always
+    # Throttle progress so the JobStore lock stays cheap on big runs: emit at
+    # the slower of every 500 images / every 15 s. The final point always
     # emits so the bar reaches 100 %.
-    _last_progress_t = {"v": 0.0}
+    _throttle = ProgressThrottle(
+        min_items=GVI_PROGRESS_MIN_ITEMS, min_seconds=GVI_PROGRESS_MIN_SECONDS
+    )
 
     def on_progress(curr: int, total: int) -> None:
         if total <= 0:
             return
-        if curr < total:
-            now = time.monotonic()
-            if now - _last_progress_t["v"] < progress_interval_s(total):
-                return
-        _last_progress_t["v"] = time.monotonic()
+        if not _throttle.should_emit(curr, final=curr >= total):
+            return
         ctx.progress(
             value=min(curr / total, 1.0),
             status_text=f"Processing ({curr}/{total})",
@@ -137,7 +157,17 @@ def run_gvi(
     def check_cancel() -> bool:
         return ctx.is_cancelled()
 
-    ctx.progress(status_text="Running")
+    def check_pause() -> bool:
+        return bool(getattr(ctx, "is_paused", lambda: False)())
+
+    # Publish the workload up front so the monitor can show scale / ETA.
+    n_points = len(dataset_data["processed"])
+    ctx.progress(
+        status_text=f"Running — {n_points:,} sampling points",
+        total_points=n_points,
+        point_breakdown=[{"label": "all", "points": n_points}],
+    )
+    _log_gvi("INFO", f"Total sampling points to process: {n_points:,}")
 
     engine.run_analysis(
         dataset_data["processed"],
@@ -150,6 +180,9 @@ def run_gvi(
         result_callback=on_result,
         cancel_callback=check_cancel,
         start_index=start_idx,
+        target_year=run_args.get("target_year"),
+        max_year_diff=run_args.get("max_year_diff"),
+        pause_callback=check_pause,
     )
 
     if ctx.is_cancelled():
@@ -157,18 +190,44 @@ def run_gvi(
 
     ctx.progress(value=1.0, status_text="Writing outputs")
 
-    res_df = gpd.GeoDataFrame(
-        dataset_data["accumulated"], crs=dataset_data["processed"].crs
+    output_paths, res_df = _write_gvi_outputs(
+        accumulated=dataset_data["accumulated"],
+        processed_crs=dataset_data["processed"].crs,
+        meta=dataset_data.get("meta") or {},
+        out_name=os.path.splitext(fname)[0],
+        output_dir=output_dir,
+        save_gpkg=save_gpkg,
+        save_geotiff=save_geotiff,
+        save_geojson=save_geojson,
     )
+    dataset_data["results"] = res_df
+    return {"output_paths": output_paths}
+
+
+def _write_gvi_outputs(
+    *,
+    accumulated: list,
+    processed_crs,
+    meta: dict,
+    out_name: str,
+    output_dir: str,
+    save_gpkg: bool,
+    save_geotiff: bool,
+    save_geojson: bool,
+) -> tuple[list[str], gpd.GeoDataFrame]:
+    """Write a GVI result set (GeoPackage / GeoJSON / per-cluster GeoTIFF).
+
+    Shared by :func:`run_gvi` and :func:`run_gvi_column`; returns the written
+    paths and the result GeoDataFrame (reprojected to the grid's planar CRS).
+    """
+    res_df = gpd.GeoDataFrame(accumulated, crs=processed_crs)
     if "orig_index" in res_df.columns:
         res_df.set_index("orig_index", inplace=True)
         res_df.index.name = None
     if res_df.crs is None:
         res_df = res_df.set_crs("EPSG:4326")
 
-    out_name = os.path.splitext(fname)[0]
     output_paths: list[str] = []
-    meta = dataset_data.get("meta") or {}
     grid_crs_wkt = meta.get("grid_crs_wkt")
     clusters = meta.get("clusters") or []
 
@@ -178,7 +237,6 @@ def run_gvi(
     # (direct API callers with point inputs + buffer=0).
     if grid_crs_wkt:
         res_df = res_df.to_crs(grid_crs_wkt)
-    dataset_data["results"] = res_df
 
     if save_gpkg:
         gpkg_path = os.path.join(output_dir, f"{out_name}_gvi.gpkg")
@@ -293,12 +351,192 @@ def run_gvi(
                 indent=2,
             )
 
+    return output_paths, res_df
+
+
+def run_gvi_column(
+    ctx: JobContext,
+    *,
+    fname: str,
+    dataset_data: dict,
+    date_column: str,
+    init_args: dict,
+    run_args: dict,
+    output_dir: str,
+    save_geotiff: bool,
+    save_geojson: bool,
+    gpu_lock: threading.Lock,
+    save_gpkg: bool = True,
+) -> dict:
+    """Run one GVI analysis per year present in ``date_column``.
+
+    The input is split by year; each year is processed as a standalone GVI job
+    over only that year's features, with ``target_year`` set to that year so
+    every sampling point uses the Street View capture nearest it. The grid CRS
+    is chosen once from the whole dataset — before the split — so all years'
+    grids share one planar CRS and align. Results land in a
+    ``{name}_temporal_gvi/`` folder, one set of files per year.
+    """
+    from geofuse.core import generate_clustered_grid
+    from geofuse.crs_utils import select_grid_crs_with_warning
+    from geofuse.longitudinal import parse_date_column
+
+    raw = dataset_data["raw"]
+    gdf_4326 = (
+        raw
+        if raw.crs is not None and raw.crs.is_geographic
+        else raw.to_crs("EPSG:4326")
+    ).copy()
+    parsed = parse_date_column(gdf_4326[date_column])
+    gdf_4326["_year"] = parsed.dt.year
+    gdf_4326 = gdf_4326.dropna(subset=["_year"])
+    if gdf_4326.empty:
+        raise ValueError(f"No valid years could be parsed from column '{date_column}'.")
+    gdf_4326["_year"] = gdf_4326["_year"].astype(int)
+
+    unique_years = sorted(gdf_4326["_year"].unique())
+    n_years = len(unique_years)
+
+    # Grid CRS chosen once from the whole dataset so every per-year grid aligns.
+    grid_crs, _distortion, _choice = select_grid_crs_with_warning(
+        gdf_4326, _log_gvi, role="Grid CRS"
+    )
+
+    base_name = os.path.splitext(fname)[0]
+    job_folder = os.path.join(output_dir, f"{base_name}_temporal_gvi")
+    os.makedirs(job_folder, exist_ok=True)
+
+    ctx.progress(status_text="Waiting for GPU...")
+    with gpu_lock:
+        if ctx.is_cancelled():
+            return {"output_paths": []}
+        ctx.progress(status_text="Initializing...")
+        engine = _get_gvi_engine(init_args["model_path"], init_args.get("api_key"))
+
+    step = run_args["step"]
+    buffer_m = float(run_args.get("buffer", 0) or 0)
+    max_year_diff = run_args.get("max_year_diff")
+    output_paths: list[str] = [job_folder]
+
+    def check_cancel() -> bool:
+        return ctx.is_cancelled()
+
+    def check_pause() -> bool:
+        return bool(getattr(ctx, "is_paused", lambda: False)())
+
+    # Build every year's sampling grid up front so the monitor can report the
+    # true total workload (and the per-year split) before any downloading
+    # starts — otherwise the scale of the run is only known at the very end.
+    ctx.progress(status_text=f"Generating sampling grids for {n_years} year(s)...")
+    plans: list[tuple[int, object, object]] = []
+    for year in unique_years:
+        if ctx.is_cancelled():
+            return {"output_paths": output_paths}
+        year_gdf = gdf_4326[gdf_4326["_year"] == year].drop(columns=["_year"])
+        is_poly = year_gdf.geometry.iloc[0].geom_type in ("Polygon", "MultiPolygon")
+        if is_poly or buffer_m > 0:
+            pts, meta = generate_clustered_grid(
+                year_gdf, buffer_m=buffer_m, step_m=float(step), grid_crs=grid_crs
+            )
+        else:
+            pts, meta = year_gdf.copy(), None
+        plans.append((year, pts, meta))
+        ctx.progress(status_text=f"Generated grid for {year}: {len(pts):,} points")
+        ctx.heartbeat()
+
+    breakdown = [{"label": str(y), "points": int(len(p))} for y, p, _ in plans]
+    total_points = sum(b["points"] for b in breakdown)
+    ctx.progress(
+        status_text=f"Running — {total_points:,} points across {n_years} year(s)",
+        total_points=total_points,
+        point_breakdown=breakdown,
+    )
+    _log_gvi(
+        "INFO",
+        f"Total sampling points: {total_points:,} across {n_years} year(s) — "
+        + ", ".join(f"{b['label']}: {b['points']:,}" for b in breakdown),
+    )
+
+    # One throttle across all years, keyed on the overall point count, so the
+    # cadence is the slower of every 500 images / every 15 s regardless of how
+    # the work is split by year.
+    _throttle = ProgressThrottle(
+        min_items=GVI_PROGRESS_MIN_ITEMS, min_seconds=GVI_PROGRESS_MIN_SECONDS
+    )
+
+    done_points = 0
+    for idx, (year, pts, meta) in enumerate(plans):
+        if ctx.is_cancelled():
+            return {"output_paths": output_paths}
+
+        # Weight the bar by real point counts, so a year with 10x the points
+        # takes 10x the bar — a far better ETA than equal-weighting years.
+        base_done = done_points
+
+        def on_progress(curr: int, total: int, _b=base_done, _y=year) -> None:
+            if total <= 0 or total_points <= 0:
+                return
+            overall = _b + curr
+            if not _throttle.should_emit(overall, final=overall >= total_points):
+                return
+            ctx.progress(
+                value=min(overall / total_points, 1.0),
+                status_text=f"Year {_y} ({curr:,}/{total:,}) — "
+                f"{overall:,}/{total_points:,} overall",
+            )
+            ctx.heartbeat()
+
+        accumulated: list = []
+        results_lock = threading.Lock()
+
+        def on_result(res, _acc=accumulated, _lock=results_lock) -> None:
+            with _lock:
+                _acc.append(res)
+
+        ctx.progress(
+            status_text=f"Processing year {idx + 1}/{n_years}: {year} "
+            f"({len(pts):,} points)"
+        )
+        engine.run_analysis(
+            pts,
+            step=step,
+            folder=job_folder,
+            save_panos=run_args["save_panos"],
+            save_masks=run_args["save_masks"],
+            external_cache=dataset_data["cache_ref"],
+            progress_callback=on_progress,
+            result_callback=on_result,
+            cancel_callback=check_cancel,
+            target_year=int(year),
+            max_year_diff=max_year_diff,
+            pause_callback=check_pause,
+        )
+        done_points += len(pts)
+        if ctx.is_cancelled():
+            return {"output_paths": output_paths}
+        if not accumulated:
+            _log_gvi("WARN", f"Year {year}: no results produced.")
+            continue
+
+        paths, _res_df = _write_gvi_outputs(
+            accumulated=accumulated,
+            processed_crs=pts.crs,
+            meta=meta or {},
+            out_name=f"{base_name}_{year}",
+            output_dir=job_folder,
+            save_gpkg=save_gpkg,
+            save_geotiff=save_geotiff,
+            save_geojson=save_geojson,
+        )
+        output_paths.extend(paths)
+
+    ctx.progress(value=1.0, status_text="Completed")
     return {"output_paths": output_paths}
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # NDVI runners
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 
 def _ndvi_on_progress_factory(
@@ -358,6 +596,10 @@ def run_ndvi(
     on_progress = _ndvi_on_progress_factory(ctx)
 
     def check_cancel() -> bool:
+        # The engine polls this at safe points (between tiles, around retries),
+        # so blocking here pauses the download without dropping queued tiles.
+        if hasattr(ctx, "wait_while_paused"):
+            ctx.wait_while_paused()
         return ctx.is_cancelled()
 
     result = engine.download_and_process(
@@ -410,7 +652,8 @@ def run_ndvi_column(
     fname: str,
     dataset_data: dict,
     date_column: str,
-    window_days: int,
+    season_start_month: int,
+    season_end_month: int,
     cloud_pct: int,
     resolution: int,
     buffer_m: int,
@@ -418,112 +661,123 @@ def run_ndvi_column(
     save_geotiff: bool,
     save_geojson: bool,
     save_gpkg: bool = False,
+    save_cluster_tiles: bool = False,
+    satellite: str = "auto",
+    coverage_rescue: bool = True,
 ) -> dict:
-    """Run NDVI extraction per feature using a date column."""
+    """Run one NDVI raster per year present in ``date_column``.
+
+    The input is split by year; each year is processed as a standalone NDVI
+    job over only that year's features, composited across the growing-season
+    months ``[season_start_month, season_end_month]`` of that year. The export
+    CRS is chosen once from the whole dataset — before the split — so every
+    year's raster snaps to the same global pixel grid and the outputs align.
+    Results land in a ``{name}_temporal_ndvi/`` folder, one set of files per
+    year (``{name}_{year}_ndvi.tif`` plus optional GeoPackage/GeoJSON).
+    """
+    import calendar
+
     from geofuse.crs_utils import buffer_gdf_union_metres
+    from geofuse.longitudinal import parse_date_column
 
     gdf = dataset_data["raw"].copy()
-    gdf["_parsed_date"] = pd.to_datetime(gdf[date_column], errors="coerce")
-    gdf = gdf.dropna(subset=["_parsed_date"])
+    parsed = parse_date_column(gdf[date_column])
+    gdf["_year"] = parsed.dt.year
+    gdf = gdf.dropna(subset=["_year"])
     if gdf.empty:
-        raise ValueError("No valid dates found in the selected column.")
+        raise ValueError(f"No valid years could be parsed from column '{date_column}'.")
+    gdf["_year"] = gdf["_year"].astype(int)
 
-    unique_dates = sorted(gdf["_parsed_date"].dt.date.unique())
-    n_dates = len(unique_dates)
+    unique_years = sorted(gdf["_year"].unique())
+    n_years = len(unique_years)
+
+    # CRS chosen once from the whole dataset so every per-year raster aligns.
+    crs_override = NDVIEngine.compute_export_crs(gdf)
+
+    base_name = os.path.splitext(fname)[0]
+    job_folder = os.path.join(output_dir, f"{base_name}_temporal_ndvi")
+    os.makedirs(job_folder, exist_ok=True)
+
     engine = NDVIEngine()
-    base_extent = gpd.GeoDataFrame(
-        {"geometry": [gdf.geometry.union_all()]}, crs=gdf.crs
-    )
-    full_extent = buffer_gdf_union_metres(base_extent, buffer_m)
-    all_results: list[gpd.GeoDataFrame] = []
-    output_paths: list[str] = []
-    base_name = fname.replace(".geojson", "")
+    output_paths: list[str] = [job_folder]
 
-    for idx, target_date in enumerate(unique_dates):
+    def check_cancel() -> bool:
+        # Blocking here pauses the Earth Engine download at a tile boundary;
+        # queued tiles are untouched and resume where they left off.
+        if hasattr(ctx, "wait_while_paused"):
+            ctx.wait_while_paused()
+        return ctx.is_cancelled()
+
+    for idx, year in enumerate(unique_years):
+        if ctx.is_cancelled():
+            return {"output_paths": output_paths}
+        # Safe pause point: hold between years so a resume continues with the
+        # next year rather than dropping it.
+        if hasattr(ctx, "wait_while_paused"):
+            ctx.wait_while_paused()
         if ctx.is_cancelled():
             return {"output_paths": output_paths}
 
-        start_d = target_date - timedelta(days=window_days)
-        end_d = target_date + timedelta(days=window_days)
-        date_str = target_date.strftime("%Y%m%d")
-        tmp_name = f"{base_name}_{date_str}_tmp"
+        year_gdf = gdf[gdf["_year"] == year].drop(columns=["_year"])
+        geometry = buffer_gdf_union_metres(year_gdf, buffer_m)
 
-        ctx.progress(status_text=f"Processing date {idx + 1}/{n_dates}: {target_date}")
+        start_d = f"{year:04d}-{season_start_month:02d}-01"
+        last_day = calendar.monthrange(int(year), int(season_end_month))[1]
+        end_d = f"{year:04d}-{season_end_month:02d}-{last_day:02d}"
+        output_name = f"{base_name}_{year}"
 
-        span = 1.0 / max(n_dates, 1)
-        base = idx / max(n_dates, 1)
+        ctx.progress(
+            status_text=f"Processing year {idx + 1}/{n_years}: {year} "
+            f"({start_d} → {end_d})"
+        )
+        span = 1.0 / max(n_years, 1)
+        base = idx / max(n_years, 1)
         on_progress = _ndvi_on_progress_factory(ctx, base_offset=base, span=span)
 
-        def check_cancel() -> bool:
-            return ctx.is_cancelled()
-
         result = engine.download_and_process(
-            geometry=full_extent,
-            start_date=start_d.isoformat(),
-            end_date=end_d.isoformat(),
-            output_name=tmp_name,
+            geometry=geometry,
+            start_date=start_d,
+            end_date=end_d,
+            output_name=output_name,
             cloud_max=cloud_pct,
             resolution=resolution,
-            folder=output_dir,
+            folder=job_folder,
             cancel_callback=check_cancel,
             ndvi_progress_callback=on_progress,
-            write_geotiff=True,
-            write_geojson=False,
+            write_geotiff=save_geotiff,
+            write_geojson=save_geojson,
+            write_geopackage=save_gpkg,
+            write_cluster_tiles=save_cluster_tiles,
+            satellite=satellite,
+            coverage_rescue=coverage_rescue,
+            crs_override=crs_override,
         )
         if result.get("status") == "cancelled":
             return {"output_paths": output_paths}
         if result.get("status") != "success":
-            _log_ndvi(
-                "WARN", f"Column run for {target_date} failed: {result.get('message')}"
-            )
+            _log_ndvi("WARN", f"Year {year} failed: {result.get('message')}")
             continue
 
-        tif_path = os.path.join(output_dir, f"{tmp_name}_ndvi.tif")
-        if not os.path.exists(tif_path):
-            continue
-
-        # Delegate the exact-pixel sample to the shared helper — it
-        # handles the planar-CRS reprojection, nodata sentinel, and
-        # NaN filtering uniformly with every other raster consumer.
-        date_gdf = gdf[gdf["_parsed_date"].dt.date == target_date].copy()
-        out = sample_raster_at_features(
-            tif_path,
-            date_gdf,
-            band=1,
-            radius_m=0.0,
-            stat="mean",
-            value_column="NDVI",
-        )
-        out["ndvi_date"] = target_date.isoformat()
-        all_results.append(out)
-
-        if not save_geotiff and os.path.isfile(tif_path):
-            os.remove(tif_path)
-        elif save_geotiff:
-            output_paths.append(tif_path)
-
-    if all_results:
-        merged = gpd.GeoDataFrame(
-            pd.concat(all_results, ignore_index=True), crs=all_results[0].crs
-        )
-        merged = merged.drop(columns=["_parsed_date"], errors="ignore")
-        if save_geojson:
-            gj_path = os.path.join(output_dir, f"{base_name}_temporal_ndvi.geojson")
-            reproject_geodataframe_to_wgs84(merged).to_file(gj_path, driver="GeoJSON")
-            output_paths.append(gj_path)
-        if save_gpkg:
-            gpkg_path = os.path.join(output_dir, f"{base_name}_temporal_ndvi.gpkg")
-            merged.to_file(gpkg_path, driver="GPKG", layer="ndvi_samples")
-            output_paths.append(gpkg_path)
-        dataset_data["results"] = merged
+        for suffix, enabled in (
+            ("_ndvi.tif", save_geotiff),
+            ("_ndvi.gpkg", save_gpkg),
+            ("_ndvi.geojson", save_geojson),
+            ("_ndvi.json", True),
+        ):
+            p = os.path.join(job_folder, f"{output_name}{suffix}")
+            if enabled and os.path.exists(p):
+                output_paths.append(p)
+        tiles_dir = os.path.join(job_folder, f"{output_name}_ndvi_tiles")
+        if save_cluster_tiles and os.path.isdir(tiles_dir):
+            output_paths.append(tiles_dir)
 
     ctx.progress(value=1.0, status_text="Completed")
     return {"output_paths": output_paths}
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Fusion runner
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 
 _STUDY_NAME_UNSAFE = re.compile(r"[^A-Za-z0-9_.-]+")
@@ -641,48 +895,27 @@ def _fusion_config_fingerprint(
     return _hl.sha256(payload.encode()).hexdigest()[:8]
 
 
-# ---------------------------------------------------------------------------
-# Nested-CV helpers
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
+# Fusion pipeline / stage-ledger helpers
+# ────────────────────────────────────────────────────────────────────
 
 
-# Ordered pipeline steps a fusion run moves through per target outcome. The
-# staged-resume ledger (geofuse.jobs.stage_ledger) records each so the monitor
-# shows where a run is and a stopped job reports where it left off. Resume itself
-# is content-addressed (metric cache, pre-aggregation cache, Optuna study), so
-# re-running the same job reuses/resumes each on-disk artifact transparently —
-# the ledger is the visibility layer over that durability.
-_FUSION_STAGE_STEPS: tuple[tuple[str, str], ...] = (
-    ("load_target", "Load target"),
-    ("load_metrics", "Load metric maps"),
-    ("preaggregate", "Spatial pre-processing"),
-    ("split", "Split train / test folds"),
-    ("optimize", "Optimize CGI study"),
-    ("robust", "Filter robust trials"),
-    ("evaluate", "Evaluate on test"),
-    ("apply", "Apply fusion weights"),
-    ("reports", "Generate reports and composite map"),
-)
-
+# Ordered pipeline steps per target outcome, recorded by the stage ledger so
+# the monitor can show where a run is. ``optimize`` is the stability search and
+# dominates the runtime; ``report_stats`` is the replicate-statistics tail.
+# Relative wall-time weights for the main progress bar. Bootstrap searches
+# dominate a run; the replicate-statistics tail is the next largest cost, while
+# I/O and apply stages are comparatively instant. Weighting keeps the ledger-
+# derived bar monotonic *and* roughly time-proportional instead of leaping to
+# ~50 % the moment the fast setup stages finish.
 # Mixed-effects fusion inserts an extra step before pre-aggregation: load
 # the per-wave target frames (wide intake only) and the per-wave greenery
 # files for every channel, then hand them to the engine. The cross-
 # sectional pipeline skips this stage.
-_FUSION_LONGITUDINAL_STAGE: tuple[str, str] = (
-    "prepare_longitudinal",
-    "Load longitudinal data",
-)
-
 # After the final ``apply`` stage, mixed-effects runs also score every
 # robust + top-X% trial + the averaged-composite parameters on the held-out
 # test set with all four ``mixedlm_*`` metrics, and write the results to
 # ``mixedlm_metrics.csv`` for downstream analysis.
-_FUSION_MIXEDLM_POSTSCORE_STAGE: tuple[str, str] = (
-    "mixedlm_postscore",
-    "Score all MixedLM metrics on robust + top trials",
-)
-
-
 def _load_longitudinal_metric_file(path: str, channel: str) -> Any:
     """Read one per-wave metric file into the layout the engine expects.
 
@@ -706,45 +939,56 @@ def _load_longitudinal_metric_file(path: str, channel: str) -> Any:
                 arr = src.read(band)
                 transform = src.transform
                 crs = src.crs
-                h, w = arr.shape
-                rows_i, cols_i = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")
-                xs, ys = xy(
-                    transform, rows_i.flatten(), cols_i.flatten(), offset="center"
-                )
-                vals = arr.flatten()
-                mask = ~np.isnan(vals)
+                w = int(arr.shape[1])
+                # Coordinates only for the pixels that survive the NaN filter —
+                # materializing one geometry per grid cell first does not scale.
+                vals = arr.ravel()
+                keep = np.flatnonzero(~np.isnan(vals))
+                rows_i = (keep // w).astype(np.int64)
+                cols_i = (keep % w).astype(np.int64)
+                xs, ys = xy(transform, rows_i, cols_i, offset="center")
                 gdf = gpd.GeoDataFrame(
-                    {channel: vals[mask]},
-                    geometry=gpd.points_from_xy(
-                        np.asarray(xs)[mask], np.asarray(ys)[mask]
-                    ),
+                    {channel: vals[keep]},
+                    geometry=gpd.points_from_xy(np.asarray(xs), np.asarray(ys)),
                     crs=crs,
                 )
                 gdf.attrs["metric_column"] = channel
                 return gdf
-            data = src.read(1, masked=True)
-            return {
-                "data": data,
+            itemsize = np.dtype(src.dtypes[0]).itemsize
+            est_bytes = src.width * src.height * itemsize
+            data = (
+                src.read(1, masked=True)
+                if est_bytes <= LAZY_RASTER_THRESHOLD_BYTES
+                else None
+            )
+            meta = {
                 "transform": src.transform,
                 "crs": src.crs,
                 "bounds": src.bounds,
                 "width": src.width,
                 "height": src.height,
             }
-    # Vector formats (GPKG / GeoJSON / shapefile / zip)
-    gdf = gpd.read_file(path)
-    default_col = {"veg": "veg", "terrain": "terrain", "ndvi": "NDVI"}[channel]
-    col = (
-        default_col
-        if default_col in gdf.columns
-        else ("value" if "value" in gdf.columns else None)
+        if data is None:
+            # A wave raster spanning widely separated study sites covers a huge
+            # extent at metric resolution; the dense band would not fit in RAM.
+            # Sample windows from disk instead.
+            data = LazyRasterArray(path, band=1)
+            _log_fusion(
+                "INFO",
+                f"Wave raster ~{est_bytes / (1024**3):.1f} GiB exceeds the "
+                f"in-memory threshold; reading windows lazily from {path}",
+            )
+        return {"data": data, **meta}
+    # Vector formats (GPKG / GeoJSON / shapefile / zip). Only the value column
+    # and geometry are sampled; the rest of a GVI file's schema (panorama id,
+    # capture date, lat/lon, grid row/col, cluster) would otherwise cost
+    # several hundred MB per wave.
+    gdf, col = read_vector_aliased_column(
+        path,
+        metric_intake.channel_columns(channel),
+        description=f"{channel} metric value",
     )
-    if col is None:
-        raise ValueError(
-            f"Cannot find metric value column in {path} for channel {channel!r}. "
-            f"Expected one of [{default_col!r}, 'value']; got columns "
-            f"{list(gdf.columns)}."
-        )
+    gdf = gdf.dropna(subset=[col])
     gdf.attrs["metric_column"] = col
     return gdf
 
@@ -759,521 +1003,8 @@ def _resolve_longitudinal_spec(
     return LongitudinalSpec.from_payload(payload)
 
 
-def _clean_params(params: dict | None) -> dict:
-    """Drop the ``__*__`` stability-selection bookkeeping keys from a params dict."""
-    if not params:
-        return {}
-    return {k: v for k, v in params.items() if not str(k).startswith("__")}
-
-
-def _study_bundles(
-    cgi_bundle: dict, standalones_bundle: dict
-) -> list[tuple[str, str, dict]]:
-    """``(study_key, display, bundle)`` for the CGI study then each standalone."""
-    out: list[tuple[str, str, dict]] = [("cgi", "CGI (combined)", cgi_bundle)]
-    for ch in ("veg", "terrain", "ndvi"):
-        b = standalones_bundle.get(ch)
-        if b:
-            out.append((ch, _STANDALONE_CHANNEL_LABELS.get(ch, ch), b))
-    return out
-
-
-def _write_fusion_outputs(
-    *,
-    output_dir: str,
-    label: str,
-    multi_outcome: bool,
-    objective_metric: str,
-    formula_name: str,
-    cgi_bundle: dict,
-    standalones_bundle: dict,
-    aic_bic: dict | None,
-    covariate_impact: dict | None,
-    collinearity_report: dict | None,
-    run_config_record: dict | None,
-    log,
-) -> list[str]:
-    """Persist every test result a fusion job produces to disk.
-
-    Writes, under ``output_dir`` (``study_results/``), a machine-readable
-    manifest plus tidy CSVs so each result is recorded both for replay and
-    for spreadsheet analysis. ``__<label>`` is appended to every basename in
-    multi-outcome runs. Returns the list of files written (best-effort: a
-    failed individual write is logged and skipped, never fatal).
-
-    Files (per outcome):
-
-    - ``run_config.json`` — every setting the job ran with (fidelity record).
-    - ``results_summary.json`` — nested manifest: each study's params, test
-      score + CI, direction, subset scores, and stability stats, plus the
-      CGI-vs-standalone AIC/BIC verdict, covariate-impact summary, and the
-      collinearity report.
-    - ``test_scores.csv`` — one headline row per study (test score, CI,
-      direction).
-    - ``scores.csv`` — long form: study × subset (train/val/test/all) ×
-      score/score_raw/n.
-    - ``parameters.csv`` — long form: study × param → value.
-    - ``stability_cells.csv`` — the ranked weight cells per study.
-    - ``stability_bootstraps.csv`` — the per-bootstrap leaderboard per study.
-    - ``covariate_impact.csv`` — per-covariate effects (when covariates set).
-    """
-    import json
-
-    import numpy as np
-    import pandas as pd
-
-    os.makedirs(output_dir, exist_ok=True)
-    sfx = f"__{label}" if multi_outcome else ""
-    written: list[str] = []
-    studies = _study_bundles(cgi_bundle, standalones_bundle)
-
-    def _path(name: str) -> str:
-        return os.path.join(output_dir, name)
-
-    def _f(v: Any) -> float | None:
-        try:
-            fv = float(v)
-            return fv if np.isfinite(fv) else None
-        except (TypeError, ValueError):
-            return None
-
-    def _ci(bundle: dict) -> dict:
-        return (bundle.get("test_results") or {}).get("test_ci") or {}
-
-    def _emit_json(name: str, payload: Any) -> None:
-        try:
-            p = _path(name)
-            with open(p, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2, default=str)
-            written.append(p)
-        except Exception as exc:  # pragma: no cover - disk-IO guard
-            log("WARN", f"[{label}] Could not write {name}: {exc}")
-
-    def _emit_csv(name: str, rows: list[dict]) -> None:
-        if not rows:
-            return
-        try:
-            p = _path(name)
-            pd.DataFrame(rows).to_csv(p, index=False)
-            written.append(p)
-        except Exception as exc:  # pragma: no cover - disk-IO guard
-            log("WARN", f"[{label}] Could not write {name}: {exc}")
-
-    # ── run_config.json (fidelity record) ─────────────────────────────
-    if run_config_record is not None:
-        _emit_json(f"run_config{sfx}.json", run_config_record)
-
-    # ── test_scores.csv ───────────────────────────────────────────────
-    test_rows: list[dict] = []
-    for key, _disp, b in studies:
-        tr = b.get("test_results") or {}
-        ci = _ci(b)
-        test_rows.append(
-            {
-                "study": key,
-                "metric": objective_metric,
-                "test_score": _f(tr.get("test_score")),
-                "ci_lower": _f(ci.get("lower")),
-                "ci_upper": _f(ci.get("upper")),
-                "direction": (
-                    int(b["direction_sign"])
-                    if b.get("direction_sign") is not None
-                    else None
-                ),
-            }
-        )
-    _emit_csv(f"test_scores{sfx}.csv", test_rows)
-
-    # ── scores.csv (every subset) ─────────────────────────────────────
-    score_rows: list[dict] = []
-    for key, _disp, b in studies:
-        subsets = b.get("subset_scores") or {}
-        for subset in ("train", "val", "test", "all"):
-            block = subsets.get(subset) or {}
-            if not block:
-                continue
-            score_rows.append(
-                {
-                    "study": key,
-                    "subset": subset,
-                    "metric": objective_metric,
-                    "score": _f(block.get("score")),
-                    "score_raw": _f(block.get("score_raw")),
-                    "n": block.get("n"),
-                }
-            )
-    _emit_csv(f"scores{sfx}.csv", score_rows)
-
-    # ── parameters.csv (long form) ────────────────────────────────────
-    param_rows: list[dict] = []
-    for key, _disp, b in studies:
-        params = _clean_params(b.get("averaged_params") or b.get("best_params"))
-        for pname, pval in params.items():
-            param_rows.append({"study": key, "param": pname, "value": pval})
-    _emit_csv(f"parameters{sfx}.csv", param_rows)
-
-    # ── stability_cells.csv + stability_bootstraps.csv ────────────────
-    cell_rows: list[dict] = []
-    bs_rows: list[dict] = []
-    for key, _disp, b in studies:
-        summ = b.get("stability_summary") or {}
-        for rank, c in enumerate(summ.get("cell_stats") or [], start=1):
-            row: dict = {"study": key, "rank": rank}
-            for wk, wv in (c.get("weights") or {}).items():
-                row[wk] = wv
-            row["count"] = c.get("count")
-            row["q_worst"] = _f(c.get("q_worst"))
-            row["median"] = _f(c.get("median"))
-            row["selection_probability"] = _f(c.get("selection_probability"))
-            cell_rows.append(row)
-        for entry in summ.get("per_bootstrap_summary") or []:
-            row = {
-                "study": key,
-                "bootstrap": entry.get("bootstrap"),
-                "n_trials": entry.get("n_trials"),
-                "top_oob": _f(entry.get("top_oob")),
-                "median_oob": _f(entry.get("median_oob")),
-                "min_oob": _f(entry.get("min_oob")),
-                "max_oob": _f(entry.get("max_oob")),
-            }
-            for pk, pv in (entry.get("top_params") or {}).items():
-                row[pk] = pv
-            bs_rows.append(row)
-    _emit_csv(f"stability_cells{sfx}.csv", cell_rows)
-    _emit_csv(f"stability_bootstraps{sfx}.csv", bs_rows)
-
-    # ── covariate_impact.csv ──────────────────────────────────────────
-    if covariate_impact and covariate_impact.get("per_covariate"):
-        _emit_csv(
-            f"covariate_impact{sfx}.csv",
-            [dict(r) for r in covariate_impact["per_covariate"]],
-        )
-
-    # ── results_summary.json (master manifest) ────────────────────────
-    studies_manifest: dict[str, dict] = {}
-    for key, disp, b in studies:
-        tr = b.get("test_results") or {}
-        summ = b.get("stability_summary") or {}
-        studies_manifest[key] = {
-            "display": disp,
-            "channel": b.get("channel", "cgi"),
-            "params": _clean_params(b.get("averaged_params") or b.get("best_params")),
-            "test_score": _f(tr.get("test_score")),
-            "test_ci": {
-                "lower": _f(_ci(b).get("lower")),
-                "upper": _f(_ci(b).get("upper")),
-                "method": _ci(b).get("method", "percentile"),
-            },
-            "direction": (
-                int(b["direction_sign"])
-                if b.get("direction_sign") is not None
-                else None
-            ),
-            "subset_scores": b.get("subset_scores") or {},
-            "stability": {
-                k: summ.get(k)
-                for k in (
-                    "q_worst",
-                    "median",
-                    "count",
-                    "selection_probability",
-                    "worst_quantile",
-                    "n_bootstraps",
-                    "n_trials_per_bootstrap",
-                    "n_total_trials",
-                    "higher_is_better",
-                )
-            },
-        }
-
-    cov_summary = None
-    if covariate_impact:
-        cov_summary = {
-            k: covariate_impact.get(k)
-            for k in (
-                "r2_full",
-                "r2_cgi_only",
-                "r2_lift_from_covariates",
-                "cgi_coef",
-                "cgi_std_err",
-                "n",
-            )
-        }
-        cov_summary["per_covariate"] = covariate_impact.get("per_covariate") or []
-
-    manifest = {
-        "outcome": label,
-        "objective_metric": objective_metric,
-        "cgi_formula": formula_name,
-        "studies": studies_manifest,
-        "cgi_vs_standalone_aic_bic": aic_bic,
-        "covariate_impact": cov_summary,
-        "collinearity": collinearity_report,
-    }
-    _emit_json(f"results_summary{sfx}.json", manifest)
-
-    # ── aic_bic.json + collinearity.json (standalone copies) ──────────
-    if aic_bic is not None:
-        _emit_json(f"aic_bic{sfx}.json", aic_bic)
-    if collinearity_report:
-        _emit_json(f"collinearity{sfx}.json", collinearity_report)
-
-    log(
-        "OK",
-        f"[{label}] Wrote {len(written)} result file(s) to {output_dir}.",
-    )
-    return written
-
-
 # Human labels for the standalone channels surfaced in ledger stages and
 # logs. Keys match the engine's ``greenery_channel`` values.
-_STANDALONE_CHANNEL_LABELS: dict[str, str] = {
-    "veg": "Vegetation",
-    "terrain": "Terrain",
-    "ndvi": "NDVI",
-}
-
-
-def _fusion_stage_key(label: str, step: str, *, multi: bool) -> str:
-    """Stage-ledger key for ``step`` under outcome ``label`` (label-scoped if multi)."""
-    return f"{label}::{step}" if multi else step
-
-
-def _build_fusion_ledger(
-    labels: list[str],
-    *,
-    multi: bool,
-    standalone_channels: list[str] | None = None,
-    longitudinal: bool = False,
-    mixedlm_postscore: bool = False,
-) -> StageLedger:
-    """Fresh ledger covering every (outcome, step) pair in run order.
-
-    For each outcome the 8-step CGI pipeline (`_FUSION_STAGE_STEPS`) lands
-    first, then one stage per enabled standalone metric — those reuse the
-    already-built split + pre-aggregation cache, so each is a single
-    optimize/robust/evaluate burst that's compact enough to fit in one
-    ledger row. When ``longitudinal`` is true an extra
-    ``prepare_longitudinal`` stage is inserted between ``load_metrics`` and
-    ``preaggregate`` to cover per-wave file loading. The MixedLM
-    post-score stage is only added when ``mixedlm_postscore`` is true
-    (a longitudinal study whose scoring metric is actually a
-    ``mixedlm_*`` one — year-aware cross-sectional studies sit on a
-    spec too but score with OLS so they skip the post-score step).
-    """
-    standalones = list(standalone_channels or [])
-    steps: list[tuple[str, str]] = []
-    for label in labels:
-        for step_key, step_label in _FUSION_STAGE_STEPS:
-            key = _fusion_stage_key(label, step_key, multi=multi)
-            disp = f"[{label}] {step_label}" if multi else step_label
-            steps.append((key, disp))
-            # Slot the longitudinal-prep stage in right after load_metrics so
-            # the monitor reads top-to-bottom in actual execution order.
-            if longitudinal and step_key == "load_metrics":
-                lon_key_raw, lon_label = _FUSION_LONGITUDINAL_STAGE
-                lon_key = _fusion_stage_key(label, lon_key_raw, multi=multi)
-                lon_disp = f"[{label}] {lon_label}" if multi else lon_label
-                steps.append((lon_key, lon_disp))
-            # And the post-score stage right after ``apply`` so the
-            # multi-metric CSV is written before any standalone studies
-            # take over the engine state.
-            if mixedlm_postscore and step_key == "apply":
-                ps_key_raw, ps_label = _FUSION_MIXEDLM_POSTSCORE_STAGE
-                ps_key = _fusion_stage_key(label, ps_key_raw, multi=multi)
-                ps_disp = f"[{label}] {ps_label}" if multi else ps_label
-                steps.append((ps_key, ps_disp))
-        for ch in standalones:
-            key = _fusion_stage_key(label, f"standalone_{ch}", multi=multi)
-            ch_lbl = _STANDALONE_CHANNEL_LABELS.get(ch, ch)
-            disp_step = f"Standalone {ch_lbl} study"
-            disp = f"[{label}] {disp_step}" if multi else disp_step
-            steps.append((key, disp))
-    return StageLedger.from_steps(steps)
-
-
-def _stability_summary(params: dict) -> dict:
-    """Lift the stability-selection diagnostics out of a winning-params dict.
-
-    ``bootstrap_stability_selection`` stashes its bookkeeping under ``__``-
-    prefixed keys (so the "Final params" panel strips them). This surfaces the
-    ones the results UI shows as a plain summary dict.
-    """
-
-    def g(key: str, default: Any = None) -> Any:
-        return params.get(key, default)
-
-    return {
-        "q_worst": g("__cell_q_worst__"),
-        "median": g("__cell_median__"),
-        "count": g("__cell_count__"),
-        "selection_probability": g("__cell_selection_probability__"),
-        "worst_quantile": g("__worst_quantile__"),
-        # Automated threshold calibration (Bodinier).
-        "stability_score": g("__stability_score__"),
-        "selection_threshold": g("__selection_threshold__"),
-        "selection_size_k": g("__selection_size_k__"),
-        "n_candidate_cells": g("__n_candidate_cells__"),
-        "n_stably_selected": g("__n_stably_selected__"),
-        "pfer": g("__pfer__"),
-        "pfer_controlled": g("__pfer_controlled__"),
-        "n_bootstraps": g("__n_bootstraps__"),
-        "n_trials_per_bootstrap": g("__n_trials_per_bootstrap__"),
-        "n_total_trials": g("__n_total_trials__"),
-        "higher_is_better": g("__higher_is_better__"),
-        "cell_stats": g("__cell_stats__", []),
-        "winning_cell": g("__winning_cell__"),
-        "winning_cell_oob_scores": g("__winning_cell_oob_scores__", []),
-        "per_bootstrap_summary": g("__per_bootstrap_summary__", []),
-        "trial_history": g("__trial_history__", []),
-        # Stage-2 (radius sub-cell) diagnostics.
-        "radius_cell_q_worst": g("__radius_cell_q_worst__"),
-        "radius_cell_median": g("__radius_cell_median__"),
-        "radius_cell_count": g("__radius_cell_count__"),
-        "radius_bin_m": g("__radius_bin_m__"),
-        "radius_cell_stats": g("__radius_cell_stats__", []),
-    }
-
-
-def _direction_sign(engine: Any, params: dict, metric: str) -> int:
-    """``+1`` / ``-1`` sign of the greenery↔outcome relationship on the test set.
-
-    Distance correlation is unsigned, so the report needs a separate direction
-    indicator. Returns ``+1`` (neutral) on any failure.
-    """
-    from .. import objective_scoring as _scoring
-
-    try:
-        res = engine.evaluate_on_test(
-            params=params, metric=metric, return_predictions=True
-        )
-        target = np.asarray(res.get("targets"), dtype=np.float64)
-        pred = np.asarray(res.get("predictions"), dtype=np.float64)
-        cov = res.get("covariates")
-        return int(
-            _scoring.relationship_sign(
-                target,
-                pred,
-                cov,
-                residualize_method=getattr(engine, "residualize_method", "linear"),
-            )
-        )
-    except Exception:
-        return 1
-
-
-def _compare_cgi_vs_standalone(
-    engine: Any,
-    standalones_bundle: dict,
-    cgi_params: dict,
-    metric: str,
-    *,
-    longitudinal: bool,
-    log,
-) -> dict | None:
-    """AIC/BIC verdict: is CGI justified over the best single standalone channel?
-
-    The best standalone is the channel with the strongest whole-data (``all``)
-    score (direction-aware). The full (3-channel) and reduced (best-channel)
-    models are fit on the whole dataset's per-entity channel design built at the
-    CGI winning aggregation params, so the verdict is on the same ``all`` slice
-    as the paired objective comparison. Returns ``None`` when no standalone
-    qualifies or the design / fit fails.
-    """
-    from .. import mixed_effects_scoring as _me
-    from .. import objective_scoring as _scoring
-
-    chans = ["veg", "terrain", "ndvi"]
-    higher_is_better = (
-        metric in _scoring.HIGHER_IS_BETTER or metric in _me.HIGHER_IS_BETTER
-    )
-    scored: list[tuple[str, float]] = []
-    for ch in chans:
-        b = standalones_bundle.get(ch)
-        if not b:
-            continue
-        ss = (b.get("subset_scores") or {}).get("all") or {}
-        ts = ss.get("score")
-        if ts is None or not np.isfinite(float(ts)):
-            continue
-        scored.append((ch, float(ts)))
-    if not scored:
-        return None
-    best_ch = max(scored, key=lambda kv: kv[1] if higher_is_better else -kv[1])[0]
-    best_idx = chans.index(best_ch)
-
-    try:
-        design = engine.build_channel_design(cgi_params, subset="all")
-    except Exception as exc:
-        log("WARN", f"AIC/BIC channel design failed: {exc}")
-        return None
-
-    X = design["channels"]
-    target = design["target"]
-    cov = design["covariates"]
-    try:
-        if longitudinal and design.get("entity_id") is not None:
-            return _me.compare_models_aic_bic_mixedlm(
-                target,
-                X,
-                chans,
-                best_idx,
-                design["entity_id"],
-                design["years_since_baseline"],
-                covariates=cov,
-            )
-        return _scoring.compare_models_aic_bic(
-            target, X, chans, best_idx, covariates=cov
-        )
-    except Exception as exc:
-        log("WARN", f"AIC/BIC comparison failed: {exc}")
-        return None
-
-
-def _jsonsafe_results(obj, _depth: int = 0):
-    """Recursively convert a fusion results payload to JSON-serializable types.
-
-    Heavy or non-serializable values (DataFrames, ndarrays, per-trial pools)
-    are dropped — they're reproducible from the on-disk artifacts — so the
-    compact bundle written beside the job can rehydrate the results view after
-    a Streamlit restart without pinning engines in memory.
-    """
-    if _depth > 12:
-        return None
-    if obj is None or isinstance(obj, (bool, int, float, str)):
-        return obj
-    if isinstance(obj, np.generic):
-        return obj.item()
-    if isinstance(obj, np.ndarray):
-        return None
-    if isinstance(obj, dict):
-        out: dict = {}
-        for k, v in obj.items():
-            if k in (
-                "composite_df",
-                "robust_trials",
-                "per_trial_test",
-                "all_completed_trials",
-            ):
-                continue
-            out[str(k)] = _jsonsafe_results(v, _depth + 1)
-        return out
-    if isinstance(obj, (list, tuple, set)):
-        return [_jsonsafe_results(v, _depth + 1) for v in obj]
-    try:
-        import pandas as _pd
-
-        if isinstance(obj, (_pd.DataFrame, _pd.Series)):
-            return None
-    except Exception:
-        pass
-    try:
-        s = str(obj)
-        return s if len(s) <= 2000 else None
-    except Exception:
-        return None
-
-
 def run_fusion(
     ctx: JobContext,
     *,
@@ -1305,7 +1036,6 @@ def run_fusion(
     ndvi_project_id: str | None = None,
     multi_objective_requested: bool = False,
     output_dir: str,
-    MetricFusionEngine,
     target_display_name: str = "target",
     resume_existing_study: bool = True,
     cgi_formula: str = "weighted_average",
@@ -1321,17 +1051,25 @@ def run_fusion(
     spatial_adjust_max_df: int = 10,
     spatial_adjust_eps_m: float | None = None,
     residualize_method: str = "linear",
+    search_scoring_method: str = "mom_em3",
     n_bootstraps: int = 20,
     n_trials_per_bootstrap: int = 50,
-    weight_bin_pct: int = 10,
+    weight_bin_pct: int = 20,
+    weight_refine_bin_pct: int | None = None,
     min_cell_count: int = 3,
     worst_quantile: float = 0.10,
     max_pfer: float = 1.0,
     spatial_split: bool = False,
     spatial_block_size_m: float | None = None,
     n_spatial_blocks: int | None = None,
-    check_collinearity: bool = False,
+    check_collinearity: bool = True,
     vif_threshold: float = 10.0,
+    report_ci_bootstrap: int | None = None,
+    report_effects_bootstrap: int = 2000,
+    report_effects_permutations: int = 1000,
+    report_paired_bootstrap: int = 2000,
+    exposure_iqr: float | None = None,
+    moderator_columns: list[str] | None = None,
 ) -> dict:
     """Run a fusion job: stability-selection tuning + held-out test scoring.
 
@@ -1344,8 +1082,19 @@ def run_fusion(
     are then scored once on the held-out test split with a percentile bootstrap
     CI. When standalones are enabled, both a whole-data (``all``) paired
     objective comparison and an ``all``-data AIC/BIC comparison report whether
-    CGI is justified over the best single channel."""
+    CGI is justified over the best single channel.
+
+    The ``report_*`` knobs set the reporting replicate budgets: the test-set
+    CI bootstrap (``report_ci_bootstrap``; ``None`` picks 2,000 for the O(n²)
+    ``partial_distance_corr`` objective and 10,000 otherwise — percentile CIs
+    are stable well below the higher figure), the effects bootstrap /
+    permutation counts, and the paired CGI-vs-standalone bootstrap."""
     try:
+        # Imported here (not at module load) so the runner module stays light
+        # and the fusion engine is only pulled into the process that runs the
+        # job — the spawn child, where fusion now executes.
+        from geofuse.fusion import MetricFusionEngine
+
         targets = list(target_features_geojson) if target_features_geojson else [None]
         n_t = max(len(targets), 1)
         multi_outcome = len([t for t in targets if t is not None]) > 1
@@ -1375,6 +1124,14 @@ def run_fusion(
                 f"Standalone single-metric studies enabled: {', '.join(standalones)}",
             )
 
+        # Test-CI replicate budget: explicit value wins; otherwise 2,000 for
+        # the O(n²) partial-distance-correlation objective, 10,000 otherwise.
+        report_ci_n = (
+            int(report_ci_bootstrap)
+            if report_ci_bootstrap is not None
+            else (2_000 if objective_metric == "partial_distance_corr" else 10_000)
+        )
+
         # Mixed-effects / longitudinal mode. Reconstructed once up front so
         # spec errors surface before any heavy compute. Cross-sectional jobs
         # pass ``longitudinal_spec_payload=None`` (the default) and follow the
@@ -1389,7 +1146,6 @@ def run_fusion(
             )
 
         by_target: dict = {}
-        engines_by_target: dict = {}
         output_paths: list[str] = []
 
         # Pre-compute every outcome label so the staged-resume ledger can list
@@ -1420,6 +1176,7 @@ def run_fusion(
         run_config_record: dict[str, Any] = {
             "objective_metric": objective_metric,
             "residualize_method": str(residualize_method),
+            "search_scoring_method": str(search_scoring_method),
             "cgi_formula": cgi_formula,
             "covariate_columns": list(covariate_columns or []),
             "standalone_channels": list(standalones),
@@ -1428,6 +1185,7 @@ def run_fusion(
             "n_bootstraps": int(n_bootstraps),
             "n_trials_per_bootstrap": int(n_trials_per_bootstrap),
             "weight_bin_pct": int(weight_bin_pct),
+            "weight_refine_bin_pct": weight_refine_bin_pct,
             "min_cell_count": int(min_cell_count),
             "worst_quantile": float(worst_quantile),
             "max_pfer": float(max_pfer),
@@ -1449,6 +1207,12 @@ def run_fusion(
             "n_spatial_blocks": n_spatial_blocks,
             "check_collinearity": bool(check_collinearity),
             "vif_threshold": float(vif_threshold),
+            "report_ci_bootstrap": int(report_ci_n),
+            "report_effects_bootstrap": int(report_effects_bootstrap),
+            "report_effects_permutations": int(report_effects_permutations),
+            "exposure_iqr": exposure_iqr,
+            "moderator_columns": list(moderator_columns or []),
+            "report_paired_bootstrap": int(report_paired_bootstrap),
             "cache_metrics": bool(cache_metrics),
             "resume_existing_study": bool(resume_existing_study),
             "ndvi_start_date": ndvi_start_date,
@@ -1469,6 +1233,25 @@ def run_fusion(
             )
             ctx.update_stage_ledger(ledger.to_dict())
 
+        # Per-stage monotonic-time gate for ``stage_progress``. ``update_stage_
+        # ledger`` writes SQLite synchronously (unlike the memory-only
+        # ``update_progress``), so per-trial fractional updates must be
+        # throttled or they hammer the store.
+        _stage_prog_t: dict[str, float] = {}
+
+        def stage_progress(key: str, frac: float, message: str = "") -> None:
+            """Advance a *running* stage's fractional progress, throttled to ~1/s.
+
+            The final tick (``frac >= 1``) always writes so the ledger row lands
+            on its true endpoint; intermediate ticks are gated at 1 s per stage.
+            """
+            now = time.monotonic()
+            if frac < 1.0 and (now - _stage_prog_t.get(key, 0.0)) < 1.0:
+                return
+            _stage_prog_t[key] = now
+            ledger.mark_progress(key, frac, message)
+            ctx.update_stage_ledger(ledger.to_dict())
+
         cache_dir = os.path.join(output_dir, "fusion_cache")
 
         # Per-run artifact folder so reruns don't overwrite each other.
@@ -1480,6 +1263,13 @@ def run_fusion(
             output_dir, "fusion", f"{job_stamp}__{_job_short}"
         )
         os.makedirs(job_artifacts_root, exist_ok=True)
+
+        # Cross-sectional metric sources (cropped veg / terrain / NDVI frames)
+        # depend only on the shared target extent + buffer, so they're loaded
+        # once and adopted by every later outcome's engine — no N-fold re-read.
+        # ``None`` until the first outcome loads them; longitudinal mode routes
+        # per-wave files instead and leaves this unused.
+        shared_metric_data: tuple | None = None
 
         for ti, target_feature in enumerate(targets):
             if ctx.is_cancelled():
@@ -1494,8 +1284,41 @@ def run_fusion(
             def prog(local: float) -> float:
                 return (ti + local) / n_t
 
+            # Stage keys belonging to this outcome, for the ledger-derived main
+            # progress bar. For multi-outcome runs keys carry a "<label>::"
+            # prefix; single-outcome runs own the whole ledger.
+            _label_prefix = f"{label}::" if multi_outcome else None
+            label_stage_keys = [
+                s.key
+                for s in ledger.stages
+                if _label_prefix is None or s.key.startswith(_label_prefix)
+            ]
+            _label_total_weight = sum(_fusion_stage_weight(k) for k in label_stage_keys)
+
+            def prog_ledger() -> float:
+                """Main-bar value derived from this outcome's ledger state.
+
+                ``(finished + running·progress)`` weighted by
+                ``_fusion_stage_weight`` over the outcome's total weight, mapped
+                into the outcome's slice via ``prog``. Monotonic by construction
+                — stages only advance and a running stage's fraction only grows.
+                """
+                if _label_total_weight <= 0:
+                    return prog(0.0)
+                done = 0.0
+                for k in label_stage_keys:
+                    st_ = ledger.get(k)
+                    if st_ is None:
+                        continue
+                    w = _fusion_stage_weight(k)
+                    if st_.status in (DONE, SKIPPED):
+                        done += w
+                    elif st_.status == RUNNING:
+                        done += w * st_.progress
+                return prog(done / _label_total_weight)
+
             ctx.progress(
-                value=prog(0.05),
+                value=prog_ledger(),
                 status_text=f"{prefix}Initializing fusion engine...",
             )
 
@@ -1537,31 +1360,34 @@ def run_fusion(
                 spatial_adjust_max_df=spatial_adjust_max_df,
                 spatial_adjust_eps_m=spatial_adjust_eps_m,
                 residualize_method=residualize_method,
+                search_scoring_method=search_scoring_method,
             )
 
-            ctx.progress(value=prog(0.1), status_text=f"{prefix}Loading target data...")
+            ctx.progress(
+                value=prog_ledger(), status_text=f"{prefix}Loading target data..."
+            )
             stage(skey("load_target"), RUNNING)
             engine.load_target()
             stage(skey("load_target"), DONE)
 
             if not veg_path:
                 ctx.progress(
-                    value=prog(0.15),
+                    value=prog_ledger(),
                     status_text=f"{prefix}Downloading GVI Vegetation data...",
                 )
             elif not terrain_path:
                 ctx.progress(
-                    value=prog(0.20),
+                    value=prog_ledger(),
                     status_text=f"{prefix}Downloading GVI Terrain data...",
                 )
             elif not ndvi_path:
                 ctx.progress(
-                    value=prog(0.25),
+                    value=prog_ledger(),
                     status_text=f"{prefix}Downloading NDVI satellite data...",
                 )
             else:
                 ctx.progress(
-                    value=prog(0.15),
+                    value=prog_ledger(),
                     status_text=f"{prefix}Loading provided metric files...",
                 )
 
@@ -1588,29 +1414,59 @@ def run_fusion(
                 ctx.heartbeat()
 
             def cancel_check():
+                # Every fusion stage polls this, so blocking here holds the
+                # run at a stage boundary; the Optuna study, caches, and
+                # ledger are untouched and a resume continues from there.
+                if hasattr(ctx, "wait_while_paused"):
+                    ctx.wait_while_paused()
                 return ctx.is_cancelled()
+
+            # Give the engine the same predicate so its inner loops (coverage
+            # probe, Optuna study, reporting resamples) can answer a cancel
+            # without waiting for the next stage boundary.
+            engine._cancel_callback = cancel_check
 
             stage(skey("load_metrics"), RUNNING)
             if longitudinal_spec is None:
-                engine.load_metrics(
-                    veg_file=veg_path,
-                    terrain_file=terrain_path,
-                    ndvi_file=ndvi_path,
-                    cache_metrics=cache_metrics,
-                    gvi_api_key=gvi_api_key,
-                    ndvi_start_date=ndvi_start_date,
-                    ndvi_end_date=ndvi_end_date,
-                    ndvi_project_id=ndvi_project_id,
-                    progress_callback=gvi_progress_callback,
-                    cancel_callback=cancel_check,
-                    ndvi_resolution_m=ndvi_resolution_m,
-                    gvi_grid_spacing_m=gvi_grid_spacing_m,
-                )
+                if shared_metric_data is None:
+                    engine.load_metrics(
+                        veg_file=veg_path,
+                        terrain_file=terrain_path,
+                        ndvi_file=ndvi_path,
+                        cache_metrics=cache_metrics,
+                        gvi_api_key=gvi_api_key,
+                        ndvi_start_date=ndvi_start_date,
+                        ndvi_end_date=ndvi_end_date,
+                        ndvi_project_id=ndvi_project_id,
+                        progress_callback=gvi_progress_callback,
+                        cancel_callback=cancel_check,
+                        ndvi_resolution_m=ndvi_resolution_m,
+                        gvi_grid_spacing_m=gvi_grid_spacing_m,
+                    )
+                    shared_metric_data = (
+                        engine.veg_data,
+                        engine.terrain_data,
+                        engine.ndvi_data,
+                    )
+                else:
+                    # Every outcome shares the same target extent + metric
+                    # paths, so reuse the first outcome's cropped frames instead
+                    # of re-reading them from disk.
+                    engine.adopt_metric_data(
+                        *shared_metric_data,
+                        ndvi_resolution_m=ndvi_resolution_m,
+                        gvi_grid_spacing_m=gvi_grid_spacing_m,
+                    )
+                    _log_fusion(
+                        "INFO",
+                        f"[{label}] Reusing metric data loaded for the first "
+                        "outcome (skipped re-reading veg / terrain / NDVI).",
+                    )
             else:
                 # Longitudinal mode bypasses ``load_metrics`` (whose path
                 # builds one cross-sectional source per channel); the per-
                 # wave files are loaded in the prepare_longitudinal stage
-                # below and pushed via ``set_longitudinal_metric_data``.
+                # below and registered via ``set_longitudinal_metric_sources``.
                 _log_fusion(
                     "INFO",
                     f"[{label}] Longitudinal mode: per-wave metric files will "
@@ -1624,18 +1480,23 @@ def run_fusion(
             if longitudinal_spec is not None:
                 stage(skey("prepare_longitudinal"), RUNNING)
                 ctx.progress(
-                    value=prog(0.26),
+                    value=prog_ledger(),
                     status_text=f"{prefix}Loading per-wave files...",
                 )
-                # Year-aware cross-sectional
-                if longitudinal_spec.derive_wave_from_date:
+                # Year-aware cross-sectional: the target has no entity column of
+                # its own, so each row becomes its own entity and its wave is
+                # the year it was measured. A genuine longitudinal target
+                # already carries the entity column and derives its own wave
+                # labels during intake, so it is left untouched here.
+                _needs_synthetic_entity = (
+                    longitudinal_spec.derive_wave_from_date
+                    and engine.target_gdf is not None
+                    and longitudinal_spec.entity_id_col not in engine.target_gdf.columns
+                )
+                if _needs_synthetic_entity:
                     from geofuse.longitudinal import parse_date_column as _parse_date
 
                     tgdf = engine.target_gdf
-                    if tgdf is None:
-                        raise RuntimeError(
-                            "derive_wave_from_date requires load_target() to have run."
-                        )
                     date_col = longitudinal_spec.date_col
                     if date_col not in tgdf.columns:
                         raise ValueError(
@@ -1656,26 +1517,49 @@ def run_fusion(
                         "cross-sectional run.",
                     )
                 if longitudinal_spec.intake_mode == "wide":
+                    # Iterate the file map, not the wave list: under year-keyed
+                    # waves a file is a container whose rows carry their own
+                    # wave, so its label is only a log/provenance string.
                     wide_frames: list[tuple[str, gpd.GeoDataFrame]] = []
-                    for wave_label in longitudinal_spec.wave_labels:
-                        wpath = longitudinal_spec.target_files_per_wave[wave_label]
-                        wide_frames.append((wave_label, gpd.read_file(wpath)))
+                    keep_cols = _longitudinal_target_intake_columns(
+                        longitudinal_spec, target_feature, outcome_covs
+                    )
+                    for (
+                        wave_label,
+                        wpath,
+                    ) in longitudinal_spec.target_files_per_wave.items():
+                        wide_frames.append(
+                            (wave_label, read_vector_subset(wpath, keep_cols))
+                        )
                     engine.set_longitudinal_wave_frames(wide_frames)
                     _log_fusion(
                         "INFO",
                         f"[{label}] Loaded {len(wide_frames)} per-wave target "
-                        "files (wide intake).",
+                        f"files (wide intake), keeping columns {keep_cols}.",
                     )
+                    # The engine owns them now and concatenates them into one
+                    # long frame; holding a second reference here would keep
+                    # the per-file copies alive for the whole run.
+                    del wide_frames
+                # Register the file paths only. The engine opens one temporal
+                # key's files when it needs them and frees them before the
+                # next, so a study with many keys never holds every metric
+                # file at once.
+                engine.set_longitudinal_metric_sources(
+                    {
+                        ch: dict(longitudinal_spec.greenery_files[ch])
+                        for ch in GREENERY_CHANNELS
+                    },
+                    _load_longitudinal_metric_file,
+                )
+                key_noun = "year" if longitudinal_spec.derive_wave_from_date else "wave"
                 for ch in GREENERY_CHANNELS:
-                    per_wave: dict[str, Any] = {}
-                    for wave_label, fp in longitudinal_spec.greenery_files[ch].items():
-                        per_wave[wave_label] = _load_longitudinal_metric_file(fp, ch)
-                    engine.set_longitudinal_metric_data(ch, per_wave)
-                    n_unique = len({id(v) for v in per_wave.values()})
+                    files = longitudinal_spec.greenery_files[ch]
+                    n_unique = len(set(files.values()))
                     _log_fusion(
                         "INFO",
-                        f"[{label}] Loaded {ch}: {len(per_wave)} wave(s), "
-                        f"{n_unique} unique source(s).",
+                        f"[{label}] Registered {ch}: {len(files)} {key_noun}(s), "
+                        f"{n_unique} distinct file(s) — opened on demand.",
                     )
                 stage(skey("prepare_longitudinal"), DONE)
                 if ctx.is_cancelled():
@@ -1685,7 +1569,7 @@ def run_fusion(
             # "spatial pre-processing" stage; prepare_fusion_data feeds the cache.
             stage(skey("preaggregate"), RUNNING)
             ctx.progress(
-                value=prog(0.28),
+                value=prog_ledger(),
                 status_text=(
                     f"{prefix}Preparing fusion samples "
                     "(can take a while on large polygon targets)..."
@@ -1713,8 +1597,9 @@ def run_fusion(
                         "percent": pct,
                     }
                 )
+                stage_progress(skey("preaggregate"), pct / 100.0)
                 ctx.progress(
-                    value=prog(0.30 + 0.04 * pct / 100),
+                    value=prog_ledger(),
                     status_text=(
                         f"{prefix}Spatial pre-processing: "
                         f"{current:,}/{total:,} grid cells ({pct}%)"
@@ -1732,6 +1617,31 @@ def run_fusion(
             if not completed or ctx.is_cancelled():
                 return {"output_paths": output_paths}
             stage(skey("preaggregate"), DONE)
+
+            # Pre-flight data sanity: an outcome or covariate whose SD dwarfs
+            # its inter-percentile spread is almost certainly corrupted
+            # (uncleaned sentinels, a units mix-up). Warn loudly so a bad input
+            # is caught before hours of fitting, but don't refuse — the user
+            # cleans inputs outside the toolbox and may know better.
+            try:
+                dispersion = engine.check_covariate_dispersion()
+                if dispersion["flagged"]:
+                    by_col = {c["column"]: c for c in dispersion["columns"]}
+                    detail = "; ".join(
+                        f"{c} (std={by_col[c]['std']:.3g} vs "
+                        f"p90−p10={by_col[c]['spread']:.3g})"
+                        for c in dispersion["flagged"]
+                    )
+                    _log_fusion(
+                        "WARN",
+                        f"[{label}] Data sanity: {len(dispersion['flagged'])} "
+                        f"column(s) have a standard deviation more than "
+                        f"{dispersion['spread_ratio']:.0f}× their p90−p10 spread — "
+                        f"likely corrupted input. Verify before trusting results: "
+                        f"{detail}.",
+                    )
+            except Exception as exc:
+                _log_fusion("WARN", f"[{label}] Dispersion sanity check failed: {exc}.")
 
             # Optional iterative-VIF collinearity check on the CGI grid
             # pixel values. Disabled channels get pinned to weight 0 in
@@ -1812,7 +1722,7 @@ def run_fusion(
             # selection resamples.
             stage(skey("split"), RUNNING)
             ctx.progress(
-                value=prog(0.89),
+                value=prog_ledger(),
                 status_text=f"{prefix}Splitting data into train / val / test...",
             )
             engine.split_data(
@@ -1825,10 +1735,11 @@ def run_fusion(
             )
             stage(skey("split"), DONE)
 
-            # Partial distance correlation builds O(n²) distance matrices per
-            # score when conditioning on covariates, so large entity counts make
-            # the bootstrap + permutation passes slow. Plain distance_corr uses
-            # the fast O(n log n) estimator and is unaffected. Warn rather than
+            # Partial distance correlation is O(n²) in entities even with the
+            # cached-side scorer (each trial still builds the composite's
+            # distance matrix), and above the cached-path budget it falls back
+            # to the stock estimator entirely. Plain distance_corr uses the
+            # fast O(n log n) estimator and is unaffected. Warn rather than
             # cap so the metric stays exact.
             if objective_metric == "partial_distance_corr" and outcome_covs:
                 try:
@@ -1843,9 +1754,15 @@ def run_fusion(
                     _log_fusion(
                         "WARN",
                         f"[{label}] partial_distance_corr scores are O(n²) over "
-                        f"{n_entities:,} entities with covariates — bootstrap CIs "
-                        "and permutation tests will take noticeably longer. "
-                        "'distance_corr' (fast) or 'spearman' are cheaper "
+                        f"{n_entities:,} entities with covariates — trials and "
+                        "reporting CIs will take noticeably longer"
+                        + (
+                            " (and the cached fast path is disabled at this "
+                            "entity count)"
+                            if n_entities > _pdcor_mod.MAX_CACHE_N
+                            else ""
+                        )
+                        + ". 'distance_corr' (fast) or 'spearman' are cheaper "
                         "covariate-aware objectives if runtime matters.",
                     )
 
@@ -1876,12 +1793,15 @@ def run_fusion(
                     f"×{_standalone_cells / _cgi_cells:.2f}).",
                 )
 
-            def _study_progress_cb(study_label: str):
-                """Per-trial callback → live caption + secondary trial bar.
+            def _study_progress_cb(study_label: str, stage_key: str | None = None):
+                """Per-trial callback → live caption, trial bar, and stage row.
 
                 Throttled to ~0.4 s (always fires on the final trial) so the
                 job card shows "<study>: k / N trials" without flooding the
-                store. Leaves the stage-driven main bar untouched.
+                store. When ``stage_key`` is given it also advances that
+                running search stage's ledger fraction (via ``stage_progress``,
+                which self-throttles the synchronous SQLite write) and steps the
+                ledger-derived main bar.
                 """
                 state = {"t": 0.0}
 
@@ -1891,8 +1811,14 @@ def run_fusion(
                         return
                     state["t"] = now
                     pct = (100.0 * done / total) if total else 0.0
+                    if stage_key is not None:
+                        stage_progress(
+                            stage_key,
+                            (done / total) if total else 0.0,
+                            f"{done:,}/{total:,} trials",
+                        )
                     ctx.progress(
-                        value=None,
+                        value=prog_ledger() if stage_key is not None else None,
                         status_text=f"{prefix}{study_label}: {done:,}/{total:,} trials",
                         fusion_study_progress={
                             "study": study_label,
@@ -1904,66 +1830,82 @@ def run_fusion(
 
                 return _cb
 
+            # A non-positive cap means "no PFER cap" — pass None so the
+            # calibration is free to grow the selection size K.
+            max_pfer_arg = None if float(max_pfer) <= 0 else float(max_pfer)
+
+            # ── Stability selection (dominant compute) ──
+            # Headline params: the stability-selection winning weight cell on
+            # the full train+val pool (params averaged within the cell). The
+            # "CGI: k/N trials" sub-bar and the running-stage fraction both live
+            # here, so the running stage and the trial counter agree.
             stage(skey("optimize"), RUNNING)
             ctx.progress(
-                value=prog(0.90),
+                value=prog_ledger(),
                 status_text=(
                     f"{prefix}Stability selection "
                     f"({int(n_bootstraps)}×{cgi_trials_per_bootstrap})..."
                 ),
             )
-            # Stability selection has no master Optuna study; ``best_params``
-            # stays empty and the winning cell is computed in the evaluate
-            # stage below.
-            best_params: dict = {}
-            if ctx.is_cancelled():
-                return {"output_paths": output_paths}
-            stage(skey("optimize"), DONE)
-
-            stage(skey("robust"), RUNNING)
-            ctx.progress(
-                value=prog(0.85),
-                status_text=f"{prefix}Aggregating bootstrap cells...",
-            )
-            # No master Optuna study to filter — the robust pool is implicit in
-            # the per-cell OOB aggregation stability selection performs.
-            robust_trials: list = []
-            stage(skey("robust"), DONE)
-
-            stage(skey("evaluate"), RUNNING)
-            ctx.progress(
-                value=prog(0.9), status_text=f"{prefix}Evaluating on test set..."
-            )
-            # A non-positive cap means "no PFER cap" — pass None so the
-            # calibration is free to grow the selection size K.
-            max_pfer_arg = None if float(max_pfer) <= 0 else float(max_pfer)
-            # Headline params: the stability-selection winning weight cell on
-            # the full train+val pool (params averaged within the cell).
             headline_params = engine.bootstrap_stability_selection(
                 metric=objective_metric,
                 n_bootstraps=int(n_bootstraps),
                 n_trials_per_bootstrap=cgi_trials_per_bootstrap,
                 weight_bin_pct=int(weight_bin_pct),
+                weight_refine_bin_pct=weight_refine_bin_pct,
                 min_cell_count=int(min_cell_count),
                 worst_quantile=float(worst_quantile),
                 max_pfer=max_pfer_arg,
                 spatial_resample=bool(spatial_split),
                 seed=42,
                 cancel_callback=cancel_check,
-                progress_callback=_study_progress_cb("CGI"),
+                progress_callback=_study_progress_cb("CGI", skey("optimize")),
             )
             engine.best_params = dict(headline_params)
             cgi_stability_summary = _stability_summary(headline_params)
+            # Kept for the results bundle's schema. Stability selection has no
+            # master Optuna study, so there is no explicit best/robust trial
+            # pool — the winning cell is the aggregate over bootstrap resamples.
+            best_params: dict = {}
+            robust_trials: list = []
+            if ctx.is_cancelled():
+                return {"output_paths": output_paths}
+            stage(skey("optimize"), DONE)
 
+            # ── Score the held-out test set ─────────────
+            stage(skey("evaluate"), RUNNING)
+            ctx.progress(
+                value=prog_ledger(),
+                status_text=f"{prefix}Scoring held-out test set...",
+            )
             test_results = engine.evaluate_on_test(
                 params=headline_params, metric=objective_metric
+            )
+            stage(skey("evaluate"), DONE)
+
+            # ── Replicate statistics: the long tail ─────
+            # Test-set percentile bootstrap CI, relationship direction, and the
+            # held-out effect sizes / permutation p-value — thousands of
+            # replicates, named for what it is instead of hiding under
+            # "evaluate".
+            stage(
+                skey("report_stats"),
+                RUNNING,
+                f"Test CI: {report_ci_n:,} bootstrap replicates...",
+            )
+            ctx.progress(
+                value=prog_ledger(),
+                status_text=(
+                    f"{prefix}Bootstrap CIs, effects & permutation tests "
+                    f"({report_ci_n:,} replicates)..."
+                ),
             )
             # Independent held-out effect size + percentile bootstrap CI.
             try:
                 cgi_test_ci = engine.bootstrap_test_score_ci(
                     headline_params,
                     objective_metric,
-                    n_bootstrap=10000,
+                    n_bootstrap=report_ci_n,
                     ci_level=0.95,
                     method="percentile",
                     seed=42,
@@ -1982,7 +1924,11 @@ def run_fusion(
             cgi_effects: dict | None = None
             try:
                 cgi_effects = engine.evaluate_effects(
-                    headline_params, objective_metric, seed=42
+                    headline_params,
+                    objective_metric,
+                    n_bootstrap=int(report_effects_bootstrap),
+                    n_perm=int(report_effects_permutations),
+                    seed=42,
                 )
                 if cgi_effects and cgi_effects.get("test"):
                     _t = cgi_effects["test"]
@@ -2001,28 +1947,23 @@ def run_fusion(
             # No master Optuna study in stability mode, so there is no per-trial
             # test sidecar to build.
             cgi_per_trial_test: dict[int, dict[str, float]] = {}
-            stage(skey("evaluate"), DONE)
+            stage(skey("report_stats"), DONE)
 
             stage(skey("apply"), RUNNING)
             ctx.progress(
-                value=prog(0.95), status_text=f"{prefix}Applying fusion weights..."
+                value=prog_ledger(), status_text=f"{prefix}Applying fusion weights..."
             )
             composite_df = engine.apply_fusion()
             stage(skey("apply"), DONE)
 
-            # ── Post-hoc multi-metric reporting (MixedLM scoring only) ──
-            # Re-score every robust + top-20% trial + the averaged-composite
-            # parameters on the test set with all four mixedlm_* metrics so
-            # the user can compare metric agreement across the trial pool.
-            # The CSV basename includes the outcome label so multi-outcome
-            # runs don't overwrite each other. Skipped when the
-            # longitudinal spec is acting only as a per-year file-routing
-            # key with an OLS scorer — there are no MixedLM metrics to
-            # report.
+            # ── Post-hoc multi-metric reporting ─────────
+            # Re-score the trial pool on the test set with all four mixedlm_*
+            # metrics, so metric agreement is visible. Skipped when the spec is
+            # only routing files per year and the scorer is OLS.
             if mixedlm_postscore_enabled:
                 stage(skey("mixedlm_postscore"), RUNNING)
                 ctx.progress(
-                    value=prog(0.97),
+                    value=prog_ledger(),
                     status_text=(
                         f"{prefix}Scoring all MixedLM metrics on robust trials..."
                     ),
@@ -2048,14 +1989,10 @@ def run_fusion(
                     )
                 stage(skey("mixedlm_postscore"), DONE)
 
-            # ── Standalone single-metric stability searches ─────────────────
-            # One bootstrap stability search per enabled channel, reusing the
-            # same engine, the already-built per-(entity, radius) cache, and the
-            # train+val/test split.
-            #
-            # Each search overwrites ``engine.best_params`` /
-            # ``engine._active_greenery_channel`` with the standalone's, so we
-            # snapshot the CGI state up front and restore it after the loop.
+            # ── Standalone stability searches ───────────
+            # One search per channel, reusing the engine, its cache and split.
+            # Each overwrites the engine's active channel and best params, so
+            # snapshot the CGI state here and restore it after the loop.
             cgi_best_value = float(
                 headline_params.get("__cell_q_worst__", float("nan"))
             )
@@ -2068,7 +2005,7 @@ def run_fusion(
                 ch_disp = _STANDALONE_CHANNEL_LABELS.get(ch, ch)
                 stage(skey(f"standalone_{ch}"), RUNNING)
                 ctx.progress(
-                    value=prog(0.95),
+                    value=prog_ledger(),
                     status_text=(
                         f"{prefix}Standalone {ch_disp} stability selection "
                         f"({int(n_bootstraps)}×{int(n_trials_per_bootstrap)})..."
@@ -2086,18 +2023,29 @@ def run_fusion(
                     n_bootstraps=int(n_bootstraps),
                     n_trials_per_bootstrap=int(standalone_trials_per_bootstrap),
                     weight_bin_pct=int(weight_bin_pct),
+                    weight_refine_bin_pct=weight_refine_bin_pct,
                     min_cell_count=int(min_cell_count),
                     worst_quantile=float(worst_quantile),
                     max_pfer=max_pfer_arg,
                     spatial_resample=bool(spatial_split),
                     seed=42,
                     cancel_callback=cancel_check,
-                    progress_callback=_study_progress_cb(f"Standalone: {ch_disp}"),
+                    progress_callback=_study_progress_cb(
+                        f"Standalone: {ch_disp}", skey(f"standalone_{ch}")
+                    ),
                 )
                 engine.best_params = dict(ch_best)
                 ch_headline_params = dict(ch_best)
                 ch_stability_summary = _stability_summary(ch_best)
+                stage(skey(f"standalone_{ch}"), DONE)
 
+                # Test scoring, CIs, subset scores, composite TIFF, and the
+                # optional MixedLM post-score form this channel's report stage.
+                stage(skey(f"standalone_{ch}_report"), RUNNING)
+                ctx.progress(
+                    value=prog_ledger(),
+                    status_text=f"{prefix}Standalone {ch_disp} test scoring & reports...",
+                )
                 ch_test = engine.evaluate_on_test(
                     params=ch_headline_params, metric=objective_metric
                 )
@@ -2105,7 +2053,7 @@ def run_fusion(
                     ch_test_ci = engine.bootstrap_test_score_ci(
                         ch_headline_params,
                         objective_metric,
-                        n_bootstrap=10000,
+                        n_bootstrap=report_ci_n,
                         ci_level=0.95,
                         method="percentile",
                         seed=42,
@@ -2207,7 +2155,7 @@ def run_fusion(
                             f"[{label}] Standalone {ch} post-hoc MixedLM "
                             f"scoring failed: {exc}",
                         )
-                stage(skey(f"standalone_{ch}"), DONE)
+                stage(skey(f"standalone_{ch}_report"), DONE)
 
             # Restore the engine to its CGI state so downstream code that reads
             # ``engine.best_params`` / ``engine._active_greenery_channel`` sees
@@ -2216,7 +2164,7 @@ def run_fusion(
                 engine.best_params = cgi_best_params
                 engine._active_greenery_channel = "cgi"
 
-            # ── AIC/BIC: is CGI justified over the best standalone channel? ──
+            # ── AIC/BIC vs the best standalone ──────────
             cgi_vs_standalone_aic_bic: dict | None = None
             if standalones:
                 cgi_vs_standalone_aic_bic = _compare_cgi_vs_standalone(
@@ -2254,9 +2202,33 @@ def run_fusion(
                         or ch_bundle.get("best_params")
                         or {}
                     )
+                    # Each standalone gets its own exposure–response table. The
+                    # single-channel arm is what a published NDVI result is read
+                    # against, so it needs the same per-IQR effect, quantile
+                    # gradient and non-linearity test as the composite.
+                    prev_channel = getattr(engine, "_active_greenery_channel", "cgi")
+                    try:
+                        engine._active_greenery_channel = ch
+                        ch_bundle["exposure_response"] = (
+                            engine.compute_exposure_response(
+                                params=ch_params, iqr=exposure_iqr
+                            )
+                        )
+                    except Exception as exc:
+                        _log_fusion(
+                            "WARN",
+                            f"[{label}] Exposure-response ({ch}) failed: {exc}",
+                        )
+                    finally:
+                        engine._active_greenery_channel = prev_channel
                     try:
                         pd_res = engine.paired_objective_difference(
-                            headline_params, ch_params, ch, objective_metric, seed=42
+                            headline_params,
+                            ch_params,
+                            ch,
+                            objective_metric,
+                            n_bootstrap=int(report_paired_bootstrap),
+                            seed=42,
                         )
                     except Exception as exc:
                         _log_fusion(
@@ -2297,13 +2269,13 @@ def run_fusion(
                     f"Holm p={cgi_vs_standalone_paired.get('p_value_holm')}.",
                 )
 
-            # ── Composite GeoTIFF (raster write) ──
+            # ── Composite GeoTIFF (raster write) ────────
             # Runs after the standalone stages so they can advance the ledger
             # first. Failures here don't kill the run — the composite_df is
             # already captured in ``bundle``.
             stage(skey("reports"), RUNNING)
             ctx.progress(
-                value=prog(0.98),
+                value=prog_ledger(),
                 status_text=f"{prefix}Generating reports + composite GeoTIFF...",
             )
             report_dir = os.path.join(job_artifacts_root, "study_results")
@@ -2352,6 +2324,54 @@ def run_fusion(
                     f"[{label}] Covariate impact computation failed: {exc}",
                 )
 
+            # Longitudinal exposure–decline terms (greenery × time) on the
+            # winning composite — the overall slope plus the optional
+            # between/within decomposition selected in the spec.
+            decline_terms: dict | None = None
+            if longitudinal_spec is not None:
+                try:
+                    decline_terms = engine.compute_decline_terms(
+                        params=averaged_params or best_params
+                    )
+                except Exception as exc:
+                    _log_fusion(
+                        "WARN",
+                        f"[{label}] Decline-terms computation failed: {exc}",
+                    )
+
+            # Exposure–response shapes on the winning composite: the effect per
+            # interquartile-range increase, the quartile gradient against the
+            # lowest group, and a spline test of whether the linear form the
+            # search assumed is right. This is the form the greenspace
+            # literature reports, so it is what a replication is read against.
+            exposure_response_report: dict | None = None
+            try:
+                exposure_response_report = engine.compute_exposure_response(
+                    params=averaged_params or best_params,
+                    iqr=exposure_iqr,
+                )
+            except Exception as exc:
+                _log_fusion(
+                    "WARN",
+                    f"[{label}] Exposure-response computation failed: {exc}",
+                )
+
+            # Effect modification: does the greenery association differ across
+            # levels of a moderator. Reporting-stage, like the exposure-response
+            # shapes — the search still optimises the greenery association, as
+            # the source papers fit one pre-specified model.
+            moderation_report: list[dict] = []
+            try:
+                moderation_report = engine.compute_moderation(
+                    params=averaged_params or best_params,
+                    moderator_columns=moderator_columns,
+                )
+            except Exception as exc:
+                _log_fusion(
+                    "WARN",
+                    f"[{label}] Moderation computation failed: {exc}",
+                )
+
             bundle = {
                 "best_params": best_params,
                 "averaged_params": averaged_params,
@@ -2363,6 +2383,9 @@ def run_fusion(
                 "test_results": test_results,
                 "subset_scores": cgi_subset_scores,
                 "covariate_impact": covariate_impact,
+                "decline_terms": decline_terms,
+                "exposure_response": exposure_response_report,
+                "moderation": moderation_report,
                 "target_feature": target_feature,
                 # Run details persisted so the results panel survives a disk
                 # reload (when the live engine is gone): user-facing covariate
@@ -2400,7 +2423,6 @@ def run_fusion(
                 "cgi_vs_standalone_paired_family": cgi_vs_standalone_paired_family,
             }
             by_target[label] = bundle
-            engines_by_target[label] = engine
 
             # Persist every test result (CGI + standalones) to disk: a
             # machine-readable manifest plus tidy CSVs. Best-effort — a write
@@ -2440,10 +2462,17 @@ def run_fusion(
         if not multi_outcome:
             results_payload.update(by_target[sole_label])
 
+        # Fusion runs in a spawn child, so live engine objects (unpicklable and
+        # large) never cross the process boundary. Ship only the JSON-safe
+        # results — the same payload persisted below — with no live engine. The
+        # results view hydrates from this exactly as it does from disk after a
+        # Streamlit restart: the composite viewer reads its GeoTIFFs from disk
+        # and simply omits the live-engine target overlay.
+        jsonsafe_payload = _jsonsafe_results(results_payload)
         ctx.set_extra(
-            engine=None if multi_outcome else engines_by_target[sole_label],
-            engines_by_target=engines_by_target,
-            results=results_payload,
+            engine=None,
+            engines_by_target={},
+            results=jsonsafe_payload,
             artifacts_dir=job_artifacts_root,
         )
 
@@ -2453,13 +2482,23 @@ def run_fusion(
         try:
             bundle_json_path = os.path.join(job_artifacts_root, "results_bundle.json")
             with open(bundle_json_path, "w", encoding="utf-8") as _bf:
-                json.dump(_jsonsafe_results(results_payload), _bf, default=str)
+                json.dump(jsonsafe_payload, _bf, default=str)
             output_paths.append(bundle_json_path)
         except Exception as exc:
             _log_fusion("WARN", f"Could not write results bundle JSON: {exc}")
 
+        _log_stage_timing(ledger, _log_fusion)
+
         ctx.progress(value=1.0, status_text="Completed")
         return {"output_paths": output_paths}
+
+    except JobCancelled:
+        # An engine loop answered the cancel mid-stage. Whatever earlier stages
+        # wrote is already on disk and in the ledger, so this returns the way
+        # the stage-boundary cancels do; the executor reads the cancel flag and
+        # files the job as cancelled rather than failed.
+        _log_fusion("WARN", "Fusion job cancelled by user.")
+        return {"output_paths": []}
 
     finally:
         if target_cleanup_dir:

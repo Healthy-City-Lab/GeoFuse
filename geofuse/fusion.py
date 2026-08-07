@@ -5,10 +5,13 @@ This module implements the optimization logic from CGI.ipynb for tuning
 weighted combinations of NDVI and GVI metrics against target outcomes.
 """
 
+import gc
 import hashlib
 import logging
 import os
-from collections.abc import Callable
+import time
+from collections import OrderedDict
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -17,16 +20,25 @@ import numpy as np
 import optuna
 import pandas as pd
 import rasterio
-from rasterio.transform import from_origin, rowcol, xy
+from rasterio.transform import from_origin, xy
 from shapely.geometry import box
 from sklearn.model_selection import train_test_split
 
 from . import (
+    JobCancelled,
+    binary_longitudinal,
     cgi_formulas,
+    exposure_response,
+)
+from . import fusion_helpers as _helpers
+from . import (
     longitudinal,
+    metric_intake,
     metric_sampling,
     mixed_effects_scoring,
     objective_scoring,
+    parallel,
+    pdcor,
     preaggregation,
     spatial_basis,
 )
@@ -37,21 +49,78 @@ from .crs_utils import (
     crs_uses_metre_axes,
     default_geotiff_creation_options,
     estimate_metre_projected_crs_for_gdf,
+    metres_per_degree_at_lat,
     normalize_geographic_gdf_to_wgs84,
     reproject_geodataframe_to_wgs84,
     select_grid_crs_with_warning,
 )
 from .logger import attach_external_logger, get_logger
 from .raster_sampling import LazyRasterArray
-from .vector_io import geometry_sha256, target_path_is_raster
+from .vector_io import (
+    match_column_alias,
+    read_vector_subset,
+    target_path_is_raster,
+)
 
 logger = logging.getLogger(__name__)
 _log = get_logger("FUSION")
 
-# Metric rasters larger than this (uncompressed band bytes) are read lazily in
-# windows from disk instead of loaded whole — keeps national-scale rasters off
-# the heap. Smaller rasters stay in RAM (faster per-point reads).
-_LAZY_RASTER_THRESHOLD_BYTES = 256 * 1024 * 1024
+# Files whose buffered-extent shortfall has already been reported this process,
+# keyed by (abspath, rounded bounds). A cached NDVI file's sub-pixel shortfall
+# is permanent, so without this the multi-outcome loop (a fresh engine per
+# outcome) and every repeated run would re-emit the same warning.
+_WARNED_METRIC_BOUNDS: set[tuple] = set()
+
+
+def _finite_or_none(value) -> float | None:
+    """``float(value)`` when it is finite, else ``None``.
+
+    Reporting payloads travel to JSON and to the results UI, where a ``NaN``
+    renders as the literal text "nan"; ``None`` is the only value both layers
+    read as "not available".
+    """
+    try:
+        fv = float(value)
+    except (TypeError, ValueError):
+        return None
+    return fv if np.isfinite(fv) else None
+
+
+def _log_parallel_efficiency(
+    log,
+    phase: str,
+    *,
+    wall_s: float,
+    busy_s: float,
+    workers: int,
+) -> None:
+    """Report a phase's achieved concurrency against what the machine offers.
+
+    ``busy_s`` is summed worker time, so ``busy_s / wall_s`` is the average
+    number of workers actually running. Comparing that to ``workers`` says
+    whether the pool is saturated, and comparing ``workers`` to the core count
+    says whether the pool itself is the ceiling — the two questions that decide
+    whether raising the worker count would buy anything on *this* host.
+    """
+    if wall_s <= 0 or busy_s <= 0:
+        return
+    cores = os.cpu_count() or 0
+    achieved = busy_s / wall_s
+    saturation = achieved / workers if workers else 0.0
+    parts = [
+        f"{phase}: {achieved:.1f} of {workers} worker(s) busy on average "
+        f"({saturation * 100:.0f}% pool saturation)"
+    ]
+    if cores:
+        parts.append(f"{achieved / cores * 100:.0f}% of {cores} logical core(s)")
+        if saturation >= 0.85 and workers < cores:
+            parts.append(
+                f"pool-bound — the cap, not the work, is the limit "
+                f"({cores - workers} core(s) idle)"
+            )
+        elif saturation < 0.6:
+            parts.append("work-bound — raising the cap would not help")
+    log("INFO", "  " + " · ".join(parts) + ".")
 
 
 class MetricFusionEngine:
@@ -97,6 +166,7 @@ class MetricFusionEngine:
         spatial_adjust_max_df: int = 10,
         spatial_adjust_eps_m: float | None = None,
         residualize_method: str = "linear",
+        search_scoring_method: str = "mom_em3",
     ):
         """
         Initialize the fusion engine.
@@ -147,6 +217,12 @@ class MetricFusionEngine:
 
         attach_external_logger("optuna", _logging.INFO)
         attach_external_logger("ee", _logging.INFO)
+        # This module's own stdlib ``logger`` (``geofuse.fusion``) carries
+        # engine diagnostics — bounds checks, metric load notes, cache messages.
+        # Attaching it routes those into the per-job log (and stops them
+        # propagating to the host terminal) alongside the engine's ``_log``
+        # output, instead of leaking to the backend console.
+        attach_external_logger("geofuse.fusion", _logging.INFO)
 
         self.target_file = target_file
         self.target_feature = target_feature
@@ -226,6 +302,12 @@ class MetricFusionEngine:
         }
         self._covariate_columns_user: list[str] = list(self.covariate_columns)
         self._covariate_dummy_map: dict[str, list[str]] = {}
+        # Expanded user covariates, and the wave / area indicators that follow
+        # them. Reporting names only the former; both are fitted.
+        self._user_covariate_columns: list[str] = list(self.covariate_columns)
+        self._period_control_columns: list[str] = []
+        self._wave_control_columns: list[str] = []
+        self._time_fixed_effect_dropped: bool = False
         self._covariates_expanded: bool = False
 
         # Spatial-confounding adjustment. ``none`` keeps the plain covariate-
@@ -261,6 +343,13 @@ class MetricFusionEngine:
                 f"{sorted(objective_scoring.RESIDUALIZE_METHODS)}; got {res_method!r}."
             )
         self.residualize_method: str = res_method
+
+        # Longitudinal search scorer. ``mom_em3`` (default) / ``mom_em1`` /
+        # ``mom`` / ``reml`` estimate the per-fold variance components for the
+        # fast fixed-V GLS trial scorer (see ``mixed_effects_scoring``);
+        # ``exact`` bypasses it and fits a full MixedLM per trial (the original
+        # behaviour). Reports always use the exact MixedLM refit regardless.
+        self.search_scoring_method: str = str(search_scoring_method)
 
         # Longitudinal / mixed-effects spec. ``None`` keeps the engine in
         # cross-sectional mode (no behaviour change). When set, every code
@@ -325,23 +414,59 @@ class MetricFusionEngine:
         self.best_params = None
         self.scaler = None
 
+        # Per-trial objective durations, appended by every search thread and
+        # summed into the phase's achieved-concurrency figure.
+        self._objective_secs: list[float] = []
+
         # Donut / ring cache: per-point annulus samples keyed by fold subset + indices
         self._ring_raster_cache: dict = {}
         self._ring_vector_cache: dict = {}
         self._max_points_ring_cache = 8000
+        # Payload ceiling for one ring-cache entry. The point cap above bounds
+        # rows only; a fine raster under a wide radius stores tens of thousands
+        # of values per row, so the estimated byte size gates the build too.
+        self._max_ring_cache_bytes = 1_000_000_000
 
         # Reporting-phase caches (all invalidated by ``split_data``): the
-        # train+val+test union frame is rebuilt by several report helpers, and
-        # ``apply_fusion`` is called repeatedly with the same winning params.
+        # train+val+test union frame is rebuilt by several report helpers,
+        # ``apply_fusion`` is called repeatedly with the same winning params,
+        # and ``evaluate_on_test`` is re-invoked with identical params by the
+        # runner headline, the effects block, and the subset-score table.
         self._full_data_cache: pd.DataFrame | None = None
         self._apply_fusion_cache: tuple[tuple, pd.DataFrame] | None = None
+        self._evaluate_test_cache: dict[tuple, dict] = {}
+
+        # Scoring-side caches, cleared with the spatial-basis cache (their
+        # contents are constant per scored subset, not per trial): the fixed
+        # U-centered sides of the partial-distance-correlation estimator and
+        # the spline-expanded covariate bases.
+        self._pdcor_cache: OrderedDict = OrderedDict()
+        self._spline_basis_cache: dict = {}
+        # Trial-invariant per-fold data (collapse codes, collapsed target /
+        # covariates / coords, points slices); cleared with the ring caches.
+        self._fold_static_cache: dict = {}
+        # Monotonic counter bumped whenever the live fold row sets are replaced
+        # (a fresh split, or each bootstrap resample). Fold-static entries key
+        # on it so an entry can never be served for a different row set.
+        self._split_generation: int = 0
+
+        # Trial threads for the stability search. Only the longitudinal
+        # fast-GLS path uses them: the other paths keep LRU scoring caches that
+        # are not thread-safe (see ``_search_n_jobs``).
+        self._search_workers: int = parallel.worker_count()
 
         # Spatial pre-aggregation (mandatory; built by precompute_aggregations()).
         # Backed by an on-disk SQLite cache (geofuse/preaggregation.py) so the
         # per-(entity, radius) stat table survives cancels/crashes and is reused
         # across runs.
         self._preaggregation_done: bool = False
-        self._preaggr_cache: preaggregation.PreAggregationCache | None = None
+        self._preaggr_cache: preaggregation.GreeneryCache | None = None
+        # RAM-resident mirror of the complete cache (kept for compatibility;
+        # the GreeneryCache is itself resident, so this stays ``None``).
+        self._preaggr_mem = None
+        # Maps frame-local ``_preaggr_id`` → stable global pixel id, so scoring
+        # rows resolve to the greenery cache's keys at lookup time.
+        self._preaggr_pid_translate: np.ndarray | None = None
         # Unique-pixel source for the pre-aggregation cache. Point/line targets
         # duplicate each catchment pixel per overlapping entity for scoring, but
         # a pixel's per-radius stats are identical across those duplicates, so
@@ -364,6 +489,9 @@ class MetricFusionEngine:
         # the check wasn't requested). Stored so the runner can hand it to
         # the results UI without re-running the analysis.
         self._collinearity_report: dict | None = None
+        # Outcome / covariate dispersion sanity report from the most recent
+        # pre-flight check (or ``None`` if it hasn't run yet).
+        self._dispersion_report: dict | None = None
 
         # Vector vs raster (``is_points`` kept for backward compatibility = vector target)
         self.is_raster = target_path_is_raster(target_file)
@@ -378,12 +506,11 @@ class MetricFusionEngine:
         # ``load_target`` exactly as in cross-sectional mode and converts it
         # to long format inside ``prepare_fusion_data``.
         self._longitudinal_wave_frames: list[tuple[str, gpd.GeoDataFrame]] | None = None
-        # Per-wave metric sources for the mixed-effects mode. Populated by
-        # ``set_longitudinal_metric_data`` before ``precompute_aggregations``.
-        # Outer dict: channel → wave_label → metric source (GeoDataFrame for
-        # vector channels, raster-dict for raster channels — same layout
-        # ``load_metrics`` produces). Cross-sectional runs leave this ``None``.
-        self._longitudinal_metric_data: dict[str, dict[str, Any]] | None = None
+        # Per-temporal-key metric sources for the mixed-effects mode. Populated
+        # by ``set_longitudinal_metric_sources`` (paths, loaded on demand)
+        # before ``precompute_aggregations``. Cross-sectional runs leave this
+        # ``None``.
+        self._metric_sources: metric_intake.LongitudinalMetricSources | None = None
 
         if self.is_longitudinal and self.is_raster:
             raise ValueError(
@@ -391,61 +518,62 @@ class MetricFusionEngine:
                 "raster targets have no entity-id attribute column."
             )
 
-    # ------------------------------------------------------------------
+    # ────────────────────────────────────────────────────────────
     # Longitudinal mode — entry points + helpers
-    # ------------------------------------------------------------------
+    # ────────────────────────────────────────────────────────────
 
     @property
     def is_longitudinal(self) -> bool:
         """True when a :class:`LongitudinalSpec` was provided at construction."""
         return self.longitudinal_spec is not None
 
-    def set_longitudinal_metric_data(
-        self,
-        channel: str,
-        per_wave_data: dict[str, Any],
-    ) -> None:
-        """Inject pre-loaded per-wave metric data for one greenery channel.
+    def _temporal_key_noun(self) -> str:
+        """What one temporal key represents, for logs and messages.
 
-        Cross-sectional callers populate ``self.veg_data`` / ``self.terrain_data``
-        / ``self.ndvi_data`` via :meth:`load_metrics`. Mixed-effects callers
-        instead supply one metric source per wave for each channel (the runner
-        resolves each wave's file path against loaded results / uploads /
-        auto-download and hands the result here). ``per_wave_data`` maps every
-        wave label in the spec to either a ``GeoDataFrame`` (vector metric) or
-        the raster-dict layout ``load_metrics`` produces; the cache build then
-        consults the right per-wave source for each ``(entity_id, wave)`` row.
+        The spec's ``derive_wave_from_date`` decides this: with it on, a row's
+        key is the calendar year it was measured in (so the same year can be a
+        baseline for one participant and a follow-up for another); with it off,
+        the key is the wave label the file was supplied under.
+        """
+        spec = self.longitudinal_spec
+        if spec is not None and spec.derive_wave_from_date:
+            return "year"
+        return "wave"
+
+    def _validate_temporal_coverage(self, per_key: Mapping[str, Any]) -> None:
+        """Every temporal key in the spec must have an entry."""
+        spec = self.longitudinal_spec
+        assert spec is not None
+        missing = [w for w in spec.wave_labels if w not in per_key]
+        if missing:
+            raise ValueError(
+                f"metric sources are missing entries for waves: {missing}."
+            )
+
+    def set_longitudinal_metric_sources(
+        self,
+        paths: Mapping[str, Mapping[str, str]],
+        loader: Callable[[str, str], Any],
+    ) -> None:
+        """Register per-temporal-key metric *file paths*, loaded on demand.
+
+        ``paths`` maps ``channel -> temporal key -> file path``, where the
+        temporal key is the measurement year when the spec derives waves from
+        dates, and the wave label otherwise. Nothing is read here: the engine
+        loads one key's files when it needs them and releases them before
+        moving to the next, so a study with many waves never holds more than
+        one key's metrics in memory.
         """
         if not self.is_longitudinal:
             raise RuntimeError(
-                "set_longitudinal_metric_data() requires longitudinal_spec to be set."
+                "set_longitudinal_metric_sources() requires longitudinal_spec "
+                "to be set."
             )
-        if channel not in longitudinal.GREENERY_CHANNELS:
-            raise ValueError(
-                f"Unknown channel {channel!r}; expected one of "
-                f"{longitudinal.GREENERY_CHANNELS}."
-            )
-        spec = self.longitudinal_spec
-        assert spec is not None
-        missing = [w for w in spec.wave_labels if w not in per_wave_data]
-        if missing:
-            raise ValueError(
-                f"per_wave_data is missing entries for {channel!r} waves: {missing}."
-            )
-        if self._longitudinal_metric_data is None:
-            self._longitudinal_metric_data = {}
-        self._longitudinal_metric_data[channel] = dict(per_wave_data)
-        # Mirror to the cross-sectional attribute so any code path that
-        # still checks ``self.<channel>_data is None`` (e.g. the
-        # pre-aggregation entry guard) passes. The actual per-wave source
-        # is consulted via ``_longitudinal_metric_data``.
-        rep_source = per_wave_data[spec.wave_labels[0]]
-        if channel == "veg":
-            self.veg_data = rep_source
-        elif channel == "terrain":
-            self.terrain_data = rep_source
-        elif channel == "ndvi":
-            self.ndvi_data = rep_source
+        for channel in longitudinal.GREENERY_CHANNELS:
+            if channel not in paths:
+                raise ValueError(f"metric source paths are missing {channel!r}.")
+            self._validate_temporal_coverage(paths[channel])
+        self._metric_sources = metric_intake.LongitudinalMetricSources(paths, loader)
 
     def set_longitudinal_wave_frames(
         self, frames: list[tuple[str, gpd.GeoDataFrame]]
@@ -475,6 +603,22 @@ class MetricFusionEngine:
         "wave",
         "years_since_baseline",
     )
+
+    def _longitudinal_intake_columns(self) -> list[str] | None:
+        """Columns worth reading from the target file, or ``None`` to read all.
+
+        Longitudinal intake replaces ``target_gdf`` with the projected long
+        frame, so any column outside this set is read and then discarded.
+        Cross-sectional mode returns ``None``: its target frame is consumed
+        directly and carries columns this engine does not enumerate.
+        """
+        if not self.is_longitudinal:
+            return None
+        return longitudinal.target_intake_columns(
+            self.longitudinal_spec,
+            self.target_feature,
+            self.covariate_columns or (),
+        )
 
     def _longitudinal_extra_cols(self) -> tuple[str, ...]:
         """Extra DataFrame columns carried through every prep path in long mode."""
@@ -521,6 +665,12 @@ class MetricFusionEngine:
             outcome_col=outcome_col,
             covariate_cols=self.covariate_columns,
         )
+        # The per-file frames have been concatenated into ``long_gdf``; drop
+        # the engine's reference so their memory is reclaimed rather than held
+        # alongside the combined frame for the rest of the run.
+        target_input = None
+        self._longitudinal_wave_frames = None
+
         dropped = long_gdf.attrs.get("dropped_rows", {})
         if dropped:
             _log(
@@ -550,17 +700,25 @@ class MetricFusionEngine:
         logger.info(f"Loading target file: {self.target_file}")
 
         if self.is_points:
-            read_kwargs: dict = {}
+            layer = None
             if self.target_layer is not None and Path(
                 self.target_file
             ).suffix.lower() in (
                 ".gpkg",
                 ".zip",
             ):
-                read_kwargs["layer"] = self.target_layer
-            self.target_gdf = reproject_geodataframe_to_wgs84(
-                gpd.read_file(self.target_file, **read_kwargs)
-            )
+                layer = self.target_layer
+            keep_cols = self._longitudinal_intake_columns()
+            if keep_cols is None:
+                raw = gpd.read_file(
+                    self.target_file, **({} if layer is None else {"layer": layer})
+                )
+            else:
+                # Longitudinal intake projects the frame down to these columns
+                # anyway; skipping the rest keeps a wide cohort file's unused
+                # survey columns out of memory instead of loading then dropping.
+                raw = read_vector_subset(self.target_file, keep_cols, layer=layer)
+            self.target_gdf = reproject_geodataframe_to_wgs84(raw)
 
             # Validate feature exists
             if (
@@ -734,6 +892,36 @@ class MetricFusionEngine:
         )
         return cropped
 
+    def adopt_metric_data(
+        self,
+        veg_data,
+        terrain_data,
+        ndvi_data,
+        *,
+        ndvi_resolution_m: float | None = None,
+        gvi_grid_spacing_m: float | None = None,
+    ) -> None:
+        """Reuse already-loaded, already-cropped metric frames from another engine.
+
+        Multi-outcome fusion builds a fresh engine per outcome, but every outcome
+        shares the same target file, buffer, and metric paths, so the cropped
+        veg / terrain / NDVI sources are identical. Adopting the first engine's
+        frames skips N-fold file reads, reprojection, cropping, and spatial-index
+        rebuilds. The frames are treated as read-only downstream (spatial-index
+        caching onto the shared GeoDataFrame only makes later engines faster), so
+        sharing references is safe. The two sampling-grid steps are carried over
+        because they drive aggregation, not just download, and are otherwise only
+        set inside :meth:`load_metrics`.
+        """
+        self.veg_data = veg_data
+        self.terrain_data = terrain_data
+        self.ndvi_data = ndvi_data
+        if ndvi_resolution_m is not None:
+            self._ndvi_export_resolution_m = float(ndvi_resolution_m)
+        if gvi_grid_spacing_m is not None:
+            self._gvi_grid_spacing_m = float(gvi_grid_spacing_m)
+        self._clear_ring_caches()
+
     def load_metrics(
         self,
         veg_file: str | None = None,
@@ -799,36 +987,29 @@ class MetricFusionEngine:
                         crs = src.crs
                         height, width = veg_band.shape
 
-                        # Convert to point GeoDataFrame
-                        rows, cols = np.meshgrid(
-                            np.arange(height), np.arange(width), indexing="ij"
-                        )
-                        xs, ys = xy(
-                            transform, rows.flatten(), cols.flatten(), offset="center"
-                        )
+                        # Pixel centres straight from the affine, and only for
+                        # the pixels that survive the NaN filter — building a
+                        # geometry per grid cell first would cost tens of GB on
+                        # a large raster.
+                        def _band_to_points(values: np.ndarray, col: str):
+                            flat = values.ravel()
+                            keep = np.flatnonzero(~np.isnan(flat))
+                            rows_i = (keep // width).astype(np.int64)
+                            cols_i = (keep % width).astype(np.int64)
+                            xs_k, ys_k = xy(transform, rows_i, cols_i, offset="center")
+                            gdf = gpd.GeoDataFrame(
+                                {col: flat[keep]},
+                                geometry=gpd.points_from_xy(
+                                    np.asarray(xs_k), np.asarray(ys_k)
+                                ),
+                                crs=crs,
+                            )
+                            gdf.attrs["metric_column"] = col
+                            return gdf
 
-                        # Create veg GeoDataFrame
-                        veg_values = veg_band.flatten()
-                        veg_mask = ~np.isnan(veg_values)
-                        veg_gdf = gpd.GeoDataFrame(
-                            {"veg": veg_values[veg_mask]},
-                            geometry=gpd.points_from_xy(xs[veg_mask], ys[veg_mask]),
-                            crs=crs,
-                        )
-                        veg_gdf.attrs["metric_column"] = "veg"
+                        veg_gdf = _band_to_points(veg_band, "veg")
                         self.veg_data = veg_gdf
-
-                        # Create terrain GeoDataFrame
-                        terrain_values = terrain_band.flatten()
-                        terrain_mask = ~np.isnan(terrain_values)
-                        terrain_gdf = gpd.GeoDataFrame(
-                            {"terrain": terrain_values[terrain_mask]},
-                            geometry=gpd.points_from_xy(
-                                xs[terrain_mask], ys[terrain_mask]
-                            ),
-                            crs=crs,
-                        )
-                        terrain_gdf.attrs["metric_column"] = "terrain"
+                        terrain_gdf = _band_to_points(terrain_band, "terrain")
                         self.terrain_data = terrain_gdf
 
                         logger.info(
@@ -843,9 +1024,6 @@ class MetricFusionEngine:
             except Exception as e:
                 logger.debug(f"Failed to load as multi-band GVI: {e}")
                 return False
-
-        _VEG_COLUMN_ALIASES = ("gvi_veg", "gvi", "veg", "vegetation")
-        _TER_COLUMN_ALIASES = ("gvi_ter", "gvi_terrain", "terrain")
 
         def load_combined_gvi_vector(filepath: str) -> bool:
             """Split a single GVI vector file carrying both veg + terrain columns.
@@ -862,13 +1040,8 @@ class MetricFusionEngine:
             except Exception as exc:
                 logger.debug(f"Failed to read combined GVI vector: {exc}")
                 return False
-            lowered = {c.lower(): c for c in gdf.columns}
-            veg_col = next(
-                (lowered[a] for a in _VEG_COLUMN_ALIASES if a in lowered), None
-            )
-            ter_col = next(
-                (lowered[a] for a in _TER_COLUMN_ALIASES if a in lowered), None
-            )
+            veg_col = match_column_alias(gdf.columns, metric_intake.VEG_COLUMNS)
+            ter_col = match_column_alias(gdf.columns, metric_intake.TERRAIN_COLUMNS)
             if not (veg_col and ter_col):
                 return False
             if gdf.crs is None:
@@ -902,9 +1075,11 @@ class MetricFusionEngine:
             if load_multiband_gvi(veg_file):
                 pass
             else:
-                self.veg_data = self._load_metric_file(veg_file)
+                self.veg_data = _helpers.load_metric_file(veg_file, "veg")
                 if terrain_file and os.path.exists(terrain_file):
-                    self.terrain_data = self._load_metric_file(terrain_file)
+                    self.terrain_data = _helpers.load_metric_file(
+                        terrain_file, "terrain"
+                    )
                 elif not terrain_file or not os.path.exists(terrain_file):
                     logger.warning(
                         "Veg file provided but terrain file missing. Auto-downloading terrain..."
@@ -915,7 +1090,9 @@ class MetricFusionEngine:
                         progress_callback=progress_callback,
                         cancel_callback=cancel_callback,
                     )
-                    self.terrain_data = self._load_metric_file(terrain_file)
+                    self.terrain_data = _helpers.load_metric_file(
+                        terrain_file, "terrain"
+                    )
         # Check if uploaded veg_file is a combined GVI vector
         # (single GeoPackage / GeoJSON with both ``gvi_veg`` and ``gvi_ter``
         # columns — the default shape produced by ``geofuse.gvi``).
@@ -938,8 +1115,8 @@ class MetricFusionEngine:
                     progress_callback=progress_callback,
                     cancel_callback=cancel_callback,
                 )
-                self.veg_data = self._load_metric_file(veg_file)
-                self.terrain_data = self._load_metric_file(terrain_file)
+                self.veg_data = _helpers.load_metric_file(veg_file, "veg")
+                self.terrain_data = _helpers.load_metric_file(terrain_file, "terrain")
         # Load separate veg/terrain files if provided
         elif (
             veg_file
@@ -948,8 +1125,8 @@ class MetricFusionEngine:
             and os.path.exists(terrain_file)
         ):
             logger.info("Loading separate veg and terrain files...")
-            self.veg_data = self._load_metric_file(veg_file)
-            self.terrain_data = self._load_metric_file(terrain_file)
+            self.veg_data = _helpers.load_metric_file(veg_file, "veg")
+            self.terrain_data = _helpers.load_metric_file(terrain_file, "terrain")
         # Auto-download if nothing provided
         elif (not veg_file or not os.path.exists(veg_file)) and (
             not terrain_file or not os.path.exists(terrain_file)
@@ -961,16 +1138,16 @@ class MetricFusionEngine:
                 progress_callback=progress_callback,
                 cancel_callback=cancel_callback,
             )
-            self.veg_data = self._load_metric_file(veg_file)
-            self.terrain_data = self._load_metric_file(terrain_file)
+            self.veg_data = _helpers.load_metric_file(veg_file, "veg")
+            self.terrain_data = _helpers.load_metric_file(terrain_file, "terrain")
         else:
             # Partial files provided - try to load what we have
             if veg_file and os.path.exists(veg_file):
                 logger.info(f"Loading vegetation from: {veg_file}")
-                self.veg_data = self._load_metric_file(veg_file)
+                self.veg_data = _helpers.load_metric_file(veg_file, "veg")
             if terrain_file and os.path.exists(terrain_file):
                 logger.info(f"Loading terrain from: {terrain_file}")
-                self.terrain_data = self._load_metric_file(terrain_file)
+                self.terrain_data = _helpers.load_metric_file(terrain_file, "terrain")
 
         # Validate that we have both veg and terrain data
         if self.veg_data is None or self.terrain_data is None:
@@ -991,7 +1168,7 @@ class MetricFusionEngine:
         if ndvi_file and os.path.exists(ndvi_file) and not force_download:
             logger.info(f"Loading NDVI from: {ndvi_file}")
             self._validate_metric_bounds(ndvi_file)
-            self.ndvi_data = self._load_metric_file(ndvi_file)
+            self.ndvi_data = _helpers.load_metric_file(ndvi_file, "ndvi")
         else:
             if force_download:
                 logger.info("Force download enabled. Skipping cache check for NDVI...")
@@ -1007,7 +1184,7 @@ class MetricFusionEngine:
             )
             if cancel_callback and cancel_callback():
                 return
-            self.ndvi_data = self._load_metric_file(ndvi_file)
+            self.ndvi_data = _helpers.load_metric_file(ndvi_file, "ndvi")
 
         # Pre-crop every metric source to the target's buffered extent
         # (target.bounds + buffer_meters, which is max(GVI, NDVI) buffer).
@@ -1025,95 +1202,91 @@ class MetricFusionEngine:
         )
 
     def _validate_metric_bounds(self, metric_file: str) -> bool:
-        """Check if manually provided metric covers the buffered extent."""
-        if metric_file.endswith((".tif", ".tiff")):
+        """Warn only when a metric misses the buffered extent beyond real slack.
+
+        Earth Engine exports snap to their pixel grid, and reprojecting the
+        extent transforms only the box's corners (the true region bulges past
+        the straight-edged polygon), so a file downloaded for this very extent
+        routinely falls a fraction of a pixel short on an edge. Strict
+        containment flags that harmless shortfall; instead the gap is measured
+        in metres and only a shortfall beyond ``max(2·pixel, 20 m)`` (rasters)
+        or ``20 m`` (vectors) is reported — once per file per process, with the
+        size of the gap and the share of the extent left uncovered.
+
+        Returns ``True`` when coverage is within tolerance, ``False`` otherwise.
+        """
+        is_raster = metric_file.endswith((".tif", ".tiff"))
+        px = py = 0.0
+        if is_raster:
             with rasterio.open(metric_file) as src:
                 metric_box = box(*src.bounds)
                 metric_crs = src.crs
+                px, py = abs(src.transform.a), abs(src.transform.e)
         else:
             metric_gdf = gpd.read_file(metric_file)
             metric_box = box(*metric_gdf.total_bounds)
             metric_crs = metric_gdf.crs
 
-        # Reproject extent to metric CRS for comparison
-        extent_reprojected = self.buffered_extent.to_crs(metric_crs)
-        extent_box = extent_reprojected.geometry.iloc[0]
-
-        if not metric_box.contains(extent_box):
-            logger.warning(
-                f"Metric file {metric_file} does not fully cover buffered extent. "
-                "Results may be incomplete."
-            )
-            return False
-        return True
-
-    def _load_metric_file(self, filepath: str) -> gpd.GeoDataFrame | dict:
-        """Load metric from GeoJSON or GeoTIFF."""
-        if filepath.endswith((".tif", ".tiff")):
-            with rasterio.open(filepath) as src:
-                transform, crs, bounds = src.transform, src.crs, src.bounds
-                itemsize = np.dtype(src.dtypes[0]).itemsize
-                est_bytes = src.width * src.height * itemsize
-                data = (
-                    src.read(1, masked=True)
-                    if est_bytes <= _LAZY_RASTER_THRESHOLD_BYTES
-                    else None
-                )
-            if data is None:
-                # Too large to hold in RAM (national-scale): read windows from
-                # disk on demand instead. Each thread gets its own handle.
-                data = LazyRasterArray(filepath, band=1)
-                logger.info(
-                    f"Metric raster ~{est_bytes / (1024**2):.0f} MB exceeds the "
-                    f"in-memory threshold; reading windows lazily from {filepath}"
-                )
-            return {
-                "data": data,
-                "transform": transform,
-                "crs": crs,
-                "bounds": bounds,
-            }
+        # Measure the shortfall in metres: reproject both boxes into a metre CRS
+        # (the metric CRS itself if already projected, otherwise a local UTM).
+        extent_in_metric = self.buffered_extent.to_crs(metric_crs)
+        if getattr(metric_crs, "is_geographic", True):
+            measure_crs = estimate_metre_projected_crs_for_gdf(extent_in_metric)
         else:
-            gdf = gpd.read_file(filepath)
-            if gdf.crs is None:
-                gdf.set_crs("EPSG:4326", inplace=True)
-            gdf = normalize_geographic_gdf_to_wgs84(gdf)
+            measure_crs = metric_crs
+        ext_m = extent_in_metric.to_crs(measure_crs).geometry.iloc[0]
+        met_m = gpd.GeoSeries([metric_box], crs=metric_crs).to_crs(measure_crs).iloc[0]
+        exb, meb = ext_m.bounds, met_m.bounds  # (minx, miny, maxx, maxy), metres
+        shortfalls = {
+            "west": max(0.0, meb[0] - exb[0]),
+            "south": max(0.0, meb[1] - exb[1]),
+            "east": max(0.0, exb[2] - meb[2]),
+            "north": max(0.0, exb[3] - meb[3]),
+        }
+        worst_edge = max(shortfalls, key=shortfalls.__getitem__)
+        max_short = shortfalls[worst_edge]
 
-            # Detect metric column - look for common naming patterns
-            metric_col = None
-            for col in gdf.columns:
-                col_lower = col.lower()
-                if col_lower in [
-                    "gvi",
-                    "gvi_veg",
-                    "veg",
-                    "vegetation",
-                    "terrain",
-                    "gvi_ter",
-                    "ndvi",
-                    "value",
-                    "metric",
-                ]:
-                    metric_col = col
-                    break
+        if is_raster:
+            # Convert a geographic pixel to metres via the box's own deg→m scale.
+            if getattr(metric_crs, "is_geographic", True):
+                deg_w = metric_box.bounds[2] - metric_box.bounds[0]
+                scale = ((meb[2] - meb[0]) / deg_w) if deg_w > 0 else 111_320.0
+                pixel_m = max(px, py) * scale
+            else:
+                pixel_m = max(px, py)
+            tolerance_m = max(2.0 * pixel_m, 20.0)
+        else:
+            tolerance_m = 20.0
 
-            if metric_col is None:
-                # Try to find first numeric column (excluding index columns)
-                numeric_cols = gdf.select_dtypes(include=[np.number]).columns.tolist()
-                numeric_cols = [
-                    c
-                    for c in numeric_cols
-                    if c not in ["index", "index_right", "index_left"]
-                ]
-                if numeric_cols:
-                    metric_col = numeric_cols[0]
-                    logger.info(
-                        f"Using '{metric_col}' as metric column from {filepath}"
-                    )
+        if max_short <= tolerance_m:
+            return True
 
-            # Store the metric column name for later use
-            gdf.attrs["metric_column"] = metric_col
-            return gdf
+        try:
+            uncovered_pct = (
+                100.0 * (1.0 - ext_m.intersection(met_m).area / ext_m.area)
+                if ext_m.area > 0
+                else float("nan")
+            )
+        except Exception:
+            uncovered_pct = float("nan")
+
+        key = (
+            os.path.abspath(metric_file),
+            tuple(round(b, 3) for b in metric_box.bounds),
+        )
+        if key not in _WARNED_METRIC_BOUNDS:
+            _WARNED_METRIC_BOUNDS.add(key)
+            logger.warning(
+                "%s metric falls short of the buffered extent by up to %.0f m on "
+                "the %s edge (~%.1f%% of the extent uncovered); rings near that "
+                "edge will be partially empty. File: %s",
+                "Raster" if is_raster else "Vector",
+                max_short,
+                worst_edge,
+                uncovered_pct,
+                metric_file,
+            )
+        return False
 
     def _get_cache_filename(self, metric_type: str, extension: str = ".geojson") -> str:
         """Generate deterministic cache filename based on target file and boundary."""
@@ -1136,69 +1309,6 @@ class MetricFusionEngine:
             cache_name = f"cache-{metric_type}-{name}{extension}"
 
         return os.path.join(self.cache_dir, cache_name)
-
-    def _save_points_as_raster(
-        self, points_gdf: gpd.GeoDataFrame, value_col: str, output_path: str
-    ) -> None:
-        """
-        Convert point GeoDataFrame to raster matching the target raster grid.
-
-        Args:
-            points_gdf: GeoDataFrame with point geometries and values
-            value_col: Column name containing values to rasterize
-            output_path: Path to save the GeoTIFF
-        """
-        if not hasattr(self, "target_raster") or self.target_raster is None:
-            raise ValueError("No target raster available for grid alignment")
-
-        from scipy.interpolate import griddata
-
-        # Get target raster properties
-        transform = self.target_raster["transform"]
-        crs = self.target_raster["crs"]
-        height, width = self.target_raster["data"].shape
-
-        # Reproject points to match target raster CRS
-        points_in_raster_crs = points_gdf.to_crs(crs)
-
-        # Extract point coordinates and values
-        coords = np.array([(p.x, p.y) for p in points_in_raster_crs.geometry])
-        values = points_in_raster_crs[value_col].values
-
-        # Filter out NaN values
-        valid_mask = ~np.isnan(values)
-        coords = coords[valid_mask]
-        values = values[valid_mask]
-
-        if len(values) == 0:
-            raise ValueError(f"No valid values in {value_col} column")
-
-        # Generate target grid coordinates
-        rows, cols = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
-        xs, ys = xy(transform, rows.flatten(), cols.flatten(), offset="center")
-        grid_coords = np.column_stack([xs, ys])
-
-        # Interpolate point values to grid using nearest neighbor
-        # (faster than cubic, appropriate for categorical-like GVI data)
-        grid_values = griddata(coords, values, grid_coords, method="nearest")
-        grid_values = grid_values.reshape(height, width)
-
-        # Write to GeoTIFF — shared compression / tiling / BIGTIFF defaults
-        # so internal cache rasters benefit from the same disk savings as
-        # the user-facing outputs.
-        with rasterio.open(
-            output_path,
-            "w",
-            driver="GTiff",
-            height=height,
-            width=width,
-            count=1,
-            dtype=rasterio.float32,
-            crs=crs,
-            transform=transform,
-            **default_geotiff_creation_options(rasterio.float32),
-        ) as dst:
-            dst.write(grid_values.astype(rasterio.float32), 1)
 
     def _save_points_as_multiband_raster(
         self, points_gdf: gpd.GeoDataFrame, value_cols: list[str], output_path: str
@@ -1270,16 +1380,6 @@ class MetricFusionEngine:
             for i, band_data in enumerate(bands, 1):
                 dst.write(band_data, i)
                 dst.set_band_description(i, value_cols[i - 1])
-
-    def _cache_metric(self, source_file: str, metric_type: str) -> None:
-        """Cache metric file with standardized naming."""
-        import shutil
-
-        ext = os.path.splitext(source_file)[1]
-        cache_path = self._get_cache_filename(metric_type, ext)
-
-        shutil.copy(source_file, cache_path)
-        logger.info(f"Cached {metric_type} to: {cache_path}")
 
     def _auto_download_gvi_both(
         self,
@@ -1455,139 +1555,6 @@ class MetricFusionEngine:
 
             return veg_temp_path, terrain_temp_path
 
-    def _auto_download_gvi(
-        self,
-        component: str,
-        api_key: str | None = None,
-        cache: bool = True,
-        progress_callback: Callable[..., Any] | None = None,
-        cancel_callback: Callable[..., Any] | None = None,
-    ) -> str:
-        """
-        Auto-download GVI metrics within buffered extent.
-
-        Args:
-            component: 'veg' or 'terrain'
-            api_key: Google Street View API key (optional)
-            cache: Whether to save to cache directory
-
-        Returns:
-            Path to generated GeoJSON file
-        """
-        from .gvi import GVIEngine
-
-        # Check cache first using deterministic filename
-        cache_path = self._get_cache_filename(component, ".geojson")
-
-        if os.path.exists(cache_path):
-            logger.info(f"Found cached {component} at: {cache_path}")
-            return cache_path
-
-        # Initialize GVI engine with model path
-        model_path = os.path.join(
-            os.path.dirname(os.path.dirname(__file__)),
-            "geofuse",
-            "model",
-            "best_model.pth",
-        )
-        gvi_engine = GVIEngine(model_path=model_path, api_key=api_key)
-
-        # Run GVI analysis on buffered extent
-        logger.info(
-            f"Computing GVI {component} for buffered extent (this may take a while)..."
-        )
-
-        gvi_step = max(1, int(round(self._gvi_grid_spacing_m)))
-
-        # Convert buffered extent to target points or grid
-        if self.is_points:
-            # Use target points directly
-            analysis_gdf = self.target_gdf.copy()
-            logger.info(f"Using {len(analysis_gdf)} target points for GVI analysis")
-        else:
-            # Use buffered extent in EPSG:4326 - GVI engine will handle grid generation
-            analysis_gdf = self.buffered_extent.copy()
-            if analysis_gdf.crs.to_epsg() != 4326:
-                analysis_gdf = analysis_gdf.to_crs("EPSG:4326")
-
-            bounds = analysis_gdf.total_bounds
-            area_km2 = ((bounds[2] - bounds[0]) * 111) * ((bounds[3] - bounds[1]) * 111)
-            logger.info(f"Buffered extent area: ~{area_km2:.2f} km²")
-            logger.info(f"Bounds (EPSG:4326): {bounds}")
-            logger.info(f"Geometry type: {analysis_gdf.geometry.iloc[0].geom_type}")
-            logger.info(
-                f"GVI will generate grid at ~{gvi_step} m spacing within this polygon"
-            )
-
-            # Verify the polygon is valid
-            if not analysis_gdf.geometry.iloc[0].is_valid:
-                logger.warning("Invalid geometry detected, attempting to fix...")
-                analysis_gdf.geometry = analysis_gdf.geometry.buffer(0)
-
-            logger.info(
-                f"Polygon area: {analysis_gdf.geometry.iloc[0].area:.6f} square degrees"
-            )
-
-        # Initialize result collector
-        accumulated_results = []
-
-        def collect_result(res):
-            accumulated_results.append(res)
-            if len(accumulated_results) % 10 == 0:
-                logger.info(
-                    f"GVI {component}: Collected {len(accumulated_results)} results so far"
-                )
-
-        def on_progress(curr, total):
-            if progress_callback:
-                progress_callback(component, curr, total)
-
-        logger.info(f"Starting GVI {component} analysis...")
-        logger.info(
-            f"Input GDF: {len(analysis_gdf)} features, CRS: {analysis_gdf.crs}, Geometry type: {analysis_gdf.geometry.iloc[0].geom_type}"
-        )
-
-        gvi_engine.run_analysis(
-            analysis_gdf,
-            folder=self.cache_dir,
-            step=gvi_step,
-            save_panos=False,
-            save_masks=False,
-            result_callback=collect_result,
-            progress_callback=on_progress,
-            cancel_callback=cancel_callback,
-        )
-
-        # Convert accumulated results to GeoDataFrame
-        if not accumulated_results:
-            # Check if analysis was cancelled
-            if cancel_callback and cancel_callback():
-                logger.info(f"GVI {component} analysis cancelled by user")
-                raise InterruptedError(f"GVI {component} analysis cancelled by user")
-            raise ValueError(
-                f"No {component} data collected. Check if Street View is available in this area."
-            )
-
-        result_gdf = gpd.GeoDataFrame(accumulated_results, crs=analysis_gdf.crs)
-
-        # Extract and save the requested component
-        if component == "veg":
-            metric_col = "gvi_veg"
-        else:
-            metric_col = "gvi_ter"
-
-        output_gdf = result_gdf[["geometry", metric_col]].copy()
-        output_gdf.rename(columns={metric_col: component}, inplace=True)
-
-        if cache:
-            output_gdf.to_file(cache_path, driver="GeoJSON")
-            logger.info(f"Cached {component} to: {cache_path}")
-            return cache_path
-        else:
-            temp_path = os.path.join(self.cache_dir, f"temp_{component}.geojson")
-            output_gdf.to_file(temp_path, driver="GeoJSON")
-            return temp_path
-
     def _auto_download_ndvi(
         self,
         start_date: str,
@@ -1673,225 +1640,103 @@ class MetricFusionEngine:
         logger.info(f"NDVI downloaded: {result['tif']}")
         return result["tif"]
 
-    def _apply_circular_buffer_aggregation(
+    def _ring_cache_bytes_estimate(
         self,
         points_gdf: gpd.GeoDataFrame,
         metric_data: gpd.GeoDataFrame | dict,
-        radius_meters: float,
-        stat: str,
-        percentile: int = 50,
-    ) -> np.ndarray:
+        max_radius_m: float,
+    ) -> float:
+        """Rough resident size of the ring cache this call would build.
+
+        Rasters: points × disc area ÷ pixel area. Vectors: points × the mean
+        neighbour count of a small sample. Both times 8 bytes per value.
         """
-        Apply circular buffer aggregation to sample metric at point locations.
-
-        This matches CGI.ipynb calculate_gm() logic:
-        - Creates circular buffer around each point
-        - Samples all metric values within buffer
-        - Aggregates using specified statistic (mean/median/percentile)
-
-        Args:
-            points_gdf: GeoDataFrame with point geometries
-            metric_data: Raster dict or vector GeoDataFrame to sample from
-            radius_meters: Buffer radius in meters
-            stat: Aggregation function ('mean', 'median', 'percentile')
-            percentile: Percentile value if stat='percentile'
-
-        Returns:
-            Array of aggregated metric values for each point
-        """
-        result = np.full(len(points_gdf), np.nan)
-
-        # Create mapping from original index to position for correct array indexing
-        idx_to_pos = {idx: pos for pos, idx in enumerate(points_gdf.index)}
-
-        if isinstance(metric_data, dict):  # Raster
-            metric_array = metric_data["data"]
-            transform = metric_data["transform"]
-            metric_crs = metric_data["crs"]
-
-            # Reproject points to metric CRS
-            points_metric_crs = points_gdf.to_crs(metric_crs)
-
-            # Calculate radius in pixels - handle geographic vs projected CRS
-            pixel_size = abs(transform.a)  # Pixel width in CRS units
-
-            # Check if CRS is geographic (degrees) - pixel size will be very small
-            if metric_crs.is_geographic:
-                # For geographic CRS, estimate pixel size in meters
-                # Using approximate conversion at equator: 1 degree ≈ 111,320 meters
-                pixel_size_meters = pixel_size * 111320
-            else:
-                # For projected CRS, pixel size is already in meters (or similar units)
-                pixel_size_meters = pixel_size
-
-            radius_pixels = int(radius_meters / pixel_size_meters)
-
-            # Sanity check to prevent memory explosion
-            if radius_pixels > 10000:
-                logger.warning(
-                    f"Radius in pixels ({radius_pixels}) is too large. "
-                    f"This may indicate CRS mismatch. Skipping raster aggregation."
-                )
-                return result  # Return all NaN
-
-            if radius_pixels < 1:
-                radius_pixels = 1  # Minimum 1 pixel
-
-            # Create circular mask
-            y, x = np.ogrid[
-                -radius_pixels : radius_pixels + 1,
-                -radius_pixels : radius_pixels + 1,
-            ]
-            circle_mask = (x**2 + y**2) <= radius_pixels**2
-
-            # Sample each point — positional loop over pre-extracted coordinate
-            # arrays (avoids the per-row Series construction of iterrows()).
-            _xs = points_metric_crs.geometry.x.to_numpy()
-            _ys = points_metric_crs.geometry.y.to_numpy()
-            for idx, _px, _py in zip(points_metric_crs.index, _xs, _ys):
-                row, col = rowcol(transform, _px, _py)
-
-                # Extract window around point
-                rmin = max(row - radius_pixels, 0)
-                rmax = min(row + radius_pixels + 1, metric_array.shape[0])
-                cmin = max(col - radius_pixels, 0)
-                cmax = min(col + radius_pixels + 1, metric_array.shape[1])
-
-                if rmin >= rmax or cmin >= cmax:
-                    continue
-
-                window = metric_array[rmin:rmax, cmin:cmax]
-
-                # Crop circular mask to match window size
-                mask_crop = circle_mask[
-                    (radius_pixels - (row - rmin)) : (radius_pixels + (rmax - row)),
-                    (radius_pixels - (col - cmin)) : (radius_pixels + (cmax - col)),
-                ]
-
-                # Extract values within circular buffer
-                if hasattr(window, "compressed"):  # Masked array
-                    valid_mask = ~window.mask & mask_crop
-                    values = window.data[valid_mask]
-                else:
-                    values = window[mask_crop]
-
-                # Remove NaN values
-                values = values[~np.isnan(values)]
-
-                # Apply aggregation statistic
-                if len(values) > 0:
-                    pos = idx_to_pos[idx]
-                    if stat == "mean":
-                        result[pos] = np.mean(values)
-                    elif stat == "median":
-                        result[pos] = np.median(values)
-                    elif stat == "percentile":
-                        result[pos] = np.percentile(values, percentile)
-
-        else:  # Vector GeoDataFrame
-            # For vector data, use spatial join with buffered points
-            # Convert both to a common metric CRS for accurate buffering
-
-            # Determine appropriate UTM zone from point data
-            # Convert to WGS84 first to get proper geographic coordinates (lon/lat in degrees)
-            points_wgs84 = points_gdf.to_crs("EPSG:4326")
-            centroid = points_wgs84.geometry.union_all().centroid
-            lon = centroid.x
-            lat = centroid.y
-
-            # Validate we actually have geographic coordinates (lon should be -180 to 180)
-            if not (-180 <= lon <= 180):
-                raise ValueError(
-                    f"Invalid longitude {lon} after WGS84 conversion. "
-                    f"Input CRS was {points_gdf.crs}, conversion may have failed."
-                )
-
-            # Calculate UTM zone from geographic coordinates
-            utm_zone = int((lon + 180) / 6) + 1
-            # Determine hemisphere
-            if lat >= 0:
-                utm_crs = f"EPSG:326{utm_zone:02d}"  # Northern hemisphere
-            else:
-                utm_crs = f"EPSG:327{utm_zone:02d}"  # Southern hemisphere
-
-            # Convert to UTM for buffering
-            points_utm = points_gdf.to_crs(utm_crs)
-            metric_utm = metric_data.to_crs(utm_crs)
-
-            # Create buffers in UTM (meters)
-            points_buffered = points_utm.copy()
-            points_buffered["geometry"] = points_utm.buffer(radius_meters)
-
-            # Spatial join to find metrics within buffers
-            joined = gpd.sjoin(
-                points_buffered, metric_utm, how="left", predicate="intersects"
-            )
-
-            # Detect metric column
-            metric_col = metric_data.attrs.get("metric_column")
-            if metric_col is None or metric_col not in metric_data.columns:
-                numeric_cols = metric_data.select_dtypes(
-                    include=[np.number]
-                ).columns.tolist()
-                # Filter out geometry-related columns
-                numeric_cols = [
-                    c
-                    for c in numeric_cols
-                    if c not in ["index_right", "index_left", "index"]
-                ]
-                if numeric_cols:
-                    metric_col = numeric_cols[0]
-                else:
-                    logger.warning(
-                        f"No numeric columns found in metric data. Columns: {metric_data.columns.tolist()}"
+        n_pts = len(points_gdf)
+        if n_pts == 0 or max_radius_m <= 0:
+            return 0.0
+        disc_area = np.pi * float(max_radius_m) ** 2
+        try:
+            if isinstance(metric_data, dict):
+                transform = metric_data["transform"]
+                px = abs(float(transform.a))
+                py = abs(float(transform.e))
+                if getattr(metric_data["crs"], "is_geographic", False):
+                    # Degree pixels: convert with the local metre-per-degree
+                    # scale so the estimate is not off by ~10^5.
+                    lat = float(
+                        np.mean(
+                            self.buffered_extent.to_crs("EPSG:4326")
+                            .geometry.iloc[0]
+                            .bounds[1::2]
+                        )
+                        if self.buffered_extent is not None
+                        else 0.0
                     )
-                    return result  # Return all NaN
+                    m_lon, m_lat = metres_per_degree_at_lat(lat)
+                    px *= m_lon
+                    py *= m_lat
+                pixel_area = max(px * py, 1e-9)
+                per_point = disc_area / pixel_area
+            else:
+                if len(metric_data) == 0:
+                    return 0.0
+                # Feature density from the extent's bounding box — cheap and
+                # good enough to separate "fits easily" from "many GB".
+                minx, miny, maxx, maxy = (float(v) for v in metric_data.total_bounds)
+                span_x = max(maxx - minx, 1e-9)
+                span_y = max(maxy - miny, 1e-9)
+                if getattr(metric_data.crs, "is_geographic", False):
+                    m_lon, m_lat = metres_per_degree_at_lat((miny + maxy) / 2.0)
+                    span_x *= m_lon
+                    span_y *= m_lat
+                density = len(metric_data) / max(span_x * span_y, 1.0)
+                per_point = disc_area * density
+        except Exception:
+            return 0.0
+        return float(n_pts) * float(per_point) * 8.0
 
-            logger.info(
-                f"Buffer aggregation using column '{metric_col}' from {metric_data.columns.tolist()}, radius={radius_meters}m, stat={stat}"
-            )
+    def _search_n_jobs(self, metric: str) -> int:
+        """Thread count for ``study.optimize``.
 
-            # Check if any data was joined
-            non_null_joins = (
-                joined[metric_col].notna().sum() if metric_col in joined.columns else 0
-            )
-            logger.info(
-                f"Spatial join: {len(joined)} total rows, {non_null_joins} with valid metric values"
-            )
+        Every metric runs its trials in parallel. All trials of a bootstrap
+        share one fold, so the per-fold state they touch — fold statics, the
+        pre-aggregation lookup plan, ring caches, fast components — takes
+        idempotent writes: two threads may build the same entry, but neither
+        can observe a wrong one. The two scoring caches that were *not* safe
+        (:mod:`geofuse.pdcor`'s side cache and the spline-basis cache) evicted
+        by walking their own iterator while another thread inserted; both now
+        guard that bookkeeping with a lock and keep the expensive build outside
+        it, which is what lifted the restriction to the fast-GLS metrics.
 
-            logger.debug(
-                f"Using metric column: {metric_col} from {metric_data.columns.tolist()}"
-            )
-            logger.debug(
-                f"Joined shape: {joined.shape}, Points shape: {len(points_gdf)}"
-            )
-
-            # Aggregate by original point index — one vectorized groupby over the
-            # joined frame instead of a per-point boolean scan (which was O(n²)).
-            if metric_col in joined.columns:
-                grouped = joined[metric_col].dropna().groupby(level=0)
-                if stat == "median":
-                    agg = grouped.median()
-                elif stat == "percentile":
-                    agg = grouped.quantile(percentile / 100.0)
-                else:
-                    agg = grouped.mean()
-                for idx, val in agg.items():
-                    pos = idx_to_pos.get(idx)
-                    if pos is not None:
-                        result[pos] = val
-
-            # Log summary of results
-            valid_count = np.sum(~np.isnan(result))
-            logger.info(
-                f"Buffer aggregation result: {valid_count}/{len(result)} points have valid values"
-            )
-
-        return result
+        An exact ``statsmodels`` MixedLM refit stays the exception: it is
+        dominated by Python-level optimiser work holding the GIL, and threading
+        it measured 0.62x of serial, so it is left alone.
+        """
+        exact_refit = (
+            self.is_longitudinal
+            and metric not in mixed_effects_scoring.FAST_SEARCH_METRICS
+            and metric in mixed_effects_scoring.MIXEDLM_METRICS
+        )
+        if exact_refit:
+            return 1
+        return max(1, int(self._search_workers))
 
     def _clear_ring_caches(self) -> None:
         self._ring_raster_cache.clear()
         self._ring_vector_cache.clear()
+        # Fold-static data (collapse codes, collapsed target/covariates,
+        # points slices) shares the ring caches' lifecycle: both key off the
+        # live fold row sets, which change with every bootstrap resample.
+        self._fold_static_cache.clear()
+
+    def _clear_scoring_caches(self) -> None:
+        """Drop the per-subset scoring caches (pdcor sides, spline bases).
+
+        Shares the spatial-basis cache's lifecycle: their entries fingerprint
+        the scored subset's rows, which change on every split / resample.
+        """
+        self._pdcor_cache.clear()
+        self._spline_basis_cache.clear()
 
     def _outer_radii_metres(self, *, gvi: bool) -> np.ndarray:
         if gvi:
@@ -1930,10 +1775,15 @@ class MetricFusionEngine:
         Otherwise falls back to the ring cache (or the direct circular buffer
         path) — same behaviour as before.
         """
-        # ── Fast path: pre-aggregation lookup table ──────────────────────────
+        # ── Fast path: pre-aggregation lookup table ─────────
         if getattr(self, "_preaggregation_done", False):
-            wave_indices = None
-            if self.is_longitudinal and "wave" in points_gdf.columns:
+            attrs = getattr(points_gdf, "attrs", None) or {}
+            wave_indices = attrs.get("_gf_wave_idx")
+            if (
+                wave_indices is None
+                and self.is_longitudinal
+                and "wave" in points_gdf.columns
+            ):
                 spec = self.longitudinal_spec
                 assert spec is not None
                 wave_index_of = {w: i for i, w in enumerate(spec.wave_labels)}
@@ -1943,11 +1793,14 @@ class MetricFusionEngine:
                 )
             # Point/line targets cache stats per unique pixel: resolve each
             # duplicated catchment row to its pixel id. Other targets key the
-            # cache by row index directly.
-            if "_preaggr_id" in points_gdf.columns:
-                lookup_ids = points_gdf["_preaggr_id"].to_numpy()
-            else:
-                lookup_ids = points_gdf.index.values
+            # cache by row index directly. Fold slices carry a pre-built id
+            # vector whose identity the cache's row indexer keys on.
+            lookup_ids = attrs.get("_gf_lookup_ids")
+            if lookup_ids is None:
+                if "_preaggr_id" in points_gdf.columns:
+                    lookup_ids = points_gdf["_preaggr_id"].to_numpy()
+                else:
+                    lookup_ids = points_gdf.index.values
             looked_up = self._lookup_preaggregation(
                 lookup_ids,
                 channel,
@@ -1970,14 +1823,25 @@ class MetricFusionEngine:
             or subset is None
             or len(points_gdf) > self._max_points_ring_cache
         ):
-            return self._apply_circular_buffer_aggregation(
+            return _helpers.apply_circular_buffer_aggregation(
                 points_gdf, metric_data, radius_m, stat, percentile
             )
 
         gvi = channel in ("veg", "terrain")
         radii = self._outer_radii_metres(gvi=gvi)
         if radii.size == 0:
-            return self._apply_circular_buffer_aggregation(
+            return _helpers.apply_circular_buffer_aggregation(
+                points_gdf, metric_data, radius_m, stat, percentile
+            )
+
+        # A ring cache holds every raw metric value inside the largest radius
+        # for every point, so the row count alone does not bound it: a fine
+        # raster under a wide radius is tens of thousands of values per point.
+        # Estimate the payload and take the direct path when it would not fit.
+        if self._ring_cache_bytes_estimate(
+            points_gdf, metric_data, float(radii[-1])
+        ) > (self._max_ring_cache_bytes):
+            return _helpers.apply_circular_buffer_aggregation(
                 points_gdf, metric_data, radius_m, stat, percentile
             )
 
@@ -2001,20 +1865,82 @@ class MetricFusionEngine:
                     rows = metric_sampling.precompute_vector_ring_values(
                         metric_data, points_gdf, radii, col
                     )
-                cache_store[key] = (radii, rows)
+                prefix = metric_sampling.ring_prefix_stats(rows)
+                cache_store[key] = (radii, rows, prefix, {})
                 logger.info(
                     f"Ring cache built: channel={channel} subset={subset} fold={fold_idx} "
                     f"points={len(points_gdf)} rings={len(radii)}"
                 )
             except Exception as e:
                 logger.warning(f"Ring cache build failed ({channel}): {e}")
-                return self._apply_circular_buffer_aggregation(
+                return _helpers.apply_circular_buffer_aggregation(
                     points_gdf, metric_data, radius_m, stat, percentile
                 )
 
-        _, rows = cache_store[key]
-        return metric_sampling.aggregate_from_ring_cache(
-            radii, rows, radius_m, stat, percentile
+        _, rows, prefix, memo = cache_store[key]
+        # Result memo: trials repeat the same (radius, stat, percentile) cells
+        # constantly, and the grid is small (n_radii × mean/median/deciles) —
+        # so the per-point percentile reduce runs once per distinct cell.
+        end_idx = metric_sampling.ring_end_index(radii, radius_m)
+        memo_key = (end_idx, stat, int(percentile) if stat == "percentile" else 0)
+        hit = memo.get(memo_key)
+        if hit is not None:
+            return hit
+        out = metric_sampling.aggregate_from_ring_cache(
+            radii, rows, radius_m, stat, percentile, prefix=prefix
+        )
+        memo[memo_key] = out
+        return out
+
+    def _aggregate_channel_for_fold(
+        self,
+        static: dict,
+        metric_data: gpd.GeoDataFrame | dict,
+        radius_m: float,
+        stat: str,
+        percentile: int,
+        *,
+        channel: str,
+        fold_idx: int | None,
+        subset: str | None,
+    ) -> tuple[np.ndarray, bool]:
+        """Channel values for one scored fold, plus whether they are deduplicated.
+
+        Returns ``(values, on_unique_axis)``. When the fold has a dedup axis and
+        the cache can serve the cell, the values are one per distinct
+        ``(pixel, wave)`` — the caller forms the composite on that shorter axis
+        and gathers to rows with ``uniq_inverse`` before the entity collapse.
+        Otherwise the values are per row, exactly as before.
+        """
+        uniq_ids = static.get("uniq_lookup_ids")
+        if uniq_ids is not None and getattr(self, "_preaggregation_done", False):
+            # The fold's row → cache-row resolution is the same for every trial,
+            # so it is built once and held on the fold's static dict; a trial
+            # then only reads its own (radius, stat) cell out of it.
+            source = self._ensure_memory_loaded() or self._preaggr_cache
+            column = preaggregation.stat_to_column(stat, percentile)
+            if source is not None and column is not None:
+                plan = self._preaggr_plan(
+                    source, uniq_ids, static.get("uniq_wave_idx"), static
+                )
+                if plan is not None:
+                    looked_up = source.gather(
+                        plan, channel, int(round(radius_m)), column
+                    )
+                    if looked_up is not None:
+                        return looked_up, True
+        return (
+            self._aggregate_with_ring_cache(
+                static["points"],
+                metric_data,
+                radius_m,
+                stat,
+                percentile,
+                channel=channel,
+                fold_idx=fold_idx,
+                subset=subset,
+            ),
+            False,
         )
 
     def prepare_fusion_data(self) -> pd.DataFrame:
@@ -2053,8 +1979,16 @@ class MetricFusionEngine:
                 self._expand_categorical_covariates()
 
         # Only the point/line per-pixel path dedups the cache to unique pixels;
-        # reset here so a re-prepared study can't inherit a stale source.
+        # reset here so a re-prepared study can't inherit a stale source. The
+        # greenery cache is dropped too; the coverage gate re-attaches a
+        # reusable one (or the build makes a fresh one) for this run.
         self._preaggr_entity_gdf = None
+        self._preaggregation_done = False
+        self._preaggr_cache = None
+        self._preaggr_pid_translate = None
+        if self._preaggr_mem is not None:
+            self._preaggr_mem.close()
+            self._preaggr_mem = None
         if self.is_polygon_target:
             _log("INFO", "Target type: POLYGON (per-pixel CGI)")
             df = self._prepare_polygon_fusion()
@@ -2069,7 +2003,24 @@ class MetricFusionEngine:
                 else self._prepare_raster_fusion()
             )
         self._compute_channel_scale(df)
+        # RAM management: narrow the resident per-pixel frames' dtypes (wave
+        # string -> category, 64-bit -> 32-bit) before the search + the RAM
+        # cache load. On a 36M-row per-pixel panel this frees several GB.
+        df = _helpers.downcast_fusion_dtypes(df)
+        self._downcast_target_gdf_dtypes()
+        import gc as _gc
+
+        _gc.collect()
         return df
+
+    def _downcast_target_gdf_dtypes(self) -> None:
+        """Apply the same narrowing to the resident ``target_gdf`` (and the
+        unique-pixel source), which the search keeps in memory alongside the
+        RAM cache."""
+        if self.target_gdf is not None:
+            _helpers.downcast_fusion_dtypes(self.target_gdf)
+        if self._preaggr_entity_gdf is not None:
+            _helpers.downcast_fusion_dtypes(self._preaggr_entity_gdf)
 
     def _compute_channel_scale(self, fusion_df: pd.DataFrame) -> None:
         """Fix per-channel [0, 1] min-max bounds from the predictor distribution.
@@ -2109,24 +2060,22 @@ class MetricFusionEngine:
 
         def _scale(a: np.ndarray, ch: str) -> np.ndarray:
             lo, hi = self._channel_minmax.get(ch, (0.0, 1.0))
+            arr = np.asarray(a)
+            if not np.issubdtype(arr.dtype, np.floating):
+                arr = arr.astype(np.float64)
             if hi <= lo:
-                return np.asarray(a, dtype=np.float64)
-            return np.clip((np.asarray(a, dtype=np.float64) - lo) / (hi - lo), 0.0, 1.0)
+                return arr
+            # Scalar ops keep the input float width (float32 on the per-pixel
+            # trial path, float64 elsewhere).
+            dt = arr.dtype.type
+            return np.clip((arr - dt(lo)) / dt(hi - lo), dt(0.0), dt(1.0))
 
         return _scale(veg, "veg"), _scale(terrain, "terrain"), _scale(ndvi, "ndvi")
 
-    # ------------------------------------------------------------------
-    # Spatial pre-aggregation (mandatory; on-disk SQLite cache)
-    # ------------------------------------------------------------------
-    #
-    # ``precompute_aggregations()`` builds a per-(entity, radius) table of
-    # (mean, p10..p90) for every channel and persists it via
-    # ``geofuse/preaggregation.py`` so the table survives cancels/crashes and is
-    # reused across runs. ``_aggregate_with_ring_cache`` short-circuits to a
-    # single column read when the trial's (radius, stat) maps onto the stored
-    # grid; off-grid percentiles fall back to the lazy ring cache.
-    # Trial-suggested percentiles are constrained to this 10 % grid so every
-    # trial maps to a stored column.
+    # ────────────────────────────────────────────────────────────
+    # ── Pre-aggregation grid ────────────────────────────────────
+    # Trial percentiles are snapped to this grid so every trial maps onto a
+    # stored column of the per-(entity, radius) cache.
     _PREAGGR_PERCENTILES = preaggregation.PERCENTILES
 
     def _preaggr_radii(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -2142,22 +2091,7 @@ class MetricFusionEngine:
             tuple(range(ndvi_lo, ndvi_hi + 1, ndvi_st)),
         )
 
-    @staticmethod
-    def _metric_value_column(metric_gdf: gpd.GeoDataFrame, default_col: str) -> str:
-        col = metric_gdf.attrs.get("metric_column")
-        if not col or col not in metric_gdf.columns:
-            for c in (default_col, "value"):
-                if c in metric_gdf.columns:
-                    col = c
-                    break
-        if not col:
-            raise ValueError(
-                "Pre-aggregation: cannot find value column in metric "
-                f"(columns: {list(metric_gdf.columns)})."
-            )
-        return col
-
-    def _metric_fingerprint(self, metric, default_col: str) -> str:
+    def _metric_fingerprint(self, metric, channel: str) -> str:
         """Cheap, deterministic identity for a loaded metric (vector or raster)."""
         if isinstance(metric, dict):  # raster
             arr = metric["data"]
@@ -2173,7 +2107,7 @@ class MetricFusionEngine:
             sample = np.ascontiguousarray(data[::17, ::17]).tobytes()
             digest = hashlib.sha256(sample).hexdigest()[:16]
             return f"ras:{data.shape}:{tuple(metric['bounds'])}:{data.dtype}:{digest}"
-        col = self._metric_value_column(metric, default_col)
+        col = _helpers.metric_value_column(metric, channel)
         vals = np.ascontiguousarray(metric[col].to_numpy(dtype=np.float64))
         digest = hashlib.sha256(vals.tobytes()).hexdigest()[:16]
         return f"vec:{len(metric)}:{tuple(metric.total_bounds)}:{col}:{digest}"
@@ -2277,6 +2211,72 @@ class MetricFusionEngine:
             )
         return self._collinearity_report
 
+    def check_covariate_dispersion(
+        self,
+        *,
+        data: "pd.DataFrame | None" = None,
+        spread_ratio: float = 20.0,
+    ) -> dict:
+        """Flag outcome / covariate columns whose spread looks corrupted.
+
+        For the outcome and each covariate column, compares the standard
+        deviation against the robust inter-percentile spread ``p90 - p10``.
+        A column where ``std > spread_ratio × (p90 - p10)`` has a bulk that
+        sits in a narrow band while a handful of extreme values (uncleaned
+        sentinels, a units mix-up, a decimal-point error) blow up the SD — the
+        signature of an input that will produce meaningless standard errors.
+
+        Returns a report dict with a per-column table and a ``flagged`` list.
+        Does not raise or drop anything: the caller decides how loudly to warn.
+        """
+        if data is not None:
+            df = data
+        elif self.target_gdf is not None:
+            df = self.target_gdf
+        else:
+            frames = [f for f in (self.train_val_data, self.test_data) if f is not None]
+            df = pd.concat(frames, ignore_index=False) if frames else None
+        if df is None:
+            return {"columns": [], "flagged": [], "spread_ratio": float(spread_ratio)}
+
+        cols = [self.target_feature, *self.covariate_columns]
+        seen: set[str] = set()
+        table: list[dict] = []
+        flagged: list[str] = []
+        for col in cols:
+            if not col or col in seen or col not in df.columns:
+                continue
+            seen.add(col)
+            vals = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=np.float64)
+            vals = vals[np.isfinite(vals)]
+            if vals.size < 2:
+                continue
+            std = float(np.std(vals, ddof=0))
+            p10, p90 = (float(x) for x in np.percentile(vals, [10, 90]))
+            spread = p90 - p10
+            is_outcome = col == self.target_feature
+            bad = std > spread_ratio * spread
+            entry = {
+                "column": col,
+                "role": "outcome" if is_outcome else "covariate",
+                "std": std,
+                "p10": p10,
+                "p90": p90,
+                "spread": spread,
+                "flagged": bool(bad),
+            }
+            table.append(entry)
+            if bad:
+                flagged.append(col)
+
+        report = {
+            "columns": table,
+            "flagged": flagged,
+            "spread_ratio": float(spread_ratio),
+        }
+        self._dispersion_report = report
+        return report
+
     def precompute_aggregations(
         self,
         progress_callback: Callable[[int, int], None] | None = None,
@@ -2294,6 +2294,14 @@ class MetricFusionEngine:
 
         Returns ``True`` on completion, ``False`` if cancelled.
         """
+        # The coverage gate may already have attached a complete reusable cache
+        # (loading it once for both coverage and scoring); nothing left to build.
+        if self._preaggregation_done and isinstance(
+            self._preaggr_cache, preaggregation.GreeneryCache
+        ):
+            if progress_callback is not None:
+                progress_callback(1, 1)
+            return True
         if self.is_longitudinal:
             return self._precompute_aggregations_longitudinal(
                 progress_callback=progress_callback,
@@ -2317,84 +2325,34 @@ class MetricFusionEngine:
             )
 
         gvi_radii, ndvi_radii = self._preaggr_radii()
-        # Pre-aggregate over the unique-pixel source for point/line targets;
-        # over the entity rows directly otherwise. Stats are keyed by this
-        # frame's index, which scoring rows resolve via ``_preaggr_id``.
+        # Cross-sectional shares the greenery store and compute path with the
+        # longitudinal build; it is simply a single implicit wave. Only the
+        # scoring/objective differs by analysis type, not the data prep or cache.
         preaggr_gdf = (
             self._preaggr_entity_gdf
             if self._preaggr_entity_gdf is not None
             else self.target_gdf
         )
         n_points = len(preaggr_gdf)
-        defaults = {"veg": "veg", "terrain": "terrain", "ndvi": "NDVI"}
 
-        # ---- Fingerprint + cache file (per data-config; reused across runs) ----
-        fp_src = "|".join(
-            [
-                f"geom:{geometry_sha256(preaggr_gdf)}",
-                self._metric_fingerprint(self.veg_data, defaults["veg"]),
-                self._metric_fingerprint(self.terrain_data, defaults["terrain"]),
-                self._metric_fingerprint(self.ndvi_data, defaults["ndvi"]),
-                f"gvi:{gvi_radii}",
-                f"ndvi:{ndvi_radii}",
-                f"stats:{preaggregation.STAT_COLUMNS}",
-                f"cgi_grid:{self.cgi_grid_spacing_m if (self.is_polygon_target or self.is_points) else 'na'}",
-            ]
+        utm_crs = _helpers.grid_metric_crs(preaggr_gdf, _log)
+        crs_key = str(utm_crs.to_epsg() or utm_crs.to_wkt())
+        cache = preaggregation.GreeneryCache(
+            self.cache_dir,
+            spacing_m=float(self.cgi_grid_spacing_m or 0.0),
+            crs_key=crs_key,
+            stats=preaggregation.STAT_COLUMNS,
         )
-        fingerprint = hashlib.sha256(fp_src.encode()).hexdigest()
-        preaggr_dir = os.path.join(self.cache_dir, "preaggr")
-        os.makedirs(preaggr_dir, exist_ok=True)
-        base = os.path.splitext(os.path.basename(self.target_file))[0]
-        db_path = os.path.join(preaggr_dir, f"preaggr-{base}-{fingerprint[:12]}.sqlite")
-
-        cache = preaggregation.PreAggregationCache(
-            db_path,
-            gvi_radii=gvi_radii,
-            ndvi_radii=ndvi_radii,
-            fingerprint=fingerprint,
+        cfg_key = cache.unit_key(
+            self._metric_fingerprint(self.veg_data, "veg"),
+            self._metric_fingerprint(self.terrain_data, "terrain"),
+            self._metric_fingerprint(self.ndvi_data, "ndvi"),
         )
+        cache.bind_wave(preaggregation.DEFAULT_WAVE_INDEX, cfg_key)
 
-        if cache.is_complete():
-            _log(
-                "OK",
-                f"Reusing pre-aggregation cache ({n_points:,} entities): {db_path}",
-            )
-            self._preaggr_cache = cache
-            self._preaggregation_done = True
-            if progress_callback is not None:
-                progress_callback(n_points, n_points)
-            return True
-
-        if not cache.matches_fingerprint():
-            cache.reset()
-        cache.write_header(n_points)
-
-        _log(
-            "INFO",
-            f"Pre-aggregation: {n_points:,} entities · GVI radii {gvi_radii} m · "
-            f"NDVI radii {ndvi_radii} m · stats {preaggregation.STAT_COLUMNS}. "
-            f"Cache: {db_path}",
-        )
-
-        # ---- Prepare per-channel samplers (format- and geometry-aware) ----
-        # Entities of any geometry type produce one cache row per (radius,
-        # stat) — the buffered-aggregation routines accept polygons / lines
-        # / multi-* / points uniformly via ``geometry.buffer(R)``. The
-        # point-only fast path (BallTree / circular raster mask) stays
-        # active when every entity is a Point, since it benefits from
-        # vectorised distance queries.
-        #
-        # All distance math happens in a projected CRS picked to minimise
-        # planar distortion across the entire study extent (UTM for small
-        # extents, Lambert Conformal Conic for larger ones, polar
-        # stereographic for high-latitude). Single-UTM-zone math would
-        # warp badly for national-scale targets, so we never use
-        # ``estimate_utm_crs`` directly here.
-        utm_crs, _grid_distortion, _grid_name = select_grid_crs_with_warning(
-            preaggr_gdf, _log, role="Pre-aggregation CRS"
-        )
         entities_utm = preaggr_gdf.to_crs(utm_crs)
         all_points = bool((entities_utm.geometry.geom_type == "Point").all())
+        entity_geoms_utm = list(entities_utm.geometry)
         if all_points:
             point_xy_utm = np.column_stack(
                 [
@@ -2402,258 +2360,400 @@ class MetricFusionEngine:
                     entities_utm.geometry.y.to_numpy(),
                 ]
             ).astype(np.float64)
-            entity_geoms_utm: list = []
         else:
             point_xy_utm = np.empty((0, 2), dtype=np.float64)
-            entity_geoms_utm = list(entities_utm.geometry)
+        if "_global_pid" in preaggr_gdf.columns:
+            global_pids = np.asarray(
+                preaggr_gdf["_global_pid"].to_numpy(), dtype=np.int64
+            )
+        else:
+            global_pids = np.asarray(preaggr_gdf.index, dtype=np.int64)
+        pid_to_pos = {int(p): i for i, p in enumerate(global_pids)}
+
+        eff_gvi, eff_ndvi, missing = cache.open_unit(
+            cfg_key,
+            gvi_radii=gvi_radii,
+            ndvi_radii=ndvi_radii,
+            required_ids=global_pids,
+        )
+        _log(
+            "INFO",
+            f"Pre-aggregation: {n_points:,} pixels · GVI radii {gvi_radii} m · "
+            f"NDVI radii {ndvi_radii} m · stats {preaggregation.STAT_COLUMNS}. "
+            f"Cache: {cache.dir} · {len(missing):,} to compute"
+            + (" (fully reused)" if len(missing) == 0 else "")
+            + ".",
+        )
+        if progress_callback is not None:
+            progress_callback(0, max(len(missing), 1))
+
+        if len(missing):
+            if cancel_callback is not None and cancel_callback():
+                self._preaggregation_done = False
+                return False
+            pos = np.fromiter(
+                (pid_to_pos[int(p)] for p in missing),
+                dtype=np.int64,
+                count=len(missing),
+            )
+            stage_secs = {"vector_agg": 0.0, "raster_agg": 0.0}
+            build_t0 = time.perf_counter()
+            total = max(len(missing), 1)
+            result = self._aggregate_pixel_channels(
+                pos,
+                veg_src=self.veg_data,
+                terrain_src=self.terrain_data,
+                ndvi_src=self.ndvi_data,
+                shared_gvi=True,
+                gvi_radii=eff_gvi,
+                ndvi_radii=eff_ndvi,
+                utm_crs=utm_crs,
+                all_points=all_points,
+                point_xy_utm=point_xy_utm,
+                entity_geoms_utm=entity_geoms_utm,
+                max_workers=max_workers,
+                cancel_callback=cancel_callback,
+                stage_secs=stage_secs,
+                progress_callback=(
+                    None
+                    if progress_callback is None
+                    else lambda done: progress_callback(done, total)
+                ),
+            )
+            if result is None:
+                _log("WARN", "Pre-aggregation cancelled (resumable).")
+                self._preaggregation_done = False
+                return False
+            cache.commit_unit(cfg_key, missing, *result)
+            if progress_callback is not None:
+                progress_callback(len(missing), total)
+            build_secs = time.perf_counter() - build_t0
+            _log(
+                "OK",
+                f"Pre-aggregation: built {len(missing):,} pixel(s) in "
+                f"{build_secs:.0f}s — vector "
+                f"{stage_secs['vector_agg']:.0f}s, raster "
+                f"{stage_secs['raster_agg']:.0f}s.",
+            )
+            _log_parallel_efficiency(
+                _log,
+                "pre-aggregation",
+                wall_s=build_secs,
+                busy_s=stage_secs["vector_agg"] + stage_secs["raster_agg"],
+                workers=int(stage_secs.get("workers", 1)),
+            )
+
+        self._preaggr_cache = cache
+        self._preaggr_mem = None
+        self._preaggregation_done = True
+        self._build_pid_translation()
+        _log(
+            "OK",
+            f"Pre-aggregation complete for {n_points:,} pixels "
+            f"(resident {cache.n_bytes / 2**30:.2f} GB).",
+        )
+        return True
+
+    def _prep_channel_source(
+        self, src: Any, channel: str, utm_crs: Any, all_points: bool
+    ) -> tuple:
+        """Normalise one channel's metric into the form both run paths consume.
+
+        Returns one of:
+
+        * ``("raster", array_or_lazy, transform, raster_crs)``
+        * ``("point", xy, values)`` — coordinates and values in ``utm_crs``
+        * ``("geom", gdf, value_column, cell_buffer_m)``
+
+        The point form stops short of the ``BallTree``: the in-process path
+        builds one here, while the pool publishes the coordinates and lets each
+        worker build its own, so no tree ever crosses the pickle channel.
+        """
+        if isinstance(src, dict):  # raster source
+            return ("raster", src["data"], src["transform"], src["crs"])
+        col = _helpers.metric_value_column(src, channel)
+        metric = src.to_crs(utm_crs)
+        metric = metric[metric[col].notna()]
+        if not all_points:
+            metric = metric.reset_index(drop=True)
+            return (
+                "geom",
+                metric,
+                col,
+                preaggregation.metric_cell_buffer_m(metric),
+            )
+        if len(metric) == 0:
+            raise ValueError(f"pre-aggregation: metric column '{col}' is all-NaN")
+        xy = np.column_stack(
+            [metric.geometry.x.to_numpy(), metric.geometry.y.to_numpy()]
+        ).astype(np.float64)
+        return ("point", xy, metric[col].to_numpy(dtype=np.float32))
+
+    @staticmethod
+    def _shared_gvi_geometry(veg_prep: tuple, ter_prep: tuple) -> np.ndarray | None:
+        """The coordinates veg and terrain share, or ``None`` if they differ.
+
+        ``veg`` and ``terrain`` are usually two attribute columns of the same
+        GVI point layer, so their geometry — and the radius query over it — is
+        identical and one query can serve both.
+        """
+        if veg_prep[0] != "point" or ter_prep[0] != "point":
+            return None
+        veg_xy, ter_xy = veg_prep[1], ter_prep[1]
+        if len(veg_xy) == 0 or not np.array_equal(veg_xy, ter_xy):
+            return None
+        return veg_xy
+
+    def _aggregate_pixel_channels(
+        self,
+        positions: np.ndarray,
+        *,
+        veg_src: Any,
+        terrain_src: Any,
+        ndvi_src: Any,
+        shared_gvi: bool,
+        gvi_radii: tuple[int, ...],
+        ndvi_radii: tuple[int, ...],
+        utm_crs: Any,
+        all_points: bool,
+        point_xy_utm: np.ndarray,
+        entity_geoms_utm: list,
+        max_workers: int | None,
+        cancel_callback: Callable[[], bool] | None,
+        stage_secs: dict[str, float],
+        progress_callback: Callable[[int], None] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+        """Compute veg / terrain / ndvi stats for the pixels at ``positions``.
+
+        ``positions`` index into ``point_xy_utm`` / ``entity_geoms_utm``. Each
+        channel samples through a raster disc or its own point/geometry tree,
+        whichever its source is. When ``shared_gvi`` and veg + terrain are two
+        point layers with identical geometry, one ``BallTree`` and one radius
+        query serve both. Returns the three ``[n_positions, n_radii, n_stats]``
+        arrays, or ``None`` if cancelled.
+
+        The batches run in worker **processes** whenever the entities are points
+        — which is every gridded target, so every per-pixel CGI run. The work is
+        a long chain of small numpy calls per entity and therefore GIL-bound, so
+        threads leave the machine idle where processes do not (measurements in
+        :mod:`geofuse.parallel`). Entity geometry that is not points keeps the
+        in-process path, since its channels are backed by spatial indexes that
+        would have to be pickled rather than rebuilt.
+
+        ``progress_callback`` receives the running count of finished entities.
+        The pool size actually used is recorded as ``stage_secs["workers"]`` for
+        the caller's parallel-efficiency log.
+        """
+        n = len(positions)
+        nstats = len(preaggregation.STAT_COLUMNS)
+        veg_out = np.full((n, len(gvi_radii), nstats), np.nan, dtype=np.float32)
+        ter_out = np.full((n, len(gvi_radii), nstats), np.nan, dtype=np.float32)
+        ndvi_out = np.full((n, len(ndvi_radii), nstats), np.nan, dtype=np.float32)
+        if n == 0:
+            return veg_out, ter_out, ndvi_out
+
+        preps = {
+            "veg": self._prep_channel_source(veg_src, "veg", utm_crs, all_points),
+            "terrain": self._prep_channel_source(
+                terrain_src, "terrain", utm_crs, all_points
+            ),
+            "ndvi": self._prep_channel_source(ndvi_src, "ndvi", utm_crs, all_points),
+        }
+        shared_xy = (
+            self._shared_gvi_geometry(preps["veg"], preps["terrain"])
+            if shared_gvi and all_points
+            else None
+        )
+
+        # Raster and geometry channels poll per entity and are the slow path, so
+        # keep batches small unless every channel is a point layer.
+        pure_points = shared_xy is not None and preps["ndvi"][0] == "point"
+        batch_size = 1024 if pure_points else 128
+        bounds = list(range(0, n, batch_size)) + [n]
+        batches = [(bounds[i], bounds[i + 1]) for i in range(len(bounds) - 1)]
+
+        done_entities = 0
+
+        def _store(res) -> None:
+            nonlocal done_entities
+            lo, hi, veg_b, ter_b, ndvi_b, vsec, rsec = res
+            veg_out[lo:hi] = veg_b
+            ter_out[lo:hi] = ter_b
+            ndvi_out[lo:hi] = ndvi_b
+            stage_secs["vector_agg"] += vsec
+            stage_secs["raster_agg"] += rsec
+            done_entities += hi - lo
+            if progress_callback is not None:
+                progress_callback(done_entities)
+
+        if all_points:
+            workers = parallel.process_worker_count(len(batches), cap=max_workers)
+            stage_secs["workers"] = float(workers)
+            finished = self._aggregate_in_processes(
+                positions,
+                preps=preps,
+                shared_xy=shared_xy,
+                gvi_radii=gvi_radii,
+                ndvi_radii=ndvi_radii,
+                utm_crs=utm_crs,
+                point_xy_utm=point_xy_utm,
+                batches=batches,
+                workers=workers,
+                cancel_callback=cancel_callback,
+                on_result=_store,
+            )
+        else:
+            workers = parallel.workers_for(len(batches), cap=max_workers)
+            stage_secs["workers"] = float(workers)
+            finished = self._aggregate_in_threads(
+                positions,
+                preps=preps,
+                shared_xy=shared_xy,
+                gvi_radii=gvi_radii,
+                ndvi_radii=ndvi_radii,
+                utm_crs=utm_crs,
+                point_xy_utm=point_xy_utm,
+                entity_geoms_utm=entity_geoms_utm,
+                batches=batches,
+                workers=workers,
+                cancel_callback=cancel_callback,
+                on_result=_store,
+            )
+        if not finished:
+            return None
+        return veg_out, ter_out, ndvi_out
+
+    def _aggregate_in_threads(
+        self,
+        positions: np.ndarray,
+        *,
+        preps: dict,
+        shared_xy: np.ndarray | None,
+        gvi_radii: tuple[int, ...],
+        ndvi_radii: tuple[int, ...],
+        utm_crs: Any,
+        point_xy_utm: np.ndarray,
+        entity_geoms_utm: list,
+        batches: list,
+        workers: int,
+        cancel_callback: Callable[[], bool] | None,
+        on_result: Callable[[Any], None],
+    ) -> bool:
+        """Run the batches in this process. ``False`` if cancelled."""
+        from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+        state = _helpers.resolved_state(
+            preps,
+            shared_xy,
+            gvi_radii=gvi_radii,
+            ndvi_radii=ndvi_radii,
+            utm_crs=utm_crs,
+        )
+
+        def _compute(lo: int, hi: int):
+            bpos = positions[lo:hi]
+            xy = point_xy_utm[bpos] if len(point_xy_utm) else None
+            geoms = [entity_geoms_utm[i] for i in bpos]
+            veg_b, ter_b, ndvi_b, vsec, rsec = preaggregation.aggregate_entity_batch(
+                state, point_xy=xy, geoms=geoms
+            )
+            return lo, hi, veg_b, ter_b, ndvi_b, vsec, rsec
+
+        if workers <= 1:
+            for lo, hi in batches:
+                if cancel_callback is not None and cancel_callback():
+                    return False
+                on_result(_compute(lo, hi))
+            return True
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            it = iter(batches)
+            in_flight = {
+                ex.submit(_compute, *b)
+                for b in (next(it, None) for _ in range(min(2 * workers, len(batches))))
+                if b is not None
+            }
+            while in_flight:
+                if cancel_callback is not None and cancel_callback():
+                    for fut in in_flight:
+                        fut.cancel()
+                    return False
+                done, in_flight = wait(
+                    in_flight, timeout=0.5, return_when=FIRST_COMPLETED
+                )
+                for fut in done:
+                    on_result(fut.result())
+                    nb = next(it, None)
+                    if nb is not None:
+                        in_flight.add(ex.submit(_compute, *nb))
+        return True
+
+    def _aggregate_in_processes(
+        self,
+        positions: np.ndarray,
+        *,
+        preps: dict,
+        shared_xy: np.ndarray | None,
+        gvi_radii: tuple[int, ...],
+        ndvi_radii: tuple[int, ...],
+        utm_crs: Any,
+        point_xy_utm: np.ndarray,
+        batches: list,
+        workers: int,
+        cancel_callback: Callable[[], bool] | None,
+        on_result: Callable[[Any], None],
+    ) -> bool:
+        """Run the batches across worker processes. ``False`` if cancelled.
+
+        Publishes every bulk array once into a scratch directory that the
+        workers memory-map, so widening the pool costs no extra transfer and no
+        extra copy of the metric in RAM. Falls back to the in-process path if a
+        channel cannot be described to a worker.
+        """
+        import shutil
+        import tempfile
+
+        share_dir = tempfile.mkdtemp(prefix="preaggr-", dir=self.cache_dir)
+        try:
+            spec = _helpers.pool_spec(
+                positions,
+                preps=preps,
+                shared_xy=shared_xy,
+                gvi_radii=gvi_radii,
+                ndvi_radii=ndvi_radii,
+                utm_crs=utm_crs,
+                point_xy_utm=point_xy_utm,
+                share_dir=share_dir,
+            )
+            # Say which limit set the width, so a pool that is narrower than the
+            # machine reads as a deliberate choice rather than a mystery.
+            by_memory = parallel.memory_worker_cap()
+            headroom = parallel.available_memory_bytes()
+            limit = "cores"
+            if by_memory is not None and by_memory <= workers:
+                limit = f"free memory ({headroom / 2**30:.1f} GB)"
+            elif workers >= len(batches):
+                limit = "batches available"
             _log(
                 "INFO",
-                f"Pre-aggregation: {len(entity_geoms_utm)} non-point entities "
-                "→ buffered-geometry aggregation per (radius, stat).",
+                f"    aggregating {len(positions):,} pixel(s) across "
+                f"{workers} worker process(es) — limited by {limit}.",
             )
-
-        # Build per-channel preparation. The point fast path (BallTree /
-        # circular raster mask) uses the legacy per-channel dict; the
-        # geometry path builds a single ``channels_meta_geom`` list that
-        # feeds the unified ``batch_geometry_stats`` (which loops
-        # entity-outermost so each buffered geometry is computed once
-        # per (entity, effective_radius) and reused across channels).
-        prep: dict = {}
-        channels_meta_geom: list = []
-        for ch, metric in (
-            ("veg", self.veg_data),
-            ("terrain", self.terrain_data),
-            ("ndvi", self.ndvi_data),
-        ):
-            radii_ch = cache.radii_for(ch)
-            if isinstance(metric, dict):  # raster
-                if all_points:
-                    px_m = preaggregation.raster_pixel_size_m(
-                        metric["transform"], metric["crs"].is_geographic
-                    )
-                    pts_r = preaggr_gdf.to_crs(metric["crs"])
-                    xy_r = np.column_stack(
-                        [pts_r.geometry.x.to_numpy(), pts_r.geometry.y.to_numpy()]
-                    ).astype(np.float64)
-                    prep[ch] = (
-                        "raster_point",
-                        metric["data"],
-                        metric["transform"],
-                        px_m,
-                        xy_r,
-                    )
-                else:
-                    # Raster stays in native CRS; buffer is built in the
-                    # grid CRS and reprojected per query for the mask op.
-                    if str(metric["crs"]) != str(utm_crs):
-                        from pyproj import Transformer as _PyProjTransformer
-
-                        utm_to_raster = _PyProjTransformer.from_crs(
-                            utm_crs, metric["crs"], always_xy=True
-                        )
-                    else:
-                        utm_to_raster = None
-                    channels_meta_geom.append(
-                        {
-                            "name": ch,
-                            "kind": "raster",
-                            "radii": radii_ch,
-                            "array": metric["data"],
-                            "raster_transform": metric["transform"],
-                            "to_raster_crs": utm_to_raster,
-                        }
-                    )
-            else:  # vector points / lines / polygons
-                col = self._metric_value_column(metric, defaults[ch])
-                if all_points:
-                    # Point fast path: BallTree distance queries need a
-                    # projected CRS; the metric is reprojected to the
-                    # grid CRS only inside the index builder (no other
-                    # uses), so the user-facing "keep metric in native
-                    # CRS" still holds for the geometry path.
-                    tree, vals = preaggregation.build_vector_index(metric, utm_crs, col)
-                    prep[ch] = ("vector_point", tree, vals)
-                else:
-                    # Keep the vector metric in its native CRS. Cell-
-                    # buffer detection still needs spacing in metres, so
-                    # detect it on a small sample temporarily reprojected
-                    # to the grid CRS; the bulk metric is never moved.
-                    metric_native = metric[metric[col].notna()].reset_index(drop=True)
-                    sample_n = min(len(metric_native), 5000)
-                    sample_for_detection = (
-                        metric_native.sample(sample_n, random_state=0).to_crs(utm_crs)
-                        if sample_n
-                        else metric_native
-                    )
-                    cell_buffer = preaggregation.metric_cell_buffer_m(
-                        sample_for_detection
-                    )
-                    if str(metric_native.crs) != str(utm_crs):
-                        from pyproj import Transformer as _PyProjTransformer
-
-                        grid_to_vector = _PyProjTransformer.from_crs(
-                            utm_crs, metric_native.crs, always_xy=True
-                        )
-                    else:
-                        grid_to_vector = None
-                    _log(
-                        "INFO",
-                        f"  {ch}: vector metric in native CRS "
-                        f"({metric_native.crs}); cell-buffer = "
-                        f"{cell_buffer:.1f} m (sqrt(2)/2 × detected grid spacing). "
-                        "Buffer is computed in grid CRS and reprojected per query.",
-                    )
-                    channels_meta_geom.append(
-                        {
-                            "name": ch,
-                            "kind": "vector",
-                            "radii": radii_ch,
-                            "cell_buffer_m": cell_buffer,
-                            "gdf": metric_native,
-                            "col": col,
-                            "sindex": metric_native.sindex,
-                            "values": metric_native[col].to_numpy(dtype=np.float32),
-                            "to_metric_crs": grid_to_vector,
-                        }
-                    )
-
-        # ---- Resume: only compute entities not already written ----
-        entity_ids = [int(x) for x in preaggr_gdf.index]
-        pos_of = {eid: i for i, eid in enumerate(entity_ids)}
-        pending = cache.pending_entities(entity_ids)
-        done0 = n_points - len(pending)
-        if progress_callback is not None and done0:
-            progress_callback(done0, n_points)
-
-        # Geometry-path batches are kept small so the per-batch cancel
-        # check fires often (with 290 entities at batch_size=1024 the
-        # whole job is one batch and the user can't interrupt mid-run).
-        # The point path stays at 1024 because its inner ops are
-        # vectorised and the batch cost is sub-second already.
-        batch_size = 1024 if all_points else 32
-        batches = [
-            pending[i : i + batch_size] for i in range(0, len(pending), batch_size)
-        ]
-
-        def _compute_batch(bids: list[int]):
-            bpos = np.fromiter(
-                (pos_of[e] for e in bids), dtype=np.int64, count=len(bids)
-            )
-            if all_points:
-                # Per-channel point fast path (BallTree / circular raster
-                # mask). Vectorised distance queries make per-channel
-                # processing the natural shape here; no per-entity buffer
-                # to share across channels.
-                channel_stats: dict[str, np.ndarray] = {}
-                for ch in preaggregation.CHANNELS:
-                    kind = prep[ch][0]
-                    radii = cache.radii_for(ch)
-                    if kind == "vector_point":
-                        _, tree, vals = prep[ch]
-                        channel_stats[ch] = preaggregation.vector_batch_stats(
-                            tree, vals, point_xy_utm[bpos], radii
-                        )
-                    else:  # raster_point
-                        _, array, transform, px_m, xy_r = prep[ch]
-                        channel_stats[ch] = preaggregation.raster_batch_stats(
-                            array, transform, px_m, xy_r[bpos], radii
-                        )
-                return bids, channel_stats
-
-            # Geometry path: one sweep across all channels with a per-
-            # entity buffer cache so shapely.buffer() is called once per
-            # (entity, effective_radius) and reused across channels. The
-            # batch function checks ``cancel_callback`` per entity and
-            # returns ``None`` to abandon the batch early.
-            batch_geoms = [entity_geoms_utm[i] for i in bpos]
-            channel_stats = preaggregation.batch_geometry_stats(
-                batch_geoms,
-                channels_meta_geom,
+            return parallel.map_batches(
+                preaggregation.worker_aggregate,
+                batches,
+                workers=workers,
+                initializer=preaggregation.worker_init,
+                initargs=(spec,),
+                on_result=on_result,
                 cancel_check=cancel_callback,
             )
-            return bids, channel_stats
-
-        if max_workers is None:
-            max_workers = max(1, min((os.cpu_count() or 2), 8))
-        max_workers = max(1, min(max_workers, len(batches) or 1))
-        _log("INFO", f"Pre-aggregation workers: {max_workers}")
-
-        # Worker threads do the compute (BallTree queries / numpy stats release
-        # the GIL and share the read-only metric indices in memory — no pickling,
-        # which matters for national-scale rasters); the SQLite writes stay on this
-        # thread so there is a single writer and the build remains resumable.
-        processed = done0
-        cancelled = False
-
-        def _on_done(bids, channel_stats) -> None:
-            nonlocal processed, cancelled
-            if channel_stats is None:
-                # Batch was abandoned mid-run by the cancel-check inside
-                # ``batch_geometry_stats``. Don't write; the next resume
-                # will pick these entities up because they remain in the
-                # cache's pending list.
-                cancelled = True
-                return
-            cache.write_batch(bids, channel_stats)
-            processed += len(bids)
-            if progress_callback is not None:
-                progress_callback(processed, n_points)
-
-        if max_workers == 1:
-            for bids in batches:
-                if cancel_callback is not None and cancel_callback():
-                    cancelled = True
-                    break
-                _on_done(*_compute_batch(bids))
-                if cancelled:
-                    break
-        else:
-            from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-
-            with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                it = iter(batches)
-                in_flight = {
-                    ex.submit(_compute_batch, b)
-                    for b in (
-                        next(it, None)
-                        for _ in range(min(2 * max_workers, len(batches)))
-                    )
-                    if b is not None
-                }
-                # 100 ms poll keeps cancel latency well under a second;
-                # combined with the per-entity cancel check inside the
-                # batch function the user-visible cancel is sub-second.
-                while in_flight:
-                    if cancel_callback is not None and cancel_callback():
-                        cancelled = True
-                        for fut in in_flight:
-                            fut.cancel()
-                        break
-                    done, in_flight = wait(
-                        in_flight, timeout=0.1, return_when=FIRST_COMPLETED
-                    )
-                    for fut in done:
-                        _on_done(*fut.result())
-                        if cancelled:
-                            for other in in_flight:
-                                other.cancel()
-                            in_flight = set()
-                            break
-                        nb = next(it, None)
-                        if nb is not None:
-                            in_flight.add(ex.submit(_compute_batch, nb))
-
-        if cancelled:
-            _log("WARN", "Pre-aggregation cancelled (resumable).")
-            self._preaggregation_done = False
-            cache.close()
-            return False
-
-        cache.mark_complete()
-        self._preaggr_cache = cache
-        self._preaggregation_done = True
-        _log("OK", f"Pre-aggregation complete for {n_points:,} entities.")
-        return True
+        finally:
+            # A single-worker pool runs the initializer here rather than in a
+            # child, so the scratch files stay mapped into *this* process until
+            # that state is dropped — and Windows will not delete a mapped file.
+            preaggregation.worker_release()
+            shutil.rmtree(share_dir, ignore_errors=True)
 
     def _precompute_aggregations_longitudinal(
         self,
@@ -2663,19 +2763,21 @@ class MetricFusionEngine:
     ) -> bool:
         """Wave-aware variant of :meth:`precompute_aggregations`.
 
-        For each greenery channel the runner has already loaded a per-wave
-        metric source into ``self._longitudinal_metric_data[channel]``. This
-        method:
+        The runner registers one metric file per channel per temporal key
+        (measurement year, or wave label when waves are not date-derived).
+        This method:
 
-        - Groups waves by file fingerprint so identical-file waves share a
-          single compute pass (a static channel that reuses one file across
-          all waves only gets computed once).
-        - Registers wave aliases on the cache so every aliased wave's lookup
-          resolves to the same representative-wave storage.
-        - For each ``(channel, representative_wave)`` group, computes stats
-          for the entities whose row in the long-format target falls in any
-          wave of that group, and writes them to the cache under the
-          representative wave index.
+        - Groups temporal keys by which file they resolve to, so keys sharing
+          a file share a single compute pass (a static channel that reuses one
+          file across every key is computed once).
+        - Registers key aliases on the cache so every aliased key's lookup
+          resolves to the same representative-key storage. Stored rows stay
+          keyed by ``(entity, temporal key)``; aliasing only decides which
+          key's computation is reused, never which key's values are returned.
+        - For each ``(channel, representative key)`` group, computes stats for
+          the entities whose long-format rows fall in any key of that group,
+          writes them to the cache, then releases that group's file before
+          opening the next.
         """
         spec = self.longitudinal_spec
         assert spec is not None
@@ -2684,92 +2786,42 @@ class MetricFusionEngine:
                 "Pre-aggregation requires sample points; call prepare_fusion_data() "
                 "first."
             )
-        if self._longitudinal_metric_data is None or not all(
-            ch in self._longitudinal_metric_data
-            for ch in longitudinal.GREENERY_CHANNELS
+        provider = self._metric_sources
+        if provider is None or not all(
+            provider.has_channel(ch) for ch in longitudinal.GREENERY_CHANNELS
         ):
             raise ValueError(
-                "Longitudinal pre-aggregation requires per-wave metric data for "
-                "every channel; call set_longitudinal_metric_data() first."
+                "Longitudinal pre-aggregation requires per-wave metric sources "
+                "for every channel; call set_longitudinal_metric_sources() (or "
+                "set_longitudinal_metric_sources()) first."
             )
 
         gvi_radii, ndvi_radii = self._preaggr_radii()
-        # Unique-pixel source for point/line targets; entity rows otherwise.
-        # Each wave's stats are stored per pixel, with wave membership derived
-        # from the duplicated rows further below.
+        # Unique-pixel source for point/line/polygon targets; entity rows
+        # otherwise. Greenery is stored per pixel, keyed by a stable global id.
         preaggr_gdf = (
             self._preaggr_entity_gdf
             if self._preaggr_entity_gdf is not None
             else self.target_gdf
         )
         n_points = len(preaggr_gdf)
-        defaults = {"veg": "veg", "terrain": "terrain", "ndvi": "NDVI"}
 
-        # Per-(channel, wave) source identity contributes to the fingerprint
-        # so changing any wave's file invalidates the cache.
-        fp_parts: list[str] = [f"geom:{geometry_sha256(preaggr_gdf)}"]
-        for ch in longitudinal.GREENERY_CHANNELS:
-            for wave_label in spec.wave_labels:
-                src = self._longitudinal_metric_data[ch][wave_label]
-                fp_parts.append(
-                    f"{ch}@{wave_label}:" + self._metric_fingerprint(src, defaults[ch])
-                )
-        fp_parts.append(f"gvi:{gvi_radii}")
-        fp_parts.append(f"ndvi:{ndvi_radii}")
-        fp_parts.append(f"stats:{preaggregation.STAT_COLUMNS}")
-        fp_parts.append(f"waves:{list(spec.wave_labels)}")
-        fp_parts.append(
-            f"cgi_grid:{self.cgi_grid_spacing_m if (self.is_polygon_target or self.is_points) else 'na'}"
-        )
-        fingerprint = hashlib.sha256("|".join(fp_parts).encode()).hexdigest()
-
-        preaggr_dir = os.path.join(self.cache_dir, "preaggr")
-        os.makedirs(preaggr_dir, exist_ok=True)
-        base = os.path.splitext(os.path.basename(self.target_file))[0]
-        db_path = os.path.join(preaggr_dir, f"preaggr-{base}-{fingerprint[:12]}.sqlite")
-
-        cache = preaggregation.PreAggregationCache(
-            db_path,
-            gvi_radii=gvi_radii,
-            ndvi_radii=ndvi_radii,
-            fingerprint=fingerprint,
-            wave_labels=spec.wave_labels,
+        # Reuse the grid's metric CRS (the pixels are already in it) so the
+        # cache key is stable between the coverage probe and this build.
+        utm_crs = _helpers.grid_metric_crs(preaggr_gdf, _log)
+        crs_key = str(utm_crs.to_epsg() or utm_crs.to_wkt())
+        cache = preaggregation.GreeneryCache(
+            self.cache_dir,
+            spacing_m=float(self.cgi_grid_spacing_m or 0.0),
+            crs_key=crs_key,
+            stats=preaggregation.STAT_COLUMNS,
         )
 
-        if cache.is_complete():
-            _log(
-                "OK",
-                f"Reusing longitudinal pre-aggregation cache "
-                f"({n_points:,} rows): {db_path}",
-            )
-            self._preaggr_cache = cache
-            self._preaggregation_done = True
-            if progress_callback is not None:
-                progress_callback(n_points, n_points)
-            return True
-
-        if not cache.matches_fingerprint():
-            cache.reset()
-        cache.write_header(n_points)
-
-        _log(
-            "INFO",
-            f"Longitudinal pre-aggregation: {n_points:,} entities · "
-            f"{len(spec.wave_labels)} waves · GVI radii {gvi_radii} m · "
-            f"NDVI radii {ndvi_radii} m · stats {preaggregation.STAT_COLUMNS}. "
-            f"Cache: {db_path}",
-        )
-
-        # Group waves by file fingerprint for each channel. Identical-file
-        # waves share one compute pass; the first wave in each group is the
-        # representative storage slot.
-        wave_index_of = {w: i for i, w in enumerate(spec.wave_labels)}
-
-        utm_crs, _grid_distortion_lon, _grid_name_lon = select_grid_crs_with_warning(
-            preaggr_gdf, _log, role="Pre-aggregation CRS (longitudinal)"
-        )
+        # Entity geometry in the metric CRS; ``pid_to_pos`` maps a global pixel
+        # id to its row so a unit's missing ids resolve to coordinates.
         entities_utm = preaggr_gdf.to_crs(utm_crs)
         all_points = bool((entities_utm.geometry.geom_type == "Point").all())
+        entity_geoms_utm: list = list(entities_utm.geometry)
         if all_points:
             point_xy_utm = np.column_stack(
                 [
@@ -2777,235 +2829,199 @@ class MetricFusionEngine:
                     entities_utm.geometry.y.to_numpy(),
                 ]
             ).astype(np.float64)
-            entity_geoms_utm: list = []
         else:
             point_xy_utm = np.empty((0, 2), dtype=np.float64)
-            entity_geoms_utm = list(entities_utm.geometry)
-        entity_ids_all = np.asarray([int(x) for x in preaggr_gdf.index], dtype=np.int64)
-        pos_of = {int(eid): i for i, eid in enumerate(entity_ids_all)}
-
-        # Cache entity ids referenced by each wave. For point/line targets the
-        # cache stores one row per unique pixel, so a wave's entities are the
-        # unique pixel ids its catchment rows touch; otherwise every row is its
-        # own entity and a wave maps directly to its own rows.
-        if self._preaggr_entity_gdf is not None:
-            tg_waves = self.target_gdf["wave"].astype(str).to_numpy()
-            tg_pixels = self.target_gdf["_preaggr_id"].to_numpy()
-            wave_to_eids = {
-                w: np.unique(tg_pixels[tg_waves == w]) for w in np.unique(tg_waves)
-            }
+        if "_global_pid" in preaggr_gdf.columns:
+            global_pids = np.asarray(
+                preaggr_gdf["_global_pid"].to_numpy(), dtype=np.int64
+            )
         else:
-            waves_by_row = self.target_gdf["wave"].astype(str).to_numpy()
-            wave_to_eids = {
-                w: entity_ids_all[waves_by_row == w] for w in np.unique(waves_by_row)
-            }
+            global_pids = np.asarray(preaggr_gdf.index, dtype=np.int64)
+        pid_to_pos = {int(p): i for i, p in enumerate(global_pids)}
 
-        def _eids_for_group(group_waves: list[str]) -> np.ndarray:
-            parts = [wave_to_eids[w] for w in group_waves if w in wave_to_eids]
-            if not parts:
-                return np.empty(0, dtype=np.int64)
-            return np.unique(np.concatenate(parts))
+        wave_index_of = {w: i for i, w in enumerate(spec.wave_labels)}
 
-        # Walk each channel: build file groups, register aliases, prep + fill
-        # one group at a time so memory only ever holds one channel's metric
-        # data per group.
+        # Global pixel ids referenced by each wave (via the duplicated catchment
+        # rows for a gridded target; the entity's own id otherwise).
+        tg = self.target_gdf
+        tg_waves = tg["wave"].astype(str).to_numpy()
+        if "_global_pid" in tg.columns:
+            tg_pids = np.asarray(tg["_global_pid"].to_numpy(), dtype=np.int64)
+        else:
+            tg_pids = np.asarray(tg.index, dtype=np.int64)
+        wave_to_pids = {
+            w: np.unique(tg_pids[tg_waves == w]) for w in np.unique(tg_waves)
+        }
+
+        # Group waves by their greenery-file triple → one cache unit. Waves
+        # resolving to the same files share a unit automatically (static-channel
+        # dedup). Bind each wave to its unit for lookups.
+        units: dict[str, dict] = {}
+        for w in spec.wave_labels:
+            cfg = cache.unit_key(
+                provider.identity("veg", w),
+                provider.identity("terrain", w),
+                provider.identity("ndvi", w),
+            )
+            cache.bind_wave(wave_index_of[w], cfg)
+            u = units.setdefault(cfg, {"waves": [], "rep": w})
+            u["waves"].append(w)
+        _log(
+            "INFO",
+            f"Longitudinal pre-aggregation: {n_points:,} pixels · "
+            f"{len(spec.wave_labels)} waves → {len(units)} greenery unit(s) · "
+            f"GVI radii {gvi_radii} m · NDVI radii {ndvi_radii} m · "
+            f"stats {preaggregation.STAT_COLUMNS}. Cache: {cache.dir}",
+        )
+
+        # Open every unit: reusable files load into RAM, missing pixels counted.
+        for cfg, u in units.items():
+            parts = [wave_to_pids[w] for w in u["waves"] if w in wave_to_pids]
+            required = (
+                np.unique(np.concatenate(parts)) if parts else np.empty(0, np.int64)
+            )
+            eff_gvi, eff_ndvi, missing = cache.open_unit(
+                cfg, gvi_radii=gvi_radii, ndvi_radii=ndvi_radii, required_ids=required
+            )
+            u["eff_gvi"] = eff_gvi
+            u["eff_ndvi"] = eff_ndvi
+            u["missing"] = missing
+        total_missing = int(sum(len(u["missing"]) for u in units.values()))
+        n_reused = sum(1 for u in units.values() if len(u["missing"]) == 0)
+        if progress_callback is not None:
+            progress_callback(0, max(total_missing, 1))
+
+        stage_secs = {"vector_agg": 0.0, "raster_agg": 0.0}
+        build_t0 = time.perf_counter()
         processed = 0
-        total_jobs = 0
-        plan: list[tuple[str, int, list[str], Any]] = (
-            []
-        )  # (channel, rep_wave_index, wave_labels_in_group, source)
-        for ch in longitudinal.GREENERY_CHANNELS:
-            per_wave = self._longitudinal_metric_data[ch]
-            groups: dict[str, list[str]] = {}
-            for wave_label in spec.wave_labels:
-                key = self._metric_fingerprint(per_wave[wave_label], defaults[ch])
-                groups.setdefault(key, []).append(wave_label)
-
-            alias_map: dict[int, int] = {}
-            for group_waves in groups.values():
-                rep_label = group_waves[0]
-                rep_idx = wave_index_of[rep_label]
-                for w in group_waves:
-                    alias_map[wave_index_of[w]] = rep_idx
-                plan.append((ch, rep_idx, group_waves, per_wave[rep_label]))
-            cache.register_wave_aliases(ch, alias_map)
-            _log(
-                "INFO",
-                f"  {ch}: {len(groups)} unique file(s) across "
-                f"{len(spec.wave_labels)} wave(s) — "
-                f"{'static' if len(groups) == 1 else 'time-varying'}.",
-            )
-
-        # Pre-count the total work for the progress bar.
-        for ch, rep_idx, group_waves, _src in plan:
-            pending = cache.pending_entities_for(
-                ch, rep_idx, _eids_for_group(group_waves).tolist()
-            )
-            total_jobs += len(pending)
-        if progress_callback is not None and total_jobs > 0:
-            progress_callback(0, total_jobs)
-
         cancelled = False
-        for ch, rep_idx, group_waves, src in plan:
+        for cfg, u in units.items():
+            provider.release()
+            missing = u["missing"]
+            if len(missing) == 0:
+                continue  # fully served by a reusable cache file
             if cancel_callback is not None and cancel_callback():
                 cancelled = True
                 break
-            group_eids = _eids_for_group(group_waves).tolist()
-            pending = cache.pending_entities_for(ch, rep_idx, group_eids)
-            if not pending:
-                continue
-
-            radii = cache.radii_for(ch)
-            xy_r: np.ndarray = np.empty((0, 2), dtype=np.float64)
-            raster_array = transform = None
-            px_m = 0.0
-            tree = vals = None
-            metric_utm = None
-            col = ""
-            utm_to_raster_lon = None
-            if isinstance(src, dict):  # raster source
-                px_m = preaggregation.raster_pixel_size_m(
-                    src["transform"], src["crs"].is_geographic
-                )
-                raster_array = src["data"]
-                transform = src["transform"]
-                if all_points:
-                    pts_r = preaggr_gdf.to_crs(src["crs"])
-                    xy_r = np.column_stack(
-                        [pts_r.geometry.x.to_numpy(), pts_r.geometry.y.to_numpy()]
-                    ).astype(np.float64)
-                    kind = "raster_point"
-                else:
-                    if str(src["crs"]) != str(utm_crs):
-                        from pyproj import Transformer as _PyProjTransformer
-
-                        utm_to_raster_lon = _PyProjTransformer.from_crs(
-                            utm_crs, src["crs"], always_xy=True
-                        )
-                    kind = "raster_geometry"
-            else:
-                col = self._metric_value_column(src, defaults[ch])
-                if all_points:
-                    tree, vals = preaggregation.build_vector_index(src, utm_crs, col)
-                    kind = "vector_point"
-                else:
-                    metric_utm = src.to_crs(utm_crs)
-                    metric_utm = metric_utm[metric_utm[col].notna()].reset_index(
-                        drop=True
-                    )
-                    cell_buffer_lon = preaggregation.metric_cell_buffer_m(metric_utm)
-                    _log(
-                        "INFO",
-                        f"  {ch}: vector metric detected — cell-buffer = "
-                        f"{cell_buffer_lon:.1f} m (sqrt(2)/2 × detected grid spacing).",
-                    )
-                    kind = "vector_geometry"
-
-            batch_size = 1024
-            batches = [
-                pending[i : i + batch_size] for i in range(0, len(pending), batch_size)
-            ]
-
-            def _compute_one(bids: list[int]):
-                bpos = np.fromiter(
-                    (pos_of[int(e)] for e in bids), dtype=np.int64, count=len(bids)
-                )
-                if kind == "vector_point":
-                    stats = preaggregation.vector_batch_stats(
-                        tree, vals, point_xy_utm[bpos], radii
-                    )
-                elif kind == "raster_point":
-                    stats = preaggregation.raster_batch_stats(
-                        raster_array, transform, px_m, xy_r[bpos], radii
-                    )
-                elif kind == "vector_geometry":
-                    batch_geoms = [entity_geoms_utm[i] for i in bpos]
-                    stats = preaggregation.vector_batch_geometry_stats(
-                        metric_utm,
-                        col,
-                        batch_geoms,
-                        radii,
-                        cell_buffer_m=cell_buffer_lon,
-                    )
-                else:  # raster_geometry
-                    batch_geoms = [entity_geoms_utm[i] for i in bpos]
-                    stats = preaggregation.raster_batch_geometry_stats(
-                        raster_array,
-                        transform,
-                        batch_geoms,
-                        radii,
-                        to_raster_crs=utm_to_raster_lon,
-                    )
-                return bids, stats
-
-            workers = (
-                max(1, min((os.cpu_count() or 2), 8))
-                if max_workers is None
-                else max_workers
+            rep = u["rep"]
+            veg_src = provider.get("veg", rep)
+            terrain_src = provider.get("terrain", rep)
+            ndvi_src = provider.get("ndvi", rep)
+            shared_gvi = provider.path("veg", rep) is not None and provider.path(
+                "veg", rep
+            ) == provider.path("terrain", rep)
+            _log(
+                "INFO",
+                f"  unit {cfg[:8]} ({'/'.join(u['waves'])}): {len(missing):,} "
+                f"pixel(s) to compute"
+                + (" · veg+terrain share one read" if shared_gvi else "")
+                + ".",
             )
-            workers = max(1, min(workers, len(batches) or 1))
-
-            def _on_done(bids: list[int], stats: np.ndarray) -> None:
-                nonlocal processed
-                cache.write_channel_wave_batch(ch, rep_idx, bids, stats)
-                processed += len(bids)
-                if progress_callback is not None and total_jobs > 0:
-                    progress_callback(processed, total_jobs)
-
-            if workers == 1:
-                for bids in batches:
-                    if cancel_callback is not None and cancel_callback():
-                        cancelled = True
-                        break
-                    _on_done(*_compute_one(bids))
-            else:
-                from concurrent.futures import (
-                    FIRST_COMPLETED,
-                    ThreadPoolExecutor,
-                    wait,
-                )
-
-                with ThreadPoolExecutor(max_workers=workers) as ex:
-                    it = iter(batches)
-                    in_flight = {
-                        ex.submit(_compute_one, b)
-                        for b in (
-                            next(it, None)
-                            for _ in range(min(2 * workers, len(batches)))
-                        )
-                        if b is not None
-                    }
-                    while in_flight:
-                        if cancel_callback is not None and cancel_callback():
-                            cancelled = True
-                            for fut in in_flight:
-                                fut.cancel()
-                            break
-                        done, in_flight = wait(
-                            in_flight, timeout=0.5, return_when=FIRST_COMPLETED
-                        )
-                        for fut in done:
-                            _on_done(*fut.result())
-                            nb = next(it, None)
-                            if nb is not None:
-                                in_flight.add(ex.submit(_compute_one, nb))
-            if cancelled:
+            pos = np.fromiter(
+                (pid_to_pos[int(p)] for p in missing),
+                dtype=np.int64,
+                count=len(missing),
+            )
+            unit_base = processed
+            result = self._aggregate_pixel_channels(
+                pos,
+                veg_src=veg_src,
+                terrain_src=terrain_src,
+                ndvi_src=ndvi_src,
+                shared_gvi=shared_gvi,
+                gvi_radii=u["eff_gvi"],
+                ndvi_radii=u["eff_ndvi"],
+                utm_crs=utm_crs,
+                all_points=all_points,
+                point_xy_utm=point_xy_utm,
+                entity_geoms_utm=entity_geoms_utm,
+                max_workers=max_workers,
+                cancel_callback=cancel_callback,
+                stage_secs=stage_secs,
+                progress_callback=(
+                    None
+                    if progress_callback is None
+                    else lambda done: progress_callback(
+                        min(unit_base + done, total_missing), max(total_missing, 1)
+                    )
+                ),
+            )
+            if result is None:
+                cancelled = True
                 break
+            veg_arr, ter_arr, ndvi_arr = result
+            cache.commit_unit(cfg, missing, veg_arr, ter_arr, ndvi_arr)
+            processed += len(missing)
+            if progress_callback is not None:
+                progress_callback(min(processed, total_missing), max(total_missing, 1))
+            del veg_arr, ter_arr, ndvi_arr, result
+            provider.release()
+            gc.collect()
 
+        provider.release()
         if cancelled:
             _log("WARN", "Longitudinal pre-aggregation cancelled (resumable).")
             self._preaggregation_done = False
-            cache.close()
             return False
 
-        cache.mark_complete()
         self._preaggr_cache = cache
+        self._preaggr_mem = None
         self._preaggregation_done = True
+        self._build_pid_translation()
+        total_build = time.perf_counter() - build_t0
         _log(
             "OK",
-            f"Longitudinal pre-aggregation complete for {n_points:,} entities.",
+            f"Longitudinal pre-aggregation complete: {len(units)} greenery "
+            f"unit(s) ({n_reused} reused, {len(units) - n_reused} built) in "
+            f"{total_build:.0f}s — vector agg {stage_secs['vector_agg']:.0f}s, "
+            f"raster agg {stage_secs['raster_agg']:.0f}s. "
+            f"Resident {cache.n_bytes / 2**30:.2f} GB (float32).",
+        )
+        _log_parallel_efficiency(
+            _log,
+            "pre-aggregation",
+            wall_s=total_build,
+            busy_s=stage_secs["vector_agg"] + stage_secs["raster_agg"],
+            workers=int(stage_secs.get("workers", 1)),
         )
         return True
+
+    def _build_pid_translation(self) -> None:
+        """Cache the ``_preaggr_id`` → ``_global_pid`` map for lookups.
+
+        The greenery cache keys on the stable global pixel id, while scoring
+        rows carry the frame-local ``_preaggr_id``; a small array indexed by the
+        latter yields the former. ``None`` when the target has no grid ids (the
+        cache then keys on the ids scoring already uses).
+        """
+        tg = self.target_gdf
+        if (
+            tg is None
+            or "_global_pid" not in tg.columns
+            or "_preaggr_id" not in tg.columns
+        ):
+            self._preaggr_pid_translate = None
+            return
+        pi = np.asarray(tg["_preaggr_id"].to_numpy(), dtype=np.int64)
+        gp = np.asarray(tg["_global_pid"].to_numpy(), dtype=np.int64)
+        if pi.size == 0:
+            self._preaggr_pid_translate = None
+            return
+        m = np.full(int(pi.max()) + 1, -1, dtype=np.int64)
+        m[pi] = gp
+        self._preaggr_pid_translate = m
+
+    def _ensure_memory_loaded(self):
+        """Return the RAM-resident greenery store.
+
+        The :class:`GreeneryCache` loads each unit into RAM as it is opened or
+        built, so it is itself the resident structure — every trial's lookups
+        are pure array gathers, shared read-only across worker threads. Returns
+        ``None`` when no cache has been built yet.
+        """
+        if not self._preaggregation_done:
+            return None
+        return self._preaggr_cache
 
     def _lookup_preaggregation(
         self,
@@ -3025,110 +3041,56 @@ class MetricFusionEngine:
         ``None`` (cross-sectional mode) the cache returns the single
         implicit wave 0 for all entities.
         """
-        cache = self._preaggr_cache
-        if cache is None or not self._preaggregation_done:
+        if not self._preaggregation_done:
+            return None
+        # Prefer the RAM-resident structure (loaded at engine start); every
+        # per-trial gather then avoids SQLite entirely. Falls back to the disk
+        # cache only if the RAM load hasn't happened.
+        source = self._ensure_memory_loaded() or self._preaggr_cache
+        if source is None:
             return None
         column = preaggregation.stat_to_column(stat, percentile)
         if column is None:
             return None
-        ids = np.asarray(point_indices)
-        radius = int(round(radius_m))
-        if wave_indices is None:
-            return cache.lookup(ids, channel, radius, column)
+        plan = self._preaggr_plan(source, point_indices, wave_indices)
+        if plan is None:
+            return None
+        # ``None`` here means an off-grid (channel, wave, radius, column) cell —
+        # the caller falls back to the ring/buffer aggregation path.
+        return source.gather(plan, channel, int(round(radius_m)), column)
 
-        waves = np.asarray(wave_indices)
-        out = np.full(ids.shape[0], np.nan, dtype=np.float32)
-        # Per-wave grouped reads: each wave maps to one cache column, so
-        # repeated entity reads within a wave benefit from the cache's
-        # column LRU.
-        for w in np.unique(waves):
-            mask = waves == w
-            sub = cache.lookup(ids[mask], channel, radius, column, wave_index=int(w))
-            if sub is None:
-                # An off-grid (channel, wave, radius, column) cell — caller
-                # falls back to the ring/buffer aggregation path.
-                return None
-            out[mask] = sub
-        return out
-
-    # ------------------------------------------------------------------
-    # Polygon-target areal aggregation
-    # ------------------------------------------------------------------
-
-    def _reference_points_in_polygon(
+    def _preaggr_plan(
         self,
-        polygon_geom,
-        polygon_crs,
-        metric_data,
-    ) -> "gpd.GeoDataFrame":
-        """Return the in-polygon sample-point locations contributed by one metric.
+        source: "preaggregation.GreeneryCache",
+        point_indices: np.ndarray,
+        wave_indices: np.ndarray | None,
+        store: dict | None = None,
+    ) -> dict | None:
+        """Where a fixed set of scoring rows lives in the greenery cache.
 
-        For raster metrics: pixel centers (as Points) that fall inside the
-        polygon. For vector metrics: each feature whose geometry is strictly
-        inside the polygon, represented by its centroid (always a Point).
-        The returned GeoDataFrame's CRS matches ``polygon_crs``.
+        Independent of anything a trial chooses, so ``store`` (a fold's static
+        dict) holds it for the whole search: resolving it costs a binary search
+        over every row, and repeating that per trial dominated the search.
         """
-        from rasterio.transform import xy as _xy
-        from shapely.geometry import Point
+        if store is not None:
+            cached = store.get("_preaggr_plan")
+            if cached is not None:
+                return cached
+        # Scoring rows carry the frame-local ``_preaggr_id``; the greenery cache
+        # keys on the stable global pixel id, so translate before resolving.
+        ids = np.asarray(point_indices, dtype=np.int64)
+        tr = self._preaggr_pid_translate
+        if tr is not None:
+            safe = (ids >= 0) & (ids < tr.shape[0])
+            ids = np.where(safe, tr[np.clip(ids, 0, tr.shape[0] - 1)], ids)
+        plan = source.build_plan(ids, wave_indices)
+        if store is not None and plan is not None:
+            store["_preaggr_plan"] = plan
+        return plan
 
-        if isinstance(metric_data, dict):  # raster
-            raster_crs = metric_data["crs"]
-            if polygon_crs is not None and str(polygon_crs) != str(raster_crs):
-                poly_r = (
-                    gpd.GeoSeries([polygon_geom], crs=polygon_crs)
-                    .to_crs(raster_crs)
-                    .iloc[0]
-                )
-            else:
-                poly_r = polygon_geom
-
-            transform = metric_data["transform"]
-            height, width = metric_data["data"].shape
-            minx, miny, maxx, maxy = poly_r.bounds
-            from rasterio.transform import rowcol
-
-            r1, c1 = rowcol(transform, minx, maxy)
-            r2, c2 = rowcol(transform, maxx, miny)
-            r_start = max(0, min(r1, r2))
-            r_end = min(height, max(r1, r2) + 1)
-            c_start = max(0, min(c1, c2))
-            c_end = min(width, max(c1, c2) + 1)
-            if r_end <= r_start or c_end <= c_start:
-                return gpd.GeoDataFrame(geometry=[], crs=polygon_crs)
-
-            rows, cols = np.meshgrid(
-                np.arange(r_start, r_end),
-                np.arange(c_start, c_end),
-                indexing="ij",
-            )
-            xs, ys = _xy(transform, rows.flatten(), cols.flatten(), offset="center")
-            cand = gpd.GeoDataFrame(
-                geometry=[Point(x, y) for x, y in zip(xs, ys)],
-                crs=raster_crs,
-            )
-            inside = cand[cand.geometry.within(poly_r)]
-            if len(inside) and polygon_crs is not None:
-                inside = inside.to_crs(polygon_crs)
-            return inside.reset_index(drop=True)
-
-        # Vector metric data
-        m = metric_data
-        if (
-            m.crs is not None
-            and polygon_crs is not None
-            and str(m.crs) != str(polygon_crs)
-        ):
-            m = m.to_crs(polygon_crs)
-        inside = m[m.geometry.within(polygon_geom)]
-        if len(inside) == 0:
-            return gpd.GeoDataFrame(geometry=[], crs=polygon_crs)
-        # Reduce non-Point geometries to centroids
-        geoms = inside.geometry.map(
-            lambda g: g if g.geom_type == "Point" else g.centroid
-        )
-        return gpd.GeoDataFrame(geometry=list(geoms), crs=polygon_crs).reset_index(
-            drop=True
-        )
+    # ────────────────────────────────────────────────────────────
+    # Polygon-target areal aggregation
+    # ────────────────────────────────────────────────────────────
 
     def _prepare_polygon_fusion(self) -> pd.DataFrame:
         """Build a per-pixel dataset for polygon targets.
@@ -3196,32 +3158,82 @@ class MetricFusionEngine:
         union_geom = polygons_grid.geometry.union_all()
         minx, miny, maxx, maxy = union_geom.bounds
 
-        # Generate a regular grid of pixel centroids covering the union
-        # bounding box, then keep only pixels whose centroid lies inside
-        # the union.
-        xs = np.arange(minx + spacing_m / 2.0, maxx, spacing_m, dtype=np.float64)
-        ys = np.arange(miny + spacing_m / 2.0, maxy, spacing_m, dtype=np.float64)
-        if xs.size == 0 or ys.size == 0:
+        # Sparse lattice: generate pixel centres only inside the polygons'
+        # connected components, on one global lattice anchored at the grid
+        # bounding box so ``(_grid_row, _grid_col)`` stay consistent across
+        # components. The empty space between dispersed polygons is never
+        # materialised as geometry.
+        import shapely as _shapely
+        from shapely.geometry import Polygon as _Polygon
+
+        n_cols = int(np.floor((maxx - minx) / spacing_m))
+        n_rows = int(np.floor((maxy - miny) / spacing_m))
+        if n_cols <= 0 or n_rows <= 0:
             raise ValueError(
                 f"CGI grid spacing {spacing_m:g} m is larger than the target "
                 f"extent ({maxx - minx:.0f} m × {maxy - miny:.0f} m)."
             )
-        # ys are top-to-bottom in raster row order so the composite TIFF
-        # writer can index pixels back to (row, col) without flipping.
-        ys_topdown = ys[::-1]
-        gx, gy = np.meshgrid(xs, ys_topdown, indexing="xy")
-        pixel_geoms = gpd.points_from_xy(gx.ravel(), gy.ravel())
-        pixels = gpd.GeoDataFrame(geometry=pixel_geoms, crs=grid_crs)
-        # Stash the (row, col) of each candidate pixel for the composite-map
-        # writer. After sjoin + dedup the surviving subset keeps these tags.
-        n_cols = len(xs)
-        n_rows = len(ys_topdown)
-        pixels["_grid_row"] = np.repeat(np.arange(n_rows, dtype=np.int64), n_cols)
-        pixels["_grid_col"] = np.tile(np.arange(n_cols, dtype=np.int64), n_rows)
+        cluster_polys = (
+            [union_geom]
+            if isinstance(union_geom, _Polygon)
+            else [
+                g for g in getattr(union_geom, "geoms", []) if isinstance(g, _Polygon)
+            ]
+        )
+        row_parts: list[np.ndarray] = []
+        col_parts: list[np.ndarray] = []
+        x_parts: list[np.ndarray] = []
+        y_parts: list[np.ndarray] = []
+        for poly in cluster_polys:
+            if poly.is_empty:
+                continue
+            cminx, cminy, cmaxx, cmaxy = poly.bounds
+            col_lo = max(0, int(np.floor((cminx - minx) / spacing_m)))
+            col_hi = min(n_cols, int(np.ceil((cmaxx - minx) / spacing_m)))
+            # Rows run top-down so the composite writer can index pixels back
+            # to (row, col) without flipping.
+            row_lo = max(0, int(np.floor((maxy - cmaxy) / spacing_m)))
+            row_hi = min(n_rows, int(np.ceil((maxy - cminy) / spacing_m)))
+            if col_hi <= col_lo or row_hi <= row_lo:
+                continue
+            cg, rg = np.meshgrid(
+                np.arange(col_lo, col_hi, dtype=np.int64),
+                np.arange(row_lo, row_hi, dtype=np.int64),
+                indexing="xy",
+            )
+            cg = cg.ravel()
+            rg = rg.ravel()
+            cx = minx + (cg + 0.5) * spacing_m
+            cy = maxy - (rg + 0.5) * spacing_m
+            inside = _shapely.contains_xy(poly, cx, cy)
+            if not inside.any():
+                continue
+            col_parts.append(cg[inside])
+            row_parts.append(rg[inside])
+            x_parts.append(cx[inside])
+            y_parts.append(cy[inside])
+
+        if not x_parts:
+            raise ValueError(
+                "CGI grid produced zero in-polygon pixels — spacing may exceed "
+                "polygon size, or the union extent has no interior points."
+            )
+        g_col = np.concatenate(col_parts)
+        g_row = np.concatenate(row_parts)
+        g_x = np.concatenate(x_parts)
+        g_y = np.concatenate(y_parts)
+        pixels = gpd.GeoDataFrame(
+            {
+                "_grid_row": g_row.astype(np.int32),
+                "_grid_col": g_col.astype(np.int32),
+            },
+            geometry=gpd.points_from_xy(g_x, g_y),
+            crs=grid_crs,
+        )
         _log(
             "INFO",
-            f"CGI grid bbox: {len(xs)} × {len(ys)} = {len(pixels):,} candidate "
-            "pixels before union mask.",
+            f"CGI grid span {n_rows} × {n_cols} · {len(cluster_polys)} cluster(s) "
+            f"· {len(pixels):,} in-union candidate pixels.",
         )
 
         # Pixel → polygon assignment via sjoin(within). For overlapping
@@ -3296,22 +3308,22 @@ class MetricFusionEngine:
 
         # Coverage probe: nearest-feature sample at each pixel using the
         # channel's max radius. The values feed only the NaN-filtering dropna
-        # gate; per-trial channel values come from the cache.
-        _log(
-            "INFO",
-            "Probing initial veg / terrain / NDVI coverage at pixel centroids "
-            "(used only for NaN-filtering and feature normalisation)...",
+        # gate; per-trial channel values come from the cache. Rows map 1:1 onto
+        # the probe frame here (one row per polygon pixel already).
+        probe_cols = self._probe_channel_coverage(
+            entity_gdf[["geometry"]].copy(),
+            np.arange(len(entity_gdf), dtype=np.int64),
+            entity_gdf,
         )
-        probe_gdf = entity_gdf[["geometry"]].copy()
-        probe_gdf = self._sample_metrics_at_points(probe_gdf)
 
         fusion_df = pd.DataFrame(
             {
                 "polygon_id": entity_gdf["polygon_id"].values,
                 "target": entity_gdf["target"].values,
-                "veg": probe_gdf["veg"].values,
-                "terrain": probe_gdf["terrain"].values,
-                "ndvi": probe_gdf["ndvi"].values,
+                # float32 halves the pixel-frame cost.
+                "veg": probe_cols["veg"],
+                "terrain": probe_cols["terrain"],
+                "ndvi": probe_cols["ndvi"],
             },
             index=entity_gdf.index,
         )
@@ -3473,6 +3485,14 @@ class MetricFusionEngine:
         g_x = np.concatenate(x_parts)
         g_y = np.concatenate(y_parts)
 
+        # Stable global pixel id: the pixel's global lattice (row, col) packed
+        # into one int64. Anchored at the CRS origin, so the same physical
+        # pixel gets the same id in any job — this is what the greenery cache
+        # keys on, making it reusable across targets/outcomes/covariates.
+        g_pid = (g_row.astype(np.int64) << np.int64(32)) | (
+            g_col.astype(np.int64) & np.int64(0xFFFFFFFF)
+        )
+
         # Local raster indices span only the populated cells' global extent.
         col_origin = int(g_col.min())
         row_origin = int(g_row.min())
@@ -3482,8 +3502,9 @@ class MetricFusionEngine:
         maxy = -row_origin * spacing_m
         pixels = gpd.GeoDataFrame(
             {
-                "_grid_row": (g_row - row_origin).astype(np.int64),
-                "_grid_col": (g_col - col_origin).astype(np.int64),
+                "_grid_row": (g_row - row_origin).astype(np.int32),
+                "_grid_col": (g_col - col_origin).astype(np.int32),
+                "_global_pid": g_pid,
             },
             geometry=gpd.points_from_xy(g_x, g_y),
             crs=grid_crs,
@@ -3514,7 +3535,7 @@ class MetricFusionEngine:
             )
             pix_idx = sdm.row.astype(np.int64)
             ent_idx = sdm.col.astype(np.int64)
-            catchment_dist = sdm.data.astype(np.float64)
+            catchment_dist = sdm.data.astype(np.float32)
         else:
             ent_buffers = gpd.GeoDataFrame(
                 {"__entity_id": ent["__entity_id"].to_numpy()},
@@ -3529,7 +3550,9 @@ class MetricFusionEngine:
                 ent_geom_by_id.loc[ent_idx].to_numpy(), crs=grid_crs
             )
             pix_geoms = gpd.GeoSeries(joined.geometry.to_numpy(), crs=grid_crs)
-            catchment_dist = pix_geoms.distance(aligned_geoms).to_numpy()
+            catchment_dist = pix_geoms.distance(aligned_geoms).to_numpy(
+                dtype=np.float32
+            )
 
         if pix_idx.size == 0:
             raise ValueError(
@@ -3541,6 +3564,7 @@ class MetricFusionEngine:
         pixel_geom = pixels.geometry.to_numpy()
         pixel_row = pixels["_grid_row"].to_numpy()
         pixel_col = pixels["_grid_col"].to_numpy()
+        pixel_pid = pixels["_global_pid"].to_numpy()
 
         # ``polygon_id`` = the entity/observation index; each (entity, wave)
         # row in longitudinal mode is already its own observation, so the
@@ -3557,6 +3581,9 @@ class MetricFusionEngine:
                 # pre-aggregation cache stores one row per pixel; scoring rows
                 # resolve their pixel's stats through this id at lookup time.
                 "_preaggr_id": pix_idx.astype(np.int64),
+                # Stable global pixel id (grid row/col packed); the greenery
+                # cache keys on this so it is reusable across jobs.
+                "_global_pid": pixel_pid[pix_idx],
             },
             geometry=pixel_geom[pix_idx],
             crs=grid_crs,
@@ -3574,26 +3601,24 @@ class MetricFusionEngine:
 
         self.target_gdf = entity_gdf.copy()
 
-        # Coverage probe — sample each unique pixel once (used only for NaN-
-        # filtering; per-trial channel values come from the cache), then map
-        # the per-pixel values onto the duplicated catchment rows.
+        # Coverage probe — used only for NaN-filtering and the channel-scale
+        # bounds; per-trial channel values come from the cache.
+        _probe_t0 = time.perf_counter()
+        probe_cols = self._probe_channel_coverage(pixels, pix_idx, entity_gdf)
         _log(
             "INFO",
-            f"Probing veg / terrain / NDVI coverage at {len(pixels):,} unique "
-            "pixel centroids...",
+            f"Coverage probe: {len(entity_gdf):,} pixel rows in "
+            f"{time.perf_counter() - _probe_t0:.0f}s.",
         )
-        probe_unique = self._sample_metrics_at_points(pixels[["geometry"]].copy())
-        veg_u = probe_unique["veg"].to_numpy()
-        terrain_u = probe_unique["terrain"].to_numpy()
-        ndvi_u = probe_unique["ndvi"].to_numpy()
 
         fusion_df = pd.DataFrame(
             {
                 "polygon_id": entity_gdf["polygon_id"].values,
                 "target": entity_gdf["target"].values,
-                "veg": veg_u[pix_idx],
-                "terrain": terrain_u[pix_idx],
-                "ndvi": ndvi_u[pix_idx],
+                # float32 halves the pixel-frame cost.
+                "veg": probe_cols["veg"],
+                "terrain": probe_cols["terrain"],
+                "ndvi": probe_cols["ndvi"],
                 "_catchment_dist": entity_gdf["_catchment_dist"].values,
             },
             index=entity_gdf.index,
@@ -3641,8 +3666,9 @@ class MetricFusionEngine:
 
         # Pre-aggregation source: the unique pixels still referenced after the
         # coverage dropna, keyed by ``_preaggr_id``. The cache iterates these
-        # (~1/16th of the duplicated catchment rows for dense point targets),
-        # and scoring rows resolve their stats through ``_preaggr_id``.
+        # (~1/16th of the duplicated catchment rows for dense point targets);
+        # scoring rows resolve their stats through ``_preaggr_id`` →
+        # ``_global_pid``.
         referenced = np.unique(self.target_gdf["_preaggr_id"].to_numpy())
         self._preaggr_entity_gdf = pixels.loc[referenced].copy()
         _log(
@@ -3654,47 +3680,9 @@ class MetricFusionEngine:
         )
         return result
 
-    # ------------------------------------------------------------------
+    # ────────────────────────────────────────────────────────────
     # Per-pixel CGI → per-entity collapse (shared by every scoring path)
-    # ------------------------------------------------------------------
-    def _catchment_radius(
-        self, veg_radius: float, terrain_radius: float, ndvi_radius: float
-    ) -> float:
-        """Per-trial catchment radius for the point/line collapse.
-
-        The active channel's radius for a standalone study (only that channel
-        contributes to the score), or the largest of the three for the
-        combined CGI run (every channel feeds the per-pixel composite).
-        """
-        ch = getattr(self, "_active_greenery_channel", "cgi") or "cgi"
-        if ch == "veg":
-            return float(veg_radius)
-        if ch == "terrain":
-            return float(terrain_radius)
-        if ch == "ndvi":
-            return float(ndvi_radius)
-        return float(max(veg_radius, terrain_radius, ndvi_radius))
-
-    def _entity_collapse_mask(
-        self, data: pd.DataFrame, catchment_radius: float | None
-    ) -> np.ndarray | None:
-        """Row mask for the per-trial catchment collapse, or ``None``.
-
-        Returns ``None`` for polygon / raster targets (no radius mask — every
-        in-footprint pixel contributes, the original behavior). For point /
-        line targets, keeps pixels within ``catchment_radius`` of their
-        entity plus each entity's nearest pixel, so no entity drops out at
-        small radii.
-        """
-        if "_catchment_dist" not in data.columns or catchment_radius is None:
-            return None
-        dist = data["_catchment_dist"].to_numpy(dtype=np.float64)
-        if "_is_nearest" in data.columns:
-            near = data["_is_nearest"].to_numpy(dtype=bool)
-        else:
-            near = np.zeros(len(data), dtype=bool)
-        return (dist <= float(catchment_radius)) | near
-
+    # ────────────────────────────────────────────────────────────
     @staticmethod
     def _collapse_to_entities(
         values: np.ndarray,
@@ -3732,6 +3720,167 @@ class MetricFusionEngine:
             return out
         return pd.Series(v).groupby(pid).first().to_numpy()
 
+    @staticmethod
+    def _collapse_mean_from_codes(
+        values: np.ndarray,
+        codes: np.ndarray,
+        n_uniq: int,
+        mask: np.ndarray | None,
+    ) -> np.ndarray:
+        """Per-entity mean of ``values`` from precomputed collapse codes.
+
+        Equivalent to ``_collapse_to_entities(values, pid, mask, "mean")``
+        without the per-call ``factorize``: ``codes`` / ``n_uniq`` come from
+        one sorted-key factorization of the fold's ``polygon_id``. The
+        ``minlength`` pin keeps the output aligned to the full entity set, so
+        the row order matches every other collapsed array even under a
+        catchment mask (the nearest-pixel guarantee keeps each entity
+        represented, exactly as the legacy masked factorize relied on).
+        """
+        v = np.asarray(values, dtype=np.float64)
+        cd = codes
+        if mask is not None:
+            v = v[mask]
+            cd = cd[mask]
+        valid = ~np.isnan(v)
+        counts = np.bincount(cd[valid], minlength=n_uniq)
+        sums = np.bincount(cd[valid], weights=v[valid], minlength=n_uniq)
+        out = np.full(n_uniq, np.nan, dtype=np.float64)
+        nz = counts > 0
+        out[nz] = sums[nz] / counts[nz]
+        return out
+
+    def _fold_entity_statics(
+        self, data: pd.DataFrame, fold_idx: Any, subset: str
+    ) -> dict:
+        """Trial-invariant arrays for one scored fold subset, computed once.
+
+        Everything here depends only on the fold's row set — never on trial
+        parameters — so every trial of a bootstrap study reuses one
+        computation: the sorted-key collapse codes of ``polygon_id``, each
+        entity's first-occurrence row (target / covariates / coords /
+        longitudinal keys are per-entity constants broadcast to pixels, so a
+        "first" collapse is a plain row-take), and the points slice the
+        aggregation path consumes. Cached on ``_fold_static_cache`` and
+        cleared with the ring caches — both key off the live fold row sets.
+        """
+        key = (self._split_generation, fold_idx, subset, len(data))
+        st = self._fold_static_cache.get(key)
+        if st is not None:
+            return st
+
+        st = {}
+        cov_cols = self.covariate_columns
+        has_pid = "polygon_id" in data.columns
+        have_coords = "_cx" in data.columns and "_cy" in data.columns
+        st["has_pid"] = has_pid
+        if has_pid:
+            pid = data["polygon_id"].values
+            codes, uniq = pd.factorize(pid, sort=True)
+            codes = np.asarray(codes, dtype=np.int64)
+            n_uniq = len(uniq)
+            order = np.argsort(codes, kind="stable")
+            first_idx = order[np.searchsorted(codes[order], np.arange(n_uniq))]
+            st["codes"] = codes
+            st["n_uniq"] = n_uniq
+            st["target"] = np.asarray(data["target"].values, dtype=np.float64)[
+                first_idx
+            ]
+            st["cov"] = (
+                data[cov_cols].to_numpy(dtype=np.float64)[first_idx]
+                if cov_cols
+                else None
+            )
+            st["coords"] = (
+                np.column_stack(
+                    [
+                        data["_cx"].to_numpy(np.float64)[first_idx],
+                        data["_cy"].to_numpy(np.float64)[first_idx],
+                    ]
+                )
+                if have_coords
+                else None
+            )
+            if self.is_longitudinal:
+                st["entity_id"] = np.asarray(data["entity_id"].values)[first_idx]
+                st["ysb"] = np.asarray(
+                    data["years_since_baseline"].values, dtype=np.float64
+                )[first_idx]
+                if "wave" in data.columns:
+                    st["wave"] = np.asarray(data["wave"].values)[first_idx]
+        else:
+            st["target"] = data["target"].values
+            st["cov"] = data[cov_cols].to_numpy(dtype=np.float64) if cov_cols else None
+            st["coords"] = (
+                data[["_cx", "_cy"]].to_numpy(np.float64) if have_coords else None
+            )
+            if self.is_longitudinal:
+                st["entity_id"] = data["entity_id"].values
+                st["ysb"] = data["years_since_baseline"].values
+                if "wave" in data.columns:
+                    st["wave"] = np.asarray(data["wave"].values)
+
+        # Aggregation input: geometry-free on the pre-aggregation fast path
+        # (the cache needs only row ids + wave), full geometry rows otherwise.
+        if getattr(self, "_preaggregation_done", False):
+            light_cols = [
+                c for c in ("wave", "_preaggr_id") if c in self.target_gdf.columns
+            ]
+            pts = self.target_gdf.loc[data.index, light_cols]
+        else:
+            pts = self.target_gdf.loc[data.index]
+        st["points"] = pts
+
+        # Cache-lookup ids for this fold, materialized once. The cache keys its
+        # row indexer on this array's identity, so handing back the same object
+        # every trial turns the lookup's position search into a dict hit.
+        if "_preaggr_id" in pts.columns:
+            lookup_ids = np.ascontiguousarray(
+                pts["_preaggr_id"].to_numpy(), dtype=np.int64
+            )
+        else:
+            lookup_ids = np.ascontiguousarray(pts.index.to_numpy(), dtype=np.int64)
+        st["lookup_ids"] = lookup_ids
+        pts.attrs["_gf_lookup_ids"] = lookup_ids
+
+        # Per-row wave index (longitudinal only) — trial-invariant per fold.
+        wave_idx = None
+        if self.is_longitudinal and "wave" in pts.columns:
+            spec = self.longitudinal_spec
+            assert spec is not None
+            wave_index_of = {w: i for i, w in enumerate(spec.wave_labels)}
+            wave_idx = np.asarray(
+                [wave_index_of[str(w)] for w in pts["wave"]], dtype=np.int64
+            )
+        st["wave_idx"] = wave_idx
+        pts.attrs["_gf_wave_idx"] = wave_idx
+
+        # Dedup axis for the per-trial channel arithmetic. Point / line targets
+        # repeat a catchment pixel once per overlapping entity, and a pixel's
+        # cached stats are identical across those repeats, so the lookup and the
+        # composite run over the distinct (pixel, wave) pairs and are gathered
+        # back onto rows just before the entity collapse.
+        st["uniq_lookup_ids"] = None
+        st["uniq_wave_idx"] = None
+        st["uniq_inverse"] = None
+        if "_preaggr_id" in pts.columns:
+            if wave_idx is not None:
+                span = int(wave_idx.max()) + 1 if wave_idx.size else 1
+                keys = lookup_ids * span + wave_idx
+            else:
+                keys = lookup_ids
+            uniq_keys, first_idx, inverse = np.unique(
+                keys, return_index=True, return_inverse=True
+            )
+            if uniq_keys.size < keys.size:
+                st["uniq_lookup_ids"] = np.ascontiguousarray(lookup_ids[first_idx])
+                st["uniq_inverse"] = np.asarray(inverse, dtype=np.int64)
+                if wave_idx is not None:
+                    st["uniq_wave_idx"] = np.ascontiguousarray(wave_idx[first_idx])
+
+        self._fold_static_cache[key] = st
+        return st
+
     def _expand_categorical_covariates(self) -> None:
         """Validate covariates and one-hot expand the categorical ones in place.
 
@@ -3756,6 +3905,7 @@ class MetricFusionEngine:
 
         if not self._covariates_expanded:
             expanded: list[str] = []
+            new_frames: list[pd.DataFrame] = []
             for c in self._covariate_columns_user:
                 if self.covariate_types.get(c) == "categorical":
                     dummies = pd.get_dummies(
@@ -3772,13 +3922,20 @@ class MetricFusionEngine:
                             "drop-first; dropping it.",
                         )
                         continue
-                    for dcol in dummies.columns:
-                        gdf[dcol] = dummies[dcol].to_numpy()
+                    new_frames.append(dummies)
                     self._covariate_dummy_map[c] = list(dummies.columns)
                     expanded.extend(dummies.columns)
                 else:
                     expanded.append(c)
-            self.covariate_columns = list(dict.fromkeys(expanded))
+            if new_frames:
+                # One concat rather than a column-at-a-time insert, so the
+                # frame is consolidated once.
+                merged = pd.concat(new_frames, axis=1)
+                for dcol in merged.columns:
+                    gdf[dcol] = merged[dcol].to_numpy()
+            self._user_covariate_columns = list(dict.fromkeys(expanded))
+            period = self._expand_period_controls(gdf)
+            self.covariate_columns = self._user_covariate_columns + period
             self._covariates_expanded = True
 
         non_numeric = [
@@ -3792,6 +3949,65 @@ class MetricFusionEngine:
                 f"based scorers; got non-numeric: {non_numeric}. Tag them as "
                 "categorical to one-hot encode instead."
             )
+
+    def _expand_period_controls(self, gdf: "gpd.GeoDataFrame") -> list[str]:
+        """One-hot the wave and area groupings into extra control columns.
+
+        These ride at the end of ``covariate_columns`` so every scoring path
+        picks them up as ordinary fixed effects, while the reporting layer —
+        which names only ``_user_covariate_columns`` — leaves them out of the
+        per-covariate table.
+
+        Wave indicators absorb period effects: with per-wave greenery files the
+        exposure carries the layer's vintage, which tracks calendar time and
+        would otherwise land on the greenery × time terms. Area indicators
+        absorb the neighbourhood level, which a person-only random effect does
+        not represent — an exposure shared across neighbours makes the greenery
+        term's standard error far too small without it.
+        """
+        self._period_control_columns = []
+        self._wave_control_columns = []
+        spec = self.longitudinal_spec
+        if not self.is_longitudinal or spec is None:
+            return []
+
+        sources: list[str] = []
+        if spec.include_wave_fixed_effects and "wave" in gdf.columns:
+            sources.append("wave")
+        if spec.area_id_col and spec.area_id_col in gdf.columns:
+            sources.append(spec.area_id_col)
+
+        out: list[str] = []
+        for col in sources:
+            dummies = pd.get_dummies(
+                gdf[col], prefix=col, prefix_sep="=", drop_first=True, dummy_na=False
+            ).astype(np.float64)
+            if dummies.shape[1] == 0:
+                _log("WARN", f"'{col}' has <2 levels; no fixed effects added.")
+                continue
+            for dcol in dummies.columns:
+                gdf[dcol] = dummies[dcol].to_numpy()
+            out.extend(dummies.columns)
+            if col == "wave":
+                self._wave_control_columns = list(dummies.columns)
+            _log("INFO", f"Added {dummies.shape[1]} fixed effect(s) for '{col}'.")
+
+        self._period_control_columns = out
+        # Wave indicators can already span continuous time; keeping both would
+        # be rank-deficient.
+        if out and "wave" in sources and "years_since_baseline" in gdf.columns:
+            t = gdf["years_since_baseline"].to_numpy(dtype=np.float64)
+            wave_cols = [c for c in out if c.startswith("wave=")]
+            if wave_cols and mixed_effects_scoring._time_spanned_by(
+                t, gdf[wave_cols].to_numpy(dtype=np.float64)
+            ):
+                self._time_fixed_effect_dropped = True
+                _log(
+                    "INFO",
+                    "Continuous time is spanned by the wave indicators; "
+                    "dropping the time fixed effect.",
+                )
+        return out
 
     def _attach_entity_coords(
         self, fusion_df: pd.DataFrame, src_gdf: "gpd.GeoDataFrame"
@@ -3833,29 +4049,6 @@ class MetricFusionEngine:
         fusion_df["_cy"] = cy
         return fusion_df
 
-    @staticmethod
-    def _spatial_cache_key(
-        coords_xy: np.ndarray, target: np.ndarray, cov: np.ndarray | None
-    ) -> tuple:
-        """Content fingerprint of a scored split for memoizing its spatial basis.
-
-        Keyed on the coordinates and outcome (both stable across Optuna trials)
-        so studies sharing a fold reuse the basis, while bootstrap resamples —
-        which change row membership — get a fresh one without manual cache
-        invalidation.
-        """
-        t = np.asarray(target, dtype=np.float64)
-        cs = float(0.0 if cov is None else np.nansum(np.asarray(cov, dtype=np.float64)))
-        return (
-            int(coords_xy.shape[0]),
-            float(np.nansum(coords_xy[:, 0])),
-            float(np.nansum(coords_xy[:, 1])),
-            float(np.nansum(coords_xy[:, 0] ** 2)),
-            float(np.nansum(t)),
-            float(np.nansum(t**2)),
-            cs,
-        )
-
     def _spatial_basis_columns(
         self,
         coords_xy: np.ndarray | None,
@@ -3875,7 +4068,7 @@ class MetricFusionEngine:
         if self.spatial_adjust_method == "none" or coords_xy is None:
             return None
         coords_xy = np.asarray(coords_xy, dtype=np.float64)
-        cache_key = self._spatial_cache_key(coords_xy, target, cov)
+        cache_key = _helpers.spatial_cache_key(coords_xy, target, cov)
         entry = self._spatial_basis_cache.get(cache_key)
         if entry is None:
             basis = spatial_basis.build_block_basis(
@@ -3904,9 +4097,15 @@ class MetricFusionEngine:
         if self.spatial_adjust_method == "ks_aic":
             return entry["ks_cols"]
         # spatial_plus: the exposure is residualized on the smooth, so df is
-        # selected on the exposure (df-Spatial+); the candidate basis is reused.
-        _df, sp_cols = spatial_basis.select_df_aic(
-            np.asarray(cgi, dtype=np.float64), basis, None
+        # selected on the exposure (df-Spatial+); the candidate basis is reused
+        # and the per-call df search runs off the memoized nested-QR precompute
+        # (one matvec instead of max_df+1 least-squares fits).
+        pre = entry.get("plus_pre")
+        if pre is None and "plus_pre" not in entry:
+            pre = spatial_basis.precompute_df_selection(basis)
+            entry["plus_pre"] = pre
+        _df, sp_cols = spatial_basis.select_df_aic_fast(
+            np.asarray(cgi, dtype=np.float64), basis, pre
         )
         return sp_cols
 
@@ -3931,82 +4130,219 @@ class MetricFusionEngine:
         """
         if not self.whole_grid_scaling:
             return composite
-        arr = np.asarray(composite, dtype=np.float64)
+        arr = np.asarray(composite)
+        if not np.issubdtype(arr.dtype, np.floating):
+            arr = arr.astype(np.float64)
         valid = ~np.isnan(arr)
         if np.any(valid):
             lo = float(arr[valid].min())
             hi = float(arr[valid].max())
             if hi > lo:
                 arr = arr.copy()
-                arr[valid] = (arr[valid] - lo) / (hi - lo)
+                dt = arr.dtype.type
+                arr[valid] = (arr[valid] - dt(lo)) / dt(hi - lo)
         return arr
 
-    def _prepare_point_fusion(self) -> pd.DataFrame:
-        """Sample metrics at point locations."""
-        _log("INFO", "====== POINT FUSION ======")
-        _log("INFO", "Preparing point-based fusion data...")
+    def _coverage_from_cache(
+        self, entity_gdf: gpd.GeoDataFrame
+    ) -> dict[str, np.ndarray] | None:
+        """Per-row veg / terrain / NDVI coverage read from the attached cache.
 
-        # Only use target points as samples, not buffered area
-        points_gdf = self.target_gdf.copy()
+        Returns the cached max-radius mean per ``(pixel, wave)`` row (NaN where
+        no greenery is within range — the same coverage the sampler would find).
+        ``None`` on any missing cell, so the caller falls back to sampling.
+        """
+        cache = self._preaggr_cache
+        spec = self.longitudinal_spec
+        if (
+            not isinstance(cache, preaggregation.GreeneryCache)
+            or spec is None
+            or "_global_pid" not in entity_gdf.columns
+        ):
+            return None
+        gvi_radii, ndvi_radii = self._preaggr_radii()
+        wave_index_of = {w: i for i, w in enumerate(spec.wave_labels)}
+        pids = np.asarray(entity_gdf["_global_pid"].to_numpy(), dtype=np.int64)
+        waves = entity_gdf["wave"].astype(str).to_numpy()
+        try:
+            widx = np.array([wave_index_of[w] for w in waves], dtype=np.int64)
+        except KeyError:
+            return None
+        out: dict[str, np.ndarray] = {}
+        for ch in longitudinal.GREENERY_CHANNELS:
+            radius = int((ndvi_radii if ch == "ndvi" else gvi_radii)[-1])
+            col = np.full(len(pids), np.nan, dtype=np.float32)
+            for w in np.unique(widx):
+                m = widx == w
+                vals = cache.lookup(pids[m], ch, radius, "mean", wave_index=int(w))
+                if vals is None:
+                    return None
+                col[m] = vals
+            out[ch] = col
+        return out
 
-        if len(points_gdf) == 0:
-            raise ValueError(
-                f"No sample points found in target file. "
-                f"The target GeoJSON must contain point geometries, not just boundaries. "
-                f"Loaded {len(points_gdf)} points from {self.target_file}"
+    def _probe_channel_coverage(
+        self,
+        pixels: gpd.GeoDataFrame,
+        pix_idx: np.ndarray,
+        entity_gdf: gpd.GeoDataFrame,
+    ) -> dict[str, np.ndarray]:
+        """Per-catchment-row veg / terrain / NDVI values for the coverage gate.
+
+        Cross-sectional runs probe every unique pixel once against the single
+        metric source per channel.
+
+        Longitudinal runs probe per wave: a row's coverage is decided by the
+        metric files of the wave it was measured in. Probing every wave against
+        one representative wave's source would gate the whole study on that
+        wave's extent, discarding observations whose own wave covers them
+        perfectly well.
+        """
+        n_rows = len(entity_gdf)
+        provider = self._metric_sources
+        waves = (
+            entity_gdf["wave"].astype(str).to_numpy()
+            if (provider is not None and "wave" in entity_gdf.columns)
+            else None
+        )
+
+        # Coverage from a reusable cache (skips the per-wave re-sample) — only
+        # when a signature-matched complete cache is available; falls back to
+        # sampling on any miss.
+        if waves is not None and _helpers.attach_cache_for_coverage(entity_gdf):
+            cached = self._coverage_from_cache(entity_gdf)
+            if cached is not None:
+                _log(
+                    "OK",
+                    f"Coverage gate: derived veg / terrain / NDVI coverage for "
+                    f"{n_rows:,} rows from the pre-aggregation cache.",
+                )
+                return cached
+
+        if waves is None:
+            _log(
+                "INFO",
+                f"Probing veg / terrain / NDVI coverage at {len(pixels):,} "
+                "unique pixel centroids...",
             )
-
-        logger.info(f"Using {len(points_gdf)} points from target file as samples")
-
-        # Sample metrics at these point locations
-        points_gdf = self._sample_metrics_at_points(points_gdf)
-
-        # Create final DataFrame
-        fusion_df = pd.DataFrame(
-            {
-                "target": points_gdf[self.target_feature],
-                "veg": points_gdf["veg"],
-                "terrain": points_gdf["terrain"],
-                "ndvi": points_gdf["ndvi"],
+            probe = self._sample_metrics_at_points(pixels[["geometry"]].copy())
+            return {
+                ch: np.asarray(probe[ch].to_numpy(), dtype=np.float32)[pix_idx]
+                for ch in ("veg", "terrain", "ndvi")
             }
-        )
-        # Carry covariate values onto each row alongside the target so the
-        # split / objective / evaluate paths all see them as plain columns.
-        for col in self.covariate_columns:
-            fusion_df[col] = points_gdf[col].to_numpy()
-        # Longitudinal mode adds the (entity_id, wave) keys and the time
-        # predictor; downstream split + MixedLM scorer key on these.
-        for col in self._longitudinal_extra_cols():
-            fusion_df[col] = points_gdf[col].to_numpy()
-        fusion_df = self._attach_entity_coords(fusion_df, points_gdf)
 
-        # Log data quality before dropping NaN
-        _log("INFO", "====== DATA QUALITY SUMMARY (POINT) ======")
-        _log("INFO", f"Total rows: {len(fusion_df)}")
-        for col in ["target", "veg", "terrain", "ndvi", *self.covariate_columns]:
-            nan_count = fusion_df[col].isna().sum()
-            pct = nan_count / max(len(fusion_df), 1) * 100
-            _log("INFO", f"{col} NaN: {nan_count} ({pct:.1f}%)")
+        channels = longitudinal.GREENERY_CHANNELS
+        out = {ch: np.full(n_rows, np.nan, dtype=np.float32) for ch in channels}
 
-        result = fusion_df.dropna(
-            subset=["target", "veg", "terrain", "ndvi", *self.covariate_columns]
-        )
+        # Temporal keys resolving to the same files across all three channels
+        # are probed once together, so a channel that reuses one file across
+        # keys is not re-read per key.
+        present_keys = list(dict.fromkeys(waves.tolist()))
+        groups: dict[tuple[str, ...], list[str]] = {}
+        for key in present_keys:
+            ident = tuple(provider.identity(ch, key) for ch in channels)
+            groups.setdefault(ident, []).append(key)
+
+        probed_total = 0
         _log(
-            "OK" if len(result) else "WARN",
-            f"After dropna: {len(result)} valid rows",
+            "INFO",
+            f"Probing veg / terrain / NDVI coverage across {len(pixels):,} "
+            f"unique pixel centroids — {len(groups)} distinct file set(s) "
+            f"over {len(present_keys)} {self._temporal_key_noun()}(s).",
         )
-
-        if len(result) == 0:
-            raise ValueError(
-                "No valid samples after spatial join. "
-                "This usually means the target points and metric data don't overlap spatially. "
-                "Check that all data covers the same geographic area."
+        for group_keys in groups.values():
+            # One file set per iteration, so cancel lands within a single
+            # wave's probe rather than after the whole ladder.
+            if self._cancel_callback is not None and self._cancel_callback():
+                raise JobCancelled("Coverage probe cancelled by user.")
+            row_mask = (
+                waves == group_keys[0]
+                if len(group_keys) == 1
+                else np.isin(waves, group_keys)
             )
+            group_pix = np.unique(pix_idx[row_mask])
+            if group_pix.size == 0:
+                continue
+            try:
+                sources = provider.get_all(group_keys[0], channels)
+                probe = self._sample_metrics_at_points(
+                    pixels.iloc[group_pix][["geometry"]].copy(), sources, quiet=True
+                )
+                counts = {}
+                for ch in channels:
+                    vals = np.asarray(probe[ch].to_numpy(), dtype=np.float32)
+                    # Position of each row's pixel within ``group_pix``, mapping
+                    # the probe result back onto this group's catchment rows.
+                    out[ch][row_mask] = vals[
+                        np.searchsorted(group_pix, pix_idx[row_mask])
+                    ]
+                    counts[ch] = int(np.isfinite(vals).sum())
+            finally:
+                # Free this key's files before the next one is opened.
+                provider.release()
+            probed_total += int(group_pix.size)
+            label = (
+                group_keys[0]
+                if len(group_keys) == 1
+                else f"{group_keys[0]}..{group_keys[-1]} ({len(group_keys)} keys)"
+            )
+            _log(
+                "OK" if any(counts.values()) else "WARN",
+                f"  {self._temporal_key_noun()} {label}: {group_pix.size:,} "
+                f"pixel(s) probed — valid veg={counts['veg']:,} "
+                f"terrain={counts['terrain']:,} ndvi={counts['ndvi']:,}",
+            )
+        _log(
+            "INFO",
+            f"Coverage probe sampled {probed_total:,} "
+            f"(pixel, {self._temporal_key_noun()}) pairs.",
+        )
+        return out
 
-        return result
+    @staticmethod
+    def _shared_gvi_layer(veg_src: Any, terrain_src: Any) -> tuple[Any, dict] | None:
+        """One point layer carrying both GVI channels, when they share geometry.
+
+        Returns ``(layer, {channel: column})``, or ``None`` when either side is
+        a raster or their point geometry differs — then each channel is sampled
+        on its own, as before. The two channels arrive as separate frames read
+        from the same file, so the shared layer is assembled here by borrowing
+        terrain's column onto veg's frame (positionally: identical coordinates
+        in identical order is exactly what was just verified).
+        """
+        if veg_src is None or terrain_src is None:
+            return None
+        if isinstance(veg_src, dict) or isinstance(terrain_src, dict):
+            return None
+        try:
+            if len(veg_src) != len(terrain_src) or len(veg_src) == 0:
+                return None
+            if veg_src.crs != terrain_src.crs:
+                return None
+            vx = veg_src.geometry.x.to_numpy()
+            tx = terrain_src.geometry.x.to_numpy()
+            if not np.array_equal(vx, tx):
+                return None
+            if not np.array_equal(
+                veg_src.geometry.y.to_numpy(), terrain_src.geometry.y.to_numpy()
+            ):
+                return None
+            veg_col = metric_sampling.vector_metric_column(veg_src, "veg")
+            ter_col = metric_sampling.vector_metric_column(terrain_src, "terrain")
+        except Exception:
+            return None
+        if veg_col == ter_col:
+            return None
+        layer = veg_src[["geometry", veg_col]].copy()
+        layer[ter_col] = terrain_src[ter_col].to_numpy()
+        return layer, {"veg": veg_col, "terrain": ter_col}
 
     def _sample_metrics_at_points(
-        self, points_gdf: gpd.GeoDataFrame
+        self,
+        points_gdf: gpd.GeoDataFrame,
+        sources: Mapping[str, Any] | None = None,
+        *,
+        quiet: bool = False,
     ) -> gpd.GeoDataFrame:
         """
         Sample vegetation, terrain, and NDVI metrics at point locations.
@@ -4016,118 +4352,86 @@ class MetricFusionEngine:
 
         Args:
             points_gdf: GeoDataFrame with point geometries to sample at
+            sources: channel → metric source to sample against. Defaults to the
+                engine's cross-sectional ``veg_data`` / ``terrain_data`` /
+                ``ndvi_data``. Longitudinal callers pass one wave's sources so
+                each observation is probed against the metrics of its own wave.
+            quiet: suppress the per-channel log lines (used when sampling is
+                repeated once per wave, which would otherwise flood the log)
 
         Returns:
             GeoDataFrame with added columns: veg, terrain, ndvi
         """
-        points_gdf["veg"] = np.nan
-        points_gdf["terrain"] = np.nan
-        points_gdf["ndvi"] = np.nan
+        src = {
+            "veg": self.veg_data,
+            "terrain": self.terrain_data,
+            "ndvi": self.ndvi_data,
+            **(dict(sources) if sources else {}),
+        }
+        radius = {
+            "veg": self.gvi_buffer_max_m,
+            "terrain": self.gvi_buffer_max_m,
+            "ndvi": self.ndvi_buffer_max_m,
+        }
+        label = {"veg": "Veg", "terrain": "Terrain", "ndvi": "NDVI"}
 
-        # Sample Vegetation
-        if isinstance(self.veg_data, dict):  # Raster
-            points_in_veg_crs = points_gdf.to_crs(self.veg_data["crs"])
-            points_gdf["veg"] = metric_sampling.sample_raster_values(
-                points_in_veg_crs, self.veg_data
+        # ``veg`` and ``terrain`` are normally two attribute columns of the same
+        # street-view points, and the nearest-feature join — the expensive half —
+        # depends only on geometry. Joining once serves both. It runs before the
+        # loop because the loop blanks each channel as it reaches it, which would
+        # wipe a value written during another channel's turn.
+        shared_gvi = self._shared_gvi_layer(src.get("veg"), src.get("terrain"))
+        shared_values: dict[str, Any] = {}
+        if shared_gvi is not None:
+            layer, cols = shared_gvi
+            joined = metric_sampling.nearest_metric_join_multi(
+                points_gdf, layer, list(cols.values()), radius["veg"]
             )
-        else:  # GeoDataFrame
-            # Detect metric column
-            veg_col = self.veg_data.attrs.get("metric_column", "gvi")
-            if veg_col not in self.veg_data.columns:
-                # Fallback to common patterns
-                for col in ["gvi", "gvi_veg", "veg", "GVI", "value"]:
-                    if col in self.veg_data.columns:
-                        veg_col = col
-                        break
+            shared_values = {ch: joined[col] for ch, col in cols.items()}
+            if not quiet:
+                _log(
+                    "INFO",
+                    f"Veg + Terrain sampled from one nearest-feature join "
+                    f"({len(layer):,} features).",
+                )
 
-            _log(
-                "INFO",
-                f"Veg data: {len(self.veg_data)} features, "
-                f"columns: {self.veg_data.columns.tolist()}",
+        for channel in ("veg", "terrain", "ndvi"):
+            points_gdf[channel] = np.nan
+            data = src[channel]
+            if data is None:
+                continue
+            if channel in shared_values:
+                points_gdf[channel] = shared_values[channel]
+                continue
+            if isinstance(data, dict):  # Raster
+                points_gdf[channel] = metric_sampling.sample_raster_values(
+                    points_gdf.to_crs(data["crs"]), data
+                )
+                continue
+            # Vector
+            col = metric_sampling.vector_metric_column(data, channel)
+            if not quiet:
+                _log(
+                    "INFO",
+                    f"{label[channel]} data: {len(data)} features, "
+                    f"columns: {data.columns.tolist()}",
+                )
+                _log("INFO", f"Using {channel} column: '{col}'")
+                _log(
+                    "INFO",
+                    f"Nearest-feature max distance ({channel}): "
+                    f"{radius[channel]} m",
+                )
+            points_gdf[channel] = metric_sampling.nearest_metric_join(
+                points_gdf, data, col, radius[channel]
             )
-            _log("INFO", f"Using veg column: '{veg_col}'")
-            _log(
-                "INFO",
-                f"Nearest-feature max distance (veg): {self.gvi_buffer_max_m} m",
-            )
-
-            points_gdf["veg"] = metric_sampling.nearest_metric_join(
-                points_gdf, self.veg_data, veg_col, self.gvi_buffer_max_m
-            )
-
-            veg_valid = points_gdf["veg"].notna().sum()
-            _log(
-                "OK" if veg_valid else "WARN",
-                f"Veg sampling: {veg_valid}/{len(points_gdf)} points have valid values",
-            )
-
-        # Sample Terrain
-        if isinstance(self.terrain_data, dict):  # Raster
-            points_in_terrain_crs = points_gdf.to_crs(self.terrain_data["crs"])
-            points_gdf["terrain"] = metric_sampling.sample_raster_values(
-                points_in_terrain_crs, self.terrain_data
-            )
-        else:  # GeoDataFrame
-            # Detect metric column
-            terrain_col = self.terrain_data.attrs.get("metric_column", "terrain")
-            if terrain_col not in self.terrain_data.columns:
-                # Fallback to common patterns
-                for col in ["terrain", "gvi_ter", "NDVI", "ndvi", "value"]:
-                    if col in self.terrain_data.columns:
-                        terrain_col = col
-                        break
-
-            _log(
-                "INFO",
-                f"Terrain data: {len(self.terrain_data)} features, "
-                f"columns: {self.terrain_data.columns.tolist()}",
-            )
-            _log("INFO", f"Using terrain column: '{terrain_col}'")
-
-            points_gdf["terrain"] = metric_sampling.nearest_metric_join(
-                points_gdf, self.terrain_data, terrain_col, self.gvi_buffer_max_m
-            )
-
-            terrain_valid = points_gdf["terrain"].notna().sum()
-            _log(
-                "OK" if terrain_valid else "WARN",
-                f"Terrain sampling: {terrain_valid}/{len(points_gdf)} "
-                "points have valid values",
-            )
-
-        # Sample NDVI
-        points_gdf["ndvi"] = np.nan
-        if isinstance(self.ndvi_data, dict):  # Raster
-            points_in_ndvi_crs = points_gdf.to_crs(self.ndvi_data["crs"])
-            points_gdf["ndvi"] = metric_sampling.sample_raster_values(
-                points_in_ndvi_crs, self.ndvi_data
-            )
-        else:  # GeoDataFrame
-            # Detect metric column
-            ndvi_col = self.ndvi_data.attrs.get("metric_column", "NDVI")
-            if ndvi_col not in self.ndvi_data.columns:
-                # Fallback to common patterns
-                for col in ["NDVI", "ndvi", "value"]:
-                    if col in self.ndvi_data.columns:
-                        ndvi_col = col
-                        break
-
-            _log(
-                "INFO",
-                f"NDVI data: {len(self.ndvi_data)} features, "
-                f"columns: {self.ndvi_data.columns.tolist()}",
-            )
-            _log("INFO", f"Using NDVI column: '{ndvi_col}'")
-
-            points_gdf["ndvi"] = metric_sampling.nearest_metric_join(
-                points_gdf, self.ndvi_data, ndvi_col, self.ndvi_buffer_max_m
-            )
-
-            ndvi_valid = points_gdf["ndvi"].notna().sum()
-            _log(
-                "OK" if ndvi_valid else "WARN",
-                f"NDVI sampling: {ndvi_valid}/{len(points_gdf)} points have valid values",
-            )
+            if not quiet:
+                valid = int(points_gdf[channel].notna().sum())
+                _log(
+                    "OK" if valid else "WARN",
+                    f"{label[channel]} sampling: {valid}/{len(points_gdf)} "
+                    "points have valid values",
+                )
 
         return points_gdf
 
@@ -4148,46 +4452,35 @@ class MetricFusionEngine:
         target_data = self.target_raster["data"]
         transform = self.target_raster["transform"]
         crs = self.target_raster["crs"]
-        height, width = target_data.shape
+        width = int(target_data.shape[1])
 
-        # Generate pixel centers as point geometries
-        rows, cols = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
-        xs, ys = xy(transform, rows.flatten(), cols.flatten(), offset="center")
-
-        # Create GeoDataFrame of pixel centers
-        pixel_points = gpd.GeoDataFrame(
-            {
-                "target": target_data.flatten(),
-                "row": rows.flatten(),
-                "col": cols.flatten(),
-            },
-            geometry=gpd.points_from_xy(xs, ys),
-            crs=crs,
-        )
-
-        # Filter out NaN target values
-        pixel_points = pixel_points[~pixel_points["target"].isna()].copy()
-
-        if len(pixel_points) == 0:
+        # Keep only valid-target pixels before building any geometry: one
+        # geometry per grid cell would cost tens of GB on a large raster.
+        flat_target = np.ma.filled(target_data, np.nan).ravel()
+        keep = np.flatnonzero(~np.isnan(flat_target))
+        if keep.size == 0:
             raise ValueError(
                 "No valid pixels found in target raster. "
                 "Target raster may be empty or all NaN."
             )
+        rows_i = (keep // width).astype(np.int64)
+        cols_i = (keep % width).astype(np.int64)
+        xs, ys = xy(transform, rows_i, cols_i, offset="center")
+
+        pixel_points = gpd.GeoDataFrame(
+            {
+                "target": flat_target[keep],
+                "row": rows_i,
+                "col": cols_i,
+            },
+            geometry=gpd.points_from_xy(np.asarray(xs), np.asarray(ys)),
+            crs=crs,
+        )
 
         logger.info(f"Created {len(pixel_points):,} point samples from raster pixels")
-        print(
-            f"[FUSION DEBUG] Created {len(pixel_points):,} point samples from raster pixels",
-            flush=True,
-        )
 
         # Store as target_gdf for unified workflow
         self.target_gdf = pixel_points
-
-        # Now sample metrics at these point locations using spatial joins
-        # This is the same logic as _prepare_point_fusion()
-        print(
-            "[FUSION DEBUG] Now sampling metrics at pixel center points...", flush=True
-        )
 
         points_gdf = pixel_points.copy()
 
@@ -4239,57 +4532,6 @@ class MetricFusionEngine:
             )
         )
 
-    @staticmethod
-    def _area_balanced_split_within_bin(
-        bin_df: pd.DataFrame,
-        area_col: str,
-        target_fractions: dict[str, float],
-        random_state: int,
-    ) -> dict[str, list]:
-        """Allocate one outcome bin's polygons to splits with greedy area balance.
-
-        Shuffles the polygons inside the bin, then for each one picks the
-        split with the largest remaining area deficit (in fraction-of-bin
-        units). Returns a dict mapping split name to a list of polygon
-        row indices.
-        """
-        if len(bin_df) == 0:
-            return {name: [] for name in target_fractions}
-        total_area = float(bin_df[area_col].sum())
-        if total_area <= 0:
-            # Fall back to count-balanced when areas are missing.
-            rng = np.random.default_rng(random_state)
-            shuffled = rng.permutation(bin_df.index.to_numpy())
-            n = len(shuffled)
-            order = list(target_fractions)
-            counts = {name: int(round(target_fractions[name] * n)) for name in order}
-            # Reconcile rounding to total n.
-            diff = n - sum(counts.values())
-            counts[order[0]] += diff
-            out: dict[str, list] = {name: [] for name in order}
-            i = 0
-            for name in order:
-                out[name] = list(shuffled[i : i + counts[name]])
-                i += counts[name]
-            return out
-
-        rng = np.random.default_rng(random_state)
-        shuffled = rng.permutation(bin_df.index.to_numpy())
-        target_area = {
-            name: target_fractions[name] * total_area for name in target_fractions
-        }
-        used_area = dict.fromkeys(target_fractions, 0.0)
-        assignments: dict[str, list] = {name: [] for name in target_fractions}
-        for idx in shuffled:
-            area = float(bin_df.at[idx, area_col])
-            deficits = {
-                name: target_area[name] - used_area[name] for name in target_fractions
-            }
-            choice = max(deficits, key=deficits.get)
-            assignments[choice].append(idx)
-            used_area[choice] += area
-        return assignments
-
     def _area_balanced_polygon_split(
         self,
         poly_df: pd.DataFrame,
@@ -4308,7 +4550,7 @@ class MetricFusionEngine:
         poly_df["_area_km2"] = self._polygon_areas_km2(poly_df[group_col]).to_numpy()
         per_bin_assignments: dict[str, list] = {name: [] for name in target_fractions}
         for bin_value, bin_df in poly_df.groupby("target_bin", sort=False):
-            alloc = self._area_balanced_split_within_bin(
+            alloc = _helpers.area_balanced_split_within_bin(
                 bin_df,
                 "_area_km2",
                 target_fractions,
@@ -4405,26 +4647,6 @@ class MetricFusionEngine:
         block_by_group = dict(zip(agg.index.to_numpy(), block_ids.tolist()))
         return block_by_group, info
 
-    @staticmethod
-    def _stripe_to_test_blocks(
-        ordered_blocks: np.ndarray, test_fraction: float, rng: np.random.Generator
-    ) -> set:
-        """Pick ~``test_fraction`` of blocks, spread evenly across their order.
-
-        ``ordered_blocks`` is the space-filling block sequence; selecting evenly
-        spaced positions (with a seed-jittered start) spreads the held-out
-        blocks across the full extent rather than into one contiguous corner.
-        """
-        n = len(ordered_blocks)
-        if n == 0:
-            return set()
-        n_pick = max(1, int(round(test_fraction * n)))
-        n_pick = min(n_pick, n)
-        step = n / n_pick
-        start = int(rng.integers(0, max(1, int(np.floor(step)))))
-        idxs = (np.floor(np.arange(n_pick) * step).astype(int) + start) % n
-        return set(ordered_blocks[np.unique(idxs)].tolist())
-
     def split_data(
         self,
         test_size: float = 0.2,
@@ -4459,6 +4681,10 @@ class MetricFusionEngine:
         # train+val / test frames this method rebuilds).
         self._full_data_cache = None
         self._apply_fusion_cache = None
+        self._evaluate_test_cache.clear()
+        self._fold_static_cache.clear()
+        self._split_generation += 1
+        self._clear_scoring_caches()
 
         # Step 1: Sample all metrics at initial buffer distance
         logger.info("Step 1/4: Sampling metrics at point locations...")
@@ -4485,7 +4711,7 @@ class MetricFusionEngine:
             group_col, group_label, group_agg = "polygon_id", "polygon", "first"
 
         if group_col is not None:
-            # ── Group-level stratified split ──────────────────────────────
+            # ── Group-level stratified split ────────────
             # Stratify on the per-group outcome so the distribution stays
             # balanced across train / val / test, and all rows of a group
             # stay together to avoid leakage.
@@ -4584,7 +4810,7 @@ class MetricFusionEngine:
                 # train and test.
                 rng_sp = np.random.default_rng(random_state)
                 ordered_blocks = np.sort(poly_df["_block"].unique())
-                test_blocks = self._stripe_to_test_blocks(
+                test_blocks = _helpers.stripe_to_test_blocks(
                     ordered_blocks, test_size, rng_sp
                 )
                 test_mask = poly_df["_block"].isin(test_blocks)
@@ -4670,7 +4896,7 @@ class MetricFusionEngine:
             self._spatial_adjust_summary = None
             return
 
-        # ── Row-level (point / raster) split ────────────────────────────────
+        # ── Row-level (point / raster) split ────────────────
         # Step 3: Create stratification bins based on target values
         logger.info("Step 3/4: Binning target values for stratified sampling...")
         fusion_df["target_bin"] = pd.qcut(
@@ -4716,9 +4942,207 @@ class MetricFusionEngine:
             return lo
         return trial.suggest_int("ndvi_radius", lo, hi, step=step)
 
-    def _objective(self, trial: optuna.Trial, metric: str) -> float:
+    def _effective_time_fixed(self, spec) -> bool:
+        """The spec's time fixed effect, minus the case where wave indicators
+        already span it (entering both would be rank-deficient)."""
+        return (
+            bool(spec.include_time_fixed_effect) and not self._time_fixed_effect_dropped
+        )
+
+    def _metric_has_pvalue(self, metric: str) -> bool:
+        """True when scoring ``metric`` yields a usable parametric p-value.
+
+        The longitudinal MixedLM ``tstat`` / ``coef`` metrics and both GEE
+        logistic metrics carry a Wald p-value; the cross-sectional OLS metrics
+        do not (their robustness comes from stability selection + bootstrap CIs,
+        not a per-trial p-gate). The cross-sectional logistic metrics do produce
+        one, and it is reported for consistency with the panel path.
         """
-        Optuna objective function with k-fold CV.
+        if metric in objective_scoring.BINARY_ONLY_METRICS:
+            return True
+        if self.is_longitudinal and metric in longitudinal.GEE_LOGIT_METRICS:
+            return True
+        return self.is_longitudinal and metric in mixed_effects_scoring.HAS_PVALUE
+
+    def _fold_fast_components(self, static: dict):
+        """Per-fold ``(D, σ²)`` for the fast search scorer, cached on the static.
+
+        Returns ``None`` (caller uses the exact per-trial fit) when the engine
+        is not longitudinal, a spatial smooth is active, the fold lacks entity /
+        time keys, or estimation fails. Computed once per fold subset and reused
+        by every trial of that fold — the whole point of the fast path.
+        """
+        if "fast_components" in static:
+            return static["fast_components"]
+        comp = None
+        spec = self.longitudinal_spec
+        if (
+            self.is_longitudinal
+            and spec is not None
+            and self.search_scoring_method
+            in mixed_effects_scoring.FAST_COMPONENT_METHODS
+            and self.spatial_adjust_method == "none"
+            and static.get("entity_id") is not None
+            and static.get("ysb") is not None
+        ):
+            comp = mixed_effects_scoring.estimate_fold_components(
+                static["target"],
+                static.get("cov"),
+                static["ysb"],
+                static["entity_id"],
+                method=self.search_scoring_method,
+                include_time_fixed=self._effective_time_fixed(spec),
+                random_slope=spec.random_slope_time,
+                target=spec.association_target,
+            )
+        static["fast_components"] = comp
+        return comp
+
+    def _fold_gee_baseline(self, static: dict):
+        """Per-fold covariates-only GEE fit for the fast binary panel scorer.
+
+        The binary analogue of :meth:`_fold_fast_components`: the null model's
+        fitted probabilities, working weights and exchangeable correlation are
+        properties of the outcome and covariates, so they are estimated once per
+        fold and every trial takes one Newton step from them. ``None`` sends the
+        caller to the exact per-trial GEE fit.
+        """
+        if "gee_baseline" in static:
+            return static["gee_baseline"]
+        baseline = None
+        if (
+            self.is_longitudinal
+            and self.search_scoring_method != "exact"
+            and self.spatial_adjust_method == "none"
+            and static.get("entity_id") is not None
+        ):
+            baseline = binary_longitudinal.estimate_fold_baseline(
+                static["target"], static["entity_id"], static.get("cov")
+            )
+        static["gee_baseline"] = baseline
+        return baseline
+
+    def _score_greenery(
+        self,
+        metric: str,
+        target: "np.ndarray",
+        composite: "np.ndarray",
+        *,
+        covariates: "np.ndarray | None" = None,
+        spatial_basis: "np.ndarray | None" = None,
+        entity_id: "np.ndarray | None" = None,
+        years_since_baseline: "np.ndarray | None" = None,
+        return_pvalue: bool = False,
+        return_all: bool = False,
+        nan_on_fail: bool = False,
+        fast_components: "tuple[np.ndarray, float] | object | None" = None,
+    ):
+        """Single scoring seam: MixedLM (longitudinal) or OLS (cross-sectional).
+
+        Routes to :func:`mixed_effects_scoring.score_mixedlm` when the engine is
+        in longitudinal mode and ``metric`` is a ``mixedlm_*`` metric, otherwise
+        to :func:`objective_scoring.score`. Every scoring call site — the
+        objective, the held-out evaluation, and the reporting helpers — goes
+        through here so the two modes cannot drift apart: a change to the
+        cross-sectional scorer (residualization, spatial handling, caches)
+        applies to the longitudinal OLS-metric path for free, and the MixedLM
+        branch is the one isolated place the panel model lives.
+
+        ``entity_id`` / ``years_since_baseline`` are consumed only by the MixedLM
+        branch; the OLS branch ignores them (they are ``None`` in cross-sectional
+        mode). ``return_all`` returns the four-metric MixedLM dict and is a no-op
+        on the OLS path.
+
+        ``nan_on_fail`` makes the MixedLM branch return ``NaN`` instead of the
+        degenerate ``0.0`` when the model can't be fit, so reporting can tell a
+        non-fit from a genuine null. The search leaves it off (a bad trial should
+        rank last, not poison the pool) and the OLS path ignores it — the OLS
+        scorers have no non-convergence mode.
+        """
+        if self.is_longitudinal and metric in longitudinal.GEE_LOGIT_METRICS:
+            # Binary outcome on a panel: GEE with an exchangeable working
+            # correlation clustered on the entity. ``fast_components`` carries a
+            # GEEFoldBaseline here (the search path); its absence, or an exact
+            # reporting call, takes the full refit.
+            if (
+                isinstance(fast_components, binary_longitudinal.GEEFoldBaseline)
+                and not return_all
+            ):
+                return binary_longitudinal.score_gee_logit_fast(
+                    metric,
+                    composite,
+                    fast_components,
+                    return_all=return_all,
+                    return_pvalue=return_pvalue,
+                )
+            return binary_longitudinal.score_gee_logit(
+                metric,
+                target,
+                composite,
+                entity_id,
+                covariates,
+                return_all=return_all,
+                return_pvalue=return_pvalue,
+            )
+
+        if self.is_longitudinal and metric in mixed_effects_scoring.MIXEDLM_METRICS:
+            spec = self.longitudinal_spec
+            assert spec is not None  # guaranteed by is_longitudinal
+            # Fast fixed-V GLS path for the trial search: reuse the per-fold
+            # variance components, one GLS per trial instead of a MixedLM fit.
+            # Only for the ranking metrics, with no spatial smooth, and never
+            # for the exact reporting calls (return_all / no components).
+            if (
+                fast_components is not None
+                and not return_all
+                and metric in mixed_effects_scoring.FAST_SEARCH_METRICS
+                and self.spatial_adjust_method == "none"
+            ):
+                return mixed_effects_scoring.score_mixedlm_fast(
+                    metric,
+                    target,
+                    composite,
+                    entity_id=entity_id,
+                    years_since_baseline=years_since_baseline,
+                    covariates=covariates,
+                    components=fast_components,
+                    include_time_fixed=self._effective_time_fixed(spec),
+                    random_slope=spec.random_slope_time,
+                    return_pvalue=return_pvalue,
+                    nan_on_fail=nan_on_fail,
+                    target=spec.association_target,
+                )
+            return mixed_effects_scoring.score_mixedlm(
+                metric,
+                target,
+                composite,
+                entity_id=entity_id,
+                years_since_baseline=years_since_baseline,
+                covariates=covariates,
+                include_time_fixed=self._effective_time_fixed(spec),
+                random_slope=spec.random_slope_time,
+                return_pvalue=return_pvalue,
+                return_all=return_all,
+                nan_on_fail=nan_on_fail,
+                spatial_basis=spatial_basis,
+                spatial_method=self.spatial_adjust_method,
+                target=spec.association_target,
+            )
+        return objective_scoring.score(
+            metric,
+            target,
+            composite,
+            covariates=covariates,
+            return_pvalue=return_pvalue,
+            spatial_basis=spatial_basis,
+            spatial_method=self.spatial_adjust_method,
+            residualize_method=self.residualize_method,
+            pdcor_cache=self._pdcor_cache,
+            spline_cache=self._spline_basis_cache,
+        )
+
+    def _objective(self, trial: optuna.Trial, metric: str) -> float:
+        """Optuna objective with k-fold CV, timed for the concurrency report.
 
         Weight search matches CGI.ipynb (ndvi / veg / terrain summing to 100).
         Radii use separate GVI and NDVI buffer ladders (min / max / step metres)
@@ -4726,6 +5150,21 @@ class MetricFusionEngine:
         Street-view aggregation parameters are shared for veg and terrain; NDVI
         uses separate stat / percentile choices.
         """
+        # A cancelled job stops paying for trials it will never report. The
+        # study-level callback stops the sampler from queueing more; this
+        # prunes the ones already dispatched to the pool.
+        if self._cancel_callback is not None and self._cancel_callback():
+            raise optuna.TrialPruned("Cancelled by user")
+
+        _t0 = time.perf_counter()
+        try:
+            return self._objective_inner(trial, metric)
+        finally:
+            # ``list.append`` is atomic under the GIL, so trials on the thread
+            # pool accumulate without a lock; summing these gives worker-seconds.
+            self._objective_secs.append(time.perf_counter() - _t0)
+
+    def _objective_inner(self, trial: optuna.Trial, metric: str) -> float:
         gvi_cap = int(round(self.gvi_buffer_max_m))
         ndvi_cap = int(round(self.ndvi_buffer_max_m))
 
@@ -4746,7 +5185,7 @@ class MetricFusionEngine:
                 f"NDVI radius search {ndvi_lo}–{ndvi_hi} m (step {ndvi_st})"
             )
 
-        # ─── Suggest formula parameters (weights + powers) ────────────────────
+        # ── Suggest formula parameters (weights + powers) ───
         # In ``cgi`` mode the formula's ``suggest_params`` bakes the weight-sum
         # / power constraints into the search space (sequential conditional
         # allocation on the simplex), and ``channel_active`` drives the
@@ -4780,7 +5219,7 @@ class MetricFusionEngine:
         preaggr_on = getattr(self, "_preaggregation_done", False)
         pct_grid = list(self._PREAGGR_PERCENTILES)
 
-        # ─── Suggest Streetview Parameters (SHARED for veg + terrain) ─────────
+        # ── Streetview params (shared: veg + terrain) ───────
         # Only suggest if either veg or terrain channel contributes. The
         # gating mirrors the legacy weighted-average ``weight > 0`` skip so an
         # all-NDVI trial doesn't burn search dimensions on unused street-view
@@ -4818,7 +5257,7 @@ class MetricFusionEngine:
             veg_radius = gvi_cap
             terrain_radius = gvi_cap
 
-        # ─── Suggest NDVI Parameters (separate) ────────────────────────────────
+        # ── Suggest NDVI Parameters (separate) ──────────────
         if channel_active["ndvi"]:
             ndvi_radius = self._suggest_ndvi_radius(trial)
             ndvi_stat = trial.suggest_categorical(
@@ -4838,7 +5277,7 @@ class MetricFusionEngine:
             ndvi_stat = "mean"
             ndvi_percentile = 50
 
-        # ─── Evaluate Across All CV Folds ─────────────────────────────────────
+        # ── Evaluate Across All CV Folds ────────────────────
         fold_train_scores = []
         fold_val_scores = []
         fold_train_pvals = []
@@ -4860,117 +5299,125 @@ class MetricFusionEngine:
             if not any(channel_active.values()):
                 return -np.inf if metric != "nrmse" else np.inf
 
-            # ─── Apply Dynamic Radius and Aggregation ─────────────────────────────
+            # ── Apply Dynamic Radius and Aggregation ────
             # Both points and rasters use the same circular buffer aggregation
             # For rasters, _prepare_raster_fusion() converted pixels to points at centers.
-            # On the pre-aggregation fast path the aggregator only needs row
-            # indices (+ wave / _preaggr_id), so pass a geometry-free slice and
-            # skip copying the geometry column every trial × fold.
-            if getattr(self, "_preaggregation_done", False):
-                light_cols = [
-                    c for c in ("wave", "_preaggr_id") if c in self.target_gdf.columns
-                ]
-                train_points = self.target_gdf.loc[train_data.index, light_cols]
-                val_points = self.target_gdf.loc[val_data.index, light_cols]
-            else:
-                train_points = self.target_gdf.loc[train_data.index]
-                val_points = self.target_gdf.loc[val_data.index]
+            # Points slices, collapse codes, and every per-entity constant are
+            # trial-invariant — served from the fold statics (computed once per
+            # fold subset, reused by all of this bootstrap's trials).
+            train_static = self._fold_entity_statics(train_data, fold_idx, "train")
+            val_static = self._fold_entity_statics(val_data, fold_idx, "val")
+            train_points = train_static["points"]
+            val_points = val_static["points"]
 
-            # Apply circular buffer aggregation for vegetation (with SHARED streetview_stat)
-            if channel_active["veg"]:
-                train_veg = self._aggregate_with_ring_cache(
-                    train_points,
+            # Channel values are computed on the fold's dedup axis when it has
+            # one (point / line catchments repeat a pixel per entity), then
+            # gathered back onto rows just before the collapse below.
+            def _channel(
+                static, metric_data, radius, stat_name, pct, ch_name, sub
+            ) -> tuple[np.ndarray, bool]:
+                n = len(static["points"])
+                if not channel_active[ch_name]:
+                    uid = static.get("uniq_lookup_ids")
+                    width = n if uid is None else len(uid)
+                    return np.zeros(width, dtype=np.float32), uid is not None
+                return self._aggregate_channel_for_fold(
+                    static,
+                    metric_data,
+                    radius,
+                    stat_name,
+                    pct,
+                    channel=ch_name,
+                    fold_idx=fold_idx,
+                    subset=sub,
+                )
+
+            train_parts = [
+                _channel(
+                    train_static,
                     self.veg_data,
                     veg_radius,
                     streetview_stat,
                     streetview_percentile,
-                    channel="veg",
-                    fold_idx=fold_idx,
-                    subset="train",
-                )
-                val_veg = self._aggregate_with_ring_cache(
-                    val_points,
+                    "veg",
+                    "train",
+                ),
+                _channel(
+                    train_static,
+                    self.terrain_data,
+                    terrain_radius,
+                    streetview_stat,
+                    streetview_percentile,
+                    "terrain",
+                    "train",
+                ),
+                _channel(
+                    train_static,
+                    self.ndvi_data,
+                    ndvi_radius,
+                    ndvi_stat,
+                    ndvi_percentile,
+                    "ndvi",
+                    "train",
+                ),
+            ]
+            val_parts = [
+                _channel(
+                    val_static,
                     self.veg_data,
                     veg_radius,
                     streetview_stat,
                     streetview_percentile,
-                    channel="veg",
-                    fold_idx=fold_idx,
-                    subset="val",
-                )
-            else:
-                train_veg = np.zeros(len(train_points))
-                val_veg = np.zeros(len(val_points))
-
-            # Apply circular buffer aggregation for terrain (with SHARED streetview_stat)
-            if channel_active["terrain"]:
-                train_terrain = self._aggregate_with_ring_cache(
-                    train_points,
+                    "veg",
+                    "val",
+                ),
+                _channel(
+                    val_static,
                     self.terrain_data,
                     terrain_radius,
                     streetview_stat,
                     streetview_percentile,
-                    channel="terrain",
-                    fold_idx=fold_idx,
-                    subset="train",
-                )
-                val_terrain = self._aggregate_with_ring_cache(
-                    val_points,
-                    self.terrain_data,
-                    terrain_radius,
-                    streetview_stat,
-                    streetview_percentile,
-                    channel="terrain",
-                    fold_idx=fold_idx,
-                    subset="val",
-                )
-            else:
-                train_terrain = np.zeros(len(train_points))
-                val_terrain = np.zeros(len(val_points))
-
-            # Apply circular buffer aggregation for NDVI (separate stat)
-            if channel_active["ndvi"]:
-                train_ndvi = self._aggregate_with_ring_cache(
-                    train_points,
+                    "terrain",
+                    "val",
+                ),
+                _channel(
+                    val_static,
                     self.ndvi_data,
                     ndvi_radius,
                     ndvi_stat,
                     ndvi_percentile,
-                    channel="ndvi",
-                    fold_idx=fold_idx,
-                    subset="train",
-                )
-                val_ndvi = self._aggregate_with_ring_cache(
-                    val_points,
-                    self.ndvi_data,
-                    ndvi_radius,
-                    ndvi_stat,
-                    ndvi_percentile,
-                    channel="ndvi",
-                    fold_idx=fold_idx,
-                    subset="val",
-                )
-            else:
-                train_ndvi = np.zeros(len(train_points))
-                val_ndvi = np.zeros(len(val_points))
+                    "ndvi",
+                    "val",
+                ),
+            ]
+            train_on_uniq = all(u for _, u in train_parts)
+            val_on_uniq = all(u for _, u in val_parts)
+            train_veg, train_terrain, train_ndvi = _helpers.align_channel_axes(
+                train_parts, train_static, len(train_points)
+            )
+            val_veg, val_terrain, val_ndvi = _helpers.align_channel_axes(
+                val_parts, val_static, len(val_points)
+            )
 
             # Per-channel scaling has been removed: the composite is always a
             # weighted combination of RAW aggregated channel values. The
             # ``whole_grid_scaling`` toggle instead normalizes the resulting
             # composite to [0, 1] (applied after compute_cgi, below).
-            train_combined = np.column_stack([train_veg, train_terrain, train_ndvi])
-            val_combined = np.column_stack([val_veg, val_terrain, val_ndvi])
-
-            train_valid_mask = ~np.isnan(train_combined).any(axis=1)
-            if train_valid_mask.sum() == 0:
+            # Any row usable at all? Checked per channel so the full-width
+            # stack (a copy of every channel) is never materialised here.
+            if not (
+                np.isfinite(train_veg)
+                & np.isfinite(train_terrain)
+                & np.isfinite(train_ndvi)
+            ).any():
                 continue  # Skip this fold if no valid data
 
-            train_veg_norm = train_combined[:, 0]
-            train_terrain_norm = train_combined[:, 1]
-            train_ndvi_norm = train_combined[:, 2]
-            val_veg_norm = val_combined[:, 0]
-            val_terrain_norm = val_combined[:, 1]
-            val_ndvi_norm = val_combined[:, 2]
+            train_veg_norm = train_veg
+            train_terrain_norm = train_terrain
+            train_ndvi_norm = train_ndvi
+            val_veg_norm = val_veg
+            val_terrain_norm = val_terrain
+            val_ndvi_norm = val_ndvi
 
             # Optional per-channel [0, 1] scaling (raw otherwise). Applied to
             # both the CGI and standalone paths so they share one footing.
@@ -5020,143 +5467,57 @@ class MetricFusionEngine:
             train_composite = self._finalize_composite(train_composite)
             val_composite = self._finalize_composite(val_composite)
 
-            # Per-fold covariate design matrix (or None when no covariates
-            # configured). Polygon mode collapses these alongside the target.
-            cov_cols = self.covariate_columns
-            if cov_cols:
-                train_cov = train_data[cov_cols].to_numpy(dtype=np.float64)
-                val_cov = val_data[cov_cols].to_numpy(dtype=np.float64)
-            else:
-                train_cov = None
-                val_cov = None
+            # Back onto the fold's rows when the composite was formed on the
+            # dedup axis: the collapse below keys on per-row entity membership.
+            if train_on_uniq and train_static.get("uniq_inverse") is not None:
+                train_composite = np.asarray(train_composite)[
+                    train_static["uniq_inverse"]
+                ]
+            if val_on_uniq and val_static.get("uniq_inverse") is not None:
+                val_composite = np.asarray(val_composite)[val_static["uniq_inverse"]]
+
+            # Per-fold covariate design matrix, per-entity target / coords /
+            # longitudinal keys: all trial-invariant, served from the fold
+            # statics (already entity-collapsed for polygon-keyed targets).
+            train_cov = train_static["cov"]
+            val_cov = val_static["cov"]
+            train_targets_arr = train_static["target"]
+            val_targets_arr = val_static["target"]
+            train_coords = train_static["coords"]
+            val_coords = val_static["coords"]
+            train_entity_id = train_static.get("entity_id")
+            val_entity_id = val_static.get("entity_id")
+            train_ysb = train_static.get("ysb")
+            val_ysb = val_static.get("ysb")
 
             # Polygon mode: per-row CGI → per-polygon mean CGI, then score
             # against the per-polygon outcome. In longitudinal+polygon mode
             # polygon_id was set to f"{entity}|{wave}" by
             # _prepare_polygon_fusion so the collapse produces one row per
-            # (entity, wave) — the exact shape the MixedLM scorer wants.
-            train_entity_id = None
-            val_entity_id = None
-            train_ysb = None
-            val_ysb = None
-            # Per-entity coordinates for the spatial-confounding smooth. ``None``
-            # whenever the adjustment is off or coordinates were not attached.
-            train_coords = None
-            val_coords = None
-            have_coords = "_cx" in train_data.columns and "_cy" in train_data.columns
-            if "polygon_id" in train_data.columns:
-                train_pid = train_data["polygon_id"].values
-                val_pid = val_data["polygon_id"].values
-                # Catchment collapse: polygons average every in-footprint pixel
-                # (mask None); point/line entities average only the pixels
-                # within this trial's catchment radius (+ each entity's nearest
-                # pixel). ``__entity_id``/wave keys were set per observation in
-                # the prepare step, so the collapse yields one row per
-                # observation — the shape the OLS / MixedLM scorers want.
-                catchment_r = self._catchment_radius(
-                    veg_radius, terrain_radius, ndvi_radius
+            # (entity, wave) — the shape the MixedLM scorer wants. Polygons
+            # average every in-footprint pixel; point/line entities average
+            # only those inside this trial's catchment radius.
+            if train_static["has_pid"]:
+                catchment_r = _helpers.catchment_radius(
+                    veg_radius,
+                    terrain_radius,
+                    ndvi_radius,
+                    self._active_greenery_channel,
                 )
-                train_mask = self._entity_collapse_mask(train_data, catchment_r)
-                val_mask = self._entity_collapse_mask(val_data, catchment_r)
-                train_composite = self._collapse_to_entities(
-                    train_composite, train_pid, train_mask, "mean"
+                train_mask = _helpers.entity_collapse_mask(train_data, catchment_r)
+                val_mask = _helpers.entity_collapse_mask(val_data, catchment_r)
+                train_composite = self._collapse_mean_from_codes(
+                    train_composite,
+                    train_static["codes"],
+                    train_static["n_uniq"],
+                    train_mask,
                 )
-                val_composite = self._collapse_to_entities(
-                    val_composite, val_pid, val_mask, "mean"
+                val_composite = self._collapse_mean_from_codes(
+                    val_composite,
+                    val_static["codes"],
+                    val_static["n_uniq"],
+                    val_mask,
                 )
-                train_targets_arr = self._collapse_to_entities(
-                    train_data["target"].values, train_pid, train_mask, "first"
-                )
-                val_targets_arr = self._collapse_to_entities(
-                    val_data["target"].values, val_pid, val_mask, "first"
-                )
-                if train_cov is not None and val_cov is not None:
-                    tc = train_cov  # local binding for the type checker
-                    vc = val_cov
-                    train_cov = np.column_stack(
-                        [
-                            self._collapse_to_entities(
-                                tc[:, j], train_pid, train_mask, "first"
-                            )
-                            for j in range(tc.shape[1])
-                        ]
-                    )
-                    val_cov = np.column_stack(
-                        [
-                            self._collapse_to_entities(
-                                vc[:, j], val_pid, val_mask, "first"
-                            )
-                            for j in range(vc.shape[1])
-                        ]
-                    )
-                if have_coords:
-                    # Collapse coordinates with an unmasked "first" so the
-                    # per-entity representative point is independent of the
-                    # trial's catchment radius — the spatial basis can then be
-                    # cached once per fold. The collapse key order (sorted
-                    # polygon_id) matches the target/covariate collapse above.
-                    train_coords = np.column_stack(
-                        [
-                            self._collapse_to_entities(
-                                train_data["_cx"].to_numpy(np.float64),
-                                train_pid,
-                                None,
-                                "first",
-                            ),
-                            self._collapse_to_entities(
-                                train_data["_cy"].to_numpy(np.float64),
-                                train_pid,
-                                None,
-                                "first",
-                            ),
-                        ]
-                    )
-                    val_coords = np.column_stack(
-                        [
-                            self._collapse_to_entities(
-                                val_data["_cx"].to_numpy(np.float64),
-                                val_pid,
-                                None,
-                                "first",
-                            ),
-                            self._collapse_to_entities(
-                                val_data["_cy"].to_numpy(np.float64),
-                                val_pid,
-                                None,
-                                "first",
-                            ),
-                        ]
-                    )
-                if self.is_longitudinal:
-                    train_entity_id = self._collapse_to_entities(
-                        train_data["entity_id"].values, train_pid, train_mask, "first"
-                    )
-                    val_entity_id = self._collapse_to_entities(
-                        val_data["entity_id"].values, val_pid, val_mask, "first"
-                    )
-                    train_ysb = self._collapse_to_entities(
-                        train_data["years_since_baseline"].values,
-                        train_pid,
-                        train_mask,
-                        "first",
-                    )
-                    val_ysb = self._collapse_to_entities(
-                        val_data["years_since_baseline"].values,
-                        val_pid,
-                        val_mask,
-                        "first",
-                    )
-            else:
-                train_targets_arr = train_data["target"].values
-                val_targets_arr = val_data["target"].values
-                if have_coords:
-                    train_coords = train_data[["_cx", "_cy"]].to_numpy(np.float64)
-                    val_coords = val_data[["_cx", "_cy"]].to_numpy(np.float64)
-                if self.is_longitudinal:
-                    train_entity_id = train_data["entity_id"].values
-                    val_entity_id = val_data["entity_id"].values
-                    train_ysb = train_data["years_since_baseline"].values
-                    val_ysb = val_data["years_since_baseline"].values
 
             # Check for constant values (variance = 0) which cause NaN correlations
             train_valid_vals = train_composite[~np.isnan(train_composite)]
@@ -5183,75 +5544,55 @@ class MetricFusionEngine:
                 val_coords, val_targets_arr, val_cov, val_composite
             )
 
-            # ─── Score: MixedLM (longitudinal) or OLS partial-corr ────────────
-            # Three modes route through this fork:
-            #   1. Cross-sectional (no longitudinal_spec) → OLS scorer.
-            #   2. Mixed-effects (spec + ``mixedlm_*`` scoring_metric) →
-            #      MixedLM scorer with per-entity random effects.
-            #   3. Year-aware cross-sectional (spec + cross-sectional
-            #      scoring_metric) → OLS scorer, ignoring entity_id /
-            #      years_since_baseline. The spec exists purely so the
-            #      pre-aggregation cache can pick the right metric file per
-            #      year; the model has no temporal predictor.
-            use_mixedlm = (
-                self.is_longitudinal and metric in mixed_effects_scoring.MIXEDLM_METRICS
+            # ── Score via the ``_score_greenery`` seam ──
+            # Three modes collapse into it: cross-sectional OLS, mixed-effects
+            # MixedLM (per-entity random effects), and year-aware cross-sectional
+            # (spec present but an OLS scoring metric — the OLS scorer ignores
+            # entity_id / years_since_baseline; the spec only routes the right
+            # metric file per year through the pre-aggregation cache).
+            wants_pval = self._metric_has_pvalue(metric)
+            # Fast fixed-V GLS scoring for the search: one variance-component
+            # estimate per fold subset, reused across trials. Only for the
+            # ranking metrics with no spatial smooth; ``None`` elsewhere makes
+            # ``_score_greenery`` take the exact per-trial fit.
+            wants_fast = (
+                self.is_longitudinal
+                and metric in mixed_effects_scoring.FAST_SEARCH_METRICS
+                and self.spatial_adjust_method == "none"
             )
-            if use_mixedlm:
-                spec = self.longitudinal_spec
-                assert spec is not None  # guaranteed by is_longitudinal
-                wants_pval = metric in mixed_effects_scoring.HAS_PVALUE
-                train_out = mixed_effects_scoring.score_mixedlm(
-                    metric,
-                    train_targets_arr,
-                    train_composite,
-                    entity_id=train_entity_id,
-                    years_since_baseline=train_ysb,
-                    covariates=train_cov,
-                    include_time_fixed=spec.include_time_fixed_effect,
-                    random_slope=spec.random_slope_time,
-                    return_pvalue=wants_pval,
-                    spatial_basis=train_sb,
-                    spatial_method=self.spatial_adjust_method,
-                )
-                val_out = mixed_effects_scoring.score_mixedlm(
-                    metric,
-                    val_targets_arr,
-                    val_composite,
-                    entity_id=val_entity_id,
-                    years_since_baseline=val_ysb,
-                    covariates=val_cov,
-                    include_time_fixed=spec.include_time_fixed_effect,
-                    random_slope=spec.random_slope_time,
-                    return_pvalue=wants_pval,
-                    spatial_basis=val_sb,
-                    spatial_method=self.spatial_adjust_method,
-                )
+            wants_gee_fast = (
+                self.is_longitudinal and metric in longitudinal.GEE_LOGIT_METRICS
+            )
+            if wants_gee_fast:
+                train_fc = self._fold_gee_baseline(train_static)
+                val_fc = self._fold_gee_baseline(val_static)
             else:
-                # OLS path: covariate-aware distance-correlation / partial rank
-                # correlation / incremental-R² / normalized-RMSE / MI scorer.
-                # None of these expose a usable p-value (robustness comes from
-                # stability selection, not a per-trial p-gate).
-                wants_pval = False
-                train_out = objective_scoring.score(
-                    metric,
-                    train_targets_arr,
-                    train_composite,
-                    covariates=train_cov,
-                    return_pvalue=wants_pval,
-                    spatial_basis=train_sb,
-                    spatial_method=self.spatial_adjust_method,
-                    residualize_method=self.residualize_method,
+                train_fc = (
+                    self._fold_fast_components(train_static) if wants_fast else None
                 )
-                val_out = objective_scoring.score(
-                    metric,
-                    val_targets_arr,
-                    val_composite,
-                    covariates=val_cov,
-                    return_pvalue=wants_pval,
-                    spatial_basis=val_sb,
-                    spatial_method=self.spatial_adjust_method,
-                    residualize_method=self.residualize_method,
-                )
+                val_fc = self._fold_fast_components(val_static) if wants_fast else None
+            train_out = self._score_greenery(
+                metric,
+                train_targets_arr,
+                train_composite,
+                covariates=train_cov,
+                spatial_basis=train_sb,
+                entity_id=train_entity_id,
+                years_since_baseline=train_ysb,
+                return_pvalue=wants_pval,
+                fast_components=train_fc,
+            )
+            val_out = self._score_greenery(
+                metric,
+                val_targets_arr,
+                val_composite,
+                covariates=val_cov,
+                spatial_basis=val_sb,
+                entity_id=val_entity_id,
+                years_since_baseline=val_ysb,
+                return_pvalue=wants_pval,
+                fast_components=val_fc,
+            )
 
             if wants_pval:
                 # return_pvalue=True returns (score, pvalue); type cast is for
@@ -5273,7 +5614,7 @@ class MetricFusionEngine:
         if not fold_val_scores:
             return -np.inf if metric != "nrmse" else np.inf
 
-        # ─── Store Aggregate Statistics ────────────────────────────────────────
+        # ── Store Aggregate Statistics ──────────────────────
         avg_train_score = np.mean(fold_train_scores)
         avg_val_score = np.mean(fold_val_scores)
         std_val_score = np.std(fold_val_scores)
@@ -5288,9 +5629,7 @@ class MetricFusionEngine:
         # p-value bookkeeping: only the longitudinal MixedLM tstat/coef metrics
         # carry a genuine Wald p-value. Recorded as user_attrs so the post-hoc
         # reporting can read them per trial.
-        produced_pvals = self.is_longitudinal and metric in (
-            mixed_effects_scoring.HAS_PVALUE
-        )
+        produced_pvals = self._metric_has_pvalue(metric)
         if produced_pvals:
             trial.set_user_attr("train_pvalue_mean", np.mean(fold_train_pvals))
             trial.set_user_attr("val_pvalue_mean", np.mean(fold_val_pvals))
@@ -5346,6 +5685,21 @@ class MetricFusionEngine:
                 )
             params = self.best_params
 
+        # Memoized on the composite-determining params (like apply_fusion):
+        # the runner headline, the effects block, the subset-score table, and
+        # the MixedLM post-score loop all re-evaluate identical configurations.
+        # Invalidated by split_data. Shallow-copied on return so callers that
+        # attach keys (e.g. ``test_ci``) don't mutate the cached entry.
+        memo_key = (
+            _helpers.fusion_param_key(self._active_greenery_channel, params),
+            metric,
+            bool(return_predictions),
+            bool(return_all_mixedlm),
+        )
+        memo_hit = self._evaluate_test_cache.get(memo_key)
+        if memo_hit is not None:
+            return dict(memo_hit)
+
         logger.info("Evaluating on held-out test set...")
 
         # Use the engine's active mode to decide which channels contribute and
@@ -5376,7 +5730,8 @@ class MetricFusionEngine:
 
         # Apply dynamic circular buffer aggregation
         # Both points and rasters use the same approach (rasters converted to points)
-        test_points = self.target_gdf.loc[self.test_data.index].copy()
+        # .loc with an index array materialises a new frame; read-only below.
+        test_points = self.target_gdf.loc[self.test_data.index]
 
         # Sample vegetation with optimized radius/stat
         if channel_active["veg"]:
@@ -5391,7 +5746,7 @@ class MetricFusionEngine:
                 subset="test",
             )
         else:
-            test_veg = np.zeros(len(test_points))
+            test_veg = np.zeros(len(test_points), dtype=np.float32)
 
         # Sample terrain with optimized radius/stat
         if channel_active["terrain"]:
@@ -5406,7 +5761,7 @@ class MetricFusionEngine:
                 subset="test",
             )
         else:
-            test_terrain = np.zeros(len(test_points))
+            test_terrain = np.zeros(len(test_points), dtype=np.float32)
 
         # Sample NDVI with optimized radius/stat
         if channel_active["ndvi"]:
@@ -5421,7 +5776,7 @@ class MetricFusionEngine:
                 subset="test",
             )
         else:
-            test_ndvi = np.zeros(len(test_points))
+            test_ndvi = np.zeros(len(test_points), dtype=np.float32)
 
         # Per-channel scaling removed — the composite uses raw aggregated
         # channels. ``whole_grid_scaling`` normalizes the composite below.
@@ -5463,143 +5818,75 @@ class MetricFusionEngine:
         # mirrored for standalone single-channel composites.
         test_composite = self._finalize_composite(test_composite)
 
-        # Test-set covariate matrix (or None when no covariates configured).
-        cov_cols = self.covariate_columns
-        if cov_cols:
-            test_cov = self.test_data[cov_cols].to_numpy(dtype=np.float64)
-        else:
-            test_cov = None
+        # Per-entity constants (covariates, target, coords, longitudinal keys)
+        # come from the fold statics — identical across every params
+        # evaluation on this test split, so the MixedLM post-score loop and
+        # the reporting passes stop re-collapsing the pixel frame per call.
+        test_static = self._fold_entity_statics(self.test_data, -1, "test")
+        test_cov = test_static["cov"]
+        test_targets = test_static["target"]
+        test_coords = test_static["coords"]
+        test_entity_id = test_static.get("entity_id")
+        test_ysb = test_static.get("ysb")
 
         # Polygon mode: aggregate per-row CGI by polygon before scoring against
         # the per-polygon outcome. Longitudinal+polygon mode keys the collapse
         # on f"{entity}|{wave}" so the result is one row per (entity, wave) —
         # the shape the MixedLM scorer expects.
-        test_entity_id = None
-        test_ysb = None
-        test_coords = None
-        have_coords = (
-            "_cx" in self.test_data.columns and "_cy" in self.test_data.columns
-        )
-        if "polygon_id" in self.test_data.columns:
-            test_pid = self.test_data["polygon_id"].values
-            catchment_r = self._catchment_radius(
-                veg_radius, terrain_radius, ndvi_radius
+        if test_static["has_pid"]:
+            catchment_r = _helpers.catchment_radius(
+                veg_radius,
+                terrain_radius,
+                ndvi_radius,
+                self._active_greenery_channel,
             )
-            test_mask = self._entity_collapse_mask(self.test_data, catchment_r)
-            test_composite = self._collapse_to_entities(
-                test_composite, test_pid, test_mask, "mean"
+            test_mask = _helpers.entity_collapse_mask(self.test_data, catchment_r)
+            test_composite = self._collapse_mean_from_codes(
+                test_composite,
+                test_static["codes"],
+                test_static["n_uniq"],
+                test_mask,
             )
-            test_targets = self._collapse_to_entities(
-                self.test_data["target"].values, test_pid, test_mask, "first"
-            )
-            if test_cov is not None:
-                tc = test_cov  # type-narrow for the comprehension
-                test_cov = np.column_stack(
-                    [
-                        self._collapse_to_entities(
-                            tc[:, j], test_pid, test_mask, "first"
-                        )
-                        for j in range(tc.shape[1])
-                    ]
-                )
-            if have_coords:
-                test_coords = np.column_stack(
-                    [
-                        self._collapse_to_entities(
-                            self.test_data["_cx"].to_numpy(np.float64),
-                            test_pid,
-                            None,
-                            "first",
-                        ),
-                        self._collapse_to_entities(
-                            self.test_data["_cy"].to_numpy(np.float64),
-                            test_pid,
-                            None,
-                            "first",
-                        ),
-                    ]
-                )
-            if self.is_longitudinal:
-                test_entity_id = self._collapse_to_entities(
-                    self.test_data["entity_id"].values, test_pid, test_mask, "first"
-                )
-                test_ysb = self._collapse_to_entities(
-                    self.test_data["years_since_baseline"].values,
-                    test_pid,
-                    test_mask,
-                    "first",
-                )
-        else:
-            test_targets = self.test_data["target"].values
-            if have_coords:
-                test_coords = self.test_data[["_cx", "_cy"]].to_numpy(np.float64)
-            if self.is_longitudinal:
-                test_entity_id = self.test_data["entity_id"].values
-                test_ysb = self.test_data["years_since_baseline"].values
 
         test_sb = self._spatial_basis_columns(
             test_coords, test_targets, test_cov, test_composite
         )
 
-        # ─── Score: MixedLM (longitudinal) or OLS partial-corr ────────────
-        # Same three-mode fork as ``_objective``: year-aware cross-sectional
-        # studies sit on a ``LongitudinalSpec`` whose ``scoring_metric`` is
-        # one of the OLS options, and route here through the ``else`` arm.
+        # ── Score via the ``_score_greenery`` seam ──────────
+        # Same routing as ``_objective``: MixedLM for a longitudinal mixedlm_*
+        # metric, OLS otherwise (a year-aware cross-sectional study sits on a
+        # spec whose scoring_metric is an OLS option and takes the OLS path).
         mixedlm_all: dict[str, float] | None = None
-        use_mixedlm = (
-            self.is_longitudinal and metric in mixed_effects_scoring.MIXEDLM_METRICS
-        )
-        if use_mixedlm:
-            spec = self.longitudinal_spec
-            assert spec is not None
-            wants_pval = metric in mixed_effects_scoring.HAS_PVALUE
-            if return_all_mixedlm:
-                mixedlm_all = mixed_effects_scoring.score_mixedlm(  # type: ignore[assignment]
-                    metric,
-                    test_targets,
-                    test_composite,
-                    entity_id=test_entity_id,
-                    years_since_baseline=test_ysb,
-                    covariates=test_cov,
-                    include_time_fixed=spec.include_time_fixed_effect,
-                    random_slope=spec.random_slope_time,
-                    return_all=True,
-                    spatial_basis=test_sb,
-                    spatial_method=self.spatial_adjust_method,
-                )
-                # Surface the requested metric's value alongside the dict so
-                # ``test_score`` still reflects the engine's active scoring
-                # metric for downstream code that inspects it.
-                s = float(mixedlm_all.get(metric, 0.0))  # type: ignore[union-attr]
-                score_out = (s, 1.0) if wants_pval else s
-            else:
-                score_out = mixed_effects_scoring.score_mixedlm(
-                    metric,
-                    test_targets,
-                    test_composite,
-                    entity_id=test_entity_id,
-                    years_since_baseline=test_ysb,
-                    covariates=test_cov,
-                    include_time_fixed=spec.include_time_fixed_effect,
-                    random_slope=spec.random_slope_time,
-                    return_pvalue=wants_pval,
-                    spatial_basis=test_sb,
-                    spatial_method=self.spatial_adjust_method,
-                )
-        else:
-            # OLS scoring (distance correlation / partial rank corr / R² /
-            # normalized RMSE / MI). No usable p-value — robustness is reported
-            # via the stability-selection OOB distribution + test-set CI.
-            wants_pval = False
-            score_out = objective_scoring.score(
+        wants_pval = self._metric_has_pvalue(metric)
+        if (
+            return_all_mixedlm
+            and self.is_longitudinal
+            and metric in mixed_effects_scoring.MIXEDLM_METRICS
+        ):
+            mixedlm_all = self._score_greenery(  # type: ignore[assignment]
                 metric,
                 test_targets,
                 test_composite,
                 covariates=test_cov,
-                return_pvalue=wants_pval,
                 spatial_basis=test_sb,
-                spatial_method=self.spatial_adjust_method,
-                residualize_method=self.residualize_method,
+                entity_id=test_entity_id,
+                years_since_baseline=test_ysb,
+                return_all=True,
+            )
+            # Surface the requested metric's value alongside the dict so
+            # ``test_score`` still reflects the engine's active scoring metric.
+            s = float(mixedlm_all.get(metric, 0.0))  # type: ignore[union-attr]
+            score_out = (s, 1.0) if wants_pval else s
+        else:
+            score_out = self._score_greenery(
+                metric,
+                test_targets,
+                test_composite,
+                covariates=test_cov,
+                spatial_basis=test_sb,
+                entity_id=test_entity_id,
+                years_since_baseline=test_ysb,
+                return_pvalue=wants_pval,
             )
         if wants_pval:
             test_score, test_pval = score_out  # type: ignore[misc]
@@ -5634,8 +5921,18 @@ class MetricFusionEngine:
             # The df-selected smooth so downstream bootstrap / permutation CIs can
             # condition on the same spatial adjustment the score used.
             result["spatial_basis"] = test_sb
+            # Longitudinal keys so the held-out CI can cluster-resample entities
+            # (and refit the MixedLM per replicate). ``None`` in cross-sectional
+            # mode; the OLS reporting path ignores them.
+            if self.is_longitudinal:
+                result["entity_id"] = test_entity_id
+                result["years_since_baseline"] = test_ysb
+                result["wave"] = test_static.get("wave")
 
-        return result
+        self._evaluate_test_cache[memo_key] = result
+        while len(self._evaluate_test_cache) > 256:
+            self._evaluate_test_cache.pop(next(iter(self._evaluate_test_cache)))
+        return dict(result)
 
     def build_channel_design(self, params: dict, subset: str = "train_val") -> dict:
         """Per-entity raw channel values for the CGI-vs-standalone AIC/BIC test.
@@ -5720,10 +6017,13 @@ class MetricFusionEngine:
             pid = data["polygon_id"].values
             # Full 3-channel design → catchment = max of the three radii for
             # point/line targets (mask None for polygons).
-            catchment_r = self._catchment_radius(
-                veg_radius, terrain_radius, ndvi_radius
+            catchment_r = _helpers.catchment_radius(
+                veg_radius,
+                terrain_radius,
+                ndvi_radius,
+                self._active_greenery_channel,
             )
-            mask = self._entity_collapse_mask(data, catchment_r)
+            mask = _helpers.entity_collapse_mask(data, catchment_r)
             veg = self._collapse_to_entities(veg, pid, mask, "mean")
             terrain = self._collapse_to_entities(terrain, pid, mask, "mean")
             ndvi = self._collapse_to_entities(ndvi, pid, mask, "mean")
@@ -5782,6 +6082,13 @@ class MetricFusionEngine:
         between full and partial residual scoring based on whether covariates
         are supplied.
 
+        Longitudinal runs resample whole entities (cluster bootstrap) so the
+        panel correlation isn't broken: an OLS-metric run passes ``groups`` to
+        :func:`statistical_testing.bootstrap_score_ci`, while a ``mixedlm_*``
+        metric routes to :func:`mixed_effects_scoring.cluster_bootstrap_metric_ci`,
+        which refits the mixed model per (entity-relabelled) replicate at a
+        capped replicate count.
+
         Returns a dict with ``observed``, ``mean``, ``lower``, ``upper``,
         ``ci_level``, ``method``, ``n``.
         """
@@ -5792,13 +6099,39 @@ class MetricFusionEngine:
         )
         target = np.asarray(res.get("targets"), dtype=np.float64)
         prediction = np.asarray(res.get("predictions"), dtype=np.float64)
+
+        # Longitudinal MixedLM metric → cluster (entity) bootstrap that refits
+        # the mixed model per replicate (resampling rows independently would
+        # break the within-entity correlation).
+        if self.is_longitudinal and metric in mixed_effects_scoring.MIXEDLM_METRICS:
+            spec = self.longitudinal_spec
+            assert spec is not None
+            return mixed_effects_scoring.cluster_bootstrap_metric_ci(
+                metric,
+                target,
+                prediction,
+                res.get("entity_id"),
+                res.get("years_since_baseline"),
+                covariates=res.get("covariates"),
+                include_time_fixed=self._effective_time_fixed(spec),
+                random_slope=spec.random_slope_time,
+                spatial_basis=res.get("spatial_basis"),
+                spatial_method=self.spatial_adjust_method,
+                n_bootstrap=min(int(n_bootstrap), self._MIXEDLM_TEST_CI_BOOTSTRAP_CAP),
+                ci_level=float(ci_level),
+                seed=int(seed),
+                target=spec.association_target,
+            )
+
         test_cov = res.get("covariates")
         cov_mat = (
             np.asarray(test_cov, dtype=np.float64) if test_cov is not None else None
         )
-        # Condition the CI on the spatial smooth by folding the df-selected basis
-        # columns into the resampled control matrix (equivalent to KS-AIC for the
-        # symmetric metrics: both sides residualize on [covariates, smooth]).
+        # The smooth rides in the resampled control matrix so its rows are drawn
+        # with the observation, then is split back out per replicate and handed
+        # to the scorer through ``spatial_basis`` — the same seam the objective
+        # uses, so the CI conditions exactly as the score being bounded did.
+        n_cov_cols = 0 if cov_mat is None else int(cov_mat.shape[1])
         sb = res.get("spatial_basis")
         if sb is not None:
             sb = np.asarray(sb, dtype=np.float64)
@@ -5812,7 +6145,14 @@ class MetricFusionEngine:
 
             def _score_fn(t_arr: np.ndarray, p_arr: np.ndarray) -> float:
                 score_out = objective_scoring.score(
-                    metric, t_arr, p_arr, covariates=None, return_pvalue=False
+                    metric,
+                    t_arr,
+                    p_arr,
+                    covariates=None,
+                    return_pvalue=False,
+                    residualize_method=self.residualize_method,
+                    pdcor_cache=self._pdcor_cache,
+                    spline_cache=self._spline_basis_cache,
                 )
                 return float(score_out)  # type: ignore[arg-type]
 
@@ -5821,10 +6161,27 @@ class MetricFusionEngine:
             def _score_fn(
                 t_arr: np.ndarray, p_arr: np.ndarray, c_arr: np.ndarray
             ) -> float:
+                cov_part, sb_part = _helpers.split_control_matrix(c_arr, n_cov_cols)
                 score_out = objective_scoring.score(
-                    metric, t_arr, p_arr, covariates=c_arr, return_pvalue=False
+                    metric,
+                    t_arr,
+                    p_arr,
+                    covariates=cov_part,
+                    return_pvalue=False,
+                    spatial_basis=sb_part,
+                    spatial_method=self.spatial_adjust_method,
+                    residualize_method=self.residualize_method,
+                    pdcor_cache=self._pdcor_cache,
+                    spline_cache=self._spline_basis_cache,
                 )
                 return float(score_out)  # type: ignore[arg-type]
+
+        # OLS-metric longitudinal runs still have panel-correlated (entity, wave)
+        # rows, so resample whole entities (cluster bootstrap) rather than rows;
+        # cross-sectional runs pass ``groups=None`` and keep the row bootstrap.
+        groups = None
+        if self.is_longitudinal and res.get("entity_id") is not None:
+            groups = np.asarray(res.get("entity_id"))
 
         ci = _stats_mod.bootstrap_score_ci(
             target,
@@ -5835,30 +6192,16 @@ class MetricFusionEngine:
             method=method,
             seed=int(seed),
             covariates=cov_mat,
+            replicate_scorer_factory=(
+                pdcor.pdcor_replicate_scorer_factory
+                if metric == "partial_distance_corr"
+                else None
+            ),
+            groups=groups,
+            cancel_callback=self._cancel_callback,
         )
         ci["n"] = n
         return ci
-
-    def build_test_prediction_column(self, params: dict, metric: str) -> dict:
-        """Convenience: return the per-test-entity (composite, target) arrays.
-
-        The nested-CV runner aggregates these across outer folds to form the
-        outer-CV-averaged prediction column used for the headline polygon-level
-        bootstrap CI.
-        """
-        res = self.evaluate_on_test(
-            params=params, metric=metric, return_predictions=True
-        )
-        return {
-            "predictions": np.asarray(res.get("predictions"), dtype=np.float64),
-            "targets": np.asarray(res.get("targets"), dtype=np.float64),
-            "test_score": float(res.get("test_score", float("nan"))),
-            "test_pvalue": (
-                float(res["test_pvalue"])
-                if res.get("test_pvalue") is not None
-                else None
-            ),
-        }
 
     def _full_data_frame(self) -> "pd.DataFrame | None":
         """train+val+test union frame, concatenated once and cached.
@@ -5870,16 +6213,6 @@ class MetricFusionEngine:
             parts = [d for d in (self.train_val_data, self.test_data) if d is not None]
             self._full_data_cache = pd.concat(parts) if parts else None
         return self._full_data_cache
-
-    @staticmethod
-    def _fusion_param_key(channel_mode: str, weights: dict) -> tuple:
-        """Hashable key over the params that determine the composite."""
-        items = tuple(
-            sorted(
-                (str(k), v) for k, v in weights.items() if not str(k).startswith("__")
-            )
-        )
-        return (channel_mode, items)
 
     def apply_fusion(self, weights: dict | None = None) -> pd.DataFrame:
         """
@@ -5905,7 +6238,7 @@ class MetricFusionEngine:
                 )
             weights = self.best_params
 
-        cache_key = self._fusion_param_key(self._active_greenery_channel, weights)
+        cache_key = _helpers.fusion_param_key(self._active_greenery_channel, weights)
         cached = self._apply_fusion_cache
         if cached is not None and cached[0] == cache_key:
             return cached[1]
@@ -5941,7 +6274,8 @@ class MetricFusionEngine:
         all_data = self._full_data_frame()
         if all_data is None:
             raise ValueError("No data available. Run split_data() first.")
-        all_points = self.target_gdf.loc[all_data.index].copy()
+        # .loc with an index array materialises a new frame; read-only below.
+        all_points = self.target_gdf.loc[all_data.index]
 
         # Apply circular buffer aggregation with optimized parameters
         if channel_active["veg"]:
@@ -5956,7 +6290,7 @@ class MetricFusionEngine:
                 subset="all",
             )
         else:
-            all_veg = np.zeros(len(all_points))
+            all_veg = np.zeros(len(all_points), dtype=np.float32)
 
         if channel_active["terrain"]:
             all_terrain = self._aggregate_with_ring_cache(
@@ -5970,7 +6304,7 @@ class MetricFusionEngine:
                 subset="all",
             )
         else:
-            all_terrain = np.zeros(len(all_points))
+            all_terrain = np.zeros(len(all_points), dtype=np.float32)
 
         if channel_active["ndvi"]:
             all_ndvi = self._aggregate_with_ring_cache(
@@ -5984,7 +6318,7 @@ class MetricFusionEngine:
                 subset="all",
             )
         else:
-            all_ndvi = np.zeros(len(all_points))
+            all_ndvi = np.zeros(len(all_points), dtype=np.float32)
 
         # Per-channel scaling removed — the composite uses raw aggregated
         # channel values.
@@ -6031,10 +6365,13 @@ class MetricFusionEngine:
         # trial's catchment radius for point/line targets), matching what the
         # optimizer scored against the per-entity outcome.
         if "polygon_id" in result_df.columns:
-            catchment_r = self._catchment_radius(
-                veg_radius, terrain_radius, ndvi_radius
+            catchment_r = _helpers.catchment_radius(
+                veg_radius,
+                terrain_radius,
+                ndvi_radius,
+                self._active_greenery_channel,
             )
-            mask = self._entity_collapse_mask(result_df, catchment_r)
+            mask = _helpers.entity_collapse_mask(result_df, catchment_r)
             masked_df = result_df if mask is None else result_df[mask]
             poly_df = (
                 masked_df.groupby("polygon_id", sort=False)
@@ -6073,11 +6410,20 @@ class MetricFusionEngine:
         * ``score_raw`` — what does CGI predict on its own? Answers "how
           predictive is the composite without controls?"
 
-        Returns ``{"score", "score_raw", "pvalue", "pvalue_raw"}``.
+        Returns ``{"score", "score_raw", "pvalue", "pvalue_raw", "fit_failed"}``.
         ``score_raw`` collapses to ``score`` when no covariates are
-        configured (they're the same number in that case).
+        configured (they're the same number in that case). A longitudinal mixed
+        model that doesn't converge yields ``None`` and ``fit_failed=True``
+        rather than the scorer's degenerate ``0.0``, which reads as a genuine
+        null effect everywhere downstream.
         """
-        empty = {"score": None, "score_raw": None, "pvalue": None, "pvalue_raw": None}
+        empty = {
+            "score": None,
+            "score_raw": None,
+            "pvalue": None,
+            "pvalue_raw": None,
+            "fit_failed": False,
+        }
         if data is None or len(data) == 0:
             return empty
         try:
@@ -6104,7 +6450,8 @@ class MetricFusionEngine:
                     .reindex(df["polygon_id"].values)
                 )
                 cov_mat = cov_per_poly.to_numpy(dtype=np.float64)
-            # Cross-sectional metrics no longer expose a usable p-value.
+            # In-sample slices carry no p-value (the params were tuned on this
+            # pool); the honest p comes from the held-out test elsewhere.
             wants_pval = False
 
             # Spatial smooth for the partial (adjusted) score; the raw score
@@ -6112,24 +6459,28 @@ class MetricFusionEngine:
             sb = self._spatial_basis_columns(
                 self._whole_data_coords(df), target, cov_mat, composite
             )
+            # Longitudinal keys for the MixedLM branch of the scoring seam
+            # (``None`` in cross-sectional mode, ignored by the OLS scorer).
+            lon_eid, lon_ysb = self._whole_data_longitudinal_keys(df)
 
             def _do(
                 cov: np.ndarray | None, spat: np.ndarray | None
             ) -> tuple[float | None, float | None]:
-                out = objective_scoring.score(
+                out = self._score_greenery(
                     metric,
                     target,
                     composite,
                     covariates=cov,
-                    return_pvalue=wants_pval,
                     spatial_basis=spat,
-                    spatial_method=self.spatial_adjust_method,
-                    residualize_method=self.residualize_method,
+                    entity_id=lon_eid,
+                    years_since_baseline=lon_ysb,
+                    return_pvalue=wants_pval,
+                    nan_on_fail=True,
                 )
                 if wants_pval:
                     s, p = out  # type: ignore[misc]
-                    return float(s), float(p)
-                return float(out), None  # type: ignore[arg-type]
+                    return _finite_or_none(s), _finite_or_none(p)
+                return _finite_or_none(out), None  # type: ignore[arg-type]
 
             partial_s, partial_p = _do(cov_mat, sb)
             raw_s, raw_p = (
@@ -6142,6 +6493,7 @@ class MetricFusionEngine:
                 "score_raw": raw_s,
                 "pvalue": partial_p,
                 "pvalue_raw": raw_p,
+                "fit_failed": partial_s is None,
             }
         except Exception as exc:
             logger.warning(f"_score_data_subset failed: {exc}")
@@ -6193,29 +6545,67 @@ class MetricFusionEngine:
             coords = full[["_cx", "_cy"]].reindex(df.index)
         return coords.to_numpy(dtype=np.float64)
 
+    def _whole_data_longitudinal_keys(
+        self, df: "pd.DataFrame"
+    ) -> "tuple[np.ndarray | None, np.ndarray | None]":
+        """Per-row ``(entity_id, years_since_baseline)`` for a collapsed frame.
+
+        Mirrors :meth:`_whole_data_covariates` for the mixed-effects scorer: reads
+        the longitudinal keys directly from a row-keyed frame, or looks them up by
+        ``polygon_id`` from the train+val+test union for a polygon-collapsed
+        ``apply_fusion`` frame. Returns ``(None, None)`` in cross-sectional mode or
+        when the keys are absent, so the OLS scoring path is unaffected.
+        """
+        if not self.is_longitudinal:
+            return None, None
+        keys = ["entity_id", "years_since_baseline"]
+        if set(keys) <= set(df.columns):
+            return (
+                df["entity_id"].to_numpy(),
+                df["years_since_baseline"].to_numpy(dtype=np.float64),
+            )
+        full = self._full_data_frame()
+        if (
+            full is None
+            or "polygon_id" not in df.columns
+            or not set(keys) <= set(full.columns)
+        ):
+            return None, None
+        lk = (
+            full.groupby("polygon_id", sort=False)[keys]
+            .first()
+            .reindex(df["polygon_id"].values)
+        )
+        return (
+            lk["entity_id"].to_numpy(),
+            lk["years_since_baseline"].to_numpy(dtype=np.float64),
+        )
+
     def _augment_cov_with_spatial(
         self,
         df: "pd.DataFrame",
         target: np.ndarray,
         composite: np.ndarray,
         cov: np.ndarray | None,
-    ) -> np.ndarray | None:
-        """Fold the df-selected spatial smooth into a control matrix for the
-        reporting CIs (bootstrap / permutation), which resample the controls
-        jointly with the rows.
+    ) -> tuple[np.ndarray | None, int]:
+        """Stack the df-selected spatial smooth onto a control matrix.
 
-        Equivalent to KS-AIC for the symmetric metrics (both sides residualize on
-        ``[covariates, smooth]``); a no-op when spatial adjustment is off or the
-        geometry is degenerate.
+        Returns ``(matrix, n_covariate_columns)`` so the caller can split the
+        smooth back out per replicate (see :meth:`_split_control_matrix`) and
+        hand it to the scorer through the same ``spatial_basis`` seam the
+        objective uses. A no-op when spatial adjustment is off or the geometry
+        is degenerate.
         """
+        n_cov_cols = 0 if cov is None else int(np.asarray(cov).shape[1])
         if self.spatial_adjust_method == "none":
-            return cov
+            return cov, n_cov_cols
         sb = self._spatial_basis_columns(
             self._whole_data_coords(df), target, cov, composite
         )
         if sb is None:
-            return cov
-        return sb if cov is None else np.column_stack([cov, sb])
+            return cov, n_cov_cols
+        stacked = sb if cov is None else np.column_stack([cov, sb])
+        return stacked, n_cov_cols
 
     def evaluate_effects(
         self,
@@ -6240,24 +6630,58 @@ class MetricFusionEngine:
         it doesn't support (e.g. longitudinal MixedLM metrics, scored elsewhere).
         """
         if metric not in objective_scoring.SUPPORTED_METRICS:
+            if self.is_longitudinal and metric in mixed_effects_scoring.MIXEDLM_METRICS:
+                return self._evaluate_effects_mixedlm(
+                    params,
+                    metric,
+                    n_bootstrap=n_bootstrap,
+                    ci_level=ci_level,
+                    seed=seed,
+                )
             return {}
         from . import statistical_testing as _stats_mod
 
         higher = metric in objective_scoring.HIGHER_IS_BETTER
 
-        def _score_fn(t_arr, c_arr, cov=None):
-            return objective_scoring.score(metric, t_arr, c_arr, cov)
+        def _make_score_fn(n_cov_cols: int):
+            """Scorer over a resampled ``[covariates | smooth]`` control matrix."""
 
-        def _block(t_arr, c_arr, cov, *, do_perm, sub_seed):
+            def _score_fn(t_arr, c_arr, cov=None):
+                cov_part, sb_part = _helpers.split_control_matrix(cov, n_cov_cols)
+                return objective_scoring.score(
+                    metric,
+                    t_arr,
+                    c_arr,
+                    cov_part,
+                    spatial_basis=sb_part,
+                    spatial_method=self.spatial_adjust_method,
+                    residualize_method=self.residualize_method,
+                    pdcor_cache=self._pdcor_cache,
+                    spline_cache=self._spline_basis_cache,
+                )
+
+            return _score_fn
+
+        # Replicate fast paths for the O(n²) metric: bootstrap replicates
+        # fancy-index precomputed distance matrices; permutation replicates
+        # reuse the fixed prediction/conditioning sides (Freedman–Lane only
+        # varies the surrogate outcome).
+        is_pdcor = metric == "partial_distance_corr"
+        rep_factory = pdcor.pdcor_replicate_scorer_factory if is_pdcor else None
+        sur_factory = pdcor.pdcor_surrogate_scorer_factory if is_pdcor else None
+
+        def _block(t_arr, c_arr, cov, *, do_perm, sub_seed, n_cov_cols=0):
             out = {
                 "score": None,
                 "lower": None,
                 "upper": None,
                 "p_value": None,
+                "p_kind": "permutation" if do_perm else None,
                 "n": None,
             }
             if t_arr is None or c_arr is None or len(t_arr) < 3:
                 return out
+            _score_fn = _make_score_fn(n_cov_cols)
             try:
                 ci = _stats_mod.bootstrap_score_ci(
                     t_arr,
@@ -6268,6 +6692,8 @@ class MetricFusionEngine:
                     method="percentile",
                     seed=int(sub_seed),
                     covariates=cov,
+                    replicate_scorer_factory=rep_factory,
+                    cancel_callback=self._cancel_callback,
                 )
                 out["score"] = ci.get("observed")
                 out["lower"] = ci.get("lower")
@@ -6284,6 +6710,8 @@ class MetricFusionEngine:
                         n_perm=int(n_perm),
                         seed=int(sub_seed) + 7,
                         covariates=cov,
+                        surrogate_scorer_factory=sur_factory,
+                        cancel_callback=self._cancel_callback,
                     )
                     out["p_value"] = perm.get("p_value")
                     if out["score"] is None:
@@ -6299,13 +6727,20 @@ class MetricFusionEngine:
             df_full = self.apply_fusion(weights=dict(params))
             t_all = np.asarray(df_full["target"].values, dtype=np.float64)
             c_all = np.asarray(df_full["composite"].values, dtype=np.float64)
-            cov_all = self._augment_cov_with_spatial(
+            cov_all, n_cov_all = self._augment_cov_with_spatial(
                 df_full, t_all, c_all, self._whole_data_covariates(df_full)
             )
             # Whole-data effect is descriptive only (CI, no permutation p): the
             # params were tuned on most of these rows, so a p-value here would
             # double-dip. The held-out ``test`` block below carries the p-value.
-            results["all"] = _block(t_all, c_all, cov_all, do_perm=False, sub_seed=seed)
+            results["all"] = _block(
+                t_all,
+                c_all,
+                cov_all,
+                do_perm=False,
+                sub_seed=seed,
+                n_cov_cols=n_cov_all,
+            )
         except Exception as exc:
             logger.warning(f"evaluate_effects: whole-data scoring failed: {exc}")
 
@@ -6320,7 +6755,9 @@ class MetricFusionEngine:
                 t_te = None if tg is None else np.asarray(tg, dtype=np.float64)
                 c_te = None if pr is None else np.asarray(pr, dtype=np.float64)
                 cov_te = None if cv is None else np.asarray(cv, dtype=np.float64)
-                # Fold the test smooth into the resampled controls (KS-style).
+                n_cov_te = 0 if cov_te is None else int(cov_te.shape[1])
+                # The smooth rides along so its rows resample with the
+                # observation; ``_block`` splits it back out per replicate.
                 te_sb = tr.get("spatial_basis")
                 if te_sb is not None:
                     te_sb = np.asarray(te_sb, dtype=np.float64)
@@ -6328,7 +6765,12 @@ class MetricFusionEngine:
                         te_sb if cov_te is None else np.column_stack([cov_te, te_sb])
                     )
                 results["test"] = _block(
-                    t_te, c_te, cov_te, do_perm=True, sub_seed=seed + 101
+                    t_te,
+                    c_te,
+                    cov_te,
+                    do_perm=True,
+                    sub_seed=seed + 101,
+                    n_cov_cols=n_cov_te,
                 )
         except Exception as exc:
             logger.warning(f"evaluate_effects: test scoring failed: {exc}")
@@ -6343,16 +6785,332 @@ class MetricFusionEngine:
                 sub = df_full[df_full["polygon_id"].isin(pids)]
                 t_tv = np.asarray(sub["target"].values, dtype=np.float64)
                 c_tv = np.asarray(sub["composite"].values, dtype=np.float64)
-                cov_tv = self._augment_cov_with_spatial(
+                cov_tv, n_cov_tv = self._augment_cov_with_spatial(
                     sub, t_tv, c_tv, self._whole_data_covariates(sub)
                 )
                 results["train_val"] = _block(
-                    t_tv, c_tv, cov_tv, do_perm=False, sub_seed=seed + 202
+                    t_tv,
+                    c_tv,
+                    cov_tv,
+                    do_perm=False,
+                    sub_seed=seed + 202,
+                    n_cov_cols=n_cov_tv,
                 )
         except Exception as exc:
             logger.warning(f"evaluate_effects: train_val scoring failed: {exc}")
 
         return results
+
+    # A MixedLM replicate is a full model refit, not the O(1) recomputation the
+    # OLS metrics bootstrap, so the caller's thousands are clamped to these.
+    # Reporting spends the bulk of a longitudinal run here: the effects cap
+    # applies per metric per slice (|t| and the signed coefficient, over all /
+    # test / train_val), and the test-CI cap once per study including each
+    # standalone. Percentile bounds get lumpier as these fall — at 100
+    # replicates the 2.5% bound sits between the 2nd and 3rd order statistic.
+    _MIXEDLM_REPORT_BOOTSTRAP_CAP = 100
+
+    # Replicate stride between cancel polls in the paired bootstrap. Each
+    # replicate is a MixedLM refit, so a far shorter stride than the array
+    # scorers in ``statistical_testing`` still costs nothing measurable.
+    _PAIRED_CANCEL_POLL_EVERY = 16
+    _MIXEDLM_TEST_CI_BOOTSTRAP_CAP = 150
+
+    def _evaluate_effects_mixedlm(
+        self,
+        params: dict,
+        metric: str,
+        *,
+        n_bootstrap: int,
+        ci_level: float,
+        seed: int,
+    ) -> dict[str, dict]:
+        """Per-subset effects for a longitudinal MixedLM objective.
+
+        Each slice gets a cluster (entity) bootstrap percentile CI; the held-out
+        ``test`` slice also carries the greenery fixed effect's Wald p. There is
+        no permutation analogue here — a Freedman–Lane surrogate would have to be
+        resampled and refit at the entity level, which the cluster bootstrap
+        already covers — so every block is tagged ``p_kind="wald"``.
+        """
+        spec = self.longitudinal_spec
+        assert spec is not None
+        n_boot = max(50, min(int(n_bootstrap), self._MIXEDLM_REPORT_BOOTSTRAP_CAP))
+        signed = "mixedlm_coef"
+
+        def _block(y, g, eid, t, cov, sb, wave, sub_seed) -> dict:
+            def _ci(m):
+                return mixed_effects_scoring.cluster_bootstrap_metric_ci(
+                    m,
+                    y,
+                    g,
+                    eid,
+                    t,
+                    covariates=cov,
+                    include_time_fixed=self._effective_time_fixed(spec),
+                    random_slope=spec.random_slope_time,
+                    spatial_basis=sb,
+                    spatial_method=self.spatial_adjust_method,
+                    n_bootstrap=n_boot,
+                    ci_level=ci_level,
+                    seed=int(sub_seed),
+                    target=spec.association_target,
+                    wave_index=wave,
+                )
+
+            r = _ci(metric)
+            out = {
+                "score": r.get("observed"),
+                "lower": r.get("lower"),
+                "upper": r.get("upper"),
+                "p_value": r.get("pvalue"),
+                "p_kind": "wald",
+                "n": r.get("n"),
+                # Replicates that actually converged. These bounds come from a
+                # capped, modest count, so the reader needs to see it.
+                "n_boot": r.get("n_boot"),
+                "status": r.get("status"),
+            }
+            # |t| is folded, so its interval can never straddle zero. The signed
+            # coefficient's interval is the one that can.
+            if metric == "mixedlm_tstat":
+                rc = _ci(signed)
+                out["signed_score"] = rc.get("observed")
+                out["signed_lower"] = rc.get("lower")
+                out["signed_upper"] = rc.get("upper")
+            return out
+
+        results: dict[str, dict] = {}
+        df_full = None
+        try:
+            df_full = self.apply_fusion(weights=dict(params))
+            t_all = np.asarray(df_full["target"].values, dtype=np.float64)
+            c_all = np.asarray(df_full["composite"].values, dtype=np.float64)
+            eid, ysb = self._whole_data_longitudinal_keys(df_full)
+            if eid is not None:
+                cov_all, n_cov = self._augment_cov_with_spatial(
+                    df_full, t_all, c_all, self._whole_data_covariates(df_full)
+                )
+                cov_part, sb_part = _helpers.split_control_matrix(cov_all, n_cov)
+                results["all"] = _block(
+                    t_all,
+                    c_all,
+                    eid,
+                    ysb,
+                    cov_part,
+                    sb_part,
+                    self._wave_labels_for_scoring(df_full),
+                    seed,
+                )
+        except Exception as exc:
+            logger.warning(f"evaluate_effects: whole-data scoring failed: {exc}")
+
+        try:
+            if self.test_data is not None and len(self.test_data) > 0:
+                tr = self.evaluate_on_test(
+                    params=dict(params), metric=metric, return_predictions=True
+                )
+                if tr.get("entity_id") is not None:
+                    results["test"] = _block(
+                        np.asarray(tr.get("targets"), dtype=np.float64),
+                        np.asarray(tr.get("predictions"), dtype=np.float64),
+                        tr.get("entity_id"),
+                        tr.get("years_since_baseline"),
+                        tr.get("covariates"),
+                        tr.get("spatial_basis"),
+                        self._wave_labels_for_scoring_array(tr.get("wave")),
+                        seed + 101,
+                    )
+        except Exception as exc:
+            logger.warning(f"evaluate_effects: test scoring failed: {exc}")
+
+        try:
+            if (
+                self.train_val_data is not None
+                and df_full is not None
+                and "polygon_id" in df_full.columns
+            ):
+                pids = set(self.train_val_data["polygon_id"].unique().tolist())
+                sub = df_full[df_full["polygon_id"].isin(pids)]
+                eid, ysb = self._whole_data_longitudinal_keys(sub)
+                if eid is not None:
+                    t_tv = np.asarray(sub["target"].values, dtype=np.float64)
+                    c_tv = np.asarray(sub["composite"].values, dtype=np.float64)
+                    cov_tv, n_cov = self._augment_cov_with_spatial(
+                        sub, t_tv, c_tv, self._whole_data_covariates(sub)
+                    )
+                    cov_part, sb_part = _helpers.split_control_matrix(cov_tv, n_cov)
+                    results["train_val"] = _block(
+                        t_tv,
+                        c_tv,
+                        eid,
+                        ysb,
+                        cov_part,
+                        sb_part,
+                        self._wave_labels_for_scoring(sub),
+                        seed + 202,
+                    )
+        except Exception as exc:
+            logger.warning(f"evaluate_effects: train_val scoring failed: {exc}")
+
+        return results
+
+    def _paired_difference_mixedlm(
+        self,
+        cgi_params: dict,
+        standalone_params: dict,
+        standalone_channel: str,
+        metric: str,
+        *,
+        n_bootstrap: int,
+        ci_level: float,
+        seed: int,
+    ) -> dict | None:
+        """Whole-data paired difference for a MixedLM objective.
+
+        Resamples **whole entities** and refits both mixed models on each
+        resample. A row bootstrap would break the within-entity correlation the
+        panel model exists to represent.
+        """
+        spec = self.longitudinal_spec
+        assert spec is not None
+        prev_ch = self._active_greenery_channel
+        try:
+            self._active_greenery_channel = "cgi"
+            df_cgi = self.apply_fusion(weights=dict(cgi_params))
+            self._active_greenery_channel = standalone_channel
+            df_std = self.apply_fusion(weights=dict(standalone_params))
+        except Exception as exc:
+            logger.warning(f"paired difference: composite build failed: {exc}")
+            return None
+        finally:
+            self._active_greenery_channel = prev_ch
+
+        if "polygon_id" not in df_cgi.columns or "polygon_id" not in df_std.columns:
+            logger.warning(
+                f"paired difference ({standalone_channel}): composites are not "
+                "entity-keyed, so CGI and the standalone cannot be paired."
+            )
+            return None
+        merged = df_cgi[["polygon_id", "target", "composite"]].merge(
+            df_std[["polygon_id", "composite"]],
+            on="polygon_id",
+            suffixes=("_cgi", "_std"),
+        )
+        eid, ysb = self._whole_data_longitudinal_keys(merged)
+        if eid is None:
+            logger.warning(
+                f"paired difference ({standalone_channel}): no longitudinal keys "
+                "on the merged frame."
+            )
+            return None
+        wave = self._wave_labels_for_scoring(merged)
+        cov = self._whole_data_covariates(merged)
+        y = merged["target"].to_numpy(dtype=np.float64)
+        g_cgi = merged["composite_cgi"].to_numpy(dtype=np.float64)
+        g_std = merged["composite_std"].to_numpy(dtype=np.float64)
+
+        def _score(yy, gg, ee, tt, cc, wv) -> float:
+            return float(
+                mixed_effects_scoring.score_mixedlm(
+                    metric,
+                    yy,
+                    gg,
+                    ee,
+                    tt,
+                    covariates=cc,
+                    include_time_fixed=self._effective_time_fixed(spec),
+                    random_slope=spec.random_slope_time,
+                    target=spec.association_target,
+                    wave_index=wv,
+                    nan_on_fail=True,
+                )
+            )
+
+        obs_cgi = _score(y, g_cgi, eid, ysb, cov, wave)
+        obs_std = _score(y, g_std, eid, ysb, cov, wave)
+        if not (np.isfinite(obs_cgi) and np.isfinite(obs_std)):
+            which = ", ".join(
+                nm
+                for nm, v in (("CGI", obs_cgi), (standalone_channel, obs_std))
+                if not np.isfinite(v)
+            )
+            logger.warning(
+                f"paired difference ({standalone_channel}): the whole-data mixed "
+                f"model did not fit for {which}, so there is no difference to "
+                "bootstrap."
+            )
+            return None
+        obs_diff = obs_cgi - obs_std  # every mixedlm_* metric is higher-is-better
+
+        uniq, inv = np.unique(eid, return_inverse=True)
+        if len(uniq) < 2:
+            logger.warning(
+                f"paired difference ({standalone_channel}): fewer than two "
+                "entities to resample."
+            )
+            return None
+        group_rows = [np.where(inv == k)[0] for k in range(len(uniq))]
+        rng = np.random.default_rng(int(seed))
+        n_boot = max(50, min(int(n_bootstrap), self._MIXEDLM_REPORT_BOOTSTRAP_CAP))
+        diffs = np.empty(n_boot, dtype=np.float64)
+        for i in range(n_boot):
+            if (
+                self._cancel_callback is not None
+                and i % self._PAIRED_CANCEL_POLL_EVERY == 0
+                and self._cancel_callback()
+            ):
+                raise JobCancelled("Paired bootstrap cancelled by user.")
+            draw = rng.integers(0, len(uniq), size=len(uniq))
+            idx = np.concatenate([group_rows[k] for k in draw])
+            # A repeated entity has to form independent groups.
+            new_eid = np.concatenate(
+                [
+                    np.full(len(group_rows[k]), slot, dtype=np.int64)
+                    for slot, k in enumerate(draw)
+                ]
+            )
+            try:
+                sc = _score(
+                    y[idx],
+                    g_cgi[idx],
+                    new_eid,
+                    ysb[idx],
+                    None if cov is None else cov[idx],
+                    None if wave is None else wave[idx],
+                )
+                ss = _score(
+                    y[idx],
+                    g_std[idx],
+                    new_eid,
+                    ysb[idx],
+                    None if cov is None else cov[idx],
+                    None if wave is None else wave[idx],
+                )
+                diffs[i] = sc - ss
+            except Exception:
+                diffs[i] = np.nan
+
+        valid = diffs[np.isfinite(diffs)]
+        if len(valid) == 0:
+            logger.warning(
+                f"paired difference ({standalone_channel}): no bootstrap replicate "
+                f"fit ({n_boot} attempted), so the interval has no support."
+            )
+            return None
+        alpha = (1.0 - ci_level) / 2.0
+        return {
+            "observed_diff": float(obs_diff),
+            "lower": float(np.quantile(valid, alpha)),
+            "upper": float(np.quantile(valid, 1.0 - alpha)),
+            "p_value": float((np.sum(valid <= 0.0) + 1) / (len(valid) + 1)),
+            "cgi_score": float(obs_cgi),
+            "standalone_score": float(obs_std),
+            "standalone_channel": standalone_channel,
+            "n": int(len(y)),
+            "n_boot": int(len(valid)),
+            "favors_cgi": bool(obs_diff > 0),
+        }
 
     def paired_objective_difference(
         self,
@@ -6379,6 +7137,16 @@ class MetricFusionEngine:
         with difference ≤ 0).
         """
         if metric not in objective_scoring.SUPPORTED_METRICS:
+            if self.is_longitudinal and metric in mixed_effects_scoring.MIXEDLM_METRICS:
+                return self._paired_difference_mixedlm(
+                    cgi_params,
+                    standalone_params,
+                    standalone_channel,
+                    metric,
+                    n_bootstrap=n_bootstrap,
+                    ci_level=ci_level,
+                    seed=seed,
+                )
             return None
         prev_ch = self._active_greenery_channel
         try:
@@ -6414,12 +7182,26 @@ class MetricFusionEngine:
             target = merged["target"].to_numpy(dtype=np.float64)
             cgi_c = merged["composite_cgi"].to_numpy(dtype=np.float64)
             std_c = merged["composite_std"].to_numpy(dtype=np.float64)
-            # Both composites share the same outcome-selected smooth; fold it into
-            # the resampled controls so the paired difference is spatially adjusted.
-            cov = self._augment_cov_with_spatial(merged, target, cgi_c, cov)
+            # Both composites share the same outcome-selected smooth; it rides in
+            # the resampled controls and is split back out per replicate so the
+            # paired difference is adjusted exactly as the objective was.
+            cov, n_cov_cols = self._augment_cov_with_spatial(merged, target, cgi_c, cov)
         except Exception as exc:
             logger.warning(f"paired_objective_difference: alignment failed: {exc}")
             return None
+
+        # Drop non-finite rows up front. ``score`` would mask them per call
+        # anyway, and doing it here keeps the shared-distance-matrix replicate
+        # path (which cannot mask per composite) available for the whole loop.
+        finite = np.isfinite(target) & np.isfinite(cgi_c) & np.isfinite(std_c)
+        if cov is not None:
+            finite &= np.isfinite(cov).all(axis=1)
+        if not finite.all():
+            target = target[finite]
+            cgi_c = cgi_c[finite]
+            std_c = std_c[finite]
+            if cov is not None:
+                cov = cov[finite]
 
         if len(target) < 3:
             return None
@@ -6428,21 +7210,47 @@ class MetricFusionEngine:
         sign = 1.0 if higher else -1.0
 
         def _score(t_arr, c_arr, cov_arr):
-            return float(objective_scoring.score(metric, t_arr, c_arr, cov_arr))
+            cov_part, sb_part = _helpers.split_control_matrix(cov_arr, n_cov_cols)
+            return float(
+                objective_scoring.score(
+                    metric,
+                    t_arr,
+                    c_arr,
+                    cov_part,
+                    spatial_basis=sb_part,
+                    spatial_method=self.spatial_adjust_method,
+                    residualize_method=self.residualize_method,
+                    pdcor_cache=self._pdcor_cache,
+                    spline_cache=self._spline_basis_cache,
+                )
+            )
 
         obs_cgi = _score(target, cgi_c, cov)
         obs_std = _score(target, std_c, cov)
         obs_diff = sign * (obs_cgi - obs_std)
+
+        # Replicate fast path for the O(n²) metric: both composites are scored
+        # on the same resample, so the target / conditioning distance matrices
+        # are precomputed once and shared. Requires fully finite inputs (the
+        # generic path masks NaN rows inside score(), which an index-vector
+        # scorer cannot reproduce per composite).
+        fast_pair = None
+        if metric == "partial_distance_corr" and cov is not None:
+            fast_pair = pdcor.pdcor_paired_replicate_scorers(target, cgi_c, std_c, cov)
 
         rng = np.random.default_rng(int(seed))
         n = len(target)
         diffs = np.empty(int(n_bootstrap), dtype=np.float64)
         for i in range(int(n_bootstrap)):
             idx = rng.integers(0, n, size=n)
-            cov_i = None if cov is None else cov[idx]
             try:
-                sc = _score(target[idx], cgi_c[idx], cov_i)
-                ss = _score(target[idx], std_c[idx], cov_i)
+                if fast_pair is not None:
+                    sc = fast_pair[0](idx)
+                    ss = fast_pair[1](idx)
+                else:
+                    cov_i = None if cov is None else cov[idx]
+                    sc = _score(target[idx], cgi_c[idx], cov_i)
+                    ss = _score(target[idx], std_c[idx], cov_i)
                 diffs[i] = sign * (sc - ss)
             except Exception:
                 diffs[i] = np.nan
@@ -6540,7 +7348,7 @@ class MetricFusionEngine:
             "n": train_val_n,
         }
 
-        # ── test: fresh evaluate_on_test with these params ────────────
+        # ── test: fresh evaluate_on_test with these params ──
         # ``evaluate_on_test`` returns the partial (covariate-adjusted)
         # score that the optimizer optimized; the raw equivalent is
         # produced by ``_score_data_subset`` on the test slice.
@@ -6554,17 +7362,21 @@ class MetricFusionEngine:
             test_both = self._score_data_subset(
                 data=self.test_data, params=params, metric=metric
             )
+            # ``evaluate_on_test`` fails soft to the metric's degenerate value,
+            # which for a mixed model is a 0.0 indistinguishable from a real
+            # null. The nan-on-fail rescore of the same slice says which it is.
+            fit_failed = bool(test_both.get("fit_failed"))
             out["test"] = {
                 "score": (
-                    float(test_result["test_score"])
-                    if test_result.get("test_score") is not None
-                    else None
+                    None
+                    if fit_failed
+                    else _finite_or_none(test_result.get("test_score"))
                 ),
                 "score_raw": test_both.get("score_raw"),
                 "pvalue": (
-                    float(test_result["test_pvalue"])
-                    if test_result.get("test_pvalue") is not None
-                    else None
+                    None
+                    if fit_failed
+                    else _finite_or_none(test_result.get("test_pvalue"))
                 ),
                 "pvalue_raw": test_both.get("pvalue_raw"),
                 "n": test_n,
@@ -6579,7 +7391,7 @@ class MetricFusionEngine:
                 "n": None,
             }
 
-        # ── all: composite on every entity (full dataset) ─────────────
+        # ── all: composite on every entity (full dataset) ───
         try:
             df = self.apply_fusion(weights=dict(params))
             target = np.asarray(df["target"].values, dtype=np.float64)
@@ -6587,37 +7399,41 @@ class MetricFusionEngine:
             cov: np.ndarray | None = None
             cov_cols = self.covariate_columns
             if cov_cols and "polygon_id" in df.columns:
-                full = pd.concat([self.train_val_data, self.test_data])
+                full = self._full_data_frame()
                 cov_per_poly = (
                     full.groupby("polygon_id", sort=False)[cov_cols]
                     .first()
                     .reindex(df["polygon_id"].values)
                 )
                 cov = cov_per_poly.to_numpy(dtype=np.float64)
-            # Cross-sectional metrics no longer expose a usable p-value.
+            # In-sample slice carries no p-value; the held-out test does.
             wants_pval = False
 
             sb = self._spatial_basis_columns(
                 self._whole_data_coords(df), target, cov, composite
             )
+            # Longitudinal keys for the MixedLM branch of the scoring seam
+            # (``None`` in cross-sectional mode, ignored by the OLS scorer).
+            lon_eid, lon_ysb = self._whole_data_longitudinal_keys(df)
 
             def _full_score(
                 c: np.ndarray | None, spat: np.ndarray | None
             ) -> tuple[float | None, float | None]:
-                s_out = objective_scoring.score(
+                s_out = self._score_greenery(
                     metric,
                     target,
                     composite,
                     covariates=c,
-                    return_pvalue=wants_pval,
                     spatial_basis=spat,
-                    spatial_method=self.spatial_adjust_method,
-                    residualize_method=self.residualize_method,
+                    entity_id=lon_eid,
+                    years_since_baseline=lon_ysb,
+                    return_pvalue=wants_pval,
+                    nan_on_fail=True,
                 )
                 if wants_pval:
                     s, p = s_out  # type: ignore[misc]
-                    return float(s), float(p)
-                return float(s_out), None  # type: ignore[arg-type]
+                    return _finite_or_none(s), _finite_or_none(p)
+                return _finite_or_none(s_out), None  # type: ignore[arg-type]
 
             partial_s, partial_p = _full_score(cov, sb)
             raw_s, raw_p = (
@@ -6684,12 +7500,60 @@ class MetricFusionEngine:
             else:
                 cov_mat = full[cov_cols].to_numpy(dtype=np.float64)
 
+            # Longitudinal keys aligned to the collapsed frame, so the
+            # mixed-effects branch below can fit a panel model instead of OLS.
+            lon_entity_id = lon_ysb = None
+            if self.is_longitudinal:
+                if "polygon_id" in df.columns:
+                    lon_keys = (
+                        full.groupby("polygon_id", sort=False)[
+                            ["entity_id", "years_since_baseline"]
+                        ]
+                        .first()
+                        .reindex(df["polygon_id"].values)
+                    )
+                    lon_entity_id = lon_keys["entity_id"].to_numpy()
+                    lon_ysb = lon_keys["years_since_baseline"].to_numpy(
+                        dtype=np.float64
+                    )
+                elif {"entity_id", "years_since_baseline"} <= set(df.columns):
+                    lon_entity_id = df["entity_id"].to_numpy()
+                    lon_ysb = df["years_since_baseline"].to_numpy(dtype=np.float64)
+
             mask = ~(
                 np.isnan(target) | np.isnan(composite) | np.isnan(cov_mat).any(axis=1)
             )
             target = target[mask]
             composite = composite[mask]
             cov_mat = cov_mat[mask]
+            if lon_entity_id is not None:
+                lon_entity_id = lon_entity_id[mask]
+                lon_ysb = lon_ysb[mask]
+
+            # Panel data: OLS standard errors are anticonservative because the
+            # (entity, wave) rows are correlated within entity. Fit the same
+            # mixed model the scorer uses so the covariate table's coefficients
+            # and Wald p-values account for the random effects.
+            if (
+                self.is_longitudinal
+                and metric in mixed_effects_scoring.MIXEDLM_METRICS
+                and lon_entity_id is not None
+            ):
+                spec = self.longitudinal_spec
+                assert spec is not None
+                # Names cover the user's covariates only; the period / area
+                # indicators trailing them stay unnamed controls.
+                return mixed_effects_scoring.covariate_impact_mixedlm(
+                    target,
+                    composite,
+                    lon_entity_id,
+                    lon_ysb,
+                    cov_mat,
+                    [c for c in cov_cols if c in set(self._user_covariate_columns)],
+                    include_time_fixed=self._effective_time_fixed(spec),
+                    random_slope=spec.random_slope_time,
+                )
+
             if target.size < len(cov_cols) + 3:
                 return None
 
@@ -6775,13 +7639,371 @@ class MetricFusionEngine:
             logger.warning(f"compute_covariate_impact failed: {exc}")
             return None
 
+    def compute_decline_terms(self, params: dict) -> dict | None:
+        """Greenery × time decline terms on the winning composite (longitudinal).
+
+        Reports the overall greenery × time slope and, per the spec's decline
+        knobs, the between-person (average-exposure) and within-person
+        (exposure-change) slopes. ``None`` for cross-sectional runs, a non-MixedLM
+        scoring metric, or when the mixed model cannot be fit.
+        """
+        if not self.is_longitudinal:
+            return None
+        spec = self.longitudinal_spec
+        assert spec is not None
+        if spec.scoring_metric not in mixed_effects_scoring.MIXEDLM_METRICS:
+            return None
+        try:
+            df = self.apply_fusion(weights=dict(params))
+            target = np.asarray(df["target"].values, dtype=np.float64)
+            composite = np.asarray(df["composite"].values, dtype=np.float64)
+            eid, ysb = self._whole_data_longitudinal_keys(df)
+            if eid is None:
+                return None
+            cov_cols = list(self.covariate_columns or [])
+            cov = None
+            if cov_cols:
+                full = self._full_data_frame()
+                if full is not None and "polygon_id" in df.columns:
+                    cov = (
+                        full.groupby("polygon_id", sort=False)[cov_cols]
+                        .first()
+                        .reindex(df["polygon_id"].values)
+                        .to_numpy(dtype=np.float64)
+                    )
+                elif set(cov_cols) <= set(df.columns):
+                    cov = df[cov_cols].to_numpy(dtype=np.float64)
+            out = mixed_effects_scoring.decline_terms_mixedlm(
+                target,
+                composite,
+                eid,
+                ysb,
+                cov,
+                random_slope=spec.random_slope_time,
+                want_between=bool(spec.decline_average_exposure),
+                want_within=bool(spec.decline_exposure_change),
+            )
+            if out is None:
+                return None
+
+            # ── Period-confounding checks ───────────────
+            # A greenery × time slope is only about greenery if it survives an
+            # exposure with no spatial content. The placebo holds each wave's
+            # mean exposure, so it carries the period structure and nothing else.
+            wave = self._whole_data_wave_labels(df)
+            out["period_diagnostic"] = mixed_effects_scoring.period_confounding_report(
+                composite, eid, ysb, wave_index=wave
+            )
+            if wave is not None:
+                placebo = mixed_effects_scoring.decline_terms_mixedlm(
+                    target,
+                    mixed_effects_scoring.placebo_exposure(composite, wave),
+                    eid,
+                    ysb,
+                    cov,
+                    random_slope=spec.random_slope_time,
+                    want_between=bool(spec.decline_average_exposure),
+                    want_within=bool(spec.decline_exposure_change),
+                )
+                out["placebo_terms"] = (placebo or {}).get("terms") or []
+            return out
+        except Exception as exc:
+            logger.warning(f"compute_decline_terms failed: {exc}")
+            return None
+
+    def compute_exposure_response(
+        self, params: dict, *, iqr: float | None = None
+    ) -> dict | None:
+        """Per-IQR effect, quartile contrasts and a spline non-linearity test.
+
+        Run once on the winning composite, this is the shape the greenspace
+        literature reports its findings in: an effect per interquartile-range
+        increase, a gradient across exposure quartiles against the lowest, and a
+        test of whether the straight line the search optimised is the right
+        functional form.
+
+        The fitter matches the study design — logistic (or GEE logistic on a
+        panel) for a binary outcome, OLS or MixedLM otherwise — so the standard
+        errors in these tables are the same kind as the headline estimate's.
+        Pass ``iqr`` to pin the scaling constant, e.g.
+        ``exposure_response.CLSA_NDVI_IQR`` when the point is to land on a
+        published NDVI number.
+        """
+        try:
+            df = self.apply_fusion(weights=dict(params))
+            target = np.asarray(df["target"].values, dtype=np.float64)
+            composite = np.asarray(df["composite"].values, dtype=np.float64)
+            cov = self._reporting_covariate_matrix(df)
+
+            entity_id = None
+            if self.is_longitudinal:
+                entity_id, _ysb = self._whole_data_longitudinal_keys(df)
+
+            keep = self._finite_rows(target, composite, cov)
+            if keep is not None and not keep.all():
+                if int(keep.sum()) < 10:
+                    _log("WARN", "Exposure-response: too few complete rows to fit.")
+                    return None
+                _log(
+                    "INFO",
+                    f"Exposure-response: dropped {int((~keep).sum())} row(s) with a "
+                    "missing outcome, composite or covariate.",
+                )
+                target, composite = target[keep], composite[keep]
+                cov = None if cov is None else cov[keep]
+                entity_id = None if entity_id is None else entity_id[keep]
+
+            binary = binary_longitudinal.is_binary(target)
+            coding = binary_longitudinal.describe_coding(target) if binary else None
+            if coding and coding["suspicious"]:
+                _log(
+                    "WARN",
+                    f"Binary outcome is coded "
+                    f"{{{coding['reference_level']:g}, {coding['modelled_level']:g}}}, "
+                    f"not {{0, 1}}. The logistic models treat "
+                    f"{coding['modelled_level']:g} as the event — confirm that is "
+                    "the affirmative level, or every odds ratio is inverted.",
+                )
+            if binary and entity_id is not None:
+                fitter = binary_longitudinal.make_gee_logit_fitter(target, entity_id)
+                design = "gee_logit"
+            elif binary:
+                fitter = binary_longitudinal.make_logit_fitter(target)
+                design = "logit"
+            else:
+                fitter = exposure_response.make_ols_fitter(target)
+                design = "ols"
+
+            # Headline per-unit effect, from the same model family, so the
+            # per-IQR rescale below is a change of units and nothing else.
+            base_cols = [np.ones(len(target)), composite]
+            base_names = ["intercept", "greenery"]
+            if cov is not None and cov.size:
+                for j in range(cov.shape[1]):
+                    base_cols.append(cov[:, j])
+                    base_names.append(f"cov{j}")
+            fitted = fitter(np.column_stack(base_cols), base_names)
+            per_iqr = None
+            if fitted is not None:
+                coef, se, _p = fitted["greenery"]
+                per_iqr = exposure_response.iqr_scaled_effect(
+                    coef, se, composite, iqr=iqr, logistic=binary
+                )
+
+            return {
+                "design": design,
+                "binary_outcome": bool(binary),
+                "coding": coding,
+                "per_iqr": per_iqr,
+                "quartiles": exposure_response.quartile_terms(
+                    composite, fitter, cov, logistic=binary
+                ),
+                "nonlinearity": exposure_response.spline_nonlinearity_test(
+                    composite, fitter, cov
+                ),
+            }
+        except Exception as exc:
+            logger.warning(f"compute_exposure_response failed: {exc}")
+            return None
+
+    def compute_moderation(
+        self, params: dict, moderator_columns: "list[str] | None"
+    ) -> list[dict]:
+        """Effect modification of the greenery association, one entry per moderator.
+
+        Fits ``outcome ~ greenery + M + greenery x M + covariates`` on the
+        winning composite and reports the interaction test plus the greenery
+        slope at each level of ``M`` — the analysis the greenspace papers run
+        when they claim an effect differs by sex, income or social standing.
+
+        The moderator is removed from the covariate matrix first: the model
+        enters its main effect explicitly, so leaving it in the controls too
+        would make the design collinear. Categorical moderators are detected
+        from ``covariate_types``, falling back to a distinct-value count.
+        """
+        moderators = [m for m in (moderator_columns or []) if m]
+        if not moderators:
+            return []
+        out: list[dict] = []
+        try:
+            df = self.apply_fusion(weights=dict(params))
+            target = np.asarray(df["target"].values, dtype=np.float64)
+            composite = np.asarray(df["composite"].values, dtype=np.float64)
+            entity_id = None
+            if self.is_longitudinal:
+                entity_id, _ysb = self._whole_data_longitudinal_keys(df)
+
+            binary = binary_longitudinal.is_binary(target)
+
+            def _fitter_for(y, ent):
+                if binary and ent is not None:
+                    return binary_longitudinal.make_gee_logit_fitter(y, ent)
+                if binary:
+                    return binary_longitudinal.make_logit_fitter(y)
+                return exposure_response.make_ols_fitter(y)
+
+            for name in moderators:
+                values = self._reporting_raw_column(df, name)
+                if values is None:
+                    _log("WARN", f"Moderator '{name}' not found; skipping.")
+                    continue
+                cov = self._reporting_covariate_matrix(df, exclude=[name])
+                # Per moderator, not once up front: a row missing this
+                # moderator says nothing about the next one, and dropping it
+                # from every analysis would throw away usable data.
+                keep = self._finite_rows(target, composite, values, cov)
+                y_m, comp_m, val_m, cov_m, ent_m = (
+                    target,
+                    composite,
+                    values,
+                    cov,
+                    entity_id,
+                )
+                if keep is not None and not keep.all():
+                    if int(keep.sum()) < 10:
+                        _log(
+                            "WARN",
+                            f"Moderator '{name}': too few complete rows; skipping.",
+                        )
+                        continue
+                    y_m, comp_m, val_m = target[keep], composite[keep], values[keep]
+                    cov_m = None if cov is None else cov[keep]
+                    ent_m = None if entity_id is None else entity_id[keep]
+                declared = self.covariate_types.get(name)
+                n_levels = int(np.unique(val_m).size)
+                categorical = declared == "categorical" if declared else n_levels <= 12
+                result = exposure_response.moderation_terms(
+                    comp_m,
+                    val_m,
+                    _fitter_for(y_m, ent_m),
+                    cov_m,
+                    categorical=categorical,
+                    logistic=binary,
+                    moderator_name=name,
+                )
+                if result is None:
+                    _log(
+                        "WARN",
+                        f"Moderation analysis for '{name}' could not be fit "
+                        "(too few rows, or a moderator with one level).",
+                    )
+                    continue
+                out.append(result)
+        except Exception as exc:
+            logger.warning(f"compute_moderation failed: {exc}")
+        return out
+
+    def _reporting_raw_column(self, df: "pd.DataFrame", name: str):
+        """One un-expanded attribute column aligned to an ``apply_fusion`` frame."""
+        full = self._full_data_frame()
+        if full is not None and "polygon_id" in df.columns and name in full.columns:
+            series = (
+                full.groupby("polygon_id", sort=False)[name]
+                .first()
+                .reindex(df["polygon_id"].values)
+            )
+            return pd.to_numeric(series, errors="coerce").to_numpy(dtype=np.float64)
+        if name in df.columns:
+            return pd.to_numeric(df[name], errors="coerce").to_numpy(dtype=np.float64)
+        return None
+
+    @staticmethod
+    def _finite_rows(*arrays) -> "np.ndarray | None":
+        """Row mask where every supplied array is finite.
+
+        The reporting matrices are aligned by reindexing on ``polygon_id``, so
+        a key the fusion frame carries but the attribute table does not yields
+        an all-NaN row. LAPACK takes the norm of the whole design before it
+        factorises, so one such row makes that norm NaN and the least-squares
+        driver rejects it outright — with a message printed from Fortran that
+        never reaches the Python log. Dropping the rows here keeps the
+        reporting fits complete-case, which is what the objective already does.
+        """
+        mask = None
+        for arr in arrays:
+            if arr is None:
+                continue
+            a = np.asarray(arr, dtype=np.float64)
+            if a.size == 0:
+                continue
+            ok = np.isfinite(a) if a.ndim == 1 else np.isfinite(a).all(axis=1)
+            mask = ok if mask is None else (mask & ok)
+        return mask
+
+    def _reporting_covariate_matrix(
+        self, df: "pd.DataFrame", exclude: "list[str] | None" = None
+    ):
+        """Covariate matrix aligned to an ``apply_fusion`` frame, or ``None``.
+
+        Shared by the decline-term, exposure-response and moderation reports so
+        all three condition on exactly the same controls the objective did.
+
+        ``exclude`` drops columns by their **user-facing** name, taking their
+        dummy expansions with them — used by the moderation report, which
+        enters the moderator's main effect itself and would otherwise hand the
+        fitter the same information twice.
+        """
+        cov_cols = list(self.covariate_columns or [])
+        for name in exclude or []:
+            drop = set(self._covariate_dummy_map.get(name, [])) | {name}
+            cov_cols = [c for c in cov_cols if c not in drop]
+        if not cov_cols:
+            return None
+        full = self._full_data_frame()
+        if full is not None and "polygon_id" in df.columns:
+            return (
+                full.groupby("polygon_id", sort=False)[cov_cols]
+                .first()
+                .reindex(df["polygon_id"].values)
+                .to_numpy(dtype=np.float64)
+            )
+        if set(cov_cols) <= set(df.columns):
+            return df[cov_cols].to_numpy(dtype=np.float64)
+        return None
+
+    def _wave_labels_for_scoring(self, df: "pd.DataFrame") -> "np.ndarray | None":
+        """Wave labels to hand the mixed-effects scorer as period fixed effects.
+
+        ``None`` once :meth:`_expand_period_controls` has folded the wave
+        indicators into ``covariate_columns``: every control matrix built from
+        those columns already carries them, and the scorer one-hots
+        ``wave_index`` into the *same* drop-first indicators, so passing both
+        makes the fixed-effects design exactly singular and the fit fails.
+        """
+        if self._wave_control_columns:
+            return None
+        return self._whole_data_wave_labels(df)
+
+    def _wave_labels_for_scoring_array(
+        self, wave: "np.ndarray | None"
+    ) -> "np.ndarray | None":
+        """:meth:`_wave_labels_for_scoring` for labels already in hand."""
+        return None if self._wave_control_columns else wave
+
+    def _whole_data_wave_labels(self, df: "pd.DataFrame") -> "np.ndarray | None":
+        """Per-row wave label for a collapsed frame, or ``None`` when absent."""
+        if not self.is_longitudinal:
+            return None
+        if "wave" in df.columns:
+            return df["wave"].to_numpy()
+        full = self._full_data_frame()
+        if full is None or "polygon_id" not in df.columns or "wave" not in full.columns:
+            return None
+        return (
+            full.groupby("polygon_id", sort=False)["wave"]
+            .first()
+            .reindex(df["polygon_id"].values)
+            .to_numpy()
+        )
+
     def bootstrap_stability_selection(
         self,
         metric: str,
         *,
         n_bootstraps: int = 20,
         n_trials_per_bootstrap: int = 50,
-        weight_bin_pct: int = 10,
+        weight_bin_pct: int = cgi_formulas.WEIGHT_BIN_PCT,
+        weight_refine_bin_pct: int | None = None,
         top_percent_per_bootstrap: float = 0.2,
         min_cell_count: int = 3,
         worst_quantile: float = 0.10,
@@ -6848,17 +8070,27 @@ class MetricFusionEngine:
                 count of complementary pairs). 20–50 typical.
             n_trials_per_bootstrap: QMC trials inside each subsample.
                 30–100 typical.
-            weight_bin_pct: Cell width for weight binning. 10 % bins yield
-                ~78 valid simplex cells for the weighted-average formula.
+            weight_bin_pct: Cell width for the first stage's weight binning.
+                20 % gives 21 cells for the weighted-average formula and 56 for
+                synergy; 10 % gives 66 and 286, which is fine enough that
+                selection frequency splits across near-identical neighbours and
+                nothing is ever declared stable.
+            weight_refine_bin_pct: Cell width for the third stage, which re-bins
+                the winning radius sub-cell's trials to pick a narrower weight
+                mix. ``None`` uses ``cgi_formulas.WEIGHT_REFINE_BIN_PCT``; a
+                value at or above ``weight_bin_pct`` disables the stage and
+                averages the coarse cell as before.
             top_percent_per_bootstrap: Fraction of each bootstrap's trials
                 considered "selected" for the selection-probability sidecar.
             min_cell_count: A cell is eligible only when at least this many
                 trials landed in it across all bootstraps. Prevents a
-                single-trial outlier cell from claiming "best".
+                single-trial outlier cell from claiming "best". Also gates the
+                refinement stage.
             worst_quantile: 0.10 → 10th percentile worst-case score for
                 higher-is-better metrics; 90th percentile for lower-is-
-                better. Tighter (e.g. 0.05) penalises rare-bad-luck cells
-                harder; looser (e.g. 0.25) tolerates more bad-luck draws.
+                better. Reported on every cell as a robustness read; the
+                **median** is what ranks them, since the question is typical
+                held-out performance rather than worst-case.
             max_pfer: Upper bound on the (approximate) per-family error rate
                 the calibration is allowed to accept. Configs whose PFER bound
                 ``K² / ((2π−1)·N)`` exceeds this are excluded, capping the
@@ -6984,12 +8216,17 @@ class MetricFusionEngine:
         # stays flat regardless of B / N_per_BS choice.
         self._clear_ring_caches()
 
-        # Group → rows once, so each bootstrap's in-bag materialisation is a
-        # dict lookup + concat instead of an O(G·N) boolean scan per group.
+        # Group → row positions once, so each bootstrap's in-bag materialisation
+        # is a lookup + one positional take instead of an O(G·N) boolean scan
+        # per group. Positions rather than row copies: the pool is stored once.
         group_rows: dict = {}
         if use_groups:
-            for g, sub in train_val.groupby(group_col, sort=False):
-                group_rows[g] = sub
+            _keys = train_val[group_col].to_numpy()
+            _uniq, _inverse = np.unique(_keys, return_inverse=True)
+            _order = np.argsort(_inverse, kind="stable")
+            _bounds = np.searchsorted(_inverse[_order], np.arange(len(_uniq) + 1))
+            for _i, _g in enumerate(_uniq):
+                group_rows[_g] = _order[_bounds[_i] : _bounds[_i + 1]]
 
         records: list[dict] = []  # one entry per completed trial across all bootstraps
         per_bootstrap_top_cells: list[set] = []  # selection-probability sidecar
@@ -7010,16 +8247,19 @@ class MetricFusionEngine:
             "trials_seed_excluded": 0,
             "trials_kept": 0,
         }
+        # Search cost, accumulated across the sequential bootstrap loop so the
+        # phase can report its own concurrency at the end.
+        search_secs = 0.0
+        search_trials = 0
+        search_jobs = 1
 
         try:
             rng = np.random.default_rng(int(seed))
-            # Complementary-pairs subsampling (Shah & Samworth 2013): each pair
-            # partitions the sampling units into halves A | B; each half is an
-            # in-bag scored on its complement, giving two ~50%-OOB subsamples.
-            # This is the ⌊n/2⌋ scheme the Meinshausen–Bühlmann PFER bound
-            # assumes, so the reported bound is rigorous rather than the
-            # approximation bootstrap resampling gives. Whole blocks are split
-            # when spatial resampling is on so each OOB half is out-of-region.
+            # Complementary-pairs subsampling (Shah & Samworth 2013): each
+            # pair splits the units into halves scored on each other. This is
+            # the ⌊n/2⌋ scheme the Meinshausen–Bühlmann PFER bound assumes.
+            # Spatial resampling splits whole blocks, so each half is
+            # out-of-region.
             n_pairs = max(1, int(round(int(n_bootstraps) / 2)))
             subsamples: list[tuple[np.ndarray, np.ndarray]] = []
             for _pair in range(n_pairs):
@@ -7068,22 +8308,32 @@ class MetricFusionEngine:
                     continue
 
                 if use_groups:
-                    # One row-slice per in-bag group (no multiplicity under
-                    # subsampling), preserving the original DataFrame index the
-                    # pre-aggregation cache is keyed by.
-                    in_bag_df = pd.concat([group_rows[g] for g in in_bag_unique])
-                    oob_df = train_val[train_val[group_col].isin(oob_unique)].copy()
+                    # One positional take per half, preserving the original
+                    # DataFrame index the pre-aggregation cache is keyed by.
+                    # Both halves index the same pooled frame — no per-subsample
+                    # isin scan over the pixel frame and no per-group copies.
+                    in_bag_df = train_val.iloc[
+                        np.concatenate([group_rows[g] for g in in_bag_unique])
+                    ]
+                    oob_df = train_val.iloc[
+                        np.concatenate([group_rows[g] for g in oob_unique])
+                    ]
                 else:
-                    in_bag_df = train_val.iloc[in_bag_unique].copy()
-                    oob_df = train_val.iloc[oob_unique].copy()
+                    # iloc with an index array materialises a new frame; the
+                    # fold frames are read-only downstream.
+                    in_bag_df = train_val.iloc[in_bag_unique]
+                    oob_df = train_val.iloc[oob_unique]
 
                 # Splice this subsample into ``cv_folds`` — the existing
                 # ``_objective`` reads ``train`` / ``val`` from each fold and
                 # handles aggregation, channel collapse, and OOB scoring.
                 self.cv_folds = [{"train": in_bag_df, "val": oob_df}]
+                self._split_generation += 1
                 # Each resample is a different row set, so its spatial basis is
-                # rebuilt; drop the previous resample's cache to bound memory.
+                # rebuilt; drop the previous resample's caches to bound memory
+                # (the pdcor / spline caches fingerprint the same row sets).
                 self._spatial_basis_cache = {}
+                self._clear_scoring_caches()
 
                 # Fresh in-memory study with a low-discrepancy QMC (Sobol)
                 # sampler: objective-blind like RandomSampler (so the per-cell
@@ -7134,18 +8384,36 @@ class MetricFusionEngine:
                     except Exception:
                         pass
 
+                def _stop_if_cancelled(_study, _trial):
+                    """End this subsample's study as soon as cancel is seen.
+
+                    ``optimize`` is otherwise uninterruptible for the whole
+                    ``n_trials_per_bootstrap`` budget, which is the difference
+                    between a cancel that lands in seconds and one that lands
+                    a bootstrap later.
+                    """
+                    if cancel_callback is not None and cancel_callback():
+                        _study.stop()
+
+                _search_jobs = self._search_n_jobs(metric)
+                _search_t0 = time.perf_counter()
                 try:
                     study.optimize(
                         lambda t: self._objective(t, metric),
                         n_trials=n_trials_b,
+                        n_jobs=_search_jobs,
                         show_progress_bar=False,
                         catch=(Exception,),
-                        callbacks=[_trial_progress],
+                        callbacks=[_trial_progress, _stop_if_cancelled],
                     )
                 except Exception:
                     # Catastrophic study failure — skip this subsample and
                     # continue rather than aborting the whole selection.
                     continue
+                finally:
+                    search_secs += time.perf_counter() - _search_t0
+                    search_trials += n_trials_b
+                    search_jobs = _search_jobs
 
                 # Extract per-trial (params, val_score). ``_objective`` puts
                 # the mean val score into ``user_attrs["val_score_mean"]`` and
@@ -7237,6 +8505,30 @@ class MetricFusionEngine:
             self.study = prev_study
             self._cancel_callback = prev_cancel_cb
             optuna.logging.set_verbosity(prev_optuna_verbosity)
+            # The last resample's cached matrices (up to hundreds of MB for
+            # the pdcor sides) have no future hits — release them now.
+            self._clear_scoring_caches()
+            self._clear_ring_caches()
+            if search_secs > 0 and search_trials:
+                _log(
+                    "INFO",
+                    f"Stability search: {search_trials:,} trial(s) over "
+                    f"{diag['bootstraps_attempted']} sequential bootstrap(s) in "
+                    f"{search_secs:.0f}s "
+                    f"({search_secs / search_trials * 1000:.1f} ms/trial, "
+                    f"n_jobs={search_jobs}).",
+                )
+                # Summed in-objective time across threads: divided by the phase's
+                # wall clock it gives the average number of workers actually
+                # running, which is measured rather than assumed.
+                _log_parallel_efficiency(
+                    _log,
+                    "stability search",
+                    wall_s=search_secs,
+                    busy_s=float(sum(self._objective_secs)),
+                    workers=search_jobs,
+                )
+            self._objective_secs.clear()
 
         if not records:
             raise RuntimeError(
@@ -7258,7 +8550,7 @@ class MetricFusionEngine:
                 "covariate / target NaN coverage on OOB rows."
             )
 
-        # ── Per-cell aggregation ─────────────────────────────────────────
+        # ── Per-cell aggregation ────────────────────────────
         from . import statistical_testing as _stats_mod
 
         cells: dict[tuple, list[dict]] = {}
@@ -7274,7 +8566,7 @@ class MetricFusionEngine:
                 return float(np.quantile(scores, worst_quantile))
             return float(np.quantile(scores, 1.0 - worst_quantile))
 
-        # ── Automated threshold calibration (stage 1: channel mix) ────────
+        # ── Threshold calibration (stage 1: channel mix) ────
         # Rank cells within each bootstrap by their best out-of-bag score, then
         # calibrate the selection size K and threshold π by maximizing the
         # stability score (Bodinier et al.) — no hand-set threshold. The
@@ -7330,15 +8622,18 @@ class MetricFusionEngine:
             candidates = [c for c in cell_stats if c["cell"] in stable_cells]
             if not candidates:
                 candidates = cell_stats
-            # Most consistently selected cell; ties broken by worst-quantile
-            # OOB score so that, when selection probability saturates (every
-            # stable cell at 1.0), the winner is the most robust rather than
-            # the best typical-case cell.
+            # Most consistently selected cell; ties broken by the cell's median
+            # OOB score. Median, not the worst quantile: the question this
+            # study asks is which composite predicts better on typical held-out
+            # data, and the worst decile answers a maximin question instead.
+            # It is also count-invariant, so a cell that happened to draw more
+            # trials gets no advantage. ``q_worst`` is still recorded on every
+            # cell and reported as a robustness read.
             best = max(
                 candidates,
                 key=lambda c: (
                     c["selection_probability"],
-                    c["q_worst"] if higher_is_better else -c["q_worst"],
+                    c["median"] if higher_is_better else -c["median"],
                 ),
             )
             _log(
@@ -7350,14 +8645,14 @@ class MetricFusionEngine:
             )
         else:
             # Too few candidate cells / resamples to calibrate (e.g. a
-            # standalone's single weight cell) — fall back to the best
-            # worst-quantile cell.
+            # standalone's single weight cell) — fall back to the best median
+            # cell.
             best = max(
                 cell_stats,
-                key=lambda c: c["q_worst"] if higher_is_better else -c["q_worst"],
+                key=lambda c: c["median"] if higher_is_better else -c["median"],
             )
 
-        # ── Stage 2: spatial tuning within the winning weight cell ────────
+        # ── Stage 2: spatial tuning in the winning cell ─────
         # The weight cell fixes the channel mix; now stability-select the
         # radii the same way — re-bin the cell's trials by a coarse radius
         # key (active channels only) and pick the radius sub-cell with the
@@ -7423,18 +8718,82 @@ class MetricFusionEngine:
             radius_stats = [_radius_stat(rk, rs) for rk, rs in radius_cells.items()]
         radius_best = max(
             radius_stats,
-            key=lambda c: c["q_worst"] if higher_is_better else -c["q_worst"],
+            key=lambda c: c["median"] if higher_is_better else -c["median"],
         )
 
-        # ── Average params within the winning radius sub-cell ─────────────
+        # ── Average params in the winning radius sub-cell ───
+        # ── Stage 3: weight refinement at the chosen scale ──
+        # The coarse cell fixed the channel mix and the radius sub-cell fixed
+        # the spatial scale. Both were decided at 20 % weight resolution, so
+        # the surviving trials still disagree about the mix by up to a whole
+        # bucket. Re-bin them at ``weight_refine_bin_pct`` and take the best
+        # fine sub-cell by median, instead of averaging across the coarse cell
+        # and landing on a mix no trial actually validated.
+        #
+        # Ordering matters and is deliberate: mix, then scale, then mix again.
+        # Refining the weights before the radius is settled would tune them
+        # against a spatial scale that is about to change.
+        #
+        # Note the fine keys do not nest inside the coarse ones —
+        # ``_snap_weight_buckets`` rounds to nearest, so the two grids have
+        # unaligned boundaries. That is fine here because the re-binning is
+        # applied to trials that are *already* members of the winning coarse
+        # cell, so the refined set is a subset of them and the averaged weights
+        # stay inside their convex hull. Do not reuse these keys as a
+        # hierarchy elsewhere.
+        refine_bin = int(
+            weight_refine_bin_pct
+            if weight_refine_bin_pct is not None
+            else cgi_formulas.WEIGHT_REFINE_BIN_PCT
+        )
+        winners = radius_best["records"]
+        refine_stats: list[dict] = []
+        if 0 < refine_bin < int(weight_bin_pct):
+            fine_cells: dict[tuple, list[dict]] = {}
+            for r in winners:
+                fk = cgi_formulas.weight_cell_key(
+                    self.cgi_formula, r["params"], refine_bin
+                )
+                fine_cells.setdefault(fk, []).append(r)
+            refine_stats = [
+                {
+                    "cell": fk,
+                    "count": len(rs),
+                    "median": float(np.median([r["oob_score"] for r in rs])),
+                    "q_worst": _q_worst([r["oob_score"] for r in rs]),
+                    "records": rs,
+                }
+                for fk, rs in fine_cells.items()
+            ]
+            # Only accept the refinement when a sub-cell has enough trials to
+            # rank on. Below that its median is a draw-noise artefact and the
+            # coarse cell's average is the safer answer.
+            eligible = [c for c in refine_stats if c["count"] >= int(min_cell_count)]
+            if len(fine_cells) > 1 and eligible:
+                refine_best = max(
+                    eligible,
+                    key=lambda c: c["median"] if higher_is_better else -c["median"],
+                )
+                _log(
+                    "INFO",
+                    f"Weight refinement: {len(fine_cells)} sub-cells at "
+                    f"{refine_bin}% inside the winning {weight_bin_pct}% cell; "
+                    f"kept {refine_best['count']} of {len(winners)} trials "
+                    f"(median {refine_best['median']:.4f} vs "
+                    f"{radius_best['median']:.4f} across the whole cell).",
+                )
+                winners = refine_best["records"]
+            elif len(fine_cells) > 1:
+                _log(
+                    "INFO",
+                    f"Weight refinement skipped: no {refine_bin}% sub-cell "
+                    f"reached min_cell_count={min_cell_count}; averaging the "
+                    f"{len(winners)} trials of the coarse cell instead.",
+                )
+
         # Snap + renormalize the winners' weights to canonical integer steps so
         # downstream code (composite generation, apply path) consumes them
         # directly. ``formula`` was resolved up front (see above).
-        winners = radius_best["records"]
-
-        def _mean_int(name: str, default: int) -> int:
-            vals = [int(r["params"].get(name, default)) for r in winners]
-            return int(round(float(np.mean(vals)))) if vals else int(default)
 
         def _mode_str(name: str, default: str) -> str:
             vals = [r["params"].get(name, default) for r in winners]
@@ -7555,6 +8914,12 @@ class MetricFusionEngine:
         final_params["__cell_q_worst__"] = float(best["q_worst"])
         final_params["__cell_count__"] = int(best["count"])
         final_params["__cell_median__"] = float(best["median"])
+        final_params["__weight_bin_pct__"] = int(weight_bin_pct)
+        final_params["__weight_refine_bin_pct__"] = int(refine_bin)
+        final_params["__refine_cell_count__"] = int(len(winners))
+        final_params["__refine_applied__"] = bool(
+            refine_stats and len(winners) < len(radius_best["records"])
+        )
         final_params["__cell_selection_probability__"] = float(
             best["selection_probability"]
         )
@@ -7602,15 +8967,9 @@ class MetricFusionEngine:
             }
             for c in ranked_radius[:10]
         ]
-        # Diagnostics for the results UI: top-10 ranked cells (so the user
-        # can see whether the winner is alone or part of a tight cluster of
-        # similar regions) and the winner's OOB-score distribution (for a
-        # histogram showing q_worst → median → max). These live under ``__``
-        # keys so the "Final params" panel still strips them out, but the
-        # raw bundle in the runner preserves them.
-        # The stability cell keys on the main-component weights only (see
-        # ``cgi_formulas.weight_cell_key``), so map the cell tuple back through
-        # the main weight keys when reconstructing each cell's representative mix.
+        # Diagnostics for the results UI, under ``__`` keys so the "Final
+        # params" panel strips them out. The cell keys on the main-component
+        # weights only, so map the tuple back through those keys.
         cell_weight_keys = formula.main_weight_keys
         # Rank the diagnostics table by the decision criterion — calibrated
         # selection probability, with worst-quantile OOB breaking ties — so the
@@ -8009,6 +9368,11 @@ class MetricFusionEngine:
         clean_params = {k: v for k, v in final_params.items() if not k.startswith("__")}
         provenance = {
             "selection_method": "bootstrap_stability_selection",
+            # Grid geometry, so a viewer can size its read before opening the
+            # file. A catchment grid over distant clusters is mostly nodata.
+            "raster_width": int(width),
+            "raster_height": int(height),
+            "raster_valid_cells": int(len(vals_arr)),
             "cell_q_worst": final_params.get("__cell_q_worst__"),
             "cell_median": final_params.get("__cell_median__"),
             "cell_count": final_params.get("__cell_count__"),

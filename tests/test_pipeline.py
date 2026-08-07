@@ -5,9 +5,9 @@ import tempfile
 import unittest
 import warnings
 
-# -------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # CRITICAL IMPORT ORDER FIX FOR WINDOWS
-# -------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -313,10 +313,10 @@ class TestGeoFuse(unittest.TestCase):
 
     @patch("geofuse.ndvi.rasterio")
     @patch("geofuse.ndvi.ee")
-    @patch("geofuse.ndvi.geemap")
+    @patch("geofuse.ndvi._export_ee_image_to_tif")
     def test_ndvi_logic(
         self,
-        mock_geemap,
+        mock_export,
         mock_ee,
         mock_rasterio,
     ):
@@ -332,11 +332,14 @@ class TestGeoFuse(unittest.TestCase):
         chain.size.return_value.getInfo.return_value = 5
         mock_ee.ImageCollection.return_value = chain
 
+        # The engine downloads through its own ``_export_ee_image_to_tif``
+        # (a diagnostics-preserving replacement for ``geemap.ee_export_image``),
+        # so that is the seam the export is verified at.
         def create_dummy_file(image, filename, **kwargs):
             with open(filename, "w") as f:
                 f.write("Dummy")
 
-        mock_geemap.ee_export_image.side_effect = create_dummy_file
+        mock_export.side_effect = create_dummy_file
 
         mock_src = MagicMock()
         mock_src.read.return_value = np.zeros((10, 10))
@@ -385,7 +388,7 @@ class TestGeoFuse(unittest.TestCase):
             folder=self.output_dir,
         )
 
-        mock_geemap.ee_export_image.assert_called_once()
+        mock_export.assert_called_once()
         print("   [PASS] NDVI Export Logic Verified")
 
 

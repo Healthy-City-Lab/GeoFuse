@@ -54,28 +54,70 @@ baseline.
 
 from __future__ import annotations
 
+import hashlib
+import logging
+import threading
 import warnings
 
 import numpy as np
 import pandas as pd
 from scipy.stats import ConstantInputWarning, pearsonr, rankdata
-from sklearn.metrics import mutual_info_score, r2_score
+from sklearn.metrics import mutual_info_score
+
+from . import pdcor
+
+logger = logging.getLogger(__name__)
+
+# Fallback events already warned about — each degraded code path logs once per
+# process instead of flooding a 1000-trial study log.
+_warned_fallbacks: set[str] = set()
+
+
+def _warn_once(key: str, message: str) -> None:
+    if key not in _warned_fallbacks:
+        _warned_fallbacks.add(key)
+        logger.warning(message)
+
 
 # Public set of metric names this module knows how to score; engine-level
 # validation should compare against it before calling :func:`score`.
 SUPPORTED_METRICS: frozenset[str] = frozenset(
-    {"partial_distance_corr", "distance_corr", "spearman", "r2", "nrmse", "mutual_info"}
+    {
+        "partial_distance_corr",
+        "distance_corr",
+        "spearman",
+        "r2",
+        "nrmse",
+        "mutual_info",
+        # Binary outcomes: logistic regression of a 0/1 target on the composite
+        # plus covariates. A Gaussian fit to a dichotomous column is a linear
+        # probability model whose standard errors are wrong in a known
+        # direction, so the greenspace literature's dichotomised outcomes get
+        # their own scorer. See :mod:`geofuse.binary_longitudinal`.
+        "logit_tstat",
+        "logit_coef",
+    }
 )
+
+# Metrics that require the target to hold exactly two distinct values. Selected
+# on a continuous outcome they return the degenerate score, so the UI and the
+# runner check this set before offering them.
+BINARY_ONLY_METRICS: frozenset[str] = frozenset({"logit_tstat", "logit_coef"})
 
 # The default cross-sectional objective: partial distance correlation captures
 # linear and nonlinear association while conditioning on covariates nonlinearly.
-DEFAULT_METRIC: str = "partial_distance_corr"
-
 # Metrics whose return value is "higher is better" — useful when the caller
 # needs a uniform direction for ranking. ``nrmse`` is the only one where lower
 # is better.
 HIGHER_IS_BETTER: frozenset[str] = frozenset(
-    {"partial_distance_corr", "distance_corr", "spearman", "r2", "mutual_info"}
+    {
+        "partial_distance_corr",
+        "distance_corr",
+        "spearman",
+        "r2",
+        "mutual_info",
+        "logit_tstat",
+    }
 )
 
 # Metrics for which the covariate-adjusted score *ignores* covariates. The UI
@@ -108,6 +150,8 @@ _DEGENERATE_SCORE: dict[str, float] = {
     "r2": 0.0,
     "nrmse": float("inf"),
     "mutual_info": 0.0,
+    "logit_tstat": 0.0,
+    "logit_coef": 0.0,
 }
 
 
@@ -144,8 +188,15 @@ def _residualize(y: np.ndarray, X: np.ndarray | None) -> np.ndarray:
 _SPLINE_MIN_UNIQUE: int = 7
 _SPLINE_DF: int = 4
 
+# Bases held per scored subset, and the lock that keeps the trim safe while
+# trials run in parallel.
+_SPLINE_CACHE_MAX: int = 8
+_SPLINE_CACHE_LOCK = threading.Lock()
 
-def _expand_covariate_basis(X: np.ndarray | None, method: str) -> np.ndarray | None:
+
+def _expand_covariate_basis(
+    X: np.ndarray | None, method: str, cache: dict | None = None
+) -> np.ndarray | None:
     """Optionally expand continuous covariate columns into a spline basis.
 
     ``method="linear"`` (or a degenerate input) returns ``X`` unchanged. With
@@ -153,9 +204,25 @@ def _expand_covariate_basis(X: np.ndarray | None, method: str) -> np.ndarray | N
     natural-cubic-spline basis so the later OLS residualization removes
     nonlinear covariate effects; discrete columns (dummies, coarse codes) pass
     through as-is. Falls back to the raw column on any expansion error.
+
+    ``cache`` (optional dict) memoizes the expanded basis on a content
+    fingerprint of ``X`` — per Optuna trial the covariate matrix is fixed per
+    scored subset, so the patsy expansion only runs once per subset.
     """
     if X is None or method != "spline" or X.shape[1] == 0:
         return X
+    cache_key: bytes | None = None
+    if cache is not None:
+        # Byte digest, not moment sums: a resampled covariate matrix holding the
+        # same values in a different order must not hit another subset's basis.
+        _x = np.ascontiguousarray(np.asarray(X, dtype=np.float64))
+        _h = hashlib.blake2b(digest_size=16)
+        _h.update(repr(_x.shape).encode())
+        _h.update(_x.tobytes())
+        cache_key = _h.digest()
+        hit = cache.get(cache_key)
+        if hit is not None:
+            return hit
     try:
         from patsy import dmatrix
     except Exception:
@@ -178,7 +245,17 @@ def _expand_covariate_basis(X: np.ndarray | None, method: str) -> np.ndarray | N
             cols.append(basis if basis.shape[1] else col.reshape(-1, 1))
         except Exception:
             cols.append(col.reshape(-1, 1))
-    return np.column_stack(cols)
+    expanded = np.column_stack(cols)
+    if cache is not None and cache_key is not None:
+        # Trials run on a thread pool, and trimming by "drop whatever iteration
+        # yields first" is not safe against a concurrent insert — the iterator
+        # can outlive the key it selected. Guard the trim; the patsy expansion
+        # above is the expensive part and stays outside the lock.
+        with _SPLINE_CACHE_LOCK:
+            cache[cache_key] = expanded
+            while len(cache) > _SPLINE_CACHE_MAX:
+                cache.pop(next(iter(cache)))
+    return expanded
 
 
 def _stack(*mats: np.ndarray | None) -> np.ndarray | None:
@@ -248,9 +325,9 @@ def _minmax01(v: np.ndarray) -> np.ndarray:
     return (v - lo) / span
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Distance correlation
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 
 def distance_correlation(x: np.ndarray, y: np.ndarray, *, seed: int = 0) -> float:
@@ -279,13 +356,22 @@ def distance_correlation(x: np.ndarray, y: np.ndarray, *, seed: int = 0) -> floa
                 xa, ya, method=dcor.DistanceCovarianceMethod.MERGESORT
             )
         )
-    except Exception:
+    except Exception as exc:
+        _warn_once(
+            "dcor-mergesort",
+            f"Fast mergesort distance correlation failed ({exc!r}); falling "
+            "back to the O(n²) estimator for this process.",
+        )
         s = float(dcor.distance_correlation(xa, ya))
     return s if np.isfinite(s) else 0.0
 
 
 def partial_distance_correlation(
-    x: np.ndarray, y: np.ndarray, z: np.ndarray | None
+    x: np.ndarray,
+    y: np.ndarray,
+    z: np.ndarray | None,
+    *,
+    cache: dict | None = None,
 ) -> float:
     """Partial distance correlation of ``x`` and ``y`` given ``z`` (Székely–Rizzo).
 
@@ -294,6 +380,11 @@ def partial_distance_correlation(
     ``z=None`` reduces to plain distance correlation. Can be slightly negative
     (``x`` adds nothing beyond ``z``); returned as-is so the optimizer ranks it.
     The estimate is O(n²); the runner warns at large n.
+
+    ``cache`` (an :class:`collections.OrderedDict` owned by the engine) enables
+    the fast path that reuses the U-centered matrices of the ``(x, z)`` sides
+    across calls — pass the vector that stays constant per scored subset (the
+    target) as ``x``. Oversized inputs fall back to the stock estimator.
     """
     import dcor
 
@@ -304,16 +395,33 @@ def partial_distance_correlation(
     za = np.asarray(z, dtype=np.float64).reshape(len(xa), -1)
     if float(np.var(xa)) == 0 or float(np.var(ya)) == 0:
         return 0.0
+    n = xa.shape[0]
+    if cache is not None and 4 <= n <= pdcor.MAX_CACHE_N:
+        try:
+            s = pdcor.partial_distance_correlation_cached(xa, ya, za, cache)
+            return s if np.isfinite(s) else 0.0
+        except Exception as exc:
+            _warn_once(
+                "pdcor-cached",
+                f"Cached partial distance correlation failed ({exc!r}); "
+                "falling back to the stock dcor estimator for this process.",
+            )
     try:
         s = float(dcor.partial_distance_correlation(xa, ya, za))
-    except Exception:
+    except Exception as exc:
+        _warn_once(
+            "pdcor-unconditioned",
+            "dcor.partial_distance_correlation failed "
+            f"({exc!r}); returning the UNCONDITIONED distance correlation — "
+            "covariates/smooth are NOT partialled out of this score.",
+        )
         return distance_correlation(xa.ravel(), ya.ravel())
     return s if np.isfinite(s) else 0.0
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Direction reporting
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 
 def relationship_sign(
@@ -367,9 +475,9 @@ def relationship_sign(
     return 1 if corr > 0 else -1
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Scoring
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 
 def score(
@@ -382,6 +490,8 @@ def score(
     spatial_basis: np.ndarray | None = None,
     spatial_method: str = "none",
     residualize_method: str = "linear",
+    pdcor_cache: dict | None = None,
+    spline_cache: dict | None = None,
 ) -> float | tuple[float, float]:
     """Score CGI's predictive power for ``target``, controlling for ``covariates``.
 
@@ -402,6 +512,12 @@ def score(
     ``residualize_method`` (``"linear"`` / ``"spline"``) sets the covariate basis
     for the residualizing metrics. ``partial_distance_corr`` conditions on the
     controls intrinsically and ``mutual_info`` ignores them, so both ignore it.
+
+    ``pdcor_cache`` / ``spline_cache`` are optional engine-owned caches for the
+    inputs that stay constant across many calls on one scored subset: the
+    U-centered target/conditioning matrices of ``partial_distance_corr`` and
+    the spline-expanded covariate basis. Both are pure accelerations — scores
+    are identical (to float32 noise for the pdcor path) with or without them.
     """
     _validate_metric(metric)
     if spatial_method not in SPATIAL_METHODS:
@@ -439,9 +555,6 @@ def score(
         s = _DEGENERATE_SCORE[metric]
         return (s, 1.0) if return_pvalue else s
 
-    # Covariate basis for the residualizing metrics (spline-expanded when asked).
-    cov_res = _expand_covariate_basis(cov, residualize_method)
-
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=RuntimeWarning)
         warnings.filterwarnings("ignore", category=ConstantInputWarning)
@@ -450,8 +563,24 @@ def score(
             # Condition on [covariates, smooth] in the distance space (both are
             # partialled out nonlinearly; no linear residualization).
             z = _stack(cov, sb)
-            s = partial_distance_correlation(t, c, z)
+            s = partial_distance_correlation(t, c, z, cache=pdcor_cache)
             return (s, 1.0) if return_pvalue else s
+
+        if metric in BINARY_ONLY_METRICS:
+            # Logistic regression enters covariates and the spatial smooth as
+            # design columns rather than residualizing on them: for a non-linear
+            # link, adjusting the outcome and the exposure separately is not the
+            # same model as conditioning inside one fit.
+            from . import binary_longitudinal
+
+            return binary_longitudinal.score_logit(
+                metric, t, c, _stack(cov, sb), return_pvalue=return_pvalue
+            )
+
+        # Covariate basis for the residualizing metrics (spline-expanded when
+        # asked). Deliberately below the pdcor branch — that metric (and
+        # mutual_info, whose cov is already None here) never consumes it.
+        cov_res = _expand_covariate_basis(cov, residualize_method, spline_cache)
 
         if metric == "distance_corr":
             x_t, x_c = _spatial_designs(cov_res, sb, spatial_method)
@@ -469,6 +598,7 @@ def score(
                 cov_use = _expand_covariate_basis(
                     np.column_stack([rankdata(cov[:, j]) for j in range(cov.shape[1])]),
                     residualize_method,
+                    spline_cache,
                 )
             else:
                 cov_use = None
@@ -486,15 +616,18 @@ def score(
         if metric == "r2":
             # Incremental R² with the spatial smooth folded into the control
             # design (both methods condition the outcome on cov + smooth).
+            #
+            # With no controls this is the R² of ``target ~ cgi`` — a *fitted*
+            # regression, not ``r2_score(target, cgi)``. The latter scores the
+            # composite as if it were already a prediction of the outcome, so a
+            # greenery index on [0, 1] against a CES-D score on [0, 30] returns
+            # a large negative number that measures the scale gap and nothing
+            # about the association. Both forms agree when the two happen to
+            # share a scale; only this one is meaningful when they do not.
             ctrl = _stack(cov_res, sb)
-            if ctrl is None:
-                # Legacy path: r2 of cgi treated as a direct prediction of
-                # target — preserves the previous engine behaviour exactly.
-                s = float(r2_score(t, c))
-            else:
-                X_red = ctrl
-                X_full = np.column_stack([ctrl, c])
-                s = _ols_r2(t, X_full) - _ols_r2(t, X_red)
+            X_red = ctrl
+            X_full = c.reshape(-1, 1) if ctrl is None else np.column_stack([ctrl, c])
+            s = _ols_r2(t, X_full) - _ols_r2(t, X_red)
             if np.isnan(s):
                 s = 0.0
             return (s, 1.0) if return_pvalue else s
@@ -524,9 +657,9 @@ def score(
     raise AssertionError(f"unreachable metric '{metric}'")
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # Penalized model comparison (CGI vs best standalone channel)
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 
 def _verdict_from_delta_bic(delta_bic: float) -> str:
