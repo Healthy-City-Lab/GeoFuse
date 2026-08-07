@@ -58,9 +58,7 @@ def job_ui_refresh_s(active_types: Iterable[str]) -> float:
     only unknown types) it falls back to the default so a freshly-submitted job
     still appears promptly.
     """
-    intervals = [
-        _UI_REFRESH_S.get(t, _DEFAULT_UI_REFRESH_S) for t in active_types
-    ]
+    intervals = [_UI_REFRESH_S.get(t, _DEFAULT_UI_REFRESH_S) for t in active_types]
     return min(intervals) if intervals else _DEFAULT_UI_REFRESH_S
 
 

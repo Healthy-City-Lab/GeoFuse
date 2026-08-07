@@ -8,7 +8,6 @@ which matches Leaflet/Folium and ``generate_raster_grid`` in ``geofuse.core``.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 
 import geopandas as gpd
@@ -16,14 +15,10 @@ import numpy as np
 import rasterio
 from pyproj import CRS as PyProjCRS
 from pyproj import Geod, Transformer
-from rasterio.transform import array_bounds, from_bounds
+from rasterio.transform import from_bounds
 from rasterio.warp import (
     Resampling,
-    calculate_default_transform,
     reproject,
-)
-from rasterio.warp import transform as rio_warp_transform
-from rasterio.warp import (
     transform_bounds,
 )
 from rasterio.windows import from_bounds as window_from_bounds

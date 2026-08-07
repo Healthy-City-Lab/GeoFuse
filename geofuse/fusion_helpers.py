@@ -18,7 +18,6 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import rasterio
-import sklearn
 from rasterio.transform import rowcol
 
 from . import metric_intake, metric_sampling, parallel, preaggregation
@@ -34,7 +33,9 @@ from .vector_io import read_vector_aliased_column
 
 logger = get_logger("FUSION")
 
-def apply_circular_buffer_aggregation(points_gdf: gpd.GeoDataFrame,
+
+def apply_circular_buffer_aggregation(
+    points_gdf: gpd.GeoDataFrame,
     metric_data: gpd.GeoDataFrame | dict,
     radius_meters: float,
     stat: str,
@@ -91,9 +92,7 @@ def apply_circular_buffer_aggregation(points_gdf: gpd.GeoDataFrame,
 
         templates = preaggregation.origin_circle_templates([float(radius_meters)])
         h, w = int(metric_array.shape[0]), int(metric_array.shape[1])
-        for idx, geom in zip(
-            pts_buf_crs.index, pts_buf_crs.geometry.to_numpy()
-        ):
+        for idx, geom in zip(pts_buf_crs.index, pts_buf_crs.geometry.to_numpy()):
             if geom is None or geom.is_empty:
                 continue
             disc = preaggregation.reproject_geoms(
@@ -120,9 +119,7 @@ def apply_circular_buffer_aggregation(points_gdf: gpd.GeoDataFrame,
             win_transform = _window_transform(
                 _Window(cmin, rmin, cmax - cmin, rmax - rmin), transform
             )
-            ring = preaggregation.ring_index_grid(
-                [disc], window.shape, win_transform
-            )
+            ring = preaggregation.ring_index_grid([disc], window.shape, win_transform)
             if ring is None:
                 continue
             values = data[base_valid & (ring == 0)]
@@ -210,9 +207,7 @@ def apply_circular_buffer_aggregation(points_gdf: gpd.GeoDataFrame,
         logger.debug(
             f"Using metric column: {metric_col} from {metric_data.columns.tolist()}"
         )
-        logger.debug(
-            f"Joined shape: {joined.shape}, Points shape: {len(points_gdf)}"
-        )
+        logger.debug(f"Joined shape: {joined.shape}, Points shape: {len(points_gdf)}")
 
         # Aggregate by original point index — one vectorized groupby over the
         # joined frame instead of a per-point boolean scan (which was O(n²)).
@@ -238,7 +233,8 @@ def apply_circular_buffer_aggregation(points_gdf: gpd.GeoDataFrame,
     return result
 
 
-def pool_spec(positions: np.ndarray,
+def pool_spec(
+    positions: np.ndarray,
     *,
     preps: dict,
     shared_xy: np.ndarray | None,
@@ -275,9 +271,11 @@ def pool_spec(positions: np.ndarray,
                 "path": parallel.publish_array(
                     share_dir,
                     f"{name}-raster",
-                    np.ma.filled(array, np.nan)
-                    if np.issubdtype(array.dtype, np.floating)
-                    else np.ma.filled(array.astype(np.float32), np.nan),
+                    (
+                        np.ma.filled(array, np.nan)
+                        if np.issubdtype(array.dtype, np.floating)
+                        else np.ma.filled(array.astype(np.float32), np.nan)
+                    ),
                 ),
                 **common,
             }
@@ -357,8 +355,7 @@ def area_balanced_split_within_bin(
     return assignments
 
 
-def load_metric_file(filepath: str, channel: str
-) -> gpd.GeoDataFrame | dict:
+def load_metric_file(filepath: str, channel: str) -> gpd.GeoDataFrame | dict:
     """Load one channel's metric from GeoJSON or GeoTIFF."""
     if filepath.endswith((".tif", ".tiff")):
         with rasterio.open(filepath) as src:
@@ -399,7 +396,8 @@ def load_metric_file(filepath: str, channel: str
         return gdf
 
 
-def resolved_state(preps: dict,
+def resolved_state(
+    preps: dict,
     shared_xy: np.ndarray | None,
     *,
     gvi_radii: tuple[int, ...],
@@ -436,7 +434,7 @@ def resolved_state(preps: dict,
     return state
 
 
-def downcast_fusion_dtypes(df: "pd.DataFrame") -> "pd.DataFrame":
+def downcast_fusion_dtypes(df: pd.DataFrame) -> pd.DataFrame:
     """Narrow a fusion/panel frame's column dtypes in place-ish.
 
     ``wave`` (year strings) -> category; float64 -> float32; int64 -> the
@@ -513,7 +511,8 @@ def spatial_cache_key(
     return h.digest()
 
 
-def entity_collapse_mask(data: pd.DataFrame, catchment_radius: float | None
+def entity_collapse_mask(
+    data: pd.DataFrame, catchment_radius: float | None
 ) -> np.ndarray | None:
     """Row mask for the per-trial catchment collapse, or ``None``.
 
@@ -593,7 +592,7 @@ def split_control_matrix(
     return cov_part, sb_part
 
 
-def grid_metric_crs(preaggr_gdf: "gpd.GeoDataFrame", log) -> Any:
+def grid_metric_crs(preaggr_gdf: gpd.GeoDataFrame, log) -> Any:
     """The metric CRS the pre-aggregation samples in.
 
     For a gridded (point / polygon) target the pixels are already built in
@@ -624,9 +623,7 @@ def attach_cache_for_coverage(entity_gdf: gpd.GeoDataFrame) -> bool:
 def fusion_param_key(channel_mode: str, weights: dict) -> tuple:
     """Hashable key over the params that determine the composite."""
     items = tuple(
-        sorted(
-            (str(k), v) for k, v in weights.items() if not str(k).startswith("__")
-        )
+        sorted((str(k), v) for k, v in weights.items() if not str(k).startswith("__"))
     )
     return (channel_mode, items)
 

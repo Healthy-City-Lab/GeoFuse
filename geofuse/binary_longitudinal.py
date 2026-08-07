@@ -236,9 +236,9 @@ class _ClusterLayout:
         self.starts = np.concatenate(
             [[0], np.flatnonzero(np.diff(sorted_ids)) + 1]
         ).astype(np.int64)
-        self.sizes = np.diff(
-            np.concatenate([self.starts, [len(sorted_ids)]])
-        ).astype(np.int64)
+        self.sizes = np.diff(np.concatenate([self.starts, [len(sorted_ids)]])).astype(
+            np.int64
+        )
         self.n_clusters = len(self.starts)
         self.n_rows = len(sorted_ids)
 
@@ -271,11 +271,11 @@ def _accumulate(
     inv_1ma = 1.0 / (1.0 - alpha) if alpha != 1.0 else 0.0
     c = layout.exchangeable_c(alpha)
 
-    a_total = X.T @ (X * var[:, None])            # sum_c A_c
-    g_total = X.T @ resid                          # sum_c g_c
-    b = layout.segment_sum(X * s[:, None])         # (n_clusters, p)
-    g = layout.segment_sum(X * resid[:, None])     # (n_clusters, p)
-    h = layout.segment_sum(resid / s)              # (n_clusters,)
+    a_total = X.T @ (X * var[:, None])  # sum_c A_c
+    g_total = X.T @ resid  # sum_c g_c
+    b = layout.segment_sum(X * s[:, None])  # (n_clusters, p)
+    g = layout.segment_sum(X * resid[:, None])  # (n_clusters, p)
+    h = layout.segment_sum(resid / s)  # (n_clusters,)
 
     bread = (a_total - b.T @ (b * c[:, None])) * inv_1ma
     score = (g_total - b.T @ (c * h)) * inv_1ma
@@ -598,7 +598,6 @@ def score_gee_logit(
 
 def make_logit_fitter(outcome: np.ndarray):
     """A :data:`geofuse.exposure_response.Fitter` backed by logistic regression."""
-    from scipy import stats
 
     y = to_binary(outcome) if is_binary(outcome) else None
 
@@ -627,7 +626,6 @@ def make_gee_logit_fitter(outcome: np.ndarray, entity_id: np.ndarray):
     those tables carry the same cluster-robust standard errors as the headline
     estimate rather than pretending the person-waves are independent.
     """
-    from scipy import stats
 
     y = to_binary(outcome) if is_binary(outcome) else None
     layout = _ClusterLayout(entity_id)
@@ -662,8 +660,7 @@ def _shape_fit(beta: np.ndarray, cov_beta: np.ndarray, names) -> dict:
         z = np.where(se > 0, beta / se, 0.0)
     p = 2.0 * stats.norm.sf(np.abs(z))
     out: dict = {
-        nm: (float(beta[i]), float(se[i]), float(p[i]))
-        for i, nm in enumerate(names)
+        nm: (float(beta[i]), float(se[i]), float(p[i])) for i, nm in enumerate(names)
     }
     out[COV_KEY] = (list(names), np.asarray(cov_beta))
     return out
@@ -681,7 +678,9 @@ def _degenerate(metric: str, return_all: bool, return_pvalue: bool):
     return (value, float("nan")) if return_pvalue else value
 
 
-def _package(metric: str, values: dict, pval: float, return_all: bool, return_pvalue: bool):
+def _package(
+    metric: str, values: dict, pval: float, return_all: bool, return_pvalue: bool
+):
     if return_all:
         return values
     value = values.get(metric, 0.0)

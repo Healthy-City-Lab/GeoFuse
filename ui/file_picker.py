@@ -119,7 +119,9 @@ def _open_tk_picker(
     import subprocess
     import tempfile
 
-    child = os.path.join(os.path.dirname(os.path.abspath(__file__)), "file_picker_child.py")
+    child = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "file_picker_child.py"
+    )
     if not os.path.isfile(child):
         raise PickerUnavailable(f"picker helper is missing at {child}")
 
@@ -161,11 +163,15 @@ def _open_tk_picker(
     lines = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()]
     if not lines:
         detail = (proc.stderr or "").strip().splitlines()
-        raise PickerUnavailable(detail[-1] if detail else "the file dialog produced no output")
+        raise PickerUnavailable(
+            detail[-1] if detail else "the file dialog produced no output"
+        )
     try:
         payload = json.loads(lines[-1])
     except json.JSONDecodeError as exc:
-        raise PickerUnavailable(f"unreadable response from the file dialog: {exc}") from exc
+        raise PickerUnavailable(
+            f"unreadable response from the file dialog: {exc}"
+        ) from exc
 
     if isinstance(payload, dict) and payload.get("error"):
         raise PickerUnavailable(str(payload["error"]))
@@ -265,9 +271,7 @@ def _render_manual_fallback(key: str, *, widget_key: str, multi: bool) -> None:
 
 
 def _remove_path_cb(key: str, path: str) -> None:
-    st.session_state[key] = [
-        p for p in (st.session_state.get(key) or []) if p != path
-    ]
+    st.session_state[key] = [p for p in (st.session_state.get(key) or []) if p != path]
 
 
 def _move_path_cb(key: str, path: str, delta: int) -> None:

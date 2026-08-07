@@ -24,12 +24,11 @@ reading the file.
 
 from __future__ import annotations
 
-from .vector_io import match_column_alias
-from collections.abc import Callable, Iterable, Mapping
-from collections.abc import Iterable, Mapping
-from typing import Any
 import os
+from collections.abc import Callable, Iterable, Mapping
+from typing import Any
 
+from .vector_io import match_column_alias
 
 VEG_COLUMNS: tuple[str, ...] = ("gvi_veg", "veg")
 

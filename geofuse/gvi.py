@@ -89,6 +89,7 @@ def _format_pano_date(date: tuple[int, int] | None) -> str | None:
     except (TypeError, ValueError):
         return None
 
+
 # Search radius (metres) for find_panorama_async around each grid point.
 _SEARCH_RADIUS_M = 50.0
 # Zoom level for tile downloads: 0 = lowest, 5 = highest. zoom=1 is a 2×1
@@ -477,8 +478,7 @@ class GVIEngine:
                 if not throttled:
                     _log(
                         "ERROR",
-                        f"  Download error for {short}…: "
-                        f"{type(e).__name__}: {e}",
+                        f"  Download error for {short}…: " f"{type(e).__name__}: {e}",
                     )
                     failed_panos.add(pid)
                     return self._empty_result(pt, search_lat, search_lon)
@@ -569,8 +569,7 @@ class GVIEngine:
             except Exception as e:
                 _log(
                     "ERROR",
-                    f"  GPU inference failed for {short}…: "
-                    f"{type(e).__name__}: {e}",
+                    f"  GPU inference failed for {short}…: " f"{type(e).__name__}: {e}",
                 )
                 return self._empty_result(pt, search_lat, search_lon)
 
@@ -626,8 +625,7 @@ class GVIEngine:
                 except Exception as e:
                     _log(
                         "ERROR",
-                        f"  Failed to save mask {short}…: "
-                        f"{type(e).__name__}: {e}",
+                        f"  Failed to save mask {short}…: " f"{type(e).__name__}: {e}",
                     )
 
         return self._make_result(

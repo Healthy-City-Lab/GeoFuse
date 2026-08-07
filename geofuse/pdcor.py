@@ -22,7 +22,7 @@ from __future__ import annotations
 import hashlib
 import threading
 from collections import OrderedDict
-from typing import Callable
+from collections.abc import Callable
 
 import numpy as np
 
@@ -150,7 +150,7 @@ _CACHE_LOCK = threading.Lock()
 
 
 def _get_side(
-    cache: "OrderedDict[tuple, PdcorSideCache]", y: np.ndarray, z: np.ndarray | None
+    cache: OrderedDict[tuple, PdcorSideCache], y: np.ndarray, z: np.ndarray | None
 ) -> PdcorSideCache:
     key = _side_fingerprint(y, z)
     with _CACHE_LOCK:
@@ -174,7 +174,7 @@ def partial_distance_correlation_cached(
     x: np.ndarray,
     y: np.ndarray,
     z: np.ndarray,
-    cache: "OrderedDict[tuple, PdcorSideCache]",
+    cache: OrderedDict[tuple, PdcorSideCache],
 ) -> float:
     """pdcor(x, y; z) reusing cached U-centered matrices for the (x, z) sides.
 

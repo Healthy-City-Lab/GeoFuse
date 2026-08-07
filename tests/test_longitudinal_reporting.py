@@ -41,12 +41,7 @@ def _panel(seed: int = 0, n_entities: int = 300, n_waves: int = 4):
     t = (wi - pd.Series(wi).groupby(eid).transform("min").to_numpy()).astype(float)
     wave = np.asarray([f"{2011 + w}" for w in wi])
     g = rng.normal(size=len(eid))
-    y = (
-        0.4 * g
-        + 0.1 * t
-        + rng.normal(size=len(eid))
-        + rng.normal(size=n_entities)[eid]
-    )
+    y = 0.4 * g + 0.1 * t + rng.normal(size=len(eid)) + rng.normal(size=n_entities)[eid]
     wave_dummies = (
         pd.get_dummies(pd.Series(wave), drop_first=True).astype(float).to_numpy()
     )

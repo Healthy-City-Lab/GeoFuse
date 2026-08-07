@@ -25,7 +25,6 @@ import threading
 import time
 import traceback
 
-
 MSG_PROGRESS = "progress"
 MSG_HEARTBEAT = "heartbeat"
 MSG_SET_EXTRA = "set_extra"

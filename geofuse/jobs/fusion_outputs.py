@@ -13,7 +13,6 @@ apart from the 1,400-line orchestration that calls them.
 from __future__ import annotations
 
 import json
-import math
 import os
 from typing import Any
 
@@ -21,7 +20,7 @@ import numpy as np
 import pandas as pd
 
 from ..logger import get_logger
-from .stage_ledger import DONE, PENDING, RUNNING, Stage, StageLedger
+from .stage_ledger import StageLedger
 
 _log_fusion = get_logger("FUSION")
 
@@ -158,10 +157,8 @@ def _write_fusion_outputs(
       departure from linearity, in the form the greenspace literature reports.
     - ``exposure_response_curve.csv`` — the fitted spline curve, ready to plot.
     """
-    import json
 
     import numpy as np
-    import pandas as pd
 
     os.makedirs(output_dir, exist_ok=True)
     sfx = f"__{label}" if multi_outcome else ""
@@ -293,9 +290,7 @@ def _write_fusion_outputs(
     # ── decline_terms.csv (longitudinal exposure × time) ────────
     decline_terms = (cgi_bundle or {}).get("decline_terms") or None
     if decline_terms and decline_terms.get("terms"):
-        _emit_csv(
-            f"decline_terms{sfx}.csv", [dict(r) for r in decline_terms["terms"]]
-        )
+        _emit_csv(f"decline_terms{sfx}.csv", [dict(r) for r in decline_terms["terms"]])
 
     # ── exposure_response.csv (per-IQR, quartiles, non-linearity) ─
     # One tidy table rather than three files: the rows are all statements
@@ -323,9 +318,13 @@ def _write_fusion_outputs(
                         f"reference={_f(coding.get('reference_level'))}"
                         + ("  CHECK CODEBOOK" if coding.get("suspicious") else "")
                     ),
-                    "estimate": None, "std_error": None,
-                    "ci_low": None, "ci_high": None,
-                    "odds_ratio": None, "or_ci_low": None, "or_ci_high": None,
+                    "estimate": None,
+                    "std_error": None,
+                    "ci_low": None,
+                    "ci_high": None,
+                    "odds_ratio": None,
+                    "or_ci_low": None,
+                    "or_ci_high": None,
                     "p_value": None,
                 }
             )
@@ -372,9 +371,13 @@ def _write_fusion_outputs(
                     "term": "quantile_trend",
                     "design": design,
                     "detail": f"{quartiles.get('n_groups')} groups",
-                    "estimate": None, "std_error": None,
-                    "ci_low": None, "ci_high": None,
-                    "odds_ratio": None, "or_ci_low": None, "or_ci_high": None,
+                    "estimate": None,
+                    "std_error": None,
+                    "ci_low": None,
+                    "ci_high": None,
+                    "odds_ratio": None,
+                    "or_ci_low": None,
+                    "or_ci_high": None,
                     "p_value": _f(quartiles.get("trend_p")),
                 }
             )
@@ -390,8 +393,12 @@ def _write_fusion_outputs(
                         f"{nonlinear.get('wald_df')} df"
                     ),
                     "estimate": _f(nonlinear.get("linear_coef")),
-                    "std_error": None, "ci_low": None, "ci_high": None,
-                    "odds_ratio": None, "or_ci_low": None, "or_ci_high": None,
+                    "std_error": None,
+                    "ci_low": None,
+                    "ci_high": None,
+                    "odds_ratio": None,
+                    "or_ci_low": None,
+                    "or_ci_high": None,
                     "p_value": _f(nonlinear.get("nonlinearity_p")),
                 }
             )
@@ -449,7 +456,9 @@ def _write_fusion_outputs(
                         "n": block.get("n"),
                         "estimate": _f(row.get("coef")),
                         "std_error": _f(row.get("std_error")),
-                        "ci_low": None, "ci_high": None, "odds_ratio": None,
+                        "ci_low": None,
+                        "ci_high": None,
+                        "odds_ratio": None,
                         "p_value": _f(row.get("p_value")),
                     }
                 )
@@ -463,8 +472,11 @@ def _write_fusion_outputs(
                     ),
                     "moderator_value": _f(block.get("centred_at")),
                     "n": block.get("n"),
-                    "estimate": None, "std_error": None,
-                    "ci_low": None, "ci_high": None, "odds_ratio": None,
+                    "estimate": None,
+                    "std_error": None,
+                    "ci_low": None,
+                    "ci_high": None,
+                    "odds_ratio": None,
                     "p_value": _f(block.get("interaction_p")),
                 }
             )

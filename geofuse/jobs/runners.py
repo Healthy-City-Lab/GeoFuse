@@ -22,15 +22,15 @@ import shutil
 import threading
 import time
 from collections.abc import Mapping
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any
 
 import geopandas as gpd
 import numpy as np
-import pandas as pd
 import rasterio
 
-from geofuse import JobCancelled
+from geofuse import JobCancelled, metric_intake
+from geofuse import pdcor as _pdcor_mod
 from geofuse.crs_utils import (
     default_geotiff_creation_options,
     raster_geographic_bounds,
@@ -43,13 +43,8 @@ from geofuse.jobs import (
     ProgressThrottle,
 )
 from geofuse.jobs.fusion_outputs import (
-    _FUSION_LONGITUDINAL_STAGE,
-    _FUSION_MIXEDLM_POSTSCORE_STAGE,
-    _FUSION_STAGE_STEPS,
-    _FUSION_STAGE_WEIGHTS,
     _STANDALONE_CHANNEL_LABELS,
     _build_fusion_ledger,
-    _clean_params,
     _compare_cgi_vs_standalone,
     _direction_sign,
     _fusion_stage_key,
@@ -57,10 +52,9 @@ from geofuse.jobs.fusion_outputs import (
     _jsonsafe_results,
     _log_stage_timing,
     _stability_summary,
-    _study_bundles,
     _write_fusion_outputs,
 )
-from geofuse.jobs.stage_ledger import DONE, RUNNING, SKIPPED, StageLedger
+from geofuse.jobs.stage_ledger import DONE, RUNNING, SKIPPED
 from geofuse.logger import get_logger
 from geofuse.longitudinal import (
     GREENERY_CHANNELS,
@@ -76,9 +70,7 @@ from geofuse.mixedlm_postscore import (
     compute_post_metrics as _compute_mixedlm_post_metrics,
 )
 from geofuse.ndvi import NDVIEngine
-from geofuse import pdcor as _pdcor_mod
 from geofuse.persistence.job_executor import JobContext
-from geofuse import metric_intake
 from geofuse.raster_sampling import LAZY_RASTER_THRESHOLD_BYTES, LazyRasterArray
 from geofuse.vector_io import read_vector_aliased_column, read_vector_subset
 from geofuse.vision import get_best_device
@@ -399,9 +391,7 @@ def run_gvi_column(
     gdf_4326["_year"] = parsed.dt.year
     gdf_4326 = gdf_4326.dropna(subset=["_year"])
     if gdf_4326.empty:
-        raise ValueError(
-            f"No valid years could be parsed from column '{date_column}'."
-        )
+        raise ValueError(f"No valid years could be parsed from column '{date_column}'.")
     gdf_4326["_year"] = gdf_4326["_year"].astype(int)
 
     unique_years = sorted(gdf_4326["_year"].unique())
@@ -451,9 +441,7 @@ def run_gvi_column(
         else:
             pts, meta = year_gdf.copy(), None
         plans.append((year, pts, meta))
-        ctx.progress(
-            status_text=f"Generated grid for {year}: {len(pts):,} points"
-        )
+        ctx.progress(status_text=f"Generated grid for {year}: {len(pts):,} points")
         ctx.heartbeat()
 
     breakdown = [{"label": str(y), "points": int(len(p))} for y, p, _ in plans]
@@ -697,9 +685,7 @@ def run_ndvi_column(
     gdf["_year"] = parsed.dt.year
     gdf = gdf.dropna(subset=["_year"])
     if gdf.empty:
-        raise ValueError(
-            f"No valid years could be parsed from column '{date_column}'."
-        )
+        raise ValueError(f"No valid years could be parsed from column '{date_column}'.")
     gdf["_year"] = gdf["_year"].astype(int)
 
     unique_years = sorted(gdf["_year"].unique())
@@ -769,9 +755,7 @@ def run_ndvi_column(
         if result.get("status") == "cancelled":
             return {"output_paths": output_paths}
         if result.get("status") != "success":
-            _log_ndvi(
-                "WARN", f"Year {year} failed: {result.get('message')}"
-            )
+            _log_ndvi("WARN", f"Year {year} failed: {result.get('message')}")
             continue
 
         for suffix, enabled in (
@@ -1309,9 +1293,7 @@ def run_fusion(
                 for s in ledger.stages
                 if _label_prefix is None or s.key.startswith(_label_prefix)
             ]
-            _label_total_weight = sum(
-                _fusion_stage_weight(k) for k in label_stage_keys
-            )
+            _label_total_weight = sum(_fusion_stage_weight(k) for k in label_stage_keys)
 
             def prog_ledger() -> float:
                 """Main-bar value derived from this outcome's ledger state.
@@ -1542,9 +1524,10 @@ def run_fusion(
                     keep_cols = _longitudinal_target_intake_columns(
                         longitudinal_spec, target_feature, outcome_covs
                     )
-                    for wave_label, wpath in (
-                        longitudinal_spec.target_files_per_wave.items()
-                    ):
+                    for (
+                        wave_label,
+                        wpath,
+                    ) in longitudinal_spec.target_files_per_wave.items():
                         wide_frames.append(
                             (wave_label, read_vector_subset(wpath, keep_cols))
                         )
@@ -1563,8 +1546,10 @@ def run_fusion(
                 # next, so a study with many keys never holds every metric
                 # file at once.
                 engine.set_longitudinal_metric_sources(
-                    {ch: dict(longitudinal_spec.greenery_files[ch])
-                     for ch in GREENERY_CHANNELS},
+                    {
+                        ch: dict(longitudinal_spec.greenery_files[ch])
+                        for ch in GREENERY_CHANNELS
+                    },
                     _load_longitudinal_metric_file,
                 )
                 key_noun = "year" if longitudinal_spec.derive_wave_from_date else "wave"

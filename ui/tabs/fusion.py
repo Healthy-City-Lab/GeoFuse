@@ -18,10 +18,8 @@ import rasterio
 import streamlit as st
 from branca.element import MacroElement
 from helpers import (
-    FUSION_TARGET_UPLOAD_TYPES,
     RESTART_SESSION_KEY,
     file_size_mtime_fingerprint,
-    materialize_uploaded_dataset,
     sanitize_gdf_attributes_for_json,
 )
 from jinja2 import Template
@@ -589,9 +587,9 @@ def _seed_fusion_form(p: dict) -> None:
     st.session_state["fusion_exposure_iqr"] = float(p.get("exposure_iqr") or 0.0)
 
     lon = p.get("longitudinal_spec_payload") or {}
-    is_longitudinal = bool(lon) and str(
-        lon.get("scoring_metric", "")
-    ).startswith("mixedlm")
+    is_longitudinal = bool(lon) and str(lon.get("scoring_metric", "")).startswith(
+        "mixedlm"
+    )
     st.session_state["fusion_run_mode"] = (
         _FUSION_RUN_MODE_LON if is_longitudinal else _FUSION_RUN_MODE_CROSS
     )
@@ -645,8 +643,14 @@ def _seed_fusion_form(p: dict) -> None:
                     by_path[path].append(wave)
         if not by_path:
             continue
-        order = sorted(by_path, key=lambda p_: waves.index(by_path[p_][0])
-                       if by_path[p_] and by_path[p_][0] in waves else 0)
+        order = sorted(
+            by_path,
+            key=lambda p_: (
+                waves.index(by_path[p_][0])
+                if by_path[p_] and by_path[p_][0] in waves
+                else 0
+            ),
+        )
         st.session_state[f"fusion_{short}_paths"] = order
         st.session_state[f"fusion_{short}_year_assign"] = {
             path: [w for w in waves if w in by_path[path]] or by_path[path]
@@ -989,9 +993,7 @@ def _render_optimization_setup_panel(
             # Years drive the greenery assignment; the wave column is not
             # needed (intake derives each row's wave from its date).
             if state["date_col"]:
-                years = _discover_years_from_date_column(
-                    preview_gdf, state["date_col"]
-                )
+                years = _discover_years_from_date_column(preview_gdf, state["date_col"])
                 state["discovered_waves"] = years
                 if years:
                     st.caption(
@@ -1177,7 +1179,6 @@ def _render_coverage_chips(covered: dict[str, int], waves: list[str]) -> None:
     st.markdown("".join(chips), unsafe_allow_html=True)
 
 
-
 # Drop zones are laid out as a responsive grid inside the component, so a
 # decade of waves across several files stays on a couple of rows instead of one
 # full-width row per file. Headers wrap rather than truncate — the whole point
@@ -1250,9 +1251,7 @@ def _match_waves_to_filenames(
     claims: dict[str, list[str]] = {}
     for path, wave in hits.items():
         claims.setdefault(wave, []).append(path)
-    return {
-        path: wave for path, wave in hits.items() if len(claims[wave]) == 1
-    }
+    return {path: wave for path, wave in hits.items() if len(claims[wave]) == 1}
 
 
 def _autofill_year_assignment(
@@ -1293,9 +1292,7 @@ def _render_year_fallback(
         options = [w for w in waves if w not in taken]
         wkey = f"fusion_{ch_short}_assign__{path_to_widget_id(path)}"
         if wkey in st.session_state:
-            st.session_state[wkey] = [
-                w for w in st.session_state[wkey] if w in options
-            ]
+            st.session_state[wkey] = [w for w in st.session_state[wkey] if w in options]
         picked = st.multiselect(head, options=options, key=wkey)
         assignment[path] = list(picked)
         stored[path] = list(picked)
@@ -1319,9 +1316,7 @@ def _render_year_assignment(
     # Drop files and years that have since disappeared, so a stale assignment
     # can't resurrect a removed file or an outdated year.
     stored = {
-        p: [w for w in ws if w in waves]
-        for p, ws in stored.items()
-        if p in file_paths
+        p: [w for w in ws if w in waves] for p, ws in stored.items() if p in file_paths
     }
     # A newly added file whose name names exactly one year is assigned for the
     # user; anything ambiguous stays in the unassigned pool.
@@ -1365,7 +1360,11 @@ def _render_year_assignment(
     with st.expander(f"Full paths ({len(file_paths)} file(s))", expanded=False):
         for idx, path in enumerate(file_paths, start=1):
             years = assignment.get(path) or []
-            span = f"{years[0]}–{years[-1]}" if len(years) > 1 else (years[0] if years else "—")
+            span = (
+                f"{years[0]}–{years[-1]}"
+                if len(years) > 1
+                else (years[0] if years else "—")
+            )
             st.caption(f"**{idx}.** `{path}` · {len(years)} year(s): {span}")
     return assignment
 
@@ -1952,7 +1951,10 @@ def _render_study_details_panel(
         if _refine_options:
             _default(
                 "fusion_weight_refine_bin_pct",
-                min(_refine_options, key=lambda o: abs(o - _cgi_formulas.WEIGHT_REFINE_BIN_PCT)),
+                min(
+                    _refine_options,
+                    key=lambda o: abs(o - _cgi_formulas.WEIGHT_REFINE_BIN_PCT),
+                ),
                 _refine_options,
             )
             weight_refine_bin_pct_ui = st.select_slider(
@@ -2436,7 +2438,9 @@ def _render_period_confounding(dt: dict) -> None:
     if r is None and not placebo:
         return
 
-    with st.expander("Is this exposure, or exposure vintage?", expanded=bool(diag.get("confounded"))):
+    with st.expander(
+        "Is this exposure, or exposure vintage?", expanded=bool(diag.get("confounded"))
+    ):
         if r is not None:
             st.metric(
                 "Within-person corr(exposure change, time)",
@@ -2540,9 +2544,7 @@ def _render_covariate_impact(results_view: dict, metric_name: str) -> None:
     if "p_display" not in df.columns:
         df["p_display"] = df["pvalue"].map(_mes.format_pvalue)
     df = df.rename(columns={"p_display": "p"})
-    df = df[
-        ["covariate", "direction", "coef", "std_err", "t_stat", "p", "partial_r2"]
-    ]
+    df = df[["covariate", "direction", "coef", "std_err", "t_stat", "p", "partial_r2"]]
     df = df.sort_values("partial_r2", ascending=False).reset_index(drop=True)
     st.dataframe(
         df, width="stretch", hide_index=True, column_config=_TERM_COLUMN_CONFIG
@@ -2665,7 +2667,12 @@ def _render_composite_map_viewer(results_view: dict, engine) -> None:
                 # The transform has to describe the decimated grid, not the
                 # native one, or the extent is wrong.
                 composites.append(
-                    (label, arr, src.transform * src.transform.scale(scale, scale), src.crs)
+                    (
+                        label,
+                        arr,
+                        src.transform * src.transform.scale(scale, scale),
+                        src.crs,
+                    )
                 )
                 if common_crs is None:
                     common_crs = src.crs
@@ -5020,7 +5027,9 @@ def render(output_dir: str) -> None:
                 )
                 if stale:
                     n, freed = _purge_fusion_preaggr_cache(stale)
-                    st.info(f"Cleared {n} cache file(s), freed {freed / 1024**2:.0f} MB.")
+                    st.info(
+                        f"Cleared {n} cache file(s), freed {freed / 1024**2:.0f} MB."
+                    )
 
             fusion_record = store.submit(
                 type="fusion",
@@ -5085,9 +5094,7 @@ def render(output_dir: str) -> None:
                     target_layer=(
                         target_layer_for_engine if is_vector_target else None
                     ),
-                    target_cleanup_dir=(
-                        target_mat.cleanup_dir if target_mat else None
-                    ),
+                    target_cleanup_dir=(target_mat.cleanup_dir if target_mat else None),
                     target_cleanup_file=(
                         target_mat.cleanup_file if target_mat else None
                     ),

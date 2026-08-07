@@ -81,9 +81,7 @@ class TestSharedJoinMatchesSeparateJoins(unittest.TestCase):
         gx, gy = np.meshgrid(np.arange(0, 500, 50.0), np.arange(0, 500, 50.0))
         pts = [Point(x, y) for x, y in zip(gx.ravel(), gy.ravel())]
         rng = np.random.default_rng(7)
-        veg = gpd.GeoDataFrame(
-            {"gvi_veg": rng.random(len(pts))}, geometry=pts, crs=CRS
-        )
+        veg = gpd.GeoDataFrame({"gvi_veg": rng.random(len(pts))}, geometry=pts, crs=CRS)
         veg.attrs["metric_column"] = "gvi_veg"
         terrain = gpd.GeoDataFrame(
             {"gvi_ter": rng.random(len(pts))}, geometry=pts, crs=CRS
@@ -146,9 +144,7 @@ class TestSampledFrameIsUnchanged(unittest.TestCase):
 
         for channel in ("veg", "terrain"):
             got = shared[channel].to_numpy()
-            self.assertTrue(
-                np.isfinite(got).any(), f"{channel} came back entirely NaN"
-            )
+            self.assertTrue(np.isfinite(got).any(), f"{channel} came back entirely NaN")
             np.testing.assert_array_equal(
                 unshared[channel].to_numpy(), got, err_msg=channel
             )

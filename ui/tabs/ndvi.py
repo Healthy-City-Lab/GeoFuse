@@ -38,8 +38,18 @@ from geofuse.crs_utils import (
 from geofuse.vector_io import geometry_sha256
 
 _MONTH_NAMES = [
-    "January", "February", "March", "April", "May", "June",
-    "July", "August", "September", "October", "November", "December",
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
 ]
 
 
@@ -78,10 +88,9 @@ def _ndvi_units() -> list[dict]:
         if merged is None:
             merged = merge_gdfs_wgs84([input_ds[f]["raw"] for f in fns])
             cache[ck] = merged
-        units.append(
-            {"key": g, "raw": merged, "merged": True, "sources": fns}
-        )
+        units.append({"key": g, "raw": merged, "merged": True, "sources": fns})
     return units
+
 
 # ────────────────────────────────────────────────────────────────────
 # Tab render entry point
@@ -190,14 +199,9 @@ def _ndvi_restart_summary_lines(p: dict) -> list[str]:
     elif mode == "column":
         sm = p.get("season_start_month")
         em = p.get("season_end_month")
-        season = (
-            f"{_MONTH_NAMES[sm - 1]}–{_MONTH_NAMES[em - 1]}"
-            if sm and em
-            else "?"
-        )
+        season = f"{_MONTH_NAMES[sm - 1]}–{_MONTH_NAMES[em - 1]}" if sm and em else "?"
         lines.append(
-            f"**Year column:** `{p.get('date_column', '?')}` "
-            f"(per year, {season})"
+            f"**Year column:** `{p.get('date_column', '?')}` " f"(per year, {season})"
         )
     lines.append(
         f"**Cloud max:** {p.get('cloud_pct', '?')}% · "
@@ -234,9 +238,7 @@ def _ndvi_resubmit_from_params(store, executor, output_dir, rec_id, p, raw):
     rec_name = os.path.splitext(fname or "merged")[0]
 
     if p.get("mode") == "column":
-        record = store.submit(
-            type="ndvi_column", name=rec_name, params=new_params
-        )
+        record = store.submit(type="ndvi_column", name=rec_name, params=new_params)
         executor.submit_ndvi_column_subprocess(
             record,
             fname=fname,
@@ -283,7 +285,15 @@ def _ndvi_resubmit_from_params(store, executor, output_dir, rec_id, p, raw):
 
 
 _NDVI_RESTART_ACCEPT = [
-    "geojson", "json", "gpkg", "shp", "dbf", "shx", "prj", "cpg", "zip",
+    "geojson",
+    "json",
+    "gpkg",
+    "shp",
+    "dbf",
+    "shx",
+    "prj",
+    "cpg",
+    "zip",
 ]
 
 
@@ -315,9 +325,7 @@ def _render_ndvi_merged_restart(store, executor, output_dir, rec, p) -> None:
         if all_ok:
             st.success("✓ All source files verified — no re-upload needed.")
             c1, c2 = st.columns(2)
-            if c1.button(
-                "Cancel restart", key=f"nmr_cancel_{rec.id}", width="stretch"
-            ):
+            if c1.button("Cancel restart", key=f"nmr_cancel_{rec.id}", width="stretch"):
                 st.session_state[RESTART_SESSION_KEY] = None
                 st.rerun()
             if c2.button(
@@ -350,9 +358,7 @@ def _render_ndvi_merged_restart(store, executor, output_dir, rec, p) -> None:
             st.info("Select the group's original files to continue.")
             return
         try:
-            raw = merge_gdfs_wgs84(
-                [g for _, g in load_vector_upload_sessions(uploads)]
-            )
+            raw = merge_gdfs_wgs84([g for _, g in load_vector_upload_sessions(uploads)])
         except Exception as e:
             st.error(f"Failed to read uploaded files: {e}")
             return
@@ -808,9 +814,7 @@ def _render_ndvi_date_config() -> None:
                                 "Years found: " + ", ".join(f"`{y}`" for y in years)
                             )
                         else:
-                            st.warning(
-                                "No parseable years in the selected column."
-                            )
+                            st.warning("No parseable years in the selected column.")
                         st.caption(
                             "Growing-season months composited for each year — pick "
                             "the same months every year for a consistent longitudinal "

@@ -16,7 +16,6 @@ import traceback
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any
 
 from geofuse.logger import bind_job_log_buffer, unbind_job_log_buffer
 from geofuse.persistence.job_store import JobRecord, JobStore

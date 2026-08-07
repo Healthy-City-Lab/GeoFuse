@@ -248,7 +248,9 @@ class LongitudinalSpec:
             association_target=payload.get(
                 "association_target", DEFAULT_ASSOCIATION_TARGET
             ),
-            decline_average_exposure=bool(payload.get("decline_average_exposure", False)),
+            decline_average_exposure=bool(
+                payload.get("decline_average_exposure", False)
+            ),
             decline_exposure_change=bool(payload.get("decline_exposure_change", False)),
             include_wave_fixed_effects=bool(
                 payload.get("include_wave_fixed_effects", True)
@@ -283,9 +285,7 @@ def validate_spec(spec: LongitudinalSpec) -> list[str]:
         )
     if spec.intake_mode == "wide":
         if not spec.target_files_per_wave:
-            errs.append(
-                "target_files_per_wave is required when intake_mode == 'wide'."
-            )
+            errs.append("target_files_per_wave is required when intake_mode == 'wide'.")
         elif not spec.derive_wave_from_date:
             # Wave-keyed intake: one target file per wave label. Under
             # year-keyed waves the files are keyed by their own label instead
@@ -309,7 +309,10 @@ def validate_spec(spec: LongitudinalSpec) -> list[str]:
             f"association_target must be one of {ASSOCIATION_TARGETS}, "
             f"got {spec.association_target!r}."
         )
-    if spec.association_target != "level" and spec.scoring_metric not in MIXEDLM_METRICS:
+    if (
+        spec.association_target != "level"
+        and spec.scoring_metric not in MIXEDLM_METRICS
+    ):
         errs.append(
             "association_target only applies to a mixed-effects scoring_metric; "
             f"got target {spec.association_target!r} with metric {spec.scoring_metric!r}."

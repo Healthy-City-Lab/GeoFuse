@@ -4,7 +4,6 @@ import hashlib
 import json
 import logging
 import os
-import time
 import traceback
 import zipfile
 from collections.abc import Callable, Mapping
@@ -592,8 +591,10 @@ class NDVIEngine:
         """
         merged = None
         for cid, _prep in self._landsat_sensor_preps():
-            col = ee.ImageCollection(cid).filterBounds(aoi).filterDate(
-                start_date, end_date
+            col = (
+                ee.ImageCollection(cid)
+                .filterBounds(aoi)
+                .filterDate(start_date, end_date)
             )
             merged = col if merged is None else merged.merge(col)
         return merged

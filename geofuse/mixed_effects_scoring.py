@@ -51,8 +51,6 @@ import warnings
 import numpy as np
 import pandas as pd
 
-from . import parallel
-
 logger = logging.getLogger(__name__)
 
 MIXEDLM_METRICS: frozenset[str] = frozenset(
@@ -309,9 +307,7 @@ def _build_target_design(
                 named.append(("__target__", gdev * t))
 
     X = np.column_stack([c[1] for c in named])
-    target_col = next(
-        (i for i, (nm, _) in enumerate(named) if nm == "__target__"), -1
-    )
+    target_col = next((i for i, (nm, _) in enumerate(named) if nm == "__target__"), -1)
     return X, target_col
 
 
@@ -594,7 +590,12 @@ def score_mixedlm(
     time_fixed = include_time_fixed and not _time_spanned_by(t, wave_d)
 
     built = _build_target_design(
-        g, cov, t, eids, target=target, include_time_fixed=time_fixed,
+        g,
+        cov,
+        t,
+        eids,
+        target=target,
+        include_time_fixed=time_fixed,
         include_target=True,
     )
     if built is None:  # e.g. a within-person slope with no over-time variation
@@ -616,8 +617,13 @@ def score_mixedlm(
     X_null = None
     if need_lr or need_r2:
         null_built = _build_target_design(
-            g, cov, t, eids, target=target,
-            include_time_fixed=time_fixed, include_target=False,
+            g,
+            cov,
+            t,
+            eids,
+            target=target,
+            include_time_fixed=time_fixed,
+            include_target=False,
         )
         X_null = null_built[0] if null_built is not None else None
     if need_r2 and X_null is not None:
@@ -630,7 +636,9 @@ def score_mixedlm(
     # A failed refit would collapse the metric to 0.0, indistinguishable from a
     # genuinely tiny value, so a single-metric request fails instead.
     if not return_all:
-        if metric == "mixedlm_lr" and (result_full_ml is None or result_null_ml is None):
+        if metric == "mixedlm_lr" and (
+            result_full_ml is None or result_null_ml is None
+        ):
             return _degenerate()
         if metric == "mixedlm_marginal_r2" and result_null is None:
             return _degenerate()
@@ -900,16 +908,21 @@ def estimate_fold_components(
         None if wave_index is None else np.asarray(wave_index)[mask], len(y)
     )
     cov = _stack_period_terms(
-        cov, wave_d, _group_dummies(
-            None if area_id is None else np.asarray(area_id)[mask], len(y)
-        )
+        cov,
+        wave_d,
+        _group_dummies(None if area_id is None else np.asarray(area_id)[mask], len(y)),
     )
     include_time_fixed = include_time_fixed and not _time_spanned_by(t, wave_d)
     if len(y) < _MIN_ROWS or len(np.unique(eids)) < 2 or float(np.var(y)) == 0:
         return None
     base = _build_target_design(
-        _g, cov, t, eids, target=target,
-        include_time_fixed=include_time_fixed, include_target=False,
+        _g,
+        cov,
+        t,
+        eids,
+        target=target,
+        include_time_fixed=include_time_fixed,
+        include_target=False,
     )
     if base is None:
         return None
@@ -975,14 +988,19 @@ def score_mixedlm_fast(
         None if wave_index is None else np.asarray(wave_index)[mask], len(y)
     )
     cov = _stack_period_terms(
-        cov, wave_d, _group_dummies(
-            None if area_id is None else np.asarray(area_id)[mask], len(y)
-        )
+        cov,
+        wave_d,
+        _group_dummies(None if area_id is None else np.asarray(area_id)[mask], len(y)),
     )
     include_time_fixed = include_time_fixed and not _time_spanned_by(t, wave_d)
     built = _build_target_design(
-        g, cov, t, eids, target=target,
-        include_time_fixed=include_time_fixed, include_target=True,
+        g,
+        cov,
+        t,
+        eids,
+        target=target,
+        include_time_fixed=include_time_fixed,
+        include_target=True,
     )
     if built is None:
         return _degenerate()
@@ -1071,9 +1089,9 @@ def compare_models_aic_bic_mixedlm(
         None if wave_index is None else np.asarray(wave_index)[mask], len(y)
     )
     cov = _stack_period_terms(
-        cov, wave_d, _group_dummies(
-            None if area_id is None else np.asarray(area_id)[mask], len(y)
-        )
+        cov,
+        wave_d,
+        _group_dummies(None if area_id is None else np.asarray(area_id)[mask], len(y)),
     )
     include_time_fixed = include_time_fixed and not _time_spanned_by(t, wave_d)
 
@@ -1250,11 +1268,17 @@ def covariate_impact_mixedlm(
         cov_minus = cov_minus if cov_minus.shape[1] > 0 else None
         cov_minus = _stack_period_terms(cov_minus, wave_d, area_d)
         X_minus, _ = _build_fixed_design(
-            g, cov_minus, t, include_time_fixed=include_time_fixed, include_greenery=True
+            g,
+            cov_minus,
+            t,
+            include_time_fixed=include_time_fixed,
+            include_greenery=True,
         )
         refit = _fit_mixedlm(y, X_minus, eids, exog_re)
         r2_minus = (
-            _marginal_r2_from_fit(refit, X_minus, exog_re) if refit is not None else r2_full
+            _marginal_r2_from_fit(refit, X_minus, exog_re)
+            if refit is not None
+            else r2_full
         )
         partial_r2 = max(0.0, r2_full - r2_minus)
 
@@ -1346,12 +1370,7 @@ def cluster_bootstrap_metric_ci(
     sb = _coerce_2d(spatial_basis) if spatial_method != "none" else None
 
     # Drop non-finite rows up front so the resampled group-row indices are valid.
-    mask = (
-        np.isfinite(y)
-        & np.isfinite(g)
-        & np.isfinite(t)
-        & ~_entity_missing_mask(eid)
-    )
+    mask = np.isfinite(y) & np.isfinite(g) & np.isfinite(t) & ~_entity_missing_mask(eid)
     if cov is not None:
         mask &= np.isfinite(cov).all(axis=1)
     if sb is not None:
@@ -1363,8 +1382,17 @@ def cluster_bootstrap_metric_ci(
     area = None if area_id is None else np.asarray(area_id)[mask]
 
     def _score(
-        yy, gg, ee, tt, cc, ss, wv=None, ar=None, *,
-        return_pvalue=False, nan_on_fail=False,
+        yy,
+        gg,
+        ee,
+        tt,
+        cc,
+        ss,
+        wv=None,
+        ar=None,
+        *,
+        return_pvalue=False,
+        nan_on_fail=False,
     ):
         return score_mixedlm(
             metric,
@@ -1553,7 +1581,9 @@ def decline_terms_mixedlm(
     if len(y) < _MIN_ROWS or len(np.unique(eids)) < 2 or float(np.var(y)) == 0:
         return None
 
-    cov_cols = [] if cov is None else [(f"cov{j}", cov[:, j]) for j in range(cov.shape[1])]
+    cov_cols = (
+        [] if cov is None else [(f"cov{j}", cov[:, j]) for j in range(cov.shape[1])]
+    )
     exog_re = _build_re_design(t, random_slope=random_slope)
 
     # Person-mean (between) and deviation (within) exposure.
@@ -1627,7 +1657,11 @@ def decline_terms_mixedlm(
                 else _unestimable("within")
             )
 
-    return {"n": int(len(y)), "within_estimable": bool(within_estimable), "terms": terms}
+    return {
+        "n": int(len(y)),
+        "within_estimable": bool(within_estimable),
+        "terms": terms,
+    }
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -1644,9 +1678,7 @@ def placebo_exposure(greenery: np.ndarray, wave_index: np.ndarray) -> np.ndarray
     content. A greenery × time term that survives this substitution is measuring
     the wave, not the neighbourhood."""
     g = np.asarray(greenery, dtype=np.float64).ravel()
-    return (
-        pd.Series(g).groupby(np.asarray(wave_index)).transform("mean").to_numpy()
-    )
+    return pd.Series(g).groupby(np.asarray(wave_index)).transform("mean").to_numpy()
 
 
 def period_confounding_report(

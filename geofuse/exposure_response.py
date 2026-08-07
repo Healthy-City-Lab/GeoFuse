@@ -282,7 +282,9 @@ def _natural_cubic_basis(x: np.ndarray, df: int = SPLINE_DF) -> np.ndarray | Non
     try:
         from patsy import dmatrix
     except Exception:
-        logger.warning("patsy is unavailable; the spline non-linearity test is skipped.")
+        logger.warning(
+            "patsy is unavailable; the spline non-linearity test is skipped."
+        )
         return None
     try:
         basis = np.asarray(
@@ -602,9 +604,7 @@ def spline_nonlinearity_test(
     grid = np.linspace(np.nanpercentile(x, 1), np.nanpercentile(x, 99), _CURVE_POINTS)
     joint = _natural_cubic_basis(np.concatenate([x, grid]), df)
     if joint is not None and joint.shape[1] == basis.shape[1]:
-        joint_linear = np.column_stack(
-            [np.ones(len(joint)), np.concatenate([x, grid])]
-        )
+        joint_linear = np.column_stack([np.ones(len(joint)), np.concatenate([x, grid])])
         q, _ = np.linalg.qr(joint_linear)
         joint_nl = (joint - q @ (q.T @ joint))[:, kept]
         yhat = fitted["linear"][0] * grid + joint_nl[n:] @ beta_nl
@@ -623,8 +623,12 @@ def spline_nonlinearity_test(
         "nonlinearity_p": p_nonlinear,
         "exact_wald": cov_entry is not None,
         "per_term": [
-            {"term": nm, "coef": fitted[nm][0], "std_error": fitted[nm][1],
-             "p_value": fitted[nm][2]}
+            {
+                "term": nm,
+                "coef": fitted[nm][0],
+                "std_error": fitted[nm][1],
+                "p_value": fitted[nm][2],
+            }
             for nm in nonlinear_names
         ],
         "curve": curve,

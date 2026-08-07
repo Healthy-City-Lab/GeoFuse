@@ -129,7 +129,11 @@ def build_scenario(tmpdir, *, lazy_raster):
         data = LazyRasterArray(path, band=1)
     else:
         data = np.ma.masked_equal(band, -9999.0)
-    ndvi = {"data": data, "transform": transform, "crs": rasterio.crs.CRS.from_string(CRS)}
+    ndvi = {
+        "data": data,
+        "transform": transform,
+        "crs": rasterio.crs.CRS.from_string(CRS),
+    }
 
     entity_xy = rng.uniform(400.0, 2000.0, (192, 2))
     return veg, terrain, ndvi, entity_xy
@@ -380,9 +384,7 @@ class TestLookupPlan(unittest.TestCase):
         out = np.full(ids.shape[0], np.nan, dtype=np.float32)
         for wave in np.unique(waves):
             mask = waves == wave
-            sub = cache.lookup(
-                ids[mask], channel, radius, column, wave_index=int(wave)
-            )
+            sub = cache.lookup(ids[mask], channel, radius, column, wave_index=int(wave))
             if sub is None:
                 return None
             out[mask] = sub

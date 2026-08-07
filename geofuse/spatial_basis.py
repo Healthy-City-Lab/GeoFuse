@@ -278,9 +278,7 @@ def build_block_basis(
             ind = np.zeros(n, dtype=np.float64)
             ind[idx] = 1.0
             intercept_cols.append(ind)
-        lin_c, phi_c = _component_columns(
-            xy[idx], max_df=max_df, knot_cap=_KNOT_CAP
-        )
+        lin_c, phi_c = _component_columns(xy[idx], max_df=max_df, knot_cap=_KNOT_CAP)
         knots_per_component.append(int(phi_c.shape[1]))
         for j in range(lin_c.shape[1]):
             col = np.zeros(n, dtype=np.float64)

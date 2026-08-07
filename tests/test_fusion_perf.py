@@ -219,9 +219,7 @@ class TestCollapseStatics(unittest.TestCase):
         for string_keys in (False, True):
             pid, values = self._synthetic(rng, string_keys=string_keys)
             codes, uniq = pd.factorize(pid, sort=True)
-            legacy = MetricFusionEngine._collapse_to_entities(
-                values, pid, None, "mean"
-            )
+            legacy = MetricFusionEngine._collapse_to_entities(values, pid, None, "mean")
             fast = MetricFusionEngine._collapse_mean_from_codes(
                 values, codes.astype(np.int64), len(uniq), None
             )

@@ -110,8 +110,9 @@ class TestYearKeyedIntake(unittest.TestCase):
         self.assertEqual(validate_spec(spec), [])
 
     def test_long_mode_without_wave_column(self):
-        spec = _spec(("2010", "2012"), {}, {"2010": "g.tif", "2012": "g.tif"},
-                     intake_mode="long")
+        spec = _spec(
+            ("2010", "2012"), {}, {"2010": "g.tif", "2012": "g.tif"}, intake_mode="long"
+        )
         self.assertEqual(validate_spec(spec), [])
         f = _frame(["2010-05-01", "2012-05-01"], ["a", "a"])
         out = build_long_format(spec, f, outcome_col="y")
@@ -186,11 +187,15 @@ class TestRasterDiscAggregation(unittest.TestCase):
             Point(x0, y0),
             MultiPoint([(x0, y0), (x0 + 50, y0 + 50)]),
             LineString([(x0, y0), (x0 + 200, y0)]),
-            MultiLineString([[(x0, y0), (x0 + 100, y0)], [(x0, y0 + 60), (x0 + 90, y0 + 60)]]),
+            MultiLineString(
+                [[(x0, y0), (x0 + 100, y0)], [(x0, y0 + 60), (x0 + 90, y0 + 60)]]
+            ),
             Polygon([(x0, y0), (x0 + 150, y0), (x0 + 150, y0 + 150), (x0, y0 + 150)]),
             MultiPolygon(
                 [
-                    Polygon([(x0, y0), (x0 + 80, y0), (x0 + 80, y0 + 80), (x0, y0 + 80)]),
+                    Polygon(
+                        [(x0, y0), (x0 + 80, y0), (x0 + 80, y0 + 80), (x0, y0 + 80)]
+                    ),
                     Polygon(
                         [
                             (x0 + 300, y0 + 300),

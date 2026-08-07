@@ -78,6 +78,7 @@ def _warn_once(key: str, message: str) -> None:
         _warned_fallbacks.add(key)
         logger.warning(message)
 
+
 # Public set of metric names this module knows how to score; engine-level
 # validation should compare against it before calling :func:`score`.
 SUPPORTED_METRICS: frozenset[str] = frozenset(
@@ -370,7 +371,7 @@ def partial_distance_correlation(
     y: np.ndarray,
     z: np.ndarray | None,
     *,
-    cache: "dict | None" = None,
+    cache: dict | None = None,
 ) -> float:
     """Partial distance correlation of ``x`` and ``y`` given ``z`` (Székely–Rizzo).
 
@@ -489,8 +490,8 @@ def score(
     spatial_basis: np.ndarray | None = None,
     spatial_method: str = "none",
     residualize_method: str = "linear",
-    pdcor_cache: "dict | None" = None,
-    spline_cache: "dict | None" = None,
+    pdcor_cache: dict | None = None,
+    spline_cache: dict | None = None,
 ) -> float | tuple[float, float]:
     """Score CGI's predictive power for ``target``, controlling for ``covariates``.
 

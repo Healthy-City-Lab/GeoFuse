@@ -386,9 +386,7 @@ def bootstrap_score_ci(
         # which BCa under-covers on a skewed score. Leave-one-out uses a toggled
         # boolean mask; under cluster resampling the unit dropped is a whole
         # group, matching the resampling design.
-        jack_units = (
-            group_row_indices if group_row_indices is not None else None
-        )
+        jack_units = group_row_indices if group_row_indices is not None else None
         jack_n = n if jack_units is None else len(jack_units)
         jack_scores = np.empty(jack_n, dtype=np.float64)
         base_idx = np.arange(n)

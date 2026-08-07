@@ -285,9 +285,7 @@ def precompute_raster_ring_values(
     n_pts = len(points_gdf)
     n_rings = len(radii_m)
     _empty = np.array([], dtype=np.float64)
-    ring_values: list[list[np.ndarray]] = [
-        [_empty] * n_rings for _ in range(n_pts)
-    ]
+    ring_values: list[list[np.ndarray]] = [[_empty] * n_rings for _ in range(n_pts)]
     if n_pts == 0 or n_rings == 0:
         return ring_values
 
@@ -382,9 +380,7 @@ def precompute_vector_ring_values(
     n_pts = len(points_gdf)
     n_rings = len(radii_m)
     _empty = np.array([], dtype=np.float64)
-    ring_values: list[list[np.ndarray]] = [
-        [_empty] * n_rings for _ in range(n_pts)
-    ]
+    ring_values: list[list[np.ndarray]] = [[_empty] * n_rings for _ in range(n_pts)]
     if n_pts == 0 or len(metric_data) == 0:
         return ring_values
 

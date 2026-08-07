@@ -251,9 +251,7 @@ def _gvi_restart_summary_lines(p: dict) -> list[str]:
     max_diff = p.get("max_year_diff")
     window = f" (±{max_diff} yr max)" if max_diff is not None else ""
     if p.get("mode") == "column":
-        year_line = (
-            f"**Per year** from column `{p.get('date_column', '?')}`{window}"
-        )
+        year_line = f"**Per year** from column `{p.get('date_column', '?')}`{window}"
     else:
         target_year = p.get("target_year")
         if target_year is None:
@@ -369,7 +367,17 @@ def _gvi_resubmit_from_params(
     return record
 
 
-_GVI_RESTART_ACCEPT = ["geojson", "json", "gpkg", "shp", "dbf", "shx", "prj", "cpg", "zip"]
+_GVI_RESTART_ACCEPT = [
+    "geojson",
+    "json",
+    "gpkg",
+    "shp",
+    "dbf",
+    "shx",
+    "prj",
+    "cpg",
+    "zip",
+]
 
 
 def _render_gvi_merged_restart(store, executor, pano_cache, output_dir, rec, p) -> None:
@@ -415,9 +423,7 @@ def _render_gvi_merged_restart(store, executor, pano_cache, output_dir, rec, p) 
         if all_ok:
             st.success("✓ All source files verified — no re-upload needed.")
             c1, c2 = st.columns(2)
-            if c1.button(
-                "Cancel restart", key=f"gmr_cancel_{rec.id}", width="stretch"
-            ):
+            if c1.button("Cancel restart", key=f"gmr_cancel_{rec.id}", width="stretch"):
                 st.session_state[RESTART_SESSION_KEY] = None
                 st.rerun()
             if c2.button(
@@ -702,9 +708,7 @@ def _gvi_units() -> list[dict]:
             merged = merge_gdfs_wgs84([input_ds[f]["raw"] for f in fns])
             cache[ck] = merged
         gtype = (
-            "poly"
-            if any(input_ds[f].get("type") == "poly" for f in fns)
-            else "point"
+            "poly" if any(input_ds[f].get("type") == "poly" for f in fns) else "point"
         )
         units.append(
             {
@@ -728,9 +732,7 @@ def _gvi_prepare_processed(raw, gtype: str, buffer_m: int, res: int):
     """
     uses_grid = gtype == "poly" or (gtype == "point" and buffer_m > 0)
     if uses_grid:
-        return generate_clustered_grid(
-            raw, buffer_m=float(buffer_m), step_m=float(res)
-        )
+        return generate_clustered_grid(raw, buffer_m=float(buffer_m), step_m=float(res))
     return raw.copy(), None
 
 
@@ -760,9 +762,7 @@ def _render_gvi_date_config() -> None:
         key = unit["key"]
         raw = unit["raw"]
         title = (
-            f"{key}  ·  {len(unit['sources'])} files merged"
-            if unit["merged"]
-            else key
+            f"{key}  ·  {len(unit['sources'])} files merged" if unit["merged"] else key
         )
         cfg = st.session_state.gvi_date_configs.setdefault(
             key,
@@ -814,9 +814,7 @@ def _render_gvi_date_config() -> None:
                     )
                     years = _gvi_discover_years(raw, cfg["date_column"])
                     if years:
-                        st.caption(
-                            "Years found: " + ", ".join(f"`{y}`" for y in years)
-                        )
+                        st.caption("Years found: " + ", ".join(f"`{y}`" for y in years))
                     else:
                         st.warning("No parseable years in the selected column.")
                 else:

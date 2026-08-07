@@ -50,7 +50,9 @@ class TestChildProtocol(unittest.TestCase):
     def test_unreadable_request_reports_an_error_object(self):
         proc = subprocess.run(
             [sys.executable, CHILD, os.path.join(REPO, "does-not-exist.json")],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True,
+            text=True,
+            timeout=60,
         )
         self.assertIn("error", json.loads(proc.stdout.strip()))
 
@@ -63,7 +65,9 @@ class TestChildProtocol(unittest.TestCase):
         try:
             proc = subprocess.run(
                 [sys.executable, "-c", stub, path],
-                capture_output=True, text=True, timeout=60,
+                capture_output=True,
+                text=True,
+                timeout=60,
             )
         finally:
             os.unlink(path)
@@ -86,7 +90,9 @@ class TestChildProtocol(unittest.TestCase):
         try:
             proc = subprocess.run(
                 [sys.executable, "-c", stub, path],
-                capture_output=True, text=True, timeout=120,
+                capture_output=True,
+                text=True,
+                timeout=120,
             )
         finally:
             os.unlink(path)
@@ -109,7 +115,9 @@ class TestChildProtocol(unittest.TestCase):
             try:
                 proc = subprocess.run(
                     [sys.executable, "-c", stub, path],
-                    capture_output=True, text=True, timeout=120,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
                 )
                 result["rc"] = proc.returncode
                 result["out"] = proc.stdout.strip()

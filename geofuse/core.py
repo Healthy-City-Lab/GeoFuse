@@ -1,6 +1,3 @@
-import json
-import logging
-import os
 
 import geopandas as gpd
 import numpy as np
@@ -15,7 +12,6 @@ from shapely.strtree import STRtree
 from .crs_utils import (
     WGS84_EPSG,
     metres_per_degree_at_lat,
-    reproject_geodataframe_to_wgs84,
     select_grid_crs_with_warning,
 )
 from .logger import get_logger

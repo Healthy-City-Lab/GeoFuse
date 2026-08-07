@@ -175,9 +175,7 @@ class TestSeeder(unittest.TestCase):
             self.fusion._seed_fusion_form(p)
 
         self.assertEqual(self.state["fusion_target_paths"][0], first)
-        self.assertEqual(
-            self.state["fusion_target_upload_sig"], (first, 4)
-        )
+        self.assertEqual(self.state["fusion_target_upload_sig"], (first, 4))
         self.assertEqual(self.state["fusion_outcome_columns"], ["SCORE"])
 
 
@@ -229,19 +227,30 @@ class TestEveryRecordedSettingIsRestored(unittest.TestCase):
         into the job record and out of the form.
         """
         handled = {
-            "covariate_columns", "covariate_types", "moderator_columns",
-            "standalone_channels", "longitudinal_spec_payload",
-            "target_display_name", "ndvi_start_date", "ndvi_end_date",
-            "ndvi_project_id", "cache_metrics", "buffer_meters",
-            "ndvi_resolution_m", "gvi_grid_spacing_m", "n_spatial_blocks",
-            "min_cell_count", "worst_quantile",
+            "covariate_columns",
+            "covariate_types",
+            "moderator_columns",
+            "standalone_channels",
+            "longitudinal_spec_payload",
+            "target_display_name",
+            "ndvi_start_date",
+            "ndvi_end_date",
+            "ndvi_project_id",
+            "cache_metrics",
+            "buffer_meters",
+            "ndvi_resolution_m",
+            "gvi_grid_spacing_m",
+            "n_spatial_blocks",
+            "min_cell_count",
+            "worst_quantile",
             # ``None`` carries meaning here (use the composite's own IQR) and
             # has to seed the widget as 0.0, which the generic map — which
             # skips ``None`` outright — cannot express.
             "exposure_iqr",
         }
         missing = [
-            k for k in self.fusion._FUSION_RUN_CONFIG_KEYS
+            k
+            for k in self.fusion._FUSION_RUN_CONFIG_KEYS
             if k not in self.fusion._FUSION_PARAM_TO_WIDGET and k not in handled
         ]
         self.assertEqual(missing, [], f"recorded but never restored: {missing}")
@@ -357,9 +366,7 @@ class TestFormSurvivesAbortedRerun(unittest.TestCase):
                 fh.write(self.APP.format(root=ROOT))
             at = AppTest.from_file(path, default_timeout=60)
             at.run()
-            at.radio(key="fusion_run_mode").set_value(
-                "Mixed-effects (longitudinal)"
-            )
+            at.radio(key="fusion_run_mode").set_value("Mixed-effects (longitudinal)")
             at.run()
             at.selectbox(key="fusion_objective_metric").set_value("mixedlm_coef")
             at.run()
@@ -374,9 +381,7 @@ class TestFormSurvivesAbortedRerun(unittest.TestCase):
         self.assertEqual(
             at.session_state["fusion_run_mode"], "Mixed-effects (longitudinal)"
         )
-        self.assertEqual(
-            at.session_state["fusion_objective_metric"], "mixedlm_coef"
-        )
+        self.assertEqual(at.session_state["fusion_objective_metric"], "mixedlm_coef")
 
     def test_without_the_pin_the_form_is_lost(self):
         at = self._run("0")

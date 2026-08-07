@@ -100,8 +100,12 @@ class TestPointEstimates(unittest.TestCase):
 
     def test_association_targets_score_their_own_term(self):
         d = make_panel(
-            n_entities=1500, b_level=0.40, b_between=-0.10, b_within=0.25,
-            b_cov=(0.8, -0.5, 1.2), seed=7,
+            n_entities=1500,
+            b_level=0.40,
+            b_between=-0.10,
+            b_within=0.25,
+            b_cov=(0.8, -0.5, 1.2),
+            seed=7,
         )
         got = {
             tgt: float(
@@ -120,8 +124,13 @@ class TestPointEstimates(unittest.TestCase):
             n_entities=800, b_level=0.3, b_between=-0.1, b_within=0.25, seed=11
         )
         report = mes.decline_terms_mixedlm(
-            d["y"], d["g"], d["eid"], d["t"], d["X"],
-            want_between=True, want_within=True,
+            d["y"],
+            d["g"],
+            d["eid"],
+            d["t"],
+            d["X"],
+            want_between=True,
+            want_within=True,
         )
         by_key = {r["key"]: r["coef"] for r in report["terms"]}
         for key, tgt in (("between", "decline_average"), ("within", "decline_change")):
@@ -134,8 +143,11 @@ class TestPointEstimates(unittest.TestCase):
 
     def test_covariate_adjustment_removes_a_planted_confound(self):
         d = make_panel(
-            n_entities=1200, b_level=0.0, b_cov=(1.0, -0.5, 1.2),
-            cov_confounds_greenery=0.7, seed=5,
+            n_entities=1200,
+            b_level=0.0,
+            b_cov=(1.0, -0.5, 1.2),
+            cov_confounds_greenery=0.7,
+            seed=5,
         )
         unadjusted = float(
             mes.score_mixedlm("mixedlm_coef", d["y"], d["g"], d["eid"], d["t"], None)
@@ -171,13 +183,23 @@ class TestCalibration(unittest.TestCase):
             d = make_panel(n_entities=250, seed=4000 + rep, **panel_kw)
             if key == "level":
                 _c, p = mes.score_mixedlm(
-                    "mixedlm_coef", d["y"], d["g"], d["eid"], d["t"], d["X"],
+                    "mixedlm_coef",
+                    d["y"],
+                    d["g"],
+                    d["eid"],
+                    d["t"],
+                    d["X"],
                     return_pvalue=True,
                 )
             else:
                 terms = mes.decline_terms_mixedlm(
-                    d["y"], d["g"], d["eid"], d["t"], d["X"],
-                    want_between=True, want_within=True,
+                    d["y"],
+                    d["g"],
+                    d["eid"],
+                    d["t"],
+                    d["X"],
+                    want_between=True,
+                    want_within=True,
                 )
                 p = {r["key"]: r["pvalue"] for r in terms["terms"]}[key]
             hits += int(np.isfinite(p) and float(p) < 0.05)
@@ -199,8 +221,13 @@ class TestCalibration(unittest.TestCase):
         for rep in range(40):
             d = make_panel(n_entities=400, b_within=0.30, seed=6000 + rep)
             terms = mes.decline_terms_mixedlm(
-                d["y"], d["g"], d["eid"], d["t"], d["X"],
-                want_between=True, want_within=True,
+                d["y"],
+                d["g"],
+                d["eid"],
+                d["t"],
+                d["X"],
+                want_between=True,
+                want_within=True,
             )
             p = {r["key"]: r["pvalue"] for r in terms["terms"]}["within"]
             hits += int(float(p) < 0.05)
@@ -214,9 +241,13 @@ class TestMetricCorrectness(unittest.TestCase):
         # LR and t^2 test the same restriction, so they agree closely at n large.
         for b in (0.0, 0.10, 0.25):
             with self.subTest(b=b):
-                d = make_panel(n_entities=1000, b_level=b, b_cov=(0.8, -0.5, 1.2), seed=5)
+                d = make_panel(
+                    n_entities=1000, b_level=b, b_cov=(0.8, -0.5, 1.2), seed=5
+                )
                 lr = float(
-                    mes.score_mixedlm("mixedlm_lr", d["y"], d["g"], d["eid"], d["t"], d["X"])
+                    mes.score_mixedlm(
+                        "mixedlm_lr", d["y"], d["g"], d["eid"], d["t"], d["X"]
+                    )
                 )
                 tstat = float(
                     mes.score_mixedlm(
@@ -228,7 +259,9 @@ class TestMetricCorrectness(unittest.TestCase):
 
     def test_likelihood_ratio_is_not_stuck_at_zero(self):
         d = make_panel(n_entities=1000, b_level=0.25, b_cov=(0.8, -0.5, 1.2), seed=5)
-        lr = float(mes.score_mixedlm("mixedlm_lr", d["y"], d["g"], d["eid"], d["t"], d["X"]))
+        lr = float(
+            mes.score_mixedlm("mixedlm_lr", d["y"], d["g"], d["eid"], d["t"], d["X"])
+        )
         self.assertGreater(lr, 10.0)
 
     def test_marginal_r2_survives_a_confounded_exposure(self):
@@ -237,8 +270,11 @@ class TestMetricCorrectness(unittest.TestCase):
         got = {}
         for b in (-0.3, 0.3):
             d = make_panel(
-                n_entities=1000, b_level=b, b_cov=(1.0, -0.5, 1.2),
-                cov_confounds_greenery=0.8, seed=9,
+                n_entities=1000,
+                b_level=b,
+                b_cov=(1.0, -0.5, 1.2),
+                cov_confounds_greenery=0.8,
+                seed=9,
             )
             got[b] = float(
                 mes.score_mixedlm(
@@ -253,8 +289,13 @@ class TestMetricCorrectness(unittest.TestCase):
 
         d = make_panel(n_entities=500, b_level=0.25, b_cov=(0.8, -0.5, 1.2), seed=3)
         comp = mes.estimate_fold_components(
-            d["y"], d["X"], d["t"], d["eid"],
-            method="mom_em3", include_time_fixed=True, random_slope=True,
+            d["y"],
+            d["X"],
+            d["t"],
+            d["eid"],
+            method="mom_em3",
+            include_time_fixed=True,
+            random_slope=True,
         )
         self.assertIsNotNone(comp)
         rng = np.random.default_rng(0)
@@ -265,13 +306,22 @@ class TestMetricCorrectness(unittest.TestCase):
             fast.append(
                 float(
                     mes.score_mixedlm_fast(
-                        "mixedlm_tstat", d["y"], gk, d["eid"], d["t"], d["X"],
+                        "mixedlm_tstat",
+                        d["y"],
+                        gk,
+                        d["eid"],
+                        d["t"],
+                        d["X"],
                         components=comp,
                     )
                 )
             )
             exact.append(
-                float(mes.score_mixedlm("mixedlm_tstat", d["y"], gk, d["eid"], d["t"], d["X"]))
+                float(
+                    mes.score_mixedlm(
+                        "mixedlm_tstat", d["y"], gk, d["eid"], d["t"], d["X"]
+                    )
+                )
             )
         self.assertGreater(float(spearmanr(fast, exact).statistic), 0.95)
         self.assertLess(float(np.max(np.abs(np.array(fast) - np.array(exact)))), 0.5)
@@ -287,8 +337,13 @@ class TestEstimability(unittest.TestCase):
     def test_within_term_reports_not_estimable(self):
         d = make_panel(n_entities=300, freeze_exposure=True, seed=3)
         out = mes.decline_terms_mixedlm(
-            d["y"], d["g"], d["eid"], d["t"], d["X"],
-            want_between=True, want_within=True,
+            d["y"],
+            d["g"],
+            d["eid"],
+            d["t"],
+            d["X"],
+            want_between=True,
+            want_within=True,
         )
         self.assertFalse(out["within_estimable"])
         within = {r["key"]: r for r in out["terms"]}["within"]
@@ -341,8 +396,13 @@ class TestPeriodConfounding(unittest.TestCase):
             d["y"], d["g"], d["eid"], d["t"], None, want_within=True
         )
         with_fe = mes.decline_terms_mixedlm(
-            d["y"], d["g"], d["eid"], d["t"], None,
-            want_within=True, wave_index=d["wave"],
+            d["y"],
+            d["g"],
+            d["eid"],
+            d["t"],
+            None,
+            want_within=True,
+            wave_index=d["wave"],
         )
         p_without = {r["key"]: r["pvalue"] for r in without["terms"]}["within"]
         p_with = {r["key"]: r["pvalue"] for r in with_fe["terms"]}["within"]
@@ -359,7 +419,9 @@ class TestPeriodConfounding(unittest.TestCase):
         placebo = mes.decline_terms_mixedlm(
             d["y"],
             mes.placebo_exposure(d["g"], d["wave"]),
-            d["eid"], d["t"], None,
+            d["eid"],
+            d["t"],
+            None,
             want_within=True,
         )
         real_overall = {r["key"]: r for r in real["terms"]}["overall"]
@@ -399,12 +461,23 @@ class TestAreaClustering(unittest.TestCase):
         for rep in range(reps):
             d = self._area_panel(seed=7000 + rep)
             _c, p0 = mes.score_mixedlm(
-                "mixedlm_coef", d["y"], d["g"], d["eid"], d["t"], None,
+                "mixedlm_coef",
+                d["y"],
+                d["g"],
+                d["eid"],
+                d["t"],
+                None,
                 return_pvalue=True,
             )
             _c, p1 = mes.score_mixedlm(
-                "mixedlm_coef", d["y"], d["g"], d["eid"], d["t"], None,
-                return_pvalue=True, area_id=d["area"],
+                "mixedlm_coef",
+                d["y"],
+                d["g"],
+                d["eid"],
+                d["t"],
+                None,
+                return_pvalue=True,
+                area_id=d["area"],
             )
             hits_without += int(float(p0) < 0.05)
             hits_with += int(float(p1) < 0.05)

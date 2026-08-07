@@ -23,19 +23,11 @@ so memory use is proportional to one feature's worth of pixels.
 
 from __future__ import annotations
 
-import math
 import threading
-from collections.abc import Callable
 
-import geopandas as gpd
 import numpy as np
 import rasterio
-from rasterio.features import geometry_mask
 from rasterio.windows import Window
-from rasterio.windows import from_bounds as window_from_bounds
-from shapely.geometry import Point
-
-from .crs_utils import metres_per_degree_at_lat
 
 # Metric rasters larger than this (uncompressed band bytes) are read lazily in
 # windows from disk instead of loaded whole — keeps national-scale rasters off
@@ -124,5 +116,3 @@ class LazyRasterArray:
             except Exception:
                 pass
         self._local = threading.local()
-
-

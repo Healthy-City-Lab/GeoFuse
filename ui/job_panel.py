@@ -522,8 +522,7 @@ def _render_job_card(rec, store) -> None:
                         key=f"restart_{rec.id}",
                         width="stretch",
                         help=(
-                            "Re-run — load this job's settings into the setup "
-                            "form."
+                            "Re-run — load this job's settings into the setup " "form."
                             if rec.type == "fusion"
                             else "Restart — resume from where this job stopped."
                         ),

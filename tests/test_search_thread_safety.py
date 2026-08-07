@@ -10,7 +10,6 @@ subset's basis and corrupt a score.
 
 import os
 import sys
-import threading
 import unittest
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -85,12 +84,10 @@ class TestSplineBasisCacheUnderThreads(unittest.TestCase):
 class TestPdcorSideCacheUnderThreads(unittest.TestCase):
     def test_concurrent_sides_match_serial(self):
         subsets = _subsets(pdcor._MAX_SIDE_ENTRIES * 3, 160, 2, seed=3)
-        serial_cache: "OrderedDict" = OrderedDict()
-        expected = [
-            pdcor._get_side(serial_cache, t, c).cc for t, _, c in subsets
-        ]
+        serial_cache: OrderedDict = OrderedDict()
+        expected = [pdcor._get_side(serial_cache, t, c).cc for t, _, c in subsets]
 
-        shared: "OrderedDict" = OrderedDict()
+        shared: OrderedDict = OrderedDict()
         errors: list = []
 
         def work(i):

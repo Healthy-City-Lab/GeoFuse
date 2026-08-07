@@ -52,15 +52,19 @@ def bench_pdcor():
         cached = _time(
             lambda: pdcor.partial_distance_correlation_cached(t2, c2, z, cache)
         )
-        print(f"{n:>7,} {stock * 1e3:>10.1f}ms {cached * 1e3:>10.1f}ms "
-              f"{stock / cached:>7.1f}x")
+        print(
+            f"{n:>7,} {stock * 1e3:>10.1f}ms {cached * 1e3:>10.1f}ms "
+            f"{stock / cached:>7.1f}x"
+        )
 
 
 def bench_collapse():
     rng = np.random.default_rng(1)
     print("\npixel-to-entity mean collapse -- one trial's train+val collapses")
-    print(f"{'pixel rows':>11} {'legacy factorize':>17} {'cached codes':>13} "
-          f"{'speedup':>8}")
+    print(
+        f"{'pixel rows':>11} {'legacy factorize':>17} {'cached codes':>13} "
+        f"{'speedup':>8}"
+    )
     for n_pixels in (10_000, 200_000):
         n_entities = max(50, n_pixels // 200)
         pid = np.array(
@@ -77,8 +81,10 @@ def bench_collapse():
                 values, codes, len(uniq), None
             )
         )
-        print(f"{n_pixels:>11,} {legacy * 1e3:>15.1f}ms {fast * 1e3:>11.1f}ms "
-              f"{legacy / fast:>7.1f}x")
+        print(
+            f"{n_pixels:>11,} {legacy * 1e3:>15.1f}ms {fast * 1e3:>11.1f}ms "
+            f"{legacy / fast:>7.1f}x"
+        )
 
 
 if __name__ == "__main__":

@@ -81,7 +81,10 @@ class TestClusterBootstrapIsPoolInvariant(unittest.TestCase):
         cls.g = rng.normal(0, 1, n)
         cls.cov = rng.normal(0, 1, (n, 2))
         cls.y = (
-            1.0 + u0 + 0.4 * cls.g + 0.2 * cls.t
+            1.0
+            + u0
+            + 0.4 * cls.g
+            + 0.2 * cls.t
             + cls.cov @ np.array([0.5, -0.3])
             + rng.normal(0, 1.0, n)
         )
@@ -120,12 +123,8 @@ class TestClusterBootstrapIsPoolInvariant(unittest.TestCase):
         # default must stay sequential until a process pool replaces it.
         serial = self._ci(1)
         auto = self._ci(None)
-        self.assertAlmostEqual(
-            float(serial["lower"]), float(auto["lower"]), places=12
-        )
-        self.assertAlmostEqual(
-            float(serial["upper"]), float(auto["upper"]), places=12
-        )
+        self.assertAlmostEqual(float(serial["lower"]), float(auto["lower"]), places=12)
+        self.assertAlmostEqual(float(serial["upper"]), float(auto["upper"]), places=12)
 
     def test_a_real_interval_came_back(self):
         r = self._ci(4)

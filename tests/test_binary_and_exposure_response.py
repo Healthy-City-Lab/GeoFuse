@@ -52,7 +52,9 @@ class TestExactGEE(unittest.TestCase):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             ref = sm.GEE(
-                y, X, groups=eid,
+                y,
+                X,
+                groups=eid,
                 family=sm.families.Binomial(),
                 cov_struct=sm.cov_struct.Exchangeable(),
             ).fit()
@@ -71,9 +73,7 @@ class TestExactGEE(unittest.TestCase):
             bl.score_gee_logit("gee_logit_tstat", y, np.ones_like(g), eid, cov), 0.0
         )
         # A continuous outcome is not a binary outcome.
-        self.assertEqual(
-            bl.score_gee_logit("gee_logit_tstat", g, g, eid, cov), 0.0
-        )
+        self.assertEqual(bl.score_gee_logit("gee_logit_tstat", g, g, eid, cov), 0.0)
 
 
 class TestFastOneStep(unittest.TestCase):
@@ -291,7 +291,11 @@ class TestEngineRouting(unittest.TestCase):
         self.assertIs(engine._fold_gee_baseline(static), first)
 
         fast = engine._score_greenery(
-            "gee_logit_tstat", y, g, covariates=cov, entity_id=eid,
+            "gee_logit_tstat",
+            y,
+            g,
+            covariates=cov,
+            entity_id=eid,
             fast_components=first,
         )
         exact = bl.score_gee_logit("gee_logit_tstat", y, g, eid, cov)
@@ -461,8 +465,13 @@ class TestModeration(unittest.TestCase):
         eta = (-0.3 - 0.6 * m) * g + 0.2 * m
         y = (rng.uniform(size=n) < 1.0 / (1.0 + np.exp(-eta))).astype(float)
         out = er.moderation_terms(
-            g, m, bl.make_logit_fitter(y), None,
-            categorical=True, logistic=True, moderator_name="sex",
+            g,
+            m,
+            bl.make_logit_fitter(y),
+            None,
+            categorical=True,
+            logistic=True,
+            moderator_name="sex",
         )
         self.assertIsNotNone(out)
         for row in out["simple_slopes"]:
@@ -478,8 +487,11 @@ class TestModeration(unittest.TestCase):
         g = rng.normal(size=n)
         self.assertIsNone(
             er.moderation_terms(
-                g, np.ones(n), er.make_ols_fitter(g + rng.normal(size=n)),
-                None, categorical=True,
+                g,
+                np.ones(n),
+                er.make_ols_fitter(g + rng.normal(size=n)),
+                None,
+                categorical=True,
             )
         )
 
@@ -496,8 +508,8 @@ class TestIncrementalR2(unittest.TestCase):
         """
         rng = np.random.default_rng(0)
         n = 5000
-        outcome = rng.gamma(2, 2.5, n)              # 0-30-ish, like CES-D-10
-        composite = rng.uniform(0, 1, n) + 0.02 * outcome   # 0-1 greenery index
+        outcome = rng.gamma(2, 2.5, n)  # 0-30-ish, like CES-D-10
+        composite = rng.uniform(0, 1, n) + 0.02 * outcome  # 0-1 greenery index
         s = osc.score("r2", outcome, composite)
         self.assertGreaterEqual(s, 0.0)
         self.assertLess(s, 1.0)
@@ -525,7 +537,9 @@ class TestIncrementalR2(unittest.TestCase):
         n = 4000
         cov = rng.normal(size=(n, 3))
         composite = rng.normal(size=n)
-        outcome = cov @ np.array([1.0, -0.5, 0.25]) + 0.3 * composite + rng.normal(size=n)
+        outcome = (
+            cov @ np.array([1.0, -0.5, 0.25]) + 0.3 * composite + rng.normal(size=n)
+        )
         full = osc.score("r2", outcome, composite, cov)
         alone = osc.score("r2", outcome, composite)
         # Adjusting for covariates that carry most of the variance leaves the
@@ -552,11 +566,15 @@ class TestScaleInvariance(unittest.TestCase):
             rescaled[:, 0] *= scale
             self.assertAlmostEqual(
                 bl.score_gee_logit("gee_logit_tstat", y, g, eid, rescaled),
-                base_z, places=6, msg=f"|z| moved at scale {scale:g}",
+                base_z,
+                places=6,
+                msg=f"|z| moved at scale {scale:g}",
             )
             self.assertAlmostEqual(
                 bl.score_gee_logit("gee_logit_coef", y, g, eid, rescaled),
-                base_coef, places=6, msg=f"coef moved at scale {scale:g}",
+                base_coef,
+                places=6,
+                msg=f"coef moved at scale {scale:g}",
             )
 
     def test_fast_scorer_is_invariant_to_covariate_units(self):
@@ -569,7 +587,8 @@ class TestScaleInvariance(unittest.TestCase):
             shifted = bl.estimate_fold_baseline(y, eid, rescaled)
             self.assertAlmostEqual(
                 bl.score_gee_logit_fast("gee_logit_tstat", g, shifted),
-                base_z, places=6,
+                base_z,
+                places=6,
             )
 
     def test_cross_sectional_metrics_are_invariant(self):

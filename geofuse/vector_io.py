@@ -31,9 +31,7 @@ def vector_field_names(
         return None
 
 
-def match_column_alias(
-    columns: Iterable[str], aliases: Iterable[str]
-) -> str | None:
+def match_column_alias(columns: Iterable[str], aliases: Iterable[str]) -> str | None:
     """The column matching the earliest of *aliases*, compared case-insensitively.
 
     Returns the name as it is spelled in *columns*, or ``None`` if no alias

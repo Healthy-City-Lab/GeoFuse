@@ -20,7 +20,7 @@ import numpy as np
 import optuna
 import pandas as pd
 import rasterio
-from rasterio.transform import from_origin, rowcol, xy
+from rasterio.transform import from_origin, xy
 from shapely.geometry import box
 from sklearn.model_selection import train_test_split
 
@@ -29,7 +29,11 @@ from . import (
     binary_longitudinal,
     cgi_formulas,
     exposure_response,
+)
+from . import fusion_helpers as _helpers
+from . import (
     longitudinal,
+    metric_intake,
     metric_sampling,
     mixed_effects_scoring,
     objective_scoring,
@@ -51,13 +55,9 @@ from .crs_utils import (
     select_grid_crs_with_warning,
 )
 from .logger import attach_external_logger, get_logger
-from .raster_sampling import LAZY_RASTER_THRESHOLD_BYTES, LazyRasterArray
-from . import fusion_helpers as _helpers
-from . import metric_intake
+from .raster_sampling import LazyRasterArray
 from .vector_io import (
-    geometry_sha256,
     match_column_alias,
-    read_vector_aliased_column,
     read_vector_subset,
     target_path_is_raster,
 )
@@ -573,9 +573,7 @@ class MetricFusionEngine:
             if channel not in paths:
                 raise ValueError(f"metric source paths are missing {channel!r}.")
             self._validate_temporal_coverage(paths[channel])
-        self._metric_sources = metric_intake.LongitudinalMetricSources(
-            paths, loader
-        )
+        self._metric_sources = metric_intake.LongitudinalMetricSources(paths, loader)
 
     def set_longitudinal_wave_frames(
         self, frames: list[tuple[str, gpd.GeoDataFrame]]
@@ -998,9 +996,7 @@ class MetricFusionEngine:
                             keep = np.flatnonzero(~np.isnan(flat))
                             rows_i = (keep // width).astype(np.int64)
                             cols_i = (keep % width).astype(np.int64)
-                            xs_k, ys_k = xy(
-                                transform, rows_i, cols_i, offset="center"
-                            )
+                            xs_k, ys_k = xy(transform, rows_i, cols_i, offset="center")
                             gdf = gpd.GeoDataFrame(
                                 {col: flat[keep]},
                                 geometry=gpd.points_from_xy(
@@ -1081,7 +1077,9 @@ class MetricFusionEngine:
             else:
                 self.veg_data = _helpers.load_metric_file(veg_file, "veg")
                 if terrain_file and os.path.exists(terrain_file):
-                    self.terrain_data = _helpers.load_metric_file(terrain_file, "terrain")
+                    self.terrain_data = _helpers.load_metric_file(
+                        terrain_file, "terrain"
+                    )
                 elif not terrain_file or not os.path.exists(terrain_file):
                     logger.warning(
                         "Veg file provided but terrain file missing. Auto-downloading terrain..."
@@ -1092,7 +1090,9 @@ class MetricFusionEngine:
                         progress_callback=progress_callback,
                         cancel_callback=cancel_callback,
                     )
-                    self.terrain_data = _helpers.load_metric_file(terrain_file, "terrain")
+                    self.terrain_data = _helpers.load_metric_file(
+                        terrain_file, "terrain"
+                    )
         # Check if uploaded veg_file is a combined GVI vector
         # (single GeoPackage / GeoJSON with both ``gvi_veg`` and ``gvi_ter``
         # columns — the default shape produced by ``geofuse.gvi``).
@@ -1664,7 +1664,11 @@ class MetricFusionEngine:
                     # Degree pixels: convert with the local metre-per-degree
                     # scale so the estimate is not off by ~10^5.
                     lat = float(
-                        np.mean(self.buffered_extent.to_crs("EPSG:4326").geometry.iloc[0].bounds[1::2])
+                        np.mean(
+                            self.buffered_extent.to_crs("EPSG:4326")
+                            .geometry.iloc[0]
+                            .bounds[1::2]
+                        )
                         if self.buffered_extent is not None
                         else 0.0
                     )
@@ -1678,9 +1682,7 @@ class MetricFusionEngine:
                     return 0.0
                 # Feature density from the extent's bounding box — cheap and
                 # good enough to separate "fits easily" from "many GB".
-                minx, miny, maxx, maxy = (
-                    float(v) for v in metric_data.total_bounds
-                )
+                minx, miny, maxx, maxy = (float(v) for v in metric_data.total_bounds)
                 span_x = max(maxx - minx, 1e-9)
                 span_y = max(maxy - miny, 1e-9)
                 if getattr(metric_data.crs, "is_geographic", False):
@@ -1777,7 +1779,11 @@ class MetricFusionEngine:
         if getattr(self, "_preaggregation_done", False):
             attrs = getattr(points_gdf, "attrs", None) or {}
             wave_indices = attrs.get("_gf_wave_idx")
-            if wave_indices is None and self.is_longitudinal and "wave" in points_gdf.columns:
+            if (
+                wave_indices is None
+                and self.is_longitudinal
+                and "wave" in points_gdf.columns
+            ):
                 spec = self.longitudinal_spec
                 assert spec is not None
                 wave_index_of = {w: i for i, w in enumerate(spec.wave_labels)}
@@ -1832,9 +1838,9 @@ class MetricFusionEngine:
         # for every point, so the row count alone does not bound it: a fine
         # raster under a wide radius is tens of thousands of values per point.
         # Estimate the payload and take the direct path when it would not fit.
-        if self._ring_cache_bytes_estimate(points_gdf, metric_data, float(radii[-1])) > (
-            self._max_ring_cache_bytes
-        ):
+        if self._ring_cache_bytes_estimate(
+            points_gdf, metric_data, float(radii[-1])
+        ) > (self._max_ring_cache_bytes):
             return _helpers.apply_circular_buffer_aggregation(
                 points_gdf, metric_data, radius_m, stat, percentile
             )
@@ -2228,11 +2234,7 @@ class MetricFusionEngine:
         elif self.target_gdf is not None:
             df = self.target_gdf
         else:
-            frames = [
-                f
-                for f in (self.train_val_data, self.test_data)
-                if f is not None
-            ]
+            frames = [f for f in (self.train_val_data, self.test_data) if f is not None]
             df = pd.concat(frames, ignore_index=False) if frames else None
         if df is None:
             return {"columns": [], "flagged": [], "spread_ratio": float(spread_ratio)}
@@ -2369,7 +2371,10 @@ class MetricFusionEngine:
         pid_to_pos = {int(p): i for i, p in enumerate(global_pids)}
 
         eff_gvi, eff_ndvi, missing = cache.open_unit(
-            cfg_key, gvi_radii=gvi_radii, ndvi_radii=ndvi_radii, required_ids=global_pids
+            cfg_key,
+            gvi_radii=gvi_radii,
+            ndvi_radii=ndvi_radii,
+            required_ids=global_pids,
         )
         _log(
             "INFO",
@@ -2665,9 +2670,7 @@ class MetricFusionEngine:
             it = iter(batches)
             in_flight = {
                 ex.submit(_compute, *b)
-                for b in (
-                    next(it, None) for _ in range(min(2 * workers, len(batches)))
-                )
+                for b in (next(it, None) for _ in range(min(2 * workers, len(batches))))
                 if b is not None
             }
             while in_flight:
@@ -2904,10 +2907,9 @@ class MetricFusionEngine:
             veg_src = provider.get("veg", rep)
             terrain_src = provider.get("terrain", rep)
             ndvi_src = provider.get("ndvi", rep)
-            shared_gvi = (
-                provider.path("veg", rep) is not None
-                and provider.path("veg", rep) == provider.path("terrain", rep)
-            )
+            shared_gvi = provider.path("veg", rep) is not None and provider.path(
+                "veg", rep
+            ) == provider.path("terrain", rep)
             _log(
                 "INFO",
                 f"  unit {cfg[:8]} ({'/'.join(u['waves'])}): {len(missing):,} "
@@ -3808,9 +3810,7 @@ class MetricFusionEngine:
                     st["wave"] = np.asarray(data["wave"].values)[first_idx]
         else:
             st["target"] = data["target"].values
-            st["cov"] = (
-                data[cov_cols].to_numpy(dtype=np.float64) if cov_cols else None
-            )
+            st["cov"] = data[cov_cols].to_numpy(dtype=np.float64) if cov_cols else None
             st["coords"] = (
                 data[["_cx", "_cy"]].to_numpy(np.float64) if have_coords else None
             )
@@ -4945,7 +4945,9 @@ class MetricFusionEngine:
     def _effective_time_fixed(self, spec) -> bool:
         """The spec's time fixed effect, minus the case where wave indicators
         already span it (entering both would be rank-deficient)."""
-        return bool(spec.include_time_fixed_effect) and not self._time_fixed_effect_dropped
+        return (
+            bool(spec.include_time_fixed_effect) and not self._time_fixed_effect_dropped
+        )
 
     def _metric_has_pvalue(self, metric: str) -> bool:
         """True when scoring ``metric`` yields a usable parametric p-value.
@@ -6115,9 +6117,7 @@ class MetricFusionEngine:
                 random_slope=spec.random_slope_time,
                 spatial_basis=res.get("spatial_basis"),
                 spatial_method=self.spatial_adjust_method,
-                n_bootstrap=min(
-                    int(n_bootstrap), self._MIXEDLM_TEST_CI_BOOTSTRAP_CAP
-                ),
+                n_bootstrap=min(int(n_bootstrap), self._MIXEDLM_TEST_CI_BOOTSTRAP_CAP),
                 ci_level=float(ci_level),
                 seed=int(seed),
                 target=spec.association_target,
@@ -6632,7 +6632,11 @@ class MetricFusionEngine:
         if metric not in objective_scoring.SUPPORTED_METRICS:
             if self.is_longitudinal and metric in mixed_effects_scoring.MIXEDLM_METRICS:
                 return self._evaluate_effects_mixedlm(
-                    params, metric, n_bootstrap=n_bootstrap, ci_level=ci_level, seed=seed
+                    params,
+                    metric,
+                    n_bootstrap=n_bootstrap,
+                    ci_level=ci_level,
+                    seed=seed,
                 )
             return {}
         from . import statistical_testing as _stats_mod
@@ -6889,8 +6893,14 @@ class MetricFusionEngine:
                 )
                 cov_part, sb_part = _helpers.split_control_matrix(cov_all, n_cov)
                 results["all"] = _block(
-                    t_all, c_all, eid, ysb, cov_part, sb_part,
-                    self._wave_labels_for_scoring(df_full), seed,
+                    t_all,
+                    c_all,
+                    eid,
+                    ysb,
+                    cov_part,
+                    sb_part,
+                    self._wave_labels_for_scoring(df_full),
+                    seed,
                 )
         except Exception as exc:
             logger.warning(f"evaluate_effects: whole-data scoring failed: {exc}")
@@ -6931,8 +6941,14 @@ class MetricFusionEngine:
                     )
                     cov_part, sb_part = _helpers.split_control_matrix(cov_tv, n_cov)
                     results["train_val"] = _block(
-                        t_tv, c_tv, eid, ysb, cov_part, sb_part,
-                        self._wave_labels_for_scoring(sub), seed + 202,
+                        t_tv,
+                        c_tv,
+                        eid,
+                        ysb,
+                        cov_part,
+                        sb_part,
+                        self._wave_labels_for_scoring(sub),
+                        seed + 202,
                     )
         except Exception as exc:
             logger.warning(f"evaluate_effects: train_val scoring failed: {exc}")
@@ -7056,12 +7072,18 @@ class MetricFusionEngine:
             )
             try:
                 sc = _score(
-                    y[idx], g_cgi[idx], new_eid, ysb[idx],
+                    y[idx],
+                    g_cgi[idx],
+                    new_eid,
+                    ysb[idx],
                     None if cov is None else cov[idx],
                     None if wave is None else wave[idx],
                 )
                 ss = _score(
-                    y[idx], g_std[idx], new_eid, ysb[idx],
+                    y[idx],
+                    g_std[idx],
+                    new_eid,
+                    ysb[idx],
                     None if cov is None else cov[idx],
                     None if wave is None else wave[idx],
                 )
@@ -7163,9 +7185,7 @@ class MetricFusionEngine:
             # Both composites share the same outcome-selected smooth; it rides in
             # the resampled controls and is split back out per replicate so the
             # paired difference is adjusted exactly as the objective was.
-            cov, n_cov_cols = self._augment_cov_with_spatial(
-                merged, target, cgi_c, cov
-            )
+            cov, n_cov_cols = self._augment_cov_with_spatial(merged, target, cgi_c, cov)
         except Exception as exc:
             logger.warning(f"paired_objective_difference: alignment failed: {exc}")
             return None
@@ -7493,7 +7513,9 @@ class MetricFusionEngine:
                         .reindex(df["polygon_id"].values)
                     )
                     lon_entity_id = lon_keys["entity_id"].to_numpy()
-                    lon_ysb = lon_keys["years_since_baseline"].to_numpy(dtype=np.float64)
+                    lon_ysb = lon_keys["years_since_baseline"].to_numpy(
+                        dtype=np.float64
+                    )
                 elif {"entity_id", "years_since_baseline"} <= set(df.columns):
                     lon_entity_id = df["entity_id"].to_numpy()
                     lon_ysb = df["years_since_baseline"].to_numpy(dtype=np.float64)
@@ -7849,9 +7871,7 @@ class MetricFusionEngine:
                     ent_m = None if entity_id is None else entity_id[keep]
                 declared = self.covariate_types.get(name)
                 n_levels = int(np.unique(val_m).size)
-                categorical = (
-                    declared == "categorical" if declared else n_levels <= 12
-                )
+                categorical = declared == "categorical" if declared else n_levels <= 12
                 result = exposure_response.moderation_terms(
                     comp_m,
                     val_m,

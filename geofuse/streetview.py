@@ -340,9 +340,7 @@ def _parse_captures(
 
     seen: set[str] = set()
     unique: list[PanoCapture] = []
-    for c in sorted(
-        captures, key=lambda c: (c.year or 0, c.month or 0), reverse=True
-    ):
+    for c in sorted(captures, key=lambda c: (c.year or 0, c.month or 0), reverse=True):
         if c.id in seen:
             continue
         seen.add(c.id)
@@ -537,5 +535,3 @@ async def get_panorama_async(
         pano.tile_size.x,
         pano.tile_size.y,
     )
-
-

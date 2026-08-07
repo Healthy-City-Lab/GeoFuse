@@ -71,12 +71,12 @@ def _percentile_ranks(n: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return lower, np.minimum(lower + 1, n - 1), virtual - lower
 
 
-def _interpolate(lower: np.ndarray, upper: np.ndarray, weight: np.ndarray) -> np.ndarray:
+def _interpolate(
+    lower: np.ndarray, upper: np.ndarray, weight: np.ndarray
+) -> np.ndarray:
     """Blend two order statistics the way ``np.percentile``'s default does."""
     span = upper - lower
-    return np.where(
-        weight < 0.5, lower + span * weight, upper - span * (1.0 - weight)
-    )
+    return np.where(weight < 0.5, lower + span * weight, upper - span * (1.0 - weight))
 
 
 def compute_all_stats(values: np.ndarray) -> np.ndarray:
@@ -239,7 +239,9 @@ def reproject_geoms(geoms: list, xy_fn: Any) -> list:
     return list(_shapely.transform(arr, _tf))
 
 
-def ring_index_grid(discs: list, out_shape: tuple, win_transform: Any) -> np.ndarray | None:
+def ring_index_grid(
+    discs: list, out_shape: tuple, win_transform: Any
+) -> np.ndarray | None:
     """Per-pixel index of the smallest disc touching it (``len(discs)`` = none).
 
     ``discs`` must be ordered by ascending radius, which makes them strictly
@@ -912,9 +914,7 @@ class GreeneryCache:
                 self._units[cfg_key] = {
                     "ids": np.empty(0, np.int64),
                     "veg": np.empty((0, len(eff_gvi), len(self.stats)), np.float32),
-                    "terrain": np.empty(
-                        (0, len(eff_gvi), len(self.stats)), np.float32
-                    ),
+                    "terrain": np.empty((0, len(eff_gvi), len(self.stats)), np.float32),
                     "ndvi": np.empty((0, len(eff_ndvi), len(self.stats)), np.float32),
                     "gvi_radii": eff_gvi,
                     "ndvi_radii": eff_ndvi,
