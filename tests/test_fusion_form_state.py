@@ -235,6 +235,10 @@ class TestEveryRecordedSettingIsRestored(unittest.TestCase):
             "ndvi_project_id", "cache_metrics", "buffer_meters",
             "ndvi_resolution_m", "gvi_grid_spacing_m", "n_spatial_blocks",
             "min_cell_count", "worst_quantile",
+            # ``None`` carries meaning here (use the composite's own IQR) and
+            # has to seed the widget as 0.0, which the generic map — which
+            # skips ``None`` outright — cannot express.
+            "exposure_iqr",
         }
         missing = [
             k for k in self.fusion._FUSION_RUN_CONFIG_KEYS

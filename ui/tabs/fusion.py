@@ -464,6 +464,7 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "covariate_columns",
     "covariate_types",
     "moderator_columns",
+    "exposure_iqr",
     "standalone_channels",
     "longitudinal_spec_payload",
     "cgi_grid_spacing_m",
@@ -585,6 +586,7 @@ def _seed_fusion_form(p: dict) -> None:
     st.session_state["fusion_moderator_columns"] = list(
         p.get("moderator_columns") or []
     )
+    st.session_state["fusion_exposure_iqr"] = float(p.get("exposure_iqr") or 0.0)
 
     lon = p.get("longitudinal_spec_payload") or {}
     is_longitudinal = bool(lon) and str(
@@ -1599,6 +1601,23 @@ def _render_study_details_panel(
                     + ", ".join(f"`{m}`" for m in moderator_columns)
                     + " → `moderation.csv`"
                 )
+
+            exposure_iqr_ui = st.number_input(
+                "Exposure IQR for reporting (0 = from data)",
+                min_value=0.0,
+                max_value=10.0,
+                step=0.001,
+                format="%.3f",
+                key="fusion_exposure_iqr",
+                help=(
+                    "The greenery increment the per-IQR effect in "
+                    "`exposure_response.csv` is expressed in. Left at 0 it is "
+                    "the interquartile range of the winning composite itself, "
+                    "which makes runs on different exposures incomparable. Set "
+                    "it to a published study's IQR to read your effect on that "
+                    "study's scale. Reporting only — the search is unaffected."
+                ),
+            )
             if covariate_columns:
                 st.caption(
                     "Fitting: "
@@ -1611,6 +1630,7 @@ def _render_study_details_panel(
             covariate_columns = []
             covariate_types = {}
             moderator_columns = []
+            exposure_iqr_ui = 0.0
             st.caption(
                 "_No attribute columns available for covariates "
                 "(raster target or no spare columns)._"
@@ -2140,6 +2160,10 @@ def _render_study_details_panel(
         "covariate_columns": list(covariate_columns or []),
         "covariate_types": dict(covariate_types or {}),
         "moderator_columns": list(moderator_columns or []),
+        # ``None`` restores the default: the IQR of the composite itself.
+        "exposure_iqr": (
+            float(exposure_iqr_ui) if exposure_iqr_ui and exposure_iqr_ui > 0 else None
+        ),
         "objective_metric": objective_metric,
         "residualize_method": str(residualize_method),
         "search_scoring_method": str(search_scoring_method),
@@ -4534,6 +4558,7 @@ def render(output_dir: str) -> None:
     covariate_columns = study_state["covariate_columns"]
     covariate_types = study_state.get("covariate_types") or {}
     moderator_columns_param = list(study_state.get("moderator_columns") or [])
+    exposure_iqr_param = study_state.get("exposure_iqr")
     objective_metric = study_state["objective_metric"]
     test_size = study_state["test_size"]
     n_bins = study_state["n_bins"]
@@ -4929,6 +4954,9 @@ def render(output_dir: str) -> None:
                 "covariate_columns": list(covariate_columns or []),
                 "covariate_types": dict(covariate_types or {}),
                 "moderator_columns": list(moderator_columns_param),
+                "exposure_iqr": (
+                    float(exposure_iqr_param) if exposure_iqr_param else None
+                ),
                 "standalone_channels": (
                     ["veg", "terrain", "ndvi"] if run_standalones else []
                 ),

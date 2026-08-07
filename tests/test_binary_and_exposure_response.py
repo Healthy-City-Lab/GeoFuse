@@ -213,6 +213,51 @@ class TestExposureResponse(unittest.TestCase):
         rate = fired / reps
         self.assertLess(rate, 0.12, f"non-linearity test fires at {rate:.3f} on a line")
 
+    def test_fitter_survives_a_rank_deficient_design(self):
+        """A tied exposure makes columns collinear; the fit must still return."""
+        rng = np.random.default_rng(11)
+        n = 2000
+        g = rng.normal(size=n)
+        y = 0.5 * g + rng.normal(size=n)
+        # A duplicated column is exactly singular, the limit of what a heavily
+        # tied quantile or spline block produces.
+        design = np.column_stack([np.ones(n), g, g])
+        out = er.make_ols_fitter(y)(design, ["const", "g", "g_dup"])
+        self.assertIsNotNone(out)
+        self.assertTrue(np.isfinite(out["g"][0]))
+        self.assertTrue(np.isfinite(out["g"][1]))
+
+    def test_a_nan_row_makes_lapack_reject_the_whole_design(self):
+        """Why the reporting fits mask: one NaN row poisons the matrix norm."""
+        from geofuse.fusion import MetricFusionEngine
+
+        rng = np.random.default_rng(13)
+        n = 500
+        g = rng.normal(size=n)
+        y = 0.5 * g + rng.normal(size=n)
+        cov = rng.normal(size=(n, 2))
+        cov[7, 0] = np.nan  # what reindex on an unmatched polygon_id produces
+
+        design = np.column_stack([np.ones(n), g, cov])
+        self.assertIsNone(er.make_ols_fitter(y)(design, ["c", "g", "x1", "x2"]))
+
+        keep = MetricFusionEngine._finite_rows(y, g, cov)
+        self.assertEqual(int((~keep).sum()), 1)
+        out = er.make_ols_fitter(y[keep])(design[keep], ["c", "g", "x1", "x2"])
+        self.assertIsNotNone(out)
+        self.assertAlmostEqual(out["g"][0], 0.5, delta=0.15)
+
+    def test_a_tied_exposure_still_reports_quartiles(self):
+        rng = np.random.default_rng(12)
+        n = 3000
+        # Three quarters of the mass on one value — the shape a terrain channel
+        # takes where most pixels carry no terrain vegetation at all.
+        g = np.where(rng.random(n) < 0.75, 0.0, rng.random(n))
+        y = 0.3 * g + rng.normal(size=n)
+        fitter = er.make_ols_fitter(y)
+        self.assertIsNotNone(er.quartile_terms(g, fitter, None))
+        self.assertIsNotNone(er.spline_nonlinearity_test(g, fitter, None))
+
 
 class TestEngineRouting(unittest.TestCase):
     """The scoring seam must send a binary panel metric to GEE, not MixedLM."""

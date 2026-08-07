@@ -301,10 +301,14 @@ def _write_fusion_outputs(
     # One tidy table rather than three files: the rows are all statements
     # about the same fitted exposure–response, and a reader comparing them
     # against a published table wants them side by side.
-    er_report = (cgi_bundle or {}).get("exposure_response") or None
-    if er_report:
-        er_rows: list[dict] = []
+    er_rows: list[dict] = []
+    er_curve_rows: list[dict] = []
+    for _study_key, _study_disp, _bundle in studies:
+        er_report = (_bundle or {}).get("exposure_response") or None
+        if not er_report:
+            continue
         design = er_report.get("design")
+        _row_start = len(er_rows)
         coding = er_report.get("coding") or {}
         if coding:
             # Which level the logistic models called the event. Carried in the
@@ -391,7 +395,24 @@ def _write_fusion_outputs(
                     "p_value": _f(nonlinear.get("nonlinearity_p")),
                 }
             )
-        _emit_csv(f"exposure_response{sfx}.csv", er_rows)
+        # Stamp this study onto the rows it just produced, so the composite
+        # and each single channel sit in one table — which is the comparison
+        # a published single-channel result is read against.
+        for _r in er_rows[_row_start:]:
+            _r["study"] = _study_key
+        curve = (nonlinear or {}).get("curve")
+        if curve:
+            er_curve_rows.extend(
+                {"study": _study_key, "exposure": x, "effect": y}
+                for x, y in zip(curve["exposure"], curve["effect"])
+            )
+    if er_rows:
+        _emit_csv(
+            f"exposure_response{sfx}.csv",
+            [{"study": r.pop("study"), **r} for r in er_rows],
+        )
+    if er_curve_rows:
+        _emit_csv(f"exposure_response_curve{sfx}.csv", er_curve_rows)
 
     # ── moderation.csv (effect modification) ────────────────────
     # One row per simple slope plus one per interaction term, so a reader can
@@ -448,15 +469,6 @@ def _write_fusion_outputs(
                 }
             )
         _emit_csv(f"moderation{sfx}.csv", mod_rows)
-        curve = (nonlinear or {}).get("curve")
-        if curve:
-            _emit_csv(
-                f"exposure_response_curve{sfx}.csv",
-                [
-                    {"exposure": x, "effect": y}
-                    for x, y in zip(curve["exposure"], curve["effect"])
-                ],
-            )
 
     # ── results_summary.json (master manifest) ──────────────────
     studies_manifest: dict[str, dict] = {}

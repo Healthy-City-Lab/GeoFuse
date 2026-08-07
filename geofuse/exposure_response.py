@@ -136,14 +136,22 @@ def make_ols_fitter(outcome: np.ndarray) -> Fitter:
         n, p = X.shape
         if n <= p:
             return None
-        beta, *_ = np.linalg.lstsq(X, y, rcond=None)
-        resid = y - X @ beta
-        dof = n - p
-        sigma2 = float(resid @ resid) / dof
+        # A quantile/spline design built on a heavily tied exposure can be
+        # rank-deficient enough that the divide-and-conquer SVD behind
+        # ``lstsq`` refuses to converge. The normal equations reach the same
+        # minimum-norm solution through a pseudo-inverse that always returns,
+        # and the covariance below needs that pseudo-inverse regardless.
         try:
             xtx_inv = np.linalg.pinv(X.T @ X)
         except np.linalg.LinAlgError:
             return None
+        try:
+            beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+        except np.linalg.LinAlgError:
+            beta = xtx_inv @ (X.T @ y)
+        resid = y - X @ beta
+        dof = n - p
+        sigma2 = float(resid @ resid) / dof
         cov_beta = xtx_inv * sigma2
         se = np.sqrt(np.clip(np.diag(cov_beta), 0.0, None))
         with np.errstate(divide="ignore", invalid="ignore"):

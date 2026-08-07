@@ -2217,6 +2217,25 @@ def run_fusion(
                         or ch_bundle.get("best_params")
                         or {}
                     )
+                    # Each standalone gets its own exposure–response table. The
+                    # single-channel arm is what a published NDVI result is read
+                    # against, so it needs the same per-IQR effect, quantile
+                    # gradient and non-linearity test as the composite.
+                    prev_channel = getattr(engine, "_active_greenery_channel", "cgi")
+                    try:
+                        engine._active_greenery_channel = ch
+                        ch_bundle["exposure_response"] = (
+                            engine.compute_exposure_response(
+                                params=ch_params, iqr=exposure_iqr
+                            )
+                        )
+                    except Exception as exc:
+                        _log_fusion(
+                            "WARN",
+                            f"[{label}] Exposure-response ({ch}) failed: {exc}",
+                        )
+                    finally:
+                        engine._active_greenery_channel = prev_channel
                     try:
                         pd_res = engine.paired_objective_difference(
                             headline_params,

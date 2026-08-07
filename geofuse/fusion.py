@@ -7717,6 +7717,20 @@ class MetricFusionEngine:
             if self.is_longitudinal:
                 entity_id, _ysb = self._whole_data_longitudinal_keys(df)
 
+            keep = self._finite_rows(target, composite, cov)
+            if keep is not None and not keep.all():
+                if int(keep.sum()) < 10:
+                    _log("WARN", "Exposure-response: too few complete rows to fit.")
+                    return None
+                _log(
+                    "INFO",
+                    f"Exposure-response: dropped {int((~keep).sum())} row(s) with a "
+                    "missing outcome, composite or covariate.",
+                )
+                target, composite = target[keep], composite[keep]
+                cov = None if cov is None else cov[keep]
+                entity_id = None if entity_id is None else entity_id[keep]
+
             binary = binary_longitudinal.is_binary(target)
             coding = binary_longitudinal.describe_coding(target) if binary else None
             if coding and coding["suspicious"]:
@@ -7798,29 +7812,51 @@ class MetricFusionEngine:
                 entity_id, _ysb = self._whole_data_longitudinal_keys(df)
 
             binary = binary_longitudinal.is_binary(target)
-            if binary and entity_id is not None:
-                fitter = binary_longitudinal.make_gee_logit_fitter(target, entity_id)
-            elif binary:
-                fitter = binary_longitudinal.make_logit_fitter(target)
-            else:
-                fitter = exposure_response.make_ols_fitter(target)
+
+            def _fitter_for(y, ent):
+                if binary and ent is not None:
+                    return binary_longitudinal.make_gee_logit_fitter(y, ent)
+                if binary:
+                    return binary_longitudinal.make_logit_fitter(y)
+                return exposure_response.make_ols_fitter(y)
 
             for name in moderators:
                 values = self._reporting_raw_column(df, name)
                 if values is None:
                     _log("WARN", f"Moderator '{name}' not found; skipping.")
                     continue
+                cov = self._reporting_covariate_matrix(df, exclude=[name])
+                # Per moderator, not once up front: a row missing this
+                # moderator says nothing about the next one, and dropping it
+                # from every analysis would throw away usable data.
+                keep = self._finite_rows(target, composite, values, cov)
+                y_m, comp_m, val_m, cov_m, ent_m = (
+                    target,
+                    composite,
+                    values,
+                    cov,
+                    entity_id,
+                )
+                if keep is not None and not keep.all():
+                    if int(keep.sum()) < 10:
+                        _log(
+                            "WARN",
+                            f"Moderator '{name}': too few complete rows; skipping.",
+                        )
+                        continue
+                    y_m, comp_m, val_m = target[keep], composite[keep], values[keep]
+                    cov_m = None if cov is None else cov[keep]
+                    ent_m = None if entity_id is None else entity_id[keep]
                 declared = self.covariate_types.get(name)
-                n_levels = int(np.unique(values[np.isfinite(values)]).size)
+                n_levels = int(np.unique(val_m).size)
                 categorical = (
                     declared == "categorical" if declared else n_levels <= 12
                 )
-                cov = self._reporting_covariate_matrix(df, exclude=[name])
                 result = exposure_response.moderation_terms(
-                    composite,
-                    values,
-                    fitter,
-                    cov,
+                    comp_m,
+                    val_m,
+                    _fitter_for(y_m, ent_m),
+                    cov_m,
                     categorical=categorical,
                     logistic=binary,
                     moderator_name=name,
@@ -7850,6 +7886,29 @@ class MetricFusionEngine:
         if name in df.columns:
             return pd.to_numeric(df[name], errors="coerce").to_numpy(dtype=np.float64)
         return None
+
+    @staticmethod
+    def _finite_rows(*arrays) -> "np.ndarray | None":
+        """Row mask where every supplied array is finite.
+
+        The reporting matrices are aligned by reindexing on ``polygon_id``, so
+        a key the fusion frame carries but the attribute table does not yields
+        an all-NaN row. LAPACK takes the norm of the whole design before it
+        factorises, so one such row makes that norm NaN and the least-squares
+        driver rejects it outright — with a message printed from Fortran that
+        never reaches the Python log. Dropping the rows here keeps the
+        reporting fits complete-case, which is what the objective already does.
+        """
+        mask = None
+        for arr in arrays:
+            if arr is None:
+                continue
+            a = np.asarray(arr, dtype=np.float64)
+            if a.size == 0:
+                continue
+            ok = np.isfinite(a) if a.ndim == 1 else np.isfinite(a).all(axis=1)
+            mask = ok if mask is None else (mask & ok)
+        return mask
 
     def _reporting_covariate_matrix(
         self, df: "pd.DataFrame", exclude: "list[str] | None" = None
