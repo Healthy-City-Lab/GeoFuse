@@ -218,9 +218,9 @@ def _render_details(rec) -> None:
         )
     elif rec.type == "fusion":
         st.write(
-            f"**Stability selection:** {p.get('n_bootstraps', '?')} bootstraps × "
-            f"{p.get('n_trials_per_bootstrap', '?')} trials/bootstrap "
-            f"(min {p.get('min_cell_count', '?')}/cell)"
+            f"**Discovery:** {p.get('channel_set', '?')} · form "
+            f"{p.get('index_form', '?')} · {p.get('sweep_splits', '?')} sweep "
+            f"splits · {p.get('discovery_reps', '?')} replicates"
         )
         st.write(f"**Objective:** {p.get('objective_metric', '?')}")
         st.write(f"**CGI formula:** `{p.get('cgi_formula') or 'weighted_average'}`")

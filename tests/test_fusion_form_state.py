@@ -241,8 +241,8 @@ class TestEveryRecordedSettingIsRestored(unittest.TestCase):
             "ndvi_resolution_m",
             "gvi_grid_spacing_m",
             "n_spatial_blocks",
-            "min_cell_count",
-            "worst_quantile",
+            # Warmup mirrors the draw count, so it has no widget of its own.
+            "posterior_warmup",
             # ``None`` carries meaning here (use the composite's own IQR) and
             # has to seed the widget as 0.0, which the generic map — which
             # skips ``None`` outright — cannot express.
