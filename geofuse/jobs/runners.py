@@ -1811,10 +1811,10 @@ def run_fusion(
             # trial-budget scaling is needed.
 
             def _study_progress_cb(study_label: str, stage_key: str | None = None):
-                """Per-trial callback → live caption, trial bar, and stage row.
+                """Per-stage callback → live caption, progress bar, stage row.
 
-                Throttled to ~0.4 s (always fires on the final trial) so the
-                job card shows "<study>: k / N trials" without flooding the
+                Throttled to ~0.4 s (always fires on the last step) so the
+                job card shows "<study>: k / N steps" without flooding the
                 store. When ``stage_key`` is given it also advances that
                 running search stage's ledger fraction (via ``stage_progress``,
                 which self-throttles the synchronous SQLite write) and steps the
@@ -1832,11 +1832,11 @@ def run_fusion(
                         stage_progress(
                             stage_key,
                             (done / total) if total else 0.0,
-                            f"{done:,}/{total:,} trials",
+                            f"{done:,}/{total:,} steps",
                         )
                     ctx.progress(
                         value=prog_ledger() if stage_key is not None else None,
-                        status_text=f"{prefix}{study_label}: {done:,}/{total:,} trials",
+                        status_text=f"{prefix}{study_label}: {done:,}/{total:,} steps",
                         fusion_study_progress={
                             "study": study_label,
                             "current": int(done),

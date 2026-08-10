@@ -488,7 +488,7 @@ def _discovery_shuffle(task):
         if fit_ is None:
             continue
         sub, w = fit_
-        v = _tstat(np.asarray(z[tr][:, i[sub]]) @ w, y[tr])
+        v = _tstat(ztr[:, i[sub]] @ w, y[tr])
         if v > best_v:
             best_v, best = v, combo
     if best is None:
@@ -574,11 +574,16 @@ def _gain_split(task):
     tr = ~te
     out = {}
 
+    # One gather of the training rows, reused by every candidate below. The
+    # memmap is disk-backed, so re-slicing it per candidate would re-read the
+    # whole training block hundreds of thousands of times.
+    ztr = np.asarray(z[tr])
+
     train_t = {}
     for ci, single in enumerate(per_channel_cols):
         best, best_v = None, -np.inf
         for col in single:
-            v = _tstat(np.asarray(z[tr][:, col]), y[tr])
+            v = _tstat(ztr[:, col], y[tr])
             if v > best_v:
                 best_v, best = v, col
         e = np.asarray(z[:, best])
@@ -586,7 +591,6 @@ def _gain_split(task):
         train_t[f"ch{ci}"] = best_v
 
     combos = list(itertools.product(*cols))
-    ztr = np.asarray(z[tr])
     g_tr, c_tr = ztr.T @ ztr, ztr.T @ y[tr]
     best, best_v = None, -np.inf
     for combo in combos:
@@ -595,7 +599,7 @@ def _gain_split(task):
         if f_ is None:
             continue
         sub, w = f_
-        v = _tstat(np.asarray(z[tr][:, i[sub]]) @ w, y[tr])
+        v = _tstat(ztr[:, i[sub]] @ w, y[tr])
         if v > best_v:
             best_v, best = v, combo
     E = np.asarray(z[:, list(best)])
