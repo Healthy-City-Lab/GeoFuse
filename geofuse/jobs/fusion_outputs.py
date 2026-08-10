@@ -262,8 +262,12 @@ def _write_fusion_outputs(
         whi = summ.get("weight_ci_high") or []
         gain = summ.get("holdout_gain") or {}
         disc = summ.get("discovery") or {}
-        for i, pick in enumerate(picked):
-            name = chans[i] if i < len(chans) else f"ch{i}"
+        # One row per weight. The synergy form's pair terms have a weight but
+        # no radius or aggregator of their own, so those columns stay blank
+        # rather than repeating a component's values.
+        labels = summ.get("weight_labels") or chans
+        for i, name in enumerate(labels):
+            pick = picked[i] if i < len(picked) else ()
             disc_rows.append(
                 {
                     "study": key,
@@ -564,6 +568,10 @@ def _write_fusion_outputs(
         "outcome": label,
         "objective_metric": objective_metric,
         "cgi_formula": formula_name,
+        # Which configuration produced this, and how much of the held-out
+        # guarantee it spent.
+        "config_hash": (cgi_bundle or {}).get("config_hash"),
+        "test_reads": (cgi_bundle or {}).get("test_reads"),
         "studies": studies_manifest,
         "cgi_vs_standalone_aic_bic": aic_bic,
         "covariate_impact": cov_summary,
@@ -709,6 +717,7 @@ def _posterior_summary(params: dict) -> dict:
         "sweep_splits": sweep.get("splits"),
         # Weights and effect, with intervals.
         "channels": post.get("channels"),
+        "weight_labels": post.get("weight_labels"),
         "weight_mean": post.get("weight_mean"),
         "weight_ci_low": post.get("weight_ci_low"),
         "weight_ci_high": post.get("weight_ci_high"),

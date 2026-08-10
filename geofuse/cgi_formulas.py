@@ -137,7 +137,7 @@ _DIRICHLET_EPS: float = 1e-9
 # Discretisation step for recorded weights. Snapping to 5 % yields 21 valid
 # values per weight (0, 5, …, 100). This is fine enough to express any
 # meaningful ratio between channels and coarse enough to make
-# ``count_trials_per_param_cell`` viable for stability-selection analyses
+# ``count_trials_per_param_cell`` viable for post-hoc trial analyses
 # (otherwise the 0–100 integer grid scatters trials across ~10⁴ cells and
 # every cell has count 1 in any realistic compute budget).
 WEIGHT_STEP_PCT: int = 5
@@ -622,6 +622,26 @@ _register_gvi_variants()
 def formula_channels(name: str) -> tuple[str, ...]:
     """Channels a formula consumes, in registry order."""
     return tuple(_CHANNEL_MAIN_KEY[name])
+
+
+# The registry names a channel set x functional form product. The channel set
+# is a job input; the form is picked from held-out data, so the run has to be
+# able to move between the two names that share its channels.
+_FORM_VARIANTS: dict[tuple[str, ...], dict[str, str]] = {
+    ("ndvi", "veg", "terrain"): {"linear": WEIGHTED_AVERAGE, "synergy": SYNERGY},
+    _GVI_CHANNELS: {"linear": WEIGHTED_AVERAGE_GVI, "synergy": SYNERGY_GVI},
+}
+
+
+def formula_for(channels: tuple[str, ...], form: str) -> str:
+    """Registry name for a channel set and a functional form.
+
+    Falls back to the linear variant for an unknown form, and raises for an
+    unknown channel set — a silent wrong-channel formula would report weights
+    against the wrong modalities.
+    """
+    variants = _FORM_VARIANTS[tuple(channels)]
+    return variants.get(form, variants["linear"])
 
 
 def seed_param_sets(

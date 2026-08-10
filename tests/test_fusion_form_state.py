@@ -243,6 +243,8 @@ class TestEveryRecordedSettingIsRestored(unittest.TestCase):
             "n_spatial_blocks",
             # Warmup mirrors the draw count, so it has no widget of its own.
             "posterior_warmup",
+            # Derived from the channel set and the picked form.
+            "cgi_formula",
             # ``None`` carries meaning here (use the composite's own IQR) and
             # has to seed the widget as 0.0, which the generic map — which
             # skips ``None`` outright — cannot express.

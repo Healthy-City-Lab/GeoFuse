@@ -281,7 +281,7 @@ class MetricFusionEngine:
         # ``ndvi`` run a standalone single-metric search that uses that
         # channel's normalised value directly as the greenery value and
         # searches only its radius + aggregation. Set per call by the runner
-        # before each stability search; ``evaluate_on_test`` reads it so the
+        # before each discovery; ``evaluate_on_test`` reads it so the
         # held-out test score stays aligned with what the search scored.
         self._active_greenery_channel: str = "cgi"
 
@@ -408,8 +408,11 @@ class MetricFusionEngine:
         self.veg_data = None  # Vegetation component (GVI vegetation)
         self.terrain_data = None  # Terrain component (GVI terrain)
         self.ndvi_data = None  # NDVI satellite data
-        self.train_val_data = None  # Train+val pool the bootstrap resamples
+        self.train_val_data = None  # Train+val pool the sweep splits
         self.test_data = None  # Held-out test set
+        # Distinct configurations scored on the test slice. A held-out set is
+        # a budget, not a metric you can query freely.
+        self._test_reads = 0
         self.cv_folds = None  # In-bag/OOB fold spliced in per bootstrap resample
         self.study = None  # Per-resample Optuna study (set inside the bootstrap)
         self.best_params = None
@@ -451,7 +454,7 @@ class MetricFusionEngine:
         # on it so an entry can never be served for a different row set.
         self._split_generation: int = 0
 
-        # Trial threads for the stability search. Only the longitudinal
+        # Trial threads for the search. Only the longitudinal
         # fast-GLS path uses them: the other paths keep LRU scoring caches that
         # are not thread-safe (see ``_search_n_jobs``).
         self._search_workers: int = parallel.worker_count()
@@ -3102,7 +3105,7 @@ class MetricFusionEngine:
     ) -> dict:
         """Select the CGI configuration from data, then quantify it.
 
-        Replaces the stability search. Stage one sweeps ``(radius, statistic)``
+        Stage one sweeps ``(radius, statistic)``
         per channel and the functional form, scoring every candidate on held-out
         rows of the train+val pool. Stage two fits a posterior over the channel
         weights at the winning columns. Neither stage touches the test split, so
@@ -3199,6 +3202,14 @@ class MetricFusionEngine:
         )
         tick()
 
+        # The form is a swept axis, so the formula the composite is built from
+        # is only known once the sweep has run. Everything downstream reads
+        # ``self.cgi_formula``, including the params dict built next.
+        if self._active_greenery_channel == "cgi":
+            self.cgi_formula = cgi_formulas.formula_for(
+                tuple(cgi_formulas.formula_channels(self.cgi_formula)), res.form
+            )
+
         params = self._params_from_sweep(res, post, index_channels)
         params["__selection_method__"] = "bayesian_index"
         params["__sweep__"] = {
@@ -3263,11 +3274,31 @@ class MetricFusionEngine:
         # 100, which is the scale every downstream consumer expects.
         w = np.asarray(post.weights).mean(0)
         keys = list(formula.weight_keys)
+        main_key = cgi_formulas._CHANNEL_MAIN_KEY[self.cgi_formula]
         vals = np.zeros(len(keys))
         for i, ch in enumerate(index_channels):
-            key = cgi_formulas._CHANNEL_MAIN_KEY[self.cgi_formula].get(ch)
+            key = main_key.get(ch)
             if key in keys and i < len(w):
                 vals[keys.index(key)] = float(w[i])
+
+        # The synergy posterior also carries one weight per channel pair.
+        # Dropping them would build the composite from a different model than
+        # the one the reported effect came from. Interaction keys abbreviate
+        # their channels (``w_ter_veg``), so they are matched on token set
+        # rather than on a reconstructed name.
+        n_main = len(index_channels)
+        if len(w) > n_main:
+            token = {ch: main_key[ch].removeprefix("w_") for ch in index_channels}
+            by_tokens = {
+                frozenset(k.removeprefix("w_").split("_")): k
+                for k in getattr(formula, "interaction_weight_keys", ())
+            }
+            for k, (i, j) in enumerate(bayesian_index._pairs(n_main)):
+                key = by_tokens.get(
+                    frozenset((token[index_channels[i]], token[index_channels[j]]))
+                )
+                if key in keys and n_main + k < len(w):
+                    vals[keys.index(key)] = float(w[n_main + k])
         total = vals.sum()
         if total <= 0:
             vals[:] = 1.0 / len(vals)
@@ -5004,9 +5035,9 @@ class MetricFusionEngine:
         n_spatial_blocks: int | None = None,
     ) -> None:
         """Carve a held-out test set and the train+val pool the bootstrap
-        stability search resamples.
+        the sweep splits.
 
-        Stability selection does its own complementary-half resampling of the
+        The sweep does its own repeated splitting of the
         train+val pool (see :meth:`fit_bayesian_index`), so this
         method only sets aside the untouched test split and the pool; it does
         not build CV folds. The split is leakage-safe (groups stay together
@@ -5235,7 +5266,7 @@ class MetricFusionEngine:
                 f"{len(test_poly)} test {group_label}s ({len(self.test_data)} rows).",
             )
 
-            # No CV folds — the bootstrap stability search resamples the pool
+            # No CV folds — the sweep splits the pool
             # itself. Reset the caches the resampler rebuilds per run.
             self.cv_folds = []
             self._spatial_basis_cache = {}
@@ -5266,7 +5297,7 @@ class MetricFusionEngine:
             f"{len(self.test_data)} test samples (holdout)"
         )
 
-        # No CV folds — the bootstrap stability search resamples the pool
+        # No CV folds — the sweep splits the pool
         # itself. Reset the caches the resampler rebuilds per run.
         self.cv_folds = []
         self._spatial_basis_cache = {}
@@ -5300,7 +5331,7 @@ class MetricFusionEngine:
 
         The longitudinal MixedLM ``tstat`` / ``coef`` metrics and both GEE
         logistic metrics carry a Wald p-value; the cross-sectional OLS metrics
-        do not (their robustness comes from stability selection + bootstrap CIs,
+        do not (their robustness comes from the held-out sweep + posterior CIs,
         not a per-trial p-gate). The cross-sectional logistic metrics do produce
         one, and it is reported for consistency with the panel path.
         """
@@ -5890,7 +5921,7 @@ class MetricFusionEngine:
                 val_coords, val_targets_arr, val_cov, val_composite
             )
 
-            # ── Score via the ``_score_greenery`` seam ──
+            # ── Score via the ``_score_greenery`` seam ───
             # Three modes collapse into it: cross-sectional OLS, mixed-effects
             # MixedLM (per-entity random effects), and year-aware cross-sectional
             # (spec present but an OLS scoring metric — the OLS scorer ignores
@@ -6045,6 +6076,12 @@ class MetricFusionEngine:
         memo_hit = self._evaluate_test_cache.get(memo_key)
         if memo_hit is not None:
             return dict(memo_hit)
+
+        # Every distinct configuration scored on the test slice spends part of
+        # the held-out guarantee. Cache hits are free (same answer), so only
+        # misses count. Surfaced in the bundle so a burned test set is visible
+        # rather than inferred.
+        self._test_reads += 1
 
         logger.info("Evaluating on held-out test set...")
 
@@ -6966,7 +7003,7 @@ class MetricFusionEngine:
         """Objective effect on the held-out test set (headline) + descriptive
         per-subset effects.
 
-        The ``test`` slice is the headline: the stability-selected params never
+        The ``test`` slice is the headline: the discovered params never
         saw it, so it carries the permutation p-value — the honest
         generalizability check. The ``all`` (whole-data) and ``train_val``
         slices are descriptive (CI only, no p-value): the params were tuned on
@@ -7625,7 +7662,7 @@ class MetricFusionEngine:
         params: dict,
         metric: str,
     ) -> dict[str, dict[str, float | None]]:
-        """Score ``params`` on every data slice the stability run produced.
+        """Score ``params`` on every data slice the discovery produced.
 
         Returns a dict of ``{subset: {score, pvalue, n}}`` for the four
         canonical slices. Selection resamples the train+val pool, so ``train``
@@ -7688,7 +7725,7 @@ class MetricFusionEngine:
             "n": train_val_n,
         }
 
-        # ── test: fresh evaluate_on_test with these params ──
+        # ── test: fresh evaluate_on_test with these params ───
         # ``evaluate_on_test`` returns the partial (covariate-adjusted)
         # score that the optimizer optimized; the raw equivalent is
         # produced by ``_score_data_subset`` on the test slice.
@@ -8342,7 +8379,7 @@ class MetricFusionEngine:
         output_path: str = "output_results/composite_greenery.tif",
         progress_callback: Callable[..., Any] | None = None,
     ) -> str:
-        """Render the composite greenery map from the stability-selected params.
+        """Render the composite greenery map from the discovered params.
 
         Builds a composite greenery raster matching the target grid (if raster
         input) or the CGI grid (if vector input) using the winning weight cell's
@@ -8357,7 +8394,7 @@ class MetricFusionEngine:
             Path to the saved composite greenery map
         """
         logger.info(
-            "Generating composite greenery map from stability-selected params..."
+            "Generating composite greenery map from discovered params..."
         )
 
         if progress_callback:
@@ -8366,10 +8403,10 @@ class MetricFusionEngine:
         if self.best_params is None:
             raise ValueError(
                 "Composite generation needs ``self.best_params`` set by a prior "
-                "stability-selection step."
+                "discovery step."
             )
         final_params = dict(self.best_params)
-        logger.info(f"Composite TIFF stability-selected params: {final_params}")
+        logger.info(f"Composite TIFF discovered params: {final_params}")
         formula = cgi_formulas.get_formula(self.cgi_formula)
 
         if progress_callback:

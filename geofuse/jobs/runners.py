@@ -15,6 +15,7 @@ These are direct lifts of the workers that used to live in ``ui/tabs/``:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -30,6 +31,7 @@ import numpy as np
 import rasterio
 
 from geofuse import JobCancelled, metric_intake
+from geofuse import bayesian_index as _bayesian_index
 from geofuse import cgi_formulas as _cgi_formulas
 from geofuse import pdcor as _pdcor_mod
 from geofuse.crs_utils import (
@@ -901,8 +903,18 @@ def _fusion_config_fingerprint(
 # ────────────────────────────────────────────────────────────────────
 
 
+# The channel sets a job can pick between. Merging the street-view components
+# into one green-view channel measured stronger than either alone and is far
+# less redundant with NDVI, so it is the default; keeping them apart stays
+# available for studies that need the components separated.
+_CHANNEL_SETS: dict[str, tuple[str, ...]] = {
+    "ndvi + gvi": ("ndvi", "gvi"),
+    "ndvi + veg + terrain": ("ndvi", "veg", "terrain"),
+}
+
+
 # Ordered pipeline steps per target outcome, recorded by the stage ledger so
-# the monitor can show where a run is. ``optimize`` is the stability search and
+# the monitor can show where a run is. ``optimize`` is the discovery step and
 # dominates the runtime; ``report_stats`` is the replicate-statistics tail.
 # Relative wall-time weights for the main progress bar. Bootstrap searches
 # dominate a run; the replicate-statistics tail is the next largest cost, while
@@ -1053,6 +1065,8 @@ def run_fusion(
     spatial_adjust_eps_m: float | None = None,
     residualize_method: str = "linear",
     search_scoring_method: str = "mom_em3",
+    channel_set: str = "",
+    index_form: str = "sweep",
     sweep_splits: int = 40,
     discovery_reps: int = 5,
     discovery_shuffles: int = 12,
@@ -1115,6 +1129,17 @@ def run_fusion(
         # Validate the standalone request up front so a typo doesn't slip
         # through to the ledger and engine. ``None`` and empty list both mean
         # "CGI only" (the legacy behaviour).
+        # The channel set is the job input; the functional form is swept
+        # unless the user pinned one. Jobs recorded before the channel set
+        # existed carry only ``cgi_formula``, so an empty value keeps it.
+        if channel_set:
+            cgi_formula = _cgi_formulas.formula_for(
+                _CHANNEL_SETS[channel_set], "linear"
+            )
+        index_forms: tuple[str, ...] = (
+            _bayesian_index.FORMS if index_form == "sweep" else (index_form,)
+        )
+
         standalones: list[str] = list(standalone_channels or [])
         allowed = _cgi_formulas.formula_channels(cgi_formula)
         for _ch in standalones:
@@ -1183,6 +1208,8 @@ def run_fusion(
             "residualize_method": str(residualize_method),
             "search_scoring_method": str(search_scoring_method),
             "cgi_formula": cgi_formula,
+            "channel_set": channel_set,
+            "index_form": index_form,
             "covariate_columns": list(covariate_columns or []),
             "standalone_channels": list(standalones),
             "test_size": float(test_size),
@@ -1229,6 +1256,12 @@ def run_fusion(
             "target_display_name": target_display_name,
             "selection_method": "bayesian_index",
         }
+        # A short hash of the settings above, so a result can be matched against
+        # the configuration that produced it — and a pre-registered analysis can
+        # be shown to be the one that ran, rather than asserted to be.
+        run_config_record["config_hash"] = hashlib.sha256(
+            json.dumps(run_config_record, sort_keys=True, default=str).encode()
+        ).hexdigest()[:16]
 
         def stage(key: str, status: str, message: str = "") -> None:
             """Record a stage transition in the ledger and persist it."""
@@ -1725,7 +1758,7 @@ def run_fusion(
                     config_fingerprint=config_fp,
                 )
 
-            # One held-out test split + the train+val pool that stability
+            # One held-out test split + the train+val pool that the sweep
             # selection resamples.
             stage(skey("split"), RUNNING)
             ctx.progress(
@@ -1814,7 +1847,7 @@ def run_fusion(
 
                 return _cb
 
-            # ── Sweep + posterior (dominant compute) ───
+            # ── Sweep + posterior (dominant compute) ────
             # Headline params: the configuration the sweep picked on the
             # train+val pool, with posterior-mean weights. The sub-bar and the
             # running-stage fraction both live here, so the stage and the
@@ -1829,6 +1862,7 @@ def run_fusion(
             )
             headline_params = engine.fit_bayesian_index(
                 metric=objective_metric,
+                forms=index_forms,
                 sweep_splits=int(sweep_splits),
                 reps=int(discovery_reps),
                 shuffles=int(discovery_shuffles),
@@ -1843,7 +1877,7 @@ def run_fusion(
                 progress_callback=_study_progress_cb("CGI", skey("optimize")),
             )
             engine.best_params = dict(headline_params)
-            cgi_stability_summary = _posterior_summary(headline_params)
+            cgi_discovery_summary = _posterior_summary(headline_params)
             # Kept for the results bundle's schema. The sweep has no master
             # Optuna study, so there is no best/robust trial pool.
             best_params: dict = {}
@@ -1924,7 +1958,7 @@ def run_fusion(
             except Exception as exc:
                 _log_fusion("WARN", f"[{label}] Whole-data effects failed: {exc}")
 
-            # No master Optuna study in stability mode, so there is no per-trial
+            # No master Optuna study, so there is no per-trial
             # test sidecar to build.
             cgi_per_trial_test: dict[int, dict[str, float]] = {}
             stage(skey("report_stats"), DONE)
@@ -1969,7 +2003,7 @@ def run_fusion(
                     )
                 stage(skey("mixedlm_postscore"), DONE)
 
-            # ── Standalone stability searches ───────────
+            # ── Standalone discoveries ──────────────────
             # One search per channel, reusing the engine, its cache and split.
             # Each overwrites the engine's active channel and best params, so
             # snapshot the CGI state here and restore it after the loop.
@@ -1999,6 +2033,7 @@ def run_fusion(
                 engine._active_greenery_channel = ch
                 ch_best = engine.fit_bayesian_index(
                     metric=objective_metric,
+                    forms=index_forms,
                     sweep_splits=int(sweep_splits),
                     reps=int(discovery_reps),
                     shuffles=int(discovery_shuffles),
@@ -2016,7 +2051,7 @@ def run_fusion(
                 )
                 engine.best_params = dict(ch_best)
                 ch_headline_params = dict(ch_best)
-                ch_stability_summary = _posterior_summary(ch_best)
+                ch_discovery_summary = _posterior_summary(ch_best)
                 stage(skey(f"standalone_{ch}"), DONE)
 
                 # Test scoring, CIs, subset scores, composite TIFF, and the
@@ -2102,7 +2137,7 @@ def run_fusion(
                     "per_trial_test": {},
                     "test_results": ch_test,
                     "subset_scores": ch_subset_scores,
-                    "stability_summary": ch_stability_summary,
+                    "discovery_summary": ch_discovery_summary,
                     "direction_sign": ch_direction,
                     "objective_metric": objective_metric,
                     "study_name": ch_study_name,
@@ -2265,7 +2300,7 @@ def run_fusion(
             averaged_params: dict | None = dict(headline_params)
             try:
                 # No master study to plot trials from — generate the composite
-                # TIFF directly from the stability-selection winning params.
+                # TIFF directly from the discovery's winning params.
                 engine.generate_composite_greenery_map(
                     output_path=cgi_composite_path,
                 )
@@ -2378,6 +2413,10 @@ def run_fusion(
                     getattr(engine, "_covariate_dummy_map", {}) or {}
                 ),
                 "cgi_formula": cgi_formula,
+                "config_hash": run_config_record["config_hash"],
+                # Distinct configurations scored on the held-out slice. A test
+                # set is a budget; this makes a spent one visible.
+                "test_reads": int(getattr(engine, "_test_reads", 0)),
                 "target_display_name": target_display_name,
                 "outcome_label": target_feature or target_display_name,
                 "standalones": standalones_bundle,
@@ -2389,9 +2428,9 @@ def run_fusion(
                 "disabled_channels": sorted(
                     getattr(engine, "_disabled_channels", set()) or set()
                 ),
-                # Stability-selection diagnostics, the held-out direction sign,
+                # Discovery diagnostics, the held-out direction sign,
                 # and the AIC/BIC verdict vs the best standalone (when run).
-                "stability_summary": cgi_stability_summary,
+                "discovery_summary": cgi_discovery_summary,
                 "direction_sign": cgi_direction,
                 "cgi_vs_standalone_aic_bic": cgi_vs_standalone_aic_bic,
                 # Held-out test effect (headline) + descriptive whole-data CI +

@@ -431,6 +431,17 @@ _MIXEDLM_METRICS: tuple[str, ...] = (
     "gee_logit_coef",
 )
 
+# Every channel that can carry a standalone study or a composite artifact,
+# across both channel sets. Iterating the union keeps artifact discovery
+# independent of which set a given job ran with.
+_ALL_STANDALONE_CHANNELS: tuple[str, ...] = ("veg", "terrain", "ndvi", "gvi")
+
+# Channel sets a job can pick between; mirrors ``runners._CHANNEL_SETS``.
+_CHANNEL_SETS: dict[str, tuple[str, ...]] = {
+    "ndvi + gvi": ("ndvi", "gvi"),
+    "ndvi + veg + terrain": ("ndvi", "veg", "terrain"),
+}
+
 # Authoritative list of every ``run_fusion`` setting that isn't a file path or
 # runtime object. The submit path records exactly these (under the same names)
 # and the restart path replays exactly these — so a re-run can never silently
@@ -493,7 +504,6 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
 # Recorded param -> form widget key. Re-run seeds these so the normal setup
 # form comes up filled in; anything not listed keeps its own default.
 _FUSION_PARAM_TO_WIDGET: dict[str, str] = {
-    "cgi_formula": "fusion_cgi_formula",
     "objective_metric": "fusion_objective_metric",
     "residualize_method": "fusion_residualize_method",
     "search_scoring_method": "fusion_search_scoring_method",
@@ -1538,22 +1548,8 @@ def _render_study_details_panel(
     """
     st.subheader("Study Details")
 
-    # ── Row 1: CGI formula + covariates ─────────────────────────
-    col_cgi1, col_cgi2 = st.columns([1, 2])
-    with col_cgi1:
-        _default("fusion_cgi_formula", "weighted_average")
-        cgi_formula = st.selectbox(
-            "CGI Formula",
-            options=["weighted_average", "synergy"],
-            help=(
-                "**weighted_average** — three weights on Vegetation / "
-                "Terrain / NDVI summing to 100. "
-                "**synergy** — seven weights summing to 100 plus three "
-                "powers on the main channel terms."
-            ),
-            key="fusion_cgi_formula",
-        )
-    with col_cgi2:
+    # ── Row 1: covariates ───────────────────────────────────────
+    with st.container():
         categorical_candidates = list(categorical_candidates or [])
         if available_covariates:
             _keep_valid("fusion_covariate_columns", available_covariates, multi=True)
@@ -1890,9 +1886,14 @@ def _render_study_details_panel(
         )
     with col_r2:
         run_standalones = st.checkbox(
-            "Also optimize each metric on its own (NDVI / Vegetation / Terrain)",
+            "Also run each channel on its own",
             key="fusion_run_standalones",
-            help="Adds three single-metric Optuna studies alongside the combined CGI run.",
+            help=(
+                "One discovery per channel of the set chosen below, each with "
+                "its own radius and aggregator picked the same way. This is the "
+                "comparison that decides whether the composite is worth its "
+                "extra complexity, so the monitor lists one step per channel."
+            ),
         )
 
     # ── Channel collinearity check (iterative VIF) ──────────────
@@ -2164,7 +2165,12 @@ def _render_study_details_panel(
                 spatial_adjust_eps_m = float(eps_ui) if eps_ui and eps_ui > 0 else None
 
     return {
-        "cgi_formula": cgi_formula,
+        # Derived, not chosen: the channel set names the modalities and
+        # the sweep picks the form, so the registry name follows from both.
+        "cgi_formula": _cgi_formulas.formula_for(
+            _CHANNEL_SETS[channel_set_ui],
+            "linear" if index_form_ui == "sweep" else str(index_form_ui),
+        ),
         "covariate_columns": list(covariate_columns or []),
         "covariate_types": dict(covariate_types or {}),
         "moderator_columns": list(moderator_columns or []),
@@ -2606,7 +2612,7 @@ def _render_composite_map_viewer(results_view: dict, engine) -> None:
     cgi_path = os.path.join(artifacts_dir, "composite_greenery.tif")
     if os.path.isfile(cgi_path):
         composite_options.append(("CGI (combined)", cgi_path))
-    for ch in ("veg", "terrain", "ndvi"):
+    for ch in _ALL_STANDALONE_CHANNELS:
         path = os.path.join(artifacts_dir, f"composite_greenery_{ch}.tif")
         if os.path.isfile(path):
             composite_options.append(
@@ -2853,10 +2859,12 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
         st.info("pandas required for the discovery diagnostics.")
         return
 
+    # Synergy carries a weight per channel pair as well, so the label list is
+    # longer than the channel list.
+    labels = summary.get("weight_labels") or post_channels
+
     def _label(i: int) -> str:
-        return (
-            post_channels[i] if i < len(post_channels) else f"ch{i}"
-        ).upper()
+        return (labels[i] if i < len(labels) else f"ch{i}").upper()
 
     # ── What the sweep picked ───────────────────────────────────
     st.markdown("**Sweep**")
@@ -3495,7 +3503,7 @@ def _render_study_detail(
 
     # ── Winning params ──────────────────────────────────────────
     if is_cgi:
-        if formula.name == _cgi_formulas.WEIGHTED_AVERAGE:
+        if not formula.power_keys:
             st.markdown("**Weights (posterior mean)**")
             weight_cols = st.columns(len(formula.weight_keys))
             total_weight = sum(
@@ -3689,7 +3697,7 @@ def _render_cross_study_comparison(results_view: dict, metric_name: str) -> None
     st.markdown("**CGI vs standalone single-metric studies**")
 
     studies: list[tuple[str, str, dict]] = [("cgi", "CGI (combined)", results_view)]
-    for ch in ("veg", "terrain", "ndvi"):
+    for ch in _ALL_STANDALONE_CHANNELS:
         b = standalones.get(ch)
         if b:
             studies.append((ch, f"{_CHANNEL_DISPLAY.get(ch, ch)} (standalone)", b))
@@ -3958,6 +3966,22 @@ def _render_fusion_results_body(output_dir: str) -> None:
             else ""
         )
     )
+    _cfg_hash = results_view.get("config_hash")
+    _test_reads = results_view.get("test_reads")
+    if _cfg_hash or _test_reads is not None:
+        bits = []
+        if _cfg_hash:
+            bits.append(f"**Config hash:** `{_cfg_hash}`")
+        if _test_reads is not None:
+            bits.append(f"**Test-set reads:** {int(_test_reads)}")
+        st.caption("  ·  ".join(bits))
+        if _test_reads is not None and int(_test_reads) > 20:
+            st.caption(
+                ":orange[The held-out set was scored on "
+                f"{int(_test_reads)} distinct configurations.] Each one spends "
+                "part of the out-of-sample guarantee; the headline p-value is "
+                "optimistic by roughly that many comparisons."
+            )
     artifacts_dir = results_view.get("artifacts_dir")
     if artifacts_dir:
         st.caption(f"📁 Job artifacts: `{artifacts_dir}`")
@@ -3966,7 +3990,7 @@ def _render_fusion_results_body(output_dir: str) -> None:
     # ── Study selector + per-study detail ───────────────────────
     standalones = results_view.get("standalones") or {}
     study_options: list[tuple[str, str]] = [("cgi", "CGI (combined)")]
-    for ch in ("veg", "terrain", "ndvi"):
+    for ch in _ALL_STANDALONE_CHANNELS:
         if standalones.get(ch):
             study_options.append((ch, f"{_CHANNEL_DISPLAY.get(ch, ch)} (standalone)"))
 
@@ -4947,8 +4971,10 @@ def render(output_dir: str) -> None:
                 "exposure_iqr": (
                     float(exposure_iqr_param) if exposure_iqr_param else None
                 ),
+                # One standalone per channel of the set the job runs, so the
+                # monitor's step list matches the channels actually studied.
                 "standalone_channels": (
-                    ["veg", "terrain", "ndvi"] if run_standalones else []
+                    list(_CHANNEL_SETS[channel_set_param]) if run_standalones else []
                 ),
                 "longitudinal_spec_payload": longitudinal_spec_payload,
                 "cgi_grid_spacing_m": (

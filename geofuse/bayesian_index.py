@@ -373,11 +373,27 @@ class IndexPosterior:
     ess_min: float
     divergences: int
 
+    def weight_labels(self) -> list[str]:
+        """One label per weight, so the pair terms are not read as channels.
+
+        The synergy form carries a weight per channel *and* per channel pair;
+        a reader given only the channel names would attribute a pair's weight
+        to whichever channel happened to sit at that index.
+        """
+        labels = list(self.channels)
+        if self.weights.shape[1] > len(self.channels):
+            labels += [
+                f"{self.channels[i]} x {self.channels[j]}"
+                for i, j in _pairs(len(self.channels))
+            ]
+        return labels
+
     def summary(self) -> dict:
         lo, hi = np.percentile(self.beta, [2.5, 97.5])
         w_lo, w_hi = np.percentile(self.weights, [2.5, 97.5], axis=0)
         return {
             "channels": list(self.channels),
+            "weight_labels": self.weight_labels(),
             "picked": [list(p) for p in self.picked],
             "form": self.form,
             "weight_mean": self.weights.mean(0).tolist(),
