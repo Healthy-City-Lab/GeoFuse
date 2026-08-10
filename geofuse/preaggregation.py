@@ -666,6 +666,10 @@ def aggregate_entity_batch(
     if shared is not None:
         both = vector_batch_stats_multi(shared[0], shared[1], point_xy, gvi_radii)
         veg, terrain = both["veg"], both["terrain"]
+        # ``gvi`` rides the same radius query. Summing the components per
+        # panorama *before* aggregating is exact for every statistic; summing
+        # the aggregates afterwards is exact only for the mean.
+        gvi = both.get("gvi")
     else:
         veg = channel_batch_stats(
             state["veg"], gvi_radii, point_xy=point_xy, geoms=geoms
@@ -673,11 +677,14 @@ def aggregate_entity_batch(
         terrain = channel_batch_stats(
             state["terrain"], gvi_radii, point_xy=point_xy, geoms=geoms
         )
+        # Separate source layers: the components live on different point sets,
+        # so an exact merged channel cannot be formed here.
+        gvi = None
     gvi_done = time.perf_counter()
     ndvi = channel_batch_stats(
         state["ndvi"], state["ndvi_radii"], point_xy=point_xy, geoms=geoms
     )
-    return veg, terrain, ndvi, gvi_done - started, time.perf_counter() - gvi_done
+    return veg, terrain, ndvi, gvi, gvi_done - started, time.perf_counter() - gvi_done
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -755,12 +762,11 @@ def worker_init(spec: dict) -> None:
     shared_xy = None
     if spec.get("gvi_shared_xy"):
         shared_xy = np.asarray(attach_array(spec["gvi_shared_xy"]))
+        _veg = np.asarray(attach_array(spec["channels"]["veg"]["values"]))
+        _ter = np.asarray(attach_array(spec["channels"]["terrain"]["values"]))
         state["gvi_shared"] = (
             BallTree(shared_xy),
-            {
-                "veg": attach_array(spec["channels"]["veg"]["values"]),
-                "terrain": attach_array(spec["channels"]["terrain"]["values"]),
-            },
+            {"veg": _veg, "terrain": _ter, "gvi": _veg + _ter},
         )
     for name, chan in spec["channels"].items():
         if shared_xy is not None and name in ("veg", "terrain"):
@@ -794,10 +800,10 @@ def worker_aggregate(lo: int, hi: int) -> tuple:
     # are grid-pixel centroids, so their points are rebuilt from the mapped
     # coordinates instead of travelling with the task.
     geoms = list(shapely.points(xy))
-    veg, terrain, ndvi, gvi_s, ndvi_s = aggregate_entity_batch(
+    veg, terrain, ndvi, gvi, gvi_s, ndvi_s = aggregate_entity_batch(
         state, point_xy=xy, geoms=geoms
     )
-    return lo, hi, veg, terrain, ndvi, gvi_s, ndvi_s
+    return lo, hi, veg, terrain, ndvi, gvi, gvi_s, ndvi_s
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -826,7 +832,13 @@ class GreeneryCache:
     shared read-only across worker threads.
     """
 
-    _CHANNELS = ("veg", "terrain", "ndvi")
+    # Every channel the aggregation can produce. A unit stores only the ones
+    # its jobs have asked for; a later job wanting more appends them.
+    ALL_CHANNELS = ("veg", "terrain", "ndvi", "gvi")
+    # Kept so a two-channel job never pays for a channel it will not read.
+    # ``gvi`` percentiles cannot be recovered by summing the components, so a
+    # merged-channel study must store its own block.
+    DEFAULT_CHANNELS = ("veg", "terrain", "ndvi")
 
     def __init__(
         self,
@@ -881,16 +893,22 @@ class GreeneryCache:
         gvi_radii: tuple[int, ...],
         ndvi_radii: tuple[int, ...],
         required_ids: np.ndarray,
-    ) -> tuple[tuple[int, ...], tuple[int, ...], np.ndarray]:
+        channels: tuple[str, ...] | None = None,
+    ) -> tuple[tuple[int, ...], tuple[int, ...], np.ndarray, tuple[str, ...]]:
         """Load a reusable file if one covers the job's radii, else start fresh.
 
-        Returns ``(effective_gvi_radii, effective_ndvi_radii, missing_ids)``:
-        the ladder that new pixels must be computed at (the file's, when reused,
-        so the unit stays uniform) and the referenced ids not yet stored.
+        Returns ``(effective_gvi_radii, effective_ndvi_radii, missing_ids,
+        missing_channels)``: the ladder new pixels must be computed at (the
+        file's, when reused, so the unit stays uniform), the referenced ids not
+        yet stored, and any requested channel the stored unit never held.
         """
         job_gvi = tuple(int(r) for r in gvi_radii)
         job_ndvi = tuple(int(r) for r in ndvi_radii)
         required = np.asarray(required_ids, dtype=np.int64)
+        want = tuple(channels or self.DEFAULT_CHANNELS)
+        bad = [c for c in want if c not in self.ALL_CHANNELS]
+        if bad:
+            raise ValueError(f"unknown greenery channel(s) {bad}")
 
         if cfg_key not in self._units:
             stored = self._peek_ladder(cfg_key)
@@ -911,18 +929,41 @@ class GreeneryCache:
                     eff_ndvi = tuple(sorted(set(job_ndvi) | set(stored[1])))
                 else:
                     eff_gvi, eff_ndvi = tuple(sorted(job_gvi)), tuple(sorted(job_ndvi))
-                self._units[cfg_key] = {
+                nstats = len(self.stats)
+                unit_new = {
                     "ids": np.empty(0, np.int64),
-                    "veg": np.empty((0, len(eff_gvi), len(self.stats)), np.float32),
-                    "terrain": np.empty((0, len(eff_gvi), len(self.stats)), np.float32),
-                    "ndvi": np.empty((0, len(eff_ndvi), len(self.stats)), np.float32),
+                    "channels": tuple(want),
                     "gvi_radii": eff_gvi,
                     "ndvi_radii": eff_ndvi,
+                    "gvi_exact": True,
                     "dirty": False,
                 }
+                for ch in want:
+                    n_r = len(eff_ndvi) if ch == "ndvi" else len(eff_gvi)
+                    unit_new[ch] = np.empty((0, n_r, nstats), np.float32)
+                self._units[cfg_key] = unit_new
         unit = self._units[cfg_key]
         missing = self._setdiff(required, unit["ids"])
-        return unit["gvi_radii"], unit["ndvi_radii"], missing
+        # A channel the stored unit never held has to be computed for every id
+        # it already covers, not just for the new ones.
+        absent = tuple(c for c in want if c not in unit.get("channels", ()))
+        if absent:
+            # The unit gains a channel it never held. One aggregation pass
+            # produces every channel anyway, so the rows are cleared and
+            # rebuilt for the full set rather than stitching a new block onto
+            # the existing id order.
+            nstats = len(self.stats)
+            unit["channels"] = tuple(
+                c for c in self.ALL_CHANNELS
+                if c in set(unit.get("channels", ())) | set(want)
+            )
+            unit["ids"] = np.empty(0, np.int64)
+            for ch in unit["channels"]:
+                n_r = (len(unit["ndvi_radii"]) if ch == "ndvi"
+                       else len(unit["gvi_radii"]))
+                unit[ch] = np.empty((0, n_r, nstats), np.float32)
+            missing = np.unique(np.concatenate([required, missing]))
+        return unit["gvi_radii"], unit["ndvi_radii"], missing, absent
 
     def _config_ok(self, meta: dict) -> bool:
         return (
@@ -959,15 +1000,17 @@ class GreeneryCache:
     def _load(self, cfg_key: str) -> dict:
         with np.load(self._path(cfg_key), allow_pickle=False) as z:
             meta = json.loads(str(z["meta"]))
+            stored = tuple(meta.get("channels") or ("veg", "terrain", "ndvi"))
             unit = {
                 "ids": np.ascontiguousarray(z["ids"], dtype=np.int64),
-                "veg": np.ascontiguousarray(z["veg"], dtype=np.float32),
-                "terrain": np.ascontiguousarray(z["terrain"], dtype=np.float32),
-                "ndvi": np.ascontiguousarray(z["ndvi"], dtype=np.float32),
+                "channels": stored,
                 "gvi_radii": tuple(int(r) for r in meta["gvi_radii"]),
                 "ndvi_radii": tuple(int(r) for r in meta["ndvi_radii"]),
+                "gvi_exact": bool(meta.get("gvi_exact", True)),
                 "dirty": False,
             }
+            for ch in stored:
+                unit[ch] = np.ascontiguousarray(z[ch], dtype=np.float32)
         self._account(unit)
         return unit
 
@@ -975,30 +1018,32 @@ class GreeneryCache:
         self,
         cfg_key: str,
         new_ids: np.ndarray,
-        veg: np.ndarray,
-        terrain: np.ndarray,
-        ndvi: np.ndarray,
+        blocks: dict,
         *,
         persist: bool = True,
     ) -> None:
         """Merge freshly-computed pixels into the unit, keep it sorted by id,
-        and (optionally) write it to disk atomically."""
+        and (optionally) write it to disk atomically.
+
+        ``blocks`` maps channel name to its ``(n_new, n_radii, n_stats)`` array.
+        A channel the unit does not yet hold is appended for the ids it already
+        covers as well, which is how a three-channel job extends a cache built
+        by a two-channel one.
+        """
         unit = self._units[cfg_key]
         new_ids = np.asarray(new_ids, dtype=np.int64)
+        missing_block = [c for c in unit["channels"] if c not in blocks]
+        if missing_block:
+            raise ValueError(f"commit_unit missing blocks for {missing_block}")
         if new_ids.size:
             unit["ids"] = np.concatenate([unit["ids"], new_ids])
-            unit["veg"] = np.concatenate(
-                [unit["veg"], np.asarray(veg, np.float32)], axis=0
-            )
-            unit["terrain"] = np.concatenate(
-                [unit["terrain"], np.asarray(terrain, np.float32)], axis=0
-            )
-            unit["ndvi"] = np.concatenate(
-                [unit["ndvi"], np.asarray(ndvi, np.float32)], axis=0
-            )
+            for ch in unit["channels"]:
+                unit[ch] = np.concatenate(
+                    [unit[ch], np.asarray(blocks[ch], np.float32)], axis=0
+                )
             order = np.argsort(unit["ids"], kind="stable")
             unit["ids"] = np.ascontiguousarray(unit["ids"][order])
-            for ch in self._CHANNELS:
+            for ch in unit["channels"]:
                 unit[ch] = np.ascontiguousarray(unit[ch][order])
             unit["dirty"] = True
         if persist and unit.get("dirty"):
@@ -1015,16 +1060,16 @@ class GreeneryCache:
             "stats": list(self.stats),
             "spacing": self.spacing_m,
             "crs": self.crs_key,
+            "gvi_exact": bool(unit.get("gvi_exact", True)),
+            "channels": list(unit["channels"]),
         }
         path = self._path(cfg_key)
         tmp = path + ".tmp"
         np.savez(
             tmp,
             ids=unit["ids"],
-            veg=unit["veg"],
-            terrain=unit["terrain"],
-            ndvi=unit["ndvi"],
             meta=np.array(json.dumps(meta)),
+            **{ch: unit[ch] for ch in unit["channels"]},
         )
         os.replace(tmp + ".npz", path)
 
@@ -1096,7 +1141,7 @@ class GreeneryCache:
         ``None`` when the cell is not on the stored grid, so the caller falls
         back exactly as it would from :meth:`lookup`.
         """
-        if channel not in self._CHANNELS:
+        if channel not in self.ALL_CHANNELS:
             return None
         col_idx = self._stat_index.get(column)
         if col_idx is None:
@@ -1143,7 +1188,7 @@ class GreeneryCache:
 
     def _account(self, unit: dict) -> None:
         self.n_bytes = sum(
-            u["ids"].nbytes + sum(u[c].nbytes for c in self._CHANNELS)
+            u["ids"].nbytes + sum(u[c].nbytes for c in u.get("channels", ()))
             for u in self._units.values()
         )
 

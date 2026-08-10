@@ -2370,12 +2370,18 @@ class MetricFusionEngine:
             global_pids = np.asarray(preaggr_gdf.index, dtype=np.int64)
         pid_to_pos = {int(p): i for i, p in enumerate(global_pids)}
 
-        eff_gvi, eff_ndvi, missing = cache.open_unit(
+        eff_gvi, eff_ndvi, missing, absent_ch = cache.open_unit(
             cfg_key,
             gvi_radii=gvi_radii,
             ndvi_radii=ndvi_radii,
             required_ids=global_pids,
+            channels=self._cache_channels(),
         )
+        if absent_ch:
+            # A channel the stored unit never held has to be built for every id
+            # it already covers, so the whole unit is recomputed once.
+            _log("INFO", f"Cache extension: computing {list(absent_ch)} for all pixels.")
+            missing = global_pids
         _log(
             "INFO",
             f"Pre-aggregation: {n_points:,} pixels · GVI radii {gvi_radii} m · "
@@ -2424,7 +2430,7 @@ class MetricFusionEngine:
                 _log("WARN", "Pre-aggregation cancelled (resumable).")
                 self._preaggregation_done = False
                 return False
-            cache.commit_unit(cfg_key, missing, *result)
+            cache.commit_unit(cfg_key, missing, self._blocks(result))
             if progress_callback is not None:
                 progress_callback(len(missing), total)
             build_secs = time.perf_counter() - build_t0
@@ -2548,9 +2554,10 @@ class MetricFusionEngine:
         nstats = len(preaggregation.STAT_COLUMNS)
         veg_out = np.full((n, len(gvi_radii), nstats), np.nan, dtype=np.float32)
         ter_out = np.full((n, len(gvi_radii), nstats), np.nan, dtype=np.float32)
+        gvi_out = np.full((n, len(gvi_radii), nstats), np.nan, dtype=np.float32)
         ndvi_out = np.full((n, len(ndvi_radii), nstats), np.nan, dtype=np.float32)
         if n == 0:
-            return veg_out, ter_out, ndvi_out
+            return veg_out, ter_out, ndvi_out, gvi_out
 
         preps = {
             "veg": self._prep_channel_source(veg_src, "veg", utm_crs, all_points),
@@ -2576,10 +2583,13 @@ class MetricFusionEngine:
 
         def _store(res) -> None:
             nonlocal done_entities
-            lo, hi, veg_b, ter_b, ndvi_b, vsec, rsec = res
+            lo, hi, veg_b, ter_b, ndvi_b, gvi_b, vsec, rsec = res
             veg_out[lo:hi] = veg_b
             ter_out[lo:hi] = ter_b
             ndvi_out[lo:hi] = ndvi_b
+            # ``None`` when the components came from separate source layers,
+            # where an exact merged channel cannot be formed.
+            gvi_out[lo:hi] = (veg_b + ter_b) if gvi_b is None else gvi_b
             stage_secs["vector_agg"] += vsec
             stage_secs["raster_agg"] += rsec
             done_entities += hi - lo
@@ -2621,7 +2631,7 @@ class MetricFusionEngine:
             )
         if not finished:
             return None
-        return veg_out, ter_out, ndvi_out
+        return veg_out, ter_out, ndvi_out, gvi_out
 
     def _aggregate_in_threads(
         self,
@@ -2654,10 +2664,12 @@ class MetricFusionEngine:
             bpos = positions[lo:hi]
             xy = point_xy_utm[bpos] if len(point_xy_utm) else None
             geoms = [entity_geoms_utm[i] for i in bpos]
-            veg_b, ter_b, ndvi_b, vsec, rsec = preaggregation.aggregate_entity_batch(
-                state, point_xy=xy, geoms=geoms
+            veg_b, ter_b, ndvi_b, gvi_b, vsec, rsec = (
+                preaggregation.aggregate_entity_batch(
+                    state, point_xy=xy, geoms=geoms
+                )
             )
-            return lo, hi, veg_b, ter_b, ndvi_b, vsec, rsec
+            return lo, hi, veg_b, ter_b, ndvi_b, gvi_b, vsec, rsec
 
         if workers <= 1:
             for lo, hi in batches:
@@ -2880,9 +2892,19 @@ class MetricFusionEngine:
             required = (
                 np.unique(np.concatenate(parts)) if parts else np.empty(0, np.int64)
             )
-            eff_gvi, eff_ndvi, missing = cache.open_unit(
-                cfg, gvi_radii=gvi_radii, ndvi_radii=ndvi_radii, required_ids=required
+            eff_gvi, eff_ndvi, missing, absent_ch = cache.open_unit(
+                cfg,
+                gvi_radii=gvi_radii,
+                ndvi_radii=ndvi_radii,
+                required_ids=required,
+                channels=self._cache_channels(),
             )
+            if absent_ch:
+                _log(
+                    "INFO",
+                    f"Cache extension for {cfg}: computing {list(absent_ch)}.",
+                )
+                missing = required
             u["eff_gvi"] = eff_gvi
             u["eff_ndvi"] = eff_ndvi
             u["missing"] = missing
@@ -2949,12 +2971,12 @@ class MetricFusionEngine:
             if result is None:
                 cancelled = True
                 break
-            veg_arr, ter_arr, ndvi_arr = result
-            cache.commit_unit(cfg, missing, veg_arr, ter_arr, ndvi_arr)
+            cache.commit_unit(cfg, missing, self._blocks(result))
+            veg_arr, ter_arr, ndvi_arr, gvi_arr = result
             processed += len(missing)
             if progress_callback is not None:
                 progress_callback(min(processed, total_missing), max(total_missing, 1))
-            del veg_arr, ter_arr, ndvi_arr, result
+            del veg_arr, ter_arr, ndvi_arr, gvi_arr, result
             provider.release()
             gc.collect()
 
@@ -3058,6 +3080,35 @@ class MetricFusionEngine:
         # ``None`` here means an off-grid (channel, wave, radius, column) cell —
         # the caller falls back to the ring/buffer aggregation path.
         return source.gather(plan, channel, int(round(radius_m)), column)
+
+    def _cache_channels(self) -> tuple[str, ...]:
+        """Greenery channels this job needs stored.
+
+        A two-channel study reads ``gvi``, whose percentiles cannot be recovered
+        by summing the components, so it must be stored in its own right. A
+        three-channel study never reads it and does not pay for it. The cache
+        keeps whatever any job has asked for, so switching a study from two
+        channels to three appends rather than rebuilds.
+        """
+        wanted = set(cgi_formulas.formula_channels(self.cgi_formula))
+        if self._active_greenery_channel != "cgi":
+            wanted.add(self._active_greenery_channel)
+        if "gvi" in wanted:
+            # ``gvi``'s mean is the component sum, but its percentiles are not,
+            # so the components stay alongside it for standalone reporting.
+            wanted |= {"veg", "terrain"}
+        return tuple(c for c in preaggregation.GreeneryCache.ALL_CHANNELS
+                     if c in wanted)
+
+    def _blocks(self, result: tuple) -> dict:
+        """Aggregation output -> ``{channel: array}``, limited to this job's set.
+
+        The aggregation always produces all four (one radius query serves the
+        street-view family), but only the requested channels are stored.
+        """
+        veg, ter, ndvi, gvi = result
+        allb = {"veg": veg, "terrain": ter, "ndvi": ndvi, "gvi": gvi}
+        return {c: allb[c] for c in self._cache_channels()}
 
     def _preaggr_plan(
         self,
