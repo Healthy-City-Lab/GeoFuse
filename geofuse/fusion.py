@@ -3081,6 +3081,98 @@ class MetricFusionEngine:
         # the caller falls back to the ring/buffer aggregation path.
         return source.gather(plan, channel, int(round(radius_m)), column)
 
+    def build_index_tensor(self, subset: str = "train_val"):
+        """Per-entity values for every (channel, radius, statistic) cell.
+
+        The sweep scores candidates out of this one tensor, so the cache is read
+        once per run instead of once per candidate. Shape is
+        ``(n_entities, n_channels, n_radii, n_stats)`` with channels in
+        :meth:`_cache_channels` order.
+
+        The entity collapse depends on the catchment radius for point and line
+        targets, so the mask is rebuilt per radius; polygon targets average
+        every in-footprint pixel and the mask is constant.
+        """
+        if subset == "test":
+            data = self.test_data
+        elif subset == "train_val":
+            data = self.train_val_data
+        else:
+            raise ValueError(f"subset must be 'train_val' or 'test'; got {subset!r}")
+        if data is None or len(data) == 0:
+            raise ValueError(f"No {subset} rows; call split_data() first.")
+
+        channels = self._cache_channels()
+        gvi_radii, ndvi_radii = self._preaggr_radii()
+        # One ladder for the tensor: NDVI and the street-view family can be
+        # configured separately, so the union is stored and each channel's
+        # off-ladder cells stay NaN and are never selected.
+        radii = tuple(sorted(set(gvi_radii) | set(ndvi_radii)))
+        stats = tuple(preaggregation.STAT_COLUMNS)
+
+        static = self._fold_entity_statics(data, f"tensor::{subset}", subset)
+        n_ent = static["n_uniq"] if static["has_pid"] else len(static["points"])
+        X = np.full((n_ent, len(channels), len(radii), len(stats)), np.nan)
+
+        for ri, radius in enumerate(radii):
+            mask = None
+            if static["has_pid"]:
+                mask = _helpers.entity_collapse_mask(data, float(radius))
+            for ci, ch in enumerate(channels):
+                ladder = ndvi_radii if ch == "ndvi" else gvi_radii
+                if radius not in ladder:
+                    continue
+                for si, column in enumerate(stats):
+                    stat, pct = (
+                        ("mean", None) if column == "mean"
+                        else ("percentile", int(column[1:]))
+                    )
+                    vals, on_uniq = self._channel_values_for_static(
+                        static, ch, radius, stat, pct, subset
+                    )
+                    if vals is None:
+                        continue
+                    v = np.asarray(vals, dtype=np.float64)
+                    if on_uniq and static.get("uniq_inverse") is not None:
+                        v = v[static["uniq_inverse"]]
+                    X[:, ci, ri, si] = (
+                        self._collapse_mean_from_codes(
+                            v, static["codes"], static["n_uniq"], mask
+                        )
+                        if static["has_pid"]
+                        else v
+                    )
+        return X, np.asarray(radii, dtype=float), list(stats), list(channels), static
+
+    def _channel_values_for_static(self, static, channel, radius, stat, pct, subset):
+        """One (channel, radius, stat) column for a prepared fold, cache first.
+
+        ``gvi`` has no source layer of its own — it is a stored cache channel —
+        so a cache miss for it is fatal rather than falling back to on-the-fly
+        aggregation over the wrong metric.
+        """
+        metric = {
+            "veg": self.veg_data,
+            "terrain": self.terrain_data,
+            "ndvi": self.ndvi_data,
+        }.get(channel)
+        if metric is None:
+            uniq = static.get("uniq_lookup_ids")
+            source = self._ensure_memory_loaded() or self._preaggr_cache
+            column = preaggregation.stat_to_column(stat, pct)
+            if uniq is None or source is None or column is None:
+                return None, False
+            plan = self._preaggr_plan(
+                source, uniq, static.get("uniq_wave_idx"), static
+            )
+            if plan is None:
+                return None, False
+            return source.gather(plan, channel, int(round(radius)), column), True
+        return self._aggregate_channel_for_fold(
+            static, metric, radius, stat, pct if pct is not None else 50,
+            channel=channel, fold_idx=None, subset=subset,
+        )
+
     def _cache_channels(self) -> tuple[str, ...]:
         """Greenery channels this job needs stored.
 
