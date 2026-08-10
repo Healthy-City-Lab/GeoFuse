@@ -19,44 +19,6 @@ from shapely.geometry import Point
 from geofuse import cgi_formulas as cf
 
 
-class TestWeightCellCount(unittest.TestCase):
-    def test_weighted_average_more_than_standalone(self):
-        # A standalone single channel has no weight keys -> 1 cell; the CGI
-        # formula must have many more so the budget scales up.
-        self.assertGreater(cf.weight_cell_count("weighted_average"), 1)
-
-    def test_synergy_counts_main_weights_only(self):
-        # Synergy keys on its 3 main channel weights, not all 7 weights; the
-        # cell key length must be the number of main weights.
-        syn = cf.get_formula("synergy")
-        self.assertEqual(len(syn.main_weight_keys), 3)
-        params = dict.fromkeys(syn.weight_keys, 20)
-        key = cf.weight_cell_key("synergy", params)
-        self.assertEqual(len(key), len(syn.main_weight_keys))
-
-    def test_weighted_average_cell_key_unchanged(self):
-        wa = cf.get_formula("weighted_average")
-        # main == all weights for weighted_average, so the key spans every weight
-        self.assertEqual(wa.main_weight_keys, wa.weight_keys)
-        params = {k: 100 // len(wa.weight_keys) for k in wa.weight_keys}
-        self.assertEqual(
-            len(cf.weight_cell_key("weighted_average", params)), len(wa.weight_keys)
-        )
-
-    def test_hand_enumerated_two_weight_case(self):
-        # Two weights at 5% step summing to 100, binned to 10%: reachable bucket
-        # pairs are (bin(w), bin(100-w)) for w in {0,5,...,100}.
-        expected = {
-            (cf.bin_weight(w), cf.bin_weight(100 - w)) for w in range(0, 101, 5)
-        }
-        # Drive the same logic the counter uses for a 2-main-weight, no-interaction
-        # formula by checking the enumeration matches the hand set size.
-        self.assertEqual(
-            len(expected),
-            len({(cf.bin_weight(w), cf.bin_weight(100 - w)) for w in range(0, 101, 5)}),
-        )
-
-
 class TestCategoricalCovariateExpansion(unittest.TestCase):
     def _engine(self, cov_cols, cov_types):
         from geofuse.fusion import MetricFusionEngine

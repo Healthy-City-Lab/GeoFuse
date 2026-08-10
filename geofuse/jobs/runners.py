@@ -30,6 +30,7 @@ import numpy as np
 import rasterio
 
 from geofuse import JobCancelled, metric_intake
+from geofuse import cgi_formulas as _cgi_formulas
 from geofuse import pdcor as _pdcor_mod
 from geofuse.crs_utils import (
     default_geotiff_creation_options,
@@ -51,7 +52,7 @@ from geofuse.jobs.fusion_outputs import (
     _fusion_stage_weight,
     _jsonsafe_results,
     _log_stage_timing,
-    _stability_summary,
+    _posterior_summary,
     _write_fusion_outputs,
 )
 from geofuse.jobs.stage_ledger import DONE, RUNNING, SKIPPED
@@ -1052,13 +1053,15 @@ def run_fusion(
     spatial_adjust_eps_m: float | None = None,
     residualize_method: str = "linear",
     search_scoring_method: str = "mom_em3",
-    n_bootstraps: int = 20,
-    n_trials_per_bootstrap: int = 50,
-    weight_bin_pct: int = 20,
-    weight_refine_bin_pct: int | None = None,
-    min_cell_count: int = 3,
-    worst_quantile: float = 0.10,
-    max_pfer: float = 1.0,
+    sweep_splits: int = 40,
+    discovery_reps: int = 5,
+    discovery_shuffles: int = 12,
+    gain_splits: int = 20,
+    gain_permutations: int = 100,
+    null_calibration_runs: int = 16,
+    posterior_draws: int = 800,
+    posterior_warmup: int = 800,
+    posterior_chains: int = 4,
     spatial_split: bool = False,
     spatial_block_size_m: float | None = None,
     n_spatial_blocks: int | None = None,
@@ -1071,16 +1074,17 @@ def run_fusion(
     exposure_iqr: float | None = None,
     moderator_columns: list[str] | None = None,
 ) -> dict:
-    """Run a fusion job: stability-selection tuning + held-out test scoring.
+    """Run a fusion job: data-driven CGI discovery + held-out test scoring.
 
-    For CGI (and each enabled standalone channel) the engine draws
-    ``n_bootstraps`` resamples of the train+val pool, runs an
-    ``n_trials_per_bootstrap``-trial RandomSampler search per resample, and
-    selects the weight cell with the best worst-quantile out-of-bag score.
-    ``max_pfer`` caps the calibrated selection size so the reported PFER bound
-    stays under it (a non-positive value disables the cap). The winning params
-    are then scored once on the held-out test split with a percentile bootstrap
-    CI. When standalones are enabled, both a whole-data (``all``) paired
+    For CGI (and each enabled standalone channel) the engine sweeps every
+    ``(radius, statistic)`` pair per channel and both functional forms, scoring
+    each candidate on held-out rows of the train+val pool over ``sweep_splits``
+    splits, then fits a posterior over the channel weights at the winning
+    columns. ``discovery_reps`` x ``discovery_shuffles`` independent repeats
+    report whether the pick itself reproduces, and ``gain_splits`` compare the
+    composite against each standalone under the identical procedure with a
+    permutation null on the gain. The winning params are then scored once on
+    the held-out test split with a percentile bootstrap CI. When standalones are enabled, both a whole-data (``all``) paired
     objective comparison and an ``all``-data AIC/BIC comparison report whether
     CGI is justified over the best single channel.
 
@@ -1112,11 +1116,12 @@ def run_fusion(
         # through to the ledger and engine. ``None`` and empty list both mean
         # "CGI only" (the legacy behaviour).
         standalones: list[str] = list(standalone_channels or [])
+        allowed = _cgi_formulas.formula_channels(cgi_formula)
         for _ch in standalones:
-            if _ch not in ("veg", "terrain", "ndvi"):
+            if _ch not in allowed:
                 raise ValueError(
-                    f"standalone_channels entries must be one of "
-                    f"'veg','terrain','ndvi'; got {_ch!r}."
+                    f"standalone_channels entries must be channels of "
+                    f"'{cgi_formula}' ({', '.join(allowed)}); got {_ch!r}."
                 )
         if standalones:
             _log_fusion(
@@ -1182,13 +1187,15 @@ def run_fusion(
             "standalone_channels": list(standalones),
             "test_size": float(test_size),
             "n_bins": n_bins,
-            "n_bootstraps": int(n_bootstraps),
-            "n_trials_per_bootstrap": int(n_trials_per_bootstrap),
-            "weight_bin_pct": int(weight_bin_pct),
-            "weight_refine_bin_pct": weight_refine_bin_pct,
-            "min_cell_count": int(min_cell_count),
-            "worst_quantile": float(worst_quantile),
-            "max_pfer": float(max_pfer),
+            "sweep_splits": int(sweep_splits),
+            "discovery_reps": int(discovery_reps),
+            "discovery_shuffles": int(discovery_shuffles),
+            "gain_splits": int(gain_splits),
+            "gain_permutations": int(gain_permutations),
+            "null_calibration_runs": int(null_calibration_runs),
+            "posterior_draws": int(posterior_draws),
+            "posterior_warmup": int(posterior_warmup),
+            "posterior_chains": int(posterior_chains),
             "buffer_meters": buffer_meters,
             "gvi_buffer_min_m": gvi_buffer_min_m,
             "gvi_buffer_max_m": gvi_buffer_max_m,
@@ -1220,7 +1227,7 @@ def run_fusion(
             "multi_objective_requested": bool(multi_objective_requested),
             "longitudinal_spec": longitudinal_spec_payload,
             "target_display_name": target_display_name,
-            "selection_method": "bootstrap_stability_selection",
+            "selection_method": "bayesian_index",
         }
 
         def stage(key: str, status: str, message: str = "") -> None:
@@ -1766,32 +1773,9 @@ def run_fusion(
                         "covariate-aware objectives if runtime matters.",
                     )
 
-            # ``n_trials_per_bootstrap`` is the CGI (target) per-bootstrap budget.
-            # A standalone single channel explores a far smaller stability-
-            # selection space — one weight axis (``slots`` 10 %-bins) vs the CGI's
-            # main-weight simplex (``weight_cell_count`` cells) — so it scales DOWN
-            # by that cell ratio to match the CGI's per-cell trial density instead
-            # of over-sampling its tiny search.
-            from .. import cgi_formulas as _cgi_formulas
-
-            _cgi_cells = max(
-                1, _cgi_formulas.weight_cell_count(cgi_formula, int(weight_bin_pct))
-            )
-            _standalone_cells = max(1, 100 // int(weight_bin_pct))
-            cgi_trials_per_bootstrap = int(n_trials_per_bootstrap)
-            standalone_trials_per_bootstrap = max(
-                1,
-                round(int(n_trials_per_bootstrap) * _standalone_cells / _cgi_cells),
-            )
-            if standalone_trials_per_bootstrap != cgi_trials_per_bootstrap:
-                _log_fusion(
-                    "INFO",
-                    f"[{label}] CGI uses {int(n_bootstraps)}×{cgi_trials_per_bootstrap} "
-                    f"trials over {_cgi_cells} weight cells; each standalone scales "
-                    f"down to {int(n_bootstraps)}×{standalone_trials_per_bootstrap} "
-                    f"({_standalone_cells} cells / {_cgi_cells} = "
-                    f"×{_standalone_cells / _cgi_cells:.2f}).",
-                )
+            # The sweep is exhaustive, so a standalone's grid is simply smaller
+            # (one channel's radius x statistic instead of the product) and no
+            # trial-budget scaling is needed.
 
             def _study_progress_cb(study_label: str, stage_key: str | None = None):
                 """Per-trial callback → live caption, trial bar, and stage row.
@@ -1830,42 +1814,38 @@ def run_fusion(
 
                 return _cb
 
-            # A non-positive cap means "no PFER cap" — pass None so the
-            # calibration is free to grow the selection size K.
-            max_pfer_arg = None if float(max_pfer) <= 0 else float(max_pfer)
-
-            # ── Stability selection (dominant compute) ──
-            # Headline params: the stability-selection winning weight cell on
-            # the full train+val pool (params averaged within the cell). The
-            # "CGI: k/N trials" sub-bar and the running-stage fraction both live
-            # here, so the running stage and the trial counter agree.
+            # ── Sweep + posterior (dominant compute) ───
+            # Headline params: the configuration the sweep picked on the
+            # train+val pool, with posterior-mean weights. The sub-bar and the
+            # running-stage fraction both live here, so the stage and the
+            # progress counter agree.
             stage(skey("optimize"), RUNNING)
             ctx.progress(
                 value=prog_ledger(),
                 status_text=(
-                    f"{prefix}Stability selection "
-                    f"({int(n_bootstraps)}×{cgi_trials_per_bootstrap})..."
+                    f"{prefix}Sweep + posterior "
+                    f"({int(sweep_splits)} splits, {int(discovery_reps)} replicates)..."
                 ),
             )
-            headline_params = engine.bootstrap_stability_selection(
+            headline_params = engine.fit_bayesian_index(
                 metric=objective_metric,
-                n_bootstraps=int(n_bootstraps),
-                n_trials_per_bootstrap=cgi_trials_per_bootstrap,
-                weight_bin_pct=int(weight_bin_pct),
-                weight_refine_bin_pct=weight_refine_bin_pct,
-                min_cell_count=int(min_cell_count),
-                worst_quantile=float(worst_quantile),
-                max_pfer=max_pfer_arg,
-                spatial_resample=bool(spatial_split),
+                sweep_splits=int(sweep_splits),
+                reps=int(discovery_reps),
+                shuffles=int(discovery_shuffles),
+                gain_splits=int(gain_splits),
+                gain_perm=int(gain_permutations),
+                null_runs=int(null_calibration_runs),
+                draws=int(posterior_draws),
+                warmup=int(posterior_warmup),
+                chains=int(posterior_chains),
                 seed=42,
                 cancel_callback=cancel_check,
                 progress_callback=_study_progress_cb("CGI", skey("optimize")),
             )
             engine.best_params = dict(headline_params)
-            cgi_stability_summary = _stability_summary(headline_params)
-            # Kept for the results bundle's schema. Stability selection has no
-            # master Optuna study, so there is no explicit best/robust trial
-            # pool — the winning cell is the aggregate over bootstrap resamples.
+            cgi_stability_summary = _posterior_summary(headline_params)
+            # Kept for the results bundle's schema. The sweep has no master
+            # Optuna study, so there is no best/robust trial pool.
             best_params: dict = {}
             robust_trials: list = []
             if ctx.is_cancelled():
@@ -2007,27 +1987,27 @@ def run_fusion(
                 ctx.progress(
                     value=prog_ledger(),
                     status_text=(
-                        f"{prefix}Standalone {ch_disp} stability selection "
-                        f"({int(n_bootstraps)}×{int(n_trials_per_bootstrap)})..."
+                        f"{prefix}Standalone {ch_disp} sweep + posterior "
+                        f"({int(sweep_splits)} splits)..."
                     ),
                 )
                 ch_study_name = _standalone_study_name(ch)
-                # Pin the active channel so _objective treats the trial's
-                # composite as this channel's normalized value, then run the
-                # same bootstrap stability search as CGI. The channel stays
-                # pinned through the composite write below; the CGI state is
-                # restored after the loop.
+                # Pin the active channel so the sweep scores this channel
+                # alone, through the same discovery the CGI gets. The channel
+                # stays pinned through the composite write below; the CGI state
+                # is restored after the loop.
                 engine._active_greenery_channel = ch
-                ch_best = engine.bootstrap_stability_selection(
+                ch_best = engine.fit_bayesian_index(
                     metric=objective_metric,
-                    n_bootstraps=int(n_bootstraps),
-                    n_trials_per_bootstrap=int(standalone_trials_per_bootstrap),
-                    weight_bin_pct=int(weight_bin_pct),
-                    weight_refine_bin_pct=weight_refine_bin_pct,
-                    min_cell_count=int(min_cell_count),
-                    worst_quantile=float(worst_quantile),
-                    max_pfer=max_pfer_arg,
-                    spatial_resample=bool(spatial_split),
+                    sweep_splits=int(sweep_splits),
+                    reps=int(discovery_reps),
+                    shuffles=int(discovery_shuffles),
+                    gain_splits=0,        # nothing to compare a standalone against
+                    gain_perm=0,
+                    null_runs=int(null_calibration_runs),
+                    draws=int(posterior_draws),
+                    warmup=int(posterior_warmup),
+                    chains=int(posterior_chains),
                     seed=42,
                     cancel_callback=cancel_check,
                     progress_callback=_study_progress_cb(
@@ -2036,7 +2016,7 @@ def run_fusion(
                 )
                 engine.best_params = dict(ch_best)
                 ch_headline_params = dict(ch_best)
-                ch_stability_summary = _stability_summary(ch_best)
+                ch_stability_summary = _posterior_summary(ch_best)
                 stage(skey(f"standalone_{ch}"), DONE)
 
                 # Test scoring, CIs, subset scores, composite TIFF, and the

@@ -1,7 +1,7 @@
 """Writing a fusion run's results, and the ledger that tracks its stages.
 
 Everything ``run_fusion`` does *after* the search: turning study bundles into
-CSVs and JSON on disk, summarising stability selection, deciding the reported
+CSVs and JSON on disk, summarising the discovery, deciding the reported
 direction of an association, comparing the composite against each standalone
 channel, and building / timing the staged-resume ledger the job monitor renders.
 
@@ -64,6 +64,7 @@ _STANDALONE_CHANNEL_LABELS: dict[str, str] = {
     "veg": "Vegetation",
     "terrain": "Terrain",
     "ndvi": "NDVI",
+    "gvi": "Green View (veg+terrain)",
 }
 
 _FUSION_STANDALONE_SEARCH_WEIGHT = 20.0
@@ -612,8 +613,10 @@ def _build_fusion_ledger(
     """Fresh ledger covering every (outcome, step) pair in run order.
 
     For each outcome the CGI pipeline (`_FUSION_STAGE_STEPS`) lands first, then
-    two stages per enabled standalone metric — the stability search and the
-    test scoring / reporting that follows it. Standalones reuse the already-
+    two stages per enabled standalone metric — the sweep + posterior and the
+    test scoring / reporting that follows it. The standalone list comes from the
+    active formula's channels, so a two-channel study shows ``ndvi`` and ``gvi``
+    rather than the legacy three. Standalones reuse the already-
     built split + pre-aggregation cache. When ``longitudinal`` is true an extra
     ``prepare_longitudinal`` stage is inserted between ``load_metrics`` and
     ``preaggregate`` to cover per-wave file loading. The MixedLM
@@ -650,7 +653,7 @@ def _build_fusion_ledger(
             report_key = _fusion_stage_key(
                 label, f"standalone_{ch}_report", multi=multi
             )
-            search_step = f"Standalone {ch_lbl} stability selection"
+            search_step = f"Standalone {ch_lbl} sweep + posterior"
             report_step = f"Standalone {ch_lbl} test scoring & reports"
             steps.append(
                 (search_key, f"[{label}] {search_step}" if multi else search_step)
@@ -661,46 +664,52 @@ def _build_fusion_ledger(
     return StageLedger.from_steps(steps)
 
 
-def _stability_summary(params: dict) -> dict:
-    """Lift the stability-selection diagnostics out of a winning-params dict.
+def _posterior_summary(params: dict) -> dict:
+    """Lift the discovery diagnostics out of a winning-params dict.
 
-    ``bootstrap_stability_selection`` stashes its bookkeeping under ``__``-
-    prefixed keys (so the "Final params" panel strips them). This surfaces the
-    ones the results UI shows as a plain summary dict.
+    ``fit_bayesian_index`` stashes its bookkeeping under ``__``-prefixed keys
+    (so the "Final params" panel strips them). This surfaces the ones the
+    results UI shows as a plain summary dict.
     """
 
     def g(key: str, default: Any = None) -> Any:
         return params.get(key, default)
 
+    sweep = g("__sweep__", {}) or {}
+    post = g("__posterior__", {}) or {}
+    disc = g("__discovery__", {}) or {}
+    gain = g("__holdout_gain__", {}) or {}
+    null = g("__null_calibration__", {}) or {}
     return {
-        "q_worst": g("__cell_q_worst__"),
-        "median": g("__cell_median__"),
-        "count": g("__cell_count__"),
-        "selection_probability": g("__cell_selection_probability__"),
-        "worst_quantile": g("__worst_quantile__"),
-        # Automated threshold calibration (Bodinier).
-        "stability_score": g("__stability_score__"),
-        "selection_threshold": g("__selection_threshold__"),
-        "selection_size_k": g("__selection_size_k__"),
-        "n_candidate_cells": g("__n_candidate_cells__"),
-        "n_stably_selected": g("__n_stably_selected__"),
-        "pfer": g("__pfer__"),
-        "pfer_controlled": g("__pfer_controlled__"),
-        "n_bootstraps": g("__n_bootstraps__"),
-        "n_trials_per_bootstrap": g("__n_trials_per_bootstrap__"),
-        "n_total_trials": g("__n_total_trials__"),
-        "higher_is_better": g("__higher_is_better__"),
-        "cell_stats": g("__cell_stats__", []),
-        "winning_cell": g("__winning_cell__"),
-        "winning_cell_oob_scores": g("__winning_cell_oob_scores__", []),
-        "per_bootstrap_summary": g("__per_bootstrap_summary__", []),
-        "trial_history": g("__trial_history__", []),
-        # Stage-2 (radius sub-cell) diagnostics.
-        "radius_cell_q_worst": g("__radius_cell_q_worst__"),
-        "radius_cell_median": g("__radius_cell_median__"),
-        "radius_cell_count": g("__radius_cell_count__"),
-        "radius_bin_m": g("__radius_bin_m__"),
-        "radius_cell_stats": g("__radius_cell_stats__", []),
+        "selection_method": g("__selection_method__", "bayesian_index"),
+        # What the sweep chose, and how confident that choice is.
+        "picked": sweep.get("picked"),
+        "form": sweep.get("form"),
+        "form_scores": sweep.get("form_scores", {}),
+        "sweep_score": sweep.get("score"),
+        "one_se_picked": sweep.get("one_se_picked"),
+        "boundary_hit": sweep.get("boundary_hit", []),
+        "n_candidates": sweep.get("n_candidates"),
+        "distinct_split_winners": sweep.get("distinct_split_winners"),
+        "sweep_splits": sweep.get("splits"),
+        # Weights and effect, with intervals.
+        "channels": post.get("channels"),
+        "weight_mean": post.get("weight_mean"),
+        "weight_ci_low": post.get("weight_ci_low"),
+        "weight_ci_high": post.get("weight_ci_high"),
+        "powers": post.get("powers"),
+        "beta_mean": post.get("beta_mean"),
+        "beta_ci_low": post.get("beta_ci_low"),
+        "beta_ci_high": post.get("beta_ci_high"),
+        "p_direction": post.get("p_direction"),
+        "rhat_max": post.get("rhat_max"),
+        "ess_min": post.get("ess_min"),
+        "divergences": post.get("divergences"),
+        # Does the discovery reproduce, and does it beat a single channel?
+        "discovery": disc,
+        "holdout_gain": gain,
+        "null_calibration": null,
+        "elapsed_s": g("__elapsed_s__"),
     }
 
 
