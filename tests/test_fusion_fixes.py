@@ -1,7 +1,6 @@
-"""Tests for the fusion results/trial-budget/categorical-covariate fixes.
+"""Tests for the fusion results and categorical-covariate fixes.
 
-Covers the main-weight stability-selection cell counting (trial-budget scaling)
-and the one-hot expansion of categorical covariates on the engine.
+Covers the one-hot expansion of categorical covariates on the engine.
 """
 
 import os

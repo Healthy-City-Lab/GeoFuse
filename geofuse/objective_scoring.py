@@ -500,7 +500,7 @@ def score(
     array. NaN rows are dropped jointly. Returns a single float by default; if
     ``return_pvalue=True`` returns ``(score, 1.0)`` — the ``1.0`` is a retained
     sentinel (no metric feeds a p-value gate anymore; robustness comes from
-    bootstrap stability selection).
+    the held-out sweep and its posterior intervals).
 
     ``spatial_basis`` is an optional already-df-selected coordinate smooth (the
     output of :func:`geofuse.spatial_basis.select_df_aic`). With ``spatial_method``

@@ -1,6 +1,6 @@
 """Diagnostics + interval estimation for the fusion engine.
 
-Two concerns live here, both used by the stability-selection pipeline:
+Two concerns live here, both used by the fusion pipeline:
 
 * **Multicollinearity diagnostics** — :func:`pairwise_pearson_matrix`,
   :func:`compute_vif`, and :func:`iterative_vif_reduction` back the optional

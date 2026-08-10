@@ -29,7 +29,7 @@ _FUSION_STAGE_STEPS: tuple[tuple[str, str], ...] = (
     ("load_metrics", "Load metric maps"),
     ("preaggregate", "Spatial pre-processing"),
     ("split", "Split train / test folds"),
-    ("optimize", "Stability selection (bootstrap search)"),
+    ("optimize", "Sweep + posterior"),
     ("evaluate", "Score held-out test set"),
     ("report_stats", "Bootstrap CIs, effects & permutation tests"),
     ("apply", "Apply fusion weights"),
@@ -96,7 +96,7 @@ def _fusion_stage_weight(stage_key: str) -> float:
 
 
 def _clean_params(params: dict | None) -> dict:
-    """Drop the ``__*__`` stability-selection bookkeeping keys from a params dict."""
+    """Drop the ``__*__`` discovery bookkeeping keys from a params dict."""
     if not params:
         return {}
     return {k: v for k, v in params.items() if not str(k).startswith("__")}
@@ -141,7 +141,7 @@ def _write_fusion_outputs(
 
     - ``run_config.json`` — every setting the job ran with (fidelity record).
     - ``results_summary.json`` — nested manifest: each study's params, test
-      score + CI, direction, subset scores, and stability stats, plus the
+      score + CI, direction, subset scores, and discovery stats, plus the
       CGI-vs-standalone AIC/BIC verdict, covariate-impact summary, and the
       collinearity report.
     - ``test_scores.csv`` — one headline row per study (test score, CI,
@@ -149,8 +149,8 @@ def _write_fusion_outputs(
     - ``scores.csv`` — long form: study × subset (train/val/test/all) ×
       score/score_raw/n.
     - ``parameters.csv`` — long form: study × param → value.
-    - ``stability_cells.csv`` — the ranked weight cells per study.
-    - ``stability_bootstraps.csv`` — the per-bootstrap leaderboard per study.
+    - ``discovery.csv`` — the picked radius / aggregator and the posterior
+      weight (with its credible interval) for every channel of every study.
     - ``covariate_impact.csv`` — per-covariate effects (when covariates set).
     - ``decline_terms.csv`` — greenery × time slopes (longitudinal runs).
     - ``exposure_response.csv`` — the per-IQR effect, the quantile gradient
@@ -251,35 +251,43 @@ def _write_fusion_outputs(
             param_rows.append({"study": key, "param": pname, "value": pval})
     _emit_csv(f"parameters{sfx}.csv", param_rows)
 
-    # ── stability_cells.csv + stability_bootstraps.csv ──────────
-    cell_rows: list[dict] = []
-    bs_rows: list[dict] = []
+    # ── discovery.csv ───────────────────────────────────────────
+    disc_rows: list[dict] = []
     for key, _disp, b in studies:
-        summ = b.get("stability_summary") or {}
-        for rank, c in enumerate(summ.get("cell_stats") or [], start=1):
-            row: dict = {"study": key, "rank": rank}
-            for wk, wv in (c.get("weights") or {}).items():
-                row[wk] = wv
-            row["count"] = c.get("count")
-            row["q_worst"] = _f(c.get("q_worst"))
-            row["median"] = _f(c.get("median"))
-            row["selection_probability"] = _f(c.get("selection_probability"))
-            cell_rows.append(row)
-        for entry in summ.get("per_bootstrap_summary") or []:
-            row = {
-                "study": key,
-                "bootstrap": entry.get("bootstrap"),
-                "n_trials": entry.get("n_trials"),
-                "top_oob": _f(entry.get("top_oob")),
-                "median_oob": _f(entry.get("median_oob")),
-                "min_oob": _f(entry.get("min_oob")),
-                "max_oob": _f(entry.get("max_oob")),
-            }
-            for pk, pv in (entry.get("top_params") or {}).items():
-                row[pk] = pv
-            bs_rows.append(row)
-    _emit_csv(f"stability_cells{sfx}.csv", cell_rows)
-    _emit_csv(f"stability_bootstraps{sfx}.csv", bs_rows)
+        summ = b.get("discovery_summary") or {}
+        picked = summ.get("picked") or []
+        chans = summ.get("channels") or []
+        wm = summ.get("weight_mean") or []
+        wlo = summ.get("weight_ci_low") or []
+        whi = summ.get("weight_ci_high") or []
+        gain = summ.get("holdout_gain") or {}
+        disc = summ.get("discovery") or {}
+        for i, pick in enumerate(picked):
+            name = chans[i] if i < len(chans) else f"ch{i}"
+            disc_rows.append(
+                {
+                    "study": key,
+                    "channel": name,
+                    "radius_m": pick[0] if len(pick) > 0 else None,
+                    "aggregator": pick[1] if len(pick) > 1 else None,
+                    "weight": _f(wm[i]) if i < len(wm) else None,
+                    "weight_ci_low": _f(wlo[i]) if i < len(wlo) else None,
+                    "weight_ci_high": _f(whi[i]) if i < len(whi) else None,
+                    "boundary_hit": name in (summ.get("boundary_hit") or []),
+                    "form": summ.get("form"),
+                    "sweep_score": _f(summ.get("sweep_score")),
+                    "beta_mean": _f(summ.get("beta_mean")),
+                    "beta_ci_low": _f(summ.get("beta_ci_low")),
+                    "beta_ci_high": _f(summ.get("beta_ci_high")),
+                    "rhat_max": _f(summ.get("rhat_max")),
+                    "ess_min": _f(summ.get("ess_min")),
+                    "distinct_picks": disc.get("distinct_picks"),
+                    "standalone_score": _f(gain.get(f"standalone_{name}")),
+                    "gain": _f(gain.get("gain")),
+                    "gain_p": _f(gain.get("gain_p")),
+                }
+            )
+    _emit_csv(f"discovery{sfx}.csv", disc_rows)
 
     # ── covariate_impact.csv ────────────────────────────────────
     if covariate_impact and covariate_impact.get("per_covariate"):
@@ -293,7 +301,7 @@ def _write_fusion_outputs(
     if decline_terms and decline_terms.get("terms"):
         _emit_csv(f"decline_terms{sfx}.csv", [dict(r) for r in decline_terms["terms"]])
 
-    # ── exposure_response.csv (per-IQR, quartiles, non-linearity) ─
+    # ── exposure_response.csv (per-IQR, quartiles, non-linearity) ───
     # One tidy table rather than three files: the rows are all statements
     # about the same fitted exposure–response, and a reader comparing them
     # against a published table wants them side by side.
@@ -487,7 +495,7 @@ def _write_fusion_outputs(
     studies_manifest: dict[str, dict] = {}
     for key, disp, b in studies:
         tr = b.get("test_results") or {}
-        summ = b.get("stability_summary") or {}
+        summ = b.get("discovery_summary") or {}
         studies_manifest[key] = {
             "display": disp,
             "channel": b.get("channel", "cgi"),
@@ -514,18 +522,25 @@ def _write_fusion_outputs(
                 else None
             ),
             "subset_scores": b.get("subset_scores") or {},
-            "stability": {
+            "discovery": {
                 k: summ.get(k)
                 for k in (
-                    "q_worst",
-                    "median",
-                    "count",
-                    "selection_probability",
-                    "worst_quantile",
-                    "n_bootstraps",
-                    "n_trials_per_bootstrap",
-                    "n_total_trials",
-                    "higher_is_better",
+                    "picked",
+                    "form",
+                    "sweep_score",
+                    "boundary_hit",
+                    "channels",
+                    "weight_mean",
+                    "weight_ci_low",
+                    "weight_ci_high",
+                    "beta_mean",
+                    "beta_ci_low",
+                    "beta_ci_high",
+                    "rhat_max",
+                    "ess_min",
+                    "divergences",
+                    "holdout_gain",
+                    "null_calibration",
                 )
             },
         }

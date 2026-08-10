@@ -316,7 +316,7 @@ class JobExecutor:
     ) -> Future:
         """Run a fusion job in a fresh subprocess. See :meth:`submit_subprocess_job`.
 
-        Isolates the GIL-bound stability-selection search + reporting from the
+        Isolates the GIL-bound discovery search + reporting from the
         Streamlit render loop. All of ``run_fusion``'s arguments are
         JSON-persisted run config, so ``run_kwargs`` pickles cleanly across the
         spawn boundary now that the engine class is imported inside the runner
