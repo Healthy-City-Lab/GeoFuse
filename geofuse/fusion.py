@@ -26,6 +26,7 @@ from sklearn.model_selection import train_test_split
 
 from . import (
     JobCancelled,
+    bayesian_index,
     binary_longitudinal,
     cgi_formulas,
     exposure_response,
@@ -3080,6 +3081,208 @@ class MetricFusionEngine:
         # ``None`` here means an off-grid (channel, wave, radius, column) cell —
         # the caller falls back to the ring/buffer aggregation path.
         return source.gather(plan, channel, int(round(radius_m)), column)
+
+    def fit_bayesian_index(
+        self,
+        metric: str,
+        *,
+        forms: tuple[str, ...] = bayesian_index.FORMS,
+        sweep_splits: int = 40,
+        reps: int = 5,
+        shuffles: int = 12,
+        gain_splits: int = 20,
+        gain_perm: int = 100,
+        null_runs: int = 16,
+        draws: int = 800,
+        warmup: int = 800,
+        chains: int = 4,
+        seed: int = 42,
+        cancel_callback: Callable[..., bool] | None = None,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> dict:
+        """Select the CGI configuration from data, then quantify it.
+
+        Replaces the stability search. Stage one sweeps ``(radius, statistic)``
+        per channel and the functional form, scoring every candidate on held-out
+        rows of the train+val pool. Stage two fits a posterior over the channel
+        weights at the winning columns. Neither stage touches the test split, so
+        the headline effect stays out of sample.
+
+        Returns a params dict the composite/apply path consumes, plus ``__``-
+        prefixed diagnostics for the results bundle.
+        """
+        t0 = time.perf_counter()
+        steps, done = 5, 0
+
+        def tick():
+            nonlocal done
+            done += 1
+            if progress_callback is not None:
+                try:
+                    progress_callback(done, steps)
+                except Exception:
+                    pass
+
+        def cancelled() -> bool:
+            return cancel_callback is not None and cancel_callback()
+
+        X, radii, stats, tensor_channels, static = self.build_index_tensor("train_val")
+        y = np.asarray(static["target"], dtype=np.float64)
+        yr, Xr = bayesian_index.prep(X, y, static.get("cov"))
+        tick()
+
+        index_channels = list(cgi_formulas.formula_channels(self.cgi_formula))
+        if self._active_greenery_channel != "cgi":
+            index_channels = [self._active_greenery_channel]
+        channel_index = [tensor_channels.index(c) for c in index_channels]
+
+        # A channel is only offered the radii its own ladder was computed at.
+        gvi_radii, ndvi_radii = self._preaggr_radii()
+        radius_idx = [
+            [i for i, r in enumerate(radii)
+             if int(r) in (ndvi_radii if c == "ndvi" else gvi_radii)]
+            for c in index_channels
+        ]
+
+        workers = parallel.process_worker_count()
+        if cancelled():
+            raise RuntimeError("Cancelled before the sweep.")
+        res = bayesian_index.sweep(
+            Xr, radii, stats, yr, channels=index_channels,
+            channel_index=channel_index, radius_idx=radius_idx,
+            forms=forms, splits=sweep_splits, seed=seed, workers=workers,
+        )
+        tick()
+        _log(
+            "INFO",
+            f"Sweep: {res.picked} form={res.form} held-out |t|={res.score:.3f}"
+            + (f"  BOUNDARY at {list(res.boundary_hit)}" if res.boundary_hit else ""),
+        )
+
+        disc = (
+            bayesian_index.repeated_discovery(
+                Xr, radii, stats, yr, channels=index_channels,
+                channel_index=channel_index, radius_idx=radius_idx,
+                forms=forms, reps=reps, shuffles=shuffles, seed=seed,
+                workers=workers,
+            )
+            if reps and shuffles
+            else {}
+        )
+        tick()
+
+        gain = (
+            bayesian_index.holdout_gain(
+                Xr, yr, channels=index_channels, channel_index=channel_index,
+                radius_idx=radius_idx, forms=forms, splits=gain_splits,
+                perm=gain_perm, seed=seed, workers=workers,
+            )
+            if gain_splits and len(index_channels) > 1
+            else {}
+        )
+        tick()
+
+        E = Xr.reshape(len(Xr), -1)[:, list(res.columns)]
+        mcmc = bayesian_index.fit(
+            E, yr, form=res.form, draws=draws, warmup=warmup,
+            chains=chains, seed=seed,
+        )
+        post = bayesian_index.posterior_from(
+            mcmc, channels=index_channels, picked=res.picked, form=res.form
+        )
+        null = (
+            bayesian_index.null_calibration(
+                E, yr, form=res.form, n=null_runs, workers=workers
+            )
+            if null_runs
+            else {}
+        )
+        tick()
+
+        params = self._params_from_sweep(res, post, index_channels)
+        params["__selection_method__"] = "bayesian_index"
+        params["__sweep__"] = {
+            "picked": [list(p) for p in res.picked],
+            "form": res.form,
+            "score": res.score,
+            "form_scores": res.form_scores,
+            "one_se_picked": [
+                list(p) for p in bayesian_index._decode(
+                    res.one_se_columns, len(radii), len(stats), radii, stats
+                )
+            ],
+            "boundary_hit": list(res.boundary_hit),
+            "n_candidates": len(res.combos),
+            "distinct_split_winners": len(res.winner_counts),
+            "splits": sweep_splits,
+        }
+        params["__posterior__"] = post.summary()
+        params["__discovery__"] = disc
+        params["__holdout_gain__"] = gain
+        params["__null_calibration__"] = null
+        params["__elapsed_s__"] = float(time.perf_counter() - t0)
+        _log(
+            "OK",
+            f"Bayesian index fitted in {params['__elapsed_s__']:.0f}s "
+            f"(R-hat {post.rhat_max:.3f}, ESS {post.ess_min:.0f}, "
+            f"{post.divergences} divergences).",
+        )
+        return params
+
+    def _params_from_sweep(self, res, post, index_channels) -> dict:
+        """Sweep pick + posterior weights -> the params dict the engine uses."""
+        formula = cgi_formulas.get_formula(self.cgi_formula)
+        params: dict[str, Any] = {}
+
+        stat_of = {"mean": ("mean", 50)}
+        for (radius, column), ch in zip(res.picked, index_channels):
+            stat, pct = stat_of.get(column, ("percentile", 0))
+            if column != "mean":
+                pct = int(column[1:])
+            if ch == "ndvi":
+                params["ndvi_radius"] = int(radius)
+                params["ndvi_stat"] = stat
+                params["ndvi_percentile"] = int(pct)
+            else:
+                params[f"{ch}_radius"] = int(radius)
+                # veg and terrain share one street-view statistic in the engine.
+                params["streetview_stat"] = stat
+                params["streetview_percentile"] = int(pct)
+        for key, default in (
+            ("veg_radius", self.gvi_buffer_max_m),
+            ("terrain_radius", self.gvi_buffer_max_m),
+            ("ndvi_radius", self.ndvi_buffer_max_m),
+        ):
+            params.setdefault(key, int(round(float(default))))
+        params.setdefault("streetview_stat", "mean")
+        params.setdefault("streetview_percentile", 50)
+        params.setdefault("ndvi_stat", "mean")
+        params.setdefault("ndvi_percentile", 50)
+
+        # Posterior-mean weights onto the formula's keys as integers summing to
+        # 100, which is the scale every downstream consumer expects.
+        w = np.asarray(post.weights).mean(0)
+        keys = list(formula.weight_keys)
+        vals = np.zeros(len(keys))
+        for i, ch in enumerate(index_channels):
+            key = cgi_formulas._CHANNEL_MAIN_KEY[self.cgi_formula].get(ch)
+            if key in keys and i < len(w):
+                vals[keys.index(key)] = float(w[i])
+        total = vals.sum()
+        if total <= 0:
+            vals[:] = 1.0 / len(vals)
+            total = 1.0
+        scaled = vals * 100.0 / total
+        floors = [int(v) for v in scaled]
+        for i in sorted(range(len(scaled)), key=lambda i: scaled[i] - floors[i],
+                        reverse=True)[: 100 - sum(floors)]:
+            floors[i] += 1
+        for key, v in zip(keys, floors):
+            params[key] = int(v)
+        if post.powers is not None:
+            for ch, p in zip(index_channels, np.asarray(post.powers).mean(0)):
+                params[f"{ch}_power"] = float(p)
+        return params
 
     def build_index_tensor(self, subset: str = "train_val"):
         """Per-entity values for every (channel, radius, statistic) cell.
