@@ -1,7 +1,7 @@
 """Composite Greenery Index (CGI) formula registry.
 
-Single source of truth for how an Optuna trial's per-trial parameters become a
-numeric greenery value at each sample. The fusion engine's objective, test
+Single source of truth for how a discovered parameter set becomes a numeric
+greenery value at each sample. The fusion engine's objective, test
 evaluation, ``apply_fusion``, and composite-raster generation all route
 through :func:`compute_cgi` so the four call sites can never drift apart.
 
@@ -33,27 +33,9 @@ Formulas
     composite is on a [0, 1]-ish range. AHP-set in the paper; optimizer-driven
     here.
 
-Weight sampling
----------------
-
-Every formula's weight suggestion draws from a **symmetric Dirichlet(1, …, 1)
-prior** — i.e. uniform on the simplex, no per-channel ordering bias. The
-implementation uses the Gamma-normalize trick: an ``Exp(1)`` sample (computed
-as ``-log(U(0, 1))``) is drawn per weight key, then the values are normalised
-to sum to ``total``. By symmetry every weight has the same marginal
-distribution.
-
-Optuna integration: the raw uniform draws live in ``trial.params`` under
-``<key>_raw`` so TPE has flat per-dimension axes to model; the normalised
-**integer** weight is then *pinned* via ``trial.suggest_int(value, value)`` so
-``trial.params`` still carries the canonical ``*_weight`` keys that downstream
-Optuna plots, robust-trial reports, and weight-vs-association CSV analyses
-expect. TPE searches over the ``*_raw`` axes; the pinned weights are
-bookkeeping.
-
-Edge cases: the raw float is clamped to ``[1e-9, 1 - 1e-9]`` so ``-log(u)``
-never hits ``±inf`` or ``0``. Largest-remainder rounding keeps the integer
-weights summing to exactly ``total``.
+Weights are no longer sampled. The discovery engine solves the
+simplex-constrained optimum in closed form and reports posterior means, which
+arrive here as integers summing to 100 (largest-remainder rounded).
 """
 
 from __future__ import annotations
@@ -63,7 +45,6 @@ from dataclasses import dataclass
 from functools import cache
 
 import numpy as np
-import optuna
 
 # ────────────────────────────────────────────────────────────────────
 # Public formula names + parameter spaces
@@ -106,7 +87,6 @@ ComponentDict = dict[str, np.ndarray]
 class CGIFormula:
     """Static descriptor for one CGI formula.
 
-    ``suggest_params`` reads / writes a trial; ``compute`` is pure and used by
     the engine both during optimization and at apply/export time. The
     ``*_keys`` tuples let the UI and reporting code introspect a formula's
     parameter shape without hard-coding any names.
@@ -116,7 +96,6 @@ class CGIFormula:
     main_weight_keys: tuple[str, ...]
     interaction_weight_keys: tuple[str, ...]
     power_keys: tuple[str, ...]
-    suggest_params: Callable[..., dict]
     compute: Callable[[dict, ComponentDict], np.ndarray]
     channel_active: Callable[[dict], dict[str, bool]]
 
@@ -143,69 +122,6 @@ _DIRICHLET_EPS: float = 1e-9
 WEIGHT_STEP_PCT: int = 5
 
 
-def _suggest_simplex_weights_dirichlet(
-    trial: optuna.Trial, keys: tuple[str, ...], total: int = 100
-) -> dict[str, int]:
-    """Sample ``keys`` from symmetric Dirichlet(1, …, 1), then snap to
-    multiples of :data:`WEIGHT_STEP_PCT` summing exactly to ``total``.
-
-    Each key gets the SAME marginal distribution (Beta(1, K-1)) by the
-    Gamma-normalize construction's symmetry, so no key is favoured by the
-    prior. TPE optimizes against the per-key ``<key>_raw`` axes recorded by
-    ``trial.suggest_float`` (flat U(eps, 1-eps), which TPE can model cleanly);
-    the snapped weight is then pinned via ``trial.suggest_int(w, w)`` so the
-    canonical ``*_weight`` keys still appear in ``trial.params`` for Optuna
-    plots, robust-trial reports, and weight-vs-association CSV readers.
-
-    The 5 % grid is enforced via largest-remainder rounding on the
-    ``total / WEIGHT_STEP_PCT`` "slot" count: divide each scaled weight by
-    the step, take the floor, and distribute the remainder to the keys with
-    the largest fractional parts. Guarantees ``sum(out) == total`` and every
-    value ``≡ 0 (mod WEIGHT_STEP_PCT)``.
-    """
-    import math as _math
-
-    raw_xs: list[float] = []
-    for k in keys:
-        u = trial.suggest_float(f"{k}_raw", _DIRICHLET_EPS, 1.0 - _DIRICHLET_EPS)
-        raw_xs.append(-_math.log(u))
-    sum_x = sum(raw_xs)
-    if sum_x <= 0.0:
-        # Defensive: all u_i hit the upper clamp. Fall back to equal weights.
-        scaled = [float(total) / len(keys)] * len(keys)
-    else:
-        scaled = [x / sum_x * total for x in raw_xs]
-
-    # Snap to the WEIGHT_STEP_PCT grid via largest-remainder rounding on the
-    # number of step-sized "slots" each key claims. ``total`` must be a
-    # multiple of WEIGHT_STEP_PCT (100 / 5 = 20 slots — the call sites all
-    # pass total=100, asserted defensively below).
-    step = int(WEIGHT_STEP_PCT)
-    if int(total) % step != 0:
-        raise ValueError(
-            f"total={total} must be a multiple of WEIGHT_STEP_PCT={step} so "
-            "snapped weights can sum to exactly ``total``."
-        )
-    n_slots = int(total) // step
-    slot_floats = [s / step for s in scaled]
-    slot_floors = [int(_math.floor(sf)) for sf in slot_floats]
-    remainder = n_slots - sum(slot_floors)
-    if remainder > 0:
-        order = sorted(
-            range(len(keys)),
-            key=lambda i: slot_floats[i] - slot_floors[i],
-            reverse=True,
-        )
-        for i in order[:remainder]:
-            slot_floors[i] += 1
-
-    out: dict[str, int] = {}
-    for k, slots in zip(keys, slot_floors):
-        w = int(slots) * step
-        out[k] = trial.suggest_int(k, int(w), int(w))
-    return out
-
-
 # ────────────────────────────────────────────────────────────────────
 # weighted_average formula
 # ────────────────────────────────────────────────────────────────────
@@ -216,35 +132,6 @@ _WA_KEY_TO_CHANNEL: dict[str, str] = {
     "veg_weight": "veg",
     "terrain_weight": "terrain",
 }
-
-
-def _suggest_weighted_average(
-    trial: optuna.Trial, *, disabled_channels: set[str] | None = None
-) -> dict:
-    disabled = set(disabled_channels or ())
-    active_keys = tuple(
-        k for k in _WA_WEIGHT_KEYS if _WA_KEY_TO_CHANNEL[k] not in disabled
-    )
-    disabled_keys = tuple(
-        k for k in _WA_WEIGHT_KEYS if _WA_KEY_TO_CHANNEL[k] in disabled
-    )
-    if not active_keys:
-        # Degenerate: every channel disabled. Pin all weights to zero —
-        # ``compute_cgi`` will return NaN and the optimizer will skip it.
-        return {k: trial.suggest_int(k, 0, 0) for k in _WA_WEIGHT_KEYS}
-    if len(active_keys) == 1:
-        # Single-channel run: pin the active one to 100, the rest to 0.
-        out: dict[str, int] = {
-            active_keys[0]: trial.suggest_int(active_keys[0], 100, 100)
-        }
-        for k in disabled_keys:
-            out[k] = trial.suggest_int(k, 0, 0)
-        return out
-    # Sample a Dirichlet simplex over the active keys; pin disabled to 0.
-    out = _suggest_simplex_weights_dirichlet(trial, active_keys, total=100)
-    for k in disabled_keys:
-        out[k] = trial.suggest_int(k, 0, 0)
-    return out
 
 
 def _component_dtype(components: ComponentDict) -> np.dtype:
@@ -320,43 +207,6 @@ _SYN_POWER_CHANNEL: dict[str, str] = {
     "veg_power": "veg",
     "terrain_power": "terrain",
 }
-
-
-def _suggest_synergy(
-    trial: optuna.Trial, *, disabled_channels: set[str] | None = None
-) -> dict:
-    disabled = set(disabled_channels or ())
-    params: dict = {}
-    # Powers: sample the active channels' powers, pin disabled ones to 1.0
-    # (multiplied by a zero weight downstream, so the value is inert).
-    for k in _SYN_POWER_KEYS:
-        if _SYN_POWER_CHANNEL[k] in disabled:
-            params[k] = trial.suggest_float(k, 1.0, 1.0)
-        else:
-            params[k] = trial.suggest_float(
-                k, SYNERGY_POWER_LOW, SYNERGY_POWER_HIGH, step=SYNERGY_POWER_STEP
-            )
-    # Weights: any term touching a disabled channel goes to zero; the
-    # rest split the 100 mass via the Dirichlet sampler.
-    active_keys = tuple(
-        k for k in _SYN_WEIGHT_KEYS if not (_SYN_KEY_CHANNELS[k] & disabled)
-    )
-    disabled_keys = tuple(
-        k for k in _SYN_WEIGHT_KEYS if _SYN_KEY_CHANNELS[k] & disabled
-    )
-    if not active_keys:
-        for k in _SYN_WEIGHT_KEYS:
-            params[k] = trial.suggest_int(k, 0, 0)
-        return params
-    if len(active_keys) == 1:
-        params[active_keys[0]] = trial.suggest_int(active_keys[0], 100, 100)
-        for k in disabled_keys:
-            params[k] = trial.suggest_int(k, 0, 0)
-        return params
-    params.update(_suggest_simplex_weights_dirichlet(trial, active_keys, total=100))
-    for k in disabled_keys:
-        params[k] = trial.suggest_int(k, 0, 0)
-    return params
 
 
 def _compute_synergy(params: dict, components: ComponentDict) -> np.ndarray:
@@ -513,13 +363,6 @@ def _generic_synergy(chans: tuple[str, ...]):
     return compute, active, tuple(f"w_{c}" for c in chans), tuple(inter_keys)
 
 
-def _unsupported_suggest(*_args, **_kwargs) -> dict:
-    """The sweep selects these formulas' parameters; Optuna never suggests them."""
-    raise NotImplementedError(
-        "Two-channel formulas are fitted by geofuse.bayesian_index, not sampled."
-    )
-
-
 # ────────────────────────────────────────────────────────────────────
 # Registry + public API
 # ────────────────────────────────────────────────────────────────────
@@ -530,7 +373,6 @@ _REGISTRY: dict[str, CGIFormula] = {
         main_weight_keys=_WA_WEIGHT_KEYS,
         interaction_weight_keys=(),
         power_keys=(),
-        suggest_params=_suggest_weighted_average,
         compute=_compute_weighted_average,
         channel_active=_wa_channel_active,
     ),
@@ -539,7 +381,6 @@ _REGISTRY: dict[str, CGIFormula] = {
         main_weight_keys=_SYN_MAIN_KEYS,
         interaction_weight_keys=_SYN_INTER_KEYS,
         power_keys=_SYN_POWER_KEYS,
-        suggest_params=_suggest_synergy,
         compute=_compute_synergy,
         channel_active=_synergy_channel_active,
     ),
@@ -554,7 +395,6 @@ def _register_gvi_variants() -> None:
         main_weight_keys=tuple(_weight_key(c) for c in _GVI_CHANNELS),
         interaction_weight_keys=(),
         power_keys=(),
-        suggest_params=_unsupported_suggest,
         compute=wa_compute,
         channel_active=wa_active,
     )
@@ -563,7 +403,6 @@ def _register_gvi_variants() -> None:
         main_weight_keys=syn_main,
         interaction_weight_keys=syn_inter,
         power_keys=tuple(f"{c}_power" for c in _GVI_CHANNELS),
-        suggest_params=_unsupported_suggest,
         compute=syn_compute,
         channel_active=syn_active,
     )
@@ -643,38 +482,3 @@ def formula_for(channels: tuple[str, ...], form: str) -> str:
     variants = _FORM_VARIANTS[tuple(channels)]
     return variants.get(form, variants["linear"])
 
-
-def seed_param_sets(
-    formula: str, disabled_channels: set[str] | None = None
-) -> list[dict]:
-    """Enqueue-ready params seeding each single-channel vertex + the centroid.
-
-    Each dict sets the Dirichlet ``*_raw`` axes so the snapped weights put all
-    mass on one channel's main term (a standalone-equivalent composite), powers
-    pinned to 1.0; the sampler fills the remaining radius / stat axes. Seeding
-    these makes CGI's nesting of every standalone reachable in practice rather
-    than relying on the sampler to land near a simplex vertex. Returns ``[]``
-    for formulas without a vertex map.
-    """
-    desc = get_formula(formula)
-    main_key = _CHANNEL_MAIN_KEY.get(formula)
-    if not main_key:
-        return []
-    disabled = set(disabled_channels or ())
-    active = [c for c in ALL_CHANNELS if c not in disabled]
-    seeds: list[dict] = []
-    for ch in active:
-        dom = main_key[ch]
-        params: dict = {
-            f"{k}_raw": (_DIRICHLET_EPS if k == dom else 1.0 - _DIRICHLET_EPS)
-            for k in desc.weight_keys
-        }
-        for pk in desc.power_keys:
-            params[pk] = 1.0
-        seeds.append(params)
-    if len(active) > 1:
-        params = {f"{k}_raw": 0.5 for k in desc.weight_keys}
-        for pk in desc.power_keys:
-            params[pk] = 1.0
-        seeds.append(params)
-    return seeds
