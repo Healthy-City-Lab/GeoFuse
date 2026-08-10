@@ -42,6 +42,21 @@ class TestWorkerCount(unittest.TestCase):
     def test_never_returns_less_than_one(self):
         self.assertGreaterEqual(parallel.worker_count(), 1)
 
+    def test_cpu_share_drives_the_process_pool(self):
+        saved = os.environ.pop("GEOFUSE_CPU_SHARE", None)
+        try:
+            self.assertAlmostEqual(parallel.cpu_share(), 0.8)
+            os.environ["GEOFUSE_CPU_SHARE"] = "0.5"
+            self.assertAlmostEqual(parallel.cpu_share(), 0.5)
+            os.environ["GEOFUSE_CPU_SHARE"] = "not-a-number"
+            self.assertAlmostEqual(parallel.cpu_share(), 0.8)
+            os.environ["GEOFUSE_CPU_SHARE"] = "9"
+            self.assertLessEqual(parallel.cpu_share(), 1.0)
+        finally:
+            os.environ.pop("GEOFUSE_CPU_SHARE", None)
+            if saved is not None:
+                os.environ["GEOFUSE_CPU_SHARE"] = saved
+
     def test_cap_bounds_the_pool(self):
         self.assertLessEqual(parallel.worker_count(cap=2), 2)
 
