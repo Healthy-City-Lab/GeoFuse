@@ -594,6 +594,86 @@ def _synergy_channel_active(params: dict) -> dict[str, bool]:
 
 
 # ────────────────────────────────────────────────────────────────────
+# Two-channel variants (NDVI + merged GVI)
+# ────────────────────────────────────────────────────────────────────
+#
+# The three-channel functions above hard-code their key names because stored
+# jobs replay through them. These generic ones are driven by a channel tuple,
+# and use uniform key naming because there are no legacy two-channel jobs to
+# preserve.
+
+GVI = "gvi"
+WEIGHTED_AVERAGE_GVI = "weighted_average_gvi"
+SYNERGY_GVI = "synergy_gvi"
+
+_GVI_CHANNELS: tuple[str, ...] = ("ndvi", "gvi")
+
+
+def _weight_key(ch: str) -> str:
+    return f"{ch}_weight"
+
+
+def _generic_weighted(chans: tuple[str, ...]):
+    def compute(params: dict, components: ComponentDict) -> np.ndarray:
+        arrs = [np.asarray(components[c]) for c in chans]
+        dt = np.result_type(*[a.dtype for a in arrs], np.float32)
+        w = [float(params.get(_weight_key(c), 0)) for c in chans]
+        total = sum(w)
+        if total <= 0:
+            return np.full_like(arrs[0], np.nan, dtype=dt)
+        out = np.zeros_like(arrs[0], dtype=dt)
+        for wi, a in zip(w, arrs):
+            out = out + dt.type(wi / total) * a.astype(dt, copy=False)
+        return out
+
+    def active(params: dict) -> dict[str, bool]:
+        return {c: float(params.get(_weight_key(c), 0)) > 0 for c in chans}
+
+    return compute, active
+
+
+def _generic_synergy(chans: tuple[str, ...]):
+    pairs = [(i, j) for i in range(len(chans)) for j in range(i + 1, len(chans))]
+    inter_keys = [f"w_{chans[i]}_{chans[j]}" for i, j in pairs]
+
+    def compute(params: dict, components: ComponentDict) -> np.ndarray:
+        arrs = [np.clip(np.asarray(components[c]), _CLAMP_LO, _CLAMP_HI)
+                for c in chans]
+        dt = np.result_type(*[a.dtype for a in arrs], np.float32)
+        arrs = [a.astype(dt, copy=False) for a in arrs]
+        wm = [float(params.get(f"w_{c}", 0)) for c in chans]
+        wi = [float(params.get(k, 0)) for k in inter_keys]
+        total = sum(wm) + sum(wi)
+        if total <= 0:
+            return np.full_like(arrs[0], np.nan, dtype=dt)
+        inv = dt.type(1.0 / total)
+        out = np.zeros_like(arrs[0], dtype=dt)
+        for w, c, a in zip(wm, chans, arrs):
+            out = out + dt.type(w) * a ** float(params.get(f"{c}_power", 1.0))
+        for w, (i, j) in zip(wi, pairs):
+            out = out + dt.type(w) * arrs[i] * arrs[j]
+        return inv * out
+
+    def active(params: dict) -> dict[str, bool]:
+        out = {}
+        for k, c in enumerate(chans):
+            terms = [float(params.get(f"w_{c}", 0))]
+            terms += [float(params.get(inter_keys[n], 0))
+                      for n, (i, j) in enumerate(pairs) if k in (i, j)]
+            out[c] = any(t > 0 for t in terms)
+        return out
+
+    return compute, active, tuple(f"w_{c}" for c in chans), tuple(inter_keys)
+
+
+def _unsupported_suggest(*_args, **_kwargs) -> dict:
+    """The sweep selects these formulas' parameters; Optuna never suggests them."""
+    raise NotImplementedError(
+        "Two-channel formulas are fitted by geofuse.bayesian_index, not sampled."
+    )
+
+
+# ────────────────────────────────────────────────────────────────────
 # Registry + public API
 # ────────────────────────────────────────────────────────────────────
 
@@ -617,6 +697,33 @@ _REGISTRY: dict[str, CGIFormula] = {
         channel_active=_synergy_channel_active,
     ),
 }
+
+
+def _register_gvi_variants() -> None:
+    wa_compute, wa_active = _generic_weighted(_GVI_CHANNELS)
+    syn_compute, syn_active, syn_main, syn_inter = _generic_synergy(_GVI_CHANNELS)
+    _REGISTRY[WEIGHTED_AVERAGE_GVI] = CGIFormula(
+        name=WEIGHTED_AVERAGE_GVI,
+        main_weight_keys=tuple(_weight_key(c) for c in _GVI_CHANNELS),
+        interaction_weight_keys=(),
+        power_keys=(),
+        suggest_params=_unsupported_suggest,
+        compute=wa_compute,
+        channel_active=wa_active,
+    )
+    _REGISTRY[SYNERGY_GVI] = CGIFormula(
+        name=SYNERGY_GVI,
+        main_weight_keys=syn_main,
+        interaction_weight_keys=syn_inter,
+        power_keys=tuple(f"{c}_power" for c in _GVI_CHANNELS),
+        suggest_params=_unsupported_suggest,
+        compute=syn_compute,
+        channel_active=syn_active,
+    )
+    _CHANNEL_MAIN_KEY[WEIGHTED_AVERAGE_GVI] = {
+        c: _weight_key(c) for c in _GVI_CHANNELS
+    }
+    _CHANNEL_MAIN_KEY[SYNERGY_GVI] = {c: f"w_{c}" for c in _GVI_CHANNELS}
 
 
 def available_formulas() -> list[str]:
@@ -660,6 +767,14 @@ _CHANNEL_MAIN_KEY: dict[str, dict[str, str]] = {
     },
     SYNERGY: {"ndvi": "w_ndvi", "veg": "w_veg", "terrain": "w_ter"},
 }
+
+
+_register_gvi_variants()
+
+
+def formula_channels(name: str) -> tuple[str, ...]:
+    """Channels a formula consumes, in registry order."""
+    return tuple(_CHANNEL_MAIN_KEY[name])
 
 
 def seed_param_sets(
