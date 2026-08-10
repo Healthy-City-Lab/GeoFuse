@@ -3173,6 +3173,12 @@ def _num(x) -> float | None:
     return fx if math.isfinite(fx) else None
 
 
+def _fmt(x, places: int = 3) -> str:
+    """``x`` at *places* decimals, or an em dash when it isn't a real number."""
+    fx = _num(x)
+    return "—" if fx is None else f"{fx:.{places}f}"
+
+
 def _usable_effect(block: dict | None) -> dict | None:
     """An effects block, or ``None`` when it carries no usable numbers.
 

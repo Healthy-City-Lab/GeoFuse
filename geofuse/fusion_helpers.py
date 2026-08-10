@@ -187,12 +187,14 @@ def apply_circular_buffer_aggregation(
             if numeric_cols:
                 metric_col = numeric_cols[0]
             else:
-                logger.warning(
+                logger(
+                    "WARN",
                     f"No numeric columns found in metric data. Columns: {metric_data.columns.tolist()}"
                 )
                 return result  # Return all NaN
 
-        logger.info(
+        logger(
+            "INFO",
             f"Buffer aggregation using column '{metric_col}' from {metric_data.columns.tolist()}, radius={radius_meters}m, stat={stat}"
         )
 
@@ -200,14 +202,16 @@ def apply_circular_buffer_aggregation(
         non_null_joins = (
             joined[metric_col].notna().sum() if metric_col in joined.columns else 0
         )
-        logger.info(
+        logger(
+            "INFO",
             f"Spatial join: {len(joined)} total rows, {non_null_joins} with valid metric values"
         )
 
-        logger.debug(
+        logger(
+            "INFO",
             f"Using metric column: {metric_col} from {metric_data.columns.tolist()}"
         )
-        logger.debug(f"Joined shape: {joined.shape}, Points shape: {len(points_gdf)}")
+        logger("INFO", f"Joined shape: {joined.shape}, Points shape: {len(points_gdf)}")
 
         # Aggregate by original point index — one vectorized groupby over the
         # joined frame instead of a per-point boolean scan (which was O(n²)).
@@ -226,7 +230,8 @@ def apply_circular_buffer_aggregation(
 
         # Log summary of results
         valid_count = np.sum(~np.isnan(result))
-        logger.info(
+        logger(
+            "INFO",
             f"Buffer aggregation result: {valid_count}/{len(result)} points have valid values"
         )
 
@@ -371,9 +376,10 @@ def load_metric_file(filepath: str, channel: str) -> gpd.GeoDataFrame | dict:
             # Too large to hold in RAM (national-scale): read windows from
             # disk on demand instead. Each thread gets its own handle.
             data = LazyRasterArray(filepath, band=1)
-            logger.info(
+            logger(
+                "INFO",
                 f"Metric raster ~{est_bytes / (1024**2):.0f} MB exceeds the "
-                f"in-memory threshold; reading windows lazily from {filepath}"
+                f"in-memory threshold; reading windows lazily from {filepath}",
             )
         return {
             "data": data,
