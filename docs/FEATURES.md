@@ -1,104 +1,159 @@
-# GeoFuse — Feature Reference
+# GeoFuse feature reference
 
-GeoFuse measures two complementary views of urban greenery, then fuses them into a single composite index tuned against a health or environmental outcome. This page is a high-level tour of what each part does and the design choices that matter for trusting the results.
+GeoFuse measures two complementary views of urban greenery and fuses them into
+a single composite index tuned against a health or environmental outcome. This
+page says what each part does and what it expects. For how anything works
+internally, read the code.
 
----
-
-## 1. Eye-Level Greenery — GVI
-
-The **Green View Index** estimates how much greenery a person sees at street level.
-
-- **Automated panorama sourcing.** Pulls Google Street View imagery for any study area (GeoJSON, Shapefile, or GeoPackage), with or without an API key.
-- **Deep-learning segmentation.** A **DeepLabV3+** model trained on the **Cityscapes** classes labels each panorama; GVI is the share of pixels classed as **vegetation** and **terrain**.
-- **Historical capture selection.** Street View re-photographs each location over the years. By default the most recent coverage is used, but you can target a specific capture year — the engine picks the historical panorama closest to it at every point, with an optional maximum-year-difference window that leaves points with no in-window capture empty. The capture date used is written to a `pano_date` column, making year-matched runs suitable for longitudinal analysis.
-- **Per-year from a column.** Point GVI at a year/date column and each layer is split by year and processed separately (target year = that year) into a `{name}_temporal_gvi/` folder, one output per year. All years share one CRS chosen from the whole layer, so the per-year grids align — the eye-level counterpart to NDVI's per-year mode.
-- **Merge files into groups (drag & drop).** Upload several files and drag them into groups; files in a group are concatenated (in a common CRS) and run as one job, each group with its own capture-date settings. Add, rename, and remove groups freely. Handy when one year is split across files — e.g. survey waves where 2020 appears in both — so every 2020 record lands in a single output. Files left in separate groups keep the default one-job-per-file behaviour. Merged jobs record every source file, so a restart re-verifies them all and **re-runs quietly** when they're unchanged.
-- **Scales from a block to a nation.** For scattered inputs (neighbourhoods across many cities), the engine dissolves overlapping buffers, splits the area into spatial clusters, and builds one sampling grid per cluster on a shared reference grid — avoiding the millions of empty cells a single continent-wide bounding box would create.
-- **True-metre grids.** Each study area is projected to the most accurate planar CRS for its extent (local UTM, Lambert Conformal Conic for continental spans, or Polar Stereographic near the poles), so every grid cell is a true square in metres. Estimated map distortion is logged, with a warning past 2 %.
-- **Responsive and fast.** Every job type (GVI, NDVI, Fusion) runs in its own process so the dashboard stays interactive and a running job isn't throttled by the foreground browser tab, and downloads, pre-processing, and GPU inference overlap across points.
-- **Shared panorama cache.** Downloaded panoramas are cached across runs and study areas, cutting redundant downloads and API cost.
-- **Crash-safe.** Interrupted jobs reappear as *Interrupted*; re-uploading the same study area resumes exactly where it stopped (the file is hash-verified first).
-- **Outputs.** **GeoPackage** point layer (canonical), optional per-cluster **GeoTIFF** tiles and **GeoJSON**, plus optional raw panoramas and segmentation masks. See [OUTPUTS.md](OUTPUTS.md).
+**Abbreviations.** GVI = Green View Index (eye-level greenery). NDVI =
+Normalized Difference Vegetation Index (overhead greenery). CGI = Composite
+Greenery Index (the fused index this toolbox produces). CRS = coordinate
+reference system. CrI = credible interval.
 
 ---
 
-## 2. Overhead Greenery — NDVI
+## 1. Eye-level greenery: GVI
 
-The **Normalized Difference Vegetation Index** measures greenery from above, from satellite imagery.
+The share of a street-level view that is vegetation.
 
-- **Earth Engine integration.** Fetches cloud-masked **Sentinel-2** or **Landsat** imagery for any study area. `auto` mode picks Sentinel-2 from 2017 onward and Landsat for earlier dates; the Landsat path spans every era (5/7/8/9), with the pre-2013 TM/ETM+ sensors harmonized to the Landsat-8 scale so values stay comparable across years. The choice is recorded.
-- **Flexible date modes** (mix freely):
-  - **Date range(s)** — one composite per range.
-  - **Specific date(s)** — a composite from a ± window around each date.
-  - **Attribute column (per-year)** — split the layer by the year in a column and run each year as its own NDVI job over only that year's features, composited across the growing-season months you pick (e.g. June–September). Every year shares one CRS chosen from the whole layer, so the per-year rasters align — ready for longitudinal comparison. Outputs land in a `{name}_temporal_ndvi/` folder, one raster per year.
-- **Merge files into groups (drag & drop).** As in the GVI tab, drag several files into a group to merge them into one job before dating — so a year split across files (e.g. survey waves where some are 2020 in wave 1 and some in wave 2) yields a single 2020 output. Add/rename/remove groups; separate groups keep the one-job-per-file default; merged jobs restart quietly when their source files are unchanged.
-- **True-metre, pixel-aligned rasters.** Tiles are exported in an auto-selected planar CRS on a shared snap grid and stream-mosaicked directly into the final GeoTIFF — no second reprojection, so output pixels are exactly what Earth Engine produced.
-- **Robust at scale.** Cluster-aware tiling skips empty regions (ocean, gaps between provinces); tiles download in parallel, retry on flaky networks, and resume from a persistent tile cache after an interruption.
-- **Honest coverage.** Clear diagnostics distinguish "no images in range" from "all images too cloudy." When a window is too sparse it widens once automatically and records that it did. Tiles that never arrive are listed in the sidecar so gaps are auditable, not mysterious.
-- **Sample at your features (optional).** Attach an NDVI value (exact-pixel or a zonal statistic over a buffer/polygon) to your own uploaded features — handy for downstream fusion.
-- **Outputs.** Single-band **GeoTIFF** (default), optional **GeoPackage**, **GeoJSON**, per-cluster tiles, and a metadata sidecar JSON. See [OUTPUTS.md](OUTPUTS.md).
+**Input.** A study area as GeoJSON, Shapefile or GeoPackage.
+**Output.** A GeoPackage point layer (canonical), optionally per-cluster GeoTIFF
+tiles, GeoJSON, and the raw panoramas and segmentation masks.
 
----
-
-## 3. Fusion & Optimization
-
-This is the analytical core: it learns how to combine GVI (vegetation + terrain) and NDVI into one **composite greenery index (CGI)** that best tracks an outcome you provide, and it reports that relationship with statistics you can defend.
-
-### Inputs and scoring
-
-- **You supply the metrics.** Upload the GVI and NDVI files produced by the tabs above (one per measurement year/wave where relevant). They are spatially aligned to your outcome automatically.
-- **Consistent per-pixel scoring.** Every vector target — **points, lines, or polygons** — is scored the same way: a regular CGI grid is computed per trial, and each entity's value is the **mean per-pixel CGI inside its catchment** (a polygon's footprint, or a point/line's buffer up to that trial's largest radius). The composite map you see therefore matches the values that were scored. Raster targets keep their native grid.
-
-### Choosing the formula and its parameters
-
-- **Pluggable CGI formula.**
-  - **Weighted average** (default) — one weight per channel of the chosen set.
-  - **Synergy** — a three-metric generalization of Wang et al. 2026 ([doi:10.3390/rs18010009](https://doi.org/10.3390/rs18010009)) with interaction terms and tunable powers on the main channels.
-- **Channel set.** `ndvi + gvi` (default) merges the street-view components into one green-view channel; `ndvi + veg + terrain` keeps them apart. The pre-aggregation cache stores whichever a job needs and extends rather than rebuilds if you switch later — a percentile of `veg + terrain` is not the sum of the components' percentiles, so the merged channel is aggregated from the raw panoramas rather than derived.
-- **What gets discovered.** Channel weights and powers, each channel's **spatial scale** (circular buffer radius, on a ladder up to a limit you set), the **aggregation** (mean / median / percentile), and the **functional form** — all from held-out data, none pre-specified.
-
-### Why you can trust the result
-
-- **Exhaustive sweep, then a posterior.** Every (radius, aggregator) combination per channel is scored on repeated held-out splits of the training pool — not sampled, enumerated. Because covariates are projected out of both sides first (Frisch–Waugh) and every candidate column already sits in the cache, a candidate is scored from a slice of a precomputed Gram matrix, and the channel weights have a closed form on the simplex. The winner is the best *averaged* held-out score, with a one-standard-error rule preferring the smaller radius among statistically indistinguishable configurations. A Bayesian fit at the winning columns then puts credible intervals on the weights and the effect.
-- **The checks that make it a finding rather than a pick.** The whole discovery is repeated on independent reshuffles, and the report says how often it landed on the same configuration — a low modal share means the surface is flat, not that the pick is wrong. The composite is compared against each channel alone under the *identical* sweep, with a permutation null on the gain, so fusion has to earn its extra flexibility. And the whole procedure is re-run on permuted outcomes: the reported false-positive rate should sit near 5 %, and the panel says so when it does not.
-- **Held-out test set (the headline).** A fraction of the data (default 25 %) is set aside and never touched during tuning. The winning configuration is scored on it once — a **percentile bootstrap confidence interval** plus a **held-out permutation p-value** (Freedman–Lane when covariates are controlled). This is the honest generalizability check. The whole-data ("all") figure is also shown, but only as a *descriptive, in-sample* number: the parameters were tuned on most of those rows, so it is optimistic and carries no p-value.
-- **Objective metrics.** **Partial distance correlation** (default) detects non-linear as well as linear associations *and* conditions on the covariates non-linearly, so a curved covariate effect is removed rather than partly credited as greenery signal. It is unsigned, so a separate **direction** indicator is reported alongside it. Also available: **distance correlation** (a faster variant with linear covariate adjustment), **Spearman**, **R²**, **normalized RMSE**, and **mutual information**.
-- **Runtime cost levers.** Partial distance correlation is **O(n²) in entity count** (the engine caches the fixed target/covariate sides per resample, but each trial still pays one distance matrix on the composite); **distance correlation with spline residualization** is the O(n log n) approximation of the same idea when entity counts are large. The trial budget is `resamples × trials per resample`; the CGI grid spacing scales the pixel-side work quadratically (halving the spacing quadruples the pixel count); and the discovery budget is `sweep splits + replicates x shuffles + gain splits + permutations + null refits`; and the reporting replicate budgets (test-set CI, effects CI/permutations, paired comparison) are configurable per job — the test CI defaults to 2,000 replicates under partial distance correlation and 10,000 otherwise. **Mixed-effects objectives are the exception:** each replicate is a full model refit rather than an O(1) recomputation, so they are clamped to 150 for the test CI and 100 per slice for the effects CI. Those clamps dominate a longitudinal run's wall clock — the effects cap applies per metric per slice, and the test-CI cap once per study including each standalone.
-
-### Controlling for confounders
-
-- **Covariate-aware objective.** Select numeric attribute columns to control for, and the score becomes the greenery term's *partial* contribution, so a dominant covariate can't crowd out the CGI parameters. (Mutual information ignores covariates by design.)
-- **Covariate residualization.** For the residualizing metrics (distance correlation, Spearman, R², normalized RMSE), choose how covariates are partialled out: **linear** (default) or **spline** (natural cubic), which removes non-linear covariate effects. Partial distance correlation conditions on covariates intrinsically, so it ignores this setting.
-- **Spatial-confounding adjustment (optional).** Adds a flexible smooth of location so the reported association reflects greenery↔outcome co-variation *beyond* an unmeasured smooth spatial confounder. Two methods: **KS-AIC** (Keller & Szpiro 2020; recommended) and **Spatial+** (Dupont, Wood & Augustin 2022 / Rainey et al. 2025). The smooth is built per spatial cluster, so it never spans gaps between clusters. *Note: with this on, the optimizer chases the de-confounded association, so the winning parameters shift versus an unadjusted run.*
-
-### Is combining channels worth it?
-
-- **Standalone single-metric studies (optional).** Run the same selection on each channel alone (NDVI / vegetation / terrain). When enabled, the report adds an **AIC/BIC verdict** on whether the multi-channel CGI is justified over the best single channel, plus a **paired objective difference** of CGI against each standalone. Those paired p-values are **Holm-corrected** across the family of channels so comparing CGI against several of them doesn't inflate significance; when several outcomes are optimised, treat those as a further family.
-
-### Longitudinal and multi-year data
-
-- **Mixed-effects (longitudinal) mode.** When entities are measured at several time points, each trial is scored with a linear mixed model (`statsmodels.MixedLM`) that accounts for within-entity correlation over time. Four scorers are available (t-statistic by default); all four are also reported post-hoc on the winning composite.
-- **Wave fixed effects (on by default).** Per-wave greenery layers differ for reasons unrelated to anyone's neighbourhood — a different satellite, a different compositing window — and that drift tracks calendar time, so without an indicator per wave it lands on the greenspace × time terms. Turn it off only when the per-wave layers are known to be harmonised.
-- **Neighbourhood grouping.** Point a column at the area people share (FSA, census subdivision, site) and it enters as fixed effects. Greenspace is an area attribute, so neighbours have almost the same exposure; a person-level random effect alone leaves that level unmodelled and the greenspace term's standard error far too small.
-- **Period-confounding check.** The report states how strongly within-person exposure change tracks *when* each person was measured, and repeats the greenspace × time terms with the exposure replaced by its per-wave mean. That placebo carries the period structure and no spatial information at all: a term it reproduces was measuring the wave, not the neighbourhood.
-- **Year-aware cross-sectional mode.** For a cohort sampled across different years, route each entity to its year-matched greenery file. The cross-sectional scorer is unchanged — the year is only a file-routing key, never a regression input.
-
-### Outputs and reproducibility
-
-- **Composite map.** A grid-aligned GeoTIFF of the winning composite (plus one per standalone). A whole-grid **[0, 1] scaling** toggle controls normalization of the written/rendered map.
-- **Everything on disk, per run.** Each run writes to its own timestamped folder so reruns never overwrite earlier results. Alongside the composite rasters, a `study_results/` folder holds a machine-readable manifest, tidy CSVs (test scores, subset scores, parameters, the discovery table, covariate impact), and a full settings snapshot. See [OUTPUTS.md](OUTPUTS.md).
-- **Re-run from a filled form.** Re-running a job loads its recorded settings into the setup form rather than replaying them, so a minor tweak costs one edit instead of a rebuild from scratch. The re-run is confirmed on the job card, not in the tab. Per-job caches (metric alignment, pre-aggregation, the search study) are keyed by a fingerprint of the settings, so an unchanged config resumes while any change starts fresh.
-- **The form keeps what you typed.** Picking files, dragging years, or an error elsewhere in the app never empties a half-filled setup form.
-- **Sized to the machine it runs on.** The scorers open thread pools; the discovery sweep and the pre-aggregation build open worker processes, taking 80 % of the host's cores by default. The same code fits a laptop or a compute node without edits; `GEOFUSE_WORKERS` overrides the thread width and `GEOFUSE_CPU_SHARE` the process share. Pre-aggregation gets processes because its per-pixel work is a long chain of small numpy calls that hold the interpreter lock, which no number of threads can spread across cores. Every run logs a stage-by-stage wall-clock breakdown and, per parallel phase, how many workers were actually busy — enough to tell a pool that is too small from work that will not divide.
-- **Load results any time.** Completed jobs can rehydrate the results panel from disk, independent of the configuration form.
+- Sources Google Street View panoramas over the study area and labels each with
+  a DeepLabV3+ model trained on the Cityscapes classes. GVI is the share of
+  pixels classed vegetation plus terrain.
+- Can target a historical capture year rather than the latest imagery, with an
+  optional maximum year gap. The capture date lands in a `pano_date` column, so
+  year-matched runs are usable for longitudinal analysis.
+- Can split a layer by a year or date column and produce one output per year.
+- Files can be merged into groups before running, so a year split across several
+  files yields a single output.
+- Projects each study area to the most accurate planar CRS for its extent, so
+  grid cells are true squares in metres. Distortion above 2 % is warned about.
+- Panoramas are cached across runs. Interrupted jobs resume after the study area
+  is re-uploaded and hash-verified.
 
 ---
 
-## 4. Running at Scale — HPC & CLI
+## 2. Overhead greenery: NDVI
 
-- **MPI-parallel CLI.** `scripts/cli.py` runs the same engines headlessly under `mpiexec` / `srun`; each rank processes a separate study area. See [USAGE.md](USAGE.md).
-- **No browser required.** The core engines are fully decoupled from the dashboard — call them from the CLI or your own Python scripts.
-- **GPU acceleration.** Automatic device selection (CUDA → MPS → CPU).
+Vegetation greenness from satellite imagery, via Google Earth Engine.
 
-> [!WARNING]
-> **HPC Monitoring tab — work in progress.** The dashboard's *HPC Monitoring* tab (last tab) is incomplete and under active development. It reads status files written by CLI runs on a cluster; the workflow is not yet finalized. For interactive runs, track progress in the **sidebar Job Monitor** instead.
+**Input.** A study area, plus dates.
+**Output.** A single-band GeoTIFF (default), optionally GeoPackage, GeoJSON,
+per-cluster tiles, and a metadata sidecar.
+
+- Fetches cloud-masked Sentinel-2 or Landsat imagery. `auto` picks Sentinel-2
+  from 2017 onward and Landsat before that, harmonising the older TM/ETM+
+  sensors to the Landsat-8 scale so values stay comparable across years.
+- Dates can be given as ranges, as specific dates with a window, or as a year
+  column that splits the layer and composites each year over the growing-season
+  months you choose.
+- Tiles export on a shared snap grid and are mosaicked without a second
+  reprojection, so output pixels are exactly what Earth Engine produced.
+- Distinguishes "no images in range" from "all images too cloudy", widens a
+  sparse window once and records that it did, and lists any missing tiles in the
+  sidecar.
+- Can optionally sample values onto your own features, exactly or as a zonal
+  statistic over a buffer.
+
+---
+
+## 3. Fusion: discovering the composite index
+
+The analytical core. It discovers how to combine the greenery channels into one
+CGI that best tracks an outcome you supply, and reports that relationship with
+held-out statistics.
+
+**Input.** Your outcome layer (points, lines, polygons or raster), the GVI and
+NDVI files from the tabs above, and the covariates to control for.
+**Output.** Composite rasters plus a results folder of tidy CSVs and a JSON
+manifest. See [OUTPUTS.md](OUTPUTS.md).
+
+### What you choose
+
+- **Channel set.** `ndvi + gvi` (default) merges the street-view components into
+  one green-view channel. `ndvi + veg + terrain` keeps vegetation and terrain
+  apart. The cache stores whichever a job needs and extends rather than rebuilds
+  if you switch later.
+- **Objective metric.** What the search maximises. Partial distance correlation
+  is the default: it detects nonlinear as well as linear association and
+  conditions on covariates nonlinearly. Also available: distance correlation,
+  Spearman, R-squared, normalized RMSE, mutual information, logistic and
+  GEE-logistic terms for binary outcomes, and four mixed-effects terms for
+  longitudinal studies.
+- **Covariates.** Numeric or categorical columns to control for. Categorical
+  ones are one-hot encoded automatically.
+- **Test-set size** and, optionally, spatial block validation.
+
+### What the toolbox discovers from the data
+
+Nothing below is pre-specified.
+
+- **Spatial scale.** Each channel's buffer radius, chosen from the ladder you
+  set.
+- **Aggregation statistic.** Mean, median or a percentile of the values inside
+  that buffer.
+- **Functional form.** A weighted sum, or a synergy form with powers on the main
+  terms and pairwise products, following Wang et al. 2026
+  ([doi:10.3390/rs18010009](https://doi.org/10.3390/rs18010009)).
+- **Channel weights**, reported with credible intervals.
+
+### Why the result is defensible
+
+- **Exhaustive held-out sweep.** Every radius-by-aggregator combination is
+  enumerated and scored on repeated held-out splits of the training pool, not
+  sampled. A one-standard-error rule prefers the smaller radius among
+  statistically indistinguishable configurations. A Bayesian fit at the winning
+  columns then puts credible intervals on the weights and the effect.
+- **A held-out test set is the headline.** A fraction of the data, 25 % by
+  default, is never touched during tuning. The winning configuration is scored
+  on it once, with a percentile bootstrap interval and a permutation p-value
+  (Freedman-Lane when covariates are controlled). Whole-data figures are shown
+  only as descriptive and carry no p-value.
+- **Reproducibility is measured, not assumed.** The whole discovery is repeated
+  on independent reshuffles and the report says how often it landed on the same
+  configuration. A low share means the surface is flat, not that the pick is
+  wrong.
+- **Fusion has to earn itself.** The composite is compared against each channel
+  alone under the identical sweep, with a permutation null on the gain.
+- **Calibration is checked.** The procedure is re-run on permuted outcomes; the
+  reported false-positive rate should sit near 5 %, and the panel says so when
+  it does not.
+- **Provenance is recorded.** Every run stores a hash of its configuration and
+  counts how many distinct configurations were scored on the held-out set, so a
+  spent test set is visible rather than inferred.
+
+### Controlling for confounding
+
+- Covariate-adjusted objectives, so a dominant covariate cannot crowd out the
+  greenery signal. Mutual information ignores covariates by design.
+- Optional spatial-confounding adjustment (KS-AIC or Spatial+) and spatial block
+  cross-validation, so geographic autocorrelation cannot inflate scores.
+- Optional collinearity check that drops redundant channels before a run.
+- Longitudinal runs add wave fixed effects, on by default, and an optional
+  neighbourhood or site column.
+
+### Reporting
+
+- Effects per interquartile-range increase, with odds ratios for binary
+  outcomes; quantile gradients against the lowest group with a test for trend;
+  and a spline test for departure from linearity.
+- Effect modification by any column you nominate, with simple slopes per group.
+- For longitudinal studies, greenspace-by-time slopes, decomposed into
+  between-person and within-person components on request.
+
+---
+
+## 4. Running it
+
+- **Dashboard.** A Streamlit app with a tab per engine. Jobs run in their own
+  process, so the interface stays responsive and a running job is not throttled
+  by the browser tab.
+- **CLI.** An MPI-parallel command-line entry point for HPC batch runs.
+- **Sized to the machine.** Thread pools take about a third of the cores;
+  process pools take 80 % by default. Override with `GEOFUSE_WORKERS` and
+  `GEOFUSE_CPU_SHARE`. Every run logs a stage-by-stage wall-clock breakdown.
+- **Everything on disk, per run.** Each run writes to its own timestamped folder
+  so reruns never overwrite earlier results.
