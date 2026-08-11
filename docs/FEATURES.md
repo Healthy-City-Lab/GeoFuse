@@ -77,12 +77,20 @@ manifest. See [OUTPUTS.md](OUTPUTS.md).
   one green-view channel. `ndvi + veg + terrain` keeps vegetation and terrain
   apart. The cache stores whichever a job needs and extends rather than rebuilds
   if you switch later.
-- **Objective metric.** What the search maximises. Partial distance correlation
-  is the default: it detects nonlinear as well as linear association and
-  conditions on covariates nonlinearly. Also available: distance correlation,
-  Spearman, R-squared, normalized RMSE, mutual information, logistic and
+- **Objective metric.** What the search maximises, and what decides which
+  configuration wins. Partial distance correlation is the default: it detects
+  nonlinear as well as linear association and conditions on covariates
+  nonlinearly. Also available: distance correlation, Spearman, R-squared,
+  normalized RMSE, mutual information, quartile contrast, logistic and
   GEE-logistic terms for binary outcomes, and four mixed-effects terms for
   longitudinal studies.
+- **Quartile contrast** deserves a note. It cuts the composite at its own
+  quartiles, enters them as indicators against the lowest quarter, and scores
+  the magnitude of the top-versus-bottom difference adjusted for covariates.
+  This is the shape the greenspace literature reports a greenness gradient in
+  (Villeneuve et al. 2022; Irvin et al. 2024). Because it is a magnitude, a
+  protective and a harmful gradient of the same size score alike, and the
+  search maximises separation either way.
 - **Covariates.** Numeric or categorical columns to control for. Categorical
   ones are one-hot encoded automatically.
 - **Test-set size** and, optionally, spatial block validation.

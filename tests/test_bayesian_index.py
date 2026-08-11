@@ -6,6 +6,11 @@ swap which channels are active, a radius picked at the edge of the search range
 has to be flagged, and the whole procedure re-run on a permuted outcome must
 not keep firing. A run that passes the smoke test but fails these is producing
 confident noise.
+
+The sweeps here run with a single worker on purpose. A spawned process pool
+cannot re-import ``__main__`` once another test in the same interpreter has
+replaced it, which made these results depend on test ordering rather than on
+the code.
 """
 
 import os
@@ -37,7 +42,7 @@ class TestRecoversAPlantedSignal(unittest.TestCase):
         Xr, yr = _planted()
         res = bi.sweep(
             Xr, RADII, STATS, yr,
-            channels=("a", "b"), channel_index=(0, 1), splits=6, workers=2,
+            channels=("a", "b"), channel_index=(0, 1), splits=6, workers=1,
         )
         self.assertEqual(res.picked[1], (600, "p50"))
 
@@ -45,7 +50,7 @@ class TestRecoversAPlantedSignal(unittest.TestCase):
         Xr, yr = _planted()
         res = bi.sweep(
             Xr, RADII, STATS, yr,
-            channels=("a", "b"), channel_index=(0, 1), splits=6, workers=2,
+            channels=("a", "b"), channel_index=(0, 1), splits=6, workers=1,
         )
         Z = Xr.reshape(len(Xr), -1)[:, list(res.columns)]
         kept, w = bi.simplex_fit(Z.T @ Z, Z.T @ yr)
@@ -68,7 +73,7 @@ class TestParsimonyTiebreak(unittest.TestCase):
         Xr, yr = _planted()
         res = bi.sweep(
             Xr, RADII, STATS, yr,
-            channels=("a", "b"), channel_index=(0, 1), splits=6, workers=2,
+            channels=("a", "b"), channel_index=(0, 1), splits=6, workers=1,
         )
         self.assertEqual(len(res.one_se_columns), len(res.columns))
         n_radii, n_stats = Xr.shape[2], Xr.shape[3]
@@ -80,7 +85,7 @@ class TestParsimonyTiebreak(unittest.TestCase):
         Xr, yr = _planted()
         res = bi.sweep(
             Xr, RADII, STATS, yr,
-            channels=("a", "b"), channel_index=(0, 1), splits=6, workers=2,
+            channels=("a", "b"), channel_index=(0, 1), splits=6, workers=1,
         )
         n_radii, n_stats = Xr.shape[2], Xr.shape[3]
         one_se = bi._decode(res.one_se_columns, n_radii, n_stats, RADII, STATS)
@@ -96,7 +101,7 @@ class TestBoundaryIsFlagged(unittest.TestCase):
         Xr, yr = _planted(radius=len(RADII) - 1, strength=1.2)
         res = bi.sweep(
             Xr, RADII, STATS, yr,
-            channels=("a", "b"), channel_index=(0, 1), splits=6, workers=2,
+            channels=("a", "b"), channel_index=(0, 1), splits=6, workers=1,
         )
         self.assertEqual(res.picked[1][0], 800)
         self.assertIn("b", res.boundary_hit)
@@ -105,7 +110,7 @@ class TestBoundaryIsFlagged(unittest.TestCase):
         Xr, yr = _planted(radius=2)
         res = bi.sweep(
             Xr, RADII, STATS, yr,
-            channels=("a", "b"), channel_index=(0, 1), splits=6, workers=2,
+            channels=("a", "b"), channel_index=(0, 1), splits=6, workers=1,
         )
         self.assertNotIn("b", res.boundary_hit)
 
@@ -117,10 +122,10 @@ class TestNullCalibration(unittest.TestCase):
         Xr, yr = _planted(n=600)
         res = bi.sweep(
             Xr, RADII, STATS, yr,
-            channels=("a", "b"), channel_index=(0, 1), splits=4, workers=2,
+            channels=("a", "b"), channel_index=(0, 1), splits=4, workers=1,
         )
         E = Xr.reshape(len(Xr), -1)[:, list(res.columns)]
-        out = bi.null_calibration(E, yr, form=res.form, n=8, workers=4)
+        out = bi.null_calibration(E, yr, form=res.form, n=8, workers=1)
         self.assertEqual(out["runs"], 8)
         # 8 runs is too few to pin 5 %, but a procedure firing on most of them
         # is broken, not merely noisy.

@@ -71,6 +71,19 @@ def prep(X: np.ndarray, y: np.ndarray, covariates: np.ndarray | None):
     return yr, flat.reshape(X.shape)
 
 
+def _map(fn, tasks, n_workers: int):
+    """``fn`` over ``tasks``, in a process pool unless one worker was asked for.
+
+    A single worker runs in-process. Spawning costs more than it saves at that
+    width, and it keeps the parallel loops usable in an interpreter where spawn
+    is unavailable, which is what a caller passing ``workers=1`` usually wants.
+    """
+    if n_workers <= 1:
+        return [fn(t) for t in tasks]
+    with ProcessPoolExecutor(max_workers=n_workers) as ex:
+        return list(ex.map(fn, tasks, chunksize=1))
+
+
 def _pairs(k: int) -> list[tuple[int, int]]:
     return [(i, j) for i in range(k) for j in range(i + 1, k)]
 
@@ -250,13 +263,21 @@ def _decode(columns, n_radii, n_stats, radii, stats):
 
 
 def sweep(X, radii, stats, y, *, channels, channel_index, radius_idx=None,
-          forms=FORMS, splits=40, frac=0.25, seed=0, workers=None):
+          forms=FORMS, splits=40, frac=0.25, seed=0, workers=None,
+          objective=None, rescore_top=50):
     """Exhaustive grid over (radius, stat) per channel, then over the form.
 
     The linear grid is solved in closed form and swept exhaustively. The
     synergy form is then fitted at the linear pick's columns and kept only if
     it scores better held-out; a full synergy grid would need the Gram matrix
     rebuilt per power combination for no measured benefit.
+
+    ``objective`` makes the job's own metric decide the winner. The Gram sweep
+    ranks every candidate by a correlation t, which is what makes an exhaustive
+    grid affordable, but that is not every objective the toolbox offers. When an
+    objective is given, the top ``rescore_top`` candidates are re-scored with it
+    on the same splits and the best of those wins: the cheap ranking stays a
+    filter, and the requested metric makes the decision.
     """
     n_radii, n_stats = X.shape[2], X.shape[3]
     if radius_idx is None:
@@ -275,8 +296,7 @@ def sweep(X, radii, stats, y, *, channels, channel_index, radius_idx=None,
         tasks = [(path, flat.shape, combos, y, seed + s, frac)
                  for s in range(splits)]
         n_workers = workers or parallel.process_worker_count(len(tasks))
-        with ProcessPoolExecutor(max_workers=n_workers) as ex:
-            surface = np.array(list(ex.map(_sweep_split, tasks, chunksize=1)))
+        surface = np.array(_map(_sweep_split, tasks, n_workers))
     finally:
         try:
             os.unlink(path)
@@ -284,6 +304,18 @@ def sweep(X, radii, stats, y, *, channels, channel_index, radius_idx=None,
             pass
 
     mean, se = surface.mean(0), surface.std(0) / math.sqrt(max(splits, 1))
+    objective_surface, shortlist = None, None
+    if objective is not None and len(combos) > 1:
+        shortlist = np.argsort(-mean)[: max(1, int(rescore_top))]
+        objective_surface = _rescore(flat, y, combos, shortlist, objective,
+                                     splits=splits, frac=frac, seed=seed)
+        # Candidates outside the shortlist keep -inf so they cannot win, and the
+        # one-SE rule below reads the same surface the winner came from.
+        obj_mean = np.full(len(combos), -np.inf)
+        obj_mean[shortlist] = objective_surface.mean(0)
+        obj_se = np.zeros(len(combos))
+        obj_se[shortlist] = objective_surface.std(0) / math.sqrt(max(splits, 1))
+        mean, se = obj_mean, obj_se
     best = int(np.argmax(mean))
     picked = _decode(combos[best], n_radii, n_stats, radii, stats)
 
@@ -297,8 +329,12 @@ def sweep(X, radii, stats, y, *, channels, channel_index, radius_idx=None,
     one_se = tuple(combos[int(eligible[int(np.argmin(totals))])])
 
     counts: dict = {}
-    for k in surface.argmax(1):
-        counts[tuple(combos[int(k)])] = counts.get(tuple(combos[int(k)]), 0) + 1
+    winner_surface = surface if objective_surface is None else objective_surface
+    winner_cols = (list(range(len(combos))) if shortlist is None
+                   else [int(c) for c in shortlist])
+    for k in winner_surface.argmax(1):
+        combo = tuple(combos[winner_cols[int(k)]])
+        counts[combo] = counts.get(combo, 0) + 1
 
     edge = {int(radii[0]), int(radii[-1])}
     boundary = tuple(c for (r, _), c in zip(picked, channels) if r in edge)
@@ -309,7 +345,7 @@ def sweep(X, radii, stats, y, *, channels, channel_index, radius_idx=None,
     if "synergy" in forms and len(channels) > 1:
         syn = _score_form_at(flat[:, list(combos[best])], y, "synergy",
                              splits=splits, frac=frac, seed=seed,
-                             workers=workers)
+                             workers=workers, objective=objective)
         form_scores["synergy"] = syn
         if syn > chosen_score:
             chosen_form, chosen_score = "synergy", syn
@@ -320,6 +356,42 @@ def sweep(X, radii, stats, y, *, channels, channel_index, radius_idx=None,
         one_se_columns=one_se, winner_counts=counts, boundary_hit=boundary,
         form_scores=form_scores,
     )
+
+
+def _rescore(flat, y, combos, shortlist, objective, *, splits, frac, seed):
+    """Score a shortlist of candidates with the job's objective, same splits.
+
+    Weights still come from the closed-form simplex fit on the training rows;
+    only the ranking changes. Runs in-process because a shortlist is small and
+    the objective is a caller-owned closure, which does not pickle reliably.
+    """
+    out = np.zeros((splits, len(shortlist)))
+    for si in range(splits):
+        te = np.random.default_rng(seed + si).random(len(y)) < frac
+        tr = ~te
+        ztr = flat[tr]
+        g_tr, c_tr = ztr.T @ ztr, ztr.T @ y[tr]
+        for k, ci in enumerate(shortlist):
+            i = np.asarray(combos[int(ci)])
+            fit = simplex_fit(g_tr[np.ix_(i, i)], c_tr[i])
+            if fit is None:
+                continue
+            sub, w = fit
+            e = flat[:, i[sub]] @ w
+            out[si, k] = objective(e[te], y[te])
+    return out
+
+
+def _form_split_objective(E, y, form, seed, frac, objective):
+    te = np.random.default_rng(seed).random(len(y)) < frac
+    tr = ~te
+    if form == "linear":
+        fit = simplex_fit(E[tr].T @ E[tr], E[tr].T @ y[tr])
+        if fit is None:
+            return 0.0
+        sub, w = fit
+        return float(objective(E[te][:, sub] @ w, y[te]))
+    return float(objective(fit_synergy(E[tr], y[tr]).apply(E[te]), y[te]))
 
 
 def _form_split(task):
@@ -335,11 +407,16 @@ def _form_split(task):
     return _tstat(fit_synergy(E[tr], y[tr]).apply(E[te]), y[te])
 
 
-def _score_form_at(E, y, form, *, splits, frac, seed, workers=None):
+def _score_form_at(E, y, form, *, splits, frac, seed, workers=None,
+                   objective=None):
+    if objective is not None:
+        return float(np.mean([
+            _form_split_objective(E, y, form, seed + s, frac, objective)
+            for s in range(splits)
+        ]))
     tasks = [(E, y, form, seed + s, frac) for s in range(splits)]
     n_workers = workers or parallel.process_worker_count(len(tasks))
-    with ProcessPoolExecutor(max_workers=n_workers) as ex:
-        return float(np.mean(list(ex.map(_form_split, tasks, chunksize=1))))
+    return float(np.mean(_map(_form_split, tasks, n_workers)))
 
 
 def build_index(E_train, y_train, form):
@@ -532,9 +609,8 @@ def repeated_discovery(X, radii, stats, y, *, channels, channel_index,
                   10_000 * (rep + 1) + b, frac)
                  for rep in range(reps) for b in range(shuffles)]
         n_workers = workers or parallel.process_worker_count(len(tasks))
-        with ProcessPoolExecutor(max_workers=n_workers) as ex:
-            res = [r for r in ex.map(_discovery_shuffle, tasks, chunksize=1)
-                   if r is not None]
+        res = [r for r in _map(_discovery_shuffle, tasks, n_workers)
+               if r is not None]
     finally:
         try:
             os.unlink(path)
@@ -643,9 +719,8 @@ def holdout_gain(X, y, *, channels, channel_index, radius_idx=None,
                   cols, cols, tuple(forms), 5_000 + i, frac)
                  for i in range(perm)]
         n_workers = workers or parallel.process_worker_count(len(base) + len(nulls))
-        with ProcessPoolExecutor(max_workers=n_workers) as ex:
-            obs = list(ex.map(_gain_split, base, chunksize=1))
-            null = list(ex.map(_gain_split, nulls, chunksize=1))
+        obs = _map(_gain_split, base, n_workers)
+        null = _map(_gain_split, nulls, n_workers)
     finally:
         try:
             os.unlink(path)
@@ -685,8 +760,7 @@ def null_calibration(E, y, *, form="linear", n=16, workers=None):
     """
     tasks = [(E, y, form, 3_000 + i) for i in range(n)]
     n_workers = workers or min(n, parallel.process_worker_count(n))
-    with ProcessPoolExecutor(max_workers=n_workers) as ex:
-        hits = list(ex.map(_null_fit, tasks, chunksize=1))
+    hits = _map(_null_fit, tasks, n_workers)
     return {"runs": n, "excluded_zero": int(sum(hits)),
             "rate": float(sum(hits)) / max(n, 1)}
 

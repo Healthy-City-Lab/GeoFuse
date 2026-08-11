@@ -123,6 +123,12 @@ def _log_parallel_efficiency(
     log("INFO", "  " + " · ".join(parts) + ".")
 
 
+# Objective metrics whose held-out ranking is not the sweep's correlation
+# t, so the sweep re-scores its shortlist with them. Everything else is a
+# monotone function of the same association and needs no second pass.
+_SWEEP_OBJECTIVES: frozenset[str] = frozenset({"quartile_contrast"})
+
+
 class MetricFusionEngine:
     """
     Engine for fusing vegetation, terrain, and NDVI metrics using optimization.
@@ -3152,6 +3158,7 @@ class MetricFusionEngine:
             Xr, radii, stats, yr, channels=index_channels,
             channel_index=channel_index, radius_idx=radius_idx,
             forms=forms, splits=sweep_splits, seed=seed, workers=workers,
+            objective=self._sweep_objective(metric),
         )
         tick()
         _log(
@@ -3237,6 +3244,33 @@ class MetricFusionEngine:
             f"{post.divergences} divergences).",
         )
         return params
+
+    def _sweep_objective(self, metric: str):
+        """Held-out scorer the sweep ranks candidates by, or ``None``.
+
+        ``None`` means the sweep's own correlation t, which is what makes the
+        exhaustive grid affordable and is the right ranking for the correlation
+        family. A metric that asks a different question of the same data gets
+        its own scorer, so the setting decides the winner rather than only the
+        number reported afterwards.
+
+        The sweep works on Frisch-Waugh residualised columns, so covariates are
+        already partialled out and the scorer is called without them.
+        """
+        from . import objective_scoring as _scoring
+
+        if metric not in _SWEEP_OBJECTIVES:
+            return None
+
+        def objective(exposure, target):
+            try:
+                return float(
+                    _scoring.score(metric, target, exposure, None)
+                )
+            except Exception:
+                return 0.0
+
+        return objective
 
     def _params_from_sweep(self, res, post, index_channels) -> dict:
         """Sweep pick + posterior weights -> the params dict the engine uses."""

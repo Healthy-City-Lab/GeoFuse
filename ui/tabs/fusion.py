@@ -388,6 +388,7 @@ _CROSS_METRICS: tuple[str, ...] = (
     "r2",
     "nrmse",
     "mutual_info",
+    "quartile_contrast",
     "logit_tstat",
     "logit_coef",
 )
@@ -399,6 +400,7 @@ _CROSS_METRIC_LABELS: dict[str, str] = {
     "r2": "Incremental R²",
     "nrmse": "Normalized RMSE (lower is better)",
     "mutual_info": "Mutual information (ignores covariates)",
+    "quartile_contrast": "Quartile contrast (top vs bottom quarter, magnitude)",
     "logit_tstat": "Logistic Wald |z| (binary outcome)",
     "logit_coef": "Logistic log-odds ratio (binary outcome)",
     "mixedlm_tstat": "Mixed-effects |t| (panel)",
@@ -1664,6 +1666,10 @@ def _render_study_details_panel(
                 "rows (maximised; nrmse minimised). "
                 "**Partial distance correlation** (default) captures linear and "
                 "nonlinear association and conditions on covariates nonlinearly. "
+                "**Quartile contrast** cuts the composite at its own "
+                "quartiles and maximises the size of the top-versus-bottom "
+                "difference, the way the greenspace literature reports a "
+                "greenness gradient. "
                 "The logistic and GEE-logistic options require a two-valued "
                 "outcome and report a log-odds ratio."
             ),

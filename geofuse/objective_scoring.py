@@ -37,6 +37,16 @@ Per-metric semantics
 ``mutual_info``
     Plain MI between target and CGI; **covariates are ignored** for this
     metric.
+``quartile_contrast``
+    Magnitude of the top-versus-bottom exposure-quartile difference in the
+    outcome, adjusted for covariates. The composite is cut at its own quartiles
+    and entered as indicators against the lowest quartile, the way the
+    greenspace literature reports a greenness gradient (Villeneuve et al. 2022;
+    Irvin et al. 2024). The score is ``|coefficient|`` of the highest quartile,
+    so a configuration that separates the greenest quarter from the least green
+    scores highly whatever the direction of the effect. Covariates enter the
+    same fit as design columns rather than being residualized out, because the
+    contrast is defined within one model.
 
 Residualization
 ---------------
@@ -89,6 +99,7 @@ SUPPORTED_METRICS: frozenset[str] = frozenset(
         "r2",
         "nrmse",
         "mutual_info",
+        "quartile_contrast",
         # Binary outcomes: logistic regression of a 0/1 target on the composite
         # plus covariates. A Gaussian fit to a dichotomous column is a linear
         # probability model whose standard errors are wrong in a known
@@ -117,6 +128,7 @@ HIGHER_IS_BETTER: frozenset[str] = frozenset(
         "r2",
         "mutual_info",
         "logit_tstat",
+        "quartile_contrast",
     }
 )
 
@@ -132,7 +144,7 @@ RESIDUALIZE_METHODS: frozenset[str] = frozenset({"linear", "spline"})
 # Metrics that condition on covariates intrinsically (so ``residualize_method``
 # has no effect). The UI greys the residualization control for these.
 RESIDUALIZE_IGNORED: frozenset[str] = frozenset(
-    {"partial_distance_corr", "mutual_info"}
+    {"partial_distance_corr", "mutual_info", "quartile_contrast"}
 )
 
 # Spatial-confounding adjustment methods. ``none`` reproduces the plain
@@ -150,6 +162,7 @@ _DEGENERATE_SCORE: dict[str, float] = {
     "r2": 0.0,
     "nrmse": float("inf"),
     "mutual_info": 0.0,
+    "quartile_contrast": 0.0,
     "logit_tstat": 0.0,
     "logit_coef": 0.0,
 }
@@ -480,6 +493,42 @@ def relationship_sign(
 # ────────────────────────────────────────────────────────────────────
 
 
+def _quartile_contrast(
+    target: np.ndarray, cgi: np.ndarray, controls: np.ndarray | None
+) -> float:
+    """|top-quartile coefficient| from indicators against the lowest quartile.
+
+    The composite is cut at its own quartiles, so the contrast is between the
+    greenest and least green quarter of *this* configuration rather than an
+    absolute greenness level. Ties are common in a composite built from
+    weighted channels, so a quantile that collapses onto its neighbour simply
+    yields fewer groups; fewer than two leaves nothing to contrast and scores 0.
+    """
+    from .exposure_response import exposure_quartiles
+
+    groups, _cuts = exposure_quartiles(cgi, n_groups=4)
+    if groups is None:
+        return 0.0
+    present = sorted(int(g) for g in np.unique(groups[groups >= 0]))
+    if len(present) < 2:
+        return 0.0
+
+    columns = [np.ones(len(groups))]
+    for g in present[1:]:
+        columns.append((groups == g).astype(np.float64))
+    if controls is not None and np.size(controls):
+        columns.append(np.asarray(controls, dtype=np.float64).reshape(len(groups), -1))
+    design = np.column_stack(columns)
+
+    coefs, _res, rank, _sv = np.linalg.lstsq(design, target, rcond=None)
+    if rank < design.shape[1]:
+        # A rank-deficient design has no unique top-quartile coefficient, so
+        # reporting one would be reading noise off the pseudo-inverse.
+        return 0.0
+    top = float(coefs[len(present) - 1])
+    return 0.0 if not np.isfinite(top) else abs(top)
+
+
 def score(
     metric: str,
     target: np.ndarray,
@@ -642,6 +691,10 @@ def score(
             t01 = _minmax01(tr)
             c01 = _minmax01(cr)
             s = float(np.sqrt(np.mean((t01 - c01) ** 2)))
+            return (s, 1.0) if return_pvalue else s
+
+        if metric == "quartile_contrast":
+            s = _quartile_contrast(t, c, _stack(cov, sb))
             return (s, 1.0) if return_pvalue else s
 
         if metric == "mutual_info":
