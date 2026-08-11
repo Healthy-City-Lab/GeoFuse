@@ -54,8 +54,10 @@ Every fusion run ends with a **stage wall-clock breakdown** in its log — each 
 
 Pool sizes come from the host's core count, and the share depends on what the phase is waiting for:
 
-- **Thread pools** (the stability search, the scorers) take about a *third* of the cores. Each task is already multi-threaded inside numpy, so a wider pool oversubscribes the cores rather than going faster.
-- **Process pools** (the greenery pre-aggregation build) take about *two thirds*. That work is a long chain of small numpy calls per pixel, which spend most of their time holding the interpreter lock, so threads leave the machine idle no matter how many you open — worker processes each bring their own interpreter, and every worker is pinned to a single numpy thread so the shares don't compound.
+- **Thread pools** (the scorers, the reporting replicates) take about a *third* of the cores. Each task is already multi-threaded inside numpy, so a wider pool oversubscribes the cores rather than going faster.
+- **Process pools** (the discovery sweep, the greenery pre-aggregation build) take **80 %** of the cores by default. Override with `GEOFUSE_CPU_SHARE` (a fraction, e.g. `0.5`) when the machine is shared. That work is a long chain of small numpy calls per pixel, which spend most of their time holding the interpreter lock, so threads leave the machine idle no matter how many you open — worker processes each bring their own interpreter, and every worker is pinned to a single numpy thread so the shares don't compound.
+
+**The sweep, the discovery replicates, the gain permutations and the null refits all run across processes.** Every candidate is scored in parallel, and workers read the exposure tensor through a memmap rather than being handed a copy.
 
 **Trials run in parallel for every objective metric.** The one exception is an exact `statsmodels` MixedLM refit (`mixedlm_lr`, `mixedlm_marginal_r2`), which is dominated by Python-level optimiser work holding the interpreter lock — threading it measured 0.62x of serial, so it is deliberately left sequential.
 
@@ -88,7 +90,7 @@ The form reads top-to-bottom in the order you reason about a run:
    - **Cross-sectional** — optionally enable **Date column available?** to route each entity to a year-matched greenery file (the year is only a file key, never a regression input).
    - **Mixed-effects (longitudinal)** — for repeated measures; a date column is required.
 3. **Metric File Assignment** — per channel (NDVI, then GVI), set the buffer ladder (min / max / step in metres) and upload one or more files. When years/waves are in play, pick the covering file for each year from its own compact picker; a year can point at only one file. Flip **Drag and drop** to move year chips onto files instead. Anything left unassigned blocks submission.
-4. **Study Details** — CGI formula (`weighted_average` or `synergy`), covariates to control for, the **objective metric**, an optional **spatial-confounding adjustment** (KS-AIC / Spatial+), the **test-set size**, the **stability-selection** knobs, the **per-pixel CGI grid pixel size**, the **[0, 1] composite scaling** toggle, and the **standalone single-metric** option. Longitudinal runs add **wave fixed effects** (on by default) and an optional **neighbourhood / site column**.
+4. **Study Details** — covariates to control for, the **objective metric**, an optional **spatial-confounding adjustment** (KS-AIC / Spatial+), the **test-set size**, the **Discovery** block (channel set, index form, sweep splits) with a **Validation & reporting** expander behind it, the **per-pixel CGI grid pixel size**, the **[0, 1] composite scaling** toggle, and the **run each channel on its own** option. There is no CGI-formula selector: the channel set names the modalities and the sweep picks the functional form, so the formula follows from both. Longitudinal runs add **wave fixed effects** (on by default) and an optional **neighbourhood / site column**.
    - Covariates listed under **Categorical** are one-hot encoded and counted as covariates automatically — there is no need to add them to both lists.
 5. **🚀 Run Fusion Optimization.**
 
@@ -100,7 +102,7 @@ The form reads top-to-bottom in the order you reason about a run:
 After a job completes — or when you click **Load results** on a completed job — the panel renders top-to-bottom:
 
 - **Headline** — held-out test score + 95 % CI, the held-out significance (labelled with the test it actually is — permutation for cross-sectional objectives, Wald for mixed-effects), the greenery↔outcome direction, and (when standalones ran) the CGI-vs-best-standalone verdicts.
-- **Study detail** — pick a study (CGI or a standalone) to see its score, selected weights / radii / aggregators, per-subset scores, final parameters, and stability diagnostics.
+- **Study detail** — pick a study (CGI or a standalone) to see its score, the discovered weights / radii / aggregators, per-subset scores, final parameters, and the discovery diagnostics: what the sweep picked and how contested it was, the posterior weights with credible intervals, whether the discovery reproduced across reshuffles, the composite's held-out gain over each channel alone, and the false-positive rate on permuted outcomes.
 - **CGI vs standalone** — score comparison plus the penalized model verdict (when standalones ran).
 - **Channel collinearity** — VIF report, when requested.
 - **Covariate impact** — per-covariate coefficient, t-stat, p-value, direction, and partial R² (when covariates are set).

@@ -9,7 +9,7 @@
 - **Green View Index (GVI)** — *eye-level* greenery measured from Google Street View panoramas with DeepLabV3+ semantic segmentation.
 - **NDVI** — *overhead* greenery from Google Earth Engine satellite imagery (Sentinel-2 / Landsat).
 
-It then combines them into a single **composite greenery index** whose channel weights, spatial scales, and formula are tuned by **bootstrap stability selection** and reported on a held-out test set — optimized against a health or environmental outcome you supply.
+It then combines them into a single **composite greenery index**. The channel weights, each channel's spatial scale and aggregation statistic, and the functional form are all **discovered from the data** — an exhaustive cross-validated sweep picks the configuration, a Bayesian fit puts credible intervals on the weights, and the effect is reported on a held-out test set the search never saw. Optimized against a health or environmental outcome you supply.
 
 Two ways to run it: an interactive **Streamlit dashboard** for exploratory analysis, and an **MPI-parallel CLI** for large-scale HPC batch processing.
 
