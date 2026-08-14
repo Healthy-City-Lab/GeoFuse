@@ -72,10 +72,10 @@ def test_real_gvi(model_path, output_dir):
         return
 
     # ``_make_result`` stores per-point GVI under ``gvi_veg``/``gvi_ter`` and
-    # the resolved panorama id under ``pano_id``. Empty results carry
-    # ``pano_id=None``.
-    n_hits = sum(1 for r in results if r.get("pano_id"))
-    print(f"   [INFO] Processed {len(results)} points; {n_hits} returned a panorama.")
+    # the resolved panorama id under ``pano_id``. Points with no panorama are
+    # never handed to ``result_callback``, so every entry here is a hit.
+    n_hits = len(results)
+    print(f"   [INFO] Processed {len(gdf)} points; {n_hits} returned a panorama.")
 
     if n_hits == 0:
         print(
@@ -86,12 +86,11 @@ def test_real_gvi(model_path, output_dir):
         return
 
     # Pull one summary GVI value to confirm segmentation actually ran.
-    first_hit = next((r for r in results if r.get("pano_id")), None)
-    if first_hit is not None:
-        veg = first_hit.get("gvi_veg")
-        ter = first_hit.get("gvi_ter")
-        pid = str(first_hit.get("pano_id"))[:12]
-        print(f"   [PASS] Sample GVI: veg={veg:.3f}, ter={ter:.3f} (pano={pid}…)")
+    first_hit = results[0]
+    veg = first_hit.get("gvi_veg")
+    ter = first_hit.get("gvi_ter")
+    pid = str(first_hit.get("pano_id"))[:12]
+    print(f"   [PASS] Sample GVI: veg={veg:.3f}, ter={ter:.3f} (pano={pid}…)")
 
     # ``save_panos=True`` writes PNGs into <output_dir>/images. Verify at
     # least one was written so the pano-write path is exercised.

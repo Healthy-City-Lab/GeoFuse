@@ -12,7 +12,6 @@ import rasterio
 import streamlit as st
 from helpers import (
     RESTART_SESSION_KEY,
-    apply_buffer_m,
     file_size_mtime_fingerprint,
     generate_clustered_grid,
     load_vector_paths,
@@ -913,7 +912,7 @@ def _render_gvi_settings_map() -> None:
             if d.get("type") == "restored":
                 continue
             if d.get("raw") is not None:
-                add_study_area_layers(
+                buf_bounds = add_study_area_layers(
                     m_input,
                     d["raw"],
                     study_name=f"{fname} (study area)",
@@ -921,10 +920,8 @@ def _render_gvi_settings_map() -> None:
                     buffer_name=f"{fname} (buffer)",
                 )
                 all_bounds.append(d["raw"].total_bounds)
-                if gvi_buf_preview > 0:
-                    all_bounds.append(
-                        apply_buffer_m(d["raw"], gvi_buf_preview).total_bounds
-                    )
+                if buf_bounds is not None:
+                    all_bounds.append(buf_bounds)
             if (
                 show_sampling_grid
                 and d.get("processed") is not None

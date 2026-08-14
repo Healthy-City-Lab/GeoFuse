@@ -276,7 +276,7 @@ def _write_gvi_outputs(
                 arr_veg = np.full((h, w), np.nan, dtype=np.float32)
                 arr_ter = np.full((h, w), np.nan, dtype=np.float32)
                 if has_cluster_col:
-                    cdf = res_df[res_df["cluster_id"] == cid].dropna(subset=["gvi_veg"])
+                    cdf = res_df[res_df["cluster_id"] == cid]
                     if not cdf.empty:
                         lr = (cdf["row"].to_numpy() - cluster["row_min"]).astype(int)
                         lc = (cdf["col"].to_numpy() - cluster["col_min"]).astype(int)
