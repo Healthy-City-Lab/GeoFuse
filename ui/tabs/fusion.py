@@ -2844,6 +2844,136 @@ def _agg_label(stat: str | None, percentile: int | float | None) -> str:
     return "—"
 
 
+def _render_fitted_grid(summary: dict, _pd, _label) -> None:
+    """The spatial scale and the aggregator, as the posterior estimated them.
+
+    These are parameters of the same model as the weights rather than choices
+    made before it ran, so each is shown against the prior it was drawn from.
+    A posterior as wide as its prior is not an estimate — it is the model
+    reporting that the data was silent — and without the prior beside it there
+    is no way to tell the two apart from the number alone.
+    """
+    profile = summary.get("radius_profile")
+    aggregator = summary.get("aggregator_mean")
+    if not profile and not aggregator:
+        return
+
+    st.markdown("**Fitted spatial scale and aggregator**")
+    st.caption(
+        "Radius and aggregator are sampled with the weights, not picked before "
+        "the sampler runs, so the credible interval on beta above already "
+        "carries their uncertainty - there is no separate correction owed for "
+        "having searched them."
+    )
+
+    peak = summary.get("peak_radius_mean")
+    if peak:
+        prior = summary.get("peak_radius_prior_ci") or [None, None]
+        lo = summary.get("peak_radius_ci_low") or [None] * len(peak)
+        hi = summary.get("peak_radius_ci_high") or [None] * len(peak)
+        ratios = summary.get("peak_radius_width_ratio") or []
+        st.dataframe(
+            _pd.DataFrame([
+                {
+                    "Channel": _label(i),
+                    "Peak radius (m)": _fmt(v, 0),
+                    "95% CrI": f"[{_fmt(lo[i], 0)}, {_fmt(hi[i], 0)}]",
+                    "Prior CrI": f"[{_fmt(prior[0], 0)}, {_fmt(prior[1], 0)}]",
+                    "vs prior": _fmt(ratios[i], 2) if i < len(ratios) else "-",
+                }
+                for i, v in enumerate(peak)
+            ]),
+            width="stretch",
+            hide_index=True,
+        )
+        # A channel whose scale is genuinely learned lands near 0.1; one the
+        # data is silent about lands near 0.8, not at 1.0, because the kernel
+        # is normalised over a finite ladder and cannot wander the whole prior.
+        # The threshold sits in the gap between those, not next to 1.0.
+        unlearned = [
+            _label(i) for i, r in enumerate(ratios)
+            if _num(r) is not None and float(r) > 0.5
+        ]
+        if unlearned:
+            st.warning(
+                "The scale posterior keeps most of its prior width for: "
+                + ", ".join(unlearned)
+                + ". The data did not identify a distance for those channels - "
+                "do not report a radius for them as a finding. The weights and "
+                "the effect are still valid; only the scale is unlearned."
+            )
+
+    radii = summary.get("radii") or []
+    if profile and radii:
+        prof = _pd.DataFrame(
+            {_label(i): row for i, row in enumerate(profile)},
+            index=[f"{int(r)} m" for r in radii],
+        )
+        st.bar_chart(prof, height=200)
+        st.caption(
+            "Posterior weight on each rung of the ladder. The kernel is placed "
+            "in log-radius with a sampled location and width, so it can rise "
+            "and then fall; monotone decay is the special case where the peak "
+            "sits at or below the smallest rung, so nothing is lost by allowing "
+            "the hump. Mass piled against either end means the effect may peak "
+            "outside the searched range - widen the buffer ladder and re-run."
+        )
+
+    if aggregator:
+        stats = summary.get("stats") or []
+        a_lo = summary.get("aggregator_ci_low") or []
+        a_hi = summary.get("aggregator_ci_high") or []
+        rows = []
+        for ci, blend in enumerate(aggregator):
+            row = {"Channel": _label(ci)}
+            for si, v in enumerate(blend):
+                name = stats[si] if si < len(stats) else f"s{si}"
+                cell = round(float(v), 3)
+                if ci < len(a_lo) and si < len(a_lo[ci]):
+                    cell = (f"{float(v):.3f} [{a_lo[ci][si]:.2f}, "
+                            f"{a_hi[ci][si]:.2f}]")
+                row[name] = cell
+            rows.append(row)
+        st.dataframe(_pd.DataFrame(rows), width="stretch", hide_index=True)
+        n_stats = len(stats) or 1
+        uniform = _num(summary.get("aggregator_uniform")) or (1.0 / n_stats)
+        informative = summary.get("aggregator_informative") or []
+        st.caption(
+            f"Blend over the aggregators, not a pick. A component is a finding "
+            f"when its credible interval excludes the prior mean "
+            f"{uniform:.2f} - in either direction, since \"certainly not "
+            f"`p90`\" is as much of a result as \"mostly `p10`\". Mass on "
+            "`p10` says the least-green part of the neighbourhood is what "
+            "matters; on `p90`, the best patch."
+        )
+        silent = [_label(ci) for ci, names in enumerate(informative) if not names]
+        spoke = [f"{_label(ci)}: {', '.join(names)}"
+                 for ci, names in enumerate(informative) if names]
+        if spoke:
+            st.caption("Aggregators the data separated - " + " | ".join(spoke))
+        if silent:
+            st.info(
+                "No aggregator is distinguishable from the others for: "
+                + ", ".join(silent)
+                + ". Percentiles of one buffer are six summaries of a single "
+                "distribution, and they only separate when its *shape* varies "
+                "between people independently of its level. Where they do not, "
+                "the composite falls back to the mean rather than to the "
+                "largest share of a flat blend, which is a coin flip."
+            )
+
+    projected = summary.get("projected_pick")
+    if projected:
+        parts = " / ".join(f"{int(x[0])} m {x[1]}" for x in projected)
+        st.caption(
+            f"**Shipped to the composite:** {parts}. The composite/apply path "
+            "carries one radius and one statistic per channel, so the blend "
+            "above is projected onto its modal cell for that purpose. The "
+            "effect and intervals reported here come from the blend, not from "
+            "a refit at the projected cell."
+        )
+
+
 def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
     """Diagnostics panel for one study's sweep + posterior.
 
@@ -2959,6 +3089,7 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
         lo = summary.get("weight_ci_low") or [None] * len(weights)
         hi = summary.get("weight_ci_high") or [None] * len(weights)
         powers = summary.get("powers")
+        ratios = summary.get("weight_width_ratio") or []
         wrows = []
         for i, w in enumerate(weights):
             row = {
@@ -2966,20 +3097,30 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
                 "Weight": round(float(w), 3),
                 "95% CrI": f"[{_fmt(lo[i], 3)}, {_fmt(hi[i], 3)}]",
             }
+            if i < len(ratios):
+                row["vs prior"] = _fmt(ratios[i], 2)
             if powers and i < len(powers):
                 row["Power"] = round(float(powers[i]), 3)
             wrows.append(row)
         st.dataframe(_pd.DataFrame(wrows), width="stretch", hide_index=True)
+        prior_ci = summary.get("weight_prior_ci")
         st.caption(
             "Weights are constrained to the simplex (non-negative, summing to "
             "1), so each one reads directly as that channel's share of the "
             "composite. A credible interval spanning most of [0, 1] means the "
-            "data does not separate that channel's contribution."
+            "data does not separate that channel's contribution. **vs prior** "
+            "is the credible interval's width as a share of the prior's"
+            + (f" (prior 95% CrI [{_fmt(prior_ci[0], 3)}, "
+               f"{_fmt(prior_ci[1], 3)}])" if prior_ci else "")
+            + " - near 1.00 means the data moved nothing and the weight is the "
+            "prior speaking back."
         )
+
+    _render_fitted_grid(summary, _pd, _label)
 
     beta = summary.get("beta_mean")
     if beta is not None:
-        b1, b2, b3, b4 = st.columns(4)
+        b1, b2, b3, b4, b5 = st.columns(5)
         with b1:
             st.metric(
                 "Beta (index to outcome)",
@@ -3011,6 +3152,18 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
                     "Sampler health. R-hat should be under 1.01 and ESS in the "
                     "hundreds; otherwise the intervals above are not "
                     "trustworthy - raise draws and chains."
+                ),
+            )
+        with b5:
+            st.metric(
+                "Partial R²",
+                _fmt(summary.get("partial_r2_mean"), 4),
+                help=(
+                    "Share of the covariate-adjusted outcome variance the "
+                    "index explains. In greenspace and mental-health research "
+                    "values near 0.001 are the published effect size, not a "
+                    "defect of the fit - but they also cap how well any method "
+                    "can resolve *which* channel carries the effect."
                 ),
             )
         div = summary.get("divergences")

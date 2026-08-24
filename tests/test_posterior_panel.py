@@ -176,5 +176,103 @@ class TestPanelRenders(unittest.TestCase):
         self.assertIn("Sweep", out)
 
 
+def _grid(**over) -> dict:
+    """A bundle from a posterior that fitted the grid rather than a picked cell."""
+    s = _summary()
+    s.update({
+        "radius_kernel": "lognormal",
+        "radii": [100, 250, 500, 1000],
+        "radius_profile": [[0.05, 0.20, 0.70, 0.05], [0.25, 0.25, 0.25, 0.25]],
+        "projected_pick": [[500, "p10"], [250, "mean"]],
+        "peak_radius_mean": [480.0, 390.0],
+        "peak_radius_ci_low": [410.0, 105.0],
+        "peak_radius_ci_high": [560.0, 980.0],
+        "peak_radius_prior_ci": [90.0, 1100.0],
+        "peak_radius_width_ratio": [0.15, 0.87],
+        "stats": ["mean", "p10", "p50", "p90"],
+        "aggregator_mean": [[0.1, 0.7, 0.1, 0.1], [0.25, 0.25, 0.25, 0.25]],
+        "aggregator_ci_low": [[0.02, 0.5, 0.02, 0.02], [0.05, 0.05, 0.05, 0.05]],
+        "aggregator_ci_high": [[0.3, 0.88, 0.3, 0.3], [0.6, 0.6, 0.6, 0.6]],
+        "aggregator_prior_ci": [0.008, 0.63],
+        "aggregator_width_ratio": [[0.45, 0.61, 0.45, 0.45], [0.88, 0.88, 0.88, 0.88]],
+        "aggregator_uniform": 0.25,
+        "aggregator_informative": [["p10"], []],
+        "partial_r2_mean": 0.0012,
+        "weight_prior_ci": [0.025, 0.975],
+        "weight_width_ratio": [0.63, 0.63],
+    })
+    s.update(over)
+    return s
+
+
+class TestFittedGridPanel(unittest.TestCase):
+    """The scale and aggregator sections, and the prior comparison they carry.
+
+    A posterior as wide as its prior is the model saying the data was silent.
+    That has to reach the page as a warning rather than as a confident radius,
+    because the point estimate looks identical either way.
+    """
+
+    def setUp(self):
+        self._real_st = fusion_tab.st
+        self.rec = _Recorder()
+        fusion_tab.st = self.rec
+
+    def tearDown(self):
+        fusion_tab.st = self._real_st
+
+    def _render(self, summary):
+        fusion_tab._render_posterior_diagnostics(summary, "DCOR")
+        return self.rec.text()
+
+    def test_the_fitted_scale_and_aggregator_are_drawn(self):
+        out = self._render(_grid())
+        self.assertIn("Fitted spatial scale and aggregator", out)
+        self.assertIn("480", out)
+        self.assertIn("p10", out)
+
+    def test_an_unidentified_scale_is_warned_about(self):
+        out = self._render(_grid())
+        self.assertIn("keeps most of its prior width", out)
+        self.assertIn("GVI", out)
+
+    def test_an_identified_scale_alone_raises_no_warning(self):
+        out = self._render(_grid(peak_radius_width_ratio=[0.15, 0.2]))
+        self.assertNotIn("keeps most of its prior width", out)
+
+    def test_the_projection_shipped_to_the_composite_is_named(self):
+        out = self._render(_grid())
+        self.assertIn("Shipped to the composite", out)
+        self.assertIn("500 m p10", out)
+
+    def test_partial_r2_reaches_the_page(self):
+        # The recorder captures a metric's label, not its value, so this gates
+        # that the tile is drawn at all -- which is what regressed when the
+        # beta row was widened to make room for it.
+        self.assertIn("Partial R", self._render(_grid()))
+
+    def test_a_bundle_without_the_grid_skips_the_section(self):
+        out = self._render(_summary())
+        self.assertNotIn("Fitted spatial scale and aggregator", out)
+
+    def test_an_undistinguishable_aggregator_is_called_out(self):
+        out = self._render(_grid())
+        self.assertIn("No aggregator is distinguishable", out)
+        self.assertIn("falls back to the mean", out)
+
+    def test_a_channel_whose_aggregator_separated_is_named(self):
+        out = self._render(_grid())
+        self.assertIn("Aggregators the data separated", out)
+        self.assertIn("NDVI: p10", out)
+
+    def test_all_channels_informative_raises_no_fallback_notice(self):
+        out = self._render(_grid(aggregator_informative=[["p10"], ["p90"]]))
+        self.assertNotIn("No aggregator is distinguishable", out)
+
+    def test_a_scale_without_an_aggregator_still_renders(self):
+        out = self._render(_grid(aggregator_mean=None))
+        self.assertIn("Fitted spatial scale and aggregator", out)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,4 +1,4 @@
-"""Data-driven CGI: sweep the spatial/aggregator/form grid, then fit a posterior.
+"""Data-driven CGI: sweep the grid for a shortlist, then fit it all jointly.
 
 Two stages, in this order:
 
@@ -10,17 +10,27 @@ Two stages, in this order:
    so a candidate is scored from small slices of a precomputed Gram matrix and
    the n-row data is never touched again.
 
-2. :func:`fit` — NUTS at the picked columns, estimating only what needs an
-   interval: the channel weights and the effect.
+2. :func:`fit` — NUTS over the whole ``(channel, radius, statistic)`` grid at
+   once. The spatial scale is a peaked kernel whose location and width are
+   sampled, the aggregator is a Dirichlet blend over the statistics, and the
+   channel weights sit on a simplex alongside them. Nothing about the scale or
+   the aggregator is chosen before the sampler runs, so uncertainty about them
+   widens the interval on the effect instead of vanishing into a pick.
 
-:func:`repeated_discovery` runs both stages over independent train/test
-shuffles, because one split cannot show that a discovery generalises.
+Every association is scored and fitted on **magnitude**. The toolbox is used on
+outcomes that rise with greenery and on outcomes that fall with it, so no stage
+declares a direction; the sign lives in ``beta``, which the posterior estimates
+freely, and the simplex weights stay non-negative so an index always reads as
+"more exposure, larger index".
 
-Selection reads the outcome, so a stage-2 interval on the same rows is
-post-selection. Three guards, all exercised here: the sweep sees the train pool
-only, the headline effect comes from rows it never saw, and
-:func:`null_calibration` permutes the outcome and re-runs *both* stages so the
-reported false-positive rate prices the sweep in.
+:func:`repeated_discovery` runs the sweep over independent train/test shuffles,
+because one split cannot show that a discovery generalises.
+
+The sweep still reads the outcome to rank a shortlist and to choose the form.
+Three guards, all exercised here: the sweep sees the train pool only, the
+headline effect comes from rows it never saw, and :func:`null_calibration`
+permutes the outcome and refits the joint model, so the scale and the
+aggregator are priced into the reported false-positive rate.
 """
 
 from __future__ import annotations
@@ -145,35 +155,48 @@ def _tstat(e: np.ndarray, y: np.ndarray) -> float:
 
 
 def simplex_fit(gram: np.ndarray, xty: np.ndarray):
-    """Non-negative weights summing to one that maximise fit, exactly.
+    """Non-negative weights summing to one that maximise |association|, exactly.
 
     Enumerates the active sets — interior, every face, every vertex — and
     solves each with a Lagrange multiplier. With two or three channels that is
     at most seven tiny solves, so there is no iterative solver and no tolerance
     to tune. Returns ``(kept_indices, weights)`` or ``None``.
+
+    The quantity maximised is the **magnitude** of the standardised association,
+    so a protective exposure and a harmful one of equal strength score the same.
+    A signed objective would instead walk away from a protective channel and
+    hand the weight to whichever channel happened to correlate upward, which on
+    greenery data is usually the one carrying no signal at all. Magnitude is a
+    max over two signed problems — one in ``xty`` and one in ``-xty`` — because
+    ``max |f| = max(max f, max -f)``, and each is the same Lagrange solve.
+
+    The weights stay non-negative in both branches, so the index always reads as
+    "more exposure is a larger index"; the direction of the *effect* lives in
+    the sign of beta, which the posterior estimates freely.
     """
     k = len(xty)
     best, best_v = None, -np.inf
-    for mask in range(1, 1 << k):
-        idx = [i for i in range(k) if mask >> i & 1]
-        g, c = gram[np.ix_(idx, idx)], xty[idx]
-        try:
-            gi = np.linalg.inv(g)
-        except np.linalg.LinAlgError:
-            continue
-        one = np.ones(len(idx))
-        denom = float(one @ gi @ one)
-        if abs(denom) < 1e-15:
-            continue
-        w = gi @ (c - ((one @ gi @ c - 1.0) / denom) * one)
-        if np.any(w < -1e-9):
-            continue
-        quad = float(w @ g @ w)
-        if quad <= 1e-15:
-            continue
-        v = float(w @ c) / math.sqrt(quad)
-        if v > best_v:
-            best_v, best = v, (np.asarray(idx), np.clip(w, 0.0, None))
+    for signed in (xty, -xty):
+        for mask in range(1, 1 << k):
+            idx = [i for i in range(k) if mask >> i & 1]
+            g, c = gram[np.ix_(idx, idx)], signed[idx]
+            try:
+                gi = np.linalg.inv(g)
+            except np.linalg.LinAlgError:
+                continue
+            one = np.ones(len(idx))
+            denom = float(one @ gi @ one)
+            if abs(denom) < 1e-15:
+                continue
+            w = gi @ (c - ((one @ gi @ c - 1.0) / denom) * one)
+            if np.any(w < -1e-9):
+                continue
+            quad = float(w @ g @ w)
+            if quad <= 1e-15:
+                continue
+            v = abs(float(w @ xty[idx])) / math.sqrt(quad)
+            if v > best_v:
+                best_v, best = v, (np.asarray(idx), np.clip(w, 0.0, None))
     return best
 
 
@@ -493,8 +516,43 @@ def build_index(E_train, y_train, form):
 
 
 # ────────────────────────────────────────────────────────────────────
-# Stage 2 — posterior at the picked columns
+# Stage 2 — the joint posterior
 # ────────────────────────────────────────────────────────────────────
+
+
+def _dirichlet_prior_ci(k: int, q=(0.025, 0.975)) -> tuple[float, float]:
+    """Central interval of one component of a symmetric ``Dirichlet(1, …, 1)``.
+
+    Each marginal is ``Beta(1, k-1)``, whose quantile function is closed form,
+    so the prior interval costs nothing to state alongside the posterior one.
+    """
+    if k <= 1:
+        return (1.0, 1.0)
+    return tuple(float(1.0 - (1.0 - p) ** (1.0 / (k - 1))) for p in q)
+
+
+def _radius_prior(radii) -> tuple[float, float]:
+    """Centre and spread, in log-metres, of the kernel's location prior.
+
+    Taken from the ladder itself, so a study that searched 50-500 m and one
+    that searched 250-5000 m each get a prior covering their own range rather
+    than a constant carried over from whichever was written down first.
+    """
+    lr = np.log(np.asarray(radii, dtype=np.float64))
+    return float(lr.mean()), float(max(lr.std(), 1e-3))
+
+
+def _width_ratio(post_lo, post_hi, prior_lo, prior_hi) -> float:
+    """Posterior interval width as a share of the prior's.
+
+    Near 1.0 the data moved nothing: the parameter is unidentified and the
+    "estimate" is the prior speaking back. This is the check that separates a
+    reportable scale from a number the model was always going to return.
+    """
+    prior_w = float(prior_hi) - float(prior_lo)
+    if not np.isfinite(prior_w) or prior_w <= 0:
+        return float("nan")
+    return float((float(post_hi) - float(post_lo)) / prior_w)
 
 
 @dataclass
@@ -508,6 +566,14 @@ class IndexPosterior:
     rhat_max: float
     ess_min: float
     divergences: int
+    sigma: np.ndarray | None = None                # (draws,)
+    radius_weights: np.ndarray | None = None       # (draws, nC, nR)
+    peak_radius: np.ndarray | None = None          # (draws, nC), metres
+    kernel_width: np.ndarray | None = None         # (draws, nC), log-metres
+    aggregator_weights: np.ndarray | None = None   # (draws, nC, nStats)
+    radii: tuple = ()
+    stats: tuple = ()
+    radius_kernel: str = "fixed"
 
     def weight_labels(self) -> list[str]:
         """One label per weight, so the pair terms are not read as channels.
@@ -524,10 +590,78 @@ class IndexPosterior:
             ]
         return labels
 
+    def partial_r2(self) -> np.ndarray:
+        """Share of the residualised outcome variance the index explains.
+
+        The outcome is standardised in :func:`prep`, so ``beta`` and ``sigma``
+        are on the same scale and the ratio is the partial R² directly. In this
+        literature values near 0.001 are the published effect size rather than
+        a defect of the fit.
+        """
+        if self.sigma is None:
+            return np.full(len(self.beta), np.nan)
+        b2 = self.beta ** 2
+        return b2 / (b2 + self.sigma ** 2)
+
+    def informative_aggregators(self) -> list[list[str]]:
+        """Per channel, the statistics the data actually had an opinion about.
+
+        A component is informative when its credible interval excludes the
+        prior mean ``1/K`` — in either direction, since "certainly not p90" is
+        as much of a finding as "mostly p10".
+
+        Interval *width* is the wrong test here, unlike for the radius. The
+        prior marginal is ``Beta(1, K-1)``, which piles its mass near zero, so
+        a posterior that correctly concentrates on one statistic near 0.5 comes
+        out wider than the prior and reads as unidentified exactly when it is
+        most informative.
+        """
+        if self.aggregator_weights is None:
+            return []
+        uniform = 1.0 / self.aggregator_weights.shape[2]
+        lo, hi = np.percentile(self.aggregator_weights, [2.5, 97.5], axis=0)
+        return [
+            [str(self.stats[i]) for i in range(len(self.stats))
+             if lo[c, i] > uniform or hi[c, i] < uniform]
+            for c in range(len(self.channels))
+        ]
+
+    def projected_pick(self) -> tuple:
+        """The single ``(radius, stat)`` per channel closest to the posterior.
+
+        The blend is the estimate; this is its projection onto the one cell per
+        channel the composite/apply path can carry, since that path takes one
+        radius and one statistic rather than a distribution over them. It is
+        named a projection so it is not read back as the model.
+
+        Where the blend is flat the argmax is a coin flip between statistics the
+        data could not tell apart — on collinear aggregators it lands on ``p10``
+        or ``p90`` depending only on the seed. That is a pick manufactured out
+        of noise, and it would be shipped downstream as though it were a
+        finding, so a channel with no informative component falls back to the
+        mean: the conventional default, and a stable one.
+        """
+        if self.radius_weights is None or self.aggregator_weights is None:
+            return tuple(self.picked)
+        rw = self.radius_weights.mean(0)
+        aw = self.aggregator_weights.mean(0)
+        informative = self.informative_aggregators()
+        default = "mean" if "mean" in self.stats else None
+        out = []
+        for c in range(len(self.channels)):
+            if informative[c] or default is None:
+                stat = str(self.stats[int(np.argmax(aw[c]))])
+            else:
+                stat = default
+            out.append((int(self.radii[int(np.argmax(rw[c]))]), stat))
+        return tuple(out)
+
     def summary(self) -> dict:
         lo, hi = np.percentile(self.beta, [2.5, 97.5])
         w_lo, w_hi = np.percentile(self.weights, [2.5, 97.5], axis=0)
-        return {
+        w_prior = _dirichlet_prior_ci(self.weights.shape[1])
+        pr2 = self.partial_r2()
+        out = {
             "channels": list(self.channels),
             "weight_labels": self.weight_labels(),
             "picked": [list(p) for p in self.picked],
@@ -535,19 +669,86 @@ class IndexPosterior:
             "weight_mean": self.weights.mean(0).tolist(),
             "weight_ci_low": np.atleast_1d(w_lo).tolist(),
             "weight_ci_high": np.atleast_1d(w_hi).tolist(),
+            "weight_prior_ci": list(w_prior),
+            "weight_width_ratio": [
+                _width_ratio(a, b, *w_prior)
+                for a, b in zip(np.atleast_1d(w_lo), np.atleast_1d(w_hi))
+            ],
             "beta_mean": float(self.beta.mean()),
             "beta_ci_low": float(lo),
             "beta_ci_high": float(hi),
             "p_direction": float(max((self.beta > 0).mean(), (self.beta < 0).mean())),
+            "partial_r2_mean": float(np.nanmean(pr2)),
+            "partial_r2_ci_low": float(np.nanpercentile(pr2, 2.5)),
+            "partial_r2_ci_high": float(np.nanpercentile(pr2, 97.5)),
             "rhat_max": self.rhat_max,
             "ess_min": self.ess_min,
             "divergences": self.divergences,
             "powers": None if self.powers is None else self.powers.mean(0).tolist(),
+            "radius_kernel": self.radius_kernel,
         }
 
+        if self.radius_weights is not None:
+            out["radii"] = [int(r) for r in self.radii]
+            out["radius_profile"] = self.radius_weights.mean(0).tolist()
+            out["projected_pick"] = [list(p) for p in self.projected_pick()]
+        if self.peak_radius is not None:
+            center, spread = _radius_prior(self.radii)
+            prior = (float(np.exp(center - 1.96 * spread)),
+                     float(np.exp(center + 1.96 * spread)))
+            p_lo, p_hi = np.percentile(self.peak_radius, [2.5, 97.5], axis=0)
+            out["peak_radius_mean"] = self.peak_radius.mean(0).tolist()
+            out["peak_radius_ci_low"] = np.atleast_1d(p_lo).tolist()
+            out["peak_radius_ci_high"] = np.atleast_1d(p_hi).tolist()
+            out["peak_radius_prior_ci"] = list(prior)
+            out["peak_radius_width_ratio"] = [
+                _width_ratio(a, b, *prior)
+                for a, b in zip(np.atleast_1d(p_lo), np.atleast_1d(p_hi))
+            ]
+        if self.kernel_width is not None:
+            out["kernel_width_mean"] = self.kernel_width.mean(0).tolist()
+        if self.aggregator_weights is not None:
+            a_lo, a_hi = np.percentile(self.aggregator_weights, [2.5, 97.5], axis=0)
+            a_prior = _dirichlet_prior_ci(self.aggregator_weights.shape[2])
+            out["stats"] = list(self.stats)
+            out["aggregator_mean"] = self.aggregator_weights.mean(0).tolist()
+            out["aggregator_ci_low"] = a_lo.tolist()
+            out["aggregator_ci_high"] = a_hi.tolist()
+            out["aggregator_prior_ci"] = list(a_prior)
+            out["aggregator_uniform"] = 1.0 / self.aggregator_weights.shape[2]
+            out["aggregator_informative"] = self.informative_aggregators()
+            out["aggregator_width_ratio"] = [
+                [_width_ratio(a, b, *a_prior) for a, b in zip(lo_c, hi_c)]
+                for lo_c, hi_c in zip(a_lo, a_hi)
+            ]
+        return out
 
-def fit(E, y, *, form="linear", draws=800, warmup=800, chains=4, seed=42):
-    """NUTS over the channel weights (and synergy powers) at fixed columns."""
+
+def fit(E, y, *, form="linear", radii=None, stats=None, radius_mask=None,
+        radius_kernel="lognormal", aggregator="dirichlet",
+        draws=800, warmup=800, chains=4, seed=42):
+    """NUTS over every unknown the index has: scale, aggregation, weights, form.
+
+    ``E`` is either ``(n, channel)`` — one already-chosen column per channel,
+    which fixes the scale and the aggregator outside the model — or
+    ``(n, channel, radius, stat)``, the whole grid, in which case the radius
+    profile and the aggregator blend are sampled alongside the weights and
+    their uncertainty flows into the interval on the effect.
+
+    **The radius kernel is peaked, not decaying.** ``lognormal`` places the
+    kernel in *log* radius with a sampled location and width, so the profile
+    may rise and then fall — the shape held-out radius sweeps on this data
+    actually show. That does not give up monotone decay: decay is the special
+    case where the location sits at or below the smallest rung, so the peaked
+    family contains the decaying one rather than replacing it. ``dirichlet``
+    assumes no shape at all and pays for it in identification; ``fixed``
+    spreads mass evenly over whatever rungs are unmasked.
+
+    Each channel's contracted exposure is standardised before the weighted sum.
+    Without that step a channel whose rungs disagree gets a lower-variance
+    blend and therefore less influence at the same weight, which both breaks
+    the reading of a weight as a share and ties the kernel width to the weight.
+    """
     import jax
     import jax.numpy as jnp
     import numpyro
@@ -555,18 +756,68 @@ def fit(E, y, *, form="linear", draws=800, warmup=800, chains=4, seed=42):
     from numpyro.infer import MCMC, NUTS
 
     numpyro.set_host_device_count(chains)
+    E = np.asarray(E, dtype=np.float64)
+    joint = E.ndim == 4
     nc = E.shape[1]
     npair = len(_pairs(nc)) if form == "synergy" else 0
-    lo, hi = E.min(0), E.max(0)
+
+    if joint:
+        nr, ns = E.shape[2], E.shape[3]
+        if radii is None or len(radii) != nr:
+            raise ValueError("A (n, channel, radius, stat) grid needs `radii`.")
+        mask = (np.ones((nc, nr), dtype=bool) if radius_mask is None
+                else np.asarray(radius_mask, dtype=bool))
+        # Off-ladder cells are NaN in the tensor. Zeroing them is only safe
+        # because the mask below also zeroes their kernel weight, so they enter
+        # neither the contraction nor its normaliser.
+        E = np.where(mask[None, :, :, None], np.nan_to_num(E), 0.0)
+        if nr == 1:
+            radius_kernel = "fixed"
+        center, spread = _radius_prior(radii)
+        log_r = jnp.asarray(np.log(np.asarray(radii, dtype=np.float64)))
+        maskj = jnp.asarray(mask.astype(np.float64))
+
+    def contract(Ej):
+        # The kernel is built in log space and normalised by subtracting its own
+        # maximum. A location far from the ladder — which the sampler visits
+        # freely whenever a channel carries no signal — otherwise drives every
+        # rung to underflow, and the row of weights becomes all zeros instead of
+        # a distribution, silently dropping the channel from those draws.
+        if radius_kernel == "lognormal":
+            mu = numpyro.sample(
+                "mu", dist.Normal(center, spread).expand([nc]).to_event(1))
+            sd = numpyro.sample(
+                "kw",
+                dist.LogNormal(math.log(spread), 0.75).expand([nc]).to_event(1))
+            logk = -0.5 * ((log_r[None, :] - mu[:, None]) / sd[:, None]) ** 2
+        elif radius_kernel == "dirichlet":
+            kr = numpyro.sample(
+                "kr", dist.Dirichlet(jnp.ones(nr)).expand([nc]).to_event(1))
+            logk = jnp.log(kr + 1e-30)
+        else:
+            logk = jnp.zeros((nc, nr))
+        logk = jnp.where(maskj > 0, logk, -1e30)
+        logk = logk - jnp.max(logk, axis=-1, keepdims=True)
+        k = jnp.exp(logk)
+        k = numpyro.deterministic("radius_w", k / jnp.sum(k, axis=-1, keepdims=True))
+        if aggregator == "dirichlet":
+            a = numpyro.sample(
+                "a", dist.Dirichlet(jnp.ones(ns)).expand([nc]).to_event(1))
+        else:
+            a = jnp.ones((nc, ns)) / ns
+        v = jnp.einsum("ncrs,cr,cs->nc", Ej, k, a)
+        return (v - v.mean(0)) / jnp.maximum(v.std(0), 1e-9)
 
     def model(Ej, yj):
+        v = contract(Ej) if joint else Ej
         w = numpyro.sample("w", dist.Dirichlet(jnp.ones(nc + npair)))
         if form == "linear":
-            e = Ej @ w
+            e = v @ w
         else:
             p = numpyro.sample(
                 "p", dist.Uniform(_POWER_LO, _POWER_HI).expand([nc]).to_event(1))
-            z = jnp.clip((Ej - lo) / (hi - lo + 1e-12), 0.0, 1.0)
+            lo, hi = v.min(0), v.max(0)
+            z = jnp.clip((v - lo) / (hi - lo + 1e-12), 0.0, 1.0)
             e = (z ** p) @ w[:nc]
             for k, (i, j) in enumerate(_pairs(nc)):
                 e = e + w[nc + k] * z[:, i] * z[:, j]
@@ -575,30 +826,63 @@ def fit(E, y, *, form="linear", draws=800, warmup=800, chains=4, seed=42):
         sigma = numpyro.sample("sigma", dist.HalfNormal(2.0))
         numpyro.sample("obs", dist.Normal(beta * e, sigma), obs=yj)
 
-    mcmc = MCMC(NUTS(model, target_accept_prob=0.9), num_warmup=warmup,
-                num_samples=draws, num_chains=chains, progress_bar=False)
+    # A channel with no signal leaves its kernel location flat under the prior,
+    # and the sampler has to traverse that ridge without stepping off it, so the
+    # joint model runs at a shorter step than the fixed-column one.
+    mcmc = MCMC(NUTS(model, target_accept_prob=0.95 if joint else 0.9),
+                num_warmup=warmup, num_samples=draws, num_chains=chains,
+                progress_bar=False)
     mcmc.run(jax.random.PRNGKey(seed), jnp.asarray(E), jnp.asarray(y),
              extra_fields=("diverging",))
     return mcmc
 
 
-def posterior_from(mcmc, *, channels, picked, form) -> IndexPosterior:
+def posterior_from(mcmc, *, channels, picked, form, radii=(), stats=(),
+                   radius_kernel="fixed") -> IndexPosterior:
     import arviz as az
 
     idata = az.from_numpyro(mcmc)
-    names = [v for v in ("w", "beta") if v in idata.posterior]
-    rhat = max(float(np.nanmax(np.asarray(az.rhat(idata, var_names=[n])[n])))
-               for n in names)
-    ess = min(float(np.nanmin(np.asarray(az.ess(idata, var_names=[n])[n])))
-              for n in names)
     s = mcmc.get_samples()
-    return IndexPosterior(
+    # A parameter with no posterior variance has no convergence to diagnose:
+    # a one-channel study's weight vector is the constant ``[1.0]``, so its
+    # R-hat is 0/0. Left in, that one NaN propagates through the max and the
+    # sampler-health gate stops firing without ever saying so.
+    names = [v for v in ("w", "beta", "mu", "kw", "kr", "a")
+             if v in idata.posterior
+             and float(np.nanvar(np.asarray(idata.posterior[v]))) > 1e-24]
+
+    def _finite(values) -> np.ndarray:
+        a = np.asarray(values, dtype=np.float64).ravel()
+        return a[np.isfinite(a)]
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        rhats = np.concatenate(
+            [_finite(az.rhat(idata, var_names=[n])[n]) for n in names]
+            or [np.array([])])
+        esss = np.concatenate(
+            [_finite(az.ess(idata, var_names=[n])[n]) for n in names]
+            or [np.array([])])
+    rhat = float(rhats.max()) if rhats.size else float("nan")
+    ess = float(esss.min()) if esss.size else float("nan")
+    post = IndexPosterior(
         weights=np.asarray(s["w"]), beta=np.asarray(s["beta"]),
         powers=np.asarray(s["p"]) if "p" in s else None,
         channels=tuple(channels), picked=tuple(picked), form=form,
         rhat_max=rhat, ess_min=ess,
         divergences=int(np.sum(mcmc.get_extra_fields()["diverging"])),
+        sigma=np.asarray(s["sigma"]) if "sigma" in s else None,
+        radius_weights=np.asarray(s["radius_w"]) if "radius_w" in s else None,
+        peak_radius=np.exp(np.asarray(s["mu"])) if "mu" in s else None,
+        kernel_width=np.asarray(s["kw"]) if "kw" in s else None,
+        aggregator_weights=np.asarray(s["a"]) if "a" in s else None,
+        radii=tuple(int(r) for r in radii), stats=tuple(stats),
+        radius_kernel=radius_kernel,
     )
+    # The grid is in the model, so the cell the composite is built from is the
+    # posterior's own projection rather than a pick made before it ran.
+    if post.radius_weights is not None and post.aggregator_weights is not None:
+        post.picked = post.projected_pick()
+    return post
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -803,24 +1087,55 @@ def holdout_gain(X, y, *, channels, channel_index, radius_idx=None,
 
 
 def _null_fit(task):
-    E, y, form, seed = task
+    """One permuted refit. Reads the exposure from a memmap, not from the pipe.
+
+    The joint model is handed the whole grid, which is orders of magnitude
+    larger than a column per channel; sending a copy to each of n workers is
+    what exhausts the pipe rather than the fitting.
+    """
+    path, shape, y, form, seed, kwargs = task
+    E = np.asarray(np.memmap(path, dtype=np.float64, mode="r", shape=shape))
     yp = np.random.default_rng(seed).permutation(y)
-    m = fit(E, yp, form=form, draws=300, warmup=300, chains=2, seed=seed)
+    m = fit(E, yp, form=form, draws=300, warmup=300, chains=2, seed=seed,
+            **kwargs)
     b = np.asarray(m.get_samples()["beta"])
     lo, hi = np.percentile(b, [2.5, 97.5])
     return int(lo > 0 or hi < 0)
 
 
 def null_calibration(E, y, *, form="linear", n=16, workers=None,
-                     cancel_check=None):
+                     cancel_check=None, **fit_kwargs):
     """How often the beta interval excludes zero on a permuted outcome (~5 %).
+
+    ``E`` and ``fit_kwargs`` are handed to :func:`fit` unchanged, so passing the
+    full grid re-estimates the radius profile and the aggregator blend on every
+    permuted refit. What that prices in is exactly what the model contains: with
+    the grid inside, the scale and the aggregator are integrated over rather
+    than selected, and this rate covers them. What it cannot cover is anything
+    still decided outside — the functional form, the channel list, the covariate
+    set — so a clean rate here is not a licence to read the interval as though
+    those had been pre-specified.
 
     One fit per process: numpyro recompiles per call, so a serial loop pays the
     JAX compile n times over.
     """
-    tasks = [(E, y, form, 3_000 + i) for i in range(n)]
-    n_workers = workers or min(n, parallel.process_worker_count(n))
-    hits = _map(_null_fit, tasks, n_workers, cancel_check)
+    E = np.ascontiguousarray(np.asarray(E, dtype=np.float64))
+    fd, path = tempfile.mkstemp(suffix=".geofuse-null")
+    os.close(fd)
+    try:
+        mm = np.memmap(path, dtype=np.float64, mode="w+", shape=E.shape)
+        mm[:] = E
+        mm.flush()
+        del mm
+        tasks = [(path, E.shape, y, form, 3_000 + i, dict(fit_kwargs))
+                 for i in range(n)]
+        n_workers = workers or min(n, parallel.process_worker_count(n))
+        hits = _map(_null_fit, tasks, n_workers, cancel_check)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
     return {"runs": n, "excluded_zero": int(sum(hits)),
             "rate": float(sum(hits)) / max(n, 1)}
 

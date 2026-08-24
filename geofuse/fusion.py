@@ -3242,6 +3242,8 @@ class MetricFusionEngine:
         draws: int = 800,
         warmup: int = 800,
         chains: int = 4,
+        radius_kernel: str = "lognormal",
+        aggregator: str = "dirichlet",
         seed: int = 42,
         cancel_callback: Callable[..., bool] | None = None,
         progress_callback: Callable[[int, int], None] | None = None,
@@ -3331,20 +3333,34 @@ class MetricFusionEngine:
         )
         tick()
 
-        E = Xr.reshape(len(Xr), -1)[:, list(res.columns)]
+        # The posterior gets the whole grid, not the sweep's pick: the radius
+        # profile and the aggregator blend are sampled with the weights, so the
+        # interval on the effect carries their uncertainty instead of being
+        # conditioned on a choice made before the sampler ran. The sweep's pick
+        # stays in the bundle as a diagnostic and as the shortlist that decided
+        # the functional form.
+        grid = Xr[:, channel_index, :, :]
+        radius_mask = np.zeros((len(index_channels), len(radii)), dtype=bool)
+        for ci, allowed in enumerate(radius_idx):
+            radius_mask[ci, list(allowed)] = True
+        grid_kwargs = dict(
+            radii=radii, stats=stats, radius_mask=radius_mask,
+            radius_kernel=radius_kernel, aggregator=aggregator,
+        )
         if cancelled():
             raise JobCancelled("Index posterior cancelled by user.")
         mcmc = bayesian_index.fit(
-            E, yr, form=res.form, draws=draws, warmup=warmup,
-            chains=chains, seed=seed,
+            grid, yr, form=res.form, draws=draws, warmup=warmup,
+            chains=chains, seed=seed, **grid_kwargs,
         )
         post = bayesian_index.posterior_from(
-            mcmc, channels=index_channels, picked=res.picked, form=res.form
+            mcmc, channels=index_channels, picked=res.picked, form=res.form,
+            radii=radii, stats=stats, radius_kernel=radius_kernel,
         )
         null = (
             bayesian_index.null_calibration(
-                E, yr, form=res.form, n=null_runs, workers=workers,
-                cancel_check=cancelled,
+                grid, yr, form=res.form, n=null_runs, workers=workers,
+                cancel_check=cancelled, **grid_kwargs,
             )
             if null_runs
             else {}
@@ -3385,7 +3401,7 @@ class MetricFusionEngine:
             "OK",
             f"Bayesian index fitted in {params['__elapsed_s__']:.0f}s "
             f"(R-hat {post.rhat_max:.3f}, ESS {post.ess_min:.0f}, "
-            f"{post.divergences} divergences).",
+            f"{post.divergences} divergences). Posterior grid: {post.picked}.",
         )
         return params
 
@@ -3417,12 +3433,19 @@ class MetricFusionEngine:
         return objective
 
     def _params_from_sweep(self, res, post, index_channels) -> dict:
-        """Sweep pick + posterior weights -> the params dict the engine uses."""
+        """Posterior -> the params dict the composite/apply path consumes.
+
+        That path carries one radius and one statistic per channel, so the
+        posterior's blend over the grid is projected onto its modal cell here.
+        The projection is what the composite is built from; the blend and its
+        credible intervals stay in the results bundle, and the effect that gets
+        reported is the one the blend produced, not a refit at the modal cell.
+        """
         formula = cgi_formulas.get_formula(self.cgi_formula)
         params: dict[str, Any] = {}
 
         stat_of = {"mean": ("mean", 50)}
-        for (radius, column), ch in zip(res.picked, index_channels):
+        for (radius, column), ch in zip(post.picked, index_channels):
             stat, pct = stat_of.get(column, ("percentile", 0))
             if column != "mean":
                 pct = int(column[1:])
