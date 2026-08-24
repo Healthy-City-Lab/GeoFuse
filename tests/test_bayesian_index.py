@@ -23,6 +23,7 @@ if ROOT not in sys.path:
 
 import numpy as np
 
+from geofuse import JobCancelled
 from geofuse import bayesian_index as bi
 
 RADII = np.array([200.0, 400.0, 600.0, 800.0])
@@ -130,6 +131,121 @@ class TestNullCalibration(unittest.TestCase):
         # 8 runs is too few to pin 5 %, but a procedure firing on most of them
         # is broken, not merely noisy.
         self.assertLessEqual(out["rate"], 0.5)
+
+
+def _probe(task):
+    """Report the worker's identity and its BLAS thread limit."""
+    return task, os.getpid(), os.environ.get("OMP_NUM_THREADS")
+
+
+class TestPooledMapIsPinned(unittest.TestCase):
+    """The pool's workers must inherit the thread limits as they are created.
+
+    Unpinned, numpy and OpenBLAS reserve ~3.0 GB of commit per worker against a
+    budget that assumes ~0.11 GB, and a pool sized on that budget overdraws the
+    host until unrelated allocations fail. Nothing about the returned numbers
+    shows this, so it needs its own gate.
+    """
+
+    def test_every_worker_runs_with_one_blas_thread(self):
+        got = bi._map(_probe, list(range(8)), 3)
+        self.assertEqual({omp for _, _, omp in got}, {"1"})
+        self.assertGreater(len({pid for _, pid, _ in got}), 1)
+
+    def test_results_come_back_in_task_order(self):
+        got = bi._map(_probe, list(range(8)), 3)
+        self.assertEqual([task for task, _, _ in got], list(range(8)))
+
+    def test_the_parent_environment_is_left_alone(self):
+        before = os.environ.get("OMP_NUM_THREADS")
+        bi._map(_probe, list(range(4)), 2)
+        self.assertEqual(os.environ.get("OMP_NUM_THREADS"), before)
+
+
+class TestWeightsAreOnePerChannel(unittest.TestCase):
+    """A fit's weight vector must be readable without knowing which fit it was.
+
+    The simplex fit drops channels it cannot use, so the surviving set differs
+    from fit to fit. Reporting only the survivors makes position *i* mean a
+    different channel in each vector, and the discovery loop averages weights
+    across dozens of them.
+    """
+
+    @staticmethod
+    def _two_channels(sign):
+        rng = np.random.default_rng(11)
+        E = rng.normal(size=(400, 2))
+        y = -1.2 * E[:, 0] + sign * 0.9 * E[:, 1] + 0.2 * rng.normal(size=400)
+        return E, y
+
+    def test_a_dropped_channel_is_reported_as_a_zero(self):
+        E, y = self._two_channels(1.0)
+        _, params = bi.build_index(E, y, "linear")
+        w = np.asarray(params["weights"])
+        self.assertEqual(len(w), E.shape[1])
+        self.assertAlmostEqual(float(w.sum()), 1.0, places=9)
+        self.assertLess(len(params["kept"]), E.shape[1])
+        self.assertAlmostEqual(float(w[0]), 0.0, places=12)
+
+    def test_the_index_still_matches_the_weights_it_reports(self):
+        E, y = self._two_channels(1.0)
+        apply_fn, params = bi.build_index(E, y, "linear")
+        self.assertTrue(
+            np.allclose(apply_fn(E), E @ np.asarray(params["weights"])))
+
+    def test_fits_with_different_active_sets_stack(self):
+        rows = [
+            np.asarray(bi.build_index(*self._two_channels(s), "linear")[1]["weights"])
+            for s in (1.0, -1.0, 1.0, -1.0)
+        ]
+        self.assertEqual(np.asarray(rows).shape, (4, 2))
+        self.assertEqual(len(np.mean(rows, axis=0)), 2)
+
+    def test_the_discovery_loop_averages_them(self):
+        Xr, yr = _planted(n=500)
+        out = bi.repeated_discovery(
+            Xr, RADII, STATS, yr, channels=("a", "b"), channel_index=(0, 1),
+            reps=2, shuffles=3, workers=1,
+        )
+        self.assertEqual(len(out["per_form"]["linear"]["weights_mean"]), 2)
+        self.assertEqual(len(out["per_form"]["linear"]["weights_sd"]), 2)
+
+
+class TestCancelStopsTheSearch(unittest.TestCase):
+    """Every phase long enough to need a pool has to answer the cancel flag.
+
+    Read only between phases, the flag leaves a stopped job running for as long
+    as the phase it landed in, which for a full grid is the whole search.
+    """
+
+    def test_the_sweep_gives_up_when_the_flag_is_set(self):
+        Xr, yr = _planted(n=400)
+        with self.assertRaises(JobCancelled):
+            bi.sweep(
+                Xr, RADII, STATS, yr, channels=("a", "b"), channel_index=(0, 1),
+                splits=50, workers=1, cancel_check=lambda: True,
+            )
+
+    def test_discovery_and_gain_give_up_too(self):
+        Xr, yr = _planted(n=400)
+        with self.assertRaises(JobCancelled):
+            bi.repeated_discovery(
+                Xr, RADII, STATS, yr, channels=("a", "b"), channel_index=(0, 1),
+                reps=2, shuffles=4, workers=1, cancel_check=lambda: True,
+            )
+        with self.assertRaises(JobCancelled):
+            bi.holdout_gain(
+                Xr, yr, channels=("a", "b"), channel_index=(0, 1),
+                splits=4, perm=4, workers=1, cancel_check=lambda: True,
+            )
+
+    def test_an_unset_flag_changes_nothing(self):
+        Xr, yr = _planted(n=400)
+        res = bi.sweep(
+            Xr, RADII, STATS, yr, channels=("a", "b"), channel_index=(0, 1),
+            splits=6, workers=1, cancel_check=lambda: False,
+        )
+        self.assertEqual(res.picked[1], (int(RADII[2]), STATS[1]))
 
 
 class TestSimplexFit(unittest.TestCase):

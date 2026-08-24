@@ -29,11 +29,12 @@ import itertools
 import math
 import os
 import tempfile
-from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 
 import numpy as np
 from scipy.optimize import minimize
+
+from geofuse import JobCancelled
 
 from . import parallel
 
@@ -71,17 +72,61 @@ def prep(X: np.ndarray, y: np.ndarray, covariates: np.ndarray | None):
     return yr, flat.reshape(X.shape)
 
 
-def _map(fn, tasks, n_workers: int):
+def _raise_if_cancelled(cancel_check) -> None:
+    """Abandon the phase if the job's cancel flag is up.
+
+    Every loop long enough to be worth parallelising is long enough to outlast
+    a user's patience, so each one answers the flag itself rather than leaving
+    it to the boundaries between phases.
+    """
+    if cancel_check is not None and cancel_check():
+        raise JobCancelled("Index search cancelled by user.")
+
+
+def _indexed(position: int, fn, task):
+    """``fn(task)`` tagged with its position, so a pool may return out of order."""
+    return position, fn(task)
+
+
+def _map(fn, tasks, n_workers: int, cancel_check=None):
     """``fn`` over ``tasks``, in a process pool unless one worker was asked for.
 
     A single worker runs in-process. Spawning costs more than it saves at that
     width, and it keeps the parallel loops usable in an interpreter where spawn
     is unavailable, which is what a caller passing ``workers=1`` usually wants.
+
+    Wider than that, the pool comes from :mod:`geofuse.parallel`, whose workers
+    are created with the BLAS thread limits already in their environment. That
+    holds each worker to ~0.11 GB of reserved commit instead of the ~3.0 GB
+    numpy and OpenBLAS take when left to size themselves for the whole host, and
+    it is the figure :func:`parallel.process_worker_count` budgets against: a
+    pool built any other way overdraws the host by more than an order of
+    magnitude, and small allocations then fail machine-wide.
     """
+    tasks = list(tasks)
+    n_workers = min(n_workers, len(tasks))
     if n_workers <= 1:
-        return [fn(t) for t in tasks]
-    with ProcessPoolExecutor(max_workers=n_workers) as ex:
-        return list(ex.map(fn, tasks, chunksize=1))
+        out = []
+        for t in tasks:
+            _raise_if_cancelled(cancel_check)
+            out.append(fn(t))
+        return out
+    out: list = [None] * len(tasks)
+
+    def collect(result):
+        position, value = result
+        out[position] = value
+
+    finished = parallel.map_batches(
+        _indexed,
+        [(i, fn, t) for i, t in enumerate(tasks)],
+        workers=n_workers,
+        on_result=collect,
+        cancel_check=cancel_check,
+    )
+    if not finished:
+        raise JobCancelled("Index search cancelled by user.")
+    return out
 
 
 def _pairs(k: int) -> list[tuple[int, int]]:
@@ -264,7 +309,7 @@ def _decode(columns, n_radii, n_stats, radii, stats):
 
 def sweep(X, radii, stats, y, *, channels, channel_index, radius_idx=None,
           forms=FORMS, splits=40, frac=0.25, seed=0, workers=None,
-          objective=None, rescore_top=50):
+          objective=None, rescore_top=50, cancel_check=None):
     """Exhaustive grid over (radius, stat) per channel, then over the form.
 
     The linear grid is solved in closed form and swept exhaustively. The
@@ -296,7 +341,7 @@ def sweep(X, radii, stats, y, *, channels, channel_index, radius_idx=None,
         tasks = [(path, flat.shape, combos, y, seed + s, frac)
                  for s in range(splits)]
         n_workers = workers or parallel.process_worker_count(len(tasks))
-        surface = np.array(_map(_sweep_split, tasks, n_workers))
+        surface = np.array(_map(_sweep_split, tasks, n_workers, cancel_check))
     finally:
         try:
             os.unlink(path)
@@ -308,7 +353,8 @@ def sweep(X, radii, stats, y, *, channels, channel_index, radius_idx=None,
     if objective is not None and len(combos) > 1:
         shortlist = np.argsort(-mean)[: max(1, int(rescore_top))]
         objective_surface = _rescore(flat, y, combos, shortlist, objective,
-                                     splits=splits, frac=frac, seed=seed)
+                                     splits=splits, frac=frac, seed=seed,
+                                     cancel_check=cancel_check)
         # Candidates outside the shortlist keep -inf so they cannot win, and the
         # one-SE rule below reads the same surface the winner came from.
         obj_mean = np.full(len(combos), -np.inf)
@@ -345,7 +391,8 @@ def sweep(X, radii, stats, y, *, channels, channel_index, radius_idx=None,
     if "synergy" in forms and len(channels) > 1:
         syn = _score_form_at(flat[:, list(combos[best])], y, "synergy",
                              splits=splits, frac=frac, seed=seed,
-                             workers=workers, objective=objective)
+                             workers=workers, objective=objective,
+                             cancel_check=cancel_check)
         form_scores["synergy"] = syn
         if syn > chosen_score:
             chosen_form, chosen_score = "synergy", syn
@@ -358,7 +405,8 @@ def sweep(X, radii, stats, y, *, channels, channel_index, radius_idx=None,
     )
 
 
-def _rescore(flat, y, combos, shortlist, objective, *, splits, frac, seed):
+def _rescore(flat, y, combos, shortlist, objective, *, splits, frac, seed,
+             cancel_check=None):
     """Score a shortlist of candidates with the job's objective, same splits.
 
     Weights still come from the closed-form simplex fit on the training rows;
@@ -367,6 +415,7 @@ def _rescore(flat, y, combos, shortlist, objective, *, splits, frac, seed):
     """
     out = np.zeros((splits, len(shortlist)))
     for si in range(splits):
+        _raise_if_cancelled(cancel_check)
         te = np.random.default_rng(seed + si).random(len(y)) < frac
         tr = ~te
         ztr = flat[tr]
@@ -408,27 +457,37 @@ def _form_split(task):
 
 
 def _score_form_at(E, y, form, *, splits, frac, seed, workers=None,
-                   objective=None):
+                   objective=None, cancel_check=None):
     if objective is not None:
-        return float(np.mean([
-            _form_split_objective(E, y, form, seed + s, frac, objective)
-            for s in range(splits)
-        ]))
+        scores = []
+        for s in range(splits):
+            _raise_if_cancelled(cancel_check)
+            scores.append(
+                _form_split_objective(E, y, form, seed + s, frac, objective))
+        return float(np.mean(scores))
     tasks = [(E, y, form, seed + s, frac) for s in range(splits)]
     n_workers = workers or parallel.process_worker_count(len(tasks))
-    return float(np.mean(_map(_form_split, tasks, n_workers)))
+    return float(np.mean(_map(_form_split, tasks, n_workers, cancel_check)))
 
 
 def build_index(E_train, y_train, form):
-    """Fit the chosen form on training rows; return ``(apply_fn, params)``."""
+    """Fit the chosen form on training rows; return ``(apply_fn, params)``.
+
+    ``weights`` carries one entry per channel, zero where the simplex fit's
+    active set dropped one, so position *i* always means channel *i*. A vector
+    holding only the surviving channels would change length with the fit, and
+    weights from different fits could then neither be compared nor averaged.
+    """
     if form == "linear":
+        k = E_train.shape[1]
         fit = simplex_fit(E_train.T @ E_train, E_train.T @ y_train)
         if fit is None:
-            k = E_train.shape[1]
             sub, w = np.arange(k), np.full(k, 1.0 / k)
         else:
             sub, w = fit
-        return (lambda M: M[:, sub] @ w), {"weights": w, "kept": sub}
+        dense = np.zeros(k)
+        dense[sub] = w
+        return (lambda M: M @ dense), {"weights": dense, "kept": sub}
     sf = fit_synergy(E_train, y_train)
     return sf.apply, {"weights": sf.w, "powers": sf.p}
 
@@ -586,7 +645,7 @@ def _discovery_shuffle(task):
 
 def repeated_discovery(X, radii, stats, y, *, channels, channel_index,
                        radius_idx=None, forms=FORMS, reps=5, shuffles=12,
-                       frac=0.25, seed=0, workers=None):
+                       frac=0.25, seed=0, workers=None, cancel_check=None):
     """Independent repeats of sweep -> fit -> score.
 
     Each replicate gets its own seed stream, so agreement across replicates is
@@ -609,7 +668,7 @@ def repeated_discovery(X, radii, stats, y, *, channels, channel_index,
                   10_000 * (rep + 1) + b, frac)
                  for rep in range(reps) for b in range(shuffles)]
         n_workers = workers or parallel.process_worker_count(len(tasks))
-        res = [r for r in _map(_discovery_shuffle, tasks, n_workers)
+        res = [r for r in _map(_discovery_shuffle, tasks, n_workers, cancel_check)
                if r is not None]
     finally:
         try:
@@ -697,7 +756,7 @@ def _gain_split(task):
 
 def holdout_gain(X, y, *, channels, channel_index, radius_idx=None,
                  forms=FORMS, splits=20, perm=100, frac=0.25, seed=0,
-                 workers=None):
+                 workers=None, cancel_check=None):
     """Composite vs each standalone, with a permutation null on the *gain*."""
     n_radii, n_stats = X.shape[2], X.shape[3]
     if radius_idx is None:
@@ -719,8 +778,8 @@ def holdout_gain(X, y, *, channels, channel_index, radius_idx=None,
                   cols, cols, tuple(forms), 5_000 + i, frac)
                  for i in range(perm)]
         n_workers = workers or parallel.process_worker_count(len(base) + len(nulls))
-        obs = _map(_gain_split, base, n_workers)
-        null = _map(_gain_split, nulls, n_workers)
+        obs = _map(_gain_split, base, n_workers, cancel_check)
+        null = _map(_gain_split, nulls, n_workers, cancel_check)
     finally:
         try:
             os.unlink(path)
@@ -752,7 +811,8 @@ def _null_fit(task):
     return int(lo > 0 or hi < 0)
 
 
-def null_calibration(E, y, *, form="linear", n=16, workers=None):
+def null_calibration(E, y, *, form="linear", n=16, workers=None,
+                     cancel_check=None):
     """How often the beta interval excludes zero on a permuted outcome (~5 %).
 
     One fit per process: numpyro recompiles per call, so a serial loop pays the
@@ -760,7 +820,7 @@ def null_calibration(E, y, *, form="linear", n=16, workers=None):
     """
     tasks = [(E, y, form, 3_000 + i) for i in range(n)]
     n_workers = workers or min(n, parallel.process_worker_count(n))
-    hits = _map(_null_fit, tasks, n_workers)
+    hits = _map(_null_fit, tasks, n_workers, cancel_check)
     return {"runs": n, "excluded_zero": int(sum(hits)),
             "rate": float(sum(hits)) / max(n, 1)}
 

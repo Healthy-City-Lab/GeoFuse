@@ -559,25 +559,23 @@ def stripe_to_test_blocks(
 
 
 def catchment_radius(
-    veg_radius: float,
-    terrain_radius: float,
-    ndvi_radius: float,
+    radii: dict[str, float],
     active_channel: str | None = None,
 ) -> float:
     """Per-trial catchment radius for the point/line collapse.
 
     ``active_channel``'s radius for a standalone study (only that channel
-    contributes to the score), or the largest of the three for the combined
-    CGI run (every channel feeds the per-pixel composite).
+    contributes to the score), or the largest in ``radii`` for a combined CGI
+    run (every channel feeds the per-pixel composite). ``radii`` is keyed by
+    channel name, so a two-channel study and a three-channel one both answer
+    from their own set rather than from a fixed triple.
     """
+    if not radii:
+        return 0.0
     ch = active_channel or "cgi"
-    if ch == "veg":
-        return float(veg_radius)
-    if ch == "terrain":
-        return float(terrain_radius)
-    if ch == "ndvi":
-        return float(ndvi_radius)
-    return float(max(veg_radius, terrain_radius, ndvi_radius))
+    if ch in radii:
+        return float(radii[ch])
+    return float(max(radii.values()))
 
 
 def split_control_matrix(

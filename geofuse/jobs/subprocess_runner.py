@@ -36,6 +36,14 @@ MSG_ERROR = "error"
 # Name of the daemon thread installed by :func:`exit_with_parent`.
 _PARENT_GUARD_THREAD = "parent-exit-guard"
 
+# How long a cancelled child gets to wind itself down before the parent stops
+# waiting for it. Cancellation is cooperative — the child answers the flag at
+# the next point its current phase checks — but a phase that cannot answer at
+# all (an in-flight NUTS run, an exact MixedLM refit) would otherwise hold a
+# "stopping" job open for as long as it takes to finish. Past this, the parent
+# reports the cancel and force-kills, which is what the user asked for.
+CANCEL_GRACE_S = 120.0
+
 
 def exit_with_parent() -> None:
     """Bind this child's lifetime to its parent's.
@@ -275,6 +283,7 @@ def drain_events_until_done(
     cancel_event,
     process_handle=None,
     poll_timeout: float = 0.5,
+    cancel_grace_s: float = CANCEL_GRACE_S,
 ):
     """Loop on ``event_queue.get(...)`` until a terminal message arrives.
 
@@ -293,17 +302,26 @@ def drain_events_until_done(
     Returns one of:
       ``("completed", output_paths: list[str])``
       ``("error",     (short_msg: str, traceback_text: str))``
-      ``("cancelled", None)``  — only if ``cancel_event`` was set *and* the
-                                 child died without sending COMPLETE/ERROR.
+      ``("cancelled", None)``  — ``cancel_event`` was set and the child either
+                                 died without sending COMPLETE/ERROR or spent
+                                 ``cancel_grace_s`` failing to wind down.
 
     The caller is responsible for joining ``process_handle`` after this
-    function returns.
+    function returns, and for killing it when the return is ``cancelled`` —
+    that case does not imply the child has exited.
     """
     import queue as _queue
 
     from geofuse.logger import _log_queue
 
+    cancel_deadline: float | None = None
+
     while True:
+        if cancel_event.is_set():
+            if cancel_deadline is None:
+                cancel_deadline = time.monotonic() + max(0.0, cancel_grace_s)
+            elif time.monotonic() >= cancel_deadline:
+                return ("cancelled", None)
         try:
             item = event_queue.get(timeout=poll_timeout)
         except (_queue.Empty, EOFError):

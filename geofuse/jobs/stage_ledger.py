@@ -173,6 +173,21 @@ class StageLedger:
     def mark_failed(self, key: str, message: str = "") -> None:
         self.set_status(key, FAILED, message=message)
 
+    def stop_running(self, status: str = FAILED, message: str = "") -> str | None:
+        """Close the clock on whatever stage was still running, and return its key.
+
+        A stage's duration is measured against the wall clock until its
+        ``ended_at`` is filled in, so a run that ends anywhere other than a
+        stage boundary leaves the monitor counting a stage that stopped long
+        ago. Ending the run is what stops the stage.
+        """
+        stopped = None
+        for s in self._stages:
+            if s.status == RUNNING:
+                self.set_status(s.key, status, message=message or None)
+                stopped = s.key
+        return stopped
+
     def timing_report(self) -> list[tuple[str, str, float, float]]:
         """``(key, label, seconds, share)`` per timed stage, longest first.
 

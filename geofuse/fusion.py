@@ -1820,6 +1820,16 @@ class MetricFusionEngine:
             if looked_up is not None:
                 return looked_up
 
+        # A channel with no source layer is served only from the cache, so a
+        # miss cannot be recovered by aggregating — there is nothing to
+        # aggregate. Falling through would silently reduce the wrong metric.
+        if metric_data is None:
+            raise RuntimeError(
+                f"Channel {channel!r} is stored in the pre-aggregation cache "
+                f"and has no source layer, but radius {radius_m} with "
+                f"stat={stat!r} percentile={percentile!r} is not in the cache."
+            )
+
         # Fell through the fast path (or pre-aggregation off): the ring-cache and
         # circular-buffer routines need geometry, so re-materialize it if a
         # geometry-free slice was passed in (see the fast path in ``_objective``).
@@ -2030,6 +2040,22 @@ class MetricFusionEngine:
         if self._preaggr_entity_gdf is not None:
             _helpers.downcast_fusion_dtypes(self._preaggr_entity_gdf)
 
+    @staticmethod
+    def _channel_column(fusion_df: pd.DataFrame, channel: str):
+        """A channel's per-pixel values out of the prepared frame, or ``None``.
+
+        The frame carries the source layers. ``gvi`` is not one of them — it is
+        the per-pixel sum of the two street-view components, which is what the
+        cache stores under that name.
+        """
+        if channel in fusion_df.columns:
+            return fusion_df[channel]
+        if channel == "gvi" and {"veg", "terrain"} <= set(fusion_df.columns):
+            return pd.to_numeric(fusion_df["veg"], errors="coerce") + pd.to_numeric(
+                fusion_df["terrain"], errors="coerce"
+            )
+        return None
+
     def _compute_channel_scale(self, fusion_df: pd.DataFrame) -> None:
         """Fix per-channel [0, 1] min-max bounds from the predictor distribution.
 
@@ -2042,11 +2068,16 @@ class MetricFusionEngine:
             self._channel_minmax = None
             return
         bounds: dict[str, tuple[float, float]] = {}
-        for ch in ("veg", "terrain", "ndvi"):
-            if ch not in fusion_df.columns:
+        # Every channel the cache can hold, so a two-channel study's ``gvi``
+        # gets real bounds instead of the (0, 1) fallback, which would clip it.
+        # The prepared frame carries the source layers only; ``gvi`` is their
+        # per-pixel sum, which is the distribution its bounds describe.
+        for ch in preaggregation.GreeneryCache.ALL_CHANNELS:
+            column = self._channel_column(fusion_df, ch)
+            if column is None:
                 bounds[ch] = (0.0, 1.0)
                 continue
-            vals = pd.to_numeric(fusion_df[ch], errors="coerce").to_numpy(np.float64)
+            vals = pd.to_numeric(column, errors="coerce").to_numpy(np.float64)
             vals = vals[np.isfinite(vals)]
             if vals.size == 0:
                 bounds[ch] = (0.0, 1.0)
@@ -2059,12 +2090,12 @@ class MetricFusionEngine:
         self._channel_minmax = bounds
         _log("INFO", f"Channel normalization bounds (2–98 pct): {bounds}")
 
-    def _normalize_channel_arrays(
-        self, veg: np.ndarray, terrain: np.ndarray, ndvi: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _normalize_channels(
+        self, blocks: dict[str, np.ndarray]
+    ) -> dict[str, np.ndarray]:
         """Min-max scale each channel to [0, 1] using the fixed bounds, or pass through."""
         if not self.normalize_channels or not self._channel_minmax:
-            return veg, terrain, ndvi
+            return blocks
 
         def _scale(a: np.ndarray, ch: str) -> np.ndarray:
             lo, hi = self._channel_minmax.get(ch, (0.0, 1.0))
@@ -2078,7 +2109,115 @@ class MetricFusionEngine:
             dt = arr.dtype.type
             return np.clip((arr - dt(lo)) / dt(hi - lo), dt(0.0), dt(1.0))
 
-        return _scale(veg, "veg"), _scale(terrain, "terrain"), _scale(ndvi, "ndvi")
+        return {ch: _scale(a, ch) for ch, a in blocks.items()}
+
+    # ────────────────────────────────────────────────────────────
+    # ── Channel vocabulary ──────────────────────────────────────
+    # A job's channels are whatever its formula consumes: ``(ndvi, gvi)`` for a
+    # two-channel study, ``(ndvi, veg, terrain)`` for a three-channel one. The
+    # composite path reads that set rather than assuming the three-channel
+    # names, so both configurations reach the scoring, apply and map stages.
+
+    def _composite_channels(self) -> tuple[str, ...]:
+        """Channels this job's composite is built from, in formula order."""
+        mode = self._active_greenery_channel
+        if mode != "cgi":
+            return (mode,)
+        return tuple(cgi_formulas.formula_channels(self.cgi_formula))
+
+    def _channel_active(self, params: dict) -> dict[str, bool]:
+        """Which of this job's channels contribute at ``params``."""
+        mode = self._active_greenery_channel
+        if mode != "cgi":
+            return {mode: True}
+        return cgi_formulas.get_formula(self.cgi_formula).channel_active(params)
+
+    def _channel_spec(self, params: dict, channel: str) -> tuple[float, str, int]:
+        """``(radius, stat, percentile)`` for one channel out of a params dict.
+
+        NDVI carries its own statistic; every street-view channel — ``veg``,
+        ``terrain`` and the combined ``gvi`` — shares one, which is how the
+        search records it.
+        """
+        if channel == "ndvi":
+            return (
+                params.get("ndvi_radius", int(round(self.ndvi_buffer_max_m))),
+                params.get("ndvi_stat", "mean"),
+                params.get("ndvi_percentile", 50),
+            )
+        return (
+            params.get(f"{channel}_radius", int(round(self.gvi_buffer_max_m))),
+            params.get("streetview_stat", "mean"),
+            params.get("streetview_percentile", 50),
+        )
+
+    def _channel_radii(self, params: dict) -> dict[str, float]:
+        """``{channel: radius}`` over this job's channels, for the entity collapse."""
+        return {
+            ch: float(self._channel_spec(params, ch)[0])
+            for ch in self._composite_channels()
+        }
+
+    def _channel_source(self, channel: str):
+        """The metric layer a channel aggregates from, or ``None`` if it has none.
+
+        ``gvi`` is a stored cache channel rather than a layer: its percentiles
+        are not recoverable from the components, so it is written during
+        pre-aggregation and only ever read back.
+        """
+        return {
+            "veg": self.veg_data,
+            "terrain": self.terrain_data,
+            "ndvi": self.ndvi_data,
+        }.get(channel)
+
+    def _aggregate_channels(
+        self,
+        points_gdf,
+        params: dict,
+        *,
+        subset: str,
+        fold_idx: int = -1,
+        channels: tuple[str, ...] | None = None,
+    ) -> dict[str, np.ndarray]:
+        """``{channel: aggregated values}`` at ``params`` for the rows given.
+
+        A channel the formula gives no weight to is returned as zeros rather
+        than aggregated, which is what makes a sparse weight vector cheap.
+        """
+        chans = self._composite_channels() if channels is None else channels
+        active = self._channel_active(params)
+        out: dict[str, np.ndarray] = {}
+        for ch in chans:
+            if not active.get(ch, False):
+                out[ch] = np.zeros(len(points_gdf), dtype=np.float32)
+                continue
+            radius, stat, pct = self._channel_spec(params, ch)
+            out[ch] = self._aggregate_with_ring_cache(
+                points_gdf,
+                self._channel_source(ch),
+                radius,
+                stat,
+                pct,
+                channel=ch,
+                fold_idx=fold_idx,
+                subset=subset,
+            )
+        return out
+
+    def _composite_from(
+        self, params: dict, blocks: dict[str, np.ndarray]
+    ) -> np.ndarray:
+        """Build the composite from normalized channel blocks via the active mode.
+
+        CGI mode delegates to the formula; standalone mode takes its single
+        channel directly, so the reported score is on the scale the search
+        optimized against.
+        """
+        mode = self._active_greenery_channel
+        if mode == "cgi":
+            return compute_cgi(self.cgi_formula, params, blocks)
+        return blocks[mode]
 
     # ────────────────────────────────────────────────────────────
     # ── Pre-aggregation grid ────────────────────────────────────
@@ -3152,13 +3291,14 @@ class MetricFusionEngine:
         ]
 
         workers = parallel.process_worker_count()
-        if cancelled():
-            raise RuntimeError("Cancelled before the sweep.")
+        # Every stage below takes minutes and runs a process pool, so the flag
+        # travels into them rather than being read only between them.
         res = bayesian_index.sweep(
             Xr, radii, stats, yr, channels=index_channels,
             channel_index=channel_index, radius_idx=radius_idx,
             forms=forms, splits=sweep_splits, seed=seed, workers=workers,
             objective=self._sweep_objective(metric),
+            cancel_check=cancelled,
         )
         tick()
         _log(
@@ -3172,7 +3312,7 @@ class MetricFusionEngine:
                 Xr, radii, stats, yr, channels=index_channels,
                 channel_index=channel_index, radius_idx=radius_idx,
                 forms=forms, reps=reps, shuffles=shuffles, seed=seed,
-                workers=workers,
+                workers=workers, cancel_check=cancelled,
             )
             if reps and shuffles
             else {}
@@ -3184,6 +3324,7 @@ class MetricFusionEngine:
                 Xr, yr, channels=index_channels, channel_index=channel_index,
                 radius_idx=radius_idx, forms=forms, splits=gain_splits,
                 perm=gain_perm, seed=seed, workers=workers,
+                cancel_check=cancelled,
             )
             if gain_splits and len(index_channels) > 1
             else {}
@@ -3191,6 +3332,8 @@ class MetricFusionEngine:
         tick()
 
         E = Xr.reshape(len(Xr), -1)[:, list(res.columns)]
+        if cancelled():
+            raise JobCancelled("Index posterior cancelled by user.")
         mcmc = bayesian_index.fit(
             E, yr, form=res.form, draws=draws, warmup=warmup,
             chains=chains, seed=seed,
@@ -3200,7 +3343,8 @@ class MetricFusionEngine:
         )
         null = (
             bayesian_index.null_calibration(
-                E, yr, form=res.form, n=null_runs, workers=workers
+                E, yr, form=res.form, n=null_runs, workers=workers,
+                cancel_check=cancelled,
             )
             if null_runs
             else {}
@@ -5603,117 +5747,26 @@ class MetricFusionEngine:
 
         logger.info("Evaluating on held-out test set...")
 
-        # Use the engine's active mode to decide which channels contribute and
-        # how the composite is built. CGI mode delegates to the formula's
-        # ``channel_active`` + ``compute_cgi``; standalone mode uses the active
-        # channel directly so the test score is on the same scale the study
-        # optimized against.
-        channel_mode = self._active_greenery_channel
-        if channel_mode == "cgi":
-            channel_active = cgi_formulas.get_formula(self.cgi_formula).channel_active(
-                params
-            )
-        else:
-            channel_active = {
-                "veg": channel_mode == "veg",
-                "terrain": channel_mode == "terrain",
-                "ndvi": channel_mode == "ndvi",
-            }
-
-        # Extract aggregation parameters
-        streetview_stat = params.get("streetview_stat", "mean")
-        streetview_percentile = params.get("streetview_percentile", 50)
-        veg_radius = params.get("veg_radius", int(round(self.gvi_buffer_max_m)))
-        terrain_radius = params.get("terrain_radius", int(round(self.gvi_buffer_max_m)))
-        ndvi_stat = params.get("ndvi_stat", "mean")
-        ndvi_percentile = params.get("ndvi_percentile", 50)
-        ndvi_radius = params.get("ndvi_radius", int(round(self.ndvi_buffer_max_m)))
-
-        # Apply dynamic circular buffer aggregation
-        # Both points and rasters use the same approach (rasters converted to points)
+        # Apply dynamic circular buffer aggregation over this job's own channel
+        # set. Both points and rasters use the same approach (rasters converted
+        # to points).
         # .loc with an index array materialises a new frame; read-only below.
         test_points = self.target_gdf.loc[self.test_data.index]
-
-        # Sample vegetation with optimized radius/stat
-        if channel_active["veg"]:
-            test_veg = self._aggregate_with_ring_cache(
-                test_points,
-                self.veg_data,
-                veg_radius,
-                streetview_stat,
-                streetview_percentile,
-                channel="veg",
-                fold_idx=-1,
-                subset="test",
-            )
-        else:
-            test_veg = np.zeros(len(test_points), dtype=np.float32)
-
-        # Sample terrain with optimized radius/stat
-        if channel_active["terrain"]:
-            test_terrain = self._aggregate_with_ring_cache(
-                test_points,
-                self.terrain_data,
-                terrain_radius,
-                streetview_stat,
-                streetview_percentile,
-                channel="terrain",
-                fold_idx=-1,
-                subset="test",
-            )
-        else:
-            test_terrain = np.zeros(len(test_points), dtype=np.float32)
-
-        # Sample NDVI with optimized radius/stat
-        if channel_active["ndvi"]:
-            test_ndvi = self._aggregate_with_ring_cache(
-                test_points,
-                self.ndvi_data,
-                ndvi_radius,
-                ndvi_stat,
-                ndvi_percentile,
-                channel="ndvi",
-                fold_idx=-1,
-                subset="test",
-            )
-        else:
-            test_ndvi = np.zeros(len(test_points), dtype=np.float32)
+        test_blocks = self._aggregate_channels(test_points, params, subset="test")
 
         # Per-channel scaling removed — the composite uses raw aggregated
         # channels. ``whole_grid_scaling`` normalizes the composite below.
-        test_combined = np.column_stack([test_veg, test_terrain, test_ndvi])
+        test_combined = np.column_stack(list(test_blocks.values()))
         test_valid_mask = ~np.isnan(test_combined).any(axis=1)
 
         if test_valid_mask.sum() == 0:
             raise ValueError("No valid test data after aggregation")
 
-        test_veg_norm = test_combined[:, 0]
-        test_terrain_norm = test_combined[:, 1]
-        test_ndvi_norm = test_combined[:, 2]
-        test_veg_norm, test_terrain_norm, test_ndvi_norm = (
-            self._normalize_channel_arrays(
-                test_veg_norm, test_terrain_norm, test_ndvi_norm
-            )
-        )
-
-        # Calculate composite via the active mode. Same fork as ``_objective``
+        # Calculate composite via the active mode. Same fork as ``apply_fusion``
         # so the held-out score is on the same scale the study optimized.
-        if channel_mode == "cgi":
-            test_composite = compute_cgi(
-                self.cgi_formula,
-                params,
-                {
-                    "veg": test_veg_norm,
-                    "terrain": test_terrain_norm,
-                    "ndvi": test_ndvi_norm,
-                },
-            )
-        else:
-            test_composite = {
-                "veg": test_veg_norm,
-                "terrain": test_terrain_norm,
-                "ndvi": test_ndvi_norm,
-            }[channel_mode]
+        test_composite = self._composite_from(
+            params, self._normalize_channels(test_blocks)
+        )
 
         # Composite-level [0, 1] normalization (raw when the toggle is off),
         # mirrored for standalone single-channel composites.
@@ -5736,10 +5789,7 @@ class MetricFusionEngine:
         # the shape the MixedLM scorer expects.
         if test_static["has_pid"]:
             catchment_r = _helpers.catchment_radius(
-                veg_radius,
-                terrain_radius,
-                ndvi_radius,
-                self._active_greenery_channel,
+                self._channel_radii(params), self._active_greenery_channel
             )
             test_mask = _helpers.entity_collapse_mask(self.test_data, catchment_r)
             test_composite = self._collapse_mean_from_codes(
@@ -5838,13 +5888,14 @@ class MetricFusionEngine:
     def build_channel_design(self, params: dict, subset: str = "train_val") -> dict:
         """Per-entity raw channel values for the CGI-vs-standalone AIC/BIC test.
 
-        Aggregates **all three** channels (veg / terrain / ndvi) at ``params``'
-        radii / stats / percentiles on the requested ``subset`` (``"train_val"``
-        for the resampling pool, ``"test"`` for the held-out set, ``"all"`` for
-        every entity), collapses to one row per entity (polygon mean when
+        Aggregates **every channel this job uses** at ``params``' radii / stats
+        / percentiles on the requested ``subset`` (``"train_val"`` for the
+        resampling pool, ``"test"`` for the held-out set, ``"all"`` for every
+        entity), collapses to one row per entity (polygon mean when
         polygon-keyed), and returns the raw arrays plus the aligned target,
         covariates, and — in longitudinal mode — entity ids and
-        ``years_since_baseline``.
+        ``years_since_baseline``. ``channel_names`` says which column is which,
+        because the set differs between a two- and three-channel study.
 
         No scaling is applied: OLS / MixedLM AIC and BIC are invariant to an
         affine transform of an individual predictor, so raw channel values are
@@ -5870,44 +5921,26 @@ class MetricFusionEngine:
             raise ValueError(f"No {subset} data available. Run split_data() first.")
 
         points = self.target_gdf.loc[data.index].copy()
-        streetview_stat = params.get("streetview_stat", "mean")
-        streetview_percentile = params.get("streetview_percentile", 50)
-        veg_radius = params.get("veg_radius", int(round(self.gvi_buffer_max_m)))
-        terrain_radius = params.get("terrain_radius", int(round(self.gvi_buffer_max_m)))
-        ndvi_stat = params.get("ndvi_stat", "mean")
-        ndvi_percentile = params.get("ndvi_percentile", 50)
-        ndvi_radius = params.get("ndvi_radius", int(round(self.ndvi_buffer_max_m)))
-
-        veg = self._aggregate_with_ring_cache(
-            points,
-            self.veg_data,
-            veg_radius,
-            streetview_stat,
-            streetview_percentile,
-            channel="veg",
-            fold_idx=None,
-            subset=None,
-        )
-        terrain = self._aggregate_with_ring_cache(
-            points,
-            self.terrain_data,
-            terrain_radius,
-            streetview_stat,
-            streetview_percentile,
-            channel="terrain",
-            fold_idx=None,
-            subset=None,
-        )
-        ndvi = self._aggregate_with_ring_cache(
-            points,
-            self.ndvi_data,
-            ndvi_radius,
-            ndvi_stat,
-            ndvi_percentile,
-            channel="ndvi",
-            fold_idx=None,
-            subset=None,
-        )
+        # The formula's channels, not the engine's active mode: this design is
+        # what the composite is compared *against*, so it has to hold every
+        # channel even while the engine is scoring one standalone.
+        channels = tuple(cgi_formulas.formula_channels(self.cgi_formula))
+        # Every channel is aggregated here regardless of its weight: the AIC/BIC
+        # comparison fits the standalones as well as the composite, so a channel
+        # the formula happens to zero is still one of the models under test.
+        blocks: dict[str, np.ndarray] = {}
+        for ch in channels:
+            radius, stat, pct = self._channel_spec(params, ch)
+            blocks[ch] = self._aggregate_with_ring_cache(
+                points,
+                self._channel_source(ch),
+                radius,
+                stat,
+                pct,
+                channel=ch,
+                fold_idx=None,
+                subset=None,
+            )
 
         cov_cols = self.covariate_columns
         cov = data[cov_cols].to_numpy(dtype=np.float64) if cov_cols else None
@@ -5916,18 +5949,16 @@ class MetricFusionEngine:
         ysb = None
         if "polygon_id" in data.columns:
             pid = data["polygon_id"].values
-            # Full 3-channel design → catchment = max of the three radii for
-            # point/line targets (mask None for polygons).
+            # Every channel feeds the design → catchment = the largest radius
+            # among them for point/line targets (mask None for polygons).
             catchment_r = _helpers.catchment_radius(
-                veg_radius,
-                terrain_radius,
-                ndvi_radius,
-                self._active_greenery_channel,
+                self._channel_radii(params), self._active_greenery_channel
             )
             mask = _helpers.entity_collapse_mask(data, catchment_r)
-            veg = self._collapse_to_entities(veg, pid, mask, "mean")
-            terrain = self._collapse_to_entities(terrain, pid, mask, "mean")
-            ndvi = self._collapse_to_entities(ndvi, pid, mask, "mean")
+            blocks = {
+                ch: self._collapse_to_entities(a, pid, mask, "mean")
+                for ch, a in blocks.items()
+            }
             target = self._collapse_to_entities(
                 data["target"].values, pid, mask, "first"
             )
@@ -5953,8 +5984,8 @@ class MetricFusionEngine:
                 ysb = data["years_since_baseline"].values
 
         return {
-            "channels": np.column_stack([veg, terrain, ndvi]),
-            "channel_names": ["veg", "terrain", "ndvi"],
+            "channels": np.column_stack(list(blocks.values())),
+            "channel_names": list(blocks),
             "target": np.asarray(target, dtype=np.float64),
             "covariates": cov,
             "entity_id": entity_id,
@@ -6144,33 +6175,6 @@ class MetricFusionEngine:
         if cached is not None and cached[0] == cache_key:
             return cached[1]
 
-        # The active mode decides which channels contribute and how the
-        # composite is built — apply_fusion routes through the same fork as
-        # _objective / evaluate_on_test so all four agree. CGI mode delegates
-        # to the formula; standalone mode isolates the active channel.
-        channel_mode = self._active_greenery_channel
-        if channel_mode == "cgi":
-            channel_active = cgi_formulas.get_formula(self.cgi_formula).channel_active(
-                weights
-            )
-        else:
-            channel_active = {
-                "veg": channel_mode == "veg",
-                "terrain": channel_mode == "terrain",
-                "ndvi": channel_mode == "ndvi",
-            }
-
-        # Extract aggregation parameters
-        streetview_stat = weights.get("streetview_stat", "mean")
-        streetview_percentile = weights.get("streetview_percentile", 50)
-        veg_radius = weights.get("veg_radius", int(round(self.gvi_buffer_max_m)))
-        terrain_radius = weights.get(
-            "terrain_radius", int(round(self.gvi_buffer_max_m))
-        )
-        ndvi_stat = weights.get("ndvi_stat", "mean")
-        ndvi_percentile = weights.get("ndvi_percentile", 50)
-        ndvi_radius = weights.get("ndvi_radius", int(round(self.ndvi_buffer_max_m)))
-
         # Combine all data (train+val+test) — cached union frame.
         all_data = self._full_data_frame()
         if all_data is None:
@@ -6178,86 +6182,23 @@ class MetricFusionEngine:
         # .loc with an index array materialises a new frame; read-only below.
         all_points = self.target_gdf.loc[all_data.index]
 
-        # Apply circular buffer aggregation with optimized parameters
-        if channel_active["veg"]:
-            all_veg = self._aggregate_with_ring_cache(
-                all_points,
-                self.veg_data,
-                veg_radius,
-                streetview_stat,
-                streetview_percentile,
-                channel="veg",
-                fold_idx=-1,
-                subset="all",
-            )
-        else:
-            all_veg = np.zeros(len(all_points), dtype=np.float32)
-
-        if channel_active["terrain"]:
-            all_terrain = self._aggregate_with_ring_cache(
-                all_points,
-                self.terrain_data,
-                terrain_radius,
-                streetview_stat,
-                streetview_percentile,
-                channel="terrain",
-                fold_idx=-1,
-                subset="all",
-            )
-        else:
-            all_terrain = np.zeros(len(all_points), dtype=np.float32)
-
-        if channel_active["ndvi"]:
-            all_ndvi = self._aggregate_with_ring_cache(
-                all_points,
-                self.ndvi_data,
-                ndvi_radius,
-                ndvi_stat,
-                ndvi_percentile,
-                channel="ndvi",
-                fold_idx=-1,
-                subset="all",
-            )
-        else:
-            all_ndvi = np.zeros(len(all_points), dtype=np.float32)
+        # Apply circular buffer aggregation with optimized parameters, over the
+        # job's own channel set — the same fork evaluate_on_test uses, so the
+        # applied composite and the held-out score agree.
+        all_blocks = self._aggregate_channels(all_points, weights, subset="all")
 
         # Per-channel scaling removed — the composite uses raw aggregated
         # channel values.
-        all_combined = np.column_stack([all_veg, all_terrain, all_ndvi])
-        all_veg_norm = all_combined[:, 0]
-        all_terrain_norm = all_combined[:, 1]
-        all_ndvi_norm = all_combined[:, 2]
-        all_veg_norm, all_terrain_norm, all_ndvi_norm = self._normalize_channel_arrays(
-            all_veg_norm, all_terrain_norm, all_ndvi_norm
+        composite = self._composite_from(
+            weights, self._normalize_channels(all_blocks)
         )
-
-        # Calculate composite via the active mode (same fork as _objective /
-        # evaluate_on_test). CGI mode uses the formula; standalone mode takes
-        # the single active channel directly.
-        if channel_mode == "cgi":
-            composite = compute_cgi(
-                self.cgi_formula,
-                weights,
-                {
-                    "veg": all_veg_norm,
-                    "terrain": all_terrain_norm,
-                    "ndvi": all_ndvi_norm,
-                },
-            )
-        else:
-            composite = {
-                "veg": all_veg_norm,
-                "terrain": all_terrain_norm,
-                "ndvi": all_ndvi_norm,
-            }[channel_mode]
         # Composite-level [0, 1] normalization over the whole grid when the
         # toggle is on (raw otherwise); mirrors the output raster + standalones.
         composite = self._finalize_composite(composite)
 
         result_df = all_data.copy()
-        result_df["veg"] = all_veg
-        result_df["terrain"] = all_terrain
-        result_df["ndvi"] = all_ndvi
+        for ch, values in all_blocks.items():
+            result_df[ch] = values
         result_df["composite"] = composite
 
         # Per-pixel mode: collapse per-pixel rows into one row per entity.
@@ -6267,22 +6208,20 @@ class MetricFusionEngine:
         # optimizer scored against the per-entity outcome.
         if "polygon_id" in result_df.columns:
             catchment_r = _helpers.catchment_radius(
-                veg_radius,
-                terrain_radius,
-                ndvi_radius,
-                self._active_greenery_channel,
+                self._channel_radii(weights), self._active_greenery_channel
             )
             mask = _helpers.entity_collapse_mask(result_df, catchment_r)
             masked_df = result_df if mask is None else result_df[mask]
+            # The channel columns are named by the job's own set, so the
+            # per-polygon means are built from it rather than a fixed triple.
+            aggregations = {ch: (ch, "mean") for ch in all_blocks}
             poly_df = (
                 masked_df.groupby("polygon_id", sort=False)
                 .agg(
                     target=("target", "first"),
-                    veg=("veg", "mean"),
-                    terrain=("terrain", "mean"),
-                    ndvi=("ndvi", "mean"),
                     composite=("composite", "mean"),
                     n_samples=("composite", "count"),
+                    **aggregations,
                 )
                 .reset_index()
             )
@@ -8071,50 +8010,23 @@ class MetricFusionEngine:
             progress_callback(40, 100)
 
         # 5. Sample metrics at grid points using final parameters
-        logger.info("Sampling vegetation at grid points...")
-        veg_values = self._aggregate_with_ring_cache(
-            points_gdf,
-            self.veg_data,
-            final_params["veg_radius"],
-            final_params["streetview_stat"],
-            final_params["streetview_percentile"],
-            channel="veg",
-            fold_idx=-1,
-            subset="robust_map",
-        )
-
-        if progress_callback:
-            progress_callback(55, 100)
-
-        logger.info("Sampling terrain at grid points...")
-        terrain_values = self._aggregate_with_ring_cache(
-            points_gdf,
-            self.terrain_data,
-            final_params["terrain_radius"],
-            final_params["streetview_stat"],
-            final_params["streetview_percentile"],
-            channel="terrain",
-            fold_idx=-1,
-            subset="robust_map",
-        )
-
-        if progress_callback:
-            progress_callback(70, 100)
-
-        logger.info("Sampling NDVI at grid points...")
-        ndvi_values = self._aggregate_with_ring_cache(
-            points_gdf,
-            self.ndvi_data,
-            final_params["ndvi_radius"],
-            final_params["ndvi_stat"],
-            final_params["ndvi_percentile"],
-            channel="ndvi",
-            fold_idx=-1,
-            subset="robust_map",
-        )
-
-        if progress_callback:
-            progress_callback(85, 100)
+        channels = self._composite_channels()
+        blocks: dict[str, np.ndarray] = {}
+        for n, ch in enumerate(channels):
+            logger.info(f"Sampling {ch} at grid points...")
+            radius, stat, pct = self._channel_spec(final_params, ch)
+            blocks[ch] = self._aggregate_with_ring_cache(
+                points_gdf,
+                self._channel_source(ch),
+                radius,
+                stat,
+                pct,
+                channel=ch,
+                fold_idx=-1,
+                subset="robust_map",
+            )
+            if progress_callback:
+                progress_callback(40 + int(45 * (n + 1) / len(channels)), 100)
 
         # Compute the composite from RAW channels (no per-channel scaling),
         # then apply the ``whole_grid_scaling`` toggle: min-max normalise to
@@ -8122,17 +8034,8 @@ class MetricFusionEngine:
         # treatment the scorer applied, mirrored for standalone single-channel
         # maps.
         logger.info(f"Calculating composite via formula '{formula.name}'...")
-        veg_values, terrain_values, ndvi_values = self._normalize_channel_arrays(
-            veg_values, terrain_values, ndvi_values
-        )
-        composite = compute_cgi(
-            self.cgi_formula,
-            final_params,
-            {
-                "veg": veg_values,
-                "terrain": terrain_values,
-                "ndvi": ndvi_values,
-            },
+        composite = self._composite_from(
+            final_params, self._normalize_channels(blocks)
         )
         composite = self._finalize_composite(np.asarray(composite, dtype=np.float64))
 

@@ -107,7 +107,10 @@ def _study_bundles(
 ) -> list[tuple[str, str, dict]]:
     """``(study_key, display, bundle)`` for the CGI study then each standalone."""
     out: list[tuple[str, str, dict]] = [("cgi", "CGI (combined)", cgi_bundle)]
-    for ch in ("veg", "terrain", "ndvi"):
+    # Whatever the job ran standalones for — a two-channel study reports ``gvi``
+    # where a three-channel one reports ``veg`` and ``terrain``. Ordered by the
+    # label map so the report's channel order does not depend on dict insertion.
+    for ch in _STANDALONE_CHANNEL_LABELS:
         b = standalones_bundle.get(ch)
         if b:
             out.append((ch, _STANDALONE_CHANNEL_LABELS.get(ch, ch), b))
@@ -800,16 +803,26 @@ def _compare_cgi_vs_standalone(
     """AIC/BIC verdict: is CGI justified over the best single standalone channel?
 
     The best standalone is the channel with the strongest whole-data (``all``)
-    score (direction-aware). The full (3-channel) and reduced (best-channel)
-    models are fit on the whole dataset's per-entity channel design built at the
-    CGI winning aggregation params, so the verdict is on the same ``all`` slice
-    as the paired objective comparison. Returns ``None`` when no standalone
-    qualifies or the design / fit fails.
+    score (direction-aware). The full and reduced (best-channel) models are fit
+    on the whole dataset's per-entity channel design built at the CGI winning
+    aggregation params, so the verdict is on the same ``all`` slice as the
+    paired objective comparison. Returns ``None`` when no standalone qualifies
+    or the design / fit fails.
+
+    The channel names come from the design rather than from a fixed list: a
+    two-channel study's design has two columns, and an index taken against the
+    three-channel names would point at the wrong one.
     """
     from .. import mixed_effects_scoring as _me
     from .. import objective_scoring as _scoring
 
-    chans = ["veg", "terrain", "ndvi"]
+    try:
+        design = engine.build_channel_design(cgi_params, subset="all")
+    except Exception as exc:
+        log("WARN", f"AIC/BIC channel design failed: {exc}")
+        return None
+
+    chans = list(design["channel_names"])
     higher_is_better = (
         metric in _scoring.HIGHER_IS_BETTER or metric in _me.HIGHER_IS_BETTER
     )
@@ -827,12 +840,6 @@ def _compare_cgi_vs_standalone(
         return None
     best_ch = max(scored, key=lambda kv: kv[1] if higher_is_better else -kv[1])[0]
     best_idx = chans.index(best_ch)
-
-    try:
-        design = engine.build_channel_design(cgi_params, subset="all")
-    except Exception as exc:
-        log("WARN", f"AIC/BIC channel design failed: {exc}")
-        return None
 
     X = design["channels"]
     target = design["target"]

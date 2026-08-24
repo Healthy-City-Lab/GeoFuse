@@ -119,6 +119,35 @@ class JobExecutor:
     def store(self) -> JobStore:
         return self._store
 
+    @staticmethod
+    def _stop_process(proc, *, grace_s: float) -> None:
+        """See the child out, escalating until it is actually gone.
+
+        ``terminate`` is the polite signal and ``kill`` the one that cannot be
+        ignored; on Windows the two differ only in that the second is retried,
+        which is what a child wedged inside a native call needs. The child's own
+        pool workers are not signalled here and do not need to be: each was
+        started through :func:`geofuse.parallel.worker_setup`, so it is waiting
+        on this process's sentinel and exits as soon as it goes.
+
+        Safe on a process that never started — a spawn that raised leaves a
+        handle that cannot be joined at all.
+        """
+        if not proc.is_alive() and proc.exitcode is None:
+            return
+        proc.join(timeout=grace_s)
+        if not proc.is_alive():
+            return
+        proc.terminate()
+        proc.join(timeout=5)
+        if not proc.is_alive():
+            return
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001 — already exited, or no such signal
+            pass
+        proc.join(timeout=5)
+
     def submit_subprocess_job(
         self,
         record: JobRecord,
@@ -227,10 +256,13 @@ class JobExecutor:
                 )
 
                 bridge_stop.set()
-                proc.join(timeout=30)
-                if proc.is_alive():
-                    proc.terminate()
-                    proc.join(timeout=5)
+                # A child that already sent its terminal message only has to
+                # unwind; one we stopped waiting for may still be inside the
+                # phase that ignored the cancel, so it goes straight to the
+                # escalation.
+                self._stop_process(
+                    proc, grace_s=2.0 if status == "cancelled" else 30.0
+                )
 
                 if status == "completed":
                     # The child returns ``output_paths=[]`` when it short-
@@ -253,6 +285,10 @@ class JobExecutor:
                     self._store.transition(record.id, "cancelled")
             finally:
                 bridge_stop.set()
+                # Covers the paths that never reached the join above — a
+                # transition that raised, or the watcher thread itself failing.
+                if proc.is_alive():
+                    self._stop_process(proc, grace_s=0.0)
                 try:
                     event_queue.close()
                 except Exception:

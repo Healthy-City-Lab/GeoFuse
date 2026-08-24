@@ -57,7 +57,7 @@ from geofuse.jobs.fusion_outputs import (
     _posterior_summary,
     _write_fusion_outputs,
 )
-from geofuse.jobs.stage_ledger import DONE, RUNNING, SKIPPED
+from geofuse.jobs.stage_ledger import DONE, FAILED, RUNNING, SKIPPED
 from geofuse.logger import get_logger
 from geofuse.longitudinal import (
     GREENERY_CHANNELS,
@@ -1107,6 +1107,21 @@ def run_fusion(
     ``partial_distance_corr`` objective and 10,000 otherwise — percentile CIs
     are stable well below the higher figure), the effects bootstrap /
     permutation counts, and the paired CGI-vs-standalone bootstrap."""
+    # Bound before the body so the handlers below can close out the ledger no
+    # matter how early a run fails.
+    ledger = None
+
+    def _close_ledger(status: str, message: str) -> None:
+        """Stop the clock on the stage the run died inside, and persist it."""
+        if ledger is None:
+            return
+        if ledger.stop_running(status, message) is None:
+            return
+        try:
+            ctx.update_stage_ledger(ledger.to_dict())
+        except Exception:
+            pass
+
     try:
         # Imported here (not at module load) so the runner module stays light
         # and the fusion engine is only pulled into the process that runs the
@@ -2208,9 +2223,10 @@ def run_fusion(
             cgi_vs_standalone_paired: dict | None = None
             cgi_vs_standalone_paired_family: list[dict] = []
             if standalones and standalones_bundle:
-                for ch in [
-                    c for c in ("veg", "terrain", "ndvi") if c in standalones_bundle
-                ]:
+                # The job's own standalone list, so a two-channel study's
+                # ``gvi`` arm is in the family rather than dropped from it —
+                # which would also change what the Holm correction is over.
+                for ch in [c for c in standalones if c in standalones_bundle]:
                     ch_bundle = standalones_bundle[ch]
                     ch_params = (
                         ch_bundle.get("averaged_params")
@@ -2517,7 +2533,12 @@ def run_fusion(
         # the stage-boundary cancels do; the executor reads the cancel flag and
         # files the job as cancelled rather than failed.
         _log_fusion("WARN", "Fusion job cancelled by user.")
+        _close_ledger(FAILED, "Cancelled by user.")
         return {"output_paths": []}
+
+    except BaseException as exc:
+        _close_ledger(FAILED, f"{type(exc).__name__}: {exc}")
+        raise
 
     finally:
         if target_cleanup_dir:
