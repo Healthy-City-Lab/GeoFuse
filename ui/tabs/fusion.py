@@ -2012,12 +2012,13 @@ def _render_study_details_panel(
                 key="fusion_discovery_shuffles",
             )
             null_calibration_runs_ui = st.number_input(
-                "Null calibration fits", min_value=0, max_value=100, step=1,
+                "Null calibration fits", min_value=0, max_value=1000, step=1,
                 key="fusion_null_calibration_runs",
                 help=(
                     "Permuted-outcome refits. The reported rate should sit near "
                     "5 %; well above means the procedure is over-confident. "
-                    "0 skips."
+                    "16 is a quick check; a calibration claim needs at least "
+                    "100, and a final, reported run should use 200. 0 skips."
                 ),
             )
         with col_v1:
@@ -3509,15 +3510,41 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
     null = summary.get("null_calibration") or {}
     if null:
         rate = _num(null.get("rate"))
+        r_lo, r_hi = _num(null.get("rate_ci_low")), _num(null.get("rate_ci_high"))
         st.markdown("**Null calibration**")
-        st.metric(
-            "False-positive rate on permuted outcomes",
-            f"{rate:.1%}" if rate is not None else "-",
-            help=(
-                "The whole procedure re-run on shuffled outcomes. The beta "
-                "interval should exclude zero about 5% of the time."
-            ),
-        )
+        n1, n2 = st.columns(2)
+        with n1:
+            st.metric(
+                "False-positive rate on permuted outcomes",
+                f"{rate:.1%}" if rate is not None else "-",
+                help=(
+                    "The whole procedure re-run on shuffled outcomes. The beta "
+                    "interval should exclude zero about 5% of the time."
+                ),
+            )
+        with n2:
+            st.metric(
+                "95% CI (exact)",
+                f"[{r_lo:.1%}, {r_hi:.1%}]"
+                if r_lo is not None and r_hi is not None else "-",
+                help=(
+                    "Clopper-Pearson interval on the rate. With few refits it "
+                    "is wide: 0 of 16 is compatible with a true rate of 20.6%."
+                ),
+            )
+        if null.get("imprecise"):
+            st.info(
+                f"{null.get('runs')} refits are too few to support a "
+                "calibration claim; the rate is a quick check only. Run at "
+                "least 100, and 200 for a final, reported run."
+            )
+        form_counts = null.get("form_counts") or {}
+        if form_counts:
+            st.caption(
+                "The form was re-chosen on every permuted outcome ("
+                + ", ".join(f"`{f}` {n}" for f, n in form_counts.items())
+                + "), so this rate covers the form choice as well."
+            )
         if rate is not None and rate > 0.15:
             st.warning(
                 f"The beta interval excludes zero on {rate:.0%} of permuted "

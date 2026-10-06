@@ -134,7 +134,10 @@ Nothing below is pre-specified.
   sides make their choices on training rows, and the permuted runs repeat them.
 - **Calibration is checked.** The procedure is re-run on permuted outcomes; the
   reported false-positive rate should sit near 5 %, and the panel says so when
-  it does not.
+  it does not. The rate carries an exact (Clopper-Pearson) interval, and fewer
+  than 100 refits is flagged as too imprecise for a calibration claim: 0 of 16
+  is still compatible with a true rate of 20 %. An engine option re-chooses the
+  form on every permuted outcome, so the rate covers that choice too.
 - **Provenance is recorded.** Every run stores a hash of its configuration and
   counts how many distinct configurations were scored on the held-out set, so a
   spent test set is visible rather than inferred.

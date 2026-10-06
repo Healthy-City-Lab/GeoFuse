@@ -812,6 +812,92 @@ class TestHonestFormSelection(unittest.TestCase):
         self.assertEqual((form, scores), ("linear", {}))
 
 
+class _StubMCMC:
+    def __init__(self, beta):
+        self._beta = beta
+
+    def get_samples(self):
+        return {"beta": self._beta}
+
+
+class TestNullCalibrationPrecision(unittest.TestCase):
+    """A false-positive rate is quoted with its uncertainty, or not at all.
+
+    The NUTS refits are stubbed: what is under test is the bookkeeping around
+    them, and a real refit per permutation would make the suite take minutes.
+    """
+
+    def setUp(self):
+        self._real_fit = bi.fit
+        self.forms_seen = []
+
+        def stub(E, y, *, form="linear", seed=0, **kw):
+            self.forms_seen.append(form)
+            centre = 1.0 if seed % 4 == 0 else 0.0
+            return _StubMCMC(np.random.default_rng(seed).normal(centre, 0.1, 200))
+
+        bi.fit = stub
+
+    def tearDown(self):
+        bi.fit = self._real_fit
+
+    @staticmethod
+    def _null_grid(n=600, seed=8):
+        rng = np.random.default_rng(seed)
+        X = rng.normal(size=(n, 2, 1, 1))
+        return bi.prep(X, rng.normal(size=n), None)[::-1]
+
+    def test_the_interval_is_the_exact_binomial_one(self):
+        from scipy.stats import binomtest
+
+        for k, n in ((0, 16), (1, 16), (10, 200), (16, 16)):
+            ci = binomtest(k, n).proportion_ci(method="exact")
+            lo, hi = bi.clopper_pearson(k, n)
+            self.assertAlmostEqual(lo, ci.low, places=10)
+            self.assertAlmostEqual(hi, ci.high, places=10)
+
+    def test_zero_of_sixteen_still_allows_a_twenty_percent_rate(self):
+        self.assertAlmostEqual(bi.clopper_pearson(0, 16)[1], 0.206, places=3)
+
+    def test_sixteen_runs_are_flagged_and_logged(self):
+        Xr, yr = self._null_grid()
+        with self.assertLogs("geofuse.bayesian_index", level="WARNING") as cm:
+            out = bi.null_calibration(Xr, yr, n=16, workers=1)
+        self.assertTrue(out["imprecise"])
+        self.assertIn("too imprecise to support a calibration claim", out["note"])
+        self.assertIn("too imprecise", cm.output[0])
+        self.assertEqual(out["excluded_zero"], 4)
+        self.assertEqual((out["rate_ci_low"], out["rate_ci_high"]),
+                         bi.clopper_pearson(4, 16))
+
+    def test_a_publication_run_is_not_flagged(self):
+        Xr, yr = self._null_grid()
+        out = bi.null_calibration(Xr, yr, n=bi.NULL_RUNS_PUBLICATION, workers=1)
+        self.assertFalse(out["imprecise"])
+        self.assertNotIn("note", out)
+
+    def test_the_form_is_fixed_unless_reselection_is_asked_for(self):
+        Xr, yr = self._null_grid()
+        out = bi.null_calibration(Xr, yr, form="synergy", n=6, workers=1)
+        self.assertEqual(set(self.forms_seen), {"synergy"})
+        self.assertNotIn("form_counts", out)
+
+    def test_reselection_varies_the_form_across_null_permutations(self):
+        Xr, yr = self._null_grid()
+        out = bi.null_calibration(
+            Xr, yr, n=16, workers=1, reselect_form=True,
+            form_E=Xr.reshape(len(Xr), -1),
+        )
+        self.assertEqual(sum(out["form_counts"].values()), 16)
+        self.assertGreater(min(out["form_counts"].values()), 0, out["form_counts"])
+        self.assertEqual(len(set(self.forms_seen)), 2)
+
+    def test_reselection_needs_the_picked_columns(self):
+        Xr, yr = self._null_grid()
+        with self.assertRaises(ValueError):
+            bi.null_calibration(Xr, yr, n=2, workers=1, reselect_form=True)
+
+
 class TestExposureResponseProjectionIsRankSafe(unittest.TestCase):
     def test_a_duplicated_linear_column_removes_only_its_span(self):
         from geofuse.exposure_response import _orthogonalise

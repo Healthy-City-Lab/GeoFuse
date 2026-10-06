@@ -1266,53 +1266,115 @@ def _null_fit(task):
 
     The joint model is handed the whole grid, which is orders of magnitude
     larger than a column per channel; sending a copy to each of n workers is
-    what exhausts the pipe rather than the fitting.
+    what exhausts the pipe rather than the fitting. With a form choice attached,
+    the form is re-chosen on the permuted outcome before the refit.
     """
-    path, shape, y, form, seed, kwargs = task
+    path, shape, y, form, seed, kwargs, choice = task
     E = np.asarray(np.memmap(path, dtype=np.float64, mode="r", shape=shape))
     yp = np.random.default_rng(seed).permutation(y)
+    if choice is not None:
+        cpath, cshape, forms = choice
+        Ef = np.asarray(np.memmap(cpath, dtype=np.float64, mode="r", shape=cshape))
+        form, _ = choose_form(Ef, yp, forms, seed=seed + _FORM_SEED_OFFSET)
     m = fit(E, yp, form=form, draws=300, warmup=300, chains=2, seed=seed,
             **kwargs)
     b = np.asarray(m.get_samples()["beta"])
     lo, hi = np.percentile(b, [2.5, 97.5])
-    return int(lo > 0 or hi < 0)
+    return int(lo > 0 or hi < 0), form
+
+
+# Below this many permuted refits the false-positive rate is too imprecise to
+# support a calibration claim: 0 of 16 is compatible with a true rate of 20.6 %.
+NULL_RUNS_FOR_CLAIM = 100
+# Documented setting for a final, reported run.
+NULL_RUNS_PUBLICATION = 200
+
+
+def clopper_pearson(k: int, n: int, level: float = 0.95) -> tuple[float, float]:
+    """Exact binomial confidence interval for ``k`` successes in ``n`` trials."""
+    from scipy.stats import beta
+
+    if n <= 0:
+        return float("nan"), float("nan")
+    a = (1.0 - level) / 2.0
+    lo = 0.0 if k <= 0 else float(beta.ppf(a, k, n - k + 1))
+    hi = 1.0 if k >= n else float(beta.ppf(1.0 - a, k + 1, n - k))
+    return lo, hi
+
+
+def _write_memmap(arr: np.ndarray, suffix: str) -> str:
+    fd, path = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)
+    mm = np.memmap(path, dtype=np.float64, mode="w+", shape=arr.shape)
+    mm[:] = arr
+    mm.flush()
+    del mm
+    return path
 
 
 def null_calibration(E, y, *, form="linear", n=16, workers=None,
-                     cancel_check=None, **fit_kwargs):
+                     cancel_check=None, reselect_form=False, form_E=None,
+                     forms=FORMS, **fit_kwargs):
     """How often the beta interval excludes zero on a permuted outcome (~5 %).
 
     ``E`` and ``fit_kwargs`` are handed to :func:`fit` unchanged, so passing the
     full grid re-estimates the radius profile and the aggregator blend on every
     permuted refit. What that prices in is exactly what the model contains: with
     the grid inside, the scale and the aggregator are integrated over rather
-    than selected, and this rate covers them. What it cannot cover is anything
-    still decided outside — the functional form, the channel list, the covariate
-    set — so a clean rate here is not a licence to read the interval as though
-    those had been pre-specified.
+    than selected, and this rate covers them.
+
+    ``reselect_form`` extends that to the functional form: each permuted
+    outcome re-runs :func:`choose_form` on ``form_E`` — one column per channel,
+    the sweep's pick — among ``forms`` before the refit. What the rate still
+    cannot cover is the channel list and the covariate set, so a clean rate is
+    not a licence to read the interval as though those had been pre-specified.
+
+    The rate carries an exact (Clopper-Pearson) 95 % interval. Fewer than
+    :data:`NULL_RUNS_FOR_CLAIM` runs is flagged ``imprecise``; use
+    :data:`NULL_RUNS_PUBLICATION` for a final run.
 
     One fit per process: numpyro recompiles per call, so a serial loop pays the
     JAX compile n times over.
     """
     E = np.ascontiguousarray(np.asarray(E, dtype=np.float64))
-    fd, path = tempfile.mkstemp(suffix=".geofuse-null")
-    os.close(fd)
+    if reselect_form and form_E is None:
+        raise ValueError("reselect_form needs form_E, one column per channel.")
+    paths = []
     try:
-        mm = np.memmap(path, dtype=np.float64, mode="w+", shape=E.shape)
-        mm[:] = E
-        mm.flush()
-        del mm
-        tasks = [(path, E.shape, y, form, 3_000 + i, dict(fit_kwargs))
+        paths.append(_write_memmap(E, ".geofuse-null"))
+        choice = None
+        if reselect_form:
+            Ef = np.ascontiguousarray(np.asarray(form_E, dtype=np.float64))
+            paths.append(_write_memmap(Ef, ".geofuse-null-form"))
+            choice = (paths[1], Ef.shape, tuple(forms))
+        tasks = [(paths[0], E.shape, y, form, 3_000 + i, dict(fit_kwargs), choice)
                  for i in range(n)]
         n_workers = workers or min(n, parallel.process_worker_count(n))
-        hits = _map(_null_fit, tasks, n_workers, cancel_check)
+        results = _map(_null_fit, tasks, n_workers, cancel_check)
     finally:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-    return {"runs": n, "excluded_zero": int(sum(hits)),
-            "rate": float(sum(hits)) / max(n, 1)}
+        for p in paths:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+    k = int(sum(hit for hit, _ in results))
+    lo, hi = clopper_pearson(k, n)
+    out = {"runs": n, "excluded_zero": k, "rate": float(k) / max(n, 1),
+           "rate_ci_low": lo, "rate_ci_high": hi,
+           "imprecise": n < NULL_RUNS_FOR_CLAIM,
+           "reselect_form": bool(reselect_form)}
+    if reselect_form:
+        out["form_counts"] = {f: sum(fm == f for _, fm in results)
+                              for f in eligible_forms(forms, E.shape[1])}
+    if out["imprecise"]:
+        out["note"] = (
+            f"{n} runs: rate too imprecise to support a calibration claim "
+            f"(exact 95% CI {lo:.1%} to {hi:.1%}); use "
+            f"{NULL_RUNS_PUBLICATION} for a final run."
+        )
+        logger.warning("Null calibration: %s", out["note"])
+    return out
 
 
 def _selfcheck():

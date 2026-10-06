@@ -81,7 +81,9 @@ automatically; there is no need to list them twice.
   picked and how contested it was, the posterior weights with credible
   intervals, whether the discovery reproduced across reshuffles, the composite's
   gain over each channel alone, and the false-positive rate on permuted
-  outcomes.
+  outcomes with its exact 95 % interval. The default of 16 null refits is a
+  quick check, and the panel says so; set **Null calibration fits** to at least
+  100 before claiming calibration, and to 200 for a final, reported run.
 - **Covariate impact**, **channel collinearity**, **composite maps**,
   **mixed-effects metrics**, and an index of every file written.
 

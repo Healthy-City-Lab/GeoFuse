@@ -424,6 +424,47 @@ class TestFormChoiceIsReported(unittest.TestCase):
         self.assertNotIn("inner splits of its training rows", out)
 
 
+class _MetricRecorder(_Recorder):
+    """Also keeps each metric's value, which the base recorder drops."""
+
+    def metric(self, label, value=None, *a, **k):
+        self.calls.append(("metric", f"{label} = {value}"))
+        return self
+
+
+class TestNullCalibrationPanel(unittest.TestCase):
+    def setUp(self):
+        self._real_st = fusion_tab.st
+        self.rec = _MetricRecorder()
+        fusion_tab.st = self.rec
+
+    def tearDown(self):
+        fusion_tab.st = self._real_st
+
+    def _render(self, null):
+        fusion_tab._render_posterior_diagnostics(
+            _summary(null_calibration=null), "DCOR")
+        return self.rec.text()
+
+    def test_the_rate_carries_its_exact_interval(self):
+        out = self._render({"runs": 200, "excluded_zero": 10, "rate": 0.05,
+                            "rate_ci_low": 0.0242, "rate_ci_high": 0.0901,
+                            "imprecise": False})
+        self.assertIn("[2.4%, 9.0%]", out)
+        self.assertNotIn("too few to support a calibration claim", out)
+
+    def test_a_short_run_is_called_a_quick_check(self):
+        out = self._render({"runs": 16, "excluded_zero": 0, "rate": 0.0,
+                            "rate_ci_low": 0.0, "rate_ci_high": 0.206,
+                            "imprecise": True})
+        self.assertIn("too few to support a calibration claim", out)
+
+    def test_a_reselected_form_is_reported(self):
+        out = self._render({"runs": 16, "excluded_zero": 1, "rate": 0.0625,
+                            "form_counts": {"linear": 11, "synergy": 5}})
+        self.assertIn("covers the form choice as well", out)
+
+
 class TestCovariateAxisOrdering(unittest.TestCase):
     """Numerics first, then each categorical's levels in value order.
 

@@ -3239,6 +3239,7 @@ class MetricFusionEngine:
         gain_splits: int = 20,
         gain_perm: int = 100,
         null_runs: int = 16,
+        null_reselect_form: bool = False,
         draws: int = 800,
         warmup: int = 800,
         chains: int = 4,
@@ -3258,6 +3259,11 @@ class MetricFusionEngine:
 
         Returns a params dict the composite/apply path consumes, plus ``__``-
         prefixed diagnostics for the results bundle.
+
+        ``null_runs`` below ``bayesian_index.NULL_RUNS_FOR_CLAIM`` is a quick
+        check; use ``bayesian_index.NULL_RUNS_PUBLICATION`` for a final run.
+        ``null_reselect_form`` re-chooses the form on every permuted outcome,
+        so the null rate covers the form choice too.
         """
         t0 = time.perf_counter()
         steps, done = 5, 0
@@ -3373,7 +3379,9 @@ class MetricFusionEngine:
         null = (
             bayesian_index.null_calibration(
                 grid, yr, form=res.form, n=null_runs, workers=workers,
-                cancel_check=cancelled, **grid_kwargs,
+                cancel_check=cancelled, reselect_form=null_reselect_form,
+                form_E=Xr.reshape(len(Xr), -1)[:, list(res.columns)],
+                forms=forms, **grid_kwargs,
             )
             if null_runs
             else {}
