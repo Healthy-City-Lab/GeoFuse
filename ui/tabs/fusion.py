@@ -2910,11 +2910,34 @@ def _render_fitted_grid(summary: dict, _pd, _label) -> None:
 
     radii = summary.get("radii") or []
     if profile and radii:
-        prof = _pd.DataFrame(
-            {_label(i): row for i, row in enumerate(profile)},
-            index=[f"{int(r)} m" for r in radii],
-        )
-        st.bar_chart(prof, height=200)
+        # Bars follow ladder order, not label text. Each channel's profile sums
+        # to 1 on its own, so channels sit side by side rather than stacked.
+        order = [f"{int(r)} m" for r in radii]
+        long = _pd.DataFrame([
+            {"Radius": order[ri], "Channel": _label(ci), "Weight": float(w)}
+            for ci, row in enumerate(profile)
+            for ri, w in enumerate(row)
+            if ri < len(order)
+        ])
+        try:
+            import plotly.express as _px
+
+            fig = _px.bar(
+                long, x="Radius", y="Weight", color="Channel",
+                barmode="group", category_orders={"Radius": order},
+            )
+            fig.update_layout(
+                height=280, margin=dict(l=50, r=20, t=30, b=50),
+                yaxis_title="Posterior weight",
+                xaxis=dict(categoryorder="array", categoryarray=order),
+            )
+            st.plotly_chart(fig, width="stretch")
+        except Exception:
+            st.bar_chart(
+                long.pivot(index="Radius", columns="Channel", values="Weight")
+                .reindex(order),
+                height=220, stack=False,
+            )
         st.caption(
             "Posterior weight on each rung of the ladder. The kernel is placed "
             "in log-radius with a sampled location and width, so it can rise "
@@ -2942,7 +2965,16 @@ def _render_fitted_grid(summary: dict, _pd, _label) -> None:
         st.dataframe(_pd.DataFrame(rows), width="stretch", hide_index=True)
         n_stats = len(stats) or 1
         uniform = _num(summary.get("aggregator_uniform")) or (1.0 / n_stats)
-        informative = summary.get("aggregator_informative") or []
+        informative = summary.get("aggregator_informative")
+        if informative is None and a_lo and a_hi:
+            # Older bundles lack the stored verdict; it is recomputed from the
+            # intervals it is read from.
+            informative = [
+                [stats[i] for i in range(min(len(stats), len(lo_c)))
+                 if lo_c[i] > uniform or hi_c[i] < uniform]
+                for lo_c, hi_c in zip(a_lo, a_hi)
+            ]
+        informative = informative or []
         st.caption(
             f"Blend over the aggregators, not a pick. A component is a finding "
             f"when its credible interval excludes the prior mean "
@@ -3060,6 +3092,19 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
             width="stretch",
             hide_index=True,
         )
+        projected = summary.get("projected_pick")
+        if projected and [list(x) for x in projected] != [list(x) for x in picked]:
+            parts = " / ".join(f"{int(x[0])} m {x[1]}" for x in projected)
+            st.info(
+                f"This is the **sweep's** pick, and it is not what the study "
+                f"was built from. The sweep ranks one cell per channel to "
+                f"shortlist the functional form; the posterior then estimates "
+                f"the radius and the aggregator as parameters over the whole "
+                f"grid, and its projection — **{parts}** — is what the params "
+                f"panel and the composite carry. The two disagreeing is "
+                f"expected where the grid is flat, and is itself a sign the "
+                f"cell is not well determined."
+            )
 
     boundary = summary.get("boundary_hit") or []
     if boundary:
@@ -3266,9 +3311,13 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
                 _fmt(gain.get("best_single"), 3),
                 delta=_fmt(gain.get("gain"), 3),
                 help=(
-                    "Best single channel under the *identical* sweep - its own "
-                    "radius and aggregator picked on train the same way. The "
-                    "delta is the composite's gain."
+                    "Not the best channel's average. In each split the stronger "
+                    "channel is chosen on the training rows, and its held-out "
+                    "score is taken; this is the mean of that. Choosing on "
+                    "train sometimes picks the weaker channel, so this sits "
+                    "below the best row in the table and above the worst - "
+                    "which is the honest comparator, because the composite had "
+                    "to make its choice on training rows too."
                 ),
             )
         with g3:

@@ -274,5 +274,110 @@ class TestFittedGridPanel(unittest.TestCase):
         self.assertIn("Fitted spatial scale and aggregator", out)
 
 
+class TestRadiusProfileChart(unittest.TestCase):
+    """The ladder is numeric; its axis and its bars have to respect that."""
+
+    def setUp(self):
+        self._real_st = fusion_tab.st
+        self.rec = _Recorder()
+        fusion_tab.st = self.rec
+
+    def tearDown(self):
+        fusion_tab.st = self._real_st
+
+    def _figure(self, summary):
+        fusion_tab._render_posterior_diagnostics(summary, "DCOR")
+        for name, val in self.rec.calls:
+            if name == "plotly_chart" and getattr(val, "data", None):
+                if any(getattr(t, "name", None) for t in val.data):
+                    return val
+        return None
+
+    def test_the_axis_follows_the_ladder_not_the_label_text(self):
+        # "1000 m" sorts before "150 m" as text, which puts the widest buffer in
+        # the middle of the axis and turns any profile into a sawtooth.
+        fig = self._figure(_grid(radii=[100, 150, 500, 1000],
+                                 radius_profile=[[0.1, 0.2, 0.6, 0.1],
+                                                 [0.25, 0.25, 0.25, 0.25]]))
+        self.assertIsNotNone(fig)
+        self.assertEqual(
+            list(fig.layout.xaxis.categoryarray),
+            ["100 m", "150 m", "500 m", "1000 m"],
+        )
+
+    def test_the_channels_sit_side_by_side_rather_than_stacked(self):
+        # Each channel's profile sums to 1 on its own, so a stacked bar adds two
+        # unrelated distributions into a height that means nothing.
+        fig = self._figure(_grid())
+        self.assertEqual(fig.layout.barmode, "group")
+
+    def test_every_channel_gets_its_own_series(self):
+        fig = self._figure(_grid())
+        self.assertEqual({t.name for t in fig.data}, {"NDVI", "GVI"})
+
+
+class TestSweepAndPosteriorDisagreement(unittest.TestCase):
+    """The sweep's cell and the posterior's projection are different objects.
+
+    Showing the sweep table alone made the params panel look inconsistent with
+    the diagnostics, when in fact the posterior is meant to override it.
+    """
+
+    def setUp(self):
+        self._real_st = fusion_tab.st
+        self.rec = _Recorder()
+        fusion_tab.st = self.rec
+
+    def tearDown(self):
+        fusion_tab.st = self._real_st
+
+    def _render(self, summary):
+        fusion_tab._render_posterior_diagnostics(summary, "DCOR")
+        return self.rec.text()
+
+    def test_a_disagreement_is_called_out_with_what_actually_ships(self):
+        out = self._render(_grid(picked=[[600, "p25"], [600, "p10"]],
+                                 projected_pick=[[500, "p10"], [500, "p10"]]))
+        self.assertIn("not what the study was built from", out)
+        self.assertIn("500 m p10", out)
+
+    def test_agreement_stays_quiet(self):
+        out = self._render(_grid(picked=[[500, "p10"], [250, "mean"]],
+                                 projected_pick=[[500, "p10"], [250, "mean"]]))
+        self.assertNotIn("not what the study was built from", out)
+
+
+class TestAggregatorVerdictForOlderBundles(unittest.TestCase):
+    """A bundle written before the verdict was stored still carries its inputs."""
+
+    def setUp(self):
+        self._real_st = fusion_tab.st
+        self.rec = _Recorder()
+        fusion_tab.st = self.rec
+
+    def tearDown(self):
+        fusion_tab.st = self._real_st
+
+    def _render(self, summary):
+        fusion_tab._render_posterior_diagnostics(summary, "DCOR")
+        return self.rec.text()
+
+    def test_a_flat_blend_is_recognised_without_the_stored_field(self):
+        s = _grid()
+        s.pop("aggregator_informative")
+        s["aggregator_ci_low"] = [[0.02, 0.02, 0.02, 0.02]] * 2
+        s["aggregator_ci_high"] = [[0.51, 0.51, 0.51, 0.51]] * 2
+        self.assertIn("No aggregator is distinguishable", self._render(s))
+
+    def test_a_separated_blend_is_recognised_without_the_stored_field(self):
+        s = _grid()
+        s.pop("aggregator_informative")
+        s["aggregator_ci_low"] = [[0.30, 0.02, 0.02, 0.02]] * 2
+        s["aggregator_ci_high"] = [[0.80, 0.20, 0.20, 0.20]] * 2
+        out = self._render(s)
+        self.assertIn("Aggregators the data separated", out)
+        self.assertNotIn("No aggregator is distinguishable", out)
+
+
 if __name__ == "__main__":
     unittest.main()
