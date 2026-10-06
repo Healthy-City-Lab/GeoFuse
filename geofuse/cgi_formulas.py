@@ -17,7 +17,10 @@ Formulas
 ``synergy``
     Three-metric generalisation of Wang et al. 2026 (doi:10.3390/rs18010009),
     paper-faithful in pattern: powers on the **main** terms only, plain
-    products elsewhere::
+    products elsewhere. Each channel enters as its approximate percentile,
+    ``Φ((x − center) / scale)``, with the center and scale the discovery
+    recorded (``<channel>_center`` / ``<channel>_scale``) — the curve the sweep
+    and the posterior fitted::
 
         CGI = w_N · NDVI^pN + w_V · Veg^pV + w_T · Ter^pT
             + w_NV · NDVI · Veg
@@ -66,9 +69,8 @@ SYNERGY_POWER_LOW: float = 0.2
 SYNERGY_POWER_HIGH: float = 1.0
 SYNERGY_POWER_STEP: float = 0.1
 
-# Numeric floor used when clamping channel values before raising to a
-# fractional power so float roundoff in the min-max normalisation can't
-# produce ``NaN`` (e.g. ``(-1e-12)**0.5``).
+# Clamp applied to a synergy channel recorded without a center and scale, so
+# float roundoff can't produce ``NaN`` under a fractional power.
 _CLAMP_LO = 0.0
 _CLAMP_HI = 1.0
 
@@ -78,8 +80,8 @@ _CLAMP_HI = 1.0
 # ────────────────────────────────────────────────────────────────────
 
 # Mapping from canonical channel name to its 1-D values array for one batch of
-# samples. The engine builds these from its per-fold MinMaxScaler-normalised
-# arrays before calling :func:`compute_cgi`.
+# samples: the aggregated channel values, min-max scaled first when the engine's
+# ``normalize_channels`` is on.
 ComponentDict = dict[str, np.ndarray]
 
 
@@ -178,6 +180,26 @@ def _wa_channel_active(params: dict) -> dict[str, bool]:
 # synergy formula
 # ────────────────────────────────────────────────────────────────────
 
+
+def percentile_channel(values, params: dict, channel: str, dt) -> np.ndarray:
+    """One channel on the synergy form's (0, 1) scale.
+
+    With ``<channel>_center`` and ``<channel>_scale`` recorded, the value is
+    its approximate percentile ``Φ((x − center) / scale)`` — the scaling the
+    discovery engine fits. Params recorded without them replay as they were
+    fitted: the values are clamped to [0, 1].
+    """
+    center = params.get(f"{channel}_center")
+    scale = params.get(f"{channel}_scale")
+    if center is None or scale is None:
+        return np.clip(np.asarray(values, dtype=dt), _CLAMP_LO, _CLAMP_HI)
+    from scipy.special import ndtr
+
+    u = (np.asarray(values, dtype=np.float64) - float(center)) / max(
+        float(scale), 1e-12
+    )
+    return ndtr(u).astype(dt, copy=False)
+
 # Key ordering is informational only — the symmetric Dirichlet sampler treats
 # every key identically, so the (main NDVI / Veg / Ter, then pairwise NV / NT
 # / TV, then triple) order doesn't bias which terms get larger prior mass.
@@ -215,11 +237,9 @@ def _compute_synergy(params: dict, components: ComponentDict) -> np.ndarray:
     ter = np.asarray(components["terrain"], dtype=dt)
     ndvi = np.asarray(components["ndvi"], dtype=dt)
 
-    # Channels arrive min-max normalised to [0, 1]; clamp away any float
-    # roundoff so a 0.4 power doesn't produce NaN on a slightly-negative input.
-    veg = np.clip(veg, _CLAMP_LO, _CLAMP_HI)
-    ter = np.clip(ter, _CLAMP_LO, _CLAMP_HI)
-    ndvi = np.clip(ndvi, _CLAMP_LO, _CLAMP_HI)
+    veg = percentile_channel(veg, params, "veg", dt)
+    ter = percentile_channel(ter, params, "terrain", dt)
+    ndvi = percentile_channel(ndvi, params, "ndvi", dt)
 
     pN = float(params.get("ndvi_power", 1.0))
     pV = float(params.get("veg_power", 1.0))
@@ -334,10 +354,9 @@ def _generic_synergy(chans: tuple[str, ...]):
     inter_keys = [f"w_{chans[i]}_{chans[j]}" for i, j in pairs]
 
     def compute(params: dict, components: ComponentDict) -> np.ndarray:
-        arrs = [np.clip(np.asarray(components[c]), _CLAMP_LO, _CLAMP_HI)
-                for c in chans]
-        dt = np.result_type(*[a.dtype for a in arrs], np.float32)
-        arrs = [a.astype(dt, copy=False) for a in arrs]
+        raw = [np.asarray(components[c]) for c in chans]
+        dt = np.result_type(*[a.dtype for a in raw], np.float32)
+        arrs = [percentile_channel(a, params, c, dt) for a, c in zip(raw, chans)]
         wm = [float(params.get(f"w_{c}", 0)) for c in chans]
         wi = [float(params.get(k, 0)) for k in inter_keys]
         total = sum(wm) + sum(wi)

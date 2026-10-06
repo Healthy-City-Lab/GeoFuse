@@ -392,9 +392,10 @@ class MetricFusionEngine:
         self.whole_grid_scaling: bool = bool(whole_grid_scaling)
         # When True, each channel is min-max scaled to [0, 1] (per-channel
         # bounds fixed at prepare time from the predictor distribution only —
-        # no outcome leakage) before the composite is formed, so weights are
-        # interpretable and the synergy powers see their assumed [0, 1] domain.
-        # Default False keeps legacy raw-channel composites bit-for-bit.
+        # no outcome leakage) before the composite is formed. Default False
+        # keeps raw-channel composites. The synergy form applies its own
+        # percentile scaling on top, with center and scale recorded on
+        # whichever scale the channels arrive in.
         self.normalize_channels: bool = bool(normalize_channels)
         # Per-channel (lo, hi) min-max bounds, filled by prepare_fusion_data.
         self._channel_minmax: dict[str, tuple[float, float]] | None = None
@@ -3402,6 +3403,9 @@ class MetricFusionEngine:
             )
 
         params = self._params_from_sweep(res, post, index_channels)
+        if res.form == "synergy" and self._active_greenery_channel == "cgi":
+            params.update(self._synergy_scaling(
+                X, radii, stats, tensor_channels, index_channels, post.picked))
         params["__selection_method__"] = "bayesian_index"
         params["__sweep__"] = {
             "picked": [list(p) for p in res.picked],
@@ -3505,6 +3509,34 @@ class MetricFusionEngine:
                 return 0.0
 
         return objective
+
+    def _synergy_scaling(self, X, radii, stats, tensor_channels, index_channels,
+                         picked) -> dict:
+        """``<channel>_center`` / ``<channel>_scale`` for the synergy composite.
+
+        The synergy form reads each channel as ``Φ((x − center) / scale)``. The
+        composite path applies it to aggregated channel values, so the center
+        and scale are the mean and SD of those values at the cell the composite
+        is built from, over the train+val entities and after
+        ``normalize_channels`` when it is on. Recorded once, they make every map
+        and test score apply the same curve.
+        """
+        out: dict[str, float] = {}
+        rungs = [int(round(float(r))) for r in radii]
+        for ch, (radius, stat) in zip(index_channels, picked):
+            if int(radius) not in rungs or stat not in stats:
+                continue
+            vals = np.asarray(
+                X[:, list(tensor_channels).index(ch), rungs.index(int(radius)),
+                  list(stats).index(stat)], dtype=np.float64)
+            vals = vals[np.isfinite(vals)]
+            if vals.size < 2:
+                continue
+            if getattr(self, "normalize_channels", False):
+                vals = np.asarray(self._normalize_channels({ch: vals})[ch])
+            out[f"{ch}_center"] = float(vals.mean())
+            out[f"{ch}_scale"] = float(vals.std())
+        return out
 
     def _params_from_sweep(self, res, post, index_channels) -> dict:
         """Posterior -> the params dict the composite/apply path consumes.

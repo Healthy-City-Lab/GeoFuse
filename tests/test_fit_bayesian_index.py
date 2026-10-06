@@ -45,7 +45,7 @@ def _stub_engine(n=300, seed=0):
         X, np.asarray(RADII), list(STATS), ["ndvi", "gvi"], static)
     eng._preaggr_radii = lambda: (list(RADII), list(RADII))
     eng._sweep_objective = lambda metric: None
-    for name in ("_params_from_sweep", "_index_layout"):
+    for name in ("_params_from_sweep", "_index_layout", "_synergy_scaling"):
         setattr(eng, name, types.MethodType(getattr(MetricFusionEngine, name), eng))
     return eng
 
@@ -95,6 +95,36 @@ class TestFitBayesianIndexWiring(unittest.TestCase):
         self.assertEqual(sum(int(self.params[k]) for k in keys), 100)
 
 
+class TestSynergyRunRecordsItsScaling(unittest.TestCase):
+    """A synergy study's params carry the curve the composite path needs."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.addClassCleanup(setattr, parallel, "process_worker_count",
+                            parallel.process_worker_count)
+        parallel.process_worker_count = lambda *a, **k: 1
+        cls.params = MetricFusionEngine.fit_bayesian_index(
+            _stub_engine(), "r2", forms=("synergy",), sweep_splits=2, reps=0,
+            gain_splits=0, null_runs=0, draws=100, warmup=100, chains=1,
+            radius_kernel="dirichlet",
+        )
+
+    def test_every_channel_gets_a_center_and_a_scale(self):
+        self.assertEqual(self.params["__sweep__"]["form"], "synergy")
+        for ch in ("ndvi", "gvi"):
+            self.assertIn(f"{ch}_center", self.params)
+            self.assertGreater(self.params[f"{ch}_scale"], 0.0)
+
+    def test_the_composite_path_evaluates_with_them(self):
+        from geofuse import cgi_formulas
+
+        rng = np.random.default_rng(0)
+        comps = {"ndvi": rng.normal(size=50), "gvi": rng.normal(size=50)}
+        out = cgi_formulas.compute_cgi("synergy_gvi", self.params, comps)
+        self.assertTrue(np.isfinite(out).all())
+        self.assertTrue(((out > 0) & (out < 1)).all())
+
+
 def _retune_stub(n=600, seed=3):
     """U rides on ndvi at 100 m and drives both outcomes; the target alone
     also follows gvi at 900 m. Re-tuning on the control should find the 100 m
@@ -115,8 +145,8 @@ def _retune_stub(n=600, seed=3):
         X, np.asarray(RADII), ["mean"], ["ndvi", "gvi"], static)
     eng._preaggr_radii = lambda: (list(RADII), list(RADII))
     eng._sweep_objective = lambda metric: None
-    for name in ("_params_from_sweep", "_index_layout", "fit_bayesian_index",
-                 "retune_concordance"):
+    for name in ("_params_from_sweep", "_index_layout", "_synergy_scaling",
+                 "fit_bayesian_index", "retune_concordance"):
         setattr(eng, name, types.MethodType(getattr(MetricFusionEngine, name), eng))
     return eng
 
