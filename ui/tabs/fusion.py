@@ -3827,8 +3827,11 @@ def _render_study_detail(
             return f"[{lo:.4f}, {hi:.4f}]"
 
         st.markdown("**Scores by data subset**")
+        # ``val`` holds the sweep's mean held-out |t|, not a value of the
+        # objective, so it goes in the caption rather than the metric column.
+        sweep_t = _num((subset_scores.get("val") or {}).get("score"))
         rows: list[dict] = []
-        for subset in ("val", "test", "all"):
+        for subset in ("test", "all"):
             block = subset_scores.get(subset) or {}
             if not block:
                 continue
@@ -3851,8 +3854,6 @@ def _render_study_detail(
             cap = (
                 "The sweep splits the full train+val pool repeatedly, so "
                 "there is no single train→fit→validate step. "
-                "**In-pool** = the winning configuration scored on the whole "
-                "train+val pool (the signal the pick was made from) · "
                 "**Held-out test** = untouched test split the params never saw "
                 "(the headline) · **All** = every entity (in-sample, descriptive). "
                 f"95% CIs are percentile bootstrap; `{p_col}` is reported on the "
@@ -3863,6 +3864,14 @@ def _render_study_detail(
                 cap += (
                     " The metric column is covariate-adjusted (partial); "
                     "`(raw)` is the unadjusted correlation."
+                )
+            if sweep_t is not None:
+                cap += (
+                    f" The sweep's own cross-resample score was **|t| = "
+                    f"{sweep_t:.3f}**, reported separately because it is a "
+                    f"t-statistic over the resampled train+val pool rather than "
+                    f"a value of `{metric_name}` — the two do not share a scale "
+                    f"and must not be compared."
                 )
             if any(r.get(metric_name) is None for r in rows):
                 cap += (
@@ -3900,13 +3909,18 @@ def _render_cross_study_comparison(results_view: dict, metric_name: str) -> None
         "test": "Held-out test",
         "all": "All",
     }
-    _default("fusion_compare_subsets", ["val", "all"])
+    _default("fusion_compare_subsets", ["test", "all"])
     subset_picks = st.multiselect(
         "Subsets to compare",
-        options=["val", "test", "all"],
+        options=["test", "all"],
         format_func=lambda s: _subset_label.get(s, s),
         key="fusion_compare_subsets",
-        help="Each study's discovered params, scored on each subset.",
+        help=(
+            f"Each study's discovered params, scored on each subset in "
+            f"{metric_name}. The sweep's held-out |t| is charted separately "
+            f"below, because it is a t-statistic rather than a value of the "
+            f"objective and sharing an axis with it hides every real bar."
+        ),
     )
     if subset_picks:
         rows: list[dict] = []
@@ -3949,6 +3963,32 @@ def _render_cross_study_comparison(results_view: dict, metric_name: str) -> None
             )
         with st.expander("Show exact values"):
             st.dataframe(df, width="stretch")
+
+    # ── Sweep held-out |t|, on its own axis ─────────────────────
+    t_rows = [
+        {"Study": disp, "Held-out |t|": _num(
+            ((b.get("subset_scores") or {}).get("val") or {}).get("score"))}
+        for _key, disp, b in studies
+    ]
+    t_rows = [r for r in t_rows if r["Held-out |t|"] is not None]
+    if t_rows:
+        st.markdown("**Sweep held-out |t| by study**")
+        t_df = pd.DataFrame(t_rows)
+        try:
+            import plotly.express as _px
+
+            fig_t = _px.bar(t_df, x="Study", y="Held-out |t|")
+            fig_t.update_layout(height=300, margin=dict(l=60, r=20, t=30, b=80))
+            st.plotly_chart(fig_t, width="stretch")
+        except Exception:
+            st.bar_chart(t_df.set_index("Study"), width="stretch")
+        st.caption(
+            "Mean |t| of each study's winning configuration across the sweep's "
+            "held-out splits — the number each pick was actually made on. It is "
+            "a t-statistic, so it grows with sample size and is **not** "
+            f"comparable to the `{metric_name}` bars above; use it to compare "
+            "studies with each other, not against the objective."
+        )
 
     # ── Paired objective difference (Holm-corrected) ────────────
     fam = results_view.get("cgi_vs_standalone_paired_family") or []

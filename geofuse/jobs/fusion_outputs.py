@@ -238,7 +238,12 @@ def _write_fusion_outputs(
                 {
                     "study": key,
                     "subset": subset,
-                    "metric": objective_metric,
+                    # ``val`` carries the sweep's mean held-out |t|, not a
+                    # value of the objective, so it gets its own metric name.
+                    "metric": (
+                        "sweep_holdout_abs_t" if subset == "val"
+                        else objective_metric
+                    ),
                     "score": _f(block.get("score")),
                     "score_raw": _f(block.get("score_raw")),
                     "n": block.get("n"),
@@ -259,6 +264,14 @@ def _write_fusion_outputs(
     for key, _disp, b in studies:
         summ = b.get("discovery_summary") or {}
         picked = summ.get("picked") or []
+        # ``radius_m`` / ``aggregator`` are the posterior projection the
+        # composite is built from; the sweep's shortlist cell is kept in the
+        # ``sweep_*`` columns.
+        projected = summ.get("projected_pick") or []
+        radius_profile = summ.get("radius_profile") or []
+        peak = summ.get("peak_radius_mean") or []
+        peak_ratio = summ.get("peak_radius_width_ratio") or []
+        informative = summ.get("aggregator_informative") or []
         chans = summ.get("channels") or []
         wm = summ.get("weight_mean") or []
         wlo = summ.get("weight_ci_low") or []
@@ -271,12 +284,29 @@ def _write_fusion_outputs(
         labels = summ.get("weight_labels") or chans
         for i, name in enumerate(labels):
             pick = picked[i] if i < len(picked) else ()
+            proj = projected[i] if i < len(projected) else ()
+            # A pair term of the synergy form has a weight but no cell of its
+            # own, so its grid columns stay blank rather than repeating a
+            # component's values.
+            has_grid = i < len(radius_profile)
             disc_rows.append(
                 {
                     "study": key,
                     "channel": name,
-                    "radius_m": pick[0] if len(pick) > 0 else None,
-                    "aggregator": pick[1] if len(pick) > 1 else None,
+                    "radius_m": (proj[0] if len(proj) > 0
+                                 else (pick[0] if len(pick) > 0 else None)),
+                    "aggregator": (proj[1] if len(proj) > 1
+                                   else (pick[1] if len(pick) > 1 else None)),
+                    "sweep_radius_m": pick[0] if len(pick) > 0 else None,
+                    "sweep_aggregator": pick[1] if len(pick) > 1 else None,
+                    "peak_radius_m": (
+                        _f(peak[i]) if has_grid and i < len(peak) else None),
+                    "peak_radius_width_vs_prior": (
+                        _f(peak_ratio[i])
+                        if has_grid and i < len(peak_ratio) else None),
+                    "aggregators_separated": (
+                        ";".join(informative[i]) if has_grid
+                        and i < len(informative) and informative[i] else None),
                     "weight": _f(wm[i]) if i < len(wm) else None,
                     "weight_ci_low": _f(wlo[i]) if i < len(wlo) else None,
                     "weight_ci_high": _f(whi[i]) if i < len(whi) else None,
