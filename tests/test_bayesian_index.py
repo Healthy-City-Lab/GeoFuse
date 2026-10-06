@@ -517,6 +517,114 @@ class TestCollinearAggregatorsDoNotManufactureAPick(unittest.TestCase):
         self.assertIn("p90", post.informative_aggregators()[0])
 
 
+class TestPartialCoverageDoesNotPoisonTheReport(unittest.TestCase):
+    """Street-view coverage is missing for a few addresses at small radii.
+
+    Two separate failures follow from that on real data, and neither shows up
+    as an error -- the run completes and reports NaN where a number belongs.
+    Standardising a column that holds one NaN yields a NaN column, so a handful
+    of uncovered entities cost every entity that candidate; and an index built
+    from the surviving channels still multiplied the dropped column by zero,
+    which is NaN rather than nothing.
+    """
+
+    @staticmethod
+    def _cube(n=600, gap_rows=5):
+        rng = np.random.default_rng(5)
+        X = rng.normal(size=(n, 2, len(RADII), len(STATS)))
+        y = 0.6 * X[:, 1, 2, 1] + rng.normal(size=n)
+        # A few entities have no coverage for channel 0 at the smallest radius,
+        # exactly as an address with no panorama inside 200 m does.
+        X[:gap_rows, 0, 0, :] = np.nan
+        return X, y
+
+    def test_a_few_uncovered_entities_do_not_kill_a_column(self):
+        X, y = self._cube()
+        yr, Xr = bi.prep(X, y, None)
+        flat = Xr.reshape(len(Xr), -1)
+        self.assertTrue(np.isfinite(flat).all())
+        self.assertEqual(len(Xr), len(X) - 5)
+        self.assertEqual(len(yr), len(Xr))
+
+    def test_a_structurally_absent_cell_drops_the_column_not_the_rows(self):
+        # A channel simply not measured at a radius is NaN for everyone. That
+        # is a column to leave out, not a reason to drop the whole cohort.
+        X, y = self._cube(gap_rows=0)
+        X[:, 0, 3, :] = np.nan
+        yr, Xr = bi.prep(X, y, None)
+        self.assertEqual(len(Xr), len(X))
+        self.assertTrue(np.isnan(Xr[:, 0, 3, :]).all())
+        keep = np.ones(Xr.shape, dtype=bool)
+        keep[:, 0, 3, :] = False
+        self.assertTrue(np.isfinite(Xr[keep]).all())
+
+    def test_the_scan_ignores_channels_the_study_does_not_use(self):
+        X, y = self._cube(gap_rows=0)
+        X[:7, 0, 1, :] = np.nan
+        _, Xr = bi.prep(X, y, None, channel_index=[1])
+        self.assertEqual(len(Xr), len(X))
+
+    def test_an_index_ignores_a_channel_it_dropped(self):
+        # The weight is zero, so the column must not reach the arithmetic at
+        # all -- ``0 * nan`` is what turned every reported t into NaN.
+        rng = np.random.default_rng(6)
+        E = rng.normal(size=(300, 2))
+        y = 1.5 * E[:, 0] + 0.05 * rng.normal(size=300)
+        apply_fn, params = bi.build_index(E, y, "linear")
+        self.assertAlmostEqual(float(np.asarray(params["weights"])[1]), 0.0, places=9)
+        E_gap = E.copy()
+        E_gap[:4, 1] = np.nan
+        self.assertTrue(np.isfinite(apply_fn(E_gap)).all())
+        self.assertTrue(np.isfinite(bi._tstat(apply_fn(E_gap), y)))
+
+    def test_the_discovery_loop_reports_numbers_not_nan(self):
+        X, y = self._cube()
+        yr, Xr = bi.prep(X, y, None)
+        out = bi.repeated_discovery(
+            Xr, RADII, STATS, yr, channels=("a", "b"), channel_index=(0, 1),
+            reps=2, shuffles=3, workers=1,
+        )
+        lin = out["per_form"]["linear"]
+        for key in ("train_t", "test_t", "shrinkage"):
+            self.assertTrue(np.isfinite(lin[key]), f"{key} is {lin[key]}")
+
+    def test_an_undefined_gain_does_not_become_a_significant_p_value(self):
+        # NaN compares false against every permuted gain, so the count of
+        # exceedances is zero and the permutation p comes out at its floor --
+        # the most significant value the test can produce, from no statistic.
+        import geofuse.bayesian_index as _bi
+
+        real_map = _bi._map
+
+        def fake_map(fn, tasks, n_workers, cancel_check=None):
+            out = real_map(fn, tasks, 1, cancel_check)
+            for r in out:
+                r["gain"] = float("nan")
+            return out
+
+        X, y = self._cube()
+        yr, Xr = bi.prep(X, y, None)
+        _bi._map = fake_map
+        try:
+            gain = bi.holdout_gain(
+                Xr, yr, channels=("a", "b"), channel_index=(0, 1),
+                splits=3, perm=3, workers=1,
+            )
+        finally:
+            _bi._map = real_map
+        self.assertIsNone(gain["gain_p"])
+
+    def test_the_gain_comparison_reports_a_composite_score(self):
+        X, y = self._cube()
+        yr, Xr = bi.prep(X, y, None)
+        gain = bi.holdout_gain(
+            Xr, yr, channels=("a", "b"), channel_index=(0, 1),
+            splits=3, perm=3, workers=1,
+        )
+        for key in ("cgi", "best_single", "gain"):
+            self.assertTrue(np.isfinite(gain[key]), f"{key} is {gain[key]}")
+
+
 class TestPriorIntervals(unittest.TestCase):
     """Every reported interval needs the prior it was drawn from beside it."""
 

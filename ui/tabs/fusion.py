@@ -3214,9 +3214,9 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
                     [
                         {
                             "Form": f,
-                            "Train |t|": round(float(v.get("train_t", np.nan)), 3),
-                            "Held-out |t|": round(float(v.get("test_t", np.nan)), 3),
-                            "Shrinkage": round(float(v.get("shrinkage", np.nan)), 3),
+                            "Train |t|": _fmt(v.get("train_t"), 3),
+                            "Held-out |t|": _fmt(v.get("test_t"), 3),
+                            "Shrinkage": _fmt(v.get("shrinkage"), 3),
                         }
                         for f, v in per_form.items()
                     ]
@@ -3230,6 +3230,15 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
                 "to unseen rows. A form with a higher train score and a larger "
                 "shrinkage is overfitting, not winning."
             )
+            if any(_num(v.get("test_t")) is None for v in per_form.values()):
+                st.info(
+                    "These are blank for runs recorded before entities without "
+                    "greenery coverage at every searched radius were excluded. "
+                    "One such entity made the average of the replicates "
+                    "undefined, so the whole column reads as missing. The "
+                    "weights beside it were unaffected, and re-running the "
+                    "study fills these in."
+                )
 
     # ── Composite vs its own channels ───────────────────────────
     gain = summary.get("holdout_gain") or {}
@@ -3240,7 +3249,11 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
             st.metric(
                 "Composite (held-out)",
                 _fmt(gain.get("cgi"), 3),
-                help="Mean held-out |t| of the fitted composite.",
+                help=(
+                    "Mean held-out |t| of the fitted composite. Blank on runs "
+                    "recorded before uncovered entities were excluded from the "
+                    "search — a single one made this average undefined."
+                ),
             )
         with g2:
             st.metric(

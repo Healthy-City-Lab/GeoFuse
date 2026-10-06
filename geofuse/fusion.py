@@ -3276,13 +3276,26 @@ class MetricFusionEngine:
 
         X, radii, stats, tensor_channels, static = self.build_index_tensor("train_val")
         y = np.asarray(static["target"], dtype=np.float64)
-        yr, Xr = bayesian_index.prep(X, y, static.get("cov"))
-        tick()
 
         index_channels = list(cgi_formulas.formula_channels(self.cgi_formula))
         if self._active_greenery_channel != "cgi":
             index_channels = [self._active_greenery_channel]
         channel_index = [tensor_channels.index(c) for c in index_channels]
+
+        # The channels in play are settled before residualising, so a coverage
+        # gap in a channel this study never reads cannot drop rows from it.
+        yr, Xr = bayesian_index.prep(X, y, static.get("cov"),
+                                     channel_index=channel_index)
+        dropped = int(len(X) - len(Xr))
+        if dropped:
+            _log(
+                "WARN",
+                f"{dropped} of {len(X)} entities have no greenery coverage at "
+                f"some searched radius and were dropped from the index search "
+                f"({100.0 * dropped / max(len(X), 1):.1f}%). Every candidate is "
+                f"scored on the remaining {len(Xr)}.",
+            )
+        tick()
 
         # A channel is only offered the radii its own ladder was computed at.
         gvi_radii, ndvi_radii = self._preaggr_radii()

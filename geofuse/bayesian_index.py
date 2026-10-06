@@ -59,25 +59,57 @@ _POWER_LO, _POWER_HI = 0.2, 1.0
 # ────────────────────────────────────────────────────────────────────
 
 
-def prep(X: np.ndarray, y: np.ndarray, covariates: np.ndarray | None):
+def prep(X: np.ndarray, y: np.ndarray, covariates: np.ndarray | None,
+         *, channel_index=None):
     """Frisch-Waugh: project the covariates out of **both** sides, then z-score.
 
     Residualising only the outcome leaves the exposure correlated with the
     covariates, and the index coefficient is then not the partial association.
 
-    ``X`` is ``(n, channel, radius, stat)``; the return has the same shape.
+    ``X`` is ``(n, channel, radius, stat)``; the return has the same shape but
+    may have **fewer rows**: standardising is not NaN-tolerant, so an entity
+    with a coverage gap in any measured column is dropped. Street-view coverage
+    has exactly this shape — an address with no panorama inside the smaller
+    radii.
+
+    Two kinds of missing are distinguished, because they call for opposite
+    treatment:
+
+    - a cell that is NaN for **every** entity is a ``(radius, stat)`` this
+      channel was never measured at, so the *column* is left out of the scan
+      and stays NaN; ``radius_idx`` already keeps it out of the candidates;
+    - a cell that is NaN for **some** entities is a coverage gap, so those
+      *entities* are dropped, and every candidate is then compared on one
+      identical set of rows — which is what makes a single Gram matrix a valid
+      basis for ranking them.
+
+    ``channel_index`` limits the scan to the channels the index will actually
+    use, so a channel that is cached but unused cannot drop rows for a study
+    that never reads it.
     """
+    X = np.asarray(X, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
-    if covariates is None or covariates.size == 0:
-        covariates = np.ones((len(y), 1))
-    q, _ = np.linalg.qr(np.asarray(covariates, dtype=np.float64))
+    cov = np.asarray(covariates, dtype=np.float64) if covariates is not None else None
+    if cov is None or cov.size == 0:
+        cov = np.ones((len(y), 1))
+
+    scan = X if channel_index is None else X[:, list(channel_index)]
+    scan = scan.reshape(len(X), -1)
+    measured = ~np.isnan(scan).all(0)
+    keep = np.isfinite(y) & np.isfinite(cov).all(1)
+    if measured.any():
+        keep &= np.isfinite(scan[:, measured]).all(1)
+    if not keep.all():
+        X, y, cov = X[keep], y[keep], cov[keep]
+
+    q, _ = np.linalg.qr(cov)
 
     def rz(a):
         return a - q @ (q.T @ a)
 
     yr = rz(y)
     yr = (yr - yr.mean()) / (yr.std() + 1e-12)
-    flat = rz(np.asarray(X, dtype=np.float64).reshape(len(X), -1))
+    flat = rz(X.reshape(len(X), -1))
     flat = (flat - flat.mean(0)) / (flat.std(0) + 1e-12)
     return yr, flat.reshape(X.shape)
 
@@ -510,7 +542,9 @@ def build_index(E_train, y_train, form):
             sub, w = fit
         dense = np.zeros(k)
         dense[sub] = w
-        return (lambda M: M @ dense), {"weights": dense, "kept": sub}
+        # Index over the kept columns only, so a dropped channel's missing
+        # values never reach the arithmetic (``0 * nan`` is ``nan``).
+        return (lambda M: M[:, sub] @ w), {"weights": dense, "kept": sub}
     sf = fit_synergy(E_train, y_train)
     return sf.apply, {"weights": sf.w, "powers": sf.p}
 
@@ -1072,12 +1106,21 @@ def holdout_gain(X, y, *, channels, channel_index, radius_idx=None,
 
     g = np.array([r["gain"] for r in obs])
     gn = np.array([r["gain"] for r in null])
+    observed = float(g.mean())
+    # A p-value needs a finite observed gain; NaN compares false against every
+    # permuted gain and would read as the floor p. Non-finite nulls are dropped.
+    usable = math.isfinite(observed) and bool(np.isfinite(gn).any())
     out = {
         "cgi": float(np.mean([r["cgi"] for r in obs])),
         "best_single": float(np.mean([r["best_single"] for r in obs])),
-        "gain": float(g.mean()),
-        "gain_null_mean": float(gn.mean()),
-        "gain_p": float((1 + int((gn >= g.mean()).sum())) / (1 + len(gn))),
+        "gain": observed,
+        "gain_null_mean": (float(gn[np.isfinite(gn)].mean())
+                           if np.isfinite(gn).any() else float("nan")),
+        "gain_p": (
+            float((1 + int((gn[np.isfinite(gn)] >= observed).sum()))
+                  / (1 + int(np.isfinite(gn).sum())))
+            if usable else None
+        ),
         "gain_won": int((g > 0).sum()),
         "splits": splits,
     }
