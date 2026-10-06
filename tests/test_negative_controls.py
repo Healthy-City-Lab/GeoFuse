@@ -37,8 +37,7 @@ class TestPartialSlope(unittest.TestCase):
         # In SD units of the residuals the slope is the partial correlation.
         q, _ = bi.covariate_basis(cov, n)
         xr, yr = x - q @ (q.T @ x), y - q @ (q.T @ y)
-        self.assertAlmostEqual(got["beta"], float(np.corrcoef(xr, yr)[0, 1]),
-                               places=10)
+        self.assertAlmostEqual(got["beta"], float(np.corrcoef(xr, yr)[0, 1]), places=10)
         self.assertLess(got["ci_low"], got["beta"])
         self.assertGreater(got["ci_high"], got["beta"])
 
@@ -91,8 +90,9 @@ class TestPairedContrast(unittest.TestCase):
         ent = nc.paired_contrast(x, a, b, cov, n_boot=600, seed=5)
         clu = nc.paired_contrast(x, a, b, cov, n_boot=600, seed=5, clusters=labels)
         self.assertEqual(clu["clusters"], k)
-        self.assertGreater(clu["ci_high"] - clu["ci_low"],
-                           ent["ci_high"] - ent["ci_low"])
+        self.assertGreater(
+            clu["ci_high"] - clu["ci_low"], ent["ci_high"] - ent["ci_low"]
+        )
 
     def test_the_contrast_uses_rows_where_both_outcomes_exist(self):
         x, a, b, cov = self._data()
@@ -123,16 +123,28 @@ def _tune_and_transfer(X, target, control, seed=0, n_boot=400):
     te = np.random.default_rng(seed + 100).random(n) < 0.25
     tr = ~te
     yr, Xr = bi.prep(X[tr], target[tr], None)
-    res = bi.sweep(Xr, np.array([100.0, 300.0, 900.0]), ["mean"], yr,
-                   channels=("a", "b"), channel_index=(0, 1), splits=6,
-                   workers=1, forms=("linear",))
+    res = bi.sweep(
+        Xr,
+        np.array([100.0, 300.0, 900.0]),
+        ["mean"],
+        yr,
+        channels=("a", "b"),
+        channel_index=(0, 1),
+        splits=6,
+        workers=1,
+        forms=("linear",),
+    )
     cols = list(res.columns)
     flat = X.reshape(n, -1)
     mu, sd = flat[tr][:, cols].mean(0), flat[tr][:, cols].std(0)
     apply_fn, _ = bi.build_index((flat[tr][:, cols] - mu) / sd, yr, "linear")
     exposure = apply_fn((flat[te][:, cols] - mu) / sd)
-    return nc.transfer_test(exposure, target[te], {"grip": control[te]},
-                            n_boot=n_boot, seed=seed), res
+    return (
+        nc.transfer_test(
+            exposure, target[te], {"grip": control[te]}, n_boot=n_boot, seed=seed
+        ),
+        res,
+    )
 
 
 class TestTransferAcceptance(unittest.TestCase):
@@ -180,23 +192,36 @@ def _engine_stub(n_ent=400, n_test=100, seed=7, controls=("grip",)):
     composite = 0.7 * u + rng.normal(size=n_ent)
     target = 0.3 * u + 0.3 * composite + rng.normal(size=n_ent)
     grip = 0.3 * u + rng.normal(size=n_ent)
-    grip[:12] = np.nan                       # missing for a few entities
+    grip[:12] = np.nan  # missing for a few entities
     age = rng.normal(size=n_ent)
     pid = np.repeat(np.arange(n_ent), 2)
-    full = pd.DataFrame({"polygon_id": pid, "target": target[pid],
-                         "age": age[pid], "grip": grip[pid],
-                         "fsa": (pid // 10).astype(str)})
-    applied = pd.DataFrame({"polygon_id": np.arange(n_ent), "target": target,
-                            "composite": composite})
+    full = pd.DataFrame(
+        {
+            "polygon_id": pid,
+            "target": target[pid],
+            "age": age[pid],
+            "grip": grip[pid],
+            "fsa": (pid // 10).astype(str),
+        }
+    )
+    applied = pd.DataFrame(
+        {"polygon_id": np.arange(n_ent), "target": target, "composite": composite}
+    )
     eng = types.SimpleNamespace(
-        negative_control_columns=list(controls), is_longitudinal=False,
-        covariate_columns=["age"], _covariate_dummy_map={},
+        negative_control_columns=list(controls),
+        is_longitudinal=False,
+        covariate_columns=["age"],
+        _covariate_dummy_map={},
         test_data=full[full["polygon_id"] < n_test],
     )
     eng.apply_fusion = lambda weights=None: applied
     eng._full_data_frame = lambda: full
-    for name in ("_reporting_covariate_matrix", "_reporting_raw_column",
-                 "_test_entity_mask", "compute_negative_controls"):
+    for name in (
+        "_reporting_covariate_matrix",
+        "_reporting_raw_column",
+        "_test_entity_mask",
+        "compute_negative_controls",
+    ):
         setattr(eng, name, types.MethodType(getattr(E, name), eng))
     eng._finite_rows = E._finite_rows
     return eng
@@ -214,7 +239,8 @@ class TestEngineTransfer(unittest.TestCase):
 
     def test_whole_areas_are_resampled_on_request(self):
         out = _engine_stub().compute_negative_controls(
-            {}, n_boot=50, cluster_column="fsa")
+            {}, n_boot=50, cluster_column="fsa"
+        )
         self.assertEqual(out["cluster_column"], "fsa")
 
     def test_no_controls_returns_nothing(self):
@@ -243,14 +269,27 @@ class TestEngineTransfer(unittest.TestCase):
 class TestConcordance(unittest.TestCase):
     @staticmethod
     def _summary(profile, agg, r50, w, pick, beta=0.1, form="linear"):
-        return {"channels": ["ndvi", "gvi"], "radius_profile": profile,
-                "aggregator_mean": agg, "r50_mean": r50, "weight_mean": w,
-                "projected_pick": pick, "beta_mean": beta, "beta_ci_low": 0.0,
-                "beta_ci_high": 0.2, "form": form}
+        return {
+            "channels": ["ndvi", "gvi"],
+            "radius_profile": profile,
+            "aggregator_mean": agg,
+            "r50_mean": r50,
+            "weight_mean": w,
+            "projected_pick": pick,
+            "beta_mean": beta,
+            "beta_ci_low": 0.0,
+            "beta_ci_high": 0.2,
+            "form": form,
+        }
 
     def test_identical_tunings_have_zero_distance_and_the_same_cells(self):
-        s = self._summary([[0.2, 0.8], [0.5, 0.5]], [[1.0, 0.0], [0.5, 0.5]],
-                          [100.0, 300.0], [0.6, 0.4], [[500, "mean"], [250, "p10"]])
+        s = self._summary(
+            [[0.2, 0.8], [0.5, 0.5]],
+            [[1.0, 0.0], [0.5, 0.5]],
+            [100.0, 300.0],
+            [0.6, 0.4],
+            [[500, "mean"], [250, "p10"]],
+        )
         out = nc.concordance(s, s)
         for row in out["channels"].values():
             self.assertEqual(row["radius_profile_tv"], 0.0)
@@ -259,11 +298,22 @@ class TestConcordance(unittest.TestCase):
             self.assertTrue(row["same_pick"])
 
     def test_disjoint_tunings_are_one_apart(self):
-        a = self._summary([[1.0, 0.0], [1.0, 0.0]], [[1.0, 0.0], [1.0, 0.0]],
-                          [70.0, 70.0], [0.9, 0.1], [[100, "mean"], [100, "mean"]])
-        b = self._summary([[0.0, 1.0], [0.0, 1.0]], [[0.0, 1.0], [0.0, 1.0]],
-                          [700.0, 700.0], [0.1, 0.9], [[900, "p90"], [900, "p90"]],
-                          beta=0.3, form="synergy")
+        a = self._summary(
+            [[1.0, 0.0], [1.0, 0.0]],
+            [[1.0, 0.0], [1.0, 0.0]],
+            [70.0, 70.0],
+            [0.9, 0.1],
+            [[100, "mean"], [100, "mean"]],
+        )
+        b = self._summary(
+            [[0.0, 1.0], [0.0, 1.0]],
+            [[0.0, 1.0], [0.0, 1.0]],
+            [700.0, 700.0],
+            [0.1, 0.9],
+            [[900, "p90"], [900, "p90"]],
+            beta=0.3,
+            form="synergy",
+        )
         out = nc.concordance(a, b)
         row = out["channels"]["ndvi"]
         self.assertEqual(row["radius_profile_tv"], 1.0)
@@ -271,8 +321,9 @@ class TestConcordance(unittest.TestCase):
         self.assertAlmostEqual(row["abs_delta_r50"], 630.0)
         self.assertAlmostEqual(row["abs_delta_weight"], 0.8)
         self.assertFalse(row["same_pick"])
-        self.assertEqual((out["form_target"], out["form_control"]),
-                         ("linear", "synergy"))
+        self.assertEqual(
+            (out["form_target"], out["form_control"]), ("linear", "synergy")
+        )
         self.assertEqual(out["control_beta"], 0.3)
 
 
@@ -280,8 +331,12 @@ class TestRetuneLedgerStage(unittest.TestCase):
     def test_the_stage_appears_only_when_asked_for(self):
         from geofuse.jobs.fusion_outputs import _build_fusion_ledger
 
-        keys = [s.key for s in _build_fusion_ledger(
-            ["Y"], multi=False, negative_control_retune=True).stages]
+        keys = [
+            s.key
+            for s in _build_fusion_ledger(
+                ["Y"], multi=False, negative_control_retune=True
+            ).stages
+        ]
         self.assertEqual(keys[-1], "negative_control_retune")
         keys = [s.key for s in _build_fusion_ledger(["Y"], multi=False).stages]
         self.assertNotIn("negative_control_retune", keys)

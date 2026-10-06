@@ -42,16 +42,28 @@ class TestRecoversAPlantedSignal(unittest.TestCase):
     def test_the_sweep_finds_the_column_the_outcome_was_built_from(self):
         Xr, yr = _planted()
         res = bi.sweep(
-            Xr, RADII, STATS, yr,
-            channels=("a", "b"), channel_index=(0, 1), splits=6, workers=1,
+            Xr,
+            RADII,
+            STATS,
+            yr,
+            channels=("a", "b"),
+            channel_index=(0, 1),
+            splits=6,
+            workers=1,
         )
         self.assertEqual(res.picked[1], (600, "p50"))
 
     def test_the_weight_lands_on_the_channel_carrying_the_signal(self):
         Xr, yr = _planted()
         res = bi.sweep(
-            Xr, RADII, STATS, yr,
-            channels=("a", "b"), channel_index=(0, 1), splits=6, workers=1,
+            Xr,
+            RADII,
+            STATS,
+            yr,
+            channels=("a", "b"),
+            channel_index=(0, 1),
+            splits=6,
+            workers=1,
         )
         Z = Xr.reshape(len(Xr), -1)[:, list(res.columns)]
         kept, w = bi.simplex_fit(Z.T @ Z, Z.T @ yr)
@@ -73,8 +85,14 @@ class TestParsimonyTiebreak(unittest.TestCase):
     def test_the_one_se_pick_keeps_the_same_active_channels(self):
         Xr, yr = _planted()
         res = bi.sweep(
-            Xr, RADII, STATS, yr,
-            channels=("a", "b"), channel_index=(0, 1), splits=6, workers=1,
+            Xr,
+            RADII,
+            STATS,
+            yr,
+            channels=("a", "b"),
+            channel_index=(0, 1),
+            splits=6,
+            workers=1,
         )
         self.assertEqual(len(res.one_se_columns), len(res.columns))
         n_radii, n_stats = Xr.shape[2], Xr.shape[3]
@@ -85,14 +103,18 @@ class TestParsimonyTiebreak(unittest.TestCase):
     def test_the_one_se_pick_is_no_larger_than_the_winner(self):
         Xr, yr = _planted()
         res = bi.sweep(
-            Xr, RADII, STATS, yr,
-            channels=("a", "b"), channel_index=(0, 1), splits=6, workers=1,
+            Xr,
+            RADII,
+            STATS,
+            yr,
+            channels=("a", "b"),
+            channel_index=(0, 1),
+            splits=6,
+            workers=1,
         )
         n_radii, n_stats = Xr.shape[2], Xr.shape[3]
         one_se = bi._decode(res.one_se_columns, n_radii, n_stats, RADII, STATS)
-        self.assertLessEqual(
-            sum(r for r, _ in one_se), sum(r for r, _ in res.picked)
-        )
+        self.assertLessEqual(sum(r for r, _ in one_se), sum(r for r, _ in res.picked))
 
 
 class TestBoundaryIsFlagged(unittest.TestCase):
@@ -101,8 +123,14 @@ class TestBoundaryIsFlagged(unittest.TestCase):
     def test_a_signal_at_the_largest_radius_raises_the_flag(self):
         Xr, yr = _planted(radius=len(RADII) - 1, strength=1.2)
         res = bi.sweep(
-            Xr, RADII, STATS, yr,
-            channels=("a", "b"), channel_index=(0, 1), splits=6, workers=1,
+            Xr,
+            RADII,
+            STATS,
+            yr,
+            channels=("a", "b"),
+            channel_index=(0, 1),
+            splits=6,
+            workers=1,
         )
         self.assertEqual(res.picked[1][0], 800)
         self.assertIn("b", res.boundary_hit)
@@ -110,8 +138,14 @@ class TestBoundaryIsFlagged(unittest.TestCase):
     def test_an_interior_signal_does_not(self):
         Xr, yr = _planted(radius=2)
         res = bi.sweep(
-            Xr, RADII, STATS, yr,
-            channels=("a", "b"), channel_index=(0, 1), splits=6, workers=1,
+            Xr,
+            RADII,
+            STATS,
+            yr,
+            channels=("a", "b"),
+            channel_index=(0, 1),
+            splits=6,
+            workers=1,
         )
         self.assertNotIn("b", res.boundary_hit)
 
@@ -122,8 +156,14 @@ class TestNullCalibration(unittest.TestCase):
     def test_a_shuffled_outcome_rarely_produces_an_interval_excluding_zero(self):
         Xr, yr = _planted(n=600)
         res = bi.sweep(
-            Xr, RADII, STATS, yr,
-            channels=("a", "b"), channel_index=(0, 1), splits=4, workers=1,
+            Xr,
+            RADII,
+            STATS,
+            yr,
+            channels=("a", "b"),
+            channel_index=(0, 1),
+            splits=4,
+            workers=1,
         )
         E = Xr.reshape(len(Xr), -1)[:, list(res.columns)]
         out = bi.null_calibration(E, yr, form=res.form, n=8, workers=1)
@@ -192,8 +232,7 @@ class TestWeightsAreOnePerChannel(unittest.TestCase):
     def test_the_index_still_matches_the_weights_it_reports(self):
         E, y = self._two_channels(1.0)
         apply_fn, params = bi.build_index(E, y, "linear")
-        self.assertTrue(
-            np.allclose(apply_fn(E), E @ np.asarray(params["weights"])))
+        self.assertTrue(np.allclose(apply_fn(E), E @ np.asarray(params["weights"])))
 
     def test_fits_with_different_active_sets_stack(self):
         rows = [
@@ -206,8 +245,15 @@ class TestWeightsAreOnePerChannel(unittest.TestCase):
     def test_the_discovery_loop_averages_them(self):
         Xr, yr = _planted(n=500)
         out = bi.repeated_discovery(
-            Xr, RADII, STATS, yr, channels=("a", "b"), channel_index=(0, 1),
-            reps=2, shuffles=3, workers=1,
+            Xr,
+            RADII,
+            STATS,
+            yr,
+            channels=("a", "b"),
+            channel_index=(0, 1),
+            reps=2,
+            shuffles=3,
+            workers=1,
         )
         self.assertEqual(len(out["per_form"]["linear"]["weights_mean"]), 2)
         self.assertEqual(len(out["per_form"]["linear"]["weights_sd"]), 2)
@@ -224,28 +270,56 @@ class TestCancelStopsTheSearch(unittest.TestCase):
         Xr, yr = _planted(n=400)
         with self.assertRaises(JobCancelled):
             bi.sweep(
-                Xr, RADII, STATS, yr, channels=("a", "b"), channel_index=(0, 1),
-                splits=50, workers=1, cancel_check=lambda: True,
+                Xr,
+                RADII,
+                STATS,
+                yr,
+                channels=("a", "b"),
+                channel_index=(0, 1),
+                splits=50,
+                workers=1,
+                cancel_check=lambda: True,
             )
 
     def test_discovery_and_gain_give_up_too(self):
         Xr, yr = _planted(n=400)
         with self.assertRaises(JobCancelled):
             bi.repeated_discovery(
-                Xr, RADII, STATS, yr, channels=("a", "b"), channel_index=(0, 1),
-                reps=2, shuffles=4, workers=1, cancel_check=lambda: True,
+                Xr,
+                RADII,
+                STATS,
+                yr,
+                channels=("a", "b"),
+                channel_index=(0, 1),
+                reps=2,
+                shuffles=4,
+                workers=1,
+                cancel_check=lambda: True,
             )
         with self.assertRaises(JobCancelled):
             bi.holdout_gain(
-                Xr, yr, channels=("a", "b"), channel_index=(0, 1),
-                splits=4, perm=4, workers=1, cancel_check=lambda: True,
+                Xr,
+                yr,
+                channels=("a", "b"),
+                channel_index=(0, 1),
+                splits=4,
+                perm=4,
+                workers=1,
+                cancel_check=lambda: True,
             )
 
     def test_an_unset_flag_changes_nothing(self):
         Xr, yr = _planted(n=400)
         res = bi.sweep(
-            Xr, RADII, STATS, yr, channels=("a", "b"), channel_index=(0, 1),
-            splits=6, workers=1, cancel_check=lambda: False,
+            Xr,
+            RADII,
+            STATS,
+            yr,
+            channels=("a", "b"),
+            channel_index=(0, 1),
+            splits=6,
+            workers=1,
+            cancel_check=lambda: False,
         )
         self.assertEqual(res.picked[1], (int(RADII[2]), STATS[1]))
 
@@ -309,8 +383,14 @@ class TestDirectionIsNotAssumed(unittest.TestCase):
         y = -0.6 * X[:, 1, 2, 1] + rng.normal(size=n)
         yr, Xr = bi.prep(X, y, None)
         res = bi.sweep(
-            Xr, RADII, STATS, yr,
-            channels=("a", "b"), channel_index=(0, 1), splits=6, workers=1,
+            Xr,
+            RADII,
+            STATS,
+            yr,
+            channels=("a", "b"),
+            channel_index=(0, 1),
+            splits=6,
+            workers=1,
         )
         self.assertEqual(res.picked[1], (600, "p50"))
 
@@ -331,8 +411,9 @@ def _humped(n=2000, peak=400.0, width=0.6, stat="p10", sign=-1.0, seed=7):
         for r in range(len(radii)):
             for s in range(len(stats)):
                 f = fidelity[r] * (1.0 if stats[s] == stat else 0.35)
-                X[:, c, r, s] = (f * latent[:, c]
-                                 + np.sqrt(1 - f ** 2) * rng.normal(size=n))
+                X[:, c, r, s] = f * latent[:, c] + np.sqrt(1 - f**2) * rng.normal(
+                    size=n
+                )
     # Only channel 0 drives the outcome; channel 1 is there to be rejected.
     y = sign * 0.35 * latent[:, 0] + rng.normal(size=n)
     yr, Xr = bi.prep(X, y, None)
@@ -351,12 +432,28 @@ class TestTheGridIsFittedNotPicked(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         Xr, yr, radii, stats = _humped()
-        mcmc = bi.fit(Xr, yr, form="linear", radii=radii, stats=stats,
-                      radius_kernel="lognormal", aggregator="dirichlet",
-                      draws=400, warmup=400, chains=2, seed=1)
+        mcmc = bi.fit(
+            Xr,
+            yr,
+            form="linear",
+            radii=radii,
+            stats=stats,
+            radius_kernel="lognormal",
+            aggregator="dirichlet",
+            draws=400,
+            warmup=400,
+            chains=2,
+            seed=1,
+        )
         cls.post = bi.posterior_from(
-            mcmc, channels=("a", "b"), picked=(), form="linear",
-            radii=radii, stats=stats, radius_kernel="lognormal")
+            mcmc,
+            channels=("a", "b"),
+            picked=(),
+            form="linear",
+            radii=radii,
+            stats=stats,
+            radius_kernel="lognormal",
+        )
         cls.out = cls.post.summary()
 
     def test_the_peak_lands_at_the_interior_radius_the_data_was_built_around(self):
@@ -390,8 +487,7 @@ class TestTheGridIsFittedNotPicked(unittest.TestCase):
         self.assertLess(self.out["beta_ci_high"], 0.0)
 
     def test_the_weight_goes_to_the_channel_driving_the_outcome(self):
-        self.assertGreater(self.out["weight_mean"][0],
-                           self.out["weight_mean"][1])
+        self.assertGreater(self.out["weight_mean"][0], self.out["weight_mean"][1])
 
     def test_the_projection_names_a_cell_the_composite_can_carry(self):
         radius, stat = self.post.projected_pick()[0]
@@ -417,11 +513,27 @@ class TestOffLadderCellsAreExcluded(unittest.TestCase):
         mask[1, :2] = False
         Xr = Xr.copy()
         Xr[:, 1, :2, :] = np.nan
-        mcmc = bi.fit(Xr, yr, form="linear", radii=radii, stats=stats,
-                      radius_mask=mask, draws=200, warmup=200, chains=2, seed=2)
+        mcmc = bi.fit(
+            Xr,
+            yr,
+            form="linear",
+            radii=radii,
+            stats=stats,
+            radius_mask=mask,
+            draws=200,
+            warmup=200,
+            chains=2,
+            seed=2,
+        )
         post = bi.posterior_from(
-            mcmc, channels=("a", "b"), picked=(), form="linear",
-            radii=radii, stats=stats, radius_kernel="lognormal")
+            mcmc,
+            channels=("a", "b"),
+            picked=(),
+            form="linear",
+            radii=radii,
+            stats=stats,
+            radius_kernel="lognormal",
+        )
         prof = np.asarray(post.summary()["radius_profile"])
         self.assertTrue(np.allclose(prof[1, :2], 0.0))
         self.assertAlmostEqual(float(prof[1].sum()), 1.0, places=5)
@@ -440,11 +552,26 @@ class TestSingleChannelStudy(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         Xr, yr, radii, stats = _humped(n=800)
-        mcmc = bi.fit(Xr[:, :1], yr, form="linear", radii=radii, stats=stats,
-                      draws=250, warmup=250, chains=2, seed=5)
+        mcmc = bi.fit(
+            Xr[:, :1],
+            yr,
+            form="linear",
+            radii=radii,
+            stats=stats,
+            draws=250,
+            warmup=250,
+            chains=2,
+            seed=5,
+        )
         cls.out = bi.posterior_from(
-            mcmc, channels=("ndvi",), picked=(), form="linear",
-            radii=radii, stats=stats, radius_kernel="lognormal").summary()
+            mcmc,
+            channels=("ndvi",),
+            picked=(),
+            form="linear",
+            radii=radii,
+            stats=stats,
+            radius_kernel="lognormal",
+        ).summary()
 
     def test_the_convergence_diagnostics_are_reported_as_numbers(self):
         self.assertTrue(np.isfinite(self.out["rhat_max"]))
@@ -480,13 +607,19 @@ class TestCollinearAggregatorsDoNotManufactureAPick(unittest.TestCase):
     def _posterior(self, aggregator_draws, stats):
         n = len(aggregator_draws)
         return bi.IndexPosterior(
-            weights=np.full((n, 1), 1.0), beta=np.zeros(n), powers=None,
-            channels=("a",), picked=(), form="linear",
-            rhat_max=1.0, ess_min=100.0, divergences=0,
-            radius_weights=np.tile(
-                np.array([[0.1, 0.8, 0.1]]), (n, 1, 1)),
+            weights=np.full((n, 1), 1.0),
+            beta=np.zeros(n),
+            powers=None,
+            channels=("a",),
+            picked=(),
+            form="linear",
+            rhat_max=1.0,
+            ess_min=100.0,
+            divergences=0,
+            radius_weights=np.tile(np.array([[0.1, 0.8, 0.1]]), (n, 1, 1)),
             aggregator_weights=aggregator_draws[:, None, :],
-            radii=(100, 500, 1000), stats=tuple(stats),
+            radii=(100, 500, 1000),
+            stats=tuple(stats),
         )
 
     def test_a_flat_blend_reports_nothing_as_informative(self):
@@ -511,8 +644,7 @@ class TestCollinearAggregatorsDoNotManufactureAPick(unittest.TestCase):
         # "Certainly not p90" is a finding, not an absence of one.
         stats = ["mean", "p10", "p25", "p50", "p75", "p90"]
         rng = np.random.default_rng(2)
-        conc = rng.dirichlet(
-            np.array([20.0, 20.0, 20.0, 20.0, 20.0, 0.05]), size=4000)
+        conc = rng.dirichlet(np.array([20.0, 20.0, 20.0, 20.0, 20.0, 0.05]), size=4000)
         post = self._posterior(conc, stats)
         self.assertIn("p90", post.informative_aggregators()[0])
 
@@ -581,8 +713,15 @@ class TestPartialCoverageDoesNotPoisonTheReport(unittest.TestCase):
         X, y = self._cube()
         yr, Xr = bi.prep(X, y, None)
         out = bi.repeated_discovery(
-            Xr, RADII, STATS, yr, channels=("a", "b"), channel_index=(0, 1),
-            reps=2, shuffles=3, workers=1,
+            Xr,
+            RADII,
+            STATS,
+            yr,
+            channels=("a", "b"),
+            channel_index=(0, 1),
+            reps=2,
+            shuffles=3,
+            workers=1,
         )
         lin = out["per_form"]["linear"]
         for key in ("train_t", "test_t", "shrinkage"):
@@ -608,8 +747,13 @@ class TestPartialCoverageDoesNotPoisonTheReport(unittest.TestCase):
         _bi._map = fake_map
         try:
             gain = bi.holdout_gain(
-                Xr, yr, channels=("a", "b"), channel_index=(0, 1),
-                splits=3, perm=3, workers=1,
+                Xr,
+                yr,
+                channels=("a", "b"),
+                channel_index=(0, 1),
+                splits=3,
+                perm=3,
+                workers=1,
             )
         finally:
             _bi._map = real_map
@@ -619,8 +763,13 @@ class TestPartialCoverageDoesNotPoisonTheReport(unittest.TestCase):
         X, y = self._cube()
         yr, Xr = bi.prep(X, y, None)
         gain = bi.holdout_gain(
-            Xr, yr, channels=("a", "b"), channel_index=(0, 1),
-            splits=3, perm=3, workers=1,
+            Xr,
+            yr,
+            channels=("a", "b"),
+            channel_index=(0, 1),
+            splits=3,
+            perm=3,
+            workers=1,
         )
         for key in ("cgi", "best_single", "gain"):
             self.assertTrue(np.isfinite(gain[key]), f"{key} is {gain[key]}")
@@ -631,6 +780,7 @@ class TestPriorIntervals(unittest.TestCase):
 
     def test_a_symmetric_dirichlet_marginal_matches_its_beta(self):
         from scipy.stats import beta as _beta
+
         for k in (2, 4, 6):
             lo, hi = bi._dirichlet_prior_ci(k)
             self.assertAlmostEqual(lo, float(_beta.ppf(0.025, 1, k - 1)), places=9)
@@ -716,8 +866,9 @@ class TestRankSafeResidualisation(unittest.TestCase):
 
     def test_a_clean_design_reports_no_deficit(self):
         X, y, onehot, age = self._data()
-        *_, info = bi.prep(X, y, np.column_stack([age, onehot[:, 1:]]),
-                           return_info=True)
+        *_, info = bi.prep(
+            X, y, np.column_stack([age, onehot[:, 1:]]), return_info=True
+        )
         self.assertEqual(info["dropped_directions"], 0)
         self.assertEqual(info["covariate_rank"], 4)
 
@@ -749,23 +900,40 @@ class TestHonestFormSelection(unittest.TestCase):
         rng = np.random.default_rng(seed)
         X = rng.normal(size=(n, 2, 1, 1))
         if truth == "synergy":
-            t = bi.SynergyFit(np.array([0.1, 0.1, 0.8]), np.ones(2),
-                              np.zeros(2), np.ones(2)).apply(X[:, :, 0, 0])
+            t = bi.SynergyFit(
+                np.array([0.1, 0.1, 0.8]), np.ones(2), np.zeros(2), np.ones(2)
+            ).apply(X[:, :, 0, 0])
             y = 0.8 * (t - t.mean()) / t.std() + rng.normal(size=n)
         else:
             y = 0.25 * X[:, 0, 0, 0] + 0.25 * X[:, 1, 0, 0] + rng.normal(size=n)
         return bi.prep(X, y, None)[::-1]
 
     def _sweep(self, Xr, yr, **kw):
-        return bi.sweep(Xr, np.array([500.0]), ["mean"], yr, channels=("a", "b"),
-                        channel_index=(0, 1), splits=8, workers=1, **kw)
+        return bi.sweep(
+            Xr,
+            np.array([500.0]),
+            ["mean"],
+            yr,
+            channels=("a", "b"),
+            channel_index=(0, 1),
+            splits=8,
+            workers=1,
+            **kw,
+        )
 
     def test_a_null_outcome_shows_no_systematic_gain(self):
         rng = np.random.default_rng(21)
         X = rng.normal(size=(800, 2, 2, 2))
         yr, Xr = bi.prep(X, rng.normal(size=800), None)
-        gain = bi.holdout_gain(Xr, yr, channels=("a", "b"), channel_index=(0, 1),
-                               splits=30, perm=30, workers=1)
+        gain = bi.holdout_gain(
+            Xr,
+            yr,
+            channels=("a", "b"),
+            channel_index=(0, 1),
+            splits=30,
+            perm=30,
+            workers=1,
+        )
         self.assertLess(abs(gain["gain"] - gain["gain_null_mean"]), 0.5)
         self.assertLessEqual(gain["cgi"], gain["cgi_max_over_forms_optimistic"])
         self.assertEqual(sum(gain["form_counts"].values()), 30)
@@ -797,8 +965,15 @@ class TestHonestFormSelection(unittest.TestCase):
     def test_discovery_chooses_on_training_rows(self):
         Xr, yr = self._cube("synergy", n=1200)
         out = bi.repeated_discovery(
-            Xr, np.array([500.0]), ["mean"], yr, channels=("a", "b"),
-            channel_index=(0, 1), reps=1, shuffles=4, workers=1,
+            Xr,
+            np.array([500.0]),
+            ["mean"],
+            yr,
+            channels=("a", "b"),
+            channel_index=(0, 1),
+            reps=1,
+            shuffles=4,
+            workers=1,
         )
         self.assertEqual(sum(out["form_counts"].values()), out["n_results"])
         self.assertGreaterEqual(out["form_counts"]["synergy"], 3)
@@ -838,8 +1013,9 @@ class TestDistanceDecay(unittest.TestCase):
         self.assertAlmostEqual(r90, r2 * np.sqrt(0.6 / 0.7), places=9)
         # Median inside the inner rung: D²(k1/r1² + k2/r2²) = q.
         r50, r90 = self._q([0.8, 0.2], [r1, r2])
-        self.assertAlmostEqual(r50, np.sqrt(0.5 / (0.8 / r1**2 + 0.2 / r2**2)),
-                               places=9)
+        self.assertAlmostEqual(
+            r50, np.sqrt(0.5 / (0.8 / r1**2 + 0.2 / r2**2)), places=9
+        )
         self.assertAlmostEqual(r90, r2 * np.sqrt(0.1 / 0.2), places=9)
 
     def test_unequal_sd_moves_the_median_the_expected_way(self):
@@ -897,12 +1073,20 @@ class TestDistanceDecay(unittest.TestCase):
         rng = np.random.default_rng(5)
         draws, radii = 50, (100, 300, 900)
         post = bi.IndexPosterior(
-            weights=rng.dirichlet(np.ones(2), size=draws), beta=rng.normal(size=draws),
-            powers=None, channels=("ndvi", "gvi"), picked=((300, "mean"),) * 2,
-            form="linear", rhat_max=1.0, ess_min=400.0, divergences=0,
+            weights=rng.dirichlet(np.ones(2), size=draws),
+            beta=rng.normal(size=draws),
+            powers=None,
+            channels=("ndvi", "gvi"),
+            picked=((300, "mean"),) * 2,
+            form="linear",
+            rhat_max=1.0,
+            ess_min=400.0,
+            divergences=0,
             radius_weights=np.broadcast_to([0.0, 1.0, 0.0], (draws, 2, 3)).copy(),
             aggregator_weights=rng.dirichlet(np.ones(2), size=(draws, 2)),
-            radii=radii, stats=("mean", "p50"), radius_kernel="dirichlet",
+            radii=radii,
+            stats=("mean", "p50"),
+            radius_kernel="dirichlet",
             rung_sd=np.ones((2, 3)),
         )
         s = post.summary()
@@ -962,12 +1146,30 @@ class TestSynergyPosteriorSamples(unittest.TestCase):
         X = rng.normal(size=(n, 2, len(RADII), len(STATS)))
         y = 0.23 * X[:, 0, 1, 0] + rng.normal(size=n)
         yr, Xr = bi.prep(X, y, None)
-        lin = bi.fit(Xr, yr, form="linear", radii=RADII, stats=STATS,
-                     draws=200, warmup=200, chains=1, seed=1)
+        lin = bi.fit(
+            Xr,
+            yr,
+            form="linear",
+            radii=RADII,
+            stats=STATS,
+            draws=200,
+            warmup=200,
+            chains=1,
+            seed=1,
+        )
         b_lin = float(np.asarray(lin.get_samples()["beta"]).mean())
         for seed in (1, 3, 5, 7):
-            m = bi.fit(Xr, yr, form="synergy", radii=RADII, stats=STATS,
-                       draws=200, warmup=200, chains=1, seed=seed)
+            m = bi.fit(
+                Xr,
+                yr,
+                form="synergy",
+                radii=RADII,
+                stats=STATS,
+                draws=200,
+                warmup=200,
+                chains=1,
+                seed=seed,
+            )
             beta = np.asarray(m.get_samples()["beta"])
             self.assertGreater(float(beta.std()), 0.01, f"seed {seed} froze")
             self.assertLess(abs(float(beta.mean()) - b_lin), 0.1, f"seed {seed}")
@@ -978,8 +1180,17 @@ class TestSynergyPosteriorSamples(unittest.TestCase):
         X = rng.normal(size=(n, 2, len(RADII), 2))
         y = 0.23 * X[:, 0, 1, 0] + rng.normal(size=n)
         yr, Xr = bi.prep(X, y, None)
-        m = bi.fit(Xr, yr, form="synergy", radii=RADII, stats=["mean", "p50"],
-                   draws=300, warmup=300, chains=2, seed=1)
+        m = bi.fit(
+            Xr,
+            yr,
+            form="synergy",
+            radii=RADII,
+            stats=["mean", "p50"],
+            draws=300,
+            warmup=300,
+            chains=2,
+            seed=1,
+        )
         self.assertLess(int(np.sum(m.get_extra_fields()["diverging"])), 10)
 
 
@@ -1038,8 +1249,9 @@ class TestNullCalibrationPrecision(unittest.TestCase):
         self.assertIn("too imprecise to support a calibration claim", out["note"])
         self.assertIn("too imprecise", cm.output[0])
         self.assertEqual(out["excluded_zero"], 4)
-        self.assertEqual((out["rate_ci_low"], out["rate_ci_high"]),
-                         bi.clopper_pearson(4, 16))
+        self.assertEqual(
+            (out["rate_ci_low"], out["rate_ci_high"]), bi.clopper_pearson(4, 16)
+        )
 
     def test_a_publication_run_is_not_flagged(self):
         Xr, yr = self._null_grid()
@@ -1056,7 +1268,11 @@ class TestNullCalibrationPrecision(unittest.TestCase):
     def test_reselection_varies_the_form_across_null_permutations(self):
         Xr, yr = self._null_grid()
         out = bi.null_calibration(
-            Xr, yr, n=16, workers=1, reselect_form=True,
+            Xr,
+            yr,
+            n=16,
+            workers=1,
+            reselect_form=True,
             form_E=Xr.reshape(len(Xr), -1),
         )
         self.assertEqual(sum(out["form_counts"].values()), 16)

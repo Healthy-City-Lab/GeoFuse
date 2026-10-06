@@ -42,7 +42,12 @@ def _stub_engine(n=300, seed=0):
         gvi_buffer_max_m=900.0,
     )
     eng.build_index_tensor = lambda subset="train_val": (
-        X, np.asarray(RADII), list(STATS), ["ndvi", "gvi"], static)
+        X,
+        np.asarray(RADII),
+        list(STATS),
+        ["ndvi", "gvi"],
+        static,
+    )
     eng._preaggr_radii = lambda: (list(RADII), list(RADII))
     eng._sweep_objective = lambda metric: None
     for name in ("_params_from_sweep", "_index_layout", "_channel_scaling"):
@@ -53,18 +58,34 @@ def _stub_engine(n=300, seed=0):
 class TestFitBayesianIndexWiring(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.addClassCleanup(setattr, parallel, "process_worker_count",
-                            parallel.process_worker_count)
+        cls.addClassCleanup(
+            setattr, parallel, "process_worker_count", parallel.process_worker_count
+        )
         parallel.process_worker_count = lambda *a, **k: 1
         cls.params = MetricFusionEngine.fit_bayesian_index(
-            _stub_engine(), "r2", sweep_splits=3, reps=1, shuffles=2,
-            gain_splits=2, gain_perm=2, null_runs=2, null_reselect_form=True,
-            draws=120, warmup=120, chains=1, radius_kernel="dirichlet",
+            _stub_engine(),
+            "r2",
+            sweep_splits=3,
+            reps=1,
+            shuffles=2,
+            gain_splits=2,
+            gain_perm=2,
+            null_runs=2,
+            null_reselect_form=True,
+            draws=120,
+            warmup=120,
+            chains=1,
+            radius_kernel="dirichlet",
         )
 
     def test_the_bundle_carries_every_stage(self):
-        for key in ("__sweep__", "__posterior__", "__discovery__",
-                    "__holdout_gain__", "__null_calibration__"):
+        for key in (
+            "__sweep__",
+            "__posterior__",
+            "__discovery__",
+            "__holdout_gain__",
+            "__null_calibration__",
+        ):
             self.assertIn(key, self.params)
         self.assertIn("selection_score", self.params["__sweep__"])
         self.assertIn("form_counts", self.params["__holdout_gain__"])
@@ -73,8 +94,9 @@ class TestFitBayesianIndexWiring(unittest.TestCase):
         post = self.params["__posterior__"]
         self.assertEqual(post["distance_scale"], "raw")
         self.assertEqual(len(post["r50_mean"]), 2)
-        for lo, mid, hi in zip(post["r50_ci_low"], post["r50_mean"],
-                               post["r50_ci_high"]):
+        for lo, mid, hi in zip(
+            post["r50_ci_low"], post["r50_mean"], post["r50_ci_high"]
+        ):
             self.assertLessEqual(lo, mid + 1e-9)
             self.assertLessEqual(mid, hi + 1e-9)
             self.assertLessEqual(hi, max(RADII))
@@ -94,8 +116,9 @@ class TestFitBayesianIndexWiring(unittest.TestCase):
     def test_weights_land_on_the_formula_keys(self):
         from geofuse import cgi_formulas
 
-        name = cgi_formulas.formula_for(("ndvi", "gvi"),
-                                        self.params["__sweep__"]["form"])
+        name = cgi_formulas.formula_for(
+            ("ndvi", "gvi"), self.params["__sweep__"]["form"]
+        )
         keys = cgi_formulas.get_formula(name).weight_keys
         self.assertEqual(sum(int(self.params[k]) for k in keys), 100)
 
@@ -105,12 +128,21 @@ class TestSynergyRunRecordsItsScaling(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.addClassCleanup(setattr, parallel, "process_worker_count",
-                            parallel.process_worker_count)
+        cls.addClassCleanup(
+            setattr, parallel, "process_worker_count", parallel.process_worker_count
+        )
         parallel.process_worker_count = lambda *a, **k: 1
         cls.params = MetricFusionEngine.fit_bayesian_index(
-            _stub_engine(), "r2", forms=("synergy",), sweep_splits=2, reps=0,
-            gain_splits=0, null_runs=0, draws=100, warmup=100, chains=1,
+            _stub_engine(),
+            "r2",
+            forms=("synergy",),
+            sweep_splits=2,
+            reps=0,
+            gain_splits=0,
+            null_runs=0,
+            draws=100,
+            warmup=100,
+            chains=1,
             radius_kernel="dirichlet",
         )
 
@@ -142,16 +174,29 @@ def _retune_stub(n=600, seed=3):
     control = 1.0 * u + rng.normal(size=n)
     static = {"target": target, "cov": None, "controls": {"grip": control}}
     eng = types.SimpleNamespace(
-        cgi_formula="weighted_average_gvi", _active_greenery_channel="cgi",
-        ndvi_buffer_max_m=900.0, gvi_buffer_max_m=900.0,
-        negative_control_columns=["grip"], is_longitudinal=False,
+        cgi_formula="weighted_average_gvi",
+        _active_greenery_channel="cgi",
+        ndvi_buffer_max_m=900.0,
+        gvi_buffer_max_m=900.0,
+        negative_control_columns=["grip"],
+        is_longitudinal=False,
     )
     eng.build_index_tensor = lambda subset="train_val": (
-        X, np.asarray(RADII), ["mean"], ["ndvi", "gvi"], static)
+        X,
+        np.asarray(RADII),
+        ["mean"],
+        ["ndvi", "gvi"],
+        static,
+    )
     eng._preaggr_radii = lambda: (list(RADII), list(RADII))
     eng._sweep_objective = lambda metric: None
-    for name in ("_params_from_sweep", "_index_layout", "_channel_scaling",
-                 "fit_bayesian_index", "retune_concordance"):
+    for name in (
+        "_params_from_sweep",
+        "_index_layout",
+        "_channel_scaling",
+        "fit_bayesian_index",
+        "retune_concordance",
+    ):
         setattr(eng, name, types.MethodType(getattr(MetricFusionEngine, name), eng))
     return eng
 
@@ -161,19 +206,27 @@ class TestRetuneOnAControl(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.addClassCleanup(setattr, parallel, "process_worker_count",
-                            parallel.process_worker_count)
+        cls.addClassCleanup(
+            setattr, parallel, "process_worker_count", parallel.process_worker_count
+        )
         parallel.process_worker_count = lambda *a, **k: 1
         cls.eng = _retune_stub()
-        kw = dict(forms=("linear",), sweep_splits=3, draws=150, warmup=150,
-                  chains=1, radius_kernel="dirichlet")
+        kw = dict(
+            forms=("linear",),
+            sweep_splits=3,
+            draws=150,
+            warmup=150,
+            chains=1,
+            radius_kernel="dirichlet",
+        )
         cls.target = cls.eng.fit_bayesian_index(
-            "r2", reps=0, shuffles=0, gain_splits=0, gain_perm=0, null_runs=0,
-            **kw)
+            "r2", reps=0, shuffles=0, gain_splits=0, gain_perm=0, null_runs=0, **kw
+        )
         kw.pop("radius_kernel")
         cls.formula_before = cls.eng.cgi_formula
         cls.retune = cls.eng.retune_concordance(
-            cls.target, "r2", radius_kernel="dirichlet", **kw)
+            cls.target, "r2", radius_kernel="dirichlet", **kw
+        )
 
     def test_the_control_concentrates_ndvi_near_the_confounded_rung(self):
         ndvi = self.retune["grip"]["channels"]["ndvi"]
@@ -189,8 +242,14 @@ class TestRetuneOnAControl(unittest.TestCase):
 
     def test_an_unknown_outcome_is_refused(self):
         with self.assertRaises(ValueError):
-            self.eng.fit_bayesian_index("r2", outcome="height", sweep_splits=2,
-                                        reps=0, gain_splits=0, null_runs=0)
+            self.eng.fit_bayesian_index(
+                "r2",
+                outcome="height",
+                sweep_splits=2,
+                reps=0,
+                gain_splits=0,
+                null_runs=0,
+            )
 
 
 if __name__ == "__main__":

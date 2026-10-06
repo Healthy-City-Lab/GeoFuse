@@ -2541,7 +2541,9 @@ class MetricFusionEngine:
         if absent_ch:
             # A channel the stored unit never held has to be built for every id
             # it already covers, so the whole unit is recomputed once.
-            _log("INFO", f"Cache extension: computing {list(absent_ch)} for all pixels.")
+            _log(
+                "INFO", f"Cache extension: computing {list(absent_ch)} for all pixels."
+            )
             missing = global_pids
         _log(
             "INFO",
@@ -2826,9 +2828,7 @@ class MetricFusionEngine:
             xy = point_xy_utm[bpos] if len(point_xy_utm) else None
             geoms = [entity_geoms_utm[i] for i in bpos]
             veg_b, ter_b, ndvi_b, gvi_b, vsec, rsec = (
-                preaggregation.aggregate_entity_batch(
-                    state, point_xy=xy, geoms=geoms
-                )
+                preaggregation.aggregate_entity_batch(state, point_xy=xy, geoms=geoms)
             )
             return lo, hi, veg_b, ter_b, ndvi_b, gvi_b, vsec, rsec
 
@@ -3312,7 +3312,10 @@ class MetricFusionEngine:
         # The channels in play are settled before residualising, so a coverage
         # gap in a channel this study never reads cannot drop rows from it.
         yr, Xr, prep_info = bayesian_index.prep(
-            X, y, static.get("cov"), channel_index=channel_index,
+            X,
+            y,
+            static.get("cov"),
+            channel_index=channel_index,
             return_info=True,
         )
         dropped = int(len(X) - len(Xr))
@@ -3330,9 +3333,17 @@ class MetricFusionEngine:
         # Every stage below takes minutes and runs a process pool, so the flag
         # travels into them rather than being read only between them.
         res = bayesian_index.sweep(
-            Xr, radii, stats, yr, channels=index_channels,
-            channel_index=channel_index, radius_idx=radius_idx,
-            forms=forms, splits=sweep_splits, seed=seed, workers=workers,
+            Xr,
+            radii,
+            stats,
+            yr,
+            channels=index_channels,
+            channel_index=channel_index,
+            radius_idx=radius_idx,
+            forms=forms,
+            splits=sweep_splits,
+            seed=seed,
+            workers=workers,
             objective=self._sweep_objective(metric),
             cancel_check=cancelled,
         )
@@ -3345,10 +3356,19 @@ class MetricFusionEngine:
 
         disc = (
             bayesian_index.repeated_discovery(
-                Xr, radii, stats, yr, channels=index_channels,
-                channel_index=channel_index, radius_idx=radius_idx,
-                forms=forms, reps=reps, shuffles=shuffles, seed=seed,
-                workers=workers, cancel_check=cancelled,
+                Xr,
+                radii,
+                stats,
+                yr,
+                channels=index_channels,
+                channel_index=channel_index,
+                radius_idx=radius_idx,
+                forms=forms,
+                reps=reps,
+                shuffles=shuffles,
+                seed=seed,
+                workers=workers,
+                cancel_check=cancelled,
             )
             if reps and shuffles
             else {}
@@ -3357,9 +3377,16 @@ class MetricFusionEngine:
 
         gain = (
             bayesian_index.holdout_gain(
-                Xr, yr, channels=index_channels, channel_index=channel_index,
-                radius_idx=radius_idx, forms=forms, splits=gain_splits,
-                perm=gain_perm, seed=seed, workers=workers,
+                Xr,
+                yr,
+                channels=index_channels,
+                channel_index=channel_index,
+                radius_idx=radius_idx,
+                forms=forms,
+                splits=gain_splits,
+                perm=gain_perm,
+                seed=seed,
+                workers=workers,
                 cancel_check=cancelled,
             )
             if gain_splits and len(index_channels) > 1
@@ -3376,18 +3403,35 @@ class MetricFusionEngine:
         if cancelled():
             raise JobCancelled("Index posterior cancelled by user.")
         post, grid, grid_kwargs = bayesian_index.grid_posterior(
-            Xr, yr, channels=index_channels, channel_index=channel_index,
-            radii=radii, stats=stats, radius_idx=radius_idx, form=res.form,
-            picked=res.picked, radius_kernel=radius_kernel,
-            aggregator=aggregator, draws=draws, warmup=warmup, chains=chains,
-            seed=seed, column_sd=prep_info["column_sd"],
+            Xr,
+            yr,
+            channels=index_channels,
+            channel_index=channel_index,
+            radii=radii,
+            stats=stats,
+            radius_idx=radius_idx,
+            form=res.form,
+            picked=res.picked,
+            radius_kernel=radius_kernel,
+            aggregator=aggregator,
+            draws=draws,
+            warmup=warmup,
+            chains=chains,
+            seed=seed,
+            column_sd=prep_info["column_sd"],
         )
         null = (
             bayesian_index.null_calibration(
-                grid, yr, form=res.form, n=null_runs, workers=workers,
-                cancel_check=cancelled, reselect_form=null_reselect_form,
+                grid,
+                yr,
+                form=res.form,
+                n=null_runs,
+                workers=workers,
+                cancel_check=cancelled,
+                reselect_form=null_reselect_form,
                 form_E=Xr.reshape(len(Xr), -1)[:, list(res.columns)],
-                forms=forms, **grid_kwargs,
+                forms=forms,
+                **grid_kwargs,
             )
             if null_runs
             else {}
@@ -3406,9 +3450,17 @@ class MetricFusionEngine:
         # The composite path rebuilds the index from raw channel values, so it
         # needs the center and scale the model's weights and form refer to.
         if self._active_greenery_channel == "cgi":
-            params.update(self._channel_scaling(
-                X, radii, stats, tensor_channels, index_channels, post.picked,
-                prep_info["column_sd"]))
+            params.update(
+                self._channel_scaling(
+                    X,
+                    radii,
+                    stats,
+                    tensor_channels,
+                    index_channels,
+                    post.picked,
+                    prep_info["column_sd"],
+                )
+            )
         params["__selection_method__"] = "bayesian_index"
         params["__sweep__"] = {
             "picked": [list(p) for p in res.picked],
@@ -3417,7 +3469,8 @@ class MetricFusionEngine:
             "selection_score": res.selection_score,
             "form_scores": res.form_scores,
             "one_se_picked": [
-                list(p) for p in bayesian_index._decode(
+                list(p)
+                for p in bayesian_index._decode(
                     res.one_se_columns, len(radii), len(stats), radii, stats
                 )
             ],
@@ -3451,8 +3504,11 @@ class MetricFusionEngine:
         channel_index = [list(tensor_channels).index(c) for c in index_channels]
         gvi_radii, ndvi_radii = self._preaggr_radii()
         radius_idx = [
-            [i for i, r in enumerate(radii)
-             if int(r) in (ndvi_radii if c == "ndvi" else gvi_radii)]
+            [
+                i
+                for i, r in enumerate(radii)
+                if int(r) in (ndvi_radii if c == "ndvi" else gvi_radii)
+            ]
             for c in index_channels
         ]
         return index_channels, channel_index, radius_idx
@@ -3478,9 +3534,14 @@ class MetricFusionEngine:
         if cov is not None and np.size(cov):
             keep &= np.isfinite(np.asarray(cov, dtype=np.float64)).all(1)
         result = validation.plasmode_recovery(
-            X[keep], None if cov is None or not np.size(cov) else np.asarray(cov)[keep],
-            channels=channels, radii=radii, stats=stats,
-            channel_index=channel_index, radius_idx=radius_idx, **kwargs,
+            X[keep],
+            None if cov is None or not np.size(cov) else np.asarray(cov)[keep],
+            channels=channels,
+            radii=radii,
+            stats=stats,
+            channel_index=channel_index,
+            radius_idx=radius_idx,
+            **kwargs,
         )
         if out_dir:
             validation.write_plasmode_report(result, out_dir)
@@ -3505,16 +3566,15 @@ class MetricFusionEngine:
 
         def objective(exposure, target):
             try:
-                return float(
-                    _scoring.score(metric, target, exposure, None)
-                )
+                return float(_scoring.score(metric, target, exposure, None))
             except Exception:
                 return 0.0
 
         return objective
 
-    def _channel_scaling(self, X, radii, stats, tensor_channels, index_channels,
-                         picked, column_sd) -> dict:
+    def _channel_scaling(
+        self, X, radii, stats, tensor_channels, index_channels, picked, column_sd
+    ) -> dict:
         """``<channel>_center`` / ``<channel>_scale`` for the composite path.
 
         :func:`bayesian_index.composite_scaling` gives the mean and the
@@ -3524,9 +3584,13 @@ class MetricFusionEngine:
         are carried onto that scale.
         """
         out = bayesian_index.composite_scaling(
-            X, column_sd, channels=index_channels,
+            X,
+            column_sd,
+            channels=index_channels,
             channel_index=[list(tensor_channels).index(c) for c in index_channels],
-            radii=radii, stats=stats, picked=picked,
+            radii=radii,
+            stats=stats,
+            picked=picked,
         )
         if getattr(self, "normalize_channels", False) and self._channel_minmax:
             for ch in index_channels:
@@ -3568,8 +3632,7 @@ class MetricFusionEngine:
         formula_channels = set(cgi_formulas.formula_channels(self.cgi_formula))
         formula_channels.update(index_channels)
         for ch in formula_channels:
-            default = (self.ndvi_buffer_max_m if ch == "ndvi"
-                       else self.gvi_buffer_max_m)
+            default = self.ndvi_buffer_max_m if ch == "ndvi" else self.gvi_buffer_max_m
             params.setdefault(f"{ch}_radius", int(round(float(default))))
         if formula_channels - {"ndvi"}:
             params.setdefault("streetview_stat", "mean")
@@ -3613,8 +3676,9 @@ class MetricFusionEngine:
             total = 1.0
         scaled = vals * 100.0 / total
         floors = [int(v) for v in scaled]
-        for i in sorted(range(len(scaled)), key=lambda i: scaled[i] - floors[i],
-                        reverse=True)[: 100 - sum(floors)]:
+        for i in sorted(
+            range(len(scaled)), key=lambda i: scaled[i] - floors[i], reverse=True
+        )[: 100 - sum(floors)]:
             floors[i] += 1
         for key, v in zip(keys, floors):
             params[key] = int(v)
@@ -3666,7 +3730,8 @@ class MetricFusionEngine:
                     continue
                 for si, column in enumerate(stats):
                     stat, pct = (
-                        ("mean", None) if column == "mean"
+                        ("mean", None)
+                        if column == "mean"
                         else ("percentile", int(column[1:]))
                     )
                     vals, on_uniq = self._channel_values_for_static(
@@ -3704,15 +3769,19 @@ class MetricFusionEngine:
             column = preaggregation.stat_to_column(stat, pct)
             if uniq is None or source is None or column is None:
                 return None, False
-            plan = self._preaggr_plan(
-                source, uniq, static.get("uniq_wave_idx"), static
-            )
+            plan = self._preaggr_plan(source, uniq, static.get("uniq_wave_idx"), static)
             if plan is None:
                 return None, False
             return source.gather(plan, channel, int(round(radius)), column), True
         return self._aggregate_channel_for_fold(
-            static, metric, radius, stat, pct if pct is not None else 50,
-            channel=channel, fold_idx=None, subset=subset,
+            static,
+            metric,
+            radius,
+            stat,
+            pct if pct is not None else 50,
+            channel=channel,
+            fold_idx=None,
+            subset=subset,
         )
 
     def _cache_channels(self) -> tuple[str, ...]:
@@ -3731,8 +3800,9 @@ class MetricFusionEngine:
             # ``gvi``'s mean is the component sum, but its percentiles are not,
             # so the components stay alongside it for standalone reporting.
             wanted |= {"veg", "terrain"}
-        return tuple(c for c in preaggregation.GreeneryCache.ALL_CHANNELS
-                     if c in wanted)
+        return tuple(
+            c for c in preaggregation.GreeneryCache.ALL_CHANNELS if c in wanted
+        )
 
     def _blocks(self, result: tuple) -> dict:
         """Aggregation output -> ``{channel: array}``, limited to this job's set.
@@ -4480,7 +4550,8 @@ class MetricFusionEngine:
             )
             st["controls"] = {
                 c: data[c].to_numpy(dtype=np.float64)[first_idx]
-                for c in self.negative_control_columns if c in data.columns
+                for c in self.negative_control_columns
+                if c in data.columns
             }
             st["coords"] = (
                 np.column_stack(
@@ -4504,7 +4575,8 @@ class MetricFusionEngine:
             st["cov"] = data[cov_cols].to_numpy(dtype=np.float64) if cov_cols else None
             st["controls"] = {
                 c: data[c].to_numpy(dtype=np.float64)
-                for c in self.negative_control_columns if c in data.columns
+                for c in self.negative_control_columns
+                if c in data.columns
             }
             st["coords"] = (
                 data[["_cx", "_cy"]].to_numpy(np.float64) if have_coords else None
@@ -6331,9 +6403,7 @@ class MetricFusionEngine:
 
         # Per-channel scaling removed — the composite uses raw aggregated
         # channel values.
-        composite = self._composite_from(
-            weights, self._normalize_channels(all_blocks)
-        )
+        composite = self._composite_from(weights, self._normalize_channels(all_blocks))
         # Composite-level [0, 1] normalization over the whole grid when the
         # toggle is on (raw otherwise); mirrors the output raster + standalones.
         composite = self._finalize_composite(composite)
@@ -7881,8 +7951,10 @@ class MetricFusionEngine:
             if col in fusion_df.columns:
                 continue
             if col not in entity_gdf.columns:
-                _log("WARN", f"Negative control '{col}' is not a target column; "
-                             "skipping it.")
+                _log(
+                    "WARN",
+                    f"Negative control '{col}' is not a target column; " "skipping it.",
+                )
                 continue
             fusion_df[col] = pd.to_numeric(entity_gdf[col], errors="coerce").values
 
@@ -7921,10 +7993,15 @@ class MetricFusionEngine:
         if not self.negative_control_columns:
             return None
         if self.is_longitudinal:
-            _log("WARN", "Negative controls are reported for cross-sectional "
-                         "targets only; skipped for this longitudinal run.")
-            return {"skipped": "longitudinal",
-                    "controls": list(self.negative_control_columns)}
+            _log(
+                "WARN",
+                "Negative controls are reported for cross-sectional "
+                "targets only; skipped for this longitudinal run.",
+            )
+            return {
+                "skipped": "longitudinal",
+                "controls": list(self.negative_control_columns),
+            }
         df = self.apply_fusion(weights=dict(params))
         target = np.asarray(df["target"].values, dtype=np.float64)
         composite = np.asarray(df["composite"].values, dtype=np.float64)
@@ -7944,9 +8021,12 @@ class MetricFusionEngine:
             if full is not None and cluster_column in full.columns:
                 key = "polygon_id" if "polygon_id" in df.columns else None
                 clusters = (
-                    full.groupby(key, sort=False)[cluster_column].first()
-                    .reindex(df[key].values).to_numpy()
-                    if key else full[cluster_column].reindex(df.index).to_numpy()
+                    full.groupby(key, sort=False)[cluster_column]
+                    .first()
+                    .reindex(df[key].values)
+                    .to_numpy()
+                    if key
+                    else full[cluster_column].reindex(df.index).to_numpy()
                 )
 
         def objective(y, x, c):
@@ -7954,42 +8034,61 @@ class MetricFusionEngine:
                 return None
             keep = self._finite_rows(y, x, c)
             try:
-                return float(objective_scoring.score(
-                    metric, y[keep], x[keep], None if c is None else c[keep]))
+                return float(
+                    objective_scoring.score(
+                        metric, y[keep], x[keep], None if c is None else c[keep]
+                    )
+                )
             except Exception:
                 return None
 
         test = self._test_entity_mask(df)
-        out: dict = {"controls": list(controls), "n_boot": int(n_boot),
-                     "cluster_column": cluster_column if clusters is not None
-                     else None, "metric": metric, "splits": {}}
+        out: dict = {
+            "controls": list(controls),
+            "n_boot": int(n_boot),
+            "cluster_column": cluster_column if clusters is not None else None,
+            "metric": metric,
+            "splits": {},
+        }
         for split, mask in (("test", test), ("train_val", ~test)):
             if int(mask.sum()) < 10:
                 continue
             c_m = None if cov is None else cov[mask]
             res = _nc.transfer_test(
-                composite[mask], target[mask],
-                {k: v[mask] for k, v in controls.items()}, c_m,
-                n_boot=int(n_boot), seed=int(seed),
+                composite[mask],
+                target[mask],
+                {k: v[mask] for k, v in controls.items()},
+                c_m,
+                n_boot=int(n_boot),
+                seed=int(seed),
                 clusters=None if clusters is None else clusters[mask],
             )
             res["target"]["objective"] = objective(target[mask], composite[mask], c_m)
             for k, v in controls.items():
                 res["controls"][k]["objective"] = objective(
-                    v[mask], composite[mask], c_m)
+                    v[mask], composite[mask], c_m
+                )
             out["splits"][split] = res
-        flagged = [k for k, v in (out["splits"].get("test") or {})
-                   .get("controls", {}).items() if v.get("nonspecific")]
+        flagged = [
+            k
+            for k, v in (out["splits"].get("test") or {}).get("controls", {}).items()
+            if v.get("nonspecific")
+        ]
         out["nonspecific"] = flagged
         if flagged:
-            _log("WARN", "Negative control(s) "
-                         + ", ".join(f"'{k}'" for k in flagged)
-                         + " carry an association indistinguishable from the "
-                         "target's on the held-out split: part of the tuned "
-                         "association is non-specific.")
+            _log(
+                "WARN",
+                "Negative control(s) "
+                + ", ".join(f"'{k}'" for k in flagged)
+                + " carry an association indistinguishable from the "
+                "target's on the held-out split: part of the tuned "
+                "association is non-specific.",
+            )
         return out
 
-    def retune_concordance(self, target_params: dict, metric: str, **fit_kwargs) -> dict:
+    def retune_concordance(
+        self, target_params: dict, metric: str, **fit_kwargs
+    ) -> dict:
         """Re-tune on each negative control and compare with the target's tuning.
 
         Each control runs the same sweep and posterior as the target — same
@@ -8010,7 +8109,8 @@ class MetricFusionEngine:
         for name in self.negative_control_columns:
             try:
                 params = self.fit_bayesian_index(
-                    metric, outcome=name, **{**fit_kwargs, **loops})
+                    metric, outcome=name, **{**fit_kwargs, **loops}
+                )
             except JobCancelled:
                 raise
             except Exception as exc:
@@ -8019,12 +8119,16 @@ class MetricFusionEngine:
             finally:
                 self.cgi_formula = saved_formula
             out[name] = _nc.concordance(target_post, params.get("__posterior__") or {})
-            same = [ch for ch, row in out[name]["channels"].items()
-                    if row.get("same_pick")]
+            same = [
+                ch for ch, row in out[name]["channels"].items() if row.get("same_pick")
+            ]
             if same:
-                _log("WARN", f"Re-tuning on '{name}' lands on the target's cell for "
-                             f"{', '.join(same)}: the search may be finding the "
-                             "shared confounding.")
+                _log(
+                    "WARN",
+                    f"Re-tuning on '{name}' lands on the target's cell for "
+                    f"{', '.join(same)}: the search may be finding the "
+                    "shared confounding.",
+                )
         return out
 
     def _reporting_raw_column(self, df: "pd.DataFrame", name: str):
@@ -8130,7 +8234,6 @@ class MetricFusionEngine:
             .to_numpy()
         )
 
-
     def generate_composite_greenery_map(
         self,
         output_path: str = "output_results/composite_greenery.tif",
@@ -8150,9 +8253,7 @@ class MetricFusionEngine:
         Returns:
             Path to the saved composite greenery map
         """
-        logger.info(
-            "Generating composite greenery map from discovered params..."
-        )
+        logger.info("Generating composite greenery map from discovered params...")
 
         if progress_callback:
             progress_callback(0, 100)
@@ -8334,9 +8435,7 @@ class MetricFusionEngine:
         # treatment the scorer applied, mirrored for standalone single-channel
         # maps.
         logger.info(f"Calculating composite via formula '{formula.name}'...")
-        composite = self._composite_from(
-            final_params, self._normalize_channels(blocks)
-        )
+        composite = self._composite_from(final_params, self._normalize_channels(blocks))
         composite = self._finalize_composite(np.asarray(composite, dtype=np.float64))
 
         # 7. Create raster

@@ -63,8 +63,15 @@ def partial_slope(exposure, outcome, covariates=None, *, level: float = 0.95) ->
     n = int(len(x))
     q, _ = covariate_basis(cov, n)
     dof = n - q.shape[1] - 1
-    empty = {"beta": float("nan"), "se": float("nan"), "ci_low": float("nan"),
-             "ci_high": float("nan"), "t": float("nan"), "n": n, "df": dof}
+    empty = {
+        "beta": float("nan"),
+        "se": float("nan"),
+        "ci_low": float("nan"),
+        "ci_high": float("nan"),
+        "t": float("nan"),
+        "n": n,
+        "df": dof,
+    }
     if dof < 2:
         return empty
     xr = x - q @ (q.T @ x)
@@ -76,14 +83,28 @@ def partial_slope(exposure, outcome, covariates=None, *, level: float = 0.95) ->
     beta = min(max(beta, -1.0), 1.0)
     se = math.sqrt(max(1.0 - beta * beta, 0.0) / dof)
     crit = float(stats.t.ppf(0.5 + level / 2.0, dof))
-    return {"beta": beta, "se": se, "ci_low": beta - crit * se,
-            "ci_high": beta + crit * se,
-            "t": beta / se if se > 0 else float("inf"), "n": n, "df": dof}
+    return {
+        "beta": beta,
+        "se": se,
+        "ci_low": beta - crit * se,
+        "ci_high": beta + crit * se,
+        "t": beta / se if se > 0 else float("inf"),
+        "n": n,
+        "df": dof,
+    }
 
 
-def paired_contrast(exposure, target, control, covariates=None, *,
-                    n_boot: int = 1000, clusters=None, seed: int = 0,
-                    level: float = 0.95) -> dict:
+def paired_contrast(
+    exposure,
+    target,
+    control,
+    covariates=None,
+    *,
+    n_boot: int = 1000,
+    clusters=None,
+    seed: int = 0,
+    level: float = 0.95,
+) -> dict:
     """``Δ = |β_target| − |β_control|``, both re-estimated on each resample.
 
     Computed on the rows where exposure, target, control and covariates are all
@@ -110,9 +131,17 @@ def paired_contrast(exposure, target, control, covariates=None, *,
     cov = None if cov is None else cov[keep]
     n = int(len(x))
     nan = float("nan")
-    out = {"delta": nan, "ci_low": nan, "ci_high": nan, "ratio": nan,
-           "ratio_ci_low": nan, "ratio_ci_high": nan, "n": n,
-           "n_boot": int(n_boot), "clusters": None}
+    out = {
+        "delta": nan,
+        "ci_low": nan,
+        "ci_high": nan,
+        "ratio": nan,
+        "ratio_ci_low": nan,
+        "ratio_ci_high": nan,
+        "n": n,
+        "n_boot": int(n_boot),
+        "clusters": None,
+    }
 
     q, _ = covariate_basis(cov, n)
     if n - q.shape[1] - 1 < 2:
@@ -165,11 +194,13 @@ def paired_contrast(exposure, target, control, covariates=None, *,
     deltas = np.concatenate(deltas)
     ratios = np.concatenate(ratios)
     tail = (1.0 - level) / 2.0 * 100.0
-    out["ci_low"], out["ci_high"] = (float(v) for v in
-                                     np.percentile(deltas, [tail, 100.0 - tail]))
+    out["ci_low"], out["ci_high"] = (
+        float(v) for v in np.percentile(deltas, [tail, 100.0 - tail])
+    )
     if np.isfinite(ratios).any():
         out["ratio_ci_low"], out["ratio_ci_high"] = (
-            float(v) for v in np.nanpercentile(ratios, [tail, 100.0 - tail]))
+            float(v) for v in np.nanpercentile(ratios, [tail, 100.0 - tail])
+        )
     return out
 
 
@@ -226,9 +257,17 @@ def concordance(target: dict, control: dict) -> dict:
     return out
 
 
-def transfer_test(exposure, target, controls: dict, covariates=None, *,
-                  n_boot: int = 1000, clusters=None, seed: int = 0,
-                  level: float = 0.95) -> dict:
+def transfer_test(
+    exposure,
+    target,
+    controls: dict,
+    covariates=None,
+    *,
+    n_boot: int = 1000,
+    clusters=None,
+    seed: int = 0,
+    level: float = 0.95,
+) -> dict:
     """The frozen exposure scored against the target and every control.
 
     Returns ``{"target": partial_slope, "controls": {name: {...}}}``. Each
@@ -238,17 +277,29 @@ def transfer_test(exposure, target, controls: dict, covariates=None, *,
     interval excludes zero while Δ's interval includes it. The flag reports;
     it does not stop anything.
     """
-    out = {"target": partial_slope(exposure, target, covariates, level=level),
-           "controls": {}}
+    out = {
+        "target": partial_slope(exposure, target, covariates, level=level),
+        "controls": {},
+    }
     for i, (name, values) in enumerate(controls.items()):
         own = partial_slope(exposure, values, covariates, level=level)
-        contrast = paired_contrast(exposure, target, values, covariates,
-                                   n_boot=n_boot, clusters=clusters,
-                                   seed=seed + i, level=level)
-        excludes_zero = (np.isfinite(own["ci_low"])
-                         and (own["ci_low"] > 0 or own["ci_high"] < 0))
-        delta_has_zero = (np.isfinite(contrast["ci_low"])
-                          and contrast["ci_low"] <= 0 <= contrast["ci_high"])
+        contrast = paired_contrast(
+            exposure,
+            target,
+            values,
+            covariates,
+            n_boot=n_boot,
+            clusters=clusters,
+            seed=seed + i,
+            level=level,
+        )
+        excludes_zero = np.isfinite(own["ci_low"]) and (
+            own["ci_low"] > 0 or own["ci_high"] < 0
+        )
+        delta_has_zero = (
+            np.isfinite(contrast["ci_low"])
+            and contrast["ci_low"] <= 0 <= contrast["ci_high"]
+        )
         out["controls"][name] = {
             **{k: own[k] for k in ("beta", "se", "ci_low", "ci_high", "t", "n")},
             "delta": contrast["delta"],

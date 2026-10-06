@@ -954,13 +954,15 @@ class GreeneryCache:
             # the existing id order.
             nstats = len(self.stats)
             unit["channels"] = tuple(
-                c for c in self.ALL_CHANNELS
+                c
+                for c in self.ALL_CHANNELS
                 if c in set(unit.get("channels", ())) | set(want)
             )
             unit["ids"] = np.empty(0, np.int64)
             for ch in unit["channels"]:
-                n_r = (len(unit["ndvi_radii"]) if ch == "ndvi"
-                       else len(unit["gvi_radii"]))
+                n_r = (
+                    len(unit["ndvi_radii"]) if ch == "ndvi" else len(unit["gvi_radii"])
+                )
                 unit[ch] = np.empty((0, n_r, nstats), np.float32)
             missing = np.unique(np.concatenate([required, missing]))
         return unit["gvi_radii"], unit["ndvi_radii"], missing, absent

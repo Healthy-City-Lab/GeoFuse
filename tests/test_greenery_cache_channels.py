@@ -28,8 +28,7 @@ IDS = np.array([10, 20, 30], dtype=np.int64)
 def _blocks(cache, channels, n_ids, fill=1.0):
     n_stats = len(cache.stats)
     return {
-        ch: np.full((n_ids, len(RADII), n_stats), fill, np.float32)
-        for ch in channels
+        ch: np.full((n_ids, len(RADII), n_stats), fill, np.float32) for ch in channels
     }
 
 
@@ -43,8 +42,11 @@ class TestChannelSets(unittest.TestCase):
 
     def _open(self, channels, ids=IDS):
         return self.cache.open_unit(
-            "cfg", gvi_radii=RADII, ndvi_radii=RADII,
-            required_ids=ids, channels=channels,
+            "cfg",
+            gvi_radii=RADII,
+            ndvi_radii=RADII,
+            required_ids=ids,
+            channels=channels,
         )
 
     def test_a_two_channel_unit_round_trips(self):
@@ -61,7 +63,8 @@ class TestChannelSets(unittest.TestCase):
 
     def test_asking_for_a_channel_the_unit_never_held_rebuilds_every_row(self):
         self.cache.commit_unit(
-            "cfg", self._open(("ndvi", "gvi"))[2],
+            "cfg",
+            self._open(("ndvi", "gvi"))[2],
             _blocks(self.cache, ("ndvi", "gvi"), 3),
         )
         _g, _n, missing, absent = self._open(("ndvi", "veg", "terrain"))
@@ -72,7 +75,8 @@ class TestChannelSets(unittest.TestCase):
 
     def test_the_rebuilt_unit_keeps_both_channel_sets(self):
         self.cache.commit_unit(
-            "cfg", self._open(("ndvi", "gvi"))[2],
+            "cfg",
+            self._open(("ndvi", "gvi"))[2],
             _blocks(self.cache, ("ndvi", "gvi"), 3),
         )
         missing = self._open(("ndvi", "veg", "terrain"))[2]
@@ -100,8 +104,11 @@ class TestChannelSets(unittest.TestCase):
         )
         fresh = GreeneryCache(self.dir, spacing_m=40.0, crs_key="EPSG:3347")
         _g, _n, missing, absent = fresh.open_unit(
-            "cfg", gvi_radii=RADII, ndvi_radii=RADII,
-            required_ids=IDS, channels=chans,
+            "cfg",
+            gvi_radii=RADII,
+            ndvi_radii=RADII,
+            required_ids=IDS,
+            channels=chans,
         )
         self.assertEqual(missing.size, 0)
         self.assertEqual(absent, ())

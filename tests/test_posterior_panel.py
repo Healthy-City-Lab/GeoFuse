@@ -17,7 +17,6 @@ for _p in (os.path.join(ROOT, "ui"), ROOT):
         sys.path.insert(0, _p)
 
 import numpy as np
-
 from tabs import fusion as fusion_tab
 
 
@@ -127,14 +126,14 @@ class TestPanelRenders(unittest.TestCase):
         self.assertEqual(self.rec.calls, [])
 
     def test_optional_stages_can_all_be_missing(self):
-        out = self._render(
-            _summary(discovery={}, holdout_gain={}, null_calibration={})
-        )
+        out = self._render(_summary(discovery={}, holdout_gain={}, null_calibration={}))
         self.assertIn("Sweep", out)
         self.assertNotIn("Null calibration", out)
 
     def test_a_boundary_pick_is_warned_about(self):
-        self._render(_summary(boundary_hit=["gvi"], picked=[[400, "mean"], [1000, "p50"]]))
+        self._render(
+            _summary(boundary_hit=["gvi"], picked=[[400, "mean"], [1000, "p50"]])
+        )
         warnings = [v for n, v in self.rec.calls if n == "warning"]
         self.assertTrue(any("edge of the searched range" in str(w) for w in warnings))
 
@@ -181,28 +180,33 @@ class TestPanelRenders(unittest.TestCase):
 def _grid(**over) -> dict:
     """A bundle from a posterior that fitted the grid rather than a picked cell."""
     s = _summary()
-    s.update({
-        "radius_kernel": "lognormal",
-        "radii": [100, 250, 500, 1000],
-        "radius_profile": [[0.05, 0.20, 0.70, 0.05], [0.25, 0.25, 0.25, 0.25]],
-        "projected_pick": [[500, "p10"], [250, "mean"]],
-        "peak_radius_mean": [480.0, 390.0],
-        "peak_radius_ci_low": [410.0, 105.0],
-        "peak_radius_ci_high": [560.0, 980.0],
-        "peak_radius_prior_ci": [90.0, 1100.0],
-        "peak_radius_width_ratio": [0.15, 0.87],
-        "stats": ["mean", "p10", "p50", "p90"],
-        "aggregator_mean": [[0.1, 0.7, 0.1, 0.1], [0.25, 0.25, 0.25, 0.25]],
-        "aggregator_ci_low": [[0.02, 0.5, 0.02, 0.02], [0.05, 0.05, 0.05, 0.05]],
-        "aggregator_ci_high": [[0.3, 0.88, 0.3, 0.3], [0.6, 0.6, 0.6, 0.6]],
-        "aggregator_prior_ci": [0.008, 0.63],
-        "aggregator_width_ratio": [[0.45, 0.61, 0.45, 0.45], [0.88, 0.88, 0.88, 0.88]],
-        "aggregator_uniform": 0.25,
-        "aggregator_informative": [["p10"], []],
-        "partial_r2_mean": 0.0012,
-        "weight_prior_ci": [0.025, 0.975],
-        "weight_width_ratio": [0.63, 0.63],
-    })
+    s.update(
+        {
+            "radius_kernel": "lognormal",
+            "radii": [100, 250, 500, 1000],
+            "radius_profile": [[0.05, 0.20, 0.70, 0.05], [0.25, 0.25, 0.25, 0.25]],
+            "projected_pick": [[500, "p10"], [250, "mean"]],
+            "peak_radius_mean": [480.0, 390.0],
+            "peak_radius_ci_low": [410.0, 105.0],
+            "peak_radius_ci_high": [560.0, 980.0],
+            "peak_radius_prior_ci": [90.0, 1100.0],
+            "peak_radius_width_ratio": [0.15, 0.87],
+            "stats": ["mean", "p10", "p50", "p90"],
+            "aggregator_mean": [[0.1, 0.7, 0.1, 0.1], [0.25, 0.25, 0.25, 0.25]],
+            "aggregator_ci_low": [[0.02, 0.5, 0.02, 0.02], [0.05, 0.05, 0.05, 0.05]],
+            "aggregator_ci_high": [[0.3, 0.88, 0.3, 0.3], [0.6, 0.6, 0.6, 0.6]],
+            "aggregator_prior_ci": [0.008, 0.63],
+            "aggregator_width_ratio": [
+                [0.45, 0.61, 0.45, 0.45],
+                [0.88, 0.88, 0.88, 0.88],
+            ],
+            "aggregator_uniform": 0.25,
+            "aggregator_informative": [["p10"], []],
+            "partial_r2_mean": 0.0012,
+            "weight_prior_ci": [0.025, 0.975],
+            "weight_width_ratio": [0.63, 0.63],
+        }
+    )
     s.update(over)
     return s
 
@@ -298,9 +302,12 @@ class TestRadiusProfileChart(unittest.TestCase):
     def test_the_axis_follows_the_ladder_not_the_label_text(self):
         # "1000 m" sorts before "150 m" as text, which puts the widest buffer in
         # the middle of the axis and turns any profile into a sawtooth.
-        fig = self._figure(_grid(radii=[100, 150, 500, 1000],
-                                 radius_profile=[[0.1, 0.2, 0.6, 0.1],
-                                                 [0.25, 0.25, 0.25, 0.25]]))
+        fig = self._figure(
+            _grid(
+                radii=[100, 150, 500, 1000],
+                radius_profile=[[0.1, 0.2, 0.6, 0.1], [0.25, 0.25, 0.25, 0.25]],
+            )
+        )
         self.assertIsNotNone(fig)
         self.assertEqual(
             list(fig.layout.xaxis.categoryarray),
@@ -338,14 +345,22 @@ class TestSweepAndPosteriorDisagreement(unittest.TestCase):
         return self.rec.text()
 
     def test_a_disagreement_is_called_out_with_what_actually_ships(self):
-        out = self._render(_grid(picked=[[600, "p25"], [600, "p10"]],
-                                 projected_pick=[[500, "p10"], [500, "p10"]]))
+        out = self._render(
+            _grid(
+                picked=[[600, "p25"], [600, "p10"]],
+                projected_pick=[[500, "p10"], [500, "p10"]],
+            )
+        )
         self.assertIn("not what the study was built from", out)
         self.assertIn("500 m p10", out)
 
     def test_agreement_stays_quiet(self):
-        out = self._render(_grid(picked=[[500, "p10"], [250, "mean"]],
-                                 projected_pick=[[500, "p10"], [250, "mean"]]))
+        out = self._render(
+            _grid(
+                picked=[[500, "p10"], [250, "mean"]],
+                projected_pick=[[500, "p10"], [250, "mean"]],
+            )
+        )
         self.assertNotIn("not what the study was built from", out)
 
 
@@ -408,8 +423,9 @@ class TestFormChoiceIsReported(unittest.TestCase):
 
     def test_the_discovery_caption_counts_the_chosen_forms(self):
         s = _summary()
-        s["discovery"].update(form_counts={"linear": 50, "synergy": 10},
-                              chosen_test_t=2.35)
+        s["discovery"].update(
+            form_counts={"linear": 50, "synergy": 10}, chosen_test_t=2.35
+        )
         out = self._render(s)
         self.assertIn("inner splits of its training rows", out)
         self.assertIn("2.350", out)
@@ -438,14 +454,20 @@ class TestDistanceDecayPanel(unittest.TestCase):
         return self.rec.text()
 
     def test_r50_and_r90_are_tabled_and_the_peak_is_labelled_buffer_space(self):
-        s = _grid(r50_mean=[424.0, 300.0], r50_ci_low=[380.0, 250.0],
-                  r50_ci_high=[470.0, 350.0], r90_mean=[569.0, 450.0],
-                  r90_ci_low=[500.0, 400.0], r90_ci_high=[600.0, 500.0],
-                  implied_weight_curve={"distance_m": [0.0, 300.0, 600.0],
-                                        "weight": [[1.0, 0.6, 0.1],
-                                                   [1.0, 0.4, 0.0]]},
-                  distance_scale="raw",
-                  distance_basis="mean-equivalent (approximate)")
+        s = _grid(
+            r50_mean=[424.0, 300.0],
+            r50_ci_low=[380.0, 250.0],
+            r50_ci_high=[470.0, 350.0],
+            r90_mean=[569.0, 450.0],
+            r90_ci_low=[500.0, 400.0],
+            r90_ci_high=[600.0, 500.0],
+            implied_weight_curve={
+                "distance_m": [0.0, 300.0, 600.0],
+                "weight": [[1.0, 0.6, 0.1], [1.0, 0.4, 0.0]],
+            },
+            distance_scale="raw",
+            distance_basis="mean-equivalent (approximate)",
+        )
         out = self._render(s)
         self.assertIn("R50 (m)", out)
         self.assertIn("424", out)
@@ -468,13 +490,24 @@ class TestNegativeControlPanel(unittest.TestCase):
 
     @staticmethod
     def _report(nonspecific):
-        ctl = {"beta": 0.04, "ci_low": 0.02, "ci_high": 0.06, "t": 4.0, "n": 48,
-               "delta": 0.01, "delta_ci_low": -0.02, "delta_ci_high": 0.04,
-               "nonspecific": nonspecific}
+        ctl = {
+            "beta": 0.04,
+            "ci_low": 0.02,
+            "ci_high": 0.06,
+            "t": 4.0,
+            "n": 48,
+            "delta": 0.01,
+            "delta_ci_low": -0.02,
+            "delta_ci_high": 0.04,
+            "nonspecific": nonspecific,
+        }
         tgt = {"beta": 0.05, "ci_low": 0.03, "ci_high": 0.07, "t": 5.0, "n": 50}
-        return {"controls": ["grip"], "n_boot": 2000,
-                "nonspecific": ["grip"] if nonspecific else [],
-                "splits": {"test": {"target": tgt, "controls": {"grip": ctl}}}}
+        return {
+            "controls": ["grip"],
+            "n_boot": 2000,
+            "nonspecific": ["grip"] if nonspecific else [],
+            "splits": {"test": {"target": tgt, "controls": {"grip": ctl}}},
+        }
 
     def test_a_nonspecific_control_is_tabled_and_warned_about(self):
         fusion_tab._render_negative_controls(self._report(True))
@@ -517,25 +550,46 @@ class TestNullCalibrationPanel(unittest.TestCase):
 
     def _render(self, null):
         fusion_tab._render_posterior_diagnostics(
-            _summary(null_calibration=null), "DCOR")
+            _summary(null_calibration=null), "DCOR"
+        )
         return self.rec.text()
 
     def test_the_rate_carries_its_exact_interval(self):
-        out = self._render({"runs": 200, "excluded_zero": 10, "rate": 0.05,
-                            "rate_ci_low": 0.0242, "rate_ci_high": 0.0901,
-                            "imprecise": False})
+        out = self._render(
+            {
+                "runs": 200,
+                "excluded_zero": 10,
+                "rate": 0.05,
+                "rate_ci_low": 0.0242,
+                "rate_ci_high": 0.0901,
+                "imprecise": False,
+            }
+        )
         self.assertIn("[2.4%, 9.0%]", out)
         self.assertNotIn("too few to support a calibration claim", out)
 
     def test_a_short_run_is_called_a_quick_check(self):
-        out = self._render({"runs": 16, "excluded_zero": 0, "rate": 0.0,
-                            "rate_ci_low": 0.0, "rate_ci_high": 0.206,
-                            "imprecise": True})
+        out = self._render(
+            {
+                "runs": 16,
+                "excluded_zero": 0,
+                "rate": 0.0,
+                "rate_ci_low": 0.0,
+                "rate_ci_high": 0.206,
+                "imprecise": True,
+            }
+        )
         self.assertIn("too few to support a calibration claim", out)
 
     def test_a_reselected_form_is_reported(self):
-        out = self._render({"runs": 16, "excluded_zero": 1, "rate": 0.0625,
-                            "form_counts": {"linear": 11, "synergy": 5}})
+        out = self._render(
+            {
+                "runs": 16,
+                "excluded_zero": 1,
+                "rate": 0.0625,
+                "form_counts": {"linear": 11, "synergy": 5},
+            }
+        )
         self.assertIn("covers the form choice as well", out)
 
 
@@ -549,13 +603,15 @@ class TestCovariateAxisOrdering(unittest.TestCase):
     def _frame(self):
         import pandas as pd
 
-        return pd.DataFrame([
-            {"covariate": "SDC_MRTL=10.0", "coef": 0.4, "partial_r2": 0.002},
-            {"covariate": "AGE", "coef": -0.05, "partial_r2": 0.010},
-            {"covariate": "SDC_MRTL=2.0", "coef": 0.1, "partial_r2": 0.001},
-            {"covariate": "STRESS", "coef": -0.03, "partial_r2": 0.050},
-            {"covariate": "SDC_MRTL=3.0", "coef": 0.2, "partial_r2": 0.004},
-        ])
+        return pd.DataFrame(
+            [
+                {"covariate": "SDC_MRTL=10.0", "coef": 0.4, "partial_r2": 0.002},
+                {"covariate": "AGE", "coef": -0.05, "partial_r2": 0.010},
+                {"covariate": "SDC_MRTL=2.0", "coef": 0.1, "partial_r2": 0.001},
+                {"covariate": "STRESS", "coef": -0.03, "partial_r2": 0.050},
+                {"covariate": "SDC_MRTL=3.0", "coef": 0.2, "partial_r2": 0.004},
+            ]
+        )
 
     def test_numeric_terms_come_first_ranked_by_partial_r2(self):
         order = fusion_tab._covariate_term_order(self._frame())
@@ -563,9 +619,7 @@ class TestCovariateAxisOrdering(unittest.TestCase):
 
     def test_levels_are_ordered_by_value_not_by_text(self):
         order = fusion_tab._covariate_term_order(self._frame())
-        self.assertEqual(
-            order[2:], ["SDC_MRTL=2.0", "SDC_MRTL=3.0", "SDC_MRTL=10.0"]
-        )
+        self.assertEqual(order[2:], ["SDC_MRTL=2.0", "SDC_MRTL=3.0", "SDC_MRTL=10.0"])
 
     def test_a_term_is_split_into_variable_and_level(self):
         self.assertEqual(fusion_tab._split_term("SEX=M"), ("SEX", "M"))
@@ -583,8 +637,14 @@ class TestCovariateTrendLine(unittest.TestCase):
         self.assertIsNone(fusion_tab._trend_points([("1", 0.5), ("2", 0.7)]))
 
     def test_the_fit_follows_the_level_values_and_their_spacing(self):
-        pts = [("1", 1.0), ("2", 2.0), ("5", 5.0), ("9", 9.0), ("12", 12.0),
-               ("20", 20.0)]
+        pts = [
+            ("1", 1.0),
+            ("2", 2.0),
+            ("5", 5.0),
+            ("9", 9.0),
+            ("12", 12.0),
+            ("20", 20.0),
+        ]
         labels, fitted, _deg = fusion_tab._trend_points(pts)
         self.assertEqual(labels, ["1", "2", "5", "9", "12", "20"])
         # A straight line through y == x must be recovered, not bent by

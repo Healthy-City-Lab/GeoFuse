@@ -60,11 +60,16 @@ def _child_owning_a_bare_pool():
 
 def _process_table() -> dict[int, tuple[int, str]]:
     out = subprocess.run(
-        ["powershell", "-NoProfile", "-Command",
-         "Get-CimInstance Win32_Process | ForEach-Object { "
-         "$_.ProcessId.ToString() + ',' + $_.ParentProcessId.ToString() + "
-         "',' + $_.Name }"],
-        capture_output=True, text=True,
+        [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_Process | ForEach-Object { "
+            "$_.ProcessId.ToString() + ',' + $_.ParentProcessId.ToString() + "
+            "',' + $_.Name }",
+        ],
+        capture_output=True,
+        text=True,
     ).stdout
     rows: dict[int, tuple[int, str]] = {}
     for line in out.splitlines():
@@ -80,8 +85,11 @@ def python_descendants(pid: int) -> list[int]:
     found: set[int] = set()
     frontier = {pid}
     while frontier:
-        nxt = {p for p, (par, _n) in rows.items()
-               if par in frontier and p != pid and p not in found}
+        nxt = {
+            p
+            for p, (par, _n) in rows.items()
+            if par in frontier and p != pid and p not in found
+        }
         if not nxt:
             break
         found |= nxt
@@ -98,8 +106,9 @@ def still_running(pids: list[int]) -> list[int]:
 def _reap(pids: list[int]) -> None:
     """Kill leftover workers, so a run that proves the leak does not cause one."""
     for pid in still_running(pids):
-        subprocess.run(["taskkill", "/PID", str(pid), "/F"],
-                       capture_output=True, text=True)
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/F"], capture_output=True, text=True
+        )
 
 
 def main(bare: bool) -> int:
@@ -110,7 +119,7 @@ def main(bare: bool) -> int:
     proc.start()
     workers: list[int] = []
     try:
-        want = WORKERS + 1          # the child plus its workers
+        want = WORKERS + 1  # the child plus its workers
         deadline = time.time() + 90
         tree = python_descendants(os.getpid())
         while time.time() < deadline and len(tree) < want:
@@ -132,8 +141,10 @@ def main(bare: bool) -> int:
             time.sleep(1.0)
             left = still_running(workers)
         if left:
-            print(f"FAIL: {len(left)}/{len(workers)} workers outlived the "
-                  f"child: {left}")
+            print(
+                f"FAIL: {len(left)}/{len(workers)} workers outlived the "
+                f"child: {left}"
+            )
             return 4
         print(f"OK: killed the child, all {len(workers)} workers went with it")
         return 0

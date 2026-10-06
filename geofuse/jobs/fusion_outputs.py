@@ -247,8 +247,7 @@ def _write_fusion_outputs(
                     # ``val`` carries the sweep's mean held-out |t|, not a
                     # value of the objective, so it gets its own metric name.
                     "metric": (
-                        "sweep_holdout_abs_t" if subset == "val"
-                        else objective_metric
+                        "sweep_holdout_abs_t" if subset == "val" else objective_metric
                     ),
                     "score": _f(block.get("score")),
                     "score_raw": _f(block.get("score_raw")),
@@ -277,9 +276,17 @@ def _write_fusion_outputs(
         radius_profile = summ.get("radius_profile") or []
         peak = summ.get("peak_radius_mean") or []
         peak_ratio = summ.get("peak_radius_width_ratio") or []
-        decay = {k: summ.get(k) or [] for k in (
-            "r50_mean", "r50_ci_low", "r50_ci_high",
-            "r90_mean", "r90_ci_low", "r90_ci_high")}
+        decay = {
+            k: summ.get(k) or []
+            for k in (
+                "r50_mean",
+                "r50_ci_low",
+                "r50_ci_high",
+                "r90_mean",
+                "r90_ci_low",
+                "r90_ci_high",
+            )
+        }
         informative = summ.get("aggregator_informative") or []
         chans = summ.get("channels") or []
         wm = summ.get("weight_mean") or []
@@ -310,21 +317,30 @@ def _write_fusion_outputs(
                 {
                     "study": key,
                     "channel": name,
-                    "radius_m": (proj[0] if len(proj) > 0
-                                 else (pick[0] if len(pick) > 0 else None)),
-                    "aggregator": (proj[1] if len(proj) > 1
-                                   else (pick[1] if len(pick) > 1 else None)),
+                    "radius_m": (
+                        proj[0]
+                        if len(proj) > 0
+                        else (pick[0] if len(pick) > 0 else None)
+                    ),
+                    "aggregator": (
+                        proj[1]
+                        if len(proj) > 1
+                        else (pick[1] if len(pick) > 1 else None)
+                    ),
                     "sweep_radius_m": pick[0] if len(pick) > 0 else None,
                     "sweep_aggregator": pick[1] if len(pick) > 1 else None,
                     "peak_radius_m": (
-                        _f(peak[i]) if has_grid and i < len(peak) else None),
+                        _f(peak[i]) if has_grid and i < len(peak) else None
+                    ),
                     "peak_radius_width_vs_prior": (
-                        _f(peak_ratio[i])
-                        if has_grid and i < len(peak_ratio) else None),
+                        _f(peak_ratio[i]) if has_grid and i < len(peak_ratio) else None
+                    ),
                     **dec,
                     "aggregators_separated": (
-                        ";".join(informative[i]) if has_grid
-                        and i < len(informative) and informative[i] else None),
+                        ";".join(informative[i])
+                        if has_grid and i < len(informative) and informative[i]
+                        else None
+                    ),
                     "weight": _f(wm[i]) if i < len(wm) else None,
                     "weight_ci_low": _f(wlo[i]) if i < len(wlo) else None,
                     "weight_ci_high": _f(whi[i]) if i < len(whi) else None,
@@ -554,26 +570,31 @@ def _write_fusion_outputs(
         report = b.get("negative_controls") or {}
         for split, res in (report.get("splits") or {}).items():
             entries = [("target", label, res.get("target") or {})]
-            entries += [("control", name, c)
-                        for name, c in (res.get("controls") or {}).items()]
+            entries += [
+                ("control", name, c) for name, c in (res.get("controls") or {}).items()
+            ]
             for role, outcome, e in entries:
-                nc_rows.append({
-                    "study": key,
-                    "split": split,
-                    "role": role,
-                    "outcome": outcome,
-                    "beta": _f(e.get("beta")),
-                    "ci_low": _f(e.get("ci_low")),
-                    "ci_high": _f(e.get("ci_high")),
-                    "t": _f(e.get("t")),
-                    "n": e.get("n"),
-                    "objective": _f(e.get("objective")),
-                    "delta_vs_target": _f(e.get("delta")),
-                    "delta_ci_low": _f(e.get("delta_ci_low")),
-                    "delta_ci_high": _f(e.get("delta_ci_high")),
-                    "ratio_to_target": _f(e.get("ratio")),
-                    "nonspecific": e.get("nonspecific") if role == "control" else None,
-                })
+                nc_rows.append(
+                    {
+                        "study": key,
+                        "split": split,
+                        "role": role,
+                        "outcome": outcome,
+                        "beta": _f(e.get("beta")),
+                        "ci_low": _f(e.get("ci_low")),
+                        "ci_high": _f(e.get("ci_high")),
+                        "t": _f(e.get("t")),
+                        "n": e.get("n"),
+                        "objective": _f(e.get("objective")),
+                        "delta_vs_target": _f(e.get("delta")),
+                        "delta_ci_low": _f(e.get("delta_ci_low")),
+                        "delta_ci_high": _f(e.get("delta_ci_high")),
+                        "ratio_to_target": _f(e.get("ratio")),
+                        "nonspecific": (
+                            e.get("nonspecific") if role == "control" else None
+                        ),
+                    }
+                )
     if nc_rows:
         _emit_csv(f"negative_controls{sfx}.csv", nc_rows)
 
@@ -789,8 +810,12 @@ def _build_fusion_ledger(
             )
         if negative_control_retune:
             rt_key_raw, rt_label = _FUSION_RETUNE_STAGE
-            steps.append((_fusion_stage_key(label, rt_key_raw, multi=multi),
-                          f"[{label}] {rt_label}" if multi else rt_label))
+            steps.append(
+                (
+                    _fusion_stage_key(label, rt_key_raw, multi=multi),
+                    f"[{label}] {rt_label}" if multi else rt_label,
+                )
+            )
     return StageLedger.from_steps(steps)
 
 

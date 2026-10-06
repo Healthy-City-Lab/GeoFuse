@@ -30,9 +30,10 @@ import geopandas as gpd
 import numpy as np
 import rasterio
 
-from geofuse import JobCancelled, metric_intake
+from geofuse import JobCancelled
 from geofuse import bayesian_index as _bayesian_index
 from geofuse import cgi_formulas as _cgi_formulas
+from geofuse import metric_intake
 from geofuse import pdcor as _pdcor_mod
 from geofuse.crs_utils import (
     default_geotiff_creation_options,
@@ -1409,7 +1410,8 @@ def run_fusion(
             # A control cannot be the outcome itself, and one that is also a
             # covariate would be partialled out of its own test.
             outcome_ncs = [
-                c for c in (negative_controls or [])
+                c
+                for c in (negative_controls or [])
                 if c != target_feature and c not in outcome_covs
             ]
             if len(outcome_ncs) != len(negative_controls or []):
@@ -2084,7 +2086,7 @@ def run_fusion(
                     sweep_splits=int(sweep_splits),
                     reps=int(discovery_reps),
                     shuffles=int(discovery_shuffles),
-                    gain_splits=0,        # nothing to compare a standalone against
+                    gain_splits=0,  # nothing to compare a standalone against
                     gain_perm=0,
                     null_runs=int(null_calibration_runs),
                     draws=int(posterior_draws),
@@ -2158,8 +2160,12 @@ def run_fusion(
                 # whether the composite is more or less specific than a single
                 # channel.
                 ch_negative_controls = _negative_control_report(
-                    engine, ch_averaged_params, objective_metric,
-                    int(report_paired_bootstrap), label=label, log=_log_fusion,
+                    engine,
+                    ch_averaged_params,
+                    objective_metric,
+                    int(report_paired_bootstrap),
+                    label=label,
+                    log=_log_fusion,
                 )
                 ch_composite_path = os.path.join(
                     job_artifacts_root, f"composite_greenery_{ch}.tif"
@@ -2446,8 +2452,12 @@ def run_fusion(
             # Specificity: the frozen composite scored against each negative-
             # control outcome, which never entered tuning.
             negative_control_report = _negative_control_report(
-                engine, averaged_params, objective_metric,
-                int(report_paired_bootstrap), label=label, log=_log_fusion,
+                engine,
+                averaged_params,
+                objective_metric,
+                int(report_paired_bootstrap),
+                label=label,
+                log=_log_fusion,
             )
             if retune_enabled:
                 if outcome_ncs and negative_control_report:
@@ -2457,16 +2467,23 @@ def run_fusion(
                         status_text=f"{prefix}Re-tuning on negative controls...",
                     )
                     negative_control_report["retune"] = engine.retune_concordance(
-                        headline_params, objective_metric, forms=index_forms,
+                        headline_params,
+                        objective_metric,
+                        forms=index_forms,
                         sweep_splits=int(sweep_splits),
-                        draws=int(posterior_draws), warmup=int(posterior_warmup),
-                        chains=int(posterior_chains), seed=42,
+                        draws=int(posterior_draws),
+                        warmup=int(posterior_warmup),
+                        chains=int(posterior_chains),
+                        seed=42,
                         cancel_callback=cancel_check,
                     )
                     stage(skey("negative_control_retune"), DONE)
                 else:
-                    stage(skey("negative_control_retune"), SKIPPED,
-                          "No negative control left for this outcome.")
+                    stage(
+                        skey("negative_control_retune"),
+                        SKIPPED,
+                        "No negative control left for this outcome.",
+                    )
 
             bundle = {
                 "best_params": best_params,

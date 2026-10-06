@@ -43,7 +43,9 @@ class TestQuartileContrastMetric(unittest.TestCase):
 
     def _score(self, y, g=None, cov=None):
         return scoring.score(
-            "quartile_contrast", y, self.g if g is None else g,
+            "quartile_contrast",
+            y,
+            self.g if g is None else g,
             self.cov if cov is None else cov,
         )
 
@@ -71,8 +73,7 @@ class TestQuartileContrastMetric(unittest.TestCase):
         self.assertLess(abs(up - down), 0.35 * max(up, down))
 
     def test_a_constant_composite_has_no_contrast(self):
-        self.assertEqual(self._score(3.0 * self.g + self.noise,
-                                     g=np.ones(self.n)), 0.0)
+        self.assertEqual(self._score(3.0 * self.g + self.noise, g=np.ones(self.n)), 0.0)
 
     def test_covariates_are_adjusted_for(self):
         # An outcome driven only by a covariate that is correlated with the
@@ -102,14 +103,22 @@ class TestSweepHonoursTheObjective(unittest.TestCase):
     def _sweep(self, Xr, yr, **kw):
         # One worker keeps this in-process: a spawned pool cannot re-import
         # __main__ once another test in the same interpreter has replaced it.
-        return bi.sweep(Xr, RADII, STATS, yr, channels=("a", "b"),
-                        channel_index=(0, 1), splits=6, workers=1, **kw)
+        return bi.sweep(
+            Xr,
+            RADII,
+            STATS,
+            yr,
+            channels=("a", "b"),
+            channel_index=(0, 1),
+            splits=6,
+            workers=1,
+            **kw,
+        )
 
     def test_the_objective_changes_the_reported_score_scale(self):
         Xr, yr = self._planted()
         default = self._sweep(Xr, yr)
-        quart = self._sweep(Xr, yr, objective=_quartile_objective,
-                            rescore_top=20)
+        quart = self._sweep(Xr, yr, objective=_quartile_objective, rescore_top=20)
         # A correlation t and a contrast magnitude are different quantities;
         # if they matched, the objective was being ignored.
         self.assertNotAlmostEqual(default.score, quart.score, places=6)

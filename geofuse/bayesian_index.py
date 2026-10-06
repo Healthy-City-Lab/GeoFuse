@@ -107,8 +107,14 @@ def covariate_basis(covariates: np.ndarray | None, n: int) -> tuple[np.ndarray, 
     return q, deficit
 
 
-def prep(X: np.ndarray, y: np.ndarray, covariates: np.ndarray | None,
-         *, channel_index=None, return_info: bool = False):
+def prep(
+    X: np.ndarray,
+    y: np.ndarray,
+    covariates: np.ndarray | None,
+    *,
+    channel_index=None,
+    return_info: bool = False,
+):
     """Frisch-Waugh: project the covariates out of **both** sides, then z-score.
 
     Residualising only the outcome leaves the exposure correlated with the
@@ -167,7 +173,9 @@ def prep(X: np.ndarray, y: np.ndarray, covariates: np.ndarray | None,
         logger.warning(
             "Covariate design is rank-deficient: %d redundant direction(s) "
             "dropped from the residualisation (rank %d, residual df %d).",
-            deficit, q.shape[1], len(y) - q.shape[1],
+            deficit,
+            q.shape[1],
+            len(y) - q.shape[1],
         )
 
     def rz(a):
@@ -324,8 +332,9 @@ def percentile_scale(E, center, scale) -> np.ndarray:
     """
     from scipy.special import log_ndtr
 
-    return log_ndtr((np.asarray(E, dtype=np.float64) - center)
-                    / np.maximum(scale, 1e-12))
+    return log_ndtr(
+        (np.asarray(E, dtype=np.float64) - center) / np.maximum(scale, 1e-12)
+    )
 
 
 @dataclass
@@ -360,7 +369,7 @@ def fit_synergy(E: np.ndarray, y: np.ndarray, restarts: int = 2) -> SynergyFit:
     def unpack(th):
         ex = np.exp(th[:nw] - th[:nw].max())
         w = ex / ex.sum()
-        p = _POWER_LO + (_POWER_HI - _POWER_LO) / (1.0 + np.exp(-th[nw:nw + nc]))
+        p = _POWER_LO + (_POWER_HI - _POWER_LO) / (1.0 + np.exp(-th[nw : nw + nc]))
         return w, p
 
     def neg(th):
@@ -377,8 +386,12 @@ def fit_synergy(E: np.ndarray, y: np.ndarray, restarts: int = 2) -> SynergyFit:
     for seed in range(restarts):
         rng = np.random.default_rng(seed)
         th0 = np.concatenate([rng.normal(0.0, 0.3, nw), np.zeros(nc)])
-        r = minimize(neg, th0, method="Powell",
-                     options={"maxiter": 40000, "xtol": 1e-4, "ftol": 1e-9})
+        r = minimize(
+            neg,
+            th0,
+            method="Powell",
+            options={"maxiter": 40000, "xtol": 1e-4, "ftol": 1e-9},
+        )
         if best is None or r.fun < best.fun:
             best = r
     w, p = unpack(best.x)
@@ -396,9 +409,10 @@ def candidate_columns(channels, radius_idx, n_radii, n_stats, stat_idx=None):
     ``radius_idx`` is per-channel, so NDVI and GVI can search different ladders.
     """
     stat_idx = range(n_stats) if stat_idx is None else stat_idx
-    return [[(c * n_radii + r) * n_stats + s
-             for r in radius_idx[ci] for s in stat_idx]
-            for ci, c in enumerate(channels)]
+    return [
+        [(c * n_radii + r) * n_stats + s for r in radius_idx[ci] for s in stat_idx]
+        for ci, c in enumerate(channels)
+    ]
 
 
 def _sweep_split(task):
@@ -426,7 +440,9 @@ def _sweep_split(task):
         sub, w = fit
         j = i[sub]
         den = math.sqrt(max(float(w @ g_te[np.ix_(j, j)] @ w), 1e-15))
-        r = float(np.clip(float(w @ c_te[j]) / den / max(yn, 1e-12), -0.999999, 0.999999))
+        r = float(
+            np.clip(float(w @ c_te[j]) / den / max(yn, 1e-12), -0.999999, 0.999999)
+        )
         out[k] = abs(r) * math.sqrt(max(n_te - 2, 1)) / math.sqrt(1.0 - r * r)
     return out
 
@@ -434,17 +450,17 @@ def _sweep_split(task):
 @dataclass
 class SweepResult:
     channels: tuple[str, ...]
-    columns: tuple[int, ...]          # chosen flat column per channel
-    picked: tuple[tuple[int, str], ...]   # (radius_m, stat) per channel
+    columns: tuple[int, ...]  # chosen flat column per channel
+    picked: tuple[tuple[int, str], ...]  # (radius_m, stat) per channel
     form: str
-    score: float                      # chosen form at the pick, fresh splits
-    surface: np.ndarray = field(repr=False)   # (splits, combos)
+    score: float  # chosen form at the pick, fresh splits
+    surface: np.ndarray = field(repr=False)  # (splits, combos)
     combos: list = field(repr=False)
     one_se_columns: tuple[int, ...] = ()
     winner_counts: dict = field(default_factory=dict, repr=False)
     boundary_hit: tuple[str, ...] = ()
     form_scores: dict = field(default_factory=dict)
-    selection_score: float = float("nan")   # grid max on the selection splits
+    selection_score: float = float("nan")  # grid max on the selection splits
 
 
 def _decode(columns, n_radii, n_stats, radii, stats):
@@ -455,9 +471,24 @@ def _decode(columns, n_radii, n_stats, radii, stats):
     return tuple(out)
 
 
-def sweep(X, radii, stats, y, *, channels, channel_index, radius_idx=None,
-          forms=FORMS, splits=40, frac=0.25, seed=0, workers=None,
-          objective=None, rescore_top=50, cancel_check=None):
+def sweep(
+    X,
+    radii,
+    stats,
+    y,
+    *,
+    channels,
+    channel_index,
+    radius_idx=None,
+    forms=FORMS,
+    splits=40,
+    frac=0.25,
+    seed=0,
+    workers=None,
+    objective=None,
+    rescore_top=50,
+    cancel_check=None,
+):
     """Exhaustive grid over (radius, stat) per channel, then over the form.
 
     The linear grid is solved in closed form and swept exhaustively. Every
@@ -488,8 +519,7 @@ def sweep(X, radii, stats, y, *, channels, channel_index, radius_idx=None,
         mm[:] = flat
         mm.flush()
         del mm
-        tasks = [(path, flat.shape, combos, y, seed + s, frac)
-                 for s in range(splits)]
+        tasks = [(path, flat.shape, combos, y, seed + s, frac) for s in range(splits)]
         n_workers = workers or parallel.process_worker_count(len(tasks))
         surface = np.array(_map(_sweep_split, tasks, n_workers, cancel_check))
     finally:
@@ -502,9 +532,17 @@ def sweep(X, radii, stats, y, *, channels, channel_index, radius_idx=None,
     objective_surface, shortlist = None, None
     if objective is not None and len(combos) > 1:
         shortlist = np.argsort(-mean)[: max(1, int(rescore_top))]
-        objective_surface = _rescore(flat, y, combos, shortlist, objective,
-                                     splits=splits, frac=frac, seed=seed,
-                                     cancel_check=cancel_check)
+        objective_surface = _rescore(
+            flat,
+            y,
+            combos,
+            shortlist,
+            objective,
+            splits=splits,
+            frac=frac,
+            seed=seed,
+            cancel_check=cancel_check,
+        )
         # Candidates outside the shortlist keep -inf so they cannot win, and the
         # one-SE rule below reads the same surface the winner came from.
         obj_mean = np.full(len(combos), -np.inf)
@@ -519,15 +557,19 @@ def sweep(X, radii, stats, y, *, channels, channel_index, radius_idx=None,
     # among combos that keep the same active channels. Ranking across channel
     # sets let the surviving channel flip and reversed the effect's sign.
     eligible = np.flatnonzero(mean >= mean[best] - se[best])
-    totals = np.array([sum(r for r, _ in _decode(combos[k], n_radii, n_stats,
-                                                 radii, stats))
-                       for k in eligible])
+    totals = np.array(
+        [
+            sum(r for r, _ in _decode(combos[k], n_radii, n_stats, radii, stats))
+            for k in eligible
+        ]
+    )
     one_se = tuple(combos[int(eligible[int(np.argmin(totals))])])
 
     counts: dict = {}
     winner_surface = surface if objective_surface is None else objective_surface
-    winner_cols = (list(range(len(combos))) if shortlist is None
-                   else [int(c) for c in shortlist])
+    winner_cols = (
+        list(range(len(combos))) if shortlist is None else [int(c) for c in shortlist]
+    )
     for k in winner_surface.argmax(1):
         combo = tuple(combos[winner_cols[int(k)]])
         counts[combo] = counts.get(combo, 0) + 1
@@ -542,9 +584,15 @@ def sweep(X, radii, stats, y, *, channels, channel_index, radius_idx=None,
     form_scores = {}
     for form in candidates:
         form_scores[form] = _score_form_at(
-            flat[:, list(combos[best])], y, form, splits=splits, frac=frac,
-            seed=seed + _FORM_SEED_OFFSET, workers=workers,
-            objective=objective, cancel_check=cancel_check,
+            flat[:, list(combos[best])],
+            y,
+            form,
+            splits=splits,
+            frac=frac,
+            seed=seed + _FORM_SEED_OFFSET,
+            workers=workers,
+            objective=objective,
+            cancel_check=cancel_check,
         )
     chosen_form = candidates[0]
     for form in candidates[1:]:
@@ -552,16 +600,24 @@ def sweep(X, radii, stats, y, *, channels, channel_index, radius_idx=None,
             chosen_form = form
 
     return SweepResult(
-        channels=tuple(channels), columns=tuple(combos[best]), picked=picked,
-        form=chosen_form, score=form_scores[chosen_form], surface=surface,
-        combos=combos, one_se_columns=one_se, winner_counts=counts,
-        boundary_hit=boundary, form_scores=form_scores,
+        channels=tuple(channels),
+        columns=tuple(combos[best]),
+        picked=picked,
+        form=chosen_form,
+        score=form_scores[chosen_form],
+        surface=surface,
+        combos=combos,
+        one_se_columns=one_se,
+        winner_counts=counts,
+        boundary_hit=boundary,
+        form_scores=form_scores,
         selection_score=float(mean[best]),
     )
 
 
-def _rescore(flat, y, combos, shortlist, objective, *, splits, frac, seed,
-             cancel_check=None):
+def _rescore(
+    flat, y, combos, shortlist, objective, *, splits, frac, seed, cancel_check=None
+):
     """Score a shortlist of candidates with the job's objective, same splits.
 
     Weights still come from the closed-form simplex fit on the training rows;
@@ -611,14 +667,14 @@ def _form_split(task):
     return _tstat(fit_synergy(E[tr], y[tr]).apply(E[te]), y[te])
 
 
-def _score_form_at(E, y, form, *, splits, frac, seed, workers=None,
-                   objective=None, cancel_check=None):
+def _score_form_at(
+    E, y, form, *, splits, frac, seed, workers=None, objective=None, cancel_check=None
+):
     if objective is not None:
         scores = []
         for s in range(splits):
             _raise_if_cancelled(cancel_check)
-            scores.append(
-                _form_split_objective(E, y, form, seed + s, frac, objective))
+            scores.append(_form_split_objective(E, y, form, seed + s, frac, objective))
         return float(np.mean(scores))
     tasks = [(E, y, form, seed + s, frac) for s in range(splits)]
     n_workers = workers or parallel.process_worker_count(len(tasks))
@@ -749,9 +805,10 @@ def raw_rung_weights(radius_w, rung_sd=None) -> np.ndarray:
 def _rung_areas(radii, areas, n_channels) -> np.ndarray:
     r = np.asarray(radii, dtype=np.float64)
     if areas is None:
-        return np.broadcast_to(r ** 2, (n_channels, len(r))).astype(np.float64)
-    return np.broadcast_to(np.asarray(areas, dtype=np.float64),
-                           (n_channels, len(r))).astype(np.float64)
+        return np.broadcast_to(r**2, (n_channels, len(r))).astype(np.float64)
+    return np.broadcast_to(
+        np.asarray(areas, dtype=np.float64), (n_channels, len(r))
+    ).astype(np.float64)
 
 
 def distance_quantiles(k, radii, *, areas=None, q=(0.5, 0.9)) -> dict:
@@ -782,7 +839,7 @@ def distance_quantiles(k, radii, *, areas=None, q=(0.5, 0.9)) -> dict:
     per_area = k / safe
     tail_incl = np.cumsum(per_area[..., ::-1], axis=-1)[..., ::-1]
     tail_excl = tail_incl - per_area
-    W = cum + a * tail_excl                       # share inside each rung
+    W = cum + a * tail_excl  # share inside each rung
 
     r_prev = np.concatenate([[0.0], r[:-1]])
     a_prev = np.concatenate([np.zeros((a.shape[0], 1)), a[:, :-1]], axis=1)
@@ -797,7 +854,7 @@ def distance_quantiles(k, radii, *, areas=None, q=(0.5, 0.9)) -> dict:
         with np.errstate(divide="ignore", invalid="ignore"):
             a_star = np.where(slope > 0, (share - before) / slope, aj)
             frac = np.where(aj > ap, (a_star - ap) / (aj - ap), 1.0)
-        d2 = rp ** 2 + np.clip(frac, 0.0, 1.0) * (rj ** 2 - rp ** 2)
+        d2 = rp**2 + np.clip(frac, 0.0, 1.0) * (rj**2 - rp**2)
         d = np.sqrt(np.maximum(d2, 0.0))
         out[share] = np.where(np.isfinite(k).all(-1), d, np.nan)
     return out
@@ -815,7 +872,7 @@ def implied_weight_curve(k, radii, *, areas=None, points=60):
     a = _rung_areas(r, areas, k.shape[-2])
     grid = np.linspace(0.0, float(r.max()), points)
     density = np.where(a > 0, k / np.where(a > 0, a, 1.0), 0.0)
-    reach = (r[None, :] >= grid[:, None]).astype(np.float64)   # (points, rung)
+    reach = (r[None, :] >= grid[:, None]).astype(np.float64)  # (points, rung)
     w = np.einsum("...cr,pr->...cp", density, reach)
     with np.errstate(invalid="ignore", divide="ignore"):
         return grid, w / w[..., :1]
@@ -823,8 +880,8 @@ def implied_weight_curve(k, radii, *, areas=None, points=60):
 
 @dataclass
 class IndexPosterior:
-    weights: np.ndarray               # (draws, nC [+ pairs])
-    beta: np.ndarray                  # (draws,)
+    weights: np.ndarray  # (draws, nC [+ pairs])
+    beta: np.ndarray  # (draws,)
     powers: np.ndarray | None
     channels: tuple[str, ...]
     picked: tuple
@@ -832,16 +889,16 @@ class IndexPosterior:
     rhat_max: float
     ess_min: float
     divergences: int
-    sigma: np.ndarray | None = None                # (draws,)
-    radius_weights: np.ndarray | None = None       # (draws, nC, nR)
-    peak_radius: np.ndarray | None = None          # (draws, nC), metres
-    kernel_width: np.ndarray | None = None         # (draws, nC), log-metres
-    aggregator_weights: np.ndarray | None = None   # (draws, nC, nStats)
+    sigma: np.ndarray | None = None  # (draws,)
+    radius_weights: np.ndarray | None = None  # (draws, nC, nR)
+    peak_radius: np.ndarray | None = None  # (draws, nC), metres
+    kernel_width: np.ndarray | None = None  # (draws, nC), log-metres
+    aggregator_weights: np.ndarray | None = None  # (draws, nC, nStats)
     radii: tuple = ()
     stats: tuple = ()
     radius_kernel: str = "fixed"
-    rung_sd: np.ndarray | None = None              # (nC, nR), SD prep divided by
-    rung_area: np.ndarray | None = None            # (nC, nR), None means r²
+    rung_sd: np.ndarray | None = None  # (nC, nR), SD prep divided by
+    rung_area: np.ndarray | None = None  # (nC, nR), None means r²
 
     def weight_labels(self) -> list[str]:
         """One label per weight, so the pair terms are not read as channels.
@@ -868,8 +925,8 @@ class IndexPosterior:
         """
         if self.sigma is None:
             return np.full(len(self.beta), np.nan)
-        b2 = self.beta ** 2
-        return b2 / (b2 + self.sigma ** 2)
+        b2 = self.beta**2
+        return b2 / (b2 + self.sigma**2)
 
     def informative_aggregators(self) -> list[list[str]]:
         """Per channel, the statistics the data actually had an opinion about.
@@ -889,8 +946,11 @@ class IndexPosterior:
         uniform = 1.0 / self.aggregator_weights.shape[2]
         lo, hi = np.percentile(self.aggregator_weights, [2.5, 97.5], axis=0)
         return [
-            [str(self.stats[i]) for i in range(len(self.stats))
-             if lo[c, i] > uniform or hi[c, i] < uniform]
+            [
+                str(self.stats[i])
+                for i in range(len(self.stats))
+                if lo[c, i] > uniform or hi[c, i] < uniform
+            ]
             for c in range(len(self.channels))
         ]
 
@@ -951,7 +1011,8 @@ class IndexPosterior:
             }
         out["distance_scale"] = "raw" if self.rung_sd is not None else "standardised"
         out["distance_basis"] = (
-            "exact (mean statistic)" if tuple(self.stats) == ("mean",)
+            "exact (mean statistic)"
+            if tuple(self.stats) == ("mean",)
             else "mean-equivalent (approximate)"
         )
         out["distance_area"] = "r^2" if self.rung_area is None else "observed"
@@ -996,8 +1057,10 @@ class IndexPosterior:
             out.update(self.distance_decay())
         if self.peak_radius is not None:
             center, spread = _radius_prior(self.radii)
-            prior = (float(np.exp(center - 1.96 * spread)),
-                     float(np.exp(center + 1.96 * spread)))
+            prior = (
+                float(np.exp(center - 1.96 * spread)),
+                float(np.exp(center + 1.96 * spread)),
+            )
             p_lo, p_hi = np.percentile(self.peak_radius, [2.5, 97.5], axis=0)
             out["peak_radius_mean"] = self.peak_radius.mean(0).tolist()
             out["peak_radius_ci_low"] = np.atleast_1d(p_lo).tolist()
@@ -1026,9 +1089,21 @@ class IndexPosterior:
         return out
 
 
-def fit(E, y, *, form="linear", radii=None, stats=None, radius_mask=None,
-        radius_kernel="lognormal", aggregator="dirichlet",
-        draws=800, warmup=800, chains=4, seed=42):
+def fit(
+    E,
+    y,
+    *,
+    form="linear",
+    radii=None,
+    stats=None,
+    radius_mask=None,
+    radius_kernel="lognormal",
+    aggregator="dirichlet",
+    draws=800,
+    warmup=800,
+    chains=4,
+    seed=42,
+):
     """NUTS over every unknown the index has: scale, aggregation, weights, form.
 
     ``E`` is either ``(n, channel)`` — one already-chosen column per channel,
@@ -1067,8 +1142,11 @@ def fit(E, y, *, form="linear", radii=None, stats=None, radius_mask=None,
         nr, ns = E.shape[2], E.shape[3]
         if radii is None or len(radii) != nr:
             raise ValueError("A (n, channel, radius, stat) grid needs `radii`.")
-        mask = (np.ones((nc, nr), dtype=bool) if radius_mask is None
-                else np.asarray(radius_mask, dtype=bool))
+        mask = (
+            np.ones((nc, nr), dtype=bool)
+            if radius_mask is None
+            else np.asarray(radius_mask, dtype=bool)
+        )
         # Off-ladder cells are NaN in the tensor. Zeroing them is only safe
         # because the mask below also zeroes their kernel weight, so they enter
         # neither the contraction nor its normaliser.
@@ -1087,14 +1165,16 @@ def fit(E, y, *, form="linear", radii=None, stats=None, radius_mask=None,
         # a distribution, silently dropping the channel from those draws.
         if radius_kernel == "lognormal":
             mu = numpyro.sample(
-                "mu", dist.Normal(center, spread).expand([nc]).to_event(1))
+                "mu", dist.Normal(center, spread).expand([nc]).to_event(1)
+            )
             sd = numpyro.sample(
-                "kw",
-                dist.LogNormal(math.log(spread), 0.75).expand([nc]).to_event(1))
+                "kw", dist.LogNormal(math.log(spread), 0.75).expand([nc]).to_event(1)
+            )
             logk = -0.5 * ((log_r[None, :] - mu[:, None]) / sd[:, None]) ** 2
         elif radius_kernel == "dirichlet":
             kr = numpyro.sample(
-                "kr", dist.Dirichlet(jnp.ones(nr)).expand([nc]).to_event(1))
+                "kr", dist.Dirichlet(jnp.ones(nr)).expand([nc]).to_event(1)
+            )
             logk = jnp.log(kr + 1e-30)
         else:
             logk = jnp.zeros((nc, nr))
@@ -1104,7 +1184,8 @@ def fit(E, y, *, form="linear", radii=None, stats=None, radius_mask=None,
         k = numpyro.deterministic("radius_w", k / jnp.sum(k, axis=-1, keepdims=True))
         if aggregator == "dirichlet":
             a = numpyro.sample(
-                "a", dist.Dirichlet(jnp.ones(ns)).expand([nc]).to_event(1))
+                "a", dist.Dirichlet(jnp.ones(ns)).expand([nc]).to_event(1)
+            )
         else:
             a = jnp.ones((nc, ns)) / ns
         v = jnp.einsum("ncrs,cr,cs->nc", Ej, k, a)
@@ -1117,7 +1198,8 @@ def fit(E, y, *, form="linear", radii=None, stats=None, radius_mask=None,
             e = v @ w
         else:
             p = numpyro.sample(
-                "p", dist.Uniform(_POWER_LO, _POWER_HI).expand([nc]).to_event(1))
+                "p", dist.Uniform(_POWER_LO, _POWER_HI).expand([nc]).to_event(1)
+            )
             # Each channel as an approximate percentile, Φ of its standardised
             # value, on the log scale (see ``percentile_scale``). Mean and SD
             # use every entity, so the scaling moves smoothly with the kernel
@@ -1135,17 +1217,34 @@ def fit(E, y, *, form="linear", radii=None, stats=None, radius_mask=None,
     # A channel with no signal leaves its kernel location flat under the prior,
     # and the sampler has to traverse that ridge without stepping off it, so the
     # joint model runs at a shorter step than the fixed-column one.
-    mcmc = MCMC(NUTS(model, target_accept_prob=0.95 if joint else 0.9),
-                num_warmup=warmup, num_samples=draws, num_chains=chains,
-                progress_bar=False)
-    mcmc.run(jax.random.PRNGKey(seed), jnp.asarray(E), jnp.asarray(y),
-             extra_fields=("diverging",))
+    mcmc = MCMC(
+        NUTS(model, target_accept_prob=0.95 if joint else 0.9),
+        num_warmup=warmup,
+        num_samples=draws,
+        num_chains=chains,
+        progress_bar=False,
+    )
+    mcmc.run(
+        jax.random.PRNGKey(seed),
+        jnp.asarray(E),
+        jnp.asarray(y),
+        extra_fields=("diverging",),
+    )
     return mcmc
 
 
-def posterior_from(mcmc, *, channels, picked, form, radii=(), stats=(),
-                   radius_kernel="fixed", rung_sd=None,
-                   rung_area=None) -> IndexPosterior:
+def posterior_from(
+    mcmc,
+    *,
+    channels,
+    picked,
+    form,
+    radii=(),
+    stats=(),
+    radius_kernel="fixed",
+    rung_sd=None,
+    rung_area=None,
+) -> IndexPosterior:
     """Posterior summaries from a fitted :func:`fit`.
 
     ``rung_sd`` (channel, rung) puts the distance-decay summaries on the raw
@@ -1160,9 +1259,12 @@ def posterior_from(mcmc, *, channels, picked, form, radii=(), stats=(),
     # a one-channel study's weight vector is the constant ``[1.0]``, so its
     # R-hat is 0/0. Left in, that one NaN propagates through the max and the
     # sampler-health gate stops firing without ever saying so.
-    names = [v for v in ("w", "beta", "mu", "kw", "kr", "a")
-             if v in idata.posterior
-             and float(np.nanvar(np.asarray(idata.posterior[v]))) > 1e-24]
+    names = [
+        v
+        for v in ("w", "beta", "mu", "kw", "kr", "a")
+        if v in idata.posterior
+        and float(np.nanvar(np.asarray(idata.posterior[v]))) > 1e-24
+    ]
 
     def _finite(values) -> np.ndarray:
         a = np.asarray(values, dtype=np.float64).ravel()
@@ -1170,29 +1272,35 @@ def posterior_from(mcmc, *, channels, picked, form, radii=(), stats=(),
 
     with np.errstate(invalid="ignore", divide="ignore"):
         rhats = np.concatenate(
-            [_finite(az.rhat(idata, var_names=[n])[n]) for n in names]
-            or [np.array([])])
+            [_finite(az.rhat(idata, var_names=[n])[n]) for n in names] or [np.array([])]
+        )
         esss = np.concatenate(
-            [_finite(az.ess(idata, var_names=[n])[n]) for n in names]
-            or [np.array([])])
+            [_finite(az.ess(idata, var_names=[n])[n]) for n in names] or [np.array([])]
+        )
     rhat = float(rhats.max()) if rhats.size else float("nan")
     ess = float(esss.min()) if esss.size else float("nan")
     post = IndexPosterior(
-        weights=np.asarray(s["w"]), beta=np.asarray(s["beta"]),
+        weights=np.asarray(s["w"]),
+        beta=np.asarray(s["beta"]),
         powers=np.asarray(s["p"]) if "p" in s else None,
-        channels=tuple(channels), picked=tuple(picked), form=form,
-        rhat_max=rhat, ess_min=ess,
+        channels=tuple(channels),
+        picked=tuple(picked),
+        form=form,
+        rhat_max=rhat,
+        ess_min=ess,
         divergences=int(np.sum(mcmc.get_extra_fields()["diverging"])),
         sigma=np.asarray(s["sigma"]) if "sigma" in s else None,
         radius_weights=np.asarray(s["radius_w"]) if "radius_w" in s else None,
         peak_radius=np.exp(np.asarray(s["mu"])) if "mu" in s else None,
         kernel_width=np.asarray(s["kw"]) if "kw" in s else None,
         aggregator_weights=np.asarray(s["a"]) if "a" in s else None,
-        radii=tuple(int(r) for r in radii), stats=tuple(stats),
+        radii=tuple(int(r) for r in radii),
+        stats=tuple(stats),
         radius_kernel=radius_kernel,
         rung_sd=None if rung_sd is None else np.asarray(rung_sd, dtype=np.float64),
-        rung_area=(None if rung_area is None
-                   else np.asarray(rung_area, dtype=np.float64)),
+        rung_area=(
+            None if rung_area is None else np.asarray(rung_area, dtype=np.float64)
+        ),
     )
     # The grid is in the model, so the cell the composite is built from is the
     # posterior's own projection rather than a pick made before it ran.
@@ -1214,8 +1322,9 @@ def rung_sd_from(column_sd, channel_index, stats) -> np.ndarray:
         return np.nanmean(sd, axis=-1)
 
 
-def composite_scaling(X, column_sd, *, channels, channel_index, radii, stats,
-                      picked) -> dict:
+def composite_scaling(
+    X, column_sd, *, channels, channel_index, radii, stats, picked
+) -> dict:
     """``<channel>_center`` / ``<channel>_scale`` for building the composite.
 
     The model divides every column by its covariate-adjusted SD (``prep``'s
@@ -1244,10 +1353,25 @@ def composite_scaling(X, column_sd, *, channels, channel_index, radii, stats,
     return out
 
 
-def grid_posterior(Xr, yr, *, channels, channel_index, radii, stats, radius_idx,
-                   form, picked, radius_kernel="lognormal",
-                   aggregator="dirichlet", draws=800, warmup=800, chains=4,
-                   seed=42, column_sd=None):
+def grid_posterior(
+    Xr,
+    yr,
+    *,
+    channels,
+    channel_index,
+    radii,
+    stats,
+    radius_idx,
+    form,
+    picked,
+    radius_kernel="lognormal",
+    aggregator="dirichlet",
+    draws=800,
+    warmup=800,
+    chains=4,
+    seed=42,
+    column_sd=None,
+):
     """The joint model over the whole grid of the index channels, summarised.
 
     ``radius_idx`` lists each channel's own rungs; every other rung is masked
@@ -1258,15 +1382,34 @@ def grid_posterior(Xr, yr, *, channels, channel_index, radii, stats, radius_idx,
     radius_mask = np.zeros((len(channels), len(radii)), dtype=bool)
     for ci, allowed in enumerate(radius_idx):
         radius_mask[ci, list(allowed)] = True
-    grid_kwargs = dict(radii=radii, stats=stats, radius_mask=radius_mask,
-                       radius_kernel=radius_kernel, aggregator=aggregator)
-    mcmc = fit(grid, yr, form=form, draws=draws, warmup=warmup, chains=chains,
-               seed=seed, **grid_kwargs)
+    grid_kwargs = dict(
+        radii=radii,
+        stats=stats,
+        radius_mask=radius_mask,
+        radius_kernel=radius_kernel,
+        aggregator=aggregator,
+    )
+    mcmc = fit(
+        grid,
+        yr,
+        form=form,
+        draws=draws,
+        warmup=warmup,
+        chains=chains,
+        seed=seed,
+        **grid_kwargs,
+    )
     post = posterior_from(
-        mcmc, channels=channels, picked=picked, form=form, radii=radii,
-        stats=stats, radius_kernel=radius_kernel,
-        rung_sd=(None if column_sd is None
-                 else rung_sd_from(column_sd, channel_index, stats)),
+        mcmc,
+        channels=channels,
+        picked=picked,
+        form=form,
+        radii=radii,
+        stats=stats,
+        radius_kernel=radius_kernel,
+        rung_sd=(
+            None if column_sd is None else rung_sd_from(column_sd, channel_index, stats)
+        ),
     )
     return post, grid, grid_kwargs
 
@@ -1310,13 +1453,28 @@ def _discovery_shuffle(task):
             "weights": np.asarray(params["weights"]).tolist(),
         }
     out["form"], out["form_inner"] = choose_form(
-        E[tr], y[tr], forms, seed=seed + _FORM_SEED_OFFSET)
+        E[tr], y[tr], forms, seed=seed + _FORM_SEED_OFFSET
+    )
     return out
 
 
-def repeated_discovery(X, radii, stats, y, *, channels, channel_index,
-                       radius_idx=None, forms=FORMS, reps=5, shuffles=12,
-                       frac=0.25, seed=0, workers=None, cancel_check=None):
+def repeated_discovery(
+    X,
+    radii,
+    stats,
+    y,
+    *,
+    channels,
+    channel_index,
+    radius_idx=None,
+    forms=FORMS,
+    reps=5,
+    shuffles=12,
+    frac=0.25,
+    seed=0,
+    workers=None,
+    cancel_check=None,
+):
     """Independent repeats of sweep -> fit -> score.
 
     Each replicate gets its own seed stream, so agreement across replicates is
@@ -1336,12 +1494,17 @@ def repeated_discovery(X, radii, stats, y, *, channels, channel_index,
         mm[:] = flat
         mm.flush()
         del mm
-        tasks = [(path, flat.shape, y, cols, tuple(forms),
-                  10_000 * (rep + 1) + b, frac)
-                 for rep in range(reps) for b in range(shuffles)]
+        tasks = [
+            (path, flat.shape, y, cols, tuple(forms), 10_000 * (rep + 1) + b, frac)
+            for rep in range(reps)
+            for b in range(shuffles)
+        ]
         n_workers = workers or parallel.process_worker_count(len(tasks))
-        res = [r for r in _map(_discovery_shuffle, tasks, n_workers, cancel_check)
-               if r is not None]
+        res = [
+            r
+            for r in _map(_discovery_shuffle, tasks, n_workers, cancel_check)
+            if r is not None
+        ]
     finally:
         try:
             os.unlink(path)
@@ -1364,14 +1527,20 @@ def repeated_discovery(X, radii, stats, y, *, channels, channel_index,
     for f in per_form:
         per_form[f]["shrinkage"] = per_form[f]["train_t"] - per_form[f]["test_t"]
     return {
-        "n_results": len(res), "reps": reps, "shuffles": shuffles,
-        "pick_counts": {str(k): v for k, v in
-                        sorted(picks.items(), key=lambda kv: -kv[1])},
+        "n_results": len(res),
+        "reps": reps,
+        "shuffles": shuffles,
+        "pick_counts": {
+            str(k): v for k, v in sorted(picks.items(), key=lambda kv: -kv[1])
+        },
         "distinct_picks": len(picks),
         "per_form": per_form,
         "form_counts": {f: sum(r["form"] == f for r in res) for f in forms},
-        "chosen_test_t": (float(np.mean([r[r["form"]]["test_t"] for r in res]))
-                          if res else float("nan")),
+        "chosen_test_t": (
+            float(np.mean([r[r["form"]]["test_t"] for r in res]))
+            if res
+            else float("nan")
+        ),
     }
 
 
@@ -1435,9 +1604,21 @@ def _gain_split(task):
     return out
 
 
-def holdout_gain(X, y, *, channels, channel_index, radius_idx=None,
-                 forms=FORMS, splits=20, perm=100, frac=0.25, seed=0,
-                 workers=None, cancel_check=None):
+def holdout_gain(
+    X,
+    y,
+    *,
+    channels,
+    channel_index,
+    radius_idx=None,
+    forms=FORMS,
+    splits=20,
+    perm=100,
+    frac=0.25,
+    seed=0,
+    workers=None,
+    cancel_check=None,
+):
     """Composite vs each standalone, with a permutation null on the *gain*.
 
     Both sides make their choices on training rows: the standalone channel and
@@ -1458,12 +1639,23 @@ def holdout_gain(X, y, *, channels, channel_index, radius_idx=None,
         mm[:] = flat
         mm.flush()
         del mm
-        base = [(path, flat.shape, y, cols, cols, tuple(forms), seed + s, frac)
-                for s in range(splits)]
-        nulls = [(path, flat.shape,
-                  np.random.default_rng(90_000 + i).permutation(y),
-                  cols, cols, tuple(forms), 5_000 + i, frac)
-                 for i in range(perm)]
+        base = [
+            (path, flat.shape, y, cols, cols, tuple(forms), seed + s, frac)
+            for s in range(splits)
+        ]
+        nulls = [
+            (
+                path,
+                flat.shape,
+                np.random.default_rng(90_000 + i).permutation(y),
+                cols,
+                cols,
+                tuple(forms),
+                5_000 + i,
+                frac,
+            )
+            for i in range(perm)
+        ]
         n_workers = workers or parallel.process_worker_count(len(base) + len(nulls))
         obs = _map(_gain_split, base, n_workers, cancel_check)
         null = _map(_gain_split, nulls, n_workers, cancel_check)
@@ -1483,19 +1675,25 @@ def holdout_gain(X, y, *, channels, channel_index, radius_idx=None,
         "cgi": float(np.mean([r["cgi"] for r in obs])),
         "best_single": float(np.mean([r["best_single"] for r in obs])),
         "gain": observed,
-        "gain_null_mean": (float(gn[np.isfinite(gn)].mean())
-                           if np.isfinite(gn).any() else float("nan")),
+        "gain_null_mean": (
+            float(gn[np.isfinite(gn)].mean()) if np.isfinite(gn).any() else float("nan")
+        ),
         "gain_p": (
-            float((1 + int((gn[np.isfinite(gn)] >= observed).sum()))
-                  / (1 + int(np.isfinite(gn).sum())))
-            if usable else None
+            float(
+                (1 + int((gn[np.isfinite(gn)] >= observed).sum()))
+                / (1 + int(np.isfinite(gn).sum()))
+            )
+            if usable
+            else None
         ),
         "gain_won": int((g > 0).sum()),
         "splits": splits,
-        "cgi_max_over_forms_optimistic": float(np.mean(
-            [r["cgi_max_over_forms_optimistic"] for r in obs])),
-        "cgi_by_form": {f: float(np.mean([r["cgi_by_form"][f] for r in obs]))
-                        for f in forms},
+        "cgi_max_over_forms_optimistic": float(
+            np.mean([r["cgi_max_over_forms_optimistic"] for r in obs])
+        ),
+        "cgi_by_form": {
+            f: float(np.mean([r["cgi_by_form"][f] for r in obs])) for f in forms
+        },
         "form_counts": {f: sum(r["cgi_form"] == f for r in obs) for f in forms},
     }
     for ci, name in enumerate(channels):
@@ -1518,8 +1716,7 @@ def _null_fit(task):
         cpath, cshape, forms = choice
         Ef = np.asarray(np.memmap(cpath, dtype=np.float64, mode="r", shape=cshape))
         form, _ = choose_form(Ef, yp, forms, seed=seed + _FORM_SEED_OFFSET)
-    m = fit(E, yp, form=form, draws=300, warmup=300, chains=2, seed=seed,
-            **kwargs)
+    m = fit(E, yp, form=form, draws=300, warmup=300, chains=2, seed=seed, **kwargs)
     b = np.asarray(m.get_samples()["beta"])
     lo, hi = np.percentile(b, [2.5, 97.5])
     return int(lo > 0 or hi < 0), form
@@ -1554,9 +1751,19 @@ def _write_memmap(arr: np.ndarray, suffix: str) -> str:
     return path
 
 
-def null_calibration(E, y, *, form="linear", n=16, workers=None,
-                     cancel_check=None, reselect_form=False, form_E=None,
-                     forms=FORMS, **fit_kwargs):
+def null_calibration(
+    E,
+    y,
+    *,
+    form="linear",
+    n=16,
+    workers=None,
+    cancel_check=None,
+    reselect_form=False,
+    form_E=None,
+    forms=FORMS,
+    **fit_kwargs,
+):
     """How often the beta interval excludes zero on a permuted outcome (~5 %).
 
     ``E`` and ``fit_kwargs`` are handed to :func:`fit` unchanged, so passing the
@@ -1589,8 +1796,10 @@ def null_calibration(E, y, *, form="linear", n=16, workers=None,
             Ef = np.ascontiguousarray(np.asarray(form_E, dtype=np.float64))
             paths.append(_write_memmap(Ef, ".geofuse-null-form"))
             choice = (paths[1], Ef.shape, tuple(forms))
-        tasks = [(paths[0], E.shape, y, form, 3_000 + i, dict(fit_kwargs), choice)
-                 for i in range(n)]
+        tasks = [
+            (paths[0], E.shape, y, form, 3_000 + i, dict(fit_kwargs), choice)
+            for i in range(n)
+        ]
         n_workers = workers or min(n, parallel.process_worker_count(n))
         results = _map(_null_fit, tasks, n_workers, cancel_check)
     finally:
@@ -1602,13 +1811,20 @@ def null_calibration(E, y, *, form="linear", n=16, workers=None,
 
     k = int(sum(hit for hit, _ in results))
     lo, hi = clopper_pearson(k, n)
-    out = {"runs": n, "excluded_zero": k, "rate": float(k) / max(n, 1),
-           "rate_ci_low": lo, "rate_ci_high": hi,
-           "imprecise": n < NULL_RUNS_FOR_CLAIM,
-           "reselect_form": bool(reselect_form)}
+    out = {
+        "runs": n,
+        "excluded_zero": k,
+        "rate": float(k) / max(n, 1),
+        "rate_ci_low": lo,
+        "rate_ci_high": hi,
+        "imprecise": n < NULL_RUNS_FOR_CLAIM,
+        "reselect_form": bool(reselect_form),
+    }
     if reselect_form:
-        out["form_counts"] = {f: sum(fm == f for _, fm in results)
-                              for f in eligible_forms(forms, E.shape[1])}
+        out["form_counts"] = {
+            f: sum(fm == f for _, fm in results)
+            for f in eligible_forms(forms, E.shape[1])
+        }
     if out["imprecise"]:
         out["note"] = (
             f"{n} runs: rate too imprecise to support a calibration claim "
@@ -1627,9 +1843,16 @@ def _selfcheck():
     truth = X[:, 1, 2, 1]
     y = 0.6 * truth + rng.normal(size=n)
     yr, Xr = prep(X, y, None)
-    res = sweep(Xr, np.array([200.0, 400.0, 600.0, 800.0]),
-                ["mean", "p50", "p90"], yr, channels=("a", "b"),
-                channel_index=(0, 1), splits=6, workers=2)
+    res = sweep(
+        Xr,
+        np.array([200.0, 400.0, 600.0, 800.0]),
+        ["mean", "p50", "p90"],
+        yr,
+        channels=("a", "b"),
+        channel_index=(0, 1),
+        splits=6,
+        workers=2,
+    )
     assert res.picked[1] == (600, "p50"), res.picked
 
     Z = Xr.reshape(n, -1)[:, list(res.columns)]
@@ -1638,8 +1861,14 @@ def _selfcheck():
     assert np.all(w >= 0.0), w
     # The planted channel must carry the weight, not the noise channel.
     assert 1 in kept, kept
-    print("selfcheck ok:", res.picked, res.form, round(res.score, 2),
-          "weights", np.round(w, 3))
+    print(
+        "selfcheck ok:",
+        res.picked,
+        res.form,
+        round(res.score, 2),
+        "weights",
+        np.round(w, 3),
+    )
 
 
 if __name__ == "__main__":

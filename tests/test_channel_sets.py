@@ -72,7 +72,8 @@ class TestAJobKnowsItsOwnChannels(unittest.TestCase):
         for formula in GVI_FORMULAS:
             with self.subTest(formula=formula):
                 self.assertEqual(
-                    _engine(formula)._composite_channels(), ("ndvi", "gvi"))
+                    _engine(formula)._composite_channels(), ("ndvi", "gvi")
+                )
 
     def test_the_three_channel_set_keeps_veg_and_terrain_apart(self):
         for formula in THREE_FORMULAS:
@@ -100,7 +101,8 @@ class TestEveryChannelResolvesItsAggregation(unittest.TestCase):
         for ch, radius in (("gvi", 300), ("veg", 250), ("terrain", 250)):
             with self.subTest(channel=ch):
                 self.assertEqual(
-                    e._channel_spec(PARAMS, ch), (radius, "percentile", 75))
+                    e._channel_spec(PARAMS, ch), (radius, "percentile", 75)
+                )
 
     def test_a_missing_radius_falls_back_to_the_ladder_maximum(self):
         e = _engine("weighted_average_gvi")
@@ -120,8 +122,14 @@ class TestEveryChannelResolvesItsAggregation(unittest.TestCase):
         e._preaggregation_done = False
         with self.assertRaises(RuntimeError) as caught:
             e._aggregate_with_ring_cache(
-                None, None, 300, "mean", 50,
-                channel="gvi", fold_idx=-1, subset="test",
+                None,
+                None,
+                300,
+                "mean",
+                50,
+                channel="gvi",
+                fold_idx=-1,
+                subset="test",
             )
         self.assertIn("gvi", str(caught.exception))
 
@@ -132,9 +140,7 @@ class TestTheCompositeIsBuiltFromThatSet(unittest.TestCase):
             with self.subTest(formula=formula):
                 e = _engine(formula)
                 params = _weighted(formula)
-                blocks = {
-                    c: np.linspace(0.1, 0.9, 5) for c in e._composite_channels()
-                }
+                blocks = {c: np.linspace(0.1, 0.9, 5) for c in e._composite_channels()}
                 out = e._composite_from(params, blocks)
                 self.assertEqual(len(out), 5)
                 self.assertTrue(np.all(np.isfinite(out)))
@@ -145,14 +151,14 @@ class TestTheCompositeIsBuiltFromThatSet(unittest.TestCase):
                 e = _engine("weighted_average_gvi", mode=mode)
                 values = np.arange(4.0)
                 self.assertTrue(
-                    np.array_equal(e._composite_from({}, {mode: values}), values))
+                    np.array_equal(e._composite_from({}, {mode: values}), values)
+                )
 
     def test_normalization_is_keyed_by_channel_name(self):
         e = _engine("weighted_average_gvi")
         e.normalize_channels = True
         e._channel_minmax = {"ndvi": (0.0, 2.0), "gvi": (0.0, 4.0)}
-        out = e._normalize_channels(
-            {"ndvi": np.array([1.0]), "gvi": np.array([1.0])})
+        out = e._normalize_channels({"ndvi": np.array([1.0]), "gvi": np.array([1.0])})
         self.assertAlmostEqual(float(out["ndvi"][0]), 0.5)
         self.assertAlmostEqual(float(out["gvi"][0]), 0.25)
 
@@ -164,23 +170,27 @@ class TestGviGetsRealNormalizationBounds(unittest.TestCase):
     which silently clips the channel instead of scaling it.
     """
 
-    FRAME = {"veg": [0.1, 0.2, 0.3],
-             "terrain": [0.05, 0.05, 0.1],
-             "ndvi": [0.4, 0.5, 0.6]}
+    FRAME = {
+        "veg": [0.1, 0.2, 0.3],
+        "terrain": [0.05, 0.05, 0.1],
+        "ndvi": [0.4, 0.5, 0.6],
+    }
 
     def _frame(self):
         import pandas as pd
+
         return pd.DataFrame(self.FRAME)
 
     def test_gvi_is_read_as_the_component_sum(self):
         col = MetricFusionEngine._channel_column(self._frame(), "gvi")
-        self.assertEqual(
-            [round(float(v), 3) for v in col], [0.15, 0.25, 0.4])
+        self.assertEqual([round(float(v), 3) for v in col], [0.15, 0.25, 0.4])
 
     def test_a_channel_with_no_column_and_no_rule_is_absent(self):
         import pandas as pd
+
         self.assertIsNone(
-            MetricFusionEngine._channel_column(pd.DataFrame({"veg": [1.0]}), "gvi"))
+            MetricFusionEngine._channel_column(pd.DataFrame({"veg": [1.0]}), "gvi")
+        )
 
     def test_the_bounds_are_derived_rather_than_defaulted(self):
         e = object.__new__(MetricFusionEngine)
@@ -200,16 +210,17 @@ class TestGviGetsRealNormalizationBounds(unittest.TestCase):
 class TestTheCatchmentComesFromTheJobsRadii(unittest.TestCase):
     def test_a_standalone_job_uses_its_own_channels_radius(self):
         self.assertEqual(
-            _helpers.catchment_radius({"ndvi": 800.0, "gvi": 300.0}, "gvi"), 300.0)
+            _helpers.catchment_radius({"ndvi": 800.0, "gvi": 300.0}, "gvi"), 300.0
+        )
 
     def test_a_combined_job_uses_the_largest(self):
         self.assertEqual(
-            _helpers.catchment_radius({"ndvi": 800.0, "gvi": 300.0}, "cgi"), 800.0)
+            _helpers.catchment_radius({"ndvi": 800.0, "gvi": 300.0}, "cgi"), 800.0
+        )
 
     def test_the_radii_map_covers_the_two_channel_set(self):
         e = _engine("weighted_average_gvi")
-        self.assertEqual(
-            e._channel_radii(PARAMS), {"ndvi": 800.0, "gvi": 300.0})
+        self.assertEqual(e._channel_radii(PARAMS), {"ndvi": 800.0, "gvi": 300.0})
 
     def test_no_radii_is_not_a_crash(self):
         self.assertEqual(_helpers.catchment_radius({}, "cgi"), 0.0)

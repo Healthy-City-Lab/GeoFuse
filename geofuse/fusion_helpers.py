@@ -189,13 +189,13 @@ def apply_circular_buffer_aggregation(
             else:
                 logger(
                     "WARN",
-                    f"No numeric columns found in metric data. Columns: {metric_data.columns.tolist()}"
+                    f"No numeric columns found in metric data. Columns: {metric_data.columns.tolist()}",
                 )
                 return result  # Return all NaN
 
         logger(
             "INFO",
-            f"Buffer aggregation using column '{metric_col}' from {metric_data.columns.tolist()}, radius={radius_meters}m, stat={stat}"
+            f"Buffer aggregation using column '{metric_col}' from {metric_data.columns.tolist()}, radius={radius_meters}m, stat={stat}",
         )
 
         # Check if any data was joined
@@ -204,12 +204,12 @@ def apply_circular_buffer_aggregation(
         )
         logger(
             "INFO",
-            f"Spatial join: {len(joined)} total rows, {non_null_joins} with valid metric values"
+            f"Spatial join: {len(joined)} total rows, {non_null_joins} with valid metric values",
         )
 
         logger(
             "INFO",
-            f"Using metric column: {metric_col} from {metric_data.columns.tolist()}"
+            f"Using metric column: {metric_col} from {metric_data.columns.tolist()}",
         )
         logger("INFO", f"Joined shape: {joined.shape}, Points shape: {len(points_gdf)}")
 
@@ -232,7 +232,7 @@ def apply_circular_buffer_aggregation(
         valid_count = np.sum(~np.isnan(result))
         logger(
             "INFO",
-            f"Buffer aggregation result: {valid_count}/{len(result)} points have valid values"
+            f"Buffer aggregation result: {valid_count}/{len(result)} points have valid values",
         )
 
     return result

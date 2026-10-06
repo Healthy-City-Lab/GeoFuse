@@ -52,8 +52,13 @@ class TestAStoppedChildIsNotWaitedOnForever(unittest.TestCase):
         cancel.set()
         t0 = time.monotonic()
         status, payload = sr.drain_events_until_done(
-            "job", _Store(), q, cancel,
-            process_handle=_FakeProc(), poll_timeout=0.05, cancel_grace_s=0.5,
+            "job",
+            _Store(),
+            q,
+            cancel,
+            process_handle=_FakeProc(),
+            poll_timeout=0.05,
+            cancel_grace_s=0.5,
         )
         self.assertEqual((status, payload), ("cancelled", None))
         self.assertLess(time.monotonic() - t0, 5.0)
@@ -64,8 +69,13 @@ class TestAStoppedChildIsNotWaitedOnForever(unittest.TestCase):
         cancel = mp.Event()
         cancel.set()
         status, payload = sr.drain_events_until_done(
-            "job", _Store(), q, cancel,
-            process_handle=_FakeProc(), poll_timeout=0.05, cancel_grace_s=5.0,
+            "job",
+            _Store(),
+            q,
+            cancel,
+            process_handle=_FakeProc(),
+            poll_timeout=0.05,
+            cancel_grace_s=5.0,
         )
         self.assertEqual((status, payload), ("completed", ["out.json"]))
 
@@ -78,10 +88,16 @@ class TestAStoppedChildIsNotWaitedOnForever(unittest.TestCase):
             q.put((sr.MSG_COMPLETE, []))
 
         import threading
+
         threading.Thread(target=_finish, daemon=True).start()
         status, _ = sr.drain_events_until_done(
-            "job", _Store(), q, cancel,
-            process_handle=_FakeProc(), poll_timeout=0.05, cancel_grace_s=0.1,
+            "job",
+            _Store(),
+            q,
+            cancel,
+            process_handle=_FakeProc(),
+            poll_timeout=0.05,
+            cancel_grace_s=0.1,
         )
         self.assertEqual(status, "completed")
 
@@ -105,12 +121,13 @@ class TestKillingAChildTakesItsPoolWithIt(unittest.TestCase):
 
     @staticmethod
     def _run_probe(*args):
-        probe = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             "_pool_teardown_probe.py")
-        done = subprocess.run([sys.executable, probe, *args],
-                              capture_output=True, text=True, timeout=300)
-        report = "\n".join(
-            x for x in (done.stdout.strip(), done.stderr.strip()) if x)
+        probe = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "_pool_teardown_probe.py"
+        )
+        done = subprocess.run(
+            [sys.executable, probe, *args], capture_output=True, text=True, timeout=300
+        )
+        report = "\n".join(x for x in (done.stdout.strip(), done.stderr.strip()) if x)
         return done.returncode, report
 
     def test_the_workers_do_not_outlive_the_child(self):

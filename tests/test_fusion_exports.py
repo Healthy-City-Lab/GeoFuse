@@ -57,10 +57,17 @@ def _study(**over) -> dict:
 def _write(**over):
     out = tempfile.mkdtemp(prefix="geofuse-export-test-")
     _write_fusion_outputs(
-        output_dir=out, label="Y", multi_outcome=False, objective_metric="r2",
-        formula_name="weighted_average_gvi", cgi_bundle=_study(**over),
-        standalones_bundle={}, aic_bic=None, covariate_impact=None,
-        collinearity_report=None, run_config_record=None,
+        output_dir=out,
+        label="Y",
+        multi_outcome=False,
+        objective_metric="r2",
+        formula_name="weighted_average_gvi",
+        cgi_bundle=_study(**over),
+        standalones_bundle={},
+        aic_bic=None,
+        covariate_impact=None,
+        collinearity_report=None,
+        run_config_record=None,
         log=lambda *a, **k: None,
     )
     return out
@@ -106,17 +113,26 @@ class TestDiscoveryCsvReportsWhatWasBuilt(unittest.TestCase):
 
     def test_the_distances_of_influence_are_exported(self):
         summ = _study()["discovery_summary"]
-        summ.update(r50_mean=[300.0, 410.0], r50_ci_low=[200.0, 350.0],
-                    r50_ci_high=[380.0, 460.0], r90_mean=[520.0, 700.0],
-                    r90_ci_low=[400.0, 640.0], r90_ci_high=[600.0, 760.0])
+        summ.update(
+            r50_mean=[300.0, 410.0],
+            r50_ci_low=[200.0, 350.0],
+            r50_ci_high=[380.0, 460.0],
+            r90_mean=[520.0, 700.0],
+            r90_ci_low=[400.0, 640.0],
+            r90_ci_high=[600.0, 760.0],
+        )
         rows = _rows(_write(discovery_summary=summ), "discovery.csv")
         self.assertEqual([r["r50_m"] for r in rows], ["300.0", "410.0"])
         self.assertEqual(rows[1]["r90_ci_high"], "760.0")
 
     def test_a_run_without_a_fitted_grid_falls_back_to_the_sweep_cell(self):
         summ = _study()["discovery_summary"]
-        for key in ("projected_pick", "radius_profile", "peak_radius_mean",
-                    "aggregator_informative"):
+        for key in (
+            "projected_pick",
+            "radius_profile",
+            "peak_radius_mean",
+            "aggregator_informative",
+        ):
             summ.pop(key)
         rows = _rows(_write(discovery_summary=summ), "discovery.csv")
         self.assertEqual([r["radius_m"] for r in rows], ["600", "600"])
@@ -124,15 +140,36 @@ class TestDiscoveryCsvReportsWhatWasBuilt(unittest.TestCase):
 
 
 def _nc_report():
-    ctl = {"beta": 0.04, "se": 0.01, "ci_low": 0.02, "ci_high": 0.06, "t": 4.0,
-           "n": 48, "objective": 0.0016, "delta": 0.01, "delta_ci_low": -0.02,
-           "delta_ci_high": 0.04, "ratio": 0.8, "nonspecific": True}
-    tgt = {"beta": 0.05, "se": 0.01, "ci_low": 0.03, "ci_high": 0.07, "t": 5.0,
-           "n": 50, "objective": 0.0025}
-    return {"controls": ["grip"], "splits": {
-        "test": {"target": dict(tgt), "controls": {"grip": dict(ctl)}},
-        "train_val": {"target": dict(tgt), "controls": {"grip": dict(ctl)}},
-    }}
+    ctl = {
+        "beta": 0.04,
+        "se": 0.01,
+        "ci_low": 0.02,
+        "ci_high": 0.06,
+        "t": 4.0,
+        "n": 48,
+        "objective": 0.0016,
+        "delta": 0.01,
+        "delta_ci_low": -0.02,
+        "delta_ci_high": 0.04,
+        "ratio": 0.8,
+        "nonspecific": True,
+    }
+    tgt = {
+        "beta": 0.05,
+        "se": 0.01,
+        "ci_low": 0.03,
+        "ci_high": 0.07,
+        "t": 5.0,
+        "n": 50,
+        "objective": 0.0025,
+    }
+    return {
+        "controls": ["grip"],
+        "splits": {
+            "test": {"target": dict(tgt), "controls": {"grip": dict(ctl)}},
+            "train_val": {"target": dict(tgt), "controls": {"grip": dict(ctl)}},
+        },
+    }
 
 
 class TestNegativeControlExport(unittest.TestCase):
@@ -152,25 +189,30 @@ class TestNegativeControlExport(unittest.TestCase):
         out = _write(negative_controls=_nc_report())
         with open(os.path.join(out, "results_summary.json"), encoding="utf-8") as f:
             manifest = json.load(f)
-        self.assertEqual(manifest["studies"]["cgi"]["negative_controls"]["controls"],
-                         ["grip"])
+        self.assertEqual(
+            manifest["studies"]["cgi"]["negative_controls"]["controls"], ["grip"]
+        )
 
     def test_no_controls_writes_no_file(self):
         out = _write()
         self.assertFalse(os.path.exists(os.path.join(out, "negative_controls.csv")))
         self.assertFalse(
-            os.path.exists(os.path.join(out, "negative_control_retune.csv")))
+            os.path.exists(os.path.join(out, "negative_control_retune.csv"))
+        )
 
     def test_the_retune_concordance_is_exported_per_channel(self):
         report = _nc_report()
-        report["retune"] = {"grip": {
-            "form_target": "linear", "form_control": "linear",
-            "control_beta": 0.04,
-            "channels": {
-                "ndvi": {"radius_profile_tv": 0.1, "same_pick": True},
-                "gvi": {"radius_profile_tv": 0.7, "same_pick": False},
-            },
-        }}
+        report["retune"] = {
+            "grip": {
+                "form_target": "linear",
+                "form_control": "linear",
+                "control_beta": 0.04,
+                "channels": {
+                    "ndvi": {"radius_profile_tv": 0.1, "same_pick": True},
+                    "gvi": {"radius_profile_tv": 0.7, "same_pick": False},
+                },
+            }
+        }
         rows = _rows(_write(negative_controls=report), "negative_control_retune.csv")
         self.assertEqual([r["channel"] for r in rows], ["ndvi", "gvi"])
         self.assertEqual(rows[0]["same_pick"], "True")
@@ -186,11 +228,13 @@ class TestNegativeControlHelper(unittest.TestCase):
                 return _nc_report()
 
         params = {"ndvi_radius": 500}
-        report = _negative_control_report(Eng(), params, "r2", 1000,
-                                          label="Y", log=lambda *a: None)
+        report = _negative_control_report(
+            Eng(), params, "r2", 1000, label="Y", log=lambda *a: None
+        )
         self.assertEqual(report["controls"], ["grip"])
-        self.assertEqual(set(params["__negative_control__"]["grip"]),
-                         {"test", "train_val"})
+        self.assertEqual(
+            set(params["__negative_control__"]["grip"]), {"test", "train_val"}
+        )
 
     def test_a_failure_is_logged_not_raised(self):
         from geofuse.jobs.fusion_outputs import _negative_control_report
@@ -201,8 +245,9 @@ class TestNegativeControlHelper(unittest.TestCase):
 
         logged = []
         params = {}
-        out = _negative_control_report(Eng(), params, "r2", 10, label="Y",
-                                       log=lambda *a: logged.append(a))
+        out = _negative_control_report(
+            Eng(), params, "r2", 10, label="Y", log=lambda *a: logged.append(a)
+        )
         self.assertIsNone(out)
         self.assertNotIn("__negative_control__", params)
         self.assertEqual(logged[0][0], "WARN")

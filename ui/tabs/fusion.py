@@ -2007,7 +2007,10 @@ def _render_study_details_panel(
         col_v0, col_v1 = st.columns(2)
         with col_v0:
             discovery_reps_ui = st.number_input(
-                "Discovery replicates", min_value=0, max_value=50, step=1,
+                "Discovery replicates",
+                min_value=0,
+                max_value=50,
+                step=1,
                 key="fusion_discovery_reps",
                 help=(
                     "Independent repeats of the whole discovery, each with its "
@@ -2016,11 +2019,17 @@ def _render_study_details_panel(
                 ),
             )
             discovery_shuffles_ui = st.number_input(
-                "Shuffles per replicate", min_value=1, max_value=100, step=1,
+                "Shuffles per replicate",
+                min_value=1,
+                max_value=100,
+                step=1,
                 key="fusion_discovery_shuffles",
             )
             null_calibration_runs_ui = st.number_input(
-                "Null calibration fits", min_value=0, max_value=1000, step=1,
+                "Null calibration fits",
+                min_value=0,
+                max_value=1000,
+                step=1,
                 key="fusion_null_calibration_runs",
                 help=(
                     "Permuted-outcome refits. The reported rate should sit near "
@@ -2031,7 +2040,10 @@ def _render_study_details_panel(
             )
         with col_v1:
             gain_splits_ui = st.number_input(
-                "Held-out gain splits", min_value=0, max_value=100, step=1,
+                "Held-out gain splits",
+                min_value=0,
+                max_value=100,
+                step=1,
                 key="fusion_gain_splits",
                 help=(
                     "Composite vs each standalone under the identical sweep, on "
@@ -2039,7 +2051,10 @@ def _render_study_details_panel(
                 ),
             )
             gain_permutations_ui = st.number_input(
-                "Gain permutations", min_value=0, max_value=1000, step=10,
+                "Gain permutations",
+                min_value=0,
+                max_value=1000,
+                step=10,
                 key="fusion_gain_permutations",
                 help=(
                     "Permutation null for the *gain*, so the composite's extra "
@@ -2047,15 +2062,20 @@ def _render_study_details_panel(
                 ),
             )
             posterior_draws_ui = st.number_input(
-                "Posterior draws per chain", min_value=100, max_value=4000,
-                step=100, key="fusion_posterior_draws",
+                "Posterior draws per chain",
+                min_value=100,
+                max_value=4000,
+                step=100,
+                key="fusion_posterior_draws",
             )
             posterior_chains_ui = st.number_input(
-                "Chains", min_value=1, max_value=8, step=1,
+                "Chains",
+                min_value=1,
+                max_value=8,
+                step=1,
                 key="fusion_posterior_chains",
             )
     posterior_warmup_ui = int(posterior_draws_ui)
-
 
     # ── Per-pixel CGI scoring (vector targets) ──────────────────
     cgi_grid_spacing_m = 50
@@ -2565,12 +2585,16 @@ def _covariate_term_order(df) -> list[str]:
         if level is None:
             numeric.append((float(row.get("partial_r2") or 0.0), term))
         else:
-            groups.setdefault(name, []).append((level, term, float(row.get("partial_r2") or 0.0)))
+            groups.setdefault(name, []).append(
+                (level, term, float(row.get("partial_r2") or 0.0))
+            )
     numeric.sort(key=lambda t: -t[0])
     ranked = sorted(groups.items(), key=lambda kv: -max(x[2] for x in kv[1]))
     order = [t for _, t in numeric]
     for _name, members in ranked:
-        order += [t for _lv, t, _p in sorted(members, key=lambda m: _level_sort_key(m[0]))]
+        order += [
+            t for _lv, t, _p in sorted(members, key=lambda m: _level_sort_key(m[0]))
+        ]
     return order
 
 
@@ -3004,39 +3028,46 @@ def _render_distance_decay(summary: dict, _pd, _label) -> None:
         return f"[{_fmt(lo, 0)}, {_fmt(hi, 0)}]"
 
     st.dataframe(
-        _pd.DataFrame([
-            {
-                "Channel": _label(i),
-                "R50 (m)": _fmt(v, 0),
-                "R50 95% CrI": ci("r50", i),
-                "R90 (m)": _fmt(r90[i], 0),
-                "R90 95% CrI": ci("r90", i),
-            }
-            for i, v in enumerate(r50)
-        ]),
+        _pd.DataFrame(
+            [
+                {
+                    "Channel": _label(i),
+                    "R50 (m)": _fmt(v, 0),
+                    "R50 95% CrI": ci("r50", i),
+                    "R90 (m)": _fmt(r90[i], 0),
+                    "R90 95% CrI": ci("r90", i),
+                }
+                for i, v in enumerate(r50)
+            ]
+        ),
         width="stretch",
         hide_index=True,
     )
     curve = summary.get("implied_weight_curve") or {}
     dist, weights = curve.get("distance_m") or [], curve.get("weight") or []
     if dist and weights:
-        long = _pd.DataFrame([
-            {"Distance (m)": float(d), "Channel": _label(ci_), "Weight": float(w)}
-            for ci_, row in enumerate(weights)
-            for d, w in zip(dist, row)
-        ])
+        long = _pd.DataFrame(
+            [
+                {"Distance (m)": float(d), "Channel": _label(ci_), "Weight": float(w)}
+                for ci_, row in enumerate(weights)
+                for d, w in zip(dist, row)
+            ]
+        )
         try:
             import plotly.express as _px
 
             fig = _px.line(long, x="Distance (m)", y="Weight", color="Channel")
             fig.update_layout(
-                height=260, margin=dict(l=50, r=20, t=30, b=50),
+                height=260,
+                margin=dict(l=50, r=20, t=30, b=50),
                 yaxis_title="Implied weight (1 at the entity)",
             )
             st.plotly_chart(fig, width="stretch")
         except Exception:
-            st.line_chart(long.pivot(index="Distance (m)", columns="Channel",
-                                     values="Weight"), height=220)
+            st.line_chart(
+                long.pivot(index="Distance (m)", columns="Channel", values="Weight"),
+                height=220,
+            )
     basis = summary.get("distance_basis") or "mean-equivalent (approximate)"
     scale = summary.get("distance_scale") or "standardised"
     st.caption(
@@ -3078,16 +3109,18 @@ def _render_fitted_grid(summary: dict, _pd, _label) -> None:
         hi = summary.get("peak_radius_ci_high") or [None] * len(peak)
         ratios = summary.get("peak_radius_width_ratio") or []
         st.dataframe(
-            _pd.DataFrame([
-                {
-                    "Channel": _label(i),
-                    "Kernel peak, buffer space (m)": _fmt(v, 0),
-                    "95% CrI": f"[{_fmt(lo[i], 0)}, {_fmt(hi[i], 0)}]",
-                    "Prior CrI": f"[{_fmt(prior[0], 0)}, {_fmt(prior[1], 0)}]",
-                    "vs prior": _fmt(ratios[i], 2) if i < len(ratios) else "-",
-                }
-                for i, v in enumerate(peak)
-            ]),
+            _pd.DataFrame(
+                [
+                    {
+                        "Channel": _label(i),
+                        "Kernel peak, buffer space (m)": _fmt(v, 0),
+                        "95% CrI": f"[{_fmt(lo[i], 0)}, {_fmt(hi[i], 0)}]",
+                        "Prior CrI": f"[{_fmt(prior[0], 0)}, {_fmt(prior[1], 0)}]",
+                        "vs prior": _fmt(ratios[i], 2) if i < len(ratios) else "-",
+                    }
+                    for i, v in enumerate(peak)
+                ]
+            ),
             width="stretch",
             hide_index=True,
         )
@@ -3096,7 +3129,8 @@ def _render_fitted_grid(summary: dict, _pd, _label) -> None:
         # is normalised over a finite ladder and cannot wander the whole prior.
         # The threshold sits in the gap between those, not next to 1.0.
         unlearned = [
-            _label(i) for i, r in enumerate(ratios)
+            _label(i)
+            for i, r in enumerate(ratios)
             if _num(r) is not None and float(r) > 0.5
         ]
         if unlearned:
@@ -3113,30 +3147,39 @@ def _render_fitted_grid(summary: dict, _pd, _label) -> None:
         # Bars follow ladder order, not label text. Each channel's profile sums
         # to 1 on its own, so channels sit side by side rather than stacked.
         order = [f"{int(r)} m" for r in radii]
-        long = _pd.DataFrame([
-            {"Radius": order[ri], "Channel": _label(ci), "Weight": float(w)}
-            for ci, row in enumerate(profile)
-            for ri, w in enumerate(row)
-            if ri < len(order)
-        ])
+        long = _pd.DataFrame(
+            [
+                {"Radius": order[ri], "Channel": _label(ci), "Weight": float(w)}
+                for ci, row in enumerate(profile)
+                for ri, w in enumerate(row)
+                if ri < len(order)
+            ]
+        )
         try:
             import plotly.express as _px
 
             fig = _px.bar(
-                long, x="Radius", y="Weight", color="Channel",
-                barmode="group", category_orders={"Radius": order},
+                long,
+                x="Radius",
+                y="Weight",
+                color="Channel",
+                barmode="group",
+                category_orders={"Radius": order},
             )
             fig.update_layout(
-                height=280, margin=dict(l=50, r=20, t=30, b=50),
+                height=280,
+                margin=dict(l=50, r=20, t=30, b=50),
                 yaxis_title="Posterior weight",
                 xaxis=dict(categoryorder="array", categoryarray=order),
             )
             st.plotly_chart(fig, width="stretch")
         except Exception:
             st.bar_chart(
-                long.pivot(index="Radius", columns="Channel", values="Weight")
-                .reindex(order),
-                height=220, stack=False,
+                long.pivot(index="Radius", columns="Channel", values="Weight").reindex(
+                    order
+                ),
+                height=220,
+                stack=False,
             )
         st.caption(
             "Posterior weight on each rung of the ladder. The kernel is placed "
@@ -3160,8 +3203,9 @@ def _render_fitted_grid(summary: dict, _pd, _label) -> None:
                 name = stats[si] if si < len(stats) else f"s{si}"
                 cell = round(float(v), 3)
                 if ci < len(a_lo) and si < len(a_lo[ci]):
-                    cell = (f"{float(v):.3f} [{a_lo[ci][si]:.2f}, "
-                            f"{a_hi[ci][si]:.2f}]")
+                    cell = (
+                        f"{float(v):.3f} [{a_lo[ci][si]:.2f}, " f"{a_hi[ci][si]:.2f}]"
+                    )
                 row[name] = cell
             rows.append(row)
         st.dataframe(_pd.DataFrame(rows), width="stretch", hide_index=True)
@@ -3172,22 +3216,28 @@ def _render_fitted_grid(summary: dict, _pd, _label) -> None:
             # Older bundles lack the stored verdict; it is recomputed from the
             # intervals it is read from.
             informative = [
-                [stats[i] for i in range(min(len(stats), len(lo_c)))
-                 if lo_c[i] > uniform or hi_c[i] < uniform]
+                [
+                    stats[i]
+                    for i in range(min(len(stats), len(lo_c)))
+                    if lo_c[i] > uniform or hi_c[i] < uniform
+                ]
                 for lo_c, hi_c in zip(a_lo, a_hi)
             ]
         informative = informative or []
         st.caption(
             f"Blend over the aggregators, not a pick. A component is a finding "
             f"when its credible interval excludes the prior mean "
-            f"{uniform:.2f} - in either direction, since \"certainly not "
-            f"`p90`\" is as much of a result as \"mostly `p10`\". Mass on "
+            f'{uniform:.2f} - in either direction, since "certainly not '
+            f'`p90`" is as much of a result as "mostly `p10`". Mass on '
             "`p10` says the least-green part of the neighbourhood is what "
             "matters; on `p90`, the best patch."
         )
         silent = [_label(ci) for ci, names in enumerate(informative) if not names]
-        spoke = [f"{_label(ci)}: {', '.join(names)}"
-                 for ci, names in enumerate(informative) if names]
+        spoke = [
+            f"{_label(ci)}: {', '.join(names)}"
+            for ci, names in enumerate(informative)
+            if names
+        ]
         if spoke:
             st.caption("Aggregators the data separated - " + " | ".join(spoke))
         if silent:
@@ -3334,9 +3384,13 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
             + " - ".join(f"`{k}` {float(v):.3f}" for k, v in form_scores.items())
             + ". Every form is fitted at the same picked columns and scored on "
             "the same fresh splits, so this compares the functional form alone."
-            + (f" The grid maximum the columns were picked on was {selection:.3f}"
-               " - optimistic, being the best of every candidate on those "
-               "splits." if selection is not None else "")
+            + (
+                f" The grid maximum the columns were picked on was {selection:.3f}"
+                " - optimistic, being the best of every candidate on those "
+                "splits."
+                if selection is not None
+                else ""
+            )
         )
 
     # ── Posterior ───────────────────────────────────────────────
@@ -3367,8 +3421,11 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
             "composite. A credible interval spanning most of [0, 1] means the "
             "data does not separate that channel's contribution. **vs prior** "
             "is the credible interval's width as a share of the prior's"
-            + (f" (prior 95% CrI [{_fmt(prior_ci[0], 3)}, "
-               f"{_fmt(prior_ci[1], 3)}])" if prior_ci else "")
+            + (
+                f" (prior 95% CrI [{_fmt(prior_ci[0], 3)}, " f"{_fmt(prior_ci[1], 3)}])"
+                if prior_ci
+                else ""
+            )
             + " - near 1.00 means the data moved nothing and the weight is the "
             "prior speaking back."
         )
@@ -3488,12 +3545,20 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
                 "held-out: the part of the in-sample fit that did not survive "
                 "to unseen rows. A form with a higher train score and a larger "
                 "shrinkage is overfitting, not winning."
-                + (" Each replicate chose its form on inner splits of its "
-                   "training rows ("
-                   + ", ".join(f"`{f}` {n}" for f, n in form_counts.items())
-                   + ")" + (f"; the chosen form's held-out |t| averaged "
-                            f"{chosen_t:.3f}" if chosen_t is not None else "")
-                   + "." if form_counts else "")
+                + (
+                    " Each replicate chose its form on inner splits of its "
+                    "training rows ("
+                    + ", ".join(f"`{f}` {n}" for f, n in form_counts.items())
+                    + ")"
+                    + (
+                        f"; the chosen form's held-out |t| averaged " f"{chosen_t:.3f}"
+                        if chosen_t is not None
+                        else ""
+                    )
+                    + "."
+                    if form_counts
+                    else ""
+                )
             )
             if any(_num(v.get("test_t")) is None for v in per_form.values()):
                 st.info(
@@ -3599,8 +3664,11 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
         with n2:
             st.metric(
                 "95% CI (exact)",
-                f"[{r_lo:.1%}, {r_hi:.1%}]"
-                if r_lo is not None and r_hi is not None else "-",
+                (
+                    f"[{r_lo:.1%}, {r_hi:.1%}]"
+                    if r_lo is not None and r_hi is not None
+                    else "-"
+                ),
                 help=(
                     "Clopper-Pearson interval on the rate. With few refits it "
                     "is wide: 0 of 16 is compatible with a true rate of 20.6%."
@@ -4039,10 +4107,13 @@ def _render_study_detail(
         street = [c for c in channels if c != "ndvi"]
         agg_specs = []
         if street:
-            agg_specs.append((
-                " + ".join(_CHANNEL_DISPLAY.get(c, c.upper()) for c in street),
-                "streetview_stat", "streetview_percentile",
-            ))
+            agg_specs.append(
+                (
+                    " + ".join(_CHANNEL_DISPLAY.get(c, c.upper()) for c in street),
+                    "streetview_stat",
+                    "streetview_percentile",
+                )
+            )
         if "ndvi" in channels:
             agg_specs.append(("NDVI", "ndvi_stat", "ndvi_percentile"))
         agg_cols = st.columns(max(len(agg_specs), 1))
@@ -4050,9 +4121,7 @@ def _render_study_detail(
             with col:
                 st.metric(
                     label,
-                    _agg_label(
-                        final_params.get(stat_key), final_params.get(pct_key)
-                    ),
+                    _agg_label(final_params.get(stat_key), final_params.get(pct_key)),
                 )
         if len(street) > 1:
             st.caption(
@@ -4214,28 +4283,32 @@ def _render_negative_controls(report: dict | None) -> None:
         if not res:
             continue
         tgt = res.get("target") or {}
-        rows = [{
-            "Outcome": "Target",
-            "β (SD per SD)": _fmt(tgt.get("beta"), 3),
-            "95% CI": f"[{_fmt(tgt.get('ci_low'), 3)}, {_fmt(tgt.get('ci_high'), 3)}]",
-            "t": _fmt(tgt.get("t"), 2),
-            "n": tgt.get("n"),
-            "|β| target − |β| control": "-",
-            "Non-specific": "-",
-        }]
+        rows = [
+            {
+                "Outcome": "Target",
+                "β (SD per SD)": _fmt(tgt.get("beta"), 3),
+                "95% CI": f"[{_fmt(tgt.get('ci_low'), 3)}, {_fmt(tgt.get('ci_high'), 3)}]",
+                "t": _fmt(tgt.get("t"), 2),
+                "n": tgt.get("n"),
+                "|β| target − |β| control": "-",
+                "Non-specific": "-",
+            }
+        ]
         for name, c in (res.get("controls") or {}).items():
-            rows.append({
-                "Outcome": name,
-                "β (SD per SD)": _fmt(c.get("beta"), 3),
-                "95% CI": f"[{_fmt(c.get('ci_low'), 3)}, {_fmt(c.get('ci_high'), 3)}]",
-                "t": _fmt(c.get("t"), 2),
-                "n": c.get("n"),
-                "|β| target − |β| control": (
-                    f"{_fmt(c.get('delta'), 3)} [{_fmt(c.get('delta_ci_low'), 3)}, "
-                    f"{_fmt(c.get('delta_ci_high'), 3)}]"
-                ),
-                "Non-specific": "yes" if c.get("nonspecific") else "no",
-            })
+            rows.append(
+                {
+                    "Outcome": name,
+                    "β (SD per SD)": _fmt(c.get("beta"), 3),
+                    "95% CI": f"[{_fmt(c.get('ci_low'), 3)}, {_fmt(c.get('ci_high'), 3)}]",
+                    "t": _fmt(c.get("t"), 2),
+                    "n": c.get("n"),
+                    "|β| target − |β| control": (
+                        f"{_fmt(c.get('delta'), 3)} [{_fmt(c.get('delta_ci_low'), 3)}, "
+                        f"{_fmt(c.get('delta_ci_high'), 3)}]"
+                    ),
+                    "Non-specific": "yes" if c.get("nonspecific") else "no",
+                }
+            )
         st.caption(title)
         st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
     retune = report.get("retune") or {}
@@ -4363,8 +4436,12 @@ def _render_cross_study_comparison(results_view: dict, metric_name: str) -> None
 
     # ── Sweep held-out |t|, on its own axis ─────────────────────
     t_rows = [
-        {"Study": disp, "Held-out |t|": _num(
-            ((b.get("subset_scores") or {}).get("val") or {}).get("score"))}
+        {
+            "Study": disp,
+            "Held-out |t|": _num(
+                ((b.get("subset_scores") or {}).get("val") or {}).get("score")
+            ),
+        }
         for _key, disp, b in studies
     ]
     t_rows = [r for r in t_rows if r["Held-out |t|"] is not None]
@@ -5018,8 +5095,7 @@ def render(output_dir: str) -> None:
                             st.session_state.fusion_outcome_columns
                         )
                         nc_options = [
-                            c for c in numeric_cols
-                            if c not in target_outcome_columns
+                            c for c in numeric_cols if c not in target_outcome_columns
                         ]
                         if target_outcome_columns and nc_options:
                             _keep_valid(
@@ -5215,10 +5291,15 @@ def render(output_dir: str) -> None:
     moderator_columns_param = list(study_state.get("moderator_columns") or [])
     # Picked in the target section, so read from state; a control cannot also
     # be an outcome of this job.
-    negative_controls_param = [
-        c for c in (st.session_state.get("fusion_negative_controls") or [])
-        if c not in target_outcome_columns
-    ] if is_vector_target else []
+    negative_controls_param = (
+        [
+            c
+            for c in (st.session_state.get("fusion_negative_controls") or [])
+            if c not in target_outcome_columns
+        ]
+        if is_vector_target
+        else []
+    )
     exposure_iqr_param = study_state.get("exposure_iqr")
     objective_metric = study_state["objective_metric"]
     test_size = study_state["test_size"]

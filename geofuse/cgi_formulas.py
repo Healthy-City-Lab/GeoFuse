@@ -219,6 +219,7 @@ def percentile_channel(values, params: dict, channel: str, dt) -> np.ndarray:
     )
     return ndtr(u).astype(dt, copy=False)
 
+
 # Key ordering is informational only — the symmetric Dirichlet sampler treats
 # every key identically, so the (main NDVI / Veg / Ter, then pairwise NV / NT
 # / TV, then triple) order doesn't bias which terms get larger prior mass.
@@ -394,8 +395,11 @@ def _generic_synergy(chans: tuple[str, ...]):
         out = {}
         for k, c in enumerate(chans):
             terms = [float(params.get(f"w_{c}", 0))]
-            terms += [float(params.get(inter_keys[n], 0))
-                      for n, (i, j) in enumerate(pairs) if k in (i, j)]
+            terms += [
+                float(params.get(inter_keys[n], 0))
+                for n, (i, j) in enumerate(pairs)
+                if k in (i, j)
+            ]
             out[c] = any(t > 0 for t in terms)
         return out
 
@@ -445,9 +449,7 @@ def _register_gvi_variants() -> None:
         compute=syn_compute,
         channel_active=syn_active,
     )
-    _CHANNEL_MAIN_KEY[WEIGHTED_AVERAGE_GVI] = {
-        c: _weight_key(c) for c in _GVI_CHANNELS
-    }
+    _CHANNEL_MAIN_KEY[WEIGHTED_AVERAGE_GVI] = {c: _weight_key(c) for c in _GVI_CHANNELS}
     _CHANNEL_MAIN_KEY[SYNERGY_GVI] = {c: f"w_{c}" for c in _GVI_CHANNELS}
 
 
@@ -520,4 +522,3 @@ def formula_for(channels: tuple[str, ...], form: str) -> str:
     """
     variants = _FORM_VARIANTS[tuple(channels)]
     return variants.get(form, variants["linear"])
-

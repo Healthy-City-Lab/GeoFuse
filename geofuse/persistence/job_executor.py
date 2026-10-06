@@ -260,9 +260,7 @@ class JobExecutor:
                 # unwind; one we stopped waiting for may still be inside the
                 # phase that ignored the cancel, so it goes straight to the
                 # escalation.
-                self._stop_process(
-                    proc, grace_s=2.0 if status == "cancelled" else 30.0
-                )
+                self._stop_process(proc, grace_s=2.0 if status == "cancelled" else 30.0)
 
                 if status == "completed":
                     # The child returns ``output_paths=[]`` when it short-

@@ -56,9 +56,9 @@ class Truth:
     """One planted CGI: per-channel kernel and aggregator, weights, form."""
 
     name: str
-    weights: tuple                 # per channel, then per pair for synergy
-    kernel: tuple                  # (channel, rung) rung weights, rows sum to 1
-    aggregator: tuple              # (channel, stat) blend, rows sum to 1
+    weights: tuple  # per channel, then per pair for synergy
+    kernel: tuple  # (channel, rung) rung weights, rows sum to 1
+    aggregator: tuple  # (channel, stat) blend, rows sum to 1
     form: str = "linear"
     powers: tuple | None = None
     null: bool = False
@@ -103,8 +103,16 @@ def default_scenarios(n_channels, radii, stats, radius_idx=None) -> list[Truth]:
         out.append(Truth("S2", w2, kern(rows), kern(agg)))
         n_pairs = n_channels * (n_channels - 1) // 2
         w3 = [0.2, 0.2] + [0.0] * (n_channels - 2) + [0.6] + [0.0] * (n_pairs - 1)
-        out.append(Truth("S3", tuple(w3), kern(rows), kern(agg), form="synergy",
-                         powers=tuple([0.6] * n_channels)))
+        out.append(
+            Truth(
+                "S3",
+                tuple(w3),
+                kern(rows),
+                kern(agg),
+                form="synergy",
+                powers=tuple([0.6] * n_channels),
+            )
+        )
     if len(ladder0) >= 3:
         rows = solo(0, ladder0[1])
         rows[0] = [0.0] * nr
@@ -141,8 +149,9 @@ def true_r50(truth: Truth, radii, column_sd, channel_index, stats) -> np.ndarray
 
 def _seed(seed: int, name: str, pr2: float, rep: int) -> int:
     seq = np.random.SeedSequence(
-        [int(seed), zlib.crc32(name.encode()), int(round(pr2 * 1e7)), int(rep)])
-    return int(seq.generate_state(1)[0] % (2 ** 31 - 1))
+        [int(seed), zlib.crc32(name.encode()), int(round(pr2 * 1e7)), int(rep)]
+    )
+    return int(seq.generate_state(1)[0] % (2**31 - 1))
 
 
 def _write_memmap(arr) -> str:
@@ -159,36 +168,68 @@ def _replicate(task) -> dict:
     """One plasmode replicate: simulate, prep, sweep, grid posterior, score."""
     (x_path, x_shape, cov_path, cov_shape, z, gamma, truth, pr2, seed, cfg) = task
     X = np.asarray(np.memmap(x_path, dtype=np.float64, mode="r", shape=x_shape))
-    cov = (None if cov_path is None else
-           np.asarray(np.memmap(cov_path, dtype=np.float64, mode="r", shape=cov_shape)))
+    cov = (
+        None
+        if cov_path is None
+        else np.asarray(
+            np.memmap(cov_path, dtype=np.float64, mode="r", shape=cov_shape)
+        )
+    )
     rng = np.random.default_rng(seed)
     beta = 0.0 if truth.null else math.sqrt(pr2 / (1.0 - pr2))
     y = beta * z + rng.normal(size=len(z))
     if cov is not None:
         y = y + cov @ gamma
 
-    yr, Xr, info = bi.prep(X, y, cov, channel_index=cfg["channel_index"],
-                           return_info=True)
-    res = bi.sweep(Xr, cfg["radii"], cfg["stats"], yr, channels=cfg["channels"],
-                   channel_index=cfg["channel_index"], radius_idx=cfg["radius_idx"],
-                   forms=cfg["forms"], splits=cfg["sweep_splits"], seed=seed,
-                   workers=1)
+    yr, Xr, info = bi.prep(
+        X, y, cov, channel_index=cfg["channel_index"], return_info=True
+    )
+    res = bi.sweep(
+        Xr,
+        cfg["radii"],
+        cfg["stats"],
+        yr,
+        channels=cfg["channels"],
+        channel_index=cfg["channel_index"],
+        radius_idx=cfg["radius_idx"],
+        forms=cfg["forms"],
+        splits=cfg["sweep_splits"],
+        seed=seed,
+        workers=1,
+    )
     post, _, _ = bi.grid_posterior(
-        Xr, yr, channels=cfg["channels"], channel_index=cfg["channel_index"],
-        radii=cfg["radii"], stats=cfg["stats"], radius_idx=cfg["radius_idx"],
-        form=res.form, picked=res.picked, radius_kernel=cfg["radius_kernel"],
-        aggregator=cfg["aggregator"], draws=cfg["draws"], warmup=cfg["warmup"],
-        chains=cfg["chains"], seed=seed, column_sd=info["column_sd"],
+        Xr,
+        yr,
+        channels=cfg["channels"],
+        channel_index=cfg["channel_index"],
+        radii=cfg["radii"],
+        stats=cfg["stats"],
+        radius_idx=cfg["radius_idx"],
+        form=res.form,
+        picked=res.picked,
+        radius_kernel=cfg["radius_kernel"],
+        aggregator=cfg["aggregator"],
+        draws=cfg["draws"],
+        warmup=cfg["warmup"],
+        chains=cfg["chains"],
+        seed=seed,
+        column_sd=info["column_sd"],
     )
     s = post.summary()
     b_true = math.sqrt(pr2) if not truth.null else 0.0
     rec = {
-        "scenario": truth.name, "partial_r2": pr2, "seed": seed,
-        "form_true": truth.form, "form": res.form,
-        "beta_true": b_true, "beta_mean": s["beta_mean"],
-        "beta_ci_low": s["beta_ci_low"], "beta_ci_high": s["beta_ci_high"],
+        "scenario": truth.name,
+        "partial_r2": pr2,
+        "seed": seed,
+        "form_true": truth.form,
+        "form": res.form,
+        "beta_true": b_true,
+        "beta_mean": s["beta_mean"],
+        "beta_ci_low": s["beta_ci_low"],
+        "beta_ci_high": s["beta_ci_high"],
         "excluded_zero": bool(s["beta_ci_low"] > 0 or s["beta_ci_high"] < 0),
-        "rhat_max": s.get("rhat_max"), "divergences": s.get("divergences"),
+        "rhat_max": s.get("rhat_max"),
+        "divergences": s.get("divergences"),
         "channels": {},
     }
     w_true = np.asarray(truth.weights)
@@ -197,33 +238,47 @@ def _replicate(task) -> dict:
         # A weight of exactly 0 or 1 sits on the simplex boundary, which a
         # continuous interval never contains, so coverage is read only for
         # interior true weights; the absolute error covers every one.
-        rec["weight_covered"] = [bool(lo <= wt <= hi)
-                                 for lo, wt, hi in zip(w_lo, w_true, w_hi)
-                                 if 0.0 < wt < 1.0]
-        rec["weight_abs_error"] = float(np.mean(
-            np.abs(np.asarray(s["weight_mean"]) - w_true)))
-    r50_true = true_r50(truth, cfg["radii"], info["column_sd"],
-                        cfg["channel_index"], cfg["stats"])
+        rec["weight_covered"] = [
+            bool(lo <= wt <= hi)
+            for lo, wt, hi in zip(w_lo, w_true, w_hi)
+            if 0.0 < wt < 1.0
+        ]
+        rec["weight_abs_error"] = float(
+            np.mean(np.abs(np.asarray(s["weight_mean"]) - w_true))
+        )
+    r50_true = true_r50(
+        truth, cfg["radii"], info["column_sd"], cfg["channel_index"], cfg["stats"]
+    )
     agg_true = np.asarray(truth.aggregator)
     for c, ch in enumerate(cfg["channels"]):
         if truth.null or w_true[c] <= 0:
             continue
         row = {"r50_true": float(r50_true[c])}
         if "r50_mean" in s:
-            row.update(r50_mean=s["r50_mean"][c], r50_ci_low=s["r50_ci_low"][c],
-                       r50_ci_high=s["r50_ci_high"][c])
+            row.update(
+                r50_mean=s["r50_mean"][c],
+                r50_ci_low=s["r50_ci_low"][c],
+                r50_ci_high=s["r50_ci_high"][c],
+            )
         if "aggregator_mean" in s:
             row["aggregator_tv"] = 0.5 * float(
-                np.abs(np.asarray(s["aggregator_mean"][c]) - agg_true[c]).sum())
+                np.abs(np.asarray(s["aggregator_mean"][c]) - agg_true[c]).sum()
+            )
         rec["channels"][ch] = row
     return rec
 
 
 def _rate_rows(name, pr2, metric, hits, n):
     lo, hi = bi.clopper_pearson(int(hits), int(n))
-    return {"scenario": name, "partial_r2": pr2, "metric": metric,
-            "value": hits / n if n else float("nan"), "ci_low": lo, "ci_high": hi,
-            "n": int(n)}
+    return {
+        "scenario": name,
+        "partial_r2": pr2,
+        "metric": metric,
+        "value": hits / n if n else float("nan"),
+        "ci_low": lo,
+        "ci_high": hi,
+        "n": int(n),
+    }
 
 
 def summarise(records: list[dict]) -> list[dict]:
@@ -235,39 +290,78 @@ def summarise(records: list[dict]) -> list[dict]:
         n = len(rs)
         hits = sum(r["excluded_zero"] for r in rs)
         null = all(r["beta_true"] == 0.0 for r in rs)
-        rows.append(_rate_rows(name, pr2, "false_positive_rate" if null else "power",
-                               hits, n))
+        rows.append(
+            _rate_rows(name, pr2, "false_positive_rate" if null else "power", hits, n)
+        )
 
         def mean_row(metric, values):
             vals = [v for v in values if v is not None and np.isfinite(v)]
-            rows.append({"scenario": name, "partial_r2": pr2, "metric": metric,
-                         "value": float(np.mean(vals)) if vals else float("nan"),
-                         "ci_low": None, "ci_high": None, "n": len(vals)})
+            rows.append(
+                {
+                    "scenario": name,
+                    "partial_r2": pr2,
+                    "metric": metric,
+                    "value": float(np.mean(vals)) if vals else float("nan"),
+                    "ci_low": None,
+                    "ci_high": None,
+                    "n": len(vals),
+                }
+            )
 
         if not null:
             mean_row("beta_bias", [r["beta_mean"] - r["beta_true"] for r in rs])
-            mean_row("beta_coverage", [float(r["beta_ci_low"] <= r["beta_true"]
-                                             <= r["beta_ci_high"]) for r in rs])
+            mean_row(
+                "beta_coverage",
+                [
+                    float(r["beta_ci_low"] <= r["beta_true"] <= r["beta_ci_high"])
+                    for r in rs
+                ],
+            )
             chans = [c for r in rs for c in r["channels"].values()]
-            mean_row("r50_abs_log_error", [
-                abs(math.log(c["r50_mean"] / c["r50_true"])) for c in chans
-                if c.get("r50_mean") and c.get("r50_true")])
-            mean_row("r50_coverage", [
-                float(c["r50_ci_low"] <= c["r50_true"] <= c["r50_ci_high"])
-                for c in chans if "r50_ci_low" in c])
+            mean_row(
+                "r50_abs_log_error",
+                [
+                    abs(math.log(c["r50_mean"] / c["r50_true"]))
+                    for c in chans
+                    if c.get("r50_mean") and c.get("r50_true")
+                ],
+            )
+            mean_row(
+                "r50_coverage",
+                [
+                    float(c["r50_ci_low"] <= c["r50_true"] <= c["r50_ci_high"])
+                    for c in chans
+                    if "r50_ci_low" in c
+                ],
+            )
             mean_row("aggregator_tv_error", [c.get("aggregator_tv") for c in chans])
-            mean_row("weight_coverage", [
-                float(v) for r in rs for v in r.get("weight_covered", [])])
+            mean_row(
+                "weight_coverage",
+                [float(v) for r in rs for v in r.get("weight_covered", [])],
+            )
             mean_row("weight_abs_error", [r.get("weight_abs_error") for r in rs])
             mean_row("form_recovery", [float(r["form"] == r["form_true"]) for r in rs])
     return rows
 
 
-def plasmode_recovery(X, covariates=None, *, channels, radii, stats,
-                      channel_index=None, radius_idx=None, scenarios=None,
-                      reps=200, partial_r2=(0.0005, 0.001, 0.002), forms=bi.FORMS,
-                      pipeline_kwargs=None, seed=0, workers=None,
-                      cancel_check=None) -> dict:
+def plasmode_recovery(
+    X,
+    covariates=None,
+    *,
+    channels,
+    radii,
+    stats,
+    channel_index=None,
+    radius_idx=None,
+    scenarios=None,
+    reps=200,
+    partial_r2=(0.0005, 0.001, 0.002),
+    forms=bi.FORMS,
+    pipeline_kwargs=None,
+    seed=0,
+    workers=None,
+    cancel_check=None,
+) -> dict:
     """Plant each scenario's CGI in ``X`` and measure what the pipeline recovers.
 
     ``X`` is the real ``(entity, channel, radius, stat)`` tensor and
@@ -283,19 +377,35 @@ def plasmode_recovery(X, covariates=None, *, channels, radii, stats,
         channel_index = list(range(n_channels))
     if radius_idx is None:
         radius_idx = [list(range(len(radii)))] * n_channels
-    cfg = {**LIGHT_SETTINGS, "radius_kernel": "lognormal", "aggregator": "dirichlet",
-           **(pipeline_kwargs or {})}
-    cfg.update(channels=list(channels), channel_index=list(channel_index),
-               radii=np.asarray(radii, dtype=np.float64), stats=list(stats),
-               radius_idx=[list(r) for r in radius_idx], forms=tuple(forms))
+    cfg = {
+        **LIGHT_SETTINGS,
+        "radius_kernel": "lognormal",
+        "aggregator": "dirichlet",
+        **(pipeline_kwargs or {}),
+    }
+    cfg.update(
+        channels=list(channels),
+        channel_index=list(channel_index),
+        radii=np.asarray(radii, dtype=np.float64),
+        stats=list(stats),
+        radius_idx=[list(r) for r in radius_idx],
+        forms=tuple(forms),
+    )
     truths = scenarios or default_scenarios(n_channels, radii, stats, radius_idx)
 
-    cov = None if covariates is None else np.ascontiguousarray(
-        np.asarray(covariates, dtype=np.float64).reshape(len(X), -1))
+    cov = (
+        None
+        if covariates is None
+        else np.ascontiguousarray(
+            np.asarray(covariates, dtype=np.float64).reshape(len(X), -1)
+        )
+    )
     _, Xr0 = bi.prep(X, np.zeros(len(X)), cov, channel_index=channel_index)
     if len(Xr0) != len(X):
-        raise ValueError("plasmode_recovery needs complete rows; drop entities "
-                         "with partial coverage first.")
+        raise ValueError(
+            "plasmode_recovery needs complete rows; drop entities "
+            "with partial coverage first."
+        )
     gamma = None
     if cov is not None:
         g = np.random.default_rng(seed).normal(size=cov.shape[1])
@@ -311,12 +421,22 @@ def plasmode_recovery(X, covariates=None, *, channels, radii, stats,
         tasks = []
         for truth in truths:
             z = planted_index(Xr0, truth, channel_index)
-            for pr2 in ((0.0,) if truth.null else tuple(partial_r2)):
+            for pr2 in (0.0,) if truth.null else tuple(partial_r2):
                 for rep in range(int(reps)):
-                    tasks.append((paths[0], X.shape, cov_path,
-                                  None if cov is None else cov.shape, z, gamma,
-                                  truth, float(pr2),
-                                  _seed(seed, truth.name, float(pr2), rep), cfg))
+                    tasks.append(
+                        (
+                            paths[0],
+                            X.shape,
+                            cov_path,
+                            None if cov is None else cov.shape,
+                            z,
+                            gamma,
+                            truth,
+                            float(pr2),
+                            _seed(seed, truth.name, float(pr2), rep),
+                            cfg,
+                        )
+                    )
         n_workers = workers or parallel.process_worker_count(len(tasks))
         records = bi._map(_replicate, tasks, n_workers, cancel_check)
     finally:
@@ -327,9 +447,14 @@ def plasmode_recovery(X, covariates=None, *, channels, radii, stats,
                 pass
 
     settings = {k: v for k, v in cfg.items() if k != "radii"}
-    settings.update(radii=[float(r) for r in cfg["radii"]], reps=int(reps),
-                    partial_r2=list(partial_r2), seed=int(seed), n=int(len(X)),
-                    scenarios=[asdict(t) for t in truths])
+    settings.update(
+        radii=[float(r) for r in cfg["radii"]],
+        reps=int(reps),
+        partial_r2=list(partial_r2),
+        seed=int(seed),
+        n=int(len(X)),
+        scenarios=[asdict(t) for t in truths],
+    )
     return {"settings": settings, "table": summarise(records), "replicates": records}
 
 
