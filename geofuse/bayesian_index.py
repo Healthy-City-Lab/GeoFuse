@@ -1103,7 +1103,12 @@ def fit(E, y, *, form="linear", radii=None, stats=None, radius_mask=None,
                 "p", dist.Uniform(_POWER_LO, _POWER_HI).expand([nc]).to_event(1))
             lo, hi = v.min(0), v.max(0)
             z = jnp.clip((v - lo) / (hi - lo + 1e-12), 0.0, 1.0)
-            e = (z ** p) @ w[:nc]
+            # ``z ** p`` has an infinite derivative in z and a NaN one in p at
+            # z = 0, which every channel's minimum hits exactly. The inner
+            # ``where`` keeps the log finite so the gradient there is zero.
+            pos = z > 0
+            zp = jnp.where(pos, jnp.exp(p * jnp.log(jnp.where(pos, z, 1.0))), 0.0)
+            e = zp @ w[:nc]
             for k, (i, j) in enumerate(_pairs(nc)):
                 e = e + w[nc + k] * z[:, i] * z[:, j]
         e = (e - e.mean()) / jnp.maximum(e.std(), 1e-9)

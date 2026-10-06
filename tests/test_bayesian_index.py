@@ -921,6 +921,25 @@ class TestDistanceDecay(unittest.TestCase):
         self.assertGreater(info["column_sd"][0, 1, 0], 2.5 * info["column_sd"][0, 0, 0])
 
 
+class TestSynergyPosteriorGradient(unittest.TestCase):
+    """The synergy power term must give the sampler finite gradients.
+
+    In the grid model each channel's exposure moves with the kernel, and min-max
+    scaling puts its minimum at exactly 0, where ``z ** p`` has an infinite
+    derivative. Fed that, the sampler diverges on most steps.
+    """
+
+    def test_the_grid_fit_does_not_diverge(self):
+        rng = np.random.default_rng(0)
+        n = 800
+        X = rng.normal(size=(n, 2, len(RADII), 2))
+        y = 0.23 * X[:, 0, 1, 0] + rng.normal(size=n)
+        yr, Xr = bi.prep(X, y, None)
+        m = bi.fit(Xr, yr, form="synergy", radii=RADII, stats=["mean", "p50"],
+                   draws=300, warmup=300, chains=2, seed=1)
+        self.assertLess(int(np.sum(m.get_extra_fields()["diverging"])), 10)
+
+
 class _StubMCMC:
     def __init__(self, beta):
         self._beta = beta
