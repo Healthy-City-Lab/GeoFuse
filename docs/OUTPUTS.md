@@ -123,10 +123,15 @@ sweep's held-out |t| under the metric name `sweep_holdout_abs_t`. It is a
 t-statistic over resamples of the training pool, not a value of the objective,
 so it does not share a scale with the other rows.
 
-**`parameters.csv`** for a synergy study also lists `<channel>_center` and
-`<channel>_scale`: the mean and standard deviation that turn each channel into
-its approximate percentile before the powers and products are applied. They
-belong to the composite as much as the weights do.
+**`parameters.csv`** also lists `<channel>_center` and `<channel>_scale` for
+each channel of a composite: the mean and the covariate-adjusted standard
+deviation that standardise the channel before the weights (and, for synergy,
+the percentile curve, powers and products) are applied. They belong to the
+composite as much as the weights do. A composite is therefore in SD units, as
+are `composite_greenery.tif` (unless scaled to [0, 1]) and the per-IQR effect in
+`exposure_response.csv`; standalone channels stay in their layer's own units.
+Results saved before these keys existed rebuild from the raw channel values, as
+they were fitted.
 
 **`discovery.csv`** has one row per weight. `radius_m` and `aggregator` are the
 posterior's projection onto one cell per channel, which is the cell the

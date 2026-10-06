@@ -1635,7 +1635,10 @@ def _render_study_details_panel(
                     "the interquartile range of the winning composite itself, "
                     "which makes runs on different exposures incomparable. Set "
                     "it to a published study's IQR to read your effect on that "
-                    "study's scale. Reporting only — the search is unaffected."
+                    "study's scale — meaningful for a single-channel standalone "
+                    "in the layer's own units; a composite is in "
+                    "covariate-adjusted SD units. Reporting only — the search "
+                    "is unaffected."
                 ),
             )
             if covariate_columns:
