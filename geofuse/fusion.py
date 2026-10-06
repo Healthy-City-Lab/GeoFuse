@@ -3381,29 +3381,14 @@ class MetricFusionEngine:
         # conditioned on a choice made before the sampler ran. The sweep's pick
         # stays in the bundle as a diagnostic and as the shortlist that decided
         # the functional form.
-        grid = Xr[:, channel_index, :, :]
-        radius_mask = np.zeros((len(index_channels), len(radii)), dtype=bool)
-        for ci, allowed in enumerate(radius_idx):
-            radius_mask[ci, list(allowed)] = True
-        grid_kwargs = dict(
-            radii=radii, stats=stats, radius_mask=radius_mask,
-            radius_kernel=radius_kernel, aggregator=aggregator,
-        )
         if cancelled():
             raise JobCancelled("Index posterior cancelled by user.")
-        mcmc = bayesian_index.fit(
-            grid, yr, form=res.form, draws=draws, warmup=warmup,
-            chains=chains, seed=seed, **grid_kwargs,
-        )
-        # The distance-decay summaries read the kernel on the raw exposure
-        # scale, through the SD of each channel's mean-statistic column.
-        sd = prep_info["column_sd"][channel_index]
-        rung_sd = (sd[:, :, list(stats).index("mean")] if "mean" in stats
-                   else np.nanmean(sd, axis=-1))
-        post = bayesian_index.posterior_from(
-            mcmc, channels=index_channels, picked=res.picked, form=res.form,
-            radii=radii, stats=stats, radius_kernel=radius_kernel,
-            rung_sd=rung_sd,
+        post, grid, grid_kwargs = bayesian_index.grid_posterior(
+            Xr, yr, channels=index_channels, channel_index=channel_index,
+            radii=radii, stats=stats, radius_idx=radius_idx, form=res.form,
+            picked=res.picked, radius_kernel=radius_kernel,
+            aggregator=aggregator, draws=draws, warmup=warmup, chains=chains,
+            seed=seed, column_sd=prep_info["column_sd"],
         )
         null = (
             bayesian_index.null_calibration(

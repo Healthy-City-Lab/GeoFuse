@@ -1180,6 +1180,46 @@ def posterior_from(mcmc, *, channels, picked, form, radii=(), stats=(),
     return post
 
 
+def rung_sd_from(column_sd, channel_index, stats) -> np.ndarray:
+    """Per-channel, per-rung SD of the mean-statistic column, from ``prep``.
+
+    The distance-decay summaries read the kernel on the raw exposure scale
+    through these. Without a ``mean`` column, the SDs are averaged over stats.
+    """
+    sd = np.asarray(column_sd, dtype=np.float64)[list(channel_index)]
+    if "mean" in stats:
+        return sd[:, :, list(stats).index("mean")]
+    with np.errstate(invalid="ignore"):
+        return np.nanmean(sd, axis=-1)
+
+
+def grid_posterior(Xr, yr, *, channels, channel_index, radii, stats, radius_idx,
+                   form, picked, radius_kernel="lognormal",
+                   aggregator="dirichlet", draws=800, warmup=800, chains=4,
+                   seed=42, column_sd=None):
+    """The joint model over the whole grid of the index channels, summarised.
+
+    ``radius_idx`` lists each channel's own rungs; every other rung is masked
+    out of its kernel. Returns ``(posterior, grid, grid_kwargs)`` so a caller
+    can refit the same model, e.g. for :func:`null_calibration`.
+    """
+    grid = np.asarray(Xr)[:, list(channel_index), :, :]
+    radius_mask = np.zeros((len(channels), len(radii)), dtype=bool)
+    for ci, allowed in enumerate(radius_idx):
+        radius_mask[ci, list(allowed)] = True
+    grid_kwargs = dict(radii=radii, stats=stats, radius_mask=radius_mask,
+                       radius_kernel=radius_kernel, aggregator=aggregator)
+    mcmc = fit(grid, yr, form=form, draws=draws, warmup=warmup, chains=chains,
+               seed=seed, **grid_kwargs)
+    post = posterior_from(
+        mcmc, channels=channels, picked=picked, form=form, radii=radii,
+        stats=stats, radius_kernel=radius_kernel,
+        rung_sd=(None if column_sd is None
+                 else rung_sd_from(column_sd, channel_index, stats)),
+    )
+    return post, grid, grid_kwargs
+
+
 # ────────────────────────────────────────────────────────────────────
 # Reproducibility and honesty loops
 # ────────────────────────────────────────────────────────────────────
