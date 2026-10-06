@@ -164,7 +164,10 @@ Nothing below is pre-specified.
   scored against it: slopes for the target and the control, their paired
   difference with a bootstrap interval, and a flag when the two cannot be told
   apart (Lipsitch, Tchetgen Tchetgen & Cohen 2010). The control never enters
-  the search, and standalone studies get the same check for comparison.
+  the search, and standalone studies get the same check for comparison. An
+  optional re-tune runs the whole discovery with each control as the target
+  and reports how closely its radius, aggregator and weights match the
+  target's.
 - Longitudinal runs add wave fixed effects, on by default, and an optional
   neighbourhood or site column.
 

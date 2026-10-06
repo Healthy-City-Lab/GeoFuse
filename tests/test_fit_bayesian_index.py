@@ -98,5 +98,70 @@ class TestFitBayesianIndexWiring(unittest.TestCase):
         self.assertEqual(sum(int(self.params[k]) for k in keys), 100)
 
 
+def _retune_stub(n=600, seed=3):
+    """U rides on ndvi at 100 m and drives both outcomes; the target alone
+    also follows gvi at 900 m. Re-tuning on the control should find the 100 m
+    ndvi cell the confounding lives in."""
+    rng = np.random.default_rng(seed)
+    X = rng.normal(size=(n, 2, len(RADII), 1))
+    u = rng.normal(size=n)
+    X[:, 0, 0, 0] = u + 0.3 * rng.normal(size=n)
+    target = 0.3 * u + 1.0 * X[:, 1, 2, 0] + rng.normal(size=n)
+    control = 1.0 * u + rng.normal(size=n)
+    static = {"target": target, "cov": None, "controls": {"grip": control}}
+    eng = types.SimpleNamespace(
+        cgi_formula="weighted_average_gvi", _active_greenery_channel="cgi",
+        ndvi_buffer_max_m=900.0, gvi_buffer_max_m=900.0,
+        negative_control_columns=["grip"], is_longitudinal=False,
+    )
+    eng.build_index_tensor = lambda subset="train_val": (
+        X, np.asarray(RADII), ["mean"], ["ndvi", "gvi"], static)
+    eng._preaggr_radii = lambda: (list(RADII), list(RADII))
+    eng._sweep_objective = lambda metric: None
+    for name in ("_params_from_sweep", "fit_bayesian_index", "retune_concordance"):
+        setattr(eng, name, types.MethodType(getattr(MetricFusionEngine, name), eng))
+    return eng
+
+
+class TestRetuneOnAControl(unittest.TestCase):
+    """The tracker's G1 acceptance 2: the control's kernel lands on U's rung."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._real_workers = parallel.process_worker_count
+        parallel.process_worker_count = lambda *a, **k: 1
+        cls.eng = _retune_stub()
+        kw = dict(forms=("linear",), sweep_splits=3, draws=150, warmup=150,
+                  chains=1, radius_kernel="dirichlet")
+        cls.target = cls.eng.fit_bayesian_index(
+            "r2", reps=0, shuffles=0, gain_splits=0, gain_perm=0, null_runs=0,
+            **kw)
+        kw.pop("radius_kernel")
+        cls.formula_before = cls.eng.cgi_formula
+        cls.retune = cls.eng.retune_concordance(
+            cls.target, "r2", radius_kernel="dirichlet", **kw)
+
+    @classmethod
+    def tearDownClass(cls):
+        parallel.process_worker_count = cls._real_workers
+
+    def test_the_control_concentrates_ndvi_near_the_confounded_rung(self):
+        ndvi = self.retune["grip"]["channels"]["ndvi"]
+        self.assertLess(ndvi["r50_control"], 150.0)
+
+    def test_the_two_tunings_put_the_weight_on_different_channels(self):
+        ndvi = self.retune["grip"]["channels"]["ndvi"]
+        self.assertGreater(ndvi["weight_control"], 0.5)
+        self.assertLess(ndvi["weight_target"], 0.5)
+
+    def test_the_target_study_state_is_left_alone(self):
+        self.assertEqual(self.eng.cgi_formula, self.formula_before)
+
+    def test_an_unknown_outcome_is_refused(self):
+        with self.assertRaises(ValueError):
+            self.eng.fit_bayesian_index("r2", outcome="height", sweep_splits=2,
+                                        reps=0, gain_splits=0, null_runs=0)
+
+
 if __name__ == "__main__":
     unittest.main()

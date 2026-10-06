@@ -3261,6 +3261,7 @@ class MetricFusionEngine:
         seed: int = 42,
         cancel_callback: Callable[..., bool] | None = None,
         progress_callback: Callable[[int, int], None] | None = None,
+        outcome: str | None = None,
     ) -> dict:
         """Select the CGI configuration from data, then quantify it.
 
@@ -3276,7 +3277,9 @@ class MetricFusionEngine:
         ``null_runs`` below ``bayesian_index.NULL_RUNS_FOR_CLAIM`` is a quick
         check; use ``bayesian_index.NULL_RUNS_PUBLICATION`` for a final run.
         ``null_reselect_form`` re-chooses the form on every permuted outcome,
-        so the null rate covers the form choice too.
+        so the null rate covers the form choice too. ``outcome`` names a
+        negative-control column to tune on instead of the target, which is
+        what :meth:`retune_concordance` uses; entities missing it are dropped.
         """
         t0 = time.perf_counter()
         steps, done = 5, 0
@@ -3294,7 +3297,12 @@ class MetricFusionEngine:
             return cancel_callback is not None and cancel_callback()
 
         X, radii, stats, tensor_channels, static = self.build_index_tensor("train_val")
-        y = np.asarray(static["target"], dtype=np.float64)
+        if outcome is None:
+            y = np.asarray(static["target"], dtype=np.float64)
+        elif outcome in (static.get("controls") or {}):
+            y = np.asarray(static["controls"][outcome], dtype=np.float64)
+        else:
+            raise ValueError(f"{outcome!r} is not a negative-control column.")
 
         index_channels = list(cgi_formulas.formula_channels(self.cgi_formula))
         if self._active_greenery_channel != "cgi":
@@ -4417,6 +4425,10 @@ class MetricFusionEngine:
                 if cov_cols
                 else None
             )
+            st["controls"] = {
+                c: data[c].to_numpy(dtype=np.float64)[first_idx]
+                for c in self.negative_control_columns if c in data.columns
+            }
             st["coords"] = (
                 np.column_stack(
                     [
@@ -4437,6 +4449,10 @@ class MetricFusionEngine:
         else:
             st["target"] = data["target"].values
             st["cov"] = data[cov_cols].to_numpy(dtype=np.float64) if cov_cols else None
+            st["controls"] = {
+                c: data[c].to_numpy(dtype=np.float64)
+                for c in self.negative_control_columns if c in data.columns
+            }
             st["coords"] = (
                 data[["_cx", "_cy"]].to_numpy(np.float64) if have_coords else None
             )
@@ -7918,6 +7934,44 @@ class MetricFusionEngine:
                          + " carry an association indistinguishable from the "
                          "target's on the held-out split: part of the tuned "
                          "association is non-specific.")
+        return out
+
+    def retune_concordance(self, target_params: dict, metric: str, **fit_kwargs) -> dict:
+        """Re-tune on each negative control and compare with the target's tuning.
+
+        Each control runs the same sweep and posterior as the target — same
+        protocol, settings and seed, passed in ``fit_kwargs`` — with the
+        reproducibility, gain and null loops skipped because the comparison
+        reads only the posterior. Returns ``{control: concordance}`` (see
+        :func:`geofuse.negative_controls.concordance`). The engine's formula is
+        restored afterwards, so the target study's state is untouched.
+        """
+        from . import negative_controls as _nc
+
+        target_post = (target_params or {}).get("__posterior__") or {}
+        out: dict = {}
+        if not self.negative_control_columns or self.is_longitudinal:
+            return out
+        loops = dict(reps=0, shuffles=0, gain_splits=0, gain_perm=0, null_runs=0)
+        saved_formula = self.cgi_formula
+        for name in self.negative_control_columns:
+            try:
+                params = self.fit_bayesian_index(
+                    metric, outcome=name, **{**fit_kwargs, **loops})
+            except JobCancelled:
+                raise
+            except Exception as exc:
+                _log("WARN", f"Re-tune on negative control '{name}' failed: {exc}")
+                continue
+            finally:
+                self.cgi_formula = saved_formula
+            out[name] = _nc.concordance(target_post, params.get("__posterior__") or {})
+            same = [ch for ch, row in out[name]["channels"].items()
+                    if row.get("same_pick")]
+            if same:
+                _log("WARN", f"Re-tuning on '{name}' lands on the target's cell for "
+                             f"{', '.join(same)}: the search may be finding the "
+                             "shared confounding.")
         return out
 
     def _reporting_raw_column(self, df: "pd.DataFrame", name: str):

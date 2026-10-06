@@ -158,6 +158,23 @@ class TestNegativeControlExport(unittest.TestCase):
     def test_no_controls_writes_no_file(self):
         out = _write()
         self.assertFalse(os.path.exists(os.path.join(out, "negative_controls.csv")))
+        self.assertFalse(
+            os.path.exists(os.path.join(out, "negative_control_retune.csv")))
+
+    def test_the_retune_concordance_is_exported_per_channel(self):
+        report = _nc_report()
+        report["retune"] = {"grip": {
+            "form_target": "linear", "form_control": "linear",
+            "control_beta": 0.04,
+            "channels": {
+                "ndvi": {"radius_profile_tv": 0.1, "same_pick": True},
+                "gvi": {"radius_profile_tv": 0.7, "same_pick": False},
+            },
+        }}
+        rows = _rows(_write(negative_controls=report), "negative_control_retune.csv")
+        self.assertEqual([r["channel"] for r in rows], ["ndvi", "gvi"])
+        self.assertEqual(rows[0]["same_pick"], "True")
+        self.assertEqual(rows[1]["radius_profile_tv"], "0.7")
 
 
 class TestNegativeControlHelper(unittest.TestCase):

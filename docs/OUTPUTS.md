@@ -95,6 +95,7 @@ output_results/fusion/<YYYYMMDDTHHMMSS>__<short_job_id>/
     ├── exposure_response_curve.csv     fitted curve, ready to plot
     ├── moderation.csv                  interaction test and simple slopes
     ├── negative_controls.csv           specificity check against control outcomes
+    ├── negative_control_retune.csv     re-tune concordance, when requested
     ├── decline_terms.csv               greenspace-by-time terms, longitudinal only
     ├── mixedlm_metrics*.csv            all four mixed-effects metrics, longitudinal only
     ├── aic_bic.json                    CGI vs standalone verdict
@@ -169,6 +170,14 @@ excludes zero while the difference's includes it: part of the tuned association
 is then shared with an outcome greenery should not cause. Standalone studies get
 the same rows, so the composite's specificity can be read against a single
 channel's.
+
+**`negative_control_retune.csv`** appears when the job setting
+`negative_control_retune` is on. The CGI's sweep and posterior are re-run with
+each control as the target, and each row compares one channel of that tuning
+with the target's: the total-variation distance between the radius profiles and
+between the aggregator blends (0 identical, 1 disjoint), both R50 values, both
+weights, and whether the projected cell is the same. A control that lands where
+the target did points at shared confounding.
 
 **`decline_terms.csv`** holds greenspace-by-time slopes, optionally decomposed
 into between-person and within-person components. A term that is not estimable

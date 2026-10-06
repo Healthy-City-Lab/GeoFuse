@@ -48,7 +48,13 @@ _FUSION_STAGE_WEIGHTS: dict[str, float] = {
     "apply": 1.0,
     "mixedlm_postscore": 2.0,
     "reports": 1.0,
+    "negative_control_retune": 20.0,
 }
+
+_FUSION_RETUNE_STAGE: tuple[str, str] = (
+    "negative_control_retune",
+    "Re-tune on negative controls",
+)
 
 _FUSION_LONGITUDINAL_STAGE: tuple[str, str] = (
     "prepare_longitudinal",
@@ -571,6 +577,23 @@ def _write_fusion_outputs(
     if nc_rows:
         _emit_csv(f"negative_controls{sfx}.csv", nc_rows)
 
+    # Re-tune concordance: one row per control x channel, CGI study only.
+    retune = ((cgi_bundle or {}).get("negative_controls") or {}).get("retune") or {}
+    rt_rows = [
+        {
+            "control": name,
+            "channel": ch,
+            "form_target": block.get("form_target"),
+            "form_control": block.get("form_control"),
+            "control_beta": _f(block.get("control_beta")),
+            **{k: (v if isinstance(v, bool) else _f(v)) for k, v in row.items()},
+        }
+        for name, block in retune.items()
+        for ch, row in (block.get("channels") or {}).items()
+    ]
+    if rt_rows:
+        _emit_csv(f"negative_control_retune{sfx}.csv", rt_rows)
+
     # ── results_summary.json (master manifest) ──────────────────
     studies_manifest: dict[str, dict] = {}
     for key, disp, b in studies:
@@ -709,6 +732,7 @@ def _build_fusion_ledger(
     standalone_channels: list[str] | None = None,
     longitudinal: bool = False,
     mixedlm_postscore: bool = False,
+    negative_control_retune: bool = False,
 ) -> StageLedger:
     """Fresh ledger covering every (outcome, step) pair in run order.
 
@@ -724,6 +748,8 @@ def _build_fusion_ledger(
     (a longitudinal study whose scoring metric is actually a
     ``mixedlm_*`` one — year-aware cross-sectional studies sit on a
     spec too but score with OLS so they skip the post-score step).
+    ``negative_control_retune`` appends one re-tune stage per outcome, after
+    its standalones, where the runner performs it.
     """
     standalones = list(standalone_channels or [])
     steps: list[tuple[str, str]] = []
@@ -761,6 +787,10 @@ def _build_fusion_ledger(
             steps.append(
                 (report_key, f"[{label}] {report_step}" if multi else report_step)
             )
+        if negative_control_retune:
+            rt_key_raw, rt_label = _FUSION_RETUNE_STAGE
+            steps.append((_fusion_stage_key(label, rt_key_raw, multi=multi),
+                          f"[{label}] {rt_label}" if multi else rt_label))
     return StageLedger.from_steps(steps)
 
 

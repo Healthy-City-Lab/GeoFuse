@@ -240,5 +240,52 @@ class TestEngineTransfer(unittest.TestCase):
         self.assertTrue(np.isnan(frame["grip"].iloc[2]))
 
 
+class TestConcordance(unittest.TestCase):
+    @staticmethod
+    def _summary(profile, agg, r50, w, pick, beta=0.1, form="linear"):
+        return {"channels": ["ndvi", "gvi"], "radius_profile": profile,
+                "aggregator_mean": agg, "r50_mean": r50, "weight_mean": w,
+                "projected_pick": pick, "beta_mean": beta, "beta_ci_low": 0.0,
+                "beta_ci_high": 0.2, "form": form}
+
+    def test_identical_tunings_have_zero_distance_and_the_same_cells(self):
+        s = self._summary([[0.2, 0.8], [0.5, 0.5]], [[1.0, 0.0], [0.5, 0.5]],
+                          [100.0, 300.0], [0.6, 0.4], [[500, "mean"], [250, "p10"]])
+        out = nc.concordance(s, s)
+        for row in out["channels"].values():
+            self.assertEqual(row["radius_profile_tv"], 0.0)
+            self.assertEqual(row["aggregator_tv"], 0.0)
+            self.assertEqual(row["abs_delta_r50"], 0.0)
+            self.assertTrue(row["same_pick"])
+
+    def test_disjoint_tunings_are_one_apart(self):
+        a = self._summary([[1.0, 0.0], [1.0, 0.0]], [[1.0, 0.0], [1.0, 0.0]],
+                          [70.0, 70.0], [0.9, 0.1], [[100, "mean"], [100, "mean"]])
+        b = self._summary([[0.0, 1.0], [0.0, 1.0]], [[0.0, 1.0], [0.0, 1.0]],
+                          [700.0, 700.0], [0.1, 0.9], [[900, "p90"], [900, "p90"]],
+                          beta=0.3, form="synergy")
+        out = nc.concordance(a, b)
+        row = out["channels"]["ndvi"]
+        self.assertEqual(row["radius_profile_tv"], 1.0)
+        self.assertEqual(row["aggregator_tv"], 1.0)
+        self.assertAlmostEqual(row["abs_delta_r50"], 630.0)
+        self.assertAlmostEqual(row["abs_delta_weight"], 0.8)
+        self.assertFalse(row["same_pick"])
+        self.assertEqual((out["form_target"], out["form_control"]),
+                         ("linear", "synergy"))
+        self.assertEqual(out["control_beta"], 0.3)
+
+
+class TestRetuneLedgerStage(unittest.TestCase):
+    def test_the_stage_appears_only_when_asked_for(self):
+        from geofuse.jobs.fusion_outputs import _build_fusion_ledger
+
+        keys = [s.key for s in _build_fusion_ledger(
+            ["Y"], multi=False, negative_control_retune=True).stages]
+        self.assertEqual(keys[-1], "negative_control_retune")
+        keys = [s.key for s in _build_fusion_ledger(["Y"], multi=False).stages]
+        self.assertNotIn("negative_control_retune", keys)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1089,6 +1089,7 @@ def run_fusion(
     exposure_iqr: float | None = None,
     moderator_columns: list[str] | None = None,
     negative_controls: list[str] | None = None,
+    negative_control_retune: bool = False,
 ) -> dict:
     """Run a fusion job: data-driven CGI discovery + held-out test scoring.
 
@@ -1113,7 +1114,9 @@ def run_fusion(
     ``negative_controls`` names target columns holding negative-control
     outcomes. They never enter tuning; each study's frozen composite is scored
     against them on the test split and on train+val, with the paired contrast
-    drawn from ``report_paired_bootstrap`` resamples."""
+    drawn from ``report_paired_bootstrap`` resamples. ``negative_control_retune``
+    also re-runs the CGI's sweep and posterior with each control as the target
+    and reports how closely that tuning reproduces the target's."""
     # Bound before the body so the handlers below can close out the ledger no
     # matter how early a run fails.
     ledger = None
@@ -1211,12 +1214,18 @@ def run_fusion(
             longitudinal_spec is not None
             and longitudinal_spec.scoring_metric in _LON_MIXEDLM_METRICS
         )
+        retune_enabled = (
+            bool(negative_control_retune)
+            and bool(negative_controls)
+            and longitudinal_spec is None
+        )
         ledger = _build_fusion_ledger(
             all_labels,
             multi=multi_outcome,
             standalone_channels=standalones,
             longitudinal=longitudinal_spec is not None,
             mixedlm_postscore=mixedlm_postscore_enabled,
+            negative_control_retune=retune_enabled,
         )
         ctx.update_stage_ledger(ledger.to_dict())
 
@@ -1269,6 +1278,7 @@ def run_fusion(
             "exposure_iqr": exposure_iqr,
             "moderator_columns": list(moderator_columns or []),
             "negative_controls": list(negative_controls or []),
+            "negative_control_retune": bool(negative_control_retune),
             "report_paired_bootstrap": int(report_paired_bootstrap),
             "cache_metrics": bool(cache_metrics),
             "resume_existing_study": bool(resume_existing_study),
@@ -2439,6 +2449,24 @@ def run_fusion(
                 engine, averaged_params, objective_metric,
                 int(report_paired_bootstrap), label=label, log=_log_fusion,
             )
+            if retune_enabled:
+                if outcome_ncs and negative_control_report:
+                    stage(skey("negative_control_retune"), RUNNING)
+                    ctx.progress(
+                        value=prog_ledger(),
+                        status_text=f"{prefix}Re-tuning on negative controls...",
+                    )
+                    negative_control_report["retune"] = engine.retune_concordance(
+                        headline_params, objective_metric, forms=index_forms,
+                        sweep_splits=int(sweep_splits),
+                        draws=int(posterior_draws), warmup=int(posterior_warmup),
+                        chains=int(posterior_chains), seed=42,
+                        cancel_callback=cancel_check,
+                    )
+                    stage(skey("negative_control_retune"), DONE)
+                else:
+                    stage(skey("negative_control_retune"), SKIPPED,
+                          "No negative control left for this outcome.")
 
             bundle = {
                 "best_params": best_params,

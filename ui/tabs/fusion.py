@@ -4234,6 +4234,31 @@ def _render_negative_controls(report: dict | None) -> None:
             })
         st.caption(title)
         st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    retune = report.get("retune") or {}
+    if retune:
+        rows = [
+            {
+                "Control": name,
+                "Channel": _CHANNEL_DISPLAY.get(ch, ch.upper()),
+                "Radius profile TV": _fmt(row.get("radius_profile_tv"), 2),
+                "Aggregator TV": _fmt(row.get("aggregator_tv"), 2),
+                "|ΔR50| (m)": _fmt(row.get("abs_delta_r50"), 0),
+                "|Δweight|": _fmt(row.get("abs_delta_weight"), 2),
+                "Same cell": "yes" if row.get("same_pick") else "no",
+            }
+            for name, block in retune.items()
+            for ch, row in (block.get("channels") or {}).items()
+        ]
+        if rows:
+            st.caption("Re-tuned on each control (same protocol and seed)")
+            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+            st.caption(
+                "Total-variation distances run from 0 (the control's tuning "
+                "reproduces the target's) to 1 (disjoint). A control that lands "
+                "on the same radius, aggregator and weights as the target says "
+                "the search found what the two outcomes share - confounding - "
+                "rather than a pathway specific to the target."
+            )
     flagged = report.get("nonspecific") or []
     if flagged:
         st.warning(

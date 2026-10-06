@@ -173,6 +173,59 @@ def paired_contrast(exposure, target, control, covariates=None, *,
     return out
 
 
+def concordance(target: dict, control: dict) -> dict:
+    """How closely a study re-tuned on a control reproduces the target's.
+
+    Takes two posterior summaries (``IndexPosterior.summary()``) from the same
+    protocol, one tuned on the target and one on the control. Per channel:
+    the total-variation distance between the posterior-mean radius profiles
+    and between the aggregator blends (0 identical, 1 disjoint), the R50 of
+    each with their absolute difference, the channel weight of each with their
+    absolute difference, and whether the projected (radius, statistic) picks
+    are identical. Plus the control's own effect and both forms. Near-identical
+    configurations for target and control are the symptom of a search that
+    found the confounding rather than the pathway.
+    """
+
+    def tv(a, b) -> float:
+        a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
+        return 0.5 * float(np.abs(a - b).sum()) if a.shape == b.shape else float("nan")
+
+    def at(summary, key, i):
+        vals = summary.get(key)
+        return vals[i] if vals is not None and i < len(vals) else None
+
+    out = {
+        "form_target": target.get("form"),
+        "form_control": control.get("form"),
+        "control_beta": control.get("beta_mean"),
+        "control_beta_ci": [control.get("beta_ci_low"), control.get("beta_ci_high")],
+        "channels": {},
+    }
+    c_chans = list(control.get("channels") or [])
+    for i, ch in enumerate(target.get("channels") or []):
+        if ch not in c_chans:
+            continue
+        j = c_chans.index(ch)
+        row: dict = {}
+        rp_t, rp_c = at(target, "radius_profile", i), at(control, "radius_profile", j)
+        if rp_t is not None and rp_c is not None:
+            row["radius_profile_tv"] = tv(rp_t, rp_c)
+        ag_t, ag_c = at(target, "aggregator_mean", i), at(control, "aggregator_mean", j)
+        if ag_t is not None and ag_c is not None:
+            row["aggregator_tv"] = tv(ag_t, ag_c)
+        for key, name in (("r50_mean", "r50"), ("weight_mean", "weight")):
+            a, b = at(target, key, i), at(control, key, j)
+            if a is not None and b is not None:
+                row[f"{name}_target"], row[f"{name}_control"] = float(a), float(b)
+                row[f"abs_delta_{name}"] = abs(float(a) - float(b))
+        pk_t, pk_c = at(target, "projected_pick", i), at(control, "projected_pick", j)
+        if pk_t is not None and pk_c is not None:
+            row["same_pick"] = list(pk_t) == list(pk_c)
+        out["channels"][ch] = row
+    return out
+
+
 def transfer_test(exposure, target, controls: dict, covariates=None, *,
                   n_boot: int = 1000, clusters=None, seed: int = 0,
                   level: float = 0.95) -> dict:
