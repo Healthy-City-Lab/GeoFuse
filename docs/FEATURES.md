@@ -109,7 +109,14 @@ Nothing below is pre-specified.
   that buffer.
 - **Functional form.** A weighted sum, or a synergy form with powers on the main
   terms and pairwise products, following Wang et al. 2026
-  ([doi:10.3390/rs18010009](https://doi.org/10.3390/rs18010009)).
+  ([doi:10.3390/rs18010009](https://doi.org/10.3390/rs18010009)). In the
+  synergy form each channel enters as its approximate percentile: the value
+  standardised by the channel's mean and standard deviation and passed through
+  the normal cumulative distribution. Where the source paper min-max scales
+  each indicator to [0, 1], this keeps the values in (0, 1) without letting the
+  single highest and lowest entity set the scale, which is what lets the
+  Bayesian fit sample the synergy form reliably. The mean and SD are recorded
+  with the parameters, so maps and test scores use the same curve.
 - **Channel weights**, reported with credible intervals.
 
 ### Why the result is defensible

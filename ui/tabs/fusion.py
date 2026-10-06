@@ -1976,7 +1976,8 @@ def _render_study_details_panel(
                 "**sweep** fits both forms and keeps whichever scores better "
                 "held-out — which form wins is configuration-dependent, so "
                 "fixing it is a guess. `linear` is a weighted sum; `synergy` "
-                "adds powers on the main terms and pairwise products."
+                "reads each channel as its approximate percentile and adds "
+                "powers on the main terms and pairwise products."
             ),
         )
     with col_s2:
