@@ -2513,6 +2513,84 @@ def _render_period_confounding(dt: dict) -> None:
             )
 
 
+# Trend line drawn over each categorical's levels. Green/red/grey carry the
+# bars' direction, so the line takes a hue none of them use and stays legible
+# against all three in either theme.
+_TREND_COLOR = "#0b84f3"
+# A cubic through four points passes exactly through them, which draws a
+# confident curve that is really just the data replotted. Below this many
+# levels the degree is dropped to keep the line a summary rather than a copy.
+_TREND_MIN_LEVELS = 4
+
+
+def _split_term(term: str) -> tuple[str, str | None]:
+    """``SDC_MRTL=3.0`` -> ``("SDC_MRTL", "3.0")``; a numeric term -> ``(term, None)``."""
+    name, sep, level = str(term).partition("=")
+    return (name, level) if sep else (str(term), None)
+
+
+def _level_sort_key(level: str):
+    """Order levels by their value, numerically when they parse as numbers.
+
+    Category codes arrive as ``2.0 … 13.0``; numeric order keeps ``2.0`` ahead
+    of ``10.0`` so a trend across the codes reads left to right.
+    """
+    try:
+        return (0, float(level), "")
+    except (TypeError, ValueError):
+        return (1, 0.0, str(level))
+
+
+def _covariate_term_order(df) -> list[str]:
+    """Numeric covariates first, then each categorical's levels in value order.
+
+    Groups are ranked by the largest partial R² they contain, so the covariate
+    that explains the most sits leftmost, but a categorical's own levels stay in
+    their natural order inside the group rather than being ranked against each
+    other.
+    """
+    numeric, groups = [], {}
+    for _, row in df.iterrows():
+        term = str(row["covariate"])
+        name, level = _split_term(term)
+        if level is None:
+            numeric.append((float(row.get("partial_r2") or 0.0), term))
+        else:
+            groups.setdefault(name, []).append((level, term, float(row.get("partial_r2") or 0.0)))
+    numeric.sort(key=lambda t: -t[0])
+    ranked = sorted(groups.items(), key=lambda kv: -max(x[2] for x in kv[1]))
+    order = [t for _, t in numeric]
+    for _name, members in ranked:
+        order += [t for _lv, t, _p in sorted(members, key=lambda m: _level_sort_key(m[0]))]
+    return order
+
+
+def _trend_points(members: list[tuple[str, float]]):
+    """Cubic through one categorical's levels, or ``None`` if it cannot be fitted.
+
+    Returns ``(labels, fitted_values, degree)``. The x used for the fit is the
+    level's own value where the levels are numeric codes, so unequal spacing is
+    respected; otherwise it falls back to position.
+    """
+    if len(members) < 3:
+        return None
+    ordered = sorted(members, key=lambda m: _level_sort_key(m[0]))
+    labels = [lv for lv, _ in ordered]
+    ys = np.asarray([c for _, c in ordered], dtype=float)
+    try:
+        xs = np.asarray([float(lv) for lv in labels], dtype=float)
+    except (TypeError, ValueError):
+        xs = np.arange(len(labels), dtype=float)
+    if not np.isfinite(ys).all() or len(np.unique(xs)) < 3:
+        return None
+    degree = 3 if len(ordered) > _TREND_MIN_LEVELS else min(2, len(ordered) - 1)
+    try:
+        fitted = np.polyval(np.polyfit(xs, ys, degree), xs)
+    except Exception:
+        return None
+    return labels, fitted, degree
+
+
 def _render_covariate_impact(results_view: dict, metric_name: str) -> None:
     """Show per-covariate effect direction + importance + lift over CGI-only."""
     impact = results_view.get("covariate_impact")
@@ -2576,8 +2654,8 @@ def _render_covariate_impact(results_view: dict, metric_name: str) -> None:
     try:
         import plotly.express as _px
 
+        order = _covariate_term_order(df)
         bar_df = df.copy()
-        bar_df["abs_coef"] = bar_df["coef"].abs()
         fig = _px.bar(
             bar_df,
             x="covariate",
@@ -2588,10 +2666,59 @@ def _render_covariate_impact(results_view: dict, metric_name: str) -> None:
                 "negative": "#d62728",
                 "—": "#7f7f7f",
             },
+            category_orders={"covariate": order},
             title="Covariate coefficients (full model)",
         )
-        fig.update_layout(margin=dict(l=60, r=20, t=60, b=80))
+
+        # One cubic per categorical, over that variable's levels in value order.
+        coef_of = dict(zip(df["covariate"].astype(str), df["coef"].astype(float)))
+        grouped: dict[str, list[tuple[str, float]]] = {}
+        for term in order:
+            name, level = _split_term(term)
+            if level is not None:
+                grouped.setdefault(name, []).append((level, coef_of[term]))
+        fitted_any = []
+        for name, members in grouped.items():
+            trend = _trend_points(members)
+            if trend is None:
+                continue
+            labels, values, degree = trend
+            fig.add_scatter(
+                x=[f"{name}={lv}" for lv in labels],
+                y=list(values),
+                mode="lines+markers",
+                name=f"{name} trend (deg {degree})",
+                line=dict(color=_TREND_COLOR, width=2.5),
+                marker=dict(color=_TREND_COLOR, size=6, symbol="diamond"),
+                hovertemplate=f"{name} fitted: %{{y:.4f}}<extra></extra>",
+            )
+            fitted_any.append(f"{name} (deg {degree}, {len(labels)} levels)")
+        fig.update_layout(
+            margin=dict(l=60, r=20, t=60, b=120),
+            xaxis=dict(categoryorder="array", categoryarray=order),
+        )
         st.plotly_chart(fig, width="stretch")
+        cap = (
+            "Numeric covariates first (largest partial R² leftmost), then each "
+            "categorical's levels in value order so a gradient across levels is "
+            "visible as a shape rather than scattered across the axis."
+        )
+        if fitted_any:
+            cap += (
+                " The blue curve is a least-squares polynomial through one "
+                "variable's level coefficients: " + "; ".join(fitted_any) + ". "
+                "It is descriptive only — it presumes the level codes are "
+                "ordered and equally meaningful, which holds for a wave or an "
+                "ordinal band but not for unordered categories like cultural "
+                "origin, where it should be read as a visual aid and nothing "
+                "more."
+            )
+        cap += (
+            " Each categorical is drop-first coded, so its reference level has "
+            "a coefficient of exactly 0 by construction and is not drawn; every "
+            "bar in a group is a contrast against that missing level."
+        )
+        st.caption(cap)
     except Exception:
         pass
 

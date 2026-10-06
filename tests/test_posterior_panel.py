@@ -16,6 +16,8 @@ for _p in (os.path.join(ROOT, "ui"), ROOT):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import numpy as np
+
 from tabs import fusion as fusion_tab
 
 
@@ -377,6 +379,67 @@ class TestAggregatorVerdictForOlderBundles(unittest.TestCase):
         out = self._render(s)
         self.assertIn("Aggregators the data separated", out)
         self.assertNotIn("No aggregator is distinguishable", out)
+
+
+class TestCovariateAxisOrdering(unittest.TestCase):
+    """Numerics first, then each categorical's levels in value order.
+
+    Ranking every term by partial R² scatters a categorical's levels across the
+    axis, which is precisely the arrangement that hides a gradient across them.
+    """
+
+    def _frame(self):
+        import pandas as pd
+
+        return pd.DataFrame([
+            {"covariate": "SDC_MRTL=10.0", "coef": 0.4, "partial_r2": 0.002},
+            {"covariate": "AGE", "coef": -0.05, "partial_r2": 0.010},
+            {"covariate": "SDC_MRTL=2.0", "coef": 0.1, "partial_r2": 0.001},
+            {"covariate": "STRESS", "coef": -0.03, "partial_r2": 0.050},
+            {"covariate": "SDC_MRTL=3.0", "coef": 0.2, "partial_r2": 0.004},
+        ])
+
+    def test_numeric_terms_come_first_ranked_by_partial_r2(self):
+        order = fusion_tab._covariate_term_order(self._frame())
+        self.assertEqual(order[:2], ["STRESS", "AGE"])
+
+    def test_levels_are_ordered_by_value_not_by_text(self):
+        order = fusion_tab._covariate_term_order(self._frame())
+        self.assertEqual(
+            order[2:], ["SDC_MRTL=2.0", "SDC_MRTL=3.0", "SDC_MRTL=10.0"]
+        )
+
+    def test_a_term_is_split_into_variable_and_level(self):
+        self.assertEqual(fusion_tab._split_term("SEX=M"), ("SEX", "M"))
+        self.assertEqual(fusion_tab._split_term("AGE"), ("AGE", None))
+
+
+class TestCovariateTrendLine(unittest.TestCase):
+    def test_a_cubic_needs_more_than_four_levels_to_stay_a_summary(self):
+        four = [(str(i), float(i)) for i in range(1, 5)]
+        self.assertEqual(fusion_tab._trend_points(four)[2], 2)
+        six = [(str(i), float(i)) for i in range(1, 7)]
+        self.assertEqual(fusion_tab._trend_points(six)[2], 3)
+
+    def test_too_few_levels_produce_no_line(self):
+        self.assertIsNone(fusion_tab._trend_points([("1", 0.5), ("2", 0.7)]))
+
+    def test_the_fit_follows_the_level_values_and_their_spacing(self):
+        pts = [("1", 1.0), ("2", 2.0), ("5", 5.0), ("9", 9.0), ("12", 12.0),
+               ("20", 20.0)]
+        labels, fitted, _deg = fusion_tab._trend_points(pts)
+        self.assertEqual(labels, ["1", "2", "5", "9", "12", "20"])
+        # A straight line through y == x must be recovered, not bent by
+        # treating the unequal level gaps as if they were evenly spaced.
+        self.assertTrue(
+            np.allclose(fitted, [1.0, 2.0, 5.0, 9.0, 12.0, 20.0], atol=1e-6)
+        )
+
+    def test_non_numeric_levels_fall_back_to_position(self):
+        pts = [("a", 1.0), ("b", 2.0), ("c", 3.0), ("d", 4.0), ("e", 5.0)]
+        labels, fitted, _ = fusion_tab._trend_points(pts)
+        self.assertEqual(labels, ["a", "b", "c", "d", "e"])
+        self.assertTrue(np.allclose(fitted, [1, 2, 3, 4, 5], atol=1e-6))
 
 
 if __name__ == "__main__":
