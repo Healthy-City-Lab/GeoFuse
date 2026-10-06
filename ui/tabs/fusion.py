@@ -90,7 +90,12 @@ _FUSION_OUTCOME_ADD_PLACEHOLDER = "— Select column —"
 # ``veg``/``terrain``/``ndvi`` everywhere in code and JSON payloads;
 # anything user-visible (UI labels, captions, log lines surfaced to
 # users) goes through this mapping so the spelling is uniform.
-_CHANNEL_DISPLAY = {"veg": "Vegetation", "terrain": "Terrain", "ndvi": "NDVI"}
+_CHANNEL_DISPLAY = {
+    "veg": "Vegetation",
+    "terrain": "Terrain",
+    "ndvi": "NDVI",
+    "gvi": "GVI",
+}
 
 
 class _FusionVerticalScaleControl(MacroElement):
@@ -3714,37 +3719,46 @@ def _render_study_detail(
                         with col:
                             st.metric(pretty, f"{val:.1f}")
 
+        # Only the channels this formula consumes.
+        channels = _cgi_formulas.formula_channels(formula.name)
         st.markdown("**Radii (m)**")
-        radii_cols = st.columns(3)
-        for col, key in zip(
-            radii_cols, ("veg_radius", "terrain_radius", "ndvi_radius")
-        ):
-            ch = key.removesuffix("_radius")
+        radii_cols = st.columns(max(len(channels), 1))
+        for col, ch in zip(radii_cols, channels):
             label = _CHANNEL_DISPLAY.get(ch, ch.upper())
             with col:
                 try:
-                    v = int(round(float(final_params.get(key, 0))))
+                    v = int(round(float(final_params[f"{ch}_radius"])))
                     st.metric(label, f"{v} m")
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, KeyError):
                     st.metric(label, "—")
 
         st.markdown("**Aggregators**")
-        agg_cols = st.columns(2)
-        with agg_cols[0]:
-            st.metric(
-                "GVI (Vegetation + Terrain)",
-                _agg_label(
-                    final_params.get("streetview_stat"),
-                    final_params.get("streetview_percentile"),
-                ),
-            )
-        with agg_cols[1]:
-            st.metric(
-                "NDVI",
-                _agg_label(
-                    final_params.get("ndvi_stat"),
-                    final_params.get("ndvi_percentile"),
-                ),
+        # NDVI has its own aggregator; every street-view channel shares one
+        # slot in the apply path, so they cannot be reported separately.
+        street = [c for c in channels if c != "ndvi"]
+        agg_specs = []
+        if street:
+            agg_specs.append((
+                " + ".join(_CHANNEL_DISPLAY.get(c, c.upper()) for c in street),
+                "streetview_stat", "streetview_percentile",
+            ))
+        if "ndvi" in channels:
+            agg_specs.append(("NDVI", "ndvi_stat", "ndvi_percentile"))
+        agg_cols = st.columns(max(len(agg_specs), 1))
+        for col, (label, stat_key, pct_key) in zip(agg_cols, agg_specs):
+            with col:
+                st.metric(
+                    label,
+                    _agg_label(
+                        final_params.get(stat_key), final_params.get(pct_key)
+                    ),
+                )
+        if len(street) > 1:
+            st.caption(
+                "The street-view channels share a single aggregator slot in the "
+                "apply path, so they are reported together. Where the posterior "
+                "prefers different statistics for them, only one can be carried "
+                "into the composite."
             )
     else:
         # Standalone: a single channel at 100 % — weights are not
@@ -4257,7 +4271,7 @@ def _render_fusion_results_body(output_dir: str) -> None:
                 )
 
         # CGI first, then the channels in their canonical order.
-        _order = {"cgi": 0, "veg": 1, "terrain": 2, "ndvi": 3}
+        _order = {"cgi": 0, "gvi": 1, "veg": 2, "terrain": 3, "ndvi": 4}
         _csv_entries.sort(key=lambda e: _order.get(e[0], 99))
 
         if _csv_entries:

@@ -3471,16 +3471,21 @@ class MetricFusionEngine:
                 # veg and terrain share one street-view statistic in the engine.
                 params["streetview_stat"] = stat
                 params["streetview_percentile"] = int(pct)
-        for key, default in (
-            ("veg_radius", self.gvi_buffer_max_m),
-            ("terrain_radius", self.gvi_buffer_max_m),
-            ("ndvi_radius", self.ndvi_buffer_max_m),
-        ):
-            params.setdefault(key, int(round(float(default))))
-        params.setdefault("streetview_stat", "mean")
-        params.setdefault("streetview_percentile", 50)
-        params.setdefault("ndvi_stat", "mean")
-        params.setdefault("ndvi_percentile", 50)
+        # Defaults only for the channels this formula consumes, so no key reads
+        # as a fitted radius for a channel the run never fitted. The apply path
+        # defaults any channel it needs that is absent.
+        formula_channels = set(cgi_formulas.formula_channels(self.cgi_formula))
+        formula_channels.update(index_channels)
+        for ch in formula_channels:
+            default = (self.ndvi_buffer_max_m if ch == "ndvi"
+                       else self.gvi_buffer_max_m)
+            params.setdefault(f"{ch}_radius", int(round(float(default))))
+        if formula_channels - {"ndvi"}:
+            params.setdefault("streetview_stat", "mean")
+            params.setdefault("streetview_percentile", 50)
+        if "ndvi" in formula_channels:
+            params.setdefault("ndvi_stat", "mean")
+            params.setdefault("ndvi_percentile", 50)
 
         # Posterior-mean weights onto the formula's keys as integers summing to
         # 100, which is the scale every downstream consumer expects.
