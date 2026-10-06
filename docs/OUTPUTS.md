@@ -116,12 +116,23 @@ and `all` only as a descriptive summary.
 converge records `test_ci.status = "fit_failed"` with a null score, so a genuine
 null is never confused with a model that never fit.
 
-**`discovery.csv`** has one row per weight: the picked radius and aggregator per
-channel, the posterior weight with its credible interval, whether that radius
-sat at the edge of the searched ladder, and the channel's standalone score
-against the composite's gain and permutation p-value. Synergy pair terms appear
-as their own rows with radius and aggregator blank, since a pair has no spatial
-scale of its own.
+**`scores.csv` keeps the sweep's score apart.** The `val` row carries the
+sweep's held-out |t| under the metric name `sweep_holdout_abs_t`. It is a
+t-statistic over resamples of the training pool, not a value of the objective,
+so it does not share a scale with the other rows.
+
+**`discovery.csv`** has one row per weight. `radius_m` and `aggregator` are the
+posterior's projection onto one cell per channel, which is the cell the
+composite is built from; `sweep_radius_m` and `sweep_aggregator` keep the
+sweep's shortlist cell, and the two disagree where the grid is flat.
+`peak_radius_m` is the kernel peak and `peak_radius_width_vs_prior` how much the
+data narrowed it (near 1 means the prior is speaking back);
+`aggregators_separated` lists the statistics the data distinguished from an even
+blend. Each row also carries the posterior weight with its credible interval,
+whether the radius sat at the edge of the searched ladder, and the channel's
+standalone score against the composite's gain and permutation p-value. Synergy
+pair terms appear as their own rows with the grid columns blank, since a pair
+has no spatial scale of its own.
 
 **`results_summary.json` records a `config_hash` and a `test_reads` count.** The
 hash identifies the configuration that produced the result, so a pre-registered
