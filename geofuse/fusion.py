@@ -222,12 +222,12 @@ class MetricFusionEngine:
         import logging as _logging
 
         attach_external_logger("ee", _logging.INFO)
-        # This module's own stdlib ``logger`` (``geofuse.fusion``) carries
-        # engine diagnostics — bounds checks, metric load notes, cache messages.
-        # Attaching it routes those into the per-job log (and stops them
-        # propagating to the host terminal) alongside the engine's ``_log``
-        # output, instead of leaking to the backend console.
+        # The stdlib loggers of this module and of ``bayesian_index`` carry
+        # engine diagnostics — bounds checks, metric load notes, cache and
+        # rank warnings. Attaching them routes those into the per-job log
+        # alongside the engine's ``_log`` output, not the host terminal.
         attach_external_logger("geofuse.fusion", _logging.INFO)
+        attach_external_logger("geofuse.bayesian_index", _logging.INFO)
 
         self.target_file = target_file
         self.target_feature = target_feature

@@ -137,6 +137,11 @@ Nothing below is pre-specified.
 
 - Covariate-adjusted objectives, so a dominant covariate cannot crowd out the
   greenery signal. Mutual information ignores covariates by design.
+- Before the search, covariates and an intercept are projected out of the
+  outcome and out of every candidate exposure column (Frisch-Waugh). The
+  projection is rank-safe: a redundant design, such as an empty category or a
+  full set of dummies, removes only its real span, and the job log reports how
+  many directions were redundant.
 - Optional spatial-confounding adjustment (KS-AIC or Spatial+) and spatial block
   cross-validation, so geographic autocorrelation cannot inflate scores.
 - Optional collinearity check that drops redundant channels before a run.

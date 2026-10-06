@@ -36,6 +36,7 @@ aggregator are priced into the reported false-positive rate.
 from __future__ import annotations
 
 import itertools
+import logging
 import math
 import os
 import tempfile
@@ -48,6 +49,8 @@ from geofuse import JobCancelled
 
 from . import parallel
 
+logger = logging.getLogger(__name__)
+
 FORMS: tuple[str, ...] = ("linear", "synergy")
 
 # Powers on the main terms of the synergy form, as in the source paper's range.
@@ -59,12 +62,54 @@ _POWER_LO, _POWER_HI = 0.2, 1.0
 # ────────────────────────────────────────────────────────────────────
 
 
+def col_basis(Z: np.ndarray, tol: float = 1e-10) -> np.ndarray:
+    """Orthonormal basis for the column space of ``Z``, safe at any rank.
+
+    Reduced QR returns one column per input column even when ``Z`` is rank-
+    deficient, and the surplus columns are arbitrary directions outside its
+    span. The SVD keeps only directions whose singular value exceeds ``tol``
+    times the largest, so an all-zero column, a duplicated intercept or a full
+    dummy set beside an intercept adds nothing to the projection.
+    """
+    Z = np.asarray(Z, dtype=np.float64)
+    if Z.ndim == 1:
+        Z = Z[:, None]
+    if Z.size == 0:
+        return np.zeros((len(Z), 0))
+    U, s, _ = np.linalg.svd(Z, full_matrices=False)
+    if not s.size or s[0] <= 0:
+        return U[:, :0]
+    return U[:, s > tol * s[0]]
+
+
+def covariate_basis(covariates: np.ndarray | None, n: int) -> tuple[np.ndarray, int]:
+    """Basis for the covariate design plus an intercept, and its rank deficit.
+
+    The intercept is added only when the covariates do not already span it, so
+    the returned deficit counts redundancy in the caller's design and nothing
+    else.
+    """
+    ones = np.ones((n, 1))
+    cov = None if covariates is None else np.asarray(covariates, dtype=np.float64)
+    if cov is None or cov.size == 0:
+        return col_basis(ones), 0
+    cov = cov.reshape(n, -1)
+    q = col_basis(cov)
+    deficit = cov.shape[1] - q.shape[1]
+    resid = ones - q @ (q.T @ ones)
+    if float(np.linalg.norm(resid)) > 1e-8 * math.sqrt(n):
+        q = np.column_stack([q, resid / np.linalg.norm(resid)])
+    return q, deficit
+
+
 def prep(X: np.ndarray, y: np.ndarray, covariates: np.ndarray | None,
-         *, channel_index=None):
+         *, channel_index=None, return_info: bool = False):
     """Frisch-Waugh: project the covariates out of **both** sides, then z-score.
 
     Residualising only the outcome leaves the exposure correlated with the
     covariates, and the index coefficient is then not the partial association.
+    The projection basis comes from :func:`covariate_basis`, so it always holds
+    an intercept and a rank-deficient design removes only its real span.
 
     ``X`` is ``(n, channel, radius, stat)``; the return has the same shape but
     may have **fewer rows**: standardising is not NaN-tolerant, so an entity
@@ -86,23 +131,36 @@ def prep(X: np.ndarray, y: np.ndarray, covariates: np.ndarray | None,
     ``channel_index`` limits the scan to the channels the index will actually
     use, so a channel that is cached but unused cannot drop rows for a study
     that never reads it.
+
+    With ``return_info`` a third value is returned: ``covariate_rank`` (the
+    basis size, intercept included), ``dropped_directions`` (redundant columns
+    in the covariate design) and ``residual_df`` (rows kept minus the rank).
     """
     X = np.asarray(X, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
-    cov = np.asarray(covariates, dtype=np.float64) if covariates is not None else None
-    if cov is None or cov.size == 0:
-        cov = np.ones((len(y), 1))
+    cov = None
+    if covariates is not None and np.size(covariates):
+        cov = np.asarray(covariates, dtype=np.float64).reshape(len(y), -1)
 
     scan = X if channel_index is None else X[:, list(channel_index)]
     scan = scan.reshape(len(X), -1)
     measured = ~np.isnan(scan).all(0)
-    keep = np.isfinite(y) & np.isfinite(cov).all(1)
+    keep = np.isfinite(y)
+    if cov is not None:
+        keep &= np.isfinite(cov).all(1)
     if measured.any():
         keep &= np.isfinite(scan[:, measured]).all(1)
     if not keep.all():
-        X, y, cov = X[keep], y[keep], cov[keep]
+        X, y = X[keep], y[keep]
+        cov = None if cov is None else cov[keep]
 
-    q, _ = np.linalg.qr(cov)
+    q, deficit = covariate_basis(cov, len(y))
+    if deficit:
+        logger.warning(
+            "Covariate design is rank-deficient: %d redundant direction(s) "
+            "dropped from the residualisation (rank %d, residual df %d).",
+            deficit, q.shape[1], len(y) - q.shape[1],
+        )
 
     def rz(a):
         return a - q @ (q.T @ a)
@@ -111,7 +169,14 @@ def prep(X: np.ndarray, y: np.ndarray, covariates: np.ndarray | None,
     yr = (yr - yr.mean()) / (yr.std() + 1e-12)
     flat = rz(X.reshape(len(X), -1))
     flat = (flat - flat.mean(0)) / (flat.std(0) + 1e-12)
-    return yr, flat.reshape(X.shape)
+    if not return_info:
+        return yr, flat.reshape(X.shape)
+    info = {
+        "covariate_rank": int(q.shape[1]),
+        "dropped_directions": int(deficit),
+        "residual_df": int(len(y) - q.shape[1]),
+    }
+    return yr, flat.reshape(X.shape), info
 
 
 def _raise_if_cancelled(cancel_check) -> None:

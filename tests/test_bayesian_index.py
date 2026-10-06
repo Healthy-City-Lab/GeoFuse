@@ -645,5 +645,106 @@ class TestPriorIntervals(unittest.TestCase):
         self.assertLess(near, far)
 
 
+class TestRankSafeResidualisation(unittest.TestCase):
+    """A degenerate covariate column must remove nothing but its own span.
+
+    Reduced QR hands back one orthonormal column per input column whatever the
+    rank, so an all-zero dummy or a full one-hot set beside an intercept adds
+    arbitrary directions to the projection and strips real variation from the
+    outcome and from every exposure column.
+    """
+
+    @staticmethod
+    def _data(n=400, seed=11):
+        rng = np.random.default_rng(seed)
+        X = rng.normal(size=(n, 2, len(RADII), len(STATS)))
+        y = 0.4 * X[:, 0, 1, 0] + rng.normal(size=n)
+        group = rng.integers(0, 3, size=n)
+        onehot = np.eye(3)[group]
+        age = rng.normal(size=n)
+        return X, y, onehot, age
+
+    @staticmethod
+    def _old_qr_prep(X, y, cov):
+        q, _ = np.linalg.qr(cov)
+        yr = y - q @ (q.T @ y)
+        yr = (yr - yr.mean()) / (yr.std() + 1e-12)
+        flat = X.reshape(len(X), -1)
+        flat = flat - q @ (q.T @ flat)
+        flat = (flat - flat.mean(0)) / (flat.std(0) + 1e-12)
+        return yr, flat.reshape(X.shape)
+
+    def _assert_same(self, a, b):
+        for u, v in zip(a, b):
+            np.testing.assert_allclose(u, v, atol=1e-10, rtol=0)
+
+    def test_an_all_zero_column_changes_nothing(self):
+        X, y, onehot, age = self._data()
+        cov = np.column_stack([age, onehot[:, 1:]])
+        with_zero = np.column_stack([cov, np.zeros(len(y))])
+        self._assert_same(bi.prep(X, y, with_zero), bi.prep(X, y, cov))
+
+    def test_a_full_dummy_set_with_an_intercept_equals_drop_first(self):
+        X, y, onehot, age = self._data()
+        full = np.column_stack([np.ones(len(y)), age, onehot])
+        drop_first = np.column_stack([age, onehot[:, 1:]])
+        self._assert_same(bi.prep(X, y, full), bi.prep(X, y, drop_first))
+
+    def test_a_full_rank_design_with_an_intercept_matches_the_qr_path(self):
+        X, y, onehot, age = self._data()
+        cov = np.column_stack([np.ones(len(y)), age, onehot[:, 1:]])
+        self._assert_same(bi.prep(X, y, cov), self._old_qr_prep(X, y, cov))
+
+    def test_the_intercept_is_always_projected_out(self):
+        # Without an intercept in the basis the covariate projection is not the
+        # Frisch-Waugh partial; centring afterwards does not make it one.
+        X, y, onehot, age = self._data()
+        drop_first = np.column_stack([age + 5.0, onehot[:, 1:]])
+        with_one = np.column_stack([np.ones(len(y)), drop_first])
+        self._assert_same(bi.prep(X, y, drop_first), bi.prep(X, y, with_one))
+
+    def test_the_deficit_is_reported_and_logged(self):
+        X, y, onehot, age = self._data()
+        full = np.column_stack([np.ones(len(y)), age, onehot])
+        with self.assertLogs("geofuse.bayesian_index", level="WARNING") as cm:
+            *_, info = bi.prep(X, y, full, return_info=True)
+        self.assertIn("1 redundant direction", cm.output[0])
+        self.assertEqual(info["dropped_directions"], 1)
+        self.assertEqual(info["covariate_rank"], 4)
+        self.assertEqual(info["residual_df"], len(y) - 4)
+
+    def test_a_clean_design_reports_no_deficit(self):
+        X, y, onehot, age = self._data()
+        *_, info = bi.prep(X, y, np.column_stack([age, onehot[:, 1:]]),
+                           return_info=True)
+        self.assertEqual(info["dropped_directions"], 0)
+        self.assertEqual(info["covariate_rank"], 4)
+
+    def test_col_basis_keeps_only_the_real_span(self):
+        rng = np.random.default_rng(3)
+        a = rng.normal(size=(50, 2))
+        Z = np.column_stack([a, a[:, 0] + a[:, 1], np.zeros(50)])
+        q = bi.col_basis(Z)
+        self.assertEqual(q.shape, (50, 2))
+        np.testing.assert_allclose(q.T @ q, np.eye(2), atol=1e-12)
+        np.testing.assert_allclose(q @ (q.T @ Z), Z, atol=1e-10)
+
+
+class TestExposureResponseProjectionIsRankSafe(unittest.TestCase):
+    def test_a_duplicated_linear_column_removes_only_its_span(self):
+        from geofuse.exposure_response import _orthogonalise
+
+        rng = np.random.default_rng(4)
+        n = 200
+        x = rng.normal(size=n)
+        block = rng.normal(size=(n, 3))
+        clean = np.column_stack([np.ones(n), x])
+        dup = np.column_stack([np.ones(n), x, 2.0 * x])
+        r_clean, keep_clean = _orthogonalise(block, clean)
+        r_dup, keep_dup = _orthogonalise(block, dup)
+        np.testing.assert_array_equal(keep_clean, keep_dup)
+        np.testing.assert_allclose(r_dup, r_clean, atol=1e-10)
+
+
 if __name__ == "__main__":
     unittest.main()

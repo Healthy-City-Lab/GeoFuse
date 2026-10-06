@@ -34,6 +34,8 @@ from collections.abc import Callable, Sequence
 
 import numpy as np
 
+from .bayesian_index import col_basis
+
 logger = logging.getLogger(__name__)
 
 #: A fitter takes the design matrix and its column names and returns
@@ -508,7 +510,7 @@ def _orthogonalise(block: np.ndarray, against: np.ndarray, tol: float = 1e-8):
     the indices kept. Used to split a spline basis into "the straight line" and
     "everything the straight line cannot express".
     """
-    q, _ = np.linalg.qr(against)
+    q = col_basis(against)
     residual = block - q @ (q.T @ block)
     scale = np.linalg.norm(residual, axis=0)
     reference = max(float(np.max(np.linalg.norm(block, axis=0))), 1e-30)
@@ -605,7 +607,7 @@ def spline_nonlinearity_test(
     joint = _natural_cubic_basis(np.concatenate([x, grid]), df)
     if joint is not None and joint.shape[1] == basis.shape[1]:
         joint_linear = np.column_stack([np.ones(len(joint)), np.concatenate([x, grid])])
-        q, _ = np.linalg.qr(joint_linear)
+        q = col_basis(joint_linear)
         joint_nl = (joint - q @ (q.T @ joint))[:, kept]
         yhat = fitted["linear"][0] * grid + joint_nl[n:] @ beta_nl
         centre = float(np.interp(float(np.nanmedian(x)), grid, yhat))
