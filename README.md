@@ -15,9 +15,12 @@ sources, processes and fuses two complementary greenery signals:
 It combines them into a single **Composite Greenery Index (CGI)**, optimized
 against a health or environmental outcome you supply. The channel weights, each
 channel's spatial scale and aggregation statistic, and the functional form are
-all discovered from the data: an exhaustive cross-validated sweep picks the
-configuration, a Bayesian fit puts credible intervals on the weights, and the
-effect is reported on a held-out test set the search never saw.
+all discovered from the data: an exhaustive cross-validated sweep shortlists the
+configuration, a Bayesian fit over the whole grid estimates the weights, the
+distance of influence and the aggregation blend with credible intervals, and the
+effect is reported on a held-out test set the search never saw. Negative-control
+outcomes check how much of the association is specific, and a plasmode module
+measures whether the pipeline recovers a planted index in your own data.
 
 Run it either as an interactive Streamlit dashboard or as an MPI-parallel CLI
 for HPC batch processing.

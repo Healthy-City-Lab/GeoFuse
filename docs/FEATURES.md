@@ -117,8 +117,10 @@ Nothing below is pre-specified.
 - **Exhaustive held-out sweep.** Every radius-by-aggregator combination is
   enumerated and scored on repeated held-out splits of the training pool, not
   sampled. A one-standard-error rule prefers the smaller radius among
-  statistically indistinguishable configurations. A Bayesian fit at the winning
-  columns then puts credible intervals on the weights and the effect.
+  statistically indistinguishable configurations. A Bayesian fit over the whole
+  grid then estimates the radius profile, the aggregator blend, the weights and
+  the effect together, so the effect's interval carries the uncertainty about
+  scale and aggregation instead of conditioning on a pick.
 - **A held-out test set is the headline.** A fraction of the data, 25 % by
   default, is never touched during tuning. The winning configuration is scored
   on it once, with a percentile bootstrap interval and a permutation p-value
@@ -142,6 +144,14 @@ Nothing below is pre-specified.
   than 100 refits is flagged as too imprecise for a calibration claim: 0 of 16
   is still compatible with a true rate of 20 %. An engine option re-chooses the
   form on every permuted outcome, so the rate covers that choice too.
+- **Recovery is measured on your own data.** A plasmode module
+  (`geofuse.validation`, or `MetricFusionEngine.plasmode_recovery`) keeps the
+  real exposure tensor and covariates, plants a known index into a simulated
+  outcome under five truths (none; one channel; two weighted channels; synergy;
+  a scale between rungs), reruns the sweep and posterior many times, and
+  reports false positives and power with exact intervals, effect bias and
+  coverage, R50 error and coverage, aggregator error, weight coverage and form
+  recovery. It runs from Python, not the dashboard.
 - **Provenance is recorded.** Every run stores a hash of its configuration and
   counts how many distinct configurations were scored on the held-out set, so a
   spent test set is visible rather than inferred.
