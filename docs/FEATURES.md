@@ -99,8 +99,12 @@ manifest. See [OUTPUTS.md](OUTPUTS.md).
 
 Nothing below is pre-specified.
 
-- **Spatial scale.** Each channel's buffer radius, chosen from the ladder you
-  set.
+- **Spatial scale.** A posterior blend over the buffer ladder you set, per
+  channel. Because every buffer is a whole disc, any blend weights the entity
+  most and decays outward, so the scale is reported as R50 and R90: the
+  distances holding half and 90 % of the implied weight, on the raw exposure
+  scale, with credible intervals. The kernel's peak is shown too, labelled as a
+  position in buffer space rather than a distance of influence.
 - **Aggregation statistic.** Mean, median or a percentile of the values inside
   that buffer.
 - **Functional form.** A weighted sum, or a synergy form with powers on the main

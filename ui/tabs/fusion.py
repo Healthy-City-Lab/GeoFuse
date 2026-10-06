@@ -2977,6 +2977,70 @@ def _agg_label(stat: str | None, percentile: int | float | None) -> str:
     return "—"
 
 
+def _render_distance_decay(summary: dict, _pd, _label) -> None:
+    """R50 / R90 and the implied radial weight, the distances of influence.
+
+    Every rung is a statistic over the whole disc, so any blend of rungs puts
+    the most weight on the entity itself and less with distance. The kernel
+    peak above is where the blend sits in buffer space; these are where its
+    influence sits on the ground.
+    """
+    r50 = summary.get("r50_mean")
+    if not r50:
+        return
+    r90 = summary.get("r90_mean") or [None] * len(r50)
+
+    def ci(key, i):
+        lo = (summary.get(f"{key}_ci_low") or [None] * len(r50))[i]
+        hi = (summary.get(f"{key}_ci_high") or [None] * len(r50))[i]
+        return f"[{_fmt(lo, 0)}, {_fmt(hi, 0)}]"
+
+    st.dataframe(
+        _pd.DataFrame([
+            {
+                "Channel": _label(i),
+                "R50 (m)": _fmt(v, 0),
+                "R50 95% CrI": ci("r50", i),
+                "R90 (m)": _fmt(r90[i], 0),
+                "R90 95% CrI": ci("r90", i),
+            }
+            for i, v in enumerate(r50)
+        ]),
+        width="stretch",
+        hide_index=True,
+    )
+    curve = summary.get("implied_weight_curve") or {}
+    dist, weights = curve.get("distance_m") or [], curve.get("weight") or []
+    if dist and weights:
+        long = _pd.DataFrame([
+            {"Distance (m)": float(d), "Channel": _label(ci_), "Weight": float(w)}
+            for ci_, row in enumerate(weights)
+            for d, w in zip(dist, row)
+        ])
+        try:
+            import plotly.express as _px
+
+            fig = _px.line(long, x="Distance (m)", y="Weight", color="Channel")
+            fig.update_layout(
+                height=260, margin=dict(l=50, r=20, t=30, b=50),
+                yaxis_title="Implied weight (1 at the entity)",
+            )
+            st.plotly_chart(fig, width="stretch")
+        except Exception:
+            st.line_chart(long.pivot(index="Distance (m)", columns="Channel",
+                                     values="Weight"), height=220)
+    basis = summary.get("distance_basis") or "mean-equivalent (approximate)"
+    scale = summary.get("distance_scale") or "standardised"
+    st.caption(
+        "**R50 / R90** are the distances holding half and 90 % of the implied "
+        "radial weight. A blend of whole-disc buffers always weights the "
+        "entity most and decays outward, so these - not the kernel peak - are "
+        "the distances of influence; all mass on one 600 m rung gives an R50 "
+        f"of 424 m. Basis: {basis}, on the {scale} exposure scale, assuming "
+        "uniform density inside each buffer."
+    )
+
+
 def _render_fitted_grid(summary: dict, _pd, _label) -> None:
     """The spatial scale and the aggregator, as the posterior estimated them.
 
@@ -3009,7 +3073,7 @@ def _render_fitted_grid(summary: dict, _pd, _label) -> None:
             _pd.DataFrame([
                 {
                     "Channel": _label(i),
-                    "Peak radius (m)": _fmt(v, 0),
+                    "Kernel peak, buffer space (m)": _fmt(v, 0),
                     "95% CrI": f"[{_fmt(lo[i], 0)}, {_fmt(hi[i], 0)}]",
                     "Prior CrI": f"[{_fmt(prior[0], 0)}, {_fmt(prior[1], 0)}]",
                     "vs prior": _fmt(ratios[i], 2) if i < len(ratios) else "-",
@@ -3074,6 +3138,8 @@ def _render_fitted_grid(summary: dict, _pd, _label) -> None:
             "the hump. Mass piled against either end means the effect may peak "
             "outside the searched range - widen the buffer ladder and re-run."
         )
+
+    _render_distance_decay(summary, _pd, _label)
 
     if aggregator:
         stats = summary.get("stats") or []

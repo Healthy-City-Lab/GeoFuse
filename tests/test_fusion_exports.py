@@ -104,6 +104,15 @@ class TestDiscoveryCsvReportsWhatWasBuilt(unittest.TestCase):
         self.assertEqual(rows[0]["aggregators_separated"], "p10")
         self.assertEqual(rows[1]["aggregators_separated"], "")
 
+    def test_the_distances_of_influence_are_exported(self):
+        summ = _study()["discovery_summary"]
+        summ.update(r50_mean=[300.0, 410.0], r50_ci_low=[200.0, 350.0],
+                    r50_ci_high=[380.0, 460.0], r90_mean=[520.0, 700.0],
+                    r90_ci_low=[400.0, 640.0], r90_ci_high=[600.0, 760.0])
+        rows = _rows(_write(discovery_summary=summ), "discovery.csv")
+        self.assertEqual([r["r50_m"] for r in rows], ["300.0", "410.0"])
+        self.assertEqual(rows[1]["r90_ci_high"], "760.0")
+
     def test_a_run_without_a_fitted_grid_falls_back_to_the_sweep_cell(self):
         summ = _study()["discovery_summary"]
         for key in ("projected_pick", "radius_profile", "peak_radius_mean",

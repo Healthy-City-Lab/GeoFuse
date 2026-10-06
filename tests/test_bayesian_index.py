@@ -812,6 +812,115 @@ class TestHonestFormSelection(unittest.TestCase):
         self.assertEqual((form, scores), ("linear", {}))
 
 
+class TestDistanceDecay(unittest.TestCase):
+    """A blend of whole-disc means is one radial weight; report where it sits.
+
+    For one rung r*, the weight is uniform over the disc, so half of it lies
+    within r*/sqrt(2) and 90 % within sqrt(0.9) r* -- not at r*, which is what a
+    kernel peak would suggest.
+    """
+
+    @staticmethod
+    def _q(k, radii, **kw):
+        k = np.asarray(k, dtype=float)[None, :]
+        out = bi.distance_quantiles(k, radii, **kw)
+        return float(out[0.5][0]), float(out[0.9][0])
+
+    def test_all_mass_on_one_rung(self):
+        r50, r90 = self._q([0.0, 1.0, 0.0], [100.0, 300.0, 900.0])
+        self.assertAlmostEqual(r50, 300.0 / np.sqrt(2.0), places=9)
+        self.assertAlmostEqual(r90, np.sqrt(0.9) * 300.0, places=9)
+
+    def test_two_rungs_match_the_closed_form(self):
+        r1, r2 = 100.0, 400.0
+        # Median beyond the inner rung: k1 + k2 D²/r2² = q.
+        r50, r90 = self._q([0.3, 0.7], [r1, r2])
+        self.assertAlmostEqual(r50, r2 * np.sqrt(0.2 / 0.7), places=9)
+        self.assertAlmostEqual(r90, r2 * np.sqrt(0.6 / 0.7), places=9)
+        # Median inside the inner rung: D²(k1/r1² + k2/r2²) = q.
+        r50, r90 = self._q([0.8, 0.2], [r1, r2])
+        self.assertAlmostEqual(r50, np.sqrt(0.5 / (0.8 / r1**2 + 0.2 / r2**2)),
+                               places=9)
+        self.assertAlmostEqual(r90, r2 * np.sqrt(0.1 / 0.2), places=9)
+
+    def test_unequal_sd_moves_the_median_the_expected_way(self):
+        k = np.array([[[0.5, 0.5]]])
+        radii = [100.0, 400.0]
+        even = bi.distance_quantiles(bi.raw_rung_weights(k, [[1.0, 1.0]]), radii)
+        # A smaller SD on the inner rung means more raw weight per unit of its
+        # kernel weight, so more of the influence sits close in.
+        tight = bi.distance_quantiles(bi.raw_rung_weights(k, [[0.5, 1.0]]), radii)
+        wide = bi.distance_quantiles(bi.raw_rung_weights(k, [[2.0, 1.0]]), radii)
+        self.assertLess(tight[0.5][0, 0], even[0.5][0, 0])
+        self.assertGreater(wide[0.5][0, 0], even[0.5][0, 0])
+
+    def test_vectorised_over_draws_and_channels(self):
+        rng = np.random.default_rng(2)
+        radii = [50.0, 150.0, 400.0, 1000.0]
+        k = rng.dirichlet(np.ones(4), size=(7, 3))
+        both = bi.distance_quantiles(k, radii)
+        for d in range(7):
+            for c in range(3):
+                r50, r90 = self._q(k[d, c], radii)
+                self.assertAlmostEqual(both[0.5][d, c], r50, places=9)
+                self.assertAlmostEqual(both[0.9][d, c], r90, places=9)
+        self.assertEqual(both[0.5].shape, (7, 3))
+
+    def test_a_masked_rung_with_no_sd_still_works(self):
+        k = np.array([[[0.0, 1.0, 0.0]]])
+        raw = bi.raw_rung_weights(k, [[np.nan, 2.0, np.nan]])
+        np.testing.assert_allclose(raw, k)
+        r50 = bi.distance_quantiles(raw, [100.0, 200.0, 400.0])[0.5]
+        self.assertAlmostEqual(float(r50[0, 0]), 200.0 / np.sqrt(2.0), places=9)
+
+    def test_a_point_rung_is_mass_at_the_entity(self):
+        r50, r90 = self._q([0.6, 0.4], [0.0, 100.0])
+        self.assertEqual(r50, 0.0)
+        self.assertAlmostEqual(r90, np.sqrt(0.3 / (0.4 / 100.0**2)), places=9)
+
+    def test_observed_areas_replace_the_uniform_density(self):
+        radii = [100.0, 400.0]
+        uniform = self._q([0.0, 1.0], radii)
+        scaled = self._q([0.0, 1.0], radii, areas=[[5.0 * 100**2, 5.0 * 400**2]])
+        np.testing.assert_allclose(uniform, scaled)
+        # Half the points already inside 100 m: the median distance is 100 m.
+        dense = self._q([0.0, 1.0], radii, areas=[[100.0, 200.0]])
+        self.assertAlmostEqual(dense[0], 100.0, places=9)
+
+    def test_the_implied_curve_never_rises_even_for_a_humped_kernel(self):
+        k = np.array([[[0.1, 0.7, 0.2]]])
+        grid, curve = bi.implied_weight_curve(k, [100.0, 300.0, 900.0])
+        self.assertEqual(curve[0, 0, 0], 1.0)
+        self.assertTrue(np.all(np.diff(curve[0, 0]) <= 1e-12))
+        self.assertEqual(grid[-1], 900.0)
+
+    def test_the_posterior_summary_reports_r50_and_labels_its_basis(self):
+        rng = np.random.default_rng(5)
+        draws, radii = 50, (100, 300, 900)
+        post = bi.IndexPosterior(
+            weights=rng.dirichlet(np.ones(2), size=draws), beta=rng.normal(size=draws),
+            powers=None, channels=("ndvi", "gvi"), picked=((300, "mean"),) * 2,
+            form="linear", rhat_max=1.0, ess_min=400.0, divergences=0,
+            radius_weights=np.broadcast_to([0.0, 1.0, 0.0], (draws, 2, 3)).copy(),
+            aggregator_weights=rng.dirichlet(np.ones(2), size=(draws, 2)),
+            radii=radii, stats=("mean", "p50"), radius_kernel="dirichlet",
+            rung_sd=np.ones((2, 3)),
+        )
+        s = post.summary()
+        np.testing.assert_allclose(s["r50_mean"], [300 / np.sqrt(2)] * 2)
+        np.testing.assert_allclose(s["r90_ci_high"], [np.sqrt(0.9) * 300] * 2)
+        self.assertEqual(s["distance_scale"], "raw")
+        self.assertEqual(s["distance_basis"], "mean-equivalent (approximate)")
+        self.assertEqual(len(s["implied_weight_curve"]["weight"]), 2)
+
+    def test_prep_reports_the_sd_it_divided_by(self):
+        rng = np.random.default_rng(6)
+        X = rng.normal(size=(300, 2, 2, 1)) * np.array([1.0, 3.0])[None, None, :, None]
+        *_, info = bi.prep(X, rng.normal(size=300), None, return_info=True)
+        self.assertEqual(info["column_sd"].shape, (2, 2, 1))
+        self.assertGreater(info["column_sd"][0, 1, 0], 2.5 * info["column_sd"][0, 0, 0])
+
+
 class _StubMCMC:
     def __init__(self, beta):
         self._beta = beta

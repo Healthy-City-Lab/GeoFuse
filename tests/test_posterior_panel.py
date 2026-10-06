@@ -424,6 +424,39 @@ class TestFormChoiceIsReported(unittest.TestCase):
         self.assertNotIn("inner splits of its training rows", out)
 
 
+class TestDistanceDecayPanel(unittest.TestCase):
+    def setUp(self):
+        self._real_st = fusion_tab.st
+        self.rec = _Recorder()
+        fusion_tab.st = self.rec
+
+    def tearDown(self):
+        fusion_tab.st = self._real_st
+
+    def _render(self, summary):
+        fusion_tab._render_posterior_diagnostics(summary, "DCOR")
+        return self.rec.text()
+
+    def test_r50_and_r90_are_tabled_and_the_peak_is_labelled_buffer_space(self):
+        s = _grid(r50_mean=[424.0, 300.0], r50_ci_low=[380.0, 250.0],
+                  r50_ci_high=[470.0, 350.0], r90_mean=[569.0, 450.0],
+                  r90_ci_low=[500.0, 400.0], r90_ci_high=[600.0, 500.0],
+                  implied_weight_curve={"distance_m": [0.0, 300.0, 600.0],
+                                        "weight": [[1.0, 0.6, 0.1],
+                                                   [1.0, 0.4, 0.0]]},
+                  distance_scale="raw",
+                  distance_basis="mean-equivalent (approximate)")
+        out = self._render(s)
+        self.assertIn("R50 (m)", out)
+        self.assertIn("424", out)
+        self.assertIn("mean-equivalent (approximate), on the raw", out)
+        self.assertIn("Kernel peak, buffer space (m)", out)
+        self.assertTrue(any(n == "plotly_chart" for n, _ in self.rec.calls))
+
+    def test_older_bundles_skip_the_section(self):
+        self.assertNotIn("R50 (m)", self._render(_grid()))
+
+
 class _MetricRecorder(_Recorder):
     """Also keeps each metric's value, which the base recorder drops."""
 

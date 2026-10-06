@@ -125,8 +125,12 @@ so it does not share a scale with the other rows.
 posterior's projection onto one cell per channel, which is the cell the
 composite is built from; `sweep_radius_m` and `sweep_aggregator` keep the
 sweep's shortlist cell, and the two disagree where the grid is flat.
-`peak_radius_m` is the kernel peak and `peak_radius_width_vs_prior` how much the
-data narrowed it (near 1 means the prior is speaking back);
+`peak_radius_m` is the kernel peak in buffer space and
+`peak_radius_width_vs_prior` how much the data narrowed it (near 1 means the
+prior is speaking back). `r50_m` and `r90_m` (intervals in `r50_ci_low` /
+`r50_ci_high` and `r90_ci_low` / `r90_ci_high`) are the distances holding half
+and 90 % of the implied radial weight, which is where the influence sits on the
+ground; for percentile aggregators they are a mean-equivalent approximation.
 `aggregators_separated` lists the statistics the data distinguished from an even
 blend. Each row also carries the posterior weight with its credible interval,
 whether the radius sat at the edge of the searched ladder, and the channel's

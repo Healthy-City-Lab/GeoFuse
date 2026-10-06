@@ -3290,8 +3290,10 @@ class MetricFusionEngine:
 
         # The channels in play are settled before residualising, so a coverage
         # gap in a channel this study never reads cannot drop rows from it.
-        yr, Xr = bayesian_index.prep(X, y, static.get("cov"),
-                                     channel_index=channel_index)
+        yr, Xr, prep_info = bayesian_index.prep(
+            X, y, static.get("cov"), channel_index=channel_index,
+            return_info=True,
+        )
         dropped = int(len(X) - len(Xr))
         if dropped:
             _log(
@@ -3372,9 +3374,15 @@ class MetricFusionEngine:
             grid, yr, form=res.form, draws=draws, warmup=warmup,
             chains=chains, seed=seed, **grid_kwargs,
         )
+        # The distance-decay summaries read the kernel on the raw exposure
+        # scale, through the SD of each channel's mean-statistic column.
+        sd = prep_info["column_sd"][channel_index]
+        rung_sd = (sd[:, :, list(stats).index("mean")] if "mean" in stats
+                   else np.nanmean(sd, axis=-1))
         post = bayesian_index.posterior_from(
             mcmc, channels=index_channels, picked=res.picked, form=res.form,
             radii=radii, stats=stats, radius_kernel=radius_kernel,
+            rung_sd=rung_sd,
         )
         null = (
             bayesian_index.null_calibration(

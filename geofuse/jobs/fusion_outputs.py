@@ -271,6 +271,9 @@ def _write_fusion_outputs(
         radius_profile = summ.get("radius_profile") or []
         peak = summ.get("peak_radius_mean") or []
         peak_ratio = summ.get("peak_radius_width_ratio") or []
+        decay = {k: summ.get(k) or [] for k in (
+            "r50_mean", "r50_ci_low", "r50_ci_high",
+            "r90_mean", "r90_ci_low", "r90_ci_high")}
         informative = summ.get("aggregator_informative") or []
         chans = summ.get("channels") or []
         wm = summ.get("weight_mean") or []
@@ -285,10 +288,18 @@ def _write_fusion_outputs(
         for i, name in enumerate(labels):
             pick = picked[i] if i < len(picked) else ()
             proj = projected[i] if i < len(projected) else ()
-            # A pair term of the synergy form has a weight but no cell of its
-            # own, so its grid columns stay blank rather than repeating a
-            # component's values.
             has_grid = i < len(radius_profile)
+            dec = {
+                col: (_f(vals[i]) if has_grid and i < len(vals) else None)
+                for col, vals in (
+                    ("r50_m", decay["r50_mean"]),
+                    ("r50_ci_low", decay["r50_ci_low"]),
+                    ("r50_ci_high", decay["r50_ci_high"]),
+                    ("r90_m", decay["r90_mean"]),
+                    ("r90_ci_low", decay["r90_ci_low"]),
+                    ("r90_ci_high", decay["r90_ci_high"]),
+                )
+            }
             disc_rows.append(
                 {
                     "study": key,
@@ -304,6 +315,7 @@ def _write_fusion_outputs(
                     "peak_radius_width_vs_prior": (
                         _f(peak_ratio[i])
                         if has_grid and i < len(peak_ratio) else None),
+                    **dec,
                     "aggregators_separated": (
                         ";".join(informative[i]) if has_grid
                         and i < len(informative) and informative[i] else None),
@@ -778,6 +790,16 @@ def _posterior_summary(params: dict) -> dict:
         "peak_radius_ci_high": post.get("peak_radius_ci_high"),
         "peak_radius_prior_ci": post.get("peak_radius_prior_ci"),
         "peak_radius_width_ratio": post.get("peak_radius_width_ratio"),
+        "r50_mean": post.get("r50_mean"),
+        "r50_ci_low": post.get("r50_ci_low"),
+        "r50_ci_high": post.get("r50_ci_high"),
+        "r90_mean": post.get("r90_mean"),
+        "r90_ci_low": post.get("r90_ci_low"),
+        "r90_ci_high": post.get("r90_ci_high"),
+        "implied_weight_curve": post.get("implied_weight_curve"),
+        "distance_scale": post.get("distance_scale"),
+        "distance_basis": post.get("distance_basis"),
+        "distance_area": post.get("distance_area"),
         "stats": post.get("stats"),
         "aggregator_mean": post.get("aggregator_mean"),
         "aggregator_ci_low": post.get("aggregator_ci_low"),

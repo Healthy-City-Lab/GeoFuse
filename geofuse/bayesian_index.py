@@ -139,7 +139,10 @@ def prep(X: np.ndarray, y: np.ndarray, covariates: np.ndarray | None,
 
     With ``return_info`` a third value is returned: ``covariate_rank`` (the
     basis size, intercept included), ``dropped_directions`` (redundant columns
-    in the covariate design) and ``residual_df`` (rows kept minus the rank).
+    in the covariate design), ``residual_df`` (rows kept minus the rank) and
+    ``column_sd``, shaped ``X.shape[1:]`` — the SD each residualised column was
+    divided by, which undoes the z-scoring when weights are read on the raw
+    scale.
     """
     X = np.asarray(X, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
@@ -173,13 +176,15 @@ def prep(X: np.ndarray, y: np.ndarray, covariates: np.ndarray | None,
     yr = rz(y)
     yr = (yr - yr.mean()) / (yr.std() + 1e-12)
     flat = rz(X.reshape(len(X), -1))
-    flat = (flat - flat.mean(0)) / (flat.std(0) + 1e-12)
+    sd = flat.std(0)
+    flat = (flat - flat.mean(0)) / (sd + 1e-12)
     if not return_info:
         return yr, flat.reshape(X.shape)
     info = {
         "covariate_rank": int(q.shape[1]),
         "dropped_directions": int(deficit),
         "residual_df": int(len(y) - q.shape[1]),
+        "column_sd": sd.reshape(X.shape[1:]),
     }
     return yr, flat.reshape(X.shape), info
 
@@ -699,6 +704,106 @@ def _width_ratio(post_lo, post_hi, prior_lo, prior_hi) -> float:
     return float((float(post_hi) - float(post_lo)) / prior_w)
 
 
+# ────────────────────────────────────────────────────────────────────
+# Distance decay implied by a nested-disc kernel
+# ────────────────────────────────────────────────────────────────────
+
+
+def raw_rung_weights(radius_w, rung_sd=None) -> np.ndarray:
+    """Rung weights on the raw exposure scale, ``k'_r ∝ k_r / σ_r``.
+
+    :func:`prep` divides every column by its SD before the kernel sees it, so a
+    kernel weight ``k_r`` on the standardised column is ``k_r / σ_r`` on the
+    raw one. ``rung_sd`` is ``(channel, rung)``; ``None`` keeps the standardised
+    scale. A rung with no weight stays at zero even where its SD is undefined.
+    """
+    k = np.asarray(radius_w, dtype=np.float64)
+    if rung_sd is None:
+        return k
+    sd = np.asarray(rung_sd, dtype=np.float64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        k = np.where(k > 0, k / sd, 0.0)
+    k = np.where(np.isfinite(k), k, 0.0)
+    tot = k.sum(-1, keepdims=True)
+    with np.errstate(invalid="ignore"):
+        return np.where(tot > 0, k / tot, np.nan)
+
+
+def _rung_areas(radii, areas, n_channels) -> np.ndarray:
+    r = np.asarray(radii, dtype=np.float64)
+    if areas is None:
+        return np.broadcast_to(r ** 2, (n_channels, len(r))).astype(np.float64)
+    return np.broadcast_to(np.asarray(areas, dtype=np.float64),
+                           (n_channels, len(r))).astype(np.float64)
+
+
+def distance_quantiles(k, radii, *, areas=None, q=(0.5, 0.9)) -> dict:
+    """Distances holding share ``q`` of the implied radial weight.
+
+    Each rung is a statistic over the **whole disc** out to ``r``, so a blend
+    of disc means is one radial weight function ``w(d) = Σ_{r ≥ d} k_r / A_r``,
+    and the share of it within distance ``D`` is
+    ``W(D) = Σ_r k_r · min(A_D, A_r) / A_r``. ``w`` never increases with ``d``,
+    whatever the kernel's shape over the rungs, so these quantiles — not the
+    kernel's peak — are the distances of influence.
+
+    ``k`` is ``(..., channel, rung)`` with each row summing to one; ``radii``
+    ascending. ``areas`` is the per-rung area measure, ``r²`` by default
+    (uniform density: exact for rasters up to pixel discretisation); a pixel
+    or point count per rung can be passed instead, with ``A_D`` interpolated
+    linearly in ``D²`` between rungs. A rung of radius 0 is a point mass at the
+    entity. Solved piecewise-analytically between rungs, vectorised over the
+    leading axes. Returns ``{q: distances}`` shaped like ``k`` without its last
+    axis.
+    """
+    k = np.asarray(k, dtype=np.float64)
+    r = np.asarray(radii, dtype=np.float64)
+    a = _rung_areas(r, areas, k.shape[-2])
+    safe = np.where(a > 0, a, np.inf)
+
+    cum = np.cumsum(k, axis=-1)
+    per_area = k / safe
+    tail_incl = np.cumsum(per_area[..., ::-1], axis=-1)[..., ::-1]
+    tail_excl = tail_incl - per_area
+    W = cum + a * tail_excl                       # share inside each rung
+
+    r_prev = np.concatenate([[0.0], r[:-1]])
+    a_prev = np.concatenate([np.zeros((a.shape[0], 1)), a[:, :-1]], axis=1)
+    out = {}
+    for share in q:
+        j = np.argmax(W >= share - 1e-12, axis=-1)[..., None]
+        before = np.take_along_axis(cum - k, j, -1)[..., 0]
+        slope = np.take_along_axis(tail_incl, j, -1)[..., 0]
+        aj = np.take_along_axis(np.broadcast_to(a, k.shape), j, -1)[..., 0]
+        ap = np.take_along_axis(np.broadcast_to(a_prev, k.shape), j, -1)[..., 0]
+        rj, rp = r[j[..., 0]], r_prev[j[..., 0]]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            a_star = np.where(slope > 0, (share - before) / slope, aj)
+            frac = np.where(aj > ap, (a_star - ap) / (aj - ap), 1.0)
+        d2 = rp ** 2 + np.clip(frac, 0.0, 1.0) * (rj ** 2 - rp ** 2)
+        d = np.sqrt(np.maximum(d2, 0.0))
+        out[share] = np.where(np.isfinite(k).all(-1), d, np.nan)
+    return out
+
+
+def implied_weight_curve(k, radii, *, areas=None, points=60):
+    """``w(d)`` on a distance grid, normalised to 1 at the entity.
+
+    Rungs of radius 0 are a point mass and have no density to draw, so they are
+    left out of the curve. Returns ``(distances, curve)`` with ``curve`` shaped
+    ``(..., channel, points)``.
+    """
+    k = np.asarray(k, dtype=np.float64)
+    r = np.asarray(radii, dtype=np.float64)
+    a = _rung_areas(r, areas, k.shape[-2])
+    grid = np.linspace(0.0, float(r.max()), points)
+    density = np.where(a > 0, k / np.where(a > 0, a, 1.0), 0.0)
+    reach = (r[None, :] >= grid[:, None]).astype(np.float64)   # (points, rung)
+    w = np.einsum("...cr,pr->...cp", density, reach)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return grid, w / w[..., :1]
+
+
 @dataclass
 class IndexPosterior:
     weights: np.ndarray               # (draws, nC [+ pairs])
@@ -718,6 +823,8 @@ class IndexPosterior:
     radii: tuple = ()
     stats: tuple = ()
     radius_kernel: str = "fixed"
+    rung_sd: np.ndarray | None = None              # (nC, nR), SD prep divided by
+    rung_area: np.ndarray | None = None            # (nC, nR), None means r²
 
     def weight_labels(self) -> list[str]:
         """One label per weight, so the pair terms are not read as channels.
@@ -800,6 +907,39 @@ class IndexPosterior:
             out.append((int(self.radii[int(np.argmax(rw[c]))]), stat))
         return tuple(out)
 
+    def distance_decay(self) -> dict:
+        """R50 / R90 per channel, per draw, summarised; plus the implied curve.
+
+        Computed from the normalised rung weights, so it holds for every radius
+        kernel. On the raw exposure scale when ``rung_sd`` is known. Exact for
+        the mean statistic; for a blend that includes percentiles it treats each
+        statistic as if it were the mean, and says so in ``distance_basis``.
+        """
+        if self.radius_weights is None or not self.radii:
+            return {}
+        k = raw_rung_weights(self.radius_weights, self.rung_sd)
+        dq = distance_quantiles(k, self.radii, areas=self.rung_area)
+        out = {}
+        with np.errstate(invalid="ignore"):
+            for name, share in (("r50", 0.5), ("r90", 0.9)):
+                d = dq[share]
+                lo, hi = np.nanpercentile(d, [2.5, 97.5], axis=0)
+                out[f"{name}_mean"] = np.nanmean(d, axis=0).tolist()
+                out[f"{name}_ci_low"] = np.atleast_1d(lo).tolist()
+                out[f"{name}_ci_high"] = np.atleast_1d(hi).tolist()
+            grid, curve = implied_weight_curve(k, self.radii, areas=self.rung_area)
+            out["implied_weight_curve"] = {
+                "distance_m": grid.tolist(),
+                "weight": np.nanmean(curve, axis=0).tolist(),
+            }
+        out["distance_scale"] = "raw" if self.rung_sd is not None else "standardised"
+        out["distance_basis"] = (
+            "exact (mean statistic)" if tuple(self.stats) == ("mean",)
+            else "mean-equivalent (approximate)"
+        )
+        out["distance_area"] = "r^2" if self.rung_area is None else "observed"
+        return out
+
     def summary(self) -> dict:
         lo, hi = np.percentile(self.beta, [2.5, 97.5])
         w_lo, w_hi = np.percentile(self.weights, [2.5, 97.5], axis=0)
@@ -836,6 +976,7 @@ class IndexPosterior:
             out["radii"] = [int(r) for r in self.radii]
             out["radius_profile"] = self.radius_weights.mean(0).tolist()
             out["projected_pick"] = [list(p) for p in self.projected_pick()]
+            out.update(self.distance_decay())
         if self.peak_radius is not None:
             center, spread = _radius_prior(self.radii)
             prior = (float(np.exp(center - 1.96 * spread)),
@@ -982,7 +1123,14 @@ def fit(E, y, *, form="linear", radii=None, stats=None, radius_mask=None,
 
 
 def posterior_from(mcmc, *, channels, picked, form, radii=(), stats=(),
-                   radius_kernel="fixed") -> IndexPosterior:
+                   radius_kernel="fixed", rung_sd=None,
+                   rung_area=None) -> IndexPosterior:
+    """Posterior summaries from a fitted :func:`fit`.
+
+    ``rung_sd`` (channel, rung) puts the distance-decay summaries on the raw
+    exposure scale; ``rung_area`` replaces the ``r²`` area measure with an
+    observed pixel or point count per rung.
+    """
     import arviz as az
 
     idata = az.from_numpyro(mcmc)
@@ -1021,6 +1169,9 @@ def posterior_from(mcmc, *, channels, picked, form, radii=(), stats=(),
         aggregator_weights=np.asarray(s["a"]) if "a" in s else None,
         radii=tuple(int(r) for r in radii), stats=tuple(stats),
         radius_kernel=radius_kernel,
+        rung_sd=None if rung_sd is None else np.asarray(rung_sd, dtype=np.float64),
+        rung_area=(None if rung_area is None
+                   else np.asarray(rung_area, dtype=np.float64)),
     )
     # The grid is in the model, so the cell the composite is built from is the
     # posterior's own projection rather than a pick made before it ran.
