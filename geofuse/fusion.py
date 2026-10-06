@@ -3304,10 +3304,9 @@ class MetricFusionEngine:
         else:
             raise ValueError(f"{outcome!r} is not a negative-control column.")
 
-        index_channels = list(cgi_formulas.formula_channels(self.cgi_formula))
-        if self._active_greenery_channel != "cgi":
-            index_channels = [self._active_greenery_channel]
-        channel_index = [tensor_channels.index(c) for c in index_channels]
+        index_channels, channel_index, radius_idx = self._index_layout(
+            tensor_channels, radii
+        )
 
         # The channels in play are settled before residualising, so a coverage
         # gap in a channel this study never reads cannot drop rows from it.
@@ -3325,14 +3324,6 @@ class MetricFusionEngine:
                 f"scored on the remaining {len(Xr)}.",
             )
         tick()
-
-        # A channel is only offered the radii its own ladder was computed at.
-        gvi_radii, ndvi_radii = self._preaggr_radii()
-        radius_idx = [
-            [i for i, r in enumerate(radii)
-             if int(r) in (ndvi_radii if c == "ndvi" else gvi_radii)]
-            for c in index_channels
-        ]
 
         workers = parallel.process_worker_count()
         # Every stage below takes minutes and runs a process pool, so the flag
@@ -3440,6 +3431,53 @@ class MetricFusionEngine:
             f"{post.divergences} divergences). Posterior grid: {post.picked}.",
         )
         return params
+
+    def _index_layout(self, tensor_channels, radii):
+        """The study's index channels, their tensor positions and their ladders.
+
+        A channel is only offered the radii its own ladder was computed at, so
+        NDVI and the street-view family can search different rungs.
+        """
+        index_channels = list(cgi_formulas.formula_channels(self.cgi_formula))
+        if self._active_greenery_channel != "cgi":
+            index_channels = [self._active_greenery_channel]
+        channel_index = [list(tensor_channels).index(c) for c in index_channels]
+        gvi_radii, ndvi_radii = self._preaggr_radii()
+        radius_idx = [
+            [i for i, r in enumerate(radii)
+             if int(r) in (ndvi_radii if c == "ndvi" else gvi_radii)]
+            for c in index_channels
+        ]
+        return index_channels, channel_index, radius_idx
+
+    def plasmode_recovery(self, *, out_dir: str | None = None, **kwargs) -> dict:
+        """Plasmode recovery on this study's own exposure tensor and covariates.
+
+        Builds the train+val tensor exactly as :meth:`fit_bayesian_index` does,
+        keeps the entities with complete coverage, and hands it to
+        :func:`geofuse.validation.plasmode_recovery` with the study's channels
+        and ladders; ``kwargs`` pass through (``reps``, ``partial_r2``,
+        ``scenarios``, ``pipeline_kwargs``, ``seed``, ...). With ``out_dir`` the
+        tidy table and the JSON bundle are written there too.
+        """
+        from . import validation
+
+        X, radii, stats, tensor_channels, static = self.build_index_tensor("train_val")
+        channels, channel_index, radius_idx = self._index_layout(tensor_channels, radii)
+        cov = static.get("cov")
+        scan = X[:, channel_index].reshape(len(X), -1)
+        measured = ~np.isnan(scan).all(0)
+        keep = np.isfinite(scan[:, measured]).all(1)
+        if cov is not None and np.size(cov):
+            keep &= np.isfinite(np.asarray(cov, dtype=np.float64)).all(1)
+        result = validation.plasmode_recovery(
+            X[keep], None if cov is None or not np.size(cov) else np.asarray(cov)[keep],
+            channels=channels, radii=radii, stats=stats,
+            channel_index=channel_index, radius_idx=radius_idx, **kwargs,
+        )
+        if out_dir:
+            validation.write_plasmode_report(result, out_dir)
+        return result
 
     def _sweep_objective(self, metric: str):
         """Held-out scorer the sweep ranks candidates by, or ``None``.
