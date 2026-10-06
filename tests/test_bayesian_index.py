@@ -743,17 +743,16 @@ class TestHonestFormSelection(unittest.TestCase):
     def _cube(truth, n=1500, seed=0):
         """Linear truth on z-scored channels; synergy truth inside its family.
 
-        The synergy form works on min-max scaled channels, so its truth is built
-        the same way: a pair-weighted product of two [0, 1] channels.
+        The synergy form works on each channel's approximate percentile, so its
+        truth is built the same way: a pair-weighted product of two percentiles.
         """
         rng = np.random.default_rng(seed)
+        X = rng.normal(size=(n, 2, 1, 1))
         if truth == "synergy":
-            X = rng.random(size=(n, 2, 1, 1))
             t = bi.SynergyFit(np.array([0.1, 0.1, 0.8]), np.ones(2),
                               np.zeros(2), np.ones(2)).apply(X[:, :, 0, 0])
             y = 0.8 * (t - t.mean()) / t.std() + rng.normal(size=n)
         else:
-            X = rng.normal(size=(n, 2, 1, 1))
             y = 0.25 * X[:, 0, 0, 0] + 0.25 * X[:, 1, 0, 0] + rng.normal(size=n)
         return bi.prep(X, y, None)[::-1]
 
@@ -921,13 +920,57 @@ class TestDistanceDecay(unittest.TestCase):
         self.assertGreater(info["column_sd"][0, 1, 0], 2.5 * info["column_sd"][0, 0, 0])
 
 
-class TestSynergyPosteriorGradient(unittest.TestCase):
-    """The synergy power term must give the sampler finite gradients.
+class TestPercentileScaling(unittest.TestCase):
+    """The synergy form reads each channel as an approximate percentile."""
 
-    In the grid model each channel's exposure moves with the kernel, and min-max
-    scaling puts its minimum at exactly 0, where ``z ** p`` has an infinite
-    derivative. Fed that, the sampler diverges on most steps.
+    def test_it_is_the_log_normal_cdf_of_the_standardised_value(self):
+        from scipy.stats import norm
+
+        x = np.array([[-1.0, 2.0], [0.5, 4.0]])
+        got = bi.percentile_scale(x, np.array([0.0, 2.0]), np.array([1.0, 2.0]))
+        want = norm.logcdf((x - [0.0, 2.0]) / [1.0, 2.0])
+        np.testing.assert_allclose(got, want, rtol=1e-12)
+
+    def test_far_below_the_mean_stays_finite_and_above_zero(self):
+        logz = bi.percentile_scale(np.array([[-60.0]]), 0.0, 1.0)
+        self.assertTrue(np.isfinite(logz).all())
+        self.assertGreater(float(np.exp(logz * 0.2)[0, 0]), 0.0)
+
+    def test_a_held_out_row_beyond_the_training_range_is_not_clipped(self):
+        rng = np.random.default_rng(0)
+        E = rng.normal(size=(200, 2))
+        y = E[:, 0] * E[:, 1] + rng.normal(size=200)
+        sf = bi.fit_synergy(E, y)
+        np.testing.assert_allclose(sf.center, E.mean(0))
+        top = np.array([[E[:, 0].max(), 0.0], [E[:, 0].max() + 3.0, 0.0]])
+        out = sf.apply(top)
+        self.assertNotEqual(out[0], out[1])
+
+
+class TestSynergyPosteriorSamples(unittest.TestCase):
+    """The synergy grid fit must sample, not freeze or diverge.
+
+    The grid model's channel exposure moves with the kernel and aggregator. Hard
+    min-max bounds jumped between entities as it moved and put each minimum at
+    z = 0, where ``z ** p`` has an infinite slope; percentile scaling is smooth
+    in both respects.
     """
+
+    def test_single_short_chains_recover_the_linear_fits_effect(self):
+        rng = np.random.default_rng(0)
+        n = 800
+        X = rng.normal(size=(n, 2, len(RADII), len(STATS)))
+        y = 0.23 * X[:, 0, 1, 0] + rng.normal(size=n)
+        yr, Xr = bi.prep(X, y, None)
+        lin = bi.fit(Xr, yr, form="linear", radii=RADII, stats=STATS,
+                     draws=200, warmup=200, chains=1, seed=1)
+        b_lin = float(np.asarray(lin.get_samples()["beta"]).mean())
+        for seed in (1, 3, 5, 7):
+            m = bi.fit(Xr, yr, form="synergy", radii=RADII, stats=STATS,
+                       draws=200, warmup=200, chains=1, seed=seed)
+            beta = np.asarray(m.get_samples()["beta"])
+            self.assertGreater(float(beta.std()), 0.01, f"seed {seed} froze")
+            self.assertLess(abs(float(beta.mean()) - b_lin), 0.1, f"seed {seed}")
 
     def test_the_grid_fit_does_not_diverge(self):
         rng = np.random.default_rng(0)

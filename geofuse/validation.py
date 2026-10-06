@@ -126,7 +126,7 @@ def planted_index(Xr, truth: Truth, channel_index) -> np.ndarray:
     v = (v - v.mean(0)) / np.maximum(v.std(0), 1e-12)
     w = np.asarray(truth.weights, dtype=np.float64)
     if truth.form == "synergy":
-        e = bi.SynergyFit(w, np.asarray(truth.powers), v.min(0), v.max(0)).apply(v)
+        e = bi.SynergyFit(w, np.asarray(truth.powers), v.mean(0), v.std(0)).apply(v)
     else:
         e = v @ w[: v.shape[1]]
     return (e - e.mean()) / np.maximum(e.std(), 1e-12)

@@ -312,33 +312,50 @@ def simplex_fit(gram: np.ndarray, xty: np.ndarray):
 # ────────────────────────────────────────────────────────────────────
 
 
+def percentile_scale(E, center, scale) -> np.ndarray:
+    """``log Φ((E − center) / scale)``: each channel as an approximate percentile.
+
+    The synergy form needs channel values in (0, 1) for its powers. A channel
+    standardised by its mean and SD and passed through the normal CDF lands
+    there with no clipping, its extremes near 0 and 1, and a smooth dependence
+    on everything upstream — unlike min-max bounds, which are set by a single
+    entity each. Returned on the log scale, where the powers are a product and
+    a value far below the mean cannot round to exactly 0.
+    """
+    from scipy.special import log_ndtr
+
+    return log_ndtr((np.asarray(E, dtype=np.float64) - center)
+                    / np.maximum(scale, 1e-12))
+
+
 @dataclass
 class SynergyFit:
-    """Weights, powers and the train-fold min/max needed to rebuild the index."""
+    """Weights, powers and the train-fold mean / SD that rebuild the index."""
 
     w: np.ndarray
     p: np.ndarray
-    lo: np.ndarray
-    hi: np.ndarray
+    center: np.ndarray
+    scale: np.ndarray
 
     def apply(self, E: np.ndarray) -> np.ndarray:
-        z = np.clip((E - self.lo) / (self.hi - self.lo + 1e-12), 0.0, 1.0)
-        nc = z.shape[1]
-        out = (z ** self.p) @ self.w[:nc]
+        logz = percentile_scale(E, self.center, self.scale)
+        nc = logz.shape[1]
+        out = np.exp(logz * self.p) @ self.w[:nc]
         for k, (i, j) in enumerate(_pairs(nc)):
-            out = out + self.w[nc + k] * z[:, i] * z[:, j]
+            out = out + self.w[nc + k] * np.exp(logz[:, i] + logz[:, j])
         return out
 
 
 def fit_synergy(E: np.ndarray, y: np.ndarray, restarts: int = 2) -> SynergyFit:
     """Simplex weights over mains + pairwise interactions, plus main powers.
 
-    Powers need non-negative inputs, so the channel values are min-max scaled
-    on the training fold before the exponent is applied.
+    Each channel enters as its approximate percentile (:func:`percentile_scale`)
+    with the mean and SD taken on the training fold, so a held-out row is
+    scaled by the same curve and never clipped.
     """
     nc = E.shape[1]
     nw = nc + len(_pairs(nc))
-    lo, hi = E.min(0), E.max(0)
+    center, scale = E.mean(0), E.std(0)
 
     def unpack(th):
         ex = np.exp(th[:nw] - th[:nw].max())
@@ -348,7 +365,7 @@ def fit_synergy(E: np.ndarray, y: np.ndarray, restarts: int = 2) -> SynergyFit:
 
     def neg(th):
         w, p = unpack(th)
-        e = SynergyFit(w, p, lo, hi).apply(E)
+        e = SynergyFit(w, p, center, scale).apply(E)
         s = e.std()
         if s < 1e-12:
             return 1e9
@@ -365,7 +382,7 @@ def fit_synergy(E: np.ndarray, y: np.ndarray, restarts: int = 2) -> SynergyFit:
         if best is None or r.fun < best.fun:
             best = r
     w, p = unpack(best.x)
-    return SynergyFit(w, p, lo, hi)
+    return SynergyFit(w, p, center, scale)
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -1101,16 +1118,15 @@ def fit(E, y, *, form="linear", radii=None, stats=None, radius_mask=None,
         else:
             p = numpyro.sample(
                 "p", dist.Uniform(_POWER_LO, _POWER_HI).expand([nc]).to_event(1))
-            lo, hi = v.min(0), v.max(0)
-            z = jnp.clip((v - lo) / (hi - lo + 1e-12), 0.0, 1.0)
-            # ``z ** p`` has an infinite derivative in z and a NaN one in p at
-            # z = 0, which every channel's minimum hits exactly. The inner
-            # ``where`` keeps the log finite so the gradient there is zero.
-            pos = z > 0
-            zp = jnp.where(pos, jnp.exp(p * jnp.log(jnp.where(pos, z, 1.0))), 0.0)
-            e = zp @ w[:nc]
+            # Each channel as an approximate percentile, Φ of its standardised
+            # value, on the log scale (see ``percentile_scale``). Mean and SD
+            # use every entity, so the scaling moves smoothly with the kernel
+            # and aggregator; z never reaches 0, so ``z ** p`` stays smooth.
+            u = (v - v.mean(0)) / jnp.maximum(v.std(0), 1e-9)
+            logz = jax.scipy.special.log_ndtr(u)
+            e = jnp.exp(logz * p) @ w[:nc]
             for k, (i, j) in enumerate(_pairs(nc)):
-                e = e + w[nc + k] * z[:, i] * z[:, j]
+                e = e + w[nc + k] * jnp.exp(logz[:, i] + logz[:, j])
         e = (e - e.mean()) / jnp.maximum(e.std(), 1e-9)
         beta = numpyro.sample("beta", dist.Normal(0.0, 1.0))
         sigma = numpyro.sample("sigma", dist.HalfNormal(2.0))
