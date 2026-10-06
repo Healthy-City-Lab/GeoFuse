@@ -45,25 +45,22 @@ def _stub_engine(n=300, seed=0):
         X, np.asarray(RADII), list(STATS), ["ndvi", "gvi"], static)
     eng._preaggr_radii = lambda: (list(RADII), list(RADII))
     eng._sweep_objective = lambda metric: None
-    eng._params_from_sweep = types.MethodType(
-        MetricFusionEngine._params_from_sweep, eng)
+    for name in ("_params_from_sweep", "_index_layout"):
+        setattr(eng, name, types.MethodType(getattr(MetricFusionEngine, name), eng))
     return eng
 
 
 class TestFitBayesianIndexWiring(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls._real_workers = parallel.process_worker_count
+        cls.addClassCleanup(setattr, parallel, "process_worker_count",
+                            parallel.process_worker_count)
         parallel.process_worker_count = lambda *a, **k: 1
         cls.params = MetricFusionEngine.fit_bayesian_index(
             _stub_engine(), "r2", sweep_splits=3, reps=1, shuffles=2,
             gain_splits=2, gain_perm=2, null_runs=2, null_reselect_form=True,
             draws=120, warmup=120, chains=1, radius_kernel="dirichlet",
         )
-
-    @classmethod
-    def tearDownClass(cls):
-        parallel.process_worker_count = cls._real_workers
 
     def test_the_bundle_carries_every_stage(self):
         for key in ("__sweep__", "__posterior__", "__discovery__",
@@ -118,7 +115,8 @@ def _retune_stub(n=600, seed=3):
         X, np.asarray(RADII), ["mean"], ["ndvi", "gvi"], static)
     eng._preaggr_radii = lambda: (list(RADII), list(RADII))
     eng._sweep_objective = lambda metric: None
-    for name in ("_params_from_sweep", "fit_bayesian_index", "retune_concordance"):
+    for name in ("_params_from_sweep", "_index_layout", "fit_bayesian_index",
+                 "retune_concordance"):
         setattr(eng, name, types.MethodType(getattr(MetricFusionEngine, name), eng))
     return eng
 
@@ -128,7 +126,8 @@ class TestRetuneOnAControl(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls._real_workers = parallel.process_worker_count
+        cls.addClassCleanup(setattr, parallel, "process_worker_count",
+                            parallel.process_worker_count)
         parallel.process_worker_count = lambda *a, **k: 1
         cls.eng = _retune_stub()
         kw = dict(forms=("linear",), sweep_splits=3, draws=150, warmup=150,
@@ -140,10 +139,6 @@ class TestRetuneOnAControl(unittest.TestCase):
         cls.formula_before = cls.eng.cgi_formula
         cls.retune = cls.eng.retune_concordance(
             cls.target, "r2", radius_kernel="dirichlet", **kw)
-
-    @classmethod
-    def tearDownClass(cls):
-        parallel.process_worker_count = cls._real_workers
 
     def test_the_control_concentrates_ndvi_near_the_confounded_rung(self):
         ndvi = self.retune["grip"]["channels"]["ndvi"]
