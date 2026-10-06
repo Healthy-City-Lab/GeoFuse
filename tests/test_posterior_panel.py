@@ -381,6 +381,49 @@ class TestAggregatorVerdictForOlderBundles(unittest.TestCase):
         self.assertNotIn("No aggregator is distinguishable", out)
 
 
+class TestFormChoiceIsReported(unittest.TestCase):
+    """Where the form was chosen, and what choosing it on test rows would read."""
+
+    def setUp(self):
+        self._real_st = fusion_tab.st
+        self.rec = _Recorder()
+        fusion_tab.st = self.rec
+
+    def tearDown(self):
+        fusion_tab.st = self._real_st
+
+    def _render(self, summary):
+        fusion_tab._render_posterior_diagnostics(summary, "DCOR")
+        return self.rec.text()
+
+    def test_the_gain_panel_names_the_training_choice_and_the_optimistic_max(self):
+        s = _summary()
+        s["holdout_gain"].update(
+            form_counts={"linear": 15, "synergy": 5},
+            cgi_max_over_forms_optimistic=2.6,
+        )
+        out = self._render(s)
+        self.assertIn("`linear` 15, `synergy` 5", out)
+        self.assertIn("2.600 - optimistic", out)
+
+    def test_the_discovery_caption_counts_the_chosen_forms(self):
+        s = _summary()
+        s["discovery"].update(form_counts={"linear": 50, "synergy": 10},
+                              chosen_test_t=2.35)
+        out = self._render(s)
+        self.assertIn("inner splits of its training rows", out)
+        self.assertIn("2.350", out)
+
+    def test_the_sweep_names_its_selection_maximum(self):
+        out = self._render(_summary(sweep_selection_score=2.9))
+        self.assertIn("grid maximum the columns were picked on was 2.900", out)
+
+    def test_older_bundles_without_the_new_keys_still_render(self):
+        out = self._render(_summary())
+        self.assertNotIn("optimistic, because", out)
+        self.assertNotIn("inner splits of its training rows", out)
+
+
 class TestCovariateAxisOrdering(unittest.TestCase):
     """Numerics first, then each categorical's levels in value order.
 

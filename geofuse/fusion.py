@@ -3394,6 +3394,7 @@ class MetricFusionEngine:
             "picked": [list(p) for p in res.picked],
             "form": res.form,
             "score": res.score,
+            "selection_score": res.selection_score,
             "form_scores": res.form_scores,
             "one_se_picked": [
                 list(p) for p in bayesian_index._decode(
@@ -7207,8 +7208,8 @@ class MetricFusionEngine:
             "n": train_val_n,
         }
         # Held-out slice: the sweep's mean score for the winning configuration
-        # across its splits. Scored on covariate-residualised rows, so there is
-        # no raw equivalent at this level.
+        # and form, on fresh splits of the pool. Scored on covariate-
+        # residualised rows, so there is no raw equivalent at this level.
         sweep_info = params.get("__sweep__") if isinstance(params, dict) else None
         cell_median = (sweep_info or {}).get("score")
         out["val"] = {

@@ -56,6 +56,11 @@ FORMS: tuple[str, ...] = ("linear", "synergy")
 # Powers on the main terms of the synergy form, as in the source paper's range.
 _POWER_LO, _POWER_HI = 0.2, 1.0
 
+# Form choice runs on inner splits of the rows it is given, on a seed stream
+# offset from the outer splits so the two never share a partition.
+_FORM_INNER_SPLITS = 5
+_FORM_SEED_OFFSET = 10_000
+
 
 # ────────────────────────────────────────────────────────────────────
 # Data preparation
@@ -410,13 +415,14 @@ class SweepResult:
     columns: tuple[int, ...]          # chosen flat column per channel
     picked: tuple[tuple[int, str], ...]   # (radius_m, stat) per channel
     form: str
-    score: float                      # mean held-out |t| of the pick
+    score: float                      # chosen form at the pick, fresh splits
     surface: np.ndarray = field(repr=False)   # (splits, combos)
     combos: list = field(repr=False)
     one_se_columns: tuple[int, ...] = ()
     winner_counts: dict = field(default_factory=dict, repr=False)
     boundary_hit: tuple[str, ...] = ()
     form_scores: dict = field(default_factory=dict)
+    selection_score: float = float("nan")   # grid max on the selection splits
 
 
 def _decode(columns, n_radii, n_stats, radii, stats):
@@ -432,10 +438,12 @@ def sweep(X, radii, stats, y, *, channels, channel_index, radius_idx=None,
           objective=None, rescore_top=50, cancel_check=None):
     """Exhaustive grid over (radius, stat) per channel, then over the form.
 
-    The linear grid is solved in closed form and swept exhaustively. The
-    synergy form is then fitted at the linear pick's columns and kept only if
-    it scores better held-out; a full synergy grid would need the Gram matrix
-    rebuilt per power combination for no measured benefit.
+    The linear grid is solved in closed form and swept exhaustively. Every
+    requested form is then scored at the linear pick's columns on a fresh set
+    of splits and the best one is kept; a full synergy grid would need the Gram
+    matrix rebuilt per power combination for no measured benefit. ``score`` is
+    the chosen form's fresh-split score, ``selection_score`` the grid maximum
+    the columns were picked on.
 
     ``objective`` makes the job's own metric decide the winner. The Gram sweep
     ranks every candidate by a correlation t, which is what makes an exhaustive
@@ -505,23 +513,28 @@ def sweep(X, radii, stats, y, *, channels, channel_index, radius_idx=None,
     edge = {int(radii[0]), int(radii[-1])}
     boundary = tuple(c for (r, _), c in zip(picked, channels) if r in edge)
 
-    # Form selection at the picked columns, scored on the same splits.
-    form_scores = {"linear": float(mean[best])}
-    chosen_form, chosen_score = "linear", float(mean[best])
-    if "synergy" in forms and len(channels) > 1:
-        syn = _score_form_at(flat[:, list(combos[best])], y, "synergy",
-                             splits=splits, frac=frac, seed=seed,
-                             workers=workers, objective=objective,
-                             cancel_check=cancel_check)
-        form_scores["synergy"] = syn
-        if syn > chosen_score:
-            chosen_form, chosen_score = "synergy", syn
+    # Form selection at the picked columns, every form scored on fresh splits.
+    # The grid winner's own score is a maximum over every combination on the
+    # selection splits, so it cannot be compared with a form scored once.
+    candidates = eligible_forms(forms, len(channels))
+    form_scores = {}
+    for form in candidates:
+        form_scores[form] = _score_form_at(
+            flat[:, list(combos[best])], y, form, splits=splits, frac=frac,
+            seed=seed + _FORM_SEED_OFFSET, workers=workers,
+            objective=objective, cancel_check=cancel_check,
+        )
+    chosen_form = candidates[0]
+    for form in candidates[1:]:
+        if form_scores[form] > form_scores[chosen_form]:
+            chosen_form = form
 
     return SweepResult(
         channels=tuple(channels), columns=tuple(combos[best]), picked=picked,
-        form=chosen_form, score=chosen_score, surface=surface, combos=combos,
-        one_se_columns=one_se, winner_counts=counts, boundary_hit=boundary,
-        form_scores=form_scores,
+        form=chosen_form, score=form_scores[chosen_form], surface=surface,
+        combos=combos, one_se_columns=one_se, winner_counts=counts,
+        boundary_hit=boundary, form_scores=form_scores,
+        selection_score=float(mean[best]),
     )
 
 
@@ -588,6 +601,38 @@ def _score_form_at(E, y, form, *, splits, frac, seed, workers=None,
     tasks = [(E, y, form, seed + s, frac) for s in range(splits)]
     n_workers = workers or parallel.process_worker_count(len(tasks))
     return float(np.mean(_map(_form_split, tasks, n_workers, cancel_check)))
+
+
+def eligible_forms(forms, n_channels: int) -> tuple[str, ...]:
+    """The requested forms that apply to ``n_channels``, in request order.
+
+    Synergy needs at least two channels to have a pair term; a single channel
+    is always linear.
+    """
+    out = tuple(f for f in forms if f == "linear" or n_channels > 1)
+    return out or ("linear",)
+
+
+def choose_form(E, y, forms, *, seed, splits=_FORM_INNER_SPLITS, frac=0.25):
+    """The form with the best mean held-out |t| on inner splits of ``E, y``.
+
+    Callers pass training rows only, so an outer held-out row never votes on
+    the form it is then used to score. Training |t| on its own cannot decide:
+    synergy has more parameters and wins in-sample. Ties go to the earlier form
+    in ``forms``. Returns ``(form, {form: inner score})``.
+    """
+    forms = eligible_forms(forms, E.shape[1])
+    if len(forms) == 1:
+        return forms[0], {}
+    scores = {
+        f: _score_form_at(E, y, f, splits=splits, frac=frac, seed=seed, workers=1)
+        for f in forms
+    }
+    best = forms[0]
+    for f in forms[1:]:
+        if scores[f] > scores[best]:
+            best = f
+    return best, scores
 
 
 def build_index(E_train, y_train, form):
@@ -1022,7 +1067,8 @@ def _discovery_shuffle(task):
             "test_t": _tstat(apply_fn(E[te]), y[te]),
             "weights": np.asarray(params["weights"]).tolist(),
         }
-    out["form"] = max(forms, key=lambda f: out[f]["test_t"])
+    out["form"], out["form_inner"] = choose_form(
+        E[tr], y[tr], forms, seed=seed + _FORM_SEED_OFFSET)
     return out
 
 
@@ -1037,6 +1083,7 @@ def repeated_discovery(X, radii, stats, y, *, channels, channel_index,
     n_radii, n_stats = X.shape[2], X.shape[3]
     if radius_idx is None:
         radius_idx = [list(range(n_radii))] * len(channels)
+    forms = eligible_forms(forms, len(channels))
     cols = candidate_columns(channel_index, radius_idx, n_radii, n_stats)
     flat = np.ascontiguousarray(X.reshape(len(X), -1))
 
@@ -1080,6 +1127,9 @@ def repeated_discovery(X, radii, stats, y, *, channels, channel_index,
                         sorted(picks.items(), key=lambda kv: -kv[1])},
         "distinct_picks": len(picks),
         "per_form": per_form,
+        "form_counts": {f: sum(r["form"] == f for r in res) for f in forms},
+        "chosen_test_t": (float(np.mean([r[r["form"]]["test_t"] for r in res]))
+                          if res else float("nan")),
     }
 
 
@@ -1125,7 +1175,13 @@ def _gain_split(task):
     for form in forms:
         apply_fn, _ = build_index(E[tr], y[tr], form)
         scores[form] = _tstat(apply_fn(E[te]), y[te])
-    out["cgi"] = max(scores.values())
+    # The form is chosen on the training rows; the held-out score of every
+    # form stays as a diagnostic, and their maximum is labelled optimistic.
+    form, _ = choose_form(E[tr], y[tr], forms, seed=seed + _FORM_SEED_OFFSET)
+    out["cgi"] = scores[form]
+    out["cgi_form"] = form
+    out["cgi_by_form"] = scores
+    out["cgi_max_over_forms_optimistic"] = max(scores.values())
 
     # Best standalone chosen on TRAIN. Choosing it on the held-out scores
     # selects on the test rows and inflates the comparator.
@@ -1140,10 +1196,16 @@ def _gain_split(task):
 def holdout_gain(X, y, *, channels, channel_index, radius_idx=None,
                  forms=FORMS, splits=20, perm=100, frac=0.25, seed=0,
                  workers=None, cancel_check=None):
-    """Composite vs each standalone, with a permutation null on the *gain*."""
+    """Composite vs each standalone, with a permutation null on the *gain*.
+
+    Both sides make their choices on training rows: the standalone channel and
+    the composite's form alike. The permuted runs repeat the same procedure, so
+    the null prices in the form choice as well.
+    """
     n_radii, n_stats = X.shape[2], X.shape[3]
     if radius_idx is None:
         radius_idx = [list(range(n_radii))] * len(channels)
+    forms = eligible_forms(forms, len(channels))
     cols = candidate_columns(channel_index, radius_idx, n_radii, n_stats)
     flat = np.ascontiguousarray(X.reshape(len(X), -1))
 
@@ -1188,6 +1250,11 @@ def holdout_gain(X, y, *, channels, channel_index, radius_idx=None,
         ),
         "gain_won": int((g > 0).sum()),
         "splits": splits,
+        "cgi_max_over_forms_optimistic": float(np.mean(
+            [r["cgi_max_over_forms_optimistic"] for r in obs])),
+        "cgi_by_form": {f: float(np.mean([r["cgi_by_form"][f] for r in obs]))
+                        for f in forms},
+        "form_counts": {f: sum(r["cgi_form"] == f for r in obs) for f in forms},
     }
     for ci, name in enumerate(channels):
         out[f"standalone_{name}"] = float(np.mean([r[f"ch{ci}"] for r in obs]))

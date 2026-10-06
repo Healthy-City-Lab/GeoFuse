@@ -743,6 +743,7 @@ def _posterior_summary(params: dict) -> dict:
         "form": sweep.get("form"),
         "form_scores": sweep.get("form_scores", {}),
         "sweep_score": sweep.get("score"),
+        "sweep_selection_score": sweep.get("selection_score"),
         "one_se_picked": sweep.get("one_se_picked"),
         "boundary_hit": sweep.get("boundary_hit", []),
         "n_candidates": sweep.get("n_candidates"),

@@ -599,7 +599,8 @@ class TestPartialCoverageDoesNotPoisonTheReport(unittest.TestCase):
         def fake_map(fn, tasks, n_workers, cancel_check=None):
             out = real_map(fn, tasks, 1, cancel_check)
             for r in out:
-                r["gain"] = float("nan")
+                if isinstance(r, dict):
+                    r["gain"] = float("nan")
             return out
 
         X, y = self._cube()
@@ -728,6 +729,87 @@ class TestRankSafeResidualisation(unittest.TestCase):
         self.assertEqual(q.shape, (50, 2))
         np.testing.assert_allclose(q.T @ q, np.eye(2), atol=1e-12)
         np.testing.assert_allclose(q @ (q.T @ Z), Z, atol=1e-10)
+
+
+class TestHonestFormSelection(unittest.TestCase):
+    """The form must be chosen without looking at the rows that score it.
+
+    Picking the better form on the held-out rows is a winner's curse over
+    forms; comparing synergy against the linear grid's own maximum stacks the
+    comparison in linear's favour. Both are what these tests rule out.
+    """
+
+    @staticmethod
+    def _cube(truth, n=1500, seed=0):
+        """Linear truth on z-scored channels; synergy truth inside its family.
+
+        The synergy form works on min-max scaled channels, so its truth is built
+        the same way: a pair-weighted product of two [0, 1] channels.
+        """
+        rng = np.random.default_rng(seed)
+        if truth == "synergy":
+            X = rng.random(size=(n, 2, 1, 1))
+            t = bi.SynergyFit(np.array([0.1, 0.1, 0.8]), np.ones(2),
+                              np.zeros(2), np.ones(2)).apply(X[:, :, 0, 0])
+            y = 0.8 * (t - t.mean()) / t.std() + rng.normal(size=n)
+        else:
+            X = rng.normal(size=(n, 2, 1, 1))
+            y = 0.25 * X[:, 0, 0, 0] + 0.25 * X[:, 1, 0, 0] + rng.normal(size=n)
+        return bi.prep(X, y, None)[::-1]
+
+    def _sweep(self, Xr, yr, **kw):
+        return bi.sweep(Xr, np.array([500.0]), ["mean"], yr, channels=("a", "b"),
+                        channel_index=(0, 1), splits=8, workers=1, **kw)
+
+    def test_a_null_outcome_shows_no_systematic_gain(self):
+        rng = np.random.default_rng(21)
+        X = rng.normal(size=(800, 2, 2, 2))
+        yr, Xr = bi.prep(X, rng.normal(size=800), None)
+        gain = bi.holdout_gain(Xr, yr, channels=("a", "b"), channel_index=(0, 1),
+                               splits=30, perm=30, workers=1)
+        self.assertLess(abs(gain["gain"] - gain["gain_null_mean"]), 0.5)
+        self.assertLessEqual(gain["cgi"], gain["cgi_max_over_forms_optimistic"])
+        self.assertEqual(sum(gain["form_counts"].values()), 30)
+        self.assertEqual(set(gain["cgi_by_form"]), {"linear", "synergy"})
+
+    def test_linear_truth_does_not_pull_in_synergy(self):
+        forms = [self._sweep(*self._cube("linear", seed=s)).form for s in range(6)]
+        self.assertLessEqual(forms.count("synergy"), 2, forms)
+
+    def test_synergy_truth_is_recognised(self):
+        forms = [self._sweep(*self._cube("synergy", seed=s)).form for s in range(4)]
+        self.assertEqual(forms.count("synergy"), 4, forms)
+
+    def test_the_forms_are_compared_on_fresh_splits(self):
+        res = self._sweep(*self._cube("linear"))
+        self.assertEqual(set(res.form_scores), {"linear", "synergy"})
+        self.assertEqual(res.score, res.form_scores[res.form])
+        self.assertNotAlmostEqual(res.form_scores["linear"], res.selection_score)
+
+    def test_only_requested_forms_compete(self):
+        res = self._sweep(*self._cube("linear"), forms=("synergy",))
+        self.assertEqual(res.form, "synergy")
+        self.assertEqual(set(res.form_scores), {"synergy"})
+
+    def test_a_single_channel_is_always_linear(self):
+        self.assertEqual(bi.eligible_forms(("synergy",), 1), ("linear",))
+        self.assertEqual(bi.eligible_forms(bi.FORMS, 2), bi.FORMS)
+
+    def test_discovery_chooses_on_training_rows(self):
+        Xr, yr = self._cube("synergy", n=1200)
+        out = bi.repeated_discovery(
+            Xr, np.array([500.0]), ["mean"], yr, channels=("a", "b"),
+            channel_index=(0, 1), reps=1, shuffles=4, workers=1,
+        )
+        self.assertEqual(sum(out["form_counts"].values()), out["n_results"])
+        self.assertGreaterEqual(out["form_counts"]["synergy"], 3)
+        self.assertTrue(np.isfinite(out["chosen_test_t"]))
+
+    def test_choose_form_breaks_ties_towards_the_first_form(self):
+        Xr, yr = self._cube("linear")
+        E = Xr.reshape(len(Xr), -1)
+        form, scores = bi.choose_form(E, yr, ("linear",), seed=0)
+        self.assertEqual((form, scores), ("linear", {}))
 
 
 class TestExposureResponseProjectionIsRankSafe(unittest.TestCase):

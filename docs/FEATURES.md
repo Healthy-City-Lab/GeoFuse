@@ -124,8 +124,14 @@ Nothing below is pre-specified.
   on independent reshuffles and the report says how often it landed on the same
   configuration. A low share means the surface is flat, not that the pick is
   wrong.
+- **The form is chosen without the rows that score it.** Once the columns are
+  picked, every requested form is scored on a fresh set of splits, so the
+  linear grid's best-of-many score never competes against a form scored once.
+  Inside the reproducibility and gain checks, each split chooses its form on
+  inner splits of its own training rows.
 - **Fusion has to earn itself.** The composite is compared against each channel
-  alone under the identical sweep, with a permutation null on the gain.
+  alone under the identical sweep, with a permutation null on the gain. Both
+  sides make their choices on training rows, and the permuted runs repeat them.
 - **Calibration is checked.** The procedure is re-run on permuted outcomes; the
   reported false-positive rate should sit near 5 %, and the panel says so when
   it does not.

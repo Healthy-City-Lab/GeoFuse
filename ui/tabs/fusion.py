@@ -3183,8 +3183,9 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
             "Held-out score",
             _fmt(summary.get("sweep_score"), 3),
             help=(
-                "Mean |t| of the winning candidate across the sweep's held-out "
-                "splits - the number the pick was made on."
+                "Mean |t| of the chosen form at the picked columns, on a fresh "
+                "set of held-out splits rather than the ones the columns were "
+                "picked on."
             ),
         )
     with c3:
@@ -3251,12 +3252,16 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
         )
 
     form_scores = summary.get("form_scores") or {}
+    selection = _num(summary.get("sweep_selection_score"))
     if len(form_scores) > 1:
         st.caption(
             "Form scores (held-out |t|): "
             + " - ".join(f"`{k}` {float(v):.3f}" for k, v in form_scores.items())
-            + ". Both forms are fitted on the same picked columns, so this "
-            "compares the functional form alone."
+            + ". Every form is fitted at the same picked columns and scored on "
+            "the same fresh splits, so this compares the functional form alone."
+            + (f" The grid maximum the columns were picked on was {selection:.3f}"
+               " - optimistic, being the best of every candidate on those "
+               "splits." if selection is not None else "")
         )
 
     # ── Posterior ───────────────────────────────────────────────
@@ -3401,11 +3406,19 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
                 width="stretch",
                 hide_index=True,
             )
+            form_counts = disc.get("form_counts") or {}
+            chosen_t = _num(disc.get("chosen_test_t"))
             st.caption(
                 "Averaged over every replicate. **Shrinkage** is train minus "
                 "held-out: the part of the in-sample fit that did not survive "
                 "to unseen rows. A form with a higher train score and a larger "
                 "shrinkage is overfitting, not winning."
+                + (" Each replicate chose its form on inner splits of its "
+                   "training rows ("
+                   + ", ".join(f"`{f}` {n}" for f, n in form_counts.items())
+                   + ")" + (f"; the chosen form's held-out |t| averaged "
+                            f"{chosen_t:.3f}" if chosen_t is not None else "")
+                   + "." if form_counts else "")
             )
             if any(_num(v.get("test_t")) is None for v in per_form.values()):
                 st.info(
@@ -3427,9 +3440,10 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
                 "Composite (held-out)",
                 _fmt(gain.get("cgi"), 3),
                 help=(
-                    "Mean held-out |t| of the fitted composite. Blank on runs "
-                    "recorded before uncovered entities were excluded from the "
-                    "search — a single one made this average undefined."
+                    "Mean held-out |t| of the fitted composite, its form chosen "
+                    "on each split's training rows. Blank on runs recorded "
+                    "before uncovered entities were excluded from the search — "
+                    "a single one made this average undefined."
                 ),
             )
         with g2:
@@ -3479,6 +3493,16 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
                 "held-out splits. Fusion is only justified when it wins on most "
                 "of them *and* the permutation p is small - otherwise report "
                 "the single channel, which is simpler and cheaper to collect."
+            )
+        form_counts = gain.get("form_counts") or {}
+        optimistic = _num(gain.get("cgi_max_over_forms_optimistic"))
+        if form_counts and optimistic is not None:
+            st.caption(
+                "Form chosen on training rows per split: "
+                + ", ".join(f"`{f}` {n}" for f, n in form_counts.items())
+                + f". Taking the better form on the held-out rows instead "
+                f"would read {optimistic:.3f} - optimistic, because it selects "
+                "on the rows it scores."
             )
 
     # ── Null calibration ────────────────────────────────────────
