@@ -457,6 +457,47 @@ class TestDistanceDecayPanel(unittest.TestCase):
         self.assertNotIn("R50 (m)", self._render(_grid()))
 
 
+class TestNegativeControlPanel(unittest.TestCase):
+    def setUp(self):
+        self._real_st = fusion_tab.st
+        self.rec = _Recorder()
+        fusion_tab.st = self.rec
+
+    def tearDown(self):
+        fusion_tab.st = self._real_st
+
+    @staticmethod
+    def _report(nonspecific):
+        ctl = {"beta": 0.04, "ci_low": 0.02, "ci_high": 0.06, "t": 4.0, "n": 48,
+               "delta": 0.01, "delta_ci_low": -0.02, "delta_ci_high": 0.04,
+               "nonspecific": nonspecific}
+        tgt = {"beta": 0.05, "ci_low": 0.03, "ci_high": 0.07, "t": 5.0, "n": 50}
+        return {"controls": ["grip"], "n_boot": 2000,
+                "nonspecific": ["grip"] if nonspecific else [],
+                "splits": {"test": {"target": tgt, "controls": {"grip": ctl}}}}
+
+    def test_a_nonspecific_control_is_tabled_and_warned_about(self):
+        fusion_tab._render_negative_controls(self._report(True))
+        out = self.rec.text()
+        self.assertIn("Negative controls", out)
+        self.assertIn("Held-out test", out)
+        self.assertIn("grip", out)
+        self.assertIn("cannot be told apart from the target", out)
+        self.assertIn("2000 resamples", out)
+
+    def test_a_specific_result_raises_no_warning(self):
+        fusion_tab._render_negative_controls(self._report(False))
+        self.assertNotIn("cannot be told apart", self.rec.text())
+
+    def test_nothing_is_drawn_without_controls(self):
+        fusion_tab._render_negative_controls(None)
+        self.assertEqual(self.rec.calls, [])
+
+    def test_a_longitudinal_skip_is_explained(self):
+        fusion_tab._render_negative_controls({"skipped": "longitudinal"})
+        self.assertIn("cross-sectional targets only", self.rec.text())
+
+
 class _MetricRecorder(_Recorder):
     """Also keeps each metric's value, which the base recorder drops."""
 

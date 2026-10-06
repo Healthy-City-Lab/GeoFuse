@@ -94,6 +94,7 @@ output_results/fusion/<YYYYMMDDTHHMMSS>__<short_job_id>/
     ├── exposure_response.csv           per-IQR effect, quantile gradient, linearity test
     ├── exposure_response_curve.csv     fitted curve, ready to plot
     ├── moderation.csv                  interaction test and simple slopes
+    ├── negative_controls.csv           specificity check against control outcomes
     ├── decline_terms.csv               greenspace-by-time terms, longitudinal only
     ├── mixedlm_metrics*.csv            all four mixed-effects metrics, longitudinal only
     ├── aic_bic.json                    CGI vs standalone verdict
@@ -155,6 +156,19 @@ matters because a column coded `1=Yes, 2=No` inverts every odds ratio.
 simple slope per moderator level, one row per interaction term, and a single
 joint p-value. Nominating a moderator does not adjust for it; add it as a
 covariate too if you want both.
+
+**`negative_controls.csv`** is written when negative-control outcomes were
+named. One row per study, split (`test` is the headline, `train_val` the
+reference) and outcome: the target first, then each control. `beta` is the
+covariate-adjusted slope of the outcome on the frozen composite, both in
+residual SD units, with its exact interval and `t`; `objective` is the job's own
+metric on that outcome. Control rows add `delta_vs_target`
+(|β target| − |β control|) with a paired bootstrap interval on the entities that
+have both outcomes, and `nonspecific`, which is true when the control's interval
+excludes zero while the difference's includes it: part of the tuned association
+is then shared with an outcome greenery should not cause. Standalone studies get
+the same rows, so the composite's specificity can be read against a single
+channel's.
 
 **`decline_terms.csv`** holds greenspace-by-time slopes, optionally decomposed
 into between-person and within-person components. A term that is not estimable

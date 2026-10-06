@@ -50,7 +50,11 @@ mismatched file is refused, and processed points are skipped.
 
 ### The Fusion form, in order
 
-1. **Target configuration.** Upload the outcome, pick the outcome columns.
+1. **Target configuration.** Upload the outcome, pick the outcome columns, and
+   optionally name **negative-control outcomes**: columns expected to share the
+   outcome's confounders but not to be caused by greenery, such as grip
+   strength for a cognitive outcome. They are never tuned on (cross-sectional
+   runs only).
 2. **Optimization setup.** Choose cross-sectional or mixed-effects
    (longitudinal). Longitudinal requires a date column. Cross-sectional can
    optionally use one to route each entity to a year-matched greenery file; the
@@ -84,6 +88,9 @@ automatically; there is no need to list them twice.
   outcomes with its exact 95 % interval. The default of 16 null refits is a
   quick check, and the panel says so; set **Null calibration fits** to at least
   100 before claiming calibration, and to 200 for a final, reported run.
+  With negative controls, each study also shows the frozen composite's slope on
+  the target and on every control, the paired difference, and a warning when a
+  control's association cannot be told apart from the target's.
 - **Covariate impact**, **channel collinearity**, **composite maps**,
   **mixed-effects metrics**, and an index of every file written.
 

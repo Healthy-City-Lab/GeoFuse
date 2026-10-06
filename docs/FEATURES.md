@@ -158,6 +158,13 @@ Nothing below is pre-specified.
 - Optional spatial-confounding adjustment (KS-AIC or Spatial+) and spatial block
   cross-validation, so geographic autocorrelation cannot inflate scores.
 - Optional collinearity check that drops redundant channels before a run.
+- **Negative-control outcomes.** Held-out scoring guards against chance, not
+  confounding. Name an outcome that shares the target's confounders but has no
+  causal path from greenery, and the finished composite, frozen as tuned, is
+  scored against it: slopes for the target and the control, their paired
+  difference with a bootstrap interval, and a flag when the two cannot be told
+  apart (Lipsitch, Tchetgen Tchetgen & Cohen 2010). The control never enters
+  the search, and standalone studies get the same check for comparison.
 - Longitudinal runs add wave fixed effects, on by default, and an optional
   neighbourhood or site column.
 

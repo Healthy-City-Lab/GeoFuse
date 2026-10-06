@@ -480,6 +480,7 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "covariate_columns",
     "covariate_types",
     "moderator_columns",
+    "negative_controls",
     "exposure_iqr",
     "standalone_channels",
     "longitudinal_spec_payload",
@@ -614,6 +615,9 @@ def _seed_fusion_form(p: dict) -> None:
     # so it cannot be recovered from the two lists above.
     st.session_state["fusion_moderator_columns"] = list(
         p.get("moderator_columns") or []
+    )
+    st.session_state["fusion_negative_controls"] = list(
+        p.get("negative_controls") or []
     )
     st.session_state["fusion_exposure_iqr"] = float(p.get("exposure_iqr") or 0.0)
 
@@ -4177,8 +4181,79 @@ def _render_study_detail(
     with st.expander("Final parameters (composite is built from these)"):
         st.json(final_params)
 
+    # ── Negative controls ───────────────────────────────────────
+    _render_negative_controls(study_view.get("negative_controls"))
+
     # ── Discovery diagnostics ───────────────────────────────────
     _render_posterior_diagnostics(summary, metric_name)
+
+
+def _render_negative_controls(report: dict | None) -> None:
+    """The frozen composite scored against each negative-control outcome.
+
+    A control shares the target's confounders but not a causal path from
+    greenery, so an association as large as the target's says the tuned one
+    is partly non-specific. Held-out split first; train+val for reference.
+    """
+    if not report:
+        return
+    st.markdown("**Negative controls**")
+    if report.get("skipped") == "longitudinal":
+        st.info(
+            "Negative controls are reported for cross-sectional targets only; "
+            "this longitudinal run did not score them."
+        )
+        return
+    splits = report.get("splits") or {}
+    for split, title in (("test", "Held-out test"), ("train_val", "Train+val")):
+        res = splits.get(split)
+        if not res:
+            continue
+        tgt = res.get("target") or {}
+        rows = [{
+            "Outcome": "Target",
+            "β (SD per SD)": _fmt(tgt.get("beta"), 3),
+            "95% CI": f"[{_fmt(tgt.get('ci_low'), 3)}, {_fmt(tgt.get('ci_high'), 3)}]",
+            "t": _fmt(tgt.get("t"), 2),
+            "n": tgt.get("n"),
+            "|β| target − |β| control": "-",
+            "Non-specific": "-",
+        }]
+        for name, c in (res.get("controls") or {}).items():
+            rows.append({
+                "Outcome": name,
+                "β (SD per SD)": _fmt(c.get("beta"), 3),
+                "95% CI": f"[{_fmt(c.get('ci_low'), 3)}, {_fmt(c.get('ci_high'), 3)}]",
+                "t": _fmt(c.get("t"), 2),
+                "n": c.get("n"),
+                "|β| target − |β| control": (
+                    f"{_fmt(c.get('delta'), 3)} [{_fmt(c.get('delta_ci_low'), 3)}, "
+                    f"{_fmt(c.get('delta_ci_high'), 3)}]"
+                ),
+                "Non-specific": "yes" if c.get("nonspecific") else "no",
+            })
+        st.caption(title)
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    flagged = report.get("nonspecific") or []
+    if flagged:
+        st.warning(
+            "On the held-out split, "
+            + ", ".join(f"`{n}`" for n in flagged)
+            + " carries an association whose size cannot be told apart from "
+            "the target's. Part of the tuned association is shared with an "
+            "outcome greenery should not cause - residual confounding or "
+            "selection, not only the pathway. Read the effect with that in mind."
+        )
+    st.caption(
+        "Each control is scored with the composite frozen as tuned; it never "
+        "entered the search. β is the covariate-adjusted slope with both sides "
+        "in residual SD units, with its exact OLS interval. The difference "
+        f"column is a paired bootstrap ({report.get('n_boot')} resamples) on the "
+        "entities that have both outcomes. **Non-specific** means the control's "
+        "interval excludes zero while the difference's interval includes it. "
+        "Compare against a standalone study's table to see whether the "
+        "composite is more or less specific than a single channel."
+    )
 
 
 def _render_cross_study_comparison(results_view: dict, metric_name: str) -> None:
@@ -4913,6 +4988,28 @@ def render(output_dir: str) -> None:
                         target_outcome_columns = list(
                             st.session_state.fusion_outcome_columns
                         )
+                        nc_options = [
+                            c for c in numeric_cols
+                            if c not in target_outcome_columns
+                        ]
+                        if target_outcome_columns and nc_options:
+                            _keep_valid(
+                                "fusion_negative_controls", nc_options, multi=True
+                            )
+                            st.multiselect(
+                                "Negative-control outcomes",
+                                options=nc_options,
+                                key="fusion_negative_controls",
+                                help=(
+                                    "Outcome expected to share confounders with "
+                                    "the target but not to be caused by greenery "
+                                    "(e.g. grip strength for cognitive outcomes). "
+                                    "Never tuned on: the finished composite is "
+                                    "scored against it to show how much of the "
+                                    "association is non-specific. "
+                                    "Cross-sectional runs only."
+                                ),
+                            )
                         if len(target_outcome_columns) > 1:
                             _default("fusion_multi_objective_run", False)
                             multi_objective_requested = st.checkbox(
@@ -5087,6 +5184,12 @@ def render(output_dir: str) -> None:
     covariate_columns = study_state["covariate_columns"]
     covariate_types = study_state.get("covariate_types") or {}
     moderator_columns_param = list(study_state.get("moderator_columns") or [])
+    # Picked in the target section, so read from state; a control cannot also
+    # be an outcome of this job.
+    negative_controls_param = [
+        c for c in (st.session_state.get("fusion_negative_controls") or [])
+        if c not in target_outcome_columns
+    ] if is_vector_target else []
     exposure_iqr_param = study_state.get("exposure_iqr")
     objective_metric = study_state["objective_metric"]
     test_size = study_state["test_size"]
@@ -5433,6 +5536,11 @@ def render(output_dir: str) -> None:
                     f"**NDVI buffers (m):** {ndvi_buffer_min_m} – {ndvi_buffer_max_m} "
                     f"(step {ndvi_buffer_step_m})"
                 )
+                if negative_controls_param:
+                    st.write(
+                        "**Negative controls:** "
+                        + ", ".join(f"`{c}`" for c in negative_controls_param)
+                    )
                 st.write(f"**Extent padding (m):** {buffer_extent_m}")
                 st.write(
                     f"**Discovery:** {channel_set_param}, form "
@@ -5493,6 +5601,7 @@ def render(output_dir: str) -> None:
                 "covariate_columns": list(covariate_columns or []),
                 "covariate_types": dict(covariate_types or {}),
                 "moderator_columns": list(moderator_columns_param),
+                "negative_controls": negative_controls_param,
                 "exposure_iqr": (
                     float(exposure_iqr_param) if exposure_iqr_param else None
                 ),

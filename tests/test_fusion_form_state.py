@@ -219,6 +219,15 @@ class TestEveryRecordedSettingIsRestored(unittest.TestCase):
         self.fusion._seed_fusion_form(_params(moderator_columns=[]))
         self.assertEqual(self.state["fusion_moderator_columns"], [])
 
+    def test_negative_controls_survive_a_re_run(self):
+        self.fusion._seed_fusion_form(_params(negative_controls=["grip"]))
+        self.assertEqual(self.state["fusion_negative_controls"], ["grip"])
+
+    def test_a_job_without_controls_clears_a_stale_pick(self):
+        self.state["fusion_negative_controls"] = ["height"]
+        self.fusion._seed_fusion_form(_params())
+        self.assertEqual(self.state["fusion_negative_controls"], [])
+
     def test_recorded_config_keys_reach_a_widget_or_a_named_handler(self):
         """Every key in the recorded config must have a restore route.
 
@@ -230,6 +239,7 @@ class TestEveryRecordedSettingIsRestored(unittest.TestCase):
             "covariate_columns",
             "covariate_types",
             "moderator_columns",
+            "negative_controls",
             "standalone_channels",
             "longitudinal_spec_payload",
             "target_display_name",
