@@ -338,7 +338,7 @@ def _write_fusion_outputs(
     if decline_terms and decline_terms.get("terms"):
         _emit_csv(f"decline_terms{sfx}.csv", [dict(r) for r in decline_terms["terms"]])
 
-    # ── exposure_response.csv (per-IQR, quartiles, non-linearity) ───
+    # ── exposure_response.csv (IQR, quartiles, non-linearity) ───
     # One tidy table rather than three files: the rows are all statements
     # about the same fitted exposure–response, and a reader comparing them
     # against a published table wants them side by side.

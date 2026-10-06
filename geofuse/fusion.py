@@ -7223,7 +7223,7 @@ class MetricFusionEngine:
             "n": train_val_n,
         }
 
-        # ── test: fresh evaluate_on_test with these params ───
+        # ── test: fresh evaluate_on_test with these params ──
         # ``evaluate_on_test`` returns the partial (covariate-adjusted)
         # score that the optimizer optimized; the raw equivalent is
         # produced by ``_score_data_subset`` on the test slice.
