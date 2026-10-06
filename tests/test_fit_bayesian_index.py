@@ -45,7 +45,7 @@ def _stub_engine(n=300, seed=0):
         X, np.asarray(RADII), list(STATS), ["ndvi", "gvi"], static)
     eng._preaggr_radii = lambda: (list(RADII), list(RADII))
     eng._sweep_objective = lambda metric: None
-    for name in ("_params_from_sweep", "_index_layout", "_synergy_scaling"):
+    for name in ("_params_from_sweep", "_index_layout", "_channel_scaling"):
         setattr(eng, name, types.MethodType(getattr(MetricFusionEngine, name), eng))
     return eng
 
@@ -85,6 +85,11 @@ class TestFitBayesianIndexWiring(unittest.TestCase):
         self.assertEqual(sum(null["form_counts"].values()), 2)
         self.assertTrue(null["imprecise"])
         self.assertIn("rate_ci_high", null)
+
+    def test_the_composite_scaling_is_recorded_for_either_form(self):
+        for ch in ("ndvi", "gvi"):
+            self.assertIn(f"{ch}_center", self.params)
+            self.assertGreater(self.params[f"{ch}_scale"], 0.0)
 
     def test_weights_land_on_the_formula_keys(self):
         from geofuse import cgi_formulas
@@ -145,7 +150,7 @@ def _retune_stub(n=600, seed=3):
         X, np.asarray(RADII), ["mean"], ["ndvi", "gvi"], static)
     eng._preaggr_radii = lambda: (list(RADII), list(RADII))
     eng._sweep_objective = lambda metric: None
-    for name in ("_params_from_sweep", "_index_layout", "_synergy_scaling",
+    for name in ("_params_from_sweep", "_index_layout", "_channel_scaling",
                  "fit_bayesian_index", "retune_concordance"):
         setattr(eng, name, types.MethodType(getattr(MetricFusionEngine, name), eng))
     return eng

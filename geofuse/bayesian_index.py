@@ -1214,6 +1214,36 @@ def rung_sd_from(column_sd, channel_index, stats) -> np.ndarray:
         return np.nanmean(sd, axis=-1)
 
 
+def composite_scaling(X, column_sd, *, channels, channel_index, radii, stats,
+                      picked) -> dict:
+    """``<channel>_center`` / ``<channel>_scale`` for building the composite.
+
+    The model divides every column by its covariate-adjusted SD (``prep``'s
+    ``column_sd``) and fits the weights, the kernel and the form on that scale.
+    A composite built from the raw channel values at the projected cell
+    reproduces it when each channel is centred on its mean and divided by that
+    same SD: the linear form's weights then carry exactly the shares the
+    posterior estimated, and the synergy form's curve keeps the slope the model
+    fitted. ``X`` is the raw tensor, ``picked`` one ``(radius, stat)`` per
+    channel.
+    """
+    out: dict[str, float] = {}
+    rungs = [int(round(float(r))) for r in radii]
+    sd_all = np.asarray(column_sd, dtype=np.float64)
+    for ch, ci, (radius, stat) in zip(channels, channel_index, picked):
+        if int(radius) not in rungs or stat not in stats:
+            continue
+        ri, si = rungs.index(int(radius)), list(stats).index(stat)
+        vals = np.asarray(X[:, ci, ri, si], dtype=np.float64)
+        vals = vals[np.isfinite(vals)]
+        sd = float(sd_all[ci, ri, si])
+        if vals.size < 2 or not np.isfinite(sd) or sd <= 0:
+            continue
+        out[f"{ch}_center"] = float(vals.mean())
+        out[f"{ch}_scale"] = sd
+    return out
+
+
 def grid_posterior(Xr, yr, *, channels, channel_index, radii, stats, radius_idx,
                    form, picked, radius_kernel="lognormal",
                    aggregator="dirichlet", draws=800, warmup=800, chains=4,

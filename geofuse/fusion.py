@@ -393,8 +393,8 @@ class MetricFusionEngine:
         # When True, each channel is min-max scaled to [0, 1] (per-channel
         # bounds fixed at prepare time from the predictor distribution only —
         # no outcome leakage) before the composite is formed. Default False
-        # keeps raw-channel composites. The synergy form applies its own
-        # percentile scaling on top, with center and scale recorded on
+        # keeps raw-channel composites. A discovered composite then centres and
+        # scales each channel with the recorded center and scale, carried onto
         # whichever scale the channels arrive in.
         self.normalize_channels: bool = bool(normalize_channels)
         # Per-channel (lo, hi) min-max bounds, filled by prepare_fusion_data.
@@ -3403,9 +3403,12 @@ class MetricFusionEngine:
             )
 
         params = self._params_from_sweep(res, post, index_channels)
-        if res.form == "synergy" and self._active_greenery_channel == "cgi":
-            params.update(self._synergy_scaling(
-                X, radii, stats, tensor_channels, index_channels, post.picked))
+        # The composite path rebuilds the index from raw channel values, so it
+        # needs the center and scale the model's weights and form refer to.
+        if self._active_greenery_channel == "cgi":
+            params.update(self._channel_scaling(
+                X, radii, stats, tensor_channels, index_channels, post.picked,
+                prep_info["column_sd"]))
         params["__selection_method__"] = "bayesian_index"
         params["__sweep__"] = {
             "picked": [list(p) for p in res.picked],
@@ -3510,32 +3513,27 @@ class MetricFusionEngine:
 
         return objective
 
-    def _synergy_scaling(self, X, radii, stats, tensor_channels, index_channels,
-                         picked) -> dict:
-        """``<channel>_center`` / ``<channel>_scale`` for the synergy composite.
+    def _channel_scaling(self, X, radii, stats, tensor_channels, index_channels,
+                         picked, column_sd) -> dict:
+        """``<channel>_center`` / ``<channel>_scale`` for the composite path.
 
-        The synergy form reads each channel as ``Φ((x − center) / scale)``. The
-        composite path applies it to aggregated channel values, so the center
-        and scale are the mean and SD of those values at the cell the composite
-        is built from, over the train+val entities and after
-        ``normalize_channels`` when it is on. Recorded once, they make every map
-        and test score apply the same curve.
+        :func:`bayesian_index.composite_scaling` gives the mean and the
+        covariate-adjusted SD of each channel at the cell the composite is built
+        from — the scale the model fitted on. With ``normalize_channels`` on,
+        the channels reach the formula min-max scaled, so the center and scale
+        are carried onto that scale.
         """
-        out: dict[str, float] = {}
-        rungs = [int(round(float(r))) for r in radii]
-        for ch, (radius, stat) in zip(index_channels, picked):
-            if int(radius) not in rungs or stat not in stats:
-                continue
-            vals = np.asarray(
-                X[:, list(tensor_channels).index(ch), rungs.index(int(radius)),
-                  list(stats).index(stat)], dtype=np.float64)
-            vals = vals[np.isfinite(vals)]
-            if vals.size < 2:
-                continue
-            if getattr(self, "normalize_channels", False):
-                vals = np.asarray(self._normalize_channels({ch: vals})[ch])
-            out[f"{ch}_center"] = float(vals.mean())
-            out[f"{ch}_scale"] = float(vals.std())
+        out = bayesian_index.composite_scaling(
+            X, column_sd, channels=index_channels,
+            channel_index=[list(tensor_channels).index(c) for c in index_channels],
+            radii=radii, stats=stats, picked=picked,
+        )
+        if getattr(self, "normalize_channels", False) and self._channel_minmax:
+            for ch in index_channels:
+                lo, hi = self._channel_minmax.get(ch, (0.0, 1.0))
+                if f"{ch}_center" in out and hi > lo:
+                    out[f"{ch}_center"] = (out[f"{ch}_center"] - lo) / (hi - lo)
+                    out[f"{ch}_scale"] = out[f"{ch}_scale"] / (hi - lo)
         return out
 
     def _params_from_sweep(self, res, post, index_channels) -> dict:

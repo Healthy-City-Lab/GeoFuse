@@ -9,18 +9,20 @@ Formulas
 --------
 
 ``weighted_average`` (legacy default)
-    Three weights on min-max-normalized channel values. Backward-compatible
-    with all pre-overhaul trials, which recorded ``ndvi_weight`` /
-    ``veg_weight`` / ``terrain_weight`` as integers summing to 100. The
-    formula renormalizes by their total so older trials replay identically.
+    Three weights on standardised channels, ``(x − center) / scale``, with the
+    center and scale the discovery recorded (``<channel>_center`` /
+    ``<channel>_scale``: each channel's mean and covariate-adjusted SD). That is
+    the scale the posterior estimated the weights on, so the composite carries
+    exactly the shares it reported. Params recorded without a center and scale
+    replay as fitted, on the raw channel values. Weights are recorded as
+    integers summing to 100; the formula renormalizes by their total.
 
 ``synergy``
     Three-metric generalisation of Wang et al. 2026 (doi:10.3390/rs18010009),
     paper-faithful in pattern: powers on the **main** terms only, plain
     products elsewhere. Each channel enters as its approximate percentile,
-    ``Φ((x − center) / scale)``, with the center and scale the discovery
-    recorded (``<channel>_center`` / ``<channel>_scale``) — the curve the sweep
-    and the posterior fitted::
+    ``Φ((x − center) / scale)``, with the same recorded center and scale as the
+    weighted average — the curve the sweep and the posterior fitted::
 
         CGI = w_N · NDVI^pN + w_V · Veg^pV + w_T · Ter^pT
             + w_NV · NDVI · Veg
@@ -150,11 +152,28 @@ def _component_dtype(components: ComponentDict) -> np.dtype:
     )
 
 
+def standardised_channel(values, params: dict, channel: str, dt) -> np.ndarray:
+    """One channel on the scale its weight was estimated on.
+
+    With ``<channel>_center`` and ``<channel>_scale`` recorded the value is
+    ``(x − center) / scale``; params recorded without them replay on the raw
+    values, as they were fitted.
+    """
+    center = params.get(f"{channel}_center")
+    scale = params.get(f"{channel}_scale")
+    arr = np.asarray(values, dtype=dt)
+    if center is None or scale is None:
+        return arr
+    return ((arr - dt.type(center)) / dt.type(max(float(scale), 1e-12))).astype(
+        dt, copy=False
+    )
+
+
 def _compute_weighted_average(params: dict, components: ComponentDict) -> np.ndarray:
     dt = _component_dtype(components)
-    veg = np.asarray(components["veg"], dtype=dt)
-    ter = np.asarray(components["terrain"], dtype=dt)
-    ndvi = np.asarray(components["ndvi"], dtype=dt)
+    veg = standardised_channel(components["veg"], params, "veg", dt)
+    ter = standardised_channel(components["terrain"], params, "terrain", dt)
+    ndvi = standardised_channel(components["ndvi"], params, "ndvi", dt)
     wv = float(params.get("veg_weight", 0))
     wt = float(params.get("terrain_weight", 0))
     wn = float(params.get("ndvi_weight", 0))
@@ -332,8 +351,9 @@ def _weight_key(ch: str) -> str:
 
 def _generic_weighted(chans: tuple[str, ...]):
     def compute(params: dict, components: ComponentDict) -> np.ndarray:
-        arrs = [np.asarray(components[c]) for c in chans]
-        dt = np.result_type(*[a.dtype for a in arrs], np.float32)
+        raw = [np.asarray(components[c]) for c in chans]
+        dt = np.result_type(*[a.dtype for a in raw], np.float32)
+        arrs = [standardised_channel(a, params, c, dt) for a, c in zip(raw, chans)]
         w = [float(params.get(_weight_key(c), 0)) for c in chans]
         total = sum(w)
         if total <= 0:
