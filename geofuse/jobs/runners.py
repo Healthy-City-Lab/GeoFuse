@@ -54,6 +54,7 @@ from geofuse.jobs.fusion_outputs import (
     _fusion_stage_weight,
     _jsonsafe_results,
     _log_stage_timing,
+    _negative_control_report,
     _posterior_summary,
     _write_fusion_outputs,
 )
@@ -1087,6 +1088,7 @@ def run_fusion(
     report_paired_bootstrap: int = 2000,
     exposure_iqr: float | None = None,
     moderator_columns: list[str] | None = None,
+    negative_controls: list[str] | None = None,
 ) -> dict:
     """Run a fusion job: data-driven CGI discovery + held-out test scoring.
 
@@ -1106,7 +1108,12 @@ def run_fusion(
     CI bootstrap (``report_ci_bootstrap``; ``None`` picks 2,000 for the O(n²)
     ``partial_distance_corr`` objective and 10,000 otherwise — percentile CIs
     are stable well below the higher figure), the effects bootstrap /
-    permutation counts, and the paired CGI-vs-standalone bootstrap."""
+    permutation counts, and the paired CGI-vs-standalone bootstrap.
+
+    ``negative_controls`` names target columns holding negative-control
+    outcomes. They never enter tuning; each study's frozen composite is scored
+    against them on the test split and on train+val, with the paired contrast
+    drawn from ``report_paired_bootstrap`` resamples."""
     # Bound before the body so the handlers below can close out the ledger no
     # matter how early a run fails.
     ledger = None
@@ -1261,6 +1268,7 @@ def run_fusion(
             "report_effects_permutations": int(report_effects_permutations),
             "exposure_iqr": exposure_iqr,
             "moderator_columns": list(moderator_columns or []),
+            "negative_controls": list(negative_controls or []),
             "report_paired_bootstrap": int(report_paired_bootstrap),
             "cache_metrics": bool(cache_metrics),
             "resume_existing_study": bool(resume_existing_study),
@@ -1388,6 +1396,19 @@ def run_fusion(
                     f"[{label}] Dropping covariate(s) that match this outcome: "
                     f"{sorted(set(user_covs) - set(outcome_covs))}",
                 )
+            # A control cannot be the outcome itself, and one that is also a
+            # covariate would be partialled out of its own test.
+            outcome_ncs = [
+                c for c in (negative_controls or [])
+                if c != target_feature and c not in outcome_covs
+            ]
+            if len(outcome_ncs) != len(negative_controls or []):
+                _log_fusion(
+                    "WARN",
+                    f"[{label}] Negative control(s) that are this outcome or a "
+                    f"covariate were dropped: "
+                    f"{sorted(set(negative_controls or []) - set(outcome_ncs))}",
+                )
 
             engine = MetricFusionEngine(
                 target_file=target_path,
@@ -1416,6 +1437,7 @@ def run_fusion(
                 spatial_adjust_eps_m=spatial_adjust_eps_m,
                 residualize_method=residualize_method,
                 search_scoring_method=search_scoring_method,
+                negative_control_columns=outcome_ncs,
             )
 
             ctx.progress(
@@ -2122,6 +2144,13 @@ def run_fusion(
                     job_artifacts_root, "study_results", f"standalone_{ch}"
                 )
                 ch_averaged_params: dict = dict(ch_headline_params)
+                # The same transfer test as the CGI's, so the report shows
+                # whether the composite is more or less specific than a single
+                # channel.
+                ch_negative_controls = _negative_control_report(
+                    engine, ch_averaged_params, objective_metric,
+                    int(report_paired_bootstrap), label=label, log=_log_fusion,
+                )
                 ch_composite_path = os.path.join(
                     job_artifacts_root, f"composite_greenery_{ch}.tif"
                 )
@@ -2154,6 +2183,7 @@ def run_fusion(
                     "subset_scores": ch_subset_scores,
                     "discovery_summary": ch_discovery_summary,
                     "direction_sign": ch_direction,
+                    "negative_controls": ch_negative_controls,
                     "objective_metric": objective_metric,
                     "study_name": ch_study_name,
                     "report_dir": ch_report_dir,
@@ -2403,6 +2433,13 @@ def run_fusion(
                     f"[{label}] Moderation computation failed: {exc}",
                 )
 
+            # Specificity: the frozen composite scored against each negative-
+            # control outcome, which never entered tuning.
+            negative_control_report = _negative_control_report(
+                engine, averaged_params, objective_metric,
+                int(report_paired_bootstrap), label=label, log=_log_fusion,
+            )
+
             bundle = {
                 "best_params": best_params,
                 "averaged_params": averaged_params,
@@ -2417,6 +2454,7 @@ def run_fusion(
                 "decline_terms": decline_terms,
                 "exposure_response": exposure_response_report,
                 "moderation": moderation_report,
+                "negative_controls": negative_control_report,
                 "target_feature": target_feature,
                 # Run details persisted so the results panel survives a disk
                 # reload (when the live engine is gone): user-facing covariate

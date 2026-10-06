@@ -123,5 +123,73 @@ class TestDiscoveryCsvReportsWhatWasBuilt(unittest.TestCase):
         self.assertEqual([r["peak_radius_m"] for r in rows], ["", ""])
 
 
+def _nc_report():
+    ctl = {"beta": 0.04, "se": 0.01, "ci_low": 0.02, "ci_high": 0.06, "t": 4.0,
+           "n": 48, "objective": 0.0016, "delta": 0.01, "delta_ci_low": -0.02,
+           "delta_ci_high": 0.04, "ratio": 0.8, "nonspecific": True}
+    tgt = {"beta": 0.05, "se": 0.01, "ci_low": 0.03, "ci_high": 0.07, "t": 5.0,
+           "n": 50, "objective": 0.0025}
+    return {"controls": ["grip"], "splits": {
+        "test": {"target": dict(tgt), "controls": {"grip": dict(ctl)}},
+        "train_val": {"target": dict(tgt), "controls": {"grip": dict(ctl)}},
+    }}
+
+
+class TestNegativeControlExport(unittest.TestCase):
+    def test_one_row_per_study_split_and_outcome(self):
+        rows = _rows(_write(negative_controls=_nc_report()), "negative_controls.csv")
+        self.assertEqual(len(rows), 4)
+        test = [r for r in rows if r["split"] == "test"]
+        self.assertEqual([r["role"] for r in test], ["target", "control"])
+        self.assertEqual(test[1]["outcome"], "grip")
+        self.assertEqual(test[1]["nonspecific"], "True")
+        self.assertEqual(test[0]["nonspecific"], "")
+        self.assertEqual(test[1]["delta_ci_low"], "-0.02")
+
+    def test_the_manifest_carries_the_report(self):
+        import json
+
+        out = _write(negative_controls=_nc_report())
+        with open(os.path.join(out, "results_summary.json"), encoding="utf-8") as f:
+            manifest = json.load(f)
+        self.assertEqual(manifest["studies"]["cgi"]["negative_controls"]["controls"],
+                         ["grip"])
+
+    def test_no_controls_writes_no_file(self):
+        out = _write()
+        self.assertFalse(os.path.exists(os.path.join(out, "negative_controls.csv")))
+
+
+class TestNegativeControlHelper(unittest.TestCase):
+    def test_the_params_carry_the_per_control_results(self):
+        from geofuse.jobs.fusion_outputs import _negative_control_report
+
+        class Eng:
+            def compute_negative_controls(self, params, **kw):
+                return _nc_report()
+
+        params = {"ndvi_radius": 500}
+        report = _negative_control_report(Eng(), params, "r2", 1000,
+                                          label="Y", log=lambda *a: None)
+        self.assertEqual(report["controls"], ["grip"])
+        self.assertEqual(set(params["__negative_control__"]["grip"]),
+                         {"test", "train_val"})
+
+    def test_a_failure_is_logged_not_raised(self):
+        from geofuse.jobs.fusion_outputs import _negative_control_report
+
+        class Eng:
+            def compute_negative_controls(self, params, **kw):
+                raise RuntimeError("boom")
+
+        logged = []
+        params = {}
+        out = _negative_control_report(Eng(), params, "r2", 10, label="Y",
+                                       log=lambda *a: logged.append(a))
+        self.assertIsNone(out)
+        self.assertNotIn("__negative_control__", params)
+        self.assertEqual(logged[0][0], "WARN")
+
+
 if __name__ == "__main__":
     unittest.main()

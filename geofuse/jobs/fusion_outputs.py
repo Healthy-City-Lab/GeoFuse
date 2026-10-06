@@ -540,6 +540,37 @@ def _write_fusion_outputs(
             )
         _emit_csv(f"moderation{sfx}.csv", mod_rows)
 
+    # ── negative_controls.csv (specificity) ─────────────────────
+    # One row per study x split x outcome: the target first, then each control
+    # with its paired contrast against the target and the non-specific flag.
+    nc_rows: list[dict] = []
+    for key, _disp, b in studies:
+        report = b.get("negative_controls") or {}
+        for split, res in (report.get("splits") or {}).items():
+            entries = [("target", label, res.get("target") or {})]
+            entries += [("control", name, c)
+                        for name, c in (res.get("controls") or {}).items()]
+            for role, outcome, e in entries:
+                nc_rows.append({
+                    "study": key,
+                    "split": split,
+                    "role": role,
+                    "outcome": outcome,
+                    "beta": _f(e.get("beta")),
+                    "ci_low": _f(e.get("ci_low")),
+                    "ci_high": _f(e.get("ci_high")),
+                    "t": _f(e.get("t")),
+                    "n": e.get("n"),
+                    "objective": _f(e.get("objective")),
+                    "delta_vs_target": _f(e.get("delta")),
+                    "delta_ci_low": _f(e.get("delta_ci_low")),
+                    "delta_ci_high": _f(e.get("delta_ci_high")),
+                    "ratio_to_target": _f(e.get("ratio")),
+                    "nonspecific": e.get("nonspecific") if role == "control" else None,
+                })
+    if nc_rows:
+        _emit_csv(f"negative_controls{sfx}.csv", nc_rows)
+
     # ── results_summary.json (master manifest) ──────────────────
     studies_manifest: dict[str, dict] = {}
     for key, disp, b in studies:
@@ -571,6 +602,7 @@ def _write_fusion_outputs(
                 else None
             ),
             "subset_scores": b.get("subset_scores") or {},
+            "negative_controls": b.get("negative_controls"),
             "discovery": {
                 k: summ.get(k)
                 for k in (
@@ -865,6 +897,34 @@ def _direction_sign(engine: Any, params: dict, metric: str) -> int:
         )
     except Exception:
         return 1
+
+
+def _negative_control_report(
+    engine: Any, params: dict, metric: str, n_boot: int, *, label: str, log: Any
+) -> dict | None:
+    """One study's negative-control transfer test, or ``None`` without controls.
+
+    The per-control results are also written onto ``params`` under
+    ``__negative_control__`` as ``{control: {split: result}}``, so the params a
+    study is saved with carry their own specificity check.
+    """
+    try:
+        report = engine.compute_negative_controls(
+            params, metric=metric, n_boot=int(n_boot), seed=42
+        )
+    except Exception as exc:
+        log("WARN", f"[{label}] Negative-control transfer test failed: {exc}")
+        return None
+    if report and report.get("splits"):
+        params["__negative_control__"] = {
+            name: {
+                split: res["controls"][name]
+                for split, res in report["splits"].items()
+                if name in res["controls"]
+            }
+            for name in report.get("controls", [])
+        }
+    return report
 
 
 def _compare_cgi_vs_standalone(

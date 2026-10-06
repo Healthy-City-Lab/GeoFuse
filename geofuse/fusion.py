@@ -173,6 +173,7 @@ class MetricFusionEngine:
         spatial_adjust_eps_m: float | None = None,
         residualize_method: str = "linear",
         search_scoring_method: str = "mom_em3",
+        negative_control_columns: list[str] | None = None,
     ):
         """
         Initialize the fusion engine.
@@ -214,6 +215,11 @@ class MetricFusionEngine:
                 (mirrors polygon mode) so the mixed-effects scorer sees a
                 clean within-entity panel. Defaults to ``None`` → engine
                 stays in cross-sectional mode.
+            negative_control_columns: Attribute columns on the (vector)
+                target holding negative-control outcomes. Carried onto the
+                frame for :meth:`compute_negative_controls` only — never
+                tuned on, never a reason to drop an entity. Cross-sectional
+                targets only.
         """
         # Route Optuna's chatter ("Trial X finished with value Y …") into
         # the per-job log instead of the Streamlit host terminal. Fusion
@@ -355,6 +361,13 @@ class MetricFusionEngine:
         # ``exact`` bypasses it and fits a full MixedLM per trial (the original
         # behaviour). Reports always use the exact MixedLM refit regardless.
         self.search_scoring_method: str = str(search_scoring_method)
+
+        # Negative-control outcomes: attribute columns carried onto the frame
+        # for the transfer test only. They never enter tuning, and a missing
+        # value never drops an entity from it.
+        self.negative_control_columns: list[str] = list(
+            dict.fromkeys(c for c in (negative_control_columns or []) if c)
+        )
 
         # Longitudinal / mixed-effects spec. ``None`` keeps the engine in
         # cross-sectional mode (no behaviour change). When set, every code
@@ -3943,6 +3956,7 @@ class MetricFusionEngine:
         for col in self._longitudinal_extra_cols():
             if col in entity_gdf.columns:
                 fusion_df[col] = entity_gdf[col].values
+        self._carry_negative_controls(fusion_df, entity_gdf)
         fusion_df = self._attach_entity_coords(fusion_df, entity_gdf)
 
         _log("INFO", "====== DATA QUALITY SUMMARY (POLYGON / PER-PIXEL) ======")
@@ -4239,6 +4253,7 @@ class MetricFusionEngine:
         for col in self._longitudinal_extra_cols():
             if col in entity_gdf.columns:
                 fusion_df[col] = entity_gdf[col].values
+        self._carry_negative_controls(fusion_df, entity_gdf)
         fusion_df = self._attach_entity_coords(fusion_df, entity_gdf)
 
         _log("INFO", "====== DATA QUALITY SUMMARY (POINT/LINE / PER-PIXEL) ======")
@@ -7783,6 +7798,126 @@ class MetricFusionEngine:
                 out.append(result)
         except Exception as exc:
             logger.warning(f"compute_moderation failed: {exc}")
+        return out
+
+    def _carry_negative_controls(
+        self, fusion_df: "pd.DataFrame", entity_gdf: "gpd.GeoDataFrame"
+    ) -> None:
+        """Copy the negative-control columns onto a freshly built fusion frame.
+
+        They stay out of every NaN gate, so an entity missing a control is
+        still tuned on; the transfer test drops it from that control alone.
+        """
+        for col in self.negative_control_columns:
+            if col in fusion_df.columns:
+                continue
+            if col not in entity_gdf.columns:
+                _log("WARN", f"Negative control '{col}' is not a target column; "
+                             "skipping it.")
+                continue
+            fusion_df[col] = pd.to_numeric(entity_gdf[col], errors="coerce").values
+
+    def _test_entity_mask(self, df: "pd.DataFrame") -> np.ndarray:
+        """Rows of an ``apply_fusion`` frame that belong to the held-out split."""
+        test = self.test_data
+        if test is None or len(test) == 0:
+            return np.zeros(len(df), dtype=bool)
+        if "polygon_id" in df.columns and "polygon_id" in test.columns:
+            return df["polygon_id"].isin(test["polygon_id"].unique()).to_numpy()
+        return df.index.isin(test.index)
+
+    def compute_negative_controls(
+        self,
+        params: dict,
+        *,
+        metric: str | None = None,
+        n_boot: int = 1000,
+        seed: int = 42,
+        cluster_column: str | None = None,
+    ) -> dict | None:
+        """Frozen-exposure transfer test against each negative-control outcome.
+
+        The composite tuned on train+val is applied unchanged; the controls
+        never entered tuning. On the held-out split (the headline) and on
+        train+val (reference) it reports, for the target and every control,
+        the covariate-adjusted slope in residual SD units with its interval
+        and t, the paired contrast ``|β_target| − |β_control|`` with an
+        ``n_boot`` bootstrap interval, and the ``nonspecific`` flag — see
+        :mod:`geofuse.negative_controls`. With ``metric``, the job's objective
+        is also scored on each outcome. ``cluster_column`` resamples whole
+        areas instead of entities. ``None`` when no controls are configured.
+        """
+        from . import negative_controls as _nc
+
+        if not self.negative_control_columns:
+            return None
+        if self.is_longitudinal:
+            _log("WARN", "Negative controls are reported for cross-sectional "
+                         "targets only; skipped for this longitudinal run.")
+            return {"skipped": "longitudinal",
+                    "controls": list(self.negative_control_columns)}
+        df = self.apply_fusion(weights=dict(params))
+        target = np.asarray(df["target"].values, dtype=np.float64)
+        composite = np.asarray(df["composite"].values, dtype=np.float64)
+        cov = self._reporting_covariate_matrix(df)
+        controls = {}
+        for name in self.negative_control_columns:
+            values = self._reporting_raw_column(df, name)
+            if values is None:
+                _log("WARN", f"Negative control '{name}' not found; skipping.")
+                continue
+            controls[name] = values
+        if not controls:
+            return None
+        clusters = None
+        if cluster_column:
+            full = self._full_data_frame()
+            if full is not None and cluster_column in full.columns:
+                key = "polygon_id" if "polygon_id" in df.columns else None
+                clusters = (
+                    full.groupby(key, sort=False)[cluster_column].first()
+                    .reindex(df[key].values).to_numpy()
+                    if key else full[cluster_column].reindex(df.index).to_numpy()
+                )
+
+        def objective(y, x, c):
+            if metric is None:
+                return None
+            keep = self._finite_rows(y, x, c)
+            try:
+                return float(objective_scoring.score(
+                    metric, y[keep], x[keep], None if c is None else c[keep]))
+            except Exception:
+                return None
+
+        test = self._test_entity_mask(df)
+        out: dict = {"controls": list(controls), "n_boot": int(n_boot),
+                     "cluster_column": cluster_column if clusters is not None
+                     else None, "metric": metric, "splits": {}}
+        for split, mask in (("test", test), ("train_val", ~test)):
+            if int(mask.sum()) < 10:
+                continue
+            c_m = None if cov is None else cov[mask]
+            res = _nc.transfer_test(
+                composite[mask], target[mask],
+                {k: v[mask] for k, v in controls.items()}, c_m,
+                n_boot=int(n_boot), seed=int(seed),
+                clusters=None if clusters is None else clusters[mask],
+            )
+            res["target"]["objective"] = objective(target[mask], composite[mask], c_m)
+            for k, v in controls.items():
+                res["controls"][k]["objective"] = objective(
+                    v[mask], composite[mask], c_m)
+            out["splits"][split] = res
+        flagged = [k for k, v in (out["splits"].get("test") or {})
+                   .get("controls", {}).items() if v.get("nonspecific")]
+        out["nonspecific"] = flagged
+        if flagged:
+            _log("WARN", "Negative control(s) "
+                         + ", ".join(f"'{k}'" for k in flagged)
+                         + " carry an association indistinguishable from the "
+                         "target's on the held-out split: part of the tuned "
+                         "association is non-specific.")
         return out
 
     def _reporting_raw_column(self, df: "pd.DataFrame", name: str):
