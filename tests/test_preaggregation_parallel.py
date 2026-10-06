@@ -526,7 +526,7 @@ class TestPoolIsBoundedByMemory(unittest.TestCase):
         with self._pretend_free(512 * 1024**3):
             self.assertEqual(
                 parallel.process_worker_count(10_000),
-                max(2, (parallel.cpu_budget() * 2) // 3),
+                max(2, int(parallel.cpu_budget() * parallel.cpu_share())),
             )
 
     def test_the_override_is_bounded_too(self):
@@ -545,7 +545,7 @@ class TestPoolIsBoundedByMemory(unittest.TestCase):
         with self._pretend_free(0):
             self.assertEqual(
                 parallel.process_worker_count(10_000),
-                max(2, (parallel.cpu_budget() * 2) // 3),
+                max(2, int(parallel.cpu_budget() * parallel.cpu_share())),
             )
 
     def test_never_returns_less_than_one(self):

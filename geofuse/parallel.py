@@ -97,11 +97,23 @@ _CORE_SHARE = 3
 
 # Share of the host's cores a *process* pool may claim. Each worker is pinned
 # to one BLAS thread, so this share stands alone rather than compounding with
-# an inner pool — measured throughput peaks here and flattens above it.
-_PROCESS_CORE_SHARE_NUM = 2
-_PROCESS_CORE_SHARE_DEN = 3
+# an inner pool. Tunable via ``GEOFUSE_CPU_SHARE`` (0 < share <= 1); the default
+# leaves a fifth of the machine responsive while a job runs.
+_PROCESS_CORE_SHARE = 0.8
 
 _ENV_OVERRIDE = "GEOFUSE_WORKERS"
+_ENV_CPU_SHARE = "GEOFUSE_CPU_SHARE"
+
+
+def cpu_share() -> float:
+    """Fraction of cores a process pool may claim, clamped to (0, 1]."""
+    raw = os.environ.get(_ENV_CPU_SHARE, "").strip()
+    if raw:
+        try:
+            return min(1.0, max(0.01, float(raw)))
+        except ValueError:
+            pass
+    return _PROCESS_CORE_SHARE
 
 
 def cpu_budget() -> int:
@@ -232,8 +244,7 @@ def process_worker_count(
         except ValueError:
             n = 0
     if n <= 0:
-        budget = cpu_budget()
-        n = max(2, (budget * _PROCESS_CORE_SHARE_NUM) // _PROCESS_CORE_SHARE_DEN)
+        n = max(2, int(cpu_budget() * cpu_share()))
     if cap:
         n = min(n, cap)
     by_memory = memory_worker_cap(bytes_per_worker)

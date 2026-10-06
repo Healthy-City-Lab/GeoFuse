@@ -1,7 +1,7 @@
 """Writing a fusion run's results, and the ledger that tracks its stages.
 
 Everything ``run_fusion`` does *after* the search: turning study bundles into
-CSVs and JSON on disk, summarising stability selection, deciding the reported
+CSVs and JSON on disk, summarising the discovery, deciding the reported
 direction of an association, comparing the composite against each standalone
 channel, and building / timing the staged-resume ledger the job monitor renders.
 
@@ -29,7 +29,7 @@ _FUSION_STAGE_STEPS: tuple[tuple[str, str], ...] = (
     ("load_metrics", "Load metric maps"),
     ("preaggregate", "Spatial pre-processing"),
     ("split", "Split train / test folds"),
-    ("optimize", "Stability selection (bootstrap search)"),
+    ("optimize", "Sweep + posterior"),
     ("evaluate", "Score held-out test set"),
     ("report_stats", "Bootstrap CIs, effects & permutation tests"),
     ("apply", "Apply fusion weights"),
@@ -48,7 +48,13 @@ _FUSION_STAGE_WEIGHTS: dict[str, float] = {
     "apply": 1.0,
     "mixedlm_postscore": 2.0,
     "reports": 1.0,
+    "negative_control_retune": 20.0,
 }
+
+_FUSION_RETUNE_STAGE: tuple[str, str] = (
+    "negative_control_retune",
+    "Re-tune on negative controls",
+)
 
 _FUSION_LONGITUDINAL_STAGE: tuple[str, str] = (
     "prepare_longitudinal",
@@ -64,6 +70,7 @@ _STANDALONE_CHANNEL_LABELS: dict[str, str] = {
     "veg": "Vegetation",
     "terrain": "Terrain",
     "ndvi": "NDVI",
+    "gvi": "Green View (veg+terrain)",
 }
 
 _FUSION_STANDALONE_SEARCH_WEIGHT = 20.0
@@ -95,7 +102,7 @@ def _fusion_stage_weight(stage_key: str) -> float:
 
 
 def _clean_params(params: dict | None) -> dict:
-    """Drop the ``__*__`` stability-selection bookkeeping keys from a params dict."""
+    """Drop the ``__*__`` discovery bookkeeping keys from a params dict."""
     if not params:
         return {}
     return {k: v for k, v in params.items() if not str(k).startswith("__")}
@@ -106,7 +113,10 @@ def _study_bundles(
 ) -> list[tuple[str, str, dict]]:
     """``(study_key, display, bundle)`` for the CGI study then each standalone."""
     out: list[tuple[str, str, dict]] = [("cgi", "CGI (combined)", cgi_bundle)]
-    for ch in ("veg", "terrain", "ndvi"):
+    # Whatever the job ran standalones for — a two-channel study reports ``gvi``
+    # where a three-channel one reports ``veg`` and ``terrain``. Ordered by the
+    # label map so the report's channel order does not depend on dict insertion.
+    for ch in _STANDALONE_CHANNEL_LABELS:
         b = standalones_bundle.get(ch)
         if b:
             out.append((ch, _STANDALONE_CHANNEL_LABELS.get(ch, ch), b))
@@ -140,7 +150,7 @@ def _write_fusion_outputs(
 
     - ``run_config.json`` — every setting the job ran with (fidelity record).
     - ``results_summary.json`` — nested manifest: each study's params, test
-      score + CI, direction, subset scores, and stability stats, plus the
+      score + CI, direction, subset scores, and discovery stats, plus the
       CGI-vs-standalone AIC/BIC verdict, covariate-impact summary, and the
       collinearity report.
     - ``test_scores.csv`` — one headline row per study (test score, CI,
@@ -148,8 +158,8 @@ def _write_fusion_outputs(
     - ``scores.csv`` — long form: study × subset (train/val/test/all) ×
       score/score_raw/n.
     - ``parameters.csv`` — long form: study × param → value.
-    - ``stability_cells.csv`` — the ranked weight cells per study.
-    - ``stability_bootstraps.csv`` — the per-bootstrap leaderboard per study.
+    - ``discovery.csv`` — the picked radius / aggregator and the posterior
+      weight (with its credible interval) for every channel of every study.
     - ``covariate_impact.csv`` — per-covariate effects (when covariates set).
     - ``decline_terms.csv`` — greenery × time slopes (longitudinal runs).
     - ``exposure_response.csv`` — the per-IQR effect, the quantile gradient
@@ -234,7 +244,11 @@ def _write_fusion_outputs(
                 {
                     "study": key,
                     "subset": subset,
-                    "metric": objective_metric,
+                    # ``val`` carries the sweep's mean held-out |t|, not a
+                    # value of the objective, so it gets its own metric name.
+                    "metric": (
+                        "sweep_holdout_abs_t" if subset == "val" else objective_metric
+                    ),
                     "score": _f(block.get("score")),
                     "score_raw": _f(block.get("score_raw")),
                     "n": block.get("n"),
@@ -250,35 +264,101 @@ def _write_fusion_outputs(
             param_rows.append({"study": key, "param": pname, "value": pval})
     _emit_csv(f"parameters{sfx}.csv", param_rows)
 
-    # ── stability_cells.csv + stability_bootstraps.csv ──────────
-    cell_rows: list[dict] = []
-    bs_rows: list[dict] = []
+    # ── discovery.csv ───────────────────────────────────────────
+    disc_rows: list[dict] = []
     for key, _disp, b in studies:
-        summ = b.get("stability_summary") or {}
-        for rank, c in enumerate(summ.get("cell_stats") or [], start=1):
-            row: dict = {"study": key, "rank": rank}
-            for wk, wv in (c.get("weights") or {}).items():
-                row[wk] = wv
-            row["count"] = c.get("count")
-            row["q_worst"] = _f(c.get("q_worst"))
-            row["median"] = _f(c.get("median"))
-            row["selection_probability"] = _f(c.get("selection_probability"))
-            cell_rows.append(row)
-        for entry in summ.get("per_bootstrap_summary") or []:
-            row = {
-                "study": key,
-                "bootstrap": entry.get("bootstrap"),
-                "n_trials": entry.get("n_trials"),
-                "top_oob": _f(entry.get("top_oob")),
-                "median_oob": _f(entry.get("median_oob")),
-                "min_oob": _f(entry.get("min_oob")),
-                "max_oob": _f(entry.get("max_oob")),
+        summ = b.get("discovery_summary") or {}
+        picked = summ.get("picked") or []
+        # ``radius_m`` / ``aggregator`` are the posterior projection the
+        # composite is built from; the sweep's shortlist cell is kept in the
+        # ``sweep_*`` columns.
+        projected = summ.get("projected_pick") or []
+        radius_profile = summ.get("radius_profile") or []
+        peak = summ.get("peak_radius_mean") or []
+        peak_ratio = summ.get("peak_radius_width_ratio") or []
+        decay = {
+            k: summ.get(k) or []
+            for k in (
+                "r50_mean",
+                "r50_ci_low",
+                "r50_ci_high",
+                "r90_mean",
+                "r90_ci_low",
+                "r90_ci_high",
+            )
+        }
+        informative = summ.get("aggregator_informative") or []
+        chans = summ.get("channels") or []
+        wm = summ.get("weight_mean") or []
+        wlo = summ.get("weight_ci_low") or []
+        whi = summ.get("weight_ci_high") or []
+        gain = summ.get("holdout_gain") or {}
+        disc = summ.get("discovery") or {}
+        # One row per weight. The synergy form's pair terms have a weight but
+        # no radius or aggregator of their own, so those columns stay blank
+        # rather than repeating a component's values.
+        labels = summ.get("weight_labels") or chans
+        for i, name in enumerate(labels):
+            pick = picked[i] if i < len(picked) else ()
+            proj = projected[i] if i < len(projected) else ()
+            has_grid = i < len(radius_profile)
+            dec = {
+                col: (_f(vals[i]) if has_grid and i < len(vals) else None)
+                for col, vals in (
+                    ("r50_m", decay["r50_mean"]),
+                    ("r50_ci_low", decay["r50_ci_low"]),
+                    ("r50_ci_high", decay["r50_ci_high"]),
+                    ("r90_m", decay["r90_mean"]),
+                    ("r90_ci_low", decay["r90_ci_low"]),
+                    ("r90_ci_high", decay["r90_ci_high"]),
+                )
             }
-            for pk, pv in (entry.get("top_params") or {}).items():
-                row[pk] = pv
-            bs_rows.append(row)
-    _emit_csv(f"stability_cells{sfx}.csv", cell_rows)
-    _emit_csv(f"stability_bootstraps{sfx}.csv", bs_rows)
+            disc_rows.append(
+                {
+                    "study": key,
+                    "channel": name,
+                    "radius_m": (
+                        proj[0]
+                        if len(proj) > 0
+                        else (pick[0] if len(pick) > 0 else None)
+                    ),
+                    "aggregator": (
+                        proj[1]
+                        if len(proj) > 1
+                        else (pick[1] if len(pick) > 1 else None)
+                    ),
+                    "sweep_radius_m": pick[0] if len(pick) > 0 else None,
+                    "sweep_aggregator": pick[1] if len(pick) > 1 else None,
+                    "peak_radius_m": (
+                        _f(peak[i]) if has_grid and i < len(peak) else None
+                    ),
+                    "peak_radius_width_vs_prior": (
+                        _f(peak_ratio[i]) if has_grid and i < len(peak_ratio) else None
+                    ),
+                    **dec,
+                    "aggregators_separated": (
+                        ";".join(informative[i])
+                        if has_grid and i < len(informative) and informative[i]
+                        else None
+                    ),
+                    "weight": _f(wm[i]) if i < len(wm) else None,
+                    "weight_ci_low": _f(wlo[i]) if i < len(wlo) else None,
+                    "weight_ci_high": _f(whi[i]) if i < len(whi) else None,
+                    "boundary_hit": name in (summ.get("boundary_hit") or []),
+                    "form": summ.get("form"),
+                    "sweep_score": _f(summ.get("sweep_score")),
+                    "beta_mean": _f(summ.get("beta_mean")),
+                    "beta_ci_low": _f(summ.get("beta_ci_low")),
+                    "beta_ci_high": _f(summ.get("beta_ci_high")),
+                    "rhat_max": _f(summ.get("rhat_max")),
+                    "ess_min": _f(summ.get("ess_min")),
+                    "distinct_picks": disc.get("distinct_picks"),
+                    "standalone_score": _f(gain.get(f"standalone_{name}")),
+                    "gain": _f(gain.get("gain")),
+                    "gain_p": _f(gain.get("gain_p")),
+                }
+            )
+    _emit_csv(f"discovery{sfx}.csv", disc_rows)
 
     # ── covariate_impact.csv ────────────────────────────────────
     if covariate_impact and covariate_impact.get("per_covariate"):
@@ -292,7 +372,7 @@ def _write_fusion_outputs(
     if decline_terms and decline_terms.get("terms"):
         _emit_csv(f"decline_terms{sfx}.csv", [dict(r) for r in decline_terms["terms"]])
 
-    # ── exposure_response.csv (per-IQR, quartiles, non-linearity) ─
+    # ── exposure_response.csv (IQR, quartiles, non-linearity) ───
     # One tidy table rather than three files: the rows are all statements
     # about the same fitted exposure–response, and a reader comparing them
     # against a published table wants them side by side.
@@ -482,11 +562,64 @@ def _write_fusion_outputs(
             )
         _emit_csv(f"moderation{sfx}.csv", mod_rows)
 
+    # ── negative_controls.csv (specificity) ─────────────────────
+    # One row per study x split x outcome: the target first, then each control
+    # with its paired contrast against the target and the non-specific flag.
+    nc_rows: list[dict] = []
+    for key, _disp, b in studies:
+        report = b.get("negative_controls") or {}
+        for split, res in (report.get("splits") or {}).items():
+            entries = [("target", label, res.get("target") or {})]
+            entries += [
+                ("control", name, c) for name, c in (res.get("controls") or {}).items()
+            ]
+            for role, outcome, e in entries:
+                nc_rows.append(
+                    {
+                        "study": key,
+                        "split": split,
+                        "role": role,
+                        "outcome": outcome,
+                        "beta": _f(e.get("beta")),
+                        "ci_low": _f(e.get("ci_low")),
+                        "ci_high": _f(e.get("ci_high")),
+                        "t": _f(e.get("t")),
+                        "n": e.get("n"),
+                        "objective": _f(e.get("objective")),
+                        "delta_vs_target": _f(e.get("delta")),
+                        "delta_ci_low": _f(e.get("delta_ci_low")),
+                        "delta_ci_high": _f(e.get("delta_ci_high")),
+                        "ratio_to_target": _f(e.get("ratio")),
+                        "nonspecific": (
+                            e.get("nonspecific") if role == "control" else None
+                        ),
+                    }
+                )
+    if nc_rows:
+        _emit_csv(f"negative_controls{sfx}.csv", nc_rows)
+
+    # Re-tune concordance: one row per control x channel, CGI study only.
+    retune = ((cgi_bundle or {}).get("negative_controls") or {}).get("retune") or {}
+    rt_rows = [
+        {
+            "control": name,
+            "channel": ch,
+            "form_target": block.get("form_target"),
+            "form_control": block.get("form_control"),
+            "control_beta": _f(block.get("control_beta")),
+            **{k: (v if isinstance(v, bool) else _f(v)) for k, v in row.items()},
+        }
+        for name, block in retune.items()
+        for ch, row in (block.get("channels") or {}).items()
+    ]
+    if rt_rows:
+        _emit_csv(f"negative_control_retune{sfx}.csv", rt_rows)
+
     # ── results_summary.json (master manifest) ──────────────────
     studies_manifest: dict[str, dict] = {}
     for key, disp, b in studies:
         tr = b.get("test_results") or {}
-        summ = b.get("stability_summary") or {}
+        summ = b.get("discovery_summary") or {}
         studies_manifest[key] = {
             "display": disp,
             "channel": b.get("channel", "cgi"),
@@ -513,18 +646,26 @@ def _write_fusion_outputs(
                 else None
             ),
             "subset_scores": b.get("subset_scores") or {},
-            "stability": {
+            "negative_controls": b.get("negative_controls"),
+            "discovery": {
                 k: summ.get(k)
                 for k in (
-                    "q_worst",
-                    "median",
-                    "count",
-                    "selection_probability",
-                    "worst_quantile",
-                    "n_bootstraps",
-                    "n_trials_per_bootstrap",
-                    "n_total_trials",
-                    "higher_is_better",
+                    "picked",
+                    "form",
+                    "sweep_score",
+                    "boundary_hit",
+                    "channels",
+                    "weight_mean",
+                    "weight_ci_low",
+                    "weight_ci_high",
+                    "beta_mean",
+                    "beta_ci_low",
+                    "beta_ci_high",
+                    "rhat_max",
+                    "ess_min",
+                    "divergences",
+                    "holdout_gain",
+                    "null_calibration",
                 )
             },
         }
@@ -548,6 +689,10 @@ def _write_fusion_outputs(
         "outcome": label,
         "objective_metric": objective_metric,
         "cgi_formula": formula_name,
+        # Which configuration produced this, and how much of the held-out
+        # guarantee it spent.
+        "config_hash": (cgi_bundle or {}).get("config_hash"),
+        "test_reads": (cgi_bundle or {}).get("test_reads"),
         "studies": studies_manifest,
         "cgi_vs_standalone_aic_bic": aic_bic,
         "covariate_impact": cov_summary,
@@ -608,12 +753,15 @@ def _build_fusion_ledger(
     standalone_channels: list[str] | None = None,
     longitudinal: bool = False,
     mixedlm_postscore: bool = False,
+    negative_control_retune: bool = False,
 ) -> StageLedger:
     """Fresh ledger covering every (outcome, step) pair in run order.
 
     For each outcome the CGI pipeline (`_FUSION_STAGE_STEPS`) lands first, then
-    two stages per enabled standalone metric — the stability search and the
-    test scoring / reporting that follows it. Standalones reuse the already-
+    two stages per enabled standalone metric — the sweep + posterior and the
+    test scoring / reporting that follows it. The standalone list comes from the
+    active formula's channels, so a two-channel study shows ``ndvi`` and ``gvi``
+    rather than the legacy three. Standalones reuse the already-
     built split + pre-aggregation cache. When ``longitudinal`` is true an extra
     ``prepare_longitudinal`` stage is inserted between ``load_metrics`` and
     ``preaggregate`` to cover per-wave file loading. The MixedLM
@@ -621,6 +769,8 @@ def _build_fusion_ledger(
     (a longitudinal study whose scoring metric is actually a
     ``mixedlm_*`` one — year-aware cross-sectional studies sit on a
     spec too but score with OLS so they skip the post-score step).
+    ``negative_control_retune`` appends one re-tune stage per outcome, after
+    its standalones, where the runner performs it.
     """
     standalones = list(standalone_channels or [])
     steps: list[tuple[str, str]] = []
@@ -650,7 +800,7 @@ def _build_fusion_ledger(
             report_key = _fusion_stage_key(
                 label, f"standalone_{ch}_report", multi=multi
             )
-            search_step = f"Standalone {ch_lbl} stability selection"
+            search_step = f"Standalone {ch_lbl} sweep + posterior"
             report_step = f"Standalone {ch_lbl} test scoring & reports"
             steps.append(
                 (search_key, f"[{label}] {search_step}" if multi else search_step)
@@ -658,49 +808,98 @@ def _build_fusion_ledger(
             steps.append(
                 (report_key, f"[{label}] {report_step}" if multi else report_step)
             )
+        if negative_control_retune:
+            rt_key_raw, rt_label = _FUSION_RETUNE_STAGE
+            steps.append(
+                (
+                    _fusion_stage_key(label, rt_key_raw, multi=multi),
+                    f"[{label}] {rt_label}" if multi else rt_label,
+                )
+            )
     return StageLedger.from_steps(steps)
 
 
-def _stability_summary(params: dict) -> dict:
-    """Lift the stability-selection diagnostics out of a winning-params dict.
+def _posterior_summary(params: dict) -> dict:
+    """Lift the discovery diagnostics out of a winning-params dict.
 
-    ``bootstrap_stability_selection`` stashes its bookkeeping under ``__``-
-    prefixed keys (so the "Final params" panel strips them). This surfaces the
-    ones the results UI shows as a plain summary dict.
+    ``fit_bayesian_index`` stashes its bookkeeping under ``__``-prefixed keys
+    (so the "Final params" panel strips them). This surfaces the ones the
+    results UI shows as a plain summary dict.
     """
 
     def g(key: str, default: Any = None) -> Any:
         return params.get(key, default)
 
+    sweep = g("__sweep__", {}) or {}
+    post = g("__posterior__", {}) or {}
+    disc = g("__discovery__", {}) or {}
+    gain = g("__holdout_gain__", {}) or {}
+    null = g("__null_calibration__", {}) or {}
     return {
-        "q_worst": g("__cell_q_worst__"),
-        "median": g("__cell_median__"),
-        "count": g("__cell_count__"),
-        "selection_probability": g("__cell_selection_probability__"),
-        "worst_quantile": g("__worst_quantile__"),
-        # Automated threshold calibration (Bodinier).
-        "stability_score": g("__stability_score__"),
-        "selection_threshold": g("__selection_threshold__"),
-        "selection_size_k": g("__selection_size_k__"),
-        "n_candidate_cells": g("__n_candidate_cells__"),
-        "n_stably_selected": g("__n_stably_selected__"),
-        "pfer": g("__pfer__"),
-        "pfer_controlled": g("__pfer_controlled__"),
-        "n_bootstraps": g("__n_bootstraps__"),
-        "n_trials_per_bootstrap": g("__n_trials_per_bootstrap__"),
-        "n_total_trials": g("__n_total_trials__"),
-        "higher_is_better": g("__higher_is_better__"),
-        "cell_stats": g("__cell_stats__", []),
-        "winning_cell": g("__winning_cell__"),
-        "winning_cell_oob_scores": g("__winning_cell_oob_scores__", []),
-        "per_bootstrap_summary": g("__per_bootstrap_summary__", []),
-        "trial_history": g("__trial_history__", []),
-        # Stage-2 (radius sub-cell) diagnostics.
-        "radius_cell_q_worst": g("__radius_cell_q_worst__"),
-        "radius_cell_median": g("__radius_cell_median__"),
-        "radius_cell_count": g("__radius_cell_count__"),
-        "radius_bin_m": g("__radius_bin_m__"),
-        "radius_cell_stats": g("__radius_cell_stats__", []),
+        "selection_method": g("__selection_method__", "bayesian_index"),
+        # What the sweep chose, and how confident that choice is.
+        "picked": sweep.get("picked"),
+        "form": sweep.get("form"),
+        "form_scores": sweep.get("form_scores", {}),
+        "sweep_score": sweep.get("score"),
+        "sweep_selection_score": sweep.get("selection_score"),
+        "one_se_picked": sweep.get("one_se_picked"),
+        "boundary_hit": sweep.get("boundary_hit", []),
+        "n_candidates": sweep.get("n_candidates"),
+        "distinct_split_winners": sweep.get("distinct_split_winners"),
+        "sweep_splits": sweep.get("splits"),
+        # Weights and effect, with intervals.
+        "channels": post.get("channels"),
+        "weight_labels": post.get("weight_labels"),
+        "weight_mean": post.get("weight_mean"),
+        "weight_ci_low": post.get("weight_ci_low"),
+        "weight_ci_high": post.get("weight_ci_high"),
+        "powers": post.get("powers"),
+        "beta_mean": post.get("beta_mean"),
+        "beta_ci_low": post.get("beta_ci_low"),
+        "beta_ci_high": post.get("beta_ci_high"),
+        "p_direction": post.get("p_direction"),
+        "partial_r2_mean": post.get("partial_r2_mean"),
+        "partial_r2_ci_low": post.get("partial_r2_ci_low"),
+        "partial_r2_ci_high": post.get("partial_r2_ci_high"),
+        "weight_prior_ci": post.get("weight_prior_ci"),
+        "weight_width_ratio": post.get("weight_width_ratio"),
+        "rhat_max": post.get("rhat_max"),
+        "ess_min": post.get("ess_min"),
+        "divergences": post.get("divergences"),
+        # The grid axes the posterior estimated rather than the sweep picked.
+        "radius_kernel": post.get("radius_kernel"),
+        "radii": post.get("radii"),
+        "radius_profile": post.get("radius_profile"),
+        "projected_pick": post.get("projected_pick"),
+        "peak_radius_mean": post.get("peak_radius_mean"),
+        "peak_radius_ci_low": post.get("peak_radius_ci_low"),
+        "peak_radius_ci_high": post.get("peak_radius_ci_high"),
+        "peak_radius_prior_ci": post.get("peak_radius_prior_ci"),
+        "peak_radius_width_ratio": post.get("peak_radius_width_ratio"),
+        "r50_mean": post.get("r50_mean"),
+        "r50_ci_low": post.get("r50_ci_low"),
+        "r50_ci_high": post.get("r50_ci_high"),
+        "r90_mean": post.get("r90_mean"),
+        "r90_ci_low": post.get("r90_ci_low"),
+        "r90_ci_high": post.get("r90_ci_high"),
+        "implied_weight_curve": post.get("implied_weight_curve"),
+        "distance_scale": post.get("distance_scale"),
+        "distance_basis": post.get("distance_basis"),
+        "distance_area": post.get("distance_area"),
+        "stats": post.get("stats"),
+        "aggregator_mean": post.get("aggregator_mean"),
+        "aggregator_ci_low": post.get("aggregator_ci_low"),
+        "aggregator_ci_high": post.get("aggregator_ci_high"),
+        "aggregator_prior_ci": post.get("aggregator_prior_ci"),
+        "aggregator_width_ratio": post.get("aggregator_width_ratio"),
+        "aggregator_uniform": post.get("aggregator_uniform"),
+        "aggregator_informative": post.get("aggregator_informative"),
+        # Does the discovery reproduce, and does it beat a single channel?
+        "discovery": disc,
+        "holdout_gain": gain,
+        "null_calibration": null,
+        "elapsed_s": g("__elapsed_s__"),
     }
 
 
@@ -755,6 +954,34 @@ def _direction_sign(engine: Any, params: dict, metric: str) -> int:
         return 1
 
 
+def _negative_control_report(
+    engine: Any, params: dict, metric: str, n_boot: int, *, label: str, log: Any
+) -> dict | None:
+    """One study's negative-control transfer test, or ``None`` without controls.
+
+    The per-control results are also written onto ``params`` under
+    ``__negative_control__`` as ``{control: {split: result}}``, so the params a
+    study is saved with carry their own specificity check.
+    """
+    try:
+        report = engine.compute_negative_controls(
+            params, metric=metric, n_boot=int(n_boot), seed=42
+        )
+    except Exception as exc:
+        log("WARN", f"[{label}] Negative-control transfer test failed: {exc}")
+        return None
+    if report and report.get("splits"):
+        params["__negative_control__"] = {
+            name: {
+                split: res["controls"][name]
+                for split, res in report["splits"].items()
+                if name in res["controls"]
+            }
+            for name in report.get("controls", [])
+        }
+    return report
+
+
 def _compare_cgi_vs_standalone(
     engine: Any,
     standalones_bundle: dict,
@@ -767,16 +994,26 @@ def _compare_cgi_vs_standalone(
     """AIC/BIC verdict: is CGI justified over the best single standalone channel?
 
     The best standalone is the channel with the strongest whole-data (``all``)
-    score (direction-aware). The full (3-channel) and reduced (best-channel)
-    models are fit on the whole dataset's per-entity channel design built at the
-    CGI winning aggregation params, so the verdict is on the same ``all`` slice
-    as the paired objective comparison. Returns ``None`` when no standalone
-    qualifies or the design / fit fails.
+    score (direction-aware). The full and reduced (best-channel) models are fit
+    on the whole dataset's per-entity channel design built at the CGI winning
+    aggregation params, so the verdict is on the same ``all`` slice as the
+    paired objective comparison. Returns ``None`` when no standalone qualifies
+    or the design / fit fails.
+
+    The channel names come from the design rather than from a fixed list: a
+    two-channel study's design has two columns, and an index taken against the
+    three-channel names would point at the wrong one.
     """
     from .. import mixed_effects_scoring as _me
     from .. import objective_scoring as _scoring
 
-    chans = ["veg", "terrain", "ndvi"]
+    try:
+        design = engine.build_channel_design(cgi_params, subset="all")
+    except Exception as exc:
+        log("WARN", f"AIC/BIC channel design failed: {exc}")
+        return None
+
+    chans = list(design["channel_names"])
     higher_is_better = (
         metric in _scoring.HIGHER_IS_BETTER or metric in _me.HIGHER_IS_BETTER
     )
@@ -794,12 +1031,6 @@ def _compare_cgi_vs_standalone(
         return None
     best_ch = max(scored, key=lambda kv: kv[1] if higher_is_better else -kv[1])[0]
     best_idx = chans.index(best_ch)
-
-    try:
-        design = engine.build_channel_design(cgi_params, subset="all")
-    except Exception as exc:
-        log("WARN", f"AIC/BIC channel design failed: {exc}")
-        return None
 
     X = design["channels"]
     target = design["target"]

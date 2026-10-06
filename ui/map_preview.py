@@ -16,6 +16,8 @@ from helpers import apply_buffer_m
 from pandas.api.types import is_scalar
 from shapely.geometry import mapping as shapely_mapping
 
+from geofuse.crs_utils import metres_per_degree_at_lat
+
 # Above this many point features, use Leaflet marker clustering (browser performance).
 MAP_CLUSTER_POINT_THRESHOLD = 500
 # Hard cap on points drawn (sample); caller may surface a warning.
@@ -281,11 +283,15 @@ def add_study_area_layers(
     study_name: str,
     buffer_m: float,
     buffer_name: str | None = None,
-) -> None:
+) -> tuple[float, float, float, float] | None:
     """Study area (blue): polygons/lines as GeoJson; point clouds use FastMarkerCluster when large.
 
     A single ``folium.GeoJson`` on tens of thousands of points freezes the UI and bypasses
     clustering — never pass an all-point ``GeoDataFrame`` through raw GeoJson.
+
+    Returns the buffer footprint's ``total_bounds`` (or ``None`` when no buffer
+    was drawn) so callers can fit the map to it without buffering a second time
+    — on a large point cloud that union is the most expensive thing on the page.
     """
     nonpt, pts = split_points_and_nonpoints(raw_gdf)
     if not nonpt.empty:
@@ -312,14 +318,25 @@ def add_study_area_layers(
             cluster_fill_opacity=0.35,
             layer_name="Study points",
         )
-    if buffer_m > 0:
-        buf_gdf = apply_buffer_m(raw_gdf, buffer_m)
-        bn = buffer_name if buffer_name is not None else f"{study_name} (buffer)"
-        folium.GeoJson(
-            buf_gdf,
-            name=bn,
-            style_function=_BUFFER_STYLE,
-        ).add_to(m)
+    if buffer_m <= 0:
+        return None
+    buf_gdf = apply_buffer_m(raw_gdf, buffer_m)
+    bounds = tuple(float(v) for v in buf_gdf.total_bounds)
+    bn = buffer_name if buffer_name is not None else f"{study_name} (buffer)"
+    # A thousands-of-disks footprint is drawn a few pixels wide, so its full
+    # vertex list is wasted bandwidth and a sluggish Leaflet layer. A tenth of
+    # the buffer distance is invisible at preview zoom.
+    display = buf_gdf.copy()
+    tol = buffer_m / 10.0
+    if buf_gdf.crs is not None and buf_gdf.crs.is_geographic:
+        tol /= metres_per_degree_at_lat(bounds[1])[1]
+    display.geometry = buf_gdf.geometry.simplify(tol)
+    folium.GeoJson(
+        display,
+        name=bn,
+        style_function=_BUFFER_STYLE,
+    ).add_to(m)
+    return bounds  # type: ignore[return-value]
 
 
 def add_mixed_geojson_preview(

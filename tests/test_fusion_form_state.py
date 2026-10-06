@@ -219,6 +219,15 @@ class TestEveryRecordedSettingIsRestored(unittest.TestCase):
         self.fusion._seed_fusion_form(_params(moderator_columns=[]))
         self.assertEqual(self.state["fusion_moderator_columns"], [])
 
+    def test_negative_controls_survive_a_re_run(self):
+        self.fusion._seed_fusion_form(_params(negative_controls=["grip"]))
+        self.assertEqual(self.state["fusion_negative_controls"], ["grip"])
+
+    def test_a_job_without_controls_clears_a_stale_pick(self):
+        self.state["fusion_negative_controls"] = ["height"]
+        self.fusion._seed_fusion_form(_params())
+        self.assertEqual(self.state["fusion_negative_controls"], [])
+
     def test_recorded_config_keys_reach_a_widget_or_a_named_handler(self):
         """Every key in the recorded config must have a restore route.
 
@@ -230,6 +239,7 @@ class TestEveryRecordedSettingIsRestored(unittest.TestCase):
             "covariate_columns",
             "covariate_types",
             "moderator_columns",
+            "negative_controls",
             "standalone_channels",
             "longitudinal_spec_payload",
             "target_display_name",
@@ -241,8 +251,10 @@ class TestEveryRecordedSettingIsRestored(unittest.TestCase):
             "ndvi_resolution_m",
             "gvi_grid_spacing_m",
             "n_spatial_blocks",
-            "min_cell_count",
-            "worst_quantile",
+            # Warmup mirrors the draw count, so it has no widget of its own.
+            "posterior_warmup",
+            # Derived from the channel set and the picked form.
+            "cgi_formula",
             # ``None`` carries meaning here (use the composite's own IQR) and
             # has to seed the widget as 0.0, which the generic map — which
             # skips ``None`` outright — cannot express.

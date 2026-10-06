@@ -187,27 +187,31 @@ def apply_circular_buffer_aggregation(
             if numeric_cols:
                 metric_col = numeric_cols[0]
             else:
-                logger.warning(
-                    f"No numeric columns found in metric data. Columns: {metric_data.columns.tolist()}"
+                logger(
+                    "WARN",
+                    f"No numeric columns found in metric data. Columns: {metric_data.columns.tolist()}",
                 )
                 return result  # Return all NaN
 
-        logger.info(
-            f"Buffer aggregation using column '{metric_col}' from {metric_data.columns.tolist()}, radius={radius_meters}m, stat={stat}"
+        logger(
+            "INFO",
+            f"Buffer aggregation using column '{metric_col}' from {metric_data.columns.tolist()}, radius={radius_meters}m, stat={stat}",
         )
 
         # Check if any data was joined
         non_null_joins = (
             joined[metric_col].notna().sum() if metric_col in joined.columns else 0
         )
-        logger.info(
-            f"Spatial join: {len(joined)} total rows, {non_null_joins} with valid metric values"
+        logger(
+            "INFO",
+            f"Spatial join: {len(joined)} total rows, {non_null_joins} with valid metric values",
         )
 
-        logger.debug(
-            f"Using metric column: {metric_col} from {metric_data.columns.tolist()}"
+        logger(
+            "INFO",
+            f"Using metric column: {metric_col} from {metric_data.columns.tolist()}",
         )
-        logger.debug(f"Joined shape: {joined.shape}, Points shape: {len(points_gdf)}")
+        logger("INFO", f"Joined shape: {joined.shape}, Points shape: {len(points_gdf)}")
 
         # Aggregate by original point index — one vectorized groupby over the
         # joined frame instead of a per-point boolean scan (which was O(n²)).
@@ -226,8 +230,9 @@ def apply_circular_buffer_aggregation(
 
         # Log summary of results
         valid_count = np.sum(~np.isnan(result))
-        logger.info(
-            f"Buffer aggregation result: {valid_count}/{len(result)} points have valid values"
+        logger(
+            "INFO",
+            f"Buffer aggregation result: {valid_count}/{len(result)} points have valid values",
         )
 
     return result
@@ -371,9 +376,10 @@ def load_metric_file(filepath: str, channel: str) -> gpd.GeoDataFrame | dict:
             # Too large to hold in RAM (national-scale): read windows from
             # disk on demand instead. Each thread gets its own handle.
             data = LazyRasterArray(filepath, band=1)
-            logger.info(
+            logger(
+                "INFO",
                 f"Metric raster ~{est_bytes / (1024**2):.0f} MB exceeds the "
-                f"in-memory threshold; reading windows lazily from {filepath}"
+                f"in-memory threshold; reading windows lazily from {filepath}",
             )
         return {
             "data": data,
@@ -553,25 +559,23 @@ def stripe_to_test_blocks(
 
 
 def catchment_radius(
-    veg_radius: float,
-    terrain_radius: float,
-    ndvi_radius: float,
+    radii: dict[str, float],
     active_channel: str | None = None,
 ) -> float:
     """Per-trial catchment radius for the point/line collapse.
 
     ``active_channel``'s radius for a standalone study (only that channel
-    contributes to the score), or the largest of the three for the combined
-    CGI run (every channel feeds the per-pixel composite).
+    contributes to the score), or the largest in ``radii`` for a combined CGI
+    run (every channel feeds the per-pixel composite). ``radii`` is keyed by
+    channel name, so a two-channel study and a three-channel one both answer
+    from their own set rather than from a fixed triple.
     """
+    if not radii:
+        return 0.0
     ch = active_channel or "cgi"
-    if ch == "veg":
-        return float(veg_radius)
-    if ch == "terrain":
-        return float(terrain_radius)
-    if ch == "ndvi":
-        return float(ndvi_radius)
-    return float(max(veg_radius, terrain_radius, ndvi_radius))
+    if ch in radii:
+        return float(radii[ch])
+    return float(max(radii.values()))
 
 
 def split_control_matrix(

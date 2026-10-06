@@ -34,6 +34,8 @@ from collections.abc import Callable, Sequence
 
 import numpy as np
 
+from .bayesian_index import col_basis
+
 logger = logging.getLogger(__name__)
 
 #: A fitter takes the design matrix and its column names and returns
@@ -61,9 +63,9 @@ CLSA_NDVI_IQR: float = 0.06
 SPLINE_DF: int = 4
 
 
-# ──────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 # IQR scaling
-# ──────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 
 
 def exposure_iqr(exposure: np.ndarray) -> float:
@@ -120,9 +122,9 @@ def iqr_scaled_effect(
     return out
 
 
-# ──────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 # Default cross-sectional fitter
-# ──────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 
 
 def make_ols_fitter(outcome: np.ndarray) -> Fitter:
@@ -167,9 +169,9 @@ def make_ols_fitter(outcome: np.ndarray) -> Fitter:
     return _fit
 
 
-# ──────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 # Quartile contrasts
-# ──────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 
 
 def exposure_quartiles(exposure: np.ndarray, n_groups: int = 4):
@@ -272,9 +274,9 @@ def quartile_terms(
     }
 
 
-# ──────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 # Non-linearity test
-# ──────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 
 
 def _natural_cubic_basis(x: np.ndarray, df: int = SPLINE_DF) -> np.ndarray | None:
@@ -297,9 +299,9 @@ def _natural_cubic_basis(x: np.ndarray, df: int = SPLINE_DF) -> np.ndarray | Non
     return basis if basis.ndim == 2 and basis.shape[1] >= 2 else None
 
 
-# ──────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 # Effect modification
-# ──────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 
 
 def _simple_slope(
@@ -430,7 +432,7 @@ def moderation_terms(
         float(stats.chi2.sf(stat, dof)) if np.isfinite(stat) else float("nan")
     )
 
-    # ── Simple slopes ────────────────────────────────────────────
+    # ── Simple slopes ───────────────────────────────────────────
     slopes: list[dict] = []
 
     def _record(label: str, value, products_at: list[tuple[str, float]], count):
@@ -508,7 +510,7 @@ def _orthogonalise(block: np.ndarray, against: np.ndarray, tol: float = 1e-8):
     the indices kept. Used to split a spline basis into "the straight line" and
     "everything the straight line cannot express".
     """
-    q, _ = np.linalg.qr(against)
+    q = col_basis(against)
     residual = block - q @ (q.T @ block)
     scale = np.linalg.norm(residual, axis=0)
     reference = max(float(np.max(np.linalg.norm(block, axis=0))), 1e-30)
@@ -605,7 +607,7 @@ def spline_nonlinearity_test(
     joint = _natural_cubic_basis(np.concatenate([x, grid]), df)
     if joint is not None and joint.shape[1] == basis.shape[1]:
         joint_linear = np.column_stack([np.ones(len(joint)), np.concatenate([x, grid])])
-        q, _ = np.linalg.qr(joint_linear)
+        q = col_basis(joint_linear)
         joint_nl = (joint - q @ (q.T @ joint))[:, kept]
         yhat = fitted["linear"][0] * grid + joint_nl[n:] @ beta_nl
         centre = float(np.interp(float(np.nanmedian(x)), grid, yhat))

@@ -15,6 +15,7 @@ These are direct lifts of the workers that used to live in ``ui/tabs/``:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -29,7 +30,10 @@ import geopandas as gpd
 import numpy as np
 import rasterio
 
-from geofuse import JobCancelled, metric_intake
+from geofuse import JobCancelled
+from geofuse import bayesian_index as _bayesian_index
+from geofuse import cgi_formulas as _cgi_formulas
+from geofuse import metric_intake
 from geofuse import pdcor as _pdcor_mod
 from geofuse.crs_utils import (
     default_geotiff_creation_options,
@@ -51,10 +55,11 @@ from geofuse.jobs.fusion_outputs import (
     _fusion_stage_weight,
     _jsonsafe_results,
     _log_stage_timing,
-    _stability_summary,
+    _negative_control_report,
+    _posterior_summary,
     _write_fusion_outputs,
 )
-from geofuse.jobs.stage_ledger import DONE, RUNNING, SKIPPED
+from geofuse.jobs.stage_ledger import DONE, FAILED, RUNNING, SKIPPED
 from geofuse.logger import get_logger
 from geofuse.longitudinal import (
     GREENERY_CHANNELS,
@@ -273,7 +278,7 @@ def _write_gvi_outputs(
                 arr_veg = np.full((h, w), np.nan, dtype=np.float32)
                 arr_ter = np.full((h, w), np.nan, dtype=np.float32)
                 if has_cluster_col:
-                    cdf = res_df[res_df["cluster_id"] == cid].dropna(subset=["gvi_veg"])
+                    cdf = res_df[res_df["cluster_id"] == cid]
                     if not cdf.empty:
                         lr = (cdf["row"].to_numpy() - cluster["row_min"]).astype(int)
                         lc = (cdf["col"].to_numpy() - cluster["col_min"]).astype(int)
@@ -900,8 +905,18 @@ def _fusion_config_fingerprint(
 # ────────────────────────────────────────────────────────────────────
 
 
+# The channel sets a job can pick between. Merging the street-view components
+# into one green-view channel measured stronger than either alone and is far
+# less redundant with NDVI, so it is the default; keeping them apart stays
+# available for studies that need the components separated.
+_CHANNEL_SETS: dict[str, tuple[str, ...]] = {
+    "ndvi + gvi": ("ndvi", "gvi"),
+    "ndvi + veg + terrain": ("ndvi", "veg", "terrain"),
+}
+
+
 # Ordered pipeline steps per target outcome, recorded by the stage ledger so
-# the monitor can show where a run is. ``optimize`` is the stability search and
+# the monitor can show where a run is. ``optimize`` is the discovery step and
 # dominates the runtime; ``report_stats`` is the replicate-statistics tail.
 # Relative wall-time weights for the main progress bar. Bootstrap searches
 # dominate a run; the replicate-statistics tail is the next largest cost, while
@@ -1052,13 +1067,17 @@ def run_fusion(
     spatial_adjust_eps_m: float | None = None,
     residualize_method: str = "linear",
     search_scoring_method: str = "mom_em3",
-    n_bootstraps: int = 20,
-    n_trials_per_bootstrap: int = 50,
-    weight_bin_pct: int = 20,
-    weight_refine_bin_pct: int | None = None,
-    min_cell_count: int = 3,
-    worst_quantile: float = 0.10,
-    max_pfer: float = 1.0,
+    channel_set: str = "",
+    index_form: str = "sweep",
+    sweep_splits: int = 40,
+    discovery_reps: int = 5,
+    discovery_shuffles: int = 12,
+    gain_splits: int = 20,
+    gain_permutations: int = 100,
+    null_calibration_runs: int = 16,
+    posterior_draws: int = 800,
+    posterior_warmup: int = 800,
+    posterior_chains: int = 4,
     spatial_split: bool = False,
     spatial_block_size_m: float | None = None,
     n_spatial_blocks: int | None = None,
@@ -1070,17 +1089,20 @@ def run_fusion(
     report_paired_bootstrap: int = 2000,
     exposure_iqr: float | None = None,
     moderator_columns: list[str] | None = None,
+    negative_controls: list[str] | None = None,
+    negative_control_retune: bool = False,
 ) -> dict:
-    """Run a fusion job: stability-selection tuning + held-out test scoring.
+    """Run a fusion job: data-driven CGI discovery + held-out test scoring.
 
-    For CGI (and each enabled standalone channel) the engine draws
-    ``n_bootstraps`` resamples of the train+val pool, runs an
-    ``n_trials_per_bootstrap``-trial RandomSampler search per resample, and
-    selects the weight cell with the best worst-quantile out-of-bag score.
-    ``max_pfer`` caps the calibrated selection size so the reported PFER bound
-    stays under it (a non-positive value disables the cap). The winning params
-    are then scored once on the held-out test split with a percentile bootstrap
-    CI. When standalones are enabled, both a whole-data (``all``) paired
+    For CGI (and each enabled standalone channel) the engine sweeps every
+    ``(radius, statistic)`` pair per channel and both functional forms, scoring
+    each candidate on held-out rows of the train+val pool over ``sweep_splits``
+    splits, then fits a posterior over the channel weights at the winning
+    columns. ``discovery_reps`` x ``discovery_shuffles`` independent repeats
+    report whether the pick itself reproduces, and ``gain_splits`` compare the
+    composite against each standalone under the identical procedure with a
+    permutation null on the gain. The winning params are then scored once on
+    the held-out test split with a percentile bootstrap CI. When standalones are enabled, both a whole-data (``all``) paired
     objective comparison and an ``all``-data AIC/BIC comparison report whether
     CGI is justified over the best single channel.
 
@@ -1088,7 +1110,29 @@ def run_fusion(
     CI bootstrap (``report_ci_bootstrap``; ``None`` picks 2,000 for the O(n²)
     ``partial_distance_corr`` objective and 10,000 otherwise — percentile CIs
     are stable well below the higher figure), the effects bootstrap /
-    permutation counts, and the paired CGI-vs-standalone bootstrap."""
+    permutation counts, and the paired CGI-vs-standalone bootstrap.
+
+    ``negative_controls`` names target columns holding negative-control
+    outcomes. They never enter tuning; each study's frozen composite is scored
+    against them on the test split and on train+val, with the paired contrast
+    drawn from ``report_paired_bootstrap`` resamples. ``negative_control_retune``
+    also re-runs the CGI's sweep and posterior with each control as the target
+    and reports how closely that tuning reproduces the target's."""
+    # Bound before the body so the handlers below can close out the ledger no
+    # matter how early a run fails.
+    ledger = None
+
+    def _close_ledger(status: str, message: str) -> None:
+        """Stop the clock on the stage the run died inside, and persist it."""
+        if ledger is None:
+            return
+        if ledger.stop_running(status, message) is None:
+            return
+        try:
+            ctx.update_stage_ledger(ledger.to_dict())
+        except Exception:
+            pass
+
     try:
         # Imported here (not at module load) so the runner module stays light
         # and the fusion engine is only pulled into the process that runs the
@@ -1111,12 +1155,24 @@ def run_fusion(
         # Validate the standalone request up front so a typo doesn't slip
         # through to the ledger and engine. ``None`` and empty list both mean
         # "CGI only" (the legacy behaviour).
+        # The channel set is the job input; the functional form is swept
+        # unless the user pinned one. Jobs recorded before the channel set
+        # existed carry only ``cgi_formula``, so an empty value keeps it.
+        if channel_set:
+            cgi_formula = _cgi_formulas.formula_for(
+                _CHANNEL_SETS[channel_set], "linear"
+            )
+        index_forms: tuple[str, ...] = (
+            _bayesian_index.FORMS if index_form == "sweep" else (index_form,)
+        )
+
         standalones: list[str] = list(standalone_channels or [])
+        allowed = _cgi_formulas.formula_channels(cgi_formula)
         for _ch in standalones:
-            if _ch not in ("veg", "terrain", "ndvi"):
+            if _ch not in allowed:
                 raise ValueError(
-                    f"standalone_channels entries must be one of "
-                    f"'veg','terrain','ndvi'; got {_ch!r}."
+                    f"standalone_channels entries must be channels of "
+                    f"'{cgi_formula}' ({', '.join(allowed)}); got {_ch!r}."
                 )
         if standalones:
             _log_fusion(
@@ -1159,12 +1215,18 @@ def run_fusion(
             longitudinal_spec is not None
             and longitudinal_spec.scoring_metric in _LON_MIXEDLM_METRICS
         )
+        retune_enabled = (
+            bool(negative_control_retune)
+            and bool(negative_controls)
+            and longitudinal_spec is None
+        )
         ledger = _build_fusion_ledger(
             all_labels,
             multi=multi_outcome,
             standalone_channels=standalones,
             longitudinal=longitudinal_spec is not None,
             mixedlm_postscore=mixedlm_postscore_enabled,
+            negative_control_retune=retune_enabled,
         )
         ctx.update_stage_ledger(ledger.to_dict())
 
@@ -1178,17 +1240,21 @@ def run_fusion(
             "residualize_method": str(residualize_method),
             "search_scoring_method": str(search_scoring_method),
             "cgi_formula": cgi_formula,
+            "channel_set": channel_set,
+            "index_form": index_form,
             "covariate_columns": list(covariate_columns or []),
             "standalone_channels": list(standalones),
             "test_size": float(test_size),
             "n_bins": n_bins,
-            "n_bootstraps": int(n_bootstraps),
-            "n_trials_per_bootstrap": int(n_trials_per_bootstrap),
-            "weight_bin_pct": int(weight_bin_pct),
-            "weight_refine_bin_pct": weight_refine_bin_pct,
-            "min_cell_count": int(min_cell_count),
-            "worst_quantile": float(worst_quantile),
-            "max_pfer": float(max_pfer),
+            "sweep_splits": int(sweep_splits),
+            "discovery_reps": int(discovery_reps),
+            "discovery_shuffles": int(discovery_shuffles),
+            "gain_splits": int(gain_splits),
+            "gain_permutations": int(gain_permutations),
+            "null_calibration_runs": int(null_calibration_runs),
+            "posterior_draws": int(posterior_draws),
+            "posterior_warmup": int(posterior_warmup),
+            "posterior_chains": int(posterior_chains),
             "buffer_meters": buffer_meters,
             "gvi_buffer_min_m": gvi_buffer_min_m,
             "gvi_buffer_max_m": gvi_buffer_max_m,
@@ -1212,6 +1278,8 @@ def run_fusion(
             "report_effects_permutations": int(report_effects_permutations),
             "exposure_iqr": exposure_iqr,
             "moderator_columns": list(moderator_columns or []),
+            "negative_controls": list(negative_controls or []),
+            "negative_control_retune": bool(negative_control_retune),
             "report_paired_bootstrap": int(report_paired_bootstrap),
             "cache_metrics": bool(cache_metrics),
             "resume_existing_study": bool(resume_existing_study),
@@ -1220,8 +1288,14 @@ def run_fusion(
             "multi_objective_requested": bool(multi_objective_requested),
             "longitudinal_spec": longitudinal_spec_payload,
             "target_display_name": target_display_name,
-            "selection_method": "bootstrap_stability_selection",
+            "selection_method": "bayesian_index",
         }
+        # A short hash of the settings above, so a result can be matched against
+        # the configuration that produced it — and a pre-registered analysis can
+        # be shown to be the one that ran, rather than asserted to be.
+        run_config_record["config_hash"] = hashlib.sha256(
+            json.dumps(run_config_record, sort_keys=True, default=str).encode()
+        ).hexdigest()[:16]
 
         def stage(key: str, status: str, message: str = "") -> None:
             """Record a stage transition in the ledger and persist it."""
@@ -1333,6 +1407,20 @@ def run_fusion(
                     f"[{label}] Dropping covariate(s) that match this outcome: "
                     f"{sorted(set(user_covs) - set(outcome_covs))}",
                 )
+            # A control cannot be the outcome itself, and one that is also a
+            # covariate would be partialled out of its own test.
+            outcome_ncs = [
+                c
+                for c in (negative_controls or [])
+                if c != target_feature and c not in outcome_covs
+            ]
+            if len(outcome_ncs) != len(negative_controls or []):
+                _log_fusion(
+                    "WARN",
+                    f"[{label}] Negative control(s) that are this outcome or a "
+                    f"covariate were dropped: "
+                    f"{sorted(set(negative_controls or []) - set(outcome_ncs))}",
+                )
 
             engine = MetricFusionEngine(
                 target_file=target_path,
@@ -1361,6 +1449,7 @@ def run_fusion(
                 spatial_adjust_eps_m=spatial_adjust_eps_m,
                 residualize_method=residualize_method,
                 search_scoring_method=search_scoring_method,
+                negative_control_columns=outcome_ncs,
             )
 
             ctx.progress(
@@ -1718,7 +1807,7 @@ def run_fusion(
                     config_fingerprint=config_fp,
                 )
 
-            # One held-out test split + the train+val pool that stability
+            # One held-out test split + the train+val pool that the sweep
             # selection resamples.
             stage(skey("split"), RUNNING)
             ctx.progress(
@@ -1766,38 +1855,15 @@ def run_fusion(
                         "covariate-aware objectives if runtime matters.",
                     )
 
-            # ``n_trials_per_bootstrap`` is the CGI (target) per-bootstrap budget.
-            # A standalone single channel explores a far smaller stability-
-            # selection space — one weight axis (``slots`` 10 %-bins) vs the CGI's
-            # main-weight simplex (``weight_cell_count`` cells) — so it scales DOWN
-            # by that cell ratio to match the CGI's per-cell trial density instead
-            # of over-sampling its tiny search.
-            from .. import cgi_formulas as _cgi_formulas
-
-            _cgi_cells = max(
-                1, _cgi_formulas.weight_cell_count(cgi_formula, int(weight_bin_pct))
-            )
-            _standalone_cells = max(1, 100 // int(weight_bin_pct))
-            cgi_trials_per_bootstrap = int(n_trials_per_bootstrap)
-            standalone_trials_per_bootstrap = max(
-                1,
-                round(int(n_trials_per_bootstrap) * _standalone_cells / _cgi_cells),
-            )
-            if standalone_trials_per_bootstrap != cgi_trials_per_bootstrap:
-                _log_fusion(
-                    "INFO",
-                    f"[{label}] CGI uses {int(n_bootstraps)}×{cgi_trials_per_bootstrap} "
-                    f"trials over {_cgi_cells} weight cells; each standalone scales "
-                    f"down to {int(n_bootstraps)}×{standalone_trials_per_bootstrap} "
-                    f"({_standalone_cells} cells / {_cgi_cells} = "
-                    f"×{_standalone_cells / _cgi_cells:.2f}).",
-                )
+            # The sweep is exhaustive, so a standalone's grid is simply smaller
+            # (one channel's radius x statistic instead of the product) and no
+            # trial-budget scaling is needed.
 
             def _study_progress_cb(study_label: str, stage_key: str | None = None):
-                """Per-trial callback → live caption, trial bar, and stage row.
+                """Per-stage callback → live caption, progress bar, stage row.
 
-                Throttled to ~0.4 s (always fires on the final trial) so the
-                job card shows "<study>: k / N trials" without flooding the
+                Throttled to ~0.4 s (always fires on the last step) so the
+                job card shows "<study>: k / N steps" without flooding the
                 store. When ``stage_key`` is given it also advances that
                 running search stage's ledger fraction (via ``stage_progress``,
                 which self-throttles the synchronous SQLite write) and steps the
@@ -1815,11 +1881,11 @@ def run_fusion(
                         stage_progress(
                             stage_key,
                             (done / total) if total else 0.0,
-                            f"{done:,}/{total:,} trials",
+                            f"{done:,}/{total:,} steps",
                         )
                     ctx.progress(
                         value=prog_ledger() if stage_key is not None else None,
-                        status_text=f"{prefix}{study_label}: {done:,}/{total:,} trials",
+                        status_text=f"{prefix}{study_label}: {done:,}/{total:,} steps",
                         fusion_study_progress={
                             "study": study_label,
                             "current": int(done),
@@ -1830,42 +1896,39 @@ def run_fusion(
 
                 return _cb
 
-            # A non-positive cap means "no PFER cap" — pass None so the
-            # calibration is free to grow the selection size K.
-            max_pfer_arg = None if float(max_pfer) <= 0 else float(max_pfer)
-
-            # ── Stability selection (dominant compute) ──
-            # Headline params: the stability-selection winning weight cell on
-            # the full train+val pool (params averaged within the cell). The
-            # "CGI: k/N trials" sub-bar and the running-stage fraction both live
-            # here, so the running stage and the trial counter agree.
+            # ── Sweep + posterior (dominant compute) ────
+            # Headline params: the configuration the sweep picked on the
+            # train+val pool, with posterior-mean weights. The sub-bar and the
+            # running-stage fraction both live here, so the stage and the
+            # progress counter agree.
             stage(skey("optimize"), RUNNING)
             ctx.progress(
                 value=prog_ledger(),
                 status_text=(
-                    f"{prefix}Stability selection "
-                    f"({int(n_bootstraps)}×{cgi_trials_per_bootstrap})..."
+                    f"{prefix}Sweep + posterior "
+                    f"({int(sweep_splits)} splits, {int(discovery_reps)} replicates)..."
                 ),
             )
-            headline_params = engine.bootstrap_stability_selection(
+            headline_params = engine.fit_bayesian_index(
                 metric=objective_metric,
-                n_bootstraps=int(n_bootstraps),
-                n_trials_per_bootstrap=cgi_trials_per_bootstrap,
-                weight_bin_pct=int(weight_bin_pct),
-                weight_refine_bin_pct=weight_refine_bin_pct,
-                min_cell_count=int(min_cell_count),
-                worst_quantile=float(worst_quantile),
-                max_pfer=max_pfer_arg,
-                spatial_resample=bool(spatial_split),
+                forms=index_forms,
+                sweep_splits=int(sweep_splits),
+                reps=int(discovery_reps),
+                shuffles=int(discovery_shuffles),
+                gain_splits=int(gain_splits),
+                gain_perm=int(gain_permutations),
+                null_runs=int(null_calibration_runs),
+                draws=int(posterior_draws),
+                warmup=int(posterior_warmup),
+                chains=int(posterior_chains),
                 seed=42,
                 cancel_callback=cancel_check,
                 progress_callback=_study_progress_cb("CGI", skey("optimize")),
             )
             engine.best_params = dict(headline_params)
-            cgi_stability_summary = _stability_summary(headline_params)
-            # Kept for the results bundle's schema. Stability selection has no
-            # master Optuna study, so there is no explicit best/robust trial
-            # pool — the winning cell is the aggregate over bootstrap resamples.
+            cgi_discovery_summary = _posterior_summary(headline_params)
+            # Kept for the results bundle's schema. The sweep has no master
+            # Optuna study, so there is no best/robust trial pool.
             best_params: dict = {}
             robust_trials: list = []
             if ctx.is_cancelled():
@@ -1944,7 +2007,7 @@ def run_fusion(
             except Exception as exc:
                 _log_fusion("WARN", f"[{label}] Whole-data effects failed: {exc}")
 
-            # No master Optuna study in stability mode, so there is no per-trial
+            # No master Optuna study, so there is no per-trial
             # test sidecar to build.
             cgi_per_trial_test: dict[int, dict[str, float]] = {}
             stage(skey("report_stats"), DONE)
@@ -1989,7 +2052,7 @@ def run_fusion(
                     )
                 stage(skey("mixedlm_postscore"), DONE)
 
-            # ── Standalone stability searches ───────────
+            # ── Standalone discoveries ──────────────────
             # One search per channel, reusing the engine, its cache and split.
             # Each overwrites the engine's active channel and best params, so
             # snapshot the CGI state here and restore it after the loop.
@@ -2007,27 +2070,28 @@ def run_fusion(
                 ctx.progress(
                     value=prog_ledger(),
                     status_text=(
-                        f"{prefix}Standalone {ch_disp} stability selection "
-                        f"({int(n_bootstraps)}×{int(n_trials_per_bootstrap)})..."
+                        f"{prefix}Standalone {ch_disp} sweep + posterior "
+                        f"({int(sweep_splits)} splits)..."
                     ),
                 )
                 ch_study_name = _standalone_study_name(ch)
-                # Pin the active channel so _objective treats the trial's
-                # composite as this channel's normalized value, then run the
-                # same bootstrap stability search as CGI. The channel stays
-                # pinned through the composite write below; the CGI state is
-                # restored after the loop.
+                # Pin the active channel so the sweep scores this channel
+                # alone, through the same discovery the CGI gets. The channel
+                # stays pinned through the composite write below; the CGI state
+                # is restored after the loop.
                 engine._active_greenery_channel = ch
-                ch_best = engine.bootstrap_stability_selection(
+                ch_best = engine.fit_bayesian_index(
                     metric=objective_metric,
-                    n_bootstraps=int(n_bootstraps),
-                    n_trials_per_bootstrap=int(standalone_trials_per_bootstrap),
-                    weight_bin_pct=int(weight_bin_pct),
-                    weight_refine_bin_pct=weight_refine_bin_pct,
-                    min_cell_count=int(min_cell_count),
-                    worst_quantile=float(worst_quantile),
-                    max_pfer=max_pfer_arg,
-                    spatial_resample=bool(spatial_split),
+                    forms=index_forms,
+                    sweep_splits=int(sweep_splits),
+                    reps=int(discovery_reps),
+                    shuffles=int(discovery_shuffles),
+                    gain_splits=0,  # nothing to compare a standalone against
+                    gain_perm=0,
+                    null_runs=int(null_calibration_runs),
+                    draws=int(posterior_draws),
+                    warmup=int(posterior_warmup),
+                    chains=int(posterior_chains),
                     seed=42,
                     cancel_callback=cancel_check,
                     progress_callback=_study_progress_cb(
@@ -2036,7 +2100,7 @@ def run_fusion(
                 )
                 engine.best_params = dict(ch_best)
                 ch_headline_params = dict(ch_best)
-                ch_stability_summary = _stability_summary(ch_best)
+                ch_discovery_summary = _posterior_summary(ch_best)
                 stage(skey(f"standalone_{ch}"), DONE)
 
                 # Test scoring, CIs, subset scores, composite TIFF, and the
@@ -2092,6 +2156,17 @@ def run_fusion(
                     job_artifacts_root, "study_results", f"standalone_{ch}"
                 )
                 ch_averaged_params: dict = dict(ch_headline_params)
+                # The same transfer test as the CGI's, so the report shows
+                # whether the composite is more or less specific than a single
+                # channel.
+                ch_negative_controls = _negative_control_report(
+                    engine,
+                    ch_averaged_params,
+                    objective_metric,
+                    int(report_paired_bootstrap),
+                    label=label,
+                    log=_log_fusion,
+                )
                 ch_composite_path = os.path.join(
                     job_artifacts_root, f"composite_greenery_{ch}.tif"
                 )
@@ -2122,8 +2197,9 @@ def run_fusion(
                     "per_trial_test": {},
                     "test_results": ch_test,
                     "subset_scores": ch_subset_scores,
-                    "stability_summary": ch_stability_summary,
+                    "discovery_summary": ch_discovery_summary,
                     "direction_sign": ch_direction,
+                    "negative_controls": ch_negative_controls,
                     "objective_metric": objective_metric,
                     "study_name": ch_study_name,
                     "report_dir": ch_report_dir,
@@ -2193,9 +2269,10 @@ def run_fusion(
             cgi_vs_standalone_paired: dict | None = None
             cgi_vs_standalone_paired_family: list[dict] = []
             if standalones and standalones_bundle:
-                for ch in [
-                    c for c in ("veg", "terrain", "ndvi") if c in standalones_bundle
-                ]:
+                # The job's own standalone list, so a two-channel study's
+                # ``gvi`` arm is in the family rather than dropped from it —
+                # which would also change what the Holm correction is over.
+                for ch in [c for c in standalones if c in standalones_bundle]:
                     ch_bundle = standalones_bundle[ch]
                     ch_params = (
                         ch_bundle.get("averaged_params")
@@ -2285,7 +2362,7 @@ def run_fusion(
             averaged_params: dict | None = dict(headline_params)
             try:
                 # No master study to plot trials from — generate the composite
-                # TIFF directly from the stability-selection winning params.
+                # TIFF directly from the discovery's winning params.
                 engine.generate_composite_greenery_map(
                     output_path=cgi_composite_path,
                 )
@@ -2372,6 +2449,42 @@ def run_fusion(
                     f"[{label}] Moderation computation failed: {exc}",
                 )
 
+            # Specificity: the frozen composite scored against each negative-
+            # control outcome, which never entered tuning.
+            negative_control_report = _negative_control_report(
+                engine,
+                averaged_params,
+                objective_metric,
+                int(report_paired_bootstrap),
+                label=label,
+                log=_log_fusion,
+            )
+            if retune_enabled:
+                if outcome_ncs and negative_control_report:
+                    stage(skey("negative_control_retune"), RUNNING)
+                    ctx.progress(
+                        value=prog_ledger(),
+                        status_text=f"{prefix}Re-tuning on negative controls...",
+                    )
+                    negative_control_report["retune"] = engine.retune_concordance(
+                        headline_params,
+                        objective_metric,
+                        forms=index_forms,
+                        sweep_splits=int(sweep_splits),
+                        draws=int(posterior_draws),
+                        warmup=int(posterior_warmup),
+                        chains=int(posterior_chains),
+                        seed=42,
+                        cancel_callback=cancel_check,
+                    )
+                    stage(skey("negative_control_retune"), DONE)
+                else:
+                    stage(
+                        skey("negative_control_retune"),
+                        SKIPPED,
+                        "No negative control left for this outcome.",
+                    )
+
             bundle = {
                 "best_params": best_params,
                 "averaged_params": averaged_params,
@@ -2386,6 +2499,7 @@ def run_fusion(
                 "decline_terms": decline_terms,
                 "exposure_response": exposure_response_report,
                 "moderation": moderation_report,
+                "negative_controls": negative_control_report,
                 "target_feature": target_feature,
                 # Run details persisted so the results panel survives a disk
                 # reload (when the live engine is gone): user-facing covariate
@@ -2398,6 +2512,10 @@ def run_fusion(
                     getattr(engine, "_covariate_dummy_map", {}) or {}
                 ),
                 "cgi_formula": cgi_formula,
+                "config_hash": run_config_record["config_hash"],
+                # Distinct configurations scored on the held-out slice. A test
+                # set is a budget; this makes a spent one visible.
+                "test_reads": int(getattr(engine, "_test_reads", 0)),
                 "target_display_name": target_display_name,
                 "outcome_label": target_feature or target_display_name,
                 "standalones": standalones_bundle,
@@ -2409,9 +2527,9 @@ def run_fusion(
                 "disabled_channels": sorted(
                     getattr(engine, "_disabled_channels", set()) or set()
                 ),
-                # Stability-selection diagnostics, the held-out direction sign,
+                # Discovery diagnostics, the held-out direction sign,
                 # and the AIC/BIC verdict vs the best standalone (when run).
-                "stability_summary": cgi_stability_summary,
+                "discovery_summary": cgi_discovery_summary,
                 "direction_sign": cgi_direction,
                 "cgi_vs_standalone_aic_bic": cgi_vs_standalone_aic_bic,
                 # Held-out test effect (headline) + descriptive whole-data CI +
@@ -2498,7 +2616,12 @@ def run_fusion(
         # the stage-boundary cancels do; the executor reads the cancel flag and
         # files the job as cancelled rather than failed.
         _log_fusion("WARN", "Fusion job cancelled by user.")
+        _close_ledger(FAILED, "Cancelled by user.")
         return {"output_paths": []}
+
+    except BaseException as exc:
+        _close_ledger(FAILED, f"{type(exc).__name__}: {exc}")
+        raise
 
     finally:
         if target_cleanup_dir:

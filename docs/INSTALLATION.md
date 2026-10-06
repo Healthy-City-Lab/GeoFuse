@@ -1,4 +1,4 @@
-# GeoFuse — Installation Guide
+# GeoFuse installation guide
 
 ## Prerequisites
 
@@ -98,8 +98,8 @@ Expected console output:
 
 Expected files in `tests/output/test2_system/`:
 
-* `images/` — downloaded Street View panoramas
-* `test_ndvi.tif` — NDVI tile
+* `images/`: downloaded Street View panoramas
+* `test_ndvi.tif`: NDVI tile
 
 ### Stability / Memory Test
 

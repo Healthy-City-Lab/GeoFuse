@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import ee
 import geopandas as gpd
+import numpy as np
+import shapely
 from shapely.geometry import mapping
 
 from .logger import get_logger
@@ -54,16 +56,54 @@ EE_REQUEST_BUDGET_BYTES = (
     5_000_000  # ~5 MiB — leave headroom for the rest of the EE compute graph
 )
 
+# Bounds on the GeoJSON bytes one coordinate pair costs, used to decide whether
+# a candidate needs serialising at all. GeoPandas writes full float repr, so a
+# lon/lat pair measures ~42 characters in practice and cannot exceed ~48; the
+# lower bound covers round numbers such as ``[0,0],``. Anything the vertex count
+# already settles skips ``to_json`` entirely.
+_GEOJSON_BYTES_PER_COORD_MAX = 48
+_GEOJSON_BYTES_PER_COORD_MIN = 8
+_GEOJSON_OVERHEAD_BYTES = 4096
+
+# Part count above which the AOI is coarsened by per-part bounding box rather
+# than by simplification. Simplification cannot take a part below a triangle, so
+# on a many-part footprint its best case is already the same order of size as the
+# box union — while costing vastly more: topology-preserving simplify runs ~90 s
+# per pass on a 1.3M-vertex, 20k-part buffered point cloud, and the tolerance
+# ladder needs eight of them. Boxes also *contain* their part, where a simplified
+# ring cuts inside it, so the coarse AOI can no longer clip real pixels away.
+_ENVELOPE_UNION_MIN_PARTS = 64
+
+
+def _coord_count(gdf: gpd.GeoDataFrame) -> int:
+    return int(shapely.get_num_coordinates(gdf.geometry.values).sum())
+
+
+def _certainly_fits_budget(gdf: gpd.GeoDataFrame) -> bool:
+    n = _coord_count(gdf) * _GEOJSON_BYTES_PER_COORD_MAX + _GEOJSON_OVERHEAD_BYTES
+    return n <= EE_REQUEST_BUDGET_BYTES
+
+
+def _certainly_over_budget(gdf: gpd.GeoDataFrame) -> bool:
+    return _coord_count(gdf) * _GEOJSON_BYTES_PER_COORD_MIN > EE_REQUEST_BUDGET_BYTES
+
 
 def shrink_gdf_for_ee(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """Return a GeoDataFrame whose GeoJSON serialisation fits the EE budget.
 
-    Pass-through when the input already fits.  Otherwise simplify the
-    geometry with growing tolerance (5 m → ~160 km across 15 doublings),
-    preserving topology.  If simplification cannot shrink the payload
-    enough — typically a dense point cloud, where ``simplify`` is a no-op
-    — fall back to the convex hull of the union, which keeps EE's
-    ``filterBounds`` correct.
+    Pass-through when the input already fits.  A footprint made of many
+    disconnected parts — a buffered survey point cloud, one disk per address —
+    is coarsened to the union of its parts' bounding boxes.  A
+    few-part footprint (a country boundary at full resolution) keeps its shape
+    and is simplified with growing tolerance (5 m → ~160 km across 15
+    doublings), preserving topology.  If neither fits, fall back to the convex
+    hull of the union, which still keeps EE's ``filterBounds`` correct.
+
+    The box union and the hull are **supersets** of the input, so the ``clip`` EE
+    applies with either cannot drop a pixel the caller asked for. Simplification
+    is the one coarsening that cuts inside the input, by at most its tolerance.
+    In every case the precise geometry still drives tiling and client-side
+    per-tile clipping.
 
     The CRS of the returned GeoDataFrame matches the input; the input is
     not modified in place.
@@ -72,38 +112,58 @@ def shrink_gdf_for_ee(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     def _size_bytes(g: gpd.GeoDataFrame) -> int:
         return len(g.to_json().encode("utf-8"))
 
-    n0 = _size_bytes(gdf)
-    if n0 <= EE_REQUEST_BUDGET_BYTES:
+    if _certainly_fits_budget(gdf):
         return gdf
+    if not _certainly_over_budget(gdf) and _size_bytes(gdf) <= EE_REQUEST_BUDGET_BYTES:
+        return gdf
+    mb0 = _coord_count(gdf) * _GEOJSON_BYTES_PER_COORD_MAX / 1e6
 
-    # 1 deg ≈ 111 km at most latitudes, so 5e-5 deg ≈ 5.5 m.
-    tol_deg = 5e-5
-    cur = gdf
-    for _ in range(15):
-        simp = cur.copy()
-        simp.geometry = cur.geometry.simplify(tol_deg, preserve_topology=True)
-        n = _size_bytes(simp)
-        if n <= EE_REQUEST_BUDGET_BYTES:
+    parts = shapely.get_parts(np.asarray(gdf.geometry.values, dtype=object))
+    if parts.size >= _ENVELOPE_UNION_MIN_PARTS:
+        boxed = gpd.GeoDataFrame(
+            {"geometry": [shapely.union_all(shapely.envelope(parts))]}, crs=gdf.crs
+        )
+        if _certainly_fits_budget(boxed) or _size_bytes(boxed) <= (
+            EE_REQUEST_BUDGET_BYTES
+        ):
             _log(
                 "WARN",
-                f"Input geometry was {n0 / 1e6:.1f} MB serialised, exceeding "
-                "the Earth Engine 10 MB request limit; simplified to "
-                f"{n / 1e6:.1f} MB at ~{tol_deg * 111_000:.0f} m tolerance. "
-                "Original geometry is retained for per-tile clipping.",
+                f"Input geometry was ~{mb0:.1f} MB serialised across "
+                f"{parts.size:,} parts, exceeding the Earth Engine 10 MB request "
+                "limit; the Earth Engine AOI was coarsened to the union of the "
+                f"parts' bounding boxes ({_size_bytes(boxed) / 1e6:.1f} MB). "
+                "Original geometry is retained for tiling and per-tile clipping.",
             )
-            return simp
-        tol_deg *= 2
+            return boxed
+    else:
+        # 1 deg ≈ 111 km at most latitudes, so 5e-5 deg ≈ 5.5 m.
+        tol_deg = 5e-5
+        for _ in range(15):
+            simp = gdf.copy()
+            simp.geometry = gdf.geometry.simplify(tol_deg, preserve_topology=True)
+            if not _certainly_over_budget(simp):
+                n = _size_bytes(simp)
+                if n <= EE_REQUEST_BUDGET_BYTES:
+                    _log(
+                        "WARN",
+                        f"Input geometry was ~{mb0:.1f} MB serialised, exceeding "
+                        "the Earth Engine 10 MB request limit; simplified to "
+                        f"{n / 1e6:.1f} MB at ~{tol_deg * 111_000:.0f} m tolerance. "
+                        "Original geometry is retained for per-tile clipping.",
+                    )
+                    return simp
+            tol_deg *= 2
 
-    # Simplification didn't shrink it enough (point clouds, very dense
-    # boundaries).  Replace with the convex hull of the union — EE's
-    # ``filterBounds`` only needs a region that intersects scenes, and the
-    # precise per-tile geometry still drives the actual clip/download.
-    hull = cur.geometry.union_all().convex_hull
-    out = gpd.GeoDataFrame({"geometry": [hull]}, crs=cur.crs)
+    # Neither coarsening fit — a footprint with hundreds of thousands of parts.
+    # Replace with the convex hull of the union: EE's ``filterBounds`` only needs
+    # a region that intersects scenes, and the precise geometry still drives the
+    # actual clip/download.
+    hull = shapely.convex_hull(shapely.union_all(parts))
+    out = gpd.GeoDataFrame({"geometry": [hull]}, crs=gdf.crs)
     _log(
         "WARN",
-        f"Input geometry was {n0 / 1e6:.1f} MB serialised and could not be "
-        "simplified under the Earth Engine 10 MB request limit; falling back "
+        f"Input geometry was ~{mb0:.1f} MB serialised and could not be "
+        "coarsened under the Earth Engine 10 MB request limit; falling back "
         f"to convex hull ({_size_bytes(out) / 1e6:.1f} MB). Per-tile clipping "
         "still uses the original geometry.",
     )

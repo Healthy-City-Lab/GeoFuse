@@ -8,6 +8,7 @@ replaced.
 
 import os
 import sys
+import time
 import unittest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -15,7 +16,7 @@ for _p in (os.path.join(ROOT, "ui"), ROOT):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from geofuse.jobs.stage_ledger import StageLedger
+from geofuse.jobs.stage_ledger import DONE, FAILED, StageLedger
 
 
 class TestStageTiming(unittest.TestCase):
@@ -98,6 +99,52 @@ class TestStageTiming(unittest.TestCase):
         led.mark_running("opt")
         led.reset_unfinished()
         self.assertEqual(led.get("load").duration_s, 2.0)
+
+
+class TestARunThatDiesStopsItsClock(unittest.TestCase):
+    """A stage counts up against the wall clock until its end is recorded.
+
+    A run that ends anywhere other than a stage boundary — an error, a cancel —
+    otherwise leaves the monitor timing a stage that stopped long ago.
+    """
+
+    def _mid_stage(self):
+        led = StageLedger.from_steps([("load", "Load"), ("opt", "Search")])
+        led.mark_done("load")
+        led.mark_running("opt")
+        return led
+
+    def test_stopping_freezes_the_running_stage(self):
+        led = self._mid_stage()
+        time.sleep(0.05)
+        self.assertEqual(led.stop_running(FAILED, "boom"), "opt")
+        first = led.get("opt").duration_s
+        time.sleep(0.15)
+        self.assertAlmostEqual(led.get("opt").duration_s, first, places=6)
+
+    def test_it_records_why(self):
+        led = self._mid_stage()
+        led.stop_running(FAILED, "Cancelled by user.")
+        self.assertEqual(led.get("opt").status, FAILED)
+        self.assertEqual(led.get("opt").message, "Cancelled by user.")
+
+    def test_finished_stages_are_left_alone(self):
+        led = self._mid_stage()
+        done_end = led.get("load").ended_at
+        led.stop_running(FAILED, "boom")
+        self.assertEqual(led.get("load").status, DONE)
+        self.assertEqual(led.get("load").ended_at, done_end)
+
+    def test_nothing_running_is_a_no_op(self):
+        led = StageLedger.from_steps([("load", "Load")])
+        led.mark_done("load")
+        self.assertIsNone(led.stop_running(FAILED, "boom"))
+
+    def test_a_retry_is_not_charged_for_the_failed_attempt(self):
+        led = self._mid_stage()
+        led.stop_running(FAILED, "boom")
+        led.reset_unfinished()
+        self.assertIsNone(led.get("opt").duration_s)
 
 
 class TestParallelEfficiencyReport(unittest.TestCase):

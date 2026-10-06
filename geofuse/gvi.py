@@ -722,7 +722,10 @@ class GVIEngine:
 
         async def _emit(result: dict) -> None:
             nonlocal completed
-            if result_callback:
+            # Skip points with no panorama (pano_id=None) so the accumulated
+            # list — and every output format built from it — only ever holds
+            # points with real data. Progress still counts every attempt.
+            if result_callback and result.get("pano_id") is not None:
                 result_callback(result)
             async with completed_lock:
                 completed += 1

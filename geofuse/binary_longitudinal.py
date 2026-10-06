@@ -27,7 +27,7 @@ Search cost, and what makes it affordable
 -----------------------------------------
 
 An exact GEE fit iterates IRLS to convergence and re-estimates the working
-correlation on every pass. Inside a stability-selection search that is hundreds
+correlation on every pass. Inside a search that is hundreds
 of fits per fold, and it dominates the runtime.
 
 The same observation that makes the Gaussian fast scorer work applies here.

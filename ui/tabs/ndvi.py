@@ -11,7 +11,6 @@ import rasterio
 import streamlit as st
 from helpers import (
     RESTART_SESSION_KEY,
-    apply_buffer_m,
     file_size_mtime_fingerprint,
     load_vector_paths,
     load_vector_upload_sessions,
@@ -579,7 +578,7 @@ def _render_ndvi_settings_map() -> None:
         for fname, d in st.session_state.ndvi_datasets.items():
             if d.get("type") == "restored" or d.get("raw") is None:
                 continue
-            add_study_area_layers(
+            buf_bounds = add_study_area_layers(
                 m_ndvi_input,
                 d["raw"],
                 study_name=fname,
@@ -587,8 +586,8 @@ def _render_ndvi_settings_map() -> None:
                 buffer_name=f"{fname} (buffer)",
             )
             all_bounds.append(d["raw"].total_bounds)
-            if buffer_m > 0:
-                all_bounds.append(apply_buffer_m(d["raw"], int(buffer_m)).total_bounds)
+            if buf_bounds is not None:
+                all_bounds.append(buf_bounds)
         if all_bounds:
             min_x = min(b[0] for b in all_bounds)
             min_y = min(b[1] for b in all_bounds)

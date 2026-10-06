@@ -13,6 +13,7 @@ from collections.abc import Callable
 import geopandas as gpd
 import numpy as np
 import rasterio
+import shapely
 from pyproj import CRS as PyProjCRS
 from pyproj import Geod, Transformer
 from rasterio.transform import from_bounds
@@ -512,11 +513,59 @@ def select_grid_crs(gdf: gpd.GeoDataFrame) -> tuple[PyProjCRS, float, str]:
     return crs, distortion, name
 
 
+# Segments per quarter circle in every buffer this module builds. 16 matches
+# what shapely's ``Geometry.buffer`` method uses, so the footprint here is
+# coordinate-for-coordinate what the pipeline produced before — dropping to
+# shapely's *functional* default of 8 would quietly shrink every AOI by up to
+# 0.5% of the buffer distance while saving only ~15% of the runtime.
+BUFFER_QUAD_SEGS = 16
+
+
+def buffer_union_planar(
+    geoms,
+    buffer_m: float,
+    *,
+    quad_segs: int = BUFFER_QUAD_SEGS,
+):
+    """Dilate ``geoms`` by ``buffer_m`` and dissolve, in the coordinates given.
+
+    Callers must pass geometries whose units are already metres — this helper
+    does no reprojection.
+
+    **Buffer first, dissolve second.** Dilation distributes over union
+    (``buffer(A ∪ B) == buffer(A) ∪ buffer(B)`` for a shared structuring
+    element), so the two orderings describe the same footprint, but they cost
+    very differently: dissolving a point cloud first hands GEOS one MultiPoint
+    whose ``BufferOp`` builds every offset curve and nodes them in a *single*
+    overlay pass, whereas buffering the parts first lets ``union_all`` merge
+    them through its spatially-indexed cascade. Measured 5-10x faster on
+    20k-50k point inputs.
+
+    Exactly co-located points are dropped before buffering: survey inputs carry
+    one row per respondent, so a single apartment block can contribute hundreds
+    of identical circles that the union then has to collapse again.
+    """
+    arr = np.asarray(geoms, dtype=object)
+    arr = shapely.get_parts(arr[shapely.is_geometry(arr)])
+    arr = arr[~shapely.is_empty(arr)]
+    if arr.size == 0:
+        return shapely.GeometryCollection()
+    if buffer_m <= 0:
+        return shapely.union_all(arr)
+
+    is_point = shapely.get_type_id(arr) == 0
+    if is_point.any():
+        uniq_xy = np.unique(shapely.get_coordinates(arr[is_point]), axis=0)
+        arr = np.concatenate([shapely.points(uniq_xy), arr[~is_point]])
+
+    return shapely.union_all(shapely.buffer(arr, buffer_m, quad_segs=quad_segs))
+
+
 def buffer_gdf_union_metres(
     gdf: gpd.GeoDataFrame,
     buffer_m: float,
 ) -> gpd.GeoDataFrame:
-    """Single-feature GeoDataFrame: ``union_all(gdf).buffer(buffer_m)`` in metres.
+    """Single-feature GeoDataFrame holding ``gdf`` dilated by ``buffer_m`` metres.
 
     Distance is never applied in geographic degrees: buffering uses either the
     dataset CRS when it is already projected with metre axes, or an estimated UTM
@@ -529,13 +578,13 @@ def buffer_gdf_union_metres(
 
     orig_crs = gdf.crs
     if orig_crs is not None and crs_uses_metre_axes(orig_crs):
-        merged = gdf.geometry.union_all().buffer(buffer_m)
+        merged = buffer_union_planar(gdf.geometry.values, buffer_m)
         return gpd.GeoDataFrame({"geometry": [merged]}, crs=orig_crs)
 
     gdf_work = gdf.set_crs(WGS84_EPSG) if orig_crs is None else gdf
     utm = estimate_metre_projected_crs_for_gdf(gdf_work)
     gdf_utm = gdf_work.to_crs(utm)
-    merged = gdf_utm.geometry.union_all().buffer(buffer_m)
+    merged = buffer_union_planar(gdf_utm.geometry.values, buffer_m)
     out = gpd.GeoDataFrame({"geometry": [merged]}, crs=gdf_utm.crs)
     if orig_crs is None:
         return out.to_crs(WGS84_EPSG)

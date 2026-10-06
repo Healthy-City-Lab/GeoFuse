@@ -90,7 +90,12 @@ _FUSION_OUTCOME_ADD_PLACEHOLDER = "— Select column —"
 # ``veg``/``terrain``/``ndvi`` everywhere in code and JSON payloads;
 # anything user-visible (UI labels, captions, log lines surfaced to
 # users) goes through this mapping so the spelling is uniform.
-_CHANNEL_DISPLAY = {"veg": "Vegetation", "terrain": "Terrain", "ndvi": "NDVI"}
+_CHANNEL_DISPLAY = {
+    "veg": "Vegetation",
+    "terrain": "Terrain",
+    "ndvi": "NDVI",
+    "gvi": "GVI",
+}
 
 
 class _FusionVerticalScaleControl(MacroElement):
@@ -388,6 +393,7 @@ _CROSS_METRICS: tuple[str, ...] = (
     "r2",
     "nrmse",
     "mutual_info",
+    "quartile_contrast",
     "logit_tstat",
     "logit_coef",
 )
@@ -399,6 +405,7 @@ _CROSS_METRIC_LABELS: dict[str, str] = {
     "r2": "Incremental R²",
     "nrmse": "Normalized RMSE (lower is better)",
     "mutual_info": "Mutual information (ignores covariates)",
+    "quartile_contrast": "Quartile contrast (top vs bottom quarter, magnitude)",
     "logit_tstat": "Logistic Wald |z| (binary outcome)",
     "logit_coef": "Logistic log-odds ratio (binary outcome)",
     "mixedlm_tstat": "Mixed-effects |t| (panel)",
@@ -431,6 +438,17 @@ _MIXEDLM_METRICS: tuple[str, ...] = (
     "gee_logit_coef",
 )
 
+# Every channel that can carry a standalone study or a composite artifact,
+# across both channel sets. Iterating the union keeps artifact discovery
+# independent of which set a given job ran with.
+_ALL_STANDALONE_CHANNELS: tuple[str, ...] = ("veg", "terrain", "ndvi", "gvi")
+
+# Channel sets a job can pick between; mirrors ``runners._CHANNEL_SETS``.
+_CHANNEL_SETS: dict[str, tuple[str, ...]] = {
+    "ndvi + gvi": ("ndvi", "gvi"),
+    "ndvi + veg + terrain": ("ndvi", "veg", "terrain"),
+}
+
 # Authoritative list of every ``run_fusion`` setting that isn't a file path or
 # runtime object. The submit path records exactly these (under the same names)
 # and the restart path replays exactly these — so a re-run can never silently
@@ -462,6 +480,7 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "covariate_columns",
     "covariate_types",
     "moderator_columns",
+    "negative_controls",
     "exposure_iqr",
     "standalone_channels",
     "longitudinal_spec_payload",
@@ -475,13 +494,17 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "spatial_split",
     "spatial_block_size_m",
     "n_spatial_blocks",
-    "n_bootstraps",
-    "n_trials_per_bootstrap",
-    "weight_bin_pct",
-    "weight_refine_bin_pct",
-    "min_cell_count",
-    "worst_quantile",
-    "max_pfer",
+    "channel_set",
+    "index_form",
+    "sweep_splits",
+    "discovery_reps",
+    "discovery_shuffles",
+    "gain_splits",
+    "gain_permutations",
+    "null_calibration_runs",
+    "posterior_draws",
+    "posterior_warmup",
+    "posterior_chains",
     "check_collinearity",
     "vif_threshold",
 )
@@ -489,17 +512,21 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
 # Recorded param -> form widget key. Re-run seeds these so the normal setup
 # form comes up filled in; anything not listed keeps its own default.
 _FUSION_PARAM_TO_WIDGET: dict[str, str] = {
-    "cgi_formula": "fusion_cgi_formula",
     "objective_metric": "fusion_objective_metric",
     "residualize_method": "fusion_residualize_method",
     "search_scoring_method": "fusion_search_scoring_method",
     "test_size": "fusion_test_size",
     "n_bins": "fusion_stratification_bins",
-    "n_bootstraps": "fusion_n_bootstraps",
-    "n_trials_per_bootstrap": "fusion_n_trials_per_bootstrap",
-    "weight_bin_pct": "fusion_weight_bin_pct",
-    "weight_refine_bin_pct": "fusion_weight_refine_bin_pct",
-    "max_pfer": "fusion_max_pfer",
+    "channel_set": "fusion_channel_set",
+    "index_form": "fusion_index_form",
+    "sweep_splits": "fusion_sweep_splits",
+    "discovery_reps": "fusion_discovery_reps",
+    "discovery_shuffles": "fusion_discovery_shuffles",
+    "gain_splits": "fusion_gain_splits",
+    "gain_permutations": "fusion_gain_permutations",
+    "null_calibration_runs": "fusion_null_calibration_runs",
+    "posterior_draws": "fusion_posterior_draws",
+    "posterior_chains": "fusion_posterior_chains",
     "check_collinearity": "fusion_check_collinearity",
     "vif_threshold": "fusion_vif_threshold",
     "cgi_grid_spacing_m": "fusion_cgi_grid_spacing_m",
@@ -533,9 +560,14 @@ _FUSION_SEED_INT_WIDGETS: frozenset[str] = frozenset(
         "fusion_ndvi_buffer_max",
         "fusion_ndvi_buffer_step",
         "fusion_stratification_bins",
-        "fusion_n_bootstraps",
-        "fusion_n_trials_per_bootstrap",
-        "fusion_weight_bin_pct",
+        "fusion_sweep_splits",
+        "fusion_discovery_reps",
+        "fusion_discovery_shuffles",
+        "fusion_gain_splits",
+        "fusion_gain_permutations",
+        "fusion_null_calibration_runs",
+        "fusion_posterior_draws",
+        "fusion_posterior_chains",
         "fusion_cgi_grid_spacing_m",
         "fusion_spatial_block_size_m",
         "fusion_spatial_adjust_max_df",
@@ -583,6 +615,9 @@ def _seed_fusion_form(p: dict) -> None:
     # so it cannot be recovered from the two lists above.
     st.session_state["fusion_moderator_columns"] = list(
         p.get("moderator_columns") or []
+    )
+    st.session_state["fusion_negative_controls"] = list(
+        p.get("negative_controls") or []
     )
     st.session_state["fusion_exposure_iqr"] = float(p.get("exposure_iqr") or 0.0)
 
@@ -1524,22 +1559,8 @@ def _render_study_details_panel(
     """
     st.subheader("Study Details")
 
-    # ── Row 1: CGI formula + covariates ─────────────────────────
-    col_cgi1, col_cgi2 = st.columns([1, 2])
-    with col_cgi1:
-        _default("fusion_cgi_formula", "weighted_average")
-        cgi_formula = st.selectbox(
-            "CGI Formula",
-            options=["weighted_average", "synergy"],
-            help=(
-                "**weighted_average** — three weights on Vegetation / "
-                "Terrain / NDVI summing to 100. "
-                "**synergy** — seven weights summing to 100 plus three "
-                "powers on the main channel terms."
-            ),
-            key="fusion_cgi_formula",
-        )
-    with col_cgi2:
+    # ── Row 1: covariates ───────────────────────────────────────
+    with st.container():
         categorical_candidates = list(categorical_candidates or [])
         if available_covariates:
             _keep_valid("fusion_covariate_columns", available_covariates, multi=True)
@@ -1614,7 +1635,10 @@ def _render_study_details_panel(
                     "the interquartile range of the winning composite itself, "
                     "which makes runs on different exposures incomparable. Set "
                     "it to a published study's IQR to read your effect on that "
-                    "study's scale. Reporting only — the search is unaffected."
+                    "study's scale — meaningful for a single-channel standalone "
+                    "in the layer's own units; a composite is in "
+                    "covariate-adjusted SD units. Reporting only — the search "
+                    "is unaffected."
                 ),
             )
             if covariate_columns:
@@ -1650,10 +1674,14 @@ def _render_study_details_panel(
             format_func=lambda m: _CROSS_METRIC_LABELS.get(m, m),
             key="fusion_objective_metric",
             help=(
-                "Quantity each stability-selection trial scores on its "
-                "out-of-bag rows (maximised; nrmse minimised). "
+                "Quantity every candidate is scored on, over held-out "
+                "rows (maximised; nrmse minimised). "
                 "**Partial distance correlation** (default) captures linear and "
                 "nonlinear association and conditions on covariates nonlinearly. "
+                "**Quartile contrast** cuts the composite at its own "
+                "quartiles and maximises the size of the top-versus-bottom "
+                "difference, the way the greenspace literature reports a "
+                "greenness gradient. "
                 "The logistic and GEE-logistic options require a two-valued "
                 "outcome and report a log-odds ratio."
             ),
@@ -1672,8 +1700,8 @@ def _render_study_details_panel(
             step=0.05,
             key="fusion_test_size",
             help=(
-                "Held-out evaluation fraction; the remainder is the train+val "
-                "pool that stability selection resamples."
+                "Held-out evaluation fraction; the remainder is the pool the "
+                "sweep splits and refits over."
             ),
         )
     with col_o3:
@@ -1688,7 +1716,7 @@ def _render_study_details_panel(
     st.caption(
         f"_Test = {float(test_size)*100:.0f}% held out · "
         f"train+val pool = {(1.0 - float(test_size))*100:.0f}% "
-        "(resampled by stability selection)._"
+        "(split repeatedly by the sweep)._"
     )
 
     # ── Covariate residualization (cross-sectional metrics) ─────
@@ -1876,9 +1904,14 @@ def _render_study_details_panel(
         )
     with col_r2:
         run_standalones = st.checkbox(
-            "Also optimize each metric on its own (NDVI / Vegetation / Terrain)",
+            "Also run each channel on its own",
             key="fusion_run_standalones",
-            help="Adds three single-metric Optuna studies alongside the combined CGI run.",
+            help=(
+                "One discovery per channel of the set chosen below, each with "
+                "its own radius and aggregator picked the same way. This is the "
+                "comparison that decides whether the composite is worth its "
+                "extra complexity, so the monitor lists one step per channel."
+            ),
         )
 
     # ── Channel collinearity check (iterative VIF) ──────────────
@@ -1911,124 +1944,138 @@ def _render_study_details_panel(
             ),
         )
 
-    # ── Stability selection ─────────────────────────────────────
-    # Tuning is bootstrap stability selection: B random-sampler studies on
-    # resamples of the train+val pool, scored on out-of-bag rows. The channel
-    # mix is chosen by automated threshold calibration (Bodinier) — the
-    # selection size and threshold are calibrated by maximizing the stability
-    # score, so there are no manual selection knobs.
-    st.markdown("**Stability selection**")
+    # ── Discovery ───────────────────────────────────────────────
+    st.markdown("**Discovery**")
     st.caption(
-        "The channel-mix winner is calibrated automatically (selection size "
-        "K + threshold π maximize the stability score, with a reported PFER "
-        "bound). Set the resampling effort and the PFER cap here."
+        "The radius, the aggregation statistic and the functional form are all "
+        "selected from held-out data; the channel weights are then fitted with "
+        "credible intervals. Nothing here touches the test split."
     )
-    _default(
-        "fusion_weight_bin_pct",
-        int(_cgi_formulas.WEIGHT_BIN_PCT),
-        [5, 10, 20, 25, 50],
-    )
-    _default("fusion_n_bootstraps", 30)
-    _default("fusion_n_trials_per_bootstrap", 150)
+    _default("fusion_channel_set", "ndvi + gvi", ["ndvi + gvi", "ndvi + veg + terrain"])
+    _default("fusion_index_form", "sweep", ["sweep", "linear", "synergy"])
+    _default("fusion_sweep_splits", 40)
     col_s0, col_s1, col_s2 = st.columns(3)
     with col_s0:
-        weight_bin_pct_ui = st.select_slider(
-            "Weight cell size (%)",
-            options=[5, 10, 20, 25, 50],
-            key="fusion_weight_bin_pct",
+        channel_set_ui = st.selectbox(
+            "Channel set",
+            options=["ndvi + gvi", "ndvi + veg + terrain"],
+            key="fusion_channel_set",
             help=(
-                "Bin width for the channel-mix weight cells the stability "
-                "selection ranks. Wider cells → fewer, coarser cells (a good "
-                "region fragments less and each cell collects more trials); "
-                "narrower cells → finer resolution but many more cells to "
-                "cover. **20 % is the default**: below that, neighbouring "
-                "cells are near-identical composites and the vote splits "
-                "across them so nothing is ever declared stable. The finer "
-                "resolution is recovered by the refinement stage below."
+                "**ndvi + gvi** merges the street-view components into one "
+                "green-view channel, which is far less redundant with NDVI "
+                "(r ≈ 0.27 vs 0.08 between veg and terrain) and measured "
+                "stronger than either component alone in all three "
+                "replications. **ndvi + veg + terrain** keeps them apart. "
+                "The cache stores whichever a job needs and extends rather "
+                "than rebuilds if you switch later."
             ),
         )
-        _refine_options = [o for o in (5, 10, 20, 25) if o < int(weight_bin_pct_ui)]
-        if _refine_options:
-            _default(
-                "fusion_weight_refine_bin_pct",
-                min(
-                    _refine_options,
-                    key=lambda o: abs(o - _cgi_formulas.WEIGHT_REFINE_BIN_PCT),
-                ),
-                _refine_options,
-            )
-            weight_refine_bin_pct_ui = st.select_slider(
-                "Refinement cell size (%)",
-                options=_refine_options,
-                key="fusion_weight_refine_bin_pct",
-                help=(
-                    "Third selection stage. After the channel mix and the "
-                    "spatial scale are settled, the surviving trials are "
-                    "re-binned at this width and the best sub-cell by median "
-                    "out-of-bag score is kept — so the final weights come from "
-                    "trials that agree, not from an average across the whole "
-                    "coarse cell."
-                ),
-            )
-        else:
-            weight_refine_bin_pct_ui = None
-            st.caption("_Refinement needs a cell size above 5 %._")
-
     with col_s1:
-        n_bootstraps_ui = st.number_input(
-            "Bootstraps (B)",
-            min_value=5,
-            max_value=200,
-            step=5,
-            key="fusion_n_bootstraps",
+        index_form_ui = st.selectbox(
+            "Index form",
+            options=["sweep", "linear", "synergy"],
+            key="fusion_index_form",
             help=(
-                "Number of ⌊n/2⌋ subsamples of the train+val pool (drawn as "
-                "complementary pairs). 20-50 typical; raise for a tighter calibration."
+                "**sweep** fits both forms and keeps whichever scores better "
+                "held-out — which form wins is configuration-dependent, so "
+                "fixing it is a guess. `linear` is a weighted sum; `synergy` "
+                "reads each channel as its approximate percentile and adds "
+                "powers on the main terms and pairwise products."
             ),
         )
     with col_s2:
-        n_trials_per_bootstrap_ui = st.number_input(
-            "Trials per bootstrap",
-            min_value=100,
-            max_value=800,
-            step=10,
-            key="fusion_n_trials_per_bootstrap",
+        sweep_splits_ui = st.number_input(
+            "Sweep splits",
+            min_value=5,
+            max_value=200,
+            step=5,
+            key="fusion_sweep_splits",
             help=(
-                "Random-sampler trials inside each bootstrap. Coverage of the "
-                "weight cells matters more than depth — see the per-cell density "
-                "below."
+                "Held-out splits each candidate is scored on. The averaged "
+                "surface is the evidence — a single split's winner is noise."
             ),
         )
-    _n_weight_cells = max(
-        1, _cgi_formulas.weight_cell_count(cgi_formula, int(weight_bin_pct_ui))
-    )
-    _avg_trials_per_cell = int(n_trials_per_bootstrap_ui) / _n_weight_cells
-    st.caption(
-        f"≈ **{_avg_trials_per_cell:.1f} trials per weight cell** on average "
-        f"({int(n_trials_per_bootstrap_ui)} trials ÷ {_n_weight_cells} cells at "
-        f"{int(weight_bin_pct_ui)}% bins). Aim for ≥ 5 so each cell's OOB "
-        "ranking is reproducible across resamples; raise the trial count or the "
-        "cell size if this is low."
-    )
-    _default("fusion_max_pfer", 1.0)
-    max_pfer_ui = st.number_input(
-        "Max PFER (approx.)",
-        min_value=0.0,
-        max_value=50.0,
-        step=0.5,
-        key="fusion_max_pfer",
-        help=(
-            "Caps the calibrated selection size K and threshold π so the "
-            "reported PFER bound K²/((2π−1)·N) stays at or below this value — "
-            "tighter values keep the stable set small and the error control "
-            "meaningful, looser values let more cells be called stable. "
-            "0 = no cap."
-        ),
-    )
-    # ── Internals ───────────────────────────────────────────────
-    # Minimum trials per radius sub-cell, and the quantile q_worst reports at.
-    min_cell_count_ui = 3
-    worst_quantile_ui = 0.10
+
+    with st.expander("Validation & reporting", expanded=False):
+        _default("fusion_discovery_reps", 5)
+        _default("fusion_discovery_shuffles", 12)
+        _default("fusion_gain_splits", 20)
+        _default("fusion_gain_permutations", 100)
+        _default("fusion_null_calibration_runs", 16)
+        _default("fusion_posterior_draws", 800)
+        _default("fusion_posterior_chains", 4)
+        col_v0, col_v1 = st.columns(2)
+        with col_v0:
+            discovery_reps_ui = st.number_input(
+                "Discovery replicates",
+                min_value=0,
+                max_value=50,
+                step=1,
+                key="fusion_discovery_reps",
+                help=(
+                    "Independent repeats of the whole discovery, each with its "
+                    "own seed stream. If the pick changes every replicate, the "
+                    "discovery is not real — that is the honesty signal. 0 skips."
+                ),
+            )
+            discovery_shuffles_ui = st.number_input(
+                "Shuffles per replicate",
+                min_value=1,
+                max_value=100,
+                step=1,
+                key="fusion_discovery_shuffles",
+            )
+            null_calibration_runs_ui = st.number_input(
+                "Null calibration fits",
+                min_value=0,
+                max_value=1000,
+                step=1,
+                key="fusion_null_calibration_runs",
+                help=(
+                    "Permuted-outcome refits. The reported rate should sit near "
+                    "5 %; well above means the procedure is over-confident. "
+                    "16 is a quick check; a calibration claim needs at least "
+                    "100, and a final, reported run should use 200. 0 skips."
+                ),
+            )
+        with col_v1:
+            gain_splits_ui = st.number_input(
+                "Held-out gain splits",
+                min_value=0,
+                max_value=100,
+                step=1,
+                key="fusion_gain_splits",
+                help=(
+                    "Composite vs each standalone under the identical sweep, on "
+                    "the same held-out rows. 0 skips the comparison."
+                ),
+            )
+            gain_permutations_ui = st.number_input(
+                "Gain permutations",
+                min_value=0,
+                max_value=1000,
+                step=10,
+                key="fusion_gain_permutations",
+                help=(
+                    "Permutation null for the *gain*, so the composite's extra "
+                    "flexibility is priced in rather than assumed away."
+                ),
+            )
+            posterior_draws_ui = st.number_input(
+                "Posterior draws per chain",
+                min_value=100,
+                max_value=4000,
+                step=100,
+                key="fusion_posterior_draws",
+            )
+            posterior_chains_ui = st.number_input(
+                "Chains",
+                min_value=1,
+                max_value=8,
+                step=1,
+                key="fusion_posterior_chains",
+            )
+    posterior_warmup_ui = int(posterior_draws_ui)
 
     # ── Per-pixel CGI scoring (vector targets) ──────────────────
     cgi_grid_spacing_m = 50
@@ -2082,8 +2129,8 @@ def _render_study_details_panel(
             "Spatial block validation",
             key="fusion_spatial_split",
             help=(
-                "Hold out whole spatial blocks (and resample blocks during "
-                "stability selection) so geographic autocorrelation can't "
+                "Hold out whole spatial blocks (and resample blocks in the "
+                "sweep) so geographic autocorrelation can't "
                 "inflate scores. Test blocks are striped across the full "
                 "extent so every region is represented in the held-out test."
             ),
@@ -2158,7 +2205,12 @@ def _render_study_details_panel(
                 spatial_adjust_eps_m = float(eps_ui) if eps_ui and eps_ui > 0 else None
 
     return {
-        "cgi_formula": cgi_formula,
+        # Derived, not chosen: the channel set names the modalities and
+        # the sweep picks the form, so the registry name follows from both.
+        "cgi_formula": _cgi_formulas.formula_for(
+            _CHANNEL_SETS[channel_set_ui],
+            "linear" if index_form_ui == "sweep" else str(index_form_ui),
+        ),
         "covariate_columns": list(covariate_columns or []),
         "covariate_types": dict(covariate_types or {}),
         "moderator_columns": list(moderator_columns or []),
@@ -2190,17 +2242,17 @@ def _render_study_details_panel(
         "spatial_split": bool(spatial_split),
         "spatial_block_size_m": spatial_block_size_m,
         "n_spatial_blocks": n_spatial_blocks,
-        "n_bootstraps": int(n_bootstraps_ui),
-        "n_trials_per_bootstrap": int(n_trials_per_bootstrap_ui),
-        "weight_bin_pct": int(weight_bin_pct_ui),
-        "weight_refine_bin_pct": (
-            int(weight_refine_bin_pct_ui)
-            if weight_refine_bin_pct_ui is not None
-            else None
-        ),
-        "min_cell_count": int(min_cell_count_ui),
-        "worst_quantile": float(worst_quantile_ui),
-        "max_pfer": float(max_pfer_ui),
+        "channel_set": str(channel_set_ui),
+        "index_form": str(index_form_ui),
+        "sweep_splits": int(sweep_splits_ui),
+        "discovery_reps": int(discovery_reps_ui),
+        "discovery_shuffles": int(discovery_shuffles_ui),
+        "gain_splits": int(gain_splits_ui),
+        "gain_permutations": int(gain_permutations_ui),
+        "null_calibration_runs": int(null_calibration_runs_ui),
+        "posterior_draws": int(posterior_draws_ui),
+        "posterior_warmup": int(posterior_warmup_ui),
+        "posterior_chains": int(posterior_chains_ui),
         "check_collinearity": bool(check_collinearity),
         "vif_threshold": float(vif_threshold_ui),
     }
@@ -2490,6 +2542,88 @@ def _render_period_confounding(dt: dict) -> None:
             )
 
 
+# Trend line drawn over each categorical's levels. Green/red/grey carry the
+# bars' direction, so the line takes a hue none of them use and stays legible
+# against all three in either theme.
+_TREND_COLOR = "#0b84f3"
+# A cubic through four points passes exactly through them, which draws a
+# confident curve that is really just the data replotted. Below this many
+# levels the degree is dropped to keep the line a summary rather than a copy.
+_TREND_MIN_LEVELS = 4
+
+
+def _split_term(term: str) -> tuple[str, str | None]:
+    """``SDC_MRTL=3.0`` -> ``("SDC_MRTL", "3.0")``; a numeric term -> ``(term, None)``."""
+    name, sep, level = str(term).partition("=")
+    return (name, level) if sep else (str(term), None)
+
+
+def _level_sort_key(level: str):
+    """Order levels by their value, numerically when they parse as numbers.
+
+    Category codes arrive as ``2.0 … 13.0``; numeric order keeps ``2.0`` ahead
+    of ``10.0`` so a trend across the codes reads left to right.
+    """
+    try:
+        return (0, float(level), "")
+    except (TypeError, ValueError):
+        return (1, 0.0, str(level))
+
+
+def _covariate_term_order(df) -> list[str]:
+    """Numeric covariates first, then each categorical's levels in value order.
+
+    Groups are ranked by the largest partial R² they contain, so the covariate
+    that explains the most sits leftmost, but a categorical's own levels stay in
+    their natural order inside the group rather than being ranked against each
+    other.
+    """
+    numeric, groups = [], {}
+    for _, row in df.iterrows():
+        term = str(row["covariate"])
+        name, level = _split_term(term)
+        if level is None:
+            numeric.append((float(row.get("partial_r2") or 0.0), term))
+        else:
+            groups.setdefault(name, []).append(
+                (level, term, float(row.get("partial_r2") or 0.0))
+            )
+    numeric.sort(key=lambda t: -t[0])
+    ranked = sorted(groups.items(), key=lambda kv: -max(x[2] for x in kv[1]))
+    order = [t for _, t in numeric]
+    for _name, members in ranked:
+        order += [
+            t for _lv, t, _p in sorted(members, key=lambda m: _level_sort_key(m[0]))
+        ]
+    return order
+
+
+def _trend_points(members: list[tuple[str, float]]):
+    """Cubic through one categorical's levels, or ``None`` if it cannot be fitted.
+
+    Returns ``(labels, fitted_values, degree)``. The x used for the fit is the
+    level's own value where the levels are numeric codes, so unequal spacing is
+    respected; otherwise it falls back to position.
+    """
+    if len(members) < 3:
+        return None
+    ordered = sorted(members, key=lambda m: _level_sort_key(m[0]))
+    labels = [lv for lv, _ in ordered]
+    ys = np.asarray([c for _, c in ordered], dtype=float)
+    try:
+        xs = np.asarray([float(lv) for lv in labels], dtype=float)
+    except (TypeError, ValueError):
+        xs = np.arange(len(labels), dtype=float)
+    if not np.isfinite(ys).all() or len(np.unique(xs)) < 3:
+        return None
+    degree = 3 if len(ordered) > _TREND_MIN_LEVELS else min(2, len(ordered) - 1)
+    try:
+        fitted = np.polyval(np.polyfit(xs, ys, degree), xs)
+    except Exception:
+        return None
+    return labels, fitted, degree
+
+
 def _render_covariate_impact(results_view: dict, metric_name: str) -> None:
     """Show per-covariate effect direction + importance + lift over CGI-only."""
     impact = results_view.get("covariate_impact")
@@ -2502,7 +2636,7 @@ def _render_covariate_impact(results_view: dict, metric_name: str) -> None:
     if is_mixedlm:
         st.caption(
             "Two mixed-effects models fit on the full dataset using the "
-            "stability-selected params: **Full** = "
+            "discovered params: **Full** = "
             "`target ~ CGI + covariates [+ time] + (RE | entity)`, **CGI-only** = "
             "`target ~ CGI [+ time] + (RE | entity)`. Standard errors and Wald "
             "p-values come from the mixed model, so they account for the "
@@ -2512,7 +2646,7 @@ def _render_covariate_impact(results_view: dict, metric_name: str) -> None:
         )
     else:
         st.caption(
-            "Two OLS models fit on the full dataset using the stability-selected "
+            "Two OLS models fit on the full dataset using the discovered "
             "params: **Full** = `target ~ CGI + covariates`, **CGI-only** = "
             "`target ~ CGI`. Coefficients show each covariate's effect direction "
             "and magnitude in the full model; partial R² is the variance only "
@@ -2553,8 +2687,8 @@ def _render_covariate_impact(results_view: dict, metric_name: str) -> None:
     try:
         import plotly.express as _px
 
+        order = _covariate_term_order(df)
         bar_df = df.copy()
-        bar_df["abs_coef"] = bar_df["coef"].abs()
         fig = _px.bar(
             bar_df,
             x="covariate",
@@ -2565,10 +2699,59 @@ def _render_covariate_impact(results_view: dict, metric_name: str) -> None:
                 "negative": "#d62728",
                 "—": "#7f7f7f",
             },
+            category_orders={"covariate": order},
             title="Covariate coefficients (full model)",
         )
-        fig.update_layout(margin=dict(l=60, r=20, t=60, b=80))
+
+        # One cubic per categorical, over that variable's levels in value order.
+        coef_of = dict(zip(df["covariate"].astype(str), df["coef"].astype(float)))
+        grouped: dict[str, list[tuple[str, float]]] = {}
+        for term in order:
+            name, level = _split_term(term)
+            if level is not None:
+                grouped.setdefault(name, []).append((level, coef_of[term]))
+        fitted_any = []
+        for name, members in grouped.items():
+            trend = _trend_points(members)
+            if trend is None:
+                continue
+            labels, values, degree = trend
+            fig.add_scatter(
+                x=[f"{name}={lv}" for lv in labels],
+                y=list(values),
+                mode="lines+markers",
+                name=f"{name} trend (deg {degree})",
+                line=dict(color=_TREND_COLOR, width=2.5),
+                marker=dict(color=_TREND_COLOR, size=6, symbol="diamond"),
+                hovertemplate=f"{name} fitted: %{{y:.4f}}<extra></extra>",
+            )
+            fitted_any.append(f"{name} (deg {degree}, {len(labels)} levels)")
+        fig.update_layout(
+            margin=dict(l=60, r=20, t=60, b=120),
+            xaxis=dict(categoryorder="array", categoryarray=order),
+        )
         st.plotly_chart(fig, width="stretch")
+        cap = (
+            "Numeric covariates first (largest partial R² leftmost), then each "
+            "categorical's levels in value order so a gradient across levels is "
+            "visible as a shape rather than scattered across the axis."
+        )
+        if fitted_any:
+            cap += (
+                " The blue curve is a least-squares polynomial through one "
+                "variable's level coefficients: " + "; ".join(fitted_any) + ". "
+                "It is descriptive only — it presumes the level codes are "
+                "ordered and equally meaningful, which holds for a wave or an "
+                "ordinal band but not for unordered categories like cultural "
+                "origin, where it should be read as a visual aid and nothing "
+                "more."
+            )
+        cap += (
+            " Each categorical is drop-first coded, so its reference level has "
+            "a coefficient of exactly 0 by construction and is not drawn; every "
+            "bar in a group is a contrast against that missing level."
+        )
+        st.caption(cap)
     except Exception:
         pass
 
@@ -2600,7 +2783,7 @@ def _render_composite_map_viewer(results_view: dict, engine) -> None:
     cgi_path = os.path.join(artifacts_dir, "composite_greenery.tif")
     if os.path.isfile(cgi_path):
         composite_options.append(("CGI (combined)", cgi_path))
-    for ch in ("veg", "terrain", "ndvi"):
+    for ch in _ALL_STANDALONE_CHANNELS:
         path = os.path.join(artifacts_dir, f"composite_greenery_{ch}.tif")
         if os.path.isfile(path):
             composite_options.append(
@@ -2826,356 +3009,700 @@ def _agg_label(stat: str | None, percentile: int | float | None) -> str:
     return "—"
 
 
-def _render_stability_diagnostics(summary: dict, metric_name: str) -> None:
-    """Diagnostics panel for one study's bootstrap stability selection.
+def _render_distance_decay(summary: dict, _pd, _label) -> None:
+    """R50 / R90 and the implied radial weight, the distances of influence.
 
-    Reads the cell-aggregation outputs ``bootstrap_stability_selection``
-    records (surfaced on each study's ``stability_summary`` bundle): the
-    ranked weight cells, the winning cell's empirical OOB-score
-    distribution, and the per-bootstrap leaderboard. Returns silently when
+    Every rung is a statistic over the whole disc, so any blend of rungs puts
+    the most weight on the entity itself and less with distance. The kernel
+    peak above is where the blend sits in buffer space; these are where its
+    influence sits on the ground.
+    """
+    r50 = summary.get("r50_mean")
+    if not r50:
+        return
+    r90 = summary.get("r90_mean") or [None] * len(r50)
+
+    def ci(key, i):
+        lo = (summary.get(f"{key}_ci_low") or [None] * len(r50))[i]
+        hi = (summary.get(f"{key}_ci_high") or [None] * len(r50))[i]
+        return f"[{_fmt(lo, 0)}, {_fmt(hi, 0)}]"
+
+    st.dataframe(
+        _pd.DataFrame(
+            [
+                {
+                    "Channel": _label(i),
+                    "R50 (m)": _fmt(v, 0),
+                    "R50 95% CrI": ci("r50", i),
+                    "R90 (m)": _fmt(r90[i], 0),
+                    "R90 95% CrI": ci("r90", i),
+                }
+                for i, v in enumerate(r50)
+            ]
+        ),
+        width="stretch",
+        hide_index=True,
+    )
+    curve = summary.get("implied_weight_curve") or {}
+    dist, weights = curve.get("distance_m") or [], curve.get("weight") or []
+    if dist and weights:
+        long = _pd.DataFrame(
+            [
+                {"Distance (m)": float(d), "Channel": _label(ci_), "Weight": float(w)}
+                for ci_, row in enumerate(weights)
+                for d, w in zip(dist, row)
+            ]
+        )
+        try:
+            import plotly.express as _px
+
+            fig = _px.line(long, x="Distance (m)", y="Weight", color="Channel")
+            fig.update_layout(
+                height=260,
+                margin=dict(l=50, r=20, t=30, b=50),
+                yaxis_title="Implied weight (1 at the entity)",
+            )
+            st.plotly_chart(fig, width="stretch")
+        except Exception:
+            st.line_chart(
+                long.pivot(index="Distance (m)", columns="Channel", values="Weight"),
+                height=220,
+            )
+    basis = summary.get("distance_basis") or "mean-equivalent (approximate)"
+    scale = summary.get("distance_scale") or "standardised"
+    st.caption(
+        "**R50 / R90** are the distances holding half and 90 % of the implied "
+        "radial weight. A blend of whole-disc buffers always weights the "
+        "entity most and decays outward, so these - not the kernel peak - are "
+        "the distances of influence; all mass on one 600 m rung gives an R50 "
+        f"of 424 m. Basis: {basis}, on the {scale} exposure scale, assuming "
+        "uniform density inside each buffer."
+    )
+
+
+def _render_fitted_grid(summary: dict, _pd, _label) -> None:
+    """The spatial scale and the aggregator, as the posterior estimated them.
+
+    These are parameters of the same model as the weights rather than choices
+    made before it ran, so each is shown against the prior it was drawn from.
+    A posterior as wide as its prior is not an estimate — it is the model
+    reporting that the data was silent — and without the prior beside it there
+    is no way to tell the two apart from the number alone.
+    """
+    profile = summary.get("radius_profile")
+    aggregator = summary.get("aggregator_mean")
+    if not profile and not aggregator:
+        return
+
+    st.markdown("**Fitted spatial scale and aggregator**")
+    st.caption(
+        "Radius and aggregator are sampled with the weights, not picked before "
+        "the sampler runs, so the credible interval on beta above already "
+        "carries their uncertainty - there is no separate correction owed for "
+        "having searched them."
+    )
+
+    peak = summary.get("peak_radius_mean")
+    if peak:
+        prior = summary.get("peak_radius_prior_ci") or [None, None]
+        lo = summary.get("peak_radius_ci_low") or [None] * len(peak)
+        hi = summary.get("peak_radius_ci_high") or [None] * len(peak)
+        ratios = summary.get("peak_radius_width_ratio") or []
+        st.dataframe(
+            _pd.DataFrame(
+                [
+                    {
+                        "Channel": _label(i),
+                        "Kernel peak, buffer space (m)": _fmt(v, 0),
+                        "95% CrI": f"[{_fmt(lo[i], 0)}, {_fmt(hi[i], 0)}]",
+                        "Prior CrI": f"[{_fmt(prior[0], 0)}, {_fmt(prior[1], 0)}]",
+                        "vs prior": _fmt(ratios[i], 2) if i < len(ratios) else "-",
+                    }
+                    for i, v in enumerate(peak)
+                ]
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+        # A channel whose scale is genuinely learned lands near 0.1; one the
+        # data is silent about lands near 0.8, not at 1.0, because the kernel
+        # is normalised over a finite ladder and cannot wander the whole prior.
+        # The threshold sits in the gap between those, not next to 1.0.
+        unlearned = [
+            _label(i)
+            for i, r in enumerate(ratios)
+            if _num(r) is not None and float(r) > 0.5
+        ]
+        if unlearned:
+            st.warning(
+                "The scale posterior keeps most of its prior width for: "
+                + ", ".join(unlearned)
+                + ". The data did not identify a distance for those channels - "
+                "do not report a radius for them as a finding. The weights and "
+                "the effect are still valid; only the scale is unlearned."
+            )
+
+    radii = summary.get("radii") or []
+    if profile and radii:
+        # Bars follow ladder order, not label text. Each channel's profile sums
+        # to 1 on its own, so channels sit side by side rather than stacked.
+        order = [f"{int(r)} m" for r in radii]
+        long = _pd.DataFrame(
+            [
+                {"Radius": order[ri], "Channel": _label(ci), "Weight": float(w)}
+                for ci, row in enumerate(profile)
+                for ri, w in enumerate(row)
+                if ri < len(order)
+            ]
+        )
+        try:
+            import plotly.express as _px
+
+            fig = _px.bar(
+                long,
+                x="Radius",
+                y="Weight",
+                color="Channel",
+                barmode="group",
+                category_orders={"Radius": order},
+            )
+            fig.update_layout(
+                height=280,
+                margin=dict(l=50, r=20, t=30, b=50),
+                yaxis_title="Posterior weight",
+                xaxis=dict(categoryorder="array", categoryarray=order),
+            )
+            st.plotly_chart(fig, width="stretch")
+        except Exception:
+            st.bar_chart(
+                long.pivot(index="Radius", columns="Channel", values="Weight").reindex(
+                    order
+                ),
+                height=220,
+                stack=False,
+            )
+        st.caption(
+            "Posterior weight on each rung of the ladder. The kernel is placed "
+            "in log-radius with a sampled location and width, so it can rise "
+            "and then fall; monotone decay is the special case where the peak "
+            "sits at or below the smallest rung, so nothing is lost by allowing "
+            "the hump. Mass piled against either end means the effect may peak "
+            "outside the searched range - widen the buffer ladder and re-run."
+        )
+
+    _render_distance_decay(summary, _pd, _label)
+
+    if aggregator:
+        stats = summary.get("stats") or []
+        a_lo = summary.get("aggregator_ci_low") or []
+        a_hi = summary.get("aggregator_ci_high") or []
+        rows = []
+        for ci, blend in enumerate(aggregator):
+            row = {"Channel": _label(ci)}
+            for si, v in enumerate(blend):
+                name = stats[si] if si < len(stats) else f"s{si}"
+                cell = round(float(v), 3)
+                if ci < len(a_lo) and si < len(a_lo[ci]):
+                    cell = (
+                        f"{float(v):.3f} [{a_lo[ci][si]:.2f}, " f"{a_hi[ci][si]:.2f}]"
+                    )
+                row[name] = cell
+            rows.append(row)
+        st.dataframe(_pd.DataFrame(rows), width="stretch", hide_index=True)
+        n_stats = len(stats) or 1
+        uniform = _num(summary.get("aggregator_uniform")) or (1.0 / n_stats)
+        informative = summary.get("aggregator_informative")
+        if informative is None and a_lo and a_hi:
+            # Older bundles lack the stored verdict; it is recomputed from the
+            # intervals it is read from.
+            informative = [
+                [
+                    stats[i]
+                    for i in range(min(len(stats), len(lo_c)))
+                    if lo_c[i] > uniform or hi_c[i] < uniform
+                ]
+                for lo_c, hi_c in zip(a_lo, a_hi)
+            ]
+        informative = informative or []
+        st.caption(
+            f"Blend over the aggregators, not a pick. A component is a finding "
+            f"when its credible interval excludes the prior mean "
+            f'{uniform:.2f} - in either direction, since "certainly not '
+            f'`p90`" is as much of a result as "mostly `p10`". Mass on '
+            "`p10` says the least-green part of the neighbourhood is what "
+            "matters; on `p90`, the best patch."
+        )
+        silent = [_label(ci) for ci, names in enumerate(informative) if not names]
+        spoke = [
+            f"{_label(ci)}: {', '.join(names)}"
+            for ci, names in enumerate(informative)
+            if names
+        ]
+        if spoke:
+            st.caption("Aggregators the data separated - " + " | ".join(spoke))
+        if silent:
+            st.info(
+                "No aggregator is distinguishable from the others for: "
+                + ", ".join(silent)
+                + ". Percentiles of one buffer are six summaries of a single "
+                "distribution, and they only separate when its *shape* varies "
+                "between people independently of its level. Where they do not, "
+                "the composite falls back to the mean rather than to the "
+                "largest share of a flat blend, which is a coin flip."
+            )
+
+    projected = summary.get("projected_pick")
+    if projected:
+        parts = " / ".join(f"{int(x[0])} m {x[1]}" for x in projected)
+        st.caption(
+            f"**Shipped to the composite:** {parts}. The composite/apply path "
+            "carries one radius and one statistic per channel, so the blend "
+            "above is projected onto its modal cell for that purpose. The "
+            "effect and intervals reported here come from the blend, not from "
+            "a refit at the projected cell."
+        )
+
+
+def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
+    """Diagnostics panel for one study's sweep + posterior.
+
+    Reads the bundle ``fit_bayesian_index`` leaves on the winning params: what
+    the sweep picked and how contested that pick was, the posterior weights
+    with credible intervals, whether the discovery reproduces across reshuffled
+    splits, whether the composite beats its own channels held-out, and how
+    often the same procedure fires on a permuted outcome. Returns silently when
     none are present.
     """
-    cell_stats = summary.get("cell_stats") or []
-    oob_scores = summary.get("winning_cell_oob_scores") or []
-    per_bs = summary.get("per_bootstrap_summary") or []
-    if not cell_stats and not oob_scores and not per_bs:
+    picked = summary.get("picked") or []
+    post_channels = summary.get("channels") or []
+    if not picked and not post_channels:
         return
 
     try:
         import pandas as _pd
-        import plotly.express as _px
     except Exception:
-        st.info("Plotly + pandas required for stability-selection diagnostics.")
+        st.info("pandas required for the discovery diagnostics.")
         return
 
-    higher_is_better = bool(summary.get("higher_is_better", True))
-    worst_q = float(summary.get("worst_quantile") or 0.10)
+    # Synergy carries a weight per channel pair as well, so the label list is
+    # longer than the channel list.
+    labels = summary.get("weight_labels") or post_channels
 
-    # ── Automated threshold calibration (Bodinier) ──────────────
-    if summary.get("selection_threshold") is not None:
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            st.metric(
-                "Threshold π*",
-                f"{float(summary['selection_threshold']):.2f}",
-                help="Calibrated selection-probability threshold (maximizes the stability score).",
-            )
-        with c2:
-            st.metric(
-                "Selection size K*",
-                str(summary.get("selection_size_k", "—")),
-                help="Calibrated number of top cells counted as selected per resample (the sparsity / λ analogue).",
-            )
-        with c3:
-            nss = summary.get("n_stably_selected")
-            ncc = summary.get("n_candidate_cells")
-            st.metric(
-                "Stable cells",
-                f"{nss} / {ncc}" if nss is not None and ncc is not None else "—",
-                help="Channel-mix cells with selection probability ≥ π* — the calibrated stable set.",
-            )
-        with c4:
-            pfer = summary.get("pfer")
-            st.metric(
-                "PFER (approx.)",
-                f"{float(pfer):.2f}" if pfer is not None else "—",
-                help=(
-                    "Expected number of falsely-stable cells (Meinshausen–Bühlmann "
-                    "bound), rigorous under the ⌊n/2⌋ complementary-pairs "
-                    "subsampling used here."
-                ),
-            )
-        sscore = summary.get("stability_score")
-        if sscore is not None:
-            st.caption(
-                "Channel-mix selection is calibrated automatically (Bodinier): K "
-                f"and π maximize the stability score ({float(sscore):.1f}). The "
-                "winner is the most consistently selected cell in the stable set, "
-                "ties broken by the worst-quantile OOB score (`q_worst`)."
-            )
+    def _label(i: int) -> str:
+        return (labels[i] if i < len(labels) else f"ch{i}").upper()
 
-        # Degenerate-regime flag: when the PFER bound exceeds the number of
-        # stably-selected cells (or K covers most candidates), the "stable set"
-        # carries no real error control — selection probability isn't
-        # discriminating and q_worst is the effective decision. An empty stable
-        # set means the PFER cap admitted no recurring cell at all.
-        nss = summary.get("n_stably_selected")
-        ncc = summary.get("n_candidate_cells")
-        pfer = summary.get("pfer")
-        ksel = summary.get("selection_size_k")
-        no_stable_set = nss is not None and int(nss) == 0
-        degenerate = (
-            summary.get("pfer_controlled") is False
-            or no_stable_set
-            or (pfer is not None and nss and float(pfer) >= max(1.0, float(nss)))
-            or (ksel and ncc and float(ksel) > 0.5 * float(ncc))
+    # ── What the sweep picked ───────────────────────────────────
+    st.markdown("**Sweep**")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric(
+            "Index form",
+            str(summary.get("form") or "-"),
+            help=(
+                "The form that scored higher on held-out rows. `linear` is a "
+                "weighted sum; `synergy` adds powers and pairwise products."
+            ),
         )
-        if no_stable_set:
-            st.warning(
-                "No stable channel-mix cell fits under your PFER cap — the cap "
-                "was honoured (reported PFER stays within budget), but no cell "
-                "recurs across resamples often enough to be called stable at "
-                "this error budget. The `q_worst` winner is the trustworthy "
-                "signal here; raise **Max PFER** to admit a (less error-"
-                "controlled) stable set."
+    with c2:
+        st.metric(
+            "Held-out score",
+            _fmt(summary.get("sweep_score"), 3),
+            help=(
+                "Mean |t| of the chosen form at the picked columns, on a fresh "
+                "set of held-out splits rather than the ones the columns were "
+                "picked on."
+            ),
+        )
+    with c3:
+        st.metric(
+            "Candidates",
+            f"{summary.get('n_candidates', '-')}",
+            help="Radius x aggregator combinations scored, per channel.",
+        )
+    with c4:
+        st.metric(
+            "Distinct split winners",
+            f"{summary.get('distinct_split_winners', '-')}",
+            help=(
+                "How many different candidates won at least one split. A high "
+                "count means the surface is flat and the pick is one of many "
+                "near-equivalent configurations, not a peak."
+            ),
+        )
+
+    if picked:
+        st.dataframe(
+            _pd.DataFrame(
+                [
+                    {
+                        "Channel": _label(i),
+                        "Radius (m)": p[0],
+                        "Aggregator": p[1],
+                    }
+                    for i, p in enumerate(picked)
+                ]
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+        projected = summary.get("projected_pick")
+        if projected and [list(x) for x in projected] != [list(x) for x in picked]:
+            parts = " / ".join(f"{int(x[0])} m {x[1]}" for x in projected)
+            st.info(
+                f"This is the **sweep's** pick, and it is not what the study "
+                f"was built from. The sweep ranks one cell per channel to "
+                f"shortlist the functional form; the posterior then estimates "
+                f"the radius and the aggregator as parameters over the whole "
+                f"grid, and its projection — **{parts}** — is what the params "
+                f"panel and the composite carry. The two disagreeing is "
+                f"expected where the grid is flat, and is itself a sign the "
+                f"cell is not well determined."
             )
-        elif degenerate:
-            detail = (
-                f" (PFER ≈ {float(pfer):.0f} vs {nss} stable cells)"
-                if pfer is not None and nss
+
+    boundary = summary.get("boundary_hit") or []
+    if boundary:
+        st.warning(
+            "Picked radius sits at the edge of the searched range for: "
+            + ", ".join(str(x).upper() for x in boundary)
+            + ". The optimum may lie outside the range - widen the buffer "
+            "min/max and re-run before reading the radius as a finding."
+        )
+
+    one_se = summary.get("one_se_picked") or []
+    if one_se and one_se != picked:
+        parts = " / ".join(f"{x[0]} m {x[1]}" for x in one_se)
+        st.caption(
+            "Within one standard error, the most parsimonious equivalent is "
+            f"{parts} - statistically indistinguishable from the pick above."
+        )
+
+    form_scores = summary.get("form_scores") or {}
+    selection = _num(summary.get("sweep_selection_score"))
+    if len(form_scores) > 1:
+        st.caption(
+            "Form scores (held-out |t|): "
+            + " - ".join(f"`{k}` {float(v):.3f}" for k, v in form_scores.items())
+            + ". Every form is fitted at the same picked columns and scored on "
+            "the same fresh splits, so this compares the functional form alone."
+            + (
+                f" The grid maximum the columns were picked on was {selection:.3f}"
+                " - optimistic, being the best of every candidate on those "
+                "splits."
+                if selection is not None
                 else ""
             )
-            st.warning(
-                f"Selection not error-controlled here{detail} — the channel "
-                "mixes aren't separable, so the `q_worst` winner is the "
-                "trustworthy signal, not the stable-set size. Lean on the "
-                "held-out test / all-entity effect."
-            )
-
-    direction_msg = (
-        f"Higher {metric_name} is better — `q_worst` is the {worst_q:.0%} "
-        "*lower* quantile of OOB scores in the cell."
-        if higher_is_better
-        else f"Lower {metric_name} is better — `q_worst` is the "
-        f"{1.0 - worst_q:.0%} *upper* quantile of OOB scores in the cell."
-    )
-    st.caption(direction_msg)
-
-    # ── Top cells ranking ───────────────────────────────────────
-    if cell_stats:
-        st.markdown("**Top weight cells (ranked by selection probability)**")
-        rows: list[dict] = []
-        for rank, c in enumerate(cell_stats, start=1):
-            row: dict = {"Rank": rank}
-            for k, v in (c.get("weights") or {}).items():
-                short = k.removeprefix("w_").removesuffix("_weight").upper()
-                row[short] = int(v)
-            row["Count"] = int(c.get("count", 0))
-            row[f"q_worst {metric_name}"] = round(
-                float(c.get("q_worst", float("nan"))), 4
-            )
-            row[f"Median {metric_name}"] = round(
-                float(c.get("median", float("nan"))), 4
-            )
-            row["Selection prob."] = round(
-                float(c.get("selection_probability", float("nan"))), 3
-            )
-            rows.append(row)
-        st.dataframe(_pd.DataFrame(rows), width="stretch")
-        st.caption(
-            "Each row is a 10-percent weight bucket. **Count** = trials "
-            "across all bootstraps that landed in this bucket. "
-            "**Selection prob.** = fraction of resamples where the cell was in "
-            "the calibrated top-K by OOB score; the winner is the cell with the "
-            "highest selection probability in the stable set (≥ π*), ties broken "
-            "by the worst-quantile OOB score (`q_worst`). When selection "
-            "probability saturates (every stable cell at 1.0), `q_worst` is the "
-            "effective decision — the most robust cell wins. A tight cluster of "
-            "similar runners-up is more credible than an isolated winner."
         )
 
-    # ── Stage-2 radius sub-cells (winning weight cell) ──────────
-    radius_stats = summary.get("radius_cell_stats") or []
-    if radius_stats:
-        bin_m = summary.get("radius_bin_m")
-        st.markdown(
-            "**Top radius sub-cells** (within the winning weight cell, "
-            "ranked by `q_worst`)"
-        )
-        rrows: list[dict] = []
-        for rank, c in enumerate(radius_stats, start=1):
-            row = {"Rank": rank}
-            for rk, lo in (c.get("radii") or {}).items():
-                label = rk.removesuffix("_radius").upper() + " radius (m)"
-                try:
-                    hi = int(lo) + int(bin_m) if bin_m else None
-                    row[label] = f"{int(lo)}–{hi}" if hi else int(lo)
-                except (TypeError, ValueError):
-                    row[label] = lo
-            row["Count"] = int(c.get("count", 0))
-            row[f"q_worst {metric_name}"] = round(
-                float(c.get("q_worst", float("nan"))), 4
-            )
-            row[f"Median {metric_name}"] = round(
-                float(c.get("median", float("nan"))), 4
-            )
-            rrows.append(row)
-        st.dataframe(_pd.DataFrame(rrows), width="stretch")
-        st.caption(
-            "Stage 2 of selection: with the channel mix fixed by the winning "
-            "weight cell above, the radii are stability-selected the same way. "
-            "Each row is a radius bucket"
-            + (f" of width {int(bin_m)} m" if bin_m else "")
-            + ". The final composite uses the params averaged within the "
-            "top radius sub-cell, so the reported radii are a validated "
-            "configuration rather than a mean across disagreeing trials."
-        )
-
-    # ── Winning cell OOB distribution ───────────────────────────
-    if oob_scores and len(oob_scores) >= 3:
-        st.markdown("**Winning-cell OOB score distribution**")
-        df_oob = _pd.DataFrame({f"OOB {metric_name}": list(oob_scores)})
-        fig = _px.histogram(
-            df_oob,
-            x=f"OOB {metric_name}",
-            nbins=min(30, max(5, len(oob_scores) // 3)),
-            opacity=0.85,
-        )
-        q_w = float(summary.get("q_worst", float("nan")) or float("nan"))
-        med = float(summary.get("median", float("nan")) or float("nan"))
-        if np.isfinite(q_w):
-            fig.add_vline(
-                x=q_w,
-                line_dash="dash",
-                line_color="red",
-                annotation_text=f"q_worst={q_w:.3f}",
-                annotation_position="top left",
-            )
-        if np.isfinite(med):
-            fig.add_vline(
-                x=med,
-                line_dash="dot",
-                line_color="green",
-                annotation_text=f"median={med:.3f}",
-                annotation_position="top right",
-            )
-        fig.update_layout(
-            height=350,
-            margin={"l": 20, "r": 20, "t": 30, "b": 20},
-        )
-        st.plotly_chart(fig, width="stretch")
-        st.caption(
-            f"Each bar counts trials in the winning cell with that OOB "
-            f"{metric_name}. The closer `q_worst` sits to `median`, the "
-            "tighter the cell's distribution — i.e. the more consistently "
-            "the picked weights performed across bootstrap resamples."
-        )
-
-    # ── Per-bootstrap leaderboard ───────────────────────────────
-    if per_bs:
-        st.markdown("**Per-bootstrap leaderboard** (one row per resample)")
-        rows = []
-        for entry in per_bs:
+    # ── Posterior ───────────────────────────────────────────────
+    weights = summary.get("weight_mean") or []
+    if weights:
+        st.markdown("**Posterior weights**")
+        lo = summary.get("weight_ci_low") or [None] * len(weights)
+        hi = summary.get("weight_ci_high") or [None] * len(weights)
+        powers = summary.get("powers")
+        ratios = summary.get("weight_width_ratio") or []
+        wrows = []
+        for i, w in enumerate(weights):
             row = {
-                "Bootstrap": int(entry.get("bootstrap", -1)),
-                "Trials": int(entry.get("n_trials", 0)),
-                f"Top OOB {metric_name}": round(
-                    float(entry.get("top_oob", float("nan"))), 4
-                ),
-                f"Median OOB {metric_name}": round(
-                    float(entry.get("median_oob", float("nan"))), 4
-                ),
-                "OOB range": (
-                    f"[{float(entry.get('min_oob', float('nan'))):.3f}, "
-                    f"{float(entry.get('max_oob', float('nan'))):.3f}]"
-                ),
+                "Channel": _label(i),
+                "Weight": round(float(w), 3),
+                "95% CrI": f"[{_fmt(lo[i], 3)}, {_fmt(hi[i], 3)}]",
             }
-            for k, v in (entry.get("top_params") or {}).items():
-                short = k.removeprefix("w_").removesuffix("_weight").upper()
-                row[short] = int(v) if v is not None else None
-            rows.append(row)
-        st.dataframe(_pd.DataFrame(rows), width="stretch")
+            if i < len(ratios):
+                row["vs prior"] = _fmt(ratios[i], 2)
+            if powers and i < len(powers):
+                row["Power"] = round(float(powers[i]), 3)
+            wrows.append(row)
+        st.dataframe(_pd.DataFrame(wrows), width="stretch", hide_index=True)
+        prior_ci = summary.get("weight_prior_ci")
         st.caption(
-            "Each row is one bootstrap resample. **Top OOB** is the "
-            "highest-scoring trial in that bootstrap; the right-hand columns "
-            "show that trial's weights. If one set of weights wins across "
-            "many bootstraps, that's strong evidence the winner is stable."
+            "Weights are constrained to the simplex (non-negative, summing to "
+            "1), so each one reads directly as that channel's share of the "
+            "composite. A credible interval spanning most of [0, 1] means the "
+            "data does not separate that channel's contribution. **vs prior** "
+            "is the credible interval's width as a share of the prior's"
+            + (
+                f" (prior 95% CrI [{_fmt(prior_ci[0], 3)}, " f"{_fmt(prior_ci[1], 3)}])"
+                if prior_ci
+                else ""
+            )
+            + " - near 1.00 means the data moved nothing and the weight is the "
+            "prior speaking back."
         )
 
-    # ── Per-trial history (stability's Optuna trial log) ────────
-    history = summary.get("trial_history") or []
-    if history and len(history) >= 5:
-        with st.expander(f"Trial history ({len(history)} trials across all resamples)"):
-            hist_df = _pd.DataFrame(history)
+    _render_fitted_grid(summary, _pd, _label)
 
-            # OOB score per resample as a pair of boxplots: one for the
-            # resample's calibrated top-K trials (winners), one for the rest
-            # (losers). Boxes show each group's spread per resample instead of a
-            # cloud of individual dots.
-            if {"bootstrap", "oob_score"}.issubset(hist_df.columns):
-                if "in_top_k" in hist_df.columns:
-                    hist_df["Membership"] = np.where(
-                        hist_df["in_top_k"].astype(bool), "Top-K", "Other"
-                    )
-                    color_arg: dict = {
-                        "color": "Membership",
-                        "color_discrete_map": {"Top-K": "#2ca02c", "Other": "#9aa0a6"},
-                        "category_orders": {"Membership": ["Top-K", "Other"]},
-                    }
-                else:
-                    color_arg = {}
-                fig_h = _px.box(
-                    hist_df,
-                    x="bootstrap",
-                    y="oob_score",
-                    points=False,
-                    labels={
-                        "bootstrap": "Resample",
-                        "oob_score": f"OOB {metric_name}",
-                    },
-                    **color_arg,
-                )
-                fig_h.update_layout(
-                    height=360,
-                    margin={"l": 20, "r": 20, "t": 30, "b": 20},
-                    boxmode="group",
-                )
-                st.plotly_chart(fig_h, width="stretch")
-                st.caption(
-                    "Two boxplots per complementary-half resample: trials whose "
-                    "channel-mix cell was in that resample's calibrated top-K "
-                    "(green = winners) versus the rest (grey = losers). A winner "
-                    "box can sit below a loser box in a resample — top-K "
-                    "membership ranks cells by their *best* trial, so a winning "
-                    "cell's other trials (different radii/aggregators) spread "
-                    "lower. The chosen winner is the cell that recurs in the "
-                    "top-K across resamples (selection probability), not the one "
-                    "scoring highest in any single resample."
-                )
-
-            # Parallel coordinates over the channel weights, colored by OOB —
-            # where the high-scoring weight combinations concentrate.
-            weight_keys = (
-                [
-                    k
-                    for k in (cell_stats[0].get("weights") or {}).keys()
-                    if k in hist_df.columns and hist_df[k].notna().any()
-                ]
-                if cell_stats
-                else []
+    beta = summary.get("beta_mean")
+    if beta is not None:
+        b1, b2, b3, b4, b5 = st.columns(5)
+        with b1:
+            st.metric(
+                "Beta (index to outcome)",
+                _fmt(beta, 4),
+                help="Posterior mean effect of the composite, in z-units.",
             )
-            if len(weight_keys) >= 2 and "oob_score" in hist_df.columns:
-                pc_df = hist_df[weight_keys + ["oob_score"]].dropna()
-                if len(pc_df) >= 5:
-                    label_map = {
-                        k: k.removeprefix("w_").removesuffix("_weight").upper()
-                        for k in weight_keys
-                    }
-                    label_map["oob_score"] = f"OOB {metric_name}"
-                    fig_pc = _px.parallel_coordinates(
-                        pc_df,
-                        dimensions=weight_keys + ["oob_score"],
-                        color="oob_score",
-                        labels=label_map,
-                        color_continuous_scale=_px.colors.sequential.Viridis,
-                    )
-                    fig_pc.update_layout(
-                        height=380, margin={"l": 60, "r": 40, "t": 40, "b": 30}
-                    )
-                    st.plotly_chart(fig_pc, width="stretch")
-                    st.caption(
-                        "Each line is one trial's channel-weight combination, "
-                        "colored by its OOB score. Brighter lines converging on "
-                        "the same weight region show where the high-scoring "
-                        "mixes concentrate."
-                    )
+        with b2:
+            st.metric(
+                "95% CrI",
+                f"[{_fmt(summary.get('beta_ci_low'), 3)}, "
+                f"{_fmt(summary.get('beta_ci_high'), 3)}]",
+                help="Excludes zero -> the direction is resolved by the data.",
+            )
+        with b3:
+            st.metric(
+                "P(direction)",
+                _fmt(summary.get("p_direction"), 3),
+                help=(
+                    "Posterior mass on the sign of beta; 0.975 is about a "
+                    "two-sided 0.05."
+                ),
+            )
+        with b4:
+            rhat = _num(summary.get("rhat_max"))
+            st.metric(
+                "R-hat / ESS",
+                f"{_fmt(rhat, 3)} / {_fmt(summary.get('ess_min'), 0)}",
+                help=(
+                    "Sampler health. R-hat should be under 1.01 and ESS in the "
+                    "hundreds; otherwise the intervals above are not "
+                    "trustworthy - raise draws and chains."
+                ),
+            )
+        with b5:
+            st.metric(
+                "Partial R²",
+                _fmt(summary.get("partial_r2_mean"), 4),
+                help=(
+                    "Share of the covariate-adjusted outcome variance the "
+                    "index explains. In greenspace and mental-health research "
+                    "values near 0.001 are the published effect size, not a "
+                    "defect of the fit - but they also cap how well any method "
+                    "can resolve *which* channel carries the effect."
+                ),
+            )
+        div = summary.get("divergences")
+        if (rhat is not None and rhat > 1.01) or (div and int(div) > 0):
+            st.warning(
+                f"Sampler did not converge cleanly (R-hat {_fmt(rhat, 3)}, "
+                f"{div} divergent transitions). Increase posterior draws and "
+                "warmup before quoting the credible intervals."
+            )
 
-            st.dataframe(hist_df, width="stretch", height=240)
+    # ── Reproducibility ─────────────────────────────────────────
+    disc = summary.get("discovery") or {}
+    if disc:
+        st.markdown("**Does the discovery reproduce?**")
+        n_res = int(disc.get("n_results") or 0)
+        counts = disc.get("pick_counts") or {}
+        top = next(iter(counts.items()), None)
+        d1, d2, d3 = st.columns(3)
+        with d1:
+            st.metric(
+                "Independent discoveries",
+                f"{disc.get('reps', '-')} x {disc.get('shuffles', '-')}",
+                help=(
+                    "Replicates x reshuffled splits. Each one re-runs the whole "
+                    "discovery on its own seed stream."
+                ),
+            )
+        with d2:
+            st.metric(
+                "Distinct picks",
+                f"{disc.get('distinct_picks', '-')}",
+                help="How many different configurations were discovered.",
+            )
+        with d3:
+            st.metric(
+                "Modal pick share",
+                f"{100.0 * int(top[1]) / n_res:.0f}%" if top and n_res else "-",
+                help=(
+                    "Share of runs landing on the single most common "
+                    "configuration. Low here means the pick above is one draw "
+                    "from a wide distribution, not a reproducible finding."
+                ),
+            )
+        per_form = disc.get("per_form") or {}
+        if per_form:
+            st.dataframe(
+                _pd.DataFrame(
+                    [
+                        {
+                            "Form": f,
+                            "Train |t|": _fmt(v.get("train_t"), 3),
+                            "Held-out |t|": _fmt(v.get("test_t"), 3),
+                            "Shrinkage": _fmt(v.get("shrinkage"), 3),
+                        }
+                        for f, v in per_form.items()
+                    ]
+                ),
+                width="stretch",
+                hide_index=True,
+            )
+            form_counts = disc.get("form_counts") or {}
+            chosen_t = _num(disc.get("chosen_test_t"))
             st.caption(
-                "The full per-trial record (resample, OOB score, snapped cell, "
-                "and every parameter), kept so the run's exploration is "
-                "reproducible and re-scorable without re-running the search."
+                "Averaged over every replicate. **Shrinkage** is train minus "
+                "held-out: the part of the in-sample fit that did not survive "
+                "to unseen rows. A form with a higher train score and a larger "
+                "shrinkage is overfitting, not winning."
+                + (
+                    " Each replicate chose its form on inner splits of its "
+                    "training rows ("
+                    + ", ".join(f"`{f}` {n}" for f, n in form_counts.items())
+                    + ")"
+                    + (
+                        f"; the chosen form's held-out |t| averaged " f"{chosen_t:.3f}"
+                        if chosen_t is not None
+                        else ""
+                    )
+                    + "."
+                    if form_counts
+                    else ""
+                )
             )
+            if any(_num(v.get("test_t")) is None for v in per_form.values()):
+                st.info(
+                    "These are blank for runs recorded before entities without "
+                    "greenery coverage at every searched radius were excluded. "
+                    "One such entity made the average of the replicates "
+                    "undefined, so the whole column reads as missing. The "
+                    "weights beside it were unaffected, and re-running the "
+                    "study fills these in."
+                )
+
+    # ── Composite vs its own channels ───────────────────────────
+    gain = summary.get("holdout_gain") or {}
+    if gain:
+        st.markdown("**Composite vs standalone channels**")
+        g1, g2, g3 = st.columns(3)
+        with g1:
+            st.metric(
+                "Composite (held-out)",
+                _fmt(gain.get("cgi"), 3),
+                help=(
+                    "Mean held-out |t| of the fitted composite, its form chosen "
+                    "on each split's training rows. Blank on runs recorded "
+                    "before uncovered entities were excluded from the search — "
+                    "a single one made this average undefined."
+                ),
+            )
+        with g2:
+            st.metric(
+                "Best standalone",
+                _fmt(gain.get("best_single"), 3),
+                delta=_fmt(gain.get("gain"), 3),
+                help=(
+                    "Not the best channel's average. In each split the stronger "
+                    "channel is chosen on the training rows, and its held-out "
+                    "score is taken; this is the mean of that. Choosing on "
+                    "train sometimes picks the weaker channel, so this sits "
+                    "below the best row in the table and above the worst - "
+                    "which is the honest comparator, because the composite had "
+                    "to make its choice on training rows too."
+                ),
+            )
+        with g3:
+            st.metric(
+                "Gain p (permutation)",
+                _fmt(gain.get("gain_p"), 3),
+                help=(
+                    "Permutation null on the gain itself, so the composite's "
+                    "extra flexibility is priced in rather than assumed away."
+                ),
+            )
+        singles = {
+            k.removeprefix("standalone_"): v
+            for k, v in gain.items()
+            if k.startswith("standalone_")
+        }
+        if singles:
+            st.dataframe(
+                _pd.DataFrame(
+                    [
+                        {"Channel": k.upper(), "Held-out |t|": round(float(v), 3)}
+                        for k, v in singles.items()
+                    ]
+                ),
+                width="stretch",
+                hide_index=True,
+            )
+        won, splits = gain.get("gain_won"), gain.get("splits")
+        if won is not None and splits:
+            st.caption(
+                f"The composite beat the best standalone on {won} of {splits} "
+                "held-out splits. Fusion is only justified when it wins on most "
+                "of them *and* the permutation p is small - otherwise report "
+                "the single channel, which is simpler and cheaper to collect."
+            )
+        form_counts = gain.get("form_counts") or {}
+        optimistic = _num(gain.get("cgi_max_over_forms_optimistic"))
+        if form_counts and optimistic is not None:
+            st.caption(
+                "Form chosen on training rows per split: "
+                + ", ".join(f"`{f}` {n}" for f, n in form_counts.items())
+                + f". Taking the better form on the held-out rows instead "
+                f"would read {optimistic:.3f} - optimistic, because it selects "
+                "on the rows it scores."
+            )
+
+    # ── Null calibration ────────────────────────────────────────
+    null = summary.get("null_calibration") or {}
+    if null:
+        rate = _num(null.get("rate"))
+        r_lo, r_hi = _num(null.get("rate_ci_low")), _num(null.get("rate_ci_high"))
+        st.markdown("**Null calibration**")
+        n1, n2 = st.columns(2)
+        with n1:
+            st.metric(
+                "False-positive rate on permuted outcomes",
+                f"{rate:.1%}" if rate is not None else "-",
+                help=(
+                    "The whole procedure re-run on shuffled outcomes. The beta "
+                    "interval should exclude zero about 5% of the time."
+                ),
+            )
+        with n2:
+            st.metric(
+                "95% CI (exact)",
+                (
+                    f"[{r_lo:.1%}, {r_hi:.1%}]"
+                    if r_lo is not None and r_hi is not None
+                    else "-"
+                ),
+                help=(
+                    "Clopper-Pearson interval on the rate. With few refits it "
+                    "is wide: 0 of 16 is compatible with a true rate of 20.6%."
+                ),
+            )
+        if null.get("imprecise"):
+            st.info(
+                f"{null.get('runs')} refits are too few to support a "
+                "calibration claim; the rate is a quick check only. Run at "
+                "least 100, and 200 for a final, reported run."
+            )
+        form_counts = null.get("form_counts") or {}
+        if form_counts:
+            st.caption(
+                "The form was re-chosen on every permuted outcome ("
+                + ", ".join(f"`{f}` {n}" for f, n in form_counts.items())
+                + "), so this rate covers the form choice as well."
+            )
+        if rate is not None and rate > 0.15:
+            st.warning(
+                f"The beta interval excludes zero on {rate:.0%} of permuted "
+                f"outcomes ({null.get('excluded_zero')} of {null.get('runs')} "
+                "runs) - well above the 5% it should be. The intervals in this "
+                "report are over-confident; treat the effect as unproven."
+            )
+        else:
+            st.caption(
+                f"{null.get('excluded_zero')} of {null.get('runs')} permuted "
+                "refits produced a beta interval excluding zero."
+            )
+
+    elapsed = _num(summary.get("elapsed_s"))
+    if elapsed:
+        st.caption(f"_Discovery took {elapsed:.0f}s._")
 
 
 def _num(x) -> float | None:
@@ -3190,6 +3717,12 @@ def _num(x) -> float | None:
     except (TypeError, ValueError):
         return None
     return fx if math.isfinite(fx) else None
+
+
+def _fmt(x, places: int = 3) -> str:
+    """``x`` at *places* decimals, or an em dash when it isn't a real number."""
+    fx = _num(x)
+    return "—" if fx is None else f"{fx:.{places}f}"
 
 
 def _usable_effect(block: dict | None) -> dict | None:
@@ -3469,14 +4002,14 @@ def _render_study_detail(
     Renders: test score + CI / direction / n tiles · the winning params
     (weights + radii + aggregators, formula-aware; standalones show their
     single active channel) · per-subset scores (bootstraps / held-out test /
-    all) · the final params JSON · and the stability-selection diagnostics.
+    all) · the final params JSON · and the discovery diagnostics.
     """
     averaged_raw = study_view.get("averaged_params") or {}
     best_params = study_view.get("best_params") or {}
     final_params = {
         k: v for k, v in averaged_raw.items() if not str(k).startswith("__")
     } or {k: v for k, v in best_params.items() if not str(k).startswith("__")}
-    summary = study_view.get("stability_summary") or {}
+    summary = study_view.get("discovery_summary") or {}
     test_res = study_view.get("test_results") or {}
     test_ci = test_res.get("test_ci") or {}
     subset_scores = study_view.get("subset_scores") or {}
@@ -3522,8 +4055,8 @@ def _render_study_detail(
 
     # ── Winning params ──────────────────────────────────────────
     if is_cgi:
-        if formula.name == _cgi_formulas.WEIGHTED_AVERAGE:
-            st.markdown("**Weights (stability-selected)**")
+        if not formula.power_keys:
+            st.markdown("**Weights (posterior mean)**")
             weight_cols = st.columns(len(formula.weight_keys))
             total_weight = sum(
                 float(final_params.get(k, 0)) for k in formula.weight_keys
@@ -3539,7 +4072,7 @@ def _render_study_detail(
                 with col:
                     st.metric(label, f"{pct:.1f}%")
         else:
-            st.markdown("**Weights and powers (stability-selected)**")
+            st.markdown("**Weights and powers (posterior mean)**")
             all_keys = list(formula.weight_keys) + list(formula.power_keys)
             groups = [all_keys[i : i + 3] for i in range(0, len(all_keys), 3)]
             for group in groups:
@@ -3555,37 +4088,47 @@ def _render_study_detail(
                         with col:
                             st.metric(pretty, f"{val:.1f}")
 
+        # Only the channels this formula consumes.
+        channels = _cgi_formulas.formula_channels(formula.name)
         st.markdown("**Radii (m)**")
-        radii_cols = st.columns(3)
-        for col, key in zip(
-            radii_cols, ("veg_radius", "terrain_radius", "ndvi_radius")
-        ):
-            ch = key.removesuffix("_radius")
+        radii_cols = st.columns(max(len(channels), 1))
+        for col, ch in zip(radii_cols, channels):
             label = _CHANNEL_DISPLAY.get(ch, ch.upper())
             with col:
                 try:
-                    v = int(round(float(final_params.get(key, 0))))
+                    v = int(round(float(final_params[f"{ch}_radius"])))
                     st.metric(label, f"{v} m")
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, KeyError):
                     st.metric(label, "—")
 
         st.markdown("**Aggregators**")
-        agg_cols = st.columns(2)
-        with agg_cols[0]:
-            st.metric(
-                "GVI (Vegetation + Terrain)",
-                _agg_label(
-                    final_params.get("streetview_stat"),
-                    final_params.get("streetview_percentile"),
-                ),
+        # NDVI has its own aggregator; every street-view channel shares one
+        # slot in the apply path, so they cannot be reported separately.
+        street = [c for c in channels if c != "ndvi"]
+        agg_specs = []
+        if street:
+            agg_specs.append(
+                (
+                    " + ".join(_CHANNEL_DISPLAY.get(c, c.upper()) for c in street),
+                    "streetview_stat",
+                    "streetview_percentile",
+                )
             )
-        with agg_cols[1]:
-            st.metric(
-                "NDVI",
-                _agg_label(
-                    final_params.get("ndvi_stat"),
-                    final_params.get("ndvi_percentile"),
-                ),
+        if "ndvi" in channels:
+            agg_specs.append(("NDVI", "ndvi_stat", "ndvi_percentile"))
+        agg_cols = st.columns(max(len(agg_specs), 1))
+        for col, (label, stat_key, pct_key) in zip(agg_cols, agg_specs):
+            with col:
+                st.metric(
+                    label,
+                    _agg_label(final_params.get(stat_key), final_params.get(pct_key)),
+                )
+        if len(street) > 1:
+            st.caption(
+                "The street-view channels share a single aggregator slot in the "
+                "apply path, so they are reported together. Where the posterior "
+                "prefers different statistics for them, only one can be carried "
+                "into the composite."
             )
     else:
         # Standalone: a single channel at 100 % — weights are not
@@ -3654,8 +4197,11 @@ def _render_study_detail(
             return f"[{lo:.4f}, {hi:.4f}]"
 
         st.markdown("**Scores by data subset**")
+        # ``val`` holds the sweep's mean held-out |t|, not a value of the
+        # objective, so it goes in the caption rather than the metric column.
+        sweep_t = _num((subset_scores.get("val") or {}).get("score"))
         rows: list[dict] = []
-        for subset in ("val", "test", "all"):
+        for subset in ("test", "all"):
             block = subset_scores.get(subset) or {}
             if not block:
                 continue
@@ -3676,10 +4222,8 @@ def _render_study_detail(
         if rows:
             st.dataframe(pd.DataFrame(rows), width="stretch")
             cap = (
-                "Stability selection resamples the full train+val pool into "
-                "complementary halves, so there is no train→fit→validate step. "
-                "**Bootstraps** = winning-cell median out-of-bag score across "
-                "the complementary-half resamples (the cross-resample signal) · "
+                "The sweep splits the full train+val pool repeatedly, so "
+                "there is no single train→fit→validate step. "
                 "**Held-out test** = untouched test split the params never saw "
                 "(the headline) · **All** = every entity (in-sample, descriptive). "
                 f"95% CIs are percentile bootstrap; `{p_col}` is reported on the "
@@ -3690,6 +4234,14 @@ def _render_study_detail(
                 cap += (
                     " The metric column is covariate-adjusted (partial); "
                     "`(raw)` is the unadjusted correlation."
+                )
+            if sweep_t is not None:
+                cap += (
+                    f" The sweep's own cross-resample score was **|t| = "
+                    f"{sweep_t:.3f}**, reported separately because it is a "
+                    f"t-statistic over the resampled train+val pool rather than "
+                    f"a value of `{metric_name}` — the two do not share a scale "
+                    f"and must not be compared."
                 )
             if any(r.get(metric_name) is None for r in rows):
                 cap += (
@@ -3702,8 +4254,108 @@ def _render_study_detail(
     with st.expander("Final parameters (composite is built from these)"):
         st.json(final_params)
 
-    # ── Stability-selection diagnostics ─────────────────────────
-    _render_stability_diagnostics(summary, metric_name)
+    # ── Negative controls ───────────────────────────────────────
+    _render_negative_controls(study_view.get("negative_controls"))
+
+    # ── Discovery diagnostics ───────────────────────────────────
+    _render_posterior_diagnostics(summary, metric_name)
+
+
+def _render_negative_controls(report: dict | None) -> None:
+    """The frozen composite scored against each negative-control outcome.
+
+    A control shares the target's confounders but not a causal path from
+    greenery, so an association as large as the target's says the tuned one
+    is partly non-specific. Held-out split first; train+val for reference.
+    """
+    if not report:
+        return
+    st.markdown("**Negative controls**")
+    if report.get("skipped") == "longitudinal":
+        st.info(
+            "Negative controls are reported for cross-sectional targets only; "
+            "this longitudinal run did not score them."
+        )
+        return
+    splits = report.get("splits") or {}
+    for split, title in (("test", "Held-out test"), ("train_val", "Train+val")):
+        res = splits.get(split)
+        if not res:
+            continue
+        tgt = res.get("target") or {}
+        rows = [
+            {
+                "Outcome": "Target",
+                "β (SD per SD)": _fmt(tgt.get("beta"), 3),
+                "95% CI": f"[{_fmt(tgt.get('ci_low'), 3)}, {_fmt(tgt.get('ci_high'), 3)}]",
+                "t": _fmt(tgt.get("t"), 2),
+                "n": tgt.get("n"),
+                "|β| target − |β| control": "-",
+                "Non-specific": "-",
+            }
+        ]
+        for name, c in (res.get("controls") or {}).items():
+            rows.append(
+                {
+                    "Outcome": name,
+                    "β (SD per SD)": _fmt(c.get("beta"), 3),
+                    "95% CI": f"[{_fmt(c.get('ci_low'), 3)}, {_fmt(c.get('ci_high'), 3)}]",
+                    "t": _fmt(c.get("t"), 2),
+                    "n": c.get("n"),
+                    "|β| target − |β| control": (
+                        f"{_fmt(c.get('delta'), 3)} [{_fmt(c.get('delta_ci_low'), 3)}, "
+                        f"{_fmt(c.get('delta_ci_high'), 3)}]"
+                    ),
+                    "Non-specific": "yes" if c.get("nonspecific") else "no",
+                }
+            )
+        st.caption(title)
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    retune = report.get("retune") or {}
+    if retune:
+        rows = [
+            {
+                "Control": name,
+                "Channel": _CHANNEL_DISPLAY.get(ch, ch.upper()),
+                "Radius profile TV": _fmt(row.get("radius_profile_tv"), 2),
+                "Aggregator TV": _fmt(row.get("aggregator_tv"), 2),
+                "|ΔR50| (m)": _fmt(row.get("abs_delta_r50"), 0),
+                "|Δweight|": _fmt(row.get("abs_delta_weight"), 2),
+                "Same cell": "yes" if row.get("same_pick") else "no",
+            }
+            for name, block in retune.items()
+            for ch, row in (block.get("channels") or {}).items()
+        ]
+        if rows:
+            st.caption("Re-tuned on each control (same protocol and seed)")
+            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+            st.caption(
+                "Total-variation distances run from 0 (the control's tuning "
+                "reproduces the target's) to 1 (disjoint). A control that lands "
+                "on the same radius, aggregator and weights as the target says "
+                "the search found what the two outcomes share - confounding - "
+                "rather than a pathway specific to the target."
+            )
+    flagged = report.get("nonspecific") or []
+    if flagged:
+        st.warning(
+            "On the held-out split, "
+            + ", ".join(f"`{n}`" for n in flagged)
+            + " carries an association whose size cannot be told apart from "
+            "the target's. Part of the tuned association is shared with an "
+            "outcome greenery should not cause - residual confounding or "
+            "selection, not only the pathway. Read the effect with that in mind."
+        )
+    st.caption(
+        "Each control is scored with the composite frozen as tuned; it never "
+        "entered the search. β is the covariate-adjusted slope with both sides "
+        "in residual SD units, with its exact OLS interval. The difference "
+        f"column is a paired bootstrap ({report.get('n_boot')} resamples) on the "
+        "entities that have both outcomes. **Non-specific** means the control's "
+        "interval excludes zero while the difference's interval includes it. "
+        "Compare against a standalone study's table to see whether the "
+        "composite is more or less specific than a single channel."
+    )
 
 
 def _render_cross_study_comparison(results_view: dict, metric_name: str) -> None:
@@ -3716,7 +4368,7 @@ def _render_cross_study_comparison(results_view: dict, metric_name: str) -> None
     st.markdown("**CGI vs standalone single-metric studies**")
 
     studies: list[tuple[str, str, dict]] = [("cgi", "CGI (combined)", results_view)]
-    for ch in ("veg", "terrain", "ndvi"):
+    for ch in _ALL_STANDALONE_CHANNELS:
         b = standalones.get(ch)
         if b:
             studies.append((ch, f"{_CHANNEL_DISPLAY.get(ch, ch)} (standalone)", b))
@@ -3727,13 +4379,18 @@ def _render_cross_study_comparison(results_view: dict, metric_name: str) -> None
         "test": "Held-out test",
         "all": "All",
     }
-    _default("fusion_compare_subsets", ["val", "all"])
+    _default("fusion_compare_subsets", ["test", "all"])
     subset_picks = st.multiselect(
         "Subsets to compare",
-        options=["val", "test", "all"],
+        options=["test", "all"],
         format_func=lambda s: _subset_label.get(s, s),
         key="fusion_compare_subsets",
-        help="Each study's stability-selected params, scored on each subset.",
+        help=(
+            f"Each study's discovered params, scored on each subset in "
+            f"{metric_name}. The sweep's held-out |t| is charted separately "
+            f"below, because it is a t-statistic rather than a value of the "
+            f"objective and sharing an axis with it hides every real bar."
+        ),
     )
     if subset_picks:
         rows: list[dict] = []
@@ -3776,6 +4433,36 @@ def _render_cross_study_comparison(results_view: dict, metric_name: str) -> None
             )
         with st.expander("Show exact values"):
             st.dataframe(df, width="stretch")
+
+    # ── Sweep held-out |t|, on its own axis ─────────────────────
+    t_rows = [
+        {
+            "Study": disp,
+            "Held-out |t|": _num(
+                ((b.get("subset_scores") or {}).get("val") or {}).get("score")
+            ),
+        }
+        for _key, disp, b in studies
+    ]
+    t_rows = [r for r in t_rows if r["Held-out |t|"] is not None]
+    if t_rows:
+        st.markdown("**Sweep held-out |t| by study**")
+        t_df = pd.DataFrame(t_rows)
+        try:
+            import plotly.express as _px
+
+            fig_t = _px.bar(t_df, x="Study", y="Held-out |t|")
+            fig_t.update_layout(height=300, margin=dict(l=60, r=20, t=30, b=80))
+            st.plotly_chart(fig_t, width="stretch")
+        except Exception:
+            st.bar_chart(t_df.set_index("Study"), width="stretch")
+        st.caption(
+            "Mean |t| of each study's winning configuration across the sweep's "
+            "held-out splits — the number each pick was actually made on. It is "
+            "a t-statistic, so it grows with sample size and is **not** "
+            f"comparable to the `{metric_name}` bars above; use it to compare "
+            "studies with each other, not against the objective."
+        )
 
     # ── Paired objective difference (Holm-corrected) ────────────
     fam = results_view.get("cgi_vs_standalone_paired_family") or []
@@ -3985,6 +4672,22 @@ def _render_fusion_results_body(output_dir: str) -> None:
             else ""
         )
     )
+    _cfg_hash = results_view.get("config_hash")
+    _test_reads = results_view.get("test_reads")
+    if _cfg_hash or _test_reads is not None:
+        bits = []
+        if _cfg_hash:
+            bits.append(f"**Config hash:** `{_cfg_hash}`")
+        if _test_reads is not None:
+            bits.append(f"**Test-set reads:** {int(_test_reads)}")
+        st.caption("  ·  ".join(bits))
+        if _test_reads is not None and int(_test_reads) > 20:
+            st.caption(
+                ":orange[The held-out set was scored on "
+                f"{int(_test_reads)} distinct configurations.] Each one spends "
+                "part of the out-of-sample guarantee; the headline p-value is "
+                "optimistic by roughly that many comparisons."
+            )
     artifacts_dir = results_view.get("artifacts_dir")
     if artifacts_dir:
         st.caption(f"📁 Job artifacts: `{artifacts_dir}`")
@@ -3993,7 +4696,7 @@ def _render_fusion_results_body(output_dir: str) -> None:
     # ── Study selector + per-study detail ───────────────────────
     standalones = results_view.get("standalones") or {}
     study_options: list[tuple[str, str]] = [("cgi", "CGI (combined)")]
-    for ch in ("veg", "terrain", "ndvi"):
+    for ch in _ALL_STANDALONE_CHANNELS:
         if standalones.get(ch):
             study_options.append((ch, f"{_CHANNEL_DISPLAY.get(ch, ch)} (standalone)"))
 
@@ -4082,7 +4785,7 @@ def _render_fusion_results_body(output_dir: str) -> None:
                 )
 
         # CGI first, then the channels in their canonical order.
-        _order = {"cgi": 0, "veg": 1, "terrain": 2, "ndvi": 3}
+        _order = {"cgi": 0, "gvi": 1, "veg": 2, "terrain": 3, "ndvi": 4}
         _csv_entries.sort(key=lambda e: _order.get(e[0], 99))
 
         if _csv_entries:
@@ -4391,6 +5094,27 @@ def render(output_dir: str) -> None:
                         target_outcome_columns = list(
                             st.session_state.fusion_outcome_columns
                         )
+                        nc_options = [
+                            c for c in numeric_cols if c not in target_outcome_columns
+                        ]
+                        if target_outcome_columns and nc_options:
+                            _keep_valid(
+                                "fusion_negative_controls", nc_options, multi=True
+                            )
+                            st.multiselect(
+                                "Negative-control outcomes",
+                                options=nc_options,
+                                key="fusion_negative_controls",
+                                help=(
+                                    "Outcome expected to share confounders with "
+                                    "the target but not to be caused by greenery "
+                                    "(e.g. grip strength for cognitive outcomes). "
+                                    "Never tuned on: the finished composite is "
+                                    "scored against it to show how much of the "
+                                    "association is non-specific. "
+                                    "Cross-sectional runs only."
+                                ),
+                            )
                         if len(target_outcome_columns) > 1:
                             _default("fusion_multi_objective_run", False)
                             multi_objective_requested = st.checkbox(
@@ -4565,6 +5289,17 @@ def render(output_dir: str) -> None:
     covariate_columns = study_state["covariate_columns"]
     covariate_types = study_state.get("covariate_types") or {}
     moderator_columns_param = list(study_state.get("moderator_columns") or [])
+    # Picked in the target section, so read from state; a control cannot also
+    # be an outcome of this job.
+    negative_controls_param = (
+        [
+            c
+            for c in (st.session_state.get("fusion_negative_controls") or [])
+            if c not in target_outcome_columns
+        ]
+        if is_vector_target
+        else []
+    )
     exposure_iqr_param = study_state.get("exposure_iqr")
     objective_metric = study_state["objective_metric"]
     test_size = study_state["test_size"]
@@ -4592,15 +5327,19 @@ def render(output_dir: str) -> None:
     spatial_split_param = bool(study_state.get("spatial_split", False))
     spatial_block_size_m_param = study_state.get("spatial_block_size_m")
     n_spatial_blocks_param = study_state.get("n_spatial_blocks")
-    n_bootstraps_param = int(study_state.get("n_bootstraps", 30))
-    n_trials_per_bootstrap_param = int(study_state.get("n_trials_per_bootstrap", 150))
-    weight_bin_pct_param = int(
-        study_state.get("weight_bin_pct", _cgi_formulas.WEIGHT_BIN_PCT)
+    channel_set_param = str(study_state.get("channel_set", "ndvi + gvi"))
+    index_form_param = str(study_state.get("index_form", "sweep"))
+    sweep_splits_param = int(study_state.get("sweep_splits", 40))
+    discovery_reps_param = int(study_state.get("discovery_reps", 5))
+    discovery_shuffles_param = int(study_state.get("discovery_shuffles", 12))
+    gain_splits_param = int(study_state.get("gain_splits", 20))
+    gain_permutations_param = int(study_state.get("gain_permutations", 100))
+    null_calibration_runs_param = int(study_state.get("null_calibration_runs", 16))
+    posterior_draws_param = int(study_state.get("posterior_draws", 800))
+    posterior_warmup_param = int(
+        study_state.get("posterior_warmup", posterior_draws_param)
     )
-    weight_refine_bin_pct_param = study_state.get("weight_refine_bin_pct")
-    min_cell_count_param = int(study_state.get("min_cell_count", 3))
-    worst_quantile_param = float(study_state.get("worst_quantile", 0.10))
-    max_pfer_param = float(study_state.get("max_pfer", 1.0))
+    posterior_chains_param = int(study_state.get("posterior_chains", 4))
     check_collinearity_param = bool(study_state.get("check_collinearity", False))
     vif_threshold_param = float(study_state.get("vif_threshold", 10.0))
 
@@ -4907,13 +5646,24 @@ def render(output_dir: str) -> None:
                     f"**NDVI buffers (m):** {ndvi_buffer_min_m} – {ndvi_buffer_max_m} "
                     f"(step {ndvi_buffer_step_m})"
                 )
+                if negative_controls_param:
+                    st.write(
+                        "**Negative controls:** "
+                        + ", ".join(f"`{c}`" for c in negative_controls_param)
+                    )
                 st.write(f"**Extent padding (m):** {buffer_extent_m}")
                 st.write(
-                    f"**Stability selection:** {n_bootstraps_param} bootstraps × "
-                    f"{n_trials_per_bootstrap_param} trials, "
-                    f"{weight_bin_pct_param}% weight cells, "
-                    f"{test_size*100:.0f}% test set · max PFER "
-                    f"{'off' if max_pfer_param <= 0 else f'{max_pfer_param:g}'}"
+                    f"**Discovery:** {channel_set_param}, form "
+                    f"{index_form_param}, {sweep_splits_param} sweep splits, "
+                    f"{test_size*100:.0f}% test set"
+                )
+                st.write(
+                    f"**Validation:** {discovery_reps_param}×"
+                    f"{discovery_shuffles_param} discovery replicates · "
+                    f"{gain_splits_param} gain splits / "
+                    f"{gain_permutations_param} permutations · "
+                    f"{null_calibration_runs_param} null refits · "
+                    f"{posterior_chains_param}×{posterior_draws_param} draws"
                 )
 
             from services import get_job_executor, get_job_store
@@ -4961,11 +5711,14 @@ def render(output_dir: str) -> None:
                 "covariate_columns": list(covariate_columns or []),
                 "covariate_types": dict(covariate_types or {}),
                 "moderator_columns": list(moderator_columns_param),
+                "negative_controls": negative_controls_param,
                 "exposure_iqr": (
                     float(exposure_iqr_param) if exposure_iqr_param else None
                 ),
+                # One standalone per channel of the set the job runs, so the
+                # monitor's step list matches the channels actually studied.
                 "standalone_channels": (
-                    ["veg", "terrain", "ndvi"] if run_standalones else []
+                    list(_CHANNEL_SETS[channel_set_param]) if run_standalones else []
                 ),
                 "longitudinal_spec_payload": longitudinal_spec_payload,
                 "cgi_grid_spacing_m": (
@@ -5004,13 +5757,17 @@ def render(output_dir: str) -> None:
                 "n_spatial_blocks": (
                     n_spatial_blocks_param if is_vector_target else None
                 ),
-                "n_bootstraps": int(n_bootstraps_param),
-                "n_trials_per_bootstrap": int(n_trials_per_bootstrap_param),
-                "weight_bin_pct": int(weight_bin_pct_param),
-                "weight_refine_bin_pct": weight_refine_bin_pct_param,
-                "min_cell_count": int(min_cell_count_param),
-                "worst_quantile": float(worst_quantile_param),
-                "max_pfer": float(max_pfer_param),
+                "channel_set": channel_set_param,
+                "index_form": index_form_param,
+                "sweep_splits": int(sweep_splits_param),
+                "discovery_reps": int(discovery_reps_param),
+                "discovery_shuffles": int(discovery_shuffles_param),
+                "gain_splits": int(gain_splits_param),
+                "gain_permutations": int(gain_permutations_param),
+                "null_calibration_runs": int(null_calibration_runs_param),
+                "posterior_draws": int(posterior_draws_param),
+                "posterior_warmup": int(posterior_warmup_param),
+                "posterior_chains": int(posterior_chains_param),
                 "check_collinearity": bool(check_collinearity_param),
                 "vif_threshold": float(vif_threshold_param),
             }

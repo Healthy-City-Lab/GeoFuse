@@ -1,15 +1,17 @@
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+import shapely
 from pyproj import Transformer
 from rasterio import features
 from rasterio.transform import from_bounds, from_origin, xy
-from shapely.geometry import MultiPoint, MultiPolygon, Polygon, box
+from shapely.geometry import MultiPolygon, Polygon, box
 from shapely.ops import transform as shapely_transform
 from shapely.strtree import STRtree
 
 from .crs_utils import (
     WGS84_EPSG,
+    buffer_union_planar,
     metres_per_degree_at_lat,
     select_grid_crs_with_warning,
 )
@@ -20,6 +22,13 @@ _log_core = get_logger("GVI")
 # Inside-buffer vs outside-buffer in the raster mask (any value other than *fill* works).
 _RASTER_INSIDE = 1
 _RASTER_OUTSIDE = 0
+
+# Candidate cell centres tested per ``contains_xy`` call. A cluster's bbox can
+# hold tens of millions of cells (a metro at 20 m step already exceeds 4M), and
+# testing them in one shot means holding two float64 coordinate arrays plus the
+# boolean result for the whole bbox at once. Blocking by grid rows caps that
+# working set at a few tens of MB no matter how large the cluster is.
+_GRID_TEST_BLOCK_CELLS = 1_000_000
 
 
 def _geometry_union_all(geoms: gpd.GeoSeries):
@@ -113,6 +122,64 @@ def generate_raster_grid(gdf_4326, spacing_meters):
     }
 
 
+def _anchored_cells_inside(
+    poly,
+    x0: float,
+    y0: float,
+    step_m: float,
+    col_min: int,
+    col_max: int,
+    row_min: int,
+    row_max: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Cells of the anchored grid whose centre falls inside ``poly``.
+
+    Returns ``(rows, cols, xs, ys)`` for the surviving cells. Membership is
+    decided with ``shapely.contains_xy`` against a prepared polygon: it reads
+    raw coordinate arrays, so no Python-level ``Point`` is ever built for a
+    candidate — the previous ``MultiPoint`` + ``STRtree`` formulation
+    materialised one shapely object *and* one index entry per candidate cell,
+    which is where a metro-scale grid spent 250 s and 1.8 GB.
+
+    Candidates are produced one row-block at a time so peak memory tracks the
+    block size rather than the cluster's bbox.
+    """
+    shapely.prepare(poly)
+    cols_range = np.arange(col_min, col_max, dtype=np.int64)
+    xs_row = x0 + (cols_range + 0.5) * step_m
+    rows_per_block = max(1, _GRID_TEST_BLOCK_CELLS // max(1, cols_range.size))
+
+    rows_out: list[np.ndarray] = []
+    cols_out: list[np.ndarray] = []
+    xs_out: list[np.ndarray] = []
+    ys_out: list[np.ndarray] = []
+    for block_start in range(row_min, row_max, rows_per_block):
+        block_rows = np.arange(
+            block_start, min(block_start + rows_per_block, row_max), dtype=np.int64
+        )
+        ys_col = y0 - (block_rows + 0.5) * step_m
+        x_flat = np.broadcast_to(xs_row, (block_rows.size, xs_row.size)).ravel()
+        y_flat = np.repeat(ys_col, xs_row.size)
+        hit = shapely.contains_xy(poly, x_flat, y_flat)
+        if not hit.any():
+            continue
+        rows_out.append(np.repeat(block_rows, cols_range.size)[hit])
+        cols_out.append(np.tile(cols_range, block_rows.size)[hit])
+        xs_out.append(x_flat[hit])
+        ys_out.append(y_flat[hit])
+
+    empty_i = np.empty(0, dtype=np.int64)
+    empty_f = np.empty(0, dtype=np.float64)
+    if not rows_out:
+        return empty_i, empty_i, empty_f, empty_f
+    return (
+        np.concatenate(rows_out),
+        np.concatenate(cols_out),
+        np.concatenate(xs_out),
+        np.concatenate(ys_out),
+    )
+
+
 def generate_clustered_grid(
     gdf_4326: gpd.GeoDataFrame,
     buffer_m: float,
@@ -149,9 +216,7 @@ def generate_clustered_grid(
             gdf_4326, _log_core, role="Grid CRS"
         )
     gdf_m = gdf_4326.to_crs(grid_crs)
-    buffered = gdf_m.geometry.union_all()
-    if buffer_m > 0:
-        buffered = buffered.buffer(buffer_m)
+    buffered = buffer_union_planar(gdf_m.geometry.values, buffer_m)
 
     x0, y0 = float(anchor[0]), float(anchor[1])
     base_meta: dict = {
@@ -202,17 +267,9 @@ def generate_clustered_grid(
         if local_width == 0 or local_height == 0:
             continue
 
-        cols_range = np.arange(col_min, col_max)
-        rows_range = np.arange(row_min, row_max)
-        col_grid, row_grid = np.meshgrid(cols_range, rows_range)
-        col_flat = col_grid.ravel()
-        row_flat = row_grid.ravel()
-        x_flat = x0 + (col_flat + 0.5) * step_m
-        y_flat = y0 - (row_flat + 0.5) * step_m
-
-        candidate_pts = MultiPoint(list(zip(x_flat.tolist(), y_flat.tolist())))
-        tree = STRtree(list(candidate_pts.geoms))
-        inside = tree.query(poly, predicate="contains")
+        hit_rows, hit_cols, hit_x, hit_y = _anchored_cells_inside(
+            poly, x0, y0, step_m, col_min, col_max, row_min, row_max
+        )
 
         snapped_left = x0 + col_min * step_m
         snapped_top = y0 - row_min * step_m
@@ -236,14 +293,14 @@ def generate_clustered_grid(
             }
         )
 
-        if len(inside) == 0:
+        if hit_rows.size == 0:
             continue
 
-        all_rows.append(row_flat[inside])
-        all_cols.append(col_flat[inside])
-        all_x.append(x_flat[inside])
-        all_y.append(y_flat[inside])
-        all_cid.append(np.full(inside.size, cid, dtype=np.int64))
+        all_rows.append(hit_rows)
+        all_cols.append(hit_cols)
+        all_x.append(hit_x)
+        all_y.append(hit_y)
+        all_cid.append(np.full(hit_rows.size, cid, dtype=np.int64))
 
     base_meta["clusters"] = cluster_meta
 
@@ -261,14 +318,23 @@ def generate_clustered_grid(
     y_arr = np.concatenate(all_y)
     cid_arr = np.concatenate(all_cid).astype(np.int64)
 
-    pts_grid_crs = gpd.GeoDataFrame(
-        {"row": rows_arr, "col": cols_arr, "cluster_id": cid_arr},
-        geometry=gpd.points_from_xy(x_arr, y_arr),
-        crs=grid_crs,
+    # Transform the coordinate arrays, not a GeoDataFrame: building points in
+    # the grid CRS only to reproject them allocates a second geometry per sample,
+    # and a metro-scale grid holds millions.
+    to_wgs84 = Transformer.from_crs(grid_crs, WGS84_EPSG, always_xy=True)
+    lon_arr, lat_arr = to_wgs84.transform(x_arr, y_arr)
+
+    pts_4326 = gpd.GeoDataFrame(
+        {
+            "row": rows_arr,
+            "col": cols_arr,
+            "cluster_id": cid_arr,
+            "x": lon_arr,
+            "y": lat_arr,
+        },
+        geometry=gpd.points_from_xy(lon_arr, lat_arr),
+        crs=WGS84_EPSG,
     )
-    pts_4326 = pts_grid_crs.to_crs(WGS84_EPSG)
-    pts_4326["x"] = pts_4326.geometry.x.to_numpy()
-    pts_4326["y"] = pts_4326.geometry.y.to_numpy()
 
     return pts_4326, base_meta
 

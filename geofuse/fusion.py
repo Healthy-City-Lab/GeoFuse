@@ -17,7 +17,6 @@ from typing import Any
 
 import geopandas as gpd
 import numpy as np
-import optuna
 import pandas as pd
 import rasterio
 from rasterio.transform import from_origin, xy
@@ -26,6 +25,7 @@ from sklearn.model_selection import train_test_split
 
 from . import (
     JobCancelled,
+    bayesian_index,
     binary_longitudinal,
     cgi_formulas,
     exposure_response,
@@ -123,6 +123,12 @@ def _log_parallel_efficiency(
     log("INFO", "  " + " · ".join(parts) + ".")
 
 
+# Objective metrics whose held-out ranking is not the sweep's correlation
+# t, so the sweep re-scores its shortlist with them. Everything else is a
+# monotone function of the same association and needs no second pass.
+_SWEEP_OBJECTIVES: frozenset[str] = frozenset({"quartile_contrast"})
+
+
 class MetricFusionEngine:
     """
     Engine for fusing vegetation, terrain, and NDVI metrics using optimization.
@@ -167,6 +173,7 @@ class MetricFusionEngine:
         spatial_adjust_eps_m: float | None = None,
         residualize_method: str = "linear",
         search_scoring_method: str = "mom_em3",
+        negative_control_columns: list[str] | None = None,
     ):
         """
         Initialize the fusion engine.
@@ -208,6 +215,11 @@ class MetricFusionEngine:
                 (mirrors polygon mode) so the mixed-effects scorer sees a
                 clean within-entity panel. Defaults to ``None`` → engine
                 stays in cross-sectional mode.
+            negative_control_columns: Attribute columns on the (vector)
+                target holding negative-control outcomes. Carried onto the
+                frame for :meth:`compute_negative_controls` only — never
+                tuned on, never a reason to drop an entity. Cross-sectional
+                targets only.
         """
         # Route Optuna's chatter ("Trial X finished with value Y …") into
         # the per-job log instead of the Streamlit host terminal. Fusion
@@ -215,14 +227,13 @@ class MetricFusionEngine:
         # those records would otherwise propagate to root from this process.
         import logging as _logging
 
-        attach_external_logger("optuna", _logging.INFO)
         attach_external_logger("ee", _logging.INFO)
-        # This module's own stdlib ``logger`` (``geofuse.fusion``) carries
-        # engine diagnostics — bounds checks, metric load notes, cache messages.
-        # Attaching it routes those into the per-job log (and stops them
-        # propagating to the host terminal) alongside the engine's ``_log``
-        # output, instead of leaking to the backend console.
+        # The stdlib loggers of this module and of ``bayesian_index`` carry
+        # engine diagnostics — bounds checks, metric load notes, cache and
+        # rank warnings. Attaching them routes those into the per-job log
+        # alongside the engine's ``_log`` output, not the host terminal.
         attach_external_logger("geofuse.fusion", _logging.INFO)
+        attach_external_logger("geofuse.bayesian_index", _logging.INFO)
 
         self.target_file = target_file
         self.target_feature = target_feature
@@ -280,7 +291,7 @@ class MetricFusionEngine:
         # ``ndvi`` run a standalone single-metric search that uses that
         # channel's normalised value directly as the greenery value and
         # searches only its radius + aggregation. Set per call by the runner
-        # before each stability search; ``evaluate_on_test`` reads it so the
+        # before each discovery; ``evaluate_on_test`` reads it so the
         # held-out test score stays aligned with what the search scored.
         self._active_greenery_channel: str = "cgi"
 
@@ -351,6 +362,13 @@ class MetricFusionEngine:
         # behaviour). Reports always use the exact MixedLM refit regardless.
         self.search_scoring_method: str = str(search_scoring_method)
 
+        # Negative-control outcomes: attribute columns carried onto the frame
+        # for the transfer test only. They never enter tuning, and a missing
+        # value never drops an entity from it.
+        self.negative_control_columns: list[str] = list(
+            dict.fromkeys(c for c in (negative_control_columns or []) if c)
+        )
+
         # Longitudinal / mixed-effects spec. ``None`` keeps the engine in
         # cross-sectional mode (no behaviour change). When set, every code
         # path that today threads a single per-entity row through Optuna
@@ -374,9 +392,10 @@ class MetricFusionEngine:
         self.whole_grid_scaling: bool = bool(whole_grid_scaling)
         # When True, each channel is min-max scaled to [0, 1] (per-channel
         # bounds fixed at prepare time from the predictor distribution only —
-        # no outcome leakage) before the composite is formed, so weights are
-        # interpretable and the synergy powers see their assumed [0, 1] domain.
-        # Default False keeps legacy raw-channel composites bit-for-bit.
+        # no outcome leakage) before the composite is formed. Default False
+        # keeps raw-channel composites. A discovered composite then centres and
+        # scales each channel with the recorded center and scale, carried onto
+        # whichever scale the channels arrive in.
         self.normalize_channels: bool = bool(normalize_channels)
         # Per-channel (lo, hi) min-max bounds, filled by prepare_fusion_data.
         self._channel_minmax: dict[str, tuple[float, float]] | None = None
@@ -407,8 +426,11 @@ class MetricFusionEngine:
         self.veg_data = None  # Vegetation component (GVI vegetation)
         self.terrain_data = None  # Terrain component (GVI terrain)
         self.ndvi_data = None  # NDVI satellite data
-        self.train_val_data = None  # Train+val pool the bootstrap resamples
+        self.train_val_data = None  # Train+val pool the sweep splits
         self.test_data = None  # Held-out test set
+        # Distinct configurations scored on the test slice. A held-out set is
+        # a budget, not a metric you can query freely.
+        self._test_reads = 0
         self.cv_folds = None  # In-bag/OOB fold spliced in per bootstrap resample
         self.study = None  # Per-resample Optuna study (set inside the bootstrap)
         self.best_params = None
@@ -450,7 +472,7 @@ class MetricFusionEngine:
         # on it so an entry can never be served for a different row set.
         self._split_generation: int = 0
 
-        # Trial threads for the stability search. Only the longitudinal
+        # Trial threads for the search. Only the longitudinal
         # fast-GLS path uses them: the other paths keep LRU scoring caches that
         # are not thread-safe (see ``_search_n_jobs``).
         self._search_workers: int = parallel.worker_count()
@@ -1812,6 +1834,16 @@ class MetricFusionEngine:
             if looked_up is not None:
                 return looked_up
 
+        # A channel with no source layer is served only from the cache, so a
+        # miss cannot be recovered by aggregating — there is nothing to
+        # aggregate. Falling through would silently reduce the wrong metric.
+        if metric_data is None:
+            raise RuntimeError(
+                f"Channel {channel!r} is stored in the pre-aggregation cache "
+                f"and has no source layer, but radius {radius_m} with "
+                f"stat={stat!r} percentile={percentile!r} is not in the cache."
+            )
+
         # Fell through the fast path (or pre-aggregation off): the ring-cache and
         # circular-buffer routines need geometry, so re-materialize it if a
         # geometry-free slice was passed in (see the fast path in ``_objective``).
@@ -2022,6 +2054,22 @@ class MetricFusionEngine:
         if self._preaggr_entity_gdf is not None:
             _helpers.downcast_fusion_dtypes(self._preaggr_entity_gdf)
 
+    @staticmethod
+    def _channel_column(fusion_df: pd.DataFrame, channel: str):
+        """A channel's per-pixel values out of the prepared frame, or ``None``.
+
+        The frame carries the source layers. ``gvi`` is not one of them — it is
+        the per-pixel sum of the two street-view components, which is what the
+        cache stores under that name.
+        """
+        if channel in fusion_df.columns:
+            return fusion_df[channel]
+        if channel == "gvi" and {"veg", "terrain"} <= set(fusion_df.columns):
+            return pd.to_numeric(fusion_df["veg"], errors="coerce") + pd.to_numeric(
+                fusion_df["terrain"], errors="coerce"
+            )
+        return None
+
     def _compute_channel_scale(self, fusion_df: pd.DataFrame) -> None:
         """Fix per-channel [0, 1] min-max bounds from the predictor distribution.
 
@@ -2034,11 +2082,16 @@ class MetricFusionEngine:
             self._channel_minmax = None
             return
         bounds: dict[str, tuple[float, float]] = {}
-        for ch in ("veg", "terrain", "ndvi"):
-            if ch not in fusion_df.columns:
+        # Every channel the cache can hold, so a two-channel study's ``gvi``
+        # gets real bounds instead of the (0, 1) fallback, which would clip it.
+        # The prepared frame carries the source layers only; ``gvi`` is their
+        # per-pixel sum, which is the distribution its bounds describe.
+        for ch in preaggregation.GreeneryCache.ALL_CHANNELS:
+            column = self._channel_column(fusion_df, ch)
+            if column is None:
                 bounds[ch] = (0.0, 1.0)
                 continue
-            vals = pd.to_numeric(fusion_df[ch], errors="coerce").to_numpy(np.float64)
+            vals = pd.to_numeric(column, errors="coerce").to_numpy(np.float64)
             vals = vals[np.isfinite(vals)]
             if vals.size == 0:
                 bounds[ch] = (0.0, 1.0)
@@ -2051,12 +2104,12 @@ class MetricFusionEngine:
         self._channel_minmax = bounds
         _log("INFO", f"Channel normalization bounds (2–98 pct): {bounds}")
 
-    def _normalize_channel_arrays(
-        self, veg: np.ndarray, terrain: np.ndarray, ndvi: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _normalize_channels(
+        self, blocks: dict[str, np.ndarray]
+    ) -> dict[str, np.ndarray]:
         """Min-max scale each channel to [0, 1] using the fixed bounds, or pass through."""
         if not self.normalize_channels or not self._channel_minmax:
-            return veg, terrain, ndvi
+            return blocks
 
         def _scale(a: np.ndarray, ch: str) -> np.ndarray:
             lo, hi = self._channel_minmax.get(ch, (0.0, 1.0))
@@ -2070,7 +2123,115 @@ class MetricFusionEngine:
             dt = arr.dtype.type
             return np.clip((arr - dt(lo)) / dt(hi - lo), dt(0.0), dt(1.0))
 
-        return _scale(veg, "veg"), _scale(terrain, "terrain"), _scale(ndvi, "ndvi")
+        return {ch: _scale(a, ch) for ch, a in blocks.items()}
+
+    # ────────────────────────────────────────────────────────────
+    # ── Channel vocabulary ──────────────────────────────────────
+    # A job's channels are whatever its formula consumes: ``(ndvi, gvi)`` for a
+    # two-channel study, ``(ndvi, veg, terrain)`` for a three-channel one. The
+    # composite path reads that set rather than assuming the three-channel
+    # names, so both configurations reach the scoring, apply and map stages.
+
+    def _composite_channels(self) -> tuple[str, ...]:
+        """Channels this job's composite is built from, in formula order."""
+        mode = self._active_greenery_channel
+        if mode != "cgi":
+            return (mode,)
+        return tuple(cgi_formulas.formula_channels(self.cgi_formula))
+
+    def _channel_active(self, params: dict) -> dict[str, bool]:
+        """Which of this job's channels contribute at ``params``."""
+        mode = self._active_greenery_channel
+        if mode != "cgi":
+            return {mode: True}
+        return cgi_formulas.get_formula(self.cgi_formula).channel_active(params)
+
+    def _channel_spec(self, params: dict, channel: str) -> tuple[float, str, int]:
+        """``(radius, stat, percentile)`` for one channel out of a params dict.
+
+        NDVI carries its own statistic; every street-view channel — ``veg``,
+        ``terrain`` and the combined ``gvi`` — shares one, which is how the
+        search records it.
+        """
+        if channel == "ndvi":
+            return (
+                params.get("ndvi_radius", int(round(self.ndvi_buffer_max_m))),
+                params.get("ndvi_stat", "mean"),
+                params.get("ndvi_percentile", 50),
+            )
+        return (
+            params.get(f"{channel}_radius", int(round(self.gvi_buffer_max_m))),
+            params.get("streetview_stat", "mean"),
+            params.get("streetview_percentile", 50),
+        )
+
+    def _channel_radii(self, params: dict) -> dict[str, float]:
+        """``{channel: radius}`` over this job's channels, for the entity collapse."""
+        return {
+            ch: float(self._channel_spec(params, ch)[0])
+            for ch in self._composite_channels()
+        }
+
+    def _channel_source(self, channel: str):
+        """The metric layer a channel aggregates from, or ``None`` if it has none.
+
+        ``gvi`` is a stored cache channel rather than a layer: its percentiles
+        are not recoverable from the components, so it is written during
+        pre-aggregation and only ever read back.
+        """
+        return {
+            "veg": self.veg_data,
+            "terrain": self.terrain_data,
+            "ndvi": self.ndvi_data,
+        }.get(channel)
+
+    def _aggregate_channels(
+        self,
+        points_gdf,
+        params: dict,
+        *,
+        subset: str,
+        fold_idx: int = -1,
+        channels: tuple[str, ...] | None = None,
+    ) -> dict[str, np.ndarray]:
+        """``{channel: aggregated values}`` at ``params`` for the rows given.
+
+        A channel the formula gives no weight to is returned as zeros rather
+        than aggregated, which is what makes a sparse weight vector cheap.
+        """
+        chans = self._composite_channels() if channels is None else channels
+        active = self._channel_active(params)
+        out: dict[str, np.ndarray] = {}
+        for ch in chans:
+            if not active.get(ch, False):
+                out[ch] = np.zeros(len(points_gdf), dtype=np.float32)
+                continue
+            radius, stat, pct = self._channel_spec(params, ch)
+            out[ch] = self._aggregate_with_ring_cache(
+                points_gdf,
+                self._channel_source(ch),
+                radius,
+                stat,
+                pct,
+                channel=ch,
+                fold_idx=fold_idx,
+                subset=subset,
+            )
+        return out
+
+    def _composite_from(
+        self, params: dict, blocks: dict[str, np.ndarray]
+    ) -> np.ndarray:
+        """Build the composite from normalized channel blocks via the active mode.
+
+        CGI mode delegates to the formula; standalone mode takes its single
+        channel directly, so the reported score is on the scale the search
+        optimized against.
+        """
+        mode = self._active_greenery_channel
+        if mode == "cgi":
+            return compute_cgi(self.cgi_formula, params, blocks)
+        return blocks[mode]
 
     # ────────────────────────────────────────────────────────────
     # ── Pre-aggregation grid ────────────────────────────────────
@@ -2370,12 +2531,20 @@ class MetricFusionEngine:
             global_pids = np.asarray(preaggr_gdf.index, dtype=np.int64)
         pid_to_pos = {int(p): i for i, p in enumerate(global_pids)}
 
-        eff_gvi, eff_ndvi, missing = cache.open_unit(
+        eff_gvi, eff_ndvi, missing, absent_ch = cache.open_unit(
             cfg_key,
             gvi_radii=gvi_radii,
             ndvi_radii=ndvi_radii,
             required_ids=global_pids,
+            channels=self._cache_channels(),
         )
+        if absent_ch:
+            # A channel the stored unit never held has to be built for every id
+            # it already covers, so the whole unit is recomputed once.
+            _log(
+                "INFO", f"Cache extension: computing {list(absent_ch)} for all pixels."
+            )
+            missing = global_pids
         _log(
             "INFO",
             f"Pre-aggregation: {n_points:,} pixels · GVI radii {gvi_radii} m · "
@@ -2424,7 +2593,7 @@ class MetricFusionEngine:
                 _log("WARN", "Pre-aggregation cancelled (resumable).")
                 self._preaggregation_done = False
                 return False
-            cache.commit_unit(cfg_key, missing, *result)
+            cache.commit_unit(cfg_key, missing, self._blocks(result))
             if progress_callback is not None:
                 progress_callback(len(missing), total)
             build_secs = time.perf_counter() - build_t0
@@ -2548,9 +2717,10 @@ class MetricFusionEngine:
         nstats = len(preaggregation.STAT_COLUMNS)
         veg_out = np.full((n, len(gvi_radii), nstats), np.nan, dtype=np.float32)
         ter_out = np.full((n, len(gvi_radii), nstats), np.nan, dtype=np.float32)
+        gvi_out = np.full((n, len(gvi_radii), nstats), np.nan, dtype=np.float32)
         ndvi_out = np.full((n, len(ndvi_radii), nstats), np.nan, dtype=np.float32)
         if n == 0:
-            return veg_out, ter_out, ndvi_out
+            return veg_out, ter_out, ndvi_out, gvi_out
 
         preps = {
             "veg": self._prep_channel_source(veg_src, "veg", utm_crs, all_points),
@@ -2576,10 +2746,13 @@ class MetricFusionEngine:
 
         def _store(res) -> None:
             nonlocal done_entities
-            lo, hi, veg_b, ter_b, ndvi_b, vsec, rsec = res
+            lo, hi, veg_b, ter_b, ndvi_b, gvi_b, vsec, rsec = res
             veg_out[lo:hi] = veg_b
             ter_out[lo:hi] = ter_b
             ndvi_out[lo:hi] = ndvi_b
+            # ``None`` when the components came from separate source layers,
+            # where an exact merged channel cannot be formed.
+            gvi_out[lo:hi] = (veg_b + ter_b) if gvi_b is None else gvi_b
             stage_secs["vector_agg"] += vsec
             stage_secs["raster_agg"] += rsec
             done_entities += hi - lo
@@ -2621,7 +2794,7 @@ class MetricFusionEngine:
             )
         if not finished:
             return None
-        return veg_out, ter_out, ndvi_out
+        return veg_out, ter_out, ndvi_out, gvi_out
 
     def _aggregate_in_threads(
         self,
@@ -2654,10 +2827,10 @@ class MetricFusionEngine:
             bpos = positions[lo:hi]
             xy = point_xy_utm[bpos] if len(point_xy_utm) else None
             geoms = [entity_geoms_utm[i] for i in bpos]
-            veg_b, ter_b, ndvi_b, vsec, rsec = preaggregation.aggregate_entity_batch(
-                state, point_xy=xy, geoms=geoms
+            veg_b, ter_b, ndvi_b, gvi_b, vsec, rsec = (
+                preaggregation.aggregate_entity_batch(state, point_xy=xy, geoms=geoms)
             )
-            return lo, hi, veg_b, ter_b, ndvi_b, vsec, rsec
+            return lo, hi, veg_b, ter_b, ndvi_b, gvi_b, vsec, rsec
 
         if workers <= 1:
             for lo, hi in batches:
@@ -2880,9 +3053,19 @@ class MetricFusionEngine:
             required = (
                 np.unique(np.concatenate(parts)) if parts else np.empty(0, np.int64)
             )
-            eff_gvi, eff_ndvi, missing = cache.open_unit(
-                cfg, gvi_radii=gvi_radii, ndvi_radii=ndvi_radii, required_ids=required
+            eff_gvi, eff_ndvi, missing, absent_ch = cache.open_unit(
+                cfg,
+                gvi_radii=gvi_radii,
+                ndvi_radii=ndvi_radii,
+                required_ids=required,
+                channels=self._cache_channels(),
             )
+            if absent_ch:
+                _log(
+                    "INFO",
+                    f"Cache extension for {cfg}: computing {list(absent_ch)}.",
+                )
+                missing = required
             u["eff_gvi"] = eff_gvi
             u["eff_ndvi"] = eff_ndvi
             u["missing"] = missing
@@ -2949,12 +3132,12 @@ class MetricFusionEngine:
             if result is None:
                 cancelled = True
                 break
-            veg_arr, ter_arr, ndvi_arr = result
-            cache.commit_unit(cfg, missing, veg_arr, ter_arr, ndvi_arr)
+            cache.commit_unit(cfg, missing, self._blocks(result))
+            veg_arr, ter_arr, ndvi_arr, gvi_arr = result
             processed += len(missing)
             if progress_callback is not None:
                 progress_callback(min(processed, total_missing), max(total_missing, 1))
-            del veg_arr, ter_arr, ndvi_arr, result
+            del veg_arr, ter_arr, ndvi_arr, gvi_arr, result
             provider.release()
             gc.collect()
 
@@ -3058,6 +3241,578 @@ class MetricFusionEngine:
         # ``None`` here means an off-grid (channel, wave, radius, column) cell —
         # the caller falls back to the ring/buffer aggregation path.
         return source.gather(plan, channel, int(round(radius_m)), column)
+
+    def fit_bayesian_index(
+        self,
+        metric: str,
+        *,
+        forms: tuple[str, ...] = bayesian_index.FORMS,
+        sweep_splits: int = 40,
+        reps: int = 5,
+        shuffles: int = 12,
+        gain_splits: int = 20,
+        gain_perm: int = 100,
+        null_runs: int = 16,
+        null_reselect_form: bool = False,
+        draws: int = 800,
+        warmup: int = 800,
+        chains: int = 4,
+        radius_kernel: str = "lognormal",
+        aggregator: str = "dirichlet",
+        seed: int = 42,
+        cancel_callback: Callable[..., bool] | None = None,
+        progress_callback: Callable[[int, int], None] | None = None,
+        outcome: str | None = None,
+    ) -> dict:
+        """Select the CGI configuration from data, then quantify it.
+
+        Stage one sweeps ``(radius, statistic)``
+        per channel and the functional form, scoring every candidate on held-out
+        rows of the train+val pool. Stage two fits a posterior over the channel
+        weights at the winning columns. Neither stage touches the test split, so
+        the headline effect stays out of sample.
+
+        Returns a params dict the composite/apply path consumes, plus ``__``-
+        prefixed diagnostics for the results bundle.
+
+        ``null_runs`` below ``bayesian_index.NULL_RUNS_FOR_CLAIM`` is a quick
+        check; use ``bayesian_index.NULL_RUNS_PUBLICATION`` for a final run.
+        ``null_reselect_form`` re-chooses the form on every permuted outcome,
+        so the null rate covers the form choice too. ``outcome`` names a
+        negative-control column to tune on instead of the target, which is
+        what :meth:`retune_concordance` uses; entities missing it are dropped.
+        """
+        t0 = time.perf_counter()
+        steps, done = 5, 0
+
+        def tick():
+            nonlocal done
+            done += 1
+            if progress_callback is not None:
+                try:
+                    progress_callback(done, steps)
+                except Exception:
+                    pass
+
+        def cancelled() -> bool:
+            return cancel_callback is not None and cancel_callback()
+
+        X, radii, stats, tensor_channels, static = self.build_index_tensor("train_val")
+        if outcome is None:
+            y = np.asarray(static["target"], dtype=np.float64)
+        elif outcome in (static.get("controls") or {}):
+            y = np.asarray(static["controls"][outcome], dtype=np.float64)
+        else:
+            raise ValueError(f"{outcome!r} is not a negative-control column.")
+
+        index_channels, channel_index, radius_idx = self._index_layout(
+            tensor_channels, radii
+        )
+
+        # The channels in play are settled before residualising, so a coverage
+        # gap in a channel this study never reads cannot drop rows from it.
+        yr, Xr, prep_info = bayesian_index.prep(
+            X,
+            y,
+            static.get("cov"),
+            channel_index=channel_index,
+            return_info=True,
+        )
+        dropped = int(len(X) - len(Xr))
+        if dropped:
+            _log(
+                "WARN",
+                f"{dropped} of {len(X)} entities have no greenery coverage at "
+                f"some searched radius and were dropped from the index search "
+                f"({100.0 * dropped / max(len(X), 1):.1f}%). Every candidate is "
+                f"scored on the remaining {len(Xr)}.",
+            )
+        tick()
+
+        workers = parallel.process_worker_count()
+        # Every stage below takes minutes and runs a process pool, so the flag
+        # travels into them rather than being read only between them.
+        res = bayesian_index.sweep(
+            Xr,
+            radii,
+            stats,
+            yr,
+            channels=index_channels,
+            channel_index=channel_index,
+            radius_idx=radius_idx,
+            forms=forms,
+            splits=sweep_splits,
+            seed=seed,
+            workers=workers,
+            objective=self._sweep_objective(metric),
+            cancel_check=cancelled,
+        )
+        tick()
+        _log(
+            "INFO",
+            f"Sweep: {res.picked} form={res.form} held-out |t|={res.score:.3f}"
+            + (f"  BOUNDARY at {list(res.boundary_hit)}" if res.boundary_hit else ""),
+        )
+
+        disc = (
+            bayesian_index.repeated_discovery(
+                Xr,
+                radii,
+                stats,
+                yr,
+                channels=index_channels,
+                channel_index=channel_index,
+                radius_idx=radius_idx,
+                forms=forms,
+                reps=reps,
+                shuffles=shuffles,
+                seed=seed,
+                workers=workers,
+                cancel_check=cancelled,
+            )
+            if reps and shuffles
+            else {}
+        )
+        tick()
+
+        gain = (
+            bayesian_index.holdout_gain(
+                Xr,
+                yr,
+                channels=index_channels,
+                channel_index=channel_index,
+                radius_idx=radius_idx,
+                forms=forms,
+                splits=gain_splits,
+                perm=gain_perm,
+                seed=seed,
+                workers=workers,
+                cancel_check=cancelled,
+            )
+            if gain_splits and len(index_channels) > 1
+            else {}
+        )
+        tick()
+
+        # The posterior gets the whole grid, not the sweep's pick: the radius
+        # profile and the aggregator blend are sampled with the weights, so the
+        # interval on the effect carries their uncertainty instead of being
+        # conditioned on a choice made before the sampler ran. The sweep's pick
+        # stays in the bundle as a diagnostic and as the shortlist that decided
+        # the functional form.
+        if cancelled():
+            raise JobCancelled("Index posterior cancelled by user.")
+        post, grid, grid_kwargs = bayesian_index.grid_posterior(
+            Xr,
+            yr,
+            channels=index_channels,
+            channel_index=channel_index,
+            radii=radii,
+            stats=stats,
+            radius_idx=radius_idx,
+            form=res.form,
+            picked=res.picked,
+            radius_kernel=radius_kernel,
+            aggregator=aggregator,
+            draws=draws,
+            warmup=warmup,
+            chains=chains,
+            seed=seed,
+            column_sd=prep_info["column_sd"],
+        )
+        null = (
+            bayesian_index.null_calibration(
+                grid,
+                yr,
+                form=res.form,
+                n=null_runs,
+                workers=workers,
+                cancel_check=cancelled,
+                reselect_form=null_reselect_form,
+                form_E=Xr.reshape(len(Xr), -1)[:, list(res.columns)],
+                forms=forms,
+                **grid_kwargs,
+            )
+            if null_runs
+            else {}
+        )
+        tick()
+
+        # The form is a swept axis, so the formula the composite is built from
+        # is only known once the sweep has run. Everything downstream reads
+        # ``self.cgi_formula``, including the params dict built next.
+        if self._active_greenery_channel == "cgi":
+            self.cgi_formula = cgi_formulas.formula_for(
+                tuple(cgi_formulas.formula_channels(self.cgi_formula)), res.form
+            )
+
+        params = self._params_from_sweep(res, post, index_channels)
+        # The composite path rebuilds the index from raw channel values, so it
+        # needs the center and scale the model's weights and form refer to.
+        if self._active_greenery_channel == "cgi":
+            params.update(
+                self._channel_scaling(
+                    X,
+                    radii,
+                    stats,
+                    tensor_channels,
+                    index_channels,
+                    post.picked,
+                    prep_info["column_sd"],
+                )
+            )
+        params["__selection_method__"] = "bayesian_index"
+        params["__sweep__"] = {
+            "picked": [list(p) for p in res.picked],
+            "form": res.form,
+            "score": res.score,
+            "selection_score": res.selection_score,
+            "form_scores": res.form_scores,
+            "one_se_picked": [
+                list(p)
+                for p in bayesian_index._decode(
+                    res.one_se_columns, len(radii), len(stats), radii, stats
+                )
+            ],
+            "boundary_hit": list(res.boundary_hit),
+            "n_candidates": len(res.combos),
+            "distinct_split_winners": len(res.winner_counts),
+            "splits": sweep_splits,
+        }
+        params["__posterior__"] = post.summary()
+        params["__discovery__"] = disc
+        params["__holdout_gain__"] = gain
+        params["__null_calibration__"] = null
+        params["__elapsed_s__"] = float(time.perf_counter() - t0)
+        _log(
+            "OK",
+            f"Bayesian index fitted in {params['__elapsed_s__']:.0f}s "
+            f"(R-hat {post.rhat_max:.3f}, ESS {post.ess_min:.0f}, "
+            f"{post.divergences} divergences). Posterior grid: {post.picked}.",
+        )
+        return params
+
+    def _index_layout(self, tensor_channels, radii):
+        """The study's index channels, their tensor positions and their ladders.
+
+        A channel is only offered the radii its own ladder was computed at, so
+        NDVI and the street-view family can search different rungs.
+        """
+        index_channels = list(cgi_formulas.formula_channels(self.cgi_formula))
+        if self._active_greenery_channel != "cgi":
+            index_channels = [self._active_greenery_channel]
+        channel_index = [list(tensor_channels).index(c) for c in index_channels]
+        gvi_radii, ndvi_radii = self._preaggr_radii()
+        radius_idx = [
+            [
+                i
+                for i, r in enumerate(radii)
+                if int(r) in (ndvi_radii if c == "ndvi" else gvi_radii)
+            ]
+            for c in index_channels
+        ]
+        return index_channels, channel_index, radius_idx
+
+    def plasmode_recovery(self, *, out_dir: str | None = None, **kwargs) -> dict:
+        """Plasmode recovery on this study's own exposure tensor and covariates.
+
+        Builds the train+val tensor exactly as :meth:`fit_bayesian_index` does,
+        keeps the entities with complete coverage, and hands it to
+        :func:`geofuse.validation.plasmode_recovery` with the study's channels
+        and ladders; ``kwargs`` pass through (``reps``, ``partial_r2``,
+        ``scenarios``, ``pipeline_kwargs``, ``seed``, ...). With ``out_dir`` the
+        tidy table and the JSON bundle are written there too.
+        """
+        from . import validation
+
+        X, radii, stats, tensor_channels, static = self.build_index_tensor("train_val")
+        channels, channel_index, radius_idx = self._index_layout(tensor_channels, radii)
+        cov = static.get("cov")
+        scan = X[:, channel_index].reshape(len(X), -1)
+        measured = ~np.isnan(scan).all(0)
+        keep = np.isfinite(scan[:, measured]).all(1)
+        if cov is not None and np.size(cov):
+            keep &= np.isfinite(np.asarray(cov, dtype=np.float64)).all(1)
+        result = validation.plasmode_recovery(
+            X[keep],
+            None if cov is None or not np.size(cov) else np.asarray(cov)[keep],
+            channels=channels,
+            radii=radii,
+            stats=stats,
+            channel_index=channel_index,
+            radius_idx=radius_idx,
+            **kwargs,
+        )
+        if out_dir:
+            validation.write_plasmode_report(result, out_dir)
+        return result
+
+    def _sweep_objective(self, metric: str):
+        """Held-out scorer the sweep ranks candidates by, or ``None``.
+
+        ``None`` means the sweep's own correlation t, which is what makes the
+        exhaustive grid affordable and is the right ranking for the correlation
+        family. A metric that asks a different question of the same data gets
+        its own scorer, so the setting decides the winner rather than only the
+        number reported afterwards.
+
+        The sweep works on Frisch-Waugh residualised columns, so covariates are
+        already partialled out and the scorer is called without them.
+        """
+        from . import objective_scoring as _scoring
+
+        if metric not in _SWEEP_OBJECTIVES:
+            return None
+
+        def objective(exposure, target):
+            try:
+                return float(_scoring.score(metric, target, exposure, None))
+            except Exception:
+                return 0.0
+
+        return objective
+
+    def _channel_scaling(
+        self, X, radii, stats, tensor_channels, index_channels, picked, column_sd
+    ) -> dict:
+        """``<channel>_center`` / ``<channel>_scale`` for the composite path.
+
+        :func:`bayesian_index.composite_scaling` gives the mean and the
+        covariate-adjusted SD of each channel at the cell the composite is built
+        from — the scale the model fitted on. With ``normalize_channels`` on,
+        the channels reach the formula min-max scaled, so the center and scale
+        are carried onto that scale.
+        """
+        out = bayesian_index.composite_scaling(
+            X,
+            column_sd,
+            channels=index_channels,
+            channel_index=[list(tensor_channels).index(c) for c in index_channels],
+            radii=radii,
+            stats=stats,
+            picked=picked,
+        )
+        if getattr(self, "normalize_channels", False) and self._channel_minmax:
+            for ch in index_channels:
+                lo, hi = self._channel_minmax.get(ch, (0.0, 1.0))
+                if f"{ch}_center" in out and hi > lo:
+                    out[f"{ch}_center"] = (out[f"{ch}_center"] - lo) / (hi - lo)
+                    out[f"{ch}_scale"] = out[f"{ch}_scale"] / (hi - lo)
+        return out
+
+    def _params_from_sweep(self, res, post, index_channels) -> dict:
+        """Posterior -> the params dict the composite/apply path consumes.
+
+        That path carries one radius and one statistic per channel, so the
+        posterior's blend over the grid is projected onto its modal cell here.
+        The projection is what the composite is built from; the blend and its
+        credible intervals stay in the results bundle, and the effect that gets
+        reported is the one the blend produced, not a refit at the modal cell.
+        """
+        formula = cgi_formulas.get_formula(self.cgi_formula)
+        params: dict[str, Any] = {}
+
+        stat_of = {"mean": ("mean", 50)}
+        for (radius, column), ch in zip(post.picked, index_channels):
+            stat, pct = stat_of.get(column, ("percentile", 0))
+            if column != "mean":
+                pct = int(column[1:])
+            if ch == "ndvi":
+                params["ndvi_radius"] = int(radius)
+                params["ndvi_stat"] = stat
+                params["ndvi_percentile"] = int(pct)
+            else:
+                params[f"{ch}_radius"] = int(radius)
+                # veg and terrain share one street-view statistic in the engine.
+                params["streetview_stat"] = stat
+                params["streetview_percentile"] = int(pct)
+        # Defaults only for the channels this formula consumes, so no key reads
+        # as a fitted radius for a channel the run never fitted. The apply path
+        # defaults any channel it needs that is absent.
+        formula_channels = set(cgi_formulas.formula_channels(self.cgi_formula))
+        formula_channels.update(index_channels)
+        for ch in formula_channels:
+            default = self.ndvi_buffer_max_m if ch == "ndvi" else self.gvi_buffer_max_m
+            params.setdefault(f"{ch}_radius", int(round(float(default))))
+        if formula_channels - {"ndvi"}:
+            params.setdefault("streetview_stat", "mean")
+            params.setdefault("streetview_percentile", 50)
+        if "ndvi" in formula_channels:
+            params.setdefault("ndvi_stat", "mean")
+            params.setdefault("ndvi_percentile", 50)
+
+        # Posterior-mean weights onto the formula's keys as integers summing to
+        # 100, which is the scale every downstream consumer expects.
+        w = np.asarray(post.weights).mean(0)
+        keys = list(formula.weight_keys)
+        main_key = cgi_formulas._CHANNEL_MAIN_KEY[self.cgi_formula]
+        vals = np.zeros(len(keys))
+        for i, ch in enumerate(index_channels):
+            key = main_key.get(ch)
+            if key in keys and i < len(w):
+                vals[keys.index(key)] = float(w[i])
+
+        # The synergy posterior also carries one weight per channel pair.
+        # Dropping them would build the composite from a different model than
+        # the one the reported effect came from. Interaction keys abbreviate
+        # their channels (``w_ter_veg``), so they are matched on token set
+        # rather than on a reconstructed name.
+        n_main = len(index_channels)
+        if len(w) > n_main:
+            token = {ch: main_key[ch].removeprefix("w_") for ch in index_channels}
+            by_tokens = {
+                frozenset(k.removeprefix("w_").split("_")): k
+                for k in getattr(formula, "interaction_weight_keys", ())
+            }
+            for k, (i, j) in enumerate(bayesian_index._pairs(n_main)):
+                key = by_tokens.get(
+                    frozenset((token[index_channels[i]], token[index_channels[j]]))
+                )
+                if key in keys and n_main + k < len(w):
+                    vals[keys.index(key)] = float(w[n_main + k])
+        total = vals.sum()
+        if total <= 0:
+            vals[:] = 1.0 / len(vals)
+            total = 1.0
+        scaled = vals * 100.0 / total
+        floors = [int(v) for v in scaled]
+        for i in sorted(
+            range(len(scaled)), key=lambda i: scaled[i] - floors[i], reverse=True
+        )[: 100 - sum(floors)]:
+            floors[i] += 1
+        for key, v in zip(keys, floors):
+            params[key] = int(v)
+        if post.powers is not None:
+            for ch, p in zip(index_channels, np.asarray(post.powers).mean(0)):
+                params[f"{ch}_power"] = float(p)
+        return params
+
+    def build_index_tensor(self, subset: str = "train_val"):
+        """Per-entity values for every (channel, radius, statistic) cell.
+
+        The sweep scores candidates out of this one tensor, so the cache is read
+        once per run instead of once per candidate. Shape is
+        ``(n_entities, n_channels, n_radii, n_stats)`` with channels in
+        :meth:`_cache_channels` order.
+
+        The entity collapse depends on the catchment radius for point and line
+        targets, so the mask is rebuilt per radius; polygon targets average
+        every in-footprint pixel and the mask is constant.
+        """
+        if subset == "test":
+            data = self.test_data
+        elif subset == "train_val":
+            data = self.train_val_data
+        else:
+            raise ValueError(f"subset must be 'train_val' or 'test'; got {subset!r}")
+        if data is None or len(data) == 0:
+            raise ValueError(f"No {subset} rows; call split_data() first.")
+
+        channels = self._cache_channels()
+        gvi_radii, ndvi_radii = self._preaggr_radii()
+        # One ladder for the tensor: NDVI and the street-view family can be
+        # configured separately, so the union is stored and each channel's
+        # off-ladder cells stay NaN and are never selected.
+        radii = tuple(sorted(set(gvi_radii) | set(ndvi_radii)))
+        stats = tuple(preaggregation.STAT_COLUMNS)
+
+        static = self._fold_entity_statics(data, f"tensor::{subset}", subset)
+        n_ent = static["n_uniq"] if static["has_pid"] else len(static["points"])
+        X = np.full((n_ent, len(channels), len(radii), len(stats)), np.nan)
+
+        for ri, radius in enumerate(radii):
+            mask = None
+            if static["has_pid"]:
+                mask = _helpers.entity_collapse_mask(data, float(radius))
+            for ci, ch in enumerate(channels):
+                ladder = ndvi_radii if ch == "ndvi" else gvi_radii
+                if radius not in ladder:
+                    continue
+                for si, column in enumerate(stats):
+                    stat, pct = (
+                        ("mean", None)
+                        if column == "mean"
+                        else ("percentile", int(column[1:]))
+                    )
+                    vals, on_uniq = self._channel_values_for_static(
+                        static, ch, radius, stat, pct, subset
+                    )
+                    if vals is None:
+                        continue
+                    v = np.asarray(vals, dtype=np.float64)
+                    if on_uniq and static.get("uniq_inverse") is not None:
+                        v = v[static["uniq_inverse"]]
+                    X[:, ci, ri, si] = (
+                        self._collapse_mean_from_codes(
+                            v, static["codes"], static["n_uniq"], mask
+                        )
+                        if static["has_pid"]
+                        else v
+                    )
+        return X, np.asarray(radii, dtype=float), list(stats), list(channels), static
+
+    def _channel_values_for_static(self, static, channel, radius, stat, pct, subset):
+        """One (channel, radius, stat) column for a prepared fold, cache first.
+
+        ``gvi`` has no source layer of its own — it is a stored cache channel —
+        so a cache miss for it is fatal rather than falling back to on-the-fly
+        aggregation over the wrong metric.
+        """
+        metric = {
+            "veg": self.veg_data,
+            "terrain": self.terrain_data,
+            "ndvi": self.ndvi_data,
+        }.get(channel)
+        if metric is None:
+            uniq = static.get("uniq_lookup_ids")
+            source = self._ensure_memory_loaded() or self._preaggr_cache
+            column = preaggregation.stat_to_column(stat, pct)
+            if uniq is None or source is None or column is None:
+                return None, False
+            plan = self._preaggr_plan(source, uniq, static.get("uniq_wave_idx"), static)
+            if plan is None:
+                return None, False
+            return source.gather(plan, channel, int(round(radius)), column), True
+        return self._aggregate_channel_for_fold(
+            static,
+            metric,
+            radius,
+            stat,
+            pct if pct is not None else 50,
+            channel=channel,
+            fold_idx=None,
+            subset=subset,
+        )
+
+    def _cache_channels(self) -> tuple[str, ...]:
+        """Greenery channels this job needs stored.
+
+        A two-channel study reads ``gvi``, whose percentiles cannot be recovered
+        by summing the components, so it must be stored in its own right. A
+        three-channel study never reads it and does not pay for it. The cache
+        keeps whatever any job has asked for, so switching a study from two
+        channels to three appends rather than rebuilds.
+        """
+        wanted = set(cgi_formulas.formula_channels(self.cgi_formula))
+        if self._active_greenery_channel != "cgi":
+            wanted.add(self._active_greenery_channel)
+        if "gvi" in wanted:
+            # ``gvi``'s mean is the component sum, but its percentiles are not,
+            # so the components stay alongside it for standalone reporting.
+            wanted |= {"veg", "terrain"}
+        return tuple(
+            c for c in preaggregation.GreeneryCache.ALL_CHANNELS if c in wanted
+        )
+
+    def _blocks(self, result: tuple) -> dict:
+        """Aggregation output -> ``{channel: array}``, limited to this job's set.
+
+        The aggregation always produces all four (one radius query serves the
+        street-view family), but only the requested channels are stored.
+        """
+        veg, ter, ndvi, gvi = result
+        allb = {"veg": veg, "terrain": ter, "ndvi": ndvi, "gvi": gvi}
+        return {c: allb[c] for c in self._cache_channels()}
 
     def _preaggr_plan(
         self,
@@ -3332,6 +4087,7 @@ class MetricFusionEngine:
         for col in self._longitudinal_extra_cols():
             if col in entity_gdf.columns:
                 fusion_df[col] = entity_gdf[col].values
+        self._carry_negative_controls(fusion_df, entity_gdf)
         fusion_df = self._attach_entity_coords(fusion_df, entity_gdf)
 
         _log("INFO", "====== DATA QUALITY SUMMARY (POLYGON / PER-PIXEL) ======")
@@ -3628,6 +4384,7 @@ class MetricFusionEngine:
         for col in self._longitudinal_extra_cols():
             if col in entity_gdf.columns:
                 fusion_df[col] = entity_gdf[col].values
+        self._carry_negative_controls(fusion_df, entity_gdf)
         fusion_df = self._attach_entity_coords(fusion_df, entity_gdf)
 
         _log("INFO", "====== DATA QUALITY SUMMARY (POINT/LINE / PER-PIXEL) ======")
@@ -3791,6 +4548,11 @@ class MetricFusionEngine:
                 if cov_cols
                 else None
             )
+            st["controls"] = {
+                c: data[c].to_numpy(dtype=np.float64)[first_idx]
+                for c in self.negative_control_columns
+                if c in data.columns
+            }
             st["coords"] = (
                 np.column_stack(
                     [
@@ -3811,6 +4573,11 @@ class MetricFusionEngine:
         else:
             st["target"] = data["target"].values
             st["cov"] = data[cov_cols].to_numpy(dtype=np.float64) if cov_cols else None
+            st["controls"] = {
+                c: data[c].to_numpy(dtype=np.float64)
+                for c in self.negative_control_columns
+                if c in data.columns
+            }
             st["coords"] = (
                 data[["_cx", "_cy"]].to_numpy(np.float64) if have_coords else None
             )
@@ -4658,10 +5425,10 @@ class MetricFusionEngine:
         n_spatial_blocks: int | None = None,
     ) -> None:
         """Carve a held-out test set and the train+val pool the bootstrap
-        stability search resamples.
+        the sweep splits.
 
-        Stability selection does its own complementary-half resampling of the
-        train+val pool (see :meth:`bootstrap_stability_selection`), so this
+        The sweep does its own repeated splitting of the
+        train+val pool (see :meth:`fit_bayesian_index`), so this
         method only sets aside the untouched test split and the pool; it does
         not build CV folds. The split is leakage-safe (groups stay together
         when ``entity_id`` / ``polygon_id`` is present) and outcome-stratified,
@@ -4889,7 +5656,7 @@ class MetricFusionEngine:
                 f"{len(test_poly)} test {group_label}s ({len(self.test_data)} rows).",
             )
 
-            # No CV folds — the bootstrap stability search resamples the pool
+            # No CV folds — the sweep splits the pool
             # itself. Reset the caches the resampler rebuilds per run.
             self.cv_folds = []
             self._spatial_basis_cache = {}
@@ -4920,27 +5687,11 @@ class MetricFusionEngine:
             f"{len(self.test_data)} test samples (holdout)"
         )
 
-        # No CV folds — the bootstrap stability search resamples the pool
+        # No CV folds — the sweep splits the pool
         # itself. Reset the caches the resampler rebuilds per run.
         self.cv_folds = []
         self._spatial_basis_cache = {}
         self._spatial_adjust_summary = None
-
-    def _suggest_gvi_radius(self, trial: optuna.Trial, name: str) -> int:
-        lo, hi, step = metric_sampling.radius_int_bounds(
-            self.gvi_buffer_min_m, self.gvi_buffer_max_m, self.gvi_buffer_step_m
-        )
-        if lo >= hi:
-            return lo
-        return trial.suggest_int(name, lo, hi, step=step)
-
-    def _suggest_ndvi_radius(self, trial: optuna.Trial) -> int:
-        lo, hi, step = metric_sampling.radius_int_bounds(
-            self.ndvi_buffer_min_m, self.ndvi_buffer_max_m, self.ndvi_buffer_step_m
-        )
-        if lo >= hi:
-            return lo
-        return trial.suggest_int("ndvi_radius", lo, hi, step=step)
 
     def _effective_time_fixed(self, spec) -> bool:
         """The spec's time fixed effect, minus the case where wave indicators
@@ -4954,7 +5705,7 @@ class MetricFusionEngine:
 
         The longitudinal MixedLM ``tstat`` / ``coef`` metrics and both GEE
         logistic metrics carry a Wald p-value; the cross-sectional OLS metrics
-        do not (their robustness comes from stability selection + bootstrap CIs,
+        do not (their robustness comes from the held-out sweep + posterior CIs,
         not a per-trial p-gate). The cross-sectional logistic metrics do produce
         one, and it is reported for consistency with the panel path.
         """
@@ -5141,504 +5892,6 @@ class MetricFusionEngine:
             spline_cache=self._spline_basis_cache,
         )
 
-    def _objective(self, trial: optuna.Trial, metric: str) -> float:
-        """Optuna objective with k-fold CV, timed for the concurrency report.
-
-        Weight search matches CGI.ipynb (ndvi / veg / terrain summing to 100).
-        Radii use separate GVI and NDVI buffer ladders (min / max / step metres)
-        on the engine; extent padding remains ``buffer_meters``.
-        Street-view aggregation parameters are shared for veg and terrain; NDVI
-        uses separate stat / percentile choices.
-        """
-        # A cancelled job stops paying for trials it will never report. The
-        # study-level callback stops the sampler from queueing more; this
-        # prunes the ones already dispatched to the pool.
-        if self._cancel_callback is not None and self._cancel_callback():
-            raise optuna.TrialPruned("Cancelled by user")
-
-        _t0 = time.perf_counter()
-        try:
-            return self._objective_inner(trial, metric)
-        finally:
-            # ``list.append`` is atomic under the GIL, so trials on the thread
-            # pool accumulate without a lock; summing these gives worker-seconds.
-            self._objective_secs.append(time.perf_counter() - _t0)
-
-    def _objective_inner(self, trial: optuna.Trial, metric: str) -> float:
-        gvi_cap = int(round(self.gvi_buffer_max_m))
-        ndvi_cap = int(round(self.ndvi_buffer_max_m))
-
-        if trial.number == 0:
-            gvi_lo, gvi_hi, gvi_st = metric_sampling.radius_int_bounds(
-                self.gvi_buffer_min_m,
-                self.gvi_buffer_max_m,
-                self.gvi_buffer_step_m,
-            )
-            ndvi_lo, ndvi_hi, ndvi_st = metric_sampling.radius_int_bounds(
-                self.ndvi_buffer_min_m,
-                self.ndvi_buffer_max_m,
-                self.ndvi_buffer_step_m,
-            )
-            logger.info(
-                f"Fusion extent buffer: {self.buffer_meters} m; "
-                f"GVI radius search {gvi_lo}–{gvi_hi} m (step {gvi_st}); "
-                f"NDVI radius search {ndvi_lo}–{ndvi_hi} m (step {ndvi_st})"
-            )
-
-        # ── Suggest formula parameters (weights + powers) ───
-        # In ``cgi`` mode the formula's ``suggest_params`` bakes the weight-sum
-        # / power constraints into the search space (sequential conditional
-        # allocation on the simplex), and ``channel_active`` drives the
-        # per-channel skip below. In a standalone single-metric study no
-        # weights are recorded — only the active channel needs aggregation —
-        # so ``formula_params`` is empty and the channel flags are hard-coded.
-        channel_mode = self._active_greenery_channel
-        if channel_mode == "cgi":
-            formula = cgi_formulas.get_formula(self.cgi_formula)
-            # Any channels turned off by check_channel_collinearity get
-            # their weights pinned to 0 inside ``suggest_params`` so the
-            # optimizer never wastes trials on disabled-channel
-            # combinations and every trial's recorded params still satisfy
-            # the formula's simplex constraint.
-            formula_params = formula.suggest_params(
-                trial, disabled_channels=set(self._disabled_channels)
-            )
-            channel_active = formula.channel_active(formula_params)
-        else:
-            formula = None
-            formula_params = {}
-            channel_active = {
-                "veg": channel_mode == "veg",
-                "terrain": channel_mode == "terrain",
-                "ndvi": channel_mode == "ndvi",
-            }
-
-        # When pre-aggregation is active, percentile suggestions are restricted
-        # to the 10 % grid {10,20,…,90} so every trial maps to a precomputed
-        # cell. Otherwise the original 1-99 search space is used.
-        preaggr_on = getattr(self, "_preaggregation_done", False)
-        pct_grid = list(self._PREAGGR_PERCENTILES)
-
-        # ── Streetview params (shared: veg + terrain) ───────
-        # Only suggest if either veg or terrain channel contributes. The
-        # gating mirrors the legacy weighted-average ``weight > 0`` skip so an
-        # all-NDVI trial doesn't burn search dimensions on unused street-view
-        # radii — under synergy a channel is virtually always active, so the
-        # gating just doesn't fire there.
-        if channel_active["veg"] or channel_active["terrain"]:
-            streetview_stat = trial.suggest_categorical(
-                "streetview_stat", ["mean", "median", "percentile"]
-            )
-            if streetview_stat == "percentile":
-                if preaggr_on:
-                    streetview_percentile = trial.suggest_categorical(
-                        "streetview_percentile", pct_grid
-                    )
-                else:
-                    streetview_percentile = trial.suggest_int(
-                        "streetview_percentile", 1, 99
-                    )
-            else:
-                streetview_percentile = 50
-
-            veg_radius = (
-                self._suggest_gvi_radius(trial, "veg_radius")
-                if channel_active["veg"]
-                else gvi_cap
-            )
-            terrain_radius = (
-                self._suggest_gvi_radius(trial, "terrain_radius")
-                if channel_active["terrain"]
-                else gvi_cap
-            )
-        else:
-            streetview_stat = "mean"
-            streetview_percentile = 50
-            veg_radius = gvi_cap
-            terrain_radius = gvi_cap
-
-        # ── Suggest NDVI Parameters (separate) ──────────────
-        if channel_active["ndvi"]:
-            ndvi_radius = self._suggest_ndvi_radius(trial)
-            ndvi_stat = trial.suggest_categorical(
-                "ndvi_stat", ["mean", "median", "percentile"]
-            )
-            if ndvi_stat == "percentile":
-                if preaggr_on:
-                    ndvi_percentile = trial.suggest_categorical(
-                        "ndvi_percentile", pct_grid
-                    )
-                else:
-                    ndvi_percentile = trial.suggest_int("ndvi_percentile", 1, 99)
-            else:
-                ndvi_percentile = 50
-        else:
-            ndvi_radius = ndvi_cap
-            ndvi_stat = "mean"
-            ndvi_percentile = 50
-
-        # ── Evaluate Across All CV Folds ────────────────────
-        fold_train_scores = []
-        fold_val_scores = []
-        fold_train_pvals = []
-        fold_val_pvals = []
-
-        for fold_idx, fold in enumerate(self.cv_folds):
-            # Mid-trial cancellation: prune this trial immediately so the
-            # study-level callback sees the next stop signal.
-            cb = getattr(self, "_cancel_callback", None)
-            if cb is not None and cb():
-                raise optuna.TrialPruned("Cancelled by user")
-
-            train_data = fold["train"]
-            val_data = fold["val"]
-
-            # All-zero trial guard. If every channel reports inactive (weighted-
-            # average with all three weights == 0) we can't form a composite,
-            # so return the metric's worst score so Optuna learns to avoid it.
-            if not any(channel_active.values()):
-                return -np.inf if metric != "nrmse" else np.inf
-
-            # ── Apply Dynamic Radius and Aggregation ────
-            # Both points and rasters use the same circular buffer aggregation
-            # For rasters, _prepare_raster_fusion() converted pixels to points at centers.
-            # Points slices, collapse codes, and every per-entity constant are
-            # trial-invariant — served from the fold statics (computed once per
-            # fold subset, reused by all of this bootstrap's trials).
-            train_static = self._fold_entity_statics(train_data, fold_idx, "train")
-            val_static = self._fold_entity_statics(val_data, fold_idx, "val")
-            train_points = train_static["points"]
-            val_points = val_static["points"]
-
-            # Channel values are computed on the fold's dedup axis when it has
-            # one (point / line catchments repeat a pixel per entity), then
-            # gathered back onto rows just before the collapse below.
-            def _channel(
-                static, metric_data, radius, stat_name, pct, ch_name, sub
-            ) -> tuple[np.ndarray, bool]:
-                n = len(static["points"])
-                if not channel_active[ch_name]:
-                    uid = static.get("uniq_lookup_ids")
-                    width = n if uid is None else len(uid)
-                    return np.zeros(width, dtype=np.float32), uid is not None
-                return self._aggregate_channel_for_fold(
-                    static,
-                    metric_data,
-                    radius,
-                    stat_name,
-                    pct,
-                    channel=ch_name,
-                    fold_idx=fold_idx,
-                    subset=sub,
-                )
-
-            train_parts = [
-                _channel(
-                    train_static,
-                    self.veg_data,
-                    veg_radius,
-                    streetview_stat,
-                    streetview_percentile,
-                    "veg",
-                    "train",
-                ),
-                _channel(
-                    train_static,
-                    self.terrain_data,
-                    terrain_radius,
-                    streetview_stat,
-                    streetview_percentile,
-                    "terrain",
-                    "train",
-                ),
-                _channel(
-                    train_static,
-                    self.ndvi_data,
-                    ndvi_radius,
-                    ndvi_stat,
-                    ndvi_percentile,
-                    "ndvi",
-                    "train",
-                ),
-            ]
-            val_parts = [
-                _channel(
-                    val_static,
-                    self.veg_data,
-                    veg_radius,
-                    streetview_stat,
-                    streetview_percentile,
-                    "veg",
-                    "val",
-                ),
-                _channel(
-                    val_static,
-                    self.terrain_data,
-                    terrain_radius,
-                    streetview_stat,
-                    streetview_percentile,
-                    "terrain",
-                    "val",
-                ),
-                _channel(
-                    val_static,
-                    self.ndvi_data,
-                    ndvi_radius,
-                    ndvi_stat,
-                    ndvi_percentile,
-                    "ndvi",
-                    "val",
-                ),
-            ]
-            train_on_uniq = all(u for _, u in train_parts)
-            val_on_uniq = all(u for _, u in val_parts)
-            train_veg, train_terrain, train_ndvi = _helpers.align_channel_axes(
-                train_parts, train_static, len(train_points)
-            )
-            val_veg, val_terrain, val_ndvi = _helpers.align_channel_axes(
-                val_parts, val_static, len(val_points)
-            )
-
-            # Per-channel scaling has been removed: the composite is always a
-            # weighted combination of RAW aggregated channel values. The
-            # ``whole_grid_scaling`` toggle instead normalizes the resulting
-            # composite to [0, 1] (applied after compute_cgi, below).
-            # Any row usable at all? Checked per channel so the full-width
-            # stack (a copy of every channel) is never materialised here.
-            if not (
-                np.isfinite(train_veg)
-                & np.isfinite(train_terrain)
-                & np.isfinite(train_ndvi)
-            ).any():
-                continue  # Skip this fold if no valid data
-
-            train_veg_norm = train_veg
-            train_terrain_norm = train_terrain
-            train_ndvi_norm = train_ndvi
-            val_veg_norm = val_veg
-            val_terrain_norm = val_terrain
-            val_ndvi_norm = val_ndvi
-
-            # Optional per-channel [0, 1] scaling (raw otherwise). Applied to
-            # both the CGI and standalone paths so they share one footing.
-            train_veg_norm, train_terrain_norm, train_ndvi_norm = (
-                self._normalize_channel_arrays(
-                    train_veg_norm, train_terrain_norm, train_ndvi_norm
-                )
-            )
-            val_veg_norm, val_terrain_norm, val_ndvi_norm = (
-                self._normalize_channel_arrays(
-                    val_veg_norm, val_terrain_norm, val_ndvi_norm
-                )
-            )
-
-            # Build the greenery value the objective scores against. In CGI
-            # mode that's the selected formula's composite; in standalone mode
-            # it's the active channel's normalised value used directly (the
-            # role the CGI value plays in the combined run).
-            if channel_mode == "cgi":
-                train_components = {
-                    "veg": train_veg_norm,
-                    "terrain": train_terrain_norm,
-                    "ndvi": train_ndvi_norm,
-                }
-                val_components = {
-                    "veg": val_veg_norm,
-                    "terrain": val_terrain_norm,
-                    "ndvi": val_ndvi_norm,
-                }
-                train_composite = compute_cgi(
-                    self.cgi_formula, formula_params, train_components
-                )
-                val_composite = compute_cgi(
-                    self.cgi_formula, formula_params, val_components
-                )
-            else:
-                single = {
-                    "veg": (train_veg_norm, val_veg_norm),
-                    "terrain": (train_terrain_norm, val_terrain_norm),
-                    "ndvi": (train_ndvi_norm, val_ndvi_norm),
-                }[channel_mode]
-                train_composite, val_composite = single
-
-            # Composite-level [0, 1] normalization when whole_grid_scaling is on
-            # (raw otherwise) — per-pixel, before the entity collapse, and
-            # applied to the standalone single-channel composite too.
-            train_composite = self._finalize_composite(train_composite)
-            val_composite = self._finalize_composite(val_composite)
-
-            # Back onto the fold's rows when the composite was formed on the
-            # dedup axis: the collapse below keys on per-row entity membership.
-            if train_on_uniq and train_static.get("uniq_inverse") is not None:
-                train_composite = np.asarray(train_composite)[
-                    train_static["uniq_inverse"]
-                ]
-            if val_on_uniq and val_static.get("uniq_inverse") is not None:
-                val_composite = np.asarray(val_composite)[val_static["uniq_inverse"]]
-
-            # Per-fold covariate design matrix, per-entity target / coords /
-            # longitudinal keys: all trial-invariant, served from the fold
-            # statics (already entity-collapsed for polygon-keyed targets).
-            train_cov = train_static["cov"]
-            val_cov = val_static["cov"]
-            train_targets_arr = train_static["target"]
-            val_targets_arr = val_static["target"]
-            train_coords = train_static["coords"]
-            val_coords = val_static["coords"]
-            train_entity_id = train_static.get("entity_id")
-            val_entity_id = val_static.get("entity_id")
-            train_ysb = train_static.get("ysb")
-            val_ysb = val_static.get("ysb")
-
-            # Polygon mode: per-row CGI → per-polygon mean CGI, then score
-            # against the per-polygon outcome. In longitudinal+polygon mode
-            # polygon_id was set to f"{entity}|{wave}" by
-            # _prepare_polygon_fusion so the collapse produces one row per
-            # (entity, wave) — the shape the MixedLM scorer wants. Polygons
-            # average every in-footprint pixel; point/line entities average
-            # only those inside this trial's catchment radius.
-            if train_static["has_pid"]:
-                catchment_r = _helpers.catchment_radius(
-                    veg_radius,
-                    terrain_radius,
-                    ndvi_radius,
-                    self._active_greenery_channel,
-                )
-                train_mask = _helpers.entity_collapse_mask(train_data, catchment_r)
-                val_mask = _helpers.entity_collapse_mask(val_data, catchment_r)
-                train_composite = self._collapse_mean_from_codes(
-                    train_composite,
-                    train_static["codes"],
-                    train_static["n_uniq"],
-                    train_mask,
-                )
-                val_composite = self._collapse_mean_from_codes(
-                    val_composite,
-                    val_static["codes"],
-                    val_static["n_uniq"],
-                    val_mask,
-                )
-
-            # Check for constant values (variance = 0) which cause NaN correlations
-            train_valid_vals = train_composite[~np.isnan(train_composite)]
-            val_valid_vals = val_composite[~np.isnan(val_composite)]
-
-            if len(train_valid_vals) == 0 or np.var(train_valid_vals) == 0:
-                # Prune trial early if train composite is constant
-                raise optuna.TrialPruned(
-                    "Train composite has no variance (constant values)"
-                )
-
-            if len(val_valid_vals) > 0 and np.var(val_valid_vals) == 0:
-                # Prune trial early if validation composite is constant
-                raise optuna.TrialPruned(
-                    "Validation composite has no variance (constant values)"
-                )
-
-            # Spatial-confounding smooth (or None when off): a df-selected
-            # coordinate basis folded into the scorer's residualization.
-            train_sb = self._spatial_basis_columns(
-                train_coords, train_targets_arr, train_cov, train_composite
-            )
-            val_sb = self._spatial_basis_columns(
-                val_coords, val_targets_arr, val_cov, val_composite
-            )
-
-            # ── Score via the ``_score_greenery`` seam ──
-            # Three modes collapse into it: cross-sectional OLS, mixed-effects
-            # MixedLM (per-entity random effects), and year-aware cross-sectional
-            # (spec present but an OLS scoring metric — the OLS scorer ignores
-            # entity_id / years_since_baseline; the spec only routes the right
-            # metric file per year through the pre-aggregation cache).
-            wants_pval = self._metric_has_pvalue(metric)
-            # Fast fixed-V GLS scoring for the search: one variance-component
-            # estimate per fold subset, reused across trials. Only for the
-            # ranking metrics with no spatial smooth; ``None`` elsewhere makes
-            # ``_score_greenery`` take the exact per-trial fit.
-            wants_fast = (
-                self.is_longitudinal
-                and metric in mixed_effects_scoring.FAST_SEARCH_METRICS
-                and self.spatial_adjust_method == "none"
-            )
-            wants_gee_fast = (
-                self.is_longitudinal and metric in longitudinal.GEE_LOGIT_METRICS
-            )
-            if wants_gee_fast:
-                train_fc = self._fold_gee_baseline(train_static)
-                val_fc = self._fold_gee_baseline(val_static)
-            else:
-                train_fc = (
-                    self._fold_fast_components(train_static) if wants_fast else None
-                )
-                val_fc = self._fold_fast_components(val_static) if wants_fast else None
-            train_out = self._score_greenery(
-                metric,
-                train_targets_arr,
-                train_composite,
-                covariates=train_cov,
-                spatial_basis=train_sb,
-                entity_id=train_entity_id,
-                years_since_baseline=train_ysb,
-                return_pvalue=wants_pval,
-                fast_components=train_fc,
-            )
-            val_out = self._score_greenery(
-                metric,
-                val_targets_arr,
-                val_composite,
-                covariates=val_cov,
-                spatial_basis=val_sb,
-                entity_id=val_entity_id,
-                years_since_baseline=val_ysb,
-                return_pvalue=wants_pval,
-                fast_components=val_fc,
-            )
-
-            if wants_pval:
-                # return_pvalue=True returns (score, pvalue); type cast is for
-                # the static checker.
-                train_score, train_pval = train_out  # type: ignore[misc]
-                val_score, val_pval = val_out  # type: ignore[misc]
-                fold_train_pvals.append(train_pval)
-                fold_val_pvals.append(val_pval)
-            else:
-                train_score = train_out
-                val_score = val_out
-
-            fold_train_scores.append(train_score)
-            fold_val_scores.append(val_score)
-
-        # Every fold was skipped (all-NaN composites) → no usable score; return
-        # the metric's worst value so Optuna avoids this region (and no empty
-        # np.mean warning fires).
-        if not fold_val_scores:
-            return -np.inf if metric != "nrmse" else np.inf
-
-        # ── Store Aggregate Statistics ──────────────────────
-        avg_train_score = np.mean(fold_train_scores)
-        avg_val_score = np.mean(fold_val_scores)
-        std_val_score = np.std(fold_val_scores)
-
-        trial.set_user_attr("train_score_mean", avg_train_score)
-        trial.set_user_attr("train_score_std", np.std(fold_train_scores))
-        trial.set_user_attr("val_score_mean", avg_val_score)
-        trial.set_user_attr("val_score_std", std_val_score)
-        trial.set_user_attr("fold_train_scores", fold_train_scores)
-        trial.set_user_attr("fold_val_scores", fold_val_scores)
-
-        # p-value bookkeeping: only the longitudinal MixedLM tstat/coef metrics
-        # carry a genuine Wald p-value. Recorded as user_attrs so the post-hoc
-        # reporting can read them per trial.
-        produced_pvals = self._metric_has_pvalue(metric)
-        if produced_pvals:
-            trial.set_user_attr("train_pvalue_mean", np.mean(fold_train_pvals))
-            trial.set_user_attr("val_pvalue_mean", np.mean(fold_val_pvals))
-            trial.set_user_attr("fold_train_pvals", fold_train_pvals)
-            trial.set_user_attr("fold_val_pvals", fold_val_pvals)
-
-        # Return average validation score across folds
-        return avg_val_score
-
     def evaluate_on_test(
         self,
         params: dict | None = None,
@@ -5700,119 +5953,34 @@ class MetricFusionEngine:
         if memo_hit is not None:
             return dict(memo_hit)
 
+        # Every distinct configuration scored on the test slice spends part of
+        # the held-out guarantee. Cache hits are free (same answer), so only
+        # misses count. Surfaced in the bundle so a burned test set is visible
+        # rather than inferred.
+        self._test_reads += 1
+
         logger.info("Evaluating on held-out test set...")
 
-        # Use the engine's active mode to decide which channels contribute and
-        # how the composite is built. CGI mode delegates to the formula's
-        # ``channel_active`` + ``compute_cgi``; standalone mode uses the active
-        # channel directly so the test score is on the same scale the study
-        # optimized against.
-        channel_mode = self._active_greenery_channel
-        if channel_mode == "cgi":
-            channel_active = cgi_formulas.get_formula(self.cgi_formula).channel_active(
-                params
-            )
-        else:
-            channel_active = {
-                "veg": channel_mode == "veg",
-                "terrain": channel_mode == "terrain",
-                "ndvi": channel_mode == "ndvi",
-            }
-
-        # Extract aggregation parameters
-        streetview_stat = params.get("streetview_stat", "mean")
-        streetview_percentile = params.get("streetview_percentile", 50)
-        veg_radius = params.get("veg_radius", int(round(self.gvi_buffer_max_m)))
-        terrain_radius = params.get("terrain_radius", int(round(self.gvi_buffer_max_m)))
-        ndvi_stat = params.get("ndvi_stat", "mean")
-        ndvi_percentile = params.get("ndvi_percentile", 50)
-        ndvi_radius = params.get("ndvi_radius", int(round(self.ndvi_buffer_max_m)))
-
-        # Apply dynamic circular buffer aggregation
-        # Both points and rasters use the same approach (rasters converted to points)
+        # Apply dynamic circular buffer aggregation over this job's own channel
+        # set. Both points and rasters use the same approach (rasters converted
+        # to points).
         # .loc with an index array materialises a new frame; read-only below.
         test_points = self.target_gdf.loc[self.test_data.index]
-
-        # Sample vegetation with optimized radius/stat
-        if channel_active["veg"]:
-            test_veg = self._aggregate_with_ring_cache(
-                test_points,
-                self.veg_data,
-                veg_radius,
-                streetview_stat,
-                streetview_percentile,
-                channel="veg",
-                fold_idx=-1,
-                subset="test",
-            )
-        else:
-            test_veg = np.zeros(len(test_points), dtype=np.float32)
-
-        # Sample terrain with optimized radius/stat
-        if channel_active["terrain"]:
-            test_terrain = self._aggregate_with_ring_cache(
-                test_points,
-                self.terrain_data,
-                terrain_radius,
-                streetview_stat,
-                streetview_percentile,
-                channel="terrain",
-                fold_idx=-1,
-                subset="test",
-            )
-        else:
-            test_terrain = np.zeros(len(test_points), dtype=np.float32)
-
-        # Sample NDVI with optimized radius/stat
-        if channel_active["ndvi"]:
-            test_ndvi = self._aggregate_with_ring_cache(
-                test_points,
-                self.ndvi_data,
-                ndvi_radius,
-                ndvi_stat,
-                ndvi_percentile,
-                channel="ndvi",
-                fold_idx=-1,
-                subset="test",
-            )
-        else:
-            test_ndvi = np.zeros(len(test_points), dtype=np.float32)
+        test_blocks = self._aggregate_channels(test_points, params, subset="test")
 
         # Per-channel scaling removed — the composite uses raw aggregated
         # channels. ``whole_grid_scaling`` normalizes the composite below.
-        test_combined = np.column_stack([test_veg, test_terrain, test_ndvi])
+        test_combined = np.column_stack(list(test_blocks.values()))
         test_valid_mask = ~np.isnan(test_combined).any(axis=1)
 
         if test_valid_mask.sum() == 0:
             raise ValueError("No valid test data after aggregation")
 
-        test_veg_norm = test_combined[:, 0]
-        test_terrain_norm = test_combined[:, 1]
-        test_ndvi_norm = test_combined[:, 2]
-        test_veg_norm, test_terrain_norm, test_ndvi_norm = (
-            self._normalize_channel_arrays(
-                test_veg_norm, test_terrain_norm, test_ndvi_norm
-            )
-        )
-
-        # Calculate composite via the active mode. Same fork as ``_objective``
+        # Calculate composite via the active mode. Same fork as ``apply_fusion``
         # so the held-out score is on the same scale the study optimized.
-        if channel_mode == "cgi":
-            test_composite = compute_cgi(
-                self.cgi_formula,
-                params,
-                {
-                    "veg": test_veg_norm,
-                    "terrain": test_terrain_norm,
-                    "ndvi": test_ndvi_norm,
-                },
-            )
-        else:
-            test_composite = {
-                "veg": test_veg_norm,
-                "terrain": test_terrain_norm,
-                "ndvi": test_ndvi_norm,
-            }[channel_mode]
+        test_composite = self._composite_from(
+            params, self._normalize_channels(test_blocks)
+        )
 
         # Composite-level [0, 1] normalization (raw when the toggle is off),
         # mirrored for standalone single-channel composites.
@@ -5835,10 +6003,7 @@ class MetricFusionEngine:
         # the shape the MixedLM scorer expects.
         if test_static["has_pid"]:
             catchment_r = _helpers.catchment_radius(
-                veg_radius,
-                terrain_radius,
-                ndvi_radius,
-                self._active_greenery_channel,
+                self._channel_radii(params), self._active_greenery_channel
             )
             test_mask = _helpers.entity_collapse_mask(self.test_data, catchment_r)
             test_composite = self._collapse_mean_from_codes(
@@ -5937,13 +6102,14 @@ class MetricFusionEngine:
     def build_channel_design(self, params: dict, subset: str = "train_val") -> dict:
         """Per-entity raw channel values for the CGI-vs-standalone AIC/BIC test.
 
-        Aggregates **all three** channels (veg / terrain / ndvi) at ``params``'
-        radii / stats / percentiles on the requested ``subset`` (``"train_val"``
-        for the resampling pool, ``"test"`` for the held-out set, ``"all"`` for
-        every entity), collapses to one row per entity (polygon mean when
+        Aggregates **every channel this job uses** at ``params``' radii / stats
+        / percentiles on the requested ``subset`` (``"train_val"`` for the
+        resampling pool, ``"test"`` for the held-out set, ``"all"`` for every
+        entity), collapses to one row per entity (polygon mean when
         polygon-keyed), and returns the raw arrays plus the aligned target,
         covariates, and — in longitudinal mode — entity ids and
-        ``years_since_baseline``.
+        ``years_since_baseline``. ``channel_names`` says which column is which,
+        because the set differs between a two- and three-channel study.
 
         No scaling is applied: OLS / MixedLM AIC and BIC are invariant to an
         affine transform of an individual predictor, so raw channel values are
@@ -5969,44 +6135,26 @@ class MetricFusionEngine:
             raise ValueError(f"No {subset} data available. Run split_data() first.")
 
         points = self.target_gdf.loc[data.index].copy()
-        streetview_stat = params.get("streetview_stat", "mean")
-        streetview_percentile = params.get("streetview_percentile", 50)
-        veg_radius = params.get("veg_radius", int(round(self.gvi_buffer_max_m)))
-        terrain_radius = params.get("terrain_radius", int(round(self.gvi_buffer_max_m)))
-        ndvi_stat = params.get("ndvi_stat", "mean")
-        ndvi_percentile = params.get("ndvi_percentile", 50)
-        ndvi_radius = params.get("ndvi_radius", int(round(self.ndvi_buffer_max_m)))
-
-        veg = self._aggregate_with_ring_cache(
-            points,
-            self.veg_data,
-            veg_radius,
-            streetview_stat,
-            streetview_percentile,
-            channel="veg",
-            fold_idx=None,
-            subset=None,
-        )
-        terrain = self._aggregate_with_ring_cache(
-            points,
-            self.terrain_data,
-            terrain_radius,
-            streetview_stat,
-            streetview_percentile,
-            channel="terrain",
-            fold_idx=None,
-            subset=None,
-        )
-        ndvi = self._aggregate_with_ring_cache(
-            points,
-            self.ndvi_data,
-            ndvi_radius,
-            ndvi_stat,
-            ndvi_percentile,
-            channel="ndvi",
-            fold_idx=None,
-            subset=None,
-        )
+        # The formula's channels, not the engine's active mode: this design is
+        # what the composite is compared *against*, so it has to hold every
+        # channel even while the engine is scoring one standalone.
+        channels = tuple(cgi_formulas.formula_channels(self.cgi_formula))
+        # Every channel is aggregated here regardless of its weight: the AIC/BIC
+        # comparison fits the standalones as well as the composite, so a channel
+        # the formula happens to zero is still one of the models under test.
+        blocks: dict[str, np.ndarray] = {}
+        for ch in channels:
+            radius, stat, pct = self._channel_spec(params, ch)
+            blocks[ch] = self._aggregate_with_ring_cache(
+                points,
+                self._channel_source(ch),
+                radius,
+                stat,
+                pct,
+                channel=ch,
+                fold_idx=None,
+                subset=None,
+            )
 
         cov_cols = self.covariate_columns
         cov = data[cov_cols].to_numpy(dtype=np.float64) if cov_cols else None
@@ -6015,18 +6163,16 @@ class MetricFusionEngine:
         ysb = None
         if "polygon_id" in data.columns:
             pid = data["polygon_id"].values
-            # Full 3-channel design → catchment = max of the three radii for
-            # point/line targets (mask None for polygons).
+            # Every channel feeds the design → catchment = the largest radius
+            # among them for point/line targets (mask None for polygons).
             catchment_r = _helpers.catchment_radius(
-                veg_radius,
-                terrain_radius,
-                ndvi_radius,
-                self._active_greenery_channel,
+                self._channel_radii(params), self._active_greenery_channel
             )
             mask = _helpers.entity_collapse_mask(data, catchment_r)
-            veg = self._collapse_to_entities(veg, pid, mask, "mean")
-            terrain = self._collapse_to_entities(terrain, pid, mask, "mean")
-            ndvi = self._collapse_to_entities(ndvi, pid, mask, "mean")
+            blocks = {
+                ch: self._collapse_to_entities(a, pid, mask, "mean")
+                for ch, a in blocks.items()
+            }
             target = self._collapse_to_entities(
                 data["target"].values, pid, mask, "first"
             )
@@ -6052,8 +6198,8 @@ class MetricFusionEngine:
                 ysb = data["years_since_baseline"].values
 
         return {
-            "channels": np.column_stack([veg, terrain, ndvi]),
-            "channel_names": ["veg", "terrain", "ndvi"],
+            "channels": np.column_stack(list(blocks.values())),
+            "channel_names": list(blocks),
             "target": np.asarray(target, dtype=np.float64),
             "covariates": cov,
             "entity_id": entity_id,
@@ -6243,33 +6389,6 @@ class MetricFusionEngine:
         if cached is not None and cached[0] == cache_key:
             return cached[1]
 
-        # The active mode decides which channels contribute and how the
-        # composite is built — apply_fusion routes through the same fork as
-        # _objective / evaluate_on_test so all four agree. CGI mode delegates
-        # to the formula; standalone mode isolates the active channel.
-        channel_mode = self._active_greenery_channel
-        if channel_mode == "cgi":
-            channel_active = cgi_formulas.get_formula(self.cgi_formula).channel_active(
-                weights
-            )
-        else:
-            channel_active = {
-                "veg": channel_mode == "veg",
-                "terrain": channel_mode == "terrain",
-                "ndvi": channel_mode == "ndvi",
-            }
-
-        # Extract aggregation parameters
-        streetview_stat = weights.get("streetview_stat", "mean")
-        streetview_percentile = weights.get("streetview_percentile", 50)
-        veg_radius = weights.get("veg_radius", int(round(self.gvi_buffer_max_m)))
-        terrain_radius = weights.get(
-            "terrain_radius", int(round(self.gvi_buffer_max_m))
-        )
-        ndvi_stat = weights.get("ndvi_stat", "mean")
-        ndvi_percentile = weights.get("ndvi_percentile", 50)
-        ndvi_radius = weights.get("ndvi_radius", int(round(self.ndvi_buffer_max_m)))
-
         # Combine all data (train+val+test) — cached union frame.
         all_data = self._full_data_frame()
         if all_data is None:
@@ -6277,86 +6396,21 @@ class MetricFusionEngine:
         # .loc with an index array materialises a new frame; read-only below.
         all_points = self.target_gdf.loc[all_data.index]
 
-        # Apply circular buffer aggregation with optimized parameters
-        if channel_active["veg"]:
-            all_veg = self._aggregate_with_ring_cache(
-                all_points,
-                self.veg_data,
-                veg_radius,
-                streetview_stat,
-                streetview_percentile,
-                channel="veg",
-                fold_idx=-1,
-                subset="all",
-            )
-        else:
-            all_veg = np.zeros(len(all_points), dtype=np.float32)
-
-        if channel_active["terrain"]:
-            all_terrain = self._aggregate_with_ring_cache(
-                all_points,
-                self.terrain_data,
-                terrain_radius,
-                streetview_stat,
-                streetview_percentile,
-                channel="terrain",
-                fold_idx=-1,
-                subset="all",
-            )
-        else:
-            all_terrain = np.zeros(len(all_points), dtype=np.float32)
-
-        if channel_active["ndvi"]:
-            all_ndvi = self._aggregate_with_ring_cache(
-                all_points,
-                self.ndvi_data,
-                ndvi_radius,
-                ndvi_stat,
-                ndvi_percentile,
-                channel="ndvi",
-                fold_idx=-1,
-                subset="all",
-            )
-        else:
-            all_ndvi = np.zeros(len(all_points), dtype=np.float32)
+        # Apply circular buffer aggregation with optimized parameters, over the
+        # job's own channel set — the same fork evaluate_on_test uses, so the
+        # applied composite and the held-out score agree.
+        all_blocks = self._aggregate_channels(all_points, weights, subset="all")
 
         # Per-channel scaling removed — the composite uses raw aggregated
         # channel values.
-        all_combined = np.column_stack([all_veg, all_terrain, all_ndvi])
-        all_veg_norm = all_combined[:, 0]
-        all_terrain_norm = all_combined[:, 1]
-        all_ndvi_norm = all_combined[:, 2]
-        all_veg_norm, all_terrain_norm, all_ndvi_norm = self._normalize_channel_arrays(
-            all_veg_norm, all_terrain_norm, all_ndvi_norm
-        )
-
-        # Calculate composite via the active mode (same fork as _objective /
-        # evaluate_on_test). CGI mode uses the formula; standalone mode takes
-        # the single active channel directly.
-        if channel_mode == "cgi":
-            composite = compute_cgi(
-                self.cgi_formula,
-                weights,
-                {
-                    "veg": all_veg_norm,
-                    "terrain": all_terrain_norm,
-                    "ndvi": all_ndvi_norm,
-                },
-            )
-        else:
-            composite = {
-                "veg": all_veg_norm,
-                "terrain": all_terrain_norm,
-                "ndvi": all_ndvi_norm,
-            }[channel_mode]
+        composite = self._composite_from(weights, self._normalize_channels(all_blocks))
         # Composite-level [0, 1] normalization over the whole grid when the
         # toggle is on (raw otherwise); mirrors the output raster + standalones.
         composite = self._finalize_composite(composite)
 
         result_df = all_data.copy()
-        result_df["veg"] = all_veg
-        result_df["terrain"] = all_terrain
-        result_df["ndvi"] = all_ndvi
+        for ch, values in all_blocks.items():
+            result_df[ch] = values
         result_df["composite"] = composite
 
         # Per-pixel mode: collapse per-pixel rows into one row per entity.
@@ -6366,22 +6420,20 @@ class MetricFusionEngine:
         # optimizer scored against the per-entity outcome.
         if "polygon_id" in result_df.columns:
             catchment_r = _helpers.catchment_radius(
-                veg_radius,
-                terrain_radius,
-                ndvi_radius,
-                self._active_greenery_channel,
+                self._channel_radii(weights), self._active_greenery_channel
             )
             mask = _helpers.entity_collapse_mask(result_df, catchment_r)
             masked_df = result_df if mask is None else result_df[mask]
+            # The channel columns are named by the job's own set, so the
+            # per-polygon means are built from it rather than a fixed triple.
+            aggregations = {ch: (ch, "mean") for ch in all_blocks}
             poly_df = (
                 masked_df.groupby("polygon_id", sort=False)
                 .agg(
                     target=("target", "first"),
-                    veg=("veg", "mean"),
-                    terrain=("terrain", "mean"),
-                    ndvi=("ndvi", "mean"),
                     composite=("composite", "mean"),
                     n_samples=("composite", "count"),
+                    **aggregations,
                 )
                 .reset_index()
             )
@@ -6620,7 +6672,7 @@ class MetricFusionEngine:
         """Objective effect on the held-out test set (headline) + descriptive
         per-subset effects.
 
-        The ``test`` slice is the headline: the stability-selected params never
+        The ``test`` slice is the headline: the discovered params never
         saw it, so it carries the permutation p-value — the honest
         generalizability check. The ``all`` (whole-data) and ``train_val``
         slices are descriptive (CI only, no p-value): the params were tuned on
@@ -7279,19 +7331,17 @@ class MetricFusionEngine:
         params: dict,
         metric: str,
     ) -> dict[str, dict[str, float | None]]:
-        """Score ``params`` on every data slice the stability run produced.
+        """Score ``params`` on every data slice the discovery produced.
 
         Returns a dict of ``{subset: {score, pvalue, n}}`` for the four
-        canonical slices. There is no train→fit→validate step — stability
-        selection resamples the train+val pool into complementary halves — so
-        ``train`` / ``val`` are *labels for continuity*, relabelled in-pool /
-        OOB in the results view:
+        canonical slices. Selection resamples the train+val pool, so ``train``
+        / ``val`` are *labels for continuity*, relabelled in-pool / held-out in
+        the results view:
 
         - ``train`` — the winning params scored on the full train+val pool
-          (an in-pool fit; the pool is what the bootstrap resamples).
-        - ``val`` — the winning cell's **median** out-of-bag score across the
-          complementary-half resamples (``__cell_median__``), a direct measure
-          of cross-resample predictive performance.
+          (an in-pool fit; the pool is what the sweep resamples).
+        - ``val`` — the sweep's mean held-out score for the winning
+          configuration (``__sweep__.score``), a cross-resample measure.
         - ``test`` — fresh test-set score by re-running
           :meth:`evaluate_on_test` with the supplied params.
         - ``all`` — composite applied to every entity (the full dataset)
@@ -7315,7 +7365,7 @@ class MetricFusionEngine:
         )
 
         # In-pool slice: the winning params scored on the full train+val pool
-        # (the closest analogue to "train" — the pool is what the bootstrap
+        # (the closest analogue to "train" — the pool is what the sweep
         # resamples).
         train_val_score = self._score_data_subset(
             data=self.train_val_data, params=params, metric=metric
@@ -7327,15 +7377,11 @@ class MetricFusionEngine:
             "pvalue_raw": train_val_score.get("pvalue_raw"),
             "n": train_val_n,
         }
-        # OOB slice: the winning cell's median out-of-bag score across the
-        # complementary-half resamples, recorded by
-        # ``bootstrap_stability_selection`` under ``__cell_median__`` — a
-        # cross-resample held-out measure. It's computed by ``_objective`` with
-        # covariates configured on the engine (a partial-correlation analogue),
-        # so there's no raw equivalent at this level.
-        cell_median = (
-            params.get("__cell_median__") if isinstance(params, dict) else None
-        )
+        # Held-out slice: the sweep's mean score for the winning configuration
+        # and form, on fresh splits of the pool. Scored on covariate-
+        # residualised rows, so there is no raw equivalent at this level.
+        sweep_info = params.get("__sweep__") if isinstance(params, dict) else None
+        cell_median = (sweep_info or {}).get("score")
         out["val"] = {
             "score": (
                 float(cell_median)
@@ -7893,6 +7939,198 @@ class MetricFusionEngine:
             logger.warning(f"compute_moderation failed: {exc}")
         return out
 
+    def _carry_negative_controls(
+        self, fusion_df: "pd.DataFrame", entity_gdf: "gpd.GeoDataFrame"
+    ) -> None:
+        """Copy the negative-control columns onto a freshly built fusion frame.
+
+        They stay out of every NaN gate, so an entity missing a control is
+        still tuned on; the transfer test drops it from that control alone.
+        """
+        for col in self.negative_control_columns:
+            if col in fusion_df.columns:
+                continue
+            if col not in entity_gdf.columns:
+                _log(
+                    "WARN",
+                    f"Negative control '{col}' is not a target column; " "skipping it.",
+                )
+                continue
+            fusion_df[col] = pd.to_numeric(entity_gdf[col], errors="coerce").values
+
+    def _test_entity_mask(self, df: "pd.DataFrame") -> np.ndarray:
+        """Rows of an ``apply_fusion`` frame that belong to the held-out split."""
+        test = self.test_data
+        if test is None or len(test) == 0:
+            return np.zeros(len(df), dtype=bool)
+        if "polygon_id" in df.columns and "polygon_id" in test.columns:
+            return df["polygon_id"].isin(test["polygon_id"].unique()).to_numpy()
+        return df.index.isin(test.index)
+
+    def compute_negative_controls(
+        self,
+        params: dict,
+        *,
+        metric: str | None = None,
+        n_boot: int = 1000,
+        seed: int = 42,
+        cluster_column: str | None = None,
+    ) -> dict | None:
+        """Frozen-exposure transfer test against each negative-control outcome.
+
+        The composite tuned on train+val is applied unchanged; the controls
+        never entered tuning. On the held-out split (the headline) and on
+        train+val (reference) it reports, for the target and every control,
+        the covariate-adjusted slope in residual SD units with its interval
+        and t, the paired contrast ``|β_target| − |β_control|`` with an
+        ``n_boot`` bootstrap interval, and the ``nonspecific`` flag — see
+        :mod:`geofuse.negative_controls`. With ``metric``, the job's objective
+        is also scored on each outcome. ``cluster_column`` resamples whole
+        areas instead of entities. ``None`` when no controls are configured.
+        """
+        from . import negative_controls as _nc
+
+        if not self.negative_control_columns:
+            return None
+        if self.is_longitudinal:
+            _log(
+                "WARN",
+                "Negative controls are reported for cross-sectional "
+                "targets only; skipped for this longitudinal run.",
+            )
+            return {
+                "skipped": "longitudinal",
+                "controls": list(self.negative_control_columns),
+            }
+        df = self.apply_fusion(weights=dict(params))
+        target = np.asarray(df["target"].values, dtype=np.float64)
+        composite = np.asarray(df["composite"].values, dtype=np.float64)
+        cov = self._reporting_covariate_matrix(df)
+        controls = {}
+        for name in self.negative_control_columns:
+            values = self._reporting_raw_column(df, name)
+            if values is None:
+                _log("WARN", f"Negative control '{name}' not found; skipping.")
+                continue
+            controls[name] = values
+        if not controls:
+            return None
+        clusters = None
+        if cluster_column:
+            full = self._full_data_frame()
+            if full is not None and cluster_column in full.columns:
+                key = "polygon_id" if "polygon_id" in df.columns else None
+                clusters = (
+                    full.groupby(key, sort=False)[cluster_column]
+                    .first()
+                    .reindex(df[key].values)
+                    .to_numpy()
+                    if key
+                    else full[cluster_column].reindex(df.index).to_numpy()
+                )
+
+        def objective(y, x, c):
+            if metric is None:
+                return None
+            keep = self._finite_rows(y, x, c)
+            try:
+                return float(
+                    objective_scoring.score(
+                        metric, y[keep], x[keep], None if c is None else c[keep]
+                    )
+                )
+            except Exception:
+                return None
+
+        test = self._test_entity_mask(df)
+        out: dict = {
+            "controls": list(controls),
+            "n_boot": int(n_boot),
+            "cluster_column": cluster_column if clusters is not None else None,
+            "metric": metric,
+            "splits": {},
+        }
+        for split, mask in (("test", test), ("train_val", ~test)):
+            if int(mask.sum()) < 10:
+                continue
+            c_m = None if cov is None else cov[mask]
+            res = _nc.transfer_test(
+                composite[mask],
+                target[mask],
+                {k: v[mask] for k, v in controls.items()},
+                c_m,
+                n_boot=int(n_boot),
+                seed=int(seed),
+                clusters=None if clusters is None else clusters[mask],
+            )
+            res["target"]["objective"] = objective(target[mask], composite[mask], c_m)
+            for k, v in controls.items():
+                res["controls"][k]["objective"] = objective(
+                    v[mask], composite[mask], c_m
+                )
+            out["splits"][split] = res
+        flagged = [
+            k
+            for k, v in (out["splits"].get("test") or {}).get("controls", {}).items()
+            if v.get("nonspecific")
+        ]
+        out["nonspecific"] = flagged
+        if flagged:
+            _log(
+                "WARN",
+                "Negative control(s) "
+                + ", ".join(f"'{k}'" for k in flagged)
+                + " carry an association indistinguishable from the "
+                "target's on the held-out split: part of the tuned "
+                "association is non-specific.",
+            )
+        return out
+
+    def retune_concordance(
+        self, target_params: dict, metric: str, **fit_kwargs
+    ) -> dict:
+        """Re-tune on each negative control and compare with the target's tuning.
+
+        Each control runs the same sweep and posterior as the target — same
+        protocol, settings and seed, passed in ``fit_kwargs`` — with the
+        reproducibility, gain and null loops skipped because the comparison
+        reads only the posterior. Returns ``{control: concordance}`` (see
+        :func:`geofuse.negative_controls.concordance`). The engine's formula is
+        restored afterwards, so the target study's state is untouched.
+        """
+        from . import negative_controls as _nc
+
+        target_post = (target_params or {}).get("__posterior__") or {}
+        out: dict = {}
+        if not self.negative_control_columns or self.is_longitudinal:
+            return out
+        loops = dict(reps=0, shuffles=0, gain_splits=0, gain_perm=0, null_runs=0)
+        saved_formula = self.cgi_formula
+        for name in self.negative_control_columns:
+            try:
+                params = self.fit_bayesian_index(
+                    metric, outcome=name, **{**fit_kwargs, **loops}
+                )
+            except JobCancelled:
+                raise
+            except Exception as exc:
+                _log("WARN", f"Re-tune on negative control '{name}' failed: {exc}")
+                continue
+            finally:
+                self.cgi_formula = saved_formula
+            out[name] = _nc.concordance(target_post, params.get("__posterior__") or {})
+            same = [
+                ch for ch, row in out[name]["channels"].items() if row.get("same_pick")
+            ]
+            if same:
+                _log(
+                    "WARN",
+                    f"Re-tuning on '{name}' lands on the target's cell for "
+                    f"{', '.join(same)}: the search may be finding the "
+                    "shared confounding.",
+                )
+        return out
+
     def _reporting_raw_column(self, df: "pd.DataFrame", name: str):
         """One un-expanded attribute column aligned to an ``apply_fusion`` frame."""
         full = self._full_data_frame()
@@ -7996,1065 +8234,16 @@ class MetricFusionEngine:
             .to_numpy()
         )
 
-    def bootstrap_stability_selection(
-        self,
-        metric: str,
-        *,
-        n_bootstraps: int = 20,
-        n_trials_per_bootstrap: int = 50,
-        weight_bin_pct: int = cgi_formulas.WEIGHT_BIN_PCT,
-        weight_refine_bin_pct: int | None = None,
-        top_percent_per_bootstrap: float = 0.2,
-        min_cell_count: int = 3,
-        worst_quantile: float = 0.10,
-        max_pfer: float | None = 1.0,
-        radius_bin_m: int | None = None,
-        spatial_resample: bool = False,
-        seed: int = 42,
-        cancel_callback: Callable[..., bool] | None = None,
-        progress_callback: Callable[[int, int], None] | None = None,
-    ) -> dict[str, Any]:
-        """Stability selection via complementary-pairs out-of-bag scoring.
-
-        Adapts Meinshausen & Bühlmann's stability selection (2010) to
-        hyperparameter search, using the complementary-pairs subsampling of
-        Shah & Samworth (2013). The ⌊n/2⌋ subsampling is what the PFER bound
-        assumes; because the candidate set here is the weight cells discovered
-        by the QMC search (not a fixed selector applied identically each
-        resample), the reported PFER is best read as a guide, not a certified
-        bound. Enqueued seed trials are excluded from the selection counts so
-        the calibration frequencies stay unbiased. The
-        procedure draws ``n_bootstraps`` ⌊n/2⌋ subsamples (in complementary
-        pairs), runs a short objective-blind QMC (Sobol) study on each, and
-        rates each parameter region by how well it does **on the held-out OOB
-        rows** of every subsample. The headline robustness metric is the
-        worst-quantile OOB score across all trials that landed in each region
-        — i.e. "how badly can this parameter region perform on a resample of
-        my data?". This is a direct statement about predictive power across
-        samples, not a selection-bias-prone p-value.
-
-        Per subsample:
-
-        1. Split entities (polygons when ``polygon_id`` is present, rows
-           otherwise) into two complementary halves; the in-bag is one half
-           and the OOB is the other (~50 % of entities, genuinely held out).
-        2. Build a fresh in-memory Optuna study with a low-discrepancy QMC
-           (Sobol) sampler (objective-aware samplers are intentionally avoided:
-           stability wants even parameter-space coverage, not depth on this
-           particular subsample). The engine's ``_objective`` already handles
-           in-bag/OOB scaler fitting, channel aggregation, polygon collapse,
-           covariate-aware partial-correlation scoring (cross-sectional), and
-           MixedLM scoring (longitudinal) — so we splice the subsample split
-           into ``self.cv_folds`` and reuse the existing pipeline.
-        3. Record per-trial ``(snapped_params, oob_score)``.
-
-        Across all subsamples:
-
-        * Snap each trial's weights to ``weight_bin_pct``-wide buckets via
-          :func:`cgi_formulas.weight_cell_key`.
-        * Pool OOB scores per cell and rank cells within each resample.
-        * Calibrate the selection size ``K`` and threshold ``π`` (Bodinier
-          et al.) and take the winning cell as the one with the highest
-          selection probability in the calibrated stable set, ties broken by
-          the worst-quantile OOB score (``q_worst = quantile(scores,
-          worst_quantile)`` for higher-is-better metrics; ``quantile(scores,
-          1 - worst_quantile)`` otherwise) subject to ``count >=
-          min_cell_count``.
-        * Within the chosen cell, snap + renormalize the winners' weights to
-          canonical integer steps so the output is drop-in compatible with the
-          composite/apply path.
-
-        Args:
-            metric: Scoring metric (any value supported by ``_objective``).
-            n_bootstraps: Target number of ⌊n/2⌋ subsamples (rounded to an even
-                count of complementary pairs). 20–50 typical.
-            n_trials_per_bootstrap: QMC trials inside each subsample.
-                30–100 typical.
-            weight_bin_pct: Cell width for the first stage's weight binning.
-                20 % gives 21 cells for the weighted-average formula and 56 for
-                synergy; 10 % gives 66 and 286, which is fine enough that
-                selection frequency splits across near-identical neighbours and
-                nothing is ever declared stable.
-            weight_refine_bin_pct: Cell width for the third stage, which re-bins
-                the winning radius sub-cell's trials to pick a narrower weight
-                mix. ``None`` uses ``cgi_formulas.WEIGHT_REFINE_BIN_PCT``; a
-                value at or above ``weight_bin_pct`` disables the stage and
-                averages the coarse cell as before.
-            top_percent_per_bootstrap: Fraction of each bootstrap's trials
-                considered "selected" for the selection-probability sidecar.
-            min_cell_count: A cell is eligible only when at least this many
-                trials landed in it across all bootstraps. Prevents a
-                single-trial outlier cell from claiming "best". Also gates the
-                refinement stage.
-            worst_quantile: 0.10 → 10th percentile worst-case score for
-                higher-is-better metrics; 90th percentile for lower-is-
-                better. Reported on every cell as a robustness read; the
-                **median** is what ranks them, since the question is typical
-                held-out performance rather than worst-case.
-            max_pfer: Upper bound on the (approximate) per-family error rate
-                the calibration is allowed to accept. Configs whose PFER bound
-                ``K² / ((2π−1)·N)`` exceeds this are excluded, capping the
-                selection size K and threshold π so the error control can't go
-                vacuous. ``None`` (or a non-positive value, normalised by the
-                caller) disables the cap.
-            seed: RNG seed for reproducibility.
-            cancel_callback: Bumped from the runner so a user-cancelled job
-                aborts the bootstrap loop cleanly.
-            progress_callback: ``(trials_done, trials_total)`` called after each
-                trial, where the counts span every subsample of this study.
-
-        Selection is two-stage: stage 1 picks the weight cell (channel mix)
-        as above; stage 2 re-bins that cell's trials by a coarse radius key
-        (active channels only, width ``radius_bin_m`` — auto-derived to ~3
-        buckets across the ladder when ``None``) and picks the radius
-        sub-cell with the best q_worst. The final params are averaged within
-        that sub-cell, so the reported radii are a validated configuration
-        rather than a mean across disagreeing trials.
-
-        Returns: a final-params dict (snapped weights, radii, stats) plus
-        bookkeeping keys
-        ``__cell_q_worst__``, ``__cell_count__``, ``__cell_median__``,
-        ``__cell_selection_probability__``, ``__n_bootstraps__``,
-        ``__n_trials_per_bootstrap__``, ``__n_total_trials__``,
-        ``__worst_quantile__``, stage-2 keys ``__radius_cell_q_worst__``,
-        ``__radius_cell_median__``, ``__radius_cell_count__``,
-        ``__radius_bin_m__``, ``__radius_cell_stats__``, and the per-trial
-        ``__trial_history__`` table.
-        """
-        from statistics import mode
-
-        if self.train_val_data is None:
-            raise ValueError(
-                "Call split_data() (or the runner's split stage) before "
-                "bootstrap_stability_selection() — there's no train+val "
-                "pool to resample."
-            )
-
-        # Direction-aware: higher-is-better → q_worst is the lower tail
-        # (e.g. q10), and we pick the cell with the *highest* q_worst.
-        # Lower-is-better (RMSE) inverts both.
-        higher_is_better = metric in objective_scoring.HIGHER_IS_BETTER or (
-            self.is_longitudinal and metric in mixed_effects_scoring.HIGHER_IS_BETTER
-        )
-
-        # Sampling unit. Polygon-mode targets must resample *polygons* —
-        # row-level resampling would split a single polygon's pixels across
-        # in-bag and OOB and produce a leaky OOB set. For row-keyed targets
-        # we fall back to plain row resampling.
-        train_val = self.train_val_data
-        use_groups = "polygon_id" in train_val.columns
-        # Resolve the formula descriptor up front — the per-bootstrap
-        # summary block inside the loop needs ``weight_keys`` to record
-        # the leader's weights, and the cell-stats block after the loop
-        # uses the same descriptor for cell-key decoding.
-        formula = cgi_formulas.get_formula(self.cgi_formula)
-        if use_groups:
-            group_col = "polygon_id"
-            groups = pd.Series(train_val[group_col].unique())
-        else:
-            group_col = None
-            groups = pd.Series(np.arange(len(train_val)))
-
-        # Spatial block resampling: resample whole grid blocks instead of
-        # individual groups so the out-of-bag set is genuinely out-of-region
-        # and the worst-quantile OOB score stops rewarding spatial leakage.
-        # Each block carries all of its groups; degenerate or too-coarse block
-        # layouts fall back to plain group resampling.
-        spatial_resample_ok = (
-            bool(spatial_resample)
-            and use_groups
-            and self._spatial_block_by_group is not None
-            and self._spatial_block_group_col == group_col
-        )
-        blocks = np.empty(0, dtype=np.int64)
-        groups_in_block: dict = {}
-        if spatial_resample_ok:
-            block_of = self._spatial_block_by_group
-            g_arr = groups.to_numpy()
-            block_labels = np.empty(len(g_arr), dtype=np.int64)
-            singleton = -1
-            for i, g in enumerate(g_arr):
-                bk = block_of.get(g)
-                if bk is None:
-                    block_labels[i] = singleton
-                    singleton -= 1
-                else:
-                    block_labels[i] = int(bk)
-            for g, bk in zip(g_arr, block_labels):
-                groups_in_block.setdefault(int(bk), []).append(g)
-            groups_in_block = {
-                bk: np.asarray(gs, dtype=g_arr.dtype)
-                for bk, gs in groups_in_block.items()
-            }
-            blocks = np.asarray(sorted(groups_in_block.keys()), dtype=np.int64)
-            if len(blocks) < 4:
-                spatial_resample_ok = False
-                logger.warning(
-                    "Spatial block resampling requested but only "
-                    f"{len(blocks)} block(s) cover the train+val pool; "
-                    "falling back to group resampling."
-                )
-
-        # Save engine state we're about to splice over. Restored in ``finally``
-        # so a cancelled / failing bootstrap loop never leaves the engine in a
-        # half-mutated state for downstream callers.
-        prev_cv_folds = self.cv_folds
-        prev_study = self.study
-        prev_cancel_cb = getattr(self, "_cancel_callback", None)
-        prev_optuna_verbosity = optuna.logging.get_verbosity()
-        optuna.logging.set_verbosity(optuna.logging.WARNING)
-
-        # The runner passes its own cancellation hook — install it so
-        # ``_objective`` can short-circuit when the user stops the job. We
-        # also poll between bootstraps to abort the whole loop.
-        if cancel_callback is not None:
-            self._cancel_callback = cancel_callback
-
-        # Ring caches are keyed by ``points_gdf.index`` so per-bootstrap
-        # entries don't collide, but they accumulate at ~thousands of arrays
-        # over the loop. Start clean and clear between bootstraps so memory
-        # stays flat regardless of B / N_per_BS choice.
-        self._clear_ring_caches()
-
-        # Group → row positions once, so each bootstrap's in-bag materialisation
-        # is a lookup + one positional take instead of an O(G·N) boolean scan
-        # per group. Positions rather than row copies: the pool is stored once.
-        group_rows: dict = {}
-        if use_groups:
-            _keys = train_val[group_col].to_numpy()
-            _uniq, _inverse = np.unique(_keys, return_inverse=True)
-            _order = np.argsort(_inverse, kind="stable")
-            _bounds = np.searchsorted(_inverse[_order], np.arange(len(_uniq) + 1))
-            for _i, _g in enumerate(_uniq):
-                group_rows[_g] = _order[_bounds[_i] : _bounds[_i + 1]]
-
-        records: list[dict] = []  # one entry per completed trial across all bootstraps
-        per_bootstrap_top_cells: list[set] = []  # selection-probability sidecar
-        per_bootstrap_summary: list[dict] = []  # one row per bootstrap for the UI table
-        # Per-bootstrap diagnostics — used to build a useful error message
-        # when zero trials end up usable so the caller can tell apart
-        # "every resample was degenerate" from "objective returned NaN".
-        diag = {
-            "bootstraps_attempted": 0,
-            "bootstraps_degenerate_split": 0,
-            "bootstraps_zero_completed": 0,
-            "bootstraps_all_nan_scores": 0,
-            "bootstraps_with_records": 0,
-            "trials_complete": 0,
-            "trials_pruned": 0,
-            "trials_failed": 0,
-            "trials_nan_score": 0,
-            "trials_seed_excluded": 0,
-            "trials_kept": 0,
-        }
-        # Search cost, accumulated across the sequential bootstrap loop so the
-        # phase can report its own concurrency at the end.
-        search_secs = 0.0
-        search_trials = 0
-        search_jobs = 1
-
-        try:
-            rng = np.random.default_rng(int(seed))
-            # Complementary-pairs subsampling (Shah & Samworth 2013): each
-            # pair splits the units into halves scored on each other. This is
-            # the ⌊n/2⌋ scheme the Meinshausen–Bühlmann PFER bound assumes.
-            # Spatial resampling splits whole blocks, so each half is
-            # out-of-region.
-            n_pairs = max(1, int(round(int(n_bootstraps) / 2)))
-            subsamples: list[tuple[np.ndarray, np.ndarray]] = []
-            for _pair in range(n_pairs):
-                if spatial_resample_ok:
-                    perm_blocks = rng.permutation(blocks)
-                    cut_b = len(perm_blocks) // 2
-
-                    def _units(bk_arr: np.ndarray) -> np.ndarray:
-                        if len(bk_arr) == 0:
-                            return np.empty(0, dtype=groups.to_numpy().dtype)
-                        return np.unique(
-                            np.concatenate([groups_in_block[int(bk)] for bk in bk_arr])
-                        )
-
-                    half_a = _units(perm_blocks[:cut_b])
-                    half_b = _units(perm_blocks[cut_b:])
-                else:
-                    perm_units = rng.permutation(groups.to_numpy())
-                    cut_u = len(perm_units) // 2
-                    half_a = np.unique(perm_units[:cut_u])
-                    half_b = np.unique(perm_units[cut_u:])
-                subsamples.append((half_a, half_b))
-                subsamples.append((half_b, half_a))
-
-            total_resamples = len(subsamples)
-            total_trials = total_resamples * int(n_trials_per_bootstrap)
-            for b, (in_bag_unique, oob_unique) in enumerate(subsamples):
-                if cancel_callback is not None and cancel_callback():
-                    break
-                # Each subsample has its own index tuples, so cached annuli never
-                # carry over — clear to keep memory flat.
-                self._clear_ring_caches()
-                diag["bootstraps_attempted"] += 1
-                if len(oob_unique) < 3 or len(in_bag_unique) < 3:
-                    # Degenerate half — too few units in-bag or OOB. Skip, but
-                    # advance the trial bar past this subsample's allotment so
-                    # the UI doesn't stall.
-                    diag["bootstraps_degenerate_split"] += 1
-                    if progress_callback is not None:
-                        try:
-                            progress_callback(
-                                (b + 1) * int(n_trials_per_bootstrap), total_trials
-                            )
-                        except Exception:
-                            pass
-                    continue
-
-                if use_groups:
-                    # One positional take per half, preserving the original
-                    # DataFrame index the pre-aggregation cache is keyed by.
-                    # Both halves index the same pooled frame — no per-subsample
-                    # isin scan over the pixel frame and no per-group copies.
-                    in_bag_df = train_val.iloc[
-                        np.concatenate([group_rows[g] for g in in_bag_unique])
-                    ]
-                    oob_df = train_val.iloc[
-                        np.concatenate([group_rows[g] for g in oob_unique])
-                    ]
-                else:
-                    # iloc with an index array materialises a new frame; the
-                    # fold frames are read-only downstream.
-                    in_bag_df = train_val.iloc[in_bag_unique]
-                    oob_df = train_val.iloc[oob_unique]
-
-                # Splice this subsample into ``cv_folds`` — the existing
-                # ``_objective`` reads ``train`` / ``val`` from each fold and
-                # handles aggregation, channel collapse, and OOB scoring.
-                self.cv_folds = [{"train": in_bag_df, "val": oob_df}]
-                self._split_generation += 1
-                # Each resample is a different row set, so its spatial basis is
-                # rebuilt; drop the previous resample's caches to bound memory
-                # (the pdcor / spline caches fingerprint the same row sets).
-                self._spatial_basis_cache = {}
-                self._clear_scoring_caches()
-
-                # Fresh in-memory study with a low-discrepancy QMC (Sobol)
-                # sampler: objective-blind like RandomSampler (so the per-cell
-                # selection frequencies the calibration relies on stay
-                # unbiased), but it fills the high-dimensional CGI search space
-                # far more evenly at the same trial budget. An objective-aware
-                # sampler (TPE / CMA-ES) would concentrate on this resample's
-                # local optimum and inflate the stability counts.
-                import warnings as _warnings
-
-                from optuna.exceptions import ExperimentalWarning as _ExpWarning
-
-                with _warnings.catch_warnings():
-                    _warnings.simplefilter("ignore", _ExpWarning)
-                    study = optuna.create_study(
-                        direction="maximize" if higher_is_better else "minimize",
-                        sampler=optuna.samplers.QMCSampler(
-                            qmc_type="sobol",
-                            scramble=True,
-                            seed=int(seed) + b,
-                            warn_independent_sampling=False,
-                        ),
-                    )
-                self.study = study
-                # Seed each bootstrap with the single-channel vertices + the
-                # centroid so the CGI search always evaluates the configurations
-                # the standalone studies explore (CGI nests every standalone).
-                if self._active_greenery_channel == "cgi":
-                    for seed_params in cgi_formulas.seed_param_sets(
-                        self.cgi_formula, self._disabled_channels
-                    ):
-                        try:
-                            study.enqueue_trial(seed_params, skip_if_exists=True)
-                        except Exception:
-                            pass
-                # Per-trial progress: report the global trial index across all
-                # subsamples so the UI can show a live "k / N trials" bar for
-                # this study.
-                n_trials_b = int(n_trials_per_bootstrap)
-
-                def _trial_progress(_study, _trial, _b=b):
-                    if progress_callback is None:
-                        return
-                    try:
-                        progress_callback(
-                            _b * n_trials_b + _trial.number + 1, total_trials
-                        )
-                    except Exception:
-                        pass
-
-                def _stop_if_cancelled(_study, _trial):
-                    """End this subsample's study as soon as cancel is seen.
-
-                    ``optimize`` is otherwise uninterruptible for the whole
-                    ``n_trials_per_bootstrap`` budget, which is the difference
-                    between a cancel that lands in seconds and one that lands
-                    a bootstrap later.
-                    """
-                    if cancel_callback is not None and cancel_callback():
-                        _study.stop()
-
-                _search_jobs = self._search_n_jobs(metric)
-                _search_t0 = time.perf_counter()
-                try:
-                    study.optimize(
-                        lambda t: self._objective(t, metric),
-                        n_trials=n_trials_b,
-                        n_jobs=_search_jobs,
-                        show_progress_bar=False,
-                        catch=(Exception,),
-                        callbacks=[_trial_progress, _stop_if_cancelled],
-                    )
-                except Exception:
-                    # Catastrophic study failure — skip this subsample and
-                    # continue rather than aborting the whole selection.
-                    continue
-                finally:
-                    search_secs += time.perf_counter() - _search_t0
-                    search_trials += n_trials_b
-                    search_jobs = _search_jobs
-
-                # Extract per-trial (params, val_score). ``_objective`` puts
-                # the mean val score into ``user_attrs["val_score_mean"]`` and
-                # returns the same number as ``trial.value``.
-                for _t in study.trials:
-                    state = _t.state
-                    if state == optuna.trial.TrialState.COMPLETE:
-                        diag["trials_complete"] += 1
-                    elif state == optuna.trial.TrialState.PRUNED:
-                        diag["trials_pruned"] += 1
-                    elif state == optuna.trial.TrialState.FAIL:
-                        diag["trials_failed"] += 1
-                completed = [
-                    t
-                    for t in study.trials
-                    if t.state == optuna.trial.TrialState.COMPLETE
-                ]
-                if not completed:
-                    diag["bootstraps_zero_completed"] += 1
-                    continue
-                bootstrap_records: list[dict] = []
-                for t in completed:
-                    # Enqueued seed trials (single-channel vertices + centroid)
-                    # are non-random, so they'd give their cells a guaranteed
-                    # selection in every resample and bias the calibration.
-                    # Keep them for search coverage; drop them from the counts.
-                    if "fixed_params" in t.system_attrs:
-                        diag["trials_seed_excluded"] += 1
-                        continue
-                    score = t.user_attrs.get("val_score_mean", t.value)
-                    if score is None or not np.isfinite(float(score)):
-                        diag["trials_nan_score"] += 1
-                        continue
-                    diag["trials_kept"] += 1
-                    bootstrap_records.append(
-                        {
-                            "bootstrap": b,
-                            "params": dict(t.params),
-                            "oob_score": float(score),
-                            "cell": cgi_formulas.weight_cell_key(
-                                self.cgi_formula, dict(t.params), weight_bin_pct
-                            ),
-                        }
-                    )
-
-                # Selection-probability sidecar: which cells landed in this
-                # bootstrap's top-X %? Reported alongside q_worst so the user
-                # can sanity-check ("this region won often AND won well").
-                if bootstrap_records:
-                    diag["bootstraps_with_records"] += 1
-                    bootstrap_records.sort(
-                        key=lambda r: r["oob_score"], reverse=higher_is_better
-                    )
-                    n_top = max(
-                        1, int(len(bootstrap_records) * top_percent_per_bootstrap)
-                    )
-                    top_cells = {r["cell"] for r in bootstrap_records[:n_top]}
-                    per_bootstrap_top_cells.append(top_cells)
-                    records.extend(bootstrap_records)
-
-                    # Per-bootstrap row for the UI table: the leader, its
-                    # cell, and the spread of OOB scores within this
-                    # resample. Lets the user see if all bootstraps agree
-                    # on a region or scatter wildly.
-                    top_record = bootstrap_records[0]
-                    all_oob = [r["oob_score"] for r in bootstrap_records]
-                    per_bootstrap_summary.append(
-                        {
-                            "bootstrap": int(b),
-                            "n_trials": int(len(bootstrap_records)),
-                            "top_oob": float(top_record["oob_score"]),
-                            "top_cell": tuple(int(x) for x in top_record["cell"]),
-                            "top_params": {
-                                k: top_record["params"].get(k)
-                                for k in formula.weight_keys
-                                if k in top_record["params"]
-                            },
-                            "mean_oob": float(np.mean(all_oob)),
-                            "median_oob": float(np.median(all_oob)),
-                            "min_oob": float(np.min(all_oob)),
-                            "max_oob": float(np.max(all_oob)),
-                        }
-                    )
-                else:
-                    diag["bootstraps_all_nan_scores"] += 1
-
-        finally:
-            self.cv_folds = prev_cv_folds
-            self.study = prev_study
-            self._cancel_callback = prev_cancel_cb
-            optuna.logging.set_verbosity(prev_optuna_verbosity)
-            # The last resample's cached matrices (up to hundreds of MB for
-            # the pdcor sides) have no future hits — release them now.
-            self._clear_scoring_caches()
-            self._clear_ring_caches()
-            if search_secs > 0 and search_trials:
-                _log(
-                    "INFO",
-                    f"Stability search: {search_trials:,} trial(s) over "
-                    f"{diag['bootstraps_attempted']} sequential bootstrap(s) in "
-                    f"{search_secs:.0f}s "
-                    f"({search_secs / search_trials * 1000:.1f} ms/trial, "
-                    f"n_jobs={search_jobs}).",
-                )
-                # Summed in-objective time across threads: divided by the phase's
-                # wall clock it gives the average number of workers actually
-                # running, which is measured rather than assumed.
-                _log_parallel_efficiency(
-                    _log,
-                    "stability search",
-                    wall_s=search_secs,
-                    busy_s=float(sum(self._objective_secs)),
-                    workers=search_jobs,
-                )
-            self._objective_secs.clear()
-
-        if not records:
-            raise RuntimeError(
-                "bootstrap_stability_selection produced zero usable trials. "
-                "Diagnostics: "
-                f"bootstraps_attempted={diag['bootstraps_attempted']}, "
-                f"degenerate_split={diag['bootstraps_degenerate_split']}, "
-                f"zero_completed={diag['bootstraps_zero_completed']}, "
-                f"all_nan_scores={diag['bootstraps_all_nan_scores']}, "
-                f"with_records={diag['bootstraps_with_records']}, "
-                f"trials_complete={diag['trials_complete']}, "
-                f"trials_pruned={diag['trials_pruned']}, "
-                f"trials_failed={diag['trials_failed']}, "
-                f"trials_nan_score={diag['trials_nan_score']}, "
-                f"trials_kept={diag['trials_kept']}. "
-                "If most trials were pruned → variance-zero composites "
-                "(check that the pre-aggregation cache covers the bootstrap "
-                "entity_ids). If most trials returned NaN → check "
-                "covariate / target NaN coverage on OOB rows."
-            )
-
-        # ── Per-cell aggregation ────────────────────────────
-        from . import statistical_testing as _stats_mod
-
-        cells: dict[tuple, list[dict]] = {}
-        for r in records:
-            cells.setdefault(r["cell"], []).append(r)
-
-        def _q_worst(scores: list[float]) -> float:
-            # Note: a weight cell pools trials across resamples *and* across
-            # radii / aggregation stats, so q_worst mixes resample-luck variance
-            # with within-cell hyperparameter variance. It's a secondary
-            # tie-breaker here; stage-2 re-selects the radii at a fixed cell.
-            if higher_is_better:
-                return float(np.quantile(scores, worst_quantile))
-            return float(np.quantile(scores, 1.0 - worst_quantile))
-
-        # ── Threshold calibration (stage 1: channel mix) ────
-        # Rank cells within each bootstrap by their best out-of-bag score, then
-        # calibrate the selection size K and threshold π by maximizing the
-        # stability score (Bodinier et al.) — no hand-set threshold. The
-        # channel-mix winner is the most consistently top-ranked cell in the
-        # calibrated stable set (a reproducibility statement), with q_worst
-        # kept as a secondary performance diagnostic.
-        by_bootstrap: dict[int, dict[tuple, list[float]]] = {}
-        for r in records:
-            by_bootstrap.setdefault(r["bootstrap"], {}).setdefault(
-                r["cell"], []
-            ).append(r["oob_score"])
-        rankings: list[list[tuple]] = []
-        for _bs, cellmap in by_bootstrap.items():
-            rep = {
-                cell: (max(s) if higher_is_better else min(s))
-                for cell, s in cellmap.items()
-            }
-            rankings.append(sorted(rep, key=lambda c: rep[c], reverse=higher_is_better))
-        n_candidate_cells = len(cells)
-        calib = _stats_mod.calibrate_stability_selection(
-            rankings, n_candidate_cells, max_pfer=max_pfer
-        )
-        n_bs_used = max(1, len(rankings))
-
-        if calib is not None:
-            calib_counts = calib["selection_counts"]
-            calib_b = calib["n_resamples"]
-            sel_prob_of = {c: calib_counts.get(c, 0) / calib_b for c in cells}
-        else:
-            calib_counts = {}
-            sel_prob_of = {
-                c: sum(1 for s in per_bootstrap_top_cells if c in s) / n_bs_used
-                for c in cells
-            }
-
-        cell_stats: list[dict] = []
-        for cell_key, rs in cells.items():
-            scores = [r["oob_score"] for r in rs]
-            cell_stats.append(
-                {
-                    "cell": cell_key,
-                    "count": len(rs),
-                    "q_worst": _q_worst(scores),
-                    "median": float(np.median(scores)),
-                    "selection_probability": float(sel_prob_of.get(cell_key, 0.0)),
-                    "records": rs,
-                }
-            )
-
-        if calib is not None:
-            hi_count = int(np.ceil(calib["pi"] * calib_b))
-            stable_cells = {c for c, h in calib_counts.items() if h >= hi_count}
-            candidates = [c for c in cell_stats if c["cell"] in stable_cells]
-            if not candidates:
-                candidates = cell_stats
-            # Most consistently selected cell; ties broken by the cell's median
-            # OOB score. Median, not the worst quantile: the question this
-            # study asks is which composite predicts better on typical held-out
-            # data, and the worst decile answers a maximin question instead.
-            # It is also count-invariant, so a cell that happened to draw more
-            # trials gets no advantage. ``q_worst`` is still recorded on every
-            # cell and reported as a robustness read.
-            best = max(
-                candidates,
-                key=lambda c: (
-                    c["selection_probability"],
-                    c["median"] if higher_is_better else -c["median"],
-                ),
-            )
-            _log(
-                "INFO",
-                f"Stability calibration: K={calib['K']}, π={calib['pi']:.2f}, "
-                f"score={calib['score']:.1f}, {calib['n_stably_selected']} of "
-                f"{n_candidate_cells} cells stable, PFER≤{calib['pfer']:.2f}; "
-                f"winner selection prob={best['selection_probability']:.2f}.",
-            )
-        else:
-            # Too few candidate cells / resamples to calibrate (e.g. a
-            # standalone's single weight cell) — fall back to the best median
-            # cell.
-            best = max(
-                cell_stats,
-                key=lambda c: c["median"] if higher_is_better else -c["median"],
-            )
-
-        # ── Stage 2: spatial tuning in the winning cell ─────
-        # The weight cell fixes the channel mix; now stability-select the
-        # radii the same way — re-bin the cell's trials by a coarse radius
-        # key (active channels only) and pick the radius sub-cell with the
-        # best q_worst. This stops the final radii from being a mean of
-        # disagreeing values that no trial actually validated.
-        active_ch = getattr(self, "_active_greenery_channel", "cgi") or "cgi"
-        radius_keys: tuple[str, ...] = {
-            "veg": ("veg_radius",),
-            "terrain": ("terrain_radius",),
-            "ndvi": ("ndvi_radius",),
-        }.get(active_ch, ("veg_radius", "terrain_radius", "ndvi_radius"))
-
-        if radius_bin_m is None:
-            # Coarsen to ~3 buckets across the active channels' ladder so the
-            # sub-cells stay populated within one weight cell's trials.
-            gvi_r = self._outer_radii_metres(gvi=True)
-            ndvi_r = self._outer_radii_metres(gvi=False)
-            spans: list[float] = []
-            if active_ch in ("veg", "terrain", "cgi") and gvi_r.size:
-                spans.append(float(gvi_r.max()) - float(gvi_r.min()))
-            if active_ch in ("ndvi", "cgi") and ndvi_r.size:
-                spans.append(float(ndvi_r.max()) - float(ndvi_r.min()))
-            span = max(spans) if spans else 0.0
-            radius_bin_eff = (
-                max(1, int(round(span / 3.0)))
-                if span > 0
-                else int(cgi_formulas.RADIUS_BIN_M)
-            )
-        else:
-            radius_bin_eff = max(1, int(round(float(radius_bin_m))))
-
-        radius_cells: dict[tuple, list[dict]] = {}
-        for r in best["records"]:
-            rk = cgi_formulas.radius_cell_key(
-                r["params"], radius_keys, (), radius_bin_eff
-            )
-            radius_cells.setdefault(rk, []).append(r)
-
-        def _radius_stat(rk: tuple, rs: list[dict]) -> dict:
-            s = [r["oob_score"] for r in rs]
-            return {
-                "cell": rk,
-                "count": len(rs),
-                "q_worst": _q_worst(s),
-                "median": float(np.median(s)),
-                "records": rs,
-            }
-
-        radius_stats = [
-            _radius_stat(rk, rs)
-            for rk, rs in radius_cells.items()
-            if len(rs) >= int(min_cell_count)
-        ]
-        if not radius_stats:
-            # Same fallback as stage 1: no radius sub-cell met the count
-            # threshold, so rank every sub-cell regardless of count.
-            logger.warning(
-                "No radius sub-cell reached min_cell_count="
-                f"{min_cell_count} within the winning weight cell; ranking "
-                "all radius sub-cells regardless of count. Consider raising "
-                "n_trials_per_bootstrap."
-            )
-            radius_stats = [_radius_stat(rk, rs) for rk, rs in radius_cells.items()]
-        radius_best = max(
-            radius_stats,
-            key=lambda c: c["median"] if higher_is_better else -c["median"],
-        )
-
-        # ── Average params in the winning radius sub-cell ───
-        # ── Stage 3: weight refinement at the chosen scale ──
-        # The coarse cell fixed the channel mix and the radius sub-cell fixed
-        # the spatial scale. Both were decided at 20 % weight resolution, so
-        # the surviving trials still disagree about the mix by up to a whole
-        # bucket. Re-bin them at ``weight_refine_bin_pct`` and take the best
-        # fine sub-cell by median, instead of averaging across the coarse cell
-        # and landing on a mix no trial actually validated.
-        #
-        # Ordering matters and is deliberate: mix, then scale, then mix again.
-        # Refining the weights before the radius is settled would tune them
-        # against a spatial scale that is about to change.
-        #
-        # Note the fine keys do not nest inside the coarse ones —
-        # ``_snap_weight_buckets`` rounds to nearest, so the two grids have
-        # unaligned boundaries. That is fine here because the re-binning is
-        # applied to trials that are *already* members of the winning coarse
-        # cell, so the refined set is a subset of them and the averaged weights
-        # stay inside their convex hull. Do not reuse these keys as a
-        # hierarchy elsewhere.
-        refine_bin = int(
-            weight_refine_bin_pct
-            if weight_refine_bin_pct is not None
-            else cgi_formulas.WEIGHT_REFINE_BIN_PCT
-        )
-        winners = radius_best["records"]
-        refine_stats: list[dict] = []
-        if 0 < refine_bin < int(weight_bin_pct):
-            fine_cells: dict[tuple, list[dict]] = {}
-            for r in winners:
-                fk = cgi_formulas.weight_cell_key(
-                    self.cgi_formula, r["params"], refine_bin
-                )
-                fine_cells.setdefault(fk, []).append(r)
-            refine_stats = [
-                {
-                    "cell": fk,
-                    "count": len(rs),
-                    "median": float(np.median([r["oob_score"] for r in rs])),
-                    "q_worst": _q_worst([r["oob_score"] for r in rs]),
-                    "records": rs,
-                }
-                for fk, rs in fine_cells.items()
-            ]
-            # Only accept the refinement when a sub-cell has enough trials to
-            # rank on. Below that its median is a draw-noise artefact and the
-            # coarse cell's average is the safer answer.
-            eligible = [c for c in refine_stats if c["count"] >= int(min_cell_count)]
-            if len(fine_cells) > 1 and eligible:
-                refine_best = max(
-                    eligible,
-                    key=lambda c: c["median"] if higher_is_better else -c["median"],
-                )
-                _log(
-                    "INFO",
-                    f"Weight refinement: {len(fine_cells)} sub-cells at "
-                    f"{refine_bin}% inside the winning {weight_bin_pct}% cell; "
-                    f"kept {refine_best['count']} of {len(winners)} trials "
-                    f"(median {refine_best['median']:.4f} vs "
-                    f"{radius_best['median']:.4f} across the whole cell).",
-                )
-                winners = refine_best["records"]
-            elif len(fine_cells) > 1:
-                _log(
-                    "INFO",
-                    f"Weight refinement skipped: no {refine_bin}% sub-cell "
-                    f"reached min_cell_count={min_cell_count}; averaging the "
-                    f"{len(winners)} trials of the coarse cell instead.",
-                )
-
-        # Snap + renormalize the winners' weights to canonical integer steps so
-        # downstream code (composite generation, apply path) consumes them
-        # directly. ``formula`` was resolved up front (see above).
-
-        def _mode_str(name: str, default: str) -> str:
-            vals = [r["params"].get(name, default) for r in winners]
-            try:
-                return mode(vals)
-            except Exception:
-                return vals[0] if vals else default
-
-        gvi_radii, ndvi_radii = self._preaggr_radii()
-        gvi_choices = np.asarray(gvi_radii) if gvi_radii else None
-        ndvi_choices = np.asarray(ndvi_radii) if ndvi_radii else None
-
-        def _snap(value: float, choices: np.ndarray | None) -> int:
-            if choices is None or len(choices) == 0:
-                return int(round(value))
-            idx = int(np.argmin(np.abs(choices - value)))
-            return int(choices[idx])
-
-        pct_grid = np.asarray(preaggregation.PERCENTILES)
-
-        def _snap_pct(value: float) -> int:
-            idx = int(np.argmin(np.abs(pct_grid - value)))
-            return int(pct_grid[idx])
-
-        final_params: dict[str, Any] = {
-            "veg_radius": _snap(
-                float(
-                    np.mean(
-                        [
-                            r["params"].get("veg_radius", self.gvi_buffer_max_m)
-                            for r in winners
-                        ]
-                    )
-                ),
-                gvi_choices,
-            ),
-            "terrain_radius": _snap(
-                float(
-                    np.mean(
-                        [
-                            r["params"].get("terrain_radius", self.gvi_buffer_max_m)
-                            for r in winners
-                        ]
-                    )
-                ),
-                gvi_choices,
-            ),
-            "ndvi_radius": _snap(
-                float(
-                    np.mean(
-                        [
-                            r["params"].get("ndvi_radius", self.ndvi_buffer_max_m)
-                            for r in winners
-                        ]
-                    )
-                ),
-                ndvi_choices,
-            ),
-            "streetview_stat": _mode_str("streetview_stat", "mean"),
-            "ndvi_stat": _mode_str("ndvi_stat", "mean"),
-            "streetview_percentile": _snap_pct(
-                float(
-                    np.mean(
-                        [r["params"].get("streetview_percentile", 50) for r in winners]
-                    )
-                )
-            ),
-            "ndvi_percentile": _snap_pct(
-                float(
-                    np.mean([r["params"].get("ndvi_percentile", 50) for r in winners])
-                )
-            ),
-        }
-        for power_key in formula.power_keys:
-            final_params[power_key] = float(
-                np.mean([r["params"].get(power_key, 1.0) for r in winners])
-            )
-        avg_weights = {
-            k: float(np.mean([r["params"].get(k, 0.0) for r in winners]))
-            for k in formula.weight_keys
-        }
-        weight_sum = sum(avg_weights.values())
-        if weight_sum > 0:
-            # Renormalize to sum=100 on the 5% recorded grid. Snap to 5% steps
-            # via largest-remainder so the downstream apply path sees
-            # canonical integer weights compatible with the picker's output.
-            step = cgi_formulas.WEIGHT_STEP_PCT
-            n_slots = 100 // step
-            scaled = [avg_weights[k] / weight_sum * (100.0 / step) for k in avg_weights]
-            floors = [int(np.floor(s)) for s in scaled]
-            remainder = n_slots - sum(floors)
-            if remainder > 0:
-                order = sorted(
-                    range(len(scaled)),
-                    key=lambda i: scaled[i] - floors[i],
-                    reverse=True,
-                )
-                for i in order[:remainder]:
-                    floors[i] += 1
-            for k, slots in zip(list(avg_weights), floors):
-                final_params[k] = int(slots) * step
-        else:
-            for k in avg_weights:
-                final_params[k] = 0
-            # Standalone fallback — keep the active channel at 100 % so the
-            # composite generator can still build a meaningful raster.
-            ch = getattr(self, "_active_greenery_channel", "cgi") or "cgi"
-            channel_to_keys = {
-                "veg": ("veg_weight", "w_veg"),
-                "terrain": ("terrain_weight", "w_ter"),
-                "ndvi": ("ndvi_weight", "w_ndvi"),
-            }
-            for candidate in channel_to_keys.get(ch, ()):
-                if candidate in avg_weights:
-                    final_params[candidate] = 100
-                    break
-
-        final_params["__cell_q_worst__"] = float(best["q_worst"])
-        final_params["__cell_count__"] = int(best["count"])
-        final_params["__cell_median__"] = float(best["median"])
-        final_params["__weight_bin_pct__"] = int(weight_bin_pct)
-        final_params["__weight_refine_bin_pct__"] = int(refine_bin)
-        final_params["__refine_cell_count__"] = int(len(winners))
-        final_params["__refine_applied__"] = bool(
-            refine_stats and len(winners) < len(radius_best["records"])
-        )
-        final_params["__cell_selection_probability__"] = float(
-            best["selection_probability"]
-        )
-        final_params["__n_bootstraps__"] = int(n_bs_used)
-        final_params["__n_trials_per_bootstrap__"] = int(n_trials_per_bootstrap)
-        final_params["__n_total_trials__"] = int(len(records))
-        final_params["__worst_quantile__"] = float(worst_quantile)
-        # Automated threshold calibration (Bodinier) diagnostics: the
-        # calibrated selection size K, threshold π, stability score, stable-set
-        # size, candidate count, and the PFER upper bound (rigorous under the
-        # ⌊n/2⌋ complementary-pairs subsampling). Absent when calibration was
-        # skipped.
-        if calib is not None:
-            final_params["__stability_score__"] = float(calib["score"])
-            final_params["__selection_threshold__"] = float(calib["pi"])
-            final_params["__selection_size_k__"] = int(calib["K"])
-            final_params["__n_candidate_cells__"] = int(calib["n_candidates"])
-            final_params["__n_stably_selected__"] = int(calib["n_stably_selected"])
-            final_params["__pfer__"] = float(calib["pfer"])
-            final_params["__pfer_controlled__"] = bool(
-                calib.get("pfer_controlled", True)
-            )
-        # Stage-2 (radius sub-cell) diagnostics: the spatial-tuning winner
-        # within the chosen weight cell. ``__cell_*__`` above describe the
-        # channel-mix decision; these describe the radii the final params
-        # were actually averaged from.
-        final_params["__radius_cell_count__"] = int(radius_best["count"])
-        final_params["__radius_cell_q_worst__"] = float(radius_best["q_worst"])
-        final_params["__radius_cell_median__"] = float(radius_best["median"])
-        final_params["__radius_bin_m__"] = int(radius_bin_eff)
-        ranked_radius = sorted(
-            radius_stats,
-            key=lambda c: c["q_worst"] if higher_is_better else -c["q_worst"],
-            reverse=True,
-        )
-        final_params["__radius_cell_stats__"] = [
-            {
-                "radii": {
-                    radius_keys[i]: int(c["cell"][i] * radius_bin_eff)
-                    for i in range(len(radius_keys))
-                },
-                "count": int(c["count"]),
-                "q_worst": float(c["q_worst"]),
-                "median": float(c["median"]),
-            }
-            for c in ranked_radius[:10]
-        ]
-        # Diagnostics for the results UI, under ``__`` keys so the "Final
-        # params" panel strips them out. The cell keys on the main-component
-        # weights only, so map the tuple back through those keys.
-        cell_weight_keys = formula.main_weight_keys
-        # Rank the diagnostics table by the decision criterion — calibrated
-        # selection probability, with worst-quantile OOB breaking ties — so the
-        # top row is the chosen winner; median is shown alongside as a
-        # diagnostic.
-        ranked = sorted(
-            cell_stats,
-            key=lambda c: (
-                c["selection_probability"],
-                c["q_worst"] if higher_is_better else -c["q_worst"],
-            ),
-            reverse=True,
-        )
-        final_params["__cell_stats__"] = [
-            {
-                "weights": {
-                    k: int(c["cell"][i] * weight_bin_pct)
-                    for i, k in enumerate(cell_weight_keys)
-                },
-                "count": int(c["count"]),
-                "q_worst": float(c["q_worst"]),
-                "median": float(c["median"]),
-                "selection_probability": float(c["selection_probability"]),
-            }
-            for c in ranked[:10]
-        ]
-        final_params["__winning_cell_oob_scores__"] = [
-            float(r["oob_score"]) for r in best["records"]
-        ]
-        final_params["__per_bootstrap_summary__"] = per_bootstrap_summary
-        final_params["__higher_is_better__"] = bool(higher_is_better)
-
-        # Per-trial history: every completed trial across all subsamples, with
-        # its resample id, OOB score, snapped weight cell, flattened weights /
-        # radii, and whether the trial's cell was in that resample's calibrated
-        # top-K. This is the stability-selection analogue of an Optuna trial
-        # log — a tidy table the results UI renders (OOB spread per resample,
-        # cell-selection frequency, weight×score) and the MixedLM post-scoring
-        # re-scores from. Cells are stored as lists so the bundle stays
-        # JSON-serializable.
-        k_for_top = int(calib["K"]) if calib is not None else None
-        top_cells_by_bs: dict[int, set] = {}
-        for bs, cellmap in by_bootstrap.items():
-            rep = {
-                cell: (max(s) if higher_is_better else min(s))
-                for cell, s in cellmap.items()
-            }
-            order = sorted(rep, key=lambda c: rep[c], reverse=higher_is_better)
-            k = (
-                k_for_top
-                if k_for_top is not None
-                else max(1, int(len(order) * top_percent_per_bootstrap))
-            )
-            top_cells_by_bs[bs] = set(order[:k])
-        trial_history: list[dict] = []
-        for r in records:
-            row: dict[str, Any] = {
-                "bootstrap": int(r["bootstrap"]),
-                "oob_score": float(r["oob_score"]),
-                "cell": [int(x) for x in r["cell"]],
-                "in_top_k": bool(
-                    r["cell"] in top_cells_by_bs.get(r["bootstrap"], set())
-                ),
-            }
-            # Full per-trial params (weights, radii, stats, percentiles,
-            # powers) so the history both drives the UI panels and can be
-            # re-scored by the MixedLM post-scoring without re-running the
-            # search.
-            for pk, pv in r["params"].items():
-                row[pk] = pv
-            trial_history.append(row)
-        final_params["__trial_history__"] = trial_history
-        final_params["__winning_cell__"] = [int(x) for x in best["cell"]]
-        return final_params
-
     def generate_composite_greenery_map(
         self,
         output_path: str = "output_results/composite_greenery.tif",
         progress_callback: Callable[..., Any] | None = None,
     ) -> str:
-        """Render the composite greenery map from the stability-selected params.
+        """Render the composite greenery map from the discovered params.
 
         Builds a composite greenery raster matching the target grid (if raster
         input) or the CGI grid (if vector input) using the winning weight cell's
-        averaged parameters that ``bootstrap_stability_selection`` pinned on
+        averaged parameters that ``fit_bayesian_index`` pinned on
         ``self.best_params``.
 
         Args:
@@ -9064,9 +8253,7 @@ class MetricFusionEngine:
         Returns:
             Path to the saved composite greenery map
         """
-        logger.info(
-            "Generating composite greenery map from stability-selected params..."
-        )
+        logger.info("Generating composite greenery map from discovered params...")
 
         if progress_callback:
             progress_callback(0, 100)
@@ -9074,10 +8261,10 @@ class MetricFusionEngine:
         if self.best_params is None:
             raise ValueError(
                 "Composite generation needs ``self.best_params`` set by a prior "
-                "stability-selection step."
+                "discovery step."
             )
         final_params = dict(self.best_params)
-        logger.info(f"Composite TIFF stability-selected params: {final_params}")
+        logger.info(f"Composite TIFF discovered params: {final_params}")
         formula = cgi_formulas.get_formula(self.cgi_formula)
 
         if progress_callback:
@@ -9224,50 +8411,23 @@ class MetricFusionEngine:
             progress_callback(40, 100)
 
         # 5. Sample metrics at grid points using final parameters
-        logger.info("Sampling vegetation at grid points...")
-        veg_values = self._aggregate_with_ring_cache(
-            points_gdf,
-            self.veg_data,
-            final_params["veg_radius"],
-            final_params["streetview_stat"],
-            final_params["streetview_percentile"],
-            channel="veg",
-            fold_idx=-1,
-            subset="robust_map",
-        )
-
-        if progress_callback:
-            progress_callback(55, 100)
-
-        logger.info("Sampling terrain at grid points...")
-        terrain_values = self._aggregate_with_ring_cache(
-            points_gdf,
-            self.terrain_data,
-            final_params["terrain_radius"],
-            final_params["streetview_stat"],
-            final_params["streetview_percentile"],
-            channel="terrain",
-            fold_idx=-1,
-            subset="robust_map",
-        )
-
-        if progress_callback:
-            progress_callback(70, 100)
-
-        logger.info("Sampling NDVI at grid points...")
-        ndvi_values = self._aggregate_with_ring_cache(
-            points_gdf,
-            self.ndvi_data,
-            final_params["ndvi_radius"],
-            final_params["ndvi_stat"],
-            final_params["ndvi_percentile"],
-            channel="ndvi",
-            fold_idx=-1,
-            subset="robust_map",
-        )
-
-        if progress_callback:
-            progress_callback(85, 100)
+        channels = self._composite_channels()
+        blocks: dict[str, np.ndarray] = {}
+        for n, ch in enumerate(channels):
+            logger.info(f"Sampling {ch} at grid points...")
+            radius, stat, pct = self._channel_spec(final_params, ch)
+            blocks[ch] = self._aggregate_with_ring_cache(
+                points_gdf,
+                self._channel_source(ch),
+                radius,
+                stat,
+                pct,
+                channel=ch,
+                fold_idx=-1,
+                subset="robust_map",
+            )
+            if progress_callback:
+                progress_callback(40 + int(45 * (n + 1) / len(channels)), 100)
 
         # Compute the composite from RAW channels (no per-channel scaling),
         # then apply the ``whole_grid_scaling`` toggle: min-max normalise to
@@ -9275,18 +8435,7 @@ class MetricFusionEngine:
         # treatment the scorer applied, mirrored for standalone single-channel
         # maps.
         logger.info(f"Calculating composite via formula '{formula.name}'...")
-        veg_values, terrain_values, ndvi_values = self._normalize_channel_arrays(
-            veg_values, terrain_values, ndvi_values
-        )
-        composite = compute_cgi(
-            self.cgi_formula,
-            final_params,
-            {
-                "veg": veg_values,
-                "terrain": terrain_values,
-                "ndvi": ndvi_values,
-            },
-        )
+        composite = self._composite_from(final_params, self._normalize_channels(blocks))
         composite = self._finalize_composite(np.asarray(composite, dtype=np.float64))
 
         # 7. Create raster
@@ -9367,22 +8516,16 @@ class MetricFusionEngine:
 
         clean_params = {k: v for k, v in final_params.items() if not k.startswith("__")}
         provenance = {
-            "selection_method": "bootstrap_stability_selection",
+            "selection_method": "bayesian_index",
             # Grid geometry, so a viewer can size its read before opening the
             # file. A catchment grid over distant clusters is mostly nodata.
             "raster_width": int(width),
             "raster_height": int(height),
             "raster_valid_cells": int(len(vals_arr)),
-            "cell_q_worst": final_params.get("__cell_q_worst__"),
-            "cell_median": final_params.get("__cell_median__"),
-            "cell_count": final_params.get("__cell_count__"),
-            "cell_selection_probability": final_params.get(
-                "__cell_selection_probability__"
-            ),
-            "worst_quantile": final_params.get("__worst_quantile__"),
-            "n_bootstraps": final_params.get("__n_bootstraps__"),
-            "n_trials_per_bootstrap": final_params.get("__n_trials_per_bootstrap__"),
-            "n_total_trials": final_params.get("__n_total_trials__"),
+            "sweep": final_params.get("__sweep__"),
+            "posterior": final_params.get("__posterior__"),
+            "holdout_gain": final_params.get("__holdout_gain__"),
+            "null_calibration": final_params.get("__null_calibration__"),
         }
         with open(params_path, "w") as f:
             json.dump(
