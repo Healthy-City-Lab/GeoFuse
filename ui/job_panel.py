@@ -210,6 +210,13 @@ def _render_details(rec) -> None:
         st.write(f"**Cloud max:** {p.get('cloud_pct', '?')}%")
         st.write(f"**Resolution:** {p.get('resolution', '?')} m")
         st.write(f"**Buffer:** {p.get('buffer_m', '?')} m")
+        stats = ", ".join(p.get("temporal_reducers") or ["median"])
+        st.write(f"**Temporal statistic:** {stats}")
+        rescue = "on" if p.get("coverage_rescue", True) else "off"
+        st.write(
+            f"**Satellite:** {p.get('satellite', 'auto')} · "
+            f"**Coverage rescue:** {rescue}"
+        )
         st.write(
             f"**Outputs:** GeoTIFF={bool(p.get('save_geotiff'))} · "
             f"GeoPackage={bool(p.get('save_gpkg'))} · "

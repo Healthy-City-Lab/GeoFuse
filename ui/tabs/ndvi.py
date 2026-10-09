@@ -34,6 +34,7 @@ from geofuse.crs_utils import (
     metres_per_degree_at_lat,
     reproject_geodataframe_to_wgs84,
 )
+from geofuse.ndvi import TEMPORAL_REDUCERS
 from geofuse.vector_io import geometry_sha256
 
 _MONTH_NAMES = [
@@ -50,6 +51,55 @@ _MONTH_NAMES = [
     "November",
     "December",
 ]
+
+_STAT_LABELS = {"median": "Median", "mean": "Mean", "max": "Maximum"}
+_STAT_HELP = (
+    "How each pixel's value is drawn from the cloud-free images in the "
+    "window. Median (default) resists leftover cloud and shadow, mean "
+    "averages every clear image, and maximum keeps the greenest. Each "
+    "statistic writes its own files (`_mean_ndvi`, `_max_ndvi`; median keeps "
+    "the plain name), and one download per tile serves all of them."
+)
+_SATELLITE_LABELS = {
+    "auto": "Auto (Sentinel-2 from 2017-03-28)",
+    "sentinel2": "Sentinel-2",
+    "landsat": "Landsat (5 / 7 / 8 / 9)",
+}
+
+
+def _job_options(p: dict) -> dict:
+    """Download options recorded on an NDVI job, with the defaults for jobs
+    recorded before they existed."""
+    return {
+        "temporal_reducers": list(p.get("temporal_reducers") or ["median"]),
+        "satellite": str(p.get("satellite", "auto")),
+        "coverage_rescue": bool(p.get("coverage_rescue", True)),
+    }
+
+
+def _job_options_line(p: dict) -> str:
+    o = _job_options(p)
+    stats = ", ".join(_STAT_LABELS.get(r, r) for r in o["temporal_reducers"])
+    rescue = "on" if o["coverage_rescue"] else "off"
+    return (
+        f"**Temporal statistic:** {stats} · "
+        f"**Satellite:** {_SATELLITE_LABELS.get(o['satellite'], o['satellite'])} · "
+        f"**Coverage rescue:** {rescue}"
+    )
+
+
+def _render_stat_select(cfg: dict, cfg_key: str, key: str) -> None:
+    """Temporal-statistic picker for one date mode of one dataset."""
+    cfg[cfg_key] = st.multiselect(
+        "Temporal statistic",
+        list(TEMPORAL_REDUCERS),
+        default=cfg.get(cfg_key, ["median"]),
+        format_func=lambda r: _STAT_LABELS.get(r, r),
+        key=key,
+        help=_STAT_HELP,
+    )
+    if not cfg[cfg_key]:
+        st.warning("Select at least one temporal statistic.")
 
 
 def _ndvi_input_datasets() -> dict:
@@ -207,6 +257,7 @@ def _ndvi_restart_summary_lines(p: dict) -> list[str]:
         f"**Resolution:** {p.get('resolution', '?')} m · "
         f"**Buffer:** {p.get('buffer_m', '?')} m"
     )
+    lines.append(_job_options_line(p))
     lines.append(
         f"**Outputs:** GeoTIFF={bool(p.get('save_geotiff'))} · "
         f"GeoPackage={bool(p.get('save_gpkg'))} · "
@@ -227,6 +278,7 @@ def _ndvi_resubmit_from_params(store, executor, output_dir, rec_id, p, raw):
     save_gp = bool(p.get("save_gpkg"))
     save_gj = bool(p.get("save_geojson"))
     save_ct = bool(p.get("save_cluster_tiles"))
+    options = _job_options(p)
 
     new_params = dict(p)
     new_params["geometry_sha256"] = geometry_sha256(raw)
@@ -253,6 +305,7 @@ def _ndvi_resubmit_from_params(store, executor, output_dir, rec_id, p, raw):
             save_gpkg=save_gp,
             save_geojson=save_gj,
             save_cluster_tiles=save_ct,
+            **options,
         )
     else:
         if p.get("mode") == "specific":
@@ -279,6 +332,7 @@ def _ndvi_resubmit_from_params(store, executor, output_dir, rec_id, p, raw):
             save_gpkg=save_gp,
             save_geojson=save_gj,
             save_cluster_tiles=save_ct,
+            **options,
         )
     return record
 
@@ -444,6 +498,7 @@ def _render_ndvi_restart_panel(store, executor, output_dir) -> None:
             "save_geotiff": bool(p.get("save_geotiff", True)),
             "save_geojson": bool(p.get("save_geojson", False)),
             "save_gpkg": bool(p.get("save_gpkg", False)),
+            **_job_options(p),
         }
 
         if rec.type == "ndvi":
@@ -571,6 +626,26 @@ def _render_ndvi_settings_map() -> None:
                 key="ndvi_buffer",
                 help="Expand the study area outward by this distance (metres) before download.",
             )
+            st.selectbox(
+                "Satellite",
+                list(_SATELLITE_LABELS),
+                format_func=_SATELLITE_LABELS.get,
+                key="ndvi_satellite",
+                help=(
+                    "Auto uses Sentinel-2 for windows ending on or after "
+                    "2017-03-28 and Landsat before. Pick one sensor to keep a "
+                    "multi-year series on one instrument."
+                ),
+            )
+            st.checkbox(
+                "Coverage rescue",
+                value=True,
+                key="ndvi_coverage_rescue",
+                help=(
+                    "Widen a window by ±50 % once when fewer than 3 cloud-free "
+                    "images remain. Turn off for year-matched composites."
+                ),
+            )
     with fc_ndvi_r:
         st.subheader("Study Area Preview")
         m_ndvi_input = folium.Map(location=[51.0447, -114.0719], zoom_start=10)
@@ -640,6 +715,9 @@ def _render_ndvi_date_config() -> None:
                     "window_days_specific": 30,
                     "season_start_month": 6,
                     "season_end_month": 9,
+                    "stats_ranges": ["median"],
+                    "stats_specific": ["median"],
+                    "stats_column": ["median"],
                 }
             cfg = st.session_state.ndvi_date_configs[fname]
             # Migrate old single-mode format
@@ -683,6 +761,9 @@ def _render_ndvi_date_config() -> None:
                 # ── Date Range(s) ───────────────────
                 if use_ranges:
                     st.markdown("**Date Range(s)**")
+                    _render_stat_select(
+                        cfg, "stats_ranges", f"ndvi_stats_ranges_{fname}"
+                    )
                     remove_idx = None
                     for i, (s, e) in enumerate(cfg["ranges"]):
                         stored_s = st.session_state.get(f"ndvi_rs_{fname}_{i}", s)
@@ -750,6 +831,9 @@ def _render_ndvi_date_config() -> None:
                     if use_ranges:
                         st.divider()
                     st.markdown("**Specific Date(s)**")
+                    _render_stat_select(
+                        cfg, "stats_specific", f"ndvi_stats_specific_{fname}"
+                    )
                     cfg["window_days_specific"] = st.number_input(
                         "Composite window (± days)",
                         min_value=7,
@@ -794,6 +878,9 @@ def _render_ndvi_date_config() -> None:
                     if use_ranges or use_specific:
                         st.divider()
                     st.markdown("**Attribute Column (per-year)**")
+                    _render_stat_select(
+                        cfg, "stats_column", f"ndvi_stats_col_{fname}"
+                    )
                     attr_cols = [c for c in d["raw"].columns if c.lower() != "geometry"]
                     if attr_cols:
                         selected_col = st.selectbox(
@@ -996,6 +1083,8 @@ def render(output_dir: str) -> None:
     cloud_pct = int(st.session_state.get("ndvi_cloud", 10))
     resolution = int(st.session_state.get("ndvi_res", 10))
     buffer_m = int(st.session_state.get("ndvi_buffer", 0))
+    satellite = str(st.session_state.get("ndvi_satellite", "auto"))
+    coverage_rescue = bool(st.session_state.get("ndvi_coverage_rescue", True))
     ndvi_out_ok = (
         st.session_state.get("ndvi_out_geotiff", True)
         or st.session_state.get("ndvi_out_gpkg", False)
@@ -1023,6 +1112,17 @@ def render(output_dir: str) -> None:
             # basename -> absolute path map so each submitted job records its
             # study-area location for silent-restart.
             ndvi_path_by_basename = {os.path.basename(p): p for p in ndvi_valid_paths}
+
+            def _options(fname: str, cfg: dict, mode_key: str, cfg_key: str) -> dict:
+                """Download options for one date mode of one dataset."""
+                stats = st.session_state.get(
+                    f"ndvi_stats_{mode_key}_{fname}", cfg.get(cfg_key, ["median"])
+                )
+                return {
+                    "temporal_reducers": list(stats),
+                    "satellite": satellite,
+                    "coverage_rescue": coverage_rescue,
+                }
 
             for unit in _ndvi_units():
                 fname = unit["key"]
@@ -1067,8 +1167,16 @@ def render(output_dir: str) -> None:
 
                 # --- Date Range jobs ---
                 if use_ranges:
+                    range_options = _options(fname, cfg, "ranges", "stats_ranges")
+                    if not range_options["temporal_reducers"]:
+                        validation_errors.append(
+                            f"{fname}: Date range(s) — select at least one "
+                            "temporal statistic."
+                        )
                     for i, (s_def, e_def) in enumerate(
                         cfg.get("ranges", [(date(2023, 6, 1), date(2023, 9, 30))])
+                        if range_options["temporal_reducers"]
+                        else []
                     ):
                         start_d = st.session_state.get(f"ndvi_rs_{fname}_{i}", s_def)
                         end_d = st.session_state.get(f"ndvi_re_{fname}_{i}", e_def)
@@ -1102,6 +1210,7 @@ def render(output_dir: str) -> None:
                                 "save_geojson": save_gj,
                                 "save_cluster_tiles": save_ct,
                                 "geometry_sha256": geometry_sha256(d["raw"]),
+                                **range_options,
                                 **merge_params,
                             },
                         )
@@ -1120,17 +1229,26 @@ def render(output_dir: str) -> None:
                             save_gpkg=save_gp,
                             save_geojson=save_gj,
                             save_cluster_tiles=save_ct,
+                            **range_options,
                         )
                         jobs_started += 1
 
                 # --- Specific Date jobs ---
                 if use_specific:
+                    specific_options = _options(fname, cfg, "specific", "stats_specific")
+                    if not specific_options["temporal_reducers"]:
+                        validation_errors.append(
+                            f"{fname}: Specific date(s) — select at least one "
+                            "temporal statistic."
+                        )
                     window_days = st.session_state.get(
                         f"ndvi_win_s_{fname}",
                         cfg.get("window_days_specific", 30),
                     )
                     for i, d_def in enumerate(
                         cfg.get("specific_dates", [date(2023, 7, 15)])
+                        if specific_options["temporal_reducers"]
+                        else []
                     ):
                         target_date = st.session_state.get(
                             f"ndvi_sd_{fname}_{i}", d_def
@@ -1160,6 +1278,7 @@ def render(output_dir: str) -> None:
                                 "save_geojson": save_gj,
                                 "save_cluster_tiles": save_ct,
                                 "geometry_sha256": geometry_sha256(d["raw"]),
+                                **specific_options,
                                 **merge_params,
                             },
                         )
@@ -1178,11 +1297,13 @@ def render(output_dir: str) -> None:
                             save_gpkg=save_gp,
                             save_geojson=save_gj,
                             save_cluster_tiles=save_ct,
+                            **specific_options,
                         )
                         jobs_started += 1
 
                 # --- Attribute Column (per-year) job ---
                 if use_column:
+                    column_options = _options(fname, cfg, "col", "stats_column")
                     date_col = st.session_state.get(f"ndvi_col_{fname}")
                     season_start = int(
                         st.session_state.get(
@@ -1201,6 +1322,11 @@ def render(output_dir: str) -> None:
                         validation_errors.append(
                             f"{fname}: Season start month must be on or before "
                             "the end month."
+                        )
+                    elif not column_options["temporal_reducers"]:
+                        validation_errors.append(
+                            f"{fname}: Attribute column — select at least one "
+                            "temporal statistic."
                         )
                     else:
                         record = store.submit(
@@ -1222,6 +1348,7 @@ def render(output_dir: str) -> None:
                                 "save_geojson": save_gj,
                                 "save_cluster_tiles": save_ct,
                                 "geometry_sha256": geometry_sha256(d["raw"]),
+                                **column_options,
                                 **merge_params,
                             },
                         )
@@ -1240,6 +1367,7 @@ def render(output_dir: str) -> None:
                             save_gpkg=save_gp,
                             save_geojson=save_gj,
                             save_cluster_tiles=save_ct,
+                            **column_options,
                         )
                         jobs_started += 1
 
