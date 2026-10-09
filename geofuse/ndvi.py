@@ -6,7 +6,7 @@ import logging
 import os
 import traceback
 import zipfile
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
@@ -69,6 +69,70 @@ _EE_TOO_LARGE_MARKERS = (
     "request payload size exceeds",
     "computed value is too large",
 )
+
+
+# ────────────────────────────────────────────────────────────────────
+# Temporal statistics
+# ────────────────────────────────────────────────────────────────────
+
+#: Statistics a composite can take, per pixel, over the cloud-free images in
+#: its date window. ``median`` is the default and keeps the historical file
+#: names and resume keys; every other statistic adds its name to both.
+TEMPORAL_REDUCERS = ("median", "mean", "max")
+
+
+def normalize_temporal_reducers(
+    value: str | Iterable[str] = "median",
+) -> tuple[str, ...]:
+    """Validated statistics in :data:`TEMPORAL_REDUCERS` order, deduplicated."""
+    names = [value] if isinstance(value, str) else list(value)
+    chosen = {str(v).strip().lower() for v in names}
+    unknown = sorted(chosen - set(TEMPORAL_REDUCERS))
+    if unknown:
+        raise ValueError(
+            f"Unknown temporal statistic(s) {unknown}; "
+            f"choose from {list(TEMPORAL_REDUCERS)}."
+        )
+    if not chosen:
+        raise ValueError("Choose at least one temporal statistic.")
+    return tuple(r for r in TEMPORAL_REDUCERS if r in chosen)
+
+
+def ndvi_output_name(output_name: str, reducer: str) -> str:
+    """Base name of one statistic's files: ``median`` keeps ``output_name``,
+    any other statistic appends ``_<reducer>`` (``{name}_max_ndvi.tif``)."""
+    return output_name if reducer == "median" else f"{output_name}_{reducer}"
+
+
+def _stack_composites(composites: Mapping[str, Any], reducers: list[str]):
+    """One image carrying ``reducers`` as bands, in order, for a single export."""
+    if len(reducers) == 1:
+        return composites[reducers[0]]
+    return ee.Image.cat([composites[r].rename(r) for r in reducers])
+
+
+def _combine_reducer_results(results: Mapping[str, dict]) -> dict:
+    """The first statistic's result, with every statistic's under ``reducers``.
+
+    ``status`` stays ``"success"`` only when every statistic succeeded; a
+    cancellation wins over a failure, and a failure's message names the
+    statistics that failed.
+    """
+    reducers = list(results)
+    combined = dict(results[reducers[0]])
+    combined["reducers"] = {r: dict(results[r]) for r in reducers}
+    bad = [r for r in reducers if results[r].get("status") != "success"]
+    if not bad:
+        return combined
+    if any(results[r].get("status") == "cancelled" for r in bad):
+        combined["status"] = "cancelled"
+        combined["message"] = "Cancelled by user"
+    elif len(reducers) > 1:
+        combined["status"] = "error"
+        combined["message"] = "; ".join(
+            f"{r}: {results[r].get('message', 'failed')}" for r in bad
+        )
+    return combined
 
 
 class _EEComputeTooLargeError(RuntimeError):
@@ -214,16 +278,19 @@ def _compute_resume_key(
     cloud_max: float,
     resolution: int,
     ee_collection: str,
+    temporal_reducer: str = "median",
 ) -> str:
     """Stable 16-hex-char key identifying a unique NDVI run.
 
     Two runs that hash to the same key produce identical output, so they can
     share an on-disk tile workspace — that's what lets resume work. The key
     includes everything that affects the per-tile contents: study area
-    (geometry + CRS), date range, cloud threshold, export resolution, and
-    Earth Engine collection ID. Changing any one of these spawns a fresh
-    workspace and forces a full re-download (which is what you want — old
-    tiles would be from a different question).
+    (geometry + CRS), date range, cloud threshold, export resolution, Earth
+    Engine collection ID and temporal statistic. Changing any one of these
+    spawns a fresh workspace and forces a full re-download (which is what you
+    want — old tiles would be from a different question). ``median`` adds
+    nothing to the hash, so its keys match those written before the
+    statistic was a choice.
     """
     h = hashlib.sha256()
     # Schema tag — bump when the on-disk tile format changes. ``planar_v1``
@@ -234,6 +301,8 @@ def _compute_resume_key(
     h.update(geometry_sha256(geom_wgs84_gdf).encode())
     h.update(f"|{start_date}|{end_date}|{cloud_max}|{resolution}|".encode())
     h.update(ee_collection.encode())
+    if temporal_reducer != "median":
+        h.update(f"|{temporal_reducer}".encode())
     return h.hexdigest()[:16]
 
 
@@ -341,6 +410,7 @@ def _write_ndvi_sidecar(
     end_date: str,
     used_start_date: str | None = None,
     used_end_date: str | None = None,
+    temporal_reducer: str = "median",
     coverage_widened: bool = False,
     cloud_max: float,
     resolution_m: int,
@@ -355,10 +425,11 @@ def _write_ndvi_sidecar(
     Mirrors GVI's ``_gvi.json`` so any downstream tool (fusion, custom
     notebooks) can introspect an NDVI raster after the fact: which planar CRS
     pixels were rasterised in, how much distortion that introduced, how many
-    clusters and tiles the input decomposed into, the exact date range, and
-    which Earth Engine ImageCollection was queried. ``failed_tile_refs``
-    lists the cluster/tile IDs that exhausted their retry budget — those
-    areas appear as NaN gaps in the mosaic.
+    clusters and tiles the input decomposed into, the exact date range, the
+    temporal statistic (median / mean / max over the window's cloud-free
+    images), and which Earth Engine ImageCollection was queried.
+    ``failed_tile_refs`` lists the cluster/tile IDs that exhausted their retry
+    budget — those areas appear as NaN gaps in the mosaic.
     """
     sidecar_path = os.path.join(folder, f"{output_name}_ndvi.json")
     payload = {
@@ -377,6 +448,7 @@ def _write_ndvi_sidecar(
         "end_date": str(end_date),
         "used_start_date": str(used_start_date or start_date),
         "used_end_date": str(used_end_date or end_date),
+        "temporal_reducer": str(temporal_reducer),
         "coverage_widened": bool(coverage_widened),
         "cloud_max": float(cloud_max),
         "resolution_m": int(resolution_m),
@@ -879,6 +951,7 @@ class NDVIEngine:
         satellite: str = "auto",
         coverage_rescue: bool = True,
         crs_override=None,
+        temporal_reducers: str | Iterable[str] = "median",
     ):
         """
         Download and process NDVI data with automatic tiling for large areas.
@@ -913,7 +986,20 @@ class NDVIEngine:
                 than 3 images, widen the date range by ±50 % once and retry.
                 Documented in the sidecar so the user knows the composite
                 spans a wider window than they originally asked for.
+            temporal_reducers: Per-pixel statistic(s) over the window's
+                cloud-free images, any of :data:`TEMPORAL_REDUCERS` (default
+                ``"median"``). Each statistic writes its own files under
+                :func:`ndvi_output_name` and caches its tiles under its own
+                resume key; one Earth Engine request per tile carries every
+                statistic that tile is missing.
+
+        Returns:
+            The first statistic's result (``status``, ``tif``, ``geojson``,
+            ``gpkg``, ``meta``, ``sidecar``) with ``reducers`` mapping every
+            statistic to its own result. ``status`` is ``"success"`` only
+            when every statistic succeeded.
         """
+        reducers = normalize_temporal_reducers(temporal_reducers)
         os.makedirs(folder, exist_ok=True)
 
         if not (
@@ -1086,11 +1172,16 @@ class NDVIEngine:
         if cancel_callback and cancel_callback():
             return {"status": "cancelled", "message": "Cancelled by user"}
 
-        # Single-band median NDVI composite. ``unmask(-9999)`` paints
-        # cloud-masked / out-of-collection pixels with the sentinel so the
-        # downstream reproject can mask them out instead of bilinear-blending
-        # them with valid neighbours.
-        ndvi_median = col.select("NDVI").median().rename("NDVI").unmask(-9999).clip(aoi)
+        # One single-band composite per temporal statistic. ``unmask(-9999)``
+        # paints cloud-masked / out-of-collection pixels with the sentinel so
+        # the downstream reproject can mask them out instead of
+        # bilinear-blending them with valid neighbours.
+        ndvi = col.select("NDVI")
+        composites = {
+            r: getattr(ndvi, r)().rename("NDVI").unmask(-9999).clip(aoi)
+            for r in reducers
+        }
+        _log("INFO", f"Temporal statistic: {', '.join(reducers)}")
 
         # 4. Build cluster-aware tile list in true metres. Scattered national
         # inputs decompose into connected components, and tiles that fall over
@@ -1111,25 +1202,31 @@ class NDVIEngine:
         # Anchoring the key on what was actually downloaded means a future
         # run that hits the same widened window / Landsat fallback reuses
         # the cache; runs that resolve differently get isolated workspaces.
-        resume_key = _compute_resume_key(
-            geom_for_crs,
-            used_start,
-            used_end,
-            cloud_max,
-            resolution,
-            ee_collection_id,
-        )
+        # Each statistic has its own key, so its tiles are its own entry.
+        resume_keys = {
+            r: _compute_resume_key(
+                geom_for_crs,
+                used_start,
+                used_end,
+                cloud_max,
+                resolution,
+                ee_collection_id,
+                temporal_reducer=r,
+            )
+            for r in reducers
+        }
+        output_names = {r: ndvi_output_name(output_name, r) for r in reducers}
 
         if n_tiles == 1:
             _log(
                 "INFO",
                 f"Single-tile download ({n_clusters} cluster(s), planar metres).",
             )
-            result = self._download_single(
-                ndvi_median,
+            results = self._download_single(
+                composites,
                 aoi,
                 geometry,
-                output_name,
+                output_names,
                 resolution,
                 folder,
                 export_crs=export_crs,
@@ -1148,12 +1245,11 @@ class NDVIEngine:
                 f"Tiled download: {n_tiles} tiles across {n_clusters} cluster(s) "
                 f"(max {max_tile_size_km} km/tile).",
             )
-            result = self._download_with_tiling(
-                ndvi_median,
+            results = self._download_with_tiling(
+                composites,
                 aoi,
                 tiles,
-                output_name,
-                resolution,
+                {r: (output_names[r], resume_keys[r]) for r in reducers},
                 folder,
                 max_tile_size_km,
                 export_crs=export_crs,
@@ -1161,7 +1257,6 @@ class NDVIEngine:
                 export_crs_name=export_crs_name,
                 crs_transform=crs_transform,
                 n_clusters=n_clusters,
-                resume_key=resume_key,
                 cancel_callback=cancel_callback,
                 ndvi_progress_callback=ndvi_progress_callback,
                 write_geotiff=write_geotiff,
@@ -1174,7 +1269,10 @@ class NDVIEngine:
         # download / notebooks) get the same parameter+CRS audit trail the GVI
         # ``_gvi.json`` provides. Failures and cancellations skip this — the
         # sidecar should only describe outputs that actually landed on disk.
-        if result.get("status") == "success":
+        for r in reducers:
+            result = results[r]
+            if result.get("status") != "success":
+                continue
             raw_meta = result.get("meta")
             result_meta: dict = raw_meta if isinstance(raw_meta, dict) else {}
             tiles_succeeded = int(result_meta.get("tiles", n_tiles))
@@ -1184,7 +1282,7 @@ class NDVIEngine:
             try:
                 sidecar_path = _write_ndvi_sidecar(
                     folder,
-                    output_name,
+                    output_names[r],
                     grid_crs=grid_crs,
                     export_crs=export_crs,
                     export_crs_name=export_crs_name,
@@ -1195,11 +1293,12 @@ class NDVIEngine:
                     tiles_failed=tiles_failed,
                     tiles_resumed=tiles_resumed,
                     failed_tile_refs=failed_refs,
-                    resume_key=resume_key,
+                    resume_key=resume_keys[r],
                     start_date=str(start_date),
                     end_date=str(end_date),
                     used_start_date=used_start,
                     used_end_date=used_end,
+                    temporal_reducer=r,
                     coverage_widened=coverage_widened,
                     cloud_max=cloud_max,
                     resolution_m=resolution,
@@ -1213,14 +1312,14 @@ class NDVIEngine:
             except Exception as e:
                 _log("WARN", f"Sidecar write failed (non-fatal): {e}")
 
-        return result
+        return _combine_reducer_results(results)
 
     def _download_single(
         self,
-        ndvi_median,
+        composites: Mapping[str, Any],
         aoi,
         geometry,
-        output_name,
+        output_names: Mapping[str, str],
         resolution,
         folder,
         *,
@@ -1233,8 +1332,20 @@ class NDVIEngine:
         write_geotiff: bool = True,
         write_geojson: bool = True,
         write_geopackage: bool = False,
-    ):
-        """Download NDVI as a single tile (for small areas)."""
+    ) -> dict[str, dict]:
+        """Download NDVI as a single tile (for small areas).
+
+        Several statistics come down as the bands of one export and are split
+        into their own GeoTIFFs, in the downloaded pixel type, so each file
+        holds the values a run of that statistic alone writes. Returns one
+        result per statistic.
+        """
+        reducers = list(composites)
+
+        def _each(status: dict) -> dict[str, dict]:
+            return {r: dict(status) for r in reducers}
+
+        cancelled = {"status": "cancelled", "message": "Cancelled by user"}
         _emit_ndvi_progress(
             ndvi_progress_callback,
             sub_progress=0.05,
@@ -1242,15 +1353,18 @@ class NDVIEngine:
             tiles=(0, 1),
         )
         if cancel_callback and cancel_callback():
-            return {"status": "cancelled", "message": "Cancelled by user"}
-        final_tif = os.path.join(folder, f"{output_name}_ndvi.tif")
-        tmp_tif = final_tif[:-4] + ".tmp.tif"
+            return _each(cancelled)
+        final_tifs = {
+            r: os.path.join(folder, f"{output_names[r]}_ndvi.tif") for r in reducers
+        }
+        tmp_tif = final_tifs[reducers[0]][:-4] + ".tmp.tif"
+        image = _stack_composites(composites, reducers)
 
         try:
 
             def _do_export() -> None:
                 _export_ee_image_to_tif(
-                    ndvi_median,
+                    image,
                     tmp_tif,
                     crs=export_crs,
                     crs_transform=crs_transform,
@@ -1269,11 +1383,16 @@ class NDVIEngine:
             if cancel_callback and cancel_callback():
                 if os.path.exists(tmp_tif):
                     os.remove(tmp_tif)
-                return {"status": "cancelled", "message": "Cancelled by user"}
+                return _each(cancelled)
 
             # Atomic publish: the user-visible final raster only appears
             # once the EE write finished cleanly.
-            os.replace(tmp_tif, final_tif)
+            if len(reducers) == 1:
+                os.replace(tmp_tif, final_tifs[reducers[0]])
+            else:
+                for band, r in enumerate(reducers, start=1):
+                    _extract_band(tmp_tif, band, final_tifs[r])
+                os.remove(tmp_tif)
 
             _emit_ndvi_progress(
                 ndvi_progress_callback,
@@ -1285,11 +1404,51 @@ class NDVIEngine:
         except Exception as e:
             if os.path.exists(tmp_tif):
                 os.remove(tmp_tif)
-            return {"status": "error", "message": f"EE export failed: {str(e)}"}
+            return _each({"status": "error", "message": f"EE export failed: {str(e)}"})
 
         if cancel_callback and cancel_callback():
-            return {"status": "cancelled", "message": "Cancelled by user"}
+            return _each(cancelled)
 
+        span = (0.99 - 0.52) / len(reducers)
+        return {
+            r: self._single_tile_output(
+                final_tifs[r],
+                geometry,
+                output_names[r],
+                folder,
+                export_crs=export_crs,
+                export_distortion=export_distortion,
+                export_crs_name=export_crs_name,
+                cancel_callback=cancel_callback,
+                ndvi_progress_callback=ndvi_progress_callback,
+                write_geotiff=write_geotiff,
+                write_geojson=write_geojson,
+                write_geopackage=write_geopackage,
+                sub_start=0.52 + i * span,
+                sub_end=0.52 + (i + 1) * span,
+            )
+            for i, r in enumerate(reducers)
+        }
+
+    def _single_tile_output(
+        self,
+        final_tif: str,
+        geometry,
+        output_name: str,
+        folder,
+        *,
+        export_crs: str,
+        export_distortion: float,
+        export_crs_name: str,
+        cancel_callback: Callable[[], bool] | None,
+        ndvi_progress_callback: Callable[[Mapping[str, Any]], None] | None,
+        write_geotiff: bool,
+        write_geojson: bool,
+        write_geopackage: bool,
+        sub_start: float,
+        sub_end: float,
+    ) -> dict:
+        """One statistic's single-tile result: metadata and vector samples."""
         try:
             with rasterio.open(final_tif) as src:
                 crs_meta = str(src.crs)
@@ -1313,7 +1472,7 @@ class NDVIEngine:
         if not (write_geojson or write_geopackage):
             _emit_ndvi_progress(
                 ndvi_progress_callback,
-                sub_progress=0.99,
+                sub_progress=sub_end,
                 phase="Finalizing",
             )
             return {
@@ -1334,6 +1493,7 @@ class NDVIEngine:
             if write_geopackage
             else None
         )
+        meta.pop("crs")
         out = self._raster_to_ndvi_points(
             final_tif,
             geometry,
@@ -1341,21 +1501,9 @@ class NDVIEngine:
             gpkg_path=gpkg_path,
             ndvi_progress_callback=ndvi_progress_callback,
             cancel_callback=cancel_callback,
-            sub_start=0.52,
-            sub_end=0.99,
-            meta_extra={
-                "tiles": 1,
-                "tiles_total": 1,
-                "tiles_failed": 0,
-                "tiles_resumed": 0,
-                "failed_tile_refs": [],
-                "n_clusters": 1,
-                "cluster_tiles_dir": None,
-                "cluster_tiles_written": 0,
-                "export_crs": export_crs,
-                "export_crs_name": export_crs_name,
-                "export_distortion": export_distortion,
-            },
+            sub_start=sub_start,
+            sub_end=sub_end,
+            meta_extra=meta,
         )
         if out.get("status") != "success":
             return out
@@ -1471,19 +1619,22 @@ class NDVIEngine:
     def _download_one_tile(
         self,
         tile_spec: dict,
-        ndvi_median,
-        work_dir: str,
-        resolution: int,
+        composites: Mapping[str, Any],
+        reducers: list[str],
+        work_dirs: Mapping[str, str],
         export_crs: str,
         crs_transform: list[float],
         cancel_callback: Callable[[], bool] | None,
     ) -> dict:
-        """Worker: one tile downloaded from EE into the planar cache.
+        """Worker: one tile's missing statistics, in one Earth Engine request.
 
         Runs on a ThreadPoolExecutor thread (see :meth:`_download_with_tiling`).
-        Returns ``{success, tile_final, idx, error}``; failures surface as
-        ``success=False`` rather than raising so a single bad tile can't sink
-        the whole batch.
+        ``reducers`` are the statistics this tile has no cache file for; they
+        are stacked as the bands of one image, exported once, and each band is
+        stored in its own statistic's workspace. Returns ``{idx, reducers,
+        tile_files, error}`` with ``tile_files`` mapping each stored statistic
+        to its tile; failures surface as ``error`` rather than raising so a
+        single bad tile can't sink the whole batch, and leave no files.
 
         Tiles stay in the engine's chosen planar CRS — *no* per-tile reproject
         to WGS84 — so all tiles share one snap grid (``crs_transform`` fixes
@@ -1491,7 +1642,7 @@ class NDVIEngine:
         sub-pixel drift. A single final reproject converts the merged planar
         mosaic to WGS84 with explicit nodata.
 
-        The download is stored as a compact float32 cache tile by
+        Each band is stored as a compact float32 cache tile by
         :func:`_extract_band`. The request itself keeps Earth Engine's float64
         encoding: a float32 request comes back with ``-inf`` at edge pixels
         outside the tile's clip, which would overwrite a neighbour's valid
@@ -1503,19 +1654,23 @@ class NDVIEngine:
         and be discarded by the caller.
         """
         idx = int(tile_spec["tile_idx"])
-        tile_geom = tile_spec["tile_geom_4326"]
-        result: dict = {"success": False, "tile_final": None, "idx": idx, "error": None}
+        result: dict = {
+            "idx": idx,
+            "reducers": list(reducers),
+            "tile_files": {},
+            "error": None,
+        }
 
         if cancel_callback and cancel_callback():
             return result
 
-        tile_final = os.path.join(work_dir, f"tile_{idx}.tif")
-        download = os.path.join(work_dir, f"tile_{idx}.download.tif")
+        download = os.path.join(work_dirs[reducers[0]], f"tile_{idx}.download.tif")
+        written: dict[str, str] = {}
 
         try:
             self._export_region_adaptive(
-                ndvi_median,
-                tile_geom,
+                _stack_composites(composites, reducers),
+                tile_spec["tile_geom_4326"],
                 download,
                 export_crs=export_crs,
                 crs_transform=crs_transform,
@@ -1527,14 +1682,16 @@ class NDVIEngine:
             if cancel_callback and cancel_callback():
                 return result
 
-            _extract_band(download, 1, tile_final, dtype="float32")
-            result["success"] = True
-            result["tile_final"] = tile_final
+            for band, r in enumerate(reducers, start=1):
+                tile_final = os.path.join(work_dirs[r], f"tile_{idx}.tif")
+                _extract_band(download, band, tile_final, dtype="float32")
+                written[r] = tile_final
+            result["tile_files"] = written
             return result
         except Exception as e:
-            if os.path.exists(tile_final):
+            for path in written.values():
                 try:
-                    os.remove(tile_final)
+                    os.remove(path)
                 except OSError:
                     pass
             result["error"] = f"{type(e).__name__}: {e}"
@@ -1646,11 +1803,10 @@ class NDVIEngine:
 
     def _download_with_tiling(
         self,
-        ndvi_median,
+        composites: Mapping[str, Any],
         aoi,
         tiles: list[dict],
-        output_name,
-        resolution,
+        outputs: Mapping[str, tuple[str, str]],
         folder,
         max_tile_size_km,
         *,
@@ -1659,14 +1815,13 @@ class NDVIEngine:
         export_crs_name: str = "Web Mercator (legacy)",
         crs_transform: list[float] | None = None,
         n_clusters: int = 1,
-        resume_key: str = "",
         cancel_callback: Callable[[], bool] | None = None,
         ndvi_progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
         write_geotiff: bool = True,
         write_geojson: bool = True,
         write_geopackage: bool = False,
         write_cluster_tiles: bool = False,
-    ):
+    ) -> dict[str, dict]:
         """Download NDVI for a precomputed cluster-aware tile list and mosaic.
 
         ``tiles`` is the output of :func:`geofuse.core.build_planar_tiles` — a list of
@@ -1674,10 +1829,15 @@ class NDVIEngine:
         independently and mosaicked into one GeoTIFF; per-cluster GeoTIFF tile
         outputs are written separately by the cluster-tiles path.
 
-        ``resume_key`` selects the tile workspace; tiles already present from
-        a previous interrupted run with the same key are skipped.
+        ``outputs`` maps each temporal statistic to ``(output_name,
+        resume_key)``. Every statistic has its own cache workspace, so a later
+        run asking for any subset reuses what is on disk; tiles already present
+        from a previous run with the same key are skipped, and a tile missing
+        several statistics fetches them in one request. Returns one result per
+        statistic.
         """
         n_tiles = len(tiles)
+        reducers = list(composites)
         _log(
             "INFO",
             f"Downloading {n_tiles} tile(s) across {n_clusters} cluster(s) "
@@ -1694,249 +1854,330 @@ class NDVIEngine:
         # The cache directory doubles as both the in-progress workspace
         # *and* the cross-run cache: successful runs leave their tiles in
         # place so a future run with the same ``resume_key`` (same area +
-        # date range + cloud max + resolution + collection) reuses every
-        # tile instantly. The cache's LRU + size cap reclaims old entries
-        # when it grows past the configured ceiling. Tiles are float32 with
-        # DEFLATE and the floating-point predictor (``_extract_band``);
+        # date range + cloud max + resolution + collection + statistic)
+        # reuses every tile instantly. The cache's LRU + size cap reclaims old
+        # entries when it grows past the configured ceiling. Tiles are float32
+        # with DEFLATE and the floating-point predictor (``_extract_band``);
         # older float64 tiles stay readable and give identical mosaics.
-        work_dir = self.tile_cache.workspace_dir(resume_key or "scratch")
+        work_dirs = {
+            r: self.tile_cache.workspace_dir(
+                outputs[r][1] or ndvi_output_name("scratch", r)
+            )
+            for r in reducers
+        }
 
         # Resume: any tile already present on disk (and openable as a
-        # rasterio dataset) is reused as-is; only the remainder gets queued
-        # for download. Same lookup whether we're resuming an interrupted
-        # run or hitting a previously-cached one — only the user-facing log
-        # message differs.
-        existing_tile_files, pending_tiles = _discover_resumable_tiles(work_dir, tiles)
-        n_resumed = len(existing_tile_files)
-        if n_resumed:
-            _log(
-                "INFO",
-                f"Resumed {n_resumed}/{n_tiles} tile(s) from previous run "
-                f"({work_dir}).",
+        # rasterio dataset) is reused as-is; only the statistics a tile is
+        # missing get queued for download. Same lookup whether we're resuming
+        # an interrupted run or hitting a previously-cached one — only the
+        # user-facing log message differs.
+        tile_files: dict[str, list[str]] = {r: [] for r in reducers}
+        n_resumed: dict[str, int] = {}
+        missing: dict[int, list[str]] = {}
+        for r in reducers:
+            existing, pending = _discover_resumable_tiles(work_dirs[r], tiles)
+            tile_files[r].extend(existing)
+            n_resumed[r] = len(existing)
+            for ts in pending:
+                missing.setdefault(int(ts["tile_idx"]), []).append(r)
+            if existing:
+                which = "" if len(reducers) == 1 else f" ({r})"
+                _log(
+                    "INFO",
+                    f"Resumed {len(existing)}/{n_tiles} tile(s){which} from "
+                    f"previous run ({work_dirs[r]}).",
+                )
+        pending_tiles = [ts for ts in tiles if int(ts["tile_idx"]) in missing]
+
+        # Tiles that exhausted the retry budget, per statistic. Recorded with
+        # their ``cluster_id`` / ``tile_idx`` / final error so the sidecar can
+        # surface exactly which areas are NaN gaps in the mosaic.
+        failed_tile_refs: dict[str, list[dict]] = {r: [] for r in reducers}
+
+        # Parallel tile downloads. Each worker handles one tile end-to-end
+        # (Earth Engine export → compact cache tiles). The ThreadPoolExecutor
+        # caps concurrency at ``_MAX_CONCURRENT_TILES`` so we don't saturate
+        # local sockets or oversubscribe EE per-user. Progress emits are
+        # throttled to every :data:`NDVI_PROGRESS_MIN_TILES` tiles so the UI
+        # bracket stays responsive without slamming the JobStore lock on
+        # big runs.
+        done_count = n_tiles - len(pending_tiles)
+        _tile_throttle = ProgressThrottle(min_items=NDVI_PROGRESS_MIN_TILES)
+
+        def _emit_progress(k: int) -> None:
+            if not _tile_throttle.should_emit(k, final=k >= n_tiles):
+                return
+            _emit_ndvi_progress(
+                ndvi_progress_callback,
+                sub_progress=0.70 * k / n_tiles if n_tiles else 0.0,
+                phase="Downloading tiles",
+                tiles=(k, n_tiles),
             )
 
-        tile_files: list[str] = list(existing_tile_files)
-        # Tiles that exhausted the retry budget. Recorded with their
-        # ``cluster_id`` / ``tile_idx`` / final error so the sidecar can
-        # surface exactly which areas are NaN gaps in the mosaic.
-        failed_tile_refs: list[dict] = []
-        mosaic_ok = False
-        final_tif = os.path.join(folder, f"{output_name}_ndvi.tif")
+        # Show the resumed count immediately so the bracket jumps to the
+        # right starting point instead of flashing 0/N.
+        _emit_progress(done_count)
 
-        try:
-            # Parallel tile downloads. Each worker handles one tile end-to-end
-            # (Earth Engine export → reproject to WGS84). The ThreadPoolExecutor
-            # caps concurrency at ``_MAX_CONCURRENT_TILES`` so we don't saturate
-            # local sockets or oversubscribe EE per-user. Progress emits are
-            # throttled to every :data:`NDVI_PROGRESS_MIN_TILES` tiles so the UI
-            # bracket stays responsive without slamming the JobStore lock on
-            # big runs.
-            done_count = n_resumed
-            _tile_throttle = ProgressThrottle(min_items=NDVI_PROGRESS_MIN_TILES)
-
-            def _emit_progress(k: int) -> None:
-                if not _tile_throttle.should_emit(k, final=k >= n_tiles):
-                    return
-                _emit_ndvi_progress(
-                    ndvi_progress_callback,
-                    sub_progress=0.70 * k / n_tiles if n_tiles else 0.0,
-                    phase="Downloading tiles",
-                    tiles=(k, n_tiles),
-                )
-
-            # Show the resumed count immediately so the bracket jumps to the
-            # right starting point instead of flashing 0/N.
-            _emit_progress(n_resumed)
-
-            with ThreadPoolExecutor(
-                max_workers=_MAX_CONCURRENT_TILES,
-                thread_name_prefix="ndvi-tile",
-            ) as pool:
-                futures = {
-                    pool.submit(
-                        self._download_one_tile,
-                        ts,
-                        ndvi_median,
-                        work_dir,
-                        resolution,
-                        export_crs,
-                        crs_transform,
-                        cancel_callback,
-                    ): ts
-                    for ts in pending_tiles
-                }
-                cancelled = False
-                for fut in as_completed(futures):
-                    res = fut.result()
-                    done_count += 1
-                    if res["success"] and res["tile_final"] is not None:
-                        tile_files.append(res["tile_final"])
-                    elif res.get("error"):
-                        tile_spec = futures[fut]
-                        failed_tile_refs.append(
+        cancelled = False
+        with ThreadPoolExecutor(
+            max_workers=_MAX_CONCURRENT_TILES,
+            thread_name_prefix="ndvi-tile",
+        ) as pool:
+            futures = {
+                pool.submit(
+                    self._download_one_tile,
+                    ts,
+                    composites,
+                    missing[int(ts["tile_idx"])],
+                    work_dirs,
+                    export_crs,
+                    crs_transform,
+                    cancel_callback,
+                ): ts
+                for ts in pending_tiles
+            }
+            for fut in as_completed(futures):
+                res = fut.result()
+                done_count += 1
+                for r, path in res["tile_files"].items():
+                    tile_files[r].append(path)
+                if res.get("error"):
+                    tile_spec = futures[fut]
+                    for r in res["reducers"]:
+                        failed_tile_refs[r].append(
                             {
                                 "cluster_id": int(tile_spec["cluster_id"]),
                                 "tile_idx": int(res["idx"]),
                                 "error": str(res["error"]),
                             }
                         )
-                        _log(
-                            "WARN",
-                            f"Tile {res['idx'] + 1} failed after retry: "
-                            f"{res['error']}",
-                        )
-                    _emit_progress(done_count)
-                    if cancel_callback and cancel_callback():
-                        cancelled = True
-                        # Cancel any not-yet-running futures; in-flight tiles
-                        # finish on their own (EE export is one blocking call,
-                        # we can't kill it mid-flight) and their results are
-                        # discarded.
-                        for f in futures:
-                            if not f.done():
-                                f.cancel()
-                        break
+                    _log(
+                        "WARN",
+                        f"Tile {res['idx'] + 1} failed after retry: "
+                        f"{res['error']}",
+                    )
+                _emit_progress(done_count)
+                if cancel_callback and cancel_callback():
+                    cancelled = True
+                    # Cancel any not-yet-running futures; in-flight tiles
+                    # finish on their own (EE export is one blocking call,
+                    # we can't kill it mid-flight) and their results are
+                    # discarded.
+                    for f in futures:
+                        if not f.done():
+                            f.cancel()
+                    break
 
-            if cancelled or (cancel_callback and cancel_callback()):
-                return {"status": "cancelled", "message": "Cancelled by user"}
+        if cancelled or (cancel_callback and cancel_callback()):
+            for r in reducers:
+                _log("INFO", f"Tile workspace preserved for resume: {work_dirs[r]}")
+            return {
+                r: {"status": "cancelled", "message": "Cancelled by user"}
+                for r in reducers
+            }
 
-            if not tile_files:
-                return {"status": "error", "message": "All tiles failed to download"}
+        # Each statistic is mosaicked in turn, in its own share of the
+        # progress bar after the shared download.
+        share = (0.99 - 0.70) / len(reducers)
+        results: dict[str, dict] = {}
+        for i, r in enumerate(reducers):
 
-            if failed_tile_refs:
-                _log(
-                    "WARN",
-                    f"{len(failed_tile_refs)}/{n_tiles} tile(s) failed after retry "
-                    "— mosaic will have NaN gaps in those areas. "
-                    "See sidecar JSON for the cluster/tile IDs.",
-                )
+            def _at(x: float, lo: float = 0.70 + i * share) -> float:
+                return lo + (x - 0.70) / (0.99 - 0.70) * share
 
-            _log(
-                "OK",
-                f"Successfully downloaded {len(tile_files)}/{n_tiles} tiles. "
-                "Mosaicking...",
+            output_name, resume_key = outputs[r]
+            results[r] = self._finish_tiled_output(
+                tile_files[r],
+                failed_tile_refs[r],
+                n_resumed[r],
+                tiles,
+                work_dirs[r],
+                resume_key,
+                output_name,
+                folder,
+                label="" if len(reducers) == 1 else f" ({r})",
+                progress_at=_at,
+                n_clusters=n_clusters,
+                export_crs=export_crs,
+                export_distortion=export_distortion,
+                export_crs_name=export_crs_name,
+                cancel_callback=cancel_callback,
+                ndvi_progress_callback=ndvi_progress_callback,
+                write_geotiff=write_geotiff,
+                write_geojson=write_geojson,
+                write_geopackage=write_geopackage,
+                write_cluster_tiles=write_cluster_tiles,
             )
 
-            if cancel_callback and cancel_callback():
-                return {"status": "cancelled", "message": "Cancelled by user"}
+        # Trim the cache once every statistic's workspace has been recorded,
+        # so a sibling workspace this run still needs is never the oldest.
+        if any(res.get("status") == "success" for res in results.values()):
+            try:
+                n_evicted, bytes_freed = self.tile_cache.evict_lru()
+                if n_evicted:
+                    _log(
+                        "INFO",
+                        f"Tile cache: evicted {n_evicted} LRU entry/entries "
+                        f"({bytes_freed / 1024**2:.0f} MB) to stay under cap.",
+                    )
+            except Exception as e:
+                _log("WARN", f"Tile cache bookkeeping failed: {e}")
+        return results
+
+    def _finish_tiled_output(
+        self,
+        tile_files: list[str],
+        failed_tile_refs: list[dict],
+        n_resumed: int,
+        tiles: list[dict],
+        work_dir: str,
+        resume_key: str,
+        output_name: str,
+        folder,
+        *,
+        label: str,
+        progress_at: Callable[[float], float],
+        n_clusters: int,
+        export_crs: str,
+        export_distortion: float,
+        export_crs_name: str,
+        cancel_callback: Callable[[], bool] | None,
+        ndvi_progress_callback: Callable[[Mapping[str, Any]], None] | None,
+        write_geotiff: bool,
+        write_geojson: bool,
+        write_geopackage: bool,
+        write_cluster_tiles: bool,
+    ) -> dict:
+        """Mosaic one statistic's tiles into its outputs.
+
+        Progress values are those of a single-statistic run, mapped into this
+        statistic's share of the bar by ``progress_at``. A successful mosaic
+        records the workspace in the cache index; the caller evicts.
+        """
+        n_tiles = len(tiles)
+        final_tif = os.path.join(folder, f"{output_name}_ndvi.tif")
+
+        if not tile_files:
+            _log("INFO", f"Tile workspace preserved for resume: {work_dir}")
+            return {"status": "error", "message": "All tiles failed to download"}
+
+        if failed_tile_refs:
+            _log(
+                "WARN",
+                f"{len(failed_tile_refs)}/{n_tiles} tile(s){label} failed after "
+                "retry — mosaic will have NaN gaps in those areas. "
+                "See sidecar JSON for the cluster/tile IDs.",
+            )
+
+        _log(
+            "OK",
+            f"Successfully downloaded {len(tile_files)}/{n_tiles} tiles{label}. "
+            "Mosaicking...",
+        )
+
+        if cancel_callback and cancel_callback():
+            _log("INFO", f"Tile workspace preserved for resume: {work_dir}")
+            return {"status": "cancelled", "message": "Cancelled by user"}
+
+        _emit_ndvi_progress(
+            ndvi_progress_callback,
+            sub_progress=progress_at(0.72),
+            phase="Mosaicking rasters",
+            tiles=(0, len(tile_files)),
+            clear_bracket=True,
+        )
+
+        # Stream-mosaic the per-tile rasters in their shared planar CRS
+        # straight into the user-facing GeoTIFF. Tile boundaries are
+        # pixel-aligned because every EE export was anchored to the same
+        # crs_transform; mosaic memory never holds more than one tile.
+        try:
+
+            def _mosaic_progress(k: int, n: int) -> None:
+                span = 0.80 - 0.72
+                _emit_ndvi_progress(
+                    ndvi_progress_callback,
+                    sub_progress=progress_at(0.72 + (span * k / n if n else 0.0)),
+                    phase="Mosaicking rasters",
+                    tiles=(k, n),
+                )
+
+            stream_mosaic_to_geotiff(
+                tile_files,
+                final_tif,
+                nodata=-9999,
+                progress_cb=_mosaic_progress,
+                build_overviews=False,
+                compress=True,
+                dst_dtype="float32",
+            )
 
             _emit_ndvi_progress(
                 ndvi_progress_callback,
-                sub_progress=0.72,
+                sub_progress=progress_at(0.80),
                 phase="Mosaicking rasters",
-                tiles=(0, len(tile_files)),
-                clear_bracket=True,
             )
+            _log("OK", f"Mosaic complete: {final_tif}")
 
-            # Stream-mosaic the per-tile rasters in their shared planar
-            # CRS straight into the user-facing GeoTIFF. Tile boundaries
-            # are pixel-aligned because every EE export was anchored to
-            # the same crs_transform; mosaic memory never holds more than
-            # one tile.
+        except Exception as e:
+            _log(
+                "ERROR",
+                f"Mosaic step failed with traceback:\n{traceback.format_exc()}",
+            )
+            _log("INFO", f"Tile workspace preserved for resume: {work_dir}")
+            return {"status": "error", "message": f"Mosaic failed: {str(e)}"}
+
+        # Per-cluster GeoTIFF tiles + tiles_index.json. Best-effort: main
+        # mosaic already succeeded, so per-cluster failures log a WARN rather
+        # than failing the whole run.
+        cluster_tiles_dir: str | None = None
+        cluster_tiles_written = 0
+        if write_cluster_tiles:
+            cluster_tiles_dir = os.path.join(folder, f"{output_name}_ndvi_tiles")
+            _emit_ndvi_progress(
+                ndvi_progress_callback,
+                sub_progress=progress_at(0.82),
+                phase="Writing per-cluster tiles",
+            )
             try:
-
-                def _mosaic_progress(k: int, n: int) -> None:
-                    span = 0.80 - 0.72
-                    _emit_ndvi_progress(
-                        ndvi_progress_callback,
-                        sub_progress=0.72 + (span * k / n if n else 0.0),
-                        phase="Mosaicking rasters",
-                        tiles=(k, n),
-                    )
-
-                stream_mosaic_to_geotiff(
-                    tile_files,
-                    final_tif,
-                    nodata=-9999,
-                    progress_cb=_mosaic_progress,
-                    build_overviews=False,
-                    compress=True,
-                    dst_dtype="float32",
+                entries = self._write_per_cluster_outputs(
+                    work_dir,
+                    tiles,
+                    failed_tile_refs,
+                    cluster_tiles_dir,
+                    export_crs,
+                    export_crs_name,
+                    resume_key,
                 )
-
-                _emit_ndvi_progress(
-                    ndvi_progress_callback,
-                    sub_progress=0.80,
-                    phase="Mosaicking rasters",
-                )
-                _log("OK", f"Mosaic complete: {final_tif}")
-                mosaic_ok = True
-
-            except Exception as e:
                 _log(
-                    "ERROR",
-                    f"Mosaic step failed with traceback:\n{traceback.format_exc()}",
+                    "OK",
+                    f"Wrote {len(entries)} per-cluster tile(s) to "
+                    f"{cluster_tiles_dir}",
                 )
-                return {"status": "error", "message": f"Mosaic failed: {str(e)}"}
-
-            # Per-cluster GeoTIFF tiles + tiles_index.json. Best-effort:
-            # main mosaic already succeeded, so per-cluster failures log
-            # a WARN rather than failing the whole run.
-            if write_cluster_tiles:
-                cluster_tiles_dir = os.path.join(folder, f"{output_name}_ndvi_tiles")
-                _emit_ndvi_progress(
-                    ndvi_progress_callback,
-                    sub_progress=0.82,
-                    phase="Writing per-cluster tiles",
-                )
-                try:
-                    entries = self._write_per_cluster_outputs(
-                        work_dir,
-                        tiles,
-                        failed_tile_refs,
-                        cluster_tiles_dir,
-                        export_crs,
-                        export_crs_name,
-                        resume_key,
-                    )
-                    _log(
-                        "OK",
-                        f"Wrote {len(entries)} per-cluster tile(s) to "
-                        f"{cluster_tiles_dir}",
-                    )
-                    cluster_tiles_written = len(entries)
-                except Exception as e:
-                    _log("WARN", f"Per-cluster tile output failed: {e}")
-                    cluster_tiles_dir = None
-                    cluster_tiles_written = 0
-            else:
+                cluster_tiles_written = len(entries)
+            except Exception as e:
+                _log("WARN", f"Per-cluster tile output failed: {e}")
                 cluster_tiles_dir = None
-                cluster_tiles_written = 0
 
-        finally:
-            if work_dir and os.path.isdir(work_dir):
-                if mosaic_ok and resume_key:
-                    # Don't delete the workspace — it's the persistent cache
-                    # now. Record the on-disk footprint + access time so the
-                    # LRU eviction has correct numbers, then trim to the cap.
-                    _emit_ndvi_progress(
-                        ndvi_progress_callback,
-                        sub_progress=0.86,
-                        phase="Updating tile cache",
-                    )
-                    try:
-                        self.tile_cache.touch(resume_key)
-                        n_evicted, bytes_freed = self.tile_cache.evict_lru()
-                        if n_evicted:
-                            _log(
-                                "INFO",
-                                f"Tile cache: evicted {n_evicted} LRU entry/entries "
-                                f"({bytes_freed / 1024**2:.0f} MB) to stay under cap.",
-                            )
-                    except Exception as e:
-                        _log("WARN", f"Tile cache bookkeeping failed: {e}")
-                elif not mosaic_ok:
-                    _log(
-                        "INFO",
-                        f"Tile workspace preserved for resume: {work_dir}",
-                    )
+        # Don't delete the workspace — it's the persistent cache now. Record
+        # the on-disk footprint + access time so the LRU eviction has correct
+        # numbers.
+        if resume_key:
+            _emit_ndvi_progress(
+                ndvi_progress_callback,
+                sub_progress=progress_at(0.86),
+                phase="Updating tile cache",
+            )
+            try:
+                self.tile_cache.touch(resume_key)
+            except Exception as e:
+                _log("WARN", f"Tile cache bookkeeping failed: {e}")
 
         if cancel_callback and cancel_callback():
             return {"status": "cancelled", "message": "Cancelled by user"}
 
-        n_mosaic_tiles = len(tile_files)
         meta_base: dict[str, Any] = {
-            "tiles": n_mosaic_tiles,
+            "tiles": len(tile_files),
             "tiles_total": n_tiles,
             "tiles_failed": len(failed_tile_refs),
             "tiles_resumed": n_resumed,
@@ -1949,16 +2190,16 @@ class NDVIEngine:
             "export_crs_name": export_crs_name,
             "export_distortion": export_distortion,
         }
-        try:
-            with rasterio.open(final_tif) as src:
-                meta_base["crs"] = str(src.crs)
-        except Exception:
-            meta_base["crs"] = export_crs
 
         if not (write_geojson or write_geopackage):
+            try:
+                with rasterio.open(final_tif) as src:
+                    meta_base["crs"] = str(src.crs)
+            except Exception:
+                meta_base["crs"] = export_crs
             _emit_ndvi_progress(
                 ndvi_progress_callback,
-                sub_progress=0.99,
+                sub_progress=progress_at(0.99),
                 phase="Finalizing",
             )
             return {
@@ -1986,22 +2227,9 @@ class NDVIEngine:
             gpkg_path=gpkg_path,
             ndvi_progress_callback=ndvi_progress_callback,
             cancel_callback=cancel_callback,
-            sub_start=0.88,
-            sub_end=0.99,
-            meta_extra={
-                "tiles": n_mosaic_tiles,
-                "tiles_total": n_tiles,
-                "tiles_failed": len(failed_tile_refs),
-                "tiles_resumed": n_resumed,
-                "failed_tile_refs": failed_tile_refs,
-                "n_clusters": n_clusters,
-                "resume_key": resume_key,
-                "cluster_tiles_dir": cluster_tiles_dir,
-                "cluster_tiles_written": cluster_tiles_written,
-                "export_crs": export_crs,
-                "export_crs_name": export_crs_name,
-                "export_distortion": export_distortion,
-            },
+            sub_start=progress_at(0.88),
+            sub_end=progress_at(0.99),
+            meta_extra=meta_base,
         )
         if out.get("status") != "success":
             return out

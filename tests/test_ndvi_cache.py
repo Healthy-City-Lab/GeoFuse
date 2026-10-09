@@ -164,17 +164,23 @@ class DownloadOneTileTests(unittest.TestCase):
     def _run(self):
         spec = {"tile_idx": 7, "cluster_id": 0, "tile_geom_4326": None}
         return self.engine._download_one_tile(
-            spec, _Image(), self.dir, 10, CRS, [10.0, 0, 0, 0, -10.0, 0], None
+            spec,
+            {"median": _Image()},
+            ["median"],
+            {"median": self.dir},
+            CRS,
+            [10.0, 0, 0, 0, -10.0, 0],
+            None,
         )
 
     def test_download_as_is_and_compact_tile(self):
         self.engine._export_region_adaptive = self._fake_export
         res = self._run()
 
-        self.assertTrue(res["success"])
+        self.assertIsNone(res["error"])
         self.assertEqual(self.requested, ["float64"])
         self.assertEqual(os.listdir(self.dir), ["tile_7.tif"])
-        with rasterio.open(res["tile_final"]) as t:
+        with rasterio.open(res["tile_files"]["median"]) as t:
             self.assertEqual(t.dtypes[0], "float32")
 
     def test_failure_leaves_no_files(self):
@@ -184,7 +190,7 @@ class DownloadOneTileTests(unittest.TestCase):
         self.engine._export_region_adaptive = _boom
         res = self._run()
 
-        self.assertFalse(res["success"])
+        self.assertEqual(res["tile_files"], {})
         self.assertIn("HTTP 500", res["error"])
         self.assertEqual(os.listdir(self.dir), [])
 
