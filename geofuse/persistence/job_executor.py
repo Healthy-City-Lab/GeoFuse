@@ -13,7 +13,7 @@ import logging
 import threading
 import time
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -386,6 +386,7 @@ class JobExecutor:
         save_cluster_tiles: bool = False,
         satellite: str = "auto",
         coverage_rescue: bool = True,
+        temporal_reducers: Sequence[str] = ("median",),
     ) -> Future:
         """Run an NDVI (single-range) job in a fresh subprocess.
 
@@ -419,6 +420,7 @@ class JobExecutor:
                 save_cluster_tiles=save_cluster_tiles,
                 satellite=satellite,
                 coverage_rescue=coverage_rescue,
+                temporal_reducers=tuple(temporal_reducers),
             ),
             process_name=f"ndvi-child-{record.id}",
         )
@@ -442,6 +444,7 @@ class JobExecutor:
         save_cluster_tiles: bool = False,
         satellite: str = "auto",
         coverage_rescue: bool = True,
+        temporal_reducers: Sequence[str] = ("median",),
     ) -> Future:
         """Run a per-year NDVI (date-column) job in a fresh subprocess."""
         from geofuse.jobs.subprocess_runner import run_ndvi_column_child
@@ -467,6 +470,7 @@ class JobExecutor:
                 save_cluster_tiles=save_cluster_tiles,
                 satellite=satellite,
                 coverage_rescue=coverage_rescue,
+                temporal_reducers=tuple(temporal_reducers),
             ),
             process_name=f"ndvi-col-child-{record.id}",
         )

@@ -22,7 +22,7 @@ import re
 import shutil
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Any
 
@@ -74,7 +74,11 @@ from geofuse.longitudinal import (
 from geofuse.mixedlm_postscore import (
     compute_post_metrics as _compute_mixedlm_post_metrics,
 )
-from geofuse.ndvi import NDVIEngine
+from geofuse.ndvi import (
+    NDVIEngine,
+    ndvi_output_name,
+    normalize_temporal_reducers,
+)
 from geofuse.persistence.job_executor import JobContext
 from geofuse.raster_sampling import LAZY_RASTER_THRESHOLD_BYTES, LazyRasterArray
 from geofuse.vector_io import read_vector_aliased_column, read_vector_subset
@@ -572,6 +576,33 @@ def _ndvi_on_progress_factory(
     return on_ndvi_progress
 
 
+def _ndvi_output_paths(
+    folder: str,
+    output_name: str,
+    temporal_reducers: Sequence[str],
+    *,
+    save_geotiff: bool,
+    save_gpkg: bool,
+    save_geojson: bool,
+    save_cluster_tiles: bool,
+) -> list[str]:
+    """Existing files of one NDVI download, every statistic in turn."""
+    paths: list[str] = []
+    for reducer in normalize_temporal_reducers(temporal_reducers):
+        stem = os.path.join(folder, ndvi_output_name(output_name, reducer))
+        for suffix, enabled in (
+            ("_ndvi.tif", save_geotiff),
+            ("_ndvi.gpkg", save_gpkg),
+            ("_ndvi.geojson", save_geojson),
+            ("_ndvi.json", True),
+        ):
+            if enabled and os.path.exists(stem + suffix):
+                paths.append(stem + suffix)
+        if save_cluster_tiles and os.path.isdir(stem + "_ndvi_tiles"):
+            paths.append(stem + "_ndvi_tiles")
+    return paths
+
+
 def run_ndvi(
     ctx: JobContext,
     *,
@@ -590,8 +621,9 @@ def run_ndvi(
     save_cluster_tiles: bool = False,
     satellite: str = "auto",
     coverage_rescue: bool = True,
+    temporal_reducers: Sequence[str] = ("median",),
 ) -> dict:
-    """Run NDVI for a single date range."""
+    """Run NDVI for a single date range, one set of files per statistic."""
     from geofuse.crs_utils import buffer_gdf_union_metres
 
     ctx.progress(status_text="Initializing Earth Engine...")
@@ -623,6 +655,7 @@ def run_ndvi(
         write_cluster_tiles=save_cluster_tiles,
         satellite=satellite,
         coverage_rescue=coverage_rescue,
+        temporal_reducers=temporal_reducers,
     )
 
     if result.get("status") == "cancelled":
@@ -630,22 +663,15 @@ def run_ndvi(
     if result.get("status") != "success":
         raise RuntimeError(result.get("message", "NDVI run failed"))
 
-    output_paths: list[str] = []
-    tif_path = os.path.join(output_dir, f"{output_name}_ndvi.tif")
-    if save_geotiff and os.path.exists(tif_path):
-        output_paths.append(tif_path)
-    gpkg_path = os.path.join(output_dir, f"{output_name}_ndvi.gpkg")
-    if save_gpkg and os.path.exists(gpkg_path):
-        output_paths.append(gpkg_path)
-    gj_path = os.path.join(output_dir, f"{output_name}_ndvi.geojson")
-    if save_geojson and os.path.exists(gj_path):
-        output_paths.append(gj_path)
-    sidecar_path = os.path.join(output_dir, f"{output_name}_ndvi.json")
-    if os.path.exists(sidecar_path):
-        output_paths.append(sidecar_path)
-    cluster_tiles_dir = os.path.join(output_dir, f"{output_name}_ndvi_tiles")
-    if save_cluster_tiles and os.path.isdir(cluster_tiles_dir):
-        output_paths.append(cluster_tiles_dir)
+    output_paths = _ndvi_output_paths(
+        output_dir,
+        output_name,
+        temporal_reducers,
+        save_geotiff=save_geotiff,
+        save_gpkg=save_gpkg,
+        save_geojson=save_geojson,
+        save_cluster_tiles=save_cluster_tiles,
+    )
 
     ctx.progress(value=1.0, status_text="Completed")
     return {"output_paths": output_paths}
@@ -669,6 +695,7 @@ def run_ndvi_column(
     save_cluster_tiles: bool = False,
     satellite: str = "auto",
     coverage_rescue: bool = True,
+    temporal_reducers: Sequence[str] = ("median",),
 ) -> dict:
     """Run one NDVI raster per year present in ``date_column``.
 
@@ -678,7 +705,8 @@ def run_ndvi_column(
     CRS is chosen once from the whole dataset — before the split — so every
     year's raster snaps to the same global pixel grid and the outputs align.
     Results land in a ``{name}_temporal_ndvi/`` folder, one set of files per
-    year (``{name}_{year}_ndvi.tif`` plus optional GeoPackage/GeoJSON).
+    year (``{name}_{year}_ndvi.tif`` plus optional GeoPackage/GeoJSON) and
+    temporal statistic (``{name}_{year}_max_ndvi.tif`` for ``max``).
     """
     import calendar
 
@@ -756,6 +784,7 @@ def run_ndvi_column(
             satellite=satellite,
             coverage_rescue=coverage_rescue,
             crs_override=crs_override,
+            temporal_reducers=temporal_reducers,
         )
         if result.get("status") == "cancelled":
             return {"output_paths": output_paths}
@@ -763,18 +792,17 @@ def run_ndvi_column(
             _log_ndvi("WARN", f"Year {year} failed: {result.get('message')}")
             continue
 
-        for suffix, enabled in (
-            ("_ndvi.tif", save_geotiff),
-            ("_ndvi.gpkg", save_gpkg),
-            ("_ndvi.geojson", save_geojson),
-            ("_ndvi.json", True),
-        ):
-            p = os.path.join(job_folder, f"{output_name}{suffix}")
-            if enabled and os.path.exists(p):
-                output_paths.append(p)
-        tiles_dir = os.path.join(job_folder, f"{output_name}_ndvi_tiles")
-        if save_cluster_tiles and os.path.isdir(tiles_dir):
-            output_paths.append(tiles_dir)
+        output_paths.extend(
+            _ndvi_output_paths(
+                job_folder,
+                output_name,
+                temporal_reducers,
+                save_geotiff=save_geotiff,
+                save_gpkg=save_gpkg,
+                save_geojson=save_geojson,
+                save_cluster_tiles=save_cluster_tiles,
+            )
+        )
 
     ctx.progress(value=1.0, status_text="Completed")
     return {"output_paths": output_paths}

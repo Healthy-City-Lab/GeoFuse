@@ -517,6 +517,7 @@ def run_ndvi_child(
     event_queue,
     cancel_event,
     pause_event=None,
+    temporal_reducers=("median",),
 ) -> None:
     """Subprocess entry point for ``run_ndvi`` (single date range).
 
@@ -549,6 +550,7 @@ def run_ndvi_child(
             save_cluster_tiles=save_cluster_tiles,
             satellite=satellite,
             coverage_rescue=coverage_rescue,
+            temporal_reducers=temporal_reducers,
         )
         event_queue.put((MSG_COMPLETE, list(result.get("output_paths") or [])))
 
@@ -581,6 +583,7 @@ def run_ndvi_column_child(
     event_queue,
     cancel_event,
     pause_event=None,
+    temporal_reducers=("median",),
 ) -> None:
     """Subprocess entry point for ``run_ndvi_column`` (one raster per year)."""
     try:
@@ -607,6 +610,7 @@ def run_ndvi_column_child(
             save_cluster_tiles=save_cluster_tiles,
             satellite=satellite,
             coverage_rescue=coverage_rescue,
+            temporal_reducers=temporal_reducers,
         )
         event_queue.put((MSG_COMPLETE, list(result.get("output_paths") or [])))
 
