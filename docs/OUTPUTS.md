@@ -61,14 +61,16 @@ Default: GeoTIFF on, GeoPackage off, GeoJSON off.
 | `[name]_ndvi.json` | Sidecar, always written on success (see below) |
 | `[name]_ndvi.gpkg` / `.geojson` | Per-pixel points, planar CRS and EPSG:4326 respectively |
 | `[name]_ndvi_tiles/` | One GeoTIFF per connected component, plus an index |
-| `[name]_temporal_ndvi/` | Per-year mode: one full output set per year |
+| `[name]_mean_ndvi.*` / `[name]_max_ndvi.*` | The same set for each other temporal statistic picked |
+| `[name]_temporal_ndvi/` | Per-year mode: one full output set per year and statistic |
 
 The sidecar lets fusion and other tools introspect a raster without re-running
 Earth Engine. It records the export CRS, the satellite and collection used, the
 dates requested and the dates actually queried (which differ if a sparse window
-was widened), the cloud threshold and surviving image count, resolution, how the
-input decomposed into clusters and tiles, any tiles that exhausted their retries
-and so appear as gaps, and the maximum map distortion.
+was widened), the temporal statistic (`temporal_reducer`), the cloud threshold
+and surviving image count, resolution, how the input decomposed into clusters
+and tiles, any tiles that exhausted their retries and so appear as gaps, and the
+maximum map distortion.
 
 ---
 

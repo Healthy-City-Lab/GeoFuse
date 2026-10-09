@@ -46,15 +46,23 @@ per-cluster tiles, and a metadata sidecar.
 
 - Fetches cloud-masked Sentinel-2 or Landsat imagery. `auto` picks Sentinel-2
   from 2017 onward and Landsat before that, harmonising the older TM/ETM+
-  sensors to the Landsat-8 scale so values stay comparable across years.
+  sensors to the Landsat-8 scale so values stay comparable across years. Pick
+  one sensor instead to keep a multi-year series on one instrument.
 - Dates can be given as ranges, as specific dates with a window, or as a year
   column that splits the layer and composites each year over the growing-season
   months you choose.
+- Each pixel's value is a temporal statistic of the window's cloud-free images:
+  the median (default), the mean, or the maximum. Each date mode takes any
+  combination; every statistic writes its own files, and one download per tile
+  serves all of them.
+- Downloaded tiles are cached per statistic, compactly and without changing any
+  output, so a re-run, or a run that adds a statistic, fetches only what is
+  missing.
 - Tiles export on a shared snap grid and are mosaicked without a second
   reprojection, so output pixels are exactly what Earth Engine produced.
 - Distinguishes "no images in range" from "all images too cloudy", widens a
-  sparse window once and records that it did, and lists any missing tiles in the
-  sidecar.
+  sparse window once and records that it did (turn this off for year-matched
+  composites), and lists any missing tiles in the sidecar.
 - Can optionally sample values onto your own features, exactly or as a zonal
   statistic over a buffer.
 

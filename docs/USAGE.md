@@ -22,7 +22,11 @@ responsive and several study areas can run at once.
 
 1. **NDVI tab.** Upload a study area, set a date range, run. For year-by-year
    data choose the per-year mode, pick the year column and the growing-season
-   months, and each year becomes its own aligned raster.
+   months, and each year becomes its own aligned raster. Each date mode has a
+   **Temporal statistic** picker: median (default), mean, maximum, or any
+   combination, each written as its own file. **Satellite** and **Coverage
+   rescue** sit with the download settings; turn rescue off when composites must
+   cover exactly the dates you asked for, such as year-matched series.
 2. **GVI tab.** Upload the same area, set grid resolution and buffer, run. To
    match a past year, target a capture year and optionally cap the year gap.
    The per-year mode works as it does for NDVI.
