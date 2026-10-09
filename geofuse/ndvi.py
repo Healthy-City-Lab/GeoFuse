@@ -19,6 +19,7 @@ from shapely.geometry import box
 
 from .core import build_planar_tiles
 from .crs_utils import (
+    default_geotiff_creation_options,
     raster_geographic_bounds,
     reproject_geodataframe_to_wgs84,
     select_grid_crs_with_warning,
@@ -234,6 +235,41 @@ def _compute_resume_key(
     h.update(f"|{start_date}|{end_date}|{cloud_max}|{resolution}|".encode())
     h.update(ee_collection.encode())
     return h.hexdigest()[:16]
+
+
+def _extract_band(
+    src_path: str, band: int, dst_path: str, *, dtype: str | None = None
+) -> None:
+    """Write band ``band`` of ``src_path`` to its own compressed GeoTIFF.
+
+    ``dtype`` defaults to the source's. Cache tiles are stored as float32:
+    every mosaic built from them is float32, so outputs match a mosaic of
+    Earth Engine's own float64 files exactly, and with DEFLATE plus the
+    floating-point predictor a tile takes under half the bytes. The file is
+    written to ``.part`` and renamed, so a tile on disk is always whole.
+    """
+    with rasterio.open(src_path) as src:
+        out_dtype = dtype or src.dtypes[band - 1]
+        data = src.read(band, out_dtype=out_dtype)
+        profile = {
+            "driver": "GTiff",
+            "height": src.height,
+            "width": src.width,
+            "count": 1,
+            "dtype": out_dtype,
+            "crs": src.crs,
+            "transform": src.transform,
+            "nodata": src.nodata,
+        }
+    profile.update(default_geotiff_creation_options(out_dtype))
+    part = dst_path + ".part"
+    try:
+        with rasterio.open(part, "w", **profile) as dst:
+            dst.write(data, 1)
+        os.replace(part, dst_path)
+    finally:
+        if os.path.exists(part):
+            os.remove(part)
 
 
 def _discover_resumable_tiles(
@@ -1442,7 +1478,7 @@ class NDVIEngine:
         crs_transform: list[float],
         cancel_callback: Callable[[], bool] | None,
     ) -> dict:
-        """Worker: one tile downloaded from EE straight into the planar cache.
+        """Worker: one tile downloaded from EE into the planar cache.
 
         Runs on a ThreadPoolExecutor thread (see :meth:`_download_with_tiling`).
         Returns ``{success, tile_final, idx, error}``; failures surface as
@@ -1454,6 +1490,12 @@ class NDVIEngine:
         the origin globally) and the mosaic step joins them with zero
         sub-pixel drift. A single final reproject converts the merged planar
         mosaic to WGS84 with explicit nodata.
+
+        The download is stored as a compact float32 cache tile by
+        :func:`_extract_band`. The request itself keeps Earth Engine's float64
+        encoding: a float32 request comes back with ``-inf`` at edge pixels
+        outside the tile's clip, which would overwrite a neighbour's valid
+        pixels where tiles overlap in the mosaic.
 
         Cancel checks short-circuit at safe boundaries — Earth Engine's HTTP
         call is one blocking step that can't be killed mid-flight, so a
@@ -1468,12 +1510,13 @@ class NDVIEngine:
             return result
 
         tile_final = os.path.join(work_dir, f"tile_{idx}.tif")
+        download = os.path.join(work_dir, f"tile_{idx}.download.tif")
 
         try:
             self._export_region_adaptive(
                 ndvi_median,
                 tile_geom,
-                tile_final,
+                download,
                 export_crs=export_crs,
                 crs_transform=crs_transform,
                 cancel_callback=cancel_callback,
@@ -1482,10 +1525,9 @@ class NDVIEngine:
             )
 
             if cancel_callback and cancel_callback():
-                if os.path.exists(tile_final):
-                    os.remove(tile_final)
                 return result
 
+            _extract_band(download, 1, tile_final, dtype="float32")
             result["success"] = True
             result["tile_final"] = tile_final
             return result
@@ -1497,6 +1539,12 @@ class NDVIEngine:
                     pass
             result["error"] = f"{type(e).__name__}: {e}"
             return result
+        finally:
+            if os.path.exists(download):
+                try:
+                    os.remove(download)
+                except OSError:
+                    pass
 
     def _export_region_adaptive(
         self,
@@ -1648,7 +1696,9 @@ class NDVIEngine:
         # place so a future run with the same ``resume_key`` (same area +
         # date range + cloud max + resolution + collection) reuses every
         # tile instantly. The cache's LRU + size cap reclaims old entries
-        # when it grows past the configured ceiling.
+        # when it grows past the configured ceiling. Tiles are float32 with
+        # DEFLATE and the floating-point predictor (``_extract_band``);
+        # older float64 tiles stay readable and give identical mosaics.
         work_dir = self.tile_cache.workspace_dir(resume_key or "scratch")
 
         # Resume: any tile already present on disk (and openable as a
