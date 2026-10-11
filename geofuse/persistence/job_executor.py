@@ -387,6 +387,10 @@ class JobExecutor:
         satellite: str = "auto",
         coverage_rescue: bool = True,
         temporal_reducers: Sequence[str] = ("median",),
+        water_mask: bool = False,
+        cloud_handling: str = "scene_filter",
+        reflectance: str = "surface",
+        substitute_2012: bool = False,
     ) -> Future:
         """Run an NDVI (single-range) job in a fresh subprocess.
 
@@ -421,6 +425,10 @@ class JobExecutor:
                 satellite=satellite,
                 coverage_rescue=coverage_rescue,
                 temporal_reducers=tuple(temporal_reducers),
+                water_mask=bool(water_mask),
+                cloud_handling=str(cloud_handling),
+                reflectance=str(reflectance),
+                substitute_2012=bool(substitute_2012),
             ),
             process_name=f"ndvi-child-{record.id}",
         )
@@ -445,6 +453,10 @@ class JobExecutor:
         satellite: str = "auto",
         coverage_rescue: bool = True,
         temporal_reducers: Sequence[str] = ("median",),
+        water_mask: bool = False,
+        cloud_handling: str = "scene_filter",
+        reflectance: str = "surface",
+        substitute_2012: bool = False,
     ) -> Future:
         """Run a per-year NDVI (date-column) job in a fresh subprocess."""
         from geofuse.jobs.subprocess_runner import run_ndvi_column_child
@@ -471,6 +483,10 @@ class JobExecutor:
                 satellite=satellite,
                 coverage_rescue=coverage_rescue,
                 temporal_reducers=tuple(temporal_reducers),
+                water_mask=bool(water_mask),
+                cloud_handling=str(cloud_handling),
+                reflectance=str(reflectance),
+                substitute_2012=bool(substitute_2012),
             ),
             process_name=f"ndvi-col-child-{record.id}",
         )

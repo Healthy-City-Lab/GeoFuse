@@ -120,6 +120,54 @@ class RunnerTests(unittest.TestCase):
             ["site_ndvi.tif", "site_ndvi.json"],
         )
 
+    def test_acquisition_options_reach_the_engine_in_every_mode(self):
+        opts = dict(
+            water_mask=True,
+            cloud_handling="pixel_only",
+            reflectance="toa",
+            substitute_2012=True,
+            satellite="landsat_no_slc_off",
+        )
+        runners.run_ndvi(
+            _Ctx(),
+            fname="site.geojson",
+            dataset_data={"raw": _points([2012])},
+            start_date="2012-06-01",
+            end_date="2012-09-30",
+            output_name="site",
+            **opts,
+            **self._common(),
+        )
+        runners.run_ndvi_column(
+            _Ctx(),
+            fname="site.geojson",
+            dataset_data={"raw": _points([2012])},
+            date_column="year",
+            season_start_month=5,
+            season_end_month=9,
+            **opts,
+            **self._common(),
+        )
+        for call in _StubEngine.calls:
+            self.assertEqual({k: call[k] for k in opts}, opts)
+
+    def test_acquisition_defaults(self):
+        runners.run_ndvi(
+            _Ctx(),
+            fname="site.geojson",
+            dataset_data={"raw": _points([2020])},
+            start_date="2023-06-01",
+            end_date="2023-09-30",
+            output_name="site",
+            **self._common(),
+        )
+        call = _StubEngine.calls[0]
+        self.assertEqual(
+            (call["water_mask"], call["cloud_handling"], call["reflectance"]),
+            (False, "scene_filter", "surface"),
+        )
+        self.assertFalse(call["substitute_2012"])
+
     def test_column_job_per_year_and_statistic(self):
         out = runners.run_ndvi_column(
             _Ctx(),

@@ -622,6 +622,10 @@ def run_ndvi(
     satellite: str = "auto",
     coverage_rescue: bool = True,
     temporal_reducers: Sequence[str] = ("median",),
+    water_mask: bool = False,
+    cloud_handling: str = "scene_filter",
+    reflectance: str = "surface",
+    substitute_2012: bool = False,
 ) -> dict:
     """Run NDVI for a single date range, one set of files per statistic."""
     from geofuse.crs_utils import buffer_gdf_union_metres
@@ -656,6 +660,10 @@ def run_ndvi(
         satellite=satellite,
         coverage_rescue=coverage_rescue,
         temporal_reducers=temporal_reducers,
+        water_mask=water_mask,
+        cloud_handling=cloud_handling,
+        reflectance=reflectance,
+        substitute_2012=substitute_2012,
     )
 
     if result.get("status") == "cancelled":
@@ -696,6 +704,10 @@ def run_ndvi_column(
     satellite: str = "auto",
     coverage_rescue: bool = True,
     temporal_reducers: Sequence[str] = ("median",),
+    water_mask: bool = False,
+    cloud_handling: str = "scene_filter",
+    reflectance: str = "surface",
+    substitute_2012: bool = False,
 ) -> dict:
     """Run one NDVI raster per year present in ``date_column``.
 
@@ -785,6 +797,10 @@ def run_ndvi_column(
             coverage_rescue=coverage_rescue,
             crs_override=crs_override,
             temporal_reducers=temporal_reducers,
+            water_mask=water_mask,
+            cloud_handling=cloud_handling,
+            reflectance=reflectance,
+            substitute_2012=substitute_2012,
         )
         if result.get("status") == "cancelled":
             return {"output_paths": output_paths}
