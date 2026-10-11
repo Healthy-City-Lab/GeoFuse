@@ -25,7 +25,16 @@ tiles, GeoJSON, and the raw panoramas and segmentation masks.
   pixels classed vegetation plus terrain.
 - Can target a historical capture year rather than the latest imagery, with an
   optional maximum year gap. The capture date lands in a `pano_date` column, so
-  year-matched runs are usable for longitudinal analysis.
+  year-matched runs are usable for longitudinal analysis. A specific-year run
+  carries its year in the file names, so one layer can be run for several
+  years into one folder.
+- Can limit captures to a range of months, such as May to October for leaf-on
+  panoramas, either excluding the rest or using them only when nothing in the
+  window exists. It applies in every capture mode; within a year the capture
+  nearest the middle of the window wins. Off by default.
+- The sidecar records the capture rule and what was sampled: points with a
+  value, points with no capture in the window, and the capture years and months
+  used.
 - Can split a layer by a year or date column and produce one output per year.
 - Files can be merged into groups before running, so a year split across several
   files yields a single output.

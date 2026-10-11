@@ -33,7 +33,8 @@ responsive and several study areas can run at once.
    series.
 2. **GVI tab.** Upload the same area, set grid resolution and buffer, run. To
    match a past year, target a capture year and optionally cap the year gap.
-   The per-year mode works as it does for NDVI.
+   **Limit capture months** keeps panoramas to a season, for example May to
+   October so trees are in leaf. The per-year mode works as it does for NDVI.
 3. **Fusion tab.** Upload the outcome layer plus the files from steps 1 and 2,
    set the run mode and objective, and run.
 4. Read the results panel and export.
