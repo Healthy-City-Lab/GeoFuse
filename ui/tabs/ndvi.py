@@ -64,7 +64,34 @@ _SATELLITE_LABELS = {
     "auto": "Auto (Sentinel-2 from 2017-03-28)",
     "sentinel2": "Sentinel-2",
     "landsat": "Landsat (5 / 7 / 8 / 9)",
+    "landsat_no_slc_off": "Landsat 5 / 7 / 8, no SLC-off",
 }
+_REFLECTANCE_LABELS = {"surface": "Surface reflectance", "toa": "Top of atmosphere"}
+_CLOUD_LABELS = {
+    "scene_filter": "Drop cloudy scenes, mask cloudy pixels",
+    "pixel_only": "Keep every scene, mask cloudy pixels",
+    "scene_only": "Drop cloudy scenes, keep their pixels",
+}
+
+# Download settings and their defaults (today's behaviour). Seeded into
+# session state before the widgets render, so a preset can set them too.
+_SETTING_DEFAULTS = {
+    "ndvi_satellite": "auto",
+    "ndvi_reflectance": "surface",
+    "ndvi_cloud_handling": "scene_filter",
+    "ndvi_cloud": 10,
+    "ndvi_res": 10,
+    "ndvi_buffer": 0,
+    "ndvi_coverage_rescue": True,
+    "ndvi_water_mask": False,
+    "ndvi_substitute_2012": False,
+}
+
+
+def _seed_settings() -> None:
+    for key, value in _SETTING_DEFAULTS.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
 
 def _job_options(p: dict) -> dict:
@@ -74,18 +101,30 @@ def _job_options(p: dict) -> dict:
         "temporal_reducers": list(p.get("temporal_reducers") or ["median"]),
         "satellite": str(p.get("satellite", "auto")),
         "coverage_rescue": bool(p.get("coverage_rescue", True)),
+        "water_mask": bool(p.get("water_mask", False)),
+        "cloud_handling": str(p.get("cloud_handling", "scene_filter")),
+        "reflectance": str(p.get("reflectance", "surface")),
+        "substitute_2012": bool(p.get("substitute_2012", False)),
     }
 
 
-def _job_options_line(p: dict) -> str:
+def _job_options_lines(p: dict) -> list[str]:
     o = _job_options(p)
     stats = ", ".join(_STAT_LABELS.get(r, r) for r in o["temporal_reducers"])
-    rescue = "on" if o["coverage_rescue"] else "off"
-    return (
+
+    def onoff(flag: bool) -> str:
+        return "on" if flag else "off"
+
+    return [
         f"**Temporal statistic:** {stats} · "
         f"**Satellite:** {_SATELLITE_LABELS.get(o['satellite'], o['satellite'])} · "
-        f"**Coverage rescue:** {rescue}"
-    )
+        f"**Reflectance:** "
+        f"{_REFLECTANCE_LABELS.get(o['reflectance'], o['reflectance'])}",
+        f"**Clouds:** {_CLOUD_LABELS.get(o['cloud_handling'], o['cloud_handling'])} · "
+        f"**Water mask:** {onoff(o['water_mask'])} · "
+        f"**Coverage rescue:** {onoff(o['coverage_rescue'])} · "
+        f"**2012 from 2013:** {onoff(o['substitute_2012'])}",
+    ]
 
 
 def _render_stat_select(cfg: dict, cfg_key: str, key: str) -> None:
@@ -257,7 +296,7 @@ def _ndvi_restart_summary_lines(p: dict) -> list[str]:
         f"**Resolution:** {p.get('resolution', '?')} m · "
         f"**Buffer:** {p.get('buffer_m', '?')} m"
     )
-    lines.append(_job_options_line(p))
+    lines.extend(_job_options_lines(p))
     lines.append(
         f"**Outputs:** GeoTIFF={bool(p.get('save_geotiff'))} · "
         f"GeoPackage={bool(p.get('save_gpkg'))} · "
@@ -602,17 +641,58 @@ def _render_ndvi_settings_map() -> None:
     fc_ndvi_l, fc_ndvi_r = st.columns(2)
     with fc_ndvi_l:
         with st.container(border=True):
+            _seed_settings()
+            sat_col, refl_col = st.columns(2)
+            sat_col.selectbox(
+                "Satellite",
+                list(_SATELLITE_LABELS),
+                format_func=_SATELLITE_LABELS.get,
+                key="ndvi_satellite",
+                help=(
+                    "Auto uses Sentinel-2 for windows ending on or after "
+                    "2017-03-28 and Landsat before. Pick one sensor to keep a "
+                    "multi-year series on one instrument. **Landsat 5 / 7 / 8, "
+                    "no SLC-off** leaves out Landsat 7 scenes taken after its "
+                    "2003 scan-line failure (striped) and Landsat 9."
+                ),
+            )
+            refl_col.selectbox(
+                "Reflectance",
+                list(_REFLECTANCE_LABELS),
+                format_func=_REFLECTANCE_LABELS.get,
+                key="ndvi_reflectance",
+                help=(
+                    "Surface reflectance is atmospherically corrected "
+                    "(Level-2). Top of atmosphere is the uncorrected product "
+                    "(Landsat Collection 2 TOA, Sentinel-2 Level-1C): its NDVI "
+                    "reads lower over vegetation, and older Landsat sensors "
+                    "are not harmonised to Landsat 8."
+                ),
+            )
+            st.selectbox(
+                "Cloud handling",
+                list(_CLOUD_LABELS),
+                format_func=_CLOUD_LABELS.get,
+                key="ndvi_cloud_handling",
+                help=(
+                    "Scenes above the cloud threshold can be dropped, the "
+                    "pixels flagged as cloud, shadow or snow in each scene "
+                    "can be masked, or both (the default)."
+                ),
+            )
             st.slider(
                 "Maximum Cloud Coverage (%)",
                 0,
                 100,
-                10,
                 key="ndvi_cloud",
-                help="Cloud mask threshold for Earth Engine, applied on Run.",
+                disabled=st.session_state["ndvi_cloud_handling"] == "pixel_only",
+                help=(
+                    "Scenes whose cloud cover is above this are dropped. Not "
+                    "used when every scene is kept."
+                ),
             )
             st.number_input(
                 "Resolution (m)",
-                value=10,
                 min_value=10,
                 key="ndvi_res",
                 help="Target pixel size for the NDVI raster export.",
@@ -621,29 +701,36 @@ def _render_ndvi_settings_map() -> None:
                 "Download Buffer (m)",
                 min_value=0,
                 max_value=2000,
-                value=0,
                 step=50,
                 key="ndvi_buffer",
                 help="Expand the study area outward by this distance (metres) before download.",
             )
-            st.selectbox(
-                "Satellite",
-                list(_SATELLITE_LABELS),
-                format_func=_SATELLITE_LABELS.get,
-                key="ndvi_satellite",
-                help=(
-                    "Auto uses Sentinel-2 for windows ending on or after "
-                    "2017-03-28 and Landsat before. Pick one sensor to keep a "
-                    "multi-year series on one instrument."
-                ),
-            )
-            st.checkbox(
+            chk_rescue, chk_water, chk_2012 = st.columns(3)
+            chk_rescue.checkbox(
                 "Coverage rescue",
-                value=True,
                 key="ndvi_coverage_rescue",
                 help=(
                     "Widen a window by ±50 % once when fewer than 3 cloud-free "
                     "images remain. Turn off for year-matched composites."
+                ),
+            )
+            chk_water.checkbox(
+                "Mask water",
+                key="ndvi_water_mask",
+                help=(
+                    "Mask pixels open water covers at least half the time "
+                    "(JRC Global Surface Water occurrence ≥ 50 %). Off keeps "
+                    "water in the composite."
+                ),
+            )
+            chk_2012.checkbox(
+                "Fill 2012 with 2013",
+                key="ndvi_substitute_2012",
+                help=(
+                    "Fill a window that lies wholly inside 2012 with the same "
+                    "days of 2013, in every date mode. The file keeps its 2012 "
+                    "name and its sidecar records the substitution. Landsat "
+                    "without striped Landsat 7 scenes has no 2012 imagery."
                 ),
             )
     with fc_ndvi_r:
@@ -1085,6 +1172,14 @@ def render(output_dir: str) -> None:
     buffer_m = int(st.session_state.get("ndvi_buffer", 0))
     satellite = str(st.session_state.get("ndvi_satellite", "auto"))
     coverage_rescue = bool(st.session_state.get("ndvi_coverage_rescue", True))
+    acquisition = {
+        "water_mask": bool(st.session_state.get("ndvi_water_mask", False)),
+        "cloud_handling": str(
+            st.session_state.get("ndvi_cloud_handling", "scene_filter")
+        ),
+        "reflectance": str(st.session_state.get("ndvi_reflectance", "surface")),
+        "substitute_2012": bool(st.session_state.get("ndvi_substitute_2012", False)),
+    }
     ndvi_out_ok = (
         st.session_state.get("ndvi_out_geotiff", True)
         or st.session_state.get("ndvi_out_gpkg", False)
@@ -1122,6 +1217,7 @@ def render(output_dir: str) -> None:
                     "temporal_reducers": list(stats),
                     "satellite": satellite,
                     "coverage_rescue": coverage_rescue,
+                    **acquisition,
                 }
 
             for unit in _ndvi_units():

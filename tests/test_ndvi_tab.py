@@ -103,8 +103,46 @@ class ResubmitTests(unittest.TestCase):
         self.assertIn(
             "**Temporal statistic:** Median, Maximum · "
             "**Satellite:** Auto (Sentinel-2 from 2017-03-28) · "
-            "**Coverage rescue:** on",
+            "**Reflectance:** Surface reflectance",
             lines,
+        )
+        self.assertIn(
+            "**Clouds:** Drop cloudy scenes, mask cloudy pixels · "
+            "**Water mask:** off · **Coverage rescue:** on · "
+            "**2012 from 2013:** off",
+            lines,
+        )
+
+    def test_acquisition_options_replay(self):
+        _params, (_kind, kw) = self._resubmit(
+            fname="site.geojson",
+            mode="range",
+            start_date="2012-06-01",
+            end_date="2012-09-30",
+            water_mask=True,
+            cloud_handling="pixel_only",
+            reflectance="toa",
+            substitute_2012=True,
+            satellite="landsat_no_slc_off",
+        )
+        self.assertEqual(
+            {k: kw[k] for k in ("water_mask", "cloud_handling", "reflectance", "substitute_2012", "satellite")},
+            {
+                "water_mask": True,
+                "cloud_handling": "pixel_only",
+                "reflectance": "toa",
+                "substitute_2012": True,
+                "satellite": "landsat_no_slc_off",
+            },
+        )
+
+    def test_old_job_gets_acquisition_defaults(self):
+        _params, (_kind, kw) = self._resubmit(
+            fname="site.geojson", mode="range", start_date="2023-06-01", end_date="2023-09-30"
+        )
+        self.assertEqual(
+            (kw["water_mask"], kw["cloud_handling"], kw["reflectance"], kw["substitute_2012"]),
+            (False, "scene_filter", "surface", False),
         )
 
 
@@ -179,6 +217,61 @@ class DateConfigPickerTests(unittest.TestCase):
                 "Select at least one temporal statistic.",
                 [w.value for w in at.warning],
             )
+
+
+class SettingsBoxTests(unittest.TestCase):
+    """Download settings: defaults are today's behaviour, every option is the user's."""
+
+    APP = textwrap.dedent(
+        """
+        import os, sys
+        ROOT = {root!r}
+        for p in (os.path.join(ROOT, "ui"), ROOT):
+            if p not in sys.path:
+                sys.path.insert(0, p)
+        import streamlit as st
+        from tabs import ndvi as ndvi_tab
+        if "ndvi_datasets" not in st.session_state:
+            st.session_state.ndvi_datasets = {{}}
+        ndvi_tab._render_ndvi_settings_map()
+        """
+    )
+
+    def test_defaults_and_cloud_threshold(self):
+        from streamlit.testing.v1 import AppTest
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "app.py")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(self.APP.format(root=ROOT))
+            at = AppTest.from_file(path, default_timeout=60)
+            at.run()
+            self.assertFalse(at.exception)
+            self.assertEqual(at.selectbox(key="ndvi_satellite").value, "auto")
+            self.assertEqual(at.selectbox(key="ndvi_reflectance").value, "surface")
+            self.assertEqual(at.selectbox(key="ndvi_cloud_handling").value, "scene_filter")
+            self.assertFalse(at.checkbox(key="ndvi_water_mask").value)
+            self.assertFalse(at.checkbox(key="ndvi_substitute_2012").value)
+            self.assertTrue(at.checkbox(key="ndvi_coverage_rescue").value)
+            self.assertFalse(at.slider(key="ndvi_cloud").disabled)
+            self.assertEqual(
+                at.selectbox(key="ndvi_satellite").options,
+                [
+                    "Auto (Sentinel-2 from 2017-03-28)",
+                    "Sentinel-2",
+                    "Landsat (5 / 7 / 8 / 9)",
+                    "Landsat 5 / 7 / 8, no SLC-off",
+                ],
+            )
+
+            at.selectbox(key="ndvi_cloud_handling").set_value("pixel_only")
+            at.checkbox(key="ndvi_water_mask").check()
+            at.run()
+            self.assertTrue(at.slider(key="ndvi_cloud").disabled)
+            self.assertTrue(at.session_state["ndvi_water_mask"])
+            at.selectbox(key="ndvi_cloud_handling").set_value("scene_only")
+            at.run()
+            self.assertFalse(at.slider(key="ndvi_cloud").disabled)
 
 
 if __name__ == "__main__":

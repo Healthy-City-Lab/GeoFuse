@@ -215,7 +215,14 @@ def _render_details(rec) -> None:
         rescue = "on" if p.get("coverage_rescue", True) else "off"
         st.write(
             f"**Satellite:** {p.get('satellite', 'auto')} · "
+            f"**Reflectance:** {p.get('reflectance', 'surface')} · "
             f"**Coverage rescue:** {rescue}"
+        )
+        water = "on" if p.get("water_mask") else "off"
+        fill = "on" if p.get("substitute_2012") else "off"
+        st.write(
+            f"**Clouds:** {p.get('cloud_handling', 'scene_filter')} · "
+            f"**Water mask:** {water} · **2012 from 2013:** {fill}"
         )
         st.write(
             f"**Outputs:** GeoTIFF={bool(p.get('save_geotiff'))} · "
