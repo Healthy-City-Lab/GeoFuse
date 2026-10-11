@@ -869,6 +869,7 @@ def _posterior_summary(params: dict) -> dict:
         "divergences": post.get("divergences"),
         # The grid axes the posterior estimated rather than the sweep picked.
         "radius_kernel": post.get("radius_kernel"),
+        "radius_prior": post.get("radius_prior", "rungs"),
         "radii": post.get("radii"),
         "radius_profile": post.get("radius_profile"),
         "projected_pick": post.get("projected_pick"),

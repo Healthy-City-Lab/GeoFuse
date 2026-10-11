@@ -3259,6 +3259,7 @@ class MetricFusionEngine:
         chains: int = 4,
         radius_kernel: str = "lognormal",
         aggregator: str = "dirichlet",
+        radius_prior: str = "rungs",
         seed: int = 42,
         cancel_callback: Callable[..., bool] | None = None,
         progress_callback: Callable[[int, int], None] | None = None,
@@ -3281,6 +3282,8 @@ class MetricFusionEngine:
         so the null rate covers the form choice too. ``outcome`` names a
         negative-control column to tune on instead of the target, which is
         what :meth:`retune_concordance` uses; entities missing it are dropped.
+        ``radius_prior`` (``bayesian_index.RADIUS_PRIORS``) ties the radius
+        kernel's prior to the listed rungs or to the range they span.
         """
         t0 = time.perf_counter()
         steps, done = 5, 0
@@ -3419,6 +3422,7 @@ class MetricFusionEngine:
             chains=chains,
             seed=seed,
             column_sd=prep_info["column_sd"],
+            radius_prior=radius_prior,
         )
         null = (
             bayesian_index.null_calibration(

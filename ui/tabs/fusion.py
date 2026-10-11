@@ -505,9 +505,16 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "posterior_draws",
     "posterior_warmup",
     "posterior_chains",
+    "radius_prior",
     "check_collinearity",
     "vif_threshold",
 )
+
+# Radius-prior options of the discovery model (``bayesian_index.RADIUS_PRIORS``).
+_RADIUS_PRIOR_LABELS: dict[str, str] = {
+    "rungs": "Rung-based",
+    "range": "Range-based (spacing-invariant)",
+}
 
 # Recorded param -> form widget key. Re-run seeds these so the normal setup
 # form comes up filled in; anything not listed keeps its own default.
@@ -527,6 +534,7 @@ _FUSION_PARAM_TO_WIDGET: dict[str, str] = {
     "null_calibration_runs": "fusion_null_calibration_runs",
     "posterior_draws": "fusion_posterior_draws",
     "posterior_chains": "fusion_posterior_chains",
+    "radius_prior": "fusion_radius_prior",
     "check_collinearity": "fusion_check_collinearity",
     "vif_threshold": "fusion_vif_threshold",
     "cgi_grid_spacing_m": "fusion_cgi_grid_spacing_m",
@@ -1995,6 +2003,23 @@ def _render_study_details_panel(
                 "surface is the evidence — a single split's winner is noise."
             ),
         )
+    col_r0, _col_r1, _col_r2 = st.columns(3)
+    with col_r0:
+        _default("fusion_radius_prior", "rungs", list(_RADIUS_PRIOR_LABELS))
+        radius_prior_ui = st.selectbox(
+            "Radius prior",
+            options=list(_RADIUS_PRIOR_LABELS),
+            format_func=_RADIUS_PRIOR_LABELS.get,
+            key="fusion_radius_prior",
+            help=(
+                "How the distance-of-influence prior relates to the buffer "
+                "ladder. **Range-based** spreads it over the range the rungs "
+                "span and weighs each rung by the distance it covers, so a "
+                "dense and a sparse ladder over the same range carry the same "
+                "prior. **Rung-based** takes it from the listed rungs, which "
+                "pulls it towards the dense top of a linear ladder."
+            ),
+        )
 
     with st.expander("Validation & reporting", expanded=False):
         _default("fusion_discovery_reps", 5)
@@ -2253,6 +2278,7 @@ def _render_study_details_panel(
         "posterior_draws": int(posterior_draws_ui),
         "posterior_warmup": int(posterior_warmup_ui),
         "posterior_chains": int(posterior_chains_ui),
+        "radius_prior": str(radius_prior_ui),
         "check_collinearity": bool(check_collinearity),
         "vif_threshold": float(vif_threshold_ui),
     }
@@ -3123,6 +3149,17 @@ def _render_fitted_grid(summary: dict, _pd, _label) -> None:
             ),
             width="stretch",
             hide_index=True,
+        )
+        prior_mode = summary.get("radius_prior", "rungs")
+        st.caption(
+            f"Radius prior: {_RADIUS_PRIOR_LABELS.get(prior_mode, prior_mode)}."
+            + (
+                " Its interval comes from the listed rungs, so it moves with "
+                "the ladder's spacing."
+                if prior_mode == "rungs"
+                else " Its interval covers the range the rungs span, whatever "
+                "their spacing."
+            )
         )
         # A channel whose scale is genuinely learned lands near 0.1; one the
         # data is silent about lands near 0.8, not at 1.0, because the kernel
@@ -5340,6 +5377,7 @@ def render(output_dir: str) -> None:
         study_state.get("posterior_warmup", posterior_draws_param)
     )
     posterior_chains_param = int(study_state.get("posterior_chains", 4))
+    radius_prior_param = str(study_state.get("radius_prior", "rungs"))
     check_collinearity_param = bool(study_state.get("check_collinearity", False))
     vif_threshold_param = float(study_state.get("vif_threshold", 10.0))
 
@@ -5655,6 +5693,7 @@ def render(output_dir: str) -> None:
                 st.write(
                     f"**Discovery:** {channel_set_param}, form "
                     f"{index_form_param}, {sweep_splits_param} sweep splits, "
+                    f"{radius_prior_param}-based radius prior, "
                     f"{test_size*100:.0f}% test set"
                 )
                 st.write(
@@ -5768,6 +5807,7 @@ def render(output_dir: str) -> None:
                 "posterior_draws": int(posterior_draws_param),
                 "posterior_warmup": int(posterior_warmup_param),
                 "posterior_chains": int(posterior_chains_param),
+                "radius_prior": radius_prior_param,
                 "check_collinearity": bool(check_collinearity_param),
                 "vif_threshold": float(vif_threshold_param),
             }
