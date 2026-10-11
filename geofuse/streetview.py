@@ -97,6 +97,30 @@ class PanoCapture:
     month: int | None
 
 
+def in_month_window(month: int | None, window: tuple[int, int]) -> bool:
+    """Whether ``month`` lies in the inclusive window ``(first, last)``.
+
+    ``first > last`` wraps over the new year (``(11, 3)`` is November to
+    March). An unknown month is never inside.
+    """
+    if month is None:
+        return False
+    first, last = int(window[0]), int(window[1])
+    if first <= last:
+        return first <= month <= last
+    return month >= first or month <= last
+
+
+def month_distance(month: int | None, window: tuple[int, int]) -> float:
+    """Months between ``month`` and the window's middle, around the year."""
+    if month is None:
+        return float("inf")
+    first, last = int(window[0]), int(window[1])
+    middle = first + ((last - first) % 12) / 2.0
+    gap = abs((month - middle) % 12)
+    return min(gap, 12 - gap)
+
+
 @dataclass
 class StreetViewPanorama:
     """Minimal Street View panorama metadata: ID, location, image grid.
@@ -119,27 +143,45 @@ class StreetViewPanorama:
         return is_third_party_panoid(self.id)
 
     def select_capture(
-        self, target_year: int, max_year_diff: int | None = None
+        self,
+        target_year: int | None,
+        max_year_diff: int | None = None,
+        *,
+        month_window: tuple[int, int] | None = None,
+        month_policy: str = "exclude",
     ) -> PanoCapture | None:
-        """Pick the capture closest to ``target_year``.
+        """Pick the capture closest to ``target_year``, or the most recent one.
 
         When ``max_year_diff`` is given, captures further than that many years
         from the target are filtered out first; if none survive the filter,
         returns ``None``. Ties resolve to the most recent capture.
+
+        ``month_window = (first, last)`` (inclusive months; ``first > last``
+        wraps over the new year) restricts the season: ``"exclude"`` drops
+        captures outside it, and captures with no month, before the year rule;
+        ``"prefer"`` ranks captures inside it first and falls back to the rest
+        only when none is inside. With a window, captures of the same year are
+        ranked by their distance from the window's middle month instead of by
+        recency. ``target_year=None`` means the most recent capture. Without a
+        window the choice is exactly the one made before windows existed.
         """
         caps = self.captures
         if not caps:
             # No temporal metadata was parsed. A hard window can't be
             # verified against an unknown date, so decline it; otherwise fall
             # back to this panorama itself.
-            if max_year_diff is not None:
+            if max_year_diff is not None and target_year is not None:
                 return None
             if self.date is not None:
-                return PanoCapture(self.id, self.date[0], self.date[1])
-            return PanoCapture(self.id, None, None)
+                own = PanoCapture(self.id, self.date[0], self.date[1])
+            else:
+                own = PanoCapture(self.id, None, None)
+            if month_window is None or month_policy == "prefer":
+                return own
+            return own if in_month_window(own.month, month_window) else None
 
         candidates = caps
-        if max_year_diff is not None:
+        if max_year_diff is not None and target_year is not None:
             candidates = [
                 c
                 for c in caps
@@ -147,9 +189,32 @@ class StreetViewPanorama:
             ]
         if not candidates:
             return None
+        if month_window is None:
+            if target_year is None:
+                return max(candidates, key=lambda c: (c.year or 0, c.month or 0))
+            return min(
+                candidates,
+                key=lambda c: (abs(c.year - target_year), -c.year, -(c.month or 0)),
+            )
+
+        inside = [c for c in candidates if in_month_window(c.month, month_window)]
+        if inside or month_policy == "exclude":
+            candidates = inside
+        if not candidates:
+            return None
+
+        def season(c: PanoCapture) -> float:
+            return month_distance(c.month, month_window)
+
+        if target_year is None:
+            return min(candidates, key=lambda c: (-(c.year or 0), season(c)))
         return min(
             candidates,
-            key=lambda c: (abs(c.year - target_year), -c.year, -(c.month or 0)),
+            key=lambda c: (
+                abs(c.year - target_year) if c.year is not None else float("inf"),
+                -(c.year or 0),
+                season(c),
+            ),
         )
 
     def clone_for_capture(self, capture: PanoCapture) -> StreetViewPanorama:

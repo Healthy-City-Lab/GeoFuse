@@ -90,6 +90,12 @@ def _format_pano_date(date: tuple[int, int] | None) -> str | None:
         return None
 
 
+# Result key marking a point whose location has panoramas but none inside
+# the requested year / month window. Counted into the sidecar and dropped
+# before outputs are written, so output schemas are unchanged.
+CAPTURE_STATUS_KEY = "capture_status"
+NO_CAPTURE_IN_WINDOW = "no_capture_in_window"
+
 # Search radius (metres) for find_panorama_async around each grid point.
 _SEARCH_RADIUS_M = 50.0
 # Zoom level for tile downloads: 0 = lowest, 5 = highest. zoom=1 is a 2×1
@@ -280,6 +286,8 @@ class GVIEngine:
         target_year: int | None,
         max_year_diff: int | None,
         throttle: "AdaptiveThrottle | None" = None,
+        month_window: tuple[int, int] | None = None,
+        month_policy: str = "exclude",
     ) -> tuple:
         """Stage 1: resolve a point to a panorama (search + cache lookup).
 
@@ -363,20 +371,34 @@ class GVIEngine:
             )
             return ("done", self._empty_result(pt, search_lat, search_lon))
 
-        # Pick which dated capture to use. Without a target year we keep the
-        # panorama the search returned (the most recent coverage).
+        # Pick which dated capture to use. Without a target year or a month
+        # window we keep the panorama the search returned (the most recent
+        # coverage). A point whose location has panoramas but none inside the
+        # year / month window is marked, so the sidecar can count it.
         download_pano = pano
         pano_date = getattr(pano, "date", None)
-        if target_year is not None:
-            capture = pano.select_capture(target_year, max_year_diff)
+        if target_year is not None or month_window is not None:
+            capture = pano.select_capture(
+                target_year,
+                max_year_diff,
+                month_window=month_window,
+                month_policy=month_policy,
+            )
             if capture is None:
+                window = []
+                if target_year is not None:
+                    window.append(f"{max_year_diff} yr of {target_year}")
+                if month_window is not None:
+                    window.append(f"months {month_window[0]}-{month_window[1]}")
                 _log(
                     "WARN",
-                    f"  Point {idx}: no capture within "
-                    f"{max_year_diff} yr of {target_year} "
-                    f"(available: {[c.year for c in pano.captures]})",
+                    f"  Point {idx}: no capture within {' and '.join(window)} "
+                    f"(available: "
+                    f"{[(c.year, c.month) for c in pano.captures]})",
                 )
-                return ("done", self._empty_result(pt, search_lat, search_lon))
+                miss = self._empty_result(pt, search_lat, search_lon)
+                miss[CAPTURE_STATUS_KEY] = NO_CAPTURE_IN_WINDOW
+                return ("done", miss)
             if capture.id != pano.id:
                 download_pano = pano.clone_for_capture(capture)
             pano_date = (
@@ -688,6 +710,8 @@ class GVIEngine:
         target_year: int | None,
         max_year_diff: int | None,
         pause_callback: Callable[[], bool] | None = None,
+        month_window: tuple[int, int] | None = None,
+        month_policy: str = "exclude",
     ) -> None:
         # Run-local set: tracks panos that already failed in *this* run.
         # Never written to pano_cache (which is the persistent session cache).
@@ -765,6 +789,8 @@ class GVIEngine:
                             target_year,
                             max_year_diff,
                             throttle,
+                            month_window=month_window,
+                            month_policy=month_policy,
                         )
                     except asyncio.CancelledError:
                         return
@@ -914,7 +940,16 @@ class GVIEngine:
         target_year=None,
         max_year_diff=None,
         pause_callback=None,
+        month_window=None,
+        month_policy="exclude",
     ):
+        """Segment the panorama nearest each point and record its GVI.
+
+        ``target_year`` / ``max_year_diff`` choose the historical capture
+        (``None`` keeps the most recent coverage); ``month_window`` /
+        ``month_policy`` restrict it to a season (see
+        :meth:`streetview.StreetViewPanorama.select_capture`).
+        """
         _log("INFO", f"Starting Analysis (Resume Index: {start_index})...")
         if target_year is not None:
             _log(
@@ -925,6 +960,12 @@ class GVIEngine:
                     if max_year_diff is not None
                     else " (closest available)"
                 ),
+            )
+        if month_window is not None:
+            _log(
+                "INFO",
+                f"Capture months {month_window[0]}-{month_window[1]} "
+                f"({month_policy} captures outside them)",
             )
         os.makedirs(folder, exist_ok=True)
         if save_panos:
@@ -1019,6 +1060,8 @@ class GVIEngine:
                 target_year=target_year,
                 max_year_diff=max_year_diff,
                 pause_callback=pause_callback,
+                month_window=month_window,
+                month_policy=month_policy,
             )
         )
 
