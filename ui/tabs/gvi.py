@@ -246,6 +246,51 @@ def _gvi_size_hint(buffer_m: int, step_m: int) -> None:
         st.info(" · ".join(msgs))
 
 
+_MONTH_ABBR = [
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+]
+_MONTH_POLICY_LABELS = {
+    "exclude": "Exclude them",
+    "prefer": "Use them only when nothing fits",
+}
+
+
+def _capture_args(p: dict) -> dict:
+    """Month-window settings recorded on a GVI job (``None`` window = off)."""
+    window = p.get("month_window")
+    return {
+        "month_window": list(window) if window else None,
+        "month_policy": str(p.get("month_policy") or "exclude"),
+    }
+
+
+def _month_window_line(p: dict) -> str:
+    args = _capture_args(p)
+    window = args["month_window"]
+    if not window:
+        return "**Capture months:** any"
+    rule = (
+        "outside excluded"
+        if args["month_policy"] == "exclude"
+        else "outside as fallback"
+    )
+    return (
+        f"**Capture months:** {_MONTH_ABBR[window[0] - 1]}–"
+        f"{_MONTH_ABBR[window[1] - 1]} ({rule})"
+    )
+
+
 def _gvi_restart_summary_lines(p: dict) -> list[str]:
     max_diff = p.get("max_year_diff")
     window = f" (±{max_diff} yr max)" if max_diff is not None else ""
@@ -263,6 +308,7 @@ def _gvi_restart_summary_lines(p: dict) -> list[str]:
         f"**Original file:** `{p.get('fname', '?')}`",
         f"**Grid step:** {p.get('step', '?')} m · **Buffer:** {p.get('buffer', '?')} m",
         year_line,
+        _month_window_line(p),
         f"**Outputs:** GeoPackage={bool(p.get('save_gpkg', True))} · "
         f"GeoTIFF={bool(p.get('save_geotiff'))} · "
         f"GeoJSON={bool(p.get('save_geojson'))}",
@@ -331,6 +377,7 @@ def _gvi_resubmit_from_params(
                 "save_panos": save_panos,
                 "save_masks": save_masks,
                 "max_year_diff": max_year_diff,
+                **_capture_args(p),
             },
             output_dir=output_dir,
             save_gpkg=save_gp,
@@ -356,6 +403,7 @@ def _gvi_resubmit_from_params(
                 "save_masks": save_masks,
                 "target_year": p.get("target_year"),
                 "max_year_diff": max_year_diff,
+                **_capture_args(p),
             },
             output_dir=output_dir,
             save_gpkg=save_gp,
@@ -589,6 +637,7 @@ def _render_gvi_restart_panel(
                     "save_panos": bool(p.get("save_panos")),
                     "save_masks": bool(p.get("save_masks")),
                     "max_year_diff": p.get("max_year_diff"),
+                    **_capture_args(p),
                 },
                 output_dir=output_dir,
                 save_gpkg=bool(p.get("save_gpkg", True)),
@@ -625,6 +674,7 @@ def _render_gvi_restart_panel(
                 "save_masks": bool(p.get("save_masks")),
                 "target_year": p.get("target_year"),
                 "max_year_diff": p.get("max_year_diff"),
+                **_capture_args(p),
             },
             output_dir=output_dir,
             save_gpkg=bool(p.get("save_gpkg", True)),
@@ -771,6 +821,10 @@ def _render_gvi_date_config() -> None:
                 "date_column": None,
                 "use_max_diff": False,
                 "max_diff": 2,
+                "use_months": False,
+                "month_start": 5,
+                "month_end": 10,
+                "month_policy": "exclude",
             },
         )
         with st.expander(title, expanded=True):
@@ -841,6 +895,51 @@ def _render_gvi_date_config() -> None:
                             key=f"gvi_md_{key}",
                         )
                     )
+
+            cfg["use_months"] = st.checkbox(
+                "Limit capture months",
+                value=bool(cfg.get("use_months", False)),
+                key=f"gvi_usemonths_{key}",
+                help=(
+                    "Only use captures taken in these months, e.g. May to "
+                    "October for leaf-on panoramas; winter captures show bare "
+                    "trees. A window that ends before it starts wraps over "
+                    "the new year. Within a year the capture nearest the "
+                    "window's middle wins."
+                ),
+            )
+            if cfg["use_months"]:
+                m1, m2, m3 = st.columns([1, 1, 2])
+                cfg["month_start"] = m1.selectbox(
+                    "From month",
+                    list(range(1, 13)),
+                    index=int(cfg.get("month_start", 5)) - 1,
+                    format_func=lambda m: _MONTH_ABBR[m - 1],
+                    key=f"gvi_month_start_{key}",
+                )
+                cfg["month_end"] = m2.selectbox(
+                    "To month",
+                    list(range(1, 13)),
+                    index=int(cfg.get("month_end", 10)) - 1,
+                    format_func=lambda m: _MONTH_ABBR[m - 1],
+                    key=f"gvi_month_end_{key}",
+                )
+                cfg["month_policy"] = m3.radio(
+                    "Captures outside these months",
+                    list(_MONTH_POLICY_LABELS),
+                    index=list(_MONTH_POLICY_LABELS).index(
+                        cfg.get("month_policy", "exclude")
+                    ),
+                    format_func=_MONTH_POLICY_LABELS.get,
+                    key=f"gvi_month_policy_{key}",
+                    horizontal=True,
+                    help=(
+                        "Exclude them: a point with no capture in the window "
+                        "stays empty. Use them only when nothing fits: an "
+                        "in-window capture wins, otherwise the usual rule "
+                        "applies."
+                    ),
+                )
 
 
 @st.fragment
@@ -1238,6 +1337,8 @@ def render(output_dir: str, parent_dir: str) -> None:
                     p.get("save_geojson"),
                     p.get("target_year"),
                     p.get("max_year_diff"),
+                    tuple(p.get("month_window") or ()),
+                    p.get("month_policy"),
                     p.get("has_api_key"),
                 )
 
@@ -1265,6 +1366,17 @@ def render(output_dir: str, parent_dir: str) -> None:
                     int(cfg["max_diff"])
                     if cfg.get("use_max_diff") and mode_cfg != _GVI_MODE_RECENT
                     else None
+                )
+                # The month window applies in every capture mode.
+                capture_args = _capture_args(
+                    {
+                        "month_window": (
+                            [int(cfg["month_start"]), int(cfg["month_end"])]
+                            if cfg.get("use_months")
+                            else None
+                        ),
+                        "month_policy": cfg.get("month_policy", "exclude"),
+                    }
                 )
 
                 # A merged group has no single source file: name outputs from
@@ -1303,6 +1415,7 @@ def render(output_dir: str, parent_dir: str) -> None:
                     "save_geotiff": save_gt,
                     "save_geojson": save_gj,
                     "max_year_diff": max_year_diff,
+                    **capture_args,
                     "model_path": model_path,
                     "has_api_key": api_key is not None,
                     "geometry_sha256": geometry_sha256(raw),
@@ -1335,6 +1448,7 @@ def render(output_dir: str, parent_dir: str) -> None:
                             "save_panos": save_debug,
                             "save_masks": save_debug,
                             "max_year_diff": max_year_diff,
+                            **capture_args,
                         },
                         output_dir=output_dir,
                         save_gpkg=save_gp,
@@ -1386,6 +1500,7 @@ def render(output_dir: str, parent_dir: str) -> None:
                         "save_masks": save_debug,
                         "target_year": target_year,
                         "max_year_diff": max_year_diff,
+                        **capture_args,
                     },
                     output_dir=output_dir,
                     save_gpkg=save_gp,

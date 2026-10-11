@@ -177,6 +177,16 @@ def _render_details(rec) -> None:
                 f"**Per year** from column `{p.get('date_column', '?')}`"
                 + (f" (±{max_diff} yr max)" if max_diff is not None else "")
             )
+        elif p.get("target_year") is not None:
+            max_diff = p.get("max_year_diff")
+            st.write(
+                f"**Target year:** {p['target_year']}"
+                + (f" (±{max_diff} yr max)" if max_diff is not None else "")
+            )
+        window = p.get("month_window")
+        if window:
+            policy = p.get("month_policy") or "exclude"
+            st.write(f"**Capture months:** {window[0]}–{window[1]} ({policy} others)")
         st.write(
             f"**Save panos / masks:** "
             f"{bool(p.get('save_panos'))} / {bool(p.get('save_masks'))}"
