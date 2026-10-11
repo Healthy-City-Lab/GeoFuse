@@ -63,13 +63,17 @@ mismatched file is refused, and processed points are skipped.
    (longitudinal). Longitudinal requires a date column. Cross-sectional can
    optionally use one to route each entity to a year-matched greenery file; the
    year is only a file key, never a regression input.
-3. **Metric file assignment.** Per channel, set the buffer ladder (min, max,
-   step in metres) and assign files. When years are in play each year points at
-   exactly one file. Anything unassigned blocks submission.
+3. **Metric file assignment.** Per channel, set the buffer ladder and assign
+   files. A ladder is a min and max in metres plus either a step (linear) or a
+   number of rungs (log-spaced); the radii it produces are listed under the
+   inputs. When years are in play each year points at exactly one file.
+   Anything unassigned blocks submission.
 4. **Study details.** Covariates, objective metric, optional spatial-confounding
    adjustment, test-set size, the discovery block (channel set, index form,
-   sweep splits) with validation settings behind an expander, per-pixel grid
-   size, composite scaling, and whether to run each channel on its own.
+   sweep splits, radius prior) with validation settings behind an expander,
+   per-pixel grid size, composite scaling, and whether to run each channel on
+   its own. Choose the range-based radius prior when the distance of influence
+   should not depend on the ladder's spacing.
    Longitudinal runs add wave fixed effects, on by default, and an optional
    neighbourhood column. There is no formula selector: the channel set names the
    modalities and the sweep picks the functional form.

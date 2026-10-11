@@ -141,7 +141,8 @@ composite is built from; `sweep_radius_m` and `sweep_aggregator` keep the
 sweep's shortlist cell, and the two disagree where the grid is flat.
 `peak_radius_m` is the kernel peak in buffer space and
 `peak_radius_width_vs_prior` how much the data narrowed it (near 1 means the
-prior is speaking back). `r50_m` and `r90_m` (intervals in `r50_ci_low` /
+prior is speaking back); `radius_prior` (rungs / range) and `ladder` (linear
+with its step, or log with its rung count) say what that prior was. `r50_m` and `r90_m` (intervals in `r50_ci_low` /
 `r50_ci_high` and `r90_ci_low` / `r90_ci_high`) are the distances holding half
 and 90 % of the implied radial weight, which is where the influence sits on the
 ground; for percentile aggregators they are a mean-equivalent approximation.

@@ -112,7 +112,12 @@ Nothing below is pre-specified.
   most and decays outward, so the scale is reported as R50 and R90: the
   distances holding half and 90 % of the implied weight, on the raw exposure
   scale, with credible intervals. The kernel's peak is shown too, labelled as a
-  position in buffer space rather than a distance of influence.
+  position in buffer space rather than a distance of influence. Ladders can be
+  linear (a fixed step) or log-spaced (a number of rungs placed geometrically).
+  The range-based radius prior covers the range the ladder spans and weighs
+  each rung by the distance it covers, so the prior on the scale does not
+  depend on how densely the ladder was sampled; the rung-based prior, the
+  default, follows the listed rungs.
 - **Aggregation statistic.** Mean, median or a percentile of the values inside
   that buffer.
 - **Functional form.** A weighted sum, or a synergy form with powers on the main
