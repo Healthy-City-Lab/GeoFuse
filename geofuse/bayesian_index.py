@@ -753,15 +753,66 @@ def _dirichlet_prior_ci(k: int, q=(0.025, 0.975)) -> tuple[float, float]:
     return tuple(float(1.0 - (1.0 - p) ** (1.0 / (k - 1))) for p in q)
 
 
-def _radius_prior(radii) -> tuple[float, float]:
+#: How the radius kernel's prior is tied to the ladder. ``rungs`` takes the
+#: location prior from the listed rungs (mean and SD of their log radii) and
+#: weighs every rung alike, so a ladder that is dense at its top pulls the
+#: prior and the kernel's mass there. ``range`` takes the prior from the range
+#: the rungs span (log-uniform moments) and weighs each rung by the log
+#: distance it covers, so neither depends on how densely the range was sampled.
+RADIUS_PRIORS = ("rungs", "range")
+
+
+def _radius_prior(radii, mode: str = "rungs") -> tuple[float, float]:
     """Centre and spread, in log-metres, of the kernel's location prior.
 
     Taken from the ladder itself, so a study that searched 50-500 m and one
     that searched 250-5000 m each get a prior covering their own range rather
     than a constant carried over from whichever was written down first.
+    ``rungs`` uses the mean and SD of the log rungs; ``range`` the moments of a
+    log-uniform over the positive rungs' range, ``((a + b) / 2, (b - a) / √12)``.
     """
-    lr = np.log(np.asarray(radii, dtype=np.float64))
+    r = np.asarray(radii, dtype=np.float64)
+    if mode == "range":
+        lr = np.log(r[r > 0])
+        lo, hi = float(lr.min()), float(lr.max())
+        return (lo + hi) / 2.0, max((hi - lo) / math.sqrt(12.0), 1e-3)
+    lr = np.log(r)
     return float(lr.mean()), float(max(lr.std(), 1e-3))
+
+
+def log_widths(radii, mask=None) -> np.ndarray:
+    """Log-distance each rung covers, per channel: trapezoid weights in log r.
+
+    ``mask`` is ``(channel, rung)``, the rungs each channel searched; widths
+    are taken over a channel's own rungs only, masked rungs get 0. The end
+    rungs cover half a gap, interior ones half of each neighbouring gap. A
+    radius-0 (point) rung has no log position and gets the smallest positive
+    width; a channel with a single rung gets width 1.
+    """
+    r = np.asarray(radii, dtype=np.float64)
+    mask = (
+        np.ones((1, len(r)), dtype=bool)
+        if mask is None
+        else np.asarray(mask, dtype=bool)
+    )
+    out = np.zeros(mask.shape, dtype=np.float64)
+    for c in range(mask.shape[0]):
+        idx = np.flatnonzero(mask[c])
+        pos = idx[r[idx] > 0]
+        pos = pos[np.argsort(r[pos])]
+        if len(pos) >= 2:
+            gaps = np.diff(np.log(r[pos]))
+            w = np.empty(len(pos))
+            w[0], w[-1] = gaps[0] / 2.0, gaps[-1] / 2.0
+            w[1:-1] = (gaps[:-1] + gaps[1:]) / 2.0
+            out[c, pos] = w
+        elif len(pos) == 1:
+            out[c, pos] = 1.0
+        zero = idx[r[idx] <= 0]
+        if len(zero):
+            positive = out[c, pos][out[c, pos] > 0]
+            out[c, zero] = positive.min() if positive.size else 1.0
+    return out
 
 
 def _width_ratio(post_lo, post_hi, prior_lo, prior_hi) -> float:
@@ -897,6 +948,7 @@ class IndexPosterior:
     radii: tuple = ()
     stats: tuple = ()
     radius_kernel: str = "fixed"
+    radius_prior: str = "rungs"
     rung_sd: np.ndarray | None = None  # (nC, nR), SD prep divided by
     rung_area: np.ndarray | None = None  # (nC, nR), None means r²
 
@@ -1048,6 +1100,7 @@ class IndexPosterior:
             "divergences": self.divergences,
             "powers": None if self.powers is None else self.powers.mean(0).tolist(),
             "radius_kernel": self.radius_kernel,
+            "radius_prior": self.radius_prior,
         }
 
         if self.radius_weights is not None:
@@ -1056,7 +1109,7 @@ class IndexPosterior:
             out["projected_pick"] = [list(p) for p in self.projected_pick()]
             out.update(self.distance_decay())
         if self.peak_radius is not None:
-            center, spread = _radius_prior(self.radii)
+            center, spread = _radius_prior(self.radii, self.radius_prior)
             prior = (
                 float(np.exp(center - 1.96 * spread)),
                 float(np.exp(center + 1.96 * spread)),
@@ -1103,6 +1156,7 @@ def fit(
     warmup=800,
     chains=4,
     seed=42,
+    radius_prior="rungs",
 ):
     """NUTS over every unknown the index has: scale, aggregation, weights, form.
 
@@ -1120,6 +1174,14 @@ def fit(
     family contains the decaying one rather than replacing it. ``dirichlet``
     assumes no shape at all and pays for it in identification; ``fixed``
     spreads mass evenly over whatever rungs are unmasked.
+
+    ``radius_prior`` (:data:`RADIUS_PRIORS`) ties the kernel to the ladder.
+    Under ``range`` the location prior covers the range the rungs span, and
+    each rung's weight is multiplied by the log distance it covers
+    (:func:`log_widths`): the lognormal kernel then integrates over log r, the
+    Dirichlet's concentration is proportional to those widths (summing to the
+    number of rungs), and ``fixed`` is uniform in log r. A linear ladder and a
+    log-spaced one over the same range then carry the same prior.
 
     Each channel's contracted exposure is standardised before the weighted sum.
     Without that step a channel whose rungs disagree gets a lower-variance
@@ -1153,9 +1215,20 @@ def fit(
         E = np.where(mask[None, :, :, None], np.nan_to_num(E), 0.0)
         if nr == 1:
             radius_kernel = "fixed"
-        center, spread = _radius_prior(radii)
+        if radius_prior not in RADIUS_PRIORS:
+            raise ValueError(f"radius_prior must be one of {RADIUS_PRIORS}.")
+        center, spread = _radius_prior(radii, radius_prior)
         log_r = jnp.asarray(np.log(np.asarray(radii, dtype=np.float64)))
         maskj = jnp.asarray(mask.astype(np.float64))
+        if radius_prior == "range":
+            widths = log_widths(radii, mask)
+            log_width = jnp.asarray(np.log(np.where(widths > 0, widths, 1.0)))
+            n_rungs = np.maximum(mask.sum(axis=1, keepdims=True), 1)
+            totals = widths.sum(axis=1, keepdims=True)
+            totals = np.where(totals > 0, totals, 1.0)
+            concentration = jnp.asarray(
+                np.where(mask & (widths > 0), n_rungs * widths / totals, 1.0)
+            )
 
     def contract(Ej):
         # The kernel is built in log space and normalised by subtracting its own
@@ -1171,11 +1244,18 @@ def fit(
                 "kw", dist.LogNormal(math.log(spread), 0.75).expand([nc]).to_event(1)
             )
             logk = -0.5 * ((log_r[None, :] - mu[:, None]) / sd[:, None]) ** 2
+            if radius_prior == "range":
+                logk = logk + log_width
         elif radius_kernel == "dirichlet":
-            kr = numpyro.sample(
-                "kr", dist.Dirichlet(jnp.ones(nr)).expand([nc]).to_event(1)
-            )
+            if radius_prior == "range":
+                kr = numpyro.sample("kr", dist.Dirichlet(concentration).to_event(1))
+            else:
+                kr = numpyro.sample(
+                    "kr", dist.Dirichlet(jnp.ones(nr)).expand([nc]).to_event(1)
+                )
             logk = jnp.log(kr + 1e-30)
+        elif radius_prior == "range":
+            logk = log_width * jnp.ones((nc, nr))
         else:
             logk = jnp.zeros((nc, nr))
         logk = jnp.where(maskj > 0, logk, -1e30)
@@ -1244,6 +1324,7 @@ def posterior_from(
     radius_kernel="fixed",
     rung_sd=None,
     rung_area=None,
+    radius_prior="rungs",
 ) -> IndexPosterior:
     """Posterior summaries from a fitted :func:`fit`.
 
@@ -1297,6 +1378,7 @@ def posterior_from(
         radii=tuple(int(r) for r in radii),
         stats=tuple(stats),
         radius_kernel=radius_kernel,
+        radius_prior=radius_prior,
         rung_sd=None if rung_sd is None else np.asarray(rung_sd, dtype=np.float64),
         rung_area=(
             None if rung_area is None else np.asarray(rung_area, dtype=np.float64)
@@ -1371,6 +1453,7 @@ def grid_posterior(
     chains=4,
     seed=42,
     column_sd=None,
+    radius_prior="rungs",
 ):
     """The joint model over the whole grid of the index channels, summarised.
 
@@ -1388,6 +1471,7 @@ def grid_posterior(
         radius_mask=radius_mask,
         radius_kernel=radius_kernel,
         aggregator=aggregator,
+        radius_prior=radius_prior,
     )
     mcmc = fit(
         grid,
@@ -1407,6 +1491,7 @@ def grid_posterior(
         radii=radii,
         stats=stats,
         radius_kernel=radius_kernel,
+        radius_prior=radius_prior,
         rung_sd=(
             None if column_sd is None else rung_sd_from(column_sd, channel_index, stats)
         ),
