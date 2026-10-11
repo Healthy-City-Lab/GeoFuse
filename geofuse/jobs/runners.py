@@ -40,7 +40,7 @@ from geofuse.crs_utils import (
     raster_geographic_bounds,
     reproject_geodataframe_to_wgs84,
 )
-from geofuse.gvi import GVIEngine
+from geofuse.gvi import CAPTURE_STATUS_KEY, NO_CAPTURE_IN_WINDOW, GVIEngine
 from geofuse.jobs import (
     GVI_PROGRESS_MIN_ITEMS,
     GVI_PROGRESS_MIN_SECONDS,
@@ -192,6 +192,8 @@ def run_gvi(
         target_year=run_args.get("target_year"),
         max_year_diff=run_args.get("max_year_diff"),
         pause_callback=check_pause,
+        month_window=_month_window(run_args),
+        month_policy=run_args.get("month_policy") or "exclude",
     )
 
     if ctx.is_cancelled():
@@ -199,15 +201,24 @@ def run_gvi(
 
     ctx.progress(value=1.0, status_text="Writing outputs")
 
+    # A specific-year run carries its year in the name, so runs of one layer
+    # for different years can share a folder.
+    target_year = run_args.get("target_year")
+    out_name = os.path.splitext(fname)[0]
+    if target_year is not None:
+        out_name = f"{out_name}_{int(target_year)}"
     output_paths, res_df = _write_gvi_outputs(
         accumulated=dataset_data["accumulated"],
         processed_crs=dataset_data["processed"].crs,
         meta=dataset_data.get("meta") or {},
-        out_name=os.path.splitext(fname)[0],
+        out_name=out_name,
         output_dir=output_dir,
         save_gpkg=save_gpkg,
         save_geotiff=save_geotiff,
         save_geojson=save_geojson,
+        capture=_capture_settings(
+            "recent" if target_year is None else "year", target_year, run_args
+        ),
     )
     dataset_data["results"] = res_df
     return {"output_paths": output_paths}
@@ -223,13 +234,19 @@ def _write_gvi_outputs(
     save_gpkg: bool,
     save_geotiff: bool,
     save_geojson: bool,
+    capture: dict | None = None,
 ) -> tuple[list[str], gpd.GeoDataFrame]:
     """Write a GVI result set (GeoPackage / GeoJSON / per-cluster GeoTIFF).
 
     Shared by :func:`run_gvi` and :func:`run_gvi_column`; returns the written
     paths and the result GeoDataFrame (reprojected to the grid's planar CRS).
+    ``capture`` holds the capture settings (:func:`_capture_settings`); with
+    the counts of what was sampled they go into the sidecar.
     """
+    capture_summary = _capture_summary(accumulated, capture or {})
     res_df = gpd.GeoDataFrame(accumulated, crs=processed_crs)
+    if CAPTURE_STATUS_KEY in res_df.columns:
+        res_df = res_df.drop(columns=[CAPTURE_STATUS_KEY])
     if "orig_index" in res_df.columns:
         res_df.set_index("orig_index", inplace=True)
         res_df.index.name = None
@@ -355,12 +372,68 @@ def _write_gvi_outputs(
                     "distortion": meta.get("distortion"),
                     "choice_name": meta.get("choice_name"),
                     "n_clusters": len(clusters),
+                    **capture_summary,
                 },
                 f,
                 indent=2,
             )
 
     return output_paths, res_df
+
+
+def _month_order(item: tuple[str, int]) -> tuple[bool, int]:
+    key = item[0]
+    return (not key.isdigit(), int(key) if key.isdigit() else 0)
+
+
+def _month_window(run_args: Mapping) -> tuple[int, int] | None:
+    window = run_args.get("month_window")
+    return (int(window[0]), int(window[1])) if window else None
+
+
+def _capture_settings(mode: str, target_year, run_args: Mapping) -> dict:
+    """The capture rule a GVI result set was sampled with, for its sidecar."""
+    window = _month_window(run_args)
+    return {
+        "capture_mode": mode,
+        "target_year": None if target_year is None else int(target_year),
+        "max_year_diff": run_args.get("max_year_diff"),
+        "month_window": list(window) if window else None,
+        "month_policy": (
+            (run_args.get("month_policy") or "exclude") if window else None
+        ),
+    }
+
+
+def _capture_summary(accumulated: list, capture: Mapping) -> dict:
+    """Capture settings plus counts of the points and the captures sampled.
+
+    ``capture_years`` / ``capture_months`` count the sampled points by the
+    year / month of the capture used (``"unknown"`` when it had no date), so
+    each sums to ``n_sampled``.
+    """
+    from collections import Counter
+
+    sampled = [r for r in accumulated if r.get("gvi_veg") is not None]
+    years: Counter = Counter()
+    months: Counter = Counter()
+    for r in sampled:
+        date = r.get("pano_date") or ""
+        year, _, month = str(date).partition("-")
+        years[year if year.isdigit() else "unknown"] += 1
+        months[str(int(month)) if month.isdigit() else "unknown"] += 1
+    return {
+        **dict(capture),
+        "n_points": len(accumulated),
+        "n_sampled": len(sampled),
+        "n_no_capture_in_window": sum(
+            1
+            for r in accumulated
+            if r.get(CAPTURE_STATUS_KEY) == NO_CAPTURE_IN_WINDOW
+        ),
+        "capture_years": dict(sorted(years.items())),
+        "capture_months": dict(sorted(months.items(), key=_month_order)),
+    }
 
 
 def run_gvi_column(
@@ -519,6 +592,8 @@ def run_gvi_column(
             target_year=int(year),
             max_year_diff=max_year_diff,
             pause_callback=check_pause,
+            month_window=_month_window(run_args),
+            month_policy=run_args.get("month_policy") or "exclude",
         )
         done_points += len(pts)
         if ctx.is_cancelled():
@@ -536,6 +611,7 @@ def run_gvi_column(
             save_gpkg=save_gpkg,
             save_geotiff=save_geotiff,
             save_geojson=save_geojson,
+            capture=_capture_settings("column", year, run_args),
         )
         output_paths.extend(paths)
 
