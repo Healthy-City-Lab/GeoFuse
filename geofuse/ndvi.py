@@ -104,6 +104,58 @@ def ndvi_output_name(output_name: str, reducer: str) -> str:
     return output_name if reducer == "median" else f"{output_name}_{reducer}"
 
 
+# ────────────────────────────────────────────────────────────────────
+# Acquisition options
+# ────────────────────────────────────────────────────────────────────
+
+#: ``auto`` picks Sentinel-2 or Landsat by date; ``landsat`` merges Landsat 5,
+#: 7, 8 and 9; ``landsat_no_slc_off`` keeps Landsat 5, Landsat 7 before its
+#: scan-line corrector failed, and Landsat 8.
+SATELLITES = ("auto", "sentinel2", "landsat", "landsat_no_slc_off")
+
+#: ``scene_filter`` (default) drops scenes above the cloud threshold and masks
+#: cloudy pixels in the rest; ``pixel_only`` keeps every scene and masks cloudy
+#: pixels; ``scene_only`` drops cloudy scenes and keeps every pixel of the rest.
+CLOUD_HANDLINGS = ("scene_filter", "pixel_only", "scene_only")
+
+#: ``surface`` (default) reads Level-2 surface reflectance; ``toa`` reads
+#: top-of-atmosphere reflectance (Landsat C2 TOA, Sentinel-2 Level-1C).
+REFLECTANCES = ("surface", "toa")
+
+#: Water mask source and threshold: pixels covered by open water at least
+#: this percent of the time are masked when the water mask is on.
+WATER_DATASET = "JRC/GSW1_4/GlobalSurfaceWater"
+WATER_OCCURRENCE_MAX = 50
+
+
+def substitute_year(
+    start_date: str, end_date: str, *, year: int = 2012, to: int = 2013
+) -> tuple[str, str, bool]:
+    """Shift a window that lies wholly inside ``year`` to the same days in ``to``.
+
+    Returns ``(start, end, shifted)``. A window only partly inside ``year`` is
+    returned unchanged with ``shifted=False``; the caller warns about it. A
+    29 February becomes the 28th.
+    """
+    from datetime import date as _date
+
+    s, e = _date.fromisoformat(str(start_date)), _date.fromisoformat(str(end_date))
+    if s.year != year or e.year != year:
+        return str(start_date), str(end_date), False
+
+    def move(d):
+        try:
+            return d.replace(year=to)
+        except ValueError:
+            return d.replace(year=to, day=28)
+
+    return move(s).isoformat(), move(e).isoformat(), True
+
+
+def _overlaps_year(start_date: str, end_date: str, year: int) -> bool:
+    return str(start_date)[:4] <= str(year) <= str(end_date)[:4]
+
+
 def _stack_composites(composites: Mapping[str, Any], reducers: list[str]):
     """One image carrying ``reducers`` as bands, in order, for a single export."""
     if len(reducers) == 1:
@@ -279,6 +331,7 @@ def _compute_resume_key(
     resolution: int,
     ee_collection: str,
     temporal_reducer: str = "median",
+    variant: tuple[str, ...] = (),
 ) -> str:
     """Stable 16-hex-char key identifying a unique NDVI run.
 
@@ -290,7 +343,9 @@ def _compute_resume_key(
     spawns a fresh workspace and forces a full re-download (which is what you
     want — old tiles would be from a different question). ``median`` adds
     nothing to the hash, so its keys match those written before the
-    statistic was a choice.
+    statistic was a choice. ``variant`` names acquisition options set away
+    from their defaults (water mask, cloud handling); the defaults add
+    nothing either.
     """
     h = hashlib.sha256()
     # Schema tag — bump when the on-disk tile format changes. ``planar_v1``
@@ -303,6 +358,8 @@ def _compute_resume_key(
     h.update(ee_collection.encode())
     if temporal_reducer != "median":
         h.update(f"|{temporal_reducer}".encode())
+    for option in variant:
+        h.update(f"|{option}".encode())
     return h.hexdigest()[:16]
 
 
@@ -412,6 +469,10 @@ def _write_ndvi_sidecar(
     used_end_date: str | None = None,
     temporal_reducer: str = "median",
     coverage_widened: bool = False,
+    year_substituted: str | None = None,
+    water_mask: bool = False,
+    cloud_handling: str = "scene_filter",
+    reflectance: str = "surface",
     cloud_max: float,
     resolution_m: int,
     max_tile_size_km: float,
@@ -450,6 +511,11 @@ def _write_ndvi_sidecar(
         "used_end_date": str(used_end_date or end_date),
         "temporal_reducer": str(temporal_reducer),
         "coverage_widened": bool(coverage_widened),
+        "year_substituted": year_substituted,
+        "water_mask": bool(water_mask),
+        "water_occurrence_max": WATER_OCCURRENCE_MAX if water_mask else None,
+        "cloud_handling": str(cloud_handling),
+        "reflectance": str(reflectance),
         "cloud_max": float(cloud_max),
         "resolution_m": int(resolution_m),
         "max_tile_size_km": float(max_tile_size_km),
@@ -507,6 +573,20 @@ class NDVIEngine:
     #: Stable label for the merged Landsat source, recorded in the sidecar
     #: metadata and mixed into the tile-cache resume key.
     LANDSAT_MERGED_LABEL = "LANDSAT/LT05+LE07+LC08+LC09/C02/T1_L2"
+
+    #: Top-of-atmosphere counterparts, Landsat 5 / 7 / 8 / 9, Collection 2
+    #: Tier 1, and Sentinel-2 Level-1C.
+    LANDSAT_TOA_COLLECTION_IDS = (
+        "LANDSAT/LT05/C02/T1_TOA",
+        "LANDSAT/LE07/C02/T1_TOA",
+        "LANDSAT/LC08/C02/T1_TOA",
+        "LANDSAT/LC09/C02/T1_TOA",
+    )
+    S2_TOA_COLLECTION_ID = "COPERNICUS/S2_HARMONIZED"
+
+    #: First day of Landsat 7's scan-line-corrector failure; the
+    #: ``landsat_no_slc_off`` sensor set keeps Landsat 7 scenes before it.
+    LANDSAT7_SLC_OFF_START = "2003-06-01"
 
     #: Roy et al. (2016) RMA coefficients that put ETM+ surface reflectance on
     #: the OLI (Landsat 8) scale as ``OLI ≈ slope · ETM+ + intercept``, so
@@ -577,11 +657,19 @@ class NDVIEngine:
         geom_wgs84 = reproject_geodataframe_to_wgs84(gdf)
         return _select_export_crs(geom_wgs84)
 
-    def prep_ndvi(self, img):
+    def prep_ndvi(self, img, pixel_mask: bool = True):
+        """NDVI from Sentinel-2 Level-2A surface reflectance (``B4`` / ``B8``).
+
+        ``pixel_mask`` removes pixels the scene classification (``SCL``) marks
+        as cloud shadow, unclassified, cloud, cirrus or snow; ``False`` keeps
+        every pixel of the scene.
+        """
         scale = 0.0001
         red = img.select("B4").multiply(scale)
         nir = img.select("B8").multiply(scale)
         ndvi = nir.subtract(red).divide(nir.add(red)).rename("NDVI")
+        if not pixel_mask:
+            return ndvi.copyProperties(img, img.propertyNames())
 
         # SCL masking (Standard in Harmonized collection)
         scl = img.select("SCL")
@@ -595,16 +683,57 @@ class NDVIEngine:
         )
         return ndvi.updateMask(mask_scl).copyProperties(img, img.propertyNames())
 
-    def get_collection(self, aoi, start_date, end_date, cloud_max=10):
-        return (
-            ee.ImageCollection(self.EE_COLLECTION_ID)
-            .filterBounds(aoi)
-            .filterDate(start_date, end_date)
-            .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", cloud_max))
-            .map(self.prep_ndvi)
-        )
+    def prep_ndvi_s2_toa(self, img, pixel_mask: bool = True):
+        """NDVI from Sentinel-2 Level-1C top-of-atmosphere reflectance.
 
-    def prep_ndvi_landsat(self, img):
+        Same bands and scale as :meth:`prep_ndvi`; Level-1C has no scene
+        classification, so ``pixel_mask`` removes the opaque-cloud and cirrus
+        pixels flagged in ``QA60`` (bits 10 and 11).
+        """
+        scale = 0.0001
+        red = img.select("B4").multiply(scale)
+        nir = img.select("B8").multiply(scale)
+        ndvi = nir.subtract(red).divide(nir.add(red)).rename("NDVI")
+        if not pixel_mask:
+            return ndvi.copyProperties(img, img.propertyNames())
+        qa = img.select("QA60")
+        cloudy = qa.bitwiseAnd(1 << 10).Or(qa.bitwiseAnd(1 << 11))
+        return ndvi.updateMask(cloudy.eq(0)).copyProperties(img, img.propertyNames())
+
+    def get_collection(
+        self,
+        aoi,
+        start_date,
+        end_date,
+        cloud_max=10,
+        *,
+        reflectance: str = "surface",
+        pixel_mask: bool = True,
+    ):
+        """Cloud-screened Sentinel-2 NDVI collection.
+
+        ``cloud_max=None`` keeps every scene (no scene-level cloud filter);
+        ``reflectance="toa"`` reads Level-1C instead of Level-2A.
+        """
+        if reflectance == "toa":
+            cid, prep = self.S2_TOA_COLLECTION_ID, self.prep_ndvi_s2_toa
+        else:
+            cid, prep = self.EE_COLLECTION_ID, self.prep_ndvi
+        col = ee.ImageCollection(cid).filterBounds(aoi).filterDate(start_date, end_date)
+        if cloud_max is not None:
+            col = col.filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", cloud_max))
+        return col.map(prep if pixel_mask else lambda img: prep(img, pixel_mask=False))
+
+    @staticmethod
+    def _qa_pixel_clear(img):
+        """1 where ``QA_PIXEL`` flags no cloud (bit 3), shadow (4) or snow (5)."""
+        qa = img.select("QA_PIXEL")
+        cloudy = (
+            qa.bitwiseAnd(1 << 3).Or(qa.bitwiseAnd(1 << 4)).Or(qa.bitwiseAnd(1 << 5))
+        )
+        return cloudy.eq(0)
+
+    def prep_ndvi_landsat(self, img, pixel_mask: bool = True):
         """NDVI from Landsat 8/9 Collection 2 Level-2 surface reflectance.
 
         Bands: ``SR_B4`` (red) / ``SR_B5`` (NIR). Apply the C2 L2 scale +
@@ -612,21 +741,20 @@ class NDVIEngine:
         mask cloud / cloud-shadow via the ``QA_PIXEL`` band so cloudy
         observations don't pollute the composite. Same output band name
         (``NDVI``) as :meth:`prep_ndvi` so downstream code is collection-
-        agnostic.
+        agnostic. ``pixel_mask=False`` keeps every pixel.
         """
         scale = 0.0000275
         offset = -0.2
         red = img.select("SR_B4").multiply(scale).add(offset)
         nir = img.select("SR_B5").multiply(scale).add(offset)
         ndvi = nir.subtract(red).divide(nir.add(red)).rename("NDVI")
-        qa = img.select("QA_PIXEL")
-        # Bit 3 = cloud, bit 4 = cloud shadow, bit 5 = snow.
-        cloudy = (
-            qa.bitwiseAnd(1 << 3).Or(qa.bitwiseAnd(1 << 4)).Or(qa.bitwiseAnd(1 << 5))
+        if not pixel_mask:
+            return ndvi.copyProperties(img, img.propertyNames())
+        return ndvi.updateMask(self._qa_pixel_clear(img)).copyProperties(
+            img, img.propertyNames()
         )
-        return ndvi.updateMask(cloudy.eq(0)).copyProperties(img, img.propertyNames())
 
-    def prep_ndvi_landsat_tm(self, img):
+    def prep_ndvi_landsat_tm(self, img, pixel_mask: bool = True):
         """NDVI from Landsat 5 TM / 7 ETM+ Collection 2 Level-2, harmonized to
         the OLI scale.
 
@@ -647,28 +775,104 @@ class NDVIEngine:
         red = red.multiply(rs).add(ri)
         nir = nir.multiply(ns).add(ni)
         ndvi = nir.subtract(red).divide(nir.add(red)).rename("NDVI")
-        qa = img.select("QA_PIXEL")
-        # Bit 3 = cloud, bit 4 = cloud shadow, bit 5 = snow.
-        cloudy = (
-            qa.bitwiseAnd(1 << 3).Or(qa.bitwiseAnd(1 << 4)).Or(qa.bitwiseAnd(1 << 5))
+        if not pixel_mask:
+            return ndvi.copyProperties(img, img.propertyNames())
+        return ndvi.updateMask(self._qa_pixel_clear(img)).copyProperties(
+            img, img.propertyNames()
         )
-        return ndvi.updateMask(cloudy.eq(0)).copyProperties(img, img.propertyNames())
 
-    def _landsat_sensor_preps(self):
-        """``(collection_id, prep_fn)`` for each Landsat sensor, old → new.
+    def prep_ndvi_landsat_toa(self, img, pixel_mask: bool = True):
+        """NDVI from Landsat 8/9 Collection 2 top-of-atmosphere reflectance.
 
-        TM/ETM+ go through the harmonized :meth:`prep_ndvi_landsat_tm`; OLI
-        (8/9) is already the reference scale so it uses :meth:`prep_ndvi_landsat`.
+        TOA collections carry reflectance directly (no scale or offset): red
+        ``B4``, NIR ``B5``. No harmonisation (the published coefficients are
+        for surface reflectance). Same ``QA_PIXEL`` mask as the SR preps.
         """
-        return (
-            (self.LANDSAT5_COLLECTION_ID, self.prep_ndvi_landsat_tm),
-            (self.LANDSAT7_COLLECTION_ID, self.prep_ndvi_landsat_tm),
-            (self.LANDSAT8_COLLECTION_ID, self.prep_ndvi_landsat),
-            (self.LANDSAT9_COLLECTION_ID, self.prep_ndvi_landsat),
+        red = img.select("B4")
+        nir = img.select("B5")
+        ndvi = nir.subtract(red).divide(nir.add(red)).rename("NDVI")
+        if not pixel_mask:
+            return ndvi.copyProperties(img, img.propertyNames())
+        return ndvi.updateMask(self._qa_pixel_clear(img)).copyProperties(
+            img, img.propertyNames()
         )
 
-    def get_collection_landsat(self, aoi, start_date, end_date, cloud_max=10):
-        """Era-aware merged Landsat NDVI collection (L5/L7/L8/L9).
+    def prep_ndvi_landsat_toa_tm(self, img, pixel_mask: bool = True):
+        """NDVI from Landsat 5 TM / 7 ETM+ top-of-atmosphere reflectance.
+
+        Red ``B3``, NIR ``B4``, not harmonised to OLI; same ``QA_PIXEL`` mask.
+        """
+        red = img.select("B3")
+        nir = img.select("B4")
+        ndvi = nir.subtract(red).divide(nir.add(red)).rename("NDVI")
+        if not pixel_mask:
+            return ndvi.copyProperties(img, img.propertyNames())
+        return ndvi.updateMask(self._qa_pixel_clear(img)).copyProperties(
+            img, img.propertyNames()
+        )
+
+    def _landsat_sensors(self, sensor_set: str = "all", reflectance: str = "surface"):
+        """``(collection_id, prep_fn, pre_slc_only)`` per Landsat sensor, old → new.
+
+        ``all`` merges LT05, LE07, LC08 and LC09. ``no_slc_off`` keeps LT05,
+        LE07 acquired before its scan-line corrector failed
+        (:data:`LANDSAT7_SLC_OFF_START`) and LC08: no striped Landsat 7 scenes
+        and no Landsat 9. Surface reflectance runs TM/ETM+ through the
+        harmonised :meth:`prep_ndvi_landsat_tm`; top-of-atmosphere is not
+        harmonised.
+        """
+        if reflectance == "toa":
+            tm, oli = self.prep_ndvi_landsat_toa_tm, self.prep_ndvi_landsat_toa
+            ids = self.LANDSAT_TOA_COLLECTION_IDS
+        else:
+            tm, oli = self.prep_ndvi_landsat_tm, self.prep_ndvi_landsat
+            ids = (
+                self.LANDSAT5_COLLECTION_ID,
+                self.LANDSAT7_COLLECTION_ID,
+                self.LANDSAT8_COLLECTION_ID,
+                self.LANDSAT9_COLLECTION_ID,
+            )
+        pre_slc = sensor_set == "no_slc_off"
+        sensors = [
+            (ids[0], tm, False),
+            (ids[1], tm, pre_slc),
+            (ids[2], oli, False),
+            (ids[3], oli, False),
+        ]
+        return sensors[:3] if pre_slc else sensors
+
+    def _landsat_label(
+        self, sensor_set: str = "all", reflectance: str = "surface"
+    ) -> str:
+        """Stable label of a merged Landsat source (sidecar, resume key)."""
+        if sensor_set == "all" and reflectance == "surface":
+            return self.LANDSAT_MERGED_LABEL
+        sensors = (
+            f"LT05+LE07(pre-{self.LANDSAT7_SLC_OFF_START[:7]})+LC08"
+            if sensor_set == "no_slc_off"
+            else "LT05+LE07+LC08+LC09"
+        )
+        product = "T1_TOA" if reflectance == "toa" else "T1_L2"
+        return f"LANDSAT/{sensors}/C02/{product}"
+
+    def _landsat_source(self, cid, aoi, start_date, end_date, pre_slc: bool):
+        col = ee.ImageCollection(cid).filterBounds(aoi).filterDate(start_date, end_date)
+        if pre_slc:
+            col = col.filterDate("1999-01-01", self.LANDSAT7_SLC_OFF_START)
+        return col
+
+    def get_collection_landsat(
+        self,
+        aoi,
+        start_date,
+        end_date,
+        cloud_max=10,
+        *,
+        sensor_set: str = "all",
+        reflectance: str = "surface",
+        pixel_mask: bool = True,
+    ):
+        """Era-aware merged Landsat NDVI collection.
 
         Each sensor is filtered, cloud-screened, and mapped to a common
         ``NDVI`` band *before* merging — TM/ETM+ and OLI have different band
@@ -676,21 +880,29 @@ class NDVIEngine:
         keeps only the sensors whose acquisitions fall in the date range, so a
         1990s query composes from TM, a 2012 query from ETM+, and a 2015 query
         from OLI, all through the same call. Same output shape as
-        :meth:`get_collection` for Sentinel-2.
+        :meth:`get_collection` for Sentinel-2. ``cloud_max=None`` keeps every
+        scene; ``sensor_set`` / ``reflectance`` follow :meth:`_landsat_sensors`.
         """
         merged = None
-        for cid, prep in self._landsat_sensor_preps():
-            col = (
-                ee.ImageCollection(cid)
-                .filterBounds(aoi)
-                .filterDate(start_date, end_date)
-                .filter(ee.Filter.lt("CLOUD_COVER", cloud_max))
-                .map(prep)
+        for cid, prep, pre_slc in self._landsat_sensors(sensor_set, reflectance):
+            col = self._landsat_source(cid, aoi, start_date, end_date, pre_slc)
+            if cloud_max is not None:
+                col = col.filter(ee.Filter.lt("CLOUD_COVER", cloud_max))
+            col = col.map(
+                prep if pixel_mask else lambda img, p=prep: p(img, pixel_mask=False)
             )
             merged = col if merged is None else merged.merge(col)
         return merged
 
-    def _landsat_base(self, aoi, start_date, end_date):
+    def _landsat_base(
+        self,
+        aoi,
+        start_date,
+        end_date,
+        *,
+        sensor_set: str = "all",
+        reflectance: str = "surface",
+    ):
         """Raw (un-prepped) merged Landsat collection over the date range.
 
         Used only to *count* acquisitions when distinguishing "no images in
@@ -698,22 +910,25 @@ class NDVIEngine:
         sensors are fine — nothing reads pixels here.
         """
         merged = None
-        for cid, _prep in self._landsat_sensor_preps():
-            col = (
-                ee.ImageCollection(cid)
-                .filterBounds(aoi)
-                .filterDate(start_date, end_date)
-            )
+        for cid, _prep, pre_slc in self._landsat_sensors(sensor_set, reflectance):
+            col = self._landsat_source(cid, aoi, start_date, end_date, pre_slc)
             merged = col if merged is None else merged.merge(col)
         return merged
+
+    def _mask_water(self, img):
+        """Mask pixels open water covers at least :data:`WATER_OCCURRENCE_MAX`
+        percent of the time (``occurrence`` of :data:`WATER_DATASET`); pixels
+        with no water record count as dry and are kept."""
+        occurrence = ee.Image(WATER_DATASET).select("occurrence").unmask(0)
+        return img.updateMask(occurrence.lt(WATER_OCCURRENCE_MAX))
 
     def _pick_satellite(self, start_date: str, end_date: str, satellite: str) -> str:
         """Resolve ``satellite='auto'`` → ``'sentinel2'`` or ``'landsat'``.
 
         ``end_date`` falling before the Sentinel-2 collection start picks
         Landsat; everything else stays on Sentinel-2 (higher resolution +
-        more frequent revisit). Explicit ``'sentinel2'`` / ``'landsat'`` are
-        passed through untouched.
+        more frequent revisit). Every explicit choice in :data:`SATELLITES`
+        is passed through untouched.
         """
         if satellite != "auto":
             return satellite
@@ -952,6 +1167,10 @@ class NDVIEngine:
         coverage_rescue: bool = True,
         crs_override=None,
         temporal_reducers: str | Iterable[str] = "median",
+        water_mask: bool = False,
+        cloud_handling: str = "scene_filter",
+        reflectance: str = "surface",
+        substitute_2012: bool = False,
     ):
         """
         Download and process NDVI data with automatic tiling for large areas.
@@ -978,10 +1197,12 @@ class NDVIEngine:
                 a ``tiles_index.json``. Mirrors GVI's per-cluster GeoTIFF tile
                 output and avoids the giant mostly-NaN mosaic that scattered
                 national-scale inputs would otherwise produce.
-            satellite: ``'auto'`` (default — Sentinel-2 for ≥2017, Landsat 8/9
-                otherwise), ``'sentinel2'``, or ``'landsat'``. Auto picks
-                Landsat for date ranges that end before
-                :attr:`S2_COLLECTION_START`.
+            satellite: one of :data:`SATELLITES`. ``'auto'`` (default)
+                picks Landsat for date ranges that end before
+                :attr:`S2_COLLECTION_START` and Sentinel-2 otherwise;
+                ``'landsat'`` merges Landsat 5 / 7 / 8 / 9;
+                ``'landsat_no_slc_off'`` keeps Landsat 5, Landsat 7 before
+                :attr:`LANDSAT7_SLC_OFF_START` and Landsat 8.
             coverage_rescue: When the cloud-filtered collection has fewer
                 than 3 images, widen the date range by ±50 % once and retry.
                 Documented in the sidecar so the user knows the composite
@@ -992,6 +1213,19 @@ class NDVIEngine:
                 :func:`ndvi_output_name` and caches its tiles under its own
                 resume key; one Earth Engine request per tile carries every
                 statistic that tile is missing.
+            water_mask: Mask pixels open water covers at least
+                :data:`WATER_OCCURRENCE_MAX` percent of the time, on every
+                image before the temporal statistic. Off by default (water
+                stays in the composite).
+            cloud_handling: one of :data:`CLOUD_HANDLINGS`: drop scenes above
+                ``cloud_max`` and mask cloudy pixels (default), keep every
+                scene and mask cloudy pixels, or drop cloudy scenes and keep
+                every pixel of the rest.
+            reflectance: ``'surface'`` (default, Level-2) or ``'toa'``
+                (top-of-atmosphere: Landsat C2 TOA, Sentinel-2 Level-1C; no
+                TM / ETM+ harmonisation).
+            substitute_2012: Fill a window that lies wholly inside 2012 with
+                the same days of 2013 (recorded as ``year_substituted``).
 
         Returns:
             The first statistic's result (``status``, ``tif``, ``geojson``,
@@ -1000,6 +1234,13 @@ class NDVIEngine:
             when every statistic succeeded.
         """
         reducers = normalize_temporal_reducers(temporal_reducers)
+        for name, value, allowed in (
+            ("satellite", satellite, SATELLITES),
+            ("cloud_handling", cloud_handling, CLOUD_HANDLINGS),
+            ("reflectance", reflectance, REFLECTANCES),
+        ):
+            if value not in allowed:
+                raise ValueError(f"{name} must be one of {allowed}, not {value!r}.")
         os.makedirs(folder, exist_ok=True)
 
         if not (
@@ -1047,19 +1288,59 @@ class NDVIEngine:
         # ``[scale, 0, x0, 0, -scale, y0]``.
         crs_transform = [float(resolution), 0.0, 0.0, 0.0, -float(resolution), 0.0]
 
-        # 3. Pick the satellite collection. ``auto`` falls back to Landsat
+        # 3. Optionally fill a window inside 2012 with the same days of 2013
+        # (no Landsat sensor without scan-line gaps imaged 2012). Applied
+        # before anything is queried, so every date mode gets it.
+        req_start, req_end = str(start_date), str(end_date)
+        year_substituted = None
+        if substitute_2012:
+            q_start, q_end, shifted = substitute_year(req_start, req_end)
+            if shifted:
+                year_substituted = "2012 → 2013"
+                _log(
+                    "INFO",
+                    f"2012 window {req_start} → {req_end} filled with "
+                    f"{q_start} → {q_end}.",
+                )
+            elif _overlaps_year(req_start, req_end, 2012):
+                _log(
+                    "WARN",
+                    f"Window {req_start} → {req_end} lies only partly in 2012; "
+                    "it is not shifted to 2013.",
+                )
+        else:
+            q_start, q_end = req_start, req_end
+
+        # 4. Pick the satellite collection. ``auto`` falls back to Landsat
         # for ranges that end before Sentinel-2 SR_HARMONIZED started.
-        chosen_satellite = self._pick_satellite(
-            str(start_date), str(end_date), satellite
-        )
-        if chosen_satellite == "landsat":
-            ee_collection_id = self.LANDSAT_MERGED_LABEL
+        chosen_satellite = self._pick_satellite(q_start, q_end, satellite)
+        # ``scene_cmax`` is the scene-level cloud filter (``None`` keeps every
+        # scene); ``pixel_mask`` the per-pixel cloud / shadow / snow mask.
+        scene_cmax = None if cloud_handling == "pixel_only" else cloud_max
+        pixel_mask = cloud_handling != "scene_only"
+        if chosen_satellite in ("landsat", "landsat_no_slc_off"):
+            sensor_set = (
+                "no_slc_off" if chosen_satellite == "landsat_no_slc_off" else "all"
+            )
+            ee_collection_id = self._landsat_label(sensor_set, reflectance)
 
             def _get_col(s, e, cmax):
-                return self.get_collection_landsat(aoi, s, e, cmax)
+                if (sensor_set, reflectance, pixel_mask) == ("all", "surface", True):
+                    return self.get_collection_landsat(aoi, s, e, cmax)
+                return self.get_collection_landsat(
+                    aoi,
+                    s,
+                    e,
+                    cmax,
+                    sensor_set=sensor_set,
+                    reflectance=reflectance,
+                    pixel_mask=pixel_mask,
+                )
 
             def _get_base(s, e):
-                return self._landsat_base(aoi, s, e)
+                return self._landsat_base(
+                    aoi, s, e, sensor_set=sensor_set, reflectance=reflectance
+                )
 
             cloud_field = "CLOUD_COVER"
 
@@ -1067,7 +1348,11 @@ class NDVIEngine:
             # ~2013-04, so a window in between is served by Landsat 7 ETM+
             # alone — whose SLC-off striping (since 2003) leaves ~22% gaps a
             # seasonal median can't fully fill.
-            if str(start_date) < "2013-04-11" and str(end_date) > "2012-05-05":
+            if (
+                sensor_set == "all"
+                and q_start < "2013-04-11"
+                and q_end > "2012-05-05"
+            ):
                 _log(
                     "WARN",
                     "Date range lies in the Landsat-7-only era "
@@ -1075,17 +1360,20 @@ class NDVIEngine:
                     "NDVI composite.",
                 )
         else:
-            ee_collection_id = self.EE_COLLECTION_ID
+            s2_id = self.EE_COLLECTION_ID
+            if reflectance == "toa":
+                s2_id = self.S2_TOA_COLLECTION_ID
+            ee_collection_id = s2_id
 
             def _get_col(s, e, cmax):
-                return self.get_collection(aoi, s, e, cmax)
+                if (reflectance, pixel_mask) == ("surface", True):
+                    return self.get_collection(aoi, s, e, cmax)
+                return self.get_collection(
+                    aoi, s, e, cmax, reflectance=reflectance, pixel_mask=pixel_mask
+                )
 
             def _get_base(s, e):
-                return (
-                    ee.ImageCollection(self.EE_COLLECTION_ID)
-                    .filterBounds(aoi)
-                    .filterDate(s, e)
-                )
+                return ee.ImageCollection(s2_id).filterBounds(aoi).filterDate(s, e)
 
             cloud_field = "CLOUDY_PIXEL_PERCENTAGE"
 
@@ -1093,10 +1381,23 @@ class NDVIEngine:
             "INFO",
             f"Satellite: {chosen_satellite} (collection: {ee_collection_id})",
         )
+        acquisition = (water_mask, cloud_handling, reflectance)
+        if acquisition != (False, "scene_filter", "surface"):
+            _log(
+                "INFO",
+                f"Acquisition: water mask {'on' if water_mask else 'off'}, "
+                f"clouds {cloud_handling}, {reflectance} reflectance.",
+            )
 
-        # 3a. Distinguish "no images in range" vs "all images filtered by
+        def _count(s, e):
+            base = _get_base(s, e)
+            if scene_cmax is not None:
+                base = base.filter(ee.Filter.lt(cloud_field, scene_cmax))
+            return base.size().getInfo()
+
+        # 4a. Distinguish "no images in range" vs "all images filtered by
         # cloud threshold" so the user gets an actionable error.
-        used_start, used_end = str(start_date), str(end_date)
+        used_start, used_end = q_start, q_end
         coverage_widened = False
         n_total = _get_base(used_start, used_end).size().getInfo()
         if n_total == 0:
@@ -1106,6 +1407,15 @@ class NDVIEngine:
                     f" Sentinel-2 SR_HARMONIZED starts {self.S2_COLLECTION_START}"
                     " — set satellite='landsat' (or 'auto') for earlier dates."
                 )
+            elif (
+                chosen_satellite == "landsat_no_slc_off"
+                and _overlaps_year(used_start, used_end, 2012)
+                and not substitute_2012
+            ):
+                suggestion = (
+                    " Without striped Landsat 7 scenes nothing images 2012 — "
+                    "fill 2012 with 2013, or use all Landsat sensors."
+                )
             return {
                 "status": "error",
                 "message": (
@@ -1114,10 +1424,7 @@ class NDVIEngine:
                 ),
             }
         n_cloud_filtered = (
-            _get_base(used_start, used_end)
-            .filter(ee.Filter.lt(cloud_field, cloud_max))
-            .size()
-            .getInfo()
+            _count(used_start, used_end) if scene_cmax is not None else n_total
         )
         if n_cloud_filtered == 0:
             return {
@@ -1129,7 +1436,7 @@ class NDVIEngine:
                 ),
             }
 
-        # 3b. Coverage rescue: if too few cloud-free images, widen the date
+        # 4b. Coverage rescue: if too few cloud-free images, widen the date
         # range by ±50 % once and re-query. Single attempt — anything more
         # aggressive belongs in user-controlled config.
         MIN_IMAGES_FOR_COMPOSITE = 3
@@ -1148,12 +1455,7 @@ class NDVIEngine:
                 pad = _timedelta(days=int(span * 0.5))
                 w_start = (s_dt - pad).isoformat()
                 w_end = (e_dt + pad).isoformat()
-                n_widened = (
-                    _get_base(w_start, w_end)
-                    .filter(ee.Filter.lt(cloud_field, cloud_max))
-                    .size()
-                    .getInfo()
-                )
+                n_widened = _count(w_start, w_end)
                 if n_widened > n_cloud_filtered:
                     _log(
                         "WARN",
@@ -1167,7 +1469,9 @@ class NDVIEngine:
             except Exception as e:
                 _log("WARN", f"Coverage rescue skipped: {e}")
 
-        col = _get_col(used_start, used_end, cloud_max)
+        col = _get_col(used_start, used_end, scene_cmax)
+        if water_mask:
+            col = col.map(self._mask_water)
 
         if cancel_callback and cancel_callback():
             return {"status": "cancelled", "message": "Cancelled by user"}
@@ -1183,7 +1487,7 @@ class NDVIEngine:
         }
         _log("INFO", f"Temporal statistic: {', '.join(reducers)}")
 
-        # 4. Build cluster-aware tile list in true metres. Scattered national
+        # 5. Build cluster-aware tile list in true metres. Scattered national
         # inputs decompose into connected components, and tiles that fall over
         # empty bbox regions (ocean, gaps between provinces) are STRtree-culled
         # before they reach Earth Engine.
@@ -1197,21 +1501,28 @@ class NDVIEngine:
 
         n_clusters = len({t["cluster_id"] for t in tiles})
 
-        # 5. Compute the resume key from the *effective* run parameters
+        # 6. Compute the resume key from the *effective* run parameters
         # (post coverage-rescue date range + post satellite-pick collection).
         # Anchoring the key on what was actually downloaded means a future
         # run that hits the same widened window / Landsat fallback reuses
         # the cache; runs that resolve differently get isolated workspaces.
-        # Each statistic has its own key, so its tiles are its own entry.
+        # Each statistic has its own key, so its tiles are its own entry; an
+        # acquisition option away from its default adds itself to the key.
+        variant = []
+        if water_mask:
+            variant.append(f"water{WATER_OCCURRENCE_MAX}")
+        if cloud_handling != "scene_filter":
+            variant.append(cloud_handling)
         resume_keys = {
             r: _compute_resume_key(
                 geom_for_crs,
                 used_start,
                 used_end,
-                cloud_max,
+                "none" if scene_cmax is None else cloud_max,
                 resolution,
                 ee_collection_id,
                 temporal_reducer=r,
+                variant=tuple(variant),
             )
             for r in reducers
         }
@@ -1300,6 +1611,10 @@ class NDVIEngine:
                     used_end_date=used_end,
                     temporal_reducer=r,
                     coverage_widened=coverage_widened,
+                    year_substituted=year_substituted,
+                    water_mask=water_mask,
+                    cloud_handling=cloud_handling,
+                    reflectance=reflectance,
                     cloud_max=cloud_max,
                     resolution_m=resolution,
                     max_tile_size_km=max_tile_size_km,
