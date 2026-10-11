@@ -867,6 +867,10 @@ def _fusion_config_fingerprint(
     spatial_adjust_method: str = "none",
     spatial_adjust_max_df: int = 10,
     spatial_adjust_eps_m: float | None = None,
+    gvi_ladder_spacing: str = "linear",
+    gvi_ladder_rungs: int = 15,
+    ndvi_ladder_spacing: str = "linear",
+    ndvi_ladder_rungs: int = 15,
 ) -> str:
     """8-char hex hash of every setting that changes the search space / split.
 
@@ -922,6 +926,16 @@ def _fusion_config_fingerprint(
                 str(v).lower() == "categorical"
                 for v in (covariate_types or {}).values()
             )
+            else []
+        )
+        # A log-spaced ladder has other rungs; only appended when one is used,
+        # so linear-ladder runs keep their hash.
+        + (
+            [
+                f"lad:gvi={gvi_ladder_spacing}{int(gvi_ladder_rungs)},"
+                f"ndvi={ndvi_ladder_spacing}{int(ndvi_ladder_rungs)}"
+            ]
+            if "log" in (gvi_ladder_spacing, ndvi_ladder_spacing)
             else []
         )
     )
@@ -1107,6 +1121,10 @@ def run_fusion(
     posterior_warmup: int = 800,
     posterior_chains: int = 4,
     radius_prior: str = "rungs",
+    gvi_ladder_spacing: str = "linear",
+    gvi_ladder_rungs: int = 15,
+    ndvi_ladder_spacing: str = "linear",
+    ndvi_ladder_rungs: int = 15,
     spatial_split: bool = False,
     spatial_block_size_m: float | None = None,
     n_spatial_blocks: int | None = None,
@@ -1292,6 +1310,10 @@ def run_fusion(
             "ndvi_buffer_min_m": ndvi_buffer_min_m,
             "ndvi_buffer_max_m": ndvi_buffer_max_m,
             "ndvi_buffer_step_m": ndvi_buffer_step_m,
+            "gvi_ladder_spacing": str(gvi_ladder_spacing),
+            "gvi_ladder_rungs": int(gvi_ladder_rungs),
+            "ndvi_ladder_spacing": str(ndvi_ladder_spacing),
+            "ndvi_ladder_rungs": int(ndvi_ladder_rungs),
             "ndvi_resolution_m": ndvi_resolution_m,
             "gvi_grid_spacing_m": gvi_grid_spacing_m,
             "cgi_grid_spacing_m": cgi_grid_spacing_m,
@@ -1464,6 +1486,10 @@ def run_fusion(
                 ndvi_buffer_min_m=ndvi_buffer_min_m,
                 ndvi_buffer_max_m=ndvi_buffer_max_m,
                 ndvi_buffer_step_m=ndvi_buffer_step_m,
+                gvi_ladder_spacing=gvi_ladder_spacing,
+                gvi_ladder_rungs=int(gvi_ladder_rungs),
+                ndvi_ladder_spacing=ndvi_ladder_spacing,
+                ndvi_ladder_rungs=int(ndvi_ladder_rungs),
                 n_bins=n_bins,
                 cache_dir=cache_dir,
                 cgi_formula=cgi_formula,
@@ -1825,6 +1851,10 @@ def run_fusion(
                 spatial_adjust_method=spatial_adjust_method,
                 spatial_adjust_max_df=spatial_adjust_max_df,
                 spatial_adjust_eps_m=spatial_adjust_eps_m,
+                gvi_ladder_spacing=gvi_ladder_spacing,
+                gvi_ladder_rungs=int(gvi_ladder_rungs),
+                ndvi_ladder_spacing=ndvi_ladder_spacing,
+                ndvi_ladder_rungs=int(ndvi_ladder_rungs),
             )
 
             def _standalone_study_name(ch: str) -> str:

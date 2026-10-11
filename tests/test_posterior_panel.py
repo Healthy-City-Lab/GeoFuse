@@ -279,6 +279,21 @@ class TestFittedGridPanel(unittest.TestCase):
         out = self._render(_grid(aggregator_mean=None))
         self.assertIn("Fitted spatial scale and aggregator", out)
 
+    def test_the_radius_prior_and_ladders_are_named(self):
+        out = self._render(
+            _grid(
+                radius_prior="range",
+                ladder_spacing={"ndvi": "log (15 rungs)", "gvi": "linear (step 50 m)"},
+            )
+        )
+        self.assertIn("Radius prior: Range-based (spacing-invariant)", out)
+        self.assertIn("ndvi log (15 rungs), gvi linear (step 50 m)", out)
+
+    def test_an_older_bundle_reads_as_rung_based(self):
+        out = self._render(_grid())
+        self.assertIn("Radius prior: Rung-based", out)
+        self.assertNotIn("Ladders:", out)
+
 
 class TestRadiusProfileChart(unittest.TestCase):
     """The ladder is numeric; its axis and its bars have to respect that."""

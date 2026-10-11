@@ -335,6 +335,12 @@ def _write_fusion_outputs(
                     "peak_radius_width_vs_prior": (
                         _f(peak_ratio[i]) if has_grid and i < len(peak_ratio) else None
                     ),
+                    "radius_prior": summ.get("radius_prior") if has_grid else None,
+                    "ladder": (
+                        (summ.get("ladder_spacing") or {}).get(name)
+                        if has_grid
+                        else None
+                    ),
                     **dec,
                     "aggregators_separated": (
                         ";".join(informative[i])
@@ -870,6 +876,7 @@ def _posterior_summary(params: dict) -> dict:
         # The grid axes the posterior estimated rather than the sweep picked.
         "radius_kernel": post.get("radius_kernel"),
         "radius_prior": post.get("radius_prior", "rungs"),
+        "ladder_spacing": post.get("ladder_spacing"),
         "radii": post.get("radii"),
         "radius_profile": post.get("radius_profile"),
         "projected_pick": post.get("projected_pick"),

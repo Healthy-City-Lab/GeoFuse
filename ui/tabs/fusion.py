@@ -34,6 +34,7 @@ except ImportError:
     _MetricFusionEngine = None
 
 from geofuse import cgi_formulas as _cgi_formulas
+from geofuse import metric_sampling as _metric_sampling
 from geofuse import mixed_effects_scoring as _mes
 from geofuse.crs_utils import buffer_gdf_union_metres, reproject_geodataframe_to_wgs84
 from geofuse.vector_io import (
@@ -462,6 +463,10 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "ndvi_buffer_min_m",
     "ndvi_buffer_max_m",
     "ndvi_buffer_step_m",
+    "gvi_ladder_spacing",
+    "gvi_ladder_rungs",
+    "ndvi_ladder_spacing",
+    "ndvi_ladder_rungs",
     "ndvi_resolution_m",
     "gvi_grid_spacing_m",
     "n_bins",
@@ -510,6 +515,9 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "vif_threshold",
 )
 
+# Buffer-ladder spacings (``metric_sampling.LADDER_SPACINGS``).
+_LADDER_SPACING_LABELS: dict[str, str] = {"linear": "Linear", "log": "Log-spaced"}
+
 # Radius-prior options of the discovery model (``bayesian_index.RADIUS_PRIORS``).
 _RADIUS_PRIOR_LABELS: dict[str, str] = {
     "rungs": "Rung-based",
@@ -554,6 +562,10 @@ _FUSION_PARAM_TO_WIDGET: dict[str, str] = {
     "ndvi_buffer_min_m": "fusion_ndvi_buffer_min",
     "ndvi_buffer_max_m": "fusion_ndvi_buffer_max",
     "ndvi_buffer_step_m": "fusion_ndvi_buffer_step",
+    "gvi_ladder_spacing": "fusion_gvi_ladder_spacing",
+    "gvi_ladder_rungs": "fusion_gvi_ladder_rungs",
+    "ndvi_ladder_spacing": "fusion_ndvi_ladder_spacing",
+    "ndvi_ladder_rungs": "fusion_ndvi_ladder_rungs",
 }
 
 # Widgets that are integer-typed ``st.number_input`` / slider controls; the
@@ -567,6 +579,8 @@ _FUSION_SEED_INT_WIDGETS: frozenset[str] = frozenset(
         "fusion_ndvi_buffer_min",
         "fusion_ndvi_buffer_max",
         "fusion_ndvi_buffer_step",
+        "fusion_gvi_ladder_rungs",
+        "fusion_ndvi_ladder_rungs",
         "fusion_stratification_bins",
         "fusion_sweep_splits",
         "fusion_discovery_reps",
@@ -1435,6 +1449,8 @@ def _render_metric_assignment_panel(
       - ``ndvi_files``: list of ``(path, list[wave_or_None])``
       - ``gvi_buffer_min/max/step``: int
       - ``ndvi_buffer_min/max/step``: int
+      - ``gvi_ladder_spacing`` / ``ndvi_ladder_spacing``: "linear" or "log"
+      - ``gvi_ladder_rungs`` / ``ndvi_ladder_rungs``: int (log ladders)
       - ``coverage_complete``: bool — True iff every wave is covered
         exactly once per channel (always True in non-year-aware mode when
         each channel has exactly one file)
@@ -1455,7 +1471,14 @@ def _render_metric_assignment_panel(
             _default(f"fusion_{ch_short}_buffer_min", 100)
             _default(f"fusion_{ch_short}_buffer_max", 1000)
             _default(f"fusion_{ch_short}_buffer_step", 100)
-            bcol1, bcol2, bcol3 = st.columns(3)
+            _default(
+                f"fusion_{ch_short}_ladder_spacing",
+                "linear",
+                list(_LADDER_SPACING_LABELS),
+            )
+            _default(f"fusion_{ch_short}_ladder_rungs", 15)
+            spacing = st.session_state[f"fusion_{ch_short}_ladder_spacing"]
+            bcol1, bcol2, bcol4, bcol3, bcol5 = st.columns(5)
             with bcol1:
                 bmin = st.number_input(
                     f"{ch_short.upper()} minimum buffer",
@@ -1463,7 +1486,7 @@ def _render_metric_assignment_panel(
                     max_value=4900,
                     step=50,
                     key=f"fusion_{ch_short}_buffer_min",
-                    help=f"Smallest {ch_short.upper()} radius (m) searched by Optuna.",
+                    help=f"Smallest {ch_short.upper()} radius (m) searched.",
                 )
             with bcol2:
                 bmax = st.number_input(
@@ -1481,11 +1504,46 @@ def _render_metric_assignment_panel(
                     max_value=500,
                     step=10,
                     key=f"fusion_{ch_short}_buffer_step",
-                    help="Radius discretisation (m).",
+                    disabled=spacing != "linear",
+                    help="Radius discretisation (m) of a linear ladder.",
                 )
+            with bcol4:
+                spacing = st.selectbox(
+                    f"{ch_short.upper()} ladder spacing",
+                    options=list(_LADDER_SPACING_LABELS),
+                    format_func=_LADDER_SPACING_LABELS.get,
+                    key=f"fusion_{ch_short}_ladder_spacing",
+                    help=(
+                        "**Linear** steps by a fixed number of metres, so the "
+                        "ladder is dense in relative terms at its top. "
+                        "**Log-spaced** places the rungs geometrically, so "
+                        "each covers the same relative distance."
+                    ),
+                )
+            with bcol5:
+                brungs = st.number_input(
+                    f"{ch_short.upper()} buffer rungs",
+                    min_value=2,
+                    max_value=60,
+                    step=1,
+                    key=f"fusion_{ch_short}_ladder_rungs",
+                    disabled=spacing != "log",
+                    help="Number of radii of a log-spaced ladder, min and max included.",
+                )
+            ladder = _metric_sampling.ladder_radii(
+                bmin, bmax, bstep, spacing=spacing, rungs=int(brungs)
+            )
+            st.caption(
+                f"{len(ladder)} radii: "
+                + ", ".join(str(r) for r in ladder[:12])
+                + (f", … {ladder[-1]}" if len(ladder) > 12 else "")
+                + " m"
+            )
             state[f"{ch_key}_buffer_min"] = int(bmin)
             state[f"{ch_key}_buffer_max"] = int(bmax)
             state[f"{ch_key}_buffer_step"] = int(bstep)
+            state[f"{ch_key}_ladder_spacing"] = str(spacing)
+            state[f"{ch_key}_ladder_rungs"] = int(brungs)
 
             # One dialog, any number of files: each pick appends to the kept
             # list and renders as its own chip (basename shown, full path as
@@ -3151,6 +3209,7 @@ def _render_fitted_grid(summary: dict, _pd, _label) -> None:
             hide_index=True,
         )
         prior_mode = summary.get("radius_prior", "rungs")
+        spacing = summary.get("ladder_spacing") or {}
         st.caption(
             f"Radius prior: {_RADIUS_PRIOR_LABELS.get(prior_mode, prior_mode)}."
             + (
@@ -3159,6 +3218,11 @@ def _render_fitted_grid(summary: dict, _pd, _label) -> None:
                 if prior_mode == "rungs"
                 else " Its interval covers the range the rungs span, whatever "
                 "their spacing."
+            )
+            + (
+                " Ladders: " + ", ".join(f"{ch} {d}" for ch, d in spacing.items()) + "."
+                if spacing
+                else ""
             )
         )
         # A channel whose scale is genuinely learned lands near 0.1; one the
@@ -5233,6 +5297,10 @@ def render(output_dir: str) -> None:
     ndvi_buffer_min_m = metric_state["ndvi_buffer_min"]
     ndvi_buffer_max_m = metric_state["ndvi_buffer_max"]
     ndvi_buffer_step_m = metric_state["ndvi_buffer_step"]
+    gvi_ladder_spacing = metric_state.get("gvi_ladder_spacing", "linear")
+    gvi_ladder_rungs = int(metric_state.get("gvi_ladder_rungs", 15))
+    ndvi_ladder_spacing = metric_state.get("ndvi_ladder_spacing", "linear")
+    ndvi_ladder_rungs = int(metric_state.get("ndvi_ladder_rungs", 15))
     buffer_extent_m = float(max(gvi_buffer_max_m, ndvi_buffer_max_m))
 
     # ── Metric-download defaults ────────────────────────────────
@@ -5676,14 +5744,30 @@ def render(output_dir: str) -> None:
                         "**Discovered years / waves:** "
                         + ", ".join(f"`{w}`" for w in opt_state["discovered_waves"])
                     )
-                st.write(
-                    f"**GVI buffers (m):** {gvi_buffer_min_m} – {gvi_buffer_max_m} "
-                    f"(step {gvi_buffer_step_m})"
-                )
-                st.write(
-                    f"**NDVI buffers (m):** {ndvi_buffer_min_m} – {ndvi_buffer_max_m} "
-                    f"(step {ndvi_buffer_step_m})"
-                )
+                for ch_name, lo_m, hi_m, step_m, spacing_m, rungs_m in (
+                    (
+                        "GVI",
+                        gvi_buffer_min_m,
+                        gvi_buffer_max_m,
+                        gvi_buffer_step_m,
+                        gvi_ladder_spacing,
+                        gvi_ladder_rungs,
+                    ),
+                    (
+                        "NDVI",
+                        ndvi_buffer_min_m,
+                        ndvi_buffer_max_m,
+                        ndvi_buffer_step_m,
+                        ndvi_ladder_spacing,
+                        ndvi_ladder_rungs,
+                    ),
+                ):
+                    detail = (
+                        f"log-spaced, {rungs_m} rungs"
+                        if spacing_m == "log"
+                        else f"step {step_m}"
+                    )
+                    st.write(f"**{ch_name} buffers (m):** {lo_m} – {hi_m} ({detail})")
                 if negative_controls_param:
                     st.write(
                         "**Negative controls:** "
@@ -5732,6 +5816,10 @@ def render(output_dir: str) -> None:
                 "ndvi_buffer_min_m": float(ndvi_buffer_min_m),
                 "ndvi_buffer_max_m": float(ndvi_buffer_max_m),
                 "ndvi_buffer_step_m": float(ndvi_buffer_step_m),
+                "gvi_ladder_spacing": str(gvi_ladder_spacing),
+                "gvi_ladder_rungs": int(gvi_ladder_rungs),
+                "ndvi_ladder_spacing": str(ndvi_ladder_spacing),
+                "ndvi_ladder_rungs": int(ndvi_ladder_rungs),
                 "ndvi_resolution_m": ndvi_resolution_m,
                 "gvi_grid_spacing_m": gvi_grid_spacing_m,
                 "n_bins": int(n_bins),

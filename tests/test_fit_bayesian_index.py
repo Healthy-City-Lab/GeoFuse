@@ -40,6 +40,10 @@ def _stub_engine(n=300, seed=0):
         _active_greenery_channel="cgi",
         ndvi_buffer_max_m=900.0,
         gvi_buffer_max_m=900.0,
+        ndvi_buffer_step_m=150.0,
+        gvi_buffer_step_m=150.0,
+        ndvi_ladder_spacing="linear",
+        gvi_ladder_spacing="linear",
     )
     eng.build_index_tensor = lambda subset="train_val": (
         X,
@@ -50,7 +54,12 @@ def _stub_engine(n=300, seed=0):
     )
     eng._preaggr_radii = lambda: (list(RADII), list(RADII))
     eng._sweep_objective = lambda metric: None
-    for name in ("_params_from_sweep", "_index_layout", "_channel_scaling"):
+    for name in (
+        "_params_from_sweep",
+        "_index_layout",
+        "_channel_scaling",
+        "_ladder_description",
+    ):
         setattr(eng, name, types.MethodType(getattr(MetricFusionEngine, name), eng))
     return eng
 
@@ -89,6 +98,14 @@ class TestFitBayesianIndexWiring(unittest.TestCase):
             self.assertIn(key, self.params)
         self.assertIn("selection_score", self.params["__sweep__"])
         self.assertIn("form_counts", self.params["__holdout_gain__"])
+
+    def test_the_prior_mode_and_ladder_spacing_are_recorded(self):
+        post = self.params["__posterior__"]
+        self.assertEqual(post["radius_prior"], "rungs")
+        self.assertEqual(
+            post["ladder_spacing"],
+            {"ndvi": "linear (step 150 m)", "gvi": "linear (step 150 m)"},
+        )
 
     def test_distance_decay_is_on_the_raw_scale(self):
         post = self.params["__posterior__"]
@@ -180,6 +197,10 @@ def _retune_stub(n=600, seed=3):
         gvi_buffer_max_m=900.0,
         negative_control_columns=["grip"],
         is_longitudinal=False,
+        ndvi_buffer_step_m=150.0,
+        gvi_buffer_step_m=150.0,
+        ndvi_ladder_spacing="linear",
+        gvi_ladder_spacing="linear",
     )
     eng.build_index_tensor = lambda subset="train_val": (
         X,
@@ -194,6 +215,7 @@ def _retune_stub(n=600, seed=3):
         "_params_from_sweep",
         "_index_layout",
         "_channel_scaling",
+        "_ladder_description",
         "fit_bayesian_index",
         "retune_concordance",
     ):

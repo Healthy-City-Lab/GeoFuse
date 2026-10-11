@@ -172,6 +172,38 @@ def radius_int_bounds(
     return lo, hi_adj, step
 
 
+#: Buffer-ladder spacings. ``linear`` steps by a fixed number of metres;
+#: ``log`` places a chosen number of rungs geometrically between the bounds,
+#: so every rung covers the same log distance.
+LADDER_SPACINGS = ("linear", "log")
+
+
+def ladder_radii(
+    r_min: float,
+    r_max: float,
+    r_step: float,
+    *,
+    spacing: str = "linear",
+    rungs: int | None = None,
+) -> tuple[int, ...]:
+    """Integer radii (m) of a buffer ladder, ascending and unique.
+
+    ``linear`` is ``range(min, max + 1, step)`` after :func:`radius_int_bounds`.
+    ``log`` takes ``rungs`` (at least 2) geometric points from ``min`` to
+    ``max``, rounded to whole metres with duplicates dropped, so the count can
+    come out lower than asked on a narrow range.
+    """
+    if spacing == "log":
+        lo = max(1, int(round(min(r_min, r_max))))
+        hi = max(lo, int(round(max(r_min, r_max))))
+        n = max(2, int(rungs or 2))
+        return tuple(sorted({int(round(r)) for r in np.geomspace(lo, hi, n)}))
+    if spacing != "linear":
+        raise ValueError(f"spacing must be one of {LADDER_SPACINGS}.")
+    lo, hi, step = radius_int_bounds(r_min, r_max, r_step)
+    return tuple(range(lo, hi + 1, step))
+
+
 def polygonal_parts(geom) -> list:
     """Flatten a geometry into its constituent polygon parts."""
     gt = geom.geom_type
