@@ -67,10 +67,12 @@ Default: GeoTIFF on, GeoPackage off, GeoJSON off.
 The sidecar lets fusion and other tools introspect a raster without re-running
 Earth Engine. It records the export CRS, the satellite and collection used, the
 dates requested and the dates actually queried (which differ if a sparse window
-was widened), the temporal statistic (`temporal_reducer`), the cloud threshold
-and surviving image count, resolution, how the input decomposed into clusters
-and tiles, any tiles that exhausted their retries and so appear as gaps, and the
-maximum map distortion.
+was widened, or a 2012 window was filled from 2013: `year_substituted`), the
+temporal statistic (`temporal_reducer`), the acquisition options
+(`reflectance`, `cloud_handling`, `water_mask` with `water_occurrence_max`),
+the cloud threshold and surviving image count, resolution, how the input
+decomposed into clusters and tiles, any tiles that exhausted their retries and
+so appear as gaps, and the maximum map distortion.
 
 ---
 

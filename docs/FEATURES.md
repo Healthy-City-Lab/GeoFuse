@@ -47,7 +47,15 @@ per-cluster tiles, and a metadata sidecar.
 - Fetches cloud-masked Sentinel-2 or Landsat imagery. `auto` picks Sentinel-2
   from 2017 onward and Landsat before that, harmonising the older TM/ETM+
   sensors to the Landsat-8 scale so values stay comparable across years. Pick
-  one sensor instead to keep a multi-year series on one instrument.
+  one sensor instead to keep a multi-year series on one instrument, or a
+  Landsat set without Landsat 7's striped scenes (after its 2003 scan-line
+  failure) and without Landsat 9.
+- Acquisition is configurable, and every option defaults to the behaviour
+  above: surface or top-of-atmosphere reflectance; cloudy scenes dropped,
+  cloudy pixels masked, or both (the default); an optional water mask that
+  removes pixels open water covers at least half the time; and an optional
+  fill of a 2012 window with the same days of 2013, a year no Landsat sensor
+  imaged without scan-line gaps.
 - Dates can be given as ranges, as specific dates with a window, or as a year
   column that splits the layer and composites each year over the growing-season
   months you choose.
