@@ -83,6 +83,11 @@ per-cluster tiles, and a metadata sidecar.
 - Can optionally sample values onto your own features, exactly or as a zonal
   statistic over a buffer.
 
+**Presets (NDVI and GVI).** Both tabs keep named presets of their settings:
+built-ins ship with the toolbox, your own are saved as JSON files that can be
+shared, and a loaded file is checked against the tab's own settings before it
+is used. Presets never hold dates, files or credentials.
+
 ---
 
 ## 3. Fusion: discovering the composite index

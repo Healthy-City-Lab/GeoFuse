@@ -73,7 +73,12 @@ temporal statistic (`temporal_reducer`), the acquisition options
 (`reflectance`, `cloud_handling`, `water_mask` with `water_occurrence_max`),
 the cloud threshold and surviving image count, resolution, how the input
 decomposed into clusters and tiles, any tiles that exhausted their retries and
-so appear as gaps, and the maximum map distortion.
+so appear as gaps, and the maximum map distortion. When the run came from a
+settings preset, `preset` names it (the GVI sidecar does the same).
+
+Saved presets live in `presets/ndvi/` and `presets/gvi/` at the repository
+root, one JSON file each (`"format": "geofuse-preset"`); built-ins ship inside
+`geofuse/presets/builtin/`.
 
 ---
 

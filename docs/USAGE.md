@@ -39,6 +39,21 @@ responsive and several study areas can run at once.
    set the run mode and objective, and run.
 4. Read the results panel and export.
 
+### Presets
+
+The NDVI and GVI settings boxes open with a **Preset** row. Choosing a preset
+applies it: the download settings, the output formats, and the method settings
+of every dataset (temporal statistics, season months and window for NDVI;
+capture mode, year limit and month window for GVI). Dates and files are never
+part of a preset. The row shows **Custom** once a setting has been changed.
+**Save** stores the current settings under a name in `presets/<tab>/` (and
+offers the JSON for download); **Load** imports a preset file, checks that it
+belongs to this tab and holds valid values, and adds it to your presets. API
+keys are never written, and a file containing one is refused. Built-in presets
+cover the defaults, a Landsat top-of-atmosphere set with water masking, a
+Sentinel-2 10 m set, and historical Street View captures within two years.
+A job records the preset it came from in its sidecar.
+
 ### Combining files
 
 Both metric tabs run one job per uploaded file by default. Set file handling to
