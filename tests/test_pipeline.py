@@ -313,10 +313,12 @@ class TestGeoFuse(unittest.TestCase):
 
     @patch("geofuse.ndvi.rasterio")
     @patch("geofuse.ndvi.ee")
+    @patch("geofuse.ndvi.initialize_earth_engine", return_value="test")
     @patch("geofuse.ndvi._export_ee_image_to_tif")
     def test_ndvi_logic(
         self,
         mock_export,
+        mock_init,
         mock_ee,
         mock_rasterio,
     ):

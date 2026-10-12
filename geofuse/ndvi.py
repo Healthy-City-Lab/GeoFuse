@@ -18,6 +18,7 @@ import requests
 from shapely.geometry import box
 
 from .core import build_planar_tiles
+from .ee_auth import initialize as initialize_earth_engine
 from .crs_utils import (
     default_geotiff_creation_options,
     raster_geographic_bounds,
@@ -634,6 +635,11 @@ class NDVIEngine:
     ):
         """Initialize Earth Engine and open the persistent tile cache.
 
+        Earth Engine is initialised by :func:`geofuse.ee_auth.initialize`: the
+        stored service-account key or sign-in when there is one, else Earth
+        Engine's own default; ``project_id`` falls back to the user
+        configuration's ``earthengine.project``.
+
         ``tile_cache`` lets the caller inject a shared :class:`NdviTileCache`
         (e.g. a singleton from ``ui/services.py``). When omitted, the engine
         opens its own at ``tile_cache_dir`` (default
@@ -651,18 +657,8 @@ class NDVIEngine:
         # across engine instances and processes.
         attach_external_logger("ee", logging.INFO)
 
-        try:
-            if project_id:
-                ee.Initialize(project=project_id)
-            else:
-                ee.Initialize()
-        except ee.EEException as e:
-            _log("WARN", f"Earth Engine init failed: {e}")
-            try:
-                ee.Authenticate()
-                ee.Initialize()
-            except Exception as final_e:
-                raise final_e
+        source = initialize_earth_engine(project_id)
+        _log("INFO", f"Earth Engine credentials: {source}")
 
         if tile_cache is not None:
             self.tile_cache = tile_cache
