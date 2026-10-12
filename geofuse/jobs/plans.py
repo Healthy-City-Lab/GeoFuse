@@ -733,15 +733,6 @@ def _build_gvi(
             "submit_gvi_column_subprocess",
             kwargs,
         )
-    from geofuse.core import generate_clustered_grid
-
-    if gtype == "poly" or s["buffer_m"] > 0:
-        processed, meta = generate_clustered_grid(
-            raw, buffer_m=float(s["buffer_m"]), step_m=float(s["grid_resolution_m"])
-        )
-    else:
-        processed, meta = raw.copy(), None
-    dataset.update({"processed": processed, "meta": meta})
     params = {**common, "target_year": o["target_year"]}
     kwargs = {
         "fname": out_fname,
@@ -749,6 +740,7 @@ def _build_gvi(
         "init_args": init_args,
         "run_args": {
             "step": s["grid_resolution_m"],
+            "buffer": s["buffer_m"],
             "save_panos": save_debug,
             "save_masks": save_debug,
             "target_year": o["target_year"],
