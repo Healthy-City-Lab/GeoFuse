@@ -339,6 +339,22 @@ def generate_clustered_grid(
     return pts_4326, base_meta
 
 
+def gvi_sampling_points(
+    raw: gpd.GeoDataFrame, polygon: bool, buffer_m: float, step_m: float
+) -> tuple[gpd.GeoDataFrame, dict | None]:
+    """The points a GVI job samples, and their grid metadata.
+
+    Polygons, and points grown by a buffer, get a clustered grid
+    (:func:`generate_clustered_grid`); bare points are sampled where they
+    are, with no grid metadata.
+    """
+    if polygon or buffer_m > 0:
+        return generate_clustered_grid(
+            raw, buffer_m=float(buffer_m), step_m=float(step_m)
+        )
+    return raw.copy(), None
+
+
 def build_planar_tiles(
     geom_wgs84_gdf: gpd.GeoDataFrame,
     grid_crs,

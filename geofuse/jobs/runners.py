@@ -128,7 +128,23 @@ def run_gvi(
     gpu_lock: threading.Lock,
     save_gpkg: bool = True,
 ) -> dict:
-    """Run a GVI analysis. Mirrors the previous ``_job_worker`` in ``ui/tabs/gvi.py``."""
+    """Run a GVI analysis. Mirrors the previous ``_job_worker`` in ``ui/tabs/gvi.py``.
+
+    Without a ``processed`` grid in ``dataset_data`` the sampling points are
+    built here from ``raw``, ``run_args["step"]`` and ``run_args["buffer"]``,
+    so the submitting process never holds them.
+    """
+    if dataset_data.get("processed") is None:
+        from geofuse.core import gvi_sampling_points
+
+        ctx.progress(status_text="Generating sampling grid...")
+        dataset_data["processed"], dataset_data["meta"] = gvi_sampling_points(
+            dataset_data["raw"],
+            dataset_data.get("type") == "poly",
+            float(run_args.get("buffer") or 0),
+            float(run_args["step"]),
+        )
+        ctx.heartbeat()
     ctx.progress(status_text="Waiting for GPU...")
     with gpu_lock:
         if ctx.is_cancelled():
