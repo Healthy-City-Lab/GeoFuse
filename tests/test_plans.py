@@ -402,6 +402,29 @@ class TabParityTests(_Case):
         )
         self.assert_same(gui, plans.build(spec))
 
+    def test_gvi_tab_falls_back_to_the_stored_street_view_key(self):
+        from geofuse import credentials
+
+        self.addCleanup(setattr, credentials, "get", credentials.get)
+        gui = self.click(
+            "gvi",
+            {"gvi_picked_paths": [self.city], "gvi_download_mode": "API (Street View)"},
+            "import geofuse.credentials as c\n"
+            "c.get = lambda name: 'AIzaSTORED'\n"
+            f"gvi.render({self.out!r}, {ROOT!r})",
+            "gvi_run_analysis",
+        )
+        (spec,) = self.expand(
+            f"""
+            output_dir = {self.out!r}
+            [[gvi]]
+            study_area = "city.gpkg"
+            download_mode = "api"
+            """
+        )
+        self.assertEqual(gui[3]["init_args"]["api_key"], "AIzaSTORED")
+        self.assert_same(gui, plans.build(spec, api_key="AIzaSTORED"))
+
     def test_fusion_tab(self):
         seed = {
             "fusion_target_paths": [self.cohort],

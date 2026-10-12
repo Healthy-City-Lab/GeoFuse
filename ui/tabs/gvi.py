@@ -446,6 +446,16 @@ def _gvi_restart_summary_lines(p: dict) -> list[str]:
     ]
 
 
+def _stored_streetview_key() -> str | None:
+    """The Street View key saved with ``geofuse credentials``, if any."""
+    from geofuse import credentials
+
+    try:
+        return credentials.get("streetview-key")
+    except credentials.CredentialError:
+        return None
+
+
 def _gvi_resubmit_from_params(
     store, executor, pano_cache, output_dir, rec_id, p, raw, api_key
 ):
@@ -466,6 +476,8 @@ def _gvi_resubmit_from_params(
     save_gj = bool(p.get("save_geojson"))
     save_panos = bool(p.get("save_panos"))
     save_masks = bool(p.get("save_masks"))
+    if p.get("has_api_key") and not api_key:
+        api_key = _stored_streetview_key()
 
     gtype = (
         "poly"
@@ -575,7 +587,10 @@ def _render_gvi_merged_restart(store, executor, pano_cache, output_dir, rec, p) 
 
         api_key = None
         if had_api_key:
-            st.caption("Original job used the Street View API — re-supply the key.")
+            st.caption(
+                "Original job used the Street View API — re-supply the key, or "
+                "leave it empty to use the stored one."
+            )
             api_key = (
                 st.text_input(
                     "Street View API Key",
@@ -697,8 +712,9 @@ def _render_gvi_restart_panel(
         if not had_api_key:
             return {}
         st.caption(
-            "Original job used the Street View API. Re-supply the API key — "
-            "secrets aren't persisted between runs."
+            "Original job used the Street View API. Re-supply the API key "
+            "(secrets aren't kept with the job), or leave it empty to use the "
+            "key stored with `geofuse credentials`."
         )
         key = st.text_input(
             "Street View API Key",
@@ -735,7 +751,9 @@ def _render_gvi_restart_panel(
         model_path = p.get("model_path") or os.path.join(
             parent_dir, "geofuse", "model", "best_model.pth"
         )
-        api_key = extras.get("api_key") if had_api_key else None
+        api_key = None
+        if had_api_key:
+            api_key = extras.get("api_key") or _stored_streetview_key()
 
         new_params = dict(p)
         new_params["geometry_sha256"] = geometry_sha256(gdf)
@@ -1064,7 +1082,11 @@ def _render_gvi_settings_map() -> None:
                     "Street View API Key",
                     type="password",
                     autocomplete="off",
-                    help="Optional Google Street View key; falls back to built-in access if empty.",
+                    help=(
+                        "Optional Google Street View key. When empty, the key "
+                        "stored with `geofuse credentials` is used, else "
+                        "built-in access."
+                    ),
                     key="gvi_google_api_key",
                 )
             st.slider(
@@ -1413,7 +1435,7 @@ def render(output_dir: str, parent_dir: str) -> None:
             api_key = None
             if mode == "API (Street View)":
                 k = st.session_state.get("gvi_google_api_key", "")
-                api_key = k if k else None
+                api_key = k or _stored_streetview_key()
 
             model_path = os.path.join(parent_dir, "geofuse", "model", "best_model.pth")
             started = False
