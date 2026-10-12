@@ -132,6 +132,25 @@ class TestYearKeyedIntake(unittest.TestCase):
             dict(back.target_files_per_wave), dict(spec.target_files_per_wave)
         )
 
+    def test_year_aware_specs_take_every_cross_sectional_metric(self):
+        from geofuse.longitudinal import CROSS_SECTIONAL_METRICS
+        from geofuse.objective_scoring import SUPPORTED_METRICS
+
+        self.assertEqual(set(CROSS_SECTIONAL_METRICS), set(SUPPORTED_METRICS))
+        greenery = {"2010": "g.tif", "2012": "g.tif"}
+        for metric in CROSS_SECTIONAL_METRICS:
+            spec = LongitudinalSpec(
+                intake_mode="long",
+                entity_id_col="_gf_entity",
+                wave_labels=("2010", "2012"),
+                wave_col="_gf_year",
+                date_col="date",
+                greenery_files={ch: greenery for ch in ("veg", "terrain", "ndvi")},
+                scoring_metric=metric,
+                derive_wave_from_date=True,
+            )
+            self.assertEqual(validate_spec(spec), [], metric)
+
 
 class TestRasterDiscAggregation(unittest.TestCase):
     """The raster path samples buffered discs reprojected into the raster CRS."""
