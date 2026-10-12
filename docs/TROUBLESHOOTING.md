@@ -31,7 +31,7 @@ A GDAL or GDAL-dependent library (GeoPandas, rasterio) fails to import.
 
 **Cause:** `torch` / `geofuse` DLLs must be loaded before the GDAL stack on Windows.
 
-**Fix:** Never import `geopandas`, `rasterio`, or similar libraries before `import torch` or `from geofuse import ...` in custom scripts. The application entry point (`ui/app.py` and `scripts/cli.py`) already enforces the correct order.
+**Fix:** Never import `geopandas`, `rasterio`, or similar libraries before `import torch` or `from geofuse import ...` in custom scripts. The entry points (`ui/app.py` and the `geofuse` command) already enforce the correct order.
 
 ---
 
@@ -67,9 +67,40 @@ A warning appears in the terminal when downloading very high-resolution Street V
 Google Earth Engine credentials are missing or expired.
 
 **Fix:**
-1. Run `earthengine authenticate` in the activated environment.
-2. Follow the browser prompt to authorize your Google account.
-3. If using a service account, ensure the credentials JSON is accessible and the project ID is set correctly.
+1. Run `geofuse auth earthengine` in the activated environment and follow the browser prompt.
+2. Without a browser (a cluster login node), connect with `ssh -L 8085:localhost:8085 HOST` and open the printed address on your own computer, or use `geofuse auth earthengine --no-browser` and paste the code it shows.
+3. For a service account, `geofuse credentials set earthengine-service-account KEY.json`.
+4. "No project found": `geofuse config set earthengine.project YOUR-PROJECT`.
+
+A background job never waits on a sign-in page where no browser can open; it stops with the command to run.
+
+---
+
+## GVI stops with "Google's Street View service no longer answers as the GVI downloader expects"
+
+Google changed one of the endpoints the scraper uses. The job stops instead of reporting every point as having no panorama. `geofuse doctor` runs one search and shows the same message. The downloader has to be updated to the endpoint Google now uses.
+
+---
+
+## `geofuse doctor` warns that the caches are on a network filesystem
+
+The panorama cache and the NDVI tile index are SQLite files, which are unsafe on NFS / SMB / Lustre / GPFS when several machines write at once. Move them to a local or scratch disk:
+
+```bash
+geofuse config set paths.caches /scratch/$USER/geofuse-caches
+```
+
+---
+
+## "No usable keyring" when storing a credential
+
+Headless Linux machines often have no keyring service. With `[credentials] store = "auto"` (the default) GeoFuse falls back to `credentials.toml` in your configuration folder, readable by you only; `geofuse config set credentials.store file` makes that explicit.
+
+---
+
+## `geofuse watch` says it needs `textual`
+
+Install it into the environment (`pip install textual`), or follow jobs with `geofuse status` and `geofuse logs JOB -f`.
 
 ---
 

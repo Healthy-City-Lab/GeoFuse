@@ -147,17 +147,178 @@ keeps only the last 100 lines.
 
 ---
 
-## 2. Command line, for HPC
+## 2. Command line
 
-The same engines run headlessly under MPI.
+Every engine also runs from the `geofuse` command, installed with the
+environment (`python -m geofuse` does the same). It uses the dashboard's
+settings and defaults, so a run started here writes the files a run started in
+a tab would. Jobs run in a background supervisor: one terminal starts them,
+another follows them, and closing either leaves them running.
+
+### First steps
 
 ```bash
 conda activate geofuse
-mpiexec -n 4 python scripts/cli.py --config config.csv
+geofuse doctor                                   # is this machine ready?
+geofuse auth earthengine                         # sign in once (NDVI)
+geofuse config set earthengine.project my-cloud-project
+geofuse credentials set streetview-key           # optional: GVI scrapes without one
 ```
 
-`--config` points at a CSV defining input files and parameters. NDVI rows take
-`start_date` and `end_date` (YYYY-MM-DD), both included. A template is
-created on first run if none exists. On a cluster, swap `mpiexec` for your
-scheduler's launcher, for example `srun -n 32`. Each rank processes a separate
-study area and writes to `output_results/` with collision-safe naming.
+### One engine, no run file
+
+```bash
+geofuse ndvi city.gpkg --range 2019-05-01:2019-09-30 --cloud-max 20
+geofuse gvi city.gpkg --capture-mode column --year-column year
+geofuse fusion --target cohort.gpkg --outcome cesd --covariate age \
+    --ndvi city_ndvi.tif --gvi city_gvi.gpkg
+```
+
+Each submits its jobs and returns. `--foreground` runs them in this terminal
+instead, `--plan` only lists them, and `--save run.toml` writes the run file the
+command stands for. `--ndvi` / `--gvi` take one file, several files matched to
+years by name, or `YEAR=FILE` pairs.
+
+### Run files
+
+A run file (TOML) holds a whole analysis: the downloads and the fit that uses
+them.
+
+```toml
+format = "geofuse-run"
+version = 1
+output_dir = "results"
+
+[[ndvi]]
+name = "city"
+study_area = "data/city.gpkg"
+year_column = "year"
+cloud_max = 20
+
+[[gvi]]
+name = "city"
+study_area = "data/city.gpkg"
+capture_mode = "column"
+year_column = "year"
+
+[[fusion]]
+name = "cesd"
+target = "data/cohort.gpkg"
+outcomes = ["cesd"]
+covariates = ["age"]
+mode = "year-aware"
+date_column = "interview_date"
+ndvi = "@ndvi.city"        # the files the ndvi step writes ("@ndvi.city[max]" for one statistic)
+gvi = "@gvi.city"
+```
+
+`geofuse config template pipeline -o run.toml` writes a commented example with
+every setting at its default (`ndvi`, `gvi` and `fusion` templates too). A
+step's settings resolve in this order, later winning: the default, the step's
+`preset`, the file's `[defaults.<engine>]`, the step, the command line. Unknown
+keys and out-of-range values are refused with the key named, and so is anything
+that looks like a credential. Relative paths are read from the run file's
+folder.
+
+```bash
+geofuse plan run.toml                       # the jobs, numbered, with settings that differ from the defaults
+geofuse submit run.toml                     # start them in the background
+geofuse run run.toml                        # or run them here until they end
+geofuse submit run.toml --cloud-max 30      # a setting for every step that has it
+geofuse submit run.toml --set ndvi.city.cloud_max=30   # one step
+geofuse submit run.toml --only gvi.city     # one step; the steps it needs are taken as done
+```
+
+A step starts when the steps it references finish; independent steps run side
+by side within the limits below.
+
+### Following and managing jobs
+
+```bash
+geofuse watch                       # full-screen monitor
+geofuse status                      # one table (--json for scripts)
+geofuse logs JOB -f                 # a job's log, followed
+geofuse pause | resume | cancel JOB...   # or --all
+geofuse wait JOB...                 # returns 0 when all completed
+geofuse rerun JOB                   # the same job again; caches make it resume
+geofuse rm --finished               # tidy the list
+```
+
+`geofuse watch` shows every job with its progress and time left, the selected
+job's stages, settings and outputs, and its log as it grows. Keys: `p` pause,
+`r` resume, `c` cancel (asks first), `a` all / unfinished, `/` filter, `l` wide
+log, `q` quit. Quitting leaves the jobs running.
+
+Job ids can be shortened to any unique prefix. The supervisor starts with the
+first `submit` and stops after ten idle minutes; `geofuse supervisor --stop`
+stops it now. Exit codes: 0 done, 1 a job failed or was cancelled, 2 invalid
+settings or inputs, 3 an environment problem.
+
+### Limits shared with the dashboard
+
+GPU, Street View, Earth Engine and fusion jobs each hold a slot while they run,
+whether the dashboard or the command line started them:
+
+```bash
+geofuse config show
+geofuse config set limits.gpu 2              # two GVI jobs at once
+geofuse config set limits.earthengine 3
+geofuse config set limits.max_parallel 6     # jobs the supervisor runs at once
+```
+
+### Results
+
+```bash
+geofuse results JOB                         # held-out score, direction, each channel alone, weights, radii
+geofuse results output_results/fusion/<run>/    # any run, dashboard runs included
+geofuse export JOB -o cgi.csv               # the per-entity CGI table (.gpkg, .csv or .geojson)
+```
+
+### Presets, caches and credentials
+
+```bash
+geofuse preset list
+geofuse preset show ndvi "Sentinel-2 10 m"           # as run-file lines
+geofuse preset save ndvi "Lenient" --cloud-max 60    # or --from run.toml --step city
+geofuse preset import shared.json
+geofuse cache list
+geofuse cache purge ndvi                # asks first; pano | ndvi | fusion | all
+geofuse credentials show                # what is stored, never the values
+```
+
+Credentials go to the operating system's keyring (Windows Credential Manager,
+macOS Keychain, Secret Service), or, where there is no keyring, to a file in
+your configuration folder that only you can read. They never go to run files,
+job records, logs or environment variables.
+
+**Earth Engine sign-in without a browser** (a cluster login node): connect with
+`ssh -L 8085:localhost:8085 HOST`, run `geofuse auth earthengine` there and open
+the address it prints on your own computer. `geofuse auth earthengine
+--no-browser` shows a code to paste instead (Google expires those sign-ins after
+about a week), and `geofuse credentials set earthengine-service-account
+KEY.json` uses a service account, which does not expire.
+
+### On a cluster
+
+The same commands run on any SLURM cluster; nothing is specific to one site.
+
+1. Install the environment and sign in (above). Put the panorama and NDVI tile
+   caches on a disk local to the nodes, or on scratch, since they are SQLite
+   files and unsafe on a shared home directory:
+   `geofuse config set paths.caches /scratch/$USER/geofuse-caches`.
+2. Split large GVI steps with `shards = N` in the run file: N jobs over spatial
+   blocks of the grid, then a merge that writes the usual outputs.
+3. Write the job scripts, submit them, and follow them from the login node:
+
+```bash
+geofuse hpc script run.toml --account my-account --gpu-partition gpu \
+    --setup "module load cuda; conda activate geofuse"
+bash hpc-run/submit.sh
+geofuse watch
+```
+
+`hpc script` writes one job array per dependency level and resource group (GVI
+on a GPU, fusion with `--fusion-cpus` / `--fusion-mem`, the rest small) and a
+`submit.sh` that makes each level wait for the one before. Each array task runs
+one job, `geofuse run run.toml --level K --group G --array-task N`, which can
+also be run by hand; `geofuse plan` shows every job's number, level and group.

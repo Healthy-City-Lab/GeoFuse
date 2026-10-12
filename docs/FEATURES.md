@@ -245,7 +245,12 @@ Nothing below is pre-specified.
 - **Dashboard.** A Streamlit app with a tab per engine. Jobs run in their own
   process, so the interface stays responsive and a running job is not throttled
   by the browser tab.
-- **CLI.** An MPI-parallel command-line entry point for HPC batch runs.
+- **Command line.** `geofuse` runs every engine with the dashboard's settings
+  and defaults, from TOML run files that chain downloads and the fit (or one
+  engine from flags). A background supervisor runs the jobs, `geofuse watch`
+  follows and controls them, and the dashboard's jobs share the same GPU, Street
+  View, Earth Engine and fusion limits. On a cluster, GVI steps split into
+  shards and `geofuse hpc script` writes SLURM job arrays.
 - **Sized to the machine.** Thread pools take about a third of the cores;
   process pools take 80 % by default. Override with `GEOFUSE_WORKERS` and
   `GEOFUSE_CPU_SHARE`. Every run logs a stage-by-stage wall-clock breakdown.

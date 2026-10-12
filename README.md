@@ -22,8 +22,9 @@ effect is reported on a held-out test set the search never saw. Negative-control
 outcomes check how much of the association is specific, and a plasmode module
 measures whether the pipeline recovers a planted index in your own data.
 
-Run it either as an interactive Streamlit dashboard or as an MPI-parallel CLI
-for HPC batch processing.
+Run it as an interactive Streamlit dashboard, or from the `geofuse` command
+line: run files that chain the downloads and the fit, a background supervisor
+with a full-screen monitor, and job arrays on any SLURM cluster.
 
 ---
 
@@ -40,6 +41,11 @@ cp your_model.pth geofuse/model/best_model.pth
 # 3. Launch the web UI
 conda activate geofuse
 streamlit run ui/app.py
+
+# ... or use the command line
+geofuse doctor
+geofuse config template pipeline -o run.toml   # edit, then:
+geofuse submit run.toml && geofuse watch
 ```
 
 ---
@@ -50,7 +56,7 @@ streamlit run ui/app.py
 | ------------------------------------------ | -------------------------------------------------------------------------------- |
 | [Features](docs/FEATURES.md)               | What each engine does, what it expects, and why the fusion result is defensible  |
 | [Installation](docs/INSTALLATION.md)       | Full setup instructions, segmentation model requirements, and verification tests |
-| [Usage](docs/USAGE.md)                     | Web UI walkthrough and CLI reference                                             |
+| [Usage](docs/USAGE.md)                     | Web UI walkthrough and command-line reference (run files, jobs, clusters)        |
 | [Outputs](docs/OUTPUTS.md)                 | All generated files and directory structure                                      |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | Common errors and fixes                                                          |
 
@@ -70,7 +76,7 @@ If you use GeoFuse in your research, please cite:
 
 **Built With & References**:
 
-* **Street View Download:** `geofuse/streetview.py`, a minimal custom port adapted from [streetlevel](https://github.com/sk-zk/streetlevel) (MIT). Uses Google's `SingleImageSearch` protobuf API for metadata and `streetviewpixels-pa.googleapis.com` for tiles.
+* **Street View Download:** `geofuse/streetview.py`, a minimal custom port adapted from [streetlevel](https://github.com/sk-zk/streetlevel) (MIT). Finds panoramas through Google Maps' coverage tiles and panorama metadata (`photometa`) and downloads them from `streetviewpixels-pa.googleapis.com`; no API key.
 * **Semantic Segmentation:** [DeepLabV3+](https://github.com/VainF/DeepLabV3Plus-Pytorch/tree/master) via PyTorch.
 * **Training Data:** [Cityscapes Dataset](https://www.cityscapes-dataset.com/).
 * **Satellite Imagery:** [Google Earth Engine](https://earthengine.google.com/) and [geemap](https://geemap.org).

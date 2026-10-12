@@ -35,6 +35,21 @@ Then run it:
 ./install.sh
 ```
 
+### The `geofuse` command
+
+The installer makes `geofuse` available in the environment and ends with
+`geofuse doctor --offline`. Run the full check once the model is in place:
+
+```bash
+conda activate geofuse
+geofuse doctor
+```
+
+It reports the configuration, the state and cache folders, the credential
+store, Street View, Earth Engine, the GPU, the segmentation model and the
+monitor, and exits 3 when something is not ready. Into an existing environment,
+`pip install -e .` from the repository root installs the command.
+
 ---
 
 ## Segmentation Model

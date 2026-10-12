@@ -95,6 +95,7 @@ output_results/fusion/<YYYYMMDDTHHMMSS>__<short_job_id>/
 ├── composite_greenery.tif              composite raster at the discovered params
 ├── composite_greenery_params.json      discovered params + provenance
 ├── composite_greenery_<channel>.tif    one per standalone channel, if enabled
+├── composite_entities.gpkg             one row per target entity: channels + CGI
 ├── results_bundle.json                 everything the results panel needs
 └── study_results/
     ├── run_config.json                 every setting the run used
@@ -213,9 +214,45 @@ resampling question. `mixedlm_tstat` is an absolute value, so its interval sits
 above zero by construction and is not a significance statement; the signed
 coefficient is reported alongside and is the one that can straddle zero.
 
+`composite_entities.gpkg` (layer `cgi`; a `.csv` when the target has no
+geometry) is the per-entity table the dashboard's "Export per-entity CGI" and
+`geofuse export` deliver.
+
 ### Caches
 
 `output_results/fusion_cache/` holds aligned channel rasters and the
 pre-aggregation store of per-entity, per-radius statistics. Both are reused
 automatically across runs with identical inputs and are safe to delete to force
 a rebuild.
+
+The panorama cache (`gvi_panos.db`, the GVI value of every panorama segmented
+so far) and the NDVI tile cache (`ndvi_tiles/`) live in `logs/caches/`, or in
+the folder `[paths] caches` of the user configuration names. Both are shared
+by every run; `geofuse cache list | purge` and the dashboard's cache panel
+manage them.
+
+---
+
+## Command-line state
+
+The command line keeps its jobs in a per-user state folder
+(`%LOCALAPPDATA%\geofuse` on Windows, `~/.local/state/geofuse` on Linux;
+`state_dir` in the configuration, or `--state-dir`, moves it):
+
+| Path | Contents |
+| --- | --- |
+| `jobs/<id>/spec.json` | What the job runs: inputs and resolved settings |
+| `jobs/<id>/status.json` | Where it is: status, progress, stages, outputs |
+| `jobs/<id>/control.json` | Pause / resume / cancel requests |
+| `logs/<id>.log` | The job's log |
+| `runs/<run>.json` | Each submitted run and its jobs |
+| `supervisors/<id>.json` | Each running supervisor and its heartbeat |
+
+The files are plain JSON replaced whole, so the folder may sit on a cluster's
+shared filesystem and be read from the login node. The user configuration
+(`config.toml`) lives in `%LOCALAPPDATA%\geofuse` / `~/.config/geofuse`.
+
+A sharded GVI step leaves `[name]_gvi.shard<i>of<N>.gpkg` and a manifest per
+shard until its merge job writes the usual outputs and removes them.
+`geofuse hpc script` writes its job scripts to `hpc-<run>/`, with the
+scheduler's logs in `hpc-<run>/logs/`.
