@@ -7,12 +7,13 @@ A preset is a JSON document::
      "geofuse_version": ..., "settings": {...}}
 
 ``settings`` holds acquisition and method settings only — never dates, file
-paths, study-area data or credentials. Each engine has a schema whose keys,
-types, choices and bounds match the tab's widgets; :func:`validate` checks a
-document against it, refusing anything malformed (with the key named) and
-warning about keys it does not know. Built-in presets ship read-only under
-``builtin/<engine>/``; user presets live in a library folder (by default
-``<repo>/presets/<engine>/``, git-ignored).
+paths, study-area data or credentials. Each engine's schema is its
+:mod:`geofuse.settings` schema, whose keys, types, choices and bounds match
+the tab's widgets; :func:`validate` checks a document against it, refusing
+anything malformed (with the key named) and warning about keys it does not
+know. Built-in presets ship read-only under ``builtin/<engine>/``; user
+presets live in a library folder (by default ``<repo>/presets/<engine>/``,
+git-ignored).
 
 Streamlit-free, so the CLI and notebooks can use it too.
 """
@@ -28,7 +29,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from ..ndvi import CLOUD_HANDLINGS, REFLECTANCES, SATELLITES, TEMPORAL_REDUCERS
+from .. import settings as _settings
 
 FORMAT = "geofuse-preset"
 VERSION = 1
@@ -38,7 +39,7 @@ BUILTIN_DIR = Path(__file__).resolve().parent / "builtin"
 USER_DIR = Path(__file__).resolve().parents[2] / "presets"
 
 
-class PresetError(ValueError):
+class PresetError(_settings.SettingError):
     """A preset that cannot be used, with the reason."""
 
 
@@ -46,97 +47,8 @@ class PresetExists(PresetError):
     """Saving would overwrite a preset of the same name."""
 
 
-# ────────────────────────────────────────────────────────────────────
-# Schemas
-# ────────────────────────────────────────────────────────────────────
-
-
-@dataclass(frozen=True)
-class Field:
-    """One setting: its type, its allowed values and its bounds."""
-
-    kind: str  # bool | int | choice | multichoice
-    choices: tuple = ()
-    lo: int | None = None
-    hi: int | None = None
-
-    def check(self, key: str, value: Any) -> Any:
-        if self.kind == "bool":
-            if not isinstance(value, bool):
-                raise PresetError(f"'{key}' must be true or false, not {value!r}.")
-            return value
-        if self.kind == "int":
-            if isinstance(value, bool) or not isinstance(value, int):
-                raise PresetError(f"'{key}' must be a whole number, not {value!r}.")
-            if (self.lo is not None and value < self.lo) or (
-                self.hi is not None and value > self.hi
-            ):
-                raise PresetError(
-                    f"'{key}' must be between {self.lo} and {self.hi}, not {value}."
-                )
-            return value
-        if self.kind == "choice":
-            if value not in self.choices:
-                raise PresetError(
-                    f"'{key}' must be one of {list(self.choices)}, not {value!r}."
-                )
-            return value
-        if self.kind == "multichoice":
-            if not isinstance(value, list) or not value:
-                raise PresetError(f"'{key}' must be a non-empty list.")
-            bad = [v for v in value if v not in self.choices]
-            if bad:
-                raise PresetError(
-                    f"'{key}' may only contain {list(self.choices)}, not {bad}."
-                )
-            return [c for c in self.choices if c in value]
-        raise AssertionError(self.kind)
-
-
-_BOOL = Field("bool")
-_MONTH = Field("int", lo=1, hi=12)
-_STATS = Field("multichoice", TEMPORAL_REDUCERS)
-
-SCHEMAS: dict[str, dict[str, Field]] = {
-    "ndvi": {
-        "satellite": Field("choice", SATELLITES),
-        "reflectance": Field("choice", REFLECTANCES),
-        "cloud_handling": Field("choice", CLOUD_HANDLINGS),
-        "cloud_max": Field("int", lo=0, hi=100),
-        "resolution_m": Field("int", lo=10, hi=1000),
-        "buffer_m": Field("int", lo=0, hi=2000),
-        "coverage_rescue": _BOOL,
-        "water_mask": _BOOL,
-        "substitute_2012": _BOOL,
-        "save_geotiff": _BOOL,
-        "save_gpkg": _BOOL,
-        "save_geojson": _BOOL,
-        "save_cluster_tiles": _BOOL,
-        "statistics_ranges": _STATS,
-        "statistics_specific": _STATS,
-        "statistics_column": _STATS,
-        "season_start_month": _MONTH,
-        "season_end_month": _MONTH,
-        "specific_window_days": Field("int", lo=7, hi=180),
-    },
-    "gvi": {
-        "download_mode": Field("choice", ("package", "api")),
-        "grid_resolution_m": Field("int", lo=20, hi=500),
-        "buffer_m": Field("int", lo=0, hi=2000),
-        "save_raw": _BOOL,
-        "show_sampling_grid": _BOOL,
-        "save_gpkg": _BOOL,
-        "save_geotiff": _BOOL,
-        "save_geojson": _BOOL,
-        "capture_mode": Field("choice", ("recent", "year", "column")),
-        "target_year": Field("int", lo=2007, hi=2100),
-        "limit_year_difference": _BOOL,
-        "max_year_difference": Field("int", lo=0, hi=20),
-        "limit_months": _BOOL,
-        "month_start": _MONTH,
-        "month_end": _MONTH,
-        "month_policy": Field("choice", ("exclude", "prefer")),
-    },
+SCHEMAS: dict[str, dict[str, _settings.Setting]] = {
+    engine: _settings.SCHEMAS[engine] for engine in ENGINES
 }
 
 # A key name like these, or a value shaped like a Google API key, anywhere in
@@ -212,7 +124,12 @@ def validate(doc: Any, engine: str) -> tuple[dict, list[str]]:
         if field is None:
             warnings.append(f"Unknown setting '{key}' ignored.")
             continue
-        settings[key] = field.check(key, value)
+        if value is None:
+            raise PresetError(f"'{key}' needs a value.")
+        try:
+            settings[key] = field.check(key, value)
+        except _settings.SettingError as exc:
+            raise PresetError(str(exc)) from exc
     lo, hi = "season_start_month", "season_end_month"
     if lo in settings and hi in settings and settings[lo] > settings[hi]:
         raise PresetError(f"'{lo}' must be on or before '{hi}'.")
