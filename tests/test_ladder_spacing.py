@@ -163,5 +163,46 @@ class LadderWidgetTests(unittest.TestCase):
             self.assertEqual(at.selectbox(key="fusion_gvi_ladder_spacing").value, "linear")
 
 
+class RadiusPriorWidgetTests(unittest.TestCase):
+    """The study-details panel offers the radius prior and returns it."""
+
+    APP = textwrap.dedent(
+        """
+        import os, sys
+        ROOT = {root!r}
+        for p in (os.path.join(ROOT, "ui"), ROOT):
+            if p not in sys.path:
+                sys.path.insert(0, p)
+        import streamlit as st
+        from tabs import fusion
+        state = fusion._render_study_details_panel(
+            False, ["age"], is_polygon_target=False, is_vector_target=True
+        )
+        st.session_state["_study_state"] = state
+        """
+    )
+
+    def test_default_and_switch(self):
+        from streamlit.testing.v1 import AppTest
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "app.py")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(self.APP.format(root=ROOT))
+            at = AppTest.from_file(path, default_timeout=60)
+            at.run()
+            self.assertFalse(at.exception)
+            prior = at.selectbox(key="fusion_radius_prior")
+            self.assertEqual(prior.label, "Radius prior")
+            self.assertEqual(prior.value, "rungs")
+            self.assertEqual(
+                prior.options, ["Rung-based", "Range-based (spacing-invariant)"]
+            )
+            self.assertEqual(at.session_state["_study_state"]["radius_prior"], "rungs")
+            prior.set_value("range")
+            at.run()
+            self.assertEqual(at.session_state["_study_state"]["radius_prior"], "range")
+
+
 if __name__ == "__main__":
     unittest.main()
