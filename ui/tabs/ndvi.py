@@ -37,7 +37,11 @@ from geofuse.crs_utils import (
     reproject_geodataframe_to_wgs84,
 )
 from geofuse.ndvi import TEMPORAL_REDUCERS
+from geofuse.settings import NDVI as _NDVI_SETTINGS
+from geofuse.settings import defaults as _settings_defaults
 from geofuse.vector_io import geometry_sha256
+
+_NDVI_DEFAULTS = _settings_defaults("ndvi")
 
 _MONTH_NAMES = [
     "January",
@@ -75,35 +79,6 @@ _CLOUD_LABELS = {
     "scene_only": "Drop cloudy scenes, keep their pixels",
 }
 
-# Download settings and their defaults (today's behaviour). Seeded into
-# session state before the widgets render, so a preset can set them too.
-_SETTING_DEFAULTS = {
-    "ndvi_satellite": "auto",
-    "ndvi_reflectance": "surface",
-    "ndvi_cloud_handling": "scene_filter",
-    "ndvi_cloud": 10,
-    "ndvi_res": 10,
-    "ndvi_buffer": 0,
-    "ndvi_coverage_rescue": True,
-    "ndvi_water_mask": False,
-    "ndvi_substitute_2012": False,
-    "ndvi_out_geotiff": True,
-    "ndvi_out_gpkg": False,
-    "ndvi_out_geojson": False,
-    "ndvi_out_cluster_tiles": False,
-}
-
-# Per-dataset method settings; a new dataset starts from these, and a preset
-# rewrites them (``ndvi_method_defaults`` in session state).
-_METHOD_DEFAULTS = {
-    "stats_ranges": ["median"],
-    "stats_specific": ["median"],
-    "stats_column": ["median"],
-    "season_start_month": 6,
-    "season_end_month": 9,
-    "window_days_specific": 30,
-}
-
 # Preset setting -> session-state key of the widget that holds it.
 _PRESET_KEYS = {
     "satellite": "ndvi_satellite",
@@ -128,6 +103,16 @@ _PRESET_METHOD_KEYS = {
     "season_start_month": ("season_start_month", "ndvi_seas_start_{}"),
     "season_end_month": ("season_end_month", "ndvi_seas_end_{}"),
     "specific_window_days": ("window_days_specific", "ndvi_win_s_{}"),
+}
+
+# Download settings and their defaults (``geofuse.settings``), seeded into
+# session state before the widgets render so a preset can set them too.
+_SETTING_DEFAULTS = {key: _NDVI_DEFAULTS[name] for name, key in _PRESET_KEYS.items()}
+
+# Per-dataset method settings; a new dataset starts from these, and a preset
+# rewrites them (``ndvi_method_defaults`` in session state).
+_METHOD_DEFAULTS = {
+    cfg_key: _NDVI_DEFAULTS[name] for name, (cfg_key, _) in _PRESET_METHOD_KEYS.items()
 }
 
 
@@ -790,8 +775,8 @@ def _render_ndvi_settings_map() -> None:
             )
             st.slider(
                 "Maximum Cloud Coverage (%)",
-                0,
-                100,
+                int(_NDVI_SETTINGS["cloud_max"].lo),
+                int(_NDVI_SETTINGS["cloud_max"].hi),
                 key="ndvi_cloud",
                 disabled=st.session_state["ndvi_cloud_handling"] == "pixel_only",
                 help=(
@@ -801,14 +786,15 @@ def _render_ndvi_settings_map() -> None:
             )
             st.number_input(
                 "Resolution (m)",
-                min_value=10,
+                min_value=int(_NDVI_SETTINGS["resolution_m"].lo),
+                max_value=int(_NDVI_SETTINGS["resolution_m"].hi),
                 key="ndvi_res",
                 help="Target pixel size for the NDVI raster export.",
             )
             buffer_m = st.slider(
                 "Download Buffer (m)",
-                min_value=0,
-                max_value=2000,
+                min_value=int(_NDVI_SETTINGS["buffer_m"].lo),
+                max_value=int(_NDVI_SETTINGS["buffer_m"].hi),
                 step=50,
                 key="ndvi_buffer",
                 help="Expand the study area outward by this distance (metres) before download.",
@@ -1031,8 +1017,8 @@ def _render_ndvi_date_config() -> None:
                     _seed(f"ndvi_win_s_{fname}", cfg.get("window_days_specific", 30))
                     cfg["window_days_specific"] = st.number_input(
                         "Composite window (± days)",
-                        min_value=7,
-                        max_value=180,
+                        min_value=int(_NDVI_SETTINGS["specific_window_days"].lo),
+                        max_value=int(_NDVI_SETTINGS["specific_window_days"].hi),
                         key=f"ndvi_win_s_{fname}",
                         help=(
                             "Composite uses imagery within ± this many days around "

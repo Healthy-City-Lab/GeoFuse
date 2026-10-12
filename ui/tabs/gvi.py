@@ -36,7 +36,11 @@ from shapely.geometry import box as shapely_box
 from streamlit_folium import st_folium
 
 from geofuse.crs_utils import reproject_geodataframe_to_wgs84
+from geofuse.settings import GVI as _GVI_SETTINGS
+from geofuse.settings import defaults as _settings_defaults
 from geofuse.vector_io import geometry_sha256
+
+_GVI_DEFAULTS = _settings_defaults("gvi")
 
 
 def _gvi_output_tif_path(output_dir: str, base_name: str) -> str | None:
@@ -281,19 +285,7 @@ def _capture_args(p: dict) -> dict:
     return args
 
 
-# Download settings and their defaults, seeded into session state before the
-# widgets render so a preset can set them too.
 _GVI_DOWNLOAD_LABELS = {"package": "Package (Scraper)", "api": "API (Street View)"}
-_GVI_SETTING_DEFAULTS = {
-    "gvi_download_mode": _GVI_DOWNLOAD_LABELS["package"],
-    "gvi_res": 50,
-    "gvi_buffer": 0,
-    "gvi_save_debug": False,
-    "gvi_preview_sampling_grid": False,
-    "gvi_out_gpkg": True,
-    "gvi_out_geotiff": False,
-    "gvi_out_geojson": False,
-}
 # Preset setting -> session-state key of the widget that holds it.
 _GVI_PRESET_KEYS = {
     "grid_resolution_m": "gvi_res",
@@ -303,6 +295,12 @@ _GVI_PRESET_KEYS = {
     "save_gpkg": "gvi_out_gpkg",
     "save_geotiff": "gvi_out_geotiff",
     "save_geojson": "gvi_out_geojson",
+}
+# Download settings and their defaults (``geofuse.settings``), seeded into
+# session state before the widgets render so a preset can set them too.
+_GVI_SETTING_DEFAULTS = {
+    "gvi_download_mode": _GVI_DOWNLOAD_LABELS[_GVI_DEFAULTS["download_mode"]],
+    **{key: _GVI_DEFAULTS[name] for name, key in _GVI_PRESET_KEYS.items()},
 }
 # Preset capture setting -> (layer config key, widget key pattern).
 _GVI_PRESET_CAPTURE_KEYS = {
@@ -334,15 +332,15 @@ def _capture_defaults() -> dict:
     return st.session_state.setdefault(
         "gvi_capture_defaults",
         {
-            "mode": _GVI_MODE_RECENT,
-            "target_year": date.today().year,
+            "mode": _mode_from_preset(_GVI_DEFAULTS["capture_mode"]),
+            "target_year": _GVI_DEFAULTS["target_year"] or date.today().year,
             "date_column": None,
-            "use_max_diff": False,
-            "max_diff": 2,
-            "use_months": False,
-            "month_start": 5,
-            "month_end": 10,
-            "month_policy": "exclude",
+            "use_max_diff": _GVI_DEFAULTS["limit_year_difference"],
+            "max_diff": _GVI_DEFAULTS["max_year_difference"],
+            "use_months": _GVI_DEFAULTS["limit_months"],
+            "month_start": _GVI_DEFAULTS["month_start"],
+            "month_end": _GVI_DEFAULTS["month_end"],
+            "month_policy": _GVI_DEFAULTS["month_policy"],
         },
     )
 
@@ -970,7 +968,7 @@ def _render_gvi_date_config() -> None:
                 cfg["target_year"] = int(
                     st.number_input(
                         "Target year",
-                        min_value=2007,
+                        min_value=int(_GVI_SETTINGS["target_year"].lo),
                         max_value=this_year,
                         step=1,
                         key=f"gvi_year_{key}",
@@ -1011,8 +1009,8 @@ def _render_gvi_date_config() -> None:
                     cfg["max_diff"] = int(
                         st.number_input(
                             "Max acceptable difference (years)",
-                            min_value=0,
-                            max_value=20,
+                            min_value=int(_GVI_SETTINGS["max_year_difference"].lo),
+                            max_value=int(_GVI_SETTINGS["max_year_difference"].hi),
                             step=1,
                             key=f"gvi_md_{key}",
                         )
@@ -1093,16 +1091,16 @@ def _render_gvi_settings_map() -> None:
                 )
             st.slider(
                 "Grid Resolution (m)",
-                min_value=20,
-                max_value=500,
+                min_value=int(_GVI_SETTINGS["grid_resolution_m"].lo),
+                max_value=int(_GVI_SETTINGS["grid_resolution_m"].hi),
                 step=5,
                 key="gvi_res",
                 help="Spacing for sampling points in the generated grid (metres).",
             )
             st.slider(
                 "Download Buffer (m)",
-                min_value=0,
-                max_value=2000,
+                min_value=int(_GVI_SETTINGS["buffer_m"].lo),
+                max_value=int(_GVI_SETTINGS["buffer_m"].hi),
                 step=50,
                 key="gvi_buffer",
                 help=(
