@@ -74,7 +74,8 @@ def _ndvi_stats() -> str:
 
     try:
         s = get_ndvi_tile_cache().stats()
-        return f"{_human_bytes(s.get('total_bytes', 0))} · {s.get('entries', 0):,} workspaces"
+        size = _human_bytes(s.get("bytes", 0))
+        return f"{size} · {s.get('entries', 0):,} workspaces"
     except Exception as e:
         return f"unavailable ({type(e).__name__})"
 
