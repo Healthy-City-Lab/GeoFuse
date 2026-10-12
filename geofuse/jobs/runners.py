@@ -731,16 +731,19 @@ def run_ndvi(
     reflectance: str = "surface",
     substitute_2012: bool = False,
     preset: str | None = None,
+    ee_project: str | None = None,
 ) -> dict:
     """Run NDVI for a single date range, one set of files per statistic.
 
     Both ends of the range are included: the engine is called with
     ``end_inclusive=True``, so a range ending 30 September keeps that day.
+    ``ee_project`` is the Earth Engine project to initialise with (``None``:
+    the one Earth Engine finds in its own configuration).
     """
     from geofuse.crs_utils import buffer_gdf_union_metres
 
     ctx.progress(status_text="Initializing Earth Engine...")
-    engine = NDVIEngine()
+    engine = NDVIEngine(project_id=ee_project)
     geometry = buffer_gdf_union_metres(dataset_data["raw"], buffer_m)
 
     on_progress = _ndvi_on_progress_factory(ctx)
@@ -820,6 +823,7 @@ def run_ndvi_column(
     reflectance: str = "surface",
     substitute_2012: bool = False,
     preset: str | None = None,
+    ee_project: str | None = None,
 ) -> dict:
     """Run one NDVI raster per year present in ``date_column``.
 
@@ -856,7 +860,7 @@ def run_ndvi_column(
     job_folder = os.path.join(output_dir, f"{base_name}_temporal_ndvi")
     os.makedirs(job_folder, exist_ok=True)
 
-    engine = NDVIEngine()
+    engine = NDVIEngine(project_id=ee_project)
     output_paths: list[str] = [job_folder]
 
     def check_cancel() -> bool:

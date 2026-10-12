@@ -237,6 +237,15 @@ class BuildTests(_Case):
         ndvi_2015 = os.path.join(self.dir, "ndvi_2015.tif")
         self.assertEqual(fps["ndvi"]["2015"], file_size_mtime_fingerprint(ndvi_2015))
 
+    def test_earth_engine_project_goes_to_the_executor_only(self):
+        (spec,) = self.expand(
+            '[[ndvi]]\nstudy_area = "city.gpkg"\nranges = [[2019-05-01, 2019-09-30]]\n'
+        )
+        sub = plans.build(spec, ee_project="my-project")
+        self.assertEqual(sub.kwargs["ee_project"], "my-project")
+        self.assertNotIn("ee_project", sub.params)
+        self.assertNotIn("ee_project", plans.build(spec).kwargs)
+
     def test_options_left_at_run_fusion_defaults_are_not_passed(self):
         (fusion,) = self.expand(
             """

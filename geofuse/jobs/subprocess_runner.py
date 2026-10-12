@@ -523,6 +523,7 @@ def run_ndvi_child(
     reflectance="surface",
     substitute_2012=False,
     preset=None,
+    ee_project=None,
 ) -> None:
     """Subprocess entry point for ``run_ndvi`` (single date range).
 
@@ -561,6 +562,7 @@ def run_ndvi_child(
             reflectance=reflectance,
             substitute_2012=substitute_2012,
             preset=preset,
+            ee_project=ee_project,
         )
         event_queue.put((MSG_COMPLETE, list(result.get("output_paths") or [])))
 
@@ -599,6 +601,7 @@ def run_ndvi_column_child(
     reflectance="surface",
     substitute_2012=False,
     preset=None,
+    ee_project=None,
 ) -> None:
     """Subprocess entry point for ``run_ndvi_column`` (one raster per year)."""
     try:
@@ -631,6 +634,7 @@ def run_ndvi_column_child(
             reflectance=reflectance,
             substitute_2012=substitute_2012,
             preset=preset,
+            ee_project=ee_project,
         )
         event_queue.put((MSG_COMPLETE, list(result.get("output_paths") or [])))
 

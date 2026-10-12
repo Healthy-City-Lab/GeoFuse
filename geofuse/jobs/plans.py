@@ -553,7 +553,7 @@ def _merge_params(spec: JobSpec, fname: str) -> dict:
     }
 
 
-def _build_ndvi(spec: JobSpec) -> Submission:
+def _build_ndvi(spec: JobSpec, ee_project: str | None = None) -> Submission:
     from geofuse.vector_io import file_size_mtime_fingerprint, geometry_sha256
 
     s, o = spec.settings, spec.options
@@ -593,6 +593,8 @@ def _build_ndvi(spec: JobSpec) -> Submission:
         **options,
         **_merge_params(spec, fname),
     }
+    if ee_project:
+        options = {**options, "ee_project": ee_project}
     data = {"raw": raw}
     if o["mode"] == "column":
         params = {
@@ -1010,14 +1012,17 @@ def build(
     model_path: str | None = None,
     api_key: str | None = None,
     pano_cache_db_path: str = "logs/caches/gvi_panos.db",
+    ee_project: str | None = None,
 ) -> Submission:
     """The record and executor call the tab would make for ``spec``.
 
     ``api_key`` is the Street View key for an ``api`` download (never part of
-    a spec); ``model_path`` defaults to the repository's segmentation model.
+    a spec); ``model_path`` defaults to the repository's segmentation model;
+    ``ee_project`` is the Earth Engine project NDVI jobs initialise with
+    (passed to the executor only when set, as the tab never sets one).
     """
     if spec.kind in ("ndvi", "ndvi_column"):
-        return _build_ndvi(spec)
+        return _build_ndvi(spec, ee_project)
     if spec.kind in ("gvi", "gvi_column"):
         if model_path is None:
             repo = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))

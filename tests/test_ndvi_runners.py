@@ -36,9 +36,10 @@ class _Ctx:
 
 class _StubEngine:
     calls: list[dict] = []
+    projects: list = []
 
-    def __init__(self, *_a, **_kw):
-        pass
+    def __init__(self, project_id=None, **_kw):
+        _StubEngine.projects.append(project_id)
 
     @staticmethod
     def compute_export_crs(_gdf):
@@ -67,6 +68,7 @@ class RunnerTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.dir = self.tmp.name
         _StubEngine.calls = []
+        _StubEngine.projects = []
         patcher = mock.patch.object(runners, "NDVIEngine", _StubEngine)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -167,6 +169,28 @@ class RunnerTests(unittest.TestCase):
             (False, "scene_filter", "surface"),
         )
         self.assertFalse(call["substitute_2012"])
+
+    def test_earth_engine_project_reaches_the_engine(self):
+        runners.run_ndvi(
+            _Ctx(),
+            fname="site.geojson",
+            dataset_data={"raw": _points([2020])},
+            start_date="2023-06-01",
+            end_date="2023-09-30",
+            output_name="site",
+            ee_project="my-project",
+            **self._common(),
+        )
+        runners.run_ndvi_column(
+            _Ctx(),
+            fname="site.geojson",
+            dataset_data={"raw": _points([2020])},
+            date_column="year",
+            season_start_month=5,
+            season_end_month=9,
+            **self._common(),
+        )
+        self.assertEqual(_StubEngine.projects, ["my-project", None])
 
     def test_column_job_per_year_and_statistic(self):
         out = runners.run_ndvi_column(
