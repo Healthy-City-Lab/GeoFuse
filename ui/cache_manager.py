@@ -14,131 +14,72 @@ runs stay loadable in the Result Inspector.
 
 from __future__ import annotations
 
-import os
-import shutil
-
 import streamlit as st
+
+from geofuse.persistence import caches
 
 _ARM_KEY = "_cache_purge_armed"
 _DONE_KEY = "_cache_purge_done"
 
 
-def _human_bytes(n: float) -> str:
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if abs(n) < 1024.0:
-            return f"{n:,.0f} {unit}" if unit == "B" else f"{n:,.1f} {unit}"
-        n /= 1024.0
-    return f"{n:,.1f} PB"
+def _open_caches(output_dir: str) -> dict:
+    """The GUI's open caches, so a purge also clears their in-memory state."""
+    from services import get_ndvi_tile_cache, get_pano_cache
+
+    return {
+        "output_dir": output_dir,
+        "pano": get_pano_cache(),
+        "ndvi": get_ndvi_tile_cache(),
+    }
 
 
-def _dir_size(path: str) -> tuple[int, int]:
-    """(bytes, file_count) for a directory tree; (0, 0) when absent."""
-    if not os.path.isdir(path):
-        return 0, 0
-    total = files = 0
-    for root, _dirs, names in os.walk(path):
-        for nm in names:
-            try:
-                total += os.path.getsize(os.path.join(root, nm))
-                files += 1
-            except OSError:
-                pass
-    return total, files
-
-
-# ────────────────────────────────────────────────────────────────────
-# Cache descriptors — each knows how to measure itself and how to purge itself.
-# ────────────────────────────────────────────────────────────────────
-
-
-def _pano_stats() -> str:
-    from services import get_pano_cache
-
+def _stats(key: str) -> str:
     try:
-        return f"{len(get_pano_cache()):,} panoramas"
+        return caches.describe_cache(key, **_open_caches(_output_dir()))
     except Exception as e:
         return f"unavailable ({type(e).__name__})"
 
 
-def _pano_purge() -> str:
-    from services import get_pano_cache
-
-    cache = get_pano_cache()
-    n = len(cache)
-    cache.clear()
-    return f"Cleared {n:,} cached panorama GVI values."
+def _purge(key: str) -> str:
+    return caches.purge_cache(key, **_open_caches(_output_dir()))
 
 
-def _ndvi_stats() -> str:
-    from services import get_ndvi_tile_cache
-
-    try:
-        s = get_ndvi_tile_cache().stats()
-        size = _human_bytes(s.get("bytes", 0))
-        return f"{size} · {s.get('entries', 0):,} workspaces"
-    except Exception as e:
-        return f"unavailable ({type(e).__name__})"
-
-
-def _ndvi_purge() -> str:
-    from services import get_ndvi_tile_cache
-
-    n, freed = get_ndvi_tile_cache().clear()
-    return f"Removed {n:,} tile workspaces, freed {_human_bytes(freed)}."
-
-
-def _fusion_dir() -> str:
-    return os.path.join(
-        st.session_state.get("_gf_output_dir", "output_results"), "fusion_cache"
-    )
-
-
-def _fusion_stats() -> str:
-    b, f = _dir_size(_fusion_dir())
-    return f"{_human_bytes(b)} · {f:,} files" if f else "empty"
-
-
-def _fusion_purge() -> str:
-    p = _fusion_dir()
-    b, f = _dir_size(p)
-    if not f:
-        return "Fusion cache was already empty."
-    shutil.rmtree(p, ignore_errors=True)
-    return f"Removed {f:,} files, freed {_human_bytes(b)}."
+def _output_dir() -> str:
+    return st.session_state.get("_gf_output_dir", "output_results")
 
 
 _CACHES = [
     {
         "key": "pano",
-        "label": "GVI panorama cache",
+        "label": caches.CACHE_LABELS["pano"],
         "help": (
             "Segmented GVI values keyed by panorama id (`logs/caches/gvi_panos.db`). "
             "Purge this after any change to the segmentation metric — otherwise "
             "old runs keep returning the previously-computed numbers."
         ),
-        "stats": _pano_stats,
-        "purge": _pano_purge,
+        "stats": lambda: _stats("pano"),
+        "purge": lambda: _purge("pano"),
     },
     {
         "key": "ndvi",
-        "label": "NDVI tile cache",
+        "label": caches.CACHE_LABELS["ndvi"],
         "help": (
             "Downloaded Earth Engine tile workspaces (`logs/caches/ndvi_tiles/`). "
             "Safe to purge; the next run re-downloads what it needs."
         ),
-        "stats": _ndvi_stats,
-        "purge": _ndvi_purge,
+        "stats": lambda: _stats("ndvi"),
+        "purge": lambda: _purge("ndvi"),
     },
     {
         "key": "fusion",
-        "label": "Fusion pre-aggregation cache",
+        "label": caches.CACHE_LABELS["fusion"],
         "help": (
             "Content-addressed fusion inputs (`output_results/fusion_cache/`). "
             "Purging only forces re-computation — finished job reports and "
             "artifacts are kept and stay loadable."
         ),
-        "stats": _fusion_stats,
-        "purge": _fusion_purge,
+        "stats": lambda: _stats("fusion"),
+        "purge": lambda: _purge("fusion"),
     },
 ]
 

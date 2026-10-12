@@ -33,19 +33,17 @@ from .ee_utils import (
 )
 from .jobs import NDVI_PROGRESS_MIN_TILES, ProgressThrottle, retry_with_backoff
 from .logger import attach_external_logger, get_logger
-from .persistence.caches import DEFAULT_MAX_BYTES, NdviTileCache
+from .persistence.caches import DEFAULT_MAX_BYTES, NDVI_TILES, NdviTileCache
 from .vector_io import geometry_sha256
 
 _log = get_logger("NDVI")
 
 # TODO: NDVI_TEMPORAL - Add time-series analysis for seasonal greenery changes
 
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
 # Persistent NDVI tile cache root. Cross-process caches live under one
 # well-known directory. Tile bodies live under ``<root>/<resume_key>/``
 # alongside a SQLite WAL index used for LRU eviction.
-_TILE_CACHE_ROOT = os.path.join(_REPO_ROOT, "logs", "caches", "ndvi_tiles")
+_TILE_CACHE_ROOT = NDVI_TILES
 
 # Concurrent tile-download workers. Earth Engine allows several parallel
 # ``ee_export_image`` calls per user well above this; the cap exists to avoid

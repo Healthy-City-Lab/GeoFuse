@@ -331,3 +331,128 @@ def remove_files(paths: list[str]) -> tuple[int, int]:
         removed += 1
         freed += size
     return removed, freed
+
+
+# ────────────────────────────────────────────────────────────────────
+# The caches as a whole, measured and purged by the GUI and the CLI
+# ────────────────────────────────────────────────────────────────────
+
+_REPO_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+#: Where the panorama and NDVI tile caches live, shared by every run.
+CACHE_ROOT = os.path.join(_REPO_ROOT, "logs", "caches")
+PANO_DB = os.path.join(CACHE_ROOT, "gvi_panos.db")
+NDVI_TILES = os.path.join(CACHE_ROOT, "ndvi_tiles")
+
+#: Each cache's name, as the GUI's cache panel and ``geofuse cache`` show it.
+CACHE_LABELS = {
+    "pano": "GVI panorama cache",
+    "ndvi": "NDVI tile cache",
+    "fusion": "Fusion pre-aggregation cache",
+}
+
+
+def human_bytes(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024.0:
+            return f"{n:,.0f} {unit}" if unit == "B" else f"{n:,.1f} {unit}"
+        n /= 1024.0
+    return f"{n:,.1f} PB"
+
+
+def dir_size(path: str) -> tuple[int, int]:
+    """``(bytes, files)`` of a folder tree; ``(0, 0)`` when it is absent."""
+    if not os.path.isdir(path):
+        return 0, 0
+    total = files = 0
+    for root, _dirs, names in os.walk(path):
+        for name in names:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+                files += 1
+            except OSError:
+                pass
+    return total, files
+
+
+def fusion_cache_dir(output_dir: str) -> str:
+    """The fusion cache of runs writing to ``output_dir``."""
+    return os.path.join(output_dir, "fusion_cache")
+
+
+def describe_cache(
+    key: str,
+    *,
+    output_dir: str = "output_results",
+    pano: PanoCache | None = None,
+    ndvi: NdviTileCache | None = None,
+) -> str:
+    """One line on what ``key`` (``pano`` / ``ndvi`` / ``fusion``) holds.
+
+    ``pano`` / ``ndvi`` are open caches to measure (the GUI's); without them
+    the shared ones are read, and a cache that does not exist yet reads empty.
+    """
+    if key == "pano":
+        if pano is None and not os.path.exists(PANO_DB):
+            return "empty"
+        cache = pano or PanoCache(PANO_DB)
+        try:
+            return f"{len(cache):,} panoramas"
+        finally:
+            if pano is None:
+                cache.close()
+    if key == "ndvi":
+        if ndvi is None and not os.path.isdir(NDVI_TILES):
+            return "empty"
+        cache = ndvi or NdviTileCache(NDVI_TILES)
+        try:
+            stats = cache.stats()
+        finally:
+            if ndvi is None:
+                cache.close()
+        return f"{human_bytes(stats['bytes'])} · {stats['entries']:,} workspaces"
+    if key == "fusion":
+        size, files = dir_size(fusion_cache_dir(output_dir))
+        return f"{human_bytes(size)} · {files:,} files" if files else "empty"
+    raise ValueError(f"Unknown cache {key!r} (known: {', '.join(CACHE_LABELS)}).")
+
+
+def purge_cache(
+    key: str,
+    *,
+    output_dir: str = "output_results",
+    pano: PanoCache | None = None,
+    ndvi: NdviTileCache | None = None,
+) -> str:
+    """Empty ``key``'s cache; returns what was freed. Job records and results
+    are never touched."""
+    if key == "pano":
+        if pano is None and not os.path.exists(PANO_DB):
+            return "GVI panorama cache was already empty."
+        cache = pano or PanoCache(PANO_DB)
+        try:
+            n = len(cache)
+            cache.clear()
+        finally:
+            if pano is None:
+                cache.close()
+        return f"Cleared {n:,} cached panorama GVI values."
+    if key == "ndvi":
+        if ndvi is None and not os.path.isdir(NDVI_TILES):
+            return "NDVI tile cache was already empty."
+        cache = ndvi or NdviTileCache(NDVI_TILES)
+        try:
+            n, freed = cache.clear()
+        finally:
+            if ndvi is None:
+                cache.close()
+        return f"Removed {n:,} tile workspaces, freed {human_bytes(freed)}."
+    if key == "fusion":
+        folder = fusion_cache_dir(output_dir)
+        size, files = dir_size(folder)
+        if not files:
+            return "Fusion cache was already empty."
+        shutil.rmtree(folder, ignore_errors=True)
+        return f"Removed {files:,} files, freed {human_bytes(size)}."
+    raise ValueError(f"Unknown cache {key!r} (known: {', '.join(CACHE_LABELS)}).")

@@ -39,9 +39,10 @@ from pathlib import Path
 from typing import Any
 
 from geofuse.jobs.state import ACTIVE, TERMINAL, StateDir, now_iso
+from geofuse.persistence import caches
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-PANO_CACHE_DB = str(REPO_ROOT / "logs" / "caches" / "gvi_panos.db")
+PANO_CACHE_DB = caches.PANO_DB
 
 # Engine extras worth carrying into status.json (small and JSON-safe).
 _EXTRA_KEYS = (
@@ -339,8 +340,6 @@ class Supervisor:
             if spec.kind == "fusion" and spec.settings.get(
                 "clear_preaggregation_cache"
             ):
-                from geofuse.persistence import caches
-
                 caches.remove_files(caches.greenery_cache_files(spec.output_dir))
             sub = self._build(
                 spec,

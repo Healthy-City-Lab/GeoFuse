@@ -37,6 +37,7 @@ from geofuse import metric_sampling as _metric_sampling
 from geofuse import mixed_effects_scoring as _mes
 from geofuse import settings as _gf_settings
 from geofuse.crs_utils import buffer_gdf_union_metres, reproject_geodataframe_to_wgs84
+from geofuse.persistence import caches
 from geofuse.vector_io import (
     geometry_sha256,
     list_gpkg_layer_names,
@@ -324,40 +325,6 @@ def _check_coverage(metric_path: str, buffered_gdf: "gpd.GeoDataFrame") -> bool:
 # ────────────────────────────────────────────────────────────────────
 # Restart workflow
 # ────────────────────────────────────────────────────────────────────
-
-
-def _fusion_preaggr_cache_files(p: dict, output_dir: str) -> list[str]:
-    """Reusable greenery pre-aggregation cache files.
-
-    The greenery cache is keyed on the greenery-file set + grid, not the target,
-    so it is shared across jobs and cannot be attributed to one target. Every
-    ``greenery-*.npz`` unit is listed — clearing them frees recomputable
-    intermediates (they rebuild on the next run). Output files and result
-    artefacts are never included.
-    """
-    greenery_dir = os.path.join(output_dir, "fusion_cache", "greenery")
-    if not os.path.isdir(greenery_dir):
-        return []
-    return sorted(
-        os.path.join(greenery_dir, n)
-        for n in os.listdir(greenery_dir)
-        if n.startswith("greenery-") and n.endswith(".npz")
-    )
-
-
-def _purge_fusion_preaggr_cache(paths: list[str]) -> tuple[int, int]:
-    """Delete the given cache files; returns ``(removed, bytes_freed)``."""
-    removed = 0
-    freed = 0
-    for path in paths:
-        try:
-            size = os.path.getsize(path)
-            os.remove(path)
-            removed += 1
-            freed += size
-        except OSError:
-            continue
-    return removed, freed
 
 
 def _consume_fusion_restart(store) -> None:
@@ -5871,11 +5838,9 @@ def render(output_dir: str) -> None:
                 )
 
             if st.session_state.get("fusion_clear_preaggr"):
-                stale = _fusion_preaggr_cache_files(
-                    {"target_path": tmp_target_path, **run_config}, output_dir
-                )
+                stale = caches.greenery_cache_files(output_dir)
                 if stale:
-                    n, freed = _purge_fusion_preaggr_cache(stale)
+                    n, freed = caches.remove_files(stale)
                     st.info(
                         f"Cleared {n} cache file(s), freed {freed / 1024**2:.0f} MB."
                     )
