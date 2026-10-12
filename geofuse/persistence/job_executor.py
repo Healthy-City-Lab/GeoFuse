@@ -537,5 +537,19 @@ class JobExecutor:
             process_name=f"gvi-col-child-{record.id}",
         )
 
+    def submit_gvi_merge_subprocess(self, record: JobRecord, **run_kwargs) -> Future:
+        """Merge a sharded GVI run in a fresh subprocess (see
+        :func:`geofuse.jobs.gvi_shards.run_gvi_merge` for the arguments)."""
+        from geofuse.jobs.subprocess_runner import run_gvi_merge_child
+
+        data = run_kwargs.pop("dataset_data")
+        run_kwargs["dataset_data"] = {k: v for k, v in data.items() if k != "cache_ref"}
+        return self.submit_subprocess_job(
+            record,
+            run_gvi_merge_child,
+            dict(job_id=record.id, run_kwargs=run_kwargs),
+            process_name=f"gvi-merge-child-{record.id}",
+        )
+
     def shutdown(self, wait: bool = True) -> None:
         self._pool.shutdown(wait=wait, cancel_futures=True)

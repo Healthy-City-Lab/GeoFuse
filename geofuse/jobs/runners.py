@@ -146,6 +146,12 @@ def run_gvi(
             float(run_args["step"]),
         )
         ctx.heartbeat()
+    shard = run_args.get("shard")
+    if shard:
+        from geofuse.core import shard_mask
+
+        processed = dataset_data["processed"]
+        dataset_data["processed"] = processed[shard_mask(processed, *shard)]
     ctx.progress(status_text="Waiting for GPU...")
     with gpu_lock:
         if ctx.is_cancelled():
@@ -216,6 +222,21 @@ def run_gvi(
     if ctx.is_cancelled():
         return {"output_paths": []}
 
+    out_name = gvi_output_name(fname, run_args)
+    if shard:
+        from geofuse.jobs.gvi_shards import write_shard
+
+        paths = write_shard(
+            {f"{out_name}_gvi": dataset_data["accumulated"]},
+            dataset_data["processed"].crs,
+            output_dir,
+            f"{out_name}_gvi",
+            shard,
+            n_points,
+        )
+        ctx.progress(value=1.0, status_text="Shard written; the merge job finishes it")
+        return {"output_paths": paths}
+
     if not dataset_data["accumulated"]:
         _log_gvi(
             "WARN",
@@ -228,7 +249,6 @@ def run_gvi(
     ctx.progress(value=1.0, status_text="Writing outputs")
 
     target_year = run_args.get("target_year")
-    out_name = gvi_output_name(fname, run_args)
     output_paths, res_df = _write_gvi_outputs(
         accumulated=dataset_data["accumulated"],
         processed_crs=dataset_data["processed"].crs,
@@ -534,6 +554,7 @@ def run_gvi_column(
     """
     gdf_4326, unique_years, grid_crs = column_years(dataset_data["raw"], date_column)
     n_years = len(unique_years)
+    shard = run_args.get("shard")
 
     base_name = os.path.splitext(fname)[0]
     job_folder = os.path.join(output_dir, f"{base_name}_temporal_gvi")
@@ -566,6 +587,10 @@ def run_gvi_column(
         if ctx.is_cancelled():
             return {"output_paths": output_paths}
         pts, meta = year_grid(gdf_4326, year, buffer_m, step, grid_crs)
+        if shard:
+            from geofuse.core import shard_mask
+
+            pts = pts[shard_mask(pts, *shard)]
         plans.append((year, pts, meta))
         ctx.progress(status_text=f"Generated grid for {year}: {len(pts):,} points")
         ctx.heartbeat()
@@ -591,6 +616,7 @@ def run_gvi_column(
     )
 
     done_points = 0
+    shard_results: dict[str, list] = {}
     for idx, (year, pts, meta) in enumerate(plans):
         if ctx.is_cancelled():
             return {"output_paths": output_paths}
@@ -642,6 +668,9 @@ def run_gvi_column(
         done_points += len(pts)
         if ctx.is_cancelled():
             return {"output_paths": output_paths}
+        if shard:
+            shard_results[f"{base_name}_{year}_gvi"] = accumulated
+            continue
         if not accumulated:
             _log_gvi("WARN", f"Year {year}: no results produced.")
             continue
@@ -658,6 +687,18 @@ def run_gvi_column(
             capture=_capture_settings("column", year, run_args),
         )
         output_paths.extend(paths)
+
+    if shard:
+        from geofuse.jobs.gvi_shards import write_shard
+
+        crs = plans[0][1].crs if plans else "EPSG:4326"
+        output_paths.extend(
+            write_shard(
+                shard_results, crs, job_folder, f"{base_name}_gvi", shard, total_points
+            )
+        )
+        ctx.progress(value=1.0, status_text="Shard written; the merge job finishes it")
+        return {"output_paths": output_paths}
 
     ctx.progress(value=1.0, status_text="Completed")
     return {"output_paths": output_paths}

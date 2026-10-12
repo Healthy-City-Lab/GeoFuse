@@ -8,9 +8,9 @@ holds both halves of that arrangement, because they are one protocol:
   routing into the event queue, :func:`exit_with_parent`, and
   :func:`drain_events_until_done`, which the parent's watcher thread runs;
 * the child entry points — ``run_gvi_child``, ``run_gvi_column_child``,
-  ``run_ndvi_child``, ``run_ndvi_column_child``, ``run_fusion_child`` — each a
-  thin adapter that rebuilds the context in the child and calls the matching
-  ``geofuse.jobs.runners`` callable while holding the job's resource slots
+  ``run_gvi_merge_child``, ``run_ndvi_child``, ``run_ndvi_column_child``,
+  ``run_fusion_child`` — each a thin adapter that rebuilds the context in the
+  child and calls the matching runner while holding the job's resource slots
   (:mod:`geofuse.jobs.locks`), so GUI and command-line jobs share one set of
   limits.
 
@@ -698,6 +698,33 @@ def run_fusion_child(
 
         ctx = SubprocJobContext(job_id, event_queue, cancel_event, pause_event)
         _run_held("fusion", ctx, event_queue, run_fusion, **run_kwargs)
+
+    except BaseException as exc:  # noqa: BLE001 — surface ANY failure to parent
+        try:
+            event_queue.put(
+                (MSG_ERROR, f"{type(exc).__name__}: {exc}", traceback.format_exc())
+            )
+        except Exception:
+            pass
+
+
+def run_gvi_merge_child(
+    job_id: str,
+    run_kwargs: dict,
+    event_queue,
+    cancel_event,
+    pause_event=None,
+) -> None:
+    """Entry point for the merge of a sharded GVI run (no resource slots: it
+    reads and writes files only)."""
+    try:
+        exit_with_parent()
+        route_engine_logging_to_queue(job_id, event_queue)
+
+        from geofuse.jobs.gvi_shards import run_gvi_merge
+
+        ctx = SubprocJobContext(job_id, event_queue, cancel_event, pause_event)
+        _run_held("gvi_merge", ctx, event_queue, run_gvi_merge, **run_kwargs)
 
     except BaseException as exc:  # noqa: BLE001 — surface ANY failure to parent
         try:

@@ -355,6 +355,52 @@ def gvi_sampling_points(
     return raw.copy(), None
 
 
+def shard_mask(
+    points: gpd.GeoDataFrame, shard: int, shards: int, *, block_cells: int = 20
+) -> np.ndarray:
+    """Which sampling points shard ``shard`` (from 0) of ``shards`` takes.
+
+    Points go in square blocks — ``block_cells`` grid cells a side within each
+    cluster (1 km at the default 50 m spacing), or cells of 0.01 degrees for
+    bare points — and each block to one shard by a hash of its key. Nearby
+    points, which often share a panorama, stay together, and the same input
+    always splits the same way, whichever machine computes it.
+    """
+    import zlib
+
+    if not 0 <= shard < shards:
+        raise ValueError(f"Shard {shard} is outside 0..{shards - 1}.")
+    if len(points) == 0:
+        return np.zeros(0, dtype=bool)
+    if {"row", "col"} <= set(points.columns):
+        cluster = (
+            points["cluster_id"].to_numpy(dtype=np.int64)
+            if "cluster_id" in points.columns
+            else np.zeros(len(points), dtype=np.int64)
+        )
+        keys = np.column_stack(
+            [
+                cluster,
+                points["row"].to_numpy(dtype=np.int64) // block_cells,
+                points["col"].to_numpy(dtype=np.int64) // block_cells,
+            ]
+        )
+    else:
+        lonlat = points.geometry.to_crs("EPSG:4326")
+        keys = np.column_stack(
+            [
+                np.zeros(len(points), dtype=np.int64),
+                np.floor(lonlat.x.to_numpy() / 0.01).astype(np.int64),
+                np.floor(lonlat.y.to_numpy() / 0.01).astype(np.int64),
+            ]
+        )
+    blocks, inverse = np.unique(keys, axis=0, return_inverse=True)
+    owner = np.array(
+        [zlib.crc32(f"{a}:{b}:{c}".encode()) % shards for a, b, c in blocks]
+    )
+    return owner[inverse.reshape(-1)] == shard
+
+
 def build_planar_tiles(
     geom_wgs84_gdf: gpd.GeoDataFrame,
     grid_crs,
