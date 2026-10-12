@@ -23,24 +23,22 @@ class CacheAdminTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.dir = self.tmp.name
-        pano_db = os.path.join(self.dir, "caches", "gvi_panos.db")
-        tiles = os.path.join(self.dir, "caches", "ndvi_tiles")
-        for name, value in (("PANO_DB", pano_db), ("NDVI_TILES", tiles)):
-            patch = mock.patch.object(caches, name, value)
-            patch.start()
-            self.addCleanup(patch.stop)
+        root = os.path.join(self.dir, "caches")
+        patch = mock.patch.object(caches, "cache_root", lambda: root)
+        patch.start()
+        self.addCleanup(patch.stop)
         self.out = os.path.join(self.dir, "out")
 
     def tearDown(self):
         self.tmp.cleanup()
 
     def fill(self):
-        os.makedirs(os.path.dirname(caches.PANO_DB), exist_ok=True)
-        pano = caches.PanoCache(caches.PANO_DB)
+        os.makedirs(caches.cache_root(), exist_ok=True)
+        pano = caches.PanoCache(caches.pano_db())
         pano["a"] = {"veg": 0.1, "ter": 0.2}
         pano["b"] = {"veg": 0.3, "ter": 0.4}
         pano.close()
-        tiles = caches.NdviTileCache(caches.NDVI_TILES)
+        tiles = caches.NdviTileCache(caches.ndvi_tiles())
         with open(os.path.join(tiles.workspace_dir("k1"), "t.tif"), "wb") as f:
             f.write(b"x" * 2048)
         tiles.touch("k1")
@@ -54,8 +52,8 @@ class CacheAdminTests(unittest.TestCase):
     def test_absent_caches_read_empty_without_being_created(self):
         for key in caches.CACHE_LABELS:
             self.assertEqual(caches.describe_cache(key, output_dir=self.out), "empty")
-        self.assertFalse(os.path.exists(caches.PANO_DB))
-        self.assertFalse(os.path.exists(caches.NDVI_TILES))
+        self.assertFalse(os.path.exists(caches.pano_db()))
+        self.assertFalse(os.path.exists(caches.ndvi_tiles()))
         self.assertIn("already empty", caches.purge_cache("pano", output_dir=self.out))
 
     def test_each_cache_reports_and_purges(self):
@@ -75,7 +73,7 @@ class CacheAdminTests(unittest.TestCase):
 
     def test_open_caches_are_measured_and_cleared_in_place(self):
         self.fill()
-        pano = caches.PanoCache(caches.PANO_DB)
+        pano = caches.PanoCache(caches.pano_db())
         self.assertIn("a", pano)
         caches.purge_cache("pano", pano=pano)
         self.assertNotIn("a", pano)

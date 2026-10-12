@@ -1010,7 +1010,7 @@ def build(
     *,
     model_path: str | None = None,
     api_key: str | None = None,
-    pano_cache_db_path: str = "logs/caches/gvi_panos.db",
+    pano_cache_db_path: str | None = None,
     ee_project: str | None = None,
 ) -> Submission:
     """The record and executor call the tab would make for ``spec``.
@@ -1023,12 +1023,14 @@ def build(
     if spec.kind in ("ndvi", "ndvi_column"):
         return _build_ndvi(spec, ee_project)
     if spec.kind in ("gvi", "gvi_column"):
+        from geofuse.persistence.caches import pano_db
+
         key = api_key if spec.settings["download_mode"] == "api" else None
         return _build_gvi(
             spec,
             model_path=model_path or DEFAULT_MODEL_PATH,
             api_key=key,
-            pano_cache_db_path=pano_cache_db_path,
+            pano_cache_db_path=pano_cache_db_path or pano_db(),
         )
     if spec.kind == "fusion":
         return _build_fusion(spec)

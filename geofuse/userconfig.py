@@ -18,6 +18,10 @@
     [credentials]
     store = "auto"                      # auto | keyring | file
 
+    [paths]
+    caches = "/local/disk/geofuse"      # panorama + NDVI tile caches
+                                        # (default: <repo>/logs/caches)
+
 The file lives in the per-user configuration folder (``%LOCALAPPDATA%\\geofuse``
 on Windows, ``~/.config/geofuse`` on Linux, Application Support on macOS).
 Every key is optional and defaults to the values above. Credentials are not
@@ -50,6 +54,7 @@ _TABLES = {
     "earthengine": {"project": str},
     "limits": dict.fromkeys(LIMIT_DEFAULTS, int),
     "credentials": {"store": str},
+    "paths": {"caches": str},
 }
 
 
@@ -77,6 +82,7 @@ class Config:
     limits: dict[str, int] = field(default_factory=lambda: dict(LIMIT_DEFAULTS))
     remotes: dict[str, dict] = field(default_factory=dict)
     credential_store: str = "auto"
+    cache_dir: str | None = None
     path: Path | None = None
 
 
@@ -118,7 +124,7 @@ def _check(doc: dict) -> None:
         else:
             raise ConfigError(
                 f"Unknown key '{key}' (known: state_dir, earthengine, limits, "
-                "credentials, remotes)."
+                "credentials, paths, remotes)."
             )
 
 
@@ -148,6 +154,7 @@ def load(path: str | os.PathLike | None = None) -> Config:
         limits=limits,
         remotes=dict(doc.get("remotes") or {}),
         credential_store=(doc.get("credentials") or {}).get("store", "auto"),
+        cache_dir=(doc.get("paths") or {}).get("caches"),
         path=path,
     )
 

@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
@@ -45,6 +46,20 @@ class UserConfigTests(unittest.TestCase):
         self.assertEqual(cfg.remotes, {"cluster": {"host": "login.example.org"}})
         userconfig.set_value("earthengine.project", None, self.path)
         self.assertIsNone(userconfig.load(self.path).ee_project)
+
+    def test_the_cache_folder_moves_the_shared_caches(self):
+        from geofuse.persistence import caches
+
+        userconfig.set_value("paths.caches", "~/fast/geofuse", self.path)
+        cfg = userconfig.load(self.path)
+        with mock.patch.object(userconfig, "load", lambda: cfg):
+            expected = os.path.abspath(os.path.expanduser("~/fast/geofuse"))
+            self.assertEqual(caches.cache_root(), expected)
+            self.assertEqual(
+                caches.pano_db(), os.path.join(expected, "gvi_panos.db")
+            )
+        with mock.patch.object(userconfig, "load", userconfig.Config):
+            self.assertEqual(caches.cache_root(), caches.DEFAULT_CACHE_ROOT)
 
     def test_bad_keys_and_values_are_named(self):
         for text, key in (

@@ -245,17 +245,18 @@ def _check_environment(args, cfg):
         limits = ", ".join(f"{k}={v}" for k, v in cfg.limits.items())
         yield "Resource locks", OK, f"{lock_dir()} ({limits})"
 
-    from geofuse.persistence.caches import CACHE_ROOT
+    from geofuse.persistence.caches import cache_root
 
-    kind = network_filesystem(CACHE_ROOT)
+    root = cache_root()
+    kind = network_filesystem(root)
     if kind:
         yield "Caches", WARN, (
-            f"{CACHE_ROOT} is on a {kind}: the panorama cache and NDVI tile "
-            "index are SQLite files, unsafe there when several machines run "
-            "jobs at once; keep the repository on local or scratch storage"
+            f"{root} is on a {kind}: the panorama cache and NDVI tile index are "
+            "SQLite files, unsafe there when several machines run jobs at once; "
+            "move them to a local disk with `geofuse config set paths.caches DIR`"
         )
     else:
-        yield "Caches", OK, f"{CACHE_ROOT} (local disk)"
+        yield "Caches", OK, f"{root} (local disk)"
 
 
 def _check_credentials(args, cfg):

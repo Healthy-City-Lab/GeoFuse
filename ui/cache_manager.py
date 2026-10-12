@@ -53,7 +53,8 @@ _CACHES = [
         "key": "pano",
         "label": caches.CACHE_LABELS["pano"],
         "help": (
-            "Segmented GVI values keyed by panorama id (`logs/caches/gvi_panos.db`). "
+            "Segmented GVI values keyed by panorama id (`gvi_panos.db` in the "
+            "cache folder, `logs/caches/` unless `[paths] caches` moves it). "
             "Purge this after any change to the segmentation metric — otherwise "
             "old runs keep returning the previously-computed numbers."
         ),
@@ -64,7 +65,8 @@ _CACHES = [
         "key": "ndvi",
         "label": caches.CACHE_LABELS["ndvi"],
         "help": (
-            "Downloaded Earth Engine tile workspaces (`logs/caches/ndvi_tiles/`). "
+            "Downloaded Earth Engine tile workspaces (`ndvi_tiles/` in the "
+            "cache folder). "
             "Safe to purge; the next run re-downloads what it needs."
         ),
         "stats": lambda: _stats("ndvi"),

@@ -20,7 +20,6 @@ from __future__ import annotations
 import json
 import os
 import sys
-from pathlib import Path
 
 from geofuse import settings as _settings
 from geofuse.cli.commands import (
@@ -145,8 +144,7 @@ def _fusion_output_dirs(args) -> list[str]:
 
     if args.output_dir:
         return [os.path.abspath(d) for d in args.output_dir]
-    # The GUI writes to output_results in the repository (beside logs/caches).
-    found = [str(Path(caches.CACHE_ROOT).parents[1] / "output_results")]
+    found = [caches.GUI_OUTPUT_DIR]
     for job in _state(args).jobs():
         out = job.spec.get("output_dir")
         if job.spec.get("kind") == "fusion" and out:
@@ -160,7 +158,7 @@ def cmd_cache(args) -> int:
     dirs = _fusion_output_dirs(args)
     if args.action == "list":
         for key in ("pano", "ndvi"):
-            where = caches.PANO_DB if key == "pano" else caches.NDVI_TILES
+            where = caches.pano_db() if key == "pano" else caches.ndvi_tiles()
             print(f"{caches.CACHE_LABELS[key]:<30} {caches.describe_cache(key)}")
             print(f"{'':<30} {where}")
         for folder in dirs:

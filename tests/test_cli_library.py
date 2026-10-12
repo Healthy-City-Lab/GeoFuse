@@ -36,9 +36,8 @@ class _Case(unittest.TestCase):
         library = os.path.join(self.dir, "presets")
         patches = [
             mock.patch.object(presets, "USER_DIR", Path(library)),
-            mock.patch.object(caches, "PANO_DB", os.path.join(self.dir, "p.db")),
-            mock.patch.object(caches, "NDVI_TILES", os.path.join(self.dir, "tiles")),
-            mock.patch.object(caches, "CACHE_ROOT", os.path.join(self.dir, "l", "c")),
+            mock.patch.object(caches, "cache_root", lambda: self.dir),
+            mock.patch.object(caches, "GUI_OUTPUT_DIR", os.path.join(self.dir, "gui")),
         ]
         for p in patches:
             p.start()

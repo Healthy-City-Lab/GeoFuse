@@ -42,7 +42,6 @@ from geofuse.jobs.state import ACTIVE, TERMINAL, StateDir, now_iso
 from geofuse.persistence import caches
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-PANO_CACHE_DB = caches.PANO_DB
 
 # Engine extras worth carrying into status.json (small and JSON-safe).
 _EXTRA_KEYS = (
@@ -344,7 +343,7 @@ class Supervisor:
             sub = self._build(
                 spec,
                 api_key=_streetview_key(),
-                pano_cache_db_path=PANO_CACHE_DB,
+                pano_cache_db_path=caches.pano_db(),
                 ee_project=self.ee_project,
             )
             os.makedirs(spec.output_dir, exist_ok=True)

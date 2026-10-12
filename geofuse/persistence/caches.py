@@ -340,10 +340,33 @@ def remove_files(paths: list[str]) -> tuple[int, int]:
 _REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
-#: Where the panorama and NDVI tile caches live, shared by every run.
-CACHE_ROOT = os.path.join(_REPO_ROOT, "logs", "caches")
-PANO_DB = os.path.join(CACHE_ROOT, "gvi_panos.db")
-NDVI_TILES = os.path.join(CACHE_ROOT, "ndvi_tiles")
+#: Where the panorama and NDVI tile caches live unless configured.
+DEFAULT_CACHE_ROOT = os.path.join(_REPO_ROOT, "logs", "caches")
+#: Where the GUI writes results, its fusion cache among them.
+GUI_OUTPUT_DIR = os.path.join(_REPO_ROOT, "output_results")
+
+
+def cache_root() -> str:
+    """The panorama and NDVI tile caches' folder: ``[paths] caches`` of the
+    user configuration, else ``<repo>/logs/caches``. Both are SQLite stores,
+    so the folder belongs on a disk local to the machine running the jobs."""
+    from geofuse import userconfig
+
+    try:
+        folder = userconfig.load().cache_dir
+    except userconfig.ConfigError:
+        folder = None
+    if not folder:
+        return DEFAULT_CACHE_ROOT
+    return os.path.abspath(os.path.expanduser(folder))
+
+
+def pano_db() -> str:
+    return os.path.join(cache_root(), "gvi_panos.db")
+
+
+def ndvi_tiles() -> str:
+    return os.path.join(cache_root(), "ndvi_tiles")
 
 #: Each cache's name, as the GUI's cache panel and ``geofuse cache`` show it.
 CACHE_LABELS = {
@@ -394,18 +417,18 @@ def describe_cache(
     the shared ones are read, and a cache that does not exist yet reads empty.
     """
     if key == "pano":
-        if pano is None and not os.path.exists(PANO_DB):
+        if pano is None and not os.path.exists(pano_db()):
             return "empty"
-        cache = pano or PanoCache(PANO_DB)
+        cache = pano or PanoCache(pano_db())
         try:
             return f"{len(cache):,} panoramas"
         finally:
             if pano is None:
                 cache.close()
     if key == "ndvi":
-        if ndvi is None and not os.path.isdir(NDVI_TILES):
+        if ndvi is None and not os.path.isdir(ndvi_tiles()):
             return "empty"
-        cache = ndvi or NdviTileCache(NDVI_TILES)
+        cache = ndvi or NdviTileCache(ndvi_tiles())
         try:
             stats = cache.stats()
         finally:
@@ -428,9 +451,9 @@ def purge_cache(
     """Empty ``key``'s cache; returns what was freed. Job records and results
     are never touched."""
     if key == "pano":
-        if pano is None and not os.path.exists(PANO_DB):
+        if pano is None and not os.path.exists(pano_db()):
             return "GVI panorama cache was already empty."
-        cache = pano or PanoCache(PANO_DB)
+        cache = pano or PanoCache(pano_db())
         try:
             n = len(cache)
             cache.clear()
@@ -439,9 +462,9 @@ def purge_cache(
                 cache.close()
         return f"Cleared {n:,} cached panorama GVI values."
     if key == "ndvi":
-        if ndvi is None and not os.path.isdir(NDVI_TILES):
+        if ndvi is None and not os.path.isdir(ndvi_tiles()):
             return "NDVI tile cache was already empty."
-        cache = ndvi or NdviTileCache(NDVI_TILES)
+        cache = ndvi or NdviTileCache(ndvi_tiles())
         try:
             n, freed = cache.clear()
         finally:

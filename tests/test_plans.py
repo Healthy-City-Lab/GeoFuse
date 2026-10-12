@@ -296,7 +296,8 @@ class Executor:
 
 import types
 STORE, EXECUTOR = Store(), Executor()
-PANO = types.SimpleNamespace(db_path="logs/caches/gvi_panos.db")
+from geofuse.persistence import caches
+PANO = types.SimpleNamespace(db_path=caches.pano_db())
 """
 
 _APP = """
