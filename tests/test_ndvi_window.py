@@ -17,10 +17,17 @@ for _p in (ROOT, os.path.dirname(__file__)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import json
+from unittest import mock
+
 import numpy as np
-from test_ndvi_acquisition import AOI, RES, _Case, _ndvi, landsat_sr
+import rasterio
+from _fake_earth_engine import FakeEarthEngine
+from test_ndvi_acquisition import AOI, CRS_OVERRIDE, RES, _Case, _ndvi, landsat_sr
 
 from geofuse import ndvi
+from geofuse.jobs import runners
+from geofuse.persistence.caches import NdviTileCache
 
 E = ndvi.NDVIEngine
 
@@ -133,6 +140,111 @@ class EngineWindowTests(_Case):
         self.assertEqual(
             eng._pick_satellite("2016-06-01", ndvi._shift_day(start, 1), "auto"),
             "sentinel2",
+        )
+
+
+# ────────────────────────────────────────────────────────────────────
+# Runners: the NDVI tab's dates are inclusive
+# ────────────────────────────────────────────────────────────────────
+
+
+class _Ctx:
+    def progress(self, **_kw):
+        pass
+
+    def heartbeat(self):
+        pass
+
+    def is_cancelled(self):
+        return False
+
+
+class RunnerWindowTests(_Case):
+    def setUp(self):
+        super().setUp()
+        case = self
+
+        class _Engine(E):
+            def __init__(self, *_a, **_kw):
+                self.tile_cache = NdviTileCache(os.path.join(case.tmp.name, "cache"))
+                case.engines.append(self)
+
+            @staticmethod
+            def compute_export_crs(_gdf):
+                return CRS_OVERRIDE
+
+        for p in (
+            mock.patch.object(runners, "NDVIEngine", _Engine),
+            mock.patch.object(ndvi, "_select_export_crs", return_value=CRS_OVERRIDE),
+        ):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _kw(self, year):
+        return dict(
+            fname="site.geojson",
+            dataset_data={"raw": AOI.assign(year=[year])},
+            cloud_pct=10,
+            resolution=RES,
+            buffer_m=0,
+            output_dir=self.out,
+            save_geotiff=True,
+            save_geojson=False,
+            satellite="landsat",
+            coverage_rescue=False,
+            temporal_reducers=["mean"],
+        )
+
+    def _column(self, scenes, year, first, last):
+        with FakeEarthEngine(AOI, {E.LANDSAT8_COLLECTION_ID: scenes}):
+            runners.run_ndvi_column(
+                _Ctx(), date_column="year", season_start_month=first,
+                season_end_month=last, **self._kw(year),
+            )
+        return self._read(os.path.join(self.out, "site_temporal_ndvi", f"site_{year}_mean"))
+
+    def _read(self, stem):
+        with rasterio.open(stem + "_ndvi.tif") as src:
+            arr = src.read(1).astype(np.float64)
+        with open(stem + "_ndvi.json") as f:
+            return arr, json.load(f)
+
+    def test_column_season_keeps_the_last_day_of_its_end_month(self):
+        arr, side = self._column([JULY, SEPT_30, OCT_1], 2015, 5, 9)
+        np.testing.assert_allclose(
+            arr, (_ndvi(0.05, 0.20) + _ndvi(0.05, 0.40)) / 2, rtol=1e-6
+        )
+        self.assertEqual(
+            (side["start_date"], side["end_date"], side["end_date_exclusive"]),
+            ("2015-05-01", "2015-09-30", "2015-10-01"),
+        )
+
+    def test_column_january_to_december_ends_on_the_next_new_year(self):
+        scenes = [
+            JULY,
+            landsat_sr("2015-12-31", 5, 0.05, 0.40),
+            landsat_sr("2016-01-01", 5, 0.05, 0.10),
+        ]
+        arr, side = self._column(scenes, 2015, 1, 12)
+        np.testing.assert_allclose(
+            arr, (_ndvi(0.05, 0.20) + _ndvi(0.05, 0.40)) / 2, rtol=1e-6
+        )
+        self.assertEqual(
+            (side["end_date"], side["used_end_date"]), ("2015-12-31", "2016-01-01")
+        )
+
+    def test_range_keeps_the_picked_end_and_not_the_next_day(self):
+        with FakeEarthEngine(AOI, {E.LANDSAT8_COLLECTION_ID: [JULY, SEPT_30, OCT_1]}):
+            runners.run_ndvi(
+                _Ctx(), start_date="2015-05-01", end_date="2015-09-30",
+                output_name="site", **self._kw(2015),
+            )
+        arr, side = self._read(os.path.join(self.out, "site_mean"))
+        np.testing.assert_allclose(
+            arr, (_ndvi(0.05, 0.20) + _ndvi(0.05, 0.40)) / 2, rtol=1e-6
+        )
+        self.assertEqual(
+            (side["end_date"], side["end_date_exclusive"]), ("2015-09-30", "2015-10-01")
         )
 
 

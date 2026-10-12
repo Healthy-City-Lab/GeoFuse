@@ -707,7 +707,11 @@ def run_ndvi(
     substitute_2012: bool = False,
     preset: str | None = None,
 ) -> dict:
-    """Run NDVI for a single date range, one set of files per statistic."""
+    """Run NDVI for a single date range, one set of files per statistic.
+
+    Both ends of the range are included: the engine is called with
+    ``end_inclusive=True``, so a range ending 30 September keeps that day.
+    """
     from geofuse.crs_utils import buffer_gdf_union_metres
 
     ctx.progress(status_text="Initializing Earth Engine...")
@@ -745,6 +749,7 @@ def run_ndvi(
         reflectance=reflectance,
         substitute_2012=substitute_2012,
         preset=preset,
+        end_inclusive=True,
     )
 
     if result.get("status") == "cancelled":
@@ -794,8 +799,9 @@ def run_ndvi_column(
     """Run one NDVI raster per year present in ``date_column``.
 
     The input is split by year; each year is processed as a standalone NDVI
-    job over only that year's features, composited across the growing-season
-    months ``[season_start_month, season_end_month]`` of that year. The export
+    job over only that year's features, composited across the whole
+    growing-season months ``[season_start_month, season_end_month]`` of that
+    year, last day of the end month included. The export
     CRS is chosen once from the whole dataset — before the split — so every
     year's raster snaps to the same global pixel grid and the outputs align.
     Results land in a ``{name}_temporal_ndvi/`` folder, one set of files per
@@ -884,6 +890,7 @@ def run_ndvi_column(
             reflectance=reflectance,
             substitute_2012=substitute_2012,
             preset=preset,
+            end_inclusive=True,
         )
         if result.get("status") == "cancelled":
             return {"output_paths": output_paths}
