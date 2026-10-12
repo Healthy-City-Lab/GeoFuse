@@ -2,8 +2,8 @@
 Minimal Google Street View client for GeoFuse.
 
 Adapted from `streetlevel <https://github.com/sk-zk/streetlevel>`_ (MIT
-License) — only the parts needed for radius-based panorama search and
-equirectangular image download.
+License) — only the parts needed to find the panorama nearest a point and
+download its equirectangular image, all without an API key.
 
 Why a custom port rather than ``pip install streetlevel``: the upstream
 package pulls in ``pyfrpc``, ``bd09convertor``, ``CoordinatesConverter``,
@@ -15,8 +15,8 @@ EXIF-writing modules.
 Public surface
 --------------
 ``find_panorama`` / ``find_panorama_async``
-    Search for the nearest panorama within a radius, returning a
-    :class:`StreetViewPanorama` or ``None``.
+    The nearest panorama within a radius (from Google's coverage tiles, then
+    its metadata), as a :class:`StreetViewPanorama` or ``None``.
 
 ``get_panorama`` / ``get_panorama_async``
     Download tiles in parallel and return a stitched PIL image.
@@ -67,13 +67,13 @@ _RATE_LIMIT_STATUSES = frozenset({403, 429, 503})
 
 
 class ServiceRetired(RuntimeError):
-    """Google answered that the panorama search is no longer offered."""
+    """A Street View endpoint no longer answers in the form this client reads."""
 
     def __init__(self, message: str):
         super().__init__(
-            "Google has retired the Street View search the GVI downloader uses "
-            f"({message}); GVI cannot sample new points until the downloader "
-            "is updated."
+            "Google's Street View service no longer answers as the GVI "
+            f"downloader expects ({message}); GVI cannot sample new points until "
+            "the downloader is updated."
         )
 
 
@@ -328,62 +328,153 @@ def _to_protobuf_url(fields: dict) -> str:
     return _to_pb_url(fields)[1]
 
 
-# ── API: find panorama by radius (SingleImageSearch) ────────────────
+# ── API: find the nearest panorama ──────────────────────────────────
+#
+# Two keyless Google Maps endpoints, as maps.google.com uses them: a coverage
+# tile lists every panorama in a zoom-17 map tile (id and position), and the
+# metadata request for one id returns its dates, historical captures and image
+# sizes. The nearest panorama is chosen from the tiles around the point, so
+# neighbouring points share one tile request.
+
+_COVERAGE_ZOOM = 17
+_COVERAGE_URL = (
+    "https://www.google.com/maps/photometa/ac/v1?pb=!1m1!1smaps_sv.tactile"
+    "!6m3!1i{x}!2i{y}!3i17!8b1"
+)
+_METADATA_URL = (
+    "https://www.google.com/maps/photometa/v1?authuser=0&hl={lang}&gl={country}&pb="
+)
+_PHOTOMETA_HEADERS = {
+    "Accept": "*/*",
+    "Referer": "https://www.google.com/",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:151.0) "
+        "Gecko/20100101 Firefox/151.0"
+    ),
+}
+_EARTH_RADIUS_M = 6_371_000.0
+#: Image types in a coverage tile: Google's own panoramas and user photospheres.
+_OFFICIAL, _THIRD_PARTY = 2, 10
+
+# Tiles fetched by this process: ``(x, y) -> [(type, id, lat, lon), ...]``.
+_TILES: dict[tuple[int, int], list[tuple[int, str, float, float]]] = {}
+_TILES_MAX = 50_000
+_TILE_TASKS: dict[tuple[int, int], asyncio.Task] = {}
 
 
-def _build_find_panorama_url(
-    lat: float, lon: float, radius: float, locale: str, search_third_party: bool
-) -> str:
-    parts = locale.split("-")
-    ietf_lang = parts[0]
-    ietf_country = parts[1] if len(parts) > 1 else parts[0]
-    image_type = 10 if search_third_party else 2
+def _tile_xy(lat: float, lon: float) -> tuple[int, int]:
+    n = 2**_COVERAGE_ZOOM
+    lat = max(min(lat, 85.0511), -85.0511)
+    x = int((lon + 180.0) / 360.0 * n)
+    y = int((1.0 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2.0 * n)
+    return min(max(x, 0), n - 1), min(max(y, 0), n - 1)
 
-    toggles = [ProtobufEnum(i) for i in (1, 2, 3, 4, 6, 8, 12)]
 
-    msg = {
-        1: {1: "apiv3", 5: "US", 11: {1: {1: False}}},
-        2: {1: {3: float(lat), 4: float(lon)}, 2: float(radius)},
-        3: {
-            2: {1: ietf_lang, 2: ietf_country},
-            9: {1: ProtobufEnum(2)},
-            11: {1: {1: ProtobufEnum(image_type), 2: True, 3: ProtobufEnum(2)}},
-        },
-        4: {1: toggles, 5: {}, 6: {}},
-    }
-    return (
-        "https://maps.googleapis.com/maps/api/js/GeoPhotoService.SingleImageSearch?pb="
-        + _to_protobuf_url(msg)
-        + "&callback=_xdc_._v2mub5"
+def _tiles_around(lat: float, lon: float, radius: float) -> list[tuple[int, int]]:
+    """The coverage tiles a circle of ``radius`` metres can touch."""
+    dlat = math.degrees(radius / _EARTH_RADIUS_M)
+    dlon = dlat / max(math.cos(math.radians(lat)), 1e-6)
+    x0, y0 = _tile_xy(lat + dlat, lon - dlon)
+    x1, y1 = _tile_xy(lat - dlat, lon + dlon)
+    return [(x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
+
+
+def _distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    h = (
+        math.sin((p2 - p1) / 2) ** 2
+        + math.cos(p1) * math.cos(p2) * math.sin(math.radians(lon2 - lon1) / 2) ** 2
     )
+    return 2 * _EARTH_RADIUS_M * math.asin(math.sqrt(h))
 
 
-def _repair_jsonp(text: str) -> str:
-    """The endpoint wraps its JSON in ``_xdc_._v2mub5(…)`` JSONP — strip it."""
+def _json_body(text: str, what: str):
+    """The JSON after Google's ``)]}'`` guard; :class:`ServiceRetired` when
+    the answer is not in that form."""
+    if not text.startswith(")]}'"):
+        raise ServiceRetired(f"the {what} answered {text[:80]!r}")
     try:
-        first = text.index("(")
-        last = text.rindex(")")
-        return "[" + text[first + 1 : last] + "]"
-    except ValueError:
-        return "[]"
+        return json.loads(text[4:])
+    except json.JSONDecodeError as exc:
+        raise ServiceRetired(f"the {what} answered unreadable JSON ({exc})") from None
 
 
-def _parse_radius_response(response: list) -> StreetViewPanorama | None:
-    """Return the parsed panorama, or ``None`` if the API reported no result.
-
-    Raises :class:`ServiceRetired` when the answer says the search itself is
-    gone, so a retired service is not read as "no coverage here".
-    """
+def _parse_coverage_tile(text: str) -> list[tuple[int, str, float, float]]:
+    """``(image type, panorama id, lat, lon)`` of every panorama in a tile."""
+    tile = _json_body(text, "coverage tile service")
+    found = []
     try:
-        status = response[0][0]
-        if status[0] != 0:
-            message = " ".join(str(part) for part in status[1:])
-            if "decommissioned" in message or "turned down" in message:
-                raise ServiceRetired(message)
-            return None
-        return _parse_pano_message(response[0][1])
-    except (IndexError, TypeError, KeyError):
+        entries = tile[1][1] if tile and tile[1] else []
+    except (IndexError, TypeError):
+        raise ServiceRetired("the coverage tile service changed its answer") from None
+    for entry in entries or []:
+        try:
+            kind, panoid = entry[0][0][0], entry[0][0][1]
+            position = entry[0][2][0]
+            lat, lon = float(position[2]), float(position[3])
+            found.append((int(kind), str(panoid), lat, lon))
+        except (IndexError, TypeError, ValueError):
+            continue
+    return found
+
+
+def _nearest(
+    tiles: list[list[tuple[int, str, float, float]]],
+    lat: float,
+    lon: float,
+    radius: float,
+    search_third_party: bool,
+) -> str | None:
+    wanted = _THIRD_PARTY if search_third_party else _OFFICIAL
+    best, best_d = None, radius
+    for tile in tiles:
+        for kind, panoid, plat, plon in tile:
+            if kind != wanted:
+                continue
+            d = _distance_m(lat, lon, plat, plon)
+            if d <= best_d:
+                best, best_d = panoid, d
+    return best
+
+
+def _remember(xy: tuple[int, int], panos: list) -> None:
+    if len(_TILES) >= _TILES_MAX:
+        _TILES.clear()
+    _TILES[xy] = panos
+
+
+def _metadata_url(panoid: str, locale: str) -> str:
+    parts = locale.split("-")
+    lang, country = parts[0], parts[1] if len(parts) > 1 else parts[0]
+    pano_type = _THIRD_PARTY if is_third_party_panoid(panoid) else _OFFICIAL
+    msg = {
+        1: {1: "maps_sv.tactile", 11: {2: {1: True}}},
+        2: {1: lang, 2: country},
+        3: {1: {1: ProtobufEnum(pano_type), 2: panoid}},
+        4: {
+            1: [ProtobufEnum(i) for i in (1, 2, 3, 4, 5, 6, 8, 12)],
+            2: {1: ProtobufEnum(1)},
+            4: {1: 48},
+            5: [{}],
+            6: [{}],
+            11: {3: {4: True}},
+        },
+    }
+    return _METADATA_URL.format(lang=lang, country=country) + _to_protobuf_url(msg)
+
+
+def _parse_metadata(text: str) -> StreetViewPanorama | None:
+    """The panorama a metadata answer describes; ``None`` when Google does not
+    know the id (status 2)."""
+    response = _json_body(text, "panorama metadata service")
+    try:
+        status = response[1][0][0][0]
+    except (IndexError, TypeError):
+        message = "the panorama metadata service changed its answer"
+        raise ServiceRetired(message) from None
+    if status not in (1, 3):
         return None
+    return _parse_pano_message(response[1][0])
 
 
 def _parse_date(raw) -> tuple[int, int] | None:
@@ -468,17 +559,61 @@ def find_panorama(
     session: requests.Session | None = None,
     timeout: float | None = None,
 ) -> StreetViewPanorama | None:
-    """Search for the nearest Street View panorama within ``radius`` metres.
+    """The nearest Street View panorama within ``radius`` metres, or ``None``.
 
-    Raises :class:`RateLimitedError` when the endpoint throttles, so a caller
-    can back off instead of mistaking the throttle body for "no coverage".
+    Raises :class:`RateLimitedError` when Google throttles, so a caller can
+    back off instead of mistaking the throttle for "no coverage", and
+    :class:`ServiceRetired` when an endpoint stops answering in the expected
+    form.
     """
-    url = _build_find_panorama_url(lat, lon, radius, locale, search_third_party)
     requester = session if session is not None else requests
-    resp = requester.get(url, headers=_TILE_HEADERS, timeout=timeout)
-    if resp.status_code in _RATE_LIMIT_STATUSES:
-        raise RateLimitedError(resp.status_code, url)
-    return _parse_radius_response(json.loads(_repair_jsonp(resp.text)))
+
+    def get(url: str) -> str:
+        resp = requester.get(url, headers=_PHOTOMETA_HEADERS, timeout=timeout)
+        if resp.status_code in _RATE_LIMIT_STATUSES:
+            raise RateLimitedError(resp.status_code, url)
+        return resp.text
+
+    tiles = []
+    for xy in _tiles_around(lat, lon, radius):
+        if xy not in _TILES:
+            text = get(_COVERAGE_URL.format(x=xy[0], y=xy[1]))
+            _remember(xy, _parse_coverage_tile(text))
+        tiles.append(_TILES[xy])
+    panoid = _nearest(tiles, lat, lon, radius, search_third_party)
+    if panoid is None:
+        return None
+    return _parse_metadata(get(_metadata_url(panoid, locale)))
+
+
+async def _get_text(session: aiohttp.ClientSession, url: str) -> str:
+    async with session.get(url, headers=_PHOTOMETA_HEADERS) as resp:
+        if resp.status in _RATE_LIMIT_STATUSES:
+            raise RateLimitedError(resp.status, url)
+        return await resp.text()
+
+
+async def _coverage_tile_async(
+    session: aiohttp.ClientSession, xy: tuple[int, int]
+) -> list[tuple[int, str, float, float]]:
+    """One coverage tile, fetched once however many searches ask at a time."""
+    if xy in _TILES:
+        return _TILES[xy]
+    loop = asyncio.get_running_loop()
+    task = _TILE_TASKS.get(xy)
+    if task is None or task.get_loop() is not loop:
+        url = _COVERAGE_URL.format(x=xy[0], y=xy[1])
+
+        async def fetch() -> list:
+            try:
+                panos = _parse_coverage_tile(await _get_text(session, url))
+                _remember(xy, panos)
+                return panos
+            finally:
+                _TILE_TASKS.pop(xy, None)
+
+        task = _TILE_TASKS[xy] = loop.create_task(fetch())
+    return await asyncio.shield(task)
 
 
 async def find_panorama_async(
@@ -489,17 +624,16 @@ async def find_panorama_async(
     locale: str = "en",
     search_third_party: bool = False,
 ) -> StreetViewPanorama | None:
-    """Async variant of :func:`find_panorama`.
-
-    Raises :class:`RateLimitedError` on throttle statuses — see
-    :func:`find_panorama` for why that distinction matters.
-    """
-    url = _build_find_panorama_url(lat, lon, radius, locale, search_third_party)
-    async with session.get(url, headers=_TILE_HEADERS) as resp:
-        if resp.status in _RATE_LIMIT_STATUSES:
-            raise RateLimitedError(resp.status, url)
-        text = await resp.text()
-    return _parse_radius_response(json.loads(_repair_jsonp(text)))
+    """Async variant of :func:`find_panorama`; concurrent searches share each
+    coverage tile request."""
+    tiles = [
+        await _coverage_tile_async(session, xy)
+        for xy in _tiles_around(lat, lon, radius)
+    ]
+    panoid = _nearest(tiles, lat, lon, radius, search_third_party)
+    if panoid is None:
+        return None
+    return _parse_metadata(await _get_text(session, _metadata_url(panoid, locale)))
 
 
 # ── API: download panorama image ────────────────────────────────────
