@@ -234,25 +234,34 @@ class TestGeoFuse(unittest.TestCase):
             message="Python 3.14 will, by default, filter extracted tar archives",
         )
 
-        mock_pano = MagicMock()
-        mock_pano.id = "test_pano_id_123"
-        mock_find.return_value = mock_pano
-        mock_get_pano.return_value = Image.fromarray(
-            np.zeros((300, 600, 3), dtype=np.uint8)
+        from geofuse import streetview as sv
+        from geofuse.core import gvi_sampling_points
+
+        mock_find.return_value = sv.StreetViewPanorama(
+            id="test_pano_id_123",
+            lat=51.04,
+            lon=-114.07,
+            tile_size=sv.Size(512, 512),
+            image_sizes=[sv.Size(512, 256), sv.Size(1024, 512)],
+            date=(2024, 6),
         )
+        # Not all black: the engine rejects a blank download.
+        noise = np.random.default_rng(0).integers(0, 255, (300, 600, 3))
+        mock_get_pano.return_value = Image.fromarray(noise.astype(np.uint8))
 
         engine = GVIEngine(download_mode="package")
         engine.segmenter = MagicMock()
 
         mock_mask = np.zeros((100, 100), dtype=int)
         mock_mask[0:50, :] = 8  # Vegetation class ID
-        engine.segmenter.predict.return_value = mock_mask
+        engine.segmenter.predict_from_tensor.return_value = mock_mask
         engine.segmenter.calculate_gvi_from_mask.return_value = {
             "GVI_Total": 0.5,
             "GVI_Terrain": 0.0,
         }
 
-        gdf = gpd.read_file("data/samples/test_area.geojson")
+        area = gpd.read_file("data/samples/test_area.geojson")
+        gdf, _meta = gvi_sampling_points(area, True, 0, 500)
         results = []
 
         engine.run_analysis(
