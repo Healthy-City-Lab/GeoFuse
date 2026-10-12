@@ -119,7 +119,7 @@ class StateDir:
     def __init__(self, root: str | os.PathLike | None = None):
         self.root = Path(root) if root is not None else default_state_dir()
 
-    # ── Paths ───────────────────────────────────────────────────────
+    # ── Paths ───────────────────────────────────────────────────
 
     @property
     def jobs_dir(self) -> Path:
@@ -147,7 +147,7 @@ class StateDir:
     def log_path(self, job_id: str) -> Path:
         return self.logs_dir / f"{job_id}.log"
 
-    # ── Jobs ────────────────────────────────────────────────────────
+    # ── Jobs ────────────────────────────────────────────────────
 
     def new_id(self) -> str:
         while True:
@@ -177,13 +177,14 @@ class StateDir:
         write_json(
             folder / "spec.json",
             {
+                **spec,
+                "depends_on_steps": list(spec.get("depends_on") or []),
                 "id": job_id,
                 "run_id": run_id,
                 "depends_on": list(depends_on),
                 "owner": owner,
                 "restart_of": restart_of,
                 "submitted_at": stamp,
-                **spec,
             },
         )
         write_json(
@@ -289,7 +290,7 @@ class StateDir:
         except OSError:
             pass
 
-    # ── Runs ────────────────────────────────────────────────────────
+    # ── Runs ────────────────────────────────────────────────────
 
     def write_run(self, run_id: str, record: dict) -> None:
         write_json(self.runs_dir / f"{run_id}.json", record)
@@ -297,7 +298,7 @@ class StateDir:
     def read_run(self, run_id: str) -> dict | None:
         return read_json(self.runs_dir / f"{run_id}.json")
 
-    # ── Supervisors ─────────────────────────────────────────────────
+    # ── Supervisors ─────────────────────────────────────────────
 
     def write_supervisor(self, supervisor_id: str, record: dict) -> None:
         write_json(

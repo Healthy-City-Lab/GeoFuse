@@ -276,3 +276,39 @@ class NdviTileCache:
                 self._conn.close()
             except Exception:
                 pass
+
+
+# ────────────────────────────────────────────────────────────────────
+# Fusion pre-aggregation cache files
+# ────────────────────────────────────────────────────────────────────
+
+
+def greenery_cache_files(output_dir: str) -> list[str]:
+    """The fusion pre-aggregation cache units under ``output_dir``.
+
+    The greenery cache is keyed on the greenery-file set and grid, not on a
+    target, so it is shared across jobs; every ``greenery-*.npz`` unit is
+    listed. They are recomputable intermediates, never outputs.
+    """
+    folder = os.path.join(output_dir, "fusion_cache", "greenery")
+    if not os.path.isdir(folder):
+        return []
+    return sorted(
+        os.path.join(folder, n)
+        for n in os.listdir(folder)
+        if n.startswith("greenery-") and n.endswith(".npz")
+    )
+
+
+def remove_files(paths: list[str]) -> tuple[int, int]:
+    """Delete ``paths``; returns ``(removed, bytes_freed)``."""
+    removed = freed = 0
+    for path in paths:
+        try:
+            size = os.path.getsize(path)
+            os.remove(path)
+        except OSError:
+            continue
+        removed += 1
+        freed += size
+    return removed, freed
