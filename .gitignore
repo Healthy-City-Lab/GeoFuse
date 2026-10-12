@@ -29,3 +29,6 @@ tests/output
 
 ## UI / Streamlit
 .streamlit/
+
+## User presets (geofuse.presets library)
+/presets/

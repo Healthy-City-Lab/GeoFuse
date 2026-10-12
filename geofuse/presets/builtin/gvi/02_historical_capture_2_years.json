@@ -1,0 +1,26 @@
+{
+  "format": "geofuse-preset",
+  "version": 1,
+  "engine": "gvi",
+  "name": "Historical capture ± 2 years",
+  "description": "Specific-year mode: at each point, the capture closest to the target year within two years either side; points with none stay empty. Set the target year per layer.",
+  "created": "2026-10-11",
+  "geofuse_version": "builtin",
+  "settings": {
+    "download_mode": "package",
+    "grid_resolution_m": 50,
+    "buffer_m": 0,
+    "save_raw": false,
+    "show_sampling_grid": false,
+    "save_gpkg": true,
+    "save_geotiff": false,
+    "save_geojson": false,
+    "capture_mode": "year",
+    "limit_year_difference": true,
+    "max_year_difference": 2,
+    "limit_months": false,
+    "month_start": 5,
+    "month_end": 10,
+    "month_policy": "exclude"
+  }
+}
