@@ -263,6 +263,25 @@ class NdviTileCache:
             bytes_freed += int(byte_count)
         return (n_removed, bytes_freed)
 
+    def clear(self) -> tuple[int, int]:
+        """Remove every tile workspace, indexed or not; returns
+        ``(workspaces_removed, bytes_freed)``."""
+        removed = freed = 0
+        for entry in os.scandir(self.cache_root):
+            if not entry.is_dir():
+                continue
+            for root, _dirs, names in os.walk(entry.path):
+                for name in names:
+                    try:
+                        freed += os.path.getsize(os.path.join(root, name))
+                    except OSError:
+                        pass
+            shutil.rmtree(entry.path, ignore_errors=True)
+            removed += 1
+        with self._lock:
+            self._conn.execute("DELETE FROM entries")
+        return (removed, freed)
+
     def stats(self) -> dict:
         with self._lock:
             row = self._conn.execute(

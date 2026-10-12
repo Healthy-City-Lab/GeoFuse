@@ -83,7 +83,7 @@ def _ndvi_stats() -> str:
 def _ndvi_purge() -> str:
     from services import get_ndvi_tile_cache
 
-    n, freed = get_ndvi_tile_cache().evict_lru(0)
+    n, freed = get_ndvi_tile_cache().clear()
     return f"Removed {n:,} tile workspaces, freed {_human_bytes(freed)}."
 
 
