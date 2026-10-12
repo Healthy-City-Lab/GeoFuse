@@ -166,6 +166,13 @@ def drop_job_log_buffer(job_id: str) -> None:
                 pass
 
 
+def set_log_dir(path: str) -> None:
+    """Write per-job log files under ``path`` from now on (``logs/jobs`` by
+    default). Files already open keep their place."""
+    global _LOG_DIR
+    _LOG_DIR = str(path)
+
+
 def get_job_log_path(job_id: str) -> str:
     """Filesystem path the listener writes for ``job_id`` (may not yet exist)."""
     return os.path.join(_LOG_DIR, f"{job_id}.log")
