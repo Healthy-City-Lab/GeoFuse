@@ -20,6 +20,8 @@ import getpass
 import json
 import os
 import platform
+import re
+import subprocess
 import sys
 import uuid
 from pathlib import Path
@@ -144,6 +146,85 @@ def _writable(folder: Path) -> str | None:
     return None
 
 
+#: Filesystem types that are shared over a network.
+_NETWORK_FS = (
+    "nfs",
+    "cifs",
+    "smb",
+    "lustre",
+    "gpfs",
+    "beegfs",
+    "ceph",
+    "glusterfs",
+    "fuse.sshfs",
+    "panfs",
+    "wekafs",
+    "afs",
+    "afpfs",
+    "webdav",
+    "9p",
+)
+
+
+def _mounts() -> list[tuple[str, str]]:
+    """``(mount point, filesystem type)`` of this machine's mounts."""
+    if sys.platform.startswith("linux"):
+        with open("/proc/mounts", encoding="utf-8") as f:
+            return [
+                (parts[1].replace("\\040", " "), parts[2])
+                for parts in (line.split() for line in f)
+                if len(parts) > 2
+            ]
+    out = subprocess.run(["mount"], capture_output=True, text=True, timeout=10).stdout
+    found = []
+    for line in out.splitlines():
+        m = re.match(r".+? on (.+) \((\w+)(.*)\)$", line)
+        if m:
+            found.append((m.group(1), m.group(2)))
+    return found
+
+
+def network_filesystem(path: str | Path, mounts=None) -> str | None:
+    """The kind of network filesystem ``path`` is on, or ``None`` when local
+    (or unknown)."""
+    path = os.path.abspath(path)
+    if os.name == "nt":
+        drive = os.path.splitdrive(path)[0]
+        if drive.startswith(("\\\\", "//")):
+            return "network share"
+        import ctypes
+
+        remote = ctypes.windll.kernel32.GetDriveTypeW(drive + "\\") == 4
+        return "network drive" if remote else None
+    try:
+        mounts = _mounts() if mounts is None else mounts
+    except (OSError, subprocess.SubprocessError):
+        return None
+    covering = [
+        (point, kind)
+        for point, kind in mounts
+        if path == point or path.startswith(point.rstrip("/") + "/")
+    ]
+    if not covering:
+        return None
+    kind = max(covering, key=lambda m: len(m[0]))[1].lower()
+    return kind if kind.startswith(_NETWORK_FS) else None
+
+
+def _reachable(url: str) -> str | None:
+    """``None`` when ``url`` answers at all, else why not."""
+    import urllib.error
+    import urllib.request
+
+    try:
+        urllib.request.urlopen(urllib.request.Request(url, method="HEAD"), timeout=8)
+    except urllib.error.HTTPError:
+        return None
+    except (urllib.error.URLError, OSError) as exc:
+        return str(getattr(exc, "reason", exc))
+    return None
+
+
 def _check_environment(args, cfg):
     from geofuse.jobs.locks import lock_dir
     from geofuse.jobs.state import StateDir
@@ -164,6 +245,18 @@ def _check_environment(args, cfg):
         limits = ", ".join(f"{k}={v}" for k, v in cfg.limits.items())
         yield "Resource locks", OK, f"{lock_dir()} ({limits})"
 
+    from geofuse.persistence.caches import CACHE_ROOT
+
+    kind = network_filesystem(CACHE_ROOT)
+    if kind:
+        yield "Caches", WARN, (
+            f"{CACHE_ROOT} is on a {kind}: the panorama cache and NDVI tile "
+            "index are SQLite files, unsafe there when several machines run "
+            "jobs at once; keep the repository on local or scratch storage"
+        )
+    else:
+        yield "Caches", OK, f"{CACHE_ROOT} (local disk)"
+
 
 def _check_credentials(args, cfg):
     from geofuse import credentials as cr
@@ -177,9 +270,17 @@ def _check_credentials(args, cfg):
     if not cr.file_is_private():
         yield "Credential store", WARN, f"others can read {cr.credentials_path()}"
     if "streetview-key" in have:
-        yield "Street View", OK, "API key stored (used when download_mode = 'api')"
+        how = "API key stored (used when download_mode = 'api')"
     else:
-        yield "Street View", OK, "no API key: GVI downloads use the scraper"
+        how = "no API key: GVI downloads use the scraper"
+    if args.offline:
+        yield "Street View", OK, f"{how} (not contacted)"
+        return
+    error = _reachable("https://maps.googleapis.com/")
+    if error:
+        yield "Street View", FAIL, f"cannot reach Google ({error}): GVI cannot run"
+    else:
+        yield "Street View", OK, f"{how}; reachable"
 
 
 def _check_earth_engine(args, cfg):
@@ -313,7 +414,7 @@ def add_parsers(sub, common) -> None:
 
     p = sub.add_parser("doctor", help="check this machine is ready to run jobs")
     p.add_argument(
-        "--offline", action="store_true", help="skip contacting Earth Engine"
+        "--offline", action="store_true", help="skip the network checks"
     )
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_doctor)
