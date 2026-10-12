@@ -729,7 +729,7 @@ def _build_gvi(
             [s["month_start"], s["month_end"]] if s["limit_months"] else None
         ),
         "month_policy": s["month_policy"],
-        **{key: s[key] for key in _settings.GVI_THROUGHPUT},
+        **{key: s[key] for key in _settings.GVI_RUN_OPTIONS},
     }
     if spec.preset:
         capture_args["preset"] = spec.preset

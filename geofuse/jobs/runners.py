@@ -220,6 +220,7 @@ def run_gvi(
         download_concurrency=run_args.get("download_concurrency"),
         batch_size=run_args.get("batch_size"),
         batch_wait_ms=run_args.get("batch_wait_ms"),
+        precision=run_args.get("precision"),
     )
 
     if ctx.is_cancelled():
@@ -675,6 +676,7 @@ def run_gvi_column(
             download_concurrency=run_args.get("download_concurrency"),
             batch_size=run_args.get("batch_size"),
             batch_wait_ms=run_args.get("batch_wait_ms"),
+            precision=run_args.get("precision"),
         )
         done_points += len(pts)
         if ctx.is_cancelled():

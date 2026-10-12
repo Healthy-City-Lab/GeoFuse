@@ -329,7 +329,12 @@ class RestartReplayTests(unittest.TestCase):
             "**Capture months:** May–Oct (outside as fallback)",
             gvi_tab._gvi_restart_summary_lines(p),
         )
-        sizing = {"download_concurrency": 16, "batch_size": 1, "batch_wait_ms": 20}
+        sizing = {
+            "download_concurrency": 16,
+            "batch_size": 1,
+            "batch_wait_ms": 20,
+            "precision": "fp16",
+        }
         self.assertEqual(
             gvi_tab._capture_args(p),
             {"month_window": [5, 10], "month_policy": "prefer", **sizing},

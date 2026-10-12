@@ -74,8 +74,9 @@ class DefaultTests(unittest.TestCase):
             preset = presets.load_settings(engine, "Default")
             defaults = settings.defaults(engine)
             self.assertEqual({k: defaults[k] for k in preset}, preset, engine)
-            # Machine sizing (download pool, GPU batches) is not part of a preset.
-            sizing = set(settings.GVI_THROUGHPUT)
+            # How a run computes (download pool, GPU batches, precision) is not
+            # part of a preset.
+            sizing = set(settings.GVI_RUN_OPTIONS)
             missing = set(defaults) - set(preset) - {"target_year"} - sizing
             self.assertEqual(missing, set(), engine)
 

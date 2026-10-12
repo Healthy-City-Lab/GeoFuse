@@ -232,10 +232,15 @@ GVI: dict[str, Setting] = {
     "batch_wait_ms": _int(
         20, 0, 2000, "Longest wait for a GPU batch to fill, in milliseconds."
     ),
+    "precision": _choice(
+        "fp16", ("fp16", "fp32"), "GPU arithmetic; fp32 repeats earlier runs' masks."
+    ),
 }
 
 #: GVI settings that size the download pool and the GPU batches.
 GVI_THROUGHPUT = ("download_concurrency", "batch_size", "batch_wait_ms")
+#: GVI settings a job records and presets leave out: how a run computes.
+GVI_RUN_OPTIONS = (*GVI_THROUGHPUT, "precision")
 
 # ────────────────────────────────────────────────────────────────────
 # Fusion
