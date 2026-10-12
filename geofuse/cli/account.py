@@ -211,18 +211,21 @@ def network_filesystem(path: str | Path, mounts=None) -> str | None:
     return kind if kind.startswith(_NETWORK_FS) else None
 
 
-def _reachable(url: str) -> str | None:
-    """``None`` when ``url`` answers at all, else why not."""
-    import urllib.error
-    import urllib.request
+def _probe_street_view() -> tuple[str, str]:
+    """Search once where Street View has coverage: ``(status, detail)``."""
+    from geofuse import streetview
 
     try:
-        urllib.request.urlopen(urllib.request.Request(url, method="HEAD"), timeout=8)
-    except urllib.error.HTTPError:
-        return None
-    except (urllib.error.URLError, OSError) as exc:
-        return str(getattr(exc, "reason", exc))
-    return None
+        pano = streetview.find_panorama(*streetview.PROBE_POINT, timeout=10)
+    except streetview.ServiceRetired as exc:
+        return FAIL, str(exc)
+    except streetview.RateLimitedError:
+        return WARN, "the search is throttling this address right now"
+    except OSError as exc:
+        return FAIL, f"cannot reach Google ({exc}): GVI cannot run"
+    if pano is None:
+        return WARN, "the search answered but found nothing at a covered place"
+    return OK, "the panorama search works"
 
 
 def _check_environment(args, cfg):
@@ -277,11 +280,8 @@ def _check_credentials(args, cfg):
     if args.offline:
         yield "Street View", OK, f"{how} (not contacted)"
         return
-    error = _reachable("https://maps.googleapis.com/")
-    if error:
-        yield "Street View", FAIL, f"cannot reach Google ({error}): GVI cannot run"
-    else:
-        yield "Street View", OK, f"{how}; reachable"
+    status, detail = _probe_street_view()
+    yield "Street View", status, f"{how}; {detail}"
 
 
 def _check_earth_engine(args, cfg):

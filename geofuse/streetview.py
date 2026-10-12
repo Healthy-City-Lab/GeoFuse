@@ -66,6 +66,21 @@ class RateLimitedError(RuntimeError):
 _RATE_LIMIT_STATUSES = frozenset({403, 429, 503})
 
 
+class ServiceRetired(RuntimeError):
+    """Google answered that the panorama search is no longer offered."""
+
+    def __init__(self, message: str):
+        super().__init__(
+            "Google has retired the Street View search the GVI downloader uses "
+            f"({message}); GVI cannot sample new points until the downloader "
+            "is updated."
+        )
+
+
+#: A place with Street View coverage, for checking that the search answers.
+PROBE_POINT = (40.7580, -73.9855)
+
+
 @dataclass
 class Size:
     """A 2-D size in pixels."""
@@ -354,9 +369,17 @@ def _repair_jsonp(text: str) -> str:
 
 
 def _parse_radius_response(response: list) -> StreetViewPanorama | None:
-    """Return the parsed panorama, or ``None`` if the API reported no result."""
+    """Return the parsed panorama, or ``None`` if the API reported no result.
+
+    Raises :class:`ServiceRetired` when the answer says the search itself is
+    gone, so a retired service is not read as "no coverage here".
+    """
     try:
-        if response[0][0][0] != 0:
+        status = response[0][0]
+        if status[0] != 0:
+            message = " ".join(str(part) for part in status[1:])
+            if "decommissioned" in message or "turned down" in message:
+                raise ServiceRetired(message)
             return None
         return _parse_pano_message(response[0][1])
     except (IndexError, TypeError, KeyError):
@@ -443,6 +466,7 @@ def find_panorama(
     locale: str = "en",
     search_third_party: bool = False,
     session: requests.Session | None = None,
+    timeout: float | None = None,
 ) -> StreetViewPanorama | None:
     """Search for the nearest Street View panorama within ``radius`` metres.
 
@@ -451,7 +475,7 @@ def find_panorama(
     """
     url = _build_find_panorama_url(lat, lon, radius, locale, search_third_party)
     requester = session if session is not None else requests
-    resp = requester.get(url, headers=_TILE_HEADERS)
+    resp = requester.get(url, headers=_TILE_HEADERS, timeout=timeout)
     if resp.status_code in _RATE_LIMIT_STATUSES:
         raise RateLimitedError(resp.status_code, url)
     return _parse_radius_response(json.loads(_repair_jsonp(resp.text)))

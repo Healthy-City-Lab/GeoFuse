@@ -356,6 +356,8 @@ class GVIEngine:
                         )
             if pano is _RL_SENTINEL:
                 return ("done", self._empty_result(pt, search_lat, search_lon))
+        except gsv.ServiceRetired:
+            raise
         except Exception as e:
             _log(
                 "ERROR",
@@ -911,7 +913,7 @@ class GVIEngine:
             try:
                 # Drain the search stage, then signal the segment stage to stop
                 # once its queue empties.
-                await asyncio.gather(*searchers, return_exceptions=True)
+                searched = await asyncio.gather(*searchers, return_exceptions=True)
                 for _ in segmenters:
                     segment_q.put_nowait(_SEG_SENTINEL)
                 await asyncio.gather(*segmenters, return_exceptions=True)
@@ -921,6 +923,10 @@ class GVIEngine:
                     await watcher
                 except asyncio.CancelledError:
                     pass
+            # A retired search fails the run instead of reading as no coverage.
+            retired = [r for r in searched if isinstance(r, gsv.ServiceRetired)]
+            if retired:
+                raise retired[0]
 
             if cancel_callback and cancel_callback():
                 _log("WARN", "Analysis Aborted by User.")

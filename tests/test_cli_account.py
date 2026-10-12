@@ -73,8 +73,9 @@ class CommandTests(StoreCase):
         self.assertIn("not contacted", rows["Earth Engine"]["detail"])
         self.assertIn("use the scraper", rows["Street View"]["detail"])
         self.assertIn(code, (0, 3))
+        unreachable = lambda: ("FAIL", "no route")  # noqa: E731
         with (
-            mock.patch.object(account, "_reachable", lambda url: "no route"),
+            mock.patch.object(account, "_probe_street_view", unreachable),
             mock.patch.object(ee_auth, "initialize", lambda *a, **k: "stub"),
         ):
             code, out = self.geofuse(*argv)
