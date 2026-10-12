@@ -48,10 +48,12 @@ class _Model:
     """Class 8 where the first channel is bright; records each forward."""
 
     VEGETATION_CLASS, TERRAIN_CLASS = 8, 9
+    effective_precision, graphs_in_use = "fp32", False
 
     def __init__(self, delay=0.0):
         self.batches: list[int] = []
         self.delay = delay
+        self.precision = "fp16"
 
     @staticmethod
     def preprocess_to_tensor(img):
@@ -63,11 +65,10 @@ class _Model:
         self.batches.append(int(tensor.shape[0]))
         return np.where(tensor[:, 0].numpy() > 0.5, 8, 0)
 
-    def predict_batch(self, tensor):
-        return self._masks(tensor)
-
-    def predict_from_tensor(self, tensor):
-        return self._masks(tensor)[0]
+    def segment(self, tensor, masks=False):
+        found = self._masks(tensor)
+        fractions = [self.calculate_gvi_from_mask(m) for m in found]
+        return fractions, found.astype(np.uint8) if masks else None
 
     def calculate_gvi_from_mask(self, mask):
         return {
@@ -169,6 +170,15 @@ class PipelineTests(_Case):
         self.assertEqual((stats["searched"], stats["downloads"]), (40, 8))
         self.assertEqual(stats["segmented"], 8)
         self.assertEqual(stats["batch_size"], 1)
+        self.assertEqual((stats["precision"], stats["cuda_graph"]), ("fp32", False))
+
+    def test_precision_reaches_the_segmenter(self):
+        model = _Model()
+        self.run_engine(model, n=4, precision="fp32")
+        self.assertEqual(model.precision, "fp32")
+        model = _Model()
+        self.run_engine(model, n=4)
+        self.assertEqual(model.precision, "fp16")
 
     def test_the_gpu_queue_is_bounded(self):
         model = _Model(delay=0.02)

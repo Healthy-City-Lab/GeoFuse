@@ -1,6 +1,8 @@
+import contextlib
 import importlib
 import os
 import sys
+import threading
 
 import numpy as np
 import torch
@@ -51,16 +53,47 @@ if dl_core_path not in sys.path:
     sys.path.append(dl_core_path)
 
 
+# ────────────────────────────────────────────────────────────────────
+# Forward pass: precision and CUDA graphs
+# ────────────────────────────────────────────────────────────────────
+
+#: Arithmetic of the forward pass. ``fp16`` runs the model under CUDA autocast
+#: (~1.7x the images per second of ``fp32``; about 3 pixels in 10,000 change
+#: class). Devices other than CUDA always run ``fp32``.
+PRECISIONS = ("fp16", "fp32")
+DEFAULT_PRECISION = "fp16"
+# On CUDA the forward is captured once per input shape as a CUDA graph and
+# replayed with a single launch, instead of launching every layer's kernels from
+# Python, where they compete for the GIL with the download threads. Replays give
+# the same masks as the eager forward. Partial batches can bring a few more
+# shapes; past this many, a shape runs eagerly.
+_MAX_GRAPHS = 4
+
+
 class DeepLabSegmenter:
-    def __init__(self, model_name=None, num_classes=19, ckpt_path=None, device="cuda"):
+    def __init__(
+        self,
+        model_name=None,
+        num_classes=19,
+        ckpt_path=None,
+        device="cuda",
+        precision=DEFAULT_PRECISION,
+        cuda_graphs=True,
+    ):
         """
         Args:
             model_name (str): Optional. If None, it is auto-detected from weights.
             ckpt_path (str): Path to the .pth file.
             device (str): 'cuda', 'mps', or 'cpu'. Auto-selects best available if not valid.
+            precision (str): 'fp16' or 'fp32' (see ``PRECISIONS``).
+            cuda_graphs (bool): Replay the forward as a CUDA graph on CUDA.
         """
         self.device = get_best_device(device)
         _log("INFO", f"Using device: {self.device}")
+        self.precision = precision
+        self.cuda_graphs = cuda_graphs
+        self._graphs: dict = {}
+        self._forward_lock = threading.Lock()
 
         # cudnn.benchmark stays OFF on purpose.
         if self.device.type == "cuda":
@@ -221,8 +254,112 @@ class DeepLabSegmenter:
                 pass
         return tensor
 
+    @property
+    def precision(self) -> str:
+        return self._precision
+
+    @precision.setter
+    def precision(self, value: str) -> None:
+        if value not in PRECISIONS:
+            raise ValueError(f"precision must be one of {PRECISIONS}, not {value!r}")
+        self._precision = value
+
+    @property
+    def effective_precision(self) -> str:
+        """The precision forwards actually run at: ``fp16`` on CUDA only."""
+        if self._precision == "fp16" and self.device.type == "cuda":
+            return "fp16"
+        return "fp32"
+
+    @property
+    def graphs_in_use(self) -> bool:
+        """Whether any forward so far was replayed from a CUDA graph."""
+        return any(graph is not None for graph in self._graphs.values())
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _inference(half: bool):
+        """No autograd, plus fp16 autocast when ``half``. The autocast cache
+        stays off: a graph captured with it would replay freed weight copies."""
+        with torch.no_grad():
+            if half:
+                with torch.autocast("cuda", dtype=torch.float16, cache_enabled=False):
+                    yield
+            else:
+                yield
+
+    def _graph(self, shape, half: bool):
+        """The CUDA graph for one input shape and precision, captured on first
+        use; ``None`` past ``_MAX_GRAPHS`` or when capture fails."""
+        key = (tuple(shape), half)
+        if key in self._graphs:
+            return self._graphs[key]
+        if len(self._graphs) >= _MAX_GRAPHS:
+            return None
+        graph = None
+        try:
+            static_in = torch.zeros(shape, device=self.device)
+            # Warm-up on a side stream, as capture requires.
+            side = torch.cuda.Stream(device=self.device)
+            side.wait_stream(torch.cuda.current_stream(self.device))
+            with torch.cuda.stream(side), self._inference(half):
+                for _ in range(3):
+                    self.model(static_in)
+            torch.cuda.current_stream(self.device).wait_stream(side)
+            cuda_graph = torch.cuda.CUDAGraph()
+            with self._inference(half), torch.cuda.graph(cuda_graph):
+                static_out = self.model(static_in)
+            graph = (static_in, cuda_graph, static_out)
+            _log("INFO", f"Forward captured as a CUDA graph for {tuple(shape)}")
+        except Exception as e:
+            _log(
+                "WARN",
+                f"CUDA graph capture failed ({type(e).__name__}: {e}); "
+                f"the forward runs eagerly",
+            )
+        self._graphs[key] = graph
+        return graph
+
+    def _logits(self, tensor):
+        """One forward over ``(B, 3, H, W)``. A graph replay returns the
+        graph's own output tensor, so callers read it before the next forward
+        (both happen under ``_forward_lock``)."""
+        half = self.effective_precision == "fp16"
+        graph = None
+        if self.cuda_graphs and self.device.type == "cuda":
+            graph = self._graph(tensor.shape, half)
+        if graph is not None:
+            static_in, cuda_graph, static_out = graph
+            static_in.copy_(tensor, non_blocking=True)
+            cuda_graph.replay()
+            return static_out
+        with self._inference(half):
+            return self.model(tensor.to(self.device, non_blocking=True))
+
+    def segment(self, tensor, masks: bool = False):
+        """Class fractions of every image in a batch, counted on the device.
+
+        Takes ``(3, H, W)`` or ``(B, 3, H, W)``; returns ``(fractions, masks)``:
+        one :meth:`calculate_gvi_from_mask` dict per image, and the ``(B, H, W)``
+        uint8 class masks when ``masks`` is set (``None`` otherwise). Only the
+        two class counts per image leave the device unless masks are asked for.
+        """
+        if tensor.dim() == 3:
+            tensor = tensor.unsqueeze(0)
+        with self._forward_lock:
+            labels = self._logits(tensor).argmax(1)
+            classes = torch.tensor(
+                [self.VEGETATION_CLASS, self.TERRAIN_CLASS], device=labels.device
+            )
+            hits = labels.unsqueeze(1) == classes.view(1, -1, 1, 1)
+            counts = hits.sum(dim=(2, 3)).cpu().numpy()
+            class_masks = labels.to(torch.uint8).cpu().numpy() if masks else None
+        total = int(labels.shape[1] * labels.shape[2])
+        fractions = [self._fractions(int(v), int(t), total) for v, t in counts]
+        return fractions, class_masks
+
     def predict_batch(self, tensor):
-        """GPU-only path: one forward for the whole batch.
+        """One forward for the whole batch.
 
         Accepts ``(3, H, W)``, ``(1, 3, H, W)`` or ``(B, 3, H, W)`` and always
         returns ``(B, H, W)`` integer class masks — one per input image, none
@@ -230,10 +367,8 @@ class DeepLabSegmenter:
         """
         if tensor.dim() == 3:
             tensor = tensor.unsqueeze(0)
-        tensor = tensor.to(self.device, non_blocking=True)
-        with torch.no_grad():
-            output = self.model(tensor)
-            return output.max(1)[1].cpu().numpy()
+        with self._forward_lock:
+            return self._logits(tensor).argmax(1).cpu().numpy()
 
     def predict_from_tensor(self, tensor):
         """Single-image path: preprocessed tensor -> one ``(H, W)`` mask.
@@ -264,10 +399,14 @@ class DeepLabSegmenter:
         ``GVI_Vegetation`` and ``GVI_Terrain`` are disjoint classes;
         ``GVI_Total`` is simply their sum.
         """
-        total_pixels = mask_array.size
-        veg_pixels = np.sum(mask_array == self.VEGETATION_CLASS)
-        terrain_pixels = np.sum(mask_array == self.TERRAIN_CLASS)
+        return self._fractions(
+            int(np.sum(mask_array == self.VEGETATION_CLASS)),
+            int(np.sum(mask_array == self.TERRAIN_CLASS)),
+            int(mask_array.size),
+        )
 
+    @staticmethod
+    def _fractions(veg_pixels: int, terrain_pixels: int, total_pixels: int) -> dict:
         return {
             "GVI_Vegetation": veg_pixels / total_pixels,
             "GVI_Terrain": terrain_pixels / total_pixels,

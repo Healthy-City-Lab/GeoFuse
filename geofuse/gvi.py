@@ -573,8 +573,8 @@ class GVIEngine:
         """Stage 3: one forward over ``batch`` (``(item, image, tensor)``
         entries); returns ``(panorama id, result)`` for each entry.
 
-        A single entry goes through ``predict_from_tensor``, several through
-        one ``predict_batch`` call. A panorama another entry cached while this
+        The segmenter counts the classes on the device; class masks come back
+        only when they are saved. A panorama another entry cached while this
         one queued is answered from the cache.
         """
         loop = asyncio.get_running_loop()
@@ -607,17 +607,14 @@ class GVIEngine:
         started = time.perf_counter()
         try:
             if len(todo) == 1:
-                masks = [
-                    await loop.run_in_executor(
-                        gpu_pool, self.segmenter.predict_from_tensor, todo[0][2]
-                    )
-                ]
+                stacked = todo[0][2]
             else:
                 import torch
 
                 stacked = torch.cat([tensor for _item, _img, tensor in todo])
-                predict = self.segmenter.predict_batch
-                masks = list(await loop.run_in_executor(gpu_pool, predict, stacked))
+            fractions, masks = await loop.run_in_executor(
+                gpu_pool, self.segmenter.segment, stacked, save_masks
+            )
         except Exception as e:
             _log(
                 "ERROR",
@@ -631,9 +628,12 @@ class GVIEngine:
         stats["gpu_batches"] += 1
         stats["segmented"] += len(todo)
 
-        for (item, img, _tensor), mask in zip(todo, masks, strict=True):
+        if masks is None:
+            masks = [None] * len(todo)
+        for (item, img, _tensor), metrics, mask in zip(
+            todo, fractions, masks, strict=True
+        ):
             pt, _pano, pid, pano_date_str, slat, slon = item
-            metrics = self.segmenter.calculate_gvi_from_mask(mask)
             # gvi_veg is vegetation only (Cityscapes class 8). Terrain (class 9)
             # is reported separately as gvi_ter, so the two bands stay
             # independent -- sum them downstream if a combined index is wanted.
@@ -1038,6 +1038,8 @@ class GVIEngine:
             downloads_per_s=round(stats["downloads"] / elapsed, 2),
             gpu_images_per_s=round(stats["segmented"] / elapsed, 2),
             gpu_busy_share=round(stats["gpu_seconds"] / elapsed, 3),
+            precision=self.segmenter.effective_precision,
+            cuda_graph=self.segmenter.graphs_in_use,
         )
         stats["gpu_seconds"] = round(stats["gpu_seconds"], 2)
         self.last_run_stats = stats
@@ -1047,7 +1049,7 @@ class GVIEngine:
             f"({stats['searches_per_s']}/s, {stats['cache_hits']:,} from cache), "
             f"{stats['downloads']:,} downloaded ({stats['downloads_per_s']}/s), "
             f"{stats['segmented']:,} segmented ({stats['gpu_images_per_s']}/s, "
-            f"{stats['gpu_batches']:,} forwards, GPU busy "
+            f"{stats['gpu_batches']:,} forwards, {stats['precision']}, GPU busy "
             f"{100 * stats['gpu_busy_share']:.0f} %), "
             f"{stats['throttle_events']} throttle event(s) in {stats['seconds']} s",
         )
@@ -1072,6 +1074,7 @@ class GVIEngine:
         download_concurrency=None,
         batch_size=None,
         batch_wait_ms=None,
+        precision=None,
     ):
         """Segment the panorama nearest each point and record its GVI.
 
@@ -1081,9 +1084,13 @@ class GVIEngine:
         :meth:`streetview.StreetViewPanorama.select_capture`).
         ``download_concurrency``, ``batch_size`` and ``batch_wait_ms`` size the
         download pool and the GPU batches (``None``: the module defaults).
-        Afterwards ``last_run_stats`` holds each stage's counts and rates.
+        ``precision`` (``vision.PRECISIONS``; ``None`` keeps the segmenter's)
+        sets the forward's arithmetic. Afterwards ``last_run_stats`` holds each
+        stage's counts and rates, and the precision the forwards ran at.
         """
         _log("INFO", f"Starting Analysis (Resume Index: {start_index})...")
+        if precision is not None:
+            self.segmenter.precision = precision
         if target_year is not None:
             _log(
                 "INFO",

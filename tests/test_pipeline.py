@@ -252,13 +252,8 @@ class TestGeoFuse(unittest.TestCase):
         engine = GVIEngine(download_mode="package")
         engine.segmenter = MagicMock()
 
-        mock_mask = np.zeros((100, 100), dtype=int)
-        mock_mask[0:50, :] = 8  # Vegetation class ID
-        engine.segmenter.predict_from_tensor.return_value = mock_mask
-        engine.segmenter.calculate_gvi_from_mask.return_value = {
-            "GVI_Total": 0.5,
-            "GVI_Terrain": 0.0,
-        }
+        fractions = {"GVI_Vegetation": 0.5, "GVI_Terrain": 0.0, "GVI_Total": 0.5}
+        engine.segmenter.segment.return_value = ([fractions], None)
 
         area = gpd.read_file("data/samples/test_area.geojson")
         gdf, _meta = gvi_sampling_points(area, True, 0, 500)
