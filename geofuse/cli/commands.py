@@ -17,6 +17,8 @@
     geofuse credentials show | set | remove
     geofuse auth earthengine        sign in (stored in the credential store)
     geofuse doctor                  check this machine is ready to run jobs
+    geofuse preset list | show | save | import | remove
+    geofuse cache list | purge
 
 Every setting is also a flag (``--cloud-max 20``, ``--no-water-mask``) that
 overrides every step having that setting; ``--set ENGINE[.STEP].KEY=VALUE``
@@ -689,9 +691,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--daemon", action="store_true", help=argparse.SUPPRESS)
     p.set_defaults(func=cmd_supervisor)
 
-    from geofuse.cli import account
+    from geofuse.cli import account, library
 
     account.add_parsers(sub, common)
+    library.add_parsers(sub, common)
     return parser
 
 
