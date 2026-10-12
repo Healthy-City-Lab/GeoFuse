@@ -391,6 +391,7 @@ class JobExecutor:
         cloud_handling: str = "scene_filter",
         reflectance: str = "surface",
         substitute_2012: bool = False,
+        preset: str | None = None,
     ) -> Future:
         """Run an NDVI (single-range) job in a fresh subprocess.
 
@@ -429,6 +430,7 @@ class JobExecutor:
                 cloud_handling=str(cloud_handling),
                 reflectance=str(reflectance),
                 substitute_2012=bool(substitute_2012),
+                preset=preset,
             ),
             process_name=f"ndvi-child-{record.id}",
         )
@@ -457,6 +459,7 @@ class JobExecutor:
         cloud_handling: str = "scene_filter",
         reflectance: str = "surface",
         substitute_2012: bool = False,
+        preset: str | None = None,
     ) -> Future:
         """Run a per-year NDVI (date-column) job in a fresh subprocess."""
         from geofuse.jobs.subprocess_runner import run_ndvi_column_child
@@ -487,6 +490,7 @@ class JobExecutor:
                 cloud_handling=str(cloud_handling),
                 reflectance=str(reflectance),
                 substitute_2012=bool(substitute_2012),
+                preset=preset,
             ),
             process_name=f"ndvi-col-child-{record.id}",
         )

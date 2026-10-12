@@ -473,6 +473,7 @@ def _write_ndvi_sidecar(
     water_mask: bool = False,
     cloud_handling: str = "scene_filter",
     reflectance: str = "surface",
+    preset: str | None = None,
     cloud_max: float,
     resolution_m: int,
     max_tile_size_km: float,
@@ -528,6 +529,8 @@ def _write_ndvi_sidecar(
             else None
         ),
     }
+    if preset:
+        payload["preset"] = str(preset)
     with open(sidecar_path, "w") as f:
         json.dump(payload, f, indent=2)
     return sidecar_path
@@ -1171,6 +1174,7 @@ class NDVIEngine:
         cloud_handling: str = "scene_filter",
         reflectance: str = "surface",
         substitute_2012: bool = False,
+        preset: str | None = None,
     ):
         """
         Download and process NDVI data with automatic tiling for large areas.
@@ -1226,6 +1230,8 @@ class NDVIEngine:
                 TM / ETM+ harmonisation).
             substitute_2012: Fill a window that lies wholly inside 2012 with
                 the same days of 2013 (recorded as ``year_substituted``).
+            preset: Name of the settings preset the run came from, recorded
+                in the sidecar for provenance (nothing recorded when ``None``).
 
         Returns:
             The first statistic's result (``status``, ``tif``, ``geojson``,
@@ -1615,6 +1621,7 @@ class NDVIEngine:
                     water_mask=water_mask,
                     cloud_handling=cloud_handling,
                     reflectance=reflectance,
+                    preset=preset,
                     cloud_max=cloud_max,
                     resolution_m=resolution,
                     max_tile_size_km=max_tile_size_km,

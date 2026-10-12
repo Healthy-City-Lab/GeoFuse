@@ -394,7 +394,7 @@ def _month_window(run_args: Mapping) -> tuple[int, int] | None:
 def _capture_settings(mode: str, target_year, run_args: Mapping) -> dict:
     """The capture rule a GVI result set was sampled with, for its sidecar."""
     window = _month_window(run_args)
-    return {
+    settings = {
         "capture_mode": mode,
         "target_year": None if target_year is None else int(target_year),
         "max_year_diff": run_args.get("max_year_diff"),
@@ -403,6 +403,9 @@ def _capture_settings(mode: str, target_year, run_args: Mapping) -> dict:
             (run_args.get("month_policy") or "exclude") if window else None
         ),
     }
+    if run_args.get("preset"):
+        settings["preset"] = str(run_args["preset"])
+    return settings
 
 
 def _capture_summary(accumulated: list, capture: Mapping) -> dict:
@@ -702,6 +705,7 @@ def run_ndvi(
     cloud_handling: str = "scene_filter",
     reflectance: str = "surface",
     substitute_2012: bool = False,
+    preset: str | None = None,
 ) -> dict:
     """Run NDVI for a single date range, one set of files per statistic."""
     from geofuse.crs_utils import buffer_gdf_union_metres
@@ -740,6 +744,7 @@ def run_ndvi(
         cloud_handling=cloud_handling,
         reflectance=reflectance,
         substitute_2012=substitute_2012,
+        preset=preset,
     )
 
     if result.get("status") == "cancelled":
@@ -784,6 +789,7 @@ def run_ndvi_column(
     cloud_handling: str = "scene_filter",
     reflectance: str = "surface",
     substitute_2012: bool = False,
+    preset: str | None = None,
 ) -> dict:
     """Run one NDVI raster per year present in ``date_column``.
 
@@ -877,6 +883,7 @@ def run_ndvi_column(
             cloud_handling=cloud_handling,
             reflectance=reflectance,
             substitute_2012=substitute_2012,
+            preset=preset,
         )
         if result.get("status") == "cancelled":
             return {"output_paths": output_paths}
