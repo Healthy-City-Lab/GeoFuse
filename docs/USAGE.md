@@ -146,23 +146,32 @@ GEOFUSE_WORKERS=8 streamlit run ui/app.py       # cap every pool at 8 workers
 
 GVI runs end with a `Throughput:` log line: points searched, panoramas
 downloaded and segmented, each per second, how busy the GPU was, and throttle
-events. Three settings size the stages, in the GVI tab's **Download & GPU
-Throughput** box or as run-file keys and command-line flags:
+events. These settings size the stages and set the model's precision, in the
+GVI tab's **Download & GPU Throughput** box or as run-file keys and
+command-line flags:
 
 | Setting | Default | What it does |
 | --- | --- | --- |
 | `download_concurrency` (**Concurrent Downloads**) | 16 | Panoramas downloaded at once |
 | `batch_size` (**GPU Batch Size**) | 1 | Images per GPU forward |
 | `batch_wait_ms` (**Batch Wait (ms)**) | 20 | Longest wait for a batch to fill |
+| `precision` (**GPU Precision**) | `fp16` | `fp32` repeats the masks of runs made before FP16 was the default |
 
 If the GPU is busy well below 90 % and there are no throttle events, raise
 `download_concurrency`; if throttle events climb, lower it, since Google limits
 requests per address whatever the pool size. Keep `batch_size` at 1 unless a
 larger batch is measurably faster on your GPU: batched forwards change a few
-pixels' labels.
+pixels' labels. On one RTX 4060 Ti against Google, FP16 segments about 50
+panoramas per second and FP32 about 28 to 31; at those rates the GPU, not
+Google, is the limit, so a pool above 16 gains nothing there.
+
+Keep one precision within a study: values differ by about 0.00005 GVI between
+the two, far below anything a model of the outcome can see, but a series is
+cleaner made one way.
 
 ```bash
 geofuse gvi city.gpkg --download-concurrency 24
+geofuse gvi city.gpkg --precision fp32
 ```
 
 Per-job logs are written in full to `logs/jobs/<job_id>.log`; the in-app view

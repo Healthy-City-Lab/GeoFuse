@@ -29,7 +29,7 @@ off.
 | Path | Contents |
 | --- | --- |
 | `[name]_gvi.gpkg` | Canonical point layer (`gvi_samples`) in the planar CRS |
-| `[name]_gvi.json` | Sidecar: grid CRS, step, anchor, cluster count, distortion, and the capture rule (`capture_mode`, `target_year`, `max_year_diff`, `month_window`, `month_policy`) with `n_points`, `n_sampled`, `n_no_capture_in_window` and per-year / per-month counts of the captures used (`capture_years`, `capture_months`, each summing to `n_sampled`), and `throughput`: the run's stage counts and rates (`searched`, `cache_hits`, `downloads`, `segmented`, `gpu_batches`, `gpu_busy_share`, `throttle_events`, the per-second rates, `download_concurrency`, `batch_size`); a merge of shards lists each shard's under `throughput.shards` |
+| `[name]_gvi.json` | Sidecar: grid CRS, step, anchor, cluster count, distortion, and the capture rule (`capture_mode`, `target_year`, `max_year_diff`, `month_window`, `month_policy`) with `n_points`, `n_sampled`, `n_no_capture_in_window` and per-year / per-month counts of the captures used (`capture_years`, `capture_months`, each summing to `n_sampled`), and `throughput`: the run's stage counts and rates (`searched`, `cache_hits`, `downloads`, `segmented`, `gpu_batches`, `gpu_busy_share`, `throttle_events`, the per-second rates, `download_concurrency`, `batch_size`, the `precision` the model ran at and whether a `cuda_graph` was used); a merge of shards lists each shard's under `throughput.shards` |
 | `[name]_gvi_tiles/` | One dense GeoTIFF per cluster, band 1 vegetation, band 2 terrain, plus an index |
 | `[name]_gvi.geojson` | The same points in EPSG:4326 for web maps |
 | `[name]_temporal_gvi/` | Per-year mode: one full output set per year |

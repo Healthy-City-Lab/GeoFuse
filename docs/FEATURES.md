@@ -49,8 +49,16 @@ tiles, GeoJSON, and the raw panoramas and segmentation masks.
   roughly one pixel in 10,000 differently; the default keeps results identical
   to labelling each image alone. Google's throttle applies whatever the pool
   size, and the run slows itself down when Google pushes back.
+- On an NVIDIA GPU the model runs in half precision (FP16) and is replayed as
+  one recorded CUDA graph rather than launched layer by layer, about 1.8x the
+  panoramas per second of full precision. FP16 moves a point's GVI by 0.00005
+  on average (at most a few ten-thousandths; correlation with FP32 0.9999998).
+  **GPU Precision** / `precision = "fp32"` repeats the masks of runs made
+  before FP16 was the default. Other devices always run FP32. Panorama values
+  already in the cache are reused whatever the precision.
 - Each run logs and records its stage counts and rates: points searched,
-  panoramas downloaded and segmented, how busy the GPU was, and throttle events.
+  panoramas downloaded and segmented, how busy the GPU was, the precision the
+  model ran at, and throttle events.
 
 ---
 
