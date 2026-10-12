@@ -5,6 +5,7 @@
     geofuse submit RUN.toml         run a run file in the background
     geofuse run RUN.toml            run it here until it ends (batch scripts)
     geofuse plan RUN.toml           show the jobs it becomes; run nothing
+    geofuse ndvi | gvi | fusion ... one engine without a run file
     geofuse status [JOB...]         where every job is
     geofuse watch                   full-screen monitor (jobs keep running on quit)
     geofuse logs JOB [-f]           a job's log
@@ -71,12 +72,14 @@ def _state(args) -> StateDir:
     return StateDir(root)
 
 
-def _add_setting_flags(parser: argparse.ArgumentParser) -> None:
-    group = parser.add_argument_group(
-        "settings", "each overrides every step that has the setting"
-    )
+def _add_setting_flags(
+    parser: argparse.ArgumentParser,
+    engines: tuple[str, ...] = ("ndvi", "gvi", "fusion"),
+    note: str = "each overrides every step that has the setting",
+) -> None:
+    group = parser.add_argument_group("settings", note)
     seen: set[str] = set()
-    for engine in ("ndvi", "gvi", "fusion"):
+    for engine in engines:
         for key, s in _settings.SCHEMAS[engine].items():
             if key in seen:
                 continue
@@ -93,6 +96,7 @@ def _add_setting_flags(parser: argparse.ArgumentParser) -> None:
                 kw["choices"] = list(s.choices)
             elif s.kind in ("int", "float"):
                 kw["type"] = int if s.kind == "int" else float
+                kw["metavar"] = "N" if s.kind == "int" else "X"
             group.add_argument(flag, **kw)
 
 
@@ -220,7 +224,8 @@ def show_plan(run, specs, *, as_json: bool = False) -> int:
         print(json.dumps([s.to_dict() for s in specs], indent=1))
         return EXIT_OK
     defaults = {e: _settings.defaults(e) for e in _settings.SCHEMAS}
-    print(f"Run {run.name!r} ({run.path}) -> {run.output_dir}")
+    source = f" ({run.path})" if run.path else ""
+    print(f"Run {run.name!r}{source} -> {run.output_dir}")
     for step in run.steps:
         changed = {
             k: v for k, v in step.settings.items() if v != defaults[step.engine].get(k)
@@ -706,8 +711,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--daemon", action="store_true", help=argparse.SUPPRESS)
     p.set_defaults(func=cmd_supervisor)
 
-    from geofuse.cli import account, library, results
+    from geofuse.cli import account, library, quick, results
 
+    quick.add_parsers(sub, common)
     account.add_parsers(sub, common)
     library.add_parsers(sub, common)
     results.add_parsers(sub, common)
