@@ -4,7 +4,6 @@ import html
 import io
 import math
 import os
-import re
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -1284,29 +1283,12 @@ _SORTABLE_STYLE = """
 def _match_waves_to_filenames(
     file_paths: list[str], waves: list[str]
 ) -> dict[str, str]:
-    """``{path: wave}`` for filenames that name exactly one wave, unambiguously.
+    """``{path: wave}`` for filenames that name exactly one wave, unambiguously
+    (``geofuse.runfile.match_years_to_filenames``, which the command line
+    uses too). Everything else is left for the user to drag."""
+    from geofuse.runfile import match_years_to_filenames
 
-    A wave is matched only when its label appears in the filename bounded by
-    non-alphanumerics, so ``2011`` does not match inside ``20115``. The pairing
-    has to be one-to-one in both directions: a filename naming several waves is
-    ambiguous, and a wave named by several filenames is too. Everything else is
-    left for the user to drag.
-    """
-    hits: dict[str, list[str]] = {}
-    for path in file_paths:
-        stem = os.path.basename(path)
-        found = [
-            w
-            for w in waves
-            if re.search(rf"(?<![0-9A-Za-z]){re.escape(str(w))}(?![0-9A-Za-z])", stem)
-        ]
-        if len(found) == 1:
-            hits[path] = found[0]
-
-    claims: dict[str, list[str]] = {}
-    for path, wave in hits.items():
-        claims.setdefault(wave, []).append(path)
-    return {path: wave for path, wave in hits.items() if len(claims[wave]) == 1}
+    return match_years_to_filenames(file_paths, waves)
 
 
 def _autofill_year_assignment(
