@@ -90,6 +90,8 @@ class PanelTests(unittest.TestCase):
     def test_the_sidebar_panel_shows_each_cache(self):
         from streamlit.testing.v1 import AppTest
 
+        # The app runs in this process: put back what its script replaces.
+        self.addCleanup(setattr, caches, "describe_cache", caches.describe_cache)
         script = (
             "import sys\n"
             f"sys.path.insert(0, {os.path.join(ROOT, 'ui')!r})\n"
