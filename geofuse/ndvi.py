@@ -128,19 +128,35 @@ WATER_DATASET = "JRC/GSW1_4/GlobalSurfaceWater"
 WATER_OCCURRENCE_MAX = 50
 
 
+def _shift_day(day: str, days: int) -> str:
+    """The ISO date ``days`` days after ``day`` (before it when negative)."""
+    from datetime import date as _date
+    from datetime import timedelta as _timedelta
+
+    return (_date.fromisoformat(str(day)[:10]) + _timedelta(days=days)).isoformat()
+
+
+def _window_text(start_date: str, end_date: str) -> str:
+    """``start → last day`` of the half-open window ``[start_date, end_date)``."""
+    return f"{start_date} → {_shift_day(end_date, -1)}"
+
+
 def substitute_year(
     start_date: str, end_date: str, *, year: int = 2012, to: int = 2013
 ) -> tuple[str, str, bool]:
     """Shift a window that lies wholly inside ``year`` to the same days in ``to``.
 
+    The window is half-open, ``[start_date, end_date)``, as Earth Engine reads
+    it, so an end on 1 January of the next year still lies inside ``year``.
     Returns ``(start, end, shifted)``. A window only partly inside ``year`` is
     returned unchanged with ``shifted=False``; the caller warns about it. A
     29 February becomes the 28th.
     """
     from datetime import date as _date
 
-    s, e = _date.fromisoformat(str(start_date)), _date.fromisoformat(str(end_date))
-    if s.year != year or e.year != year:
+    s = _date.fromisoformat(str(start_date))
+    last = _date.fromisoformat(_shift_day(end_date, -1))
+    if s.year != year or last.year != year:
         return str(start_date), str(end_date), False
 
     def move(d):
@@ -149,11 +165,12 @@ def substitute_year(
         except ValueError:
             return d.replace(year=to, day=28)
 
-    return move(s).isoformat(), move(e).isoformat(), True
+    return move(s).isoformat(), _shift_day(move(last).isoformat(), 1), True
 
 
 def _overlaps_year(start_date: str, end_date: str, year: int) -> bool:
-    return str(start_date)[:4] <= str(year) <= str(end_date)[:4]
+    """Whether the half-open window ``[start_date, end_date)`` reaches ``year``."""
+    return str(start_date)[:4] <= str(year) <= _shift_day(end_date, -1)[:4]
 
 
 def _stack_composites(composites: Mapping[str, Any], reducers: list[str]):
@@ -465,6 +482,7 @@ def _write_ndvi_sidecar(
     resume_key: str = "",
     start_date: str,
     end_date: str,
+    end_date_exclusive: str | None = None,
     used_start_date: str | None = None,
     used_end_date: str | None = None,
     temporal_reducer: str = "median",
@@ -490,6 +508,9 @@ def _write_ndvi_sidecar(
     clusters and tiles the input decomposed into, the exact date range, the
     temporal statistic (median / mean / max over the window's cloud-free
     images), and which Earth Engine ImageCollection was queried.
+    ``start_date`` / ``end_date`` are the dates as given and
+    ``end_date_exclusive`` the exclusive end of that window; ``used_*`` is
+    the half-open window queried after any 2012 fill or coverage rescue.
     ``failed_tile_refs`` lists the cluster/tile IDs that exhausted their retry
     budget — those areas appear as NaN gaps in the mosaic.
     """
@@ -508,6 +529,7 @@ def _write_ndvi_sidecar(
         "failed_tile_refs": list(failed_tile_refs or []),
         "start_date": str(start_date),
         "end_date": str(end_date),
+        "end_date_exclusive": str(end_date_exclusive or end_date),
         "used_start_date": str(used_start_date or start_date),
         "used_end_date": str(used_end_date or end_date),
         "temporal_reducer": str(temporal_reducer),
@@ -928,14 +950,14 @@ class NDVIEngine:
     def _pick_satellite(self, start_date: str, end_date: str, satellite: str) -> str:
         """Resolve ``satellite='auto'`` → ``'sentinel2'`` or ``'landsat'``.
 
-        ``end_date`` falling before the Sentinel-2 collection start picks
-        Landsat; everything else stays on Sentinel-2 (higher resolution +
-        more frequent revisit). Every explicit choice in :data:`SATELLITES`
-        is passed through untouched.
+        A window whose exclusive ``end_date`` is on or before the Sentinel-2
+        collection start picks Landsat; everything else stays on Sentinel-2
+        (higher resolution + more frequent revisit). Every explicit choice in
+        :data:`SATELLITES` is passed through untouched.
         """
         if satellite != "auto":
             return satellite
-        return "landsat" if str(end_date) < self.S2_COLLECTION_START else "sentinel2"
+        return "landsat" if str(end_date) <= self.S2_COLLECTION_START else "sentinel2"
 
     #: Block-iteration buffer cap. Points accumulate here across raster
     #: windows; once we cross this threshold we build a GeoDataFrame and
@@ -1175,14 +1197,17 @@ class NDVIEngine:
         reflectance: str = "surface",
         substitute_2012: bool = False,
         preset: str | None = None,
+        end_inclusive: bool = False,
     ):
         """
         Download and process NDVI data with automatic tiling for large areas.
 
         Args:
             geometry: GeoDataFrame or Shapely geometry
-            start_date: Start date (YYYY-MM-DD)
-            end_date: End date (YYYY-MM-DD)
+            start_date: Start date (YYYY-MM-DD), included.
+            end_date: End date (YYYY-MM-DD). Exclusive by default, as Earth
+                Engine's ``filterDate`` reads it: the window is
+                ``[start_date, end_date)``. See ``end_inclusive``.
             output_name: Base name for output files
             cloud_max: Maximum cloud percentage
             resolution: Pixel resolution in meters
@@ -1232,6 +1257,10 @@ class NDVIEngine:
                 the same days of 2013 (recorded as ``year_substituted``).
             preset: Name of the settings preset the run came from, recorded
                 in the sidecar for provenance (nothing recorded when ``None``).
+            end_inclusive: Treat ``end_date`` as the last day to include; the
+                day after it is sent to Earth Engine. The sidecar records both
+                (``end_date``, ``end_date_exclusive``), and the 2012 fill and
+                coverage rescue work on the corrected window.
 
         Returns:
             The first statistic's result (``status``, ``tif``, ``geojson``,
@@ -1294,28 +1323,33 @@ class NDVIEngine:
         # ``[scale, 0, x0, 0, -scale, y0]``.
         crs_transform = [float(resolution), 0.0, 0.0, 0.0, -float(resolution), 0.0]
 
-        # 3. Optionally fill a window inside 2012 with the same days of 2013
+        # 3. The window as Earth Engine reads it, ``[start, end)``: an
+        # inclusive end moves to the next day. Every later step works on
+        # this half-open window.
+        req_start, req_end = str(start_date), str(end_date)
+        end_exclusive = _shift_day(req_end, 1) if end_inclusive else req_end
+
+        # 3a. Optionally fill a window inside 2012 with the same days of 2013
         # (no Landsat sensor without scan-line gaps imaged 2012). Applied
         # before anything is queried, so every date mode gets it.
-        req_start, req_end = str(start_date), str(end_date)
         year_substituted = None
         if substitute_2012:
-            q_start, q_end, shifted = substitute_year(req_start, req_end)
+            q_start, q_end, shifted = substitute_year(req_start, end_exclusive)
             if shifted:
                 year_substituted = "2012 → 2013"
                 _log(
                     "INFO",
-                    f"2012 window {req_start} → {req_end} filled with "
-                    f"{q_start} → {q_end}.",
+                    f"2012 window {_window_text(req_start, end_exclusive)} "
+                    f"filled with {_window_text(q_start, q_end)}.",
                 )
-            elif _overlaps_year(req_start, req_end, 2012):
+            elif _overlaps_year(req_start, end_exclusive, 2012):
                 _log(
                     "WARN",
-                    f"Window {req_start} → {req_end} lies only partly in 2012; "
-                    "it is not shifted to 2013.",
+                    f"Window {_window_text(req_start, end_exclusive)} lies only "
+                    "partly in 2012; it is not shifted to 2013.",
                 )
         else:
-            q_start, q_end = req_start, req_end
+            q_start, q_end = req_start, end_exclusive
 
         # 4. Pick the satellite collection. ``auto`` falls back to Landsat
         # for ranges that end before Sentinel-2 SR_HARMONIZED started.
@@ -1408,7 +1442,7 @@ class NDVIEngine:
         n_total = _get_base(used_start, used_end).size().getInfo()
         if n_total == 0:
             suggestion = ""
-            if chosen_satellite == "sentinel2" and used_end < self.S2_COLLECTION_START:
+            if chosen_satellite == "sentinel2" and used_end <= self.S2_COLLECTION_START:
                 suggestion = (
                     f" Sentinel-2 SR_HARMONIZED starts {self.S2_COLLECTION_START}"
                     " — set satellite='landsat' (or 'auto') for earlier dates."
@@ -1426,7 +1460,7 @@ class NDVIEngine:
                 "status": "error",
                 "message": (
                     f"No {chosen_satellite} images in collection for "
-                    f"{used_start} → {used_end}.{suggestion}"
+                    f"{_window_text(used_start, used_end)}.{suggestion}"
                 ),
             }
         n_cloud_filtered = (
@@ -1437,8 +1471,8 @@ class NDVIEngine:
                 "status": "error",
                 "message": (
                     f"All {n_total} {chosen_satellite} image(s) for "
-                    f"{used_start} → {used_end} exceeded the {cloud_max}% cloud "
-                    "threshold. Try raising the cloud max."
+                    f"{_window_text(used_start, used_end)} exceeded the "
+                    f"{cloud_max}% cloud threshold. Try raising the cloud max."
                 ),
             }
 
@@ -1466,8 +1500,9 @@ class NDVIEngine:
                     _log(
                         "WARN",
                         f"Coverage rescue: only {n_cloud_filtered} cloud-free "
-                        f"image(s) in {used_start}→{used_end}, widening to "
-                        f"{w_start}→{w_end} ({n_widened} images).",
+                        f"image(s) in {_window_text(used_start, used_end)}, "
+                        f"widening to {_window_text(w_start, w_end)} "
+                        f"({n_widened} images).",
                     )
                     used_start, used_end = w_start, w_end
                     n_cloud_filtered = n_widened
@@ -1613,6 +1648,7 @@ class NDVIEngine:
                     resume_key=resume_keys[r],
                     start_date=str(start_date),
                     end_date=str(end_date),
+                    end_date_exclusive=end_exclusive,
                     used_start_date=used_start,
                     used_end_date=used_end,
                     temporal_reducer=r,

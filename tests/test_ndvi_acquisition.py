@@ -383,7 +383,7 @@ class Year2012Tests(_Case):
             ndvi.substitute_year("2011-12-01", "2012-02-01"), ("2011-12-01", "2012-02-01", False)
         )
         self.assertEqual(
-            ndvi.substitute_year("2012-02-01", "2012-02-29"), ("2013-02-01", "2013-02-28", True)
+            ndvi.substitute_year("2012-02-01", "2012-03-01"), ("2013-02-01", "2013-03-01", True)
         )
         self.assertEqual(
             ndvi.substitute_year("2015-02-01", "2015-03-01"), ("2015-02-01", "2015-03-01", False)
