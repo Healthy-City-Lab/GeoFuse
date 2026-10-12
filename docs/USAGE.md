@@ -37,6 +37,8 @@ responsive and several study areas can run at once.
    match a past year, target a capture year and optionally cap the year gap.
    **Limit capture months** keeps panoramas to a season, for example May to
    October so trees are in leaf. The per-year mode works as it does for NDVI.
+   **Download & GPU Throughput**, collapsed under the settings, sizes the
+   download pool and the GPU batches (see *Performance* below).
 3. **Fusion tab.** Upload the outcome layer plus the files from steps 1 and 2,
    set the run mode and objective, and run.
 4. Read the results panel and export.
@@ -140,6 +142,27 @@ pool; `limited by cores` means the machine is fully used.
 ```bash
 GEOFUSE_CPU_SHARE=0.5 streamlit run ui/app.py   # halve the process-pool share
 GEOFUSE_WORKERS=8 streamlit run ui/app.py       # cap every pool at 8 workers
+```
+
+GVI runs end with a `Throughput:` log line: points searched, panoramas
+downloaded and segmented, each per second, how busy the GPU was, and throttle
+events. Three settings size the stages, in the GVI tab's **Download & GPU
+Throughput** box or as run-file keys and command-line flags:
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `download_concurrency` (**Concurrent Downloads**) | 16 | Panoramas downloaded at once |
+| `batch_size` (**GPU Batch Size**) | 1 | Images per GPU forward |
+| `batch_wait_ms` (**Batch Wait (ms)**) | 20 | Longest wait for a batch to fill |
+
+If the GPU is busy well below 90 % and there are no throttle events, raise
+`download_concurrency`; if throttle events climb, lower it, since Google limits
+requests per address whatever the pool size. Keep `batch_size` at 1 unless a
+larger batch is measurably faster on your GPU: batched forwards change a few
+pixels' labels.
+
+```bash
+geofuse gvi city.gpkg --download-concurrency 24
 ```
 
 Per-job logs are written in full to `logs/jobs/<job_id>.log`; the in-app view

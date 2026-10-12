@@ -109,8 +109,19 @@ Install it into the environment (`pip install textual`), or follow jobs with `ge
 The segmentation model runs out of VRAM during batch processing.
 
 **Fix:**
+* Set **GPU Batch Size** (`batch_size`) back to 1.
 * Process fewer study areas simultaneously.
 * The engine automatically falls back from CUDA → MPS → CPU if a device runs out of memory mid-job.
+
+---
+
+## GVI is slow, or its `Throughput:` line reports throttle events
+
+The line at the end of each GVI run shows where the time went.
+
+* **Throttle events, slow downloads:** Google is limiting requests from your address. The run backs off by itself; lower **Concurrent Downloads** (`download_concurrency`) so it trips less often. A larger pool does not lift Google's limit.
+* **No throttle events, GPU busy well below 90 %:** downloads are the bottleneck. Raise `download_concurrency`.
+* **GPU busy near 100 %:** the GPU is the limit. A faster card, or several shards on several GPUs (`shards = N` in a run file), is the way up.
 
 ---
 

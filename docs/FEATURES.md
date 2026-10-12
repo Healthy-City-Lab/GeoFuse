@@ -42,6 +42,15 @@ tiles, GeoJSON, and the raw panoramas and segmentation masks.
   grid cells are true squares in metres. Distortion above 2 % is warned about.
 - Panoramas are cached across runs. Interrupted jobs resume after the study area
   is re-uploaded and hash-verified.
+- Search, download and segmentation run as separate stages: a pool of downloads
+  (16 at once by default) prepares images for the GPU, which labels them one at
+  a time unless a batch size is set. On a single desktop GPU the model already
+  keeps the card busy, so batching seldom helps, and a batched forward labels
+  roughly one pixel in 10,000 differently; the default keeps results identical
+  to labelling each image alone. Google's throttle applies whatever the pool
+  size, and the run slows itself down when Google pushes back.
+- Each run logs and records its stage counts and rates: points searched,
+  panoramas downloaded and segmented, how busy the GPU was, and throttle events.
 
 ---
 
