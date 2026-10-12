@@ -514,6 +514,30 @@ def _expand_fusion(
     ]
 
 
+#: Cluster resource groups: GVI needs a GPU, fusion cores and memory, the
+#: rest (NDVI downloads, GVI merges) little of either.
+GROUPS = ("gpu", "fusion", "light")
+
+
+def job_group(spec: JobSpec) -> str:
+    if spec.kind in ("gvi", "gvi_column"):
+        return "gpu"
+    return "fusion" if spec.kind == "fusion" else "light"
+
+
+def levels(specs: Sequence[JobSpec]) -> list[int]:
+    """Each job's dependency level: 0 when it waits for no job in ``specs``,
+    else one more than the deepest step it waits for."""
+    by_step: dict[str, int] = {}
+    out = []
+    for spec in specs:
+        waits = [by_step[d] for d in spec.depends_on if d in by_step]
+        level = 1 + max(waits) if waits else 0
+        by_step[spec.step] = max(by_step.get(spec.step, 0), level)
+        out.append(level)
+    return out
+
+
 def expand(run: _rf.RunFile, *, today: date | None = None) -> list[JobSpec]:
     """Every job of ``run``, in dependency order (``depends_on`` names steps)."""
     today = today or date.today()

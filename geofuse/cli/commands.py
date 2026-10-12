@@ -118,6 +118,27 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
         help="run only these steps (ENGINE.STEP or STEP; repeatable); the "
         "steps they depend on are taken as already done",
     )
+    jobs = parser.add_argument_group(
+        "job arrays", "pick jobs for one task of a scheduler array (see plan)"
+    )
+    jobs.add_argument(
+        "--level",
+        type=int,
+        metavar="K",
+        help="only jobs at dependency level K (0: they wait for nothing); "
+        "earlier levels are taken as done",
+    )
+    jobs.add_argument(
+        "--group",
+        choices=["gpu", "fusion", "light"],
+        help="only jobs needing these resources (GVI / fusion / the rest)",
+    )
+    jobs.add_argument(
+        "--array-task",
+        type=int,
+        metavar="N",
+        help="only the N-th of the jobs picked so far (from 0)",
+    )
     _add_setting_flags(parser)
 
 
@@ -141,17 +162,40 @@ def _load(args):
         specs = expand(run)
     except (RunFileError, PlanError, _settings.SettingError) as exc:
         raise CliError(str(exc)) from exc
+    return run, _pick(args, specs)
+
+
+def _pick(args, specs: list) -> list:
+    """The jobs ``--only``, ``--level``, ``--group`` and ``--array-task`` keep."""
+    from geofuse.jobs.plans import job_group, levels
+
+    level_of = dict(zip(map(id, specs), levels(specs), strict=True))
     only = getattr(args, "only", None)
     if only:
-        picked = [
+        specs = [
             s
             for s in specs
             if any(s.step == o or s.step.endswith(f".{o}") for o in only)
         ]
-        if not picked:
+        if not specs:
             raise CliError(f"--only {only} matches no step of {args.runfile}.")
-        specs = picked
-    return run, specs
+    level = getattr(args, "level", None)
+    if level is not None:
+        specs = [s for s in specs if level_of[id(s)] == level]
+    group = getattr(args, "group", None)
+    if group:
+        specs = [s for s in specs if job_group(s) == group]
+    task = getattr(args, "array_task", None)
+    if task is not None:
+        if not 0 <= task < len(specs):
+            raise CliError(
+                f"--array-task {task}: the selection has {len(specs)} job(s), "
+                f"0..{len(specs) - 1}."
+            )
+        specs = [specs[task]]
+    if (level is not None or group) and not specs:
+        raise CliError("No job matches --level / --group.")
+    return specs
 
 
 def _resolve(state: StateDir, refs: list[str]) -> list[str]:
@@ -223,10 +267,17 @@ def show_plan(run, specs, *, as_json: bool = False) -> int:
     if as_json:
         print(json.dumps([s.to_dict() for s in specs], indent=1))
         return EXIT_OK
+    from geofuse.jobs.plans import job_group, levels
+
     defaults = {e: _settings.defaults(e) for e in _settings.SCHEMAS}
     source = f" ({run.path})" if run.path else ""
     print(f"Run {run.name!r}{source} -> {run.output_dir}")
+    level_of = dict(zip(map(id, specs), levels(specs), strict=True))
     for step in run.steps:
+        shard_step = f"{step.key}:shards"
+        mine = [s for s in specs if s.step in (step.key, shard_step)]
+        if not mine:
+            continue
         changed = {
             k: v for k, v in step.settings.items() if v != defaults[step.engine].get(k)
         }
@@ -236,10 +287,10 @@ def show_plan(run, specs, *, as_json: bool = False) -> int:
             print("  settings: " + ", ".join(f"{k}={v}" for k, v in changed.items()))
         if step.depends_on:
             print("  after: " + ", ".join(step.depends_on))
-        shard_step = f"{step.key}:shards"
-        for spec in [s for s in specs if s.step in (step.key, shard_step)]:
+        for spec in mine:
             label = spec.options.get("output_name") or spec.name
-            print(f"  job {spec.kind:12s} {label}")
+            where = f"level {level_of[id(spec)]}, {job_group(spec)}"
+            print(f"  #{specs.index(spec):<3} {spec.kind:12s} {label}  ({where})")
             outs = spec.outputs
             if "years" in outs:
                 years = outs["years"]
