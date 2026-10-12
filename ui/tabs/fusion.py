@@ -4,7 +4,7 @@ import html
 import io
 import math
 import os
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -5464,64 +5464,25 @@ def render(output_dir: str) -> None:
                 "Export per-entity CGI",
                 width="stretch",
                 key="fusion_export",
-                help="One row per target entity with sampled channels + composite CGI.",
+                help=(
+                    "The table the run wrote: one row per target entity with "
+                    "the sampled channels and the composite CGI."
+                ),
             ):
                 bundle, _eng = _fusion_resolve_active_bundle()
-                if bundle is None or bundle.get("composite_df") is None:
-                    st.error("No composite table available to export.")
-                elif _eng is None:
-                    st.error("Engine state unavailable; cannot attach geometries.")
-                else:
-                    result_df = bundle["composite_df"].copy()
-                    artifacts_dir = bundle.get("artifacts_dir") or output_dir
-                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-                    geom_attached = False
-                    export_path: str | None = None
-
-                    if (
-                        "polygon_id" in result_df.columns
-                        and _eng.target_polygons_gdf is not None
-                    ):
-                        polys = _eng.target_polygons_gdf.reset_index(drop=True).copy()
-                        polys["polygon_id"] = polys.index
-                        keep_attr_cols = [
-                            c for c in polys.columns if c == "geometry"
-                        ] + ["polygon_id"]
-                        result_gdf = polys[keep_attr_cols].merge(
-                            result_df, on="polygon_id", how="inner"
-                        )
-                        export_path = os.path.join(
-                            artifacts_dir,
-                            f"fusion_composite_{ts}.gpkg",
-                        )
-                        result_gdf.to_file(export_path, driver="GPKG", layer="cgi")
-                        geom_attached = True
-                    elif _eng.target_gdf is not None and len(_eng.target_gdf) == len(
-                        result_df
-                    ):
-                        base = _eng.target_gdf.reset_index(drop=True).copy()
-                        for col in result_df.columns:
-                            base[col] = result_df[col].reset_index(drop=True).values
-                        export_path = os.path.join(
-                            artifacts_dir,
-                            f"fusion_composite_{ts}.gpkg",
-                        )
-                        base.to_file(export_path, driver="GPKG", layer="cgi")
-                        geom_attached = True
-
-                    if not geom_attached:
-                        export_path = os.path.join(
-                            artifacts_dir,
-                            f"fusion_composite_{ts}.csv",
-                        )
-                        result_df.to_csv(export_path, index=False)
-
-                    st.success(f"Exported {len(result_df)} rows to: `{export_path}`")
+                table = (bundle or {}).get("entity_table_path")
+                if table and os.path.isfile(table):
+                    st.success(f"Per-entity CGI table: `{table}`")
                     st.caption(
-                        "Columns: `polygon_id`, `target`, `veg` / `terrain` / "
-                        "`ndvi`, `composite`, `n_samples`. Geometries joined "
-                        "from the loaded target file."
+                        "Columns: `polygon_id` (polygon targets), `target`, the "
+                        "sampled channels, `composite`, `n_samples`; geometries "
+                        "from the target file. GeoPackage layer `cgi`."
+                    )
+                else:
+                    st.error(
+                        "This run has no per-entity table on disk. Runs write "
+                        "`composite_entities.gpkg` beside the composite GeoTIFF; "
+                        "re-run to produce it."
                     )
     with col_run3:
         if st.session_state.fusion_results:
