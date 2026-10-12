@@ -227,12 +227,8 @@ def run_gvi(
 
     ctx.progress(value=1.0, status_text="Writing outputs")
 
-    # A specific-year run carries its year in the name, so runs of one layer
-    # for different years can share a folder.
     target_year = run_args.get("target_year")
-    out_name = os.path.splitext(fname)[0]
-    if target_year is not None:
-        out_name = f"{out_name}_{int(target_year)}"
+    out_name = gvi_output_name(fname, run_args)
     output_paths, res_df = _write_gvi_outputs(
         accumulated=dataset_data["accumulated"],
         processed_crs=dataset_data["processed"].crs,
@@ -248,6 +244,14 @@ def run_gvi(
     )
     dataset_data["results"] = res_df
     return {"output_paths": output_paths}
+
+
+def gvi_output_name(fname: str, run_args: Mapping) -> str:
+    """The name a GVI job's files start with. A specific-year run carries its
+    year, so runs of one layer for different years can share a folder."""
+    out_name = os.path.splitext(fname)[0]
+    target_year = run_args.get("target_year")
+    return out_name if target_year is None else f"{out_name}_{int(target_year)}"
 
 
 def _write_gvi_outputs(
@@ -465,6 +469,46 @@ def _capture_summary(accumulated: list, capture: Mapping) -> dict:
     }
 
 
+def column_years(raw: gpd.GeoDataFrame, date_column: str):
+    """``(rows in EPSG:4326 with a _year column, the years, the grid CRS)``.
+
+    The grid CRS is chosen once from the whole dataset, before any split by
+    year, so every year's grid shares one planar CRS and aligns.
+    """
+    from geofuse.crs_utils import select_grid_crs_with_warning
+    from geofuse.longitudinal import parse_date_column
+
+    gdf_4326 = (
+        raw
+        if raw.crs is not None and raw.crs.is_geographic
+        else raw.to_crs("EPSG:4326")
+    ).copy()
+    parsed = parse_date_column(gdf_4326[date_column])
+    gdf_4326["_year"] = parsed.dt.year
+    gdf_4326 = gdf_4326.dropna(subset=["_year"])
+    if gdf_4326.empty:
+        raise ValueError(f"No valid years could be parsed from column '{date_column}'.")
+    gdf_4326["_year"] = gdf_4326["_year"].astype(int)
+    grid_crs, _distortion, _choice = select_grid_crs_with_warning(
+        gdf_4326, _log_gvi, role="Grid CRS"
+    )
+    return gdf_4326, sorted(gdf_4326["_year"].unique()), grid_crs
+
+
+def year_grid(gdf_4326, year: int, buffer_m: float, step, grid_crs):
+    """One year's sampling points and their grid metadata (``None`` for bare
+    points)."""
+    from geofuse.core import generate_clustered_grid
+
+    year_gdf = gdf_4326[gdf_4326["_year"] == year].drop(columns=["_year"])
+    is_poly = year_gdf.geometry.iloc[0].geom_type in ("Polygon", "MultiPolygon")
+    if is_poly or buffer_m > 0:
+        return generate_clustered_grid(
+            year_gdf, buffer_m=buffer_m, step_m=float(step), grid_crs=grid_crs
+        )
+    return year_gdf.copy(), None
+
+
 def run_gvi_column(
     ctx: JobContext,
     *,
@@ -488,30 +532,8 @@ def run_gvi_column(
     grids share one planar CRS and align. Results land in a
     ``{name}_temporal_gvi/`` folder, one set of files per year.
     """
-    from geofuse.core import generate_clustered_grid
-    from geofuse.crs_utils import select_grid_crs_with_warning
-    from geofuse.longitudinal import parse_date_column
-
-    raw = dataset_data["raw"]
-    gdf_4326 = (
-        raw
-        if raw.crs is not None and raw.crs.is_geographic
-        else raw.to_crs("EPSG:4326")
-    ).copy()
-    parsed = parse_date_column(gdf_4326[date_column])
-    gdf_4326["_year"] = parsed.dt.year
-    gdf_4326 = gdf_4326.dropna(subset=["_year"])
-    if gdf_4326.empty:
-        raise ValueError(f"No valid years could be parsed from column '{date_column}'.")
-    gdf_4326["_year"] = gdf_4326["_year"].astype(int)
-
-    unique_years = sorted(gdf_4326["_year"].unique())
+    gdf_4326, unique_years, grid_crs = column_years(dataset_data["raw"], date_column)
     n_years = len(unique_years)
-
-    # Grid CRS chosen once from the whole dataset so every per-year grid aligns.
-    grid_crs, _distortion, _choice = select_grid_crs_with_warning(
-        gdf_4326, _log_gvi, role="Grid CRS"
-    )
 
     base_name = os.path.splitext(fname)[0]
     job_folder = os.path.join(output_dir, f"{base_name}_temporal_gvi")
@@ -543,14 +565,7 @@ def run_gvi_column(
     for year in unique_years:
         if ctx.is_cancelled():
             return {"output_paths": output_paths}
-        year_gdf = gdf_4326[gdf_4326["_year"] == year].drop(columns=["_year"])
-        is_poly = year_gdf.geometry.iloc[0].geom_type in ("Polygon", "MultiPolygon")
-        if is_poly or buffer_m > 0:
-            pts, meta = generate_clustered_grid(
-                year_gdf, buffer_m=buffer_m, step_m=float(step), grid_crs=grid_crs
-            )
-        else:
-            pts, meta = year_gdf.copy(), None
+        pts, meta = year_grid(gdf_4326, year, buffer_m, step, grid_crs)
         plans.append((year, pts, meta))
         ctx.progress(status_text=f"Generated grid for {year}: {len(pts):,} points")
         ctx.heartbeat()
