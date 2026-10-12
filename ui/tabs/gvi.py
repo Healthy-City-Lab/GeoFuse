@@ -306,6 +306,13 @@ _GVI_PRESET_KEYS = {
 _GVI_SETTING_DEFAULTS = {
     "gvi_download_mode": _GVI_DOWNLOAD_LABELS[_GVI_DEFAULTS["download_mode"]],
     **{key: _GVI_DEFAULTS[name] for name, key in _GVI_PRESET_KEYS.items()},
+    **{f"gvi_{name}": _GVI_DEFAULTS[name] for name in _GVI_THROUGHPUT},
+}
+# Download / GPU sizing widgets: setting -> (label, step).
+_GVI_THROUGHPUT_WIDGETS = {
+    "download_concurrency": ("Concurrent Downloads", 1),
+    "batch_size": ("GPU Batch Size", 1),
+    "batch_wait_ms": ("Batch Wait (ms)", 10),
 }
 # Preset capture setting -> (layer config key, widget key pattern).
 _GVI_PRESET_CAPTURE_KEYS = {
@@ -1126,6 +1133,17 @@ def _render_gvi_settings_map() -> None:
                     "off for large grids to keep the browser responsive."
                 ),
             )
+            with st.expander("Download & GPU Throughput", expanded=False):
+                for name, (label, step) in _GVI_THROUGHPUT_WIDGETS.items():
+                    spec = _GVI_SETTINGS[name]
+                    st.number_input(
+                        label,
+                        min_value=int(spec.lo),
+                        max_value=int(spec.hi),
+                        step=step,
+                        key=f"gvi_{name}",
+                        help=spec.help,
+                    )
     with fc_gvi_r:
         st.subheader("Study Area Preview")
         show_sampling_grid = st.session_state.get("gvi_preview_sampling_grid", False)
