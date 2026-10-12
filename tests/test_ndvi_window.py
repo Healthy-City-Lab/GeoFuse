@@ -248,6 +248,35 @@ class RunnerWindowTests(_Case):
         )
 
 
+class FusionAutoDownloadTests(unittest.TestCase):
+    def test_auto_download_sends_an_inclusive_end(self):
+        from geofuse.fusion import MetricFusionEngine
+
+        calls = []
+
+        class _Stub:
+            def __init__(self, *_a, **_kw):
+                pass
+
+            def download_and_process(self, **kw):
+                calls.append(kw)
+                return {"status": "success", "tif": "site_ndvi.tif"}
+
+        eng = MetricFusionEngine.__new__(MetricFusionEngine)
+        eng.buffered_extent = AOI
+        eng.target_file = "site.gpkg"
+        eng.cache_dir = "unused"
+        eng._ndvi_export_resolution_m = 10.0
+        with (
+            mock.patch.object(ndvi, "NDVIEngine", _Stub),
+            mock.patch.object(eng, "_get_cache_filename", return_value="missing.tif"),
+        ):
+            eng._auto_download_ndvi("2023-06-01", "2023-09-30", cache=False)
+        self.assertEqual(
+            (calls[0]["end_date"], calls[0]["end_inclusive"]), ("2023-09-30", True)
+        )
+
+
 # ────────────────────────────────────────────────────────────────────
 # Window helpers
 # ────────────────────────────────────────────────────────────────────

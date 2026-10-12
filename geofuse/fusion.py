@@ -990,7 +990,7 @@ class MetricFusionEngine:
             cache_metrics: Whether to cache downloaded metrics for future use
             gvi_api_key: Google Street View API key for GVI download
             ndvi_start_date: Start date for NDVI composite (YYYY-MM-DD)
-            ndvi_end_date: End date for NDVI composite (YYYY-MM-DD)
+            ndvi_end_date: Last day of the NDVI composite (YYYY-MM-DD), included
             ndvi_project_id: Google Earth Engine project ID for NDVI download
             force_download: If True, bypass cache and force fresh download of all metrics
             ndvi_resolution_m: GEE export resolution (m) when fetching NDVI; default 10
@@ -1608,7 +1608,7 @@ class MetricFusionEngine:
 
         Args:
             start_date: Start date for temporal composite (YYYY-MM-DD)
-            end_date: End date for temporal composite (YYYY-MM-DD)
+            end_date: Last day of the temporal composite (YYYY-MM-DD), included
             project_id: Google Earth Engine project ID
             cache: Whether to save to cache directory
             force_download: If True, bypass cache and force fresh download
@@ -1661,6 +1661,7 @@ class MetricFusionEngine:
             folder=self.cache_dir,
             resolution=ndvi_res,
             cancel_callback=cancel_callback,
+            end_inclusive=True,
         )
 
         if result.get("status") == "cancelled":

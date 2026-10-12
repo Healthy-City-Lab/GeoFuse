@@ -318,6 +318,7 @@ def main():
                             cloud_max=row.get("cloud_max", 10),
                             resolution=row.get("resolution", 10),
                             folder=args.output_dir,
+                            end_inclusive=True,
                         )
                         if res.get("status") == "success":
                             print(f"  -> Saved: {os.path.basename(res['tif'])}")
