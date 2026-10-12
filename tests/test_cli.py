@@ -81,6 +81,13 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(overrides["statistics_ranges"].value, ["mean", "max"])
         self.assertEqual(overrides["objective_metric"].target, ("*",))
 
+    def test_help_lists_the_setting_flags(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as done:
+            cli.main(["plan", "--help"])
+        self.assertEqual(done.exception.code, 0)
+        self.assertIn("cloud cover (%)", out.getvalue())
+
     def test_set_overrides_come_after_flags(self):
         args = cli.build_parser().parse_args(
             ["plan", "r.toml", "--cloud-max", "20", "--set", "ndvi.city.cloud_max=5"]

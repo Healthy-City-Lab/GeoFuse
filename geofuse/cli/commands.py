@@ -79,7 +79,9 @@ def _add_setting_flags(parser: argparse.ArgumentParser) -> None:
                 continue
             seen.add(key)
             flag = "--" + key.replace("_", "-")
-            kw: dict = {"dest": f"setting__{key}", "default": None, "help": s.help}
+            # argparse formats help with %, so a literal one is doubled.
+            text = s.help.replace("%", "%%")
+            kw: dict = {"dest": f"setting__{key}", "default": None, "help": text}
             if s.kind == "bool":
                 kw["action"] = argparse.BooleanOptionalAction
             elif s.kind == "multichoice":
