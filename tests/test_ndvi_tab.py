@@ -219,6 +219,31 @@ class DateConfigPickerTests(unittest.TestCase):
             )
 
 
+class OneDayRangeTests(unittest.TestCase):
+    """End dates are included, so a range may start and end on the same day."""
+
+    APP = DateConfigPickerTests.APP.replace(
+        '"use_specific": True', '"use_specific": False'
+    ).replace("date(2023, 6, 1), date(2023, 9, 30)", "date(2023, 7, 1), date(2023, 7, 1)")
+    WARNING = "End date must be on or after the start date."
+
+    def test_same_day_is_valid_and_a_reversed_range_is_not(self):
+        from streamlit.testing.v1 import AppTest
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "app.py")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(self.APP.format(root=ROOT))
+            at = AppTest.from_file(path, default_timeout=60)
+            at.run()
+            self.assertFalse(at.exception)
+            self.assertFalse(any(self.WARNING in m.value for m in at.markdown))
+
+            at.date_input(key="ndvi_re_site.geojson_0").set_value(date(2023, 6, 30))
+            at.run()
+            self.assertTrue(any(self.WARNING in m.value for m in at.markdown))
+
+
 class SettingsBoxTests(unittest.TestCase):
     """Download settings: defaults are today's behaviour, every option is the user's."""
 

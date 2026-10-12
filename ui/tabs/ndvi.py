@@ -952,14 +952,14 @@ def _render_ndvi_date_config() -> None:
                     for i, (s, e) in enumerate(cfg["ranges"]):
                         stored_s = st.session_state.get(f"ndvi_rs_{fname}_{i}", s)
                         stored_e = st.session_state.get(f"ndvi_re_{fname}_{i}", e)
-                        range_invalid = stored_s >= stored_e
+                        range_invalid = stored_s > stored_e
                         s_help = (
-                            "Start date is on or after the end date."
+                            "Start date is after the end date."
                             if range_invalid
                             else None
                         )
                         e_help = (
-                            "End date is on or before the start date."
+                            "End date is before the start date."
                             if range_invalid
                             else None
                         )
@@ -981,11 +981,11 @@ def _render_ndvi_date_config() -> None:
                             help=e_help,
                         )
                         cfg["ranges"][i] = (new_s, new_e)
-                        if new_s >= new_e:
+                        if new_s > new_e:
                             st.markdown(
                                 '<p style="color:#ff4b4b;font-size:0.78em;'
                                 'margin:0 0 4px 0;">'
-                                "⚠ End date must be after start date.</p>",
+                                "⚠ End date must be on or after the start date.</p>",
                                 unsafe_allow_html=True,
                             )
                         if len(cfg["ranges"]) > 1:
@@ -1376,10 +1376,10 @@ def render(output_dir: str) -> None:
                     ):
                         start_d = st.session_state.get(f"ndvi_rs_{fname}_{i}", s_def)
                         end_d = st.session_state.get(f"ndvi_re_{fname}_{i}", e_def)
-                        if start_d >= end_d:
+                        if start_d > end_d:
                             validation_errors.append(
                                 f"{fname}: Date range {i + 1} — "
-                                "start date must be before end date."
+                                "start date must be on or before the end date."
                             )
                             continue
                         output_name = (
