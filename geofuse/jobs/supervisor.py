@@ -398,6 +398,11 @@ class Supervisor:
 
     def step(self) -> None:
         """One pass: claim, schedule, apply control, report."""
+        stop_file = self.state.supervisors_dir / f"{self.id}.stop"
+        if stop_file.exists():
+            stop_file.unlink(missing_ok=True)
+            self._log("stop requested: cancelling jobs")
+            self.cancel_all()
         self.heartbeat()
         self._scan()
         self._schedule()
@@ -405,6 +410,8 @@ class Supervisor:
 
     def _finished(self) -> bool:
         busy = any(e["phase"] != "done" for e in self.jobs.values())
+        if self._cancel_all.is_set() and not busy:
+            return True
         if self.mode == "foreground":
             return not busy and self._seen_own_jobs()
         if busy or self._unclaimed_queued():
@@ -481,10 +488,10 @@ def start_daemon(state: StateDir, *, wait_s: float = 20.0) -> dict:
         sys.executable,
         "-m",
         "geofuse",
-        "supervisor",
-        "--daemon",
         "--state-dir",
         str(state.root),
+        "supervisor",
+        "--daemon",
     ]
     log = open(state.root / "supervisor.log", "ab")
     kwargs: dict[str, Any] = {

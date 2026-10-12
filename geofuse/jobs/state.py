@@ -117,7 +117,9 @@ class StateDir:
     """One state folder (see the module docstring)."""
 
     def __init__(self, root: str | os.PathLike | None = None):
-        self.root = Path(root) if root is not None else default_state_dir()
+        # Absolute, so a supervisor started in another folder finds the same one.
+        root = Path(root).expanduser() if root is not None else default_state_dir()
+        self.root = root.resolve()
 
     # ── Paths ───────────────────────────────────────────────────
 
@@ -305,6 +307,11 @@ class StateDir:
             self.supervisors_dir / f"{supervisor_id}.json",
             {**record, "id": supervisor_id, "heartbeat": now_iso()},
         )
+
+    def request_stop(self, supervisor_id: str) -> None:
+        """Ask a supervisor to cancel its jobs and exit."""
+        self.supervisors_dir.mkdir(parents=True, exist_ok=True)
+        (self.supervisors_dir / f"{supervisor_id}.stop").touch()
 
     def remove_supervisor(self, supervisor_id: str) -> None:
         try:

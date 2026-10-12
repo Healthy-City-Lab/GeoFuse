@@ -75,6 +75,15 @@ class JobFileTests(_Case):
         self.assertEqual(self.state.read_status(job_id), {})
         self.assertIsNone(state.read_json(self.state.root / "nope.json"))
 
+    def test_a_relative_folder_is_held_absolute(self):
+        here = os.getcwd()
+        os.chdir(self.tmp.name)
+        try:
+            expected = (state.Path(self.tmp.name) / "rel").resolve()
+            self.assertEqual(StateDir("rel").root, expected)
+        finally:
+            os.chdir(here)
+
     def test_writes_replace_the_file_whole(self):
         path = self.state.root / "x.json"
         state.write_json(path, {"a": 1})
