@@ -67,7 +67,8 @@ per-cluster tiles, and a metadata sidecar.
   imaged without scan-line gaps.
 - Dates can be given as ranges, as specific dates with a window, or as a year
   column that splits the layer and composites each year over the growing-season
-  months you choose.
+  months you choose. End dates are included: a range ending 30 September keeps
+  that day's scenes, and a season covers its months in full.
 - Each pixel's value is a temporal statistic of the window's cloud-free images:
   the median (default), the mean, or the maximum. Each date mode takes any
   combination; every statistic writes its own files, and one download per tile

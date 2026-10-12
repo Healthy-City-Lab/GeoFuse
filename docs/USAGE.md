@@ -20,9 +20,11 @@ responsive and several study areas can run at once.
 
 ### Typical workflow
 
-1. **NDVI tab.** Upload a study area, set a date range, run. For year-by-year
+1. **NDVI tab.** Upload a study area, set a date range, run. Both ends of a
+   range are included, so a range can be a single day. For year-by-year
    data choose the per-year mode, pick the year column and the growing-season
-   months, and each year becomes its own aligned raster. Each date mode has a
+   months, and each year becomes its own aligned raster covering those months
+   in full (May to September runs to 30 September). Each date mode has a
    **Temporal statistic** picker: median (default), mean, maximum, or any
    combination, each written as its own file. The download settings hold
    **Satellite**, **Reflectance**, **Cloud handling** (drop cloudy scenes,
@@ -154,7 +156,8 @@ conda activate geofuse
 mpiexec -n 4 python scripts/cli.py --config config.csv
 ```
 
-`--config` points at a CSV defining input files and parameters. A template is
+`--config` points at a CSV defining input files and parameters. NDVI rows take
+`start_date` and `end_date` (YYYY-MM-DD), both included. A template is
 created on first run if none exists. On a cluster, swap `mpiexec` for your
 scheduler's launcher, for example `srun -n 32`. Each rank processes a separate
 study area and writes to `output_results/` with collision-safe naming.
