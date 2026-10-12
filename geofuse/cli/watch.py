@@ -48,7 +48,7 @@ _STAGE_MARKS = {
     "failed": ("✗", "red"),
     "skipped": ("–", "dim"),
 }
-_ENGINE = {"ndvi_column": "ndvi", "gvi_column": "gvi"}
+_ENGINE = {"ndvi_column": "ndvi", "gvi_column": "gvi", "gvi_merge": "gvi"}
 _COLUMNS = ("ID", "KIND", "NAME", "STATUS", "PROG", "ETA", "STEP", "NOTE")
 
 

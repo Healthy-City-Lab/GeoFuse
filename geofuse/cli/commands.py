@@ -236,7 +236,8 @@ def show_plan(run, specs, *, as_json: bool = False) -> int:
             print("  settings: " + ", ".join(f"{k}={v}" for k, v in changed.items()))
         if step.depends_on:
             print("  after: " + ", ".join(step.depends_on))
-        for spec in [s for s in specs if s.step == step.key]:
+        shard_step = f"{step.key}:shards"
+        for spec in [s for s in specs if s.step in (step.key, shard_step)]:
             label = spec.options.get("output_name") or spec.name
             print(f"  job {spec.kind:12s} {label}")
             outs = spec.outputs

@@ -262,6 +262,70 @@ class BuildTests(_Case):
         self.assertNotIn("report_effects_bootstrap", run)
 
 
+class ShardTests(_Case):
+    RUN = """
+        [[gvi]]
+        name = "city"
+        study_area = "city.gpkg"
+        capture_mode = "column"
+        year_column = "year"
+        shards = 3
+
+        [[fusion]]
+        name = "cesd"
+        target = "cohort.gpkg"
+        outcomes = ["cesd"]
+        mode = "year-aware"
+        date_column = "visit"
+        ndvi = ["ndvi_2015.tif", "ndvi_2018.tif"]
+        gvi = "@gvi.city"
+        """
+
+    def test_a_sharded_step_becomes_shard_jobs_and_a_merge(self):
+        specs = self.expand(self.RUN)
+        self.assertEqual(
+            [(s.step, s.kind, s.options.get("shard")) for s in specs],
+            [
+                ("gvi.city:shards", "gvi_column", [0, 3]),
+                ("gvi.city:shards", "gvi_column", [1, 3]),
+                ("gvi.city:shards", "gvi_column", [2, 3]),
+                ("gvi.city", "gvi_merge", None),
+                ("fusion.cesd", "fusion", None),
+            ],
+        )
+        merge, fusion = specs[3], specs[4]
+        self.assertEqual(merge.depends_on, ["gvi.city:shards"])
+        self.assertEqual(merge.resources, [])
+        self.assertEqual(sorted(fusion.options["gvi_files"]), ["2015", "2018"])
+
+    def test_the_merge_waits_for_the_shards_and_fusion_for_the_merge(self):
+        from geofuse.jobs.state import StateDir
+        from geofuse.jobs.supervisor import submit_specs
+
+        state = StateDir(os.path.join(self.dir, "state"))
+        _, ids = submit_specs(state, self.expand(self.RUN), run_name="t")
+        self.assertEqual(state.job(ids[3]).spec["depends_on"], ids[:3])
+        self.assertEqual(state.job(ids[4]).spec["depends_on"], [ids[3]])
+
+    def test_shards_and_the_merge_build_their_calls(self):
+        specs = self.expand(self.RUN)
+        shard = plans.build(specs[1])
+        self.assertEqual(shard.kwargs["run_args"]["shard"], [1, 3])
+        self.assertEqual(shard.params["shard"], [1, 3])
+        merge = plans.build(specs[3])
+        self.assertEqual(merge.method, "submit_gvi_merge_subprocess")
+        self.assertEqual(merge.kwargs["shards"], 3)
+        self.assertEqual(merge.kwargs["date_column"], "year")
+        self.assertNotIn("shard", merge.kwargs["run_args"])
+
+    def test_shard_counts_are_checked(self):
+        one = self.expand(self.RUN.replace("shards = 3", "shards = 1"))
+        self.assertEqual([s.kind for s in one], ["gvi_column", "fusion"])
+        for value in ("0", '"2"', "true"):
+            with self.assertRaisesRegex(runfile.RunFileError, "shards"):
+                self.expand(self.RUN.replace("shards = 3", f"shards = {value}"))
+
+
 # ────────────────────────────────────────────────────────────────────
 # Parity with the tabs
 # ────────────────────────────────────────────────────────────────────

@@ -89,6 +89,8 @@ def _step(args) -> dict:
         }
         if args.merge:
             step["merge"] = True
+        if getattr(args, "shards", None):
+            step["shards"] = args.shards
         if args.year_column:
             step["year_column"] = args.year_column
         if engine == "ndvi":
@@ -243,6 +245,10 @@ def add_parsers(sub, common) -> None:
                 "--merge", action="store_true", help="treat the files as one area"
             )
             p.add_argument("--year-column", help="the column of per-row years")
+        if engine == "gvi":
+            p.add_argument(
+                "--shards", type=int, metavar="N", help="split into N jobs + a merge"
+            )
         if engine == "ndvi":
             p.add_argument(
                 "--range", action="append", metavar="START:END", help="a date range"

@@ -74,7 +74,7 @@ _COMMON_INPUTS = ("name", "preset", "output_dir", "depends_on")
 INPUTS: dict[str, tuple[str, ...]] = {
     "ndvi": _COMMON_INPUTS
     + ("study_area", "merge", "ranges", "specific_dates", "year_column"),
-    "gvi": _COMMON_INPUTS + ("study_area", "merge", "year_column"),
+    "gvi": _COMMON_INPUTS + ("study_area", "merge", "year_column", "shards"),
     "fusion": _COMMON_INPUTS
     + (
         "target",
@@ -530,7 +530,10 @@ def _gvi_inputs(raw: dict, settings: dict, base: Path) -> dict:
             raise RunFileError("capture_mode 'column' needs 'year_column'.")
     elif column is not None:
         raise RunFileError("'year_column' is only read when capture_mode is 'column'.")
-    return {**out, "year_column": column}
+    shards = raw.get("shards", 1)
+    if isinstance(shards, bool) or not isinstance(shards, int) or shards < 1:
+        raise RunFileError(f"'shards' must be a whole number from 1, not {shards!r}.")
+    return {**out, "year_column": column, "shards": shards}
 
 
 def parse_reference(value: Any) -> Reference | None:

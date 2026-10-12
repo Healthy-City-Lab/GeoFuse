@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, timedelta
 from typing import Any
 
@@ -241,6 +241,38 @@ def _expand_ndvi(step: _rf.Step, today: date) -> list[JobSpec]:
     return specs
 
 
+def _shard(specs: list[JobSpec], step: _rf.Step) -> list[JobSpec]:
+    """``shards = N``: each job becomes N shard jobs (the sub-step
+    ``<step>:shards``) and a merge job, under the step's own key, that waits
+    for them and writes the step's outputs."""
+    count = int(step.inputs.get("shards") or 1)
+    if count < 2:
+        return specs
+    sub_step = f"{step.key}:shards"
+    shards = [
+        replace(
+            spec,
+            step=sub_step,
+            name=f"{spec.name} [{i + 1}/{count}]",
+            options={**spec.options, "shard": [i, count]},
+            outputs={},
+        )
+        for spec in specs
+        for i in range(count)
+    ]
+    merges = [
+        replace(
+            spec,
+            kind="gvi_merge",
+            options={**spec.options, "shards": count, "of": spec.kind},
+            depends_on=[sub_step, *spec.depends_on],
+            resources=[],
+        )
+        for spec in specs
+    ]
+    return shards + merges
+
+
 def _expand_gvi(step: _rf.Step, today: date) -> list[JobSpec]:
     s, out = step.settings, step.output_dir
     mode = s["capture_mode"]
@@ -285,7 +317,7 @@ def _expand_gvi(step: _rf.Step, today: date) -> list[JobSpec]:
                 outputs=outputs,
             )
         )
-    return specs
+    return _shard(specs, step)
 
 
 def _target_info(path: str, layer) -> dict:
@@ -710,6 +742,9 @@ def _build_gvi(
         "pano_cache_db_path": pano_cache_db_path,
     }
     init_args = {"model_path": model_path, "api_key": api_key}
+    if o.get("shard"):
+        capture_args["shard"] = list(o["shard"])
+        common["shard"] = list(o["shard"])
     if o["mode"] == "column":
         params = {**common, "mode": "column", "date_column": o["date_column"]}
         kwargs = {
@@ -752,6 +787,31 @@ def _build_gvi(
     }
     return Submission(
         "gvi", os.path.splitext(out_fname)[0], params, "submit_gvi_subprocess", kwargs
+    )
+
+
+def _build_gvi_merge(spec: JobSpec, **build_args) -> Submission:
+    """The merge of a sharded GVI step: the GVI job's inputs, read again."""
+    o = spec.options
+    gvi = _build_gvi(replace(spec, kind=o["of"]), **build_args)
+    kw = gvi.kwargs
+    kwargs = {
+        "fname": kw["fname"],
+        "dataset_data": {
+            "raw": kw["dataset_data"]["raw"],
+            "type": kw["dataset_data"]["type"],
+        },
+        "run_args": kw["run_args"],
+        "output_dir": spec.output_dir,
+        "shards": int(o["shards"]),
+        "date_column": o.get("date_column"),
+        "save_gpkg": kw["save_gpkg"],
+        "save_geotiff": kw["save_geotiff"],
+        "save_geojson": kw["save_geojson"],
+    }
+    params = {**gvi.params, "shards": int(o["shards"])}
+    return Submission(
+        "gvi_merge", gvi.record_name, params, "submit_gvi_merge_subprocess", kwargs
     )
 
 
@@ -1022,11 +1082,12 @@ def build(
     """
     if spec.kind in ("ndvi", "ndvi_column"):
         return _build_ndvi(spec, ee_project)
-    if spec.kind in ("gvi", "gvi_column"):
+    if spec.kind in ("gvi", "gvi_column", "gvi_merge"):
         from geofuse.persistence.caches import pano_db
 
         key = api_key if spec.settings["download_mode"] == "api" else None
-        return _build_gvi(
+        builder = _build_gvi_merge if spec.kind == "gvi_merge" else _build_gvi
+        return builder(
             spec,
             model_path=model_path or DEFAULT_MODEL_PATH,
             api_key=key,
