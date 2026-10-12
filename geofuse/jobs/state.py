@@ -235,6 +235,26 @@ class StateDir:
     def read_control(self, job_id: str) -> dict:
         return read_json(self.job_dir(job_id) / "control.json", {}) or {}
 
+    def control(self, job_id: str, **flags: bool) -> str:
+        """Pause / resume / cancel ``job_id`` as a client; returns what
+        happened. A cancel of a job no supervisor has taken settles it here,
+        and claims it so none starts it later; anything else is a request the
+        owner applies."""
+        job = self.job(job_id)
+        if job is None or job.state in TERMINAL:
+            return f"already {job.state if job else 'gone'}"
+        if (
+            flags.get("cancel")
+            and self.owner(job_id) is None
+            and self.claim(job_id, "client")
+        ):
+            self.write_status(
+                job_id, {**job.status, "status": "cancelled", "owner": "client"}
+            )
+            return "cancelled"
+        self.request(job_id, **flags)
+        return f"{', '.join(k for k, v in flags.items() if v) or 'resume'} requested"
+
     def job_ids(self) -> list[str]:
         if not self.jobs_dir.is_dir():
             return []

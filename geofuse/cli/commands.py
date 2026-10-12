@@ -381,22 +381,7 @@ def _control(args, **flags) -> int:
             raise CliError("Name the job(s), or use --all.")
         ids = _resolve(state, args.jobs)
     for job_id in ids:
-        job = state.job(job_id)
-        if job is None or job.state in TERMINAL:
-            print(f"{job_id}: already {job.state if job else 'gone'}")
-            continue
-        if flags.get("cancel") and state.owner(job_id) is None:
-            # Nobody has taken it yet: settle it here, and claim it so no
-            # supervisor starts it later.
-            if state.claim(job_id, "client"):
-                state.write_status(
-                    job_id, {**job.status, "status": "cancelled", "owner": "client"}
-                )
-                print(f"{job_id}: cancelled")
-                continue
-        state.request(job_id, **flags)
-        print(f"{job_id}: {', '.join(k for k, v in flags.items() if v) or 'resume'}"
-              " requested")
+        print(f"{job_id}: {state.control(job_id, **flags)}")
     return EXIT_OK
 
 
