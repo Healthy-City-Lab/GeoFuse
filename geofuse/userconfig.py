@@ -15,10 +15,14 @@
     fusion = 1
     idle_minutes = 10
 
+    [credentials]
+    store = "auto"                      # auto | keyring | file
+
 The file lives in the per-user configuration folder (``%LOCALAPPDATA%\\geofuse``
 on Windows, ``~/.config/geofuse`` on Linux, Application Support on macOS).
 Every key is optional and defaults to the values above. Credentials are not
-kept here; see ``geofuse credentials``.
+kept here; ``[credentials] store`` only picks where ``geofuse credentials``
+keeps them (see ``geofuse.credentials``).
 """
 
 from __future__ import annotations
@@ -40,9 +44,12 @@ LIMIT_DEFAULTS: dict[str, int] = {
     "fusion": 1,
     "idle_minutes": 10,
 }
+#: Where credentials are kept: the OS keyring when one works, or a file.
+CREDENTIAL_STORES = ("auto", "keyring", "file")
 _TABLES = {
     "earthengine": {"project": str},
     "limits": dict.fromkeys(LIMIT_DEFAULTS, int),
+    "credentials": {"store": str},
 }
 
 
@@ -69,6 +76,7 @@ class Config:
     ee_project: str | None = None
     limits: dict[str, int] = field(default_factory=lambda: dict(LIMIT_DEFAULTS))
     remotes: dict[str, dict] = field(default_factory=dict)
+    credential_store: str = "auto"
     path: Path | None = None
 
 
@@ -100,10 +108,17 @@ def _check(doc: dict) -> None:
                     raise ConfigError(f"'{key}.{sub}' must be a whole number from 1.")
                 if kind is str and (not isinstance(sub_value, str) or not sub_value):
                     raise ConfigError(f"'{key}.{sub}' must be text.")
+            store = value.get("store") if key == "credentials" else None
+            if store is not None and store not in CREDENTIAL_STORES:
+                raise ConfigError(
+                    "'credentials.store' must be one of: "
+                    + ", ".join(CREDENTIAL_STORES)
+                    + "."
+                )
         else:
             raise ConfigError(
                 f"Unknown key '{key}' (known: state_dir, earthengine, limits, "
-                "remotes)."
+                "credentials, remotes)."
             )
 
 
@@ -132,6 +147,7 @@ def load(path: str | os.PathLike | None = None) -> Config:
         ee_project=(doc.get("earthengine") or {}).get("project"),
         limits=limits,
         remotes=dict(doc.get("remotes") or {}),
+        credential_store=(doc.get("credentials") or {}).get("store", "auto"),
         path=path,
     )
 

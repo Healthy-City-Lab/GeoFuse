@@ -52,6 +52,7 @@ class UserConfigTests(unittest.TestCase):
             ("[limits]\ngpus = 2\n", "limits.gpus"),
             ("[limits]\ngpu = 0\n", "limits.gpu"),
             ("[earthengine]\nproject = 3\n", "earthengine.project"),
+            ('[credentials]\nstore = "vault"\n', "credentials.store"),
         ):
             self.path.write_text(text, encoding="utf-8")
             with self.assertRaisesRegex(ConfigError, key):

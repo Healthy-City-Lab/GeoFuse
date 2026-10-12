@@ -102,11 +102,12 @@ def submit_specs(
 
 
 def _streetview_key() -> str | None:
+    from geofuse import credentials
+
     try:
-        from geofuse import credentials
-    except ImportError:
+        return credentials.get("streetview-key")
+    except credentials.CredentialError:
         return None
-    return credentials.get("streetview-key")
 
 
 class Supervisor:
