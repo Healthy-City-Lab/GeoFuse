@@ -392,7 +392,7 @@ class TabParityTests(_Case):
             f.write(_STUB)
         sys.modules.pop("gf_parity_stub", None)
 
-    def click(self, tab, seed, call, button, numbers=None):
+    def click(self, tab, seed, call, button, numbers=None, selects=None):
         from streamlit.testing.v1 import AppTest
 
         path = os.path.join(self.dir, "app.py")
@@ -407,7 +407,9 @@ class TabParityTests(_Case):
         self.assertFalse(at.exception, [e.value for e in at.exception])
         for key, value in (numbers or {}).items():
             at.number_input(key=key).set_value(value)
-        if numbers:
+        for key, value in (selects or {}).items():
+            at.selectbox(key=key).set_value(value)
+        if numbers or selects:
             at.run()
         at.button(key=button).click()
         at.run()
@@ -479,6 +481,7 @@ class TabParityTests(_Case):
             f"gvi.render({self.out!r}, {ROOT!r})",
             "gvi_run_analysis",
             numbers={f"gvi_{k}": v for k, v in sizing.items()},
+            selects={"gvi_precision": "fp32"},
         )
         (spec,) = self.expand(
             f"""
@@ -488,8 +491,10 @@ class TabParityTests(_Case):
             download_concurrency = 8
             batch_size = 4
             batch_wait_ms = 50
+            precision = "fp32"
             """
         )
+        sizing["precision"] = "fp32"
         self.assertEqual({k: gui[3]["run_args"][k] for k in sizing}, sizing)
         self.assert_same(gui, plans.build(spec))
 

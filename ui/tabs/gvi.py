@@ -316,6 +316,7 @@ _GVI_THROUGHPUT_WIDGETS = {
     "batch_size": ("GPU Batch Size", 1),
     "batch_wait_ms": ("Batch Wait (ms)", 10),
 }
+_GVI_PRECISION_LABELS = {"fp16": "FP16 (faster)", "fp32": "FP32 (matches earlier runs)"}
 # Preset capture setting -> (layer config key, widget key pattern).
 _GVI_PRESET_CAPTURE_KEYS = {
     "capture_mode": ("mode", "gvi_mode_{}"),
@@ -1146,6 +1147,17 @@ def _render_gvi_settings_map() -> None:
                         key=f"gvi_{name}",
                         help=spec.help,
                     )
+                st.selectbox(
+                    "GPU Precision",
+                    list(_GVI_SETTINGS["precision"].choices),
+                    format_func=_GVI_PRECISION_LABELS.get,
+                    key="gvi_precision",
+                    help=(
+                        "FP16 runs the model about twice as fast and changes the "
+                        "class of about 3 pixels in 10,000. FP32 repeats the masks "
+                        "of runs made before FP16 became the default."
+                    ),
+                )
     with fc_gvi_r:
         st.subheader("Study Area Preview")
         show_sampling_grid = st.session_state.get("gvi_preview_sampling_grid", False)
