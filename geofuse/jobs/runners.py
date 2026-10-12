@@ -58,6 +58,7 @@ from geofuse.jobs.fusion_outputs import (
     _negative_control_report,
     _posterior_summary,
     _write_fusion_outputs,
+    write_entity_table,
 )
 from geofuse.jobs.stage_ledger import DONE, FAILED, RUNNING, SKIPPED
 from geofuse.logger import get_logger
@@ -2213,6 +2214,25 @@ def run_fusion(
                 value=prog_ledger(), status_text=f"{prefix}Applying fusion weights..."
             )
             composite_df = engine.apply_fusion()
+            # One row per target entity, written now so it survives the
+            # process boundary (the live frame does not).
+            entity_table_path: str | None = None
+            try:
+                entity_table_path = write_entity_table(
+                    engine,
+                    composite_df,
+                    os.path.join(
+                        job_artifacts_root,
+                        (
+                            f"composite_entities__{_STUDY_NAME_UNSAFE.sub('_', label)}"
+                            if multi_outcome
+                            else "composite_entities"
+                        ),
+                    ),
+                )
+                output_paths.append(entity_table_path)
+            except Exception as exc:
+                _log_fusion("WARN", f"[{label}] Per-entity table not written: {exc}")
             stage(skey("apply"), DONE)
 
             # ── Post-hoc multi-metric reporting ─────────
@@ -2719,6 +2739,7 @@ def run_fusion(
                 "standalones": standalones_bundle,
                 "artifacts_dir": job_artifacts_root,
                 "composite_path": cgi_composite_path,
+                "entity_table_path": entity_table_path,
                 "report_dir": report_dir,
                 # ``None`` when the collinearity check wasn't requested.
                 "collinearity_report": getattr(engine, "_collinearity_report", None),
