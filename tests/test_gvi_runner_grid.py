@@ -105,6 +105,29 @@ class RunnerGridTests(unittest.TestCase):
         self.run_gvi(raw, "point", 100, processed=given)
         self.assertEqual(len(self.engine.points), 2)
 
+    def test_no_panorama_anywhere_finishes_without_outputs(self):
+        class _Empty:
+            def run_analysis(self, gdf, **_kw):
+                pass
+
+        raw = gpd.GeoDataFrame(geometry=[Point(-114.07, 51.04)], crs="EPSG:4326")
+        with mock.patch.object(runners, "_get_gvi_engine", return_value=_Empty()):
+            out = runners.run_gvi(
+                _Ctx(),
+                fname="site.gpkg",
+                dataset_data={"raw": raw, "type": "point", "processed": None,
+                              "accumulated": [], "cache_ref": {}},
+                init_args={"model_path": "m.pth"},
+                run_args={"step": 50, "buffer": 0, "save_panos": False,
+                          "save_masks": False},
+                output_dir=self.tmp.name,
+                save_geotiff=False,
+                save_geojson=False,
+                gpu_lock=threading.Lock(),
+            )
+        self.assertEqual(out, {"output_paths": []})
+        self.assertEqual(os.listdir(self.tmp.name), [])
+
     def test_the_helper_matches_the_tab_s_rule(self):
         raw = gpd.GeoDataFrame(geometry=[Point(-114.07, 51.04)], crs="EPSG:4326")
         points, meta = gvi_sampling_points(raw, False, 0, 50)

@@ -215,6 +215,15 @@ def run_gvi(
     if ctx.is_cancelled():
         return {"output_paths": []}
 
+    if not dataset_data["accumulated"]:
+        _log_gvi(
+            "WARN",
+            f"No panorama found at any of the {n_points:,} sampling points; "
+            "no outputs written.",
+        )
+        ctx.progress(value=1.0, status_text="No panoramas found")
+        return {"output_paths": []}
+
     ctx.progress(value=1.0, status_text="Writing outputs")
 
     # A specific-year run carries its year in the name, so runs of one layer
