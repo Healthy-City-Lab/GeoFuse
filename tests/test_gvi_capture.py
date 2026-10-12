@@ -329,11 +329,14 @@ class RestartReplayTests(unittest.TestCase):
             "**Capture months:** May–Oct (outside as fallback)",
             gvi_tab._gvi_restart_summary_lines(p),
         )
+        sizing = {"download_concurrency": 16, "batch_size": 1, "batch_wait_ms": 20}
         self.assertEqual(
-            gvi_tab._capture_args(p), {"month_window": [5, 10], "month_policy": "prefer"}
+            gvi_tab._capture_args(p),
+            {"month_window": [5, 10], "month_policy": "prefer", **sizing},
         )
         self.assertEqual(
-            gvi_tab._capture_args({}), {"month_window": None, "month_policy": "exclude"}
+            gvi_tab._capture_args({}),
+            {"month_window": None, "month_policy": "exclude", **sizing},
         )
         self.assertIn("**Capture months:** any", gvi_tab._gvi_restart_summary_lines({}))
 

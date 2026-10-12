@@ -49,6 +49,7 @@ class _Engine:
     """Samples every point from its grid position; every seventh has none."""
 
     def run_analysis(self, gdf, *, result_callback, target_year=None, **_kw):
+        self.last_run_stats = {"points": len(gdf), "segmented": len(gdf)}
         for idx, pt in gdf.iterrows():
             row, col = int(pt.get("row", 0)), int(pt.get("col", 0))
             sampled = (row + col) % 7 != 0
@@ -143,10 +144,13 @@ class _Case(unittest.TestCase):
         self.assertEqual(len(a_tab), len(b_tab))
         self.assertTrue(a_tab.equals(b_tab))
         self.assertTrue(a_geo.geom_equals_exact(b_geo, 1e-9).all())
+        # Run timings differ by nature; everything else must match.
         with open(os.path.join(a_dir, f"{name}_gvi.json")) as f:
             a_side = json.load(f)
         with open(os.path.join(b_dir, f"{name}_gvi.json")) as f:
             b_side = json.load(f)
+        a_side.pop("throughput", None)
+        b_side.pop("throughput", None)
         self.assertEqual(a_side, b_side)
         a_tiles = os.path.join(a_dir, f"{name}_gvi_tiles")
         b_tiles = os.path.join(b_dir, f"{name}_gvi_tiles")
@@ -183,6 +187,12 @@ class MergeTests(_Case):
             self.assertTrue(any(p.endswith(".json") for p in out["output_paths"]))
         merged = _merge(raw, self.split)
         self.assertIn(os.path.join(self.split, "site_gvi.gpkg"), merged["output_paths"])
+        with open(os.path.join(self.split, "site_gvi.json")) as f:
+            shards = json.load(f)["throughput"]["shards"]
+        self.assertEqual([s["shard"] for s in shards], [1, 2, 3])
+        with open(os.path.join(self.whole, "site_gvi.json")) as f:
+            whole = json.load(f)["throughput"]
+        self.assertEqual(sum(s["points"] for s in shards), whole["points"])
         self.assert_same_outputs(self.whole, self.split, "site")
         self.assertFalse([n for n in os.listdir(self.split) if ".shard" in n])
 

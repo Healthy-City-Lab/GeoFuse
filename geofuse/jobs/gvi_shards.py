@@ -44,9 +44,11 @@ def write_shard(
     stem: str,
     shard,
     points: int,
+    throughput: list | None = None,
 ) -> list[str]:
     """Keep one shard's raw results: ``{name}.{label}.gpkg`` for each result
-    set that has rows, and the manifest ``{stem}.{label}.json``."""
+    set that has rows, and the manifest ``{stem}.{label}.json`` (with the
+    engine's stage counts of each run, ``throughput``)."""
     label = shard_label(shard)
     os.makedirs(folder, exist_ok=True)
     written, counts = [], {}
@@ -65,6 +67,7 @@ def write_shard(
             "shards": int(shard[1]),
             "points": int(points),
             "results": counts,
+            "throughput": [t for t in throughput or [] if t],
         }
         json.dump(record, f, indent=2)
     return [*written, manifest]
@@ -110,6 +113,23 @@ def read_shards(folder: str, stem: str, shards: int) -> dict[str, tuple[list, ob
     return merged
 
 
+def shard_throughput(folder: str, stem: str, shards: int) -> list[dict]:
+    """Every shard's recorded stage counts, shard by shard."""
+    found = []
+    for i in range(shards):
+        path = _manifest(folder, stem, shard_label((i, shards)))
+        with open(path, encoding="utf-8") as f:
+            record = json.load(f)
+        for stats in record.get("throughput") or []:
+            found.append({"shard": record["shard"], **stats})
+    return found
+
+
+def _throughput(folder: str, stem: str, shards: int) -> dict | None:
+    found = shard_throughput(folder, stem, shards)
+    return {"shards": found} if found else None
+
+
 def remove_shards(folder: str, stem: str, names, shards: int) -> None:
     for i in range(shards):
         label = shard_label((i, shards))
@@ -153,6 +173,7 @@ def run_gvi_merge(
         base = os.path.splitext(fname)[0]
         folder = os.path.join(output_dir, f"{base}_temporal_gvi")
         merged = read_shards(folder, f"{base}_gvi", shards)
+        throughput = _throughput(folder, f"{base}_gvi", shards)
         gdf_4326, years, grid_crs = runners.column_years(raw, date_column)
         outputs: list[str] = [folder]
         for year in years:
@@ -169,6 +190,7 @@ def run_gvi_merge(
                 out_name=f"{base}_{year}",
                 output_dir=folder,
                 capture=runners._capture_settings("column", year, run_args),
+                throughput=throughput,
                 **write,
             )
             outputs.extend(paths)
@@ -177,6 +199,7 @@ def run_gvi_merge(
         out_name = runners.gvi_output_name(fname, run_args)
         stem = f"{out_name}_gvi"
         merged = read_shards(output_dir, stem, shards)
+        throughput = _throughput(output_dir, stem, shards)
         records, crs = merged.get(stem, ([], None))
         outputs = []
         if not records:
@@ -195,6 +218,7 @@ def run_gvi_merge(
                 capture=runners._capture_settings(
                     "recent" if target_year is None else "year", target_year, run_args
                 ),
+                throughput=throughput,
                 **write,
             )
         remove_shards(output_dir, stem, merged, shards)

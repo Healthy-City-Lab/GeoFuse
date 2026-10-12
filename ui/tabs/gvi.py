@@ -37,6 +37,7 @@ from streamlit_folium import st_folium
 
 from geofuse.crs_utils import reproject_geodataframe_to_wgs84
 from geofuse.settings import GVI as _GVI_SETTINGS
+from geofuse.settings import GVI_THROUGHPUT as _GVI_THROUGHPUT
 from geofuse.settings import defaults as _settings_defaults
 from geofuse.vector_io import geometry_sha256
 
@@ -273,13 +274,17 @@ _MONTH_POLICY_LABELS = {
 
 
 def _capture_args(p: dict) -> dict:
-    """Month-window settings recorded on a GVI job (``None`` window = off),
-    plus the preset the job came from, when there was one."""
+    """Month-window settings recorded on a GVI job (``None`` window = off), the
+    download / GPU sizing (defaults when absent), and the preset the job came
+    from, when there was one."""
     window = p.get("month_window")
     args = {
         "month_window": list(window) if window else None,
         "month_policy": str(p.get("month_policy") or "exclude"),
     }
+    for key in _GVI_THROUGHPUT:
+        value = p.get(key)
+        args[key] = int(_GVI_DEFAULTS[key] if value is None else value)
     if p.get("preset"):
         args["preset"] = p["preset"]
     return args
@@ -1495,6 +1500,10 @@ def render(output_dir: str, parent_dir: str) -> None:
                         ),
                         "month_policy": cfg.get("month_policy", "exclude"),
                         "preset": st.session_state.get("_gvi_preset_in_force"),
+                        **{
+                            key: st.session_state.get(f"gvi_{key}")
+                            for key in _GVI_THROUGHPUT
+                        },
                     }
                 )
 

@@ -217,6 +217,9 @@ def run_gvi(
         pause_callback=check_pause,
         month_window=_month_window(run_args),
         month_policy=run_args.get("month_policy") or "exclude",
+        download_concurrency=run_args.get("download_concurrency"),
+        batch_size=run_args.get("batch_size"),
+        batch_wait_ms=run_args.get("batch_wait_ms"),
     )
 
     if ctx.is_cancelled():
@@ -233,6 +236,7 @@ def run_gvi(
             f"{out_name}_gvi",
             shard,
             n_points,
+            throughput=[getattr(engine, "last_run_stats", None)],
         )
         ctx.progress(value=1.0, status_text="Shard written; the merge job finishes it")
         return {"output_paths": paths}
@@ -261,6 +265,7 @@ def run_gvi(
         capture=_capture_settings(
             "recent" if target_year is None else "year", target_year, run_args
         ),
+        throughput=getattr(engine, "last_run_stats", None),
     )
     dataset_data["results"] = res_df
     return {"output_paths": output_paths}
@@ -285,6 +290,7 @@ def _write_gvi_outputs(
     save_geotiff: bool,
     save_geojson: bool,
     capture: dict | None = None,
+    throughput: dict | None = None,
 ) -> tuple[list[str], gpd.GeoDataFrame]:
     """Write a GVI result set (GeoPackage / GeoJSON / per-cluster GeoTIFF).
 
@@ -423,6 +429,7 @@ def _write_gvi_outputs(
                     "choice_name": meta.get("choice_name"),
                     "n_clusters": len(clusters),
                     **capture_summary,
+                    **({"throughput": throughput} if throughput else {}),
                 },
                 f,
                 indent=2,
@@ -617,6 +624,7 @@ def run_gvi_column(
 
     done_points = 0
     shard_results: dict[str, list] = {}
+    shard_stats: list = []
     for idx, (year, pts, meta) in enumerate(plans):
         if ctx.is_cancelled():
             return {"output_paths": output_paths}
@@ -664,12 +672,16 @@ def run_gvi_column(
             pause_callback=check_pause,
             month_window=_month_window(run_args),
             month_policy=run_args.get("month_policy") or "exclude",
+            download_concurrency=run_args.get("download_concurrency"),
+            batch_size=run_args.get("batch_size"),
+            batch_wait_ms=run_args.get("batch_wait_ms"),
         )
         done_points += len(pts)
         if ctx.is_cancelled():
             return {"output_paths": output_paths}
         if shard:
             shard_results[f"{base_name}_{year}_gvi"] = accumulated
+            shard_stats.append(getattr(engine, "last_run_stats", None))
             continue
         if not accumulated:
             _log_gvi("WARN", f"Year {year}: no results produced.")
@@ -685,6 +697,7 @@ def run_gvi_column(
             save_geotiff=save_geotiff,
             save_geojson=save_geojson,
             capture=_capture_settings("column", year, run_args),
+            throughput=getattr(engine, "last_run_stats", None),
         )
         output_paths.extend(paths)
 
@@ -694,7 +707,13 @@ def run_gvi_column(
         crs = plans[0][1].crs if plans else "EPSG:4326"
         output_paths.extend(
             write_shard(
-                shard_results, crs, job_folder, f"{base_name}_gvi", shard, total_points
+                shard_results,
+                crs,
+                job_folder,
+                f"{base_name}_gvi",
+                shard,
+                total_points,
+                throughput=shard_stats,
             )
         )
         ctx.progress(value=1.0, status_text="Shard written; the merge job finishes it")

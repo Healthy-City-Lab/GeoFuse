@@ -223,7 +223,19 @@ GVI: dict[str, Setting] = {
     "month_policy": _choice(
         "exclude", ("exclude", "prefer"), "Outside the window: drop, or last resort."
     ),
+    "download_concurrency": _int(
+        16, 1, 64, "Panoramas downloaded at once (Google's throttle still applies)."
+    ),
+    "batch_size": _int(
+        1, 1, 32, "Images per GPU forward; 1 gives image-by-image results exactly."
+    ),
+    "batch_wait_ms": _int(
+        20, 0, 2000, "Longest wait for a GPU batch to fill, in milliseconds."
+    ),
 }
+
+#: GVI settings that size the download pool and the GPU batches.
+GVI_THROUGHPUT = ("download_concurrency", "batch_size", "batch_wait_ms")
 
 # ────────────────────────────────────────────────────────────────────
 # Fusion
