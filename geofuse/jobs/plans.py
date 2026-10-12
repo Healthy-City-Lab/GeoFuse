@@ -31,6 +31,13 @@ from geofuse.vector_io import sanitize_name_for_file
 # The fusion tab never downloads metrics itself; it records this window.
 _FUSION_NDVI_WINDOW = ("2023-06-01", "2023-09-30")
 
+#: The segmentation model GVI jobs load, as the GVI tab does.
+DEFAULT_MODEL_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "model",
+    "best_model.pth",
+)
+
 
 class PlanError(ValueError):
     """A run file whose jobs cannot be laid out, with the reason."""
@@ -1016,13 +1023,10 @@ def build(
     if spec.kind in ("ndvi", "ndvi_column"):
         return _build_ndvi(spec, ee_project)
     if spec.kind in ("gvi", "gvi_column"):
-        if model_path is None:
-            repo = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-            model_path = os.path.join(repo, "geofuse", "model", "best_model.pth")
         key = api_key if spec.settings["download_mode"] == "api" else None
         return _build_gvi(
             spec,
-            model_path=model_path,
+            model_path=model_path or DEFAULT_MODEL_PATH,
             api_key=key,
             pano_cache_db_path=pano_cache_db_path,
         )

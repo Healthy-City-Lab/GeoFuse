@@ -13,6 +13,9 @@
     geofuse rm JOB... | --finished
     geofuse config template | validate | show | set | unset
     geofuse supervisor [--stop]     the shared background supervisor
+    geofuse credentials show | set | remove
+    geofuse auth earthengine        sign in (stored in the credential store)
+    geofuse doctor                  check this machine is ready to run jobs
 
 Every setting is also a flag (``--cloud-max 20``, ``--no-water-mask``) that
 overrides every step having that setting; ``--set ENGINE[.STEP].KEY=VALUE``
@@ -679,6 +682,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--stop", action="store_true", help="cancel its jobs and stop it")
     p.add_argument("--daemon", action="store_true", help=argparse.SUPPRESS)
     p.set_defaults(func=cmd_supervisor)
+
+    from geofuse.cli import account
+
+    account.add_parsers(sub, common)
     return parser
 
 
