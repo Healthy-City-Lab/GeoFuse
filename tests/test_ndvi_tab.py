@@ -10,8 +10,10 @@ import os
 import sys
 import tempfile
 import textwrap
+import types
 import unittest
 from datetime import date
+from unittest import mock
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 for _p in (os.path.join(ROOT, "ui"), ROOT):
@@ -144,6 +146,52 @@ class ResubmitTests(unittest.TestCase):
             (kw["water_mask"], kw["cloud_handling"], kw["reflectance"], kw["substitute_2012"]),
             (False, "scene_filter", "surface", False),
         )
+
+
+class _State(dict):
+    """``st.session_state`` stand-in: item and attribute access."""
+
+    __getattr__ = dict.__getitem__
+
+    def __setattr__(self, key, value):
+        self[key] = value
+
+
+class SingleFileRestartTests(unittest.TestCase):
+    """The restart panel replays a job's own window in every date mode."""
+
+    def _restart(self, **params):
+        params = {"fname": "site.geojson", **params}
+        rec = types.SimpleNamespace(id="job1", type="ndvi", name="site", params=params)
+        store, executor = _Store(), _Executor()
+        store.get = lambda _id: rec
+        panel = {}
+        state = _State({ndvi_tab.RESTART_SESSION_KEY: "job1"})
+        with (
+            mock.patch.object(ndvi_tab, "st", mock.MagicMock(session_state=state)),
+            mock.patch.object(
+                ndvi_tab,
+                "render_job_restart_panel",
+                side_effect=lambda _rec, **kw: panel.update(kw),
+            ),
+        ):
+            ndvi_tab._render_ndvi_restart_panel(store, executor, "out")
+            panel["on_confirm"](_raw(), "site.geojson", {})
+        self.assertEqual(len(store.submitted), 1)
+        kw = executor.calls[0][1]
+        return kw["start_date"], kw["end_date"]
+
+    def test_specific_date_job_replays_its_window(self):
+        window = self._restart(
+            mode="specific", target_date="2023-07-15", window_days=30
+        )
+        self.assertEqual(window, ("2023-06-15", "2023-08-14"))
+
+    def test_range_job_replays_its_dates(self):
+        window = self._restart(
+            mode="range", start_date="2023-06-01", end_date="2023-09-30"
+        )
+        self.assertEqual(window, ("2023-06-01", "2023-09-30"))
 
 
 class DateConfigPickerTests(unittest.TestCase):

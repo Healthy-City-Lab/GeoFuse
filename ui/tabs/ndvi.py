@@ -401,6 +401,22 @@ def _ndvi_restart_summary_lines(p: dict) -> list[str]:
     return lines
 
 
+def _ndvi_job_window(p: dict) -> tuple[str, str]:
+    """``(start, end)`` of a range or specific-date job, end included.
+
+    Specific-date jobs store the date of interest and the ± window, not the
+    dates; the end is capped at today, as when the job was first submitted.
+    """
+    if p.get("mode") == "specific":
+        td = date.fromisoformat(p["target_date"])
+        w = int(p.get("window_days", 30))
+        return (
+            (td - timedelta(days=w)).isoformat(),
+            min(td + timedelta(days=w), date.today()).isoformat(),
+        )
+    return str(p["start_date"]), str(p["end_date"])
+
+
 def _ndvi_resubmit_from_params(store, executor, output_dir, rec_id, p, raw):
     """Resubmit an NDVI job from stored params + a (re)merged layer."""
     dataset_data = {"raw": raw}
@@ -442,14 +458,7 @@ def _ndvi_resubmit_from_params(store, executor, output_dir, rec_id, p, raw):
             **options,
         )
     else:
-        if p.get("mode") == "specific":
-            td = date.fromisoformat(p["target_date"])
-            w = int(p.get("window_days", 30))
-            start_d = (td - timedelta(days=w)).isoformat()
-            end_d = min(td + timedelta(days=w), date.today()).isoformat()
-        else:  # range
-            start_d = p["start_date"]
-            end_d = p["end_date"]
+        start_d, end_d = _ndvi_job_window(p)
         record = store.submit(type="ndvi", name=rec_name, params=new_params)
         executor.submit_ndvi_subprocess(
             record,
@@ -618,6 +627,7 @@ def _render_ndvi_restart_panel(store, executor, output_dir) -> None:
         new_params["geometry_sha256"] = geometry_sha256(gdf)
         new_params["restart_of"] = rec.id
         new_params["fname"] = fname
+        window = _ndvi_job_window(p) if rec.type == "ndvi" else None
 
         base_name = os.path.splitext(fname)[0]
         record = store.submit(type=rec.type, name=base_name, params=new_params)
@@ -635,11 +645,11 @@ def _render_ndvi_restart_panel(store, executor, output_dir) -> None:
             **_job_options(p),
         }
 
-        if rec.type == "ndvi":
+        if window is not None:
             executor.submit_ndvi_subprocess(
                 record,
-                start_date=str(p.get("start_date", "")),
-                end_date=str(p.get("end_date", "")),
+                start_date=window[0],
+                end_date=window[1],
                 output_name=str(p.get("output_name", base_name)),
                 save_cluster_tiles=bool(p.get("save_cluster_tiles", False)),
                 **common,
