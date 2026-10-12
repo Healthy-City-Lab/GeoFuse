@@ -6,6 +6,7 @@
     geofuse run RUN.toml            run it here until it ends (batch scripts)
     geofuse plan RUN.toml           show the jobs it becomes; run nothing
     geofuse status [JOB...]         where every job is
+    geofuse watch                   full-screen monitor (jobs keep running on quit)
     geofuse logs JOB [-f]           a job's log
     geofuse pause | resume | cancel JOB... | --all
     geofuse wait JOB... | --run RUN
@@ -250,8 +251,8 @@ def cmd_submit(args) -> int:
         raise CliError(str(exc), EXIT_ENVIRONMENT) from exc
     print(_table([state.job(i) for i in ids]))
     print(
-        f"\nSubmitted {len(ids)} job(s). Follow with: geofuse status  "
-        "(or geofuse logs JOB -f)"
+        f"\nSubmitted {len(ids)} job(s). Follow them with: geofuse watch  "
+        "(or geofuse status, geofuse logs JOB -f)"
     )
     return EXIT_OK
 
@@ -338,6 +339,19 @@ def cmd_status(args) -> int:
         f"\nState folder: {state.root} · supervisor: "
         + (f"running (pid {daemon.get('pid')})" if daemon else "not running")
     )
+    return EXIT_OK
+
+
+def cmd_watch(args) -> int:
+    try:
+        from geofuse.cli.watch import LocalSource, WatchApp
+    except ImportError as exc:
+        raise CliError(
+            f"geofuse watch needs the textual package ({exc}); install it with "
+            "`pip install textual`, or use geofuse status.",
+            EXIT_ENVIRONMENT,
+        ) from exc
+    WatchApp(LocalSource(_state(args)), run=args.run, active_only=args.active).run()
     return EXIT_OK
 
 
@@ -610,6 +624,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=0, help="only the newest N")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("watch", help="full-screen monitor: follow and manage jobs")
+    p.add_argument("--run", help="only this run's jobs")
+    p.add_argument("--active", action="store_true", help="start with unfinished jobs")
+    p.set_defaults(func=cmd_watch)
 
     p = sub.add_parser("logs", help="a job's log")
     p.add_argument("job")
