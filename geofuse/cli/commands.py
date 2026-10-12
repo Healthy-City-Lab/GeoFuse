@@ -210,7 +210,13 @@ def _table(jobs) -> str:
 
 def cmd_plan(args) -> int:
     run, specs = _load(args)
-    if args.json:
+    return show_plan(run, specs, as_json=args.json)
+
+
+def show_plan(run, specs, *, as_json: bool = False) -> int:
+    """Print the jobs ``run`` becomes, with the settings that differ from the
+    defaults."""
+    if as_json:
         print(json.dumps([s.to_dict() for s in specs], indent=1))
         return EXIT_OK
     defaults = {e: _settings.defaults(e) for e in _settings.SCHEMAS}
@@ -245,9 +251,13 @@ def cmd_plan(args) -> int:
 
 
 def cmd_submit(args) -> int:
+    return submit(args, *_load(args))
+
+
+def submit(args, run, specs) -> int:
+    """Hand ``specs`` to the shared supervisor, starting it if needed."""
     from geofuse.jobs.supervisor import start_daemon, submit_specs
 
-    run, specs = _load(args)
     state = _state(args)
     _, ids = submit_specs(state, specs, run_name=run.name, run_file=run.path)
     try:
@@ -282,9 +292,13 @@ def _follow(state: StateDir, ids: list[str], stop: threading.Event) -> None:
 
 
 def cmd_run(args) -> int:
+    return run_here(args, *_load(args))
+
+
+def run_here(args, run, specs) -> int:
+    """Run ``specs`` in a supervisor in this process until they end."""
     from geofuse.jobs.supervisor import serve, submit_specs
 
-    run, specs = _load(args)
     state = _state(args)
     cfg = _config(args)
     sup_id = f"f{uuid.uuid4().hex[:7]}"
