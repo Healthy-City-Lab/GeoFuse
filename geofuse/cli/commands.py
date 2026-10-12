@@ -21,6 +21,7 @@
     geofuse preset list | show | save | import | remove
     geofuse cache list | purge
     geofuse results | export JOB    a fusion run's headline / per-entity table
+    geofuse hpc script RUN.toml     SLURM job arrays (one job per task)
 
 Every setting is also a flag (``--cloud-max 20``, ``--no-water-mask``) that
 overrides every step having that setting; ``--set ENGINE[.STEP].KEY=VALUE``
@@ -100,7 +101,7 @@ def _add_setting_flags(
             group.add_argument(flag, **kw)
 
 
-def _add_run_args(parser: argparse.ArgumentParser) -> None:
+def _add_run_args(parser: argparse.ArgumentParser, *, arrays: bool = True) -> None:
     parser.add_argument("runfile", help="the run file (TOML, or JSON)")
     parser.add_argument(
         "--set",
@@ -118,6 +119,9 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
         help="run only these steps (ENGINE.STEP or STEP; repeatable); the "
         "steps they depend on are taken as already done",
     )
+    if not arrays:
+        _add_setting_flags(parser)
+        return
     jobs = parser.add_argument_group(
         "job arrays", "pick jobs for one task of a scheduler array (see plan)"
     )
@@ -763,9 +767,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--daemon", action="store_true", help=argparse.SUPPRESS)
     p.set_defaults(func=cmd_supervisor)
 
-    from geofuse.cli import account, library, quick, results
+    from geofuse.cli import account, hpc, library, quick, results
 
     quick.add_parsers(sub, common)
+    hpc.add_parsers(sub, common)
     account.add_parsers(sub, common)
     library.add_parsers(sub, common)
     results.add_parsers(sub, common)
