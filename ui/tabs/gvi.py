@@ -22,6 +22,8 @@ from helpers import (
     render_job_restart_panel,
     sanitize_name_for_file,
 )
+from preset_row import finish as finish_presets
+from preset_row import refresh_if_stale, render_preset_row
 from map_preview import (
     add_black_point_layer,
     add_study_area_layers,
@@ -267,12 +269,142 @@ _MONTH_POLICY_LABELS = {
 
 
 def _capture_args(p: dict) -> dict:
-    """Month-window settings recorded on a GVI job (``None`` window = off)."""
+    """Month-window settings recorded on a GVI job (``None`` window = off),
+    plus the preset the job came from, when there was one."""
     window = p.get("month_window")
-    return {
+    args = {
         "month_window": list(window) if window else None,
         "month_policy": str(p.get("month_policy") or "exclude"),
     }
+    if p.get("preset"):
+        args["preset"] = p["preset"]
+    return args
+
+
+# Download settings and their defaults, seeded into session state before the
+# widgets render so a preset can set them too.
+_GVI_DOWNLOAD_LABELS = {"package": "Package (Scraper)", "api": "API (Street View)"}
+_GVI_SETTING_DEFAULTS = {
+    "gvi_download_mode": _GVI_DOWNLOAD_LABELS["package"],
+    "gvi_res": 50,
+    "gvi_buffer": 0,
+    "gvi_save_debug": False,
+    "gvi_preview_sampling_grid": False,
+    "gvi_out_gpkg": True,
+    "gvi_out_geotiff": False,
+    "gvi_out_geojson": False,
+}
+# Preset setting -> session-state key of the widget that holds it.
+_GVI_PRESET_KEYS = {
+    "grid_resolution_m": "gvi_res",
+    "buffer_m": "gvi_buffer",
+    "save_raw": "gvi_save_debug",
+    "show_sampling_grid": "gvi_preview_sampling_grid",
+    "save_gpkg": "gvi_out_gpkg",
+    "save_geotiff": "gvi_out_geotiff",
+    "save_geojson": "gvi_out_geojson",
+}
+# Preset capture setting -> (layer config key, widget key pattern).
+_GVI_PRESET_CAPTURE_KEYS = {
+    "capture_mode": ("mode", "gvi_mode_{}"),
+    "target_year": ("target_year", "gvi_year_{}"),
+    "limit_year_difference": ("use_max_diff", "gvi_usemd_{}"),
+    "max_year_difference": ("max_diff", "gvi_md_{}"),
+    "limit_months": ("use_months", "gvi_usemonths_{}"),
+    "month_start": ("month_start", "gvi_month_start_{}"),
+    "month_end": ("month_end", "gvi_month_end_{}"),
+    "month_policy": ("month_policy", "gvi_month_policy_{}"),
+}
+
+
+def _seed_gvi_settings() -> None:
+    for key, value in _GVI_SETTING_DEFAULTS.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def _seed(key: str, value) -> None:
+    """Give a widget its starting value through session state."""
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+
+def _capture_defaults() -> dict:
+    """Capture settings a new layer starts from; a preset rewrites them."""
+    return st.session_state.setdefault(
+        "gvi_capture_defaults",
+        {
+            "mode": _GVI_MODE_RECENT,
+            "target_year": date.today().year,
+            "date_column": None,
+            "use_max_diff": False,
+            "max_diff": 2,
+            "use_months": False,
+            "month_start": 5,
+            "month_end": 10,
+            "month_policy": "exclude",
+        },
+    )
+
+
+def _mode_to_preset(mode: str) -> str:
+    return {_GVI_MODE_RECENT: "recent", _GVI_MODE_YEAR: "year"}.get(mode, "column")
+
+
+def _mode_from_preset(value: str) -> str:
+    return {"recent": _GVI_MODE_RECENT, "year": _GVI_MODE_YEAR}.get(
+        value, _GVI_MODE_COLUMN
+    )
+
+
+def _gvi_preset_current() -> dict:
+    """The tab's settings as a preset (never the API key). A capture setting
+    on which the layers disagree is ``None``."""
+    _seed_gvi_settings()
+    s = st.session_state
+    out = {name: s[key] for name, key in _GVI_PRESET_KEYS.items()}
+    out["grid_resolution_m"] = int(out["grid_resolution_m"])
+    out["buffer_m"] = int(out["buffer_m"])
+    out["download_mode"] = (
+        "api" if s["gvi_download_mode"] == _GVI_DOWNLOAD_LABELS["api"] else "package"
+    )
+    # A layer's widget holds its newest value; its config catches up only when
+    # the capture configuration renders, later in the run.
+    configs = list((s.get("gvi_date_configs") or {}).items()) or [
+        (None, _capture_defaults())
+    ]
+    for name, (cfg_key, widget) in _GVI_PRESET_CAPTURE_KEYS.items():
+        values = [
+            s.get(widget.format(key), cfg.get(cfg_key, _capture_defaults()[cfg_key]))
+            for key, cfg in configs
+        ]
+        if name == "capture_mode":
+            values = [_mode_to_preset(v) for v in values]
+        out[name] = values[0] if all(v == values[0] for v in values) else None
+    return out
+
+
+def _gvi_preset_apply(settings: dict) -> None:
+    """Write a preset's settings into the widgets and every layer's config."""
+    s = st.session_state
+    for name, key in _GVI_PRESET_KEYS.items():
+        if name in settings:
+            s[key] = settings[name]
+    if "download_mode" in settings:
+        s["gvi_download_mode"] = _GVI_DOWNLOAD_LABELS[settings["download_mode"]]
+    defaults = _capture_defaults()
+    for name, (cfg_key, widget) in _GVI_PRESET_CAPTURE_KEYS.items():
+        if name not in settings:
+            continue
+        value = settings[name]
+        if name == "capture_mode":
+            value = _mode_from_preset(value)
+        elif name == "target_year":
+            value = min(int(value), date.today().year)
+        defaults[cfg_key] = value
+        for key, cfg in (s.get("gvi_date_configs") or {}).items():
+            cfg[cfg_key] = value
+            s[widget.format(key)] = value
 
 
 def _month_window_line(p: dict) -> str:
@@ -814,24 +946,13 @@ def _render_gvi_date_config() -> None:
             f"{key}  ·  {len(unit['sources'])} files merged" if unit["merged"] else key
         )
         cfg = st.session_state.gvi_date_configs.setdefault(
-            key,
-            {
-                "mode": _GVI_MODE_RECENT,
-                "target_year": this_year,
-                "date_column": None,
-                "use_max_diff": False,
-                "max_diff": 2,
-                "use_months": False,
-                "month_start": 5,
-                "month_end": 10,
-                "month_policy": "exclude",
-            },
+            key, dict(_capture_defaults())
         )
+        _seed(f"gvi_mode_{key}", cfg.get("mode", _GVI_MODE_RECENT))
         with st.expander(title, expanded=True):
             cfg["mode"] = st.radio(
                 "Which capture to segment",
                 _GVI_MODES,
-                index=_GVI_MODES.index(cfg.get("mode", _GVI_MODE_RECENT)),
                 key=f"gvi_mode_{key}",
                 horizontal=True,
                 help=(
@@ -844,12 +965,13 @@ def _render_gvi_date_config() -> None:
             mode = cfg["mode"]
 
             if mode == _GVI_MODE_YEAR:
+                year = min(int(cfg.get("target_year", this_year)), this_year)
+                _seed(f"gvi_year_{key}", year)
                 cfg["target_year"] = int(
                     st.number_input(
                         "Target year",
                         min_value=2007,
                         max_value=this_year,
-                        value=int(cfg.get("target_year", this_year)),
                         step=1,
                         key=f"gvi_year_{key}",
                     )
@@ -875,9 +997,9 @@ def _render_gvi_date_config() -> None:
                     st.warning("No attribute columns found in this layer.")
 
             if mode in (_GVI_MODE_YEAR, _GVI_MODE_COLUMN):
+                _seed(f"gvi_usemd_{key}", bool(cfg.get("use_max_diff", False)))
                 cfg["use_max_diff"] = st.checkbox(
                     "Limit maximum year difference",
-                    value=bool(cfg.get("use_max_diff", False)),
                     key=f"gvi_usemd_{key}",
                     help=(
                         "Only accept a capture within this many years of the "
@@ -885,20 +1007,20 @@ def _render_gvi_date_config() -> None:
                     ),
                 )
                 if cfg["use_max_diff"]:
+                    _seed(f"gvi_md_{key}", int(cfg.get("max_diff", 2)))
                     cfg["max_diff"] = int(
                         st.number_input(
                             "Max acceptable difference (years)",
                             min_value=0,
                             max_value=20,
-                            value=int(cfg.get("max_diff", 2)),
                             step=1,
                             key=f"gvi_md_{key}",
                         )
                     )
 
+            _seed(f"gvi_usemonths_{key}", bool(cfg.get("use_months", False)))
             cfg["use_months"] = st.checkbox(
                 "Limit capture months",
-                value=bool(cfg.get("use_months", False)),
                 key=f"gvi_usemonths_{key}",
                 help=(
                     "Only use captures taken in these months, e.g. May to "
@@ -909,27 +1031,25 @@ def _render_gvi_date_config() -> None:
                 ),
             )
             if cfg["use_months"]:
+                _seed(f"gvi_month_start_{key}", int(cfg.get("month_start", 5)))
+                _seed(f"gvi_month_end_{key}", int(cfg.get("month_end", 10)))
+                _seed(f"gvi_month_policy_{key}", cfg.get("month_policy", "exclude"))
                 m1, m2, m3 = st.columns([1, 1, 2])
                 cfg["month_start"] = m1.selectbox(
                     "From month",
                     list(range(1, 13)),
-                    index=int(cfg.get("month_start", 5)) - 1,
                     format_func=lambda m: _MONTH_ABBR[m - 1],
                     key=f"gvi_month_start_{key}",
                 )
                 cfg["month_end"] = m2.selectbox(
                     "To month",
                     list(range(1, 13)),
-                    index=int(cfg.get("month_end", 10)) - 1,
                     format_func=lambda m: _MONTH_ABBR[m - 1],
                     key=f"gvi_month_end_{key}",
                 )
                 cfg["month_policy"] = m3.radio(
                     "Captures outside these months",
                     list(_MONTH_POLICY_LABELS),
-                    index=list(_MONTH_POLICY_LABELS).index(
-                        cfg.get("month_policy", "exclude")
-                    ),
                     format_func=_MONTH_POLICY_LABELS.get,
                     key=f"gvi_month_policy_{key}",
                     horizontal=True,
@@ -940,6 +1060,7 @@ def _render_gvi_date_config() -> None:
                         "applies."
                     ),
                 )
+    refresh_if_stale("gvi", _gvi_preset_current)
 
 
 @st.fragment
@@ -951,6 +1072,10 @@ def _render_gvi_settings_map() -> None:
     fc_gvi_l, fc_gvi_r = st.columns(2)
     with fc_gvi_l:
         with st.container(border=True):
+            _seed_gvi_settings()
+            st.session_state["_gvi_preset_in_force"] = render_preset_row(
+                "gvi", current=_gvi_preset_current, apply=_gvi_preset_apply
+            )
             st.radio(
                 "Download Mode",
                 ["Package (Scraper)", "API (Street View)"],
@@ -970,7 +1095,6 @@ def _render_gvi_settings_map() -> None:
                 "Grid Resolution (m)",
                 min_value=20,
                 max_value=500,
-                value=50,
                 step=5,
                 key="gvi_res",
                 help="Spacing for sampling points in the generated grid (metres).",
@@ -979,7 +1103,6 @@ def _render_gvi_settings_map() -> None:
                 "Download Buffer (m)",
                 min_value=0,
                 max_value=2000,
-                value=0,
                 step=50,
                 key="gvi_buffer",
                 help=(
@@ -989,13 +1112,11 @@ def _render_gvi_settings_map() -> None:
             )
             st.checkbox(
                 "Save Raw Images & Masks",
-                value=False,
                 key="gvi_save_debug",
                 help="Keep downloaded panoramas and segmentation masks under the output folder.",
             )
             st.checkbox(
                 "Show Sampling Grid on Map",
-                value=False,
                 key="gvi_preview_sampling_grid",
                 help=(
                     "Draw generated sampling grid points on the preview map. Turn "
@@ -1059,6 +1180,7 @@ def _render_gvi_settings_map() -> None:
         int(st.session_state.get("gvi_buffer", 0)),
         int(st.session_state.get("gvi_res", 50)),
     )
+    finish_presets("gvi")
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -1190,11 +1312,11 @@ def render(output_dir: str, parent_dir: str) -> None:
 
     _render_gvi_date_config()
 
+    _seed_gvi_settings()
     oc_gvi_a, oc_gvi_b, oc_gvi_c = st.columns(3)
     with oc_gvi_a:
         st.checkbox(
             "Save GeoPackage",
-            value=True,
             key="gvi_out_gpkg",
             help=(
                 "Recommended. Single-file vector samples (EPSG:4326) "
@@ -1205,7 +1327,6 @@ def render(output_dir: str, parent_dir: str) -> None:
     with oc_gvi_b:
         st.checkbox(
             "Save GeoTIFF (per-cluster tiles)",
-            value=False,
             key="gvi_out_geotiff",
             help=(
                 "Optional. Writes one GeoTIFF tile per buffered cluster "
@@ -1216,7 +1337,6 @@ def render(output_dir: str, parent_dir: str) -> None:
     with oc_gvi_c:
         st.checkbox(
             "Save GeoJSON",
-            value=False,
             key="gvi_out_geojson",
             help=(
                 "Compatibility option only. Slow to read past ~100k "
@@ -1376,6 +1496,7 @@ def render(output_dir: str, parent_dir: str) -> None:
                             else None
                         ),
                         "month_policy": cfg.get("month_policy", "exclude"),
+                        "preset": st.session_state.get("_gvi_preset_in_force"),
                     }
                 )
 

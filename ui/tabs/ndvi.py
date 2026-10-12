@@ -20,6 +20,8 @@ from helpers import (
     render_job_restart_panel,
     sanitize_name_for_file,
 )
+from preset_row import finish as finish_presets
+from preset_row import refresh_if_stale, render_preset_row
 from map_preview import (
     add_black_point_layer,
     add_study_area_layers,
@@ -85,6 +87,47 @@ _SETTING_DEFAULTS = {
     "ndvi_coverage_rescue": True,
     "ndvi_water_mask": False,
     "ndvi_substitute_2012": False,
+    "ndvi_out_geotiff": True,
+    "ndvi_out_gpkg": False,
+    "ndvi_out_geojson": False,
+    "ndvi_out_cluster_tiles": False,
+}
+
+# Per-dataset method settings; a new dataset starts from these, and a preset
+# rewrites them (``ndvi_method_defaults`` in session state).
+_METHOD_DEFAULTS = {
+    "stats_ranges": ["median"],
+    "stats_specific": ["median"],
+    "stats_column": ["median"],
+    "season_start_month": 6,
+    "season_end_month": 9,
+    "window_days_specific": 30,
+}
+
+# Preset setting -> session-state key of the widget that holds it.
+_PRESET_KEYS = {
+    "satellite": "ndvi_satellite",
+    "reflectance": "ndvi_reflectance",
+    "cloud_handling": "ndvi_cloud_handling",
+    "cloud_max": "ndvi_cloud",
+    "resolution_m": "ndvi_res",
+    "buffer_m": "ndvi_buffer",
+    "coverage_rescue": "ndvi_coverage_rescue",
+    "water_mask": "ndvi_water_mask",
+    "substitute_2012": "ndvi_substitute_2012",
+    "save_geotiff": "ndvi_out_geotiff",
+    "save_gpkg": "ndvi_out_gpkg",
+    "save_geojson": "ndvi_out_geojson",
+    "save_cluster_tiles": "ndvi_out_cluster_tiles",
+}
+# Preset method setting -> (dataset config key, widget key pattern).
+_PRESET_METHOD_KEYS = {
+    "statistics_ranges": ("stats_ranges", "ndvi_stats_ranges_{}"),
+    "statistics_specific": ("stats_specific", "ndvi_stats_specific_{}"),
+    "statistics_column": ("stats_column", "ndvi_stats_col_{}"),
+    "season_start_month": ("season_start_month", "ndvi_seas_start_{}"),
+    "season_end_month": ("season_end_month", "ndvi_seas_end_{}"),
+    "specific_window_days": ("window_days_specific", "ndvi_win_s_{}"),
 }
 
 
@@ -92,6 +135,57 @@ def _seed_settings() -> None:
     for key, value in _SETTING_DEFAULTS.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
+
+def _method_defaults() -> dict:
+    return st.session_state.setdefault("ndvi_method_defaults", dict(_METHOD_DEFAULTS))
+
+
+def _seed(key: str, value) -> None:
+    """Give a widget its starting value through session state."""
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+
+def _preset_current() -> dict:
+    """The tab's settings as a preset. A method setting on which the datasets
+    disagree is ``None``: it matches no preset and is left out of a save."""
+    _seed_settings()
+    s = st.session_state
+    out = {name: s[key] for name, key in _PRESET_KEYS.items()}
+    for name in ("cloud_max", "resolution_m", "buffer_m"):
+        out[name] = int(out[name])
+    # A dataset's widget holds its newest value; its config catches up only
+    # when the date configuration renders, later in the run.
+    configs = list((s.get("ndvi_date_configs") or {}).items()) or [
+        (None, _method_defaults())
+    ]
+    for name, (cfg_key, widget) in _PRESET_METHOD_KEYS.items():
+        values = [
+            s.get(
+                widget.format(fname), cfg.get(cfg_key, _METHOD_DEFAULTS[cfg_key])
+            )
+            for fname, cfg in configs
+        ]
+        out[name] = values[0] if all(v == values[0] for v in values) else None
+    return out
+
+
+def _preset_apply(settings: dict) -> None:
+    """Write a preset's settings into the widgets and every dataset's config."""
+    s = st.session_state
+    for name, key in _PRESET_KEYS.items():
+        if name in settings:
+            s[key] = settings[name]
+    defaults = _method_defaults()
+    for name, (cfg_key, widget) in _PRESET_METHOD_KEYS.items():
+        if name not in settings:
+            continue
+        value = settings[name]
+        defaults[cfg_key] = list(value) if isinstance(value, list) else value
+        for fname, cfg in (s.get("ndvi_date_configs") or {}).items():
+            cfg[cfg_key] = list(value) if isinstance(value, list) else value
+            s[widget.format(fname)] = list(value) if isinstance(value, list) else value
 
 
 def _job_options(p: dict) -> dict:
@@ -105,6 +199,7 @@ def _job_options(p: dict) -> dict:
         "cloud_handling": str(p.get("cloud_handling", "scene_filter")),
         "reflectance": str(p.get("reflectance", "surface")),
         "substitute_2012": bool(p.get("substitute_2012", False)),
+        "preset": p.get("preset"),
     }
 
 
@@ -129,10 +224,10 @@ def _job_options_lines(p: dict) -> list[str]:
 
 def _render_stat_select(cfg: dict, cfg_key: str, key: str) -> None:
     """Temporal-statistic picker for one date mode of one dataset."""
+    _seed(key, list(cfg.get(cfg_key, ["median"])))
     cfg[cfg_key] = st.multiselect(
         "Temporal statistic",
         list(TEMPORAL_REDUCERS),
-        default=cfg.get(cfg_key, ["median"]),
         format_func=lambda r: _STAT_LABELS.get(r, r),
         key=key,
         help=_STAT_HELP,
@@ -642,6 +737,9 @@ def _render_ndvi_settings_map() -> None:
     with fc_ndvi_l:
         with st.container(border=True):
             _seed_settings()
+            st.session_state["_ndvi_preset_in_force"] = render_preset_row(
+                "ndvi", current=_preset_current, apply=_preset_apply
+            )
             sat_col, refl_col = st.columns(2)
             sat_col.selectbox(
                 "Satellite",
@@ -764,6 +862,7 @@ def _render_ndvi_settings_map() -> None:
             returned_objects=[],
         )
     _ndvi_size_hint(int(buffer_m), int(st.session_state.get("ndvi_res", 10)))
+    finish_presets("ndvi")
 
 
 def _ndvi_discover_years(gdf, col: str) -> list[str]:
@@ -799,12 +898,10 @@ def _render_ndvi_date_config() -> None:
                     "use_column": False,
                     "ranges": [(date(2023, 6, 1), date(2023, 9, 30))],
                     "specific_dates": [date(2023, 7, 15)],
-                    "window_days_specific": 30,
-                    "season_start_month": 6,
-                    "season_end_month": 9,
-                    "stats_ranges": ["median"],
-                    "stats_specific": ["median"],
-                    "stats_column": ["median"],
+                    **{
+                        k: list(v) if isinstance(v, list) else v
+                        for k, v in _method_defaults().items()
+                    },
                 }
             cfg = st.session_state.ndvi_date_configs[fname]
             # Migrate old single-mode format
@@ -921,11 +1018,11 @@ def _render_ndvi_date_config() -> None:
                     _render_stat_select(
                         cfg, "stats_specific", f"ndvi_stats_specific_{fname}"
                     )
+                    _seed(f"ndvi_win_s_{fname}", cfg.get("window_days_specific", 30))
                     cfg["window_days_specific"] = st.number_input(
                         "Composite window (± days)",
                         min_value=7,
                         max_value=180,
-                        value=cfg.get("window_days_specific", 30),
                         key=f"ndvi_win_s_{fname}",
                         help=(
                             "Composite uses imagery within ± this many days around "
@@ -994,17 +1091,19 @@ def _render_ndvi_date_config() -> None:
                             "comparison."
                         )
                         mc1, mc2 = st.columns(2)
+                        _seed(
+                            f"ndvi_seas_start_{fname}", cfg.get("season_start_month", 6)
+                        )
+                        _seed(f"ndvi_seas_end_{fname}", cfg.get("season_end_month", 9))
                         cfg["season_start_month"] = mc1.selectbox(
                             "Season start month",
                             list(range(1, 13)),
-                            index=cfg.get("season_start_month", 6) - 1,
                             format_func=lambda m: _MONTH_NAMES[m - 1],
                             key=f"ndvi_seas_start_{fname}",
                         )
                         cfg["season_end_month"] = mc2.selectbox(
                             "Season end month",
                             list(range(1, 13)),
-                            index=cfg.get("season_end_month", 9) - 1,
                             format_func=lambda m: _MONTH_NAMES[m - 1],
                             key=f"ndvi_seas_end_{fname}",
                         )
@@ -1017,6 +1116,7 @@ def _render_ndvi_date_config() -> None:
                             )
                     else:
                         st.warning("No attribute columns found in this file.")
+    refresh_if_stale("ndvi", _preset_current)
 
 
 def render(output_dir: str) -> None:
@@ -1122,18 +1222,17 @@ def render(output_dir: str) -> None:
 
     _render_ndvi_date_config()
 
+    _seed_settings()
     oc_ndvi_a, oc_ndvi_b, oc_ndvi_c, oc_ndvi_d = st.columns(4)
     with oc_ndvi_a:
         st.checkbox(
             "Save GeoTIFF",
-            value=True,
             key="ndvi_out_geotiff",
             help="Raster NDVI surface (primary format for NDVI).",
         )
     with oc_ndvi_b:
         st.checkbox(
             "Save GeoPackage",
-            value=False,
             key="ndvi_out_gpkg",
             help=(
                 "Vector samples in EPSG:4326, single file, readable by every "
@@ -1143,14 +1242,12 @@ def render(output_dir: str) -> None:
     with oc_ndvi_c:
         st.checkbox(
             "Save GeoJSON",
-            value=False,
             key="ndvi_out_geojson",
             help="Compatibility option only. Slow to read past ~100k points.",
         )
     with oc_ndvi_d:
         st.checkbox(
             "Per-cluster tiles",
-            value=False,
             key="ndvi_out_cluster_tiles",
             help=(
                 "For scattered inputs (one feature per city / province), write "
@@ -1180,6 +1277,9 @@ def render(output_dir: str) -> None:
         "reflectance": str(st.session_state.get("ndvi_reflectance", "surface")),
         "substitute_2012": bool(st.session_state.get("ndvi_substitute_2012", False)),
     }
+    preset_in_force = st.session_state.get("_ndvi_preset_in_force")
+    if preset_in_force:
+        acquisition["preset"] = preset_in_force
     ndvi_out_ok = (
         st.session_state.get("ndvi_out_geotiff", True)
         or st.session_state.get("ndvi_out_gpkg", False)
