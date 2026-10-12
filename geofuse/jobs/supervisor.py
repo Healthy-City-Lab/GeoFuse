@@ -19,7 +19,9 @@ Two kinds run:
 Resource classes cap what runs at once (``[limits]`` in the user
 configuration): ``gpu`` and ``streetview`` (one GVI job per machine by
 default — Google throttles per address), ``earthengine``, ``fusion`` and
-``max_parallel`` overall.
+``max_parallel`` overall. The supervisor schedules within them, and each job
+also holds its slots while it runs (``geofuse.jobs.locks``), so jobs the GUI
+started count against the same limits.
 """
 
 from __future__ import annotations

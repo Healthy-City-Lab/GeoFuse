@@ -139,10 +139,6 @@ class StateDir:
     def logs_dir(self) -> Path:
         return self.root / "logs"
 
-    @property
-    def locks_dir(self) -> Path:
-        return self.root / "locks"
-
     def job_dir(self, job_id: str) -> Path:
         return self.jobs_dir / job_id
 

@@ -25,19 +25,11 @@ from typing import Any
 
 from geofuse import runfile as _rf
 from geofuse import settings as _settings
+from geofuse.jobs.locks import RESOURCES
 from geofuse.vector_io import sanitize_name_for_file
 
 # The fusion tab never downloads metrics itself; it records this window.
 _FUSION_NDVI_WINDOW = ("2023-06-01", "2023-09-30")
-
-#: Resource classes a job needs while it runs (see the supervisor).
-RESOURCES: dict[str, tuple[str, ...]] = {
-    "ndvi": ("earthengine",),
-    "ndvi_column": ("earthengine",),
-    "gvi": ("gpu", "streetview"),
-    "gvi_column": ("gpu", "streetview"),
-    "fusion": ("fusion",),
-}
 
 
 class PlanError(ValueError):

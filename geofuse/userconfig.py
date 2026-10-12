@@ -7,7 +7,7 @@
     [earthengine]
     project = "my-cloud-project"        # the project NDVI downloads bill
 
-    [limits]                            # what the supervisor runs at once
+    [limits]                            # what runs at once on this machine
     max_parallel = 4
     gpu = 1
     streetview = 1
@@ -29,7 +29,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-#: Resource classes the supervisor caps, and their defaults.
+#: Resource classes capped on one machine, and their defaults. ``max_parallel``
+#: and ``idle_minutes`` govern the supervisor; the rest are slots that GUI and
+#: command-line jobs share (``geofuse.jobs.locks``).
 LIMIT_DEFAULTS: dict[str, int] = {
     "max_parallel": 4,
     "gpu": 1,
