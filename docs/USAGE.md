@@ -344,7 +344,9 @@ the Fusion tab's results view.
 Job ids can be shortened to any unique prefix. The supervisor starts with the
 first `submit` and stops after ten idle minutes; `geofuse supervisor --stop`
 stops it now. Exit codes: 0 done, 1 a job failed or was cancelled, 2 invalid
-settings or inputs, 3 an environment problem.
+settings or inputs, 3 an environment problem. Should the supervisor itself stop
+on an error, its jobs show as interrupted, never cancelled, and `geofuse rerun`
+continues them from their caches.
 
 ### Limits shared with the dashboard
 
