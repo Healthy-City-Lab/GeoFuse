@@ -28,6 +28,7 @@ from geofuse.cli.commands import (
     CliError,
     _add_setting_flags,
     _overrides,
+    _resolve,
     _state,
 )
 from geofuse.cli.templates import _value
@@ -152,9 +153,36 @@ def _fusion_output_dirs(args) -> list[str]:
     return list(dict.fromkeys(found))
 
 
+def _adopt(args) -> int:
+    """Record the NDVI tile workspaces earlier jobs cached before workspaces
+    carried records, so runs over a smaller area reuse their tiles."""
+    from geofuse.jobs.plans import JobSpec, PlanError, build
+    from geofuse.jobs.runners import record_ndvi_cache
+
+    state = _state(args)
+    fields = JobSpec.__dataclass_fields__
+    for job_id in _resolve(state, args.jobs):
+        raw = state.read_spec(job_id) or {}
+        label = f"{job_id} ({raw.get('name')})"
+        if raw.get("kind") not in ("ndvi", "ndvi_column"):
+            print(f"{label}: not an NDVI job; skipped.")
+            continue
+        spec = JobSpec.from_dict({k: v for k, v in raw.items() if k in fields})
+        try:
+            sub = build(spec)
+            counts = record_ndvi_cache(**sub.kwargs)
+        except (PlanError, OSError, ValueError) as exc:
+            raise CliError(f"{label}: {exc}") from exc
+        summary = ", ".join(f"{n} {what}" for what, n in sorted(counts.items()))
+        print(f"{label}: {summary or 'nothing cached'}")
+    return EXIT_OK
+
+
 def cmd_cache(args) -> int:
     from geofuse.persistence import caches
 
+    if args.action == "adopt":
+        return _adopt(args)
     dirs = _fusion_output_dirs(args)
     if args.action == "list":
         for key in ("pano", "ndvi"):
@@ -258,4 +286,10 @@ def add_parsers(sub, common) -> None:
             help="whose fusion cache (repeatable; default: the GUI's and every "
             "command-line fusion job's)",
         )
+    a = actions.add_parser(
+        "adopt",
+        parents=[common],
+        help="let runs over a smaller area reuse NDVI tiles these jobs cached",
+    )
+    a.add_argument("jobs", nargs="+", metavar="JOB")
     p.set_defaults(func=cmd_cache)

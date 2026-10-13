@@ -317,6 +317,26 @@ a chain that does not check is named under the picker and blocks the run. On
 the command line, chains are text:
 `--chains-column "f500: focal:mean:500, temporal:mean, water_mask"`.
 
+### Reusing NDVI tiles from a larger area
+
+Every tiled NDVI download records its tile cache: the settings that shape the
+values (dates, clouds, sensors, reflectance, resolution, statistic or chain)
+and its study area. A later download with the same settings over a smaller
+area, such as a narrower buffer or fewer features, takes each tile from that
+cache wherever the earlier run covers every pixel the tile needs, and asks
+Earth Engine only for the rest. The values are those a fresh download
+computes; the sidecar counts the tiles taken (`tiles_salvaged`).
+
+Caches written before these records existed are recorded from the jobs that
+wrote them:
+
+```bash
+geofuse cache adopt JOB...    # finished, cancelled or interrupted NDVI jobs
+```
+
+Downloads small enough for a single tile keep no cache, so there is nothing to
+reuse for them.
+
 ### Following and managing jobs
 
 ```bash

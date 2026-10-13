@@ -914,6 +914,85 @@ def _column_years(
     return gdf, years
 
 
+def record_ndvi_cache(
+    *,
+    fname: str,
+    dataset_data: dict,
+    cloud_pct: int,
+    resolution: int,
+    buffer_m: int,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    output_name: str | None = None,
+    date_column: str | None = None,
+    season_start_month: int = 6,
+    season_end_month: int = 9,
+    satellite: str = "auto",
+    temporal_reducers: Sequence[str] = ("median",),
+    water_mask: bool = False,
+    cloud_handling: str = "scene_filter",
+    reflectance: str = "surface",
+    substitute_2012: bool = False,
+    chains: Sequence[Mapping] | None = None,
+    **_other,
+) -> dict[str, int]:
+    """Record the tile workspaces an NDVI job cached before workspaces
+    carried records, from the arguments :func:`run_ndvi` or
+    :func:`run_ndvi_column` ran with, so later runs over a smaller study area
+    reuse them (:meth:`~geofuse.ndvi.NDVIEngine.record_workspaces`). Returns
+    how many outputs were ``recorded``, ``already recorded`` or ``not cached``.
+    """
+    from collections import Counter
+
+    from geofuse.crs_utils import buffer_gdf_union_metres
+
+    engine = NDVIEngine.without_earth_engine()
+    common = {
+        "cloud_max": cloud_pct,
+        "resolution": resolution,
+        "satellite": satellite,
+        "temporal_reducers": temporal_reducers,
+        "water_mask": water_mask,
+        "cloud_handling": cloud_handling,
+        "reflectance": reflectance,
+        "substitute_2012": substitute_2012,
+        "end_inclusive": True,
+        "chains": chains,
+    }
+    counts: Counter = Counter()
+    try:
+        if date_column:
+            gdf, years = _column_years(
+                dataset_data["raw"], date_column, season_start_month, season_end_month
+            )
+            crs_override = NDVIEngine.compute_export_crs(gdf)
+            base_name = os.path.splitext(fname)[0]
+            for year, year_gdf, start_d, end_d in years:
+                counts.update(
+                    engine.record_workspaces(
+                        buffer_gdf_union_metres(year_gdf, buffer_m),
+                        start_d,
+                        end_d,
+                        f"{base_name}_{year}",
+                        crs_override=crs_override,
+                        **common,
+                    ).values()
+                )
+        else:
+            counts.update(
+                engine.record_workspaces(
+                    buffer_gdf_union_metres(dataset_data["raw"], buffer_m),
+                    start_date,
+                    end_date,
+                    output_name,
+                    **common,
+                ).values()
+            )
+    finally:
+        engine.tile_cache.close()
+    return dict(counts)
+
+
 def run_ndvi_column(
     ctx: JobContext,
     *,

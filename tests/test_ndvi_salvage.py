@@ -13,6 +13,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 for _p in (ROOT, os.path.dirname(__file__)):
@@ -194,6 +195,60 @@ class SalvageTests(unittest.TestCase):
         self.assertEqual(other, {"fm": "not cached", "tm": "not cached"})
         _, exports, _ = self.run_area(_square(0.3, 0.3, 0.5), "small")
         self.assertEqual(exports, [])
+
+    def test_a_per_year_job_is_adopted_and_a_smaller_buffer_reuses_it(self):
+        from shapely.geometry import Point
+        from test_ndvi_runners import _Ctx
+
+        from geofuse.jobs import runners
+
+        cache = self.cache
+
+        class Engine(E):
+            def __init__(self, project_id=None, **_kw):
+                self.tile_cache = NdviTileCache(cache)
+
+            @classmethod
+            def without_earth_engine(cls, tile_cache=None):
+                return super().without_earth_engine(NdviTileCache(cache))
+
+        dlon = 8000 / (111_320 * math.cos(math.radians(LAT)))
+        homes = gpd.GeoDataFrame(
+            {"year": [2015, 2015]},
+            geometry=[Point(LON, LAT), Point(LON + dlon, LAT)],
+            crs="EPSG:4326",
+        )
+        job = {
+            "fname": "homes.gpkg",
+            "dataset_data": {"raw": homes},
+            "date_column": "year",
+            "season_start_month": 6,
+            "season_end_month": 9,
+            "cloud_pct": 10,
+            "resolution": RES,
+            "save_geotiff": True,
+            "save_geojson": False,
+            "satellite": "landsat",
+            "coverage_rescue": False,
+            "chains": [{"name": "fm", "steps": ["focal:mean:60", "temporal:mean"]}],
+        }
+        area = _square(0, 0, 1)
+        with mock.patch.object(runners, "NDVIEngine", Engine):
+            for buffer_m, out in ((300, "big"), (150, "small")):
+                if buffer_m == 150:
+                    shutil.rmtree(os.path.join(cache, ndvi.RECORDS_DIR))
+                    counts = runners.record_ndvi_cache(**job, buffer_m=300)
+                    self.assertEqual(counts, {"recorded": 1})
+                with FakeEarthEngine(area, SCENES, self.water) as fake:
+                    runners.run_ndvi_column(
+                        _Ctx(),
+                        buffer_m=buffer_m,
+                        output_dir=os.path.join(self.tmp.name, out),
+                        **job,
+                    )
+                if buffer_m == 300:
+                    self.assertTrue(fake.exports)
+            self.assertEqual(fake.exports, [])
 
     def test_content_keys_ignore_only_the_area(self):
         fields = ("2015-06-01", "2015-09-30", 10, RES, E.LANDSAT_MERGED_LABEL)
