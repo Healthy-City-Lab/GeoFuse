@@ -24,6 +24,7 @@ from shapely.ops import transform as shapely_transform
 
 from .core import build_planar_tiles
 from .crs_utils import (
+    declare_nodata,
     default_geotiff_creation_options,
     raster_geographic_bounds,
     reproject_geodataframe_to_wgs84,
@@ -2271,10 +2272,12 @@ class NDVIEngine:
                 return _each(cancelled)
 
             # Atomic publish: the user-visible final raster only appears
-            # once the EE write finished cleanly, with its statistics.
+            # once the EE write finished cleanly, declaring the -9999
+            # sentinel as nodata (as the mosaics do), with its statistics.
             for names, path in files:
+                declare_nodata(path, -9999)
                 if len(names) == 1:
-                    write_band_statistics(path, nodata=-9999)
+                    write_band_statistics(path)
                     os.replace(path, final_tifs[names[0]])
                     continue
                 for band, r in enumerate(names, start=1):

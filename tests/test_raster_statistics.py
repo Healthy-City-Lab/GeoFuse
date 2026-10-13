@@ -23,7 +23,11 @@ from rasterio.transform import from_origin
 
 from geofuse import crs_utils
 from geofuse import ndvi as ndvi_mod
-from geofuse.crs_utils import stream_mosaic_to_geotiff, write_band_statistics
+from geofuse.crs_utils import (
+    declare_nodata,
+    stream_mosaic_to_geotiff,
+    write_band_statistics,
+)
 
 CRS = "EPSG:32611"
 RES = 30.0
@@ -171,6 +175,28 @@ class WriteBandStatisticsTests(_Case):
             gdal = src.statistics(1, approx=True)
         valid = _valid(full)
         self.assertEqual((gdal.min, gdal.max), (valid.min(), valid.max()))
+
+
+class DeclareNodataTests(_Case):
+    def test_declared_on_a_file_without_one(self):
+        data = _field(self.rng, 30, 30)
+        path = os.path.join(self.dir, "ee.tif")
+        _write(path, data)
+
+        declare_nodata(path, -9999)
+
+        with rasterio.open(path) as src:
+            self.assertEqual(src.nodata, -9999)
+            np.testing.assert_array_equal(src.read(1), data)
+
+    def test_existing_nodata_kept(self):
+        path = os.path.join(self.dir, "zero.tif")
+        _write(path, _field(self.rng, 30, 30), nodata=0.0)
+
+        declare_nodata(path, -9999)
+
+        with rasterio.open(path) as src:
+            self.assertEqual(src.nodata, 0.0)
 
 
 class CacheTileStatisticsTests(_Case):

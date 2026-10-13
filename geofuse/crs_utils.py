@@ -149,6 +149,13 @@ def build_internal_overviews(
         dst.update_tags(ns="rio_overview", resampling=resampling.name)
 
 
+def declare_nodata(path: str, value: float) -> None:
+    """Write ``value`` as the nodata of a GeoTIFF that declares none."""
+    with rasterio.open(path, "r+") as ds:
+        if ds.nodata is None:
+            ds.nodata = value
+
+
 def _block_stored(ds, band: int, i: int, j: int) -> bool:
     """Whether block ``(i, j)`` of ``band`` holds bytes on disk.
 

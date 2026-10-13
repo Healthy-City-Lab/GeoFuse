@@ -334,9 +334,10 @@ class _EngineCase(unittest.TestCase):
         self.assertTrue((arr != -9999).any())
         self.assertStatistics(path)
 
-    def assertStatistics(self, path):
-        """The exact statistics of the pixels other than the sentinel are stored."""
+    def assertStatistics(self, path, nodata=-9999):
+        """``nodata`` is declared; the statistics of the other pixels are stored."""
         with rasterio.open(path) as src:
+            self.assertEqual(src.nodata, nodata)
             arr = src.read(1).astype(np.float64)
             tags = src.tags(1)
         valid = arr[arr != -9999]
@@ -452,7 +453,7 @@ class TiledCacheTests(_EngineCase):
             tile = os.path.join(self.cache, key, tiles[0])
             with rasterio.open(tile) as t:
                 self.assertEqual((t.count, t.dtypes[0], t.nodata), (1, "float32", None))
-            self.assertStatistics(tile)
+            self.assertStatistics(tile, nodata=None)
         self.assertEqual(self.engine().tile_cache.stats()["entries"], 2)
 
         # Adding mean downloads mean only, one single-band request per tile.
