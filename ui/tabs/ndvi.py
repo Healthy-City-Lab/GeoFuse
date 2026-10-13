@@ -20,14 +20,14 @@ from helpers import (
     render_job_restart_panel,
     sanitize_name_for_file,
 )
-from preset_row import finish as finish_presets
-from preset_row import refresh_if_stale, render_preset_row
 from map_preview import (
     add_black_point_layer,
     add_study_area_layers,
     add_uniform_point_layer,
     trim_point_gdf_for_display,
 )
+from preset_row import finish as finish_presets
+from preset_row import refresh_if_stale, render_preset_row
 from raster_overlay import add_mercator_image_overlay_from_file
 from shapely.geometry import box as shapely_box
 from streamlit_folium import st_folium
@@ -147,9 +147,7 @@ def _preset_current() -> dict:
     ]
     for name, (cfg_key, widget) in _PRESET_METHOD_KEYS.items():
         values = [
-            s.get(
-                widget.format(fname), cfg.get(cfg_key, _METHOD_DEFAULTS[cfg_key])
-            )
+            s.get(widget.format(fname), cfg.get(cfg_key, _METHOD_DEFAULTS[cfg_key]))
             for fname, cfg in configs
         ]
         out[name] = values[0] if all(v == values[0] for v in values) else None
@@ -1058,9 +1056,7 @@ def _render_ndvi_date_config() -> None:
                     if use_ranges or use_specific:
                         st.divider()
                     st.markdown("**Attribute Column (per-year)**")
-                    _render_stat_select(
-                        cfg, "stats_column", f"ndvi_stats_col_{fname}"
-                    )
+                    _render_stat_select(cfg, "stats_column", f"ndvi_stats_col_{fname}")
                     attr_cols = [c for c in d["raw"].columns if c.lower() != "geometry"]
                     if attr_cols:
                         selected_col = st.selectbox(
@@ -1427,7 +1423,9 @@ def render(output_dir: str) -> None:
 
                 # --- Specific Date jobs ---
                 if use_specific:
-                    specific_options = _options(fname, cfg, "specific", "stats_specific")
+                    specific_options = _options(
+                        fname, cfg, "specific", "stats_specific"
+                    )
                     if not specific_options["temporal_reducers"]:
                         validation_errors.append(
                             f"{fname}: Specific date(s) — select at least one "

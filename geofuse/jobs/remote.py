@@ -233,7 +233,7 @@ def fetch_outputs(
     paths = [_remote_path(f["path"]) for f in files]
     shared = 0
     if len(paths) > 1:
-        for group in zip(*(p.parent.parts for p in paths)):
+        for group in zip(*(p.parent.parts for p in paths), strict=False):
             if any(part != group[0] for part in group):
                 break
             shared += 1
@@ -433,9 +433,7 @@ def attach(
                         )
                     except RemoteRefused:
                         continue
-                    mirror.write_log(
-                        job_id, answer["text"], append=job_id in offsets
-                    )
+                    mirror.write_log(job_id, answer["text"], append=job_id in offsets)
                     offsets[job_id] = answer["offset"]
                     synced_states[job_id] = now_state
                 for request_id, request in mirror.requests():
@@ -576,7 +574,5 @@ class MirrorSource:
         if not folder.is_dir():
             return []
         return sorted(
-            p
-            for p in folder.rglob("*")
-            if p.is_file() and not p.name.endswith(".part")
+            p for p in folder.rglob("*") if p.is_file() and not p.name.endswith(".part")
         )

@@ -72,8 +72,14 @@ class PresetTests(_Case):
 
     def test_save_from_flags_and_from_a_run_file_step(self):
         code, out = self.geofuse(
-            "preset", "save", "ndvi", "Cloudy", "--cloud-max", "60",
-            "--description", "lenient",
+            "preset",
+            "save",
+            "ndvi",
+            "Cloudy",
+            "--cloud-max",
+            "60",
+            "--description",
+            "lenient",
         )
         self.assertEqual(code, 0, out)
         self.assertEqual(presets.load_settings("ndvi", "Cloudy"), {"cloud_max": 60})
@@ -85,8 +91,9 @@ class PresetTests(_Case):
 
         run = os.path.join(self.dir, "run.toml")
         with open(run, "w", encoding="utf-8") as f:
-            f.write(textwrap.dedent(
-                """
+            f.write(
+                textwrap.dedent(
+                    """
                 [[ndvi]]
                 name = "city"
                 study_area = "a.gpkg"
@@ -94,7 +101,8 @@ class PresetTests(_Case):
                 satellite = "sentinel2"
                 water_mask = true
                 """
-            ))
+                )
+            )
         open(os.path.join(self.dir, "a.gpkg"), "w").close()
         code, out = self.geofuse(
             "preset", "save", "ndvi", "City", "--from", run, "--step", "city"
@@ -130,8 +138,12 @@ class CacheTests(_Case):
             f.write(b"z" * 4096)
         self.state = StateDir(self.state_dir)
         self.job = self.state.create_job(
-            {"step": "fusion.fit", "kind": "fusion", "name": "fit",
-             "output_dir": self.out},
+            {
+                "step": "fusion.fit",
+                "kind": "fusion",
+                "name": "fit",
+                "output_dir": self.out,
+            },
             run_id="r1",
             depends_on=[],
         )

@@ -271,9 +271,7 @@ FUSION: dict[str, Setting] = {
         CROSS_SECTIONAL_METRICS + LONGITUDINAL_METRICS,
         "Score every candidate is ranked on (longitudinal runs: mixedlm_tstat).",
     ),
-    "test_size": Setting(
-        "float", 0.25, lo=0.1, hi=0.5, help="Held-out test fraction."
-    ),
+    "test_size": Setting("float", 0.25, lo=0.1, hi=0.5, help="Held-out test fraction."),
     "n_bins": _int(5, 3, 10, "Quantile bins of the stratified split."),
     "residualize_method": _choice(
         "linear", ("linear", "spline"), "How covariates are partialled out."

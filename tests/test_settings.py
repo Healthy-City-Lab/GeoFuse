@@ -87,7 +87,7 @@ class DefaultTests(unittest.TestCase):
         self.assertEqual(recorded - set(settings.FUSION) - _FUSION_INPUTS, set())
 
     def test_defaults_are_valid_and_lists_are_copied(self):
-        for engine, schema in settings.SCHEMAS.items():
+        for engine in settings.SCHEMAS:
             values = settings.defaults(engine)
             self.assertEqual(settings.check(engine, values), values, engine)
         a = settings.defaults("ndvi")["statistics_ranges"]

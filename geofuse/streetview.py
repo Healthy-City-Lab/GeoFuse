@@ -950,9 +950,7 @@ async def get_panorama_api_async(
     async def fetch(t: Tile) -> bytes:
         path = f"/streetview/tiles/{zoom}/{t.x}/{t.y}"
         params = {"session": token, "panoId": pano.id}
-        data = await _api_request(
-            session, "GET", path, key, params=params, binary=True
-        )
+        data = await _api_request(session, "GET", path, key, params=params, binary=True)
         if data is None:
             raise FileNotFoundError(f"tile {zoom}/{t.x}/{t.y} of {pano.id[:12]}")
         return data

@@ -167,7 +167,12 @@ class RemoteSettingsTests(unittest.TestCase):
         self.assertEqual(
             remote.ssh_argv(),
             [
-                "ssh", "-T", "-p", "2222", "-i", "/home/me/.ssh/key",
+                "ssh",
+                "-T",
+                "-p",
+                "2222",
+                "-i",
+                "/home/me/.ssh/key",
                 "me@login.example.org",
                 "conda run -n geofuse geofuse --state-dir "
                 "'/scratch/me/geofuse state' agent --stdio",
@@ -175,8 +180,16 @@ class RemoteSettingsTests(unittest.TestCase):
         )
         self.assertEqual(
             remote.scp_argv("/scratch/out/a b.tif", "a.tif"),
-            ["scp", "-q", "-P", "2222", "-i", "/home/me/.ssh/key",
-             "me@login.example.org:'/scratch/out/a b.tif'", "a.tif"],
+            [
+                "scp",
+                "-q",
+                "-P",
+                "2222",
+                "-i",
+                "/home/me/.ssh/key",
+                "me@login.example.org:'/scratch/out/a b.tif'",
+                "a.tif",
+            ],
         )
 
     def test_remote_tables_are_checked(self):
@@ -206,9 +219,18 @@ class CommandTests(_LinkCase):
 
     def test_add_list_and_remove(self):
         code, out = self.geofuse(
-            "remote", "add", "hpc", "login.example.org", "--user", "me",
-            "--port", "2222", "--ssh-option", "-i /home/me/key",
-            "--command", "conda run -n geofuse geofuse",
+            "remote",
+            "add",
+            "hpc",
+            "login.example.org",
+            "--user",
+            "me",
+            "--port",
+            "2222",
+            "--ssh-option",
+            "-i /home/me/key",
+            "--command",
+            "conda run -n geofuse geofuse",
         )
         self.assertEqual(code, 0, out)
         table = userconfig.load(self.config).remotes["hpc"]

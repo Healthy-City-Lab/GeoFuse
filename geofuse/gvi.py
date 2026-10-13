@@ -622,7 +622,12 @@ class GVIEngine:
                     (
                         pid,
                         self._make_result(
-                            pt, slat, slon, cached["veg"], cached["ter"], pid,
+                            pt,
+                            slat,
+                            slon,
+                            cached["veg"],
+                            cached["ter"],
+                            pid,
                             pano_date_str,
                         ),
                     )
@@ -672,9 +677,14 @@ class GVIEngine:
             _log("OK", f"  GVI {pid[:12]}… → veg={val_veg:.3f}  ter={val_ter:.3f}")
             if save_panos or save_masks:
                 await loop.run_in_executor(
-                    getattr(self, "_prep_pool", None), self._save_artefacts, folder,
-                    pid, img, mask,
-                    save_panos, save_masks,
+                    getattr(self, "_prep_pool", None),
+                    self._save_artefacts,
+                    folder,
+                    pid,
+                    img,
+                    mask,
+                    save_panos,
+                    save_masks,
                 )
             out.append(
                 (
@@ -1038,9 +1048,7 @@ class GVIEngine:
                 searched = await asyncio.gather(*searchers, return_exceptions=True)
                 for _ in downloaders:
                     download_q.put_nowait(_STOP)
-                downloaded = await asyncio.gather(
-                    *downloaders, return_exceptions=True
-                )
+                downloaded = await asyncio.gather(*downloaders, return_exceptions=True)
                 if not consumer.done():
                     await gpu_q.put(_STOP)
                 await asyncio.gather(consumer, return_exceptions=True)

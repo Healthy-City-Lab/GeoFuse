@@ -22,14 +22,14 @@ from helpers import (
     render_job_restart_panel,
     sanitize_name_for_file,
 )
-from preset_row import finish as finish_presets
-from preset_row import refresh_if_stale, render_preset_row
 from map_preview import (
     add_black_point_layer,
     add_study_area_layers,
     add_uniform_point_layer,
     trim_point_gdf_for_display,
 )
+from preset_row import finish as finish_presets
+from preset_row import refresh_if_stale, render_preset_row
 from raster_overlay import add_mercator_image_overlay
 from rasterio.transform import array_bounds
 from shapely.geometry import box as shapely_box
@@ -923,7 +923,6 @@ def _gvi_units() -> list[dict]:
             }
         )
     return units
-
 
 
 def _gvi_discover_years(gdf, col: str) -> list[str]:

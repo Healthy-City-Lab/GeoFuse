@@ -70,8 +70,15 @@ class _AgentProcess:
     def __init__(self, state: StateDir):
         env = {**os.environ, "PYTHONPATH": ROOT}
         self.proc = subprocess.Popen(
-            [sys.executable, "-m", "geofuse", "--state-dir", str(state.root),
-             "agent", "--stdio"],
+            [
+                sys.executable,
+                "-m",
+                "geofuse",
+                "--state-dir",
+                str(state.root),
+                "agent",
+                "--stdio",
+            ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,

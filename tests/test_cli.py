@@ -31,7 +31,6 @@ from geofuse.cli import commands as cli
 from geofuse.cli.templates import template
 from geofuse.jobs.plans import Submission
 from geofuse.jobs.state import StateDir
-from geofuse.persistence.job_store import JobStore
 
 RUN = """
 [[ndvi]]
@@ -72,8 +71,18 @@ class _Case(unittest.TestCase):
 class ParserTests(unittest.TestCase):
     def test_every_setting_is_a_flag(self):
         args = cli.build_parser().parse_args(
-            ["plan", "r.toml", "--cloud-max", "20", "--no-water-mask",
-             "--statistics-ranges", "mean", "max", "--objective-metric", "spearman"]
+            [
+                "plan",
+                "r.toml",
+                "--cloud-max",
+                "20",
+                "--no-water-mask",
+                "--statistics-ranges",
+                "mean",
+                "max",
+                "--objective-metric",
+                "spearman",
+            ]
         )
         overrides = {o.key: o for o in cli._overrides(args)}
         self.assertEqual(overrides["cloud_max"].value, 20)
@@ -175,9 +184,10 @@ class JobCommandTests(_Case):
         def build(spec, **_kw):
             return Submission("ndvi", spec.name, {}, "submit_ndvi_subprocess", {})
 
-        with mock.patch(
-            "geofuse.persistence.job_executor.JobExecutor", _Executor
-        ), mock.patch("geofuse.jobs.plans.build", build):
+        with (
+            mock.patch("geofuse.persistence.job_executor.JobExecutor", _Executor),
+            mock.patch("geofuse.jobs.plans.build", build),
+        ):
             code, out, _ = self.geofuse("run", self.run_file)
         self.assertEqual(code, 0, out)
         jobs = StateDir(self.state_dir).jobs()

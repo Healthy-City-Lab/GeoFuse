@@ -172,9 +172,7 @@ def cmd_cache(args) -> int:
         j
         for j in _state(args).jobs()
         if j.state in ("running", "waiting")
-        and any(
-            j.spec.get("kind") in _CACHE_KINDS.get(k, ("fusion",)) for k in keys
-        )
+        and any(j.spec.get("kind") in _CACHE_KINDS.get(k, ("fusion",)) for k in keys)
     ]
     if busy and not args.force:
         names = ", ".join(f"{j.id} ({j.name})" for j in busy)

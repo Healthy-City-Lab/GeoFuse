@@ -18,12 +18,12 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-import geofuse  # noqa: F401  (import order: torch before GeoPandas)
 import geopandas as gpd
 import numpy as np
 import rasterio
 from shapely.geometry import Point, box
 
+import geofuse  # noqa: F401  (import order: torch before GeoPandas)
 from geofuse.core import generate_clustered_grid, shard_mask
 from geofuse.jobs import gvi_shards, runners
 

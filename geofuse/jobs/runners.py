@@ -488,9 +488,7 @@ def _capture_summary(accumulated: list, capture: Mapping) -> dict:
         "n_points": len(accumulated),
         "n_sampled": len(sampled),
         "n_no_capture_in_window": sum(
-            1
-            for r in accumulated
-            if r.get(CAPTURE_STATUS_KEY) == NO_CAPTURE_IN_WINDOW
+            1 for r in accumulated if r.get(CAPTURE_STATUS_KEY) == NO_CAPTURE_IN_WINDOW
         ),
         "capture_years": dict(sorted(years.items())),
         "capture_months": dict(sorted(months.items(), key=_month_order)),

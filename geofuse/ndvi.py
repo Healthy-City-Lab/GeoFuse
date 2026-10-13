@@ -18,7 +18,6 @@ import requests
 from shapely.geometry import box
 
 from .core import build_planar_tiles
-from .ee_auth import initialize as initialize_earth_engine
 from .crs_utils import (
     default_geotiff_creation_options,
     raster_geographic_bounds,
@@ -26,6 +25,7 @@ from .crs_utils import (
     select_grid_crs_with_warning,
     stream_mosaic_to_geotiff,
 )
+from .ee_auth import initialize as initialize_earth_engine
 from .ee_utils import (
     crs_to_ee_string,
     shapely_to_ee_geometry,
@@ -1378,11 +1378,7 @@ class NDVIEngine:
             # ~2013-04, so a window in between is served by Landsat 7 ETM+
             # alone — whose SLC-off striping (since 2003) leaves ~22% gaps a
             # seasonal median can't fully fill.
-            if (
-                sensor_set == "all"
-                and q_start < "2013-04-11"
-                and q_end > "2012-05-05"
-            ):
+            if sensor_set == "all" and q_start < "2013-04-11" and q_end > "2012-05-05":
                 _log(
                     "WARN",
                     "Date range lies in the Landsat-7-only era "
@@ -2301,8 +2297,7 @@ class NDVIEngine:
                         )
                     _log(
                         "WARN",
-                        f"Tile {res['idx'] + 1} failed after retry: "
-                        f"{res['error']}",
+                        f"Tile {res['idx'] + 1} failed after retry: " f"{res['error']}",
                     )
                 _emit_progress(done_count)
                 if cancel_callback and cancel_callback():

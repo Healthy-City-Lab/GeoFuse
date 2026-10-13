@@ -15,8 +15,6 @@ import numpy as np
 import pandas as pd
 from shapely.geometry import Point
 
-from geofuse import cgi_formulas as cf
-
 
 class TestCategoricalCovariateExpansion(unittest.TestCase):
     def _engine(self, cov_cols, cov_types):

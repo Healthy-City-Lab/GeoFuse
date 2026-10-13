@@ -196,8 +196,12 @@ def _expand_ndvi(step: _rf.Step, today: date) -> list[JobSpec]:
             specs.append(
                 spec(
                     "ndvi",
-                    {"mode": "range", "start_date": start, "end_date": end,
-                     "output_name": name},
+                    {
+                        "mode": "range",
+                        "start_date": start,
+                        "end_date": end,
+                        "output_name": name,
+                    },
                     {"files": _ndvi_files(out, name, s, stats)},
                 )
             )
@@ -225,9 +229,7 @@ def _expand_ndvi(step: _rf.Step, today: date) -> list[JobSpec]:
             stats = s["statistics_column"]
             folder = os.path.join(out, f"{base}_temporal_ndvi")
             years = column_years(unit["sources"], column)
-            by_year = {
-                y: _ndvi_files(folder, f"{base}_{y}", s, stats) for y in years
-            }
+            by_year = {y: _ndvi_files(folder, f"{base}_{y}", s, stats) for y in years}
             specs.append(
                 spec(
                     "ndvi_column",
@@ -453,9 +455,7 @@ def _channel_files(
     return {w: files[w] for w in waves}
 
 
-def _expand_fusion(
-    step: _rf.Step, by_step: dict[str, list[JobSpec]]
-) -> list[JobSpec]:
+def _expand_fusion(step: _rf.Step, by_step: dict[str, list[JobSpec]]) -> list[JobSpec]:
     i = step.inputs
     target = i["target"] or i["waves"][0]["file"]
     info = _target_info(target, i["layer"])
@@ -467,8 +467,16 @@ def _expand_fusion(
                 + i["negative_controls"]
                 + i["covariates"]
                 + i["moderators"]
-                + [i[k] for k in ("date_column", "entity_column", "wave_column",
-                                  "area_column") if i[k]]
+                + [
+                    i[k]
+                    for k in (
+                        "date_column",
+                        "entity_column",
+                        "wave_column",
+                        "area_column",
+                    )
+                    if i[k]
+                ]
             )
             if c not in info["fields"] and not i["waves"]
         ]
@@ -561,7 +569,8 @@ def expand(run: _rf.RunFile, *, today: date | None = None) -> list[JobSpec]:
         except PlanError as exc:
             msg = str(exc)
             prefix = f"[[{step.engine}]] {step.name}"
-            raise PlanError(msg if msg.startswith(prefix) else f"{prefix}: {msg}")
+            named = msg if msg.startswith(prefix) else f"{prefix}: {msg}"
+            raise PlanError(named) from exc
         by_step[step.key] = jobs
         specs.extend(jobs)
     return specs
@@ -621,8 +630,11 @@ def _build_ndvi(spec: JobSpec, ee_project: str | None = None) -> Submission:
     s, o = spec.settings, spec.options
     fname, raw, _ = _load_unit(spec)
     ds_path = None if spec.merged else spec.sources[0]
-    stats_key = {"range": "statistics_ranges", "specific": "statistics_specific",
-                 "column": "statistics_column"}[o["mode"]]
+    stats_key = {
+        "range": "statistics_ranges",
+        "specific": "statistics_specific",
+        "column": "statistics_column",
+    }[o["mode"]]
     options = {
         "temporal_reducers": list(s[stats_key]),
         "satellite": s["satellite"],
@@ -684,11 +696,17 @@ def _build_ndvi(spec: JobSpec, ee_project: str | None = None) -> Submission:
             "ndvi_column", spec.name, params, "submit_ndvi_column_subprocess", kwargs
         )
     if o["mode"] == "range":
-        mode_params = {"mode": "range", "start_date": o["start_date"],
-                       "end_date": o["end_date"]}
+        mode_params = {
+            "mode": "range",
+            "start_date": o["start_date"],
+            "end_date": o["end_date"],
+        }
     else:
-        mode_params = {"mode": "specific", "target_date": o["target_date"],
-                       "window_days": o["window_days"]}
+        mode_params = {
+            "mode": "specific",
+            "target_date": o["target_date"],
+            "window_days": o["window_days"],
+        }
     params = {
         **head,
         **mode_params,

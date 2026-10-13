@@ -77,14 +77,14 @@ class RunnerTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def _common(self):
-        return dict(
-            cloud_pct=10,
-            resolution=10,
-            buffer_m=0,
-            output_dir=self.dir,
-            save_geotiff=True,
-            save_geojson=False,
-        )
+        return {
+            "cloud_pct": 10,
+            "resolution": 10,
+            "buffer_m": 0,
+            "output_dir": self.dir,
+            "save_geotiff": True,
+            "save_geojson": False,
+        }
 
     def test_range_job(self):
         out = runners.run_ndvi(
@@ -101,7 +101,12 @@ class RunnerTests(unittest.TestCase):
         names = [os.path.basename(p) for p in out["output_paths"]]
         self.assertEqual(
             names,
-            ["site_ndvi.tif", "site_ndvi.json", "site_max_ndvi.tif", "site_max_ndvi.json"],
+            [
+                "site_ndvi.tif",
+                "site_ndvi.json",
+                "site_max_ndvi.tif",
+                "site_max_ndvi.json",
+            ],
         )
 
     def test_default_is_median_only(self):
@@ -114,22 +119,20 @@ class RunnerTests(unittest.TestCase):
             output_name="site",
             **self._common(),
         )
-        self.assertEqual(
-            tuple(_StubEngine.calls[0]["temporal_reducers"]), ("median",)
-        )
+        self.assertEqual(tuple(_StubEngine.calls[0]["temporal_reducers"]), ("median",))
         self.assertEqual(
             [os.path.basename(p) for p in out["output_paths"]],
             ["site_ndvi.tif", "site_ndvi.json"],
         )
 
     def test_acquisition_options_reach_the_engine_in_every_mode(self):
-        opts = dict(
-            water_mask=True,
-            cloud_handling="pixel_only",
-            reflectance="toa",
-            substitute_2012=True,
-            satellite="landsat_no_slc_off",
-        )
+        opts = {
+            "water_mask": True,
+            "cloud_handling": "pixel_only",
+            "reflectance": "toa",
+            "substitute_2012": True,
+            "satellite": "landsat_no_slc_off",
+        }
         runners.run_ndvi(
             _Ctx(),
             fname="site.geojson",
@@ -203,7 +206,9 @@ class RunnerTests(unittest.TestCase):
             temporal_reducers=["mean"],
             **self._common(),
         )
-        self.assertEqual([c["temporal_reducers"] for c in _StubEngine.calls], [["mean"]] * 2)
+        self.assertEqual(
+            [c["temporal_reducers"] for c in _StubEngine.calls], [["mean"]] * 2
+        )
         names = [os.path.basename(p) for p in out["output_paths"][1:]]
         self.assertEqual(
             names,

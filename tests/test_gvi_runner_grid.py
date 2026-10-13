@@ -18,10 +18,10 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-import geofuse  # noqa: F401  (import order: torch before GeoPandas)
 import geopandas as gpd
 from shapely.geometry import Point, box
 
+import geofuse  # noqa: F401  (import order: torch before GeoPandas)
 from geofuse.core import generate_clustered_grid, gvi_sampling_points
 from geofuse.jobs import runners
 
@@ -44,9 +44,19 @@ class _Engine:
         self.points = gdf
         for i, geom in enumerate(gdf.geometry):
             result_callback(
-                {"orig_index": i, "geometry": geom, "gvi_veg": 0.3, "gvi_ter": 0.1,
-                 "pano_id": f"p{i}", "pano_date": "2020-07", "lat": geom.y,
-                 "lon": geom.x, "row": 0, "col": i, "cluster_id": 0}
+                {
+                    "orig_index": i,
+                    "geometry": geom,
+                    "gvi_veg": 0.3,
+                    "gvi_ter": 0.1,
+                    "pano_id": f"p{i}",
+                    "pano_date": "2020-07",
+                    "lat": geom.y,
+                    "lon": geom.x,
+                    "row": 0,
+                    "col": i,
+                    "cluster_id": 0,
+                }
             )
 
 
@@ -62,15 +72,25 @@ class RunnerGridTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def run_gvi(self, raw, gtype, buffer_m, processed=None):
-        data = {"raw": raw, "type": gtype, "processed": processed, "meta": None,
-                "accumulated": [], "cache_ref": {}}
+        data = {
+            "raw": raw,
+            "type": gtype,
+            "processed": processed,
+            "meta": None,
+            "accumulated": [],
+            "cache_ref": {},
+        }
         runners.run_gvi(
             _Ctx(),
             fname="site.gpkg",
             dataset_data=data,
             init_args={"model_path": "m.pth"},
-            run_args={"step": 50, "buffer": buffer_m, "save_panos": False,
-                      "save_masks": False},
+            run_args={
+                "step": 50,
+                "buffer": buffer_m,
+                "save_panos": False,
+                "save_masks": False,
+            },
             output_dir=self.tmp.name,
             save_geotiff=False,
             save_geojson=False,
@@ -115,11 +135,20 @@ class RunnerGridTests(unittest.TestCase):
             out = runners.run_gvi(
                 _Ctx(),
                 fname="site.gpkg",
-                dataset_data={"raw": raw, "type": "point", "processed": None,
-                              "accumulated": [], "cache_ref": {}},
+                dataset_data={
+                    "raw": raw,
+                    "type": "point",
+                    "processed": None,
+                    "accumulated": [],
+                    "cache_ref": {},
+                },
                 init_args={"model_path": "m.pth"},
-                run_args={"step": 50, "buffer": 0, "save_panos": False,
-                          "save_masks": False},
+                run_args={
+                    "step": 50,
+                    "buffer": 0,
+                    "save_panos": False,
+                    "save_masks": False,
+                },
                 output_dir=self.tmp.name,
                 save_geotiff=False,
                 save_geojson=False,

@@ -22,7 +22,6 @@ for _p in (os.path.join(ROOT, "ui"), ROOT):
 
 import geopandas as gpd
 from shapely.geometry import Point
-
 from tabs import ndvi as ndvi_tab
 
 
@@ -128,7 +127,16 @@ class ResubmitTests(unittest.TestCase):
             satellite="landsat_no_slc_off",
         )
         self.assertEqual(
-            {k: kw[k] for k in ("water_mask", "cloud_handling", "reflectance", "substitute_2012", "satellite")},
+            {
+                k: kw[k]
+                for k in (
+                    "water_mask",
+                    "cloud_handling",
+                    "reflectance",
+                    "substitute_2012",
+                    "satellite",
+                )
+            },
             {
                 "water_mask": True,
                 "cloud_handling": "pixel_only",
@@ -140,10 +148,18 @@ class ResubmitTests(unittest.TestCase):
 
     def test_old_job_gets_acquisition_defaults(self):
         _params, (_kind, kw) = self._resubmit(
-            fname="site.geojson", mode="range", start_date="2023-06-01", end_date="2023-09-30"
+            fname="site.geojson",
+            mode="range",
+            start_date="2023-06-01",
+            end_date="2023-09-30",
         )
         self.assertEqual(
-            (kw["water_mask"], kw["cloud_handling"], kw["reflectance"], kw["substitute_2012"]),
+            (
+                kw["water_mask"],
+                kw["cloud_handling"],
+                kw["reflectance"],
+                kw["substitute_2012"],
+            ),
             (False, "scene_filter", "surface", False),
         )
 
@@ -250,9 +266,7 @@ class DateConfigPickerTests(unittest.TestCase):
                 self.assertEqual(picker.label, "Temporal statistic")
                 self.assertEqual(picker.value, ["median"])
 
-            at.multiselect(key="ndvi_stats_col_site.geojson").set_value(
-                ["mean", "max"]
-            )
+            at.multiselect(key="ndvi_stats_col_site.geojson").set_value(["mean", "max"])
             at.run()
             cfg = at.session_state["ndvi_date_configs"]["site.geojson"]
             self.assertEqual(cfg["stats_column"], ["mean", "max"])
@@ -272,7 +286,9 @@ class OneDayRangeTests(unittest.TestCase):
 
     APP = DateConfigPickerTests.APP.replace(
         '"use_specific": True', '"use_specific": False'
-    ).replace("date(2023, 6, 1), date(2023, 9, 30)", "date(2023, 7, 1), date(2023, 7, 1)")
+    ).replace(
+        "date(2023, 6, 1), date(2023, 9, 30)", "date(2023, 7, 1), date(2023, 7, 1)"
+    )
     WARNING = "End date must be on or after the start date."
 
     def test_same_day_is_valid_and_a_reversed_range_is_not(self):
@@ -322,7 +338,9 @@ class SettingsBoxTests(unittest.TestCase):
             self.assertFalse(at.exception)
             self.assertEqual(at.selectbox(key="ndvi_satellite").value, "auto")
             self.assertEqual(at.selectbox(key="ndvi_reflectance").value, "surface")
-            self.assertEqual(at.selectbox(key="ndvi_cloud_handling").value, "scene_filter")
+            self.assertEqual(
+                at.selectbox(key="ndvi_cloud_handling").value, "scene_filter"
+            )
             self.assertFalse(at.checkbox(key="ndvi_water_mask").value)
             self.assertFalse(at.checkbox(key="ndvi_substitute_2012").value)
             self.assertTrue(at.checkbox(key="ndvi_coverage_rescue").value)

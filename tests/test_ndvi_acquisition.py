@@ -39,13 +39,15 @@ def _aoi(km=0.6):
     lon, lat = -114.07, 51.04
     dlon = km * 1000 / (111_320 * math.cos(math.radians(lat)))
     dlat = km * 1000 / 110_950
-    return gpd.GeoDataFrame(geometry=[box(lon, lat, lon + dlon, lat + dlat)], crs="EPSG:4326")
+    return gpd.GeoDataFrame(
+        geometry=[box(lon, lat, lon + dlon, lat + dlat)], crs="EPSG:4326"
+    )
 
 
 AOI = _aoi()
-_X0, _, _X1, _ = Transformer.from_crs("EPSG:4326", GRID, always_xy=True).transform_bounds(
-    *AOI.total_bounds
-)
+_X0, _, _X1, _ = Transformer.from_crs(
+    "EPSG:4326", GRID, always_xy=True
+).transform_bounds(*AOI.total_bounds)
 THIRD_1 = _X0 + (_X1 - _X0) / 3
 THIRD_2 = _X0 + 2 * (_X1 - _X0) / 3
 
@@ -65,7 +67,11 @@ def _ndvi(red, nir):
 
 def landsat_sr(date, cloud, red, nir, *, tm=False, qa=0):
     dn = lambda r: (r + 0.2) / 0.0000275  # noqa: E731
-    bands = {"SR_B3": dn(red), "SR_B4": dn(nir)} if tm else {"SR_B4": dn(red), "SR_B5": dn(nir)}
+    bands = (
+        {"SR_B3": dn(red), "SR_B4": dn(nir)}
+        if tm
+        else {"SR_B4": dn(red), "SR_B5": dn(nir)}
+    )
     bands["QA_PIXEL"] = qa
     return Image(bands, {"date": date, "CLOUD_COVER": cloud})
 
@@ -152,7 +158,10 @@ class DefaultsTests(_Case):
 
     def test_default_landsat_composite(self):
         res = self.run_engine(
-            LANDSAT_SR, start="2015-06-01", end="2015-09-30", satellite="landsat",
+            LANDSAT_SR,
+            start="2015-06-01",
+            end="2015-09-30",
+            satellite="landsat",
             temporal_reducers="mean",
         )
         self.assertEqual(res["status"], "success", res.get("message"))
@@ -162,7 +171,12 @@ class DefaultsTests(_Case):
         np.testing.assert_allclose(arr, expected, rtol=1e-6)
         side = self.sidecar("site_mean")
         self.assertEqual(
-            (side["water_mask"], side["cloud_handling"], side["reflectance"], side["year_substituted"]),
+            (
+                side["water_mask"],
+                side["cloud_handling"],
+                side["reflectance"],
+                side["year_substituted"],
+            ),
             (False, "scene_filter", "surface", None),
         )
         self.assertEqual(side["ee_collection"], E.LANDSAT_MERGED_LABEL)
@@ -195,8 +209,13 @@ class WaterMaskTests(_Case):
         col = {E.LANDSAT8_COLLECTION_ID: [landsat_sr("2015-07-01", 5, 0.05, 0.40)]}
         for water in (False, True):
             res = self.run_engine(
-                col, self.WATER, start="2015-06-01", end="2015-09-30",
-                satellite="landsat", water_mask=water, name=f"w{int(water)}",
+                col,
+                self.WATER,
+                start="2015-06-01",
+                end="2015-09-30",
+                satellite="landsat",
+                water_mask=water,
+                name=f"w{int(water)}",
             )
             self.assertEqual(res["status"], "success", res.get("message"))
             arr, X, Y = self.raster(f"w{int(water)}")
@@ -218,9 +237,14 @@ class CloudHandlingTests(_Case):
 
     def _mean(self, scenes, mode, name):
         res = self.run_engine(
-            {E.LANDSAT8_COLLECTION_ID: scenes}, start="2015-06-01", end="2015-09-30",
-            satellite="landsat", cloud_handling=mode, temporal_reducers="mean",
-            cloud_max=20, name=name,
+            {E.LANDSAT8_COLLECTION_ID: scenes},
+            start="2015-06-01",
+            end="2015-09-30",
+            satellite="landsat",
+            cloud_handling=mode,
+            temporal_reducers="mean",
+            cloud_max=20,
+            name=name,
         )
         self.assertEqual(res["status"], "success", res.get("message"))
         return self.raster(f"{name}_mean")
@@ -234,7 +258,9 @@ class CloudHandlingTests(_Case):
         arr, X, Y = self._mean(scenes, "scene_filter", "sf")
         np.testing.assert_allclose(arr, a, rtol=1e-6)
         arr, X, Y = self._mean(scenes, "pixel_only", "po")
-        np.testing.assert_allclose(arr, np.where(_west(X, Y), a, (a + b) / 2), rtol=1e-6)
+        np.testing.assert_allclose(
+            arr, np.where(_west(X, Y), a, (a + b) / 2), rtol=1e-6
+        )
 
     def test_scene_only_keeps_the_cloudy_pixels_of_kept_scenes(self):
         scenes = [
@@ -244,21 +270,32 @@ class CloudHandlingTests(_Case):
         ]
         a, c = _ndvi(0.05, 0.40), _ndvi(0.05, 0.25)
         arr, X, Y = self._mean(scenes, "scene_filter", "sf")
-        np.testing.assert_allclose(arr, np.where(_west(X, Y), c, (a + c) / 2), rtol=1e-6)
+        np.testing.assert_allclose(
+            arr, np.where(_west(X, Y), c, (a + c) / 2), rtol=1e-6
+        )
         arr, X, Y = self._mean(scenes, "scene_only", "so")
         np.testing.assert_allclose(arr, (a + c) / 2, rtol=1e-6)
 
     def test_pixel_only_never_reports_every_scene_as_too_cloudy(self):
         scenes = [landsat_sr("2015-07-01", 95, 0.05, 0.40)]
         res = self.run_engine(
-            {E.LANDSAT8_COLLECTION_ID: scenes}, start="2015-06-01", end="2015-09-30",
-            satellite="landsat", cloud_max=10, name="sf",
+            {E.LANDSAT8_COLLECTION_ID: scenes},
+            start="2015-06-01",
+            end="2015-09-30",
+            satellite="landsat",
+            cloud_max=10,
+            name="sf",
         )
         self.assertEqual(res["status"], "error")
         self.assertIn("exceeded the 10% cloud threshold", res["message"])
         res = self.run_engine(
-            {E.LANDSAT8_COLLECTION_ID: scenes}, start="2015-06-01", end="2015-09-30",
-            satellite="landsat", cloud_max=10, cloud_handling="pixel_only", name="po",
+            {E.LANDSAT8_COLLECTION_ID: scenes},
+            start="2015-06-01",
+            end="2015-09-30",
+            satellite="landsat",
+            cloud_max=10,
+            cloud_handling="pixel_only",
+            name="po",
         )
         self.assertEqual(res["status"], "success", res.get("message"))
 
@@ -267,7 +304,11 @@ class CloudHandlingTests(_Case):
         col = {E.EE_COLLECTION_ID: [s2("2020-07-01", 5, 0.05, 0.40, SCL=scl)]}
         for mode, west_masked in (("scene_filter", True), ("scene_only", False)):
             res = self.run_engine(
-                col, start="2020-06-01", end="2020-09-30", cloud_handling=mode, name=mode,
+                col,
+                start="2020-06-01",
+                end="2020-09-30",
+                cloud_handling=mode,
+                name=mode,
             )
             self.assertEqual(res["status"], "success", res.get("message"))
             arr, X, Y = self.raster(mode)
@@ -293,15 +334,22 @@ class SensorSetTests(_Case):
         eng = E.__new__(E)
         with FakeEarthEngine(AOI, self.COLLECTIONS):
             n_all = eng._landsat_base(AOI, "2001-01-01", "2023-12-31").size().getInfo()
-            n_clean = eng._landsat_base(
-                AOI, "2001-01-01", "2023-12-31", sensor_set="no_slc_off"
-            ).size().getInfo()
+            n_clean = (
+                eng._landsat_base(
+                    AOI, "2001-01-01", "2023-12-31", sensor_set="no_slc_off"
+                )
+                .size()
+                .getInfo()
+            )
         self.assertEqual((n_all, n_clean), (5, 3))
 
     def test_a_2002_composite_uses_tm_and_pre_slc_etm(self):
         res = self.run_engine(
-            self.COLLECTIONS, start="2002-06-01", end="2002-09-30",
-            satellite="landsat_no_slc_off", temporal_reducers="mean",
+            self.COLLECTIONS,
+            start="2002-06-01",
+            end="2002-09-30",
+            satellite="landsat_no_slc_off",
+            temporal_reducers="mean",
         )
         self.assertEqual(res["status"], "success", res.get("message"))
         arr, _, _ = self.raster("site_mean")
@@ -315,12 +363,17 @@ class SensorSetTests(_Case):
 
     def test_slc_off_years_have_no_scenes(self):
         res = self.run_engine(
-            self.COLLECTIONS, start="2005-06-01", end="2005-09-30",
+            self.COLLECTIONS,
+            start="2005-06-01",
+            end="2005-09-30",
             satellite="landsat_no_slc_off",
         )
         self.assertEqual(res["status"], "error")
         res = self.run_engine(
-            self.COLLECTIONS, start="2005-06-01", end="2005-09-30", satellite="landsat",
+            self.COLLECTIONS,
+            start="2005-06-01",
+            end="2005-09-30",
+            satellite="landsat",
             name="all",
         )
         self.assertEqual(res["status"], "success", res.get("message"))
@@ -331,11 +384,19 @@ class ReflectanceTests(_Case):
 
     def test_landsat_toa(self):
         cols = {
-            E.LANDSAT_TOA_COLLECTION_IDS[0]: [landsat_toa("2009-07-01", 5, 0.06, 0.32, tm=True)],
-            E.LANDSAT5_COLLECTION_ID: [landsat_sr("2009-07-01", 5, 0.20, 0.25, tm=True)],
+            E.LANDSAT_TOA_COLLECTION_IDS[0]: [
+                landsat_toa("2009-07-01", 5, 0.06, 0.32, tm=True)
+            ],
+            E.LANDSAT5_COLLECTION_ID: [
+                landsat_sr("2009-07-01", 5, 0.20, 0.25, tm=True)
+            ],
         }
         res = self.run_engine(
-            cols, start="2009-06-01", end="2009-09-30", satellite="landsat", reflectance="toa",
+            cols,
+            start="2009-06-01",
+            end="2009-09-30",
+            satellite="landsat",
+            reflectance="toa",
         )
         self.assertEqual(res["status"], "success", res.get("message"))
         arr, _, _ = self.raster()
@@ -349,13 +410,17 @@ class ReflectanceTests(_Case):
     def test_sentinel2_toa_masks_with_qa60(self):
         qa60 = lambda X, Y: np.where(_west(X, Y), 1 << 10, 0)  # noqa: E731
         cols = {E.S2_TOA_COLLECTION_ID: [s2("2020-07-01", 5, 0.07, 0.33, QA60=qa60)]}
-        res = self.run_engine(cols, start="2020-06-01", end="2020-09-30", reflectance="toa")
+        res = self.run_engine(
+            cols, start="2020-06-01", end="2020-09-30", reflectance="toa"
+        )
         self.assertEqual(res["status"], "success", res.get("message"))
         arr, X, Y = self.raster()
         west = _west(X, Y)
         self.assertTrue((arr[west] == -9999).all())
         np.testing.assert_allclose(arr[~west], _ndvi(0.07, 0.33), rtol=1e-6)
-        self.assertEqual(self.fake.queried, [E.S2_TOA_COLLECTION_ID] * len(self.fake.queried))
+        self.assertEqual(
+            self.fake.queried, [E.S2_TOA_COLLECTION_ID] * len(self.fake.queried)
+        )
 
 
 class Year2012Tests(_Case):
@@ -365,33 +430,50 @@ class Year2012Tests(_Case):
 
     def test_substitution(self):
         res = self.run_engine(
-            self.COLLECTIONS, start="2012-06-01", end="2012-09-30", satellite="landsat",
+            self.COLLECTIONS,
+            start="2012-06-01",
+            end="2012-09-30",
+            satellite="landsat",
         )
         self.assertEqual(res["status"], "error")
         res = self.run_engine(
-            self.COLLECTIONS, start="2012-06-01", end="2012-09-30", satellite="landsat",
-            substitute_2012=True, name="sub",
+            self.COLLECTIONS,
+            start="2012-06-01",
+            end="2012-09-30",
+            satellite="landsat",
+            substitute_2012=True,
+            name="sub",
         )
         self.assertEqual(res["status"], "success", res.get("message"))
         side = self.sidecar("sub")
-        self.assertEqual((side["start_date"], side["end_date"]), ("2012-06-01", "2012-09-30"))
-        self.assertEqual((side["used_start_date"], side["used_end_date"]), ("2013-06-01", "2013-09-30"))
+        self.assertEqual(
+            (side["start_date"], side["end_date"]), ("2012-06-01", "2012-09-30")
+        )
+        self.assertEqual(
+            (side["used_start_date"], side["used_end_date"]),
+            ("2013-06-01", "2013-09-30"),
+        )
         self.assertEqual(side["year_substituted"], "2012 → 2013")
 
     def test_partial_and_leap_windows(self):
         self.assertEqual(
-            ndvi.substitute_year("2011-12-01", "2012-02-01"), ("2011-12-01", "2012-02-01", False)
+            ndvi.substitute_year("2011-12-01", "2012-02-01"),
+            ("2011-12-01", "2012-02-01", False),
         )
         self.assertEqual(
-            ndvi.substitute_year("2012-02-01", "2012-03-01"), ("2013-02-01", "2013-03-01", True)
+            ndvi.substitute_year("2012-02-01", "2012-03-01"),
+            ("2013-02-01", "2013-03-01", True),
         )
         self.assertEqual(
-            ndvi.substitute_year("2015-02-01", "2015-03-01"), ("2015-02-01", "2015-03-01", False)
+            ndvi.substitute_year("2015-02-01", "2015-03-01"),
+            ("2015-02-01", "2015-03-01", False),
         )
 
     def test_no_slc_off_2012_suggests_the_substitution(self):
         res = self.run_engine(
-            self.COLLECTIONS, start="2012-06-01", end="2012-09-30",
+            self.COLLECTIONS,
+            start="2012-06-01",
+            end="2012-09-30",
             satellite="landsat_no_slc_off",
         )
         self.assertIn("fill 2012 with 2013", res["message"])
@@ -425,13 +507,22 @@ class ResumeKeyTests(_Case):
         self.assertEqual(
             keys["default"],
             ndvi._compute_resume_key(
-                AOI.to_crs(4326), "2015-06-01", "2015-09-30", 10, RES, E.LANDSAT_MERGED_LABEL
+                AOI.to_crs(4326),
+                "2015-06-01",
+                "2015-09-30",
+                10,
+                RES,
+                E.LANDSAT_MERGED_LABEL,
             ),
         )
 
     def test_unknown_option_values_are_refused(self):
         eng = E.__new__(E)
-        for kw in ({"cloud_handling": "none"}, {"reflectance": "dn"}, {"satellite": "modis"}):
+        for kw in (
+            {"cloud_handling": "none"},
+            {"reflectance": "dn"},
+            {"satellite": "modis"},
+        ):
             with self.assertRaises(ValueError):
                 eng.download_and_process(AOI, "2015-06-01", "2015-09-30", "x", **kw)
 

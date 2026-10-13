@@ -207,7 +207,7 @@ class RefusalTests(_Case):
         self.assert_refused(panel, "'mode'")
         self.assert_refused(
             PIPELINE.replace('date_column = "interview_date"\n', ""),
-            "needs 'date_column'"
+            "needs 'date_column'",
         )
         cross = PIPELINE.replace('mode = "year-aware"', 'mode = "cross-sectional"')
         self.assert_refused(cross, "per-year files", ['fusion.ndvi={2019 = "x.tif"}'])

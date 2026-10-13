@@ -25,10 +25,10 @@ for _p in (os.path.join(ROOT, "ui"), ROOT):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import geofuse  # noqa: F401  (import order: torch before GeoPandas)
 import geopandas as gpd
 from shapely.geometry import Point
 
+import geofuse  # noqa: F401  (import order: torch before GeoPandas)
 from geofuse import streetview as sv
 from geofuse.gvi import CAPTURE_STATUS_KEY, NO_CAPTURE_IN_WINDOW, GVIEngine
 from geofuse.jobs import runners
@@ -78,14 +78,20 @@ class NoWindowTests(unittest.TestCase):
         for _ in range(2000):
             n = rng.randint(0, 6)
             caps = [
-                C(f"p{i}", rng.randint(2008, 2023), rng.choice([None] + list(range(1, 13))))
+                C(
+                    f"p{i}",
+                    rng.randint(2008, 2023),
+                    rng.choice([None] + list(range(1, 13))),
+                )
                 for i in range(n)
             ]
             date = rng.choice([None, (2019, 7)])
             pano = _pano(caps, date)
             target = rng.randint(2006, 2025)
             diff = rng.choice([None, 0, 1, 2, 5])
-            self.assertEqual(pano.select_capture(target, diff), _old_select(pano, target, diff))
+            self.assertEqual(
+                pano.select_capture(target, diff), _old_select(pano, target, diff)
+            )
 
 
 class MonthWindowTests(unittest.TestCase):
@@ -109,7 +115,11 @@ class MonthWindowTests(unittest.TestCase):
         rng = random.Random(3)
         for _ in range(500):
             caps = [
-                C(f"p{i}", rng.randint(2010, 2020), rng.choice([None] + list(range(1, 13))))
+                C(
+                    f"p{i}",
+                    rng.randint(2010, 2020),
+                    rng.choice([None] + list(range(1, 13))),
+                )
                 for i in range(rng.randint(1, 6))
             ]
             window = (rng.randint(1, 12), rng.randint(1, 12))
@@ -124,12 +134,16 @@ class MonthWindowTests(unittest.TestCase):
         # 2018 ± 0: only February 2018 is in the year window; outside May-Oct.
         self.assertIsNone(pano.select_capture(2018, 0, month_window=(5, 10)))
         self.assertEqual(
-            pano.select_capture(2018, 0, month_window=(5, 10), month_policy="prefer").id,
+            pano.select_capture(
+                2018, 0, month_window=(5, 10), month_policy="prefer"
+            ).id,
             "feb18",
         )
         # 2018 ± 1: summer 2017 is inside the window and wins over February 2018.
         self.assertEqual(
-            pano.select_capture(2018, 1, month_window=(5, 10), month_policy="prefer").id,
+            pano.select_capture(
+                2018, 1, month_window=(5, 10), month_policy="prefer"
+            ).id,
             "aug17",
         )
 
@@ -140,7 +154,9 @@ class MonthWindowTests(unittest.TestCase):
         self.assertFalse(sv.in_month_window(6, (11, 3)))
 
     def test_most_recent_in_window_when_no_year_is_targeted(self):
-        self.assertEqual(_pano(self.CAPS).select_capture(None, month_window=(5, 10)).id, "aug17")
+        self.assertEqual(
+            _pano(self.CAPS).select_capture(None, month_window=(5, 10)).id, "aug17"
+        )
         self.assertEqual(_pano(self.CAPS).select_capture(None).id, "feb18")
 
     def test_no_capture_list_checks_the_own_date(self):
@@ -149,7 +165,9 @@ class MonthWindowTests(unittest.TestCase):
         self.assertEqual(own_summer.select_capture(None, month_window=(5, 10)).month, 7)
         self.assertIsNone(own_winter.select_capture(None, month_window=(5, 10)))
         self.assertEqual(
-            own_winter.select_capture(None, month_window=(5, 10), month_policy="prefer").month,
+            own_winter.select_capture(
+                None, month_window=(5, 10), month_policy="prefer"
+            ).month,
             1,
         )
 
@@ -158,22 +176,34 @@ class EngineMarksWindowMissesTests(unittest.TestCase):
     def _resolve(self, pano, **kw):
         engine = GVIEngine.__new__(GVIEngine)
         gdf = gpd.GeoDataFrame(geometry=[Point(-114.0, 51.0)], crs="EPSG:4326")
-        pt = {"orig_index": 0, "lat": 51.0, "lon": -114.0, "geometry": gdf.geometry[0],
-              "row": 0, "col": 0}
-        with mock.patch.object(sv, "find_panorama_async", mock.AsyncMock(return_value=pano)):
+        pt = {
+            "orig_index": 0,
+            "lat": 51.0,
+            "lon": -114.0,
+            "geometry": gdf.geometry[0],
+            "row": 0,
+            "col": 0,
+        }
+        with mock.patch.object(
+            sv, "find_panorama_async", mock.AsyncMock(return_value=pano)
+        ):
             return asyncio.run(
                 engine._search_and_resolve(pt, None, gdf, set(), {}, None, **kw)
             )
 
     def test_a_point_with_no_capture_in_the_window_is_marked(self):
         pano = _pano([C("dec19", 2019, 12), C("jan18", 2018, 1)])
-        out = self._resolve(pano, target_year=None, max_year_diff=None, month_window=(5, 10))
+        out = self._resolve(
+            pano, target_year=None, max_year_diff=None, month_window=(5, 10)
+        )
         self.assertEqual(out[0], "done")
         self.assertEqual(out[1][CAPTURE_STATUS_KEY], NO_CAPTURE_IN_WINDOW)
 
     def test_an_in_window_capture_is_segmented(self):
         pano = _pano([C("dec19", 2019, 12), C("jul18", 2018, 7)])
-        out = self._resolve(pano, target_year=None, max_year_diff=None, month_window=(5, 10))
+        out = self._resolve(
+            pano, target_year=None, max_year_diff=None, month_window=(5, 10)
+        )
         self.assertEqual(out[0], "segment")
         self.assertEqual(out[2], "jul18")
         self.assertEqual(out[3], "2018-07")
@@ -198,18 +228,42 @@ class _Ctx:
 class _StubEngine:
     """Feeds two sampled points, one point with no in-window capture and one miss."""
 
-    def run_analysis(self, gdf, *, result_callback, target_year=None, month_window=None,
-                     month_policy="exclude", **_kw):
-        self.kw = {"target_year": target_year, "month_window": month_window,
-                   "month_policy": month_policy}
+    def run_analysis(
+        self,
+        gdf,
+        *,
+        result_callback,
+        target_year=None,
+        month_window=None,
+        month_policy="exclude",
+        **_kw,
+    ):
+        self.kw = {
+            "target_year": target_year,
+            "month_window": month_window,
+            "month_policy": month_policy,
+        }
         for i, (veg, date, status) in enumerate(
-            [(0.3, "2017-07", None), (0.4, "2017-08", None),
-             (None, None, NO_CAPTURE_IN_WINDOW), (None, None, None)]
+            [
+                (0.3, "2017-07", None),
+                (0.4, "2017-08", None),
+                (None, None, NO_CAPTURE_IN_WINDOW),
+                (None, None, None),
+            ]
         ):
-            res = {"orig_index": i, "geometry": Point(-114.0 + i * 1e-3, 51.0),
-                   "gvi_veg": veg, "gvi_ter": veg, "pano_id": None if veg is None else f"p{i}",
-                   "pano_date": date, "lat": 51.0, "lon": -114.0, "row": 0, "col": i,
-                   "cluster_id": 0}
+            res = {
+                "orig_index": i,
+                "geometry": Point(-114.0 + i * 1e-3, 51.0),
+                "gvi_veg": veg,
+                "gvi_ter": veg,
+                "pano_id": None if veg is None else f"p{i}",
+                "pano_date": date,
+                "lat": 51.0,
+                "lon": -114.0,
+                "row": 0,
+                "col": i,
+                "cluster_id": 0,
+            }
             if status:
                 res[CAPTURE_STATUS_KEY] = status
             result_callback(res)
@@ -231,12 +285,22 @@ class RunnerOutputTests(unittest.TestCase):
         return runners.run_gvi(
             _Ctx(),
             fname="site.geojson",
-            dataset_data={"accumulated": [], "processed": pts, "meta": {"step_m": 50},
-                          "cache_ref": {}},
+            dataset_data={
+                "accumulated": [],
+                "processed": pts,
+                "meta": {"step_m": 50},
+                "cache_ref": {},
+            },
             init_args={"model_path": "m.pth"},
-            run_args={"step": 50, "save_panos": False, "save_masks": False,
-                      "target_year": target_year, "max_year_diff": 2,
-                      "month_window": month_window, "month_policy": "exclude"},
+            run_args={
+                "step": 50,
+                "save_panos": False,
+                "save_masks": False,
+                "target_year": target_year,
+                "max_year_diff": 2,
+                "month_window": month_window,
+                "month_policy": "exclude",
+            },
             output_dir=self.tmp.name,
             save_geotiff=False,
             save_geojson=False,
@@ -249,12 +313,19 @@ class RunnerOutputTests(unittest.TestCase):
         names = sorted(os.listdir(self.tmp.name))
         self.assertEqual(
             names,
-            ["site_2015_gvi.gpkg", "site_2015_gvi.json", "site_2018_gvi.gpkg", "site_2018_gvi.json"],
+            [
+                "site_2015_gvi.gpkg",
+                "site_2015_gvi.json",
+                "site_2018_gvi.gpkg",
+                "site_2018_gvi.json",
+            ],
         )
 
     def test_most_recent_keeps_its_name(self):
         self._run(None)
-        self.assertEqual(sorted(os.listdir(self.tmp.name)), ["site_gvi.gpkg", "site_gvi.json"])
+        self.assertEqual(
+            sorted(os.listdir(self.tmp.name)), ["site_gvi.gpkg", "site_gvi.json"]
+        )
 
     def test_sidecar_records_the_capture_rule_and_counts(self):
         self._run(2017, month_window=[5, 10])
@@ -316,15 +387,22 @@ class CaptureConfigWidgetTests(unittest.TestCase):
             at.run()
             cfg = at.session_state["gvi_date_configs"]["site.geojson"]
             self.assertTrue(cfg["use_months"])
-            self.assertEqual((cfg["month_start"], cfg["month_end"], cfg["month_policy"]), (5, 10, "prefer"))
+            self.assertEqual(
+                (cfg["month_start"], cfg["month_end"], cfg["month_policy"]),
+                (5, 10, "prefer"),
+            )
 
 
 class RestartReplayTests(unittest.TestCase):
     def test_summary_and_replay(self):
         from tabs import gvi as gvi_tab
 
-        p = {"fname": "site.geojson", "month_window": [5, 10], "month_policy": "prefer",
-             "target_year": 2017}
+        p = {
+            "fname": "site.geojson",
+            "month_window": [5, 10],
+            "month_policy": "prefer",
+            "target_year": 2017,
+        }
         self.assertIn(
             "**Capture months:** May–Oct (outside as fallback)",
             gvi_tab._gvi_restart_summary_lines(p),

@@ -54,18 +54,18 @@ class LadderRadiiTests(unittest.TestCase):
 class EngineLadderTests(unittest.TestCase):
     def _engine(self, **over):
         eng = MetricFusionEngine.__new__(MetricFusionEngine)
-        cfg = dict(
-            gvi_buffer_min_m=20.0,
-            gvi_buffer_max_m=500.0,
-            gvi_buffer_step_m=20.0,
-            ndvi_buffer_min_m=50.0,
-            ndvi_buffer_max_m=2000.0,
-            ndvi_buffer_step_m=50.0,
-            gvi_ladder_spacing="linear",
-            ndvi_ladder_spacing="linear",
-            gvi_ladder_rungs=15,
-            ndvi_ladder_rungs=15,
-        )
+        cfg = {
+            "gvi_buffer_min_m": 20.0,
+            "gvi_buffer_max_m": 500.0,
+            "gvi_buffer_step_m": 20.0,
+            "ndvi_buffer_min_m": 50.0,
+            "ndvi_buffer_max_m": 2000.0,
+            "ndvi_buffer_step_m": 50.0,
+            "gvi_ladder_spacing": "linear",
+            "ndvi_ladder_spacing": "linear",
+            "gvi_ladder_rungs": 15,
+            "ndvi_ladder_rungs": 15,
+        }
         cfg.update(over)
         eng.__dict__.update(cfg)
         return eng
@@ -86,21 +86,21 @@ class EngineLadderTests(unittest.TestCase):
 
 
 class FingerprintTests(unittest.TestCase):
-    BASE = dict(
-        buffer_meters=2000.0,
-        gvi_buffer_min_m=20.0,
-        gvi_buffer_max_m=500.0,
-        gvi_buffer_step_m=20.0,
-        ndvi_buffer_min_m=50.0,
-        ndvi_buffer_max_m=2000.0,
-        ndvi_buffer_step_m=50.0,
-        cgi_formula="weighted_average_gvi",
-        covariate_columns=["age"],
-        whole_grid_scaling=True,
-        cgi_grid_spacing_m=50,
-        area_balanced_split=True,
-        test_size=0.2,
-    )
+    BASE = {
+        "buffer_meters": 2000.0,
+        "gvi_buffer_min_m": 20.0,
+        "gvi_buffer_max_m": 500.0,
+        "gvi_buffer_step_m": 20.0,
+        "ndvi_buffer_min_m": 50.0,
+        "ndvi_buffer_max_m": 2000.0,
+        "ndvi_buffer_step_m": 50.0,
+        "cgi_formula": "weighted_average_gvi",
+        "covariate_columns": ["age"],
+        "whole_grid_scaling": True,
+        "cgi_grid_spacing_m": 50,
+        "area_balanced_split": True,
+        "test_size": 0.2,
+    }
 
     def test_linear_ladders_keep_their_hash(self):
         a = runners._fusion_config_fingerprint(**self.BASE)
@@ -151,16 +151,22 @@ class LadderWidgetTests(unittest.TestCase):
             self.assertEqual(spacing.value, "linear")
             self.assertFalse(at.number_input(key="fusion_ndvi_buffer_step").disabled)
             self.assertTrue(at.number_input(key="fusion_ndvi_ladder_rungs").disabled)
-            self.assertIn("10 radii: 100, 200, 300", " ".join(c.value for c in at.caption))
+            self.assertIn(
+                "10 radii: 100, 200, 300", " ".join(c.value for c in at.caption)
+            )
 
             spacing.set_value("log")
             at.number_input(key="fusion_ndvi_ladder_rungs").set_value(5)
             at.run()
             self.assertTrue(at.number_input(key="fusion_ndvi_buffer_step").disabled)
             self.assertFalse(at.number_input(key="fusion_ndvi_ladder_rungs").disabled)
-            self.assertIn("5 radii: 100, 178, 316, 562, 1000 m", [c.value for c in at.caption])
+            self.assertIn(
+                "5 radii: 100, 178, 316, 562, 1000 m", [c.value for c in at.caption]
+            )
             # The GVI row keeps its own settings.
-            self.assertEqual(at.selectbox(key="fusion_gvi_ladder_spacing").value, "linear")
+            self.assertEqual(
+                at.selectbox(key="fusion_gvi_ladder_spacing").value, "linear"
+            )
 
 
 class RadiusPriorWidgetTests(unittest.TestCase):

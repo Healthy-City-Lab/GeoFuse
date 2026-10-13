@@ -145,7 +145,7 @@ class TestYearKeyedIntake(unittest.TestCase):
                 wave_labels=("2010", "2012"),
                 wave_col="_gf_year",
                 date_col="date",
-                greenery_files={ch: greenery for ch in ("veg", "terrain", "ndvi")},
+                greenery_files=dict.fromkeys(("veg", "terrain", "ndvi"), greenery),
                 scoring_metric=metric,
                 derive_wave_from_date=True,
             )

@@ -24,9 +24,9 @@ if ROOT not in sys.path:
 import geopandas as gpd
 import numpy as np
 import rasterio
+import shapely
 from pyproj import CRS, Transformer
 from rasterio.transform import from_origin
-import shapely
 from shapely.geometry import box
 from shapely.ops import transform as shp_transform
 
@@ -348,17 +348,24 @@ class SingleTileTests(_EngineCase):
         self.assertEqual(fake.exports, [(("median", "mean", "max"), "float64")])
         self.assertEqual(set(res["reducers"]), {"median", "mean", "max"})
         self.assertEqual(res["tif"], os.path.join(self.out, "site_ndvi.tif"))
-        for stat, name in (("median", "site"), ("mean", "site_mean"), ("max", "site_max")):
+        for stat, name in (
+            ("median", "site"),
+            ("mean", "site_mean"),
+            ("max", "site_max"),
+        ):
             tif = os.path.join(self.out, f"{name}_ndvi.tif")
             self.assertEqual(res["reducers"][stat]["tif"], tif)
             self.assertComposite(tif, stat)
             self.assertTrue(os.path.isfile(os.path.join(self.out, f"{name}_ndvi.gpkg")))
             self.assertEqual(self.sidecar(name)["temporal_reducer"], stat)
-        self.assertEqual(sorted(os.listdir(self.out)), sorted(
-            f"{n}_ndvi.{ext}"
-            for n in ("site", "site_mean", "site_max")
-            for ext in ("tif", "gpkg", "json")
-        ))
+        self.assertEqual(
+            sorted(os.listdir(self.out)),
+            sorted(
+                f"{n}_ndvi.{ext}"
+                for n in ("site", "site_mean", "site_max")
+                for ext in ("tif", "gpkg", "json")
+            ),
+        )
 
     def test_matches_a_single_statistic_run(self):
         """A statistic's file holds what a run of that statistic alone writes."""
@@ -367,9 +374,10 @@ class SingleTileTests(_EngineCase):
         with FakeEarthEngine(aoi):
             _run(self.engine(), aoi, alone, "median")
             _run(self.engine(), aoi, self.out, ["median", "max"])
-        with rasterio.open(os.path.join(alone, "site_ndvi.tif")) as a, rasterio.open(
-            os.path.join(self.out, "site_ndvi.tif")
-        ) as b:
+        with (
+            rasterio.open(os.path.join(alone, "site_ndvi.tif")) as a,
+            rasterio.open(os.path.join(self.out, "site_ndvi.tif")) as b,
+        ):
             self.assertEqual(a.dtypes, b.dtypes)
             self.assertEqual(a.transform, b.transform)
             np.testing.assert_array_equal(a.read(1), b.read(1))
@@ -415,7 +423,10 @@ class TiledCacheTests(_EngineCase):
         self.assertComposite(os.path.join(self.out, "site_ndvi.tif"), "median")
         self.assertComposite(os.path.join(self.out, "site_max_ndvi.tif"), "max")
 
-        keys = {r: self.sidecar(n)["resume_key"] for r, n in (("median", "site"), ("max", "site_max"))}
+        keys = {
+            r: self.sidecar(n)["resume_key"]
+            for r, n in (("median", "site"), ("max", "site_max"))
+        }
         self.assertEqual(self._workspaces(), sorted(keys.values()))
         for key in keys.values():
             tiles = os.listdir(os.path.join(self.cache, key))

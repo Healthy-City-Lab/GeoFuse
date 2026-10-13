@@ -51,5 +51,6 @@ class ScriptTests(_Case):
         self.assertLess(level1, submit.index("level1-light.sbatch"))
         self.assertIn("--dependency=afterok:$after", submit)
 
+
 if __name__ == "__main__":
     unittest.main()

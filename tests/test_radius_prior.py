@@ -66,7 +66,9 @@ class PriorMomentsTests(unittest.TestCase):
         self.assertAlmostEqual(c, (a + b) / 2)
         self.assertAlmostEqual(s, (b - a) / math.sqrt(12))
         self.assertAlmostEqual(math.exp(c), math.sqrt(50 * 2000))
-        self.assertEqual(bi._radius_prior(LINEAR, "range"), bi._radius_prior(LOG15, "range"))
+        self.assertEqual(
+            bi._radius_prior(LINEAR, "range"), bi._radius_prior(LOG15, "range")
+        )
 
     def test_rung_prior_is_unchanged(self):
         lr = np.log(LINEAR)
@@ -84,7 +86,9 @@ class LogWidthTests(unittest.TestCase):
         r = np.array([100.0, 200.0, 400.0, 1000.0])
         w = bi.log_widths(r)[0]
         g = np.diff(np.log(r))
-        np.testing.assert_allclose(w, [g[0] / 2, (g[0] + g[1]) / 2, (g[1] + g[2]) / 2, g[2] / 2])
+        np.testing.assert_allclose(
+            w, [g[0] / 2, (g[0] + g[1]) / 2, (g[1] + g[2]) / 2, g[2] / 2]
+        )
         self.assertAlmostEqual(w.sum(), math.log(10))
 
     def test_widths_follow_each_channels_own_rungs(self):
@@ -171,7 +175,8 @@ class RecordedModeTests(unittest.TestCase):
         self.assertEqual(s["radius_prior"], "range")
         c, sd = bi._radius_prior(radii, "range")
         np.testing.assert_allclose(
-            s["peak_radius_prior_ci"], [math.exp(c - 1.96 * sd), math.exp(c + 1.96 * sd)]
+            s["peak_radius_prior_ci"],
+            [math.exp(c - 1.96 * sd), math.exp(c + 1.96 * sd)],
         )
 
     def test_unknown_mode_is_refused(self):

@@ -149,7 +149,8 @@ def cmd_remote_fetch(args) -> int:
         client.call("hello", timeout=LOGIN_TIMEOUT_S)
         files = fetch_outputs(client, args.job, dest, remote=remote, progress=_print)
     except LinkError as exc:
-        raise CliError(f"The link to {remote.name} failed: {exc}", EXIT_ENVIRONMENT)
+        message = f"The link to {remote.name} failed: {exc}"
+        raise CliError(message, EXIT_ENVIRONMENT) from exc
     except RemoteRefused as exc:
         raise CliError(str(exc), EXIT_INVALID) from exc
     finally:
@@ -185,9 +186,7 @@ def add_parsers(sub, common) -> None:
         help="how geofuse starts there (default: geofuse), e.g. "
         "'conda run -n geofuse geofuse'",
     )
-    a.add_argument(
-        "--remote-state-dir", metavar="DIR", help="the state folder there"
-    )
+    a.add_argument("--remote-state-dir", metavar="DIR", help="the state folder there")
     a.add_argument("--ssh", help="the ssh program (default: ssh)")
     a.set_defaults(func=cmd_remote_add)
 

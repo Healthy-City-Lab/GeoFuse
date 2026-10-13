@@ -16,11 +16,11 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-import geofuse  # noqa: F401  (import order: torch before GeoPandas)
 import geopandas  # noqa: F401  (pyproj's DLLs load before torchvision's)
 import numpy as np
 import torch
 
+import geofuse  # noqa: F401  (import order: torch before GeoPandas)
 from geofuse import vision
 from geofuse.vision import DeepLabSegmenter
 
@@ -63,9 +63,7 @@ class CountingTests(unittest.TestCase):
         reference = seg.predict_batch(batch)
         self.assertEqual(masks.dtype, np.uint8)
         np.testing.assert_array_equal(masks, reference)
-        self.assertEqual(
-            fractions, [seg.calculate_gvi_from_mask(m) for m in reference]
-        )
+        self.assertEqual(fractions, [seg.calculate_gvi_from_mask(m) for m in reference])
         self.assertIsNone(seg.segment(batch)[1])
 
     def test_a_single_image_is_a_batch_of_one(self):
@@ -129,9 +127,7 @@ class CudaGraphTests(unittest.TestCase):
     def test_real_model_graph_is_bit_identical_in_fp32(self):
         seg = DeepLabSegmenter(ckpt_path=MODEL, precision="fp32")
         rng = np.random.default_rng(3)
-        image = torch.from_numpy(
-            rng.normal(size=(1, 3, 512, 1024)).astype(np.float32)
-        )
+        image = torch.from_numpy(rng.normal(size=(1, 3, 512, 1024)).astype(np.float32))
         graphed = seg.segment(image, masks=True)[1]
         self.assertTrue(seg.graphs_in_use)
         seg.cuda_graphs = False

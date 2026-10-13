@@ -37,9 +37,13 @@ def _doc(engine="ndvi", **settings):
 
 class ValidationTests(unittest.TestCase):
     def test_other_engine_is_refused_with_the_tab_named(self):
-        with self.assertRaisesRegex(presets.PresetError, "This is a GVI preset — load it in the GVI tab"):
+        with self.assertRaisesRegex(
+            presets.PresetError, "This is a GVI preset — load it in the GVI tab"
+        ):
             presets.validate(_doc("gvi", buffer_m=0), "ndvi")
-        with self.assertRaisesRegex(presets.PresetError, "This is a NDVI preset — load it in the NDVI tab"):
+        with self.assertRaisesRegex(
+            presets.PresetError, "This is a NDVI preset — load it in the NDVI tab"
+        ):
             presets.validate(_doc("ndvi", buffer_m=0), "gvi")
 
     def test_unknown_settings_warn_and_are_ignored(self):
@@ -70,7 +74,9 @@ class ValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(presets.PresetError, "credential"):
             presets.validate({**_doc("gvi", buffer_m=0), "api_key": "x"}, "gvi")
         with self.assertRaisesRegex(presets.PresetError, "credential"):
-            presets.validate(_doc("gvi", download_mode="api", google_api_key="x"), "gvi")
+            presets.validate(
+                _doc("gvi", download_mode="api", google_api_key="x"), "gvi"
+            )
         leaked = "AIza" + "B" * 35
         with self.assertRaisesRegex(presets.PresetError, "credential"):
             presets.validate({**_doc("gvi", buffer_m=0), "description": leaked}, "gvi")
@@ -90,7 +96,10 @@ class ValidationTests(unittest.TestCase):
             (s["satellite"], s["reflectance"], s["cloud_handling"], s["water_mask"]),
             ("landsat_no_slc_off", "toa", "pixel_only", True),
         )
-        self.assertEqual((s["substitute_2012"], s["coverage_rescue"], s["resolution_m"]), (True, False, 30))
+        self.assertEqual(
+            (s["substitute_2012"], s["coverage_rescue"], s["resolution_m"]),
+            (True, False, 30),
+        )
         self.assertEqual(s["statistics_column"], ["mean", "max"])
 
 
@@ -103,14 +112,20 @@ class LibraryTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_save_then_load_round_trip(self):
-        settings = presets.load_settings("ndvi", "Landsat TOA, all scenes, water-masked")
+        settings = presets.load_settings(
+            "ndvi", "Landsat TOA, all scenes, water-masked"
+        )
         doc = presets.make_preset("ndvi", "My Landsat", "for P1", settings)
         path = presets.save_user_preset(doc, self.lib)
         self.assertEqual(path.parent.name, "ndvi")
-        self.assertEqual(presets.load_settings("ndvi", "My Landsat", self.lib), settings)
+        self.assertEqual(
+            presets.load_settings("ndvi", "My Landsat", self.lib), settings
+        )
         names = [e.name for e in presets.list_presets("ndvi", self.lib)]
         self.assertEqual(names[-1], "My Landsat")
-        self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["format"], "geofuse-preset")
+        self.assertEqual(
+            json.loads(path.read_text(encoding="utf-8"))["format"], "geofuse-preset"
+        )
 
     def test_name_clashes(self):
         doc = presets.make_preset("gvi", "Mine", "", {"buffer_m": 50})
@@ -119,9 +134,13 @@ class LibraryTests(unittest.TestCase):
             presets.save_user_preset(doc, self.lib)
         doc2 = presets.make_preset("gvi", "Mine", "", {"buffer_m": 100})
         presets.save_user_preset(doc2, self.lib, overwrite=True)
-        self.assertEqual(presets.load_settings("gvi", "Mine", self.lib), {"buffer_m": 100})
+        self.assertEqual(
+            presets.load_settings("gvi", "Mine", self.lib), {"buffer_m": 100}
+        )
         with self.assertRaisesRegex(presets.PresetError, "built-in"):
-            presets.save_user_preset(presets.make_preset("gvi", "Default", "", {}), self.lib)
+            presets.save_user_preset(
+                presets.make_preset("gvi", "Default", "", {}), self.lib
+            )
 
     def test_unreadable_files(self):
         bad = os.path.join(self.lib, "bad.json")
@@ -182,20 +201,33 @@ ndvi_tab._render_ndvi_date_config()
             sel.set_value("Landsat TOA, all scenes, water-masked")
             at.run()
             self.assertFalse(at.exception)
-            self.assertEqual(at.selectbox(key="ndvi_satellite").value, "landsat_no_slc_off")
+            self.assertEqual(
+                at.selectbox(key="ndvi_satellite").value, "landsat_no_slc_off"
+            )
             self.assertEqual(at.selectbox(key="ndvi_reflectance").value, "toa")
-            self.assertEqual(at.selectbox(key="ndvi_cloud_handling").value, "pixel_only")
+            self.assertEqual(
+                at.selectbox(key="ndvi_cloud_handling").value, "pixel_only"
+            )
             self.assertEqual(at.number_input(key="ndvi_res").value, 30)
             self.assertTrue(at.checkbox(key="ndvi_water_mask").value)
             self.assertTrue(at.checkbox(key="ndvi_substitute_2012").value)
             self.assertFalse(at.checkbox(key="ndvi_coverage_rescue").value)
             self.assertTrue(at.slider(key="ndvi_cloud").disabled)
-            self.assertEqual(at.multiselect(key="ndvi_stats_ranges_site.geojson").value, ["mean", "max"])
-            cfg = at.session_state["ndvi_date_configs"]["site.geojson"]
-            self.assertEqual((cfg["stats_column"], cfg["season_start_month"]), (["mean", "max"], 5))
-            self.assertEqual(at.session_state["_ndvi_preset_in_force"], "Landsat TOA, all scenes, water-masked")
             self.assertEqual(
-                at.selectbox(key="ndvi_preset_select").value, "Landsat TOA, all scenes, water-masked"
+                at.multiselect(key="ndvi_stats_ranges_site.geojson").value,
+                ["mean", "max"],
+            )
+            cfg = at.session_state["ndvi_date_configs"]["site.geojson"]
+            self.assertEqual(
+                (cfg["stats_column"], cfg["season_start_month"]), (["mean", "max"], 5)
+            )
+            self.assertEqual(
+                at.session_state["_ndvi_preset_in_force"],
+                "Landsat TOA, all scenes, water-masked",
+            )
+            self.assertEqual(
+                at.selectbox(key="ndvi_preset_select").value,
+                "Landsat TOA, all scenes, water-masked",
             )
 
             at.checkbox(key="ndvi_water_mask").uncheck()
@@ -209,17 +241,26 @@ ndvi_tab._render_ndvi_date_config()
             saved = presets.load_settings("ndvi", "No water mask", lib)
             self.assertFalse(saved["water_mask"])
             self.assertEqual(saved["reflectance"], "toa")
-            self.assertEqual(at.selectbox(key="ndvi_preset_select").value, "No water mask")
+            self.assertEqual(
+                at.selectbox(key="ndvi_preset_select").value, "No water mask"
+            )
 
             # Loading a GVI file in this tab is refused and changes nothing.
             gvi_file = os.path.join(lib, "gvi.json")
-            presets.write_preset(gvi_file, presets.make_preset("gvi", "G", "", {"buffer_m": 0}))
+            presets.write_preset(
+                gvi_file, presets.make_preset("gvi", "G", "", {"buffer_m": 0})
+            )
             at.session_state["ndvi_preset_manual"] = True
             at.run()
             at.text_input(key="ndvi_preset_manual_path").input(gvi_file)
             at.run()
-            self.assertIn("This is a GVI preset — load it in the GVI tab", " ".join(e.value for e in at.error))
-            self.assertEqual(at.selectbox(key="ndvi_preset_select").value, "No water mask")
+            self.assertIn(
+                "This is a GVI preset — load it in the GVI tab",
+                " ".join(e.value for e in at.error),
+            )
+            self.assertEqual(
+                at.selectbox(key="ndvi_preset_select").value, "No water mask"
+            )
 
     def test_no_preset_means_no_provenance(self):
         with tempfile.TemporaryDirectory() as lib:
@@ -256,16 +297,25 @@ gvi_tab._render_gvi_date_config()
             self.assertFalse(at.exception)
             self.assertEqual(at.selectbox(key="gvi_preset_select").value, "Custom")
 
-            at.selectbox(key="gvi_preset_select").set_value("Historical capture ± 2 years")
+            at.selectbox(key="gvi_preset_select").set_value(
+                "Historical capture ± 2 years"
+            )
             at.run()
             self.assertFalse(at.exception)
             from tabs import gvi as gvi_tab
 
-            self.assertEqual(at.radio(key="gvi_mode_site.geojson").value, gvi_tab._GVI_MODE_YEAR)
+            self.assertEqual(
+                at.radio(key="gvi_mode_site.geojson").value, gvi_tab._GVI_MODE_YEAR
+            )
             self.assertTrue(at.checkbox(key="gvi_usemd_site.geojson").value)
             self.assertEqual(at.number_input(key="gvi_md_site.geojson").value, 2)
-            self.assertEqual(at.radio(key="gvi_download_mode").value, "Package (Scraper)")
-            self.assertEqual(at.selectbox(key="gvi_preset_select").value, "Historical capture ± 2 years")
+            self.assertEqual(
+                at.radio(key="gvi_download_mode").value, "Package (Scraper)"
+            )
+            self.assertEqual(
+                at.selectbox(key="gvi_preset_select").value,
+                "Historical capture ± 2 years",
+            )
 
             at.number_input(key="gvi_md_site.geojson").set_value(3)
             at.run()
@@ -288,13 +338,26 @@ class ProvenanceTests(unittest.TestCase):
         from geofuse.jobs import runners
 
         with tempfile.TemporaryDirectory() as d:
-            kw = dict(grid_crs=None, export_crs="EPSG:32611", export_crs_name="UTM",
-                      export_distortion=0.0, n_clusters=1, tiles_total=1, tiles_succeeded=1,
-                      start_date="2020-06-01", end_date="2020-09-30", cloud_max=10,
-                      resolution_m=10, max_tile_size_km=5, ee_collection="X")
+            kw = {
+                "grid_crs": None,
+                "export_crs": "EPSG:32611",
+                "export_crs_name": "UTM",
+                "export_distortion": 0.0,
+                "n_clusters": 1,
+                "tiles_total": 1,
+                "tiles_succeeded": 1,
+                "start_date": "2020-06-01",
+                "end_date": "2020-09-30",
+                "cloud_max": 10,
+                "resolution_m": 10,
+                "max_tile_size_km": 5,
+                "ee_collection": "X",
+            }
             with open(ndvi._write_ndvi_sidecar(d, "a", **kw)) as f:
                 self.assertNotIn("preset", json.load(f))
-            with open(ndvi._write_ndvi_sidecar(d, "b", preset="Sentinel-2 10 m", **kw)) as f:
+            with open(
+                ndvi._write_ndvi_sidecar(d, "b", preset="Sentinel-2 10 m", **kw)
+            ) as f:
                 self.assertEqual(json.load(f)["preset"], "Sentinel-2 10 m")
         self.assertNotIn("preset", runners._capture_settings("recent", None, {}))
         self.assertEqual(

@@ -12,7 +12,6 @@ import os
 import sys
 import tempfile
 import textwrap
-import types
 import unittest
 from datetime import date
 
@@ -94,8 +93,9 @@ class ExpandTests(_Case):
             ],
         )
         specific = specs[1].options
-        self.assertEqual((specific["start_date"], specific["end_date"]),
-                         ("2026-09-01", "2026-10-12"))
+        self.assertEqual(
+            (specific["start_date"], specific["end_date"]), ("2026-09-01", "2026-10-12")
+        )
         years = specs[2].outputs["years"]
         self.assertEqual(sorted(years), ["max", "mean"])
         self.assertEqual(
@@ -112,7 +112,9 @@ class ExpandTests(_Case):
             merge = true
             capture_mode = "year"
             target_year = 2030
-            """.replace('"both towns"', '"both-towns"')
+            """.replace(
+                '"both towns"', '"both-towns"'
+            )
         )
         (spec,) = specs
         self.assertTrue(spec.merged)
@@ -175,11 +177,15 @@ class ExpandTests(_Case):
         with self.assertRaisesRegex(PlanError, r"several statistics .*\[mean\]"):
             self.expand(base)
         with self.assertRaisesRegex(PlanError, "no GVI file for 2018"):
-            self.expand(base.replace("@ndvi.city", "@ndvi.city[max]"),
-                        ['fusion.gvi={2015 = "gvi.gpkg"}'])
+            self.expand(
+                base.replace("@ndvi.city", "@ndvi.city[max]"),
+                ['fusion.gvi={2015 = "gvi.gpkg"}'],
+            )
         with self.assertRaisesRegex(PlanError, r"no column\(s\) \['bmi'\]"):
-            self.expand(base.replace("@ndvi.city", "@ndvi.city[max]"),
-                        ["fusion.covariates=['bmi']"])
+            self.expand(
+                base.replace("@ndvi.city", "@ndvi.city[max]"),
+                ["fusion.covariates=['bmi']"],
+            )
         with self.assertRaisesRegex(PlanError, "has no column 'yr'"):
             self.expand(base, ["ndvi.city.year_column=yr"])
 
@@ -392,17 +398,13 @@ class TabParityTests(_Case):
             f.write(_STUB)
         sys.modules.pop("gf_parity_stub", None)
 
-    def click(
-        self, tab, seed, call, button, numbers=None, selects=None, submits=1
-    ):
+    def click(self, tab, seed, call, button, numbers=None, selects=None, submits=1):
         from streamlit.testing.v1 import AppTest
 
         path = os.path.join(self.dir, "app.py")
         with open(path, "w", encoding="utf-8") as f:
             f.write(
-                _APP.format(
-                    root=ROOT, stub_dir=self.dir, tab=tab, seed=seed, call=call
-                )
+                _APP.format(root=ROOT, stub_dir=self.dir, tab=tab, seed=seed, call=call)
             )
         at = AppTest.from_file(path, default_timeout=120)
         at.run()

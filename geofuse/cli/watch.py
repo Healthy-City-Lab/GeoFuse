@@ -302,7 +302,7 @@ class WatchApp(App):
             for job in shown:
                 cells = row_cells(job)
                 old = self._cells.get(job.id) or ()
-                for label, value, before in zip(_COLUMNS, cells, old):
+                for label, value, before in zip(_COLUMNS, cells, old, strict=False):
                     if str(value) != str(before):
                         table.update_cell(job.id, label, value)
                 self._cells[job.id] = cells

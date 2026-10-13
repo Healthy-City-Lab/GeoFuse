@@ -368,6 +368,7 @@ def pano_db() -> str:
 def ndvi_tiles() -> str:
     return os.path.join(cache_root(), "ndvi_tiles")
 
+
 #: Each cache's name, as the GUI's cache panel and ``geofuse cache`` show it.
 CACHE_LABELS = {
     "pano": "GVI panorama cache",

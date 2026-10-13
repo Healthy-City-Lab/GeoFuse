@@ -44,8 +44,13 @@ JULY = landsat_sr("2015-07-01", 5, 0.05, 0.20)
 class EngineWindowTests(_Case):
     def _mean(self, scenes, *, start, end, name, **kw):
         res = self.run_engine(
-            {E.LANDSAT8_COLLECTION_ID: scenes}, start=start, end=end, name=name,
-            satellite="landsat", temporal_reducers="mean", **kw,
+            {E.LANDSAT8_COLLECTION_ID: scenes},
+            start=start,
+            end=end,
+            name=name,
+            satellite="landsat",
+            temporal_reducers="mean",
+            **kw,
         )
         self.assertEqual(res["status"], "success", res.get("message"))
         arr, _, _ = self.raster(f"{name}_mean")
@@ -53,15 +58,21 @@ class EngineWindowTests(_Case):
 
     def test_inclusive_end_keeps_the_last_day_and_not_the_next(self):
         arr = self._mean(
-            [JULY, SEPT_30, OCT_1], start="2015-05-01", end="2015-09-30",
-            name="incl", end_inclusive=True,
+            [JULY, SEPT_30, OCT_1],
+            start="2015-05-01",
+            end="2015-09-30",
+            name="incl",
+            end_inclusive=True,
         )
         expected = (_ndvi(0.05, 0.20) + _ndvi(0.05, 0.40)) / 2
         np.testing.assert_allclose(arr, expected, rtol=1e-6)
 
     def test_default_end_stays_exclusive(self):
         arr = self._mean(
-            [JULY, SEPT_30, OCT_1], start="2015-05-01", end="2015-09-30", name="excl",
+            [JULY, SEPT_30, OCT_1],
+            start="2015-05-01",
+            end="2015-09-30",
+            name="excl",
         )
         np.testing.assert_allclose(arr, _ndvi(0.05, 0.20), rtol=1e-6)
         side = self.sidecar("excl_mean")
@@ -69,14 +80,22 @@ class EngineWindowTests(_Case):
         self.assertEqual(
             side["resume_key"],
             ndvi._compute_resume_key(
-                AOI.to_crs(4326), "2015-05-01", "2015-09-30", 10, RES,
-                E.LANDSAT_MERGED_LABEL, temporal_reducer="mean",
+                AOI.to_crs(4326),
+                "2015-05-01",
+                "2015-09-30",
+                10,
+                RES,
+                E.LANDSAT_MERGED_LABEL,
+                temporal_reducer="mean",
             ),
         )
 
     def test_sidecar_records_the_given_and_the_exclusive_end(self):
         self._mean(
-            [JULY, SEPT_30], start="2015-05-01", end="2015-09-30", name="side",
+            [JULY, SEPT_30],
+            start="2015-05-01",
+            end="2015-09-30",
+            name="side",
             end_inclusive=True,
         )
         side = self.sidecar("side_mean")
@@ -85,13 +104,19 @@ class EngineWindowTests(_Case):
             ("2015-05-01", "2015-09-30", "2015-10-01"),
         )
         self.assertEqual(
-            (side["used_start_date"], side["used_end_date"]), ("2015-05-01", "2015-10-01")
+            (side["used_start_date"], side["used_end_date"]),
+            ("2015-05-01", "2015-10-01"),
         )
         self.assertEqual(
             side["resume_key"],
             ndvi._compute_resume_key(
-                AOI.to_crs(4326), "2015-05-01", "2015-10-01", 10, RES,
-                E.LANDSAT_MERGED_LABEL, temporal_reducer="mean",
+                AOI.to_crs(4326),
+                "2015-05-01",
+                "2015-10-01",
+                10,
+                RES,
+                E.LANDSAT_MERGED_LABEL,
+                temporal_reducer="mean",
             ),
         )
 
@@ -102,8 +127,12 @@ class EngineWindowTests(_Case):
             landsat_sr("2014-01-01", 5, 0.05, 0.10),
         ]
         arr = self._mean(
-            scenes, start="2012-01-01", end="2012-12-31", name="y2012",
-            end_inclusive=True, substitute_2012=True,
+            scenes,
+            start="2012-01-01",
+            end="2012-12-31",
+            name="y2012",
+            end_inclusive=True,
+            substitute_2012=True,
         )
         np.testing.assert_allclose(
             arr, (_ndvi(0.05, 0.20) + _ndvi(0.05, 0.40)) / 2, rtol=1e-6
@@ -111,7 +140,8 @@ class EngineWindowTests(_Case):
         side = self.sidecar("y2012_mean")
         self.assertEqual(side["year_substituted"], "2012 → 2013")
         self.assertEqual(
-            (side["used_start_date"], side["used_end_date"]), ("2013-01-01", "2014-01-01")
+            (side["used_start_date"], side["used_end_date"]),
+            ("2013-01-01", "2014-01-01"),
         )
 
     def test_coverage_rescue_widens_the_corrected_window(self):
@@ -121,8 +151,13 @@ class EngineWindowTests(_Case):
             landsat_sr("2015-12-01", 5, 0.05, 0.30),
         ]
         res = self.run_engine(
-            {E.LANDSAT8_COLLECTION_ID: scenes}, start="2015-06-01", end="2015-09-30",
-            satellite="landsat", coverage_rescue=True, end_inclusive=True, name="rescue",
+            {E.LANDSAT8_COLLECTION_ID: scenes},
+            start="2015-06-01",
+            end="2015-09-30",
+            satellite="landsat",
+            coverage_rescue=True,
+            end_inclusive=True,
+            name="rescue",
         )
         self.assertEqual(res["status"], "success", res.get("message"))
         side = self.sidecar("rescue")
@@ -130,7 +165,8 @@ class EngineWindowTests(_Case):
         self.assertTrue(side["coverage_widened"])
         self.assertEqual(side["n_cloud_filtered_images"], 2)
         self.assertEqual(
-            (side["used_start_date"], side["used_end_date"]), ("2015-04-01", "2015-12-01")
+            (side["used_start_date"], side["used_end_date"]),
+            ("2015-04-01", "2015-12-01"),
         )
 
     def test_auto_satellite_reads_the_end_as_exclusive(self):
@@ -181,27 +217,32 @@ class RunnerWindowTests(_Case):
             self.addCleanup(p.stop)
 
     def _kw(self, year):
-        return dict(
-            fname="site.geojson",
-            dataset_data={"raw": AOI.assign(year=[year])},
-            cloud_pct=10,
-            resolution=RES,
-            buffer_m=0,
-            output_dir=self.out,
-            save_geotiff=True,
-            save_geojson=False,
-            satellite="landsat",
-            coverage_rescue=False,
-            temporal_reducers=["mean"],
-        )
+        return {
+            "fname": "site.geojson",
+            "dataset_data": {"raw": AOI.assign(year=[year])},
+            "cloud_pct": 10,
+            "resolution": RES,
+            "buffer_m": 0,
+            "output_dir": self.out,
+            "save_geotiff": True,
+            "save_geojson": False,
+            "satellite": "landsat",
+            "coverage_rescue": False,
+            "temporal_reducers": ["mean"],
+        }
 
     def _column(self, scenes, year, first, last):
         with FakeEarthEngine(AOI, {E.LANDSAT8_COLLECTION_ID: scenes}):
             runners.run_ndvi_column(
-                _Ctx(), date_column="year", season_start_month=first,
-                season_end_month=last, **self._kw(year),
+                _Ctx(),
+                date_column="year",
+                season_start_month=first,
+                season_end_month=last,
+                **self._kw(year),
             )
-        return self._read(os.path.join(self.out, "site_temporal_ndvi", f"site_{year}_mean"))
+        return self._read(
+            os.path.join(self.out, "site_temporal_ndvi", f"site_{year}_mean")
+        )
 
     def _read(self, stem):
         with rasterio.open(stem + "_ndvi.tif") as src:
@@ -236,8 +277,11 @@ class RunnerWindowTests(_Case):
     def test_range_keeps_the_picked_end_and_not_the_next_day(self):
         with FakeEarthEngine(AOI, {E.LANDSAT8_COLLECTION_ID: [JULY, SEPT_30, OCT_1]}):
             runners.run_ndvi(
-                _Ctx(), start_date="2015-05-01", end_date="2015-09-30",
-                output_name="site", **self._kw(2015),
+                _Ctx(),
+                start_date="2015-05-01",
+                end_date="2015-09-30",
+                output_name="site",
+                **self._kw(2015),
             )
         arr, side = self._read(os.path.join(self.out, "site_mean"))
         np.testing.assert_allclose(

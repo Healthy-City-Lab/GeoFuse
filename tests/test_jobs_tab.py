@@ -61,14 +61,27 @@ class JobsTabTests(unittest.TestCase):
         )
         self.running = self.job("fusion", "fit", {"n_trials": 40})
         self.state.claim(self.running, "s1")
-        ledger = {"stages": [
-            {"key": "preaggr", "label": "Pre-aggregation", "status": "done"},
-            {"key": "sweep", "label": "Sweep", "status": "running", "progress": 0.5},
-        ]}
+        ledger = {
+            "stages": [
+                {"key": "preaggr", "label": "Pre-aggregation", "status": "done"},
+                {
+                    "key": "sweep",
+                    "label": "Sweep",
+                    "status": "running",
+                    "progress": 0.5,
+                },
+            ]
+        }
         self.state.write_status(
             self.running,
-            {"status": "running", "progress": 0.5, "started_at": _ago(60),
-             "text": "Sweeping", "stage_ledger": ledger, "owner": "s1"},
+            {
+                "status": "running",
+                "progress": 0.5,
+                "started_at": _ago(60),
+                "text": "Sweeping",
+                "stage_ledger": ledger,
+                "owner": "s1",
+            },
         )
         self.state.logs_dir.mkdir(parents=True, exist_ok=True)
         self.state.log_path(self.running).write_bytes(b"first line\nsecond line\n")
@@ -83,11 +96,21 @@ class JobsTabTests(unittest.TestCase):
         )
         self.queued = self.job("ndvi", "streets")
         mirror = Mirror(self.state, "lab")
-        mirror.write_snapshot({"jobs": [{
-            "id": "feedbeef",
-            "spec": {"kind": "gvi", "name": "remote-gvi", "step": "gvi.x"},
-            "status": {"status": "completed", "progress": 1.0, "outputs": ["/x"]},
-        }]})
+        mirror.write_snapshot(
+            {
+                "jobs": [
+                    {
+                        "id": "feedbeef",
+                        "spec": {"kind": "gvi", "name": "remote-gvi", "step": "gvi.x"},
+                        "status": {
+                            "status": "completed",
+                            "progress": 1.0,
+                            "outputs": ["/x"],
+                        },
+                    }
+                ]
+            }
+        )
         mirror.write_link("stopped", host="me@lab.example.org")
 
         path = os.path.join(root, "app.py")
@@ -101,9 +124,18 @@ class JobsTabTests(unittest.TestCase):
 
     def job(self, kind, name, settings=None):
         time.sleep(0.01)
-        spec = {"step": f"{kind}.{name}", "kind": kind, "name": name,
-                "settings": settings or {}, "output_dir": "out", "sources": [],
-                "merged": False, "group": None, "options": {}, "preset": None}
+        spec = {
+            "step": f"{kind}.{name}",
+            "kind": kind,
+            "name": name,
+            "settings": settings or {},
+            "output_dir": "out",
+            "sources": [],
+            "merged": False,
+            "group": None,
+            "options": {},
+            "preset": None,
+        }
         return self.state.create_job(spec, run_id="r1", depends_on=[])
 
     def text(self) -> str:

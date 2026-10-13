@@ -246,8 +246,14 @@ def _table(jobs) -> str:
     rows = [("ID", "KIND", "NAME", "STATUS", "PROG", "NOTE")]
     for j in jobs:
         rows.append(
-            (j.id, str(j.spec.get("kind")), j.name[:28], _shown_state(j),
-             _fmt_progress(j), _note(j))
+            (
+                j.id,
+                str(j.spec.get("kind")),
+                j.name[:28],
+                _shown_state(j),
+                _fmt_progress(j),
+                _note(j),
+            )
         )
     widths = [max(len(r[i]) for r in rows) for i in range(5)]
     return "\n".join(
@@ -563,7 +569,10 @@ def cmd_rerun(args) -> int:
         return EXIT_OK
     cfg = _config(args)
     code = serve(
-        state, mode="foreground", limits=cfg.limits, ee_project=cfg.ee_project,
+        state,
+        mode="foreground",
+        limits=cfg.limits,
+        ee_project=cfg.ee_project,
         supervisor_id=owner,
     )
     print(_table([state.job(i) for i in new_ids]))
@@ -736,9 +745,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("watch", help="full-screen monitor: follow and manage jobs")
     p.add_argument("--run", help="only this run's jobs")
     p.add_argument("--active", action="store_true", help="start with unfinished jobs")
-    p.add_argument(
-        "--remote", metavar="NAME", help="start on a remote's mirrored jobs"
-    )
+    p.add_argument("--remote", metavar="NAME", help="start on a remote's mirrored jobs")
     p.set_defaults(func=cmd_watch)
 
     p = sub.add_parser("logs", help="a job's log")

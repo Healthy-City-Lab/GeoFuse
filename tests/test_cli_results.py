@@ -42,15 +42,28 @@ def _bundle(artifacts: str) -> dict:
         "direction_sign": -1,
         "standalones": {"ndvi": {"test_results": {"test_score": 0.062}}},
         "cgi_vs_standalone_paired_family": [
-            {"standalone_channel": "ndvi", "observed_diff": -0.015,
-             "lower": -0.029, "upper": 0.001, "p_value_holm": 0.97}
+            {
+                "standalone_channel": "ndvi",
+                "observed_diff": -0.015,
+                "lower": -0.029,
+                "upper": 0.001,
+                "p_value_holm": 0.97,
+            }
         ],
         "cgi_vs_standalone_aic_bic": {
-            "ok": True, "best_channel": "ndvi", "verdict": "not justified",
-            "delta_aic": -2.3, "delta_bic": -15.6,
+            "ok": True,
+            "best_channel": "ndvi",
+            "verdict": "not justified",
+            "delta_aic": -2.3,
+            "delta_bic": -15.6,
         },
-        "averaged_params": {"ndvi_weight": 20, "gvi_weight": 80,
-                            "ndvi_radius": 700, "gvi_radius": 400, "__x__": 1},
+        "averaged_params": {
+            "ndvi_weight": 20,
+            "gvi_weight": 80,
+            "ndvi_radius": 700,
+            "gvi_radius": 400,
+            "__x__": 1,
+        },
         "report_dir": os.path.join(rel, "study_results"),
         "entity_table_path": os.path.join(rel, "composite_entities.gpkg"),
     }

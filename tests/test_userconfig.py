@@ -55,9 +55,7 @@ class UserConfigTests(unittest.TestCase):
         with mock.patch.object(userconfig, "load", lambda: cfg):
             expected = os.path.abspath(os.path.expanduser("~/fast/geofuse"))
             self.assertEqual(caches.cache_root(), expected)
-            self.assertEqual(
-                caches.pano_db(), os.path.join(expected, "gvi_panos.db")
-            )
+            self.assertEqual(caches.pano_db(), os.path.join(expected, "gvi_panos.db"))
         with mock.patch.object(userconfig, "load", userconfig.Config):
             self.assertEqual(caches.cache_root(), caches.DEFAULT_CACHE_ROOT)
 

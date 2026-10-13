@@ -19,10 +19,10 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-import geofuse  # noqa: F401  (import order: torch before GeoPandas)
 import geopandas as gpd
 from shapely.geometry import Point
 
+import geofuse  # noqa: F401  (import order: torch before GeoPandas)
 from geofuse import streetview as sv
 from geofuse.gvi import GVIEngine
 
@@ -164,8 +164,14 @@ class RetiredSearchTests(_Case):
             geometry=[Point(-114.0, 51.0), Point(-114.001, 51.0)], crs="EPSG:4326"
         )
         points = [
-            {"orig_index": i, "lat": 51.0, "lon": geom.x, "geometry": geom,
-             "row": 0, "col": i}
+            {
+                "orig_index": i,
+                "lat": 51.0,
+                "lon": geom.x,
+                "geometry": geom,
+                "row": 0,
+                "col": i,
+            }
             for i, geom in enumerate(gdf.geometry)
         ]
         retired = mock.AsyncMock(side_effect=sv.ServiceRetired("turned down"))
@@ -173,8 +179,19 @@ class RetiredSearchTests(_Case):
             with self.assertRaisesRegex(sv.ServiceRetired, "turned down"):
                 asyncio.run(
                     engine._run_analysis_async(
-                        points, 2, 0, gdf, "out", False, False, {}, None, None,
-                        None, None, None,
+                        points,
+                        2,
+                        0,
+                        gdf,
+                        "out",
+                        False,
+                        False,
+                        {},
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
                     )
                 )
 

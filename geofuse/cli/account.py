@@ -402,7 +402,7 @@ def cmd_doctor(args) -> int:
     failed = sum(status == FAIL for _, status, _ in rows)
     if args.json:
         keys = ("check", "status", "detail")
-        print(json.dumps([dict(zip(keys, row)) for row in rows], indent=1))
+        print(json.dumps([dict(zip(keys, row, strict=True)) for row in rows], indent=1))
     else:
         print(f"\n{failed} problem(s)." if failed else "\nReady.")
     return EXIT_ENVIRONMENT if failed else EXIT_OK
@@ -445,8 +445,6 @@ def add_parsers(sub, common) -> None:
     p.set_defaults(func=cmd_auth)
 
     p = sub.add_parser("doctor", help="check this machine is ready to run jobs")
-    p.add_argument(
-        "--offline", action="store_true", help="skip the network checks"
-    )
+    p.add_argument("--offline", action="store_true", help="skip the network checks")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_doctor)

@@ -136,8 +136,11 @@ def summary(label: str, bundle: dict, artifacts: Path) -> list[str]:
     if direction is not None:
         lines.append(
             "  Direction        "
-            + ("positive: more greenery, higher outcome" if int(direction) > 0
-               else "negative: more greenery, lower outcome")
+            + (
+                "positive: more greenery, higher outcome"
+                if int(direction) > 0
+                else "negative: more greenery, lower outcome"
+            )
         )
 
     standalones = bundle.get("standalones") or {}

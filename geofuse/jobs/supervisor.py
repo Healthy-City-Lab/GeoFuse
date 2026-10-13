@@ -38,7 +38,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from geofuse.jobs.state import ACTIVE, TERMINAL, StateDir, now_iso
+from geofuse.jobs.state import TERMINAL, StateDir, now_iso
 from geofuse.persistence import caches
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -333,17 +333,24 @@ class Supervisor:
             if not self._fits(entry["spec"], self._in_use()):
                 if entry["status"].get("text") != "Waiting for a free slot":
                     self._write(
-                        job_id, status="queued", paused=False,
+                        job_id,
+                        status="queued",
+                        paused=False,
                         text="Waiting for a free slot",
                     )
                 continue
             entry["phase"] = "build"
             self._write(
-                job_id, status="running", paused=False, text="Preparing inputs...",
+                job_id,
+                status="running",
+                paused=False,
+                text="Preparing inputs...",
                 started_at=now_iso(),
             )
             threading.Thread(
-                target=self._start, args=(job_id,), daemon=True,
+                target=self._start,
+                args=(job_id,),
+                daemon=True,
                 name=f"build-{job_id}",
             ).start()
 
@@ -446,7 +453,8 @@ class Supervisor:
 
     def _seen_own_jobs(self) -> bool:
         own = [
-            j for j in self.state.job_ids()
+            j
+            for j in self.state.job_ids()
             if (self.state.read_spec(j) or {}).get("owner") == self.id
         ]
         return all(j in self.jobs for j in own)

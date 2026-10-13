@@ -58,7 +58,10 @@ class CacheAdminTests(unittest.TestCase):
 
     def test_each_cache_reports_and_purges(self):
         self.fill()
-        describe = lambda key: caches.describe_cache(key, output_dir=self.out)
+
+        def describe(key):
+            return caches.describe_cache(key, output_dir=self.out)
+
         self.assertEqual(describe("pano"), "2 panoramas")
         self.assertEqual(describe("ndvi"), "2.0 KB · 1 workspaces")
         self.assertEqual(describe("fusion"), "2.0 KB · 2 files")
@@ -66,7 +69,9 @@ class CacheAdminTests(unittest.TestCase):
 
         self.assertIn("Cleared 2", caches.purge_cache("pano", output_dir=self.out))
         self.assertIn("freed 2.0 KB", caches.purge_cache("ndvi", output_dir=self.out))
-        self.assertIn("Removed 2 files", caches.purge_cache("fusion", output_dir=self.out))
+        self.assertIn(
+            "Removed 2 files", caches.purge_cache("fusion", output_dir=self.out)
+        )
         for key in ("pano", "ndvi"):
             self.assertIn(describe(key), ("0 panoramas", "0 B · 0 workspaces"))
         self.assertEqual(describe("fusion"), "empty")

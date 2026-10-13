@@ -238,9 +238,7 @@ def read_document(path: str | os.PathLike) -> dict:
     return _plain(doc)
 
 
-def load(
-    path: str | os.PathLike, overrides: Iterable[Override | str] = ()
-) -> RunFile:
+def load(path: str | os.PathLike, overrides: Iterable[Override | str] = ()) -> RunFile:
     """Read, override, check and order the run file at ``path``."""
     p = Path(path).expanduser().resolve()
     run = from_document(

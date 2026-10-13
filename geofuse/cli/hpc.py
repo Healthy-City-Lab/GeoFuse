@@ -141,7 +141,7 @@ def write_scripts(args, run, specs) -> tuple[Path, list[Path]]:
         lines += ["", f"# level {level}", "ids=()"]
         for path in by_level[level]:
             lines += [
-                f'id=$(sbatch --parsable ${{after:+--dependency=afterok:$after}} '
+                f"id=$(sbatch --parsable ${{after:+--dependency=afterok:$after}} "
                 f"{path.name})",
                 'ids+=("${id%%;*}")',
                 f'echo "{path.name}: $id"',

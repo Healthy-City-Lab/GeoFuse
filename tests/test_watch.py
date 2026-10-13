@@ -45,15 +45,26 @@ class _Case(unittest.TestCase):
         ledger = {
             "stages": [
                 {"key": "preaggr", "label": "Pre-aggregation", "status": "done"},
-                {"key": "sweep", "label": "Sweep", "status": "running",
-                 "progress": 0.5, "message": "form 2 of 3"},
+                {
+                    "key": "sweep",
+                    "label": "Sweep",
+                    "status": "running",
+                    "progress": 0.5,
+                    "message": "form 2 of 3",
+                },
                 {"key": "posterior", "label": "Posterior", "status": "pending"},
             ]
         }
         self.state.write_status(
             self.running,
-            {"status": "running", "progress": 0.5, "started_at": _ago(60),
-             "text": "Sweeping", "stage_ledger": ledger, "owner": "s1"},
+            {
+                "status": "running",
+                "progress": 0.5,
+                "started_at": _ago(60),
+                "text": "Sweeping",
+                "stage_ledger": ledger,
+                "owner": "s1",
+            },
         )
         self.log = self.state.log_path(self.running)
         self.log.parent.mkdir(parents=True, exist_ok=True)
@@ -70,8 +81,13 @@ class _Case(unittest.TestCase):
 
     def job(self, kind, name, settings=None):
         time.sleep(0.01)
-        spec = {"step": f"{kind}.{name}", "kind": kind, "name": name,
-                "settings": settings or {}, "output_dir": "out"}
+        spec = {
+            "step": f"{kind}.{name}",
+            "kind": kind,
+            "name": name,
+            "settings": settings or {},
+            "output_dir": "out",
+        }
         return self.state.create_job(spec, run_id="r1", depends_on=[])
 
 
@@ -83,8 +99,13 @@ class CellTests(_Case):
 
     def test_details_show_stages_changed_settings_and_outputs(self):
         text = details(self.state.job(self.running)).plain
-        for part in ("Pre-aggregation", "Sweep  50%  form 2 of 3", "Posterior",
-                     "n_trials = 40", "none yet; written to out"):
+        for part in (
+            "Pre-aggregation",
+            "Sweep  50%  form 2 of 3",
+            "Posterior",
+            "n_trials = 40",
+            "none yet; written to out",
+        ):
             self.assertIn(part, text)
         self.assertNotIn("test_size", text)
         self.assertIn("a.gpkg", details(self.state.job(self.done)).plain)

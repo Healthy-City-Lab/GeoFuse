@@ -4,7 +4,6 @@ Jobs carry a dependency level and a resource group; ``plan`` numbers them,
 and a selection by level and group, then by index, names exactly one job.
 """
 
-
 import contextlib
 import io
 import os
@@ -85,6 +84,7 @@ class ArrayTests(_Case):
         self.assertIn("0..1", out)
         code, out = self.geofuse("plan", self.run, "--level", "4")
         self.assertIn("No job matches", out)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -130,7 +130,9 @@ class TestDiscoveryCsvReportsWhatWasBuilt(unittest.TestCase):
         s = _posterior_summary({"__posterior__": post})
         self.assertEqual(s["radius_prior"], "range")
         self.assertEqual(s["ladder_spacing"], {"ndvi": "log (9 rungs)"})
-        self.assertEqual(_posterior_summary({"__posterior__": {}})["radius_prior"], "rungs")
+        self.assertEqual(
+            _posterior_summary({"__posterior__": {}})["radius_prior"], "rungs"
+        )
 
     def test_the_distances_of_influence_are_exported(self):
         summ = _study()["discovery_summary"]

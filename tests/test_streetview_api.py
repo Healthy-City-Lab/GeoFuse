@@ -21,7 +21,6 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-import geofuse  # noqa: F401  (import order: torch before GeoPandas)
 import aiohttp
 import geopandas as gpd
 import numpy as np
@@ -30,6 +29,7 @@ from aiohttp import web
 from PIL import Image
 from shapely.geometry import Point
 
+import geofuse  # noqa: F401  (import order: torch before GeoPandas)
 from geofuse import gvi as gvi_mod
 from geofuse import logger
 from geofuse import streetview as sv
@@ -116,9 +116,7 @@ class _ApiCase(unittest.TestCase):
             app = web.Application()
             app.router.add_post("/v1/createSession", self.google.create_session)
             app.router.add_get("/v1/streetview/metadata", self.google.metadata)
-            app.router.add_get(
-                "/v1/streetview/tiles/{z}/{x}/{y}", self.google.tile
-            )
+            app.router.add_get("/v1/streetview/tiles/{z}/{x}/{y}", self.google.tile)
             runner = web.AppRunner(app)
             await runner.setup()
             site = web.TCPSite(runner, "127.0.0.1", 0)
@@ -148,8 +146,10 @@ class SearchTests(_ApiCase):
     def test_concurrent_searches_share_one_session(self):
         async def many(session):
             return await asyncio.gather(
-                *(sv.find_panorama_api_async(50 + i / 10, -114, session, KEY)
-                  for i in range(8))
+                *(
+                    sv.find_panorama_api_async(50 + i / 10, -114, session, KEY)
+                    for i in range(8)
+                )
             )
 
         found = self.serve(many)
@@ -165,8 +165,14 @@ class SearchTests(_ApiCase):
 
     def test_a_year_only_date_keeps_the_year(self):
         answer = {
-            "panoId": PANO_ID, "lat": 1, "lng": 2, "imageWidth": 13312,
-            "imageHeight": 6656, "tileWidth": 512, "tileHeight": 512, "date": "2019",
+            "panoId": PANO_ID,
+            "lat": 1,
+            "lng": 2,
+            "imageWidth": 13312,
+            "imageHeight": 6656,
+            "tileWidth": 512,
+            "tileHeight": 512,
+            "date": "2019",
         }
         pano = sv._parse_api_metadata(answer)
         self.assertIsNone(pano.date)

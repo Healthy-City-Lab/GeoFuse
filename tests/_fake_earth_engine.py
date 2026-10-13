@@ -46,7 +46,9 @@ class Image:
 
     # ── evaluation ──────────────────────────────────────────────
     def evaluate(self, X, Y):
-        return np.stack([np.asarray(f(X, Y), dtype=np.float64) for f in self.bands.values()])
+        return np.stack(
+            [np.asarray(f(X, Y), dtype=np.float64) for f in self.bands.values()]
+        )
 
     def _one(self):
         if len(self.bands) != 1:
@@ -71,7 +73,8 @@ class Image:
         return Image({n: self.bands[n] for n in names}, self.props, self.dtype)
 
     def rename(self, *names):
-        return Image(dict(zip(names, self.bands.values())), self.props, self.dtype)
+        bands = dict(zip(names, self.bands.values(), strict=False))
+        return Image(bands, self.props, self.dtype)
 
     # ── arithmetic ──────────────────────────────────────────────
     def multiply(self, k):
@@ -122,7 +125,9 @@ class Image:
         def apply(f):
             return lambda X, Y: np.where(np.nan_to_num(m(X, Y)) != 0, f(X, Y), np.nan)
 
-        return Image({k: apply(f) for k, f in self.bands.items()}, self.props, self.dtype)
+        return Image(
+            {k: apply(f) for k, f in self.bands.items()}, self.props, self.dtype
+        )
 
     def unmask(self, value=0):
         return self._unary(lambda a: np.where(np.isnan(a), value, a))
