@@ -101,6 +101,27 @@ def submit_specs(
     return run_id, job_ids
 
 
+def resubmit(
+    state: StateDir, job_ids: list[str], *, owner: str | None = None
+) -> list[str]:
+    """Queue ``job_ids`` again from their specs, as a run named ``rerun``;
+    returns the new jobs' ids. Each new job records the one it restarts."""
+    from geofuse.jobs.plans import JobSpec
+
+    fields = JobSpec.__dataclass_fields__
+    specs, restart_of = [], {}
+    for i, job_id in enumerate(job_ids):
+        raw = state.read_spec(job_id) or {}
+        spec = JobSpec.from_dict({k: v for k, v in raw.items() if k in fields})
+        spec.depends_on = []
+        specs.append(spec)
+        restart_of[i] = job_id
+    _, new_ids = submit_specs(
+        state, specs, run_name="rerun", owner=owner, restart_of=restart_of
+    )
+    return new_ids
+
+
 def _streetview_key() -> str | None:
     from geofuse import credentials
 

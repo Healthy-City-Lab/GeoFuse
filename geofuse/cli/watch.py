@@ -7,15 +7,14 @@
     stages, settings, outputs  │  the selected job's log
     p pause · r resume · c cancel · a all/active · / filter · l log · q quit
 
-The screen reads its jobs through a source (:class:`LocalSource` for a state
-folder on this machine) once a second, so the same screen can show any other
-source with the same four methods. Leaving it leaves every job running.
+The screen reads its jobs through a source (``geofuse.jobs.sources``: a state
+folder on this machine, or a remote one mirrored here) once a second. Leaving
+it leaves every job running.
 """
 
 from __future__ import annotations
 
 import time
-from typing import Protocol
 
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -26,10 +25,8 @@ from textual.widgets import Button, DataTable, Footer, Header, Input, RichLog, S
 
 from geofuse import settings as _settings
 from geofuse.cli.commands import _fmt_progress, _note, _shown_state
-from geofuse.jobs.state import ACTIVE, TERMINAL, Job, StateDir, parse_iso
-
-#: How much of a log the screen shows when a job is selected.
-LOG_TAIL_BYTES = 64 * 1024
+from geofuse.jobs.sources import JobSource, LocalSource  # noqa: F401
+from geofuse.jobs.state import ACTIVE, TERMINAL, Job, parse_iso
 
 _STATE_STYLES = {
     "running": "bold cyan",
@@ -50,55 +47,6 @@ _STAGE_MARKS = {
 }
 _ENGINE = {"ndvi_column": "ndvi", "gvi_column": "gvi", "gvi_merge": "gvi"}
 _COLUMNS = ("ID", "KIND", "NAME", "STATUS", "PROG", "ETA", "STEP", "NOTE")
-
-
-class JobSource(Protocol):
-    label: str
-
-    def jobs(self) -> list[Job]: ...
-
-    def supervisor(self) -> dict | None: ...
-
-    def control(self, job_id: str, **flags: bool) -> str: ...
-
-    def read_log(self, job_id: str, offset: int | None) -> tuple[str, int]: ...
-
-
-class LocalSource:
-    """The jobs of a state folder on this machine."""
-
-    def __init__(self, state: StateDir):
-        self.state = state
-        self.label = str(state.root)
-
-    def jobs(self) -> list[Job]:
-        return self.state.jobs()
-
-    def supervisor(self) -> dict | None:
-        return self.state.daemon()
-
-    def control(self, job_id: str, **flags: bool) -> str:
-        return self.state.control(job_id, **flags)
-
-    def read_log(self, job_id: str, offset: int | None) -> tuple[str, int]:
-        """The whole lines of the log from ``offset`` on (its tail when
-        ``offset`` is ``None``), and the offset to read from next."""
-        path = self.state.log_path(job_id)
-        try:
-            size = path.stat().st_size
-        except OSError:
-            return "", 0
-        tail = offset is None or offset > size
-        if tail:
-            offset = max(0, size - LOG_TAIL_BYTES)
-        with open(path, "rb") as f:
-            f.seek(offset)
-            data = f.read()
-        data = data[: data.rfind(b"\n") + 1]
-        text = data.decode("utf-8", errors="replace")
-        if tail and offset:
-            text = text.split("\n", 1)[-1]
-        return text, offset + len(data)
 
 
 # ────────────────────────────────────────────────────────────────────

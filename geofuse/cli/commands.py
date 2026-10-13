@@ -536,23 +536,12 @@ def cmd_wait(args) -> int:
 
 
 def cmd_rerun(args) -> int:
-    from geofuse.jobs.plans import JobSpec
-    from geofuse.jobs.supervisor import serve, start_daemon, submit_specs
+    from geofuse.jobs.supervisor import resubmit, serve, start_daemon
 
     state = _state(args)
     ids = _resolve(state, args.jobs)
-    fields = JobSpec.__dataclass_fields__
-    specs, restart_of = [], {}
-    for i, job_id in enumerate(ids):
-        raw = state.read_spec(job_id) or {}
-        spec = JobSpec.from_dict({k: v for k, v in raw.items() if k in fields})
-        spec.depends_on = []
-        specs.append(spec)
-        restart_of[i] = job_id
     owner = f"f{uuid.uuid4().hex[:7]}" if args.foreground else None
-    _, new_ids = submit_specs(
-        state, specs, run_name="rerun", owner=owner, restart_of=restart_of
-    )
+    new_ids = resubmit(state, ids, owner=owner)
     if not args.foreground:
         try:
             start_daemon(state)
@@ -567,6 +556,12 @@ def cmd_rerun(args) -> int:
     )
     print(_table([state.job(i) for i in new_ids]))
     return EXIT_OK if code == 0 else EXIT_FAILED
+
+
+def cmd_agent(args) -> int:
+    from geofuse.jobs.agent import run_stdio
+
+    return run_stdio(_state(args))
 
 
 def cmd_rm(args) -> int:
@@ -765,6 +760,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--finished", action="store_true", help="every finished job")
     p.add_argument("--force", action="store_true", help="also unfinished ones")
     p.set_defaults(func=cmd_rm)
+
+    p = sub.add_parser(
+        "agent", help="serve this machine's jobs to a remote client (geofuse remote)"
+    )
+    p.add_argument(
+        "--stdio",
+        action="store_true",
+        required=True,
+        help="answer JSON-line requests on standard input and output",
+    )
+    p.set_defaults(func=cmd_agent)
 
     p = sub.add_parser("config", help="run-file templates, validation, user settings")
     actions = p.add_subparsers(dest="action", metavar="ACTION", required=True)
