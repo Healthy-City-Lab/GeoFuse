@@ -230,11 +230,27 @@ class AdaptiveThrottle:
                 )
 
 
+#: Where panoramas come from: the keyless scraper, or Google's keyed tile API.
+DOWNLOAD_MODES = ("package", "api")
+
+
 class GVIEngine:
+    download_mode: str = "package"
+    api_key: str | None = None
+
     def __init__(
         self, model_path=None, download_mode="package", device="cuda", api_key=None
     ):
-        self.download_mode = download_mode
+        """``api_key`` selects the keyed Street View tile API (``download_mode``
+        becomes ``"api"``); ``download_mode="api"`` without a key is refused."""
+        if download_mode not in DOWNLOAD_MODES:
+            raise ValueError(f"download_mode must be one of {DOWNLOAD_MODES}")
+        self.download_mode = "api" if api_key else download_mode
+        if self.download_mode == "api" and not api_key:
+            raise ValueError(
+                "The Street View API download needs a key: type one in the GVI "
+                "tab or store it with `geofuse credentials set streetview-key`."
+            )
         self.device = get_best_device(device)
         self.api_key = api_key
 
@@ -288,6 +304,22 @@ class GVIEngine:
         img_cropped = img.crop((x_min, y_min, x_max, y_max))
         target_height = int(target_width / 2)
         return img_cropped.resize((target_width, target_height), Image.BILINEAR)
+
+    def _find(self, lat: float, lon: float, session: aiohttp.ClientSession):
+        """The search request for this engine's download mode."""
+        if self.download_mode == "api":
+            return gsv.find_panorama_api_async(
+                lat, lon, session, self.api_key, radius=_SEARCH_RADIUS_M
+            )
+        return gsv.find_panorama_async(lat, lon, session, radius=_SEARCH_RADIUS_M)
+
+    def _fetch(self, pano, session: aiohttp.ClientSession):
+        """The download request for this engine's download mode."""
+        if self.download_mode == "api":
+            return gsv.get_panorama_api_async(
+                pano, session, self.api_key, zoom=_DOWNLOAD_ZOOM
+            )
+        return gsv.get_panorama_async(pano, session, zoom=_DOWNLOAD_ZOOM)
 
     async def _search_and_resolve(
         self,
@@ -344,12 +376,7 @@ class GVIEngine:
                 if throttle is not None:
                     await throttle.before_request()
                 try:
-                    pano = await gsv.find_panorama_async(
-                        search_lat,
-                        search_lon,
-                        session,
-                        radius=_SEARCH_RADIUS_M,
-                    )
+                    pano = await self._find(search_lat, search_lon, session)
                     if throttle is not None:
                         await throttle.record_success()
                     break
@@ -370,12 +397,12 @@ class GVIEngine:
                         )
             if pano is _RL_SENTINEL:
                 return ("done", self._empty_result(pt, search_lat, search_lon))
-        except gsv.ServiceRetired:
+        except (gsv.ServiceRetired, gsv.ApiRequestRefused):
             raise
         except Exception as e:
             _log(
                 "ERROR",
-                f"  Point {idx}: find_panorama_async raised — "
+                f"  Point {idx}: the panorama search raised — "
                 f"{type(e).__name__}: {e}",
             )
             return ("done", self._empty_result(pt, search_lat, search_lon))
@@ -487,7 +514,7 @@ class GVIEngine:
                 await throttle.before_request()
             try:
                 raw_image = await asyncio.wait_for(
-                    gsv.get_panorama_async(download_pano, session, zoom=_DOWNLOAD_ZOOM),
+                    self._fetch(download_pano, session),
                     timeout=_DOWNLOAD_TIMEOUT_S,
                 )
                 if throttle is not None:
@@ -501,6 +528,8 @@ class GVIEngine:
                 )
                 failed_panos.add(pid)
                 return empty
+            except gsv.ApiRequestRefused:
+                raise
             except Exception as e:
                 status = getattr(e, "status", None)
                 throttled = isinstance(e, gsv.RateLimitedError) or (
@@ -1009,7 +1038,9 @@ class GVIEngine:
                 searched = await asyncio.gather(*searchers, return_exceptions=True)
                 for _ in downloaders:
                     download_q.put_nowait(_STOP)
-                await asyncio.gather(*downloaders, return_exceptions=True)
+                downloaded = await asyncio.gather(
+                    *downloaders, return_exceptions=True
+                )
                 if not consumer.done():
                     await gpu_q.put(_STOP)
                 await asyncio.gather(consumer, return_exceptions=True)
@@ -1024,10 +1055,12 @@ class GVIEngine:
 
         for pool in (self._prep_pool, self._gpu_pool):
             pool.shutdown(wait=False, cancel_futures=True)
-        # A retired search fails the run instead of reading as no coverage.
-        retired = [r for r in searched if isinstance(r, gsv.ServiceRetired)]
-        if retired:
-            raise retired[0]
+        # A retired search or a refused API key fails the run instead of
+        # reading as no coverage.
+        fatal = (gsv.ServiceRetired, gsv.ApiRequestRefused)
+        stopped = [r for r in (*searched, *downloaded) if isinstance(r, fatal)]
+        if stopped:
+            raise stopped[0]
         elapsed = max(time.perf_counter() - started, 1e-9)
         stats.update(
             seconds=round(elapsed, 2),
@@ -1040,6 +1073,7 @@ class GVIEngine:
             gpu_busy_share=round(stats["gpu_seconds"] / elapsed, 3),
             precision=self.segmenter.effective_precision,
             cuda_graph=self.segmenter.graphs_in_use,
+            download_mode=self.download_mode,
         )
         stats["gpu_seconds"] = round(stats["gpu_seconds"], 2)
         self.last_run_stats = stats

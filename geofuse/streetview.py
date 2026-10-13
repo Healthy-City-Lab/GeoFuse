@@ -21,8 +21,9 @@ Public surface
 ``get_panorama`` / ``get_panorama_async``
     Download tiles in parallel and return a stitched PIL image.
 
-``download_panorama`` / ``download_panorama_async``
-    Same as ``get_panorama`` but writes directly to a JPEG file.
+``find_panorama_api_async`` / ``get_panorama_api_async``
+    The same two steps through Google's keyed, billed Street View tile API
+    (Map Tiles API), for runs given an API key.
 
 ``StreetViewPanorama``
     Lightweight dataclass with the minimum fields needed to download tiles
@@ -36,6 +37,7 @@ import io
 import itertools
 import json
 import math
+import time
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
@@ -723,6 +725,20 @@ def get_panorama(
     )
 
 
+async def _fetch_tiles(pano: StreetViewPanorama, zoom: int, fetch) -> Image.Image:
+    """Every tile of ``pano`` at ``zoom`` through ``fetch(tile)``, stitched."""
+    tile_list = _generate_tile_list(pano, zoom)
+    results = await asyncio.gather(*(fetch(t) for t in tile_list))
+    tile_data = {(t.x, t.y): data for t, data in zip(tile_list, results, strict=True)}
+    return _stitch_tiles(
+        tile_data,
+        pano.image_sizes[zoom].x,
+        pano.image_sizes[zoom].y,
+        pano.tile_size.x,
+        pano.tile_size.y,
+    )
+
+
 async def get_panorama_async(
     pano: StreetViewPanorama,
     session: aiohttp.ClientSession,
@@ -758,3 +774,187 @@ async def get_panorama_async(
         pano.tile_size.x,
         pano.tile_size.y,
     )
+
+
+# ── API: the keyed Street View tiles (Map Tiles API) ────────────────
+#
+# Google's billed, documented route to the same equirectangular tiles. Every
+# request carries a session token (created once per key and process, valid for
+# about two weeks) and the key. The key only ever travels in query strings
+# built here, and no error raised from this section quotes a URL, so a key
+# never reaches a log or an error message. A search is one metadata request for
+# the nearest panorama within the radius; the API knows only the current
+# capture at a place, so ``captures`` holds that one capture.
+
+_API_ROOT = "https://tile.googleapis.com/v1"
+_API_SESSION = {"mapType": "streetview", "language": "en-US", "region": "US"}
+#: Zoom levels of the tile API; the full-size image is at the last one.
+_API_MAX_ZOOM = 5
+# A session token is renewed when it has less than this long left.
+_API_RENEW_S = 3600.0
+_API_TOKENS: dict[str, tuple[str, float]] = {}
+_API_TOKEN_TASKS: dict[str, asyncio.Task] = {}
+
+
+class ApiRequestRefused(RuntimeError):
+    """Google refused a Street View API request with this key: a wrong key, an
+    API not enabled for the key's project, billing off, or a restriction.
+    Retrying does not help, so a run stops with the reason."""
+
+    def __init__(self, status: int, reason: str):
+        super().__init__(
+            f"Google refused the Street View API request (HTTP {status}: {reason}). "
+            "Check the key, that the Map Tiles API is enabled for its Google Cloud "
+            "project, and that billing is on."
+        )
+        self.status = status
+
+
+def _api_reason(body) -> str:
+    """Google's error message from an error answer, shortened."""
+    try:
+        return str(body["error"]["message"])[:200]
+    except (KeyError, TypeError):
+        return "no reason given"
+
+
+async def _api_request(
+    session: aiohttp.ClientSession,
+    method: str,
+    path: str,
+    key: str,
+    *,
+    params: dict | None = None,
+    body: dict | None = None,
+    binary: bool = False,
+):
+    """One API request: the JSON (or bytes) answer, or ``None`` for 404.
+
+    429 / 503 raise :class:`RateLimitedError`; other refusals raise
+    :class:`ApiRequestRefused`; connection errors are re-raised as
+    ``ConnectionError`` naming only the path.
+    """
+    query = {**(params or {}), "key": key}
+    try:
+        async with session.request(
+            method, _API_ROOT + path, params=query, json=body
+        ) as resp:
+            if resp.status in (429, 503):
+                raise RateLimitedError(resp.status, path)
+            if resp.status == 404:
+                return None
+            if resp.status >= 400:
+                try:
+                    answer = await resp.json(content_type=None)
+                except (ValueError, aiohttp.ContentTypeError):
+                    answer = None
+                raise ApiRequestRefused(resp.status, _api_reason(answer))
+            if binary:
+                return await resp.read()
+            return await resp.json(content_type=None)
+    except aiohttp.ClientError as exc:
+        raise ConnectionError(
+            f"Street View API request {path} failed: {type(exc).__name__}"
+        ) from None
+
+
+async def _api_token(session: aiohttp.ClientSession, key: str) -> str:
+    """This process's session token for ``key``, created once and renewed
+    before it expires; concurrent callers share one request."""
+    held = _API_TOKENS.get(key)
+    if held is not None and held[1] - time.time() > _API_RENEW_S:
+        return held[0]
+    loop = asyncio.get_running_loop()
+    task = _API_TOKEN_TASKS.get(key)
+    if task is None or task.get_loop() is not loop:
+
+        async def create() -> str:
+            try:
+                answer = await _api_request(
+                    session, "POST", "/createSession", key, body=_API_SESSION
+                )
+                if not answer or "session" not in answer:
+                    raise ApiRequestRefused(404, "no session token in the answer")
+                expiry = float(answer.get("expiry") or time.time() + 86400)
+                _API_TOKENS[key] = (str(answer["session"]), expiry)
+                return str(answer["session"])
+            finally:
+                _API_TOKEN_TASKS.pop(key, None)
+
+        task = _API_TOKEN_TASKS[key] = loop.create_task(create())
+    return await asyncio.shield(task)
+
+
+def _parse_api_date(raw) -> tuple[int, int] | None:
+    """``"2023-05"`` -> ``(2023, 5)``; a year alone or nothing -> ``None``."""
+    parts = str(raw or "").split("-")
+    try:
+        return int(parts[0]), int(parts[1])
+    except (ValueError, IndexError):
+        return None
+
+
+def _parse_api_metadata(answer: dict) -> StreetViewPanorama | None:
+    """The panorama an API metadata answer describes; ``None`` for indoor
+    imagery and user photospheres, which the keyless search skips too."""
+    panoid = str(answer.get("panoId") or "")
+    if not panoid or is_third_party_panoid(panoid):
+        return None
+    if str(answer.get("imageryType", "outdoor")).lower() == "indoor":
+        return None
+    width, height = int(answer["imageWidth"]), int(answer["imageHeight"])
+    shifts = range(_API_MAX_ZOOM, -1, -1)
+    date = _parse_api_date(answer.get("date"))
+    year = date[0] if date else None
+    if date is None and str(answer.get("date") or "").isdigit():
+        year = int(answer["date"])
+    return StreetViewPanorama(
+        id=panoid,
+        lat=float(answer["lat"]),
+        lon=float(answer["lng"]),
+        tile_size=Size(int(answer["tileWidth"]), int(answer["tileHeight"])),
+        image_sizes=[Size(max(width >> s, 1), max(height >> s, 1)) for s in shifts],
+        date=date,
+        captures=[PanoCapture(panoid, year, date[1] if date else None)],
+    )
+
+
+async def find_panorama_api_async(
+    lat: float,
+    lon: float,
+    session: aiohttp.ClientSession,
+    key: str,
+    radius: float = 50.0,
+) -> StreetViewPanorama | None:
+    """The nearest panorama within ``radius`` metres through the keyed API, or
+    ``None``. Raises :class:`RateLimitedError` when throttled and
+    :class:`ApiRequestRefused` when Google refuses the key."""
+    token = await _api_token(session, key)
+    params = {"session": token, "lat": f"{lat:.7f}", "lng": f"{lon:.7f}"}
+    params["radius"] = str(int(round(radius)))
+    path = "/streetview/metadata"
+    answer = await _api_request(session, "GET", path, key, params=params)
+    return _parse_api_metadata(answer) if answer else None
+
+
+async def get_panorama_api_async(
+    pano: StreetViewPanorama,
+    session: aiohttp.ClientSession,
+    key: str,
+    zoom: int = 1,
+) -> Image.Image:
+    """Download ``pano`` at ``zoom`` through the keyed tile API, stitched."""
+    token = await _api_token(session, key)
+    zoom = _validate_zoom(pano, zoom)
+
+    async def fetch(t: Tile) -> bytes:
+        path = f"/streetview/tiles/{zoom}/{t.x}/{t.y}"
+        params = {"session": token, "panoId": pano.id}
+        data = await _api_request(
+            session, "GET", path, key, params=params, binary=True
+        )
+        if data is None:
+            raise FileNotFoundError(f"tile {zoom}/{t.x}/{t.y} of {pano.id[:12]}")
+        return data
+
+    return await _fetch_tiles(pano, zoom, fetch)
