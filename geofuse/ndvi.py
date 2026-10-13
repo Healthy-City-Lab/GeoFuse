@@ -185,6 +185,53 @@ def _stack_composites(composites: Mapping[str, Any], reducers: list[str]):
     return ee.Image.cat([composites[r].rename(r) for r in reducers])
 
 
+def _export_bands(
+    composites: Mapping[str, Any],
+    names: list[str],
+    path: str,
+    export: Callable[[Any, str, bool], None],
+    *,
+    label: str,
+) -> tuple[list[tuple[list[str], str]], bool]:
+    """Export ``names`` as the bands of one Earth Engine request into ``path``.
+
+    When Earth Engine refuses the request as too large, the names are halved
+    into two requests, each halved again while refused, down to one output
+    per request; ``export(image, path, alone)`` gets ``alone=True`` for a
+    single output and may then subdivide the region instead. Returns every
+    file written with the names it holds, in order, and whether the request
+    was split. A failure leaves no files behind.
+    """
+    try:
+        export(_stack_composites(composites, names), path, len(names) == 1)
+        return [(list(names), path)], False
+    except _EEComputeTooLargeError as too_large:
+        if len(names) == 1:
+            raise
+        _log(
+            "INFO",
+            f"{label}: {too_large} — splitting {len(names)} outputs across "
+            "two requests.",
+        )
+    half = len(names) // 2
+    stem = path[:-4] if path.endswith(".tif") else path
+    files: list[tuple[list[str], str]] = []
+    try:
+        for i, part in enumerate((names[:half], names[half:])):
+            got, _ = _export_bands(
+                composites, part, f"{stem}.{i}.tif", export, label=label
+            )
+            files.extend(got)
+    except Exception:
+        for _names, written in files:
+            try:
+                os.remove(written)
+            except OSError:
+                pass
+        raise
+    return files, True
+
+
 def _combine_reducer_results(results: Mapping[str, dict]) -> dict:
     """The first statistic's result, with every statistic's under ``reducers``.
 
@@ -484,6 +531,7 @@ def _write_ndvi_sidecar(
     tiles_succeeded: int,
     tiles_failed: int = 0,
     tiles_resumed: int = 0,
+    tiles_split_across_requests: int = 0,
     failed_tile_refs: list[dict] | None = None,
     resume_key: str = "",
     start_date: str,
@@ -522,8 +570,10 @@ def _write_ndvi_sidecar(
     the half-open window queried after any 2012 fill or coverage rescue.
     ``n_images`` counts the scenes over the study area in that window, and
     ``n_images_after_cloud_filter`` those left by the scene-level cloud filter
-    (``None`` when every scene is kept). ``failed_tile_refs`` lists the cluster/tile IDs that exhausted their retry
-    budget — those areas appear as NaN gaps in the mosaic.
+    (``None`` when every scene is kept). ``tiles_split_across_requests``
+    counts the tiles Earth Engine took in several requests because one was
+    too large. ``failed_tile_refs`` lists the cluster/tile IDs that exhausted
+    their retry budget — those areas appear as NaN gaps in the mosaic.
     """
     sidecar_path = os.path.join(folder, f"{output_name}_ndvi.json")
     payload = {
@@ -536,6 +586,7 @@ def _write_ndvi_sidecar(
         "tiles_succeeded": int(tiles_succeeded),
         "tiles_failed": int(tiles_failed),
         "tiles_resumed": int(tiles_resumed),
+        "tiles_split_across_requests": int(tiles_split_across_requests),
         "resume_key": resume_key,
         "failed_tile_refs": list(failed_tile_refs or []),
         "start_date": str(start_date),
@@ -1645,6 +1696,7 @@ class NDVIEngine:
             tiles_succeeded = int(result_meta.get("tiles", n_tiles))
             tiles_failed = int(result_meta.get("tiles_failed", 0))
             tiles_resumed = int(result_meta.get("tiles_resumed", 0))
+            tiles_split = int(result_meta.get("tiles_split_across_requests", 0))
             failed_refs = result_meta.get("failed_tile_refs") or []
             try:
                 sidecar_path = _write_ndvi_sidecar(
@@ -1659,6 +1711,7 @@ class NDVIEngine:
                     tiles_succeeded=tiles_succeeded,
                     tiles_failed=tiles_failed,
                     tiles_resumed=tiles_resumed,
+                    tiles_split_across_requests=tiles_split,
                     failed_tile_refs=failed_refs,
                     resume_key=resume_keys[r],
                     start_date=str(start_date),
@@ -1712,10 +1765,11 @@ class NDVIEngine:
     ) -> dict[str, dict]:
         """Download NDVI as a single tile (for small areas).
 
-        Several statistics come down as the bands of one export and are split
-        into their own GeoTIFFs, in the downloaded pixel type, so each file
-        holds the values a run of that statistic alone writes. Returns one
-        result per statistic.
+        Several outputs come down as the bands of one export (or of several,
+        when Earth Engine refuses one as too large: :func:`_export_bands`)
+        and are split into their own GeoTIFFs, in the downloaded pixel type,
+        so each file holds the values a run of that output alone writes.
+        Returns one result per output.
         """
         reducers = list(composites)
 
@@ -1735,41 +1789,42 @@ class NDVIEngine:
             r: os.path.join(folder, f"{output_names[r]}_ndvi.tif") for r in reducers
         }
         tmp_tif = final_tifs[reducers[0]][:-4] + ".tmp.tif"
-        image = _stack_composites(composites, reducers)
 
-        try:
-
-            def _do_export() -> None:
-                _export_ee_image_to_tif(
+        def _export(image, path: str, _alone: bool) -> None:
+            retry_with_backoff(
+                lambda: _export_ee_image_to_tif(
                     image,
-                    tmp_tif,
+                    path,
                     crs=export_crs,
                     crs_transform=crs_transform,
                     region=aoi,
-                )
-
-            retry_with_backoff(
-                _do_export,
+                ),
                 attempts=3,
                 base_delay=2.0,
                 cancel_callback=cancel_callback,
                 log_fn=_log,
                 label="EE export",
+                non_retryable=(_EEComputeTooLargeError,),
+            )
+
+        files: list[tuple[list[str], str]] = []
+        split = False
+        try:
+            files, split = _export_bands(
+                composites, reducers, tmp_tif, _export, label="EE export"
             )
 
             if cancel_callback and cancel_callback():
-                if os.path.exists(tmp_tif):
-                    os.remove(tmp_tif)
                 return _each(cancelled)
 
             # Atomic publish: the user-visible final raster only appears
             # once the EE write finished cleanly.
-            if len(reducers) == 1:
-                os.replace(tmp_tif, final_tifs[reducers[0]])
-            else:
-                for band, r in enumerate(reducers, start=1):
-                    _extract_band(tmp_tif, band, final_tifs[r])
-                os.remove(tmp_tif)
+            for names, path in files:
+                if len(names) == 1:
+                    os.replace(path, final_tifs[names[0]])
+                    continue
+                for band, r in enumerate(names, start=1):
+                    _extract_band(path, band, final_tifs[r])
 
             _emit_ndvi_progress(
                 ndvi_progress_callback,
@@ -1779,9 +1834,11 @@ class NDVIEngine:
             )
 
         except Exception as e:
-            if os.path.exists(tmp_tif):
-                os.remove(tmp_tif)
             return _each({"status": "error", "message": f"EE export failed: {str(e)}"})
+        finally:
+            for path in [tmp_tif, *(p for _, p in files)]:
+                if os.path.exists(path):
+                    os.remove(path)
 
         if cancel_callback and cancel_callback():
             return _each(cancelled)
@@ -1803,6 +1860,7 @@ class NDVIEngine:
                 write_geopackage=write_geopackage,
                 sub_start=0.52 + i * span,
                 sub_end=0.52 + (i + 1) * span,
+                split=split,
             )
             for i, r in enumerate(reducers)
         }
@@ -1824,8 +1882,10 @@ class NDVIEngine:
         write_geopackage: bool,
         sub_start: float,
         sub_end: float,
+        split: bool = False,
     ) -> dict:
-        """One statistic's single-tile result: metadata and vector samples."""
+        """One output's single-tile result: metadata and vector samples.
+        ``split`` records that the outputs came down in several requests."""
         try:
             with rasterio.open(final_tif) as src:
                 crs_meta = str(src.crs)
@@ -1837,6 +1897,7 @@ class NDVIEngine:
             "tiles_total": 1,
             "tiles_failed": 0,
             "tiles_resumed": 0,
+            "tiles_split_across_requests": int(split),
             "failed_tile_refs": [],
             "n_clusters": 1,
             "cluster_tiles_dir": None,
@@ -2003,15 +2064,18 @@ class NDVIEngine:
         crs_transform: list[float],
         cancel_callback: Callable[[], bool] | None,
     ) -> dict:
-        """Worker: one tile's missing statistics, in one Earth Engine request.
+        """Worker: one tile's missing outputs, in one Earth Engine request.
 
         Runs on a ThreadPoolExecutor thread (see :meth:`_download_with_tiling`).
-        ``reducers`` are the statistics this tile has no cache file for; they
-        are stacked as the bands of one image, exported once, and each band is
-        stored in its own statistic's workspace. Returns ``{idx, reducers,
-        tile_files, error}`` with ``tile_files`` mapping each stored statistic
-        to its tile; failures surface as ``error`` rather than raising so a
-        single bad tile can't sink the whole batch, and leave no files.
+        ``reducers`` are the outputs this tile has no cache file for; they
+        are stacked as the bands of one image, exported once (split across
+        requests when Earth Engine refuses it as too large:
+        :func:`_export_bands`), and each band is stored in its own output's
+        workspace. Returns ``{idx, reducers, tile_files, split, error}`` with
+        ``tile_files`` mapping each stored output to its tile and ``split``
+        whether the request was split; failures surface as ``error`` rather
+        than raising so a single bad tile can't sink the whole batch, and
+        leave no files.
 
         Tiles stay in the engine's chosen planar CRS — *no* per-tile reproject
         to WGS84 — so all tiles share one snap grid (``crs_transform`` fixes
@@ -2035,6 +2099,7 @@ class NDVIEngine:
             "idx": idx,
             "reducers": list(reducers),
             "tile_files": {},
+            "split": False,
             "error": None,
         }
 
@@ -2042,27 +2107,37 @@ class NDVIEngine:
             return result
 
         download = os.path.join(work_dirs[reducers[0]], f"tile_{idx}.download.tif")
+        label = f"Tile {idx + 1}"
         written: dict[str, str] = {}
+        files: list[tuple[list[str], str]] = []
 
-        try:
+        def _export(image, path: str, alone: bool) -> None:
+            # Several outputs split across requests before the region does.
             self._export_region_adaptive(
-                _stack_composites(composites, reducers),
+                image,
                 tile_spec["tile_geom_4326"],
-                download,
+                path,
                 export_crs=export_crs,
                 crs_transform=crs_transform,
                 cancel_callback=cancel_callback,
                 depth=0,
-                label=f"Tile {idx + 1}",
+                max_depth=_MAX_TILE_SUBDIVISION_DEPTH if alone else 0,
+                label=label,
+            )
+
+        try:
+            files, result["split"] = _export_bands(
+                composites, list(reducers), download, _export, label=label
             )
 
             if cancel_callback and cancel_callback():
                 return result
 
-            for band, r in enumerate(reducers, start=1):
-                tile_final = os.path.join(work_dirs[r], f"tile_{idx}.tif")
-                _extract_band(download, band, tile_final, dtype="float32")
-                written[r] = tile_final
+            for names, path in files:
+                for band, r in enumerate(names, start=1):
+                    tile_final = os.path.join(work_dirs[r], f"tile_{idx}.tif")
+                    _extract_band(path, band, tile_final, dtype="float32")
+                    written[r] = tile_final
             result["tile_files"] = written
             return result
         except Exception as e:
@@ -2074,11 +2149,12 @@ class NDVIEngine:
             result["error"] = f"{type(e).__name__}: {e}"
             return result
         finally:
-            if os.path.exists(download):
-                try:
-                    os.remove(download)
-                except OSError:
-                    pass
+            for path in [download, *(p for _, p in files)]:
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
 
     def _export_region_adaptive(
         self,
@@ -2091,6 +2167,7 @@ class NDVIEngine:
         cancel_callback: Callable[[], bool] | None,
         depth: int,
         label: str,
+        max_depth: int = _MAX_TILE_SUBDIVISION_DEPTH,
     ) -> None:
         """Export one region to ``out_path``, subdividing on EE size limits.
 
@@ -2099,7 +2176,7 @@ class NDVIEngine:
         too large to compute — ``_EEComputeTooLargeError`` — the region is
         halved into a 2×2 grid of sub-regions, each exported the same way
         (recursively, so a still-too-big quadrant halves again up to
-        :data:`_MAX_TILE_SUBDIVISION_DEPTH`), and the pieces are stream-
+        ``max_depth`` levels; 0 re-raises at once), and the pieces are stream-
         mosaicked back into ``out_path``. Every sub-region shares the global
         ``crs_transform``, so the merged result is pixel-identical to what a
         single successful export would have produced — the on-disk tile is
@@ -2132,7 +2209,7 @@ class NDVIEngine:
             return
         except _EEComputeTooLargeError as too_large:
             quadrants = _split_geom_quadrants(region_geom_4326)
-            if depth >= _MAX_TILE_SUBDIVISION_DEPTH or len(quadrants) < 2:
+            if depth >= max_depth or len(quadrants) < 2:
                 raise
             _log(
                 "INFO",
@@ -2154,6 +2231,7 @@ class NDVIEngine:
                         cancel_callback=cancel_callback,
                         depth=depth + 1,
                         label=f"{label}.{qi + 1}",
+                        max_depth=max_depth,
                     )
                     sub_paths.append(sub_out)
                 stream_mosaic_to_geotiff(
@@ -2270,6 +2348,8 @@ class NDVIEngine:
         # their ``cluster_id`` / ``tile_idx`` / final error so the sidecar can
         # surface exactly which areas are NaN gaps in the mosaic.
         failed_tile_refs: dict[str, list[dict]] = {r: [] for r in reducers}
+        # Tiles whose outputs Earth Engine took in several requests, per output.
+        n_split: dict[str, int] = {r: 0 for r in reducers}
 
         # Parallel tile downloads. Each worker handles one tile end-to-end
         # (Earth Engine export → compact cache tiles). The ThreadPoolExecutor
@@ -2318,6 +2398,7 @@ class NDVIEngine:
                 done_count += 1
                 for r, path in res["tile_files"].items():
                     tile_files[r].append(path)
+                    n_split[r] += int(res["split"])
                 if res.get("error"):
                     tile_spec = futures[fut]
                     for r in res["reducers"]:
@@ -2371,6 +2452,7 @@ class NDVIEngine:
                 resume_key,
                 output_name,
                 folder,
+                n_split=n_split[r],
                 label="" if len(reducers) == 1 else f" ({r})",
                 progress_at=_at,
                 n_clusters=n_clusters,
@@ -2411,6 +2493,7 @@ class NDVIEngine:
         output_name: str,
         folder,
         *,
+        n_split: int = 0,
         label: str,
         progress_at: Callable[[float], float],
         n_clusters: int,
@@ -2557,6 +2640,7 @@ class NDVIEngine:
             "tiles_total": n_tiles,
             "tiles_failed": len(failed_tile_refs),
             "tiles_resumed": n_resumed,
+            "tiles_split_across_requests": n_split,
             "failed_tile_refs": failed_tile_refs,
             "n_clusters": n_clusters,
             "resume_key": resume_key,

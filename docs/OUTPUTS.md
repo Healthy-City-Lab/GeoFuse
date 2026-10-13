@@ -80,8 +80,10 @@ the cloud threshold, how many scenes over the study area the queried window
 held (`n_images`) and how many the cloud threshold kept
 (`n_images_after_cloud_filter`, empty when every scene is kept), resolution,
 how the input
-decomposed into clusters and tiles, any tiles that exhausted their retries and
-so appear as gaps, and the maximum map distortion. When the run came from a
+decomposed into clusters and tiles, how many tiles came down in several
+requests because Earth Engine refused one as too large
+(`tiles_split_across_requests`), any tiles that exhausted their retries and so
+appear as gaps, and the maximum map distortion. When the run came from a
 settings preset, `preset` names it (the GVI sidecar does the same).
 
 Saved presets live in `presets/ndvi/` and `presets/gvi/` at the repository

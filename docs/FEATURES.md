@@ -101,7 +101,8 @@ per-cluster tiles, and a metadata sidecar.
 - Each pixel's value is a temporal statistic of the window's cloud-free images:
   the median (default), the mean, or the maximum. Each date mode takes any
   combination; every statistic writes its own files, and one download per tile
-  serves all of them.
+  serves all of them. When Earth Engine refuses that download as too large, the
+  statistics are split across requests before the tile itself is subdivided.
 - Downloaded tiles are cached per statistic, compactly and without changing any
   output, so a re-run, or a run that adds a statistic, fetches only what is
   missing.
