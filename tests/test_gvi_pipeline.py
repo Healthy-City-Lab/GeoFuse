@@ -195,6 +195,94 @@ class PipelineTests(_Case):
         self.assertLessEqual(max(waiting), 4)
 
 
+class OutcomeTests(_Case):
+    """Every point is counted once: sampled, no panorama, no capture in the
+    window, or failed. Points 0, 4, 8, ... have no panorama, 1, 5, ... only a
+    January capture, and 2, 6, ... a panorama whose download fails."""
+
+    def setUp(self):
+        super().setUp()
+
+        async def find(lat, lon, session, radius=50.0, **_):
+            i = round((lon + 114.0) / 0.001)
+            if i % 4 == 0:
+                return None
+            return sv.StreetViewPanorama(
+                id=f"pano{i:04d}",
+                lat=lat,
+                lon=lon,
+                tile_size=sv.Size(256, 128),
+                image_sizes=[sv.Size(256, 128), sv.Size(256, 128)],
+                date=(2024, 1 if i % 4 == 1 else 6),
+            )
+
+        async def download(pano, session, zoom=1):
+            if int(pano.id[4:]) % 4 == 2:
+                raise RuntimeError("tile server error")
+            return _image(pano.id)
+
+        fakes = {"find_panorama_async": find, "get_panorama_async": download}
+        for name, value in fakes.items():
+            patch = mock.patch.object(sv, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def counts(self, stats):
+        """``(sampled, no panorama, no capture in the window, failed)``."""
+        keys = ("sampled", "no_panorama", "no_capture_in_window", "failed")
+        return tuple(stats[key] for key in keys)
+
+    def test_a_month_window_moves_points_from_sampled_to_window_misses(self):
+        engine, results = self.run_engine(_Model(), n=40)
+        self.assertEqual(self.counts(engine.last_run_stats), (20, 10, 0, 10))
+        self.assertEqual(len(results), 20)
+
+        engine, results = self.run_engine(_Model(), n=40, month_window=(5, 10))
+        stats = engine.last_run_stats
+        self.assertEqual(self.counts(stats), (10, 10, 10, 10))
+        self.assertEqual(stats["no_capture_in_month_window"], 10)
+        self.assertEqual(sum(self.counts(stats)), stats["points"])
+        self.assertEqual(len(results), 10)
+
+    def test_a_year_window_miss_is_counted_as_such(self):
+        engine, _results = self.run_engine(
+            _Model(), n=40, target_year=2015, max_year_diff=1
+        )
+        stats = engine.last_run_stats
+        self.assertEqual(stats["no_capture_in_window"], 30)
+        self.assertEqual(stats["no_capture_in_year_window"], 30)
+        self.assertEqual(stats["no_capture_in_month_window"], 0)
+
+    def test_the_sidecar_holds_the_engine_counts(self):
+        import json
+        import tempfile
+
+        from geofuse.jobs import runners
+
+        engine, results = self.run_engine(_Model(), n=40, month_window=(5, 10))
+        stats = engine.last_run_stats
+        with tempfile.TemporaryDirectory() as out:
+            runners._write_gvi_outputs(
+                accumulated=list(results.values()),
+                processed_crs="EPSG:4326",
+                meta={"step_m": 50},
+                out_name="site",
+                output_dir=out,
+                save_gpkg=True,
+                save_geotiff=False,
+                save_geojson=False,
+                counts=runners.point_counts(stats),
+            )
+            with open(os.path.join(out, "site_gvi.json")) as f:
+                side = json.load(f)
+        self.assertEqual(side["n_grid_points"], 40)
+        found = [side[k] for k in ("n_sampled", "n_no_panorama", "n_failed")]
+        self.assertEqual(found, [10, 10, 10])
+        self.assertEqual(side["n_no_capture_in_window"], 10)
+        self.assertEqual(side["n_no_capture_in_month_window"], 10)
+        self.assertEqual(sum(side["capture_years"].values()), side["n_sampled"])
+
+
 class ControlTests(_Case):
     def test_cancel_ends_the_run_promptly(self):
         model = _Model(delay=0.05)

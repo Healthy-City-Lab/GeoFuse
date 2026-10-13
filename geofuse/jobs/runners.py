@@ -40,7 +40,7 @@ from geofuse.crs_utils import (
     raster_geographic_bounds,
     reproject_geodataframe_to_wgs84,
 )
-from geofuse.gvi import CAPTURE_STATUS_KEY, NO_CAPTURE_IN_WINDOW, GVIEngine
+from geofuse.gvi import CAPTURE_STATUS_KEY, WINDOW_MISS_KEY, GVIEngine
 from geofuse.jobs import (
     GVI_PROGRESS_MIN_ITEMS,
     GVI_PROGRESS_MIN_SECONDS,
@@ -227,6 +227,7 @@ def run_gvi(
     if shard:
         from geofuse.jobs.gvi_shards import write_shard
 
+        stats = getattr(engine, "last_run_stats", None)
         paths = write_shard(
             {f"{out_name}_gvi": dataset_data["accumulated"]},
             dataset_data["processed"].crs,
@@ -234,7 +235,8 @@ def run_gvi(
             f"{out_name}_gvi",
             shard,
             n_points,
-            throughput=[getattr(engine, "last_run_stats", None)],
+            throughput=[stats],
+            counts={f"{out_name}_gvi": point_counts(stats)},
         )
         ctx.progress(value=1.0, status_text="Shard written; the merge job finishes it")
         return {"output_paths": paths}
@@ -264,6 +266,7 @@ def run_gvi(
             "recent" if target_year is None else "year", target_year, run_args
         ),
         throughput=getattr(engine, "last_run_stats", None),
+        counts=point_counts(getattr(engine, "last_run_stats", None)),
     )
     dataset_data["results"] = res_df
     return {"output_paths": output_paths}
@@ -289,18 +292,20 @@ def _write_gvi_outputs(
     save_geojson: bool,
     capture: dict | None = None,
     throughput: dict | None = None,
+    counts: Mapping | None = None,
 ) -> tuple[list[str], gpd.GeoDataFrame]:
     """Write a GVI result set (GeoPackage / GeoJSON / per-cluster GeoTIFF).
 
     Shared by :func:`run_gvi` and :func:`run_gvi_column`; returns the written
     paths and the result GeoDataFrame (reprojected to the grid's planar CRS).
     ``capture`` holds the capture settings (:func:`_capture_settings`); with
-    the counts of what was sampled they go into the sidecar.
+    the run's point ``counts`` (:func:`point_counts`) and the counts of the
+    captures sampled they go into the sidecar.
     """
-    capture_summary = _capture_summary(accumulated, capture or {})
+    capture_summary = _capture_summary(accumulated, capture or {}, counts)
     res_df = gpd.GeoDataFrame(accumulated, crs=processed_crs)
-    if CAPTURE_STATUS_KEY in res_df.columns:
-        res_df = res_df.drop(columns=[CAPTURE_STATUS_KEY])
+    status = [c for c in (CAPTURE_STATUS_KEY, WINDOW_MISS_KEY) if c in res_df.columns]
+    res_df = res_df.drop(columns=status)
     if "orig_index" in res_df.columns:
         res_df.set_index("orig_index", inplace=True)
         res_df.index.name = None
@@ -463,12 +468,36 @@ def _capture_settings(mode: str, target_year, run_args: Mapping) -> dict:
     return settings
 
 
-def _capture_summary(accumulated: list, capture: Mapping) -> dict:
+#: Sidecar point counts and the ``last_run_stats`` key each is read from.
+_POINT_COUNTS = {
+    "n_grid_points": "points",
+    "n_sampled": "sampled",
+    "n_no_panorama": "no_panorama",
+    "n_no_capture_in_window": "no_capture_in_window",
+    "n_no_capture_in_year_window": "no_capture_in_year_window",
+    "n_no_capture_in_month_window": "no_capture_in_month_window",
+    "n_failed": "failed",
+}
+
+
+def point_counts(stats: Mapping | None) -> dict | None:
+    """A run's sidecar point counts from the engine's ``last_run_stats``;
+    ``None`` when the stats do not count the points' outcomes."""
+    if not stats or "sampled" not in stats:
+        return None
+    return {name: int(stats.get(key, 0)) for name, key in _POINT_COUNTS.items()}
+
+
+def _capture_summary(
+    accumulated: list, capture: Mapping, counts: Mapping | None = None
+) -> dict:
     """Capture settings plus counts of the points and the captures sampled.
 
-    ``capture_years`` / ``capture_months`` count the sampled points by the
-    year / month of the capture used (``"unknown"`` when it had no date), so
-    each sums to ``n_sampled``.
+    ``counts`` are the run's :func:`point_counts`; without them only
+    ``n_sampled`` is known, from the results. ``capture_years`` /
+    ``capture_months`` count the sampled points by the year / month of the
+    capture used (``"unknown"`` when it had no date), so each sums to
+    ``n_sampled``.
     """
     from collections import Counter
 
@@ -482,11 +511,7 @@ def _capture_summary(accumulated: list, capture: Mapping) -> dict:
         months[str(int(month)) if month.isdigit() else "unknown"] += 1
     return {
         **dict(capture),
-        "n_points": len(accumulated),
-        "n_sampled": len(sampled),
-        "n_no_capture_in_window": sum(
-            1 for r in accumulated if r.get(CAPTURE_STATUS_KEY) == NO_CAPTURE_IN_WINDOW
-        ),
+        **(dict(counts) if counts else {"n_sampled": len(sampled)}),
         "capture_years": dict(sorted(years.items())),
         "capture_months": dict(sorted(months.items(), key=_month_order)),
     }
@@ -621,6 +646,7 @@ def run_gvi_column(
     done_points = 0
     shard_results: dict[str, list] = {}
     shard_stats: list = []
+    shard_counts: dict[str, dict | None] = {}
     for idx, (year, pts, meta) in enumerate(plans):
         if ctx.is_cancelled():
             return {"output_paths": output_paths}
@@ -676,9 +702,11 @@ def run_gvi_column(
         done_points += len(pts)
         if ctx.is_cancelled():
             return {"output_paths": output_paths}
+        stats = getattr(engine, "last_run_stats", None)
         if shard:
             shard_results[f"{base_name}_{year}_gvi"] = accumulated
-            shard_stats.append(getattr(engine, "last_run_stats", None))
+            shard_stats.append(stats)
+            shard_counts[f"{base_name}_{year}_gvi"] = point_counts(stats)
             continue
         if not accumulated:
             _log_gvi("WARN", f"Year {year}: no results produced.")
@@ -694,7 +722,8 @@ def run_gvi_column(
             save_geotiff=save_geotiff,
             save_geojson=save_geojson,
             capture=_capture_settings("column", year, run_args),
-            throughput=getattr(engine, "last_run_stats", None),
+            throughput=stats,
+            counts=point_counts(stats),
         )
         output_paths.extend(paths)
 
@@ -711,6 +740,7 @@ def run_gvi_column(
                 shard,
                 total_points,
                 throughput=shard_stats,
+                counts=shard_counts,
             )
         )
         ctx.progress(value=1.0, status_text="Shard written; the merge job finishes it")

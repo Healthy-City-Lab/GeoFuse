@@ -46,14 +46,16 @@ class _Ctx:
 
 
 class _Engine:
-    """Samples every point from its grid position; every seventh has none."""
+    """Samples every point from its grid position; every seventh has no
+    panorama. Like the engine, it passes only the sampled points on."""
 
     def run_analysis(self, gdf, *, result_callback, target_year=None, **_kw):
-        self.last_run_stats = {"points": len(gdf), "segmented": len(gdf)}
+        sampled = 0
         for idx, pt in gdf.iterrows():
             row, col = int(pt.get("row", 0)), int(pt.get("col", 0))
-            sampled = (row + col) % 7 != 0
-            month = f"{target_year or 2021}-0{1 + col % 9}"
+            if (row + col) % 7 == 0:
+                continue
+            sampled += 1
             result_callback(
                 {
                     "orig_index": int(idx),
@@ -61,21 +63,7 @@ class _Engine:
                     "gvi_veg": round(0.01 * ((row * 31 + col) % 90), 4),
                     "gvi_ter": 0.05,
                     "pano_id": f"p{row}_{col}",
-                    "pano_date": month,
-                    "lat": pt.geometry.y,
-                    "lon": pt.geometry.x,
-                    "row": row,
-                    "col": col,
-                    "cluster_id": int(pt.get("cluster_id", 0)),
-                }
-                if sampled
-                else {
-                    "orig_index": int(idx),
-                    "geometry": pt.geometry,
-                    "gvi_veg": None,
-                    "gvi_ter": None,
-                    "pano_id": None,
-                    "pano_date": None,
+                    "pano_date": f"{target_year or 2021}-0{1 + col % 9}",
                     "lat": pt.geometry.y,
                     "lon": pt.geometry.x,
                     "row": row,
@@ -83,6 +71,14 @@ class _Engine:
                     "cluster_id": int(pt.get("cluster_id", 0)),
                 }
             )
+        self.last_run_stats = {
+            "points": len(gdf),
+            "segmented": sampled,
+            "sampled": sampled,
+            "no_panorama": len(gdf) - sampled,
+            "no_capture_in_window": 0,
+            "failed": 0,
+        }
 
 
 def _gvi(runner, raw, out, *, shard=None, **kw):
@@ -195,6 +191,13 @@ class MergeTests(_Case):
         self.assertEqual(sum(s["points"] for s in shards), whole["points"])
         self.assert_same_outputs(self.whole, self.split, "site")
         self.assertFalse([n for n in os.listdir(self.split) if ".shard" in n])
+        # The point counts are the shards' summed (and equal the whole run's).
+        with open(os.path.join(self.split, "site_gvi.json")) as f:
+            side = json.load(f)
+        self.assertEqual(side["n_grid_points"], whole["points"])
+        self.assertGreater(side["n_no_panorama"], 0)
+        found = side["n_sampled"] + side["n_no_panorama"]
+        self.assertEqual(found, side["n_grid_points"])
 
     def test_column_mode_merges_each_year(self):
         points = [Point(-114.08 + 0.01 * i, 51.03 + 0.005 * i) for i in range(6)]

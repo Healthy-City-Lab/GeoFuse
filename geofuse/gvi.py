@@ -91,11 +91,40 @@ def _format_pano_date(date: tuple[int, int] | None) -> str | None:
         return None
 
 
-# Result key marking a point whose location has panoramas but none inside
-# the requested year / month window. Counted into the sidecar and dropped
-# before outputs are written, so output schemas are unchanged.
+# Result key marking a point left without a sample because no panorama lies
+# within the search radius, or because its location has panoramas but none
+# inside the requested year / month window. Counted into the run's stats and
+# dropped before outputs are written, so output schemas are unchanged.
 CAPTURE_STATUS_KEY = "capture_status"
+NO_PANORAMA = "no_panorama"
 NO_CAPTURE_IN_WINDOW = "no_capture_in_window"
+# Result key naming the rule a window miss broke: ``"year"`` (no capture in
+# the year range) or ``"month"`` (captures in the year range, none in the
+# months).
+WINDOW_MISS_KEY = "window_miss"
+#: What became of each point, counted in ``GVIEngine.last_run_stats``.
+POINT_OUTCOMES = ("sampled", NO_PANORAMA, NO_CAPTURE_IN_WINDOW, "failed")
+
+
+def _outcome(result: dict) -> str:
+    """Which of :data:`POINT_OUTCOMES` a point's result is."""
+    if result.get("pano_id") is not None:
+        return "sampled"
+    status = result.get(CAPTURE_STATUS_KEY)
+    return status if status in (NO_PANORAMA, NO_CAPTURE_IN_WINDOW) else "failed"
+
+
+def _window_miss(pano, target_year: int | None, max_year_diff: int | None) -> str:
+    """The rule that left ``pano`` without a capture: ``"year"`` when none is
+    within ``max_year_diff`` of ``target_year``, otherwise ``"month"``."""
+    if target_year is None or max_year_diff is None:
+        return "month"
+    near = [
+        c
+        for c in pano.captures
+        if c.year is not None and abs(c.year - target_year) <= max_year_diff
+    ]
+    return "month" if near else "year"
 
 # Search radius (metres) for find_panorama_async around each grid point.
 _SEARCH_RADIUS_M = 50.0
@@ -447,7 +476,9 @@ class GVIEngine:
                 "WARN",
                 f"  Point {idx}: no panoramas within {_SEARCH_RADIUS_M:.0f} m",
             )
-            return ("done", self._empty_result(pt, search_lat, search_lon))
+            miss = self._empty_result(pt, search_lat, search_lon)
+            miss[CAPTURE_STATUS_KEY] = NO_PANORAMA
+            return ("done", miss)
 
         # Pick which dated capture to use. Without a target year or a month
         # window we keep the panorama the search returned (the most recent
@@ -476,6 +507,7 @@ class GVIEngine:
                 )
                 miss = self._empty_result(pt, search_lat, search_lon)
                 miss[CAPTURE_STATUS_KEY] = NO_CAPTURE_IN_WINDOW
+                miss[WINDOW_MISS_KEY] = _window_miss(pano, target_year, max_year_diff)
                 return ("done", miss)
             if capture.id != pano.id:
                 download_pano = pano.clone_for_capture(capture)
@@ -856,6 +888,9 @@ class GVIEngine:
             "segmented": 0,
             "gpu_batches": 0,
             "gpu_seconds": 0.0,
+            **dict.fromkeys(POINT_OUTCOMES, 0),
+            "no_capture_in_year_window": 0,
+            "no_capture_in_month_window": 0,
         }
         started = time.perf_counter()
         from concurrent.futures import ThreadPoolExecutor
@@ -887,6 +922,10 @@ class GVIEngine:
 
         async def _emit(result: dict) -> None:
             nonlocal completed
+            outcome = _outcome(result)
+            stats[outcome] += 1
+            if outcome == NO_CAPTURE_IN_WINDOW:
+                stats[f"no_capture_in_{result[WINDOW_MISS_KEY]}_window"] += 1
             # Skip points with no panorama (pano_id=None) so the accumulated
             # list — and every output format built from it — only ever holds
             # points with real data. Progress still counts every attempt.
@@ -1163,8 +1202,12 @@ class GVIEngine:
         download pool and the GPU batches (``None``: the module defaults).
         ``precision`` (``vision.PRECISIONS``; ``None`` keeps the segmenter's)
         sets the forward's arithmetic. Afterwards ``last_run_stats`` holds each
-        stage's counts and rates, and the precision the forwards ran at.
+        stage's counts and rates, what became of the points
+        (:data:`POINT_OUTCOMES`, with the window misses also split into
+        ``no_capture_in_year_window`` / ``no_capture_in_month_window``), and
+        the precision the forwards ran at; ``None`` when no point was run.
         """
+        self.last_run_stats = None
         _log("INFO", f"Starting Analysis (Resume Index: {start_index})...")
         if precision is not None:
             self.segmenter.precision = precision
