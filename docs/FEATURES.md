@@ -23,6 +23,14 @@ tiles, GeoJSON, and the raw panoramas and segmentation masks.
 - Sources Google Street View panoramas over the study area and labels each with
   a DeepLabV3+ model trained on the Cityscapes classes. GVI is the share of
   pixels classed vegetation plus terrain.
+- Two download modes, giving the same equirectangular images. **Package**
+  (the default) needs no key: it reads Google Maps' own coverage and panorama
+  endpoints, sees every historical capture, and is free. **API** uses Google's
+  documented Map Tiles API with your key: it is billed per request and sees
+  only the most recent capture at each place, so a specific-year run keeps a
+  point only when that capture is within the year limit. Both skip indoor
+  imagery and user photospheres. A key Google refuses stops the run with
+  Google's reason.
 - Can target a historical capture year rather than the latest imagery, with an
   optional maximum year gap. The capture date lands in a `pano_date` column, so
   year-matched runs are usable for longitudinal analysis. A specific-year run

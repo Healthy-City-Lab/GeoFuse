@@ -76,7 +76,7 @@ If you use GeoFuse in your research, please cite:
 
 **Built With & References**:
 
-* **Street View Download:** `geofuse/streetview.py`, a minimal custom port adapted from [streetlevel](https://github.com/sk-zk/streetlevel) (MIT). Finds panoramas through Google Maps' coverage tiles and panorama metadata (`photometa`) and downloads them from `streetviewpixels-pa.googleapis.com`; no API key.
+* **Street View Download:** `geofuse/streetview.py`, a minimal custom port adapted from [streetlevel](https://github.com/sk-zk/streetlevel) (MIT). Finds panoramas through Google Maps' coverage tiles and panorama metadata (`photometa`) and downloads them from `streetviewpixels-pa.googleapis.com`; no API key. With a key, the same images come through Google's [Map Tiles API](https://developers.google.com/maps/documentation/tile/streetview) instead.
 * **Semantic Segmentation:** [DeepLabV3+](https://github.com/VainF/DeepLabV3Plus-Pytorch/tree/master) via PyTorch.
 * **Training Data:** [Cityscapes Dataset](https://www.cityscapes-dataset.com/).
 * **Satellite Imagery:** [Google Earth Engine](https://earthengine.google.com/) and [geemap](https://geemap.org).

@@ -78,7 +78,19 @@ A background job never waits on a sign-in page where no browser can open; it sto
 
 ## GVI stops with "Google's Street View service no longer answers as the GVI downloader expects"
 
-Google changed one of the endpoints the scraper uses. The job stops instead of reporting every point as having no panorama. `geofuse doctor` runs one search and shows the same message. The downloader has to be updated to the endpoint Google now uses.
+Google changed one of the endpoints the scraper uses. The job stops instead of reporting every point as having no panorama. `geofuse doctor` runs one search and shows the same message. The downloader has to be updated to the endpoint Google now uses. Meanwhile, a Street View API key and `download_mode = "api"` download through Google's documented API instead.
+
+---
+
+## GVI stops with "Google refused the Street View API request"
+
+Google checked the key and refused it. The message carries Google's reason:
+
+* **API key not valid:** the key was mistyped or deleted. Store it again with `geofuse credentials set streetview-key`.
+* **Map Tiles API has not been used in project … or it is disabled:** enable the **Map Tiles API** for the key's Google Cloud project, wait a few minutes, and run again.
+* **Billing / permission errors:** turn billing on for the project, or lift API or address restrictions on the key that exclude this machine.
+
+`geofuse doctor` runs one API search and shows the same reason. A run in API mode with no key stored stops before it starts (`download_mode = "api" needs a Street View API key`).
 
 ---
 

@@ -197,6 +197,15 @@ geofuse config set earthengine.project my-cloud-project
 geofuse credentials set streetview-key           # optional: GVI scrapes without one
 ```
 
+**Street View API key (optional).** The scraper needs no key. To download
+through Google's documented API instead, create a key in a Google Cloud
+project with the **Map Tiles API** enabled and billing on, store it with
+`geofuse credentials set streetview-key`, and set `download_mode = "api"` on
+the GVI step (or choose **API (Street View)** in the GVI tab, which also takes
+a key typed there). `geofuse doctor` then runs one search through the API and
+shows Google's reason if it refuses the key. Google bills each tile and search
+request; the API sees only the most recent capture at each place.
+
 ### One engine, no run file
 
 ```bash
