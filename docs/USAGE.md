@@ -176,6 +176,14 @@ geofuse gvi city.gpkg --download-concurrency 24
 geofuse gvi city.gpkg --precision fp32
 ```
 
+While a GVI run works, its log gets a summary line at most every 30 seconds:
+points done; how many were sampled, had no panorama, had no capture in the
+year or month window, or failed; cache hits, downloads, the rate and throttle
+events. Warnings and errors appear as they happen. `log_points`
+(`--log-points`, or `log_points = true` in a run file) adds a line for every
+point and panorama, for debugging; the log then grows with the number of
+points.
+
 Per-job logs are written in full to `logs/jobs/<job_id>.log`; the in-app view
 keeps only the last 100 lines.
 

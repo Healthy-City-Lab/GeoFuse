@@ -66,7 +66,10 @@ tiles, GeoJSON, and the raw panoramas and segmentation masks.
   already in the cache are reused whatever the precision.
 - Each run logs and records its stage counts and rates: points searched,
   panoramas downloaded and segmented, how busy the GPU was, the precision the
-  model ran at, and throttle events.
+  model ran at, and throttle events. It also counts what became of every grid
+  point (sampled, no panorama, no capture in the window, failed), and its log
+  gets a summary of those counts at most every 30 seconds rather than a line
+  per point (`log_points` brings the per-point lines back).
 
 ---
 
