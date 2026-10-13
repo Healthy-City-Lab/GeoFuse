@@ -76,7 +76,10 @@ temporal statistic (`temporal_reducer`), the NDVI formula (`ndvi_formula`:
 pixels with negative red or near-infrared reflectance masked), the acquisition
 options
 (`reflectance`, `cloud_handling`, `water_mask` with `water_occurrence_max`),
-the cloud threshold and surviving image count, resolution, how the input
+the cloud threshold, how many scenes over the study area the queried window
+held (`n_images`) and how many the cloud threshold kept
+(`n_images_after_cloud_filter`, empty when every scene is kept), resolution,
+how the input
 decomposed into clusters and tiles, any tiles that exhausted their retries and
 so appear as gaps, and the maximum map distortion. When the run came from a
 settings preset, `preset` names it (the GVI sidecar does the same).

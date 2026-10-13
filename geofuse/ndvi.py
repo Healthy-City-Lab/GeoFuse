@@ -505,6 +505,8 @@ def _write_ndvi_sidecar(
     satellite: str = "sentinel2",
     bands: list[str] | None = None,
     n_cloud_filtered_images: int | None = None,
+    n_images: int | None = None,
+    n_images_after_cloud_filter: int | None = None,
 ) -> str:
     """Write ``{output_name}_ndvi.json`` capturing the parameters and grid CRS.
 
@@ -518,7 +520,9 @@ def _write_ndvi_sidecar(
     ``start_date`` / ``end_date`` are the dates as given and
     ``end_date_exclusive`` the exclusive end of that window; ``used_*`` is
     the half-open window queried after any 2012 fill or coverage rescue.
-    ``failed_tile_refs`` lists the cluster/tile IDs that exhausted their retry
+    ``n_images`` counts the scenes over the study area in that window, and
+    ``n_images_after_cloud_filter`` those left by the scene-level cloud filter
+    (``None`` when every scene is kept). ``failed_tile_refs`` lists the cluster/tile IDs that exhausted their retry
     budget — those areas appear as NaN gaps in the mosaic.
     """
     sidecar_path = os.path.join(folder, f"{output_name}_ndvi.json")
@@ -556,6 +560,12 @@ def _write_ndvi_sidecar(
         "n_cloud_filtered_images": (
             int(n_cloud_filtered_images)
             if n_cloud_filtered_images is not None
+            else None
+        ),
+        "n_images": int(n_images) if n_images is not None else None,
+        "n_images_after_cloud_filter": (
+            int(n_images_after_cloud_filter)
+            if n_images_after_cloud_filter is not None
             else None
         ),
     }
@@ -1507,6 +1517,11 @@ class NDVIEngine:
                     used_start, used_end = w_start, w_end
                     n_cloud_filtered = n_widened
                     coverage_widened = True
+                    n_total = (
+                        n_widened
+                        if scene_cmax is None
+                        else _get_base(used_start, used_end).size().getInfo()
+                    )
             except Exception as e:
                 _log("WARN", f"Coverage rescue skipped: {e}")
 
@@ -1665,6 +1680,10 @@ class NDVIEngine:
                     satellite=chosen_satellite,
                     bands=["NDVI"],
                     n_cloud_filtered_images=n_cloud_filtered,
+                    n_images=n_total,
+                    n_images_after_cloud_filter=(
+                        n_cloud_filtered if scene_cmax is not None else None
+                    ),
                 )
                 result["sidecar"] = sidecar_path
             except Exception as e:
