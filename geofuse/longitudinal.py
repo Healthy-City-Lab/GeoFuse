@@ -59,16 +59,19 @@ DEFAULT_MIXEDLM_METRIC = "mixedlm_tstat"
 
 # Cross-sectional scoring metrics accepted by ``LongitudinalSpec`` so a
 # cross-sectional study can use the per-wave cache infrastructure to assign
-# different greenery files per measurement year while still scoring with OLS-
-# based partial correlation / incremental R² / RMSE / mutual_info — see
-# :mod:`geofuse.objective_scoring`. The year column is only a routing key in
-# this mode (synthesised in the runner); the scorer never reads it.
+# different greenery files per measurement year while still scoring through
+# :mod:`geofuse.objective_scoring` — every metric of its ``SUPPORTED_METRICS``
+# (listed here, not imported, to keep that module's dependencies out). The
+# year column is only a routing key in this mode (synthesised in the
+# runner); the scorer never reads it.
 CROSS_SECTIONAL_METRICS: tuple[str, ...] = (
-    "pearson",
+    "partial_distance_corr",
+    "distance_corr",
     "spearman",
     "r2",
-    "rmse",
+    "nrmse",
     "mutual_info",
+    "quartile_contrast",
     # Binary outcome, single measurement per entity: plain logistic regression.
     # A year-keyed cross-sectional study with a dichotomous outcome is exactly
     # the design of the published CLSA greenspace papers, so it has to be

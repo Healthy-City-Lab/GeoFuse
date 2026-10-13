@@ -8,9 +8,11 @@ holds both halves of that arrangement, because they are one protocol:
   routing into the event queue, :func:`exit_with_parent`, and
   :func:`drain_events_until_done`, which the parent's watcher thread runs;
 * the child entry points — ``run_gvi_child``, ``run_gvi_column_child``,
-  ``run_ndvi_child``, ``run_ndvi_column_child``, ``run_fusion_child`` — each a
-  thin adapter that rebuilds the context in the child and calls the matching
-  ``geofuse.jobs.runners`` callable.
+  ``run_gvi_merge_child``, ``run_ndvi_child``, ``run_ndvi_column_child``,
+  ``run_fusion_child`` — each a thin adapter that rebuilds the context in the
+  child and calls the matching runner while holding the job's resource slots
+  (:mod:`geofuse.jobs.locks`), so GUI and command-line jobs share one set of
+  limits.
 
 The entry points keep their engine imports *inside* the function body: this
 module is imported in every pre-aggregation worker (for ``exit_with_parent``),
@@ -372,6 +374,21 @@ def drain_events_until_done(
         # Unknown tags are silently ignored — forward-compatibility hook.
 
 
+def _run_held(job_type: str, ctx, event_queue, runner, **kwargs) -> None:
+    """Run ``runner(ctx, **kwargs)`` holding ``job_type``'s resource slots,
+    then report its outputs. A job cancelled while it waits reports none."""
+    from geofuse.jobs.locks import hold
+
+    with hold(
+        job_type,
+        cancelled=ctx.is_cancelled,
+        waiting=lambda text: ctx.progress(status_text=text),
+        tick=ctx.heartbeat,
+    ) as held:
+        result = runner(ctx, **kwargs) if held else {}
+    event_queue.put((MSG_COMPLETE, list((result or {}).get("output_paths") or [])))
+
+
 def run_gvi_child(
     job_id: str,
     fname: str,
@@ -418,8 +435,11 @@ def run_gvi_child(
         ctx = SubprocJobContext(job_id, event_queue, cancel_event, pause_event)
         gpu_lock = threading.Lock()  # per-process; the parent's lock doesn't apply here
 
-        result = run_gvi(
+        _run_held(
+            "gvi",
             ctx,
+            event_queue,
+            run_gvi,
             fname=fname,
             dataset_data=dataset_data,
             init_args=init_args,
@@ -430,8 +450,6 @@ def run_gvi_child(
             save_gpkg=save_gpkg,
             gpu_lock=gpu_lock,
         )
-
-        event_queue.put((MSG_COMPLETE, list(result.get("output_paths") or [])))
 
     except BaseException as exc:  # noqa: BLE001 — surface ANY failure to parent
         try:
@@ -472,8 +490,11 @@ def run_gvi_column_child(
         ctx = SubprocJobContext(job_id, event_queue, cancel_event, pause_event)
         gpu_lock = threading.Lock()
 
-        result = run_gvi_column(
+        _run_held(
+            "gvi_column",
             ctx,
+            event_queue,
+            run_gvi_column,
             fname=fname,
             dataset_data=dataset_data,
             date_column=date_column,
@@ -485,8 +506,6 @@ def run_gvi_column_child(
             save_gpkg=save_gpkg,
             gpu_lock=gpu_lock,
         )
-
-        event_queue.put((MSG_COMPLETE, list(result.get("output_paths") or [])))
 
     except BaseException as exc:  # noqa: BLE001 — surface ANY failure to parent
         try:
@@ -517,6 +536,13 @@ def run_ndvi_child(
     event_queue,
     cancel_event,
     pause_event=None,
+    temporal_reducers=("median",),
+    water_mask=False,
+    cloud_handling="scene_filter",
+    reflectance="surface",
+    substitute_2012=False,
+    preset=None,
+    ee_project=None,
 ) -> None:
     """Subprocess entry point for ``run_ndvi`` (single date range).
 
@@ -532,8 +558,11 @@ def run_ndvi_child(
         from geofuse.jobs.runners import run_ndvi
 
         ctx = SubprocJobContext(job_id, event_queue, cancel_event, pause_event)
-        result = run_ndvi(
+        _run_held(
+            "ndvi",
             ctx,
+            event_queue,
+            run_ndvi,
             fname=fname,
             dataset_data=dataset_data,
             start_date=start_date,
@@ -549,8 +578,14 @@ def run_ndvi_child(
             save_cluster_tiles=save_cluster_tiles,
             satellite=satellite,
             coverage_rescue=coverage_rescue,
+            temporal_reducers=temporal_reducers,
+            water_mask=water_mask,
+            cloud_handling=cloud_handling,
+            reflectance=reflectance,
+            substitute_2012=substitute_2012,
+            preset=preset,
+            ee_project=ee_project,
         )
-        event_queue.put((MSG_COMPLETE, list(result.get("output_paths") or [])))
 
     except BaseException as exc:  # noqa: BLE001
         try:
@@ -581,6 +616,13 @@ def run_ndvi_column_child(
     event_queue,
     cancel_event,
     pause_event=None,
+    temporal_reducers=("median",),
+    water_mask=False,
+    cloud_handling="scene_filter",
+    reflectance="surface",
+    substitute_2012=False,
+    preset=None,
+    ee_project=None,
 ) -> None:
     """Subprocess entry point for ``run_ndvi_column`` (one raster per year)."""
     try:
@@ -590,8 +632,11 @@ def run_ndvi_column_child(
         from geofuse.jobs.runners import run_ndvi_column
 
         ctx = SubprocJobContext(job_id, event_queue, cancel_event, pause_event)
-        result = run_ndvi_column(
+        _run_held(
+            "ndvi_column",
             ctx,
+            event_queue,
+            run_ndvi_column,
             fname=fname,
             dataset_data=dataset_data,
             date_column=date_column,
@@ -607,8 +652,14 @@ def run_ndvi_column_child(
             save_cluster_tiles=save_cluster_tiles,
             satellite=satellite,
             coverage_rescue=coverage_rescue,
+            temporal_reducers=temporal_reducers,
+            water_mask=water_mask,
+            cloud_handling=cloud_handling,
+            reflectance=reflectance,
+            substitute_2012=substitute_2012,
+            preset=preset,
+            ee_project=ee_project,
         )
-        event_queue.put((MSG_COMPLETE, list(result.get("output_paths") or [])))
 
     except BaseException as exc:  # noqa: BLE001
         try:
@@ -646,9 +697,34 @@ def run_fusion_child(
         from geofuse.jobs.runners import run_fusion
 
         ctx = SubprocJobContext(job_id, event_queue, cancel_event, pause_event)
-        result = run_fusion(ctx, **run_kwargs)
+        _run_held("fusion", ctx, event_queue, run_fusion, **run_kwargs)
 
-        event_queue.put((MSG_COMPLETE, list((result or {}).get("output_paths") or [])))
+    except BaseException as exc:  # noqa: BLE001 — surface ANY failure to parent
+        try:
+            event_queue.put(
+                (MSG_ERROR, f"{type(exc).__name__}: {exc}", traceback.format_exc())
+            )
+        except Exception:
+            pass
+
+
+def run_gvi_merge_child(
+    job_id: str,
+    run_kwargs: dict,
+    event_queue,
+    cancel_event,
+    pause_event=None,
+) -> None:
+    """Entry point for the merge of a sharded GVI run (no resource slots: it
+    reads and writes files only)."""
+    try:
+        exit_with_parent()
+        route_engine_logging_to_queue(job_id, event_queue)
+
+        from geofuse.jobs.gvi_shards import run_gvi_merge
+
+        ctx = SubprocJobContext(job_id, event_queue, cancel_event, pause_event)
+        _run_held("gvi_merge", ctx, event_queue, run_gvi_merge, **run_kwargs)
 
     except BaseException as exc:  # noqa: BLE001 — surface ANY failure to parent
         try:

@@ -8,7 +8,7 @@ ENV_NAME="geofuse"
 PYTHON_VER="3.12.12"
 
 echo "========================================================"
-echo "        GeoFuse Installer (MPI-Enabled)"
+echo "        GeoFuse Installer"
 echo "========================================================"
 
 # --- STEP 1: AUTO-DETECT CONDA ---
@@ -84,9 +84,10 @@ fi
 echo ""
 echo "========================================================"
 echo "[SUCCESS] Installation complete."
-echo "[READY] To launch the CLI (example with 4 MPI processes):"
+echo "[READY] In the environment, the command line is geofuse:"
 echo "   conda activate $ENV_NAME"
-echo "   mpiexec -n 4 python scripts/cli.py --config config.csv"
+echo "   geofuse doctor"
+echo "   geofuse --help"
 echo "========================================================"
 
 # Only prompt for input if running interactively

@@ -111,16 +111,6 @@ section[data-testid="stSidebar"] [data-testid="stProgress"] > div {
 	border-right: 1px solid rgba(49, 51, 63, 0.18);
 }
 
-/* Muted last tab (HPC Monitoring): de-emphasized until the HPC workflow is finalized */
-button.gf-tab-muted {
-	opacity: 0.48 !important;
-	color: #8c8c8c !important;
-}
-button.gf-tab-muted[aria-selected="true"] {
-	opacity: 0.72 !important;
-	color: #6d6d6d !important;
-}
-
 /* --- Tab strip ------------------------------------------------------ */
 /* The strip stays inside stTabs where React renders it and is pinned to the
    top of the content column, sharing the band with the toolbar's

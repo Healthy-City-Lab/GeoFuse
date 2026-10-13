@@ -22,7 +22,7 @@ import re
 import shutil
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Any
 
@@ -40,7 +40,7 @@ from geofuse.crs_utils import (
     raster_geographic_bounds,
     reproject_geodataframe_to_wgs84,
 )
-from geofuse.gvi import GVIEngine
+from geofuse.gvi import CAPTURE_STATUS_KEY, NO_CAPTURE_IN_WINDOW, GVIEngine
 from geofuse.jobs import (
     GVI_PROGRESS_MIN_ITEMS,
     GVI_PROGRESS_MIN_SECONDS,
@@ -58,6 +58,7 @@ from geofuse.jobs.fusion_outputs import (
     _negative_control_report,
     _posterior_summary,
     _write_fusion_outputs,
+    write_entity_table,
 )
 from geofuse.jobs.stage_ledger import DONE, FAILED, RUNNING, SKIPPED
 from geofuse.logger import get_logger
@@ -74,7 +75,11 @@ from geofuse.longitudinal import (
 from geofuse.mixedlm_postscore import (
     compute_post_metrics as _compute_mixedlm_post_metrics,
 )
-from geofuse.ndvi import NDVIEngine
+from geofuse.ndvi import (
+    NDVIEngine,
+    ndvi_output_name,
+    normalize_temporal_reducers,
+)
 from geofuse.persistence.job_executor import JobContext
 from geofuse.raster_sampling import LAZY_RASTER_THRESHOLD_BYTES, LazyRasterArray
 from geofuse.vector_io import read_vector_aliased_column, read_vector_subset
@@ -124,7 +129,29 @@ def run_gvi(
     gpu_lock: threading.Lock,
     save_gpkg: bool = True,
 ) -> dict:
-    """Run a GVI analysis. Mirrors the previous ``_job_worker`` in ``ui/tabs/gvi.py``."""
+    """Run a GVI analysis. Mirrors the previous ``_job_worker`` in ``ui/tabs/gvi.py``.
+
+    Without a ``processed`` grid in ``dataset_data`` the sampling points are
+    built here from ``raw``, ``run_args["step"]`` and ``run_args["buffer"]``,
+    so the submitting process never holds them.
+    """
+    if dataset_data.get("processed") is None:
+        from geofuse.core import gvi_sampling_points
+
+        ctx.progress(status_text="Generating sampling grid...")
+        dataset_data["processed"], dataset_data["meta"] = gvi_sampling_points(
+            dataset_data["raw"],
+            dataset_data.get("type") == "poly",
+            float(run_args.get("buffer") or 0),
+            float(run_args["step"]),
+        )
+        ctx.heartbeat()
+    shard = run_args.get("shard")
+    if shard:
+        from geofuse.core import shard_mask
+
+        processed = dataset_data["processed"]
+        dataset_data["processed"] = processed[shard_mask(processed, *shard)]
     ctx.progress(status_text="Waiting for GPU...")
     with gpu_lock:
         if ctx.is_cancelled():
@@ -188,25 +215,69 @@ def run_gvi(
         target_year=run_args.get("target_year"),
         max_year_diff=run_args.get("max_year_diff"),
         pause_callback=check_pause,
+        month_window=_month_window(run_args),
+        month_policy=run_args.get("month_policy") or "exclude",
+        download_concurrency=run_args.get("download_concurrency"),
+        batch_size=run_args.get("batch_size"),
+        batch_wait_ms=run_args.get("batch_wait_ms"),
+        precision=run_args.get("precision"),
     )
 
     if ctx.is_cancelled():
         return {"output_paths": []}
 
+    out_name = gvi_output_name(fname, run_args)
+    if shard:
+        from geofuse.jobs.gvi_shards import write_shard
+
+        paths = write_shard(
+            {f"{out_name}_gvi": dataset_data["accumulated"]},
+            dataset_data["processed"].crs,
+            output_dir,
+            f"{out_name}_gvi",
+            shard,
+            n_points,
+            throughput=[getattr(engine, "last_run_stats", None)],
+        )
+        ctx.progress(value=1.0, status_text="Shard written; the merge job finishes it")
+        return {"output_paths": paths}
+
+    if not dataset_data["accumulated"]:
+        _log_gvi(
+            "WARN",
+            f"No panorama found at any of the {n_points:,} sampling points; "
+            "no outputs written.",
+        )
+        ctx.progress(value=1.0, status_text="No panoramas found")
+        return {"output_paths": []}
+
     ctx.progress(value=1.0, status_text="Writing outputs")
 
+    target_year = run_args.get("target_year")
     output_paths, res_df = _write_gvi_outputs(
         accumulated=dataset_data["accumulated"],
         processed_crs=dataset_data["processed"].crs,
         meta=dataset_data.get("meta") or {},
-        out_name=os.path.splitext(fname)[0],
+        out_name=out_name,
         output_dir=output_dir,
         save_gpkg=save_gpkg,
         save_geotiff=save_geotiff,
         save_geojson=save_geojson,
+        capture=_capture_settings(
+            "recent" if target_year is None else "year", target_year, run_args
+        ),
+        throughput=getattr(engine, "last_run_stats", None),
     )
     dataset_data["results"] = res_df
     return {"output_paths": output_paths}
+
+
+def gvi_output_name(fname: str, run_args: Mapping) -> str:
+    """The name a GVI job's files start with. A specific-year run carries its
+    year, so runs of one layer for different years can share a folder."""
+    out_name = os.path.splitext(fname)[0]
+    target_year = run_args.get("target_year")
+    return out_name if target_year is None else f"{out_name}_{int(target_year)}"
 
 
 def _write_gvi_outputs(
@@ -219,13 +290,20 @@ def _write_gvi_outputs(
     save_gpkg: bool,
     save_geotiff: bool,
     save_geojson: bool,
+    capture: dict | None = None,
+    throughput: dict | None = None,
 ) -> tuple[list[str], gpd.GeoDataFrame]:
     """Write a GVI result set (GeoPackage / GeoJSON / per-cluster GeoTIFF).
 
     Shared by :func:`run_gvi` and :func:`run_gvi_column`; returns the written
     paths and the result GeoDataFrame (reprojected to the grid's planar CRS).
+    ``capture`` holds the capture settings (:func:`_capture_settings`); with
+    the counts of what was sampled they go into the sidecar.
     """
+    capture_summary = _capture_summary(accumulated, capture or {})
     res_df = gpd.GeoDataFrame(accumulated, crs=processed_crs)
+    if CAPTURE_STATUS_KEY in res_df.columns:
+        res_df = res_df.drop(columns=[CAPTURE_STATUS_KEY])
     if "orig_index" in res_df.columns:
         res_df.set_index("orig_index", inplace=True)
         res_df.index.name = None
@@ -351,12 +429,110 @@ def _write_gvi_outputs(
                     "distortion": meta.get("distortion"),
                     "choice_name": meta.get("choice_name"),
                     "n_clusters": len(clusters),
+                    **capture_summary,
+                    **({"throughput": throughput} if throughput else {}),
                 },
                 f,
                 indent=2,
             )
 
     return output_paths, res_df
+
+
+def _month_order(item: tuple[str, int]) -> tuple[bool, int]:
+    key = item[0]
+    return (not key.isdigit(), int(key) if key.isdigit() else 0)
+
+
+def _month_window(run_args: Mapping) -> tuple[int, int] | None:
+    window = run_args.get("month_window")
+    return (int(window[0]), int(window[1])) if window else None
+
+
+def _capture_settings(mode: str, target_year, run_args: Mapping) -> dict:
+    """The capture rule a GVI result set was sampled with, for its sidecar."""
+    window = _month_window(run_args)
+    settings = {
+        "capture_mode": mode,
+        "target_year": None if target_year is None else int(target_year),
+        "max_year_diff": run_args.get("max_year_diff"),
+        "month_window": list(window) if window else None,
+        "month_policy": (
+            (run_args.get("month_policy") or "exclude") if window else None
+        ),
+    }
+    if run_args.get("preset"):
+        settings["preset"] = str(run_args["preset"])
+    return settings
+
+
+def _capture_summary(accumulated: list, capture: Mapping) -> dict:
+    """Capture settings plus counts of the points and the captures sampled.
+
+    ``capture_years`` / ``capture_months`` count the sampled points by the
+    year / month of the capture used (``"unknown"`` when it had no date), so
+    each sums to ``n_sampled``.
+    """
+    from collections import Counter
+
+    sampled = [r for r in accumulated if r.get("gvi_veg") is not None]
+    years: Counter = Counter()
+    months: Counter = Counter()
+    for r in sampled:
+        date = r.get("pano_date") or ""
+        year, _, month = str(date).partition("-")
+        years[year if year.isdigit() else "unknown"] += 1
+        months[str(int(month)) if month.isdigit() else "unknown"] += 1
+    return {
+        **dict(capture),
+        "n_points": len(accumulated),
+        "n_sampled": len(sampled),
+        "n_no_capture_in_window": sum(
+            1 for r in accumulated if r.get(CAPTURE_STATUS_KEY) == NO_CAPTURE_IN_WINDOW
+        ),
+        "capture_years": dict(sorted(years.items())),
+        "capture_months": dict(sorted(months.items(), key=_month_order)),
+    }
+
+
+def column_years(raw: gpd.GeoDataFrame, date_column: str):
+    """``(rows in EPSG:4326 with a _year column, the years, the grid CRS)``.
+
+    The grid CRS is chosen once from the whole dataset, before any split by
+    year, so every year's grid shares one planar CRS and aligns.
+    """
+    from geofuse.crs_utils import select_grid_crs_with_warning
+    from geofuse.longitudinal import parse_date_column
+
+    gdf_4326 = (
+        raw
+        if raw.crs is not None and raw.crs.is_geographic
+        else raw.to_crs("EPSG:4326")
+    ).copy()
+    parsed = parse_date_column(gdf_4326[date_column])
+    gdf_4326["_year"] = parsed.dt.year
+    gdf_4326 = gdf_4326.dropna(subset=["_year"])
+    if gdf_4326.empty:
+        raise ValueError(f"No valid years could be parsed from column '{date_column}'.")
+    gdf_4326["_year"] = gdf_4326["_year"].astype(int)
+    grid_crs, _distortion, _choice = select_grid_crs_with_warning(
+        gdf_4326, _log_gvi, role="Grid CRS"
+    )
+    return gdf_4326, sorted(gdf_4326["_year"].unique()), grid_crs
+
+
+def year_grid(gdf_4326, year: int, buffer_m: float, step, grid_crs):
+    """One year's sampling points and their grid metadata (``None`` for bare
+    points)."""
+    from geofuse.core import generate_clustered_grid
+
+    year_gdf = gdf_4326[gdf_4326["_year"] == year].drop(columns=["_year"])
+    is_poly = year_gdf.geometry.iloc[0].geom_type in ("Polygon", "MultiPolygon")
+    if is_poly or buffer_m > 0:
+        return generate_clustered_grid(
+            year_gdf, buffer_m=buffer_m, step_m=float(step), grid_crs=grid_crs
+        )
+    return year_gdf.copy(), None
 
 
 def run_gvi_column(
@@ -382,30 +558,9 @@ def run_gvi_column(
     grids share one planar CRS and align. Results land in a
     ``{name}_temporal_gvi/`` folder, one set of files per year.
     """
-    from geofuse.core import generate_clustered_grid
-    from geofuse.crs_utils import select_grid_crs_with_warning
-    from geofuse.longitudinal import parse_date_column
-
-    raw = dataset_data["raw"]
-    gdf_4326 = (
-        raw
-        if raw.crs is not None and raw.crs.is_geographic
-        else raw.to_crs("EPSG:4326")
-    ).copy()
-    parsed = parse_date_column(gdf_4326[date_column])
-    gdf_4326["_year"] = parsed.dt.year
-    gdf_4326 = gdf_4326.dropna(subset=["_year"])
-    if gdf_4326.empty:
-        raise ValueError(f"No valid years could be parsed from column '{date_column}'.")
-    gdf_4326["_year"] = gdf_4326["_year"].astype(int)
-
-    unique_years = sorted(gdf_4326["_year"].unique())
+    gdf_4326, unique_years, grid_crs = column_years(dataset_data["raw"], date_column)
     n_years = len(unique_years)
-
-    # Grid CRS chosen once from the whole dataset so every per-year grid aligns.
-    grid_crs, _distortion, _choice = select_grid_crs_with_warning(
-        gdf_4326, _log_gvi, role="Grid CRS"
-    )
+    shard = run_args.get("shard")
 
     base_name = os.path.splitext(fname)[0]
     job_folder = os.path.join(output_dir, f"{base_name}_temporal_gvi")
@@ -437,14 +592,11 @@ def run_gvi_column(
     for year in unique_years:
         if ctx.is_cancelled():
             return {"output_paths": output_paths}
-        year_gdf = gdf_4326[gdf_4326["_year"] == year].drop(columns=["_year"])
-        is_poly = year_gdf.geometry.iloc[0].geom_type in ("Polygon", "MultiPolygon")
-        if is_poly or buffer_m > 0:
-            pts, meta = generate_clustered_grid(
-                year_gdf, buffer_m=buffer_m, step_m=float(step), grid_crs=grid_crs
-            )
-        else:
-            pts, meta = year_gdf.copy(), None
+        pts, meta = year_grid(gdf_4326, year, buffer_m, step, grid_crs)
+        if shard:
+            from geofuse.core import shard_mask
+
+            pts = pts[shard_mask(pts, *shard)]
         plans.append((year, pts, meta))
         ctx.progress(status_text=f"Generated grid for {year}: {len(pts):,} points")
         ctx.heartbeat()
@@ -470,6 +622,8 @@ def run_gvi_column(
     )
 
     done_points = 0
+    shard_results: dict[str, list] = {}
+    shard_stats: list = []
     for idx, (year, pts, meta) in enumerate(plans):
         if ctx.is_cancelled():
             return {"output_paths": output_paths}
@@ -515,10 +669,20 @@ def run_gvi_column(
             target_year=int(year),
             max_year_diff=max_year_diff,
             pause_callback=check_pause,
+            month_window=_month_window(run_args),
+            month_policy=run_args.get("month_policy") or "exclude",
+            download_concurrency=run_args.get("download_concurrency"),
+            batch_size=run_args.get("batch_size"),
+            batch_wait_ms=run_args.get("batch_wait_ms"),
+            precision=run_args.get("precision"),
         )
         done_points += len(pts)
         if ctx.is_cancelled():
             return {"output_paths": output_paths}
+        if shard:
+            shard_results[f"{base_name}_{year}_gvi"] = accumulated
+            shard_stats.append(getattr(engine, "last_run_stats", None))
+            continue
         if not accumulated:
             _log_gvi("WARN", f"Year {year}: no results produced.")
             continue
@@ -532,8 +696,28 @@ def run_gvi_column(
             save_gpkg=save_gpkg,
             save_geotiff=save_geotiff,
             save_geojson=save_geojson,
+            capture=_capture_settings("column", year, run_args),
+            throughput=getattr(engine, "last_run_stats", None),
         )
         output_paths.extend(paths)
+
+    if shard:
+        from geofuse.jobs.gvi_shards import write_shard
+
+        crs = plans[0][1].crs if plans else "EPSG:4326"
+        output_paths.extend(
+            write_shard(
+                shard_results,
+                crs,
+                job_folder,
+                f"{base_name}_gvi",
+                shard,
+                total_points,
+                throughput=shard_stats,
+            )
+        )
+        ctx.progress(value=1.0, status_text="Shard written; the merge job finishes it")
+        return {"output_paths": output_paths}
 
     ctx.progress(value=1.0, status_text="Completed")
     return {"output_paths": output_paths}
@@ -572,6 +756,33 @@ def _ndvi_on_progress_factory(
     return on_ndvi_progress
 
 
+def _ndvi_output_paths(
+    folder: str,
+    output_name: str,
+    temporal_reducers: Sequence[str],
+    *,
+    save_geotiff: bool,
+    save_gpkg: bool,
+    save_geojson: bool,
+    save_cluster_tiles: bool,
+) -> list[str]:
+    """Existing files of one NDVI download, every statistic in turn."""
+    paths: list[str] = []
+    for reducer in normalize_temporal_reducers(temporal_reducers):
+        stem = os.path.join(folder, ndvi_output_name(output_name, reducer))
+        for suffix, enabled in (
+            ("_ndvi.tif", save_geotiff),
+            ("_ndvi.gpkg", save_gpkg),
+            ("_ndvi.geojson", save_geojson),
+            ("_ndvi.json", True),
+        ):
+            if enabled and os.path.exists(stem + suffix):
+                paths.append(stem + suffix)
+        if save_cluster_tiles and os.path.isdir(stem + "_ndvi_tiles"):
+            paths.append(stem + "_ndvi_tiles")
+    return paths
+
+
 def run_ndvi(
     ctx: JobContext,
     *,
@@ -590,12 +801,25 @@ def run_ndvi(
     save_cluster_tiles: bool = False,
     satellite: str = "auto",
     coverage_rescue: bool = True,
+    temporal_reducers: Sequence[str] = ("median",),
+    water_mask: bool = False,
+    cloud_handling: str = "scene_filter",
+    reflectance: str = "surface",
+    substitute_2012: bool = False,
+    preset: str | None = None,
+    ee_project: str | None = None,
 ) -> dict:
-    """Run NDVI for a single date range."""
+    """Run NDVI for a single date range, one set of files per statistic.
+
+    Both ends of the range are included: the engine is called with
+    ``end_inclusive=True``, so a range ending 30 September keeps that day.
+    ``ee_project`` is the Earth Engine project to initialise with (``None``:
+    the one Earth Engine finds in its own configuration).
+    """
     from geofuse.crs_utils import buffer_gdf_union_metres
 
     ctx.progress(status_text="Initializing Earth Engine...")
-    engine = NDVIEngine()
+    engine = NDVIEngine(project_id=ee_project)
     geometry = buffer_gdf_union_metres(dataset_data["raw"], buffer_m)
 
     on_progress = _ndvi_on_progress_factory(ctx)
@@ -623,6 +847,13 @@ def run_ndvi(
         write_cluster_tiles=save_cluster_tiles,
         satellite=satellite,
         coverage_rescue=coverage_rescue,
+        temporal_reducers=temporal_reducers,
+        water_mask=water_mask,
+        cloud_handling=cloud_handling,
+        reflectance=reflectance,
+        substitute_2012=substitute_2012,
+        preset=preset,
+        end_inclusive=True,
     )
 
     if result.get("status") == "cancelled":
@@ -630,22 +861,15 @@ def run_ndvi(
     if result.get("status") != "success":
         raise RuntimeError(result.get("message", "NDVI run failed"))
 
-    output_paths: list[str] = []
-    tif_path = os.path.join(output_dir, f"{output_name}_ndvi.tif")
-    if save_geotiff and os.path.exists(tif_path):
-        output_paths.append(tif_path)
-    gpkg_path = os.path.join(output_dir, f"{output_name}_ndvi.gpkg")
-    if save_gpkg and os.path.exists(gpkg_path):
-        output_paths.append(gpkg_path)
-    gj_path = os.path.join(output_dir, f"{output_name}_ndvi.geojson")
-    if save_geojson and os.path.exists(gj_path):
-        output_paths.append(gj_path)
-    sidecar_path = os.path.join(output_dir, f"{output_name}_ndvi.json")
-    if os.path.exists(sidecar_path):
-        output_paths.append(sidecar_path)
-    cluster_tiles_dir = os.path.join(output_dir, f"{output_name}_ndvi_tiles")
-    if save_cluster_tiles and os.path.isdir(cluster_tiles_dir):
-        output_paths.append(cluster_tiles_dir)
+    output_paths = _ndvi_output_paths(
+        output_dir,
+        output_name,
+        temporal_reducers,
+        save_geotiff=save_geotiff,
+        save_gpkg=save_gpkg,
+        save_geojson=save_geojson,
+        save_cluster_tiles=save_cluster_tiles,
+    )
 
     ctx.progress(value=1.0, status_text="Completed")
     return {"output_paths": output_paths}
@@ -669,16 +893,25 @@ def run_ndvi_column(
     save_cluster_tiles: bool = False,
     satellite: str = "auto",
     coverage_rescue: bool = True,
+    temporal_reducers: Sequence[str] = ("median",),
+    water_mask: bool = False,
+    cloud_handling: str = "scene_filter",
+    reflectance: str = "surface",
+    substitute_2012: bool = False,
+    preset: str | None = None,
+    ee_project: str | None = None,
 ) -> dict:
     """Run one NDVI raster per year present in ``date_column``.
 
     The input is split by year; each year is processed as a standalone NDVI
-    job over only that year's features, composited across the growing-season
-    months ``[season_start_month, season_end_month]`` of that year. The export
+    job over only that year's features, composited across the whole
+    growing-season months ``[season_start_month, season_end_month]`` of that
+    year, last day of the end month included. The export
     CRS is chosen once from the whole dataset — before the split — so every
     year's raster snaps to the same global pixel grid and the outputs align.
     Results land in a ``{name}_temporal_ndvi/`` folder, one set of files per
-    year (``{name}_{year}_ndvi.tif`` plus optional GeoPackage/GeoJSON).
+    year (``{name}_{year}_ndvi.tif`` plus optional GeoPackage/GeoJSON) and
+    temporal statistic (``{name}_{year}_max_ndvi.tif`` for ``max``).
     """
     import calendar
 
@@ -703,7 +936,7 @@ def run_ndvi_column(
     job_folder = os.path.join(output_dir, f"{base_name}_temporal_ndvi")
     os.makedirs(job_folder, exist_ok=True)
 
-    engine = NDVIEngine()
+    engine = NDVIEngine(project_id=ee_project)
     output_paths: list[str] = [job_folder]
 
     def check_cancel() -> bool:
@@ -756,6 +989,13 @@ def run_ndvi_column(
             satellite=satellite,
             coverage_rescue=coverage_rescue,
             crs_override=crs_override,
+            temporal_reducers=temporal_reducers,
+            water_mask=water_mask,
+            cloud_handling=cloud_handling,
+            reflectance=reflectance,
+            substitute_2012=substitute_2012,
+            preset=preset,
+            end_inclusive=True,
         )
         if result.get("status") == "cancelled":
             return {"output_paths": output_paths}
@@ -763,18 +1003,17 @@ def run_ndvi_column(
             _log_ndvi("WARN", f"Year {year} failed: {result.get('message')}")
             continue
 
-        for suffix, enabled in (
-            ("_ndvi.tif", save_geotiff),
-            ("_ndvi.gpkg", save_gpkg),
-            ("_ndvi.geojson", save_geojson),
-            ("_ndvi.json", True),
-        ):
-            p = os.path.join(job_folder, f"{output_name}{suffix}")
-            if enabled and os.path.exists(p):
-                output_paths.append(p)
-        tiles_dir = os.path.join(job_folder, f"{output_name}_ndvi_tiles")
-        if save_cluster_tiles and os.path.isdir(tiles_dir):
-            output_paths.append(tiles_dir)
+        output_paths.extend(
+            _ndvi_output_paths(
+                job_folder,
+                output_name,
+                temporal_reducers,
+                save_geotiff=save_geotiff,
+                save_gpkg=save_gpkg,
+                save_geojson=save_geojson,
+                save_cluster_tiles=save_cluster_tiles,
+            )
+        )
 
     ctx.progress(value=1.0, status_text="Completed")
     return {"output_paths": output_paths}
@@ -839,6 +1078,10 @@ def _fusion_config_fingerprint(
     spatial_adjust_method: str = "none",
     spatial_adjust_max_df: int = 10,
     spatial_adjust_eps_m: float | None = None,
+    gvi_ladder_spacing: str = "linear",
+    gvi_ladder_rungs: int = 15,
+    ndvi_ladder_spacing: str = "linear",
+    ndvi_ladder_rungs: int = 15,
 ) -> str:
     """8-char hex hash of every setting that changes the search space / split.
 
@@ -894,6 +1137,16 @@ def _fusion_config_fingerprint(
                 str(v).lower() == "categorical"
                 for v in (covariate_types or {}).values()
             )
+            else []
+        )
+        # A log-spaced ladder has other rungs; only appended when one is used,
+        # so linear-ladder runs keep their hash.
+        + (
+            [
+                f"lad:gvi={gvi_ladder_spacing}{int(gvi_ladder_rungs)},"
+                f"ndvi={ndvi_ladder_spacing}{int(ndvi_ladder_rungs)}"
+            ]
+            if "log" in (gvi_ladder_spacing, ndvi_ladder_spacing)
             else []
         )
     )
@@ -1078,6 +1331,11 @@ def run_fusion(
     posterior_draws: int = 800,
     posterior_warmup: int = 800,
     posterior_chains: int = 4,
+    radius_prior: str = "rungs",
+    gvi_ladder_spacing: str = "linear",
+    gvi_ladder_rungs: int = 15,
+    ndvi_ladder_spacing: str = "linear",
+    ndvi_ladder_rungs: int = 15,
     spatial_split: bool = False,
     spatial_block_size_m: float | None = None,
     n_spatial_blocks: int | None = None,
@@ -1255,6 +1513,7 @@ def run_fusion(
             "posterior_draws": int(posterior_draws),
             "posterior_warmup": int(posterior_warmup),
             "posterior_chains": int(posterior_chains),
+            "radius_prior": str(radius_prior),
             "buffer_meters": buffer_meters,
             "gvi_buffer_min_m": gvi_buffer_min_m,
             "gvi_buffer_max_m": gvi_buffer_max_m,
@@ -1262,6 +1521,10 @@ def run_fusion(
             "ndvi_buffer_min_m": ndvi_buffer_min_m,
             "ndvi_buffer_max_m": ndvi_buffer_max_m,
             "ndvi_buffer_step_m": ndvi_buffer_step_m,
+            "gvi_ladder_spacing": str(gvi_ladder_spacing),
+            "gvi_ladder_rungs": int(gvi_ladder_rungs),
+            "ndvi_ladder_spacing": str(ndvi_ladder_spacing),
+            "ndvi_ladder_rungs": int(ndvi_ladder_rungs),
             "ndvi_resolution_m": ndvi_resolution_m,
             "gvi_grid_spacing_m": gvi_grid_spacing_m,
             "cgi_grid_spacing_m": cgi_grid_spacing_m,
@@ -1434,6 +1697,10 @@ def run_fusion(
                 ndvi_buffer_min_m=ndvi_buffer_min_m,
                 ndvi_buffer_max_m=ndvi_buffer_max_m,
                 ndvi_buffer_step_m=ndvi_buffer_step_m,
+                gvi_ladder_spacing=gvi_ladder_spacing,
+                gvi_ladder_rungs=int(gvi_ladder_rungs),
+                ndvi_ladder_spacing=ndvi_ladder_spacing,
+                ndvi_ladder_rungs=int(ndvi_ladder_rungs),
                 n_bins=n_bins,
                 cache_dir=cache_dir,
                 cgi_formula=cgi_formula,
@@ -1795,6 +2062,10 @@ def run_fusion(
                 spatial_adjust_method=spatial_adjust_method,
                 spatial_adjust_max_df=spatial_adjust_max_df,
                 spatial_adjust_eps_m=spatial_adjust_eps_m,
+                gvi_ladder_spacing=gvi_ladder_spacing,
+                gvi_ladder_rungs=int(gvi_ladder_rungs),
+                ndvi_ladder_spacing=ndvi_ladder_spacing,
+                ndvi_ladder_rungs=int(ndvi_ladder_rungs),
             )
 
             def _standalone_study_name(ch: str) -> str:
@@ -1921,6 +2192,7 @@ def run_fusion(
                 draws=int(posterior_draws),
                 warmup=int(posterior_warmup),
                 chains=int(posterior_chains),
+                radius_prior=str(radius_prior),
                 seed=42,
                 cancel_callback=cancel_check,
                 progress_callback=_study_progress_cb("CGI", skey("optimize")),
@@ -2017,6 +2289,25 @@ def run_fusion(
                 value=prog_ledger(), status_text=f"{prefix}Applying fusion weights..."
             )
             composite_df = engine.apply_fusion()
+            # One row per target entity, written now so it survives the
+            # process boundary (the live frame does not).
+            entity_table_path: str | None = None
+            try:
+                entity_table_path = write_entity_table(
+                    engine,
+                    composite_df,
+                    os.path.join(
+                        job_artifacts_root,
+                        (
+                            f"composite_entities__{_STUDY_NAME_UNSAFE.sub('_', label)}"
+                            if multi_outcome
+                            else "composite_entities"
+                        ),
+                    ),
+                )
+                output_paths.append(entity_table_path)
+            except Exception as exc:
+                _log_fusion("WARN", f"[{label}] Per-entity table not written: {exc}")
             stage(skey("apply"), DONE)
 
             # ── Post-hoc multi-metric reporting ─────────
@@ -2092,6 +2383,7 @@ def run_fusion(
                     draws=int(posterior_draws),
                     warmup=int(posterior_warmup),
                     chains=int(posterior_chains),
+                    radius_prior=str(radius_prior),
                     seed=42,
                     cancel_callback=cancel_check,
                     progress_callback=_study_progress_cb(
@@ -2474,6 +2766,7 @@ def run_fusion(
                         draws=int(posterior_draws),
                         warmup=int(posterior_warmup),
                         chains=int(posterior_chains),
+                        radius_prior=str(radius_prior),
                         seed=42,
                         cancel_callback=cancel_check,
                     )
@@ -2521,6 +2814,7 @@ def run_fusion(
                 "standalones": standalones_bundle,
                 "artifacts_dir": job_artifacts_root,
                 "composite_path": cgi_composite_path,
+                "entity_table_path": entity_table_path,
                 "report_dir": report_dir,
                 # ``None`` when the collinearity check wasn't requested.
                 "collinearity_report": getattr(engine, "_collinearity_report", None),

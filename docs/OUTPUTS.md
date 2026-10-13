@@ -29,10 +29,11 @@ off.
 | Path | Contents |
 | --- | --- |
 | `[name]_gvi.gpkg` | Canonical point layer (`gvi_samples`) in the planar CRS |
-| `[name]_gvi.json` | Sidecar: grid CRS, step, anchor, cluster count, distortion |
+| `[name]_gvi.json` | Sidecar: grid CRS, step, anchor, cluster count, distortion, and the capture rule (`capture_mode`, `target_year`, `max_year_diff`, `month_window`, `month_policy`) with `n_points`, `n_sampled`, `n_no_capture_in_window` and per-year / per-month counts of the captures used (`capture_years`, `capture_months`, each summing to `n_sampled`), and `throughput`: the run's stage counts and rates (`searched`, `cache_hits`, `downloads`, `segmented`, `gpu_batches`, `gpu_busy_share`, `throttle_events`, the per-second rates, `download_concurrency`, `batch_size`, the `precision` the model ran at, whether a `cuda_graph` was used, and the `download_mode`, `package` or `api`); a merge of shards lists each shard's under `throughput.shards` |
 | `[name]_gvi_tiles/` | One dense GeoTIFF per cluster, band 1 vegetation, band 2 terrain, plus an index |
 | `[name]_gvi.geojson` | The same points in EPSG:4326 for web maps |
 | `[name]_temporal_gvi/` | Per-year mode: one full output set per year |
+| `[name]_[year]_gvi.*` | Specific-year mode: the same set, named with the target year |
 | `output_results/images/`, `masks/` | Raw panoramas and segmentation masks, if enabled |
 
 Fields in `gvi_samples`:
@@ -61,14 +62,26 @@ Default: GeoTIFF on, GeoPackage off, GeoJSON off.
 | `[name]_ndvi.json` | Sidecar, always written on success (see below) |
 | `[name]_ndvi.gpkg` / `.geojson` | Per-pixel points, planar CRS and EPSG:4326 respectively |
 | `[name]_ndvi_tiles/` | One GeoTIFF per connected component, plus an index |
-| `[name]_temporal_ndvi/` | Per-year mode: one full output set per year |
+| `[name]_mean_ndvi.*` / `[name]_max_ndvi.*` | The same set for each other temporal statistic picked |
+| `[name]_temporal_ndvi/` | Per-year mode: one full output set per year and statistic |
 
 The sidecar lets fusion and other tools introspect a raster without re-running
 Earth Engine. It records the export CRS, the satellite and collection used, the
-dates requested and the dates actually queried (which differ if a sparse window
-was widened), the cloud threshold and surviving image count, resolution, how the
-input decomposed into clusters and tiles, any tiles that exhausted their retries
-and so appear as gaps, and the maximum map distortion.
+dates requested (`start_date`, `end_date`; the end date is included, and
+`end_date_exclusive` is the day after it, which is what Earth Engine is sent)
+and the dates actually queried (`used_start_date`, `used_end_date`, end
+exclusive; they differ if a sparse window was widened, or a 2012 window was
+filled from 2013: `year_substituted`), the
+temporal statistic (`temporal_reducer`), the acquisition options
+(`reflectance`, `cloud_handling`, `water_mask` with `water_occurrence_max`),
+the cloud threshold and surviving image count, resolution, how the input
+decomposed into clusters and tiles, any tiles that exhausted their retries and
+so appear as gaps, and the maximum map distortion. When the run came from a
+settings preset, `preset` names it (the GVI sidecar does the same).
+
+Saved presets live in `presets/ndvi/` and `presets/gvi/` at the repository
+root, one JSON file each (`"format": "geofuse-preset"`); built-ins ship inside
+`geofuse/presets/builtin/`.
 
 ---
 
@@ -82,6 +95,7 @@ output_results/fusion/<YYYYMMDDTHHMMSS>__<short_job_id>/
 ├── composite_greenery.tif              composite raster at the discovered params
 ├── composite_greenery_params.json      discovered params + provenance
 ├── composite_greenery_<channel>.tif    one per standalone channel, if enabled
+├── composite_entities.gpkg             one row per target entity: channels + CGI
 ├── results_bundle.json                 everything the results panel needs
 └── study_results/
     ├── run_config.json                 every setting the run used
@@ -139,7 +153,8 @@ composite is built from; `sweep_radius_m` and `sweep_aggregator` keep the
 sweep's shortlist cell, and the two disagree where the grid is flat.
 `peak_radius_m` is the kernel peak in buffer space and
 `peak_radius_width_vs_prior` how much the data narrowed it (near 1 means the
-prior is speaking back). `r50_m` and `r90_m` (intervals in `r50_ci_low` /
+prior is speaking back); `radius_prior` (rungs / range) and `ladder` (linear
+with its step, or log with its rung count) say what that prior was. `r50_m` and `r90_m` (intervals in `r50_ci_low` /
 `r50_ci_high` and `r90_ci_low` / `r90_ci_high`) are the distances holding half
 and 90 % of the implied radial weight, which is where the influence sits on the
 ground; for percentile aggregators they are a mean-equivalent approximation.
@@ -199,9 +214,50 @@ resampling question. `mixedlm_tstat` is an absolute value, so its interval sits
 above zero by construction and is not a significance statement; the signed
 coefficient is reported alongside and is the one that can straddle zero.
 
+`composite_entities.gpkg` (layer `cgi`; a `.csv` when the target has no
+geometry) is the per-entity table the dashboard's "Export per-entity CGI" and
+`geofuse export` deliver.
+
 ### Caches
 
 `output_results/fusion_cache/` holds aligned channel rasters and the
 pre-aggregation store of per-entity, per-radius statistics. Both are reused
 automatically across runs with identical inputs and are safe to delete to force
 a rebuild.
+
+The panorama cache (`gvi_panos.db`, the GVI value of every panorama segmented
+so far) and the NDVI tile cache (`ndvi_tiles/`) live in `logs/caches/`, or in
+the folder `[paths] caches` of the user configuration names. Both are shared
+by every run; `geofuse cache list | purge` and the dashboard's cache panel
+manage them.
+
+---
+
+## Command-line state
+
+The command line keeps its jobs in a per-user state folder
+(`%LOCALAPPDATA%\geofuse` on Windows, `~/.local/state/geofuse` on Linux;
+`state_dir` in the configuration, or `--state-dir`, moves it):
+
+| Path | Contents |
+| --- | --- |
+| `jobs/<id>/spec.json` | What the job runs: inputs and resolved settings |
+| `jobs/<id>/status.json` | Where it is: status, progress, stages, outputs |
+| `jobs/<id>/control.json` | Pause / resume / cancel requests |
+| `logs/<id>.log` | The job's log |
+| `runs/<run>.json` | Each submitted run and its jobs |
+| `supervisors/<id>.json` | Each running supervisor and its heartbeat |
+| `remotes/<name>/link.json` | A remote link's state (connecting, connected, reconnecting, stopped) and heartbeat |
+| `remotes/<name>/snapshot.json` | The remote's jobs and supervisor, as last read |
+| `remotes/<name>/logs/<id>.log` | Each remote job's log, copied as it grows |
+| `remotes/<name>/requests/`, `responses/` | Control, re-run, output and fetch requests waiting for the link, and their answers |
+| `remotes/<name>/outputs/<id>/` | A remote job's files, fetched over the link |
+
+The files are plain JSON replaced whole, so the folder may sit on a cluster's
+shared filesystem and be read from the login node. The user configuration
+(`config.toml`) lives in `%LOCALAPPDATA%\geofuse` / `~/.config/geofuse`.
+
+A sharded GVI step leaves `[name]_gvi.shard<i>of<N>.gpkg` and a manifest per
+shard until its merge job writes the usual outputs and removes them.
+`geofuse hpc script` writes its job scripts to `hpc-<run>/`, with the
+scheduler's logs in `hpc-<run>/logs/`.

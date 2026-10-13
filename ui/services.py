@@ -20,6 +20,7 @@ import subprocess
 
 import streamlit as st
 
+from geofuse.persistence import caches
 from geofuse.persistence.caches import NdviTileCache, PanoCache
 from geofuse.persistence.job_executor import JobExecutor
 from geofuse.persistence.job_store import JobStore
@@ -114,11 +115,11 @@ def get_job_executor() -> JobExecutor:
 @st.cache_resource
 def get_pano_cache() -> PanoCache:
     """SQLite-backed GVI pano cache. Global across study areas and runs."""
-    return PanoCache("logs/caches/gvi_panos.db")
+    return PanoCache(caches.pano_db())
 
 
 @st.cache_resource
 def get_ndvi_tile_cache() -> NdviTileCache:
     """Persistent NDVI tile cache. Filesystem-backed tile bodies + SQLite WAL
     index for LRU eviction. Shared across runs and subprocesses."""
-    return NdviTileCache("logs/caches/ndvi_tiles")
+    return NdviTileCache(caches.ndvi_tiles())

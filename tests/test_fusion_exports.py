@@ -111,6 +111,29 @@ class TestDiscoveryCsvReportsWhatWasBuilt(unittest.TestCase):
         self.assertEqual(rows[0]["aggregators_separated"], "p10")
         self.assertEqual(rows[1]["aggregators_separated"], "")
 
+    def test_the_prior_mode_and_ladder_travel_with_the_radius(self):
+        summ = _study()["discovery_summary"]
+        summ.update(
+            radius_prior="range",
+            ladder_spacing={"ndvi": "log (15 rungs)", "gvi": "linear (step 50 m)"},
+        )
+        rows = _rows(_write(discovery_summary=summ), "discovery.csv")
+        self.assertEqual([r["radius_prior"] for r in rows], ["range", "range"])
+        self.assertEqual(
+            [r["ladder"] for r in rows], ["log (15 rungs)", "linear (step 50 m)"]
+        )
+
+    def test_the_lifted_summary_keeps_the_prior_mode_and_ladder(self):
+        from geofuse.jobs.fusion_outputs import _posterior_summary
+
+        post = {"radius_prior": "range", "ladder_spacing": {"ndvi": "log (9 rungs)"}}
+        s = _posterior_summary({"__posterior__": post})
+        self.assertEqual(s["radius_prior"], "range")
+        self.assertEqual(s["ladder_spacing"], {"ndvi": "log (9 rungs)"})
+        self.assertEqual(
+            _posterior_summary({"__posterior__": {}})["radius_prior"], "rungs"
+        )
+
     def test_the_distances_of_influence_are_exported(self):
         summ = _study()["discovery_summary"]
         summ.update(

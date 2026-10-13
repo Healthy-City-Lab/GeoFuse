@@ -31,7 +31,7 @@ A GDAL or GDAL-dependent library (GeoPandas, rasterio) fails to import.
 
 **Cause:** `torch` / `geofuse` DLLs must be loaded before the GDAL stack on Windows.
 
-**Fix:** Never import `geopandas`, `rasterio`, or similar libraries before `import torch` or `from geofuse import ...` in custom scripts. The application entry point (`ui/app.py` and `scripts/cli.py`) already enforces the correct order.
+**Fix:** Never import `geopandas`, `rasterio`, or similar libraries before `import torch` or `from geofuse import ...` in custom scripts. The entry points (`ui/app.py` and the `geofuse` command) already enforce the correct order.
 
 ---
 
@@ -67,9 +67,62 @@ A warning appears in the terminal when downloading very high-resolution Street V
 Google Earth Engine credentials are missing or expired.
 
 **Fix:**
-1. Run `earthengine authenticate` in the activated environment.
-2. Follow the browser prompt to authorize your Google account.
-3. If using a service account, ensure the credentials JSON is accessible and the project ID is set correctly.
+1. Run `geofuse auth earthengine` in the activated environment and follow the browser prompt.
+2. Without a browser (a cluster login node), connect with `ssh -L 8085:localhost:8085 HOST` and open the printed address on your own computer, or use `geofuse auth earthengine --no-browser` and paste the code it shows.
+3. For a service account, `geofuse credentials set earthengine-service-account KEY.json`.
+4. "No project found": `geofuse config set earthengine.project YOUR-PROJECT`.
+
+A background job never waits on a sign-in page where no browser can open; it stops with the command to run.
+
+---
+
+## GVI stops with "Google's Street View service no longer answers as the GVI downloader expects"
+
+Google changed one of the endpoints the scraper uses. The job stops instead of reporting every point as having no panorama. `geofuse doctor` runs one search and shows the same message. The downloader has to be updated to the endpoint Google now uses. Meanwhile, a Street View API key and `download_mode = "api"` download through Google's documented API instead.
+
+---
+
+## GVI stops with "Google refused the Street View API request"
+
+Google checked the key and refused it. The message carries Google's reason:
+
+* **API key not valid:** the key was mistyped or deleted. Store it again with `geofuse credentials set streetview-key`.
+* **Map Tiles API has not been used in project … or it is disabled:** enable the **Map Tiles API** for the key's Google Cloud project, wait a few minutes, and run again.
+* **Billing / permission errors:** turn billing on for the project, or lift API or address restrictions on the key that exclude this machine.
+
+`geofuse doctor` runs one API search and shows the same reason. A run in API mode with no key stored stops before it starts (`download_mode = "api" needs a Street View API key`).
+
+---
+
+## `geofuse doctor` warns that the caches are on a network filesystem
+
+The panorama cache and the NDVI tile index are SQLite files, which are unsafe on NFS / SMB / Lustre / GPFS when several machines write at once. Move them to a local or scratch disk:
+
+```bash
+geofuse config set paths.caches /scratch/$USER/geofuse-caches
+```
+
+---
+
+## "No usable keyring" when storing a credential
+
+Headless Linux machines often have no keyring service. With `[credentials] store = "auto"` (the default) GeoFuse falls back to `credentials.toml` in your configuration folder, readable by you only; `geofuse config set credentials.store file` makes that explicit.
+
+---
+
+## `geofuse watch` says it needs `textual`
+
+Install it into the environment (`pip install textual`), or follow jobs with `geofuse status` and `geofuse logs JOB -f`.
+
+---
+
+## The Jobs tab or `geofuse watch` says a remote's link is down
+
+The remote's jobs are shown as they were when last read, and requests are not sent. Run `geofuse remote attach NAME` in a terminal and keep it open; it asks for the login there.
+
+* **`the remote side closed the link (exit code 127)`:** the remote shell cannot find `geofuse`. Set the full start command, e.g. `geofuse remote add NAME HOST --command "conda run -n geofuse geofuse"` (or `module load ...; geofuse`).
+* **`exit code 255`:** `ssh` itself failed: host name, user, key or network. Try `ssh USER@HOST` by hand.
+* **It keeps reconnecting:** the link retries with growing pauses, up to a minute apart; it recovers by itself once the connection does.
 
 ---
 
@@ -78,8 +131,20 @@ Google Earth Engine credentials are missing or expired.
 The segmentation model runs out of VRAM during batch processing.
 
 **Fix:**
+* Set **GPU Batch Size** (`batch_size`) back to 1.
+* The recorded CUDA graph holds its own memory. When recording fails the log says `CUDA graph capture failed` and the run continues layer by layer, slower but with the same values.
 * Process fewer study areas simultaneously.
 * The engine automatically falls back from CUDA → MPS → CPU if a device runs out of memory mid-job.
+
+---
+
+## GVI is slow, or its `Throughput:` line reports throttle events
+
+The line at the end of each GVI run shows where the time went.
+
+* **Throttle events, slow downloads:** Google is limiting requests from your address. The run backs off by itself; lower **Concurrent Downloads** (`download_concurrency`) so it trips less often. A larger pool does not lift Google's limit.
+* **No throttle events, GPU busy well below 90 %:** downloads are the bottleneck. Raise `download_concurrency`.
+* **GPU busy near 100 %:** the GPU is the limit. Check that the line says `fp16` (the default); a faster card, or several shards on several GPUs (`shards = N` in a run file), is the way up from there.
 
 ---
 

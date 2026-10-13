@@ -23,9 +23,26 @@ tiles, GeoJSON, and the raw panoramas and segmentation masks.
 - Sources Google Street View panoramas over the study area and labels each with
   a DeepLabV3+ model trained on the Cityscapes classes. GVI is the share of
   pixels classed vegetation plus terrain.
+- Two download modes, giving the same equirectangular images. **Package**
+  (the default) needs no key: it reads Google Maps' own coverage and panorama
+  endpoints, sees every historical capture, and is free. **API** uses Google's
+  documented Map Tiles API with your key: it is billed per request and sees
+  only the most recent capture at each place, so a specific-year run keeps a
+  point only when that capture is within the year limit. Both skip indoor
+  imagery and user photospheres. A key Google refuses stops the run with
+  Google's reason.
 - Can target a historical capture year rather than the latest imagery, with an
   optional maximum year gap. The capture date lands in a `pano_date` column, so
-  year-matched runs are usable for longitudinal analysis.
+  year-matched runs are usable for longitudinal analysis. A specific-year run
+  carries its year in the file names, so one layer can be run for several
+  years into one folder.
+- Can limit captures to a range of months, such as May to October for leaf-on
+  panoramas, either excluding the rest or using them only when nothing in the
+  window exists. It applies in every capture mode; within a year the capture
+  nearest the middle of the window wins. Off by default.
+- The sidecar records the capture rule and what was sampled: points with a
+  value, points with no capture in the window, and the capture years and months
+  used.
 - Can split a layer by a year or date column and produce one output per year.
 - Files can be merged into groups before running, so a year split across several
   files yields a single output.
@@ -33,6 +50,23 @@ tiles, GeoJSON, and the raw panoramas and segmentation masks.
   grid cells are true squares in metres. Distortion above 2 % is warned about.
 - Panoramas are cached across runs. Interrupted jobs resume after the study area
   is re-uploaded and hash-verified.
+- Search, download and segmentation run as separate stages: a pool of downloads
+  (16 at once by default) prepares images for the GPU, which labels them one at
+  a time unless a batch size is set. On a single desktop GPU the model already
+  keeps the card busy, so batching seldom helps, and a batched forward labels
+  roughly one pixel in 10,000 differently; the default keeps results identical
+  to labelling each image alone. Google's throttle applies whatever the pool
+  size, and the run slows itself down when Google pushes back.
+- On an NVIDIA GPU the model runs in half precision (FP16) and is replayed as
+  one recorded CUDA graph rather than launched layer by layer, about 1.8x the
+  panoramas per second of full precision. FP16 moves a point's GVI by 0.00005
+  on average (at most a few ten-thousandths; correlation with FP32 0.9999998).
+  **GPU Precision** / `precision = "fp32"` repeats the masks of runs made
+  before FP16 was the default. Other devices always run FP32. Panorama values
+  already in the cache are reused whatever the precision.
+- Each run logs and records its stage counts and rates: points searched,
+  panoramas downloaded and segmented, how busy the GPU was, the precision the
+  model ran at, and throttle events.
 
 ---
 
@@ -46,17 +80,39 @@ per-cluster tiles, and a metadata sidecar.
 
 - Fetches cloud-masked Sentinel-2 or Landsat imagery. `auto` picks Sentinel-2
   from 2017 onward and Landsat before that, harmonising the older TM/ETM+
-  sensors to the Landsat-8 scale so values stay comparable across years.
+  sensors to the Landsat-8 scale so values stay comparable across years. Pick
+  one sensor instead to keep a multi-year series on one instrument, or a
+  Landsat set without Landsat 7's striped scenes (after its 2003 scan-line
+  failure) and without Landsat 9.
+- Acquisition is configurable, and every option defaults to the behaviour
+  above: surface or top-of-atmosphere reflectance; cloudy scenes dropped,
+  cloudy pixels masked, or both (the default); an optional water mask that
+  removes pixels open water covers at least half the time; and an optional
+  fill of a 2012 window with the same days of 2013, a year no Landsat sensor
+  imaged without scan-line gaps.
 - Dates can be given as ranges, as specific dates with a window, or as a year
   column that splits the layer and composites each year over the growing-season
-  months you choose.
+  months you choose. End dates are included: a range ending 30 September keeps
+  that day's scenes, and a season covers its months in full.
+- Each pixel's value is a temporal statistic of the window's cloud-free images:
+  the median (default), the mean, or the maximum. Each date mode takes any
+  combination; every statistic writes its own files, and one download per tile
+  serves all of them.
+- Downloaded tiles are cached per statistic, compactly and without changing any
+  output, so a re-run, or a run that adds a statistic, fetches only what is
+  missing.
 - Tiles export on a shared snap grid and are mosaicked without a second
   reprojection, so output pixels are exactly what Earth Engine produced.
 - Distinguishes "no images in range" from "all images too cloudy", widens a
-  sparse window once and records that it did, and lists any missing tiles in the
-  sidecar.
+  sparse window once and records that it did (turn this off for year-matched
+  composites), and lists any missing tiles in the sidecar.
 - Can optionally sample values onto your own features, exactly or as a zonal
   statistic over a buffer.
+
+**Presets (NDVI and GVI).** Both tabs keep named presets of their settings:
+built-ins ship with the toolbox, your own are saved as JSON files that can be
+shared, and a loaded file is checked against the tab's own settings before it
+is used. Presets never hold dates, files or credentials.
 
 ---
 
@@ -104,7 +160,12 @@ Nothing below is pre-specified.
   most and decays outward, so the scale is reported as R50 and R90: the
   distances holding half and 90 % of the implied weight, on the raw exposure
   scale, with credible intervals. The kernel's peak is shown too, labelled as a
-  position in buffer space rather than a distance of influence.
+  position in buffer space rather than a distance of influence. Ladders can be
+  linear (a fixed step) or log-spaced (a number of rungs placed geometrically).
+  The range-based radius prior covers the range the ladder spans and weighs
+  each rung by the distance it covers, so the prior on the scale does not
+  depend on how densely the ladder was sampled; the rung-based prior, the
+  default, follows the listed rungs.
 - **Aggregation statistic.** Mean, median or a percentile of the values inside
   that buffer.
 - **Functional form.** A weighted sum, or a synergy form with powers on the main
@@ -209,7 +270,16 @@ Nothing below is pre-specified.
 - **Dashboard.** A Streamlit app with a tab per engine. Jobs run in their own
   process, so the interface stays responsive and a running job is not throttled
   by the browser tab.
-- **CLI.** An MPI-parallel command-line entry point for HPC batch runs.
+- **Command line.** `geofuse` runs every engine with the dashboard's settings
+  and defaults, from TOML run files that chain downloads and the fit (or one
+  engine from flags). A background supervisor runs the jobs, `geofuse watch`
+  follows and controls them, and the dashboard's jobs share the same GPU, Street
+  View, Earth Engine and fusion limits. On a cluster, GVI steps split into
+  shards and `geofuse hpc script` writes SLURM job arrays.
+- **Jobs on other machines.** `geofuse remote attach` holds one SSH login to a
+  cluster or workstation and mirrors its jobs here; the dashboard's **Jobs**
+  tab and `geofuse watch` show and control local and remote jobs alike, and
+  fetch remote outputs. A dropped connection reopens on its own.
 - **Sized to the machine.** Thread pools take about a third of the cores;
   process pools take 80 % by default. Override with `GEOFUSE_WORKERS` and
   `GEOFUSE_CPU_SHARE`. Every run logs a stage-by-stage wall-clock breakdown.

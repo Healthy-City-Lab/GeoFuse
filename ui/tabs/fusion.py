@@ -4,8 +4,7 @@ import html
 import io
 import math
 import os
-import re
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -34,8 +33,11 @@ except ImportError:
     _MetricFusionEngine = None
 
 from geofuse import cgi_formulas as _cgi_formulas
+from geofuse import metric_sampling as _metric_sampling
 from geofuse import mixed_effects_scoring as _mes
+from geofuse import settings as _gf_settings
 from geofuse.crs_utils import buffer_gdf_union_metres, reproject_geodataframe_to_wgs84
+from geofuse.persistence import caches
 from geofuse.vector_io import (
     geometry_sha256,
     list_gpkg_layer_names,
@@ -325,40 +327,6 @@ def _check_coverage(metric_path: str, buffered_gdf: "gpd.GeoDataFrame") -> bool:
 # ────────────────────────────────────────────────────────────────────
 
 
-def _fusion_preaggr_cache_files(p: dict, output_dir: str) -> list[str]:
-    """Reusable greenery pre-aggregation cache files.
-
-    The greenery cache is keyed on the greenery-file set + grid, not the target,
-    so it is shared across jobs and cannot be attributed to one target. Every
-    ``greenery-*.npz`` unit is listed — clearing them frees recomputable
-    intermediates (they rebuild on the next run). Output files and result
-    artefacts are never included.
-    """
-    greenery_dir = os.path.join(output_dir, "fusion_cache", "greenery")
-    if not os.path.isdir(greenery_dir):
-        return []
-    return sorted(
-        os.path.join(greenery_dir, n)
-        for n in os.listdir(greenery_dir)
-        if n.startswith("greenery-") and n.endswith(".npz")
-    )
-
-
-def _purge_fusion_preaggr_cache(paths: list[str]) -> tuple[int, int]:
-    """Delete the given cache files; returns ``(removed, bytes_freed)``."""
-    removed = 0
-    freed = 0
-    for path in paths:
-        try:
-            size = os.path.getsize(path)
-            os.remove(path)
-            removed += 1
-            freed += size
-        except OSError:
-            continue
-    return removed, freed
-
-
 def _consume_fusion_restart(store) -> None:
     """Seed the setup form when a re-run was confirmed in the job monitor.
 
@@ -383,20 +351,31 @@ def _consume_fusion_restart(store) -> None:
 # Section panels (new layout)
 # ────────────────────────────────────────────────────────────────────
 
+# Fusion settings (``geofuse.settings``): every default and bound the form
+# shows comes from there, so the command line and the form start alike.
+_FS = _gf_settings.FUSION
+
+
+def _fs_default(name: str):
+    return _FS[name].default
+
+
+def _fs_bounds(name: str) -> dict:
+    """``min_value`` / ``max_value`` of a setting, typed like the setting."""
+    s = _FS[name]
+    cast = int if s.kind == "int" else float
+    out = {}
+    if s.lo is not None:
+        out["min_value"] = cast(s.lo)
+    if s.hi is not None:
+        out["max_value"] = cast(s.hi)
+    return out
+
+
 # Public set of cross-sectional objective metrics offered by the OLS scorer
 # (covariate-aware distance correlation / partial rank correlation /
 # incremental R² / normalized RMSE / MI).
-_CROSS_METRICS: tuple[str, ...] = (
-    "partial_distance_corr",
-    "distance_corr",
-    "spearman",
-    "r2",
-    "nrmse",
-    "mutual_info",
-    "quartile_contrast",
-    "logit_tstat",
-    "logit_coef",
-)
+_CROSS_METRICS: tuple[str, ...] = _gf_settings.CROSS_SECTIONAL_METRICS
 # Friendly labels for the objective-metric picker.
 _CROSS_METRIC_LABELS: dict[str, str] = {
     "partial_distance_corr": "Partial distance correlation (linear + nonlinear, covariate-aware)",
@@ -417,26 +396,15 @@ _CROSS_METRIC_LABELS: dict[str, str] = {
 }
 # Metrics that require a two-valued outcome. Mirror of
 # ``objective_scoring.BINARY_ONLY_METRICS`` plus the GEE panel pair.
-_BINARY_ONLY_METRICS: frozenset[str] = frozenset(
-    {"logit_tstat", "logit_coef", "gee_logit_tstat", "gee_logit_coef"}
-)
+_BINARY_ONLY_METRICS: frozenset[str] = _gf_settings.BINARY_ONLY_METRICS
 # Metrics that condition on covariates intrinsically, so the residualization
 # picker doesn't apply. Mirror of ``objective_scoring.RESIDUALIZE_IGNORED``.
 _RESIDUALIZE_IGNORED_METRICS: frozenset[str] = frozenset(
     {"partial_distance_corr", "mutual_info"}
 )
-# MixedLM scoring metrics — mirror the engine's MIXEDLM_METRICS so they can
-# round-trip through the spec without an explicit import.
-_MIXEDLM_METRICS: tuple[str, ...] = (
-    "mixedlm_tstat",
-    "mixedlm_marginal_r2",
-    "mixedlm_lr",
-    "mixedlm_coef",
-    # Binary outcomes on a panel: MixedLM is Gaussian-only, so these route to
-    # GEE with an exchangeable working correlation clustered on the entity.
-    "gee_logit_tstat",
-    "gee_logit_coef",
-)
+# Longitudinal scoring metrics: the engine's MIXEDLM_METRICS, plus the GEE
+# pair for binary outcomes on a panel (MixedLM is Gaussian-only).
+_MIXEDLM_METRICS: tuple[str, ...] = _gf_settings.LONGITUDINAL_METRICS
 
 # Every channel that can carry a standalone study or a composite artifact,
 # across both channel sets. Iterating the union keeps artifact discovery
@@ -444,10 +412,7 @@ _MIXEDLM_METRICS: tuple[str, ...] = (
 _ALL_STANDALONE_CHANNELS: tuple[str, ...] = ("veg", "terrain", "ndvi", "gvi")
 
 # Channel sets a job can pick between; mirrors ``runners._CHANNEL_SETS``.
-_CHANNEL_SETS: dict[str, tuple[str, ...]] = {
-    "ndvi + gvi": ("ndvi", "gvi"),
-    "ndvi + veg + terrain": ("ndvi", "veg", "terrain"),
-}
+_CHANNEL_SETS: dict[str, tuple[str, ...]] = _gf_settings.CHANNEL_SETS
 
 # Authoritative list of every ``run_fusion`` setting that isn't a file path or
 # runtime object. The submit path records exactly these (under the same names)
@@ -462,6 +427,10 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "ndvi_buffer_min_m",
     "ndvi_buffer_max_m",
     "ndvi_buffer_step_m",
+    "gvi_ladder_spacing",
+    "gvi_ladder_rungs",
+    "ndvi_ladder_spacing",
+    "ndvi_ladder_rungs",
     "ndvi_resolution_m",
     "gvi_grid_spacing_m",
     "n_bins",
@@ -505,9 +474,19 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "posterior_draws",
     "posterior_warmup",
     "posterior_chains",
+    "radius_prior",
     "check_collinearity",
     "vif_threshold",
 )
+
+# Buffer-ladder spacings (``metric_sampling.LADDER_SPACINGS``).
+_LADDER_SPACING_LABELS: dict[str, str] = {"linear": "Linear", "log": "Log-spaced"}
+
+# Radius-prior options of the discovery model (``bayesian_index.RADIUS_PRIORS``).
+_RADIUS_PRIOR_LABELS: dict[str, str] = {
+    "rungs": "Rung-based",
+    "range": "Range-based (spacing-invariant)",
+}
 
 # Recorded param -> form widget key. Re-run seeds these so the normal setup
 # form comes up filled in; anything not listed keeps its own default.
@@ -527,6 +506,7 @@ _FUSION_PARAM_TO_WIDGET: dict[str, str] = {
     "null_calibration_runs": "fusion_null_calibration_runs",
     "posterior_draws": "fusion_posterior_draws",
     "posterior_chains": "fusion_posterior_chains",
+    "radius_prior": "fusion_radius_prior",
     "check_collinearity": "fusion_check_collinearity",
     "vif_threshold": "fusion_vif_threshold",
     "cgi_grid_spacing_m": "fusion_cgi_grid_spacing_m",
@@ -546,6 +526,10 @@ _FUSION_PARAM_TO_WIDGET: dict[str, str] = {
     "ndvi_buffer_min_m": "fusion_ndvi_buffer_min",
     "ndvi_buffer_max_m": "fusion_ndvi_buffer_max",
     "ndvi_buffer_step_m": "fusion_ndvi_buffer_step",
+    "gvi_ladder_spacing": "fusion_gvi_ladder_spacing",
+    "gvi_ladder_rungs": "fusion_gvi_ladder_rungs",
+    "ndvi_ladder_spacing": "fusion_ndvi_ladder_spacing",
+    "ndvi_ladder_rungs": "fusion_ndvi_ladder_rungs",
 }
 
 # Widgets that are integer-typed ``st.number_input`` / slider controls; the
@@ -559,6 +543,8 @@ _FUSION_SEED_INT_WIDGETS: frozenset[str] = frozenset(
         "fusion_ndvi_buffer_min",
         "fusion_ndvi_buffer_max",
         "fusion_ndvi_buffer_step",
+        "fusion_gvi_ladder_rungs",
+        "fusion_ndvi_ladder_rungs",
         "fusion_stratification_bins",
         "fusion_sweep_splits",
         "fusion_discovery_reps",
@@ -1264,29 +1250,12 @@ _SORTABLE_STYLE = """
 def _match_waves_to_filenames(
     file_paths: list[str], waves: list[str]
 ) -> dict[str, str]:
-    """``{path: wave}`` for filenames that name exactly one wave, unambiguously.
+    """``{path: wave}`` for filenames that name exactly one wave, unambiguously
+    (``geofuse.runfile.match_years_to_filenames``, which the command line
+    uses too). Everything else is left for the user to drag."""
+    from geofuse.runfile import match_years_to_filenames
 
-    A wave is matched only when its label appears in the filename bounded by
-    non-alphanumerics, so ``2011`` does not match inside ``20115``. The pairing
-    has to be one-to-one in both directions: a filename naming several waves is
-    ambiguous, and a wave named by several filenames is too. Everything else is
-    left for the user to drag.
-    """
-    hits: dict[str, list[str]] = {}
-    for path in file_paths:
-        stem = os.path.basename(path)
-        found = [
-            w
-            for w in waves
-            if re.search(rf"(?<![0-9A-Za-z]){re.escape(str(w))}(?![0-9A-Za-z])", stem)
-        ]
-        if len(found) == 1:
-            hits[path] = found[0]
-
-    claims: dict[str, list[str]] = {}
-    for path, wave in hits.items():
-        claims.setdefault(wave, []).append(path)
-    return {path: wave for path, wave in hits.items() if len(claims[wave]) == 1}
+    return match_years_to_filenames(file_paths, waves)
 
 
 def _autofill_year_assignment(
@@ -1427,6 +1396,8 @@ def _render_metric_assignment_panel(
       - ``ndvi_files``: list of ``(path, list[wave_or_None])``
       - ``gvi_buffer_min/max/step``: int
       - ``ndvi_buffer_min/max/step``: int
+      - ``gvi_ladder_spacing`` / ``ndvi_ladder_spacing``: "linear" or "log"
+      - ``gvi_ladder_rungs`` / ``ndvi_ladder_rungs``: int (log ladders)
       - ``coverage_complete``: bool — True iff every wave is covered
         exactly once per channel (always True in non-year-aware mode when
         each channel has exactly one file)
@@ -1444,24 +1415,33 @@ def _render_metric_assignment_panel(
     for ch_key, ch_label, ch_short in _FUSION_METRIC_CHANNELS:
         st.markdown(f"#### {ch_label}")
         with st.container(border=True):
-            _default(f"fusion_{ch_short}_buffer_min", 100)
-            _default(f"fusion_{ch_short}_buffer_max", 1000)
-            _default(f"fusion_{ch_short}_buffer_step", 100)
-            bcol1, bcol2, bcol3 = st.columns(3)
+            for part in ("buffer_min", "buffer_max", "buffer_step"):
+                _default(
+                    f"fusion_{ch_short}_{part}", _fs_default(f"{ch_short}_{part}_m")
+                )
+            _default(
+                f"fusion_{ch_short}_ladder_spacing",
+                _fs_default(f"{ch_short}_ladder_spacing"),
+                list(_LADDER_SPACING_LABELS),
+            )
+            _default(
+                f"fusion_{ch_short}_ladder_rungs",
+                _fs_default(f"{ch_short}_ladder_rungs"),
+            )
+            spacing = st.session_state[f"fusion_{ch_short}_ladder_spacing"]
+            bcol1, bcol2, bcol4, bcol3, bcol5 = st.columns(5)
             with bcol1:
                 bmin = st.number_input(
                     f"{ch_short.upper()} minimum buffer",
-                    min_value=50,
-                    max_value=4900,
+                    **_fs_bounds(f"{ch_short}_buffer_min_m"),
                     step=50,
                     key=f"fusion_{ch_short}_buffer_min",
-                    help=f"Smallest {ch_short.upper()} radius (m) searched by Optuna.",
+                    help=f"Smallest {ch_short.upper()} radius (m) searched.",
                 )
             with bcol2:
                 bmax = st.number_input(
                     f"{ch_short.upper()} maximum buffer",
-                    min_value=100,
-                    max_value=5000,
+                    **_fs_bounds(f"{ch_short}_buffer_max_m"),
                     step=50,
                     key=f"fusion_{ch_short}_buffer_max",
                     help=f"Largest {ch_short.upper()} radius (m). Extent padding uses the max.",
@@ -1469,15 +1449,48 @@ def _render_metric_assignment_panel(
             with bcol3:
                 bstep = st.number_input(
                     f"{ch_short.upper()} buffer step",
-                    min_value=10,
-                    max_value=500,
+                    **_fs_bounds(f"{ch_short}_buffer_step_m"),
                     step=10,
                     key=f"fusion_{ch_short}_buffer_step",
-                    help="Radius discretisation (m).",
+                    disabled=spacing != "linear",
+                    help="Radius discretisation (m) of a linear ladder.",
                 )
+            with bcol4:
+                spacing = st.selectbox(
+                    f"{ch_short.upper()} ladder spacing",
+                    options=list(_LADDER_SPACING_LABELS),
+                    format_func=_LADDER_SPACING_LABELS.get,
+                    key=f"fusion_{ch_short}_ladder_spacing",
+                    help=(
+                        "**Linear** steps by a fixed number of metres, so the "
+                        "ladder is dense in relative terms at its top. "
+                        "**Log-spaced** places the rungs geometrically, so "
+                        "each covers the same relative distance."
+                    ),
+                )
+            with bcol5:
+                brungs = st.number_input(
+                    f"{ch_short.upper()} buffer rungs",
+                    **_fs_bounds(f"{ch_short}_ladder_rungs"),
+                    step=1,
+                    key=f"fusion_{ch_short}_ladder_rungs",
+                    disabled=spacing != "log",
+                    help="Number of radii of a log-spaced ladder, min and max included.",
+                )
+            ladder = _metric_sampling.ladder_radii(
+                bmin, bmax, bstep, spacing=spacing, rungs=int(brungs)
+            )
+            st.caption(
+                f"{len(ladder)} radii: "
+                + ", ".join(str(r) for r in ladder[:12])
+                + (f", … {ladder[-1]}" if len(ladder) > 12 else "")
+                + " m"
+            )
             state[f"{ch_key}_buffer_min"] = int(bmin)
             state[f"{ch_key}_buffer_max"] = int(bmax)
             state[f"{ch_key}_buffer_step"] = int(bstep)
+            state[f"{ch_key}_ladder_spacing"] = str(spacing)
+            state[f"{ch_key}_ladder_rungs"] = int(brungs)
 
             # One dialog, any number of files: each pick appends to the kept
             # list and renders as its own chip (basename shown, full path as
@@ -1624,8 +1637,7 @@ def _render_study_details_panel(
 
             exposure_iqr_ui = st.number_input(
                 "Exposure IQR for reporting (0 = from data)",
-                min_value=0.0,
-                max_value=10.0,
+                **_fs_bounds("exposure_iqr"),
                 step=0.001,
                 format="%.3f",
                 key="fusion_exposure_iqr",
@@ -1692,11 +1704,10 @@ def _render_study_details_panel(
                 "A continuous outcome scores zero on every trial."
             )
     with col_o2:
-        _default("fusion_test_size", 0.25)
+        _default("fusion_test_size", _fs_default("test_size"))
         test_size = st.slider(
             "Test set size",
-            min_value=0.1,
-            max_value=0.5,
+            **_fs_bounds("test_size"),
             step=0.05,
             key="fusion_test_size",
             help=(
@@ -1705,11 +1716,10 @@ def _render_study_details_panel(
             ),
         )
     with col_o3:
-        _default("fusion_stratification_bins", 5)
+        _default("fusion_stratification_bins", _fs_default("n_bins"))
         n_bins = st.number_input(
             "Stratification bins",
-            min_value=3,
-            max_value=10,
+            **_fs_bounds("n_bins"),
             key="fusion_stratification_bins",
             help="Quantile bins for the stratified train / test split.",
         )
@@ -1731,10 +1741,10 @@ def _render_study_details_panel(
             "covariate may relate to the outcome nonlinearly); linear is faster "
             "and assumes covariate effects are linear."
         )
-        _default("fusion_residualize_method", "linear")
+        _default("fusion_residualize_method", _fs_default("residualize_method"))
         residualize_method = st.selectbox(
             "Covariate residualization",
-            options=["linear", "spline"],
+            options=list(_FS["residualize_method"].choices),
             format_func=lambda m: {
                 "linear": "Linear",
                 "spline": "Spline (natural cubic)",
@@ -1757,14 +1767,16 @@ def _render_study_details_panel(
     area_id_col = None
     search_scoring_method = "mom_em3"
     if is_longitudinal:
-        _target_keys = ["level", "decline_overall", "decline_average", "decline_change"]
+        _target_keys = list(_FS["association_target"].choices)
         _target_labels = {
             "level": "Level — overall association",
             "decline_overall": "Decline — greenspace × time",
             "decline_average": "Decline — average exposure",
             "decline_change": "Decline — exposure change",
         }
-        _default("fusion_lon_assoc_target", "level", _target_keys)
+        _default(
+            "fusion_lon_assoc_target", _fs_default("association_target"), _target_keys
+        )
         association_target = st.selectbox(
             "Fit the greenspace formula to",
             options=_target_keys,
@@ -1779,9 +1791,11 @@ def _render_study_details_panel(
                 "is then computed on the chosen term."
             ),
         )
-        _default("fusion_lon_random_slope", True)
-        _default("fusion_lon_include_time_fixed", True)
-        _default("fusion_lon_wave_fe", True)
+        _default("fusion_lon_random_slope", _fs_default("random_slope_time"))
+        _default(
+            "fusion_lon_include_time_fixed", _fs_default("include_time_fixed_effect")
+        )
+        _default("fusion_lon_wave_fe", _fs_default("include_wave_fixed_effects"))
         mc1, mc2 = st.columns(2)
         with mc1:
             mixedlm_random_slope = st.checkbox(
@@ -1828,8 +1842,8 @@ def _render_study_details_panel(
             "Exposure–change over time (reported alongside the overall "
             "greenspace × time effect):"
         )
-        _default("fusion_lon_decline_between", False)
-        _default("fusion_lon_decline_within", False)
+        _default("fusion_lon_decline_between", _fs_default("decline_average_exposure"))
+        _default("fusion_lon_decline_within", _fs_default("decline_exposure_change"))
         dc1, dc2 = st.columns(2)
         with dc1:
             decline_average_exposure = st.checkbox(
@@ -1852,14 +1866,18 @@ def _render_study_details_panel(
                     "per-wave greenery that varies over time."
                 ),
             )
-        _ssm_keys = ["mom_em3", "mom_em1", "mom", "exact"]
+        _ssm_keys = list(_FS["search_scoring_method"].choices)
         _ssm_labels = {
             "mom_em3": "Method of Moments + 3 EM steps",
             "mom_em1": "Method of Moments + 1 EM step",
             "mom": "Method of Moments",
             "exact": "Exact Mixed Linear Model (per trial)",
         }
-        _default("fusion_search_scoring_method", "mom_em3", _ssm_keys)
+        _default(
+            "fusion_search_scoring_method",
+            _fs_default("search_scoring_method"),
+            _ssm_keys,
+        )
         search_scoring_method = st.selectbox(
             "Trial scoring method",
             options=_ssm_keys,
@@ -1879,9 +1897,9 @@ def _render_study_details_panel(
         )
 
     # ── Resume + standalones ────────────────────────────────────
-    _default("fusion_resume_study", True)
-    _default("fusion_clear_preaggr", False)
-    _default("fusion_run_standalones", False)
+    _default("fusion_resume_study", _fs_default("resume_existing_study"))
+    _default("fusion_clear_preaggr", _fs_default("clear_preaggregation_cache"))
+    _default("fusion_run_standalones", _fs_default("run_standalones"))
     col_r1, col_r2 = st.columns(2)
     with col_r1:
         resume_existing_study = st.checkbox(
@@ -1918,8 +1936,8 @@ def _render_study_details_panel(
     # Runs after pre-aggregation, before optimization. Drops channels
     # whose pixel-level values are redundant with the others (high VIF).
     # Dropped channels get pinned to weight 0 in every subsequent trial.
-    _default("fusion_check_collinearity", True)
-    _default("fusion_vif_threshold", 10.0)
+    _default("fusion_check_collinearity", _fs_default("check_collinearity"))
+    _default("fusion_vif_threshold", _fs_default("vif_threshold"))
     col_c1, col_c2 = st.columns([2, 1])
     with col_c1:
         check_collinearity = st.checkbox(
@@ -1933,8 +1951,7 @@ def _render_study_details_panel(
     with col_c2:
         vif_threshold_ui = st.number_input(
             "VIF threshold",
-            min_value=2.0,
-            max_value=100.0,
+            **_fs_bounds("vif_threshold"),
             step=1.0,
             key="fusion_vif_threshold",
             disabled=not check_collinearity,
@@ -1951,14 +1968,16 @@ def _render_study_details_panel(
         "selected from held-out data; the channel weights are then fitted with "
         "credible intervals. Nothing here touches the test split."
     )
-    _default("fusion_channel_set", "ndvi + gvi", ["ndvi + gvi", "ndvi + veg + terrain"])
-    _default("fusion_index_form", "sweep", ["sweep", "linear", "synergy"])
-    _default("fusion_sweep_splits", 40)
+    _default("fusion_channel_set", _fs_default("channel_set"), list(_CHANNEL_SETS))
+    _default(
+        "fusion_index_form", _fs_default("index_form"), list(_gf_settings.INDEX_FORMS)
+    )
+    _default("fusion_sweep_splits", _fs_default("sweep_splits"))
     col_s0, col_s1, col_s2 = st.columns(3)
     with col_s0:
         channel_set_ui = st.selectbox(
             "Channel set",
-            options=["ndvi + gvi", "ndvi + veg + terrain"],
+            options=list(_CHANNEL_SETS),
             key="fusion_channel_set",
             help=(
                 "**ndvi + gvi** merges the street-view components into one "
@@ -1973,7 +1992,7 @@ def _render_study_details_panel(
     with col_s1:
         index_form_ui = st.selectbox(
             "Index form",
-            options=["sweep", "linear", "synergy"],
+            options=list(_gf_settings.INDEX_FORMS),
             key="fusion_index_form",
             help=(
                 "**sweep** fits both forms and keeps whichever scores better "
@@ -1986,8 +2005,7 @@ def _render_study_details_panel(
     with col_s2:
         sweep_splits_ui = st.number_input(
             "Sweep splits",
-            min_value=5,
-            max_value=200,
+            **_fs_bounds("sweep_splits"),
             step=5,
             key="fusion_sweep_splits",
             help=(
@@ -1995,21 +2013,44 @@ def _render_study_details_panel(
                 "surface is the evidence — a single split's winner is noise."
             ),
         )
+    col_r0, _col_r1, _col_r2 = st.columns(3)
+    with col_r0:
+        _default(
+            "fusion_radius_prior",
+            _fs_default("radius_prior"),
+            list(_RADIUS_PRIOR_LABELS),
+        )
+        radius_prior_ui = st.selectbox(
+            "Radius prior",
+            options=list(_RADIUS_PRIOR_LABELS),
+            format_func=_RADIUS_PRIOR_LABELS.get,
+            key="fusion_radius_prior",
+            help=(
+                "How the distance-of-influence prior relates to the buffer "
+                "ladder. **Range-based** spreads it over the range the rungs "
+                "span and weighs each rung by the distance it covers, so a "
+                "dense and a sparse ladder over the same range carry the same "
+                "prior. **Rung-based** takes it from the listed rungs, which "
+                "pulls it towards the dense top of a linear ladder."
+            ),
+        )
 
     with st.expander("Validation & reporting", expanded=False):
-        _default("fusion_discovery_reps", 5)
-        _default("fusion_discovery_shuffles", 12)
-        _default("fusion_gain_splits", 20)
-        _default("fusion_gain_permutations", 100)
-        _default("fusion_null_calibration_runs", 16)
-        _default("fusion_posterior_draws", 800)
-        _default("fusion_posterior_chains", 4)
+        for name in (
+            "discovery_reps",
+            "discovery_shuffles",
+            "gain_splits",
+            "gain_permutations",
+            "null_calibration_runs",
+            "posterior_draws",
+            "posterior_chains",
+        ):
+            _default(f"fusion_{name}", _fs_default(name))
         col_v0, col_v1 = st.columns(2)
         with col_v0:
             discovery_reps_ui = st.number_input(
                 "Discovery replicates",
-                min_value=0,
-                max_value=50,
+                **_fs_bounds("discovery_reps"),
                 step=1,
                 key="fusion_discovery_reps",
                 help=(
@@ -2020,15 +2061,13 @@ def _render_study_details_panel(
             )
             discovery_shuffles_ui = st.number_input(
                 "Shuffles per replicate",
-                min_value=1,
-                max_value=100,
+                **_fs_bounds("discovery_shuffles"),
                 step=1,
                 key="fusion_discovery_shuffles",
             )
             null_calibration_runs_ui = st.number_input(
                 "Null calibration fits",
-                min_value=0,
-                max_value=1000,
+                **_fs_bounds("null_calibration_runs"),
                 step=1,
                 key="fusion_null_calibration_runs",
                 help=(
@@ -2041,8 +2080,7 @@ def _render_study_details_panel(
         with col_v1:
             gain_splits_ui = st.number_input(
                 "Held-out gain splits",
-                min_value=0,
-                max_value=100,
+                **_fs_bounds("gain_splits"),
                 step=1,
                 key="fusion_gain_splits",
                 help=(
@@ -2052,8 +2090,7 @@ def _render_study_details_panel(
             )
             gain_permutations_ui = st.number_input(
                 "Gain permutations",
-                min_value=0,
-                max_value=1000,
+                **_fs_bounds("gain_permutations"),
                 step=10,
                 key="fusion_gain_permutations",
                 help=(
@@ -2063,15 +2100,13 @@ def _render_study_details_panel(
             )
             posterior_draws_ui = st.number_input(
                 "Posterior draws per chain",
-                min_value=100,
-                max_value=4000,
+                **_fs_bounds("posterior_draws"),
                 step=100,
                 key="fusion_posterior_draws",
             )
             posterior_chains_ui = st.number_input(
                 "Chains",
-                min_value=1,
-                max_value=8,
+                **_fs_bounds("posterior_chains"),
                 step=1,
                 key="fusion_posterior_chains",
             )
@@ -2090,15 +2125,26 @@ def _render_study_details_panel(
     spatial_adjust_eps_m: float | None = None
     if is_vector_target:
         st.markdown("**Per-pixel CGI scoring**")
-        _default("fusion_cgi_grid_spacing_m", 50, list(range(10, 510, 10)))
-        _default("fusion_whole_grid_scaling", True)
-        _default("fusion_normalize_channels", True)
-        _default("fusion_area_balanced_split", True)
-        _default("fusion_spatial_split", True)
-        _default("fusion_spatial_block_size_m", 0)
+        _grid = _FS["cgi_grid_spacing_m"]
+        _grid_options = list(range(int(_grid.lo), int(_grid.hi) + 1, int(_grid.step)))
+        _default(
+            "fusion_cgi_grid_spacing_m",
+            _fs_default("cgi_grid_spacing_m"),
+            _grid_options,
+        )
+        for name in (
+            "whole_grid_scaling",
+            "normalize_channels",
+            "area_balanced_split",
+            "spatial_split",
+        ):
+            _default(f"fusion_{name}", _fs_default(name))
+        _default(
+            "fusion_spatial_block_size_m", _fs_default("spatial_block_size_m") or 0
+        )
         cgi_grid_spacing_m = st.select_slider(
             "CGI grid pixel size (m)",
-            options=list(range(10, 510, 10)),
+            options=_grid_options,
             key="fusion_cgi_grid_spacing_m",
             help=(
                 "Per-pixel CGI grid spacing. Smaller = higher fidelity and a bigger cache."
@@ -2157,8 +2203,12 @@ def _render_study_details_panel(
             "ks_aic": "KS-AIC (recommended)",
             "spatial_plus": "Spatial+ (df-Spatial+)",
         }
-        _spatial_adjust_keys = ["none", "ks_aic", "spatial_plus"]
-        _default("fusion_spatial_adjust_method", "none", _spatial_adjust_keys)
+        _spatial_adjust_keys = list(_FS["spatial_adjust_method"].choices)
+        _default(
+            "fusion_spatial_adjust_method",
+            _fs_default("spatial_adjust_method"),
+            _spatial_adjust_keys,
+        )
         spatial_adjust_method = st.selectbox(
             "Spatial-confounding adjustment",
             options=_spatial_adjust_keys,
@@ -2175,14 +2225,17 @@ def _render_study_details_panel(
             ),
         )
         if spatial_adjust_method != "none":
-            _default("fusion_spatial_adjust_max_df", 10)
-            _default("fusion_spatial_adjust_eps_m", 0)
+            _default(
+                "fusion_spatial_adjust_max_df", _fs_default("spatial_adjust_max_df")
+            )
+            _default(
+                "fusion_spatial_adjust_eps_m", _fs_default("spatial_adjust_eps_m") or 0
+            )
             with st.expander("Spatial adjustment — advanced", expanded=False):
                 spatial_adjust_max_df = int(
                     st.number_input(
                         "Max spatial df per cluster",
-                        min_value=1,
-                        max_value=50,
+                        **_fs_bounds("spatial_adjust_max_df"),
                         step=1,
                         key="fusion_spatial_adjust_max_df",
                         help=(
@@ -2253,6 +2306,7 @@ def _render_study_details_panel(
         "posterior_draws": int(posterior_draws_ui),
         "posterior_warmup": int(posterior_warmup_ui),
         "posterior_chains": int(posterior_chains_ui),
+        "radius_prior": str(radius_prior_ui),
         "check_collinearity": bool(check_collinearity),
         "vif_threshold": float(vif_threshold_ui),
     }
@@ -3123,6 +3177,23 @@ def _render_fitted_grid(summary: dict, _pd, _label) -> None:
             ),
             width="stretch",
             hide_index=True,
+        )
+        prior_mode = summary.get("radius_prior", "rungs")
+        spacing = summary.get("ladder_spacing") or {}
+        st.caption(
+            f"Radius prior: {_RADIUS_PRIOR_LABELS.get(prior_mode, prior_mode)}."
+            + (
+                " Its interval comes from the listed rungs, so it moves with "
+                "the ladder's spacing."
+                if prior_mode == "rungs"
+                else " Its interval covers the range the rungs span, whatever "
+                "their spacing."
+            )
+            + (
+                " Ladders: " + ", ".join(f"{ch} {d}" for ch, d in spacing.items()) + "."
+                if spacing
+                else ""
+            )
         )
         # A channel whose scale is genuinely learned lands near 0.1; one the
         # data is silent about lands near 0.8, not at 1.0, because the kernel
@@ -5196,6 +5267,10 @@ def render(output_dir: str) -> None:
     ndvi_buffer_min_m = metric_state["ndvi_buffer_min"]
     ndvi_buffer_max_m = metric_state["ndvi_buffer_max"]
     ndvi_buffer_step_m = metric_state["ndvi_buffer_step"]
+    gvi_ladder_spacing = metric_state.get("gvi_ladder_spacing", "linear")
+    gvi_ladder_rungs = int(metric_state.get("gvi_ladder_rungs", 15))
+    ndvi_ladder_spacing = metric_state.get("ndvi_ladder_spacing", "linear")
+    ndvi_ladder_rungs = int(metric_state.get("ndvi_ladder_rungs", 15))
     buffer_extent_m = float(max(gvi_buffer_max_m, ndvi_buffer_max_m))
 
     # ── Metric-download defaults ────────────────────────────────
@@ -5340,6 +5415,7 @@ def render(output_dir: str) -> None:
         study_state.get("posterior_warmup", posterior_draws_param)
     )
     posterior_chains_param = int(study_state.get("posterior_chains", 4))
+    radius_prior_param = str(study_state.get("radius_prior", "rungs"))
     check_collinearity_param = bool(study_state.get("check_collinearity", False))
     vif_threshold_param = float(study_state.get("vif_threshold", 10.0))
 
@@ -5355,64 +5431,25 @@ def render(output_dir: str) -> None:
                 "Export per-entity CGI",
                 width="stretch",
                 key="fusion_export",
-                help="One row per target entity with sampled channels + composite CGI.",
+                help=(
+                    "The table the run wrote: one row per target entity with "
+                    "the sampled channels and the composite CGI."
+                ),
             ):
                 bundle, _eng = _fusion_resolve_active_bundle()
-                if bundle is None or bundle.get("composite_df") is None:
-                    st.error("No composite table available to export.")
-                elif _eng is None:
-                    st.error("Engine state unavailable; cannot attach geometries.")
-                else:
-                    result_df = bundle["composite_df"].copy()
-                    artifacts_dir = bundle.get("artifacts_dir") or output_dir
-                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-                    geom_attached = False
-                    export_path: str | None = None
-
-                    if (
-                        "polygon_id" in result_df.columns
-                        and _eng.target_polygons_gdf is not None
-                    ):
-                        polys = _eng.target_polygons_gdf.reset_index(drop=True).copy()
-                        polys["polygon_id"] = polys.index
-                        keep_attr_cols = [
-                            c for c in polys.columns if c == "geometry"
-                        ] + ["polygon_id"]
-                        result_gdf = polys[keep_attr_cols].merge(
-                            result_df, on="polygon_id", how="inner"
-                        )
-                        export_path = os.path.join(
-                            artifacts_dir,
-                            f"fusion_composite_{ts}.gpkg",
-                        )
-                        result_gdf.to_file(export_path, driver="GPKG", layer="cgi")
-                        geom_attached = True
-                    elif _eng.target_gdf is not None and len(_eng.target_gdf) == len(
-                        result_df
-                    ):
-                        base = _eng.target_gdf.reset_index(drop=True).copy()
-                        for col in result_df.columns:
-                            base[col] = result_df[col].reset_index(drop=True).values
-                        export_path = os.path.join(
-                            artifacts_dir,
-                            f"fusion_composite_{ts}.gpkg",
-                        )
-                        base.to_file(export_path, driver="GPKG", layer="cgi")
-                        geom_attached = True
-
-                    if not geom_attached:
-                        export_path = os.path.join(
-                            artifacts_dir,
-                            f"fusion_composite_{ts}.csv",
-                        )
-                        result_df.to_csv(export_path, index=False)
-
-                    st.success(f"Exported {len(result_df)} rows to: `{export_path}`")
+                table = (bundle or {}).get("entity_table_path")
+                if table and os.path.isfile(table):
+                    st.success(f"Per-entity CGI table: `{table}`")
                     st.caption(
-                        "Columns: `polygon_id`, `target`, `veg` / `terrain` / "
-                        "`ndvi`, `composite`, `n_samples`. Geometries joined "
-                        "from the loaded target file."
+                        "Columns: `polygon_id` (polygon targets), `target`, the "
+                        "sampled channels, `composite`, `n_samples`; geometries "
+                        "from the target file. GeoPackage layer `cgi`."
+                    )
+                else:
+                    st.error(
+                        "This run has no per-entity table on disk. Runs write "
+                        "`composite_entities.gpkg` beside the composite GeoTIFF; "
+                        "re-run to produce it."
                     )
     with col_run3:
         if st.session_state.fusion_results:
@@ -5638,14 +5675,30 @@ def render(output_dir: str) -> None:
                         "**Discovered years / waves:** "
                         + ", ".join(f"`{w}`" for w in opt_state["discovered_waves"])
                     )
-                st.write(
-                    f"**GVI buffers (m):** {gvi_buffer_min_m} – {gvi_buffer_max_m} "
-                    f"(step {gvi_buffer_step_m})"
-                )
-                st.write(
-                    f"**NDVI buffers (m):** {ndvi_buffer_min_m} – {ndvi_buffer_max_m} "
-                    f"(step {ndvi_buffer_step_m})"
-                )
+                for ch_name, lo_m, hi_m, step_m, spacing_m, rungs_m in (
+                    (
+                        "GVI",
+                        gvi_buffer_min_m,
+                        gvi_buffer_max_m,
+                        gvi_buffer_step_m,
+                        gvi_ladder_spacing,
+                        gvi_ladder_rungs,
+                    ),
+                    (
+                        "NDVI",
+                        ndvi_buffer_min_m,
+                        ndvi_buffer_max_m,
+                        ndvi_buffer_step_m,
+                        ndvi_ladder_spacing,
+                        ndvi_ladder_rungs,
+                    ),
+                ):
+                    detail = (
+                        f"log-spaced, {rungs_m} rungs"
+                        if spacing_m == "log"
+                        else f"step {step_m}"
+                    )
+                    st.write(f"**{ch_name} buffers (m):** {lo_m} – {hi_m} ({detail})")
                 if negative_controls_param:
                     st.write(
                         "**Negative controls:** "
@@ -5655,6 +5708,7 @@ def render(output_dir: str) -> None:
                 st.write(
                     f"**Discovery:** {channel_set_param}, form "
                     f"{index_form_param}, {sweep_splits_param} sweep splits, "
+                    f"{radius_prior_param}-based radius prior, "
                     f"{test_size*100:.0f}% test set"
                 )
                 st.write(
@@ -5693,6 +5747,10 @@ def render(output_dir: str) -> None:
                 "ndvi_buffer_min_m": float(ndvi_buffer_min_m),
                 "ndvi_buffer_max_m": float(ndvi_buffer_max_m),
                 "ndvi_buffer_step_m": float(ndvi_buffer_step_m),
+                "gvi_ladder_spacing": str(gvi_ladder_spacing),
+                "gvi_ladder_rungs": int(gvi_ladder_rungs),
+                "ndvi_ladder_spacing": str(ndvi_ladder_spacing),
+                "ndvi_ladder_rungs": int(ndvi_ladder_rungs),
                 "ndvi_resolution_m": ndvi_resolution_m,
                 "gvi_grid_spacing_m": gvi_grid_spacing_m,
                 "n_bins": int(n_bins),
@@ -5768,6 +5826,7 @@ def render(output_dir: str) -> None:
                 "posterior_draws": int(posterior_draws_param),
                 "posterior_warmup": int(posterior_warmup_param),
                 "posterior_chains": int(posterior_chains_param),
+                "radius_prior": radius_prior_param,
                 "check_collinearity": bool(check_collinearity_param),
                 "vif_threshold": float(vif_threshold_param),
             }
@@ -5779,11 +5838,9 @@ def render(output_dir: str) -> None:
                 )
 
             if st.session_state.get("fusion_clear_preaggr"):
-                stale = _fusion_preaggr_cache_files(
-                    {"target_path": tmp_target_path, **run_config}, output_dir
-                )
+                stale = caches.greenery_cache_files(output_dir)
                 if stale:
-                    n, freed = _purge_fusion_preaggr_cache(stale)
+                    n, freed = caches.remove_files(stale)
                     st.info(
                         f"Cleared {n} cache file(s), freed {freed / 1024**2:.0f} MB."
                     )

@@ -13,7 +13,7 @@ import logging
 import threading
 import time
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -328,18 +328,18 @@ class JobExecutor:
         return self.submit_subprocess_job(
             record,
             run_gvi_child,
-            dict(
-                job_id=record.id,
-                fname=fname,
-                dataset_data=shippable,
-                init_args=init_args,
-                run_args=run_args,
-                output_dir=output_dir,
-                save_geotiff=save_geotiff,
-                save_geojson=save_geojson,
-                save_gpkg=save_gpkg,
-                pano_cache_db_path=pano_cache_db_path,
-            ),
+            {
+                "job_id": record.id,
+                "fname": fname,
+                "dataset_data": shippable,
+                "init_args": init_args,
+                "run_args": run_args,
+                "output_dir": output_dir,
+                "save_geotiff": save_geotiff,
+                "save_geojson": save_geojson,
+                "save_gpkg": save_gpkg,
+                "pano_cache_db_path": pano_cache_db_path,
+            },
             process_name=f"gvi-child-{record.id}",
         )
 
@@ -363,7 +363,7 @@ class JobExecutor:
         return self.submit_subprocess_job(
             record,
             run_fusion_child,
-            dict(job_id=record.id, run_kwargs=run_kwargs),
+            {"job_id": record.id, "run_kwargs": run_kwargs},
             process_name=f"fusion-child-{record.id}",
         )
 
@@ -386,6 +386,13 @@ class JobExecutor:
         save_cluster_tiles: bool = False,
         satellite: str = "auto",
         coverage_rescue: bool = True,
+        temporal_reducers: Sequence[str] = ("median",),
+        water_mask: bool = False,
+        cloud_handling: str = "scene_filter",
+        reflectance: str = "surface",
+        substitute_2012: bool = False,
+        preset: str | None = None,
+        ee_project: str | None = None,
     ) -> Future:
         """Run an NDVI (single-range) job in a fresh subprocess.
 
@@ -402,24 +409,31 @@ class JobExecutor:
         return self.submit_subprocess_job(
             record,
             run_ndvi_child,
-            dict(
-                job_id=record.id,
-                fname=fname,
-                dataset_data=shippable,
-                start_date=start_date,
-                end_date=end_date,
-                cloud_pct=cloud_pct,
-                resolution=resolution,
-                buffer_m=buffer_m,
-                output_name=output_name,
-                output_dir=output_dir,
-                save_geotiff=save_geotiff,
-                save_geojson=save_geojson,
-                save_gpkg=save_gpkg,
-                save_cluster_tiles=save_cluster_tiles,
-                satellite=satellite,
-                coverage_rescue=coverage_rescue,
-            ),
+            {
+                "job_id": record.id,
+                "fname": fname,
+                "dataset_data": shippable,
+                "start_date": start_date,
+                "end_date": end_date,
+                "cloud_pct": cloud_pct,
+                "resolution": resolution,
+                "buffer_m": buffer_m,
+                "output_name": output_name,
+                "output_dir": output_dir,
+                "save_geotiff": save_geotiff,
+                "save_geojson": save_geojson,
+                "save_gpkg": save_gpkg,
+                "save_cluster_tiles": save_cluster_tiles,
+                "satellite": satellite,
+                "coverage_rescue": coverage_rescue,
+                "temporal_reducers": tuple(temporal_reducers),
+                "water_mask": bool(water_mask),
+                "cloud_handling": str(cloud_handling),
+                "reflectance": str(reflectance),
+                "substitute_2012": bool(substitute_2012),
+                "preset": preset,
+                "ee_project": ee_project,
+            },
             process_name=f"ndvi-child-{record.id}",
         )
 
@@ -442,6 +456,13 @@ class JobExecutor:
         save_cluster_tiles: bool = False,
         satellite: str = "auto",
         coverage_rescue: bool = True,
+        temporal_reducers: Sequence[str] = ("median",),
+        water_mask: bool = False,
+        cloud_handling: str = "scene_filter",
+        reflectance: str = "surface",
+        substitute_2012: bool = False,
+        preset: str | None = None,
+        ee_project: str | None = None,
     ) -> Future:
         """Run a per-year NDVI (date-column) job in a fresh subprocess."""
         from geofuse.jobs.subprocess_runner import run_ndvi_column_child
@@ -450,24 +471,31 @@ class JobExecutor:
         return self.submit_subprocess_job(
             record,
             run_ndvi_column_child,
-            dict(
-                job_id=record.id,
-                fname=fname,
-                dataset_data=shippable,
-                date_column=date_column,
-                season_start_month=season_start_month,
-                season_end_month=season_end_month,
-                cloud_pct=cloud_pct,
-                resolution=resolution,
-                buffer_m=buffer_m,
-                output_dir=output_dir,
-                save_geotiff=save_geotiff,
-                save_geojson=save_geojson,
-                save_gpkg=save_gpkg,
-                save_cluster_tiles=save_cluster_tiles,
-                satellite=satellite,
-                coverage_rescue=coverage_rescue,
-            ),
+            {
+                "job_id": record.id,
+                "fname": fname,
+                "dataset_data": shippable,
+                "date_column": date_column,
+                "season_start_month": season_start_month,
+                "season_end_month": season_end_month,
+                "cloud_pct": cloud_pct,
+                "resolution": resolution,
+                "buffer_m": buffer_m,
+                "output_dir": output_dir,
+                "save_geotiff": save_geotiff,
+                "save_geojson": save_geojson,
+                "save_gpkg": save_gpkg,
+                "save_cluster_tiles": save_cluster_tiles,
+                "satellite": satellite,
+                "coverage_rescue": coverage_rescue,
+                "temporal_reducers": tuple(temporal_reducers),
+                "water_mask": bool(water_mask),
+                "cloud_handling": str(cloud_handling),
+                "reflectance": str(reflectance),
+                "substitute_2012": bool(substitute_2012),
+                "preset": preset,
+                "ee_project": ee_project,
+            },
             process_name=f"ndvi-col-child-{record.id}",
         )
 
@@ -493,20 +521,34 @@ class JobExecutor:
         return self.submit_subprocess_job(
             record,
             run_gvi_column_child,
-            dict(
-                job_id=record.id,
-                fname=fname,
-                dataset_data=shippable,
-                date_column=date_column,
-                init_args=init_args,
-                run_args=run_args,
-                output_dir=output_dir,
-                save_geotiff=save_geotiff,
-                save_geojson=save_geojson,
-                save_gpkg=save_gpkg,
-                pano_cache_db_path=pano_cache_db_path,
-            ),
+            {
+                "job_id": record.id,
+                "fname": fname,
+                "dataset_data": shippable,
+                "date_column": date_column,
+                "init_args": init_args,
+                "run_args": run_args,
+                "output_dir": output_dir,
+                "save_geotiff": save_geotiff,
+                "save_geojson": save_geojson,
+                "save_gpkg": save_gpkg,
+                "pano_cache_db_path": pano_cache_db_path,
+            },
             process_name=f"gvi-col-child-{record.id}",
+        )
+
+    def submit_gvi_merge_subprocess(self, record: JobRecord, **run_kwargs) -> Future:
+        """Merge a sharded GVI run in a fresh subprocess (see
+        :func:`geofuse.jobs.gvi_shards.run_gvi_merge` for the arguments)."""
+        from geofuse.jobs.subprocess_runner import run_gvi_merge_child
+
+        data = run_kwargs.pop("dataset_data")
+        run_kwargs["dataset_data"] = {k: v for k, v in data.items() if k != "cache_ref"}
+        return self.submit_subprocess_job(
+            record,
+            run_gvi_merge_child,
+            {"job_id": record.id, "run_kwargs": run_kwargs},
+            process_name=f"gvi-merge-child-{record.id}",
         )
 
     def shutdown(self, wait: bool = True) -> None:

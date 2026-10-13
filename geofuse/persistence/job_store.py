@@ -138,9 +138,15 @@ class JobStore:
     # Lifecycle
     # ────────────────────────────────────────────────────────────
 
-    def submit(self, type: str, params: dict, name: str = "") -> JobRecord:
-        """Create a new ``queued`` job, persist it, return the live record."""
-        job_id = uuid.uuid4().hex[:8]
+    def submit(
+        self, type: str, params: dict, name: str = "", job_id: str | None = None
+    ) -> JobRecord:
+        """Create a new ``queued`` job, persist it, return the live record.
+
+        ``job_id`` names the job when the caller already has an id for it (the
+        command line's state folder); otherwise a fresh one is drawn.
+        """
+        job_id = job_id or uuid.uuid4().hex[:8]
         now = _utc_now_iso()
         rec = JobRecord(
             id=job_id,

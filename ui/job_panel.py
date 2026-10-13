@@ -122,8 +122,13 @@ def _load_fusion_results_into_session(rec) -> bool:
 
     # Disk fallback: find the persisted results bundle among the job's outputs.
     bundle_path = _fusion_results_bundle_path(rec)
-    if bundle_path is None:
-        return False
+    return bundle_path is not None and load_fusion_bundle(bundle_path)
+
+
+def load_fusion_bundle(bundle_path: str) -> bool:
+    """Show a fusion run's ``results_bundle.json`` in the Fusion tab's results
+    view, without the engine objects (maps read their GeoTIFFs from disk).
+    Returns ``True`` when the bundle could be read."""
     try:
         with open(bundle_path, encoding="utf-8") as f:
             disk_results = json.load(f)
@@ -177,6 +182,16 @@ def _render_details(rec) -> None:
                 f"**Per year** from column `{p.get('date_column', '?')}`"
                 + (f" (±{max_diff} yr max)" if max_diff is not None else "")
             )
+        elif p.get("target_year") is not None:
+            max_diff = p.get("max_year_diff")
+            st.write(
+                f"**Target year:** {p['target_year']}"
+                + (f" (±{max_diff} yr max)" if max_diff is not None else "")
+            )
+        window = p.get("month_window")
+        if window:
+            policy = p.get("month_policy") or "exclude"
+            st.write(f"**Capture months:** {window[0]}–{window[1]} ({policy} others)")
         st.write(
             f"**Save panos / masks:** "
             f"{bool(p.get('save_panos'))} / {bool(p.get('save_masks'))}"
@@ -210,6 +225,20 @@ def _render_details(rec) -> None:
         st.write(f"**Cloud max:** {p.get('cloud_pct', '?')}%")
         st.write(f"**Resolution:** {p.get('resolution', '?')} m")
         st.write(f"**Buffer:** {p.get('buffer_m', '?')} m")
+        stats = ", ".join(p.get("temporal_reducers") or ["median"])
+        st.write(f"**Temporal statistic:** {stats}")
+        rescue = "on" if p.get("coverage_rescue", True) else "off"
+        st.write(
+            f"**Satellite:** {p.get('satellite', 'auto')} · "
+            f"**Reflectance:** {p.get('reflectance', 'surface')} · "
+            f"**Coverage rescue:** {rescue}"
+        )
+        water = "on" if p.get("water_mask") else "off"
+        fill = "on" if p.get("substitute_2012") else "off"
+        st.write(
+            f"**Clouds:** {p.get('cloud_handling', 'scene_filter')} · "
+            f"**Water mask:** {water} · **2012 from 2013:** {fill}"
+        )
         st.write(
             f"**Outputs:** GeoTIFF={bool(p.get('save_geotiff'))} · "
             f"GeoPackage={bool(p.get('save_gpkg'))} · "

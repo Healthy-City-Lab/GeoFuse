@@ -12,7 +12,6 @@ import sys
 ENV_NAME = "geofuse"
 
 # 1. CONDA PACKAGES (System Binaries & Core Geospatial)
-#    MPI packages are added dynamically below based on OS.
 CONDA_PACKAGES = [
     "libblas=*=*openblas",
     "libcblas=*=*openblas",
@@ -55,6 +54,11 @@ PIP_PACKAGES = [
     # Earth Engine & Geospatial APIs
     "geemap==0.36.6",
     "earthengine-api==1.7.4",
+    # Command line: monitor, credential store, per-user folders, resource locks
+    "textual==8.2.8",
+    "keyring==25.7.0",
+    "platformdirs==4.9.6",
+    "filelock==3.29.0",
     # Utility
     "isort==7.0.0",
     # Dev tooling — must match the version pinned in .github/workflows/code-quality.yml
@@ -127,28 +131,6 @@ def get_solver():
     return "mamba" if shutil.which("mamba") else "conda"
 
 
-def get_mpi_packages(system):
-    """
-    Returns the correct MPI list for Conda based on OS.
-    Reference: https://mpi4py.readthedocs.io/en/stable/install.html
-    """
-    if system == "Windows":
-        # Windows requires Microsoft MPI (msmpi) binaries + the mpi4py wrapper
-        return ["mpi4py=4.1.1", "msmpi"]
-
-    elif system == "Darwin":
-        # macOS (Intel/M1/M2/M3): OpenMPI is the recommended implementation on Conda-forge
-        return ["mpi4py=4.1.1", "openmpi"]
-
-    elif system == "Linux":
-        # Linux: OpenMPI is the standard
-        return ["mpi4py=4.1.1", "openmpi"]
-
-    else:
-        print(f"[WARN] Unknown OS: {system}. Defaulting to openmpi.")
-        return ["mpi4py=4.1.1", "openmpi"]
-
-
 def get_env_python(env_name):
     """Get the Python executable path for a conda environment."""
     system = platform.system()
@@ -215,14 +197,11 @@ def main(env_name, log_file=None):
     )
     print("[SUCCESS] Environment created successfully\n")
 
-    # 1. Prepare Conda List (Core + OS-Specific MPI)
-    mpi_pkgs = get_mpi_packages(system)
-    full_conda_list = CONDA_PACKAGES + mpi_pkgs
-    conda_str = " ".join(full_conda_list)
+    # 1. Conda packages (core binaries and the geospatial stack)
+    conda_str = " ".join(CONDA_PACKAGES)
     env_python = get_env_python(env_name)
 
-    print(f"[1/5] Installing Core & MPI Binaries ({solver})...")
-    # Conda handles the binary linking for mpi4py automatically here
+    print(f"[1/5] Installing Core Binaries ({solver})...")
     run_cmd(f"{solver} install -n {env_name} -y -c conda-forge {conda_str}", log_file)
 
     # 2. Install PyTorch
@@ -263,19 +242,21 @@ def main(env_name, log_file=None):
     env_python = get_env_python(env_name)
 
     verify_imports = (
-        "import geofuse; import torch; import platform; from mpi4py import MPI; "
+        "import geofuse; import geofuse.cli; import torch; import platform; "
     )
     verify_geofuse = "print(f'   [OK] GeoFuse Package: {geofuse.__file__}'); "
-    verify_mpi = "print(f'   [OK] MPI Rank: {MPI.COMM_WORLD.Get_rank()} - Vendor: {MPI.get_vendor()}');"
 
     if system == "Darwin":
         verify_torch = "print(f'   [OK] PyTorch: {torch.__version__} - MPS Available: {torch.backends.mps.is_available()}'); "
     else:
         verify_torch = "print(f'   [OK] PyTorch: {torch.__version__} - CUDA Available: {torch.cuda.is_available()}'); "
 
-    verify_script = verify_imports + verify_geofuse + verify_torch + verify_mpi
+    verify_script = verify_imports + verify_geofuse + verify_torch
 
     run_cmd(f'"{env_python}" -c "{verify_script}"', log_file)
+    # The readiness check needs the model file and a sign-in, which may come
+    # after installing, so its problems do not fail the install.
+    run_cmd(f'"{env_python}" -m geofuse doctor --offline', log_file, optional=True)
 
 
 if __name__ == "__main__":

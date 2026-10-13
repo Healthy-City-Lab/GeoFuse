@@ -1,4 +1,3 @@
-import datetime
 import os
 import shutil
 import tempfile
@@ -15,7 +14,18 @@ from geofuse.core import (  # noqa: F401  (re-exported for UI modules)
     generate_raster_grid,
 )
 from geofuse.crs_utils import buffer_gdf_union_metres
-from geofuse.vector_io import geometry_sha256, read_vector_path, target_path_is_raster
+from geofuse.vector_io import (  # noqa: F401  (re-exported for UI modules)
+    file_size_mtime_fingerprint,
+    fingerprint_paths,
+    geometry_sha256,
+    load_vector_paths,
+    merge_gdfs_wgs84,
+    path_drift_status,
+    read_vector_path,
+    sanitize_gdf_attributes_for_json,
+    sanitize_name_for_file,
+    target_path_is_raster,
+)
 
 FUSION_VECTOR_UPLOAD_TYPES: list[str] = [
     "geojson",
@@ -198,53 +208,6 @@ def rasterize_points_for_preview(
     return arr, (left, bottom, right, top), width, height
 
 
-def file_size_mtime_fingerprint(path: str | None) -> str:
-    """Cheap deterministic fingerprint for a file: ``"<size>:<mtime_int>"``.
-
-    Used by the restart flow to detect whether an input file has been
-    edited / moved / replaced since the original job ran. An empty string
-    means the path is missing or ``None`` (treated as drift on comparison).
-    Size + integer-mtime is intentionally lightweight — a full SHA256 of a
-    large NDVI raster would block the submit handler for several seconds
-    and isn't needed to detect the cases the restart panel cares about
-    (file gone, file rewritten in place, file truncated).
-    """
-    if not path:
-        return ""
-    try:
-        st = os.stat(path)
-    except OSError:
-        return ""
-    return f"{st.st_size}:{int(st.st_mtime)}"
-
-
-def path_drift_status(path: str | None, expected_fingerprint: str) -> str:
-    """Return one of ``"ok"`` / ``"no-path"`` / ``"missing"`` / ``"modified"``.
-
-    Drift semantics shared across every tab's restart flow:
-    - ``no-path``: the spec never had a value for this slot (empty string / None)
-    - ``missing``: the recorded path is no longer present on disk
-    - ``modified``: the file exists but its size+mtime fingerprint differs
-      from the one recorded at submit time
-    - ``ok``: file present and fingerprint matches
-    """
-    if not path:
-        return "no-path"
-    if not os.path.isfile(path):
-        return "missing"
-    if (
-        expected_fingerprint
-        and file_size_mtime_fingerprint(path) != expected_fingerprint
-    ):
-        return "modified"
-    return "ok"
-
-
-def fingerprint_paths(paths: dict[str, str | None]) -> dict[str, str]:
-    """Fingerprint every path in ``paths``; missing files produce ``""``."""
-    return {k: file_size_mtime_fingerprint(v) for k, v in paths.items()}
-
-
 def apply_buffer_m(gdf: gpd.GeoDataFrame, buffer_m: float) -> gpd.GeoDataFrame:
     """Return a GeoDataFrame whose geometry is the union of ``gdf`` buffered by
     ``buffer_m`` metres, re-projected back to the original CRS.
@@ -255,58 +218,6 @@ def apply_buffer_m(gdf: gpd.GeoDataFrame, buffer_m: float) -> gpd.GeoDataFrame:
     If ``buffer_m`` is 0 the original GeoDataFrame is returned unchanged.
     """
     return buffer_gdf_union_metres(gdf, buffer_m)
-
-
-def sanitize_gdf_attributes_for_json(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """Cast non-geometry attributes to JSON-friendly values (Folium, ``json.dumps``).
-
-    GeoJSON sources with date/time properties are often read as ``datetime64`` or
-    ``Timestamp`` in object columns; Folium's ``GeoJson(gdf)`` then fails with
-    "Object of type Timestamp is not JSON serializable".
-    """
-    geom_col = gdf.geometry.name
-    out = gdf.copy()
-    for col in out.columns:
-        if col == geom_col:
-            continue
-        s = out[col]
-        if pd.api.types.is_datetime64_any_dtype(s):
-            out[col] = s.astype(str)
-        elif isinstance(s.dtype, pd.CategoricalDtype):
-            out[col] = s.astype(str)
-        elif s.dtype == object:
-
-            def _cell(v):
-                if isinstance(v, (pd.Timestamp, datetime.datetime, datetime.date)):
-                    return v.isoformat()
-                if isinstance(v, datetime.time):
-                    return str(v)
-                return v
-
-            out[col] = s.map(_cell)
-    return out
-
-
-def load_vector_paths(
-    paths: Sequence[str],
-) -> list[tuple[str, gpd.GeoDataFrame]]:
-    """Read vector datasets from disk paths to ``(basename, gdf)`` pairs.
-
-    Direct path-based sibling of :func:`load_vector_upload_sessions` for
-    flows that capture absolute filesystem paths instead of HTTP-uploaded
-    bytes (the file-picker workflow). Each path is read lazily through
-    :func:`geofuse.vector_io.read_vector_path` and the attributes are
-    sanitised the same way the uploads pathway does. Shapefile sidecars
-    must already sit beside the ``.shp`` in the same folder — GDAL picks
-    them up automatically.
-    """
-    results: list[tuple[str, gpd.GeoDataFrame]] = []
-    for path in paths:
-        if not path or not os.path.isfile(path):
-            continue
-        gdf = read_vector_path(path)
-        results.append((os.path.basename(path), sanitize_gdf_attributes_for_json(gdf)))
-    return results
 
 
 def load_vector_upload_sessions(
@@ -370,42 +281,6 @@ def load_vector_upload_sessions(
                     os.remove(tpath)
 
     return results
-
-
-# ── File merging / grouping ─────────────────────────────────────────
-
-
-def sanitize_name_for_file(name: str) -> str:
-    """Make an arbitrary group name safe to use as an output filename stem."""
-    cleaned = "".join(c if (c.isalnum() or c in "-_ .") else "_" for c in str(name))
-    cleaned = cleaned.strip().replace(" ", "_").replace(".", "_")
-    return cleaned or "group"
-
-
-def merge_gdfs_wgs84(gdfs: Sequence[gpd.GeoDataFrame]) -> gpd.GeoDataFrame:
-    """Concatenate several vector layers into one GeoDataFrame in EPSG:4326.
-
-    Each input is reprojected to WGS84 first so layers in different CRSs
-    combine cleanly; the column set is the union across inputs (missing values
-    become NaN). Used to merge several uploaded files into a single job so,
-    e.g., every 2020 measurement across survey waves lands in one per-year
-    output.
-    """
-    from geofuse.crs_utils import reproject_geodataframe_to_wgs84
-
-    frames: list[gpd.GeoDataFrame] = []
-    for g in gdfs:
-        if g is None or len(g) == 0:
-            continue
-        gg = (
-            reproject_geodataframe_to_wgs84(g)
-            if g.crs is not None
-            else g.set_crs("EPSG:4326")
-        )
-        frames.append(gg)
-    if not frames:
-        return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
-    return gpd.GeoDataFrame(pd.concat(frames, ignore_index=True), crs="EPSG:4326")
 
 
 def _grouping_fallback_table(input_fnames, groups, groups_key) -> None:

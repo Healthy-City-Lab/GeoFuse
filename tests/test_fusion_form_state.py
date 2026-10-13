@@ -75,6 +75,8 @@ def _params(**over) -> dict:
 class TestSeeder(unittest.TestCase):
     def setUp(self):
         self.state = _StubState()
+        # ``fusion.st`` is this same module: one restore covers both.
+        self.addCleanup(setattr, st, "session_state", st.session_state)
         st.session_state = self.state
         from tabs import fusion
 
@@ -271,6 +273,8 @@ class TestEveryRecordedSettingIsRestored(unittest.TestCase):
 class TestStaleOptionGuard(unittest.TestCase):
     def setUp(self):
         self.state = _StubState()
+        # ``fusion.st`` is this same module: one restore covers both.
+        self.addCleanup(setattr, st, "session_state", st.session_state)
         st.session_state = self.state
         from tabs import fusion
 

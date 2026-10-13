@@ -174,6 +174,10 @@ class MetricFusionEngine:
         residualize_method: str = "linear",
         search_scoring_method: str = "mom_em3",
         negative_control_columns: list[str] | None = None,
+        gvi_ladder_spacing: str = "linear",
+        ndvi_ladder_spacing: str = "linear",
+        gvi_ladder_rungs: int | None = None,
+        ndvi_ladder_rungs: int | None = None,
     ):
         """
         Initialize the fusion engine.
@@ -220,6 +224,10 @@ class MetricFusionEngine:
                 frame for :meth:`compute_negative_controls` only — never
                 tuned on, never a reason to drop an entity. Cross-sectional
                 targets only.
+            gvi_ladder_spacing / ndvi_ladder_spacing: ``"linear"`` (steps of
+                ``*_buffer_step_m``) or ``"log"`` (``*_ladder_rungs`` rungs
+                spaced geometrically between min and max); see
+                :func:`metric_sampling.ladder_radii`.
         """
         # Route Optuna's chatter ("Trial X finished with value Y …") into
         # the per-job log instead of the Streamlit host terminal. Fusion
@@ -276,6 +284,15 @@ class MetricFusionEngine:
                 self.ndvi_buffer_max_m,
                 self.ndvi_buffer_min_m,
             )
+        for spacing in (gvi_ladder_spacing, ndvi_ladder_spacing):
+            if spacing not in metric_sampling.LADDER_SPACINGS:
+                raise ValueError(
+                    f"ladder spacing must be one of {metric_sampling.LADDER_SPACINGS}."
+                )
+        self.gvi_ladder_spacing = gvi_ladder_spacing
+        self.ndvi_ladder_spacing = ndvi_ladder_spacing
+        self.gvi_ladder_rungs = int(gvi_ladder_rungs) if gvi_ladder_rungs else 15
+        self.ndvi_ladder_rungs = int(ndvi_ladder_rungs) if ndvi_ladder_rungs else 15
 
         self.n_bins = n_bins
         self.cache_dir = cache_dir
@@ -973,7 +990,7 @@ class MetricFusionEngine:
             cache_metrics: Whether to cache downloaded metrics for future use
             gvi_api_key: Google Street View API key for GVI download
             ndvi_start_date: Start date for NDVI composite (YYYY-MM-DD)
-            ndvi_end_date: End date for NDVI composite (YYYY-MM-DD)
+            ndvi_end_date: Last day of the NDVI composite (YYYY-MM-DD), included
             ndvi_project_id: Google Earth Engine project ID for NDVI download
             force_download: If True, bypass cache and force fresh download of all metrics
             ndvi_resolution_m: GEE export resolution (m) when fetching NDVI; default 10
@@ -1591,7 +1608,7 @@ class MetricFusionEngine:
 
         Args:
             start_date: Start date for temporal composite (YYYY-MM-DD)
-            end_date: End date for temporal composite (YYYY-MM-DD)
+            end_date: Last day of the temporal composite (YYYY-MM-DD), included
             project_id: Google Earth Engine project ID
             cache: Whether to save to cache directory
             force_download: If True, bypass cache and force fresh download
@@ -1644,6 +1661,7 @@ class MetricFusionEngine:
             folder=self.cache_dir,
             resolution=ndvi_res,
             cancel_callback=cancel_callback,
+            end_inclusive=True,
         )
 
         if result.get("status") == "cancelled":
@@ -1760,20 +1778,24 @@ class MetricFusionEngine:
         self._pdcor_cache.clear()
         self._spline_basis_cache.clear()
 
+    def _ladder(self, channel: str) -> tuple[int, ...]:
+        """One channel family's buffer ladder: ``"gvi"`` or ``"ndvi"``."""
+        return metric_sampling.ladder_radii(
+            getattr(self, f"{channel}_buffer_min_m"),
+            getattr(self, f"{channel}_buffer_max_m"),
+            getattr(self, f"{channel}_buffer_step_m"),
+            spacing=getattr(self, f"{channel}_ladder_spacing"),
+            rungs=getattr(self, f"{channel}_ladder_rungs"),
+        )
+
+    def _ladder_description(self, channel: str) -> str:
+        """How a channel family's ladder was spaced, for the results bundle."""
+        if getattr(self, f"{channel}_ladder_spacing") == "log":
+            return f"log ({len(self._ladder(channel))} rungs)"
+        return f"linear (step {getattr(self, f'{channel}_buffer_step_m'):g} m)"
+
     def _outer_radii_metres(self, *, gvi: bool) -> np.ndarray:
-        if gvi:
-            lo, hi, st = metric_sampling.radius_int_bounds(
-                self.gvi_buffer_min_m,
-                self.gvi_buffer_max_m,
-                self.gvi_buffer_step_m,
-            )
-        else:
-            lo, hi, st = metric_sampling.radius_int_bounds(
-                self.ndvi_buffer_min_m,
-                self.ndvi_buffer_max_m,
-                self.ndvi_buffer_step_m,
-            )
-        return np.arange(lo, hi + 1, st, dtype=np.int64)
+        return np.asarray(self._ladder("gvi" if gvi else "ndvi"), dtype=np.int64)
 
     def _aggregate_with_ring_cache(
         self,
@@ -2240,17 +2262,8 @@ class MetricFusionEngine:
     _PREAGGR_PERCENTILES = preaggregation.PERCENTILES
 
     def _preaggr_radii(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        """(gvi_radii, ndvi_radii) snapped to int + step from the buffer ladders."""
-        gvi_lo, gvi_hi, gvi_st = metric_sampling.radius_int_bounds(
-            self.gvi_buffer_min_m, self.gvi_buffer_max_m, self.gvi_buffer_step_m
-        )
-        ndvi_lo, ndvi_hi, ndvi_st = metric_sampling.radius_int_bounds(
-            self.ndvi_buffer_min_m, self.ndvi_buffer_max_m, self.ndvi_buffer_step_m
-        )
-        return (
-            tuple(range(gvi_lo, gvi_hi + 1, gvi_st)),
-            tuple(range(ndvi_lo, ndvi_hi + 1, ndvi_st)),
-        )
+        """(gvi_radii, ndvi_radii): the integer radii of the two buffer ladders."""
+        return self._ladder("gvi"), self._ladder("ndvi")
 
     def _metric_fingerprint(self, metric, channel: str) -> str:
         """Cheap, deterministic identity for a loaded metric (vector or raster)."""
@@ -3259,6 +3272,7 @@ class MetricFusionEngine:
         chains: int = 4,
         radius_kernel: str = "lognormal",
         aggregator: str = "dirichlet",
+        radius_prior: str = "rungs",
         seed: int = 42,
         cancel_callback: Callable[..., bool] | None = None,
         progress_callback: Callable[[int, int], None] | None = None,
@@ -3281,6 +3295,8 @@ class MetricFusionEngine:
         so the null rate covers the form choice too. ``outcome`` names a
         negative-control column to tune on instead of the target, which is
         what :meth:`retune_concordance` uses; entities missing it are dropped.
+        ``radius_prior`` (``bayesian_index.RADIUS_PRIORS``) ties the radius
+        kernel's prior to the listed rungs or to the range they span.
         """
         t0 = time.perf_counter()
         steps, done = 5, 0
@@ -3419,6 +3435,7 @@ class MetricFusionEngine:
             chains=chains,
             seed=seed,
             column_sd=prep_info["column_sd"],
+            radius_prior=radius_prior,
         )
         null = (
             bayesian_index.null_calibration(
@@ -3480,6 +3497,10 @@ class MetricFusionEngine:
             "splits": sweep_splits,
         }
         params["__posterior__"] = post.summary()
+        params["__posterior__"]["ladder_spacing"] = {
+            ch: self._ladder_description("ndvi" if ch == "ndvi" else "gvi")
+            for ch in index_channels
+        }
         params["__discovery__"] = disc
         params["__holdout_gain__"] = gain
         params["__null_calibration__"] = null

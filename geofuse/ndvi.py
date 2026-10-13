@@ -6,7 +6,7 @@ import logging
 import os
 import traceback
 import zipfile
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
@@ -19,11 +19,13 @@ from shapely.geometry import box
 
 from .core import build_planar_tiles
 from .crs_utils import (
+    default_geotiff_creation_options,
     raster_geographic_bounds,
     reproject_geodataframe_to_wgs84,
     select_grid_crs_with_warning,
     stream_mosaic_to_geotiff,
 )
+from .ee_auth import initialize as initialize_earth_engine
 from .ee_utils import (
     crs_to_ee_string,
     shapely_to_ee_geometry,
@@ -31,19 +33,12 @@ from .ee_utils import (
 )
 from .jobs import NDVI_PROGRESS_MIN_TILES, ProgressThrottle, retry_with_backoff
 from .logger import attach_external_logger, get_logger
-from .persistence.caches import DEFAULT_MAX_BYTES, NdviTileCache
+from .persistence.caches import DEFAULT_MAX_BYTES, NdviTileCache, ndvi_tiles
 from .vector_io import geometry_sha256
 
 _log = get_logger("NDVI")
 
 # TODO: NDVI_TEMPORAL - Add time-series analysis for seasonal greenery changes
-
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-# Persistent NDVI tile cache root. Cross-process caches live under one
-# well-known directory. Tile bodies live under ``<root>/<resume_key>/``
-# alongside a SQLite WAL index used for LRU eviction.
-_TILE_CACHE_ROOT = os.path.join(_REPO_ROOT, "logs", "caches", "ndvi_tiles")
 
 # Concurrent tile-download workers. Earth Engine allows several parallel
 # ``ee_export_image`` calls per user well above this; the cap exists to avoid
@@ -68,6 +63,139 @@ _EE_TOO_LARGE_MARKERS = (
     "request payload size exceeds",
     "computed value is too large",
 )
+
+
+# ────────────────────────────────────────────────────────────────────
+# Temporal statistics
+# ────────────────────────────────────────────────────────────────────
+
+#: Statistics a composite can take, per pixel, over the cloud-free images in
+#: its date window. ``median`` is the default and keeps the historical file
+#: names and resume keys; every other statistic adds its name to both.
+TEMPORAL_REDUCERS = ("median", "mean", "max")
+
+
+def normalize_temporal_reducers(
+    value: str | Iterable[str] = "median",
+) -> tuple[str, ...]:
+    """Validated statistics in :data:`TEMPORAL_REDUCERS` order, deduplicated."""
+    names = [value] if isinstance(value, str) else list(value)
+    chosen = {str(v).strip().lower() for v in names}
+    unknown = sorted(chosen - set(TEMPORAL_REDUCERS))
+    if unknown:
+        raise ValueError(
+            f"Unknown temporal statistic(s) {unknown}; "
+            f"choose from {list(TEMPORAL_REDUCERS)}."
+        )
+    if not chosen:
+        raise ValueError("Choose at least one temporal statistic.")
+    return tuple(r for r in TEMPORAL_REDUCERS if r in chosen)
+
+
+def ndvi_output_name(output_name: str, reducer: str) -> str:
+    """Base name of one statistic's files: ``median`` keeps ``output_name``,
+    any other statistic appends ``_<reducer>`` (``{name}_max_ndvi.tif``)."""
+    return output_name if reducer == "median" else f"{output_name}_{reducer}"
+
+
+# ────────────────────────────────────────────────────────────────────
+# Acquisition options
+# ────────────────────────────────────────────────────────────────────
+
+#: ``auto`` picks Sentinel-2 or Landsat by date; ``landsat`` merges Landsat 5,
+#: 7, 8 and 9; ``landsat_no_slc_off`` keeps Landsat 5, Landsat 7 before its
+#: scan-line corrector failed, and Landsat 8.
+SATELLITES = ("auto", "sentinel2", "landsat", "landsat_no_slc_off")
+
+#: ``scene_filter`` (default) drops scenes above the cloud threshold and masks
+#: cloudy pixels in the rest; ``pixel_only`` keeps every scene and masks cloudy
+#: pixels; ``scene_only`` drops cloudy scenes and keeps every pixel of the rest.
+CLOUD_HANDLINGS = ("scene_filter", "pixel_only", "scene_only")
+
+#: ``surface`` (default) reads Level-2 surface reflectance; ``toa`` reads
+#: top-of-atmosphere reflectance (Landsat C2 TOA, Sentinel-2 Level-1C).
+REFLECTANCES = ("surface", "toa")
+
+#: Water mask source and threshold: pixels covered by open water at least
+#: this percent of the time are masked when the water mask is on.
+WATER_DATASET = "JRC/GSW1_4/GlobalSurfaceWater"
+WATER_OCCURRENCE_MAX = 50
+
+
+def _shift_day(day: str, days: int) -> str:
+    """The ISO date ``days`` days after ``day`` (before it when negative)."""
+    from datetime import date as _date
+    from datetime import timedelta as _timedelta
+
+    return (_date.fromisoformat(str(day)[:10]) + _timedelta(days=days)).isoformat()
+
+
+def _window_text(start_date: str, end_date: str) -> str:
+    """``start → last day`` of the half-open window ``[start_date, end_date)``."""
+    return f"{start_date} → {_shift_day(end_date, -1)}"
+
+
+def substitute_year(
+    start_date: str, end_date: str, *, year: int = 2012, to: int = 2013
+) -> tuple[str, str, bool]:
+    """Shift a window that lies wholly inside ``year`` to the same days in ``to``.
+
+    The window is half-open, ``[start_date, end_date)``, as Earth Engine reads
+    it, so an end on 1 January of the next year still lies inside ``year``.
+    Returns ``(start, end, shifted)``. A window only partly inside ``year`` is
+    returned unchanged with ``shifted=False``; the caller warns about it. A
+    29 February becomes the 28th.
+    """
+    from datetime import date as _date
+
+    s = _date.fromisoformat(str(start_date))
+    last = _date.fromisoformat(_shift_day(end_date, -1))
+    if s.year != year or last.year != year:
+        return str(start_date), str(end_date), False
+
+    def move(d):
+        try:
+            return d.replace(year=to)
+        except ValueError:
+            return d.replace(year=to, day=28)
+
+    return move(s).isoformat(), _shift_day(move(last).isoformat(), 1), True
+
+
+def _overlaps_year(start_date: str, end_date: str, year: int) -> bool:
+    """Whether the half-open window ``[start_date, end_date)`` reaches ``year``."""
+    return str(start_date)[:4] <= str(year) <= _shift_day(end_date, -1)[:4]
+
+
+def _stack_composites(composites: Mapping[str, Any], reducers: list[str]):
+    """One image carrying ``reducers`` as bands, in order, for a single export."""
+    if len(reducers) == 1:
+        return composites[reducers[0]]
+    return ee.Image.cat([composites[r].rename(r) for r in reducers])
+
+
+def _combine_reducer_results(results: Mapping[str, dict]) -> dict:
+    """The first statistic's result, with every statistic's under ``reducers``.
+
+    ``status`` stays ``"success"`` only when every statistic succeeded; a
+    cancellation wins over a failure, and a failure's message names the
+    statistics that failed.
+    """
+    reducers = list(results)
+    combined = dict(results[reducers[0]])
+    combined["reducers"] = {r: dict(results[r]) for r in reducers}
+    bad = [r for r in reducers if results[r].get("status") != "success"]
+    if not bad:
+        return combined
+    if any(results[r].get("status") == "cancelled" for r in bad):
+        combined["status"] = "cancelled"
+        combined["message"] = "Cancelled by user"
+    elif len(reducers) > 1:
+        combined["status"] = "error"
+        combined["message"] = "; ".join(
+            f"{r}: {results[r].get('message', 'failed')}" for r in bad
+        )
+    return combined
 
 
 class _EEComputeTooLargeError(RuntimeError):
@@ -213,16 +341,22 @@ def _compute_resume_key(
     cloud_max: float,
     resolution: int,
     ee_collection: str,
+    temporal_reducer: str = "median",
+    variant: tuple[str, ...] = (),
 ) -> str:
     """Stable 16-hex-char key identifying a unique NDVI run.
 
     Two runs that hash to the same key produce identical output, so they can
     share an on-disk tile workspace — that's what lets resume work. The key
     includes everything that affects the per-tile contents: study area
-    (geometry + CRS), date range, cloud threshold, export resolution, and
-    Earth Engine collection ID. Changing any one of these spawns a fresh
-    workspace and forces a full re-download (which is what you want — old
-    tiles would be from a different question).
+    (geometry + CRS), date range, cloud threshold, export resolution, Earth
+    Engine collection ID and temporal statistic. Changing any one of these
+    spawns a fresh workspace and forces a full re-download (which is what you
+    want — old tiles would be from a different question). ``median`` adds
+    nothing to the hash, so its keys match those written before the
+    statistic was a choice. ``variant`` names acquisition options set away
+    from their defaults (water mask, cloud handling); the defaults add
+    nothing either.
     """
     h = hashlib.sha256()
     # Schema tag — bump when the on-disk tile format changes. ``planar_v1``
@@ -233,7 +367,46 @@ def _compute_resume_key(
     h.update(geometry_sha256(geom_wgs84_gdf).encode())
     h.update(f"|{start_date}|{end_date}|{cloud_max}|{resolution}|".encode())
     h.update(ee_collection.encode())
+    if temporal_reducer != "median":
+        h.update(f"|{temporal_reducer}".encode())
+    for option in variant:
+        h.update(f"|{option}".encode())
     return h.hexdigest()[:16]
+
+
+def _extract_band(
+    src_path: str, band: int, dst_path: str, *, dtype: str | None = None
+) -> None:
+    """Write band ``band`` of ``src_path`` to its own compressed GeoTIFF.
+
+    ``dtype`` defaults to the source's. Cache tiles are stored as float32:
+    every mosaic built from them is float32, so outputs match a mosaic of
+    Earth Engine's own float64 files exactly, and with DEFLATE plus the
+    floating-point predictor a tile takes under half the bytes. The file is
+    written to ``.part`` and renamed, so a tile on disk is always whole.
+    """
+    with rasterio.open(src_path) as src:
+        out_dtype = dtype or src.dtypes[band - 1]
+        data = src.read(band, out_dtype=out_dtype)
+        profile = {
+            "driver": "GTiff",
+            "height": src.height,
+            "width": src.width,
+            "count": 1,
+            "dtype": out_dtype,
+            "crs": src.crs,
+            "transform": src.transform,
+            "nodata": src.nodata,
+        }
+    profile.update(default_geotiff_creation_options(out_dtype))
+    part = dst_path + ".part"
+    try:
+        with rasterio.open(part, "w", **profile) as dst:
+            dst.write(data, 1)
+        os.replace(part, dst_path)
+    finally:
+        if os.path.exists(part):
+            os.remove(part)
 
 
 def _discover_resumable_tiles(
@@ -303,9 +476,16 @@ def _write_ndvi_sidecar(
     resume_key: str = "",
     start_date: str,
     end_date: str,
+    end_date_exclusive: str | None = None,
     used_start_date: str | None = None,
     used_end_date: str | None = None,
+    temporal_reducer: str = "median",
     coverage_widened: bool = False,
+    year_substituted: str | None = None,
+    water_mask: bool = False,
+    cloud_handling: str = "scene_filter",
+    reflectance: str = "surface",
+    preset: str | None = None,
     cloud_max: float,
     resolution_m: int,
     max_tile_size_km: float,
@@ -319,10 +499,14 @@ def _write_ndvi_sidecar(
     Mirrors GVI's ``_gvi.json`` so any downstream tool (fusion, custom
     notebooks) can introspect an NDVI raster after the fact: which planar CRS
     pixels were rasterised in, how much distortion that introduced, how many
-    clusters and tiles the input decomposed into, the exact date range, and
-    which Earth Engine ImageCollection was queried. ``failed_tile_refs``
-    lists the cluster/tile IDs that exhausted their retry budget — those
-    areas appear as NaN gaps in the mosaic.
+    clusters and tiles the input decomposed into, the exact date range, the
+    temporal statistic (median / mean / max over the window's cloud-free
+    images), and which Earth Engine ImageCollection was queried.
+    ``start_date`` / ``end_date`` are the dates as given and
+    ``end_date_exclusive`` the exclusive end of that window; ``used_*`` is
+    the half-open window queried after any 2012 fill or coverage rescue.
+    ``failed_tile_refs`` lists the cluster/tile IDs that exhausted their retry
+    budget — those areas appear as NaN gaps in the mosaic.
     """
     sidecar_path = os.path.join(folder, f"{output_name}_ndvi.json")
     payload = {
@@ -339,9 +523,16 @@ def _write_ndvi_sidecar(
         "failed_tile_refs": list(failed_tile_refs or []),
         "start_date": str(start_date),
         "end_date": str(end_date),
+        "end_date_exclusive": str(end_date_exclusive or end_date),
         "used_start_date": str(used_start_date or start_date),
         "used_end_date": str(used_end_date or end_date),
+        "temporal_reducer": str(temporal_reducer),
         "coverage_widened": bool(coverage_widened),
+        "year_substituted": year_substituted,
+        "water_mask": bool(water_mask),
+        "water_occurrence_max": WATER_OCCURRENCE_MAX if water_mask else None,
+        "cloud_handling": str(cloud_handling),
+        "reflectance": str(reflectance),
         "cloud_max": float(cloud_max),
         "resolution_m": int(resolution_m),
         "max_tile_size_km": float(max_tile_size_km),
@@ -354,6 +545,8 @@ def _write_ndvi_sidecar(
             else None
         ),
     }
+    if preset:
+        payload["preset"] = str(preset)
     with open(sidecar_path, "w") as f:
         json.dump(payload, f, indent=2)
     return sidecar_path
@@ -400,6 +593,20 @@ class NDVIEngine:
     #: metadata and mixed into the tile-cache resume key.
     LANDSAT_MERGED_LABEL = "LANDSAT/LT05+LE07+LC08+LC09/C02/T1_L2"
 
+    #: Top-of-atmosphere counterparts, Landsat 5 / 7 / 8 / 9, Collection 2
+    #: Tier 1, and Sentinel-2 Level-1C.
+    LANDSAT_TOA_COLLECTION_IDS = (
+        "LANDSAT/LT05/C02/T1_TOA",
+        "LANDSAT/LE07/C02/T1_TOA",
+        "LANDSAT/LC08/C02/T1_TOA",
+        "LANDSAT/LC09/C02/T1_TOA",
+    )
+    S2_TOA_COLLECTION_ID = "COPERNICUS/S2_HARMONIZED"
+
+    #: First day of Landsat 7's scan-line-corrector failure; the
+    #: ``landsat_no_slc_off`` sensor set keeps Landsat 7 scenes before it.
+    LANDSAT7_SLC_OFF_START = "2003-06-01"
+
     #: Roy et al. (2016) RMA coefficients that put ETM+ surface reflectance on
     #: the OLI (Landsat 8) scale as ``OLI ≈ slope · ETM+ + intercept``, so
     #: pre-2013 TM/ETM+ NDVI is comparable to the LC08/LC09 (and, loosely,
@@ -421,10 +628,16 @@ class NDVIEngine:
     ):
         """Initialize Earth Engine and open the persistent tile cache.
 
+        Earth Engine is initialised by :func:`geofuse.ee_auth.initialize`: the
+        stored service-account key or sign-in when there is one, else Earth
+        Engine's own default; ``project_id`` falls back to the user
+        configuration's ``earthengine.project``.
+
         ``tile_cache`` lets the caller inject a shared :class:`NdviTileCache`
         (e.g. a singleton from ``ui/services.py``). When omitted, the engine
-        opens its own at ``tile_cache_dir`` (default
-        ``<repo>/logs/caches/ndvi_tiles/``) so direct API callers — fusion
+        opens its own at ``tile_cache_dir`` (default ``ndvi_tiles/`` in the
+        cache folder, :func:`~geofuse.persistence.caches.cache_root`) so
+        direct API callers — fusion
         auto-download, CLI, notebooks — benefit from the same cross-run
         cache the UI uses. The cache is keyed by ``resume_key`` so repeat
         runs over the same area + date range are near-instant.
@@ -438,23 +651,13 @@ class NDVIEngine:
         # across engine instances and processes.
         attach_external_logger("ee", logging.INFO)
 
-        try:
-            if project_id:
-                ee.Initialize(project=project_id)
-            else:
-                ee.Initialize()
-        except ee.EEException as e:
-            _log("WARN", f"Earth Engine init failed: {e}")
-            try:
-                ee.Authenticate()
-                ee.Initialize()
-            except Exception as final_e:
-                raise final_e
+        source = initialize_earth_engine(project_id)
+        _log("INFO", f"Earth Engine credentials: {source}")
 
         if tile_cache is not None:
             self.tile_cache = tile_cache
         else:
-            root = tile_cache_dir if tile_cache_dir is not None else _TILE_CACHE_ROOT
+            root = tile_cache_dir if tile_cache_dir is not None else ndvi_tiles()
             self.tile_cache = NdviTileCache(root, max_bytes=tile_cache_max_bytes)
 
     @staticmethod
@@ -469,11 +672,19 @@ class NDVIEngine:
         geom_wgs84 = reproject_geodataframe_to_wgs84(gdf)
         return _select_export_crs(geom_wgs84)
 
-    def prep_ndvi(self, img):
+    def prep_ndvi(self, img, pixel_mask: bool = True):
+        """NDVI from Sentinel-2 Level-2A surface reflectance (``B4`` / ``B8``).
+
+        ``pixel_mask`` removes pixels the scene classification (``SCL``) marks
+        as cloud shadow, unclassified, cloud, cirrus or snow; ``False`` keeps
+        every pixel of the scene.
+        """
         scale = 0.0001
         red = img.select("B4").multiply(scale)
         nir = img.select("B8").multiply(scale)
         ndvi = nir.subtract(red).divide(nir.add(red)).rename("NDVI")
+        if not pixel_mask:
+            return ndvi.copyProperties(img, img.propertyNames())
 
         # SCL masking (Standard in Harmonized collection)
         scl = img.select("SCL")
@@ -487,16 +698,57 @@ class NDVIEngine:
         )
         return ndvi.updateMask(mask_scl).copyProperties(img, img.propertyNames())
 
-    def get_collection(self, aoi, start_date, end_date, cloud_max=10):
-        return (
-            ee.ImageCollection(self.EE_COLLECTION_ID)
-            .filterBounds(aoi)
-            .filterDate(start_date, end_date)
-            .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", cloud_max))
-            .map(self.prep_ndvi)
-        )
+    def prep_ndvi_s2_toa(self, img, pixel_mask: bool = True):
+        """NDVI from Sentinel-2 Level-1C top-of-atmosphere reflectance.
 
-    def prep_ndvi_landsat(self, img):
+        Same bands and scale as :meth:`prep_ndvi`; Level-1C has no scene
+        classification, so ``pixel_mask`` removes the opaque-cloud and cirrus
+        pixels flagged in ``QA60`` (bits 10 and 11).
+        """
+        scale = 0.0001
+        red = img.select("B4").multiply(scale)
+        nir = img.select("B8").multiply(scale)
+        ndvi = nir.subtract(red).divide(nir.add(red)).rename("NDVI")
+        if not pixel_mask:
+            return ndvi.copyProperties(img, img.propertyNames())
+        qa = img.select("QA60")
+        cloudy = qa.bitwiseAnd(1 << 10).Or(qa.bitwiseAnd(1 << 11))
+        return ndvi.updateMask(cloudy.eq(0)).copyProperties(img, img.propertyNames())
+
+    def get_collection(
+        self,
+        aoi,
+        start_date,
+        end_date,
+        cloud_max=10,
+        *,
+        reflectance: str = "surface",
+        pixel_mask: bool = True,
+    ):
+        """Cloud-screened Sentinel-2 NDVI collection.
+
+        ``cloud_max=None`` keeps every scene (no scene-level cloud filter);
+        ``reflectance="toa"`` reads Level-1C instead of Level-2A.
+        """
+        if reflectance == "toa":
+            cid, prep = self.S2_TOA_COLLECTION_ID, self.prep_ndvi_s2_toa
+        else:
+            cid, prep = self.EE_COLLECTION_ID, self.prep_ndvi
+        col = ee.ImageCollection(cid).filterBounds(aoi).filterDate(start_date, end_date)
+        if cloud_max is not None:
+            col = col.filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", cloud_max))
+        return col.map(prep if pixel_mask else lambda img: prep(img, pixel_mask=False))
+
+    @staticmethod
+    def _qa_pixel_clear(img):
+        """1 where ``QA_PIXEL`` flags no cloud (bit 3), shadow (4) or snow (5)."""
+        qa = img.select("QA_PIXEL")
+        cloudy = (
+            qa.bitwiseAnd(1 << 3).Or(qa.bitwiseAnd(1 << 4)).Or(qa.bitwiseAnd(1 << 5))
+        )
+        return cloudy.eq(0)
+
+    def prep_ndvi_landsat(self, img, pixel_mask: bool = True):
         """NDVI from Landsat 8/9 Collection 2 Level-2 surface reflectance.
 
         Bands: ``SR_B4`` (red) / ``SR_B5`` (NIR). Apply the C2 L2 scale +
@@ -504,21 +756,20 @@ class NDVIEngine:
         mask cloud / cloud-shadow via the ``QA_PIXEL`` band so cloudy
         observations don't pollute the composite. Same output band name
         (``NDVI``) as :meth:`prep_ndvi` so downstream code is collection-
-        agnostic.
+        agnostic. ``pixel_mask=False`` keeps every pixel.
         """
         scale = 0.0000275
         offset = -0.2
         red = img.select("SR_B4").multiply(scale).add(offset)
         nir = img.select("SR_B5").multiply(scale).add(offset)
         ndvi = nir.subtract(red).divide(nir.add(red)).rename("NDVI")
-        qa = img.select("QA_PIXEL")
-        # Bit 3 = cloud, bit 4 = cloud shadow, bit 5 = snow.
-        cloudy = (
-            qa.bitwiseAnd(1 << 3).Or(qa.bitwiseAnd(1 << 4)).Or(qa.bitwiseAnd(1 << 5))
+        if not pixel_mask:
+            return ndvi.copyProperties(img, img.propertyNames())
+        return ndvi.updateMask(self._qa_pixel_clear(img)).copyProperties(
+            img, img.propertyNames()
         )
-        return ndvi.updateMask(cloudy.eq(0)).copyProperties(img, img.propertyNames())
 
-    def prep_ndvi_landsat_tm(self, img):
+    def prep_ndvi_landsat_tm(self, img, pixel_mask: bool = True):
         """NDVI from Landsat 5 TM / 7 ETM+ Collection 2 Level-2, harmonized to
         the OLI scale.
 
@@ -539,28 +790,104 @@ class NDVIEngine:
         red = red.multiply(rs).add(ri)
         nir = nir.multiply(ns).add(ni)
         ndvi = nir.subtract(red).divide(nir.add(red)).rename("NDVI")
-        qa = img.select("QA_PIXEL")
-        # Bit 3 = cloud, bit 4 = cloud shadow, bit 5 = snow.
-        cloudy = (
-            qa.bitwiseAnd(1 << 3).Or(qa.bitwiseAnd(1 << 4)).Or(qa.bitwiseAnd(1 << 5))
+        if not pixel_mask:
+            return ndvi.copyProperties(img, img.propertyNames())
+        return ndvi.updateMask(self._qa_pixel_clear(img)).copyProperties(
+            img, img.propertyNames()
         )
-        return ndvi.updateMask(cloudy.eq(0)).copyProperties(img, img.propertyNames())
 
-    def _landsat_sensor_preps(self):
-        """``(collection_id, prep_fn)`` for each Landsat sensor, old → new.
+    def prep_ndvi_landsat_toa(self, img, pixel_mask: bool = True):
+        """NDVI from Landsat 8/9 Collection 2 top-of-atmosphere reflectance.
 
-        TM/ETM+ go through the harmonized :meth:`prep_ndvi_landsat_tm`; OLI
-        (8/9) is already the reference scale so it uses :meth:`prep_ndvi_landsat`.
+        TOA collections carry reflectance directly (no scale or offset): red
+        ``B4``, NIR ``B5``. No harmonisation (the published coefficients are
+        for surface reflectance). Same ``QA_PIXEL`` mask as the SR preps.
         """
-        return (
-            (self.LANDSAT5_COLLECTION_ID, self.prep_ndvi_landsat_tm),
-            (self.LANDSAT7_COLLECTION_ID, self.prep_ndvi_landsat_tm),
-            (self.LANDSAT8_COLLECTION_ID, self.prep_ndvi_landsat),
-            (self.LANDSAT9_COLLECTION_ID, self.prep_ndvi_landsat),
+        red = img.select("B4")
+        nir = img.select("B5")
+        ndvi = nir.subtract(red).divide(nir.add(red)).rename("NDVI")
+        if not pixel_mask:
+            return ndvi.copyProperties(img, img.propertyNames())
+        return ndvi.updateMask(self._qa_pixel_clear(img)).copyProperties(
+            img, img.propertyNames()
         )
 
-    def get_collection_landsat(self, aoi, start_date, end_date, cloud_max=10):
-        """Era-aware merged Landsat NDVI collection (L5/L7/L8/L9).
+    def prep_ndvi_landsat_toa_tm(self, img, pixel_mask: bool = True):
+        """NDVI from Landsat 5 TM / 7 ETM+ top-of-atmosphere reflectance.
+
+        Red ``B3``, NIR ``B4``, not harmonised to OLI; same ``QA_PIXEL`` mask.
+        """
+        red = img.select("B3")
+        nir = img.select("B4")
+        ndvi = nir.subtract(red).divide(nir.add(red)).rename("NDVI")
+        if not pixel_mask:
+            return ndvi.copyProperties(img, img.propertyNames())
+        return ndvi.updateMask(self._qa_pixel_clear(img)).copyProperties(
+            img, img.propertyNames()
+        )
+
+    def _landsat_sensors(self, sensor_set: str = "all", reflectance: str = "surface"):
+        """``(collection_id, prep_fn, pre_slc_only)`` per Landsat sensor, old → new.
+
+        ``all`` merges LT05, LE07, LC08 and LC09. ``no_slc_off`` keeps LT05,
+        LE07 acquired before its scan-line corrector failed
+        (:data:`LANDSAT7_SLC_OFF_START`) and LC08: no striped Landsat 7 scenes
+        and no Landsat 9. Surface reflectance runs TM/ETM+ through the
+        harmonised :meth:`prep_ndvi_landsat_tm`; top-of-atmosphere is not
+        harmonised.
+        """
+        if reflectance == "toa":
+            tm, oli = self.prep_ndvi_landsat_toa_tm, self.prep_ndvi_landsat_toa
+            ids = self.LANDSAT_TOA_COLLECTION_IDS
+        else:
+            tm, oli = self.prep_ndvi_landsat_tm, self.prep_ndvi_landsat
+            ids = (
+                self.LANDSAT5_COLLECTION_ID,
+                self.LANDSAT7_COLLECTION_ID,
+                self.LANDSAT8_COLLECTION_ID,
+                self.LANDSAT9_COLLECTION_ID,
+            )
+        pre_slc = sensor_set == "no_slc_off"
+        sensors = [
+            (ids[0], tm, False),
+            (ids[1], tm, pre_slc),
+            (ids[2], oli, False),
+            (ids[3], oli, False),
+        ]
+        return sensors[:3] if pre_slc else sensors
+
+    def _landsat_label(
+        self, sensor_set: str = "all", reflectance: str = "surface"
+    ) -> str:
+        """Stable label of a merged Landsat source (sidecar, resume key)."""
+        if sensor_set == "all" and reflectance == "surface":
+            return self.LANDSAT_MERGED_LABEL
+        sensors = (
+            f"LT05+LE07(pre-{self.LANDSAT7_SLC_OFF_START[:7]})+LC08"
+            if sensor_set == "no_slc_off"
+            else "LT05+LE07+LC08+LC09"
+        )
+        product = "T1_TOA" if reflectance == "toa" else "T1_L2"
+        return f"LANDSAT/{sensors}/C02/{product}"
+
+    def _landsat_source(self, cid, aoi, start_date, end_date, pre_slc: bool):
+        col = ee.ImageCollection(cid).filterBounds(aoi).filterDate(start_date, end_date)
+        if pre_slc:
+            col = col.filterDate("1999-01-01", self.LANDSAT7_SLC_OFF_START)
+        return col
+
+    def get_collection_landsat(
+        self,
+        aoi,
+        start_date,
+        end_date,
+        cloud_max=10,
+        *,
+        sensor_set: str = "all",
+        reflectance: str = "surface",
+        pixel_mask: bool = True,
+    ):
+        """Era-aware merged Landsat NDVI collection.
 
         Each sensor is filtered, cloud-screened, and mapped to a common
         ``NDVI`` band *before* merging — TM/ETM+ and OLI have different band
@@ -568,21 +895,29 @@ class NDVIEngine:
         keeps only the sensors whose acquisitions fall in the date range, so a
         1990s query composes from TM, a 2012 query from ETM+, and a 2015 query
         from OLI, all through the same call. Same output shape as
-        :meth:`get_collection` for Sentinel-2.
+        :meth:`get_collection` for Sentinel-2. ``cloud_max=None`` keeps every
+        scene; ``sensor_set`` / ``reflectance`` follow :meth:`_landsat_sensors`.
         """
         merged = None
-        for cid, prep in self._landsat_sensor_preps():
-            col = (
-                ee.ImageCollection(cid)
-                .filterBounds(aoi)
-                .filterDate(start_date, end_date)
-                .filter(ee.Filter.lt("CLOUD_COVER", cloud_max))
-                .map(prep)
+        for cid, prep, pre_slc in self._landsat_sensors(sensor_set, reflectance):
+            col = self._landsat_source(cid, aoi, start_date, end_date, pre_slc)
+            if cloud_max is not None:
+                col = col.filter(ee.Filter.lt("CLOUD_COVER", cloud_max))
+            col = col.map(
+                prep if pixel_mask else lambda img, p=prep: p(img, pixel_mask=False)
             )
             merged = col if merged is None else merged.merge(col)
         return merged
 
-    def _landsat_base(self, aoi, start_date, end_date):
+    def _landsat_base(
+        self,
+        aoi,
+        start_date,
+        end_date,
+        *,
+        sensor_set: str = "all",
+        reflectance: str = "surface",
+    ):
         """Raw (un-prepped) merged Landsat collection over the date range.
 
         Used only to *count* acquisitions when distinguishing "no images in
@@ -590,26 +925,29 @@ class NDVIEngine:
         sensors are fine — nothing reads pixels here.
         """
         merged = None
-        for cid, _prep in self._landsat_sensor_preps():
-            col = (
-                ee.ImageCollection(cid)
-                .filterBounds(aoi)
-                .filterDate(start_date, end_date)
-            )
+        for cid, _prep, pre_slc in self._landsat_sensors(sensor_set, reflectance):
+            col = self._landsat_source(cid, aoi, start_date, end_date, pre_slc)
             merged = col if merged is None else merged.merge(col)
         return merged
+
+    def _mask_water(self, img):
+        """Mask pixels open water covers at least :data:`WATER_OCCURRENCE_MAX`
+        percent of the time (``occurrence`` of :data:`WATER_DATASET`); pixels
+        with no water record count as dry and are kept."""
+        occurrence = ee.Image(WATER_DATASET).select("occurrence").unmask(0)
+        return img.updateMask(occurrence.lt(WATER_OCCURRENCE_MAX))
 
     def _pick_satellite(self, start_date: str, end_date: str, satellite: str) -> str:
         """Resolve ``satellite='auto'`` → ``'sentinel2'`` or ``'landsat'``.
 
-        ``end_date`` falling before the Sentinel-2 collection start picks
-        Landsat; everything else stays on Sentinel-2 (higher resolution +
-        more frequent revisit). Explicit ``'sentinel2'`` / ``'landsat'`` are
-        passed through untouched.
+        A window whose exclusive ``end_date`` is on or before the Sentinel-2
+        collection start picks Landsat; everything else stays on Sentinel-2
+        (higher resolution + more frequent revisit). Every explicit choice in
+        :data:`SATELLITES` is passed through untouched.
         """
         if satellite != "auto":
             return satellite
-        return "landsat" if str(end_date) < self.S2_COLLECTION_START else "sentinel2"
+        return "landsat" if str(end_date) <= self.S2_COLLECTION_START else "sentinel2"
 
     #: Block-iteration buffer cap. Points accumulate here across raster
     #: windows; once we cross this threshold we build a GeoDataFrame and
@@ -843,14 +1181,23 @@ class NDVIEngine:
         satellite: str = "auto",
         coverage_rescue: bool = True,
         crs_override=None,
+        temporal_reducers: str | Iterable[str] = "median",
+        water_mask: bool = False,
+        cloud_handling: str = "scene_filter",
+        reflectance: str = "surface",
+        substitute_2012: bool = False,
+        preset: str | None = None,
+        end_inclusive: bool = False,
     ):
         """
         Download and process NDVI data with automatic tiling for large areas.
 
         Args:
             geometry: GeoDataFrame or Shapely geometry
-            start_date: Start date (YYYY-MM-DD)
-            end_date: End date (YYYY-MM-DD)
+            start_date: Start date (YYYY-MM-DD), included.
+            end_date: End date (YYYY-MM-DD). Exclusive by default, as Earth
+                Engine's ``filterDate`` reads it: the window is
+                ``[start_date, end_date)``. See ``end_inclusive``.
             output_name: Base name for output files
             cloud_max: Maximum cloud percentage
             resolution: Pixel resolution in meters
@@ -869,15 +1216,56 @@ class NDVIEngine:
                 a ``tiles_index.json``. Mirrors GVI's per-cluster GeoTIFF tile
                 output and avoids the giant mostly-NaN mosaic that scattered
                 national-scale inputs would otherwise produce.
-            satellite: ``'auto'`` (default — Sentinel-2 for ≥2017, Landsat 8/9
-                otherwise), ``'sentinel2'``, or ``'landsat'``. Auto picks
-                Landsat for date ranges that end before
-                :attr:`S2_COLLECTION_START`.
+            satellite: one of :data:`SATELLITES`. ``'auto'`` (default)
+                picks Landsat for date ranges that end before
+                :attr:`S2_COLLECTION_START` and Sentinel-2 otherwise;
+                ``'landsat'`` merges Landsat 5 / 7 / 8 / 9;
+                ``'landsat_no_slc_off'`` keeps Landsat 5, Landsat 7 before
+                :attr:`LANDSAT7_SLC_OFF_START` and Landsat 8.
             coverage_rescue: When the cloud-filtered collection has fewer
                 than 3 images, widen the date range by ±50 % once and retry.
                 Documented in the sidecar so the user knows the composite
                 spans a wider window than they originally asked for.
+            temporal_reducers: Per-pixel statistic(s) over the window's
+                cloud-free images, any of :data:`TEMPORAL_REDUCERS` (default
+                ``"median"``). Each statistic writes its own files under
+                :func:`ndvi_output_name` and caches its tiles under its own
+                resume key; one Earth Engine request per tile carries every
+                statistic that tile is missing.
+            water_mask: Mask pixels open water covers at least
+                :data:`WATER_OCCURRENCE_MAX` percent of the time, on every
+                image before the temporal statistic. Off by default (water
+                stays in the composite).
+            cloud_handling: one of :data:`CLOUD_HANDLINGS`: drop scenes above
+                ``cloud_max`` and mask cloudy pixels (default), keep every
+                scene and mask cloudy pixels, or drop cloudy scenes and keep
+                every pixel of the rest.
+            reflectance: ``'surface'`` (default, Level-2) or ``'toa'``
+                (top-of-atmosphere: Landsat C2 TOA, Sentinel-2 Level-1C; no
+                TM / ETM+ harmonisation).
+            substitute_2012: Fill a window that lies wholly inside 2012 with
+                the same days of 2013 (recorded as ``year_substituted``).
+            preset: Name of the settings preset the run came from, recorded
+                in the sidecar for provenance (nothing recorded when ``None``).
+            end_inclusive: Treat ``end_date`` as the last day to include; the
+                day after it is sent to Earth Engine. The sidecar records both
+                (``end_date``, ``end_date_exclusive``), and the 2012 fill and
+                coverage rescue work on the corrected window.
+
+        Returns:
+            The first statistic's result (``status``, ``tif``, ``geojson``,
+            ``gpkg``, ``meta``, ``sidecar``) with ``reducers`` mapping every
+            statistic to its own result. ``status`` is ``"success"`` only
+            when every statistic succeeded.
         """
+        reducers = normalize_temporal_reducers(temporal_reducers)
+        for name, value, allowed in (
+            ("satellite", satellite, SATELLITES),
+            ("cloud_handling", cloud_handling, CLOUD_HANDLINGS),
+            ("reflectance", reflectance, REFLECTANCES),
+        ):
+            if value not in allowed:
+                raise ValueError(f"{name} must be one of {allowed}, not {value!r}.")
         os.makedirs(folder, exist_ok=True)
 
         if not (
@@ -925,19 +1313,64 @@ class NDVIEngine:
         # ``[scale, 0, x0, 0, -scale, y0]``.
         crs_transform = [float(resolution), 0.0, 0.0, 0.0, -float(resolution), 0.0]
 
-        # 3. Pick the satellite collection. ``auto`` falls back to Landsat
+        # 3. The window as Earth Engine reads it, ``[start, end)``: an
+        # inclusive end moves to the next day. Every later step works on
+        # this half-open window.
+        req_start, req_end = str(start_date), str(end_date)
+        end_exclusive = _shift_day(req_end, 1) if end_inclusive else req_end
+
+        # 3a. Optionally fill a window inside 2012 with the same days of 2013
+        # (no Landsat sensor without scan-line gaps imaged 2012). Applied
+        # before anything is queried, so every date mode gets it.
+        year_substituted = None
+        if substitute_2012:
+            q_start, q_end, shifted = substitute_year(req_start, end_exclusive)
+            if shifted:
+                year_substituted = "2012 → 2013"
+                _log(
+                    "INFO",
+                    f"2012 window {_window_text(req_start, end_exclusive)} "
+                    f"filled with {_window_text(q_start, q_end)}.",
+                )
+            elif _overlaps_year(req_start, end_exclusive, 2012):
+                _log(
+                    "WARN",
+                    f"Window {_window_text(req_start, end_exclusive)} lies only "
+                    "partly in 2012; it is not shifted to 2013.",
+                )
+        else:
+            q_start, q_end = req_start, end_exclusive
+
+        # 4. Pick the satellite collection. ``auto`` falls back to Landsat
         # for ranges that end before Sentinel-2 SR_HARMONIZED started.
-        chosen_satellite = self._pick_satellite(
-            str(start_date), str(end_date), satellite
-        )
-        if chosen_satellite == "landsat":
-            ee_collection_id = self.LANDSAT_MERGED_LABEL
+        chosen_satellite = self._pick_satellite(q_start, q_end, satellite)
+        # ``scene_cmax`` is the scene-level cloud filter (``None`` keeps every
+        # scene); ``pixel_mask`` the per-pixel cloud / shadow / snow mask.
+        scene_cmax = None if cloud_handling == "pixel_only" else cloud_max
+        pixel_mask = cloud_handling != "scene_only"
+        if chosen_satellite in ("landsat", "landsat_no_slc_off"):
+            sensor_set = (
+                "no_slc_off" if chosen_satellite == "landsat_no_slc_off" else "all"
+            )
+            ee_collection_id = self._landsat_label(sensor_set, reflectance)
 
             def _get_col(s, e, cmax):
-                return self.get_collection_landsat(aoi, s, e, cmax)
+                if (sensor_set, reflectance, pixel_mask) == ("all", "surface", True):
+                    return self.get_collection_landsat(aoi, s, e, cmax)
+                return self.get_collection_landsat(
+                    aoi,
+                    s,
+                    e,
+                    cmax,
+                    sensor_set=sensor_set,
+                    reflectance=reflectance,
+                    pixel_mask=pixel_mask,
+                )
 
             def _get_base(s, e):
-                return self._landsat_base(aoi, s, e)
+                return self._landsat_base(
+                    aoi, s, e, sensor_set=sensor_set, reflectance=reflectance
+                )
 
             cloud_field = "CLOUD_COVER"
 
@@ -945,7 +1378,7 @@ class NDVIEngine:
             # ~2013-04, so a window in between is served by Landsat 7 ETM+
             # alone — whose SLC-off striping (since 2003) leaves ~22% gaps a
             # seasonal median can't fully fill.
-            if str(start_date) < "2013-04-11" and str(end_date) > "2012-05-05":
+            if sensor_set == "all" and q_start < "2013-04-11" and q_end > "2012-05-05":
                 _log(
                     "WARN",
                     "Date range lies in the Landsat-7-only era "
@@ -953,17 +1386,20 @@ class NDVIEngine:
                     "NDVI composite.",
                 )
         else:
-            ee_collection_id = self.EE_COLLECTION_ID
+            s2_id = self.EE_COLLECTION_ID
+            if reflectance == "toa":
+                s2_id = self.S2_TOA_COLLECTION_ID
+            ee_collection_id = s2_id
 
             def _get_col(s, e, cmax):
-                return self.get_collection(aoi, s, e, cmax)
+                if (reflectance, pixel_mask) == ("surface", True):
+                    return self.get_collection(aoi, s, e, cmax)
+                return self.get_collection(
+                    aoi, s, e, cmax, reflectance=reflectance, pixel_mask=pixel_mask
+                )
 
             def _get_base(s, e):
-                return (
-                    ee.ImageCollection(self.EE_COLLECTION_ID)
-                    .filterBounds(aoi)
-                    .filterDate(s, e)
-                )
+                return ee.ImageCollection(s2_id).filterBounds(aoi).filterDate(s, e)
 
             cloud_field = "CLOUDY_PIXEL_PERCENTAGE"
 
@@ -971,43 +1407,62 @@ class NDVIEngine:
             "INFO",
             f"Satellite: {chosen_satellite} (collection: {ee_collection_id})",
         )
+        acquisition = (water_mask, cloud_handling, reflectance)
+        if acquisition != (False, "scene_filter", "surface"):
+            _log(
+                "INFO",
+                f"Acquisition: water mask {'on' if water_mask else 'off'}, "
+                f"clouds {cloud_handling}, {reflectance} reflectance.",
+            )
 
-        # 3a. Distinguish "no images in range" vs "all images filtered by
+        def _count(s, e):
+            base = _get_base(s, e)
+            if scene_cmax is not None:
+                base = base.filter(ee.Filter.lt(cloud_field, scene_cmax))
+            return base.size().getInfo()
+
+        # 4a. Distinguish "no images in range" vs "all images filtered by
         # cloud threshold" so the user gets an actionable error.
-        used_start, used_end = str(start_date), str(end_date)
+        used_start, used_end = q_start, q_end
         coverage_widened = False
         n_total = _get_base(used_start, used_end).size().getInfo()
         if n_total == 0:
             suggestion = ""
-            if chosen_satellite == "sentinel2" and used_end < self.S2_COLLECTION_START:
+            if chosen_satellite == "sentinel2" and used_end <= self.S2_COLLECTION_START:
                 suggestion = (
                     f" Sentinel-2 SR_HARMONIZED starts {self.S2_COLLECTION_START}"
                     " — set satellite='landsat' (or 'auto') for earlier dates."
+                )
+            elif (
+                chosen_satellite == "landsat_no_slc_off"
+                and _overlaps_year(used_start, used_end, 2012)
+                and not substitute_2012
+            ):
+                suggestion = (
+                    " Without striped Landsat 7 scenes nothing images 2012 — "
+                    "fill 2012 with 2013, or use all Landsat sensors."
                 )
             return {
                 "status": "error",
                 "message": (
                     f"No {chosen_satellite} images in collection for "
-                    f"{used_start} → {used_end}.{suggestion}"
+                    f"{_window_text(used_start, used_end)}.{suggestion}"
                 ),
             }
         n_cloud_filtered = (
-            _get_base(used_start, used_end)
-            .filter(ee.Filter.lt(cloud_field, cloud_max))
-            .size()
-            .getInfo()
+            _count(used_start, used_end) if scene_cmax is not None else n_total
         )
         if n_cloud_filtered == 0:
             return {
                 "status": "error",
                 "message": (
                     f"All {n_total} {chosen_satellite} image(s) for "
-                    f"{used_start} → {used_end} exceeded the {cloud_max}% cloud "
-                    "threshold. Try raising the cloud max."
+                    f"{_window_text(used_start, used_end)} exceeded the "
+                    f"{cloud_max}% cloud threshold. Try raising the cloud max."
                 ),
             }
 
-        # 3b. Coverage rescue: if too few cloud-free images, widen the date
+        # 4b. Coverage rescue: if too few cloud-free images, widen the date
         # range by ±50 % once and re-query. Single attempt — anything more
         # aggressive belongs in user-controlled config.
         MIN_IMAGES_FOR_COMPOSITE = 3
@@ -1026,18 +1481,14 @@ class NDVIEngine:
                 pad = _timedelta(days=int(span * 0.5))
                 w_start = (s_dt - pad).isoformat()
                 w_end = (e_dt + pad).isoformat()
-                n_widened = (
-                    _get_base(w_start, w_end)
-                    .filter(ee.Filter.lt(cloud_field, cloud_max))
-                    .size()
-                    .getInfo()
-                )
+                n_widened = _count(w_start, w_end)
                 if n_widened > n_cloud_filtered:
                     _log(
                         "WARN",
                         f"Coverage rescue: only {n_cloud_filtered} cloud-free "
-                        f"image(s) in {used_start}→{used_end}, widening to "
-                        f"{w_start}→{w_end} ({n_widened} images).",
+                        f"image(s) in {_window_text(used_start, used_end)}, "
+                        f"widening to {_window_text(w_start, w_end)} "
+                        f"({n_widened} images).",
                     )
                     used_start, used_end = w_start, w_end
                     n_cloud_filtered = n_widened
@@ -1045,18 +1496,25 @@ class NDVIEngine:
             except Exception as e:
                 _log("WARN", f"Coverage rescue skipped: {e}")
 
-        col = _get_col(used_start, used_end, cloud_max)
+        col = _get_col(used_start, used_end, scene_cmax)
+        if water_mask:
+            col = col.map(self._mask_water)
 
         if cancel_callback and cancel_callback():
             return {"status": "cancelled", "message": "Cancelled by user"}
 
-        # Single-band median NDVI composite. ``unmask(-9999)`` paints
-        # cloud-masked / out-of-collection pixels with the sentinel so the
-        # downstream reproject can mask them out instead of bilinear-blending
-        # them with valid neighbours.
-        ndvi_median = col.select("NDVI").median().rename("NDVI").unmask(-9999).clip(aoi)
+        # One single-band composite per temporal statistic. ``unmask(-9999)``
+        # paints cloud-masked / out-of-collection pixels with the sentinel so
+        # the downstream reproject can mask them out instead of
+        # bilinear-blending them with valid neighbours.
+        ndvi = col.select("NDVI")
+        composites = {
+            r: getattr(ndvi, r)().rename("NDVI").unmask(-9999).clip(aoi)
+            for r in reducers
+        }
+        _log("INFO", f"Temporal statistic: {', '.join(reducers)}")
 
-        # 4. Build cluster-aware tile list in true metres. Scattered national
+        # 5. Build cluster-aware tile list in true metres. Scattered national
         # inputs decompose into connected components, and tiles that fall over
         # empty bbox regions (ocean, gaps between provinces) are STRtree-culled
         # before they reach Earth Engine.
@@ -1070,30 +1528,43 @@ class NDVIEngine:
 
         n_clusters = len({t["cluster_id"] for t in tiles})
 
-        # 5. Compute the resume key from the *effective* run parameters
+        # 6. Compute the resume key from the *effective* run parameters
         # (post coverage-rescue date range + post satellite-pick collection).
         # Anchoring the key on what was actually downloaded means a future
         # run that hits the same widened window / Landsat fallback reuses
         # the cache; runs that resolve differently get isolated workspaces.
-        resume_key = _compute_resume_key(
-            geom_for_crs,
-            used_start,
-            used_end,
-            cloud_max,
-            resolution,
-            ee_collection_id,
-        )
+        # Each statistic has its own key, so its tiles are its own entry; an
+        # acquisition option away from its default adds itself to the key.
+        variant = []
+        if water_mask:
+            variant.append(f"water{WATER_OCCURRENCE_MAX}")
+        if cloud_handling != "scene_filter":
+            variant.append(cloud_handling)
+        resume_keys = {
+            r: _compute_resume_key(
+                geom_for_crs,
+                used_start,
+                used_end,
+                "none" if scene_cmax is None else cloud_max,
+                resolution,
+                ee_collection_id,
+                temporal_reducer=r,
+                variant=tuple(variant),
+            )
+            for r in reducers
+        }
+        output_names = {r: ndvi_output_name(output_name, r) for r in reducers}
 
         if n_tiles == 1:
             _log(
                 "INFO",
                 f"Single-tile download ({n_clusters} cluster(s), planar metres).",
             )
-            result = self._download_single(
-                ndvi_median,
+            results = self._download_single(
+                composites,
                 aoi,
                 geometry,
-                output_name,
+                output_names,
                 resolution,
                 folder,
                 export_crs=export_crs,
@@ -1112,12 +1583,11 @@ class NDVIEngine:
                 f"Tiled download: {n_tiles} tiles across {n_clusters} cluster(s) "
                 f"(max {max_tile_size_km} km/tile).",
             )
-            result = self._download_with_tiling(
-                ndvi_median,
+            results = self._download_with_tiling(
+                composites,
                 aoi,
                 tiles,
-                output_name,
-                resolution,
+                {r: (output_names[r], resume_keys[r]) for r in reducers},
                 folder,
                 max_tile_size_km,
                 export_crs=export_crs,
@@ -1125,7 +1595,6 @@ class NDVIEngine:
                 export_crs_name=export_crs_name,
                 crs_transform=crs_transform,
                 n_clusters=n_clusters,
-                resume_key=resume_key,
                 cancel_callback=cancel_callback,
                 ndvi_progress_callback=ndvi_progress_callback,
                 write_geotiff=write_geotiff,
@@ -1138,7 +1607,10 @@ class NDVIEngine:
         # download / notebooks) get the same parameter+CRS audit trail the GVI
         # ``_gvi.json`` provides. Failures and cancellations skip this — the
         # sidecar should only describe outputs that actually landed on disk.
-        if result.get("status") == "success":
+        for r in reducers:
+            result = results[r]
+            if result.get("status") != "success":
+                continue
             raw_meta = result.get("meta")
             result_meta: dict = raw_meta if isinstance(raw_meta, dict) else {}
             tiles_succeeded = int(result_meta.get("tiles", n_tiles))
@@ -1148,7 +1620,7 @@ class NDVIEngine:
             try:
                 sidecar_path = _write_ndvi_sidecar(
                     folder,
-                    output_name,
+                    output_names[r],
                     grid_crs=grid_crs,
                     export_crs=export_crs,
                     export_crs_name=export_crs_name,
@@ -1159,12 +1631,19 @@ class NDVIEngine:
                     tiles_failed=tiles_failed,
                     tiles_resumed=tiles_resumed,
                     failed_tile_refs=failed_refs,
-                    resume_key=resume_key,
+                    resume_key=resume_keys[r],
                     start_date=str(start_date),
                     end_date=str(end_date),
+                    end_date_exclusive=end_exclusive,
                     used_start_date=used_start,
                     used_end_date=used_end,
+                    temporal_reducer=r,
                     coverage_widened=coverage_widened,
+                    year_substituted=year_substituted,
+                    water_mask=water_mask,
+                    cloud_handling=cloud_handling,
+                    reflectance=reflectance,
+                    preset=preset,
                     cloud_max=cloud_max,
                     resolution_m=resolution,
                     max_tile_size_km=max_tile_size_km,
@@ -1177,14 +1656,14 @@ class NDVIEngine:
             except Exception as e:
                 _log("WARN", f"Sidecar write failed (non-fatal): {e}")
 
-        return result
+        return _combine_reducer_results(results)
 
     def _download_single(
         self,
-        ndvi_median,
+        composites: Mapping[str, Any],
         aoi,
         geometry,
-        output_name,
+        output_names: Mapping[str, str],
         resolution,
         folder,
         *,
@@ -1197,8 +1676,20 @@ class NDVIEngine:
         write_geotiff: bool = True,
         write_geojson: bool = True,
         write_geopackage: bool = False,
-    ):
-        """Download NDVI as a single tile (for small areas)."""
+    ) -> dict[str, dict]:
+        """Download NDVI as a single tile (for small areas).
+
+        Several statistics come down as the bands of one export and are split
+        into their own GeoTIFFs, in the downloaded pixel type, so each file
+        holds the values a run of that statistic alone writes. Returns one
+        result per statistic.
+        """
+        reducers = list(composites)
+
+        def _each(status: dict) -> dict[str, dict]:
+            return {r: dict(status) for r in reducers}
+
+        cancelled = {"status": "cancelled", "message": "Cancelled by user"}
         _emit_ndvi_progress(
             ndvi_progress_callback,
             sub_progress=0.05,
@@ -1206,15 +1697,18 @@ class NDVIEngine:
             tiles=(0, 1),
         )
         if cancel_callback and cancel_callback():
-            return {"status": "cancelled", "message": "Cancelled by user"}
-        final_tif = os.path.join(folder, f"{output_name}_ndvi.tif")
-        tmp_tif = final_tif[:-4] + ".tmp.tif"
+            return _each(cancelled)
+        final_tifs = {
+            r: os.path.join(folder, f"{output_names[r]}_ndvi.tif") for r in reducers
+        }
+        tmp_tif = final_tifs[reducers[0]][:-4] + ".tmp.tif"
+        image = _stack_composites(composites, reducers)
 
         try:
 
             def _do_export() -> None:
                 _export_ee_image_to_tif(
-                    ndvi_median,
+                    image,
                     tmp_tif,
                     crs=export_crs,
                     crs_transform=crs_transform,
@@ -1233,11 +1727,16 @@ class NDVIEngine:
             if cancel_callback and cancel_callback():
                 if os.path.exists(tmp_tif):
                     os.remove(tmp_tif)
-                return {"status": "cancelled", "message": "Cancelled by user"}
+                return _each(cancelled)
 
             # Atomic publish: the user-visible final raster only appears
             # once the EE write finished cleanly.
-            os.replace(tmp_tif, final_tif)
+            if len(reducers) == 1:
+                os.replace(tmp_tif, final_tifs[reducers[0]])
+            else:
+                for band, r in enumerate(reducers, start=1):
+                    _extract_band(tmp_tif, band, final_tifs[r])
+                os.remove(tmp_tif)
 
             _emit_ndvi_progress(
                 ndvi_progress_callback,
@@ -1249,11 +1748,51 @@ class NDVIEngine:
         except Exception as e:
             if os.path.exists(tmp_tif):
                 os.remove(tmp_tif)
-            return {"status": "error", "message": f"EE export failed: {str(e)}"}
+            return _each({"status": "error", "message": f"EE export failed: {str(e)}"})
 
         if cancel_callback and cancel_callback():
-            return {"status": "cancelled", "message": "Cancelled by user"}
+            return _each(cancelled)
 
+        span = (0.99 - 0.52) / len(reducers)
+        return {
+            r: self._single_tile_output(
+                final_tifs[r],
+                geometry,
+                output_names[r],
+                folder,
+                export_crs=export_crs,
+                export_distortion=export_distortion,
+                export_crs_name=export_crs_name,
+                cancel_callback=cancel_callback,
+                ndvi_progress_callback=ndvi_progress_callback,
+                write_geotiff=write_geotiff,
+                write_geojson=write_geojson,
+                write_geopackage=write_geopackage,
+                sub_start=0.52 + i * span,
+                sub_end=0.52 + (i + 1) * span,
+            )
+            for i, r in enumerate(reducers)
+        }
+
+    def _single_tile_output(
+        self,
+        final_tif: str,
+        geometry,
+        output_name: str,
+        folder,
+        *,
+        export_crs: str,
+        export_distortion: float,
+        export_crs_name: str,
+        cancel_callback: Callable[[], bool] | None,
+        ndvi_progress_callback: Callable[[Mapping[str, Any]], None] | None,
+        write_geotiff: bool,
+        write_geojson: bool,
+        write_geopackage: bool,
+        sub_start: float,
+        sub_end: float,
+    ) -> dict:
+        """One statistic's single-tile result: metadata and vector samples."""
         try:
             with rasterio.open(final_tif) as src:
                 crs_meta = str(src.crs)
@@ -1277,7 +1816,7 @@ class NDVIEngine:
         if not (write_geojson or write_geopackage):
             _emit_ndvi_progress(
                 ndvi_progress_callback,
-                sub_progress=0.99,
+                sub_progress=sub_end,
                 phase="Finalizing",
             )
             return {
@@ -1298,6 +1837,7 @@ class NDVIEngine:
             if write_geopackage
             else None
         )
+        meta.pop("crs")
         out = self._raster_to_ndvi_points(
             final_tif,
             geometry,
@@ -1305,21 +1845,9 @@ class NDVIEngine:
             gpkg_path=gpkg_path,
             ndvi_progress_callback=ndvi_progress_callback,
             cancel_callback=cancel_callback,
-            sub_start=0.52,
-            sub_end=0.99,
-            meta_extra={
-                "tiles": 1,
-                "tiles_total": 1,
-                "tiles_failed": 0,
-                "tiles_resumed": 0,
-                "failed_tile_refs": [],
-                "n_clusters": 1,
-                "cluster_tiles_dir": None,
-                "cluster_tiles_written": 0,
-                "export_crs": export_crs,
-                "export_crs_name": export_crs_name,
-                "export_distortion": export_distortion,
-            },
+            sub_start=sub_start,
+            sub_end=sub_end,
+            meta_extra=meta,
         )
         if out.get("status") != "success":
             return out
@@ -1435,19 +1963,22 @@ class NDVIEngine:
     def _download_one_tile(
         self,
         tile_spec: dict,
-        ndvi_median,
-        work_dir: str,
-        resolution: int,
+        composites: Mapping[str, Any],
+        reducers: list[str],
+        work_dirs: Mapping[str, str],
         export_crs: str,
         crs_transform: list[float],
         cancel_callback: Callable[[], bool] | None,
     ) -> dict:
-        """Worker: one tile downloaded from EE straight into the planar cache.
+        """Worker: one tile's missing statistics, in one Earth Engine request.
 
         Runs on a ThreadPoolExecutor thread (see :meth:`_download_with_tiling`).
-        Returns ``{success, tile_final, idx, error}``; failures surface as
-        ``success=False`` rather than raising so a single bad tile can't sink
-        the whole batch.
+        ``reducers`` are the statistics this tile has no cache file for; they
+        are stacked as the bands of one image, exported once, and each band is
+        stored in its own statistic's workspace. Returns ``{idx, reducers,
+        tile_files, error}`` with ``tile_files`` mapping each stored statistic
+        to its tile; failures surface as ``error`` rather than raising so a
+        single bad tile can't sink the whole batch, and leave no files.
 
         Tiles stay in the engine's chosen planar CRS — *no* per-tile reproject
         to WGS84 — so all tiles share one snap grid (``crs_transform`` fixes
@@ -1455,25 +1986,36 @@ class NDVIEngine:
         sub-pixel drift. A single final reproject converts the merged planar
         mosaic to WGS84 with explicit nodata.
 
+        Each band is stored as a compact float32 cache tile by
+        :func:`_extract_band`. The request itself keeps Earth Engine's float64
+        encoding: a float32 request comes back with ``-inf`` at edge pixels
+        outside the tile's clip, which would overwrite a neighbour's valid
+        pixels where tiles overlap in the mosaic.
+
         Cancel checks short-circuit at safe boundaries — Earth Engine's HTTP
         call is one blocking step that can't be killed mid-flight, so a
         freshly-cancelled run may still have a few in-flight downloads finish
         and be discarded by the caller.
         """
         idx = int(tile_spec["tile_idx"])
-        tile_geom = tile_spec["tile_geom_4326"]
-        result: dict = {"success": False, "tile_final": None, "idx": idx, "error": None}
+        result: dict = {
+            "idx": idx,
+            "reducers": list(reducers),
+            "tile_files": {},
+            "error": None,
+        }
 
         if cancel_callback and cancel_callback():
             return result
 
-        tile_final = os.path.join(work_dir, f"tile_{idx}.tif")
+        download = os.path.join(work_dirs[reducers[0]], f"tile_{idx}.download.tif")
+        written: dict[str, str] = {}
 
         try:
             self._export_region_adaptive(
-                ndvi_median,
-                tile_geom,
-                tile_final,
+                _stack_composites(composites, reducers),
+                tile_spec["tile_geom_4326"],
+                download,
                 export_crs=export_crs,
                 crs_transform=crs_transform,
                 cancel_callback=cancel_callback,
@@ -1482,21 +2024,28 @@ class NDVIEngine:
             )
 
             if cancel_callback and cancel_callback():
-                if os.path.exists(tile_final):
-                    os.remove(tile_final)
                 return result
 
-            result["success"] = True
-            result["tile_final"] = tile_final
+            for band, r in enumerate(reducers, start=1):
+                tile_final = os.path.join(work_dirs[r], f"tile_{idx}.tif")
+                _extract_band(download, band, tile_final, dtype="float32")
+                written[r] = tile_final
+            result["tile_files"] = written
             return result
         except Exception as e:
-            if os.path.exists(tile_final):
+            for path in written.values():
                 try:
-                    os.remove(tile_final)
+                    os.remove(path)
                 except OSError:
                     pass
             result["error"] = f"{type(e).__name__}: {e}"
             return result
+        finally:
+            if os.path.exists(download):
+                try:
+                    os.remove(download)
+                except OSError:
+                    pass
 
     def _export_region_adaptive(
         self,
@@ -1598,11 +2147,10 @@ class NDVIEngine:
 
     def _download_with_tiling(
         self,
-        ndvi_median,
+        composites: Mapping[str, Any],
         aoi,
         tiles: list[dict],
-        output_name,
-        resolution,
+        outputs: Mapping[str, tuple[str, str]],
         folder,
         max_tile_size_km,
         *,
@@ -1611,14 +2159,13 @@ class NDVIEngine:
         export_crs_name: str = "Web Mercator (legacy)",
         crs_transform: list[float] | None = None,
         n_clusters: int = 1,
-        resume_key: str = "",
         cancel_callback: Callable[[], bool] | None = None,
         ndvi_progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
         write_geotiff: bool = True,
         write_geojson: bool = True,
         write_geopackage: bool = False,
         write_cluster_tiles: bool = False,
-    ):
+    ) -> dict[str, dict]:
         """Download NDVI for a precomputed cluster-aware tile list and mosaic.
 
         ``tiles`` is the output of :func:`geofuse.core.build_planar_tiles` — a list of
@@ -1626,10 +2173,15 @@ class NDVIEngine:
         independently and mosaicked into one GeoTIFF; per-cluster GeoTIFF tile
         outputs are written separately by the cluster-tiles path.
 
-        ``resume_key`` selects the tile workspace; tiles already present from
-        a previous interrupted run with the same key are skipped.
+        ``outputs`` maps each temporal statistic to ``(output_name,
+        resume_key)``. Every statistic has its own cache workspace, so a later
+        run asking for any subset reuses what is on disk; tiles already present
+        from a previous run with the same key are skipped, and a tile missing
+        several statistics fetches them in one request. Returns one result per
+        statistic.
         """
         n_tiles = len(tiles)
+        reducers = list(composites)
         _log(
             "INFO",
             f"Downloading {n_tiles} tile(s) across {n_clusters} cluster(s) "
@@ -1646,247 +2198,329 @@ class NDVIEngine:
         # The cache directory doubles as both the in-progress workspace
         # *and* the cross-run cache: successful runs leave their tiles in
         # place so a future run with the same ``resume_key`` (same area +
-        # date range + cloud max + resolution + collection) reuses every
-        # tile instantly. The cache's LRU + size cap reclaims old entries
-        # when it grows past the configured ceiling.
-        work_dir = self.tile_cache.workspace_dir(resume_key or "scratch")
+        # date range + cloud max + resolution + collection + statistic)
+        # reuses every tile instantly. The cache's LRU + size cap reclaims old
+        # entries when it grows past the configured ceiling. Tiles are float32
+        # with DEFLATE and the floating-point predictor (``_extract_band``);
+        # older float64 tiles stay readable and give identical mosaics.
+        work_dirs = {
+            r: self.tile_cache.workspace_dir(
+                outputs[r][1] or ndvi_output_name("scratch", r)
+            )
+            for r in reducers
+        }
 
         # Resume: any tile already present on disk (and openable as a
-        # rasterio dataset) is reused as-is; only the remainder gets queued
-        # for download. Same lookup whether we're resuming an interrupted
-        # run or hitting a previously-cached one — only the user-facing log
-        # message differs.
-        existing_tile_files, pending_tiles = _discover_resumable_tiles(work_dir, tiles)
-        n_resumed = len(existing_tile_files)
-        if n_resumed:
-            _log(
-                "INFO",
-                f"Resumed {n_resumed}/{n_tiles} tile(s) from previous run "
-                f"({work_dir}).",
+        # rasterio dataset) is reused as-is; only the statistics a tile is
+        # missing get queued for download. Same lookup whether we're resuming
+        # an interrupted run or hitting a previously-cached one — only the
+        # user-facing log message differs.
+        tile_files: dict[str, list[str]] = {r: [] for r in reducers}
+        n_resumed: dict[str, int] = {}
+        missing: dict[int, list[str]] = {}
+        for r in reducers:
+            existing, pending = _discover_resumable_tiles(work_dirs[r], tiles)
+            tile_files[r].extend(existing)
+            n_resumed[r] = len(existing)
+            for ts in pending:
+                missing.setdefault(int(ts["tile_idx"]), []).append(r)
+            if existing:
+                which = "" if len(reducers) == 1 else f" ({r})"
+                _log(
+                    "INFO",
+                    f"Resumed {len(existing)}/{n_tiles} tile(s){which} from "
+                    f"previous run ({work_dirs[r]}).",
+                )
+        pending_tiles = [ts for ts in tiles if int(ts["tile_idx"]) in missing]
+
+        # Tiles that exhausted the retry budget, per statistic. Recorded with
+        # their ``cluster_id`` / ``tile_idx`` / final error so the sidecar can
+        # surface exactly which areas are NaN gaps in the mosaic.
+        failed_tile_refs: dict[str, list[dict]] = {r: [] for r in reducers}
+
+        # Parallel tile downloads. Each worker handles one tile end-to-end
+        # (Earth Engine export → compact cache tiles). The ThreadPoolExecutor
+        # caps concurrency at ``_MAX_CONCURRENT_TILES`` so we don't saturate
+        # local sockets or oversubscribe EE per-user. Progress emits are
+        # throttled to every :data:`NDVI_PROGRESS_MIN_TILES` tiles so the UI
+        # bracket stays responsive without slamming the JobStore lock on
+        # big runs.
+        done_count = n_tiles - len(pending_tiles)
+        _tile_throttle = ProgressThrottle(min_items=NDVI_PROGRESS_MIN_TILES)
+
+        def _emit_progress(k: int) -> None:
+            if not _tile_throttle.should_emit(k, final=k >= n_tiles):
+                return
+            _emit_ndvi_progress(
+                ndvi_progress_callback,
+                sub_progress=0.70 * k / n_tiles if n_tiles else 0.0,
+                phase="Downloading tiles",
+                tiles=(k, n_tiles),
             )
 
-        tile_files: list[str] = list(existing_tile_files)
-        # Tiles that exhausted the retry budget. Recorded with their
-        # ``cluster_id`` / ``tile_idx`` / final error so the sidecar can
-        # surface exactly which areas are NaN gaps in the mosaic.
-        failed_tile_refs: list[dict] = []
-        mosaic_ok = False
-        final_tif = os.path.join(folder, f"{output_name}_ndvi.tif")
+        # Show the resumed count immediately so the bracket jumps to the
+        # right starting point instead of flashing 0/N.
+        _emit_progress(done_count)
 
-        try:
-            # Parallel tile downloads. Each worker handles one tile end-to-end
-            # (Earth Engine export → reproject to WGS84). The ThreadPoolExecutor
-            # caps concurrency at ``_MAX_CONCURRENT_TILES`` so we don't saturate
-            # local sockets or oversubscribe EE per-user. Progress emits are
-            # throttled to every :data:`NDVI_PROGRESS_MIN_TILES` tiles so the UI
-            # bracket stays responsive without slamming the JobStore lock on
-            # big runs.
-            done_count = n_resumed
-            _tile_throttle = ProgressThrottle(min_items=NDVI_PROGRESS_MIN_TILES)
-
-            def _emit_progress(k: int) -> None:
-                if not _tile_throttle.should_emit(k, final=k >= n_tiles):
-                    return
-                _emit_ndvi_progress(
-                    ndvi_progress_callback,
-                    sub_progress=0.70 * k / n_tiles if n_tiles else 0.0,
-                    phase="Downloading tiles",
-                    tiles=(k, n_tiles),
-                )
-
-            # Show the resumed count immediately so the bracket jumps to the
-            # right starting point instead of flashing 0/N.
-            _emit_progress(n_resumed)
-
-            with ThreadPoolExecutor(
-                max_workers=_MAX_CONCURRENT_TILES,
-                thread_name_prefix="ndvi-tile",
-            ) as pool:
-                futures = {
-                    pool.submit(
-                        self._download_one_tile,
-                        ts,
-                        ndvi_median,
-                        work_dir,
-                        resolution,
-                        export_crs,
-                        crs_transform,
-                        cancel_callback,
-                    ): ts
-                    for ts in pending_tiles
-                }
-                cancelled = False
-                for fut in as_completed(futures):
-                    res = fut.result()
-                    done_count += 1
-                    if res["success"] and res["tile_final"] is not None:
-                        tile_files.append(res["tile_final"])
-                    elif res.get("error"):
-                        tile_spec = futures[fut]
-                        failed_tile_refs.append(
+        cancelled = False
+        with ThreadPoolExecutor(
+            max_workers=_MAX_CONCURRENT_TILES,
+            thread_name_prefix="ndvi-tile",
+        ) as pool:
+            futures = {
+                pool.submit(
+                    self._download_one_tile,
+                    ts,
+                    composites,
+                    missing[int(ts["tile_idx"])],
+                    work_dirs,
+                    export_crs,
+                    crs_transform,
+                    cancel_callback,
+                ): ts
+                for ts in pending_tiles
+            }
+            for fut in as_completed(futures):
+                res = fut.result()
+                done_count += 1
+                for r, path in res["tile_files"].items():
+                    tile_files[r].append(path)
+                if res.get("error"):
+                    tile_spec = futures[fut]
+                    for r in res["reducers"]:
+                        failed_tile_refs[r].append(
                             {
                                 "cluster_id": int(tile_spec["cluster_id"]),
                                 "tile_idx": int(res["idx"]),
                                 "error": str(res["error"]),
                             }
                         )
-                        _log(
-                            "WARN",
-                            f"Tile {res['idx'] + 1} failed after retry: "
-                            f"{res['error']}",
-                        )
-                    _emit_progress(done_count)
-                    if cancel_callback and cancel_callback():
-                        cancelled = True
-                        # Cancel any not-yet-running futures; in-flight tiles
-                        # finish on their own (EE export is one blocking call,
-                        # we can't kill it mid-flight) and their results are
-                        # discarded.
-                        for f in futures:
-                            if not f.done():
-                                f.cancel()
-                        break
+                    _log(
+                        "WARN",
+                        f"Tile {res['idx'] + 1} failed after retry: " f"{res['error']}",
+                    )
+                _emit_progress(done_count)
+                if cancel_callback and cancel_callback():
+                    cancelled = True
+                    # Cancel any not-yet-running futures; in-flight tiles
+                    # finish on their own (EE export is one blocking call,
+                    # we can't kill it mid-flight) and their results are
+                    # discarded.
+                    for f in futures:
+                        if not f.done():
+                            f.cancel()
+                    break
 
-            if cancelled or (cancel_callback and cancel_callback()):
-                return {"status": "cancelled", "message": "Cancelled by user"}
+        if cancelled or (cancel_callback and cancel_callback()):
+            for r in reducers:
+                _log("INFO", f"Tile workspace preserved for resume: {work_dirs[r]}")
+            return {
+                r: {"status": "cancelled", "message": "Cancelled by user"}
+                for r in reducers
+            }
 
-            if not tile_files:
-                return {"status": "error", "message": "All tiles failed to download"}
+        # Each statistic is mosaicked in turn, in its own share of the
+        # progress bar after the shared download.
+        share = (0.99 - 0.70) / len(reducers)
+        results: dict[str, dict] = {}
+        for i, r in enumerate(reducers):
 
-            if failed_tile_refs:
-                _log(
-                    "WARN",
-                    f"{len(failed_tile_refs)}/{n_tiles} tile(s) failed after retry "
-                    "— mosaic will have NaN gaps in those areas. "
-                    "See sidecar JSON for the cluster/tile IDs.",
-                )
+            def _at(x: float, lo: float = 0.70 + i * share) -> float:
+                return lo + (x - 0.70) / (0.99 - 0.70) * share
 
-            _log(
-                "OK",
-                f"Successfully downloaded {len(tile_files)}/{n_tiles} tiles. "
-                "Mosaicking...",
+            output_name, resume_key = outputs[r]
+            results[r] = self._finish_tiled_output(
+                tile_files[r],
+                failed_tile_refs[r],
+                n_resumed[r],
+                tiles,
+                work_dirs[r],
+                resume_key,
+                output_name,
+                folder,
+                label="" if len(reducers) == 1 else f" ({r})",
+                progress_at=_at,
+                n_clusters=n_clusters,
+                export_crs=export_crs,
+                export_distortion=export_distortion,
+                export_crs_name=export_crs_name,
+                cancel_callback=cancel_callback,
+                ndvi_progress_callback=ndvi_progress_callback,
+                write_geotiff=write_geotiff,
+                write_geojson=write_geojson,
+                write_geopackage=write_geopackage,
+                write_cluster_tiles=write_cluster_tiles,
             )
 
-            if cancel_callback and cancel_callback():
-                return {"status": "cancelled", "message": "Cancelled by user"}
+        # Trim the cache once every statistic's workspace has been recorded,
+        # so a sibling workspace this run still needs is never the oldest.
+        if any(res.get("status") == "success" for res in results.values()):
+            try:
+                n_evicted, bytes_freed = self.tile_cache.evict_lru()
+                if n_evicted:
+                    _log(
+                        "INFO",
+                        f"Tile cache: evicted {n_evicted} LRU entry/entries "
+                        f"({bytes_freed / 1024**2:.0f} MB) to stay under cap.",
+                    )
+            except Exception as e:
+                _log("WARN", f"Tile cache bookkeeping failed: {e}")
+        return results
+
+    def _finish_tiled_output(
+        self,
+        tile_files: list[str],
+        failed_tile_refs: list[dict],
+        n_resumed: int,
+        tiles: list[dict],
+        work_dir: str,
+        resume_key: str,
+        output_name: str,
+        folder,
+        *,
+        label: str,
+        progress_at: Callable[[float], float],
+        n_clusters: int,
+        export_crs: str,
+        export_distortion: float,
+        export_crs_name: str,
+        cancel_callback: Callable[[], bool] | None,
+        ndvi_progress_callback: Callable[[Mapping[str, Any]], None] | None,
+        write_geotiff: bool,
+        write_geojson: bool,
+        write_geopackage: bool,
+        write_cluster_tiles: bool,
+    ) -> dict:
+        """Mosaic one statistic's tiles into its outputs.
+
+        Progress values are those of a single-statistic run, mapped into this
+        statistic's share of the bar by ``progress_at``. A successful mosaic
+        records the workspace in the cache index; the caller evicts.
+        """
+        n_tiles = len(tiles)
+        final_tif = os.path.join(folder, f"{output_name}_ndvi.tif")
+
+        if not tile_files:
+            _log("INFO", f"Tile workspace preserved for resume: {work_dir}")
+            return {"status": "error", "message": "All tiles failed to download"}
+
+        if failed_tile_refs:
+            _log(
+                "WARN",
+                f"{len(failed_tile_refs)}/{n_tiles} tile(s){label} failed after "
+                "retry — mosaic will have NaN gaps in those areas. "
+                "See sidecar JSON for the cluster/tile IDs.",
+            )
+
+        _log(
+            "OK",
+            f"Successfully downloaded {len(tile_files)}/{n_tiles} tiles{label}. "
+            "Mosaicking...",
+        )
+
+        if cancel_callback and cancel_callback():
+            _log("INFO", f"Tile workspace preserved for resume: {work_dir}")
+            return {"status": "cancelled", "message": "Cancelled by user"}
+
+        _emit_ndvi_progress(
+            ndvi_progress_callback,
+            sub_progress=progress_at(0.72),
+            phase="Mosaicking rasters",
+            tiles=(0, len(tile_files)),
+            clear_bracket=True,
+        )
+
+        # Stream-mosaic the per-tile rasters in their shared planar CRS
+        # straight into the user-facing GeoTIFF. Tile boundaries are
+        # pixel-aligned because every EE export was anchored to the same
+        # crs_transform; mosaic memory never holds more than one tile.
+        try:
+
+            def _mosaic_progress(k: int, n: int) -> None:
+                span = 0.80 - 0.72
+                _emit_ndvi_progress(
+                    ndvi_progress_callback,
+                    sub_progress=progress_at(0.72 + (span * k / n if n else 0.0)),
+                    phase="Mosaicking rasters",
+                    tiles=(k, n),
+                )
+
+            stream_mosaic_to_geotiff(
+                tile_files,
+                final_tif,
+                nodata=-9999,
+                progress_cb=_mosaic_progress,
+                build_overviews=False,
+                compress=True,
+                dst_dtype="float32",
+            )
 
             _emit_ndvi_progress(
                 ndvi_progress_callback,
-                sub_progress=0.72,
+                sub_progress=progress_at(0.80),
                 phase="Mosaicking rasters",
-                tiles=(0, len(tile_files)),
-                clear_bracket=True,
             )
+            _log("OK", f"Mosaic complete: {final_tif}")
 
-            # Stream-mosaic the per-tile rasters in their shared planar
-            # CRS straight into the user-facing GeoTIFF. Tile boundaries
-            # are pixel-aligned because every EE export was anchored to
-            # the same crs_transform; mosaic memory never holds more than
-            # one tile.
+        except Exception as e:
+            _log(
+                "ERROR",
+                f"Mosaic step failed with traceback:\n{traceback.format_exc()}",
+            )
+            _log("INFO", f"Tile workspace preserved for resume: {work_dir}")
+            return {"status": "error", "message": f"Mosaic failed: {str(e)}"}
+
+        # Per-cluster GeoTIFF tiles + tiles_index.json. Best-effort: main
+        # mosaic already succeeded, so per-cluster failures log a WARN rather
+        # than failing the whole run.
+        cluster_tiles_dir: str | None = None
+        cluster_tiles_written = 0
+        if write_cluster_tiles:
+            cluster_tiles_dir = os.path.join(folder, f"{output_name}_ndvi_tiles")
+            _emit_ndvi_progress(
+                ndvi_progress_callback,
+                sub_progress=progress_at(0.82),
+                phase="Writing per-cluster tiles",
+            )
             try:
-
-                def _mosaic_progress(k: int, n: int) -> None:
-                    span = 0.80 - 0.72
-                    _emit_ndvi_progress(
-                        ndvi_progress_callback,
-                        sub_progress=0.72 + (span * k / n if n else 0.0),
-                        phase="Mosaicking rasters",
-                        tiles=(k, n),
-                    )
-
-                stream_mosaic_to_geotiff(
-                    tile_files,
-                    final_tif,
-                    nodata=-9999,
-                    progress_cb=_mosaic_progress,
-                    build_overviews=False,
-                    compress=True,
-                    dst_dtype="float32",
+                entries = self._write_per_cluster_outputs(
+                    work_dir,
+                    tiles,
+                    failed_tile_refs,
+                    cluster_tiles_dir,
+                    export_crs,
+                    export_crs_name,
+                    resume_key,
                 )
-
-                _emit_ndvi_progress(
-                    ndvi_progress_callback,
-                    sub_progress=0.80,
-                    phase="Mosaicking rasters",
-                )
-                _log("OK", f"Mosaic complete: {final_tif}")
-                mosaic_ok = True
-
-            except Exception as e:
                 _log(
-                    "ERROR",
-                    f"Mosaic step failed with traceback:\n{traceback.format_exc()}",
+                    "OK",
+                    f"Wrote {len(entries)} per-cluster tile(s) to "
+                    f"{cluster_tiles_dir}",
                 )
-                return {"status": "error", "message": f"Mosaic failed: {str(e)}"}
-
-            # Per-cluster GeoTIFF tiles + tiles_index.json. Best-effort:
-            # main mosaic already succeeded, so per-cluster failures log
-            # a WARN rather than failing the whole run.
-            if write_cluster_tiles:
-                cluster_tiles_dir = os.path.join(folder, f"{output_name}_ndvi_tiles")
-                _emit_ndvi_progress(
-                    ndvi_progress_callback,
-                    sub_progress=0.82,
-                    phase="Writing per-cluster tiles",
-                )
-                try:
-                    entries = self._write_per_cluster_outputs(
-                        work_dir,
-                        tiles,
-                        failed_tile_refs,
-                        cluster_tiles_dir,
-                        export_crs,
-                        export_crs_name,
-                        resume_key,
-                    )
-                    _log(
-                        "OK",
-                        f"Wrote {len(entries)} per-cluster tile(s) to "
-                        f"{cluster_tiles_dir}",
-                    )
-                    cluster_tiles_written = len(entries)
-                except Exception as e:
-                    _log("WARN", f"Per-cluster tile output failed: {e}")
-                    cluster_tiles_dir = None
-                    cluster_tiles_written = 0
-            else:
+                cluster_tiles_written = len(entries)
+            except Exception as e:
+                _log("WARN", f"Per-cluster tile output failed: {e}")
                 cluster_tiles_dir = None
-                cluster_tiles_written = 0
 
-        finally:
-            if work_dir and os.path.isdir(work_dir):
-                if mosaic_ok and resume_key:
-                    # Don't delete the workspace — it's the persistent cache
-                    # now. Record the on-disk footprint + access time so the
-                    # LRU eviction has correct numbers, then trim to the cap.
-                    _emit_ndvi_progress(
-                        ndvi_progress_callback,
-                        sub_progress=0.86,
-                        phase="Updating tile cache",
-                    )
-                    try:
-                        self.tile_cache.touch(resume_key)
-                        n_evicted, bytes_freed = self.tile_cache.evict_lru()
-                        if n_evicted:
-                            _log(
-                                "INFO",
-                                f"Tile cache: evicted {n_evicted} LRU entry/entries "
-                                f"({bytes_freed / 1024**2:.0f} MB) to stay under cap.",
-                            )
-                    except Exception as e:
-                        _log("WARN", f"Tile cache bookkeeping failed: {e}")
-                elif not mosaic_ok:
-                    _log(
-                        "INFO",
-                        f"Tile workspace preserved for resume: {work_dir}",
-                    )
+        # Don't delete the workspace — it's the persistent cache now. Record
+        # the on-disk footprint + access time so the LRU eviction has correct
+        # numbers.
+        if resume_key:
+            _emit_ndvi_progress(
+                ndvi_progress_callback,
+                sub_progress=progress_at(0.86),
+                phase="Updating tile cache",
+            )
+            try:
+                self.tile_cache.touch(resume_key)
+            except Exception as e:
+                _log("WARN", f"Tile cache bookkeeping failed: {e}")
 
         if cancel_callback and cancel_callback():
             return {"status": "cancelled", "message": "Cancelled by user"}
 
-        n_mosaic_tiles = len(tile_files)
         meta_base: dict[str, Any] = {
-            "tiles": n_mosaic_tiles,
+            "tiles": len(tile_files),
             "tiles_total": n_tiles,
             "tiles_failed": len(failed_tile_refs),
             "tiles_resumed": n_resumed,
@@ -1899,16 +2533,16 @@ class NDVIEngine:
             "export_crs_name": export_crs_name,
             "export_distortion": export_distortion,
         }
-        try:
-            with rasterio.open(final_tif) as src:
-                meta_base["crs"] = str(src.crs)
-        except Exception:
-            meta_base["crs"] = export_crs
 
         if not (write_geojson or write_geopackage):
+            try:
+                with rasterio.open(final_tif) as src:
+                    meta_base["crs"] = str(src.crs)
+            except Exception:
+                meta_base["crs"] = export_crs
             _emit_ndvi_progress(
                 ndvi_progress_callback,
-                sub_progress=0.99,
+                sub_progress=progress_at(0.99),
                 phase="Finalizing",
             )
             return {
@@ -1936,22 +2570,9 @@ class NDVIEngine:
             gpkg_path=gpkg_path,
             ndvi_progress_callback=ndvi_progress_callback,
             cancel_callback=cancel_callback,
-            sub_start=0.88,
-            sub_end=0.99,
-            meta_extra={
-                "tiles": n_mosaic_tiles,
-                "tiles_total": n_tiles,
-                "tiles_failed": len(failed_tile_refs),
-                "tiles_resumed": n_resumed,
-                "failed_tile_refs": failed_tile_refs,
-                "n_clusters": n_clusters,
-                "resume_key": resume_key,
-                "cluster_tiles_dir": cluster_tiles_dir,
-                "cluster_tiles_written": cluster_tiles_written,
-                "export_crs": export_crs,
-                "export_crs_name": export_crs_name,
-                "export_distortion": export_distortion,
-            },
+            sub_start=progress_at(0.88),
+            sub_end=progress_at(0.99),
+            meta_extra=meta_base,
         )
         if out.get("status") != "success":
             return out

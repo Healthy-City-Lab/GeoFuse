@@ -335,6 +335,12 @@ def _write_fusion_outputs(
                     "peak_radius_width_vs_prior": (
                         _f(peak_ratio[i]) if has_grid and i < len(peak_ratio) else None
                     ),
+                    "radius_prior": summ.get("radius_prior") if has_grid else None,
+                    "ladder": (
+                        (summ.get("ladder_spacing") or {}).get(name)
+                        if has_grid
+                        else None
+                    ),
                     **dec,
                     "aggregators_separated": (
                         ";".join(informative[i])
@@ -719,6 +725,36 @@ def _write_fusion_outputs(
     return written
 
 
+def write_entity_table(engine: Any, composite_df: pd.DataFrame, stem: str) -> str:
+    """Write one row per target entity — sampled channels and the composite.
+
+    Polygon targets join on ``polygon_id`` to their polygons, a target with
+    one row per composite row takes its columns, and anything else is written
+    without geometry. Returns the path: ``{stem}.gpkg`` (layer ``cgi``) or
+    ``{stem}.csv``.
+    """
+    polygons = getattr(engine, "target_polygons_gdf", None)
+    target = getattr(engine, "target_gdf", None)
+    table = None
+    if "polygon_id" in composite_df.columns and polygons is not None:
+        polys = polygons.reset_index(drop=True).copy()
+        polys["polygon_id"] = polys.index
+        table = polys[["geometry", "polygon_id"]].merge(
+            composite_df, on="polygon_id", how="inner"
+        )
+    elif target is not None and len(target) == len(composite_df):
+        table = target.reset_index(drop=True).copy()
+        for col in composite_df.columns:
+            table[col] = composite_df[col].reset_index(drop=True).values
+    if table is not None:
+        path = f"{stem}.gpkg"
+        table.to_file(path, driver="GPKG", layer="cgi")
+        return path
+    path = f"{stem}.csv"
+    composite_df.to_csv(path, index=False)
+    return path
+
+
 def _log_stage_timing(ledger: StageLedger, log: Any) -> None:
     """Log where the run spent its wall clock, longest stage first.
 
@@ -869,6 +905,8 @@ def _posterior_summary(params: dict) -> dict:
         "divergences": post.get("divergences"),
         # The grid axes the posterior estimated rather than the sweep picked.
         "radius_kernel": post.get("radius_kernel"),
+        "radius_prior": post.get("radius_prior", "rungs"),
+        "ladder_spacing": post.get("ladder_spacing"),
         "radii": post.get("radii"),
         "radius_profile": post.get("radius_profile"),
         "projected_pick": post.get("projected_pick"),

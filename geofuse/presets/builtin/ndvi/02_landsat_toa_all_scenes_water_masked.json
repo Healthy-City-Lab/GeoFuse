@@ -1,0 +1,39 @@
+{
+  "format": "geofuse-preset",
+  "version": 1,
+  "engine": "ndvi",
+  "name": "Landsat TOA, all scenes, water-masked",
+  "description": "Landsat 5, Landsat 7 before its 2003 scan-line failure, and Landsat 8; top-of-atmosphere reflectance; every scene kept with cloudy pixels masked; pixels covered by water at least half the time masked; 2012 windows filled from 2013; 30 m; no coverage rescue; mean and maximum composites in every date mode; growing season May-September in the per-year mode.",
+  "created": "2026-10-11",
+  "geofuse_version": "builtin",
+  "settings": {
+    "satellite": "landsat_no_slc_off",
+    "reflectance": "toa",
+    "cloud_handling": "pixel_only",
+    "cloud_max": 10,
+    "resolution_m": 30,
+    "buffer_m": 0,
+    "coverage_rescue": false,
+    "water_mask": true,
+    "substitute_2012": true,
+    "save_geotiff": true,
+    "save_gpkg": false,
+    "save_geojson": false,
+    "save_cluster_tiles": false,
+    "statistics_ranges": [
+      "mean",
+      "max"
+    ],
+    "statistics_specific": [
+      "mean",
+      "max"
+    ],
+    "statistics_column": [
+      "mean",
+      "max"
+    ],
+    "season_start_month": 5,
+    "season_end_month": 9,
+    "specific_window_days": 30
+  }
+}

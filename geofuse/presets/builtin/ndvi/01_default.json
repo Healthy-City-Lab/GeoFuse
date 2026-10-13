@@ -1,0 +1,36 @@
+{
+  "format": "geofuse-preset",
+  "version": 1,
+  "engine": "ndvi",
+  "name": "Default",
+  "description": "The tab's own defaults: Sentinel-2 from 2017-03-28 and Landsat before, surface reflectance, cloudy scenes dropped and cloudy pixels masked, water kept, 10 m, median composite, coverage rescue on.",
+  "created": "2026-10-11",
+  "geofuse_version": "builtin",
+  "settings": {
+    "satellite": "auto",
+    "reflectance": "surface",
+    "cloud_handling": "scene_filter",
+    "cloud_max": 10,
+    "resolution_m": 10,
+    "buffer_m": 0,
+    "coverage_rescue": true,
+    "water_mask": false,
+    "substitute_2012": false,
+    "save_geotiff": true,
+    "save_gpkg": false,
+    "save_geojson": false,
+    "save_cluster_tiles": false,
+    "statistics_ranges": [
+      "median"
+    ],
+    "statistics_specific": [
+      "median"
+    ],
+    "statistics_column": [
+      "median"
+    ],
+    "season_start_month": 6,
+    "season_end_month": 9,
+    "specific_window_days": 30
+  }
+}

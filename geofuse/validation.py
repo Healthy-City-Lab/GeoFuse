@@ -209,6 +209,7 @@ def _replicate(task) -> dict:
         picked=res.picked,
         radius_kernel=cfg["radius_kernel"],
         aggregator=cfg["aggregator"],
+        radius_prior=cfg.get("radius_prior", "rungs"),
         draws=cfg["draws"],
         warmup=cfg["warmup"],
         chains=cfg["chains"],
@@ -368,7 +369,7 @@ def plasmode_recovery(
     ``covariates`` the real covariate matrix, both unchanged. ``reps`` runs per
     scenario and effect size; ``S0`` runs once, at no effect. ``pipeline_kwargs``
     overrides :data:`LIGHT_SETTINGS` and may set ``radius_kernel`` /
-    ``aggregator``. Returns ``{"settings", "table", "replicates"}``; the
+    ``aggregator`` / ``radius_prior``. Returns ``{"settings", "table", "replicates"}``; the
     settings record every light setting used.
     """
     X = np.ascontiguousarray(np.asarray(X, dtype=np.float64))
@@ -381,6 +382,7 @@ def plasmode_recovery(
         **LIGHT_SETTINGS,
         "radius_kernel": "lognormal",
         "aggregator": "dirichlet",
+        "radius_prior": "rungs",
         **(pipeline_kwargs or {}),
     }
     cfg.update(

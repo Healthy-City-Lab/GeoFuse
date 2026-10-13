@@ -1,0 +1,59 @@
+/* geofuse watch: the job table on top, details and the log below. */
+
+#jobs {
+    height: auto;
+    max-height: 50%;
+    min-height: 4;
+}
+
+#lower {
+    height: 1fr;
+}
+
+#details {
+    width: 2fr;
+    border: round $primary;
+    border-title-color: $primary;
+    padding: 0 1;
+}
+
+#log {
+    width: 3fr;
+    border: round $secondary;
+    border-title-color: $secondary;
+}
+
+#lower.log-only #details {
+    display: none;
+}
+
+#filter {
+    dock: bottom;
+    display: none;
+}
+
+#filter.shown {
+    display: block;
+}
+
+ConfirmScreen {
+    align: center middle;
+}
+
+#confirm {
+    width: 64;
+    height: auto;
+    border: thick $error;
+    background: $surface;
+    padding: 1 2;
+}
+
+#confirm-buttons {
+    height: auto;
+    align: center middle;
+    margin-top: 1;
+}
+
+#confirm-buttons Button {
+    margin: 0 1;
+}

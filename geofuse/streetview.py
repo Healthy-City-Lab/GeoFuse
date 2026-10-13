@@ -2,8 +2,8 @@
 Minimal Google Street View client for GeoFuse.
 
 Adapted from `streetlevel <https://github.com/sk-zk/streetlevel>`_ (MIT
-License) — only the parts needed for radius-based panorama search and
-equirectangular image download.
+License) — only the parts needed to find the panorama nearest a point and
+download its equirectangular image, all without an API key.
 
 Why a custom port rather than ``pip install streetlevel``: the upstream
 package pulls in ``pyfrpc``, ``bd09convertor``, ``CoordinatesConverter``,
@@ -15,14 +15,15 @@ EXIF-writing modules.
 Public surface
 --------------
 ``find_panorama`` / ``find_panorama_async``
-    Search for the nearest panorama within a radius, returning a
-    :class:`StreetViewPanorama` or ``None``.
+    The nearest panorama within a radius (from Google's coverage tiles, then
+    its metadata), as a :class:`StreetViewPanorama` or ``None``.
 
 ``get_panorama`` / ``get_panorama_async``
     Download tiles in parallel and return a stitched PIL image.
 
-``download_panorama`` / ``download_panorama_async``
-    Same as ``get_panorama`` but writes directly to a JPEG file.
+``find_panorama_api_async`` / ``get_panorama_api_async``
+    The same two steps through Google's keyed, billed Street View tile API
+    (Map Tiles API), for runs given an API key.
 
 ``StreetViewPanorama``
     Lightweight dataclass with the minimum fields needed to download tiles
@@ -36,6 +37,7 @@ import io
 import itertools
 import json
 import math
+import time
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
@@ -64,6 +66,21 @@ class RateLimitedError(RuntimeError):
 
 #: Statuses that mean "you are being throttled", not "no data".
 _RATE_LIMIT_STATUSES = frozenset({403, 429, 503})
+
+
+class ServiceRetired(RuntimeError):
+    """A Street View endpoint no longer answers in the form this client reads."""
+
+    def __init__(self, message: str):
+        super().__init__(
+            "Google's Street View service no longer answers as the GVI "
+            f"downloader expects ({message}); GVI cannot sample new points until "
+            "the downloader is updated."
+        )
+
+
+#: A place with Street View coverage, for checking that the search answers.
+PROBE_POINT = (40.7580, -73.9855)
 
 
 @dataclass
@@ -97,6 +114,30 @@ class PanoCapture:
     month: int | None
 
 
+def in_month_window(month: int | None, window: tuple[int, int]) -> bool:
+    """Whether ``month`` lies in the inclusive window ``(first, last)``.
+
+    ``first > last`` wraps over the new year (``(11, 3)`` is November to
+    March). An unknown month is never inside.
+    """
+    if month is None:
+        return False
+    first, last = int(window[0]), int(window[1])
+    if first <= last:
+        return first <= month <= last
+    return month >= first or month <= last
+
+
+def month_distance(month: int | None, window: tuple[int, int]) -> float:
+    """Months between ``month`` and the window's middle, around the year."""
+    if month is None:
+        return float("inf")
+    first, last = int(window[0]), int(window[1])
+    middle = first + ((last - first) % 12) / 2.0
+    gap = abs((month - middle) % 12)
+    return min(gap, 12 - gap)
+
+
 @dataclass
 class StreetViewPanorama:
     """Minimal Street View panorama metadata: ID, location, image grid.
@@ -119,27 +160,45 @@ class StreetViewPanorama:
         return is_third_party_panoid(self.id)
 
     def select_capture(
-        self, target_year: int, max_year_diff: int | None = None
+        self,
+        target_year: int | None,
+        max_year_diff: int | None = None,
+        *,
+        month_window: tuple[int, int] | None = None,
+        month_policy: str = "exclude",
     ) -> PanoCapture | None:
-        """Pick the capture closest to ``target_year``.
+        """Pick the capture closest to ``target_year``, or the most recent one.
 
         When ``max_year_diff`` is given, captures further than that many years
         from the target are filtered out first; if none survive the filter,
         returns ``None``. Ties resolve to the most recent capture.
+
+        ``month_window = (first, last)`` (inclusive months; ``first > last``
+        wraps over the new year) restricts the season: ``"exclude"`` drops
+        captures outside it, and captures with no month, before the year rule;
+        ``"prefer"`` ranks captures inside it first and falls back to the rest
+        only when none is inside. With a window, captures of the same year are
+        ranked by their distance from the window's middle month instead of by
+        recency. ``target_year=None`` means the most recent capture. Without a
+        window the choice is exactly the one made before windows existed.
         """
         caps = self.captures
         if not caps:
             # No temporal metadata was parsed. A hard window can't be
             # verified against an unknown date, so decline it; otherwise fall
             # back to this panorama itself.
-            if max_year_diff is not None:
+            if max_year_diff is not None and target_year is not None:
                 return None
             if self.date is not None:
-                return PanoCapture(self.id, self.date[0], self.date[1])
-            return PanoCapture(self.id, None, None)
+                own = PanoCapture(self.id, self.date[0], self.date[1])
+            else:
+                own = PanoCapture(self.id, None, None)
+            if month_window is None or month_policy == "prefer":
+                return own
+            return own if in_month_window(own.month, month_window) else None
 
         candidates = caps
-        if max_year_diff is not None:
+        if max_year_diff is not None and target_year is not None:
             candidates = [
                 c
                 for c in caps
@@ -147,9 +206,32 @@ class StreetViewPanorama:
             ]
         if not candidates:
             return None
+        if month_window is None:
+            if target_year is None:
+                return max(candidates, key=lambda c: (c.year or 0, c.month or 0))
+            return min(
+                candidates,
+                key=lambda c: (abs(c.year - target_year), -c.year, -(c.month or 0)),
+            )
+
+        inside = [c for c in candidates if in_month_window(c.month, month_window)]
+        if inside or month_policy == "exclude":
+            candidates = inside
+        if not candidates:
+            return None
+
+        def season(c: PanoCapture) -> float:
+            return month_distance(c.month, month_window)
+
+        if target_year is None:
+            return min(candidates, key=lambda c: (-(c.year or 0), season(c)))
         return min(
             candidates,
-            key=lambda c: (abs(c.year - target_year), -c.year, -(c.month or 0)),
+            key=lambda c: (
+                abs(c.year - target_year) if c.year is not None else float("inf"),
+                -(c.year or 0),
+                season(c),
+            ),
         )
 
     def clone_for_capture(self, capture: PanoCapture) -> StreetViewPanorama:
@@ -248,54 +330,153 @@ def _to_protobuf_url(fields: dict) -> str:
     return _to_pb_url(fields)[1]
 
 
-# ── API: find panorama by radius (SingleImageSearch) ────────────────
+# ── API: find the nearest panorama ──────────────────────────────────
+#
+# Two keyless Google Maps endpoints, as maps.google.com uses them: a coverage
+# tile lists every panorama in a zoom-17 map tile (id and position), and the
+# metadata request for one id returns its dates, historical captures and image
+# sizes. The nearest panorama is chosen from the tiles around the point, so
+# neighbouring points share one tile request.
+
+_COVERAGE_ZOOM = 17
+_COVERAGE_URL = (
+    "https://www.google.com/maps/photometa/ac/v1?pb=!1m1!1smaps_sv.tactile"
+    "!6m3!1i{x}!2i{y}!3i17!8b1"
+)
+_METADATA_URL = (
+    "https://www.google.com/maps/photometa/v1?authuser=0&hl={lang}&gl={country}&pb="
+)
+_PHOTOMETA_HEADERS = {
+    "Accept": "*/*",
+    "Referer": "https://www.google.com/",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:151.0) "
+        "Gecko/20100101 Firefox/151.0"
+    ),
+}
+_EARTH_RADIUS_M = 6_371_000.0
+#: Image types in a coverage tile: Google's own panoramas and user photospheres.
+_OFFICIAL, _THIRD_PARTY = 2, 10
+
+# Tiles fetched by this process: ``(x, y) -> [(type, id, lat, lon), ...]``.
+_TILES: dict[tuple[int, int], list[tuple[int, str, float, float]]] = {}
+_TILES_MAX = 50_000
+_TILE_TASKS: dict[tuple[int, int], asyncio.Task] = {}
 
 
-def _build_find_panorama_url(
-    lat: float, lon: float, radius: float, locale: str, search_third_party: bool
-) -> str:
-    parts = locale.split("-")
-    ietf_lang = parts[0]
-    ietf_country = parts[1] if len(parts) > 1 else parts[0]
-    image_type = 10 if search_third_party else 2
+def _tile_xy(lat: float, lon: float) -> tuple[int, int]:
+    n = 2**_COVERAGE_ZOOM
+    lat = max(min(lat, 85.0511), -85.0511)
+    x = int((lon + 180.0) / 360.0 * n)
+    y = int((1.0 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2.0 * n)
+    return min(max(x, 0), n - 1), min(max(y, 0), n - 1)
 
-    toggles = [ProtobufEnum(i) for i in (1, 2, 3, 4, 6, 8, 12)]
 
-    msg = {
-        1: {1: "apiv3", 5: "US", 11: {1: {1: False}}},
-        2: {1: {3: float(lat), 4: float(lon)}, 2: float(radius)},
-        3: {
-            2: {1: ietf_lang, 2: ietf_country},
-            9: {1: ProtobufEnum(2)},
-            11: {1: {1: ProtobufEnum(image_type), 2: True, 3: ProtobufEnum(2)}},
-        },
-        4: {1: toggles, 5: {}, 6: {}},
-    }
-    return (
-        "https://maps.googleapis.com/maps/api/js/GeoPhotoService.SingleImageSearch?pb="
-        + _to_protobuf_url(msg)
-        + "&callback=_xdc_._v2mub5"
+def _tiles_around(lat: float, lon: float, radius: float) -> list[tuple[int, int]]:
+    """The coverage tiles a circle of ``radius`` metres can touch."""
+    dlat = math.degrees(radius / _EARTH_RADIUS_M)
+    dlon = dlat / max(math.cos(math.radians(lat)), 1e-6)
+    x0, y0 = _tile_xy(lat + dlat, lon - dlon)
+    x1, y1 = _tile_xy(lat - dlat, lon + dlon)
+    return [(x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
+
+
+def _distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    h = (
+        math.sin((p2 - p1) / 2) ** 2
+        + math.cos(p1) * math.cos(p2) * math.sin(math.radians(lon2 - lon1) / 2) ** 2
     )
+    return 2 * _EARTH_RADIUS_M * math.asin(math.sqrt(h))
 
 
-def _repair_jsonp(text: str) -> str:
-    """The endpoint wraps its JSON in ``_xdc_._v2mub5(…)`` JSONP — strip it."""
+def _json_body(text: str, what: str):
+    """The JSON after Google's ``)]}'`` guard; :class:`ServiceRetired` when
+    the answer is not in that form."""
+    if not text.startswith(")]}'"):
+        raise ServiceRetired(f"the {what} answered {text[:80]!r}")
     try:
-        first = text.index("(")
-        last = text.rindex(")")
-        return "[" + text[first + 1 : last] + "]"
-    except ValueError:
-        return "[]"
+        return json.loads(text[4:])
+    except json.JSONDecodeError as exc:
+        raise ServiceRetired(f"the {what} answered unreadable JSON ({exc})") from None
 
 
-def _parse_radius_response(response: list) -> StreetViewPanorama | None:
-    """Return the parsed panorama, or ``None`` if the API reported no result."""
+def _parse_coverage_tile(text: str) -> list[tuple[int, str, float, float]]:
+    """``(image type, panorama id, lat, lon)`` of every panorama in a tile."""
+    tile = _json_body(text, "coverage tile service")
+    found = []
     try:
-        if response[0][0][0] != 0:
-            return None
-        return _parse_pano_message(response[0][1])
-    except (IndexError, TypeError, KeyError):
+        entries = tile[1][1] if tile and tile[1] else []
+    except (IndexError, TypeError):
+        raise ServiceRetired("the coverage tile service changed its answer") from None
+    for entry in entries or []:
+        try:
+            kind, panoid = entry[0][0][0], entry[0][0][1]
+            position = entry[0][2][0]
+            lat, lon = float(position[2]), float(position[3])
+            found.append((int(kind), str(panoid), lat, lon))
+        except (IndexError, TypeError, ValueError):
+            continue
+    return found
+
+
+def _nearest(
+    tiles: list[list[tuple[int, str, float, float]]],
+    lat: float,
+    lon: float,
+    radius: float,
+    search_third_party: bool,
+) -> str | None:
+    wanted = _THIRD_PARTY if search_third_party else _OFFICIAL
+    best, best_d = None, radius
+    for tile in tiles:
+        for kind, panoid, plat, plon in tile:
+            if kind != wanted:
+                continue
+            d = _distance_m(lat, lon, plat, plon)
+            if d <= best_d:
+                best, best_d = panoid, d
+    return best
+
+
+def _remember(xy: tuple[int, int], panos: list) -> None:
+    if len(_TILES) >= _TILES_MAX:
+        _TILES.clear()
+    _TILES[xy] = panos
+
+
+def _metadata_url(panoid: str, locale: str) -> str:
+    parts = locale.split("-")
+    lang, country = parts[0], parts[1] if len(parts) > 1 else parts[0]
+    pano_type = _THIRD_PARTY if is_third_party_panoid(panoid) else _OFFICIAL
+    msg = {
+        1: {1: "maps_sv.tactile", 11: {2: {1: True}}},
+        2: {1: lang, 2: country},
+        3: {1: {1: ProtobufEnum(pano_type), 2: panoid}},
+        4: {
+            1: [ProtobufEnum(i) for i in (1, 2, 3, 4, 5, 6, 8, 12)],
+            2: {1: ProtobufEnum(1)},
+            4: {1: 48},
+            5: [{}],
+            6: [{}],
+            11: {3: {4: True}},
+        },
+    }
+    return _METADATA_URL.format(lang=lang, country=country) + _to_protobuf_url(msg)
+
+
+def _parse_metadata(text: str) -> StreetViewPanorama | None:
+    """The panorama a metadata answer describes; ``None`` when Google does not
+    know the id (status 2)."""
+    response = _json_body(text, "panorama metadata service")
+    try:
+        status = response[1][0][0][0]
+    except (IndexError, TypeError):
+        message = "the panorama metadata service changed its answer"
+        raise ServiceRetired(message) from None
+    if status not in (1, 3):
         return None
+    return _parse_pano_message(response[1][0])
 
 
 def _parse_date(raw) -> tuple[int, int] | None:
@@ -378,18 +559,63 @@ def find_panorama(
     locale: str = "en",
     search_third_party: bool = False,
     session: requests.Session | None = None,
+    timeout: float | None = None,
 ) -> StreetViewPanorama | None:
-    """Search for the nearest Street View panorama within ``radius`` metres.
+    """The nearest Street View panorama within ``radius`` metres, or ``None``.
 
-    Raises :class:`RateLimitedError` when the endpoint throttles, so a caller
-    can back off instead of mistaking the throttle body for "no coverage".
+    Raises :class:`RateLimitedError` when Google throttles, so a caller can
+    back off instead of mistaking the throttle for "no coverage", and
+    :class:`ServiceRetired` when an endpoint stops answering in the expected
+    form.
     """
-    url = _build_find_panorama_url(lat, lon, radius, locale, search_third_party)
     requester = session if session is not None else requests
-    resp = requester.get(url, headers=_TILE_HEADERS)
-    if resp.status_code in _RATE_LIMIT_STATUSES:
-        raise RateLimitedError(resp.status_code, url)
-    return _parse_radius_response(json.loads(_repair_jsonp(resp.text)))
+
+    def get(url: str) -> str:
+        resp = requester.get(url, headers=_PHOTOMETA_HEADERS, timeout=timeout)
+        if resp.status_code in _RATE_LIMIT_STATUSES:
+            raise RateLimitedError(resp.status_code, url)
+        return resp.text
+
+    tiles = []
+    for xy in _tiles_around(lat, lon, radius):
+        if xy not in _TILES:
+            text = get(_COVERAGE_URL.format(x=xy[0], y=xy[1]))
+            _remember(xy, _parse_coverage_tile(text))
+        tiles.append(_TILES[xy])
+    panoid = _nearest(tiles, lat, lon, radius, search_third_party)
+    if panoid is None:
+        return None
+    return _parse_metadata(get(_metadata_url(panoid, locale)))
+
+
+async def _get_text(session: aiohttp.ClientSession, url: str) -> str:
+    async with session.get(url, headers=_PHOTOMETA_HEADERS) as resp:
+        if resp.status in _RATE_LIMIT_STATUSES:
+            raise RateLimitedError(resp.status, url)
+        return await resp.text()
+
+
+async def _coverage_tile_async(
+    session: aiohttp.ClientSession, xy: tuple[int, int]
+) -> list[tuple[int, str, float, float]]:
+    """One coverage tile, fetched once however many searches ask at a time."""
+    if xy in _TILES:
+        return _TILES[xy]
+    loop = asyncio.get_running_loop()
+    task = _TILE_TASKS.get(xy)
+    if task is None or task.get_loop() is not loop:
+        url = _COVERAGE_URL.format(x=xy[0], y=xy[1])
+
+        async def fetch() -> list:
+            try:
+                panos = _parse_coverage_tile(await _get_text(session, url))
+                _remember(xy, panos)
+                return panos
+            finally:
+                _TILE_TASKS.pop(xy, None)
+
+        task = _TILE_TASKS[xy] = loop.create_task(fetch())
+    return await asyncio.shield(task)
 
 
 async def find_panorama_async(
@@ -400,17 +626,16 @@ async def find_panorama_async(
     locale: str = "en",
     search_third_party: bool = False,
 ) -> StreetViewPanorama | None:
-    """Async variant of :func:`find_panorama`.
-
-    Raises :class:`RateLimitedError` on throttle statuses — see
-    :func:`find_panorama` for why that distinction matters.
-    """
-    url = _build_find_panorama_url(lat, lon, radius, locale, search_third_party)
-    async with session.get(url, headers=_TILE_HEADERS) as resp:
-        if resp.status in _RATE_LIMIT_STATUSES:
-            raise RateLimitedError(resp.status, url)
-        text = await resp.text()
-    return _parse_radius_response(json.loads(_repair_jsonp(text)))
+    """Async variant of :func:`find_panorama`; concurrent searches share each
+    coverage tile request."""
+    tiles = [
+        await _coverage_tile_async(session, xy)
+        for xy in _tiles_around(lat, lon, radius)
+    ]
+    panoid = _nearest(tiles, lat, lon, radius, search_third_party)
+    if panoid is None:
+        return None
+    return _parse_metadata(await _get_text(session, _metadata_url(panoid, locale)))
 
 
 # ── API: download panorama image ────────────────────────────────────
@@ -500,6 +725,20 @@ def get_panorama(
     )
 
 
+async def _fetch_tiles(pano: StreetViewPanorama, zoom: int, fetch) -> Image.Image:
+    """Every tile of ``pano`` at ``zoom`` through ``fetch(tile)``, stitched."""
+    tile_list = _generate_tile_list(pano, zoom)
+    results = await asyncio.gather(*(fetch(t) for t in tile_list))
+    tile_data = {(t.x, t.y): data for t, data in zip(tile_list, results, strict=True)}
+    return _stitch_tiles(
+        tile_data,
+        pano.image_sizes[zoom].x,
+        pano.image_sizes[zoom].y,
+        pano.tile_size.x,
+        pano.tile_size.y,
+    )
+
+
 async def get_panorama_async(
     pano: StreetViewPanorama,
     session: aiohttp.ClientSession,
@@ -535,3 +774,185 @@ async def get_panorama_async(
         pano.tile_size.x,
         pano.tile_size.y,
     )
+
+
+# ── API: the keyed Street View tiles (Map Tiles API) ────────────────
+#
+# Google's billed, documented route to the same equirectangular tiles. Every
+# request carries a session token (created once per key and process, valid for
+# about two weeks) and the key. The key only ever travels in query strings
+# built here, and no error raised from this section quotes a URL, so a key
+# never reaches a log or an error message. A search is one metadata request for
+# the nearest panorama within the radius; the API knows only the current
+# capture at a place, so ``captures`` holds that one capture.
+
+_API_ROOT = "https://tile.googleapis.com/v1"
+_API_SESSION = {"mapType": "streetview", "language": "en-US", "region": "US"}
+#: Zoom levels of the tile API; the full-size image is at the last one.
+_API_MAX_ZOOM = 5
+# A session token is renewed when it has less than this long left.
+_API_RENEW_S = 3600.0
+_API_TOKENS: dict[str, tuple[str, float]] = {}
+_API_TOKEN_TASKS: dict[str, asyncio.Task] = {}
+
+
+class ApiRequestRefused(RuntimeError):
+    """Google refused a Street View API request with this key: a wrong key, an
+    API not enabled for the key's project, billing off, or a restriction.
+    Retrying does not help, so a run stops with the reason."""
+
+    def __init__(self, status: int, reason: str):
+        super().__init__(
+            f"Google refused the Street View API request (HTTP {status}: {reason}). "
+            "Check the key, that the Map Tiles API is enabled for its Google Cloud "
+            "project, and that billing is on."
+        )
+        self.status = status
+
+
+def _api_reason(body) -> str:
+    """Google's error message from an error answer, shortened."""
+    try:
+        return str(body["error"]["message"])[:200]
+    except (KeyError, TypeError):
+        return "no reason given"
+
+
+async def _api_request(
+    session: aiohttp.ClientSession,
+    method: str,
+    path: str,
+    key: str,
+    *,
+    params: dict | None = None,
+    body: dict | None = None,
+    binary: bool = False,
+):
+    """One API request: the JSON (or bytes) answer, or ``None`` for 404.
+
+    429 / 503 raise :class:`RateLimitedError`; other refusals raise
+    :class:`ApiRequestRefused`; connection errors are re-raised as
+    ``ConnectionError`` naming only the path.
+    """
+    query = {**(params or {}), "key": key}
+    try:
+        async with session.request(
+            method, _API_ROOT + path, params=query, json=body
+        ) as resp:
+            if resp.status in (429, 503):
+                raise RateLimitedError(resp.status, path)
+            if resp.status == 404:
+                return None
+            if resp.status >= 400:
+                try:
+                    answer = await resp.json(content_type=None)
+                except (ValueError, aiohttp.ContentTypeError):
+                    answer = None
+                raise ApiRequestRefused(resp.status, _api_reason(answer))
+            if binary:
+                return await resp.read()
+            return await resp.json(content_type=None)
+    except aiohttp.ClientError as exc:
+        raise ConnectionError(
+            f"Street View API request {path} failed: {type(exc).__name__}"
+        ) from None
+
+
+async def _api_token(session: aiohttp.ClientSession, key: str) -> str:
+    """This process's session token for ``key``, created once and renewed
+    before it expires; concurrent callers share one request."""
+    held = _API_TOKENS.get(key)
+    if held is not None and held[1] - time.time() > _API_RENEW_S:
+        return held[0]
+    loop = asyncio.get_running_loop()
+    task = _API_TOKEN_TASKS.get(key)
+    if task is None or task.get_loop() is not loop:
+
+        async def create() -> str:
+            try:
+                answer = await _api_request(
+                    session, "POST", "/createSession", key, body=_API_SESSION
+                )
+                if not answer or "session" not in answer:
+                    raise ApiRequestRefused(404, "no session token in the answer")
+                expiry = float(answer.get("expiry") or time.time() + 86400)
+                _API_TOKENS[key] = (str(answer["session"]), expiry)
+                return str(answer["session"])
+            finally:
+                _API_TOKEN_TASKS.pop(key, None)
+
+        task = _API_TOKEN_TASKS[key] = loop.create_task(create())
+    return await asyncio.shield(task)
+
+
+def _parse_api_date(raw) -> tuple[int, int] | None:
+    """``"2023-05"`` -> ``(2023, 5)``; a year alone or nothing -> ``None``."""
+    parts = str(raw or "").split("-")
+    try:
+        return int(parts[0]), int(parts[1])
+    except (ValueError, IndexError):
+        return None
+
+
+def _parse_api_metadata(answer: dict) -> StreetViewPanorama | None:
+    """The panorama an API metadata answer describes; ``None`` for indoor
+    imagery and user photospheres, which the keyless search skips too."""
+    panoid = str(answer.get("panoId") or "")
+    if not panoid or is_third_party_panoid(panoid):
+        return None
+    if str(answer.get("imageryType", "outdoor")).lower() == "indoor":
+        return None
+    width, height = int(answer["imageWidth"]), int(answer["imageHeight"])
+    shifts = range(_API_MAX_ZOOM, -1, -1)
+    date = _parse_api_date(answer.get("date"))
+    year = date[0] if date else None
+    if date is None and str(answer.get("date") or "").isdigit():
+        year = int(answer["date"])
+    return StreetViewPanorama(
+        id=panoid,
+        lat=float(answer["lat"]),
+        lon=float(answer["lng"]),
+        tile_size=Size(int(answer["tileWidth"]), int(answer["tileHeight"])),
+        image_sizes=[Size(max(width >> s, 1), max(height >> s, 1)) for s in shifts],
+        date=date,
+        captures=[PanoCapture(panoid, year, date[1] if date else None)],
+    )
+
+
+async def find_panorama_api_async(
+    lat: float,
+    lon: float,
+    session: aiohttp.ClientSession,
+    key: str,
+    radius: float = 50.0,
+) -> StreetViewPanorama | None:
+    """The nearest panorama within ``radius`` metres through the keyed API, or
+    ``None``. Raises :class:`RateLimitedError` when throttled and
+    :class:`ApiRequestRefused` when Google refuses the key."""
+    token = await _api_token(session, key)
+    params = {"session": token, "lat": f"{lat:.7f}", "lng": f"{lon:.7f}"}
+    params["radius"] = str(int(round(radius)))
+    path = "/streetview/metadata"
+    answer = await _api_request(session, "GET", path, key, params=params)
+    return _parse_api_metadata(answer) if answer else None
+
+
+async def get_panorama_api_async(
+    pano: StreetViewPanorama,
+    session: aiohttp.ClientSession,
+    key: str,
+    zoom: int = 1,
+) -> Image.Image:
+    """Download ``pano`` at ``zoom`` through the keyed tile API, stitched."""
+    token = await _api_token(session, key)
+    zoom = _validate_zoom(pano, zoom)
+
+    async def fetch(t: Tile) -> bytes:
+        path = f"/streetview/tiles/{zoom}/{t.x}/{t.y}"
+        params = {"session": token, "panoId": pano.id}
+        data = await _api_request(session, "GET", path, key, params=params, binary=True)
+        if data is None:
+            raise FileNotFoundError(f"tile {zoom}/{t.x}/{t.y} of {pano.id[:12]}")
+        return data
+
+    return await _fetch_tiles(pano, zoom, fetch)

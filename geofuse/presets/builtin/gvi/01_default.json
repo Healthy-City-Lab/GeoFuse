@@ -1,0 +1,26 @@
+{
+  "format": "geofuse-preset",
+  "version": 1,
+  "engine": "gvi",
+  "name": "Default",
+  "description": "The tab's own defaults: package download, 50 m grid, no buffer, most recent capture at each point, GeoPackage output.",
+  "created": "2026-10-11",
+  "geofuse_version": "builtin",
+  "settings": {
+    "download_mode": "package",
+    "grid_resolution_m": 50,
+    "buffer_m": 0,
+    "save_raw": false,
+    "show_sampling_grid": false,
+    "save_gpkg": true,
+    "save_geotiff": false,
+    "save_geojson": false,
+    "capture_mode": "recent",
+    "limit_year_difference": false,
+    "max_year_difference": 2,
+    "limit_months": false,
+    "month_start": 5,
+    "month_end": 10,
+    "month_policy": "exclude"
+  }
+}
