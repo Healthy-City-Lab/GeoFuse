@@ -33,6 +33,15 @@ from .ee_utils import (
 )
 from .jobs import NDVI_PROGRESS_MIN_TILES, ProgressThrottle, retry_with_backoff
 from .logger import attach_external_logger, get_logger
+from .ndvi_chains import (
+    WATER_MASK,
+    as_statistic,
+    check_chains,
+    focal_radius,
+    output_stems,
+    statistic_chain,
+    temporal_statistic,
+)
 from .persistence.caches import DEFAULT_MAX_BYTES, NdviTileCache, ndvi_tiles
 from .vector_io import geometry_sha256
 
@@ -95,7 +104,7 @@ def normalize_temporal_reducers(
 def ndvi_output_name(output_name: str, reducer: str) -> str:
     """Base name of one statistic's files: ``median`` keeps ``output_name``,
     any other statistic appends ``_<reducer>`` (``{name}_max_ndvi.tif``)."""
-    return output_name if reducer == "median" else f"{output_name}_{reducer}"
+    return output_stems(output_name, [reducer])[reducer]
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -433,6 +442,24 @@ def _compute_resume_key(
     return h.hexdigest()[:16]
 
 
+def _chain_key(
+    steps: list[str], cloud_variant: tuple[str, ...]
+) -> tuple[str, tuple[str, ...]]:
+    """``(temporal_reducer, variant)`` of an output's resume key.
+
+    A statistic's own chain keys as that statistic always has, its per-scene
+    water mask a variant, so its cached tiles stay valid; any other chain
+    keys by its steps.
+    """
+    water = f"water{WATER_OCCURRENCE_MAX}"
+    plain = as_statistic(steps)
+    if plain is not None:
+        statistic, masked = plain
+        return statistic, ((water,) if masked else ()) + cloud_variant
+    token = ",".join(water if step == WATER_MASK else step for step in steps)
+    return f"chain:{token}", cloud_variant
+
+
 def _extract_band(
     src_path: str, band: int, dst_path: str, *, dtype: str | None = None
 ) -> None:
@@ -540,6 +567,8 @@ def _write_ndvi_sidecar(
     used_start_date: str | None = None,
     used_end_date: str | None = None,
     temporal_reducer: str = "median",
+    chain: list[str] | None = None,
+    chain_name: str | None = None,
     coverage_widened: bool = False,
     year_substituted: str | None = None,
     water_mask: bool = False,
@@ -563,8 +592,10 @@ def _write_ndvi_sidecar(
     pixels were rasterised in, how much distortion that introduced, how many
     clusters and tiles the input decomposed into, the exact date range, the
     temporal statistic (median / mean / max over the window's cloud-free
-    images), the NDVI formula (:data:`NDVI_FORMULA`), and which Earth Engine
-    ImageCollection was queried.
+    images), the aggregation chain that made the file (``chain``, with
+    ``chain_name`` when it was one of the run's chains; a statistic's own
+    chain otherwise), the NDVI formula (:data:`NDVI_FORMULA`), and which
+    Earth Engine ImageCollection was queried.
     ``start_date`` / ``end_date`` are the dates as given and
     ``end_date_exclusive`` the exclusive end of that window; ``used_*`` is
     the half-open window queried after any 2012 fill or coverage rescue.
@@ -595,6 +626,8 @@ def _write_ndvi_sidecar(
         "used_start_date": str(used_start_date or start_date),
         "used_end_date": str(used_end_date or end_date),
         "temporal_reducer": str(temporal_reducer),
+        "chain": list(chain or statistic_chain(temporal_reducer, water_mask)),
+        "chain_name": chain_name,
         "ndvi_formula": NDVI_FORMULA,
         "coverage_widened": bool(coverage_widened),
         "year_substituted": year_substituted,
@@ -1012,6 +1045,32 @@ class NDVIEngine:
         occurrence = ee.Image(WATER_DATASET).select("occurrence").unmask(0)
         return img.updateMask(occurrence.lt(WATER_OCCURRENCE_MAX))
 
+    def _apply_steps(self, img, steps: list[str]):
+        """``img`` (band ``NDVI``) after the chain operations ``steps``: water
+        masks and neighbourhood statistics, in order."""
+        for step in steps:
+            if step == WATER_MASK:
+                img = self._mask_water(img)
+                continue
+            _, statistic, radius = step.split(":")
+            img = img.reduceNeighborhood(
+                reducer=getattr(ee.Reducer, statistic)(),
+                kernel=ee.Kernel.circle(float(radius), "meters"),
+            ).rename("NDVI")
+        return img
+
+    def _chain_composite(self, col, steps: list[str]):
+        """The composite ``steps`` make of the prepped scenes in ``col``: the
+        operations before the temporal step act on every scene, those after
+        it on the composite. Neighbourhoods are computed on the export grid,
+        the projection every download requests."""
+        t = next(i for i, step in enumerate(steps) if step.startswith("temporal:"))
+        before, after = steps[:t], steps[t + 1 :]
+        if before:
+            col = col.map(lambda img: self._apply_steps(img, before))
+        composite = getattr(col.select("NDVI"), temporal_statistic(steps))()
+        return self._apply_steps(composite.rename("NDVI"), after)
+
     def _pick_satellite(self, start_date: str, end_date: str, satellite: str) -> str:
         """Resolve ``satellite='auto'`` → ``'sentinel2'`` or ``'landsat'``.
 
@@ -1263,6 +1322,7 @@ class NDVIEngine:
         substitute_2012: bool = False,
         preset: str | None = None,
         end_inclusive: bool = False,
+        chains: Iterable[Mapping[str, Any]] | None = None,
     ):
         """
         Download and process NDVI data with automatic tiling for large areas.
@@ -1306,11 +1366,12 @@ class NDVIEngine:
                 ``"median"``). Each statistic writes its own files under
                 :func:`ndvi_output_name` and caches its tiles under its own
                 resume key; one Earth Engine request per tile carries every
-                statistic that tile is missing.
+                statistic that tile is missing. Not read when ``chains`` are
+                given.
             water_mask: Mask pixels open water covers at least
                 :data:`WATER_OCCURRENCE_MAX` percent of the time, on every
-                image before the temporal statistic. Off by default (water
-                stays in the composite).
+                image before the temporal statistic (or before every chain).
+                Off by default (water stays in the composite).
             cloud_handling: one of :data:`CLOUD_HANDLINGS`: drop scenes above
                 ``cloud_max`` and mask cloudy pixels (default), keep every
                 scene and mask cloudy pixels, or drop cloudy scenes and keep
@@ -1326,14 +1387,36 @@ class NDVIEngine:
                 day after it is sent to Earth Engine. The sidecar records both
                 (``end_date``, ``end_date_exclusive``), and the 2012 fill and
                 coverage rescue work on the corrected window.
+            chains: Aggregation chains (:mod:`geofuse.ndvi_chains`), each a
+                ``{"name", "steps"}`` table; they replace
+                ``temporal_reducers``. Each chain writes its own files,
+                ``{output_name}_{name}_ndvi.*``, and caches its tiles under
+                its own resume key (a statistic's own chain shares that
+                statistic's); one request per tile carries every chain.
 
         Returns:
-            The first statistic's result (``status``, ``tif``, ``geojson``,
+            The first output's result (``status``, ``tif``, ``geojson``,
             ``gpkg``, ``meta``, ``sidecar``) with ``reducers`` mapping every
-            statistic to its own result. ``status`` is ``"success"`` only
-            when every statistic succeeded.
+            output (statistic, or chain name) to its own result. ``status``
+            is ``"success"`` only when every output succeeded.
         """
         reducers = normalize_temporal_reducers(temporal_reducers)
+        user_chains = check_chains(chains)
+        # Each output's steps: a chain as given, after the per-scene water
+        # mask when that is on, or a statistic's own chain.
+        if user_chains:
+            chain_steps = {
+                c["name"]: (
+                    [WATER_MASK, *c["steps"]]
+                    if water_mask and c["steps"][0] != WATER_MASK
+                    else list(c["steps"])
+                )
+                for c in user_chains
+            }
+            output_names = output_stems(output_name, chains=user_chains)
+        else:
+            chain_steps = {r: statistic_chain(r, water_mask) for r in reducers}
+            output_names = output_stems(output_name, reducers)
         for name, value, allowed in (
             ("satellite", satellite, SATELLITES),
             ("cloud_handling", cloud_handling, CLOUD_HANDLINGS),
@@ -1416,6 +1499,13 @@ class NDVIEngine:
         else:
             q_start, q_end = req_start, end_exclusive
 
+        # 3b. Scenes are fetched over the study area grown by the largest
+        # neighbourhood radius, so neighbourhoods at its edge are whole.
+        radius = focal_radius(chain_steps.values())
+        fetch = aoi.buffer(radius + float(resolution)) if radius else aoi
+        if radius:
+            _log("INFO", f"Scenes fetched within {radius:g} m of the study area.")
+
         # 4. Pick the satellite collection. ``auto`` falls back to Landsat
         # for ranges that end before Sentinel-2 SR_HARMONIZED started.
         chosen_satellite = self._pick_satellite(q_start, q_end, satellite)
@@ -1431,9 +1521,9 @@ class NDVIEngine:
 
             def _get_col(s, e, cmax):
                 if (sensor_set, reflectance, pixel_mask) == ("all", "surface", True):
-                    return self.get_collection_landsat(aoi, s, e, cmax)
+                    return self.get_collection_landsat(fetch, s, e, cmax)
                 return self.get_collection_landsat(
-                    aoi,
+                    fetch,
                     s,
                     e,
                     cmax,
@@ -1444,7 +1534,7 @@ class NDVIEngine:
 
             def _get_base(s, e):
                 return self._landsat_base(
-                    aoi, s, e, sensor_set=sensor_set, reflectance=reflectance
+                    fetch, s, e, sensor_set=sensor_set, reflectance=reflectance
                 )
 
             cloud_field = "CLOUD_COVER"
@@ -1468,13 +1558,13 @@ class NDVIEngine:
 
             def _get_col(s, e, cmax):
                 if (reflectance, pixel_mask) == ("surface", True):
-                    return self.get_collection(aoi, s, e, cmax)
+                    return self.get_collection(fetch, s, e, cmax)
                 return self.get_collection(
-                    aoi, s, e, cmax, reflectance=reflectance, pixel_mask=pixel_mask
+                    fetch, s, e, cmax, reflectance=reflectance, pixel_mask=pixel_mask
                 )
 
             def _get_base(s, e):
-                return ee.ImageCollection(s2_id).filterBounds(aoi).filterDate(s, e)
+                return ee.ImageCollection(s2_id).filterBounds(fetch).filterDate(s, e)
 
             cloud_field = "CLOUDY_PIXEL_PERCENTAGE"
 
@@ -1577,22 +1667,24 @@ class NDVIEngine:
                 _log("WARN", f"Coverage rescue skipped: {e}")
 
         col = _get_col(used_start, used_end, scene_cmax)
-        if water_mask:
-            col = col.map(self._mask_water)
 
         if cancel_callback and cancel_callback():
             return {"status": "cancelled", "message": "Cancelled by user"}
 
-        # One single-band composite per temporal statistic. ``unmask(-9999)``
-        # paints cloud-masked / out-of-collection pixels with the sentinel so
-        # the downstream reproject can mask them out instead of
-        # bilinear-blending them with valid neighbours.
-        ndvi = col.select("NDVI")
+        # One single-band composite per output, clipped after its whole chain
+        # so neighbourhoods read unclipped scenes. ``unmask(-9999)`` paints
+        # cloud-masked / out-of-collection pixels with the sentinel so the
+        # downstream reproject can mask them out instead of bilinear-blending
+        # them with valid neighbours.
         composites = {
-            r: getattr(ndvi, r)().rename("NDVI").unmask(-9999).clip(aoi)
-            for r in reducers
+            n: self._chain_composite(col, steps).unmask(-9999).clip(aoi)
+            for n, steps in chain_steps.items()
         }
-        _log("INFO", f"Temporal statistic: {', '.join(reducers)}")
+        if user_chains:
+            for n, steps in chain_steps.items():
+                _log("INFO", f"Aggregation chain {n}: {', '.join(steps)}")
+        else:
+            _log("INFO", f"Temporal statistic: {', '.join(reducers)}")
 
         # 5. Build cluster-aware tile list in true metres. Scattered national
         # inputs decompose into connected components, and tiles that fall over
@@ -1613,27 +1705,23 @@ class NDVIEngine:
         # Anchoring the key on what was actually downloaded means a future
         # run that hits the same widened window / Landsat fallback reuses
         # the cache; runs that resolve differently get isolated workspaces.
-        # Each statistic has its own key, so its tiles are its own entry; an
-        # acquisition option away from its default adds itself to the key.
-        variant = []
-        if water_mask:
-            variant.append(f"water{WATER_OCCURRENCE_MAX}")
-        if cloud_handling != "scene_filter":
-            variant.append(cloud_handling)
-        resume_keys = {
-            r: _compute_resume_key(
+        # Each output has its own key (:func:`_chain_key`), so its tiles are
+        # its own entry; an acquisition option away from its default adds
+        # itself to the key.
+        cloud_variant = (cloud_handling,) if cloud_handling != "scene_filter" else ()
+        resume_keys = {}
+        for n, steps in chain_steps.items():
+            token, variant = _chain_key(steps, cloud_variant)
+            resume_keys[n] = _compute_resume_key(
                 geom_for_crs,
                 used_start,
                 used_end,
                 "none" if scene_cmax is None else cloud_max,
                 resolution,
                 ee_collection_id,
-                temporal_reducer=r,
-                variant=tuple(variant),
+                temporal_reducer=token,
+                variant=variant,
             )
-            for r in reducers
-        }
-        output_names = {r: ndvi_output_name(output_name, r) for r in reducers}
 
         if n_tiles == 1:
             _log(
@@ -1667,7 +1755,7 @@ class NDVIEngine:
                 composites,
                 aoi,
                 tiles,
-                {r: (output_names[r], resume_keys[r]) for r in reducers},
+                {n: (output_names[n], resume_keys[n]) for n in chain_steps},
                 folder,
                 max_tile_size_km,
                 export_crs=export_crs,
@@ -1687,8 +1775,8 @@ class NDVIEngine:
         # download / notebooks) get the same parameter+CRS audit trail the GVI
         # ``_gvi.json`` provides. Failures and cancellations skip this — the
         # sidecar should only describe outputs that actually landed on disk.
-        for r in reducers:
-            result = results[r]
+        for n, steps in chain_steps.items():
+            result = results[n]
             if result.get("status") != "success":
                 continue
             raw_meta = result.get("meta")
@@ -1701,7 +1789,7 @@ class NDVIEngine:
             try:
                 sidecar_path = _write_ndvi_sidecar(
                     folder,
-                    output_names[r],
+                    output_names[n],
                     grid_crs=grid_crs,
                     export_crs=export_crs,
                     export_crs_name=export_crs_name,
@@ -1713,13 +1801,15 @@ class NDVIEngine:
                     tiles_resumed=tiles_resumed,
                     tiles_split_across_requests=tiles_split,
                     failed_tile_refs=failed_refs,
-                    resume_key=resume_keys[r],
+                    resume_key=resume_keys[n],
                     start_date=str(start_date),
                     end_date=str(end_date),
                     end_date_exclusive=end_exclusive,
                     used_start_date=used_start,
                     used_end_date=used_end,
-                    temporal_reducer=r,
+                    temporal_reducer=temporal_statistic(steps),
+                    chain=steps,
+                    chain_name=n if user_chains else None,
                     coverage_widened=coverage_widened,
                     year_substituted=year_substituted,
                     water_mask=water_mask,

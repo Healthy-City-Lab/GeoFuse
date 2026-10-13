@@ -4,10 +4,10 @@ Images are functions of planar coordinates ``(X, Y)`` returning arrays, with
 NaN for masked pixels; collections are lists of images with a date and
 properties. The band algebra the NDVI preps use (``select``, arithmetic,
 ``bitwiseAnd`` / ``Or`` / ``And`` / ``eq`` / ``neq`` / ``lt`` / ``gte``,
-``updateMask``, ``unmask``), the collection operations (``filterDate``,
-``filter``, ``map``, ``merge``, ``size``) and the temporal reducers are
-evaluated with numpy, so a test can run the real engine and check every output
-pixel.
+``updateMask``, ``unmask``, ``reduceNeighborhood``), the collection
+operations (``filterDate``, ``filter``, ``map``, ``merge``, ``size``) and the
+temporal reducers are evaluated with numpy, so a test can run the real engine
+and check every output pixel.
 
 ``FakeEarthEngine(aoi, collections, images)`` patches ``geofuse.ndvi`` while
 active: ``collections`` maps a collection id to its scenes, ``images`` maps an
@@ -18,6 +18,7 @@ every export's band names and dtype; ``queried`` every collection id opened.
 from __future__ import annotations
 
 import math
+import warnings
 from unittest import mock
 
 import numpy as np
@@ -142,6 +143,27 @@ class Image:
     def toFloat(self):
         return Image(self.bands, self.props, "float32")
 
+    def reduceNeighborhood(self, reducer, kernel):
+        """A statistic over the pixel centres within the kernel's radius, on
+        the grid the image is evaluated on; masked pixels are skipped and a
+        masked centre stays masked (Earth Engine's defaults)."""
+        name, fn = self._one()
+        radius, units = kernel
+        assert units == "meters"
+        reduce = {
+            "mean": np.nanmean,
+            "max": np.nanmax,
+            "min": np.nanmin,
+            "median": np.nanmedian,
+        }[reducer]
+
+        def out(X, Y):
+            wide = X.shape[1] > 1
+            res = abs(X[0, 1] - X[0, 0]) if wide else abs(Y[1, 0] - Y[0, 0])
+            return focal(fn, X, Y, radius, float(res), reduce)
+
+        return Image({f"{name}_{reducer}": out}, self.props, self.dtype)
+
     def copyProperties(self, img, _names=None):
         return Image(self.bands, {**img.props, **self.props}, self.dtype)
 
@@ -154,6 +176,23 @@ class Image:
         for im in images:
             bands.update(im.bands)
         return Image(bands, {}, images[0].dtype)
+
+
+def focal(fn, X, Y, radius, res, reduce=np.nanmean):
+    """``reduce`` of ``fn`` over the grid pixels whose centres lie within
+    ``radius`` of each centre; NaN where the centre itself is NaN."""
+    k = int(radius // res)
+    offsets = [
+        (i * res, j * res)
+        for i in range(-k, k + 1)
+        for j in range(-k, k + 1)
+        if (i * i + j * j) * res * res <= radius * radius
+    ]
+    stack = np.stack([fn(X + dx, Y + dy) for dx, dy in offsets])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        values = reduce(stack, axis=0)
+    return np.where(np.isnan(fn(X, Y)), np.nan, values)
 
 
 class Number:
@@ -262,6 +301,9 @@ class FakeEarthEngine:
         fake.Filter.lt.side_effect = lambda prop, v: ("lt", prop, v)
         fake.Image.side_effect = lambda asset: self.images[asset]
         fake.Image.cat.side_effect = Image.cat
+        for stat in ("mean", "max", "min", "median"):
+            getattr(fake.Reducer, stat).side_effect = lambda s=stat: s
+        fake.Kernel.circle.side_effect = lambda radius, units: (radius, units)
         fake.FeatureCollection.return_value.geometry.return_value = (
             self.aoi.geometry.iloc[0]
         )

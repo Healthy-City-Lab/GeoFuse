@@ -63,6 +63,7 @@ Default: GeoTIFF on, GeoPackage off, GeoJSON off.
 | `[name]_ndvi.gpkg` / `.geojson` | Per-pixel points, planar CRS and EPSG:4326 respectively |
 | `[name]_ndvi_tiles/` | One GeoTIFF per connected component, plus an index |
 | `[name]_mean_ndvi.*` / `[name]_max_ndvi.*` | The same set for each other temporal statistic picked |
+| `[name]_[chain]_ndvi.*` | With aggregation chains: the same set for each chain, named by the chain (in place of the statistics) |
 | `[name]_temporal_ndvi/` | Per-year mode: one full output set per year and statistic |
 
 The sidecar lets fusion and other tools introspect a raster without re-running
@@ -72,7 +73,9 @@ dates requested (`start_date`, `end_date`; the end date is included, and
 and the dates actually queried (`used_start_date`, `used_end_date`, end
 exclusive; they differ if a sparse window was widened, or a 2012 window was
 filled from 2013: `year_substituted`), the
-temporal statistic (`temporal_reducer`), the NDVI formula (`ndvi_formula`:
+temporal statistic (`temporal_reducer`), the aggregation chain that made the
+file (`chain`, its operations in order, and `chain_name`, empty for a plain
+statistic, whose chain is its temporal step), the NDVI formula (`ndvi_formula`:
 pixels with negative red or near-infrared reflectance masked), the acquisition
 options
 (`reflectance`, `cloud_handling`, `water_mask` with `water_occurrence_max`),
