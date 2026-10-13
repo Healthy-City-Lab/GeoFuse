@@ -3,8 +3,9 @@
 Driven headless through Textual's pilot against a state folder: rows show
 newest first with the time left; the detail pane shows stages, changed
 settings and outputs; the log pane follows the selected job; keys pause,
-cancel (after confirming), toggle finished jobs and filter; quitting leaves
-the jobs as they were.
+cancel (after confirming), toggle finished jobs, filter and move to a remote's
+mirrored jobs, whose stale link the title states; quitting leaves the jobs as
+they were.
 """
 
 import asyncio
@@ -23,6 +24,7 @@ if ROOT not in sys.path:
 from textual.widgets import DataTable, RichLog, Static
 
 from geofuse.cli.watch import LocalSource, WatchApp, details, eta
+from geofuse.jobs.remote import Mirror, MirrorSource
 from geofuse.jobs.state import StateDir
 
 
@@ -139,6 +141,35 @@ class MonitorTests(_Case):
 
             await pilot.press("q")
         self.assertEqual(self.state.job(self.running).state, "running")
+
+    def test_the_source_key_moves_to_a_remote(self):
+        asyncio.run(self._remote_scenario())
+
+    async def _remote_scenario(self):
+        mirror = Mirror(self.state, "lab")
+        remote_job = {
+            "id": "feedbeef",
+            "spec": {"kind": "gvi", "name": "remote-streets", "step": "gvi.x"},
+            "status": {"status": "running", "progress": 0.25},
+        }
+        mirror.write_snapshot({"jobs": [remote_job], "supervisor": None})
+        mirror.write_link("stopped", host="me@lab.example.org")
+        local = LocalSource(self.state)
+        app = WatchApp(
+            local, sources=[local, MirrorSource(self.state, "lab")], refresh_s=0.1
+        )
+        async with app.run_test(size=(150, 40)) as pilot:
+            await pilot.pause(0.3)
+            self.assertEqual(len(app._order), 3)
+            await pilot.press("s")
+            await pilot.pause(0.3)
+            self.assertEqual(app._order, ["feedbeef"])
+            self.assertIn("lab · me@lab.example.org · stopped · stale", app.sub_title)
+            self.assertIn("jobs as of", app.sub_title)
+            await pilot.press("s")
+            await pilot.pause(0.3)
+            self.assertEqual(len(app._order), 3)
+            await pilot.press("q")
 
 
 if __name__ == "__main__":

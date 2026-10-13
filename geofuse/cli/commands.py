@@ -452,7 +452,19 @@ def cmd_watch(args) -> int:
             "`pip install textual`, or use geofuse status.",
             EXIT_ENVIRONMENT,
         ) from exc
-    WatchApp(LocalSource(_state(args)), run=args.run, active_only=args.active).run()
+    from geofuse.jobs.remote import MirrorSource, remotes
+
+    state = _state(args)
+    names = list(remotes(_config(args)))
+    sources = [LocalSource(state), *(MirrorSource(state, n) for n in names)]
+    first = sources[0]
+    if args.remote:
+        if args.remote not in names:
+            raise CliError(
+                f"No remote {args.remote!r} (known: {', '.join(names) or 'none'})."
+            )
+        first = sources[1 + names.index(args.remote)]
+    WatchApp(first, sources=sources, run=args.run, active_only=args.active).run()
     return EXIT_OK
 
 
@@ -724,6 +736,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("watch", help="full-screen monitor: follow and manage jobs")
     p.add_argument("--run", help="only this run's jobs")
     p.add_argument("--active", action="store_true", help="start with unfinished jobs")
+    p.add_argument(
+        "--remote", metavar="NAME", help="start on a remote's mirrored jobs"
+    )
     p.set_defaults(func=cmd_watch)
 
     p = sub.add_parser("logs", help="a job's log")

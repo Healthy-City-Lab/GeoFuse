@@ -5,11 +5,14 @@
     GeoFuse jobs · <state folder> · supervisor running
     ID  KIND  NAME  STATUS  PROG  ETA  STEP  NOTE            the job table
     stages, settings, outputs  │  the selected job's log
-    p pause · r resume · c cancel · a all/active · / filter · l log · q quit
+    p pause · r resume · c cancel · a all/active · / filter · l log ·
+    s source · q quit
 
 The screen reads its jobs through a source (``geofuse.jobs.sources``: a state
-folder on this machine, or a remote one mirrored here) once a second. Leaving
-it leaves every job running.
+folder on this machine, or a remote one mirrored here by ``geofuse remote
+attach``) once a second; ``s`` moves to the next source. A remote's title
+says when its link is down and how old its jobs are. Leaving the screen leaves
+every job running.
 """
 
 from __future__ import annotations
@@ -196,6 +199,7 @@ class WatchApp(App):
         Binding("a", "toggle_all", "All / active"),
         Binding("slash", "filter", "Filter"),
         Binding("l", "toggle_log", "Wide log"),
+        Binding("s", "next_source", "Source"),
         Binding("escape", "close_filter", show=False),
         Binding("q", "quit", "Quit"),
     ]
@@ -204,12 +208,14 @@ class WatchApp(App):
         self,
         source: JobSource,
         *,
+        sources: list[JobSource] | None = None,
         run: str | None = None,
         active_only: bool = False,
         refresh_s: float = 1.0,
     ):
         super().__init__()
         self.source = source
+        self.sources = list(sources or [source])
         self.run_prefix = run
         self.active_only = active_only
         self.refresh_s = refresh_s
@@ -267,6 +273,11 @@ class WatchApp(App):
         shown = [j for j in reversed(jobs) if self._visible(j)]
         active = sum(j.state in ACTIVE for j in jobs)
         sup = f"supervisor pid {daemon.get('pid')}" if daemon else "no supervisor"
+        link = self.source.link()
+        if link.get("stale"):
+            seen = parse_iso(link.get("seen"))
+            when = time.strftime("%H:%M:%S", time.localtime(seen)) if seen else None
+            sup += f" · jobs as of {when}" if when else " · no jobs read yet"
         view = "active" if self.active_only else "all"
         if self.filter_text:
             view += f" matching '{self.filter_text}'"
@@ -361,6 +372,16 @@ class WatchApp(App):
 
     def action_toggle_all(self) -> None:
         self.active_only = not self.active_only
+        self.refresh_jobs()
+
+    def action_next_source(self) -> None:
+        if len(self.sources) < 2:
+            self.notify("No other source; add a remote with geofuse remote add.")
+            return
+        at = self.sources.index(self.source)
+        self.source = self.sources[(at + 1) % len(self.sources)]
+        self.selected, self._order, self._log_job = None, [], None
+        self.query_one(DataTable).clear()
         self.refresh_jobs()
 
     def action_toggle_log(self) -> None:
