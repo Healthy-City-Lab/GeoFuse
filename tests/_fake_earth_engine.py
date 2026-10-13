@@ -3,10 +3,11 @@
 Images are functions of planar coordinates ``(X, Y)`` returning arrays, with
 NaN for masked pixels; collections are lists of images with a date and
 properties. The band algebra the NDVI preps use (``select``, arithmetic,
-``bitwiseAnd`` / ``Or`` / ``And`` / ``eq`` / ``neq`` / ``lt``, ``updateMask``,
-``unmask``), the collection operations (``filterDate``, ``filter``, ``map``,
-``merge``, ``size``) and the temporal reducers are evaluated with numpy, so a
-test can run the real engine and check every output pixel.
+``bitwiseAnd`` / ``Or`` / ``And`` / ``eq`` / ``neq`` / ``lt`` / ``gte``,
+``updateMask``, ``unmask``), the collection operations (``filterDate``,
+``filter``, ``map``, ``merge``, ``size``) and the temporal reducers are
+evaluated with numpy, so a test can run the real engine and check every output
+pixel.
 
 ``FakeEarthEngine(aoi, collections, images)`` patches ``geofuse.ndvi`` while
 active: ``collections`` maps a collection id to its scenes, ``images`` maps an
@@ -117,6 +118,9 @@ class Image:
 
     def lt(self, k):
         return self._binary(k, self._logic(lambda a, b: a < b))
+
+    def gte(self, k):
+        return self._binary(k, self._logic(lambda a, b: a >= b))
 
     # ── masks ───────────────────────────────────────────────────
     def updateMask(self, mask):

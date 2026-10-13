@@ -121,6 +121,17 @@ REFLECTANCES = ("surface", "toa")
 WATER_DATASET = "JRC/GSW1_4/GlobalSurfaceWater"
 WATER_OCCURRENCE_MAX = 50
 
+#: How every prep computes NDVI from red and near-infrared reflectance.
+NDVI_FORMULA = "normalized_difference (negative inputs masked)"
+
+
+def _normalized_difference(nir, red):
+    """``(nir − red) / (nir + red)`` as band ``NDVI``, masked where either band
+    is negative: Earth Engine's ``normalizedDifference`` rule, which keeps
+    every value in [−1, 1]."""
+    valid = nir.gte(0).And(red.gte(0))
+    return nir.subtract(red).divide(nir.add(red)).updateMask(valid).rename("NDVI")
+
 
 def _shift_day(day: str, days: int) -> str:
     """The ISO date ``days`` days after ``day`` (before it when negative)."""
@@ -348,15 +359,14 @@ def _compute_resume_key(
 
     Two runs that hash to the same key produce identical output, so they can
     share an on-disk tile workspace — that's what lets resume work. The key
-    includes everything that affects the per-tile contents: study area
-    (geometry + CRS), date range, cloud threshold, export resolution, Earth
-    Engine collection ID and temporal statistic. Changing any one of these
-    spawns a fresh workspace and forces a full re-download (which is what you
-    want — old tiles would be from a different question). ``median`` adds
-    nothing to the hash, so its keys match those written before the
-    statistic was a choice. ``variant`` names acquisition options set away
-    from their defaults (water mask, cloud handling); the defaults add
-    nothing either.
+    includes everything that affects the per-tile contents: NDVI formula,
+    study area (geometry + CRS), date range, cloud threshold, export
+    resolution, Earth Engine collection ID and temporal statistic. Changing
+    any one of these spawns a fresh workspace and forces a full re-download
+    (which is what you want — old tiles would be from a different question).
+    ``median`` adds nothing to the hash. ``variant`` names acquisition
+    options set away from their defaults (water mask, cloud handling); the
+    defaults add nothing either.
     """
     h = hashlib.sha256()
     # Schema tag — bump when the on-disk tile format changes. ``planar_v1``
@@ -364,6 +374,8 @@ def _compute_resume_key(
     # grid). Older WGS84-tile cache entries hash to different keys and are
     # naturally orphaned (LRU-evicted as space pressure builds).
     h.update(b"planar_v1|")
+    # Formula tag: tiles computed with another NDVI formula never share a key.
+    h.update(b"nd_masked|")
     h.update(geometry_sha256(geom_wgs84_gdf).encode())
     h.update(f"|{start_date}|{end_date}|{cloud_max}|{resolution}|".encode())
     h.update(ee_collection.encode())
@@ -501,7 +513,8 @@ def _write_ndvi_sidecar(
     pixels were rasterised in, how much distortion that introduced, how many
     clusters and tiles the input decomposed into, the exact date range, the
     temporal statistic (median / mean / max over the window's cloud-free
-    images), and which Earth Engine ImageCollection was queried.
+    images), the NDVI formula (:data:`NDVI_FORMULA`), and which Earth Engine
+    ImageCollection was queried.
     ``start_date`` / ``end_date`` are the dates as given and
     ``end_date_exclusive`` the exclusive end of that window; ``used_*`` is
     the half-open window queried after any 2012 fill or coverage rescue.
@@ -527,6 +540,7 @@ def _write_ndvi_sidecar(
         "used_start_date": str(used_start_date or start_date),
         "used_end_date": str(used_end_date or end_date),
         "temporal_reducer": str(temporal_reducer),
+        "ndvi_formula": NDVI_FORMULA,
         "coverage_widened": bool(coverage_widened),
         "year_substituted": year_substituted,
         "water_mask": bool(water_mask),
@@ -682,7 +696,7 @@ class NDVIEngine:
         scale = 0.0001
         red = img.select("B4").multiply(scale)
         nir = img.select("B8").multiply(scale)
-        ndvi = nir.subtract(red).divide(nir.add(red)).rename("NDVI")
+        ndvi = _normalized_difference(nir, red)
         if not pixel_mask:
             return ndvi.copyProperties(img, img.propertyNames())
 
@@ -708,7 +722,7 @@ class NDVIEngine:
         scale = 0.0001
         red = img.select("B4").multiply(scale)
         nir = img.select("B8").multiply(scale)
-        ndvi = nir.subtract(red).divide(nir.add(red)).rename("NDVI")
+        ndvi = _normalized_difference(nir, red)
         if not pixel_mask:
             return ndvi.copyProperties(img, img.propertyNames())
         qa = img.select("QA60")
@@ -762,7 +776,7 @@ class NDVIEngine:
         offset = -0.2
         red = img.select("SR_B4").multiply(scale).add(offset)
         nir = img.select("SR_B5").multiply(scale).add(offset)
-        ndvi = nir.subtract(red).divide(nir.add(red)).rename("NDVI")
+        ndvi = _normalized_difference(nir, red)
         if not pixel_mask:
             return ndvi.copyProperties(img, img.propertyNames())
         return ndvi.updateMask(self._qa_pixel_clear(img)).copyProperties(
@@ -789,7 +803,7 @@ class NDVIEngine:
         ns, ni = self._ETM_TO_OLI["nir"]
         red = red.multiply(rs).add(ri)
         nir = nir.multiply(ns).add(ni)
-        ndvi = nir.subtract(red).divide(nir.add(red)).rename("NDVI")
+        ndvi = _normalized_difference(nir, red)
         if not pixel_mask:
             return ndvi.copyProperties(img, img.propertyNames())
         return ndvi.updateMask(self._qa_pixel_clear(img)).copyProperties(
@@ -805,7 +819,7 @@ class NDVIEngine:
         """
         red = img.select("B4")
         nir = img.select("B5")
-        ndvi = nir.subtract(red).divide(nir.add(red)).rename("NDVI")
+        ndvi = _normalized_difference(nir, red)
         if not pixel_mask:
             return ndvi.copyProperties(img, img.propertyNames())
         return ndvi.updateMask(self._qa_pixel_clear(img)).copyProperties(
@@ -819,7 +833,7 @@ class NDVIEngine:
         """
         red = img.select("B3")
         nir = img.select("B4")
-        ndvi = nir.subtract(red).divide(nir.add(red)).rename("NDVI")
+        ndvi = _normalized_difference(nir, red)
         if not pixel_mask:
             return ndvi.copyProperties(img, img.propertyNames())
         return ndvi.updateMask(self._qa_pixel_clear(img)).copyProperties(

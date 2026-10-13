@@ -72,7 +72,9 @@ dates requested (`start_date`, `end_date`; the end date is included, and
 and the dates actually queried (`used_start_date`, `used_end_date`, end
 exclusive; they differ if a sparse window was widened, or a 2012 window was
 filled from 2013: `year_substituted`), the
-temporal statistic (`temporal_reducer`), the acquisition options
+temporal statistic (`temporal_reducer`), the NDVI formula (`ndvi_formula`:
+pixels with negative red or near-infrared reflectance masked), the acquisition
+options
 (`reflectance`, `cloud_handling`, `water_mask` with `water_occurrence_max`),
 the cloud threshold and surviving image count, resolution, how the input
 decomposed into clusters and tiles, any tiles that exhausted their retries and

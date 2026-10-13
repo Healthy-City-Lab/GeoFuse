@@ -84,6 +84,10 @@ per-cluster tiles, and a metadata sidecar.
   one sensor instead to keep a multi-year series on one instrument, or a
   Landsat set without Landsat 7's striped scenes (after its 2003 scan-line
   failure) and without Landsat 9.
+- NDVI is the normalized difference of near-infrared and red reflectance. A
+  pixel where either band reads negative (top-of-atmosphere artefacts, surface
+  reflectance over water or deep shadow) is masked, as Earth Engine's
+  `normalizedDifference` does, so every value lies in [−1, 1].
 - Acquisition is configurable, and every option defaults to the behaviour
   above: surface or top-of-atmosphere reflectance; cloudy scenes dropped,
   cloudy pixels masked, or both (the default); an optional water mask that

@@ -251,13 +251,13 @@ class TemporalReducerNameTests(unittest.TestCase):
         self.assertEqual(ndvi.ndvi_output_name("a_2015", "max"), "a_2015_max")
 
     def test_resume_keys(self):
-        """Median keys are unchanged; every statistic gets its own key."""
+        """Median adds nothing to the key; every statistic gets its own key."""
         import hashlib
 
         aoi = _aoi(1.0)
         args = (aoi, "2023-06-01", "2023-09-30", 10, 10, "COPERNICUS/S2_SR_HARMONIZED")
         h = hashlib.sha256()
-        h.update(b"planar_v1|")
+        h.update(b"planar_v1|nd_masked|")
         h.update(geometry_sha256(aoi).encode())
         h.update(b"|2023-06-01|2023-09-30|10|10|")
         h.update(b"COPERNICUS/S2_SR_HARMONIZED")
