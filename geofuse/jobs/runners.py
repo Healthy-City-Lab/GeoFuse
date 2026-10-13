@@ -881,6 +881,39 @@ def run_ndvi(
     return {"output_paths": output_paths}
 
 
+def _column_years(
+    raw: gpd.GeoDataFrame,
+    date_column: str,
+    season_start_month: int,
+    season_end_month: int,
+) -> tuple[gpd.GeoDataFrame, list[tuple[int, gpd.GeoDataFrame, str, str]]]:
+    """``(features with a year, [(year, its features, first day, last day)])``
+    of a per-year NDVI job; a year's window runs over its season months."""
+    import calendar
+
+    from geofuse.longitudinal import parse_date_column
+
+    gdf = raw.copy()
+    parsed = parse_date_column(gdf[date_column])
+    gdf["_year"] = parsed.dt.year
+    gdf = gdf.dropna(subset=["_year"])
+    if gdf.empty:
+        raise ValueError(f"No valid years could be parsed from column '{date_column}'.")
+    gdf["_year"] = gdf["_year"].astype(int)
+    years = []
+    for year in sorted(gdf["_year"].unique()):
+        last_day = calendar.monthrange(int(year), int(season_end_month))[1]
+        years.append(
+            (
+                int(year),
+                gdf[gdf["_year"] == year].drop(columns=["_year"]),
+                f"{year:04d}-{season_start_month:02d}-01",
+                f"{year:04d}-{season_end_month:02d}-{last_day:02d}",
+            )
+        )
+    return gdf, years
+
+
 def run_ndvi_column(
     ctx: JobContext,
     *,
@@ -921,21 +954,12 @@ def run_ndvi_column(
     temporal statistic (``{name}_{year}_max_ndvi.tif`` for ``max``), or
     aggregation chain (``{name}_{year}_{chain}_ndvi.tif``).
     """
-    import calendar
-
     from geofuse.crs_utils import buffer_gdf_union_metres
-    from geofuse.longitudinal import parse_date_column
 
-    gdf = dataset_data["raw"].copy()
-    parsed = parse_date_column(gdf[date_column])
-    gdf["_year"] = parsed.dt.year
-    gdf = gdf.dropna(subset=["_year"])
-    if gdf.empty:
-        raise ValueError(f"No valid years could be parsed from column '{date_column}'.")
-    gdf["_year"] = gdf["_year"].astype(int)
-
-    unique_years = sorted(gdf["_year"].unique())
-    n_years = len(unique_years)
+    gdf, years = _column_years(
+        dataset_data["raw"], date_column, season_start_month, season_end_month
+    )
+    n_years = len(years)
 
     # CRS chosen once from the whole dataset so every per-year raster aligns.
     crs_override = NDVIEngine.compute_export_crs(gdf)
@@ -954,7 +978,7 @@ def run_ndvi_column(
             ctx.wait_while_paused()
         return ctx.is_cancelled()
 
-    for idx, year in enumerate(unique_years):
+    for idx, (year, year_gdf, start_d, end_d) in enumerate(years):
         if ctx.is_cancelled():
             return {"output_paths": output_paths}
         # Safe pause point: hold between years so a resume continues with the
@@ -964,12 +988,7 @@ def run_ndvi_column(
         if ctx.is_cancelled():
             return {"output_paths": output_paths}
 
-        year_gdf = gdf[gdf["_year"] == year].drop(columns=["_year"])
         geometry = buffer_gdf_union_metres(year_gdf, buffer_m)
-
-        start_d = f"{year:04d}-{season_start_month:02d}-01"
-        last_day = calendar.monthrange(int(year), int(season_end_month))[1]
-        end_d = f"{year:04d}-{season_end_month:02d}-{last_day:02d}"
         output_name = f"{base_name}_{year}"
 
         ctx.progress(
