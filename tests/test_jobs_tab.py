@@ -46,6 +46,12 @@ def _ago(seconds: float) -> str:
 
 class JobsTabTests(unittest.TestCase):
     def setUp(self):
+        from geofuse import userconfig
+        from geofuse.jobs import supervisor
+
+        # The app script replaces these in this process; put them back after.
+        self.addCleanup(setattr, userconfig, "load", userconfig.load)
+        self.addCleanup(setattr, supervisor, "start_daemon", supervisor.start_daemon)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         root = self.tmp.name
