@@ -75,11 +75,8 @@ from geofuse.longitudinal import (
 from geofuse.mixedlm_postscore import (
     compute_post_metrics as _compute_mixedlm_post_metrics,
 )
-from geofuse.ndvi import (
-    NDVIEngine,
-    ndvi_output_name,
-    normalize_temporal_reducers,
-)
+from geofuse.ndvi import NDVIEngine, normalize_temporal_reducers
+from geofuse.ndvi_chains import output_stems
 from geofuse.persistence.job_executor import JobContext
 from geofuse.raster_sampling import LAZY_RASTER_THRESHOLD_BYTES, LazyRasterArray
 from geofuse.vector_io import read_vector_aliased_column, read_vector_subset
@@ -761,15 +758,20 @@ def _ndvi_output_paths(
     output_name: str,
     temporal_reducers: Sequence[str],
     *,
+    chains: Sequence[Mapping] | None = None,
     save_geotiff: bool,
     save_gpkg: bool,
     save_geojson: bool,
     save_cluster_tiles: bool,
 ) -> list[str]:
-    """Existing files of one NDVI download, every statistic in turn."""
+    """Existing files of one NDVI download, every statistic (or every
+    aggregation chain) in turn."""
     paths: list[str] = []
-    for reducer in normalize_temporal_reducers(temporal_reducers):
-        stem = os.path.join(folder, ndvi_output_name(output_name, reducer))
+    stems = output_stems(
+        output_name, normalize_temporal_reducers(temporal_reducers), chains or ()
+    )
+    for base in stems.values():
+        stem = os.path.join(folder, base)
         for suffix, enabled in (
             ("_ndvi.tif", save_geotiff),
             ("_ndvi.gpkg", save_gpkg),
@@ -808,8 +810,10 @@ def run_ndvi(
     substitute_2012: bool = False,
     preset: str | None = None,
     ee_project: str | None = None,
+    chains: Sequence[Mapping] | None = None,
 ) -> dict:
-    """Run NDVI for a single date range, one set of files per statistic.
+    """Run NDVI for a single date range, one set of files per statistic
+    (or per aggregation chain, when ``chains`` are given).
 
     Both ends of the range are included: the engine is called with
     ``end_inclusive=True``, so a range ending 30 September keeps that day.
@@ -854,6 +858,7 @@ def run_ndvi(
         substitute_2012=substitute_2012,
         preset=preset,
         end_inclusive=True,
+        chains=chains,
     )
 
     if result.get("status") == "cancelled":
@@ -865,6 +870,7 @@ def run_ndvi(
         output_dir,
         output_name,
         temporal_reducers,
+        chains=chains,
         save_geotiff=save_geotiff,
         save_gpkg=save_gpkg,
         save_geojson=save_geojson,
@@ -900,6 +906,7 @@ def run_ndvi_column(
     substitute_2012: bool = False,
     preset: str | None = None,
     ee_project: str | None = None,
+    chains: Sequence[Mapping] | None = None,
 ) -> dict:
     """Run one NDVI raster per year present in ``date_column``.
 
@@ -911,7 +918,8 @@ def run_ndvi_column(
     year's raster snaps to the same global pixel grid and the outputs align.
     Results land in a ``{name}_temporal_ndvi/`` folder, one set of files per
     year (``{name}_{year}_ndvi.tif`` plus optional GeoPackage/GeoJSON) and
-    temporal statistic (``{name}_{year}_max_ndvi.tif`` for ``max``).
+    temporal statistic (``{name}_{year}_max_ndvi.tif`` for ``max``), or
+    aggregation chain (``{name}_{year}_{chain}_ndvi.tif``).
     """
     import calendar
 
@@ -996,6 +1004,7 @@ def run_ndvi_column(
             substitute_2012=substitute_2012,
             preset=preset,
             end_inclusive=True,
+            chains=chains,
         )
         if result.get("status") == "cancelled":
             return {"output_paths": output_paths}
@@ -1008,6 +1017,7 @@ def run_ndvi_column(
                 job_folder,
                 output_name,
                 temporal_reducers,
+                chains=chains,
                 save_geotiff=save_geotiff,
                 save_gpkg=save_gpkg,
                 save_geojson=save_geojson,

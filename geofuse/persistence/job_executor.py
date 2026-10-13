@@ -13,7 +13,7 @@ import logging
 import threading
 import time
 import traceback
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -393,6 +393,7 @@ class JobExecutor:
         substitute_2012: bool = False,
         preset: str | None = None,
         ee_project: str | None = None,
+        chains: Sequence[Mapping] | None = None,
     ) -> Future:
         """Run an NDVI (single-range) job in a fresh subprocess.
 
@@ -433,6 +434,7 @@ class JobExecutor:
                 "substitute_2012": bool(substitute_2012),
                 "preset": preset,
                 "ee_project": ee_project,
+                "chains": [dict(c) for c in chains] if chains else None,
             },
             process_name=f"ndvi-child-{record.id}",
         )
@@ -463,6 +465,7 @@ class JobExecutor:
         substitute_2012: bool = False,
         preset: str | None = None,
         ee_project: str | None = None,
+        chains: Sequence[Mapping] | None = None,
     ) -> Future:
         """Run a per-year NDVI (date-column) job in a fresh subprocess."""
         from geofuse.jobs.subprocess_runner import run_ndvi_column_child
@@ -495,6 +498,7 @@ class JobExecutor:
                 "substitute_2012": bool(substitute_2012),
                 "preset": preset,
                 "ee_project": ee_project,
+                "chains": [dict(c) for c in chains] if chains else None,
             },
             process_name=f"ndvi-col-child-{record.id}",
         )

@@ -543,6 +543,7 @@ def run_ndvi_child(
     substitute_2012=False,
     preset=None,
     ee_project=None,
+    chains=None,
 ) -> None:
     """Subprocess entry point for ``run_ndvi`` (single date range).
 
@@ -585,6 +586,7 @@ def run_ndvi_child(
             substitute_2012=substitute_2012,
             preset=preset,
             ee_project=ee_project,
+            chains=chains,
         )
 
     except BaseException as exc:  # noqa: BLE001
@@ -623,6 +625,7 @@ def run_ndvi_column_child(
     substitute_2012=False,
     preset=None,
     ee_project=None,
+    chains=None,
 ) -> None:
     """Subprocess entry point for ``run_ndvi_column`` (one raster per year)."""
     try:
@@ -659,6 +662,7 @@ def run_ndvi_column_child(
             substitute_2012=substitute_2012,
             preset=preset,
             ee_project=ee_project,
+            chains=chains,
         )
 
     except BaseException as exc:  # noqa: BLE001
