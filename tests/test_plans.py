@@ -392,7 +392,9 @@ class TabParityTests(_Case):
             f.write(_STUB)
         sys.modules.pop("gf_parity_stub", None)
 
-    def click(self, tab, seed, call, button, numbers=None, selects=None):
+    def click(
+        self, tab, seed, call, button, numbers=None, selects=None, submits=1
+    ):
         from streamlit.testing.v1 import AppTest
 
         path = os.path.join(self.dir, "app.py")
@@ -415,7 +417,9 @@ class TabParityTests(_Case):
         at.run()
         self.assertFalse(at.exception, [e.value for e in at.exception])
         stub = sys.modules["gf_parity_stub"]
-        self.assertEqual(len(stub.STORE.submitted), 1)
+        self.assertEqual(len(stub.STORE.submitted), submits)
+        if not submits:
+            return at
         (rec,) = stub.STORE.submitted
         ((method, _r, args, kwargs),) = stub.EXECUTOR.calls
         return rec, method, args, kwargs
@@ -520,6 +524,31 @@ class TabParityTests(_Case):
         )
         self.assertEqual(gui[3]["init_args"]["api_key"], "AIzaSTORED")
         self.assert_same(gui, plans.build(spec, api_key="AIzaSTORED"))
+
+    def test_gvi_tab_api_mode_without_a_key_submits_nothing(self):
+        from geofuse import credentials
+
+        self.addCleanup(setattr, credentials, "get", credentials.get)
+        at = self.click(
+            "gvi",
+            {"gvi_picked_paths": [self.city], "gvi_download_mode": "API (Street View)"},
+            "import geofuse.credentials as c\n"
+            "c.get = lambda name: None\n"
+            f"gvi.render({self.out!r}, {ROOT!r})",
+            "gvi_run_analysis",
+            submits=0,
+        )
+        self.assertTrue(any("needs a key" in e.value for e in at.error))
+        (spec,) = self.expand(
+            f"""
+            output_dir = {self.out!r}
+            [[gvi]]
+            study_area = "city.gpkg"
+            download_mode = "api"
+            """
+        )
+        with self.assertRaises(plans.PlanError):
+            plans.build(spec)
 
     def test_fusion_tab(self):
         seed = {

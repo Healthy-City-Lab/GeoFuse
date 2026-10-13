@@ -1098,11 +1098,16 @@ def _render_gvi_settings_map() -> None:
                     type="password",
                     autocomplete="off",
                     help=(
-                        "Optional Google Street View key. When empty, the key "
-                        "stored with `geofuse credentials` is used, else "
-                        "built-in access."
+                        "A Google Maps Platform key with the Map Tiles API "
+                        "enabled. When empty, the key stored with `geofuse "
+                        "credentials set streetview-key` is used."
                     ),
                     key="gvi_google_api_key",
+                )
+                st.caption(
+                    "Google bills the API per request. It sees only the most "
+                    "recent capture at each place, so a specific-year run keeps "
+                    "a point only when that capture is within the year limit."
                 )
             st.slider(
                 "Grid Resolution (m)",
@@ -1459,10 +1464,20 @@ def render(output_dir: str, parent_dir: str) -> None:
     )
 
     if run:
+        api_mode = st.session_state.get("gvi_download_mode") == "API (Street View)"
         if not gvi_out_ok:
             st.error("Select at least one output format.")
         elif not st.session_state.datasets:
             st.warning("Upload at least one study area to get started.")
+        elif (
+            api_mode
+            and not st.session_state.get("gvi_google_api_key")
+            and not _stored_streetview_key()
+        ):
+            st.error(
+                "API (Street View) needs a key: type one above, or store it "
+                "with `geofuse credentials set streetview-key`."
+            )
         else:
             save_gp = st.session_state.get("gvi_out_gpkg", True)
             save_gt = st.session_state.get("gvi_out_geotiff", False)
