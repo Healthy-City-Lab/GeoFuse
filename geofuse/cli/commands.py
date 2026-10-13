@@ -794,13 +794,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--daemon", action="store_true", help=argparse.SUPPRESS)
     p.set_defaults(func=cmd_supervisor)
 
-    from geofuse.cli import account, hpc, library, quick, results
+    from geofuse.cli import account, hpc, library, quick, remote, results
 
     quick.add_parsers(sub, common)
     hpc.add_parsers(sub, common)
     account.add_parsers(sub, common)
     library.add_parsers(sub, common)
     results.add_parsers(sub, common)
+    remote.add_parsers(sub, common)
     return parser
 
 

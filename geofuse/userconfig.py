@@ -22,6 +22,10 @@
     caches = "/local/disk/geofuse"      # panorama + NDVI tile caches
                                         # (default: <repo>/logs/caches)
 
+    [remotes.cluster]                   # another machine (geofuse remote)
+    host = "login.cluster.example.org"
+    command = "conda run -n geofuse geofuse"
+
 The file lives in the per-user configuration folder (``%LOCALAPPDATA%\\geofuse``
 on Windows, ``~/.config/geofuse`` on Linux, Application Support on macOS).
 Every key is optional and defaults to the values above. Credentials are not
@@ -50,6 +54,16 @@ LIMIT_DEFAULTS: dict[str, int] = {
 }
 #: Where credentials are kept: the OS keyring when one works, or a file.
 CREDENTIAL_STORES = ("auto", "keyring", "file")
+#: Keys a ``[remotes.<name>]`` table takes (see ``geofuse.jobs.remote``).
+REMOTE_KEYS: dict[str, type | tuple] = {
+    "host": str,
+    "user": str,
+    "port": int,
+    "ssh_options": list,
+    "command": str,
+    "state_dir": str,
+    "ssh": (str, list),
+}
 _TABLES = {
     "earthengine": {"project": str},
     "limits": dict.fromkeys(LIMIT_DEFAULTS, int),
@@ -96,6 +110,8 @@ def _check(doc: dict) -> None:
                 isinstance(v, dict) for v in value.values()
             ):
                 raise ConfigError("'remotes' holds one table per remote host.")
+            for name, table in value.items():
+                _check_remote(name, table)
         elif key in _TABLES:
             if not isinstance(value, dict):
                 raise ConfigError(f"'{key}' must be a table ([{key}]).")
@@ -126,6 +142,24 @@ def _check(doc: dict) -> None:
                 f"Unknown key '{key}' (known: state_dir, earthengine, limits, "
                 "credentials, paths, remotes)."
             )
+
+
+def _check_remote(name: str, table: dict) -> None:
+    where = f"remotes.{name}"
+    if not table.get("host"):
+        raise ConfigError(f"'{where}.host' is missing.")
+    for key, value in table.items():
+        kind = REMOTE_KEYS.get(key)
+        if kind is None:
+            raise ConfigError(
+                f"Unknown key '{where}.{key}' (known: {', '.join(REMOTE_KEYS)})."
+            )
+        if kind is int and (isinstance(value, bool) or not isinstance(value, int)):
+            raise ConfigError(f"'{where}.{key}' must be a whole number.")
+        if not isinstance(value, kind):
+            raise ConfigError(f"'{where}.{key}' has the wrong type.")
+        if isinstance(value, list) and not all(isinstance(v, str) for v in value):
+            raise ConfigError(f"'{where}.{key}' must list text only.")
 
 
 def read_document(path: str | os.PathLike | None = None) -> dict:
