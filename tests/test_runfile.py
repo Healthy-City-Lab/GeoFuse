@@ -190,11 +190,27 @@ class RefusalTests(_Case):
         leaked = '"AIza' + "C" * 35 + '"'
         self.assert_refused(PIPELINE.replace('"data/a.gpkg"', leaked), "credential")
 
+    def test_chains_are_checked_with_the_chain_named(self):
+        bad = 'cloud_max = 20\nchains = ["g7: temporal:mean, temporal:max"]'
+        refused = PIPELINE.replace("cloud_max = 20", bad)
+        self.assert_refused(refused, r"city: 'chains_ranges': Chain 'g7'")
+        shared = 'cloud_max = 30\nchains = ["a: temporal:max"]'
+        run = self.load(
+            PIPELINE.replace("cloud_max = 30", shared),
+            ["ndvi.city.chains_column=['b: temporal:mean']"],
+        )
+        s = run.step("ndvi.city").settings
+        a = {"name": "a", "steps": ["temporal:max"]}
+        b = {"name": "b", "steps": ["temporal:mean"]}
+        self.assertEqual((s["chains_ranges"], s["chains_column"]), ([a], [b]))
+
     def test_references_and_dependencies(self):
         self.assert_refused(PIPELINE.replace("@gvi.city", "@gvi.town"), "names no step")
         crossed = PIPELINE.replace('ndvi = "@ndvi.city[max]"', 'ndvi = "@gvi.city"')
         self.assert_refused(crossed, "must reference")
-        self.assert_refused(PIPELINE.replace("[max]", "[p90]"), "statistic")
+        self.assert_refused(PIPELINE.replace("[max]", "[max-1]"), "not a step ref")
+        named = PIPELINE.replace('"@gvi.city"', '"@gvi.city[max]"')
+        self.assert_refused(named, "only NDVI references")
         area = 'study_area = "data/city.gpkg"'
         cyclic = PIPELINE.replace(
             f'name = "city"\n{area}',

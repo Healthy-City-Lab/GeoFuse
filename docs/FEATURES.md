@@ -103,6 +103,11 @@ per-cluster tiles, and a metadata sidecar.
   combination; every statistic writes its own files, and one download per tile
   serves all of them. When Earth Engine refuses that download as too large, the
   statistics are split across requests before the tile itself is subdivided.
+- Aggregation chains replace the statistics when the order of operations
+  matters: a neighbourhood statistic on every scene before the temporal
+  statistic, a water mask on the composite only, or a neighbourhood statistic
+  of the composite, in the order you give. Each chain writes its own files, so
+  a reference product can be reproduced exactly next to the plain composites.
 - Downloaded tiles are cached per statistic, compactly and without changing any
   output, so a re-run, or a run that adds a statistic, fetches only what is
   missing.

@@ -174,8 +174,10 @@ class ExpandTests(_Case):
             ndvi = "@ndvi.city"
             gvi = {2015 = "gvi.gpkg", 2018 = "gvi.gpkg"}
             """
-        with self.assertRaisesRegex(PlanError, r"several statistics .*\[mean\]"):
+        with self.assertRaisesRegex(PlanError, r"several outputs .*\[mean\]"):
             self.expand(base)
+        with self.assertRaisesRegex(PlanError, "no output named 'p90'"):
+            self.expand(base.replace("@ndvi.city", "@ndvi.city[p90]"))
         with self.assertRaisesRegex(PlanError, "no GVI file for 2018"):
             self.expand(
                 base.replace("@ndvi.city", "@ndvi.city[max]"),
@@ -188,6 +190,61 @@ class ExpandTests(_Case):
             )
         with self.assertRaisesRegex(PlanError, "has no column 'yr'"):
             self.expand(base, ["ndvi.city.year_column=yr"])
+
+    def test_chains_replace_the_statistics_of_every_date_mode(self):
+        specs = self.expand(
+            """
+            [defaults.ndvi]
+            chains = [
+              {name = "f500", steps = ["focal:mean:500", "temporal:mean",
+                                       "water_mask"]},
+              {name = "max", steps = ["temporal:max"]},
+            ]
+
+            [[ndvi]]
+            name = "city"
+            study_area = "city.gpkg"
+            ranges = [[2019-05-01, 2019-09-30]]
+            year_column = "year"
+            statistics_column = ["mean"]
+            chains_ranges = ["r: temporal:median"]
+
+            [[fusion]]
+            target = "cohort.gpkg"
+            outcomes = ["cesd"]
+            mode = "year-aware"
+            date_column = "visit"
+            ndvi = "@ndvi.city[f500]"
+            gvi = {2015 = "gvi.gpkg", 2018 = "gvi.gpkg"}
+            """
+        )
+        ranged, column, fusion = specs
+        self.assertEqual(
+            {k: os.path.basename(p) for k, p in ranged.outputs["files"].items()},
+            {"r": "city_20190501_20190930_r_ndvi.tif"},
+        )
+        self.assertEqual(sorted(column.outputs["years"]), ["f500", "max"])
+        self.assertEqual(
+            {y: os.path.basename(p) for y, p in fusion.options["ndvi_files"].items()},
+            {"2015": "city_2015_f500_ndvi.tif", "2018": "city_2018_f500_ndvi.tif"},
+        )
+        sub = plans.build(column)
+        chains = column.settings["chains_column"]
+        self.assertEqual(sub.kwargs["chains"], chains)
+        self.assertEqual(sub.params["chains"], chains)
+        self.assertEqual(chains[0]["steps"][0], "focal:mean:500")
+
+    def test_ndvi_jobs_without_chains_pass_none(self):
+        (spec,) = self.expand(
+            '[[ndvi]]\nstudy_area = "city.gpkg"\nranges = [[2019-05-01, 2019-09-30]]\n'
+        )
+        sub = plans.build(spec)
+        self.assertNotIn("chains", sub.kwargs)
+        self.assertNotIn("chains", sub.params)
+        self.assertEqual(
+            os.path.basename(spec.outputs["files"]["median"]),
+            "city_20190501_20190930_ndvi.tif",
+        )
 
     def test_filename_lists_match_years(self):
         (fusion,) = self.expand(

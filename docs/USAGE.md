@@ -249,7 +249,7 @@ outcomes = ["cesd"]
 covariates = ["age"]
 mode = "year-aware"
 date_column = "interview_date"
-ndvi = "@ndvi.city"        # the files the ndvi step writes ("@ndvi.city[max]" for one statistic)
+ndvi = "@ndvi.city"        # the files the ndvi step writes ("@ndvi.city[max]" for one statistic or chain)
 gvi = "@gvi.city"
 ```
 
@@ -272,6 +272,45 @@ geofuse submit run.toml --only gvi.city     # one step; the steps it needs are t
 
 A step starts when the steps it references finish; independent steps run side
 by side within the limits below.
+
+### NDVI aggregation chains
+
+By default each date mode writes one composite per temporal statistic. A
+reference product may instead summarise each scene's neighbourhood before the
+temporal statistic, or mask water on the finished composite only. An
+aggregation chain states the order:
+
+```toml
+[[ndvi]]
+name = "city"
+study_area = "data/city.gpkg"
+year_column = "year"
+chains = [
+  {name = "mean", steps = ["temporal:mean"]},
+  {name = "f500", steps = ["focal:mean:500", "temporal:mean", "water_mask"]},
+]
+```
+
+Each chain has exactly one temporal step. Steps before it act on every scene,
+steps after it on the composite:
+
+| Step | What it does |
+| --- | --- |
+| `focal:<stat>:<radius_m>` | The mean, max, min or median over a circle of that radius (above 0, at most 5,000 m) around each pixel, as Earth Engine's `reduceNeighborhood` computes it; a masked pixel stays masked |
+| `temporal:<stat>` | The median, mean or max over the window's scenes |
+| `water_mask` | Masks pixels open water covers at least half the time |
+
+A chain named `f500` writes `city_2018_f500_ndvi.*` and records its steps in
+the sidecar. Names use letters, digits and `_`, and must differ ignoring case.
+`chains` replaces the statistics of every date mode the step uses;
+`chains_ranges`, `chains_specific` and `chains_column` set one date mode. With
+a neighbourhood step, scenes are fetched over the study area grown by the
+largest radius, so pixels at its edge get whole neighbourhoods. **Mask water**
+(`water_mask = true`) still masks every scene first, before each chain. A
+fusion step names one chain's files with `@ndvi.city[f500]`. A chain that is
+only a temporal step, with or without a leading `water_mask`, shares that
+statistic's cached tiles. On the command line, chains are text:
+`--chains-column "f500: focal:mean:500, temporal:mean, water_mask"`.
 
 ### Following and managing jobs
 
