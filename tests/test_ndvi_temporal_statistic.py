@@ -332,6 +332,17 @@ class _EngineCase(unittest.TestCase):
         np.testing.assert_array_equal(arr, _expected(stat, X, Y).astype(dtype))
         self.assertTrue((arr == -9999).any(), "sentinel pixels expected")
         self.assertTrue((arr != -9999).any())
+        self.assertStatistics(path)
+
+    def assertStatistics(self, path):
+        """The exact statistics of the pixels other than the sentinel are stored."""
+        with rasterio.open(path) as src:
+            arr = src.read(1).astype(np.float64)
+            tags = src.tags(1)
+        valid = arr[arr != -9999]
+        self.assertEqual(float(tags["STATISTICS_MINIMUM"]), valid.min())
+        self.assertEqual(float(tags["STATISTICS_MAXIMUM"]), valid.max())
+        self.assertAlmostEqual(float(tags["STATISTICS_MEAN"]), valid.mean(), places=10)
 
     def sidecar(self, name):
         with open(os.path.join(self.out, f"{name}_ndvi.json")) as f:
@@ -438,8 +449,10 @@ class TiledCacheTests(_EngineCase):
         for key in keys.values():
             tiles = os.listdir(os.path.join(self.cache, key))
             self.assertEqual(len(tiles), n_tiles)
-            with rasterio.open(os.path.join(self.cache, key, tiles[0])) as t:
-                self.assertEqual((t.count, t.dtypes[0]), (1, "float32"))
+            tile = os.path.join(self.cache, key, tiles[0])
+            with rasterio.open(tile) as t:
+                self.assertEqual((t.count, t.dtypes[0], t.nodata), (1, "float32", None))
+            self.assertStatistics(tile)
         self.assertEqual(self.engine().tile_cache.stats()["entries"], 2)
 
         # Adding mean downloads mean only, one single-band request per tile.
@@ -478,6 +491,23 @@ class TiledCacheTests(_EngineCase):
             _read_with_centres(os.path.join(self.out, "site_ndvi.tif"))[0], first
         )
         self.assertComposite(os.path.join(self.out, "site_max_ndvi.tif"), "max")
+
+    def test_per_cluster_tiles_carry_statistics(self):
+        with FakeEarthEngine(self.aoi):
+            res = _run(
+                self.engine(),
+                self.aoi,
+                self.out,
+                "median",
+                max_tile_size_km=1,
+                write_cluster_tiles=True,
+            )
+        self.assertEqual(res["status"], "success")
+        tiles_dir = os.path.join(self.out, "site_ndvi_tiles")
+        clusters = [f for f in os.listdir(tiles_dir) if f.endswith(".tif")]
+        self.assertTrue(clusters)
+        for name in clusters:
+            self.assertStatistics(os.path.join(tiles_dir, name))
 
     def test_failed_tile_is_a_gap_for_every_statistic_it_carried(self):
         with FakeEarthEngine(self.aoi) as fake:

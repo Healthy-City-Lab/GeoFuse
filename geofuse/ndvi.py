@@ -28,7 +28,9 @@ from .crs_utils import (
     raster_geographic_bounds,
     reproject_geodataframe_to_wgs84,
     select_grid_crs_with_warning,
+    statistics_tags,
     stream_mosaic_to_geotiff,
+    write_band_statistics,
 )
 from .ee_auth import initialize as initialize_earth_engine
 from .ee_utils import (
@@ -621,6 +623,7 @@ class _Donors:
 
 def _write_tile(path: str, left: float, top: float, values, res: float, crs) -> None:
     """A cache tile, written as :func:`_extract_band` writes one."""
+    tags = statistics_tags([values], nodata=-9999, size=values.size)
     profile = {
         "driver": "GTiff",
         "height": values.shape[0],
@@ -636,6 +639,7 @@ def _write_tile(path: str, left: float, top: float, values, res: float, crs) -> 
     try:
         with rasterio.open(part, "w", **profile) as dst:
             dst.write(values, 1)
+            dst.update_tags(1, **tags)
         os.replace(part, path)
     finally:
         if os.path.exists(part):
@@ -729,12 +733,15 @@ def _extract_band(
     ``dtype`` defaults to the source's. Cache tiles are stored as float32:
     every mosaic built from them is float32, so outputs match a mosaic of
     Earth Engine's own float64 files exactly, and with DEFLATE plus the
-    floating-point predictor a tile takes under half the bytes. The file is
-    written to ``.part`` and renamed, so a tile on disk is always whole.
+    floating-point predictor a tile takes under half the bytes. The file
+    stores the exact statistics of its pixels, without the source's nodata
+    (the -9999 sentinel when the source declares none). It is written to
+    ``.part`` and renamed, so a tile on disk is always whole.
     """
     with rasterio.open(src_path) as src:
         out_dtype = dtype or src.dtypes[band - 1]
         data = src.read(band, out_dtype=out_dtype)
+        fill = src.nodata if src.nodata is not None else -9999
         profile = {
             "driver": "GTiff",
             "height": src.height,
@@ -750,6 +757,7 @@ def _extract_band(
     try:
         with rasterio.open(part, "w", **profile) as dst:
             dst.write(data, 1)
+            dst.update_tags(1, **statistics_tags([data], nodata=fill, size=data.size))
         os.replace(part, dst_path)
     finally:
         if os.path.exists(part):
@@ -2263,9 +2271,10 @@ class NDVIEngine:
                 return _each(cancelled)
 
             # Atomic publish: the user-visible final raster only appears
-            # once the EE write finished cleanly.
+            # once the EE write finished cleanly, with its statistics.
             for names, path in files:
                 if len(names) == 1:
+                    write_band_statistics(path, nodata=-9999)
                     os.replace(path, final_tifs[names[0]])
                     continue
                 for band, r in enumerate(names, start=1):
@@ -2453,6 +2462,7 @@ class NDVIEngine:
                     compress=True,
                     dst_dtype="float32",
                 )
+                write_band_statistics(cluster_path)
             except Exception as e:
                 _log("WARN", f"Cluster {cid} mosaic failed: {e}")
                 continue
@@ -3130,6 +3140,7 @@ class NDVIEngine:
                 compress=True,
                 dst_dtype="float32",
             )
+            write_band_statistics(final_tif)
 
             _emit_ndvi_progress(
                 ndvi_progress_callback,

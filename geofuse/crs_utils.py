@@ -8,7 +8,7 @@ which matches Leaflet/Folium and ``generate_raster_grid`` in ``geofuse.core``.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 import geopandas as gpd
 import numpy as np
@@ -16,6 +16,7 @@ import rasterio
 import shapely
 from pyproj import CRS as PyProjCRS
 from pyproj import Geod, Transformer
+from rasterio.errors import RasterBlockError
 from rasterio.transform import from_bounds
 from rasterio.warp import (
     Resampling,
@@ -146,6 +147,88 @@ def build_internal_overviews(
     with rasterio.open(path, "r+") as dst:
         dst.build_overviews(list(factors), resampling)
         dst.update_tags(ns="rio_overview", resampling=resampling.name)
+
+
+def _block_stored(ds, band: int, i: int, j: int) -> bool:
+    """Whether block ``(i, j)`` of ``band`` holds bytes on disk.
+
+    A GeoTIFF written with ``SPARSE_OK`` omits blocks that are entirely
+    nodata; GDAL reports no size for them and reads them as nodata.
+    """
+    try:
+        return ds.block_size(band, i, j) > 0
+    except RasterBlockError:
+        return False
+
+
+def statistics_tags(
+    blocks: Iterable[np.ndarray], *, nodata: float | None = None, size: int
+) -> dict[str, str]:
+    """GDAL's ``STATISTICS_*`` band metadata for the pixels in ``blocks``.
+
+    Exact minimum, maximum, mean, population standard deviation and valid
+    percentage of a band of ``size`` pixels, merged block by block. Pixels
+    equal to ``nodata`` and non-finite pixels are left out. Empty when no
+    pixel is valid.
+    """
+    n, mean, m2 = 0, 0.0, 0.0
+    lo, hi = np.inf, -np.inf
+    for block in blocks:
+        a = np.asarray(block).ravel()
+        a = a[np.isfinite(a)]
+        if nodata is not None:
+            a = a[a != nodata]
+        if a.size == 0:
+            continue
+        # ── Running moments (Chan) ──────────────────────────
+        a = a.astype(np.float64)
+        k, m = a.size, float(a.mean())
+        delta, total = m - mean, n + k
+        mean += delta * k / total
+        m2 += float(((a - m) ** 2).sum()) + delta * delta * n * k / total
+        n = total
+        lo, hi = min(lo, float(a.min())), max(hi, float(a.max()))
+    if n == 0:
+        return {}
+    return {
+        "STATISTICS_MINIMUM": repr(lo),
+        "STATISTICS_MAXIMUM": repr(hi),
+        "STATISTICS_MEAN": repr(mean),
+        "STATISTICS_STDDEV": repr(float(np.sqrt(m2 / n))),
+        "STATISTICS_VALID_PERCENT": repr(100.0 * n / size),
+    }
+
+
+def write_band_statistics(
+    path: str, *, nodata: float | None = None
+) -> list[dict[str, str]]:
+    """Store each band's exact statistics in a GeoTIFF's metadata.
+
+    GDAL readers take these ``STATISTICS_*`` tags instead of estimating a
+    band's statistics from a sample of pixels. Only blocks stored on disk
+    are read (a sparse file omits blocks that hold nothing but nodata), so
+    the cost follows the area with data rather than the bounding box.
+
+    Pixels equal to the file's nodata value, or to ``nodata`` when the file
+    declares none, and non-finite pixels are left out; the file's nodata is
+    not changed. A band without a valid pixel gets no tags. Returns each
+    band's tags.
+    """
+    results: list[dict[str, str]] = []
+    with rasterio.open(path, "r+") as ds:
+        fill = ds.nodata if ds.nodata is not None else nodata
+        tiff = ds.driver == "GTiff"
+        for band in range(1, ds.count + 1):
+            blocks = (
+                ds.read(band, window=win)
+                for (i, j), win in ds.block_windows(band)
+                if not tiff or _block_stored(ds, band, i, j)
+            )
+            tags = statistics_tags(blocks, nodata=fill, size=ds.width * ds.height)
+            if tags:
+                ds.update_tags(band, **tags)
+            results.append(tags)
+    return results
 
 
 def stream_mosaic_to_geotiff(
