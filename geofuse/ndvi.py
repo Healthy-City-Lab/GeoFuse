@@ -15,7 +15,12 @@ import geopandas as gpd
 import numpy as np
 import rasterio
 import requests
+import shapely
+from pyproj import Transformer
+from rasterio.transform import from_origin
+from rasterio.windows import Window
 from shapely.geometry import box
+from shapely.ops import transform as shapely_transform
 
 from .core import build_planar_tiles
 from .crs_utils import (
@@ -442,6 +447,262 @@ def _compute_resume_key(
     return h.hexdigest()[:16]
 
 
+def _content_key(
+    start_date: str,
+    end_date: str,
+    cloud_max,
+    resolution: int,
+    ee_collection: str,
+    temporal_reducer: str = "median",
+    variant: tuple[str, ...] = (),
+) -> str:
+    """What a workspace's tiles hold apart from the study area: every field
+    of :func:`_compute_resume_key` but the geometry.
+
+    Two runs with the same content key compute the same value at every pixel
+    inside both study areas: each fetches every scene its own area's pixels
+    and their neighbourhoods need, on one snap grid.
+    """
+    h = hashlib.sha256()
+    h.update(b"content_v1|planar_v1|nd_masked|")
+    h.update(f"{start_date}|{end_date}|{cloud_max}|{resolution}|".encode())
+    h.update(ee_collection.encode())
+    if temporal_reducer != "median":
+        h.update(f"|{temporal_reducer}".encode())
+    for option in variant:
+        h.update(f"|{option}".encode())
+    return h.hexdigest()[:16]
+
+
+# ────────────────────────────────────────────────────────────────────
+# Reusing tiles cached by a run over a larger area
+# ────────────────────────────────────────────────────────────────────
+
+#: Each tiled workspace's record, ``<resume key>.json`` in this folder of the
+#: cache: its content key, export grid, tile size and the id of its study
+#: area, which is stored once under :data:`AREAS_DIR`. Workspaces hold tiles
+#: only.
+RECORDS_DIR = "_records"
+AREAS_DIR = "_areas"
+
+
+def _write_record(cache_root: str, key: str, record: Mapping[str, Any]) -> None:
+    folder = os.path.join(cache_root, RECORDS_DIR)
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, f"{key}.json")
+    part = path + ".part"
+    with open(part, "w", encoding="utf-8") as f:
+        json.dump(dict(record), f, indent=1)
+    os.replace(part, path)
+
+
+def _read_record(cache_root: str, key: str) -> dict | None:
+    path = os.path.join(cache_root, RECORDS_DIR, f"{key}.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            record = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def _save_area(cache_root: str, area_id: str, area: gpd.GeoDataFrame) -> None:
+    """Store a study area once, as the WGS84 features the run tiled."""
+    folder = os.path.join(cache_root, AREAS_DIR)
+    path = os.path.join(folder, f"{area_id}.parquet")
+    if os.path.isfile(path):
+        return
+    os.makedirs(folder, exist_ok=True)
+    part = path + ".part"
+    area.to_parquet(part)
+    os.replace(part, path)
+
+
+def _grid_window(geom, res: float) -> tuple[float, float, int, int]:
+    """``(left, top, width, height)`` of the snap-grid pixels around ``geom``."""
+    minx, miny, maxx, maxy = geom.bounds
+    left, right = np.floor(minx / res) * res, np.ceil(maxx / res) * res
+    bottom, top = np.floor(miny / res) * res, np.ceil(maxy / res) * res
+    return left, top, int(round((right - left) / res)), int(round((top - bottom) / res))
+
+
+class _Donors:
+    """Cached workspaces of other study areas that hold this run's outputs.
+
+    A donor pixel is used only where it lies inside the donor's study area and
+    inside the rectangle of a donor tile on disk (half a pixel beyond its edge
+    included: the export holds every pixel the rectangle touches), so it holds
+    exactly what this run computes there.
+    """
+
+    def __init__(self, cache_root: str, grid_crs, res: float):
+        self.cache_root = cache_root
+        self.grid_crs = grid_crs
+        self.res = float(res)
+        self._to_grid = Transformer.from_crs(
+            "EPSG:4326", grid_crs, always_xy=True
+        ).transform
+        self._areas: dict[str, tuple] = {}
+        self._cover: dict[tuple, list] = {}
+
+    def area(self, record: Mapping[str, Any]):
+        """``(area in grid CRS, [(tile_idx, rectangle)])`` of a donor's run."""
+        key = (record["area_id"], float(record["max_tile_size_km"]))
+        if key not in self._areas:
+            path = os.path.join(self.cache_root, AREAS_DIR, f"{key[0]}.parquet")
+            area = gpd.read_parquet(path)
+            union = area.to_crs(self.grid_crs).geometry.union_all()
+            shapely.prepare(union)
+            tiles = [
+                (
+                    int(t["tile_idx"]),
+                    shapely_transform(self._to_grid, t["tile_geom_4326"]).buffer(
+                        self.res / 2, join_style="mitre"
+                    ),
+                )
+                for t in build_planar_tiles(area, self.grid_crs, key[1])
+            ]
+            self._areas[key] = (union, tiles, shapely.STRtree([g for _, g in tiles]))
+        return self._areas[key]
+
+    def fill(self, rect, need, donor_dir: str, record: Mapping[str, Any]):
+        """``(left, top, values, crs)`` for the pixels around ``rect`` from
+        one donor workspace (``crs`` that of its tiles), or ``None`` when it
+        cannot supply every pixel whose centre lies in ``need``."""
+        res = self.res
+        left, top, width, height = _grid_window(rect, res)
+        xs = left + (np.arange(width) + 0.5) * res
+        ys = top - (np.arange(height) + 0.5) * res
+        X, Y = np.meshgrid(xs, ys)
+        union, tiles, tree = self.area(record)
+        cover_key = (record["area_id"], left, top, width, height)
+        if cover_key not in self._cover:
+            inside = shapely.contains_xy(union, X, Y)
+            parts = []
+            for i in tree.query(box(left, top - height * res, left + width * res, top)):
+                idx, rect_i = tiles[int(i)]
+                mask = inside & shapely.contains_xy(rect_i, X, Y)
+                if mask.any():
+                    parts.append((idx, mask))
+            self._cover[cover_key] = parts
+        values = np.full((height, width), -9999.0, dtype="float32")
+        filled = np.zeros((height, width), dtype=bool)
+        crs = None
+        for idx, mask in self._cover[cover_key]:
+            path = os.path.join(donor_dir, f"tile_{idx}.tif")
+            todo = mask & ~filled
+            if not todo.any() or not os.path.isfile(path):
+                continue
+            try:
+                with rasterio.open(path) as src:
+                    crs = crs or src.crs
+                    t = src.transform
+                    col = (left - t.c) / res
+                    row = (t.f - top) / res
+                    if abs(col - round(col)) > 1e-6 or abs(row - round(row)) > 1e-6:
+                        return None
+                    data = src.read(
+                        1,
+                        window=Window(round(col), round(row), width, height),
+                        boundless=True,
+                        fill_value=np.nan,
+                        out_dtype="float32",
+                    )
+            except Exception:
+                continue
+            ok = todo & ~np.isnan(data)
+            values[ok] = data[ok]
+            filled |= ok
+        required = shapely.contains_xy(need, X, Y)
+        if crs is None or not filled[required].all():
+            return None
+        return left, top, values, crs
+
+
+def _write_tile(path: str, left: float, top: float, values, res: float, crs) -> None:
+    """A cache tile, written as :func:`_extract_band` writes one."""
+    profile = {
+        "driver": "GTiff",
+        "height": values.shape[0],
+        "width": values.shape[1],
+        "count": 1,
+        "dtype": "float32",
+        "crs": crs,
+        "transform": from_origin(left, top, res, res),
+        "nodata": None,
+    }
+    profile.update(default_geotiff_creation_options("float32"))
+    part = path + ".part"
+    try:
+        with rasterio.open(part, "w", **profile) as dst:
+            dst.write(values, 1)
+        os.replace(part, path)
+    finally:
+        if os.path.exists(part):
+            os.remove(part)
+
+
+def _output_chains(
+    output_name: str, temporal_reducers, chains, water_mask: bool
+) -> tuple[tuple[str, ...], list[dict], dict[str, list[str]], dict[str, str]]:
+    """``(statistics, chains, steps, base names)`` of a download's outputs.
+
+    Each output's steps are a chain as given, after the per-scene water mask
+    when that is on, or a statistic's own chain.
+    """
+    reducers = normalize_temporal_reducers(temporal_reducers)
+    user_chains = check_chains(chains)
+    if user_chains:
+        chain_steps = {
+            c["name"]: (
+                [WATER_MASK, *c["steps"]]
+                if water_mask and c["steps"][0] != WATER_MASK
+                else list(c["steps"])
+            )
+            for c in user_chains
+        }
+        return reducers, user_chains, chain_steps, output_stems(
+            output_name, chains=user_chains
+        )
+    chain_steps = {r: statistic_chain(r, water_mask) for r in reducers}
+    return reducers, user_chains, chain_steps, output_stems(output_name, reducers)
+
+
+def _query_window(
+    start_date, end_date, *, end_inclusive: bool, substitute_2012: bool
+) -> tuple[str, str, str, str, bool]:
+    """``(start, exclusive end, query start, query end, shifted)``: the window
+    as Earth Engine reads it, ``[start, end)``, and after the 2012 fill."""
+    req_start, req_end = str(start_date), str(end_date)
+    end_exclusive = _shift_day(req_end, 1) if end_inclusive else req_end
+    if substitute_2012:
+        q_start, q_end, shifted = substitute_year(req_start, end_exclusive)
+        return req_start, end_exclusive, q_start, q_end, shifted
+    return req_start, end_exclusive, req_start, end_exclusive, False
+
+
+def _output_keys(
+    area: gpd.GeoDataFrame,
+    start: str,
+    end: str,
+    cloud_value,
+    resolution: int,
+    ee_collection: str,
+    chain_steps: Mapping[str, list[str]],
+    cloud_variant: tuple[str, ...],
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Each output's resume key and content key (:func:`_chain_key`)."""
+    resume, content = {}, {}
+    for n, steps in chain_steps.items():
+        token, variant = _chain_key(steps, cloud_variant)
+        fields = (start, end, cloud_value, resolution, ee_collection)
+        resume[n] = _compute_resume_key(
+            area, *fields, temporal_reducer=token, variant=variant
+        )
+        content[n] = _content_key(*fields, temporal_reducer=token, variant=variant)
+    return resume, content
+
+
 def _chain_key(
     steps: list[str], cloud_variant: tuple[str, ...]
 ) -> tuple[str, tuple[str, ...]]:
@@ -559,6 +820,7 @@ def _write_ndvi_sidecar(
     tiles_failed: int = 0,
     tiles_resumed: int = 0,
     tiles_split_across_requests: int = 0,
+    tiles_salvaged: int = 0,
     failed_tile_refs: list[dict] | None = None,
     resume_key: str = "",
     start_date: str,
@@ -603,8 +865,10 @@ def _write_ndvi_sidecar(
     ``n_images_after_cloud_filter`` those left by the scene-level cloud filter
     (``None`` when every scene is kept). ``tiles_split_across_requests``
     counts the tiles Earth Engine took in several requests because one was
-    too large. ``failed_tile_refs`` lists the cluster/tile IDs that exhausted
-    their retry budget — those areas appear as NaN gaps in the mosaic.
+    too large, and ``tiles_salvaged`` the tiles taken from a cached run over a
+    larger study area. ``failed_tile_refs`` lists the cluster/tile IDs that
+    exhausted their retry budget — those areas appear as NaN gaps in the
+    mosaic.
     """
     sidecar_path = os.path.join(folder, f"{output_name}_ndvi.json")
     payload = {
@@ -618,6 +882,7 @@ def _write_ndvi_sidecar(
         "tiles_failed": int(tiles_failed),
         "tiles_resumed": int(tiles_resumed),
         "tiles_split_across_requests": int(tiles_split_across_requests),
+        "tiles_salvaged": int(tiles_salvaged),
         "resume_key": resume_key,
         "failed_tile_refs": list(failed_tile_refs or []),
         "start_date": str(start_date),
@@ -767,6 +1032,14 @@ class NDVIEngine:
         else:
             root = tile_cache_dir if tile_cache_dir is not None else ndvi_tiles()
             self.tile_cache = NdviTileCache(root, max_bytes=tile_cache_max_bytes)
+
+    @classmethod
+    def without_earth_engine(cls, tile_cache: NdviTileCache | None = None):
+        """An engine that works on the tile cache only
+        (:meth:`record_workspaces`): no Earth Engine sign-in."""
+        engine = cls.__new__(cls)
+        engine.tile_cache = tile_cache or NdviTileCache(ndvi_tiles())
+        return engine
 
     @staticmethod
     def compute_export_crs(gdf: gpd.GeoDataFrame):
@@ -1070,6 +1343,16 @@ class NDVIEngine:
             col = col.map(lambda img: self._apply_steps(img, before))
         composite = getattr(col.select("NDVI"), temporal_statistic(steps))()
         return self._apply_steps(composite.rename("NDVI"), after)
+
+    def _collection_label(self, satellite: str, reflectance: str) -> str:
+        """The collection id, or merged Landsat label, a resolved satellite
+        reads (sidecar, resume key)."""
+        if satellite in ("landsat", "landsat_no_slc_off"):
+            sensor_set = "no_slc_off" if satellite == "landsat_no_slc_off" else "all"
+            return self._landsat_label(sensor_set, reflectance)
+        if reflectance == "toa":
+            return self.S2_TOA_COLLECTION_ID
+        return self.EE_COLLECTION_ID
 
     def _pick_satellite(self, start_date: str, end_date: str, satellite: str) -> str:
         """Resolve ``satellite='auto'`` → ``'sentinel2'`` or ``'landsat'``.
@@ -1400,23 +1683,9 @@ class NDVIEngine:
             output (statistic, or chain name) to its own result. ``status``
             is ``"success"`` only when every output succeeded.
         """
-        reducers = normalize_temporal_reducers(temporal_reducers)
-        user_chains = check_chains(chains)
-        # Each output's steps: a chain as given, after the per-scene water
-        # mask when that is on, or a statistic's own chain.
-        if user_chains:
-            chain_steps = {
-                c["name"]: (
-                    [WATER_MASK, *c["steps"]]
-                    if water_mask and c["steps"][0] != WATER_MASK
-                    else list(c["steps"])
-                )
-                for c in user_chains
-            }
-            output_names = output_stems(output_name, chains=user_chains)
-        else:
-            chain_steps = {r: statistic_chain(r, water_mask) for r in reducers}
-            output_names = output_stems(output_name, reducers)
+        reducers, user_chains, chain_steps, output_names = _output_chains(
+            output_name, temporal_reducers, chains, water_mask
+        )
         for name, value, allowed in (
             ("satellite", satellite, SATELLITES),
             ("cloud_handling", cloud_handling, CLOUD_HANDLINGS),
@@ -1474,30 +1743,28 @@ class NDVIEngine:
         # 3. The window as Earth Engine reads it, ``[start, end)``: an
         # inclusive end moves to the next day. Every later step works on
         # this half-open window.
-        req_start, req_end = str(start_date), str(end_date)
-        end_exclusive = _shift_day(req_end, 1) if end_inclusive else req_end
-
         # 3a. Optionally fill a window inside 2012 with the same days of 2013
         # (no Landsat sensor without scan-line gaps imaged 2012). Applied
         # before anything is queried, so every date mode gets it.
-        year_substituted = None
-        if substitute_2012:
-            q_start, q_end, shifted = substitute_year(req_start, end_exclusive)
-            if shifted:
-                year_substituted = "2012 → 2013"
-                _log(
-                    "INFO",
-                    f"2012 window {_window_text(req_start, end_exclusive)} "
-                    f"filled with {_window_text(q_start, q_end)}.",
-                )
-            elif _overlaps_year(req_start, end_exclusive, 2012):
-                _log(
-                    "WARN",
-                    f"Window {_window_text(req_start, end_exclusive)} lies only "
-                    "partly in 2012; it is not shifted to 2013.",
-                )
-        else:
-            q_start, q_end = req_start, end_exclusive
+        req_start, end_exclusive, q_start, q_end, shifted = _query_window(
+            start_date,
+            end_date,
+            end_inclusive=end_inclusive,
+            substitute_2012=substitute_2012,
+        )
+        year_substituted = "2012 → 2013" if shifted else None
+        if shifted:
+            _log(
+                "INFO",
+                f"2012 window {_window_text(req_start, end_exclusive)} "
+                f"filled with {_window_text(q_start, q_end)}.",
+            )
+        elif substitute_2012 and _overlaps_year(req_start, end_exclusive, 2012):
+            _log(
+                "WARN",
+                f"Window {_window_text(req_start, end_exclusive)} lies only "
+                "partly in 2012; it is not shifted to 2013.",
+            )
 
         # 3b. Scenes are fetched over the study area grown by the largest
         # neighbourhood radius, so neighbourhoods at its edge are whole.
@@ -1513,11 +1780,11 @@ class NDVIEngine:
         # scene); ``pixel_mask`` the per-pixel cloud / shadow / snow mask.
         scene_cmax = None if cloud_handling == "pixel_only" else cloud_max
         pixel_mask = cloud_handling != "scene_only"
+        ee_collection_id = self._collection_label(chosen_satellite, reflectance)
         if chosen_satellite in ("landsat", "landsat_no_slc_off"):
             sensor_set = (
                 "no_slc_off" if chosen_satellite == "landsat_no_slc_off" else "all"
             )
-            ee_collection_id = self._landsat_label(sensor_set, reflectance)
 
             def _get_col(s, e, cmax):
                 if (sensor_set, reflectance, pixel_mask) == ("all", "surface", True):
@@ -1551,10 +1818,7 @@ class NDVIEngine:
                     "NDVI composite.",
                 )
         else:
-            s2_id = self.EE_COLLECTION_ID
-            if reflectance == "toa":
-                s2_id = self.S2_TOA_COLLECTION_ID
-            ee_collection_id = s2_id
+            s2_id = ee_collection_id
 
             def _get_col(s, e, cmax):
                 if (reflectance, pixel_mask) == ("surface", True):
@@ -1709,19 +1973,16 @@ class NDVIEngine:
         # its own entry; an acquisition option away from its default adds
         # itself to the key.
         cloud_variant = (cloud_handling,) if cloud_handling != "scene_filter" else ()
-        resume_keys = {}
-        for n, steps in chain_steps.items():
-            token, variant = _chain_key(steps, cloud_variant)
-            resume_keys[n] = _compute_resume_key(
-                geom_for_crs,
-                used_start,
-                used_end,
-                "none" if scene_cmax is None else cloud_max,
-                resolution,
-                ee_collection_id,
-                temporal_reducer=token,
-                variant=variant,
-            )
+        resume_keys, content_keys = _output_keys(
+            geom_for_crs,
+            used_start,
+            used_end,
+            "none" if scene_cmax is None else cloud_max,
+            resolution,
+            ee_collection_id,
+            chain_steps,
+            cloud_variant,
+        )
 
         if n_tiles == 1:
             _log(
@@ -1758,6 +2019,13 @@ class NDVIEngine:
                 {n: (output_names[n], resume_keys[n]) for n in chain_steps},
                 folder,
                 max_tile_size_km,
+                salvage={
+                    "content_keys": content_keys,
+                    "area": geom_for_crs,
+                    "area_id": geometry_sha256(geom_for_crs),
+                    "grid_crs": grid_crs,
+                    "resolution": resolution,
+                },
                 export_crs=export_crs,
                 export_distortion=export_distortion,
                 export_crs_name=export_crs_name,
@@ -1785,6 +2053,7 @@ class NDVIEngine:
             tiles_failed = int(result_meta.get("tiles_failed", 0))
             tiles_resumed = int(result_meta.get("tiles_resumed", 0))
             tiles_split = int(result_meta.get("tiles_split_across_requests", 0))
+            tiles_salvaged = int(result_meta.get("tiles_salvaged", 0))
             failed_refs = result_meta.get("failed_tile_refs") or []
             try:
                 sidecar_path = _write_ndvi_sidecar(
@@ -1800,6 +2069,7 @@ class NDVIEngine:
                     tiles_failed=tiles_failed,
                     tiles_resumed=tiles_resumed,
                     tiles_split_across_requests=tiles_split,
+                    tiles_salvaged=tiles_salvaged,
                     failed_tile_refs=failed_refs,
                     resume_key=resume_keys[n],
                     start_date=str(start_date),
@@ -1833,6 +2103,91 @@ class NDVIEngine:
                 _log("WARN", f"Sidecar write failed (non-fatal): {e}")
 
         return _combine_reducer_results(results)
+
+    def record_workspaces(
+        self,
+        geometry,
+        start_date,
+        end_date,
+        output_name,
+        *,
+        cloud_max=10,
+        resolution=10,
+        max_tile_size_km=5,
+        satellite: str = "auto",
+        crs_override=None,
+        temporal_reducers: str | Iterable[str] = "median",
+        water_mask: bool = False,
+        cloud_handling: str = "scene_filter",
+        reflectance: str = "surface",
+        substitute_2012: bool = False,
+        end_inclusive: bool = False,
+        chains: Iterable[Mapping[str, Any]] | None = None,
+    ) -> dict[str, str]:
+        """Record the cached tiles of an earlier :meth:`download_and_process`
+        (same arguments) made before workspaces carried records, so a later
+        run over a smaller study area can reuse them.
+
+        Keys are worked out as that download did for a window it did not
+        widen (coverage rescue); no Earth Engine request is made. Returns
+        each output's outcome: ``recorded``, ``already recorded`` or ``not
+        cached`` (single-tile downloads cache nothing).
+        """
+        _, _, chain_steps, _ = _output_chains(
+            output_name, temporal_reducers, chains, water_mask
+        )
+        if isinstance(geometry, gpd.GeoDataFrame):
+            area = reproject_geodataframe_to_wgs84(geometry)
+        else:
+            area = gpd.GeoDataFrame({"geometry": [geometry]}, crs="EPSG:4326")
+        if crs_override is not None:
+            export_crs = crs_override[0]
+        else:
+            export_crs = _select_export_crs(area)[0]
+        _, _, q_start, q_end, _ = _query_window(
+            start_date,
+            end_date,
+            end_inclusive=end_inclusive,
+            substitute_2012=substitute_2012,
+        )
+        label = self._collection_label(
+            self._pick_satellite(q_start, q_end, satellite), reflectance
+        )
+        resume, content = _output_keys(
+            area,
+            q_start,
+            q_end,
+            "none" if cloud_handling == "pixel_only" else cloud_max,
+            resolution,
+            label,
+            chain_steps,
+            (cloud_handling,) if cloud_handling != "scene_filter" else (),
+        )
+        area_id = geometry_sha256(area)
+        outcome: dict[str, str] = {}
+        for n in chain_steps:
+            root = self.tile_cache.cache_root
+            if not os.path.isdir(os.path.join(root, resume[n])):
+                outcome[n] = "not cached"
+                continue
+            if _read_record(root, resume[n]) is not None:
+                outcome[n] = "already recorded"
+                continue
+            _save_area(root, area_id, area)
+            _write_record(
+                root,
+                resume[n],
+                {
+                    "version": 1,
+                    "content_key": content[n],
+                    "export_crs": export_crs,
+                    "resolution": float(resolution),
+                    "max_tile_size_km": float(max_tile_size_km),
+                    "area_id": area_id,
+                },
+            )
+            outcome[n] = "recorded"
+        return outcome
 
     def _download_single(
         self,
@@ -2366,6 +2721,7 @@ class NDVIEngine:
         write_geojson: bool = True,
         write_geopackage: bool = False,
         write_cluster_tiles: bool = False,
+        salvage: Mapping[str, Any] | None = None,
     ) -> dict[str, dict]:
         """Download NDVI for a precomputed cluster-aware tile list and mosaic.
 
@@ -2380,6 +2736,11 @@ class NDVIEngine:
         from a previous run with the same key are skipped, and a tile missing
         several statistics fetches them in one request. Returns one result per
         statistic.
+
+        ``salvage`` (each output's content key, the study area and its id, the
+        grid CRS and resolution) records every workspace (:data:`RECORDS_DIR`)
+        and lets a tile come from a cached run over a larger area
+        (:meth:`_reuse_tiles`) before Earth Engine is asked for it.
         """
         n_tiles = len(tiles)
         reducers = list(composites)
@@ -2431,6 +2792,33 @@ class NDVIEngine:
                     "INFO",
                     f"Resumed {len(existing)}/{n_tiles} tile(s){which} from "
                     f"previous run ({work_dirs[r]}).",
+                )
+        n_salvaged: dict[str, int] = {}
+        if salvage is not None:
+            _save_area(self.tile_cache.cache_root, salvage["area_id"], salvage["area"])
+            for r in reducers:
+                _write_record(
+                    self.tile_cache.cache_root,
+                    os.path.basename(work_dirs[r]),
+                    {
+                        "version": 1,
+                        "content_key": salvage["content_keys"][r],
+                        "export_crs": export_crs,
+                        "resolution": float(salvage["resolution"]),
+                        "max_tile_size_km": float(max_tile_size_km),
+                        "area_id": salvage["area_id"],
+                    },
+                )
+            if missing:
+                n_salvaged = self._reuse_tiles(
+                    tiles, missing, work_dirs, tile_files, salvage, export_crs
+                )
+            for r, n in n_salvaged.items():
+                which = "" if len(reducers) == 1 else f" ({r})"
+                _log(
+                    "INFO",
+                    f"Took {n}/{n_tiles} tile(s){which} from a cached run over a "
+                    "larger area.",
                 )
         pending_tiles = [ts for ts in tiles if int(ts["tile_idx"]) in missing]
 
@@ -2543,6 +2931,7 @@ class NDVIEngine:
                 output_name,
                 folder,
                 n_split=n_split[r],
+                n_salvaged=n_salvaged.get(r, 0),
                 label="" if len(reducers) == 1 else f" ({r})",
                 progress_at=_at,
                 n_clusters=n_clusters,
@@ -2572,6 +2961,86 @@ class NDVIEngine:
                 _log("WARN", f"Tile cache bookkeeping failed: {e}")
         return results
 
+    def _reuse_tiles(
+        self,
+        tiles: list[dict],
+        missing: dict[int, list[str]],
+        work_dirs: Mapping[str, str],
+        tile_files: dict[str, list[str]],
+        salvage: Mapping[str, Any],
+        export_crs: str,
+    ) -> dict[str, int]:
+        """Fill missing tiles from cached workspaces of other study areas.
+
+        A donor is a workspace whose record has an output's content key, the
+        same export grid and another area. A tile is written from it only when
+        every pixel within a pixel of the tile's part of this run's area is
+        covered (:class:`_Donors`); the rest stay for Earth Engine. Updates
+        ``missing`` and ``tile_files``; returns the tiles taken per output.
+        """
+        res = float(salvage["resolution"])
+        wanted: dict[str, list[str]] = {}
+        for r, key in salvage["content_keys"].items():
+            if r in work_dirs:
+                wanted.setdefault(key, []).append(r)
+        root = self.tile_cache.cache_root
+        own = {os.path.basename(d) for d in work_dirs.values()}
+        donors: dict[str, list[tuple[str, dict]]] = {}
+        folder = os.path.join(root, RECORDS_DIR)
+        names = os.listdir(folder) if os.path.isdir(folder) else []
+        for name in names:
+            key = name[: -len(".json")]
+            donor_dir = os.path.join(root, key)
+            if not name.endswith(".json") or key in own or not os.path.isdir(donor_dir):
+                continue
+            record = _read_record(root, key)
+            if (
+                record is None
+                or record.get("export_crs") != export_crs
+                or float(record.get("resolution", -1)) != res
+                or record.get("area_id") == salvage["area_id"]
+            ):
+                continue
+            for r in wanted.get(record.get("content_key"), ()):
+                donors.setdefault(r, []).append((donor_dir, record))
+        if not donors:
+            return {}
+        for found in donors.values():
+            for donor_dir, _ in found:
+                self.tile_cache.refresh(os.path.basename(donor_dir))
+
+        grid_crs = salvage["grid_crs"]
+        supply = _Donors(self.tile_cache.cache_root, grid_crs, res)
+        to_grid = Transformer.from_crs("EPSG:4326", grid_crs, always_xy=True).transform
+        area = salvage["area"].to_crs(grid_crs).geometry.union_all()
+        taken: dict[str, int] = {}
+        for ts in tiles:
+            idx = int(ts["tile_idx"])
+            outputs = missing.get(idx)
+            if not outputs:
+                continue
+            rect = shapely_transform(to_grid, ts["tile_geom_4326"])
+            need = rect.intersection(area).buffer(res)
+            for r in list(outputs):
+                for donor_dir, record in donors.get(r, ()):
+                    try:
+                        got = supply.fill(rect, need, donor_dir, record)
+                    except Exception as exc:  # noqa: BLE001 — Earth Engine remains
+                        _log("WARN", f"Tile {idx + 1}: cached run unusable ({exc}).")
+                        got = None
+                    if got is None:
+                        continue
+                    left, top, values, crs = got
+                    path = os.path.join(work_dirs[r], f"tile_{idx}.tif")
+                    _write_tile(path, left, top, values, res, crs)
+                    tile_files[r].append(path)
+                    outputs.remove(r)
+                    taken[r] = taken.get(r, 0) + 1
+                    break
+            if not outputs:
+                del missing[idx]
+        return taken
+
     def _finish_tiled_output(
         self,
         tile_files: list[str],
@@ -2584,6 +3053,7 @@ class NDVIEngine:
         folder,
         *,
         n_split: int = 0,
+        n_salvaged: int = 0,
         label: str,
         progress_at: Callable[[float], float],
         n_clusters: int,
@@ -2731,6 +3201,7 @@ class NDVIEngine:
             "tiles_failed": len(failed_tile_refs),
             "tiles_resumed": n_resumed,
             "tiles_split_across_requests": n_split,
+            "tiles_salvaged": n_salvaged,
             "failed_tile_refs": failed_tile_refs,
             "n_clusters": n_clusters,
             "resume_key": resume_key,

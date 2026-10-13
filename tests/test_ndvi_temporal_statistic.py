@@ -413,6 +413,7 @@ class TiledCacheTests(_EngineCase):
             d
             for d in os.listdir(self.cache)
             if os.path.isdir(os.path.join(self.cache, d))
+            and d not in (ndvi.RECORDS_DIR, ndvi.AREAS_DIR)
         )
 
     def test_shared_download_then_partial_and_full_reuse(self):

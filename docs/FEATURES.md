@@ -110,7 +110,9 @@ per-cluster tiles, and a metadata sidecar.
   a reference product can be reproduced exactly next to the plain composites.
 - Downloaded tiles are cached per statistic, compactly and without changing any
   output, so a re-run, or a run that adds a statistic, fetches only what is
-  missing.
+  missing. A run over a smaller area with the same settings (a narrower
+  buffer, fewer features) takes its tiles from a cached run over a larger
+  one wherever that run covers them, and downloads only the rest.
 - Tiles export on a shared snap grid and are mosaicked without a second
   reprojection, so output pixels are exactly what Earth Engine produced.
 - Distinguishes "no images in range" from "all images too cloudy", widens a

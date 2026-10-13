@@ -85,7 +85,8 @@ held (`n_images`) and how many the cloud threshold kept
 how the input
 decomposed into clusters and tiles, how many tiles came down in several
 requests because Earth Engine refused one as too large
-(`tiles_split_across_requests`), any tiles that exhausted their retries and so
+(`tiles_split_across_requests`), how many tiles came from a cached run over a
+larger area (`tiles_salvaged`), any tiles that exhausted their retries and so
 appear as gaps, and the maximum map distortion. When the run came from a
 settings preset, `preset` names it (the GVI sidecar does the same).
 

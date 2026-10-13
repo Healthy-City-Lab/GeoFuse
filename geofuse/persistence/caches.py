@@ -232,6 +232,16 @@ class NdviTileCache:
                 (resume_key, int(total_bytes), int(n_tiles)),
             )
 
+    def refresh(self, resume_key: str) -> None:
+        """Mark an indexed entry as just used, so eviction keeps it longer;
+        an entry not in the index stays out of it."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE entries SET last_access = datetime('now') "
+                "WHERE resume_key = ?",
+                (resume_key,),
+            )
+
     def evict_lru(self, max_bytes: int | None = None) -> tuple[int, int]:
         """Drop oldest entries until total cache size ≤ ``max_bytes``.
 
