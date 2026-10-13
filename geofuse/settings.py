@@ -251,12 +251,14 @@ GVI: dict[str, Setting] = {
     "precision": _choice(
         "fp16", ("fp16", "fp32"), "GPU arithmetic; fp32 repeats earlier runs' masks."
     ),
+    "log_points": _bool(False, "Log a line for every point and panorama (debugging)."),
 }
 
 #: GVI settings that size the download pool and the GPU batches.
 GVI_THROUGHPUT = ("download_concurrency", "batch_size", "batch_wait_ms")
-#: GVI settings a job records and presets leave out: how a run computes.
-GVI_RUN_OPTIONS = (*GVI_THROUGHPUT, "precision")
+#: GVI settings a job records and presets leave out: how a run computes and
+#: what it logs.
+GVI_RUN_OPTIONS = (*GVI_THROUGHPUT, "precision", "log_points")
 
 # ────────────────────────────────────────────────────────────────────
 # Fusion

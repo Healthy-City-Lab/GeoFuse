@@ -264,6 +264,7 @@ class _StubEngine:
             "target_year": target_year,
             "month_window": month_window,
             "month_policy": month_policy,
+            "log_points": _kw.get("log_points"),
         }
         for i, (veg, date) in enumerate([(0.3, "2017-07"), (0.4, "2017-08")]):
             result_callback(
@@ -303,7 +304,7 @@ class RunnerOutputTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _run(self, target_year, month_window=None):
+    def _run(self, target_year, month_window=None, **run_args):
         pts = gpd.GeoDataFrame(geometry=[Point(-114.0, 51.0)], crs="EPSG:4326")
         return runners.run_gvi(
             _Ctx(),
@@ -323,6 +324,7 @@ class RunnerOutputTests(unittest.TestCase):
                 "max_year_diff": 2,
                 "month_window": month_window,
                 "month_policy": "exclude",
+                **run_args,
             },
             output_dir=self.tmp.name,
             save_geotiff=False,
@@ -343,6 +345,12 @@ class RunnerOutputTests(unittest.TestCase):
                 "site_2018_gvi.json",
             ],
         )
+
+    def test_log_points_reaches_the_engine(self):
+        self._run(None)
+        self.assertIs(self.stub.kw["log_points"], False)
+        self._run(None, log_points=True)
+        self.assertIs(self.stub.kw["log_points"], True)
 
     def test_most_recent_keeps_its_name(self):
         self._run(None)
@@ -438,11 +446,13 @@ class RestartReplayTests(unittest.TestCase):
             "batch_size": 1,
             "batch_wait_ms": 20,
             "precision": "fp16",
+            "log_points": False,
         }
         self.assertEqual(
             gvi_tab._capture_args(p),
             {"month_window": [5, 10], "month_policy": "prefer", **sizing},
         )
+        self.assertIs(gvi_tab._capture_args({"log_points": True})["log_points"], True)
         self.assertEqual(
             gvi_tab._capture_args({}),
             {"month_window": None, "month_policy": "exclude", **sizing},

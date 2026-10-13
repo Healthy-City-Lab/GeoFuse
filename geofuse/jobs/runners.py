@@ -218,6 +218,7 @@ def run_gvi(
         batch_size=run_args.get("batch_size"),
         batch_wait_ms=run_args.get("batch_wait_ms"),
         precision=run_args.get("precision"),
+        log_points=bool(run_args.get("log_points")),
     )
 
     if ctx.is_cancelled():
@@ -698,6 +699,7 @@ def run_gvi_column(
             batch_size=run_args.get("batch_size"),
             batch_wait_ms=run_args.get("batch_wait_ms"),
             precision=run_args.get("precision"),
+            log_points=bool(run_args.get("log_points")),
         )
         done_points += len(pts)
         if ctx.is_cancelled():

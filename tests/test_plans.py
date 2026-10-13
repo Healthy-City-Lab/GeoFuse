@@ -324,6 +324,14 @@ class BuildTests(_Case):
         self.assertEqual(run["report_paired_bootstrap"], 500)
         self.assertNotIn("report_effects_bootstrap", run)
 
+    def test_gvi_log_points_reaches_the_run(self):
+        step = '[[gvi]]\nstudy_area = "city.gpkg"\n'
+        (quiet,) = self.expand(step)
+        (loud,) = self.expand(step + "log_points = true\n")
+        self.assertIs(plans.build(quiet).kwargs["run_args"]["log_points"], False)
+        self.assertIs(plans.build(loud).kwargs["run_args"]["log_points"], True)
+        self.assertIs(plans.build(loud).params["log_points"], True)
+
 
 class ShardTests(_Case):
     RUN = """

@@ -276,8 +276,8 @@ _MONTH_POLICY_LABELS = {
 
 def _capture_args(p: dict) -> dict:
     """Month-window settings recorded on a GVI job (``None`` window = off), the
-    download / GPU sizing and precision (defaults when absent), and the preset
-    the job came from, when there was one."""
+    download / GPU sizing, precision and per-point logging (defaults when
+    absent), and the preset the job came from, when there was one."""
     window = p.get("month_window")
     args = {
         "month_window": list(window) if window else None,
@@ -287,6 +287,7 @@ def _capture_args(p: dict) -> dict:
         value = p.get(key)
         args[key] = int(_GVI_DEFAULTS[key] if value is None else value)
     args["precision"] = str(p.get("precision") or _GVI_DEFAULTS["precision"])
+    args["log_points"] = bool(p.get("log_points", _GVI_DEFAULTS["log_points"]))
     if p.get("preset"):
         args["preset"] = p["preset"]
     return args
