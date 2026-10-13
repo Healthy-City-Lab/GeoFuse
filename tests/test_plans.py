@@ -520,6 +520,43 @@ class TabParityTests(_Case):
         )
         self.assert_same(gui, plans.build(spec))
 
+    def test_ndvi_tab_chains(self):
+        lines = ["f500: focal:mean:500, temporal:mean, water_mask", "max: temporal:max"]
+        gui = self.click(
+            "ndvi",
+            {
+                "ndvi_picked_paths": [self.city],
+                "ndvi_chains_ranges_city.gpkg": "\n".join(lines),
+            },
+            f"ndvi.render({self.out!r})",
+            "ndvi_run_btn",
+        )
+        (spec,) = self.expand(
+            f"""
+            output_dir = {self.out!r}
+            [[ndvi]]
+            study_area = "city.gpkg"
+            ranges = [[2023-06-01, 2023-09-30]]
+            chains_ranges = {lines!r}
+            """
+        )
+        self.assert_same(gui, plans.build(spec))
+        self.assertEqual([c["name"] for c in gui[3]["chains"]], ["f500", "max"])
+
+    def test_ndvi_tab_refuses_a_chain_that_does_not_check(self):
+        at = self.click(
+            "ndvi",
+            {
+                "ndvi_picked_paths": [self.city],
+                "ndvi_chains_ranges_city.gpkg": "g7: temporal:mean, temporal:max",
+            },
+            f"ndvi.render({self.out!r})",
+            "ndvi_run_btn",
+            submits=0,
+        )
+        errors = [e.value for e in at.error]
+        self.assertTrue(any("Chain 'g7'" in e for e in errors), errors)
+
     def test_gvi_tab(self):
         gui = self.click(
             "gvi",

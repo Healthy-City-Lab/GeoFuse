@@ -26,7 +26,9 @@ responsive and several study areas can run at once.
    months, and each year becomes its own aligned raster covering those months
    in full (May to September runs to 30 September). Each date mode has a
    **Temporal statistic** picker: median (default), mean, maximum, or any
-   combination, each written as its own file. The download settings hold
+   combination, each written as its own file. **Aggregation chains**, under
+   the picker, replace the statistics with chains, one `name: operation, ...`
+   per line (see *NDVI aggregation chains* below). The download settings hold
    **Satellite**, **Reflectance**, **Cloud handling** (drop cloudy scenes,
    mask cloudy pixels, or both), **Coverage rescue**, **Mask water** and
    **Fill 2012 with 2013**. The defaults reproduce the plain composite: water
@@ -309,7 +311,10 @@ largest radius, so pixels at its edge get whole neighbourhoods. **Mask water**
 (`water_mask = true`) still masks every scene first, before each chain. A
 fusion step names one chain's files with `@ndvi.city[f500]`. A chain that is
 only a temporal step, with or without a leading `water_mask`, shares that
-statistic's cached tiles. On the command line, chains are text:
+statistic's cached tiles. In the NDVI tab the same chains go into
+**Aggregation chains** under each date mode's **Temporal statistic** picker;
+a chain that does not check is named under the picker and blocks the run. On
+the command line, chains are text:
 `--chains-column "f500: focal:mean:500, temporal:mean, water_mask"`.
 
 ### Following and managing jobs

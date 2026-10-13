@@ -1,7 +1,8 @@
 """The NDVI tab records and replays the download options of each job.
 
-Each date mode of each dataset has its own temporal-statistic picker; the
-satellite and coverage-rescue settings apply to the whole run. The options are
+Each date mode of each dataset has its own temporal-statistic picker and
+aggregation-chain editor; the satellite and coverage-rescue settings apply to
+the whole run. The options are
 stored on the job record, so a restart replays them, and jobs recorded before
 the options existed replay with the defaults (median, auto, rescue on).
 """
@@ -145,6 +146,26 @@ class ResubmitTests(unittest.TestCase):
                 "satellite": "landsat_no_slc_off",
             },
         )
+
+    def test_chains_replay_and_name_the_job(self):
+        chains = [{"name": "f500", "steps": ["focal:mean:500", "temporal:mean"]}]
+        params, (_kind, kw) = self._resubmit(
+            fname="site.geojson",
+            mode="column",
+            date_column="year",
+            chains=chains,
+        )
+        self.assertEqual((kw["chains"], params["chains"]), (chains, chains))
+        lines = ndvi_tab._ndvi_restart_summary_lines(
+            {"mode": "range", "chains": chains}
+        )
+        made = [line for line in lines if line.startswith("**Aggregation chains:**")]
+        self.assertEqual(len(made), 1)
+        self.assertTrue(made[0].startswith("**Aggregation chains:** f500 · "))
+        _params, (_kind, kw) = self._resubmit(
+            fname="site.geojson", mode="column", date_column="year"
+        )
+        self.assertNotIn("chains", kw)
 
     def test_old_job_gets_acquisition_defaults(self):
         _params, (_kind, kw) = self._resubmit(
