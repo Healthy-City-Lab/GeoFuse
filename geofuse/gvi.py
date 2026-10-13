@@ -155,6 +155,10 @@ _RL_RECOVER_AFTER_OK = 40
 # How many times a single point retries through throttling before giving up.
 # Without this a throttled point is silently dropped as "no panorama".
 _RL_MAX_RETRIES = 4
+# How long Street View may answer pages instead of data, with no clean answer
+# between, before the run stops as "service retired" (seconds). Until then a
+# point retries as long as it takes.
+_UNEXPECTED_GIVE_UP_S = 15 * 60
 
 
 class AdaptiveThrottle:
@@ -180,6 +184,7 @@ class AdaptiveThrottle:
         self._backoff = _RL_BACKOFF_START_S
         self._gate_until = 0.0
         self._ok_streak = 0
+        self._unexpected_since: float | None = None
         self.trips = 0
 
     async def before_request(self) -> None:
@@ -195,7 +200,25 @@ class AdaptiveThrottle:
                 await asyncio.sleep(delay)
             return
 
-    async def record_throttle(self, status: int | None = None) -> None:
+    async def record_unexpected(self, error: gsv.UnexpectedAnswer) -> None:
+        """Street View answered a page instead of data: back off as for a
+        throttle. Raises :class:`~geofuse.streetview.ServiceRetired` once such
+        answers have lasted :data:`_UNEXPECTED_GIVE_UP_S` with no clean answer
+        between."""
+        async with self._lock:
+            now = asyncio.get_running_loop().time()
+            if self._unexpected_since is None:
+                self._unexpected_since = now
+            lasted = now - self._unexpected_since
+        if lasted >= _UNEXPECTED_GIVE_UP_S:
+            raise gsv.ServiceRetired(
+                f"{error}, and nothing else for {lasted / 60:.0f} minutes"
+            )
+        await self.record_throttle(reason=f"Street View answered a page ({error})")
+
+    async def record_throttle(
+        self, status: int | None = None, reason: str | None = None
+    ) -> None:
         """A request was rate-limited: close the gate and widen the spacing."""
         async with self._lock:
             self.trips += 1
@@ -208,7 +231,7 @@ class AdaptiveThrottle:
                 self._delay = min(max(self._delay * 2.0, 0.25), _RL_DELAY_MAX_S)
                 _log(
                     "WARN",
-                    f"Rate limited (HTTP {status}) — backing off "
+                    f"{reason or f'Rate limited (HTTP {status})'} — backing off "
                     f"{self._backoff:.0f}s, spacing requests {self._delay:.2f}s "
                     f"(event #{self.trips})",
                 )
@@ -217,6 +240,7 @@ class AdaptiveThrottle:
     async def record_success(self) -> None:
         """A clean response: decay the spacing after a sustained good streak."""
         async with self._lock:
+            self._unexpected_since = None
             self._ok_streak += 1
             if self._ok_streak >= _RL_RECOVER_AFTER_OK and self._delay > 0:
                 self._ok_streak = 0
@@ -348,6 +372,8 @@ class GVIEngine:
 
         Every request goes through the shared :class:`AdaptiveThrottle`, and a
         rate-limited search is retried rather than mistaken for "no coverage".
+        A search answered with a page instead of data retries until it gets an
+        answer, or until the throttle decides the service changed.
         """
         idx = pt["orig_index"]
         lat, lon = pt["lat"], pt["lon"]
@@ -372,7 +398,8 @@ class GVIEngine:
         # rate limiting silently turns into missing sample points.
         pano = _RL_SENTINEL = object()
         try:
-            for attempt in range(_RL_MAX_RETRIES):
+            attempt = 0
+            while attempt < _RL_MAX_RETRIES:
                 if throttle is not None:
                     await throttle.before_request()
                 try:
@@ -380,12 +407,20 @@ class GVIEngine:
                     if throttle is not None:
                         await throttle.record_success()
                     break
+                except gsv.UnexpectedAnswer as odd:
+                    if throttle is None:
+                        raise gsv.ServiceRetired(str(odd)) from None
+                    await throttle.record_unexpected(odd)
+                    if cancel_callback and cancel_callback():
+                        return ("done", self._empty_result(pt, search_lat, search_lon))
+                    continue
                 except gsv.RateLimitedError as rl:
+                    attempt += 1
                     if throttle is not None:
                         await throttle.record_throttle(rl.status)
                     if cancel_callback and cancel_callback():
                         return ("done", self._empty_result(pt, search_lat, search_lon))
-                    if attempt == _RL_MAX_RETRIES - 1:
+                    if attempt == _RL_MAX_RETRIES:
                         _log(
                             "ERROR",
                             f"  Point {idx}: still rate limited after "

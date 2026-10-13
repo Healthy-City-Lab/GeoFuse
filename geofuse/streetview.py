@@ -68,6 +68,15 @@ class RateLimitedError(RuntimeError):
 _RATE_LIMIT_STATUSES = frozenset({403, 429, 503})
 
 
+class UnexpectedAnswer(RuntimeError):
+    """A Street View endpoint answered something other than its data, such as
+    a web page: usually a temporary block or error page. Callers back off and
+    retry; only a persistent run of these means the service changed."""
+
+    def __init__(self, what: str, text: str):
+        super().__init__(f"the {what} answered {text[:80]!r}")
+
+
 class ServiceRetired(RuntimeError):
     """A Street View endpoint no longer answers in the form this client reads."""
 
@@ -391,10 +400,11 @@ def _distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def _json_body(text: str, what: str):
-    """The JSON after Google's ``)]}'`` guard; :class:`ServiceRetired` when
-    the answer is not in that form."""
+    """The JSON after Google's ``)]}'`` guard. An answer without the guard
+    raises :class:`UnexpectedAnswer`; guarded but unreadable JSON raises
+    :class:`ServiceRetired`."""
     if not text.startswith(")]}'"):
-        raise ServiceRetired(f"the {what} answered {text[:80]!r}")
+        raise UnexpectedAnswer(what, text)
     try:
         return json.loads(text[4:])
     except json.JSONDecodeError as exc:
@@ -564,8 +574,9 @@ def find_panorama(
     """The nearest Street View panorama within ``radius`` metres, or ``None``.
 
     Raises :class:`RateLimitedError` when Google throttles, so a caller can
-    back off instead of mistaking the throttle for "no coverage", and
-    :class:`ServiceRetired` when an endpoint stops answering in the expected
+    back off instead of mistaking the throttle for "no coverage",
+    :class:`UnexpectedAnswer` when an endpoint answers a page instead of data,
+    and :class:`ServiceRetired` when its data is no longer in the expected
     form.
     """
     requester = session if session is not None else requests

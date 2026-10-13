@@ -153,7 +153,10 @@ class SearchTests(_Case):
 
 class RetiredSearchTests(_Case):
     def test_an_unexpected_answer_is_not_no_coverage(self):
-        for body in ("<html>moved</html>", GUARD + "{not json", GUARD + '"text"'):
+        sv._TILES.clear()
+        with self.assertRaises(sv.UnexpectedAnswer):
+            self.find(_Session("<!DOCTYPE html><html>sorry</html>"))
+        for body in (GUARD + "{not json", GUARD + '"text"'):
             sv._TILES.clear()
             with self.assertRaises(sv.ServiceRetired):
                 self.find(_Session(body))
@@ -194,6 +197,73 @@ class RetiredSearchTests(_Case):
                         None,
                     )
                 )
+
+
+class PageAnswerTests(unittest.TestCase):
+    """A page instead of data is retried; only a long run of them stops GVI."""
+
+    PAGE = sv.UnexpectedAnswer("panorama metadata service", "<!DOCTYPE html>")
+
+    def setUp(self):
+        from geofuse import gvi
+
+        self.gvi = gvi
+        for name, value in (("_RL_BACKOFF_START_S", 0.01), ("_RL_DELAY_MAX_S", 0.01)):
+            patcher = mock.patch.object(gvi, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def resolve(self, find, throttle):
+        engine = GVIEngine.__new__(GVIEngine)
+        gdf = gpd.GeoDataFrame(geometry=[Point(-114.0, 51.0)], crs="EPSG:4326")
+        pt = {
+            "orig_index": 0,
+            "lat": 51.0,
+            "lon": -114.0,
+            "geometry": gdf.geometry[0],
+            "row": 0,
+            "col": 0,
+        }
+
+        async def run():
+            return await engine._search_and_resolve(
+                pt,
+                None,
+                gdf,
+                set(),
+                {},
+                None,
+                target_year=None,
+                max_year_diff=None,
+                throttle=throttle,
+            )
+
+        with mock.patch.object(sv, "find_panorama_async", find):
+            return asyncio.run(run())
+
+    def test_a_search_answered_with_pages_retries_until_data(self):
+        find = mock.AsyncMock(side_effect=[self.PAGE] * 6 + [None])
+        throttle = self.gvi.AdaptiveThrottle()
+        out = self.resolve(find, throttle)
+        self.assertEqual(out[0], "done")
+        self.assertEqual(find.await_count, 7)
+        self.assertEqual(throttle.trips, 6)
+        self.assertIsNone(throttle._unexpected_since)
+
+    def test_pages_and_nothing_else_for_too_long_stop_the_run(self):
+        find = mock.AsyncMock(side_effect=self.PAGE)
+        with mock.patch.object(self.gvi, "_UNEXPECTED_GIVE_UP_S", 0.2):
+            with self.assertRaisesRegex(sv.ServiceRetired, "nothing else for"):
+                self.resolve(find, self.gvi.AdaptiveThrottle())
+        self.assertGreater(find.await_count, 1)
+
+    def test_doctor_warns_rather_than_fails(self):
+        from geofuse.cli import account
+
+        with mock.patch.object(sv, "find_panorama", side_effect=self.PAGE):
+            status, detail = account._probe_street_view()
+        self.assertEqual(status, account.WARN)
+        self.assertIn("temporary block", detail)
 
 
 if __name__ == "__main__":

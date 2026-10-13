@@ -80,6 +80,8 @@ A background job never waits on a sign-in page where no browser can open; it sto
 
 Google changed one of the endpoints the scraper uses. The job stops instead of reporting every point as having no panorama. `geofuse doctor` runs one search and shows the same message. The downloader has to be updated to the endpoint Google now uses. Meanwhile, a Street View API key and `download_mode = "api"` download through Google's documented API instead.
 
+A web page in place of data (the log shows `Street View answered a page`) is usually a temporary block of your address, not a change: the run backs off and retries those searches as it does for throttling. It stops with this message only when nothing but pages has come back for 15 minutes; `geofuse doctor` then warns rather than fails, and a rerun later continues from the panorama cache.
+
 ---
 
 ## GVI stops with "Google refused the Street View API request"
