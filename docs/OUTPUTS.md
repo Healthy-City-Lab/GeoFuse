@@ -58,10 +58,10 @@ Default: GeoTIFF on, GeoPackage off, GeoJSON off.
 
 | Path | Contents |
 | --- | --- |
-| `[name]_ndvi.tif` | Single band, float32, median NDVI over the range after cloud masking. NoData `-9999` |
+| `[name]_ndvi.tif` | Single band, float32, median NDVI over the range after cloud masking. NoData `-9999`, declared in the file. The file also stores the exact minimum, maximum, mean and standard deviation of its valid pixels (GDAL's `STATISTICS_*` band metadata) |
 | `[name]_ndvi.json` | Sidecar, always written on success (see below) |
 | `[name]_ndvi.gpkg` / `.geojson` | Per-pixel points, planar CRS and EPSG:4326 respectively |
-| `[name]_ndvi_tiles/` | One GeoTIFF per connected component, plus an index |
+| `[name]_ndvi_tiles/` | One GeoTIFF per connected component, plus an index; NoData and statistics as above |
 | `[name]_mean_ndvi.*` / `[name]_max_ndvi.*` | The same set for each other temporal statistic picked |
 | `[name]_[chain]_ndvi.*` | With aggregation chains: the same set for each chain, named by the chain (in place of the statistics) |
 | `[name]_temporal_ndvi/` | Per-year mode: one full output set per year and statistic |
