@@ -93,6 +93,8 @@ def _add_setting_flags(
                 kw["action"] = argparse.BooleanOptionalAction
             elif s.kind == "multichoice":
                 kw.update(nargs="+", choices=list(s.choices), metavar="STAT")
+            elif s.kind == "chains":
+                kw.update(nargs="+", metavar="'NAME: OP, OP'")
             elif s.kind == "choice":
                 kw["choices"] = list(s.choices)
             elif s.kind in ("int", "float"):

@@ -37,6 +37,7 @@ from geofuse.crs_utils import (
     reproject_geodataframe_to_wgs84,
 )
 from geofuse.ndvi import TEMPORAL_REDUCERS
+from geofuse.ndvi_chains import ChainError, format_lines, parse_lines
 from geofuse.settings import NDVI as _NDVI_SETTINGS
 from geofuse.settings import defaults as _settings_defaults
 from geofuse.vector_io import geometry_sha256
@@ -104,6 +105,14 @@ _PRESET_METHOD_KEYS = {
     "season_end_month": ("season_end_month", "ndvi_seas_end_{}"),
     "specific_window_days": ("window_days_specific", "ndvi_win_s_{}"),
 }
+# Preset chain setting -> (dataset config key, widget key pattern). The widget
+# holds a date mode's aggregation chains as text, one ``name: op, op`` per
+# line; the config holds them checked.
+_PRESET_CHAIN_KEYS = {
+    "chains_ranges": ("chains_ranges", "ndvi_chains_ranges_{}"),
+    "chains_specific": ("chains_specific", "ndvi_chains_specific_{}"),
+    "chains_column": ("chains_column", "ndvi_chains_col_{}"),
+}
 
 # Download settings and their defaults (``geofuse.settings``), seeded into
 # session state before the widgets render so a preset can set them too.
@@ -112,7 +121,8 @@ _SETTING_DEFAULTS = {key: _NDVI_DEFAULTS[name] for name, key in _PRESET_KEYS.ite
 # Per-dataset method settings; a new dataset starts from these, and a preset
 # rewrites them (``ndvi_method_defaults`` in session state).
 _METHOD_DEFAULTS = {
-    cfg_key: _NDVI_DEFAULTS[name] for name, (cfg_key, _) in _PRESET_METHOD_KEYS.items()
+    cfg_key: _NDVI_DEFAULTS[name]
+    for name, (cfg_key, _) in (_PRESET_METHOD_KEYS | _PRESET_CHAIN_KEYS).items()
 }
 
 
@@ -130,6 +140,18 @@ def _seed(key: str, value) -> None:
     """Give a widget its starting value through session state."""
     if key not in st.session_state:
         st.session_state[key] = value
+
+
+def _dataset_chains(fname, cfg: dict, cfg_key: str, widget: str) -> list | None:
+    """A dataset's chains for one date mode: its editor's text once it has
+    one (``None`` while that text does not check), else its config."""
+    text = st.session_state.get(widget.format(fname))
+    if text is None:
+        return list(cfg.get(cfg_key, []))
+    try:
+        return parse_lines(text)
+    except ChainError:
+        return None
 
 
 def _preset_current() -> dict:
@@ -151,6 +173,11 @@ def _preset_current() -> dict:
             for fname, cfg in configs
         ]
         out[name] = values[0] if all(v == values[0] for v in values) else None
+    for name, (cfg_key, widget) in _PRESET_CHAIN_KEYS.items():
+        values = [
+            _dataset_chains(fname, cfg, cfg_key, widget) for fname, cfg in configs
+        ]
+        out[name] = values[0] if all(v == values[0] for v in values) else None
     return out
 
 
@@ -169,6 +196,14 @@ def _preset_apply(settings: dict) -> None:
         for fname, cfg in (s.get("ndvi_date_configs") or {}).items():
             cfg[cfg_key] = list(value) if isinstance(value, list) else value
             s[widget.format(fname)] = list(value) if isinstance(value, list) else value
+    for name, (cfg_key, widget) in _PRESET_CHAIN_KEYS.items():
+        if name not in settings:
+            continue
+        chains = list(settings[name])
+        defaults[cfg_key] = chains
+        for fname, cfg in (s.get("ndvi_date_configs") or {}).items():
+            cfg[cfg_key] = list(chains)
+            s[widget.format(fname)] = format_lines(chains)
 
 
 def _job_options(p: dict) -> dict:

@@ -29,6 +29,9 @@
     "statistics_column": [
       "median"
     ],
+    "chains_ranges": [],
+    "chains_specific": [],
+    "chains_column": [],
     "season_start_month": 6,
     "season_end_month": 9,
     "specific_window_days": 30

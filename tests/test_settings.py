@@ -45,11 +45,12 @@ _FUSION_INPUTS = {
 
 class EngineConstantTests(unittest.TestCase):
     def test_choice_lists_equal_the_engines(self):
-        from geofuse import bayesian_index, metric_sampling, ndvi
+        from geofuse import bayesian_index, metric_sampling, ndvi, ndvi_chains
         from geofuse.jobs import runners
         from geofuse.longitudinal import MIXEDLM_METRICS
 
         self.assertEqual(settings.TEMPORAL_REDUCERS, ndvi.TEMPORAL_REDUCERS)
+        self.assertEqual(ndvi_chains.TEMPORAL, ndvi.TEMPORAL_REDUCERS)
         self.assertEqual(settings.SATELLITES, ndvi.SATELLITES)
         self.assertEqual(settings.REFLECTANCES, ndvi.REFLECTANCES)
         self.assertEqual(settings.CLOUD_HANDLINGS, ndvi.CLOUD_HANDLINGS)
@@ -220,6 +221,64 @@ class CheckTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(SettingError, "season_start_month"):
             self.check("ndvi", season_start_month=10, season_end_month=4)
+
+
+class ChainSettingTests(unittest.TestCase):
+    """Aggregation chains per date mode, and the ``chains`` shorthand."""
+
+    CHAINS = [{"name": "a", "steps": ["temporal:max"]}]
+
+    def test_chains_are_checked_and_stored_as_tables(self):
+        out = settings.check(
+            "ndvi", {"chains_column": ["g: Focal:mean:500.0, temporal:mean"]}
+        )
+        self.assertEqual(
+            out,
+            {
+                "chains_column": [
+                    {"name": "g", "steps": ["focal:mean:500", "temporal:mean"]}
+                ]
+            },
+        )
+        self.assertEqual(settings.defaults("ndvi")["chains_ranges"], [])
+        with self.assertRaisesRegex(SettingError, "'chains_ranges': Chain 'g'"):
+            settings.check(
+                "ndvi", {"chains_ranges": ["g: temporal:mean, temporal:max"]}
+            )
+
+    def test_the_shorthand_sets_every_date_mode_unless_one_is_given(self):
+        mine = [{"name": "b", "steps": ["temporal:mean"]}]
+        out = settings.check("ndvi", {"chains": self.CHAINS, "chains_column": mine})
+        self.assertEqual(
+            out,
+            {
+                "chains_ranges": self.CHAINS,
+                "chains_specific": self.CHAINS,
+                "chains_column": mine,
+            },
+        )
+        with self.assertRaisesRegex(SettingError, "Unknown GVI setting 'chains'"):
+            settings.check("gvi", {"chains": self.CHAINS})
+
+    def test_presets_take_the_shorthand(self):
+        doc = presets.make_preset("ndvi", "Reference", "", {"chains": self.CHAINS})
+        keys = settings.SHORTHANDS["ndvi"]["chains"]
+        self.assertEqual(doc["settings"], {k: self.CHAINS for k in keys})
+
+    def test_the_command_line_takes_chains_as_text(self):
+        from geofuse.cli import commands as cli
+
+        args = cli.build_parser().parse_args(
+            ["plan", "r.toml", "--chains-column", "g: temporal:mean", "h: temporal:max"]
+        )
+        override = {o.key: o for o in cli._overrides(args)}["chains_column"]
+        self.assertEqual(
+            settings.check("ndvi", {"chains_column": override.value})["chains_column"],
+            [
+                {"name": "g", "steps": ["temporal:mean"]},
+                {"name": "h", "steps": ["temporal:max"]},
+            ],
+        )
 
 
 if __name__ == "__main__":

@@ -6,7 +6,8 @@ line all read it, so a default cannot differ between them. A run's inputs
 (files, dates, outcome and covariate columns) are not settings and are not
 listed here.
 
-The module imports no engine. Its choice lists repeat the engines' own
+The module imports no engine (NDVI aggregation chains are checked by the
+pure :mod:`geofuse.ndvi_chains`). Its choice lists repeat the engines' own
 constants, and a test holds the two equal.
 """
 
@@ -15,6 +16,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
+
+from .ndvi_chains import ChainError, check_chains
 
 
 class SettingError(ValueError):
@@ -25,11 +28,13 @@ class SettingError(ValueError):
 class Setting:
     """One setting: its type, default, allowed values and a one-line help.
 
-    ``kind`` is ``bool``, ``int``, ``float``, ``choice``, ``multichoice`` or
-    ``text``. A ``None`` default marks an optional setting whose absence has
-    a meaning of its own (given in ``help``). ``auto_zero`` marks a number
-    whose 0 means "work it out" and is stored as ``None``, the way the tabs
-    read a 0 in those fields. ``step`` restricts an int to ``lo + k * step``.
+    ``kind`` is ``bool``, ``int``, ``float``, ``choice``, ``multichoice``,
+    ``text`` or ``chains`` (NDVI aggregation chains: ``{name, steps}`` tables
+    or ``"name: op, op"`` lines, stored as tables). A ``None`` default marks
+    an optional setting whose absence has a meaning of its own (given in
+    ``help``). ``auto_zero`` marks a number whose 0 means "work it out" and is
+    stored as ``None``, the way the tabs read a 0 in those fields. ``step``
+    restricts an int to ``lo + k * step``.
     """
 
     kind: str
@@ -72,6 +77,11 @@ class Setting:
             if not isinstance(value, str):
                 raise SettingError(f"'{key}' must be text, not {value!r}.")
             return value
+        if self.kind == "chains":
+            try:
+                return check_chains(value)
+            except ChainError as exc:
+                raise SettingError(f"'{key}': {exc}") from None
         raise AssertionError(self.kind)
 
     def _number(self, key: str, value: Any) -> int | float | None:
@@ -169,6 +179,9 @@ SPATIAL_ADJUST_METHODS = ("none", "ks_aic", "spatial_plus")
 # ────────────────────────────────────────────────────────────────────
 
 _STATS = Setting("multichoice", ["median"], TEMPORAL_REDUCERS)
+_CHAINS = Setting(
+    "chains", [], help="Aggregation chains in place of the statistics; [] = none."
+)
 
 NDVI: dict[str, Setting] = {
     "satellite": _choice(
@@ -191,6 +204,9 @@ NDVI: dict[str, Setting] = {
     "statistics_ranges": _STATS,
     "statistics_specific": _STATS,
     "statistics_column": _STATS,
+    "chains_ranges": _CHAINS,
+    "chains_specific": _CHAINS,
+    "chains_column": _CHAINS,
     "season_start_month": _int(6, 1, 12, "First month of the per-year season."),
     "season_end_month": _int(9, 1, 12, "Last month of the per-year season."),
     "specific_window_days": _int(30, 7, 180, "Days either side of a specific date."),
@@ -353,6 +369,24 @@ LONGITUDINAL_DEFAULT_METRIC = LONGITUDINAL_METRICS[0]
 
 SCHEMAS: dict[str, dict[str, Setting]] = {"ndvi": NDVI, "gvi": GVI, "fusion": FUSION}
 
+#: One key that sets several settings at once (run files, presets, ``--set``):
+#: NDVI ``chains`` gives every date mode the same aggregation chains.
+SHORTHANDS: dict[str, dict[str, tuple[str, ...]]] = {
+    "ndvi": {"chains": ("chains_ranges", "chains_specific", "chains_column")},
+}
+
+
+def expand_shorthands(engine: str, table: Mapping[str, Any]) -> dict[str, Any]:
+    """``table`` with each shorthand of ``engine`` spread over the settings it
+    stands for; a setting given in the same table keeps its own value."""
+    out = dict(table)
+    for short, keys in SHORTHANDS.get(engine, {}).items():
+        if short in out:
+            value = out.pop(short)
+            for key in keys:
+                out.setdefault(key, value)
+    return out
+
 
 def defaults(engine: str) -> dict[str, Any]:
     """Every setting of ``engine`` at its default (lists copied)."""
@@ -365,13 +399,14 @@ def defaults(engine: str) -> dict[str, Any]:
 def check(engine: str, values: Mapping[str, Any]) -> dict[str, Any]:
     """``values`` checked against ``engine``'s schema, as stored.
 
-    Raises :class:`SettingError` naming the first unknown setting or bad
-    value, and when a month window or season runs backwards where the
-    engine needs it forwards.
+    Shorthands are spread first (:func:`expand_shorthands`). Raises
+    :class:`SettingError` naming the first unknown setting or bad value, and
+    when a month window or season runs backwards where the engine needs it
+    forwards.
     """
     schema = SCHEMAS[engine]
     out: dict[str, Any] = {}
-    for key, value in values.items():
+    for key, value in expand_shorthands(engine, values).items():
         if key not in schema:
             raise SettingError(f"Unknown {engine.upper()} setting '{key}'.")
         out[key] = schema[key].check(key, value)
