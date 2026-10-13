@@ -39,6 +39,13 @@ DEFAULT_MODEL_PATH = os.path.join(
 )
 
 
+#: Why a GVI step with ``download_mode = "api"`` cannot start without a key.
+NO_STREETVIEW_KEY = (
+    'download_mode = "api" needs a Street View API key: store one with '
+    "`geofuse credentials set streetview-key`."
+)
+
+
 class PlanError(ValueError):
     """A run file whose jobs cannot be laid out, with the reason."""
 
@@ -1111,6 +1118,8 @@ def build(
         from geofuse.persistence.caches import pano_db
 
         key = api_key if spec.settings["download_mode"] == "api" else None
+        if spec.settings["download_mode"] == "api" and not key:
+            raise PlanError(NO_STREETVIEW_KEY)
         builder = _build_gvi_merge if spec.kind == "gvi_merge" else _build_gvi
         return builder(
             spec,

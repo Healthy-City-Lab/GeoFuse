@@ -228,6 +228,34 @@ def _probe_street_view() -> tuple[str, str]:
     return OK, "the panorama search works"
 
 
+def _probe_street_view_api(key: str) -> tuple[str, str]:
+    """Search once through the keyed API: ``(status, detail)``."""
+    import asyncio
+
+    import aiohttp
+
+    from geofuse import streetview
+
+    async def search():
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            return await streetview.find_panorama_api_async(
+                *streetview.PROBE_POINT, session, key
+            )
+
+    try:
+        pano = asyncio.run(search())
+    except streetview.ApiRequestRefused as exc:
+        return FAIL, str(exc)
+    except streetview.RateLimitedError:
+        return WARN, "the API is throttling this key right now"
+    except OSError as exc:
+        return FAIL, f"cannot reach the API ({exc})"
+    if pano is None:
+        return WARN, "the API answered but found nothing at a covered place"
+    return OK, "the API search works"
+
+
 def _check_environment(args, cfg):
     from geofuse.jobs.locks import lock_dir
     from geofuse.jobs.state import StateDir
@@ -282,6 +310,9 @@ def _check_credentials(args, cfg):
         return
     status, detail = _probe_street_view()
     yield "Street View", status, f"{how}; {detail}"
+    if "streetview-key" in have:
+        status, detail = _probe_street_view_api(cr.get("streetview-key"))
+        yield "Street View API", status, detail
 
 
 def _check_earth_engine(args, cfg):

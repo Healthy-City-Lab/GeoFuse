@@ -311,6 +311,25 @@ def show_plan(run, specs, *, as_json: bool = False) -> int:
     return EXIT_OK
 
 
+def _need_streetview_key(specs: list) -> None:
+    """Refuse GVI steps that download through the API when no key is stored."""
+    from geofuse.jobs.plans import NO_STREETVIEW_KEY
+
+    gvi = ("gvi", "gvi_column", "gvi_merge")
+    if not any(
+        s.kind in gvi and s.settings.get("download_mode") == "api" for s in specs
+    ):
+        return
+    from geofuse import credentials
+
+    try:
+        stored = credentials.get("streetview-key")
+    except credentials.CredentialError:
+        stored = None
+    if not stored:
+        raise CliError(NO_STREETVIEW_KEY, EXIT_ENVIRONMENT)
+
+
 def cmd_submit(args) -> int:
     return submit(args, *_load(args))
 
@@ -319,6 +338,7 @@ def submit(args, run, specs) -> int:
     """Hand ``specs`` to the shared supervisor, starting it if needed."""
     from geofuse.jobs.supervisor import start_daemon, submit_specs
 
+    _need_streetview_key(specs)
     state = _state(args)
     _, ids = submit_specs(state, specs, run_name=run.name, run_file=run.path)
     try:
@@ -360,6 +380,7 @@ def run_here(args, run, specs) -> int:
     """Run ``specs`` in a supervisor in this process until they end."""
     from geofuse.jobs.supervisor import serve, submit_specs
 
+    _need_streetview_key(specs)
     state = _state(args)
     cfg = _config(args)
     sup_id = f"f{uuid.uuid4().hex[:7]}"

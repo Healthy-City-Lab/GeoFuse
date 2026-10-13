@@ -6,7 +6,7 @@ capture; misses, indoor imagery and user photospheres are no panorama; tiles
 stitch at the requested zoom; throttling is retryable, a refused key is not,
 and the key never appears in an error or a log line. The engine runs on the API
 when given a key, stops when the key is refused, and refuses API mode without
-one.
+one; the command line refuses API steps when no key is stored.
 """
 
 import asyncio
@@ -309,6 +309,25 @@ class EngineTests(_ApiCase):
             self.assertEqual(engine.download_mode, "api")
             engine = gvi_mod.GVIEngine(device="cpu")
             self.assertEqual(engine.download_mode, "package")
+
+
+class CommandLineTests(unittest.TestCase):
+    def test_api_steps_need_a_stored_key(self):
+        from types import SimpleNamespace
+
+        from geofuse import credentials
+        from geofuse.cli import commands
+
+        api = SimpleNamespace(kind="gvi", settings={"download_mode": "api"})
+        scraper = SimpleNamespace(kind="gvi", settings={"download_mode": "package"})
+        with mock.patch.object(credentials, "get", lambda name: None):
+            commands._need_streetview_key([scraper])
+            with self.assertRaises(commands.CliError) as caught:
+                commands._need_streetview_key([scraper, api])
+        self.assertEqual(caught.exception.code, commands.EXIT_ENVIRONMENT)
+        self.assertIn("geofuse credentials set streetview-key", str(caught.exception))
+        with mock.patch.object(credentials, "get", lambda name: KEY):
+            commands._need_streetview_key([api])
 
 
 if __name__ == "__main__":

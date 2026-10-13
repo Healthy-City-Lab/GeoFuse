@@ -82,6 +82,30 @@ class CommandTests(StoreCase):
         rows = {r["check"]: r for r in json.loads(out[out.index("[") :])}
         self.assertEqual(rows["Street View"]["status"], "FAIL")
         self.assertIn("no route", rows["Street View"]["detail"])
+        self.assertNotIn("Street View API", rows)
+        self.assertEqual(code, 3)
+
+    def test_doctor_checks_a_stored_key_against_the_api(self):
+        from geofuse import streetview
+
+        cr.put("streetview-key", "AIzaSECRET")
+        state = os.path.join(self.tmp.name, "state")
+        config = os.path.join(self.tmp.name, "config.toml")
+        argv = ["--state-dir", state, "--config", config, "doctor", "--json"]
+
+        async def refused(*_args, **_kw):
+            raise streetview.ApiRequestRefused(403, "Map Tiles API is disabled")
+
+        with (
+            mock.patch.object(account, "_probe_street_view", lambda: ("OK", "ok")),
+            mock.patch.object(streetview, "find_panorama_api_async", refused),
+            mock.patch.object(ee_auth, "initialize", lambda *a, **k: "stub"),
+        ):
+            code, out = self.geofuse(*argv)
+        rows = {r["check"]: r for r in json.loads(out[out.index("[") :])}
+        self.assertEqual(rows["Street View API"]["status"], "FAIL")
+        self.assertIn("Map Tiles API is disabled", rows["Street View API"]["detail"])
+        self.assertNotIn("AIzaSECRET", out)
         self.assertEqual(code, 3)
 
 
