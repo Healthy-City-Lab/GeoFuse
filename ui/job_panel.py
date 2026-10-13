@@ -122,8 +122,13 @@ def _load_fusion_results_into_session(rec) -> bool:
 
     # Disk fallback: find the persisted results bundle among the job's outputs.
     bundle_path = _fusion_results_bundle_path(rec)
-    if bundle_path is None:
-        return False
+    return bundle_path is not None and load_fusion_bundle(bundle_path)
+
+
+def load_fusion_bundle(bundle_path: str) -> bool:
+    """Show a fusion run's ``results_bundle.json`` in the Fusion tab's results
+    view, without the engine objects (maps read their GeoTIFFs from disk).
+    Returns ``True`` when the bundle could be read."""
     try:
         with open(bundle_path, encoding="utf-8") as f:
             disk_results = json.load(f)

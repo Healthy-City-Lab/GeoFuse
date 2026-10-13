@@ -36,7 +36,7 @@ if __name__ == "__main__":
     from chrome import inject_chrome  # noqa: E402
     from resource_monitor import render_resource_monitor  # noqa: E402
     from services import get_job_executor, get_job_store  # noqa: E402, F401
-    from tabs import fusion, gvi, job_monitor, ndvi  # noqa: E402
+    from tabs import fusion, gvi, jobs, ndvi  # noqa: E402
 
     # Warm the singletons once per process so the heartbeat thread starts even
     # before any job is submitted.
@@ -58,7 +58,7 @@ if __name__ == "__main__":
     pin_fusion_form_state()
 
     tab_ndvi, tab_gvi, tab_fusion, tab_job = st.tabs(
-        ["NDVI", "GVI", "Fusion & Optimization", "HPC Monitoring"]
+        ["NDVI", "GVI", "Fusion & Optimization", "Jobs"]
     )
 
     output_dir = "output_results"
@@ -75,7 +75,7 @@ if __name__ == "__main__":
         fusion.render(output_dir)
 
     with tab_job:
-        job_monitor.render(output_dir)
+        jobs.render()
 
     # Cache management lives in the sidebar and is rendered here (not inside a
     # tab) so it is reachable from every tab — the job monitor is only mounted

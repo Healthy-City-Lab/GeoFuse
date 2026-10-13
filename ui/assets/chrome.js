@@ -126,21 +126,8 @@
 		list.insertBefore(span, list.firstChild);
 	}
 
-	function markMutedTab() {
-		var list = findTabList();
-		if (!list) return;
-		var tabs = list.querySelectorAll("button[role='tab']");
-		for (var i = 0; i < tabs.length; i++) {
-			tabs[i].classList.remove("gf-tab-muted");
-		}
-		if (tabs.length > 0) {
-			tabs[tabs.length - 1].classList.add("gf-tab-muted");
-		}
-	}
-
 	function apply() {
 		injectBrand();
-		markMutedTab();
 		ensureFloaterButton();
 		placeFloater();
 		bindSidebarToggle();
