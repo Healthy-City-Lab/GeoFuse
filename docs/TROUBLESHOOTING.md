@@ -116,6 +116,16 @@ Install it into the environment (`pip install textual`), or follow jobs with `ge
 
 ---
 
+## The Jobs tab or `geofuse watch` says a remote's link is down
+
+The remote's jobs are shown as they were when last read, and requests are not sent. Run `geofuse remote attach NAME` in a terminal and keep it open; it asks for the login there.
+
+* **`the remote side closed the link (exit code 127)`:** the remote shell cannot find `geofuse`. Set the full start command, e.g. `geofuse remote add NAME HOST --command "conda run -n geofuse geofuse"` (or `module load ...; geofuse`).
+* **`exit code 255`:** `ssh` itself failed: host name, user, key or network. Try `ssh USER@HOST` by hand.
+* **It keeps reconnecting:** the link retries with growing pauses, up to a minute apart; it recovers by itself once the connection does.
+
+---
+
 ## Out-of-Memory (GPU) Errors
 
 The segmentation model runs out of VRAM during batch processing.

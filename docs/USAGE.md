@@ -12,7 +12,7 @@ streamlit run ui/app.py
 | NDVI | Upload study areas, set dates, run Earth Engine downloads, inspect on a map |
 | GVI | Upload study areas, generate sampling grids, run Street View segmentation |
 | Fusion | Upload an outcome plus your GVI/NDVI files, discover the composite index, read the results |
-| HPC monitoring | Work in progress. Track CLI jobs by ID |
+| Jobs | Follow and control command-line jobs on this computer and on linked remote machines |
 
 Jobs survive a browser refresh and are tracked in the sidebar job monitor from
 every tab. Each engine runs in its own process, so the interface stays
@@ -288,7 +288,14 @@ geofuse rm --finished               # tidy the list
 `geofuse watch` shows every job with its progress and time left, the selected
 job's stages, settings and outputs, and its log as it grows. Keys: `p` pause,
 `r` resume, `c` cancel (asks first), `a` all / unfinished, `/` filter, `l` wide
-log, `q` quit. Quitting leaves the jobs running.
+log, `s` next source (this computer, then each remote), `q` quit. Quitting
+leaves the jobs running.
+
+The dashboard's **Jobs** tab shows the same jobs: choose a **Source**, filter
+the table, and pick a **Job** to see its stages, changed settings, outputs and
+log, refreshed every two seconds. **Pause** / **Resume**, **Cancel** (confirmed),
+**Re-run**, and for a finished fusion run **Load results**, which opens it in
+the Fusion tab's results view.
 
 Job ids can be shortened to any unique prefix. The supervisor starts with the
 first `submit` and stops after ten idle minutes; `geofuse supervisor --stop`
@@ -363,3 +370,32 @@ on a GPU, fusion with `--fusion-cpus` / `--fusion-mem`, the rest small) and a
 `submit.sh` that makes each level wait for the one before. Each array task runs
 one job, `geofuse run run.toml --level K --group G --array-task N`, which can
 also be run by hand; `geofuse plan` shows every job's number, level and group.
+
+### Following a remote machine from this one
+
+A remote link shows another machine's jobs here, in `geofuse watch` and the
+Jobs tab, over one SSH login. It needs `ssh` on this computer and GeoFuse on
+the other machine; nothing is specific to one cluster or scheduler.
+
+```bash
+geofuse remote add cluster login.cluster.example.org --user me \
+    --command "conda run -n geofuse geofuse" \
+    --remote-state-dir /scratch/me/geofuse-state      # optional
+geofuse remote attach cluster       # keep this terminal open
+geofuse watch --remote cluster      # or the Jobs tab, Source "cluster"
+geofuse remote fetch cluster JOB -o results/   # copy a job's outputs
+```
+
+`attach` logs in once (answer the password or second-factor prompt in that
+terminal), starts `geofuse agent --stdio` there, and copies the remote jobs and
+their logs into this computer's state folder every two seconds. Pause, resume,
+cancel and re-run from the monitor or the Jobs tab travel back over the same
+login. If the connection drops it reconnects by itself, with growing pauses;
+meanwhile both views say the link is down and when the jobs were last read,
+and send nothing. `--ssh-option "-i ~/.ssh/key"` adds options for `ssh` and
+`scp`; `geofuse remote list` shows each remote and its link.
+
+**Fetch outputs** in the Jobs tab copies a finished remote job's files over the
+link into the state folder's `remotes/<name>/outputs/<job>/`. `geofuse remote
+fetch` does the same with its own login and sends files over 16 MB through
+`scp`.

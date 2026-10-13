@@ -247,6 +247,11 @@ The command line keeps its jobs in a per-user state folder
 | `logs/<id>.log` | The job's log |
 | `runs/<run>.json` | Each submitted run and its jobs |
 | `supervisors/<id>.json` | Each running supervisor and its heartbeat |
+| `remotes/<name>/link.json` | A remote link's state (connecting, connected, reconnecting, stopped) and heartbeat |
+| `remotes/<name>/snapshot.json` | The remote's jobs and supervisor, as last read |
+| `remotes/<name>/logs/<id>.log` | Each remote job's log, copied as it grows |
+| `remotes/<name>/requests/`, `responses/` | Control, re-run, output and fetch requests waiting for the link, and their answers |
+| `remotes/<name>/outputs/<id>/` | A remote job's files, fetched over the link |
 
 The files are plain JSON replaced whole, so the folder may sit on a cluster's
 shared filesystem and be read from the login node. The user configuration

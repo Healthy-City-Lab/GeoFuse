@@ -276,6 +276,10 @@ Nothing below is pre-specified.
   follows and controls them, and the dashboard's jobs share the same GPU, Street
   View, Earth Engine and fusion limits. On a cluster, GVI steps split into
   shards and `geofuse hpc script` writes SLURM job arrays.
+- **Jobs on other machines.** `geofuse remote attach` holds one SSH login to a
+  cluster or workstation and mirrors its jobs here; the dashboard's **Jobs**
+  tab and `geofuse watch` show and control local and remote jobs alike, and
+  fetch remote outputs. A dropped connection reopens on its own.
 - **Sized to the machine.** Thread pools take about a third of the cores;
   process pools take 80 % by default. Override with `GEOFUSE_WORKERS` and
   `GEOFUSE_CPU_SHARE`. Every run logs a stage-by-stage wall-clock breakdown.
