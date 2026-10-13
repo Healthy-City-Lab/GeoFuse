@@ -29,6 +29,7 @@ from geofuse.persistence.job_store import JobStore
 # converter has no dependency on the engine side beyond strings on the wire.
 _ANSI_ESC = re.compile(r"\x1b\[([0-9;]+)m")
 _ANSI_COLOUR_HEX = {
+    "90": "#9e9e9e",  # grey    (DEBUG)
     "36": "#4dd0e1",  # cyan-ish (INFO)
     "32": "#66bb6a",  # green   (OK)
     "33": "#ffd54f",  # yellow  (WARN)

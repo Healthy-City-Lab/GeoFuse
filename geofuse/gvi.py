@@ -126,8 +126,25 @@ def _window_miss(pano, target_year: int | None, max_year_diff: int | None) -> st
     ]
     return "month" if near else "year"
 
+
+def _progress_summary(stats: dict, done: int, elapsed: float, throttled: int) -> str:
+    """One INFO line: the points done, what became of them, and the rates."""
+    return (
+        f"Points {done:,}/{stats['points']:,}: {stats['sampled']:,} sampled, "
+        f"{stats[NO_PANORAMA]:,} no panorama, "
+        f"{stats[NO_CAPTURE_IN_WINDOW]:,} no capture in the window "
+        f"(year {stats['no_capture_in_year_window']:,}, "
+        f"month {stats['no_capture_in_month_window']:,}), "
+        f"{stats['failed']:,} failed; {stats['cache_hits']:,} from cache, "
+        f"{stats['downloads']:,} downloaded; "
+        f"{done / max(elapsed, 1e-9):.1f} points/s, {throttled} throttle event(s)"
+    )
+
 # Search radius (metres) for find_panorama_async around each grid point.
 _SEARCH_RADIUS_M = 50.0
+# Seconds between the INFO summaries of a run's progress. The lines about
+# single points and panoramas are DEBUG, logged only with ``log_points``.
+_SUMMARY_EVERY_S = 30.0
 # Zoom level for tile downloads: 0 = lowest, 5 = highest. zoom=1 is a 2×1
 # tile grid — plenty of resolution for segmentation, fast to fetch.
 _DOWNLOAD_ZOOM = 1
@@ -290,6 +307,7 @@ DOWNLOAD_MODES = ("package", "api")
 class GVIEngine:
     download_mode: str = "package"
     api_key: str | None = None
+    log_points: bool = False
 
     def __init__(
         self, model_path=None, download_mode="package", device="cuda", api_key=None
@@ -358,6 +376,11 @@ class GVIEngine:
         target_height = int(target_width / 2)
         return img_cropped.resize((target_width, target_height), Image.BILINEAR)
 
+    def _point_log(self, msg: str) -> None:
+        """A line about one point or panorama: DEBUG, only with ``log_points``."""
+        if self.log_points:
+            _log("DEBUG", msg)
+
     def _find(self, lat: float, lon: float, session: aiohttp.ClientSession):
         """The search request for this engine's download mode."""
         if self.download_mode == "api":
@@ -420,7 +443,7 @@ class GVIEngine:
                 _log("ERROR", f"Point {idx}: CRS transform failed — {e}")
                 return ("done", self._empty_result(pt, lat, lon))
 
-        _log("INFO", f"Point {idx} @ ({search_lat:.5f}, {search_lon:.5f})")
+        self._point_log(f"Point {idx} @ ({search_lat:.5f}, {search_lon:.5f})")
 
         # Search for the nearest panorama. Throttling is retried (with the
         # shared backoff) rather than treated as "no coverage" -- otherwise
@@ -472,9 +495,8 @@ class GVIEngine:
             return ("done", self._empty_result(pt, search_lat, search_lon))
 
         if pano is None:
-            _log(
-                "WARN",
-                f"  Point {idx}: no panoramas within {_SEARCH_RADIUS_M:.0f} m",
+            self._point_log(
+                f"  Point {idx}: no panoramas within {_SEARCH_RADIUS_M:.0f} m"
             )
             miss = self._empty_result(pt, search_lat, search_lon)
             miss[CAPTURE_STATUS_KEY] = NO_PANORAMA
@@ -499,11 +521,10 @@ class GVIEngine:
                     window.append(f"{max_year_diff} yr of {target_year}")
                 if month_window is not None:
                     window.append(f"months {month_window[0]}-{month_window[1]}")
-                _log(
-                    "WARN",
+                self._point_log(
                     f"  Point {idx}: no capture within {' and '.join(window)} "
                     f"(available: "
-                    f"{[(c.year, c.month) for c in pano.captures]})",
+                    f"{[(c.year, c.month) for c in pano.captures]})"
                 )
                 miss = self._empty_result(pt, search_lat, search_lon)
                 miss[CAPTURE_STATUS_KEY] = NO_CAPTURE_IN_WINDOW
@@ -523,15 +544,14 @@ class GVIEngine:
 
         # Cache lookups (run-local fail set + persistent success cache)
         if pid in failed_panos:
-            _log("WARN", f"  Skipping {short}… (failed earlier this run)")
+            self._point_log(f"  Skipping {short}… (failed earlier this run)")
             return ("done", self._empty_result(pt, search_lat, search_lon))
 
         if pid in pano_cache:
             cached = pano_cache[pid]
-            _log(
-                "OK",
+            self._point_log(
                 f"  Cache hit {short}… → veg={cached['veg']:.3f} "
-                f"ter={cached['ter']:.3f}",
+                f"ter={cached['ter']:.3f}"
             )
             return (
                 "done",
@@ -574,7 +594,7 @@ class GVIEngine:
         # A throttled tile fetch surfaces as ClientResponseError from
         # raise_for_status(); those statuses are retried, never taken as a
         # permanently-failed panorama.
-        _log("INFO", f"  Downloading {short}… (zoom={_DOWNLOAD_ZOOM})")
+        self._point_log(f"  Downloading {short}… (zoom={_DOWNLOAD_ZOOM})")
         raw_image = None
         for attempt in range(_RL_MAX_RETRIES):
             if throttle is not None:
@@ -625,10 +645,9 @@ class GVIEngine:
         if raw_image is None or (cancel_callback and cancel_callback()):
             return empty
 
-        _log(
-            "INFO",
+        self._point_log(
             f"  Downloaded {short}… ({raw_image.width}×{raw_image.height}) "
-            f"— preprocessing",
+            f"— preprocessing"
         )
         # Preprocess in the executor, never inline: every worker is a coroutine
         # on one event-loop thread, and numpy / PIL release the GIL, so a
@@ -680,10 +699,9 @@ class GVIEngine:
             pt, _pano, pid, pano_date_str, slat, slon = item
             if pid in pano_cache:
                 cached = pano_cache[pid]
-                _log(
-                    "OK",
+                self._point_log(
                     f"  Cache hit (after queue) {pid[:12]}… → "
-                    f"veg={cached['veg']:.3f} ter={cached['ter']:.3f}",
+                    f"veg={cached['veg']:.3f} ter={cached['ter']:.3f}"
                 )
                 out.append(
                     (
@@ -741,7 +759,9 @@ class GVIEngine:
             val_veg = metrics.get("GVI_Vegetation", 0.0)
             val_ter = metrics.get("GVI_Terrain", 0.0)
             pano_cache[pid] = {"veg": val_veg, "ter": val_ter}
-            _log("OK", f"  GVI {pid[:12]}… → veg={val_veg:.3f}  ter={val_ter:.3f}")
+            self._point_log(
+                f"  GVI {pid[:12]}… → veg={val_veg:.3f}  ter={val_ter:.3f}"
+            )
             if save_panos or save_masks:
                 await loop.run_in_executor(
                     getattr(self, "_prep_pool", None),
@@ -763,8 +783,7 @@ class GVIEngine:
             )
         return out
 
-    @staticmethod
-    def _save_artefacts(folder, pid, img, mask, save_panos, save_masks) -> None:
+    def _save_artefacts(self, folder, pid, img, mask, save_panos, save_masks) -> None:
         """Write the panorama and / or its class mask, unless already there."""
         short = pid[:12]
         if save_panos:
@@ -775,7 +794,7 @@ class GVIEngine:
                         Image.fromarray(img) if isinstance(img, np.ndarray) else img
                     )
                     img_to_save.save(p_path)
-                    _log("OK", f"  Saved panorama → {p_path}")
+                    self._point_log(f"  Saved panorama → {p_path}")
                 except Exception as e:
                     _log(
                         "ERROR",
@@ -793,11 +812,11 @@ class GVIEngine:
                         mask_img = Image.fromarray(m.astype(np.uint8))
                         mask_img.putpalette(CITYSCAPES_PALETTE)
                         mask_img.save(m_path)
-                        _log("OK", f"  Saved mask     → {m_path}")
+                        self._point_log(f"  Saved mask     → {m_path}")
                     elif isinstance(m, Image.Image):
                         m.putpalette(CITYSCAPES_PALETTE)
                         m.save(m_path)
-                        _log("OK", f"  Saved mask     → {m_path}")
+                        self._point_log(f"  Saved mask     → {m_path}")
                     else:
                         _log(
                             "WARN",
@@ -1116,6 +1135,21 @@ class GVIEngine:
 
             watcher = asyncio.create_task(_cancel_watcher())
 
+            # Reporter: a summary at most every _SUMMARY_EVERY_S, when points
+            # were done since the last one.
+            async def _reporter() -> None:
+                reported = 0
+                while True:
+                    await asyncio.sleep(_SUMMARY_EVERY_S)
+                    if completed == reported:
+                        continue
+                    reported = completed
+                    elapsed = time.perf_counter() - started
+                    line = _progress_summary(stats, reported, elapsed, throttle.trips)
+                    _log("INFO", line)
+
+            reporter = asyncio.create_task(_reporter())
+
             try:
                 # Drain the stages in order: searching ends, then the
                 # downloads, then the consumer once its queue is empty.
@@ -1127,11 +1161,12 @@ class GVIEngine:
                     await gpu_q.put(_STOP)
                 await asyncio.gather(consumer, return_exceptions=True)
             finally:
-                watcher.cancel()
-                try:
-                    await watcher
-                except asyncio.CancelledError:
-                    pass
+                for task in (watcher, reporter):
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
             if cancel_callback and cancel_callback():
                 _log("WARN", "Analysis Aborted by User.")
 
@@ -1159,6 +1194,7 @@ class GVIEngine:
         )
         stats["gpu_seconds"] = round(stats["gpu_seconds"], 2)
         self.last_run_stats = stats
+        _log("INFO", _progress_summary(stats, completed, elapsed, throttle.trips))
         _log(
             "INFO",
             f"Throughput: {stats['searched']:,} searched "
@@ -1191,6 +1227,7 @@ class GVIEngine:
         batch_size=None,
         batch_wait_ms=None,
         precision=None,
+        log_points=False,
     ):
         """Segment the panorama nearest each point and record its GVI.
 
@@ -1206,8 +1243,13 @@ class GVIEngine:
         (:data:`POINT_OUTCOMES`, with the window misses also split into
         ``no_capture_in_year_window`` / ``no_capture_in_month_window``), and
         the precision the forwards ran at; ``None`` when no point was run.
+
+        The log gets a summary of the progress at most every 30 s and the
+        warnings and errors; ``log_points`` adds a DEBUG line for every point
+        searched and every panorama downloaded, segmented or saved.
         """
         self.last_run_stats = None
+        self.log_points = bool(log_points)
         _log("INFO", f"Starting Analysis (Resume Index: {start_index})...")
         if precision is not None:
             self.segmenter.precision = precision

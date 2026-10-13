@@ -27,6 +27,7 @@ from PIL import Image
 from shapely.geometry import Point
 
 import geofuse  # noqa: F401  (import order: torch before GeoPandas)
+from geofuse import gvi as gvi_mod
 from geofuse import streetview as sv
 from geofuse.gvi import GVIEngine
 
@@ -195,10 +196,9 @@ class PipelineTests(_Case):
         self.assertLessEqual(max(waiting), 4)
 
 
-class OutcomeTests(_Case):
-    """Every point is counted once: sampled, no panorama, no capture in the
-    window, or failed. Points 0, 4, 8, ... have no panorama, 1, 5, ... only a
-    January capture, and 2, 6, ... a panorama whose download fails."""
+class _OutcomeCase(_Case):
+    """Points 0, 4, 8, ... have no panorama, 1, 5, ... only a January
+    capture, and 2, 6, ... a panorama whose download fails."""
 
     def setUp(self):
         super().setUp()
@@ -226,6 +226,11 @@ class OutcomeTests(_Case):
             patch = mock.patch.object(sv, name, value)
             patch.start()
             self.addCleanup(patch.stop)
+
+
+class OutcomeTests(_OutcomeCase):
+    """Every point is counted once: sampled, no panorama, no capture in the
+    window, or failed."""
 
     def counts(self, stats):
         """``(sampled, no panorama, no capture in the window, failed)``."""
@@ -281,6 +286,92 @@ class OutcomeTests(_Case):
         self.assertEqual(side["n_no_capture_in_window"], 10)
         self.assertEqual(side["n_no_capture_in_month_window"], 10)
         self.assertEqual(sum(side["capture_years"].values()), side["n_sampled"])
+
+
+class LogTests(_OutcomeCase):
+    """The log does not grow with the points: a summary at most every
+    ``_SUMMARY_EVERY_S`` and the warnings and errors; ``log_points`` brings
+    back a DEBUG line for every point."""
+
+    def run_logged(self, model=None, **kw):
+        lines: list[tuple[str, str]] = []
+        record = lambda level, msg: lines.append((level, msg))  # noqa: E731
+        with mock.patch.object(gvi_mod, "_log", record):
+            engine, _results = self.run_engine(model or _Model(), **kw)
+        return engine, lines
+
+    def test_the_log_does_not_grow_with_the_points(self):
+        async def find(lat, lon, session, radius=50.0, **_):
+            i = round((lon + 114.0) / 0.001)
+            return sv.StreetViewPanorama(
+                id=f"pano{i // 10:04d}",
+                lat=lat,
+                lon=lon,
+                tile_size=sv.Size(256, 128),
+                image_sizes=[sv.Size(256, 128), sv.Size(256, 128)],
+                date=(2024, 6),
+            )
+
+        async def download(pano, session, zoom=1):
+            return _image(pano.id)
+
+        with (
+            mock.patch.object(sv, "find_panorama_async", find),
+            mock.patch.object(sv, "get_panorama_async", download),
+            mock.patch.object(gvi_mod, "_SUMMARY_EVERY_S", 3600.0),
+        ):
+            _engine, small = self.run_logged(n=100)
+            engine, large = self.run_logged(n=10_000)
+        self.assertEqual(engine.last_run_stats["sampled"], 10_000)
+        self.assertEqual([lvl for lvl, _ in large], [lvl for lvl, _ in small])
+        self.assertLess(sum(len(m) for _, m in large), 2_000)
+
+    def test_summaries_carry_the_run_counts(self):
+        with mock.patch.object(gvi_mod, "_SUMMARY_EVERY_S", 0.02):
+            engine, lines = self.run_logged(
+                _Model(delay=0.01), n=80, month_window=(5, 10)
+            )
+        summaries = [m for lvl, m in lines if lvl == "INFO" and m.startswith("Points")]
+        self.assertGreaterEqual(len(summaries), 2)
+        stats = engine.last_run_stats
+        self.assertTrue(
+            summaries[-1].startswith(
+                f"Points 80/80: {stats['sampled']} sampled, "
+                f"{stats['no_panorama']} no panorama, "
+                f"{stats['no_capture_in_window']} no capture in the window "
+                f"(year 0, month {stats['no_capture_in_month_window']}), "
+                f"{stats['failed']} failed; "
+            ),
+            summaries[-1],
+        )
+        self.assertEqual(stats["no_capture_in_window"], 20)
+
+    def test_failures_and_throttling_are_still_logged(self):
+        real_find = sv.find_panorama_async
+        throttled: list[int] = []
+
+        async def find(lat, lon, session, **kw):
+            if not throttled:
+                throttled.append(1)
+                raise sv.RateLimitedError(429)
+            return await real_find(lat, lon, session, **kw)
+
+        with (
+            mock.patch.object(sv, "find_panorama_async", find),
+            mock.patch.object(gvi_mod, "_RL_BACKOFF_START_S", 0.05),
+        ):
+            _engine, lines = self.run_logged(n=20)
+        errors = [m for lvl, m in lines if lvl == "ERROR"]
+        self.assertEqual(len([m for m in errors if "Download error" in m]), 5)
+        self.assertTrue(any("backing off" in m for lvl, m in lines if lvl == "WARN"))
+        self.assertFalse([m for lvl, m in lines if lvl == "DEBUG"])
+
+    def test_log_points_brings_back_a_line_per_point(self):
+        _engine, lines = self.run_logged(n=20, log_points=True)
+        debug = [m for lvl, m in lines if lvl == "DEBUG"]
+        for i in range(20):
+            self.assertTrue(any(m.startswith(f"Point {i} @") for m in debug), i)
+        self.assertEqual(len([m for m in debug if "no panoramas within" in m]), 5)
 
 
 class ControlTests(_Case):
