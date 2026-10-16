@@ -937,6 +937,8 @@ def _posterior_summary(params: dict) -> dict:
         "discovery": disc,
         "holdout_gain": gain,
         "null_calibration": null,
+        # Which street-view rungs were searched, and what the gate dropped.
+        "coverage": g("__coverage__"),
         "elapsed_s": g("__elapsed_s__"),
     }
 

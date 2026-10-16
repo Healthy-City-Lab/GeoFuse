@@ -3595,6 +3595,7 @@ class MetricFusionEngine:
         params["__discovery__"] = disc
         params["__holdout_gain__"] = gain
         params["__null_calibration__"] = null
+        params["__coverage__"] = getattr(self, "_coverage_report", None)
         params["__elapsed_s__"] = float(time.perf_counter() - t0)
         _log(
             "OK",
@@ -8135,6 +8136,7 @@ class MetricFusionEngine:
             "posterior": final_params.get("__posterior__"),
             "holdout_gain": final_params.get("__holdout_gain__"),
             "null_calibration": final_params.get("__null_calibration__"),
+            "coverage": final_params.get("__coverage__"),
         }
         with open(params_path, "w") as f:
             json.dump(
