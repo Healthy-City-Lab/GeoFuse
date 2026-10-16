@@ -28,6 +28,7 @@ from . import (
     bayesian_index,
     binary_longitudinal,
     cgi_formulas,
+    exposure,
     exposure_response,
 )
 from . import fusion_helpers as _helpers
@@ -178,6 +179,10 @@ class MetricFusionEngine:
         ndvi_ladder_spacing: str = "linear",
         gvi_ladder_rungs: int | None = None,
         ndvi_ladder_rungs: int | None = None,
+        exposure_kernel: str = "none",
+        exposure_radius_m: float = 100.0,
+        exposure_plateau_m: float = 0.0,
+        exposure_sigma_m: float = 35.0,
     ):
         """
         Initialize the fusion engine.
@@ -228,6 +233,9 @@ class MetricFusionEngine:
                 ``*_buffer_step_m``) or ``"log"`` (``*_ladder_rungs`` rungs
                 spaced geometrically between min and max); see
                 :func:`metric_sampling.ladder_radii`.
+            exposure_kernel / exposure_radius_m / exposure_plateau_m /
+                exposure_sigma_m: which CGI cells an entity is exposed to and
+                with what weight; see :func:`exposure.cell_weights`.
         """
         # Route Optuna's chatter ("Trial X finished with value Y …") into
         # the per-job log instead of the Streamlit host terminal. Fusion
@@ -406,6 +414,15 @@ class MetricFusionEngine:
         self.cgi_grid_spacing_m: float = (
             float(cgi_grid_spacing_m) if cgi_grid_spacing_m is not None else 25.0
         )
+        # Which CGI cells an entity is exposed to: the cells its geometry
+        # touches, widened by an optional buffer (``geofuse.exposure``).
+        exposure.check_kernel(
+            exposure_kernel, exposure_radius_m, exposure_plateau_m, exposure_sigma_m
+        )
+        self.exposure_kernel = str(exposure_kernel)
+        self.exposure_radius_m = float(exposure_radius_m)
+        self.exposure_plateau_m = float(exposure_plateau_m)
+        self.exposure_sigma_m = float(exposure_sigma_m)
         self.whole_grid_scaling: bool = bool(whole_grid_scaling)
         # When True, each channel is min-max scaled to [0, 1] (per-channel
         # bounds fixed at prepare time from the predictor distribution only —
@@ -419,15 +436,12 @@ class MetricFusionEngine:
         # When True, the area-balanced train-val split tries to keep the total
         # area balanced across train / val / test sets.
         self.area_balanced_split: bool = bool(area_balanced_split)
-        # Per-polygon-id area (km²) populated by ``_prepare_polygon_fusion``
+        # Per-polygon-id area (km²) populated by ``_prepare_vector_fusion``
         # so the area-balanced split has stable polygon → area lookups even
         # after the NaN-outcome filter renumbers polygons.
         self._polygon_id_to_area_km2: dict[int, float] | None = None
-        self._polygon_grid_crs: Any = None
-        self._polygon_grid_transform: Any = None
-        self._polygon_grid_shape: tuple[int, int] | None = None
-        # Per-pixel CGI grid metadata for point / line targets (the composite
-        # raster reuses these so it matches the scored CGI field).
+        # CGI grid metadata for vector targets (the composite raster reuses
+        # these so it matches the scored CGI field).
         self._entity_grid_crs: Any = None
         self._entity_grid_transform: Any = None
         self._entity_grid_shape: tuple[int, int] | None = None
@@ -2026,19 +2040,12 @@ class MetricFusionEngine:
         if self._preaggr_mem is not None:
             self._preaggr_mem.close()
             self._preaggr_mem = None
-        if self.is_polygon_target:
-            _log("INFO", "Target type: POLYGON (per-pixel CGI)")
-            df = self._prepare_polygon_fusion()
+        if self.is_points:
+            _log("INFO", "Target type: VECTOR (per-cell CGI)")
+            df = self._prepare_vector_fusion()
         else:
-            _log(
-                "INFO",
-                f"Target type: {'POINT/LINE (per-pixel CGI)' if self.is_points else 'RASTER'}",
-            )
-            df = (
-                self._prepare_entity_fusion()
-                if self.is_points
-                else self._prepare_raster_fusion()
-            )
+            _log("INFO", "Target type: RASTER")
+            df = self._prepare_raster_fusion()
         self._compute_channel_scale(df)
         # RAM management: narrow the resident per-pixel frames' dtypes (wave
         # string -> category, 64-bit -> 32-bit) before the search + the RAM
@@ -3775,7 +3782,11 @@ class MetricFusionEngine:
                         v = v[static["uniq_inverse"]]
                     X[:, ci, ri, si] = (
                         self._collapse_mean_from_codes(
-                            v, static["codes"], static["n_uniq"], mask
+                            v,
+                            static["codes"],
+                            static["n_uniq"],
+                            mask,
+                            static.get("weight"),
                         )
                         if static["has_pid"]
                         else v
@@ -3878,311 +3889,28 @@ class MetricFusionEngine:
     # Polygon-target areal aggregation
     # ────────────────────────────────────────────────────────────
 
-    def _prepare_polygon_fusion(self) -> pd.DataFrame:
-        """Build a per-pixel dataset for polygon targets.
+    def _prepare_vector_fusion(self) -> pd.DataFrame:
+        """Per-cell dataset for vector targets of any geometry type.
 
-        Generates a regular grid of pixel centroids at
-        ``self.cgi_grid_spacing_m`` spacing covering the union of the
-        target polygons, tags each pixel with the polygon it falls inside
-        (first-match for overlapping polygons), and returns one row per
-        pixel. Each pixel carries the parent polygon's outcome,
-        covariates, and longitudinal extras. Downstream:
-
-        - ``precompute_aggregations`` runs the point-fast path because
-          every entity is a Point.
-        - ``_objective`` / ``evaluate_on_test`` compute per-pixel CGI and
-          collapse to per-polygon via ``groupby("polygon_id").mean()``.
+        Lays the CGI grid over the targets in a low-distortion metre CRS and
+        exposes every entity to the cells its geometry touches, widened by the
+        optional exposure buffer (:func:`exposure.cell_weights`). Returns one
+        row per ``(entity, cell)`` exposure, keyed by ``polygon_id`` (the entity
+        or observation index) and carrying the exposure ``_weight``; an entity's
+        exposure is the weighted mean of its cells' values. A cell shared by
+        several entities appears once per entity, so group membership stays
+        fixed for :meth:`split_data`, while the pre-aggregation cache holds each
+        cell once (``_preaggr_id`` → ``_global_pid``).
         """
-
-        _log("INFO", "====== POLYGON FUSION (per-pixel CGI) ======")
-        if self.target_polygons_gdf is None:
-            self.target_polygons_gdf = self.target_gdf.copy()
-        polygons = self.target_polygons_gdf
-
-        outcome_col = self.target_feature
-        spacing_m = float(self.cgi_grid_spacing_m)
-        _log(
-            "INFO",
-            f"Target polygons: {len(polygons)} · CGI grid pixel size: "
-            f"{spacing_m:g} m",
-        )
-
-        # Drop NaN-outcome polygons up front so the grid never includes
-        # pixels for entities that would be filtered later.
-        valid_mask = polygons[outcome_col].notna()
-        if self.covariate_columns:
-            for col in self.covariate_columns:
-                valid_mask &= polygons[col].notna()
-        skipped_nan = int((~valid_mask).sum())
-        if skipped_nan:
-            _log(
-                "WARN",
-                f"Skipped {skipped_nan} polygon(s) with NaN outcome / covariate.",
-            )
-        polygons = polygons.loc[valid_mask].reset_index(drop=True)
-        if len(polygons) < 2:
-            raise ValueError(
-                "Polygon fusion needs ≥2 polygons with a valid outcome "
-                f"(and covariates if configured); got {len(polygons)}."
-            )
-
-        # Distance math (grid step) is metres, so move the polygons into a
-        # projected CRS chosen for low distortion across the study extent.
-        grid_crs, _grid_distortion, _grid_name = select_grid_crs_with_warning(
-            polygons, _log, role="CGI grid CRS"
-        )
-        polygons_grid = polygons.to_crs(grid_crs)
-        polygons_grid["__polygon_id"] = np.arange(len(polygons_grid), dtype=np.int64)
-        # Per-polygon area lookup for the area-balanced split.
-        self._polygon_id_to_area_km2 = {
-            int(pid): float(area)
-            for pid, area in zip(
-                polygons_grid["__polygon_id"].to_numpy(),
-                polygons_grid.geometry.area.to_numpy() / 1_000_000.0,
-            )
-        }
-        union_geom = polygons_grid.geometry.union_all()
-        minx, miny, maxx, maxy = union_geom.bounds
-
-        # Sparse lattice: generate pixel centres only inside the polygons'
-        # connected components, on one global lattice anchored at the grid
-        # bounding box so ``(_grid_row, _grid_col)`` stay consistent across
-        # components. The empty space between dispersed polygons is never
-        # materialised as geometry.
-        import shapely as _shapely
-        from shapely.geometry import Polygon as _Polygon
-
-        n_cols = int(np.floor((maxx - minx) / spacing_m))
-        n_rows = int(np.floor((maxy - miny) / spacing_m))
-        if n_cols <= 0 or n_rows <= 0:
-            raise ValueError(
-                f"CGI grid spacing {spacing_m:g} m is larger than the target "
-                f"extent ({maxx - minx:.0f} m × {maxy - miny:.0f} m)."
-            )
-        cluster_polys = (
-            [union_geom]
-            if isinstance(union_geom, _Polygon)
-            else [
-                g for g in getattr(union_geom, "geoms", []) if isinstance(g, _Polygon)
-            ]
-        )
-        row_parts: list[np.ndarray] = []
-        col_parts: list[np.ndarray] = []
-        x_parts: list[np.ndarray] = []
-        y_parts: list[np.ndarray] = []
-        for poly in cluster_polys:
-            if poly.is_empty:
-                continue
-            cminx, cminy, cmaxx, cmaxy = poly.bounds
-            col_lo = max(0, int(np.floor((cminx - minx) / spacing_m)))
-            col_hi = min(n_cols, int(np.ceil((cmaxx - minx) / spacing_m)))
-            # Rows run top-down so the composite writer can index pixels back
-            # to (row, col) without flipping.
-            row_lo = max(0, int(np.floor((maxy - cmaxy) / spacing_m)))
-            row_hi = min(n_rows, int(np.ceil((maxy - cminy) / spacing_m)))
-            if col_hi <= col_lo or row_hi <= row_lo:
-                continue
-            cg, rg = np.meshgrid(
-                np.arange(col_lo, col_hi, dtype=np.int64),
-                np.arange(row_lo, row_hi, dtype=np.int64),
-                indexing="xy",
-            )
-            cg = cg.ravel()
-            rg = rg.ravel()
-            cx = minx + (cg + 0.5) * spacing_m
-            cy = maxy - (rg + 0.5) * spacing_m
-            inside = _shapely.contains_xy(poly, cx, cy)
-            if not inside.any():
-                continue
-            col_parts.append(cg[inside])
-            row_parts.append(rg[inside])
-            x_parts.append(cx[inside])
-            y_parts.append(cy[inside])
-
-        if not x_parts:
-            raise ValueError(
-                "CGI grid produced zero in-polygon pixels — spacing may exceed "
-                "polygon size, or the union extent has no interior points."
-            )
-        g_col = np.concatenate(col_parts)
-        g_row = np.concatenate(row_parts)
-        g_x = np.concatenate(x_parts)
-        g_y = np.concatenate(y_parts)
-        pixels = gpd.GeoDataFrame(
-            {
-                "_grid_row": g_row.astype(np.int32),
-                "_grid_col": g_col.astype(np.int32),
-            },
-            geometry=gpd.points_from_xy(g_x, g_y),
-            crs=grid_crs,
-        )
-        _log(
-            "INFO",
-            f"CGI grid span {n_rows} × {n_cols} · {len(cluster_polys)} cluster(s) "
-            f"· {len(pixels):,} in-union candidate pixels.",
-        )
-
-        # Pixel → polygon assignment via sjoin(within). For overlapping
-        # polygons each pixel falls in multiple — keep the first match per
-        # pixel (decided in the plan; census-tract use case has no overlap).
-        joined = gpd.sjoin(
-            pixels[["geometry", "_grid_row", "_grid_col"]],
-            polygons_grid[["__polygon_id", "geometry"]],
-            how="inner",
-            predicate="within",
-        )
-        joined = joined[~joined.index.duplicated(keep="first")]
-        if len(joined) == 0:
-            raise ValueError(
-                "CGI grid produced zero in-polygon pixels — spacing may exceed "
-                "polygon size, or the union extent has no interior points."
-            )
-
-        # Carry outcome + covariates + longitudinal extras onto each pixel
-        # by indexing back into the (NaN-filtered) polygon table.
-        poly_attr_cols = [outcome_col, *self.covariate_columns]
-        if self.is_longitudinal:
-            poly_attr_cols.extend(self._longitudinal_extra_cols())
-        # Drop duplicates conservatively so covariate / longitudinal aliases
-        # to outcome don't collide.
-        poly_attr_cols = list(dict.fromkeys(poly_attr_cols))
-        attr_lookup = polygons_grid.set_index("__polygon_id")[poly_attr_cols]
-        attrs = attr_lookup.loc[joined["__polygon_id"].values].reset_index(drop=True)
-
-        polygon_ids = joined["__polygon_id"].values.astype(np.int64)
-        if self.is_longitudinal:
-            entity_ids = attrs["entity_id"].astype(str).to_numpy()
-            wave_labels = attrs["wave"].astype(str).to_numpy()
-            collapse_keys = np.array(
-                [f"{e}|{w}" for e, w in zip(entity_ids, wave_labels)]
-            )
-        else:
-            collapse_keys = polygon_ids
-
-        entity_gdf = gpd.GeoDataFrame(
-            {
-                "polygon_id": collapse_keys,
-                "target": attrs[outcome_col].to_numpy(),
-                "_grid_row": joined["_grid_row"].to_numpy(),
-                "_grid_col": joined["_grid_col"].to_numpy(),
-            },
-            geometry=joined.geometry.values,
-            crs=grid_crs,
-        ).reset_index(drop=True)
-        for col in self.covariate_columns:
-            entity_gdf[col] = attrs[col].to_numpy()
-        for col in self._longitudinal_extra_cols():
-            if col in attrs.columns:
-                entity_gdf[col] = attrs[col].to_numpy()
-
-        # Stash the grid metadata so the composite-map writer can build the
-        # output raster directly from the pixel grid (no re-sampling step).
-        self._polygon_grid_crs = grid_crs
-        self._polygon_grid_transform = from_origin(minx, maxy, spacing_m, spacing_m)
-        self._polygon_grid_shape = (n_rows, n_cols)
-
-        _log(
-            "INFO",
-            f"Per-pixel entities: {len(entity_gdf):,} "
-            f"(unique polygon_id keys: {pd.Series(collapse_keys).nunique()}).",
-        )
-
-        # Re-bind target_gdf to the per-pixel view. Pixel geometries are
-        # Points, so the pre-aggregation cache takes the point-fast path
-        # (BallTree / circular raster mask) automatically.
-        self.target_gdf = entity_gdf.copy()
-
-        # Coverage probe: nearest-feature sample at each pixel using the
-        # channel's max radius. The values feed only the NaN-filtering dropna
-        # gate; per-trial channel values come from the cache. Rows map 1:1 onto
-        # the probe frame here (one row per polygon pixel already).
-        probe_cols = self._probe_channel_coverage(
-            entity_gdf[["geometry"]].copy(),
-            np.arange(len(entity_gdf), dtype=np.int64),
-            entity_gdf,
-        )
-
-        fusion_df = pd.DataFrame(
-            {
-                "polygon_id": entity_gdf["polygon_id"].values,
-                "target": entity_gdf["target"].values,
-                # float32 halves the pixel-frame cost.
-                "veg": probe_cols["veg"],
-                "terrain": probe_cols["terrain"],
-                "ndvi": probe_cols["ndvi"],
-            },
-            index=entity_gdf.index,
-        )
-        for col in self.covariate_columns:
-            fusion_df[col] = entity_gdf[col].values
-        for col in self._longitudinal_extra_cols():
-            if col in entity_gdf.columns:
-                fusion_df[col] = entity_gdf[col].values
-        self._carry_negative_controls(fusion_df, entity_gdf)
-        fusion_df = self._attach_entity_coords(fusion_df, entity_gdf)
-
-        _log("INFO", "====== DATA QUALITY SUMMARY (POLYGON / PER-PIXEL) ======")
-        _log(
-            "INFO",
-            f"Pixel rows: {len(fusion_df):,} "
-            f"({fusion_df['polygon_id'].nunique()} unique polygon_id keys)",
-        )
-        for col in ["target", "veg", "terrain", "ndvi", *self.covariate_columns]:
-            nan_count = fusion_df[col].isna().sum()
-            pct = nan_count / max(len(fusion_df), 1) * 100
-            _log("INFO", f"{col} NaN: {nan_count} ({pct:.1f}%)")
-
-        result = fusion_df.dropna(
-            subset=["target", "veg", "terrain", "ndvi", *self.covariate_columns]
-        )
-        polygons_left = result["polygon_id"].nunique() if len(result) else 0
-        _log(
-            "OK" if polygons_left else "WARN",
-            f"After dropna: {len(result):,} pixel rows "
-            f"({polygons_left} unique polygon_id keys)",
-        )
-        if polygons_left < 2:
-            raise ValueError(
-                "Polygon fusion needs ≥2 polygons with valid coverage after NaN "
-                f"filtering; got {polygons_left}. Check metric coverage or "
-                "increase the buffer."
-            )
-        # Trim target_gdf to the surviving pixels so the cache + split
-        # only see entities that passed the coverage probe.
-        self.target_gdf = entity_gdf.loc[result.index].copy()
-        return result
-
-    def _prepare_entity_fusion(self) -> pd.DataFrame:
-        """Per-pixel CGI dataset for point / line targets.
-
-        Mirrors :meth:`_prepare_polygon_fusion` so every geometry type scores
-        the same way: build a regular pixel grid from the pre-aggregation
-        cache, evaluate per-pixel CGI, and aggregate the pixels in each
-        entity's catchment to the entity value. Points and lines have no
-        footprint, so each entity's catchment is the pixels within its
-        **buffer**; the per-trial collapse
-        (:meth:`_entity_collapse_mask`) later restricts that buffer to the
-        trial's largest channel radius.
-
-        Returns one row per ``(entity, catchment-pixel)``, keyed by
-        ``polygon_id`` (= the entity/observation index) and carrying
-        ``_catchment_dist`` (pixel→entity distance, metres) and
-        ``_is_nearest`` (the entity's closest surviving pixel, always kept so
-        no entity drops out at small radii). Shared pixels between nearby
-        entities are duplicated per entity, which keeps fixed ``polygon_id``
-        membership so :meth:`split_data` and the in-bag/OOB scaler work
-        exactly as in the polygon path.
-        """
-        _log("INFO", "====== POINT/LINE FUSION (per-pixel CGI) ======")
+        _log("INFO", "====== VECTOR FUSION (per-cell CGI) ======")
         entities = self.target_gdf.copy()
         outcome_col = self.target_feature
         spacing_m = float(self.cgi_grid_spacing_m)
 
         # Drop NaN-outcome / NaN-covariate entities up front.
         valid_mask = entities[outcome_col].notna()
-        if self.covariate_columns:
-            for col in self.covariate_columns:
-                valid_mask &= entities[col].notna()
+        for col in self.covariate_columns or []:
+            valid_mask &= entities[col].notna()
         skipped_nan = int((~valid_mask).sum())
         if skipped_nan:
             _log(
@@ -4192,192 +3920,96 @@ class MetricFusionEngine:
         entities = entities.loc[valid_mask].reset_index(drop=True)
         if len(entities) < 2:
             raise ValueError(
-                "Point/line fusion needs ≥2 entities with a valid outcome "
-                f"(and covariates if configured); got {len(entities)}."
+                "Fusion needs ≥2 entities with a valid outcome (and covariates "
+                f"if configured); got {len(entities)}."
             )
 
-        # Project to a low-distortion CRS so the grid step + buffers are metres.
+        # Project to a low-distortion CRS so the grid step and buffers are metres.
         grid_crs, _grid_distortion, _grid_name = select_grid_crs_with_warning(
             entities, _log, role="CGI grid CRS"
         )
         ent = entities.to_crs(grid_crs)
-        ent["__entity_id"] = np.arange(len(ent), dtype=np.int64)
-
-        # Catchment cap = the largest radius any trial can request. Each
-        # trial's collapse then masks down to its own max channel radius.
-        r_max = float(max(self.gvi_buffer_max_m, self.ndvi_buffer_max_m))
-        buffers = ent.geometry.buffer(r_max)
-
-        # Cluster-aware sparse grid: generate pixel centres only inside the
-        # buffered catchments. The buffered union is split into connected
-        # components and each component is gridded on a single global lattice
-        # anchored at the CRS origin, so ``(_grid_row, _grid_col)`` stay
-        # consistent across components and the empty space between dispersed
-        # entities is never materialised.
-        import shapely
-        from shapely.geometry import Polygon
-
-        union_geom = buffers.union_all()
-        if union_geom.is_empty:
-            raise ValueError(
-                "Buffered target catchments are empty — check the target "
-                "geometry and buffer settings."
+        if self.is_polygon_target:
+            # Per-entity area for the area-balanced split.
+            self._polygon_id_to_area_km2 = dict(
+                enumerate((ent.geometry.area.to_numpy() / 1_000_000.0).tolist())
             )
-        cluster_polys = (
-            [union_geom]
-            if isinstance(union_geom, Polygon)
-            else [g for g in getattr(union_geom, "geoms", []) if isinstance(g, Polygon)]
+
+        ent_idx, g_row, g_col, weight = exposure.cell_weights(
+            ent.geometry.values,
+            spacing_m,
+            kernel=self.exposure_kernel,
+            radius_m=self.exposure_radius_m,
+            plateau_m=self.exposure_plateau_m,
+            sigma_m=self.exposure_sigma_m,
         )
-
-        col_parts: list[np.ndarray] = []
-        row_parts: list[np.ndarray] = []
-        x_parts: list[np.ndarray] = []
-        y_parts: list[np.ndarray] = []
-        for poly in cluster_polys:
-            if poly.is_empty:
-                continue
-            cminx, cminy, cmaxx, cmaxy = poly.bounds
-            # Global lattice indices (anchor = CRS origin); rows increase south.
-            col_lo = int(np.floor(cminx / spacing_m))
-            col_hi = int(np.ceil(cmaxx / spacing_m))
-            row_lo = int(np.floor(-cmaxy / spacing_m))
-            row_hi = int(np.ceil(-cminy / spacing_m))
-            if col_hi <= col_lo or row_hi <= row_lo:
-                continue
-            cg, rg = np.meshgrid(
-                np.arange(col_lo, col_hi, dtype=np.int64),
-                np.arange(row_lo, row_hi, dtype=np.int64),
-                indexing="xy",
-            )
-            cg = cg.ravel()
-            rg = rg.ravel()
-            cx = (cg + 0.5) * spacing_m
-            cy = -(rg + 0.5) * spacing_m
-            inside = shapely.contains_xy(poly, cx, cy)
-            if not inside.any():
-                continue
-            col_parts.append(cg[inside])
-            row_parts.append(rg[inside])
-            x_parts.append(cx[inside])
-            y_parts.append(cy[inside])
-
-        if not x_parts:
+        if ent_idx.size == 0:
             raise ValueError(
-                f"CGI grid spacing {spacing_m:g} m produced no pixels inside the "
-                f"buffered target extent — lower the grid spacing or raise the buffer."
+                "No target geometry touches a CGI cell — check the target geometry."
+            )
+        untouched = len(ent) - int(np.unique(ent_idx).size)
+        if untouched:
+            _log(
+                "WARN",
+                f"{untouched} entity(ies) have an empty geometry and no exposure; "
+                "skipped.",
             )
 
-        g_col = np.concatenate(col_parts)
-        g_row = np.concatenate(row_parts)
-        g_x = np.concatenate(x_parts)
-        g_y = np.concatenate(y_parts)
-
-        # Stable global pixel id: the pixel's global lattice (row, col) packed
-        # into one int64. Anchored at the CRS origin, so the same physical
-        # pixel gets the same id in any job — this is what the greenery cache
-        # keys on, making it reusable across targets/outcomes/covariates.
-        g_pid = (g_row.astype(np.int64) << np.int64(32)) | (
-            g_col.astype(np.int64) & np.int64(0xFFFFFFFF)
+        # One pixel per distinct cell. The global id packs the cell's lattice
+        # (row, col), anchored at the CRS origin, so the same cell has the same
+        # id in any job and the greenery cache is reusable across targets.
+        g_pid = (g_row << np.int64(32)) | (g_col & np.int64(0xFFFFFFFF))
+        uniq_pid, first, cell_of_row = np.unique(
+            g_pid, return_index=True, return_inverse=True
         )
-
-        # Local raster indices span only the populated cells' global extent.
-        col_origin = int(g_col.min())
-        row_origin = int(g_row.min())
-        n_cols = int(g_col.max()) - col_origin + 1
-        n_rows = int(g_row.max()) - row_origin + 1
+        u_row, u_col = g_row[first], g_col[first]
+        col_origin = int(u_col.min())
+        row_origin = int(u_row.min())
+        n_cols = int(u_col.max()) - col_origin + 1
+        n_rows = int(u_row.max()) - row_origin + 1
         minx = col_origin * spacing_m
         maxy = -row_origin * spacing_m
         pixels = gpd.GeoDataFrame(
             {
-                "_grid_row": (g_row - row_origin).astype(np.int32),
-                "_grid_col": (g_col - col_origin).astype(np.int32),
-                "_global_pid": g_pid,
+                "_grid_row": (u_row - row_origin).astype(np.int32),
+                "_grid_col": (u_col - col_origin).astype(np.int32),
+                "_global_pid": uniq_pid,
             },
-            geometry=gpd.points_from_xy(g_x, g_y),
+            geometry=gpd.points_from_xy(
+                (u_col + 0.5) * spacing_m, -(u_row + 0.5) * spacing_m
+            ),
             crs=grid_crs,
         )
         _log(
             "INFO",
-            f"Entities: {len(ent)} · catchment cap: {r_max:g} m · CGI grid "
-            f"pixel size: {spacing_m:g} m · {len(cluster_polys)} cluster(s) · "
-            f"{len(pixels):,} in-buffer pixels · grid span {n_rows}×{n_cols}.",
+            f"Entities: {len(ent)} · exposure buffer: {self.exposure_kernel} · CGI "
+            f"grid pixel size: {spacing_m:g} m · {len(pixels):,} cells · "
+            f"{len(ent_idx):,} entity–cell exposures · grid span {n_rows}×{n_cols}.",
         )
 
-        # Assign every pixel to each entity whose catchment contains it
-        # (shared pixels are duplicated per entity → fixed polygon_id
-        # membership). For point entities the catchment is a disc, so the
-        # assignment is a radius neighbour query on the entity coordinates —
-        # far cheaper than a polygon ``within`` join plus a separate distance
-        # pass. Line entities keep the buffer-polygon join (their catchment
-        # distance is perpendicular, not point-to-point).
-        if bool((ent.geom_type == "Point").all()):
-            from scipy.spatial import cKDTree
-
-            ent_xy = np.column_stack(
-                [ent.geometry.x.to_numpy(), ent.geometry.y.to_numpy()]
-            )
-            pix_xy = np.column_stack([g_x, g_y])
-            sdm = cKDTree(pix_xy).sparse_distance_matrix(
-                cKDTree(ent_xy), r_max, output_type="coo_matrix"
-            )
-            pix_idx = sdm.row.astype(np.int64)
-            ent_idx = sdm.col.astype(np.int64)
-            catchment_dist = sdm.data.astype(np.float32)
-        else:
-            ent_buffers = gpd.GeoDataFrame(
-                {"__entity_id": ent["__entity_id"].to_numpy()},
-                geometry=buffers.values,
-                crs=grid_crs,
-            )
-            joined = gpd.sjoin(pixels, ent_buffers, how="inner", predicate="within")
-            pix_idx = joined.index.to_numpy()
-            ent_idx = joined["__entity_id"].to_numpy()
-            ent_geom_by_id = ent.set_index("__entity_id").geometry
-            aligned_geoms = gpd.GeoSeries(
-                ent_geom_by_id.loc[ent_idx].to_numpy(), crs=grid_crs
-            )
-            pix_geoms = gpd.GeoSeries(joined.geometry.to_numpy(), crs=grid_crs)
-            catchment_dist = pix_geoms.distance(aligned_geoms).to_numpy(
-                dtype=np.float32
-            )
-
-        if pix_idx.size == 0:
-            raise ValueError(
-                "Entity catchment grid produced zero pixels — the grid spacing "
-                "may exceed the buffer extent."
-            )
-
-        # Per-unique-pixel columns, indexed onto the duplicated catchment rows.
-        pixel_geom = pixels.geometry.to_numpy()
-        pixel_row = pixels["_grid_row"].to_numpy()
-        pixel_col = pixels["_grid_col"].to_numpy()
-        pixel_pid = pixels["_global_pid"].to_numpy()
-
         # ``polygon_id`` = the entity/observation index; each (entity, wave)
-        # row in longitudinal mode is already its own observation, so the
-        # row index doubles as the collapse key.
-        target_vals = ent[outcome_col].to_numpy()
+        # row in longitudinal mode is already its own observation.
         entity_gdf = gpd.GeoDataFrame(
             {
                 "polygon_id": ent_idx,
-                "target": target_vals[ent_idx],
-                "_grid_row": pixel_row[pix_idx],
-                "_grid_col": pixel_col[pix_idx],
-                "_catchment_dist": catchment_dist,
-                # Unique-pixel id this duplicated catchment row maps to. The
-                # pre-aggregation cache stores one row per pixel; scoring rows
-                # resolve their pixel's stats through this id at lookup time.
-                "_preaggr_id": pix_idx.astype(np.int64),
-                # Stable global pixel id (grid row/col packed); the greenery
-                # cache keys on this so it is reusable across jobs.
-                "_global_pid": pixel_pid[pix_idx],
+                "target": ent[outcome_col].to_numpy()[ent_idx],
+                "_grid_row": pixels["_grid_row"].to_numpy()[cell_of_row],
+                "_grid_col": pixels["_grid_col"].to_numpy()[cell_of_row],
+                "_weight": weight,
+                # Unique-cell id this exposure row maps to; the pre-aggregation
+                # cache stores one row per cell and resolves it at lookup time.
+                "_preaggr_id": cell_of_row.astype(np.int64),
+                "_global_pid": uniq_pid[cell_of_row],
             },
-            geometry=pixel_geom[pix_idx],
+            geometry=pixels.geometry.values[cell_of_row],
             crs=grid_crs,
-        ).reset_index(drop=True)
-        for col in self.covariate_columns:
-            entity_gdf[col] = ent[col].to_numpy()[ent_idx]
-        for col in self._longitudinal_extra_cols():
+        )
+        extra = [
+            *(self.covariate_columns or []),
+            *self._longitudinal_extra_cols(),
+            *self.negative_control_columns,
+        ]
+        for col in dict.fromkeys(extra):
             if col in ent.columns:
                 entity_gdf[col] = ent[col].to_numpy()[ent_idx]
 
@@ -4391,10 +4023,10 @@ class MetricFusionEngine:
         # Coverage probe — used only for NaN-filtering and the channel-scale
         # bounds; per-trial channel values come from the cache.
         _probe_t0 = time.perf_counter()
-        probe_cols = self._probe_channel_coverage(pixels, pix_idx, entity_gdf)
+        probe_cols = self._probe_channel_coverage(pixels, cell_of_row, entity_gdf)
         _log(
             "INFO",
-            f"Coverage probe: {len(entity_gdf):,} pixel rows in "
+            f"Coverage probe: {len(entity_gdf):,} exposure rows in "
             f"{time.perf_counter() - _probe_t0:.0f}s.",
         )
 
@@ -4402,69 +4034,59 @@ class MetricFusionEngine:
             {
                 "polygon_id": entity_gdf["polygon_id"].values,
                 "target": entity_gdf["target"].values,
-                # float32 halves the pixel-frame cost.
+                # float32 halves the per-cell frame cost.
                 "veg": probe_cols["veg"],
                 "terrain": probe_cols["terrain"],
                 "ndvi": probe_cols["ndvi"],
-                "_catchment_dist": entity_gdf["_catchment_dist"].values,
+                "_weight": weight,
             },
             index=entity_gdf.index,
         )
-        for col in self.covariate_columns:
+        for col in self.covariate_columns or []:
             fusion_df[col] = entity_gdf[col].values
         for col in self._longitudinal_extra_cols():
             if col in entity_gdf.columns:
                 fusion_df[col] = entity_gdf[col].values
         self._carry_negative_controls(fusion_df, entity_gdf)
-        fusion_df = self._attach_entity_coords(fusion_df, entity_gdf)
+        # Coordinates of the entity, not of the cell, so the spatial smooth
+        # sees one location per entity.
+        fusion_df = self._attach_entity_coords(
+            fusion_df,
+            gpd.GeoDataFrame(geometry=ent.geometry.values[ent_idx], crs=grid_crs),
+        )
 
-        _log("INFO", "====== DATA QUALITY SUMMARY (POINT/LINE / PER-PIXEL) ======")
-        for col in ["target", "veg", "terrain", "ndvi", *self.covariate_columns]:
+        _log("INFO", "====== DATA QUALITY SUMMARY (PER-CELL) ======")
+        required = ["target", "veg", "terrain", "ndvi", *(self.covariate_columns or [])]
+        for col in required:
             nan_count = int(fusion_df[col].isna().sum())
             pct = nan_count / max(len(fusion_df), 1) * 100
             _log("INFO", f"{col} NaN: {nan_count} ({pct:.1f}%)")
 
-        result = fusion_df.dropna(
-            subset=["target", "veg", "terrain", "ndvi", *self.covariate_columns]
-        )
+        result = fusion_df.dropna(subset=required)
         entities_left = result["polygon_id"].nunique() if len(result) else 0
         _log(
             "OK" if entities_left else "WARN",
-            f"After dropna: {len(result):,} pixel rows "
+            f"After dropna: {len(result):,} exposure rows "
             f"({entities_left} unique entities)",
         )
         if entities_left < 2:
             raise ValueError(
-                "Point/line fusion needs ≥2 entities with valid coverage after "
-                f"NaN filtering; got {entities_left}. Check metric coverage or "
-                "increase the buffer."
+                "Fusion needs ≥2 entities with valid coverage after NaN filtering; "
+                f"got {entities_left}. Check metric coverage or the exposure buffer."
             )
 
-        # Always keep each entity's nearest surviving pixel so no entity drops
-        # out when a trial's catchment radius is smaller than its closest
-        # pixel — computed on the surviving rows so the flag stays valid.
-        nearest_idx = result.groupby("polygon_id")["_catchment_dist"].idxmin()
-        result = result.copy()
-        result["_is_nearest"] = False
-        result.loc[nearest_idx, "_is_nearest"] = True
-
-        # Trim target_gdf to surviving pixels and carry the nearest flag.
+        # Trim target_gdf to the surviving rows so the cache and the split only
+        # see entities that passed the coverage probe.
         self.target_gdf = entity_gdf.loc[result.index].copy()
-        self.target_gdf["_is_nearest"] = result["_is_nearest"].to_numpy()
 
-        # Pre-aggregation source: the unique pixels still referenced after the
-        # coverage dropna, keyed by ``_preaggr_id``. The cache iterates these
-        # (~1/16th of the duplicated catchment rows for dense point targets);
-        # scoring rows resolve their stats through ``_preaggr_id`` →
-        # ``_global_pid``.
+        # Pre-aggregation source: the unique cells still referenced after the
+        # coverage dropna, keyed by ``_preaggr_id``.
         referenced = np.unique(self.target_gdf["_preaggr_id"].to_numpy())
         self._preaggr_entity_gdf = pixels.loc[referenced].copy()
         _log(
             "INFO",
             f"Pre-aggregation source: {len(self._preaggr_entity_gdf):,} unique "
-            f"pixels (vs {len(self.target_gdf):,} catchment rows; "
-            f"{len(self.target_gdf) / max(len(self._preaggr_entity_gdf), 1):.1f}× "
-            "dedup).",
+            f"cells (vs {len(self.target_gdf):,} exposure rows).",
         )
         return result
 
@@ -4477,21 +4099,24 @@ class MetricFusionEngine:
         polygon_id: np.ndarray,
         mask: np.ndarray | None = None,
         how: str = "mean",
+        weights: np.ndarray | None = None,
     ) -> np.ndarray:
-        """Collapse per-pixel ``values`` to one value per ``polygon_id``.
+        """Collapse per-cell ``values`` to one value per ``polygon_id``.
 
-        ``how="mean"`` for the composite, ``"first"`` for per-entity constants
+        ``how="mean"`` for the composite (weighted by ``weights``, the exposure
+        weight of each row, when given), ``"first"`` for per-entity constants
         (target / covariates / entity_id / years_since_baseline). When
-        ``mask`` is given only the masked rows contribute; the
-        nearest-pixel guarantee keeps every entity present, so the grouped
-        key order matches across every collapsed array (pandas sorts the
-        group keys).
+        ``mask`` is given only the masked rows contribute. The grouped key
+        order matches across every collapsed array (pandas sorts the group
+        keys).
         """
         v = np.asarray(values)
         pid = np.asarray(polygon_id)
+        w = None if weights is None else np.asarray(weights, dtype=np.float64)
         if mask is not None:
             v = v[mask]
             pid = pid[mask]
+            w = None if w is None else w[mask]
         if how == "mean":
             # factorize(sort=True) reproduces the sorted-key order pandas
             # groupby uses, so every collapsed array stays row-aligned, while
@@ -4500,8 +4125,9 @@ class MetricFusionEngine:
             vv = np.asarray(v, dtype=np.float64)
             valid = ~np.isnan(vv)
             n = len(uniq)
-            counts = np.bincount(codes[valid], minlength=n)
-            sums = np.bincount(codes[valid], weights=vv[valid], minlength=n)
+            ww = np.ones(int(valid.sum())) if w is None else w[valid]
+            counts = np.bincount(codes[valid], weights=ww, minlength=n)
+            sums = np.bincount(codes[valid], weights=vv[valid] * ww, minlength=n)
             out = np.full(n, np.nan, dtype=np.float64)
             nz = counts > 0
             out[nz] = sums[nz] / counts[nz]
@@ -4514,25 +4140,29 @@ class MetricFusionEngine:
         codes: np.ndarray,
         n_uniq: int,
         mask: np.ndarray | None,
+        weights: np.ndarray | None = None,
     ) -> np.ndarray:
         """Per-entity mean of ``values`` from precomputed collapse codes.
+
+        Weighted by ``weights`` (each row's exposure weight) when given.
 
         Equivalent to ``_collapse_to_entities(values, pid, mask, "mean")``
         without the per-call ``factorize``: ``codes`` / ``n_uniq`` come from
         one sorted-key factorization of the fold's ``polygon_id``. The
         ``minlength`` pin keeps the output aligned to the full entity set, so
-        the row order matches every other collapsed array even under a
-        catchment mask (the nearest-pixel guarantee keeps each entity
-        represented, exactly as the legacy masked factorize relied on).
+        the row order matches every other collapsed array.
         """
         v = np.asarray(values, dtype=np.float64)
         cd = codes
+        w = None if weights is None else np.asarray(weights, dtype=np.float64)
         if mask is not None:
             v = v[mask]
             cd = cd[mask]
+            w = None if w is None else w[mask]
         valid = ~np.isnan(v)
-        counts = np.bincount(cd[valid], minlength=n_uniq)
-        sums = np.bincount(cd[valid], weights=v[valid], minlength=n_uniq)
+        ww = np.ones(int(valid.sum())) if w is None else w[valid]
+        counts = np.bincount(cd[valid], weights=ww, minlength=n_uniq)
+        sums = np.bincount(cd[valid], weights=v[valid] * ww, minlength=n_uniq)
         out = np.full(n_uniq, np.nan, dtype=np.float64)
         nz = counts > 0
         out[nz] = sums[nz] / counts[nz]
@@ -4572,6 +4202,12 @@ class MetricFusionEngine:
             st["codes"] = codes
             st["n_uniq"] = n_uniq
             st["pid"] = np.asarray(uniq)
+            # Exposure weight of each (entity, cell) row for the entity mean.
+            st["weight"] = (
+                data["_weight"].to_numpy(dtype=np.float64)
+                if "_weight" in data.columns
+                else None
+            )
             st["target"] = np.asarray(data["target"].values, dtype=np.float64)[
                 first_idx
             ]
@@ -6043,6 +5679,7 @@ class MetricFusionEngine:
                 test_static["codes"],
                 test_static["n_uniq"],
                 test_mask,
+                test_static.get("weight"),
             )
 
         test_sb = self._spatial_basis_columns(
@@ -6201,8 +5838,9 @@ class MetricFusionEngine:
                 self._channel_radii(params), self._active_greenery_channel
             )
             mask = _helpers.entity_collapse_mask(data, catchment_r)
+            row_w = data["_weight"].values if "_weight" in data.columns else None
             blocks = {
-                ch: self._collapse_to_entities(a, pid, mask, "mean")
+                ch: self._collapse_to_entities(a, pid, mask, "mean", row_w)
                 for ch, a in blocks.items()
             }
             target = self._collapse_to_entities(
@@ -6445,29 +6083,36 @@ class MetricFusionEngine:
             result_df[ch] = values
         result_df["composite"] = composite
 
-        # Per-pixel mode: collapse per-pixel rows into one row per entity.
-        # Each entity's composite is the mean of per-pixel CGIs in its
-        # catchment (the whole footprint for polygons; the pixels within the
-        # trial's catchment radius for point/line targets), matching what the
-        # optimizer scored against the per-entity outcome.
+        # Per-cell mode: one row per entity. The composite is formed per cell
+        # above and averaged here with each cell's exposure weight, exactly
+        # as the search scored it; the channel columns are averaged the same
+        # way for reporting.
         if "polygon_id" in result_df.columns:
-            catchment_r = _helpers.catchment_radius(
-                self._channel_radii(weights), self._active_greenery_channel
+            codes, uniq = pd.factorize(result_df["polygon_id"].to_numpy())
+            n_ent = len(uniq)
+            row_w = (
+                result_df["_weight"].to_numpy(dtype=np.float64)
+                if "_weight" in result_df.columns
+                else None
             )
-            mask = _helpers.entity_collapse_mask(result_df, catchment_r)
-            masked_df = result_df if mask is None else result_df[mask]
-            # The channel columns are named by the job's own set, so the
-            # per-polygon means are built from it rather than a fixed triple.
-            aggregations = {ch: (ch, "mean") for ch in all_blocks}
-            poly_df = (
-                masked_df.groupby("polygon_id", sort=False)
-                .agg(
-                    target=("target", "first"),
-                    composite=("composite", "mean"),
-                    n_samples=("composite", "count"),
-                    **aggregations,
+
+            def _mean(col: str) -> np.ndarray:
+                return self._collapse_mean_from_codes(
+                    result_df[col].to_numpy(), codes, n_ent, None, row_w
                 )
-                .reset_index()
+
+            _, first = np.unique(codes, return_index=True)
+            comp = result_df["composite"].to_numpy(dtype=np.float64)
+            poly_df = pd.DataFrame(
+                {
+                    "polygon_id": uniq,
+                    "target": result_df["target"].to_numpy()[first],
+                    "composite": _mean("composite"),
+                    "n_samples": np.bincount(
+                        codes[np.isfinite(comp)], minlength=n_ent
+                    ),
+                    **{ch: _mean(ch) for ch in all_blocks},
+                }
             )
             self._apply_fusion_cache = (cache_key, poly_df)
             return poly_df
@@ -8341,40 +7986,13 @@ class MetricFusionEngine:
             )
 
         elif (
-            self.is_polygon_target
-            and self._polygon_grid_shape is not None
-            and self._polygon_grid_transform is not None
-        ):
-            # Polygon target: reuse the per-pixel CGI grid the engine
-            # already constructed in ``_prepare_polygon_fusion``. Pixels
-            # outside the polygon union are written as NaN in the output.
-            # Index alignment with the entity cache requires keeping the
-            # engine's row index on the new frame so cache lookups hit.
-            transform = self._polygon_grid_transform
-            crs = self._polygon_grid_crs
-            height, width = self._polygon_grid_shape
-            grid_rows = self.target_gdf["_grid_row"].to_numpy(dtype=np.int64)
-            grid_cols = self.target_gdf["_grid_col"].to_numpy(dtype=np.int64)
-            points_gdf = gpd.GeoDataFrame(
-                {"row": grid_rows, "col": grid_cols},
-                geometry=self.target_gdf.geometry.values,
-                crs=crs,
-                index=self.target_gdf.index,
-            )
-            logger.info(
-                f"Generating composite for {len(points_gdf)} pixels "
-                f"({self.cgi_grid_spacing_m:g} m grid inside polygon union)"
-            )
-
-        elif (
-            self.is_points
-            and self._entity_grid_shape is not None
+            self._entity_grid_shape is not None
             and self._entity_grid_transform is not None
         ):
-            # Point/line target: render the CGI field over the same per-pixel
-            # grid the scorer used (``_prepare_entity_fusion``), so the
-            # composite matches the scored values. The catchment pixels were
-            # duplicated per entity, so collapse to the unique grid cells.
+            # Vector target: render the CGI field over the cells the entities
+            # are exposed to (``_prepare_vector_fusion``), so the composite
+            # matches the scored values. Exposure rows repeat a cell once per
+            # entity, so collapse to the unique cells.
             transform = self._entity_grid_transform
             crs = self._entity_grid_crs
             height, width = self._entity_grid_shape
@@ -8382,8 +8000,8 @@ class MetricFusionEngine:
             grid_rows = uniq["_grid_row"].to_numpy(dtype=np.int64)
             grid_cols = uniq["_grid_col"].to_numpy(dtype=np.int64)
             pts_cols = {"row": grid_rows, "col": grid_cols}
-            # Carry the unique-pixel id so the cache resolves per-pixel stats
-            # (the cache is keyed by pixel, not by the collapsed row index).
+            # Carry the unique-cell id so the cache resolves per-cell stats
+            # (the cache is keyed by cell, not by the exposure row index).
             if "_preaggr_id" in uniq.columns:
                 pts_cols["_preaggr_id"] = uniq["_preaggr_id"].to_numpy()
             points_gdf = gpd.GeoDataFrame(
@@ -8393,8 +8011,8 @@ class MetricFusionEngine:
                 index=uniq.index,
             )
             logger.info(
-                f"Generating composite for {len(points_gdf)} pixels "
-                f"({self.cgi_grid_spacing_m:g} m grid over point/line catchments)"
+                f"Generating composite for {len(points_gdf)} cells "
+                f"({self.cgi_grid_spacing_m:g} m grid over the exposed cells)"
             )
 
         else:
