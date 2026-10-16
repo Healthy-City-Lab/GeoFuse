@@ -323,7 +323,10 @@ FUSION: dict[str, Setting] = {
         help="Share of entities the smallest searched GVI rung must cover.",
     ),
     "run_standalones": _bool(False, "Also run each channel on its own."),
-    "check_collinearity": _bool(True, "Drop channels above the VIF threshold."),
+    "check_collinearity": _bool(True, "Report channels above the VIF threshold."),
+    "drop_collinear_channels": _bool(
+        False, "Leave channels above the VIF threshold out of the search."
+    ),
     "vif_threshold": Setting(
         "float", 10.0, lo=2.0, hi=100.0, help="Largest variance inflation kept."
     ),

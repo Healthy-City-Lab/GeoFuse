@@ -1226,6 +1226,7 @@ def _fusion_config_fingerprint(
     exposure_plateau_m: float = 0.0,
     exposure_sigma_m: float = 35.0,
     gvi_min_coverage: float = 0.95,
+    drop_collinear_channels: bool = False,
 ) -> str:
     """8-char hex hash of every setting that changes the search space / split.
 
@@ -1254,6 +1255,8 @@ def _fusion_config_fingerprint(
             "sel:stabsel-cpss-v3",
             f"gmc:{gvi_min_coverage:g}",
         ]
+        # Dropping high-VIF channels changes the search; only appended when on.
+        + (["dvc:1"] if drop_collinear_channels else [])
         # An exposure buffer changes every entity's cells, so it splits the
         # cache; only appended when on so unbuffered runs keep their hash.
         + (
@@ -1497,6 +1500,7 @@ def run_fusion(
     n_spatial_blocks: int | None = None,
     check_collinearity: bool = True,
     vif_threshold: float = 10.0,
+    drop_collinear_channels: bool = False,
     report_ci_bootstrap: int | None = None,
     report_effects_bootstrap: int = 2000,
     report_effects_permutations: int = 1000,
@@ -1695,6 +1699,7 @@ def run_fusion(
             "n_spatial_blocks": n_spatial_blocks,
             "check_collinearity": bool(check_collinearity),
             "vif_threshold": float(vif_threshold),
+            "drop_collinear_channels": bool(drop_collinear_channels),
             "report_ci_bootstrap": int(report_ci_n),
             "report_effects_bootstrap": int(report_effects_bootstrap),
             "report_effects_permutations": int(report_effects_permutations),
@@ -1872,6 +1877,7 @@ def run_fusion(
                 exposure_plateau_m=float(exposure_plateau_m),
                 exposure_sigma_m=float(exposure_sigma_m),
                 gvi_min_coverage=float(gvi_min_coverage),
+                drop_collinear_channels=bool(drop_collinear_channels),
                 whole_grid_scaling=whole_grid_scaling,
                 area_balanced_split=area_balanced_split,
                 spatial_adjust_method=spatial_adjust_method,
@@ -2231,6 +2237,7 @@ def run_fusion(
                 exposure_plateau_m=float(exposure_plateau_m),
                 exposure_sigma_m=float(exposure_sigma_m),
                 gvi_min_coverage=float(gvi_min_coverage),
+                drop_collinear_channels=bool(drop_collinear_channels),
             )
 
             def _standalone_study_name(ch: str) -> str:

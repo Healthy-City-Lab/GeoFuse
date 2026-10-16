@@ -959,6 +959,9 @@ def fusion_run_config(spec: JobSpec) -> dict[str, Any]:
         "radius_prior": s["radius_prior"],
         "gvi_min_coverage": float(s["gvi_min_coverage"]),
         "check_collinearity": bool(s["check_collinearity"]),
+        "drop_collinear_channels": bool(
+            s["check_collinearity"] and s["drop_collinear_channels"]
+        ),
         "vif_threshold": float(s["vif_threshold"]),
     }
 
