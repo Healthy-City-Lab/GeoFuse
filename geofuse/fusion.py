@@ -520,8 +520,8 @@ class MetricFusionEngine:
         # Maps frame-local ``_preaggr_id`` → stable global pixel id, so scoring
         # rows resolve to the greenery cache's keys at lookup time.
         self._preaggr_pid_translate: np.ndarray | None = None
-        # Unique-pixel source for the pre-aggregation cache. Point/line targets
-        # duplicate each catchment pixel per overlapping entity for scoring, but
+        # Unique-pixel source for the pre-aggregation cache. Vector targets
+        # repeat a cell once per entity exposed to it for scoring, but
         # a pixel's per-radius stats are identical across those duplicates, so
         # the cache is built over these unique pixels (keyed by ``_preaggr_id``)
         # and duplicated scoring rows translate to a pixel id at lookup time.
@@ -1832,8 +1832,8 @@ class MetricFusionEngine:
                     [wave_index_of[str(w)] for w in points_gdf["wave"]],
                     dtype=np.int64,
                 )
-            # Point/line targets cache stats per unique pixel: resolve each
-            # duplicated catchment row to its pixel id. Other targets key the
+            # Vector targets cache stats per unique cell: resolve each
+            # exposure row to its cell id. Other targets key the
             # cache by row index directly. Fold slices carry a pre-built id
             # vector whose identity the cache's row indexer keys on.
             lookup_ids = attrs.get("_gf_lookup_ids")
@@ -2178,13 +2178,6 @@ class MetricFusionEngine:
                 f"{channel}_percentile", params.get("streetview_percentile", 50)
             ),
         )
-
-    def _channel_radii(self, params: dict) -> dict[str, float]:
-        """``{channel: radius}`` over this job's channels, for the entity collapse."""
-        return {
-            ch: float(self._channel_spec(params, ch)[0])
-            for ch in self._composite_channels()
-        }
 
     def _channel_source(self, channel: str):
         """The metric layer a channel aggregates from, or ``None`` if it has none.
@@ -3021,8 +3014,8 @@ class MetricFusionEngine:
 
         wave_index_of = {w: i for i, w in enumerate(spec.wave_labels)}
 
-        # Global pixel ids referenced by each wave (via the duplicated catchment
-        # rows for a gridded target; the entity's own id otherwise).
+        # Global pixel ids referenced by each wave (via the exposure rows for a
+        # gridded target; the entity's own id otherwise).
         tg = self.target_gdf
         tg_waves = tg["wave"].astype(str).to_numpy()
         if "_global_pid" in tg.columns:
@@ -3733,9 +3726,8 @@ class MetricFusionEngine:
         ``(n_entities, n_channels, n_radii, n_stats)`` with channels in
         :meth:`_cache_channels` order.
 
-        The entity collapse depends on the catchment radius for point and line
-        targets, so the mask is rebuilt per radius; polygon targets average
-        every in-footprint pixel and the mask is constant.
+        Every entity's value is the exposure-weighted mean over its cells,
+        which do not depend on the radius.
         """
         if subset == "test":
             data = self.test_data
@@ -3759,9 +3751,6 @@ class MetricFusionEngine:
         X = np.full((n_ent, len(channels), len(radii), len(stats)), np.nan)
 
         for ri, radius in enumerate(radii):
-            mask = None
-            if static["has_pid"]:
-                mask = _helpers.entity_collapse_mask(data, float(radius))
             for ci, ch in enumerate(channels):
                 ladder = ndvi_radii if ch == "ndvi" else gvi_radii
                 if radius not in ladder:
@@ -3785,7 +3774,7 @@ class MetricFusionEngine:
                             v,
                             static["codes"],
                             static["n_uniq"],
-                            mask,
+                            None,
                             static.get("weight"),
                         )
                         if static["has_pid"]
@@ -4290,8 +4279,8 @@ class MetricFusionEngine:
         st["wave_idx"] = wave_idx
         pts.attrs["_gf_wave_idx"] = wave_idx
 
-        # Dedup axis for the per-trial channel arithmetic. Point / line targets
-        # repeat a catchment pixel once per overlapping entity, and a pixel's
+        # Dedup axis for the per-trial channel arithmetic. Vector targets
+        # repeat a cell once per entity exposed to it, and a cell's
         # cached stats are identical across those repeats, so the lookup and the
         # composite run over the distinct (pixel, wave) pairs and are gathered
         # back onto rows just before the entity collapse.
@@ -4578,51 +4567,13 @@ class MetricFusionEngine:
                 arr[valid] = (arr[valid] - dt(lo)) / dt(hi - lo)
         return arr
 
-    def _coverage_from_cache(
-        self, entity_gdf: gpd.GeoDataFrame
-    ) -> dict[str, np.ndarray] | None:
-        """Per-row veg / terrain / NDVI coverage read from the attached cache.
-
-        Returns the cached max-radius mean per ``(pixel, wave)`` row (NaN where
-        no greenery is within range — the same coverage the sampler would find).
-        ``None`` on any missing cell, so the caller falls back to sampling.
-        """
-        cache = self._preaggr_cache
-        spec = self.longitudinal_spec
-        if (
-            not isinstance(cache, preaggregation.GreeneryCache)
-            or spec is None
-            or "_global_pid" not in entity_gdf.columns
-        ):
-            return None
-        gvi_radii, ndvi_radii = self._preaggr_radii()
-        wave_index_of = {w: i for i, w in enumerate(spec.wave_labels)}
-        pids = np.asarray(entity_gdf["_global_pid"].to_numpy(), dtype=np.int64)
-        waves = entity_gdf["wave"].astype(str).to_numpy()
-        try:
-            widx = np.array([wave_index_of[w] for w in waves], dtype=np.int64)
-        except KeyError:
-            return None
-        out: dict[str, np.ndarray] = {}
-        for ch in longitudinal.GREENERY_CHANNELS:
-            radius = int((ndvi_radii if ch == "ndvi" else gvi_radii)[-1])
-            col = np.full(len(pids), np.nan, dtype=np.float32)
-            for w in np.unique(widx):
-                m = widx == w
-                vals = cache.lookup(pids[m], ch, radius, "mean", wave_index=int(w))
-                if vals is None:
-                    return None
-                col[m] = vals
-            out[ch] = col
-        return out
-
     def _probe_channel_coverage(
         self,
         pixels: gpd.GeoDataFrame,
         pix_idx: np.ndarray,
         entity_gdf: gpd.GeoDataFrame,
     ) -> dict[str, np.ndarray]:
-        """Per-catchment-row veg / terrain / NDVI values for the coverage gate.
+        """Per-exposure-row veg / terrain / NDVI values for the coverage gate.
 
         Cross-sectional runs probe every unique pixel once against the single
         metric source per channel.
@@ -4640,19 +4591,6 @@ class MetricFusionEngine:
             if (provider is not None and "wave" in entity_gdf.columns)
             else None
         )
-
-        # Coverage from a reusable cache (skips the per-wave re-sample) — only
-        # when a signature-matched complete cache is available; falls back to
-        # sampling on any miss.
-        if waves is not None and _helpers.attach_cache_for_coverage(entity_gdf):
-            cached = self._coverage_from_cache(entity_gdf)
-            if cached is not None:
-                _log(
-                    "OK",
-                    f"Coverage gate: derived veg / terrain / NDVI coverage for "
-                    f"{n_rows:,} rows from the pre-aggregation cache.",
-                )
-                return cached
 
         if waves is None:
             _log(
@@ -4707,7 +4645,7 @@ class MetricFusionEngine:
                 for ch in channels:
                     vals = np.asarray(probe[ch].to_numpy(), dtype=np.float32)
                     # Position of each row's pixel within ``group_pix``, mapping
-                    # the probe result back onto this group's catchment rows.
+                    # the probe result back onto this group's exposure rows.
                     out[ch][row_mask] = vals[
                         np.searchsorted(group_pix, pix_idx[row_mask])
                     ]
@@ -4963,9 +4901,9 @@ class MetricFusionEngine:
         ``fusion_df``. Returns ``({group_id: block_id}, info)`` or ``None`` when
         group geometry can't be resolved (caller then skips spatial blocking).
 
-        The block edge is floored at twice the largest catchment radius so a
+        The block edge is floored at twice the largest channel radius so a
         block is wider than the greenery autocorrelation range, keeping a
-        held-out block's catchments clear of the train blocks around it.
+        held-out block's buffers clear of the train blocks around it.
         """
         tg = self.target_gdf
         if tg is None or getattr(tg, "geometry", None) is None or len(tg) == 0:
@@ -5144,7 +5082,7 @@ class MetricFusionEngine:
             # Optional spatial blocking: tag each group with a coarse grid
             # block so whole blocks — never split groups — can be striped
             # across the held-out test, spreading it over the full extent
-            # while keeping a block's catchments clear of its neighbours.
+            # while keeping a block's buffers clear of its neighbours.
             spatial_ok = False
             self._spatial_block_by_group = None
             self._spatial_block_group_col = None
@@ -5612,20 +5550,15 @@ class MetricFusionEngine:
         test_entity_id = test_static.get("entity_id")
         test_ysb = test_static.get("ysb")
 
-        # Polygon mode: aggregate per-row CGI by polygon before scoring against
-        # the per-polygon outcome. Longitudinal+polygon mode keys the collapse
-        # on f"{entity}|{wave}" so the result is one row per (entity, wave) —
-        # the shape the MixedLM scorer expects.
+        # Per-cell mode: the exposure-weighted mean of each entity's per-cell
+        # composites, one row per entity (per (entity, wave) on a panel, the
+        # shape the MixedLM scorer expects).
         if test_static["has_pid"]:
-            catchment_r = _helpers.catchment_radius(
-                self._channel_radii(params), self._active_greenery_channel
-            )
-            test_mask = _helpers.entity_collapse_mask(self.test_data, catchment_r)
             test_composite = self._collapse_mean_from_codes(
                 test_composite,
                 test_static["codes"],
                 test_static["n_uniq"],
-                test_mask,
+                None,
                 test_static.get("weight"),
             )
 
@@ -5779,34 +5712,28 @@ class MetricFusionEngine:
         ysb = None
         if "polygon_id" in data.columns:
             pid = data["polygon_id"].values
-            # Every channel feeds the design → catchment = the largest radius
-            # among them for point/line targets (mask None for polygons).
-            catchment_r = _helpers.catchment_radius(
-                self._channel_radii(params), self._active_greenery_channel
-            )
-            mask = _helpers.entity_collapse_mask(data, catchment_r)
             row_w = data["_weight"].values if "_weight" in data.columns else None
             blocks = {
-                ch: self._collapse_to_entities(a, pid, mask, "mean", row_w)
+                ch: self._collapse_to_entities(a, pid, None, "mean", row_w)
                 for ch, a in blocks.items()
             }
             target = self._collapse_to_entities(
-                data["target"].values, pid, mask, "first"
+                data["target"].values, pid, None, "first"
             )
             if cov is not None:
                 c = cov
                 cov = np.column_stack(
                     [
-                        self._collapse_to_entities(c[:, j], pid, mask, "first")
+                        self._collapse_to_entities(c[:, j], pid, None, "first")
                         for j in range(c.shape[1])
                     ]
                 )
             if self.is_longitudinal:
                 entity_id = self._collapse_to_entities(
-                    data["entity_id"].values, pid, mask, "first"
+                    data["entity_id"].values, pid, None, "first"
                 )
                 ysb = self._collapse_to_entities(
-                    data["years_since_baseline"].values, pid, mask, "first"
+                    data["years_since_baseline"].values, pid, None, "first"
                 )
         else:
             target = data["target"].values
@@ -8041,7 +7968,7 @@ class MetricFusionEngine:
 
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-        # A point/line catchment grid can span a country-wide extent that is
+        # A CGI grid of exposed cells can span a country-wide extent that is
         # mostly empty (entities clustered in a few cities). Scatter-then-write
         # a dense (height × width) array only when it fits a modest budget;
         # above it, write in row bands into a SPARSE_OK GeoTIFF so neither
@@ -8111,7 +8038,7 @@ class MetricFusionEngine:
         provenance = {
             "selection_method": "bayesian_index",
             # Grid geometry, so a viewer can size its read before opening the
-            # file. A catchment grid over distant clusters is mostly nodata.
+            # file. A grid over distant clusters is mostly nodata.
             "raster_width": int(width),
             "raster_height": int(height),
             "raster_valid_cells": int(len(vals_arr)),

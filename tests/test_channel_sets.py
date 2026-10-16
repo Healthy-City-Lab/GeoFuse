@@ -22,7 +22,6 @@ if ROOT not in sys.path:
 import numpy as np
 
 from geofuse import cgi_formulas
-from geofuse import fusion_helpers as _helpers
 from geofuse.fusion import MetricFusionEngine
 
 GVI_FORMULAS = ("weighted_average_gvi", "synergy_gvi")
@@ -232,25 +231,6 @@ class TestGviGetsRealNormalizationBounds(unittest.TestCase):
         e.normalize_channels = False
         e._compute_channel_scale(self._frame())
         self.assertIsNone(e._channel_minmax)
-
-
-class TestTheCatchmentComesFromTheJobsRadii(unittest.TestCase):
-    def test_a_standalone_job_uses_its_own_channels_radius(self):
-        self.assertEqual(
-            _helpers.catchment_radius({"ndvi": 800.0, "gvi": 300.0}, "gvi"), 300.0
-        )
-
-    def test_a_combined_job_uses_the_largest(self):
-        self.assertEqual(
-            _helpers.catchment_radius({"ndvi": 800.0, "gvi": 300.0}, "cgi"), 800.0
-        )
-
-    def test_the_radii_map_covers_the_two_channel_set(self):
-        e = _engine("weighted_average_gvi")
-        self.assertEqual(e._channel_radii(PARAMS), {"ndvi": 800.0, "gvi": 300.0})
-
-    def test_no_radii_is_not_a_crash(self):
-        self.assertEqual(_helpers.catchment_radius({}, "cgi"), 0.0)
 
 
 if __name__ == "__main__":
