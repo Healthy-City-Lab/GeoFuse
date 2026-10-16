@@ -562,12 +562,13 @@ def sweep(
 ):
     """Exhaustive grid over (radius, stat) per channel, then over the form.
 
-    The linear grid is solved in closed form and swept exhaustively. Every
-    requested form is then scored at the linear pick's columns on a fresh set
-    of splits and the best one is kept. ``score`` is the chosen form's
-    fresh-split score, ``selection_score`` the grid maximum the columns were
-    picked on. The synergy form needs ``design`` (:class:`SynergyDesign`) and
-    is skipped without it.
+    The linear grid is solved in closed form and swept exhaustively. The
+    synergy form re-scores the linear grid's ``rescore_top`` best candidates
+    with its own terms on the same splits and keeps its best; every requested
+    form is then scored at its own pick on a fresh set of splits and the best
+    one is kept. ``score`` is the chosen form's fresh-split score,
+    ``selection_score`` the maximum its columns were picked on. The synergy
+    form needs ``design`` (:class:`SynergyDesign`) and is skipped without it.
 
     ``objective`` makes the job's own metric decide the winner. The Gram sweep
     ranks every candidate by a correlation t, which is what makes an exhaustive
@@ -629,7 +630,6 @@ def sweep(
         obj_se[shortlist] = objective_surface.std(0) / math.sqrt(max(splits, 1))
         mean, se = obj_mean, obj_se
     best = int(np.argmax(mean))
-    picked = _decode(combos[best], n_radii, n_stats, radii, stats)
 
     # One-standard-error rule: of the candidates within one SE of the best, the
     # one with the smallest total radius. Every candidate holds one column per
@@ -653,18 +653,38 @@ def sweep(
         combo = tuple(combos[winner_cols[int(k)]])
         counts[combo] = counts.get(combo, 0) + 1
 
-    edge = {int(radii[0]), int(radii[-1])}
-    boundary = tuple(c for (r, _), c in zip(picked, channels) if r in edge)
-
-    # Form selection at the picked columns, every form scored on fresh splits.
-    # The grid winner's own score is a maximum over every combination on the
-    # selection splits, so it cannot be compared with a form scored once.
+    # Synergy picks its own columns from the linear grid's shortlist on the
+    # same selection splits: an interaction can favour other cells than the
+    # main terms alone.
     candidates = eligible_forms(forms, len(channels), design is not None)
-    form_E = form_columns(candidates, flat, combos[best], design)
+    pick = {f: combos[best] for f in candidates}
+    selection = {f: float(mean[best]) for f in candidates}
+    if "synergy" in candidates:
+        short = np.argsort(-mean)[: max(1, int(rescore_top))]
+        syn = [
+            _score_form_at(
+                design.columns(combos[int(k)])[0],
+                y,
+                splits=splits,
+                frac=frac,
+                seed=seed,
+                workers=1,
+                objective=objective,
+                cancel_check=cancel_check,
+                groups=groups,
+            )
+            for k in short
+        ]
+        pick["synergy"] = combos[int(short[int(np.argmax(syn))])]
+        selection["synergy"] = float(max(syn))
+
+    # Form selection at each form's pick, every form scored on fresh splits.
+    # A pick's own score is a maximum over candidates on the selection
+    # splits, so it cannot be compared with a form scored once.
     form_scores = {}
     for form in candidates:
         form_scores[form] = _score_form_at(
-            form_E[form],
+            form_columns((form,), flat, pick[form], design)[form],
             y,
             splits=splits,
             frac=frac,
@@ -678,10 +698,13 @@ def sweep(
     for form in candidates[1:]:
         if form_scores[form] > form_scores[chosen_form]:
             chosen_form = form
+    picked = _decode(pick[chosen_form], n_radii, n_stats, radii, stats)
+    edge = {int(radii[0]), int(radii[-1])}
+    boundary = tuple(c for (r, _), c in zip(picked, channels) if r in edge)
 
     return SweepResult(
         channels=tuple(channels),
-        columns=tuple(combos[best]),
+        columns=tuple(pick[chosen_form]),
         picked=picked,
         form=chosen_form,
         score=form_scores[chosen_form],
@@ -691,7 +714,7 @@ def sweep(
         winner_counts=counts,
         boundary_hit=boundary,
         form_scores=form_scores,
-        selection_score=float(mean[best]),
+        selection_score=selection[chosen_form],
     )
 
 
