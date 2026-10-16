@@ -257,6 +257,23 @@ class TestExposureResponse(unittest.TestCase):
         self.assertIsNotNone(out)
         self.assertAlmostEqual(out["g"][0], 0.5, delta=0.15)
 
+    def test_incomplete_rows_are_refused_rather_than_misread(self):
+        # A missing exposure used to fall into the reference quantile, and a
+        # moderation design with a NaN row reached the fitter unmasked.
+        rng = np.random.default_rng(14)
+        n = 600
+        g = rng.normal(size=n)
+        y = 0.5 * g + rng.normal(size=n)
+        m = rng.normal(size=n)
+        fitter = er.make_ols_fitter(y)
+        g_gap = g.copy()
+        g_gap[3] = np.nan
+        self.assertIsNone(er.quartile_terms(g_gap, fitter, None))
+        m_gap = m.copy()
+        m_gap[5] = np.nan
+        self.assertIsNone(er.moderation_terms(g, m_gap, fitter, None))
+        self.assertIsNotNone(er.moderation_terms(g, m, fitter, None))
+
     def test_a_tied_exposure_still_reports_quartiles(self):
         rng = np.random.default_rng(12)
         n = 3000

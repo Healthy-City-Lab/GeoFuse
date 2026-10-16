@@ -214,6 +214,14 @@ def quartile_terms(
     groups, cuts = exposure_quartiles(exposure, n_groups)
     if groups is None:
         return None
+    # The fitter is bound to the outcome's rows, so a row cannot be dropped here
+    # without misaligning it; callers pass complete rows.
+    if (groups < 0).any() or (
+        covariates is not None
+        and np.size(covariates)
+        and not np.isfinite(np.asarray(covariates, dtype=np.float64)).all()
+    ):
+        return None
     valid = groups >= 0
     present = sorted(int(g) for g in np.unique(groups[valid]))
     if len(present) < 2:
@@ -405,8 +413,9 @@ def moderation_terms(
             names.append(f"cov{j}")
 
     design = np.column_stack(columns)
-    mask = np.isfinite(design).all(axis=1)
-    if mask.sum() < 20:
+    # The fitter is bound to the outcome's rows, so incomplete rows are refused
+    # rather than dropped; callers pass complete rows.
+    if not np.isfinite(design).all():
         return None
     fitted = fitter(design, names)
     if fitted is None:
@@ -486,7 +495,7 @@ def moderation_terms(
         "moderator": moderator_name,
         "categorical": bool(categorical),
         "centred_at": centre,
-        "n": int(mask.sum()),
+        "n": int(n),
         "interaction_wald_chi2": stat,
         "interaction_df": dof,
         "interaction_p": interaction_p,
