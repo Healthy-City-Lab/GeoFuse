@@ -3833,7 +3833,8 @@ class MetricFusionEngine:
 
         ``gvi`` has no source layer of its own — it is a stored cache channel —
         so a cache miss for it is fatal rather than falling back to on-the-fly
-        aggregation over the wrong metric.
+        aggregation over the wrong metric. It is read on the fold's distinct
+        cells when rows share cells, else row by row.
         """
         metric = {
             "veg": self.veg_data,
@@ -3841,15 +3842,17 @@ class MetricFusionEngine:
             "ndvi": self.ndvi_data,
         }.get(channel)
         if metric is None:
-            uniq = static.get("uniq_lookup_ids")
+            on_uniq = static.get("uniq_lookup_ids") is not None
+            ids = static["uniq_lookup_ids" if on_uniq else "lookup_ids"]
+            waves = static.get("uniq_wave_idx" if on_uniq else "wave_idx")
             source = self._ensure_memory_loaded() or self._preaggr_cache
             column = preaggregation.stat_to_column(stat, pct)
-            if uniq is None or source is None or column is None:
+            if source is None or column is None:
                 return None, False
-            plan = self._preaggr_plan(source, uniq, static.get("uniq_wave_idx"), static)
+            plan = self._preaggr_plan(source, ids, waves, static)
             if plan is None:
                 return None, False
-            return source.gather(plan, channel, int(round(radius)), column), True
+            return source.gather(plan, channel, int(round(radius)), column), on_uniq
         return self._aggregate_channel_for_fold(
             static,
             metric,
