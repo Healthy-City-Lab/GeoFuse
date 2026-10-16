@@ -7466,7 +7466,29 @@ class MetricFusionEngine:
         Pass ``iqr`` to pin the scaling constant, e.g.
         ``exposure_response.CLSA_NDVI_IQR`` when the point is to land on a
         published NDVI number.
+
+        Estimates, contrasts and the curve use every row and are descriptive;
+        their p-values, intervals and minimum detectable effects come from the
+        held-out rows (:func:`exposure_response.split_inference`), scaled by
+        the whole data's IQR and grouped by its quartile cut points.
         """
+        whole = self._exposure_response_on(params, iqr)
+        if whole is None:
+            return None
+        test = self._exposure_response_on(
+            params,
+            (whole.get("per_iqr") or {}).get("iqr", iqr),
+            held_out=True,
+            cut_points=(whole.get("quartiles") or {}).get("cut_points"),
+        )
+        out = exposure_response.split_inference(whole, test)
+        out["inference_n"] = None if test is None else test["n"]
+        return out
+
+    def _exposure_response_on(
+        self, params: dict, iqr, *, held_out: bool = False, cut_points=None
+    ) -> dict | None:
+        """:meth:`compute_exposure_response` on every row or the held-out rows."""
         try:
             df = self.apply_fusion(weights=dict(params))
             target = np.asarray(df["target"].values, dtype=np.float64)
@@ -7476,6 +7498,11 @@ class MetricFusionEngine:
             entity_id = None
             if self.is_longitudinal:
                 entity_id, _ysb = self._whole_data_longitudinal_keys(df)
+            if held_out:
+                rows = self._test_entity_mask(df)
+                target, composite = target[rows], composite[rows]
+                cov = None if cov is None else cov[rows]
+                entity_id = None if entity_id is None else entity_id[rows]
 
             keep = self._finite_rows(target, composite, cov)
             if keep is not None and not keep.all():
@@ -7532,9 +7559,10 @@ class MetricFusionEngine:
                 "design": design,
                 "binary_outcome": bool(binary),
                 "coding": coding,
+                "n": int(len(target)),
                 "per_iqr": per_iqr,
                 "quartiles": exposure_response.quartile_terms(
-                    composite, fitter, cov, logistic=binary
+                    composite, fitter, cov, logistic=binary, cut_points=cut_points
                 ),
                 "nonlinearity": exposure_response.spline_nonlinearity_test(
                     composite, fitter, cov
@@ -7558,10 +7586,30 @@ class MetricFusionEngine:
         enters its main effect explicitly, so leaving it in the controls too
         would make the design collinear. Categorical moderators are detected
         from ``covariate_types``, falling back to a distinct-value count.
+
+        The interaction and the simple slopes are estimated on every row; their
+        tests and intervals come from the held-out rows, where a continuous
+        moderator's slopes sit at the held-out mean and SD.
         """
         moderators = [m for m in (moderator_columns or []) if m]
         if not moderators:
             return []
+        test = {
+            r["moderator"]: r
+            for r in self._moderation_on(params, moderators, held_out=True)
+        }
+        out = []
+        for r in self._moderation_on(params, moderators):
+            held = test.get(r["moderator"])
+            merged = exposure_response.split_inference(r, held)
+            merged["inference_n"] = None if held is None else held["n"]
+            out.append(merged)
+        return out
+
+    def _moderation_on(
+        self, params: dict, moderators: list[str], *, held_out: bool = False
+    ) -> list[dict]:
+        """:meth:`compute_moderation` on every row or the held-out rows."""
         out: list[dict] = []
         try:
             df = self.apply_fusion(weights=dict(params))
@@ -7570,6 +7618,11 @@ class MetricFusionEngine:
             entity_id = None
             if self.is_longitudinal:
                 entity_id, _ysb = self._whole_data_longitudinal_keys(df)
+            rows = self._test_entity_mask(df) if held_out else None
+            if rows is not None:
+                df = df.loc[rows]
+                target, composite = target[rows], composite[rows]
+                entity_id = None if entity_id is None else entity_id[rows]
 
             binary = binary_longitudinal.is_binary(target)
 

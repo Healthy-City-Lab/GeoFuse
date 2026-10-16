@@ -224,8 +224,12 @@ def quartile_terms(
     *,
     n_groups: int = 4,
     logistic: bool = False,
+    cut_points=None,
 ) -> dict | None:
     """Exposure as quantile indicators against the lowest group.
+
+    ``cut_points`` fixes the group boundaries, so a subset is grouped by the
+    quantiles of the whole data.
 
     Returns one contrast per group above the reference, each with its
     coefficient, standard error, p-value, and (for a logistic fit) odds ratio.
@@ -235,7 +239,13 @@ def quartile_terms(
     This does not assume the gradient is linear, so a monotone set of contrasts
     is evidence about the shape rather than a restatement of the model.
     """
-    groups, cuts = exposure_quartiles(exposure, n_groups)
+    if cut_points is None:
+        groups, cuts = exposure_quartiles(exposure, n_groups)
+    else:
+        cuts = np.asarray(cut_points, dtype=np.float64)
+        values = np.asarray(exposure, dtype=np.float64)
+        groups = np.searchsorted(cuts, values, side="right")
+        groups[~np.isfinite(values)] = -1
     if groups is None:
         return None
     # The fitter is bound to the outcome's rows, so a row cannot be dropped here
@@ -679,3 +689,85 @@ def spline_nonlinearity_test(
         ],
         "curve": curve,
     }
+
+
+# ────────────────────────────────────────────────────────────────────
+# Whole-data estimates, held-out inference
+# ────────────────────────────────────────────────────────────────────
+
+# Keys that describe sampling uncertainty rather than the estimate itself.
+_INFERENCE_KEYS = frozenset(
+    {
+        "std_error",
+        "std_err",
+        "z",
+        "t_stat",
+        "p_value",
+        "pvalue",
+        "ci_low",
+        "ci_high",
+        "or_ci_low",
+        "or_ci_high",
+        "lower",
+        "upper",
+        "trend_p",
+        "interaction_p",
+        "interaction_wald_chi2",
+        "interaction_df",
+        "nonlinearity_p",
+        "wald_chi2",
+        "wald_df",
+        "linear_p",
+        "exact_wald",
+    }
+)
+# Keys that name a row of a result table, so held-out rows pair by name.
+_ROW_KEYS = ("group", "level", "term", "key", "covariate", "name")
+_ESTIMATE_KEYS = ("estimate", "coef", "slope", "observed_diff")
+# Two-sided 5 % test at 80 % power: z_0.975 + z_0.8.
+MDE_SE_MULTIPLE = 2.8
+
+
+def _paired(row, i: int, rows: list):
+    if isinstance(row, dict):
+        for k in _ROW_KEYS:
+            if k in row:
+                return next(
+                    (r for r in rows if isinstance(r, dict) and r.get(k) == row[k]),
+                    None,
+                )
+    return rows[i] if i < len(rows) else None
+
+
+def split_inference(whole, test):
+    """Estimates from ``whole``, their uncertainty from ``test``.
+
+    ``whole`` and ``test`` are the same analysis on every row and on the
+    held-out rows. The composite was chosen with the training rows' outcome,
+    so only the held-out rows give honest p-values and intervals; estimates
+    and curves keep every row and are descriptive. Each row with a standard
+    error also gets the held-out estimate its interval belongs to and the
+    minimum detectable effect, :data:`MDE_SE_MULTIPLE` held-out standard
+    errors. Inference with no held-out counterpart is ``None``.
+    """
+    if isinstance(whole, dict):
+        t = test if isinstance(test, dict) else {}
+        out = {
+            k: t.get(k) if k in _INFERENCE_KEYS else split_inference(v, t.get(k))
+            for k, v in whole.items()
+        }
+        if "std_error" in whole or "std_err" in whole:
+            se = t.get("std_error", t.get("std_err"))
+            out["test_estimate"] = next(
+                (t[k] for k in _ESTIMATE_KEYS if k in t), None
+            )
+            out["mde"] = (
+                MDE_SE_MULTIPLE * float(se)
+                if se is not None and np.isfinite(se)
+                else None
+            )
+        return out
+    if isinstance(whole, list):
+        rows = test if isinstance(test, list) else []
+        return [split_inference(w, _paired(w, i, rows)) for i, w in enumerate(whole)]
+    return whole

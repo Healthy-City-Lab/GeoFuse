@@ -478,6 +478,54 @@ class TestModeration(unittest.TestCase):
         )
 
 
+class TestHeldOutInference(unittest.TestCase):
+    WHOLE = {
+        "n": 900,
+        "per_iqr": {"estimate": 0.4, "std_error": 0.1, "ci_low": 0.2, "ci_high": 0.6},
+        "quartiles": {
+            "cut_points": [1.0, 2.0, 3.0],
+            "contrasts": [
+                {"group": 2, "coef": 0.1, "std_error": 0.05, "p_value": 0.04},
+                {"group": 3, "coef": 0.3, "std_error": 0.05, "p_value": 0.001},
+            ],
+            "trend_p": 0.001,
+        },
+        "curve": {"exposure": [1.0, 2.0], "effect": [0.0, 0.2]},
+    }
+    TEST = {
+        "n": 300,
+        "per_iqr": {"estimate": 0.3, "std_error": 0.2, "ci_low": -0.1, "ci_high": 0.7},
+        "quartiles": {
+            "cut_points": [1.0, 2.0, 3.0],
+            "contrasts": [
+                {"group": 3, "coef": 0.2, "std_error": 0.1, "p_value": 0.05},
+            ],
+            "trend_p": 0.2,
+        },
+        "curve": {"exposure": [1.5], "effect": [0.1]},
+    }
+
+    def test_estimates_stay_whole_and_inference_comes_from_the_test_rows(self):
+        out = er.split_inference(self.WHOLE, self.TEST)
+        self.assertEqual(out["per_iqr"]["estimate"], 0.4)
+        self.assertEqual(out["per_iqr"]["ci_low"], -0.1)
+        self.assertEqual(out["per_iqr"]["test_estimate"], 0.3)
+        self.assertAlmostEqual(out["per_iqr"]["mde"], 0.56)
+        self.assertEqual(out["quartiles"]["trend_p"], 0.2)
+        self.assertEqual(out["curve"], self.WHOLE["curve"])
+
+    def test_rows_pair_by_name_and_a_missing_one_has_no_inference(self):
+        q2, q3 = er.split_inference(self.WHOLE, self.TEST)["quartiles"]["contrasts"]
+        self.assertEqual((q3["coef"], q3["p_value"]), (0.3, 0.05))
+        self.assertIsNone(q2["p_value"])
+        self.assertIsNone(q2["mde"])
+
+    def test_a_failed_held_out_fit_leaves_every_p_value_empty(self):
+        out = er.split_inference(self.WHOLE, None)
+        self.assertIsNone(out["per_iqr"]["std_error"])
+        self.assertEqual(out["per_iqr"]["estimate"], 0.4)
+
+
 class TestIncrementalR2(unittest.TestCase):
     """``r2`` must measure association, not agreement of scales."""
 
