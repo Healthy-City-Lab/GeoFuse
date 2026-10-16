@@ -870,20 +870,6 @@ class MetricFusionEngine:
                             f"{channel_label}: target extent does not overlap the "
                             "metric raster — check the target / raster CRS.",
                         )
-                    else:
-                        ix = max(0.0, min(maxx, rr) - max(minx, rl))
-                        iy = max(0.0, min(maxy, rt) - max(miny, rb))
-                        fx, fy = (rr - rl), (rt - rb)
-                        frac = (ix / fx) * (iy / fy) if fx > 0 and fy > 0 else 0.0
-                        if frac > 0.5:
-                            _log(
-                                "WARN",
-                                f"{channel_label}: the buffered target extent covers "
-                                f"~{frac * 100:.0f}% of the metric raster — a study "
-                                "area should be a small slice, so this likely means a "
-                                "target/raster CRS mismatch (sampled values would be "
-                                "wrong). Sampling proceeds via windowed reads.",
-                            )
             except Exception:
                 pass
             return metric_data
