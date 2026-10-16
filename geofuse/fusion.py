@@ -45,6 +45,7 @@ from . import (
 from .cgi_formulas import WEIGHTED_AVERAGE, compute_cgi
 from .crs_utils import (
     assign_spatial_blocks,
+    buffer_gdf_union_metres,
     build_internal_overviews,
     crs_uses_metre_axes,
     default_geotiff_creation_options,
@@ -805,18 +806,15 @@ class MetricFusionEngine:
                     "data": src.read(self.target_band, masked=True),
                 }
 
-            # Create buffered bounds
-            minx, miny, maxx, maxy = self.target_raster["bounds"]
-            buffer_deg = self.buffer_meters / 111000  # Rough conversion
-            buffered_box = box(
-                minx - buffer_deg,
-                miny - buffer_deg,
-                maxx + buffer_deg,
-                maxy + buffer_deg,
+            # Buffered bounds in metres whatever the raster's CRS, then WGS84 as
+            # for vector targets.
+            extent = gpd.GeoDataFrame(
+                {"geometry": [box(*self.target_raster["bounds"])]},
+                crs=self.target_raster["crs"],
             )
-            self.buffered_extent = gpd.GeoDataFrame(
-                {"geometry": [buffered_box]}, crs=self.target_raster["crs"]
-            )
+            self.buffered_extent = buffer_gdf_union_metres(
+                extent, float(self.buffer_meters)
+            ).to_crs("EPSG:4326")
 
         return self.buffered_extent
 

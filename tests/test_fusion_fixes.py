@@ -86,6 +86,37 @@ class TestCategoricalCovariateExpansion(unittest.TestCase):
         self.assertEqual(eng.covariate_columns, cols)
 
 
+class TestRasterTargetExtent(unittest.TestCase):
+    def test_a_projected_raster_is_buffered_in_metres(self):
+        import rasterio
+        from rasterio.transform import from_origin
+
+        from geofuse.fusion import MetricFusionEngine
+
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "target.tif")
+        with rasterio.open(
+            path,
+            "w",
+            driver="GTiff",
+            width=10,
+            height=10,
+            count=1,
+            dtype="float32",
+            crs="EPSG:32617",
+            transform=from_origin(500000, 4800000, 100, 100),
+        ) as dst:
+            dst.write(np.ones((1, 10, 10), dtype="float32"))
+        eng = MetricFusionEngine(target_file=path, cache_dir=tmp)
+        eng.buffer_meters = 1500
+        extent = eng.load_target()
+        self.assertEqual(extent.crs.to_epsg(), 4326)
+        bounds = extent.to_crs("EPSG:32617").total_bounds
+        np.testing.assert_allclose(
+            bounds, [498500, 4797500, 502500, 4801500], atol=1.0
+        )
+
+
 class TestDispersionCheck(unittest.TestCase):
     def test_rare_dummies_and_binary_outcomes_are_not_flagged(self):
         from geofuse.fusion import MetricFusionEngine
