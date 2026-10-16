@@ -1214,7 +1214,6 @@ def _fusion_config_fingerprint(
     spatial_split: bool = False,
     spatial_block_size_m: float | None = None,
     n_spatial_blocks: int | None = None,
-    normalize_channels: bool = False,
     spatial_adjust_method: str = "none",
     spatial_adjust_max_df: int = 10,
     spatial_adjust_eps_m: float | None = None,
@@ -1249,8 +1248,6 @@ def _fusion_config_fingerprint(
             # per-job caches can't pool with a new run.
             "sel:stabsel-cpss-v3",
         ]
-        # Only appended when on, so legacy (un-normalized) runs keep their hash.
-        + (["nc:1"] if normalize_channels else [])
         # Spatial-confounding adjustment changes the objective, so it splits the
         # cache; only appended when on so legacy runs keep their hash.
         + (
@@ -1454,7 +1451,6 @@ def run_fusion(
     cgi_grid_spacing_m: float | None = None,
     whole_grid_scaling: bool = False,
     area_balanced_split: bool = False,
-    normalize_channels: bool = False,
     spatial_adjust_method: str = "none",
     spatial_adjust_max_df: int = 10,
     spatial_adjust_eps_m: float | None = None,
@@ -1668,7 +1664,6 @@ def run_fusion(
             "cgi_grid_spacing_m": cgi_grid_spacing_m,
             "whole_grid_scaling": bool(whole_grid_scaling),
             "area_balanced_split": bool(area_balanced_split),
-            "normalize_channels": bool(normalize_channels),
             "spatial_split": bool(spatial_split),
             "spatial_block_size_m": spatial_block_size_m,
             "n_spatial_blocks": n_spatial_blocks,
@@ -2195,7 +2190,6 @@ def run_fusion(
                 spatial_split=bool(spatial_split),
                 spatial_block_size_m=spatial_block_size_m,
                 n_spatial_blocks=n_spatial_blocks,
-                normalize_channels=bool(normalize_channels),
                 spatial_adjust_method=spatial_adjust_method,
                 spatial_adjust_max_df=spatial_adjust_max_df,
                 spatial_adjust_eps_m=spatial_adjust_eps_m,

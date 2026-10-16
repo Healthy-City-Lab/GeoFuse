@@ -932,7 +932,6 @@ def fusion_run_config(spec: JobSpec) -> dict[str, Any]:
         "cgi_grid_spacing_m": int(s["cgi_grid_spacing_m"]),
         "whole_grid_scaling": bool(s["whole_grid_scaling"]) if vector else True,
         "area_balanced_split": bool(s["area_balanced_split"]) if polygon else False,
-        "normalize_channels": bool(s["normalize_channels"]) if vector else False,
         "spatial_adjust_method": adjust,
         "spatial_adjust_max_df": int(
             s["spatial_adjust_max_df"]

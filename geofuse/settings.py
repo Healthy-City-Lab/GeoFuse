@@ -341,7 +341,6 @@ FUSION: dict[str, Setting] = {
     # ── Per-pixel scoring (vector targets) ──────────────────────
     "cgi_grid_spacing_m": _int(50, 10, 500, "CGI grid pixel size (m).", step=10),
     "whole_grid_scaling": _bool(True, "Scale the composite map to [0, 1]."),
-    "normalize_channels": _bool(True, "Scale channels to [0, 1] before mixing."),
     "area_balanced_split": _bool(True, "Balance polygon area across the split."),
     "spatial_split": _bool(True, "Hold out whole spatial blocks."),
     "spatial_block_size_m": Setting(
