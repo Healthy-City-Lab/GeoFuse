@@ -480,6 +480,7 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "gvi_min_coverage",
     "check_collinearity",
     "vif_threshold",
+    "drop_collinear_channels",
 )
 
 # Buffer-ladder spacings (``metric_sampling.LADDER_SPACINGS``).
@@ -512,6 +513,7 @@ _FUSION_PARAM_TO_WIDGET: dict[str, str] = {
     "gvi_min_coverage": "fusion_gvi_min_coverage",
     "check_collinearity": "fusion_check_collinearity",
     "vif_threshold": "fusion_vif_threshold",
+    "drop_collinear_channels": "fusion_drop_collinear_channels",
     "cgi_grid_spacing_m": "fusion_cgi_grid_spacing_m",
     "exposure_kernel": "fusion_exposure_kernel",
     "exposure_radius_m": "fusion_exposure_radius_m",
@@ -1938,19 +1940,31 @@ def _render_study_details_panel(
         )
 
     # ── Channel collinearity check (iterative VIF) ──────────────
-    # Runs after pre-aggregation, before optimization. Drops channels
-    # whose pixel-level values are redundant with the others (high VIF).
-    # Dropped channels get pinned to weight 0 in every subsequent trial.
+    # Runs after pre-aggregation, before the search, and reports the channels
+    # whose pixel values are redundant with the others (high VIF); dropping
+    # them from the search is a separate choice.
     _default("fusion_check_collinearity", _fs_default("check_collinearity"))
     _default("fusion_vif_threshold", _fs_default("vif_threshold"))
+    _default("fusion_drop_collinear_channels", _fs_default("drop_collinear_channels"))
     col_c1, col_c2 = st.columns([2, 1])
     with col_c1:
         check_collinearity = st.checkbox(
             "Check channel collinearity (iterative VIF)",
             key="fusion_check_collinearity",
             help=(
-                "Iteratively drop the highest-VIF channel until all remaining "
-                "VIFs are below threshold, pinning dropped channels to weight 0."
+                "Report the study's channels whose variance inflation exceeds "
+                "the threshold, found by removing the highest-VIF channel until "
+                "the rest are below it."
+            ),
+        )
+        drop_collinear_channels = st.checkbox(
+            "Drop high-VIF channels",
+            key="fusion_drop_collinear_channels",
+            disabled=not check_collinearity,
+            help=(
+                "Leave the reported channels out of the index search, so the "
+                "composite gives them weight 0. Off keeps every channel and "
+                "only reports them."
             ),
         )
     with col_c2:
@@ -2369,6 +2383,7 @@ def _render_study_details_panel(
         "gvi_min_coverage": float(gvi_min_coverage_ui),
         "check_collinearity": bool(check_collinearity),
         "vif_threshold": float(vif_threshold_ui),
+        "drop_collinear_channels": bool(check_collinearity and drop_collinear_channels),
     }
 
 
@@ -2451,8 +2466,8 @@ def _render_collinearity_report(results_view: dict) -> None:
 
     Reads ``results_view["collinearity_report"]`` and renders:
     * Pairwise Pearson r between channels (3×3 matrix as a heatmap-styled table)
-    * VIF before / after each drop iteration
-    * Channels kept vs dropped
+    * VIF before / after each reduction step
+    * Channels below vs above the threshold
     """
     report = results_view.get("collinearity_report") or None
     if not report:
@@ -2480,9 +2495,9 @@ def _render_collinearity_report(results_view: dict) -> None:
         st.metric("Pixels sampled", f"{n_sample:,}")
     with summary_cols[2]:
         st.metric(
-            "Channels kept",
+            "Channels below threshold",
             f"{len(kept)}/{len(channels)}",
-            delta=(f"dropped: {', '.join(dropped)}" if dropped else "all retained"),
+            delta=(f"above: {', '.join(dropped)}" if dropped else "all below"),
             delta_color="off",
         )
 
@@ -2509,7 +2524,7 @@ def _render_collinearity_report(results_view: dict) -> None:
                 "Initial VIF": (
                     round(float(vif_in), 3) if vif_in is not None else float("nan")
                 ),
-                "Status": "dropped" if ch in dropped else "kept",
+                "Status": "above threshold" if ch in dropped else "below threshold",
                 "Final VIF": (
                     round(float(final_by_name[ch]), 3) if ch in final_by_name else "—"
                 ),
@@ -2517,11 +2532,11 @@ def _render_collinearity_report(results_view: dict) -> None:
         )
     st.dataframe(_pd.DataFrame(rows), width="stretch")
 
-    # Per-iteration drop history (only if anything was actually dropped).
+    # Per-iteration reduction history (only when a channel was above).
     iterations = report.get("iterations") or []
     if iterations:
         with st.expander(
-            f"Drop history ({len(iterations)} iteration(s))", expanded=False
+            f"Reduction history ({len(iterations)} iteration(s))", expanded=False
         ):
             for i, it in enumerate(iterations, start=1):
                 st.write(f"**Iteration {i}** — removed `{it.get('removed', '?')}`")
@@ -5488,6 +5503,9 @@ def render(output_dir: str) -> None:
     )
     check_collinearity_param = bool(study_state.get("check_collinearity", False))
     vif_threshold_param = float(study_state.get("vif_threshold", 10.0))
+    drop_collinear_channels_param = bool(
+        study_state.get("drop_collinear_channels", False)
+    )
 
     # =========================================================================
     # Run controls and progress
@@ -5895,6 +5913,7 @@ def render(output_dir: str) -> None:
                 "gvi_min_coverage": gvi_min_coverage_param,
                 "check_collinearity": bool(check_collinearity_param),
                 "vif_threshold": float(vif_threshold_param),
+                "drop_collinear_channels": drop_collinear_channels_param,
             }
             _missing = [k for k in _FUSION_RUN_CONFIG_KEYS if k not in run_config]
             if _missing:
