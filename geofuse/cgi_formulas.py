@@ -18,7 +18,21 @@ Formulas
     fitted on. Weights are recorded as shares of 100; the formula renormalizes
     by their total.
 
-``synergy``
+``synergy_gm``
+    Main terms plus the geometric mean of every channel pair and of the
+    triple, on the raw channel values::
+
+        CGI = w_N · NDVI + w_V · Veg + w_T · Ter
+            + w_NV · √(NDVI⁺ · Veg) + w_NT · √(NDVI⁺ · Ter) + w_TV · √(Ter · Veg)
+            + w_NVT · ∛(NDVI⁺ · Veg · Ter)
+
+    with ``x⁺ = max(x, 0)`` inside the interactions only, so a negative NDVI
+    (water, bare surfaces) adds no synergy but still enters its main term.
+    Every term is on its channels' own physical scale, so a cell's value does
+    not depend on the study it was fitted in. Seven weights recorded as shares
+    of 100; with the interaction weights at 0 it is the weighted average.
+
+``synergy`` (earlier runs)
     Three-metric generalisation of Wang et al. 2026 (doi:10.3390/rs18010009),
     paper-faithful in pattern: powers on the **main** terms only, plain
     products elsewhere. Each channel enters as its approximate percentile,
@@ -46,6 +60,7 @@ arrive here as shares of 100.
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -57,6 +72,7 @@ import numpy as np
 
 WEIGHTED_AVERAGE = "weighted_average"
 SYNERGY = "synergy"
+SYNERGY_GM = "synergy_gm"
 
 ALL_CHANNELS: tuple[str, ...] = ("veg", "terrain", "ndvi")
 
@@ -330,6 +346,64 @@ def _synergy_channel_active(params: dict) -> dict[str, bool]:
 
 
 # ────────────────────────────────────────────────────────────────────
+# Geometric-mean synergy
+# ────────────────────────────────────────────────────────────────────
+
+
+def synergy_combos(n: int) -> list[tuple[int, ...]]:
+    """Channel index sets of the interaction terms: every pair, then the triple."""
+    return [
+        c for k in range(2, n + 1) for c in itertools.combinations(range(n), k)
+    ]
+
+
+def synergy_terms(values, xp=np) -> list:
+    """Term columns of the geometric-mean synergy form, in weight-key order.
+
+    The channels themselves, then the geometric mean of each
+    :func:`synergy_combos` set with every channel clipped at 0. ``xp`` is the
+    array module (``numpy`` or ``jax.numpy``).
+    """
+    pos = [xp.maximum(v, 0) for v in values]
+    out = list(values)
+    for combo in synergy_combos(len(values)):
+        prod = pos[combo[0]]
+        for i in combo[1:]:
+            prod = prod * pos[i]
+        out.append(prod ** (1.0 / len(combo)))
+    return out
+
+
+def _geomean_synergy(chans: tuple[str, ...], keys: tuple[str, ...]):
+    combos = synergy_combos(len(chans))
+    involves = [{i} for i in range(len(chans))] + [set(c) for c in combos]
+
+    def compute(params: dict, components: ComponentDict) -> np.ndarray:
+        raw = [np.asarray(components[c]) for c in chans]
+        dt = np.result_type(*[a.dtype for a in raw], np.float32)
+        terms = synergy_terms([a.astype(dt, copy=False) for a in raw])
+        w = [float(params.get(k, 0)) for k in keys]
+        total = sum(w)
+        if total <= 0:
+            return np.full_like(terms[0], np.nan, dtype=dt)
+        out = np.zeros_like(terms[0], dtype=dt)
+        for wi, t in zip(w, terms):
+            if wi:
+                out = out + dt.type(wi / total) * t
+        return out
+
+    def active(params: dict) -> dict[str, bool]:
+        return {
+            c: any(
+                float(params.get(k, 0)) > 0 for k, s in zip(keys, involves) if i in s
+            )
+            for i, c in enumerate(chans)
+        }
+
+    return compute, active
+
+
+# ────────────────────────────────────────────────────────────────────
 # Two-channel variants (NDVI + merged GVI)
 # ────────────────────────────────────────────────────────────────────
 #
@@ -341,6 +415,7 @@ def _synergy_channel_active(params: dict) -> dict[str, bool]:
 GVI = "gvi"
 WEIGHTED_AVERAGE_GVI = "weighted_average_gvi"
 SYNERGY_GVI = "synergy_gvi"
+SYNERGY_GM_GVI = "synergy_gm_gvi"
 
 _GVI_CHANNELS: tuple[str, ...] = ("ndvi", "gvi")
 
@@ -452,6 +527,28 @@ def _register_gvi_variants() -> None:
     _CHANNEL_MAIN_KEY[SYNERGY_GVI] = {c: f"w_{c}" for c in _GVI_CHANNELS}
 
 
+def _register_geomean_synergy() -> None:
+    for name, chans, main, inter in (
+        (SYNERGY_GM, ("ndvi", "veg", "terrain"), _SYN_MAIN_KEYS, _SYN_INTER_KEYS),
+        (
+            SYNERGY_GM_GVI,
+            _GVI_CHANNELS,
+            tuple(f"w_{c}" for c in _GVI_CHANNELS),
+            ("w_ndvi_gvi",),
+        ),
+    ):
+        compute, active = _geomean_synergy(chans, main + inter)
+        _REGISTRY[name] = CGIFormula(
+            name=name,
+            main_weight_keys=main,
+            interaction_weight_keys=inter,
+            power_keys=(),
+            compute=compute,
+            channel_active=active,
+        )
+        _CHANNEL_MAIN_KEY[name] = dict(zip(chans, main))
+
+
 def available_formulas() -> list[str]:
     """Stable-ordered list of registered formula names."""
     return sorted(_REGISTRY)
@@ -496,6 +593,7 @@ _CHANNEL_MAIN_KEY: dict[str, dict[str, str]] = {
 
 
 _register_gvi_variants()
+_register_geomean_synergy()
 
 
 def formula_channels(name: str) -> tuple[str, ...]:

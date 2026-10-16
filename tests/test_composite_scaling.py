@@ -188,6 +188,44 @@ class TestSynergy(unittest.TestCase):
         np.testing.assert_allclose(got, [0.1, 0.3, 0.6], rtol=1e-6)
 
 
+class TestGeometricMeanSynergy(unittest.TestCase):
+    COMPS = {
+        "ndvi": np.array([-0.3, 0.2, 0.6]),
+        "veg": np.array([0.4, 0.1, 0.3]),
+        "terrain": np.array([0.05, 0.2, 0.0]),
+    }
+
+    def test_interactions_are_geometric_means_of_clipped_channels(self):
+        n, v, t = (self.COMPS[c] for c in ("ndvi", "veg", "terrain"))
+        p = dict.fromkeys(cgi_formulas.get_formula("synergy_gm").weight_keys, 0)
+        p.update(w_ndvi=20, w_ter=10, w_ndvi_veg=30, w_ter_veg=10, w_ndvi_veg_ter=30)
+        n0 = np.maximum(n, 0)
+        want = (
+            0.2 * n
+            + 0.1 * t
+            + 0.3 * np.sqrt(n0 * v)
+            + 0.1 * np.sqrt(t * v)
+            + 0.3 * np.cbrt(n0 * v * t)
+        )
+        got = cgi_formulas.compute_cgi("synergy_gm", p, self.COMPS)
+        np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-7)
+
+    def test_without_interactions_it_is_the_weighted_average(self):
+        p = {"w_ndvi": 50, "w_gvi": 50, "w_ndvi_gvi": 0}
+        comps = {"ndvi": self.COMPS["ndvi"], "gvi": self.COMPS["veg"]}
+        got = cgi_formulas.compute_cgi("synergy_gm_gvi", p, comps)
+        want = cgi_formulas.compute_cgi(
+            "weighted_average_gvi", {"ndvi_weight": 50, "gvi_weight": 50}, comps
+        )
+        np.testing.assert_allclose(got, want, atol=1e-7)
+
+    def test_a_channel_is_active_through_any_of_its_terms(self):
+        active = cgi_formulas.channel_active(
+            "synergy_gm", {"w_ndvi": 50, "w_ndvi_veg_ter": 50}
+        )
+        self.assertEqual(active, {"ndvi": True, "veg": True, "terrain": True})
+
+
 class TestScalingIsRecorded(unittest.TestCase):
     @staticmethod
     def _tensor():
