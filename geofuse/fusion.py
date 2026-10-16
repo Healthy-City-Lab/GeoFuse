@@ -7216,7 +7216,22 @@ class MetricFusionEngine:
         covariate carries (the drop in residual variance when the
         covariate is removed from the full model). Returns ``None``
         when there are no covariates or when the regression fails.
+
+        Coefficients and R² use every row; standard errors, t and p come from
+        the held-out rows (:func:`exposure_response.split_inference`).
         """
+        whole = self._covariate_impact_on(params, metric)
+        if whole is None:
+            return None
+        held = self._covariate_impact_on(params, metric, held_out=True)
+        out = exposure_response.split_inference(whole, held)
+        out["inference_n"] = None if held is None else held.get("n")
+        return out
+
+    def _covariate_impact_on(
+        self, params: dict, metric: str, *, held_out: bool = False
+    ) -> dict | None:
+        """:meth:`compute_covariate_impact` on every row or the held-out rows."""
         cov_cols = list(self.covariate_columns or [])
         if not cov_cols:
             return None
@@ -7256,6 +7271,13 @@ class MetricFusionEngine:
                 elif {"entity_id", "years_since_baseline"} <= set(df.columns):
                     lon_entity_id = df["entity_id"].to_numpy()
                     lon_ysb = df["years_since_baseline"].to_numpy(dtype=np.float64)
+
+            if held_out:
+                rows = self._test_entity_mask(df)
+                target, composite = target[rows], composite[rows]
+                cov_mat = cov_mat[rows]
+                if lon_entity_id is not None:
+                    lon_entity_id, lon_ysb = lon_entity_id[rows], lon_ysb[rows]
 
             mask = ~(
                 np.isnan(target) | np.isnan(composite) | np.isnan(cov_mat).any(axis=1)

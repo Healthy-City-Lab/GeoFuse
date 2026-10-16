@@ -700,10 +700,12 @@ _INFERENCE_KEYS = frozenset(
     {
         "std_error",
         "std_err",
+        "cgi_std_err",
         "z",
         "t_stat",
         "p_value",
         "pvalue",
+        "p_display",
         "ci_low",
         "ci_high",
         "or_ci_low",
