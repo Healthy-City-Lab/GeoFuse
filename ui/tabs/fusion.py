@@ -454,6 +454,10 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "standalone_channels",
     "longitudinal_spec_payload",
     "cgi_grid_spacing_m",
+    "exposure_kernel",
+    "exposure_radius_m",
+    "exposure_plateau_m",
+    "exposure_sigma_m",
     "whole_grid_scaling",
     "area_balanced_split",
     "spatial_adjust_method",
@@ -507,6 +511,10 @@ _FUSION_PARAM_TO_WIDGET: dict[str, str] = {
     "check_collinearity": "fusion_check_collinearity",
     "vif_threshold": "fusion_vif_threshold",
     "cgi_grid_spacing_m": "fusion_cgi_grid_spacing_m",
+    "exposure_kernel": "fusion_exposure_kernel",
+    "exposure_radius_m": "fusion_exposure_radius_m",
+    "exposure_plateau_m": "fusion_exposure_plateau_m",
+    "exposure_sigma_m": "fusion_exposure_sigma_m",
     "whole_grid_scaling": "fusion_whole_grid_scaling",
     "area_balanced_split": "fusion_area_balanced_split",
     "spatial_split": "fusion_spatial_split",
@@ -2232,6 +2240,63 @@ def _render_study_details_panel(
                 )
                 spatial_adjust_eps_m = float(eps_ui) if eps_ui and eps_ui > 0 else None
 
+    # ── Exposure buffer ─────────────────────────────────────────
+    for name in (
+        "exposure_kernel",
+        "exposure_radius_m",
+        "exposure_plateau_m",
+        "exposure_sigma_m",
+    ):
+        _default(f"fusion_{name}", _fs_default(name))
+    _exposure_labels = {
+        "none": "None (touched cells only)",
+        "uniform": "Uniform",
+        "linear": "Linear decay",
+        "gaussian": "Gaussian decay",
+    }
+    exposure_kernel = st.selectbox(
+        "Exposure buffer",
+        options=list(_FS["exposure_kernel"].choices),
+        format_func=lambda k: _exposure_labels[k],
+        key="fusion_exposure_kernel",
+        help=(
+            "Each target is exposed to the CGI cells its geometry touches. A "
+            "buffer adds the cells within its radius, weighted by distance: "
+            "uniform keeps full weight, linear decay falls to 0 at the radius "
+            "after a full-weight distance, Gaussian decay follows its SD."
+        ),
+    )
+    exposure_radius_m = float(st.session_state["fusion_exposure_radius_m"])
+    exposure_plateau_m = float(st.session_state["fusion_exposure_plateau_m"])
+    exposure_sigma_m = float(st.session_state["fusion_exposure_sigma_m"])
+    if exposure_kernel != "none":
+        _buffer_cols = st.columns(2)
+        with _buffer_cols[0]:
+            exposure_radius_m = st.number_input(
+                "Buffer radius (m)",
+                **_fs_bounds("exposure_radius_m"),
+                step=10.0,
+                key="fusion_exposure_radius_m",
+                help="Cells farther than this from the target get no weight.",
+            )
+        with _buffer_cols[1]:
+            if exposure_kernel == "linear":
+                exposure_plateau_m = st.number_input(
+                    "Full-weight distance (m)",
+                    **_fs_bounds("exposure_plateau_m"),
+                    step=10.0,
+                    key="fusion_exposure_plateau_m",
+                    help="Cells within this distance keep full weight.",
+                )
+            elif exposure_kernel == "gaussian":
+                exposure_sigma_m = st.number_input(
+                    "Gaussian SD (m)",
+                    **_fs_bounds("exposure_sigma_m"),
+                    step=5.0,
+                    key="fusion_exposure_sigma_m",
+                    help="Distance at which a cell's weight falls to 0.61.",
+                )
+
     return {
         # Derived, not chosen: the channel set names the modalities and
         # the sweep picks the form, so the registry name follows from both.
@@ -2261,6 +2326,10 @@ def _render_study_details_panel(
         "resume_existing_study": bool(resume_existing_study),
         "run_standalones": bool(run_standalones),
         "cgi_grid_spacing_m": int(cgi_grid_spacing_m),
+        "exposure_kernel": str(exposure_kernel),
+        "exposure_radius_m": float(exposure_radius_m),
+        "exposure_plateau_m": float(exposure_plateau_m),
+        "exposure_sigma_m": float(exposure_sigma_m),
         "whole_grid_scaling": bool(whole_grid_scaling),
         "area_balanced_split": bool(area_balanced_split),
         "spatial_adjust_method": str(spatial_adjust_method),
@@ -5362,6 +5431,15 @@ def render(output_dir: str) -> None:
     lon_wave_fe = study_state.get("include_wave_fixed_effects", True)
     lon_area_col = study_state.get("area_id_col") or None
     cgi_grid_spacing_m_param = study_state.get("cgi_grid_spacing_m")
+    exposure_params = {
+        k: study_state.get(k, _fs_default(k))
+        for k in (
+            "exposure_kernel",
+            "exposure_radius_m",
+            "exposure_plateau_m",
+            "exposure_sigma_m",
+        )
+    }
     whole_grid_scaling_param = bool(study_state.get("whole_grid_scaling", False))
     area_balanced_split_param = bool(study_state.get("area_balanced_split", False))
     residualize_method_param = str(study_state.get("residualize_method", "linear"))
@@ -5749,6 +5827,7 @@ def render(output_dir: str) -> None:
                     list(_CHANNEL_SETS[channel_set_param]) if run_standalones else []
                 ),
                 "longitudinal_spec_payload": longitudinal_spec_payload,
+                **exposure_params,
                 "cgi_grid_spacing_m": (
                     int(cgi_grid_spacing_m_param)
                     if cgi_grid_spacing_m_param is not None and is_vector_target
