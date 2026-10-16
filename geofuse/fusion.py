@@ -4642,23 +4642,12 @@ class MetricFusionEngine:
         return sp_cols
 
     def _finalize_composite(self, composite: np.ndarray) -> np.ndarray:
-        """Apply the ``whole_grid_scaling`` toggle to a per-pixel composite.
+        """Apply the ``whole_grid_scaling`` toggle to the written composite map.
 
-        Per-channel scaling is never applied — the composite (CGI in combined
-        mode, the single channel in standalone mode) is always a weighted
-        combination of **raw** aggregated channel values. This toggle instead
-        governs the composite itself: when on, the per-pixel composite is
-        min-max normalized to ``[0, 1]`` over the supplied pixels before it is
-        collapsed to entities / scored / written; when off, the raw composite
-        is used everywhere. Applied identically in scoring and in the output
-        raster (and mirrored for standalone single-channel maps) so the
-        rendered map always matches the values that were scored.
-
-        Note: the cross-sectional metrics are scale-invariant (distance
-        correlation and r² are affine-invariant; Spearman and quantile-binned
-        mutual information are rank-invariant; nRMSE min-max normalizes
-        internally), so this changes the recorded composite values and the
-        output raster — not the optimization objective.
+        When on, the per-pixel map is min-max normalized to ``[0, 1]`` over the
+        whole grid; when off it is written raw. Scores, the entity table and
+        every reported estimate use the raw composite, whose units do not
+        depend on which pixels a subset happens to hold.
         """
         if not self.whole_grid_scaling:
             return composite
@@ -5641,10 +5630,6 @@ class MetricFusionEngine:
         # so the held-out score is on the same scale the study optimized.
         test_composite = self._composite_from(params, test_blocks)
 
-        # Composite-level [0, 1] normalization (raw when the toggle is off),
-        # mirrored for standalone single-channel composites.
-        test_composite = self._finalize_composite(test_composite)
-
         # Per-entity constants (covariates, target, coords, longitudinal keys)
         # come from the fold statics — identical across every params
         # evaluation on this test split, so the MixedLM post-score loop and
@@ -6052,9 +6037,6 @@ class MetricFusionEngine:
         all_blocks = self._aggregate_channels(all_points, weights, subset="all")
 
         composite = self._composite_from(weights, all_blocks)
-        # Composite-level [0, 1] normalization over the whole grid when the
-        # toggle is on (raw otherwise); mirrors the output raster + standalones.
-        composite = self._finalize_composite(composite)
 
         result_df = all_data.copy()
         for ch, values in all_blocks.items():
@@ -8059,9 +8041,8 @@ class MetricFusionEngine:
                 progress_callback(40 + int(45 * (n + 1) / len(channels)), 100)
 
         # The composite from the raw channels, then the ``whole_grid_scaling``
-        # toggle: min-max normalise to [0, 1] over the whole grid when on, raw
-        # otherwise — the same treatment the scorer applied, mirrored for
-        # standalone single-channel maps.
+        # toggle: min-max normalise the map to [0, 1] over the whole grid when
+        # on, raw otherwise; standalone single-channel maps alike.
         logger.info(f"Calculating composite via formula '{formula.name}'...")
         composite = self._composite_from(final_params, blocks)
         composite = self._finalize_composite(np.asarray(composite, dtype=np.float64))
