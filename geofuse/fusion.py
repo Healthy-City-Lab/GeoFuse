@@ -3889,7 +3889,7 @@ class MetricFusionEngine:
     # Polygon-target areal aggregation
     # ────────────────────────────────────────────────────────────
 
-    def _prepare_vector_fusion(self) -> pd.DataFrame:
+    def _prepare_vector_fusion(self, outcome_col: str | None = None) -> pd.DataFrame:
         """Per-cell dataset for vector targets of any geometry type.
 
         Lays the CGI grid over the targets in a low-distortion metre CRS and
@@ -3904,7 +3904,7 @@ class MetricFusionEngine:
         """
         _log("INFO", "====== VECTOR FUSION (per-cell CGI) ======")
         entities = self.target_gdf.copy()
-        outcome_col = self.target_feature
+        outcome_col = outcome_col or self.target_feature
         spacing_m = float(self.cgi_grid_spacing_m)
 
         # Drop NaN-outcome / NaN-covariate entities up front.
@@ -4871,90 +4871,37 @@ class MetricFusionEngine:
         return points_gdf
 
     def _prepare_raster_fusion(self) -> pd.DataFrame:
-        """
-        Convert raster to point samples at pixel centers.
+        """Raster targets: every valid pixel is an entity at its pixel centre.
 
-        Each pixel in the target raster becomes a sample point. During optimization,
-        circular buffer aggregation will be applied around each point to sample
-        greenery metrics with trial-specific radii.
-
-        This matches CGI.ipynb methodology where each pixel is treated as a point
-        sample with circular neighborhood aggregation.
+        The target's own grid only locates the entities. Their exposure comes
+        from the CGI grid the study's settings define, as for any vector target
+        of points (:meth:`_prepare_vector_fusion`).
         """
         logger.info("Preparing raster-based fusion data...")
-        logger.info("Converting target raster pixels to point samples...")
-
         target_data = self.target_raster["data"]
         transform = self.target_raster["transform"]
-        crs = self.target_raster["crs"]
         width = int(target_data.shape[1])
 
         # Keep only valid-target pixels before building any geometry: one
         # geometry per grid cell would cost tens of GB on a large raster.
-        flat_target = np.ma.filled(target_data, np.nan).ravel()
+        flat_target = np.ma.filled(target_data.astype(np.float64), np.nan).ravel()
         keep = np.flatnonzero(~np.isnan(flat_target))
         if keep.size == 0:
             raise ValueError(
                 "No valid pixels found in target raster. "
                 "Target raster may be empty or all NaN."
             )
-        rows_i = (keep // width).astype(np.int64)
-        cols_i = (keep % width).astype(np.int64)
-        xs, ys = xy(transform, rows_i, cols_i, offset="center")
-
-        pixel_points = gpd.GeoDataFrame(
-            {
-                "target": flat_target[keep],
-                "row": rows_i,
-                "col": cols_i,
-            },
+        xs, ys = xy(transform, keep // width, keep % width, offset="center")
+        self.target_gdf = gpd.GeoDataFrame(
+            {"target": flat_target[keep]},
             geometry=gpd.points_from_xy(np.asarray(xs), np.asarray(ys)),
-            crs=crs,
+            crs=self.target_raster["crs"],
         )
-
-        logger.info(f"Created {len(pixel_points):,} point samples from raster pixels")
-
-        # Store as target_gdf for unified workflow
-        self.target_gdf = pixel_points
-
-        points_gdf = pixel_points.copy()
-
-        # Sample each metric using the shared helper method
-        points_gdf = self._sample_metrics_at_points(points_gdf)
-
-        # Create final DataFrame
-        fusion_df = pd.DataFrame(
-            {
-                "target": points_gdf["target"],
-                "veg": points_gdf["veg"],
-                "terrain": points_gdf["terrain"],
-                "ndvi": points_gdf["ndvi"],
-            }
+        logger.info(
+            f"Created {len(self.target_gdf):,} pixel-centre entities from the "
+            "target raster"
         )
-        fusion_df = self._attach_entity_coords(fusion_df, points_gdf)
-
-        # Log data quality before dropping NaN
-        _log("INFO", "====== DATA QUALITY SUMMARY (RASTER) ======")
-        _log("INFO", f"Total rows: {len(fusion_df)}")
-        for col in ("target", "veg", "terrain", "ndvi"):
-            nan_count = fusion_df[col].isna().sum()
-            pct = nan_count / max(len(fusion_df), 1) * 100
-            _log("INFO", f"{col.capitalize()} NaN: {nan_count} ({pct:.1f}%)")
-
-        result = fusion_df.dropna()
-        _log(
-            "OK" if len(result) else "WARN",
-            f"After dropna: {len(result)} valid rows",
-        )
-
-        if len(result) == 0:
-            raise ValueError(
-                "No valid samples after spatial join. "
-                "This usually means the target raster pixels and metric data don't overlap spatially. "
-                "Check that all data covers the same geographic area."
-            )
-
-        return result
+        return self._prepare_vector_fusion(outcome_col="target")
 
     def _polygon_areas_km2(self, polygon_ids: pd.Series) -> pd.Series:
         """Per-polygon area in km² keyed by polygon_id (NaN if unknown)."""
@@ -7935,10 +7882,9 @@ class MetricFusionEngine:
     ) -> str:
         """Render the composite greenery map from the discovered params.
 
-        Builds a composite greenery raster matching the target grid (if raster
-        input) or the CGI grid (if vector input) using the winning weight cell's
-        averaged parameters that ``fit_bayesian_index`` pinned on
-        ``self.best_params``.
+        Builds a composite greenery raster on the study's CGI grid, for raster
+        and vector targets alike, using the winning weight cell's averaged
+        parameters that ``fit_bayesian_index`` pinned on ``self.best_params``.
 
         Args:
             output_path: Path to save the composite greenery GeoTIFF
@@ -7964,32 +7910,12 @@ class MetricFusionEngine:
         if progress_callback:
             progress_callback(30, 100)
 
-        # 4. Determine grid (raster, polygon target, or point/vector)
-        if self.is_raster:
-            # Use exact target raster grid
-            transform = self.target_raster["transform"]
-            crs = self.target_raster["crs"]
-            height, width = self.target_raster["data"].shape
-
-            # Create point grid at pixel centers
-            rows, cols = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
-            xs, ys = xy(transform, rows.flatten(), cols.flatten(), offset="center")
-
-            points_gdf = gpd.GeoDataFrame(
-                {"row": rows.flatten(), "col": cols.flatten()},
-                geometry=gpd.points_from_xy(xs, ys),
-                crs=crs,
-            )
-
-            logger.info(
-                f"Generating composite for {len(points_gdf)} pixels (target raster grid)"
-            )
-
-        elif (
+        # 4. Determine grid: the CGI grid of the prepared study, or a fallback
+        if (
             self._entity_grid_shape is not None
             and self._entity_grid_transform is not None
         ):
-            # Vector target: render the CGI field over the cells the entities
+            # Render the CGI field over the cells the entities
             # are exposed to (``_prepare_vector_fusion``), so the composite
             # matches the scored values. Exposure rows repeat a cell once per
             # entity, so collapse to the unique cells.

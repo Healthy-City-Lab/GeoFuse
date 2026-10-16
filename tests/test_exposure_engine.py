@@ -83,6 +83,7 @@ class TestVectorExposure(unittest.TestCase):
         )
         gpath = os.path.join(tmp, "g.gpkg")
         gvi.to_file(gpath, driver="GPKG")
+        cls.tmp, cls.npath, cls.gpath = tmp, npath, gpath
 
         eng = MetricFusionEngine(
             target_file=tpath,
@@ -124,6 +125,45 @@ class TestVectorExposure(unittest.TestCase):
         applied = eng.apply_fusion(weights=dict(PARAMS)).set_index("polygon_id")
         got = applied.loc[static["pid"], "composite"].to_numpy()
         np.testing.assert_allclose(got, expected, rtol=1e-5, atol=1e-6)
+
+
+    def test_raster_pixels_are_entities_on_the_study_grid(self):
+        rng = np.random.default_rng(3)
+        rpath = os.path.join(self.tmp, "target.tif")
+        with rasterio.open(
+            rpath,
+            "w",
+            driver="GTiff",
+            height=6,
+            width=8,
+            count=1,
+            dtype="float32",
+            crs="EPSG:4326",
+            nodata=-9999.0,
+            transform=from_origin(-114.10, 51.02, 0.003, 0.003),
+        ) as d:
+            band = rng.normal(size=(6, 8)).astype("float32")
+            band[0, 0] = -9999.0
+            d.write(band, 1)
+        eng = MetricFusionEngine(
+            target_file=rpath,
+            buffer_meters=400,
+            gvi_buffer_min_m=200,
+            gvi_buffer_max_m=400,
+            gvi_buffer_step_m=200,
+            ndvi_buffer_min_m=200,
+            ndvi_buffer_max_m=400,
+            ndvi_buffer_step_m=200,
+            cache_dir=os.path.join(self.tmp, "cache_r"),
+            cgi_grid_spacing_m=50,
+        )
+        eng.load_target()
+        eng.load_metrics(veg_file=self.gpath, ndvi_file=self.npath, cache_metrics=False)
+        df = eng.prepare_fusion_data()
+        self.assertEqual(df["polygon_id"].nunique(), 47)
+        # A point touches one 50 m cell, whatever the target's own pixel size.
+        self.assertEqual(len(df), 47)
+        self.assertEqual(eng._entity_grid_transform.a, 50.0)
 
 
 if __name__ == "__main__":
