@@ -1847,6 +1847,38 @@ def holdout_gain(
     return out
 
 
+def _permuted(y, seed: int, entities=None, waves=None) -> np.ndarray:
+    """``y`` permuted for one null refit.
+
+    Without ``entities`` the rows are permuted freely. With them (a panel's
+    entity per row, and optionally its wave) whole entity histories are swapped
+    between entities with the same pattern of waves, so a permuted outcome keeps
+    its within-entity correlation and its wave structure, and only its link to
+    the exposure is broken.
+    """
+    rng = np.random.default_rng(seed)
+    y = np.asarray(y)
+    if entities is None:
+        return rng.permutation(y)
+    _, ent = np.unique(np.asarray(entities), return_inverse=True)
+    wave = (
+        np.zeros(len(y), dtype=np.int64)
+        if waves is None
+        else np.unique(np.asarray(waves), return_inverse=True)[1]
+    )
+    order = np.lexsort((wave, ent))
+    starts = np.flatnonzero(np.r_[True, np.diff(ent[order]) != 0])
+    blocks = np.split(order, starts[1:])
+    by_pattern: dict = {}
+    for b, rows in enumerate(blocks):
+        by_pattern.setdefault(tuple(wave[rows]), []).append(b)
+    out = y.copy()
+    for members in by_pattern.values():
+        for dst, src in zip(members, rng.permutation(members)):
+            out[blocks[dst]] = y[blocks[src]]
+    return out
+
+
 def _null_fit(task):
     """One permuted refit. Reads the exposure from a memmap, not from the pipe.
 
@@ -1855,13 +1887,16 @@ def _null_fit(task):
     what exhausts the pipe rather than the fitting. With a form choice attached,
     the form is re-chosen on the permuted outcome before the refit.
     """
-    path, shape, y, form, seed, kwargs, choice = task
+    path, shape, y, form, seed, kwargs, choice, panel = task
     E = np.asarray(np.memmap(path, dtype=np.float64, mode="r", shape=shape))
-    yp = np.random.default_rng(seed).permutation(y)
+    groups, entities, waves = panel
+    yp = _permuted(y, seed, entities, waves)
     if choice is not None:
         cpath, cshape, forms = choice
         Ef = np.asarray(np.memmap(cpath, dtype=np.float64, mode="r", shape=cshape))
-        form, _ = choose_form(Ef, yp, forms, seed=seed + _FORM_SEED_OFFSET)
+        form, _ = choose_form(
+            Ef, yp, forms, seed=seed + _FORM_SEED_OFFSET, groups=groups
+        )
     m = fit(E, yp, form=form, draws=300, warmup=300, chains=2, seed=seed, **kwargs)
     b = np.asarray(m.get_samples()["beta"])
     lo, hi = np.percentile(b, [2.5, 97.5])
@@ -1908,6 +1943,9 @@ def null_calibration(
     reselect_form=False,
     form_E=None,
     forms=FORMS,
+    groups=None,
+    entities=None,
+    waves=None,
     **fit_kwargs,
 ):
     """How often the beta interval excludes zero on a permuted outcome (~5 %).
@@ -1928,6 +1966,10 @@ def null_calibration(
     :data:`NULL_RUNS_FOR_CLAIM` runs is flagged ``imprecise``; use
     :data:`NULL_RUNS_PUBLICATION` for a final run.
 
+    On a panel, ``entities`` (and ``waves``) make each permutation swap whole
+    entity histories (:func:`_permuted`); ``groups`` holds out whole groups in
+    the form re-choice, as in :func:`sweep`.
+
     One fit per process: numpyro recompiles per call, so a serial loop pays the
     JAX compile n times over.
     """
@@ -1942,8 +1984,9 @@ def null_calibration(
             Ef = np.ascontiguousarray(np.asarray(form_E, dtype=np.float64))
             paths.append(_write_memmap(Ef, ".geofuse-null-form"))
             choice = (paths[1], Ef.shape, tuple(forms))
+        panel = (groups, entities, waves)
         tasks = [
-            (paths[0], E.shape, y, form, 3_000 + i, dict(fit_kwargs), choice)
+            (paths[0], E.shape, y, form, 3_000 + i, dict(fit_kwargs), choice, panel)
             for i in range(n)
         ]
         n_workers = workers or min(n, parallel.process_worker_count(n))

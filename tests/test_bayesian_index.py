@@ -1326,6 +1326,26 @@ class TestExposureResponseProjectionIsRankSafe(unittest.TestCase):
         np.testing.assert_allclose(r_dup, r_clean, atol=1e-10)
 
 
+class TestPanelPermutation(unittest.TestCase):
+    def test_rows_are_permuted_as_before_without_entities(self):
+        y = np.arange(50.0)
+        expected = np.random.default_rng(4).permutation(y)
+        np.testing.assert_array_equal(bi._permuted(y, 4), expected)
+
+    def test_whole_histories_move_between_entities_of_one_wave_pattern(self):
+        # Entities 0-2 have waves (1, 2); entities 3-4 only wave 1.
+        ent = np.array([0, 0, 1, 1, 2, 2, 3, 4])
+        wave = np.array([1, 2, 1, 2, 1, 2, 1, 1])
+        y = np.array([10.0, 11.0, 20.0, 21.0, 30.0, 31.0, 40.0, 50.0])
+        histories = {(10.0, 11.0), (20.0, 21.0), (30.0, 31.0)}
+        for seed in range(10):
+            out = bi._permuted(y, seed, ent, wave)
+            for e in range(3):
+                self.assertIn(tuple(out[ent == e]), histories)
+            self.assertEqual(sorted(out[ent >= 3]), [40.0, 50.0])
+            self.assertEqual(sorted(out), sorted(y))
+
+
 class TestGroupedInnerSplits(unittest.TestCase):
     def test_row_splits_are_unchanged_without_groups(self):
         expected = np.random.default_rng(7).random(500) < 0.25

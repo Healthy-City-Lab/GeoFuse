@@ -3332,6 +3332,13 @@ class MetricFusionEngine:
         groups = self._inner_split_groups(static)
         if groups is not None:
             groups = groups[prep_info["kept"]]
+        # A panel's null permutes whole entity histories, not rows.
+        entities = waves = None
+        eid = static.get("entity_id")
+        if getattr(self, "is_longitudinal", False) and eid is not None:
+            entities = np.asarray(eid)[prep_info["kept"]]
+            if static.get("wave") is not None:
+                waves = np.asarray(static["wave"])[prep_info["kept"]]
         tick()
 
         workers = parallel.process_worker_count()
@@ -3439,6 +3446,9 @@ class MetricFusionEngine:
                 reselect_form=null_reselect_form,
                 form_E=Xr.reshape(len(Xr), -1)[:, list(res.columns)],
                 forms=forms,
+                groups=groups,
+                entities=entities,
+                waves=waves,
                 **grid_kwargs,
             )
             if null_runs
