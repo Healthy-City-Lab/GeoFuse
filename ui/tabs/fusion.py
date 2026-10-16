@@ -2556,7 +2556,14 @@ _TERM_COLUMN_CONFIG = {
     "std_err": st.column_config.NumberColumn("SE", format="%.4f"),
     "t_stat": st.column_config.NumberColumn("t", format="%.2f"),
     "partial_r2": st.column_config.NumberColumn("partial R²", format="%.4f"),
+    "mde": st.column_config.NumberColumn("MDE", format="%.4f"),
 }
+
+_HELD_OUT_NOTE = (
+    "Coefficients use every row; SE, t, p and the minimum detectable effect "
+    "(MDE, 2.8 held-out SEs) come from the {n} held-out rows, which took no "
+    "part in choosing the composite."
+)
 
 _DECLINE_TERM_LABELS = {
     "overall": "Greenspace × time (overall)",
@@ -2589,6 +2596,7 @@ def _render_decline_terms(results_view: dict) -> None:
                 "std_err": term.get("std_err"),
                 "t_stat": term.get("t_stat"),
                 "p": term.get("p_display"),
+                "mde": term.get("mde"),
                 "direction": term.get("direction"),
             }
         )
@@ -2598,6 +2606,7 @@ def _render_decline_terms(results_view: dict) -> None:
         hide_index=True,
         column_config=_TERM_COLUMN_CONFIG,
     )
+    st.caption(_HELD_OUT_NOTE.format(n=dt.get("inference_n") or "—"))
     if dt.get("within_estimable") is False:
         st.caption(
             "_Within-person term not estimable — the greenspace exposure does "
@@ -2798,8 +2807,8 @@ def _render_covariate_impact(results_view: dict, metric_name: str) -> None:
         )
     st.caption(
         f"Sample size: n = {impact.get('n', 0)} · CGI coefficient = "
-        f"{impact.get('cgi_coef', 0):.4f} "
-        f"(SE = {impact.get('cgi_std_err', 0):.4f})"
+        f"{_fmt(impact.get('cgi_coef'), 4)} "
+        f"(held-out SE = {_fmt(impact.get('cgi_std_err'), 4)})"
     )
 
     rows = impact.get("per_covariate") or []
@@ -2810,11 +2819,15 @@ def _render_covariate_impact(results_view: dict, metric_name: str) -> None:
     if "p_display" not in df.columns:
         df["p_display"] = df["pvalue"].map(_mes.format_pvalue)
     df = df.rename(columns={"p_display": "p"})
-    df = df[["covariate", "direction", "coef", "std_err", "t_stat", "p", "partial_r2"]]
+    if "mde" not in df.columns:
+        df["mde"] = None
+    shown = ["covariate", "direction", "coef", "std_err", "t_stat", "p", "mde"]
+    df = df[shown + ["partial_r2"]]
     df = df.sort_values("partial_r2", ascending=False).reset_index(drop=True)
     st.dataframe(
         df, width="stretch", hide_index=True, column_config=_TERM_COLUMN_CONFIG
     )
+    st.caption(_HELD_OUT_NOTE.format(n=impact.get("inference_n") or "—"))
 
     try:
         import plotly.express as _px
