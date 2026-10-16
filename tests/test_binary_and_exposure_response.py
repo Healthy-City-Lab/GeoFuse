@@ -511,6 +511,24 @@ class TestScaleInvariance(unittest.TestCase):
                 msg=f"coef moved at scale {scale:g}",
             )
 
+    def test_plain_logit_is_invariant_to_covariate_units(self):
+        rng = np.random.default_rng(8)
+        n = 3000
+        cov = rng.normal(size=(n, 2))
+        g = rng.normal(size=n)
+        eta = -0.2 + 0.4 * g + cov @ np.array([0.3, -0.2])
+        y = (rng.uniform(size=n) < 1.0 / (1.0 + np.exp(-eta))).astype(float)
+        base = osc.score("logit_tstat", y, g, cov)
+        for scale in (1e6, 1e12):
+            rescaled = cov.copy()
+            rescaled[:, 0] *= scale
+            self.assertAlmostEqual(
+                osc.score("logit_tstat", y, g, rescaled),
+                base,
+                places=6,
+                msg=f"|z| moved at scale {scale:g}",
+            )
+
     def test_fast_scorer_is_invariant_to_covariate_units(self):
         y, g, eid, cov = make_panel(n_entities=800, seed=1, beta_g=0.30)
         baseline = bl.estimate_fold_baseline(y, eid, cov)
