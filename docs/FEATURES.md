@@ -235,12 +235,24 @@ Nothing below is pre-specified.
   statistically indistinguishable configurations. A Bayesian fit over the whole
   grid then estimates the radius profile, the aggregator blend, the weights and
   the effect together, so the effect's interval carries the uncertainty about
-  scale and aggregation instead of conditioning on a pick.
+  scale and aggregation instead of conditioning on a pick. Inner splits hold
+  out whole spatial blocks when the test set is spatially blocked, and whole
+  entities on a panel, so no block's neighbours and no person's other waves sit
+  on both sides of a split.
 - **A held-out test set is the headline.** A fraction of the data, 25 % by
   default, is never touched during tuning. The winning configuration is scored
   on it once, with a percentile bootstrap interval and a permutation p-value
   (Freedman-Lane when covariates are controlled). Whole-data figures are shown
   only as descriptive and carry no p-value.
+- **Effects are estimated on all rows and tested on held-out ones.** The
+  per-IQR effect, quantile gradient, spline curve, moderation slopes, decline
+  terms, covariate table and the paired CGI-versus-channel difference report
+  their estimates from every row, as descriptive figures, and their standard
+  errors, intervals and p-values from the held-out rows, which never chose the
+  composite. Each row also carries the held-out estimate and the minimum
+  detectable effect, 2.8 held-out standard errors (80 % power at a two-sided
+  5 % level), so a null held-out result can be read against the effect size
+  the test split could have detected.
 - **Reproducibility is measured, not assumed.** The whole discovery is repeated
   on independent reshuffles and the report says how often it landed on the same
   configuration. A low share means the surface is flat, not that the pick is
@@ -251,14 +263,23 @@ Nothing below is pre-specified.
   Inside the reproducibility and gain checks, each split chooses its form on
   inner splits of its own training rows.
 - **Fusion has to earn itself.** The composite is compared against each channel
-  alone under the identical sweep, with a permutation null on the gain. Both
-  sides make their choices on training rows, and the permuted runs repeat them.
+  alone under the identical sweep, on the same held-out rows of every split.
+  Both sides make their choices on training rows. The gain is tested with the
+  corrected resampled t-test (Nadeau & Bengio 2003): the splits share most of
+  their training rows, so the variance of the per-split gains is inflated by
+  1/S + n_test/n_train before a one-sided t on S − 1 degrees of freedom.
 - **Calibration is checked.** The procedure is re-run on permuted outcomes; the
   reported false-positive rate should sit near 5 %, and the panel says so when
   it does not. The rate carries an exact (Clopper-Pearson) interval, and fewer
   than 100 refits is flagged as too imprecise for a calibration claim: 0 of 16
   is still compatible with a true rate of 20 %. An engine option re-chooses the
-  form on every permuted outcome, so the rate covers that choice too.
+  form on every permuted outcome, so the rate covers that choice too. On a
+  panel, each permutation swaps whole entity histories between entities with
+  the same pattern of waves, so the null keeps the within-person correlation.
+- **Repeated measures count once.** On a panel the posterior carries a random
+  intercept per entity, integrated out exactly, so one person's waves do not
+  narrow the interval on the effect as if they were independent people; the
+  exposure-response and moderation fits use entity-clustered standard errors.
 - **Recovery is measured on your own data.** A plasmode module
   (`geofuse.validation`, or `MetricFusionEngine.plasmode_recovery`) keeps the
   real exposure tensor and covariates, plants a known index into a simulated
@@ -282,7 +303,9 @@ Nothing below is pre-specified.
   many directions were redundant.
 - Optional spatial-confounding adjustment (KS-AIC or Spatial+) and spatial block
   cross-validation, so geographic autocorrelation cannot inflate scores.
-- Optional collinearity check that drops redundant channels before a run.
+- Optional collinearity check on the study's own channels (GVI as the sum of
+  its components) that reports the channels above a VIF threshold, and
+  optionally leaves them out of the search.
 - **Negative-control outcomes.** Held-out scoring guards against chance, not
   confounding. Name an outcome that shares the target's confounders but has no
   causal path from greenery, and the finished composite, frozen as tuned, is

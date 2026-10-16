@@ -139,6 +139,17 @@ those same rows, so an in-sample p-value would look significant because it was
 tuned to, not because the effect generalises. Read `test` for the honest result
 and `all` only as a descriptive summary.
 
+**Effect tables test on the held-out rows.** In `exposure_response.csv`,
+`moderation.csv`, `decline_terms.csv` and `covariate_impact.csv`, and in the
+paired CGI-versus-channel difference, the estimates use every row and are
+descriptive; standard errors, intervals and p-values come from the held-out
+rows. `test_estimate` is the held-out estimate the interval belongs to,
+`test_n` the rows it rests on and `mde` the minimum detectable effect, 2.8
+held-out standard errors.
+
+**`gain_p` in `discovery.csv`** is the corrected resampled t-test of a positive
+mean gain over the best single channel across the held-out splits.
+
 **A failed fit is reported empty, never as `0.0`.** A mixed model that did not
 converge records `test_ci.status = "fit_failed"` with a null score, so a genuine
 null is never confused with a model that never fit.
