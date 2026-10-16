@@ -322,7 +322,6 @@ FUSION: dict[str, Setting] = {
     "discovery_reps": _int(5, 0, 50, "Independent repeats of the discovery."),
     "discovery_shuffles": _int(12, 1, 100, "Shuffles per discovery repeat."),
     "gain_splits": _int(20, 0, 100, "Splits comparing composite and standalones."),
-    "gain_permutations": _int(100, 0, 1000, "Permutations of the gain null."),
     "null_calibration_runs": _int(16, 0, 1000, "Permuted-outcome refits."),
     "posterior_draws": _int(800, 100, 4000, "Posterior draws per chain."),
     "posterior_warmup": _int(None, 100, 4000, "Warm-up draws; none = as many."),

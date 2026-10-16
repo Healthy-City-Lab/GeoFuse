@@ -949,7 +949,6 @@ def fusion_run_config(spec: JobSpec) -> dict[str, Any]:
         "discovery_reps": int(s["discovery_reps"]),
         "discovery_shuffles": int(s["discovery_shuffles"]),
         "gain_splits": int(s["gain_splits"]),
-        "gain_permutations": int(s["gain_permutations"]),
         "null_calibration_runs": int(s["null_calibration_runs"]),
         "posterior_draws": int(s["posterior_draws"]),
         "posterior_warmup": int(s["posterior_warmup"] or s["posterior_draws"]),
