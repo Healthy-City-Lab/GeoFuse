@@ -369,7 +369,10 @@ def synergy_terms(values, xp=np) -> list:
         prod = pos[combo[0]]
         for i in combo[1:]:
             prod = prod * pos[i]
-        out.append(prod ** (1.0 / len(combo)))
+        # The root's slope is infinite at 0; the inner ``where`` keeps a
+        # gradient taken through it finite.
+        safe = xp.where(prod > 0, prod, 1.0)
+        out.append(xp.where(prod > 0, safe ** (1.0 / len(combo)), 0.0))
     return out
 
 
@@ -604,8 +607,8 @@ def formula_channels(name: str) -> tuple[str, ...]:
 # is a job input; the form is picked from held-out data, so the run has to be
 # able to move between the two names that share its channels.
 _FORM_VARIANTS: dict[tuple[str, ...], dict[str, str]] = {
-    ("ndvi", "veg", "terrain"): {"linear": WEIGHTED_AVERAGE, "synergy": SYNERGY},
-    _GVI_CHANNELS: {"linear": WEIGHTED_AVERAGE_GVI, "synergy": SYNERGY_GVI},
+    ("ndvi", "veg", "terrain"): {"linear": WEIGHTED_AVERAGE, "synergy": SYNERGY_GM},
+    _GVI_CHANNELS: {"linear": WEIGHTED_AVERAGE_GVI, "synergy": SYNERGY_GM_GVI},
 }
 
 

@@ -222,7 +222,7 @@ class TestWeightsAreOnePerChannel(unittest.TestCase):
         # Channel 0 is the stronger association (-1.2 against +0.9) and it is
         # protective, so a direction-free fit keeps it and drops channel 1.
         E, y = self._two_channels(1.0)
-        _, params = bi.build_index(E, y, "linear")
+        _, params = bi.build_index(E, y)
         w = np.asarray(params["weights"])
         self.assertEqual(len(w), E.shape[1])
         self.assertAlmostEqual(float(w.sum()), 1.0, places=9)
@@ -231,12 +231,12 @@ class TestWeightsAreOnePerChannel(unittest.TestCase):
 
     def test_the_index_still_matches_the_weights_it_reports(self):
         E, y = self._two_channels(1.0)
-        apply_fn, params = bi.build_index(E, y, "linear")
+        apply_fn, params = bi.build_index(E, y)
         self.assertTrue(np.allclose(apply_fn(E), E @ np.asarray(params["weights"])))
 
     def test_fits_with_different_active_sets_stack(self):
         rows = [
-            np.asarray(bi.build_index(*self._two_channels(s), "linear")[1]["weights"])
+            np.asarray(bi.build_index(*self._two_channels(s))[1]["weights"])
             for s in (1.0, -1.0, 1.0, -1.0)
         ]
         self.assertEqual(np.asarray(rows).shape, (4, 2))
@@ -608,7 +608,6 @@ class TestCollinearAggregatorsDoNotManufactureAPick(unittest.TestCase):
         return bi.IndexPosterior(
             weights=np.full((n, 1), 1.0),
             beta=np.zeros(n),
-            powers=None,
             channels=("a",),
             picked=(),
             form="linear",
@@ -701,7 +700,7 @@ class TestPartialCoverageDoesNotPoisonTheReport(unittest.TestCase):
         rng = np.random.default_rng(6)
         E = rng.normal(size=(300, 2))
         y = 1.5 * E[:, 0] + 0.05 * rng.normal(size=300)
-        apply_fn, params = bi.build_index(E, y, "linear")
+        apply_fn, params = bi.build_index(E, y)
         self.assertAlmostEqual(float(np.asarray(params["weights"])[1]), 0.0, places=9)
         E_gap = E.copy()
         E_gap[:4, 1] = np.nan
@@ -917,23 +916,24 @@ class TestHonestFormSelection(unittest.TestCase):
 
     @staticmethod
     def _cube(truth, n=1500, seed=0):
-        """Linear truth on z-scored channels; synergy truth inside its family.
+        """Linear truth on the channels; synergy truth inside its family.
 
-        The synergy form works on each channel's approximate percentile, so its
-        truth is built the same way: a pair-weighted product of two percentiles.
+        The synergy form's interaction is the geometric mean of the raw
+        channels, so its truth is one: mostly the interaction of two positive
+        channels. Returns ``(Xr, yr, design)``.
         """
         rng = np.random.default_rng(seed)
-        X = rng.normal(size=(n, 2, 1, 1))
+        X = rng.lognormal(-1.0, 0.6, size=(n, 2, 1, 1))
+        a, b = X[:, 0, 0, 0], X[:, 1, 0, 0]
         if truth == "synergy":
-            t = bi.SynergyFit(
-                np.array([0.1, 0.1, 0.8]), np.ones(2), np.zeros(2), np.ones(2)
-            ).apply(X[:, :, 0, 0])
+            t = 0.1 * a / a.std() + 0.1 * b / b.std() + 0.8 * np.sqrt(a * b)
             y = 0.8 * (t - t.mean()) / t.std() + rng.normal(size=n)
         else:
-            y = 0.25 * X[:, 0, 0, 0] + 0.25 * X[:, 1, 0, 0] + rng.normal(size=n)
-        return bi.prep(X, y, None)[::-1]
+            y = 0.25 * a / a.std() + 0.25 * b / b.std() + rng.normal(size=n)
+        yr, Xr = bi.prep(X, y, None)
+        return Xr, yr, bi.SynergyDesign.build(X)
 
-    def _sweep(self, Xr, yr, **kw):
+    def _sweep(self, Xr, yr, design, **kw):
         return bi.sweep(
             Xr,
             np.array([500.0]),
@@ -943,12 +943,13 @@ class TestHonestFormSelection(unittest.TestCase):
             channel_index=(0, 1),
             splits=8,
             workers=1,
+            design=design,
             **kw,
         )
 
     def test_a_null_outcome_shows_no_systematic_gain(self):
         rng = np.random.default_rng(21)
-        X = rng.normal(size=(800, 2, 2, 2))
+        X = rng.lognormal(size=(800, 2, 2, 2))
         yr, Xr = bi.prep(X, rng.normal(size=800), None)
         gain = bi.holdout_gain(
             Xr,
@@ -957,6 +958,7 @@ class TestHonestFormSelection(unittest.TestCase):
             channel_index=(0, 1),
             splits=30,
             workers=1,
+            design=bi.SynergyDesign.build(X),
         )
         self.assertLess(abs(gain["gain"]), 0.5)
         self.assertGreater(gain["gain_p"], 0.01)
@@ -987,8 +989,20 @@ class TestHonestFormSelection(unittest.TestCase):
         self.assertEqual(bi.eligible_forms(("synergy",), 1), ("linear",))
         self.assertEqual(bi.eligible_forms(bi.FORMS, 2), bi.FORMS)
 
+    def test_synergy_needs_the_raw_cell_values(self):
+        self.assertEqual(bi.eligible_forms(bi.FORMS, 2, False), ("linear",))
+        Xr, yr, _ = self._cube("synergy")
+        self.assertEqual(self._sweep(Xr, yr, None).form, "linear")
+
+    def test_the_main_terms_are_the_tensor_columns(self):
+        Xr, _, design = self._cube("synergy")
+        T, sd = design.columns((0, 1))
+        np.testing.assert_allclose(T[:, :2], Xr.reshape(len(Xr), -1), atol=1e-9)
+        self.assertEqual(T.shape[1], 3)
+        self.assertTrue((sd > 0).all())
+
     def test_discovery_chooses_on_training_rows(self):
-        Xr, yr = self._cube("synergy", n=1200)
+        Xr, yr, design = self._cube("synergy", n=1200)
         out = bi.repeated_discovery(
             Xr,
             np.array([500.0]),
@@ -999,16 +1013,18 @@ class TestHonestFormSelection(unittest.TestCase):
             reps=1,
             shuffles=4,
             workers=1,
+            design=design,
         )
         self.assertEqual(sum(out["form_counts"].values()), out["n_results"])
         self.assertGreaterEqual(out["form_counts"]["synergy"], 3)
         self.assertTrue(np.isfinite(out["chosen_test_t"]))
 
     def test_choose_form_breaks_ties_towards_the_first_form(self):
-        Xr, yr = self._cube("linear")
+        Xr, yr, _ = self._cube("linear")
         E = Xr.reshape(len(Xr), -1)
-        form, scores = bi.choose_form(E, yr, ("linear",), seed=0)
-        self.assertEqual((form, scores), ("linear", {}))
+        self.assertEqual(bi.choose_form({"linear": E}, yr, seed=0), ("linear", {}))
+        form, _ = bi.choose_form({"linear": E, "synergy": E}, yr, seed=0)
+        self.assertEqual(form, "linear")
 
 
 class TestDistanceDecay(unittest.TestCase):
@@ -1100,7 +1116,6 @@ class TestDistanceDecay(unittest.TestCase):
         post = bi.IndexPosterior(
             weights=rng.dirichlet(np.ones(2), size=draws),
             beta=rng.normal(size=draws),
-            powers=None,
             channels=("ndvi", "gvi"),
             picked=((300, "mean"),) * 2,
             form="linear",
@@ -1129,46 +1144,19 @@ class TestDistanceDecay(unittest.TestCase):
         self.assertGreater(info["column_sd"][0, 1, 0], 2.5 * info["column_sd"][0, 0, 0])
 
 
-class TestPercentileScaling(unittest.TestCase):
-    """The synergy form reads each channel as an approximate percentile."""
-
-    def test_it_is_the_log_normal_cdf_of_the_standardised_value(self):
-        from scipy.stats import norm
-
-        x = np.array([[-1.0, 2.0], [0.5, 4.0]])
-        got = bi.percentile_scale(x, np.array([0.0, 2.0]), np.array([1.0, 2.0]))
-        want = norm.logcdf((x - [0.0, 2.0]) / [1.0, 2.0])
-        np.testing.assert_allclose(got, want, rtol=1e-12)
-
-    def test_far_below_the_mean_stays_finite_and_above_zero(self):
-        logz = bi.percentile_scale(np.array([[-60.0]]), 0.0, 1.0)
-        self.assertTrue(np.isfinite(logz).all())
-        self.assertGreater(float(np.exp(logz * 0.2)[0, 0]), 0.0)
-
-    def test_a_held_out_row_beyond_the_training_range_is_not_clipped(self):
-        rng = np.random.default_rng(0)
-        E = rng.normal(size=(200, 2))
-        y = E[:, 0] * E[:, 1] + rng.normal(size=200)
-        sf = bi.fit_synergy(E, y)
-        np.testing.assert_allclose(sf.center, E.mean(0))
-        top = np.array([[E[:, 0].max(), 0.0], [E[:, 0].max() + 3.0, 0.0]])
-        out = sf.apply(top)
-        self.assertNotEqual(out[0], out[1])
-
-
 class TestSynergyPosteriorSamples(unittest.TestCase):
     """The synergy grid fit must sample, not freeze or diverge.
 
-    The grid model's channel exposure moves with the kernel and aggregator. Hard
-    min-max bounds jumped between entities as it moved and put each minimum at
-    z = 0, where ``z ** p`` has an infinite slope; percentile scaling is smooth
-    in both respects.
+    Its interactions move with the kernel and aggregator, and a geometric mean
+    has an infinite slope where a clipped channel reaches 0; the channels here
+    are centred on 0, so half of every interaction sits on that edge.
     """
 
     def test_single_short_chains_recover_the_linear_fits_effect(self):
         rng = np.random.default_rng(0)
         n = 800
         X = rng.normal(size=(n, 2, len(RADII), len(STATS)))
+        design = bi.SynergyDesign.build(X)
         y = 0.23 * X[:, 0, 1, 0] + rng.normal(size=n)
         yr, Xr = bi.prep(X, y, None)
         lin = bi.fit(
@@ -1194,6 +1182,8 @@ class TestSynergyPosteriorSamples(unittest.TestCase):
                 warmup=200,
                 chains=1,
                 seed=seed,
+                design=design,
+                design_channels=(0, 1),
             )
             beta = np.asarray(m.get_samples()["beta"])
             self.assertGreater(float(beta.std()), 0.01, f"seed {seed} froze")
@@ -1215,8 +1205,16 @@ class TestSynergyPosteriorSamples(unittest.TestCase):
             warmup=300,
             chains=2,
             seed=1,
+            design=bi.SynergyDesign.build(X),
+            design_channels=(0, 1),
         )
         self.assertLess(int(np.sum(m.get_extra_fields()["diverging"])), 10)
+
+    def test_it_refuses_to_run_without_the_raw_cell_values(self):
+        rng = np.random.default_rng(0)
+        _, Xr = bi.prep(rng.normal(size=(50, 2, 2, 1)), rng.normal(size=50), None)
+        with self.assertRaises(ValueError):
+            bi.fit(Xr, rng.normal(size=50), form="synergy", radii=RADII[:2])
 
 
 class _StubMCMC:
@@ -1292,13 +1290,14 @@ class TestNullCalibrationPrecision(unittest.TestCase):
 
     def test_reselection_varies_the_form_across_null_permutations(self):
         Xr, yr = self._null_grid()
+        E = Xr.reshape(len(Xr), -1)
         out = bi.null_calibration(
             Xr,
             yr,
             n=16,
             workers=1,
             reselect_form=True,
-            form_E=Xr.reshape(len(Xr), -1),
+            form_E={"linear": E, "synergy": np.column_stack([E, E[:, 0] * E[:, 1]])},
         )
         self.assertEqual(sum(out["form_counts"].values()), 16)
         self.assertGreater(min(out["form_counts"].values()), 0, out["form_counts"])

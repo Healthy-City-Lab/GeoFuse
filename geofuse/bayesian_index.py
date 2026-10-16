@@ -23,6 +23,14 @@ declares a direction; the sign lives in ``beta``, which the posterior estimates
 freely, and the simplex weights stay non-negative so an index always reads as
 "more exposure, larger index".
 
+The synergy form adds to the channels the geometric mean of every channel pair
+and of the triple (:func:`geofuse.cgi_formulas.synergy_terms`). Those terms are
+defined on each cell's raw channel values, so they are built from a
+:class:`SynergyDesign` — the raw cell values and the exposure rows that average
+them — and then residualised and standardised like every other column. Each
+form is then the same closed-form simplex fit over its own columns, so the
+linear form is the synergy form with its interaction weights at 0.
+
 :func:`repeated_discovery` runs the sweep over independent train/test shuffles,
 because one split cannot show that a discovery generalises.
 
@@ -40,21 +48,19 @@ import logging
 import math
 import os
 import tempfile
+import weakref
 from dataclasses import dataclass, field
 
 import numpy as np
-from scipy.optimize import minimize
 
 from geofuse import JobCancelled
 
 from . import parallel
+from .cgi_formulas import synergy_combos, synergy_terms
 
 logger = logging.getLogger(__name__)
 
 FORMS: tuple[str, ...] = ("linear", "synergy")
-
-# Powers on the main terms of the synergy form, as in the source paper's range.
-_POWER_LO, _POWER_HI = 0.2, 1.0
 
 # Form choice runs on inner splits of the rows it is given, on a seed stream
 # offset from the outer splits so the two never share a partition.
@@ -255,10 +261,6 @@ def _map(fn, tasks, n_workers: int, cancel_check=None):
     return out
 
 
-def _pairs(k: int) -> list[tuple[int, int]]:
-    return [(i, j) for i in range(k) for j in range(i + 1, k)]
-
-
 def _holdout(n: int, seed: int, frac: float, groups=None) -> np.ndarray:
     """Held-out row mask for one inner split.
 
@@ -340,82 +342,109 @@ def simplex_fit(gram: np.ndarray, xty: np.ndarray):
 # ────────────────────────────────────────────────────────────────────
 
 
-def percentile_scale(E, center, scale) -> np.ndarray:
-    """``log Φ((E − center) / scale)``: each channel as an approximate percentile.
-
-    The synergy form needs channel values in (0, 1) for its powers. A channel
-    standardised by its mean and SD and passed through the normal CDF lands
-    there with no clipping, its extremes near 0 and 1, and a smooth dependence
-    on everything upstream — unlike min-max bounds, which are set by a single
-    entity each. Returned on the log scale, where the powers are a product and
-    a value far below the mean cannot round to exactly 0.
-    """
-    from scipy.special import log_ndtr
-
-    return log_ndtr(
-        (np.asarray(E, dtype=np.float64) - center) / np.maximum(scale, 1e-12)
-    )
-
-
 @dataclass
-class SynergyFit:
-    """Weights, powers and the train-fold mean / SD that rebuild the index."""
+class SynergyDesign:
+    """The raw cell values the synergy form's terms are built from.
 
-    w: np.ndarray
-    p: np.ndarray
-    center: np.ndarray
-    scale: np.ndarray
+    The geometric-mean interactions are defined on each cell's raw channel
+    values, so they cannot be formed from the residualised, standardised
+    tensor the rest of the index works on. ``path`` holds a float64 memmap of
+    the raw values, one row per flat ``(channel, radius, stat)`` column of the
+    tensor and one column per cell (``shape`` is ``(n_cells, channel, radius,
+    stat)``); exposure row ``k`` adds cell ``row_cell[k]`` with weight
+    ``row_weight[k]`` to tensor row ``row_entity[k]``. ``basis`` is the
+    covariate basis the tensor and the outcome were residualised on.
 
-    def apply(self, E: np.ndarray) -> np.ndarray:
-        logz = percentile_scale(E, self.center, self.scale)
-        nc = logz.shape[1]
-        out = np.exp(logz * self.p) @ self.w[:nc]
-        for k, (i, j) in enumerate(_pairs(nc)):
-            out = out + self.w[nc + k] * np.exp(logz[:, i] + logz[:, j])
-        return out
-
-
-def fit_synergy(E: np.ndarray, y: np.ndarray, restarts: int = 2) -> SynergyFit:
-    """Simplex weights over mains + pairwise interactions, plus main powers.
-
-    Each channel enters as its approximate percentile (:func:`percentile_scale`)
-    with the mean and SD taken on the training fold, so a held-out row is
-    scaled by the same curve and never clipped.
+    Only the path travels to worker processes, so the cells are never copied
+    per task; the file is removed with the design that built it.
     """
-    nc = E.shape[1]
-    nw = nc + len(_pairs(nc))
-    center, scale = E.mean(0), E.std(0)
 
-    def unpack(th):
-        ex = np.exp(th[:nw] - th[:nw].max())
-        w = ex / ex.sum()
-        p = _POWER_LO + (_POWER_HI - _POWER_LO) / (1.0 + np.exp(-th[nw : nw + nc]))
-        return w, p
+    path: str
+    shape: tuple
+    row_cell: np.ndarray
+    row_entity: np.ndarray
+    row_weight: np.ndarray
+    basis: np.ndarray
 
-    def neg(th):
-        w, p = unpack(th)
-        e = SynergyFit(w, p, center, scale).apply(E)
-        s = e.std()
-        if s < 1e-12:
-            return 1e9
-        e = (e - e.mean()) / s
-        b = float(e @ y / (e @ e))
-        return float(np.sum((y - b * e) ** 2))
+    @classmethod
+    def build(cls, cells, covariates=None, rows=None) -> "SynergyDesign":
+        """From ``(n_cells, channel, radius, stat)`` raw values.
 
-    best = None
-    for seed in range(restarts):
-        rng = np.random.default_rng(seed)
-        th0 = np.concatenate([rng.normal(0.0, 0.3, nw), np.zeros(nc)])
-        r = minimize(
-            neg,
-            th0,
-            method="Powell",
-            options={"maxiter": 40000, "xtol": 1e-4, "ftol": 1e-9},
+        ``rows`` is ``(row_cell, row_entity, row_weight)``; without it each
+        cell is one tensor row, in order.
+        """
+        cells = np.asarray(cells, dtype=np.float64)
+        n_cells = len(cells)
+        if rows is None:
+            idx = np.arange(n_cells)
+            rows = (idx, idx, np.ones(n_cells))
+        row_cell, row_entity, row_weight = (np.asarray(r) for r in rows)
+        n = int(row_entity.max()) + 1 if row_entity.size else 0
+        q, _ = covariate_basis(covariates, n)
+        flat = np.ascontiguousarray(cells.reshape(n_cells, -1).T)
+        design = cls(
+            _write_memmap(flat, ".geofuse-synergy"),
+            tuple(cells.shape),
+            row_cell.astype(np.int64),
+            row_entity.astype(np.int64),
+            row_weight.astype(np.float64),
+            q,
         )
-        if best is None or r.fun < best.fun:
-            best = r
-    w, p = unpack(best.x)
-    return SynergyFit(w, p, center, scale)
+        weakref.finalize(design, _unlink, design.path)
+        return design
+
+    def _cols(self) -> np.ndarray:
+        n_cells = self.shape[0]
+        n_cols = int(np.prod(self.shape[1:]))
+        return np.memmap(self.path, dtype=np.float64, mode="r", shape=(n_cols, n_cells))
+
+    def grid(self, channel_index) -> np.ndarray:
+        """``(n_cells, channel, radius, stat)`` raw values of the given channels."""
+        _, nc, nr, ns = self.shape
+        g = self._cols().reshape(nc, nr, ns, -1)[list(channel_index)]
+        return np.ascontiguousarray(np.moveaxis(g, -1, 0))
+
+    def collapse(self, t) -> np.ndarray:
+        """Exposure-weighted mean of a per-cell value for every tensor row."""
+        v = np.asarray(t, dtype=np.float64)[self.row_cell]
+        ok = np.isfinite(v)
+        n = self.basis.shape[0]
+        e, w = self.row_entity[ok], self.row_weight[ok]
+        den = np.bincount(e, weights=w, minlength=n)
+        num = np.bincount(e, weights=w * v[ok], minlength=n)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            return num / den
+
+    def columns(self, columns) -> tuple[np.ndarray, np.ndarray]:
+        """Term columns at one flat tensor column per channel, and their SDs.
+
+        Each term is formed per cell, averaged over the exposure rows,
+        residualised on the covariates and standardised; the SDs are those of
+        the residualised raw terms, which carry a weight back to the raw scale.
+        """
+        cols = self._cols()
+        vals = [np.asarray(cols[int(c)]) for c in columns]
+        T = np.column_stack([self.collapse(t) for t in synergy_terms(vals)])
+        T = T - self.basis @ (self.basis.T @ T)
+        sd = T.std(0)
+        return (T - T.mean(0)) / (sd + 1e-12), sd
+
+
+def interaction_columns(raw, k, a, collapse, basis, xp=np):
+    """The synergy form's interaction columns for a radius and aggregator blend.
+
+    ``raw`` is ``(n_cells, channel, radius, stat)``, ``k`` the per-channel rung
+    weights and ``a`` the per-channel statistic weights. Each channel is blended
+    per cell, the geometric-mean terms formed per cell and averaged by
+    ``collapse``, then residualised on ``basis`` and standardised. ``xp`` is
+    ``numpy`` or ``jax.numpy``.
+    """
+    x = xp.einsum("mcrs,cr,cs->mc", raw, k, a)
+    nc = x.shape[1]
+    terms = synergy_terms([x[:, i] for i in range(nc)], xp)[nc:]
+    T = xp.stack([collapse(t) for t in terms], axis=1)
+    T = T - basis @ (basis.T @ T)
+    return (T - T.mean(0)) / xp.maximum(T.std(0), 1e-9)
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -509,15 +538,16 @@ def sweep(
     rescore_top=50,
     cancel_check=None,
     groups=None,
+    design=None,
 ):
     """Exhaustive grid over (radius, stat) per channel, then over the form.
 
     The linear grid is solved in closed form and swept exhaustively. Every
     requested form is then scored at the linear pick's columns on a fresh set
-    of splits and the best one is kept; a full synergy grid would need the Gram
-    matrix rebuilt per power combination for no measured benefit. ``score`` is
-    the chosen form's fresh-split score, ``selection_score`` the grid maximum
-    the columns were picked on.
+    of splits and the best one is kept. ``score`` is the chosen form's
+    fresh-split score, ``selection_score`` the grid maximum the columns were
+    picked on. The synergy form needs ``design`` (:class:`SynergyDesign`) and
+    is skipped without it.
 
     ``objective`` makes the job's own metric decide the winner. The Gram sweep
     ranks every candidate by a correlation t, which is what makes an exhaustive
@@ -609,13 +639,13 @@ def sweep(
     # Form selection at the picked columns, every form scored on fresh splits.
     # The grid winner's own score is a maximum over every combination on the
     # selection splits, so it cannot be compared with a form scored once.
-    candidates = eligible_forms(forms, len(channels))
+    candidates = eligible_forms(forms, len(channels), design is not None)
+    form_E = form_columns(candidates, flat, combos[best], design)
     form_scores = {}
     for form in candidates:
         form_scores[form] = _score_form_at(
-            flat[:, list(combos[best])],
+            form_E[form],
             y,
-            form,
             splits=splits,
             frac=frac,
             seed=seed + _FORM_SEED_OFFSET,
@@ -682,35 +712,30 @@ def _rescore(
     return out
 
 
-def _form_split_objective(E, y, form, seed, frac, objective, groups=None):
+def _form_split_objective(E, y, seed, frac, objective, groups=None):
     te = _holdout(len(y), seed, frac, groups)
     tr = ~te
-    if form == "linear":
-        fit = simplex_fit(E[tr].T @ E[tr], E[tr].T @ y[tr])
-        if fit is None:
-            return 0.0
-        sub, w = fit
-        return float(objective(E[te][:, sub] @ w, y[te]))
-    return float(objective(fit_synergy(E[tr], y[tr]).apply(E[te]), y[te]))
+    fit = simplex_fit(E[tr].T @ E[tr], E[tr].T @ y[tr])
+    if fit is None:
+        return 0.0
+    sub, w = fit
+    return float(objective(E[te][:, sub] @ w, y[te]))
 
 
 def _form_split(task):
-    E, y, form, seed, frac, groups = task
+    E, y, seed, frac, groups = task
     te = _holdout(len(y), seed, frac, groups)
     tr = ~te
-    if form == "linear":
-        fit = simplex_fit(E[tr].T @ E[tr], E[tr].T @ y[tr])
-        if fit is None:
-            return 0.0
-        sub, w = fit
-        return _tstat(E[te][:, sub] @ w, y[te])
-    return _tstat(fit_synergy(E[tr], y[tr]).apply(E[te]), y[te])
+    fit = simplex_fit(E[tr].T @ E[tr], E[tr].T @ y[tr])
+    if fit is None:
+        return 0.0
+    sub, w = fit
+    return _tstat(E[te][:, sub] @ w, y[te])
 
 
 def _score_form_at(
     E,
     y,
-    form,
     *,
     splits,
     frac,
@@ -720,45 +745,56 @@ def _score_form_at(
     cancel_check=None,
     groups=None,
 ):
+    """Mean held-out score of the simplex fit over one form's columns ``E``."""
     if objective is not None:
         scores = []
         for s in range(splits):
             _raise_if_cancelled(cancel_check)
             scores.append(
-                _form_split_objective(E, y, form, seed + s, frac, objective, groups)
+                _form_split_objective(E, y, seed + s, frac, objective, groups)
             )
         return float(np.mean(scores))
-    tasks = [(E, y, form, seed + s, frac, groups) for s in range(splits)]
+    tasks = [(E, y, seed + s, frac, groups) for s in range(splits)]
     n_workers = workers or parallel.process_worker_count(len(tasks))
     return float(np.mean(_map(_form_split, tasks, n_workers, cancel_check)))
 
 
-def eligible_forms(forms, n_channels: int) -> tuple[str, ...]:
-    """The requested forms that apply to ``n_channels``, in request order.
+def eligible_forms(forms, n_channels: int, has_terms: bool = True) -> tuple[str, ...]:
+    """The requested forms that apply, in request order.
 
-    Synergy needs at least two channels to have a pair term; a single channel
-    is always linear.
+    Synergy needs at least two channels to have an interaction, and the raw
+    cell values its terms are built from (``has_terms``); otherwise the study
+    is linear.
     """
-    out = tuple(f for f in forms if f == "linear" or n_channels > 1)
+    out = tuple(
+        f for f in forms if f == "linear" or (n_channels > 1 and has_terms)
+    )
     return out or ("linear",)
 
 
-def choose_form(
-    E, y, forms, *, seed, splits=_FORM_INNER_SPLITS, frac=0.25, groups=None
-):
-    """The form with the best mean held-out |t| on inner splits of ``E, y``.
+def form_columns(forms, flat, combo, design=None) -> dict:
+    """Each form's columns at one candidate: the tensor's, plus synergy's terms."""
+    out = {"linear": np.asarray(flat[:, list(combo)])}
+    if "synergy" in forms:
+        out["synergy"] = design.columns(combo)[0]
+    return {f: out[f] for f in forms}
 
-    Callers pass training rows only, so an outer held-out row never votes on
-    the form it is then used to score. Training |t| on its own cannot decide:
-    synergy has more parameters and wins in-sample. Ties go to the earlier form
-    in ``forms``. Returns ``(form, {form: inner score})``.
+
+def choose_form(E, y, *, seed, splits=_FORM_INNER_SPLITS, frac=0.25, groups=None):
+    """The form with the best mean held-out |t| on inner splits of ``y``.
+
+    ``E`` maps each candidate form to its columns (:func:`form_columns`), in
+    preference order. Callers pass training rows only, so an outer held-out
+    row never votes on the form it is then used to score. Training |t| on its
+    own cannot decide: synergy has more parameters and wins in-sample. Ties go
+    to the earlier form. Returns ``(form, {form: inner score})``.
     """
-    forms = eligible_forms(forms, E.shape[1])
+    forms = tuple(E)
     if len(forms) == 1:
         return forms[0], {}
     scores = {
         f: _score_form_at(
-            E, y, f, splits=splits, frac=frac, seed=seed, workers=1, groups=groups
+            E[f], y, splits=splits, frac=frac, seed=seed, workers=1, groups=groups
         )
         for f in forms
     }
@@ -769,28 +805,25 @@ def choose_form(
     return best, scores
 
 
-def build_index(E_train, y_train, form):
-    """Fit the chosen form on training rows; return ``(apply_fn, params)``.
+def build_index(E_train, y_train):
+    """Fit a form's columns on training rows; return ``(apply_fn, params)``.
 
-    ``weights`` carries one entry per channel, zero where the simplex fit's
-    active set dropped one, so position *i* always means channel *i*. A vector
-    holding only the surviving channels would change length with the fit, and
+    ``weights`` carries one entry per column, zero where the simplex fit's
+    active set dropped one, so position *i* always means column *i*. A vector
+    holding only the surviving columns would change length with the fit, and
     weights from different fits could then neither be compared nor averaged.
     """
-    if form == "linear":
-        k = E_train.shape[1]
-        fit = simplex_fit(E_train.T @ E_train, E_train.T @ y_train)
-        if fit is None:
-            sub, w = np.arange(k), np.full(k, 1.0 / k)
-        else:
-            sub, w = fit
-        dense = np.zeros(k)
-        dense[sub] = w
-        # Index over the kept columns only, so a dropped channel's missing
-        # values never reach the arithmetic (``0 * nan`` is ``nan``).
-        return (lambda M: M[:, sub] @ w), {"weights": dense, "kept": sub}
-    sf = fit_synergy(E_train, y_train)
-    return sf.apply, {"weights": sf.w, "powers": sf.p}
+    k = E_train.shape[1]
+    fit = simplex_fit(E_train.T @ E_train, E_train.T @ y_train)
+    if fit is None:
+        sub, w = np.arange(k), np.full(k, 1.0 / k)
+    else:
+        sub, w = fit
+    dense = np.zeros(k)
+    dense[sub] = w
+    # Index over the kept columns only, so a dropped column's missing values
+    # never reach the arithmetic (``0 * nan`` is ``nan``).
+    return (lambda M: M[:, sub] @ w), {"weights": dense, "kept": sub}
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -987,9 +1020,8 @@ def implied_weight_curve(k, radii, *, areas=None, points=60):
 
 @dataclass
 class IndexPosterior:
-    weights: np.ndarray  # (draws, nC [+ pairs])
+    weights: np.ndarray  # (draws, nC [+ interactions])
     beta: np.ndarray  # (draws,)
-    powers: np.ndarray | None
     channels: tuple[str, ...]
     picked: tuple
     form: str
@@ -1009,17 +1041,17 @@ class IndexPosterior:
     rung_area: np.ndarray | None = None  # (nC, nR), None means r²
 
     def weight_labels(self) -> list[str]:
-        """One label per weight, so the pair terms are not read as channels.
+        """One label per weight, so the interactions are not read as channels.
 
-        The synergy form carries a weight per channel *and* per channel pair;
-        a reader given only the channel names would attribute a pair's weight
-        to whichever channel happened to sit at that index.
+        The synergy form carries a weight per channel *and* per interaction; a
+        reader given only the channel names would attribute an interaction's
+        weight to whichever channel happened to sit at that index.
         """
         labels = list(self.channels)
         if self.weights.shape[1] > len(self.channels):
             labels += [
-                f"{self.channels[i]} x {self.channels[j]}"
-                for i, j in _pairs(len(self.channels))
+                " x ".join(self.channels[i] for i in combo)
+                for combo in synergy_combos(len(self.channels))
             ]
         return labels
 
@@ -1154,7 +1186,6 @@ class IndexPosterior:
             "rhat_max": self.rhat_max,
             "ess_min": self.ess_min,
             "divergences": self.divergences,
-            "powers": None if self.powers is None else self.powers.mean(0).tolist(),
             "radius_kernel": self.radius_kernel,
             "radius_prior": self.radius_prior,
         }
@@ -1214,6 +1245,8 @@ def fit(
     seed=42,
     radius_prior="rungs",
     entities=None,
+    design=None,
+    design_channels=None,
 ):
     """NUTS over every unknown the index has: scale, aggregation, weights, form.
 
@@ -1250,6 +1283,11 @@ def fit(
     exchangeable covariance ``sigma² I + sigma_u² 11ᵀ``. Without it the waves of
     one person count as independent evidence and the interval on ``beta`` is
     too narrow.
+
+    The synergy form needs the whole grid and ``design``
+    (:class:`SynergyDesign`) with ``design_channels``, the tensor channels of
+    ``E``: its interactions are formed per cell from the raw channel values
+    blended by the same kernel and aggregator (:func:`interaction_columns`).
     """
     import jax
     import jax.numpy as jnp
@@ -1268,7 +1306,9 @@ def fit(
     E = np.asarray(E, dtype=np.float64)
     joint = E.ndim == 4
     nc = E.shape[1]
-    npair = len(_pairs(nc)) if form == "synergy" else 0
+    nterm = len(synergy_combos(nc)) if form == "synergy" else 0
+    if nterm and (not joint or design is None):
+        raise ValueError("The synergy form needs the whole grid and a SynergyDesign.")
 
     if joint:
         nr, ns = E.shape[2], E.shape[3]
@@ -1299,6 +1339,20 @@ def fit(
             concentration = jnp.asarray(
                 np.where(mask & (widths > 0), n_rungs * widths / totals, 1.0)
             )
+    if nterm:
+        raw = design.grid(design_channels)
+        raw = jnp.asarray(np.where(mask[None, :, :, None], np.nan_to_num(raw), 0.0))
+        cell_j = jnp.asarray(design.row_cell)
+        ent_j = jnp.asarray(design.row_entity)
+        w_j = jnp.asarray(design.row_weight)
+        den_j = jnp.asarray(
+            np.bincount(design.row_entity, weights=design.row_weight, minlength=len(E))
+        )
+        basis_j = jnp.asarray(design.basis)
+
+        def collapse_j(t):
+            num = jax.ops.segment_sum(t[cell_j] * w_j, ent_j, num_segments=len(E))
+            return num / den_j
 
     def contract(Ej):
         # The kernel is built in log space and normalised by subtracting its own
@@ -1339,26 +1393,15 @@ def fit(
         else:
             a = jnp.ones((nc, ns)) / ns
         v = jnp.einsum("ncrs,cr,cs->nc", Ej, k, a)
-        return (v - v.mean(0)) / jnp.maximum(v.std(0), 1e-9)
+        return (v - v.mean(0)) / jnp.maximum(v.std(0), 1e-9), k, a
 
     def model(Ej, yj):
-        v = contract(Ej) if joint else Ej
-        w = numpyro.sample("w", dist.Dirichlet(jnp.ones(nc + npair)))
-        if form == "linear":
-            e = v @ w
-        else:
-            p = numpyro.sample(
-                "p", dist.Uniform(_POWER_LO, _POWER_HI).expand([nc]).to_event(1)
-            )
-            # Each channel as an approximate percentile, Φ of its standardised
-            # value, on the log scale (see ``percentile_scale``). Mean and SD
-            # use every entity, so the scaling moves smoothly with the kernel
-            # and aggregator; z never reaches 0, so ``z ** p`` stays smooth.
-            u = (v - v.mean(0)) / jnp.maximum(v.std(0), 1e-9)
-            logz = jax.scipy.special.log_ndtr(u)
-            e = jnp.exp(logz * p) @ w[:nc]
-            for k, (i, j) in enumerate(_pairs(nc)):
-                e = e + w[nc + k] * jnp.exp(logz[:, i] + logz[:, j])
+        v, k, a = contract(Ej) if joint else (Ej, None, None)
+        w = numpyro.sample("w", dist.Dirichlet(jnp.ones(nc + nterm)))
+        e = v @ w[:nc]
+        if nterm:
+            T = interaction_columns(raw, k, a, collapse_j, basis_j, jnp)
+            e = e + T @ w[nc:]
         e = (e - e.mean()) / jnp.maximum(e.std(), 1e-9)
         beta = numpyro.sample("beta", dist.Normal(0.0, 1.0))
         sigma = numpyro.sample("sigma", dist.HalfNormal(2.0))
@@ -1454,7 +1497,6 @@ def posterior_from(
     post = IndexPosterior(
         weights=np.asarray(s["w"]),
         beta=np.asarray(s["beta"]),
-        powers=np.asarray(s["p"]) if "p" in s else None,
         channels=tuple(channels),
         picked=tuple(picked),
         form=form,
@@ -1500,37 +1542,6 @@ def rung_sd_from(column_sd, channel_index, stats) -> np.ndarray:
         return np.nanmean(sd, axis=-1)
 
 
-def composite_scaling(
-    X, column_sd, *, channels, channel_index, radii, stats, picked
-) -> dict:
-    """``<channel>_center`` / ``<channel>_scale`` for building the composite.
-
-    The model divides every column by its covariate-adjusted SD (``prep``'s
-    ``column_sd``) and fits the weights, the kernel and the form on that scale.
-    A composite built from the raw channel values at the projected cell
-    reproduces it when each channel is centred on its mean and divided by that
-    same SD: the linear form's weights then carry exactly the shares the
-    posterior estimated, and the synergy form's curve keeps the slope the model
-    fitted. ``X`` is the raw tensor, ``picked`` one ``(radius, stat)`` per
-    channel.
-    """
-    out: dict[str, float] = {}
-    rungs = [int(round(float(r))) for r in radii]
-    sd_all = np.asarray(column_sd, dtype=np.float64)
-    for ch, ci, (radius, stat) in zip(channels, channel_index, picked):
-        if int(radius) not in rungs or stat not in stats:
-            continue
-        ri, si = rungs.index(int(radius)), list(stats).index(stat)
-        vals = np.asarray(X[:, ci, ri, si], dtype=np.float64)
-        vals = vals[np.isfinite(vals)]
-        sd = float(sd_all[ci, ri, si])
-        if vals.size < 2 or not np.isfinite(sd) or sd <= 0:
-            continue
-        out[f"{ch}_center"] = float(vals.mean())
-        out[f"{ch}_scale"] = sd
-    return out
-
-
 def grid_posterior(
     Xr,
     yr,
@@ -1551,14 +1562,15 @@ def grid_posterior(
     column_sd=None,
     radius_prior="rungs",
     entities=None,
+    design=None,
 ):
     """The joint model over the whole grid of the index channels, summarised.
 
     ``radius_idx`` lists each channel's own rungs; every other rung is masked
     out of its kernel. Returns ``(posterior, grid, grid_kwargs)`` so a caller
     can refit the same model, e.g. for :func:`null_calibration`. ``entities``
-    (a panel's entity per row) adds the per-entity intercept of :func:`fit`
-    and travels in ``grid_kwargs``.
+    (a panel's entity per row) adds the per-entity intercept of :func:`fit`,
+    and ``design`` the synergy form's terms; both travel in ``grid_kwargs``.
     """
     grid = np.asarray(Xr)[:, list(channel_index), :, :]
     radius_mask = np.zeros((len(channels), len(radii)), dtype=bool)
@@ -1572,6 +1584,8 @@ def grid_posterior(
         aggregator=aggregator,
         radius_prior=radius_prior,
         entities=entities,
+        design=design,
+        design_channels=tuple(channel_index),
     )
     mcmc = fit(
         grid,
@@ -1606,7 +1620,7 @@ def grid_posterior(
 
 def _discovery_shuffle(task):
     """Sweep on train, fit the winning form, score on the held-out rows."""
-    Zpath, shape, y, cols_per_channel, forms, seed, frac, groups = task
+    Zpath, shape, y, cols_per_channel, forms, seed, frac, groups, design = task
     z = np.memmap(Zpath, dtype=np.float64, mode="r", shape=shape)
     te = _holdout(len(y), seed, frac, groups)
     tr = ~te
@@ -1627,19 +1641,18 @@ def _discovery_shuffle(task):
     if best is None:
         return None
 
-    E = np.asarray(z[:, list(best)])
+    E = form_columns(forms, z, best, design)
     out = {"columns": tuple(best)}
     for form in forms:
-        apply_fn, params = build_index(E[tr], y[tr], form)
+        apply_fn, params = build_index(E[form][tr], y[tr])
         out[form] = {
-            "train_t": _tstat(apply_fn(E[tr]), y[tr]),
-            "test_t": _tstat(apply_fn(E[te]), y[te]),
+            "train_t": _tstat(apply_fn(E[form][tr]), y[tr]),
+            "test_t": _tstat(apply_fn(E[form][te]), y[te]),
             "weights": np.asarray(params["weights"]).tolist(),
         }
     out["form"], out["form_inner"] = choose_form(
-        E[tr],
+        {f: e[tr] for f, e in E.items()},
         y[tr],
-        forms,
         seed=seed + _FORM_SEED_OFFSET,
         groups=None if groups is None else np.asarray(groups)[tr],
     )
@@ -1663,17 +1676,19 @@ def repeated_discovery(
     workers=None,
     cancel_check=None,
     groups=None,
+    design=None,
 ):
     """Independent repeats of sweep -> fit -> score.
 
     Each replicate gets its own seed stream, so agreement across replicates is
     reproducibility rather than one long correlated run. ``groups`` holds out
-    whole groups in every split, as in :func:`sweep`.
+    whole groups in every split and ``design`` enables the synergy form, as in
+    :func:`sweep`.
     """
     n_radii, n_stats = X.shape[2], X.shape[3]
     if radius_idx is None:
         radius_idx = [list(range(n_radii))] * len(channels)
-    forms = eligible_forms(forms, len(channels))
+    forms = eligible_forms(forms, len(channels), design is not None)
     cols = candidate_columns(channel_index, radius_idx, n_radii, n_stats)
     flat = np.ascontiguousarray(X.reshape(len(X), -1))
 
@@ -1694,6 +1709,7 @@ def repeated_discovery(
                 10_000 * (rep + 1) + b,
                 frac,
                 groups,
+                design,
             )
             for rep in range(reps)
             for b in range(shuffles)
@@ -1745,7 +1761,7 @@ def repeated_discovery(
 
 def _gain_split(task):
     """One split: every standalone and the composite, same held-out rows."""
-    path, shape, y, cols, per_channel_cols, forms, seed, frac, groups = task
+    path, shape, y, cols, per_channel_cols, forms, seed, frac, groups, design = task
     z = np.memmap(path, dtype=np.float64, mode="r", shape=shape)
     te = _holdout(len(y), seed, frac, groups)
     tr = ~te
@@ -1779,17 +1795,16 @@ def _gain_split(task):
         v = _tstat(ztr[:, i[sub]] @ w, y[tr])
         if v > best_v:
             best_v, best = v, combo
-    E = np.asarray(z[:, list(best)])
+    E = form_columns(forms, z, best, design)
     scores = {}
     for form in forms:
-        apply_fn, _ = build_index(E[tr], y[tr], form)
-        scores[form] = _tstat(apply_fn(E[te]), y[te])
+        apply_fn, _ = build_index(E[form][tr], y[tr])
+        scores[form] = _tstat(apply_fn(E[form][te]), y[te])
     # The form is chosen on the training rows; the held-out score of every
     # form stays as a diagnostic, and their maximum is labelled optimistic.
     form, _ = choose_form(
-        E[tr],
+        {f: e[tr] for f, e in E.items()},
         y[tr],
-        forms,
         seed=seed + _FORM_SEED_OFFSET,
         groups=None if groups is None else np.asarray(groups)[tr],
     )
@@ -1822,6 +1837,7 @@ def holdout_gain(
     workers=None,
     cancel_check=None,
     groups=None,
+    design=None,
 ):
     """Composite vs each standalone on the same held-out rows, split by split.
 
@@ -1831,14 +1847,15 @@ def holdout_gain(
     share most of their training rows, so their variance is inflated by
     ``1/S + n_test/n_train`` before the t on ``S − 1`` degrees of freedom.
     It is ``None`` when fewer than two splits give a gain, or all give the same
-    one. ``groups`` holds out whole groups in every split, as in :func:`sweep`.
+    one. ``groups`` holds out whole groups in every split and ``design``
+    enables the synergy form, as in :func:`sweep`.
     """
     from scipy import stats as _stats
 
     n_radii, n_stats = X.shape[2], X.shape[3]
     if radius_idx is None:
         radius_idx = [list(range(n_radii))] * len(channels)
-    forms = eligible_forms(forms, len(channels))
+    forms = eligible_forms(forms, len(channels), design is not None)
     cols = candidate_columns(channel_index, radius_idx, n_radii, n_stats)
     flat = np.ascontiguousarray(X.reshape(len(X), -1))
 
@@ -1850,7 +1867,18 @@ def holdout_gain(
         mm.flush()
         del mm
         base = [
-            (path, flat.shape, y, cols, cols, tuple(forms), seed + s, frac, groups)
+            (
+                path,
+                flat.shape,
+                y,
+                cols,
+                cols,
+                tuple(forms),
+                seed + s,
+                frac,
+                groups,
+                design,
+            )
             for s in range(splits)
         ]
         n_workers = workers or parallel.process_worker_count(len(base))
@@ -1936,11 +1964,11 @@ def _null_fit(task):
     groups, entities, waves = panel
     yp = _permuted(y, seed, entities, waves)
     if choice is not None:
-        cpath, cshape, forms = choice
-        Ef = np.asarray(np.memmap(cpath, dtype=np.float64, mode="r", shape=cshape))
-        form, _ = choose_form(
-            Ef, yp, forms, seed=seed + _FORM_SEED_OFFSET, groups=groups
-        )
+        Ef = {
+            f: np.asarray(np.memmap(p, dtype=np.float64, mode="r", shape=sh))
+            for f, p, sh in choice
+        }
+        form, _ = choose_form(Ef, yp, seed=seed + _FORM_SEED_OFFSET, groups=groups)
     m = fit(E, yp, form=form, draws=300, warmup=300, chains=2, seed=seed, **kwargs)
     b = np.asarray(m.get_samples()["beta"])
     lo, hi = np.percentile(b, [2.5, 97.5])
@@ -1966,6 +1994,13 @@ def clopper_pearson(k: int, n: int, level: float = 0.95) -> tuple[float, float]:
     return lo, hi
 
 
+def _unlink(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 def _write_memmap(arr: np.ndarray, suffix: str) -> str:
     fd, path = tempfile.mkstemp(suffix=suffix)
     os.close(fd)
@@ -1986,7 +2021,6 @@ def null_calibration(
     cancel_check=None,
     reselect_form=False,
     form_E=None,
-    forms=FORMS,
     groups=None,
     entities=None,
     waves=None,
@@ -2001,10 +2035,11 @@ def null_calibration(
     than selected, and this rate covers them.
 
     ``reselect_form`` extends that to the functional form: each permuted
-    outcome re-runs :func:`choose_form` on ``form_E`` — one column per channel,
-    the sweep's pick — among ``forms`` before the refit. What the rate still
-    cannot cover is the channel list and the covariate set, so a clean rate is
-    not a licence to read the interval as though those had been pre-specified.
+    outcome re-runs :func:`choose_form` on ``form_E`` — each candidate form's
+    columns at the sweep's pick (:func:`form_columns`) — before the refit. What
+    the rate still cannot cover is the channel list and the covariate set, so a
+    clean rate is not a licence to read the interval as though those had been
+    pre-specified.
 
     The rate carries an exact (Clopper-Pearson) 95 % interval. Fewer than
     :data:`NULL_RUNS_FOR_CLAIM` runs is flagged ``imprecise``; use
@@ -2018,16 +2053,18 @@ def null_calibration(
     JAX compile n times over.
     """
     E = np.ascontiguousarray(np.asarray(E, dtype=np.float64))
-    if reselect_form and form_E is None:
-        raise ValueError("reselect_form needs form_E, one column per channel.")
+    if reselect_form and not form_E:
+        raise ValueError("reselect_form needs form_E, each form's columns.")
     paths = []
     try:
         paths.append(_write_memmap(E, ".geofuse-null"))
         choice = None
         if reselect_form:
-            Ef = np.ascontiguousarray(np.asarray(form_E, dtype=np.float64))
-            paths.append(_write_memmap(Ef, ".geofuse-null-form"))
-            choice = (paths[1], Ef.shape, tuple(forms))
+            choice = []
+            for f, cols in form_E.items():
+                Ef = np.ascontiguousarray(np.asarray(cols, dtype=np.float64))
+                paths.append(_write_memmap(Ef, ".geofuse-null-form"))
+                choice.append((f, paths[-1], Ef.shape))
         panel = (groups, entities, waves)
         kwargs = dict(fit_kwargs, entities=entities)
         tasks = [
@@ -2055,10 +2092,7 @@ def null_calibration(
         "reselect_form": bool(reselect_form),
     }
     if reselect_form:
-        out["form_counts"] = {
-            f: sum(fm == f for _, fm in results)
-            for f in eligible_forms(forms, E.shape[1])
-        }
+        out["form_counts"] = {f: sum(fm == f for _, fm in results) for f in form_E}
     if out["imprecise"]:
         out["note"] = (
             f"{n} runs: rate too imprecise to support a calibration claim "

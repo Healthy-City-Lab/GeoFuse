@@ -72,7 +72,7 @@ class TestScenarios(unittest.TestCase):
 class TestPlantedTruth(unittest.TestCase):
     def setUp(self):
         X, cov = correlated_tensor(n=600)
-        self.cov = cov
+        self.X, self.cov = X, cov
         _, self.Xr, self.info = bi.prep(X, np.zeros(len(X)), cov, return_info=True)
 
     def test_a_single_cell_truth_is_that_column(self):
@@ -85,6 +85,15 @@ class TestPlantedTruth(unittest.TestCase):
         s2 = v.default_scenarios(2, RADII, STATS)[2]
         z = v.planted_index(self.Xr, s2, [0, 1])
         self.assertLess(abs(float(np.corrcoef(z, self.cov[:, 0])[0, 1])), 1e-8)
+
+    def test_the_synergy_truth_carries_its_interaction(self):
+        s3 = v.default_scenarios(2, RADII, STATS)[3]
+        design = bi.SynergyDesign.build(self.X, self.cov)
+        z = v.planted_index(self.Xr, s3, [0, 1], design)
+        self.assertLess(abs(float(np.corrcoef(z, self.cov[:, 0])[0, 1])), 1e-8)
+        flat = v.Truth("mains", (0.5, 0.5), s3.kernel, s3.aggregator)
+        mains = v.planted_index(self.Xr, flat, [0, 1])
+        self.assertLess(abs(float(np.corrcoef(z, mains)[0, 1])), 0.99)
 
     def test_a_between_rung_truth_has_an_r50_between_its_rungs(self):
         truths = {t.name: t for t in v.default_scenarios(2, RADII, STATS)}

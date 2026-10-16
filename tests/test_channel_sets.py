@@ -120,7 +120,6 @@ class TestEveryChannelResolvesItsAggregation(unittest.TestCase):
         post = SimpleNamespace(
             picked=((800, "mean"), (250, "p90"), (300, "p10")),
             weights=np.full((4, 3), 1.0 / 3.0),
-            powers=None,
         )
         params = e._params_from_sweep(None, post, ["ndvi", "veg", "terrain"])
         self.assertEqual(e._channel_spec(params, "ndvi"), (800, "mean", 50))

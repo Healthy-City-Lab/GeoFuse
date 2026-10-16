@@ -59,7 +59,6 @@ def _stub_engine(n=300, seed=0):
         "_index_layout",
         "_search_radii",
         "_inner_split_groups",
-        "_channel_scaling",
         "_ladder_description",
     ):
         setattr(eng, name, types.MethodType(getattr(MetricFusionEngine, name), eng))
@@ -190,8 +189,8 @@ class TestLinearRunRecordsRawWeights(unittest.TestCase):
         )
 
 
-class TestSynergyRunRecordsItsScaling(unittest.TestCase):
-    """A synergy study's params carry the curve the composite path needs."""
+class TestSynergyRunRecordsRawWeights(unittest.TestCase):
+    """A synergy study's weights apply to the raw channels and their interaction."""
 
     @classmethod
     def setUpClass(cls):
@@ -199,8 +198,9 @@ class TestSynergyRunRecordsItsScaling(unittest.TestCase):
             setattr, parallel, "process_worker_count", parallel.process_worker_count
         )
         parallel.process_worker_count = lambda *a, **k: 1
+        cls.eng = _stub_engine()
         cls.params = MetricFusionEngine.fit_bayesian_index(
-            _stub_engine(),
+            cls.eng,
             "r2",
             forms=("synergy",),
             sweep_splits=2,
@@ -213,20 +213,33 @@ class TestSynergyRunRecordsItsScaling(unittest.TestCase):
             radius_kernel="dirichlet",
         )
 
-    def test_every_channel_gets_a_center_and_a_scale(self):
+    def test_the_weights_cover_the_interaction_and_no_scaling_is_recorded(self):
         self.assertEqual(self.params["__sweep__"]["form"], "synergy")
+        keys = ("w_ndvi", "w_gvi", "w_ndvi_gvi")
+        self.assertAlmostEqual(sum(self.params[k] for k in keys), 100.0, places=2)
         for ch in ("ndvi", "gvi"):
-            self.assertIn(f"{ch}_center", self.params)
-            self.assertGreater(self.params[f"{ch}_scale"], 0.0)
+            self.assertNotIn(f"{ch}_center", self.params)
+            self.assertNotIn(f"{ch}_power", self.params)
 
-    def test_the_composite_path_evaluates_with_them(self):
-        from geofuse import cgi_formulas
+    def test_the_raw_composite_is_the_fitted_index(self):
+        from geofuse import bayesian_index, cgi_formulas
 
-        rng = np.random.default_rng(0)
-        comps = {"ndvi": rng.normal(size=50), "gvi": rng.normal(size=50)}
-        out = cgi_formulas.compute_cgi("synergy_gvi", self.params, comps)
-        self.assertTrue(np.isfinite(out).all())
-        self.assertTrue(((out > 0) & (out < 1)).all())
+        X, radii, stats, _, static = self.eng.build_index_tensor()
+        post = self.params["__posterior__"]
+        nr, ns = len(radii), len(stats)
+        cols = [
+            (i * nr + list(radii).index(r)) * ns + stats.index(c)
+            for i, (r, c) in enumerate(post["picked"])
+        ]
+        design = bayesian_index.SynergyDesign.build(X, static["cov"])
+        fitted = design.columns(cols)[0] @ np.asarray(post["weight_mean"])
+        flat = X.reshape(len(X), -1)
+        raw = {"ndvi": flat[:, cols[0]], "gvi": flat[:, cols[1]]}
+        comp = cgi_formulas.compute_cgi("synergy_gm_gvi", self.params, raw)
+        comp_r = comp - design.basis @ (design.basis.T @ comp)
+        self.assertAlmostEqual(
+            float(np.corrcoef(comp_r, fitted)[0, 1]), 1.0, places=6
+        )
 
 
 def _retune_stub(n=600, seed=3):
@@ -266,7 +279,6 @@ def _retune_stub(n=600, seed=3):
         "_index_layout",
         "_search_radii",
         "_inner_split_groups",
-        "_channel_scaling",
         "_ladder_description",
         "fit_bayesian_index",
         "retune_concordance",

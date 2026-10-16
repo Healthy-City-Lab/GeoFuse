@@ -3410,6 +3410,14 @@ class MetricFusionEngine:
             entities = np.asarray(eid)[prep_info["kept"]]
             if static.get("wave") is not None:
                 waves = np.asarray(static["wave"])[prep_info["kept"]]
+        # The synergy form's interactions are formed from the raw channel values.
+        design = None
+        if bayesian_index.eligible_forms(forms, len(index_channels)) != ("linear",):
+            cov = static.get("cov")
+            design = bayesian_index.SynergyDesign.build(
+                X[prep_info["kept"]],
+                None if cov is None else np.asarray(cov)[prep_info["kept"]],
+            )
         tick()
 
         workers = parallel.process_worker_count()
@@ -3430,6 +3438,7 @@ class MetricFusionEngine:
             objective=self._sweep_objective(metric),
             cancel_check=cancelled,
             groups=groups,
+            design=design,
         )
         tick()
         _log(
@@ -3454,6 +3463,7 @@ class MetricFusionEngine:
                 workers=workers,
                 cancel_check=cancelled,
                 groups=groups,
+                design=design,
             )
             if reps and shuffles
             else {}
@@ -3473,6 +3483,7 @@ class MetricFusionEngine:
                 workers=workers,
                 cancel_check=cancelled,
                 groups=groups,
+                design=design,
             )
             if gain_splits and len(index_channels) > 1
             else {}
@@ -3506,6 +3517,7 @@ class MetricFusionEngine:
             column_sd=prep_info["column_sd"],
             radius_prior=radius_prior,
             entities=entities,
+            design=design,
         )
         null = (
             bayesian_index.null_calibration(
@@ -3516,8 +3528,14 @@ class MetricFusionEngine:
                 workers=workers,
                 cancel_check=cancelled,
                 reselect_form=null_reselect_form,
-                form_E=Xr.reshape(len(Xr), -1)[:, list(res.columns)],
-                forms=forms,
+                form_E=bayesian_index.form_columns(
+                    bayesian_index.eligible_forms(
+                        forms, len(index_channels), design is not None
+                    ),
+                    Xr.reshape(len(Xr), -1),
+                    res.columns,
+                    design,
+                ),
                 groups=groups,
                 waves=waves,
                 **grid_kwargs,
@@ -3535,36 +3553,23 @@ class MetricFusionEngine:
                 tuple(cgi_formulas.formula_channels(self.cgi_formula)), res.form
             )
 
-        # The composite path rebuilds the index from raw channel values. A
-        # linear index is a weighted average of them, with the weights carried
-        # onto the raw scale; synergy needs the center and scale its curve
-        # refers to.
-        scaling = (
-            self._channel_scaling(
-                X,
-                radii,
-                stats,
-                tensor_channels,
-                index_channels,
-                post.picked,
-                prep_info["column_sd"],
+        # The composite path rebuilds the index from raw channel values at the
+        # projected cells, so each weight is carried onto the raw scale of its
+        # term.
+        term_sd = None
+        if self._active_greenery_channel == "cgi":
+            rungs = [int(round(float(r))) for r in radii]
+            cols = [
+                (ci * len(rungs) + rungs.index(int(r))) * len(stats)
+                + list(stats).index(st)
+                for ci, (r, st) in zip(channel_index, post.picked)
+            ]
+            term_sd = (
+                design.columns(cols)[1]
+                if res.form == "synergy"
+                else prep_info["column_sd"].reshape(-1)[cols]
             )
-            if self._active_greenery_channel == "cgi"
-            else {}
-        )
-        linear = res.form == "linear"
-        params = self._params_from_sweep(
-            res,
-            post,
-            index_channels,
-            channel_sd=(
-                {ch: scaling.get(f"{ch}_scale", 1.0) for ch in index_channels}
-                if linear and scaling
-                else None
-            ),
-        )
-        if not linear:
-            params.update(scaling)
+        params = self._params_from_sweep(res, post, index_channels, term_sd=term_sd)
         params["__selection_method__"] = "bayesian_index"
         params["__sweep__"] = {
             "picked": [list(p) for p in res.picked],
@@ -3698,26 +3703,7 @@ class MetricFusionEngine:
 
         return objective
 
-    def _channel_scaling(
-        self, X, radii, stats, tensor_channels, index_channels, picked, column_sd
-    ) -> dict:
-        """``<channel>_center`` / ``<channel>_scale`` for the composite path.
-
-        :func:`bayesian_index.composite_scaling` gives the mean and the
-        covariate-adjusted SD of each channel at the cell the composite is built
-        from — the scale the model fitted on.
-        """
-        return bayesian_index.composite_scaling(
-            X,
-            column_sd,
-            channels=index_channels,
-            channel_index=[list(tensor_channels).index(c) for c in index_channels],
-            radii=radii,
-            stats=stats,
-            picked=picked,
-        )
-
-    def _params_from_sweep(self, res, post, index_channels, channel_sd=None) -> dict:
+    def _params_from_sweep(self, res, post, index_channels, term_sd=None) -> dict:
         """Posterior -> the params dict the composite/apply path consumes.
 
         That path carries one radius and one statistic per channel, so the
@@ -3726,10 +3712,11 @@ class MetricFusionEngine:
         credible intervals stay in the results bundle, and the effect that gets
         reported is the one the blend produced, not a refit at the modal cell.
 
-        The posterior's weights are influence shares on standardised channels.
-        With ``channel_sd`` (each channel's adjusted SD at its cell) a linear
-        index's weights are divided by it, so the weighted average of the raw
-        channels is the fitted index up to a shift and a positive scale.
+        The posterior's weights are influence shares on standardised terms.
+        With ``term_sd`` (each term's covariate-adjusted SD at the projected
+        cells, in weight order) every weight is divided by it, so the composite
+        of the raw channel values is the fitted index up to a shift and a
+        positive scale.
         """
         formula = cgi_formulas.get_formula(self.cgi_formula)
         params: dict[str, Any] = {}
@@ -3754,8 +3741,11 @@ class MetricFusionEngine:
             params.setdefault(f"{ch}_percentile", 50)
 
         # Posterior-mean weights onto the formula's keys as shares of 100, the
-        # scale every downstream consumer expects.
+        # scale every downstream consumer expects: one per channel, then the
+        # synergy form's interactions in the formula's interaction-key order.
         w = np.asarray(post.weights).mean(0)
+        if term_sd is not None:
+            w = w / np.maximum(np.asarray(term_sd, dtype=np.float64)[: len(w)], 1e-12)
         keys = list(formula.weight_keys)
         main_key = cgi_formulas._CHANNEL_MAIN_KEY[self.cgi_formula]
         vals = np.zeros(len(keys))
@@ -3763,39 +3753,15 @@ class MetricFusionEngine:
             key = main_key.get(ch)
             if key in keys and i < len(w):
                 vals[keys.index(key)] = float(w[i])
-
-        # The synergy posterior also carries one weight per channel pair.
-        # Dropping them would build the composite from a different model than
-        # the one the reported effect came from. Interaction keys abbreviate
-        # their channels (``w_ter_veg``), so they are matched on token set
-        # rather than on a reconstructed name.
-        n_main = len(index_channels)
-        if len(w) > n_main:
-            token = {ch: main_key[ch].removeprefix("w_") for ch in index_channels}
-            by_tokens = {
-                frozenset(k.removeprefix("w_").split("_")): k
-                for k in getattr(formula, "interaction_weight_keys", ())
-            }
-            for k, (i, j) in enumerate(bayesian_index._pairs(n_main)):
-                key = by_tokens.get(
-                    frozenset((token[index_channels[i]], token[index_channels[j]]))
-                )
-                if key in keys and n_main + k < len(w):
-                    vals[keys.index(key)] = float(w[n_main + k])
-        if channel_sd is not None:
-            for ch in index_channels:
-                key = main_key.get(ch)
-                if key in keys:
-                    vals[keys.index(key)] /= max(float(channel_sd[ch]), 1e-12)
+        inter = formula.interaction_weight_keys[: max(len(w) - len(index_channels), 0)]
+        for k, key in enumerate(inter):
+            vals[keys.index(key)] = float(w[len(index_channels) + k])
         total = vals.sum()
         if total <= 0:
             vals[:] = 1.0 / len(vals)
             total = 1.0
         for key, v in zip(keys, vals * 100.0 / total):
             params[key] = round(float(v), 4)
-        if post.powers is not None:
-            for ch, p in zip(index_channels, np.asarray(post.powers).mean(0)):
-                params[f"{ch}_power"] = float(p)
         return params
 
     def build_index_tensor(self, subset: str = "train_val"):

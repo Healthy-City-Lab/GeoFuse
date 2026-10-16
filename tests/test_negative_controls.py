@@ -137,7 +137,7 @@ def _tune_and_transfer(X, target, control, seed=0, n_boot=400):
     cols = list(res.columns)
     flat = X.reshape(n, -1)
     mu, sd = flat[tr][:, cols].mean(0), flat[tr][:, cols].std(0)
-    apply_fn, _ = bi.build_index((flat[tr][:, cols] - mu) / sd, yr, "linear")
+    apply_fn, _ = bi.build_index((flat[tr][:, cols] - mu) / sd, yr)
     exposure = apply_fn((flat[te][:, cols] - mu) / sd)
     return (
         nc.transfer_test(
