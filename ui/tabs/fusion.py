@@ -456,7 +456,6 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "cgi_grid_spacing_m",
     "whole_grid_scaling",
     "area_balanced_split",
-    "normalize_channels",
     "spatial_adjust_method",
     "spatial_adjust_max_df",
     "spatial_adjust_eps_m",
@@ -510,7 +509,6 @@ _FUSION_PARAM_TO_WIDGET: dict[str, str] = {
     "cgi_grid_spacing_m": "fusion_cgi_grid_spacing_m",
     "whole_grid_scaling": "fusion_whole_grid_scaling",
     "area_balanced_split": "fusion_area_balanced_split",
-    "normalize_channels": "fusion_normalize_channels",
     "spatial_split": "fusion_spatial_split",
     "spatial_block_size_m": "fusion_spatial_block_size_m",
     "spatial_adjust_method": "fusion_spatial_adjust_method",
@@ -2104,7 +2102,6 @@ def _render_study_details_panel(
     cgi_grid_spacing_m = 50
     whole_grid_scaling = True
     area_balanced_split = True
-    normalize_channels = True
     spatial_split = False
     spatial_block_size_m: float | None = None
     n_spatial_blocks: int | None = None
@@ -2122,7 +2119,6 @@ def _render_study_details_panel(
         )
         for name in (
             "whole_grid_scaling",
-            "normalize_channels",
             "area_balanced_split",
             "spatial_split",
         ):
@@ -2142,15 +2138,6 @@ def _render_study_details_panel(
             "Scale composite map to [0, 1]",
             key="fusion_whole_grid_scaling",
             help="Min-max normalise the optimized greenery map to [0, 1] over the whole grid.",
-        )
-        normalize_channels = st.checkbox(
-            "Normalize channels before fusion",
-            key="fusion_normalize_channels",
-            help=(
-                "Scale each channel to [0, 1] before combining, so CGI weights "
-                "are comparable across channels and the comparison with the "
-                "standalone studies is on equal footing. Off = legacy raw mix."
-            ),
         )
         if is_polygon_target:
             area_balanced_split = st.checkbox(
@@ -2276,7 +2263,6 @@ def _render_study_details_panel(
         "cgi_grid_spacing_m": int(cgi_grid_spacing_m),
         "whole_grid_scaling": bool(whole_grid_scaling),
         "area_balanced_split": bool(area_balanced_split),
-        "normalize_channels": bool(normalize_channels),
         "spatial_adjust_method": str(spatial_adjust_method),
         "spatial_adjust_max_df": int(spatial_adjust_max_df),
         "spatial_adjust_eps_m": spatial_adjust_eps_m,
@@ -5378,7 +5364,6 @@ def render(output_dir: str) -> None:
     cgi_grid_spacing_m_param = study_state.get("cgi_grid_spacing_m")
     whole_grid_scaling_param = bool(study_state.get("whole_grid_scaling", False))
     area_balanced_split_param = bool(study_state.get("area_balanced_split", False))
-    normalize_channels_param = bool(study_state.get("normalize_channels", False))
     residualize_method_param = str(study_state.get("residualize_method", "linear"))
     search_scoring_method_param = str(
         study_state.get("search_scoring_method", "mom_em3")
@@ -5776,10 +5761,6 @@ def render(output_dir: str) -> None:
                 ),
                 "area_balanced_split": (
                     area_balanced_split_param if is_polygon_target_ui else False
-                ),
-                # Per-channel normalization applies to vector targets only.
-                "normalize_channels": (
-                    bool(normalize_channels_param) if is_vector_target else False
                 ),
                 # Spatial-confounding adjustment applies to vector targets only.
                 "spatial_adjust_method": (
