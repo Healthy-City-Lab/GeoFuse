@@ -162,7 +162,7 @@ class TestCollinearityCheck(unittest.TestCase):
     def test_a_one_channel_study_has_nothing_to_check(self):
         eng = self._engine("weighted_average_gvi")
         eng._active_greenery_channel = "ndvi"
-        df = pd.DataFrame({"veg": [0.1, 0.2], "terrain": [0.0, 0.1], "ndvi": [0.3, 0.6]})
+        df = pd.DataFrame({"veg": [0.1, 0.2], "terrain": [0.0, 0.1], "ndvi": [0.3, 1]})
         self.assertIsNone(eng.check_channel_collinearity(data=df))
 
 

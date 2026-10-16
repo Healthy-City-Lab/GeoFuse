@@ -183,6 +183,7 @@ class MetricFusionEngine:
         exposure_plateau_m: float = 0.0,
         exposure_sigma_m: float = 35.0,
         gvi_min_coverage: float = 0.95,
+        drop_collinear_channels: bool = False,
     ):
         """
         Initialize the fusion engine.
@@ -239,6 +240,9 @@ class MetricFusionEngine:
             gvi_min_coverage: share of entities that must keep a covered cell
                 at a street-view rung for the search to offer it; see
                 :meth:`_apply_coverage_gate`.
+            drop_collinear_channels: leave the channels the collinearity check
+                puts above its VIF threshold out of the index search (weight 0)
+                instead of only reporting them.
         """
         # Route Optuna's chatter ("Trial X finished with value Y …") into
         # the per-job log instead of the Streamlit host terminal. Fusion
@@ -431,6 +435,7 @@ class MetricFusionEngine:
                 f"gvi_min_coverage must lie in (0, 1]; got {gvi_min_coverage}."
             )
         self.gvi_min_coverage = float(gvi_min_coverage)
+        self.drop_collinear_channels = bool(drop_collinear_channels)
         # Set by the coverage gate after pre-aggregation: the smallest offered
         # street-view rung, the exposure rows kept, and what was measured.
         self._gvi_floor_m: int | None = None
@@ -2237,7 +2242,8 @@ class MetricFusionEngine:
         ``fusion_df`` explicitly is the standard usage.
 
         Channels the procedure would drop are reported in
-        ``self._high_vif_channels``; they stay in the index search. The full
+        ``self._high_vif_channels``; they stay in the index search unless
+        ``drop_collinear_channels`` is on (:meth:`_index_layout`). The full
         report (pairwise Pearson, initial / final VIFs, the per-iteration drop
         history) is stored on ``self._collinearity_report`` so the runner can
         hand it to the UI. A study with one channel has nothing to check.
@@ -3640,11 +3646,16 @@ class MetricFusionEngine:
         """The study's index channels, their tensor positions and their ladders.
 
         A channel is only offered the radii its own ladder was computed at, so
-        NDVI and the street-view family can search different rungs.
+        NDVI and the street-view family can search different rungs. With
+        ``drop_collinear_channels`` the collinearity check's high-VIF channels
+        are left out, so the composite gives them weight 0.
         """
         index_channels = list(cgi_formulas.formula_channels(self.cgi_formula))
         if self._active_greenery_channel != "cgi":
             index_channels = [self._active_greenery_channel]
+        elif getattr(self, "drop_collinear_channels", False):
+            high = getattr(self, "_high_vif_channels", set())
+            index_channels = [c for c in index_channels if c not in high]
         channel_index = [list(tensor_channels).index(c) for c in index_channels]
         gvi_radii, ndvi_radii = self._search_radii()
         radius_idx = [
@@ -3766,9 +3777,17 @@ class MetricFusionEngine:
             key = main_key.get(ch)
             if key in keys and i < len(w):
                 vals[keys.index(key)] = float(w[i])
-        inter = formula.interaction_weight_keys[: max(len(w) - len(index_channels), 0)]
-        for k, key in enumerate(inter):
-            vals[keys.index(key)] = float(w[len(index_channels) + k])
+        # Interactions are matched on their channel set, so a study searching
+        # fewer channels than its formula holds lands on the right keys.
+        fchans = list(cgi_formulas.formula_channels(self.cgi_formula))
+        fcombos = cgi_formulas.synergy_combos(len(fchans))
+        n_main = len(index_channels)
+        for k, combo in enumerate(cgi_formulas.synergy_combos(n_main)):
+            if n_main + k >= len(w):
+                break
+            at = tuple(sorted(fchans.index(index_channels[i]) for i in combo))
+            key = formula.interaction_weight_keys[fcombos.index(at)]
+            vals[keys.index(key)] = float(w[n_main + k])
         total = vals.sum()
         if total <= 0:
             vals[:] = 1.0 / len(vals)

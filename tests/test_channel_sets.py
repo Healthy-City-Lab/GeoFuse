@@ -127,6 +127,30 @@ class TestEveryChannelResolvesItsAggregation(unittest.TestCase):
         self.assertEqual(e._channel_spec(params, "terrain"), (300, "percentile", 10))
         self.assertNotIn("streetview_stat", params)
 
+    def test_interactions_land_on_their_channels_when_one_is_dropped(self):
+        from types import SimpleNamespace
+
+        e = _engine("synergy_gm")
+        post = SimpleNamespace(
+            picked=((800, "mean"), (300, "mean")),
+            weights=np.array([[0.2, 0.3, 0.5]]),
+        )
+        params = e._params_from_sweep(None, post, ["ndvi", "terrain"])
+        self.assertAlmostEqual(params["w_ndvi_ter"], 50.0)
+        self.assertEqual(params["w_ndvi_veg"], 0.0)
+        self.assertEqual(params["w_veg"], 0.0)
+
+    def test_dropping_high_vif_channels_leaves_them_out_of_the_search(self):
+        e = _engine("weighted_average")
+        e._search_radii = lambda: ((300,), (300,))
+        e._high_vif_channels = {"veg"}
+        tensor = ["veg", "terrain", "ndvi"]
+        e.drop_collinear_channels = False
+        self.assertIn("veg", e._index_layout(tensor, [300])[0])
+        e.drop_collinear_channels = True
+        channels, positions, _ = e._index_layout(tensor, [300])
+        self.assertEqual((channels, positions), (["ndvi", "terrain"], [2, 1]))
+
     def test_a_missing_radius_falls_back_to_the_ladder_maximum(self):
         e = _engine("weighted_average_gvi")
         self.assertEqual(e._channel_spec({}, "gvi")[0], 500)
