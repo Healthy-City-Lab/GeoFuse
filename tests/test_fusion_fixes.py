@@ -86,5 +86,27 @@ class TestCategoricalCovariateExpansion(unittest.TestCase):
         self.assertEqual(eng.covariate_columns, cols)
 
 
+class TestDispersionCheck(unittest.TestCase):
+    def test_rare_dummies_and_binary_outcomes_are_not_flagged(self):
+        from geofuse.fusion import MetricFusionEngine
+
+        eng = object.__new__(MetricFusionEngine)
+        eng.target_feature = "event"
+        eng.covariate_columns = ["area=b", "income"]
+        rng = np.random.default_rng(1)
+        n = 1000
+        income = rng.normal(50, 10, n)
+        income[0] = 5e6  # a sentinel the check exists to catch
+        df = pd.DataFrame(
+            {
+                "event": (rng.random(n) < 0.05).astype(float),
+                "area=b": (rng.random(n) < 0.03).astype(float),
+                "income": income,
+            }
+        )
+        report = eng.check_covariate_dispersion(data=df)
+        self.assertEqual(report["flagged"], ["income"])
+
+
 if __name__ == "__main__":
     unittest.main()

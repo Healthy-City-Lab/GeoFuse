@@ -2424,7 +2424,9 @@ class MetricFusionEngine:
             seen.add(col)
             vals = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=np.float64)
             vals = vals[np.isfinite(vals)]
-            if vals.size < 2:
+            # A 0/1 column (a dummy, a binary outcome) has no inter-percentile
+            # spread whenever one level is under 10 %, so the test cannot apply.
+            if vals.size < 2 or binary_longitudinal.is_binary(vals):
                 continue
             std = float(np.std(vals, ddof=0))
             p10, p90 = (float(x) for x in np.percentile(vals, [10, 90]))
