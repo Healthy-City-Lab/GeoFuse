@@ -553,9 +553,10 @@ def sweep(
     best = int(np.argmax(mean))
     picked = _decode(combos[best], n_radii, n_stats, radii, stats)
 
-    # One-standard-error rule, ranked by total radius for parsimony -- but only
-    # among combos that keep the same active channels. Ranking across channel
-    # sets let the surviving channel flip and reversed the effect's sign.
+    # One-standard-error rule: of the candidates within one SE of the best, the
+    # one with the smallest total radius. Every candidate holds one column per
+    # channel, so no channel set is traded for another. A diagnostic only; the
+    # run uses the pick above.
     eligible = np.flatnonzero(mean >= mean[best] - se[best])
     totals = np.array(
         [
