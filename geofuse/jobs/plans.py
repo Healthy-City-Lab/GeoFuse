@@ -929,7 +929,7 @@ def fusion_run_config(spec: JobSpec) -> dict[str, Any]:
             else []
         ),
         "longitudinal_spec_payload": _longitudinal_payload(spec),
-        "cgi_grid_spacing_m": int(s["cgi_grid_spacing_m"]) if vector else None,
+        "cgi_grid_spacing_m": int(s["cgi_grid_spacing_m"]),
         "whole_grid_scaling": bool(s["whole_grid_scaling"]) if vector else True,
         "area_balanced_split": bool(s["area_balanced_split"]) if polygon else False,
         "normalize_channels": bool(s["normalize_channels"]) if vector else False,
