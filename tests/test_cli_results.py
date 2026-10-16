@@ -154,5 +154,12 @@ class ExportTests(_Case):
         self.assertEqual(code, 2)
 
 
+class CgiMapTests(_Case):
+    def test_it_says_it_is_not_available_yet(self):
+        code, out = self.geofuse("cgi-map", self.artifacts, "area.gpkg")
+        self.assertEqual(code, 2)
+        self.assertIn("not available yet", out)
+
+
 if __name__ == "__main__":
     unittest.main()

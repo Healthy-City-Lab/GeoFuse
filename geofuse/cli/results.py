@@ -289,6 +289,14 @@ def cmd_export(args) -> int:
     return EXIT_OK
 
 
+def cmd_cgi_map(args) -> int:
+    from geofuse import cgi_generator
+
+    if not cgi_generator.AVAILABLE:
+        raise CliError("cgi-map is not available yet.")
+    return EXIT_OK
+
+
 def add_parsers(sub, common) -> None:
     """This module's commands on ``sub`` (which adds ``common`` itself)."""
     p = sub.add_parser("results", help="a fusion run's headline results")
@@ -302,3 +310,11 @@ def add_parsers(sub, common) -> None:
     p.add_argument("-o", "--output", help="write it here (.gpkg, .csv or .geojson)")
     p.add_argument("--outcome", help="one outcome of a multi-outcome run")
     p.set_defaults(func=cmd_export)
+
+    p = sub.add_parser(
+        "cgi-map", help="a fusion run's CGI over a whole area (not available yet)"
+    )
+    p.add_argument("run", metavar="JOB|FOLDER", help="a job id or a results folder")
+    p.add_argument("area", help="the area to map (a vector file)")
+    p.add_argument("-o", "--output", help="write it here (.tif)")
+    p.set_defaults(func=cmd_cgi_map)
