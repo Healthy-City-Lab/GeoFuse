@@ -3120,6 +3120,18 @@ def _direction_badge(direction: object) -> str:
         return "—"
 
 
+def _channel_stat(params: dict, channel: str) -> tuple:
+    """``(stat, percentile)`` a channel was aggregated with.
+
+    Each channel records its own; runs recorded before that hold one shared
+    street-view statistic.
+    """
+    shared = "ndvi" if channel == "ndvi" else "streetview"
+    stat = params.get(f"{channel}_stat", params.get(f"{shared}_stat"))
+    pct = params.get(f"{channel}_percentile", params.get(f"{shared}_percentile"))
+    return stat, pct
+
+
 def _agg_label(stat: str | None, percentile: int | float | None) -> str:
     """Pretty aggregator label (Mean / Median / Nth percentile)."""
     if stat == "mean":
@@ -4248,34 +4260,13 @@ def _render_study_detail(
                     st.metric(label, "—")
 
         st.markdown("**Aggregators**")
-        # NDVI has its own aggregator; every street-view channel shares one
-        # slot in the apply path, so they cannot be reported separately.
-        street = [c for c in channels if c != "ndvi"]
-        agg_specs = []
-        if street:
-            agg_specs.append(
-                (
-                    " + ".join(_CHANNEL_DISPLAY.get(c, c.upper()) for c in street),
-                    "streetview_stat",
-                    "streetview_percentile",
-                )
-            )
-        if "ndvi" in channels:
-            agg_specs.append(("NDVI", "ndvi_stat", "ndvi_percentile"))
-        agg_cols = st.columns(max(len(agg_specs), 1))
-        for col, (label, stat_key, pct_key) in zip(agg_cols, agg_specs):
+        agg_cols = st.columns(max(len(channels), 1))
+        for col, ch in zip(agg_cols, channels):
             with col:
                 st.metric(
-                    label,
-                    _agg_label(final_params.get(stat_key), final_params.get(pct_key)),
+                    _CHANNEL_DISPLAY.get(ch, ch.upper()),
+                    _agg_label(*_channel_stat(final_params, ch)),
                 )
-        if len(street) > 1:
-            st.caption(
-                "The street-view channels share a single aggregator slot in the "
-                "apply path, so they are reported together. Where the posterior "
-                "prefers different statistics for them, only one can be carried "
-                "into the composite."
-            )
     else:
         # Standalone: a single channel at 100 % — weights are not
         # meaningful, so only the active channel's radius + aggregator are
@@ -4283,8 +4274,6 @@ def _render_study_detail(
         ch_label = _CHANNEL_DISPLAY.get(study_key, study_key.upper())
         st.caption(f"Single channel — **100 % {ch_label}**.")
         radius_key = f"{study_key}_radius"
-        stat_key = "ndvi_stat" if study_key == "ndvi" else "streetview_stat"
-        pct_key = "ndvi_percentile" if study_key == "ndvi" else "streetview_percentile"
         detail_cols = st.columns(2)
         with detail_cols[0]:
             try:
@@ -4295,7 +4284,7 @@ def _render_study_detail(
         with detail_cols[1]:
             st.metric(
                 f"{ch_label} aggregator",
-                _agg_label(final_params.get(stat_key), final_params.get(pct_key)),
+                _agg_label(*_channel_stat(final_params, study_key)),
             )
 
     # ── Per-subset scores ───────────────────────────────────────
