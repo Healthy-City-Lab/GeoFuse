@@ -3617,21 +3617,36 @@ class MetricFusionEngine:
                 tuple(cgi_formulas.formula_channels(self.cgi_formula)), res.form
             )
 
-        params = self._params_from_sweep(res, post, index_channels)
-        # The composite path rebuilds the index from raw channel values, so it
-        # needs the center and scale the model's weights and form refer to.
-        if self._active_greenery_channel == "cgi":
-            params.update(
-                self._channel_scaling(
-                    X,
-                    radii,
-                    stats,
-                    tensor_channels,
-                    index_channels,
-                    post.picked,
-                    prep_info["column_sd"],
-                )
+        # The composite path rebuilds the index from raw channel values. A
+        # linear index is a weighted average of them, with the weights carried
+        # onto the raw scale; synergy needs the center and scale its curve
+        # refers to.
+        scaling = (
+            self._channel_scaling(
+                X,
+                radii,
+                stats,
+                tensor_channels,
+                index_channels,
+                post.picked,
+                prep_info["column_sd"],
             )
+            if self._active_greenery_channel == "cgi"
+            else {}
+        )
+        linear = res.form == "linear"
+        params = self._params_from_sweep(
+            res,
+            post,
+            index_channels,
+            channel_sd=(
+                {ch: scaling.get(f"{ch}_scale", 1.0) for ch in index_channels}
+                if linear and scaling
+                else None
+            ),
+        )
+        if not linear:
+            params.update(scaling)
         params["__selection_method__"] = "bayesian_index"
         params["__sweep__"] = {
             "picked": [list(p) for p in res.picked],
@@ -3793,7 +3808,7 @@ class MetricFusionEngine:
                     out[f"{ch}_scale"] = out[f"{ch}_scale"] / (hi - lo)
         return out
 
-    def _params_from_sweep(self, res, post, index_channels) -> dict:
+    def _params_from_sweep(self, res, post, index_channels, channel_sd=None) -> dict:
         """Posterior -> the params dict the composite/apply path consumes.
 
         That path carries one radius and one statistic per channel, so the
@@ -3801,6 +3816,11 @@ class MetricFusionEngine:
         The projection is what the composite is built from; the blend and its
         credible intervals stay in the results bundle, and the effect that gets
         reported is the one the blend produced, not a refit at the modal cell.
+
+        The posterior's weights are influence shares on standardised channels.
+        With ``channel_sd`` (each channel's adjusted SD at its cell) a linear
+        index's weights are divided by it, so the weighted average of the raw
+        channels is the fitted index up to a shift and a positive scale.
         """
         formula = cgi_formulas.get_formula(self.cgi_formula)
         params: dict[str, Any] = {}
@@ -3824,8 +3844,8 @@ class MetricFusionEngine:
             params.setdefault(f"{ch}_stat", "mean")
             params.setdefault(f"{ch}_percentile", 50)
 
-        # Posterior-mean weights onto the formula's keys as integers summing to
-        # 100, which is the scale every downstream consumer expects.
+        # Posterior-mean weights onto the formula's keys as shares of 100, the
+        # scale every downstream consumer expects.
         w = np.asarray(post.weights).mean(0)
         keys = list(formula.weight_keys)
         main_key = cgi_formulas._CHANNEL_MAIN_KEY[self.cgi_formula]
@@ -3853,18 +3873,17 @@ class MetricFusionEngine:
                 )
                 if key in keys and n_main + k < len(w):
                     vals[keys.index(key)] = float(w[n_main + k])
+        if channel_sd is not None:
+            for ch in index_channels:
+                key = main_key.get(ch)
+                if key in keys:
+                    vals[keys.index(key)] /= max(float(channel_sd[ch]), 1e-12)
         total = vals.sum()
         if total <= 0:
             vals[:] = 1.0 / len(vals)
             total = 1.0
-        scaled = vals * 100.0 / total
-        floors = [int(v) for v in scaled]
-        for i in sorted(
-            range(len(scaled)), key=lambda i: scaled[i] - floors[i], reverse=True
-        )[: 100 - sum(floors)]:
-            floors[i] += 1
-        for key, v in zip(keys, floors):
-            params[key] = int(v)
+        for key, v in zip(keys, vals * 100.0 / total):
+            params[key] = round(float(v), 4)
         if post.powers is not None:
             for ch, p in zip(index_channels, np.asarray(post.powers).mean(0)):
                 params[f"{ch}_power"] = float(p)

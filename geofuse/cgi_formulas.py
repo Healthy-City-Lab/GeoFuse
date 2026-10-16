@@ -9,13 +9,14 @@ Formulas
 --------
 
 ``weighted_average`` (legacy default)
-    Three weights on standardised channels, ``(x − center) / scale``, with the
-    center and scale the discovery recorded (``<channel>_center`` /
-    ``<channel>_scale``: each channel's mean and covariate-adjusted SD). That is
-    the scale the posterior estimated the weights on, so the composite carries
-    exactly the shares it reported. Params recorded without a center and scale
-    replay as fitted, on the raw channel values. Weights are recorded as
-    integers summing to 100; the formula renormalizes by their total.
+    A weighted average of the raw channel values. The posterior estimates the
+    weights on standardised channels (its influence shares); the discovery
+    divides each by the channel's covariate-adjusted SD, so the average of the
+    raw values is the fitted index up to a shift and a positive scale. Params
+    recorded with ``<channel>_center`` / ``<channel>_scale`` (earlier runs)
+    replay on the standardised channels ``(x − center) / scale`` they were
+    fitted on. Weights are recorded as shares of 100; the formula renormalizes
+    by their total.
 
 ``synergy``
     Three-metric generalisation of Wang et al. 2026 (doi:10.3390/rs18010009),
@@ -40,7 +41,7 @@ Formulas
 
 Weights are no longer sampled. The discovery engine solves the
 simplex-constrained optimum in closed form and reports posterior means, which
-arrive here as integers summing to 100 (largest-remainder rounded).
+arrive here as shares of 100.
 """
 
 from __future__ import annotations
@@ -152,11 +153,10 @@ def _component_dtype(components: ComponentDict) -> np.dtype:
 
 
 def standardised_channel(values, params: dict, channel: str, dt) -> np.ndarray:
-    """One channel on the scale its weight was estimated on.
+    """One channel on the scale its weight applies to.
 
-    With ``<channel>_center`` and ``<channel>_scale`` recorded the value is
-    ``(x − center) / scale``; params recorded without them replay on the raw
-    values, as they were fitted.
+    The raw value, or ``(x − center) / scale`` for params recorded with
+    ``<channel>_center`` and ``<channel>_scale``.
     """
     center = params.get(f"{channel}_center")
     scale = params.get(f"{channel}_scale")

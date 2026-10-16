@@ -126,11 +126,6 @@ class TestFitBayesianIndexWiring(unittest.TestCase):
         self.assertTrue(null["imprecise"])
         self.assertIn("rate_ci_high", null)
 
-    def test_the_composite_scaling_is_recorded_for_either_form(self):
-        for ch in ("ndvi", "gvi"):
-            self.assertIn(f"{ch}_center", self.params)
-            self.assertGreater(self.params[f"{ch}_scale"], 0.0)
-
     def test_weights_land_on_the_formula_keys(self):
         from geofuse import cgi_formulas
 
@@ -138,7 +133,61 @@ class TestFitBayesianIndexWiring(unittest.TestCase):
             ("ndvi", "gvi"), self.params["__sweep__"]["form"]
         )
         keys = cgi_formulas.get_formula(name).weight_keys
-        self.assertEqual(sum(int(self.params[k]) for k in keys), 100)
+        self.assertAlmostEqual(sum(self.params[k] for k in keys), 100.0, places=2)
+
+
+class TestLinearRunRecordsRawWeights(unittest.TestCase):
+    """A linear study's weights apply to the raw channel values."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.addClassCleanup(
+            setattr, parallel, "process_worker_count", parallel.process_worker_count
+        )
+        parallel.process_worker_count = lambda *a, **k: 1
+        cls.eng = _stub_engine()
+        cls.params = MetricFusionEngine.fit_bayesian_index(
+            cls.eng,
+            "r2",
+            forms=("linear",),
+            sweep_splits=2,
+            reps=0,
+            gain_splits=0,
+            null_runs=0,
+            draws=100,
+            warmup=100,
+            chains=1,
+            radius_kernel="dirichlet",
+        )
+
+    def test_no_center_or_scale_is_recorded(self):
+        for ch in ("ndvi", "gvi"):
+            self.assertNotIn(f"{ch}_center", self.params)
+            self.assertNotIn(f"{ch}_scale", self.params)
+
+    def test_the_raw_average_is_the_fitted_index(self):
+        # Partialling the covariates out of the raw average gives the
+        # posterior-mean index at the projected cells, up to a scale.
+        from geofuse import bayesian_index, cgi_formulas
+
+        X, radii, stats, _, static = self.eng.build_index_tensor()
+        _, Xr = bayesian_index.prep(X, static["target"], static["cov"])
+        post = self.params["__posterior__"]
+        cells = [(list(radii).index(r), stats.index(c)) for r, c in post["picked"]]
+        raw = {
+            ch: X[:, i, ri, si]
+            for i, (ch, (ri, si)) in enumerate(zip(("ndvi", "gvi"), cells))
+        }
+        fitted = sum(
+            w * Xr[:, i, ri, si]
+            for i, (w, (ri, si)) in enumerate(zip(post["weight_mean"], cells))
+        )
+        comp = cgi_formulas.compute_cgi("weighted_average_gvi", self.params, raw)
+        q, _ = bayesian_index.covariate_basis(static["cov"], len(comp))
+        comp_r = comp - q @ (q.T @ comp)
+        self.assertAlmostEqual(
+            float(np.corrcoef(comp_r, fitted)[0, 1]), 1.0, places=6
+        )
 
 
 class TestSynergyRunRecordsItsScaling(unittest.TestCase):
