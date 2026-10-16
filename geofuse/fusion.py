@@ -168,7 +168,6 @@ class MetricFusionEngine:
         cgi_grid_spacing_m: float | None = None,
         whole_grid_scaling: bool = False,
         area_balanced_split: bool = False,
-        normalize_channels: bool = False,
         spatial_adjust_method: str = "none",
         spatial_adjust_max_df: int = 10,
         spatial_adjust_eps_m: float | None = None,
@@ -439,15 +438,6 @@ class MetricFusionEngine:
         self._coverage_report: dict | None = None
         self._entity_coverage_share: dict | None = None
         self.whole_grid_scaling: bool = bool(whole_grid_scaling)
-        # When True, each channel is min-max scaled to [0, 1] (per-channel
-        # bounds fixed at prepare time from the predictor distribution only —
-        # no outcome leakage) before the composite is formed. Default False
-        # keeps raw-channel composites. A discovered composite then centres and
-        # scales each channel with the recorded center and scale, carried onto
-        # whichever scale the channels arrive in.
-        self.normalize_channels: bool = bool(normalize_channels)
-        # Per-channel (lo, hi) min-max bounds, filled by prepare_fusion_data.
-        self._channel_minmax: dict[str, tuple[float, float]] | None = None
         # When True, the area-balanced train-val split tries to keep the total
         # area balanced across train / val / test sets.
         self.area_balanced_split: bool = bool(area_balanced_split)
@@ -2065,7 +2055,6 @@ class MetricFusionEngine:
         else:
             _log("INFO", "Target type: RASTER")
             df = self._prepare_raster_fusion()
-        self._compute_channel_scale(df)
         # RAM management: narrow the resident per-pixel frames' dtypes (wave
         # string -> category, 64-bit -> 32-bit) before the search + the RAM
         # cache load. On a 36M-row per-pixel panel this frees several GB.
@@ -2084,77 +2073,6 @@ class MetricFusionEngine:
             _helpers.downcast_fusion_dtypes(self.target_gdf)
         if self._preaggr_entity_gdf is not None:
             _helpers.downcast_fusion_dtypes(self._preaggr_entity_gdf)
-
-    @staticmethod
-    def _channel_column(fusion_df: pd.DataFrame, channel: str):
-        """A channel's per-pixel values out of the prepared frame, or ``None``.
-
-        The frame carries the source layers. ``gvi`` is not one of them — it is
-        the per-pixel sum of the two street-view components, which is what the
-        cache stores under that name.
-        """
-        if channel in fusion_df.columns:
-            return fusion_df[channel]
-        if channel == "gvi" and {"veg", "terrain"} <= set(fusion_df.columns):
-            return pd.to_numeric(fusion_df["veg"], errors="coerce") + pd.to_numeric(
-                fusion_df["terrain"], errors="coerce"
-            )
-        return None
-
-    def _compute_channel_scale(self, fusion_df: pd.DataFrame) -> None:
-        """Fix per-channel [0, 1] min-max bounds from the predictor distribution.
-
-        Robust 2nd/98th-percentile bounds per channel, computed once on the
-        prepared probe values (no outcome involved, so no CV leakage) and
-        applied identically to every fold / split / output. No-op unless
-        ``normalize_channels`` is on.
-        """
-        if not self.normalize_channels:
-            self._channel_minmax = None
-            return
-        bounds: dict[str, tuple[float, float]] = {}
-        # Every channel the cache can hold, so a two-channel study's ``gvi``
-        # gets real bounds instead of the (0, 1) fallback, which would clip it.
-        # The prepared frame carries the source layers only; ``gvi`` is their
-        # per-pixel sum, which is the distribution its bounds describe.
-        for ch in preaggregation.GreeneryCache.ALL_CHANNELS:
-            column = self._channel_column(fusion_df, ch)
-            if column is None:
-                bounds[ch] = (0.0, 1.0)
-                continue
-            vals = pd.to_numeric(column, errors="coerce").to_numpy(np.float64)
-            vals = vals[np.isfinite(vals)]
-            if vals.size == 0:
-                bounds[ch] = (0.0, 1.0)
-                continue
-            lo = float(np.percentile(vals, 2.0))
-            hi = float(np.percentile(vals, 98.0))
-            if hi <= lo:
-                lo, hi = float(vals.min()), float(vals.max())
-            bounds[ch] = (lo, hi)
-        self._channel_minmax = bounds
-        _log("INFO", f"Channel normalization bounds (2–98 pct): {bounds}")
-
-    def _normalize_channels(
-        self, blocks: dict[str, np.ndarray]
-    ) -> dict[str, np.ndarray]:
-        """Min-max scale each channel to [0, 1] using the fixed bounds, or pass through."""
-        if not self.normalize_channels or not self._channel_minmax:
-            return blocks
-
-        def _scale(a: np.ndarray, ch: str) -> np.ndarray:
-            lo, hi = self._channel_minmax.get(ch, (0.0, 1.0))
-            arr = np.asarray(a)
-            if not np.issubdtype(arr.dtype, np.floating):
-                arr = arr.astype(np.float64)
-            if hi <= lo:
-                return arr
-            # Scalar ops keep the input float width (float32 on the per-pixel
-            # trial path, float64 elsewhere).
-            dt = arr.dtype.type
-            return np.clip((arr - dt(lo)) / dt(hi - lo), dt(0.0), dt(1.0))
-
-        return {ch: _scale(a, ch) for ch, a in blocks.items()}
 
     # ────────────────────────────────────────────────────────────
     # ── Channel vocabulary ──────────────────────────────────────
@@ -2248,7 +2166,7 @@ class MetricFusionEngine:
     def _composite_from(
         self, params: dict, blocks: dict[str, np.ndarray]
     ) -> np.ndarray:
-        """Build the composite from normalized channel blocks via the active mode.
+        """Build the composite from the channel blocks via the active mode.
 
         CGI mode delegates to the formula; standalone mode takes its single
         channel directly, so the reported score is on the scale the search
@@ -3787,11 +3705,9 @@ class MetricFusionEngine:
 
         :func:`bayesian_index.composite_scaling` gives the mean and the
         covariate-adjusted SD of each channel at the cell the composite is built
-        from — the scale the model fitted on. With ``normalize_channels`` on,
-        the channels reach the formula min-max scaled, so the center and scale
-        are carried onto that scale.
+        from — the scale the model fitted on.
         """
-        out = bayesian_index.composite_scaling(
+        return bayesian_index.composite_scaling(
             X,
             column_sd,
             channels=index_channels,
@@ -3800,13 +3716,6 @@ class MetricFusionEngine:
             stats=stats,
             picked=picked,
         )
-        if getattr(self, "normalize_channels", False) and self._channel_minmax:
-            for ch in index_channels:
-                lo, hi = self._channel_minmax.get(ch, (0.0, 1.0))
-                if f"{ch}_center" in out and hi > lo:
-                    out[f"{ch}_center"] = (out[f"{ch}_center"] - lo) / (hi - lo)
-                    out[f"{ch}_scale"] = out[f"{ch}_scale"] / (hi - lo)
-        return out
 
     def _params_from_sweep(self, res, post, index_channels, channel_sd=None) -> dict:
         """Posterior -> the params dict the composite/apply path consumes.
@@ -5693,8 +5602,6 @@ class MetricFusionEngine:
         test_points = self.target_gdf.loc[self.test_data.index]
         test_blocks = self._aggregate_channels(test_points, params, subset="test")
 
-        # Per-channel scaling removed — the composite uses raw aggregated
-        # channels. ``whole_grid_scaling`` normalizes the composite below.
         test_combined = np.column_stack(list(test_blocks.values()))
         test_valid_mask = ~np.isnan(test_combined).any(axis=1)
 
@@ -5703,9 +5610,7 @@ class MetricFusionEngine:
 
         # Calculate composite via the active mode. Same fork as ``apply_fusion``
         # so the held-out score is on the same scale the study optimized.
-        test_composite = self._composite_from(
-            params, self._normalize_channels(test_blocks)
-        )
+        test_composite = self._composite_from(params, test_blocks)
 
         # Composite-level [0, 1] normalization (raw when the toggle is off),
         # mirrored for standalone single-channel composites.
@@ -6117,9 +6022,7 @@ class MetricFusionEngine:
         # applied composite and the held-out score agree.
         all_blocks = self._aggregate_channels(all_points, weights, subset="all")
 
-        # Per-channel scaling removed — the composite uses raw aggregated
-        # channel values.
-        composite = self._composite_from(weights, self._normalize_channels(all_blocks))
+        composite = self._composite_from(weights, all_blocks)
         # Composite-level [0, 1] normalization over the whole grid when the
         # toggle is on (raw otherwise); mirrors the output raster + standalones.
         composite = self._finalize_composite(composite)
@@ -8126,13 +8029,12 @@ class MetricFusionEngine:
             if progress_callback:
                 progress_callback(40 + int(45 * (n + 1) / len(channels)), 100)
 
-        # Compute the composite from RAW channels (no per-channel scaling),
-        # then apply the ``whole_grid_scaling`` toggle: min-max normalise to
-        # [0, 1] over the whole grid when on, raw otherwise — the same
-        # treatment the scorer applied, mirrored for standalone single-channel
-        # maps.
+        # The composite from the raw channels, then the ``whole_grid_scaling``
+        # toggle: min-max normalise to [0, 1] over the whole grid when on, raw
+        # otherwise — the same treatment the scorer applied, mirrored for
+        # standalone single-channel maps.
         logger.info(f"Calculating composite via formula '{formula.name}'...")
-        composite = self._composite_from(final_params, self._normalize_channels(blocks))
+        composite = self._composite_from(final_params, blocks)
         composite = self._finalize_composite(np.asarray(composite, dtype=np.float64))
 
         # 7. Create raster

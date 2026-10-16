@@ -1848,7 +1848,6 @@ def run_fusion(
                 cgi_grid_spacing_m=cgi_grid_spacing_m,
                 whole_grid_scaling=whole_grid_scaling,
                 area_balanced_split=area_balanced_split,
-                normalize_channels=normalize_channels,
                 spatial_adjust_method=spatial_adjust_method,
                 spatial_adjust_max_df=spatial_adjust_max_df,
                 spatial_adjust_eps_m=spatial_adjust_eps_m,

@@ -51,8 +51,6 @@ def _engine(formula: str, mode: str = "cgi") -> MetricFusionEngine:
     e._active_greenery_channel = mode
     e.gvi_buffer_max_m = 500.0
     e.ndvi_buffer_max_m = 1000.0
-    e.normalize_channels = False
-    e._channel_minmax = None
     e.veg_data = "VEG-LAYER"
     e.terrain_data = "TERRAIN-LAYER"
     e.ndvi_data = "NDVI-LAYER"
@@ -179,58 +177,6 @@ class TestTheCompositeIsBuiltFromThatSet(unittest.TestCase):
                 self.assertTrue(
                     np.array_equal(e._composite_from({}, {mode: values}), values)
                 )
-
-    def test_normalization_is_keyed_by_channel_name(self):
-        e = _engine("weighted_average_gvi")
-        e.normalize_channels = True
-        e._channel_minmax = {"ndvi": (0.0, 2.0), "gvi": (0.0, 4.0)}
-        out = e._normalize_channels({"ndvi": np.array([1.0]), "gvi": np.array([1.0])})
-        self.assertAlmostEqual(float(out["ndvi"][0]), 0.5)
-        self.assertAlmostEqual(float(out["gvi"][0]), 0.25)
-
-
-class TestGviGetsRealNormalizationBounds(unittest.TestCase):
-    """``gvi`` is not a column of the prepared frame — it is the components' sum.
-
-    Reading it straight off the frame finds nothing and falls back to (0, 1),
-    which silently clips the channel instead of scaling it.
-    """
-
-    FRAME = {
-        "veg": [0.1, 0.2, 0.3],
-        "terrain": [0.05, 0.05, 0.1],
-        "ndvi": [0.4, 0.5, 0.6],
-    }
-
-    def _frame(self):
-        import pandas as pd
-
-        return pd.DataFrame(self.FRAME)
-
-    def test_gvi_is_read_as_the_component_sum(self):
-        col = MetricFusionEngine._channel_column(self._frame(), "gvi")
-        self.assertEqual([round(float(v), 3) for v in col], [0.15, 0.25, 0.4])
-
-    def test_a_channel_with_no_column_and_no_rule_is_absent(self):
-        import pandas as pd
-
-        self.assertIsNone(
-            MetricFusionEngine._channel_column(pd.DataFrame({"veg": [1.0]}), "gvi")
-        )
-
-    def test_the_bounds_are_derived_rather_than_defaulted(self):
-        e = object.__new__(MetricFusionEngine)
-        e.normalize_channels = True
-        e._compute_channel_scale(self._frame())
-        self.assertNotEqual(e._channel_minmax["gvi"], (0.0, 1.0))
-        lo, hi = e._channel_minmax["gvi"]
-        self.assertGreater(hi, lo)
-
-    def test_the_toggle_still_switches_it_all_off(self):
-        e = object.__new__(MetricFusionEngine)
-        e.normalize_channels = False
-        e._compute_channel_scale(self._frame())
-        self.assertIsNone(e._channel_minmax)
 
 
 if __name__ == "__main__":

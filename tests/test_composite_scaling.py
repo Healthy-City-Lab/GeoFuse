@@ -10,7 +10,6 @@ composite is the fitted index rather than a reweighted cousin of it.
 
 import os
 import sys
-import types
 import unittest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -250,28 +249,6 @@ class TestScalingIsRecorded(unittest.TestCase):
         self.assertAlmostEqual(out["ndvi_center"], float(X[:, 0, 1, 0].mean()))
         self.assertAlmostEqual(out["gvi_center"], float(X[5:, 1, 2, 1].mean()))
         self.assertEqual((out["ndvi_scale"], out["gvi_scale"]), (0.15, 0.07))
-
-    def test_the_engine_carries_it_onto_normalised_channels(self):
-        from geofuse.fusion import MetricFusionEngine as E
-
-        X, sd = self._tensor()
-        eng = types.SimpleNamespace(
-            normalize_channels=True,
-            _channel_minmax={"ndvi": (0.0, 1.0), "gvi": (0.0, 2.0)},
-        )
-        eng._channel_scaling = types.MethodType(E._channel_scaling, eng)
-        out = eng._channel_scaling(
-            X,
-            np.array([100.0, 200.0, 400.0]),
-            ["mean", "p50"],
-            ["ndvi", "gvi"],
-            ["ndvi", "gvi"],
-            ((200, "mean"), (400, "p50")),
-            sd,
-        )
-        self.assertAlmostEqual(out["gvi_center"], float(X[5:, 1, 2, 1].mean()) / 2.0)
-        self.assertAlmostEqual(out["gvi_scale"], 0.075)
-        self.assertAlmostEqual(out["ndvi_scale"], 0.15)
 
 
 if __name__ == "__main__":

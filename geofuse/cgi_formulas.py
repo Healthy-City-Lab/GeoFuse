@@ -98,8 +98,7 @@ _CLAMP_HI = 1.0
 # ────────────────────────────────────────────────────────────────────
 
 # Mapping from canonical channel name to its 1-D values array for one batch of
-# samples: the aggregated channel values, min-max scaled first when the engine's
-# ``normalize_channels`` is on.
+# samples: the aggregated channel values.
 ComponentDict = dict[str, np.ndarray]
 
 
