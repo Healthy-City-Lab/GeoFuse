@@ -1213,6 +1213,7 @@ def fit(
     chains=4,
     seed=42,
     radius_prior="rungs",
+    entities=None,
 ):
     """NUTS over every unknown the index has: scale, aggregation, weights, form.
 
@@ -1243,12 +1244,25 @@ def fit(
     Without that step a channel whose rungs disagree gets a lower-variance
     blend and therefore less influence at the same weight, which both breaks
     the reading of a weight as a share and ties the kernel width to the weight.
+
+    ``entities`` (one label per row of a panel) adds a random intercept per
+    entity, integrated out in closed form: each entity's rows share the
+    exchangeable covariance ``sigma² I + sigma_u² 11ᵀ``. Without it the waves of
+    one person count as independent evidence and the interval on ``beta`` is
+    too narrow.
     """
     import jax
     import jax.numpy as jnp
     import numpyro
     import numpyro.distributions as dist
     from numpyro.infer import MCMC, NUTS
+
+    codes = counts = None
+    if entities is not None:
+        _, ent = np.unique(np.asarray(entities), return_inverse=True)
+        n_groups = int(ent.max()) + 1
+        codes = jnp.asarray(ent)
+        counts = jnp.asarray(np.bincount(ent, minlength=n_groups).astype(np.float64))
 
     numpyro.set_host_device_count(chains)
     E = np.asarray(E, dtype=np.float64)
@@ -1348,7 +1362,28 @@ def fit(
         e = (e - e.mean()) / jnp.maximum(e.std(), 1e-9)
         beta = numpyro.sample("beta", dist.Normal(0.0, 1.0))
         sigma = numpyro.sample("sigma", dist.HalfNormal(2.0))
-        numpyro.sample("obs", dist.Normal(beta * e, sigma), obs=yj)
+        if codes is None:
+            numpyro.sample("obs", dist.Normal(beta * e, sigma), obs=yj)
+            return
+        # Marginal log-likelihood of an exchangeable block of size m, from the
+        # block's residual sum and sum of squares.
+        sigma_u = numpyro.sample("sigma_u", dist.HalfNormal(1.0))
+        r = yj - beta * e
+        s1 = jax.ops.segment_sum(r, codes, num_segments=n_groups)
+        s2 = jax.ops.segment_sum(r * r, codes, num_segments=n_groups)
+        ve, vu = sigma**2, sigma_u**2
+        denom = ve + counts * vu
+        quad = (s2 - vu / denom * s1**2) / ve
+        numpyro.factor(
+            "obs",
+            -0.5
+            * jnp.sum(
+                counts * math.log(2.0 * math.pi)
+                + (counts - 1.0) * jnp.log(ve)
+                + jnp.log(denom)
+                + quad
+            ),
+        )
 
     # A channel with no signal leaves its kernel location flat under the prior,
     # and the sampler has to traverse that ridge without stepping off it, so the
@@ -1426,7 +1461,12 @@ def posterior_from(
         rhat_max=rhat,
         ess_min=ess,
         divergences=int(np.sum(mcmc.get_extra_fields()["diverging"])),
-        sigma=np.asarray(s["sigma"]) if "sigma" in s else None,
+        # The residual SD a partial R² divides by includes the entity intercept.
+        sigma=(
+            np.sqrt(np.asarray(s["sigma"]) ** 2 + np.asarray(s["sigma_u"]) ** 2)
+            if "sigma_u" in s
+            else np.asarray(s["sigma"]) if "sigma" in s else None
+        ),
         radius_weights=np.asarray(s["radius_w"]) if "radius_w" in s else None,
         peak_radius=np.exp(np.asarray(s["mu"])) if "mu" in s else None,
         kernel_width=np.asarray(s["kw"]) if "kw" in s else None,
@@ -1510,12 +1550,15 @@ def grid_posterior(
     seed=42,
     column_sd=None,
     radius_prior="rungs",
+    entities=None,
 ):
     """The joint model over the whole grid of the index channels, summarised.
 
     ``radius_idx`` lists each channel's own rungs; every other rung is masked
     out of its kernel. Returns ``(posterior, grid, grid_kwargs)`` so a caller
-    can refit the same model, e.g. for :func:`null_calibration`.
+    can refit the same model, e.g. for :func:`null_calibration`. ``entities``
+    (a panel's entity per row) adds the per-entity intercept of :func:`fit`
+    and travels in ``grid_kwargs``.
     """
     grid = np.asarray(Xr)[:, list(channel_index), :, :]
     radius_mask = np.zeros((len(channels), len(radii)), dtype=bool)
@@ -1528,6 +1571,7 @@ def grid_posterior(
         radius_kernel=radius_kernel,
         aggregator=aggregator,
         radius_prior=radius_prior,
+        entities=entities,
     )
     mcmc = fit(
         grid,
@@ -1985,8 +2029,9 @@ def null_calibration(
             paths.append(_write_memmap(Ef, ".geofuse-null-form"))
             choice = (paths[1], Ef.shape, tuple(forms))
         panel = (groups, entities, waves)
+        kwargs = dict(fit_kwargs, entities=entities)
         tasks = [
-            (paths[0], E.shape, y, form, 3_000 + i, dict(fit_kwargs), choice, panel)
+            (paths[0], E.shape, y, form, 3_000 + i, kwargs, choice, panel)
             for i in range(n)
         ]
         n_workers = workers or min(n, parallel.process_worker_count(n))

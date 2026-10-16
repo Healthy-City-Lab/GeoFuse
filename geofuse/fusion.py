@@ -3332,7 +3332,8 @@ class MetricFusionEngine:
         groups = self._inner_split_groups(static)
         if groups is not None:
             groups = groups[prep_info["kept"]]
-        # A panel's null permutes whole entity histories, not rows.
+        # On a panel the posterior carries a per-entity intercept and its null
+        # permutes whole entity histories, not rows.
         entities = waves = None
         eid = static.get("entity_id")
         if getattr(self, "is_longitudinal", False) and eid is not None:
@@ -3434,6 +3435,7 @@ class MetricFusionEngine:
             seed=seed,
             column_sd=prep_info["column_sd"],
             radius_prior=radius_prior,
+            entities=entities,
         )
         null = (
             bayesian_index.null_calibration(
@@ -3447,7 +3449,6 @@ class MetricFusionEngine:
                 form_E=Xr.reshape(len(Xr), -1)[:, list(res.columns)],
                 forms=forms,
                 groups=groups,
-                entities=entities,
                 waves=waves,
                 **grid_kwargs,
             )

@@ -1326,6 +1326,26 @@ class TestExposureResponseProjectionIsRankSafe(unittest.TestCase):
         np.testing.assert_allclose(r_dup, r_clean, atol=1e-10)
 
 
+class TestPanelPosterior(unittest.TestCase):
+    def test_the_entity_intercept_widens_the_effect_interval(self):
+        # Exposure and a strong intercept both vary by entity, so treating the
+        # waves as independent rows understates the uncertainty on beta.
+        rng = np.random.default_rng(31)
+        n_ent, waves = 120, 4
+        ent = np.repeat(np.arange(n_ent), waves)
+        E = np.repeat(rng.normal(size=(n_ent, 2)), waves, axis=0)
+        E += 0.1 * rng.normal(size=E.shape)
+        y = np.repeat(rng.normal(size=n_ent), waves) * 2.0 + rng.normal(size=len(ent))
+        y = (y - y.mean()) / y.std()
+        kw = dict(form="linear", draws=200, warmup=200, chains=1, seed=1)
+        plain = bi.fit(E, y, **kw).get_samples()
+        panel = bi.fit(E, y, entities=ent, **kw).get_samples()
+        self.assertIn("sigma_u", panel)
+        self.assertGreater(
+            float(np.std(panel["beta"])), 1.5 * float(np.std(plain["beta"]))
+        )
+
+
 class TestPanelPermutation(unittest.TestCase):
     def test_rows_are_permuted_as_before_without_entities(self):
         y = np.arange(50.0)
