@@ -166,6 +166,10 @@ def _write_fusion_outputs(
       against the lowest group with its test for trend, and the spline test of
       departure from linearity, in the form the greenspace literature reports.
     - ``exposure_response_curve.csv`` — the fitted spline curve, ready to plot.
+
+    In the effect tables the estimates use every row and the standard errors,
+    intervals and p-values the held-out rows; ``test_estimate``, ``test_n`` and
+    ``mde`` (the minimum detectable effect) say what that inference rests on.
     """
 
     import numpy as np
@@ -429,6 +433,8 @@ def _write_fusion_outputs(
                     "or_ci_low": _f(per_iqr.get("or_ci_low")),
                     "or_ci_high": _f(per_iqr.get("or_ci_high")),
                     "p_value": None,
+                    "test_estimate": _f(per_iqr.get("test_estimate")),
+                    "mde": _f(per_iqr.get("mde")),
                 }
             )
         quartiles = er_report.get("quartiles") or {}
@@ -449,6 +455,8 @@ def _write_fusion_outputs(
                     "or_ci_low": _f(row.get("or_ci_low")),
                     "or_ci_high": _f(row.get("or_ci_high")),
                     "p_value": _f(row.get("p_value")),
+                    "test_estimate": _f(row.get("test_estimate")),
+                    "mde": _f(row.get("mde")),
                 }
             )
         if quartiles.get("trend_p") is not None:
@@ -493,6 +501,7 @@ def _write_fusion_outputs(
         # a published single-channel result is read against.
         for _r in er_rows[_row_start:]:
             _r["study"] = _study_key
+            _r["test_n"] = er_report.get("inference_n")
         curve = (nonlinear or {}).get("curve")
         if curve:
             er_curve_rows.extend(
@@ -530,6 +539,9 @@ def _write_fusion_outputs(
                         "ci_high": _f(row.get("ci_high")),
                         "odds_ratio": _f(row.get("odds_ratio")),
                         "p_value": _f(row.get("p_value")),
+                        "test_estimate": _f(row.get("test_estimate")),
+                        "mde": _f(row.get("mde")),
+                        "test_n": block.get("inference_n"),
                     }
                 )
             for row in block.get("interaction_terms") or []:
@@ -546,6 +558,9 @@ def _write_fusion_outputs(
                         "ci_high": None,
                         "odds_ratio": None,
                         "p_value": _f(row.get("p_value")),
+                        "test_estimate": _f(row.get("test_estimate")),
+                        "mde": _f(row.get("mde")),
+                        "test_n": block.get("inference_n"),
                     }
                 )
             mod_rows.append(
