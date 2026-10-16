@@ -148,15 +148,14 @@ sweep's held-out |t| under the metric name `sweep_holdout_abs_t`. It is a
 t-statistic over resamples of the training pool, not a value of the objective,
 so it does not share a scale with the other rows.
 
-**`parameters.csv`** also lists `<channel>_center` and `<channel>_scale` for
-each channel of a composite: the mean and the covariate-adjusted standard
-deviation that standardise the channel before the weights (and, for synergy,
-the percentile curve, powers and products) are applied. They belong to the
-composite as much as the weights do. A composite is therefore in SD units, as
-are `composite_greenery.tif` (unless scaled to [0, 1]) and the per-IQR effect in
-`exposure_response.csv`; standalone channels stay in their layer's own units.
-Results saved before these keys existed rebuild from the raw channel values, as
-they were fitted.
+**`parameters.csv`** records the composite weights as shares of 100 of a mix of
+raw channel values (and, for synergy, of their pair and triple geometric
+means), so the composite, `composite_greenery.tif` (unless scaled to [0, 1])
+and the per-IQR effect in `exposure_response.csv` are in the channels' own
+units. The posterior's influence shares, on standardised terms, are in
+`discovery.csv`. Results saved by earlier versions carry `<channel>_center` /
+`<channel>_scale` (and, for synergy, powers) and rebuild through the formulas
+they were fitted with.
 
 **`discovery.csv`** has one row per weight. `radius_m` and `aggregator` are the
 posterior's projection onto one cell per channel, which is the cell the
@@ -172,9 +171,9 @@ ground; for percentile aggregators they are a mean-equivalent approximation.
 `aggregators_separated` lists the statistics the data distinguished from an even
 blend. Each row also carries the posterior weight with its credible interval,
 whether the radius sat at the edge of the searched ladder, and the channel's
-standalone score against the composite's gain and permutation p-value. Synergy
-pair terms appear as their own rows with the grid columns blank, since a pair
-has no spatial scale of its own.
+standalone score against the composite's gain and its p-value. Synergy
+interaction terms appear as their own rows with the grid columns blank, since
+an interaction has no spatial scale of its own.
 
 **`results_summary.json` records a `config_hash` and a `test_reads` count.** The
 hash identifies the configuration that produced the result, so a pre-registered

@@ -203,22 +203,29 @@ Nothing below is pre-specified.
   default, follows the listed rungs.
 - **Aggregation statistic.** Mean, median or a percentile of the values inside
   that buffer.
-- **Functional form.** A weighted sum, or a synergy form with powers on the main
-  terms and pairwise products, following Wang et al. 2026
-  ([doi:10.3390/rs18010009](https://doi.org/10.3390/rs18010009)). Both forms
-  work on standardised channels: each channel centred on its mean and divided
-  by its covariate-adjusted standard deviation, the scale the Bayesian fit
-  estimates on. The weighted sum combines those standardised values, so the
-  composite is in SD units. The synergy form passes them through the normal
-  cumulative distribution first, so each channel enters as its approximate
-  percentile. Where the source paper min-max scales each indicator to [0, 1],
-  this keeps the values in (0, 1) without letting the single highest and
-  lowest entity set the scale, which is what lets the Bayesian fit sample the
-  synergy form reliably. The mean and SD are recorded with the parameters, so
-  maps and test scores rebuild exactly the index that was fitted.
-- **Channel weights**, reported with credible intervals. A weight is the share
-  of a standardised channel, so weights compare channels on a common footing
-  whatever their units.
+- **Functional form.** A weighted average of the raw channel values, or a
+  synergy form that adds the geometric mean of every channel pair and, with
+  three channels, of the triple: √(NDVI⁺ · GVI), ∛(NDVI⁺ · Veg · Ter), with
+  NDVI⁺ = max(NDVI, 0) inside the interactions only, so water and bare surfaces
+  add no synergy but still enter their own term. It follows the idea of Wang et
+  al. 2026 ([doi:10.3390/rs18010009](https://doi.org/10.3390/rs18010009))
+  without powers or rescaling: every term stays on its channels' physical
+  scale, so a cell's CGI does not depend on the study area it was fitted in,
+  and the linear form is the synergy form with its interaction weights at 0.
+  Both forms are computed per CGI cell and then averaged over the entity's
+  cells. The sweep tries synergy on the 50 best candidates of the linear grid
+  and keeps the form that scores better on fresh splits.
+- **Channel weights**, reported twice. The posterior estimates each term's
+  weight on its covariate-adjusted, standardised scale: these are the
+  **influence shares**, with credible intervals, which compare channels on a
+  common footing whatever their units. The composite carries each share onto
+  raw units by dividing it by that term's SD, so the map is the fitted index up
+  to a shift and a positive scale; these **composite weights** are what
+  `parameters.csv` records. A channel with a small spread gets a large composite
+  weight for the same influence.
+- **Composite scaling.** "Scale composite map to [0, 1]" rescales the written
+  map only; scores, the entity table and every reported effect use the raw
+  composite.
 
 ### Why the result is defensible
 
