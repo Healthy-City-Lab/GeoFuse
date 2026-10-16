@@ -2162,10 +2162,8 @@ def run_fusion(
             except Exception as exc:
                 _log_fusion("WARN", f"[{label}] Dispersion sanity check failed: {exc}.")
 
-            # Optional iterative-VIF collinearity check on the CGI grid
-            # pixel values. Disabled channels get pinned to weight 0 in
-            # every subsequent trial (the engine threads
-            # ``self._disabled_channels`` into ``formula.suggest_params``).
+            # Optional iterative-VIF collinearity check on the study's channels
+            # at the CGI grid pixels.
             if check_collinearity:
                 try:
                     # Pass ``fusion_df`` explicitly — this stage runs
@@ -2175,15 +2173,15 @@ def run_fusion(
                         data=fusion_df,
                         vif_threshold=float(vif_threshold),
                     )
-                    if engine._disabled_channels:
+                    if collinearity_report and engine._high_vif_channels:
                         _log_fusion(
                             "WARN",
-                            f"[{label}] Collinearity check dropped: "
-                            f"{sorted(engine._disabled_channels)}. "
-                            f"VIFs (initial): "
+                            f"[{label}] Collinearity check: "
+                            f"{sorted(engine._high_vif_channels)} above the VIF "
+                            f"threshold (kept in the search). VIFs (initial): "
                             f"{dict(zip(collinearity_report['channels_in'], collinearity_report['initial_vifs']))}.",
                         )
-                    else:
+                    elif collinearity_report:
                         _log_fusion(
                             "OK",
                             f"[{label}] Collinearity check passed (max VIF ≤ "
@@ -2193,7 +2191,7 @@ def run_fusion(
                     _log_fusion(
                         "WARN",
                         f"[{label}] Collinearity check failed: {exc}. "
-                        "Continuing with all three channels enabled.",
+                        "Continuing with every channel.",
                     )
 
             # Config fingerprint keys the per-job caches; ``suffix`` forces a
@@ -2983,8 +2981,8 @@ def run_fusion(
                 "report_dir": report_dir,
                 # ``None`` when the collinearity check wasn't requested.
                 "collinearity_report": getattr(engine, "_collinearity_report", None),
-                "disabled_channels": sorted(
-                    getattr(engine, "_disabled_channels", set()) or set()
+                "high_vif_channels": sorted(
+                    getattr(engine, "_high_vif_channels", set()) or set()
                 ),
                 # Discovery diagnostics, the held-out direction sign,
                 # and the AIC/BIC verdict vs the best standalone (when run).

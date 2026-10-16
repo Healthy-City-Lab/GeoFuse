@@ -538,11 +538,9 @@ class MetricFusionEngine:
         self._spatial_block_group_col: str | None = None
         self._cancel_callback: Callable[[], bool] | None = None
 
-        # Channels turned off by the optional collinearity check
-        # (``check_channel_collinearity``). Disabled channels are pinned to
-        # weight 0 in every trial and skipped in the per-channel
-        # aggregation path. Default: all three channels active.
-        self._disabled_channels: set[str] = set()
+        # Channels above the VIF threshold in the optional collinearity check
+        # (``check_channel_collinearity``).
+        self._high_vif_channels: set[str] = set()
         # Collinearity report from the most recent check (or ``None`` if
         # the check wasn't requested). Stored so the runner can hand it to
         # the results UI without re-running the analysis.
@@ -2226,11 +2224,11 @@ class MetricFusionEngine:
     ) -> dict:
         """Run iterative-VIF channel reduction on the CGI grid pixel values.
 
-        Reads per-pixel ``veg`` / ``terrain`` / ``ndvi`` columns from
-        ``data`` (typically the ``fusion_df`` produced by
-        :meth:`prepare_fusion_data` — every CGI grid pixel before any
-        train/val/test split), optionally subsamples to ``sample_size``
-        rows for speed, then delegates the math to
+        Reads the study's own channels per pixel from ``data`` (typically the
+        ``fusion_df`` produced by :meth:`prepare_fusion_data` — every CGI grid
+        pixel before any train/val/test split; ``gvi`` is the sum of ``veg``
+        and ``terrain``), optionally subsamples to ``sample_size`` rows for
+        speed, then delegates the math to
         :func:`statistical_testing.iterative_vif_reduction`.
 
         When ``data`` is not supplied, falls back to the post-split pool
@@ -2238,11 +2236,11 @@ class MetricFusionEngine:
         path calls this **before** ``split_data`` runs, so passing
         ``fusion_df`` explicitly is the standard usage.
 
-        Channels dropped by the procedure are recorded in
-        ``self._disabled_channels`` and pinned to weight 0 in every trial.
-        The full report (pairwise Pearson, initial / final VIFs, the
-        per-iteration drop history) is stored on
-        ``self._collinearity_report`` so the runner can hand it to the UI.
+        Channels the procedure would drop are reported in
+        ``self._high_vif_channels``; they stay in the index search. The full
+        report (pairwise Pearson, initial / final VIFs, the per-iteration drop
+        history) is stored on ``self._collinearity_report`` so the runner can
+        hand it to the UI. A study with one channel has nothing to check.
 
         The check uses the raw pixel values rather than the
         pre-aggregated cache because the aggregation step smooths spatial
@@ -2270,15 +2268,30 @@ class MetricFusionEngine:
                 )
             df = pd.concat(frames, ignore_index=False) if len(frames) > 1 else frames[0]
 
-        all_channels = ["veg", "terrain", "ndvi"]
-        missing = [c for c in all_channels if c not in df.columns]
+        all_channels = list(self._composite_channels())
+        sources = {"gvi": ["veg", "terrain"]}
+        missing = [
+            c
+            for ch in all_channels
+            for c in sources.get(ch, [ch])
+            if c not in df.columns
+        ]
         if missing:
             raise ValueError(
                 f"Channel columns missing from CGI pool: {missing}. "
                 "Re-run prepare_fusion_data() with all channels loaded."
             )
+        self._high_vif_channels = set()
+        if len(all_channels) < 2:
+            self._collinearity_report = None
+            return None
 
-        X = df[all_channels].to_numpy(dtype=np.float64)
+        X = np.column_stack(
+            [
+                df[sources.get(ch, [ch])].to_numpy(dtype=np.float64).sum(axis=1)
+                for ch in all_channels
+            ]
+        )
         mask = np.isfinite(X).all(axis=1)
         X = X[mask]
         if len(X) > int(sample_size):
@@ -2296,7 +2309,7 @@ class MetricFusionEngine:
 
         kept = set(report["kept"])
         dropped = set(report["dropped"])
-        self._disabled_channels = {c for c in all_channels if c not in kept}
+        self._high_vif_channels = {c for c in all_channels if c not in kept}
         self._collinearity_report = dict(report)
         self._collinearity_report["vif_threshold"] = float(vif_threshold)
         self._collinearity_report["sample_size"] = int(len(X))
@@ -2304,8 +2317,8 @@ class MetricFusionEngine:
 
         if dropped:
             logger.warning(
-                f"Collinearity reduction dropped: {sorted(dropped)}. "
-                f"Kept: {sorted(kept)}. Initial VIFs: "
+                f"Collinearity check: {sorted(dropped)} above the VIF threshold "
+                f"(kept in the search). Initial VIFs: "
                 f"{dict(zip(all_channels, report['initial_vifs']))}."
             )
         else:

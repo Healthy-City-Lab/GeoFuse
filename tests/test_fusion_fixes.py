@@ -139,5 +139,32 @@ class TestDispersionCheck(unittest.TestCase):
         self.assertEqual(report["flagged"], ["income"])
 
 
+class TestCollinearityCheck(unittest.TestCase):
+    @staticmethod
+    def _engine(formula):
+        from geofuse.fusion import MetricFusionEngine
+
+        eng = object.__new__(MetricFusionEngine)
+        eng.cgi_formula = formula
+        eng._active_greenery_channel = "cgi"
+        return eng
+
+    def test_a_two_channel_study_checks_ndvi_against_gvi(self):
+        rng = np.random.default_rng(0)
+        veg, ter = rng.random(500), rng.random(500)
+        ndvi = veg + ter + 0.01 * rng.normal(size=500)
+        df = pd.DataFrame({"veg": veg, "terrain": ter, "ndvi": ndvi})
+        eng = self._engine("weighted_average_gvi")
+        report = eng.check_channel_collinearity(data=df)
+        self.assertEqual(report["channels_in"], ["ndvi", "gvi"])
+        self.assertEqual(len(eng._high_vif_channels), 1)
+
+    def test_a_one_channel_study_has_nothing_to_check(self):
+        eng = self._engine("weighted_average_gvi")
+        eng._active_greenery_channel = "ndvi"
+        df = pd.DataFrame({"veg": [0.1, 0.2], "terrain": [0.0, 0.1], "ndvi": [0.3, 0.6]})
+        self.assertIsNone(eng.check_channel_collinearity(data=df))
+
+
 if __name__ == "__main__":
     unittest.main()
