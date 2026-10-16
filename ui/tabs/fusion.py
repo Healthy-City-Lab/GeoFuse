@@ -469,7 +469,6 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "discovery_reps",
     "discovery_shuffles",
     "gain_splits",
-    "gain_permutations",
     "null_calibration_runs",
     "posterior_draws",
     "posterior_warmup",
@@ -502,7 +501,6 @@ _FUSION_PARAM_TO_WIDGET: dict[str, str] = {
     "discovery_reps": "fusion_discovery_reps",
     "discovery_shuffles": "fusion_discovery_shuffles",
     "gain_splits": "fusion_gain_splits",
-    "gain_permutations": "fusion_gain_permutations",
     "null_calibration_runs": "fusion_null_calibration_runs",
     "posterior_draws": "fusion_posterior_draws",
     "posterior_chains": "fusion_posterior_chains",
@@ -550,7 +548,6 @@ _FUSION_SEED_INT_WIDGETS: frozenset[str] = frozenset(
         "fusion_discovery_reps",
         "fusion_discovery_shuffles",
         "fusion_gain_splits",
-        "fusion_gain_permutations",
         "fusion_null_calibration_runs",
         "fusion_posterior_draws",
         "fusion_posterior_chains",
@@ -2040,7 +2037,6 @@ def _render_study_details_panel(
             "discovery_reps",
             "discovery_shuffles",
             "gain_splits",
-            "gain_permutations",
             "null_calibration_runs",
             "posterior_draws",
             "posterior_chains",
@@ -2085,17 +2081,9 @@ def _render_study_details_panel(
                 key="fusion_gain_splits",
                 help=(
                     "Composite vs each standalone under the identical sweep, on "
-                    "the same held-out rows. 0 skips the comparison."
-                ),
-            )
-            gain_permutations_ui = st.number_input(
-                "Gain permutations",
-                **_fs_bounds("gain_permutations"),
-                step=10,
-                key="fusion_gain_permutations",
-                help=(
-                    "Permutation null for the *gain*, so the composite's extra "
-                    "flexibility is priced in rather than assumed away."
+                    "the same held-out rows; the gain is tested with a "
+                    "corrected resampled t-test over the splits. 0 skips the "
+                    "comparison."
                 ),
             )
             posterior_draws_ui = st.number_input(
@@ -2301,7 +2289,6 @@ def _render_study_details_panel(
         "discovery_reps": int(discovery_reps_ui),
         "discovery_shuffles": int(discovery_shuffles_ui),
         "gain_splits": int(gain_splits_ui),
-        "gain_permutations": int(gain_permutations_ui),
         "null_calibration_runs": int(null_calibration_runs_ui),
         "posterior_draws": int(posterior_draws_ui),
         "posterior_warmup": int(posterior_warmup_ui),
@@ -5408,7 +5395,6 @@ def render(output_dir: str) -> None:
     discovery_reps_param = int(study_state.get("discovery_reps", 5))
     discovery_shuffles_param = int(study_state.get("discovery_shuffles", 12))
     gain_splits_param = int(study_state.get("gain_splits", 20))
-    gain_permutations_param = int(study_state.get("gain_permutations", 100))
     null_calibration_runs_param = int(study_state.get("null_calibration_runs", 16))
     posterior_draws_param = int(study_state.get("posterior_draws", 800))
     posterior_warmup_param = int(
@@ -5714,8 +5700,7 @@ def render(output_dir: str) -> None:
                 st.write(
                     f"**Validation:** {discovery_reps_param}×"
                     f"{discovery_shuffles_param} discovery replicates · "
-                    f"{gain_splits_param} gain splits / "
-                    f"{gain_permutations_param} permutations · "
+                    f"{gain_splits_param} gain splits · "
                     f"{null_calibration_runs_param} null refits · "
                     f"{posterior_chains_param}×{posterior_draws_param} draws"
                 )
@@ -5821,7 +5806,6 @@ def render(output_dir: str) -> None:
                 "discovery_reps": int(discovery_reps_param),
                 "discovery_shuffles": int(discovery_shuffles_param),
                 "gain_splits": int(gain_splits_param),
-                "gain_permutations": int(gain_permutations_param),
                 "null_calibration_runs": int(null_calibration_runs_param),
                 "posterior_draws": int(posterior_draws_param),
                 "posterior_warmup": int(posterior_warmup_param),
