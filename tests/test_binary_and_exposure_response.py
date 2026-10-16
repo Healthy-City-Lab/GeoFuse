@@ -270,6 +270,24 @@ class TestExposureResponse(unittest.TestCase):
         self.assertIsNotNone(out)
         self.assertAlmostEqual(out["g"][0], 0.5, delta=0.15)
 
+    def test_clustered_ols_matches_statsmodels_cluster_errors(self):
+        import statsmodels.api as sm
+
+        rng = np.random.default_rng(16)
+        n_ent, waves = 300, 3
+        eid = np.repeat(np.arange(n_ent), waves)
+        g = np.repeat(rng.normal(size=n_ent), waves) + 0.3 * rng.normal(size=len(eid))
+        u = np.repeat(rng.normal(size=n_ent), waves)
+        y = 0.4 * g + u + rng.normal(size=len(eid))
+        X = np.column_stack([np.ones(len(y)), g])
+        out = er.make_ols_fitter(y, eid)(X, ["c", "g"])
+        ref = sm.OLS(y, X).fit(cov_type="cluster", cov_kwds={"groups": eid})
+        self.assertAlmostEqual(out["g"][0], float(ref.params[1]), places=8)
+        self.assertAlmostEqual(out["g"][1], float(ref.bse[1]), places=8)
+        # Independent-row errors are too small when the waves share an entity.
+        plain = er.make_ols_fitter(y)(X, ["c", "g"])
+        self.assertLess(plain["g"][1], out["g"][1])
+
     def test_incomplete_rows_are_refused_rather_than_misread(self):
         # A missing exposure used to fall into the reference quantile, and a
         # moderation design with a NaN row reached the fitter unmasked.

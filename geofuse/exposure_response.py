@@ -127,11 +127,21 @@ def iqr_scaled_effect(
 # ────────────────────────────────────────────────────────────────────
 
 
-def make_ols_fitter(outcome: np.ndarray) -> Fitter:
-    """An OLS :data:`Fitter` bound to *outcome*."""
+def make_ols_fitter(outcome: np.ndarray, groups: np.ndarray | None = None) -> Fitter:
+    """An OLS :data:`Fitter` bound to *outcome*.
+
+    With *groups* (one label per row, e.g. the entity of a panel) the covariance
+    is the cluster-robust CR1 sandwich over those groups and the tests use
+    ``G − 1`` degrees of freedom, so the rows of one entity are not counted as
+    independent evidence.
+    """
     from scipy import stats
 
     y = np.asarray(outcome, dtype=np.float64)
+    codes = n_groups = None
+    if groups is not None:
+        _, codes = np.unique(np.asarray(groups), return_inverse=True)
+        n_groups = int(codes.max()) + 1 if codes.size else 0
 
     def _fit(design: np.ndarray, names: Sequence[str]) -> dict | None:
         X = np.asarray(design, dtype=np.float64)
@@ -152,9 +162,23 @@ def make_ols_fitter(outcome: np.ndarray) -> Fitter:
         except np.linalg.LinAlgError:
             beta = xtx_inv @ (X.T @ y)
         resid = y - X @ beta
-        dof = n - p
-        sigma2 = float(resid @ resid) / dof
-        cov_beta = xtx_inv * sigma2
+        if codes is None:
+            dof = n - p
+            sigma2 = float(resid @ resid) / dof
+            cov_beta = xtx_inv * sigma2
+        else:
+            if n_groups < 2:
+                return None
+            ux = X * resid[:, None]
+            scores = np.column_stack(
+                [
+                    np.bincount(codes, weights=ux[:, j], minlength=n_groups)
+                    for j in range(p)
+                ]
+            )
+            correction = n_groups / (n_groups - 1) * (n - 1) / (n - p)
+            cov_beta = correction * (xtx_inv @ (scores.T @ scores) @ xtx_inv)
+            dof = n_groups - 1
         se = np.sqrt(np.clip(np.diag(cov_beta), 0.0, None))
         with np.errstate(divide="ignore", invalid="ignore"):
             tvals = np.where(se > 0, beta / se, 0.0)

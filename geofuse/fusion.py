@@ -7781,8 +7781,9 @@ class MetricFusionEngine:
         functional form.
 
         The fitter matches the study design — logistic (or GEE logistic on a
-        panel) for a binary outcome, OLS or MixedLM otherwise — so the standard
-        errors in these tables are the same kind as the headline estimate's.
+        panel) for a binary outcome, OLS otherwise, with entity-clustered
+        standard errors on a panel — so no table counts one entity's waves as
+        independent evidence.
         Pass ``iqr`` to pin the scaling constant, e.g.
         ``exposure_response.CLSA_NDVI_IQR`` when the point is to land on a
         published NDVI number.
@@ -7829,8 +7830,8 @@ class MetricFusionEngine:
                 fitter = binary_longitudinal.make_logit_fitter(target)
                 design = "logit"
             else:
-                fitter = exposure_response.make_ols_fitter(target)
-                design = "ols"
+                fitter = exposure_response.make_ols_fitter(target, entity_id)
+                design = "ols" if entity_id is None else "ols_cluster"
 
             # Headline per-unit effect, from the same model family, so the
             # per-IQR rescale below is a change of units and nothing else.
@@ -7898,7 +7899,7 @@ class MetricFusionEngine:
                     return binary_longitudinal.make_gee_logit_fitter(y, ent)
                 if binary:
                     return binary_longitudinal.make_logit_fitter(y)
-                return exposure_response.make_ols_fitter(y)
+                return exposure_response.make_ols_fitter(y, ent)
 
             for name in moderators:
                 values = self._reporting_raw_column(df, name)
