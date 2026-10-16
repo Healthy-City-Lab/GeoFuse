@@ -164,6 +164,26 @@ manifest. See [OUTPUTS.md](OUTPUTS.md).
   search maximises separation either way.
 - **Covariates.** Numeric or categorical columns to control for. Categorical
   ones are one-hot encoded automatically.
+- **Exposure on the CGI grid.** Every target is exposed to the cells of one
+  regular grid (**CGI grid pixel size (m)**, 50 m by default) that its geometry
+  touches, whatever its type: a point counts in every cell whose closed square
+  holds it (two on an edge, four on a corner), a line once per pass through a
+  cell, a polygon once per part in every cell it shares area with. Points and
+  parts add up, so a cell touched twice counts twice. A raster target's pixels
+  are points at their centres on that grid; the raster's own pixel size is not
+  reused. The composite is computed per cell first and then averaged over the
+  entity's cells. Overlapping targets each keep every cell they touch.
+- **Exposure buffer.** Optional: the cells within a radius of the geometry
+  (100 m by default) join its exposure, weighted by their distance to it:
+  uniformly, falling linearly to 0 after a full-weight distance, or as a
+  Gaussian with a chosen SD (35 m by default) cut at the radius. The default is
+  no buffer, the touched cells alone.
+- **Minimum GVI coverage.** Street-view points are sparse, so small GVI radii
+  leave many cells without data. The searched GVI ladder starts at the first
+  radius at which this share of entities (95 % by default) keeps a cell with
+  street-view data, and a cell is kept only when every channel has data at its
+  smallest searched radius, so every candidate is compared on the same cells.
+  Each entity's kept share of exposure weight is reported.
 - **Test-set size** and, optionally, spatial block validation.
 
 ### What the toolbox discovers from the data

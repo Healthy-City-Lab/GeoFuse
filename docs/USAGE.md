@@ -96,10 +96,11 @@ mismatched file is refused, and processed points are skipped.
    Anything unassigned blocks submission.
 4. **Study details.** Covariates, objective metric, optional spatial-confounding
    adjustment, test-set size, the discovery block (channel set, index form,
-   sweep splits, radius prior) with validation settings behind an expander,
-   per-pixel grid size, composite scaling, and whether to run each channel on
-   its own. Choose the range-based radius prior when the distance of influence
-   should not depend on the ladder's spacing.
+   sweep splits, radius prior, minimum GVI coverage) with validation settings
+   behind an expander, the CGI grid pixel size (for every target type, rasters
+   included), the exposure buffer, composite scaling, and whether to run each
+   channel on its own. Choose the range-based radius prior when the distance of
+   influence should not depend on the ladder's spacing.
    Longitudinal runs add wave fixed effects, on by default, and an optional
    neighbourhood column. There is no formula selector: the channel set names the
    modalities and the sweep picks the functional form.
@@ -125,8 +126,12 @@ automatically; there is no need to list them twice.
   With negative controls, each study also shows the frozen composite's slope on
   the target and on every control, the paired difference, and a warning when a
   control's association cannot be told apart from the target's.
+- **GVI coverage.** Which GVI radii were searched, each radius's entity
+  coverage, and how many cells and entities the coverage gate left out.
 - **Covariate impact**, **channel collinearity**, **composite maps**,
-  **mixed-effects metrics**, and an index of every file written.
+  **mixed-effects metrics**, and an index of every file written. **Generate
+  CGI Map**, under the map viewer, is a placeholder for a planned full-area map
+  built from the study's definition; it is not available yet.
 
 See [OUTPUTS.md](OUTPUTS.md) for the folder layout.
 
@@ -394,6 +399,7 @@ geofuse config set limits.max_parallel 6     # jobs the supervisor runs at once
 geofuse results JOB                         # held-out score, direction, each channel alone, weights, radii
 geofuse results output_results/fusion/<run>/    # any run, dashboard runs included
 geofuse export JOB -o cgi.csv               # the per-entity CGI table (.gpkg, .csv or .geojson)
+geofuse cgi-map JOB area.gpkg               # planned full-area CGI map; exits 2, not available yet
 ```
 
 ### Presets, caches and credentials

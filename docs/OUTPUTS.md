@@ -227,7 +227,15 @@ coefficient is reported alongside and is the one that can straddle zero.
 
 `composite_entities.gpkg` (layer `cgi`; a `.csv` when the target has no
 geometry) is the per-entity table the dashboard's "Export per-entity CGI" and
-`geofuse export` deliver.
+`geofuse export` deliver. Each entity's composite is the exposure-weighted mean
+of its CGI cells; `n_samples` counts the cells and `coverage_share` is the
+share of its exposure weight on cells the GVI coverage gate kept.
+
+**The coverage gate** is recorded as `coverage` in `results_summary.json` and
+`composite_greenery_params.json`: the first searched GVI radius
+(`gvi_floor_m`), the smallest one offered, the minimum share asked for, each
+radius's share of entities with a covered cell, and the exposure rows and
+entities left out.
 
 ### Caches
 
