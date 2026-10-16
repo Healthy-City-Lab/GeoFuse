@@ -7383,6 +7383,10 @@ class MetricFusionEngine:
         knobs, the between-person (average-exposure) and within-person
         (exposure-change) slopes. ``None`` for cross-sectional runs, a non-MixedLM
         scoring metric, or when the mixed model cannot be fit.
+
+        The slopes are estimated on every row; their tests and intervals come
+        from the held-out entities (:func:`exposure_response.split_inference`).
+        The period checks stay on every row.
         """
         if not self.is_longitudinal:
             return None
@@ -7410,18 +7414,25 @@ class MetricFusionEngine:
                     )
                 elif set(cov_cols) <= set(df.columns):
                     cov = df[cov_cols].to_numpy(dtype=np.float64)
-            out = mixed_effects_scoring.decline_terms_mixedlm(
-                target,
-                composite,
-                eid,
-                ysb,
-                cov,
-                random_slope=spec.random_slope_time,
-                want_between=bool(spec.decline_average_exposure),
-                want_within=bool(spec.decline_exposure_change),
-            )
+
+            def fit(rows):
+                return mixed_effects_scoring.decline_terms_mixedlm(
+                    target[rows],
+                    composite[rows],
+                    eid[rows],
+                    ysb[rows],
+                    None if cov is None else cov[rows],
+                    random_slope=spec.random_slope_time,
+                    want_between=bool(spec.decline_average_exposure),
+                    want_within=bool(spec.decline_exposure_change),
+                )
+
+            out = fit(np.ones(len(target), dtype=bool))
             if out is None:
                 return None
+            held = fit(self._test_entity_mask(df))
+            out = exposure_response.split_inference(out, held)
+            out["inference_n"] = None if held is None else held.get("n")
 
             # ── Period-confounding checks ───────────────
             # A greenery × time slope is only about greenery if it survives an
