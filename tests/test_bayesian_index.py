@@ -303,7 +303,6 @@ class TestCancelStopsTheSearch(unittest.TestCase):
                 channels=("a", "b"),
                 channel_index=(0, 1),
                 splits=4,
-                perm=4,
                 workers=1,
                 cancel_check=lambda: True,
             )
@@ -728,9 +727,8 @@ class TestPartialCoverageDoesNotPoisonTheReport(unittest.TestCase):
             self.assertTrue(np.isfinite(lin[key]), f"{key} is {lin[key]}")
 
     def test_an_undefined_gain_does_not_become_a_significant_p_value(self):
-        # NaN compares false against every permuted gain, so the count of
-        # exceedances is zero and the permutation p comes out at its floor --
-        # the most significant value the test can produce, from no statistic.
+        # Splits whose gain is undefined carry no statistic, so a test built
+        # from them must report nothing rather than a p-value.
         import geofuse.bayesian_index as _bi
 
         real_map = _bi._map
@@ -752,12 +750,40 @@ class TestPartialCoverageDoesNotPoisonTheReport(unittest.TestCase):
                 channels=("a", "b"),
                 channel_index=(0, 1),
                 splits=3,
-                perm=3,
                 workers=1,
             )
         finally:
             _bi._map = real_map
         self.assertIsNone(gain["gain_p"])
+
+    def test_the_gain_p_value_is_the_corrected_resampled_t(self):
+        from scipy import stats
+
+        import geofuse.bayesian_index as _bi
+
+        real_map = _bi._map
+        planted = iter([1.0, 2.0, 3.0])
+
+        def fake_map(fn, tasks, n_workers, cancel_check=None):
+            out = real_map(fn, tasks, 1, cancel_check)
+            for r in out:
+                if isinstance(r, dict) and "gain" in r:
+                    r["gain"] = next(planted)
+            return out
+
+        X, y = self._cube()
+        yr, Xr = bi.prep(X, y, None)
+        _bi._map = fake_map
+        try:
+            gain = bi.holdout_gain(
+                Xr, yr, channels=("a", "b"), channel_index=(0, 1), splits=3, workers=1
+            )
+        finally:
+            _bi._map = real_map
+        # mean 2, variance 1, inflation 1/3 + 0.25/0.75.
+        t = 2.0 / np.sqrt(2.0 / 3.0)
+        self.assertAlmostEqual(gain["gain_t"], t)
+        self.assertAlmostEqual(gain["gain_p"], float(stats.t.sf(t, 2)))
 
     def test_the_gain_comparison_reports_a_composite_score(self):
         X, y = self._cube()
@@ -768,7 +794,6 @@ class TestPartialCoverageDoesNotPoisonTheReport(unittest.TestCase):
             channels=("a", "b"),
             channel_index=(0, 1),
             splits=3,
-            perm=3,
             workers=1,
         )
         for key in ("cgi", "best_single", "gain"):
@@ -931,10 +956,10 @@ class TestHonestFormSelection(unittest.TestCase):
             channels=("a", "b"),
             channel_index=(0, 1),
             splits=30,
-            perm=30,
             workers=1,
         )
-        self.assertLess(abs(gain["gain"] - gain["gain_null_mean"]), 0.5)
+        self.assertLess(abs(gain["gain"]), 0.5)
+        self.assertGreater(gain["gain_p"], 0.01)
         self.assertLessEqual(gain["cgi"], gain["cgi_max_over_forms_optimistic"])
         self.assertEqual(sum(gain["form_counts"].values()), 30)
         self.assertEqual(set(gain["cgi_by_form"]), {"linear", "synergy"})

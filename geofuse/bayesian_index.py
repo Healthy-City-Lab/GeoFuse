@@ -1773,20 +1773,24 @@ def holdout_gain(
     radius_idx=None,
     forms=FORMS,
     splits=20,
-    perm=100,
     frac=0.25,
     seed=0,
     workers=None,
     cancel_check=None,
     groups=None,
 ):
-    """Composite vs each standalone, with a permutation null on the *gain*.
+    """Composite vs each standalone on the same held-out rows, split by split.
 
     Both sides make their choices on training rows: the standalone channel and
-    the composite's form alike. The permuted runs repeat the same procedure, so
-    the null prices in the form choice as well. ``groups`` holds out whole
-    groups in every split, as in :func:`sweep`.
+    the composite's form alike. ``gain_p`` is the one-sided Nadeau–Bengio
+    corrected resampled t-test of a positive mean gain: the per-split gains
+    share most of their training rows, so their variance is inflated by
+    ``1/S + n_test/n_train`` before the t on ``S − 1`` degrees of freedom.
+    It is ``None`` when fewer than two splits give a gain, or all give the same
+    one. ``groups`` holds out whole groups in every split, as in :func:`sweep`.
     """
+    from scipy import stats as _stats
+
     n_radii, n_stats = X.shape[2], X.shape[3]
     if radius_idx is None:
         radius_idx = [list(range(n_radii))] * len(channels)
@@ -1805,50 +1809,29 @@ def holdout_gain(
             (path, flat.shape, y, cols, cols, tuple(forms), seed + s, frac, groups)
             for s in range(splits)
         ]
-        nulls = [
-            (
-                path,
-                flat.shape,
-                np.random.default_rng(90_000 + i).permutation(y),
-                cols,
-                cols,
-                tuple(forms),
-                5_000 + i,
-                frac,
-                groups,
-            )
-            for i in range(perm)
-        ]
-        n_workers = workers or parallel.process_worker_count(len(base) + len(nulls))
+        n_workers = workers or parallel.process_worker_count(len(base))
         obs = _map(_gain_split, base, n_workers, cancel_check)
-        null = _map(_gain_split, nulls, n_workers, cancel_check)
     finally:
         try:
             os.unlink(path)
         except OSError:
             pass
 
-    g = np.array([r["gain"] for r in obs])
-    gn = np.array([r["gain"] for r in null])
-    observed = float(g.mean())
-    # A p-value needs a finite observed gain; NaN compares false against every
-    # permuted gain and would read as the floor p. Non-finite nulls are dropped.
-    usable = math.isfinite(observed) and bool(np.isfinite(gn).any())
+    g = np.array([r["gain"] for r in obs], dtype=np.float64)
+    finite = g[np.isfinite(g)]
+    observed = float(finite.mean()) if finite.size else float("nan")
+    gain_t = gain_p = None
+    if finite.size >= 2:
+        corrected = (1.0 / finite.size + frac / (1.0 - frac)) * finite.var(ddof=1)
+        if corrected > 0:
+            gain_t = observed / math.sqrt(float(corrected))
+            gain_p = float(_stats.t.sf(gain_t, finite.size - 1))
     out = {
         "cgi": float(np.mean([r["cgi"] for r in obs])),
         "best_single": float(np.mean([r["best_single"] for r in obs])),
         "gain": observed,
-        "gain_null_mean": (
-            float(gn[np.isfinite(gn)].mean()) if np.isfinite(gn).any() else float("nan")
-        ),
-        "gain_p": (
-            float(
-                (1 + int((gn[np.isfinite(gn)] >= observed).sum()))
-                / (1 + int(np.isfinite(gn).sum()))
-            )
-            if usable
-            else None
-        ),
+        "gain_t": gain_t,
+        "gain_p": gain_p,
         "gain_won": int((g > 0).sum()),
         "splits": splits,
         "cgi_max_over_forms_optimistic": float(

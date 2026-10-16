@@ -2327,7 +2327,6 @@ def run_fusion(
                 reps=int(discovery_reps),
                 shuffles=int(discovery_shuffles),
                 gain_splits=int(gain_splits),
-                gain_perm=int(gain_permutations),
                 null_runs=int(null_calibration_runs),
                 draws=int(posterior_draws),
                 warmup=int(posterior_warmup),
@@ -2518,7 +2517,6 @@ def run_fusion(
                     reps=int(discovery_reps),
                     shuffles=int(discovery_shuffles),
                     gain_splits=0,  # nothing to compare a standalone against
-                    gain_perm=0,
                     null_runs=int(null_calibration_runs),
                     draws=int(posterior_draws),
                     warmup=int(posterior_warmup),

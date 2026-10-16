@@ -3251,7 +3251,6 @@ class MetricFusionEngine:
         reps: int = 5,
         shuffles: int = 12,
         gain_splits: int = 20,
-        gain_perm: int = 100,
         null_runs: int = 16,
         null_reselect_form: bool = False,
         draws: int = 800,
@@ -3392,7 +3391,6 @@ class MetricFusionEngine:
                 radius_idx=radius_idx,
                 forms=forms,
                 splits=gain_splits,
-                perm=gain_perm,
                 seed=seed,
                 workers=workers,
                 cancel_check=cancelled,
@@ -8144,7 +8142,7 @@ class MetricFusionEngine:
         out: dict = {}
         if not self.negative_control_columns or self.is_longitudinal:
             return out
-        loops = dict(reps=0, shuffles=0, gain_splits=0, gain_perm=0, null_runs=0)
+        loops = dict(reps=0, shuffles=0, gain_splits=0, null_runs=0)
         saved_formula = self.cgi_formula
         for name in self.negative_control_columns:
             try:

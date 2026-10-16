@@ -79,7 +79,6 @@ class TestFitBayesianIndexWiring(unittest.TestCase):
             reps=1,
             shuffles=2,
             gain_splits=2,
-            gain_perm=2,
             null_runs=2,
             null_reselect_form=True,
             draws=120,
@@ -244,7 +243,7 @@ class TestRetuneOnAControl(unittest.TestCase):
             radius_kernel="dirichlet",
         )
         cls.target = cls.eng.fit_bayesian_index(
-            "r2", reps=0, shuffles=0, gain_splits=0, gain_perm=0, null_runs=0, **kw
+            "r2", reps=0, shuffles=0, gain_splits=0, null_runs=0, **kw
         )
         kw.pop("radius_kernel")
         cls.formula_before = cls.eng.cgi_formula
