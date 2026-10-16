@@ -3330,6 +3330,9 @@ class MetricFusionEngine:
                 f"({100.0 * dropped / max(len(X), 1):.1f}%). Every candidate is "
                 f"scored on the remaining {len(Xr)}.",
             )
+        groups = self._inner_split_groups(static)
+        if groups is not None:
+            groups = groups[prep_info["kept"]]
         tick()
 
         workers = parallel.process_worker_count()
@@ -3349,6 +3352,7 @@ class MetricFusionEngine:
             workers=workers,
             objective=self._sweep_objective(metric),
             cancel_check=cancelled,
+            groups=groups,
         )
         tick()
         _log(
@@ -3372,6 +3376,7 @@ class MetricFusionEngine:
                 seed=seed,
                 workers=workers,
                 cancel_check=cancelled,
+                groups=groups,
             )
             if reps and shuffles
             else {}
@@ -3391,6 +3396,7 @@ class MetricFusionEngine:
                 seed=seed,
                 workers=workers,
                 cancel_check=cancelled,
+                groups=groups,
             )
             if gain_splits and len(index_channels) > 1
             else {}
@@ -3499,6 +3505,24 @@ class MetricFusionEngine:
             f"{post.divergences} divergences). Posterior grid: {post.picked}.",
         )
         return params
+
+    def _inner_split_groups(self, static: dict) -> "np.ndarray | None":
+        """One label per tensor row for the index search's inner splits.
+
+        The spatial block when the held-out test is spatially blocked, else the
+        entity on a panel, so no inner split puts one block or one entity on
+        both sides. ``None`` (row-level splits) otherwise.
+        """
+        blocks = getattr(self, "_spatial_block_by_group", None)
+        col = getattr(self, "_spatial_block_group_col", None)
+        if blocks is not None and col is not None:
+            keys = static.get("entity_id") if col == "entity_id" else static.get("pid")
+            if keys is not None:
+                return pd.Series(np.asarray(keys)).map(blocks).fillna(-1).to_numpy()
+        eid = static.get("entity_id")
+        if getattr(self, "is_longitudinal", False) and eid is not None:
+            return np.asarray(eid)
+        return None
 
     def _index_layout(self, tensor_channels, radii):
         """The study's index channels, their tensor positions and their ladders.
@@ -4538,6 +4562,7 @@ class MetricFusionEngine:
             first_idx = order[np.searchsorted(codes[order], np.arange(n_uniq))]
             st["codes"] = codes
             st["n_uniq"] = n_uniq
+            st["pid"] = np.asarray(uniq)
             st["target"] = np.asarray(data["target"].values, dtype=np.float64)[
                 first_idx
             ]

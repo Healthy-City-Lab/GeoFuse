@@ -145,10 +145,10 @@ def prep(
 
     With ``return_info`` a third value is returned: ``covariate_rank`` (the
     basis size, intercept included), ``dropped_directions`` (redundant columns
-    in the covariate design), ``residual_df`` (rows kept minus the rank) and
+    in the covariate design), ``residual_df`` (rows kept minus the rank),
     ``column_sd``, shaped ``X.shape[1:]`` — the SD each residualised column was
     divided by, which undoes the z-scoring when weights are read on the raw
-    scale.
+    scale — and ``kept``, the boolean mask of input rows that survived.
     """
     X = np.asarray(X, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
@@ -193,6 +193,7 @@ def prep(
         "dropped_directions": int(deficit),
         "residual_df": int(len(y) - q.shape[1]),
         "column_sd": sd.reshape(X.shape[1:]),
+        "kept": keep,
     }
     return yr, flat.reshape(X.shape), info
 
@@ -256,6 +257,25 @@ def _map(fn, tasks, n_workers: int, cancel_check=None):
 
 def _pairs(k: int) -> list[tuple[int, int]]:
     return [(i, j) for i in range(k) for j in range(i + 1, k)]
+
+
+def _holdout(n: int, seed: int, frac: float, groups=None) -> np.ndarray:
+    """Held-out row mask for one inner split.
+
+    Without ``groups`` each row is held out with probability ``frac``. With
+    ``groups`` (one label per row: a panel's entity, or a spatial block) whole
+    groups are held out together, so no entity's waves and no block's
+    neighbours sit on both sides of the split. Both sides are kept non-empty.
+    """
+    rng = np.random.default_rng(seed)
+    if groups is None:
+        return rng.random(n) < frac
+    _, codes = np.unique(np.asarray(groups), return_inverse=True)
+    n_groups = int(codes.max()) + 1
+    while True:
+        held = rng.random(n_groups) < frac
+        if n_groups < 2 or 0 < held.sum() < n_groups:
+            return held[codes]
 
 
 def _tstat(e: np.ndarray, y: np.ndarray) -> float:
@@ -422,9 +442,9 @@ def _sweep_split(task):
     through the pipe for every task exhausts Windows pipe handles once this is
     called a few dozen times.
     """
-    path, shape, combos, y, seed, frac = task
+    path, shape, combos, y, seed, frac, groups = task
     z = np.memmap(path, dtype=np.float64, mode="r", shape=shape)
-    te = np.random.default_rng(seed).random(len(y)) < frac
+    te = _holdout(len(y), seed, frac, groups)
     tr = ~te
     ztr, zte = np.asarray(z[tr]), np.asarray(z[te])
     g_tr, c_tr = ztr.T @ ztr, ztr.T @ y[tr]
@@ -488,6 +508,7 @@ def sweep(
     objective=None,
     rescore_top=50,
     cancel_check=None,
+    groups=None,
 ):
     """Exhaustive grid over (radius, stat) per channel, then over the form.
 
@@ -504,6 +525,9 @@ def sweep(
     objective is given, the top ``rescore_top`` candidates are re-scored with it
     on the same splits and the best of those wins: the cheap ranking stays a
     filter, and the requested metric makes the decision.
+
+    ``groups`` (one label per row) makes every inner split hold out whole
+    groups (see :func:`_holdout`); ``None`` splits rows.
     """
     n_radii, n_stats = X.shape[2], X.shape[3]
     if radius_idx is None:
@@ -519,7 +543,10 @@ def sweep(
         mm[:] = flat
         mm.flush()
         del mm
-        tasks = [(path, flat.shape, combos, y, seed + s, frac) for s in range(splits)]
+        tasks = [
+            (path, flat.shape, combos, y, seed + s, frac, groups)
+            for s in range(splits)
+        ]
         n_workers = workers or parallel.process_worker_count(len(tasks))
         surface = np.array(_map(_sweep_split, tasks, n_workers, cancel_check))
     finally:
@@ -542,6 +569,7 @@ def sweep(
             frac=frac,
             seed=seed,
             cancel_check=cancel_check,
+            groups=groups,
         )
         # Candidates outside the shortlist keep -inf so they cannot win, and the
         # one-SE rule below reads the same surface the winner came from.
@@ -594,6 +622,7 @@ def sweep(
             workers=workers,
             objective=objective,
             cancel_check=cancel_check,
+            groups=groups,
         )
     chosen_form = candidates[0]
     for form in candidates[1:]:
@@ -617,7 +646,17 @@ def sweep(
 
 
 def _rescore(
-    flat, y, combos, shortlist, objective, *, splits, frac, seed, cancel_check=None
+    flat,
+    y,
+    combos,
+    shortlist,
+    objective,
+    *,
+    splits,
+    frac,
+    seed,
+    cancel_check=None,
+    groups=None,
 ):
     """Score a shortlist of candidates with the job's objective, same splits.
 
@@ -628,7 +667,7 @@ def _rescore(
     out = np.zeros((splits, len(shortlist)))
     for si in range(splits):
         _raise_if_cancelled(cancel_check)
-        te = np.random.default_rng(seed + si).random(len(y)) < frac
+        te = _holdout(len(y), seed + si, frac, groups)
         tr = ~te
         ztr = flat[tr]
         g_tr, c_tr = ztr.T @ ztr, ztr.T @ y[tr]
@@ -643,8 +682,8 @@ def _rescore(
     return out
 
 
-def _form_split_objective(E, y, form, seed, frac, objective):
-    te = np.random.default_rng(seed).random(len(y)) < frac
+def _form_split_objective(E, y, form, seed, frac, objective, groups=None):
+    te = _holdout(len(y), seed, frac, groups)
     tr = ~te
     if form == "linear":
         fit = simplex_fit(E[tr].T @ E[tr], E[tr].T @ y[tr])
@@ -656,8 +695,8 @@ def _form_split_objective(E, y, form, seed, frac, objective):
 
 
 def _form_split(task):
-    E, y, form, seed, frac = task
-    te = np.random.default_rng(seed).random(len(y)) < frac
+    E, y, form, seed, frac, groups = task
+    te = _holdout(len(y), seed, frac, groups)
     tr = ~te
     if form == "linear":
         fit = simplex_fit(E[tr].T @ E[tr], E[tr].T @ y[tr])
@@ -669,15 +708,27 @@ def _form_split(task):
 
 
 def _score_form_at(
-    E, y, form, *, splits, frac, seed, workers=None, objective=None, cancel_check=None
+    E,
+    y,
+    form,
+    *,
+    splits,
+    frac,
+    seed,
+    workers=None,
+    objective=None,
+    cancel_check=None,
+    groups=None,
 ):
     if objective is not None:
         scores = []
         for s in range(splits):
             _raise_if_cancelled(cancel_check)
-            scores.append(_form_split_objective(E, y, form, seed + s, frac, objective))
+            scores.append(
+                _form_split_objective(E, y, form, seed + s, frac, objective, groups)
+            )
         return float(np.mean(scores))
-    tasks = [(E, y, form, seed + s, frac) for s in range(splits)]
+    tasks = [(E, y, form, seed + s, frac, groups) for s in range(splits)]
     n_workers = workers or parallel.process_worker_count(len(tasks))
     return float(np.mean(_map(_form_split, tasks, n_workers, cancel_check)))
 
@@ -692,7 +743,9 @@ def eligible_forms(forms, n_channels: int) -> tuple[str, ...]:
     return out or ("linear",)
 
 
-def choose_form(E, y, forms, *, seed, splits=_FORM_INNER_SPLITS, frac=0.25):
+def choose_form(
+    E, y, forms, *, seed, splits=_FORM_INNER_SPLITS, frac=0.25, groups=None
+):
     """The form with the best mean held-out |t| on inner splits of ``E, y``.
 
     Callers pass training rows only, so an outer held-out row never votes on
@@ -704,7 +757,9 @@ def choose_form(E, y, forms, *, seed, splits=_FORM_INNER_SPLITS, frac=0.25):
     if len(forms) == 1:
         return forms[0], {}
     scores = {
-        f: _score_form_at(E, y, f, splits=splits, frac=frac, seed=seed, workers=1)
+        f: _score_form_at(
+            E, y, f, splits=splits, frac=frac, seed=seed, workers=1, groups=groups
+        )
         for f in forms
     }
     best = forms[0]
@@ -1507,10 +1562,9 @@ def grid_posterior(
 
 def _discovery_shuffle(task):
     """Sweep on train, fit the winning form, score on the held-out rows."""
-    Zpath, shape, y, cols_per_channel, forms, seed, frac = task
+    Zpath, shape, y, cols_per_channel, forms, seed, frac, groups = task
     z = np.memmap(Zpath, dtype=np.float64, mode="r", shape=shape)
-    rng = np.random.default_rng(seed)
-    te = rng.random(len(y)) < frac
+    te = _holdout(len(y), seed, frac, groups)
     tr = ~te
     combos = list(itertools.product(*cols_per_channel))
     ztr = np.asarray(z[tr])
@@ -1539,7 +1593,11 @@ def _discovery_shuffle(task):
             "weights": np.asarray(params["weights"]).tolist(),
         }
     out["form"], out["form_inner"] = choose_form(
-        E[tr], y[tr], forms, seed=seed + _FORM_SEED_OFFSET
+        E[tr],
+        y[tr],
+        forms,
+        seed=seed + _FORM_SEED_OFFSET,
+        groups=None if groups is None else np.asarray(groups)[tr],
     )
     return out
 
@@ -1560,11 +1618,13 @@ def repeated_discovery(
     seed=0,
     workers=None,
     cancel_check=None,
+    groups=None,
 ):
     """Independent repeats of sweep -> fit -> score.
 
     Each replicate gets its own seed stream, so agreement across replicates is
-    reproducibility rather than one long correlated run.
+    reproducibility rather than one long correlated run. ``groups`` holds out
+    whole groups in every split, as in :func:`sweep`.
     """
     n_radii, n_stats = X.shape[2], X.shape[3]
     if radius_idx is None:
@@ -1581,7 +1641,16 @@ def repeated_discovery(
         mm.flush()
         del mm
         tasks = [
-            (path, flat.shape, y, cols, tuple(forms), 10_000 * (rep + 1) + b, frac)
+            (
+                path,
+                flat.shape,
+                y,
+                cols,
+                tuple(forms),
+                10_000 * (rep + 1) + b,
+                frac,
+                groups,
+            )
             for rep in range(reps)
             for b in range(shuffles)
         ]
@@ -1632,10 +1701,9 @@ def repeated_discovery(
 
 def _gain_split(task):
     """One split: every standalone and the composite, same held-out rows."""
-    path, shape, y, cols, per_channel_cols, forms, seed, frac = task
+    path, shape, y, cols, per_channel_cols, forms, seed, frac, groups = task
     z = np.memmap(path, dtype=np.float64, mode="r", shape=shape)
-    rng = np.random.default_rng(seed)
-    te = rng.random(len(y)) < frac
+    te = _holdout(len(y), seed, frac, groups)
     tr = ~te
     out = {}
 
@@ -1674,7 +1742,13 @@ def _gain_split(task):
         scores[form] = _tstat(apply_fn(E[te]), y[te])
     # The form is chosen on the training rows; the held-out score of every
     # form stays as a diagnostic, and their maximum is labelled optimistic.
-    form, _ = choose_form(E[tr], y[tr], forms, seed=seed + _FORM_SEED_OFFSET)
+    form, _ = choose_form(
+        E[tr],
+        y[tr],
+        forms,
+        seed=seed + _FORM_SEED_OFFSET,
+        groups=None if groups is None else np.asarray(groups)[tr],
+    )
     out["cgi"] = scores[form]
     out["cgi_form"] = form
     out["cgi_by_form"] = scores
@@ -1704,12 +1778,14 @@ def holdout_gain(
     seed=0,
     workers=None,
     cancel_check=None,
+    groups=None,
 ):
     """Composite vs each standalone, with a permutation null on the *gain*.
 
     Both sides make their choices on training rows: the standalone channel and
     the composite's form alike. The permuted runs repeat the same procedure, so
-    the null prices in the form choice as well.
+    the null prices in the form choice as well. ``groups`` holds out whole
+    groups in every split, as in :func:`sweep`.
     """
     n_radii, n_stats = X.shape[2], X.shape[3]
     if radius_idx is None:
@@ -1726,7 +1802,7 @@ def holdout_gain(
         mm.flush()
         del mm
         base = [
-            (path, flat.shape, y, cols, cols, tuple(forms), seed + s, frac)
+            (path, flat.shape, y, cols, cols, tuple(forms), seed + s, frac, groups)
             for s in range(splits)
         ]
         nulls = [
@@ -1739,6 +1815,7 @@ def holdout_gain(
                 tuple(forms),
                 5_000 + i,
                 frac,
+                groups,
             )
             for i in range(perm)
         ]

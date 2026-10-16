@@ -1301,5 +1301,39 @@ class TestExposureResponseProjectionIsRankSafe(unittest.TestCase):
         np.testing.assert_allclose(r_dup, r_clean, atol=1e-10)
 
 
+class TestGroupedInnerSplits(unittest.TestCase):
+    def test_row_splits_are_unchanged_without_groups(self):
+        expected = np.random.default_rng(7).random(500) < 0.25
+        np.testing.assert_array_equal(bi._holdout(500, 7, 0.25), expected)
+
+    def test_a_group_never_sits_on_both_sides(self):
+        groups = np.repeat(np.arange(120), 3)
+        for seed in range(20):
+            te = bi._holdout(len(groups), seed, 0.25, groups)
+            self.assertTrue(te.any() and (~te).any())
+            for g in np.unique(groups):
+                self.assertEqual(len(set(te[groups == g])), 1)
+
+    def test_the_sweep_runs_on_grouped_splits(self):
+        rng = np.random.default_rng(3)
+        n_ent, waves = 150, 3
+        groups = np.repeat(np.arange(n_ent), waves)
+        X = rng.normal(size=(n_ent * waves, 2, 2, 1))
+        y = X[:, 0, 1, 0] + rng.normal(size=len(groups))
+        yr, Xr = bi.prep(X, y, None)
+        res = bi.sweep(
+            Xr,
+            [100.0, 300.0],
+            ["mean"],
+            yr,
+            channels=["a", "b"],
+            channel_index=[0, 1],
+            splits=4,
+            workers=1,
+            groups=groups,
+        )
+        self.assertEqual(res.picked[0], (300, "mean"))
+
+
 if __name__ == "__main__":
     unittest.main()
