@@ -3410,13 +3410,12 @@ class MetricFusionEngine:
             entities = np.asarray(eid)[prep_info["kept"]]
             if static.get("wave") is not None:
                 waves = np.asarray(static["wave"])[prep_info["kept"]]
-        # The synergy form's interactions are formed from the raw channel values.
+        # The synergy form's interactions are formed per cell from the raw
+        # channel values, as the composite is.
         design = None
         if bayesian_index.eligible_forms(forms, len(index_channels)) != ("linear",):
-            cov = static.get("cov")
-            design = bayesian_index.SynergyDesign.build(
-                X[prep_info["kept"]],
-                None if cov is None else np.asarray(cov)[prep_info["kept"]],
+            design = self._synergy_design(
+                static, prep_info["kept"], channel_index, index_channels, radii, stats
             )
         tick()
 
@@ -3827,6 +3826,67 @@ class MetricFusionEngine:
                         else v
                     )
         return X, np.asarray(radii, dtype=float), list(stats), list(channels), static
+
+    def _synergy_design(
+        self, static, kept, channel_index, index_channels, radii, stats
+    ):
+        """The synergy form's raw values per CGI cell, over the kept tensor rows.
+
+        Holds each distinct cell of the train+val fold once, for the index
+        channels only, with the exposure rows that average it into an entity.
+        """
+        gvi_radii, ndvi_radii = self._search_radii()
+        inverse = static.get("uniq_inverse")
+        n_rows = len(static["lookup_ids"])
+        if inverse is None:
+            inverse, first = np.arange(n_rows), None
+        else:
+            first = np.unique(inverse, return_index=True)[1]
+        n_cells = int(inverse.max()) + 1
+        cells = np.full(
+            (n_cells, len(index_channels), len(radii), len(stats)),
+            np.nan,
+            dtype=np.float32,
+        )
+        _log(
+            "INFO",
+            f"Synergy terms: {n_cells:,} cells x {len(index_channels)} channels x "
+            f"{len(radii)} radii x {len(stats)} stats = {cells.nbytes / 2**20:,.0f} "
+            "MB, held once on disk and once in the posterior.",
+        )
+        for ci, ch in enumerate(index_channels):
+            ladder = ndvi_radii if ch == "ndvi" else gvi_radii
+            for ri, radius in enumerate(radii):
+                if int(radius) not in ladder:
+                    continue
+                for si, column in enumerate(stats):
+                    stat, pct = (
+                        ("mean", None)
+                        if column == "mean"
+                        else ("percentile", int(column[1:]))
+                    )
+                    vals, on_uniq = self._channel_values_for_static(
+                        static, ch, radius, stat, pct, "train_val"
+                    )
+                    if vals is None:
+                        continue
+                    v = np.asarray(vals)
+                    cells[:, ci, ri, si] = v if on_uniq or first is None else v[first]
+
+        codes = static["codes"] if static["has_pid"] else np.arange(n_rows)
+        rows = np.flatnonzero(np.asarray(kept)[codes])
+        weight = static.get("weight")
+        cov = static.get("cov")
+        return bayesian_index.SynergyDesign.build(
+            cells,
+            None if cov is None else np.asarray(cov)[kept],
+            rows=(
+                inverse[rows],
+                (np.cumsum(kept) - 1)[codes[rows]],
+                np.ones(len(rows)) if weight is None else np.asarray(weight)[rows],
+            ),
+            channels=channel_index,
+        )
 
     def _channel_values_for_static(self, static, channel, radius, stat, pct, subset):
         """One (channel, radius, stat) column for a prepared fold, cache first.

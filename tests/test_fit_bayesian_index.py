@@ -19,11 +19,25 @@ if ROOT not in sys.path:
 
 import numpy as np
 
-from geofuse import parallel
+from geofuse import bayesian_index, parallel
 from geofuse.fusion import MetricFusionEngine
 
 RADII = (100.0, 300.0, 900.0)
 STATS = ["mean", "p50"]
+
+
+def _entity_cells(X, static):
+    """The stub has no CGI cells: each entity stands for its one cell."""
+
+    def design(_static, kept, channel_index, *_):
+        cov = static["cov"]
+        return bayesian_index.SynergyDesign.build(
+            X[kept][:, list(channel_index)],
+            None if cov is None else cov[kept],
+            channels=channel_index,
+        )
+
+    return design
 
 
 def _stub_engine(n=300, seed=0):
@@ -54,6 +68,7 @@ def _stub_engine(n=300, seed=0):
     )
     eng._preaggr_radii = lambda: (list(RADII), list(RADII))
     eng._sweep_objective = lambda metric: None
+    eng._synergy_design = _entity_cells(X, static)
     for name in (
         "_params_from_sweep",
         "_index_layout",
@@ -167,7 +182,7 @@ class TestLinearRunRecordsRawWeights(unittest.TestCase):
     def test_the_raw_average_is_the_fitted_index(self):
         # Partialling the covariates out of the raw average gives the
         # posterior-mean index at the projected cells, up to a scale.
-        from geofuse import bayesian_index, cgi_formulas
+        from geofuse import cgi_formulas
 
         X, radii, stats, _, static = self.eng.build_index_tensor()
         _, Xr = bayesian_index.prep(X, static["target"], static["cov"])
@@ -222,7 +237,7 @@ class TestSynergyRunRecordsRawWeights(unittest.TestCase):
             self.assertNotIn(f"{ch}_power", self.params)
 
     def test_the_raw_composite_is_the_fitted_index(self):
-        from geofuse import bayesian_index, cgi_formulas
+        from geofuse import cgi_formulas
 
         X, radii, stats, _, static = self.eng.build_index_tensor()
         post = self.params["__posterior__"]
@@ -274,6 +289,7 @@ def _retune_stub(n=600, seed=3):
     )
     eng._preaggr_radii = lambda: (list(RADII), list(RADII))
     eng._sweep_objective = lambda metric: None
+    eng._synergy_design = _entity_cells(X, static)
     for name in (
         "_params_from_sweep",
         "_index_layout",

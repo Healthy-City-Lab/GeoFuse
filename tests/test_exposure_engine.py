@@ -8,6 +8,8 @@ raster and street-view points. Pinned here:
 - the applied composite is the weighted mean of per-cell composites, and for a
   linear composite it equals the same combination of the index tensor — the
   object the discovery engine fits — entity for entity;
+- the synergy form's cells are the distinct cells, averaged back into the
+  tensor by the same exposure weights;
 - sparse street-view data moves the searched ladder up to the first rung that
   covers enough entities, and every kept entity is covered at every searched
   rung.
@@ -128,6 +130,23 @@ class TestVectorExposure(unittest.TestCase):
         applied = eng.apply_fusion(weights=dict(PARAMS)).set_index("polygon_id")
         got = applied.loc[static["pid"], "composite"].to_numpy()
         np.testing.assert_allclose(got, expected, rtol=1e-5, atol=1e-6)
+
+    def test_synergy_cells_average_back_to_the_tensor(self):
+        eng = self.eng
+        X, radii, stats, channels, static = eng.build_index_tensor("train_val")
+        index = ["ndvi", "veg", "terrain"]
+        channel_index = [channels.index(c) for c in index]
+        kept = np.ones(len(X), dtype=bool)
+        design = eng._synergy_design(static, kept, channel_index, index, radii, stats)
+        # Overlapping entities share cells, which the design holds once.
+        self.assertLess(design.shape[0], len(static["lookup_ids"]))
+        ri = list(np.asarray(radii, dtype=int)).index(400)
+        si = list(stats).index("mean")
+        grid = design.grid(channel_index)
+        for k, ci in enumerate(channel_index):
+            np.testing.assert_allclose(
+                design.collapse(grid[:, k, ri, si]), X[:, ci, ri, si], rtol=1e-5
+            )
 
     def test_every_entity_reports_its_kept_exposure_share(self):
         applied = self.eng.apply_fusion(weights=dict(PARAMS))

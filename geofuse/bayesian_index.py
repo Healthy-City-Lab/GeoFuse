@@ -348,12 +348,13 @@ class SynergyDesign:
 
     The geometric-mean interactions are defined on each cell's raw channel
     values, so they cannot be formed from the residualised, standardised
-    tensor the rest of the index works on. ``path`` holds a float64 memmap of
-    the raw values, one row per flat ``(channel, radius, stat)`` column of the
-    tensor and one column per cell (``shape`` is ``(n_cells, channel, radius,
-    stat)``); exposure row ``k`` adds cell ``row_cell[k]`` with weight
-    ``row_weight[k]`` to tensor row ``row_entity[k]``. ``basis`` is the
-    covariate basis the tensor and the outcome were residualised on.
+    tensor the rest of the index works on. ``path`` holds a float32 memmap of
+    the raw values, one row per stored ``(channel, radius, stat)`` column and
+    one column per cell (``shape`` is ``(n_cells, channel, radius, stat)``);
+    ``channels`` names the tensor channel each stored channel is. Exposure row
+    ``k`` adds cell ``row_cell[k]`` with weight ``row_weight[k]`` to tensor row
+    ``row_entity[k]``. ``basis`` is the covariate basis the tensor and the
+    outcome were residualised on.
 
     Only the path travels to worker processes, so the cells are never copied
     per task; the file is removed with the design that built it.
@@ -361,19 +362,23 @@ class SynergyDesign:
 
     path: str
     shape: tuple
+    channels: tuple
     row_cell: np.ndarray
     row_entity: np.ndarray
     row_weight: np.ndarray
     basis: np.ndarray
 
     @classmethod
-    def build(cls, cells, covariates=None, rows=None) -> "SynergyDesign":
+    def build(
+        cls, cells, covariates=None, rows=None, channels=None
+    ) -> "SynergyDesign":
         """From ``(n_cells, channel, radius, stat)`` raw values.
 
         ``rows`` is ``(row_cell, row_entity, row_weight)``; without it each
-        cell is one tensor row, in order.
+        cell is one tensor row, in order. ``channels`` are the tensor channels
+        stored, all of them by default.
         """
-        cells = np.asarray(cells, dtype=np.float64)
+        cells = np.asarray(cells)
         n_cells = len(cells)
         if rows is None:
             idx = np.arange(n_cells)
@@ -381,10 +386,18 @@ class SynergyDesign:
         row_cell, row_entity, row_weight = (np.asarray(r) for r in rows)
         n = int(row_entity.max()) + 1 if row_entity.size else 0
         q, _ = covariate_basis(covariates, n)
-        flat = np.ascontiguousarray(cells.reshape(n_cells, -1).T)
+        fd, path = tempfile.mkstemp(suffix=".geofuse-synergy")
+        os.close(fd)
+        mm = np.memmap(
+            path, dtype=np.float32, mode="w+", shape=(cells[0].size, n_cells)
+        )
+        mm[:] = cells.reshape(n_cells, -1).T
+        mm.flush()
+        del mm
         design = cls(
-            _write_memmap(flat, ".geofuse-synergy"),
+            path,
             tuple(cells.shape),
+            tuple(range(cells.shape[1])) if channels is None else tuple(channels),
             row_cell.astype(np.int64),
             row_entity.astype(np.int64),
             row_weight.astype(np.float64),
@@ -396,12 +409,19 @@ class SynergyDesign:
     def _cols(self) -> np.ndarray:
         n_cells = self.shape[0]
         n_cols = int(np.prod(self.shape[1:]))
-        return np.memmap(self.path, dtype=np.float64, mode="r", shape=(n_cols, n_cells))
+        return np.memmap(self.path, dtype=np.float32, mode="r", shape=(n_cols, n_cells))
+
+    def _stored(self, column: int) -> int:
+        """A flat tensor column's row in the stored values."""
+        block = self.shape[2] * self.shape[3]
+        channel, rest = divmod(int(column), block)
+        return self.channels.index(channel) * block + rest
 
     def grid(self, channel_index) -> np.ndarray:
         """``(n_cells, channel, radius, stat)`` raw values of the given channels."""
         _, nc, nr, ns = self.shape
-        g = self._cols().reshape(nc, nr, ns, -1)[list(channel_index)]
+        stored = [self.channels.index(c) for c in channel_index]
+        g = self._cols().reshape(nc, nr, ns, -1)[stored]
         return np.ascontiguousarray(np.moveaxis(g, -1, 0))
 
     def collapse(self, t) -> np.ndarray:
@@ -423,7 +443,7 @@ class SynergyDesign:
         the residualised raw terms, which carry a weight back to the raw scale.
         """
         cols = self._cols()
-        vals = [np.asarray(cols[int(c)]) for c in columns]
+        vals = [np.asarray(cols[self._stored(c)]) for c in columns]
         T = np.column_stack([self.collapse(t) for t in synergy_terms(vals)])
         T = T - self.basis @ (self.basis.T @ T)
         sd = T.std(0)
