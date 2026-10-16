@@ -7234,6 +7234,7 @@ class MetricFusionEngine:
                     suffixes=("_cgi", "_std"),
                 )
                 cov = self._whole_data_covariates(merged)
+                eid, _ = self._whole_data_longitudinal_keys(merged)
             else:
                 merged = pd.DataFrame(
                     {
@@ -7243,6 +7244,7 @@ class MetricFusionEngine:
                     }
                 )
                 cov = None
+                eid, _ = self._whole_data_longitudinal_keys(df_cgi)
             target = merged["target"].to_numpy(dtype=np.float64)
             cgi_c = merged["composite_cgi"].to_numpy(dtype=np.float64)
             std_c = merged["composite_std"].to_numpy(dtype=np.float64)
@@ -7266,9 +7268,19 @@ class MetricFusionEngine:
             std_c = std_c[finite]
             if cov is not None:
                 cov = cov[finite]
+            if eid is not None:
+                eid = eid[finite]
 
         if len(target) < 3:
             return None
+
+        # A panel's waves are resampled with their entity, as the test-score
+        # bootstrap does, so correlated rows are not counted as independent.
+        blocks = None
+        if eid is not None:
+            _, codes = np.unique(eid, return_inverse=True)
+            order = np.argsort(codes, kind="stable")
+            blocks = np.split(order, np.flatnonzero(np.diff(codes[order])) + 1)
 
         higher = metric in objective_scoring.HIGHER_IS_BETTER
         sign = 1.0 if higher else -1.0
@@ -7306,7 +7318,11 @@ class MetricFusionEngine:
         n = len(target)
         diffs = np.empty(int(n_bootstrap), dtype=np.float64)
         for i in range(int(n_bootstrap)):
-            idx = rng.integers(0, n, size=n)
+            if blocks is None:
+                idx = rng.integers(0, n, size=n)
+            else:
+                picks = rng.integers(0, len(blocks), size=len(blocks))
+                idx = np.concatenate([blocks[j] for j in picks])
             try:
                 if fast_pair is not None:
                     sc = fast_pair[0](idx)
