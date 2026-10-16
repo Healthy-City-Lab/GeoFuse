@@ -477,6 +477,7 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "posterior_warmup",
     "posterior_chains",
     "radius_prior",
+    "gvi_min_coverage",
     "check_collinearity",
     "vif_threshold",
 )
@@ -508,6 +509,7 @@ _FUSION_PARAM_TO_WIDGET: dict[str, str] = {
     "posterior_draws": "fusion_posterior_draws",
     "posterior_chains": "fusion_posterior_chains",
     "radius_prior": "fusion_radius_prior",
+    "gvi_min_coverage": "fusion_gvi_min_coverage",
     "check_collinearity": "fusion_check_collinearity",
     "vif_threshold": "fusion_vif_threshold",
     "cgi_grid_spacing_m": "fusion_cgi_grid_spacing_m",
@@ -2016,7 +2018,7 @@ def _render_study_details_panel(
                 "surface is the evidence — a single split's winner is noise."
             ),
         )
-    col_r0, _col_r1, _col_r2 = st.columns(3)
+    col_r0, col_r1, _col_r2 = st.columns(3)
     with col_r0:
         _default(
             "fusion_radius_prior",
@@ -2035,6 +2037,21 @@ def _render_study_details_panel(
                 "dense and a sparse ladder over the same range carry the same "
                 "prior. **Rung-based** takes it from the listed rungs, which "
                 "pulls it towards the dense top of a linear ladder."
+            ),
+        )
+    with col_r1:
+        _default("fusion_gvi_min_coverage", _fs_default("gvi_min_coverage"))
+        gvi_min_coverage_ui = st.number_input(
+            "Minimum GVI coverage",
+            **_fs_bounds("gvi_min_coverage"),
+            step=0.05,
+            format="%.2f",
+            key="fusion_gvi_min_coverage",
+            help=(
+                "Share of entities that must keep a cell with street-view data "
+                "at the smallest searched GVI rung. Smaller rungs that cover "
+                "fewer are not searched, and cells without data at the "
+                "smallest searched rung are left out of the study."
             ),
         )
 
@@ -2349,6 +2366,7 @@ def _render_study_details_panel(
         "posterior_warmup": int(posterior_warmup_ui),
         "posterior_chains": int(posterior_chains_ui),
         "radius_prior": str(radius_prior_ui),
+        "gvi_min_coverage": float(gvi_min_coverage_ui),
         "check_collinearity": bool(check_collinearity),
         "vif_threshold": float(vif_threshold_ui),
     }
@@ -5465,6 +5483,9 @@ def render(output_dir: str) -> None:
     )
     posterior_chains_param = int(study_state.get("posterior_chains", 4))
     radius_prior_param = str(study_state.get("radius_prior", "rungs"))
+    gvi_min_coverage_param = float(
+        study_state.get("gvi_min_coverage", _fs_default("gvi_min_coverage"))
+    )
     check_collinearity_param = bool(study_state.get("check_collinearity", False))
     vif_threshold_param = float(study_state.get("vif_threshold", 10.0))
 
@@ -5871,6 +5892,7 @@ def render(output_dir: str) -> None:
                 "posterior_warmup": int(posterior_warmup_param),
                 "posterior_chains": int(posterior_chains_param),
                 "radius_prior": radius_prior_param,
+                "gvi_min_coverage": gvi_min_coverage_param,
                 "check_collinearity": bool(check_collinearity_param),
                 "vif_threshold": float(vif_threshold_param),
             }
