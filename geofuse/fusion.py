@@ -6692,12 +6692,15 @@ class MetricFusionEngine:
         n_bootstrap: int,
         ci_level: float,
         seed: int,
+        held_out: bool = False,
+        bootstrap: bool = True,
     ) -> dict | None:
-        """Whole-data paired difference for a MixedLM objective.
+        """Paired difference for a MixedLM objective, on all or held-out rows.
 
         Resamples **whole entities** and refits both mixed models on each
         resample. A row bootstrap would break the within-entity correlation the
-        panel model exists to represent.
+        panel model exists to represent. Without ``bootstrap`` only the
+        observed difference is computed.
         """
         spec = self.longitudinal_spec
         assert spec is not None
@@ -6724,6 +6727,8 @@ class MetricFusionEngine:
             on="polygon_id",
             suffixes=("_cgi", "_std"),
         )
+        if held_out:
+            merged = merged.loc[self._test_entity_mask(merged)].reset_index(drop=True)
         eid, ysb = self._whole_data_longitudinal_keys(merged)
         if eid is None:
             logger.warning(
@@ -6769,6 +6774,16 @@ class MetricFusionEngine:
             )
             return None
         obs_diff = obs_cgi - obs_std  # every mixedlm_* metric is higher-is-better
+        result = {
+            "observed_diff": float(obs_diff),
+            "cgi_score": float(obs_cgi),
+            "standalone_score": float(obs_std),
+            "standalone_channel": standalone_channel,
+            "n": int(len(y)),
+            "favors_cgi": bool(obs_diff > 0),
+        }
+        if not bootstrap:
+            return result
 
         uniq, inv = np.unique(eid, return_inverse=True)
         if len(uniq) < 2:
@@ -6826,18 +6841,13 @@ class MetricFusionEngine:
             )
             return None
         alpha = (1.0 - ci_level) / 2.0
-        return {
-            "observed_diff": float(obs_diff),
-            "lower": float(np.quantile(valid, alpha)),
-            "upper": float(np.quantile(valid, 1.0 - alpha)),
-            "p_value": float((np.sum(valid <= 0.0) + 1) / (len(valid) + 1)),
-            "cgi_score": float(obs_cgi),
-            "standalone_score": float(obs_std),
-            "standalone_channel": standalone_channel,
-            "n": int(len(y)),
-            "n_boot": int(len(valid)),
-            "favors_cgi": bool(obs_diff > 0),
-        }
+        result.update(
+            lower=float(np.quantile(valid, alpha)),
+            upper=float(np.quantile(valid, 1.0 - alpha)),
+            p_value=float((np.sum(valid <= 0.0) + 1) / (len(valid) + 1)),
+            n_boot=int(len(valid)),
+        )
+        return result
 
     def paired_objective_difference(
         self,
@@ -6850,10 +6860,41 @@ class MetricFusionEngine:
         ci_level: float = 0.95,
         seed: int = 42,
     ) -> dict | None:
-        """Whole-data objective difference between CGI and the best standalone.
+        """Objective difference between CGI and the best standalone.
+
+        The observed difference and both scores use every row; the bootstrap
+        interval and p-value come from the held-out rows
+        (:func:`exposure_response.split_inference`), the only rows that chose
+        neither composite.
+        """
+        kw = dict(n_bootstrap=n_bootstrap, ci_level=ci_level, seed=seed)
+        args = (cgi_params, standalone_params, standalone_channel, metric)
+        whole = self._paired_difference_on(*args, bootstrap=False, **kw)
+        if whole is None:
+            return None
+        held = self._paired_difference_on(*args, held_out=True, **kw)
+        out = exposure_response.split_inference(whole, held)
+        out["inference_n"] = None if held is None else held["n"]
+        return out
+
+    def _paired_difference_on(
+        self,
+        cgi_params: dict,
+        standalone_params: dict,
+        standalone_channel: str,
+        metric: str,
+        *,
+        n_bootstrap: int = 2000,
+        ci_level: float = 0.95,
+        seed: int = 42,
+        held_out: bool = False,
+        bootstrap: bool = True,
+    ) -> dict | None:
+        """:meth:`paired_objective_difference` on every row or the held-out rows.
 
         Builds both composites on the full dataset (CGI via the formula, the
-        standalone via its single channel), then bootstraps entities once per
+        standalone via its single channel), keeps the held-out rows when
+        ``held_out`` is set, then bootstraps entities once per
         replicate and scores both on the same resample so the paired
         difference is in the objective metric's own units. The difference is
         signed so a **positive** value favours CGI regardless of metric
@@ -6861,7 +6902,8 @@ class MetricFusionEngine:
         standalone_score, standalone_channel, n, favors_cgi}`` or ``None`` when
         the metric isn't an objective-scoring metric or the composites can't be
         built. ``p_value`` is the one-sided bootstrap tail (share of replicates
-        with difference ≤ 0).
+        with difference ≤ 0). Without ``bootstrap`` only the observed
+        difference is computed.
         """
         if metric not in objective_scoring.SUPPORTED_METRICS:
             if self.is_longitudinal and metric in mixed_effects_scoring.MIXEDLM_METRICS:
@@ -6873,6 +6915,8 @@ class MetricFusionEngine:
                     n_bootstrap=n_bootstrap,
                     ci_level=ci_level,
                     seed=seed,
+                    held_out=held_out,
+                    bootstrap=bootstrap,
                 )
             return None
         prev_ch = self._active_greenery_channel
@@ -6896,18 +6940,27 @@ class MetricFusionEngine:
                     on="polygon_id",
                     suffixes=("_cgi", "_std"),
                 )
+                if held_out:
+                    rows = self._test_entity_mask(merged)
+                    merged = merged.loc[rows].reset_index(drop=True)
                 cov = self._whole_data_covariates(merged)
                 eid, _ = self._whole_data_longitudinal_keys(merged)
             else:
+                rows = (
+                    self._test_entity_mask(df_cgi)
+                    if held_out
+                    else np.ones(len(df_cgi), dtype=bool)
+                )
                 merged = pd.DataFrame(
                     {
-                        "target": np.asarray(df_cgi["target"].values),
-                        "composite_cgi": np.asarray(df_cgi["composite"].values),
-                        "composite_std": np.asarray(df_std["composite"].values),
+                        "target": np.asarray(df_cgi["target"].values)[rows],
+                        "composite_cgi": np.asarray(df_cgi["composite"].values)[rows],
+                        "composite_std": np.asarray(df_std["composite"].values)[rows],
                     }
                 )
                 cov = None
                 eid, _ = self._whole_data_longitudinal_keys(df_cgi)
+                eid = None if eid is None else eid[rows]
             target = merged["target"].to_numpy(dtype=np.float64)
             cgi_c = merged["composite_cgi"].to_numpy(dtype=np.float64)
             std_c = merged["composite_std"].to_numpy(dtype=np.float64)
@@ -6967,6 +7020,16 @@ class MetricFusionEngine:
         obs_cgi = _score(target, cgi_c, cov)
         obs_std = _score(target, std_c, cov)
         obs_diff = sign * (obs_cgi - obs_std)
+        result = {
+            "observed_diff": float(obs_diff),
+            "cgi_score": float(obs_cgi),
+            "standalone_score": float(obs_std),
+            "standalone_channel": standalone_channel,
+            "n": int(len(target)),
+            "favors_cgi": bool(obs_diff > 0),
+        }
+        if not bootstrap:
+            return result
 
         # Replicate fast path for the O(n²) metric: both composites are scored
         # on the same resample, so the target / conditioning distance matrices
@@ -7002,20 +7065,12 @@ class MetricFusionEngine:
         if len(valid) == 0:
             return None
         alpha = (1.0 - ci_level) / 2.0
-        lower = float(np.quantile(valid, alpha))
-        upper = float(np.quantile(valid, 1.0 - alpha))
-        p_value = float((np.sum(valid <= 0.0) + 1) / (len(valid) + 1))
-        return {
-            "observed_diff": float(obs_diff),
-            "lower": lower,
-            "upper": upper,
-            "p_value": p_value,
-            "cgi_score": float(obs_cgi),
-            "standalone_score": float(obs_std),
-            "standalone_channel": standalone_channel,
-            "n": int(n),
-            "favors_cgi": bool(obs_diff > 0),
-        }
+        result.update(
+            lower=float(np.quantile(valid, alpha)),
+            upper=float(np.quantile(valid, 1.0 - alpha)),
+            p_value=float((np.sum(valid <= 0.0) + 1) / (len(valid) + 1)),
+        )
+        return result
 
     def compute_subset_scores(
         self,
