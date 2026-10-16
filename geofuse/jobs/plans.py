@@ -957,6 +957,7 @@ def fusion_run_config(spec: JobSpec) -> dict[str, Any]:
         "posterior_warmup": int(s["posterior_warmup"] or s["posterior_draws"]),
         "posterior_chains": int(s["posterior_chains"]),
         "radius_prior": s["radius_prior"],
+        "gvi_min_coverage": float(s["gvi_min_coverage"]),
         "check_collinearity": bool(s["check_collinearity"]),
         "vif_threshold": float(s["vif_threshold"]),
     }

@@ -315,6 +315,13 @@ FUSION: dict[str, Setting] = {
     "index_form": _choice("sweep", INDEX_FORMS, "Functional form; sweep fits both."),
     "sweep_splits": _int(40, 5, 200, "Held-out splits each candidate is scored on."),
     "radius_prior": _choice("rungs", RADIUS_PRIORS, "Distance-of-influence prior."),
+    "gvi_min_coverage": Setting(
+        "float",
+        0.95,
+        lo=0.05,
+        hi=1.0,
+        help="Share of entities the smallest searched GVI rung must cover.",
+    ),
     "run_standalones": _bool(False, "Also run each channel on its own."),
     "check_collinearity": _bool(True, "Drop channels above the VIF threshold."),
     "vif_threshold": Setting(

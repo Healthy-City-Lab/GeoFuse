@@ -1225,6 +1225,7 @@ def _fusion_config_fingerprint(
     exposure_radius_m: float = 100.0,
     exposure_plateau_m: float = 0.0,
     exposure_sigma_m: float = 35.0,
+    gvi_min_coverage: float = 0.95,
 ) -> str:
     """8-char hex hash of every setting that changes the search space / split.
 
@@ -1251,6 +1252,7 @@ def _fusion_config_fingerprint(
             # Bump when the search space / selection scheme changes so old
             # per-job caches can't pool with a new run.
             "sel:stabsel-cpss-v3",
+            f"gmc:{gvi_min_coverage:g}",
         ]
         # An exposure buffer changes every entity's cells, so it splits the
         # cache; only appended when on so unbuffered runs keep their hash.
@@ -1485,6 +1487,7 @@ def run_fusion(
     posterior_warmup: int = 800,
     posterior_chains: int = 4,
     radius_prior: str = "rungs",
+    gvi_min_coverage: float = 0.95,
     gvi_ladder_spacing: str = "linear",
     gvi_ladder_rungs: int = 15,
     ndvi_ladder_spacing: str = "linear",
@@ -1666,6 +1669,7 @@ def run_fusion(
             "posterior_warmup": int(posterior_warmup),
             "posterior_chains": int(posterior_chains),
             "radius_prior": str(radius_prior),
+            "gvi_min_coverage": float(gvi_min_coverage),
             "buffer_meters": buffer_meters,
             "gvi_buffer_min_m": gvi_buffer_min_m,
             "gvi_buffer_max_m": gvi_buffer_max_m,
@@ -1867,6 +1871,7 @@ def run_fusion(
                 exposure_radius_m=float(exposure_radius_m),
                 exposure_plateau_m=float(exposure_plateau_m),
                 exposure_sigma_m=float(exposure_sigma_m),
+                gvi_min_coverage=float(gvi_min_coverage),
                 whole_grid_scaling=whole_grid_scaling,
                 area_balanced_split=area_balanced_split,
                 spatial_adjust_method=spatial_adjust_method,
@@ -2227,6 +2232,7 @@ def run_fusion(
                 exposure_radius_m=float(exposure_radius_m),
                 exposure_plateau_m=float(exposure_plateau_m),
                 exposure_sigma_m=float(exposure_sigma_m),
+                gvi_min_coverage=float(gvi_min_coverage),
             )
 
             def _standalone_study_name(ch: str) -> str:
