@@ -45,7 +45,7 @@ _FUSION_INPUTS = {
 
 class EngineConstantTests(unittest.TestCase):
     def test_choice_lists_equal_the_engines(self):
-        from geofuse import bayesian_index, metric_sampling, ndvi, ndvi_chains
+        from geofuse import bayesian_index, exposure, metric_sampling, ndvi, ndvi_chains
         from geofuse.jobs import runners
         from geofuse.longitudinal import MIXEDLM_METRICS
 
@@ -56,6 +56,7 @@ class EngineConstantTests(unittest.TestCase):
         self.assertEqual(settings.CLOUD_HANDLINGS, ndvi.CLOUD_HANDLINGS)
         self.assertEqual(settings.LADDER_SPACINGS, metric_sampling.LADDER_SPACINGS)
         self.assertEqual(settings.RADIUS_PRIORS, bayesian_index.RADIUS_PRIORS)
+        self.assertEqual(settings.EXPOSURE_KERNELS, exposure.KERNELS)
         self.assertEqual(settings.INDEX_FORMS[1:], bayesian_index.FORMS)
         self.assertEqual(settings.CHANNEL_SETS, runners._CHANNEL_SETS)
         n = len(MIXEDLM_METRICS)

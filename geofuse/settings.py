@@ -135,6 +135,8 @@ CLOUD_HANDLINGS = ("scene_filter", "pixel_only", "scene_only")
 LADDER_SPACINGS = ("linear", "log")
 #: ``geofuse.bayesian_index.RADIUS_PRIORS``.
 RADIUS_PRIORS = ("rungs", "range")
+#: ``geofuse.exposure.KERNELS``.
+EXPOSURE_KERNELS = ("none", "uniform", "linear", "gaussian")
 #: ``geofuse.bayesian_index.FORMS``, plus ``sweep`` (fit both, keep the better).
 INDEX_FORMS = ("sweep", "linear", "synergy")
 #: Channel sets a fusion job can pick between (``runners._CHANNEL_SETS``).
@@ -340,6 +342,18 @@ FUSION: dict[str, Setting] = {
     "clear_preaggregation_cache": _bool(False, "Rebuild the target's cache first."),
     # ── Per-pixel scoring (vector targets) ──────────────────────
     "cgi_grid_spacing_m": _int(50, 10, 500, "CGI grid pixel size (m).", step=10),
+    "exposure_kernel": _choice(
+        "none", EXPOSURE_KERNELS, "Exposure buffer; none = touched cells only."
+    ),
+    "exposure_radius_m": Setting(
+        "float", 100.0, lo=1.0, hi=5000.0, help="Exposure buffer radius (m)."
+    ),
+    "exposure_plateau_m": Setting(
+        "float", 0.0, lo=0.0, hi=5000.0, help="Linear buffer: full weight up to (m)."
+    ),
+    "exposure_sigma_m": Setting(
+        "float", 35.0, lo=1.0, hi=5000.0, help="Gaussian buffer SD (m)."
+    ),
     "whole_grid_scaling": _bool(True, "Scale the composite map to [0, 1]."),
     "area_balanced_split": _bool(True, "Balance polygon area across the split."),
     "spatial_split": _bool(True, "Hold out whole spatial blocks."),

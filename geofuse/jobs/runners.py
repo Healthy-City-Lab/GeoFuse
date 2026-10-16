@@ -1221,6 +1221,10 @@ def _fusion_config_fingerprint(
     gvi_ladder_rungs: int = 15,
     ndvi_ladder_spacing: str = "linear",
     ndvi_ladder_rungs: int = 15,
+    exposure_kernel: str = "none",
+    exposure_radius_m: float = 100.0,
+    exposure_plateau_m: float = 0.0,
+    exposure_sigma_m: float = 35.0,
 ) -> str:
     """8-char hex hash of every setting that changes the search space / split.
 
@@ -1248,6 +1252,16 @@ def _fusion_config_fingerprint(
             # per-job caches can't pool with a new run.
             "sel:stabsel-cpss-v3",
         ]
+        # An exposure buffer changes every entity's cells, so it splits the
+        # cache; only appended when on so unbuffered runs keep their hash.
+        + (
+            [
+                f"exp:{exposure_kernel}@{exposure_radius_m:g}@"
+                f"{exposure_plateau_m:g}@{exposure_sigma_m:g}"
+            ]
+            if exposure_kernel != "none"
+            else []
+        )
         # Spatial-confounding adjustment changes the objective, so it splits the
         # cache; only appended when on so legacy runs keep their hash.
         + (
@@ -1449,6 +1463,10 @@ def run_fusion(
     standalone_channels: list[str] | None = None,
     longitudinal_spec_payload: dict | None = None,
     cgi_grid_spacing_m: float | None = None,
+    exposure_kernel: str = "none",
+    exposure_radius_m: float = 100.0,
+    exposure_plateau_m: float = 0.0,
+    exposure_sigma_m: float = 35.0,
     whole_grid_scaling: bool = False,
     area_balanced_split: bool = False,
     spatial_adjust_method: str = "none",
@@ -1662,6 +1680,10 @@ def run_fusion(
             "ndvi_resolution_m": ndvi_resolution_m,
             "gvi_grid_spacing_m": gvi_grid_spacing_m,
             "cgi_grid_spacing_m": cgi_grid_spacing_m,
+            "exposure_kernel": str(exposure_kernel),
+            "exposure_radius_m": float(exposure_radius_m),
+            "exposure_plateau_m": float(exposure_plateau_m),
+            "exposure_sigma_m": float(exposure_sigma_m),
             "whole_grid_scaling": bool(whole_grid_scaling),
             "area_balanced_split": bool(area_balanced_split),
             "spatial_split": bool(spatial_split),
@@ -1841,6 +1863,10 @@ def run_fusion(
                 covariate_types=dict(covariate_types or {}),
                 longitudinal_spec=longitudinal_spec,
                 cgi_grid_spacing_m=cgi_grid_spacing_m,
+                exposure_kernel=exposure_kernel,
+                exposure_radius_m=float(exposure_radius_m),
+                exposure_plateau_m=float(exposure_plateau_m),
+                exposure_sigma_m=float(exposure_sigma_m),
                 whole_grid_scaling=whole_grid_scaling,
                 area_balanced_split=area_balanced_split,
                 spatial_adjust_method=spatial_adjust_method,
@@ -2197,6 +2223,10 @@ def run_fusion(
                 gvi_ladder_rungs=int(gvi_ladder_rungs),
                 ndvi_ladder_spacing=ndvi_ladder_spacing,
                 ndvi_ladder_rungs=int(ndvi_ladder_rungs),
+                exposure_kernel=exposure_kernel,
+                exposure_radius_m=float(exposure_radius_m),
+                exposure_plateau_m=float(exposure_plateau_m),
+                exposure_sigma_m=float(exposure_sigma_m),
             )
 
             def _standalone_study_name(ch: str) -> str:
