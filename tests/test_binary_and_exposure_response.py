@@ -210,6 +210,19 @@ class TestExposureResponse(unittest.TestCase):
         self.assertLess(out["nonlinearity_p"], 1e-6)
         self.assertEqual(len(out["curve"]["exposure"]), 50)
 
+    def test_the_curve_follows_the_response_on_a_skewed_exposure(self):
+        # Knots placed on the data alone; a uniform plotting grid appended to
+        # the data used to drag them towards the tail.
+        rng = np.random.default_rng(15)
+        n = 4000
+        g = rng.lognormal(0.0, 0.6, size=n)
+        y = (g - 1.0) ** 2 + 0.05 * rng.normal(size=n)
+        out = er.spline_nonlinearity_test(g, er.make_ols_fitter(y), None)
+        grid = np.asarray(out["curve"]["exposure"])
+        truth = (grid - 1.0) ** 2 - (np.median(g) - 1.0) ** 2
+        err = np.abs(np.asarray(out["curve"]["effect"]) - truth)
+        self.assertLess(float(np.max(err)), 0.1 * float(np.ptp(truth)))
+
     def test_spline_type_one_error_is_calibrated(self):
         fired = 0
         reps = 200

@@ -287,24 +287,34 @@ def quartile_terms(
 # ────────────────────────────────────────────────────────────────────
 
 
-def _natural_cubic_basis(x: np.ndarray, df: int = SPLINE_DF) -> np.ndarray | None:
-    """Natural cubic spline basis for *x*, or ``None`` if it cannot be built."""
+def _natural_cubic_basis(
+    x: np.ndarray, df: int = SPLINE_DF, at: np.ndarray | None = None
+) -> tuple[np.ndarray, np.ndarray | None] | None:
+    """Natural cubic spline basis for *x*, or ``None`` if it cannot be built.
+
+    Returns ``(basis on x, basis on at)``. The knots are placed on *x* alone and
+    reused for *at*, so evaluation points never move them.
+    """
     try:
-        from patsy import dmatrix
+        from patsy import build_design_matrices, dmatrix
     except Exception:
         logger.warning(
             "patsy is unavailable; the spline non-linearity test is skipped."
         )
         return None
     try:
-        basis = np.asarray(
-            dmatrix("cr(v, df=d) - 1", {"v": x, "d": df}, return_type="dataframe"),
-            dtype=np.float64,
-        )
+        frame = dmatrix("cr(v, df=d) - 1", {"v": x, "d": df}, return_type="dataframe")
+        basis = np.asarray(frame, dtype=np.float64)
+        at_basis = None
+        if at is not None:
+            (at_frame,) = build_design_matrices([frame.design_info], {"v": at, "d": df})
+            at_basis = np.asarray(at_frame, dtype=np.float64)
     except Exception as exc:
         logger.warning(f"spline basis failed: {exc}")
         return None
-    return basis if basis.ndim == 2 and basis.shape[1] >= 2 else None
+    if basis.ndim != 2 or basis.shape[1] < 2:
+        return None
+    return basis, at_basis
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -556,9 +566,11 @@ def spline_nonlinearity_test(
     from scipy import stats
 
     x = np.asarray(exposure, dtype=np.float64)
-    basis = _natural_cubic_basis(x, df)
-    if basis is None:
+    grid = np.linspace(np.nanpercentile(x, 1), np.nanpercentile(x, 99), _CURVE_POINTS)
+    built = _natural_cubic_basis(x, df, at=grid)
+    if built is None:
         return None
+    basis, grid_basis = built
 
     n = len(x)
     linear_part = np.column_stack([np.ones(n), x])
@@ -609,16 +621,15 @@ def spline_nonlinearity_test(
     p_nonlinear = float(stats.chi2.sf(stat, dof)) if np.isfinite(stat) else float("nan")
 
     # Fitted curve: the linear term plus the non-linear block, evaluated on a
-    # grid. The grid rows are appended to the data before building the basis so
-    # the knot placement is identical, then orthogonalised the same way.
+    # grid with the knots of the fit. The block is the basis minus its
+    # least-squares projection on [1, x], so the grid takes the coefficients
+    # of that projection rather than a projection of its own.
     curve = None
-    grid = np.linspace(np.nanpercentile(x, 1), np.nanpercentile(x, 99), _CURVE_POINTS)
-    joint = _natural_cubic_basis(np.concatenate([x, grid]), df)
-    if joint is not None and joint.shape[1] == basis.shape[1]:
-        joint_linear = np.column_stack([np.ones(len(joint)), np.concatenate([x, grid])])
-        q = col_basis(joint_linear)
-        joint_nl = (joint - q @ (q.T @ joint))[:, kept]
-        yhat = fitted["linear"][0] * grid + joint_nl[n:] @ beta_nl
+    if grid_basis is not None:
+        proj, *_ = np.linalg.lstsq(linear_part, basis[:, kept], rcond=None)
+        grid_linear = np.column_stack([np.ones(len(grid)), grid])
+        grid_nl = grid_basis[:, kept] - grid_linear @ proj
+        yhat = fitted["linear"][0] * grid + grid_nl @ beta_nl
         centre = float(np.interp(float(np.nanmedian(x)), grid, yhat))
         curve = {
             "exposure": [float(v) for v in grid],
