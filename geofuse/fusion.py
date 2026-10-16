@@ -140,8 +140,7 @@ class MetricFusionEngine:
     4. Optimizes 9 parameters matching CGI.ipynb:
        - Weights: veg_weight, terrain_weight, ndvi_weight (0-100, sum=100)
        - Radii: veg_radius, terrain_radius, ndvi_radius (GVI / NDVI ladder grids)
-       - Streetview agg: streetview_stat, streetview_percentile (shared for veg+terrain)
-       - NDVI agg: ndvi_stat, ndvi_percentile (separate for NDVI)
+       - Aggregation per channel: <channel>_stat, <channel>_percentile
     5. Validates performance using cross-validation and held-out test set
     """
 
@@ -2171,9 +2170,9 @@ class MetricFusionEngine:
     def _channel_spec(self, params: dict, channel: str) -> tuple[float, str, int]:
         """``(radius, stat, percentile)`` for one channel out of a params dict.
 
-        NDVI carries its own statistic; every street-view channel — ``veg``,
-        ``terrain`` and the combined ``gvi`` — shares one, which is how the
-        search records it.
+        Every channel carries its own statistic. Street-view channels of params
+        recorded with one shared ``streetview_stat`` / ``streetview_percentile``
+        fall back to it.
         """
         if channel == "ndvi":
             return (
@@ -2183,8 +2182,10 @@ class MetricFusionEngine:
             )
         return (
             params.get(f"{channel}_radius", int(round(self.gvi_buffer_max_m))),
-            params.get("streetview_stat", "mean"),
-            params.get("streetview_percentile", 50),
+            params.get(f"{channel}_stat", params.get("streetview_stat", "mean")),
+            params.get(
+                f"{channel}_percentile", params.get("streetview_percentile", 50)
+            ),
         )
 
     def _channel_radii(self, params: dict) -> dict[str, float]:
@@ -3638,15 +3639,9 @@ class MetricFusionEngine:
             stat, pct = stat_of.get(column, ("percentile", 0))
             if column != "mean":
                 pct = int(column[1:])
-            if ch == "ndvi":
-                params["ndvi_radius"] = int(radius)
-                params["ndvi_stat"] = stat
-                params["ndvi_percentile"] = int(pct)
-            else:
-                params[f"{ch}_radius"] = int(radius)
-                # veg and terrain share one street-view statistic in the engine.
-                params["streetview_stat"] = stat
-                params["streetview_percentile"] = int(pct)
+            params[f"{ch}_radius"] = int(radius)
+            params[f"{ch}_stat"] = stat
+            params[f"{ch}_percentile"] = int(pct)
         # Defaults only for the channels this formula consumes, so no key reads
         # as a fitted radius for a channel the run never fitted. The apply path
         # defaults any channel it needs that is absent.
@@ -3655,12 +3650,8 @@ class MetricFusionEngine:
         for ch in formula_channels:
             default = self.ndvi_buffer_max_m if ch == "ndvi" else self.gvi_buffer_max_m
             params.setdefault(f"{ch}_radius", int(round(float(default))))
-        if formula_channels - {"ndvi"}:
-            params.setdefault("streetview_stat", "mean")
-            params.setdefault("streetview_percentile", 50)
-        if "ndvi" in formula_channels:
-            params.setdefault("ndvi_stat", "mean")
-            params.setdefault("ndvi_percentile", 50)
+            params.setdefault(f"{ch}_stat", "mean")
+            params.setdefault(f"{ch}_percentile", 50)
 
         # Posterior-mean weights onto the formula's keys as integers summing to
         # 100, which is the scale every downstream consumer expects.

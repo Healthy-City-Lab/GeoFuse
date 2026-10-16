@@ -96,13 +96,40 @@ class TestEveryChannelResolvesItsAggregation(unittest.TestCase):
         e = _engine("weighted_average_gvi")
         self.assertEqual(e._channel_spec(PARAMS, "ndvi"), (800, "mean", 50))
 
-    def test_the_street_view_channels_share_one_statistic(self):
+    def test_shared_street_view_statistics_of_stored_params_still_resolve(self):
         e = _engine("weighted_average_gvi")
         for ch, radius in (("gvi", 300), ("veg", 250), ("terrain", 250)):
             with self.subTest(channel=ch):
                 self.assertEqual(
                     e._channel_spec(PARAMS, ch), (radius, "percentile", 75)
                 )
+
+    def test_each_street_view_channel_reads_its_own_statistic(self):
+        e = _engine("weighted_average")
+        params = dict(
+            PARAMS,
+            veg_stat="percentile",
+            veg_percentile=90,
+            terrain_stat="percentile",
+            terrain_percentile=10,
+        )
+        self.assertEqual(e._channel_spec(params, "veg"), (250, "percentile", 90))
+        self.assertEqual(e._channel_spec(params, "terrain"), (250, "percentile", 10))
+
+    def test_the_sweep_records_a_statistic_per_channel(self):
+        from types import SimpleNamespace
+
+        e = _engine("weighted_average")
+        post = SimpleNamespace(
+            picked=((800, "mean"), (250, "p90"), (300, "p10")),
+            weights=np.full((4, 3), 1.0 / 3.0),
+            powers=None,
+        )
+        params = e._params_from_sweep(None, post, ["ndvi", "veg", "terrain"])
+        self.assertEqual(e._channel_spec(params, "ndvi"), (800, "mean", 50))
+        self.assertEqual(e._channel_spec(params, "veg"), (250, "percentile", 90))
+        self.assertEqual(e._channel_spec(params, "terrain"), (300, "percentile", 10))
+        self.assertNotIn("streetview_stat", params)
 
     def test_a_missing_radius_falls_back_to_the_ladder_maximum(self):
         e = _engine("weighted_average_gvi")
