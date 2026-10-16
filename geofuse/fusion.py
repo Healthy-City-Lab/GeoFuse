@@ -3906,6 +3906,9 @@ class MetricFusionEngine:
                 "WARN",
                 f"Skipped {skipped_nan} entity(ies) with NaN outcome / covariate.",
             )
+        # Entity keys stay the target's own row positions, so outputs join back
+        # to the target's geometries.
+        keep_pos = np.flatnonzero(valid_mask.to_numpy())
         entities = entities.loc[valid_mask].reset_index(drop=True)
         if len(entities) < 2:
             raise ValueError(
@@ -3921,7 +3924,10 @@ class MetricFusionEngine:
         if self.is_polygon_target:
             # Per-entity area for the area-balanced split.
             self._polygon_id_to_area_km2 = dict(
-                enumerate((ent.geometry.area.to_numpy() / 1_000_000.0).tolist())
+                zip(
+                    keep_pos.tolist(),
+                    (ent.geometry.area.to_numpy() / 1_000_000.0).tolist(),
+                )
             )
 
         ent_idx, g_row, g_col, weight = exposure.cell_weights(
@@ -3976,11 +3982,11 @@ class MetricFusionEngine:
             f"{len(ent_idx):,} entity–cell exposures · grid span {n_rows}×{n_cols}.",
         )
 
-        # ``polygon_id`` = the entity/observation index; each (entity, wave)
+        # ``polygon_id`` = the entity's row in the target; each (entity, wave)
         # row in longitudinal mode is already its own observation.
         entity_gdf = gpd.GeoDataFrame(
             {
-                "polygon_id": ent_idx,
+                "polygon_id": keep_pos[ent_idx],
                 "target": ent[outcome_col].to_numpy()[ent_idx],
                 "_grid_row": pixels["_grid_row"].to_numpy()[cell_of_row],
                 "_grid_col": pixels["_grid_col"].to_numpy()[cell_of_row],
