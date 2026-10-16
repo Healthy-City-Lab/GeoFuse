@@ -179,7 +179,9 @@ def _column_scales(X: np.ndarray) -> np.ndarray:
 
 
 def _irls(y: np.ndarray, X: np.ndarray, beta0: np.ndarray | None = None):
-    """Plain logistic IRLS. Returns ``(beta, mu)`` or ``None`` if it diverges."""
+    """Plain logistic IRLS. Returns ``(beta, mu)``, or ``None`` if it diverges or
+    does not converge within ``_MAX_IRLS`` steps (separated data walks off to
+    infinity rather than settling)."""
     n, p = X.shape
     beta = np.zeros(p) if beta0 is None else np.array(beta0, dtype=np.float64)
     for _ in range(_MAX_IRLS):
@@ -199,6 +201,8 @@ def _irls(y: np.ndarray, X: np.ndarray, beta0: np.ndarray | None = None):
             beta = new
             break
         beta = new
+    else:
+        return None
     eta = X @ beta
     return beta, _clip_mu(1.0 / (1.0 + np.exp(-eta)))
 
@@ -381,7 +385,8 @@ def _fit_gee_logit(
 ):
     """Fit a GEE logistic model. Returns ``(beta, mu, alpha, cov)`` or ``None``.
 
-    ``y`` and ``X`` must already be in ``layout.order``. Fisher scoring on the
+    ``None`` also when the steps never settle within ``max_iter``. ``y`` and
+    ``X`` must already be in ``layout.order``. Fisher scoring on the
     estimating equations, alternating with a moment update of the working
     correlation — the standard Liang–Zeger loop, with every step vectorised
     through :func:`_accumulate`.
@@ -410,6 +415,8 @@ def _fit_gee_logit(
         beta = beta + step
         if np.max(np.abs(step)) < tol:
             break
+    else:
+        return None
     mu = _clip_mu(1.0 / (1.0 + np.exp(-(Xs @ beta))))
     alpha = _alpha_from_residuals(y, mu, layout, Xs.shape[1])
     bread, _score, meat = _accumulate(Xs, mu * (1.0 - mu), y - mu, layout, alpha)

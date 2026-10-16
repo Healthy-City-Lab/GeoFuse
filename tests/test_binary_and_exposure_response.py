@@ -159,6 +159,16 @@ class TestCrossSectionalLogit(unittest.TestCase):
         g = rng.normal(size=500)
         self.assertEqual(osc.score("logit_tstat", g + rng.normal(size=500), g), 0.0)
 
+    def test_a_separated_outcome_gives_no_estimate(self):
+        # The likelihood has no maximum when the exposure splits the outcome
+        # perfectly, so the iterate walks off instead of converging.
+        g = np.linspace(-2.0, 2.0, 400)
+        y = (g > 0).astype(float)
+        X = np.column_stack([np.ones_like(g), g])
+        self.assertIsNone(bl._irls(y, X))
+        self.assertIsNone(bl.make_logit_fitter(y)(X, ["c", "g"]))
+        self.assertEqual(osc.score("logit_tstat", y, g), 0.0)
+
 
 class TestExposureResponse(unittest.TestCase):
     def test_iqr_scaling_moves_units_only(self):
