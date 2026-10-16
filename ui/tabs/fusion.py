@@ -2137,8 +2137,7 @@ def _render_study_details_panel(
             )
     posterior_warmup_ui = int(posterior_draws_ui)
 
-    # ── Per-pixel CGI scoring (vector targets) ──────────────────
-    cgi_grid_spacing_m = 50
+    # ── Per-pixel CGI scoring ───────────────────────────────────
     whole_grid_scaling = True
     area_balanced_split = True
     spatial_split = False
@@ -2147,15 +2146,25 @@ def _render_study_details_panel(
     spatial_adjust_method = "none"
     spatial_adjust_max_df = 10
     spatial_adjust_eps_m: float | None = None
+    st.markdown("**Per-pixel CGI scoring**")
+    _grid = _FS["cgi_grid_spacing_m"]
+    _grid_options = list(range(int(_grid.lo), int(_grid.hi) + 1, int(_grid.step)))
+    _default(
+        "fusion_cgi_grid_spacing_m",
+        _fs_default("cgi_grid_spacing_m"),
+        _grid_options,
+    )
+    cgi_grid_spacing_m = st.select_slider(
+        "CGI grid pixel size (m)",
+        options=_grid_options,
+        key="fusion_cgi_grid_spacing_m",
+        help=(
+            "Per-pixel CGI grid spacing. Smaller = higher fidelity and a bigger "
+            "cache. A raster target's pixels are placed on this grid by their "
+            "centres; the target's own pixel size is not reused."
+        ),
+    )
     if is_vector_target:
-        st.markdown("**Per-pixel CGI scoring**")
-        _grid = _FS["cgi_grid_spacing_m"]
-        _grid_options = list(range(int(_grid.lo), int(_grid.hi) + 1, int(_grid.step)))
-        _default(
-            "fusion_cgi_grid_spacing_m",
-            _fs_default("cgi_grid_spacing_m"),
-            _grid_options,
-        )
         for name in (
             "whole_grid_scaling",
             "area_balanced_split",
@@ -2164,14 +2173,6 @@ def _render_study_details_panel(
             _default(f"fusion_{name}", _fs_default(name))
         _default(
             "fusion_spatial_block_size_m", _fs_default("spatial_block_size_m") or 0
-        )
-        cgi_grid_spacing_m = st.select_slider(
-            "CGI grid pixel size (m)",
-            options=_grid_options,
-            key="fusion_cgi_grid_spacing_m",
-            help=(
-                "Per-pixel CGI grid spacing. Smaller = higher fidelity and a bigger cache."
-            ),
         )
         whole_grid_scaling = st.checkbox(
             "Scale composite map to [0, 1]",
@@ -5858,7 +5859,7 @@ def render(output_dir: str) -> None:
                 **exposure_params,
                 "cgi_grid_spacing_m": (
                     int(cgi_grid_spacing_m_param)
-                    if cgi_grid_spacing_m_param is not None and is_vector_target
+                    if cgi_grid_spacing_m_param is not None
                     else None
                 ),
                 # Composite [0, 1] scaling: user-chosen for vector targets;
