@@ -7,7 +7,10 @@ raster and street-view points. Pinned here:
   overlap, and each (entity, cell) row carries its exposure weight;
 - the applied composite is the weighted mean of per-cell composites, and for a
   linear composite it equals the same combination of the index tensor — the
-  object the discovery engine fits — entity for entity.
+  object the discovery engine fits — entity for entity;
+- sparse street-view data moves the searched ladder up to the first rung that
+  covers enough entities, and every kept entity is covered at every searched
+  rung.
 """
 
 import os
@@ -126,6 +129,53 @@ class TestVectorExposure(unittest.TestCase):
         got = applied.loc[static["pid"], "composite"].to_numpy()
         np.testing.assert_allclose(got, expected, rtol=1e-5, atol=1e-6)
 
+    def test_every_entity_reports_its_kept_exposure_share(self):
+        applied = self.eng.apply_fusion(weights=dict(PARAMS))
+        share = applied["coverage_share"]
+        self.assertTrue(((share > 0) & (share <= 1)).all())
+
+    def test_sparse_street_view_moves_the_search_to_a_covered_rung(self):
+        rng = np.random.default_rng(4)
+        pts = [
+            Point(-114.10 + rng.random() * 0.03, 51.00 + rng.random() * 0.02)
+            for _ in range(25)
+        ]
+        sparse = gpd.GeoDataFrame(
+            {"gvi_veg": rng.random(25), "gvi_ter": rng.random(25)},
+            geometry=pts,
+            crs="EPSG:4326",
+        )
+        spath = os.path.join(self.tmp, "sparse.gpkg")
+        sparse.to_file(spath, driver="GPKG")
+        eng = MetricFusionEngine(
+            target_file=os.path.join(self.tmp, "t.gpkg"),
+            target_feature="outcome",
+            buffer_meters=400,
+            gvi_buffer_min_m=100,
+            gvi_buffer_max_m=400,
+            gvi_buffer_step_m=100,
+            ndvi_buffer_min_m=200,
+            ndvi_buffer_max_m=400,
+            ndvi_buffer_step_m=200,
+            cache_dir=os.path.join(self.tmp, "cache_s"),
+            cgi_grid_spacing_m=100,
+            gvi_min_coverage=0.9,
+        )
+        eng.load_target()
+        eng.load_metrics(veg_file=spath, ndvi_file=self.npath, cache_metrics=False)
+        df = eng.prepare_fusion_data()
+        eng.precompute_aggregations()
+        shares = eng._coverage_report["gvi_rung_entity_share"]
+        floor = eng._gvi_floor_m
+        self.assertGreater(floor, 100)
+        self.assertTrue(all(v < 0.9 for r, v in shares.items() if r < floor))
+        self.assertEqual(eng._search_radii()[0][0], floor)
+
+        eng.split_data(test_size=0.3, random_state=5, fusion_df=df)
+        X, radii, _, channels, _ = eng.build_index_tensor("train_val")
+        searched = [i for i, r in enumerate(radii) if r >= floor]
+        for ch in ("veg", "terrain"):
+            self.assertTrue(np.isfinite(X[:, channels.index(ch), searched]).all())
 
     def test_raster_pixels_are_entities_on_the_study_grid(self):
         rng = np.random.default_rng(3)

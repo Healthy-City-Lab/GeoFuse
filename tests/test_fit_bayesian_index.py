@@ -57,6 +57,7 @@ def _stub_engine(n=300, seed=0):
     for name in (
         "_params_from_sweep",
         "_index_layout",
+        "_search_radii",
         "_inner_split_groups",
         "_channel_scaling",
         "_ladder_description",
@@ -214,6 +215,7 @@ def _retune_stub(n=600, seed=3):
     for name in (
         "_params_from_sweep",
         "_index_layout",
+        "_search_radii",
         "_inner_split_groups",
         "_channel_scaling",
         "_ladder_description",

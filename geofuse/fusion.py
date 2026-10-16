@@ -183,6 +183,7 @@ class MetricFusionEngine:
         exposure_radius_m: float = 100.0,
         exposure_plateau_m: float = 0.0,
         exposure_sigma_m: float = 35.0,
+        gvi_min_coverage: float = 0.95,
     ):
         """
         Initialize the fusion engine.
@@ -236,6 +237,9 @@ class MetricFusionEngine:
             exposure_kernel / exposure_radius_m / exposure_plateau_m /
                 exposure_sigma_m: which CGI cells an entity is exposed to and
                 with what weight; see :func:`exposure.cell_weights`.
+            gvi_min_coverage: share of entities that must keep a covered cell
+                at a street-view rung for the search to offer it; see
+                :meth:`_apply_coverage_gate`.
         """
         # Route Optuna's chatter ("Trial X finished with value Y …") into
         # the per-job log instead of the Streamlit host terminal. Fusion
@@ -423,6 +427,17 @@ class MetricFusionEngine:
         self.exposure_radius_m = float(exposure_radius_m)
         self.exposure_plateau_m = float(exposure_plateau_m)
         self.exposure_sigma_m = float(exposure_sigma_m)
+        if not 0.0 < float(gvi_min_coverage) <= 1.0:
+            raise ValueError(
+                f"gvi_min_coverage must lie in (0, 1]; got {gvi_min_coverage}."
+            )
+        self.gvi_min_coverage = float(gvi_min_coverage)
+        # Set by the coverage gate after pre-aggregation: the smallest offered
+        # street-view rung, the exposure rows kept, and what was measured.
+        self._gvi_floor_m: int | None = None
+        self._coverage_keep_index: pd.Index | None = None
+        self._coverage_report: dict | None = None
+        self._entity_coverage_share: dict | None = None
         self.whole_grid_scaling: bool = bool(whole_grid_scaling)
         # When True, each channel is min-max scaled to [0, 1] (per-channel
         # bounds fixed at prepare time from the predictor distribution only —
@@ -2037,6 +2052,10 @@ class MetricFusionEngine:
         self._preaggregation_done = False
         self._preaggr_cache = None
         self._preaggr_pid_translate = None
+        self._gvi_floor_m = None
+        self._coverage_keep_index = None
+        self._coverage_report = None
+        self._entity_coverage_share = None
         if self._preaggr_mem is not None:
             self._preaggr_mem.close()
             self._preaggr_mem = None
@@ -2250,6 +2269,14 @@ class MetricFusionEngine:
         """(gvi_radii, ndvi_radii): the integer radii of the two buffer ladders."""
         return self._ladder("gvi"), self._ladder("ndvi")
 
+    def _search_radii(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        """The ladders the index searches: the street-view one from its floor."""
+        gvi_radii, ndvi_radii = self._preaggr_radii()
+        floor = getattr(self, "_gvi_floor_m", None)
+        if floor is not None:
+            gvi_radii = tuple(r for r in gvi_radii if r >= floor)
+        return gvi_radii, ndvi_radii
+
     def _metric_fingerprint(self, metric, channel: str) -> str:
         """Cheap, deterministic identity for a loaded metric (vector or raster)."""
         if isinstance(metric, dict):  # raster
@@ -2446,6 +2473,25 @@ class MetricFusionEngine:
     ) -> bool:
         """Build (or reuse/resume) the on-disk per-(entity, radius) stat cache.
 
+        On completion the coverage gate settles the study's cell set
+        (:meth:`_apply_coverage_gate`). Returns ``True`` on completion,
+        ``False`` if cancelled.
+        """
+        done = self._build_aggregations(
+            progress_callback, cancel_callback, max_workers
+        )
+        if done:
+            self._apply_coverage_gate()
+        return done
+
+    def _build_aggregations(
+        self,
+        progress_callback: Callable[[int, int], None] | None = None,
+        cancel_callback: Callable[[], bool] | None = None,
+        max_workers: int | None = None,
+    ) -> bool:
+        """Build (or reuse/resume) the on-disk per-(entity, radius) stat cache.
+
         For every sample entity and every buffer radius in the ladder, stores
         (mean, p10..p90) per channel in a per-job SQLite database
         (``geofuse/preaggregation.py``). Handles both vector (point) and raster
@@ -2455,8 +2501,7 @@ class MetricFusionEngine:
 
         Returns ``True`` on completion, ``False`` if cancelled.
         """
-        # The coverage gate may already have attached a complete reusable cache
-        # (loading it once for both coverage and scoring); nothing left to build.
+        # An earlier call already built the complete cache; nothing left to build.
         if self._preaggregation_done and isinstance(
             self._preaggr_cache, preaggregation.GreeneryCache
         ):
@@ -2927,6 +2972,113 @@ class MetricFusionEngine:
             # that state is dropped — and Windows will not delete a mapped file.
             preaggregation.worker_release()
             shutil.rmtree(share_dir, ignore_errors=True)
+
+    def _apply_coverage_gate(self) -> None:
+        """Settle the one cell set every candidate of the study is scored on.
+
+        The street-view ladder is searched from the first rung at which at
+        least ``gvi_min_coverage`` of the entities keep a cell with street-view
+        data (the largest rung when none does). A cell is kept when each index
+        channel has data at its smallest searched rung; a larger disc holds the
+        smaller one, so a kept cell is covered at every searched rung.
+        """
+        tg = self.target_gdf
+        source = self._ensure_memory_loaded() or self._preaggr_cache
+        if source is None or tg is None or "_preaggr_id" not in tg.columns:
+            return
+        plan = self._preaggr_plan(
+            source, tg["_preaggr_id"].to_numpy(), self._wave_index(tg)
+        )
+        if plan is None:
+            return
+        column = preaggregation.stat_to_column("mean", None)
+        gvi_radii, ndvi_radii = self._preaggr_radii()
+
+        def covered(channel, radius):
+            v = source.gather(plan, channel, int(radius), column)
+            return np.ones(len(tg), dtype=bool) if v is None else np.isfinite(v)
+
+        index_channels = (
+            set(cgi_formulas.formula_channels(self.cgi_formula))
+            if self._active_greenery_channel == "cgi"
+            else {self._active_greenery_channel}
+        )
+        keep = np.ones(len(tg), dtype=bool)
+        if "ndvi" in index_channels:
+            keep &= covered("ndvi", ndvi_radii[0])
+        if "polygon_id" in tg.columns:
+            codes, uniq = pd.factorize(tg["polygon_id"], sort=True)
+        else:
+            codes, uniq = np.arange(len(tg)), tg.index.to_numpy()
+        n_ent = len(uniq)
+
+        street = [
+            c for c in self._cache_channels() if c in index_channels and c != "ndvi"
+        ]
+        shares: dict[int, float] = {}
+        if street:
+            floor = None
+            for r in gvi_radii:
+                rung = keep & covered(street[0], r)
+                hit = np.bincount(codes[rung], minlength=n_ent) > 0
+                share = float(hit.mean())
+                shares[int(r)] = share
+                if share >= self.gvi_min_coverage:
+                    floor = int(r)
+                    break
+            if floor is None:
+                floor = int(gvi_radii[-1])
+                _log(
+                    "WARN",
+                    f"No street-view rung reaches {self.gvi_min_coverage:.0%} entity "
+                    f"coverage; searching {floor} m only "
+                    f"({shares[floor]:.1%} covered).",
+                )
+            keep = rung
+            self._gvi_floor_m = floor
+
+        w = (
+            tg["_weight"].to_numpy(dtype=np.float64)
+            if "_weight" in tg.columns
+            else np.ones(len(tg))
+        )
+        total = np.bincount(codes, weights=w, minlength=n_ent)
+        kept = np.bincount(codes[keep], weights=w[keep], minlength=n_ent)
+        self._entity_coverage_share = dict(
+            zip(uniq.tolist(), (kept / np.where(total > 0, total, 1.0)).tolist())
+        )
+        self._coverage_keep_index = tg.index[keep]
+        self._coverage_report = {
+            "gvi_floor_m": self._gvi_floor_m,
+            "smallest_offered_m": int(gvi_radii[0]) if street else None,
+            "min_coverage": self.gvi_min_coverage,
+            "gvi_rung_entity_share": shares,
+            "rows_dropped": int((~keep).sum()),
+            "entities_dropped": int(n_ent - np.unique(codes[keep]).size),
+        }
+        if street and self._gvi_floor_m != int(gvi_radii[0]):
+            _log(
+                "WARN",
+                f"Street-view coverage: rungs below {self._gvi_floor_m} m cover fewer "
+                f"than {self.gvi_min_coverage:.0%} of entities and are not searched.",
+            )
+        _log(
+            "INFO",
+            f"Coverage gate: {self._coverage_report['rows_dropped']:,} of {len(tg):,} "
+            f"exposure rows and {self._coverage_report['entities_dropped']:,} of "
+            f"{n_ent:,} entities lack data at the smallest searched rung.",
+        )
+
+    def _wave_index(self, frame: pd.DataFrame) -> np.ndarray | None:
+        """Per-row wave index of ``frame`` (longitudinal only), else ``None``."""
+        if not self.is_longitudinal or "wave" not in frame.columns:
+            return None
+        spec = self.longitudinal_spec
+        assert spec is not None
+        wave_index_of = {w: i for i, w in enumerate(spec.wave_labels)}
+        return np.asarray(
+            [wave_index_of[str(w)] for w in frame["wave"]], dtype=np.int64
+        )
 
     def _precompute_aggregations_longitudinal(
         self,
@@ -3543,7 +3695,7 @@ class MetricFusionEngine:
         if self._active_greenery_channel != "cgi":
             index_channels = [self._active_greenery_channel]
         channel_index = [list(tensor_channels).index(c) for c in index_channels]
-        gvi_radii, ndvi_radii = self._preaggr_radii()
+        gvi_radii, ndvi_radii = self._search_radii()
         radius_idx = [
             [
                 i
@@ -3739,7 +3891,7 @@ class MetricFusionEngine:
             raise ValueError(f"No {subset} rows; call split_data() first.")
 
         channels = self._cache_channels()
-        gvi_radii, ndvi_radii = self._preaggr_radii()
+        gvi_radii, ndvi_radii = self._search_radii()
         # One ladder for the tensor: NDVI and the street-view family can be
         # configured separately, so the union is stored and each channel's
         # off-ladder cells stay NaN and are never selected.
@@ -4274,14 +4426,7 @@ class MetricFusionEngine:
         pts.attrs["_gf_lookup_ids"] = lookup_ids
 
         # Per-row wave index (longitudinal only) — trial-invariant per fold.
-        wave_idx = None
-        if self.is_longitudinal and "wave" in pts.columns:
-            spec = self.longitudinal_spec
-            assert spec is not None
-            wave_index_of = {w: i for i, w in enumerate(spec.wave_labels)}
-            wave_idx = np.asarray(
-                [wave_index_of[str(w)] for w in pts["wave"]], dtype=np.int64
-            )
+        wave_idx = self._wave_index(pts)
         st["wave_idx"] = wave_idx
         pts.attrs["_gf_wave_idx"] = wave_idx
 
@@ -5022,6 +5167,8 @@ class MetricFusionEngine:
         # Step 2: Filter NaN values (already done in prepare_fusion_data with dropna)
         logger.info("Step 2/4: Filtering complete - removed samples with NaN values")
         logger.info(f"Valid samples after filtering: {len(fusion_df)}")
+        if self._coverage_keep_index is not None:
+            fusion_df = fusion_df.loc[fusion_df.index.isin(self._coverage_keep_index)]
 
         # Determine the group column for leakage-safe splitting. entity_id
         # takes priority over polygon_id because in longitudinal+polygon mode
@@ -5994,6 +6141,11 @@ class MetricFusionEngine:
                     **{ch: _mean(ch) for ch in all_blocks},
                 }
             )
+            if self._entity_coverage_share is not None:
+                # Share of the entity's exposure weight the coverage gate kept.
+                poly_df["coverage_share"] = poly_df["polygon_id"].map(
+                    self._entity_coverage_share
+                )
             self._apply_fusion_cache = (cache_key, poly_df)
             return poly_df
 

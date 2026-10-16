@@ -199,7 +199,7 @@ class TestEngineEntryPoint(unittest.TestCase):
             {"cov": cov},
         )
         eng._preaggr_radii = lambda: (list(RADII), list(RADII[:4]))
-        for name in ("_index_layout", "plasmode_recovery"):
+        for name in ("_index_layout", "_search_radii", "plasmode_recovery"):
             setattr(eng, name, types.MethodType(getattr(E, name), eng))
         truth = v.default_scenarios(2, RADII, STATS)[1]
         out_dir = tempfile.mkdtemp(prefix="geofuse-plasmode-engine-")
