@@ -114,7 +114,7 @@ class TestPanelRenders(unittest.TestCase):
         out = self._render(_summary())
         for expected in (
             "Sweep",
-            "Posterior weights",
+            "Posterior weights (influence shares)",
             "Does the discovery reproduce?",
             "Composite vs standalone channels",
             "Null calibration",
@@ -160,7 +160,7 @@ class TestPanelRenders(unittest.TestCase):
                 powers=[0.7, 0.9],
             )
         )
-        self.assertIn("Posterior weights", out)
+        self.assertIn("Posterior weights (influence shares)", out)
 
     def test_a_single_channel_standalone_renders(self):
         out = self._render(

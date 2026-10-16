@@ -3121,6 +3121,17 @@ def _direction_badge(direction: object) -> str:
         return "—"
 
 
+def _weight_key_label(key: str) -> str:
+    """Display name of a formula weight: a channel, or a geometric-mean term."""
+    if key.endswith("_weight"):
+        ch = key.removesuffix("_weight")
+        return _CHANNEL_DISPLAY.get(ch, ch.upper())
+    tokens = [
+        {"ter": "terrain"}.get(t, t) for t in key.removeprefix("w_").split("_")
+    ]
+    return " × ".join(_CHANNEL_DISPLAY.get(t, t.upper()) for t in tokens)
+
+
 def _channel_stat(params: dict, channel: str) -> tuple:
     """``(stat, percentile)`` a channel was aggregated with.
 
@@ -3552,10 +3563,29 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
             )
         )
 
+    coverage = summary.get("coverage") or {}
+    if coverage.get("gvi_floor_m") is not None:
+        shares = coverage.get("gvi_rung_entity_share") or {}
+        st.caption(
+            f"GVI coverage: rungs from **{int(coverage['gvi_floor_m'])} m** were "
+            f"searched, the first to give a street-view cell to at least "
+            f"{float(coverage.get('min_coverage', 0)):.0%} of entities"
+            + (
+                " ("
+                + ", ".join(f"{int(r)} m {float(v):.0%}" for r, v in shares.items())
+                + ")"
+                if shares
+                else ""
+            )
+            + f". {int(coverage.get('rows_dropped', 0)):,} exposure rows and "
+            f"{int(coverage.get('entities_dropped', 0)):,} entities had no data "
+            "at that rung and were left out."
+        )
+
     # ── Posterior ───────────────────────────────────────────────
     weights = summary.get("weight_mean") or []
     if weights:
-        st.markdown("**Posterior weights**")
+        st.markdown("**Posterior weights (influence shares)**")
         lo = summary.get("weight_ci_low") or [None] * len(weights)
         hi = summary.get("weight_ci_high") or [None] * len(weights)
         powers = summary.get("powers")
@@ -3563,8 +3593,8 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
         wrows = []
         for i, w in enumerate(weights):
             row = {
-                "Channel": _label(i),
-                "Weight": round(float(w), 3),
+                "Term": _label(i),
+                "Share": round(float(w), 3),
                 "95% CrI": f"[{_fmt(lo[i], 3)}, {_fmt(hi[i], 3)}]",
             }
             if i < len(ratios):
@@ -3575,10 +3605,12 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
         st.dataframe(_pd.DataFrame(wrows), width="stretch", hide_index=True)
         prior_ci = summary.get("weight_prior_ci")
         st.caption(
-            "Weights are constrained to the simplex (non-negative, summing to "
-            "1), so each one reads directly as that channel's share of the "
-            "composite. A credible interval spanning most of [0, 1] means the "
-            "data does not separate that channel's contribution. **vs prior** "
+            "Weights on the standardised terms, constrained to the simplex "
+            "(non-negative, summing to 1), so each one reads as that term's "
+            "share of the index's influence. The composite weights carry them "
+            "onto raw channel units. A credible interval spanning most of "
+            "[0, 1] means the data does not separate that term's contribution. "
+            "**vs prior** "
             "is the credible interval's width as a share of the prior's"
             + (
                 f" (prior 95% CrI [{_fmt(prior_ci[0], 3)}, " f"{_fmt(prior_ci[1], 3)}])"
@@ -4215,14 +4247,18 @@ def _render_study_detail(
     # ── Winning params ──────────────────────────────────────────
     if is_cgi:
         if not formula.power_keys:
-            st.markdown("**Weights (posterior mean)**")
+            st.markdown("**Composite weights (raw channel units)**")
+            st.caption(
+                "Shares of the mix of raw channel values the composite and the "
+                "map are built from. A channel's influence on the index is its "
+                "posterior weight."
+            )
             weight_cols = st.columns(len(formula.weight_keys))
             total_weight = sum(
                 float(final_params.get(k, 0)) for k in formula.weight_keys
             )
             for col, key in zip(weight_cols, formula.weight_keys):
-                ch = key.removesuffix("_weight")
-                label = _CHANNEL_DISPLAY.get(ch, ch.upper())
+                label = _weight_key_label(key)
                 pct = (
                     100.0 * float(final_params.get(key, 0)) / total_weight
                     if total_weight > 0
