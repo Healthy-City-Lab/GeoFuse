@@ -4926,6 +4926,13 @@ def _render_fusion_results_body(output_dir: str) -> None:
 
     # ── Composite map viewer ────────────────────────────────────
     _render_composite_map_viewer(results_view, engine)
+    with st.expander("Generate CGI Map", expanded=False):
+        st.caption(
+            "Planned: this study's CGI over a whole area, computed from its "
+            "channels, radii, statistics, formula and weights on the same grid, "
+            "so it can be mapped where no target sits. Not available yet."
+        )
+        st.button("Generate CGI Map", disabled=True, key="fusion_generate_cgi_map")
 
     # ── Mixed-effects post-hoc metrics CSV viewer ───────────────
     try:
