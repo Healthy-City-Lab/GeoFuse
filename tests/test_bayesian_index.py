@@ -997,7 +997,8 @@ class TestHonestFormSelection(unittest.TestCase):
     def test_the_main_terms_are_the_tensor_columns(self):
         Xr, _, design = self._cube("synergy")
         T, sd = design.columns((0, 1))
-        np.testing.assert_allclose(T[:, :2], Xr.reshape(len(Xr), -1), atol=1e-9)
+        # The design stores its cells as float32.
+        np.testing.assert_allclose(T[:, :2], Xr.reshape(len(Xr), -1), atol=1e-5)
         self.assertEqual(T.shape[1], 3)
         self.assertTrue((sd > 0).all())
 
