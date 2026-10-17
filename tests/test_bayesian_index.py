@@ -1331,7 +1331,7 @@ class TestPanelPosterior(unittest.TestCase):
         # Exposure and a strong intercept both vary by entity, so treating the
         # waves as independent rows understates the uncertainty on beta.
         rng = np.random.default_rng(31)
-        n_ent, waves = 120, 4
+        n_ent, waves = 120, 8
         ent = np.repeat(np.arange(n_ent), waves)
         E = np.repeat(rng.normal(size=(n_ent, 2)), waves, axis=0)
         E += 0.1 * rng.normal(size=E.shape)
