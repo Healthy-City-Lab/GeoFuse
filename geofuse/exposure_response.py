@@ -750,7 +750,9 @@ def split_inference(whole, test):
     and curves keep every row and are descriptive. Each row with a standard
     error also gets the held-out estimate its interval belongs to and the
     minimum detectable effect, :data:`MDE_SE_MULTIPLE` held-out standard
-    errors. Inference with no held-out counterpart is ``None``.
+    errors. Inference with no held-out counterpart is ``None``. Held-out
+    inference is kept even where ``whole`` carries none, as when the
+    whole-data pass skips its bootstrap.
     """
     if isinstance(whole, dict):
         t = test if isinstance(test, dict) else {}
@@ -758,7 +760,9 @@ def split_inference(whole, test):
             k: t.get(k) if k in _INFERENCE_KEYS else split_inference(v, t.get(k))
             for k, v in whole.items()
         }
-        if "std_error" in whole or "std_err" in whole:
+        for k in _INFERENCE_KEYS & (t.keys() - whole.keys()):
+            out[k] = t[k]
+        if "std_error" in out or "std_err" in out:
             se = t.get("std_error", t.get("std_err"))
             out["test_estimate"] = next(
                 (t[k] for k in _ESTIMATE_KEYS if k in t), None

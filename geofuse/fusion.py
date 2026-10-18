@@ -6956,6 +6956,10 @@ class MetricFusionEngine:
             return None
         held = self._paired_difference_on(*args, held_out=True, **kw)
         out = exposure_response.split_inference(whole, held)
+        # Present even when the held-out half could not be scored, so readers
+        # see "no inference" rather than a missing key.
+        for k in ("lower", "upper", "p_value"):
+            out.setdefault(k, None)
         out["inference_n"] = None if held is None else held["n"]
         return out
 

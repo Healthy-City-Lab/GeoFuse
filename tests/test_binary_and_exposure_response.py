@@ -525,6 +525,23 @@ class TestHeldOutInference(unittest.TestCase):
         self.assertIsNone(out["per_iqr"]["std_error"])
         self.assertEqual(out["per_iqr"]["estimate"], 0.4)
 
+    def test_held_out_inference_is_kept_where_the_whole_rows_have_none(self):
+        # A whole-data pass that skips its bootstrap carries only the estimate.
+        whole = {"observed_diff": 0.02, "n": 900}
+        held = {
+            "observed_diff": 0.01,
+            "n": 300,
+            "lower": -0.01,
+            "upper": 0.03,
+            "p_value": 0.2,
+        }
+        out = er.split_inference(whole, held)
+        self.assertEqual(out["observed_diff"], 0.02)
+        self.assertEqual(out["n"], 900)
+        self.assertEqual(
+            (out["lower"], out["upper"], out["p_value"]), (-0.01, 0.03, 0.2)
+        )
+
 
 class TestIncrementalR2(unittest.TestCase):
     """``r2`` must measure association, not agreement of scales."""
