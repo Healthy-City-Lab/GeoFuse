@@ -67,6 +67,9 @@ FORMS: tuple[str, ...] = ("linear", "synergy")
 _FORM_INNER_SPLITS = 5
 _FORM_SEED_OFFSET = 10_000
 
+# Largest split R-hat a posterior is reported as converged at.
+RHAT_CONVERGED = 1.05
+
 
 # ────────────────────────────────────────────────────────────────────
 # Data preparation
@@ -1229,6 +1232,9 @@ class IndexPosterior:
             "rhat_max": self.rhat_max,
             "ess_min": self.ess_min,
             "divergences": self.divergences,
+            "converged": bool(
+                np.isfinite(self.rhat_max) and self.rhat_max <= RHAT_CONVERGED
+            ),
             "radius_kernel": self.radius_kernel,
             "radius_prior": self.radius_prior,
         }
@@ -1270,6 +1276,25 @@ class IndexPosterior:
                 for lo_c, hi_c in zip(a_lo, a_hi)
             ]
         return out
+
+
+def panel_entities(entities, *, warn: bool = True):
+    """``entities`` when some entity holds several rows, else ``None``.
+
+    On singleton groups the row variance and the per-entity variance enter the
+    likelihood only through their sum, so a random intercept is not identified
+    and the sampler stalls along that ridge.
+    """
+    if entities is None:
+        return None
+    _, counts = np.unique(np.asarray(entities), return_counts=True)
+    if counts.size and counts.max() > 1:
+        return entities
+    if warn:
+        logger.warning(
+            "Every entity holds one row, so the per-entity intercept is left out."
+        )
+    return None
 
 
 def fit(
@@ -1325,7 +1350,8 @@ def fit(
     entity, integrated out in closed form: each entity's rows share the
     exchangeable covariance ``sigma² I + sigma_u² 11ᵀ``. Without it the waves of
     one person count as independent evidence and the interval on ``beta`` is
-    too narrow.
+    too narrow. Labels that are all distinct are ignored with a warning
+    (:func:`panel_entities`).
 
     The synergy form needs the whole grid and ``design``
     (:class:`SynergyDesign`) with ``design_channels``, the tensor channels of
@@ -1339,6 +1365,7 @@ def fit(
     from numpyro.infer import MCMC, NUTS
 
     codes = counts = None
+    entities = panel_entities(entities)
     if entities is not None:
         _, ent = np.unique(np.asarray(entities), return_inverse=True)
         n_groups = int(ent.max()) + 1
@@ -2108,6 +2135,7 @@ def null_calibration(
                 Ef = np.ascontiguousarray(np.asarray(cols, dtype=np.float64))
                 paths.append(_write_memmap(Ef, ".geofuse-null-form"))
                 choice.append((f, paths[-1], Ef.shape))
+        entities = panel_entities(entities, warn=False)
         panel = (groups, entities, waves)
         kwargs = dict(fit_kwargs, entities=entities)
         tasks = [

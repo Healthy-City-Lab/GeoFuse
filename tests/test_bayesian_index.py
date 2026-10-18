@@ -1345,6 +1345,39 @@ class TestPanelPosterior(unittest.TestCase):
             float(np.std(panel["beta"])), 1.5 * float(np.std(plain["beta"]))
         )
 
+    def test_one_row_per_entity_is_the_plain_fit_draw_for_draw(self):
+        # Singleton groups cannot separate the entity variance from the row
+        # variance, so the intercept is left out rather than freezing chains.
+        rng = np.random.default_rng(32)
+        n = 300
+        E = rng.normal(size=(n, 2))
+        y = 0.3 * E[:, 0] + rng.normal(size=n)
+        y = (y - y.mean()) / y.std()
+        kw = dict(form="linear", draws=300, warmup=300, chains=2, seed=1)
+        plain = bi.fit(E, y, **kw)
+        with self.assertLogs("geofuse.bayesian_index", "WARNING"):
+            single = bi.fit(E, y, entities=np.arange(n).astype(str), **kw)
+        self.assertNotIn("sigma_u", single.get_samples())
+        np.testing.assert_array_equal(
+            plain.get_samples()["beta"], single.get_samples()["beta"]
+        )
+        post = bi.posterior_from(
+            single,
+            channels=("a", "b"),
+            picked=((1, "mean"), (1, "mean")),
+            form="linear",
+        )
+        self.assertLessEqual(post.rhat_max, 1.01)
+        self.assertTrue(post.summary()["converged"])
+
+    def test_panel_entities_are_kept_and_singletons_dropped(self):
+        panel = np.array([0, 0, 1, 2, 2])
+        self.assertIs(bi.panel_entities(panel), panel)
+        self.assertIsNone(bi.panel_entities(None))
+        with self.assertLogs("geofuse.bayesian_index", "WARNING"):
+            self.assertIsNone(bi.panel_entities(np.arange(5)))
+        self.assertIsNone(bi.panel_entities(np.arange(5), warn=False))
+
 
 class TestPanelPermutation(unittest.TestCase):
     def test_rows_are_permuted_as_before_without_entities(self):
