@@ -698,6 +698,12 @@ def run_fusion_child(
         # the runner imports anything that might cache a logger closure.
         route_engine_logging_to_queue(job_id, event_queue)
 
+        # One CPU device per posterior chain, requested before anything in this
+        # process starts JAX, so the chains run in parallel.
+        from geofuse.bayesian_index import reserve_host_devices
+
+        reserve_host_devices(int(run_kwargs.get("posterior_chains", 4)))
+
         from geofuse.jobs.runners import run_fusion
 
         ctx = SubprocJobContext(job_id, event_queue, cancel_event, pause_event)

@@ -47,6 +47,7 @@ import itertools
 import logging
 import math
 import os
+import re
 import tempfile
 import weakref
 from dataclasses import dataclass, field
@@ -1278,6 +1279,24 @@ class IndexPosterior:
         return out
 
 
+_DEVICE_FLAG = re.compile(r"--xla_force_host_platform_device_count=(\d+)")
+
+
+def reserve_host_devices(n: int) -> None:
+    """Ask XLA for at least ``n`` CPU devices, one per parallel chain.
+
+    XLA reads the count once, when JAX first starts its backend in a process;
+    a later request has no effect. :func:`fit` asks before its first JAX
+    operation, and a job process can ask at start-up for the chains it will
+    run. A count already requested is never lowered.
+    """
+    import numpyro
+
+    asked = _DEVICE_FLAG.search(os.environ.get("XLA_FLAGS", ""))
+    if asked is None or int(asked.group(1)) < int(n):
+        numpyro.set_host_device_count(int(n))
+
+
 def panel_entities(entities, *, warn: bool = True):
     """``entities`` when some entity holds several rows, else ``None``.
 
@@ -1358,6 +1377,8 @@ def fit(
     ``E``: its interactions are formed per cell from the raw channel values
     blended by the same kernel and aggregator (:func:`interaction_columns`).
     """
+    # Before the first JAX operation below, which fixes the device count.
+    reserve_host_devices(chains)
     import jax
     import jax.numpy as jnp
     import numpyro
@@ -1372,7 +1393,6 @@ def fit(
         codes = jnp.asarray(ent)
         counts = jnp.asarray(np.bincount(ent, minlength=n_groups).astype(np.float64))
 
-    numpyro.set_host_device_count(chains)
     E = np.asarray(E, dtype=np.float64)
     joint = E.ndim == 4
     nc = E.shape[1]
@@ -1498,6 +1518,15 @@ def fit(
             ),
         )
 
+    # One CPU device per chain runs the chains in parallel. A process that
+    # started JAX with fewer devices runs them one after another instead.
+    devices = jax.local_device_count()
+    if chains > 1 and devices < chains:
+        logger.info(
+            "%d CPU device(s) for %d chains: the chains run one after another.",
+            devices,
+            chains,
+        )
     # A channel with no signal leaves its kernel location flat under the prior,
     # and the sampler has to traverse that ridge without stepping off it, so the
     # joint model runs at a shorter step than the fixed-column one.
@@ -1506,6 +1535,7 @@ def fit(
         num_warmup=warmup,
         num_samples=draws,
         num_chains=chains,
+        chain_method="parallel" if devices >= chains else "sequential",
         progress_bar=False,
     )
     mcmc.run(

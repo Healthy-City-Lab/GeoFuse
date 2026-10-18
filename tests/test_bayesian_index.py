@@ -1433,5 +1433,89 @@ class TestGroupedInnerSplits(unittest.TestCase):
         self.assertEqual(res.picked[0], (300, "mean"))
 
 
+# Run in a fresh interpreter: XLA fixes its CPU device count the first time a
+# process starts JAX, so it cannot be tested inside one that already has.
+_CHAINS_SCRIPT = """
+import json, logging, sys, warnings
+sys.path.insert(0, {root!r})
+import numpy as np
+from geofuse import bayesian_index as bi
+if {start_jax}:
+    import jax.numpy as jnp
+    jnp.zeros(1)
+records = []
+handler = logging.Handler()
+handler.emit = lambda r: records.append(r.getMessage())
+logging.getLogger("geofuse.bayesian_index").addHandler(handler)
+logging.getLogger("geofuse.bayesian_index").setLevel(logging.INFO)
+rng = np.random.default_rng(5)
+ent = np.repeat(np.arange(100), 3)
+E = rng.normal(size=(len(ent), 2))
+y = 0.3 * E[:, 0] + rng.normal(size=len(ent))
+kw = dict(entities=ent, draws=100, warmup=100, chains=4, seed=3)
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    a = np.asarray(bi.fit(E, y, **kw).get_samples()["beta"])
+    b = np.asarray(bi.fit(E, y, **kw).get_samples()["beta"])
+import jax
+print(json.dumps({{
+    "devices": jax.local_device_count(),
+    "same": bool(np.array_equal(a, b)),
+    "device_warnings": [str(w.message) for w in caught if "devices" in str(w.message)],
+    "logs": records,
+}}))
+"""
+
+
+def _chains_run(start_jax: bool) -> dict:
+    import json
+    import subprocess
+
+    script = _CHAINS_SCRIPT.format(root=ROOT, start_jax=start_jax)
+    env = {k: v for k, v in os.environ.items() if k != "XLA_FLAGS"}
+    out = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=600,
+        check=True,
+    )
+    return json.loads(out.stdout.strip().splitlines()[-1])
+
+
+class TestParallelChains(unittest.TestCase):
+    def test_an_entity_fit_runs_its_chains_in_parallel(self):
+        # The entity block touches JAX first; the devices must be asked before.
+        out = _chains_run(start_jax=False)
+        self.assertGreaterEqual(out["devices"], 4)
+        self.assertEqual(out["device_warnings"], [])
+        self.assertTrue(out["same"])
+
+    def test_a_process_that_started_jax_runs_them_in_turn_without_a_warning(self):
+        out = _chains_run(start_jax=True)
+        self.assertEqual(out["devices"], 1)
+        self.assertEqual(out["device_warnings"], [])
+        self.assertTrue(any("one after another" in m for m in out["logs"]))
+        self.assertTrue(out["same"])
+
+    def test_a_requested_device_count_is_never_lowered(self):
+        saved = os.environ.get("XLA_FLAGS")
+
+        def restore():
+            if saved is None:
+                os.environ.pop("XLA_FLAGS", None)
+            else:
+                os.environ["XLA_FLAGS"] = saved
+
+        self.addCleanup(restore)
+        os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8 --x=1"
+        bi.reserve_host_devices(4)
+        self.assertIn("device_count=8", os.environ["XLA_FLAGS"])
+        bi.reserve_host_devices(12)
+        self.assertIn("device_count=12", os.environ["XLA_FLAGS"])
+        self.assertIn("--x=1", os.environ["XLA_FLAGS"])
+
+
 if __name__ == "__main__":
     unittest.main()
