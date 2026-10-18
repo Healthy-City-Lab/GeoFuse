@@ -1167,6 +1167,39 @@ def run_ndvi_column(
 _STUDY_NAME_UNSAFE = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
+def _fmt_or_na(value: Any, spec: str) -> str:
+    """``value`` formatted with ``spec`` for a log line, or ``n/a`` when it is
+    missing or not a finite number."""
+    try:
+        fv = float(value)
+    except (TypeError, ValueError):
+        return "n/a"
+    return format(fv, spec) if np.isfinite(fv) else "n/a"
+
+
+def _paired_family_headline(family: list[dict], best_channel: str | None) -> dict:
+    """Holm-correct the CGI-vs-standalone family in place and pick its headline.
+
+    Each entry gains ``p_value_holm`` (``None`` where its own p-value is
+    missing) and ``family_size``. The headline is the AIC/BIC best channel's
+    entry, else the one with the largest observed difference.
+    """
+    from .. import statistical_testing as _stats_mod
+
+    holm = _stats_mod.holm_bonferroni([d.get("p_value") for d in family])
+    for d, hp in zip(family, holm):
+        d["p_value_holm"] = None if hp != hp else float(hp)
+        d["family_size"] = len(family)
+
+    def _diff(d: dict) -> float:
+        v = d.get("observed_diff")
+        return float(v) if v is not None and np.isfinite(v) else float("-inf")
+
+    return next(
+        (d for d in family if d.get("standalone_channel") == best_channel), None
+    ) or max(family, key=_diff)
+
+
 def _build_fusion_study_name(
     target_display_name: str,
     label: str,
@@ -2794,35 +2827,27 @@ def run_fusion(
                         cgi_vs_standalone_paired_family.append(pd_res)
 
             if cgi_vs_standalone_paired_family:
-                from .. import statistical_testing as _stats_mod
-
-                holm = _stats_mod.holm_bonferroni(
-                    [d.get("p_value") for d in cgi_vs_standalone_paired_family]
-                )
-                for d, hp in zip(cgi_vs_standalone_paired_family, holm):
-                    d["p_value_holm"] = None if hp != hp else float(hp)
-                    d["family_size"] = len(cgi_vs_standalone_paired_family)
-                best_ch = (cgi_vs_standalone_aic_bic or {}).get("best_channel")
-                cgi_vs_standalone_paired = next(
-                    (
-                        d
-                        for d in cgi_vs_standalone_paired_family
-                        if d.get("standalone_channel") == best_ch
-                    ),
-                    None,
-                ) or max(
-                    cgi_vs_standalone_paired_family,
-                    key=lambda d: d.get("observed_diff", float("-inf")),
-                )
-                _log_fusion(
-                    "OK",
-                    f"[{label}] CGI vs standalones (family of "
-                    f"{len(cgi_vs_standalone_paired_family)}): headline "
-                    f"`{cgi_vs_standalone_paired.get('standalone_channel')}` "
-                    f"Δ={cgi_vs_standalone_paired.get('observed_diff'):.4f}, "
-                    f"p={cgi_vs_standalone_paired.get('p_value'):.4g}, "
-                    f"Holm p={cgi_vs_standalone_paired.get('p_value_holm')}.",
-                )
+                try:
+                    head = _paired_family_headline(
+                        cgi_vs_standalone_paired_family,
+                        (cgi_vs_standalone_aic_bic or {}).get("best_channel"),
+                    )
+                    cgi_vs_standalone_paired = head
+                    _log_fusion(
+                        "OK",
+                        f"[{label}] CGI vs standalones (family of "
+                        f"{len(cgi_vs_standalone_paired_family)}): headline "
+                        f"`{head.get('standalone_channel')}` "
+                        f"Δ={_fmt_or_na(head.get('observed_diff'), '.4f')}, "
+                        f"p={_fmt_or_na(head.get('p_value'), '.4g')}, "
+                        f"Holm p={_fmt_or_na(head.get('p_value_holm'), '.4g')}.",
+                    )
+                except Exception as exc:
+                    _log_fusion(
+                        "WARN",
+                        f"[{label}] CGI vs standalones summary failed: {exc}. "
+                        "The run continues.",
+                    )
 
             # ── Composite GeoTIFF (raster write) ────────
             # Runs after the standalone stages so they can advance the ledger
@@ -2944,19 +2969,29 @@ def run_fusion(
                         value=prog_ledger(),
                         status_text=f"{prefix}Re-tuning on negative controls...",
                     )
-                    negative_control_report["retune"] = engine.retune_concordance(
-                        headline_params,
-                        objective_metric,
-                        forms=index_forms,
-                        sweep_splits=int(sweep_splits),
-                        draws=int(posterior_draws),
-                        warmup=int(posterior_warmup),
-                        chains=int(posterior_chains),
-                        radius_prior=str(radius_prior),
-                        seed=42,
-                        cancel_callback=cancel_check,
-                    )
-                    stage(skey("negative_control_retune"), DONE)
+                    try:
+                        negative_control_report["retune"] = engine.retune_concordance(
+                            headline_params,
+                            objective_metric,
+                            forms=index_forms,
+                            sweep_splits=int(sweep_splits),
+                            draws=int(posterior_draws),
+                            warmup=int(posterior_warmup),
+                            chains=int(posterior_chains),
+                            radius_prior=str(radius_prior),
+                            seed=42,
+                            cancel_callback=cancel_check,
+                        )
+                        stage(skey("negative_control_retune"), DONE)
+                    except JobCancelled:
+                        raise
+                    except Exception as exc:
+                        _log_fusion(
+                            "WARN",
+                            f"[{label}] Negative-control re-tune failed: {exc}. "
+                            "The run continues.",
+                        )
+                        stage(skey("negative_control_retune"), FAILED, str(exc))
                 else:
                     stage(
                         skey("negative_control_retune"),

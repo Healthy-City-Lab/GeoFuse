@@ -145,7 +145,10 @@ paired CGI-versus-channel difference, the estimates use every row and are
 descriptive; standard errors, intervals and p-values come from the held-out
 rows. `test_estimate` is the held-out estimate the interval belongs to,
 `test_n` the rows it rests on and `mde` the minimum detectable effect, 2.8
-held-out standard errors.
+held-out standard errors. Each CGI-versus-channel row's `lower`, `upper` and
+`p_value` come from the held-out bootstrap (on `inference_n` rows), and
+`p_value_holm` corrects that p-value across the channels; all four are empty
+when the held-out rows could not be scored.
 
 **`gain_p` in `discovery.csv`** is the corrected resampled t-test of a positive
 mean gain over the best single channel across the held-out splits.
