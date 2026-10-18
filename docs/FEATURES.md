@@ -329,6 +329,17 @@ Nothing below is pre-specified.
   and reports how closely its radius, aggregator and weights match the
   target's. Controls are scored for cross-sectional and year-aware runs; a
   panel skips them.
+- **Comparator exposures.** "Does mixing beat the best single channel?" is the
+  standalones' question; "does the tuned composite beat the exposure the
+  literature already uses?" is a different one. Name existing exposure columns
+  of the target as comparators and each is scored untuned, as a frozen
+  composite, through the composite's own code: the same held-out entities,
+  coverage, covariates, year fixed effects, spatial adjustment, objective,
+  bootstrap and permutation test. Each gets its effects and exposure-response
+  table, the negative-control transfer test, and a paired composite-minus-
+  comparator difference on the held-out rows, Holm-corrected over the
+  pre-specified primary comparators; the rest are descriptive. An entity missing
+  a comparator is left out of that comparator alone. Panels skip comparators.
 - Longitudinal runs add wave fixed effects, on by default, and an optional
   neighbourhood or site column.
 

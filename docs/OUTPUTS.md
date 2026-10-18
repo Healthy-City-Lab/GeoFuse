@@ -121,6 +121,8 @@ output_results/fusion/<YYYYMMDDTHHMMSS>__<short_job_id>/
     ├── moderation.csv                  interaction test and simple slopes
     ├── negative_controls.csv           specificity check against control outcomes
     ├── negative_control_retune.csv     re-tune concordance, when requested
+    ├── comparators.csv                 comparator exposures, when named
+    ├── cgi_vs_comparator_paired.csv    CGI minus each comparator, when named
     ├── decline_terms.csv               greenspace-by-time terms, longitudinal only
     ├── mixedlm_metrics*.csv            all four mixed-effects metrics, longitudinal only
     ├── aic_bic.json                    CGI vs standalone verdict
@@ -229,7 +231,23 @@ have both outcomes, and `nonspecific`, which is true when the control's interval
 excludes zero while the difference's includes it: part of the tuned association
 is then shared with an outcome greenery should not cause. Standalone studies get
 the same rows, so the composite's specificity can be read against a single
-channel's.
+channel's, and so do comparator exposures; `exposure` says which kind each
+`study` is (`cgi`, `standalone` or `comparator`).
+
+**`comparators.csv`** appears when comparator exposures were named: existing
+exposure columns of the target, scored untuned on the composite's own rows,
+split, covariates and objective. One row per exposure and split, the CGI first
+on the same scale: `score` with its interval (`test` is the held-out headline,
+`train_val` and `all` are descriptive), the held-out `p_value`, `n` (an entity
+missing a comparator counts only against that comparator), `beta` (the
+covariate-adjusted slope in SD units, with its interval) and `primary`.
+**`cgi_vs_comparator_paired.csv`** holds the paired difference CGI − comparator
+in the objective's units (positive favours the CGI), estimated on every row
+with its interval and p-value from the held-out rows; `p_value_holm` is
+Holm-corrected over the primary comparators only and is empty for the others,
+which are descriptive. Comparators are not scored for panels (several rows per
+entity). The same results are in `results_summary.json` under `comparators`,
+`comparator_reference` (the CGI's row) and `cgi_vs_comparator_paired`.
 
 **`negative_control_retune.csv`** appears when the job setting
 `negative_control_retune` is on. The CGI's sweep and posterior are re-run with
@@ -253,7 +271,9 @@ coefficient is reported alongside and is the one that can straddle zero.
 geometry) is the per-entity table the dashboard's "Export per-entity CGI" and
 `geofuse export` deliver. Each entity's composite is the exposure-weighted mean
 of its CGI cells; `n_samples` counts the cells and `coverage_share` is the
-share of its exposure weight on cells the GVI coverage gate kept.
+share of its exposure weight on cells the GVI coverage gate kept. `split` is
+`test` or `train_val` (`dropped` for an entity in neither), so an outside
+analysis can use exactly the held-out entities the reported scores rest on.
 
 **The coverage gate** is recorded as `coverage` in `results_summary.json` and
 `composite_greenery_params.json`: the first searched GVI radius

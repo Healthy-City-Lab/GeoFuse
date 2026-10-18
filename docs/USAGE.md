@@ -85,6 +85,14 @@ mismatched file is refused, and processed points are skipped.
    outcome's confounders but not to be caused by greenery, such as grip
    strength for a cognitive outcome. They are never tuned on, and are scored
    for cross-sectional runs, year-matched ones included, but not for panels.
+   **Comparator exposures** are existing exposure columns to benchmark the
+   composite against, such as a published buffer mean. They are never tuned:
+   each is scored on the composite's own held-out entities, covariates and
+   objective, with a paired composite-vs-comparator test. **Primary
+   comparators** are the pre-specified ones the Holm correction runs over
+   (empty = all). In a run file: `comparators = [...]`,
+   `comparators_primary = [...]`; on the command line `--comparator` and
+   `--comparator-primary`.
 2. **Optimization setup.** Choose cross-sectional or mixed-effects
    (longitudinal). Longitudinal requires a date column. Cross-sectional can
    optionally use one to route each entity to a year-matched greenery file.
@@ -135,6 +143,9 @@ own** (a `<column>=missing` dummy). In a run file it is
   control's association cannot be told apart from the target's.
 - **GVI coverage.** Which GVI radii were searched, each radius's entity
   coverage, and how many cells and entities the coverage gate left out.
+- **CGI vs comparator exposures.** Each comparator's held-out score, interval,
+  p-value, n and β next to the composite's, with the paired difference and its
+  Holm p-value (descriptive for non-primary comparators).
 - **Covariate impact**, **channel collinearity**, **composite maps**,
   **mixed-effects metrics**, and an index of every file written. **Generate
   CGI Map**, under the map viewer, is a placeholder for a planned full-area map
