@@ -163,7 +163,12 @@ manifest. See [OUTPUTS.md](OUTPUTS.md).
   protective and a harmful gradient of the same size score alike, and the
   search maximises separation either way.
 - **Covariates.** Numeric or categorical columns to control for. Categorical
-  ones are one-hot encoded automatically.
+  ones are one-hot encoded automatically. A row missing a covariate is left
+  out (complete cases), whether the covariate is numeric or categorical. For
+  categorical covariates **Missing categorical values** can instead keep such
+  rows under a `<column>=missing` level of their own, so they are never counted
+  in the reference level. The log and the results list how many rows each
+  covariate was missing and how many rows with an outcome were dropped.
 - **Exposure on the CGI grid.** Every target is exposed to the cells of one
   regular grid (**CGI grid pixel size (m)**, 50 m by default) that its geometry
   touches, whatever its type: a point counts in every cell whose closed square

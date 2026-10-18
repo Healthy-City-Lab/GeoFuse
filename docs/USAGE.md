@@ -107,14 +107,19 @@ mismatched file is refused, and processed points are skipped.
 5. **Run.**
 
 Covariates listed as categorical are one-hot encoded and counted as covariates
-automatically; there is no need to list them twice.
+automatically; there is no need to list them twice. **Missing categorical
+values**, beside that list, decides what an empty category does: **Drop the
+row** (default, as for a missing numeric covariate) or **Keep as a level of its
+own** (a `<column>=missing` dummy). In a run file it is
+`categorical_missing = "drop"` or `"indicator"`.
 
 ### Reading the results panel
 
 - **Headline.** Held-out test score with its 95 % interval, the significance
   test that actually applies (permutation for cross-sectional, Wald for
   mixed-effects), the direction of the relationship, and the verdict against the
-  best standalone channel.
+  best standalone channel. Under it, the covariates some rows were missing, with
+  how each was handled and how many rows with an outcome were dropped.
 - **Study detail.** Per study: the discovered radii, aggregators and weights,
   per-subset scores, and the discovery diagnostics, which cover what the sweep
   picked and how contested it was, the posterior weights with credible

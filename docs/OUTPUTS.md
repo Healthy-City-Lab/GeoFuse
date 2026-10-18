@@ -192,6 +192,13 @@ analysis can be shown to be the one that ran. `test_reads` counts distinct
 configurations scored on the held-out slice; a large number means the headline
 p-value is optimistic by roughly that many comparisons.
 
+**Missing covariates** are recorded as `covariate_missing` in
+`results_summary.json`: the job's `categorical_missing` setting, the target's
+row count (`n_rows`), one entry per covariate with its `type`, `n_missing` and
+`handling` (`drop`, or `indicator` for a categorical covariate kept under a
+`<column>=missing` level), and `rows_dropped`, the rows that had an outcome but
+were left out for a missing covariate.
+
 **`exposure_response.csv`** restates the effect in the shapes the greenspace
 literature publishes: per-IQR increase (with an odds ratio for binary outcomes),
 the gradient across exposure quantiles against the lowest group with a test for
