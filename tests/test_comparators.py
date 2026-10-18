@@ -14,6 +14,7 @@ columns, plus a copy with gaps. Pinned here:
 - a comparator equal to a single channel's composite scores like that channel;
 - missing values cost only that comparator's statistics, and ``n`` says so;
 - its negative-control rows are the transfer test on the same vector;
+- the Holm correction runs over the primary comparators only;
 - a comparator that is also a covariate is refused.
 """
 
@@ -31,6 +32,7 @@ import geopandas as gpd
 import numpy as np
 
 from geofuse.fusion import MetricFusionEngine, comparator_mode
+from geofuse.jobs.fusion_outputs import _comparator_family
 from test_fusion_run import _write_study
 
 PARAMS = {
@@ -223,6 +225,24 @@ class TestComparatorScoring(unittest.TestCase):
                     places=5,
                     msg=key,
                 )
+
+
+class TestComparatorFamily(unittest.TestCase):
+    def test_holm_runs_over_the_primary_comparators_only(self):
+        comparators = {
+            "a": {"paired": {"comparator": "a", "primary": True, "p_value": 0.01}},
+            "b": {"paired": {"comparator": "b", "primary": True, "p_value": 0.04}},
+            "c": {"paired": {"comparator": "c", "primary": False, "p_value": 0.001}},
+            "d": {"paired": None},
+        }
+        rows = {r["comparator"]: r for r in _comparator_family(comparators)}
+        self.assertEqual(sorted(rows), ["a", "b", "c"])
+        self.assertAlmostEqual(rows["a"]["p_value_holm"], 0.02)
+        self.assertAlmostEqual(rows["b"]["p_value_holm"], 0.04)
+        self.assertEqual({rows[k]["family_size"] for k in rows}, {2})
+        self.assertIsNone(rows["c"]["p_value_holm"])
+        self.assertTrue(rows["c"]["descriptive"])
+        self.assertFalse(rows["a"]["descriptive"])
 
 
 class TestRefusals(unittest.TestCase):

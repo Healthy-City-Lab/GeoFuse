@@ -67,6 +67,18 @@ class EntityTableTests(unittest.TestCase):
         self.assertTrue(path.endswith(".csv"))
         self.assertEqual(list(pd.read_csv(path)["composite"]), [0.5])
 
+    def test_each_entity_names_its_split(self):
+        # The engine's held-out rows, so outside checks use the same entities.
+        composite = pd.DataFrame(
+            {"polygon_id": [0, 1, 2, 3], "target": [1.0] * 4, "composite": [0.5] * 4}
+        )
+        engine = _engine()
+        engine.test_data = pd.DataFrame({"polygon_id": [1, 1, 3]})
+        engine.train_val_data = pd.DataFrame({"polygon_id": [0, 0]})
+        path = write_entity_table(engine, composite, self.stem)
+        out = pd.read_csv(path).sort_values("polygon_id")
+        self.assertEqual(list(out["split"]), ["train_val", "test", "dropped", "test"])
+
 
 if __name__ == "__main__":
     unittest.main()

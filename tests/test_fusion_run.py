@@ -12,7 +12,9 @@ here:
 - a missing held-out half leaves that inference empty instead of failing;
 - a year-aware run (a greenery file per measurement year, one row per entity)
   is not a panel: with every visit in one year its posterior, splits and
-  negative controls are the cross-sectional run's.
+  negative controls are the cross-sectional run's;
+- comparator exposures are scored on the same rows without touching the
+  composite, and written to their own tables; every entity's split is recorded.
 """
 
 import os
@@ -65,7 +67,8 @@ report_paired_bootstrap = 100
 
 def _write_study(folder: str, n: int = 160) -> None:
     """A cohort whose outcome follows the NDVI at its point, every visit in
-    2015, per-year NDVI rasters and street-view points."""
+    2015, per-year NDVI rasters and street-view points. Three finished exposure
+    columns ride along: the NDVI at the point, noise, and the NDVI with gaps."""
     rng = np.random.default_rng(3)
     xs = _X0 + rng.random(n) * 0.03
     ys = _Y0 + rng.random(n) * 0.02
@@ -85,6 +88,9 @@ def _write_study(folder: str, n: int = 160) -> None:
             dst.write(ndvi + shift, 1)
     col = ((xs - (_X0 - 0.01)) / _PX).astype(int)
     row = (((_Y0 + 0.04) - ys) / _PX).astype(int)
+    here = ndvi[row, col].astype(np.float64)
+    patchy = here.copy()
+    patchy[::7] = np.nan
     gpd.GeoDataFrame(
         {
             "outcome": 0.8 * ndvi[row, col] + rng.normal(0, 0.3, n),
@@ -92,6 +98,9 @@ def _write_study(folder: str, n: int = 160) -> None:
             "age": rng.normal(60, 8, n),
             "sex": rng.choice(["f", "m"], n),
             "visit": ["2015-06-15"] * n,
+            "ndvi_here": here,
+            "noise": rng.normal(size=n),
+            "patchy": patchy,
         },
         geometry=[Point(a, b) for a, b in zip(xs, ys)],
         crs="EPSG:4326",
@@ -135,9 +144,10 @@ class _Context:
         pass
 
 
-def run_study(folder: str, inputs: str) -> tuple[_Context, dict]:
+def run_study(folder: str, inputs: str, **extra) -> tuple[_Context, dict]:
     """Run one fusion step over the study in ``folder``; ``inputs`` names the
-    mode and the greenery files. Returns the context and the outcome's bundle."""
+    mode and the greenery files, ``extra`` adds ``run_fusion`` arguments.
+    Returns the context and the outcome's bundle."""
     doc = (
         f"output_dir = {os.path.join(folder, 'out')!r}\n"
         "[[fusion]]\n"
@@ -153,7 +163,7 @@ def run_study(folder: str, inputs: str) -> tuple[_Context, dict]:
         f.write(doc)
     (spec,) = plans.expand(runfile.load(path, ()))
     ctx = _Context()
-    runners.run_fusion(ctx, **plans.build(spec).kwargs["run_kwargs"])
+    runners.run_fusion(ctx, **{**plans.build(spec).kwargs["run_kwargs"], **extra})
     return ctx, ctx.extra["results"]["by_target"]["outcome"]
 
 
@@ -178,8 +188,16 @@ def _run(mode: str) -> tuple[_Context, dict]:
                 ndvi = {2015 = "ndvi_2015.tif"}
                 gvi = {2015 = "gvi.gpkg"}
                 """,
-        }[mode]
-        _RUNS[mode] = run_study(_RUNS["folder"], inputs)
+        }[mode.split(" with ")[0]]
+        extra = (
+            {
+                "comparators": ["ndvi_here", "noise", "patchy"],
+                "comparators_primary": ["ndvi_here", "patchy"],
+            }
+            if mode.endswith("with comparators")
+            else {}
+        )
+        _RUNS[mode] = run_study(_RUNS["folder"], inputs, **extra)
     return _RUNS[mode]
 
 
@@ -231,6 +249,96 @@ class TestYearAwareRun(unittest.TestCase):
             y_grip, c_grip = y_split["controls"]["grip"], c_split["controls"]["grip"]
             for key in ("beta", "delta", "delta_ci_low", "delta_ci_high"):
                 self.assertAlmostEqual(y_grip[key], c_grip[key], places=6, msg=key)
+
+
+class TestComparatorRun(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.ctx, cls.bundle = _run("year-aware with comparators")
+        cls.plain = _run("year-aware")[1]
+        cls.report = cls.bundle["report_dir"]
+
+    def _csv(self, name):
+        import pandas as pd
+
+        return pd.read_csv(os.path.join(self.report, name))
+
+    def test_the_composite_is_untouched_by_comparators(self):
+        with_cmp, without = self.bundle, self.plain
+        self.assertEqual(without["comparators"], {})
+        self.assertFalse(
+            os.path.exists(os.path.join(without["report_dir"], "comparators.csv"))
+        )
+        self.assertEqual(
+            with_cmp["test_results"]["test_score"],
+            without["test_results"]["test_score"],
+        )
+        for key in ("beta_mean", "beta_ci_low", "beta_ci_high", "weight_mean"):
+            self.assertEqual(
+                with_cmp["discovery_summary"][key],
+                without["discovery_summary"][key],
+                key,
+            )
+
+    def test_every_comparator_is_scored_and_gaps_cost_only_its_rows(self):
+        cmp = self.bundle["comparators"]
+        self.assertEqual(sorted(cmp), ["ndvi_here", "noise", "patchy"])
+        for name, c in cmp.items():
+            self.assertEqual(c["status"], "ok", name)
+            self.assertIsNotNone(c["test"]["score"], name)
+            self.assertIn("negative_controls", c)
+        full, gappy = cmp["ndvi_here"]["n"], cmp["patchy"]["n"]
+        for split in ("test", "train_val", "all"):
+            self.assertLess(gappy[split], full[split], split)
+        self.assertEqual(
+            full["test"], self.bundle["cgi_effects"]["test"]["n"], "same held-out rows"
+        )
+
+    def test_holm_runs_over_the_primary_comparators(self):
+        rows = {r["comparator"]: r for r in self.bundle["cgi_vs_comparator_paired"]}
+        self.assertTrue(rows["noise"]["descriptive"])
+        self.assertIsNone(rows["noise"]["p_value_holm"])
+        for name in ("ndvi_here", "patchy"):
+            self.assertEqual(rows[name]["family_size"], 2)
+            self.assertGreaterEqual(rows[name]["p_value_holm"], rows[name]["p_value"])
+
+    def test_the_tables_carry_the_comparators(self):
+        table = self._csv("comparators.csv")
+        self.assertEqual(
+            list(table["exposure"].unique()), ["cgi", "ndvi_here", "noise", "patchy"]
+        )
+        self.assertEqual(len(table), 12)
+        self.assertEqual(len(self._csv("cgi_vs_comparator_paired.csv")), 3)
+        nc = self._csv("negative_controls.csv")
+        self.assertEqual(set(nc["exposure"]), {"cgi", "standalone", "comparator"})
+        self.assertEqual(
+            set(nc.loc[nc["exposure"] == "comparator", "study"]),
+            {"ndvi_here", "noise", "patchy"},
+        )
+        import json
+
+        with open(
+            os.path.join(self.report, "results_summary.json"), encoding="utf-8"
+        ) as f:
+            manifest = json.load(f)
+        self.assertEqual(
+            sorted(manifest["comparators"]), ["ndvi_here", "noise", "patchy"]
+        )
+        self.assertEqual(len(manifest["cgi_vs_comparator_paired"]), 3)
+
+    def test_every_entity_names_its_split(self):
+        import pandas as pd
+
+        path = self.bundle["entity_table_path"]
+        if path.endswith(".gpkg"):
+            table = gpd.read_file(path, layer="cgi")
+        else:
+            table = pd.read_csv(path)
+        counts = table["split"].value_counts()
+        self.assertEqual(int(counts["test"]), self.bundle["cgi_effects"]["test"]["n"])
+        self.assertEqual(
+            int(counts["train_val"]), self.bundle["cgi_effects"]["train_val"]["n"]
+        )
 
 
 class TestPanelRule(unittest.TestCase):

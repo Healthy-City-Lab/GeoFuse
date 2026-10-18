@@ -50,7 +50,10 @@ from geofuse.jobs.fusion_outputs import (
     _STANDALONE_CHANNEL_LABELS,
     _build_fusion_ledger,
     _compare_cgi_vs_standalone,
+    _comparator_family,
+    _comparator_report,
     _direction_sign,
+    _exposure_splits,
     _fusion_stage_key,
     _fusion_stage_weight,
     _jsonsafe_results,
@@ -1555,6 +1558,8 @@ def run_fusion(
     moderator_columns: list[str] | None = None,
     negative_controls: list[str] | None = None,
     negative_control_retune: bool = False,
+    comparators: list[str] | None = None,
+    comparators_primary: list[str] | None = None,
 ) -> dict:
     """Run a fusion job: data-driven CGI discovery + held-out test scoring.
 
@@ -1581,7 +1586,13 @@ def run_fusion(
     against them on the test split and on train+val, with the paired contrast
     drawn from ``report_paired_bootstrap`` resamples. ``negative_control_retune``
     also re-runs the CGI's sweep and posterior with each control as the target
-    and reports how closely that tuning reproduces the target's."""
+    and reports how closely that tuning reproduces the target's.
+
+    ``comparators`` names target columns holding finished exposures to
+    benchmark the composite against. Each is scored untuned, as a frozen
+    composite, on the CGI's own rows, split and covariates, with a paired
+    CGI − comparator test whose Holm correction runs over
+    ``comparators_primary`` (all of them when ``None``)."""
     # Bound before the body so the handlers below can close out the ledger no
     # matter how early a run fails.
     ledger = None
@@ -1644,6 +1655,22 @@ def run_fusion(
                 f"Standalone single-metric studies enabled: {', '.join(standalones)}",
             )
 
+        comparator_cols = list(dict.fromkeys(comparators or []))
+        primary_cols = (
+            comparator_cols
+            if comparators_primary is None
+            else list(dict.fromkeys(comparators_primary))
+        )
+        stray = [c for c in primary_cols if c not in comparator_cols]
+        if stray:
+            raise ValueError(f"Primary comparators {stray} are not comparators.")
+        if comparator_cols:
+            _log_fusion(
+                "INFO",
+                f"Comparator exposures: {', '.join(comparator_cols)} "
+                f"(primary: {', '.join(primary_cols) or 'none'}).",
+            )
+
         # Test-CI replicate budget: explicit value wins; otherwise 2,000 for
         # the O(n²) partial-distance-correlation objective, 10,000 otherwise.
         report_ci_n = (
@@ -1688,6 +1715,7 @@ def run_fusion(
             longitudinal=longitudinal_spec is not None,
             mixedlm_postscore=mixedlm_postscore_enabled,
             negative_control_retune=retune_enabled,
+            comparators=bool(comparator_cols),
         )
         ctx.update_stage_ledger(ledger.to_dict())
 
@@ -1751,6 +1779,8 @@ def run_fusion(
             "moderator_columns": list(moderator_columns or []),
             "negative_controls": list(negative_controls or []),
             "negative_control_retune": bool(negative_control_retune),
+            "comparators": list(comparator_cols),
+            "comparators_primary": list(primary_cols),
             "report_paired_bootstrap": int(report_paired_bootstrap),
             "cache_metrics": bool(cache_metrics),
             "resume_existing_study": bool(resume_existing_study),
@@ -1892,6 +1922,20 @@ def run_fusion(
                     f"covariate were dropped: "
                     f"{sorted(set(negative_controls or []) - set(outcome_ncs))}",
                 )
+            # Likewise a comparator cannot be the outcome it is scored against,
+            # a covariate it is adjusted for, or a control.
+            outcome_cmps = [
+                c
+                for c in comparator_cols
+                if c != target_feature and c not in outcome_covs + outcome_ncs
+            ]
+            if len(outcome_cmps) != len(comparator_cols):
+                _log_fusion(
+                    "WARN",
+                    f"[{label}] Comparator(s) that are this outcome, a covariate or "
+                    f"a control were dropped: "
+                    f"{sorted(set(comparator_cols) - set(outcome_cmps))}",
+                )
 
             engine = MetricFusionEngine(
                 target_file=target_path,
@@ -1931,6 +1975,7 @@ def run_fusion(
                 residualize_method=residualize_method,
                 search_scoring_method=search_scoring_method,
                 negative_control_columns=outcome_ncs,
+                comparator_columns=outcome_cmps,
             )
 
             ctx.progress(
@@ -2846,6 +2891,71 @@ def run_fusion(
                         "The run continues.",
                     )
 
+            # ── Comparator exposures ────────────────────
+            # Finished exposures from the target table, scored untuned on the
+            # CGI's own rows, split, covariates and objective, then compared
+            # with the CGI pairwise. A separate family from the standalones.
+            comparators_report: dict[str, dict] = {}
+            comparator_reference: dict | None = None
+            cgi_vs_comparator_paired: list[dict] = []
+            if outcome_cmps:
+                stage(skey("comparators"), RUNNING)
+                ctx.progress(
+                    value=prog_ledger(),
+                    status_text=f"{prefix}Scoring comparator exposures...",
+                )
+                if engine.is_panel:
+                    _log_fusion(
+                        "WARN",
+                        f"[{label}] Comparators are scored for one row per entity "
+                        "only; skipped for this panel.",
+                    )
+                    stage(
+                        skey("comparators"),
+                        SKIPPED,
+                        "Several rows per entity: comparators are not scored.",
+                    )
+                else:
+                    for name in outcome_cmps:
+                        if ctx.is_cancelled():
+                            return {"output_paths": output_paths}
+                        comparators_report[name] = _comparator_report(
+                            engine,
+                            name,
+                            headline_params,
+                            objective_metric,
+                            primary=name in primary_cols,
+                            n_ci=report_ci_n,
+                            n_effects_boot=int(report_effects_bootstrap),
+                            n_perm=int(report_effects_permutations),
+                            n_paired=int(report_paired_bootstrap),
+                            iqr=exposure_iqr,
+                            label=label,
+                            log=_log_fusion,
+                        )
+                    cgi_vs_comparator_paired = _comparator_family(comparators_report)
+                    try:
+                        comparator_reference = _exposure_splits(
+                            test_results,
+                            cgi_effects,
+                            engine.compute_partial_slopes(headline_params),
+                        )
+                    except Exception as exc:
+                        _log_fusion(
+                            "WARN", f"[{label}] CGI reference slopes failed: {exc}"
+                        )
+                    for row in cgi_vs_comparator_paired:
+                        _log_fusion(
+                            "OK",
+                            f"[{label}] CGI vs comparator `{row['comparator']}`: "
+                            f"Δ={_fmt_or_na(row.get('observed_diff'), '.4f')}, "
+                            f"p={_fmt_or_na(row.get('p_value'), '.4g')}, Holm p="
+                            f"{_fmt_or_na(row.get('p_value_holm'), '.4g')}"
+                            + (" (descriptive)" if row.get("descriptive") else "")
+                            + ".",
+                        )
+                    stage(skey("comparators"), DONE)
+
             # ── Composite GeoTIFF (raster write) ────────
             # Runs after the standalone stages so they can advance the ledger
             # first. Failures here don't kill the run — the composite_df is
@@ -3020,6 +3130,11 @@ def run_fusion(
                 "exposure_response": exposure_response_report,
                 "moderation": moderation_report,
                 "negative_controls": negative_control_report,
+                # Comparator exposures, the CGI's row on the same scale, and
+                # the paired CGI − comparator family.
+                "comparators": comparators_report,
+                "comparator_reference": comparator_reference,
+                "cgi_vs_comparator_paired": cgi_vs_comparator_paired,
                 "target_feature": target_feature,
                 # Run details persisted so the results panel survives a disk
                 # reload (when the live engine is gone): user-facing covariate
