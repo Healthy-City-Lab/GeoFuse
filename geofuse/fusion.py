@@ -130,6 +130,11 @@ def _log_parallel_efficiency(
 # monotone function of the same association and needs no second pass.
 _SWEEP_OBJECTIVES: frozenset[str] = frozenset({"quartile_contrast"})
 
+# What a missing categorical covariate value does to its row: ``drop`` removes
+# the row, as a missing numeric covariate does; ``indicator`` keeps it under a
+# ``<column>=missing`` level of its own.
+CATEGORICAL_MISSING = ("drop", "indicator")
+
 
 class MetricFusionEngine:
     """
@@ -184,6 +189,7 @@ class MetricFusionEngine:
         exposure_sigma_m: float = 35.0,
         gvi_min_coverage: float = 0.95,
         drop_collinear_channels: bool = False,
+        categorical_missing: str = "drop",
     ):
         """
         Initialize the fusion engine.
@@ -243,6 +249,10 @@ class MetricFusionEngine:
             drop_collinear_channels: leave the channels the collinearity check
                 puts above its VIF threshold out of the index search (weight 0)
                 instead of only reporting them.
+            categorical_missing: a row whose categorical covariate is missing
+                is dropped (``"drop"``, like a missing numeric covariate) or
+                kept under a ``<column>=missing`` level (``"indicator"``); see
+                :meth:`_expand_categorical_covariates`.
         """
         # Route Optuna's chatter ("Trial X finished with value Y …") into
         # the per-job log instead of the Streamlit host terminal. Fusion
@@ -352,6 +362,15 @@ class MetricFusionEngine:
         self._wave_control_columns: list[str] = []
         self._time_fixed_effect_dropped: bool = False
         self._covariates_expanded: bool = False
+        if categorical_missing not in CATEGORICAL_MISSING:
+            raise ValueError(
+                f"categorical_missing must be one of {CATEGORICAL_MISSING}; got "
+                f"{categorical_missing!r}."
+            )
+        self.categorical_missing: str = categorical_missing
+        # Rows missing each user covariate and what became of them; filled by
+        # the covariate expansion and the vector prep, carried into the results.
+        self._covariate_missing_report: dict | None = None
 
         # Spatial-confounding adjustment. ``none`` keeps the plain covariate-
         # residualized objective. ``ks_aic`` / ``spatial_plus`` fold a low-rank
@@ -4039,14 +4058,19 @@ class MetricFusionEngine:
         spacing_m = float(self.cgi_grid_spacing_m)
 
         # Drop NaN-outcome / NaN-covariate entities up front.
-        valid_mask = entities[outcome_col].notna()
+        has_outcome = entities[outcome_col].notna()
+        valid_mask = has_outcome.copy()
         for col in self.covariate_columns or []:
             valid_mask &= entities[col].notna()
         skipped_nan = int((~valid_mask).sum())
+        no_covariate = int((has_outcome & ~valid_mask).sum())
+        if self._covariate_missing_report is not None:
+            self._covariate_missing_report["rows_dropped"] = no_covariate
         if skipped_nan:
             _log(
                 "WARN",
-                f"Skipped {skipped_nan} entity(ies) with NaN outcome / covariate.",
+                f"Skipped {skipped_nan} entity(ies) with NaN outcome / covariate "
+                f"({no_covariate} with an outcome but a missing covariate).",
             )
         # Entity keys stay the target's own row positions, so outputs join back
         # to the target's geometries.
@@ -4456,6 +4480,13 @@ class MetricFusionEngine:
         drop-first dummy column names; numeric covariates are kept as-is. After
         expansion, any covariate the user tagged numeric that isn't numeric is
         rejected.
+
+        A missing categorical value never reads as the reference level. Under
+        ``categorical_missing="drop"`` the row's dummies are NaN, so the NaN
+        filter of the vector prep removes it exactly as it removes a missing
+        numeric covariate; under ``"indicator"`` the row gets a
+        ``<column>=missing`` dummy of its own. Rows missing each covariate are
+        counted in ``self._covariate_missing_report``.
         """
         gdf = self.target_gdf
         if gdf is None or not self._covariate_columns_user:
@@ -4469,29 +4500,80 @@ class MetricFusionEngine:
             )
 
         if not self._covariates_expanded:
+            indicator = self.categorical_missing == "indicator"
             expanded: list[str] = []
             new_frames: list[pd.DataFrame] = []
+            counts: list[dict] = []
             for c in self._covariate_columns_user:
-                if self.covariate_types.get(c) == "categorical":
-                    dummies = pd.get_dummies(
-                        gdf[c],
-                        prefix=c,
-                        prefix_sep="=",
-                        drop_first=True,
-                        dummy_na=False,
-                    ).astype(np.float64)
-                    if dummies.shape[1] == 0:
-                        _log(
-                            "WARN",
-                            f"Categorical covariate '{c}' has <2 levels after "
-                            "drop-first; dropping it.",
-                        )
-                        continue
-                    new_frames.append(dummies)
-                    self._covariate_dummy_map[c] = list(dummies.columns)
-                    expanded.extend(dummies.columns)
-                else:
+                missing = gdf[c].isna().to_numpy()
+                n_missing = int(missing.sum())
+                if self.covariate_types.get(c) != "categorical":
                     expanded.append(c)
+                    counts.append(
+                        {
+                            "column": c,
+                            "type": "numeric",
+                            "n_missing": n_missing,
+                            "handling": "drop",
+                        }
+                    )
+                    if n_missing:
+                        _log(
+                            "INFO",
+                            f"Covariate '{c}': {n_missing:,} row(s) missing; "
+                            "dropped.",
+                        )
+                    continue
+                dummies = pd.get_dummies(
+                    gdf[c],
+                    prefix=c,
+                    prefix_sep="=",
+                    drop_first=True,
+                    dummy_na=False,
+                ).astype(np.float64)
+                missing_level = f"{c}=missing"
+                if missing_level in dummies.columns:
+                    missing_level = f"{c}=<missing>"
+                if n_missing and indicator:
+                    dummies[missing_level] = missing.astype(np.float64)
+                if dummies.shape[1] == 0:
+                    _log(
+                        "WARN",
+                        f"Categorical covariate '{c}' has <2 levels after "
+                        "drop-first; dropping it.",
+                    )
+                    continue
+                if n_missing and not indicator:
+                    dummies.loc[missing, :] = np.nan
+                counts.append(
+                    {
+                        "column": c,
+                        "type": "categorical",
+                        "n_missing": n_missing,
+                        "handling": self.categorical_missing,
+                    }
+                )
+                if n_missing:
+                    _log(
+                        "INFO",
+                        f"Categorical covariate '{c}': {n_missing:,} row(s) "
+                        "missing; "
+                        + (
+                            f"coded as level '{missing_level}'."
+                            if indicator
+                            else "dropped."
+                        ),
+                    )
+                new_frames.append(dummies)
+                self._covariate_dummy_map[c] = list(dummies.columns)
+                expanded.extend(dummies.columns)
+            self._covariate_missing_report = {
+                "categorical_missing": self.categorical_missing,
+                "n_rows": int(len(gdf)),
+                "covariates": counts,
+                # Set by the vector prep, which drops the rows.
+                "rows_dropped": None,
+            }
             if new_frames:
                 # One concat rather than a column-at-a-time insert, so the
                 # frame is consolidated once.
