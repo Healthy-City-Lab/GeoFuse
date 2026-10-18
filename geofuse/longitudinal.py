@@ -340,15 +340,23 @@ def target_intake_columns(
     spec: LongitudinalSpec,
     outcome_col: str | None,
     covariate_cols: Iterable[str] = (),
+    extra_cols: Iterable[str] = (),
 ) -> list[str]:
     """Non-geometry columns :func:`build_long_format` reads from a target frame.
 
     The union of what intake consumes (entity id, date, wave label) and what
-    :func:`_project_columns` keeps (outcome, covariates). Any other column in
-    the user's file is discarded by intake, so a reader may skip it entirely
-    rather than materialize a cohort file's full survey schema.
+    :func:`_project_columns` keeps (outcome, covariates, the optional
+    ``extra_cols``). Any other column in the user's file is discarded by
+    intake, so a reader may skip it entirely rather than materialize a cohort
+    file's full survey schema.
     """
-    cols = [spec.entity_id_col, spec.date_col, outcome_col, *covariate_cols]
+    cols = [
+        spec.entity_id_col,
+        spec.date_col,
+        outcome_col,
+        *covariate_cols,
+        *extra_cols,
+    ]
     if not spec.derive_wave_from_date:
         cols.append(spec.wave_col)
     if spec.area_id_col:
@@ -367,6 +375,7 @@ def build_long_format(
     target_input: gpd.GeoDataFrame | Sequence[tuple[str, gpd.GeoDataFrame]],
     outcome_col: str,
     covariate_cols: Iterable[str] = (),
+    extra_cols: Iterable[str] = (),
 ) -> gpd.GeoDataFrame:
     """Normalise the user's longitudinal target into the internal long format.
 
@@ -391,6 +400,8 @@ def build_long_format(
     - ``years_since_baseline`` — float, per entity (baseline wave = ``0.0``).
     - ``outcome_col`` — passed through unchanged.
     - every column in ``covariate_cols`` — passed through unchanged.
+    - every column in ``extra_cols`` the input has (e.g. negative-control
+      outcomes) — passed through unchanged, never required.
     - ``geometry`` — passed through unchanged from the input row.
 
     Rows missing the outcome, the date column, or the entity id are dropped
@@ -449,7 +460,8 @@ def build_long_format(
         )
 
     frame = _compute_years_since_baseline(frame, spec)
-    out = _project_columns(frame, spec, outcome_col, cov_cols)
+    extras = [c for c in extra_cols if c in frame.columns]
+    out = _project_columns(frame, spec, outcome_col, cov_cols + extras)
 
     out.attrs["dropped_rows"] = {
         "missing_required": int(dropped_missing),
