@@ -541,9 +541,9 @@ class TestNegativeControlPanel(unittest.TestCase):
         fusion_tab._render_negative_controls(None)
         self.assertEqual(self.rec.calls, [])
 
-    def test_a_longitudinal_skip_is_explained(self):
+    def test_a_panel_skip_is_explained(self):
         fusion_tab._render_negative_controls({"skipped": "longitudinal"})
-        self.assertIn("cross-sectional targets only", self.rec.text())
+        self.assertIn("one row per entity only", self.rec.text())
 
 
 class _MetricRecorder(_Recorder):

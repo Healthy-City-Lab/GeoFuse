@@ -4517,8 +4517,8 @@ def _render_negative_controls(report: dict | None) -> None:
     st.markdown("**Negative controls**")
     if report.get("skipped") == "longitudinal":
         st.info(
-            "Negative controls are reported for cross-sectional targets only; "
-            "this longitudinal run did not score them."
+            "Negative controls are reported for one row per entity only; this "
+            "panel (several rows per entity) did not score them."
         )
         return
     splits = report.get("splits") or {}
