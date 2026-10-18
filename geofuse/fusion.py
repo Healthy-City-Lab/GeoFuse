@@ -135,6 +135,21 @@ _SWEEP_OBJECTIVES: frozenset[str] = frozenset({"quartile_contrast"})
 # ``<column>=missing`` level of its own.
 CATEGORICAL_MISSING = ("drop", "indicator")
 
+# Active-channel prefix under which a comparator column is scored as a frozen
+# exposure (``comparator_mode``).
+_COMPARATOR_PREFIX = "comparator:"
+
+
+def comparator_mode(column: str) -> str:
+    """The active-channel name that scores target ``column`` as the exposure.
+
+    Pinned on the engine, every scoring path — held-out score, bootstraps,
+    subset scores, effects, paired differences, negative controls — takes the
+    column's per-entity value as its composite, so a comparator is treated
+    exactly as the CGI is, without being tuned.
+    """
+    return _COMPARATOR_PREFIX + column
+
 
 class MetricFusionEngine:
     """
@@ -190,6 +205,7 @@ class MetricFusionEngine:
         gvi_min_coverage: float = 0.95,
         drop_collinear_channels: bool = False,
         categorical_missing: str = "drop",
+        comparator_columns: list[str] | None = None,
     ):
         """
         Initialize the fusion engine.
@@ -253,6 +269,12 @@ class MetricFusionEngine:
                 is dropped (``"drop"``, like a missing numeric covariate) or
                 kept under a ``<column>=missing`` level (``"indicator"``); see
                 :meth:`_expand_categorical_covariates`.
+            comparator_columns: target columns holding finished per-entity
+                exposures to benchmark the composite against. Carried like
+                negative controls, never tuned on and never a reason to drop
+                an entity; scored through :func:`comparator_mode`. A column
+                that is the outcome, a covariate or a negative control is
+                refused.
         """
         # Route Optuna's chatter ("Trial X finished with value Y …") into
         # the per-job log instead of the Streamlit host terminal. Fusion
@@ -419,6 +441,20 @@ class MetricFusionEngine:
         self.negative_control_columns: list[str] = list(
             dict.fromkeys(c for c in (negative_control_columns or []) if c)
         )
+        # Comparator exposures: carried the same way, scored as frozen
+        # composites (:func:`comparator_mode`). A comparator that is also the
+        # outcome, a covariate or a control would be scored against itself.
+        self.comparator_columns: list[str] = list(
+            dict.fromkeys(c for c in (comparator_columns or []) if c)
+        )
+        for role, cols in (
+            ("the outcome", [target_feature]),
+            ("a covariate", self.covariate_columns),
+            ("a negative control", self.negative_control_columns),
+        ):
+            clash = [c for c in self.comparator_columns if c in cols]
+            if clash:
+                raise ValueError(f"Comparator column(s) {clash} are also {role}.")
 
         # Longitudinal / mixed-effects spec. ``None`` keeps the engine in
         # cross-sectional mode (no behaviour change). When set, every code
@@ -716,7 +752,7 @@ class MetricFusionEngine:
             self.longitudinal_spec,
             self.target_feature,
             self.covariate_columns or (),
-            self.negative_control_columns,
+            [*self.negative_control_columns, *self.comparator_columns],
         )
 
     def _longitudinal_extra_cols(self) -> tuple[str, ...]:
@@ -763,7 +799,7 @@ class MetricFusionEngine:
             target_input,
             outcome_col=outcome_col,
             covariate_cols=self.covariate_columns,
-            extra_cols=self.negative_control_columns,
+            extra_cols=[*self.negative_control_columns, *self.comparator_columns],
         )
         # The per-file frames have been concatenated into ``long_gdf``; drop
         # the engine's reference so their memory is reclaimed rather than held
@@ -2183,12 +2219,22 @@ class MetricFusionEngine:
         """``{channel: aggregated values}`` at ``params`` for the rows given.
 
         A channel the formula gives no weight to is returned as zeros rather
-        than aggregated, which is what makes a sparse weight vector cheap.
+        than aggregated, which is what makes a sparse weight vector cheap. A
+        comparator (:func:`comparator_mode`) is its target column as carried on
+        the rows, so each entity's cells all hold its value.
         """
         chans = self._composite_channels() if channels is None else channels
         active = self._channel_active(params)
         out: dict[str, np.ndarray] = {}
         for ch in chans:
+            if ch.startswith(_COMPARATOR_PREFIX):
+                col = ch[len(_COMPARATOR_PREFIX) :]
+                if col not in points_gdf.columns:
+                    raise ValueError(f"Comparator '{col}' is not on the target rows.")
+                out[ch] = pd.to_numeric(points_gdf[col], errors="coerce").to_numpy(
+                    dtype=np.float64
+                )
+                continue
             if not active.get(ch, False):
                 out[ch] = np.zeros(len(points_gdf), dtype=np.float32)
                 continue
@@ -4013,8 +4059,9 @@ class MetricFusionEngine:
         channels to three appends rather than rebuilds.
         """
         wanted = set(cgi_formulas.formula_channels(self.cgi_formula))
-        if self._active_greenery_channel != "cgi":
-            wanted.add(self._active_greenery_channel)
+        mode = self._active_greenery_channel
+        if mode != "cgi" and not mode.startswith(_COMPARATOR_PREFIX):
+            wanted.add(mode)
         if "gvi" in wanted:
             # ``gvi``'s mean is the component sum, but its percentiles are not,
             # so the components stay alongside it for standalone reporting.
@@ -4204,6 +4251,7 @@ class MetricFusionEngine:
             *(self.covariate_columns or []),
             *self._longitudinal_extra_cols(),
             *self.negative_control_columns,
+            *self.comparator_columns,
         ]
         for col in dict.fromkeys(extra):
             if col in ent.columns:
@@ -6562,7 +6610,14 @@ class MetricFusionEngine:
                         out["score"] = perm.get("observed")
                 except Exception as exc:
                     logger.warning(f"evaluate_effects: permutation failed: {exc}")
-            out["n"] = int(len(t_arr))
+            # The rows the bootstrap and permutation actually use: they drop a
+            # missing outcome or exposure and any non-finite control row.
+            used = ~(np.isnan(t_arr) | np.isnan(c_arr))
+            if cov is not None:
+                used &= np.isfinite(np.asarray(cov, dtype=np.float64)).reshape(
+                    len(t_arr), -1
+                ).all(axis=1)
+            out["n"] = int(used.sum())
             return out
 
         results: dict[str, dict] = {}
@@ -7902,17 +7957,20 @@ class MetricFusionEngine:
 
         They stay out of every NaN gate, so an entity missing a control is
         still tuned on; the transfer test drops it from that control alone.
+        Comparator columns ride the same way and are left out of only their own
+        statistics.
         """
-        for col in self.negative_control_columns:
-            if col in fusion_df.columns:
-                continue
-            if col not in entity_gdf.columns:
-                _log(
-                    "WARN",
-                    f"Negative control '{col}' is not a target column; " "skipping it.",
-                )
-                continue
-            fusion_df[col] = pd.to_numeric(entity_gdf[col], errors="coerce").values
+        for role, cols in (
+            ("Negative control", self.negative_control_columns),
+            ("Comparator", self.comparator_columns),
+        ):
+            for col in cols:
+                if col in fusion_df.columns:
+                    continue
+                if col not in entity_gdf.columns:
+                    _log("WARN", f"{role} '{col}' is not a target column; skipped.")
+                    continue
+                fusion_df[col] = pd.to_numeric(entity_gdf[col], errors="coerce").values
 
     def _test_entity_mask(self, df: "pd.DataFrame") -> np.ndarray:
         """Rows of an ``apply_fusion`` frame that belong to the held-out split."""
@@ -7922,6 +7980,34 @@ class MetricFusionEngine:
         if "polygon_id" in df.columns and "polygon_id" in test.columns:
             return df["polygon_id"].isin(test["polygon_id"].unique()).to_numpy()
         return df.index.isin(test.index)
+
+    def compute_partial_slopes(self, params: dict) -> dict[str, dict]:
+        """Covariate-adjusted slope of the outcome on the applied composite.
+
+        ``{split: partial_slope}`` for ``test``, ``train_val`` and ``all``: the
+        outcome change in SDs per SD of the composite, both residualised on the
+        reporting covariates, with its exact interval and ``n`` (rows where both
+        are observed; see :func:`negative_controls.partial_slope`). The slope is
+        the one the negative-control transfer test reports, so an exposure's
+        effect and its specificity read on one scale.
+        """
+        from . import negative_controls as _nc
+
+        df = self.apply_fusion(weights=dict(params))
+        target = np.asarray(df["target"].values, dtype=np.float64)
+        composite = np.asarray(df["composite"].values, dtype=np.float64)
+        cov = self._reporting_covariate_matrix(df)
+        test = self._test_entity_mask(df)
+        out: dict[str, dict] = {}
+        for split, rows in (
+            ("test", test),
+            ("train_val", ~test),
+            ("all", np.ones(len(df), dtype=bool)),
+        ):
+            out[split] = _nc.partial_slope(
+                composite[rows], target[rows], None if cov is None else cov[rows]
+            )
+        return out
 
     def compute_negative_controls(
         self,

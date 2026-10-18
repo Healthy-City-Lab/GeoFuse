@@ -209,6 +209,7 @@ def _engine_stub(n_ent=400, n_test=100, seed=7, controls=("grip",)):
     )
     eng = types.SimpleNamespace(
         negative_control_columns=list(controls),
+        comparator_columns=[],
         is_panel=False,
         covariate_columns=["age"],
         _covariate_dummy_map={},
