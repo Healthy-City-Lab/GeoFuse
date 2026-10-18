@@ -426,6 +426,8 @@ class MetricFusionEngine:
         # forks to use (entity_id, wave) rows + a continuous
         # ``years_since_baseline`` time predictor instead.
         self.longitudinal_spec: longitudinal.LongitudinalSpec | None = longitudinal_spec
+        # Whether an entity repeats across rows; see :attr:`is_panel`.
+        self._panel: bool | None = None
         if self.longitudinal_spec is not None:
             spec_errs = longitudinal.validate_spec(self.longitudinal_spec)
             if spec_errs:
@@ -607,6 +609,22 @@ class MetricFusionEngine:
         """True when a :class:`LongitudinalSpec` was provided at construction."""
         return self.longitudinal_spec is not None
 
+    @property
+    def is_panel(self) -> bool:
+        """True when some entity holds several rows, so inference keeps them
+        together: the posterior's per-entity intercept, entity-history nulls,
+        entity-grouped splits and bootstraps.
+
+        A year-aware cross-sectional run is longitudinal in its intake (each
+        row reads the greenery of its own measurement year) but holds one row
+        per entity, and a per-entity intercept on singleton groups is not
+        identified; its inference is the cross-sectional one. Set by the vector
+        prep; before it, every longitudinal run counts as a panel.
+        """
+        if not self.is_longitudinal:
+            return False
+        return True if self._panel is None else self._panel
+
     def _temporal_key_noun(self) -> str:
         """What one temporal key represents, for logs and messages.
 
@@ -698,6 +716,7 @@ class MetricFusionEngine:
             self.longitudinal_spec,
             self.target_feature,
             self.covariate_columns or (),
+            self.negative_control_columns,
         )
 
     def _longitudinal_extra_cols(self) -> tuple[str, ...]:
@@ -744,6 +763,7 @@ class MetricFusionEngine:
             target_input,
             outcome_col=outcome_col,
             covariate_cols=self.covariate_columns,
+            extra_cols=self.negative_control_columns,
         )
         # The per-file frames have been concatenated into ``long_gdf``; drop
         # the engine's reference so their memory is reclaimed rather than held
@@ -3444,7 +3464,7 @@ class MetricFusionEngine:
         # permutes whole entity histories, not rows.
         entities = waves = None
         eid = static.get("entity_id")
-        if getattr(self, "is_longitudinal", False) and eid is not None:
+        if getattr(self, "is_panel", False) and eid is not None:
             entities = np.asarray(eid)[prep_info["kept"]]
             if static.get("wave") is not None:
                 waves = np.asarray(static["wave"])[prep_info["kept"]]
@@ -3641,6 +3661,13 @@ class MetricFusionEngine:
             f"(R-hat {post.rhat_max:.3f}, ESS {post.ess_min:.0f}, "
             f"{post.divergences} divergences). Posterior grid: {post.picked}.",
         )
+        if not params["__posterior__"]["converged"]:
+            _log(
+                "WARN",
+                f"The posterior did not converge (R-hat {post.rhat_max:.3f} > "
+                f"{bayesian_index.RHAT_CONVERGED}): its weights, radii and "
+                "intervals are not reliable.",
+            )
         return params
 
     def _inner_split_groups(self, static: dict) -> "np.ndarray | None":
@@ -3657,7 +3684,7 @@ class MetricFusionEngine:
             if keys is not None:
                 return pd.Series(np.asarray(keys)).map(blocks).fillna(-1).to_numpy()
         eid = static.get("entity_id")
-        if getattr(self, "is_longitudinal", False) and eid is not None:
+        if getattr(self, "is_panel", False) and eid is not None:
             return np.asarray(eid)
         return None
 
@@ -4076,6 +4103,14 @@ class MetricFusionEngine:
         # to the target's geometries.
         keep_pos = np.flatnonzero(valid_mask.to_numpy())
         entities = entities.loc[valid_mask].reset_index(drop=True)
+        if self.is_longitudinal and "entity_id" in entities.columns:
+            self._panel = bool(entities["entity_id"].duplicated().any())
+            if not self._panel:
+                _log(
+                    "INFO",
+                    "One row per entity: posterior, nulls, splits, bootstraps and "
+                    "negative controls are the cross-sectional ones.",
+                )
         if len(entities) < 2:
             raise ValueError(
                 "Fusion needs ≥2 entities with a valid outcome (and covariates "
@@ -6072,11 +6107,11 @@ class MetricFusionEngine:
                 )
                 return float(score_out)  # type: ignore[arg-type]
 
-        # OLS-metric longitudinal runs still have panel-correlated (entity, wave)
-        # rows, so resample whole entities (cluster bootstrap) rather than rows;
-        # cross-sectional runs pass ``groups=None`` and keep the row bootstrap.
+        # OLS-metric panels still have correlated (entity, wave) rows, so
+        # resample whole entities (cluster bootstrap) rather than rows; one row
+        # per entity passes ``groups=None`` and keeps the row bootstrap.
         groups = None
-        if self.is_longitudinal and res.get("entity_id") is not None:
+        if self.is_panel and res.get("entity_id") is not None:
             groups = np.asarray(res.get("entity_id"))
 
         ci = _stats_mod.bootstrap_score_ci(
@@ -7047,6 +7082,8 @@ class MetricFusionEngine:
                 cov = None
                 eid, _ = self._whole_data_longitudinal_keys(df_cgi)
                 eid = None if eid is None else eid[rows]
+            if not self.is_panel:
+                eid = None
             target = merged["target"].to_numpy(dtype=np.float64)
             cgi_c = merged["composite_cgi"].to_numpy(dtype=np.float64)
             std_c = merged["composite_std"].to_numpy(dtype=np.float64)
@@ -7670,7 +7707,7 @@ class MetricFusionEngine:
             cov = self._reporting_covariate_matrix(df)
 
             entity_id = None
-            if self.is_longitudinal:
+            if self.is_panel:
                 entity_id, _ysb = self._whole_data_longitudinal_keys(df)
             if held_out:
                 rows = self._test_entity_mask(df)
@@ -7790,7 +7827,7 @@ class MetricFusionEngine:
             target = np.asarray(df["target"].values, dtype=np.float64)
             composite = np.asarray(df["composite"].values, dtype=np.float64)
             entity_id = None
-            if self.is_longitudinal:
+            if self.is_panel:
                 entity_id, _ysb = self._whole_data_longitudinal_keys(df)
             rows = self._test_entity_mask(df) if held_out else None
             if rows is not None:
@@ -7911,11 +7948,11 @@ class MetricFusionEngine:
 
         if not self.negative_control_columns:
             return None
-        if self.is_longitudinal:
+        if self.is_panel:
             _log(
                 "WARN",
-                "Negative controls are reported for cross-sectional "
-                "targets only; skipped for this longitudinal run.",
+                "Negative controls are reported for one row per entity only; "
+                "skipped for this panel.",
             )
             return {
                 "skipped": "longitudinal",
@@ -8021,7 +8058,7 @@ class MetricFusionEngine:
 
         target_post = (target_params or {}).get("__posterior__") or {}
         out: dict = {}
-        if not self.negative_control_columns or self.is_longitudinal:
+        if not self.negative_control_columns or self.is_panel:
             return out
         loops = dict(reps=0, shuffles=0, gain_splits=0, null_runs=0)
         saved_formula = self.cgi_formula

@@ -9,7 +9,10 @@ here:
 - the run completes and writes its results;
 - every CGI-vs-standalone row carries the held-out interval and p-value, and
   its Holm-corrected p-value;
-- a missing held-out half leaves that inference empty instead of failing.
+- a missing held-out half leaves that inference empty instead of failing;
+- a year-aware run (a greenery file per measurement year, one row per entity)
+  is not a panel: with every visit in one year its posterior, splits and
+  negative controls are the cross-sectional run's.
 """
 
 import os
@@ -61,8 +64,8 @@ report_paired_bootstrap = 100
 
 
 def _write_study(folder: str, n: int = 160) -> None:
-    """A cohort whose outcome follows the NDVI at its point, per-year NDVI
-    rasters and street-view points."""
+    """A cohort whose outcome follows the NDVI at its point, every visit in
+    2015, per-year NDVI rasters and street-view points."""
     rng = np.random.default_rng(3)
     xs = _X0 + rng.random(n) * 0.03
     ys = _Y0 + rng.random(n) * 0.02
@@ -82,14 +85,13 @@ def _write_study(folder: str, n: int = 160) -> None:
             dst.write(ndvi + shift, 1)
     col = ((xs - (_X0 - 0.01)) / _PX).astype(int)
     row = (((_Y0 + 0.04) - ys) / _PX).astype(int)
-    years = np.where(rng.random(n) < 0.5, 2015, 2018)
     gpd.GeoDataFrame(
         {
             "outcome": 0.8 * ndvi[row, col] + rng.normal(0, 0.3, n),
             "grip": rng.normal(size=n),
             "age": rng.normal(60, 8, n),
             "sex": rng.choice(["f", "m"], n),
-            "visit": [f"{y}-06-15" for y in years],
+            "visit": ["2015-06-15"] * n,
         },
         geometry=[Point(a, b) for a, b in zip(xs, ys)],
         crs="EPSG:4326",
@@ -155,19 +157,36 @@ def run_study(folder: str, inputs: str) -> tuple[_Context, dict]:
     return ctx, ctx.extra["results"]["by_target"]["outcome"]
 
 
+_RUNS: dict = {}
+
+
+def _run(mode: str) -> tuple[_Context, dict]:
+    """The study run once per mode for the whole module."""
+    if mode not in _RUNS:
+        if "folder" not in _RUNS:
+            _RUNS["folder"] = tempfile.mkdtemp(prefix="geofuse-run-")
+            _write_study(_RUNS["folder"])
+        inputs = {
+            "cross-sectional": """
+                mode = "cross-sectional"
+                ndvi = "ndvi_2015.tif"
+                gvi = "gvi.gpkg"
+                """,
+            "year-aware": """
+                mode = "year-aware"
+                date_column = "visit"
+                ndvi = {2015 = "ndvi_2015.tif"}
+                gvi = {2015 = "gvi.gpkg"}
+                """,
+        }[mode]
+        _RUNS[mode] = run_study(_RUNS["folder"], inputs)
+    return _RUNS[mode]
+
+
 class TestCrossSectionalRun(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.tmp = tempfile.mkdtemp(prefix="geofuse-run-")
-        _write_study(cls.tmp)
-        cls.ctx, cls.bundle = run_study(
-            cls.tmp,
-            """
-            mode = "cross-sectional"
-            ndvi = "ndvi_2015.tif"
-            gvi = "gvi.gpkg"
-            """,
-        )
+        cls.ctx, cls.bundle = _run("cross-sectional")
 
     def test_the_run_completes_and_writes_its_results(self):
         stages = {s["key"]: s["status"] for s in self.ctx.ledger["stages"]}
@@ -184,6 +203,47 @@ class TestCrossSectionalRun(unittest.TestCase):
             self.assertGreaterEqual(d["p_value_holm"], d["p_value"])
             self.assertLess(d["inference_n"], d["n"])
         self.assertIn(self.bundle["cgi_vs_standalone_paired"], family)
+
+
+class TestYearAwareRun(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.ctx, cls.bundle = _run("year-aware")
+        cls.cross = _run("cross-sectional")[1]
+
+    def test_the_posterior_is_the_cross_sectional_one(self):
+        year, cross = self.bundle["discovery_summary"], self.cross["discovery_summary"]
+        self.assertEqual(year["converged"], cross["converged"])
+        for key in ("beta_mean", "beta_ci_low", "beta_ci_high", "rhat_max"):
+            self.assertAlmostEqual(year[key], cross[key], places=6, msg=key)
+        np.testing.assert_allclose(year["weight_mean"], cross["weight_mean"])
+
+    def test_negative_controls_are_reported_as_in_the_cross_sectional_run(self):
+        year = self.bundle["negative_controls"]
+        cross = self.cross["negative_controls"]
+        self.assertNotIn("skipped", year)
+        for split in ("test", "train_val"):
+            y_split, c_split = year["splits"][split], cross["splits"][split]
+            self.assertEqual(y_split["target"]["n"], c_split["target"]["n"])
+            self.assertAlmostEqual(
+                y_split["target"]["beta"], c_split["target"]["beta"], places=6
+            )
+            y_grip, c_grip = y_split["controls"]["grip"], c_split["controls"]["grip"]
+            for key in ("beta", "delta", "delta_ci_low", "delta_ci_high"):
+                self.assertAlmostEqual(y_grip[key], c_grip[key], places=6, msg=key)
+
+
+class TestPanelRule(unittest.TestCase):
+    def _state(self, longitudinal, panel):
+        return types.SimpleNamespace(is_longitudinal=longitudinal, _panel=panel)
+
+    def test_only_repeated_entities_make_a_panel(self):
+        is_panel = MetricFusionEngine.is_panel.fget
+        self.assertFalse(is_panel(self._state(False, None)))
+        self.assertFalse(is_panel(self._state(True, False)))
+        self.assertTrue(is_panel(self._state(True, True)))
+        # Before the prep has seen the rows, a longitudinal run counts as one.
+        self.assertTrue(is_panel(self._state(True, None)))
 
 
 class TestPairedInferenceWithoutAHeldOutHalf(unittest.TestCase):

@@ -1679,11 +1679,8 @@ def run_fusion(
             longitudinal_spec is not None
             and longitudinal_spec.scoring_metric in _LON_MIXEDLM_METRICS
         )
-        retune_enabled = (
-            bool(negative_control_retune)
-            and bool(negative_controls)
-            and longitudinal_spec is None
-        )
+        # A panel (several rows per entity) skips it once its data are known.
+        retune_enabled = bool(negative_control_retune) and bool(negative_controls)
         ledger = _build_fusion_ledger(
             all_labels,
             multi=multi_outcome,
@@ -2095,7 +2092,7 @@ def run_fusion(
                     # wave, so its label is only a log/provenance string.
                     wide_frames: list[tuple[str, gpd.GeoDataFrame]] = []
                     keep_cols = _longitudinal_target_intake_columns(
-                        longitudinal_spec, target_feature, outcome_covs
+                        longitudinal_spec, target_feature, outcome_covs, outcome_ncs
                     )
                     for (
                         wave_label,
@@ -2963,7 +2960,11 @@ def run_fusion(
                 log=_log_fusion,
             )
             if retune_enabled:
-                if outcome_ncs and negative_control_report:
+                if (
+                    outcome_ncs
+                    and negative_control_report
+                    and not negative_control_report.get("skipped")
+                ):
                     stage(skey("negative_control_retune"), RUNNING)
                     ctx.progress(
                         value=prog_ledger(),
@@ -2996,7 +2997,12 @@ def run_fusion(
                     stage(
                         skey("negative_control_retune"),
                         SKIPPED,
-                        "No negative control left for this outcome.",
+                        (
+                            "Several rows per entity: negative controls are not "
+                            "scored."
+                            if engine.is_panel
+                            else "No negative control left for this outcome."
+                        ),
                     )
 
             bundle = {

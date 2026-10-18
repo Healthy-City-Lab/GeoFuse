@@ -685,6 +685,7 @@ def _write_fusion_outputs(
                     "rhat_max",
                     "ess_min",
                     "divergences",
+                    "converged",
                     "holdout_gain",
                     "null_calibration",
                 )
@@ -919,6 +920,7 @@ def _posterior_summary(params: dict) -> dict:
         "rhat_max": post.get("rhat_max"),
         "ess_min": post.get("ess_min"),
         "divergences": post.get("divergences"),
+        "converged": post.get("converged"),
         # The grid axes the posterior estimated rather than the sweep picked.
         "radius_kernel": post.get("radius_kernel"),
         "radius_prior": post.get("radius_prior", "rungs"),

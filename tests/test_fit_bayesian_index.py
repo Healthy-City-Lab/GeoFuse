@@ -275,6 +275,7 @@ def _retune_stub(n=600, seed=3):
         gvi_buffer_max_m=900.0,
         negative_control_columns=["grip"],
         is_longitudinal=False,
+        is_panel=False,
         ndvi_buffer_step_m=150.0,
         gvi_buffer_step_m=150.0,
         ndvi_ladder_spacing="linear",

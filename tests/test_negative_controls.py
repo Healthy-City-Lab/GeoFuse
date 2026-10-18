@@ -209,7 +209,7 @@ def _engine_stub(n_ent=400, n_test=100, seed=7, controls=("grip",)):
     )
     eng = types.SimpleNamespace(
         negative_control_columns=list(controls),
-        is_longitudinal=False,
+        is_panel=False,
         covariate_columns=["age"],
         _covariate_dummy_map={},
         test_data=full[full["polygon_id"] < n_test],
@@ -246,9 +246,9 @@ class TestEngineTransfer(unittest.TestCase):
     def test_no_controls_returns_nothing(self):
         self.assertIsNone(_engine_stub(controls=()).compute_negative_controls({}))
 
-    def test_a_longitudinal_run_is_skipped_and_says_so(self):
+    def test_a_panel_is_skipped_and_says_so(self):
         eng = _engine_stub()
-        eng.is_longitudinal = True
+        eng.is_panel = True
         out = eng.compute_negative_controls({})
         self.assertEqual(out["skipped"], "longitudinal")
 
