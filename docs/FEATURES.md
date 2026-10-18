@@ -285,6 +285,13 @@ Nothing below is pre-specified.
   intercept per entity, integrated out exactly, so one person's waves do not
   narrow the interval on the effect as if they were independent people; the
   exposure-response and moderation fits use entity-clustered standard errors.
+  A panel is a run where some entity has several rows. A year-aware
+  cross-sectional run, which only picks each row's greenery by its measurement
+  year, has one row per entity and keeps the cross-sectional posterior, nulls,
+  splits and bootstraps: an intercept per entity cannot be estimated from one
+  row each.
+- **Convergence is checked.** A posterior whose largest R-hat exceeds 1.05 is
+  logged as a warning and marked `converged = false` in the results.
 - **Recovery is measured on your own data.** A plasmode module
   (`geofuse.validation`, or `MetricFusionEngine.plasmode_recovery`) keeps the
   real exposure tensor and covariates, plants a known index into a simulated
@@ -320,7 +327,8 @@ Nothing below is pre-specified.
   the search, and standalone studies get the same check for comparison. An
   optional re-tune runs the whole discovery with each control as the target
   and reports how closely its radius, aggregator and weights match the
-  target's.
+  target's. Controls are scored for cross-sectional and year-aware runs; a
+  panel skips them.
 - Longitudinal runs add wave fixed effects, on by default, and an optional
   neighbourhood or site column.
 

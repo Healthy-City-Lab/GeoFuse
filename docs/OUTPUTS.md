@@ -150,6 +150,10 @@ held-out standard errors. Each CGI-versus-channel row's `lower`, `upper` and
 `p_value_holm` corrects that p-value across the channels; all four are empty
 when the held-out rows could not be scored.
 
+**`converged`** in each study's `discovery` block of `results_summary.json` is
+false when the posterior's largest R-hat exceeds 1.05; its weights, radii and
+intervals are then not reliable, and the job log says so.
+
 **`gain_p` in `discovery.csv`** is the corrected resampled t-test of a positive
 mean gain over the best single channel across the held-out splits.
 

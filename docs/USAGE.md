@@ -83,12 +83,14 @@ mismatched file is refused, and processed points are skipped.
 1. **Target configuration.** Upload the outcome, pick the outcome columns, and
    optionally name **negative-control outcomes**: columns expected to share the
    outcome's confounders but not to be caused by greenery, such as grip
-   strength for a cognitive outcome. They are never tuned on (cross-sectional
-   runs only).
+   strength for a cognitive outcome. They are never tuned on, and are scored
+   for cross-sectional runs, year-matched ones included, but not for panels.
 2. **Optimization setup.** Choose cross-sectional or mixed-effects
    (longitudinal). Longitudinal requires a date column. Cross-sectional can
-   optionally use one to route each entity to a year-matched greenery file; the
-   year is only a file key, never a regression input.
+   optionally use one to route each entity to a year-matched greenery file.
+   The years then also enter as fixed effects, which absorb differences
+   between the yearly files; with one row per entity the run is otherwise
+   cross-sectional, with no per-entity terms.
 3. **Metric file assignment.** Per channel, set the buffer ladder and assign
    files. A ladder is a min and max in metres plus either a step (linear) or a
    number of rungs (log-spaced); the radii it produces are listed under the
