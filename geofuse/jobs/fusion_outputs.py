@@ -151,8 +151,8 @@ def _write_fusion_outputs(
     - ``run_config.json`` — every setting the job ran with (fidelity record).
     - ``results_summary.json`` — nested manifest: each study's params, test
       score + CI, direction, subset scores, and discovery stats, plus the
-      CGI-vs-standalone AIC/BIC verdict, covariate-impact summary, and the
-      collinearity report.
+      CGI-vs-standalone AIC/BIC verdict, covariate-impact summary, the
+      collinearity report, and the rows missing each covariate.
     - ``test_scores.csv`` — one headline row per study (test score, CI,
       direction).
     - ``scores.csv`` — long form: study × subset (train/val/test/all) ×
@@ -724,6 +724,7 @@ def _write_fusion_outputs(
         "exposure_response": (cgi_bundle or {}).get("exposure_response"),
         "moderation": (cgi_bundle or {}).get("moderation") or [],
         "collinearity": collinearity_report,
+        "covariate_missing": (cgi_bundle or {}).get("covariate_missing"),
     }
     _emit_json(f"results_summary{sfx}.json", manifest)
 

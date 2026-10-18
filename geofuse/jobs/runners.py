@@ -1227,6 +1227,7 @@ def _fusion_config_fingerprint(
     exposure_sigma_m: float = 35.0,
     gvi_min_coverage: float = 0.95,
     drop_collinear_channels: bool = False,
+    categorical_missing: str = "drop",
 ) -> str:
     """8-char hex hash of every setting that changes the search space / split.
 
@@ -1290,6 +1291,17 @@ def _fusion_config_fingerprint(
                 )
             ]
             if any(
+                str(v).lower() == "categorical"
+                for v in (covariate_types or {}).values()
+            )
+            else []
+        )
+        # A missing level adds a dummy column; only appended when one can be
+        # added, so dropping runs keep their hash.
+        + (
+            [f"catna:{categorical_missing}"]
+            if categorical_missing != "drop"
+            and any(
                 str(v).lower() == "categorical"
                 for v in (covariate_types or {}).values()
             )
@@ -1465,6 +1477,7 @@ def run_fusion(
     cgi_formula: str = "weighted_average",
     covariate_columns: list[str] | None = None,
     covariate_types: dict[str, str] | None = None,
+    categorical_missing: str = "drop",
     standalone_channels: list[str] | None = None,
     longitudinal_spec_payload: dict | None = None,
     cgi_grid_spacing_m: float | None = None,
@@ -1661,6 +1674,7 @@ def run_fusion(
             "channel_set": channel_set,
             "index_form": index_form,
             "covariate_columns": list(covariate_columns or []),
+            "categorical_missing": str(categorical_missing),
             "standalone_channels": list(standalones),
             "test_size": float(test_size),
             "n_bins": n_bins,
@@ -1870,6 +1884,7 @@ def run_fusion(
                 cgi_formula=cgi_formula,
                 covariate_columns=outcome_covs,
                 covariate_types=dict(covariate_types or {}),
+                categorical_missing=str(categorical_missing),
                 longitudinal_spec=longitudinal_spec,
                 cgi_grid_spacing_m=cgi_grid_spacing_m,
                 exposure_kernel=exposure_kernel,
@@ -2238,6 +2253,7 @@ def run_fusion(
                 exposure_sigma_m=float(exposure_sigma_m),
                 gvi_min_coverage=float(gvi_min_coverage),
                 drop_collinear_channels=bool(drop_collinear_channels),
+                categorical_missing=str(categorical_missing),
             )
 
             def _standalone_study_name(ch: str) -> str:
@@ -2974,6 +2990,8 @@ def run_fusion(
                 "covariate_dummy_map": dict(
                     getattr(engine, "_covariate_dummy_map", {}) or {}
                 ),
+                # Rows missing each covariate, and how many were dropped.
+                "covariate_missing": getattr(engine, "_covariate_missing_report", None),
                 "cgi_formula": cgi_formula,
                 "config_hash": run_config_record["config_hash"],
                 # Distinct configurations scored on the held-out slice. A test
