@@ -153,6 +153,11 @@ bounded by free memory, since every worker is a fresh interpreter. A log line
 saying `limited by free memory` means closing other applications would widen the
 pool; `limited by cores` means the machine is fully used.
 
+The posterior's chains (**Chains**, 4 by default) run in parallel, one CPU core
+each. A log line saying the chains `run one after another` means the process
+had already started JAX with fewer CPU devices than chains; the result is valid,
+only slower.
+
 ```bash
 GEOFUSE_CPU_SHARE=0.5 streamlit run ui/app.py   # halve the process-pool share
 GEOFUSE_WORKERS=8 streamlit run ui/app.py       # cap every pool at 8 workers
