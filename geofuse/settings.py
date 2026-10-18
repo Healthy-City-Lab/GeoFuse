@@ -175,6 +175,8 @@ ASSOCIATION_TARGETS = ("level", "decline_overall", "decline_average", "decline_c
 SEARCH_SCORING_METHODS = ("mom_em3", "mom_em1", "mom", "exact")
 #: Spatial-confounding adjustments of the fusion objective.
 SPATIAL_ADJUST_METHODS = ("none", "ks_aic", "spatial_plus")
+#: ``geofuse.fusion.CATEGORICAL_MISSING``.
+CATEGORICAL_MISSING = ("drop", "indicator")
 
 # ────────────────────────────────────────────────────────────────────
 # NDVI
@@ -295,6 +297,11 @@ FUSION: dict[str, Setting] = {
     "n_bins": _int(5, 3, 10, "Quantile bins of the stratified split."),
     "residualize_method": _choice(
         "linear", ("linear", "spline"), "How covariates are partialled out."
+    ),
+    "categorical_missing": _choice(
+        "drop",
+        CATEGORICAL_MISSING,
+        "A missing categorical covariate: drop the row, or a level of its own.",
     ),
     "search_scoring_method": _choice(
         "mom_em3", SEARCH_SCORING_METHODS, "Mixed-model fit per trial (longitudinal)."

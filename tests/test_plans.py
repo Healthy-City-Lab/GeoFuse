@@ -682,6 +682,38 @@ class TabParityTests(_Case):
         )
         self.assert_same(gui, plans.build(spec))
 
+    def test_fusion_tab_missing_category_level(self):
+        seed = {
+            "fusion_target_paths": [self.cohort],
+            "fusion_target_upload_sig": (self.cohort, os.path.getsize(self.cohort)),
+            "fusion_outcome_columns": ["cesd"],
+            "fusion_covariate_categorical": ["age"],
+            "fusion_run_mode": "Cross-sectional",
+            "fusion_ndvi_paths": [os.path.join(self.dir, "ndvi_2015.tif")],
+            "fusion_gvi_paths": [os.path.join(self.dir, "gvi.gpkg")],
+        }
+        gui = self.click(
+            "fusion",
+            seed,
+            f"fusion.render({self.out!r})",
+            "fusion_form_run_submit",
+            selects={"fusion_categorical_missing": "indicator"},
+        )
+        (spec,) = self.expand(
+            f"""
+            output_dir = {self.out!r}
+            [[fusion]]
+            target = "cohort.gpkg"
+            outcomes = ["cesd"]
+            categorical = ["age"]
+            categorical_missing = "indicator"
+            ndvi = "ndvi_2015.tif"
+            gvi = "gvi.gpkg"
+            """
+        )
+        self.assertEqual(gui[2][0]["categorical_missing"], "indicator")
+        self.assert_same(gui, plans.build(spec))
+
 
 if __name__ == "__main__":
     unittest.main()

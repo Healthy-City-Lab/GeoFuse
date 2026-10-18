@@ -45,7 +45,14 @@ _FUSION_INPUTS = {
 
 class EngineConstantTests(unittest.TestCase):
     def test_choice_lists_equal_the_engines(self):
-        from geofuse import bayesian_index, exposure, metric_sampling, ndvi, ndvi_chains
+        from geofuse import (
+            bayesian_index,
+            exposure,
+            fusion,
+            metric_sampling,
+            ndvi,
+            ndvi_chains,
+        )
         from geofuse.jobs import runners
         from geofuse.longitudinal import MIXEDLM_METRICS
 
@@ -57,6 +64,7 @@ class EngineConstantTests(unittest.TestCase):
         self.assertEqual(settings.LADDER_SPACINGS, metric_sampling.LADDER_SPACINGS)
         self.assertEqual(settings.RADIUS_PRIORS, bayesian_index.RADIUS_PRIORS)
         self.assertEqual(settings.EXPOSURE_KERNELS, exposure.KERNELS)
+        self.assertEqual(settings.CATEGORICAL_MISSING, fusion.CATEGORICAL_MISSING)
         self.assertEqual(settings.INDEX_FORMS[1:], bayesian_index.FORMS)
         self.assertEqual(settings.CHANNEL_SETS, runners._CHANNEL_SETS)
         n = len(MIXEDLM_METRICS)
@@ -187,6 +195,7 @@ class CheckTests(unittest.TestCase):
             ("fusion", {"cgi_grid_spacing_m": 55}, "cgi_grid_spacing_m"),
             ("fusion", {"objective_metric": "pearson"}, "objective_metric"),
             ("fusion", {"check_collinearity": None}, "check_collinearity"),
+            ("fusion", {"categorical_missing": "impute"}, "categorical_missing"),
         ):
             with self.assertRaisesRegex(SettingError, f"'{key}'"):
                 settings.check(engine, values)
@@ -222,6 +231,11 @@ class CheckTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(SettingError, "season_start_month"):
             self.check("ndvi", season_start_month=10, season_end_month=4)
+
+
+class CategoricalMissingTests(unittest.TestCase):
+    def test_drop_is_the_default(self):
+        self.assertEqual(settings.FUSION["categorical_missing"].default, "drop")
 
 
 class ChainSettingTests(unittest.TestCase):

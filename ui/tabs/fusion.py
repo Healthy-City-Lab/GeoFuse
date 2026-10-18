@@ -448,6 +448,7 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "cgi_formula",
     "covariate_columns",
     "covariate_types",
+    "categorical_missing",
     "moderator_columns",
     "negative_controls",
     "exposure_iqr",
@@ -492,11 +493,18 @@ _RADIUS_PRIOR_LABELS: dict[str, str] = {
     "range": "Range-based (spacing-invariant)",
 }
 
+# Missing categorical covariate values (``settings.CATEGORICAL_MISSING``).
+_CATEGORICAL_MISSING_LABELS: dict[str, str] = {
+    "drop": "Drop the row",
+    "indicator": "Keep as a level of its own",
+}
+
 # Recorded param -> form widget key. Re-run seeds these so the normal setup
 # form comes up filled in; anything not listed keeps its own default.
 _FUSION_PARAM_TO_WIDGET: dict[str, str] = {
     "objective_metric": "fusion_objective_metric",
     "residualize_method": "fusion_residualize_method",
+    "categorical_missing": "fusion_categorical_missing",
     "search_scoring_method": "fusion_search_scoring_method",
     "test_size": "fusion_test_size",
     "n_bins": "fusion_stratification_bins",
@@ -1597,21 +1605,44 @@ def _render_study_details_panel(
             # Options are the full static column list, so this doesn't depend on
             # the selection above and stays form-safe.
             detected = ", ".join(categorical_candidates[:8]) or "none"
-            _keep_valid(
-                "fusion_covariate_categorical", available_covariates, multi=True
-            )
-            categorical_pick = st.multiselect(
-                "Categorical covariates (one-hot encoded)",
-                options=available_covariates,
-                key="fusion_covariate_categorical",
-                help=(
-                    "One-hot encoded (drop-first) and entered as dummy controls. "
-                    "Listing a column here is enough — it does not also need to "
-                    "be in the covariate list. Tag numeric-coded categories "
-                    "(e.g. an education band stored as 1–6) here too. "
-                    f"Detected as non-numeric: {detected}."
-                ),
-            )
+            col_cat, col_na = st.columns([3, 1])
+            with col_cat:
+                _keep_valid(
+                    "fusion_covariate_categorical", available_covariates, multi=True
+                )
+                categorical_pick = st.multiselect(
+                    "Categorical covariates (one-hot encoded)",
+                    options=available_covariates,
+                    key="fusion_covariate_categorical",
+                    help=(
+                        "One-hot encoded (drop-first) and entered as dummy "
+                        "controls. Listing a column here is enough — it does not "
+                        "also need to be in the covariate list. Tag "
+                        "numeric-coded categories (e.g. an education band stored "
+                        "as 1–6) here too. "
+                        f"Detected as non-numeric: {detected}."
+                    ),
+                )
+            with col_na:
+                _default(
+                    "fusion_categorical_missing",
+                    _fs_default("categorical_missing"),
+                    list(_CATEGORICAL_MISSING_LABELS),
+                )
+                categorical_missing = st.selectbox(
+                    "Missing categorical values",
+                    options=list(_CATEGORICAL_MISSING_LABELS),
+                    format_func=_CATEGORICAL_MISSING_LABELS.get,
+                    key="fusion_categorical_missing",
+                    help=(
+                        "Rows whose categorical covariate is empty. **Drop the "
+                        "row** treats them like a missing numeric covariate "
+                        "(complete cases). **Keep as a level of its own** adds a "
+                        "`<column>=missing` dummy, so they are never counted in "
+                        "the reference level. The results list how many rows "
+                        "each covariate was missing."
+                    ),
+                )
             cat_set = set(categorical_pick) & set(available_covariates)
             covariate_columns = sorted(set(numeric_pick) | cat_set)
             covariate_types = {
@@ -1671,6 +1702,7 @@ def _render_study_details_panel(
         else:
             covariate_columns = []
             covariate_types = {}
+            categorical_missing = _fs_default("categorical_missing")
             moderator_columns = []
             exposure_iqr_ui = 0.0
             st.caption(
@@ -2340,6 +2372,7 @@ def _render_study_details_panel(
         ),
         "covariate_columns": list(covariate_columns or []),
         "covariate_types": dict(covariate_types or {}),
+        "categorical_missing": str(categorical_missing),
         "moderator_columns": list(moderator_columns or []),
         # ``None`` restores the default: the IQR of the composite itself.
         "exposure_iqr": (
@@ -2462,6 +2495,29 @@ div[data-testid="stVerticalBlock"]:has(> div > div > div[data-fusion-results-anc
             unsafe_allow_html=True,
         )
         _render_fusion_results_body(output_dir)
+
+
+def _covariate_missing_caption(report: dict | None) -> str | None:
+    """One line naming the covariates some rows were missing, or ``None``."""
+    rows = [r for r in (report or {}).get("covariates") or [] if r.get("n_missing")]
+    if not rows:
+        return None
+    handled = {"drop": "dropped", "indicator": "own level"}
+    parts = [
+        f"`{r['column']}` {int(r['n_missing']):,} "
+        f"({handled.get(r.get('handling'), r.get('handling'))})"
+        for r in rows
+    ]
+    dropped = report.get("rows_dropped")
+    return (
+        "**Missing covariates (rows):** "
+        + ", ".join(parts)
+        + (
+            f"  ·  {int(dropped):,} row(s) with an outcome were dropped"
+            if dropped
+            else ""
+        )
+    )
 
 
 def _render_collinearity_report(results_view: dict) -> None:
@@ -4860,6 +4916,9 @@ def _render_fusion_results_body(output_dir: str) -> None:
             else ""
         )
     )
+    missing_note = _covariate_missing_caption(results_view.get("covariate_missing"))
+    if missing_note:
+        st.caption(missing_note)
     _cfg_hash = results_view.get("config_hash")
     _test_reads = results_view.get("test_reads")
     if _cfg_hash or _test_reads is not None:
@@ -5487,6 +5546,9 @@ def render(output_dir: str) -> None:
     cgi_formula = study_state["cgi_formula"]
     covariate_columns = study_state["covariate_columns"]
     covariate_types = study_state.get("covariate_types") or {}
+    categorical_missing_param = str(
+        study_state.get("categorical_missing", _fs_default("categorical_missing"))
+    )
     moderator_columns_param = list(study_state.get("moderator_columns") or [])
     # Picked in the target section, so read from state; a control cannot also
     # be an outcome of this job.
@@ -5904,6 +5966,7 @@ def render(output_dir: str) -> None:
                 "cgi_formula": cgi_formula,
                 "covariate_columns": list(covariate_columns or []),
                 "covariate_types": dict(covariate_types or {}),
+                "categorical_missing": categorical_missing_param,
                 "moderator_columns": list(moderator_columns_param),
                 "negative_controls": negative_controls_param,
                 "exposure_iqr": (

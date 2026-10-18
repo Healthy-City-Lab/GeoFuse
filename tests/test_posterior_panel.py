@@ -675,5 +675,29 @@ class TestCovariateTrendLine(unittest.TestCase):
         self.assertTrue(np.allclose(fitted, [1, 2, 3, 4, 5], atol=1e-6))
 
 
+class TestMissingCovariateCaption(unittest.TestCase):
+    def test_nothing_missing_draws_nothing(self):
+        self.assertIsNone(fusion_tab._covariate_missing_caption(None))
+        complete = {
+            "covariates": [{"column": "sex", "n_missing": 0, "handling": "drop"}],
+            "rows_dropped": 0,
+        }
+        self.assertIsNone(fusion_tab._covariate_missing_caption(complete))
+
+    def test_each_missing_covariate_and_the_dropped_rows_are_named(self):
+        caption = fusion_tab._covariate_missing_caption(
+            {
+                "covariates": [
+                    {"column": "sex", "n_missing": 3, "handling": "drop"},
+                    {"column": "edu", "n_missing": 2, "handling": "indicator"},
+                ],
+                "rows_dropped": 3,
+            }
+        )
+        self.assertIn("`sex` 3 (dropped)", caption)
+        self.assertIn("`edu` 2 (own level)", caption)
+        self.assertIn("3 row(s) with an outcome were dropped", caption)
+
+
 if __name__ == "__main__":
     unittest.main()

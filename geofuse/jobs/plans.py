@@ -920,6 +920,7 @@ def fusion_run_config(spec: JobSpec) -> dict[str, Any]:
         "covariate_types": {
             c: ("categorical" if c in cats else "numeric") for c in covariates
         },
+        "categorical_missing": s["categorical_missing"],
         "moderator_columns": list(o["moderators"]),
         "negative_controls": controls if vector else [],
         "exposure_iqr": s["exposure_iqr"],
