@@ -77,6 +77,8 @@ _FUSION_COLUMNS = (
     ("covariates", "covariate", "a covariate column"),
     ("categorical", "categorical", "a categorical covariate column"),
     ("moderators", "moderator", "an effect-modifier column"),
+    ("comparators", "comparator", "an existing exposure column to benchmark against"),
+    ("comparators_primary", "comparator-primary", "a pre-specified primary comparator"),
 )
 
 
@@ -118,8 +120,9 @@ def _step(args) -> dict:
         if args.band != 1:
             step["band"] = args.band
         for key, flag, _help in _FUSION_COLUMNS:
-            if getattr(args, flag):
-                step[key] = list(getattr(args, flag))
+            values = getattr(args, flag.replace("-", "_"))
+            if values:
+                step[key] = list(values)
         step["ndvi"] = _channel(args.ndvi, "--ndvi")
         step["gvi"] = _channel(args.gvi, "--gvi")
     if args.preset:

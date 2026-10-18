@@ -37,6 +37,8 @@ _FUSION_INPUTS = {
     "covariate_types",
     "moderator_columns",
     "negative_controls",
+    "comparators",
+    "comparators_primary",
     "standalone_channels",
     "longitudinal_spec_payload",
     "n_spatial_blocks",

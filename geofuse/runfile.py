@@ -90,6 +90,8 @@ INPUTS: dict[str, tuple[str, ...]] = {
         "covariates",
         "categorical",
         "moderators",
+        "comparators",
+        "comparators_primary",
         "mode",
         "date_column",
         "entity_column",
@@ -623,7 +625,15 @@ def _fusion_inputs(raw: dict, settings: dict, base: Path) -> dict:
         raise RunFileError(f"'band' must be a band number from 1, not {band!r}.")
     out.update({"layer": layer, "band": band})
 
-    lists = ("outcomes", "negative_controls", "covariates", "categorical", "moderators")
+    lists = (
+        "outcomes",
+        "negative_controls",
+        "covariates",
+        "categorical",
+        "moderators",
+        "comparators",
+        "comparators_primary",
+    )
     for key in lists:
         out[key] = _strings(raw.get(key) or [], key)
     cats = set(out["categorical"])
@@ -631,6 +641,17 @@ def _fusion_inputs(raw: dict, settings: dict, base: Path) -> dict:
     clash = sorted(set(out["outcomes"]) & set(out["negative_controls"]))
     if clash:
         raise RunFileError(f"A column cannot be an outcome and a control: {clash}.")
+    for role, key in (
+        ("an outcome", "outcomes"),
+        ("a covariate", "covariates"),
+        ("a negative control", "negative_controls"),
+    ):
+        clash = sorted(set(out["comparators"]) & set(out[key]))
+        if clash:
+            raise RunFileError(f"A comparator cannot also be {role}: {clash}.")
+    stray = sorted(set(out["comparators_primary"]) - set(out["comparators"]))
+    if stray:
+        raise RunFileError(f"'comparators_primary' names non-comparators: {stray}.")
 
     for key in ("date_column", "entity_column", "wave_column", "area_column"):
         value = raw.get(key)

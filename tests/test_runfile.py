@@ -230,6 +230,25 @@ class RefusalTests(_Case):
         no_gvi = PIPELINE.replace('gvi = "@gvi.city"\n', "")
         self.assert_refused(no_gvi, "'gvi' is required")
 
+    def test_comparators_are_kept_apart_from_the_other_columns(self):
+        with_cmp = PIPELINE.replace(
+            'covariates = ["age"]',
+            'covariates = ["age"]\ncomparators = ["ndvi_500m", "ndvi_1km"]',
+        )
+        step = self.load(with_cmp).step("fusion.cesd")
+        self.assertEqual(step.inputs["comparators"], ["ndvi_500m", "ndvi_1km"])
+        self.assertEqual(step.inputs["comparators_primary"], [])
+        for clash, role in (("age", "covariate"), ("cesd", "outcome")):
+            self.assert_refused(
+                with_cmp.replace('"ndvi_1km"]', f'"{clash}"]'),
+                rf"{role}: \['{clash}'\]",
+            )
+        primary = with_cmp.replace(
+            'outcomes = ["cesd"]',
+            'outcomes = ["cesd"]\ncomparators_primary = ["ndvi_250m"]',
+        )
+        self.assert_refused(primary, r"non-comparators: \['ndvi_250m'\]")
+
     def test_gvi_column_mode_needs_its_column(self):
         blank = ["gvi.city.year_column=''"]
         self.assert_refused(PIPELINE, "needs 'year_column'", blank)

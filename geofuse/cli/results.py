@@ -165,6 +165,26 @@ def summary(label: str, bundle: dict, artifacts: Path) -> list[str]:
         lines.append(
             f"  CGI − {name:<10} {diff:+.4f}  {_interval(d)}  {p_text}".rstrip()
         )
+    comparators = bundle.get("comparators") or {}
+    if comparators:
+        lines.append("  Comparators      held-out score, then CGI − comparator")
+    for row in bundle.get("cgi_vs_comparator_paired") or []:
+        name = row.get("comparator")
+        test = (comparators.get(name) or {}).get("test") or {}
+        score, diff = _num(test.get("score")), _num(row.get("observed_diff"))
+        p = _num(row.get("p_value_holm"))
+        if row.get("descriptive"):
+            p_text = "descriptive"
+        elif p is not None:
+            p_text = f"Holm p={p:.3g}"
+        else:
+            p_text = ""
+        lines.append(
+            f"    {name:<15}"
+            + (f"{score:.4f}" if score is not None else "—")
+            + (f"  {diff:+.4f}  {_interval(row)}" if diff is not None else "")
+            + (f"  {p_text}" if p_text else "")
+        )
     aic = bundle.get("cgi_vs_standalone_aic_bic") or {}
     if aic.get("ok"):
         best = _CHANNELS.get(aic.get("best_channel"), aic.get("best_channel"))

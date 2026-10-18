@@ -451,6 +451,8 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "categorical_missing",
     "moderator_columns",
     "negative_controls",
+    "comparators",
+    "comparators_primary",
     "exposure_iqr",
     "standalone_channels",
     "longitudinal_spec_payload",
@@ -619,6 +621,10 @@ def _seed_fusion_form(p: dict) -> None:
     )
     st.session_state["fusion_negative_controls"] = list(
         p.get("negative_controls") or []
+    )
+    st.session_state["fusion_comparators"] = list(p.get("comparators") or [])
+    st.session_state["fusion_comparators_primary"] = list(
+        p.get("comparators_primary") or []
     )
     st.session_state["fusion_exposure_iqr"] = float(p.get("exposure_iqr") or 0.0)
 
@@ -2518,6 +2524,78 @@ def _covariate_missing_caption(report: dict | None) -> str | None:
             else ""
         )
     )
+
+
+def _comparator_rows(results_view: dict) -> list[dict]:
+    """One table row per exposure: the CGI, then each comparator."""
+    comparators = results_view.get("comparators") or {}
+    paired = {
+        r.get("comparator"): r
+        for r in results_view.get("cgi_vs_comparator_paired") or []
+    }
+    sources = [("CGI", None, results_view.get("comparator_reference") or {})]
+    sources += [(name, c, c) for name, c in comparators.items()]
+    rows = []
+    for name, c, block in sources:
+        test = block.get("test") or {}
+        row = {
+            "Exposure": name,
+            "Primary": "" if c is None else ("yes" if c.get("primary") else "no"),
+            "Held-out score": _fmt(test.get("score")),
+            "95% CI": f"[{_fmt(test.get('lower'))}, {_fmt(test.get('upper'))}]",
+            "p": _fmt(test.get("p_value"), 4),
+            "n": test.get("n"),
+            "β per SD": _fmt(test.get("beta")),
+        }
+        p = paired.get(name) or {}
+        row["CGI − comparator"] = "" if c is None else _fmt(p.get("observed_diff"))
+        row["Δ 95% CI"] = (
+            "" if c is None else f"[{_fmt(p.get('lower'))}, {_fmt(p.get('upper'))}]"
+        )
+        row["Δ p"] = "" if c is None else _fmt(p.get("p_value"), 4)
+        if c is None:
+            row["Holm p"] = ""
+        elif p.get("descriptive"):
+            row["Holm p"] = "descriptive"
+        else:
+            row["Holm p"] = _fmt(p.get("p_value_holm"), 4)
+        rows.append(row)
+    return rows
+
+
+def _render_comparators(results_view: dict, metric_name: str) -> None:
+    """The comparator exposures next to the CGI, on the same held-out rows."""
+    comparators = results_view.get("comparators") or {}
+    if not comparators:
+        return
+    st.divider()
+    st.markdown("**CGI vs comparator exposures**")
+    st.caption(
+        f"Each comparator is an existing exposure column, never tuned, scored in "
+        f"{metric_name} on the composite's own held-out entities with the same "
+        "covariates. The paired difference is positive when the composite scores "
+        "higher; its Holm correction runs over the primary comparators only, and "
+        "the others are descriptive. β is the covariate-adjusted slope in SD units."
+    )
+    st.dataframe(pd.DataFrame(_comparator_rows(results_view)), width="stretch")
+    failed = [n for n, c in comparators.items() if c.get("status") != "ok"]
+    if failed:
+        st.caption(
+            "Not scored: "
+            + ", ".join(f"`{n}`" for n in failed)
+            + " (see the job log)."
+        )
+    flagged = [
+        n
+        for n, c in comparators.items()
+        if (c.get("negative_controls") or {}).get("nonspecific")
+    ]
+    if flagged:
+        st.caption(
+            ":orange[Non-specific on a negative control:] "
+            + ", ".join(f"`{n}`" for n in flagged)
+            + " — the control's association cannot be told apart from the target's."
+        )
 
 
 def _render_collinearity_report(results_view: dict) -> None:
@@ -4974,6 +5052,9 @@ def _render_fusion_results_body(output_dir: str) -> None:
     # ── Cross-study comparison (CGI vs standalones) ─────────────
     _render_cross_study_comparison(results_view, metric_name)
 
+    # ── Comparator exposures ────────────────────────────────────
+    _render_comparators(results_view, metric_name)
+
     # ── Channel collinearity report ─────────────────────────────
     _render_collinearity_report(results_view)
 
@@ -5369,6 +5450,47 @@ def render(output_dir: str) -> None:
                                     "Cross-sectional runs only."
                                 ),
                             )
+                        taken = set(target_outcome_columns) | set(
+                            (st.session_state.get("fusion_negative_controls") or [])
+                            + (st.session_state.get("fusion_covariate_columns") or [])
+                            + (
+                                st.session_state.get("fusion_covariate_categorical")
+                                or []
+                            )
+                        )
+                        cmp_options = [c for c in numeric_cols if c not in taken]
+                        if target_outcome_columns and cmp_options:
+                            _keep_valid("fusion_comparators", cmp_options, multi=True)
+                            st.multiselect(
+                                "Comparator exposures",
+                                options=cmp_options,
+                                key="fusion_comparators",
+                                help=(
+                                    "Existing exposure columns to benchmark the "
+                                    "composite against; never tuned. Each is "
+                                    "scored on the composite's own held-out "
+                                    "entities, covariates and objective, with a "
+                                    "paired composite-vs-comparator test. "
+                                    "Cross-sectional runs only."
+                                ),
+                            )
+                        picked_cmps = list(
+                            st.session_state.get("fusion_comparators") or []
+                        )
+                        if picked_cmps:
+                            _keep_valid(
+                                "fusion_comparators_primary", picked_cmps, multi=True
+                            )
+                            st.multiselect(
+                                "Primary comparators",
+                                options=picked_cmps,
+                                key="fusion_comparators_primary",
+                                help=(
+                                    "The pre-specified comparators the paired "
+                                    "tests' Holm correction runs over; the others "
+                                    "are reported as descriptive. Empty = all."
+                                ),
+                            )
                         if len(target_outcome_columns) > 1:
                             _default("fusion_multi_objective_run", False)
                             multi_objective_requested = st.checkbox(
@@ -5561,6 +5683,24 @@ def render(output_dir: str) -> None:
         if is_vector_target
         else []
     )
+    # Comparators, also picked in the target section. One that has since become
+    # an outcome, a covariate or a control is refused at submit.
+    comparators_param = (
+        list(st.session_state.get("fusion_comparators") or [])
+        if is_vector_target
+        else []
+    )
+    comparators_primary_param = [
+        c
+        for c in (st.session_state.get("fusion_comparators_primary") or [])
+        if c in comparators_param
+    ] or None
+    taken_cols = {
+        *target_outcome_columns,
+        *(covariate_columns or []),
+        *negative_controls_param,
+    }
+    comparator_clash = sorted(c for c in comparators_param if c in taken_cols)
     exposure_iqr_param = study_state.get("exposure_iqr")
     objective_metric = study_state["objective_metric"]
     test_size = study_state["test_size"]
@@ -5676,6 +5816,11 @@ def render(output_dir: str) -> None:
         elif not metric_state["coverage_complete"]:
             for _err in metric_state["coverage_errors"]:
                 st.error(f"❌ {_err}")
+        elif comparator_clash:
+            st.error(
+                "❌ A comparator cannot also be an outcome, a covariate or a "
+                "negative control: " + ", ".join(f"`{c}`" for c in comparator_clash)
+            )
         else:
             # ── Build LongitudinalSpec (or None) ────────
             from geofuse.longitudinal import LongitudinalSpec as _LonSpec
@@ -5903,6 +6048,19 @@ def render(output_dir: str) -> None:
                         "**Negative controls:** "
                         + ", ".join(f"`{c}`" for c in negative_controls_param)
                     )
+                if comparators_param:
+                    st.write(
+                        "**Comparators:** "
+                        + ", ".join(
+                            f"`{c}`"
+                            + (
+                                " (primary)"
+                                if c in (comparators_primary_param or comparators_param)
+                                else ""
+                            )
+                            for c in comparators_param
+                        )
+                    )
                 st.write(f"**Extent padding (m):** {buffer_extent_m}")
                 st.write(
                     f"**Discovery:** {channel_set_param}, form "
@@ -5969,6 +6127,8 @@ def render(output_dir: str) -> None:
                 "categorical_missing": categorical_missing_param,
                 "moderator_columns": list(moderator_columns_param),
                 "negative_controls": negative_controls_param,
+                "comparators": comparators_param,
+                "comparators_primary": comparators_primary_param,
                 "exposure_iqr": (
                     float(exposure_iqr_param) if exposure_iqr_param else None
                 ),

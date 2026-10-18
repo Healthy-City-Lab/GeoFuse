@@ -472,6 +472,7 @@ def _expand_fusion(step: _rf.Step, by_step: dict[str, list[JobSpec]]) -> list[Jo
             for c in (
                 i["outcomes"]
                 + i["negative_controls"]
+                + i["comparators"]
                 + i["covariates"]
                 + i["moderators"]
                 + [
@@ -923,6 +924,12 @@ def fusion_run_config(spec: JobSpec) -> dict[str, Any]:
         "categorical_missing": s["categorical_missing"],
         "moderator_columns": list(o["moderators"]),
         "negative_controls": controls if vector else [],
+        "comparators": list(o["comparators"]) if vector else [],
+        "comparators_primary": (
+            list(o["comparators_primary"])
+            if vector and o["comparators_primary"]
+            else None
+        ),
         "exposure_iqr": s["exposure_iqr"],
         "standalone_channels": (
             list(_settings.CHANNEL_SETS[s["channel_set"]])
