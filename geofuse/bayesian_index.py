@@ -49,6 +49,7 @@ import math
 import os
 import re
 import tempfile
+import time
 import weakref
 from dataclasses import dataclass, field
 
@@ -224,7 +225,7 @@ def _indexed(position: int, fn, task):
     return position, fn(task)
 
 
-def _map(fn, tasks, n_workers: int, cancel_check=None):
+def _map(fn, tasks, n_workers: int, cancel_check=None, progress=None):
     """``fn`` over ``tasks``, in a process pool unless one worker was asked for.
 
     A single worker runs in-process. Spawning costs more than it saves at that
@@ -238,6 +239,8 @@ def _map(fn, tasks, n_workers: int, cancel_check=None):
     it is the figure :func:`parallel.process_worker_count` budgets against: a
     pool built any other way overdraws the host by more than an order of
     magnitude, and small allocations then fail machine-wide.
+
+    ``progress(done, total)`` is called after every finished task.
     """
     tasks = list(tasks)
     n_workers = min(n_workers, len(tasks))
@@ -246,12 +249,18 @@ def _map(fn, tasks, n_workers: int, cancel_check=None):
         for t in tasks:
             _raise_if_cancelled(cancel_check)
             out.append(fn(t))
+            if progress is not None:
+                progress(len(out), len(tasks))
         return out
     out: list = [None] * len(tasks)
+    done = [0]
 
     def collect(result):
         position, value = result
         out[position] = value
+        done[0] += 1
+        if progress is not None:
+            progress(done[0], len(tasks))
 
     finished = parallel.map_batches(
         _indexed,
@@ -1086,6 +1095,8 @@ class IndexPosterior:
     radius_prior: str = "rungs"
     rung_sd: np.ndarray | None = None  # (nC, nR), SD prep divided by
     rung_area: np.ndarray | None = None  # (nC, nR), None means r²
+    # The fit's adapted sampler (warm_start_from), for refits to start from.
+    warm_start: dict | None = None
 
     def weight_labels(self) -> list[str]:
         """One label per weight, so the interactions are not read as channels.
@@ -1297,6 +1308,88 @@ def reserve_host_devices(n: int) -> None:
         numpyro.set_host_device_count(int(n))
 
 
+# How ``fit`` evaluates the likelihood: ``auto`` uses the exposure columns'
+# cross-products wherever that is exact (the linear form without a per-entity
+# intercept), ``rows`` always sums over the rows.
+LIKELIHOODS = ("auto", "rows")
+# Warm-up of a null refit that starts from the main fit's adapted sampler. A
+# permuted outcome leaves the radius kernel without signal, so the refit still
+# re-adapts its mass matrix; it saves the cold start's long search for a step
+# size and a typical set.
+NULL_WARMUP_WARM = 150
+
+
+def _masked_grid(E, radius_mask=None) -> np.ndarray:
+    """``E`` as ``fit`` reads it: a whole grid's off-ladder cells set to zero."""
+    E = np.asarray(E, dtype=np.float64)
+    if E.ndim != 4:
+        return E
+    nc, nr = E.shape[1], E.shape[2]
+    mask = (
+        np.ones((nc, nr), dtype=bool)
+        if radius_mask is None
+        else np.asarray(radius_mask, dtype=bool)
+    )
+    return np.where(mask[None, :, :, None], np.nan_to_num(E), 0.0)
+
+
+def linear_cross_products(E, y, radius_mask=None) -> dict:
+    """What the linear form's likelihood needs from the data, computed once.
+
+    Every channel contraction is a weighted sum of exposure columns, and the
+    Gaussian likelihood of the standardised index depends on the rows only
+    through the columns' centred cross-products ``S`` and their centred
+    products with the outcome ``cy``, plus ``y'y``. These replace the ``n`` rows
+    exactly, so a gradient costs the same at any ``n``. ``Xc`` (the centred
+    columns) is kept for callers that score permuted outcomes; :func:`fit`
+    never reads it.
+    """
+    E = _masked_grid(E, radius_mask)
+    n = E.shape[0]
+    Xc = E.reshape(n, -1)
+    Xc = Xc - Xc.mean(axis=0)
+    y = np.asarray(y, dtype=np.float64)
+    return {
+        "shape": tuple(E.shape),
+        "S": Xc.T @ Xc,
+        "cy": Xc.T @ y,
+        "yy": float(y @ y),
+        "Xc": Xc,
+    }
+
+
+def warm_start_from(mcmc, *, warmup: int = NULL_WARMUP_WARM) -> dict:
+    """The adapted sampler of a fitted :func:`fit`, to start a refit from.
+
+    The step size (median over chains), the diagonal inverse mass matrix
+    (averaged over chains) and the posterior mean of every sampled site; a
+    refit given this to ``warm_start`` starts there and re-adapts over a short
+    ``warmup`` instead of a full one.
+    """
+    adapt = mcmc.last_state.adapt_state
+    step = np.asarray(adapt.step_size, dtype=np.float64).reshape(-1)
+    chained = step.size > 1
+    imm = {
+        key: np.asarray(value, dtype=np.float64)
+        for key, value in adapt.inverse_mass_matrix.items()
+    }
+    if chained:
+        imm = {key: value.mean(axis=0) for key, value in imm.items()}
+    sites = {name for key in imm for name in key}
+    init = {
+        name: np.asarray(value, dtype=np.float64).mean(axis=0)
+        for name, value in mcmc.get_samples().items()
+        if name in sites
+    }
+    return {
+        "step_size": float(np.median(step)),
+        "inverse_mass_matrix": imm,
+        "init": init,
+        "warmup": int(warmup),
+        "adapt_mass_matrix": True,
+    }
+
+
 def panel_entities(entities, *, warn: bool = True):
     """``entities`` when some entity holds several rows, else ``None``.
 
@@ -1334,6 +1427,9 @@ def fit(
     entities=None,
     design=None,
     design_channels=None,
+    likelihood="auto",
+    cross_products=None,
+    warm_start=None,
 ):
     """NUTS over every unknown the index has: scale, aggregation, weights, form.
 
@@ -1376,6 +1472,15 @@ def fit(
     (:class:`SynergyDesign`) with ``design_channels``, the tensor channels of
     ``E``: its interactions are formed per cell from the raw channel values
     blended by the same kernel and aggregator (:func:`interaction_columns`).
+
+    ``likelihood="auto"`` evaluates the linear form without a per-entity
+    intercept from the columns' cross-products (:func:`linear_cross_products`,
+    or ``cross_products`` when given, in which case ``E`` and ``y`` may be
+    ``None``): the identical log-likelihood at a cost independent of ``n``.
+    ``"rows"`` sums over the rows, as synergy and panels always do.
+    ``warm_start`` (:func:`warm_start_from`) starts the sampler from another
+    fit's adapted step size, mass matrix and posterior mean, re-adapting over
+    the warm start's shorter ``warmup``.
     """
     # Before the first JAX operation below, which fixes the device count.
     reserve_host_devices(chains)
@@ -1383,8 +1488,10 @@ def fit(
     import jax.numpy as jnp
     import numpyro
     import numpyro.distributions as dist
-    from numpyro.infer import MCMC, NUTS
+    from numpyro.infer import MCMC, NUTS, init_to_value
 
+    if likelihood not in LIKELIHOODS:
+        raise ValueError(f"likelihood must be one of {LIKELIHOODS}.")
     codes = counts = None
     entities = panel_entities(entities)
     if entities is not None:
@@ -1393,15 +1500,24 @@ def fit(
         codes = jnp.asarray(ent)
         counts = jnp.asarray(np.bincount(ent, minlength=n_groups).astype(np.float64))
 
-    E = np.asarray(E, dtype=np.float64)
-    joint = E.ndim == 4
-    nc = E.shape[1]
+    if E is None:
+        if cross_products is None:
+            raise ValueError("fit needs E, or cross_products in its place.")
+        shape = tuple(cross_products["shape"])
+    else:
+        E = np.asarray(E, dtype=np.float64)
+        shape = E.shape
+    joint = len(shape) == 4
+    nc = shape[1]
     nterm = len(synergy_combos(nc)) if form == "synergy" else 0
     if nterm and (not joint or design is None):
         raise ValueError("The synergy form needs the whole grid and a SynergyDesign.")
+    sufficient = likelihood == "auto" and not nterm and codes is None
+    if cross_products is not None and not sufficient:
+        raise ValueError("cross_products serve the linear form without entities.")
 
     if joint:
-        nr, ns = E.shape[2], E.shape[3]
+        nr, ns = shape[2], shape[3]
         if radii is None or len(radii) != nr:
             raise ValueError("A (n, channel, radius, stat) grid needs `radii`.")
         mask = (
@@ -1412,7 +1528,8 @@ def fit(
         # Off-ladder cells are NaN in the tensor. Zeroing them is only safe
         # because the mask below also zeroes their kernel weight, so they enter
         # neither the contraction nor its normaliser.
-        E = np.where(mask[None, :, :, None], np.nan_to_num(E), 0.0)
+        if E is not None:
+            E = _masked_grid(E, mask)
         if nr == 1:
             radius_kernel = "fixed"
         if radius_prior not in RADIUS_PRIORS:
@@ -1444,7 +1561,15 @@ def fit(
             num = jax.ops.segment_sum(t[cell_j] * w_j, ent_j, num_segments=len(E))
             return num / den_j
 
-    def contract(Ej):
+    if sufficient:
+        cp = cross_products or linear_cross_products(E, y)
+        n_rows = float(shape[0])
+        q = nr * ns if joint else 1
+        S_j = jnp.asarray(np.asarray(cp["S"]).reshape(nc, q, nc, q))
+        cy_j = jnp.asarray(np.asarray(cp["cy"]).reshape(nc, q))
+        yy = float(cp["yy"])
+
+    def kernel():
         # The kernel is built in log space and normalised by subtracting its own
         # maximum. A location far from the ladder — which the sampler visits
         # freely whenever a channel carries no signal — otherwise drives every
@@ -1482,8 +1607,43 @@ def fit(
             )
         else:
             a = jnp.ones((nc, ns)) / ns
+        return k, a
+
+    def contract(Ej):
+        k, a = kernel()
         v = jnp.einsum("ncrs,cr,cs->nc", Ej, k, a)
         return (v - v.mean(0)) / jnp.maximum(v.std(0), 1e-9), k, a
+
+    def model_sufficient(_E, _y):
+        # The row model below, term for term, from the cross-products: each
+        # channel's contraction is u_c'x with u_c = k_c ⊗ a_c, so its variance
+        # and covariances are u'Su / n and its product with y is u'cy.
+        if joint:
+            k, a = kernel()
+            u = (k[:, :, None] * a[:, None, :]).reshape(nc, q)
+            M = jnp.einsum("cq,cqdr,dr->cd", u, S_j, u)
+            cyv = jnp.einsum("cq,cq->c", u, cy_j)
+            sd = jnp.maximum(jnp.sqrt(jnp.maximum(jnp.diag(M), 0.0) / n_rows), 1e-9)
+            M = M / (sd[:, None] * sd[None, :])
+            cyv = cyv / sd
+        else:
+            M, cyv = S_j[:, 0, :, 0], cy_j[:, 0]
+        w = numpyro.sample("w", dist.Dirichlet(jnp.ones(nc)))
+        see_raw = jnp.maximum(w @ M @ w, 0.0)
+        sd_e = jnp.maximum(jnp.sqrt(see_raw / n_rows), 1e-9)
+        see = see_raw / sd_e**2  # sum of e² of the standardised index
+        sye = (w @ cyv) / sd_e  # sum of y·e
+        beta = numpyro.sample("beta", dist.Normal(0.0, 1.0))
+        sigma = numpyro.sample("sigma", dist.HalfNormal(2.0))
+        # sum of (y - beta e)², written so float32 keeps its precision.
+        fit_part = sye**2 / jnp.maximum(see, 1e-12)
+        rss = (yy - fit_part) + see * (beta - sye / jnp.maximum(see, 1e-12)) ** 2
+        numpyro.factor(
+            "obs",
+            -n_rows * jnp.log(sigma)
+            - 0.5 * n_rows * math.log(2.0 * math.pi)
+            - rss / (2.0 * sigma**2),
+        )
 
     def model(Ej, yj):
         v, k, a = contract(Ej) if joint else (Ej, None, None)
@@ -1530,8 +1690,17 @@ def fit(
     # A channel with no signal leaves its kernel location flat under the prior,
     # and the sampler has to traverse that ridge without stepping off it, so the
     # joint model runs at a shorter step than the fixed-column one.
+    nuts_kw: dict = {"target_accept_prob": 0.95 if joint else 0.9}
+    if warm_start:
+        nuts_kw.update(
+            step_size=float(warm_start["step_size"]),
+            inverse_mass_matrix=warm_start["inverse_mass_matrix"],
+            adapt_mass_matrix=bool(warm_start.get("adapt_mass_matrix", False)),
+            init_strategy=init_to_value(values=warm_start["init"]),
+        )
+        warmup = int(warm_start.get("warmup", NULL_WARMUP_WARM))
     mcmc = MCMC(
-        NUTS(model, target_accept_prob=0.95 if joint else 0.9),
+        NUTS(model_sufficient if sufficient else model, **nuts_kw),
         num_warmup=warmup,
         num_samples=draws,
         num_chains=chains,
@@ -1540,8 +1709,8 @@ def fit(
     )
     mcmc.run(
         jax.random.PRNGKey(seed),
-        jnp.asarray(E),
-        jnp.asarray(y),
+        None if sufficient else jnp.asarray(E),
+        None if sufficient else jnp.asarray(y),
         extra_fields=("diverging",),
     )
     return mcmc
@@ -1710,6 +1879,7 @@ def grid_posterior(
             None if column_sd is None else rung_sd_from(column_sd, channel_index, stats)
         ),
     )
+    post.warm_start = warm_start_from(mcmc)
     return post, grid, grid_kwargs
 
 
@@ -2057,7 +2227,8 @@ def _null_fit(task):
     The joint model is handed the whole grid, which is orders of magnitude
     larger than a column per channel; sending a copy to each of n workers is
     what exhausts the pipe rather than the fitting. With a form choice attached,
-    the form is re-chosen on the permuted outcome before the refit.
+    the form is re-chosen on the permuted outcome before the refit; a warm
+    start is used only when that form is the main fit's, whose sampler it is.
     """
     path, shape, y, form, seed, kwargs, choice, panel = task
     E = np.asarray(np.memmap(path, dtype=np.float64, mode="r", shape=shape))
@@ -2068,8 +2239,37 @@ def _null_fit(task):
             f: np.asarray(np.memmap(p, dtype=np.float64, mode="r", shape=sh))
             for f, p, sh in choice
         }
-        form, _ = choose_form(Ef, yp, seed=seed + _FORM_SEED_OFFSET, groups=groups)
+        chosen, _ = choose_form(Ef, yp, seed=seed + _FORM_SEED_OFFSET, groups=groups)
+        if chosen != form:
+            kwargs = {k: v for k, v in kwargs.items() if k != "warm_start"}
+        form = chosen
     m = fit(E, yp, form=form, draws=300, warmup=300, chains=2, seed=seed, **kwargs)
+    b = np.asarray(m.get_samples()["beta"])
+    lo, hi = np.percentile(b, [2.5, 97.5])
+    return int(lo > 0 or hi < 0), form
+
+
+def _null_fit_linear(task):
+    """One permuted refit of the linear form from its cross-products.
+
+    The permuted outcome changes only ``X'y`` (and nothing in ``y'y``), which
+    the caller computes; the cross-product matrix is read from a memmap, so the
+    exposure tensor never reaches the worker.
+    """
+    path, p, shape, cy, yy, form, seed, kwargs = task
+    S = np.asarray(np.memmap(path, dtype=np.float64, mode="r", shape=(p, p)))
+    cross = {"shape": shape, "S": S, "cy": cy, "yy": yy}
+    m = fit(
+        None,
+        None,
+        form=form,
+        draws=300,
+        warmup=300,
+        chains=2,
+        seed=seed,
+        cross_products=cross,
+        **kwargs,
+    )
     b = np.asarray(m.get_samples()["beta"])
     lo, hi = np.percentile(b, [2.5, 97.5])
     return int(lo > 0 or hi < 0), form
@@ -2124,6 +2324,7 @@ def null_calibration(
     groups=None,
     entities=None,
     waves=None,
+    warm_start=None,
     **fit_kwargs,
 ):
     """How often the beta interval excludes zero on a permuted outcome (~5 %).
@@ -2151,33 +2352,89 @@ def null_calibration(
 
     One fit per process: numpyro recompiles per call, so a serial loop pays the
     JAX compile n times over.
+
+    The linear form without a per-entity intercept and without form re-choice
+    refits from the columns' cross-products (:func:`linear_cross_products`),
+    computed once: each task carries only its permuted ``X'y``. ``warm_start``
+    (the main fit's :func:`warm_start_from`) starts every refit from the main
+    fit's adapted sampler with a short warm-up. A progress line is logged
+    about every tenth of the refits.
     """
     E = np.ascontiguousarray(np.asarray(E, dtype=np.float64))
     if reselect_form and not form_E:
         raise ValueError("reselect_form needs form_E, each form's columns.")
+    entities = panel_entities(entities, warn=False)
+    sufficient = (
+        form == "linear"
+        and not reselect_form
+        and entities is None
+        and fit_kwargs.get("likelihood", "auto") == "auto"
+    )
+    started = time.perf_counter()
+    every = max(1, n // 10)
+
+    def progress(done: int, total: int) -> None:
+        if done % every and done != total:
+            return
+        elapsed = time.perf_counter() - started
+        logger.info(
+            "Null calibration: %d / %d refits (%.0f s, ~%.0f s left).",
+            done,
+            total,
+            elapsed,
+            elapsed / done * (total - done),
+        )
+
     paths = []
     try:
-        paths.append(_write_memmap(E, ".geofuse-null"))
-        choice = None
-        if reselect_form:
-            choice = []
-            for f, cols in form_E.items():
-                Ef = np.ascontiguousarray(np.asarray(cols, dtype=np.float64))
-                paths.append(_write_memmap(Ef, ".geofuse-null-form"))
-                choice.append((f, paths[-1], Ef.shape))
-        entities = panel_entities(entities, warn=False)
-        panel = (groups, entities, waves)
-        kwargs = dict(fit_kwargs, entities=entities)
-        tasks = [
-            (paths[0], E.shape, y, form, 3_000 + i, kwargs, choice, panel)
-            for i in range(n)
-        ]
         n_workers = workers or min(n, parallel.process_worker_count(n))
-        results = _map(_null_fit, tasks, n_workers, cancel_check)
+        if sufficient:
+            cross = linear_cross_products(E, y, fit_kwargs.get("radius_mask"))
+            paths.append(_write_memmap(cross["S"], ".geofuse-null-cross"))
+            kwargs = {
+                k: v
+                for k, v in fit_kwargs.items()
+                if k not in ("design", "design_channels")
+            }
+            kwargs.update(entities=None, warm_start=warm_start)
+            p = cross["S"].shape[0]
+            tasks = []
+            for i in range(n):
+                yp = _permuted(y, 3_000 + i)
+                tasks.append(
+                    (
+                        paths[0],
+                        p,
+                        cross["shape"],
+                        cross["Xc"].T @ yp,
+                        float(yp @ yp),
+                        form,
+                        3_000 + i,
+                        kwargs,
+                    )
+                )
+            del cross
+            results = _map(_null_fit_linear, tasks, n_workers, cancel_check, progress)
+        else:
+            paths.append(_write_memmap(E, ".geofuse-null"))
+            choice = None
+            if reselect_form:
+                choice = []
+                for f, cols in form_E.items():
+                    Ef = np.ascontiguousarray(np.asarray(cols, dtype=np.float64))
+                    paths.append(_write_memmap(Ef, ".geofuse-null-form"))
+                    choice.append((f, paths[-1], Ef.shape))
+            panel = (groups, entities, waves)
+            kwargs = dict(fit_kwargs, entities=entities, warm_start=warm_start)
+            tasks = [
+                (paths[0], E.shape, y, form, 3_000 + i, kwargs, choice, panel)
+                for i in range(n)
+            ]
+            results = _map(_null_fit, tasks, n_workers, cancel_check, progress)
     finally:
-        for p in paths:
+        for path in paths:
             try:
-                os.unlink(p)
+                os.unlink(path)
             except OSError:
                 pass
 
@@ -2191,6 +2448,17 @@ def null_calibration(
         "rate_ci_high": hi,
         "imprecise": n < NULL_RUNS_FOR_CLAIM,
         "reselect_form": bool(reselect_form),
+        "likelihood": "cross_products" if sufficient else "rows",
+        "warm_start": (
+            {
+                "warmup": int(warm_start.get("warmup", NULL_WARMUP_WARM)),
+                "step_size": float(warm_start["step_size"]),
+                "adapt_mass_matrix": bool(warm_start.get("adapt_mass_matrix")),
+            }
+            if warm_start
+            else None
+        ),
+        "elapsed_s": float(time.perf_counter() - started),
     }
     if reselect_form:
         out["form_counts"] = {f: sum(fm == f for _, fm in results) for f in form_E}

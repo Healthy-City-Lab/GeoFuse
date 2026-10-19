@@ -1353,7 +1353,7 @@ class TestPanelPosterior(unittest.TestCase):
         E = rng.normal(size=(n, 2))
         y = 0.3 * E[:, 0] + rng.normal(size=n)
         y = (y - y.mean()) / y.std()
-        kw = dict(form="linear", draws=300, warmup=300, chains=2, seed=1)
+        kw = dict(form="linear", draws=800, warmup=600, chains=2, seed=1)
         plain = bi.fit(E, y, **kw)
         with self.assertLogs("geofuse.bayesian_index", "WARNING"):
             single = bi.fit(E, y, entities=np.arange(n).astype(str), **kw)
@@ -1431,6 +1431,197 @@ class TestGroupedInnerSplits(unittest.TestCase):
             groups=groups,
         )
         self.assertEqual(res.picked[0], (300, "mean"))
+
+
+def _linear_grid(n, seed=1, effect=0.15):
+    rng = np.random.default_rng(seed)
+    E = rng.normal(size=(n, 2, 4, 3))
+    E = np.cumsum(E, axis=2) / np.sqrt(np.arange(1, 5))[None, None, :, None]
+    y = effect * E[:, 0, 1, 0] + rng.normal(size=n)
+    return E, (y - y.mean()) / y.std()
+
+
+_GRID = dict(radii=[100, 200, 300, 400], stats=("a", "b", "c"))
+
+
+class TestCrossProductLikelihood(unittest.TestCase):
+    """The linear form's likelihood from the columns' cross-products.
+
+    It is the row likelihood term for term, so the posterior is the same; the
+    draws themselves differ, since float32 sums in another order send the
+    trajectories apart, so the comparison is on posterior summaries.
+    """
+
+    def _close(self, a, b, key):
+        sa, sb = np.asarray(a[key]), np.asarray(b[key])
+        sd = np.maximum(sa.std(axis=0), 1e-6)
+        self.assertTrue(
+            np.all(np.abs(sa.mean(axis=0) - sb.mean(axis=0)) < 0.3 * sd), key
+        )
+
+    def test_the_grid_posterior_is_the_row_posterior(self):
+        E, y = _linear_grid(3000)
+        kw = dict(_GRID, draws=400, warmup=400, chains=2, seed=3)
+        rows = bi.fit(E, y, likelihood="rows", **kw).get_samples()
+        cross = bi.fit(E, y, **kw).get_samples()
+        for key in ("beta", "w", "mu", "a", "sigma"):
+            self._close(rows, cross, key)
+        for q in (2.5, 97.5):
+            self.assertAlmostEqual(
+                np.percentile(rows["beta"], q), np.percentile(cross["beta"], q), 2
+            )
+
+    def test_fixed_columns_too(self):
+        E, y = _linear_grid(3000)
+        X = E[:, :, 1, 0]
+        kw = dict(draws=400, warmup=400, chains=2, seed=3)
+        rows = bi.fit(X, y, likelihood="rows", **kw).get_samples()
+        cross = bi.fit(X, y, **kw).get_samples()
+        for key in ("beta", "w", "sigma"):
+            self._close(rows, cross, key)
+
+    def test_the_cross_products_replace_the_rows(self):
+        E, y = _linear_grid(2000)
+        cross = bi.linear_cross_products(E, y)
+        self.assertEqual(cross["S"].shape, (24, 24))
+        del cross["Xc"]
+        kw = dict(_GRID, draws=200, warmup=200, chains=1, seed=5)
+        given = bi.fit(None, None, cross_products=cross, **kw).get_samples()
+        own = bi.fit(E, y, **kw).get_samples()
+        np.testing.assert_allclose(given["beta"], own["beta"], rtol=1e-5)
+
+    def test_panels_and_synergy_keep_the_row_likelihood(self):
+        E, y = _linear_grid(600)
+        ent = np.repeat(np.arange(200), 3)
+        kw = dict(_GRID, entities=ent, draws=100, warmup=100, chains=1, seed=2)
+        auto = bi.fit(E, y, **kw).get_samples()
+        rows = bi.fit(E, y, likelihood="rows", **kw).get_samples()
+        self.assertIn("sigma_u", auto)
+        np.testing.assert_array_equal(auto["beta"], rows["beta"])
+        with self.assertRaises(ValueError):
+            bi.fit(None, None, cross_products=bi.linear_cross_products(E, y), **kw)
+
+    @unittest.skipUnless(os.environ.get("GEOFUSE_SLOW_TESTS"), "timing check")
+    def test_the_cost_does_not_grow_with_n(self):
+        import time
+
+        kw = dict(_GRID, draws=300, warmup=300, chains=2, seed=1)
+        took = {}
+        for n in (2000, 20000):
+            E, y = _linear_grid(n)
+            t = time.perf_counter()
+            bi.fit(E, y, **kw)
+            took[n] = time.perf_counter() - t
+        self.assertLess(took[20000], 1.5 * took[2000])
+
+
+class TestNullRefits(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.E, cls.y = _linear_grid(3000)
+        cls.post, cls.grid, cls.kwargs = bi.grid_posterior(
+            cls.E,
+            cls.y,
+            channels=("x1", "x2"),
+            channel_index=(0, 1),
+            radius_idx=[range(4), range(4)],
+            form="linear",
+            picked=((200, "a"), (200, "a")),
+            draws=300,
+            warmup=300,
+            chains=2,
+            seed=1,
+            **_GRID,
+        )
+
+    def test_the_main_fit_hands_over_its_adapted_sampler(self):
+        warm = self.post.warm_start
+        self.assertGreater(warm["step_size"], 0.0)
+        self.assertEqual(warm["warmup"], bi.NULL_WARMUP_WARM)
+        self.assertTrue(warm["adapt_mass_matrix"])
+        self.assertEqual(set(warm["init"]), {"a", "beta", "kw", "mu", "sigma", "w"})
+        (block,) = warm["inverse_mass_matrix"].values()
+        self.assertEqual(block.ndim, 1)
+
+    def test_cross_product_refits_match_the_row_refits(self):
+        drop = ("design", "design_channels")
+        kwargs = {k: v for k, v in self.kwargs.items() if k not in drop}
+        for seed in range(3000, 3004):
+            yp = bi._permuted(self.y, seed)
+            cross = bi.linear_cross_products(self.grid, yp)
+            path = bi._write_memmap(cross["S"], ".test-cross")
+            try:
+                fast = bi._null_fit_linear(
+                    (
+                        path,
+                        cross["S"].shape[0],
+                        cross["shape"],
+                        cross["cy"],
+                        cross["yy"],
+                        "linear",
+                        seed,
+                        kwargs,
+                    )
+                )
+            finally:
+                os.unlink(path)
+            path = bi._write_memmap(self.grid, ".test-grid")
+            try:
+                slow = bi._null_fit(
+                    (
+                        path,
+                        self.grid.shape,
+                        self.y,
+                        "linear",
+                        seed,
+                        dict(kwargs, likelihood="rows"),
+                        None,
+                        (None, None, None),
+                    )
+                )
+            finally:
+                os.unlink(path)
+            self.assertEqual(fast, slow, seed)
+
+    def test_the_calibration_records_how_it_refitted_and_logs_progress(self):
+        with self.assertLogs("geofuse.bayesian_index", "INFO") as logs:
+            out = bi.null_calibration(
+                self.grid,
+                self.y,
+                form="linear",
+                n=4,
+                workers=1,
+                warm_start=self.post.warm_start,
+                **self.kwargs,
+            )
+        self.assertEqual(out["likelihood"], "cross_products")
+        self.assertEqual(out["warm_start"]["warmup"], bi.NULL_WARMUP_WARM)
+        self.assertGreater(out["elapsed_s"], 0.0)
+        self.assertTrue(any("4 / 4 refits" in m for m in logs.output), logs.output)
+
+    def test_a_warm_refit_mixes_like_a_cold_one(self):
+        drop = ("design", "design_channels")
+        kwargs = {k: v for k, v in self.kwargs.items() if k not in drop}
+        yp = bi._permuted(self.y, 3005)
+        kw = dict(kwargs, draws=300, warmup=300, chains=4, seed=3005)
+        summaries = {}
+        warm = {"warm_start": self.post.warm_start}
+        for label, extra in (("cold", {}), ("warm", warm)):
+            m = bi.fit(self.grid, yp, **kw, **extra)
+            post = bi.posterior_from(
+                m,
+                channels=("x1", "x2"),
+                picked=((200, "a"), (200, "a")),
+                form="linear",
+                radius_kernel="lognormal",
+                **_GRID,
+            )
+            lo, hi = np.percentile(np.asarray(m.get_samples()["beta"]), [2.5, 97.5])
+            summaries[label] = (post.rhat_max, hi - lo)
+        self.assertLess(summaries["warm"][0], 1.05)
+        self.assertAlmostEqual(
+            summaries["warm"][1], summaries["cold"][1], delta=0.2 * summaries["cold"][1]
+        )
 
 
 # Run in a fresh interpreter: XLA fixes its CPU device count the first time a

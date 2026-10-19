@@ -3601,6 +3601,7 @@ class MetricFusionEngine:
         # the functional form.
         if cancelled():
             raise JobCancelled("Index posterior cancelled by user.")
+        t_post = time.perf_counter()
         post, grid, grid_kwargs = bayesian_index.grid_posterior(
             Xr,
             yr,
@@ -3622,6 +3623,11 @@ class MetricFusionEngine:
             entities=entities,
             design=design,
         )
+        _log(
+            "INFO",
+            f"Posterior fitted in {time.perf_counter() - t_post:.0f}s"
+            + (f"; {null_runs} warm-started null refits follow." if null_runs else "."),
+        )
         null = (
             bayesian_index.null_calibration(
                 grid,
@@ -3641,6 +3647,7 @@ class MetricFusionEngine:
                 ),
                 groups=groups,
                 waves=waves,
+                warm_start=post.warm_start,
                 **grid_kwargs,
             )
             if null_runs
