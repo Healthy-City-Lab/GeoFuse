@@ -168,6 +168,9 @@ def _load(args):
         specs = expand(run)
     except (RunFileError, PlanError, _settings.SettingError) as exc:
         raise CliError(str(exc)) from exc
+    for spec in specs:
+        for note in spec.notes:
+            print(f"warning: {spec.step}: {note}", file=sys.stderr)
     return run, _pick(args, specs)
 
 

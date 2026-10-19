@@ -75,6 +75,8 @@ class JobSpec:
     depends_on: list[str] = field(default_factory=list)
     resources: list[str] = field(default_factory=list)
     outputs: dict[str, Any] = field(default_factory=dict)
+    #: Warnings the plan raises about this job, shown before it is submitted.
+    notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -345,7 +347,12 @@ def _target_info(path: str, layer) -> dict:
         import rasterio
 
         with rasterio.open(path) as src:
-            return {"vector": False, "bands": int(src.count), "layer": None}
+            return {
+                "vector": False,
+                "bands": int(src.count),
+                "layer": None,
+                "rows": int(src.width) * int(src.height),
+            }
     import pyogrio
 
     if layer is None and path.lower().endswith((".gpkg", ".zip")):
@@ -362,6 +369,7 @@ def _target_info(path: str, layer) -> dict:
         "layer": layer,
         "fields": [str(f) for f in info["fields"]],
         "geometry_type": str(info.get("geometry_type") or ""),
+        "rows": int(info.get("features") or 0),
     }
 
 
@@ -518,6 +526,15 @@ def _expand_fusion(step: _rf.Step, by_step: dict[str, list[JobSpec]]) -> list[Jo
         "ndvi_files": channels["ndvi"],
         "gvi_files": channels["gvi"],
     }
+    notes: list[str] = []
+    size = _settings.objective_size_check(
+        step.settings["objective_metric"], info["rows"], _physical_memory()
+    )
+    if size is not None:
+        level, text = size
+        if level == "refuse" and not step.settings["allow_large_objective"]:
+            raise PlanError(f"[[fusion]] {step.name}: {text}")
+        notes.append(text)
     return [
         JobSpec(
             step=step.key,
@@ -533,8 +550,15 @@ def _expand_fusion(step: _rf.Step, by_step: dict[str, list[JobSpec]]) -> list[Jo
             depends_on=list(step.depends_on),
             resources=list(RESOURCES["fusion"]),
             outputs={"folder": os.path.join(step.output_dir, "fusion")},
+            notes=notes,
         )
     ]
+
+
+def _physical_memory() -> int:
+    from geofuse.parallel import physical_memory_bytes
+
+    return physical_memory_bytes()
 
 
 #: Cluster resource groups: GVI needs a GPU, fusion cores and memory, the

@@ -206,6 +206,40 @@ def available_memory_bytes() -> int:
         return 0
 
 
+def physical_memory_bytes() -> int:
+    """This host's installed RAM, or ``0`` when it cannot be read."""
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            class _MemoryStatus(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            status = _MemoryStatus()
+            status.dwLength = ctypes.sizeof(_MemoryStatus)
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return 0
+            return int(status.ullTotalPhys)
+        except Exception:
+            return 0
+    try:
+        import psutil
+
+        return int(psutil.virtual_memory().total)
+    except Exception:
+        return 0
+
+
 def memory_worker_cap(bytes_per_worker: int = _WORKER_COMMIT_BYTES) -> int | None:
     """How many workers this host currently has the memory to reserve.
 

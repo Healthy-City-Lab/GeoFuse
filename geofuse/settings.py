@@ -144,12 +144,14 @@ CHANNEL_SETS: dict[str, tuple[str, ...]] = {
     "ndvi + gvi": ("ndvi", "gvi"),
     "ndvi + veg + terrain": ("ndvi", "veg", "terrain"),
 }
-#: Objective metrics of a cross-sectional fusion run, first = default.
+#: Objective metrics of a cross-sectional fusion run, first = default: ``r2``
+#: for a linear association, ``spearman`` for a monotone one, the distance
+#: correlations for general dependence.
 CROSS_SECTIONAL_METRICS = (
+    "r2",
+    "spearman",
     "partial_distance_corr",
     "distance_corr",
-    "spearman",
-    "r2",
     "nrmse",
     "mutual_info",
     "quartile_contrast",
@@ -175,6 +177,14 @@ ASSOCIATION_TARGETS = ("level", "decline_overall", "decline_average", "decline_c
 SEARCH_SCORING_METHODS = ("mom_em3", "mom_em1", "mom", "exact")
 #: Spatial-confounding adjustments of the fusion objective.
 SPATIAL_ADJUST_METHODS = ("none", "ks_aic", "spatial_plus")
+#: ``geofuse.pdcor.MAX_CACHE_N``: above it ``partial_distance_corr`` leaves its
+#: shared-matrix fast path.
+PDCOR_CACHE_N = 6_000
+#: Peak bytes of one ``partial_distance_corr`` call per n²: 66 n × n float64
+#: matrices (measured 2.8 GB at n = 2,305, 13 GB at 5,000, ~53 GB at 10,000).
+PDCOR_BYTES_PER_N2 = 66 * 8
+#: Objective metrics whose memory grows with n².
+QUADRATIC_METRICS = frozenset({"partial_distance_corr"})
 #: ``geofuse.fusion.CATEGORICAL_MISSING``.
 CATEGORICAL_MISSING = ("drop", "indicator")
 
@@ -291,7 +301,12 @@ FUSION: dict[str, Setting] = {
     "objective_metric": _choice(
         CROSS_SECTIONAL_METRICS[0],
         CROSS_SECTIONAL_METRICS + LONGITUDINAL_METRICS,
-        "Score every candidate is ranked on (longitudinal runs: mixedlm_tstat).",
+        "Score candidates are ranked on, by the association expected: r2 linear, "
+        "spearman monotone, partial_distance_corr any (small samples only). "
+        "Longitudinal runs: mixedlm_tstat.",
+    ),
+    "allow_large_objective": _bool(
+        False, "Run partial_distance_corr even where it may not fit in memory."
     ),
     "test_size": Setting("float", 0.25, lo=0.1, hi=0.5, help="Held-out test fraction."),
     "n_bins": _int(5, 3, 10, "Quantile bins of the stratified split."),
@@ -417,6 +432,39 @@ def expand_shorthands(engine: str, table: Mapping[str, Any]) -> dict[str, Any]:
             for key in keys:
                 out.setdefault(key, value)
     return out
+
+
+def objective_size_check(
+    metric: str, n: int, memory_bytes: int
+) -> tuple[str, str] | None:
+    """Whether a run scoring ``metric`` on ``n`` rows can finish here.
+
+    ``None`` when the metric's memory does not grow with n² or ``n`` is small;
+    otherwise ``("warn", message)`` above :data:`PDCOR_CACHE_N`, and
+    ``("refuse", message)`` when one call's estimated peak exceeds
+    ``memory_bytes`` (the machine's physical memory; ``0`` = unknown). A run
+    scores its objective thousands of times, so a call that pages never ends.
+    """
+    if metric not in QUADRATIC_METRICS or n <= PDCOR_CACHE_N:
+        return None
+    need = PDCOR_BYTES_PER_N2 * n * n
+    text = (
+        f"{metric} at n = {n:,} needs ~{need / 1e9:.0f} GB per call and is "
+        "scored thousands of times in a run"
+    )
+    alternatives = "r2 (linear) or spearman (monotone) run at any n"
+    if memory_bytes and need > memory_bytes:
+        return (
+            "refuse",
+            f"{text}; this machine has {memory_bytes / 1e9:.0f} GB, so it would "
+            f"page without finishing. Use {alternatives}, or set "
+            "allow_large_objective to run it anyway.",
+        )
+    return (
+        "warn",
+        f"{text}, without the fast path above n = {PDCOR_CACHE_N:,}; "
+        f"{alternatives}.",
+    )
 
 
 def defaults(engine: str) -> dict[str, Any]:

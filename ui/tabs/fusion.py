@@ -360,6 +360,14 @@ def _fs_default(name: str):
     return _FS[name].default
 
 
+@st.cache_data(show_spinner=False)
+def _physical_memory_bytes() -> int:
+    """This machine's RAM, read once per session."""
+    from geofuse.parallel import physical_memory_bytes
+
+    return physical_memory_bytes()
+
+
 def _fs_bounds(name: str) -> dict:
     """``min_value`` / ``max_value`` of a setting, typed like the setting."""
     s = _FS[name]
@@ -1732,9 +1740,13 @@ def _render_study_details_panel(
             key="fusion_objective_metric",
             help=(
                 "Quantity every candidate is scored on, over held-out "
-                "rows (maximised; nrmse minimised). "
-                "**Partial distance correlation** (default) captures linear and "
-                "nonlinear association and conditions on covariates nonlinearly. "
+                "rows (maximised; nrmse minimised). Choose it by the "
+                "association you expect: **Incremental R²** (default) for a "
+                "linear one, matching the linear search and the per-SD effect; "
+                "**partial rank correlation** for a monotone one or a skewed "
+                "outcome; **partial distance correlation** for general "
+                "dependence, at small samples only (its memory grows with the "
+                "square of the rows). "
                 "**Quartile contrast** cuts the composite at its own "
                 "quartiles and maximises the size of the top-versus-bottom "
                 "difference, the way the greenspace literature reports a "
@@ -1747,6 +1759,17 @@ def _render_study_details_panel(
             st.caption(
                 ":orange[Requires a two-valued outcome column.] "
                 "A continuous outcome scores zero on every trial."
+            )
+        if objective_metric in _gf_settings.QUADRATIC_METRICS:
+            _default("fusion_allow_large_objective", False)
+            st.checkbox(
+                "Run even beyond the memory estimate",
+                key="fusion_allow_large_objective",
+                help=(
+                    "A run whose estimated memory per call exceeds this "
+                    "machine's RAM is refused, since it would page without "
+                    "finishing. Tick to run it anyway."
+                ),
             )
     with col_o2:
         _default("fusion_test_size", _fs_default("test_size"))
@@ -5695,6 +5718,17 @@ def render(output_dir: str) -> None:
         for c in (st.session_state.get("fusion_comparators_primary") or [])
         if c in comparators_param
     ] or None
+    # Memory a quadratic objective needs at this target's size, refused when
+    # it exceeds the machine's RAM unless the user ticked the override.
+    objective_size = _gf_settings.objective_size_check(
+        study_state["objective_metric"],
+        len(preview_vector_gdf) if preview_vector_gdf is not None else 0,
+        _physical_memory_bytes(),
+    )
+    if objective_size is not None and st.session_state.get(
+        "fusion_allow_large_objective"
+    ):
+        objective_size = ("warn", objective_size[1])
     taken_cols = {
         *target_outcome_columns,
         *(covariate_columns or []),
@@ -5816,12 +5850,16 @@ def render(output_dir: str) -> None:
         elif not metric_state["coverage_complete"]:
             for _err in metric_state["coverage_errors"]:
                 st.error(f"❌ {_err}")
+        elif objective_size is not None and objective_size[0] == "refuse":
+            st.error(f"❌ {objective_size[1]}")
         elif comparator_clash:
             st.error(
                 "❌ A comparator cannot also be an outcome, a covariate or a "
                 "negative control: " + ", ".join(f"`{c}`" for c in comparator_clash)
             )
         else:
+            if objective_size is not None:
+                st.warning(objective_size[1])
             # ── Build LongitudinalSpec (or None) ────────
             from geofuse.longitudinal import LongitudinalSpec as _LonSpec
             from geofuse.longitudinal import validate_spec as _validate_lon_spec

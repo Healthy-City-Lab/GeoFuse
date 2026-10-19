@@ -67,6 +67,9 @@ class EngineConstantTests(unittest.TestCase):
         self.assertEqual(settings.RADIUS_PRIORS, bayesian_index.RADIUS_PRIORS)
         self.assertEqual(settings.EXPOSURE_KERNELS, exposure.KERNELS)
         self.assertEqual(settings.CATEGORICAL_MISSING, fusion.CATEGORICAL_MISSING)
+        from geofuse import pdcor
+
+        self.assertEqual(settings.PDCOR_CACHE_N, pdcor.MAX_CACHE_N)
         self.assertEqual(settings.INDEX_FORMS[1:], bayesian_index.FORMS)
         self.assertEqual(settings.CHANNEL_SETS, runners._CHANNEL_SETS)
         n = len(MIXEDLM_METRICS)
@@ -233,6 +236,42 @@ class CheckTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(SettingError, "season_start_month"):
             self.check("ndvi", season_start_month=10, season_end_month=4)
+
+
+class ObjectiveDefaultTests(unittest.TestCase):
+    def test_r2_is_the_cross_sectional_default_and_every_metric_stays(self):
+        self.assertEqual(settings.defaults("fusion")["objective_metric"], "r2")
+        self.assertEqual(settings.CROSS_SECTIONAL_METRICS[0], "r2")
+        for metric in ("partial_distance_corr", "distance_corr", "spearman"):
+            self.assertIn(metric, settings.CROSS_SECTIONAL_METRICS)
+        self.assertEqual(settings.LONGITUDINAL_DEFAULT_METRIC, "mixedlm_tstat")
+
+    def test_the_size_guard_fires_only_for_the_quadratic_metric(self):
+        quiet = (
+            "r2",
+            "spearman",
+            "nrmse",
+            "distance_corr",
+            "logit_tstat",
+            "logit_coef",
+            "mixedlm_tstat",
+            "gee_logit_tstat",
+        )
+        for metric in quiet:
+            self.assertIsNone(
+                settings.objective_size_check(metric, 1_000_000, 10**9), metric
+            )
+        check = settings.objective_size_check
+        self.assertIsNone(check("partial_distance_corr", 5_000, 10**9))
+        level, text = check("partial_distance_corr", 8_000, 64 * 10**9)
+        self.assertEqual(level, "warn")
+        self.assertIn("8,000", text)
+        level, text = check("partial_distance_corr", 20_000, 32 * 10**9)
+        self.assertEqual(level, "refuse")
+        self.assertIn("r2", text)
+        self.assertIn("allow_large_objective", text)
+        # Unknown memory never refuses.
+        self.assertEqual(check("partial_distance_corr", 20_000, 0)[0], "warn")
 
 
 class CategoricalMissingTests(unittest.TestCase):

@@ -158,6 +158,37 @@ class ExpandTests(_Case):
         self.assertEqual(fusion.depends_on, ["ndvi.city", "gvi.city"])
         self.assertEqual(fusion.options["layer"], "layer1")
 
+    def test_the_objective_defaults_to_r2_and_is_checked_for_size(self):
+        base = f'''
+            output_dir = {self.dir!r}
+            [[fusion]]
+            target = "cohort.gpkg"
+            outcomes = ["cesd"]
+            ndvi = "ndvi_2015.tif"
+            gvi = "gvi.gpkg"
+            '''
+        (spec,) = self.expand(base)
+        self.assertEqual(spec.settings["objective_metric"], "r2")
+        self.assertEqual(spec.notes, [])
+        pdcor = base + 'objective_metric = "partial_distance_corr"\n'
+        self.assertEqual(self.expand(pdcor)[0].notes, [])
+
+        _points(
+            os.path.join(self.dir, "cohort.gpkg"),
+            n=7_000,
+            cesd=[1.0] * 7_000,
+        )
+        from unittest import mock
+
+        with mock.patch.object(plans, "_physical_memory", return_value=10**12):
+            (spec,) = self.expand(pdcor)
+        self.assertIn("7,000", spec.notes[0])
+        with mock.patch.object(plans, "_physical_memory", return_value=10**9):
+            with self.assertRaisesRegex(PlanError, "allow_large_objective"):
+                self.expand(pdcor)
+            (spec,) = self.expand(pdcor + "allow_large_objective = true\n")
+        self.assertEqual(len(spec.notes), 1)
+
     def test_plan_errors_name_the_problem(self):
         base = """
             [[ndvi]]
