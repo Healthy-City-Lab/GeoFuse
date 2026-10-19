@@ -3130,6 +3130,8 @@ def run_fusion(
                 "exposure_response": exposure_response_report,
                 "moderation": moderation_report,
                 "negative_controls": negative_control_report,
+                # The spatial blocks the held-out split used, ``None`` without.
+                "spatial_split": getattr(engine, "_spatial_split_report", None),
                 # Comparator exposures, the CGI's row on the same scale, and
                 # the paired CGI − comparator family.
                 "comparators": comparators_report,

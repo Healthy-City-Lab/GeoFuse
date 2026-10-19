@@ -701,11 +701,16 @@ def assign_spatial_blocks(
     Block edge length is ``block_size_m`` when given; otherwise it is derived
     so roughly ``target_blocks`` non-empty cells result, floored at
     ``min_block_size_m`` (used to keep a block larger than the spatial
-    autocorrelation range, e.g. a few × the catchment radius).
+    autocorrelation range, e.g. a few × the catchment radius). The bounding
+    box's edge (``sqrt(area / target_blocks)``) is kept when it already
+    occupies at least 80 % of the target; for clustered features, where most
+    of the box is empty, the edge is shrunk until the occupied cells reach the
+    target.
 
     Returns ``(block_ids, info)`` where ``info`` records the metre CRS, the
-    block size used, and the number of occupied blocks. A degenerate extent
-    (single location / zero span) yields a single block.
+    block size used, the number of occupied blocks and the ``rule`` that set
+    the size. A degenerate extent (single location / zero span) yields a
+    single block.
     """
     n = len(gdf)
     if n == 0:
@@ -737,13 +742,35 @@ def assign_spatial_blocks(
     w = float(np.max(x[finite]) - minx)
     h = float(np.max(y[finite]) - miny)
 
+    rule = "given"
     if block_size_m is not None and float(block_size_m) > 0:
         s = float(block_size_m)
     else:
         if target_blocks is None:
             target_blocks = max(9, min(200, int(round(n / 15))))
+        target = max(int(target_blocks), 1)
         area = max(w * h, 1.0)
-        s = float(np.sqrt(area / max(int(target_blocks), 1)))
+        s = float(np.sqrt(area / target))
+        rule = "bounding box"
+        xf, yf = x[finite], y[finite]
+
+        def occupied(edge: float) -> int:
+            cx = np.floor((xf - minx) / edge).astype(np.int64)
+            cy = np.floor((yf - miny) / edge).astype(np.int64)
+            return int(np.unique(cy * (int(cx.max()) + 1) + cx).size)
+
+        if s > 0 and occupied(s) < 0.8 * target:
+            # The largest edge whose occupied cells reach the target, by
+            # bisection in log space below the bounding-box edge.
+            lo, hi = s / 1.0e4, s
+            for _ in range(48):
+                mid = float(np.sqrt(lo * hi))
+                if occupied(mid) >= target:
+                    lo = mid
+                else:
+                    hi = mid
+            s = lo
+            rule = "occupied extent"
     if min_block_size_m is not None:
         s = max(s, float(min_block_size_m))
     if not np.isfinite(s) or s <= 0:
@@ -767,6 +794,7 @@ def assign_spatial_blocks(
         "block_size_m": float(s),
         "n_blocks": int(len(_uniq)),
         "crs": str(gdf_m.crs),
+        "rule": rule,
     }
 
 

@@ -569,6 +569,9 @@ class MetricFusionEngine:
         # (a fresh split, or each bootstrap resample). Fold-static entries key
         # on it so an entry can never be served for a different row set.
         self._split_generation: int = 0
+        # The spatial blocking a held-out split used and the test share it
+        # realised; ``None`` without spatial blocks.
+        self._spatial_split_report: dict | None = None
 
         # Trial threads for the search. Only the longitudinal
         # fast-GLS path uses them: the other paths keep LRU scoring caches that
@@ -5307,6 +5310,7 @@ class MetricFusionEngine:
         self._fold_static_cache.clear()
         self._split_generation += 1
         self._clear_scoring_caches()
+        self._spatial_split_report = None
 
         # Step 1: Sample all metrics at initial buffer distance
         logger.info("Step 1/4: Sampling metrics at point locations...")
@@ -5447,6 +5451,26 @@ class MetricFusionEngine:
                     f"train+val={len(train_val_poly)} {group_label}s, "
                     f"test={len(test_poly)} {group_label}s.",
                 )
+                share = len(test_poly) / max(n_polys, 1)
+                self._spatial_split_report = {
+                    "block_size_m": float(binfo.get("block_size_m", 0.0)),
+                    "rule": binfo.get("rule"),
+                    "occupied_blocks": int(len(ordered_blocks)),
+                    "test_blocks": int(len(test_blocks)),
+                    "test_share": float(share),
+                    "test_size": float(test_size),
+                }
+                # Whole blocks go to the test set, so a few large blocks make
+                # a lumpy test set and inner splits with few groups.
+                if abs(share - test_size) > 0.05 or len(ordered_blocks) < 20:
+                    _log(
+                        "WARN",
+                        f"Spatial blocks: {len(ordered_blocks)} occupied blocks of "
+                        f"~{binfo.get('block_size_m', 0.0):.0f} m held out "
+                        f"{share:.0%} of the {group_label}s for test (asked "
+                        f"{test_size:.0%}). Set a smaller spatial block size if "
+                        "that is not the hold-out intended.",
+                    )
             else:
                 # Single-split mode: area-balanced or stratified random split
                 # on ``test_size`` (original behaviour).

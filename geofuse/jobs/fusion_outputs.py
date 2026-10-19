@@ -798,6 +798,7 @@ def _write_fusion_outputs(
             (cgi_bundle or {}).get("cgi_vs_comparator_paired") or []
         ),
         "covariate_missing": (cgi_bundle or {}).get("covariate_missing"),
+        "spatial_split": (cgi_bundle or {}).get("spatial_split"),
     }
     _emit_json(f"results_summary{sfx}.json", manifest)
 
