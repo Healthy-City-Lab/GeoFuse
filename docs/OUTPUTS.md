@@ -156,6 +156,17 @@ when the held-out rows could not be scored.
 false when the posterior's largest R-hat exceeds 1.05; its weights, radii and
 intervals are then not reliable, and the job log says so.
 
+**`spatial_split`** in `results_summary.json` records the spatial blocks the
+held-out split used: `block_size_m`, the `rule` that set it (`given`,
+`bounding box` or `occupied extent`), `occupied_blocks`, `test_blocks`, and
+the realised `test_share` next to the asked `test_size`. It is empty without
+spatial blocks.
+
+**`null_calibration`** in each study's `discovery` block of
+`results_summary.json` records the refits' `likelihood` (`cross_products` for
+the linear form, `rows` otherwise), the `warm_start` they began from (warm-up
+length, step size) and `elapsed_s`.
+
 **`gain_p` in `discovery.csv`** is the corrected resampled t-test of a positive
 mean gain over the best single channel across the held-out splits.
 

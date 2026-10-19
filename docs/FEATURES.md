@@ -149,11 +149,17 @@ manifest. See [OUTPUTS.md](OUTPUTS.md).
   apart. The cache stores whichever a job needs and extends rather than rebuilds
   if you switch later.
 - **Objective metric.** What the search maximises, and what decides which
-  configuration wins. Partial distance correlation is the default: it detects
-  nonlinear as well as linear association and conditions on covariates
-  nonlinearly. Also available: distance correlation, Spearman, R-squared,
-  normalized RMSE, mutual information, quartile contrast, logistic and
-  GEE-logistic terms for binary outcomes, and four mixed-effects terms for
+  configuration wins. Choose it by the association the study expects.
+  Incremental R² is the default: a linear association, which matches the
+  linear search, the posterior and the per-SD effect, and runs at any sample
+  size. Partial rank correlation (Spearman) suits a monotone association or a
+  skewed outcome. Partial distance correlation detects any dependence and
+  conditions on covariates nonlinearly, but its memory grows with the square of
+  the rows: above 6,000 entities a run is warned about, and one whose estimate
+  exceeds the machine's RAM is refused unless `allow_large_objective` is set
+  (the GUI's "Run even beyond the memory estimate"). Also available: distance
+  correlation, normalized RMSE, mutual information, quartile contrast, logistic
+  and GEE-logistic terms for binary outcomes, and four mixed-effects terms for
   longitudinal studies.
 - **Quartile contrast** deserves a note. It cuts the composite at its own
   quartiles, enters them as indicators against the lowest quarter, and scores
@@ -189,7 +195,13 @@ manifest. See [OUTPUTS.md](OUTPUTS.md).
   street-view data, and a cell is kept only when every channel has data at its
   smallest searched radius, so every candidate is compared on the same cells.
   Each entity's kept share of exposure weight is reported.
-- **Test-set size** and, optionally, spatial block validation.
+- **Test-set size** and, optionally, spatial block validation. Whole blocks go
+  to the test set. Left at 0 (automatic), the block edge follows where the
+  entities are: it divides their occupied extent into about one block per 15
+  entities (9 to 200 blocks), so a sample of a few cities across a country gets
+  city-scale blocks rather than a few regions. A split whose test share misses
+  **Test-set size** by more than 5 points, or that has fewer than 20 occupied
+  blocks, says so in the log.
 
 ### What the toolbox discovers from the data
 
@@ -281,6 +293,11 @@ Nothing below is pre-specified.
   form on every permuted outcome, so the rate covers that choice too. On a
   panel, each permutation swaps whole entity histories between entities with
   the same pattern of waves, so the null keeps the within-person correlation.
+  Each refit starts from the main fit's tuned sampler and needs a shorter
+  warm-up. The linear form (and every standalone) is fitted from the exposure
+  columns' cross-products, the identical likelihood at a cost that does not
+  grow with the number of entities, so large samples and many refits stay
+  affordable; synergy and panels sum over the rows.
 - **Repeated measures count once.** On a panel the posterior carries a random
   intercept per entity, integrated out exactly, so one person's waves do not
   narrow the interval on the effect as if they were independent people; the

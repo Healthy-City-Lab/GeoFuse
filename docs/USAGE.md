@@ -104,7 +104,9 @@ mismatched file is refused, and processed points are skipped.
    number of rungs (log-spaced); the radii it produces are listed under the
    inputs. When years are in play each year points at exactly one file.
    Anything unassigned blocks submission.
-4. **Study details.** Covariates, objective metric, optional spatial-confounding
+4. **Study details.** Covariates, objective metric (Incremental R² by default;
+   choose it by the association you expect, see FEATURES), optional
+   spatial-confounding
    adjustment, test-set size, the discovery block (channel set, index form,
    sweep splits, radius prior, minimum GVI coverage) with validation settings
    behind an expander, the CGI grid pixel size (for every target type, rasters
@@ -163,6 +165,9 @@ multi-threaded inside numpy. Process pools take 80 % by default and are also
 bounded by free memory, since every worker is a fresh interpreter. A log line
 saying `limited by free memory` means closing other applications would widen the
 pool; `limited by cores` means the machine is fully used.
+
+The posterior logs its own time, and the null calibration logs a progress line
+about every tenth of its refits with the time left.
 
 The posterior's chains (**Chains**, 4 by default) run in parallel, one CPU core
 each. A log line saying the chains `run one after another` means the process
