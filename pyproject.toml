@@ -1,3 +1,67 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "geofuse"
+version = "1.0.0"
+description = "Green View Index, NDVI and their fusion into a composite greenery index"
+readme = "README.md"
+requires-python = ">=3.12"
+# Names only: the installer (scripts/setup_env.py) pins the tested versions and
+# takes the geospatial stack from conda-forge, which these leave in place.
+dependencies = [
+    "aiohttp",
+    "arviz",
+    "dcor",
+    "earthengine-api",
+    "filelock",
+    "fiona",
+    "folium",
+    "geopandas",
+    "jax",
+    "keyring",
+    "matplotlib",
+    "numpy>=2",
+    "numpyro",
+    "pandas",
+    "patsy",
+    "pillow",
+    "platformdirs",
+    "plotly",
+    "psutil",
+    "pyogrio",
+    "pyproj",
+    "rasterio",
+    "requests",
+    "scikit-learn",
+    "scipy",
+    "shapely>=2",
+    "statsmodels",
+    "streamlit",
+    "streamlit-folium",
+    "streamlit-sortables",
+    "textual",
+    "torch",
+    "torchvision",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+dev = ["black==25.1.0", "isort==8.0.1", "optuna", "pytest", "ruff==0.15.12"]
+gpu-monitor = ["nvidia-ml-py"]
+
+[project.scripts]
+geofuse = "geofuse.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["geofuse*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+"geofuse.presets" = ["builtin/*/*.json"]
+"geofuse.cli" = ["*.tcss"]
+
 [tool.black]
 line-length = 88
 target-version = ['py312']
