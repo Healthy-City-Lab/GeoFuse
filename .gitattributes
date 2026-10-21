@@ -1,0 +1,12 @@
+# Text files are stored with LF; checkouts follow these rules on every system.
+* text=auto
+
+# cmd.exe misreads labels and goto in LF batch files; bash refuses CRLF scripts.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.sh text eol=lf
+
+*.pth binary
+*.tif binary
+*.gpkg binary
+*.png binary
