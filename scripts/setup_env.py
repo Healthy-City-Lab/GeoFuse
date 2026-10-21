@@ -1,4 +1,4 @@
-﻿import os
+import os
 import platform
 import shutil
 import subprocess
@@ -11,59 +11,72 @@ import sys
 # 0. ENVIRONMENT NAME
 ENV_NAME = "geofuse"
 
-# 1. CONDA PACKAGES (System Binaries & Core Geospatial)
+# 1. CONDA PACKAGES
+# Everything conda-forge carries for Windows, Linux and macOS comes from here;
+# pip only adds what it lacks (below), and leaves these in place.
 CONDA_PACKAGES = [
     "libblas=*=*openblas",
     "libcblas=*=*openblas",
     "liblapack=*=*openblas",
     "numpy=2.4.6",
     "scipy=1.17.1",
+    # PyTorch, installed by pip afterwards, needs setuptools < 82
+    "setuptools=81",
+    # Geospatial stack
     "gdal=3.12.3",
     "geopandas=1.1.4",
-    "statsmodels=0.14.6",
-    "cmaes=0.13.0",
-    # Async HTTP — used by the in-house geofuse.streetview client (GVIEngine)
-    "aiohttp=3.12.15",
-    # Geospatial native stack
     "rasterio=1.5.0",
     "shapely=2.1.2",
     "fiona=1.10.1",
-    # numpy/BLAS-linked C extensions
+    # streamlit needs pandas < 3
+    "pandas=2.3.3",
+    "statsmodels=0.14.6",
     "matplotlib=3.10.8",
     "scikit-learn=1.6.0",
     "pillow=12.0.0",
     "tqdm=4.67.1",
+    # Async HTTP — used by the in-house geofuse.streetview client (GVIEngine)
+    "aiohttp=3.12.15",
+    # Bayesian index diagnostics
+    "arviz=1.2.0",
+    # Distance-correlation objectives and spline residualization
+    "dcor=0.7",
+    "patsy=1.0.2",
+    # UI / Web
+    "streamlit=1.52.1",
+    "streamlit-folium=0.27.4",
+    "folium=0.20.0",
+    "plotly=6.7.0",
+    # Earth Engine
+    "earthengine-api=1.7.4",
+    # Command line: monitor, credential store, per-user folders, resource
+    # locks, memory sizing
+    "textual=8.2.8",
+    "keyring=25.7.0",
+    "platformdirs=4.9.6",
+    "filelock=3.29.0",
+    "psutil=7.2.2",
+    # Tests
+    "pytest=9.1.1",
+    "optuna=4.6.0",
+    # Dev tooling — must match the versions in .github/workflows/code-quality.yml
+    "black=25.1.0",
+    "ruff=0.15.12",
+    "isort=8.0.1",
 ]
 
 # 2. PYTORCH
-PYTORCH_VERSION = "torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0"
+PYTORCH_VERSION = "torch==2.11.0 torchvision==0.26.0"
 
-# 3. PIP PACKAGES
+# 3. PIP PACKAGES: what conda-forge cannot provide alongside the packages above
 PIP_PACKAGES = [
-    # Data Science
-    "optuna==4.6.0",
-    "skrebate==0.62",
-    # Partial distance correlation (default objective) + spline residualization
-    "dcor==0.7",
-    "patsy==1.0.2",
-    # UI / Web
-    "streamlit==1.52.1",
-    "streamlit-folium==0.25.3",
+    # Bayesian index sampler. conda-forge has no jaxlib for Windows, and its
+    # Linux / macOS jaxlib for Python 3.13 needs protobuf 7, which
+    # streamlit 1.52 refuses; the pip wheels carry their own libraries.
+    "jax==0.11.0",
+    "numpyro==0.21.0",
+    # Not on conda-forge
     "streamlit-sortables==0.3.1",
-    "folium==0.20.0",
-    # Earth Engine & Geospatial APIs
-    "geemap==0.36.6",
-    "earthengine-api==1.7.4",
-    # Command line: monitor, credential store, per-user folders, resource locks
-    "textual==8.2.8",
-    "keyring==25.7.0",
-    "platformdirs==4.9.6",
-    "filelock==3.29.0",
-    # Utility
-    "isort==7.0.0",
-    # Dev tooling — must match the version pinned in .github/workflows/code-quality.yml
-    "black==25.1.0",
-    "ruff==0.15.12",
 ]
 
 
@@ -243,6 +256,7 @@ def main(env_name, log_file=None):
 
     verify_imports = (
         "import geofuse; import geofuse.cli; import torch; import platform; "
+        "import jax; import numpyro; import arviz; import plotly; import psutil; "
     )
     verify_geofuse = "print(f'   [OK] GeoFuse Package: {geofuse.__file__}'); "
 
