@@ -6,6 +6,9 @@ import threading
 
 import numpy as np
 import torch
+
+# Pillow loads before torchvision: torchvision ships its own jpeg8.dll, which
+# conda-forge's Pillow cannot load on Windows.
 from PIL import Image
 from torchvision import transforms as T
 
@@ -126,9 +129,11 @@ class DeepLabSegmenter:
         # 4. Initialize Network Architecture
         try:
             network_module = importlib.import_module("network")
-            # Dynamically instantiate the class (e.g., deeplabv3plus_resnet101)
+            # Dynamically instantiate the class (e.g., deeplabv3plus_resnet101).
+            # The checkpoint holds the whole network, so the ImageNet backbone
+            # weights would only be downloaded to be overwritten.
             self.model = network_module.modeling.__dict__[model_name](
-                num_classes=num_classes, output_stride=16
+                num_classes=num_classes, output_stride=16, pretrained_backbone=False
             )
         except KeyError:
             _log("ERROR", f"Model '{model_name}' is not defined in network.modeling.")
