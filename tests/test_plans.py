@@ -44,7 +44,10 @@ def _points(path, n=4, **columns):
 class _Case(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.dir = self.tmp.name
+        # Run files resolve paths; the resolved folder keeps the GUI's paths
+        # identical where the temp folder has another spelling (/var vs
+        # /private/var on macOS, 8.3 short names on Windows).
+        self.dir = os.path.realpath(self.tmp.name)
         p = lambda name: os.path.join(self.dir, name)  # noqa: E731
         self.city = _points(p("city.gpkg"), year=[2015, 2015, 2018, 2018])
         self.town = _points(p("town.gpkg"), n=2, year=[2018, 2018])
