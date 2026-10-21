@@ -6,10 +6,37 @@
 
 The package wasn't linked correctly during setup.
 
-**Fix:** Re-run the installer (`install.bat` / `install.sh`) and confirm a success message at the end. If it still fails, manually run inside the activated environment:
+**Fix:** Re-run the installer (`install.bat` / `install.sh`), confirm replacing the environment, and check for a success message at the end. If it still fails, manually run inside the activated environment:
 
 ```bash
 pip install -e .
+```
+
+---
+
+## `No module named 'numpyro'` (or `jax`, `arviz`, `plotly`) during fusion
+
+The environment was built by an installer that did not install the Bayesian index's sampler.
+
+**Fix:** Re-run the installer, or add the packages to the existing environment, from conda-forge where it has them:
+
+```bash
+conda activate geofuse
+conda install -c conda-forge arviz=1.2.0 plotly=6.7.0 psutil=7.2.2
+pip install jax==0.11.0 numpyro==0.21.0
+```
+
+---
+
+## `DLL load failed while importing _imaging` after `import torchvision`
+
+On Windows, torchvision ships its own `jpeg8.dll`; once it is loaded, the Pillow build from conda-forge cannot load its own. GeoFuse imports Pillow first, so this only affects your own scripts and notebooks.
+
+**Fix:** import Pillow (or GeoPandas) before torchvision:
+
+```python
+from PIL import Image  # first
+import torchvision
 ```
 
 ---
@@ -50,7 +77,7 @@ pip uninstall numpy scipy -y
 conda install -c conda-forge numpy scipy --force-reinstall -y
 ```
 
-Fresh installs run by the current `install.bat` / `install.sh` already pin openblas + conda-installed numpy/scipy (see `scripts/setup_env.py`), so this fix is only needed for envs built manually, or before this recent fix.
+Fresh installs run by the current `install.bat` / `install.sh` already pin openblas + conda-installed numpy/scipy (see `scripts/setup_env.py`), so this fix is only needed for envs built manually, or before this recent fix. The installer also warns at the end when a pip step has replaced any of its conda packages.
 
 ---
 
