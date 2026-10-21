@@ -1,6 +1,7 @@
 name: Code Quality & Linting
 
 on:
+  workflow_dispatch:
   pull_request:
     branches: [main, master]
   push:
@@ -10,55 +11,85 @@ on:
       - '.github/workflows/code-quality.yml'
       - 'pyproject.toml'
 
-# Opt into Node.js 24 for all actions before it becomes the forced default (June 2026)
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   lint:
     name: Code Quality Checks
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 15
+
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
-          python-version: '3.12'
+          python-version: '3.13'
           cache: 'pip'
+          cache-dependency-path: '.github/workflows/code-quality.yml'
 
+      # Same versions as scripts/setup_env.py installs
       - name: Install linting tools
-        run: |
-          pip install black==25.1.0 ruff==0.15.12 isort==8.0.1
+        run: pip install black==25.1.0 ruff==0.15.12 isort==8.0.1
 
       - name: Check code formatting with Black
-        run: |
-          black --check --diff geofuse/ tests/ scripts/ ui/
-        continue-on-error: false
+        id: black
+        continue-on-error: true
+        run: black --check --diff geofuse/ tests/ scripts/ ui/
 
       - name: Check import sorting with isort
-        run: |
-          isort --check-only --diff geofuse/ tests/ scripts/ ui/
-        continue-on-error: false
+        id: isort
+        continue-on-error: true
+        run: isort --check-only --diff geofuse/ tests/ scripts/ ui/
 
-      - name: Lint with Ruff
-        run: |
-          ruff check geofuse/ tests/ scripts/ ui/
-        continue-on-error: true  # Allow warnings, fail only on errors
+      # Errors fail the job: undefined names, unused imports and variables,
+      # syntax errors.
+      - name: Ruff errors
+        id: ruff_errors
+        continue-on-error: true
+        run: ruff check --select F,E9 geofuse/ tests/ scripts/ ui/
 
-      - name: Generate summary
+      # Everything else in pyproject.toml is reported but does not fail.
+      - name: Ruff warnings (report only)
+        id: ruff_all
+        continue-on-error: true
+        run: ruff check --statistics geofuse/ tests/ scripts/ ui/
+
+      - name: Summary
         if: always()
+        env:
+          BLACK: ${{ steps.black.outcome }}
+          ISORT: ${{ steps.isort.outcome }}
+          RUFF_ERRORS: ${{ steps.ruff_errors.outcome }}
+          RUFF_ALL: ${{ steps.ruff_all.outcome }}
         run: |
-          echo "## Code Quality Results" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "✅ **Black**: Code formatting" >> $GITHUB_STEP_SUMMARY
-          echo "✅ **isort**: Import sorting" >> $GITHUB_STEP_SUMMARY
-          echo "✅ **Ruff**: Linting checks" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### To fix formatting issues locally:" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
-          echo "black geofuse/ tests/ scripts/ ui/" >> $GITHUB_STEP_SUMMARY
-          echo "isort geofuse/ tests/ scripts/ ui/" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          mark() { [ "$1" = "success" ] && echo "✅" || echo "❌"; }
+          {
+            echo "## Code Quality Results"
+            echo ""
+            echo "| Check | Result |"
+            echo "| --- | --- |"
+            echo "| Black formatting | $(mark "$BLACK") $BLACK |"
+            echo "| isort import order | $(mark "$ISORT") $ISORT |"
+            echo "| Ruff errors (F, E9) | $(mark "$RUFF_ERRORS") $RUFF_ERRORS |"
+            echo "| Ruff warnings (report only) | $([ "$RUFF_ALL" = "success" ] && echo "✅" || echo "⚠️") $RUFF_ALL |"
+            echo ""
+            echo "### To fix formatting locally"
+            echo '```bash'
+            echo "black geofuse/ tests/ scripts/ ui/"
+            echo "isort geofuse/ tests/ scripts/ ui/"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail on formatting or Ruff errors
+        if: steps.black.outcome != 'success' || steps.isort.outcome != 'success' || steps.ruff_errors.outcome != 'success'
+        run: |
+          echo "::error::Black: ${{ steps.black.outcome }}, isort: ${{ steps.isort.outcome }}, Ruff errors: ${{ steps.ruff_errors.outcome }}"
+          exit 1
