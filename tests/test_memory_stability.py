@@ -166,3 +166,4 @@ if __name__ == "__main__":
         stress_test_pipeline(MODEL_PATH, args.iterations, OUTPUT_DIR)
     else:
         print(f"[ERROR] Model not found at {MODEL_PATH}")
+        sys.exit(1)
