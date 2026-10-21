@@ -48,12 +48,18 @@ _FUSION_STAGE_WEIGHTS: dict[str, float] = {
     "apply": 1.0,
     "mixedlm_postscore": 2.0,
     "reports": 1.0,
+    "comparators": 4.0,
     "negative_control_retune": 20.0,
 }
 
 _FUSION_RETUNE_STAGE: tuple[str, str] = (
     "negative_control_retune",
     "Re-tune on negative controls",
+)
+
+_FUSION_COMPARATORS_STAGE: tuple[str, str] = (
+    "comparators",
+    "Score comparator exposures",
 )
 
 _FUSION_LONGITUDINAL_STAGE: tuple[str, str] = (
@@ -151,8 +157,8 @@ def _write_fusion_outputs(
     - ``run_config.json`` — every setting the job ran with (fidelity record).
     - ``results_summary.json`` — nested manifest: each study's params, test
       score + CI, direction, subset scores, and discovery stats, plus the
-      CGI-vs-standalone AIC/BIC verdict, covariate-impact summary, and the
-      collinearity report.
+      CGI-vs-standalone AIC/BIC verdict, covariate-impact summary, the
+      collinearity report, and the rows missing each covariate.
     - ``test_scores.csv`` — one headline row per study (test score, CI,
       direction).
     - ``scores.csv`` — long form: study × subset (train/val/test/all) ×
@@ -166,6 +172,10 @@ def _write_fusion_outputs(
       against the lowest group with its test for trend, and the spline test of
       departure from linearity, in the form the greenspace literature reports.
     - ``exposure_response_curve.csv`` — the fitted spline curve, ready to plot.
+
+    In the effect tables the estimates use every row and the standard errors,
+    intervals and p-values the held-out rows; ``test_estimate``, ``test_n`` and
+    ``mde`` (the minimum detectable effect) say what that inference rests on.
     """
 
     import numpy as np
@@ -429,6 +439,8 @@ def _write_fusion_outputs(
                     "or_ci_low": _f(per_iqr.get("or_ci_low")),
                     "or_ci_high": _f(per_iqr.get("or_ci_high")),
                     "p_value": None,
+                    "test_estimate": _f(per_iqr.get("test_estimate")),
+                    "mde": _f(per_iqr.get("mde")),
                 }
             )
         quartiles = er_report.get("quartiles") or {}
@@ -449,6 +461,8 @@ def _write_fusion_outputs(
                     "or_ci_low": _f(row.get("or_ci_low")),
                     "or_ci_high": _f(row.get("or_ci_high")),
                     "p_value": _f(row.get("p_value")),
+                    "test_estimate": _f(row.get("test_estimate")),
+                    "mde": _f(row.get("mde")),
                 }
             )
         if quartiles.get("trend_p") is not None:
@@ -493,6 +507,7 @@ def _write_fusion_outputs(
         # a published single-channel result is read against.
         for _r in er_rows[_row_start:]:
             _r["study"] = _study_key
+            _r["test_n"] = er_report.get("inference_n")
         curve = (nonlinear or {}).get("curve")
         if curve:
             er_curve_rows.extend(
@@ -530,6 +545,9 @@ def _write_fusion_outputs(
                         "ci_high": _f(row.get("ci_high")),
                         "odds_ratio": _f(row.get("odds_ratio")),
                         "p_value": _f(row.get("p_value")),
+                        "test_estimate": _f(row.get("test_estimate")),
+                        "mde": _f(row.get("mde")),
+                        "test_n": block.get("inference_n"),
                     }
                 )
             for row in block.get("interaction_terms") or []:
@@ -546,6 +564,9 @@ def _write_fusion_outputs(
                         "ci_high": None,
                         "odds_ratio": None,
                         "p_value": _f(row.get("p_value")),
+                        "test_estimate": _f(row.get("test_estimate")),
+                        "mde": _f(row.get("mde")),
+                        "test_n": block.get("inference_n"),
                     }
                 )
             mod_rows.append(
@@ -569,11 +590,22 @@ def _write_fusion_outputs(
         _emit_csv(f"moderation{sfx}.csv", mod_rows)
 
     # ── negative_controls.csv (specificity) ─────────────────────
-    # One row per study x split x outcome: the target first, then each control
-    # with its paired contrast against the target and the non-specific flag.
+    # One row per exposure x split x outcome: the target first, then each
+    # control with its paired contrast against the target and the non-specific
+    # flag. ``exposure`` says whether the frozen exposure was the CGI, a
+    # standalone or a comparator.
+    comparators = (cgi_bundle or {}).get("comparators") or {}
+    nc_sources = [
+        (key, "cgi" if key == "cgi" else "standalone", b.get("negative_controls"))
+        for key, _disp, b in studies
+    ]
+    nc_sources += [
+        (name, "comparator", c.get("negative_controls"))
+        for name, c in comparators.items()
+    ]
     nc_rows: list[dict] = []
-    for key, _disp, b in studies:
-        report = b.get("negative_controls") or {}
+    for key, exposure, report in nc_sources:
+        report = report or {}
         for split, res in (report.get("splits") or {}).items():
             entries = [("target", label, res.get("target") or {})]
             entries += [
@@ -583,6 +615,7 @@ def _write_fusion_outputs(
                 nc_rows.append(
                     {
                         "study": key,
+                        "exposure": exposure,
                         "split": split,
                         "role": role,
                         "outcome": outcome,
@@ -620,6 +653,52 @@ def _write_fusion_outputs(
     ]
     if rt_rows:
         _emit_csv(f"negative_control_retune{sfx}.csv", rt_rows)
+
+    # ── comparators.csv + cgi_vs_comparator_paired.csv ──────────
+    # One row per exposure x split, the CGI first on the same scale, then each
+    # comparator; and one paired row per comparator.
+    if comparators:
+        reference = (cgi_bundle or {}).get("comparator_reference") or {}
+        sources = [("cgi", True, reference)] + [
+            (name, bool(c.get("primary")), c) for name, c in comparators.items()
+        ]
+        cmp_rows = [
+            {
+                "exposure": name,
+                "primary": None if name == "cgi" else primary,
+                "split": split,
+                "score": _f(row.get("score")),
+                "ci_low": _f(row.get("lower")),
+                "ci_high": _f(row.get("upper")),
+                "p_value": _f(row.get("p_value")),
+                "n": row.get("n"),
+                "beta": _f(row.get("beta")),
+                "beta_ci_low": _f(row.get("beta_ci_low")),
+                "beta_ci_high": _f(row.get("beta_ci_high")),
+            }
+            for name, primary, block in sources
+            for split in _SPLITS
+            for row in [block.get(split) or {}]
+        ]
+        _emit_csv(f"comparators{sfx}.csv", cmp_rows)
+        paired_rows = [
+            {
+                "comparator": r.get("comparator"),
+                "primary": r.get("primary"),
+                "observed_diff": _f(r.get("observed_diff")),
+                "ci_low": _f(r.get("lower")),
+                "ci_high": _f(r.get("upper")),
+                "p_value": _f(r.get("p_value")),
+                "p_value_holm": _f(r.get("p_value_holm")),
+                "cgi_score": _f(r.get("cgi_score")),
+                "comparator_score": _f(r.get("standalone_score")),
+                "n": r.get("n"),
+                "inference_n": r.get("inference_n"),
+                "favors_cgi": r.get("favors_cgi"),
+            }
+            for r in (cgi_bundle or {}).get("cgi_vs_comparator_paired") or []
+        ]
+        _emit_csv(f"cgi_vs_comparator_paired{sfx}.csv", paired_rows)
 
     # ── results_summary.json (master manifest) ──────────────────
     studies_manifest: dict[str, dict] = {}
@@ -670,6 +749,7 @@ def _write_fusion_outputs(
                     "rhat_max",
                     "ess_min",
                     "divergences",
+                    "converged",
                     "holdout_gain",
                     "null_calibration",
                 )
@@ -709,6 +789,16 @@ def _write_fusion_outputs(
         "exposure_response": (cgi_bundle or {}).get("exposure_response"),
         "moderation": (cgi_bundle or {}).get("moderation") or [],
         "collinearity": collinearity_report,
+        "comparators": {
+            name: {k: v for k, v in c.items() if k != "test_results"}
+            for name, c in comparators.items()
+        },
+        "comparator_reference": (cgi_bundle or {}).get("comparator_reference"),
+        "cgi_vs_comparator_paired": (
+            (cgi_bundle or {}).get("cgi_vs_comparator_paired") or []
+        ),
+        "covariate_missing": (cgi_bundle or {}).get("covariate_missing"),
+        "spatial_split": (cgi_bundle or {}).get("spatial_split"),
     }
     _emit_json(f"results_summary{sfx}.json", manifest)
 
@@ -725,14 +815,37 @@ def _write_fusion_outputs(
     return written
 
 
+def _entity_split(engine: Any, df: pd.DataFrame) -> np.ndarray:
+    """``test`` / ``train_val`` / ``dropped`` for each row of an applied frame.
+
+    Membership is the engine's own split, by the rule
+    ``MetricFusionEngine._test_entity_mask`` uses, so an external check can use
+    exactly the held-out entities the reported scores rest on.
+    """
+
+    def members(part) -> np.ndarray:
+        if part is None or len(part) == 0:
+            return np.zeros(len(df), dtype=bool)
+        if "polygon_id" in df.columns and "polygon_id" in part.columns:
+            return df["polygon_id"].isin(part["polygon_id"].unique()).to_numpy()
+        return df.index.isin(part.index)
+
+    test = members(getattr(engine, "test_data", None))
+    train = members(getattr(engine, "train_val_data", None))
+    return np.where(test, "test", np.where(train, "train_val", "dropped"))
+
+
 def write_entity_table(engine: Any, composite_df: pd.DataFrame, stem: str) -> str:
     """Write one row per target entity — sampled channels and the composite.
 
     Polygon targets join on ``polygon_id`` to their polygons, a target with
     one row per composite row takes its columns, and anything else is written
-    without geometry. Returns the path: ``{stem}.gpkg`` (layer ``cgi``) or
-    ``{stem}.csv``.
+    without geometry. Each row's ``split`` says whether the entity is in the
+    held-out test set, the train+val pool, or neither. Returns the path:
+    ``{stem}.gpkg`` (layer ``cgi``) or ``{stem}.csv``.
     """
+    composite_df = composite_df.copy()
+    composite_df["split"] = _entity_split(engine, composite_df)
     polygons = getattr(engine, "target_polygons_gdf", None)
     target = getattr(engine, "target_gdf", None)
     table = None
@@ -790,6 +903,7 @@ def _build_fusion_ledger(
     longitudinal: bool = False,
     mixedlm_postscore: bool = False,
     negative_control_retune: bool = False,
+    comparators: bool = False,
 ) -> StageLedger:
     """Fresh ledger covering every (outcome, step) pair in run order.
 
@@ -806,7 +920,8 @@ def _build_fusion_ledger(
     ``mixedlm_*`` one — year-aware cross-sectional studies sit on a
     spec too but score with OLS so they skip the post-score step).
     ``negative_control_retune`` appends one re-tune stage per outcome, after
-    its standalones, where the runner performs it.
+    its standalones, where the runner performs it; ``comparators`` one stage
+    for the comparator exposures, between the two.
     """
     standalones = list(standalone_channels or [])
     steps: list[tuple[str, str]] = []
@@ -843,6 +958,14 @@ def _build_fusion_ledger(
             )
             steps.append(
                 (report_key, f"[{label}] {report_step}" if multi else report_step)
+            )
+        if comparators:
+            cmp_key_raw, cmp_label = _FUSION_COMPARATORS_STAGE
+            steps.append(
+                (
+                    _fusion_stage_key(label, cmp_key_raw, multi=multi),
+                    f"[{label}] {cmp_label}" if multi else cmp_label,
+                )
             )
         if negative_control_retune:
             rt_key_raw, rt_label = _FUSION_RETUNE_STAGE
@@ -903,6 +1026,7 @@ def _posterior_summary(params: dict) -> dict:
         "rhat_max": post.get("rhat_max"),
         "ess_min": post.get("ess_min"),
         "divergences": post.get("divergences"),
+        "converged": post.get("converged"),
         # The grid axes the posterior estimated rather than the sweep picked.
         "radius_kernel": post.get("radius_kernel"),
         "radius_prior": post.get("radius_prior", "rungs"),
@@ -937,6 +1061,8 @@ def _posterior_summary(params: dict) -> dict:
         "discovery": disc,
         "holdout_gain": gain,
         "null_calibration": null,
+        # Which street-view rungs were searched, and what the gate dropped.
+        "coverage": g("__coverage__"),
         "elapsed_s": g("__elapsed_s__"),
     }
 
@@ -1018,6 +1144,163 @@ def _negative_control_report(
             for name in report.get("controls", [])
         }
     return report
+
+
+# ────────────────────────────────────────────────────────────────────
+# Comparator exposures
+# ────────────────────────────────────────────────────────────────────
+
+_SPLITS = ("test", "train_val", "all")
+
+
+def _exposure_splits(
+    test_results: dict | None, effects: dict | None, slopes: dict | None
+) -> dict[str, dict]:
+    """One exposure's ``{split: score, lower, upper, p_value, n, beta, ...}``.
+
+    The held-out row takes its score and interval from the test-set headline
+    (``evaluate_on_test`` and its bootstrap CI) and its p-value from the
+    held-out permutation test, as the CGI's headline does; ``train_val`` and
+    ``all`` are the descriptive ``evaluate_effects`` slices. ``beta`` is the
+    covariate-adjusted slope in SD units (``compute_partial_slopes``).
+    """
+    out: dict[str, dict] = {}
+    for split in _SPLITS:
+        e = (effects or {}).get(split) or {}
+        s = (slopes or {}).get(split) or {}
+        row = {
+            "score": e.get("score"),
+            "lower": e.get("lower"),
+            "upper": e.get("upper"),
+            "p_value": e.get("p_value"),
+            "n": e.get("n", s.get("n")),
+            "beta": s.get("beta"),
+            "beta_ci_low": s.get("ci_low"),
+            "beta_ci_high": s.get("ci_high"),
+        }
+        if split == "test" and test_results:
+            ci = test_results.get("test_ci") or {}
+            row["score"] = test_results.get("test_score")
+            row["lower"], row["upper"] = ci.get("lower"), ci.get("upper")
+            if row["p_value"] is None:
+                row["p_value"] = test_results.get("test_pvalue")
+        out[split] = row
+    return out
+
+
+def _comparator_report(
+    engine: Any,
+    column: str,
+    cgi_params: dict,
+    metric: str,
+    *,
+    primary: bool,
+    n_ci: int,
+    n_effects_boot: int,
+    n_perm: int,
+    n_paired: int,
+    iqr: float | None,
+    label: str,
+    log: Any,
+) -> dict:
+    """Score target ``column`` as a frozen exposure, exactly as the CGI is.
+
+    With the engine pinned to :func:`geofuse.fusion.comparator_mode`, the
+    column runs through the CGI's own held-out headline, its bootstrap,
+    permutation test, subset slices, exposure-response table and negative
+    controls; the paired CGI − comparator difference follows on the held-out
+    rows both are observed on. A step that fails is logged and left empty.
+    """
+    from .. import JobCancelled
+    from ..fusion import comparator_mode
+
+    mode = comparator_mode(column)
+    params = {"comparator": column}
+    out: dict = {"primary": bool(primary), "status": "ok"}
+    previous = engine._active_greenery_channel
+    engine._active_greenery_channel = mode
+    try:
+        test = engine.evaluate_on_test(params=params, metric=metric)
+        try:
+            test["test_ci"] = engine.bootstrap_test_score_ci(
+                params,
+                metric,
+                n_bootstrap=int(n_ci),
+                ci_level=0.95,
+                method="percentile",
+                seed=42,
+            )
+        except JobCancelled:
+            raise
+        except Exception as exc:
+            log("WARN", f"[{label}] Comparator '{column}' bootstrap CI failed: {exc}")
+        effects = engine.evaluate_effects(
+            params,
+            metric,
+            n_bootstrap=int(n_effects_boot),
+            n_perm=int(n_perm),
+            seed=42,
+        )
+        out.update(
+            _exposure_splits(test, effects, engine.compute_partial_slopes(params))
+        )
+        out["test_results"] = test
+        out["direction"] = _direction_sign(engine, params, metric)
+        try:
+            out["effects"] = engine.compute_exposure_response(params=params, iqr=iqr)
+        except JobCancelled:
+            raise
+        except Exception as exc:
+            log("WARN", f"[{label}] Comparator '{column}' exposure-response: {exc}")
+        out["negative_controls"] = _negative_control_report(
+            engine, params, metric, n_paired, label=f"{label}/{column}", log=log
+        )
+    except JobCancelled:
+        raise
+    except Exception as exc:
+        log("WARN", f"[{label}] Comparator '{column}' could not be scored: {exc}")
+        out["status"] = f"failed: {exc}"
+    finally:
+        engine._active_greenery_channel = previous
+    out["n"] = {split: (out.get(split) or {}).get("n") for split in _SPLITS}
+
+    paired = None
+    try:
+        paired = engine.paired_objective_difference(
+            cgi_params, params, mode, metric, n_bootstrap=int(n_paired), seed=42
+        )
+    except JobCancelled:
+        raise
+    except Exception as exc:
+        log("WARN", f"[{label}] CGI vs comparator '{column}' failed: {exc}")
+    if paired:
+        paired["comparator"] = column
+        paired["primary"] = bool(primary)
+    out["paired"] = paired
+    return out
+
+
+def _comparator_family(comparators: dict[str, dict]) -> list[dict]:
+    """The paired CGI − comparator rows, Holm-corrected over the primary ones.
+
+    Only the pre-specified primary comparators form the confirmatory family;
+    the others keep their unadjusted p-value and are marked ``descriptive``.
+    """
+    from .. import statistical_testing as _stats
+
+    rows = [c["paired"] for c in comparators.values() if c.get("paired")]
+    primary = [r for r in rows if r.get("primary")]
+    holm = _stats.holm_bonferroni([r.get("p_value") for r in primary])
+    for r, hp in zip(primary, holm, strict=True):
+        r["p_value_holm"] = None if hp != hp else float(hp)
+        r["family_size"] = len(primary)
+        r["descriptive"] = False
+    for r in rows:
+        if not r.get("primary"):
+            r["p_value_holm"] = None
+            r["family_size"] = len(primary)
+            r["descriptive"] = True
+    return rows
 
 
 def _compare_cgi_vs_standalone(

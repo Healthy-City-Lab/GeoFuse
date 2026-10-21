@@ -6,7 +6,8 @@ line all read it, so a default cannot differ between them. A run's inputs
 (files, dates, outcome and covariate columns) are not settings and are not
 listed here.
 
-The module imports no engine. Its choice lists repeat the engines' own
+The module imports no engine (NDVI aggregation chains are checked by the
+pure :mod:`geofuse.ndvi_chains`). Its choice lists repeat the engines' own
 constants, and a test holds the two equal.
 """
 
@@ -15,6 +16,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
+
+from .ndvi_chains import ChainError, check_chains
 
 
 class SettingError(ValueError):
@@ -25,11 +28,13 @@ class SettingError(ValueError):
 class Setting:
     """One setting: its type, default, allowed values and a one-line help.
 
-    ``kind`` is ``bool``, ``int``, ``float``, ``choice``, ``multichoice`` or
-    ``text``. A ``None`` default marks an optional setting whose absence has
-    a meaning of its own (given in ``help``). ``auto_zero`` marks a number
-    whose 0 means "work it out" and is stored as ``None``, the way the tabs
-    read a 0 in those fields. ``step`` restricts an int to ``lo + k * step``.
+    ``kind`` is ``bool``, ``int``, ``float``, ``choice``, ``multichoice``,
+    ``text`` or ``chains`` (NDVI aggregation chains: ``{name, steps}`` tables
+    or ``"name: op, op"`` lines, stored as tables). A ``None`` default marks
+    an optional setting whose absence has a meaning of its own (given in
+    ``help``). ``auto_zero`` marks a number whose 0 means "work it out" and is
+    stored as ``None``, the way the tabs read a 0 in those fields. ``step``
+    restricts an int to ``lo + k * step``.
     """
 
     kind: str
@@ -72,6 +77,11 @@ class Setting:
             if not isinstance(value, str):
                 raise SettingError(f"'{key}' must be text, not {value!r}.")
             return value
+        if self.kind == "chains":
+            try:
+                return check_chains(value)
+            except ChainError as exc:
+                raise SettingError(f"'{key}': {exc}") from None
         raise AssertionError(self.kind)
 
     def _number(self, key: str, value: Any) -> int | float | None:
@@ -125,6 +135,8 @@ CLOUD_HANDLINGS = ("scene_filter", "pixel_only", "scene_only")
 LADDER_SPACINGS = ("linear", "log")
 #: ``geofuse.bayesian_index.RADIUS_PRIORS``.
 RADIUS_PRIORS = ("rungs", "range")
+#: ``geofuse.exposure.KERNELS``.
+EXPOSURE_KERNELS = ("none", "uniform", "linear", "gaussian")
 #: ``geofuse.bayesian_index.FORMS``, plus ``sweep`` (fit both, keep the better).
 INDEX_FORMS = ("sweep", "linear", "synergy")
 #: Channel sets a fusion job can pick between (``runners._CHANNEL_SETS``).
@@ -132,12 +144,14 @@ CHANNEL_SETS: dict[str, tuple[str, ...]] = {
     "ndvi + gvi": ("ndvi", "gvi"),
     "ndvi + veg + terrain": ("ndvi", "veg", "terrain"),
 }
-#: Objective metrics of a cross-sectional fusion run, first = default.
+#: Objective metrics of a cross-sectional fusion run, first = default: ``r2``
+#: for a linear association, ``spearman`` for a monotone one, the distance
+#: correlations for general dependence.
 CROSS_SECTIONAL_METRICS = (
+    "r2",
+    "spearman",
     "partial_distance_corr",
     "distance_corr",
-    "spearman",
-    "r2",
     "nrmse",
     "mutual_info",
     "quartile_contrast",
@@ -163,12 +177,25 @@ ASSOCIATION_TARGETS = ("level", "decline_overall", "decline_average", "decline_c
 SEARCH_SCORING_METHODS = ("mom_em3", "mom_em1", "mom", "exact")
 #: Spatial-confounding adjustments of the fusion objective.
 SPATIAL_ADJUST_METHODS = ("none", "ks_aic", "spatial_plus")
+#: ``geofuse.pdcor.MAX_CACHE_N``: above it ``partial_distance_corr`` leaves its
+#: shared-matrix fast path.
+PDCOR_CACHE_N = 6_000
+#: Peak bytes of one ``partial_distance_corr`` call per n²: 66 n × n float64
+#: matrices (measured 2.8 GB at n = 2,305, 13 GB at 5,000, ~53 GB at 10,000).
+PDCOR_BYTES_PER_N2 = 66 * 8
+#: Objective metrics whose memory grows with n².
+QUADRATIC_METRICS = frozenset({"partial_distance_corr"})
+#: ``geofuse.fusion.CATEGORICAL_MISSING``.
+CATEGORICAL_MISSING = ("drop", "indicator")
 
 # ────────────────────────────────────────────────────────────────────
 # NDVI
 # ────────────────────────────────────────────────────────────────────
 
 _STATS = Setting("multichoice", ["median"], TEMPORAL_REDUCERS)
+_CHAINS = Setting(
+    "chains", [], help="Aggregation chains in place of the statistics; [] = none."
+)
 
 NDVI: dict[str, Setting] = {
     "satellite": _choice(
@@ -191,6 +218,9 @@ NDVI: dict[str, Setting] = {
     "statistics_ranges": _STATS,
     "statistics_specific": _STATS,
     "statistics_column": _STATS,
+    "chains_ranges": _CHAINS,
+    "chains_specific": _CHAINS,
+    "chains_column": _CHAINS,
     "season_start_month": _int(6, 1, 12, "First month of the per-year season."),
     "season_end_month": _int(9, 1, 12, "Last month of the per-year season."),
     "specific_window_days": _int(30, 7, 180, "Days either side of a specific date."),
@@ -235,12 +265,14 @@ GVI: dict[str, Setting] = {
     "precision": _choice(
         "fp16", ("fp16", "fp32"), "GPU arithmetic; fp32 repeats earlier runs' masks."
     ),
+    "log_points": _bool(False, "Log a line for every point and panorama (debugging)."),
 }
 
 #: GVI settings that size the download pool and the GPU batches.
 GVI_THROUGHPUT = ("download_concurrency", "batch_size", "batch_wait_ms")
-#: GVI settings a job records and presets leave out: how a run computes.
-GVI_RUN_OPTIONS = (*GVI_THROUGHPUT, "precision")
+#: GVI settings a job records and presets leave out: how a run computes and
+#: what it logs.
+GVI_RUN_OPTIONS = (*GVI_THROUGHPUT, "precision", "log_points")
 
 # ────────────────────────────────────────────────────────────────────
 # Fusion
@@ -269,12 +301,22 @@ FUSION: dict[str, Setting] = {
     "objective_metric": _choice(
         CROSS_SECTIONAL_METRICS[0],
         CROSS_SECTIONAL_METRICS + LONGITUDINAL_METRICS,
-        "Score every candidate is ranked on (longitudinal runs: mixedlm_tstat).",
+        "Score candidates are ranked on, by the association expected: r2 linear, "
+        "spearman monotone, partial_distance_corr any (small samples only). "
+        "Longitudinal runs: mixedlm_tstat.",
+    ),
+    "allow_large_objective": _bool(
+        False, "Run partial_distance_corr even where it may not fit in memory."
     ),
     "test_size": Setting("float", 0.25, lo=0.1, hi=0.5, help="Held-out test fraction."),
     "n_bins": _int(5, 3, 10, "Quantile bins of the stratified split."),
     "residualize_method": _choice(
         "linear", ("linear", "spline"), "How covariates are partialled out."
+    ),
+    "categorical_missing": _choice(
+        "drop",
+        CATEGORICAL_MISSING,
+        "A missing categorical covariate: drop the row, or a level of its own.",
     ),
     "search_scoring_method": _choice(
         "mom_em3", SEARCH_SCORING_METHODS, "Mixed-model fit per trial (longitudinal)."
@@ -295,8 +337,18 @@ FUSION: dict[str, Setting] = {
     "index_form": _choice("sweep", INDEX_FORMS, "Functional form; sweep fits both."),
     "sweep_splits": _int(40, 5, 200, "Held-out splits each candidate is scored on."),
     "radius_prior": _choice("rungs", RADIUS_PRIORS, "Distance-of-influence prior."),
+    "gvi_min_coverage": Setting(
+        "float",
+        0.95,
+        lo=0.05,
+        hi=1.0,
+        help="Share of entities the smallest searched GVI rung must cover.",
+    ),
     "run_standalones": _bool(False, "Also run each channel on its own."),
-    "check_collinearity": _bool(True, "Drop channels above the VIF threshold."),
+    "check_collinearity": _bool(True, "Report channels above the VIF threshold."),
+    "drop_collinear_channels": _bool(
+        False, "Leave channels above the VIF threshold out of the search."
+    ),
     "vif_threshold": Setting(
         "float", 10.0, lo=2.0, hi=100.0, help="Largest variance inflation kept."
     ),
@@ -304,7 +356,6 @@ FUSION: dict[str, Setting] = {
     "discovery_reps": _int(5, 0, 50, "Independent repeats of the discovery."),
     "discovery_shuffles": _int(12, 1, 100, "Shuffles per discovery repeat."),
     "gain_splits": _int(20, 0, 100, "Splits comparing composite and standalones."),
-    "gain_permutations": _int(100, 0, 1000, "Permutations of the gain null."),
     "null_calibration_runs": _int(16, 0, 1000, "Permuted-outcome refits."),
     "posterior_draws": _int(800, 100, 4000, "Posterior draws per chain."),
     "posterior_warmup": _int(None, 100, 4000, "Warm-up draws; none = as many."),
@@ -323,8 +374,19 @@ FUSION: dict[str, Setting] = {
     "clear_preaggregation_cache": _bool(False, "Rebuild the target's cache first."),
     # ── Per-pixel scoring (vector targets) ──────────────────────
     "cgi_grid_spacing_m": _int(50, 10, 500, "CGI grid pixel size (m).", step=10),
+    "exposure_kernel": _choice(
+        "none", EXPOSURE_KERNELS, "Exposure buffer; none = touched cells only."
+    ),
+    "exposure_radius_m": Setting(
+        "float", 100.0, lo=1.0, hi=5000.0, help="Exposure buffer radius (m)."
+    ),
+    "exposure_plateau_m": Setting(
+        "float", 0.0, lo=0.0, hi=5000.0, help="Linear buffer: full weight up to (m)."
+    ),
+    "exposure_sigma_m": Setting(
+        "float", 35.0, lo=1.0, hi=5000.0, help="Gaussian buffer SD (m)."
+    ),
     "whole_grid_scaling": _bool(True, "Scale the composite map to [0, 1]."),
-    "normalize_channels": _bool(True, "Scale channels to [0, 1] before mixing."),
     "area_balanced_split": _bool(True, "Balance polygon area across the split."),
     "spatial_split": _bool(True, "Hold out whole spatial blocks."),
     "spatial_block_size_m": Setting(
@@ -353,6 +415,57 @@ LONGITUDINAL_DEFAULT_METRIC = LONGITUDINAL_METRICS[0]
 
 SCHEMAS: dict[str, dict[str, Setting]] = {"ndvi": NDVI, "gvi": GVI, "fusion": FUSION}
 
+#: One key that sets several settings at once (run files, presets, ``--set``):
+#: NDVI ``chains`` gives every date mode the same aggregation chains.
+SHORTHANDS: dict[str, dict[str, tuple[str, ...]]] = {
+    "ndvi": {"chains": ("chains_ranges", "chains_specific", "chains_column")},
+}
+
+
+def expand_shorthands(engine: str, table: Mapping[str, Any]) -> dict[str, Any]:
+    """``table`` with each shorthand of ``engine`` spread over the settings it
+    stands for; a setting given in the same table keeps its own value."""
+    out = dict(table)
+    for short, keys in SHORTHANDS.get(engine, {}).items():
+        if short in out:
+            value = out.pop(short)
+            for key in keys:
+                out.setdefault(key, value)
+    return out
+
+
+def objective_size_check(
+    metric: str, n: int, memory_bytes: int
+) -> tuple[str, str] | None:
+    """Whether a run scoring ``metric`` on ``n`` rows can finish here.
+
+    ``None`` when the metric's memory does not grow with n² or ``n`` is small;
+    otherwise ``("warn", message)`` above :data:`PDCOR_CACHE_N`, and
+    ``("refuse", message)`` when one call's estimated peak exceeds
+    ``memory_bytes`` (the machine's physical memory; ``0`` = unknown). A run
+    scores its objective thousands of times, so a call that pages never ends.
+    """
+    if metric not in QUADRATIC_METRICS or n <= PDCOR_CACHE_N:
+        return None
+    need = PDCOR_BYTES_PER_N2 * n * n
+    text = (
+        f"{metric} at n = {n:,} needs ~{need / 1e9:.0f} GB per call and is "
+        "scored thousands of times in a run"
+    )
+    alternatives = "r2 (linear) or spearman (monotone) run at any n"
+    if memory_bytes and need > memory_bytes:
+        return (
+            "refuse",
+            f"{text}; this machine has {memory_bytes / 1e9:.0f} GB, so it would "
+            f"page without finishing. Use {alternatives}, or set "
+            "allow_large_objective to run it anyway.",
+        )
+    return (
+        "warn",
+        f"{text}, without the fast path above n = {PDCOR_CACHE_N:,}; "
+        f"{alternatives}.",
+    )
+
 
 def defaults(engine: str) -> dict[str, Any]:
     """Every setting of ``engine`` at its default (lists copied)."""
@@ -365,13 +478,14 @@ def defaults(engine: str) -> dict[str, Any]:
 def check(engine: str, values: Mapping[str, Any]) -> dict[str, Any]:
     """``values`` checked against ``engine``'s schema, as stored.
 
-    Raises :class:`SettingError` naming the first unknown setting or bad
-    value, and when a month window or season runs backwards where the
-    engine needs it forwards.
+    Shorthands are spread first (:func:`expand_shorthands`). Raises
+    :class:`SettingError` naming the first unknown setting or bad value, and
+    when a month window or season runs backwards where the engine needs it
+    forwards.
     """
     schema = SCHEMAS[engine]
     out: dict[str, Any] = {}
-    for key, value in values.items():
+    for key, value in expand_shorthands(engine, values).items():
         if key not in schema:
             raise SettingError(f"Unknown {engine.upper()} setting '{key}'.")
         out[key] = schema[key].check(key, value)

@@ -29,7 +29,7 @@ off.
 | Path | Contents |
 | --- | --- |
 | `[name]_gvi.gpkg` | Canonical point layer (`gvi_samples`) in the planar CRS |
-| `[name]_gvi.json` | Sidecar: grid CRS, step, anchor, cluster count, distortion, and the capture rule (`capture_mode`, `target_year`, `max_year_diff`, `month_window`, `month_policy`) with `n_points`, `n_sampled`, `n_no_capture_in_window` and per-year / per-month counts of the captures used (`capture_years`, `capture_months`, each summing to `n_sampled`), and `throughput`: the run's stage counts and rates (`searched`, `cache_hits`, `downloads`, `segmented`, `gpu_batches`, `gpu_busy_share`, `throttle_events`, the per-second rates, `download_concurrency`, `batch_size`, the `precision` the model ran at, whether a `cuda_graph` was used, and the `download_mode`, `package` or `api`); a merge of shards lists each shard's under `throughput.shards` |
+| `[name]_gvi.json` | Sidecar: grid CRS, step, anchor, cluster count, distortion, and the capture rule (`capture_mode`, `target_year`, `max_year_diff`, `month_window`, `month_policy`) with what became of the grid points (`n_grid_points` = `n_sampled` + `n_no_panorama` + `n_no_capture_in_window` + `n_failed`; the window misses also split into `n_no_capture_in_year_window` / `n_no_capture_in_month_window`; a merge of shards sums them) and per-year / per-month counts of the captures used (`capture_years`, `capture_months`, each summing to `n_sampled`), and `throughput`: the run's stage counts and rates (`searched`, `cache_hits`, `downloads`, `segmented`, `gpu_batches`, `gpu_busy_share`, `throttle_events`, the per-second rates, `download_concurrency`, `batch_size`, the `precision` the model ran at, whether a `cuda_graph` was used, and the `download_mode`, `package` or `api`); a merge of shards lists each shard's under `throughput.shards` |
 | `[name]_gvi_tiles/` | One dense GeoTIFF per cluster, band 1 vegetation, band 2 terrain, plus an index |
 | `[name]_gvi.geojson` | The same points in EPSG:4326 for web maps |
 | `[name]_temporal_gvi/` | Per-year mode: one full output set per year |
@@ -58,11 +58,12 @@ Default: GeoTIFF on, GeoPackage off, GeoJSON off.
 
 | Path | Contents |
 | --- | --- |
-| `[name]_ndvi.tif` | Single band, float32, median NDVI over the range after cloud masking. NoData `-9999` |
+| `[name]_ndvi.tif` | Single band, float32, median NDVI over the range after cloud masking. NoData `-9999`, declared in the file. The file also stores the exact minimum, maximum, mean and standard deviation of its valid pixels (GDAL's `STATISTICS_*` band metadata) |
 | `[name]_ndvi.json` | Sidecar, always written on success (see below) |
 | `[name]_ndvi.gpkg` / `.geojson` | Per-pixel points, planar CRS and EPSG:4326 respectively |
-| `[name]_ndvi_tiles/` | One GeoTIFF per connected component, plus an index |
+| `[name]_ndvi_tiles/` | One GeoTIFF per connected component, plus an index; NoData and statistics as above |
 | `[name]_mean_ndvi.*` / `[name]_max_ndvi.*` | The same set for each other temporal statistic picked |
+| `[name]_[chain]_ndvi.*` | With aggregation chains: the same set for each chain, named by the chain (in place of the statistics) |
 | `[name]_temporal_ndvi/` | Per-year mode: one full output set per year and statistic |
 
 The sidecar lets fusion and other tools introspect a raster without re-running
@@ -72,11 +73,21 @@ dates requested (`start_date`, `end_date`; the end date is included, and
 and the dates actually queried (`used_start_date`, `used_end_date`, end
 exclusive; they differ if a sparse window was widened, or a 2012 window was
 filled from 2013: `year_substituted`), the
-temporal statistic (`temporal_reducer`), the acquisition options
+temporal statistic (`temporal_reducer`), the aggregation chain that made the
+file (`chain`, its operations in order, and `chain_name`, empty for a plain
+statistic, whose chain is its temporal step), the NDVI formula (`ndvi_formula`:
+pixels with negative red or near-infrared reflectance masked), the acquisition
+options
 (`reflectance`, `cloud_handling`, `water_mask` with `water_occurrence_max`),
-the cloud threshold and surviving image count, resolution, how the input
-decomposed into clusters and tiles, any tiles that exhausted their retries and
-so appear as gaps, and the maximum map distortion. When the run came from a
+the cloud threshold, how many scenes over the study area the queried window
+held (`n_images`) and how many the cloud threshold kept
+(`n_images_after_cloud_filter`, empty when every scene is kept), resolution,
+how the input
+decomposed into clusters and tiles, how many tiles came down in several
+requests because Earth Engine refused one as too large
+(`tiles_split_across_requests`), how many tiles came from a cached run over a
+larger area (`tiles_salvaged`), any tiles that exhausted their retries and so
+appear as gaps, and the maximum map distortion. When the run came from a
 settings preset, `preset` names it (the GVI sidecar does the same).
 
 Saved presets live in `presets/ndvi/` and `presets/gvi/` at the repository
@@ -110,6 +121,8 @@ output_results/fusion/<YYYYMMDDTHHMMSS>__<short_job_id>/
     ├── moderation.csv                  interaction test and simple slopes
     ├── negative_controls.csv           specificity check against control outcomes
     ├── negative_control_retune.csv     re-tune concordance, when requested
+    ├── comparators.csv                 comparator exposures, when named
+    ├── cgi_vs_comparator_paired.csv    CGI minus each comparator, when named
     ├── decline_terms.csv               greenspace-by-time terms, longitudinal only
     ├── mixedlm_metrics*.csv            all four mixed-effects metrics, longitudinal only
     ├── aic_bic.json                    CGI vs standalone verdict
@@ -128,6 +141,35 @@ those same rows, so an in-sample p-value would look significant because it was
 tuned to, not because the effect generalises. Read `test` for the honest result
 and `all` only as a descriptive summary.
 
+**Effect tables test on the held-out rows.** In `exposure_response.csv`,
+`moderation.csv`, `decline_terms.csv` and `covariate_impact.csv`, and in the
+paired CGI-versus-channel difference, the estimates use every row and are
+descriptive; standard errors, intervals and p-values come from the held-out
+rows. `test_estimate` is the held-out estimate the interval belongs to,
+`test_n` the rows it rests on and `mde` the minimum detectable effect, 2.8
+held-out standard errors. Each CGI-versus-channel row's `lower`, `upper` and
+`p_value` come from the held-out bootstrap (on `inference_n` rows), and
+`p_value_holm` corrects that p-value across the channels; all four are empty
+when the held-out rows could not be scored.
+
+**`converged`** in each study's `discovery` block of `results_summary.json` is
+false when the posterior's largest R-hat exceeds 1.05; its weights, radii and
+intervals are then not reliable, and the job log says so.
+
+**`spatial_split`** in `results_summary.json` records the spatial blocks the
+held-out split used: `block_size_m`, the `rule` that set it (`given`,
+`bounding box` or `occupied extent`), `occupied_blocks`, `test_blocks`, and
+the realised `test_share` next to the asked `test_size`. It is empty without
+spatial blocks.
+
+**`null_calibration`** in each study's `discovery` block of
+`results_summary.json` records the refits' `likelihood` (`cross_products` for
+the linear form, `rows` otherwise), the `warm_start` they began from (warm-up
+length, step size) and `elapsed_s`.
+
+**`gain_p` in `discovery.csv`** is the corrected resampled t-test of a positive
+mean gain over the best single channel across the held-out splits.
+
 **A failed fit is reported empty, never as `0.0`.** A mixed model that did not
 converge records `test_ci.status = "fit_failed"` with a null score, so a genuine
 null is never confused with a model that never fit.
@@ -137,15 +179,14 @@ sweep's held-out |t| under the metric name `sweep_holdout_abs_t`. It is a
 t-statistic over resamples of the training pool, not a value of the objective,
 so it does not share a scale with the other rows.
 
-**`parameters.csv`** also lists `<channel>_center` and `<channel>_scale` for
-each channel of a composite: the mean and the covariate-adjusted standard
-deviation that standardise the channel before the weights (and, for synergy,
-the percentile curve, powers and products) are applied. They belong to the
-composite as much as the weights do. A composite is therefore in SD units, as
-are `composite_greenery.tif` (unless scaled to [0, 1]) and the per-IQR effect in
-`exposure_response.csv`; standalone channels stay in their layer's own units.
-Results saved before these keys existed rebuild from the raw channel values, as
-they were fitted.
+**`parameters.csv`** records the composite weights as shares of 100 of a mix of
+raw channel values (and, for synergy, of their pair and triple geometric
+means), so the composite, `composite_greenery.tif` (unless scaled to [0, 1])
+and the per-IQR effect in `exposure_response.csv` are in the channels' own
+units. The posterior's influence shares, on standardised terms, are in
+`discovery.csv`. Results saved by earlier versions carry `<channel>_center` /
+`<channel>_scale` (and, for synergy, powers) and rebuild through the formulas
+they were fitted with.
 
 **`discovery.csv`** has one row per weight. `radius_m` and `aggregator` are the
 posterior's projection onto one cell per channel, which is the cell the
@@ -161,15 +202,22 @@ ground; for percentile aggregators they are a mean-equivalent approximation.
 `aggregators_separated` lists the statistics the data distinguished from an even
 blend. Each row also carries the posterior weight with its credible interval,
 whether the radius sat at the edge of the searched ladder, and the channel's
-standalone score against the composite's gain and permutation p-value. Synergy
-pair terms appear as their own rows with the grid columns blank, since a pair
-has no spatial scale of its own.
+standalone score against the composite's gain and its p-value. Synergy
+interaction terms appear as their own rows with the grid columns blank, since
+an interaction has no spatial scale of its own.
 
 **`results_summary.json` records a `config_hash` and a `test_reads` count.** The
 hash identifies the configuration that produced the result, so a pre-registered
 analysis can be shown to be the one that ran. `test_reads` counts distinct
 configurations scored on the held-out slice; a large number means the headline
 p-value is optimistic by roughly that many comparisons.
+
+**Missing covariates** are recorded as `covariate_missing` in
+`results_summary.json`: the job's `categorical_missing` setting, the target's
+row count (`n_rows`), one entry per covariate with its `type`, `n_missing` and
+`handling` (`drop`, or `indicator` for a categorical covariate kept under a
+`<column>=missing` level), and `rows_dropped`, the rows that had an outcome but
+were left out for a missing covariate.
 
 **`exposure_response.csv`** restates the effect in the shapes the greenspace
 literature publishes: per-IQR increase (with an odds ratio for binary outcomes),
@@ -194,7 +242,23 @@ have both outcomes, and `nonspecific`, which is true when the control's interval
 excludes zero while the difference's includes it: part of the tuned association
 is then shared with an outcome greenery should not cause. Standalone studies get
 the same rows, so the composite's specificity can be read against a single
-channel's.
+channel's, and so do comparator exposures; `exposure` says which kind each
+`study` is (`cgi`, `standalone` or `comparator`).
+
+**`comparators.csv`** appears when comparator exposures were named: existing
+exposure columns of the target, scored untuned on the composite's own rows,
+split, covariates and objective. One row per exposure and split, the CGI first
+on the same scale: `score` with its interval (`test` is the held-out headline,
+`train_val` and `all` are descriptive), the held-out `p_value`, `n` (an entity
+missing a comparator counts only against that comparator), `beta` (the
+covariate-adjusted slope in SD units, with its interval) and `primary`.
+**`cgi_vs_comparator_paired.csv`** holds the paired difference CGI − comparator
+in the objective's units (positive favours the CGI), estimated on every row
+with its interval and p-value from the held-out rows; `p_value_holm` is
+Holm-corrected over the primary comparators only and is empty for the others,
+which are descriptive. Comparators are not scored for panels (several rows per
+entity). The same results are in `results_summary.json` under `comparators`,
+`comparator_reference` (the CGI's row) and `cgi_vs_comparator_paired`.
 
 **`negative_control_retune.csv`** appears when the job setting
 `negative_control_retune` is on. The CGI's sweep and posterior are re-run with
@@ -216,7 +280,17 @@ coefficient is reported alongside and is the one that can straddle zero.
 
 `composite_entities.gpkg` (layer `cgi`; a `.csv` when the target has no
 geometry) is the per-entity table the dashboard's "Export per-entity CGI" and
-`geofuse export` deliver.
+`geofuse export` deliver. Each entity's composite is the exposure-weighted mean
+of its CGI cells; `n_samples` counts the cells and `coverage_share` is the
+share of its exposure weight on cells the GVI coverage gate kept. `split` is
+`test` or `train_val` (`dropped` for an entity in neither), so an outside
+analysis can use exactly the held-out entities the reported scores rest on.
+
+**The coverage gate** is recorded as `coverage` in `results_summary.json` and
+`composite_greenery_params.json`: the first searched GVI radius
+(`gvi_floor_m`), the smallest one offered, the minimum share asked for, each
+radius's share of entities with a covered cell, and the exposure rows and
+entities left out.
 
 ### Caches
 

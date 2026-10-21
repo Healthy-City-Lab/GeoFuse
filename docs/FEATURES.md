@@ -66,7 +66,10 @@ tiles, GeoJSON, and the raw panoramas and segmentation masks.
   already in the cache are reused whatever the precision.
 - Each run logs and records its stage counts and rates: points searched,
   panoramas downloaded and segmented, how busy the GPU was, the precision the
-  model ran at, and throttle events.
+  model ran at, and throttle events. It also counts what became of every grid
+  point (sampled, no panorama, no capture in the window, failed), and its log
+  gets a summary of those counts at most every 30 seconds rather than a line
+  per point (`log_points` brings the per-point lines back).
 
 ---
 
@@ -84,6 +87,10 @@ per-cluster tiles, and a metadata sidecar.
   one sensor instead to keep a multi-year series on one instrument, or a
   Landsat set without Landsat 7's striped scenes (after its 2003 scan-line
   failure) and without Landsat 9.
+- NDVI is the normalized difference of near-infrared and red reflectance. A
+  pixel where either band reads negative (top-of-atmosphere artefacts, surface
+  reflectance over water or deep shadow) is masked, as Earth Engine's
+  `normalizedDifference` does, so every value lies in [−1, 1].
 - Acquisition is configurable, and every option defaults to the behaviour
   above: surface or top-of-atmosphere reflectance; cloudy scenes dropped,
   cloudy pixels masked, or both (the default); an optional water mask that
@@ -97,10 +104,18 @@ per-cluster tiles, and a metadata sidecar.
 - Each pixel's value is a temporal statistic of the window's cloud-free images:
   the median (default), the mean, or the maximum. Each date mode takes any
   combination; every statistic writes its own files, and one download per tile
-  serves all of them.
+  serves all of them. When Earth Engine refuses that download as too large, the
+  statistics are split across requests before the tile itself is subdivided.
+- Aggregation chains replace the statistics when the order of operations
+  matters: a neighbourhood statistic on every scene before the temporal
+  statistic, a water mask on the composite only, or a neighbourhood statistic
+  of the composite, in the order you give. Each chain writes its own files, so
+  a reference product can be reproduced exactly next to the plain composites.
 - Downloaded tiles are cached per statistic, compactly and without changing any
   output, so a re-run, or a run that adds a statistic, fetches only what is
-  missing.
+  missing. A run over a smaller area with the same settings (a narrower
+  buffer, fewer features) takes its tiles from a cached run over a larger
+  one wherever that run covers them, and downloads only the rest.
 - Tiles export on a shared snap grid and are mosaicked without a second
   reprojection, so output pixels are exactly what Earth Engine produced.
 - Distinguishes "no images in range" from "all images too cloudy", widens a
@@ -134,11 +149,17 @@ manifest. See [OUTPUTS.md](OUTPUTS.md).
   apart. The cache stores whichever a job needs and extends rather than rebuilds
   if you switch later.
 - **Objective metric.** What the search maximises, and what decides which
-  configuration wins. Partial distance correlation is the default: it detects
-  nonlinear as well as linear association and conditions on covariates
-  nonlinearly. Also available: distance correlation, Spearman, R-squared,
-  normalized RMSE, mutual information, quartile contrast, logistic and
-  GEE-logistic terms for binary outcomes, and four mixed-effects terms for
+  configuration wins. Choose it by the association the study expects.
+  Incremental R² is the default: a linear association, which matches the
+  linear search, the posterior and the per-SD effect, and runs at any sample
+  size. Partial rank correlation (Spearman) suits a monotone association or a
+  skewed outcome. Partial distance correlation detects any dependence and
+  conditions on covariates nonlinearly, but its memory grows with the square of
+  the rows: above 6,000 entities a run is warned about, and one whose estimate
+  exceeds the machine's RAM is refused unless `allow_large_objective` is set
+  (the GUI's "Run even beyond the memory estimate"). Also available: distance
+  correlation, normalized RMSE, mutual information, quartile contrast, logistic
+  and GEE-logistic terms for binary outcomes, and four mixed-effects terms for
   longitudinal studies.
 - **Quartile contrast** deserves a note. It cuts the composite at its own
   quartiles, enters them as indicators against the lowest quarter, and scores
@@ -148,8 +169,39 @@ manifest. See [OUTPUTS.md](OUTPUTS.md).
   protective and a harmful gradient of the same size score alike, and the
   search maximises separation either way.
 - **Covariates.** Numeric or categorical columns to control for. Categorical
-  ones are one-hot encoded automatically.
-- **Test-set size** and, optionally, spatial block validation.
+  ones are one-hot encoded automatically. A row missing a covariate is left
+  out (complete cases), whether the covariate is numeric or categorical. For
+  categorical covariates **Missing categorical values** can instead keep such
+  rows under a `<column>=missing` level of their own, so they are never counted
+  in the reference level. The log and the results list how many rows each
+  covariate was missing and how many rows with an outcome were dropped.
+- **Exposure on the CGI grid.** Every target is exposed to the cells of one
+  regular grid (**CGI grid pixel size (m)**, 50 m by default) that its geometry
+  touches, whatever its type: a point counts in every cell whose closed square
+  holds it (two on an edge, four on a corner), a line once per pass through a
+  cell, a polygon once per part in every cell it shares area with. Points and
+  parts add up, so a cell touched twice counts twice. A raster target's pixels
+  are points at their centres on that grid; the raster's own pixel size is not
+  reused. The composite is computed per cell first and then averaged over the
+  entity's cells. Overlapping targets each keep every cell they touch.
+- **Exposure buffer.** Optional: the cells within a radius of the geometry
+  (100 m by default) join its exposure, weighted by their distance to it:
+  uniformly, falling linearly to 0 after a full-weight distance, or as a
+  Gaussian with a chosen SD (35 m by default) cut at the radius. The default is
+  no buffer, the touched cells alone.
+- **Minimum GVI coverage.** Street-view points are sparse, so small GVI radii
+  leave many cells without data. The searched GVI ladder starts at the first
+  radius at which this share of entities (95 % by default) keeps a cell with
+  street-view data, and a cell is kept only when every channel has data at its
+  smallest searched radius, so every candidate is compared on the same cells.
+  Each entity's kept share of exposure weight is reported.
+- **Test-set size** and, optionally, spatial block validation. Whole blocks go
+  to the test set. Left at 0 (automatic), the block edge follows where the
+  entities are: it divides their occupied extent into about one block per 15
+  entities (9 to 200 blocks), so a sample of a few cities across a country gets
+  city-scale blocks rather than a few regions. A split whose test share misses
+  **Test-set size** by more than 5 points, or that has fewer than 20 occupied
+  blocks, says so in the log.
 
 ### What the toolbox discovers from the data
 
@@ -168,22 +220,29 @@ Nothing below is pre-specified.
   default, follows the listed rungs.
 - **Aggregation statistic.** Mean, median or a percentile of the values inside
   that buffer.
-- **Functional form.** A weighted sum, or a synergy form with powers on the main
-  terms and pairwise products, following Wang et al. 2026
-  ([doi:10.3390/rs18010009](https://doi.org/10.3390/rs18010009)). Both forms
-  work on standardised channels: each channel centred on its mean and divided
-  by its covariate-adjusted standard deviation, the scale the Bayesian fit
-  estimates on. The weighted sum combines those standardised values, so the
-  composite is in SD units. The synergy form passes them through the normal
-  cumulative distribution first, so each channel enters as its approximate
-  percentile. Where the source paper min-max scales each indicator to [0, 1],
-  this keeps the values in (0, 1) without letting the single highest and
-  lowest entity set the scale, which is what lets the Bayesian fit sample the
-  synergy form reliably. The mean and SD are recorded with the parameters, so
-  maps and test scores rebuild exactly the index that was fitted.
-- **Channel weights**, reported with credible intervals. A weight is the share
-  of a standardised channel, so weights compare channels on a common footing
-  whatever their units.
+- **Functional form.** A weighted average of the raw channel values, or a
+  synergy form that adds the geometric mean of every channel pair and, with
+  three channels, of the triple: √(NDVI⁺ · GVI), ∛(NDVI⁺ · Veg · Ter), with
+  NDVI⁺ = max(NDVI, 0) inside the interactions only, so water and bare surfaces
+  add no synergy but still enter their own term. It follows the idea of Wang et
+  al. 2026 ([doi:10.3390/rs18010009](https://doi.org/10.3390/rs18010009))
+  without powers or rescaling: every term stays on its channels' physical
+  scale, so a cell's CGI does not depend on the study area it was fitted in,
+  and the linear form is the synergy form with its interaction weights at 0.
+  Both forms are computed per CGI cell and then averaged over the entity's
+  cells. The sweep tries synergy on the 50 best candidates of the linear grid
+  and keeps the form that scores better on fresh splits.
+- **Channel weights**, reported twice. The posterior estimates each term's
+  weight on its covariate-adjusted, standardised scale: these are the
+  **influence shares**, with credible intervals, which compare channels on a
+  common footing whatever their units. The composite carries each share onto
+  raw units by dividing it by that term's SD, so the map is the fitted index up
+  to a shift and a positive scale; these **composite weights** are what
+  `parameters.csv` records. A channel with a small spread gets a large composite
+  weight for the same influence.
+- **Composite scaling.** "Scale composite map to [0, 1]" rescales the written
+  map only; scores, the entity table and every reported effect use the raw
+  composite.
 
 ### Why the result is defensible
 
@@ -193,12 +252,24 @@ Nothing below is pre-specified.
   statistically indistinguishable configurations. A Bayesian fit over the whole
   grid then estimates the radius profile, the aggregator blend, the weights and
   the effect together, so the effect's interval carries the uncertainty about
-  scale and aggregation instead of conditioning on a pick.
+  scale and aggregation instead of conditioning on a pick. Inner splits hold
+  out whole spatial blocks when the test set is spatially blocked, and whole
+  entities on a panel, so no block's neighbours and no person's other waves sit
+  on both sides of a split.
 - **A held-out test set is the headline.** A fraction of the data, 25 % by
   default, is never touched during tuning. The winning configuration is scored
   on it once, with a percentile bootstrap interval and a permutation p-value
   (Freedman-Lane when covariates are controlled). Whole-data figures are shown
   only as descriptive and carry no p-value.
+- **Effects are estimated on all rows and tested on held-out ones.** The
+  per-IQR effect, quantile gradient, spline curve, moderation slopes, decline
+  terms, covariate table and the paired CGI-versus-channel difference report
+  their estimates from every row, as descriptive figures, and their standard
+  errors, intervals and p-values from the held-out rows, which never chose the
+  composite. Each row also carries the held-out estimate and the minimum
+  detectable effect, 2.8 held-out standard errors (80 % power at a two-sided
+  5 % level), so a null held-out result can be read against the effect size
+  the test split could have detected.
 - **Reproducibility is measured, not assumed.** The whole discovery is repeated
   on independent reshuffles and the report says how often it landed on the same
   configuration. A low share means the surface is flat, not that the pick is
@@ -209,14 +280,35 @@ Nothing below is pre-specified.
   Inside the reproducibility and gain checks, each split chooses its form on
   inner splits of its own training rows.
 - **Fusion has to earn itself.** The composite is compared against each channel
-  alone under the identical sweep, with a permutation null on the gain. Both
-  sides make their choices on training rows, and the permuted runs repeat them.
+  alone under the identical sweep, on the same held-out rows of every split.
+  Both sides make their choices on training rows. The gain is tested with the
+  corrected resampled t-test (Nadeau & Bengio 2003): the splits share most of
+  their training rows, so the variance of the per-split gains is inflated by
+  1/S + n_test/n_train before a one-sided t on S − 1 degrees of freedom.
 - **Calibration is checked.** The procedure is re-run on permuted outcomes; the
   reported false-positive rate should sit near 5 %, and the panel says so when
   it does not. The rate carries an exact (Clopper-Pearson) interval, and fewer
   than 100 refits is flagged as too imprecise for a calibration claim: 0 of 16
   is still compatible with a true rate of 20 %. An engine option re-chooses the
-  form on every permuted outcome, so the rate covers that choice too.
+  form on every permuted outcome, so the rate covers that choice too. On a
+  panel, each permutation swaps whole entity histories between entities with
+  the same pattern of waves, so the null keeps the within-person correlation.
+  Each refit starts from the main fit's tuned sampler and needs a shorter
+  warm-up. The linear form (and every standalone) is fitted from the exposure
+  columns' cross-products, the identical likelihood at a cost that does not
+  grow with the number of entities, so large samples and many refits stay
+  affordable; synergy and panels sum over the rows.
+- **Repeated measures count once.** On a panel the posterior carries a random
+  intercept per entity, integrated out exactly, so one person's waves do not
+  narrow the interval on the effect as if they were independent people; the
+  exposure-response and moderation fits use entity-clustered standard errors.
+  A panel is a run where some entity has several rows. A year-aware
+  cross-sectional run, which only picks each row's greenery by its measurement
+  year, has one row per entity and keeps the cross-sectional posterior, nulls,
+  splits and bootstraps: an intercept per entity cannot be estimated from one
+  row each.
+- **Convergence is checked.** A posterior whose largest R-hat exceeds 1.05 is
+  logged as a warning and marked `converged = false` in the results.
 - **Recovery is measured on your own data.** A plasmode module
   (`geofuse.validation`, or `MetricFusionEngine.plasmode_recovery`) keeps the
   real exposure tensor and covariates, plants a known index into a simulated
@@ -240,7 +332,9 @@ Nothing below is pre-specified.
   many directions were redundant.
 - Optional spatial-confounding adjustment (KS-AIC or Spatial+) and spatial block
   cross-validation, so geographic autocorrelation cannot inflate scores.
-- Optional collinearity check that drops redundant channels before a run.
+- Optional collinearity check on the study's own channels (GVI as the sum of
+  its components) that reports the channels above a VIF threshold, and
+  optionally leaves them out of the search.
 - **Negative-control outcomes.** Held-out scoring guards against chance, not
   confounding. Name an outcome that shares the target's confounders but has no
   causal path from greenery, and the finished composite, frozen as tuned, is
@@ -250,7 +344,19 @@ Nothing below is pre-specified.
   the search, and standalone studies get the same check for comparison. An
   optional re-tune runs the whole discovery with each control as the target
   and reports how closely its radius, aggregator and weights match the
-  target's.
+  target's. Controls are scored for cross-sectional and year-aware runs; a
+  panel skips them.
+- **Comparator exposures.** "Does mixing beat the best single channel?" is the
+  standalones' question; "does the tuned composite beat the exposure the
+  literature already uses?" is a different one. Name existing exposure columns
+  of the target as comparators and each is scored untuned, as a frozen
+  composite, through the composite's own code: the same held-out entities,
+  coverage, covariates, year fixed effects, spatial adjustment, objective,
+  bootstrap and permutation test. Each gets its effects and exposure-response
+  table, the negative-control transfer test, and a paired composite-minus-
+  comparator difference on the held-out rows, Holm-corrected over the
+  pre-specified primary comparators; the rest are descriptive. An entity missing
+  a comparator is left out of that comparator alone. Panels skip comparators.
 - Longitudinal runs add wave fixed effects, on by default, and an optional
   neighbourhood or site column.
 

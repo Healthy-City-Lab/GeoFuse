@@ -225,6 +225,17 @@ class TestEveryRecordedSettingIsRestored(unittest.TestCase):
         self.fusion._seed_fusion_form(_params(negative_controls=["grip"]))
         self.assertEqual(self.state["fusion_negative_controls"], ["grip"])
 
+    def test_the_missing_category_handling_survives_a_re_run(self):
+        self.fusion._seed_fusion_form(_params(categorical_missing="indicator"))
+        self.assertEqual(self.state["fusion_categorical_missing"], "indicator")
+
+    def test_comparators_survive_a_re_run(self):
+        self.fusion._seed_fusion_form(
+            _params(comparators=["ndvi_500m", "ndvi_1km"], comparators_primary=None)
+        )
+        self.assertEqual(self.state["fusion_comparators"], ["ndvi_500m", "ndvi_1km"])
+        self.assertEqual(self.state["fusion_comparators_primary"], [])
+
     def test_a_job_without_controls_clears_a_stale_pick(self):
         self.state["fusion_negative_controls"] = ["height"]
         self.fusion._seed_fusion_form(_params())
@@ -242,6 +253,8 @@ class TestEveryRecordedSettingIsRestored(unittest.TestCase):
             "covariate_types",
             "moderator_columns",
             "negative_controls",
+            "comparators",
+            "comparators_primary",
             "standalone_channels",
             "longitudinal_spec_payload",
             "target_display_name",

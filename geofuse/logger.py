@@ -18,6 +18,7 @@ so engine initialisation logs land in the same job's log.
 
 Levels
 ------
+    DEBUG  grey    — per-item detail an engine logs only when asked to
     INFO   cyan    — routine progress
     OK     green   — successful result / file written
     WARN   yellow  — skipped step / missing data (non-fatal)
@@ -35,6 +36,7 @@ from collections import deque
 from typing import IO
 
 _ANSI = {
+    "DEBUG": "\033[90m",  # grey
     "INFO": "\033[36m",  # cyan
     "OK": "\033[32m",  # green
     "WARN": "\033[33m",  # yellow

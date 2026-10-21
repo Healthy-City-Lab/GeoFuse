@@ -479,6 +479,50 @@ class Year2012Tests(_Case):
         self.assertIn("fill 2012 with 2013", res["message"])
 
 
+class SceneCountTests(_Case):
+    """The sidecar states which sensors and how many scenes made a file."""
+
+    def counts(self, **kw):
+        side = self.sidecar(kw.pop("name", "site"))
+        return side["n_images"], side["n_images_after_cloud_filter"]
+
+    def test_scene_filter_and_every_scene(self):
+        for mode, filtered in (("scene_filter", 2), ("pixel_only", None)):
+            res = self.run_engine(
+                LANDSAT_SR,
+                start="2015-06-01",
+                end="2015-09-30",
+                satellite="landsat",
+                cloud_handling=mode,
+                name=mode,
+            )
+            self.assertEqual(res["status"], "success", res.get("message"))
+            self.assertEqual(self.counts(name=mode), (3, filtered))
+            side = self.sidecar(mode)
+            self.assertEqual(side["satellite"], "landsat")
+            self.assertEqual(side["ee_collection"], E.LANDSAT_MERGED_LABEL)
+
+    def test_a_widened_window_counts_its_own_scenes(self):
+        col = {
+            E.LANDSAT8_COLLECTION_ID: [
+                landsat_sr("2015-07-10", 5, 0.05, 0.40),
+                landsat_sr("2015-06-20", 5, 0.05, 0.40),
+                landsat_sr("2015-08-05", 5, 0.05, 0.40),
+                landsat_sr("2015-08-10", 95, 0.05, 0.40),
+            ]
+        }
+        res = self.run_engine(
+            col,
+            start="2015-07-01",
+            end="2015-07-31",
+            satellite="landsat",
+            coverage_rescue=True,
+        )
+        self.assertEqual(res["status"], "success", res.get("message"))
+        self.assertTrue(self.sidecar()["coverage_widened"])
+        self.assertEqual(self.counts(), (4, 3))
+
+
 class ResumeKeyTests(_Case):
     """Acceptance 7: every non-default option gets its own cache entry."""
 

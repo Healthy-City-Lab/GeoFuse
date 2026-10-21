@@ -4,7 +4,8 @@ A stub executor stands in for the spawn processes: each job is a thread that
 moves its record through the store the way the real watcher does, honouring
 pause and cancel. The supervisor claims jobs, waits for their dependencies,
 caps what runs by resource class, applies control requests, mirrors status
-files, and skips jobs whose dependency failed.
+files, and skips jobs whose dependency failed. It also outlives its own
+errors: a status file held open, a failing pass, a loop that ends on an error.
 """
 
 import os
@@ -227,6 +228,60 @@ class SupervisorTests(unittest.TestCase):
         sup.cancel_all()
         t.join(10)
         self.assertEqual(self.state.job(ids[0]).state, "cancelled")
+
+    def test_a_status_file_held_open_is_written_on_a_later_pass(self):
+        ids = self.submit([_spec("ndvi.a", "a", ticks=6)])
+        logs: list[str] = []
+        sup = self.supervisor(log=logs.append)
+        real = self.state.write_status
+        held_until = time.monotonic() + 0.4
+
+        def held(job_id, status):
+            if time.monotonic() < held_until:
+                raise PermissionError(13, "Access is denied")
+            real(job_id, status)
+
+        self.state.write_status = held
+        self.assertEqual(sup.run(), 0)
+        self.assertEqual(self.state.read_status(ids[0])["status"], "completed")
+        self.assertTrue(any("could not write the status" in m for m in logs))
+
+    def test_an_error_in_one_pass_is_logged_and_the_run_goes_on(self):
+        ids = self.submit([_spec("ndvi.a", "a")])
+        logs: list[str] = []
+        sup = self.supervisor(log=logs.append)
+        real, calls = sup._control, {"n": 0}
+
+        def once():
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("disk hiccup")
+            real()
+
+        sup._control = once
+        self.assertEqual(sup.run(), 0)
+        self.assertEqual(self.state.read_status(ids[0])["status"], "completed")
+        self.assertEqual(sum("a pass failed" in m for m in logs), 1)
+
+    def test_a_loop_that_ends_on_an_error_leaves_its_jobs_interrupted(self):
+        ids = self.submit([_spec("ndvi.a", "a", ticks=100, tick_s=0.02)])
+        sup = self.supervisor()
+        real = sup._finished
+
+        def broken():
+            if sup.jobs.get(ids[0], {}).get("phase") == "run":
+                raise RuntimeError("broken loop")
+            return real()
+
+        sup._finished = broken
+        with self.assertRaisesRegex(RuntimeError, "broken loop"):
+            sup.run()
+        status = self.state.read_status(ids[0])
+        self.assertEqual(status["status"], "interrupted")
+        self.assertIn("rerun", status["error"])
+        record = sup.jobs[ids[0]]["record"]
+        self.assertFalse(record.cancel_event.is_set())
+        self.executor.store.request_cancel(ids[0])
 
 
 if __name__ == "__main__":

@@ -26,7 +26,9 @@ responsive and several study areas can run at once.
    months, and each year becomes its own aligned raster covering those months
    in full (May to September runs to 30 September). Each date mode has a
    **Temporal statistic** picker: median (default), mean, maximum, or any
-   combination, each written as its own file. The download settings hold
+   combination, each written as its own file. **Aggregation chains**, under
+   the picker, replace the statistics with chains, one `name: operation, ...`
+   per line (see *NDVI aggregation chains* below). The download settings hold
    **Satellite**, **Reflectance**, **Cloud handling** (drop cloudy scenes,
    mask cloudy pixels, or both), **Coverage rescue**, **Mask water** and
    **Fill 2012 with 2013**. The defaults reproduce the plain composite: water
@@ -81,37 +83,55 @@ mismatched file is refused, and processed points are skipped.
 1. **Target configuration.** Upload the outcome, pick the outcome columns, and
    optionally name **negative-control outcomes**: columns expected to share the
    outcome's confounders but not to be caused by greenery, such as grip
-   strength for a cognitive outcome. They are never tuned on (cross-sectional
-   runs only).
+   strength for a cognitive outcome. They are never tuned on, and are scored
+   for cross-sectional runs, year-matched ones included, but not for panels.
+   **Comparator exposures** are existing exposure columns to benchmark the
+   composite against, such as a published buffer mean. They are never tuned:
+   each is scored on the composite's own held-out entities, covariates and
+   objective, with a paired composite-vs-comparator test. **Primary
+   comparators** are the pre-specified ones the Holm correction runs over
+   (empty = all). In a run file: `comparators = [...]`,
+   `comparators_primary = [...]`; on the command line `--comparator` and
+   `--comparator-primary`.
 2. **Optimization setup.** Choose cross-sectional or mixed-effects
    (longitudinal). Longitudinal requires a date column. Cross-sectional can
-   optionally use one to route each entity to a year-matched greenery file; the
-   year is only a file key, never a regression input.
+   optionally use one to route each entity to a year-matched greenery file.
+   The years then also enter as fixed effects, which absorb differences
+   between the yearly files; with one row per entity the run is otherwise
+   cross-sectional, with no per-entity terms.
 3. **Metric file assignment.** Per channel, set the buffer ladder and assign
    files. A ladder is a min and max in metres plus either a step (linear) or a
    number of rungs (log-spaced); the radii it produces are listed under the
    inputs. When years are in play each year points at exactly one file.
    Anything unassigned blocks submission.
-4. **Study details.** Covariates, objective metric, optional spatial-confounding
+4. **Study details.** Covariates, objective metric (Incremental R² by default;
+   choose it by the association you expect, see FEATURES), optional
+   spatial-confounding
    adjustment, test-set size, the discovery block (channel set, index form,
-   sweep splits, radius prior) with validation settings behind an expander,
-   per-pixel grid size, composite scaling, and whether to run each channel on
-   its own. Choose the range-based radius prior when the distance of influence
-   should not depend on the ladder's spacing.
+   sweep splits, radius prior, minimum GVI coverage) with validation settings
+   behind an expander, the CGI grid pixel size (for every target type, rasters
+   included), the exposure buffer, composite scaling, and whether to run each
+   channel on its own. Choose the range-based radius prior when the distance of
+   influence should not depend on the ladder's spacing.
    Longitudinal runs add wave fixed effects, on by default, and an optional
    neighbourhood column. There is no formula selector: the channel set names the
    modalities and the sweep picks the functional form.
 5. **Run.**
 
 Covariates listed as categorical are one-hot encoded and counted as covariates
-automatically; there is no need to list them twice.
+automatically; there is no need to list them twice. **Missing categorical
+values**, beside that list, decides what an empty category does: **Drop the
+row** (default, as for a missing numeric covariate) or **Keep as a level of its
+own** (a `<column>=missing` dummy). In a run file it is
+`categorical_missing = "drop"` or `"indicator"`.
 
 ### Reading the results panel
 
 - **Headline.** Held-out test score with its 95 % interval, the significance
   test that actually applies (permutation for cross-sectional, Wald for
   mixed-effects), the direction of the relationship, and the verdict against the
-  best standalone channel.
+  best standalone channel. Under it, the covariates some rows were missing, with
+  how each was handled and how many rows with an outcome were dropped.
 - **Study detail.** Per study: the discovered radii, aggregators and weights,
   per-subset scores, and the discovery diagnostics, which cover what the sweep
   picked and how contested it was, the posterior weights with credible
@@ -123,8 +143,15 @@ automatically; there is no need to list them twice.
   With negative controls, each study also shows the frozen composite's slope on
   the target and on every control, the paired difference, and a warning when a
   control's association cannot be told apart from the target's.
+- **GVI coverage.** Which GVI radii were searched, each radius's entity
+  coverage, and how many cells and entities the coverage gate left out.
+- **CGI vs comparator exposures.** Each comparator's held-out score, interval,
+  p-value, n and β next to the composite's, with the paired difference and its
+  Holm p-value (descriptive for non-primary comparators).
 - **Covariate impact**, **channel collinearity**, **composite maps**,
-  **mixed-effects metrics**, and an index of every file written.
+  **mixed-effects metrics**, and an index of every file written. **Generate
+  CGI Map**, under the map viewer, is a placeholder for a planned full-area map
+  built from the study's definition; it is not available yet.
 
 See [OUTPUTS.md](OUTPUTS.md) for the folder layout.
 
@@ -138,6 +165,14 @@ multi-threaded inside numpy. Process pools take 80 % by default and are also
 bounded by free memory, since every worker is a fresh interpreter. A log line
 saying `limited by free memory` means closing other applications would widen the
 pool; `limited by cores` means the machine is fully used.
+
+The posterior logs its own time, and the null calibration logs a progress line
+about every tenth of its refits with the time left.
+
+The posterior's chains (**Chains**, 4 by default) run in parallel, one CPU core
+each. A log line saying the chains `run one after another` means the process
+had already started JAX with fewer CPU devices than chains; the result is valid,
+only slower.
 
 ```bash
 GEOFUSE_CPU_SHARE=0.5 streamlit run ui/app.py   # halve the process-pool share
@@ -173,6 +208,14 @@ cleaner made one way.
 geofuse gvi city.gpkg --download-concurrency 24
 geofuse gvi city.gpkg --precision fp32
 ```
+
+While a GVI run works, its log gets a summary line at most every 30 seconds:
+points done; how many were sampled, had no panorama, had no capture in the
+year or month window, or failed; cache hits, downloads, the rate and throttle
+events. Warnings and errors appear as they happen. `log_points`
+(`--log-points`, or `log_points = true` in a run file) adds a line for every
+point and panorama, for debugging; the log then grows with the number of
+points.
 
 Per-job logs are written in full to `logs/jobs/<job_id>.log`; the in-app view
 keeps only the last 100 lines.
@@ -249,7 +292,7 @@ outcomes = ["cesd"]
 covariates = ["age"]
 mode = "year-aware"
 date_column = "interview_date"
-ndvi = "@ndvi.city"        # the files the ndvi step writes ("@ndvi.city[max]" for one statistic)
+ndvi = "@ndvi.city"        # the files the ndvi step writes ("@ndvi.city[max]" for one statistic or chain)
 gvi = "@gvi.city"
 ```
 
@@ -272,6 +315,68 @@ geofuse submit run.toml --only gvi.city     # one step; the steps it needs are t
 
 A step starts when the steps it references finish; independent steps run side
 by side within the limits below.
+
+### NDVI aggregation chains
+
+By default each date mode writes one composite per temporal statistic. A
+reference product may instead summarise each scene's neighbourhood before the
+temporal statistic, or mask water on the finished composite only. An
+aggregation chain states the order:
+
+```toml
+[[ndvi]]
+name = "city"
+study_area = "data/city.gpkg"
+year_column = "year"
+chains = [
+  {name = "mean", steps = ["temporal:mean"]},
+  {name = "f500", steps = ["focal:mean:500", "temporal:mean", "water_mask"]},
+]
+```
+
+Each chain has exactly one temporal step. Steps before it act on every scene,
+steps after it on the composite:
+
+| Step | What it does |
+| --- | --- |
+| `focal:<stat>:<radius_m>` | The mean, max, min or median over a circle of that radius (above 0, at most 5,000 m) around each pixel, as Earth Engine's `reduceNeighborhood` computes it; a masked pixel stays masked |
+| `temporal:<stat>` | The median, mean or max over the window's scenes |
+| `water_mask` | Masks pixels open water covers at least half the time |
+
+A chain named `f500` writes `city_2018_f500_ndvi.*` and records its steps in
+the sidecar. Names use letters, digits and `_`, and must differ ignoring case.
+`chains` replaces the statistics of every date mode the step uses;
+`chains_ranges`, `chains_specific` and `chains_column` set one date mode. With
+a neighbourhood step, scenes are fetched over the study area grown by the
+largest radius, so pixels at its edge get whole neighbourhoods. **Mask water**
+(`water_mask = true`) still masks every scene first, before each chain. A
+fusion step names one chain's files with `@ndvi.city[f500]`. A chain that is
+only a temporal step, with or without a leading `water_mask`, shares that
+statistic's cached tiles. In the NDVI tab the same chains go into
+**Aggregation chains** under each date mode's **Temporal statistic** picker;
+a chain that does not check is named under the picker and blocks the run. On
+the command line, chains are text:
+`--chains-column "f500: focal:mean:500, temporal:mean, water_mask"`.
+
+### Reusing NDVI tiles from a larger area
+
+Every tiled NDVI download records its tile cache: the settings that shape the
+values (dates, clouds, sensors, reflectance, resolution, statistic or chain)
+and its study area. A later download with the same settings over a smaller
+area, such as a narrower buffer or fewer features, takes each tile from that
+cache wherever the earlier run covers every pixel the tile needs, and asks
+Earth Engine only for the rest. The values are those a fresh download
+computes; the sidecar counts the tiles taken (`tiles_salvaged`).
+
+Caches written before these records existed are recorded from the jobs that
+wrote them:
+
+```bash
+geofuse cache adopt JOB...    # finished, cancelled or interrupted NDVI jobs
+```
+
+Downloads small enough for a single tile keep no cache, so there is nothing to
+reuse for them.
 
 ### Following and managing jobs
 
@@ -300,7 +405,9 @@ the Fusion tab's results view.
 Job ids can be shortened to any unique prefix. The supervisor starts with the
 first `submit` and stops after ten idle minutes; `geofuse supervisor --stop`
 stops it now. Exit codes: 0 done, 1 a job failed or was cancelled, 2 invalid
-settings or inputs, 3 an environment problem.
+settings or inputs, 3 an environment problem. Should the supervisor itself stop
+on an error, its jobs show as interrupted, never cancelled, and `geofuse rerun`
+continues them from their caches.
 
 ### Limits shared with the dashboard
 
@@ -320,6 +427,7 @@ geofuse config set limits.max_parallel 6     # jobs the supervisor runs at once
 geofuse results JOB                         # held-out score, direction, each channel alone, weights, radii
 geofuse results output_results/fusion/<run>/    # any run, dashboard runs included
 geofuse export JOB -o cgi.csv               # the per-entity CGI table (.gpkg, .csv or .geojson)
+geofuse cgi-map JOB area.gpkg               # planned full-area CGI map; exits 2, not available yet
 ```
 
 ### Presets, caches and credentials

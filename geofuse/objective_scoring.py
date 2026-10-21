@@ -10,13 +10,15 @@ parameters; the run is meant to maximize how much the CGI itself explains
 Per-metric semantics
 --------------------
 
-``partial_distance_corr`` (default)
+``partial_distance_corr``
     Partial distance correlation (Székely–Rizzo) between target and CGI given
     the covariates (and spatial smooth). Detects linear *and* nonlinear
     association and conditions on the controls nonlinearly, so a covariate with
     a curved effect is removed rather than partly leaking into the score. Falls
     back to plain distance correlation when there is nothing to condition on.
-    The ``residualize`` option does not apply (conditioning is intrinsic).
+    The ``residualize`` option does not apply (conditioning is intrinsic). Its
+    memory grows with the square of the rows, so it suits small samples; the
+    toolbox's default objective is ``r2``.
 ``distance_corr``
     Distance correlation between target and CGI. With covariates both sides are
     residualized first (linear or spline, see ``residualize``), then

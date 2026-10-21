@@ -114,7 +114,7 @@ class TestPanelRenders(unittest.TestCase):
         out = self._render(_summary())
         for expected in (
             "Sweep",
-            "Posterior weights",
+            "Posterior weights (influence shares)",
             "Does the discovery reproduce?",
             "Composite vs standalone channels",
             "Null calibration",
@@ -160,7 +160,7 @@ class TestPanelRenders(unittest.TestCase):
                 powers=[0.7, 0.9],
             )
         )
-        self.assertIn("Posterior weights", out)
+        self.assertIn("Posterior weights (influence shares)", out)
 
     def test_a_single_channel_standalone_renders(self):
         out = self._render(
@@ -541,9 +541,9 @@ class TestNegativeControlPanel(unittest.TestCase):
         fusion_tab._render_negative_controls(None)
         self.assertEqual(self.rec.calls, [])
 
-    def test_a_longitudinal_skip_is_explained(self):
+    def test_a_panel_skip_is_explained(self):
         fusion_tab._render_negative_controls({"skipped": "longitudinal"})
-        self.assertIn("cross-sectional targets only", self.rec.text())
+        self.assertIn("one row per entity only", self.rec.text())
 
 
 class _MetricRecorder(_Recorder):
@@ -673,6 +673,30 @@ class TestCovariateTrendLine(unittest.TestCase):
         labels, fitted, _ = fusion_tab._trend_points(pts)
         self.assertEqual(labels, ["a", "b", "c", "d", "e"])
         self.assertTrue(np.allclose(fitted, [1, 2, 3, 4, 5], atol=1e-6))
+
+
+class TestMissingCovariateCaption(unittest.TestCase):
+    def test_nothing_missing_draws_nothing(self):
+        self.assertIsNone(fusion_tab._covariate_missing_caption(None))
+        complete = {
+            "covariates": [{"column": "sex", "n_missing": 0, "handling": "drop"}],
+            "rows_dropped": 0,
+        }
+        self.assertIsNone(fusion_tab._covariate_missing_caption(complete))
+
+    def test_each_missing_covariate_and_the_dropped_rows_are_named(self):
+        caption = fusion_tab._covariate_missing_caption(
+            {
+                "covariates": [
+                    {"column": "sex", "n_missing": 3, "handling": "drop"},
+                    {"column": "edu", "n_missing": 2, "handling": "indicator"},
+                ],
+                "rows_dropped": 3,
+            }
+        )
+        self.assertIn("`sex` 3 (dropped)", caption)
+        self.assertIn("`edu` 2 (own level)", caption)
+        self.assertIn("3 row(s) with an outcome were dropped", caption)
 
 
 if __name__ == "__main__":

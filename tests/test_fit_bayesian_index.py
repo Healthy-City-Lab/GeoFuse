@@ -19,11 +19,25 @@ if ROOT not in sys.path:
 
 import numpy as np
 
-from geofuse import parallel
+from geofuse import bayesian_index, parallel
 from geofuse.fusion import MetricFusionEngine
 
 RADII = (100.0, 300.0, 900.0)
 STATS = ["mean", "p50"]
+
+
+def _entity_cells(X, static):
+    """The stub has no CGI cells: each entity stands for its one cell."""
+
+    def design(_static, kept, channel_index, *_):
+        cov = static["cov"]
+        return bayesian_index.SynergyDesign.build(
+            X[kept][:, list(channel_index)],
+            None if cov is None else cov[kept],
+            channels=channel_index,
+        )
+
+    return design
 
 
 def _stub_engine(n=300, seed=0):
@@ -54,10 +68,12 @@ def _stub_engine(n=300, seed=0):
     )
     eng._preaggr_radii = lambda: (list(RADII), list(RADII))
     eng._sweep_objective = lambda metric: None
+    eng._synergy_design = _entity_cells(X, static)
     for name in (
         "_params_from_sweep",
         "_index_layout",
-        "_channel_scaling",
+        "_search_radii",
+        "_inner_split_groups",
         "_ladder_description",
     ):
         setattr(eng, name, types.MethodType(getattr(MetricFusionEngine, name), eng))
@@ -78,7 +94,6 @@ class TestFitBayesianIndexWiring(unittest.TestCase):
             reps=1,
             shuffles=2,
             gain_splits=2,
-            gain_perm=2,
             null_runs=2,
             null_reselect_form=True,
             draws=120,
@@ -125,11 +140,6 @@ class TestFitBayesianIndexWiring(unittest.TestCase):
         self.assertTrue(null["imprecise"])
         self.assertIn("rate_ci_high", null)
 
-    def test_the_composite_scaling_is_recorded_for_either_form(self):
-        for ch in ("ndvi", "gvi"):
-            self.assertIn(f"{ch}_center", self.params)
-            self.assertGreater(self.params[f"{ch}_scale"], 0.0)
-
     def test_weights_land_on_the_formula_keys(self):
         from geofuse import cgi_formulas
 
@@ -137,11 +147,11 @@ class TestFitBayesianIndexWiring(unittest.TestCase):
             ("ndvi", "gvi"), self.params["__sweep__"]["form"]
         )
         keys = cgi_formulas.get_formula(name).weight_keys
-        self.assertEqual(sum(int(self.params[k]) for k in keys), 100)
+        self.assertAlmostEqual(sum(self.params[k] for k in keys), 100.0, places=2)
 
 
-class TestSynergyRunRecordsItsScaling(unittest.TestCase):
-    """A synergy study's params carry the curve the composite path needs."""
+class TestLinearRunRecordsRawWeights(unittest.TestCase):
+    """A linear study's weights apply to the raw channel values."""
 
     @classmethod
     def setUpClass(cls):
@@ -149,8 +159,63 @@ class TestSynergyRunRecordsItsScaling(unittest.TestCase):
             setattr, parallel, "process_worker_count", parallel.process_worker_count
         )
         parallel.process_worker_count = lambda *a, **k: 1
+        cls.eng = _stub_engine()
         cls.params = MetricFusionEngine.fit_bayesian_index(
-            _stub_engine(),
+            cls.eng,
+            "r2",
+            forms=("linear",),
+            sweep_splits=2,
+            reps=0,
+            gain_splits=0,
+            null_runs=0,
+            draws=100,
+            warmup=100,
+            chains=1,
+            radius_kernel="dirichlet",
+        )
+
+    def test_no_center_or_scale_is_recorded(self):
+        for ch in ("ndvi", "gvi"):
+            self.assertNotIn(f"{ch}_center", self.params)
+            self.assertNotIn(f"{ch}_scale", self.params)
+
+    def test_the_raw_average_is_the_fitted_index(self):
+        # Partialling the covariates out of the raw average gives the
+        # posterior-mean index at the projected cells, up to a scale.
+        from geofuse import cgi_formulas
+
+        X, radii, stats, _, static = self.eng.build_index_tensor()
+        _, Xr = bayesian_index.prep(X, static["target"], static["cov"])
+        post = self.params["__posterior__"]
+        cells = [(list(radii).index(r), stats.index(c)) for r, c in post["picked"]]
+        raw = {
+            ch: X[:, i, ri, si]
+            for i, (ch, (ri, si)) in enumerate(zip(("ndvi", "gvi"), cells, strict=True))
+        }
+        fitted = sum(
+            w * Xr[:, i, ri, si]
+            for i, (w, (ri, si)) in enumerate(
+                zip(post["weight_mean"], cells, strict=True)
+            )
+        )
+        comp = cgi_formulas.compute_cgi("weighted_average_gvi", self.params, raw)
+        q, _ = bayesian_index.covariate_basis(static["cov"], len(comp))
+        comp_r = comp - q @ (q.T @ comp)
+        self.assertAlmostEqual(float(np.corrcoef(comp_r, fitted)[0, 1]), 1.0, places=6)
+
+
+class TestSynergyRunRecordsRawWeights(unittest.TestCase):
+    """A synergy study's weights apply to the raw channels and their interaction."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.addClassCleanup(
+            setattr, parallel, "process_worker_count", parallel.process_worker_count
+        )
+        parallel.process_worker_count = lambda *a, **k: 1
+        cls.eng = _stub_engine()
+        cls.params = MetricFusionEngine.fit_bayesian_index(
+            cls.eng,
             "r2",
             forms=("synergy",),
             sweep_splits=2,
@@ -163,20 +228,31 @@ class TestSynergyRunRecordsItsScaling(unittest.TestCase):
             radius_kernel="dirichlet",
         )
 
-    def test_every_channel_gets_a_center_and_a_scale(self):
+    def test_the_weights_cover_the_interaction_and_no_scaling_is_recorded(self):
         self.assertEqual(self.params["__sweep__"]["form"], "synergy")
+        keys = ("w_ndvi", "w_gvi", "w_ndvi_gvi")
+        self.assertAlmostEqual(sum(self.params[k] for k in keys), 100.0, places=2)
         for ch in ("ndvi", "gvi"):
-            self.assertIn(f"{ch}_center", self.params)
-            self.assertGreater(self.params[f"{ch}_scale"], 0.0)
+            self.assertNotIn(f"{ch}_center", self.params)
+            self.assertNotIn(f"{ch}_power", self.params)
 
-    def test_the_composite_path_evaluates_with_them(self):
+    def test_the_raw_composite_is_the_fitted_index(self):
         from geofuse import cgi_formulas
 
-        rng = np.random.default_rng(0)
-        comps = {"ndvi": rng.normal(size=50), "gvi": rng.normal(size=50)}
-        out = cgi_formulas.compute_cgi("synergy_gvi", self.params, comps)
-        self.assertTrue(np.isfinite(out).all())
-        self.assertTrue(((out > 0) & (out < 1)).all())
+        X, radii, stats, _, static = self.eng.build_index_tensor()
+        post = self.params["__posterior__"]
+        nr, ns = len(radii), len(stats)
+        cols = [
+            (i * nr + list(radii).index(r)) * ns + stats.index(c)
+            for i, (r, c) in enumerate(post["picked"])
+        ]
+        design = bayesian_index.SynergyDesign.build(X, static["cov"])
+        fitted = design.columns(cols)[0] @ np.asarray(post["weight_mean"])
+        flat = X.reshape(len(X), -1)
+        raw = {"ndvi": flat[:, cols[0]], "gvi": flat[:, cols[1]]}
+        comp = cgi_formulas.compute_cgi("synergy_gm_gvi", self.params, raw)
+        comp_r = comp - design.basis @ (design.basis.T @ comp)
+        self.assertAlmostEqual(float(np.corrcoef(comp_r, fitted)[0, 1]), 1.0, places=6)
 
 
 def _retune_stub(n=600, seed=3):
@@ -197,6 +273,7 @@ def _retune_stub(n=600, seed=3):
         gvi_buffer_max_m=900.0,
         negative_control_columns=["grip"],
         is_longitudinal=False,
+        is_panel=False,
         ndvi_buffer_step_m=150.0,
         gvi_buffer_step_m=150.0,
         ndvi_ladder_spacing="linear",
@@ -211,10 +288,12 @@ def _retune_stub(n=600, seed=3):
     )
     eng._preaggr_radii = lambda: (list(RADII), list(RADII))
     eng._sweep_objective = lambda metric: None
+    eng._synergy_design = _entity_cells(X, static)
     for name in (
         "_params_from_sweep",
         "_index_layout",
-        "_channel_scaling",
+        "_search_radii",
+        "_inner_split_groups",
         "_ladder_description",
         "fit_bayesian_index",
         "retune_concordance",
@@ -242,7 +321,7 @@ class TestRetuneOnAControl(unittest.TestCase):
             radius_kernel="dirichlet",
         )
         cls.target = cls.eng.fit_bayesian_index(
-            "r2", reps=0, shuffles=0, gain_splits=0, gain_perm=0, null_runs=0, **kw
+            "r2", reps=0, shuffles=0, gain_splits=0, null_runs=0, **kw
         )
         kw.pop("radius_kernel")
         cls.formula_before = cls.eng.cgi_formula

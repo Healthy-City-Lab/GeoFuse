@@ -117,6 +117,23 @@ class FingerprintTests(unittest.TestCase):
         )
         self.assertEqual(len({a, b, c}), 3)
 
+    def test_only_a_missing_level_on_a_categorical_covariate_splits_the_hash(self):
+        fp = runners._fusion_config_fingerprint
+        cats = {"age": "categorical"}
+        plain = fp(**self.BASE, covariate_types=cats)
+        self.assertEqual(
+            plain, fp(**self.BASE, covariate_types=cats, categorical_missing="drop")
+        )
+        self.assertNotEqual(
+            plain,
+            fp(**self.BASE, covariate_types=cats, categorical_missing="indicator"),
+        )
+        numeric = {"age": "numeric"}
+        self.assertEqual(
+            fp(**self.BASE, covariate_types=numeric),
+            fp(**self.BASE, covariate_types=numeric, categorical_missing="indicator"),
+        )
+
 
 class LadderWidgetTests(unittest.TestCase):
     """The ladder row: spacing switches which of step / rungs is live."""

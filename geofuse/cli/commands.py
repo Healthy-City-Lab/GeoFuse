@@ -93,6 +93,8 @@ def _add_setting_flags(
                 kw["action"] = argparse.BooleanOptionalAction
             elif s.kind == "multichoice":
                 kw.update(nargs="+", choices=list(s.choices), metavar="STAT")
+            elif s.kind == "chains":
+                kw.update(nargs="+", metavar="'NAME: OP, OP'")
             elif s.kind == "choice":
                 kw["choices"] = list(s.choices)
             elif s.kind in ("int", "float"):
@@ -166,6 +168,9 @@ def _load(args):
         specs = expand(run)
     except (RunFileError, PlanError, _settings.SettingError) as exc:
         raise CliError(str(exc)) from exc
+    for spec in specs:
+        for note in spec.notes:
+            print(f"warning: {spec.step}: {note}", file=sys.stderr)
     return run, _pick(args, specs)
 
 

@@ -262,6 +262,11 @@ def _render_details(rec) -> None:
         st.write(
             f"**Covariates:** {', '.join(_cov_disp(c) for c in covs) if covs else '—'}"
         )
+        if any(str(t).lower() == "categorical" for t in cov_types.values()):
+            st.write(
+                "**Missing categorical values:** "
+                f"{p.get('categorical_missing') or 'drop'}"
+            )
         mods = p.get("moderator_columns") or []
         st.write(
             f"**Effect modifiers:** "

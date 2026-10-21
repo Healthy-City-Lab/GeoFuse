@@ -242,6 +242,29 @@ class TestNegativeControlExport(unittest.TestCase):
         self.assertEqual(rows[1]["radius_profile_tv"], "0.7")
 
 
+class TestCovariateMissingExport(unittest.TestCase):
+    def _manifest(self, out):
+        import json
+
+        with open(os.path.join(out, "results_summary.json"), encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_the_manifest_carries_the_missing_covariate_counts(self):
+        report = {
+            "categorical_missing": "drop",
+            "n_rows": 120,
+            "covariates": [
+                {"column": "sex", "type": "categorical", "n_missing": 3},
+            ],
+            "rows_dropped": 3,
+        }
+        manifest = self._manifest(_write(covariate_missing=report))
+        self.assertEqual(manifest["covariate_missing"], report)
+
+    def test_a_run_without_covariates_records_none(self):
+        self.assertIsNone(self._manifest(_write())["covariate_missing"])
+
+
 class TestNegativeControlHelper(unittest.TestCase):
     def test_the_params_carry_the_per_control_results(self):
         from geofuse.jobs.fusion_outputs import _negative_control_report

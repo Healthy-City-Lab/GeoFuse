@@ -127,11 +127,21 @@ def iqr_scaled_effect(
 # ────────────────────────────────────────────────────────────────────
 
 
-def make_ols_fitter(outcome: np.ndarray) -> Fitter:
-    """An OLS :data:`Fitter` bound to *outcome*."""
+def make_ols_fitter(outcome: np.ndarray, groups: np.ndarray | None = None) -> Fitter:
+    """An OLS :data:`Fitter` bound to *outcome*.
+
+    With *groups* (one label per row, e.g. the entity of a panel) the covariance
+    is the cluster-robust CR1 sandwich over those groups and the tests use
+    ``G − 1`` degrees of freedom, so the rows of one entity are not counted as
+    independent evidence.
+    """
     from scipy import stats
 
     y = np.asarray(outcome, dtype=np.float64)
+    codes = n_groups = None
+    if groups is not None:
+        _, codes = np.unique(np.asarray(groups), return_inverse=True)
+        n_groups = int(codes.max()) + 1 if codes.size else 0
 
     def _fit(design: np.ndarray, names: Sequence[str]) -> dict | None:
         X = np.asarray(design, dtype=np.float64)
@@ -152,9 +162,23 @@ def make_ols_fitter(outcome: np.ndarray) -> Fitter:
         except np.linalg.LinAlgError:
             beta = xtx_inv @ (X.T @ y)
         resid = y - X @ beta
-        dof = n - p
-        sigma2 = float(resid @ resid) / dof
-        cov_beta = xtx_inv * sigma2
+        if codes is None:
+            dof = n - p
+            sigma2 = float(resid @ resid) / dof
+            cov_beta = xtx_inv * sigma2
+        else:
+            if n_groups < 2:
+                return None
+            ux = X * resid[:, None]
+            scores = np.column_stack(
+                [
+                    np.bincount(codes, weights=ux[:, j], minlength=n_groups)
+                    for j in range(p)
+                ]
+            )
+            correction = n_groups / (n_groups - 1) * (n - 1) / (n - p)
+            cov_beta = correction * (xtx_inv @ (scores.T @ scores) @ xtx_inv)
+            dof = n_groups - 1
         se = np.sqrt(np.clip(np.diag(cov_beta), 0.0, None))
         with np.errstate(divide="ignore", invalid="ignore"):
             tvals = np.where(se > 0, beta / se, 0.0)
@@ -200,8 +224,12 @@ def quartile_terms(
     *,
     n_groups: int = 4,
     logistic: bool = False,
+    cut_points=None,
 ) -> dict | None:
     """Exposure as quantile indicators against the lowest group.
+
+    ``cut_points`` fixes the group boundaries, so a subset is grouped by the
+    quantiles of the whole data.
 
     Returns one contrast per group above the reference, each with its
     coefficient, standard error, p-value, and (for a logistic fit) odds ratio.
@@ -211,8 +239,22 @@ def quartile_terms(
     This does not assume the gradient is linear, so a monotone set of contrasts
     is evidence about the shape rather than a restatement of the model.
     """
-    groups, cuts = exposure_quartiles(exposure, n_groups)
+    if cut_points is None:
+        groups, cuts = exposure_quartiles(exposure, n_groups)
+    else:
+        cuts = np.asarray(cut_points, dtype=np.float64)
+        values = np.asarray(exposure, dtype=np.float64)
+        groups = np.searchsorted(cuts, values, side="right")
+        groups[~np.isfinite(values)] = -1
     if groups is None:
+        return None
+    # The fitter is bound to the outcome's rows, so a row cannot be dropped here
+    # without misaligning it; callers pass complete rows.
+    if (groups < 0).any() or (
+        covariates is not None
+        and np.size(covariates)
+        and not np.isfinite(np.asarray(covariates, dtype=np.float64)).all()
+    ):
         return None
     valid = groups >= 0
     present = sorted(int(g) for g in np.unique(groups[valid]))
@@ -279,24 +321,34 @@ def quartile_terms(
 # ────────────────────────────────────────────────────────────────────
 
 
-def _natural_cubic_basis(x: np.ndarray, df: int = SPLINE_DF) -> np.ndarray | None:
-    """Natural cubic spline basis for *x*, or ``None`` if it cannot be built."""
+def _natural_cubic_basis(
+    x: np.ndarray, df: int = SPLINE_DF, at: np.ndarray | None = None
+) -> tuple[np.ndarray, np.ndarray | None] | None:
+    """Natural cubic spline basis for *x*, or ``None`` if it cannot be built.
+
+    Returns ``(basis on x, basis on at)``. The knots are placed on *x* alone and
+    reused for *at*, so evaluation points never move them.
+    """
     try:
-        from patsy import dmatrix
+        from patsy import build_design_matrices, dmatrix
     except Exception:
         logger.warning(
             "patsy is unavailable; the spline non-linearity test is skipped."
         )
         return None
     try:
-        basis = np.asarray(
-            dmatrix("cr(v, df=d) - 1", {"v": x, "d": df}, return_type="dataframe"),
-            dtype=np.float64,
-        )
+        frame = dmatrix("cr(v, df=d) - 1", {"v": x, "d": df}, return_type="dataframe")
+        basis = np.asarray(frame, dtype=np.float64)
+        at_basis = None
+        if at is not None:
+            (at_frame,) = build_design_matrices([frame.design_info], {"v": at, "d": df})
+            at_basis = np.asarray(at_frame, dtype=np.float64)
     except Exception as exc:
         logger.warning(f"spline basis failed: {exc}")
         return None
-    return basis if basis.ndim == 2 and basis.shape[1] >= 2 else None
+    if basis.ndim != 2 or basis.shape[1] < 2:
+        return None
+    return basis, at_basis
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -375,7 +427,6 @@ def moderation_terms(
 
     columns: list[np.ndarray] = [np.ones(n), g]
     names: list[str] = ["intercept", "greenery"]
-    products: list[tuple[str, float]] = []
     levels: list[float] = []
 
     if categorical:
@@ -405,8 +456,9 @@ def moderation_terms(
             names.append(f"cov{j}")
 
     design = np.column_stack(columns)
-    mask = np.isfinite(design).all(axis=1)
-    if mask.sum() < 20:
+    # The fitter is bound to the outcome's rows, so incomplete rows are refused
+    # rather than dropped; callers pass complete rows.
+    if not np.isfinite(design).all():
         return None
     fitted = fitter(design, names)
     if fitted is None:
@@ -486,7 +538,7 @@ def moderation_terms(
         "moderator": moderator_name,
         "categorical": bool(categorical),
         "centred_at": centre,
-        "n": int(mask.sum()),
+        "n": int(n),
         "interaction_wald_chi2": stat,
         "interaction_df": dof,
         "interaction_p": interaction_p,
@@ -547,9 +599,11 @@ def spline_nonlinearity_test(
     from scipy import stats
 
     x = np.asarray(exposure, dtype=np.float64)
-    basis = _natural_cubic_basis(x, df)
-    if basis is None:
+    grid = np.linspace(np.nanpercentile(x, 1), np.nanpercentile(x, 99), _CURVE_POINTS)
+    built = _natural_cubic_basis(x, df, at=grid)
+    if built is None:
         return None
+    basis, grid_basis = built
 
     n = len(x)
     linear_part = np.column_stack([np.ones(n), x])
@@ -600,16 +654,15 @@ def spline_nonlinearity_test(
     p_nonlinear = float(stats.chi2.sf(stat, dof)) if np.isfinite(stat) else float("nan")
 
     # Fitted curve: the linear term plus the non-linear block, evaluated on a
-    # grid. The grid rows are appended to the data before building the basis so
-    # the knot placement is identical, then orthogonalised the same way.
+    # grid with the knots of the fit. The block is the basis minus its
+    # least-squares projection on [1, x], so the grid takes the coefficients
+    # of that projection rather than a projection of its own.
     curve = None
-    grid = np.linspace(np.nanpercentile(x, 1), np.nanpercentile(x, 99), _CURVE_POINTS)
-    joint = _natural_cubic_basis(np.concatenate([x, grid]), df)
-    if joint is not None and joint.shape[1] == basis.shape[1]:
-        joint_linear = np.column_stack([np.ones(len(joint)), np.concatenate([x, grid])])
-        q = col_basis(joint_linear)
-        joint_nl = (joint - q @ (q.T @ joint))[:, kept]
-        yhat = fitted["linear"][0] * grid + joint_nl[n:] @ beta_nl
+    if grid_basis is not None:
+        proj, *_ = np.linalg.lstsq(linear_part, basis[:, kept], rcond=None)
+        grid_linear = np.column_stack([np.ones(len(grid)), grid])
+        grid_nl = grid_basis[:, kept] - grid_linear @ proj
+        yhat = fitted["linear"][0] * grid + grid_nl @ beta_nl
         centre = float(np.interp(float(np.nanmedian(x)), grid, yhat))
         curve = {
             "exposure": [float(v) for v in grid],
@@ -635,3 +688,89 @@ def spline_nonlinearity_test(
         ],
         "curve": curve,
     }
+
+
+# ────────────────────────────────────────────────────────────────────
+# Whole-data estimates, held-out inference
+# ────────────────────────────────────────────────────────────────────
+
+# Keys that describe sampling uncertainty rather than the estimate itself.
+_INFERENCE_KEYS = frozenset(
+    {
+        "std_error",
+        "std_err",
+        "cgi_std_err",
+        "z",
+        "t_stat",
+        "p_value",
+        "pvalue",
+        "p_display",
+        "ci_low",
+        "ci_high",
+        "or_ci_low",
+        "or_ci_high",
+        "lower",
+        "upper",
+        "trend_p",
+        "interaction_p",
+        "interaction_wald_chi2",
+        "interaction_df",
+        "nonlinearity_p",
+        "wald_chi2",
+        "wald_df",
+        "linear_p",
+        "exact_wald",
+    }
+)
+# Keys that name a row of a result table, so held-out rows pair by name.
+_ROW_KEYS = ("group", "level", "term", "key", "covariate", "name")
+_ESTIMATE_KEYS = ("estimate", "coef", "slope", "observed_diff")
+# Two-sided 5 % test at 80 % power: z_0.975 + z_0.8.
+MDE_SE_MULTIPLE = 2.8
+
+
+def _paired(row, i: int, rows: list):
+    if isinstance(row, dict):
+        for k in _ROW_KEYS:
+            if k in row:
+                return next(
+                    (r for r in rows if isinstance(r, dict) and r.get(k) == row[k]),
+                    None,
+                )
+    return rows[i] if i < len(rows) else None
+
+
+def split_inference(whole, test):
+    """Estimates from ``whole``, their uncertainty from ``test``.
+
+    ``whole`` and ``test`` are the same analysis on every row and on the
+    held-out rows. The composite was chosen with the training rows' outcome,
+    so only the held-out rows give honest p-values and intervals; estimates
+    and curves keep every row and are descriptive. Each row with a standard
+    error also gets the held-out estimate its interval belongs to and the
+    minimum detectable effect, :data:`MDE_SE_MULTIPLE` held-out standard
+    errors. Inference with no held-out counterpart is ``None``. Held-out
+    inference is kept even where ``whole`` carries none, as when the
+    whole-data pass skips its bootstrap.
+    """
+    if isinstance(whole, dict):
+        t = test if isinstance(test, dict) else {}
+        out = {
+            k: t.get(k) if k in _INFERENCE_KEYS else split_inference(v, t.get(k))
+            for k, v in whole.items()
+        }
+        for k in _INFERENCE_KEYS & (t.keys() - whole.keys()):
+            out[k] = t[k]
+        if "std_error" in out or "std_err" in out:
+            se = t.get("std_error", t.get("std_err"))
+            out["test_estimate"] = next((t[k] for k in _ESTIMATE_KEYS if k in t), None)
+            out["mde"] = (
+                MDE_SE_MULTIPLE * float(se)
+                if se is not None and np.isfinite(se)
+                else None
+            )
+        return out
+    if isinstance(whole, list):
+        rows = test if isinstance(test, list) else []
+        return [split_inference(w, _paired(w, i, rows)) for i, w in enumerate(whole)]
+    return whole

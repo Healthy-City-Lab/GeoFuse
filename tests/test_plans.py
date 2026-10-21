@@ -158,6 +158,37 @@ class ExpandTests(_Case):
         self.assertEqual(fusion.depends_on, ["ndvi.city", "gvi.city"])
         self.assertEqual(fusion.options["layer"], "layer1")
 
+    def test_the_objective_defaults_to_r2_and_is_checked_for_size(self):
+        base = f"""
+            output_dir = {self.dir!r}
+            [[fusion]]
+            target = "cohort.gpkg"
+            outcomes = ["cesd"]
+            ndvi = "ndvi_2015.tif"
+            gvi = "gvi.gpkg"
+            """
+        (spec,) = self.expand(base)
+        self.assertEqual(spec.settings["objective_metric"], "r2")
+        self.assertEqual(spec.notes, [])
+        pdcor = base + 'objective_metric = "partial_distance_corr"\n'
+        self.assertEqual(self.expand(pdcor)[0].notes, [])
+
+        _points(
+            os.path.join(self.dir, "cohort.gpkg"),
+            n=7_000,
+            cesd=[1.0] * 7_000,
+        )
+        from unittest import mock
+
+        with mock.patch.object(plans, "_physical_memory", return_value=10**12):
+            (spec,) = self.expand(pdcor)
+        self.assertIn("7,000", spec.notes[0])
+        with mock.patch.object(plans, "_physical_memory", return_value=10**9):
+            with self.assertRaisesRegex(PlanError, "allow_large_objective"):
+                self.expand(pdcor)
+            (spec,) = self.expand(pdcor + "allow_large_objective = true\n")
+        self.assertEqual(len(spec.notes), 1)
+
     def test_plan_errors_name_the_problem(self):
         base = """
             [[ndvi]]
@@ -174,8 +205,10 @@ class ExpandTests(_Case):
             ndvi = "@ndvi.city"
             gvi = {2015 = "gvi.gpkg", 2018 = "gvi.gpkg"}
             """
-        with self.assertRaisesRegex(PlanError, r"several statistics .*\[mean\]"):
+        with self.assertRaisesRegex(PlanError, r"several outputs .*\[mean\]"):
             self.expand(base)
+        with self.assertRaisesRegex(PlanError, "no output named 'p90'"):
+            self.expand(base.replace("@ndvi.city", "@ndvi.city[p90]"))
         with self.assertRaisesRegex(PlanError, "no GVI file for 2018"):
             self.expand(
                 base.replace("@ndvi.city", "@ndvi.city[max]"),
@@ -188,6 +221,61 @@ class ExpandTests(_Case):
             )
         with self.assertRaisesRegex(PlanError, "has no column 'yr'"):
             self.expand(base, ["ndvi.city.year_column=yr"])
+
+    def test_chains_replace_the_statistics_of_every_date_mode(self):
+        specs = self.expand(
+            """
+            [defaults.ndvi]
+            chains = [
+              {name = "f500", steps = ["focal:mean:500", "temporal:mean",
+                                       "water_mask"]},
+              {name = "max", steps = ["temporal:max"]},
+            ]
+
+            [[ndvi]]
+            name = "city"
+            study_area = "city.gpkg"
+            ranges = [[2019-05-01, 2019-09-30]]
+            year_column = "year"
+            statistics_column = ["mean"]
+            chains_ranges = ["r: temporal:median"]
+
+            [[fusion]]
+            target = "cohort.gpkg"
+            outcomes = ["cesd"]
+            mode = "year-aware"
+            date_column = "visit"
+            ndvi = "@ndvi.city[f500]"
+            gvi = {2015 = "gvi.gpkg", 2018 = "gvi.gpkg"}
+            """
+        )
+        ranged, column, fusion = specs
+        self.assertEqual(
+            {k: os.path.basename(p) for k, p in ranged.outputs["files"].items()},
+            {"r": "city_20190501_20190930_r_ndvi.tif"},
+        )
+        self.assertEqual(sorted(column.outputs["years"]), ["f500", "max"])
+        self.assertEqual(
+            {y: os.path.basename(p) for y, p in fusion.options["ndvi_files"].items()},
+            {"2015": "city_2015_f500_ndvi.tif", "2018": "city_2018_f500_ndvi.tif"},
+        )
+        sub = plans.build(column)
+        chains = column.settings["chains_column"]
+        self.assertEqual(sub.kwargs["chains"], chains)
+        self.assertEqual(sub.params["chains"], chains)
+        self.assertEqual(chains[0]["steps"][0], "focal:mean:500")
+
+    def test_ndvi_jobs_without_chains_pass_none(self):
+        (spec,) = self.expand(
+            '[[ndvi]]\nstudy_area = "city.gpkg"\nranges = [[2019-05-01, 2019-09-30]]\n'
+        )
+        sub = plans.build(spec)
+        self.assertNotIn("chains", sub.kwargs)
+        self.assertNotIn("chains", sub.params)
+        self.assertEqual(
+            os.path.basename(spec.outputs["files"]["median"]),
+            "city_20190501_20190930_ndvi.tif",
+        )
 
     def test_filename_lists_match_years(self):
         (fusion,) = self.expand(
@@ -266,6 +354,14 @@ class BuildTests(_Case):
         run = plans.build(fusion).kwargs["run_kwargs"]
         self.assertEqual(run["report_paired_bootstrap"], 500)
         self.assertNotIn("report_effects_bootstrap", run)
+
+    def test_gvi_log_points_reaches_the_run(self):
+        step = '[[gvi]]\nstudy_area = "city.gpkg"\n'
+        (quiet,) = self.expand(step)
+        (loud,) = self.expand(step + "log_points = true\n")
+        self.assertIs(plans.build(quiet).kwargs["run_args"]["log_points"], False)
+        self.assertIs(plans.build(loud).kwargs["run_args"]["log_points"], True)
+        self.assertIs(plans.build(loud).params["log_points"], True)
 
 
 class ShardTests(_Case):
@@ -463,6 +559,43 @@ class TabParityTests(_Case):
         )
         self.assert_same(gui, plans.build(spec))
 
+    def test_ndvi_tab_chains(self):
+        lines = ["f500: focal:mean:500, temporal:mean, water_mask", "max: temporal:max"]
+        gui = self.click(
+            "ndvi",
+            {
+                "ndvi_picked_paths": [self.city],
+                "ndvi_chains_ranges_city.gpkg": "\n".join(lines),
+            },
+            f"ndvi.render({self.out!r})",
+            "ndvi_run_btn",
+        )
+        (spec,) = self.expand(
+            f"""
+            output_dir = {self.out!r}
+            [[ndvi]]
+            study_area = "city.gpkg"
+            ranges = [[2023-06-01, 2023-09-30]]
+            chains_ranges = {lines!r}
+            """
+        )
+        self.assert_same(gui, plans.build(spec))
+        self.assertEqual([c["name"] for c in gui[3]["chains"]], ["f500", "max"])
+
+    def test_ndvi_tab_refuses_a_chain_that_does_not_check(self):
+        at = self.click(
+            "ndvi",
+            {
+                "ndvi_picked_paths": [self.city],
+                "ndvi_chains_ranges_city.gpkg": "g7: temporal:mean, temporal:max",
+            },
+            f"ndvi.render({self.out!r})",
+            "ndvi_run_btn",
+            submits=0,
+        )
+        errors = [e.value for e in at.error]
+        self.assertTrue(any("Chain 'g7'" in e for e in errors), errors)
+
     def test_gvi_tab(self):
         gui = self.click(
             "gvi",
@@ -578,6 +711,68 @@ class TabParityTests(_Case):
             gvi = "gvi.gpkg"
             """
         )
+        self.assert_same(gui, plans.build(spec))
+
+    def test_fusion_tab_comparators(self):
+        seed = {
+            "fusion_target_paths": [self.cohort],
+            "fusion_target_upload_sig": (self.cohort, os.path.getsize(self.cohort)),
+            "fusion_outcome_columns": ["cesd"],
+            "fusion_comparators": ["grip", "age"],
+            "fusion_comparators_primary": ["grip"],
+            "fusion_run_mode": "Cross-sectional",
+            "fusion_ndvi_paths": [os.path.join(self.dir, "ndvi_2015.tif")],
+            "fusion_gvi_paths": [os.path.join(self.dir, "gvi.gpkg")],
+        }
+        gui = self.click(
+            "fusion", seed, f"fusion.render({self.out!r})", "fusion_form_run_submit"
+        )
+        (spec,) = self.expand(
+            f"""
+            output_dir = {self.out!r}
+            [[fusion]]
+            target = "cohort.gpkg"
+            outcomes = ["cesd"]
+            comparators = ["grip", "age"]
+            comparators_primary = ["grip"]
+            ndvi = "ndvi_2015.tif"
+            gvi = "gvi.gpkg"
+            """
+        )
+        self.assertEqual(gui[2][0]["comparators"], ["grip", "age"])
+        self.assertEqual(gui[2][0]["comparators_primary"], ["grip"])
+        self.assert_same(gui, plans.build(spec))
+
+    def test_fusion_tab_missing_category_level(self):
+        seed = {
+            "fusion_target_paths": [self.cohort],
+            "fusion_target_upload_sig": (self.cohort, os.path.getsize(self.cohort)),
+            "fusion_outcome_columns": ["cesd"],
+            "fusion_covariate_categorical": ["age"],
+            "fusion_run_mode": "Cross-sectional",
+            "fusion_ndvi_paths": [os.path.join(self.dir, "ndvi_2015.tif")],
+            "fusion_gvi_paths": [os.path.join(self.dir, "gvi.gpkg")],
+        }
+        gui = self.click(
+            "fusion",
+            seed,
+            f"fusion.render({self.out!r})",
+            "fusion_form_run_submit",
+            selects={"fusion_categorical_missing": "indicator"},
+        )
+        (spec,) = self.expand(
+            f"""
+            output_dir = {self.out!r}
+            [[fusion]]
+            target = "cohort.gpkg"
+            outcomes = ["cesd"]
+            categorical = ["age"]
+            categorical_missing = "indicator"
+            ndvi = "ndvi_2015.tif"
+            gvi = "gvi.gpkg"
+            """
+        )
+        self.assertEqual(gui[2][0]["categorical_missing"], "indicator")
         self.assert_same(gui, plans.build(spec))
 
 

@@ -2,8 +2,9 @@
 
 The engine is replaced by a stub that records its arguments and writes the
 files a real download would, so the tests pin the runner contract: the chosen
-statistics reach ``download_and_process``, and the job's output paths name each
-statistic's files (median unsuffixed, the others ``_<stat>_ndvi``).
+statistics (or aggregation chains) reach ``download_and_process``, and the
+job's output paths name each output's files (median unsuffixed, the others
+``_<stat>_ndvi``, a chain ``_<chain>_ndvi``).
 """
 
 import os
@@ -20,7 +21,8 @@ import geopandas as gpd
 from shapely.geometry import Point
 
 from geofuse.jobs import runners
-from geofuse.ndvi import ndvi_output_name, normalize_temporal_reducers
+from geofuse.ndvi import normalize_temporal_reducers
+from geofuse.ndvi_chains import output_stems
 
 
 class _Ctx:
@@ -47,8 +49,13 @@ class _StubEngine:
 
     def download_and_process(self, **kw):
         _StubEngine.calls.append(kw)
-        for r in normalize_temporal_reducers(kw["temporal_reducers"]):
-            stem = os.path.join(kw["folder"], ndvi_output_name(kw["output_name"], r))
+        stems = output_stems(
+            kw["output_name"],
+            normalize_temporal_reducers(kw["temporal_reducers"]),
+            kw["chains"] or (),
+        )
+        for base in stems.values():
+            stem = os.path.join(kw["folder"], base)
             for suffix in ("_ndvi.tif", "_ndvi.json"):
                 with open(stem + suffix, "w") as f:
                     f.write("x")
@@ -219,6 +226,104 @@ class RunnerTests(unittest.TestCase):
                 "site_2018_mean_ndvi.json",
             ],
         )
+
+    def test_chains_reach_the_engine_and_name_the_files(self):
+        chains = [
+            {"name": "g01", "steps": ["focal:mean:250", "temporal:mean"]},
+            {"name": "mean", "steps": ["temporal:mean"]},
+        ]
+        out = runners.run_ndvi(
+            _Ctx(),
+            fname="site.geojson",
+            dataset_data={"raw": _points([2020])},
+            start_date="2023-06-01",
+            end_date="2023-09-30",
+            output_name="site",
+            chains=chains,
+            **self._common(),
+        )
+        column = runners.run_ndvi_column(
+            _Ctx(),
+            fname="site.geojson",
+            dataset_data={"raw": _points([2015])},
+            date_column="year",
+            season_start_month=5,
+            season_end_month=9,
+            chains=chains,
+            **self._common(),
+        )
+        self.assertEqual([c["chains"] for c in _StubEngine.calls], [chains] * 2)
+        self.assertEqual(
+            [os.path.basename(p) for p in out["output_paths"]],
+            [
+                "site_g01_ndvi.tif",
+                "site_g01_ndvi.json",
+                "site_mean_ndvi.tif",
+                "site_mean_ndvi.json",
+            ],
+        )
+        self.assertEqual(
+            [os.path.basename(p) for p in column["output_paths"][1:]],
+            [
+                "site_2015_g01_ndvi.tif",
+                "site_2015_g01_ndvi.json",
+                "site_2015_mean_ndvi.tif",
+                "site_2015_mean_ndvi.json",
+            ],
+        )
+
+
+class SubprocessPayloadTests(unittest.TestCase):
+    """What the executor sends is what the child entry points take."""
+
+    def test_chains_reach_the_child(self):
+        import inspect
+        from types import SimpleNamespace
+
+        from geofuse.persistence.job_executor import JobExecutor
+
+        chains = [{"name": "g01", "steps": ["focal:mean:250", "temporal:mean"]}]
+        sent = []
+        executor = JobExecutor.__new__(JobExecutor)
+        common = {
+            "fname": "site.geojson",
+            "dataset_data": {"raw": _points([2020])},
+            "cloud_pct": 10,
+            "resolution": 30,
+            "buffer_m": 0,
+            "output_dir": "out",
+            "save_geotiff": True,
+            "save_geojson": False,
+            "save_gpkg": False,
+            "chains": chains,
+        }
+        with mock.patch.object(
+            JobExecutor,
+            "submit_subprocess_job",
+            lambda _self, _record, target, payload, **_kw: sent.append(
+                (target, payload)
+            ),
+        ):
+            record = SimpleNamespace(id="job1")
+            executor.submit_ndvi_subprocess(
+                record,
+                start_date="2023-06-01",
+                end_date="2023-09-30",
+                output_name="site",
+                **common,
+            )
+            executor.submit_ndvi_column_subprocess(
+                record,
+                date_column="year",
+                season_start_month=5,
+                season_end_month=9,
+                **common,
+            )
+        self.assertEqual(len(sent), 2)
+        for target, payload in sent:
+            params = inspect.signature(target).parameters
+            self.assertLessEqual(set(payload), set(params), target.__name__)
+            self.assertEqual(payload["chains"], chains)
 
 
 if __name__ == "__main__":

@@ -27,6 +27,9 @@ study_area = "data/area.gpkg"      # a path, or a list of paths
 ranges = [[2023-06-01, 2023-09-30]]     # both ends included
 # specific_dates = [2023-07-15]         # +/- specific_window_days
 # year_column = "year"                  # one composite per year, season months
+# chains = [                            # aggregation chains, in place of statistics
+#   {name = "f500", steps = ["focal:mean:500", "temporal:mean", "water_mask"]},
+# ]
 """,
     "gvi": """\
 name = "area"
@@ -45,13 +48,15 @@ outcomes = ["outcome"]
 # covariates = ["age", "income"]
 # categorical = ["sex"]            # one-hot encoded; also covariates
 # moderators = ["sex"]
+# comparators = ["ndvi_500m"]      # existing exposure columns; never tuned
+# comparators_primary = ["ndvi_500m"]  # Holm family; default: all comparators
 mode = "cross-sectional"           # or "year-aware", "longitudinal"
 # date_column = "visit_date"       # year-aware and longitudinal
 # entity_column = "id"             # longitudinal
 # assign_by = "year"               # longitudinal: "year" or "wave"
 # wave_column = "wave"             # longitudinal, assign_by = "wave"
 # area_column = "fsa"              # longitudinal neighbourhood fixed effects
-ndvi = "@ndvi.area"                # a file, {year = file}, [files], or @ndvi.STEP[stat]
+ndvi = "@ndvi.area"                # a file, {year = file}, [files], or @ndvi.STEP[name]
 gvi = "@gvi.area"                  # a file, {year = file}, [files], or @gvi.STEP
 """,
 }

@@ -360,6 +360,14 @@ def _fs_default(name: str):
     return _FS[name].default
 
 
+@st.cache_data(show_spinner=False)
+def _physical_memory_bytes() -> int:
+    """This machine's RAM, read once per session."""
+    from geofuse.parallel import physical_memory_bytes
+
+    return physical_memory_bytes()
+
+
 def _fs_bounds(name: str) -> dict:
     """``min_value`` / ``max_value`` of a setting, typed like the setting."""
     s = _FS[name]
@@ -448,15 +456,21 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "cgi_formula",
     "covariate_columns",
     "covariate_types",
+    "categorical_missing",
     "moderator_columns",
     "negative_controls",
+    "comparators",
+    "comparators_primary",
     "exposure_iqr",
     "standalone_channels",
     "longitudinal_spec_payload",
     "cgi_grid_spacing_m",
+    "exposure_kernel",
+    "exposure_radius_m",
+    "exposure_plateau_m",
+    "exposure_sigma_m",
     "whole_grid_scaling",
     "area_balanced_split",
-    "normalize_channels",
     "spatial_adjust_method",
     "spatial_adjust_max_df",
     "spatial_adjust_eps_m",
@@ -469,14 +483,15 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "discovery_reps",
     "discovery_shuffles",
     "gain_splits",
-    "gain_permutations",
     "null_calibration_runs",
     "posterior_draws",
     "posterior_warmup",
     "posterior_chains",
     "radius_prior",
+    "gvi_min_coverage",
     "check_collinearity",
     "vif_threshold",
+    "drop_collinear_channels",
 )
 
 # Buffer-ladder spacings (``metric_sampling.LADDER_SPACINGS``).
@@ -488,11 +503,18 @@ _RADIUS_PRIOR_LABELS: dict[str, str] = {
     "range": "Range-based (spacing-invariant)",
 }
 
+# Missing categorical covariate values (``settings.CATEGORICAL_MISSING``).
+_CATEGORICAL_MISSING_LABELS: dict[str, str] = {
+    "drop": "Drop the row",
+    "indicator": "Keep as a level of its own",
+}
+
 # Recorded param -> form widget key. Re-run seeds these so the normal setup
 # form comes up filled in; anything not listed keeps its own default.
 _FUSION_PARAM_TO_WIDGET: dict[str, str] = {
     "objective_metric": "fusion_objective_metric",
     "residualize_method": "fusion_residualize_method",
+    "categorical_missing": "fusion_categorical_missing",
     "search_scoring_method": "fusion_search_scoring_method",
     "test_size": "fusion_test_size",
     "n_bins": "fusion_stratification_bins",
@@ -502,17 +524,21 @@ _FUSION_PARAM_TO_WIDGET: dict[str, str] = {
     "discovery_reps": "fusion_discovery_reps",
     "discovery_shuffles": "fusion_discovery_shuffles",
     "gain_splits": "fusion_gain_splits",
-    "gain_permutations": "fusion_gain_permutations",
     "null_calibration_runs": "fusion_null_calibration_runs",
     "posterior_draws": "fusion_posterior_draws",
     "posterior_chains": "fusion_posterior_chains",
     "radius_prior": "fusion_radius_prior",
+    "gvi_min_coverage": "fusion_gvi_min_coverage",
     "check_collinearity": "fusion_check_collinearity",
     "vif_threshold": "fusion_vif_threshold",
+    "drop_collinear_channels": "fusion_drop_collinear_channels",
     "cgi_grid_spacing_m": "fusion_cgi_grid_spacing_m",
+    "exposure_kernel": "fusion_exposure_kernel",
+    "exposure_radius_m": "fusion_exposure_radius_m",
+    "exposure_plateau_m": "fusion_exposure_plateau_m",
+    "exposure_sigma_m": "fusion_exposure_sigma_m",
     "whole_grid_scaling": "fusion_whole_grid_scaling",
     "area_balanced_split": "fusion_area_balanced_split",
-    "normalize_channels": "fusion_normalize_channels",
     "spatial_split": "fusion_spatial_split",
     "spatial_block_size_m": "fusion_spatial_block_size_m",
     "spatial_adjust_method": "fusion_spatial_adjust_method",
@@ -550,7 +576,6 @@ _FUSION_SEED_INT_WIDGETS: frozenset[str] = frozenset(
         "fusion_discovery_reps",
         "fusion_discovery_shuffles",
         "fusion_gain_splits",
-        "fusion_gain_permutations",
         "fusion_null_calibration_runs",
         "fusion_posterior_draws",
         "fusion_posterior_chains",
@@ -604,6 +629,10 @@ def _seed_fusion_form(p: dict) -> None:
     )
     st.session_state["fusion_negative_controls"] = list(
         p.get("negative_controls") or []
+    )
+    st.session_state["fusion_comparators"] = list(p.get("comparators") or [])
+    st.session_state["fusion_comparators_primary"] = list(
+        p.get("comparators_primary") or []
     )
     st.session_state["fusion_exposure_iqr"] = float(p.get("exposure_iqr") or 0.0)
 
@@ -1590,21 +1619,44 @@ def _render_study_details_panel(
             # Options are the full static column list, so this doesn't depend on
             # the selection above and stays form-safe.
             detected = ", ".join(categorical_candidates[:8]) or "none"
-            _keep_valid(
-                "fusion_covariate_categorical", available_covariates, multi=True
-            )
-            categorical_pick = st.multiselect(
-                "Categorical covariates (one-hot encoded)",
-                options=available_covariates,
-                key="fusion_covariate_categorical",
-                help=(
-                    "One-hot encoded (drop-first) and entered as dummy controls. "
-                    "Listing a column here is enough — it does not also need to "
-                    "be in the covariate list. Tag numeric-coded categories "
-                    "(e.g. an education band stored as 1–6) here too. "
-                    f"Detected as non-numeric: {detected}."
-                ),
-            )
+            col_cat, col_na = st.columns([3, 1])
+            with col_cat:
+                _keep_valid(
+                    "fusion_covariate_categorical", available_covariates, multi=True
+                )
+                categorical_pick = st.multiselect(
+                    "Categorical covariates (one-hot encoded)",
+                    options=available_covariates,
+                    key="fusion_covariate_categorical",
+                    help=(
+                        "One-hot encoded (drop-first) and entered as dummy "
+                        "controls. Listing a column here is enough — it does not "
+                        "also need to be in the covariate list. Tag "
+                        "numeric-coded categories (e.g. an education band stored "
+                        "as 1–6) here too. "
+                        f"Detected as non-numeric: {detected}."
+                    ),
+                )
+            with col_na:
+                _default(
+                    "fusion_categorical_missing",
+                    _fs_default("categorical_missing"),
+                    list(_CATEGORICAL_MISSING_LABELS),
+                )
+                categorical_missing = st.selectbox(
+                    "Missing categorical values",
+                    options=list(_CATEGORICAL_MISSING_LABELS),
+                    format_func=_CATEGORICAL_MISSING_LABELS.get,
+                    key="fusion_categorical_missing",
+                    help=(
+                        "Rows whose categorical covariate is empty. **Drop the "
+                        "row** treats them like a missing numeric covariate "
+                        "(complete cases). **Keep as a level of its own** adds a "
+                        "`<column>=missing` dummy, so they are never counted in "
+                        "the reference level. The results list how many rows "
+                        "each covariate was missing."
+                    ),
+                )
             cat_set = set(categorical_pick) & set(available_covariates)
             covariate_columns = sorted(set(numeric_pick) | cat_set)
             covariate_types = {
@@ -1664,6 +1716,7 @@ def _render_study_details_panel(
         else:
             covariate_columns = []
             covariate_types = {}
+            categorical_missing = _fs_default("categorical_missing")
             moderator_columns = []
             exposure_iqr_ui = 0.0
             st.caption(
@@ -1687,9 +1740,13 @@ def _render_study_details_panel(
             key="fusion_objective_metric",
             help=(
                 "Quantity every candidate is scored on, over held-out "
-                "rows (maximised; nrmse minimised). "
-                "**Partial distance correlation** (default) captures linear and "
-                "nonlinear association and conditions on covariates nonlinearly. "
+                "rows (maximised; nrmse minimised). Choose it by the "
+                "association you expect: **Incremental R²** (default) for a "
+                "linear one, matching the linear search and the per-SD effect; "
+                "**partial rank correlation** for a monotone one or a skewed "
+                "outcome; **partial distance correlation** for general "
+                "dependence, at small samples only (its memory grows with the "
+                "square of the rows). "
                 "**Quartile contrast** cuts the composite at its own "
                 "quartiles and maximises the size of the top-versus-bottom "
                 "difference, the way the greenspace literature reports a "
@@ -1702,6 +1759,17 @@ def _render_study_details_panel(
             st.caption(
                 ":orange[Requires a two-valued outcome column.] "
                 "A continuous outcome scores zero on every trial."
+            )
+        if objective_metric in _gf_settings.QUADRATIC_METRICS:
+            _default("fusion_allow_large_objective", False)
+            st.checkbox(
+                "Run even beyond the memory estimate",
+                key="fusion_allow_large_objective",
+                help=(
+                    "A run whose estimated memory per call exceeds this "
+                    "machine's RAM is refused, since it would page without "
+                    "finishing. Tick to run it anyway."
+                ),
             )
     with col_o2:
         _default("fusion_test_size", _fs_default("test_size"))
@@ -1912,7 +1980,7 @@ def _render_study_details_panel(
                 "again."
             ),
         )
-        clear_preaggr_cache = st.checkbox(
+        st.checkbox(
             "Clear this target's pre-aggregation cache first",
             key="fusion_clear_preaggr",
             help=(
@@ -1933,19 +2001,31 @@ def _render_study_details_panel(
         )
 
     # ── Channel collinearity check (iterative VIF) ──────────────
-    # Runs after pre-aggregation, before optimization. Drops channels
-    # whose pixel-level values are redundant with the others (high VIF).
-    # Dropped channels get pinned to weight 0 in every subsequent trial.
+    # Runs after pre-aggregation, before the search, and reports the channels
+    # whose pixel values are redundant with the others (high VIF); dropping
+    # them from the search is a separate choice.
     _default("fusion_check_collinearity", _fs_default("check_collinearity"))
     _default("fusion_vif_threshold", _fs_default("vif_threshold"))
+    _default("fusion_drop_collinear_channels", _fs_default("drop_collinear_channels"))
     col_c1, col_c2 = st.columns([2, 1])
     with col_c1:
         check_collinearity = st.checkbox(
             "Check channel collinearity (iterative VIF)",
             key="fusion_check_collinearity",
             help=(
-                "Iteratively drop the highest-VIF channel until all remaining "
-                "VIFs are below threshold, pinning dropped channels to weight 0."
+                "Report the study's channels whose variance inflation exceeds "
+                "the threshold, found by removing the highest-VIF channel until "
+                "the rest are below it."
+            ),
+        )
+        drop_collinear_channels = st.checkbox(
+            "Drop high-VIF channels",
+            key="fusion_drop_collinear_channels",
+            disabled=not check_collinearity,
+            help=(
+                "Leave the reported channels out of the index search, so the "
+                "composite gives them weight 0. Off keeps every channel and "
+                "only reports them."
             ),
         )
     with col_c2:
@@ -1997,9 +2077,11 @@ def _render_study_details_panel(
             help=(
                 "**sweep** fits both forms and keeps whichever scores better "
                 "held-out — which form wins is configuration-dependent, so "
-                "fixing it is a guess. `linear` is a weighted sum; `synergy` "
-                "reads each channel as its approximate percentile and adds "
-                "powers on the main terms and pairwise products."
+                "fixing it is a guess. `linear` is a weighted average of the "
+                "raw channels; `synergy` adds the geometric mean of every "
+                "channel pair (and of the triple), with NDVI clipped at 0 "
+                "inside them. The sweep picks synergy's cells from the linear "
+                "grid's 50 best candidates."
             ),
         )
     with col_s2:
@@ -2013,7 +2095,7 @@ def _render_study_details_panel(
                 "surface is the evidence — a single split's winner is noise."
             ),
         )
-    col_r0, _col_r1, _col_r2 = st.columns(3)
+    col_r0, col_r1, _col_r2 = st.columns(3)
     with col_r0:
         _default(
             "fusion_radius_prior",
@@ -2034,13 +2116,27 @@ def _render_study_details_panel(
                 "pulls it towards the dense top of a linear ladder."
             ),
         )
+    with col_r1:
+        _default("fusion_gvi_min_coverage", _fs_default("gvi_min_coverage"))
+        gvi_min_coverage_ui = st.number_input(
+            "Minimum GVI coverage",
+            **_fs_bounds("gvi_min_coverage"),
+            step=0.05,
+            format="%.2f",
+            key="fusion_gvi_min_coverage",
+            help=(
+                "Share of entities that must keep a cell with street-view data "
+                "at the smallest searched GVI rung. Smaller rungs that cover "
+                "fewer are not searched, and cells without data at the "
+                "smallest searched rung are left out of the study."
+            ),
+        )
 
     with st.expander("Validation & reporting", expanded=False):
         for name in (
             "discovery_reps",
             "discovery_shuffles",
             "gain_splits",
-            "gain_permutations",
             "null_calibration_runs",
             "posterior_draws",
             "posterior_chains",
@@ -2085,17 +2181,9 @@ def _render_study_details_panel(
                 key="fusion_gain_splits",
                 help=(
                     "Composite vs each standalone under the identical sweep, on "
-                    "the same held-out rows. 0 skips the comparison."
-                ),
-            )
-            gain_permutations_ui = st.number_input(
-                "Gain permutations",
-                **_fs_bounds("gain_permutations"),
-                step=10,
-                key="fusion_gain_permutations",
-                help=(
-                    "Permutation null for the *gain*, so the composite's extra "
-                    "flexibility is priced in rather than assumed away."
+                    "the same held-out rows; the gain is tested with a "
+                    "corrected resampled t-test over the splits. 0 skips the "
+                    "comparison."
                 ),
             )
             posterior_draws_ui = st.number_input(
@@ -2112,29 +2200,36 @@ def _render_study_details_panel(
             )
     posterior_warmup_ui = int(posterior_draws_ui)
 
-    # ── Per-pixel CGI scoring (vector targets) ──────────────────
-    cgi_grid_spacing_m = 50
+    # ── Per-pixel CGI scoring ───────────────────────────────────
     whole_grid_scaling = True
     area_balanced_split = True
-    normalize_channels = True
     spatial_split = False
     spatial_block_size_m: float | None = None
     n_spatial_blocks: int | None = None
     spatial_adjust_method = "none"
     spatial_adjust_max_df = 10
     spatial_adjust_eps_m: float | None = None
+    st.markdown("**Per-pixel CGI scoring**")
+    _grid = _FS["cgi_grid_spacing_m"]
+    _grid_options = list(range(int(_grid.lo), int(_grid.hi) + 1, int(_grid.step)))
+    _default(
+        "fusion_cgi_grid_spacing_m",
+        _fs_default("cgi_grid_spacing_m"),
+        _grid_options,
+    )
+    cgi_grid_spacing_m = st.select_slider(
+        "CGI grid pixel size (m)",
+        options=_grid_options,
+        key="fusion_cgi_grid_spacing_m",
+        help=(
+            "Per-pixel CGI grid spacing. Smaller = higher fidelity and a bigger "
+            "cache. A raster target's pixels are placed on this grid by their "
+            "centres; the target's own pixel size is not reused."
+        ),
+    )
     if is_vector_target:
-        st.markdown("**Per-pixel CGI scoring**")
-        _grid = _FS["cgi_grid_spacing_m"]
-        _grid_options = list(range(int(_grid.lo), int(_grid.hi) + 1, int(_grid.step)))
-        _default(
-            "fusion_cgi_grid_spacing_m",
-            _fs_default("cgi_grid_spacing_m"),
-            _grid_options,
-        )
         for name in (
             "whole_grid_scaling",
-            "normalize_channels",
             "area_balanced_split",
             "spatial_split",
         ):
@@ -2142,27 +2237,10 @@ def _render_study_details_panel(
         _default(
             "fusion_spatial_block_size_m", _fs_default("spatial_block_size_m") or 0
         )
-        cgi_grid_spacing_m = st.select_slider(
-            "CGI grid pixel size (m)",
-            options=_grid_options,
-            key="fusion_cgi_grid_spacing_m",
-            help=(
-                "Per-pixel CGI grid spacing. Smaller = higher fidelity and a bigger cache."
-            ),
-        )
         whole_grid_scaling = st.checkbox(
             "Scale composite map to [0, 1]",
             key="fusion_whole_grid_scaling",
             help="Min-max normalise the optimized greenery map to [0, 1] over the whole grid.",
-        )
-        normalize_channels = st.checkbox(
-            "Normalize channels before fusion",
-            key="fusion_normalize_channels",
-            help=(
-                "Scale each channel to [0, 1] before combining, so CGI weights "
-                "are comparable across channels and the comparison with the "
-                "standalone studies is on equal footing. Off = legacy raw mix."
-            ),
         )
         if is_polygon_target:
             area_balanced_split = st.checkbox(
@@ -2257,6 +2335,63 @@ def _render_study_details_panel(
                 )
                 spatial_adjust_eps_m = float(eps_ui) if eps_ui and eps_ui > 0 else None
 
+    # ── Exposure buffer ─────────────────────────────────────────
+    for name in (
+        "exposure_kernel",
+        "exposure_radius_m",
+        "exposure_plateau_m",
+        "exposure_sigma_m",
+    ):
+        _default(f"fusion_{name}", _fs_default(name))
+    _exposure_labels = {
+        "none": "None (touched cells only)",
+        "uniform": "Uniform",
+        "linear": "Linear decay",
+        "gaussian": "Gaussian decay",
+    }
+    exposure_kernel = st.selectbox(
+        "Exposure buffer",
+        options=list(_FS["exposure_kernel"].choices),
+        format_func=lambda k: _exposure_labels[k],
+        key="fusion_exposure_kernel",
+        help=(
+            "Each target is exposed to the CGI cells its geometry touches. A "
+            "buffer adds the cells within its radius, weighted by distance: "
+            "uniform keeps full weight, linear decay falls to 0 at the radius "
+            "after a full-weight distance, Gaussian decay follows its SD."
+        ),
+    )
+    exposure_radius_m = float(st.session_state["fusion_exposure_radius_m"])
+    exposure_plateau_m = float(st.session_state["fusion_exposure_plateau_m"])
+    exposure_sigma_m = float(st.session_state["fusion_exposure_sigma_m"])
+    if exposure_kernel != "none":
+        _buffer_cols = st.columns(2)
+        with _buffer_cols[0]:
+            exposure_radius_m = st.number_input(
+                "Buffer radius (m)",
+                **_fs_bounds("exposure_radius_m"),
+                step=10.0,
+                key="fusion_exposure_radius_m",
+                help="Cells farther than this from the target get no weight.",
+            )
+        with _buffer_cols[1]:
+            if exposure_kernel == "linear":
+                exposure_plateau_m = st.number_input(
+                    "Full-weight distance (m)",
+                    **_fs_bounds("exposure_plateau_m"),
+                    step=10.0,
+                    key="fusion_exposure_plateau_m",
+                    help="Cells within this distance keep full weight.",
+                )
+            elif exposure_kernel == "gaussian":
+                exposure_sigma_m = st.number_input(
+                    "Gaussian SD (m)",
+                    **_fs_bounds("exposure_sigma_m"),
+                    step=5.0,
+                    key="fusion_exposure_sigma_m",
+                    help="Distance at which a cell's weight falls to 0.61.",
+                )
+
     return {
         # Derived, not chosen: the channel set names the modalities and
         # the sweep picks the form, so the registry name follows from both.
@@ -2266,6 +2401,7 @@ def _render_study_details_panel(
         ),
         "covariate_columns": list(covariate_columns or []),
         "covariate_types": dict(covariate_types or {}),
+        "categorical_missing": str(categorical_missing),
         "moderator_columns": list(moderator_columns or []),
         # ``None`` restores the default: the IQR of the composite itself.
         "exposure_iqr": (
@@ -2286,9 +2422,12 @@ def _render_study_details_panel(
         "resume_existing_study": bool(resume_existing_study),
         "run_standalones": bool(run_standalones),
         "cgi_grid_spacing_m": int(cgi_grid_spacing_m),
+        "exposure_kernel": str(exposure_kernel),
+        "exposure_radius_m": float(exposure_radius_m),
+        "exposure_plateau_m": float(exposure_plateau_m),
+        "exposure_sigma_m": float(exposure_sigma_m),
         "whole_grid_scaling": bool(whole_grid_scaling),
         "area_balanced_split": bool(area_balanced_split),
-        "normalize_channels": bool(normalize_channels),
         "spatial_adjust_method": str(spatial_adjust_method),
         "spatial_adjust_max_df": int(spatial_adjust_max_df),
         "spatial_adjust_eps_m": spatial_adjust_eps_m,
@@ -2301,14 +2440,15 @@ def _render_study_details_panel(
         "discovery_reps": int(discovery_reps_ui),
         "discovery_shuffles": int(discovery_shuffles_ui),
         "gain_splits": int(gain_splits_ui),
-        "gain_permutations": int(gain_permutations_ui),
         "null_calibration_runs": int(null_calibration_runs_ui),
         "posterior_draws": int(posterior_draws_ui),
         "posterior_warmup": int(posterior_warmup_ui),
         "posterior_chains": int(posterior_chains_ui),
         "radius_prior": str(radius_prior_ui),
+        "gvi_min_coverage": float(gvi_min_coverage_ui),
         "check_collinearity": bool(check_collinearity),
         "vif_threshold": float(vif_threshold_ui),
+        "drop_collinear_channels": bool(check_collinearity and drop_collinear_channels),
     }
 
 
@@ -2386,13 +2526,106 @@ div[data-testid="stVerticalBlock"]:has(> div > div > div[data-fusion-results-anc
         _render_fusion_results_body(output_dir)
 
 
+def _covariate_missing_caption(report: dict | None) -> str | None:
+    """One line naming the covariates some rows were missing, or ``None``."""
+    rows = [r for r in (report or {}).get("covariates") or [] if r.get("n_missing")]
+    if not rows:
+        return None
+    handled = {"drop": "dropped", "indicator": "own level"}
+    parts = [
+        f"`{r['column']}` {int(r['n_missing']):,} "
+        f"({handled.get(r.get('handling'), r.get('handling'))})"
+        for r in rows
+    ]
+    dropped = report.get("rows_dropped")
+    return (
+        "**Missing covariates (rows):** "
+        + ", ".join(parts)
+        + (
+            f"  ·  {int(dropped):,} row(s) with an outcome were dropped"
+            if dropped
+            else ""
+        )
+    )
+
+
+def _comparator_rows(results_view: dict) -> list[dict]:
+    """One table row per exposure: the CGI, then each comparator."""
+    comparators = results_view.get("comparators") or {}
+    paired = {
+        r.get("comparator"): r
+        for r in results_view.get("cgi_vs_comparator_paired") or []
+    }
+    sources = [("CGI", None, results_view.get("comparator_reference") or {})]
+    sources += [(name, c, c) for name, c in comparators.items()]
+    rows = []
+    for name, c, block in sources:
+        test = block.get("test") or {}
+        row = {
+            "Exposure": name,
+            "Primary": "" if c is None else ("yes" if c.get("primary") else "no"),
+            "Held-out score": _fmt(test.get("score")),
+            "95% CI": f"[{_fmt(test.get('lower'))}, {_fmt(test.get('upper'))}]",
+            "p": _fmt(test.get("p_value"), 4),
+            "n": test.get("n"),
+            "β per SD": _fmt(test.get("beta")),
+        }
+        p = paired.get(name) or {}
+        row["CGI − comparator"] = "" if c is None else _fmt(p.get("observed_diff"))
+        row["Δ 95% CI"] = (
+            "" if c is None else f"[{_fmt(p.get('lower'))}, {_fmt(p.get('upper'))}]"
+        )
+        row["Δ p"] = "" if c is None else _fmt(p.get("p_value"), 4)
+        if c is None:
+            row["Holm p"] = ""
+        elif p.get("descriptive"):
+            row["Holm p"] = "descriptive"
+        else:
+            row["Holm p"] = _fmt(p.get("p_value_holm"), 4)
+        rows.append(row)
+    return rows
+
+
+def _render_comparators(results_view: dict, metric_name: str) -> None:
+    """The comparator exposures next to the CGI, on the same held-out rows."""
+    comparators = results_view.get("comparators") or {}
+    if not comparators:
+        return
+    st.divider()
+    st.markdown("**CGI vs comparator exposures**")
+    st.caption(
+        f"Each comparator is an existing exposure column, never tuned, scored in "
+        f"{metric_name} on the composite's own held-out entities with the same "
+        "covariates. The paired difference is positive when the composite scores "
+        "higher; its Holm correction runs over the primary comparators only, and "
+        "the others are descriptive. β is the covariate-adjusted slope in SD units."
+    )
+    st.dataframe(pd.DataFrame(_comparator_rows(results_view)), width="stretch")
+    failed = [n for n, c in comparators.items() if c.get("status") != "ok"]
+    if failed:
+        st.caption(
+            "Not scored: " + ", ".join(f"`{n}`" for n in failed) + " (see the job log)."
+        )
+    flagged = [
+        n
+        for n, c in comparators.items()
+        if (c.get("negative_controls") or {}).get("nonspecific")
+    ]
+    if flagged:
+        st.caption(
+            ":orange[Non-specific on a negative control:] "
+            + ", ".join(f"`{n}`" for n in flagged)
+            + " — the control's association cannot be told apart from the target's."
+        )
+
+
 def _render_collinearity_report(results_view: dict) -> None:
     """Show the iterative-VIF channel reduction report, if one was produced.
 
     Reads ``results_view["collinearity_report"]`` and renders:
     * Pairwise Pearson r between channels (3×3 matrix as a heatmap-styled table)
-    * VIF before / after each drop iteration
-    * Channels kept vs dropped
+    * VIF before / after each reduction step
+    * Channels below vs above the threshold
     """
     report = results_view.get("collinearity_report") or None
     if not report:
@@ -2420,9 +2653,9 @@ def _render_collinearity_report(results_view: dict) -> None:
         st.metric("Pixels sampled", f"{n_sample:,}")
     with summary_cols[2]:
         st.metric(
-            "Channels kept",
+            "Channels below threshold",
             f"{len(kept)}/{len(channels)}",
-            delta=(f"dropped: {', '.join(dropped)}" if dropped else "all retained"),
+            delta=(f"above: {', '.join(dropped)}" if dropped else "all below"),
             delta_color="off",
         )
 
@@ -2449,7 +2682,7 @@ def _render_collinearity_report(results_view: dict) -> None:
                 "Initial VIF": (
                     round(float(vif_in), 3) if vif_in is not None else float("nan")
                 ),
-                "Status": "dropped" if ch in dropped else "kept",
+                "Status": "above threshold" if ch in dropped else "below threshold",
                 "Final VIF": (
                     round(float(final_by_name[ch]), 3) if ch in final_by_name else "—"
                 ),
@@ -2457,11 +2690,11 @@ def _render_collinearity_report(results_view: dict) -> None:
         )
     st.dataframe(_pd.DataFrame(rows), width="stretch")
 
-    # Per-iteration drop history (only if anything was actually dropped).
+    # Per-iteration reduction history (only when a channel was above).
     iterations = report.get("iterations") or []
     if iterations:
         with st.expander(
-            f"Drop history ({len(iterations)} iteration(s))", expanded=False
+            f"Reduction history ({len(iterations)} iteration(s))", expanded=False
         ):
             for i, it in enumerate(iterations, start=1):
                 st.write(f"**Iteration {i}** — removed `{it.get('removed', '?')}`")
@@ -2478,7 +2711,14 @@ _TERM_COLUMN_CONFIG = {
     "std_err": st.column_config.NumberColumn("SE", format="%.4f"),
     "t_stat": st.column_config.NumberColumn("t", format="%.2f"),
     "partial_r2": st.column_config.NumberColumn("partial R²", format="%.4f"),
+    "mde": st.column_config.NumberColumn("MDE", format="%.4f"),
 }
+
+_HELD_OUT_NOTE = (
+    "Coefficients use every row; SE, t, p and the minimum detectable effect "
+    "(MDE, 2.8 held-out SEs) come from the {n} held-out rows, which took no "
+    "part in choosing the composite."
+)
 
 _DECLINE_TERM_LABELS = {
     "overall": "Greenspace × time (overall)",
@@ -2511,6 +2751,7 @@ def _render_decline_terms(results_view: dict) -> None:
                 "std_err": term.get("std_err"),
                 "t_stat": term.get("t_stat"),
                 "p": term.get("p_display"),
+                "mde": term.get("mde"),
                 "direction": term.get("direction"),
             }
         )
@@ -2520,6 +2761,7 @@ def _render_decline_terms(results_view: dict) -> None:
         hide_index=True,
         column_config=_TERM_COLUMN_CONFIG,
     )
+    st.caption(_HELD_OUT_NOTE.format(n=dt.get("inference_n") or "—"))
     if dt.get("within_estimable") is False:
         st.caption(
             "_Within-person term not estimable — the greenspace exposure does "
@@ -2720,8 +2962,8 @@ def _render_covariate_impact(results_view: dict, metric_name: str) -> None:
         )
     st.caption(
         f"Sample size: n = {impact.get('n', 0)} · CGI coefficient = "
-        f"{impact.get('cgi_coef', 0):.4f} "
-        f"(SE = {impact.get('cgi_std_err', 0):.4f})"
+        f"{_fmt(impact.get('cgi_coef'), 4)} "
+        f"(held-out SE = {_fmt(impact.get('cgi_std_err'), 4)})"
     )
 
     rows = impact.get("per_covariate") or []
@@ -2732,11 +2974,15 @@ def _render_covariate_impact(results_view: dict, metric_name: str) -> None:
     if "p_display" not in df.columns:
         df["p_display"] = df["pvalue"].map(_mes.format_pvalue)
     df = df.rename(columns={"p_display": "p"})
-    df = df[["covariate", "direction", "coef", "std_err", "t_stat", "p", "partial_r2"]]
+    if "mde" not in df.columns:
+        df["mde"] = None
+    shown = ["covariate", "direction", "coef", "std_err", "t_stat", "p", "mde"]
+    df = df[shown + ["partial_r2"]]
     df = df.sort_values("partial_r2", ascending=False).reset_index(drop=True)
     st.dataframe(
         df, width="stretch", hide_index=True, column_config=_TERM_COLUMN_CONFIG
     )
+    st.caption(_HELD_OUT_NOTE.format(n=impact.get("inference_n") or "—"))
 
     try:
         import plotly.express as _px
@@ -2984,7 +3230,7 @@ def _render_composite_map_viewer(results_view: dict, engine) -> None:
 
     # ── Composite panels (shared colorbar at [0, 1]) ────────────
     last_im = None
-    for label, arr, transform, crs in composites:
+    for label, arr, transform, _crs in composites:
         ax = flat_axes[panel_idx]
         panel_idx += 1
         try:
@@ -3043,6 +3289,27 @@ def _direction_badge(direction: object) -> str:
         return "↑ positive" if int(direction) > 0 else "↓ negative"
     except (TypeError, ValueError):
         return "—"
+
+
+def _weight_key_label(key: str) -> str:
+    """Display name of a formula weight: a channel, or a geometric-mean term."""
+    if key.endswith("_weight"):
+        ch = key.removesuffix("_weight")
+        return _CHANNEL_DISPLAY.get(ch, ch.upper())
+    tokens = [{"ter": "terrain"}.get(t, t) for t in key.removeprefix("w_").split("_")]
+    return " × ".join(_CHANNEL_DISPLAY.get(t, t.upper()) for t in tokens)
+
+
+def _channel_stat(params: dict, channel: str) -> tuple:
+    """``(stat, percentile)`` a channel was aggregated with.
+
+    Each channel records its own; runs recorded before that hold one shared
+    street-view statistic.
+    """
+    shared = "ndvi" if channel == "ndvi" else "streetview"
+    stat = params.get(f"{channel}_stat", params.get(f"{shared}_stat"))
+    pct = params.get(f"{channel}_percentile", params.get(f"{shared}_percentile"))
+    return stat, pct
 
 
 def _agg_label(stat: str | None, percentile: int | float | None) -> str:
@@ -3371,7 +3638,8 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
             str(summary.get("form") or "-"),
             help=(
                 "The form that scored higher on held-out rows. `linear` is a "
-                "weighted sum; `synergy` adds powers and pairwise products."
+                "weighted average of the raw channels; `synergy` adds the "
+                "geometric means of the channel pairs (and of the triple)."
             ),
         )
     with c2:
@@ -3464,10 +3732,29 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
             )
         )
 
+    coverage = summary.get("coverage") or {}
+    if coverage.get("gvi_floor_m") is not None:
+        shares = coverage.get("gvi_rung_entity_share") or {}
+        st.caption(
+            f"GVI coverage: rungs from **{int(coverage['gvi_floor_m'])} m** were "
+            f"searched, the first to give a street-view cell to at least "
+            f"{float(coverage.get('min_coverage', 0)):.0%} of entities"
+            + (
+                " ("
+                + ", ".join(f"{int(r)} m {float(v):.0%}" for r, v in shares.items())
+                + ")"
+                if shares
+                else ""
+            )
+            + f". {int(coverage.get('rows_dropped', 0)):,} exposure rows and "
+            f"{int(coverage.get('entities_dropped', 0)):,} entities had no data "
+            "at that rung and were left out."
+        )
+
     # ── Posterior ───────────────────────────────────────────────
     weights = summary.get("weight_mean") or []
     if weights:
-        st.markdown("**Posterior weights**")
+        st.markdown("**Posterior weights (influence shares)**")
         lo = summary.get("weight_ci_low") or [None] * len(weights)
         hi = summary.get("weight_ci_high") or [None] * len(weights)
         powers = summary.get("powers")
@@ -3475,8 +3762,8 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
         wrows = []
         for i, w in enumerate(weights):
             row = {
-                "Channel": _label(i),
-                "Weight": round(float(w), 3),
+                "Term": _label(i),
+                "Share": round(float(w), 3),
                 "95% CrI": f"[{_fmt(lo[i], 3)}, {_fmt(hi[i], 3)}]",
             }
             if i < len(ratios):
@@ -3487,10 +3774,12 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
         st.dataframe(_pd.DataFrame(wrows), width="stretch", hide_index=True)
         prior_ci = summary.get("weight_prior_ci")
         st.caption(
-            "Weights are constrained to the simplex (non-negative, summing to "
-            "1), so each one reads directly as that channel's share of the "
-            "composite. A credible interval spanning most of [0, 1] means the "
-            "data does not separate that channel's contribution. **vs prior** "
+            "Weights on the standardised terms, constrained to the simplex "
+            "(non-negative, summing to 1), so each one reads as that term's "
+            "share of the index's influence. The composite weights carry them "
+            "onto raw channel units. A credible interval spanning most of "
+            "[0, 1] means the data does not separate that term's contribution. "
+            "**vs prior** "
             "is the credible interval's width as a share of the prior's"
             + (
                 f" (prior 95% CrI [{_fmt(prior_ci[0], 3)}, " f"{_fmt(prior_ci[1], 3)}])"
@@ -4127,14 +4416,18 @@ def _render_study_detail(
     # ── Winning params ──────────────────────────────────────────
     if is_cgi:
         if not formula.power_keys:
-            st.markdown("**Weights (posterior mean)**")
+            st.markdown("**Composite weights (raw channel units)**")
+            st.caption(
+                "Shares of the mix of raw channel values the composite and the "
+                "map are built from. A channel's influence on the index is its "
+                "posterior weight."
+            )
             weight_cols = st.columns(len(formula.weight_keys))
             total_weight = sum(
                 float(final_params.get(k, 0)) for k in formula.weight_keys
             )
             for col, key in zip(weight_cols, formula.weight_keys):
-                ch = key.removesuffix("_weight")
-                label = _CHANNEL_DISPLAY.get(ch, ch.upper())
+                label = _weight_key_label(key)
                 pct = (
                     100.0 * float(final_params.get(key, 0)) / total_weight
                     if total_weight > 0
@@ -4173,34 +4466,13 @@ def _render_study_detail(
                     st.metric(label, "—")
 
         st.markdown("**Aggregators**")
-        # NDVI has its own aggregator; every street-view channel shares one
-        # slot in the apply path, so they cannot be reported separately.
-        street = [c for c in channels if c != "ndvi"]
-        agg_specs = []
-        if street:
-            agg_specs.append(
-                (
-                    " + ".join(_CHANNEL_DISPLAY.get(c, c.upper()) for c in street),
-                    "streetview_stat",
-                    "streetview_percentile",
-                )
-            )
-        if "ndvi" in channels:
-            agg_specs.append(("NDVI", "ndvi_stat", "ndvi_percentile"))
-        agg_cols = st.columns(max(len(agg_specs), 1))
-        for col, (label, stat_key, pct_key) in zip(agg_cols, agg_specs):
+        agg_cols = st.columns(max(len(channels), 1))
+        for col, ch in zip(agg_cols, channels, strict=False):
             with col:
                 st.metric(
-                    label,
-                    _agg_label(final_params.get(stat_key), final_params.get(pct_key)),
+                    _CHANNEL_DISPLAY.get(ch, ch.upper()),
+                    _agg_label(*_channel_stat(final_params, ch)),
                 )
-        if len(street) > 1:
-            st.caption(
-                "The street-view channels share a single aggregator slot in the "
-                "apply path, so they are reported together. Where the posterior "
-                "prefers different statistics for them, only one can be carried "
-                "into the composite."
-            )
     else:
         # Standalone: a single channel at 100 % — weights are not
         # meaningful, so only the active channel's radius + aggregator are
@@ -4208,8 +4480,6 @@ def _render_study_detail(
         ch_label = _CHANNEL_DISPLAY.get(study_key, study_key.upper())
         st.caption(f"Single channel — **100 % {ch_label}**.")
         radius_key = f"{study_key}_radius"
-        stat_key = "ndvi_stat" if study_key == "ndvi" else "streetview_stat"
-        pct_key = "ndvi_percentile" if study_key == "ndvi" else "streetview_percentile"
         detail_cols = st.columns(2)
         with detail_cols[0]:
             try:
@@ -4220,7 +4490,7 @@ def _render_study_detail(
         with detail_cols[1]:
             st.metric(
                 f"{ch_label} aggregator",
-                _agg_label(final_params.get(stat_key), final_params.get(pct_key)),
+                _agg_label(*_channel_stat(final_params, study_key)),
             )
 
     # ── Per-subset scores ───────────────────────────────────────
@@ -4344,8 +4614,8 @@ def _render_negative_controls(report: dict | None) -> None:
     st.markdown("**Negative controls**")
     if report.get("skipped") == "longitudinal":
         st.info(
-            "Negative controls are reported for cross-sectional targets only; "
-            "this longitudinal run did not score them."
+            "Negative controls are reported for one row per entity only; this "
+            "panel (several rows per entity) did not score them."
         )
         return
     splits = report.get("splits") or {}
@@ -4743,6 +5013,9 @@ def _render_fusion_results_body(output_dir: str) -> None:
             else ""
         )
     )
+    missing_note = _covariate_missing_caption(results_view.get("covariate_missing"))
+    if missing_note:
+        st.caption(missing_note)
     _cfg_hash = results_view.get("config_hash")
     _test_reads = results_view.get("test_reads")
     if _cfg_hash or _test_reads is not None:
@@ -4798,6 +5071,9 @@ def _render_fusion_results_body(output_dir: str) -> None:
     # ── Cross-study comparison (CGI vs standalones) ─────────────
     _render_cross_study_comparison(results_view, metric_name)
 
+    # ── Comparator exposures ────────────────────────────────────
+    _render_comparators(results_view, metric_name)
+
     # ── Channel collinearity report ─────────────────────────────
     _render_collinearity_report(results_view)
 
@@ -4809,6 +5085,13 @@ def _render_fusion_results_body(output_dir: str) -> None:
 
     # ── Composite map viewer ────────────────────────────────────
     _render_composite_map_viewer(results_view, engine)
+    with st.expander("Generate CGI Map", expanded=False):
+        st.caption(
+            "Planned: this study's CGI over a whole area, computed from its "
+            "channels, radii, statistics, formula and weights on the same grid, "
+            "so it can be mapped where no target sits. Not available yet."
+        )
+        st.button("Generate CGI Map", disabled=True, key="fusion_generate_cgi_map")
 
     # ── Mixed-effects post-hoc metrics CSV viewer ───────────────
     try:
@@ -5186,6 +5469,47 @@ def render(output_dir: str) -> None:
                                     "Cross-sectional runs only."
                                 ),
                             )
+                        taken = set(target_outcome_columns) | set(
+                            (st.session_state.get("fusion_negative_controls") or [])
+                            + (st.session_state.get("fusion_covariate_columns") or [])
+                            + (
+                                st.session_state.get("fusion_covariate_categorical")
+                                or []
+                            )
+                        )
+                        cmp_options = [c for c in numeric_cols if c not in taken]
+                        if target_outcome_columns and cmp_options:
+                            _keep_valid("fusion_comparators", cmp_options, multi=True)
+                            st.multiselect(
+                                "Comparator exposures",
+                                options=cmp_options,
+                                key="fusion_comparators",
+                                help=(
+                                    "Existing exposure columns to benchmark the "
+                                    "composite against; never tuned. Each is "
+                                    "scored on the composite's own held-out "
+                                    "entities, covariates and objective, with a "
+                                    "paired composite-vs-comparator test. "
+                                    "Cross-sectional runs only."
+                                ),
+                            )
+                        picked_cmps = list(
+                            st.session_state.get("fusion_comparators") or []
+                        )
+                        if picked_cmps:
+                            _keep_valid(
+                                "fusion_comparators_primary", picked_cmps, multi=True
+                            )
+                            st.multiselect(
+                                "Primary comparators",
+                                options=picked_cmps,
+                                key="fusion_comparators_primary",
+                                help=(
+                                    "The pre-specified comparators the paired "
+                                    "tests' Holm correction runs over; the others "
+                                    "are reported as descriptive. Empty = all."
+                                ),
+                            )
                         if len(target_outcome_columns) > 1:
                             _default("fusion_multi_objective_run", False)
                             multi_objective_requested = st.checkbox(
@@ -5363,6 +5687,9 @@ def render(output_dir: str) -> None:
     cgi_formula = study_state["cgi_formula"]
     covariate_columns = study_state["covariate_columns"]
     covariate_types = study_state.get("covariate_types") or {}
+    categorical_missing_param = str(
+        study_state.get("categorical_missing", _fs_default("categorical_missing"))
+    )
     moderator_columns_param = list(study_state.get("moderator_columns") or [])
     # Picked in the target section, so read from state; a control cannot also
     # be an outcome of this job.
@@ -5375,6 +5702,35 @@ def render(output_dir: str) -> None:
         if is_vector_target
         else []
     )
+    # Comparators, also picked in the target section. One that has since become
+    # an outcome, a covariate or a control is refused at submit.
+    comparators_param = (
+        list(st.session_state.get("fusion_comparators") or [])
+        if is_vector_target
+        else []
+    )
+    comparators_primary_param = [
+        c
+        for c in (st.session_state.get("fusion_comparators_primary") or [])
+        if c in comparators_param
+    ] or None
+    # Memory a quadratic objective needs at this target's size, refused when
+    # it exceeds the machine's RAM unless the user ticked the override.
+    objective_size = _gf_settings.objective_size_check(
+        study_state["objective_metric"],
+        len(preview_vector_gdf) if preview_vector_gdf is not None else 0,
+        _physical_memory_bytes(),
+    )
+    if objective_size is not None and st.session_state.get(
+        "fusion_allow_large_objective"
+    ):
+        objective_size = ("warn", objective_size[1])
+    taken_cols = {
+        *target_outcome_columns,
+        *(covariate_columns or []),
+        *negative_controls_param,
+    }
+    comparator_clash = sorted(c for c in comparators_param if c in taken_cols)
     exposure_iqr_param = study_state.get("exposure_iqr")
     objective_metric = study_state["objective_metric"]
     test_size = study_state["test_size"]
@@ -5389,9 +5745,17 @@ def render(output_dir: str) -> None:
     lon_wave_fe = study_state.get("include_wave_fixed_effects", True)
     lon_area_col = study_state.get("area_id_col") or None
     cgi_grid_spacing_m_param = study_state.get("cgi_grid_spacing_m")
+    exposure_params = {
+        k: study_state.get(k, _fs_default(k))
+        for k in (
+            "exposure_kernel",
+            "exposure_radius_m",
+            "exposure_plateau_m",
+            "exposure_sigma_m",
+        )
+    }
     whole_grid_scaling_param = bool(study_state.get("whole_grid_scaling", False))
     area_balanced_split_param = bool(study_state.get("area_balanced_split", False))
-    normalize_channels_param = bool(study_state.get("normalize_channels", False))
     residualize_method_param = str(study_state.get("residualize_method", "linear"))
     search_scoring_method_param = str(
         study_state.get("search_scoring_method", "mom_em3")
@@ -5408,7 +5772,6 @@ def render(output_dir: str) -> None:
     discovery_reps_param = int(study_state.get("discovery_reps", 5))
     discovery_shuffles_param = int(study_state.get("discovery_shuffles", 12))
     gain_splits_param = int(study_state.get("gain_splits", 20))
-    gain_permutations_param = int(study_state.get("gain_permutations", 100))
     null_calibration_runs_param = int(study_state.get("null_calibration_runs", 16))
     posterior_draws_param = int(study_state.get("posterior_draws", 800))
     posterior_warmup_param = int(
@@ -5416,8 +5779,14 @@ def render(output_dir: str) -> None:
     )
     posterior_chains_param = int(study_state.get("posterior_chains", 4))
     radius_prior_param = str(study_state.get("radius_prior", "rungs"))
+    gvi_min_coverage_param = float(
+        study_state.get("gvi_min_coverage", _fs_default("gvi_min_coverage"))
+    )
     check_collinearity_param = bool(study_state.get("check_collinearity", False))
     vif_threshold_param = float(study_state.get("vif_threshold", 10.0))
+    drop_collinear_channels_param = bool(
+        study_state.get("drop_collinear_channels", False)
+    )
 
     # =========================================================================
     # Run controls and progress
@@ -5477,7 +5846,16 @@ def render(output_dir: str) -> None:
         elif not metric_state["coverage_complete"]:
             for _err in metric_state["coverage_errors"]:
                 st.error(f"❌ {_err}")
+        elif objective_size is not None and objective_size[0] == "refuse":
+            st.error(f"❌ {objective_size[1]}")
+        elif comparator_clash:
+            st.error(
+                "❌ A comparator cannot also be an outcome, a covariate or a "
+                "negative control: " + ", ".join(f"`{c}`" for c in comparator_clash)
+            )
         else:
+            if objective_size is not None:
+                st.warning(objective_size[1])
             # ── Build LongitudinalSpec (or None) ────────
             from geofuse.longitudinal import LongitudinalSpec as _LonSpec
             from geofuse.longitudinal import validate_spec as _validate_lon_spec
@@ -5704,6 +6082,19 @@ def render(output_dir: str) -> None:
                         "**Negative controls:** "
                         + ", ".join(f"`{c}`" for c in negative_controls_param)
                     )
+                if comparators_param:
+                    st.write(
+                        "**Comparators:** "
+                        + ", ".join(
+                            f"`{c}`"
+                            + (
+                                " (primary)"
+                                if c in (comparators_primary_param or comparators_param)
+                                else ""
+                            )
+                            for c in comparators_param
+                        )
+                    )
                 st.write(f"**Extent padding (m):** {buffer_extent_m}")
                 st.write(
                     f"**Discovery:** {channel_set_param}, form "
@@ -5714,8 +6105,7 @@ def render(output_dir: str) -> None:
                 st.write(
                     f"**Validation:** {discovery_reps_param}×"
                     f"{discovery_shuffles_param} discovery replicates · "
-                    f"{gain_splits_param} gain splits / "
-                    f"{gain_permutations_param} permutations · "
+                    f"{gain_splits_param} gain splits · "
                     f"{null_calibration_runs_param} null refits · "
                     f"{posterior_chains_param}×{posterior_draws_param} draws"
                 )
@@ -5768,8 +6158,11 @@ def render(output_dir: str) -> None:
                 "cgi_formula": cgi_formula,
                 "covariate_columns": list(covariate_columns or []),
                 "covariate_types": dict(covariate_types or {}),
+                "categorical_missing": categorical_missing_param,
                 "moderator_columns": list(moderator_columns_param),
                 "negative_controls": negative_controls_param,
+                "comparators": comparators_param,
+                "comparators_primary": comparators_primary_param,
                 "exposure_iqr": (
                     float(exposure_iqr_param) if exposure_iqr_param else None
                 ),
@@ -5779,9 +6172,10 @@ def render(output_dir: str) -> None:
                     list(_CHANNEL_SETS[channel_set_param]) if run_standalones else []
                 ),
                 "longitudinal_spec_payload": longitudinal_spec_payload,
+                **exposure_params,
                 "cgi_grid_spacing_m": (
                     int(cgi_grid_spacing_m_param)
-                    if cgi_grid_spacing_m_param is not None and is_vector_target
+                    if cgi_grid_spacing_m_param is not None
                     else None
                 ),
                 # Composite [0, 1] scaling: user-chosen for vector targets;
@@ -5791,10 +6185,6 @@ def render(output_dir: str) -> None:
                 ),
                 "area_balanced_split": (
                     area_balanced_split_param if is_polygon_target_ui else False
-                ),
-                # Per-channel normalization applies to vector targets only.
-                "normalize_channels": (
-                    bool(normalize_channels_param) if is_vector_target else False
                 ),
                 # Spatial-confounding adjustment applies to vector targets only.
                 "spatial_adjust_method": (
@@ -5821,14 +6211,15 @@ def render(output_dir: str) -> None:
                 "discovery_reps": int(discovery_reps_param),
                 "discovery_shuffles": int(discovery_shuffles_param),
                 "gain_splits": int(gain_splits_param),
-                "gain_permutations": int(gain_permutations_param),
                 "null_calibration_runs": int(null_calibration_runs_param),
                 "posterior_draws": int(posterior_draws_param),
                 "posterior_warmup": int(posterior_warmup_param),
                 "posterior_chains": int(posterior_chains_param),
                 "radius_prior": radius_prior_param,
+                "gvi_min_coverage": gvi_min_coverage_param,
                 "check_collinearity": bool(check_collinearity_param),
                 "vif_threshold": float(vif_threshold_param),
+                "drop_collinear_channels": drop_collinear_channels_param,
             }
             _missing = [k for k in _FUSION_RUN_CONFIG_KEYS if k not in run_config]
             if _missing:

@@ -114,6 +114,16 @@ class ShortcutTests(_Case):
         self.assertEqual(labels, ["w1", "wave2"])
         self.assertIn("[[fusion.waves]]", quick.dumps(waves))
 
+    def test_fusion_comparators_are_repeatable_flags(self):
+        doc = self.document(
+            "fusion --target cohort.gpkg --outcome cesd --comparator ndvi_500m "
+            "--comparator ndvi_1km --comparator-primary ndvi_500m "
+            "--ndvi n.tif --gvi g.gpkg"
+        )
+        (step,) = doc["fusion"]
+        self.assertEqual(step["comparators"], ["ndvi_500m", "ndvi_1km"])
+        self.assertEqual(step["comparators_primary"], ["ndvi_500m"])
+
     def test_the_default_action_submits(self):
         with mock.patch.object(quick, "submit", return_value=0) as submitted:
             code, _ = self.geofuse("ndvi city.gpkg --range 2019-05-01:2019-09-30")

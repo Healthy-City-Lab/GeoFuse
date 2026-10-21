@@ -179,18 +179,28 @@ def _column_scales(X: np.ndarray) -> np.ndarray:
 
 
 def _irls(y: np.ndarray, X: np.ndarray, beta0: np.ndarray | None = None):
-    """Plain logistic IRLS. Returns ``(beta, mu)`` or ``None`` if it diverges."""
-    n, p = X.shape
-    beta = np.zeros(p) if beta0 is None else np.array(beta0, dtype=np.float64)
+    """Plain logistic IRLS. Returns ``(beta, mu)``, or ``None`` if it diverges or
+    does not converge within ``_MAX_IRLS`` steps (separated data walks off to
+    infinity rather than settling).
+
+    Solved on the column-scaled design (:func:`_column_scales`) and reported
+    back in the caller's units, so a covariate's unit cannot change the answer.
+    """
+    from scipy.special import expit
+
+    scales = _column_scales(X)
+    Xs = X / scales
+    p = Xs.shape[1]
+    beta = np.zeros(p) if beta0 is None else np.array(beta0, dtype=np.float64) * scales
     for _ in range(_MAX_IRLS):
-        eta = X @ beta
-        mu = _clip_mu(1.0 / (1.0 + np.exp(-eta)))
+        eta = Xs @ beta
+        mu = _clip_mu(expit(eta))
         w = mu * (1.0 - mu)
         # Working response of the Fisher-scoring step.
         z = eta + (y - mu) / w
-        XtW = X.T * w
+        XtW = Xs.T * w
         try:
-            new = np.linalg.solve(XtW @ X, XtW @ z)
+            new = np.linalg.solve(XtW @ Xs, XtW @ z)
         except np.linalg.LinAlgError:
             return None
         if not np.all(np.isfinite(new)):
@@ -199,8 +209,16 @@ def _irls(y: np.ndarray, X: np.ndarray, beta0: np.ndarray | None = None):
             beta = new
             break
         beta = new
-    eta = X @ beta
-    return beta, _clip_mu(1.0 / (1.0 + np.exp(-eta)))
+    else:
+        return None
+    return beta / scales, _clip_mu(expit(Xs @ beta))
+
+
+def _logit_cov(X: np.ndarray, mu: np.ndarray) -> np.ndarray:
+    """Model-based covariance of a logistic fit, inverted on the scaled design."""
+    scales = _column_scales(X)
+    Xs = X / scales
+    return np.linalg.pinv((Xs.T * (mu * (1.0 - mu))) @ Xs) / np.outer(scales, scales)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -352,9 +370,8 @@ def score_logit(
         return _degenerate(metric, return_all, return_pvalue)
     beta, mu = fit
 
-    w = mu * (1.0 - mu)
     try:
-        cov_beta = np.linalg.pinv((X.T * w) @ X)
+        cov_beta = _logit_cov(X, mu)
     except np.linalg.LinAlgError:
         return _degenerate(metric, return_all, return_pvalue)
     se = float(np.sqrt(max(cov_beta[gi, gi], 0.0)))
@@ -381,7 +398,8 @@ def _fit_gee_logit(
 ):
     """Fit a GEE logistic model. Returns ``(beta, mu, alpha, cov)`` or ``None``.
 
-    ``y`` and ``X`` must already be in ``layout.order``. Fisher scoring on the
+    ``None`` also when the steps never settle within ``max_iter``. ``y`` and
+    ``X`` must already be in ``layout.order``. Fisher scoring on the
     estimating equations, alternating with a moment update of the working
     correlation — the standard Liang–Zeger loop, with every step vectorised
     through :func:`_accumulate`.
@@ -395,10 +413,12 @@ def _fit_gee_logit(
     start = _irls(y, Xs)
     if start is None:
         return None
+    from scipy.special import expit
+
     beta = start[0]
     alpha = 0.0
     for _ in range(max_iter):
-        mu = _clip_mu(1.0 / (1.0 + np.exp(-(Xs @ beta))))
+        mu = _clip_mu(expit(Xs @ beta))
         alpha = _alpha_from_residuals(y, mu, layout, Xs.shape[1])
         bread, score, _ = _accumulate(Xs, mu * (1.0 - mu), y - mu, layout, alpha)
         try:
@@ -410,7 +430,9 @@ def _fit_gee_logit(
         beta = beta + step
         if np.max(np.abs(step)) < tol:
             break
-    mu = _clip_mu(1.0 / (1.0 + np.exp(-(Xs @ beta))))
+    else:
+        return None
+    mu = _clip_mu(expit(Xs @ beta))
     alpha = _alpha_from_residuals(y, mu, layout, Xs.shape[1])
     bread, _score, meat = _accumulate(Xs, mu * (1.0 - mu), y - mu, layout, alpha)
     try:
@@ -609,9 +631,8 @@ def make_logit_fitter(outcome: np.ndarray):
         if fit is None:
             return None
         beta, mu = fit
-        w = mu * (1.0 - mu)
         try:
-            cov_beta = np.linalg.pinv((X.T * w) @ X)
+            cov_beta = _logit_cov(X, mu)
         except np.linalg.LinAlgError:
             return None
         return _shape_fit(beta, cov_beta, names)

@@ -517,27 +517,6 @@ def spatial_cache_key(
     return h.digest()
 
 
-def entity_collapse_mask(
-    data: pd.DataFrame, catchment_radius: float | None
-) -> np.ndarray | None:
-    """Row mask for the per-trial catchment collapse, or ``None``.
-
-    Returns ``None`` for polygon / raster targets (no radius mask — every
-    in-footprint pixel contributes, the original behavior). For point /
-    line targets, keeps pixels within ``catchment_radius`` of their
-    entity plus each entity's nearest pixel, so no entity drops out at
-    small radii.
-    """
-    if "_catchment_dist" not in data.columns or catchment_radius is None:
-        return None
-    dist = data["_catchment_dist"].to_numpy(dtype=np.float64)
-    if "_is_nearest" in data.columns:
-        near = data["_is_nearest"].to_numpy(dtype=bool)
-    else:
-        near = np.zeros(len(data), dtype=bool)
-    return (dist <= float(catchment_radius)) | near
-
-
 def stripe_to_test_blocks(
     ordered_blocks: np.ndarray, test_fraction: float, rng: np.random.Generator
 ) -> set:
@@ -556,26 +535,6 @@ def stripe_to_test_blocks(
     start = int(rng.integers(0, max(1, int(np.floor(step)))))
     idxs = (np.floor(np.arange(n_pick) * step).astype(int) + start) % n
     return set(ordered_blocks[np.unique(idxs)].tolist())
-
-
-def catchment_radius(
-    radii: dict[str, float],
-    active_channel: str | None = None,
-) -> float:
-    """Per-trial catchment radius for the point/line collapse.
-
-    ``active_channel``'s radius for a standalone study (only that channel
-    contributes to the score), or the largest in ``radii`` for a combined CGI
-    run (every channel feeds the per-pixel composite). ``radii`` is keyed by
-    channel name, so a two-channel study and a three-channel one both answer
-    from their own set rather than from a fixed triple.
-    """
-    if not radii:
-        return 0.0
-    ch = active_channel or "cgi"
-    if ch in radii:
-        return float(radii[ch])
-    return float(max(radii.values()))
 
 
 def split_control_matrix(
@@ -610,18 +569,6 @@ def grid_metric_crs(preaggr_gdf: gpd.GeoDataFrame, log) -> Any:
         preaggr_gdf, log, role="Pre-aggregation CRS"
     )
     return crs
-
-
-def attach_cache_for_coverage(entity_gdf: gpd.GeoDataFrame) -> bool:
-    """Reserved: derive the coverage gate from a reusable greenery cache.
-
-    Disabled for now. The coverage sampler reports the nearest-feature
-    value while the cache stores the max-radius mean, so reading coverage
-    from the cache would shift the channel-normalisation bounds between a
-    fresh run and a reuse run. Re-enabling it requires computing the
-    channel scale from cache statistics on both paths.
-    """
-    return False
 
 
 def fusion_param_key(channel_mode: str, weights: dict) -> tuple:

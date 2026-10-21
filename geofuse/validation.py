@@ -11,7 +11,7 @@ several truths:
 - ``S0`` null (no effect): how often the effect interval excludes zero;
 - ``S1`` one channel at a small radius, mean statistic;
 - ``S2`` two channels, weights 0.7 / 0.3, at different radii;
-- ``S3`` a synergy truth (powers and a pairwise product);
+- ``S3`` a synergy truth (a geometric-mean interaction of two channels);
 - ``S4`` a truth between rungs (an even blend of two adjacent rungs).
 
 The outcome is ``y* = β · z(CGI_true) + covariate part + ε`` with ``β`` set so
@@ -56,11 +56,10 @@ class Truth:
     """One planted CGI: per-channel kernel and aggregator, weights, form."""
 
     name: str
-    weights: tuple  # per channel, then per pair for synergy
+    weights: tuple  # per channel, then per interaction for synergy
     kernel: tuple  # (channel, rung) rung weights, rows sum to 1
     aggregator: tuple  # (channel, stat) blend, rows sum to 1
     form: str = "linear"
-    powers: tuple | None = None
     null: bool = False
 
 
@@ -101,18 +100,9 @@ def default_scenarios(n_channels, radii, stats, radius_idx=None) -> list[Truth]:
         rows[1] = _one_hot(nr, far)
         w2 = tuple([0.7, 0.3] + [0.0] * (n_channels - 2))
         out.append(Truth("S2", w2, kern(rows), kern(agg)))
-        n_pairs = n_channels * (n_channels - 1) // 2
-        w3 = [0.2, 0.2] + [0.0] * (n_channels - 2) + [0.6] + [0.0] * (n_pairs - 1)
-        out.append(
-            Truth(
-                "S3",
-                tuple(w3),
-                kern(rows),
-                kern(agg),
-                form="synergy",
-                powers=tuple([0.6] * n_channels),
-            )
-        )
+        n_terms = len(bi.synergy_combos(n_channels))
+        w3 = [0.2, 0.2] + [0.0] * (n_channels - 2) + [0.6] + [0.0] * (n_terms - 1)
+        out.append(Truth("S3", tuple(w3), kern(rows), kern(agg), form="synergy"))
     if len(ladder0) >= 3:
         rows = solo(0, ladder0[1])
         rows[0] = [0.0] * nr
@@ -121,22 +111,25 @@ def default_scenarios(n_channels, radii, stats, radius_idx=None) -> list[Truth]:
     return out
 
 
-def planted_index(Xr, truth: Truth, channel_index) -> np.ndarray:
+def planted_index(Xr, truth: Truth, channel_index, design=None) -> np.ndarray:
     """The truth's CGI on a prepped tensor, standardised.
 
     Mirrors the model's contraction: each channel is the kernel- and
     aggregator-weighted sum of its columns, standardised, then combined by the
-    truth's form.
+    truth's form; a synergy truth's interactions come from ``design``'s raw
+    values, as the model's do.
     """
     grid = np.nan_to_num(np.asarray(Xr)[:, list(channel_index)])
     k, a = np.asarray(truth.kernel), np.asarray(truth.aggregator)
     v = np.einsum("ncrs,cr,cs->nc", grid, k, a)
     v = (v - v.mean(0)) / np.maximum(v.std(0), 1e-12)
     w = np.asarray(truth.weights, dtype=np.float64)
+    nc = v.shape[1]
+    e = v @ w[:nc]
     if truth.form == "synergy":
-        e = bi.SynergyFit(w, np.asarray(truth.powers), v.mean(0), v.std(0)).apply(v)
-    else:
-        e = v @ w[: v.shape[1]]
+        raw = np.nan_to_num(design.grid(channel_index))
+        T = bi.interaction_columns(raw, k, a, design.collapse, design.basis)
+        e = e + T @ w[nc:]
     return (e - e.mean()) / np.maximum(e.std(), 1e-12)
 
 
@@ -166,7 +159,7 @@ def _write_memmap(arr) -> str:
 
 def _replicate(task) -> dict:
     """One plasmode replicate: simulate, prep, sweep, grid posterior, score."""
-    (x_path, x_shape, cov_path, cov_shape, z, gamma, truth, pr2, seed, cfg) = task
+    x_path, x_shape, cov_path, cov_shape, z, gamma, truth, pr2, seed, cfg, design = task
     X = np.asarray(np.memmap(x_path, dtype=np.float64, mode="r", shape=x_shape))
     cov = (
         None
@@ -196,6 +189,7 @@ def _replicate(task) -> dict:
         splits=cfg["sweep_splits"],
         seed=seed,
         workers=1,
+        design=design,
     )
     post, _, _ = bi.grid_posterior(
         Xr,
@@ -215,6 +209,7 @@ def _replicate(task) -> dict:
         chains=cfg["chains"],
         seed=seed,
         column_sd=info["column_sd"],
+        design=design,
     )
     s = post.summary()
     b_true = math.sqrt(pr2) if not truth.null else 0.0
@@ -414,6 +409,11 @@ def plasmode_recovery(
         part = cov @ g
         gamma = g * (0.5 / max(float(part.std()), 1e-12))
 
+    design = (
+        bi.SynergyDesign.build(X, cov)
+        if bi.eligible_forms(forms, n_channels) != ("linear",)
+        else None
+    )
     paths = [_write_memmap(X)]
     try:
         cov_path = None
@@ -422,7 +422,7 @@ def plasmode_recovery(
             cov_path = paths[1]
         tasks = []
         for truth in truths:
-            z = planted_index(Xr0, truth, channel_index)
+            z = planted_index(Xr0, truth, channel_index, design)
             for pr2 in (0.0,) if truth.null else tuple(partial_r2):
                 for rep in range(int(reps)):
                     tasks.append(
@@ -437,6 +437,7 @@ def plasmode_recovery(
                             float(pr2),
                             _seed(seed, truth.name, float(pr2), rep),
                             cfg,
+                            design,
                         )
                     )
         n_workers = workers or parallel.process_worker_count(len(tasks))

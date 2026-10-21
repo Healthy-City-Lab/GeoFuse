@@ -132,6 +132,31 @@ class TestYearKeyedIntake(unittest.TestCase):
             dict(back.target_files_per_wave), dict(spec.target_files_per_wave)
         )
 
+    def test_extra_columns_ride_through_when_present(self):
+        from geofuse.longitudinal import target_intake_columns
+
+        f1 = _frame(["2010-03-01", "2010-07-02"], ["a", "b"])
+        f1["grip"] = [30.0, 41.0]
+        f2 = _frame(["2016-01-20"], ["a"])  # this file has no control column
+        spec = _spec(
+            ("2010", "2016"),
+            {"fileA": "/f1.gpkg", "fileB": "/f2.gpkg"},
+            {"2010": "g.tif", "2016": "g.tif"},
+        )
+        out = build_long_format(
+            spec,
+            [("fileA", f1), ("fileB", f2)],
+            outcome_col="y",
+            extra_cols=["grip", "height"],
+        )
+        self.assertIn("grip", out.columns)
+        self.assertNotIn("height", out.columns)
+        keys = zip(out["entity_id"], out["wave"], strict=True)
+        by_row = dict(zip(keys, out["grip"], strict=True))
+        self.assertEqual(by_row[("b", "2010")], 41.0)
+        self.assertTrue(np.isnan(by_row[("a", "2016")]))
+        self.assertIn("grip", target_intake_columns(spec, "y", (), ["grip"]))
+
     def test_year_aware_specs_take_every_cross_sectional_metric(self):
         from geofuse.longitudinal import CROSS_SECTIONAL_METRICS
         from geofuse.objective_scoring import SUPPORTED_METRICS

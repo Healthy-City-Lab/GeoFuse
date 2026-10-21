@@ -137,7 +137,7 @@ def _tune_and_transfer(X, target, control, seed=0, n_boot=400):
     cols = list(res.columns)
     flat = X.reshape(n, -1)
     mu, sd = flat[tr][:, cols].mean(0), flat[tr][:, cols].std(0)
-    apply_fn, _ = bi.build_index((flat[tr][:, cols] - mu) / sd, yr, "linear")
+    apply_fn, _ = bi.build_index((flat[tr][:, cols] - mu) / sd, yr)
     exposure = apply_fn((flat[te][:, cols] - mu) / sd)
     return (
         nc.transfer_test(
@@ -209,7 +209,8 @@ def _engine_stub(n_ent=400, n_test=100, seed=7, controls=("grip",)):
     )
     eng = types.SimpleNamespace(
         negative_control_columns=list(controls),
-        is_longitudinal=False,
+        comparator_columns=[],
+        is_panel=False,
         covariate_columns=["age"],
         _covariate_dummy_map={},
         test_data=full[full["polygon_id"] < n_test],
@@ -246,9 +247,9 @@ class TestEngineTransfer(unittest.TestCase):
     def test_no_controls_returns_nothing(self):
         self.assertIsNone(_engine_stub(controls=()).compute_negative_controls({}))
 
-    def test_a_longitudinal_run_is_skipped_and_says_so(self):
+    def test_a_panel_is_skipped_and_says_so(self):
         eng = _engine_stub()
-        eng.is_longitudinal = True
+        eng.is_panel = True
         out = eng.compute_negative_controls({})
         self.assertEqual(out["skipped"], "longitudinal")
 

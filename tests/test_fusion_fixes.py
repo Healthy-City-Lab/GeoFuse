@@ -86,5 +86,83 @@ class TestCategoricalCovariateExpansion(unittest.TestCase):
         self.assertEqual(eng.covariate_columns, cols)
 
 
+class TestRasterTargetExtent(unittest.TestCase):
+    def test_a_projected_raster_is_buffered_in_metres(self):
+        import rasterio
+        from rasterio.transform import from_origin
+
+        from geofuse.fusion import MetricFusionEngine
+
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "target.tif")
+        with rasterio.open(
+            path,
+            "w",
+            driver="GTiff",
+            width=10,
+            height=10,
+            count=1,
+            dtype="float32",
+            crs="EPSG:32617",
+            transform=from_origin(500000, 4800000, 100, 100),
+        ) as dst:
+            dst.write(np.ones((1, 10, 10), dtype="float32"))
+        eng = MetricFusionEngine(target_file=path, cache_dir=tmp)
+        eng.buffer_meters = 1500
+        extent = eng.load_target()
+        self.assertEqual(extent.crs.to_epsg(), 4326)
+        bounds = extent.to_crs("EPSG:32617").total_bounds
+        np.testing.assert_allclose(bounds, [498500, 4797500, 502500, 4801500], atol=1.0)
+
+
+class TestDispersionCheck(unittest.TestCase):
+    def test_rare_dummies_and_binary_outcomes_are_not_flagged(self):
+        from geofuse.fusion import MetricFusionEngine
+
+        eng = object.__new__(MetricFusionEngine)
+        eng.target_feature = "event"
+        eng.covariate_columns = ["area=b", "income"]
+        rng = np.random.default_rng(1)
+        n = 1000
+        income = rng.normal(50, 10, n)
+        income[0] = 5e6  # a sentinel the check exists to catch
+        df = pd.DataFrame(
+            {
+                "event": (rng.random(n) < 0.05).astype(float),
+                "area=b": (rng.random(n) < 0.03).astype(float),
+                "income": income,
+            }
+        )
+        report = eng.check_covariate_dispersion(data=df)
+        self.assertEqual(report["flagged"], ["income"])
+
+
+class TestCollinearityCheck(unittest.TestCase):
+    @staticmethod
+    def _engine(formula):
+        from geofuse.fusion import MetricFusionEngine
+
+        eng = object.__new__(MetricFusionEngine)
+        eng.cgi_formula = formula
+        eng._active_greenery_channel = "cgi"
+        return eng
+
+    def test_a_two_channel_study_checks_ndvi_against_gvi(self):
+        rng = np.random.default_rng(0)
+        veg, ter = rng.random(500), rng.random(500)
+        ndvi = veg + ter + 0.01 * rng.normal(size=500)
+        df = pd.DataFrame({"veg": veg, "terrain": ter, "ndvi": ndvi})
+        eng = self._engine("weighted_average_gvi")
+        report = eng.check_channel_collinearity(data=df)
+        self.assertEqual(report["channels_in"], ["ndvi", "gvi"])
+        self.assertEqual(len(eng._high_vif_channels), 1)
+
+    def test_a_one_channel_study_has_nothing_to_check(self):
+        eng = self._engine("weighted_average_gvi")
+        eng._active_greenery_channel = "ndvi"
+        df = pd.DataFrame({"veg": [0.1, 0.2], "terrain": [0.0, 0.1], "ndvi": [0.3, 1]})
+        self.assertIsNone(eng.check_channel_collinearity(data=df))
+
+
 if __name__ == "__main__":
     unittest.main()

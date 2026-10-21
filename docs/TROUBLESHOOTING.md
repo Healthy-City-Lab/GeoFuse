@@ -80,6 +80,8 @@ A background job never waits on a sign-in page where no browser can open; it sto
 
 Google changed one of the endpoints the scraper uses. The job stops instead of reporting every point as having no panorama. `geofuse doctor` runs one search and shows the same message. The downloader has to be updated to the endpoint Google now uses. Meanwhile, a Street View API key and `download_mode = "api"` download through Google's documented API instead.
 
+A web page in place of data (the log shows `Street View answered a page`) is usually a temporary block of your address, not a change: the run backs off and retries those searches as it does for throttling. It stops with this message only when nothing but pages has come back for 15 minutes; `geofuse doctor` then warns rather than fails, and a rerun later continues from the panorama cache.
+
 ---
 
 ## GVI stops with "Google refused the Street View API request"
@@ -192,3 +194,15 @@ External library logs (Google Earth Engine, Optuna) are routed into the same per
 This happens when a single bbox-wide raster is rendered for a study area whose points are clustered in a few small regions (e.g. neighbourhoods across multiple cities). The bbox contains millions of empty cells.
 
 **Fix:** Switch to **GeoPackage** as the GVI output format; it is the recommended default for sparse or national-scale data. If you still want raster output, enable **Save GeoTIFF** in the GVI tab and GeoFuse will write one dense GeoTIFF per spatial cluster into `[Filename]_gvi_tiles/` along with a `tiles_index.json` describing each tile's bounds. No empty cells.
+
+---
+
+## NDVI GeoTIFFs written by earlier versions
+
+Earlier versions wrote NDVI GeoTIFFs without stored band statistics, and single-tile outputs (small study areas) without a declared NoData value, although their empty pixels hold `-9999`. To bring such a file up to date in place, from the activated environment:
+
+```bash
+python -c "from geofuse.crs_utils import declare_nodata, write_band_statistics; p = r'PATH\TO\name_ndvi.tif'; declare_nodata(p, -9999); write_band_statistics(p)"
+```
+
+Do the same for each `cluster_NNNN.tif` in `[name]_ndvi_tiles/`. Rerunning a tiled job also rewrites its outputs from the tile cache, without downloading again.

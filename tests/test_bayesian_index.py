@@ -222,7 +222,7 @@ class TestWeightsAreOnePerChannel(unittest.TestCase):
         # Channel 0 is the stronger association (-1.2 against +0.9) and it is
         # protective, so a direction-free fit keeps it and drops channel 1.
         E, y = self._two_channels(1.0)
-        _, params = bi.build_index(E, y, "linear")
+        _, params = bi.build_index(E, y)
         w = np.asarray(params["weights"])
         self.assertEqual(len(w), E.shape[1])
         self.assertAlmostEqual(float(w.sum()), 1.0, places=9)
@@ -231,12 +231,12 @@ class TestWeightsAreOnePerChannel(unittest.TestCase):
 
     def test_the_index_still_matches_the_weights_it_reports(self):
         E, y = self._two_channels(1.0)
-        apply_fn, params = bi.build_index(E, y, "linear")
+        apply_fn, params = bi.build_index(E, y)
         self.assertTrue(np.allclose(apply_fn(E), E @ np.asarray(params["weights"])))
 
     def test_fits_with_different_active_sets_stack(self):
         rows = [
-            np.asarray(bi.build_index(*self._two_channels(s), "linear")[1]["weights"])
+            np.asarray(bi.build_index(*self._two_channels(s))[1]["weights"])
             for s in (1.0, -1.0, 1.0, -1.0)
         ]
         self.assertEqual(np.asarray(rows).shape, (4, 2))
@@ -303,7 +303,6 @@ class TestCancelStopsTheSearch(unittest.TestCase):
                 channels=("a", "b"),
                 channel_index=(0, 1),
                 splits=4,
-                perm=4,
                 workers=1,
                 cancel_check=lambda: True,
             )
@@ -609,7 +608,6 @@ class TestCollinearAggregatorsDoNotManufactureAPick(unittest.TestCase):
         return bi.IndexPosterior(
             weights=np.full((n, 1), 1.0),
             beta=np.zeros(n),
-            powers=None,
             channels=("a",),
             picked=(),
             form="linear",
@@ -702,7 +700,7 @@ class TestPartialCoverageDoesNotPoisonTheReport(unittest.TestCase):
         rng = np.random.default_rng(6)
         E = rng.normal(size=(300, 2))
         y = 1.5 * E[:, 0] + 0.05 * rng.normal(size=300)
-        apply_fn, params = bi.build_index(E, y, "linear")
+        apply_fn, params = bi.build_index(E, y)
         self.assertAlmostEqual(float(np.asarray(params["weights"])[1]), 0.0, places=9)
         E_gap = E.copy()
         E_gap[:4, 1] = np.nan
@@ -728,9 +726,8 @@ class TestPartialCoverageDoesNotPoisonTheReport(unittest.TestCase):
             self.assertTrue(np.isfinite(lin[key]), f"{key} is {lin[key]}")
 
     def test_an_undefined_gain_does_not_become_a_significant_p_value(self):
-        # NaN compares false against every permuted gain, so the count of
-        # exceedances is zero and the permutation p comes out at its floor --
-        # the most significant value the test can produce, from no statistic.
+        # Splits whose gain is undefined carry no statistic, so a test built
+        # from them must report nothing rather than a p-value.
         import geofuse.bayesian_index as _bi
 
         real_map = _bi._map
@@ -752,12 +749,40 @@ class TestPartialCoverageDoesNotPoisonTheReport(unittest.TestCase):
                 channels=("a", "b"),
                 channel_index=(0, 1),
                 splits=3,
-                perm=3,
                 workers=1,
             )
         finally:
             _bi._map = real_map
         self.assertIsNone(gain["gain_p"])
+
+    def test_the_gain_p_value_is_the_corrected_resampled_t(self):
+        from scipy import stats
+
+        import geofuse.bayesian_index as _bi
+
+        real_map = _bi._map
+        planted = iter([1.0, 2.0, 3.0])
+
+        def fake_map(fn, tasks, n_workers, cancel_check=None):
+            out = real_map(fn, tasks, 1, cancel_check)
+            for r in out:
+                if isinstance(r, dict) and "gain" in r:
+                    r["gain"] = next(planted)
+            return out
+
+        X, y = self._cube()
+        yr, Xr = bi.prep(X, y, None)
+        _bi._map = fake_map
+        try:
+            gain = bi.holdout_gain(
+                Xr, yr, channels=("a", "b"), channel_index=(0, 1), splits=3, workers=1
+            )
+        finally:
+            _bi._map = real_map
+        # mean 2, variance 1, inflation 1/3 + 0.25/0.75.
+        t = 2.0 / np.sqrt(2.0 / 3.0)
+        self.assertAlmostEqual(gain["gain_t"], t)
+        self.assertAlmostEqual(gain["gain_p"], float(stats.t.sf(t, 2)))
 
     def test_the_gain_comparison_reports_a_composite_score(self):
         X, y = self._cube()
@@ -768,7 +793,6 @@ class TestPartialCoverageDoesNotPoisonTheReport(unittest.TestCase):
             channels=("a", "b"),
             channel_index=(0, 1),
             splits=3,
-            perm=3,
             workers=1,
         )
         for key in ("cgi", "best_single", "gain"):
@@ -892,23 +916,24 @@ class TestHonestFormSelection(unittest.TestCase):
 
     @staticmethod
     def _cube(truth, n=1500, seed=0):
-        """Linear truth on z-scored channels; synergy truth inside its family.
+        """Linear truth on the channels; synergy truth inside its family.
 
-        The synergy form works on each channel's approximate percentile, so its
-        truth is built the same way: a pair-weighted product of two percentiles.
+        The synergy form's interaction is the geometric mean of the raw
+        channels, so its truth is one: mostly the interaction of two positive
+        channels. Returns ``(Xr, yr, design)``.
         """
         rng = np.random.default_rng(seed)
-        X = rng.normal(size=(n, 2, 1, 1))
+        X = rng.lognormal(-1.0, 0.6, size=(n, 2, 1, 1))
+        a, b = X[:, 0, 0, 0], X[:, 1, 0, 0]
         if truth == "synergy":
-            t = bi.SynergyFit(
-                np.array([0.1, 0.1, 0.8]), np.ones(2), np.zeros(2), np.ones(2)
-            ).apply(X[:, :, 0, 0])
+            t = 0.1 * a / a.std() + 0.1 * b / b.std() + 0.8 * np.sqrt(a * b)
             y = 0.8 * (t - t.mean()) / t.std() + rng.normal(size=n)
         else:
-            y = 0.25 * X[:, 0, 0, 0] + 0.25 * X[:, 1, 0, 0] + rng.normal(size=n)
-        return bi.prep(X, y, None)[::-1]
+            y = 0.25 * a / a.std() + 0.25 * b / b.std() + rng.normal(size=n)
+        yr, Xr = bi.prep(X, y, None)
+        return Xr, yr, bi.SynergyDesign.build(X)
 
-    def _sweep(self, Xr, yr, **kw):
+    def _sweep(self, Xr, yr, design, **kw):
         return bi.sweep(
             Xr,
             np.array([500.0]),
@@ -918,12 +943,13 @@ class TestHonestFormSelection(unittest.TestCase):
             channel_index=(0, 1),
             splits=8,
             workers=1,
+            design=design,
             **kw,
         )
 
     def test_a_null_outcome_shows_no_systematic_gain(self):
         rng = np.random.default_rng(21)
-        X = rng.normal(size=(800, 2, 2, 2))
+        X = rng.lognormal(size=(800, 2, 2, 2))
         yr, Xr = bi.prep(X, rng.normal(size=800), None)
         gain = bi.holdout_gain(
             Xr,
@@ -931,10 +957,11 @@ class TestHonestFormSelection(unittest.TestCase):
             channels=("a", "b"),
             channel_index=(0, 1),
             splits=30,
-            perm=30,
             workers=1,
+            design=bi.SynergyDesign.build(X),
         )
-        self.assertLess(abs(gain["gain"] - gain["gain_null_mean"]), 0.5)
+        self.assertLess(abs(gain["gain"]), 0.5)
+        self.assertGreater(gain["gain_p"], 0.01)
         self.assertLessEqual(gain["cgi"], gain["cgi_max_over_forms_optimistic"])
         self.assertEqual(sum(gain["form_counts"].values()), 30)
         self.assertEqual(set(gain["cgi_by_form"]), {"linear", "synergy"})
@@ -962,8 +989,21 @@ class TestHonestFormSelection(unittest.TestCase):
         self.assertEqual(bi.eligible_forms(("synergy",), 1), ("linear",))
         self.assertEqual(bi.eligible_forms(bi.FORMS, 2), bi.FORMS)
 
+    def test_synergy_needs_the_raw_cell_values(self):
+        self.assertEqual(bi.eligible_forms(bi.FORMS, 2, False), ("linear",))
+        Xr, yr, _ = self._cube("synergy")
+        self.assertEqual(self._sweep(Xr, yr, None).form, "linear")
+
+    def test_the_main_terms_are_the_tensor_columns(self):
+        Xr, _, design = self._cube("synergy")
+        T, sd = design.columns((0, 1))
+        # The design stores its cells as float32.
+        np.testing.assert_allclose(T[:, :2], Xr.reshape(len(Xr), -1), atol=1e-5)
+        self.assertEqual(T.shape[1], 3)
+        self.assertTrue((sd > 0).all())
+
     def test_discovery_chooses_on_training_rows(self):
-        Xr, yr = self._cube("synergy", n=1200)
+        Xr, yr, design = self._cube("synergy", n=1200)
         out = bi.repeated_discovery(
             Xr,
             np.array([500.0]),
@@ -974,16 +1014,18 @@ class TestHonestFormSelection(unittest.TestCase):
             reps=1,
             shuffles=4,
             workers=1,
+            design=design,
         )
         self.assertEqual(sum(out["form_counts"].values()), out["n_results"])
         self.assertGreaterEqual(out["form_counts"]["synergy"], 3)
         self.assertTrue(np.isfinite(out["chosen_test_t"]))
 
     def test_choose_form_breaks_ties_towards_the_first_form(self):
-        Xr, yr = self._cube("linear")
+        Xr, yr, _ = self._cube("linear")
         E = Xr.reshape(len(Xr), -1)
-        form, scores = bi.choose_form(E, yr, ("linear",), seed=0)
-        self.assertEqual((form, scores), ("linear", {}))
+        self.assertEqual(bi.choose_form({"linear": E}, yr, seed=0), ("linear", {}))
+        form, _ = bi.choose_form({"linear": E, "synergy": E}, yr, seed=0)
+        self.assertEqual(form, "linear")
 
 
 class TestDistanceDecay(unittest.TestCase):
@@ -1075,7 +1117,6 @@ class TestDistanceDecay(unittest.TestCase):
         post = bi.IndexPosterior(
             weights=rng.dirichlet(np.ones(2), size=draws),
             beta=rng.normal(size=draws),
-            powers=None,
             channels=("ndvi", "gvi"),
             picked=((300, "mean"),) * 2,
             form="linear",
@@ -1104,46 +1145,19 @@ class TestDistanceDecay(unittest.TestCase):
         self.assertGreater(info["column_sd"][0, 1, 0], 2.5 * info["column_sd"][0, 0, 0])
 
 
-class TestPercentileScaling(unittest.TestCase):
-    """The synergy form reads each channel as an approximate percentile."""
-
-    def test_it_is_the_log_normal_cdf_of_the_standardised_value(self):
-        from scipy.stats import norm
-
-        x = np.array([[-1.0, 2.0], [0.5, 4.0]])
-        got = bi.percentile_scale(x, np.array([0.0, 2.0]), np.array([1.0, 2.0]))
-        want = norm.logcdf((x - [0.0, 2.0]) / [1.0, 2.0])
-        np.testing.assert_allclose(got, want, rtol=1e-12)
-
-    def test_far_below_the_mean_stays_finite_and_above_zero(self):
-        logz = bi.percentile_scale(np.array([[-60.0]]), 0.0, 1.0)
-        self.assertTrue(np.isfinite(logz).all())
-        self.assertGreater(float(np.exp(logz * 0.2)[0, 0]), 0.0)
-
-    def test_a_held_out_row_beyond_the_training_range_is_not_clipped(self):
-        rng = np.random.default_rng(0)
-        E = rng.normal(size=(200, 2))
-        y = E[:, 0] * E[:, 1] + rng.normal(size=200)
-        sf = bi.fit_synergy(E, y)
-        np.testing.assert_allclose(sf.center, E.mean(0))
-        top = np.array([[E[:, 0].max(), 0.0], [E[:, 0].max() + 3.0, 0.0]])
-        out = sf.apply(top)
-        self.assertNotEqual(out[0], out[1])
-
-
 class TestSynergyPosteriorSamples(unittest.TestCase):
     """The synergy grid fit must sample, not freeze or diverge.
 
-    The grid model's channel exposure moves with the kernel and aggregator. Hard
-    min-max bounds jumped between entities as it moved and put each minimum at
-    z = 0, where ``z ** p`` has an infinite slope; percentile scaling is smooth
-    in both respects.
+    Its interactions move with the kernel and aggregator, and a geometric mean
+    has an infinite slope where a clipped channel reaches 0; the channels here
+    are centred on 0, so half of every interaction sits on that edge.
     """
 
     def test_single_short_chains_recover_the_linear_fits_effect(self):
         rng = np.random.default_rng(0)
         n = 800
         X = rng.normal(size=(n, 2, len(RADII), len(STATS)))
+        design = bi.SynergyDesign.build(X)
         y = 0.23 * X[:, 0, 1, 0] + rng.normal(size=n)
         yr, Xr = bi.prep(X, y, None)
         lin = bi.fit(
@@ -1169,6 +1183,8 @@ class TestSynergyPosteriorSamples(unittest.TestCase):
                 warmup=200,
                 chains=1,
                 seed=seed,
+                design=design,
+                design_channels=(0, 1),
             )
             beta = np.asarray(m.get_samples()["beta"])
             self.assertGreater(float(beta.std()), 0.01, f"seed {seed} froze")
@@ -1190,8 +1206,16 @@ class TestSynergyPosteriorSamples(unittest.TestCase):
             warmup=300,
             chains=2,
             seed=1,
+            design=bi.SynergyDesign.build(X),
+            design_channels=(0, 1),
         )
         self.assertLess(int(np.sum(m.get_extra_fields()["diverging"])), 10)
+
+    def test_it_refuses_to_run_without_the_raw_cell_values(self):
+        rng = np.random.default_rng(0)
+        _, Xr = bi.prep(rng.normal(size=(50, 2, 2, 1)), rng.normal(size=50), None)
+        with self.assertRaises(ValueError):
+            bi.fit(Xr, rng.normal(size=50), form="synergy", radii=RADII[:2])
 
 
 class _StubMCMC:
@@ -1267,13 +1291,14 @@ class TestNullCalibrationPrecision(unittest.TestCase):
 
     def test_reselection_varies_the_form_across_null_permutations(self):
         Xr, yr = self._null_grid()
+        E = Xr.reshape(len(Xr), -1)
         out = bi.null_calibration(
             Xr,
             yr,
             n=16,
             workers=1,
             reselect_form=True,
-            form_E=Xr.reshape(len(Xr), -1),
+            form_E={"linear": E, "synergy": np.column_stack([E, E[:, 0] * E[:, 1]])},
         )
         self.assertEqual(sum(out["form_counts"].values()), 16)
         self.assertGreater(min(out["form_counts"].values()), 0, out["form_counts"])
@@ -1299,6 +1324,388 @@ class TestExposureResponseProjectionIsRankSafe(unittest.TestCase):
         r_dup, keep_dup = _orthogonalise(block, dup)
         np.testing.assert_array_equal(keep_clean, keep_dup)
         np.testing.assert_allclose(r_dup, r_clean, atol=1e-10)
+
+
+class TestPanelPosterior(unittest.TestCase):
+    def test_the_entity_intercept_widens_the_effect_interval(self):
+        # Exposure and a strong intercept both vary by entity, so treating the
+        # waves as independent rows understates the uncertainty on beta.
+        rng = np.random.default_rng(31)
+        n_ent, waves = 120, 8
+        ent = np.repeat(np.arange(n_ent), waves)
+        E = np.repeat(rng.normal(size=(n_ent, 2)), waves, axis=0)
+        E += 0.1 * rng.normal(size=E.shape)
+        y = np.repeat(rng.normal(size=n_ent), waves) * 2.0 + rng.normal(size=len(ent))
+        y = (y - y.mean()) / y.std()
+        kw = {"form": "linear", "draws": 200, "warmup": 200, "chains": 1, "seed": 1}
+        plain = bi.fit(E, y, **kw).get_samples()
+        panel = bi.fit(E, y, entities=ent, **kw).get_samples()
+        self.assertIn("sigma_u", panel)
+        self.assertGreater(
+            float(np.std(panel["beta"])), 1.5 * float(np.std(plain["beta"]))
+        )
+
+    def test_one_row_per_entity_is_the_plain_fit_draw_for_draw(self):
+        # Singleton groups cannot separate the entity variance from the row
+        # variance, so the intercept is left out rather than freezing chains.
+        rng = np.random.default_rng(32)
+        n = 300
+        E = rng.normal(size=(n, 2))
+        y = 0.3 * E[:, 0] + rng.normal(size=n)
+        y = (y - y.mean()) / y.std()
+        kw = {"form": "linear", "draws": 800, "warmup": 600, "chains": 2, "seed": 1}
+        plain = bi.fit(E, y, **kw)
+        with self.assertLogs("geofuse.bayesian_index", "WARNING"):
+            single = bi.fit(E, y, entities=np.arange(n).astype(str), **kw)
+        self.assertNotIn("sigma_u", single.get_samples())
+        np.testing.assert_array_equal(
+            plain.get_samples()["beta"], single.get_samples()["beta"]
+        )
+        post = bi.posterior_from(
+            single,
+            channels=("a", "b"),
+            picked=((1, "mean"), (1, "mean")),
+            form="linear",
+        )
+        self.assertLessEqual(post.rhat_max, 1.01)
+        self.assertTrue(post.summary()["converged"])
+
+    def test_panel_entities_are_kept_and_singletons_dropped(self):
+        panel = np.array([0, 0, 1, 2, 2])
+        self.assertIs(bi.panel_entities(panel), panel)
+        self.assertIsNone(bi.panel_entities(None))
+        with self.assertLogs("geofuse.bayesian_index", "WARNING"):
+            self.assertIsNone(bi.panel_entities(np.arange(5)))
+        self.assertIsNone(bi.panel_entities(np.arange(5), warn=False))
+
+
+class TestPanelPermutation(unittest.TestCase):
+    def test_rows_are_permuted_as_before_without_entities(self):
+        y = np.arange(50.0)
+        expected = np.random.default_rng(4).permutation(y)
+        np.testing.assert_array_equal(bi._permuted(y, 4), expected)
+
+    def test_whole_histories_move_between_entities_of_one_wave_pattern(self):
+        # Entities 0-2 have waves (1, 2); entities 3-4 only wave 1.
+        ent = np.array([0, 0, 1, 1, 2, 2, 3, 4])
+        wave = np.array([1, 2, 1, 2, 1, 2, 1, 1])
+        y = np.array([10.0, 11.0, 20.0, 21.0, 30.0, 31.0, 40.0, 50.0])
+        histories = {(10.0, 11.0), (20.0, 21.0), (30.0, 31.0)}
+        for seed in range(10):
+            out = bi._permuted(y, seed, ent, wave)
+            for e in range(3):
+                self.assertIn(tuple(out[ent == e]), histories)
+            self.assertEqual(sorted(out[ent >= 3]), [40.0, 50.0])
+            self.assertEqual(sorted(out), sorted(y))
+
+
+class TestGroupedInnerSplits(unittest.TestCase):
+    def test_row_splits_are_unchanged_without_groups(self):
+        expected = np.random.default_rng(7).random(500) < 0.25
+        np.testing.assert_array_equal(bi._holdout(500, 7, 0.25), expected)
+
+    def test_a_group_never_sits_on_both_sides(self):
+        groups = np.repeat(np.arange(120), 3)
+        for seed in range(20):
+            te = bi._holdout(len(groups), seed, 0.25, groups)
+            self.assertTrue(te.any() and (~te).any())
+            for g in np.unique(groups):
+                self.assertEqual(len(set(te[groups == g])), 1)
+
+    def test_the_sweep_runs_on_grouped_splits(self):
+        rng = np.random.default_rng(3)
+        n_ent, waves = 150, 3
+        groups = np.repeat(np.arange(n_ent), waves)
+        X = rng.normal(size=(n_ent * waves, 2, 2, 1))
+        y = X[:, 0, 1, 0] + rng.normal(size=len(groups))
+        yr, Xr = bi.prep(X, y, None)
+        res = bi.sweep(
+            Xr,
+            [100.0, 300.0],
+            ["mean"],
+            yr,
+            channels=["a", "b"],
+            channel_index=[0, 1],
+            splits=4,
+            workers=1,
+            groups=groups,
+        )
+        self.assertEqual(res.picked[0], (300, "mean"))
+
+
+def _linear_grid(n, seed=1, effect=0.15):
+    rng = np.random.default_rng(seed)
+    E = rng.normal(size=(n, 2, 4, 3))
+    E = np.cumsum(E, axis=2) / np.sqrt(np.arange(1, 5))[None, None, :, None]
+    y = effect * E[:, 0, 1, 0] + rng.normal(size=n)
+    return E, (y - y.mean()) / y.std()
+
+
+_GRID = {"radii": [100, 200, 300, 400], "stats": ("a", "b", "c")}
+
+
+class TestCrossProductLikelihood(unittest.TestCase):
+    """The linear form's likelihood from the columns' cross-products.
+
+    It is the row likelihood term for term, so the posterior is the same; the
+    draws themselves differ, since float32 sums in another order send the
+    trajectories apart, so the comparison is on posterior summaries.
+    """
+
+    def _close(self, a, b, key):
+        sa, sb = np.asarray(a[key]), np.asarray(b[key])
+        sd = np.maximum(sa.std(axis=0), 1e-6)
+        self.assertTrue(
+            np.all(np.abs(sa.mean(axis=0) - sb.mean(axis=0)) < 0.3 * sd), key
+        )
+
+    def test_the_grid_posterior_is_the_row_posterior(self):
+        E, y = _linear_grid(3000)
+        kw = dict(_GRID, draws=400, warmup=400, chains=2, seed=3)
+        rows = bi.fit(E, y, likelihood="rows", **kw).get_samples()
+        cross = bi.fit(E, y, **kw).get_samples()
+        for key in ("beta", "w", "mu", "a", "sigma"):
+            self._close(rows, cross, key)
+        for q in (2.5, 97.5):
+            self.assertAlmostEqual(
+                np.percentile(rows["beta"], q), np.percentile(cross["beta"], q), 2
+            )
+
+    def test_fixed_columns_too(self):
+        E, y = _linear_grid(3000)
+        X = E[:, :, 1, 0]
+        kw = {"draws": 400, "warmup": 400, "chains": 2, "seed": 3}
+        rows = bi.fit(X, y, likelihood="rows", **kw).get_samples()
+        cross = bi.fit(X, y, **kw).get_samples()
+        for key in ("beta", "w", "sigma"):
+            self._close(rows, cross, key)
+
+    def test_the_cross_products_replace_the_rows(self):
+        E, y = _linear_grid(2000)
+        cross = bi.linear_cross_products(E, y)
+        self.assertEqual(cross["S"].shape, (24, 24))
+        del cross["Xc"]
+        kw = dict(_GRID, draws=200, warmup=200, chains=1, seed=5)
+        given = bi.fit(None, None, cross_products=cross, **kw).get_samples()
+        own = bi.fit(E, y, **kw).get_samples()
+        np.testing.assert_allclose(given["beta"], own["beta"], rtol=1e-5)
+
+    def test_panels_and_synergy_keep_the_row_likelihood(self):
+        E, y = _linear_grid(600)
+        ent = np.repeat(np.arange(200), 3)
+        kw = dict(_GRID, entities=ent, draws=100, warmup=100, chains=1, seed=2)
+        auto = bi.fit(E, y, **kw).get_samples()
+        rows = bi.fit(E, y, likelihood="rows", **kw).get_samples()
+        self.assertIn("sigma_u", auto)
+        np.testing.assert_array_equal(auto["beta"], rows["beta"])
+        with self.assertRaises(ValueError):
+            bi.fit(None, None, cross_products=bi.linear_cross_products(E, y), **kw)
+
+    @unittest.skipUnless(os.environ.get("GEOFUSE_SLOW_TESTS"), "timing check")
+    def test_the_cost_does_not_grow_with_n(self):
+        import time
+
+        kw = dict(_GRID, draws=300, warmup=300, chains=2, seed=1)
+        took = {}
+        for n in (2000, 20000):
+            E, y = _linear_grid(n)
+            t = time.perf_counter()
+            bi.fit(E, y, **kw)
+            took[n] = time.perf_counter() - t
+        self.assertLess(took[20000], 1.5 * took[2000])
+
+
+class TestNullRefits(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.E, cls.y = _linear_grid(3000)
+        cls.post, cls.grid, cls.kwargs = bi.grid_posterior(
+            cls.E,
+            cls.y,
+            channels=("x1", "x2"),
+            channel_index=(0, 1),
+            radius_idx=[range(4), range(4)],
+            form="linear",
+            picked=((200, "a"), (200, "a")),
+            draws=300,
+            warmup=300,
+            chains=2,
+            seed=1,
+            **_GRID,
+        )
+
+    def test_the_main_fit_hands_over_its_adapted_sampler(self):
+        warm = self.post.warm_start
+        self.assertGreater(warm["step_size"], 0.0)
+        self.assertEqual(warm["warmup"], bi.NULL_WARMUP_WARM)
+        self.assertTrue(warm["adapt_mass_matrix"])
+        self.assertEqual(set(warm["init"]), {"a", "beta", "kw", "mu", "sigma", "w"})
+        (block,) = warm["inverse_mass_matrix"].values()
+        self.assertEqual(block.ndim, 1)
+
+    def test_cross_product_refits_match_the_row_refits(self):
+        drop = ("design", "design_channels")
+        kwargs = {k: v for k, v in self.kwargs.items() if k not in drop}
+        for seed in range(3000, 3004):
+            yp = bi._permuted(self.y, seed)
+            cross = bi.linear_cross_products(self.grid, yp)
+            path = bi._write_memmap(cross["S"], ".test-cross")
+            try:
+                fast = bi._null_fit_linear(
+                    (
+                        path,
+                        cross["S"].shape[0],
+                        cross["shape"],
+                        cross["cy"],
+                        cross["yy"],
+                        "linear",
+                        seed,
+                        kwargs,
+                    )
+                )
+            finally:
+                os.unlink(path)
+            path = bi._write_memmap(self.grid, ".test-grid")
+            try:
+                slow = bi._null_fit(
+                    (
+                        path,
+                        self.grid.shape,
+                        self.y,
+                        "linear",
+                        seed,
+                        dict(kwargs, likelihood="rows"),
+                        None,
+                        (None, None, None),
+                    )
+                )
+            finally:
+                os.unlink(path)
+            self.assertEqual(fast, slow, seed)
+
+    def test_the_calibration_records_how_it_refitted_and_logs_progress(self):
+        with self.assertLogs("geofuse.bayesian_index", "INFO") as logs:
+            out = bi.null_calibration(
+                self.grid,
+                self.y,
+                form="linear",
+                n=4,
+                workers=1,
+                warm_start=self.post.warm_start,
+                **self.kwargs,
+            )
+        self.assertEqual(out["likelihood"], "cross_products")
+        self.assertEqual(out["warm_start"]["warmup"], bi.NULL_WARMUP_WARM)
+        self.assertGreater(out["elapsed_s"], 0.0)
+        self.assertTrue(any("4 / 4 refits" in m for m in logs.output), logs.output)
+
+    def test_a_warm_refit_mixes_like_a_cold_one(self):
+        drop = ("design", "design_channels")
+        kwargs = {k: v for k, v in self.kwargs.items() if k not in drop}
+        yp = bi._permuted(self.y, 3005)
+        kw = dict(kwargs, draws=300, warmup=300, chains=4, seed=3005)
+        summaries = {}
+        warm = {"warm_start": self.post.warm_start}
+        for label, extra in (("cold", {}), ("warm", warm)):
+            m = bi.fit(self.grid, yp, **kw, **extra)
+            post = bi.posterior_from(
+                m,
+                channels=("x1", "x2"),
+                picked=((200, "a"), (200, "a")),
+                form="linear",
+                radius_kernel="lognormal",
+                **_GRID,
+            )
+            lo, hi = np.percentile(np.asarray(m.get_samples()["beta"]), [2.5, 97.5])
+            summaries[label] = (post.rhat_max, hi - lo)
+        self.assertLess(summaries["warm"][0], 1.05)
+        self.assertAlmostEqual(
+            summaries["warm"][1], summaries["cold"][1], delta=0.2 * summaries["cold"][1]
+        )
+
+
+# Run in a fresh interpreter: XLA fixes its CPU device count the first time a
+# process starts JAX, so it cannot be tested inside one that already has.
+_CHAINS_SCRIPT = """
+import json, logging, sys, warnings
+sys.path.insert(0, {root!r})
+import numpy as np
+from geofuse import bayesian_index as bi
+if {start_jax}:
+    import jax.numpy as jnp
+    jnp.zeros(1)
+records = []
+handler = logging.Handler()
+handler.emit = lambda r: records.append(r.getMessage())
+logging.getLogger("geofuse.bayesian_index").addHandler(handler)
+logging.getLogger("geofuse.bayesian_index").setLevel(logging.INFO)
+rng = np.random.default_rng(5)
+ent = np.repeat(np.arange(100), 3)
+E = rng.normal(size=(len(ent), 2))
+y = 0.3 * E[:, 0] + rng.normal(size=len(ent))
+kw = dict(entities=ent, draws=100, warmup=100, chains=4, seed=3)
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    a = np.asarray(bi.fit(E, y, **kw).get_samples()["beta"])
+    b = np.asarray(bi.fit(E, y, **kw).get_samples()["beta"])
+import jax
+print(json.dumps({{
+    "devices": jax.local_device_count(),
+    "same": bool(np.array_equal(a, b)),
+    "device_warnings": [str(w.message) for w in caught if "devices" in str(w.message)],
+    "logs": records,
+}}))
+"""
+
+
+def _chains_run(start_jax: bool) -> dict:
+    import json
+    import subprocess
+
+    script = _CHAINS_SCRIPT.format(root=ROOT, start_jax=start_jax)
+    env = {k: v for k, v in os.environ.items() if k != "XLA_FLAGS"}
+    out = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=600,
+        check=True,
+    )
+    return json.loads(out.stdout.strip().splitlines()[-1])
+
+
+class TestParallelChains(unittest.TestCase):
+    def test_an_entity_fit_runs_its_chains_in_parallel(self):
+        # The entity block touches JAX first; the devices must be asked before.
+        out = _chains_run(start_jax=False)
+        self.assertGreaterEqual(out["devices"], 4)
+        self.assertEqual(out["device_warnings"], [])
+        self.assertTrue(out["same"])
+
+    def test_a_process_that_started_jax_runs_them_in_turn_without_a_warning(self):
+        out = _chains_run(start_jax=True)
+        self.assertEqual(out["devices"], 1)
+        self.assertEqual(out["device_warnings"], [])
+        self.assertTrue(any("one after another" in m for m in out["logs"]))
+        self.assertTrue(out["same"])
+
+    def test_a_requested_device_count_is_never_lowered(self):
+        saved = os.environ.get("XLA_FLAGS")
+
+        def restore():
+            if saved is None:
+                os.environ.pop("XLA_FLAGS", None)
+            else:
+                os.environ["XLA_FLAGS"] = saved
+
+        self.addCleanup(restore)
+        os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8 --x=1"
+        bi.reserve_host_devices(4)
+        self.assertIn("device_count=8", os.environ["XLA_FLAGS"])
+        bi.reserve_host_devices(12)
+        self.assertIn("device_count=12", os.environ["XLA_FLAGS"])
+        self.assertIn("--x=1", os.environ["XLA_FLAGS"])
 
 
 if __name__ == "__main__":

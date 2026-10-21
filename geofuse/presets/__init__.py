@@ -116,6 +116,7 @@ def validate(doc: Any, engine: str) -> tuple[dict, list[str]]:
     raw = doc.get("settings")
     if not isinstance(raw, dict):
         raise PresetError("The preset has no 'settings' object.")
+    raw = _settings.expand_shorthands(engine, raw)
     schema = SCHEMAS[engine]
     settings: dict = {}
     warnings: list[str] = []

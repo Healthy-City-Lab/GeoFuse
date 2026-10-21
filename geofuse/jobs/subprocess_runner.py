@@ -543,6 +543,7 @@ def run_ndvi_child(
     substitute_2012=False,
     preset=None,
     ee_project=None,
+    chains=None,
 ) -> None:
     """Subprocess entry point for ``run_ndvi`` (single date range).
 
@@ -585,6 +586,7 @@ def run_ndvi_child(
             substitute_2012=substitute_2012,
             preset=preset,
             ee_project=ee_project,
+            chains=chains,
         )
 
     except BaseException as exc:  # noqa: BLE001
@@ -623,6 +625,7 @@ def run_ndvi_column_child(
     substitute_2012=False,
     preset=None,
     ee_project=None,
+    chains=None,
 ) -> None:
     """Subprocess entry point for ``run_ndvi_column`` (one raster per year)."""
     try:
@@ -659,6 +662,7 @@ def run_ndvi_column_child(
             substitute_2012=substitute_2012,
             preset=preset,
             ee_project=ee_project,
+            chains=chains,
         )
 
     except BaseException as exc:  # noqa: BLE001
@@ -693,6 +697,12 @@ def run_fusion_child(
         # Route engine log lines + stdout/stderr into the parent queue before
         # the runner imports anything that might cache a logger closure.
         route_engine_logging_to_queue(job_id, event_queue)
+
+        # One CPU device per posterior chain, requested before anything in this
+        # process starts JAX, so the chains run in parallel.
+        from geofuse.bayesian_index import reserve_host_devices
+
+        reserve_host_devices(int(run_kwargs.get("posterior_chains", 4)))
 
         from geofuse.jobs.runners import run_fusion
 

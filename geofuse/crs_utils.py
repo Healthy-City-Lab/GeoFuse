@@ -8,7 +8,7 @@ which matches Leaflet/Folium and ``generate_raster_grid`` in ``geofuse.core``.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 import geopandas as gpd
 import numpy as np
@@ -16,6 +16,7 @@ import rasterio
 import shapely
 from pyproj import CRS as PyProjCRS
 from pyproj import Geod, Transformer
+from rasterio.errors import RasterBlockError
 from rasterio.transform import from_bounds
 from rasterio.warp import (
     Resampling,
@@ -146,6 +147,95 @@ def build_internal_overviews(
     with rasterio.open(path, "r+") as dst:
         dst.build_overviews(list(factors), resampling)
         dst.update_tags(ns="rio_overview", resampling=resampling.name)
+
+
+def declare_nodata(path: str, value: float) -> None:
+    """Write ``value`` as the nodata of a GeoTIFF that declares none."""
+    with rasterio.open(path, "r+") as ds:
+        if ds.nodata is None:
+            ds.nodata = value
+
+
+def _block_stored(ds, band: int, i: int, j: int) -> bool:
+    """Whether block ``(i, j)`` of ``band`` holds bytes on disk.
+
+    A GeoTIFF written with ``SPARSE_OK`` omits blocks that are entirely
+    nodata; GDAL reports no size for them and reads them as nodata.
+    """
+    try:
+        return ds.block_size(band, i, j) > 0
+    except RasterBlockError:
+        return False
+
+
+def statistics_tags(
+    blocks: Iterable[np.ndarray], *, nodata: float | None = None, size: int
+) -> dict[str, str]:
+    """GDAL's ``STATISTICS_*`` band metadata for the pixels in ``blocks``.
+
+    Exact minimum, maximum, mean, population standard deviation and valid
+    percentage of a band of ``size`` pixels, merged block by block. Pixels
+    equal to ``nodata`` and non-finite pixels are left out. Empty when no
+    pixel is valid.
+    """
+    n, mean, m2 = 0, 0.0, 0.0
+    lo, hi = np.inf, -np.inf
+    for block in blocks:
+        a = np.asarray(block).ravel()
+        a = a[np.isfinite(a)]
+        if nodata is not None:
+            a = a[a != nodata]
+        if a.size == 0:
+            continue
+        # ── Running moments (Chan) ──────────────────────────
+        a = a.astype(np.float64)
+        k, m = a.size, float(a.mean())
+        delta, total = m - mean, n + k
+        mean += delta * k / total
+        m2 += float(((a - m) ** 2).sum()) + delta * delta * n * k / total
+        n = total
+        lo, hi = min(lo, float(a.min())), max(hi, float(a.max()))
+    if n == 0:
+        return {}
+    return {
+        "STATISTICS_MINIMUM": repr(lo),
+        "STATISTICS_MAXIMUM": repr(hi),
+        "STATISTICS_MEAN": repr(mean),
+        "STATISTICS_STDDEV": repr(float(np.sqrt(m2 / n))),
+        "STATISTICS_VALID_PERCENT": repr(100.0 * n / size),
+    }
+
+
+def write_band_statistics(
+    path: str, *, nodata: float | None = None
+) -> list[dict[str, str]]:
+    """Store each band's exact statistics in a GeoTIFF's metadata.
+
+    GDAL readers take these ``STATISTICS_*`` tags instead of estimating a
+    band's statistics from a sample of pixels. Only blocks stored on disk
+    are read (a sparse file omits blocks that hold nothing but nodata), so
+    the cost follows the area with data rather than the bounding box.
+
+    Pixels equal to the file's nodata value, or to ``nodata`` when the file
+    declares none, and non-finite pixels are left out; the file's nodata is
+    not changed. A band without a valid pixel gets no tags. Returns each
+    band's tags.
+    """
+    results: list[dict[str, str]] = []
+    with rasterio.open(path, "r+") as ds:
+        fill = ds.nodata if ds.nodata is not None else nodata
+        tiff = ds.driver == "GTiff"
+        for band in range(1, ds.count + 1):
+            blocks = (
+                ds.read(band, window=win)
+                for (i, j), win in ds.block_windows(band)
+                if not tiff or _block_stored(ds, band, i, j)
+            )
+            tags = statistics_tags(blocks, nodata=fill, size=ds.width * ds.height)
+            if tags:
+                ds.update_tags(band, **tags)
+            results.append(tags)
+    return results
 
 
 def stream_mosaic_to_geotiff(
@@ -611,11 +701,16 @@ def assign_spatial_blocks(
     Block edge length is ``block_size_m`` when given; otherwise it is derived
     so roughly ``target_blocks`` non-empty cells result, floored at
     ``min_block_size_m`` (used to keep a block larger than the spatial
-    autocorrelation range, e.g. a few × the catchment radius).
+    autocorrelation range, e.g. a few × the catchment radius). The bounding
+    box's edge (``sqrt(area / target_blocks)``) is kept when it already
+    occupies at least 80 % of the target; for clustered features, where most
+    of the box is empty, the edge is shrunk until the occupied cells reach the
+    target.
 
     Returns ``(block_ids, info)`` where ``info`` records the metre CRS, the
-    block size used, and the number of occupied blocks. A degenerate extent
-    (single location / zero span) yields a single block.
+    block size used, the number of occupied blocks and the ``rule`` that set
+    the size. A degenerate extent (single location / zero span) yields a
+    single block.
     """
     n = len(gdf)
     if n == 0:
@@ -647,13 +742,35 @@ def assign_spatial_blocks(
     w = float(np.max(x[finite]) - minx)
     h = float(np.max(y[finite]) - miny)
 
+    rule = "given"
     if block_size_m is not None and float(block_size_m) > 0:
         s = float(block_size_m)
     else:
         if target_blocks is None:
             target_blocks = max(9, min(200, int(round(n / 15))))
+        target = max(int(target_blocks), 1)
         area = max(w * h, 1.0)
-        s = float(np.sqrt(area / max(int(target_blocks), 1)))
+        s = float(np.sqrt(area / target))
+        rule = "bounding box"
+        xf, yf = x[finite], y[finite]
+
+        def occupied(edge: float) -> int:
+            cx = np.floor((xf - minx) / edge).astype(np.int64)
+            cy = np.floor((yf - miny) / edge).astype(np.int64)
+            return int(np.unique(cy * (int(cx.max()) + 1) + cx).size)
+
+        if s > 0 and occupied(s) < 0.8 * target:
+            # The largest edge whose occupied cells reach the target, by
+            # bisection in log space below the bounding-box edge.
+            lo, hi = s / 1.0e4, s
+            for _ in range(48):
+                mid = float(np.sqrt(lo * hi))
+                if occupied(mid) >= target:
+                    lo = mid
+                else:
+                    hi = mid
+            s = lo
+            rule = "occupied extent"
     if min_block_size_m is not None:
         s = max(s, float(min_block_size_m))
     if not np.isfinite(s) or s <= 0:
@@ -677,6 +794,7 @@ def assign_spatial_blocks(
         "block_size_m": float(s),
         "n_blocks": int(len(_uniq)),
         "crs": str(gdf_m.crs),
+        "rule": rule,
     }
 
 

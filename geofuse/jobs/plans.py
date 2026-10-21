@@ -26,6 +26,7 @@ from typing import Any
 from geofuse import runfile as _rf
 from geofuse import settings as _settings
 from geofuse.jobs.locks import RESOURCES
+from geofuse.ndvi_chains import output_stems
 from geofuse.vector_io import sanitize_name_for_file
 
 # The fusion tab never downloads metrics itself; it records this window.
@@ -58,7 +59,7 @@ class JobSpec:
     range, a GVI capture year, the fusion inputs); ``settings`` is the
     step's resolved settings. ``outputs`` lists what the job will write:
     ``files`` for a single result, ``years`` (``{year: file}``) for a
-    per-year job, each keyed by statistic for NDVI.
+    per-year job, each keyed by statistic (or aggregation chain) for NDVI.
     """
 
     step: str
@@ -74,6 +75,8 @@ class JobSpec:
     depends_on: list[str] = field(default_factory=list)
     resources: list[str] = field(default_factory=list)
     outputs: dict[str, Any] = field(default_factory=dict)
+    #: Warnings the plan raises about this job, shown before it is submitted.
+    notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -97,11 +100,6 @@ class Submission:
 # ────────────────────────────────────────────────────────────────────
 # Reading what a plan needs from the inputs
 # ────────────────────────────────────────────────────────────────────
-
-
-def _ndvi_output_name(output_name: str, reducer: str) -> str:
-    """``geofuse.ndvi.ndvi_output_name`` (median keeps the plain name)."""
-    return output_name if reducer == "median" else f"{output_name}_{reducer}"
 
 
 def column_years(paths: Sequence[str], column: str) -> list[str]:
@@ -155,15 +153,26 @@ def _base(unit: dict) -> str:
     return os.path.splitext(unit["key"])[0]
 
 
-def _ndvi_files(folder: str, output_name: str, settings: dict, stats) -> dict:
+#: Each NDVI date mode's statistics and aggregation-chain settings.
+_NDVI_MODE_SETTINGS = {
+    "range": ("statistics_ranges", "chains_ranges"),
+    "specific": ("statistics_specific", "chains_specific"),
+    "column": ("statistics_column", "chains_column"),
+}
+
+
+def _ndvi_files(folder: str, output_name: str, settings: dict, mode: str) -> dict:
+    """The file each output of one NDVI date mode writes, keyed by statistic,
+    or by chain name when the mode has aggregation chains."""
     ext = (
         ".tif"
         if settings["save_geotiff"]
         else ".gpkg" if settings["save_gpkg"] else ".geojson"
     )
+    stats, chains = (settings[k] for k in _NDVI_MODE_SETTINGS[mode])
     return {
-        stat: os.path.join(folder, f"{_ndvi_output_name(output_name, stat)}_ndvi{ext}")
-        for stat in stats
+        key: os.path.join(folder, f"{stem}_ndvi{ext}")
+        for key, stem in output_stems(output_name, stats, chains).items()
     }
 
 
@@ -190,7 +199,6 @@ def _expand_ndvi(step: _rf.Step, today: date) -> list[JobSpec]:
                 outputs=outputs,
             )
 
-        stats = s["statistics_ranges"]
         for start, end in step.inputs["ranges"]:
             name = f"{base}_{start.replace('-', '')}_{end.replace('-', '')}"
             specs.append(
@@ -202,10 +210,9 @@ def _expand_ndvi(step: _rf.Step, today: date) -> list[JobSpec]:
                         "end_date": end,
                         "output_name": name,
                     },
-                    {"files": _ndvi_files(out, name, s, stats)},
+                    {"files": _ndvi_files(out, name, s, "range")},
                 )
             )
-        stats = s["statistics_specific"]
         window = s["specific_window_days"]
         for target in step.inputs["specific_dates"]:
             t = date.fromisoformat(target)
@@ -221,15 +228,17 @@ def _expand_ndvi(step: _rf.Step, today: date) -> list[JobSpec]:
                         "end_date": min(t + timedelta(days=window), today).isoformat(),
                         "output_name": name,
                     },
-                    {"files": _ndvi_files(out, name, s, stats)},
+                    {"files": _ndvi_files(out, name, s, "specific")},
                 )
             )
         column = step.inputs["year_column"]
         if column:
-            stats = s["statistics_column"]
             folder = os.path.join(out, f"{base}_temporal_ndvi")
             years = column_years(unit["sources"], column)
-            by_year = {y: _ndvi_files(folder, f"{base}_{y}", s, stats) for y in years}
+            by_year = {
+                y: _ndvi_files(folder, f"{base}_{y}", s, "column") for y in years
+            }
+            keys = list(by_year[years[0]])
             specs.append(
                 spec(
                     "ndvi_column",
@@ -242,7 +251,7 @@ def _expand_ndvi(step: _rf.Step, today: date) -> list[JobSpec]:
                     {
                         "folder": folder,
                         "years": {
-                            stat: {y: by_year[y][stat] for y in years} for stat in stats
+                            key: {y: by_year[y][key] for y in years} for key in keys
                         },
                     },
                 )
@@ -338,7 +347,12 @@ def _target_info(path: str, layer) -> dict:
         import rasterio
 
         with rasterio.open(path) as src:
-            return {"vector": False, "bands": int(src.count), "layer": None}
+            return {
+                "vector": False,
+                "bands": int(src.count),
+                "layer": None,
+                "rows": int(src.width) * int(src.height),
+            }
     import pyogrio
 
     if layer is None and path.lower().endswith((".gpkg", ".zip")):
@@ -355,6 +369,7 @@ def _target_info(path: str, layer) -> dict:
         "layer": layer,
         "fields": [str(f) for f in info["fields"]],
         "geometry_type": str(info.get("geometry_type") or ""),
+        "rows": int(info.get("features") or 0),
     }
 
 
@@ -410,16 +425,16 @@ def _reference_files(
             raise PlanError(f"{ref} must save its GeoPackage for fusion to read it.")
         return years if per_year else files
     table = years if per_year else files
-    stats = list(table)
-    if ref.statistic is None and len(stats) != 1:
+    outputs = list(table)
+    if ref.statistic is None and len(outputs) != 1:
         raise PlanError(
-            f"{ref} writes several statistics {stats}; name one, e.g. "
-            f"{ref}[{stats[0]}]."
+            f"{ref} writes several outputs {outputs}; name one, e.g. "
+            f"{ref}[{outputs[0]}]."
         )
-    stat = ref.statistic or stats[0]
-    if stat not in table:
-        raise PlanError(f"{ref} does not write the {stat} statistic ({stats}).")
-    return table[stat]
+    name = ref.statistic or outputs[0]
+    if name not in table:
+        raise PlanError(f"{ref} writes no output named {name!r} ({outputs}).")
+    return table[name]
 
 
 def _channel_files(
@@ -465,6 +480,7 @@ def _expand_fusion(step: _rf.Step, by_step: dict[str, list[JobSpec]]) -> list[Jo
             for c in (
                 i["outcomes"]
                 + i["negative_controls"]
+                + i["comparators"]
                 + i["covariates"]
                 + i["moderators"]
                 + [
@@ -510,6 +526,15 @@ def _expand_fusion(step: _rf.Step, by_step: dict[str, list[JobSpec]]) -> list[Jo
         "ndvi_files": channels["ndvi"],
         "gvi_files": channels["gvi"],
     }
+    notes: list[str] = []
+    size = _settings.objective_size_check(
+        step.settings["objective_metric"], info["rows"], _physical_memory()
+    )
+    if size is not None:
+        level, text = size
+        if level == "refuse" and not step.settings["allow_large_objective"]:
+            raise PlanError(f"[[fusion]] {step.name}: {text}")
+        notes.append(text)
     return [
         JobSpec(
             step=step.key,
@@ -525,8 +550,15 @@ def _expand_fusion(step: _rf.Step, by_step: dict[str, list[JobSpec]]) -> list[Jo
             depends_on=list(step.depends_on),
             resources=list(RESOURCES["fusion"]),
             outputs={"folder": os.path.join(step.output_dir, "fusion")},
+            notes=notes,
         )
     ]
+
+
+def _physical_memory() -> int:
+    from geofuse.parallel import physical_memory_bytes
+
+    return physical_memory_bytes()
 
 
 #: Cluster resource groups: GVI needs a GPU, fusion cores and memory, the
@@ -630,11 +662,7 @@ def _build_ndvi(spec: JobSpec, ee_project: str | None = None) -> Submission:
     s, o = spec.settings, spec.options
     fname, raw, _ = _load_unit(spec)
     ds_path = None if spec.merged else spec.sources[0]
-    stats_key = {
-        "range": "statistics_ranges",
-        "specific": "statistics_specific",
-        "column": "statistics_column",
-    }[o["mode"]]
+    stats_key, chains_key = _NDVI_MODE_SETTINGS[o["mode"]]
     options = {
         "temporal_reducers": list(s[stats_key]),
         "satellite": s["satellite"],
@@ -644,6 +672,8 @@ def _build_ndvi(spec: JobSpec, ee_project: str | None = None) -> Submission:
         "reflectance": s["reflectance"],
         "substitute_2012": s["substitute_2012"],
     }
+    if s[chains_key]:
+        options["chains"] = [dict(c) for c in s[chains_key]]
     if spec.preset:
         options["preset"] = spec.preset
     common = {
@@ -915,8 +945,15 @@ def fusion_run_config(spec: JobSpec) -> dict[str, Any]:
         "covariate_types": {
             c: ("categorical" if c in cats else "numeric") for c in covariates
         },
+        "categorical_missing": s["categorical_missing"],
         "moderator_columns": list(o["moderators"]),
         "negative_controls": controls if vector else [],
+        "comparators": list(o["comparators"]) if vector else [],
+        "comparators_primary": (
+            list(o["comparators_primary"])
+            if vector and o["comparators_primary"]
+            else None
+        ),
         "exposure_iqr": s["exposure_iqr"],
         "standalone_channels": (
             list(_settings.CHANNEL_SETS[s["channel_set"]])
@@ -924,10 +961,13 @@ def fusion_run_config(spec: JobSpec) -> dict[str, Any]:
             else []
         ),
         "longitudinal_spec_payload": _longitudinal_payload(spec),
-        "cgi_grid_spacing_m": int(s["cgi_grid_spacing_m"]) if vector else None,
+        "cgi_grid_spacing_m": int(s["cgi_grid_spacing_m"]),
+        "exposure_kernel": s["exposure_kernel"],
+        "exposure_radius_m": float(s["exposure_radius_m"]),
+        "exposure_plateau_m": float(s["exposure_plateau_m"]),
+        "exposure_sigma_m": float(s["exposure_sigma_m"]),
         "whole_grid_scaling": bool(s["whole_grid_scaling"]) if vector else True,
         "area_balanced_split": bool(s["area_balanced_split"]) if polygon else False,
-        "normalize_channels": bool(s["normalize_channels"]) if vector else False,
         "spatial_adjust_method": adjust,
         "spatial_adjust_max_df": int(
             s["spatial_adjust_max_df"]
@@ -944,13 +984,16 @@ def fusion_run_config(spec: JobSpec) -> dict[str, Any]:
         "discovery_reps": int(s["discovery_reps"]),
         "discovery_shuffles": int(s["discovery_shuffles"]),
         "gain_splits": int(s["gain_splits"]),
-        "gain_permutations": int(s["gain_permutations"]),
         "null_calibration_runs": int(s["null_calibration_runs"]),
         "posterior_draws": int(s["posterior_draws"]),
         "posterior_warmup": int(s["posterior_warmup"] or s["posterior_draws"]),
         "posterior_chains": int(s["posterior_chains"]),
         "radius_prior": s["radius_prior"],
+        "gvi_min_coverage": float(s["gvi_min_coverage"]),
         "check_collinearity": bool(s["check_collinearity"]),
+        "drop_collinear_channels": bool(
+            s["check_collinearity"] and s["drop_collinear_channels"]
+        ),
         "vif_threshold": float(s["vif_threshold"]),
     }
 

@@ -40,7 +40,7 @@ from geofuse.crs_utils import (
     raster_geographic_bounds,
     reproject_geodataframe_to_wgs84,
 )
-from geofuse.gvi import CAPTURE_STATUS_KEY, NO_CAPTURE_IN_WINDOW, GVIEngine
+from geofuse.gvi import CAPTURE_STATUS_KEY, WINDOW_MISS_KEY, GVIEngine
 from geofuse.jobs import (
     GVI_PROGRESS_MIN_ITEMS,
     GVI_PROGRESS_MIN_SECONDS,
@@ -49,8 +49,11 @@ from geofuse.jobs import (
 from geofuse.jobs.fusion_outputs import (
     _STANDALONE_CHANNEL_LABELS,
     _build_fusion_ledger,
+    _comparator_family,
+    _comparator_report,
     _compare_cgi_vs_standalone,
     _direction_sign,
+    _exposure_splits,
     _fusion_stage_key,
     _fusion_stage_weight,
     _jsonsafe_results,
@@ -75,11 +78,8 @@ from geofuse.longitudinal import (
 from geofuse.mixedlm_postscore import (
     compute_post_metrics as _compute_mixedlm_post_metrics,
 )
-from geofuse.ndvi import (
-    NDVIEngine,
-    ndvi_output_name,
-    normalize_temporal_reducers,
-)
+from geofuse.ndvi import NDVIEngine, normalize_temporal_reducers
+from geofuse.ndvi_chains import output_stems
 from geofuse.persistence.job_executor import JobContext
 from geofuse.raster_sampling import LAZY_RASTER_THRESHOLD_BYTES, LazyRasterArray
 from geofuse.vector_io import read_vector_aliased_column, read_vector_subset
@@ -221,6 +221,7 @@ def run_gvi(
         batch_size=run_args.get("batch_size"),
         batch_wait_ms=run_args.get("batch_wait_ms"),
         precision=run_args.get("precision"),
+        log_points=bool(run_args.get("log_points")),
     )
 
     if ctx.is_cancelled():
@@ -230,6 +231,7 @@ def run_gvi(
     if shard:
         from geofuse.jobs.gvi_shards import write_shard
 
+        stats = getattr(engine, "last_run_stats", None)
         paths = write_shard(
             {f"{out_name}_gvi": dataset_data["accumulated"]},
             dataset_data["processed"].crs,
@@ -237,7 +239,8 @@ def run_gvi(
             f"{out_name}_gvi",
             shard,
             n_points,
-            throughput=[getattr(engine, "last_run_stats", None)],
+            throughput=[stats],
+            counts={f"{out_name}_gvi": point_counts(stats)},
         )
         ctx.progress(value=1.0, status_text="Shard written; the merge job finishes it")
         return {"output_paths": paths}
@@ -267,6 +270,7 @@ def run_gvi(
             "recent" if target_year is None else "year", target_year, run_args
         ),
         throughput=getattr(engine, "last_run_stats", None),
+        counts=point_counts(getattr(engine, "last_run_stats", None)),
     )
     dataset_data["results"] = res_df
     return {"output_paths": output_paths}
@@ -292,18 +296,20 @@ def _write_gvi_outputs(
     save_geojson: bool,
     capture: dict | None = None,
     throughput: dict | None = None,
+    counts: Mapping | None = None,
 ) -> tuple[list[str], gpd.GeoDataFrame]:
     """Write a GVI result set (GeoPackage / GeoJSON / per-cluster GeoTIFF).
 
     Shared by :func:`run_gvi` and :func:`run_gvi_column`; returns the written
     paths and the result GeoDataFrame (reprojected to the grid's planar CRS).
     ``capture`` holds the capture settings (:func:`_capture_settings`); with
-    the counts of what was sampled they go into the sidecar.
+    the run's point ``counts`` (:func:`point_counts`) and the counts of the
+    captures sampled they go into the sidecar.
     """
-    capture_summary = _capture_summary(accumulated, capture or {})
+    capture_summary = _capture_summary(accumulated, capture or {}, counts)
     res_df = gpd.GeoDataFrame(accumulated, crs=processed_crs)
-    if CAPTURE_STATUS_KEY in res_df.columns:
-        res_df = res_df.drop(columns=[CAPTURE_STATUS_KEY])
+    status = [c for c in (CAPTURE_STATUS_KEY, WINDOW_MISS_KEY) if c in res_df.columns]
+    res_df = res_df.drop(columns=status)
     if "orig_index" in res_df.columns:
         res_df.set_index("orig_index", inplace=True)
         res_df.index.name = None
@@ -466,12 +472,36 @@ def _capture_settings(mode: str, target_year, run_args: Mapping) -> dict:
     return settings
 
 
-def _capture_summary(accumulated: list, capture: Mapping) -> dict:
+#: Sidecar point counts and the ``last_run_stats`` key each is read from.
+_POINT_COUNTS = {
+    "n_grid_points": "points",
+    "n_sampled": "sampled",
+    "n_no_panorama": "no_panorama",
+    "n_no_capture_in_window": "no_capture_in_window",
+    "n_no_capture_in_year_window": "no_capture_in_year_window",
+    "n_no_capture_in_month_window": "no_capture_in_month_window",
+    "n_failed": "failed",
+}
+
+
+def point_counts(stats: Mapping | None) -> dict | None:
+    """A run's sidecar point counts from the engine's ``last_run_stats``;
+    ``None`` when the stats do not count the points' outcomes."""
+    if not stats or "sampled" not in stats:
+        return None
+    return {name: int(stats.get(key, 0)) for name, key in _POINT_COUNTS.items()}
+
+
+def _capture_summary(
+    accumulated: list, capture: Mapping, counts: Mapping | None = None
+) -> dict:
     """Capture settings plus counts of the points and the captures sampled.
 
-    ``capture_years`` / ``capture_months`` count the sampled points by the
-    year / month of the capture used (``"unknown"`` when it had no date), so
-    each sums to ``n_sampled``.
+    ``counts`` are the run's :func:`point_counts`; without them only
+    ``n_sampled`` is known, from the results. ``capture_years`` /
+    ``capture_months`` count the sampled points by the year / month of the
+    capture used (``"unknown"`` when it had no date), so each sums to
+    ``n_sampled``.
     """
     from collections import Counter
 
@@ -485,11 +515,7 @@ def _capture_summary(accumulated: list, capture: Mapping) -> dict:
         months[str(int(month)) if month.isdigit() else "unknown"] += 1
     return {
         **dict(capture),
-        "n_points": len(accumulated),
-        "n_sampled": len(sampled),
-        "n_no_capture_in_window": sum(
-            1 for r in accumulated if r.get(CAPTURE_STATUS_KEY) == NO_CAPTURE_IN_WINDOW
-        ),
+        **(dict(counts) if counts else {"n_sampled": len(sampled)}),
         "capture_years": dict(sorted(years.items())),
         "capture_months": dict(sorted(months.items(), key=_month_order)),
     }
@@ -624,6 +650,7 @@ def run_gvi_column(
     done_points = 0
     shard_results: dict[str, list] = {}
     shard_stats: list = []
+    shard_counts: dict[str, dict | None] = {}
     for idx, (year, pts, meta) in enumerate(plans):
         if ctx.is_cancelled():
             return {"output_paths": output_paths}
@@ -675,13 +702,16 @@ def run_gvi_column(
             batch_size=run_args.get("batch_size"),
             batch_wait_ms=run_args.get("batch_wait_ms"),
             precision=run_args.get("precision"),
+            log_points=bool(run_args.get("log_points")),
         )
         done_points += len(pts)
         if ctx.is_cancelled():
             return {"output_paths": output_paths}
+        stats = getattr(engine, "last_run_stats", None)
         if shard:
             shard_results[f"{base_name}_{year}_gvi"] = accumulated
-            shard_stats.append(getattr(engine, "last_run_stats", None))
+            shard_stats.append(stats)
+            shard_counts[f"{base_name}_{year}_gvi"] = point_counts(stats)
             continue
         if not accumulated:
             _log_gvi("WARN", f"Year {year}: no results produced.")
@@ -697,7 +727,8 @@ def run_gvi_column(
             save_geotiff=save_geotiff,
             save_geojson=save_geojson,
             capture=_capture_settings("column", year, run_args),
-            throughput=getattr(engine, "last_run_stats", None),
+            throughput=stats,
+            counts=point_counts(stats),
         )
         output_paths.extend(paths)
 
@@ -714,6 +745,7 @@ def run_gvi_column(
                 shard,
                 total_points,
                 throughput=shard_stats,
+                counts=shard_counts,
             )
         )
         ctx.progress(value=1.0, status_text="Shard written; the merge job finishes it")
@@ -761,15 +793,20 @@ def _ndvi_output_paths(
     output_name: str,
     temporal_reducers: Sequence[str],
     *,
+    chains: Sequence[Mapping] | None = None,
     save_geotiff: bool,
     save_gpkg: bool,
     save_geojson: bool,
     save_cluster_tiles: bool,
 ) -> list[str]:
-    """Existing files of one NDVI download, every statistic in turn."""
+    """Existing files of one NDVI download, every statistic (or every
+    aggregation chain) in turn."""
     paths: list[str] = []
-    for reducer in normalize_temporal_reducers(temporal_reducers):
-        stem = os.path.join(folder, ndvi_output_name(output_name, reducer))
+    stems = output_stems(
+        output_name, normalize_temporal_reducers(temporal_reducers), chains or ()
+    )
+    for base in stems.values():
+        stem = os.path.join(folder, base)
         for suffix, enabled in (
             ("_ndvi.tif", save_geotiff),
             ("_ndvi.gpkg", save_gpkg),
@@ -808,8 +845,10 @@ def run_ndvi(
     substitute_2012: bool = False,
     preset: str | None = None,
     ee_project: str | None = None,
+    chains: Sequence[Mapping] | None = None,
 ) -> dict:
-    """Run NDVI for a single date range, one set of files per statistic.
+    """Run NDVI for a single date range, one set of files per statistic
+    (or per aggregation chain, when ``chains`` are given).
 
     Both ends of the range are included: the engine is called with
     ``end_inclusive=True``, so a range ending 30 September keeps that day.
@@ -854,6 +893,7 @@ def run_ndvi(
         substitute_2012=substitute_2012,
         preset=preset,
         end_inclusive=True,
+        chains=chains,
     )
 
     if result.get("status") == "cancelled":
@@ -865,6 +905,7 @@ def run_ndvi(
         output_dir,
         output_name,
         temporal_reducers,
+        chains=chains,
         save_geotiff=save_geotiff,
         save_gpkg=save_gpkg,
         save_geojson=save_geojson,
@@ -873,6 +914,118 @@ def run_ndvi(
 
     ctx.progress(value=1.0, status_text="Completed")
     return {"output_paths": output_paths}
+
+
+def _column_years(
+    raw: gpd.GeoDataFrame,
+    date_column: str,
+    season_start_month: int,
+    season_end_month: int,
+) -> tuple[gpd.GeoDataFrame, list[tuple[int, gpd.GeoDataFrame, str, str]]]:
+    """``(features with a year, [(year, its features, first day, last day)])``
+    of a per-year NDVI job; a year's window runs over its season months."""
+    import calendar
+
+    from geofuse.longitudinal import parse_date_column
+
+    gdf = raw.copy()
+    parsed = parse_date_column(gdf[date_column])
+    gdf["_year"] = parsed.dt.year
+    gdf = gdf.dropna(subset=["_year"])
+    if gdf.empty:
+        raise ValueError(f"No valid years could be parsed from column '{date_column}'.")
+    gdf["_year"] = gdf["_year"].astype(int)
+    years = []
+    for year in sorted(gdf["_year"].unique()):
+        last_day = calendar.monthrange(int(year), int(season_end_month))[1]
+        years.append(
+            (
+                int(year),
+                gdf[gdf["_year"] == year].drop(columns=["_year"]),
+                f"{year:04d}-{season_start_month:02d}-01",
+                f"{year:04d}-{season_end_month:02d}-{last_day:02d}",
+            )
+        )
+    return gdf, years
+
+
+def record_ndvi_cache(
+    *,
+    fname: str,
+    dataset_data: dict,
+    cloud_pct: int,
+    resolution: int,
+    buffer_m: int,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    output_name: str | None = None,
+    date_column: str | None = None,
+    season_start_month: int = 6,
+    season_end_month: int = 9,
+    satellite: str = "auto",
+    temporal_reducers: Sequence[str] = ("median",),
+    water_mask: bool = False,
+    cloud_handling: str = "scene_filter",
+    reflectance: str = "surface",
+    substitute_2012: bool = False,
+    chains: Sequence[Mapping] | None = None,
+    **_other,
+) -> dict[str, int]:
+    """Record the tile workspaces an NDVI job cached before workspaces
+    carried records, from the arguments :func:`run_ndvi` or
+    :func:`run_ndvi_column` ran with, so later runs over a smaller study area
+    reuse them (:meth:`~geofuse.ndvi.NDVIEngine.record_workspaces`). Returns
+    how many outputs were ``recorded``, ``already recorded`` or ``not cached``.
+    """
+    from collections import Counter
+
+    from geofuse.crs_utils import buffer_gdf_union_metres
+
+    engine = NDVIEngine.without_earth_engine()
+    common = {
+        "cloud_max": cloud_pct,
+        "resolution": resolution,
+        "satellite": satellite,
+        "temporal_reducers": temporal_reducers,
+        "water_mask": water_mask,
+        "cloud_handling": cloud_handling,
+        "reflectance": reflectance,
+        "substitute_2012": substitute_2012,
+        "end_inclusive": True,
+        "chains": chains,
+    }
+    counts: Counter = Counter()
+    try:
+        if date_column:
+            gdf, years = _column_years(
+                dataset_data["raw"], date_column, season_start_month, season_end_month
+            )
+            crs_override = NDVIEngine.compute_export_crs(gdf)
+            base_name = os.path.splitext(fname)[0]
+            for year, year_gdf, start_d, end_d in years:
+                counts.update(
+                    engine.record_workspaces(
+                        buffer_gdf_union_metres(year_gdf, buffer_m),
+                        start_d,
+                        end_d,
+                        f"{base_name}_{year}",
+                        crs_override=crs_override,
+                        **common,
+                    ).values()
+                )
+        else:
+            counts.update(
+                engine.record_workspaces(
+                    buffer_gdf_union_metres(dataset_data["raw"], buffer_m),
+                    start_date,
+                    end_date,
+                    output_name,
+                    **common,
+                ).values()
+            )
+    finally:
+        engine.tile_cache.close()
+    return dict(counts)
 
 
 def run_ndvi_column(
@@ -900,6 +1053,7 @@ def run_ndvi_column(
     substitute_2012: bool = False,
     preset: str | None = None,
     ee_project: str | None = None,
+    chains: Sequence[Mapping] | None = None,
 ) -> dict:
     """Run one NDVI raster per year present in ``date_column``.
 
@@ -911,23 +1065,15 @@ def run_ndvi_column(
     year's raster snaps to the same global pixel grid and the outputs align.
     Results land in a ``{name}_temporal_ndvi/`` folder, one set of files per
     year (``{name}_{year}_ndvi.tif`` plus optional GeoPackage/GeoJSON) and
-    temporal statistic (``{name}_{year}_max_ndvi.tif`` for ``max``).
+    temporal statistic (``{name}_{year}_max_ndvi.tif`` for ``max``), or
+    aggregation chain (``{name}_{year}_{chain}_ndvi.tif``).
     """
-    import calendar
-
     from geofuse.crs_utils import buffer_gdf_union_metres
-    from geofuse.longitudinal import parse_date_column
 
-    gdf = dataset_data["raw"].copy()
-    parsed = parse_date_column(gdf[date_column])
-    gdf["_year"] = parsed.dt.year
-    gdf = gdf.dropna(subset=["_year"])
-    if gdf.empty:
-        raise ValueError(f"No valid years could be parsed from column '{date_column}'.")
-    gdf["_year"] = gdf["_year"].astype(int)
-
-    unique_years = sorted(gdf["_year"].unique())
-    n_years = len(unique_years)
+    gdf, years = _column_years(
+        dataset_data["raw"], date_column, season_start_month, season_end_month
+    )
+    n_years = len(years)
 
     # CRS chosen once from the whole dataset so every per-year raster aligns.
     crs_override = NDVIEngine.compute_export_crs(gdf)
@@ -946,7 +1092,7 @@ def run_ndvi_column(
             ctx.wait_while_paused()
         return ctx.is_cancelled()
 
-    for idx, year in enumerate(unique_years):
+    for idx, (year, year_gdf, start_d, end_d) in enumerate(years):
         if ctx.is_cancelled():
             return {"output_paths": output_paths}
         # Safe pause point: hold between years so a resume continues with the
@@ -956,12 +1102,7 @@ def run_ndvi_column(
         if ctx.is_cancelled():
             return {"output_paths": output_paths}
 
-        year_gdf = gdf[gdf["_year"] == year].drop(columns=["_year"])
         geometry = buffer_gdf_union_metres(year_gdf, buffer_m)
-
-        start_d = f"{year:04d}-{season_start_month:02d}-01"
-        last_day = calendar.monthrange(int(year), int(season_end_month))[1]
-        end_d = f"{year:04d}-{season_end_month:02d}-{last_day:02d}"
         output_name = f"{base_name}_{year}"
 
         ctx.progress(
@@ -996,6 +1137,7 @@ def run_ndvi_column(
             substitute_2012=substitute_2012,
             preset=preset,
             end_inclusive=True,
+            chains=chains,
         )
         if result.get("status") == "cancelled":
             return {"output_paths": output_paths}
@@ -1008,6 +1150,7 @@ def run_ndvi_column(
                 job_folder,
                 output_name,
                 temporal_reducers,
+                chains=chains,
                 save_geotiff=save_geotiff,
                 save_gpkg=save_gpkg,
                 save_geojson=save_geojson,
@@ -1025,6 +1168,39 @@ def run_ndvi_column(
 
 
 _STUDY_NAME_UNSAFE = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def _fmt_or_na(value: Any, spec: str) -> str:
+    """``value`` formatted with ``spec`` for a log line, or ``n/a`` when it is
+    missing or not a finite number."""
+    try:
+        fv = float(value)
+    except (TypeError, ValueError):
+        return "n/a"
+    return format(fv, spec) if np.isfinite(fv) else "n/a"
+
+
+def _paired_family_headline(family: list[dict], best_channel: str | None) -> dict:
+    """Holm-correct the CGI-vs-standalone family in place and pick its headline.
+
+    Each entry gains ``p_value_holm`` (``None`` where its own p-value is
+    missing) and ``family_size``. The headline is the AIC/BIC best channel's
+    entry, else the one with the largest observed difference.
+    """
+    from .. import statistical_testing as _stats_mod
+
+    holm = _stats_mod.holm_bonferroni([d.get("p_value") for d in family])
+    for d, hp in zip(family, holm, strict=True):
+        d["p_value_holm"] = None if hp != hp else float(hp)
+        d["family_size"] = len(family)
+
+    def _diff(d: dict) -> float:
+        v = d.get("observed_diff")
+        return float(v) if v is not None and np.isfinite(v) else float("-inf")
+
+    return next(
+        (d for d in family if d.get("standalone_channel") == best_channel), None
+    ) or max(family, key=_diff)
 
 
 def _build_fusion_study_name(
@@ -1074,7 +1250,6 @@ def _fusion_config_fingerprint(
     spatial_split: bool = False,
     spatial_block_size_m: float | None = None,
     n_spatial_blocks: int | None = None,
-    normalize_channels: bool = False,
     spatial_adjust_method: str = "none",
     spatial_adjust_max_df: int = 10,
     spatial_adjust_eps_m: float | None = None,
@@ -1082,6 +1257,13 @@ def _fusion_config_fingerprint(
     gvi_ladder_rungs: int = 15,
     ndvi_ladder_spacing: str = "linear",
     ndvi_ladder_rungs: int = 15,
+    exposure_kernel: str = "none",
+    exposure_radius_m: float = 100.0,
+    exposure_plateau_m: float = 0.0,
+    exposure_sigma_m: float = 35.0,
+    gvi_min_coverage: float = 0.95,
+    drop_collinear_channels: bool = False,
+    categorical_missing: str = "drop",
 ) -> str:
     """8-char hex hash of every setting that changes the search space / split.
 
@@ -1108,9 +1290,20 @@ def _fusion_config_fingerprint(
             # Bump when the search space / selection scheme changes so old
             # per-job caches can't pool with a new run.
             "sel:stabsel-cpss-v3",
+            f"gmc:{gvi_min_coverage:g}",
         ]
-        # Only appended when on, so legacy (un-normalized) runs keep their hash.
-        + (["nc:1"] if normalize_channels else [])
+        # Dropping high-VIF channels changes the search; only appended when on.
+        + (["dvc:1"] if drop_collinear_channels else [])
+        # An exposure buffer changes every entity's cells, so it splits the
+        # cache; only appended when on so unbuffered runs keep their hash.
+        + (
+            [
+                f"exp:{exposure_kernel}@{exposure_radius_m:g}@"
+                f"{exposure_plateau_m:g}@{exposure_sigma_m:g}"
+            ]
+            if exposure_kernel != "none"
+            else []
+        )
         # Spatial-confounding adjustment changes the objective, so it splits the
         # cache; only appended when on so legacy runs keep their hash.
         + (
@@ -1134,6 +1327,17 @@ def _fusion_config_fingerprint(
                 )
             ]
             if any(
+                str(v).lower() == "categorical"
+                for v in (covariate_types or {}).values()
+            )
+            else []
+        )
+        # A missing level adds a dummy column; only appended when one can be
+        # added, so dropping runs keep their hash.
+        + (
+            [f"catna:{categorical_missing}"]
+            if categorical_missing != "drop"
+            and any(
                 str(v).lower() == "categorical"
                 for v in (covariate_types or {}).values()
             )
@@ -1309,12 +1513,16 @@ def run_fusion(
     cgi_formula: str = "weighted_average",
     covariate_columns: list[str] | None = None,
     covariate_types: dict[str, str] | None = None,
+    categorical_missing: str = "drop",
     standalone_channels: list[str] | None = None,
     longitudinal_spec_payload: dict | None = None,
     cgi_grid_spacing_m: float | None = None,
+    exposure_kernel: str = "none",
+    exposure_radius_m: float = 100.0,
+    exposure_plateau_m: float = 0.0,
+    exposure_sigma_m: float = 35.0,
     whole_grid_scaling: bool = False,
     area_balanced_split: bool = False,
-    normalize_channels: bool = False,
     spatial_adjust_method: str = "none",
     spatial_adjust_max_df: int = 10,
     spatial_adjust_eps_m: float | None = None,
@@ -1326,12 +1534,12 @@ def run_fusion(
     discovery_reps: int = 5,
     discovery_shuffles: int = 12,
     gain_splits: int = 20,
-    gain_permutations: int = 100,
     null_calibration_runs: int = 16,
     posterior_draws: int = 800,
     posterior_warmup: int = 800,
     posterior_chains: int = 4,
     radius_prior: str = "rungs",
+    gvi_min_coverage: float = 0.95,
     gvi_ladder_spacing: str = "linear",
     gvi_ladder_rungs: int = 15,
     ndvi_ladder_spacing: str = "linear",
@@ -1341,6 +1549,7 @@ def run_fusion(
     n_spatial_blocks: int | None = None,
     check_collinearity: bool = True,
     vif_threshold: float = 10.0,
+    drop_collinear_channels: bool = False,
     report_ci_bootstrap: int | None = None,
     report_effects_bootstrap: int = 2000,
     report_effects_permutations: int = 1000,
@@ -1349,6 +1558,8 @@ def run_fusion(
     moderator_columns: list[str] | None = None,
     negative_controls: list[str] | None = None,
     negative_control_retune: bool = False,
+    comparators: list[str] | None = None,
+    comparators_primary: list[str] | None = None,
 ) -> dict:
     """Run a fusion job: data-driven CGI discovery + held-out test scoring.
 
@@ -1375,7 +1586,13 @@ def run_fusion(
     against them on the test split and on train+val, with the paired contrast
     drawn from ``report_paired_bootstrap`` resamples. ``negative_control_retune``
     also re-runs the CGI's sweep and posterior with each control as the target
-    and reports how closely that tuning reproduces the target's."""
+    and reports how closely that tuning reproduces the target's.
+
+    ``comparators`` names target columns holding finished exposures to
+    benchmark the composite against. Each is scored untuned, as a frozen
+    composite, on the CGI's own rows, split and covariates, with a paired
+    CGI − comparator test whose Holm correction runs over
+    ``comparators_primary`` (all of them when ``None``)."""
     # Bound before the body so the handlers below can close out the ledger no
     # matter how early a run fails.
     ledger = None
@@ -1438,6 +1655,22 @@ def run_fusion(
                 f"Standalone single-metric studies enabled: {', '.join(standalones)}",
             )
 
+        comparator_cols = list(dict.fromkeys(comparators or []))
+        primary_cols = (
+            comparator_cols
+            if comparators_primary is None
+            else list(dict.fromkeys(comparators_primary))
+        )
+        stray = [c for c in primary_cols if c not in comparator_cols]
+        if stray:
+            raise ValueError(f"Primary comparators {stray} are not comparators.")
+        if comparator_cols:
+            _log_fusion(
+                "INFO",
+                f"Comparator exposures: {', '.join(comparator_cols)} "
+                f"(primary: {', '.join(primary_cols) or 'none'}).",
+            )
+
         # Test-CI replicate budget: explicit value wins; otherwise 2,000 for
         # the O(n²) partial-distance-correlation objective, 10,000 otherwise.
         report_ci_n = (
@@ -1473,11 +1706,8 @@ def run_fusion(
             longitudinal_spec is not None
             and longitudinal_spec.scoring_metric in _LON_MIXEDLM_METRICS
         )
-        retune_enabled = (
-            bool(negative_control_retune)
-            and bool(negative_controls)
-            and longitudinal_spec is None
-        )
+        # A panel (several rows per entity) skips it once its data are known.
+        retune_enabled = bool(negative_control_retune) and bool(negative_controls)
         ledger = _build_fusion_ledger(
             all_labels,
             multi=multi_outcome,
@@ -1485,6 +1715,7 @@ def run_fusion(
             longitudinal=longitudinal_spec is not None,
             mixedlm_postscore=mixedlm_postscore_enabled,
             negative_control_retune=retune_enabled,
+            comparators=bool(comparator_cols),
         )
         ctx.update_stage_ledger(ledger.to_dict())
 
@@ -1501,6 +1732,7 @@ def run_fusion(
             "channel_set": channel_set,
             "index_form": index_form,
             "covariate_columns": list(covariate_columns or []),
+            "categorical_missing": str(categorical_missing),
             "standalone_channels": list(standalones),
             "test_size": float(test_size),
             "n_bins": n_bins,
@@ -1508,12 +1740,12 @@ def run_fusion(
             "discovery_reps": int(discovery_reps),
             "discovery_shuffles": int(discovery_shuffles),
             "gain_splits": int(gain_splits),
-            "gain_permutations": int(gain_permutations),
             "null_calibration_runs": int(null_calibration_runs),
             "posterior_draws": int(posterior_draws),
             "posterior_warmup": int(posterior_warmup),
             "posterior_chains": int(posterior_chains),
             "radius_prior": str(radius_prior),
+            "gvi_min_coverage": float(gvi_min_coverage),
             "buffer_meters": buffer_meters,
             "gvi_buffer_min_m": gvi_buffer_min_m,
             "gvi_buffer_max_m": gvi_buffer_max_m,
@@ -1528,14 +1760,18 @@ def run_fusion(
             "ndvi_resolution_m": ndvi_resolution_m,
             "gvi_grid_spacing_m": gvi_grid_spacing_m,
             "cgi_grid_spacing_m": cgi_grid_spacing_m,
+            "exposure_kernel": str(exposure_kernel),
+            "exposure_radius_m": float(exposure_radius_m),
+            "exposure_plateau_m": float(exposure_plateau_m),
+            "exposure_sigma_m": float(exposure_sigma_m),
             "whole_grid_scaling": bool(whole_grid_scaling),
             "area_balanced_split": bool(area_balanced_split),
-            "normalize_channels": bool(normalize_channels),
             "spatial_split": bool(spatial_split),
             "spatial_block_size_m": spatial_block_size_m,
             "n_spatial_blocks": n_spatial_blocks,
             "check_collinearity": bool(check_collinearity),
             "vif_threshold": float(vif_threshold),
+            "drop_collinear_channels": bool(drop_collinear_channels),
             "report_ci_bootstrap": int(report_ci_n),
             "report_effects_bootstrap": int(report_effects_bootstrap),
             "report_effects_permutations": int(report_effects_permutations),
@@ -1543,6 +1779,8 @@ def run_fusion(
             "moderator_columns": list(moderator_columns or []),
             "negative_controls": list(negative_controls or []),
             "negative_control_retune": bool(negative_control_retune),
+            "comparators": list(comparator_cols),
+            "comparators_primary": list(primary_cols),
             "report_paired_bootstrap": int(report_paired_bootstrap),
             "cache_metrics": bool(cache_metrics),
             "resume_existing_study": bool(resume_existing_study),
@@ -1684,6 +1922,20 @@ def run_fusion(
                     f"covariate were dropped: "
                     f"{sorted(set(negative_controls or []) - set(outcome_ncs))}",
                 )
+            # Likewise a comparator cannot be the outcome it is scored against,
+            # a covariate it is adjusted for, or a control.
+            outcome_cmps = [
+                c
+                for c in comparator_cols
+                if c != target_feature and c not in outcome_covs + outcome_ncs
+            ]
+            if len(outcome_cmps) != len(comparator_cols):
+                _log_fusion(
+                    "WARN",
+                    f"[{label}] Comparator(s) that are this outcome, a covariate or "
+                    f"a control were dropped: "
+                    f"{sorted(set(comparator_cols) - set(outcome_cmps))}",
+                )
 
             engine = MetricFusionEngine(
                 target_file=target_path,
@@ -1706,17 +1958,24 @@ def run_fusion(
                 cgi_formula=cgi_formula,
                 covariate_columns=outcome_covs,
                 covariate_types=dict(covariate_types or {}),
+                categorical_missing=str(categorical_missing),
                 longitudinal_spec=longitudinal_spec,
                 cgi_grid_spacing_m=cgi_grid_spacing_m,
+                exposure_kernel=exposure_kernel,
+                exposure_radius_m=float(exposure_radius_m),
+                exposure_plateau_m=float(exposure_plateau_m),
+                exposure_sigma_m=float(exposure_sigma_m),
+                gvi_min_coverage=float(gvi_min_coverage),
+                drop_collinear_channels=bool(drop_collinear_channels),
                 whole_grid_scaling=whole_grid_scaling,
                 area_balanced_split=area_balanced_split,
-                normalize_channels=normalize_channels,
                 spatial_adjust_method=spatial_adjust_method,
                 spatial_adjust_max_df=spatial_adjust_max_df,
                 spatial_adjust_eps_m=spatial_adjust_eps_m,
                 residualize_method=residualize_method,
                 search_scoring_method=search_scoring_method,
                 negative_control_columns=outcome_ncs,
+                comparator_columns=outcome_cmps,
             )
 
             ctx.progress(
@@ -1878,7 +2137,7 @@ def run_fusion(
                     # wave, so its label is only a log/provenance string.
                     wide_frames: list[tuple[str, gpd.GeoDataFrame]] = []
                     keep_cols = _longitudinal_target_intake_columns(
-                        longitudinal_spec, target_feature, outcome_covs
+                        longitudinal_spec, target_feature, outcome_covs, outcome_ncs
                     )
                     for (
                         wave_label,
@@ -1999,10 +2258,8 @@ def run_fusion(
             except Exception as exc:
                 _log_fusion("WARN", f"[{label}] Dispersion sanity check failed: {exc}.")
 
-            # Optional iterative-VIF collinearity check on the CGI grid
-            # pixel values. Disabled channels get pinned to weight 0 in
-            # every subsequent trial (the engine threads
-            # ``self._disabled_channels`` into ``formula.suggest_params``).
+            # Optional iterative-VIF collinearity check on the study's channels
+            # at the CGI grid pixels.
             if check_collinearity:
                 try:
                     # Pass ``fusion_df`` explicitly — this stage runs
@@ -2012,15 +2269,15 @@ def run_fusion(
                         data=fusion_df,
                         vif_threshold=float(vif_threshold),
                     )
-                    if engine._disabled_channels:
+                    if collinearity_report and engine._high_vif_channels:
                         _log_fusion(
                             "WARN",
-                            f"[{label}] Collinearity check dropped: "
-                            f"{sorted(engine._disabled_channels)}. "
-                            f"VIFs (initial): "
+                            f"[{label}] Collinearity check: "
+                            f"{sorted(engine._high_vif_channels)} above the VIF "
+                            f"threshold (kept in the search). VIFs (initial): "
                             f"{dict(zip(collinearity_report['channels_in'], collinearity_report['initial_vifs']))}.",
                         )
-                    else:
+                    elif collinearity_report:
                         _log_fusion(
                             "OK",
                             f"[{label}] Collinearity check passed (max VIF ≤ "
@@ -2030,7 +2287,7 @@ def run_fusion(
                     _log_fusion(
                         "WARN",
                         f"[{label}] Collinearity check failed: {exc}. "
-                        "Continuing with all three channels enabled.",
+                        "Continuing with every channel.",
                     )
 
             # Config fingerprint keys the per-job caches; ``suffix`` forces a
@@ -2058,7 +2315,6 @@ def run_fusion(
                 spatial_split=bool(spatial_split),
                 spatial_block_size_m=spatial_block_size_m,
                 n_spatial_blocks=n_spatial_blocks,
-                normalize_channels=bool(normalize_channels),
                 spatial_adjust_method=spatial_adjust_method,
                 spatial_adjust_max_df=spatial_adjust_max_df,
                 spatial_adjust_eps_m=spatial_adjust_eps_m,
@@ -2066,6 +2322,13 @@ def run_fusion(
                 gvi_ladder_rungs=int(gvi_ladder_rungs),
                 ndvi_ladder_spacing=ndvi_ladder_spacing,
                 ndvi_ladder_rungs=int(ndvi_ladder_rungs),
+                exposure_kernel=exposure_kernel,
+                exposure_radius_m=float(exposure_radius_m),
+                exposure_plateau_m=float(exposure_plateau_m),
+                exposure_sigma_m=float(exposure_sigma_m),
+                gvi_min_coverage=float(gvi_min_coverage),
+                drop_collinear_channels=bool(drop_collinear_channels),
+                categorical_missing=str(categorical_missing),
             )
 
             def _standalone_study_name(ch: str) -> str:
@@ -2187,7 +2450,6 @@ def run_fusion(
                 reps=int(discovery_reps),
                 shuffles=int(discovery_shuffles),
                 gain_splits=int(gain_splits),
-                gain_perm=int(gain_permutations),
                 null_runs=int(null_calibration_runs),
                 draws=int(posterior_draws),
                 warmup=int(posterior_warmup),
@@ -2378,7 +2640,6 @@ def run_fusion(
                     reps=int(discovery_reps),
                     shuffles=int(discovery_shuffles),
                     gain_splits=0,  # nothing to compare a standalone against
-                    gain_perm=0,
                     null_runs=int(null_calibration_runs),
                     draws=int(posterior_draws),
                     warmup=int(posterior_warmup),
@@ -2608,35 +2869,92 @@ def run_fusion(
                         cgi_vs_standalone_paired_family.append(pd_res)
 
             if cgi_vs_standalone_paired_family:
-                from .. import statistical_testing as _stats_mod
+                try:
+                    head = _paired_family_headline(
+                        cgi_vs_standalone_paired_family,
+                        (cgi_vs_standalone_aic_bic or {}).get("best_channel"),
+                    )
+                    cgi_vs_standalone_paired = head
+                    _log_fusion(
+                        "OK",
+                        f"[{label}] CGI vs standalones (family of "
+                        f"{len(cgi_vs_standalone_paired_family)}): headline "
+                        f"`{head.get('standalone_channel')}` "
+                        f"Δ={_fmt_or_na(head.get('observed_diff'), '.4f')}, "
+                        f"p={_fmt_or_na(head.get('p_value'), '.4g')}, "
+                        f"Holm p={_fmt_or_na(head.get('p_value_holm'), '.4g')}.",
+                    )
+                except Exception as exc:
+                    _log_fusion(
+                        "WARN",
+                        f"[{label}] CGI vs standalones summary failed: {exc}. "
+                        "The run continues.",
+                    )
 
-                holm = _stats_mod.holm_bonferroni(
-                    [d.get("p_value") for d in cgi_vs_standalone_paired_family]
+            # ── Comparator exposures ────────────────────
+            # Finished exposures from the target table, scored untuned on the
+            # CGI's own rows, split, covariates and objective, then compared
+            # with the CGI pairwise. A separate family from the standalones.
+            comparators_report: dict[str, dict] = {}
+            comparator_reference: dict | None = None
+            cgi_vs_comparator_paired: list[dict] = []
+            if outcome_cmps:
+                stage(skey("comparators"), RUNNING)
+                ctx.progress(
+                    value=prog_ledger(),
+                    status_text=f"{prefix}Scoring comparator exposures...",
                 )
-                for d, hp in zip(cgi_vs_standalone_paired_family, holm):
-                    d["p_value_holm"] = None if hp != hp else float(hp)
-                    d["family_size"] = len(cgi_vs_standalone_paired_family)
-                best_ch = (cgi_vs_standalone_aic_bic or {}).get("best_channel")
-                cgi_vs_standalone_paired = next(
-                    (
-                        d
-                        for d in cgi_vs_standalone_paired_family
-                        if d.get("standalone_channel") == best_ch
-                    ),
-                    None,
-                ) or max(
-                    cgi_vs_standalone_paired_family,
-                    key=lambda d: d.get("observed_diff", float("-inf")),
-                )
-                _log_fusion(
-                    "OK",
-                    f"[{label}] CGI vs standalones (family of "
-                    f"{len(cgi_vs_standalone_paired_family)}): headline "
-                    f"`{cgi_vs_standalone_paired.get('standalone_channel')}` "
-                    f"Δ={cgi_vs_standalone_paired.get('observed_diff'):.4f}, "
-                    f"p={cgi_vs_standalone_paired.get('p_value'):.4g}, "
-                    f"Holm p={cgi_vs_standalone_paired.get('p_value_holm')}.",
-                )
+                if engine.is_panel:
+                    _log_fusion(
+                        "WARN",
+                        f"[{label}] Comparators are scored for one row per entity "
+                        "only; skipped for this panel.",
+                    )
+                    stage(
+                        skey("comparators"),
+                        SKIPPED,
+                        "Several rows per entity: comparators are not scored.",
+                    )
+                else:
+                    for name in outcome_cmps:
+                        if ctx.is_cancelled():
+                            return {"output_paths": output_paths}
+                        comparators_report[name] = _comparator_report(
+                            engine,
+                            name,
+                            headline_params,
+                            objective_metric,
+                            primary=name in primary_cols,
+                            n_ci=report_ci_n,
+                            n_effects_boot=int(report_effects_bootstrap),
+                            n_perm=int(report_effects_permutations),
+                            n_paired=int(report_paired_bootstrap),
+                            iqr=exposure_iqr,
+                            label=label,
+                            log=_log_fusion,
+                        )
+                    cgi_vs_comparator_paired = _comparator_family(comparators_report)
+                    try:
+                        comparator_reference = _exposure_splits(
+                            test_results,
+                            cgi_effects,
+                            engine.compute_partial_slopes(headline_params),
+                        )
+                    except Exception as exc:
+                        _log_fusion(
+                            "WARN", f"[{label}] CGI reference slopes failed: {exc}"
+                        )
+                    for row in cgi_vs_comparator_paired:
+                        _log_fusion(
+                            "OK",
+                            f"[{label}] CGI vs comparator `{row['comparator']}`: "
+                            f"Δ={_fmt_or_na(row.get('observed_diff'), '.4f')}, "
+                            f"p={_fmt_or_na(row.get('p_value'), '.4g')}, Holm p="
+                            f"{_fmt_or_na(row.get('p_value_holm'), '.4g')}"
+                            + (" (descriptive)" if row.get("descriptive") else "")
+                            + ".",
+                        )
+                    stage(skey("comparators"), DONE)
 
             # ── Composite GeoTIFF (raster write) ────────
             # Runs after the standalone stages so they can advance the ledger
@@ -2752,30 +3070,49 @@ def run_fusion(
                 log=_log_fusion,
             )
             if retune_enabled:
-                if outcome_ncs and negative_control_report:
+                if (
+                    outcome_ncs
+                    and negative_control_report
+                    and not negative_control_report.get("skipped")
+                ):
                     stage(skey("negative_control_retune"), RUNNING)
                     ctx.progress(
                         value=prog_ledger(),
                         status_text=f"{prefix}Re-tuning on negative controls...",
                     )
-                    negative_control_report["retune"] = engine.retune_concordance(
-                        headline_params,
-                        objective_metric,
-                        forms=index_forms,
-                        sweep_splits=int(sweep_splits),
-                        draws=int(posterior_draws),
-                        warmup=int(posterior_warmup),
-                        chains=int(posterior_chains),
-                        radius_prior=str(radius_prior),
-                        seed=42,
-                        cancel_callback=cancel_check,
-                    )
-                    stage(skey("negative_control_retune"), DONE)
+                    try:
+                        negative_control_report["retune"] = engine.retune_concordance(
+                            headline_params,
+                            objective_metric,
+                            forms=index_forms,
+                            sweep_splits=int(sweep_splits),
+                            draws=int(posterior_draws),
+                            warmup=int(posterior_warmup),
+                            chains=int(posterior_chains),
+                            radius_prior=str(radius_prior),
+                            seed=42,
+                            cancel_callback=cancel_check,
+                        )
+                        stage(skey("negative_control_retune"), DONE)
+                    except JobCancelled:
+                        raise
+                    except Exception as exc:
+                        _log_fusion(
+                            "WARN",
+                            f"[{label}] Negative-control re-tune failed: {exc}. "
+                            "The run continues.",
+                        )
+                        stage(skey("negative_control_retune"), FAILED, str(exc))
                 else:
                     stage(
                         skey("negative_control_retune"),
                         SKIPPED,
-                        "No negative control left for this outcome.",
+                        (
+                            "Several rows per entity: negative controls are not "
+                            "scored."
+                            if engine.is_panel
+                            else "No negative control left for this outcome."
+                        ),
                     )
 
             bundle = {
@@ -2793,6 +3130,13 @@ def run_fusion(
                 "exposure_response": exposure_response_report,
                 "moderation": moderation_report,
                 "negative_controls": negative_control_report,
+                # The spatial blocks the held-out split used, ``None`` without.
+                "spatial_split": getattr(engine, "_spatial_split_report", None),
+                # Comparator exposures, the CGI's row on the same scale, and
+                # the paired CGI − comparator family.
+                "comparators": comparators_report,
+                "comparator_reference": comparator_reference,
+                "cgi_vs_comparator_paired": cgi_vs_comparator_paired,
                 "target_feature": target_feature,
                 # Run details persisted so the results panel survives a disk
                 # reload (when the live engine is gone): user-facing covariate
@@ -2804,6 +3148,8 @@ def run_fusion(
                 "covariate_dummy_map": dict(
                     getattr(engine, "_covariate_dummy_map", {}) or {}
                 ),
+                # Rows missing each covariate, and how many were dropped.
+                "covariate_missing": getattr(engine, "_covariate_missing_report", None),
                 "cgi_formula": cgi_formula,
                 "config_hash": run_config_record["config_hash"],
                 # Distinct configurations scored on the held-out slice. A test
@@ -2818,8 +3164,8 @@ def run_fusion(
                 "report_dir": report_dir,
                 # ``None`` when the collinearity check wasn't requested.
                 "collinearity_report": getattr(engine, "_collinearity_report", None),
-                "disabled_channels": sorted(
-                    getattr(engine, "_disabled_channels", set()) or set()
+                "high_vif_channels": sorted(
+                    getattr(engine, "_high_vif_channels", set()) or set()
                 ),
                 # Discovery diagnostics, the held-out direction sign,
                 # and the AIC/BIC verdict vs the best standalone (when run).

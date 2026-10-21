@@ -24,6 +24,10 @@ its inputs and settings::
     date_column = "interview_date"
     ndvi = "@ndvi.city"              # the output of the step above
 
+An NDVI step may give ``chains`` (aggregation chains, in place of the
+temporal statistics, for every date mode it uses); a reference then names
+one, ``@ndvi.city[f500]``.
+
 A step's settings resolve in a fixed order — the schema default (the GUI's,
 :mod:`geofuse.settings`), its preset, the file's ``[defaults.<engine>]``, the
 step itself, then command-line overrides — and are checked against the
@@ -58,7 +62,7 @@ CHANNEL_INPUTS = ("ndvi", "gvi")
 _STEP_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 _REFERENCE = re.compile(
     r"^@(?P<engine>ndvi|gvi)\.(?P<step>[A-Za-z0-9][A-Za-z0-9_-]*)"
-    r"(?:\[(?P<statistic>[a-z]+)\])?$"
+    r"(?:\[(?P<statistic>[A-Za-z0-9_]+)\])?$"
 )
 
 
@@ -86,6 +90,8 @@ INPUTS: dict[str, tuple[str, ...]] = {
         "covariates",
         "categorical",
         "moderators",
+        "comparators",
+        "comparators_primary",
         "mode",
         "date_column",
         "entity_column",
@@ -101,7 +107,8 @@ _WAVE_KEYS = ("file", "label", "entity_column", "date_column")
 
 @dataclass(frozen=True)
 class Reference:
-    """``@<engine>.<step>[<statistic>]``: the output of an earlier step."""
+    """``@<engine>.<step>[<statistic>]``: the output of an earlier step;
+    ``statistic`` names an NDVI statistic or aggregation chain."""
 
     engine: str
     step: str
@@ -358,7 +365,11 @@ def _apply_overrides(
 
 
 def _knows(engine: str, key: str) -> bool:
-    return key in INPUTS[engine] or key in _settings.SCHEMAS[engine]
+    return (
+        key in INPUTS[engine]
+        or key in _settings.SCHEMAS[engine]
+        or key in _settings.SHORTHANDS.get(engine, {})
+    )
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -410,7 +421,7 @@ def _resolve_settings(
         values.update(loaded)
         explicit.update(loaded)
     for source, label in ((file_defaults, f"defaults.{engine}"), (raw, raw["name"])):
-        for key, value in source.items():
+        for key, value in _settings.expand_shorthands(engine, source).items():
             if key in INPUTS[engine]:
                 continue
             if key not in schema:
@@ -542,15 +553,13 @@ def parse_reference(value: Any) -> Reference | None:
     if not m:
         raise RunFileError(
             f"{value!r} is not a step reference; write @ndvi.STEP, "
-            "@ndvi.STEP[statistic] or @gvi.STEP."
+            "@ndvi.STEP[statistic or chain] or @gvi.STEP."
         )
     stat = m.group("statistic")
-    if stat is not None and (
-        m.group("engine") != "ndvi" or stat not in _settings.TEMPORAL_REDUCERS
-    ):
+    if stat is not None and m.group("engine") != "ndvi":
         raise RunFileError(
-            f"{value!r}: only NDVI references take a statistic, one of "
-            f"{list(_settings.TEMPORAL_REDUCERS)}."
+            f"{value!r}: only NDVI references name an output (a statistic or "
+            "an aggregation chain)."
         )
     return Reference(m.group("engine"), m.group("step"), stat)
 
@@ -616,7 +625,15 @@ def _fusion_inputs(raw: dict, settings: dict, base: Path) -> dict:
         raise RunFileError(f"'band' must be a band number from 1, not {band!r}.")
     out.update({"layer": layer, "band": band})
 
-    lists = ("outcomes", "negative_controls", "covariates", "categorical", "moderators")
+    lists = (
+        "outcomes",
+        "negative_controls",
+        "covariates",
+        "categorical",
+        "moderators",
+        "comparators",
+        "comparators_primary",
+    )
     for key in lists:
         out[key] = _strings(raw.get(key) or [], key)
     cats = set(out["categorical"])
@@ -624,6 +641,17 @@ def _fusion_inputs(raw: dict, settings: dict, base: Path) -> dict:
     clash = sorted(set(out["outcomes"]) & set(out["negative_controls"]))
     if clash:
         raise RunFileError(f"A column cannot be an outcome and a control: {clash}.")
+    for role, key in (
+        ("an outcome", "outcomes"),
+        ("a covariate", "covariates"),
+        ("a negative control", "negative_controls"),
+    ):
+        clash = sorted(set(out["comparators"]) & set(out[key]))
+        if clash:
+            raise RunFileError(f"A comparator cannot also be {role}: {clash}.")
+    stray = sorted(set(out["comparators_primary"]) - set(out["comparators"]))
+    if stray:
+        raise RunFileError(f"'comparators_primary' names non-comparators: {stray}.")
 
     for key in ("date_column", "entity_column", "wave_column", "area_column"):
         value = raw.get(key)

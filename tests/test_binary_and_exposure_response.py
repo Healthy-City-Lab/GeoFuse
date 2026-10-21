@@ -159,6 +159,16 @@ class TestCrossSectionalLogit(unittest.TestCase):
         g = rng.normal(size=500)
         self.assertEqual(osc.score("logit_tstat", g + rng.normal(size=500), g), 0.0)
 
+    def test_a_separated_outcome_gives_no_estimate(self):
+        # The likelihood has no maximum when the exposure splits the outcome
+        # perfectly, so the iterate walks off instead of converging.
+        g = np.linspace(-2.0, 2.0, 400)
+        y = (g > 0).astype(float)
+        X = np.column_stack([np.ones_like(g), g])
+        self.assertIsNone(bl._irls(y, X))
+        self.assertIsNone(bl.make_logit_fitter(y)(X, ["c", "g"]))
+        self.assertEqual(osc.score("logit_tstat", y, g), 0.0)
+
 
 class TestExposureResponse(unittest.TestCase):
     def test_iqr_scaling_moves_units_only(self):
@@ -199,6 +209,19 @@ class TestExposureResponse(unittest.TestCase):
         out = er.spline_nonlinearity_test(g, er.make_ols_fitter(y), None)
         self.assertLess(out["nonlinearity_p"], 1e-6)
         self.assertEqual(len(out["curve"]["exposure"]), 50)
+
+    def test_the_curve_follows_the_response_on_a_skewed_exposure(self):
+        # Knots placed on the data alone; a uniform plotting grid appended to
+        # the data used to drag them towards the tail.
+        rng = np.random.default_rng(15)
+        n = 4000
+        g = rng.lognormal(0.0, 0.6, size=n)
+        y = (g - 1.0) ** 2 + 0.05 * rng.normal(size=n)
+        out = er.spline_nonlinearity_test(g, er.make_ols_fitter(y), None)
+        grid = np.asarray(out["curve"]["exposure"])
+        truth = (grid - 1.0) ** 2 - (np.median(g) - 1.0) ** 2
+        err = np.abs(np.asarray(out["curve"]["effect"]) - truth)
+        self.assertLess(float(np.max(err)), 0.1 * float(np.ptp(truth)))
 
     def test_spline_type_one_error_is_calibrated(self):
         fired = 0
@@ -246,6 +269,41 @@ class TestExposureResponse(unittest.TestCase):
         out = er.make_ols_fitter(y[keep])(design[keep], ["c", "g", "x1", "x2"])
         self.assertIsNotNone(out)
         self.assertAlmostEqual(out["g"][0], 0.5, delta=0.15)
+
+    def test_clustered_ols_matches_statsmodels_cluster_errors(self):
+        import statsmodels.api as sm
+
+        rng = np.random.default_rng(16)
+        n_ent, waves = 300, 3
+        eid = np.repeat(np.arange(n_ent), waves)
+        g = np.repeat(rng.normal(size=n_ent), waves) + 0.3 * rng.normal(size=len(eid))
+        u = np.repeat(rng.normal(size=n_ent), waves)
+        y = 0.4 * g + u + rng.normal(size=len(eid))
+        X = np.column_stack([np.ones(len(y)), g])
+        out = er.make_ols_fitter(y, eid)(X, ["c", "g"])
+        ref = sm.OLS(y, X).fit(cov_type="cluster", cov_kwds={"groups": eid})
+        self.assertAlmostEqual(out["g"][0], float(ref.params[1]), places=8)
+        self.assertAlmostEqual(out["g"][1], float(ref.bse[1]), places=8)
+        # Independent-row errors are too small when the waves share an entity.
+        plain = er.make_ols_fitter(y)(X, ["c", "g"])
+        self.assertLess(plain["g"][1], out["g"][1])
+
+    def test_incomplete_rows_are_refused_rather_than_misread(self):
+        # A missing exposure used to fall into the reference quantile, and a
+        # moderation design with a NaN row reached the fitter unmasked.
+        rng = np.random.default_rng(14)
+        n = 600
+        g = rng.normal(size=n)
+        y = 0.5 * g + rng.normal(size=n)
+        m = rng.normal(size=n)
+        fitter = er.make_ols_fitter(y)
+        g_gap = g.copy()
+        g_gap[3] = np.nan
+        self.assertIsNone(er.quartile_terms(g_gap, fitter, None))
+        m_gap = m.copy()
+        m_gap[5] = np.nan
+        self.assertIsNone(er.moderation_terms(g, m_gap, fitter, None))
+        self.assertIsNotNone(er.moderation_terms(g, m, fitter, None))
 
     def test_a_tied_exposure_still_reports_quartiles(self):
         rng = np.random.default_rng(12)
@@ -420,6 +478,71 @@ class TestModeration(unittest.TestCase):
         )
 
 
+class TestHeldOutInference(unittest.TestCase):
+    WHOLE = {
+        "n": 900,
+        "per_iqr": {"estimate": 0.4, "std_error": 0.1, "ci_low": 0.2, "ci_high": 0.6},
+        "quartiles": {
+            "cut_points": [1.0, 2.0, 3.0],
+            "contrasts": [
+                {"group": 2, "coef": 0.1, "std_error": 0.05, "p_value": 0.04},
+                {"group": 3, "coef": 0.3, "std_error": 0.05, "p_value": 0.001},
+            ],
+            "trend_p": 0.001,
+        },
+        "curve": {"exposure": [1.0, 2.0], "effect": [0.0, 0.2]},
+    }
+    TEST = {
+        "n": 300,
+        "per_iqr": {"estimate": 0.3, "std_error": 0.2, "ci_low": -0.1, "ci_high": 0.7},
+        "quartiles": {
+            "cut_points": [1.0, 2.0, 3.0],
+            "contrasts": [
+                {"group": 3, "coef": 0.2, "std_error": 0.1, "p_value": 0.05},
+            ],
+            "trend_p": 0.2,
+        },
+        "curve": {"exposure": [1.5], "effect": [0.1]},
+    }
+
+    def test_estimates_stay_whole_and_inference_comes_from_the_test_rows(self):
+        out = er.split_inference(self.WHOLE, self.TEST)
+        self.assertEqual(out["per_iqr"]["estimate"], 0.4)
+        self.assertEqual(out["per_iqr"]["ci_low"], -0.1)
+        self.assertEqual(out["per_iqr"]["test_estimate"], 0.3)
+        self.assertAlmostEqual(out["per_iqr"]["mde"], 0.56)
+        self.assertEqual(out["quartiles"]["trend_p"], 0.2)
+        self.assertEqual(out["curve"], self.WHOLE["curve"])
+
+    def test_rows_pair_by_name_and_a_missing_one_has_no_inference(self):
+        q2, q3 = er.split_inference(self.WHOLE, self.TEST)["quartiles"]["contrasts"]
+        self.assertEqual((q3["coef"], q3["p_value"]), (0.3, 0.05))
+        self.assertIsNone(q2["p_value"])
+        self.assertIsNone(q2["mde"])
+
+    def test_a_failed_held_out_fit_leaves_every_p_value_empty(self):
+        out = er.split_inference(self.WHOLE, None)
+        self.assertIsNone(out["per_iqr"]["std_error"])
+        self.assertEqual(out["per_iqr"]["estimate"], 0.4)
+
+    def test_held_out_inference_is_kept_where_the_whole_rows_have_none(self):
+        # A whole-data pass that skips its bootstrap carries only the estimate.
+        whole = {"observed_diff": 0.02, "n": 900}
+        held = {
+            "observed_diff": 0.01,
+            "n": 300,
+            "lower": -0.01,
+            "upper": 0.03,
+            "p_value": 0.2,
+        }
+        out = er.split_inference(whole, held)
+        self.assertEqual(out["observed_diff"], 0.02)
+        self.assertEqual(out["n"], 900)
+        self.assertEqual(
+            (out["lower"], out["upper"], out["p_value"]), (-0.01, 0.03, 0.2)
+        )
+
+
 class TestIncrementalR2(unittest.TestCase):
     """``r2`` must measure association, not agreement of scales."""
 
@@ -499,6 +622,24 @@ class TestScaleInvariance(unittest.TestCase):
                 base_coef,
                 places=6,
                 msg=f"coef moved at scale {scale:g}",
+            )
+
+    def test_plain_logit_is_invariant_to_covariate_units(self):
+        rng = np.random.default_rng(8)
+        n = 3000
+        cov = rng.normal(size=(n, 2))
+        g = rng.normal(size=n)
+        eta = -0.2 + 0.4 * g + cov @ np.array([0.3, -0.2])
+        y = (rng.uniform(size=n) < 1.0 / (1.0 + np.exp(-eta))).astype(float)
+        base = osc.score("logit_tstat", y, g, cov)
+        for scale in (1e6, 1e12):
+            rescaled = cov.copy()
+            rescaled[:, 0] *= scale
+            self.assertAlmostEqual(
+                osc.score("logit_tstat", y, g, rescaled),
+                base,
+                places=6,
+                msg=f"|z| moved at scale {scale:g}",
             )
 
     def test_fast_scorer_is_invariant_to_covariate_units(self):

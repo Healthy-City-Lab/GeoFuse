@@ -22,7 +22,6 @@ if ROOT not in sys.path:
 import numpy as np
 
 from geofuse import cgi_formulas
-from geofuse import fusion_helpers as _helpers
 from geofuse.fusion import MetricFusionEngine
 
 GVI_FORMULAS = ("weighted_average_gvi", "synergy_gvi")
@@ -52,8 +51,6 @@ def _engine(formula: str, mode: str = "cgi") -> MetricFusionEngine:
     e._active_greenery_channel = mode
     e.gvi_buffer_max_m = 500.0
     e.ndvi_buffer_max_m = 1000.0
-    e.normalize_channels = False
-    e._channel_minmax = None
     e.veg_data = "VEG-LAYER"
     e.terrain_data = "TERRAIN-LAYER"
     e.ndvi_data = "NDVI-LAYER"
@@ -96,13 +93,63 @@ class TestEveryChannelResolvesItsAggregation(unittest.TestCase):
         e = _engine("weighted_average_gvi")
         self.assertEqual(e._channel_spec(PARAMS, "ndvi"), (800, "mean", 50))
 
-    def test_the_street_view_channels_share_one_statistic(self):
+    def test_shared_street_view_statistics_of_stored_params_still_resolve(self):
         e = _engine("weighted_average_gvi")
         for ch, radius in (("gvi", 300), ("veg", 250), ("terrain", 250)):
             with self.subTest(channel=ch):
                 self.assertEqual(
                     e._channel_spec(PARAMS, ch), (radius, "percentile", 75)
                 )
+
+    def test_each_street_view_channel_reads_its_own_statistic(self):
+        e = _engine("weighted_average")
+        params = dict(
+            PARAMS,
+            veg_stat="percentile",
+            veg_percentile=90,
+            terrain_stat="percentile",
+            terrain_percentile=10,
+        )
+        self.assertEqual(e._channel_spec(params, "veg"), (250, "percentile", 90))
+        self.assertEqual(e._channel_spec(params, "terrain"), (250, "percentile", 10))
+
+    def test_the_sweep_records_a_statistic_per_channel(self):
+        from types import SimpleNamespace
+
+        e = _engine("weighted_average")
+        post = SimpleNamespace(
+            picked=((800, "mean"), (250, "p90"), (300, "p10")),
+            weights=np.full((4, 3), 1.0 / 3.0),
+        )
+        params = e._params_from_sweep(None, post, ["ndvi", "veg", "terrain"])
+        self.assertEqual(e._channel_spec(params, "ndvi"), (800, "mean", 50))
+        self.assertEqual(e._channel_spec(params, "veg"), (250, "percentile", 90))
+        self.assertEqual(e._channel_spec(params, "terrain"), (300, "percentile", 10))
+        self.assertNotIn("streetview_stat", params)
+
+    def test_interactions_land_on_their_channels_when_one_is_dropped(self):
+        from types import SimpleNamespace
+
+        e = _engine("synergy_gm")
+        post = SimpleNamespace(
+            picked=((800, "mean"), (300, "mean")),
+            weights=np.array([[0.2, 0.3, 0.5]]),
+        )
+        params = e._params_from_sweep(None, post, ["ndvi", "terrain"])
+        self.assertAlmostEqual(params["w_ndvi_ter"], 50.0)
+        self.assertEqual(params["w_ndvi_veg"], 0.0)
+        self.assertEqual(params["w_veg"], 0.0)
+
+    def test_dropping_high_vif_channels_leaves_them_out_of_the_search(self):
+        e = _engine("weighted_average")
+        e._search_radii = lambda: ((300,), (300,))
+        e._high_vif_channels = {"veg"}
+        tensor = ["veg", "terrain", "ndvi"]
+        e.drop_collinear_channels = False
+        self.assertIn("veg", e._index_layout(tensor, [300])[0])
+        e.drop_collinear_channels = True
+        channels, positions, _ = e._index_layout(tensor, [300])
+        self.assertEqual((channels, positions), (["ndvi", "terrain"], [2, 1]))
 
     def test_a_missing_radius_falls_back_to_the_ladder_maximum(self):
         e = _engine("weighted_average_gvi")
@@ -153,77 +200,6 @@ class TestTheCompositeIsBuiltFromThatSet(unittest.TestCase):
                 self.assertTrue(
                     np.array_equal(e._composite_from({}, {mode: values}), values)
                 )
-
-    def test_normalization_is_keyed_by_channel_name(self):
-        e = _engine("weighted_average_gvi")
-        e.normalize_channels = True
-        e._channel_minmax = {"ndvi": (0.0, 2.0), "gvi": (0.0, 4.0)}
-        out = e._normalize_channels({"ndvi": np.array([1.0]), "gvi": np.array([1.0])})
-        self.assertAlmostEqual(float(out["ndvi"][0]), 0.5)
-        self.assertAlmostEqual(float(out["gvi"][0]), 0.25)
-
-
-class TestGviGetsRealNormalizationBounds(unittest.TestCase):
-    """``gvi`` is not a column of the prepared frame — it is the components' sum.
-
-    Reading it straight off the frame finds nothing and falls back to (0, 1),
-    which silently clips the channel instead of scaling it.
-    """
-
-    FRAME = {
-        "veg": [0.1, 0.2, 0.3],
-        "terrain": [0.05, 0.05, 0.1],
-        "ndvi": [0.4, 0.5, 0.6],
-    }
-
-    def _frame(self):
-        import pandas as pd
-
-        return pd.DataFrame(self.FRAME)
-
-    def test_gvi_is_read_as_the_component_sum(self):
-        col = MetricFusionEngine._channel_column(self._frame(), "gvi")
-        self.assertEqual([round(float(v), 3) for v in col], [0.15, 0.25, 0.4])
-
-    def test_a_channel_with_no_column_and_no_rule_is_absent(self):
-        import pandas as pd
-
-        self.assertIsNone(
-            MetricFusionEngine._channel_column(pd.DataFrame({"veg": [1.0]}), "gvi")
-        )
-
-    def test_the_bounds_are_derived_rather_than_defaulted(self):
-        e = object.__new__(MetricFusionEngine)
-        e.normalize_channels = True
-        e._compute_channel_scale(self._frame())
-        self.assertNotEqual(e._channel_minmax["gvi"], (0.0, 1.0))
-        lo, hi = e._channel_minmax["gvi"]
-        self.assertGreater(hi, lo)
-
-    def test_the_toggle_still_switches_it_all_off(self):
-        e = object.__new__(MetricFusionEngine)
-        e.normalize_channels = False
-        e._compute_channel_scale(self._frame())
-        self.assertIsNone(e._channel_minmax)
-
-
-class TestTheCatchmentComesFromTheJobsRadii(unittest.TestCase):
-    def test_a_standalone_job_uses_its_own_channels_radius(self):
-        self.assertEqual(
-            _helpers.catchment_radius({"ndvi": 800.0, "gvi": 300.0}, "gvi"), 300.0
-        )
-
-    def test_a_combined_job_uses_the_largest(self):
-        self.assertEqual(
-            _helpers.catchment_radius({"ndvi": 800.0, "gvi": 300.0}, "cgi"), 800.0
-        )
-
-    def test_the_radii_map_covers_the_two_channel_set(self):
-        e = _engine("weighted_average_gvi")
-        self.assertEqual(e._channel_radii(PARAMS), {"ndvi": 800.0, "gvi": 300.0})
-
-    def test_no_radii_is_not_a_crash(self):
-        self.assertEqual(_helpers.catchment_radius({}, "cgi"), 0.0)
 
 
 if __name__ == "__main__":

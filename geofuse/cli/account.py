@@ -219,6 +219,8 @@ def _probe_street_view() -> tuple[str, str]:
         pano = streetview.find_panorama(*streetview.PROBE_POINT, timeout=10)
     except streetview.ServiceRetired as exc:
         return FAIL, str(exc)
+    except streetview.UnexpectedAnswer as exc:
+        return WARN, f"{exc}; often a temporary block of this address, try again later"
     except streetview.RateLimitedError:
         return WARN, "the search is throttling this address right now"
     except OSError as exc:

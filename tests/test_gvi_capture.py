@@ -30,7 +30,13 @@ from shapely.geometry import Point
 
 import geofuse  # noqa: F401  (import order: torch before GeoPandas)
 from geofuse import streetview as sv
-from geofuse.gvi import CAPTURE_STATUS_KEY, NO_CAPTURE_IN_WINDOW, GVIEngine
+from geofuse.gvi import (
+    CAPTURE_STATUS_KEY,
+    NO_CAPTURE_IN_WINDOW,
+    NO_PANORAMA,
+    WINDOW_MISS_KEY,
+    GVIEngine,
+)
 from geofuse.jobs import runners
 
 C = sv.PanoCapture
@@ -198,6 +204,20 @@ class EngineMarksWindowMissesTests(unittest.TestCase):
         )
         self.assertEqual(out[0], "done")
         self.assertEqual(out[1][CAPTURE_STATUS_KEY], NO_CAPTURE_IN_WINDOW)
+        self.assertEqual(out[1][WINDOW_MISS_KEY], "month")
+
+    def test_the_rule_a_window_miss_broke_is_named(self):
+        pano = _pano([C("dec19", 2019, 12), C("jan18", 2018, 1)])
+        far = self._resolve(pano, target_year=2014, max_year_diff=1)
+        self.assertEqual(far[1][WINDOW_MISS_KEY], "year")
+        near = self._resolve(
+            pano, target_year=2018, max_year_diff=1, month_window=(5, 10)
+        )
+        self.assertEqual(near[1][WINDOW_MISS_KEY], "month")
+
+    def test_a_point_without_a_panorama_is_marked(self):
+        out = self._resolve(None, target_year=None, max_year_diff=None)
+        self.assertEqual(out[1][CAPTURE_STATUS_KEY], NO_PANORAMA)
 
     def test_an_in_window_capture_is_segmented(self):
         pano = _pano([C("dec19", 2019, 12), C("jul18", 2018, 7)])
@@ -226,7 +246,9 @@ class _Ctx:
 
 
 class _StubEngine:
-    """Feeds two sampled points, one point with no in-window capture and one miss."""
+    """Samples two of five points; one has no capture in the window, one no
+    panorama and one failed. Like the engine, it passes only the sampled
+    points to ``result_callback`` and counts every outcome."""
 
     def run_analysis(
         self,
@@ -242,31 +264,33 @@ class _StubEngine:
             "target_year": target_year,
             "month_window": month_window,
             "month_policy": month_policy,
+            "log_points": _kw.get("log_points"),
         }
-        for i, (veg, date, status) in enumerate(
-            [
-                (0.3, "2017-07", None),
-                (0.4, "2017-08", None),
-                (None, None, NO_CAPTURE_IN_WINDOW),
-                (None, None, None),
-            ]
-        ):
-            res = {
-                "orig_index": i,
-                "geometry": Point(-114.0 + i * 1e-3, 51.0),
-                "gvi_veg": veg,
-                "gvi_ter": veg,
-                "pano_id": None if veg is None else f"p{i}",
-                "pano_date": date,
-                "lat": 51.0,
-                "lon": -114.0,
-                "row": 0,
-                "col": i,
-                "cluster_id": 0,
-            }
-            if status:
-                res[CAPTURE_STATUS_KEY] = status
-            result_callback(res)
+        for i, (veg, date) in enumerate([(0.3, "2017-07"), (0.4, "2017-08")]):
+            result_callback(
+                {
+                    "orig_index": i,
+                    "geometry": Point(-114.0 + i * 1e-3, 51.0),
+                    "gvi_veg": veg,
+                    "gvi_ter": veg,
+                    "pano_id": f"p{i}",
+                    "pano_date": date,
+                    "lat": 51.0,
+                    "lon": -114.0,
+                    "row": 0,
+                    "col": i,
+                    "cluster_id": 0,
+                }
+            )
+        self.last_run_stats = {
+            "points": 5,
+            "sampled": 2,
+            "no_panorama": 1,
+            "no_capture_in_window": 1,
+            "no_capture_in_year_window": 0,
+            "no_capture_in_month_window": 1,
+            "failed": 1,
+        }
 
 
 class RunnerOutputTests(unittest.TestCase):
@@ -280,7 +304,7 @@ class RunnerOutputTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _run(self, target_year, month_window=None):
+    def _run(self, target_year, month_window=None, **run_args):
         pts = gpd.GeoDataFrame(geometry=[Point(-114.0, 51.0)], crs="EPSG:4326")
         return runners.run_gvi(
             _Ctx(),
@@ -300,6 +324,7 @@ class RunnerOutputTests(unittest.TestCase):
                 "max_year_diff": 2,
                 "month_window": month_window,
                 "month_policy": "exclude",
+                **run_args,
             },
             output_dir=self.tmp.name,
             save_geotiff=False,
@@ -321,6 +346,12 @@ class RunnerOutputTests(unittest.TestCase):
             ],
         )
 
+    def test_log_points_reaches_the_engine(self):
+        self._run(None)
+        self.assertIs(self.stub.kw["log_points"], False)
+        self._run(None, log_points=True)
+        self.assertIs(self.stub.kw["log_points"], True)
+
     def test_most_recent_keeps_its_name(self):
         self._run(None)
         self.assertEqual(
@@ -337,8 +368,11 @@ class RunnerOutputTests(unittest.TestCase):
         self.assertEqual(side["max_year_diff"], 2)
         self.assertEqual(side["month_window"], [5, 10])
         self.assertEqual(side["month_policy"], "exclude")
-        self.assertEqual((side["n_points"], side["n_sampled"]), (4, 2))
+        self.assertEqual((side["n_grid_points"], side["n_sampled"]), (5, 2))
+        self.assertEqual((side["n_no_panorama"], side["n_failed"]), (1, 1))
         self.assertEqual(side["n_no_capture_in_window"], 1)
+        split = ("n_no_capture_in_year_window", "n_no_capture_in_month_window")
+        self.assertEqual([side[k] for k in split], [0, 1])
         self.assertEqual(side["capture_years"], {"2017": 2})
         self.assertEqual(side["capture_months"], {"7": 1, "8": 1})
         self.assertEqual(sum(side["capture_years"].values()), side["n_sampled"])
@@ -412,11 +446,13 @@ class RestartReplayTests(unittest.TestCase):
             "batch_size": 1,
             "batch_wait_ms": 20,
             "precision": "fp16",
+            "log_points": False,
         }
         self.assertEqual(
             gvi_tab._capture_args(p),
             {"month_window": [5, 10], "month_policy": "prefer", **sizing},
         )
+        self.assertIs(gvi_tab._capture_args({"log_points": True})["log_points"], True)
         self.assertEqual(
             gvi_tab._capture_args({}),
             {"month_window": None, "month_policy": "exclude", **sizing},

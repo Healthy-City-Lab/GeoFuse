@@ -45,15 +45,17 @@ def write_shard(
     shard,
     points: int,
     throughput: list | None = None,
+    counts: dict[str, dict | None] | None = None,
 ) -> list[str]:
     """Keep one shard's raw results: ``{name}.{label}.gpkg`` for each result
     set that has rows, and the manifest ``{stem}.{label}.json`` (with the
-    engine's stage counts of each run, ``throughput``)."""
+    engine's stage counts of each run, ``throughput``, and each result set's
+    point counts, ``counts``)."""
     label = shard_label(shard)
     os.makedirs(folder, exist_ok=True)
-    written, counts = [], {}
+    written, rows = [], {}
     for name, records in results.items():
-        counts[name] = len(records)
+        rows[name] = len(records)
         if not records:
             continue
         path = os.path.join(folder, f"{name}.{label}.gpkg")
@@ -66,8 +68,9 @@ def write_shard(
             "shard": int(shard[0]) + 1,
             "shards": int(shard[1]),
             "points": int(points),
-            "results": counts,
+            "results": rows,
             "throughput": [t for t in throughput or [] if t],
+            "point_counts": dict(counts or {}),
         }
         json.dump(record, f, indent=2)
     return [*written, manifest]
@@ -125,6 +128,26 @@ def shard_throughput(folder: str, stem: str, shards: int) -> list[dict]:
     return found
 
 
+def shard_point_counts(folder: str, stem: str, shards: int) -> dict[str, dict | None]:
+    """Each result set's point counts summed over the shards; ``None`` for a
+    set that some shard recorded no counts for."""
+    totals: dict[str, dict | None] = {}
+    seen: dict[str, int] = {}
+    for i in range(shards):
+        path = _manifest(folder, stem, shard_label((i, shards)))
+        with open(path, encoding="utf-8") as f:
+            record = json.load(f)
+        for name, counts in (record.get("point_counts") or {}).items():
+            seen[name] = seen.get(name, 0) + 1
+            if counts is None or (name in totals and totals[name] is None):
+                totals[name] = None
+                continue
+            total = totals.setdefault(name, {})
+            for key, value in counts.items():
+                total[key] = total.get(key, 0) + int(value)
+    return {name: t if seen[name] == shards else None for name, t in totals.items()}
+
+
 def _throughput(folder: str, stem: str, shards: int) -> dict | None:
     found = shard_throughput(folder, stem, shards)
     return {"shards": found} if found else None
@@ -174,6 +197,7 @@ def run_gvi_merge(
         folder = os.path.join(output_dir, f"{base}_temporal_gvi")
         merged = read_shards(folder, f"{base}_gvi", shards)
         throughput = _throughput(folder, f"{base}_gvi", shards)
+        counts = shard_point_counts(folder, f"{base}_gvi", shards)
         gdf_4326, years, grid_crs = runners.column_years(raw, date_column)
         outputs: list[str] = [folder]
         for year in years:
@@ -191,6 +215,7 @@ def run_gvi_merge(
                 output_dir=folder,
                 capture=runners._capture_settings("column", year, run_args),
                 throughput=throughput,
+                counts=counts.get(name),
                 **write,
             )
             outputs.extend(paths)
@@ -200,6 +225,7 @@ def run_gvi_merge(
         stem = f"{out_name}_gvi"
         merged = read_shards(output_dir, stem, shards)
         throughput = _throughput(output_dir, stem, shards)
+        counts = shard_point_counts(output_dir, stem, shards)
         records, crs = merged.get(stem, ([], None))
         outputs = []
         if not records:
@@ -219,6 +245,7 @@ def run_gvi_merge(
                     "recent" if target_year is None else "year", target_year, run_args
                 ),
                 throughput=throughput,
+                counts=counts.get(stem),
                 **write,
             )
         remove_shards(output_dir, stem, merged, shards)

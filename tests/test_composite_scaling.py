@@ -1,16 +1,14 @@
-"""The composite path rebuilds the model the discovery fitted.
+"""The composite path evaluates every form on the scale its weights apply to.
 
-The sweep and the posterior fit weights and forms on each channel divided by its
-covariate-adjusted SD; the composite path builds maps and test scores from raw
-channel values and the saved parameters (``cgi_formulas.compute_cgi``). With the
-recorded ``<channel>_center`` / ``<channel>_scale`` it standardises each channel
-first — directly for the weighted average, through ``Φ`` for synergy — so the
-composite is the fitted index rather than a reweighted cousin of it.
+New params carry raw-scale weights, so the weighted average and the
+geometric-mean synergy form read the raw channel values. Params recorded with
+``<channel>_center`` / ``<channel>_scale`` by earlier runs replay as they were
+fitted — standardised for the weighted average, through ``Φ`` and powers for
+the earlier synergy form.
 """
 
 import os
 import sys
-import types
 import unittest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -20,7 +18,6 @@ if ROOT not in sys.path:
 import numpy as np
 from scipy.stats import norm
 
-from geofuse import bayesian_index as bi
 from geofuse import cgi_formulas
 
 
@@ -73,64 +70,19 @@ class TestWeightedAverage(unittest.TestCase):
         )
         np.testing.assert_allclose(got, [0.3, 0.3], atol=1e-7)
 
-    def test_the_composite_reproduces_the_models_index_given_covariates(self):
-        # Covariates explain more of one channel than the other, so dividing by
-        # the raw SD would distort the shares; the covariate-adjusted SD that
-        # ``prep`` divided by reproduces the fitted index exactly.
-        rng = np.random.default_rng(5)
-        n = 2000
-        cov = rng.normal(size=(n, 2))
-        X = rng.normal(size=(n, 2, 2, 1))
-        X[:, 0, :, 0] += 3.0 * cov[:, :1]
-        X[:, 0] *= 0.1
-        yr, Xr, info = bi.prep(X, rng.normal(size=n), cov, return_info=True)
-        w = np.array([0.6, 0.4])
-        model_index = Xr[:, 0, 1, 0] * w[0] + Xr[:, 1, 0, 0] * w[1]
-        scaling = bi.composite_scaling(
-            X,
-            info["column_sd"],
-            channels=["ndvi", "gvi"],
-            channel_index=[0, 1],
-            radii=[100.0, 200.0],
-            stats=["mean"],
-            picked=((200, "mean"), (100, "mean")),
-        )
-        p = dict(scaling, ndvi_weight=60, gvi_weight=40)
-        comp = cgi_formulas.compute_cgi(
-            "weighted_average_gvi", p, {"ndvi": X[:, 0, 1, 0], "gvi": X[:, 1, 0, 0]}
-        )
-        q, _ = bi.covariate_basis(cov, n)
-        comp_r = comp - q @ (q.T @ comp)
-        self.assertAlmostEqual(
-            float(np.corrcoef(comp_r, model_index)[0, 1]), 1.0, places=10
-        )
-        raw_sd = dict(
-            p,
-            ndvi_scale=float(X[:, 0, 1, 0].std()),
-            gvi_scale=float(X[:, 1, 0, 0].std()),
-        )
-        naive = cgi_formulas.compute_cgi(
-            "weighted_average_gvi",
-            raw_sd,
-            {"ndvi": X[:, 0, 1, 0], "gvi": X[:, 1, 0, 0]},
-        )
-        naive_r = naive - q @ (q.T @ naive)
-        self.assertLess(float(np.corrcoef(naive_r, model_index)[0, 1]), 0.999)
-
 
 class TestSynergy(unittest.TestCase):
-    def test_compute_cgi_reproduces_the_sweeps_synergy_index(self):
+    def test_stored_params_replay_through_percentiles_and_powers(self):
         R = _raw()
-        sf = bi.SynergyFit(
-            np.array([0.3, 0.2, 0.5]), np.array([0.6, 0.9]), R.mean(0), R.std(0)
-        )
         p = _params(
             R, w_ndvi=30, w_gvi=20, w_ndvi_gvi=50, ndvi_power=0.6, gvi_power=0.9
         )
+        z = norm.cdf((R - R.mean(0)) / R.std(0))
+        want = 0.3 * z[:, 0] ** 0.6 + 0.2 * z[:, 1] ** 0.9 + 0.5 * z[:, 0] * z[:, 1]
         got = cgi_formulas.compute_cgi(
             "synergy_gvi", p, {"ndvi": R[:, 0], "gvi": R[:, 1]}
         )
-        np.testing.assert_allclose(got, sf.apply(R), rtol=1e-6, atol=1e-9)
+        np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-9)
 
     def test_the_three_channel_form_uses_the_same_curve(self):
         rng = np.random.default_rng(1)
@@ -188,52 +140,42 @@ class TestSynergy(unittest.TestCase):
         np.testing.assert_allclose(got, [0.1, 0.3, 0.6], rtol=1e-6)
 
 
-class TestScalingIsRecorded(unittest.TestCase):
-    @staticmethod
-    def _tensor():
-        rng = np.random.default_rng(3)
-        X = rng.normal(0.5, 0.2, size=(300, 2, 3, 2))
-        X[:5, 1, 2, 1] = np.nan
-        sd = np.full((2, 3, 2), 0.15)
-        return X, sd
+class TestGeometricMeanSynergy(unittest.TestCase):
+    COMPS = {
+        "ndvi": np.array([-0.3, 0.2, 0.6]),
+        "veg": np.array([0.4, 0.1, 0.3]),
+        "terrain": np.array([0.05, 0.2, 0.0]),
+    }
 
-    def test_center_is_the_cell_mean_and_scale_the_adjusted_sd(self):
-        X, sd = self._tensor()
-        sd[1, 2, 1] = 0.07
-        out = bi.composite_scaling(
-            X,
-            sd,
-            channels=["ndvi", "gvi"],
-            channel_index=[0, 1],
-            radii=[100.0, 200.0, 400.0],
-            stats=["mean", "p50"],
-            picked=((200, "mean"), (400, "p50")),
+    def test_interactions_are_geometric_means_of_clipped_channels(self):
+        n, v, t = (self.COMPS[c] for c in ("ndvi", "veg", "terrain"))
+        p = dict.fromkeys(cgi_formulas.get_formula("synergy_gm").weight_keys, 0)
+        p.update(w_ndvi=20, w_ter=10, w_ndvi_veg=30, w_ter_veg=10, w_ndvi_veg_ter=30)
+        n0 = np.maximum(n, 0)
+        want = (
+            0.2 * n
+            + 0.1 * t
+            + 0.3 * np.sqrt(n0 * v)
+            + 0.1 * np.sqrt(t * v)
+            + 0.3 * np.cbrt(n0 * v * t)
         )
-        self.assertAlmostEqual(out["ndvi_center"], float(X[:, 0, 1, 0].mean()))
-        self.assertAlmostEqual(out["gvi_center"], float(X[5:, 1, 2, 1].mean()))
-        self.assertEqual((out["ndvi_scale"], out["gvi_scale"]), (0.15, 0.07))
+        got = cgi_formulas.compute_cgi("synergy_gm", p, self.COMPS)
+        np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-7)
 
-    def test_the_engine_carries_it_onto_normalised_channels(self):
-        from geofuse.fusion import MetricFusionEngine as E
+    def test_without_interactions_it_is_the_weighted_average(self):
+        p = {"w_ndvi": 50, "w_gvi": 50, "w_ndvi_gvi": 0}
+        comps = {"ndvi": self.COMPS["ndvi"], "gvi": self.COMPS["veg"]}
+        got = cgi_formulas.compute_cgi("synergy_gm_gvi", p, comps)
+        want = cgi_formulas.compute_cgi(
+            "weighted_average_gvi", {"ndvi_weight": 50, "gvi_weight": 50}, comps
+        )
+        np.testing.assert_allclose(got, want, atol=1e-7)
 
-        X, sd = self._tensor()
-        eng = types.SimpleNamespace(
-            normalize_channels=True,
-            _channel_minmax={"ndvi": (0.0, 1.0), "gvi": (0.0, 2.0)},
+    def test_a_channel_is_active_through_any_of_its_terms(self):
+        active = cgi_formulas.channel_active(
+            "synergy_gm", {"w_ndvi": 50, "w_ndvi_veg_ter": 50}
         )
-        eng._channel_scaling = types.MethodType(E._channel_scaling, eng)
-        out = eng._channel_scaling(
-            X,
-            np.array([100.0, 200.0, 400.0]),
-            ["mean", "p50"],
-            ["ndvi", "gvi"],
-            ["ndvi", "gvi"],
-            ((200, "mean"), (400, "p50")),
-            sd,
-        )
-        self.assertAlmostEqual(out["gvi_center"], float(X[5:, 1, 2, 1].mean()) / 2.0)
-        self.assertAlmostEqual(out["gvi_scale"], 0.075)
-        self.assertAlmostEqual(out["ndvi_scale"], 0.15)
+        self.assertEqual(active, {"ndvi": True, "veg": True, "terrain": True})
 
 
 if __name__ == "__main__":

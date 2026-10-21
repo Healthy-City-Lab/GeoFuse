@@ -22,6 +22,12 @@ default — Google throttles per address), ``earthengine``, ``fusion`` and
 ``max_parallel`` overall. The supervisor schedules within them, and each job
 also holds its slots while it runs (``geofuse.jobs.locks``), so jobs the GUI
 started count against the same limits.
+
+A supervisor outlives its own errors. A status file it cannot replace (another
+program holding it open) is kept in memory and written on a later pass, and
+an error in one pass is logged before the next. Should the loop still end on
+an error, its jobs are recorded as ``interrupted``, never ``cancelled``, so
+``geofuse rerun`` picks them up from their caches.
 """
 
 from __future__ import annotations
@@ -33,6 +39,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -56,6 +63,9 @@ _EXTRA_KEYS = (
 _STATUS_EVERY_S = 2.0
 _HEARTBEAT_EVERY_S = 5.0
 _SCAN_EVERY_S = 1.0
+# How long a stopping supervisor keeps retrying status files it could not
+# write, in seconds.
+_FLUSH_FOR_S = 10.0
 
 
 def submit_specs(
@@ -166,6 +176,7 @@ class Supervisor:
         self._last_scan = 0.0
         self._last_beat = 0.0
         self._idle_since: float | None = None
+        self._last_error: str | None = None
 
     # ── Setup ───────────────────────────────────────────────────
 
@@ -249,8 +260,26 @@ class Supervisor:
                 **fields,
             }
         )
-        self.state.write_status(job_id, current)
+        try:
+            self.state.write_status(job_id, current)
+        except OSError as exc:
+            # The file mirrors ``current``, which keeps the update: a later
+            # pass writes it (:meth:`_write_unsaved`).
+            if not entry.get("unsaved"):
+                self._log(f"could not write the status of {job_id} ({exc}); retrying")
+            entry["unsaved"] = True
+            return
+        if entry.pop("unsaved", False):
+            self._log(f"status of {job_id} written")
         entry["written"] = time.monotonic()
+
+    def _write_unsaved(self) -> bool:
+        """Write every status a failed write left in memory; whether all are
+        on disk now."""
+        for job_id, entry in list(self.jobs.items()):
+            if entry.get("unsaved"):
+                self._write(job_id)
+        return not any(e.get("unsaved") for e in self.jobs.values())
 
     def _mirror(self, job_id: str, *, force: bool = False) -> None:
         entry = self.jobs[job_id]
@@ -388,8 +417,6 @@ class Supervisor:
                 entry["phase"] = "run"
             self._log(f"started {job_id}")
         except Exception as exc:  # noqa: BLE001 — a bad job must not stop the rest
-            import traceback
-
             entry["phase"] = "done"
             self._write(
                 job_id,
@@ -436,6 +463,19 @@ class Supervisor:
         self._scan()
         self._schedule()
         self._control()
+        self._write_unsaved()
+
+    def _guarded_step(self) -> None:
+        """One :meth:`step`; an error is logged (once while it repeats) and
+        the next pass tries again, so the jobs keep running."""
+        try:
+            self.step()
+            self._last_error = None
+        except Exception as exc:  # noqa: BLE001 — the jobs must outlive a bad pass
+            text = f"{type(exc).__name__}: {exc}"
+            if text != self._last_error:
+                self._log(f"a pass failed; continuing:\n{traceback.format_exc()}")
+            self._last_error = text
 
     def _finished(self) -> bool:
         busy = any(e["phase"] != "done" for e in self.jobs.values())
@@ -483,28 +523,60 @@ class Supervisor:
         self._started_at = now_iso()
         self._ensure_executor()
         self.heartbeat(force=True)
+        failure: Exception | None = None
         try:
             while not self._stop.is_set():
-                self.step()
+                self._guarded_step()
                 if self._finished():
                     break
                 time.sleep(self.poll_s)
+        except Exception as exc:
+            failure = exc
+            raise
         finally:
-            for job_id, entry in self.jobs.items():
-                if entry["phase"] in ("build", "run") and entry["record"] is not None:
-                    self._store.request_cancel(job_id)
-            if self._executor is not None:
-                # Stopped outright, the jobs' processes end with this one
-                # (they watch their parent); otherwise let them finish.
-                self._executor.shutdown(wait=not self._stop.is_set())
-            for job_id, entry in self.jobs.items():
-                if entry["record"] is not None:
-                    self._mirror(job_id, force=True)
+            if failure is not None:
+                self._interrupt_jobs(failure)
+            else:
+                self._wind_down()
+            deadline = time.monotonic() + _FLUSH_FOR_S
+            while not self._write_unsaved() and time.monotonic() < deadline:
+                time.sleep(0.5)
             self.state.remove_supervisor(self.id)
             if self._store is not None:
                 self._store.shutdown()
         states = [e.get("status", {}).get("status") for e in self.jobs.values()]
         return 0 if all(s == "completed" for s in states) else 1
+
+    def _wind_down(self) -> None:
+        """A finished or stopped run: cancel what still runs and record it."""
+        for job_id, entry in self.jobs.items():
+            if entry["phase"] in ("build", "run") and entry["record"] is not None:
+                self._store.request_cancel(job_id)
+        if self._executor is not None:
+            # Stopped outright, the jobs' processes end with this one (they
+            # watch their parent); otherwise let them finish.
+            self._executor.shutdown(wait=not self._stop.is_set())
+        for job_id, entry in self.jobs.items():
+            if entry["record"] is not None:
+                self._mirror(job_id, force=True)
+
+    def _interrupt_jobs(self, failure: Exception) -> None:
+        """The loop ended on an error: record every unfinished job as
+        ``interrupted`` (its process ends with this one) rather than
+        cancelling it."""
+        reason = (
+            f"Its supervisor stopped on an error ({type(failure).__name__}: "
+            f"{failure}); rerun it to continue from its caches."
+        )
+        self._log(reason)
+        for job_id, entry in self.jobs.items():
+            if entry["phase"] != "done":
+                entry["phase"] = "done"
+                self._write(
+                    job_id, status="interrupted", error=reason, completed_at=now_iso()
+                )
+        if self._executor is not None:
+            self._executor.shutdown(wait=False)
 
 
 def start_daemon(state: StateDir, *, wait_s: float = 20.0) -> dict:

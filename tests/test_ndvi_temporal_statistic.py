@@ -135,14 +135,20 @@ class FakeEarthEngine:
     Like Earth Engine, a float32 request writes ``-inf`` where a pixel centre
     falls outside the export region, while float64 writes the data there.
     Neighbouring tiles overlap by a pixel, so a float32 request would put
-    ``-inf`` into the mosaic.
+    ``-inf`` into the mosaic. A request with more than ``max_bands`` bands is
+    refused as too large (and recorded in ``refused``).
     """
 
-    def __init__(self, aoi):
+    def __init__(self, aoi, max_bands=None):
         self.aoi = aoi
+        self.max_bands = max_bands
         self.exports: list[tuple[tuple[str, ...], str]] = []
+        self.refused: list[tuple[str, ...]] = []
 
     def export(self, image, filename, *, crs, crs_transform, region, timeout=300):
+        if self.max_bands is not None and len(image.bands) > self.max_bands:
+            self.refused.append(image.bands)
+            raise ndvi._EEComputeTooLargeError("User memory limit exceeded.")
         self.exports.append((image.bands, image.dtype))
         region_grid = shp_transform(_TO_GRID, region)
         minx, miny, maxx, maxy = region_grid.bounds
@@ -251,13 +257,13 @@ class TemporalReducerNameTests(unittest.TestCase):
         self.assertEqual(ndvi.ndvi_output_name("a_2015", "max"), "a_2015_max")
 
     def test_resume_keys(self):
-        """Median keys are unchanged; every statistic gets its own key."""
+        """Median adds nothing to the key; every statistic gets its own key."""
         import hashlib
 
         aoi = _aoi(1.0)
         args = (aoi, "2023-06-01", "2023-09-30", 10, 10, "COPERNICUS/S2_SR_HARMONIZED")
         h = hashlib.sha256()
-        h.update(b"planar_v1|")
+        h.update(b"planar_v1|nd_masked|")
         h.update(geometry_sha256(aoi).encode())
         h.update(b"|2023-06-01|2023-09-30|10|10|")
         h.update(b"COPERNICUS/S2_SR_HARMONIZED")
@@ -326,6 +332,18 @@ class _EngineCase(unittest.TestCase):
         np.testing.assert_array_equal(arr, _expected(stat, X, Y).astype(dtype))
         self.assertTrue((arr == -9999).any(), "sentinel pixels expected")
         self.assertTrue((arr != -9999).any())
+        self.assertStatistics(path)
+
+    def assertStatistics(self, path, nodata=-9999):
+        """``nodata`` is declared; the statistics of the other pixels are stored."""
+        with rasterio.open(path) as src:
+            self.assertEqual(src.nodata, nodata)
+            arr = src.read(1).astype(np.float64)
+            tags = src.tags(1)
+        valid = arr[arr != -9999]
+        self.assertEqual(float(tags["STATISTICS_MINIMUM"]), valid.min())
+        self.assertEqual(float(tags["STATISTICS_MAXIMUM"]), valid.max())
+        self.assertAlmostEqual(float(tags["STATISTICS_MEAN"]), valid.mean(), places=10)
 
     def sidecar(self, name):
         with open(os.path.join(self.out, f"{name}_ndvi.json")) as f:
@@ -407,6 +425,7 @@ class TiledCacheTests(_EngineCase):
             d
             for d in os.listdir(self.cache)
             if os.path.isdir(os.path.join(self.cache, d))
+            and d not in (ndvi.RECORDS_DIR, ndvi.AREAS_DIR)
         )
 
     def test_shared_download_then_partial_and_full_reuse(self):
@@ -431,8 +450,10 @@ class TiledCacheTests(_EngineCase):
         for key in keys.values():
             tiles = os.listdir(os.path.join(self.cache, key))
             self.assertEqual(len(tiles), n_tiles)
-            with rasterio.open(os.path.join(self.cache, key, tiles[0])) as t:
-                self.assertEqual((t.count, t.dtypes[0]), (1, "float32"))
+            tile = os.path.join(self.cache, key, tiles[0])
+            with rasterio.open(tile) as t:
+                self.assertEqual((t.count, t.dtypes[0], t.nodata), (1, "float32", None))
+            self.assertStatistics(tile, nodata=None)
         self.assertEqual(self.engine().tile_cache.stats()["entries"], 2)
 
         # Adding mean downloads mean only, one single-band request per tile.
@@ -472,6 +493,23 @@ class TiledCacheTests(_EngineCase):
         )
         self.assertComposite(os.path.join(self.out, "site_max_ndvi.tif"), "max")
 
+    def test_per_cluster_tiles_carry_statistics(self):
+        with FakeEarthEngine(self.aoi):
+            res = _run(
+                self.engine(),
+                self.aoi,
+                self.out,
+                "median",
+                max_tile_size_km=1,
+                write_cluster_tiles=True,
+            )
+        self.assertEqual(res["status"], "success")
+        tiles_dir = os.path.join(self.out, "site_ndvi_tiles")
+        clusters = [f for f in os.listdir(tiles_dir) if f.endswith(".tif")]
+        self.assertTrue(clusters)
+        for name in clusters:
+            self.assertStatistics(os.path.join(tiles_dir, name))
+
     def test_failed_tile_is_a_gap_for_every_statistic_it_carried(self):
         with FakeEarthEngine(self.aoi) as fake:
             real = fake.export
@@ -495,6 +533,54 @@ class TiledCacheTests(_EngineCase):
             meta = res["reducers"][stat]["meta"]
             self.assertEqual(meta["tiles_failed"], 1)
             self.assertEqual(len(meta["failed_tile_refs"]), 1)
+
+
+class SplitRequestTests(_EngineCase):
+    """Outputs Earth Engine refuses as one request come down in several."""
+
+    STATS = ["median", "mean", "max"]
+    NAMES = {"median": "site", "mean": "site_mean", "max": "site_max"}
+
+    def _run(self, aoi, max_bands, **kw):
+        with FakeEarthEngine(aoi, max_bands=max_bands) as fake:
+            res = _run(self.engine(), aoi, self.out, self.STATS, **kw)
+        self.assertEqual(res["status"], "success", res.get("message"))
+        for stat, name in self.NAMES.items():
+            self.assertComposite(os.path.join(self.out, f"{name}_ndvi.tif"), stat)
+        return res, fake
+
+    def test_single_tile_halves_until_accepted(self):
+        res, fake = self._run(_aoi(0.6), 2)
+        self.assertEqual(fake.refused, [("median", "mean", "max")])
+        self.assertEqual(
+            fake.exports, [(("NDVI",), "float64"), (("mean", "max"), "float64")]
+        )
+        for name in self.NAMES.values():
+            self.assertEqual(self.sidecar(name)["tiles_split_across_requests"], 1)
+        files = [f"{n}_ndvi.{e}" for n in self.NAMES.values() for e in ("tif", "json")]
+        self.assertEqual(sorted(os.listdir(self.out)), sorted(files))
+
+    def test_every_tile_splits_down_to_one_output(self):
+        aoi = _aoi(2.2)
+        res, fake = self._run(aoi, 1, max_tile_size_km=1)
+        n_tiles = res["meta"]["tiles_total"]
+        self.assertGreater(n_tiles, 3)
+        # Tiles download in parallel, so only the counts are fixed.
+        self.assertEqual(
+            sorted(fake.refused),
+            sorted([("median", "mean", "max"), ("mean", "max")] * n_tiles),
+        )
+        self.assertEqual(fake.exports, [(("NDVI",), "float64")] * (3 * n_tiles))
+        for name in self.NAMES.values():
+            side = self.sidecar(name)
+            self.assertEqual(side["tiles_split_across_requests"], n_tiles)
+            tiles = os.listdir(os.path.join(self.cache, side["resume_key"]))
+            expected = [f"tile_{i}.tif" for i in range(n_tiles)]
+            self.assertEqual(sorted(tiles), sorted(expected))
+
+    def test_no_split_when_accepted(self):
+        self._run(_aoi(0.6), None)
+        self.assertEqual(self.sidecar("site")["tiles_split_across_requests"], 0)
 
 
 if __name__ == "__main__":

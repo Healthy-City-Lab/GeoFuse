@@ -37,6 +37,7 @@ from geofuse.crs_utils import (
     reproject_geodataframe_to_wgs84,
 )
 from geofuse.ndvi import TEMPORAL_REDUCERS
+from geofuse.ndvi_chains import ChainError, format_lines, parse_lines
 from geofuse.settings import NDVI as _NDVI_SETTINGS
 from geofuse.settings import defaults as _settings_defaults
 from geofuse.vector_io import geometry_sha256
@@ -66,6 +67,23 @@ _STAT_HELP = (
     "statistic writes its own files (`_mean_ndvi`, `_max_ndvi`; median keeps "
     "the plain name), and one download per tile serves all of them."
 )
+_CHAINS_HELP = (
+    "One chain per line, `name: operation, operation, ...`, with exactly one "
+    "temporal step. Operations before it act on every scene, those after it "
+    "on the composite: `focal:<mean|max|min|median>:<radius_m>` (a statistic "
+    "over a circle, up to 5,000 m), `temporal:<median|mean|max>`, "
+    "`water_mask`. Each chain writes `<name>_<chain>_ndvi` files in place of "
+    "the temporal statistics. Leave empty to use the statistics."
+)
+_CHAINS_PLACEHOLDER = (
+    "f500: focal:mean:500, temporal:mean, water_mask\nmax: temporal:max"
+)
+# Date mode (as the widget keys spell it) -> its chain setting.
+_MODE_CHAINS = {
+    "ranges": "chains_ranges",
+    "specific": "chains_specific",
+    "col": "chains_column",
+}
 _SATELLITE_LABELS = {
     "auto": "Auto (Sentinel-2 from 2017-03-28)",
     "sentinel2": "Sentinel-2",
@@ -104,6 +122,14 @@ _PRESET_METHOD_KEYS = {
     "season_end_month": ("season_end_month", "ndvi_seas_end_{}"),
     "specific_window_days": ("window_days_specific", "ndvi_win_s_{}"),
 }
+# Preset chain setting -> (dataset config key, widget key pattern). The widget
+# holds a date mode's aggregation chains as text, one ``name: op, op`` per
+# line; the config holds them checked.
+_PRESET_CHAIN_KEYS = {
+    "chains_ranges": ("chains_ranges", "ndvi_chains_ranges_{}"),
+    "chains_specific": ("chains_specific", "ndvi_chains_specific_{}"),
+    "chains_column": ("chains_column", "ndvi_chains_col_{}"),
+}
 
 # Download settings and their defaults (``geofuse.settings``), seeded into
 # session state before the widgets render so a preset can set them too.
@@ -112,7 +138,8 @@ _SETTING_DEFAULTS = {key: _NDVI_DEFAULTS[name] for name, key in _PRESET_KEYS.ite
 # Per-dataset method settings; a new dataset starts from these, and a preset
 # rewrites them (``ndvi_method_defaults`` in session state).
 _METHOD_DEFAULTS = {
-    cfg_key: _NDVI_DEFAULTS[name] for name, (cfg_key, _) in _PRESET_METHOD_KEYS.items()
+    cfg_key: _NDVI_DEFAULTS[name]
+    for name, (cfg_key, _) in (_PRESET_METHOD_KEYS | _PRESET_CHAIN_KEYS).items()
 }
 
 
@@ -130,6 +157,23 @@ def _seed(key: str, value) -> None:
     """Give a widget its starting value through session state."""
     if key not in st.session_state:
         st.session_state[key] = value
+
+
+def _mode_chains(fname, cfg: dict, cfg_key: str, widget: str) -> list:
+    """A dataset's chains for one date mode: its editor's text once it has
+    one, else its config. Raises ``ChainError`` when the text does not check."""
+    text = st.session_state.get(widget.format(fname))
+    if text is None:
+        return list(cfg.get(cfg_key, []))
+    return parse_lines(text)
+
+
+def _dataset_chains(fname, cfg: dict, cfg_key: str, widget: str) -> list | None:
+    """:func:`_mode_chains`, ``None`` while the editor's text does not check."""
+    try:
+        return _mode_chains(fname, cfg, cfg_key, widget)
+    except ChainError:
+        return None
 
 
 def _preset_current() -> dict:
@@ -151,6 +195,11 @@ def _preset_current() -> dict:
             for fname, cfg in configs
         ]
         out[name] = values[0] if all(v == values[0] for v in values) else None
+    for name, (cfg_key, widget) in _PRESET_CHAIN_KEYS.items():
+        values = [
+            _dataset_chains(fname, cfg, cfg_key, widget) for fname, cfg in configs
+        ]
+        out[name] = values[0] if all(v == values[0] for v in values) else None
     return out
 
 
@@ -169,12 +218,20 @@ def _preset_apply(settings: dict) -> None:
         for fname, cfg in (s.get("ndvi_date_configs") or {}).items():
             cfg[cfg_key] = list(value) if isinstance(value, list) else value
             s[widget.format(fname)] = list(value) if isinstance(value, list) else value
+    for name, (cfg_key, widget) in _PRESET_CHAIN_KEYS.items():
+        if name not in settings:
+            continue
+        chains = list(settings[name])
+        defaults[cfg_key] = chains
+        for fname, cfg in (s.get("ndvi_date_configs") or {}).items():
+            cfg[cfg_key] = list(chains)
+            s[widget.format(fname)] = format_lines(chains)
 
 
 def _job_options(p: dict) -> dict:
     """Download options recorded on an NDVI job, with the defaults for jobs
     recorded before they existed."""
-    return {
+    options = {
         "temporal_reducers": list(p.get("temporal_reducers") or ["median"]),
         "satellite": str(p.get("satellite", "auto")),
         "coverage_rescue": bool(p.get("coverage_rescue", True)),
@@ -184,17 +241,24 @@ def _job_options(p: dict) -> dict:
         "substitute_2012": bool(p.get("substitute_2012", False)),
         "preset": p.get("preset"),
     }
+    if p.get("chains"):
+        options["chains"] = [dict(c) for c in p["chains"]]
+    return options
 
 
 def _job_options_lines(p: dict) -> list[str]:
     o = _job_options(p)
     stats = ", ".join(_STAT_LABELS.get(r, r) for r in o["temporal_reducers"])
+    made = f"**Temporal statistic:** {stats}"
+    if o.get("chains"):
+        names = ", ".join(c["name"] for c in o["chains"])
+        made = f"**Aggregation chains:** {names}"
 
     def onoff(flag: bool) -> str:
         return "on" if flag else "off"
 
     return [
-        f"**Temporal statistic:** {stats} · "
+        f"{made} · "
         f"**Satellite:** {_SATELLITE_LABELS.get(o['satellite'], o['satellite'])} · "
         f"**Reflectance:** "
         f"{_REFLECTANCE_LABELS.get(o['reflectance'], o['reflectance'])}",
@@ -205,18 +269,49 @@ def _job_options_lines(p: dict) -> list[str]:
     ]
 
 
-def _render_stat_select(cfg: dict, cfg_key: str, key: str) -> None:
-    """Temporal-statistic picker for one date mode of one dataset."""
+def _render_stat_select(fname: str, cfg: dict, mode: str) -> None:
+    """Temporal-statistic picker and aggregation-chain editor for one date
+    mode (``ranges`` / ``specific`` / ``col``) of one dataset. Chains, when
+    given, replace the statistics, so the picker is disabled meanwhile."""
+    cfg_key = "stats_column" if mode == "col" else f"stats_{mode}"
+    key = f"ndvi_stats_{mode}_{fname}"
+    chains_key, chains_widget = _PRESET_CHAIN_KEYS[_MODE_CHAINS[mode]]
+    text_key = chains_widget.format(fname)
     _seed(key, list(cfg.get(cfg_key, ["median"])))
+    _seed(text_key, format_lines(cfg.get(chains_key, [])))
+    try:
+        chains, error = parse_lines(st.session_state[text_key]), None
+    except ChainError as exc:
+        chains, error = [], str(exc)
     cfg[cfg_key] = st.multiselect(
         "Temporal statistic",
         list(TEMPORAL_REDUCERS),
         format_func=lambda r: _STAT_LABELS.get(r, r),
         key=key,
         help=_STAT_HELP,
+        disabled=bool(chains),
     )
-    if not cfg[cfg_key]:
-        st.warning("Select at least one temporal statistic.")
+    with st.popover("Aggregation chains"):
+        st.text_area(
+            "Aggregation chains",
+            key=text_key,
+            height=160,
+            placeholder=_CHAINS_PLACEHOLDER,
+            help=_CHAINS_HELP,
+        )
+        st.caption(
+            "The **Mask water** setting also masks every scene before each chain."
+        )
+    if error:
+        st.error(error)
+    elif chains:
+        cfg[chains_key] = chains
+        names = ", ".join(f"`{c['name']}`" for c in chains)
+        st.caption(f"Aggregation chains replace the temporal statistic: {names}.")
+    else:
+        cfg[chains_key] = []
+        if not cfg[cfg_key]:
+            st.warning("Select at least one temporal statistic.")
 
 
 def _ndvi_input_datasets() -> dict:
@@ -939,9 +1034,7 @@ def _render_ndvi_date_config() -> None:
                 # ── Date Range(s) ───────────────────
                 if use_ranges:
                     st.markdown("**Date Range(s)**")
-                    _render_stat_select(
-                        cfg, "stats_ranges", f"ndvi_stats_ranges_{fname}"
-                    )
+                    _render_stat_select(fname, cfg, "ranges")
                     remove_idx = None
                     for i, (s, e) in enumerate(cfg["ranges"]):
                         stored_s = st.session_state.get(f"ndvi_rs_{fname}_{i}", s)
@@ -1009,9 +1102,7 @@ def _render_ndvi_date_config() -> None:
                     if use_ranges:
                         st.divider()
                     st.markdown("**Specific Date(s)**")
-                    _render_stat_select(
-                        cfg, "stats_specific", f"ndvi_stats_specific_{fname}"
-                    )
+                    _render_stat_select(fname, cfg, "specific")
                     _seed(f"ndvi_win_s_{fname}", cfg.get("window_days_specific", 30))
                     cfg["window_days_specific"] = st.number_input(
                         "Composite window (± days)",
@@ -1056,7 +1147,7 @@ def _render_ndvi_date_config() -> None:
                     if use_ranges or use_specific:
                         st.divider()
                     st.markdown("**Attribute Column (per-year)**")
-                    _render_stat_select(cfg, "stats_column", f"ndvi_stats_col_{fname}")
+                    _render_stat_select(fname, cfg, "col")
                     attr_cols = [c for c in d["raw"].columns if c.lower() != "geometry"]
                     if attr_cols:
                         selected_col = st.selectbox(
@@ -1300,17 +1391,35 @@ def render(output_dir: str) -> None:
             # study-area location for silent-restart.
             ndvi_path_by_basename = {os.path.basename(p): p for p in ndvi_valid_paths}
 
-            def _options(fname: str, cfg: dict, mode_key: str, cfg_key: str) -> dict:
-                """Download options for one date mode of one dataset."""
+            def _options(
+                fname: str, cfg: dict, mode_key: str, cfg_key: str, label: str
+            ) -> dict | None:
+                """Download options for one date mode of one dataset; ``None``
+                (with the reason recorded) when it cannot run."""
                 stats = st.session_state.get(
                     f"ndvi_stats_{mode_key}_{fname}", cfg.get(cfg_key, ["median"])
                 )
-                return {
+                options = {
                     "temporal_reducers": list(stats),
                     "satellite": satellite,
                     "coverage_rescue": coverage_rescue,
                     **acquisition,
                 }
+                try:
+                    chains = _mode_chains(
+                        fname, cfg, *_PRESET_CHAIN_KEYS[_MODE_CHAINS[mode_key]]
+                    )
+                except ChainError as exc:
+                    validation_errors.append(f"{fname}: {label} — {exc}")
+                    return None
+                if chains:
+                    options["chains"] = chains
+                elif not stats:
+                    validation_errors.append(
+                        f"{fname}: {label} — select at least one temporal statistic."
+                    )
+                    return None
+                return options
 
             for unit in _ndvi_units():
                 fname = unit["key"]
@@ -1355,15 +1464,12 @@ def render(output_dir: str) -> None:
 
                 # --- Date Range jobs ---
                 if use_ranges:
-                    range_options = _options(fname, cfg, "ranges", "stats_ranges")
-                    if not range_options["temporal_reducers"]:
-                        validation_errors.append(
-                            f"{fname}: Date range(s) — select at least one "
-                            "temporal statistic."
-                        )
+                    range_options = _options(
+                        fname, cfg, "ranges", "stats_ranges", "Date range(s)"
+                    )
                     for i, (s_def, e_def) in enumerate(
                         cfg.get("ranges", [(date(2023, 6, 1), date(2023, 9, 30))])
-                        if range_options["temporal_reducers"]
+                        if range_options
                         else []
                     ):
                         start_d = st.session_state.get(f"ndvi_rs_{fname}_{i}", s_def)
@@ -1424,20 +1530,15 @@ def render(output_dir: str) -> None:
                 # --- Specific Date jobs ---
                 if use_specific:
                     specific_options = _options(
-                        fname, cfg, "specific", "stats_specific"
+                        fname, cfg, "specific", "stats_specific", "Specific date(s)"
                     )
-                    if not specific_options["temporal_reducers"]:
-                        validation_errors.append(
-                            f"{fname}: Specific date(s) — select at least one "
-                            "temporal statistic."
-                        )
                     window_days = st.session_state.get(
                         f"ndvi_win_s_{fname}",
                         cfg.get("window_days_specific", 30),
                     )
                     for i, d_def in enumerate(
                         cfg.get("specific_dates", [date(2023, 7, 15)])
-                        if specific_options["temporal_reducers"]
+                        if specific_options
                         else []
                     ):
                         target_date = st.session_state.get(
@@ -1493,7 +1594,9 @@ def render(output_dir: str) -> None:
 
                 # --- Attribute Column (per-year) job ---
                 if use_column:
-                    column_options = _options(fname, cfg, "col", "stats_column")
+                    column_options = _options(
+                        fname, cfg, "col", "stats_column", "Attribute column"
+                    )
                     date_col = st.session_state.get(f"ndvi_col_{fname}")
                     season_start = int(
                         st.session_state.get(
@@ -1513,12 +1616,7 @@ def render(output_dir: str) -> None:
                             f"{fname}: Season start month must be on or before "
                             "the end month."
                         )
-                    elif not column_options["temporal_reducers"]:
-                        validation_errors.append(
-                            f"{fname}: Attribute column — select at least one "
-                            "temporal statistic."
-                        )
-                    else:
+                    elif column_options is not None:
                         record = store.submit(
                             type="ndvi_column",
                             name=base_name,
@@ -1721,8 +1819,8 @@ def render(output_dir: str) -> None:
                 if not rendered_from_tif and ds.get("results") is not None:
                     pts = ds["results"]
                     if pts is not None and not pts.empty:
-                        l, btm, r, t = pts.total_bounds
-                        res_bounds.append([l, btm, r, t])
+                        left, btm, r, t = pts.total_bounds
+                        res_bounds.append([left, btm, r, t])
                         add_black_point_layer(
                             m_ndvi_result,
                             pts,
