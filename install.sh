@@ -1,18 +1,25 @@
 #!/bin/bash
+# GeoFuse installer for Linux and macOS.
+# Usage: ./install.sh [--yes] [--torch auto|cuda|cpu] [--env-name NAME]
+# The options are passed to scripts/setup_env.py.
 
-# Exit immediately if a command exits with a non-zero status.
-set -e
+set -euo pipefail
 
-# --- CONFIGURATION ---
 ENV_NAME="geofuse"
-PYTHON_VER="3.12.12"
+for ((i = 1; i <= $#; i++)); do
+    if [ "${!i}" = "--env-name" ]; then
+        j=$((i + 1))
+        ENV_NAME="${!j:-geofuse}"
+    fi
+done
+
+cd "$(dirname "$0")"
 
 echo "========================================================"
 echo "        GeoFuse Installer"
 echo "========================================================"
 
-# --- STEP 1: AUTO-DETECT CONDA ---
-CONDA_EXEC=""
+# --- STEP 1: FIND CONDA ---
 CONDA_ROOT=""
 PATHS=(
     "$HOME/miniforge3"
@@ -35,51 +42,48 @@ PATHS=(
     "/Applications/miniforge3"
 )
 
-for TEST_PATH in "${PATHS[@]}"; do
-    if [ -f "$TEST_PATH/bin/conda" ]; then
-        CONDA_ROOT="$TEST_PATH"
-        echo "[INFO] Found Conda at: $CONDA_ROOT"
-        break
-    fi
-done
-
-if [ -z "$CONDA_ROOT" ]; then
-    if command -v conda &> /dev/null; then
-        echo "[INFO] Found Conda in system PATH."
-        CONDA_EXEC="conda"
-        # Try to find CONDA_ROOT from conda info
-        CONDA_ROOT=$(conda info --base 2>/dev/null)
-    else
-        read -p "Conda installation not found. Please paste the path to your Conda folder: " CONDA_ROOT
-        if [ ! -f "$CONDA_ROOT/bin/conda" ]; then
-            echo "[ERROR] Conda executable not found at specified path. Exiting."
-            exit 1
-        fi
-        CONDA_EXEC="$CONDA_ROOT/bin/conda"
-    fi
+if [ -n "${CONDA_EXE:-}" ] && [ -x "$CONDA_EXE" ]; then
+    CONDA_ROOT="$(cd "$(dirname "$CONDA_EXE")/.." && pwd)"
+    echo "[INFO] Found Conda from CONDA_EXE: $CONDA_ROOT"
+elif command -v conda &> /dev/null; then
+    CONDA_ROOT="$(conda info --base 2>/dev/null)"
+    echo "[INFO] Found Conda on PATH: $CONDA_ROOT"
 else
-    CONDA_EXEC="$CONDA_ROOT/bin/conda"
+    for TEST_PATH in "${PATHS[@]}"; do
+        if [ -f "$TEST_PATH/bin/conda" ]; then
+            CONDA_ROOT="$TEST_PATH"
+            echo "[INFO] Found Conda at: $CONDA_ROOT"
+            break
+        fi
+    done
 fi
 
-# Activate base environment (suppress output)
-source "$CONDA_ROOT/etc/profile.d/conda.sh" 2>/dev/null || true
-conda activate base >/dev/null 2>&1 || true
-
-# --- STEP 2: CREATE LOGS DIRECTORY ---
-mkdir -p logs
-
-# --- STEP 3: RUN PYTHON SETUP SCRIPT (handles environment creation) ---
-if [ -f "scripts/setup_env.py" ]; then
-    python scripts/setup_env.py
-    if [ $? -ne 0 ]; then
-        echo "[ERROR] Setup script failed!"
+if [ -z "$CONDA_ROOT" ]; then
+    if [ ! -t 0 ]; then
+        echo "[ERROR] Conda not found. Install Miniforge, or put conda on PATH."
         exit 1
     fi
-else
-    echo "[ERROR] scripts/setup_env.py not found!"
+    read -r -p "Conda installation not found. Paste the path to your Conda folder: " CONDA_ROOT
+fi
+if [ ! -f "$CONDA_ROOT/etc/profile.d/conda.sh" ]; then
+    echo "[ERROR] No Conda installation at: $CONDA_ROOT"
     exit 1
 fi
 
+# Activate base so that conda, mamba and python resolve to this installation.
+# Activation scripts may read unset variables, so -u is off around them.
+set +u
+# shellcheck disable=SC1091
+source "$CONDA_ROOT/etc/profile.d/conda.sh"
+conda activate base
+set -u
+
+# --- STEP 2: CREATE THE ENVIRONMENT AND INSTALL ---
+mkdir -p logs
+if ! python scripts/setup_env.py "$@"; then
+    echo "[ERROR] Setup script failed. See logs/install.log."
+    exit 1
+fi
 
 echo ""
 echo "========================================================"
@@ -90,9 +94,7 @@ echo "   geofuse doctor"
 echo "   geofuse --help"
 echo "========================================================"
 
-# Only prompt for input if running interactively
+# Only wait for a key when run from a terminal
 if [ -t 0 ]; then
-    read -p "Press Enter to exit..."
+    read -r -p "Press Enter to exit..."
 fi
-
-exit 0

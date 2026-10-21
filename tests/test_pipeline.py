@@ -133,7 +133,10 @@ class TestPackageSmoke(unittest.TestCase):
             x = trial.suggest_float("x", -2.0, 2.0)
             return (x - 1.0) ** 2
 
-        study = optuna.create_study(direction="minimize")
+        # Seeded, so the five trials are the same on every run
+        study = optuna.create_study(
+            direction="minimize", sampler=optuna.samplers.TPESampler(seed=0)
+        )
         study.optimize(objective, n_trials=5)
         # Best x should be near 1.0; accept anything ≤ 1 as "working"
         self.assertLessEqual(study.best_value, 1.0)

@@ -1,54 +1,85 @@
 name: Installation & Test Suite
 
 on:
-  # Manual triggering only
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'install.sh'
+      - 'install.bat'
+      - 'scripts/setup_env.py'
+      - 'pyproject.toml'
+      - '.github/workflows/setup-tests.yml'
+  # Weekly, to catch upstream changes (yanked packages, retired wheels)
+  schedule:
+    - cron: '0 7 * * 1'
 
-# Opt into Node.js 24 for all actions before it becomes the forced default (June 2026)
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  MODEL_PATH: geofuse/model/best_model.pth
+  MODEL_DRIVE_ID: 1t7TC8mxQaFECt4jutdq_NMnWxdm6B-Nb
+  # Saved from Linux, restored on every OS (enableCrossOsArchive)
+  MODEL_CACHE_KEY: model-weights-resnet101-v2
 
 jobs:
   prepare-models:
     name: Download and Cache Models
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
       - name: Cache model weights
         id: cache-model
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
-          path: geofuse/model/best_model.pth
-          key: model-weights-resnet101-v1
+          path: ${{ env.MODEL_PATH }}
+          key: ${{ env.MODEL_CACHE_KEY }}
+          enableCrossOsArchive: true
 
       - name: Download model weights
         if: steps.cache-model.outputs.cache-hit != 'true'
         run: |
-          mkdir -p geofuse/model
-          echo "Downloading model weights..."
+          mkdir -p "$(dirname "$MODEL_PATH")"
           pip install gdown -q
-          gdown "1t7TC8mxQaFECt4jutdq_NMnWxdm6B-Nb" -O geofuse/model/best_model.pth
-          echo "Model downloaded successfully"
-          ls -lh geofuse/model/best_model.pth
+          for attempt in 1 2 3; do
+            gdown "$MODEL_DRIVE_ID" -O "$MODEL_PATH" && break
+            echo "Download attempt $attempt failed; retrying in 60 s"
+            sleep 60
+          done
+          test -s "$MODEL_PATH"
+          ls -lh "$MODEL_PATH"
 
   test-installation:
     name: Test on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     needs: prepare-models
+    timeout-minutes: 120
 
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          # The CPU build keeps the Linux runner within its disk space; Windows
+          # installs the CUDA build users get; macOS has only the one build.
+          - os: ubuntu-latest
+            torch: cpu
+          - os: windows-latest
+            torch: auto
+          - os: macos-latest
+            torch: auto
 
-    # Tell conda/mamba to store downloaded packages in the cached directory.
-    # PYTHONUTF8 forces UTF-8 stdout so Unicode chars in mamba progress output
-    # don't crash the installer on Windows (default console encoding is cp1252).
+    # conda/mamba keep downloaded packages in the cached directory. PYTHONUTF8
+    # forces UTF-8 stdout so mamba's progress output cannot crash the installer
+    # on Windows (default console encoding is cp1252).
     env:
       CONDA_PKGS_DIRS: ~/conda_pkgs_dir
+      PIP_CACHE_DIR: ~/pip_cache
       PYTHONUTF8: "1"
 
     defaults:
@@ -57,75 +88,37 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
-      # -----------------------------------------------------------------------
-      # Model weights
-      # -----------------------------------------------------------------------
-      - name: Restore model weights from cache
-        id: cache-model
-        uses: actions/cache/restore@v4
+      # ── Model weights ────────────────────────────────────────────────
+      - name: Restore model weights
+        uses: actions/cache/restore@v6
         with:
-          path: geofuse/model/best_model.pth
-          key: model-weights-resnet101-v1
+          path: ${{ env.MODEL_PATH }}
+          key: ${{ env.MODEL_CACHE_KEY }}
+          enableCrossOsArchive: true
+          fail-on-cache-miss: true
 
-      - name: Download model weights if not cached
-        if: steps.cache-model.outputs.cache-hit != 'true'
-        shell: bash
-        run: |
-          echo "Downloading model weights..."
-          mkdir -p geofuse/model
-          pip install gdown -q
-          gdown "1t7TC8mxQaFECt4jutdq_NMnWxdm6B-Nb" -O geofuse/model/best_model.pth
-
-      - name: Verify model exists
-        shell: bash
-        run: |
-          python - <<'EOF'
-          import os, sys
-          model_path = "geofuse/model/best_model.pth"
-          if os.path.exists(model_path):
-            size_mb = os.path.getsize(model_path) / (1024 * 1024)
-            print(f"[OK] Model found: {size_mb:.1f} MB")
-          else:
-            print(f"[ERROR] Model not found at {model_path}")
-            sys.exit(1)
-          EOF
-
-      # -----------------------------------------------------------------------
-      # Conda package cache
-      # Content-addressed key: changes when setup_env.py changes.
-      # restore-keys allows a partial hit (different setup_env.py version)
-      # so unchanged packages are still served from cache.
-      # CONDA_PKGS_DIRS (set above) directs conda/mamba to read/write here.
-      # -----------------------------------------------------------------------
+      # ── Package caches (keyed on the installer's pins) ───────────────
       - name: Cache conda packages
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/conda_pkgs_dir
           key: conda-pkgs-${{ runner.os }}-${{ hashFiles('scripts/setup_env.py') }}
           restore-keys: |
             conda-pkgs-${{ runner.os }}-
 
-      # -----------------------------------------------------------------------
-      # PyTorch Hub model cache (ResNet101 backbone, downloaded on first engine use)
-      # restore-keys allows reuse from a prior run even when key rotates.
-      # -----------------------------------------------------------------------
-      - name: Restore PyTorch Hub cache
-        uses: actions/cache/restore@v4
+      - name: Cache pip downloads
+        uses: actions/cache@v6
         with:
-          path: ~/.cache/torch/hub
-          key: torch-hub-${{ runner.os }}-v1
+          path: ~/pip_cache
+          key: pip-${{ runner.os }}-${{ matrix.torch }}-${{ hashFiles('scripts/setup_env.py') }}
           restore-keys: |
-            torch-hub-${{ runner.os }}-
+            pip-${{ runner.os }}-${{ matrix.torch }}-
 
-      # -----------------------------------------------------------------------
-      # Conda environment setup
-      # setup-miniconda with use-mamba:true already provides mamba — no
-      # separate "conda install mamba" step is needed.
-      # -----------------------------------------------------------------------
+      # ── Conda ────────────────────────────────────────────────────────
       - name: Set up Conda (Miniforge + mamba)
-        uses: conda-incubator/setup-miniconda@v3
+        uses: conda-incubator/setup-miniconda@v4
         with:
           miniforge-version: latest
           activate-environment: base
@@ -133,72 +126,57 @@ jobs:
           use-mamba: true
           conda-remove-defaults: true
 
-      - name: Configure conda to use package cache directory
-        run: conda config --add pkgs_dirs ~/conda_pkgs_dir
-
-      - name: Remove existing environment (if any)
-        run: conda env remove -n geofuse -y || true
-
-      # -----------------------------------------------------------------------
-      # Install
-      # -----------------------------------------------------------------------
-      - name: Make installer executable (Unix)
-        if: runner.os != 'Windows'
-        run: chmod +x install.sh
-
+      # ── Install ──────────────────────────────────────────────────────
       - name: Run installer (Unix)
         if: runner.os != 'Windows'
-        run: ./install.sh
+        run: bash install.sh --yes --torch ${{ matrix.torch }}
 
       - name: Run installer (Windows)
         if: runner.os == 'Windows'
         shell: cmd /C CALL {0}
-        run: install.bat
+        run: install.bat --yes --torch ${{ matrix.torch }}
 
-      # -----------------------------------------------------------------------
-      # Tests
-      # -----------------------------------------------------------------------
-      - name: Run Logic Tests (Offline)
-        run: conda run -n geofuse python tests/test_pipeline.py
+      # ── Tests ────────────────────────────────────────────────────────
+      - name: Readiness check (offline)
+        run: |
+          conda activate geofuse
+          geofuse doctor --offline || echo "::notice::geofuse doctor reports items not ready (expected without sign-ins)"
 
-      - name: Run Memory Stability Test (Short)
-        run: conda run -n geofuse python tests/test_memory_stability.py --iterations 20
-        continue-on-error: true
+      - name: Run logic tests (offline)
+        run: |
+          conda activate geofuse
+          python tests/test_pipeline.py
 
-      # -----------------------------------------------------------------------
-      # Save PyTorch Hub cache after tests (populated during engine init)
-      # -----------------------------------------------------------------------
-      - name: Save PyTorch Hub cache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: ~/.cache/torch/hub
-          key: torch-hub-${{ runner.os }}-v1
+      - name: Run unit tests (settings, plans, Bayesian index)
+        run: |
+          conda activate geofuse
+          python -m pytest -q -p no:cacheprovider tests/test_settings.py tests/test_plans.py tests/test_bayesian_index.py
 
-      # -----------------------------------------------------------------------
-      # Diagnostics & artefacts
-      # -----------------------------------------------------------------------
+      - name: Run memory stability test (short)
+        run: |
+          conda activate geofuse
+          python tests/test_memory_stability.py --iterations 20 \
+            || echo "::warning::Memory stability test failed on ${{ matrix.os }}"
+
+      # ── Diagnostics & artefacts ──────────────────────────────────────
       - name: Show installation log on failure
         if: failure()
         run: |
           if [ -f "logs/install.log" ]; then
-            echo "=== Last 80 lines of installation log ==="
-            tail -n 80 logs/install.log
+            echo "=== Last 120 lines of installation log ==="
+            tail -n 120 logs/install.log
           else
             echo "No installation log found"
           fi
 
       - name: Upload test artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-results-${{ matrix.os }}
           path: |
             tests/output/**/*.png
             tests/output/**/*.geojson
             logs/install.log
-          retention-days: 7
-
-      - name: Cleanup environment
-        if: always()
-        run: conda env remove -n geofuse -y || true
+          if-no-files-found: ignore
+          retention-days: 30
