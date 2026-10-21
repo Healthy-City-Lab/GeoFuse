@@ -49,9 +49,9 @@ from geofuse.jobs import (
 from geofuse.jobs.fusion_outputs import (
     _STANDALONE_CHANNEL_LABELS,
     _build_fusion_ledger,
-    _compare_cgi_vs_standalone,
     _comparator_family,
     _comparator_report,
+    _compare_cgi_vs_standalone,
     _direction_sign,
     _exposure_splits,
     _fusion_stage_key,
@@ -1190,7 +1190,7 @@ def _paired_family_headline(family: list[dict], best_channel: str | None) -> dic
     from .. import statistical_testing as _stats_mod
 
     holm = _stats_mod.holm_bonferroni([d.get("p_value") for d in family])
-    for d, hp in zip(family, holm):
+    for d, hp in zip(family, holm, strict=True):
         d["p_value_holm"] = None if hp != hp else float(hp)
         d["family_size"] = len(family)
 

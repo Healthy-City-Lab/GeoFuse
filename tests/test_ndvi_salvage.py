@@ -112,7 +112,8 @@ class SalvageTests(unittest.TestCase):
                 cols, rows = np.meshgrid(np.arange(w), np.arange(h))
                 X, Y = t.c + (cols + 0.5) * t.a, t.f + (rows + 0.5) * t.e
                 inside = shapely.contains_xy(poly, X, Y)
-                grids.append(dict(zip(zip(X[inside], Y[inside]), arr[inside])))
+                cells = zip(X[inside], Y[inside], strict=True)
+                grids.append(dict(zip(cells, arr[inside], strict=True)))
             self.assertEqual(set(grids[0]), set(grids[1]), chain)
             a = np.array([grids[0][k] for k in sorted(grids[0])])
             b = np.array([grids[1][k] for k in sorted(grids[0])])
@@ -174,14 +175,14 @@ class SalvageTests(unittest.TestCase):
         self.run_area(big, "big")
         shutil.rmtree(os.path.join(self.cache, ndvi.RECORDS_DIR))
         shutil.rmtree(os.path.join(self.cache, ndvi.AREAS_DIR))
-        args = dict(
-            cloud_max=10,
-            resolution=RES,
-            max_tile_size_km=0.4,
-            satellite="landsat",
-            crs_override=CRS_OVERRIDE,
-            chains=CHAINS,
-        )
+        args = {
+            "cloud_max": 10,
+            "resolution": RES,
+            "max_tile_size_km": 0.4,
+            "satellite": "landsat",
+            "crs_override": CRS_OVERRIDE,
+            "chains": CHAINS,
+        }
         eng = self.engines[0]
         self.assertEqual(
             eng.record_workspaces(big, "2015-06-01", "2015-09-30", "x", **args),

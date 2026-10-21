@@ -547,7 +547,6 @@ class Supervisor:
         states = [e.get("status", {}).get("status") for e in self.jobs.values()]
         return 0 if all(s == "completed" for s in states) else 1
 
-
     def _wind_down(self) -> None:
         """A finished or stopped run: cancel what still runs and record it."""
         for job_id, entry in self.jobs.items():

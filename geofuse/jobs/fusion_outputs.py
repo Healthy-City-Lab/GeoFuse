@@ -1291,7 +1291,7 @@ def _comparator_family(comparators: dict[str, dict]) -> list[dict]:
     rows = [c["paired"] for c in comparators.values() if c.get("paired")]
     primary = [r for r in rows if r.get("primary")]
     holm = _stats.holm_bonferroni([r.get("p_value") for r in primary])
-    for r, hp in zip(primary, holm):
+    for r, hp in zip(primary, holm, strict=True):
         r["p_value_holm"] = None if hp != hp else float(hp)
         r["family_size"] = len(primary)
         r["descriptive"] = False

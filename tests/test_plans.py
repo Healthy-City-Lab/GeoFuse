@@ -159,14 +159,14 @@ class ExpandTests(_Case):
         self.assertEqual(fusion.options["layer"], "layer1")
 
     def test_the_objective_defaults_to_r2_and_is_checked_for_size(self):
-        base = f'''
+        base = f"""
             output_dir = {self.dir!r}
             [[fusion]]
             target = "cohort.gpkg"
             outcomes = ["cesd"]
             ndvi = "ndvi_2015.tif"
             gvi = "gvi.gpkg"
-            '''
+            """
         (spec,) = self.expand(base)
         self.assertEqual(spec.settings["objective_metric"], "r2")
         self.assertEqual(spec.notes, [])

@@ -2502,9 +2502,7 @@ class MetricFusionEngine:
         (:meth:`_apply_coverage_gate`). Returns ``True`` on completion,
         ``False`` if cancelled.
         """
-        done = self._build_aggregations(
-            progress_callback, cancel_callback, max_workers
-        )
+        done = self._build_aggregations(progress_callback, cancel_callback, max_workers)
         if done:
             self._apply_coverage_gate()
         return done
@@ -3070,7 +3068,11 @@ class MetricFusionEngine:
         total = np.bincount(codes, weights=w, minlength=n_ent)
         kept = np.bincount(codes[keep], weights=w[keep], minlength=n_ent)
         self._entity_coverage_share = dict(
-            zip(uniq.tolist(), (kept / np.where(total > 0, total, 1.0)).tolist())
+            zip(
+                uniq.tolist(),
+                (kept / np.where(total > 0, total, 1.0)).tolist(),
+                strict=True,
+            )
         )
         self._coverage_keep_index = tg.index[keep]
         self._coverage_report = {
@@ -3675,7 +3677,7 @@ class MetricFusionEngine:
             cols = [
                 (ci * len(rungs) + rungs.index(int(r))) * len(stats)
                 + list(stats).index(st)
-                for ci, (r, st) in zip(channel_index, post.picked)
+                for ci, (r, st) in zip(channel_index, post.picked, strict=True)
             ]
             term_sd = (
                 design.columns(cols)[1]
@@ -3894,7 +3896,7 @@ class MetricFusionEngine:
         if total <= 0:
             vals[:] = 1.0 / len(vals)
             total = 1.0
-        for key, v in zip(keys, vals * 100.0 / total):
+        for key, v in zip(keys, vals * 100.0 / total, strict=True):
             params[key] = round(float(v), 4)
         return params
 
@@ -4185,6 +4187,7 @@ class MetricFusionEngine:
                 zip(
                     keep_pos.tolist(),
                     (ent.geometry.area.to_numpy() / 1_000_000.0).tolist(),
+                    strict=True,
                 )
             )
 
@@ -6297,9 +6300,7 @@ class MetricFusionEngine:
                     "polygon_id": uniq,
                     "target": result_df["target"].to_numpy()[first],
                     "composite": _mean("composite"),
-                    "n_samples": np.bincount(
-                        codes[np.isfinite(comp)], minlength=n_ent
-                    ),
+                    "n_samples": np.bincount(codes[np.isfinite(comp)], minlength=n_ent),
                     **{ch: _mean(ch) for ch in all_blocks},
                 }
             )
@@ -6645,9 +6646,11 @@ class MetricFusionEngine:
             # missing outcome or exposure and any non-finite control row.
             used = ~(np.isnan(t_arr) | np.isnan(c_arr))
             if cov is not None:
-                used &= np.isfinite(np.asarray(cov, dtype=np.float64)).reshape(
-                    len(t_arr), -1
-                ).all(axis=1)
+                used &= (
+                    np.isfinite(np.asarray(cov, dtype=np.float64))
+                    .reshape(len(t_arr), -1)
+                    .all(axis=1)
+                )
             out["n"] = int(used.sum())
             return out
 
@@ -7070,7 +7073,7 @@ class MetricFusionEngine:
         (:func:`exposure_response.split_inference`), the only rows that chose
         neither composite.
         """
-        kw = dict(n_bootstrap=n_bootstrap, ci_level=ci_level, seed=seed)
+        kw = {"n_bootstrap": n_bootstrap, "ci_level": ci_level, "seed": seed}
         args = (cgi_params, standalone_params, standalone_channel, metric)
         whole = self._paired_difference_on(*args, bootstrap=False, **kw)
         if whole is None:
@@ -8177,7 +8180,7 @@ class MetricFusionEngine:
         out: dict = {}
         if not self.negative_control_columns or self.is_panel:
             return out
-        loops = dict(reps=0, shuffles=0, gain_splits=0, null_runs=0)
+        loops = {"reps": 0, "shuffles": 0, "gain_splits": 0, "null_runs": 0}
         saved_formula = self.cgi_formula
         for name in self.negative_control_columns:
             try:

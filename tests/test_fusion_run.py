@@ -102,7 +102,7 @@ def _write_study(folder: str, n: int = 160) -> None:
             "noise": rng.normal(size=n),
             "patchy": patchy,
         },
-        geometry=[Point(a, b) for a, b in zip(xs, ys)],
+        geometry=[Point(a, b) for a, b in zip(xs, ys, strict=True)],
         crs="EPSG:4326",
     ).to_file(os.path.join(folder, "cohort.gpkg"), driver="GPKG")
     pts = [

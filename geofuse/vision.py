@@ -138,7 +138,7 @@ class DeepLabSegmenter:
             raise
         except Exception as e:
             print(f"[FATAL] Could not load network module from: {dl_core_path}")
-            raise ImportError(f"DeepLab Import Failed: {e}")
+            raise ImportError(f"DeepLab Import Failed: {e}") from e
 
         # 5. Load Weights
         try:

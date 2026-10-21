@@ -86,8 +86,9 @@ class TestAutomaticBlockSize(unittest.TestCase):
 
 class TestSplitReportsItsBlocks(unittest.TestCase):
     def test_too_few_blocks_are_reported_and_recorded(self):
-        from geofuse.fusion import MetricFusionEngine
         from test_fusion_run import _write_study
+
+        from geofuse.fusion import MetricFusionEngine
 
         folder = tempfile.mkdtemp(prefix="geofuse-blocks-")
         _write_study(folder)

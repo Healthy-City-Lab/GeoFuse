@@ -112,9 +112,7 @@ class TestRasterTargetExtent(unittest.TestCase):
         extent = eng.load_target()
         self.assertEqual(extent.crs.to_epsg(), 4326)
         bounds = extent.to_crs("EPSG:32617").total_bounds
-        np.testing.assert_allclose(
-            bounds, [498500, 4797500, 502500, 4801500], atol=1.0
-        )
+        np.testing.assert_allclose(bounds, [498500, 4797500, 502500, 4801500], atol=1.0)
 
 
 class TestDispersionCheck(unittest.TestCase):

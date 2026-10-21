@@ -1980,7 +1980,7 @@ def _render_study_details_panel(
                 "again."
             ),
         )
-        clear_preaggr_cache = st.checkbox(
+        st.checkbox(
             "Clear this target's pre-aggregation cache first",
             key="fusion_clear_preaggr",
             help=(
@@ -2604,9 +2604,7 @@ def _render_comparators(results_view: dict, metric_name: str) -> None:
     failed = [n for n, c in comparators.items() if c.get("status") != "ok"]
     if failed:
         st.caption(
-            "Not scored: "
-            + ", ".join(f"`{n}`" for n in failed)
-            + " (see the job log)."
+            "Not scored: " + ", ".join(f"`{n}`" for n in failed) + " (see the job log)."
         )
     flagged = [
         n
@@ -3232,7 +3230,7 @@ def _render_composite_map_viewer(results_view: dict, engine) -> None:
 
     # ── Composite panels (shared colorbar at [0, 1]) ────────────
     last_im = None
-    for label, arr, transform, crs in composites:
+    for label, arr, transform, _crs in composites:
         ax = flat_axes[panel_idx]
         panel_idx += 1
         try:
@@ -3298,9 +3296,7 @@ def _weight_key_label(key: str) -> str:
     if key.endswith("_weight"):
         ch = key.removesuffix("_weight")
         return _CHANNEL_DISPLAY.get(ch, ch.upper())
-    tokens = [
-        {"ter": "terrain"}.get(t, t) for t in key.removeprefix("w_").split("_")
-    ]
+    tokens = [{"ter": "terrain"}.get(t, t) for t in key.removeprefix("w_").split("_")]
     return " × ".join(_CHANNEL_DISPLAY.get(t, t.upper()) for t in tokens)
 
 
@@ -4471,7 +4467,7 @@ def _render_study_detail(
 
         st.markdown("**Aggregators**")
         agg_cols = st.columns(max(len(channels), 1))
-        for col, ch in zip(agg_cols, channels):
+        for col, ch in zip(agg_cols, channels, strict=False):
             with col:
                 st.metric(
                     _CHANNEL_DISPLAY.get(ch, ch.upper()),

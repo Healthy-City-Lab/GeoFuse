@@ -28,7 +28,10 @@ S = 10.0
 
 def _cells(geoms, **kw):
     ent, row, col, w = exposure.cell_weights(geoms, S, **kw)
-    return {(int(e), int(r), int(c)): float(x) for e, r, c, x in zip(ent, row, col, w)}
+    return {
+        (int(e), int(r), int(c)): float(x)
+        for e, r, c, x in zip(ent, row, col, w, strict=True)
+    }
 
 
 class TestPoints(unittest.TestCase):

@@ -140,6 +140,7 @@ def _progress_summary(stats: dict, done: int, elapsed: float, throttled: int) ->
         f"{done / max(elapsed, 1e-9):.1f} points/s, {throttled} throttle event(s)"
     )
 
+
 # Search radius (metres) for find_panorama_async around each grid point.
 _SEARCH_RADIUS_M = 50.0
 # Seconds between the INFO summaries of a run's progress. The lines about
@@ -759,9 +760,7 @@ class GVIEngine:
             val_veg = metrics.get("GVI_Vegetation", 0.0)
             val_ter = metrics.get("GVI_Terrain", 0.0)
             pano_cache[pid] = {"veg": val_veg, "ter": val_ter}
-            self._point_log(
-                f"  GVI {pid[:12]}… → veg={val_veg:.3f}  ter={val_ter:.3f}"
-            )
+            self._point_log(f"  GVI {pid[:12]}… → veg={val_veg:.3f}  ter={val_ter:.3f}")
             if save_panos or save_masks:
                 await loop.run_in_executor(
                     getattr(self, "_prep_pool", None),

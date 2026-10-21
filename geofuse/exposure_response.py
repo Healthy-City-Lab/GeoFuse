@@ -427,7 +427,6 @@ def moderation_terms(
 
     columns: list[np.ndarray] = [np.ones(n), g]
     names: list[str] = ["intercept", "greenery"]
-    products: list[tuple[str, float]] = []
     levels: list[float] = []
 
     if categorical:
@@ -764,9 +763,7 @@ def split_inference(whole, test):
             out[k] = t[k]
         if "std_error" in out or "std_err" in out:
             se = t.get("std_error", t.get("std_err"))
-            out["test_estimate"] = next(
-                (t[k] for k in _ESTIMATE_KEYS if k in t), None
-            )
+            out["test_estimate"] = next((t[k] for k in _ESTIMATE_KEYS if k in t), None)
             out["mde"] = (
                 MDE_SE_MULTIPLE * float(se)
                 if se is not None and np.isfinite(se)

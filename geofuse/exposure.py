@@ -235,7 +235,7 @@ def cell_weights(
                 reach,
             )
         )
-    for part, own, k in zip(parts[~pts], owner[~pts], kind[~pts]):
+    for part, own, k in zip(parts[~pts], owner[~pts], kind[~pts], strict=True):
         handler = _polygon_cells if k == 3 else _line_cells
         got = handler(part, own, s, reach)
         if got is not None:
@@ -244,7 +244,7 @@ def cell_weights(
         empty = np.zeros(0, dtype=np.int64)
         return empty, empty, empty, np.zeros(0, dtype=np.float32)
 
-    ent, rows, cols, d = (np.concatenate(c) for c in zip(*chunks))
+    ent, rows, cols, d = (np.concatenate(c) for c in zip(*chunks, strict=True))
     w = kernel_weights(d, kernel, radius_m, plateau_m, sigma_m)
     order = np.lexsort((cols, rows, ent))
     ent, rows, cols, w = ent[order], rows[order], cols[order], w[order]

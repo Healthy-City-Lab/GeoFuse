@@ -1337,7 +1337,7 @@ class TestPanelPosterior(unittest.TestCase):
         E += 0.1 * rng.normal(size=E.shape)
         y = np.repeat(rng.normal(size=n_ent), waves) * 2.0 + rng.normal(size=len(ent))
         y = (y - y.mean()) / y.std()
-        kw = dict(form="linear", draws=200, warmup=200, chains=1, seed=1)
+        kw = {"form": "linear", "draws": 200, "warmup": 200, "chains": 1, "seed": 1}
         plain = bi.fit(E, y, **kw).get_samples()
         panel = bi.fit(E, y, entities=ent, **kw).get_samples()
         self.assertIn("sigma_u", panel)
@@ -1353,7 +1353,7 @@ class TestPanelPosterior(unittest.TestCase):
         E = rng.normal(size=(n, 2))
         y = 0.3 * E[:, 0] + rng.normal(size=n)
         y = (y - y.mean()) / y.std()
-        kw = dict(form="linear", draws=800, warmup=600, chains=2, seed=1)
+        kw = {"form": "linear", "draws": 800, "warmup": 600, "chains": 2, "seed": 1}
         plain = bi.fit(E, y, **kw)
         with self.assertLogs("geofuse.bayesian_index", "WARNING"):
             single = bi.fit(E, y, entities=np.arange(n).astype(str), **kw)
@@ -1441,7 +1441,7 @@ def _linear_grid(n, seed=1, effect=0.15):
     return E, (y - y.mean()) / y.std()
 
 
-_GRID = dict(radii=[100, 200, 300, 400], stats=("a", "b", "c"))
+_GRID = {"radii": [100, 200, 300, 400], "stats": ("a", "b", "c")}
 
 
 class TestCrossProductLikelihood(unittest.TestCase):
@@ -1474,7 +1474,7 @@ class TestCrossProductLikelihood(unittest.TestCase):
     def test_fixed_columns_too(self):
         E, y = _linear_grid(3000)
         X = E[:, :, 1, 0]
-        kw = dict(draws=400, warmup=400, chains=2, seed=3)
+        kw = {"draws": 400, "warmup": 400, "chains": 2, "seed": 3}
         rows = bi.fit(X, y, likelihood="rows", **kw).get_samples()
         cross = bi.fit(X, y, **kw).get_samples()
         for key in ("beta", "w", "sigma"):

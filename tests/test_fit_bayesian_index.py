@@ -190,18 +190,18 @@ class TestLinearRunRecordsRawWeights(unittest.TestCase):
         cells = [(list(radii).index(r), stats.index(c)) for r, c in post["picked"]]
         raw = {
             ch: X[:, i, ri, si]
-            for i, (ch, (ri, si)) in enumerate(zip(("ndvi", "gvi"), cells))
+            for i, (ch, (ri, si)) in enumerate(zip(("ndvi", "gvi"), cells, strict=True))
         }
         fitted = sum(
             w * Xr[:, i, ri, si]
-            for i, (w, (ri, si)) in enumerate(zip(post["weight_mean"], cells))
+            for i, (w, (ri, si)) in enumerate(
+                zip(post["weight_mean"], cells, strict=True)
+            )
         )
         comp = cgi_formulas.compute_cgi("weighted_average_gvi", self.params, raw)
         q, _ = bayesian_index.covariate_basis(static["cov"], len(comp))
         comp_r = comp - q @ (q.T @ comp)
-        self.assertAlmostEqual(
-            float(np.corrcoef(comp_r, fitted)[0, 1]), 1.0, places=6
-        )
+        self.assertAlmostEqual(float(np.corrcoef(comp_r, fitted)[0, 1]), 1.0, places=6)
 
 
 class TestSynergyRunRecordsRawWeights(unittest.TestCase):
@@ -252,9 +252,7 @@ class TestSynergyRunRecordsRawWeights(unittest.TestCase):
         raw = {"ndvi": flat[:, cols[0]], "gvi": flat[:, cols[1]]}
         comp = cgi_formulas.compute_cgi("synergy_gm_gvi", self.params, raw)
         comp_r = comp - design.basis @ (design.basis.T @ comp)
-        self.assertAlmostEqual(
-            float(np.corrcoef(comp_r, fitted)[0, 1]), 1.0, places=6
-        )
+        self.assertAlmostEqual(float(np.corrcoef(comp_r, fitted)[0, 1]), 1.0, places=6)
 
 
 def _retune_stub(n=600, seed=3):

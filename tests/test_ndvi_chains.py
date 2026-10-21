@@ -52,7 +52,10 @@ WINDOW = {"start": "2015-06-01", "end": "2015-09-30", "satellite": "landsat"}
 class GrammarTests(unittest.TestCase):
     def test_tables_and_lines_check_to_one_spelling(self):
         tables = [
-            {"name": "a", "steps": [" Focal:MEAN:500.0 ", "temporal:mean", "water_mask"]},
+            {
+                "name": "a",
+                "steps": [" Focal:MEAN:500.0 ", "temporal:mean", "water_mask"],
+            },
             {"name": "b_2", "steps": ["temporal:max"]},
         ]
         lines = ["a: focal:mean:500, temporal:mean, water_mask", "b_2: temporal:max"]
@@ -205,7 +208,10 @@ class EngineChainTests(_Case):
         np.testing.assert_allclose(scenes, expected, rtol=1e-6)
 
         composite, _, _ = self.raster("site_composite")
-        temporal = lambda X, Y: np.nanmean(np.stack([A(X, Y), B(X, Y)]), axis=0)  # noqa: E731
+
+        def temporal(X, Y):
+            return np.nanmean(np.stack([A(X, Y), B(X, Y)]), axis=0)
+
         expected = focal(temporal, X, Y, RADIUS, RES)
         np.testing.assert_allclose(
             composite, np.where(np.isnan(expected), -9999.0, expected), rtol=1e-6

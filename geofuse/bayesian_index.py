@@ -382,9 +382,7 @@ class SynergyDesign:
     basis: np.ndarray
 
     @classmethod
-    def build(
-        cls, cells, covariates=None, rows=None, channels=None
-    ) -> "SynergyDesign":
+    def build(cls, cells, covariates=None, rows=None, channels=None) -> SynergyDesign:
         """From ``(n_cells, channel, radius, stat)`` raw values.
 
         ``rows`` is ``(row_cell, row_entity, row_weight)``; without it each
@@ -608,8 +606,7 @@ def sweep(
         mm.flush()
         del mm
         tasks = [
-            (path, flat.shape, combos, y, seed + s, frac, groups)
-            for s in range(splits)
+            (path, flat.shape, combos, y, seed + s, frac, groups) for s in range(splits)
         ]
         n_workers = workers or parallel.process_worker_count(len(tasks))
         surface = np.array(_map(_sweep_split, tasks, n_workers, cancel_check))
@@ -670,7 +667,7 @@ def sweep(
     # same selection splits: an interaction can favour other cells than the
     # main terms alone.
     candidates = eligible_forms(forms, len(channels), design is not None)
-    pick = {f: combos[best] for f in candidates}
+    pick = dict.fromkeys(candidates, combos[best])
     selection = {f: float(mean[best]) for f in candidates}
     if "synergy" in candidates:
         short = np.argsort(-mean)[: max(1, int(rescore_top))]
@@ -713,7 +710,7 @@ def sweep(
             chosen_form = form
     picked = _decode(pick[chosen_form], n_radii, n_stats, radii, stats)
     edge = {int(radii[0]), int(radii[-1])}
-    boundary = tuple(c for (r, _), c in zip(picked, channels) if r in edge)
+    boundary = tuple(c for (r, _), c in zip(picked, channels, strict=True) if r in edge)
 
     return SweepResult(
         channels=tuple(channels),
@@ -822,9 +819,7 @@ def eligible_forms(forms, n_channels: int, has_terms: bool = True) -> tuple[str,
     cell values its terms are built from (``has_terms``); otherwise the study
     is linear.
     """
-    out = tuple(
-        f for f in forms if f == "linear" or (n_channels > 1 and has_terms)
-    )
+    out = tuple(f for f in forms if f == "linear" or (n_channels > 1 and has_terms))
     return out or ("linear",)
 
 
@@ -2216,7 +2211,7 @@ def _permuted(y, seed: int, entities=None, waves=None) -> np.ndarray:
         by_pattern.setdefault(tuple(wave[rows]), []).append(b)
     out = y.copy()
     for members in by_pattern.values():
-        for dst, src in zip(members, rng.permutation(members)):
+        for dst, src in zip(members, rng.permutation(members), strict=True):
             out[blocks[dst]] = y[blocks[src]]
     return out
 

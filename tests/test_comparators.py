@@ -30,10 +30,10 @@ for _p in (os.path.dirname(os.path.abspath(__file__)), ROOT):
 
 import geopandas as gpd
 import numpy as np
+from test_fusion_run import _write_study
 
 from geofuse.fusion import MetricFusionEngine, comparator_mode
 from geofuse.jobs.fusion_outputs import _comparator_family
-from test_fusion_run import _write_study
 
 PARAMS = {
     "veg_weight": 30,
@@ -140,7 +140,12 @@ class TestComparatorScoring(unittest.TestCase):
             b, mode, lambda: b.evaluate_on_test(params=_cmp("cgi_copy"), metric=METRIC)
         )
         self.assertAlmostEqual(cmp["test_score"], cgi["test_score"], places=5)
-        ci_kw = dict(n_bootstrap=200, ci_level=0.95, method="percentile", seed=42)
+        ci_kw = {
+            "n_bootstrap": 200,
+            "ci_level": 0.95,
+            "method": "percentile",
+            "seed": 42,
+        }
         cgi_ci = b.bootstrap_test_score_ci(dict(PARAMS), METRIC, **ci_kw)
         cmp_ci = _as(
             b,
@@ -149,7 +154,7 @@ class TestComparatorScoring(unittest.TestCase):
         )
         self.assertAlmostEqual(cmp_ci["lower"], cgi_ci["lower"], places=5)
         self.assertAlmostEqual(cmp_ci["upper"], cgi_ci["upper"], places=5)
-        eff_kw = dict(n_bootstrap=100, n_perm=99, seed=42)
+        eff_kw = {"n_bootstrap": 100, "n_perm": 99, "seed": 42}
         cgi_p = b.evaluate_effects(dict(PARAMS), METRIC, **eff_kw)["test"]["p_value"]
         cmp_p = _as(
             b,

@@ -159,9 +159,7 @@ def _write_memmap(arr) -> str:
 
 def _replicate(task) -> dict:
     """One plasmode replicate: simulate, prep, sweep, grid posterior, score."""
-    x_path, x_shape, cov_path, cov_shape, z, gamma, truth, pr2, seed, cfg, design = (
-        task
-    )
+    x_path, x_shape, cov_path, cov_shape, z, gamma, truth, pr2, seed, cfg, design = task
     X = np.asarray(np.memmap(x_path, dtype=np.float64, mode="r", shape=x_shape))
     cov = (
         None

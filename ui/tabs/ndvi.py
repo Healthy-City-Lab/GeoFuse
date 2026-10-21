@@ -1819,8 +1819,8 @@ def render(output_dir: str) -> None:
                 if not rendered_from_tif and ds.get("results") is not None:
                     pts = ds["results"]
                     if pts is not None and not pts.empty:
-                        l, btm, r, t = pts.total_bounds
-                        res_bounds.append([l, btm, r, t])
+                        left, btm, r, t = pts.total_bounds
+                        res_bounds.append([left, btm, r, t])
                         add_black_point_layer(
                             m_ndvi_result,
                             pts,

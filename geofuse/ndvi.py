@@ -666,8 +666,11 @@ def _output_chains(
             )
             for c in user_chains
         }
-        return reducers, user_chains, chain_steps, output_stems(
-            output_name, chains=user_chains
+        return (
+            reducers,
+            user_chains,
+            chain_steps,
+            output_stems(output_name, chains=user_chains),
         )
     chain_steps = {r: statistic_chain(r, water_mask) for r in reducers}
     return reducers, user_chains, chain_steps, output_stems(output_name, reducers)
@@ -2840,7 +2843,7 @@ class NDVIEngine:
         # surface exactly which areas are NaN gaps in the mosaic.
         failed_tile_refs: dict[str, list[dict]] = {r: [] for r in reducers}
         # Tiles whose outputs Earth Engine took in several requests, per output.
-        n_split: dict[str, int] = {r: 0 for r in reducers}
+        n_split: dict[str, int] = dict.fromkeys(reducers, 0)
 
         # Parallel tile downloads. Each worker handles one tile end-to-end
         # (Earth Engine export → compact cache tiles). The ThreadPoolExecutor

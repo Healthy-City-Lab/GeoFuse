@@ -351,9 +351,7 @@ def _synergy_channel_active(params: dict) -> dict[str, bool]:
 
 def synergy_combos(n: int) -> list[tuple[int, ...]]:
     """Channel index sets of the interaction terms: every pair, then the triple."""
-    return [
-        c for k in range(2, n + 1) for c in itertools.combinations(range(n), k)
-    ]
+    return [c for k in range(2, n + 1) for c in itertools.combinations(range(n), k)]
 
 
 def synergy_terms(values, xp=np) -> list:
@@ -389,7 +387,7 @@ def _geomean_synergy(chans: tuple[str, ...], keys: tuple[str, ...]):
         if total <= 0:
             return np.full_like(terms[0], np.nan, dtype=dt)
         out = np.zeros_like(terms[0], dtype=dt)
-        for wi, t in zip(w, terms):
+        for wi, t in zip(w, terms, strict=True):
             if wi:
                 out = out + dt.type(wi / total) * t
         return out
@@ -397,7 +395,9 @@ def _geomean_synergy(chans: tuple[str, ...], keys: tuple[str, ...]):
     def active(params: dict) -> dict[str, bool]:
         return {
             c: any(
-                float(params.get(k, 0)) > 0 for k, s in zip(keys, involves) if i in s
+                float(params.get(k, 0)) > 0
+                for k, s in zip(keys, involves, strict=True)
+                if i in s
             )
             for i, c in enumerate(chans)
         }
@@ -548,7 +548,7 @@ def _register_geomean_synergy() -> None:
             compute=compute,
             channel_active=active,
         )
-        _CHANNEL_MAIN_KEY[name] = dict(zip(chans, main))
+        _CHANNEL_MAIN_KEY[name] = dict(zip(chans, main, strict=True))
 
 
 def available_formulas() -> list[str]:

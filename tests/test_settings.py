@@ -319,7 +319,7 @@ class ChainSettingTests(unittest.TestCase):
     def test_presets_take_the_shorthand(self):
         doc = presets.make_preset("ndvi", "Reference", "", {"chains": self.CHAINS})
         keys = settings.SHORTHANDS["ndvi"]["chains"]
-        self.assertEqual(doc["settings"], {k: self.CHAINS for k in keys})
+        self.assertEqual(doc["settings"], dict.fromkeys(keys, self.CHAINS))
 
     def test_the_command_line_takes_chains_as_text(self):
         from geofuse.cli import commands as cli
