@@ -7,8 +7,9 @@ standalone studies on, at the smallest budgets the settings allow. Pinned
 here:
 
 - the run completes and writes its results;
-- every CGI-vs-standalone row carries the held-out interval and p-value, and
-  its Holm-corrected p-value;
+- every CGI-vs-standalone row carries the held-out difference, interval and
+  p-value, and its Holm-corrected p-value; the estimate lies inside its own
+  interval, and the whole-data difference is a separate field;
 - a missing held-out half leaves that inference empty instead of failing;
 - a year-aware run (a greenery file per measurement year, one row per entity)
   is not a panel: with every visit in one year its posterior, splits and
@@ -35,7 +36,7 @@ from rasterio.transform import from_origin
 from shapely.geometry import Point
 
 from geofuse import runfile
-from geofuse.fusion import MetricFusionEngine
+from geofuse.fusion import PAIRED_HEADLINE_KEYS, MetricFusionEngine
 from geofuse.jobs import plans, runners
 
 _X0, _Y0, _PX = -114.10, 51.00, 0.0004
@@ -216,10 +217,13 @@ class TestCrossSectionalRun(unittest.TestCase):
         family = self.bundle["cgi_vs_standalone_paired_family"]
         self.assertEqual({d["standalone_channel"] for d in family}, {"ndvi", "gvi"})
         for d in family:
-            self.assertLessEqual(d["lower"], d["upper"])
+            self.assertLessEqual(d["lower"], d["observed_diff"])
+            self.assertLessEqual(d["observed_diff"], d["upper"])
             self.assertTrue(0.0 < d["p_value"] <= 1.0)
             self.assertGreaterEqual(d["p_value_holm"], d["p_value"])
-            self.assertLess(d["inference_n"], d["n"])
+            self.assertEqual(d["inference_n"], d["n"])
+            self.assertLess(d["n"], d["n_all"])
+            self.assertIsNotNone(d["observed_diff_all"])
         self.assertIn(self.bundle["cgi_vs_standalone_paired"], family)
 
 
@@ -370,9 +374,11 @@ class TestPairedInferenceWithoutAHeldOutHalf(unittest.TestCase):
 
         return types.SimpleNamespace(_paired_difference_on=paired_on)
 
-    def test_the_held_out_interval_and_p_value_are_kept(self):
+    def test_the_headline_is_the_held_out_difference(self):
         held = {
             "observed_diff": 0.01,
+            "cgi_score": 0.04,
+            "standalone_score": 0.03,
             "n": 50,
             "lower": -0.02,
             "upper": 0.04,
@@ -381,17 +387,24 @@ class TestPairedInferenceWithoutAHeldOutHalf(unittest.TestCase):
         out = MetricFusionEngine.paired_objective_difference(
             self._engine(held), {}, {}, "ndvi", "r2"
         )
-        self.assertEqual(out["observed_diff"], 0.02)
+        self.assertEqual(out["observed_diff"], 0.01)
+        self.assertEqual((out["cgi_score"], out["standalone_score"]), (0.04, 0.03))
         self.assertEqual((out["lower"], out["upper"]), (-0.02, 0.04))
         self.assertEqual(out["p_value"], 0.3)
-        self.assertEqual(out["inference_n"], 50)
+        self.assertEqual((out["n"], out["inference_n"]), (50, 50))
+        self.assertEqual(out["observed_diff_all"], 0.02)
+        self.assertEqual(
+            (out["cgi_score_all"], out["standalone_score_all"], out["n_all"]),
+            (0.05, 0.03, 200),
+        )
 
-    def test_no_held_out_half_leaves_the_inference_empty(self):
+    def test_no_held_out_half_leaves_the_headline_empty(self):
         out = MetricFusionEngine.paired_objective_difference(
             self._engine(None), {}, {}, "ndvi", "r2"
         )
-        self.assertEqual(out["observed_diff"], 0.02)
-        for key in ("lower", "upper", "p_value", "inference_n"):
+        self.assertEqual(out["observed_diff_all"], 0.02)
+        self.assertEqual(out["standalone_channel"], "ndvi")
+        for key in (*PAIRED_HEADLINE_KEYS, "inference_n"):
             self.assertIsNone(out[key], key)
 
     def test_the_family_summary_tolerates_a_missing_p_value(self):

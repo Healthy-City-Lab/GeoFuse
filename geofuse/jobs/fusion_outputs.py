@@ -695,6 +695,10 @@ def _write_fusion_outputs(
                 "n": r.get("n"),
                 "inference_n": r.get("inference_n"),
                 "favors_cgi": r.get("favors_cgi"),
+                "observed_diff_all": _f(r.get("observed_diff_all")),
+                "cgi_score_all": _f(r.get("cgi_score_all")),
+                "comparator_score_all": _f(r.get("standalone_score_all")),
+                "n_all": r.get("n_all"),
             }
             for r in (cgi_bundle or {}).get("cgi_vs_comparator_paired") or []
         ]

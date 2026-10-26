@@ -139,6 +139,19 @@ CATEGORICAL_MISSING = ("drop", "indicator")
 # exposure (``comparator_mode``).
 _COMPARATOR_PREFIX = "comparator:"
 
+# Keys of a paired CGI-vs-exposure row that always exist, ``None`` when the
+# held-out rows could not be scored.
+PAIRED_HEADLINE_KEYS = (
+    "observed_diff",
+    "cgi_score",
+    "standalone_score",
+    "n",
+    "favors_cgi",
+    "lower",
+    "upper",
+    "p_value",
+)
+
 
 def comparator_mode(column: str) -> str:
     """The active-channel name that scores target ``column`` as the exposure.
@@ -7068,10 +7081,13 @@ class MetricFusionEngine:
     ) -> dict | None:
         """Objective difference between CGI and the best standalone.
 
-        The observed difference and both scores use every row; the bootstrap
-        interval and p-value come from the held-out rows
-        (:func:`exposure_response.split_inference`), the only rows that chose
-        neither composite.
+        The headline difference, both scores, the bootstrap interval and the
+        p-value all come from the held-out rows, the only rows that chose
+        neither composite, so the estimate sits inside its own interval. The
+        same quantities on every row are descriptive and carry an ``_all``
+        suffix (``observed_diff_all``, ``cgi_score_all``,
+        ``standalone_score_all``, ``n_all``). When the held-out rows cannot be
+        scored the headline keys are ``None``.
         """
         kw = {"n_bootstrap": n_bootstrap, "ci_level": ci_level, "seed": seed}
         args = (cgi_params, standalone_params, standalone_channel, metric)
@@ -7079,11 +7095,12 @@ class MetricFusionEngine:
         if whole is None:
             return None
         held = self._paired_difference_on(*args, held_out=True, **kw)
-        out = exposure_response.split_inference(whole, held)
-        # Present even when the held-out half could not be scored, so readers
-        # see "no inference" rather than a missing key.
-        for k in ("lower", "upper", "p_value"):
+        out = dict(held or {})
+        for k in PAIRED_HEADLINE_KEYS:
             out.setdefault(k, None)
+        for k in ("observed_diff", "cgi_score", "standalone_score", "n"):
+            out[f"{k}_all"] = whole.get(k)
+        out["standalone_channel"] = standalone_channel
         out["inference_n"] = None if held is None else held["n"]
         return out
 
