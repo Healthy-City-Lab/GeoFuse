@@ -45,11 +45,19 @@ def _bundle(artifacts: str) -> dict:
             {
                 "standalone_channel": "ndvi",
                 "observed_diff": -0.015,
+                "cgi_score": 0.047,
+                "standalone_score": 0.062,
                 "lower": -0.029,
                 "upper": 0.001,
                 "p_value_holm": 0.97,
+                "verdict": "no difference",
             }
         ],
+        "cgi_vs_standalone_paired": {
+            "standalone_channel": "ndvi",
+            "observed_diff": -0.015,
+            "verdict": "no difference",
+        },
         "cgi_vs_standalone_aic_bic": {
             "ok": True,
             "best_channel": "ndvi",
@@ -107,8 +115,12 @@ class ResultsTests(_Case):
             "0.0610  [0.0460, 0.0890]  n=400  p=0.001",
             "negative: more greenery, lower outcome",
             "NDVI alone       0.0620",
-            "CGI − NDVI       -0.0150  [-0.0290, 0.0010]  Holm p=0.97",
-            "CGI vs NDVI alone: not justified (ΔAIC -2.3, ΔBIC -15.6)",
+            "Held-out paired  CGI score − channel score = difference",
+            "CGI − NDVI       0.0470 − 0.0620 = -0.0150  [-0.0290, 0.0010]  "
+            "Holm p=0.97",
+            "CGI vs NDVI alone (chosen on train+val): no difference",
+            "in-sample, all channels vs NDVI alone: not justified "
+            "(ΔAIC -2.3, ΔBIC -15.6)",
             "NDVI 20, GVI 80 (of 100)",
             "NDVI 700 m, GVI 400 m",
             os.path.join(self.artifacts, "study_results"),

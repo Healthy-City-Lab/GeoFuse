@@ -83,6 +83,20 @@ def _interval(block: dict, lo: str = "lower", hi: str = "upper") -> str:
     return f"[{low:.4f}, {high:.4f}]" if low is not None and high is not None else ""
 
 
+def _difference(row: dict) -> str:
+    """``cgi − channel = diff`` when both held-out scores are there, else the
+    difference alone. A lower-is-better objective's difference is signed so
+    a positive value favours the CGI, so its scores are printed the other
+    way round."""
+    diff = _num(row.get("observed_diff"))
+    cgi, other = _num(row.get("cgi_score")), _num(row.get("standalone_score"))
+    if cgi is None or other is None:
+        return f"{diff:+.4f}"
+    if abs((other - cgi) - diff) < abs((cgi - other) - diff):
+        return f"{other:.4f} − {cgi:.4f} = {diff:+.4f} (lower is better)"
+    return f"{cgi:.4f} − {other:.4f} = {diff:+.4f}"
+
+
 def resolve(value: str, artifacts: Path) -> Path:
     """A path the run recorded, found again: GUI runs record paths relative
     to the folder the GUI ran in, so those are rebased on the run's own
@@ -153,6 +167,8 @@ def summary(label: str, bundle: dict, artifacts: Path) -> list[str]:
             lines.append(f"  {name + ' alone':<17}{score:.4f}  {ci}".rstrip())
     family = bundle.get("cgi_vs_standalone_paired_family") or []
     paired = family or [bundle.get("cgi_vs_standalone_paired") or {}]
+    if any(_num(d.get("observed_diff")) is not None for d in paired):
+        lines.append("  Held-out paired  CGI score − channel score = difference")
     for d in paired:
         diff = _num(d.get("observed_diff"))
         if diff is None:
@@ -163,7 +179,16 @@ def summary(label: str, bundle: dict, artifacts: Path) -> list[str]:
         if p is None and _num(d.get("p_value")) is not None:
             p_text = f"p={_num(d.get('p_value')):.3g}"
         lines.append(
-            f"  CGI − {name:<10} {diff:+.4f}  {_interval(d)}  {p_text}".rstrip()
+            f"  CGI − {name:<10} {_difference(d)}  {_interval(d)}  {p_text}".rstrip()
+        )
+    head = bundle.get("cgi_vs_standalone_paired") or {}
+    if head.get("verdict"):
+        name = _CHANNELS.get(
+            head.get("standalone_channel"), head.get("standalone_channel")
+        )
+        lines.append(
+            f"  Verdict          CGI vs {name} alone (chosen on train+val): "
+            f"{head['verdict']}"
         )
     comparators = bundle.get("comparators") or {}
     if comparators:
@@ -189,8 +214,8 @@ def summary(label: str, bundle: dict, artifacts: Path) -> list[str]:
     if aic.get("ok"):
         best = _CHANNELS.get(aic.get("best_channel"), aic.get("best_channel"))
         lines.append(
-            f"  AIC / BIC        CGI vs {best} alone: {aic.get('verdict')} "
-            f"(ΔAIC {_num(aic.get('delta_aic')):+.1f}, "
+            f"  AIC / BIC        in-sample, all channels vs {best} alone: "
+            f"{aic.get('verdict')} (ΔAIC {_num(aic.get('delta_aic')):+.1f}, "
             f"ΔBIC {_num(aic.get('delta_bic')):+.1f})"
         )
 
