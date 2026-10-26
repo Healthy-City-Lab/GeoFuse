@@ -537,6 +537,34 @@ def stripe_to_test_blocks(
     return set(ordered_blocks[np.unique(idxs)].tolist())
 
 
+def random_test_blocks(
+    blocks: np.ndarray,
+    sizes: np.ndarray,
+    test_fraction: float,
+    rng: np.random.Generator,
+) -> set:
+    """Draw whole blocks at random until they hold ~``test_fraction`` of the groups.
+
+    ``sizes`` is the number of groups in each of ``blocks``. Blocks are taken
+    in a random order, and the block that crosses the target is kept when that
+    lands closer to it than stopping short. At least one block is held out
+    and at least one is left for training. Unlike
+    :func:`stripe_to_test_blocks`, whose seed only shifts the stripe's start,
+    every seed can draw another test set.
+    """
+    n = len(blocks)
+    if n == 0:
+        return set()
+    order = rng.permutation(n)
+    cum = np.cumsum(np.asarray(sizes, dtype=np.float64)[order])
+    target = test_fraction * cum[-1]
+    k = min(int(np.searchsorted(cum, target)), n - 1)
+    before = cum[k - 1] if k > 0 else 0.0
+    take = k + 1 if abs(cum[k] - target) <= abs(before - target) else k
+    take = min(max(take, 1), max(n - 1, 1))
+    return set(np.asarray(blocks)[order[:take]].tolist())
+
+
 def split_control_matrix(
     c_arr: np.ndarray | None, n_cov_cols: int
 ) -> tuple[np.ndarray | None, np.ndarray | None]:

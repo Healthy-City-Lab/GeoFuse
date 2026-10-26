@@ -135,6 +135,11 @@ _SWEEP_OBJECTIVES: frozenset[str] = frozenset({"quartile_contrast"})
 # ``<column>=missing`` level of its own.
 CATEGORICAL_MISSING = ("drop", "indicator")
 
+# How whole spatial blocks are chosen for the held-out test: ``stripe`` takes
+# evenly spaced positions of the space-filling block order, ``random`` draws
+# blocks at random until they hold the test share.
+SPATIAL_SPLIT_MODES = ("stripe", "random")
+
 # Active-channel prefix under which a comparator column is scored as a frozen
 # exposure (``comparator_mode``).
 _COMPARATOR_PREFIX = "comparator:"
@@ -5297,6 +5302,7 @@ class MetricFusionEngine:
         spatial_split: bool = False,
         spatial_block_size_m: float | None = None,
         n_spatial_blocks: int | None = None,
+        spatial_split_mode: str = "stripe",
     ) -> None:
         """Carve a held-out test set and the train+val pool the bootstrap
         the sweep splits.
@@ -5317,7 +5323,17 @@ class MetricFusionEngine:
                 tiles the full extent and no group straddles train and test.
             spatial_block_size_m: Block edge length (metres) when blocking.
             n_spatial_blocks: Target block count when blocking.
+            spatial_split_mode: How test blocks are chosen
+                (:data:`SPATIAL_SPLIT_MODES`): ``stripe`` spaces them evenly
+                along the block order, so a seed can only shift the stripe;
+                ``random`` draws them at random, so each seed gives another
+                test set.
         """
+        if spatial_split_mode not in SPATIAL_SPLIT_MODES:
+            raise ValueError(
+                f"spatial_split_mode must be one of {SPATIAL_SPLIT_MODES}; "
+                f"got {spatial_split_mode!r}."
+            )
         # A fresh split invalidates the reporting-phase caches (they key off the
         # train+val / test frames this method rebuilds).
         self._full_data_cache = None
@@ -5449,28 +5465,39 @@ class MetricFusionEngine:
 
             if spatial_ok:
                 # Spatial single-split: assign whole blocks to the held-out
-                # test by even striping across the space-filling block order,
-                # so the test tiles the full extent and no group straddles
-                # train and test.
+                # test, striped evenly across the space-filling block order or
+                # drawn at random, so no group straddles train and test.
                 rng_sp = np.random.default_rng(random_state)
                 ordered_blocks = np.sort(poly_df["_block"].unique())
-                test_blocks = _helpers.stripe_to_test_blocks(
-                    ordered_blocks, test_size, rng_sp
-                )
+                if spatial_split_mode == "random":
+                    sizes = poly_df["_block"].value_counts()
+                    test_blocks = _helpers.random_test_blocks(
+                        ordered_blocks,
+                        sizes.reindex(ordered_blocks).to_numpy(),
+                        test_size,
+                        rng_sp,
+                    )
+                else:
+                    test_blocks = _helpers.stripe_to_test_blocks(
+                        ordered_blocks, test_size, rng_sp
+                    )
                 test_mask = poly_df["_block"].isin(test_blocks)
                 test_poly = poly_df[test_mask].copy()
                 train_val_poly = poly_df[~test_mask].copy()
+                share = len(test_poly) / max(n_polys, 1)
                 _log(
                     "INFO",
-                    f"Spatial block test split: {len(test_blocks)} of "
+                    f"Spatial block test split ({spatial_split_mode}, seed "
+                    f"{random_state}): {len(test_blocks)} of "
                     f"{len(ordered_blocks)} blocks held out — "
                     f"train+val={len(train_val_poly)} {group_label}s, "
-                    f"test={len(test_poly)} {group_label}s.",
+                    f"test={len(test_poly)} {group_label}s ({share:.1%}).",
                 )
-                share = len(test_poly) / max(n_polys, 1)
                 self._spatial_split_report = {
                     "block_size_m": float(binfo.get("block_size_m", 0.0)),
                     "rule": binfo.get("rule"),
+                    "mode": spatial_split_mode,
+                    "seed": int(random_state),
                     "occupied_blocks": int(len(ordered_blocks)),
                     "test_blocks": int(len(test_blocks)),
                     "test_share": float(share),
