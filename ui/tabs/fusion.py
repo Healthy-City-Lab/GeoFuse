@@ -4079,6 +4079,12 @@ def _num(x) -> float | None:
     return fx if math.isfinite(fx) else None
 
 
+def _rounded(x, places: int = 4) -> float | None:
+    """:func:`_num` rounded to *places* decimals for a table cell."""
+    fx = _num(x)
+    return None if fx is None else round(fx, places)
+
+
 def _fmt(x, places: int = 3) -> str:
     """``x`` at *places* decimals, or an em dash when it isn't a real number."""
     fx = _num(x)
@@ -4117,9 +4123,9 @@ _P_KIND_HELP = {
 def _render_results_headline(results_view: dict, metric_name: str) -> None:
     """At-a-glance CGI bottom line: the held-out test greenery effect (headline,
     with the whole-data figure in its tooltip), the held-out significance check,
-    direction, and the CGI-vs-standalone verdict as two whole-data (all)
-    sub-answers — the paired objective difference and the AIC/BIC
-    penalized-model comparison."""
+    direction, and the CGI-vs-standalone verdict as two sub-answers — the
+    held-out paired objective difference (the verdict) and the in-sample
+    AIC/BIC penalized-model comparison."""
     effects = results_view.get("cgi_effects") or {}
     # A block whose mixed model didn't fit is all-NaN; drop it here so the
     # tiles below fall through to the held-out cluster bootstrap, which is an
@@ -4250,8 +4256,8 @@ def _render_results_headline(results_view: dict, metric_name: str) -> None:
         else:
             st.metric("Held-out significance", "—")
 
-    # 3) CGI vs best standalone — sub-answer A: whole-data (all) paired
-    #    objective difference.
+    # 3) CGI vs standalone — sub-answer A, the verdict: held-out paired
+    #    objective difference against the channel chosen on train+val.
     with cols2[0]:
         if paired:
             diff = _f(paired.get("observed_diff"))
@@ -4260,7 +4266,7 @@ def _render_results_headline(results_view: dict, metric_name: str) -> None:
             pp_holm = _f(paired.get("p_value_holm"))
             fam_n = paired.get("family_size")
             ch = paired.get("standalone_channel")
-            verdict = "CGI better" if paired.get("favors_cgi") else "not better"
+            verdict = paired.get("verdict") or "—"
             if diff is not None:
                 ci_str = (
                     f"[{lo:.4f}, {hi:.4f}]"
@@ -4274,64 +4280,79 @@ def _render_results_headline(results_view: dict, metric_name: str) -> None:
                     if pp_holm is not None and fam_n
                     else ""
                 )
+                all_diff = _f(paired.get("observed_diff_all"))
+                all_str = (
+                    f" Whole-data (all, in-sample) Δ={all_diff:.4f}."
+                    if all_diff is not None
+                    else ""
+                )
                 help_txt = (
-                    f"Whole-data (all) paired bootstrap difference in "
-                    f"{metric_name} (CGI − `{ch}`): Δ={diff:.4f} {ci_str}, "
-                    f"one-sided p={p_str} (positive favours CGI).{holm_str}"
+                    f"Held-out paired bootstrap difference in {metric_name} "
+                    f"(CGI − `{ch}`, the channel scoring best on train+val): "
+                    f"Δ={diff:.4f} {ci_str}, one-sided p={p_str} (positive "
+                    f"favours CGI).{holm_str}{all_str}"
                 )
             else:
-                help_txt = "Comparison unavailable."
-            st.metric("CGI vs standalone — objective (all)", verdict, help=help_txt)
+                help_txt = (
+                    "The held-out rows could not be scored, so there is no "
+                    "verdict."
+                )
+            st.metric(
+                "CGI vs standalone — objective (held-out)", verdict, help=help_txt
+            )
         elif has_standalones:
             # Standalones ran but the paired bootstrap produced nothing — the
             # whole-data model didn't fit for one of the two composites. Say so
             # instead of implying the studies were never enabled.
             st.metric(
-                "CGI vs standalone — objective (all)",
+                "CGI vs standalone — objective (held-out)",
                 "unavailable",
                 help=(
-                    "The paired whole-data comparison could not be computed — "
-                    "the mixed model did not fit for CGI or for the standalone "
-                    "composite on the full dataset. See the job log for which "
-                    "channel failed; the AIC/BIC comparison beside this tile is "
-                    "the independent second opinion."
+                    "The paired comparison could not be computed — the model "
+                    "did not fit for CGI or for the standalone composite, or "
+                    "the channel chosen on train+val has no paired row. See the "
+                    "job log for which channel failed."
                 ),
             )
         else:
             st.metric(
-                "CGI vs standalone — objective (all)",
+                "CGI vs standalone — objective (held-out)",
                 "—",
                 help="Enable standalone studies to compare CGI against them.",
             )
 
-    # 4) CGI vs best standalone — sub-answer B: whole-data (all) AIC/BIC
-    #    penalized-model comparison.
+    # 4) CGI vs standalone — sub-answer B: in-sample AIC/BIC
+    #    penalized-model comparison, secondary to the held-out verdict.
     with cols2[1]:
         if aic_bic and aic_bic.get("ok"):
+            d_aic = _f(aic_bic.get("delta_aic"))
             d_bic = _f(aic_bic.get("delta_bic"))
             st.metric(
-                "CGI vs standalone — AIC/BIC (all)",
+                "CGI vs standalone — AIC/BIC (in-sample)",
                 str(aic_bic.get("verdict", "—")),
                 help=(
-                    "AIC/BIC of CGI (all channels) vs the best single channel "
-                    f"(`{aic_bic.get('best_channel')}`), both fit on the whole "
-                    "dataset. "
+                    "In-sample OLS of all channels vs the single channel "
+                    f"scoring best on train+val (`{aic_bic.get('best_channel')}`),"
+                    " both fit on the whole dataset; a secondary statistic, not "
+                    "the verdict. It does not score the tuned composite itself, "
+                    "and BIC charges ln n per extra channel. "
                     + (
-                        f"ΔBIC={d_bic:.1f} (positive favours CGI)."
-                        if d_bic is not None
+                        f"ΔAIC={d_aic:.1f}, ΔBIC={d_bic:.1f} (positive favours "
+                        "CGI)."
+                        if d_aic is not None and d_bic is not None
                         else ""
                     )
                 ),
             )
         elif aic_bic is not None:
             st.metric(
-                "CGI vs standalone — AIC/BIC (all)",
+                "CGI vs standalone — AIC/BIC (in-sample)",
                 "inconclusive",
                 help=str(aic_bic.get("reason", "Comparison unavailable.")),
             )
         else:
             st.metric(
-                "CGI vs standalone — AIC/BIC (all)",
+                "CGI vs standalone — AIC/BIC (in-sample)",
                 "—",
                 help="Enable standalone studies to compare CGI against them.",
             )
@@ -4819,6 +4840,8 @@ def _render_cross_study_comparison(results_view: dict, metric_name: str) -> None
                     "Standalone": _CHANNEL_DISPLAY.get(
                         d.get("standalone_channel"), str(d.get("standalone_channel"))
                     ),
+                    "CGI score": _rounded(d.get("cgi_score")),
+                    "Standalone score": _rounded(d.get("standalone_score")),
                     f"Δ {metric_name} (CGI − ch)": (
                         round(float(diff), 4) if diff is not None else None
                     ),
@@ -4829,12 +4852,14 @@ def _render_cross_study_comparison(results_view: dict, metric_name: str) -> None
                     ),
                     "p (one-sided)": f"{float(pr):.3g}" if pr is not None else None,
                     "p (Holm)": f"{float(ph):.3g}" if ph is not None else None,
+                    "Verdict": d.get("verdict"),
                 }
             )
         st.dataframe(pd.DataFrame(fam_rows), width="stretch")
         st.caption(
-            "Whole-data paired bootstrap difference of CGI against each "
-            "standalone channel (positive Δ favours CGI). `p (Holm)` controls "
+            "Held-out paired bootstrap difference of CGI against each "
+            "standalone channel (positive Δ favours CGI); both scores and the "
+            "interval come from the same held-out rows. `p (Holm)` controls "
             "the family-wise error rate across these comparisons. When several "
             "outcomes are optimised, treat those as a further family and discount "
             "the p-values accordingly."
@@ -4843,17 +4868,18 @@ def _render_cross_study_comparison(results_view: dict, metric_name: str) -> None
     # ── AIC/BIC verdict detail ──────────────────────────────────
     aic_bic = results_view.get("cgi_vs_standalone_aic_bic") or None
     if aic_bic and aic_bic.get("ok"):
-        st.markdown("**Penalized model comparison (AIC / BIC)**")
+        st.markdown("**Penalized model comparison (AIC / BIC, in-sample)**")
         best_ch = _CHANNEL_DISPLAY.get(
             aic_bic.get("best_channel"), str(aic_bic.get("best_channel"))
         )
         st.caption(
             f"Full model = `outcome ~ veg + terrain + ndvi (+ covariates)`; "
-            f"reduced model = `outcome ~ {best_ch} (+ covariates)` — the best "
-            f"single channel by whole-data (all) score. Both models are fit on "
-            f"the whole dataset (all entities). Lower AIC/BIC is better; a "
-            f"positive Δ favours CGI. **Verdict: {aic_bic.get('verdict')}** "
-            f"(n = {aic_bic.get('n')})."
+            f"reduced model = `outcome ~ {best_ch} (+ covariates)` — the "
+            f"single channel scoring best on train+val. Both models are fit on "
+            f"the whole dataset (all entities), so this is an in-sample "
+            f"statistic, secondary to the held-out paired difference above. "
+            f"Lower AIC/BIC is better; a positive Δ favours CGI. "
+            f"**{aic_bic.get('verdict')}** (n = {aic_bic.get('n')})."
         )
         comp_rows = [
             {
