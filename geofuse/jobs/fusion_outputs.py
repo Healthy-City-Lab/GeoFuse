@@ -695,6 +695,7 @@ def _write_fusion_outputs(
                 "n": r.get("n"),
                 "inference_n": r.get("inference_n"),
                 "favors_cgi": r.get("favors_cgi"),
+                "verdict": r.get("verdict"),
                 "observed_diff_all": _f(r.get("observed_diff_all")),
                 "cgi_score_all": _f(r.get("cgi_score_all")),
                 "comparator_score_all": _f(r.get("standalone_score_all")),
@@ -785,6 +786,12 @@ def _write_fusion_outputs(
         "test_reads": (cgi_bundle or {}).get("test_reads"),
         "studies": studies_manifest,
         "cgi_vs_standalone_aic_bic": aic_bic,
+        "cgi_vs_standalone_paired": (
+            (cgi_bundle or {}).get("cgi_vs_standalone_paired_family") or []
+        ),
+        "comparison_channel": (
+            (cgi_bundle or {}).get("cgi_vs_standalone_paired") or {}
+        ).get("standalone_channel"),
         "covariate_impact": cov_summary,
         "decline_terms": (cgi_bundle or {}).get("decline_terms"),
         # Carried in the manifest, not only in their CSVs: the results panel
@@ -1304,7 +1311,67 @@ def _comparator_family(comparators: dict[str, dict]) -> list[dict]:
             r["p_value_holm"] = None
             r["family_size"] = len(primary)
             r["descriptive"] = True
+    for r in rows:
+        r["verdict"] = paired_verdict(r)
     return rows
+
+
+# Readings of a paired CGI-vs-exposure row, in the order the checks run.
+PAIRED_VERDICTS = ("CGI better", "standalone better", "no difference", "no inference")
+
+
+def paired_verdict(row: dict, alpha: float = 0.05) -> str:
+    """Held-out reading of one paired CGI-vs-exposure row.
+
+    ``CGI better`` when the Holm p-value (the raw one when there is no Holm
+    correction) of the one-sided test CGI > exposure is below ``alpha``;
+    ``standalone better`` when the whole interval lies below zero; ``no
+    difference`` otherwise, and ``no inference`` when the held-out rows gave
+    no p-value.
+    """
+    p = row.get("p_value_holm")
+    if p is None:
+        p = row.get("p_value")
+    if p is None or not np.isfinite(float(p)):
+        return "no inference"
+    diff = row.get("observed_diff")
+    if float(p) < alpha and diff is not None and float(diff) > 0:
+        return "CGI better"
+    upper = row.get("upper")
+    if upper is not None and np.isfinite(float(upper)) and float(upper) < 0:
+        return "standalone better"
+    return "no difference"
+
+
+def comparison_channel(
+    standalones_bundle: dict, channels: list[str], metric: str
+) -> tuple[str | None, dict[str, float]]:
+    """The single channel the CGI is compared against, and its scores.
+
+    The channel whose standalone scores best on the train+val pool (the
+    ``train`` subset score), direction-aware, so the test rows the comparison
+    is then read on never choose it. Returns ``(None, {})`` when no channel in
+    ``channels`` has a finite pool score.
+    """
+    from .. import mixed_effects_scoring as _me
+    from .. import objective_scoring as _scoring
+
+    higher_is_better = (
+        metric in _scoring.HIGHER_IS_BETTER or metric in _me.HIGHER_IS_BETTER
+    )
+    scores: dict[str, float] = {}
+    for ch in channels:
+        b = standalones_bundle.get(ch)
+        if not b:
+            continue
+        ts = ((b.get("subset_scores") or {}).get("train") or {}).get("score")
+        if ts is None or not np.isfinite(float(ts)):
+            continue
+        scores[ch] = float(ts)
+    if not scores:
+        return None, {}
+    sign = 1.0 if higher_is_better else -1.0
+    return max(scores, key=lambda ch: sign * scores[ch]), scores
 
 
 def _compare_cgi_vs_standalone(
@@ -1316,14 +1383,14 @@ def _compare_cgi_vs_standalone(
     longitudinal: bool,
     log,
 ) -> dict | None:
-    """AIC/BIC verdict: is CGI justified over the best single standalone channel?
+    """In-sample AIC/BIC: do the other channels earn their keep over one?
 
-    The best standalone is the channel with the strongest whole-data (``all``)
-    score (direction-aware). The full and reduced (best-channel) models are fit
-    on the whole dataset's per-entity channel design built at the CGI winning
-    aggregation params, so the verdict is on the same ``all`` slice as the
-    paired objective comparison. Returns ``None`` when no standalone qualifies
-    or the design / fit fails.
+    The reduced model's channel is :func:`comparison_channel`, chosen on the
+    train+val pool. The full and reduced (that channel) models are fit on the
+    whole dataset's per-entity channel design built at the CGI winning
+    aggregation params, so both are in-sample statistics, secondary to the
+    held-out paired test. Returns ``None`` when no standalone qualifies or the
+    design / fit fails.
 
     The channel names come from the design rather than from a fixed list: a
     two-channel study's design has two columns, and an index taken against the
@@ -1339,22 +1406,9 @@ def _compare_cgi_vs_standalone(
         return None
 
     chans = list(design["channel_names"])
-    higher_is_better = (
-        metric in _scoring.HIGHER_IS_BETTER or metric in _me.HIGHER_IS_BETTER
-    )
-    scored: list[tuple[str, float]] = []
-    for ch in chans:
-        b = standalones_bundle.get(ch)
-        if not b:
-            continue
-        ss = (b.get("subset_scores") or {}).get("all") or {}
-        ts = ss.get("score")
-        if ts is None or not np.isfinite(float(ts)):
-            continue
-        scored.append((ch, float(ts)))
-    if not scored:
+    best_ch, pool_scores = comparison_channel(standalones_bundle, chans, metric)
+    if best_ch is None:
         return None
-    best_ch = max(scored, key=lambda kv: kv[1] if higher_is_better else -kv[1])[0]
     best_idx = chans.index(best_ch)
 
     X = design["channels"]
@@ -1371,7 +1425,7 @@ def _compare_cgi_vs_standalone(
         # converge — taking the CGI-vs-standalone verdict down with it.
         panel_metric = metric in _me.MIXEDLM_METRICS
         if longitudinal and panel_metric and design.get("entity_id") is not None:
-            return _me.compare_models_aic_bic_mixedlm(
+            out = _me.compare_models_aic_bic_mixedlm(
                 target,
                 X,
                 chans,
@@ -1380,12 +1434,17 @@ def _compare_cgi_vs_standalone(
                 design["years_since_baseline"],
                 covariates=cov,
             )
-        return _scoring.compare_models_aic_bic(
-            target, X, chans, best_idx, covariates=cov
-        )
+        else:
+            out = _scoring.compare_models_aic_bic(
+                target, X, chans, best_idx, covariates=cov
+            )
     except Exception as exc:
         log("WARN", f"AIC/BIC comparison failed: {exc}")
         return None
+    out["in_sample"] = True
+    out["best_channel_selected_on"] = "train_val"
+    out["train_val_scores"] = pool_scores
+    return out
 
 
 def _jsonsafe_results(obj, _depth: int = 0):

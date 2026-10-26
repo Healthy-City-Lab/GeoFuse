@@ -10,6 +10,8 @@ here:
 - every CGI-vs-standalone row carries the held-out difference, interval and
   p-value, and its Holm-corrected p-value; the estimate lies inside its own
   interval, and the whole-data difference is a separate field;
+- the headline channel is the one scoring best on the train+val pool, so the
+  test outcomes never choose it, and its verdict is the held-out test;
 - a missing held-out half leaves that inference empty instead of failing;
 - a year-aware run (a greenery file per measurement year, one row per entity)
   is not a panel: with every visit in one year its posterior, splits and
@@ -37,7 +39,7 @@ from shapely.geometry import Point
 
 from geofuse import runfile
 from geofuse.fusion import PAIRED_HEADLINE_KEYS, MetricFusionEngine
-from geofuse.jobs import plans, runners
+from geofuse.jobs import fusion_outputs, plans, runners
 
 _X0, _Y0, _PX = -114.10, 51.00, 0.0004
 
@@ -224,7 +226,20 @@ class TestCrossSectionalRun(unittest.TestCase):
             self.assertEqual(d["inference_n"], d["n"])
             self.assertLess(d["n"], d["n_all"])
             self.assertIsNotNone(d["observed_diff_all"])
+            self.assertIn(d["verdict"], fusion_outputs.PAIRED_VERDICTS)
         self.assertIn(self.bundle["cgi_vs_standalone_paired"], family)
+
+    def test_the_headline_channel_is_chosen_on_the_train_val_pool(self):
+        pool = {
+            ch: b["subset_scores"]["train"]["score"]
+            for ch, b in self.bundle["standalones"].items()
+        }
+        head = self.bundle["cgi_vs_standalone_paired"]
+        self.assertEqual(head["standalone_channel"], max(pool, key=pool.get))
+        self.assertEqual(head["selected_on"], "train_val")
+        aic_bic = self.bundle["cgi_vs_standalone_aic_bic"]
+        self.assertEqual(aic_bic["best_channel"], head["standalone_channel"])
+        self.assertTrue(aic_bic["in_sample"])
 
 
 class TestYearAwareRun(unittest.TestCase):
@@ -406,22 +421,84 @@ class TestPairedInferenceWithoutAHeldOutHalf(unittest.TestCase):
         self.assertEqual(out["standalone_channel"], "ndvi")
         for key in (*PAIRED_HEADLINE_KEYS, "inference_n"):
             self.assertIsNone(out[key], key)
+        self.assertEqual(fusion_outputs.paired_verdict(out), "no inference")
 
     def test_the_family_summary_tolerates_a_missing_p_value(self):
         family = [
             {"standalone_channel": "ndvi", "observed_diff": 0.02, "p_value": None},
             {"standalone_channel": "gvi", "observed_diff": 0.01, "p_value": 0.04},
         ]
-        head = runners._paired_family_headline(family, best_channel="gvi")
+        head = runners._paired_family_headline(family, "gvi")
         self.assertIs(head, family[1])
         self.assertIsNone(family[0]["p_value_holm"])
         self.assertAlmostEqual(family[1]["p_value_holm"], 0.04)
         self.assertEqual({d["family_size"] for d in family}, {2})
-        # Without an AIC/BIC verdict the largest difference heads the family.
-        self.assertIs(runners._paired_family_headline(family, None), family[0])
+        self.assertEqual(family[0]["verdict"], "no inference")
+        self.assertEqual(family[1]["verdict"], "CGI better")
         self.assertEqual(runners._fmt_or_na(None, ".4g"), "n/a")
         self.assertEqual(runners._fmt_or_na(float("nan"), ".4f"), "n/a")
         self.assertEqual(runners._fmt_or_na(0.04, ".2f"), "0.04")
+
+    def test_a_channel_without_a_row_gives_no_headline(self):
+        family = [{"standalone_channel": "ndvi", "observed_diff": 0.02}]
+        # The largest difference must not stand in: it was read off the test rows.
+        self.assertIsNone(runners._paired_family_headline(family, "gvi"))
+        self.assertIsNone(runners._paired_family_headline(family, None))
+
+
+class TestComparisonChannel(unittest.TestCase):
+    """The CGI's comparison channel and the verdict read from its row."""
+
+    @staticmethod
+    def _bundle(train, test):
+        return {
+            ch: {
+                "subset_scores": {
+                    "train": {"score": train[ch]},
+                    "test": {"score": test[ch]},
+                    "all": {"score": test[ch]},
+                }
+            }
+            for ch in train
+        }
+
+    def test_the_channel_never_depends_on_the_test_rows(self):
+        train = {"ndvi": 0.030, "gvi": 0.020}
+        for test in ({"ndvi": 0.01, "gvi": 0.05}, {"ndvi": 0.05, "gvi": 0.01}):
+            ch, scores = fusion_outputs.comparison_channel(
+                self._bundle(train, test), ["ndvi", "gvi"], "r2"
+            )
+            self.assertEqual(ch, "ndvi")
+            self.assertEqual(scores, train)
+
+    def test_a_lower_is_better_objective_picks_the_smallest_score(self):
+        bundle = self._bundle({"ndvi": 0.9, "gvi": 0.7}, {"ndvi": 0, "gvi": 0})
+        ch, _ = fusion_outputs.comparison_channel(bundle, ["ndvi", "gvi"], "nrmse")
+        self.assertEqual(ch, "gvi")
+
+    def test_no_pool_score_means_no_channel(self):
+        bundle = {"ndvi": {"subset_scores": {"train": {"score": float("nan")}}}}
+        self.assertEqual(
+            fusion_outputs.comparison_channel(bundle, ["ndvi", "gvi"], "r2"),
+            (None, {}),
+        )
+
+    def test_a_composite_equal_to_its_channel_reads_as_no_difference(self):
+        # Identical composites: every replicate's difference is 0, so the
+        # one-sided bootstrap p is 1 and the interval is [0, 0].
+        row = {"observed_diff": 0.0, "lower": 0.0, "upper": 0.0, "p_value": 1.0}
+        self.assertEqual(fusion_outputs.paired_verdict(row), "no difference")
+
+    def test_the_verdict_reads_the_held_out_test(self):
+        verdict = fusion_outputs.paired_verdict
+        base = {"observed_diff": 0.02, "lower": 0.001, "upper": 0.04}
+        self.assertEqual(verdict({**base, "p_value": 0.01}), "CGI better")
+        # The Holm p-value decides when there is one.
+        self.assertEqual(
+            verdict({**base, "p_value": 0.01, "p_value_holm": 0.08}), "no difference"
+        )
+        below = {"observed_diff": -0.02, "lower": -0.04, "upper": -0.001}
+        self.assertEqual(verdict({**below, "p_value": 0.99}), "standalone better")
 
 
 if __name__ == "__main__":

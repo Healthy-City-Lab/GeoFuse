@@ -61,6 +61,8 @@ from geofuse.jobs.fusion_outputs import (
     _negative_control_report,
     _posterior_summary,
     _write_fusion_outputs,
+    comparison_channel,
+    paired_verdict,
     write_entity_table,
 )
 from geofuse.jobs.stage_ledger import DONE, FAILED, RUNNING, SKIPPED
@@ -1180,12 +1182,15 @@ def _fmt_or_na(value: Any, spec: str) -> str:
     return format(fv, spec) if np.isfinite(fv) else "n/a"
 
 
-def _paired_family_headline(family: list[dict], best_channel: str | None) -> dict:
+def _paired_family_headline(family: list[dict], channel: str | None) -> dict | None:
     """Holm-correct the CGI-vs-standalone family in place and pick its headline.
 
     Each entry gains ``p_value_holm`` (``None`` where its own p-value is
-    missing) and ``family_size``. The headline is the AIC/BIC best channel's
-    entry, else the one with the largest observed difference.
+    missing), ``family_size`` and a held-out ``verdict``
+    (:func:`paired_verdict`). The headline is the entry for ``channel``, the
+    channel chosen on the train+val pool (:func:`comparison_channel`), so the
+    test rows never pick the channel they then judge; ``None`` when that
+    channel has no entry.
     """
     from .. import statistical_testing as _stats_mod
 
@@ -1193,14 +1198,13 @@ def _paired_family_headline(family: list[dict], best_channel: str | None) -> dic
     for d, hp in zip(family, holm, strict=True):
         d["p_value_holm"] = None if hp != hp else float(hp)
         d["family_size"] = len(family)
-
-    def _diff(d: dict) -> float:
-        v = d.get("observed_diff")
-        return float(v) if v is not None and np.isfinite(v) else float("-inf")
-
-    return next(
-        (d for d in family if d.get("standalone_channel") == best_channel), None
-    ) or max(family, key=_diff)
+        d["verdict"] = paired_verdict(d)
+    head = next(
+        (d for d in family if d.get("standalone_channel") == channel), None
+    )
+    if head is not None:
+        head["selected_on"] = "train_val"
+    return head
 
 
 def _build_fusion_study_name(
@@ -1571,9 +1575,10 @@ def run_fusion(
     report whether the pick itself reproduces, and ``gain_splits`` compare the
     composite against each standalone under the identical procedure with a
     permutation null on the gain. The winning params are then scored once on
-    the held-out test split with a percentile bootstrap CI. When standalones are enabled, both a whole-data (``all``) paired
-    objective comparison and an ``all``-data AIC/BIC comparison report whether
-    CGI is justified over the best single channel.
+    the held-out test split with a percentile bootstrap CI. When standalones
+    are enabled, a held-out paired objective comparison against the channel
+    scoring best on train+val gives the verdict, and an in-sample AIC/BIC
+    comparison against that channel is reported beside it.
 
     The ``report_*`` knobs set the reporting replicate budgets: the test-set
     CI bootstrap (``report_ci_bootstrap``; ``None`` picks 2,000 for the O(n²)
@@ -2807,18 +2812,19 @@ def run_fusion(
                 if cgi_vs_standalone_aic_bic and cgi_vs_standalone_aic_bic.get("ok"):
                     _log_fusion(
                         "OK",
-                        f"[{label}] CGI vs best standalone "
+                        f"[{label}] CGI vs standalone, in-sample AIC/BIC "
                         f"({cgi_vs_standalone_aic_bic['best_channel']}): "
+                        f"ΔAIC={cgi_vs_standalone_aic_bic['delta_aic']:.1f}, "
                         f"ΔBIC={cgi_vs_standalone_aic_bic['delta_bic']:.1f} → "
                         f"{cgi_vs_standalone_aic_bic['verdict']}.",
                     )
 
             # Paired bootstrap objective difference (CGI − standalone) on the
-            # full dataset, in the metric's own units — computed for every
+            # held-out rows, in the metric's own units — computed for every
             # standalone channel as one family and Holm-corrected across it, so
             # comparing CGI against several channels doesn't inflate
-            # significance. The headline verdict is the AIC/BIC best channel;
-            # AIC/BIC stays a secondary report.
+            # significance. The headline verdict is the channel chosen on the
+            # train+val pool; AIC/BIC stays a secondary, in-sample report.
             cgi_vs_standalone_paired: dict | None = None
             cgi_vs_standalone_paired_family: list[dict] = []
             if standalones and standalones_bundle:
@@ -2870,20 +2876,34 @@ def run_fusion(
 
             if cgi_vs_standalone_paired_family:
                 try:
+                    comparison_ch, _ = comparison_channel(
+                        standalones_bundle,
+                        [c for c in standalones if c in standalones_bundle],
+                        objective_metric,
+                    )
                     head = _paired_family_headline(
-                        cgi_vs_standalone_paired_family,
-                        (cgi_vs_standalone_aic_bic or {}).get("best_channel"),
+                        cgi_vs_standalone_paired_family, comparison_ch
                     )
                     cgi_vs_standalone_paired = head
-                    _log_fusion(
-                        "OK",
-                        f"[{label}] CGI vs standalones (family of "
-                        f"{len(cgi_vs_standalone_paired_family)}): headline "
-                        f"`{head.get('standalone_channel')}` "
-                        f"Δ={_fmt_or_na(head.get('observed_diff'), '.4f')}, "
-                        f"p={_fmt_or_na(head.get('p_value'), '.4g')}, "
-                        f"Holm p={_fmt_or_na(head.get('p_value_holm'), '.4g')}.",
-                    )
+                    if head is None:
+                        _log_fusion(
+                            "WARN",
+                            f"[{label}] CGI vs standalones: no paired row for "
+                            f"the channel chosen on train+val ({comparison_ch}), "
+                            "so there is no headline comparison.",
+                        )
+                    else:
+                        _log_fusion(
+                            "OK",
+                            f"[{label}] CGI vs standalones (family of "
+                            f"{len(cgi_vs_standalone_paired_family)}): headline "
+                            f"`{head.get('standalone_channel')}` (chosen on "
+                            "train+val), held-out "
+                            f"Δ={_fmt_or_na(head.get('observed_diff'), '.4f')}, "
+                            f"p={_fmt_or_na(head.get('p_value'), '.4g')}, Holm "
+                            f"p={_fmt_or_na(head.get('p_value_holm'), '.4g')} → "
+                            f"{head.get('verdict')}.",
+                        )
                 except Exception as exc:
                     _log_fusion(
                         "WARN",
