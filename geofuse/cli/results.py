@@ -97,6 +97,44 @@ def _difference(row: dict) -> str:
     return f"{cgi:.4f} − {other:.4f} = {diff:+.4f}"
 
 
+def _outer_name(entry: dict) -> str:
+    quantity, exposure = entry.get("quantity"), entry.get("exposure")
+    name = _CHANNELS.get(exposure, exposure)
+    return {
+        "held_out_score": "Held-out score",
+        "held_out_beta": "β per SD",
+        "negative_control_beta": f"β {name}",
+    }.get(quantity, f"CGI − {name}")
+
+
+def _outer_lines(outer: dict) -> list[str]:
+    """The across-split summary: median [range], share holding, corrected p."""
+    summary = outer.get("summary") or []
+    if not summary:
+        return []
+    seeds = outer.get("seeds") or []
+    lines = [
+        f"  Across {outer.get('k')} held-out splits"
+        + (f" (seeds {seeds[0]}–{seeds[-1]})" if seeds else "")
+        + ": median [min, max], share of splits holding, corrected p"
+    ]
+    for e in summary:
+        median, lo, hi = (_num(e.get(k)) for k in ("median", "min", "max"))
+        if median is None:
+            continue
+        share = _num(e.get("share_holds"))
+        p = _num(e.get("corrected_p_holm"))
+        p_text = f"Holm p={p:.3g}" if p is not None else ""
+        if p is None and _num(e.get("corrected_p")) is not None:
+            p_text = f"p={_num(e.get('corrected_p')):.3g}"
+        lines.append(
+            f"    {_outer_name(e):<22}{median:+.4f} [{lo:+.4f}, {hi:+.4f}]"
+            + (f"  holds {share:.0%}" if share is not None else "")
+            + (f"  {p_text}" if p_text else "")
+        )
+    return lines
+
+
 def resolve(value: str, artifacts: Path) -> Path:
     """A path the run recorded, found again: GUI runs record paths relative
     to the folder the GUI ran in, so those are rebased on the run's own
@@ -218,6 +256,7 @@ def summary(label: str, bundle: dict, artifacts: Path) -> list[str]:
             f"{aic.get('verdict')} (ΔAIC {_num(aic.get('delta_aic')):+.1f}, "
             f"ΔBIC {_num(aic.get('delta_bic')):+.1f})"
         )
+    lines += _outer_lines(bundle.get("outer_splits") or {})
 
     params = _params(bundle)
     weights = {

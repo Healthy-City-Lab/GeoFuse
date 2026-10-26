@@ -65,6 +65,31 @@ def _bundle(artifacts: str) -> dict:
             "delta_aic": -2.3,
             "delta_bic": -15.6,
         },
+        "outer_splits": {
+            "k": 10,
+            "seeds": [1, 10],
+            "summary": [
+                {
+                    "quantity": "held_out_beta",
+                    "exposure": "cgi",
+                    "median": 0.031,
+                    "min": 0.004,
+                    "max": 0.058,
+                    "share_holds": 0.7,
+                    "corrected_p": 0.012,
+                },
+                {
+                    "quantity": "cgi_minus_comparator",
+                    "exposure": "g13",
+                    "median": 0.0004,
+                    "min": -0.0011,
+                    "max": 0.0021,
+                    "share_holds": 0.1,
+                    "corrected_p": 0.31,
+                    "corrected_p_holm": 0.31,
+                },
+            ],
+        },
         "averaged_params": {
             "ndvi_weight": 20,
             "gvi_weight": 80,
@@ -121,6 +146,9 @@ class ResultsTests(_Case):
             "CGI vs NDVI alone (chosen on train+val): no difference",
             "in-sample, all channels vs NDVI alone: not justified "
             "(ΔAIC -2.3, ΔBIC -15.6)",
+            "Across 10 held-out splits (seeds 1–10)",
+            "β per SD              +0.0310 [+0.0040, +0.0580]  holds 70%  p=0.012",
+            "CGI − g13             +0.0004 [-0.0011, +0.0021]  holds 10%  Holm p=0.31",
             "NDVI 20, GVI 80 (of 100)",
             "NDVI 700 m, GVI 400 m",
             os.path.join(self.artifacts, "study_results"),
