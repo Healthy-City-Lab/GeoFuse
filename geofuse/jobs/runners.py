@@ -1269,6 +1269,7 @@ def _fusion_config_fingerprint(
     drop_collinear_channels: bool = False,
     categorical_missing: str = "drop",
     split_seed: int = 42,
+    spatial_split_mode: str = "stripe",
 ) -> str:
     """8-char hex hash of every setting that changes the search space / split.
 
@@ -1361,6 +1362,13 @@ def _fusion_config_fingerprint(
         # Another split seed holds out other rows; only appended when the seed
         # is not the default, so default runs keep their hash.
         + ([f"ss:{int(split_seed)}"] if int(split_seed) != 42 else [])
+        # Randomly drawn test blocks are another split; only appended when
+        # used, so striped runs keep their hash.
+        + (
+            [f"spm:{spatial_split_mode}"]
+            if spatial_split and spatial_split_mode != "stripe"
+            else []
+        )
     )
     return _hl.sha256(payload.encode()).hexdigest()[:8]
 
@@ -1556,6 +1564,7 @@ def run_fusion(
     spatial_split: bool = False,
     spatial_block_size_m: float | None = None,
     n_spatial_blocks: int | None = None,
+    spatial_split_mode: str = "stripe",
     check_collinearity: bool = True,
     vif_threshold: float = 10.0,
     drop_collinear_channels: bool = False,
@@ -1779,6 +1788,7 @@ def run_fusion(
             "spatial_split": bool(spatial_split),
             "spatial_block_size_m": spatial_block_size_m,
             "n_spatial_blocks": n_spatial_blocks,
+            "spatial_split_mode": str(spatial_split_mode),
             "split_seed": int(split_seed),
             "check_collinearity": bool(check_collinearity),
             "vif_threshold": float(vif_threshold),
@@ -2341,6 +2351,7 @@ def run_fusion(
                 drop_collinear_channels=bool(drop_collinear_channels),
                 categorical_missing=str(categorical_missing),
                 split_seed=int(split_seed),
+                spatial_split_mode=str(spatial_split_mode),
             )
 
             def _standalone_study_name(ch: str) -> str:
@@ -2367,6 +2378,7 @@ def run_fusion(
                 spatial_split=bool(spatial_split),
                 spatial_block_size_m=spatial_block_size_m,
                 n_spatial_blocks=n_spatial_blocks,
+                spatial_split_mode=str(spatial_split_mode),
             )
             stage(skey("split"), DONE)
 

@@ -187,6 +187,8 @@ PDCOR_BYTES_PER_N2 = 66 * 8
 QUADRATIC_METRICS = frozenset({"partial_distance_corr"})
 #: ``geofuse.fusion.CATEGORICAL_MISSING``.
 CATEGORICAL_MISSING = ("drop", "indicator")
+#: ``geofuse.fusion.SPATIAL_SPLIT_MODES``.
+SPATIAL_SPLIT_MODES = ("stripe", "random")
 
 # ────────────────────────────────────────────────────────────────────
 # NDVI
@@ -392,6 +394,9 @@ FUSION: dict[str, Setting] = {
     "spatial_split": _bool(True, "Hold out whole spatial blocks."),
     "spatial_block_size_m": Setting(
         "float", None, lo=0.0, auto_zero=True, help="Block edge (m); 0 = automatic."
+    ),
+    "spatial_split_mode": _choice(
+        "stripe", SPATIAL_SPLIT_MODES, "Test blocks: evenly striped, or at random."
     ),
     "spatial_adjust_method": _choice(
         "none", SPATIAL_ADJUST_METHODS, "Spatial-confounding adjustment."
