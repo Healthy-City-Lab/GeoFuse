@@ -125,7 +125,7 @@ output_results/fusion/<YYYYMMDDTHHMMSS>__<short_job_id>/
     ├── cgi_vs_comparator_paired.csv    CGI minus each comparator, when named
     ├── decline_terms.csv               greenspace-by-time terms, longitudinal only
     ├── mixedlm_metrics*.csv            all four mixed-effects metrics, longitudinal only
-    ├── aic_bic.json                    CGI vs standalone verdict
+    ├── aic_bic.json                    in-sample AIC / BIC, all channels vs one
     ├── collinearity.json               VIF report, if requested
     └── standalone_<channel>/           per-standalone artifacts
 ```
@@ -142,15 +142,24 @@ tuned to, not because the effect generalises. Read `test` for the honest result
 and `all` only as a descriptive summary.
 
 **Effect tables test on the held-out rows.** In `exposure_response.csv`,
-`moderation.csv`, `decline_terms.csv` and `covariate_impact.csv`, and in the
-paired CGI-versus-channel difference, the estimates use every row and are
-descriptive; standard errors, intervals and p-values come from the held-out
-rows. `test_estimate` is the held-out estimate the interval belongs to,
-`test_n` the rows it rests on and `mde` the minimum detectable effect, 2.8
-held-out standard errors. Each CGI-versus-channel row's `lower`, `upper` and
-`p_value` come from the held-out bootstrap (on `inference_n` rows), and
-`p_value_holm` corrects that p-value across the channels; all four are empty
-when the held-out rows could not be scored.
+`moderation.csv`, `decline_terms.csv` and `covariate_impact.csv` the estimates
+use every row and are descriptive; standard errors, intervals and p-values
+come from the held-out rows. `test_estimate` is the held-out estimate the
+interval belongs to, `test_n` the rows it rests on and `mde` the minimum
+detectable effect, 2.8 held-out standard errors.
+
+**The CGI-versus-channel comparison is read on the held-out rows.** Each paired
+row (`cgi_vs_standalone_paired` in `results_summary.json`) reports the
+held-out difference `observed_diff`, both held-out scores (`cgi_score`,
+`standalone_score`, so the difference is the one between them), its bootstrap
+`lower` / `upper` / `p_value` on the same `n` rows, `p_value_holm` across the
+channels and a `verdict`: `CGI better` (Holm p below 0.05), `standalone
+better` (the interval lies below zero), `no difference` or `no inference`.
+The whole-data figures are descriptive and kept as `observed_diff_all`,
+`cgi_score_all`, `standalone_score_all` and `n_all`. The headline row,
+`comparison_channel`, is the channel whose standalone scores best on the
+train+val rows, so the test rows never choose the channel they judge. The
+headline values are empty when the held-out rows could not be scored.
 
 **`converged`** in each study's `discovery` block of `results_summary.json` is
 false when the posterior's largest R-hat exceeds 1.05; its weights, radii and
@@ -253,8 +262,9 @@ on the same scale: `score` with its interval (`test` is the held-out headline,
 missing a comparator counts only against that comparator), `beta` (the
 covariate-adjusted slope in SD units, with its interval) and `primary`.
 **`cgi_vs_comparator_paired.csv`** holds the paired difference CGI − comparator
-in the objective's units (positive favours the CGI), estimated on every row
-with its interval and p-value from the held-out rows; `p_value_holm` is
+in the objective's units (positive favours the CGI), estimated with its
+interval and p-value on the held-out rows (the whole-data difference and
+scores are the `_all` columns), with a `verdict`; `p_value_holm` is
 Holm-corrected over the primary comparators only and is empty for the others,
 which are descriptive. Comparators are not scored for panels (several rows per
 entity). The same results are in `results_summary.json` under `comparators`,

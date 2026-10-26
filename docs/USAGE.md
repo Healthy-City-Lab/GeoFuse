@@ -130,8 +130,11 @@ own** (a `<column>=missing` dummy). In a run file it is
 - **Headline.** Held-out test score with its 95 % interval, the significance
   test that actually applies (permutation for cross-sectional, Wald for
   mixed-effects), the direction of the relationship, and the verdict against the
-  best standalone channel. Under it, the covariates some rows were missing, with
-  how each was handled and how many rows with an outcome were dropped.
+  channel that scores best on train+val: "CGI vs standalone — objective
+  (held-out)" is the paired held-out test, and "CGI vs standalone — AIC/BIC
+  (in-sample)" beside it is a secondary statistic. Under it, the covariates
+  some rows were missing, with how each was handled and how many rows with an
+  outcome were dropped.
 - **Study detail.** Per study: the discovered radii, aggregators and weights,
   per-subset scores, and the discovery diagnostics, which cover what the sweep
   picked and how contested it was, the posterior weights with credible

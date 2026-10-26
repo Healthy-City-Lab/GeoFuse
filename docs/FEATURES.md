@@ -263,13 +263,21 @@ Nothing below is pre-specified.
   only as descriptive and carry no p-value.
 - **Effects are estimated on all rows and tested on held-out ones.** The
   per-IQR effect, quantile gradient, spline curve, moderation slopes, decline
-  terms, covariate table and the paired CGI-versus-channel difference report
-  their estimates from every row, as descriptive figures, and their standard
-  errors, intervals and p-values from the held-out rows, which never chose the
-  composite. Each row also carries the held-out estimate and the minimum
-  detectable effect, 2.8 held-out standard errors (80 % power at a two-sided
-  5 % level), so a null held-out result can be read against the effect size
-  the test split could have detected.
+  terms and covariate table report their estimates from every row, as
+  descriptive figures, and their standard errors, intervals and p-values from
+  the held-out rows, which never chose the composite. Each row also carries the
+  held-out estimate and the minimum detectable effect, 2.8 held-out standard
+  errors (80 % power at a two-sided 5 % level), so a null held-out result can
+  be read against the effect size the test split could have detected.
+- **The composite is judged against one channel on held-out rows.** The
+  comparison channel is the standalone that scores best on the train+val rows,
+  so the test rows never choose the channel they then judge. The verdict is the
+  paired bootstrap difference CGI − channel on the held-out rows, with both
+  scores, its interval and its p-value from those same rows, Holm-corrected
+  across the channels: CGI better, standalone better or no difference.
+  Whole-data differences are kept as descriptive figures, and the AIC / BIC
+  comparison of all channels against that one channel is reported as a
+  secondary, in-sample statistic.
 - **Reproducibility is measured, not assumed.** The whole discovery is repeated
   on independent reshuffles and the report says how often it landed on the same
   configuration. A low share means the surface is flat, not that the pick is
