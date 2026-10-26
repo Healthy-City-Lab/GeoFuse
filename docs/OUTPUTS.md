@@ -123,6 +123,8 @@ output_results/fusion/<YYYYMMDDTHHMMSS>__<short_job_id>/
     ├── negative_control_retune.csv     re-tune concordance, when requested
     ├── comparators.csv                 comparator exposures, when named
     ├── cgi_vs_comparator_paired.csv    CGI minus each comparator, when named
+    ├── outer_splits.csv                every held-out split's results, outer_splits > 1
+    ├── outer_summary.csv               their spread and corrected test, outer_splits > 1
     ├── decline_terms.csv               greenspace-by-time terms, longitudinal only
     ├── mixedlm_metrics*.csv            all four mixed-effects metrics, longitudinal only
     ├── aic_bic.json                    in-sample AIC / BIC, all channels vs one
@@ -167,9 +169,31 @@ intervals are then not reliable, and the job log says so.
 
 **`spatial_split`** in `results_summary.json` records the spatial blocks the
 held-out split used: `block_size_m`, the `rule` that set it (`given`,
-`bounding box` or `occupied extent`), `occupied_blocks`, `test_blocks`, and
-the realised `test_share` next to the asked `test_size`. It is empty without
-spatial blocks.
+`bounding box` or `occupied extent`), the `mode` that chose the test blocks
+(`stripe` or `random`), the `seed`, `occupied_blocks`, `test_blocks`, and the
+realised `test_share` next to the asked `test_size`. It is empty without
+spatial blocks. `split_seed` records the seed of the held-out split; it is
+also in `run_config.json`.
+
+**`outer_splits.csv`** appears when the job setting `outer_splits` is above 1.
+Split, tuning and held-out scoring were repeated on that many test splits,
+with seeds `split_seed`, `split_seed + 1`, …; split 0 is the run's own split.
+One row per split and result: `quantity` (`held_out_score`, `held_out_beta`
+— the covariate-adjusted slope per SD of the composite —, `cgi_minus_channel`
+against the channel chosen on that split's train+val rows,
+`cgi_minus_comparator`, `negative_control_beta`), the `exposure` it concerns,
+`estimate`, `ci_low`, `ci_high`, `p_value`, and the split's `seed`, `n_test`,
+`n_train_val`, `test_share` and `test_blocks`. The repeated splits run no
+reproducibility, gain or null-calibration loops, and score the primary
+comparators only unless `outer_comparators = "all"`. **`outer_summary.csv`**
+gives, per quantity and exposure, the `median`, `q025` / `q975`, `min` /
+`max`, `share_holds` (the share of splits whose p-value is below 0.05, or
+whose interval excludes zero) and `corrected_p`: the Nadeau–Bengio corrected
+resampled t-test across the splits, two-sided for slopes and one-sided (CGI
+better) for differences. The splits share data, so their own p-values are not
+combined. The held-out score is not tested, since it cannot be negative.
+`corrected_p_holm` corrects the primary comparators as a family. Both tables
+are also in `results_summary.json` under `outer_splits`.
 
 **`null_calibration`** in each study's `discovery` block of
 `results_summary.json` records the refits' `likelihood` (`cross_products` for

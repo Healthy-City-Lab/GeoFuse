@@ -107,9 +107,10 @@ mismatched file is refused, and processed points are skipped.
 4. **Study details.** Covariates, objective metric (Incremental R² by default;
    choose it by the association you expect, see FEATURES), optional
    spatial-confounding
-   adjustment, test-set size, the discovery block (channel set, index form,
-   sweep splits, radius prior, minimum GVI coverage) with validation settings
-   behind an expander, the CGI grid pixel size (for every target type, rasters
+   adjustment, test-set size and split seed, the discovery block (channel
+   set, index form, sweep splits, radius prior, minimum GVI coverage) with
+   validation settings behind an expander (including "Held-out splits", which
+   repeats the whole tuning on that many test splits), the CGI grid pixel size (for every target type, rasters
    included), the exposure buffer, composite scaling, and whether to run each
    channel on its own. Choose the range-based radius prior when the distance of
    influence should not depend on the ladder's spacing.

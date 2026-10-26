@@ -260,7 +260,17 @@ Nothing below is pre-specified.
   default, is never touched during tuning. The winning configuration is scored
   on it once, with a percentile bootstrap interval and a permutation p-value
   (Freedman-Lane when covariates are controlled). Whole-data figures are shown
-  only as descriptive and carry no p-value.
+  only as descriptive and carry no p-value. The split seed is a setting.
+  Spatial test blocks are striped evenly across the extent by default, which
+  leaves a seed only a few test sets to choose from, or drawn at random, so
+  each seed holds out other blocks.
+- **One split need not decide.** A weak association can look strong on one
+  equally valid test set and vanish on another. With several held-out splits,
+  split, tuning and held-out scoring are repeated on each, and every headline
+  result — held-out score and slope, composite minus channel, composite minus
+  comparator, negative-control slopes — is reported as its spread across the
+  splits, the share of splits where it holds, and a corrected resampled t-test
+  across them (the splits share data, so their p-values are not combined).
 - **Effects are estimated on all rows and tested on held-out ones.** The
   per-IQR effect, quantile gradient, spline curve, moderation slopes, decline
   terms and covariate table report their estimates from every row, as
