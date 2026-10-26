@@ -607,3 +607,41 @@ def holm_bonferroni(pvalues) -> list[float]:
         running = max(running, (m - rank) * float(vals[i]))
         out[i] = float(min(1.0, running))
     return out
+
+
+# ────────────────────────────────────────────────────────────────────
+# Inference across repeated held-out splits
+# ────────────────────────────────────────────────────────────────────
+
+
+def corrected_resampled_t(
+    values, test_fraction: float, alternative: str = "two-sided"
+) -> dict:
+    """Nadeau–Bengio corrected resampled t-test of a zero mean.
+
+    ``values`` are one held-out estimate per split of the same data. The
+    splits share most of their training rows, so the estimates are correlated
+    and their plain variance understates the mean's: it is inflated by
+    ``1/K + n_test/n_train`` (``test_fraction`` is ``n_test / n``) before the t
+    on ``K − 1`` degrees of freedom. ``alternative`` is ``two-sided`` or
+    ``greater``. Returns ``{mean, t, p_value, k}``; ``t`` and ``p_value`` are
+    ``None`` with fewer than two finite values or no spread.
+    """
+    from scipy import stats
+
+    if alternative not in ("two-sided", "greater"):
+        raise ValueError(f"alternative must be two-sided or greater: {alternative!r}")
+    v = np.asarray([x for x in values if x is not None], dtype=np.float64)
+    v = v[np.isfinite(v)]
+    out = {"mean": float(v.mean()) if v.size else None, "t": None, "p_value": None}
+    out["k"] = int(v.size)
+    if v.size < 2 or not 0.0 < test_fraction < 1.0:
+        return out
+    var = (1.0 / v.size + test_fraction / (1.0 - test_fraction)) * v.var(ddof=1)
+    if not var > 0:
+        return out
+    t = float(v.mean() / np.sqrt(var))
+    df = v.size - 1
+    p = stats.t.sf(t, df) if alternative == "greater" else 2 * stats.t.sf(abs(t), df)
+    out.update(t=t, p_value=float(p))
+    return out
