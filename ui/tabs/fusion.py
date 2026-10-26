@@ -445,6 +445,8 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "cache_metrics",
     "test_size",
     "split_seed",
+    "outer_splits",
+    "outer_comparators",
     "objective_metric",
     "residualize_method",
     "search_scoring_method",
@@ -505,6 +507,12 @@ _RADIUS_PRIOR_LABELS: dict[str, str] = {
     "range": "Range-based (spacing-invariant)",
 }
 
+# Comparators scored on every held-out split (``settings.OUTER_COMPARATORS``).
+_OUTER_COMPARATOR_LABELS: dict[str, str] = {
+    "primary": "Primary comparators",
+    "all": "All comparators",
+}
+
 # How held-out spatial blocks are chosen (``settings.SPATIAL_SPLIT_MODES``).
 _SPATIAL_SPLIT_MODE_LABELS: dict[str, str] = {
     "stripe": "Striped across the extent",
@@ -526,6 +534,8 @@ _FUSION_PARAM_TO_WIDGET: dict[str, str] = {
     "search_scoring_method": "fusion_search_scoring_method",
     "test_size": "fusion_test_size",
     "split_seed": "fusion_split_seed",
+    "outer_splits": "fusion_outer_splits",
+    "outer_comparators": "fusion_outer_comparators",
     "n_bins": "fusion_stratification_bins",
     "channel_set": "fusion_channel_set",
     "index_form": "fusion_index_form",
@@ -583,6 +593,7 @@ _FUSION_SEED_INT_WIDGETS: frozenset[str] = frozenset(
         "fusion_ndvi_ladder_rungs",
         "fusion_stratification_bins",
         "fusion_split_seed",
+        "fusion_outer_splits",
         "fusion_sweep_splits",
         "fusion_discovery_reps",
         "fusion_discovery_shuffles",
@@ -2220,6 +2231,38 @@ def _render_study_details_panel(
                 step=1,
                 key="fusion_posterior_chains",
             )
+        _default("fusion_outer_splits", _fs_default("outer_splits"))
+        _default(
+            "fusion_outer_comparators",
+            _fs_default("outer_comparators"),
+            list(_OUTER_COMPARATOR_LABELS),
+        )
+        col_v2, col_v3 = st.columns(2)
+        with col_v2:
+            outer_splits_ui = st.number_input(
+                "Held-out splits",
+                **_fs_bounds("outer_splits"),
+                step=1,
+                key="fusion_outer_splits",
+                help=(
+                    "Repeat split, tuning and held-out scoring on this many "
+                    "test splits (seeds: the split seed, then the next ones), "
+                    "and report each result's spread and a corrected resampled "
+                    "t-test across them. 1 = one split. Each extra split costs "
+                    "about one sweep and posterior per study."
+                ),
+            )
+        with col_v3:
+            outer_comparators_ui = st.selectbox(
+                "Comparators on every split",
+                options=list(_OUTER_COMPARATOR_LABELS),
+                format_func=_OUTER_COMPARATOR_LABELS.get,
+                key="fusion_outer_comparators",
+                help=(
+                    "Comparator exposures scored on the repeated splits; the "
+                    "first split always scores all of them."
+                ),
+            )
     posterior_warmup_ui = int(posterior_draws_ui)
 
     # ── Per-pixel CGI scoring ───────────────────────────────────
@@ -2478,6 +2521,8 @@ def _render_study_details_panel(
         "channel_set": str(channel_set_ui),
         "index_form": str(index_form_ui),
         "sweep_splits": int(sweep_splits_ui),
+        "outer_splits": int(outer_splits_ui),
+        "outer_comparators": str(outer_comparators_ui),
         "discovery_reps": int(discovery_reps_ui),
         "discovery_shuffles": int(discovery_shuffles_ui),
         "gain_splits": int(gain_splits_ui),
@@ -2625,6 +2670,53 @@ def _comparator_rows(results_view: dict) -> list[dict]:
             row["Holm p"] = _fmt(p.get("p_value_holm"), 4)
         rows.append(row)
     return rows
+
+
+_OUTER_QUANTITY_LABELS: dict[str, str] = {
+    "held_out_score": "Held-out score",
+    "held_out_beta": "β per SD",
+    "cgi_minus_channel": "CGI − channel",
+    "cgi_minus_comparator": "CGI − comparator",
+    "negative_control_beta": "Negative-control β",
+}
+
+
+def _render_outer_splits(results_view: dict) -> None:
+    """Each result's spread across the repeated held-out splits."""
+    outer = results_view.get("outer_splits") or {}
+    summary = outer.get("summary") or []
+    if not summary:
+        return
+    st.divider()
+    st.markdown("**Across held-out splits**")
+    seeds = outer.get("seeds") or []
+    st.caption(
+        f"Split, tuning and held-out scoring repeated on {outer.get('k')} test "
+        "splits"
+        + (f" (seeds {seeds[0]}–{seeds[-1]})" if seeds else "")
+        + ". The splits share data, so the test across them is a corrected "
+        "resampled t, not a combination of the per-split p-values. The held-out "
+        "score is not tested (it cannot be negative); its signed slope is. "
+        "Every other table on this page reads the first split."
+    )
+    rows = [
+        {
+            "Result": _OUTER_QUANTITY_LABELS.get(e.get("quantity"), e.get("quantity")),
+            "Exposure": _CHANNEL_DISPLAY.get(e.get("exposure"), e.get("exposure")),
+            "Splits": e.get("n_splits"),
+            "Median": _fmt(e.get("median"), 4),
+            "2.5–97.5 %": f"[{_fmt(e.get('q025'), 4)}, {_fmt(e.get('q975'), 4)}]",
+            "Holds in": (
+                "—"
+                if _num(e.get("share_holds")) is None
+                else f"{float(e['share_holds']):.0%}"
+            ),
+            "Corrected p": _fmt(e.get("corrected_p"), 4),
+            "Holm p": _fmt(e.get("corrected_p_holm"), 4),
+        }
+        for e in summary
+    ]
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 
 def _render_comparators(results_view: dict, metric_name: str) -> None:
@@ -5140,6 +5232,7 @@ def _render_fusion_results_body(output_dir: str) -> None:
 
     # ── Comparator exposures ────────────────────────────────────
     _render_comparators(results_view, metric_name)
+    _render_outer_splits(results_view)
 
     # ── Channel collinearity report ─────────────────────────────
     _render_collinearity_report(results_view)
@@ -5838,6 +5931,8 @@ def render(output_dir: str) -> None:
     channel_set_param = str(study_state.get("channel_set", "ndvi + gvi"))
     index_form_param = str(study_state.get("index_form", "sweep"))
     sweep_splits_param = int(study_state.get("sweep_splits", 40))
+    outer_splits_param = int(study_state.get("outer_splits", 1))
+    outer_comparators_param = str(study_state.get("outer_comparators", "primary"))
     discovery_reps_param = int(study_state.get("discovery_reps", 5))
     discovery_shuffles_param = int(study_state.get("discovery_shuffles", 12))
     gain_splits_param = int(study_state.get("gain_splits", 20))
@@ -6283,6 +6378,8 @@ def render(output_dir: str) -> None:
                 "channel_set": channel_set_param,
                 "index_form": index_form_param,
                 "sweep_splits": int(sweep_splits_param),
+                "outer_splits": int(outer_splits_param),
+                "outer_comparators": outer_comparators_param,
                 "discovery_reps": int(discovery_reps_param),
                 "discovery_shuffles": int(discovery_shuffles_param),
                 "gain_splits": int(gain_splits_param),
