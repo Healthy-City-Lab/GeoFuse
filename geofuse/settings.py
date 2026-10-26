@@ -309,6 +309,7 @@ FUSION: dict[str, Setting] = {
         False, "Run partial_distance_corr even where it may not fit in memory."
     ),
     "test_size": Setting("float", 0.25, lo=0.1, hi=0.5, help="Held-out test fraction."),
+    "split_seed": _int(42, 0, 2**31 - 1, "Seed of the held-out test split."),
     "n_bins": _int(5, 3, 10, "Quantile bins of the stratified split."),
     "residualize_method": _choice(
         "linear", ("linear", "spline"), "How covariates are partialled out."

@@ -927,6 +927,7 @@ def fusion_run_config(spec: JobSpec) -> dict[str, Any]:
         "n_bins": int(s["n_bins"]),
         "cache_metrics": False,
         "test_size": float(s["test_size"]),
+        "split_seed": int(s["split_seed"]),
         "objective_metric": s["objective_metric"],
         "residualize_method": s["residualize_method"],
         "search_scoring_method": s["search_scoring_method"],

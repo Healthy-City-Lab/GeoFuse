@@ -1268,6 +1268,7 @@ def _fusion_config_fingerprint(
     gvi_min_coverage: float = 0.95,
     drop_collinear_channels: bool = False,
     categorical_missing: str = "drop",
+    split_seed: int = 42,
 ) -> str:
     """8-char hex hash of every setting that changes the search space / split.
 
@@ -1357,6 +1358,9 @@ def _fusion_config_fingerprint(
             if "log" in (gvi_ladder_spacing, ndvi_ladder_spacing)
             else []
         )
+        # Another split seed holds out other rows; only appended when the seed
+        # is not the default, so default runs keep their hash.
+        + ([f"ss:{int(split_seed)}"] if int(split_seed) != 42 else [])
     )
     return _hl.sha256(payload.encode()).hexdigest()[:8]
 
@@ -1506,6 +1510,7 @@ def run_fusion(
     cache_metrics: bool = False,
     test_size: float,
     objective_metric: str,
+    split_seed: int = 42,
     gvi_api_key: str | None = None,
     ndvi_start_date: str | None = None,
     ndvi_end_date: str | None = None,
@@ -1774,6 +1779,7 @@ def run_fusion(
             "spatial_split": bool(spatial_split),
             "spatial_block_size_m": spatial_block_size_m,
             "n_spatial_blocks": n_spatial_blocks,
+            "split_seed": int(split_seed),
             "check_collinearity": bool(check_collinearity),
             "vif_threshold": float(vif_threshold),
             "drop_collinear_channels": bool(drop_collinear_channels),
@@ -2334,6 +2340,7 @@ def run_fusion(
                 gvi_min_coverage=float(gvi_min_coverage),
                 drop_collinear_channels=bool(drop_collinear_channels),
                 categorical_missing=str(categorical_missing),
+                split_seed=int(split_seed),
             )
 
             def _standalone_study_name(ch: str) -> str:
@@ -2356,7 +2363,7 @@ def run_fusion(
             engine.split_data(
                 fusion_df=fusion_df,
                 test_size=test_size,
-                random_state=42,
+                random_state=int(split_seed),
                 spatial_split=bool(spatial_split),
                 spatial_block_size_m=spatial_block_size_m,
                 n_spatial_blocks=n_spatial_blocks,
@@ -3199,6 +3206,7 @@ def run_fusion(
                 "cgi_effects": cgi_effects,
                 "cgi_vs_standalone_paired": cgi_vs_standalone_paired,
                 "cgi_vs_standalone_paired_family": cgi_vs_standalone_paired_family,
+                "split_seed": int(split_seed),
             }
             by_target[label] = bundle
 
