@@ -50,6 +50,7 @@ _FUSION_STAGE_WEIGHTS: dict[str, float] = {
     "reports": 1.0,
     "comparators": 4.0,
     "negative_control_retune": 20.0,
+    "outer_splits": 40.0,
 }
 
 _FUSION_RETUNE_STAGE: tuple[str, str] = (
@@ -60,6 +61,11 @@ _FUSION_RETUNE_STAGE: tuple[str, str] = (
 _FUSION_COMPARATORS_STAGE: tuple[str, str] = (
     "comparators",
     "Score comparator exposures",
+)
+
+_FUSION_OUTER_SPLITS_STAGE: tuple[str, str] = (
+    "outer_splits",
+    "Repeat on other held-out splits",
 )
 
 _FUSION_LONGITUDINAL_STAGE: tuple[str, str] = (
@@ -705,6 +711,12 @@ def _write_fusion_outputs(
         ]
         _emit_csv(f"cgi_vs_comparator_paired{sfx}.csv", paired_rows)
 
+    # ── outer_splits.csv + outer_summary.csv ────────────────────
+    outer = (cgi_bundle or {}).get("outer_splits") or {}
+    if outer.get("splits"):
+        _emit_csv(f"outer_splits{sfx}.csv", outer["splits"])
+        _emit_csv(f"outer_summary{sfx}.csv", outer.get("summary") or [])
+
     # ── results_summary.json (master manifest) ──────────────────
     studies_manifest: dict[str, dict] = {}
     for key, disp, b in studies:
@@ -811,6 +823,7 @@ def _write_fusion_outputs(
         "covariate_missing": (cgi_bundle or {}).get("covariate_missing"),
         "split_seed": (cgi_bundle or {}).get("split_seed"),
         "spatial_split": (cgi_bundle or {}).get("spatial_split"),
+        "outer_splits": (cgi_bundle or {}).get("outer_splits"),
     }
     _emit_json(f"results_summary{sfx}.json", manifest)
 
@@ -916,6 +929,7 @@ def _build_fusion_ledger(
     mixedlm_postscore: bool = False,
     negative_control_retune: bool = False,
     comparators: bool = False,
+    outer_splits: bool = False,
 ) -> StageLedger:
     """Fresh ledger covering every (outcome, step) pair in run order.
 
@@ -933,7 +947,8 @@ def _build_fusion_ledger(
     spec too but score with OLS so they skip the post-score step).
     ``negative_control_retune`` appends one re-tune stage per outcome, after
     its standalones, where the runner performs it; ``comparators`` one stage
-    for the comparator exposures, between the two.
+    for the comparator exposures, between the two; ``outer_splits`` one stage
+    for the repeated held-out splits, last.
     """
     standalones = list(standalone_channels or [])
     steps: list[tuple[str, str]] = []
@@ -985,6 +1000,14 @@ def _build_fusion_ledger(
                 (
                     _fusion_stage_key(label, rt_key_raw, multi=multi),
                     f"[{label}] {rt_label}" if multi else rt_label,
+                )
+            )
+        if outer_splits:
+            os_key_raw, os_label = _FUSION_OUTER_SPLITS_STAGE
+            steps.append(
+                (
+                    _fusion_stage_key(label, os_key_raw, multi=multi),
+                    f"[{label}] {os_label}" if multi else os_label,
                 )
             )
     return StageLedger.from_steps(steps)

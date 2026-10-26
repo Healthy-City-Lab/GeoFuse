@@ -68,6 +68,9 @@ class EngineConstantTests(unittest.TestCase):
         self.assertEqual(settings.EXPOSURE_KERNELS, exposure.KERNELS)
         self.assertEqual(settings.CATEGORICAL_MISSING, fusion.CATEGORICAL_MISSING)
         self.assertEqual(settings.SPATIAL_SPLIT_MODES, fusion.SPATIAL_SPLIT_MODES)
+        from geofuse.jobs import outer_splits
+
+        self.assertEqual(settings.OUTER_COMPARATORS, outer_splits.OUTER_COMPARATORS)
         from geofuse import pdcor
 
         self.assertEqual(settings.PDCOR_CACHE_N, pdcor.MAX_CACHE_N)

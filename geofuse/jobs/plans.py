@@ -928,6 +928,8 @@ def fusion_run_config(spec: JobSpec) -> dict[str, Any]:
         "cache_metrics": False,
         "test_size": float(s["test_size"]),
         "split_seed": int(s["split_seed"]),
+        "outer_splits": int(s["outer_splits"]),
+        "outer_comparators": s["outer_comparators"],
         "objective_metric": s["objective_metric"],
         "residualize_method": s["residualize_method"],
         "search_scoring_method": s["search_scoring_method"],

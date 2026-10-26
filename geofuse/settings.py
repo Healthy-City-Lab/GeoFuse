@@ -189,6 +189,8 @@ QUADRATIC_METRICS = frozenset({"partial_distance_corr"})
 CATEGORICAL_MISSING = ("drop", "indicator")
 #: ``geofuse.fusion.SPATIAL_SPLIT_MODES``.
 SPATIAL_SPLIT_MODES = ("stripe", "random")
+#: ``geofuse.jobs.outer_splits.OUTER_COMPARATORS``.
+OUTER_COMPARATORS = ("primary", "all")
 
 # ────────────────────────────────────────────────────────────────────
 # NDVI
@@ -312,6 +314,12 @@ FUSION: dict[str, Setting] = {
     ),
     "test_size": Setting("float", 0.25, lo=0.1, hi=0.5, help="Held-out test fraction."),
     "split_seed": _int(42, 0, 2**31 - 1, "Seed of the held-out test split."),
+    "outer_splits": _int(
+        1, 1, 100, "Held-out splits, each tuned anew; seeds split_seed + k."
+    ),
+    "outer_comparators": _choice(
+        "primary", OUTER_COMPARATORS, "Comparators scored on every held-out split."
+    ),
     "n_bins": _int(5, 3, 10, "Quantile bins of the stratified split."),
     "residualize_method": _choice(
         "linear", ("linear", "spline"), "How covariates are partialled out."

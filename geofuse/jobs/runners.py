@@ -46,6 +46,7 @@ from geofuse.jobs import (
     GVI_PROGRESS_MIN_SECONDS,
     ProgressThrottle,
 )
+from geofuse.jobs import outer_splits as _outer
 from geofuse.jobs.fusion_outputs import (
     _STANDALONE_CHANNEL_LABELS,
     _build_fusion_ledger,
@@ -1207,6 +1208,127 @@ def _paired_family_headline(family: list[dict], channel: str | None) -> dict | N
     return head
 
 
+def _run_outer_splits(
+    engine: Any,
+    *,
+    k_splits: int,
+    split_seed: int,
+    split_kwargs: dict,
+    fit_kwargs: dict,
+    headline_params: dict,
+    metric: str,
+    first_split: dict,
+    standalones: list[str],
+    comparators: list[str],
+    comparators_primary: list[str],
+    outer_comparators: str,
+    n_effects_boot: int,
+    n_perm: int,
+    n_paired: int,
+    stage_key: str,
+    stage: Any,
+    stage_progress: Any,
+    ctx: Any,
+    label: str,
+) -> dict | None:
+    """The first split's results and ``k_splits − 1`` repeats, summarised.
+
+    The first split's rows come from the run's own reports (its comparators
+    reduced to the ones every split scores); the repeats from
+    :func:`geofuse.jobs.outer_splits.repeat`. The engine is put back on the
+    first split afterwards. A failure is logged and the run continues.
+    Returns ``{k, seeds, comparators, splits, summary}``.
+    """
+    stage(stage_key, RUNNING)
+    scored = set(
+        _outer.scored_comparators(comparators, comparators_primary, outer_comparators)
+    )
+    primary = set(comparators_primary or comparators)
+    try:
+        rows = []
+        info = _outer.split_info(engine)
+        for r in _outer.split_rows(
+            effects_test=(first_split.get("effects") or {}).get("test"),
+            slope_test=engine.compute_partial_slopes(headline_params).get("test"),
+            channel_paired=first_split.get("channel_paired"),
+            comparator_paired=[
+                r
+                for r in first_split.get("comparator_paired") or []
+                if r.get("comparator") in scored
+            ],
+            negative_controls=first_split.get("negative_controls"),
+        ):
+            r.update(split=0, seed=int(split_seed), **info)
+            if r["quantity"] == "cgi_minus_comparator":
+                r["primary"] = r["exposure"] in primary
+
+            rows.append(r)
+
+        def _progress(k: int) -> None:
+            stage_progress(
+                stage_key, k / k_splits, f"split {k + 1:,}/{k_splits:,}"
+            )
+            ctx.progress(
+                status_text=f"[{label}] Held-out split {k + 1}/{k_splits}..."
+            )
+
+        rows += _outer.repeat(
+            engine,
+            k_splits=k_splits,
+            split_seed=split_seed,
+            split_kwargs=split_kwargs,
+            fit_kwargs=fit_kwargs,
+            metric=metric,
+            standalones=standalones,
+            comparators=comparators,
+            comparators_primary=comparators_primary,
+            outer_comparators=outer_comparators,
+            n_effects_boot=n_effects_boot,
+            n_perm=n_perm,
+            n_paired=n_paired,
+            log=lambda level, msg: _log_fusion(level, f"[{label}] {msg}"),
+            progress=_progress,
+            cancelled=ctx.is_cancelled,
+        )
+    except JobCancelled:
+        raise
+    except Exception as exc:
+        _log_fusion(
+            "WARN",
+            f"[{label}] Repeated held-out splits failed: {exc}. The run continues "
+            "with the first split's results.",
+        )
+        stage(stage_key, FAILED, str(exc))
+        rows = None
+    finally:
+        engine._active_greenery_channel = "cgi"
+        engine.split_data(random_state=int(split_seed), **split_kwargs)
+        engine.best_params = dict(headline_params)
+    if rows is None:
+        return None
+    summary = _outer.summarise(rows)
+    for e in summary:
+        if e["quantity"] == "held_out_score":
+            continue
+        _log_fusion(
+            "OK",
+            f"[{label}] Across {e['n_splits']} held-out splits, "
+            f"{e['quantity']} ({e['exposure']}): median "
+            f"{_fmt_or_na(e['median'], '.4f')} [{_fmt_or_na(e['min'], '.4f')}, "
+            f"{_fmt_or_na(e['max'], '.4f')}], holds in "
+            f"{_fmt_or_na(e['share_holds'], '.0%')}, corrected "
+            f"p={_fmt_or_na(e['corrected_p'], '.3g')}.",
+        )
+    stage(stage_key, DONE)
+    return {
+        "k": int(k_splits),
+        "seeds": [int(split_seed) + k for k in range(int(k_splits))],
+        "comparators": str(outer_comparators),
+        "splits": rows,
+        "summary": summary,
+    }
+
+
 def _build_fusion_study_name(
     target_display_name: str,
     label: str,
@@ -1519,6 +1641,8 @@ def run_fusion(
     test_size: float,
     objective_metric: str,
     split_seed: int = 42,
+    outer_splits: int = 1,
+    outer_comparators: str = "primary",
     gvi_api_key: str | None = None,
     ndvi_start_date: str | None = None,
     ndvi_end_date: str | None = None,
@@ -1611,7 +1735,13 @@ def run_fusion(
     benchmark the composite against. Each is scored untuned, as a frozen
     composite, on the CGI's own rows, split and covariates, with a paired
     CGI − comparator test whose Holm correction runs over
-    ``comparators_primary`` (all of them when ``None``)."""
+    ``comparators_primary`` (all of them when ``None``).
+
+    ``outer_splits`` > 1 repeats split → tuning → held-out scoring on seeds
+    ``split_seed + 1 …`` (see :mod:`geofuse.jobs.outer_splits`), scoring the
+    comparators ``outer_comparators`` names on each, and reports the spread
+    and a corrected resampled t across all splits; every other report stays
+    on the first split."""
     # Bound before the body so the handlers below can close out the ledger no
     # matter how early a run fails.
     ledger = None
@@ -1735,6 +1865,7 @@ def run_fusion(
             mixedlm_postscore=mixedlm_postscore_enabled,
             negative_control_retune=retune_enabled,
             comparators=bool(comparator_cols),
+            outer_splits=int(outer_splits) > 1,
         )
         ctx.update_stage_ledger(ledger.to_dict())
 
@@ -1790,6 +1921,8 @@ def run_fusion(
             "n_spatial_blocks": n_spatial_blocks,
             "spatial_split_mode": str(spatial_split_mode),
             "split_seed": int(split_seed),
+            "outer_splits": int(outer_splits),
+            "outer_comparators": str(outer_comparators),
             "check_collinearity": bool(check_collinearity),
             "vif_threshold": float(vif_threshold),
             "drop_collinear_channels": bool(drop_collinear_channels),
@@ -3154,6 +3287,61 @@ def run_fusion(
                         ),
                     )
 
+            # ── Repeated held-out splits ────────────────
+            outer_report: dict | None = None
+            if int(outer_splits) > 1:
+                outer_report = _run_outer_splits(
+                    engine,
+                    k_splits=int(outer_splits),
+                    split_seed=int(split_seed),
+                    split_kwargs={
+                        "fusion_df": fusion_df,
+                        "test_size": test_size,
+                        "spatial_split": bool(spatial_split),
+                        "spatial_block_size_m": spatial_block_size_m,
+                        "n_spatial_blocks": n_spatial_blocks,
+                        "spatial_split_mode": str(spatial_split_mode),
+                    },
+                    fit_kwargs={
+                        "forms": index_forms,
+                        "sweep_splits": int(sweep_splits),
+                        "draws": int(posterior_draws),
+                        "warmup": int(posterior_warmup),
+                        "chains": int(posterior_chains),
+                        "radius_prior": str(radius_prior),
+                        "seed": 42,
+                        "cancel_callback": cancel_check,
+                    },
+                    headline_params=headline_params,
+                    metric=objective_metric,
+                    first_split={
+                        "effects": cgi_effects,
+                        "channel_paired": cgi_vs_standalone_paired,
+                        "comparator_paired": cgi_vs_comparator_paired,
+                        "negative_controls": negative_control_report,
+                    },
+                    standalones=(
+                        [c for c in standalones if c in standalones_bundle]
+                        if standalones
+                        else []
+                    ),
+                    comparators=list(outcome_cmps or []),
+                    comparators_primary=[
+                        c for c in (outcome_cmps or []) if c in primary_cols
+                    ],
+                    outer_comparators=str(outer_comparators),
+                    n_effects_boot=int(report_effects_bootstrap),
+                    n_perm=int(report_effects_permutations),
+                    n_paired=int(report_paired_bootstrap),
+                    stage_key=skey("outer_splits"),
+                    stage=stage,
+                    stage_progress=stage_progress,
+                    ctx=ctx,
+                    label=label,
+                )
+                if ctx.is_cancelled():
+                    return {"output_paths": output_paths}
+
             bundle = {
                 "best_params": best_params,
                 "averaged_params": averaged_params,
@@ -3219,6 +3407,7 @@ def run_fusion(
                 "cgi_vs_standalone_paired": cgi_vs_standalone_paired,
                 "cgi_vs_standalone_paired_family": cgi_vs_standalone_paired_family,
                 "split_seed": int(split_seed),
+                "outer_splits": outer_report,
             }
             by_target[label] = bundle
 

@@ -1,11 +1,22 @@
-"""Corrected resampled t-test across repeated held-out splits.
+"""Repeated held-out evaluation: the tuning redone on other test splits.
 
-Under a null outcome it rejects at about its level over ten splits, while a
-naive t over the same splits rejects several times as often.
+Pinned here:
+
+- under a null outcome the corrected resampled t over ten splits rejects at
+  about its level, while a naive t over the same splits rejects several times
+  as often;
+- the summary gives each result's spread, the share of splits where it holds
+  and the corrected p-value, Holm-corrected over the primary comparators;
+- on the repeats only the primary comparators are scored unless all are asked;
+- a run with three splits reports every quantity per split, a planted effect
+  holds in most of them, the first split's results are the single-split run's,
+  and the tables are written.
 """
 
+import csv
 import os
 import sys
+import tempfile
 import unittest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -17,6 +28,7 @@ import geopandas as gpd  # noqa: F401
 import numpy as np
 from scipy import stats
 
+from geofuse.jobs import outer_splits
 from geofuse.statistical_testing import corrected_resampled_t
 
 
@@ -61,6 +73,223 @@ class TestCorrectedResampledT(unittest.TestCase):
         self.assertIsNone(corrected_resampled_t([0.1, None, 0.1], 0.25)["t"])
         with self.assertRaises(ValueError):
             corrected_resampled_t([0.1, 0.2], 0.25, alternative="less")
+
+
+def _rows(quantity, exposure, estimates, p=None, **extra):
+    return [
+        {
+            "quantity": quantity,
+            "exposure": exposure,
+            "estimate": e,
+            "ci_low": e - 0.01,
+            "ci_high": e + 0.01,
+            "p_value": p,
+            "split": k,
+            "test_share": 0.25,
+            **extra,
+        }
+        for k, e in enumerate(estimates)
+    ]
+
+
+class TestSummary(unittest.TestCase):
+    def test_spread_share_and_corrected_p(self):
+        rows = _rows("held_out_beta", "cgi", [0.03, 0.02, 0.04, -0.005, 0.03])
+        (entry,) = outer_splits.summarise(rows)
+        self.assertEqual(entry["n_splits"], 5)
+        self.assertAlmostEqual(entry["median"], 0.03)
+        self.assertEqual((entry["min"], entry["max"]), (-0.005, 0.04))
+        # The fourth interval holds zero.
+        self.assertAlmostEqual(entry["share_holds"], 0.8)
+        expected = corrected_resampled_t([0.03, 0.02, 0.04, -0.005, 0.03], 0.25)
+        self.assertAlmostEqual(entry["corrected_p"], expected["p_value"])
+
+    def test_the_score_is_summarised_but_not_tested(self):
+        (entry,) = outer_splits.summarise(
+            _rows("held_out_score", "cgi", [0.004, 0.001], p=0.01)
+        )
+        self.assertEqual(entry["share_holds"], 1.0)
+        self.assertIsNone(entry["corrected_p"])
+
+    def test_holm_runs_over_the_primary_comparators(self):
+        rows = (
+            _rows("cgi_minus_comparator", "a", [0.02, 0.03, 0.025], primary=True)
+            + _rows("cgi_minus_comparator", "b", [0.0, 0.01, -0.01], primary=True)
+            + _rows("cgi_minus_comparator", "c", [0.02, 0.02, 0.03], primary=False)
+            + _rows("cgi_minus_channel", "ndvi", [0.01, 0.0, 0.02])
+        )
+        summary = outer_splits.summarise(rows)
+        by = {(e["quantity"], e["exposure"]): e for e in summary}
+        a, b = by[("cgi_minus_comparator", "a")], by[("cgi_minus_comparator", "b")]
+        holm = sorted([a["corrected_p"], b["corrected_p"]])
+        smallest = min(a["corrected_p_holm"], b["corrected_p_holm"])
+        self.assertAlmostEqual(smallest, min(1.0, 2 * holm[0]))
+        self.assertIsNone(by[("cgi_minus_comparator", "c")]["corrected_p_holm"])
+        self.assertIsNone(by[("cgi_minus_channel", "ndvi")]["corrected_p_holm"])
+        first = outer_splits.summarise(rows)[0]
+        self.assertEqual(first["quantity"], "cgi_minus_channel")
+
+    def test_the_repeats_score_the_primary_comparators(self):
+        pick = outer_splits.scored_comparators
+        self.assertEqual(pick(["a", "b", "c"], ["b"], "primary"), ["b"])
+        self.assertEqual(pick(["a", "b", "c"], ["b"], "all"), ["a", "b", "c"])
+        self.assertEqual(pick(["a", "b"], [], "primary"), ["a", "b"])
+
+    def test_split_rows_read_the_engine_reports(self):
+        rows = outer_splits.split_rows(
+            effects_test={
+                "score": 0.01,
+                "lower": 0.0,
+                "upper": 0.02,
+                "p_value": 0.03,
+            },
+            slope_test={
+                "beta": 0.1,
+                "ci_low": 0.02,
+                "ci_high": 0.18,
+                "t": 2.5,
+                "df": 90,
+            },
+            channel_paired={
+                "standalone_channel": "ndvi",
+                "observed_diff": 0.002,
+                "lower": -0.001,
+                "upper": 0.005,
+                "p_value": 0.2,
+            },
+            comparator_paired=[{"comparator": "g13", "observed_diff": 0.001}],
+            negative_controls={
+                "splits": {
+                    "test": {
+                        "controls": {
+                            "grip": {"beta": 0.03, "ci_low": -0.05, "ci_high": 0.11}
+                        }
+                    }
+                }
+            },
+        )
+        got = {(r["quantity"], r["exposure"]): r for r in rows}
+        self.assertEqual(
+            list(got),
+            [
+                ("held_out_score", "cgi"),
+                ("held_out_beta", "cgi"),
+                ("cgi_minus_channel", "ndvi"),
+                ("cgi_minus_comparator", "g13"),
+                ("negative_control_beta", "grip"),
+            ],
+        )
+        self.assertAlmostEqual(
+            got[("held_out_beta", "cgi")]["p_value"], 2 * stats.t.sf(2.5, 90)
+        )
+        self.assertIsNone(got[("negative_control_beta", "grip")]["p_value"])
+
+
+def _write_smooth_study(folder: str) -> None:
+    """``test_fusion_run``'s study with a smooth NDVI field, so that the
+    neighbourhood means the composite reads carry the outcome's signal."""
+    import geopandas as gpd
+    import rasterio
+    from test_fusion_run import _PX, _X0, _Y0, _write_study
+
+    _write_study(folder)
+    rows, cols = np.mgrid[0:160, 0:160]
+    field = (
+        0.5 + 0.25 * np.sin(rows / 9.0) + 0.25 * np.cos(cols / 11.0)
+    ).astype("float32")
+    path = os.path.join(folder, "ndvi_2015.tif")
+    with rasterio.open(path, "r+") as dst:
+        dst.write(field, 1)
+    cohort = gpd.read_file(os.path.join(folder, "cohort.gpkg"))
+    col = ((cohort.geometry.x - (_X0 - 0.01)) / _PX).astype(int)
+    row = (((_Y0 + 0.04) - cohort.geometry.y) / _PX).astype(int)
+    rng = np.random.default_rng(5)
+    cohort["outcome"] = 0.8 * field[row, col] + rng.normal(0, 0.15, len(cohort))
+    cohort.to_file(os.path.join(folder, "cohort.gpkg"), driver="GPKG")
+
+
+class TestRepeatedRun(unittest.TestCase):
+    """A small study whose composite carries a planted effect, run on one
+    held-out split and on three."""
+
+    INPUTS = """
+        mode = "cross-sectional"
+        ndvi = "ndvi_2015.tif"
+        gvi = "gvi.gpkg"
+        """
+
+    @classmethod
+    def setUpClass(cls):
+        from test_fusion_run import run_study
+
+        folder = tempfile.mkdtemp(prefix="geofuse-outer-")
+        _write_smooth_study(folder)
+        comparators = {
+            "comparators": ["ndvi_here", "noise", "patchy"],
+            "comparators_primary": ["ndvi_here", "patchy"],
+        }
+        cls.single = run_study(folder, cls.INPUTS, **comparators)[1]
+        cls.ctx, cls.bundle = run_study(
+            folder, cls.INPUTS, outer_splits=3, **comparators
+        )
+        cls.outer = cls.bundle["outer_splits"]
+
+    def test_every_split_reports_every_quantity(self):
+        self.assertEqual(self.outer["k"], 3)
+        self.assertEqual(self.outer["seeds"], [42, 43, 44])
+        by_split: dict = {}
+        for r in self.outer["splits"]:
+            by_split.setdefault(r["split"], set()).add((r["quantity"], r["exposure"]))
+        self.assertEqual(sorted(by_split), [0, 1, 2])
+        for quantities in by_split.values():
+            names = {q for q, _ in quantities}
+            self.assertTrue(
+                {
+                    "held_out_score",
+                    "held_out_beta",
+                    "cgi_minus_channel",
+                    "cgi_minus_comparator",
+                    "negative_control_beta",
+                }
+                <= names,
+                names,
+            )
+            comparators = {e for q, e in quantities if q == "cgi_minus_comparator"}
+            self.assertEqual(comparators, {"ndvi_here", "patchy"})
+        test_sets = {r["n_test"] for r in self.outer["splits"]}
+        self.assertTrue(all(n > 0 for n in test_sets))
+
+    def test_a_planted_effect_holds_in_most_splits(self):
+        beta = next(
+            e
+            for e in self.outer["summary"]
+            if (e["quantity"], e["exposure"]) == ("held_out_beta", "cgi")
+        )
+        self.assertGreater(beta["median"], 0)
+        self.assertGreaterEqual(beta["share_holds"], 2 / 3)
+
+    def test_the_first_split_is_the_single_split_run(self):
+        self.assertAlmostEqual(
+            self.bundle["cgi_effects"]["test"]["score"],
+            self.single["cgi_effects"]["test"]["score"],
+        )
+        first = {
+            (r["quantity"], r["exposure"]): r["estimate"]
+            for r in self.outer["splits"]
+            if r["split"] == 0
+        }
+        self.assertAlmostEqual(
+            first[("held_out_score", "cgi")],
+            self.single["cgi_effects"]["test"]["score"],
+        )
+
+    def test_the_tables_are_written(self):
+        report = self.bundle["report_dir"]
+        with open(os.path.join(report, "outer_splits.csv"), encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual({r["split"] for r in rows}, {"0", "1", "2"})
+        with open(os.path.join(report, "outer_summary.csv"), encoding="utf-8") as f:
+            self.assertIn("corrected_p", next(csv.reader(f)))
 
 
 if __name__ == "__main__":
