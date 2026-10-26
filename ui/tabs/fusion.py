@@ -477,6 +477,7 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "spatial_adjust_eps_m",
     "spatial_split",
     "spatial_block_size_m",
+    "spatial_split_mode",
     "n_spatial_blocks",
     "channel_set",
     "index_form",
@@ -502,6 +503,12 @@ _LADDER_SPACING_LABELS: dict[str, str] = {"linear": "Linear", "log": "Log-spaced
 _RADIUS_PRIOR_LABELS: dict[str, str] = {
     "rungs": "Rung-based",
     "range": "Range-based (spacing-invariant)",
+}
+
+# How held-out spatial blocks are chosen (``settings.SPATIAL_SPLIT_MODES``).
+_SPATIAL_SPLIT_MODE_LABELS: dict[str, str] = {
+    "stripe": "Striped across the extent",
+    "random": "Drawn at random",
 }
 
 # Missing categorical covariate values (``settings.CATEGORICAL_MISSING``).
@@ -543,6 +550,7 @@ _FUSION_PARAM_TO_WIDGET: dict[str, str] = {
     "area_balanced_split": "fusion_area_balanced_split",
     "spatial_split": "fusion_spatial_split",
     "spatial_block_size_m": "fusion_spatial_block_size_m",
+    "spatial_split_mode": "fusion_spatial_split_mode",
     "spatial_adjust_method": "fusion_spatial_adjust_method",
     "spatial_adjust_max_df": "fusion_spatial_adjust_max_df",
     "spatial_adjust_eps_m": "fusion_spatial_adjust_eps_m",
@@ -2219,6 +2227,7 @@ def _render_study_details_panel(
     area_balanced_split = True
     spatial_split = False
     spatial_block_size_m: float | None = None
+    spatial_split_mode = "stripe"
     n_spatial_blocks: int | None = None
     spatial_adjust_method = "none"
     spatial_adjust_max_df = 10
@@ -2268,9 +2277,9 @@ def _render_study_details_panel(
             key="fusion_spatial_split",
             help=(
                 "Hold out whole spatial blocks (and resample blocks in the "
-                "sweep) so geographic autocorrelation can't "
-                "inflate scores. Test blocks are striped across the full "
-                "extent so every region is represented in the held-out test."
+                "sweep) so geographic autocorrelation can't inflate scores. "
+                "Test blocks are striped across the full extent, or drawn at "
+                "random (Test blocks)."
             ),
         )
         if spatial_split:
@@ -2287,6 +2296,22 @@ def _render_study_details_panel(
             )
             spatial_block_size_m = (
                 float(block_size_ui) if block_size_ui and block_size_ui > 0 else None
+            )
+            _modes = list(_FS["spatial_split_mode"].choices)
+            _default(
+                "fusion_spatial_split_mode", _fs_default("spatial_split_mode"), _modes
+            )
+            spatial_split_mode = st.selectbox(
+                "Test blocks",
+                options=_modes,
+                format_func=lambda k: _SPATIAL_SPLIT_MODE_LABELS[k],
+                key="fusion_spatial_split_mode",
+                help=(
+                    "Striped: test blocks evenly spaced along the block order; "
+                    "the split seed only shifts the stripe, so few test sets "
+                    "exist. Drawn at random: each split seed draws other blocks "
+                    "until they hold the test share."
+                ),
             )
 
         # ── Spatial-confounding adjustment ──────────────────
@@ -2448,6 +2473,7 @@ def _render_study_details_panel(
         "spatial_adjust_eps_m": spatial_adjust_eps_m,
         "spatial_split": bool(spatial_split),
         "spatial_block_size_m": spatial_block_size_m,
+        "spatial_split_mode": str(spatial_split_mode),
         "n_spatial_blocks": n_spatial_blocks,
         "channel_set": str(channel_set_ui),
         "index_form": str(index_form_ui),
@@ -5807,6 +5833,7 @@ def render(output_dir: str) -> None:
     spatial_adjust_eps_m_param = study_state.get("spatial_adjust_eps_m")
     spatial_split_param = bool(study_state.get("spatial_split", False))
     spatial_block_size_m_param = study_state.get("spatial_block_size_m")
+    spatial_split_mode_param = str(study_state.get("spatial_split_mode", "stripe"))
     n_spatial_blocks_param = study_state.get("n_spatial_blocks")
     channel_set_param = str(study_state.get("channel_set", "ndvi + gvi"))
     index_form_param = str(study_state.get("index_form", "sweep"))
@@ -6244,6 +6271,11 @@ def render(output_dir: str) -> None:
                 ),
                 "spatial_block_size_m": (
                     spatial_block_size_m_param if is_vector_target else None
+                ),
+                "spatial_split_mode": (
+                    spatial_split_mode_param
+                    if is_vector_target and spatial_split_param
+                    else "stripe"
                 ),
                 "n_spatial_blocks": (
                     n_spatial_blocks_param if is_vector_target else None
