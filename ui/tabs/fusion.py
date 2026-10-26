@@ -444,6 +444,7 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "n_bins",
     "cache_metrics",
     "test_size",
+    "split_seed",
     "objective_metric",
     "residualize_method",
     "search_scoring_method",
@@ -517,6 +518,7 @@ _FUSION_PARAM_TO_WIDGET: dict[str, str] = {
     "categorical_missing": "fusion_categorical_missing",
     "search_scoring_method": "fusion_search_scoring_method",
     "test_size": "fusion_test_size",
+    "split_seed": "fusion_split_seed",
     "n_bins": "fusion_stratification_bins",
     "channel_set": "fusion_channel_set",
     "index_form": "fusion_index_form",
@@ -572,6 +574,7 @@ _FUSION_SEED_INT_WIDGETS: frozenset[str] = frozenset(
         "fusion_gvi_ladder_rungs",
         "fusion_ndvi_ladder_rungs",
         "fusion_stratification_bins",
+        "fusion_split_seed",
         "fusion_sweep_splits",
         "fusion_discovery_reps",
         "fusion_discovery_shuffles",
@@ -1783,6 +1786,17 @@ def _render_study_details_panel(
                 "sweep splits and refits over."
             ),
         )
+        _default("fusion_split_seed", _fs_default("split_seed"))
+        split_seed = st.number_input(
+            "Split seed",
+            **_fs_bounds("split_seed"),
+            step=1,
+            key="fusion_split_seed",
+            help=(
+                "Seed of the held-out test split. Another seed holds out other "
+                "rows, so a result can be checked against the split it rests on."
+            ),
+        )
     with col_o3:
         _default("fusion_stratification_bins", _fs_default("n_bins"))
         n_bins = st.number_input(
@@ -2411,6 +2425,7 @@ def _render_study_details_panel(
         "residualize_method": str(residualize_method),
         "search_scoring_method": str(search_scoring_method),
         "test_size": float(test_size),
+        "split_seed": int(split_seed),
         "n_bins": int(n_bins),
         "mixedlm_random_slope": bool(mixedlm_random_slope),
         "mixedlm_time_fixed": bool(mixedlm_time_fixed),
@@ -5760,6 +5775,7 @@ def render(output_dir: str) -> None:
     exposure_iqr_param = study_state.get("exposure_iqr")
     objective_metric = study_state["objective_metric"]
     test_size = study_state["test_size"]
+    split_seed = int(study_state.get("split_seed", 42))
     n_bins = study_state["n_bins"]
     resume_existing_study = study_state["resume_existing_study"]
     run_standalones = study_state["run_standalones"]
@@ -6172,6 +6188,7 @@ def render(output_dir: str) -> None:
                 "n_bins": int(n_bins),
                 "cache_metrics": bool(cache_metrics),
                 "test_size": float(test_size),
+                "split_seed": int(split_seed),
                 "objective_metric": objective_metric,
                 "residualize_method": residualize_method_param,
                 "search_scoring_method": search_scoring_method_param,
