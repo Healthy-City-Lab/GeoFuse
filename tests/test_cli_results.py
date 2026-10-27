@@ -88,6 +88,29 @@ def _bundle(artifacts: str) -> dict:
                     "corrected_p": 0.31,
                     "corrected_p_holm": 0.31,
                 },
+                {
+                    "quantity": "posterior_beta",
+                    "exposure": "cgi",
+                    "median": 0.03,
+                    "min": 0.01,
+                    "max": 0.05,
+                    "forms": "linear 7/10, synergy 3/10",
+                },
+                {
+                    "quantity": "posterior_weight",
+                    "exposure": "ndvi",
+                    "median": 0.62,
+                    "min": 0.4,
+                    "max": 0.8,
+                    "share_largest": 0.7,
+                },
+                {
+                    "quantity": "posterior_r50",
+                    "exposure": "ndvi",
+                    "median": 520.0,
+                    "min": 400.0,
+                    "max": 700.0,
+                },
             ],
         },
         "averaged_params": {
@@ -149,11 +172,17 @@ class ResultsTests(_Case):
             "Across 10 held-out splits (seeds 1–10)",
             "β per SD              +0.0310 [+0.0040, +0.0580]  holds 70%  p=0.012",
             "CGI − g13             +0.0004 [-0.0011, +0.0021]  holds 10%  Holm p=0.31",
+            "Posterior on each split's train+val: median [min, max]",
+            "β                     +0.0300 [+0.0100, +0.0500]  forms linear 7/10, "
+            "synergy 3/10",
+            "Weight NDVI           0.620 [0.400, 0.800]  largest 70%",
+            "R50 NDVI              520 m [400, 700]",
             "NDVI 20, GVI 80 (of 100)",
             "NDVI 700 m, GVI 400 m",
             os.path.join(self.artifacts, "study_results"),
         ):
             self.assertIn(part, out)
+        self.assertNotIn("+520.0000", out)
 
     def test_a_job_id_finds_its_bundle_and_unfinished_runs_say_so(self):
         state = StateDir(self.state_dir)

@@ -120,7 +120,7 @@ def _outer_lines(outer: dict) -> list[str]:
     ]
     for e in summary:
         median, lo, hi = (_num(e.get(k)) for k in ("median", "min", "max"))
-        if median is None:
+        if median is None or str(e.get("quantity")).startswith("posterior_"):
             continue
         share = _num(e.get("share_holds"))
         p = _num(e.get("corrected_p_holm"))
@@ -132,6 +132,37 @@ def _outer_lines(outer: dict) -> list[str]:
             + (f"  holds {share:.0%}" if share is not None else "")
             + (f"  {p_text}" if p_text else "")
         )
+    return lines + _posterior_lines(summary)
+
+
+def _posterior_lines(summary: list[dict]) -> list[str]:
+    """Each split's CGI posterior, across the splits: median [min, max]."""
+    rows = [
+        e
+        for e in summary
+        if str(e.get("quantity")).startswith("posterior_")
+        and _num(e.get("median")) is not None
+    ]
+    if not rows:
+        return []
+    lines = ["  Posterior on each split's train+val: median [min, max]"]
+    for e in rows:
+        median, lo, hi = (_num(e.get(k)) for k in ("median", "min", "max"))
+        name = _CHANNELS.get(e.get("exposure"), e.get("exposure"))
+        quantity = e["quantity"]
+        if quantity == "posterior_beta":
+            text = f"{'β':<22}{median:+.4f} [{lo:+.4f}, {hi:+.4f}]"
+            if e.get("forms"):
+                text += f"  forms {e['forms']}"
+        elif quantity == "posterior_weight":
+            text = f"{'Weight ' + name:<22}{median:.3f} [{lo:.3f}, {hi:.3f}]"
+            share = _num(e.get("share_largest"))
+            if share is not None:
+                text += f"  largest {share:.0%}"
+        else:
+            label = "R50 " if quantity == "posterior_r50" else "R90 "
+            text = f"{label + name:<22}{median:.0f} m [{lo:.0f}, {hi:.0f}]"
+        lines.append("    " + text)
     return lines
 
 
