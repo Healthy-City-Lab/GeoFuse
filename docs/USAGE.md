@@ -92,7 +92,10 @@ mismatched file is refused, and processed points are skipped.
    comparators** are the pre-specified ones the Holm correction runs over
    (empty = all). In a run file: `comparators = [...]`,
    `comparators_primary = [...]`; on the command line `--comparator` and
-   `--comparator-primary`.
+   `--comparator-primary`. With controls picked, **Specificity contrast**
+   tests whether the composite is more specific than each primary comparator
+   and the comparison channel (`specificity_contrast = true`,
+   `--specificity-contrast`).
 2. **Optimization setup.** Choose cross-sectional or mixed-effects
    (longitudinal). Longitudinal requires a date column. Cross-sectional can
    optionally use one to route each entity to a year-matched greenery file.
@@ -152,6 +155,15 @@ own** (a `<column>=missing` dummy). In a run file it is
 - **CGI vs comparator exposures.** Each comparator's held-out score, interval,
   p-value, n and β next to the composite's, with the paired difference and its
   Holm p-value (descriptive for non-primary comparators).
+- **Specificity contrast** (when on). Per control and exposure: the four
+  slopes, each exposure's |β target| − |β control|, and their difference with
+  its paired interval, p and Holm p; positive means the composite is the more
+  specific.
+- **Across held-out splits** (with several splits). Each result's spread,
+  share of splits holding and corrected p, the specificity contrast per
+  control included; **Posterior across held-out splits** gives the range of
+  β, each term's weight and R50 / R90, the share of splits in which a term
+  has the largest weight, and the forms chosen.
 - **Covariate impact**, **channel collinearity**, **composite maps**,
   **mixed-effects metrics**, and an index of every file written. **Generate
   CGI Map**, under the map viewer, is a placeholder for a planned full-area map
@@ -428,7 +440,7 @@ geofuse config set limits.max_parallel 6     # jobs the supervisor runs at once
 ### Results
 
 ```bash
-geofuse results JOB                         # held-out score, direction, each channel alone, weights, radii
+geofuse results JOB                         # held-out score, direction, each channel alone, specificity, splits, weights, radii
 geofuse results output_results/fusion/<run>/    # any run, dashboard runs included
 geofuse export JOB -o cgi.csv               # the per-entity CGI table (.gpkg, .csv or .geojson)
 geofuse cgi-map JOB area.gpkg               # planned full-area CGI map; exits 2, not available yet

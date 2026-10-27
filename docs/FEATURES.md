@@ -271,6 +271,11 @@ Nothing below is pre-specified.
   comparator, negative-control slopes — is reported as its spread across the
   splits, the share of splits where it holds, and a corrected resampled t-test
   across them (the splits share data, so their p-values are not combined).
+  Each split's posterior is reported too: the effect, every term's weight,
+  R50 / R90 per channel and the chosen form, with their range across the
+  splits and the share of splits in which each term carries the largest
+  weight, so a distance of influence or a dominant layer read from one split
+  can be checked against the others.
 - **Effects are estimated on all rows and tested on held-out ones.** The
   per-IQR effect, quantile gradient, spline curve, moderation slopes, decline
   terms and covariate table report their estimates from every row, as
@@ -364,6 +369,17 @@ Nothing below is pre-specified.
   and reports how closely its radius, aggregator and weights match the
   target's. Controls are scored for cross-sectional and year-aware runs; a
   panel skips them.
+- **Specificity contrast.** An optional, paired test of whether the composite
+  is less non-specific than another exposure. For each exposure, D = |β target|
+  − |β control|, and the contrast is D(composite) − D(exposure), positive when
+  the composite is the more specific. It is computed per control on the
+  held-out entities, against each primary comparator and the comparison
+  channel. All four slopes are refitted on each paired bootstrap resample,
+  because two exposures' slopes on the same rows move together: their
+  separate intervals overlap even when the difference is clear. The result is
+  an interval and a one-sided p, Holm-corrected over the primary comparators.
+  It is repeated on every held-out split and tested across them with the
+  corrected t. Off by default.
 - **Comparator exposures.** "Does mixing beat the best single channel?" is the
   standalones' question; "does the tuned composite beat the exposure the
   literature already uses?" is a different one. Name existing exposure columns

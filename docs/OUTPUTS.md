@@ -123,6 +123,7 @@ output_results/fusion/<YYYYMMDDTHHMMSS>__<short_job_id>/
     ├── negative_control_retune.csv     re-tune concordance, when requested
     ├── comparators.csv                 comparator exposures, when named
     ├── cgi_vs_comparator_paired.csv    CGI minus each comparator, when named
+    ├── specificity_contrast.csv        CGI vs other exposures per control, when on
     ├── outer_splits.csv                every held-out split's results, outer_splits > 1
     ├── outer_summary.csv               their spread and corrected test, outer_splits > 1
     ├── decline_terms.csv               greenspace-by-time terms, longitudinal only
@@ -194,6 +195,26 @@ better) for differences. The splits share data, so their own p-values are not
 combined. The held-out score is not tested, since it cannot be negative.
 `corrected_p_holm` corrects the primary comparators as a family. Both tables
 are also in `results_summary.json` under `outer_splits`.
+
+Each split also reports the composite's posterior, refitted on that split's
+train+val rows: `posterior_beta`, `posterior_weight` (one row per term, the
+synergy form's pair terms included), `posterior_r50` and `posterior_r90` (one
+row per channel), each with its posterior mean as `estimate`, its credible
+interval and the split's chosen `form`; split 0's rows are the values in
+`discovery.csv`. Being in-sample fits, they are summarised (median, range) but
+not tested. In `outer_summary.csv` each `posterior_weight` entry adds
+`share_largest`, the share of splits in which that term has the largest weight,
+and the `posterior_beta` entry adds `forms`, how often each form was chosen.
+
+With the specificity contrast on (see `specificity_contrast.csv`), every split
+adds three quantities with a `control` column, empty on the other rows:
+`exposure_beta` (the other exposure's held-out slope on the target),
+`exposure_negative_control_beta` (its slope on the control) and
+`specificity_difference` (ΔD, the CGI's specificity minus the exposure's), with
+`kind` (`comparator` or `channel`) and `primary`. They are summarised per
+exposure and control; `specificity_difference` is tested one-sided (the CGI
+more specific), with `corrected_p_holm` over the primary comparators per
+control.
 
 **`null_calibration`** in each study's `discovery` block of
 `results_summary.json` records the refits' `likelihood` (`cross_products` for
@@ -277,6 +298,26 @@ is then shared with an outcome greenery should not cause. Standalone studies get
 the same rows, so the composite's specificity can be read against a single
 channel's, and so do comparator exposures; `exposure` says which kind each
 `study` is (`cgi`, `standalone` or `comparator`).
+
+**`specificity_contrast.csv`** appears when the job setting
+`specificity_contrast` is on. It answers whether the composite is less
+non-specific than another exposure, which the separate rows above cannot
+show: two exposures' slopes on the same rows move together, so their
+intervals overlap even when the difference is clear. One row per exposure and
+control, on the held-out entities where the target, the control and both
+exposures are observed. The exposures are each primary comparator and the
+comparison channel (`kind`). The table gives the four signed slopes
+(`beta_target_cgi`, `beta_control_cgi`, `beta_target_exposure`,
+`beta_control_exposure`), each exposure's specificity `d_cgi` and
+`d_exposure` (|β target| − |β control|), and `delta_d` = `d_cgi` −
+`d_exposure`, positive when the composite is the more specific. `delta_d`
+comes with a paired bootstrap interval in which all four slopes are refitted
+on every resample, and a one-sided `p_value` for `delta_d` > 0.
+`p_value_holm` is corrected over the primary comparators, separately for each
+control. Each control is a separate check, with no correction across
+controls. When repeated splits score all comparators, so does this table. The
+same rows are in `results_summary.json` under `specificity_contrast`. With
+the setting off, nothing in the run's outputs changes.
 
 **`comparators.csv`** appears when comparator exposures were named: existing
 exposure columns of the target, scored untuned on the composite's own rows,
