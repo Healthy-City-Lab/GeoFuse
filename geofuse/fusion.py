@@ -8212,6 +8212,128 @@ class MetricFusionEngine:
             )
         return out
 
+    def compute_specificity_contrast(
+        self,
+        cgi_params: dict,
+        exposures: dict[str, tuple[str, dict]],
+        *,
+        n_boot: int = 1000,
+        seed: int = 42,
+        cluster_column: str | None = None,
+    ) -> dict | None:
+        """Whether the CGI is more specific than each other exposure.
+
+        ``exposures`` maps a name to ``(active channel, params)``: a comparator
+        is ``(comparator_mode(column), {"comparator": column})``, a standalone
+        ``(channel, its params)``. Each is applied next to the CGI and, on the
+        held-out rows, compared with it per negative control by
+        :func:`negative_controls.specificity_contrast` (``ΔD = D_cgi − D_e``,
+        ``D = |β_target| − |β_control|``, ``n_boot`` resamples, whole areas
+        with ``cluster_column``; one seed per control, so every exposure is
+        read on the same resamples). ``rows`` holds one entry per exposure x
+        control; ``slopes`` each exposure's own held-out slopes on the target
+        and on every control, on the rows where each pair is observed, as the
+        CGI's are in :meth:`compute_negative_controls`. ``None`` without
+        controls or exposures; ``{"skipped": "longitudinal"}`` for a panel.
+        """
+        from . import negative_controls as _nc
+
+        if not self.negative_control_columns or not exposures:
+            return None
+        if self.is_panel:
+            return {
+                "skipped": "longitudinal",
+                "controls": list(self.negative_control_columns),
+            }
+        prev = self._active_greenery_channel
+        try:
+            self._active_greenery_channel = "cgi"
+            df = self.apply_fusion(weights=dict(cgi_params))
+            x_cgi = df["composite"].to_numpy(dtype=np.float64)
+            keys = df["polygon_id"].to_numpy() if "polygon_id" in df.columns else None
+            target = df["target"].to_numpy(dtype=np.float64)
+            cov = self._reporting_covariate_matrix(df)
+            clusters = self._reporting_clusters(df, cluster_column)
+            test = self._test_entity_mask(df)
+            controls = {}
+            for name in self.negative_control_columns:
+                values = self._reporting_raw_column(df, name)
+                if values is not None:
+                    controls[name] = values
+            xs: dict[str, np.ndarray] = {}
+            for name, (channel, params) in exposures.items():
+                try:
+                    self._active_greenery_channel = channel
+                    other = self.apply_fusion(weights=dict(params))
+                except JobCancelled:
+                    raise
+                except Exception as exc:
+                    _log("WARN", f"Specificity contrast: '{name}' not applied: {exc}")
+                    continue
+                values = other["composite"].to_numpy(dtype=np.float64)
+                if keys is not None and "polygon_id" in other.columns:
+                    values = (
+                        pd.Series(values, index=other["polygon_id"].to_numpy())
+                        .reindex(keys)
+                        .to_numpy(dtype=np.float64)
+                    )
+                if len(values) == len(x_cgi):
+                    xs[name] = values
+        finally:
+            self._active_greenery_channel = prev
+
+        out: dict = {
+            "controls": list(controls),
+            "exposures": list(xs),
+            "split": "test",
+            "n_test": int(test.sum()),
+            "n_boot": int(n_boot),
+            "cluster_column": cluster_column if clusters is not None else None,
+            "rows": [],
+            "slopes": {},
+        }
+        if not controls or int(test.sum()) < 10:
+            return out
+        c_t = None if cov is None else cov[test]
+        cl_t = None if clusters is None else clusters[test]
+        for name, x_e in xs.items():
+            out["slopes"][name] = {
+                "target": _nc.partial_slope(x_e[test], target[test], c_t),
+                "controls": {
+                    c: _nc.partial_slope(x_e[test], v[test], c_t)
+                    for c, v in controls.items()
+                },
+            }
+            for j, (c, v) in enumerate(controls.items()):
+                res = _nc.specificity_contrast(
+                    x_cgi[test],
+                    x_e[test],
+                    target[test],
+                    v[test],
+                    c_t,
+                    n_boot=int(n_boot),
+                    clusters=cl_t,
+                    seed=int(seed) + j,
+                )
+                out["rows"].append(
+                    {
+                        "exposure": name,
+                        "control": c,
+                        "beta_target_cgi": res["beta_target"],
+                        "beta_control_cgi": res["beta_control"],
+                        "beta_target_exposure": res["beta_target_other"],
+                        "beta_control_exposure": res["beta_control_other"],
+                        "d_cgi": res["d"],
+                        "d_exposure": res["d_other"],
+                        "delta_d": res["delta"],
+                        "ci_low": res["ci_low"],
+                        "ci_high": res["ci_high"],
+                        "p_value": res["p_value"],
+                        "n": res["n"],
+                    }
+                )
+        return out
+
     def retune_concordance(
         self, target_params: dict, metric: str, **fit_kwargs
     ) -> dict:

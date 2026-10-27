@@ -17,7 +17,10 @@ against each control:
   bootstrap interval, both slopes re-estimated on every resample, whole
   clusters resampled when entities are nested in areas;
 - :func:`transfer_test` — both, for each control, plus the ``nonspecific``
-  flag: the control's interval excludes zero and Δ's interval includes it.
+  flag: the control's interval excludes zero and Δ's interval includes it;
+- :func:`specificity_contrast` — whether one exposure is more specific than
+  another on the same rows: ``ΔD = D_a − D_b`` with ``D = |β_target| −
+  |β_control|``, all four slopes re-estimated on every resample.
 
 Pure numpy and scipy, so the same code serves the engine and a direct caller.
 """
@@ -201,6 +204,134 @@ def paired_contrast(
         out["ratio_ci_low"], out["ratio_ci_high"] = (
             float(v) for v in np.nanpercentile(ratios, [tail, 100.0 - tail])
         )
+    return out
+
+
+def specificity_contrast(
+    exposure,
+    other,
+    target,
+    control,
+    covariates=None,
+    *,
+    n_boot: int = 1000,
+    clusters=None,
+    seed: int = 0,
+    level: float = 0.95,
+) -> dict:
+    """``ΔD = D − D_other``: is ``exposure`` more specific than ``other``.
+
+    ``D = |β_target| − |β_control|`` per exposure, as in
+    :func:`paired_contrast`, on the rows where both exposures, the target, the
+    control and the covariates are all finite. The two exposures' slopes on the
+    same rows are strongly correlated, so their separate intervals overlap even
+    when the difference is clear: every resample (multiplicities over entities,
+    or whole clusters with ``clusters``) re-estimates all four slopes from
+    per-cluster Gram blocks, one design per exposure. Returns the four signed
+    slopes (``beta_target``, ``beta_control``, ``beta_target_other``,
+    ``beta_control_other``), ``d``, ``d_other``, ``delta`` with its percentile
+    interval, the one-sided bootstrap ``p_value`` for ``delta > 0`` (share of
+    resamples ≤ 0), ``n``, ``n_boot`` and ``clusters``. Unit weights reproduce
+    :func:`partial_slope`, and two identical exposures give ``delta = 0`` on
+    every resample.
+    """
+    xa = np.asarray(exposure, dtype=np.float64)
+    xb = np.asarray(other, dtype=np.float64)
+    ya = np.asarray(target, dtype=np.float64)
+    yb = np.asarray(control, dtype=np.float64)
+    cov = None if covariates is None else np.asarray(covariates, dtype=np.float64)
+    if cov is not None:
+        cov = cov.reshape(len(xa), -1)
+    keep = np.isfinite(xa) & np.isfinite(xb) & np.isfinite(ya) & np.isfinite(yb)
+    if cov is not None and cov.size:
+        keep &= np.isfinite(cov).all(1)
+    cl = None if clusters is None else np.asarray(clusters)[keep]
+    xa, xb, ya, yb = xa[keep], xb[keep], ya[keep], yb[keep]
+    cov = None if cov is None else cov[keep]
+    n = int(len(xa))
+    nan = float("nan")
+    out = {
+        "beta_target": nan,
+        "beta_control": nan,
+        "beta_target_other": nan,
+        "beta_control_other": nan,
+        "d": nan,
+        "d_other": nan,
+        "delta": nan,
+        "ci_low": nan,
+        "ci_high": nan,
+        "p_value": nan,
+        "n": n,
+        "n_boot": int(n_boot),
+        "clusters": None,
+    }
+
+    q, _ = covariate_basis(cov, n)
+    if n - q.shape[1] - 1 < 2:
+        return out
+    scales = [_residual_scale(v, q) for v in (xa, xb, ya, yb)]
+    if min(scales) <= 1e-12:
+        return out
+    ys = np.column_stack([ya / scales[2], yb / scales[3]])
+
+    if cl is None:
+        codes = np.arange(n)
+    else:
+        _, codes = np.unique(cl, return_inverse=True)
+    n_cl = int(codes.max()) + 1
+    out["clusters"] = None if cl is None else n_cl
+
+    # ── Per-cluster Gram blocks, one design per exposure ────────
+    designs = []
+    for x, s in ((xa, scales[0]), (xb, scales[1])):
+        Z = np.column_stack([x / s, q])
+        p = Z.shape[1]
+        G = np.zeros((n_cl, p, p))
+        np.add.at(G, codes, Z[:, :, None] * Z[:, None, :])
+        H = np.zeros((n_cl, p, 2))
+        np.add.at(H, codes, Z[:, :, None] * ys[:, None, :])
+        designs.append((G.reshape(n_cl, p * p), H.reshape(n_cl, p * 2), p))
+
+    def slopes(m):
+        """``(b, 4)`` slopes: target and control on each exposure."""
+        cols = []
+        for G_flat, H_flat, p in designs:
+            gi = np.linalg.pinv((m @ G_flat).reshape(-1, p, p))
+            b = np.einsum("bpq,bqk->bpk", gi, (m @ H_flat).reshape(-1, p, 2))
+            cols.append(b[:, 0, :])
+        return np.concatenate(cols, axis=1)
+
+    def contrast(b):
+        d = np.abs(b[:, 0]) - np.abs(b[:, 1])
+        return d - (np.abs(b[:, 2]) - np.abs(b[:, 3]))
+
+    b0 = slopes(np.ones((1, n_cl)))
+    for key, v in zip(
+        ("beta_target", "beta_control", "beta_target_other", "beta_control_other"),
+        b0[0],
+        strict=True,
+    ):
+        out[key] = float(v)
+    out["d"] = float(abs(b0[0, 0]) - abs(b0[0, 1]))
+    out["d_other"] = float(abs(b0[0, 2]) - abs(b0[0, 3]))
+    out["delta"] = float(contrast(b0)[0])
+    if n_boot <= 0:
+        return out
+
+    rng = np.random.default_rng(seed)
+    deltas = []
+    for start in range(0, int(n_boot), _BATCH):
+        b = min(_BATCH, int(n_boot) - start)
+        draws = rng.integers(0, n_cl, size=(b, n_cl))
+        m = np.zeros((b, n_cl))
+        np.add.at(m, (np.repeat(np.arange(b), n_cl), draws.ravel()), 1.0)
+        deltas.append(contrast(slopes(m)))
+    deltas = np.concatenate(deltas)
+    tail = (1.0 - level) / 2.0 * 100.0
+    out["ci_low"], out["ci_high"] = (
+        float(v) for v in np.percentile(deltas, [tail, 100.0 - tail])
+    )
+    out["p_value"] = float((np.sum(deltas <= 0.0) + 1) / (len(deltas) + 1))
     return out
 
 
