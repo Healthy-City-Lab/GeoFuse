@@ -8087,6 +8087,24 @@ class MetricFusionEngine:
             )
         return out
 
+    def _reporting_clusters(
+        self, df: "pd.DataFrame", cluster_column: str | None
+    ) -> "np.ndarray | None":
+        """Cluster labels aligned to an ``apply_fusion`` frame, or ``None``."""
+        if not cluster_column:
+            return None
+        full = self._full_data_frame()
+        if full is None or cluster_column not in full.columns:
+            return None
+        if "polygon_id" in df.columns:
+            return (
+                full.groupby("polygon_id", sort=False)[cluster_column]
+                .first()
+                .reindex(df["polygon_id"].values)
+                .to_numpy()
+            )
+        return full[cluster_column].reindex(df.index).to_numpy()
+
     def compute_negative_controls(
         self,
         params: dict,
@@ -8135,19 +8153,7 @@ class MetricFusionEngine:
             controls[name] = values
         if not controls:
             return None
-        clusters = None
-        if cluster_column:
-            full = self._full_data_frame()
-            if full is not None and cluster_column in full.columns:
-                key = "polygon_id" if "polygon_id" in df.columns else None
-                clusters = (
-                    full.groupby(key, sort=False)[cluster_column]
-                    .first()
-                    .reindex(df[key].values)
-                    .to_numpy()
-                    if key
-                    else full[cluster_column].reindex(df.index).to_numpy()
-                )
+        clusters = self._reporting_clusters(df, cluster_column)
 
         def objective(y, x, c):
             if metric is None:

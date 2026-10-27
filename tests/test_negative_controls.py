@@ -220,6 +220,7 @@ def _engine_stub(n_ent=400, n_test=100, seed=7, controls=("grip",)):
     for name in (
         "_reporting_covariate_matrix",
         "_reporting_raw_column",
+        "_reporting_clusters",
         "_test_entity_mask",
         "compute_negative_controls",
     ):
