@@ -951,6 +951,7 @@ def fusion_run_config(spec: JobSpec) -> dict[str, Any]:
         "categorical_missing": s["categorical_missing"],
         "moderator_columns": list(o["moderators"]),
         "negative_controls": controls if vector else [],
+        "specificity_contrast": bool(s["specificity_contrast"] and vector),
         "comparators": list(o["comparators"]) if vector else [],
         "comparators_primary": (
             list(o["comparators_primary"])
@@ -1006,7 +1007,6 @@ def fusion_run_config(spec: JobSpec) -> dict[str, Any]:
 #: away from ``run_fusion``'s own defaults.
 _FUSION_EXTRAS = {
     "negative_control_retune": False,
-    "specificity_contrast": False,
     "report_ci_bootstrap": None,
     "report_effects_bootstrap": 2000,
     "report_effects_permutations": 1000,

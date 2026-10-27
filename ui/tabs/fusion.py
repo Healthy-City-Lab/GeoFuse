@@ -462,6 +462,7 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "categorical_missing",
     "moderator_columns",
     "negative_controls",
+    "specificity_contrast",
     "comparators",
     "comparators_primary",
     "exposure_iqr",
@@ -536,6 +537,7 @@ _FUSION_PARAM_TO_WIDGET: dict[str, str] = {
     "split_seed": "fusion_split_seed",
     "outer_splits": "fusion_outer_splits",
     "outer_comparators": "fusion_outer_comparators",
+    "specificity_contrast": "fusion_specificity_contrast",
     "n_bins": "fusion_stratification_bins",
     "channel_set": "fusion_channel_set",
     "index_form": "fusion_index_form",
@@ -2678,6 +2680,9 @@ _OUTER_QUANTITY_LABELS: dict[str, str] = {
     "cgi_minus_channel": "CGI − channel",
     "cgi_minus_comparator": "CGI − comparator",
     "negative_control_beta": "Negative-control β",
+    "exposure_beta": "Exposure β per SD",
+    "exposure_negative_control_beta": "Exposure negative-control β",
+    "specificity_difference": "Specificity ΔD (CGI − exposure)",
 }
 
 # Each split's CGI posterior (``outer_splits.POSTERIOR_QUANTITIES``).
@@ -2708,10 +2713,12 @@ def _render_outer_splits(results_view: dict) -> None:
         "score is not tested (it cannot be negative); its signed slope is. "
         "Every other table on this page reads the first split."
     )
+    with_control = any("control" in e for e in summary)
     rows = [
         {
             "Result": _OUTER_QUANTITY_LABELS.get(e.get("quantity"), e.get("quantity")),
             "Exposure": _CHANNEL_DISPLAY.get(e.get("exposure"), e.get("exposure")),
+            **({"Control": e.get("control") or "—"} if with_control else {}),
             "Splits": e.get("n_splits"),
             "Median": _fmt(e.get("median"), 4),
             "2.5–97.5 %": f"[{_fmt(e.get('q025'), 4)}, {_fmt(e.get('q975'), 4)}]",
@@ -2799,6 +2806,48 @@ def _render_comparators(results_view: dict, metric_name: str) -> None:
             + ", ".join(f"`{n}`" for n in flagged)
             + " — the control's association cannot be told apart from the target's."
         )
+
+
+def _render_specificity_contrast(results_view: dict) -> None:
+    """Is the CGI more specific than each other exposure, per control."""
+    rows = (results_view.get("specificity_contrast") or {}).get("rows") or []
+    if not rows:
+        return
+    st.divider()
+    st.markdown("**Specificity contrast**")
+    st.caption(
+        "Per negative control, on the held-out entities where the target, the "
+        "control and both exposures are observed: D = |β target| − |β control| "
+        "for the composite and for each other exposure, and ΔD = D(CGI) − D(e). "
+        "A positive ΔD means the composite is the more specific of the two. The "
+        "interval and the one-sided p (ΔD > 0) come from a paired bootstrap that "
+        "refits all four slopes; Holm runs over the primary comparators per "
+        "control. β are covariate-adjusted slopes in SD units."
+    )
+    table = [
+        {
+            "Exposure": _CHANNEL_DISPLAY.get(r.get("exposure"), r.get("exposure")),
+            "Kind": (
+                "Comparison channel"
+                if r.get("kind") == "channel"
+                else ("Primary comparator" if r.get("primary") else "Comparator")
+            ),
+            "Control": r.get("control"),
+            "β target (CGI)": _fmt(r.get("beta_target_cgi"), 4),
+            "β control (CGI)": _fmt(r.get("beta_control_cgi"), 4),
+            "β target (e)": _fmt(r.get("beta_target_exposure"), 4),
+            "β control (e)": _fmt(r.get("beta_control_exposure"), 4),
+            "D (CGI)": _fmt(r.get("d_cgi"), 4),
+            "D (e)": _fmt(r.get("d_exposure"), 4),
+            "ΔD": _fmt(r.get("delta_d"), 4),
+            "95 % CI": f"[{_fmt(r.get('ci_low'), 4)}, {_fmt(r.get('ci_high'), 4)}]",
+            "p": _fmt(r.get("p_value"), 4),
+            "Holm p": _fmt(r.get("p_value_holm"), 4),
+            "n": r.get("n"),
+        }
+        for r in rows
+    ]
+    st.dataframe(pd.DataFrame(table), width="stretch", hide_index=True)
 
 
 def _render_collinearity_report(results_view: dict) -> None:
@@ -5281,6 +5330,7 @@ def _render_fusion_results_body(output_dir: str) -> None:
 
     # ── Comparator exposures ────────────────────────────────────
     _render_comparators(results_view, metric_name)
+    _render_specificity_contrast(results_view)
     _render_outer_splits(results_view)
 
     # ── Channel collinearity report ─────────────────────────────
@@ -5678,6 +5728,22 @@ def render(output_dir: str) -> None:
                                     "Cross-sectional runs only."
                                 ),
                             )
+                            st.checkbox(
+                                "Specificity contrast",
+                                key="fusion_specificity_contrast",
+                                disabled=not st.session_state.get(
+                                    "fusion_negative_controls"
+                                ),
+                                help=(
+                                    "Test, per negative control on the held-out "
+                                    "entities, whether the composite is more "
+                                    "specific than each primary comparator and the "
+                                    "channel chosen on train+val: the difference in "
+                                    "|β target| − |β control|, all four slopes "
+                                    "refitted on each paired bootstrap resample. "
+                                    "Repeated on every held-out split."
+                                ),
+                            )
                         taken = set(target_outcome_columns) | set(
                             (st.session_state.get("fusion_negative_controls") or [])
                             + (st.session_state.get("fusion_covariate_columns") or [])
@@ -5910,6 +5976,9 @@ def render(output_dir: str) -> None:
         ]
         if is_vector_target
         else []
+    )
+    specificity_contrast_param = bool(
+        st.session_state.get("fusion_specificity_contrast") and negative_controls_param
     )
     # Comparators, also picked in the target section. One that has since become
     # an outcome, a covariate or a control is refused at submit.
@@ -6375,6 +6444,7 @@ def render(output_dir: str) -> None:
                 "categorical_missing": categorical_missing_param,
                 "moderator_columns": list(moderator_columns_param),
                 "negative_controls": negative_controls_param,
+                "specificity_contrast": specificity_contrast_param,
                 "comparators": comparators_param,
                 "comparators_primary": comparators_primary_param,
                 "exposure_iqr": (

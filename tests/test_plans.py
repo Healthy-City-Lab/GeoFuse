@@ -716,6 +716,37 @@ class TabParityTests(_Case):
         )
         self.assert_same(gui, plans.build(spec))
 
+    def test_fusion_tab_specificity_contrast(self):
+        seed = {
+            "fusion_target_paths": [self.cohort],
+            "fusion_target_upload_sig": (self.cohort, os.path.getsize(self.cohort)),
+            "fusion_outcome_columns": ["cesd"],
+            "fusion_negative_controls": ["grip"],
+            "fusion_specificity_contrast": True,
+            "fusion_comparators": ["age"],
+            "fusion_run_mode": "Cross-sectional",
+            "fusion_ndvi_paths": [os.path.join(self.dir, "ndvi_2015.tif")],
+            "fusion_gvi_paths": [os.path.join(self.dir, "gvi.gpkg")],
+        }
+        gui = self.click(
+            "fusion", seed, f"fusion.render({self.out!r})", "fusion_form_run_submit"
+        )
+        (spec,) = self.expand(
+            f"""
+            output_dir = {self.out!r}
+            [[fusion]]
+            target = "cohort.gpkg"
+            outcomes = ["cesd"]
+            negative_controls = ["grip"]
+            comparators = ["age"]
+            specificity_contrast = true
+            ndvi = "ndvi_2015.tif"
+            gvi = "gvi.gpkg"
+            """
+        )
+        self.assertIs(gui[2][0]["specificity_contrast"], True)
+        self.assert_same(gui, plans.build(spec))
+
     def test_fusion_tab_comparators(self):
         seed = {
             "fusion_target_paths": [self.cohort],
