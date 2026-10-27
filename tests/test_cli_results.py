@@ -3,7 +3,8 @@
 A fusion run is found by job id or by its results folder (paths a GUI run
 recorded relative to its own folder are found again); the summary carries the
 held-out score and interval, direction, each channel alone, the paired
-difference, the AIC / BIC verdict and the weights; the per-entity table
+difference, the AIC / BIC verdict, the specificity contrast, the across-split
+summary with each split's posterior, and the weights; the per-entity table
 exports as GeoPackage, CSV (no geometry) or GeoJSON (WGS 84).
 """
 
@@ -89,6 +90,17 @@ def _bundle(artifacts: str) -> dict:
                     "corrected_p_holm": 0.31,
                 },
                 {
+                    "quantity": "specificity_difference",
+                    "exposure": "g13",
+                    "control": "grip",
+                    "median": 0.012,
+                    "min": -0.004,
+                    "max": 0.03,
+                    "share_holds": 0.3,
+                    "corrected_p": 0.04,
+                    "corrected_p_holm": 0.04,
+                },
+                {
                     "quantity": "posterior_beta",
                     "exposure": "cgi",
                     "median": 0.03,
@@ -110,6 +122,39 @@ def _bundle(artifacts: str) -> dict:
                     "median": 520.0,
                     "min": 400.0,
                     "max": 700.0,
+                },
+            ],
+        },
+        "specificity_contrast": {
+            "controls": ["grip"],
+            "rows": [
+                {
+                    "exposure": "g13",
+                    "kind": "comparator",
+                    "primary": True,
+                    "control": "grip",
+                    "d_cgi": 0.018,
+                    "d_exposure": -0.048,
+                    "delta_d": 0.066,
+                    "ci_low": 0.012,
+                    "ci_high": 0.118,
+                    "p_value": 0.01,
+                    "p_value_holm": 0.01,
+                    "n": 400,
+                },
+                {
+                    "exposure": "ndvi",
+                    "kind": "channel",
+                    "primary": None,
+                    "control": "grip",
+                    "d_cgi": 0.018,
+                    "d_exposure": 0.011,
+                    "delta_d": 0.007,
+                    "ci_low": -0.02,
+                    "ci_high": 0.035,
+                    "p_value": 0.31,
+                    "p_value_holm": None,
+                    "n": 400,
                 },
             ],
         },
@@ -172,6 +217,13 @@ class ResultsTests(_Case):
             "Across 10 held-out splits (seeds 1–10)",
             "β per SD              +0.0310 [+0.0040, +0.0580]  holds 70%  p=0.012",
             "CGI − g13             +0.0004 [-0.0011, +0.0021]  holds 10%  Holm p=0.31",
+            "Specificity vs g13: held-out D = |β target| − |β control|, "
+            "ΔD = D_cgi − D_e",
+            "grip           D_cgi +0.0180  D_e -0.0480  ΔD +0.0660  "
+            "[0.0120, 0.1180]  Holm p=0.01  n=400",
+            "Specificity vs NDVI (comparison channel)",
+            "D_e +0.0110  ΔD +0.0070  [-0.0200, 0.0350]  p=0.31",
+            "ΔD vs g13, grip       +0.0120 [-0.0040, +0.0300]  holds 30%  Holm p=0.04",
             "Posterior on each split's train+val: median [min, max]",
             "β                     +0.0300 [+0.0100, +0.0500]  forms linear 7/10, "
             "synergy 3/10",

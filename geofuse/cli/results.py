@@ -100,10 +100,14 @@ def _difference(row: dict) -> str:
 def _outer_name(entry: dict) -> str:
     quantity, exposure = entry.get("quantity"), entry.get("exposure")
     name = _CHANNELS.get(exposure, exposure)
+    control = entry.get("control")
     return {
         "held_out_score": "Held-out score",
         "held_out_beta": "β per SD",
         "negative_control_beta": f"β {name}",
+        "exposure_beta": f"β per SD, {name}",
+        "exposure_negative_control_beta": f"β {name} on {control}",
+        "specificity_difference": f"ΔD vs {name}, {control}",
     }.get(quantity, f"CGI − {name}")
 
 
@@ -133,6 +137,41 @@ def _outer_lines(outer: dict) -> list[str]:
             + (f"  {p_text}" if p_text else "")
         )
     return lines + _posterior_lines(summary)
+
+
+def _specificity_lines(report: dict) -> list[str]:
+    """One "Specificity vs" block per exposure: per control, each exposure's
+    D = |β target| − |β control| and ΔD = D_cgi − D_e with its interval."""
+    rows = report.get("rows") or []
+    if not rows:
+        return []
+    lines: list[str] = []
+    for exposure in dict.fromkeys(r.get("exposure") for r in rows):
+        name = _CHANNELS.get(exposure, exposure)
+        kind = next(r.get("kind") for r in rows if r.get("exposure") == exposure)
+        lines.append(
+            f"  Specificity vs {name}"
+            + (" (comparison channel)" if kind == "channel" else "")
+            + ": held-out D = |β target| − |β control|, ΔD = D_cgi − D_e"
+        )
+        for r in rows:
+            if r.get("exposure") != exposure:
+                continue
+            values = [_num(r.get(k)) for k in ("d_cgi", "d_exposure", "delta_d")]
+            if None in values:
+                continue
+            d_cgi, d_e, delta = values
+            p = _num(r.get("p_value_holm"))
+            p_text = f"Holm p={p:.3g}" if p is not None else ""
+            if p is None and _num(r.get("p_value")) is not None:
+                p_text = f"p={_num(r.get('p_value')):.3g}"
+            lines.append(
+                f"    {str(r.get('control')):<15}D_cgi {d_cgi:+.4f}  D_e {d_e:+.4f}  "
+                f"ΔD {delta:+.4f}  {_interval(r, 'ci_low', 'ci_high')}"
+                + (f"  {p_text}" if p_text else "")
+                + (f"  n={r['n']}" if r.get("n") else "")
+            )
+    return lines
 
 
 def _posterior_lines(summary: list[dict]) -> list[str]:
@@ -287,6 +326,7 @@ def summary(label: str, bundle: dict, artifacts: Path) -> list[str]:
             f"{aic.get('verdict')} (ΔAIC {_num(aic.get('delta_aic')):+.1f}, "
             f"ΔBIC {_num(aic.get('delta_bic')):+.1f})"
         )
+    lines += _specificity_lines(bundle.get("specificity_contrast") or {})
     lines += _outer_lines(bundle.get("outer_splits") or {})
 
     params = _params(bundle)
