@@ -1257,6 +1257,7 @@ def _run_outer_splits(
                 if r.get("comparator") in scored
             ],
             negative_controls=first_split.get("negative_controls"),
+            posterior=first_split.get("posterior"),
         ):
             r.update(split=0, seed=int(split_seed), **info)
             if r["quantity"] == "cgi_minus_comparator":
@@ -1310,6 +1311,8 @@ def _run_outer_splits(
     for e in summary:
         if e["quantity"] == "held_out_score":
             continue
+        if e["quantity"] in _outer.POSTERIOR_QUANTITIES:
+            continue
         _log_fusion(
             "OK",
             f"[{label}] Across {e['n_splits']} held-out splits, "
@@ -1318,6 +1321,11 @@ def _run_outer_splits(
             f"{_fmt_or_na(e['max'], '.4f')}], holds in "
             f"{_fmt_or_na(e['share_holds'], '.0%')}, corrected "
             f"p={_fmt_or_na(e['corrected_p'], '.3g')}.",
+        )
+    posterior = _outer.describe_posterior(summary)
+    if posterior:
+        _log_fusion(
+            "OK", f"[{label}] Posterior across {int(k_splits)} splits: {posterior}."
         )
     stage(stage_key, DONE)
     return {
@@ -3319,6 +3327,7 @@ def run_fusion(
                         "channel_paired": cgi_vs_standalone_paired,
                         "comparator_paired": cgi_vs_comparator_paired,
                         "negative_controls": negative_control_report,
+                        "posterior": cgi_discovery_summary,
                     },
                     standalones=(
                         [c for c in standalones if c in standalones_bundle]

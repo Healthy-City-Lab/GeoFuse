@@ -17,6 +17,12 @@ share data and their p-values cannot be combined naively. The held-out score
 is unsigned for several objectives (``r2`` is an incremental R²), so it is
 summarised but not tested; the signed slope ``held_out_beta`` carries the
 across-split test of the association.
+
+Each split's CGI posterior is reported too (:func:`posterior_rows`): R50 and
+R90 per channel, the weight of every term, β and the chosen form. They are
+fitted on that split's train+val rows, so they are summarised as a spread,
+with the share of splits in which each term carries the largest weight, and
+not tested.
 """
 
 from __future__ import annotations
@@ -32,7 +38,14 @@ QUANTITIES: dict[str, str | None] = {
     "cgi_minus_channel": "greater",
     "cgi_minus_comparator": "greater",
     "negative_control_beta": "two-sided",
+    "posterior_beta": None,
+    "posterior_weight": None,
+    "posterior_r50": None,
+    "posterior_r90": None,
 }
+
+# Posterior quantities: summarised only, with no share holding.
+POSTERIOR_QUANTITIES = frozenset(q for q in QUANTITIES if q.startswith("posterior_"))
 
 OUTER_COMPARATORS = ("primary", "all")
 
@@ -90,6 +103,7 @@ def split_rows(
     channel_paired: dict | None,
     comparator_paired: list[dict],
     negative_controls: dict | None,
+    posterior: dict | None = None,
 ) -> list[dict]:
     """One split's quantities as ``(quantity, exposure)`` rows.
 
@@ -98,7 +112,8 @@ def split_rows(
     against the channel chosen on the split's train+val rows,
     ``comparator_paired`` the paired rows of the comparators scored on every
     split (:func:`scored_comparators`), ``negative_controls`` the
-    :meth:`compute_negative_controls` report.
+    :meth:`compute_negative_controls` report, ``posterior`` the CGI's
+    ``_posterior_summary`` (:func:`posterior_rows`).
     """
     rows: list[dict] = []
     if effects_test:
@@ -157,6 +172,65 @@ def split_rows(
                 p_value=_slope_p(block),
             )
         )
+    rows += posterior_rows(posterior)
+    return rows
+
+
+def posterior_rows(summary: dict | None) -> list[dict]:
+    """One split's CGI posterior as ``posterior_*`` rows.
+
+    ``summary`` is ``_posterior_summary(params)``. ``posterior_beta`` for the
+    composite, ``posterior_weight`` for every term (the synergy form's pair
+    terms included), ``posterior_r50`` / ``posterior_r90`` for every channel
+    with a radius grid: the posterior mean and credible interval under the
+    names ``discovery.csv`` uses, each row carrying the split's ``form``.
+    """
+    if not summary:
+        return []
+
+    def at(key: str, i: int):
+        values = summary.get(key) or []
+        return values[i] if i < len(values) else None
+
+    names = summary.get("weight_labels") or summary.get("channels") or []
+    labels = [str(x) for x in names]
+    rows: list[dict] = []
+    if _f(summary.get("beta_mean")) is not None:
+        rows.append(
+            _row(
+                "posterior_beta",
+                "cgi",
+                estimate=summary.get("beta_mean"),
+                ci_low=summary.get("beta_ci_low"),
+                ci_high=summary.get("beta_ci_high"),
+            )
+        )
+    for i, name in enumerate(labels):
+        rows.append(
+            _row(
+                "posterior_weight",
+                name,
+                estimate=at("weight_mean", i),
+                ci_low=at("weight_ci_low", i),
+                ci_high=at("weight_ci_high", i),
+            )
+        )
+    n_grid = len(summary.get("radius_profile") or [])
+    for quantity, key in (("posterior_r50", "r50"), ("posterior_r90", "r90")):
+        for i, name in enumerate(labels[:n_grid]):
+            if _f(at(f"{key}_mean", i)) is None:
+                continue
+            rows.append(
+                _row(
+                    quantity,
+                    name,
+                    estimate=at(f"{key}_mean", i),
+                    ci_low=at(f"{key}_ci_low", i),
+                    ci_high=at(f"{key}_ci_high", i),
+                )
+            )
+    for r in rows:
+        r["form"] = summary.get("form")
     return rows
 
 
@@ -177,7 +251,10 @@ def summarise(rows: list[dict]) -> list[dict]:
     ``rows`` carry ``split`` and ``test_share`` next to the :func:`split_rows`
     fields. The corrected t uses the mean realised test share. The primary
     comparators form one Holm family on the corrected p-value, as on a single
-    split; the comparison channel is one test.
+    split; the comparison channel is one test. Posterior quantities get the
+    spread only; each term's weight entry adds ``share_largest`` (the share of
+    splits in which that term has the largest weight) and the β entry
+    ``forms`` (how often each form was chosen).
     """
     from geofuse.statistical_testing import corrected_resampled_t, holm_bonferroni
 
@@ -192,7 +269,11 @@ def summarise(rows: list[dict]) -> list[dict]:
         est = np.array(
             [r["estimate"] for r in group if r["estimate"] is not None], dtype=float
         )
-        held = [h for h in (_holds(r) for r in group) if h is not None]
+        held = [
+            h
+            for h in (_holds(r) for r in group)
+            if h is not None and quantity not in POSTERIOR_QUANTITIES
+        ]
         shares = [r["test_share"] for r in group if r.get("test_share") is not None]
         entry = {
             "quantity": quantity,
@@ -225,7 +306,62 @@ def summarise(rows: list[dict]) -> list[dict]:
         family, holm_bonferroni([e["corrected_p"] for e in family]), strict=True
     ):
         e["corrected_p_holm"] = None if hp != hp else float(hp)
+    _posterior_shares(rows, out)
     return out
+
+
+def _posterior_shares(rows: list[dict], summary: list[dict]) -> None:
+    """``share_largest`` on each weight entry and ``forms`` on the β entry."""
+    weights: dict = {}
+    forms: dict = {}
+    for r in rows:
+        if r["quantity"] not in POSTERIOR_QUANTITIES:
+            continue
+        forms[r.get("split")] = r.get("form")
+        if r["quantity"] == "posterior_weight" and r["estimate"] is not None:
+            weights.setdefault(r.get("split"), []).append(r)
+    top = [max(g, key=lambda r: r["estimate"])["exposure"] for g in weights.values()]
+    counts: dict = {}
+    for form in forms.values():
+        counts[form] = counts.get(form, 0) + 1
+    for e in summary:
+        if e["quantity"] == "posterior_weight":
+            e["share_largest"] = top.count(e["exposure"]) / len(top) if top else None
+        elif e["quantity"] == "posterior_beta" and forms:
+            e["forms"] = ", ".join(
+                f"{form} {n}/{len(forms)}"
+                for form, n in sorted(counts.items(), key=lambda kv: -kv[1])
+            )
+
+
+def describe_posterior(summary: list[dict]) -> str:
+    """The posterior entries of a :func:`summarise` result as one line:
+    β with the forms chosen, each term's weight with its share largest, and
+    R50 / R90 per channel, each as median [min, max]."""
+
+    def spread(e: dict, spec: str, unit: str = "") -> str:
+        return (
+            f"{format(e['median'], spec)}{unit} "
+            f"[{format(e['min'], spec)}, {format(e['max'], spec)}]"
+        )
+
+    parts: list[str] = []
+    for e in summary:
+        if e["quantity"] not in POSTERIOR_QUANTITIES or e.get("median") is None:
+            continue
+        if e["quantity"] == "posterior_beta":
+            text = f"β {spread(e, '+.4f')}"
+            parts.append(text + (f" (forms {e['forms']})" if e.get("forms") else ""))
+        elif e["quantity"] == "posterior_weight":
+            share = e.get("share_largest")
+            parts.append(
+                f"weight {e['exposure']} {spread(e, '.3f')}"
+                + (f", largest in {share:.0%}" if share is not None else "")
+            )
+        else:
+            name = "R50" if e["quantity"] == "posterior_r50" else "R90"
+            parts.append(f"{name} {e['exposure']} {spread(e, '.0f', ' m')}")
+    return "; ".join(parts)
 
 
 def scored_comparators(columns: list[str], primary: list[str], mode: str) -> list[str]:
@@ -262,12 +398,13 @@ def repeat(
     every standalone with ``fit_kwargs`` (the reproducibility, gain and null
     loops off), picks the comparison channel on the split's train+val rows and
     scores the paired differences, the comparators of
-    :func:`scored_comparators` and the negative controls. The caller restores
-    the first split. ``progress(k)`` is called before each split;
+    :func:`scored_comparators` and the negative controls, and reports the
+    split's CGI posterior (:func:`posterior_rows`). The caller restores the
+    first split. ``progress(k)`` is called before each split;
     ``cancelled()`` stops between steps.
     """
     from ..fusion import comparator_mode
-    from .fusion_outputs import comparison_channel
+    from .fusion_outputs import _posterior_summary, comparison_channel
 
     loops = {"reps": 0, "shuffles": 0, "gain_splits": 0, "null_runs": 0}
     rows: list[dict] = []
@@ -331,6 +468,7 @@ def repeat(
             channel_paired=channel_paired,
             comparator_paired=comparator_paired,
             negative_controls=controls,
+            posterior=_posterior_summary(params),
         ):
             r.update(split=k, seed=seed, **info)
             if r["quantity"] == "cgi_minus_comparator":

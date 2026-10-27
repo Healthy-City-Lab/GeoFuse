@@ -8,9 +8,12 @@ Pinned here:
 - the summary gives each result's spread, the share of splits where it holds
   and the corrected p-value, Holm-corrected over the primary comparators;
 - on the repeats only the primary comparators are scored unless all are asked;
+- each split's posterior (β, every term's weight, R50 / R90 per channel, the
+  form) becomes rows that are summarised but not tested, with the share of
+  splits in which each term has the largest weight;
 - a run with three splits reports every quantity per split, a planted effect
-  holds in most of them, the first split's results are the single-split run's,
-  and the tables are written.
+  holds in most of them, the first split's results are the single-split run's
+  (its posterior rows are ``discovery.csv``'s), and the tables are written.
 """
 
 import csv
@@ -185,6 +188,78 @@ class TestSummary(unittest.TestCase):
         self.assertIsNone(got[("negative_control_beta", "grip")]["p_value"])
 
 
+def _posterior(weights, r50, form="linear", beta=0.04):
+    return {
+        "form": form,
+        "channels": ["ndvi", "gvi"],
+        "weight_labels": ["ndvi", "gvi", "ndvi×gvi"][: len(weights)],
+        "weight_mean": list(weights),
+        "weight_ci_low": [w - 0.1 for w in weights],
+        "weight_ci_high": [w + 0.1 for w in weights],
+        "radius_profile": [[0.5, 0.5], [0.5, 0.5]],
+        "r50_mean": list(r50),
+        "r50_ci_low": [r - 50 for r in r50],
+        "r50_ci_high": [r + 50 for r in r50],
+        "r90_mean": [r * 2 for r in r50],
+        "r90_ci_low": [r * 2 - 50 for r in r50],
+        "r90_ci_high": [r * 2 + 50 for r in r50],
+        "beta_mean": beta,
+        "beta_ci_low": beta - 0.02,
+        "beta_ci_high": beta + 0.02,
+    }
+
+
+class TestPosteriorRows(unittest.TestCase):
+    def test_one_row_per_term_and_channel_carrying_the_form(self):
+        rows = outer_splits.posterior_rows(
+            _posterior([0.5, 0.3, 0.2], [400, 200], form="synergy")
+        )
+        got = [(r["quantity"], r["exposure"]) for r in rows]
+        self.assertEqual(
+            got,
+            [
+                ("posterior_beta", "cgi"),
+                ("posterior_weight", "ndvi"),
+                ("posterior_weight", "gvi"),
+                ("posterior_weight", "ndvi×gvi"),
+                ("posterior_r50", "ndvi"),
+                ("posterior_r50", "gvi"),
+                ("posterior_r90", "ndvi"),
+                ("posterior_r90", "gvi"),
+            ],
+        )
+        self.assertTrue(all(r["form"] == "synergy" for r in rows))
+        r50 = rows[4]
+        interval = (r50["estimate"], r50["ci_low"], r50["ci_high"])
+        self.assertEqual(interval, (400, 350, 450))
+        self.assertEqual(outer_splits.posterior_rows(None), [])
+
+    def test_the_summary_describes_and_counts_the_largest_weight(self):
+        splits = [
+            _posterior([0.7, 0.3], [400, 200]),
+            _posterior([0.6, 0.4], [500, 250]),
+            _posterior([0.2, 0.8], [300, 150], form="synergy"),
+        ]
+        rows = []
+        for k, post in enumerate(splits):
+            for r in outer_splits.posterior_rows(post):
+                r.update(split=k, test_share=0.25)
+                rows.append(r)
+        by = {(e["quantity"], e["exposure"]): e for e in outer_splits.summarise(rows)}
+        ndvi = by[("posterior_weight", "ndvi")]
+        self.assertAlmostEqual(ndvi["share_largest"], 2 / 3)
+        self.assertAlmostEqual(by[("posterior_weight", "gvi")]["share_largest"], 1 / 3)
+        self.assertAlmostEqual(by[("posterior_r50", "ndvi")]["median"], 400)
+        forms = by[("posterior_beta", "cgi")]["forms"]
+        self.assertEqual(forms, "linear 2/3, synergy 1/3")
+        for e in by.values():
+            self.assertIsNone(e["share_holds"])
+            self.assertIsNone(e["corrected_p"])
+        line = outer_splits.describe_posterior(list(by.values()))
+        self.assertIn("R50 ndvi 400 m [300, 500]", line)
+        self.assertIn("weight ndvi 0.600 [0.200, 0.700], largest in 67%", line)
+
+
 def _write_smooth_study(folder: str) -> None:
     """``test_fusion_run``'s study with a smooth NDVI field, so that the
     neighbourhood means the composite reads carry the outcome's signal."""
@@ -290,6 +365,53 @@ class TestRepeatedRun(unittest.TestCase):
         self.assertEqual({r["split"] for r in rows}, {"0", "1", "2"})
         with open(os.path.join(report, "outer_summary.csv"), encoding="utf-8") as f:
             self.assertIn("corrected_p", next(csv.reader(f)))
+
+    def test_the_first_split_posterior_is_discovery_csv(self):
+        report = self.bundle["report_dir"]
+        with open(os.path.join(report, "discovery.csv"), encoding="utf-8") as f:
+            disc = [r for r in csv.DictReader(f) if r["study"] == "cgi"]
+        first = {
+            (r["quantity"], r["exposure"]): r
+            for r in self.outer["splits"]
+            if r["split"] == 0 and r["quantity"].startswith("posterior_")
+        }
+        for d in disc:
+            w = first[("posterior_weight", d["channel"])]
+            self.assertAlmostEqual(w["estimate"], float(d["weight"]))
+            self.assertAlmostEqual(w["ci_low"], float(d["weight_ci_low"]))
+            self.assertEqual(w["form"], d["form"])
+            if d["r50_m"]:
+                r50 = first[("posterior_r50", d["channel"])]
+                self.assertAlmostEqual(r50["estimate"], float(d["r50_m"]))
+                r90 = first[("posterior_r90", d["channel"])]
+                self.assertAlmostEqual(r90["estimate"], float(d["r90_m"]))
+        beta = first[("posterior_beta", "cgi")]
+        self.assertAlmostEqual(beta["estimate"], float(disc[0]["beta_mean"]))
+
+    def test_every_split_reports_its_posterior(self):
+        terms: dict = {}
+        for r in self.outer["splits"]:
+            if r["quantity"] == "posterior_weight":
+                terms.setdefault(r["split"], []).append(r)
+        self.assertEqual(sorted(terms), [0, 1, 2])
+        for group in terms.values():
+            names = [r["exposure"] for r in group]
+            self.assertEqual(len(names), len(set(names)))
+        largest = [
+            max(g, key=lambda r: r["estimate"])["exposure"] for g in terms.values()
+        ]
+        for e in self.outer["summary"]:
+            if e["quantity"] == "posterior_weight":
+                self.assertAlmostEqual(
+                    e["share_largest"], largest.count(e["exposure"]) / 3
+                )
+                values = [
+                    r["estimate"]
+                    for g in terms.values()
+                    for r in g
+                    if r["exposure"] == e["exposure"]
+                ]
+                self.assertAlmostEqual(e["median"], float(np.median(values)))
 
 
 if __name__ == "__main__":
