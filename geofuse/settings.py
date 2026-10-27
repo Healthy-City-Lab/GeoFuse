@@ -374,6 +374,9 @@ FUSION: dict[str, Setting] = {
     "negative_control_retune": _bool(
         False, "Also re-tune on each negative control and compare."
     ),
+    "specificity_contrast": _bool(
+        False, "Paired test: is the CGI more specific than each other exposure."
+    ),
     "report_ci_bootstrap": _int(
         None, 100, 100000, "Test-CI bootstrap; none = 2,000 or 10,000 by metric."
     ),

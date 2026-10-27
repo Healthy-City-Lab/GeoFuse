@@ -18,6 +18,12 @@ is unsigned for several objectives (``r2`` is an incremental R²), so it is
 summarised but not tested; the signed slope ``held_out_beta`` carries the
 across-split test of the association.
 
+With the specificity contrast on, every split also compares the CGI's
+specificity with the comparators it scores and its own comparison channel
+(:func:`specificity_rows`): rows carry a ``control`` column, are summarised per
+``(quantity, exposure, control)``, and ``specificity_difference`` is tested
+one-sided (ΔD > 0, the CGI more specific).
+
 Each split's CGI posterior is reported too (:func:`posterior_rows`): R50 and
 R90 per channel, the weight of every term, β and the chosen form. They are
 fitted on that split's train+val rows, so they are summarised as a spread,
@@ -38,6 +44,9 @@ QUANTITIES: dict[str, str | None] = {
     "cgi_minus_channel": "greater",
     "cgi_minus_comparator": "greater",
     "negative_control_beta": "two-sided",
+    "exposure_beta": "two-sided",
+    "exposure_negative_control_beta": "two-sided",
+    "specificity_difference": "greater",
     "posterior_beta": None,
     "posterior_weight": None,
     "posterior_r50": None,
@@ -104,6 +113,7 @@ def split_rows(
     comparator_paired: list[dict],
     negative_controls: dict | None,
     posterior: dict | None = None,
+    specificity: dict | None = None,
 ) -> list[dict]:
     """One split's quantities as ``(quantity, exposure)`` rows.
 
@@ -113,7 +123,8 @@ def split_rows(
     ``comparator_paired`` the paired rows of the comparators scored on every
     split (:func:`scored_comparators`), ``negative_controls`` the
     :meth:`compute_negative_controls` report, ``posterior`` the CGI's
-    ``_posterior_summary`` (:func:`posterior_rows`).
+    ``_posterior_summary`` (:func:`posterior_rows`), ``specificity`` the
+    specificity-contrast report (:func:`specificity_rows`).
     """
     rows: list[dict] = []
     if effects_test:
@@ -172,7 +183,64 @@ def split_rows(
                 p_value=_slope_p(block),
             )
         )
+    rows += specificity_rows(specificity)
     rows += posterior_rows(posterior)
+    return rows
+
+
+def specificity_rows(report: dict | None) -> list[dict]:
+    """One split's specificity contrast as rows with a ``control`` column.
+
+    ``report`` comes from ``fusion_outputs._specificity_report``. Per exposure
+    e: ``exposure_beta`` (its held-out slope on the target, no control),
+    ``exposure_negative_control_beta`` per control (its slope on the control)
+    and ``specificity_difference`` per control (ΔD = D_cgi − D_e with its
+    bootstrap interval and one-sided p). Every row carries ``kind`` and
+    ``primary``.
+    """
+    if not report or report.get("skipped"):
+        return []
+    info = report.get("exposure_info") or {}
+    rows: list[dict] = []
+
+    def add(quantity: str, exposure: str, control: str | None, **values) -> None:
+        row = _row(quantity, exposure, **values)
+        row["control"] = control
+        meta = info.get(exposure) or {}
+        row["kind"], row["primary"] = meta.get("kind"), meta.get("primary")
+        rows.append(row)
+
+    for name, slopes in (report.get("slopes") or {}).items():
+        target = slopes.get("target") or {}
+        add(
+            "exposure_beta",
+            name,
+            None,
+            estimate=target.get("beta"),
+            ci_low=target.get("ci_low"),
+            ci_high=target.get("ci_high"),
+            p_value=_slope_p(target),
+        )
+        for control, block in (slopes.get("controls") or {}).items():
+            add(
+                "exposure_negative_control_beta",
+                name,
+                control,
+                estimate=block.get("beta"),
+                ci_low=block.get("ci_low"),
+                ci_high=block.get("ci_high"),
+                p_value=_slope_p(block),
+            )
+    for r in report.get("rows") or []:
+        add(
+            "specificity_difference",
+            str(r.get("exposure")),
+            r.get("control"),
+            estimate=r.get("delta_d"),
+            ci_low=r.get("ci_low"),
+            ci_high=r.get("ci_high"),
+            p_value=r.get("p_value"),
+        )
     return rows
 
 
@@ -251,20 +319,25 @@ def summarise(rows: list[dict]) -> list[dict]:
     ``rows`` carry ``split`` and ``test_share`` next to the :func:`split_rows`
     fields. The corrected t uses the mean realised test share. The primary
     comparators form one Holm family on the corrected p-value, as on a single
-    split; the comparison channel is one test. Posterior quantities get the
-    spread only; each term's weight entry adds ``share_largest`` (the share of
-    splits in which that term has the largest weight) and the β entry
-    ``forms`` (how often each form was chosen).
+    split; the comparison channel is one test. Rows with a ``control`` (the
+    specificity contrast) are summarised per ``(quantity, exposure, control)``,
+    and the primary comparators' ``specificity_difference`` entries form one
+    Holm family per control. Posterior quantities get the spread only; each
+    term's weight entry adds ``share_largest`` (the share of splits in which
+    that term has the largest weight) and the β entry ``forms`` (how often
+    each form was chosen).
     """
     from geofuse.statistical_testing import corrected_resampled_t, holm_bonferroni
 
-    groups: dict[tuple[str, str], list[dict]] = {}
+    groups: dict[tuple, list[dict]] = {}
     for r in rows:
-        groups.setdefault((r["quantity"], r["exposure"]), []).append(r)
+        key = (r["quantity"], r["exposure"], r.get("control"))
+        groups.setdefault(key, []).append(r)
     order = list(QUANTITIES)
     out: list[dict] = []
-    for (quantity, exposure), group in sorted(
-        groups.items(), key=lambda kv: (order.index(kv[0][0]), kv[0][1])
+    for (quantity, exposure, control), group in sorted(
+        groups.items(),
+        key=lambda kv: (order.index(kv[0][0]), kv[0][1], kv[0][2] or ""),
     ):
         est = np.array(
             [r["estimate"] for r in group if r["estimate"] is not None], dtype=float
@@ -291,21 +364,37 @@ def summarise(rows: list[dict]) -> list[dict]:
             "alternative": QUANTITIES.get(quantity),
             "primary": group[0].get("primary"),
         }
+        if "control" in group[0]:
+            entry["control"] = control
+            entry["kind"] = group[0].get("kind")
         if entry["alternative"] and shares:
             test = corrected_resampled_t(
                 est, float(np.mean(shares)), alternative=entry["alternative"]
             )
             entry["corrected_t"], entry["corrected_p"] = test["t"], test["p_value"]
         out.append(entry)
-    family = [
-        e
-        for e in out
-        if e["quantity"] == "cgi_minus_comparator" and e.get("primary") is not False
+    families = [
+        [
+            e
+            for e in out
+            if e["quantity"] == "cgi_minus_comparator" and e.get("primary") is not False
+        ]
     ]
-    for e, hp in zip(
-        family, holm_bonferroni([e["corrected_p"] for e in family]), strict=True
-    ):
-        e["corrected_p_holm"] = None if hp != hp else float(hp)
+    for control in dict.fromkeys(e.get("control") for e in out if "control" in e):
+        families.append(
+            [
+                e
+                for e in out
+                if e["quantity"] == "specificity_difference"
+                and e.get("control") == control
+                and e.get("kind") == "comparator"
+                and e.get("primary") is not False
+            ]
+        )
+    for family in families:
+        holm = holm_bonferroni([e["corrected_p"] for e in family])
+        for e, hp in zip(family, holm, strict=True):
+            e["corrected_p_holm"] = None if hp != hp else float(hp)
     _posterior_shares(rows, out)
     return out
 
@@ -391,6 +480,7 @@ def repeat(
     log: Any,
     progress: Any = None,
     cancelled: Any = None,
+    specificity: bool = False,
 ) -> list[dict]:
     """Splits ``1 … k_splits − 1`` (seeds ``split_seed + k``) as split rows.
 
@@ -399,12 +489,19 @@ def repeat(
     loops off), picks the comparison channel on the split's train+val rows and
     scores the paired differences, the comparators of
     :func:`scored_comparators` and the negative controls, and reports the
-    split's CGI posterior (:func:`posterior_rows`). The caller restores the
+    split's CGI posterior (:func:`posterior_rows`). With ``specificity`` the
+    CGI's specificity is contrasted with those comparators and the split's
+    comparison channel (:func:`specificity_rows`). The caller restores the
     first split. ``progress(k)`` is called before each split;
     ``cancelled()`` stops between steps.
     """
     from ..fusion import comparator_mode
-    from .fusion_outputs import _posterior_summary, comparison_channel
+    from .fusion_outputs import (
+        _posterior_summary,
+        _specificity_report,
+        comparison_channel,
+        specificity_exposures,
+    )
 
     loops = {"reps": 0, "shuffles": 0, "gain_splits": 0, "null_runs": 0}
     rows: list[dict] = []
@@ -424,6 +521,7 @@ def repeat(
         slopes = engine.compute_partial_slopes(params)
 
         channel_paired = None
+        best, fits = None, {}
         if standalones:
             fits, pool = {}, {}
             for ch in standalones:
@@ -443,10 +541,8 @@ def repeat(
                 )
 
         comparator_paired: list[dict] = []
+        names = scored_comparators(comparators, comparators_primary, outer_comparators)
         if not engine.is_panel:
-            names = scored_comparators(
-                comparators, comparators_primary, outer_comparators
-            )
             for name in names:
                 r = engine.paired_objective_difference(
                     params,
@@ -460,6 +556,22 @@ def repeat(
                     comparator_paired.append(r)
         engine._active_greenery_channel = "cgi"
         controls = engine.compute_negative_controls(params, n_boot=int(n_paired))
+        contrast = None
+        if specificity:
+            exposures = specificity_exposures(
+                [] if engine.is_panel else names,
+                comparators_primary,
+                best,
+                fits.get(best),
+            )
+            contrast = _specificity_report(
+                engine,
+                params,
+                exposures,
+                int(n_paired),
+                label=f"split {k + 1}",
+                log=lambda level, msg: log(level, msg) if level == "WARN" else None,
+            )
 
         primary = set(comparators_primary or comparators)
         for r in split_rows(
@@ -469,6 +581,7 @@ def repeat(
             comparator_paired=comparator_paired,
             negative_controls=controls,
             posterior=_posterior_summary(params),
+            specificity=contrast,
         ):
             r.update(split=k, seed=seed, **info)
             if r["quantity"] == "cgi_minus_comparator":

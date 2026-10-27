@@ -1006,6 +1006,7 @@ def fusion_run_config(spec: JobSpec) -> dict[str, Any]:
 #: away from ``run_fusion``'s own defaults.
 _FUSION_EXTRAS = {
     "negative_control_retune": False,
+    "specificity_contrast": False,
     "report_ci_bootstrap": None,
     "report_effects_bootstrap": 2000,
     "report_effects_permutations": 1000,

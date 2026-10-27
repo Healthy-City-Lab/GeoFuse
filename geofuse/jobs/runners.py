@@ -61,9 +61,11 @@ from geofuse.jobs.fusion_outputs import (
     _log_stage_timing,
     _negative_control_report,
     _posterior_summary,
+    _specificity_report,
     _write_fusion_outputs,
     comparison_channel,
     paired_verdict,
+    specificity_exposures,
     write_entity_table,
 )
 from geofuse.jobs.stage_ledger import DONE, FAILED, RUNNING, SKIPPED
@@ -1230,14 +1232,16 @@ def _run_outer_splits(
     stage_progress: Any,
     ctx: Any,
     label: str,
+    specificity: bool = False,
 ) -> dict | None:
     """The first split's results and ``k_splits − 1`` repeats, summarised.
 
     The first split's rows come from the run's own reports (its comparators
     reduced to the ones every split scores); the repeats from
-    :func:`geofuse.jobs.outer_splits.repeat`. The engine is put back on the
-    first split afterwards. A failure is logged and the run continues.
-    Returns ``{k, seeds, comparators, splits, summary}``.
+    :func:`geofuse.jobs.outer_splits.repeat`, which also redo the specificity
+    contrast when ``specificity`` is set. The engine is put back on the first
+    split afterwards. A failure is logged and the run continues. Returns
+    ``{k, seeds, comparators, splits, summary}``.
     """
     stage(stage_key, RUNNING)
     scored = set(
@@ -1258,6 +1262,7 @@ def _run_outer_splits(
             ],
             negative_controls=first_split.get("negative_controls"),
             posterior=first_split.get("posterior"),
+            specificity=first_split.get("specificity"),
         ):
             r.update(split=0, seed=int(split_seed), **info)
             if r["quantity"] == "cgi_minus_comparator":
@@ -1290,6 +1295,7 @@ def _run_outer_splits(
             log=lambda level, msg: _log_fusion(level, f"[{label}] {msg}"),
             progress=_progress,
             cancelled=ctx.is_cancelled,
+            specificity=specificity,
         )
     except JobCancelled:
         raise
@@ -1316,7 +1322,9 @@ def _run_outer_splits(
         _log_fusion(
             "OK",
             f"[{label}] Across {e['n_splits']} held-out splits, "
-            f"{e['quantity']} ({e['exposure']}): median "
+            f"{e['quantity']} ({e['exposure']}"
+            + (f" / {e['control']}" if e.get("control") else "")
+            + "): median "
             f"{_fmt_or_na(e['median'], '.4f')} [{_fmt_or_na(e['min'], '.4f')}, "
             f"{_fmt_or_na(e['max'], '.4f')}], holds in "
             f"{_fmt_or_na(e['share_holds'], '.0%')}, corrected "
@@ -1708,6 +1716,7 @@ def run_fusion(
     moderator_columns: list[str] | None = None,
     negative_controls: list[str] | None = None,
     negative_control_retune: bool = False,
+    specificity_contrast: bool = False,
     comparators: list[str] | None = None,
     comparators_primary: list[str] | None = None,
 ) -> dict:
@@ -1738,6 +1747,10 @@ def run_fusion(
     drawn from ``report_paired_bootstrap`` resamples. ``negative_control_retune``
     also re-runs the CGI's sweep and posterior with each control as the target
     and reports how closely that tuning reproduces the target's.
+    ``specificity_contrast`` tests, per control on the held-out rows, whether
+    the CGI is more specific than each primary comparator and the comparison
+    channel (``ΔD = D_cgi − D_e``, ``D = |β_target| − |β_control|``), on the
+    first split and on every repeated one.
 
     ``comparators`` names target columns holding finished exposures to
     benchmark the composite against. Each is scored untuned, as a frozen
@@ -1941,6 +1954,8 @@ def run_fusion(
             "moderator_columns": list(moderator_columns or []),
             "negative_controls": list(negative_controls or []),
             "negative_control_retune": bool(negative_control_retune),
+            # Only when on: off, the record and its hash match a run without it.
+            **({"specificity_contrast": True} if specificity_contrast else {}),
             "comparators": list(comparator_cols),
             "comparators_primary": list(primary_cols),
             "report_paired_bootstrap": int(report_paired_bootstrap),
@@ -3295,6 +3310,57 @@ def run_fusion(
                         ),
                     )
 
+            # ── Specificity contrast ────────────────────
+            # Is the CGI more specific than the primary comparators and the
+            # comparison channel, per negative control, on the held-out rows.
+            primary_cmps = [c for c in (outcome_cmps or []) if c in primary_cols]
+            specificity_report: dict | None = None
+            if specificity_contrast:
+                sc_channel = None
+                if standalones and standalones_bundle:
+                    sc_channel, _ = comparison_channel(
+                        standalones_bundle,
+                        [c for c in standalones if c in standalones_bundle],
+                        objective_metric,
+                    )
+                sc_bundle = standalones_bundle.get(sc_channel) or {}
+                # With repeated splits, the first split scores the comparators
+                # every split scores.
+                sc_mode = str(outer_comparators) if int(outer_splits) > 1 else "primary"
+                sc_exposures = specificity_exposures(
+                    _outer.scored_comparators(
+                        [c for c in (outcome_cmps or []) if c in comparators_report],
+                        primary_cmps,
+                        sc_mode,
+                    ),
+                    primary_cmps,
+                    sc_channel,
+                    sc_bundle.get("averaged_params") or sc_bundle.get("best_params"),
+                )
+                if not outcome_ncs:
+                    _log_fusion(
+                        "WARN",
+                        f"[{label}] Specificity contrast needs negative controls; "
+                        "none for this outcome, so it is skipped.",
+                    )
+                elif not sc_exposures:
+                    _log_fusion(
+                        "WARN",
+                        f"[{label}] Specificity contrast needs comparators or "
+                        "standalone channels to compare the CGI with; skipped.",
+                    )
+                else:
+                    specificity_report = _specificity_report(
+                        engine,
+                        headline_params,
+                        sc_exposures,
+                        int(report_paired_bootstrap),
+                        label=label,
+                        log=_log_fusion,
+                    )
+                if ctx.is_cancelled():
+                    return {"output_paths": output_paths}
+
             # ── Repeated held-out splits ────────────────
             outer_report: dict | None = None
             if int(outer_splits) > 1:
@@ -3328,7 +3394,9 @@ def run_fusion(
                         "comparator_paired": cgi_vs_comparator_paired,
                         "negative_controls": negative_control_report,
                         "posterior": cgi_discovery_summary,
+                        "specificity": specificity_report,
                     },
+                    specificity=specificity_report is not None,
                     standalones=(
                         [c for c in standalones if c in standalones_bundle]
                         if standalones
@@ -3418,6 +3486,8 @@ def run_fusion(
                 "split_seed": int(split_seed),
                 "outer_splits": outer_report,
             }
+            if specificity_contrast:
+                bundle["specificity_contrast"] = specificity_report
             by_target[label] = bundle
 
             # Persist every test result (CGI + standalones) to disk: a

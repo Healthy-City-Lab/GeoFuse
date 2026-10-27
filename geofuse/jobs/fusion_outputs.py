@@ -711,6 +711,39 @@ def _write_fusion_outputs(
         ]
         _emit_csv(f"cgi_vs_comparator_paired{sfx}.csv", paired_rows)
 
+    # ── specificity_contrast.csv ────────────────────────────────
+    # One row per exposure x control on the held-out rows: the four slopes,
+    # each exposure's D = |β_target| − |β_control|, and ΔD = D_cgi − D_e.
+    specificity = (cgi_bundle or {}).get("specificity_contrast") or {}
+    spec_rows = [
+        {
+            "outcome": label,
+            "exposure": r.get("exposure"),
+            "kind": r.get("kind"),
+            "primary": r.get("primary"),
+            "control": r.get("control"),
+            **{
+                k: _f(r.get(k))
+                for k in (
+                    "beta_target_cgi",
+                    "beta_control_cgi",
+                    "beta_target_exposure",
+                    "beta_control_exposure",
+                    "d_cgi",
+                    "d_exposure",
+                    "delta_d",
+                    "ci_low",
+                    "ci_high",
+                    "p_value",
+                    "p_value_holm",
+                )
+            },
+            "n": r.get("n"),
+        }
+        for r in specificity.get("rows") or []
+    ]
+    _emit_csv(f"specificity_contrast{sfx}.csv", spec_rows)
+
     # ── outer_splits.csv + outer_summary.csv ────────────────────
     outer = (cgi_bundle or {}).get("outer_splits") or {}
     if outer.get("splits"):
@@ -825,6 +858,8 @@ def _write_fusion_outputs(
         "spatial_split": (cgi_bundle or {}).get("spatial_split"),
         "outer_splits": (cgi_bundle or {}).get("outer_splits"),
     }
+    if (cgi_bundle or {}).get("specificity_contrast") is not None:
+        manifest["specificity_contrast"] = cgi_bundle["specificity_contrast"]
     _emit_json(f"results_summary{sfx}.json", manifest)
 
     # ── aic_bic.json + collinearity.json (standalone copies) ────
@@ -1338,6 +1373,126 @@ def _comparator_family(comparators: dict[str, dict]) -> list[dict]:
     for r in rows:
         r["verdict"] = paired_verdict(r)
     return rows
+
+
+# ────────────────────────────────────────────────────────────────────
+# Specificity contrast
+# ────────────────────────────────────────────────────────────────────
+
+
+def specificity_exposures(
+    comparators: list[str],
+    primary: list[str],
+    channel: str | None,
+    channel_params: dict | None,
+) -> dict[str, dict]:
+    """The exposures the CGI's specificity is contrasted with.
+
+    Each of ``comparators`` (``kind`` comparator, ``primary`` when it is one of
+    ``primary``, or when none is) and the comparison ``channel`` with its own
+    params (``kind`` channel), as ``{name: {kind, primary, channel, params}}``,
+    where ``channel`` is the engine's active-channel name for the exposure. A
+    channel named like a comparator is keyed ``channel:<name>``.
+    """
+    from ..fusion import comparator_mode
+
+    primary_set = set(primary or comparators)
+    out: dict[str, dict] = {
+        c: {
+            "kind": "comparator",
+            "primary": c in primary_set,
+            "channel": comparator_mode(c),
+            "params": {"comparator": c},
+        }
+        for c in comparators
+    }
+    if channel is not None and channel_params is not None:
+        key = channel if channel not in out else f"channel:{channel}"
+        out[key] = {
+            "kind": "channel",
+            "primary": None,
+            "channel": channel,
+            "params": dict(channel_params),
+        }
+    return out
+
+
+def _specificity_report(
+    engine: Any,
+    cgi_params: dict,
+    exposures: dict[str, dict],
+    n_boot: int,
+    *,
+    label: str,
+    log: Any,
+) -> dict | None:
+    """The CGI's specificity contrast with ``exposures``, Holm-corrected.
+
+    Runs ``engine.compute_specificity_contrast`` on
+    :func:`specificity_exposures`' entries. Each row gains ``kind`` and
+    ``primary``; per control, the primary comparators' rows form one Holm
+    family (``p_value_holm``, ``None`` on the other rows), as the paired
+    CGI − comparator rows do. ``exposure_info`` records each exposure's kind
+    and primary flag. ``log=None`` keeps it quiet. A failure is logged and
+    gives ``None``.
+    """
+    from .. import JobCancelled
+    from .. import statistical_testing as _stats
+
+    try:
+        report = engine.compute_specificity_contrast(
+            cgi_params,
+            {k: (v["channel"], v["params"]) for k, v in exposures.items()},
+            n_boot=int(n_boot),
+            seed=42,
+        )
+    except JobCancelled:
+        raise
+    except Exception as exc:
+        if log is not None:
+            log("WARN", f"[{label}] Specificity contrast failed: {exc}")
+        return None
+    if not report or report.get("skipped"):
+        return report
+    report["exposure_info"] = {
+        k: {"kind": v["kind"], "primary": v["primary"]} for k, v in exposures.items()
+    }
+    rows = report["rows"]
+    for r in rows:
+        info = report["exposure_info"].get(r["exposure"]) or {}
+        r["kind"], r["primary"] = info.get("kind"), info.get("primary")
+        r["p_value_holm"] = None
+    for control in report["controls"]:
+        family = [
+            r
+            for r in rows
+            if r["control"] == control and r["kind"] == "comparator" and r["primary"]
+        ]
+        holm = _stats.holm_bonferroni([r["p_value"] for r in family])
+        for r, hp in zip(family, holm, strict=True):
+            r["p_value_holm"] = None if hp != hp else float(hp)
+    for r in rows if log is not None else []:
+        ci = f"[{_fmt_num(r['ci_low'], '+.4f')}, {_fmt_num(r['ci_high'], '+.4f')}]"
+        holm = r["p_value_holm"]
+        log(
+            "OK",
+            f"[{label}] Specificity vs `{r['exposure']}` on '{r['control']}': "
+            f"D_cgi={_fmt_num(r['d_cgi'], '+.4f')}, "
+            f"D_e={_fmt_num(r['d_exposure'], '+.4f')}, "
+            f"ΔD={_fmt_num(r['delta_d'], '+.4f')} {ci}, "
+            f"p={_fmt_num(r['p_value'], '.3g')}"
+            + (f", Holm p={_fmt_num(holm, '.3g')}" if holm is not None else "")
+            + f" (n={r['n']}).",
+        )
+    return report
+
+
+def _fmt_num(value: Any, spec: str) -> str:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "n/a"
+    return format(v, spec) if np.isfinite(v) else "n/a"
 
 
 # Readings of a paired CGI-vs-exposure row, in the order the checks run.
