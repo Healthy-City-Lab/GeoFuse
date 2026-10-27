@@ -2680,12 +2680,21 @@ _OUTER_QUANTITY_LABELS: dict[str, str] = {
     "negative_control_beta": "Negative-control β",
 }
 
+# Each split's CGI posterior (``outer_splits.POSTERIOR_QUANTITIES``).
+_OUTER_POSTERIOR_LABELS: dict[str, str] = {
+    "posterior_beta": "β",
+    "posterior_weight": "Weight",
+    "posterior_r50": "R50 (m)",
+    "posterior_r90": "R90 (m)",
+}
+
 
 def _render_outer_splits(results_view: dict) -> None:
     """Each result's spread across the repeated held-out splits."""
     outer = results_view.get("outer_splits") or {}
-    summary = outer.get("summary") or []
-    if not summary:
+    every = outer.get("summary") or []
+    summary = [e for e in every if e.get("quantity") not in _OUTER_POSTERIOR_LABELS]
+    if not every:
         return
     st.divider()
     st.markdown("**Across held-out splits**")
@@ -2715,6 +2724,46 @@ def _render_outer_splits(results_view: dict) -> None:
             "Holm p": _fmt(e.get("corrected_p_holm"), 4),
         }
         for e in summary
+    ]
+    if rows:
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    _render_outer_posterior(every)
+
+
+def _render_outer_posterior(summary: list[dict]) -> None:
+    """Each split's CGI posterior, summarised across the splits."""
+    entries = [e for e in summary if e.get("quantity") in _OUTER_POSTERIOR_LABELS]
+    if not entries:
+        return
+    st.markdown("**Posterior across held-out splits**")
+    st.caption(
+        "The composite's posterior refitted on each split's train+val rows: "
+        "median and range across the splits, the share of splits in which a term "
+        "carries the largest weight, and how often each form was chosen. These "
+        "are in-sample fits, so they are described, not tested."
+    )
+
+    def digits(quantity: str) -> int:
+        return {"posterior_beta": 4, "posterior_weight": 3}.get(quantity, 0)
+
+    rows = [
+        {
+            "Result": _OUTER_POSTERIOR_LABELS[e["quantity"]],
+            "Term": _CHANNEL_DISPLAY.get(e.get("exposure"), e.get("exposure")),
+            "Splits": e.get("n_splits"),
+            "Median": _fmt(e.get("median"), digits(e["quantity"])),
+            "Range": (
+                f"[{_fmt(e.get('min'), digits(e['quantity']))}, "
+                f"{_fmt(e.get('max'), digits(e['quantity']))}]"
+            ),
+            "Largest weight in": (
+                "—"
+                if _num(e.get("share_largest")) is None
+                else f"{float(e['share_largest']):.0%}"
+            ),
+            "Forms": e.get("forms") or "—",
+        }
+        for e in entries
     ]
     st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
