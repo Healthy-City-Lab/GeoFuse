@@ -18,7 +18,8 @@ for the same kind of coordinate smooth the scores do. Pinned here:
   run with two held-out splits every split's slope rows carry them, the
   corrected t recomputes from those rows, and every table names the smooth,
   while an unadjusted run has no such column;
-- the reported direction conditions on the score's smooth.
+- the reported direction conditions on the score's smooth;
+- ``geofuse results`` names the adjustment and each row's smooth.
 """
 
 import csv
@@ -27,6 +28,7 @@ import sys
 import tempfile
 import types
 import unittest
+from pathlib import Path
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 for _p in (os.path.dirname(os.path.abspath(__file__)), ROOT):
@@ -549,6 +551,55 @@ class TestDirection(unittest.TestCase):
             )
             signs[method] = fusion_outputs._direction_sign(eng, {}, "r2")
         self.assertEqual(signs, {"none": 1, "spatial_plus": -1, "ks_aic": -1})
+
+
+# ────────────────────────────────────────────────────────────────────
+# The command line
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestCommandLine(unittest.TestCase):
+    def test_the_summary_names_the_adjustment(self):
+        from geofuse.cli import results
+
+        record = {"method": "spatial_plus", "df": 3}
+        bundle = {
+            "test_results": {"spatial_adjustment": {"method": "spatial_plus"}},
+            "negative_controls": {
+                "splits": {"test": {"target": {"spatial_adjustment": record}}}
+            },
+            "specificity_contrast": {
+                "rows": [
+                    {
+                        "exposure": "g13",
+                        "kind": "comparator",
+                        "control": "grip",
+                        "d_cgi": 0.02,
+                        "d_exposure": -0.01,
+                        "delta_d": 0.03,
+                        "ci_low": 0.01,
+                        "ci_high": 0.05,
+                        "p_value": 0.01,
+                        "n": 300,
+                        "spatial_adjustment": {
+                            "method": "spatial_plus",
+                            "df_cgi": 3,
+                            "df_exposure": 2,
+                        },
+                    }
+                ]
+            },
+        }
+        text = "\n".join(results.summary("y", bundle, Path(".")))
+        self.assertIn(
+            "Spatial adjust   spatial_plus smooth in the scores, slopes, negative "
+            "controls and specificity (held-out β: df 3)",
+            text,
+        )
+        self.assertIn("spatial_plus df cgi 3, exposure 2", text)
+        old = {"test_results": {"spatial_adjustment": {"method": "ks_aic"}}}
+        lines = results.summary("y", old, Path("."))
+        self.assertIn("  Spatial adjust   ks_aic smooth in the scores", lines)
 
 
 if __name__ == "__main__":

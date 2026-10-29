@@ -19,6 +19,7 @@ import shutil
 from pathlib import Path
 
 from geofuse.cli.commands import EXIT_OK, CliError, _state
+from geofuse.jobs.outer_splits import spatial_label
 
 _CHANNELS = {"veg": "vegetation", "terrain": "terrain", "ndvi": "NDVI", "gvi": "GVI"}
 
@@ -117,10 +118,12 @@ def _outer_lines(outer: dict) -> list[str]:
     if not summary:
         return []
     seeds = outer.get("seeds") or []
+    methods = [e["spatial_method"] for e in summary if e.get("spatial_method")]
     lines = [
         f"  Across {outer.get('k')} held-out splits"
         + (f" (seeds {seeds[0]}–{seeds[-1]})" if seeds else "")
         + ": median [min, max], share of splits holding, corrected p"
+        + (f"; slopes adjusted for a {methods[0]} smooth" if methods else "")
     ]
     for e in summary:
         median, lo, hi = (_num(e.get(k)) for k in ("median", "min", "max"))
@@ -165,13 +168,35 @@ def _specificity_lines(report: dict) -> list[str]:
             p_text = f"Holm p={p:.3g}" if p is not None else ""
             if p is None and _num(r.get("p_value")) is not None:
                 p_text = f"p={_num(r.get('p_value')):.3g}"
+            spatial = spatial_label(r.get("spatial_adjustment"))
             lines.append(
                 f"    {str(r.get('control')):<15}D_cgi {d_cgi:+.4f}  D_e {d_e:+.4f}  "
                 f"ΔD {delta:+.4f}  {_interval(r, 'ci_low', 'ci_high')}"
                 + (f"  {p_text}" if p_text else "")
                 + (f"  n={r['n']}" if r.get("n") else "")
+                + (f"  {spatial}" if spatial else "")
             )
     return lines
+
+
+def _spatial_lines(bundle: dict) -> list[str]:
+    """The run's spatial adjustment: the method, and whether the slopes carry
+    it (runs from before it reached them adjusted the scores only)."""
+    adjustment = (bundle.get("test_results") or {}).get("spatial_adjustment") or {}
+    if not adjustment.get("method"):
+        return []
+    splits = (bundle.get("negative_controls") or {}).get("splits") or {}
+    target = (splits.get("test") or {}).get("target") or {}
+    reference = (bundle.get("comparator_reference") or {}).get("test") or {}
+    record = target.get("spatial_adjustment") or reference.get("spatial_adjustment")
+    outer = (bundle.get("outer_splits") or {}).get("splits") or []
+    line = f"  Spatial adjust   {adjustment['method']} smooth in the scores"
+    if record is not None or any("spatial_method" in r for r in outer):
+        line += ", slopes, negative controls and specificity"
+    if record is not None:
+        df = record.get("df")
+        line += f" (held-out β: df {'none' if df is None else df})"
+    return [line]
 
 
 def _posterior_lines(summary: list[dict]) -> list[str]:
@@ -264,6 +289,7 @@ def summary(label: str, bundle: dict, artifacts: Path) -> list[str]:
                 else "negative: more greenery, lower outcome"
             )
         )
+    lines += _spatial_lines(bundle)
 
     standalones = bundle.get("standalones") or {}
     for channel, sb in standalones.items():
