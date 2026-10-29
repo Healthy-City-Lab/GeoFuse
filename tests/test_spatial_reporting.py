@@ -13,11 +13,17 @@ for the same kind of coordinate smooth the scores do. Pinned here:
 - with unit weights the specificity contrast's four slopes are the adjusted
   partial slopes (each exposure's own smooth under ``spatial_plus``, each
   outcome's under ``ks_aic``), and every slope and row records its smooth;
-- ``none`` adds no record anywhere.
+- ``none`` adds no record anywhere;
+- the records become text columns on the slope rows; in a spatially adjusted
+  run with two held-out splits every split's slope rows carry them, the
+  corrected t recomputes from those rows, and every table names the smooth,
+  while an unadjusted run has no such column.
 """
 
+import csv
 import os
 import sys
+import tempfile
 import types
 import unittest
 
@@ -31,6 +37,8 @@ import numpy as np
 import pandas as pd
 
 from geofuse import negative_controls as nc
+from geofuse.jobs import outer_splits
+from geofuse.statistical_testing import corrected_resampled_t
 
 # ────────────────────────────────────────────────────────────────────
 # The statistics' extra columns
@@ -359,6 +367,158 @@ class TestSpecificityAdjusted(unittest.TestCase):
         )
         (row,) = out["rows"]
         self.assertEqual((row["delta_d"], row["ci_low"], row["ci_high"]), (0, 0, 0))
+
+
+# ────────────────────────────────────────────────────────────────────
+# Rows and tables
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestRecords(unittest.TestCase):
+    def test_columns_and_labels(self):
+        one = {"method": "spatial_plus", "df": 3}
+        pair = {"method": "ks_aic", "df_target": 2, "df_control": None}
+        self.assertEqual(
+            outer_splits.spatial_columns(one),
+            {"spatial_method": "spatial_plus", "spatial_df": "3"},
+        )
+        self.assertEqual(
+            outer_splits.spatial_columns(pair),
+            {
+                "spatial_method": "ks_aic",
+                "spatial_df_target": "2",
+                "spatial_df_control": "none",
+            },
+        )
+        self.assertEqual(outer_splits.spatial_columns(None), {})
+        self.assertEqual(outer_splits.spatial_label(one), "spatial_plus df 3")
+        self.assertEqual(
+            outer_splits.spatial_label(pair), "ks_aic df target 2, control none"
+        )
+
+    def test_slope_rows_carry_the_record_and_the_summary_the_method(self):
+        record = {"method": "spatial_plus", "df": 4}
+        slope = {"beta": 0.1, "ci_low": 0.0, "ci_high": 0.2, "t": 2.0, "df": 300}
+        rows = []
+        for k in range(3):
+            for r in outer_splits.split_rows(
+                effects_test={"score": 0.01},
+                slope_test={**slope, "spatial_adjustment": record},
+                channel_paired=None,
+                comparator_paired=[],
+                negative_controls=None,
+            ):
+                r.update(split=k, test_share=0.2)
+                rows.append(r)
+        beta = [r for r in rows if r["quantity"] == "held_out_beta"]
+        self.assertTrue(all(r["spatial_df"] == "4" for r in beta))
+        score = [r for r in rows if r["quantity"] == "held_out_score"]
+        self.assertNotIn("spatial_method", score[0])
+        summary = {e["quantity"]: e for e in outer_splits.summarise(rows)}
+        self.assertEqual(summary["held_out_beta"]["spatial_method"], "spatial_plus")
+        self.assertNotIn("spatial_method", summary["held_out_score"])
+
+
+# ────────────────────────────────────────────────────────────────────
+# A whole spatially adjusted run with two held-out splits
+# ────────────────────────────────────────────────────────────────────
+
+_INPUTS = """
+    mode = "cross-sectional"
+    ndvi = "ndvi_2015.tif"
+    gvi = "gvi.gpkg"
+    """
+
+_SLOPES = (
+    "held_out_beta",
+    "negative_control_beta",
+    "exposure_beta",
+    "exposure_negative_control_beta",
+    "specificity_difference",
+)
+
+
+class TestAdjustedRun(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from test_fusion_run import _write_study, run_study
+
+        cls.folder = tempfile.mkdtemp(prefix="geofuse-spatial-")
+        _write_study(cls.folder)
+        cls.ctx, cls.bundle = run_study(
+            cls.folder,
+            _INPUTS,
+            spatial_adjust_method="spatial_plus",
+            outer_splits=2,
+            specificity_contrast=True,
+            comparators=["ndvi_here", "noise", "patchy"],
+            comparators_primary=["ndvi_here", "patchy"],
+        )
+        cls.report = cls.bundle["report_dir"]
+
+    def _table(self, name):
+        with open(os.path.join(self.report, name), encoding="utf-8") as f:
+            return list(csv.DictReader(f))
+
+    def test_the_run_completes(self):
+        stages = {s["key"]: s["status"] for s in self.ctx.ledger["stages"]}
+        self.assertNotIn("failed", stages.values(), stages)
+
+    def test_every_splits_slope_rows_carry_the_smooth(self):
+        rows = self.bundle["outer_splits"]["splits"]
+        for k in (0, 1):
+            split = [r for r in rows if r["split"] == k]
+            quantities = {r["quantity"] for r in split}
+            for quantity in _SLOPES:
+                with self.subTest(split=k, quantity=quantity):
+                    self.assertIn(quantity, quantities)
+                    for r in split:
+                        if r["quantity"] == quantity:
+                            self.assertEqual(r["spatial_method"], "spatial_plus")
+        diffs = [r for r in rows if r["quantity"] == "specificity_difference"]
+        self.assertTrue(all("spatial_df_cgi" in r for r in diffs))
+
+    def test_the_corrected_t_recomputes_from_the_adjusted_rows(self):
+        outer = self.bundle["outer_splits"]
+        rows = [r for r in outer["splits"] if r["quantity"] == "held_out_beta"]
+        (entry,) = [e for e in outer["summary"] if e["quantity"] == "held_out_beta"]
+        self.assertEqual(entry["spatial_method"], "spatial_plus")
+        want = corrected_resampled_t(
+            [r["estimate"] for r in rows],
+            float(np.mean([r["test_share"] for r in rows])),
+            alternative="two-sided",
+        )
+        self.assertAlmostEqual(entry["corrected_p"], want["p_value"])
+        first = next(r for r in rows if r["split"] == 0)
+        reference = self.bundle["comparator_reference"]["test"]
+        self.assertAlmostEqual(first["estimate"], reference["beta"])
+        self.assertEqual(
+            first["spatial_df"], str(reference["spatial_adjustment"]["df"])
+        )
+
+    def test_the_tables_name_the_smooth(self):
+        for name, column in (
+            ("negative_controls.csv", "spatial_df"),
+            ("comparators.csv", "spatial_df"),
+            ("specificity_contrast.csv", "spatial_df_exposure"),
+            ("outer_splits.csv", "spatial_df"),
+        ):
+            with self.subTest(name):
+                table = self._table(name)
+                self.assertIn(column, table[0])
+                methods = {r["spatial_method"] for r in table if r["spatial_method"]}
+                self.assertEqual(methods, {"spatial_plus"})
+
+
+class TestUnadjustedRun(unittest.TestCase):
+    def test_no_spatial_column_anywhere(self):
+        from test_fusion_run import _run
+
+        _, bundle = _run("cross-sectional with comparators")
+        for name in ("negative_controls.csv", "comparators.csv"):
+            with open(os.path.join(bundle["report_dir"], name), encoding="utf-8") as f:
+                header = next(csv.reader(f))
+            self.assertFalse([c for c in header if c.startswith("spatial_")], name)
 
 
 if __name__ == "__main__":

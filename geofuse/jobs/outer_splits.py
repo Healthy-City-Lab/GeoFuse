@@ -29,6 +29,10 @@ R90 per channel, the weight of every term, β and the chosen form. They are
 fitted on that split's train+val rows, so they are summarised as a spread,
 with the share of splits in which each term carries the largest weight, and
 not tested.
+
+With spatial adjustment on, every slope (the held-out β, the negative-control
+β, each exposure's β and ΔD) is adjusted for that split's spatial smooth, and
+its row carries ``spatial_method`` and the selected df (:func:`spatial_columns`).
 """
 
 from __future__ import annotations
@@ -79,7 +83,33 @@ def _slope_p(slope: dict) -> float | None:
     return float(2 * stats.t.sf(abs(t), df))
 
 
-def _row(quantity: str, exposure: str, **values) -> dict:
+def spatial_columns(record: dict | None) -> dict:
+    """A ``spatial_adjustment`` record as flat columns: ``spatial_method`` and
+    one ``spatial_df…`` per smooth, as text (``"none"`` where no smooth was
+    used, so a table column never mixes numbers with blanks). Empty without a
+    record."""
+    out = {}
+    for key, value in (record or {}).items():
+        if key.startswith("df"):
+            value = "none" if value is None else str(value)
+        out[f"spatial_{key}"] = value
+    return out
+
+
+def spatial_label(record: dict | None) -> str | None:
+    """A ``spatial_adjustment`` record as text: ``"spatial_plus df 3"``,
+    ``"ks_aic df target 2, control none"``; ``None`` without a record."""
+    if not record:
+        return None
+    dfs = [
+        ("" if key == "df" else f"{key[3:]} ") + ("none" if v is None else str(v))
+        for key, v in record.items()
+        if key.startswith("df")
+    ]
+    return f"{record.get('method')} df {', '.join(dfs)}"
+
+
+def _row(quantity: str, exposure: str, spatial: dict | None = None, **values) -> dict:
     return {
         "quantity": quantity,
         "exposure": exposure,
@@ -87,6 +117,7 @@ def _row(quantity: str, exposure: str, **values) -> dict:
         "ci_low": _f(values.get("ci_low")),
         "ci_high": _f(values.get("ci_high")),
         "p_value": _f(values.get("p_value")),
+        **spatial_columns(spatial),
     }
 
 
@@ -143,6 +174,7 @@ def split_rows(
             _row(
                 "held_out_beta",
                 "cgi",
+                slope_test.get("spatial_adjustment"),
                 estimate=slope_test.get("beta"),
                 ci_low=slope_test.get("ci_low"),
                 ci_high=slope_test.get("ci_high"),
@@ -177,6 +209,7 @@ def split_rows(
             _row(
                 "negative_control_beta",
                 str(name),
+                block.get("spatial_adjustment"),
                 estimate=block.get("beta"),
                 ci_low=block.get("ci_low"),
                 ci_high=block.get("ci_high"),
@@ -216,6 +249,7 @@ def specificity_rows(report: dict | None) -> list[dict]:
             "exposure_beta",
             name,
             None,
+            spatial=target.get("spatial_adjustment"),
             estimate=target.get("beta"),
             ci_low=target.get("ci_low"),
             ci_high=target.get("ci_high"),
@@ -226,6 +260,7 @@ def specificity_rows(report: dict | None) -> list[dict]:
                 "exposure_negative_control_beta",
                 name,
                 control,
+                spatial=block.get("spatial_adjustment"),
                 estimate=block.get("beta"),
                 ci_low=block.get("ci_low"),
                 ci_high=block.get("ci_high"),
@@ -236,6 +271,7 @@ def specificity_rows(report: dict | None) -> list[dict]:
             "specificity_difference",
             str(r.get("exposure")),
             r.get("control"),
+            spatial=r.get("spatial_adjustment"),
             estimate=r.get("delta_d"),
             ci_low=r.get("ci_low"),
             ci_high=r.get("ci_high"),
@@ -325,7 +361,7 @@ def summarise(rows: list[dict]) -> list[dict]:
     Holm family per control. Posterior quantities get the spread only; each
     term's weight entry adds ``share_largest`` (the share of splits in which
     that term has the largest weight) and the β entry ``forms`` (how often
-    each form was chosen).
+    each form was chosen). Spatially adjusted slopes carry ``spatial_method``.
     """
     from geofuse.statistical_testing import corrected_resampled_t, holm_bonferroni
 
@@ -367,6 +403,8 @@ def summarise(rows: list[dict]) -> list[dict]:
         if "control" in group[0]:
             entry["control"] = control
             entry["kind"] = group[0].get("kind")
+        if "spatial_method" in group[0]:
+            entry["spatial_method"] = group[0]["spatial_method"]
         if entry["alternative"] and shares:
             test = corrected_resampled_t(
                 est, float(np.mean(shares)), alternative=entry["alternative"]

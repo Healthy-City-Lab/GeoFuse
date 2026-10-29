@@ -1324,6 +1324,7 @@ def _run_outer_splits(
             f"[{label}] Across {e['n_splits']} held-out splits, "
             f"{e['quantity']} ({e['exposure']}"
             + (f" / {e['control']}" if e.get("control") else "")
+            + (f", {e['spatial_method']}" if e.get("spatial_method") else "")
             + "): median "
             f"{_fmt_or_na(e['median'], '.4f')} [{_fmt_or_na(e['min'], '.4f')}, "
             f"{_fmt_or_na(e['max'], '.4f')}], holds in "

@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 
 from ..logger import get_logger
+from .outer_splits import spatial_columns, spatial_label
 from .stage_ledger import StageLedger
 
 _log_fusion = get_logger("FUSION")
@@ -599,7 +600,9 @@ def _write_fusion_outputs(
     # One row per exposure x split x outcome: the target first, then each
     # control with its paired contrast against the target and the non-specific
     # flag. ``exposure`` says whether the frozen exposure was the CGI, a
-    # standalone or a comparator.
+    # standalone or a comparator. In a spatially adjusted run the
+    # ``spatial_*`` columns name the smooth each row's slopes adjust for, as
+    # in comparators.csv, specificity_contrast.csv and outer_splits.csv.
     comparators = (cgi_bundle or {}).get("comparators") or {}
     nc_sources = [
         (key, "cgi" if key == "cgi" else "standalone", b.get("negative_controls"))
@@ -638,6 +641,7 @@ def _write_fusion_outputs(
                         "nonspecific": (
                             e.get("nonspecific") if role == "control" else None
                         ),
+                        **spatial_columns(e.get("spatial_adjustment")),
                     }
                 )
     if nc_rows:
@@ -681,6 +685,7 @@ def _write_fusion_outputs(
                 "beta": _f(row.get("beta")),
                 "beta_ci_low": _f(row.get("beta_ci_low")),
                 "beta_ci_high": _f(row.get("beta_ci_high")),
+                **spatial_columns(row.get("spatial_adjustment")),
             }
             for name, primary, block in sources
             for split in _SPLITS
@@ -739,6 +744,7 @@ def _write_fusion_outputs(
                 )
             },
             "n": r.get("n"),
+            **spatial_columns(r.get("spatial_adjustment")),
         }
         for r in specificity.get("rows") or []
     ]
@@ -1232,7 +1238,8 @@ def _exposure_splits(
     (``evaluate_on_test`` and its bootstrap CI) and its p-value from the
     held-out permutation test, as the CGI's headline does; ``train_val`` and
     ``all`` are the descriptive ``evaluate_effects`` slices. ``beta`` is the
-    covariate-adjusted slope in SD units (``compute_partial_slopes``).
+    covariate-adjusted slope in SD units (``compute_partial_slopes``), with its
+    ``spatial_adjustment`` record when the run is spatially adjusted.
     """
     out: dict[str, dict] = {}
     for split in _SPLITS:
@@ -1248,6 +1255,8 @@ def _exposure_splits(
             "beta_ci_low": s.get("ci_low"),
             "beta_ci_high": s.get("ci_high"),
         }
+        if s.get("spatial_adjustment") is not None:
+            row["spatial_adjustment"] = s["spatial_adjustment"]
         if split == "test" and test_results:
             ci = test_results.get("test_ci") or {}
             row["score"] = test_results.get("test_score")
@@ -1474,6 +1483,7 @@ def _specificity_report(
     for r in rows if log is not None else []:
         ci = f"[{_fmt_num(r['ci_low'], '+.4f')}, {_fmt_num(r['ci_high'], '+.4f')}]"
         holm = r["p_value_holm"]
+        spatial = spatial_label(r.get("spatial_adjustment"))
         log(
             "OK",
             f"[{label}] Specificity vs `{r['exposure']}` on '{r['control']}': "
@@ -1482,7 +1492,9 @@ def _specificity_report(
             f"ΔD={_fmt_num(r['delta_d'], '+.4f')} {ci}, "
             f"p={_fmt_num(r['p_value'], '.3g')}"
             + (f", Holm p={_fmt_num(holm, '.3g')}" if holm is not None else "")
-            + f" (n={r['n']}).",
+            + f" (n={r['n']}"
+            + (f", {spatial}" if spatial else "")
+            + ").",
         )
     return report
 
