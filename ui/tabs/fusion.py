@@ -37,6 +37,7 @@ from geofuse import metric_sampling as _metric_sampling
 from geofuse import mixed_effects_scoring as _mes
 from geofuse import settings as _gf_settings
 from geofuse.crs_utils import buffer_gdf_union_metres, reproject_geodataframe_to_wgs84
+from geofuse.jobs.outer_splits import spatial_label
 from geofuse.persistence import caches
 from geofuse.vector_io import (
     geometry_sha256,
@@ -2377,13 +2378,14 @@ def _render_study_details_panel(
             format_func=lambda k: _spatial_adjust_labels[k],
             key="fusion_spatial_adjust_method",
             help=(
-                "Remove unmeasured smooth spatial confounding by adding a "
-                "coordinate smooth (per spatial cluster, df chosen by AIC) to the "
-                "objective. KS-AIC (Keller & Szpiro) is recommended; Spatial+ "
-                "residualizes the greenery exposure on the smooth instead. The "
-                "reported CGI association becomes fine-scale (within-cluster) "
-                "contrast, so the optimal CGI parameters will shift versus an "
-                "unadjusted run."
+                "Remove unmeasured smooth spatial confounding from the reported "
+                "results by adding a coordinate smooth (per spatial cluster, df "
+                "chosen by AIC) to the held-out scores, paired tests, slopes, "
+                "negative controls and specificity contrast. KS-AIC (Keller & "
+                "Szpiro) is recommended; Spatial+ residualizes the greenery "
+                "exposure on the smooth instead. The CGI's tuning is unchanged; "
+                "the reported association becomes fine-scale (within-cluster) "
+                "contrast."
             ),
         )
         if spatial_adjust_method != "none":
@@ -2637,6 +2639,12 @@ def _covariate_missing_caption(report: dict | None) -> str | None:
     )
 
 
+def _spatial_cell(entry: dict) -> dict:
+    """``{"Spatial smooth": label}`` for a spatially adjusted slope, else ``{}``."""
+    label = spatial_label(entry.get("spatial_adjustment"))
+    return {"Spatial smooth": label} if label else {}
+
+
 def _comparator_rows(results_view: dict) -> list[dict]:
     """One table row per exposure: the CGI, then each comparator."""
     comparators = results_view.get("comparators") or {}
@@ -2646,6 +2654,7 @@ def _comparator_rows(results_view: dict) -> list[dict]:
     }
     sources = [("CGI", None, results_view.get("comparator_reference") or {})]
     sources += [(name, c, c) for name, c in comparators.items()]
+    spatial = any((b.get("test") or {}).get("spatial_adjustment") for *_, b in sources)
     rows = []
     for name, c, block in sources:
         test = block.get("test") or {}
@@ -2658,6 +2667,8 @@ def _comparator_rows(results_view: dict) -> list[dict]:
             "n": test.get("n"),
             "β per SD": _fmt(test.get("beta")),
         }
+        if spatial:
+            row["Spatial smooth"] = spatial_label(test.get("spatial_adjustment")) or "—"
         p = paired.get(name) or {}
         row["CGI − comparator"] = "" if c is None else _fmt(p.get("observed_diff"))
         row["Δ 95% CI"] = (
@@ -2712,6 +2723,12 @@ def _render_outer_splits(results_view: dict) -> None:
         "resampled t, not a combination of the per-split p-values. The held-out "
         "score is not tested (it cannot be negative); its signed slope is. "
         "Every other table on this page reads the first split."
+        + (
+            " Every slope is adjusted for that split's coordinate smooth; "
+            "outer_splits.csv gives its df per split."
+            if any(e.get("spatial_method") for e in summary)
+            else ""
+        )
     )
     with_control = any("control" in e for e in summary)
     rows = [
@@ -2844,10 +2861,17 @@ def _render_specificity_contrast(results_view: dict) -> None:
             "p": _fmt(r.get("p_value"), 4),
             "Holm p": _fmt(r.get("p_value_holm"), 4),
             "n": r.get("n"),
+            **_spatial_cell(r),
         }
         for r in rows
     ]
     st.dataframe(pd.DataFrame(table), width="stretch", hide_index=True)
+    if any(r.get("spatial_adjustment") for r in rows):
+        st.caption(
+            "Spatially adjusted: every slope also controls for a coordinate "
+            "smooth, each exposure's own under Spatial+ and each outcome's own "
+            "under KS-AIC; the column gives the df of the two smooths in play."
+        )
 
 
 def _render_collinearity_report(results_view: dict) -> None:
@@ -4885,6 +4909,7 @@ def _render_negative_controls(report: dict | None) -> None:
                 "n": tgt.get("n"),
                 "|β| target − |β| control": "-",
                 "Non-specific": "-",
+                **_spatial_cell(tgt),
             }
         ]
         for name, c in (res.get("controls") or {}).items():
@@ -4900,6 +4925,7 @@ def _render_negative_controls(report: dict | None) -> None:
                         f"{_fmt(c.get('delta_ci_high'), 3)}]"
                     ),
                     "Non-specific": "yes" if c.get("nonspecific") else "no",
+                    **_spatial_cell(c),
                 }
             )
         st.caption(title)
@@ -4939,6 +4965,11 @@ def _render_negative_controls(report: dict | None) -> None:
             "outcome greenery should not cause - residual confounding or "
             "selection, not only the pathway. Read the effect with that in mind."
         )
+    adjusted = any(
+        (res.get("target") or {}).get("spatial_adjustment")
+        for res in splits.values()
+        if res
+    )
     st.caption(
         "Each control is scored with the composite frozen as tuned; it never "
         "entered the search. β is the covariate-adjusted slope with both sides "
@@ -4948,6 +4979,14 @@ def _render_negative_controls(report: dict | None) -> None:
         "interval excludes zero while the difference's interval includes it. "
         "Compare against a standalone study's table to see whether the "
         "composite is more or less specific than a single channel."
+        + (
+            " Spatially adjusted: β, the difference and the objective also "
+            "control for a coordinate smooth, the composite's under Spatial+ "
+            "and each outcome's own under KS-AIC (its df in the Spatial smooth "
+            "column)."
+            if adjusted
+            else ""
+        )
     )
 
 
