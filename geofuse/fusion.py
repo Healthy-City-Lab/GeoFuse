@@ -8080,7 +8080,10 @@ class MetricFusionEngine:
         reporting covariates, with its exact interval and ``n`` (rows where both
         are observed; see :func:`negative_controls.partial_slope`). The slope is
         the one the negative-control transfer test reports, so an exposure's
-        effect and its specificity read on one scale.
+        effect and its specificity read on one scale. With spatial adjustment
+        on, both sides are also residualised on the split's spatial smooth
+        (:meth:`_slope_smooths`) and each entry records it under
+        ``spatial_adjustment``.
         """
         from . import negative_controls as _nc
 
@@ -8088,6 +8091,7 @@ class MetricFusionEngine:
         target = np.asarray(df["target"].values, dtype=np.float64)
         composite = np.asarray(df["composite"].values, dtype=np.float64)
         cov = self._reporting_covariate_matrix(df)
+        coords = self._whole_data_coords(df)
         test = self._test_entity_mask(df)
         out: dict[str, dict] = {}
         for split, rows in (
@@ -8095,10 +8099,84 @@ class MetricFusionEngine:
             ("train_val", ~test),
             ("all", np.ones(len(df), dtype=bool)),
         ):
-            out[split] = _nc.partial_slope(
-                composite[rows], target[rows], None if cov is None else cov[rows]
+            (smooth, record), _ = self._slope_smooths(
+                coords, rows, composite, target, {}, cov
             )
+            out[split] = _nc.partial_slope(
+                composite[rows],
+                target[rows],
+                self._with_smooth(None if cov is None else cov[rows], smooth),
+            )
+            if record is not None:
+                out[split]["spatial_adjustment"] = record
         return out
+
+    # ── Spatial smooth of the reported slopes ───────────────────
+
+    def _reporting_smooth(
+        self,
+        coords: "np.ndarray | None",
+        rows: np.ndarray,
+        outcome: np.ndarray,
+        cov: "np.ndarray | None",
+        exposure: np.ndarray,
+    ) -> "tuple[np.ndarray | None, dict]":
+        """One reported slope's spatial smooth on ``rows``, and its record.
+
+        ``coords`` are :meth:`_whole_data_coords` of an ``apply_fusion`` frame
+        and ``rows`` a mask over it. The smooth is built on those rows as the
+        scores build theirs, with its df selected on ``exposure``
+        (``spatial_plus``) or on ``outcome`` given the covariates
+        (``ks_aic``). The record is ``{"method", "df"}``; ``df`` is ``None``
+        when no smooth is used (no coordinates, or the criterion kept none).
+        """
+        cols, df = None, None
+        if coords is not None:
+            cols, df = self._spatial_smooth(
+                coords[rows],
+                outcome[rows],
+                None if cov is None else cov[rows],
+                exposure[rows],
+            )
+        record = {"method": self.spatial_adjust_method, "df": None}
+        if cols is not None:
+            record["df"] = None if df is None else int(df)
+        return cols, record
+
+    def _slope_smooths(
+        self,
+        coords: "np.ndarray | None",
+        rows: np.ndarray,
+        exposure: np.ndarray,
+        target: np.ndarray,
+        controls: dict,
+        cov: "np.ndarray | None",
+    ) -> tuple[tuple, dict]:
+        """The smooths of ``exposure``'s slopes on the target and each control.
+
+        ``((columns, record), {control: (columns, record)})`` over ``rows``
+        (:meth:`_reporting_smooth`): under ``spatial_plus`` one smooth, selected
+        on the exposure, serves every outcome; under ``ks_aic`` each outcome has
+        its own, selected on it. Without spatial adjustment every pair is
+        ``(None, None)``.
+        """
+        method = self.spatial_adjust_method
+        if method == "none":
+            return (None, None), {c: (None, None) for c in controls}
+        on_target = self._reporting_smooth(coords, rows, target, cov, exposure)
+        if method == "spatial_plus":
+            return on_target, {c: on_target for c in controls}
+        return on_target, {
+            c: self._reporting_smooth(coords, rows, values, cov, exposure)
+            for c, values in controls.items()
+        }
+
+    @staticmethod
+    def _with_smooth(cov: "np.ndarray | None", smooth: "np.ndarray | None"):
+        """``cov`` with the smooth's columns appended (``cov`` itself without)."""
+        if smooth is None:
+            return cov
+        return smooth if cov is None else np.column_stack([cov, smooth])
 
     def _reporting_clusters(
         self, df: "pd.DataFrame", cluster_column: str | None
@@ -8138,6 +8216,12 @@ class MetricFusionEngine:
         :mod:`geofuse.negative_controls`. With ``metric``, the job's objective
         is also scored on each outcome. ``cluster_column`` resamples whole
         areas instead of entities. ``None`` when no controls are configured.
+
+        With spatial adjustment on, every slope, contrast and objective score
+        also adjusts for the split's spatial smooth: the composite's under
+        ``spatial_plus``, each outcome's own under ``ks_aic``
+        (:meth:`_slope_smooths`); each outcome's entry records it under
+        ``spatial_adjustment``.
         """
         from . import negative_controls as _nc
 
@@ -8167,15 +8251,22 @@ class MetricFusionEngine:
         if not controls:
             return None
         clusters = self._reporting_clusters(df, cluster_column)
+        coords = self._whole_data_coords(df)
+        method = self.spatial_adjust_method
 
-        def objective(y, x, c):
+        def objective(y, x, c, smooth):
             if metric is None:
                 return None
             keep = self._finite_rows(y, x, c)
             try:
                 return float(
                     objective_scoring.score(
-                        metric, y[keep], x[keep], None if c is None else c[keep]
+                        metric,
+                        y[keep],
+                        x[keep],
+                        None if c is None else c[keep],
+                        spatial_basis=None if smooth is None else smooth[keep],
+                        spatial_method=method,
                     )
                 )
             except Exception:
@@ -8193,20 +8284,38 @@ class MetricFusionEngine:
             if int(mask.sum()) < 10:
                 continue
             c_m = None if cov is None else cov[mask]
+            (t_smooth, t_record), c_smooths = self._slope_smooths(
+                coords, mask, composite, target, controls, cov
+            )
+            extra = None
+            if method == "spatial_plus":
+                extra = {"exposure": t_smooth}
+            elif method == "ks_aic":
+                extra = {
+                    "target": t_smooth,
+                    "controls": {k: s for k, (s, _) in c_smooths.items()},
+                }
             res = _nc.transfer_test(
                 composite[mask],
                 target[mask],
                 {k: v[mask] for k, v in controls.items()},
                 c_m,
+                extra=extra,
                 n_boot=int(n_boot),
                 seed=int(seed),
                 clusters=None if clusters is None else clusters[mask],
             )
-            res["target"]["objective"] = objective(target[mask], composite[mask], c_m)
+            res["target"]["objective"] = objective(
+                target[mask], composite[mask], c_m, t_smooth
+            )
             for k, v in controls.items():
                 res["controls"][k]["objective"] = objective(
-                    v[mask], composite[mask], c_m
+                    v[mask], composite[mask], c_m, c_smooths[k][0]
                 )
+            if t_record is not None:
+                res["target"]["spatial_adjustment"] = t_record
+                for k in controls:
+                    res["controls"][k]["spatial_adjustment"] = c_smooths[k][1]
             out["splits"][split] = res
         flagged = [
             k
@@ -8248,6 +8357,13 @@ class MetricFusionEngine:
         and on every control, on the rows where each pair is observed, as the
         CGI's are in :meth:`compute_negative_controls`. ``None`` without
         controls or exposures; ``{"skipped": "longitudinal"}`` for a panel.
+
+        With spatial adjustment on, the held-out spatial smooth joins the
+        covariates (:meth:`_slope_smooths`): under ``spatial_plus`` each
+        exposure has its own, selected on it, which the paired resamples carry
+        for that exposure's two slopes; under ``ks_aic`` each outcome has its
+        own. Every slope and row records it under ``spatial_adjustment`` (a row:
+        ``df_cgi`` / ``df_exposure`` or ``df_target`` / ``df_control``).
         """
         from . import negative_controls as _nc
 
@@ -8309,42 +8425,78 @@ class MetricFusionEngine:
             return out
         c_t = None if cov is None else cov[test]
         cl_t = None if clusters is None else clusters[test]
+        coords = self._whole_data_coords(df)
+        method = self.spatial_adjust_method
+        (cgi_smooth, cgi_record), cgi_smooths = self._slope_smooths(
+            coords, test, x_cgi, target, controls, cov
+        )
         for name, x_e in xs.items():
-            out["slopes"][name] = {
-                "target": _nc.partial_slope(x_e[test], target[test], c_t),
+            (e_smooth, e_record), e_smooths = self._slope_smooths(
+                coords, test, x_e, target, controls, cov
+            )
+            slopes = {
+                "target": _nc.partial_slope(
+                    x_e[test], target[test], self._with_smooth(c_t, e_smooth)
+                ),
                 "controls": {
-                    c: _nc.partial_slope(x_e[test], v[test], c_t)
+                    c: _nc.partial_slope(
+                        x_e[test], v[test], self._with_smooth(c_t, e_smooths[c][0])
+                    )
                     for c, v in controls.items()
                 },
             }
+            if e_record is not None:
+                slopes["target"]["spatial_adjustment"] = e_record
+                for c in controls:
+                    slopes["controls"][c]["spatial_adjustment"] = e_smooths[c][1]
+            out["slopes"][name] = slopes
             for j, (c, v) in enumerate(controls.items()):
+                # Spatial+ adjusts each exposure for its own smooth, KS-AIC each
+                # outcome; the record names the df of the two smooths in play.
+                extra, record = None, None
+                if method == "spatial_plus":
+                    extra = {"exposure": cgi_smooth, "other": e_smooth}
+                    record = {
+                        "method": method,
+                        "df_cgi": cgi_record["df"],
+                        "df_exposure": e_record["df"],
+                    }
+                elif method == "ks_aic":
+                    extra = {"target": cgi_smooth, "control": cgi_smooths[c][0]}
+                    record = {
+                        "method": method,
+                        "df_target": cgi_record["df"],
+                        "df_control": cgi_smooths[c][1]["df"],
+                    }
                 res = _nc.specificity_contrast(
                     x_cgi[test],
                     x_e[test],
                     target[test],
                     v[test],
                     c_t,
+                    extra=extra,
                     n_boot=int(n_boot),
                     clusters=cl_t,
                     seed=int(seed) + j,
                 )
-                out["rows"].append(
-                    {
-                        "exposure": name,
-                        "control": c,
-                        "beta_target_cgi": res["beta_target"],
-                        "beta_control_cgi": res["beta_control"],
-                        "beta_target_exposure": res["beta_target_other"],
-                        "beta_control_exposure": res["beta_control_other"],
-                        "d_cgi": res["d"],
-                        "d_exposure": res["d_other"],
-                        "delta_d": res["delta"],
-                        "ci_low": res["ci_low"],
-                        "ci_high": res["ci_high"],
-                        "p_value": res["p_value"],
-                        "n": res["n"],
-                    }
-                )
+                row = {
+                    "exposure": name,
+                    "control": c,
+                    "beta_target_cgi": res["beta_target"],
+                    "beta_control_cgi": res["beta_control"],
+                    "beta_target_exposure": res["beta_target_other"],
+                    "beta_control_exposure": res["beta_control_other"],
+                    "d_cgi": res["d"],
+                    "d_exposure": res["d_other"],
+                    "delta_d": res["delta"],
+                    "ci_low": res["ci_low"],
+                    "ci_high": res["ci_high"],
+                    "p_value": res["p_value"],
+                    "n": res["n"],
+                }
+                if record is not None:
+                    row["spatial_adjustment"] = record
+                out["rows"].append(row)
         return out
 
     def retune_concordance(

@@ -214,6 +214,7 @@ def _engine_stub(n_ent=400, n_test=100, seed=7, controls=("grip",)):
         covariate_columns=["age"],
         _covariate_dummy_map={},
         test_data=full[full["polygon_id"] < n_test],
+        spatial_adjust_method="none",
     )
     eng.apply_fusion = lambda weights=None: applied
     eng._full_data_frame = lambda: full
@@ -222,6 +223,8 @@ def _engine_stub(n_ent=400, n_test=100, seed=7, controls=("grip",)):
         "_reporting_raw_column",
         "_reporting_clusters",
         "_test_entity_mask",
+        "_whole_data_coords",
+        "_slope_smooths",
         "compute_negative_controls",
     ):
         setattr(eng, name, types.MethodType(getattr(E, name), eng))

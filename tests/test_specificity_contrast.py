@@ -160,6 +160,7 @@ def _engine_stub(n_ent=400, n_test=120, seed=7, controls=("grip", "height")):
         _covariate_dummy_map={},
         test_data=full[full["polygon_id"] < n_test],
         _active_greenery_channel="cgi",
+        spatial_adjust_method="none",
     )
     eng.apply_fusion = lambda weights=None: frames[eng._active_greenery_channel]
     eng._full_data_frame = lambda: full
@@ -168,9 +169,12 @@ def _engine_stub(n_ent=400, n_test=120, seed=7, controls=("grip", "height")):
         "_reporting_raw_column",
         "_reporting_clusters",
         "_test_entity_mask",
+        "_whole_data_coords",
+        "_slope_smooths",
         "compute_specificity_contrast",
     ):
         setattr(eng, name, types.MethodType(getattr(E, name), eng))
+    eng._with_smooth = E._with_smooth
     eng.frames = frames
     eng.entity = {"target": target, "age": age, "bench": bench}
     return eng
