@@ -109,8 +109,9 @@ mismatched file is refused, and processed points are skipped.
    Anything unassigned blocks submission.
 4. **Study details.** Covariates, objective metric (Incremental R² by default;
    choose it by the association you expect, see FEATURES), optional
-   spatial-confounding
-   adjustment, test-set size and split seed, the discovery block (channel
+   spatial-confounding adjustment (a coordinate smooth in the held-out scores,
+   paired tests, slopes, negative controls and specificity contrast; the tuning
+   does not use it), test-set size and split seed, the discovery block (channel
    set, index form, sweep splits, radius prior, minimum GVI coverage) with
    validation settings behind an expander (including "Held-out splits", which
    repeats the whole tuning on that many test splits), the CGI grid pixel size (for every target type, rasters
@@ -164,6 +165,9 @@ own** (a `<column>=missing` dummy). In a run file it is
   control included; **Posterior across held-out splits** gives the range of
   β, each term's weight and R50 / R90, the share of splits in which a term
   has the largest weight, and the forms chosen.
+- In a spatially adjusted run the negative-control, comparator and
+  specificity tables add a **Spatial smooth** column with the df of the smooth
+  each slope adjusts for, and the captions say what was adjusted.
 - **Covariate impact**, **channel collinearity**, **composite maps**,
   **mixed-effects metrics**, and an index of every file written. **Generate
   CGI Map**, under the map viewer, is a placeholder for a planned full-area map
@@ -440,7 +444,7 @@ geofuse config set limits.max_parallel 6     # jobs the supervisor runs at once
 ### Results
 
 ```bash
-geofuse results JOB                         # held-out score, direction, each channel alone, specificity, splits, weights, radii
+geofuse results JOB                         # held-out score, direction, spatial adjustment, each channel alone, specificity, splits, weights, radii
 geofuse results output_results/fusion/<run>/    # any run, dashboard runs included
 geofuse export JOB -o cgi.csv               # the per-entity CGI table (.gpkg, .csv or .geojson)
 geofuse cgi-map JOB area.gpkg               # planned full-area CGI map; exits 2, not available yet

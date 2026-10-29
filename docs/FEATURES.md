@@ -354,7 +354,13 @@ Nothing below is pre-specified.
   full set of dummies, removes only its real span, and the job log reports how
   many directions were redundant.
 - Optional spatial-confounding adjustment (KS-AIC or Spatial+) and spatial block
-  cross-validation, so geographic autocorrelation cannot inflate scores.
+  cross-validation, so geographic autocorrelation cannot inflate scores. The
+  adjustment's coordinate smooth enters the scores, the direction, the paired
+  tests, the slopes, the negative controls and the specificity contrast, on
+  every held-out split, but not the tuning. Spatial+ selects the smooth on each
+  exposure, KS-AIC on each outcome, and every adjusted slope records the method
+  and the smooth's degrees of freedom. The exposure-response, moderation and
+  AIC / BIC tables control for the covariates only.
 - Optional collinearity check on the study's own channels (GVI as the sum of
   its components) that reports the channels above a VIF threshold, and
   optionally leaves them out of the search.
