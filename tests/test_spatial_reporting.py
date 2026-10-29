@@ -17,7 +17,8 @@ for the same kind of coordinate smooth the scores do. Pinned here:
 - the records become text columns on the slope rows; in a spatially adjusted
   run with two held-out splits every split's slope rows carry them, the
   corrected t recomputes from those rows, and every table names the smooth,
-  while an unadjusted run has no such column.
+  while an unadjusted run has no such column;
+- the reported direction conditions on the score's smooth.
 """
 
 import csv
@@ -519,6 +520,35 @@ class TestUnadjustedRun(unittest.TestCase):
             with open(os.path.join(bundle["report_dir"], name), encoding="utf-8") as f:
                 header = next(csv.reader(f))
             self.assertFalse([c for c in header if c.startswith("spatial_")], name)
+
+
+# ────────────────────────────────────────────────────────────────────
+# The direction
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestDirection(unittest.TestCase):
+    def test_the_direction_conditions_on_the_scores_smooth(self):
+        from geofuse.jobs import fusion_outputs
+
+        rng = np.random.default_rng(5)
+        u, g = rng.normal(size=400), rng.normal(size=400)
+        held_out = {
+            "targets": u - 0.5 * g,
+            "predictions": u + g,
+            "covariates": None,
+            "spatial_basis": u.reshape(-1, 1),
+        }
+        signs = {}
+        for method in ("none", "spatial_plus", "ks_aic"):
+            eng = types.SimpleNamespace(
+                evaluate_on_test=lambda **kw: dict(held_out),
+                is_longitudinal=False,
+                spatial_adjust_method=method,
+                residualize_method="linear",
+            )
+            signs[method] = fusion_outputs._direction_sign(eng, {}, "r2")
+        self.assertEqual(signs, {"none": 1, "spatial_plus": -1, "ks_aic": -1})
 
 
 if __name__ == "__main__":

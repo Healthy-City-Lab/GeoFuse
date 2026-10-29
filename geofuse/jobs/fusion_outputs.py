@@ -1147,7 +1147,9 @@ def _direction_sign(engine: Any, params: dict, metric: str) -> int:
     """``+1`` / ``-1`` sign of the greenery↔outcome relationship on the test set.
 
     Distance correlation is unsigned, so the report needs a separate direction
-    indicator. Returns ``+1`` (neutral) on any failure.
+    indicator. It conditions on what the held-out score did: the covariates
+    and, in a spatially adjusted run, the score's spatial smooth. Returns
+    ``+1`` (neutral) on any failure.
     """
     from .. import mixed_effects_scoring as _me
     from .. import objective_scoring as _scoring
@@ -1187,6 +1189,8 @@ def _direction_sign(engine: Any, params: dict, metric: str) -> int:
                 target,
                 pred,
                 cov,
+                spatial_basis=res.get("spatial_basis"),
+                spatial_method=getattr(engine, "spatial_adjust_method", "none"),
                 residualize_method=getattr(engine, "residualize_method", "linear"),
             )
         )
