@@ -22,6 +22,11 @@ against each control:
   another on the same rows: ``ΔD = D_a − D_b`` with ``D = |β_target| −
   |β_control|``, all four slopes re-estimated on every resample.
 
+The paired statistics take ``extra``: control columns that belong to one
+variable and join the covariates of every slope involving it, such as a
+spatial smooth selected on the exposure (Spatial+) or on each outcome
+(KS-AIC). Their rows are resampled with the observations.
+
 Pure numpy and scipy, so the same code serves the engine and a direct caller.
 """
 
@@ -40,6 +45,36 @@ _BATCH = 100
 def _residual_scale(a: np.ndarray, q: np.ndarray) -> float:
     r = a - q @ (q.T @ a)
     return float(r.std())
+
+
+def _extra_blocks(extra: dict | None, n: int, roles: tuple[str, ...]) -> dict:
+    """The ``extra`` control columns as ``{role: (n, k) array}``.
+
+    ``None`` entries and empty blocks are dropped; a key outside ``roles``
+    raises, so a misspelt role cannot leave a slope unadjusted.
+    """
+    out = {}
+    for role, cols in (extra or {}).items():
+        if role not in roles:
+            raise ValueError(f"extra: unknown role {role!r}; expected one of {roles}.")
+        if cols is None:
+            continue
+        block = np.asarray(cols, dtype=np.float64).reshape(n, -1)
+        if block.shape[1]:
+            out[role] = block
+    return out
+
+
+def _picked(blocks: dict, *roles: str) -> list[np.ndarray]:
+    return [blocks[r] for r in roles if r in blocks]
+
+
+def _with_blocks(cov: np.ndarray | None, blocks: list[np.ndarray]):
+    """``cov`` with ``blocks`` appended as columns (``cov`` itself without)."""
+    if not blocks:
+        return cov
+    parts = ([] if cov is None or not cov.size else [cov]) + blocks
+    return parts[0] if len(parts) == 1 else np.column_stack(parts)
 
 
 def partial_slope(exposure, outcome, covariates=None, *, level: float = 0.95) -> dict:
@@ -103,6 +138,7 @@ def paired_contrast(
     control,
     covariates=None,
     *,
+    extra: dict | None = None,
     n_boot: int = 1000,
     clusters=None,
     seed: int = 0,
@@ -119,6 +155,10 @@ def paired_contrast(
     labels each row with its area — applied to per-cluster Gram blocks, so
     every resample costs one small solve per outcome (``pinv``, rank-safe)
     rather than a pass over the rows.
+
+    ``extra`` maps ``"exposure"``, ``"target"`` or ``"control"`` to more
+    control columns: the exposure's join both slopes, an outcome's only the
+    slope on that outcome. Rows where any of them is non-finite are dropped.
     """
     x = np.asarray(exposure, dtype=np.float64)
     ya = np.asarray(target, dtype=np.float64)
@@ -126,12 +166,16 @@ def paired_contrast(
     cov = None if covariates is None else np.asarray(covariates, dtype=np.float64)
     if cov is not None:
         cov = cov.reshape(len(x), -1)
+    blocks = _extra_blocks(extra, len(x), ("exposure", "target", "control"))
     keep = np.isfinite(x) & np.isfinite(ya) & np.isfinite(yb)
     if cov is not None and cov.size:
         keep &= np.isfinite(cov).all(1)
+    for block in blocks.values():
+        keep &= np.isfinite(block).all(1)
     cl = None if clusters is None else np.asarray(clusters)[keep]
     x, ya, yb = x[keep], ya[keep], yb[keep]
     cov = None if cov is None else cov[keep]
+    blocks = {k: v[keep] for k, v in blocks.items()}
     n = int(len(x))
     nan = float("nan")
     out = {
@@ -146,14 +190,23 @@ def paired_contrast(
         "clusters": None,
     }
 
-    q, _ = covariate_basis(cov, n)
-    if n - q.shape[1] - 1 < 2:
+    shared = _picked(blocks, "exposure")
+    q, _ = covariate_basis(_with_blocks(cov, shared + _picked(blocks, "target")), n)
+    qb = q
+    if "target" in blocks or "control" in blocks:
+        qb, _ = covariate_basis(
+            _with_blocks(cov, shared + _picked(blocks, "control")), n
+        )
+    if n - max(q.shape[1], qb.shape[1]) - 1 < 2:
         return out
-    scales = [_residual_scale(v, q) for v in (x, ya, yb)]
+    scales = [_residual_scale(v, b) for v, b in ((x, q), (ya, q), (yb, qb))]
+    if qb is not q:
+        scales.append(_residual_scale(x, qb))
     if min(scales) <= 1e-12:
         return out
     xs, ya_s, yb_s = x / scales[0], ya / scales[1], yb / scales[2]
     Z = np.column_stack([xs, q])
+    Zb = Z if qb is q else np.column_stack([x / scales[3], qb])
 
     if cl is None:
         codes = np.arange(n)
@@ -161,20 +214,25 @@ def paired_contrast(
         _, codes = np.unique(cl, return_inverse=True)
     n_cl = int(codes.max()) + 1
     out["clusters"] = None if cl is None else n_cl
-    p = Z.shape[1]
-    G = np.zeros((n_cl, p, p))
-    np.add.at(G, codes, Z[:, :, None] * Z[:, None, :])
-    Ha = np.zeros((n_cl, p))
-    Hb = np.zeros((n_cl, p))
-    np.add.at(Ha, codes, Z * ya_s[:, None])
-    np.add.at(Hb, codes, Z * yb_s[:, None])
 
-    G_flat = G.reshape(n_cl, p * p)
+    def gram(Z):
+        p = Z.shape[1]
+        G = np.zeros((n_cl, p, p))
+        np.add.at(G, codes, Z[:, :, None] * Z[:, None, :])
+        return G.reshape(n_cl, p * p), p
+
+    G_flat, p = gram(Z)
+    Gb_flat, pb = (G_flat, p) if Zb is Z else gram(Zb)
+    Ha = np.zeros((n_cl, p))
+    Hb = np.zeros((n_cl, pb))
+    np.add.at(Ha, codes, Z * ya_s[:, None])
+    np.add.at(Hb, codes, Zb * yb_s[:, None])
 
     def slopes(m):
         gi = np.linalg.pinv((m @ G_flat).reshape(-1, p, p))
+        gib = gi if Zb is Z else np.linalg.pinv((m @ Gb_flat).reshape(-1, pb, pb))
         ba = np.einsum("bpq,bq->bp", gi, m @ Ha)[:, 0]
-        bb = np.einsum("bpq,bq->bp", gi, m @ Hb)[:, 0]
+        bb = np.einsum("bpq,bq->bp", gib, m @ Hb)[:, 0]
         return ba, bb
 
     ba0, bb0 = slopes(np.ones((1, n_cl)))
@@ -214,6 +272,7 @@ def specificity_contrast(
     control,
     covariates=None,
     *,
+    extra: dict | None = None,
     n_boot: int = 1000,
     clusters=None,
     seed: int = 0,
@@ -234,6 +293,11 @@ def specificity_contrast(
     resamples ≤ 0), ``n``, ``n_boot`` and ``clusters``. Unit weights reproduce
     :func:`partial_slope`, and two identical exposures give ``delta = 0`` on
     every resample.
+
+    ``extra`` maps ``"exposure"``, ``"other"``, ``"target"`` or ``"control"``
+    to more control columns, which join the covariates of the two slopes that
+    involve that variable (one design per exposure and outcome when an outcome
+    has its own). Rows where any of them is non-finite are dropped.
     """
     xa = np.asarray(exposure, dtype=np.float64)
     xb = np.asarray(other, dtype=np.float64)
@@ -242,12 +306,16 @@ def specificity_contrast(
     cov = None if covariates is None else np.asarray(covariates, dtype=np.float64)
     if cov is not None:
         cov = cov.reshape(len(xa), -1)
+    blocks = _extra_blocks(extra, len(xa), ("exposure", "other", "target", "control"))
     keep = np.isfinite(xa) & np.isfinite(xb) & np.isfinite(ya) & np.isfinite(yb)
     if cov is not None and cov.size:
         keep &= np.isfinite(cov).all(1)
+    for block in blocks.values():
+        keep &= np.isfinite(block).all(1)
     cl = None if clusters is None else np.asarray(clusters)[keep]
     xa, xb, ya, yb = xa[keep], xb[keep], ya[keep], yb[keep]
     cov = None if cov is None else cov[keep]
+    blocks = {k: v[keep] for k, v in blocks.items()}
     n = int(len(xa))
     nan = float("nan")
     out = {
@@ -266,13 +334,33 @@ def specificity_contrast(
         "clusters": None,
     }
 
-    q, _ = covariate_basis(cov, n)
-    if n - q.shape[1] - 1 < 2:
+    # ── Designs: per exposure, or per exposure and outcome ──────
+    # Each is ``(exposure, basis, outcomes)``, in the order of the four slopes.
+    bases: dict = {}
+
+    def basis(*roles):
+        key = tuple(r for r in roles if r in blocks)
+        if key not in bases:
+            bases[key], _ = covariate_basis(
+                _with_blocks(cov, _picked(blocks, *key)), n
+            )
+        return bases[key]
+
+    own = "target" in blocks or "control" in blocks
+    specs = []
+    for x, role in ((xa, "exposure"), (xb, "other")):
+        if own:
+            specs += [
+                (x, basis(role, "target"), [ya]),
+                (x, basis(role, "control"), [yb]),
+            ]
+        else:
+            specs.append((x, basis(role), [ya, yb]))
+    if any(n - q.shape[1] - 1 < 2 for _, q, _ in specs):
         return out
-    scales = [_residual_scale(v, q) for v in (xa, xb, ya, yb)]
-    if min(scales) <= 1e-12:
+    scales = [[_residual_scale(v, q) for v in (x, *ys)] for x, q, ys in specs]
+    if min(min(s) for s in scales) <= 1e-12:
         return out
-    ys = np.column_stack([ya / scales[2], yb / scales[3]])
 
     if cl is None:
         codes = np.arange(n)
@@ -281,23 +369,24 @@ def specificity_contrast(
     n_cl = int(codes.max()) + 1
     out["clusters"] = None if cl is None else n_cl
 
-    # ── Per-cluster Gram blocks, one design per exposure ────────
+    # ── Per-cluster Gram blocks, one per design ─────────────────
     designs = []
-    for x, s in ((xa, scales[0]), (xb, scales[1])):
-        Z = np.column_stack([x / s, q])
-        p = Z.shape[1]
+    for (x, q, ys), s in zip(specs, scales, strict=True):
+        Z = np.column_stack([x / s[0], q])
+        Y = np.column_stack([y / sy for y, sy in zip(ys, s[1:], strict=True)])
+        p, k = Z.shape[1], Y.shape[1]
         G = np.zeros((n_cl, p, p))
         np.add.at(G, codes, Z[:, :, None] * Z[:, None, :])
-        H = np.zeros((n_cl, p, 2))
-        np.add.at(H, codes, Z[:, :, None] * ys[:, None, :])
-        designs.append((G.reshape(n_cl, p * p), H.reshape(n_cl, p * 2), p))
+        H = np.zeros((n_cl, p, k))
+        np.add.at(H, codes, Z[:, :, None] * Y[:, None, :])
+        designs.append((G.reshape(n_cl, p * p), H.reshape(n_cl, p * k), p, k))
 
     def slopes(m):
         """``(b, 4)`` slopes: target and control on each exposure."""
         cols = []
-        for G_flat, H_flat, p in designs:
+        for G_flat, H_flat, p, k in designs:
             gi = np.linalg.pinv((m @ G_flat).reshape(-1, p, p))
-            b = np.einsum("bpq,bqk->bpk", gi, (m @ H_flat).reshape(-1, p, 2))
+            b = np.einsum("bpq,bqk->bpk", gi, (m @ H_flat).reshape(-1, p, k))
             cols.append(b[:, 0, :])
         return np.concatenate(cols, axis=1)
 
@@ -394,6 +483,7 @@ def transfer_test(
     controls: dict,
     covariates=None,
     *,
+    extra: dict | None = None,
     n_boot: int = 1000,
     clusters=None,
     seed: int = 0,
@@ -407,18 +497,57 @@ def transfer_test(
     paired contrast against the target, and ``nonspecific``: the control's
     interval excludes zero while Δ's interval includes it. The flag reports;
     it does not stop anything.
+
+    ``extra`` holds more control columns: ``"exposure"`` for every slope,
+    ``"target"`` for the target's, ``"controls"`` ``{name: columns}`` for
+    each control's; see :func:`paired_contrast`.
     """
+    extra = dict(extra or {})
+    own_extra = dict(extra.pop("controls", None) or {})
+    unknown = set(extra) - {"exposure", "target"}
+    if unknown:
+        raise ValueError(f"extra: unknown role(s) {sorted(unknown)}.")
+
+    n = len(np.asarray(exposure))
+
+    def design(*blocks):
+        """The covariates with the given blocks appended (as given without)."""
+        parts = [
+            np.asarray(b, dtype=np.float64).reshape(n, -1)
+            for b in blocks
+            if b is not None
+        ]
+        if not parts:
+            return covariates
+        cov = None if covariates is None else np.asarray(covariates, dtype=np.float64)
+        return _with_blocks(None if cov is None else cov.reshape(n, -1), parts)
+
     out = {
-        "target": partial_slope(exposure, target, covariates, level=level),
+        "target": partial_slope(
+            exposure,
+            target,
+            design(extra.get("exposure"), extra.get("target")),
+            level=level,
+        ),
         "controls": {},
     }
     for i, (name, values) in enumerate(controls.items()):
-        own = partial_slope(exposure, values, covariates, level=level)
+        own = partial_slope(
+            exposure,
+            values,
+            design(extra.get("exposure"), own_extra.get(name)),
+            level=level,
+        )
         contrast = paired_contrast(
             exposure,
             target,
             values,
             covariates,
+            extra={
+                "exposure": extra.get("exposure"),
+                "target": extra.get("target"),
+                "control": own_extra.get(name),
+            },
             n_boot=n_boot,
             clusters=clusters,
             seed=seed + i,
