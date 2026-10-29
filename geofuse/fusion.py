@@ -4826,8 +4826,21 @@ class MetricFusionEngine:
         exposure ``cgi``. ``None`` means no spatial adjustment is applied (off,
         no coordinates, degenerate geometry, or AIC preferred no smooth).
         """
+        return self._spatial_smooth(coords_xy, target, cov, cgi)[0]
+
+    def _spatial_smooth(
+        self,
+        coords_xy: np.ndarray | None,
+        target: np.ndarray,
+        cov: np.ndarray | None,
+        cgi: np.ndarray,
+    ) -> tuple[np.ndarray | None, int | None]:
+        """:meth:`_spatial_basis_columns` with the selected df: ``(columns, df)``.
+
+        ``(None, None)`` when no smooth is applied.
+        """
         if self.spatial_adjust_method == "none" or coords_xy is None:
-            return None
+            return None, None
         coords_xy = np.asarray(coords_xy, dtype=np.float64)
         cache_key = _helpers.spatial_cache_key(coords_xy, target, cov)
         entry = self._spatial_basis_cache.get(cache_key)
@@ -4854,9 +4867,9 @@ class MetricFusionEngine:
                 }
         basis = entry["basis"]
         if not basis.has_spatial:
-            return None
+            return None, None
         if self.spatial_adjust_method == "ks_aic":
-            return entry["ks_cols"]
+            return entry["ks_cols"], entry["ks_df"]
         # spatial_plus: the exposure is residualized on the smooth, so df is
         # selected on the exposure (df-Spatial+); the candidate basis is reused
         # and the per-call df search runs off the memoized nested-QR precompute
@@ -4865,10 +4878,10 @@ class MetricFusionEngine:
         if pre is None and "plus_pre" not in entry:
             pre = spatial_basis.precompute_df_selection(basis)
             entry["plus_pre"] = pre
-        _df, sp_cols = spatial_basis.select_df_aic_fast(
+        sp_df, sp_cols = spatial_basis.select_df_aic_fast(
             np.asarray(cgi, dtype=np.float64), basis, pre
         )
-        return sp_cols
+        return sp_cols, sp_df
 
     def _finalize_composite(self, composite: np.ndarray) -> np.ndarray:
         """Apply the ``whole_grid_scaling`` toggle to the written composite map.
