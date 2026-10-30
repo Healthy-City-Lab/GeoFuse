@@ -857,7 +857,7 @@ def _render_gvi_restart_panel(
 
 
 # ────────────────────────────────────────────────────────────────────
-# Capture-date configuration (per-file), mirroring the NDVI tab's layout
+# Capture-date configuration per file, as in the NDVI tab
 # ────────────────────────────────────────────────────────────────────
 
 _GVI_MODE_RECENT = "Most recent capture"
@@ -1224,7 +1224,7 @@ def _render_gvi_settings_map() -> None:
 
 
 # ────────────────────────────────────────────────────────────────────
-# Live dataset registry (per-session, in addition to the process-level store)
+# Live dataset registry (per session, beside the process-level store)
 # ────────────────────────────────────────────────────────────────────
 #
 # Job records persisted in SQLite carry only JSON-serializable parameters.

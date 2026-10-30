@@ -2153,6 +2153,9 @@ def run_fusion(
                 comparator_columns=outcome_cmps,
             )
 
+            # ────────────────────────────────────────────
+            # Target and greenery inputs
+            # ────────────────────────────────────────────
             ctx.progress(
                 value=prog_ledger(), status_text=f"{prefix}Loading target data..."
             )
@@ -2354,6 +2357,9 @@ def run_fusion(
                 if ctx.is_cancelled():
                     return {"output_paths": output_paths}
 
+            # ────────────────────────────────────────────
+            # Spatial pre-processing
+            # ────────────────────────────────────────────
             # Sample materialization + the on-disk pre-aggregation cache form one
             # "spatial pre-processing" stage; prepare_fusion_data feeds the cache.
             stage(skey("preaggregate"), RUNNING)
@@ -2527,6 +2533,9 @@ def run_fusion(
                     config_fingerprint=_config_fp,
                 )
 
+            # ────────────────────────────────────────────
+            # Held-out split
+            # ────────────────────────────────────────────
             # One held-out test split + the train+val pool that the sweep
             # selection resamples.
             stage(skey("split"), RUNNING)
@@ -2619,7 +2628,9 @@ def run_fusion(
 
                 return _cb
 
-            # ── Sweep + posterior (dominant compute) ────
+            # ────────────────────────────────────────────
+            # Sweep + posterior (dominant compute)
+            # ────────────────────────────────────────────
             # Headline params: the configuration the sweep picked on the
             # train+val pool, with posterior-mean weights. The sub-bar and the
             # running-stage fraction both live here, so the stage and the
@@ -2658,7 +2669,9 @@ def run_fusion(
                 return {"output_paths": output_paths}
             stage(skey("optimize"), DONE)
 
-            # ── Score the held-out test set ─────────────
+            # ────────────────────────────────────────────
+            # Score the held-out test set
+            # ────────────────────────────────────────────
             stage(skey("evaluate"), RUNNING)
             ctx.progress(
                 value=prog_ledger(),
@@ -2669,7 +2682,9 @@ def run_fusion(
             )
             stage(skey("evaluate"), DONE)
 
-            # ── Replicate statistics: the long tail ─────
+            # ────────────────────────────────────────────
+            # Replicate statistics: the long tail
+            # ────────────────────────────────────────────
             # Test-set percentile bootstrap CI, relationship direction, and the
             # held-out effect sizes / permutation p-value — thousands of
             # replicates, named for what it is instead of hiding under
@@ -2761,7 +2776,9 @@ def run_fusion(
                 _log_fusion("WARN", f"[{label}] Per-entity table not written: {exc}")
             stage(skey("apply"), DONE)
 
-            # ── Post-hoc multi-metric reporting ─────────
+            # ────────────────────────────────────────────
+            # Post-hoc multi-metric reporting
+            # ────────────────────────────────────────────
             # Re-score the trial pool on the test set with all four mixedlm_*
             # metrics, so metric agreement is visible. Skipped when the spec is
             # only routing files per year and the scorer is OLS.
@@ -2794,7 +2811,9 @@ def run_fusion(
                     )
                 stage(skey("mixedlm_postscore"), DONE)
 
-            # ── Standalone discoveries ──────────────────
+            # ────────────────────────────────────────────
+            # Standalone discoveries
+            # ────────────────────────────────────────────
             # One search per channel, reusing the engine, its cache and split.
             # Each overwrites the engine's active channel and best params, so
             # snapshot the CGI state here and restore it after the loop.
@@ -2982,7 +3001,9 @@ def run_fusion(
                 engine.best_params = cgi_best_params
                 engine._active_greenery_channel = "cgi"
 
-            # ── AIC/BIC vs the best standalone ──────────
+            # ────────────────────────────────────────────
+            # AIC/BIC vs the best standalone
+            # ────────────────────────────────────────────
             cgi_vs_standalone_aic_bic: dict | None = None
             if standalones:
                 cgi_vs_standalone_aic_bic = _compare_cgi_vs_standalone(
@@ -3095,7 +3116,9 @@ def run_fusion(
                         "The run continues.",
                     )
 
-            # ── Comparator exposures ────────────────────
+            # ────────────────────────────────────────────
+            # Comparator exposures
+            # ────────────────────────────────────────────
             # Finished exposures from the target table, scored untuned on the
             # CGI's own rows, split, covariates and objective, then compared
             # with the CGI pairwise. A separate family from the standalones.
@@ -3160,7 +3183,9 @@ def run_fusion(
                         )
                     stage(skey("comparators"), DONE)
 
-            # ── Composite GeoTIFF (raster write) ────────
+            # ────────────────────────────────────────────
+            # Composite GeoTIFF (raster write)
+            # ────────────────────────────────────────────
             # Runs after the standalone stages so they can advance the ledger
             # first. Failures here don't kill the run — the composite_df is
             # already captured in ``bundle``.
@@ -3319,7 +3344,9 @@ def run_fusion(
                         ),
                     )
 
-            # ── Specificity contrast ────────────────────
+            # ────────────────────────────────────────────
+            # Specificity contrast
+            # ────────────────────────────────────────────
             # Is the CGI more specific than the primary comparators and the
             # comparison channel, per negative control, on the held-out rows.
             primary_cmps = [c for c in (outcome_cmps or []) if c in primary_cols]
@@ -3370,7 +3397,9 @@ def run_fusion(
                 if ctx.is_cancelled():
                     return {"output_paths": output_paths}
 
-            # ── Repeated held-out splits ────────────────
+            # ────────────────────────────────────────────
+            # Repeated held-out splits
+            # ────────────────────────────────────────────
             outer_report: dict | None = None
             if int(outer_splits) > 1:
                 outer_report = _run_outer_splits(

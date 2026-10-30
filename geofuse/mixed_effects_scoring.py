@@ -671,7 +671,7 @@ def score_mixedlm(
 
 
 # ────────────────────────────────────────────────────────────────────
-# Fast fixed-V GLS search scorer (ranking only; reports use the exact fit)
+# Fast fixed-V GLS search scorer (ranking only; reports fit exactly)
 # ────────────────────────────────────────────────────────────────────
 #
 # The exact per-trial MixedLM fit re-estimates the whole variance-component
@@ -1024,7 +1024,7 @@ def score_mixedlm_fast(
 
 
 # ────────────────────────────────────────────────────────────────────
-# Penalized model comparison (CGI vs best standalone channel) — longitudinal
+# Penalized model comparison, longitudinal (CGI vs best standalone)
 # ────────────────────────────────────────────────────────────────────
 
 

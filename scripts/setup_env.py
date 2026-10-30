@@ -331,7 +331,7 @@ def main(env_name, log_file=None, assume_yes=False, torch_choice="auto"):
     print(f"\n[INFO] Starting setup on {system} using {solver}...")
     print(f"[INFO] Detailed logs: {log_file}\n")
 
-    # ── 1. Environment with Python and the conda packages ────────────
+    # ── 1. Environment with Python and the conda packages ───────
     existing = env_prefix(env_name)
     if existing:
         if not confirm_replace(env_name, existing, assume_yes):
@@ -354,11 +354,11 @@ def main(env_name, log_file=None, assume_yes=False, torch_choice="auto"):
     python = env_python(prefix)
     print(f"[INFO] Environment: {prefix}\n")
 
-    # ── 2. PyTorch ───────────────────────────────────────────────────
+    # ── 2. PyTorch ──────────────────────────────────────────────
     print(f"[2/5] Installing PyTorch ({torch_choice})...")
     run_cmd(torch_command(python, torch_choice), log_file)
 
-    # ── 3. Python libraries ──────────────────────────────────────────
+    # ── 3. Python libraries ─────────────────────────────────────
     print("[3/5] Installing Python libraries...")
     run_cmd(
         f'"{python}" -m pip install --upgrade pip --no-warn-script-location',
@@ -367,14 +367,14 @@ def main(env_name, log_file=None, assume_yes=False, torch_choice="auto"):
     pip_str = " ".join(PIP_PACKAGES)
     run_cmd(f'"{python}" -m pip install {pip_str} --no-warn-script-location', log_file)
 
-    # ── 4. GeoFuse itself ────────────────────────────────────────────
+    # ── 4. GeoFuse itself ───────────────────────────────────────
     print("[4/5] Installing GeoFuse (editable)...")
     run_cmd(
         f'"{python}" -m pip install -e "{ROOT_DIR}" --no-warn-script-location',
         log_file,
     )
 
-    # ── 5. Verification ──────────────────────────────────────────────
+    # ── 5. Verification ─────────────────────────────────────────
     print("[5/5] Verifying the installation...")
     replaced = pip_replaced_conda(python)
     if replaced:

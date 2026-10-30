@@ -120,7 +120,7 @@ def _choice(default, choices, help: str = "") -> Setting:
 
 
 # ────────────────────────────────────────────────────────────────────
-# Choice lists (each equals an engine constant; see the module docstring)
+# Choice lists (each equals an engine constant; see the docstring)
 # ────────────────────────────────────────────────────────────────────
 
 #: ``geofuse.ndvi.TEMPORAL_REDUCERS``.

@@ -19,7 +19,9 @@ echo "========================================================"
 echo "        GeoFuse Installer"
 echo "========================================================"
 
-# --- STEP 1: FIND CONDA ---
+# ────────────────────────────────────────────────────────────────────
+# Step 1: find Conda
+# ────────────────────────────────────────────────────────────────────
 CONDA_ROOT=""
 PATHS=(
     "$HOME/miniforge3"
@@ -78,7 +80,9 @@ source "$CONDA_ROOT/etc/profile.d/conda.sh"
 conda activate base
 set -u
 
-# --- STEP 2: CREATE THE ENVIRONMENT AND INSTALL ---
+# ────────────────────────────────────────────────────────────────────
+# Step 2: create the environment and install
+# ────────────────────────────────────────────────────────────────────
 mkdir -p logs
 if ! python scripts/setup_env.py "$@"; then
     echo "[ERROR] Setup script failed. See logs/install.log."

@@ -452,7 +452,9 @@ def render_file_grouping_controls(
     return "merge"
 
 
-# ── Form-state pinning ──────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
+# Form-state pinning
+# ────────────────────────────────────────────────────────────────────
 
 # Streamlit drops a widget's session-state entry at the end of any run in
 # which the widget did not render — including runs aborted mid-script by
@@ -500,7 +502,9 @@ def pin_fusion_form_state() -> None:
         st.session_state[key] = st.session_state[key]
 
 
-# ── Job Restart Workflow ────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
+# Job Restart Workflow
+# ────────────────────────────────────────────────────────────────────
 
 RESTART_SESSION_KEY = "_restart_job_id"
 

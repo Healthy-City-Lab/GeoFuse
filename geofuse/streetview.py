@@ -46,7 +46,9 @@ import aiohttp
 import requests
 from PIL import Image
 
-# ── Dataclasses ─────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
+# Dataclasses
+# ────────────────────────────────────────────────────────────────────
 
 
 class RateLimitedError(RuntimeError):
@@ -269,7 +271,9 @@ def is_third_party_panoid(panoid: str) -> bool:
     return panoid.startswith("CIHM0og") or len(panoid) > 22
 
 
-# ── URL-encoded protobuf encoder (Google Maps' RPC format) ──────────
+# ────────────────────────────────────────────────────────────────────
+# URL-encoded protobuf encoder (Google Maps' RPC format)
+# ────────────────────────────────────────────────────────────────────
 
 
 class _PbType(Enum):
@@ -339,7 +343,9 @@ def _to_protobuf_url(fields: dict) -> str:
     return _to_pb_url(fields)[1]
 
 
-# ── API: find the nearest panorama ──────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
+# API: find the nearest panorama
+# ────────────────────────────────────────────────────────────────────
 #
 # Two keyless Google Maps endpoints, as maps.google.com uses them: a coverage
 # tile lists every panorama in a zoom-17 map tile (id and position), and the
@@ -649,7 +655,9 @@ async def find_panorama_async(
     return _parse_metadata(await _get_text(session, _metadata_url(panoid, locale)))
 
 
-# ── API: download panorama image ────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
+# API: download panorama image
+# ────────────────────────────────────────────────────────────────────
 
 
 _TILE_URL = (
@@ -787,7 +795,9 @@ async def get_panorama_async(
     )
 
 
-# ── API: the keyed Street View tiles (Map Tiles API) ────────────────
+# ────────────────────────────────────────────────────────────────────
+# API: the keyed Street View tiles (Map Tiles API)
+# ────────────────────────────────────────────────────────────────────
 #
 # Google's billed, documented route to the same equirectangular tiles. Every
 # request carries a session token (created once per key and process, valid for

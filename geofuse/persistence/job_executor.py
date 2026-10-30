@@ -301,7 +301,7 @@ class JobExecutor:
         return future
 
     # ────────────────────────────────────────────────────────────
-    # Engine-specific convenience wrappers around :meth:`submit_subprocess_job`.
+    # Engine wrappers around ``submit_subprocess_job``
     # ────────────────────────────────────────────────────────────
 
     def submit_gvi_subprocess(

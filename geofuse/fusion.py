@@ -4366,7 +4366,7 @@ class MetricFusionEngine:
         return result
 
     # ────────────────────────────────────────────────────────────
-    # Per-pixel CGI → per-entity collapse (shared by every scoring path)
+    # Per-pixel CGI → per-entity collapse (every scoring path)
     # ────────────────────────────────────────────────────────────
     @staticmethod
     def _collapse_to_entities(

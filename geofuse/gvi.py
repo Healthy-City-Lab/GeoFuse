@@ -14,7 +14,9 @@ from . import streetview as gsv
 from .logger import get_logger
 from .vision import DeepLabSegmenter, get_best_device
 
-# ── Configuration ───────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
+# Configuration
+# ────────────────────────────────────────────────────────────────────
 Image.MAX_IMAGE_PIXELS = None
 warnings.simplefilter("ignore", Image.DecompressionBombWarning)
 
@@ -190,7 +192,9 @@ _EMPTY_CACHE_EVERY_N = 200
 # find the padding edges, never to sample colour, so a coarse step is safe.
 _SCAN_STEP = 4
 
-# ── Adaptive rate-limit handling ────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
+# Adaptive rate-limit handling
+# ────────────────────────────────────────────────────────────────────
 # Google's endpoints are unofficial and throttle by IP with no published quota,
 # so the safe design is to *detect* push-back and back off rather than guess a
 # fixed rate. Backoff grows exponentially per consecutive throttle event and
@@ -300,6 +304,10 @@ class AdaptiveThrottle:
                     f"Rate limit easing — spacing now {self._delay:.2f}s",
                 )
 
+
+# ────────────────────────────────────────────────────────────────────
+# GVI engine
+# ────────────────────────────────────────────────────────────────────
 
 #: Where panoramas come from: the keyless scraper, or Google's keyed tile API.
 DOWNLOAD_MODES = ("package", "api")

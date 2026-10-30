@@ -1626,7 +1626,9 @@ def _render_study_details_panel(
     """
     st.subheader("Study Details")
 
-    # ── Row 1: covariates ───────────────────────────────────────
+    # ────────────────────────────────────────────────────────────
+    # Row 1: covariates
+    # ────────────────────────────────────────────────────────────
     with st.container():
         categorical_candidates = list(categorical_candidates or [])
         if available_covariates:
@@ -1749,7 +1751,9 @@ def _render_study_details_panel(
                 "(raster target or no spare columns)._"
             )
 
-    # ── Objective metric + test split + stratification bins ─────
+    # ────────────────────────────────────────────────────────────
+    # Objective metric + test split + stratification bins
+    # ────────────────────────────────────────────────────────────
     metric_options = list(_MIXEDLM_METRICS if is_longitudinal else _CROSS_METRICS)
     default_metric = metric_options[0]
     prior = st.session_state.get("fusion_objective_metric")
@@ -1833,7 +1837,9 @@ def _render_study_details_panel(
         "(split repeatedly by the sweep)._"
     )
 
-    # ── Covariate residualization (cross-sectional metrics) ─────
+    # ────────────────────────────────────────────────────────────
+    # Covariate residualization (cross-sectional metrics)
+    # ────────────────────────────────────────────────────────────
     residualize_method = "linear"
     if not is_longitudinal:
         _res_ignored = objective_metric in _RESIDUALIZE_IGNORED_METRICS
@@ -1861,7 +1867,9 @@ def _render_study_details_panel(
             ),
         )
 
-    # ── Longitudinal-only mixed-effects toggles ─────────────────
+    # ────────────────────────────────────────────────────────────
+    # Longitudinal-only mixed-effects toggles
+    # ────────────────────────────────────────────────────────────
     mixedlm_random_slope = True
     mixedlm_time_fixed = True
     association_target = "level"
@@ -2000,7 +2008,9 @@ def _render_study_details_panel(
             ),
         )
 
-    # ── Resume + standalones ────────────────────────────────────
+    # ────────────────────────────────────────────────────────────
+    # Resume + standalones
+    # ────────────────────────────────────────────────────────────
     _default("fusion_resume_study", _fs_default("resume_existing_study"))
     _default("fusion_clear_preaggr", _fs_default("clear_preaggregation_cache"))
     _default("fusion_run_standalones", _fs_default("run_standalones"))
@@ -2036,7 +2046,9 @@ def _render_study_details_panel(
             ),
         )
 
-    # ── Channel collinearity check (iterative VIF) ──────────────
+    # ────────────────────────────────────────────────────────────
+    # Channel collinearity check (iterative VIF)
+    # ────────────────────────────────────────────────────────────
     # Runs after pre-aggregation, before the search, and reports the channels
     # whose pixel values are redundant with the others (high VIF); dropping
     # them from the search is a separate choice.
@@ -2077,7 +2089,9 @@ def _render_study_details_panel(
             ),
         )
 
-    # ── Discovery ───────────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────
+    # Discovery
+    # ────────────────────────────────────────────────────────────
     st.markdown("**Discovery**")
     st.caption(
         "The radius, the aggregation statistic and the functional form are all "
@@ -2268,7 +2282,9 @@ def _render_study_details_panel(
             )
     posterior_warmup_ui = int(posterior_draws_ui)
 
-    # ── Per-pixel CGI scoring ───────────────────────────────────
+    # ────────────────────────────────────────────────────────────
+    # Per-pixel CGI scoring
+    # ────────────────────────────────────────────────────────────
     whole_grid_scaling = True
     area_balanced_split = True
     spatial_split = False
@@ -2421,7 +2437,9 @@ def _render_study_details_panel(
                 )
                 spatial_adjust_eps_m = float(eps_ui) if eps_ui and eps_ui > 0 else None
 
-    # ── Exposure buffer ─────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────
+    # Exposure buffer
+    # ────────────────────────────────────────────────────────────
     for name in (
         "exposure_kernel",
         "exposure_radius_m",
@@ -3886,7 +3904,9 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
     def _label(i: int) -> str:
         return (labels[i] if i < len(labels) else f"ch{i}").upper()
 
-    # ── What the sweep picked ───────────────────────────────────
+    # ────────────────────────────────────────────────────────────
+    # What the sweep picked
+    # ────────────────────────────────────────────────────────────
     st.markdown("**Sweep**")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -4008,7 +4028,9 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
             "at that rung and were left out."
         )
 
-    # ── Posterior ───────────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────
+    # Posterior
+    # ────────────────────────────────────────────────────────────
     weights = summary.get("weight_mean") or []
     if weights:
         st.markdown("**Posterior weights (influence shares)**")
@@ -4105,7 +4127,9 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
                 "warmup before quoting the credible intervals."
             )
 
-    # ── Reproducibility ─────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────
+    # Reproducibility
+    # ────────────────────────────────────────────────────────────
     disc = summary.get("discovery") or {}
     if disc:
         st.markdown("**Does the discovery reproduce?**")
@@ -4187,7 +4211,9 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
                     "study fills these in."
                 )
 
-    # ── Composite vs its own channels ───────────────────────────
+    # ────────────────────────────────────────────────────────────
+    # Composite vs its own channels
+    # ────────────────────────────────────────────────────────────
     gain = summary.get("holdout_gain") or {}
     if gain:
         st.markdown("**Composite vs standalone channels**")
@@ -4262,7 +4288,9 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
                 "on the rows it scores."
             )
 
-    # ── Null calibration ────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────
+    # Null calibration
+    # ────────────────────────────────────────────────────────────
     null = summary.get("null_calibration") or {}
     if null:
         rate = _num(null.get("rate"))
@@ -5615,7 +5643,9 @@ def render(output_dir: str) -> None:
     if "fusion_engines_by_target" not in st.session_state:
         st.session_state.fusion_engines_by_target = {}
 
-    # ── Loaded-results overview ─────────────────────────────────
+    # ────────────────────────────────────────────────────────────
+    # Loaded-results overview
+    # ────────────────────────────────────────────────────────────
     # Rendered first so it survives the configuration early-returns below.
     _render_fusion_results_section(output_dir)
 

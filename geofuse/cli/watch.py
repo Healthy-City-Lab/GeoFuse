@@ -247,7 +247,7 @@ class WatchApp(App):
         self.set_interval(self.refresh_s, self.refresh_jobs)
         self.query_one(DataTable).focus()
 
-    # ── Refresh ─────────────────────────────────────────────────────
+    # ── Refresh ─────────────────────────────────────────────────
 
     def _visible(self, job: Job) -> bool:
         if self.active_only and job.state not in ACTIVE:
@@ -339,7 +339,7 @@ class WatchApp(App):
             self.selected = job_id
             self._show(job_id)
 
-    # ── Actions ─────────────────────────────────────────────────────
+    # ── Actions ─────────────────────────────────────────────────
 
     def _act(self, **flags: bool) -> None:
         if not self.selected:
