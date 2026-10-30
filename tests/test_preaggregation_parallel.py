@@ -506,24 +506,26 @@ class TestWorkersAreThreadPinned(unittest.TestCase):
                 os.environ["OMP_NUM_THREADS"] = previous
 
 
+@contextlib.contextmanager
+def pretend_free(free_bytes):
+    """Report ``free_bytes`` of free commit, whatever the host has."""
+    original = parallel.available_memory_bytes
+    parallel.available_memory_bytes = lambda: free_bytes
+    try:
+        yield
+    finally:
+        parallel.available_memory_bytes = original
+
+
 class TestPoolIsBoundedByMemory(unittest.TestCase):
     """A pool spends memory per worker, so cores alone cannot size it."""
 
-    @contextlib.contextmanager
-    def _pretend_free(self, free_bytes):
-        original = parallel.available_memory_bytes
-        parallel.available_memory_bytes = lambda: free_bytes
-        try:
-            yield
-        finally:
-            parallel.available_memory_bytes = original
-
     def test_a_tight_host_narrows_the_pool(self):
-        with self._pretend_free(1 * 1024**3):
+        with pretend_free(1 * 1024**3):
             self.assertLess(parallel.process_worker_count(10_000), 4)
 
     def test_a_roomy_host_lets_the_cores_decide(self):
-        with self._pretend_free(512 * 1024**3):
+        with pretend_free(512 * 1024**3):
             self.assertEqual(
                 parallel.process_worker_count(10_000),
                 max(2, int(parallel.cpu_budget() * parallel.cpu_share())),
@@ -533,7 +535,7 @@ class TestPoolIsBoundedByMemory(unittest.TestCase):
         previous = os.environ.get("GEOFUSE_WORKERS")
         os.environ["GEOFUSE_WORKERS"] = "64"
         try:
-            with self._pretend_free(1 * 1024**3):
+            with pretend_free(1 * 1024**3):
                 self.assertLess(parallel.process_worker_count(10_000), 8)
         finally:
             if previous is None:
@@ -542,18 +544,23 @@ class TestPoolIsBoundedByMemory(unittest.TestCase):
                 os.environ["GEOFUSE_WORKERS"] = previous
 
     def test_an_unreadable_figure_falls_back_to_cores(self):
-        with self._pretend_free(0):
+        with pretend_free(0):
             self.assertEqual(
                 parallel.process_worker_count(10_000),
                 max(2, int(parallel.cpu_budget() * parallel.cpu_share())),
             )
 
     def test_never_returns_less_than_one(self):
-        with self._pretend_free(1):
+        with pretend_free(1):
             self.assertEqual(parallel.process_worker_count(10_000), 1)
 
 
 class TestProcessWorkerCount(unittest.TestCase):
+    """Sizing by cores, on a host with memory to spare whatever else runs."""
+
+    def setUp(self):
+        self.enterContext(pretend_free(512 * 1024**3))
+
     def test_never_exceeds_the_work_available(self):
         self.assertEqual(parallel.process_worker_count(3), 3)
 
