@@ -128,7 +128,7 @@ class TestPlasmodeRun(unittest.TestCase):
             reps=2,
             partial_r2=(0.03,),
             forms=("linear",),
-            pipeline_kwargs=dict(draws=60, warmup=60, chains=1, sweep_splits=2),
+            pipeline_kwargs={"draws": 60, "warmup": 60, "chains": 1, "sweep_splits": 2},
             seed=3,
             workers=1,
         )
@@ -217,7 +217,7 @@ class TestEngineEntryPoint(unittest.TestCase):
             reps=1,
             partial_r2=(0.05,),
             forms=("linear",),
-            pipeline_kwargs=dict(draws=40, warmup=40, chains=1, sweep_splits=2),
+            pipeline_kwargs={"draws": 40, "warmup": 40, "chains": 1, "sweep_splits": 2},
             workers=1,
             out_dir=out_dir,
         )

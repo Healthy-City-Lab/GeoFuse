@@ -34,7 +34,7 @@ def create_sample_data():
         center_lon - half_size,
     ]
 
-    polygon_geom = Polygon(zip(lon_point_list, lat_point_list))
+    polygon_geom = Polygon(zip(lon_point_list, lat_point_list, strict=True))
     gdf = gpd.GeoDataFrame(index=[0], crs="epsg:4326", geometry=[polygon_geom])
 
     # Save as GeoJSON (for NDVI) and Shapefile (for GVI)

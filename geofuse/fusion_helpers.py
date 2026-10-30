@@ -92,7 +92,9 @@ def apply_circular_buffer_aggregation(
 
         templates = preaggregation.origin_circle_templates([float(radius_meters)])
         h, w = int(metric_array.shape[0]), int(metric_array.shape[1])
-        for idx, geom in zip(pts_buf_crs.index, pts_buf_crs.geometry.to_numpy()):
+        for idx, geom in zip(
+            pts_buf_crs.index, pts_buf_crs.geometry.to_numpy(), strict=True
+        ):
             if geom is None or geom.is_empty:
                 continue
             disc = preaggregation.reproject_geoms(
@@ -455,7 +457,7 @@ def downcast_fusion_dtypes(df: pd.DataFrame) -> pd.DataFrame:
         try:
             s = df[col]
             dt = s.dtype
-            if col == "wave" and dt == object:
+            if col == "wave" and dt == np.dtype(object):
                 df[col] = s.astype("category")
             elif dt == np.float64:
                 df[col] = s.astype(np.float32)

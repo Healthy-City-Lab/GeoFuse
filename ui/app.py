@@ -2,7 +2,7 @@ import os
 import sys
 
 if __name__ == "__main__":
-    # --- 1. GLOBAL PATH SETUP (must happen before other imports) ---
+    # ── 1. Global path setup (before any other import) ──────────
     current_dir = os.path.dirname(os.path.abspath(__file__))
     parent_dir = os.path.dirname(current_dir)
     if parent_dir not in sys.path:
@@ -11,7 +11,7 @@ if __name__ == "__main__":
     if current_dir not in sys.path:
         sys.path.insert(0, current_dir)
 
-    # --- 2. GDAL ENVIRONMENT FIX ---
+    # ── 2. GDAL environment ─────────────────────────────────────
     if "GDAL_DATA" not in os.environ:
         conda_prefix = sys.prefix
         gdal_data_path = os.path.join(conda_prefix, "Library", "share", "gdal")
@@ -20,7 +20,7 @@ if __name__ == "__main__":
 
     os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-    # --- 3. LOAD GEOFUSE (GDAL stack first; torch follows via geofuse.vision) ---
+    # ── 3. Load geofuse (GDAL stack first, then torch) ──────────
     from geofuse.gvi import GVIEngine  # noqa: F401, E402
     from geofuse.ndvi import NDVIEngine  # noqa: F401, E402
     from geofuse.vision import get_best_device  # noqa: F401, E402
@@ -30,7 +30,7 @@ if __name__ == "__main__":
     except ImportError:
         pass
 
-    # --- 4. UI IMPORTS (after geofuse to preserve DLL order on Windows) ---
+    # ── 4. UI imports (after geofuse, for DLL order) ────────────
     import streamlit as st  # noqa: E402
     from cache_manager import render_cache_manager  # noqa: E402
     from chrome import inject_chrome  # noqa: E402
@@ -43,7 +43,7 @@ if __name__ == "__main__":
     get_job_store()
     get_job_executor()
 
-    # --- 5. PAGE CONFIG ---
+    # ── 5. Page config ──────────────────────────────────────────
     st.set_page_config(page_title="GeoFuse Toolbox", layout="wide")
 
     # Global page chrome: CSS, floater toggle, and the MutationObserver

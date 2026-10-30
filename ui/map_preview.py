@@ -26,17 +26,13 @@ MAP_POINT_DISPLAY_MAX = 75_000
 # Include per-point tooltips in fast-cluster data only below this count (tooltip strings inflate JSON).
 MAP_FAST_CLUSTER_TOOLTIP_MAX = 8_000
 
-_STUDY_OUTLINE_STYLE: Callable[[dict], Mapping[str, Any]] = lambda x: {
-    "color": "#1a73e8",
-    "weight": 2,
-    "fill": False,
-}
-_BUFFER_STYLE: Callable[[dict], Mapping[str, Any]] = lambda x: {
-    "color": "#f4910c",
-    "weight": 2,
-    "fillOpacity": 0.07,
-    "dashArray": "6 4",
-}
+
+def _study_outline_style(feature: dict) -> Mapping[str, Any]:
+    return {"color": "#1a73e8", "weight": 2, "fill": False}
+
+
+def _buffer_style(feature: dict) -> Mapping[str, Any]:
+    return {"color": "#f4910c", "weight": 2, "fillOpacity": 0.07, "dashArray": "6 4"}
 
 
 def split_points_and_nonpoints(
@@ -185,17 +181,19 @@ def _point_coords_and_optional_tooltips(
     fields = [f for f in tooltip_fields if f in base.columns]
     if not fields:
         return np.column_stack([ys, xs]).tolist()
-    alias_map = dict(zip(tooltip_fields, tooltip_aliases or tooltip_fields))
+    alias_map = dict(
+        zip(tooltip_fields, tooltip_aliases or tooltip_fields, strict=False)
+    )
     tips: list[str] = []
     field_aliases = [alias_map.get(f, f) for f in fields]
     for _, row in base.iterrows():
         tips.append(_row_tooltip_html(row, fields, field_aliases))
-    return [[float(y), float(x), t] for y, x, t in zip(ys, xs, tips)]
+    return [[float(y), float(x), t] for y, x, t in zip(ys, xs, tips, strict=True)]
 
 
 def _row_tooltip_html(row: pd.Series, fields: list[str], aliases: list[str]) -> str:
     parts: list[str] = []
-    for f, alias in zip(fields, aliases):
+    for f, alias in zip(fields, aliases, strict=True):
         if f not in row.index:
             continue
         v = row[f]
@@ -298,7 +296,7 @@ def add_study_area_layers(
         folium.GeoJson(
             nonpt,
             name=study_name,
-            style_function=_STUDY_OUTLINE_STYLE,
+            style_function=_study_outline_style,
         ).add_to(m)
     if not pts.empty:
         add_uniform_point_layer(
@@ -334,7 +332,7 @@ def add_study_area_layers(
     folium.GeoJson(
         display,
         name=bn,
-        style_function=_BUFFER_STYLE,
+        style_function=_buffer_style,
     ).add_to(m)
     return bounds  # type: ignore[return-value]
 

@@ -1226,7 +1226,7 @@ def _container_headers(file_paths: list[str]) -> list[str]:
     bases = [os.path.basename(p) for p in file_paths]
     dupes = {b for b in bases if bases.count(b) > 1}
     out: list[str] = []
-    for p, b in zip(file_paths, bases):
+    for p, b in zip(file_paths, bases, strict=True):
         if b in dupes:
             parent = os.path.basename(os.path.dirname(p)) or os.path.dirname(p)
             out.append(f"{parent}/{b}" if parent else b)
@@ -1345,7 +1345,7 @@ def _render_year_fallback(
     from file_picker import path_to_widget_id
 
     assignment: dict[str, list[str]] = {}
-    for path, head in zip(file_paths, headers):
+    for path, head in zip(file_paths, headers, strict=True):
         taken = {w for q, ws in stored.items() if q != path for w in ws}
         options = [w for w in waves if w not in taken]
         wkey = f"fusion_{ch_short}_assign__{path_to_widget_id(path)}"
@@ -1395,7 +1395,7 @@ def _render_year_assignment(
             "items": [w for w in waves if w not in claimed],
         }
     ]
-    for idx, (path, head) in enumerate(zip(file_paths, headers), start=1):
+    for idx, (path, head) in enumerate(zip(file_paths, headers, strict=True), start=1):
         containers.append({"header": f"{idx}. {head}", "items": stored.get(path, [])})
 
     # Remount when the file list or year set changes: a custom component keyed
@@ -2930,7 +2930,7 @@ def _render_collinearity_report(results_view: dict) -> None:
     st.markdown("**VIF: before vs after reduction**")
     rows: list[dict] = []
     final_by_name = {kept[i]: final[i] for i in range(len(kept))} if final else {}
-    for ch, vif_in in zip(channels, initial):
+    for ch, vif_in in zip(channels, initial, strict=False):
         rows.append(
             {
                 "Channel": ch,
@@ -3259,7 +3259,9 @@ def _render_covariate_impact(results_view: dict, metric_name: str) -> None:
         )
 
         # One cubic per categorical, over that variable's levels in value order.
-        coef_of = dict(zip(df["covariate"].astype(str), df["coef"].astype(float)))
+        coef_of = dict(
+            zip(df["covariate"].astype(str), df["coef"].astype(float), strict=True)
+        )
         grouped: dict[str, list[tuple[str, float]]] = {}
         for term in order:
             name, level = _split_term(term)
@@ -3276,14 +3278,14 @@ def _render_covariate_impact(results_view: dict, metric_name: str) -> None:
                 y=list(values),
                 mode="lines+markers",
                 name=f"{name} trend (deg {degree})",
-                line=dict(color=_TREND_COLOR, width=2.5),
-                marker=dict(color=_TREND_COLOR, size=6, symbol="diamond"),
+                line={"color": _TREND_COLOR, "width": 2.5},
+                marker={"color": _TREND_COLOR, "size": 6, "symbol": "diamond"},
                 hovertemplate=f"{name} fitted: %{{y:.4f}}<extra></extra>",
             )
             fitted_any.append(f"{name} (deg {degree}, {len(labels)} levels)")
         fig.update_layout(
-            margin=dict(l=60, r=20, t=60, b=120),
-            xaxis=dict(categoryorder="array", categoryarray=order),
+            margin={"l": 60, "r": 20, "t": 60, "b": 120},
+            xaxis={"categoryorder": "array", "categoryarray": order},
         )
         st.plotly_chart(fig, width="stretch")
         cap = (
@@ -3355,7 +3357,7 @@ def _render_composite_map_viewer(results_view: dict, engine) -> None:
         "target outcome. All composite subplots share the [0, 1] colorbar."
     )
 
-    label_to_path = {label: path for label, path in composite_options}
+    label_to_path = dict(composite_options)
     _labels = [label for label, _ in composite_options]
     _default("fusion_map_picks", [_labels[0]], _labels, multi=True)
     picks = st.multiselect(
@@ -3626,7 +3628,7 @@ def _render_distance_decay(summary: dict, _pd, _label) -> None:
             [
                 {"Distance (m)": float(d), "Channel": _label(ci_), "Weight": float(w)}
                 for ci_, row in enumerate(weights)
-                for d, w in zip(dist, row)
+                for d, w in zip(dist, row, strict=False)
             ]
         )
         try:
@@ -3635,7 +3637,7 @@ def _render_distance_decay(summary: dict, _pd, _label) -> None:
             fig = _px.line(long, x="Distance (m)", y="Weight", color="Channel")
             fig.update_layout(
                 height=260,
-                margin=dict(l=50, r=20, t=30, b=50),
+                margin={"l": 50, "r": 20, "t": 30, "b": 50},
                 yaxis_title="Implied weight (1 at the entity)",
             )
             st.plotly_chart(fig, width="stretch")
@@ -3761,9 +3763,9 @@ def _render_fitted_grid(summary: dict, _pd, _label) -> None:
             )
             fig.update_layout(
                 height=280,
-                margin=dict(l=50, r=20, t=30, b=50),
+                margin={"l": 50, "r": 20, "t": 30, "b": 50},
                 yaxis_title="Posterior weight",
-                xaxis=dict(categoryorder="array", categoryarray=order),
+                xaxis={"categoryorder": "array", "categoryarray": order},
             )
             st.plotly_chart(fig, width="stretch")
         except Exception:
@@ -3814,7 +3816,7 @@ def _render_fitted_grid(summary: dict, _pd, _label) -> None:
                     for i in range(min(len(stats), len(lo_c)))
                     if lo_c[i] > uniform or hi_c[i] < uniform
                 ]
-                for lo_c, hi_c in zip(a_lo, a_hi)
+                for lo_c, hi_c in zip(a_lo, a_hi, strict=False)
             ]
         informative = informative or []
         st.caption(
@@ -4549,8 +4551,7 @@ def _render_results_headline(results_view: dict, metric_name: str) -> None:
                 )
             else:
                 help_txt = (
-                    "The held-out rows could not be scored, so there is no "
-                    "verdict."
+                    "The held-out rows could not be scored, so there is no verdict."
                 )
             st.metric(
                 "CGI vs standalone — objective (held-out)", verdict, help=help_txt
@@ -4592,8 +4593,7 @@ def _render_results_headline(results_view: dict, metric_name: str) -> None:
                     "the verdict. It does not score the tuned composite itself, "
                     "and BIC charges ln n per extra channel. "
                     + (
-                        f"ΔAIC={d_aic:.1f}, ΔBIC={d_bic:.1f} (positive favours "
-                        "CGI)."
+                        f"ΔAIC={d_aic:.1f}, ΔBIC={d_bic:.1f} (positive favours CGI)."
                         if d_aic is not None and d_bic is not None
                         else ""
                     )
@@ -4702,7 +4702,7 @@ def _render_study_detail(
             total_weight = sum(
                 float(final_params.get(k, 0)) for k in formula.weight_keys
             )
-            for col, key in zip(weight_cols, formula.weight_keys):
+            for col, key in zip(weight_cols, formula.weight_keys, strict=True):
                 label = _weight_key_label(key)
                 pct = (
                     100.0 * float(final_params.get(key, 0)) / total_weight
@@ -4717,7 +4717,7 @@ def _render_study_detail(
             groups = [all_keys[i : i + 3] for i in range(0, len(all_keys), 3)]
             for group in groups:
                 cols = st.columns(len(group))
-                for col, key in zip(cols, group):
+                for col, key in zip(cols, group, strict=True):
                     val = float(final_params.get(key, 0))
                     if key in formula.power_keys:
                         pretty = key.removesuffix("_power").upper() + " power"
@@ -4732,7 +4732,7 @@ def _render_study_detail(
         channels = _cgi_formulas.formula_channels(formula.name)
         st.markdown("**Radii (m)**")
         radii_cols = st.columns(max(len(channels), 1))
-        for col, ch in zip(radii_cols, channels):
+        for col, ch in zip(radii_cols, channels, strict=False):
             label = _CHANNEL_DISPLAY.get(ch, ch.upper())
             with col:
                 try:
@@ -5048,7 +5048,7 @@ def _render_cross_study_comparison(results_view: dict, metric_name: str) -> None
                 barmode="group",
                 title=f"{metric_name} by study and subset",
             )
-            fig.update_layout(margin=dict(l=60, r=20, t=60, b=80))
+            fig.update_layout(margin={"l": 60, "r": 20, "t": 60, "b": 80})
             st.plotly_chart(fig, width="stretch")
         except Exception:
             st.bar_chart(
@@ -5084,7 +5084,7 @@ def _render_cross_study_comparison(results_view: dict, metric_name: str) -> None
             import plotly.express as _px
 
             fig_t = _px.bar(t_df, x="Study", y="Held-out |t|")
-            fig_t.update_layout(height=300, margin=dict(l=60, r=20, t=30, b=80))
+            fig_t.update_layout(height=300, margin={"l": 60, "r": 20, "t": 30, "b": 80})
             st.plotly_chart(fig_t, width="stretch")
         except Exception:
             st.bar_chart(t_df.set_index("Study"), width="stretch")
@@ -5451,7 +5451,7 @@ def _render_fusion_results_body(output_dir: str) -> None:
             )
 
             _tabs = st.tabs([disp for _, disp, _ in _csv_entries])
-            for _tab, (_, _, _path) in zip(_tabs, _csv_entries):
+            for _tab, (_, _, _path) in zip(_tabs, _csv_entries, strict=True):
                 with _tab:
                     st.caption(f"Source: `{_path}`")
                     st.dataframe(pd.read_csv(_path), width="stretch")
@@ -5619,9 +5619,9 @@ def render(output_dir: str) -> None:
     # Rendered first so it survives the configuration early-returns below.
     _render_fusion_results_section(output_dir)
 
-    # =========================================================================
+    # ────────────────────────────────────────────────────────────
     # ROW 1: Configuration (Left) | Preview (Right)
-    # =========================================================================
+    # ────────────────────────────────────────────────────────────
     col_fusion_left, col_fusion_right = st.columns([1, 1])
 
     tmp_target_path = None
@@ -5871,9 +5871,9 @@ def render(output_dir: str) -> None:
             preview_vector_gdf if is_vector_target else None,
         )
 
-    # =========================================================================
+    # ────────────────────────────────────────────────────────────
     # SECTION 2 — Optimization setup
-    # =========================================================================
+    # ────────────────────────────────────────────────────────────
     st.divider()
     opt_state = _render_optimization_setup_panel(
         preview_vector_gdf if is_vector_target else None,
@@ -5887,9 +5887,9 @@ def render(output_dir: str) -> None:
     is_longitudinal = opt_state["is_longitudinal"]
     year_aware = is_longitudinal or opt_state["cross_sectional_date_on"]
 
-    # =========================================================================
+    # ────────────────────────────────────────────────────────────
     # SECTION 3 — Metric file assignment
-    # =========================================================================
+    # ────────────────────────────────────────────────────────────
     st.divider()
     metric_state = _render_metric_assignment_panel(
         opt_state["discovered_waves"],
@@ -5918,9 +5918,9 @@ def render(output_dir: str) -> None:
     ndvi_resolution_m = None
     gvi_grid_spacing_m = None
 
-    # =========================================================================
+    # ────────────────────────────────────────────────────────────
     # SECTION 4 — Study details (form)
-    # =========================================================================
+    # ────────────────────────────────────────────────────────────
     st.divider()
 
     # Attribute columns the user can pick as covariates — numeric columns are
@@ -6109,9 +6109,9 @@ def render(output_dir: str) -> None:
         study_state.get("drop_collinear_channels", False)
     )
 
-    # =========================================================================
+    # ────────────────────────────────────────────────────────────
     # Run controls and progress
-    # =========================================================================
+    # ────────────────────────────────────────────────────────────
     st.divider()
 
     col_run2, col_run3 = st.columns([1, 1])

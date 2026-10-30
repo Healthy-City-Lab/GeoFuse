@@ -597,7 +597,7 @@ def _render_gvi_merged_restart(store, executor, pano_cache, output_dir, rec, p) 
 
         statuses = [
             (fn, pth, path_drift_status(pth, fp))
-            for fn, pth, fp in zip(sources, paths, fps)
+            for fn, pth, fp in zip(sources, paths, fps, strict=False)
         ]
         all_ok = bool(paths) and all(s == "ok" for _, _, s in statuses)
 
@@ -1240,7 +1240,7 @@ def _render_gvi_settings_map() -> None:
 def render(output_dir: str, parent_dir: str) -> None:
     st.header("GVI")
 
-    # --- SESSION STATE ---
+    # ── Session state ───────────────────────────────────────────
     if "datasets" not in st.session_state:
         st.session_state.datasets = {}
     if "gvi_inspector_select" not in st.session_state:
@@ -1260,7 +1260,7 @@ def render(output_dir: str, parent_dir: str) -> None:
 
     render_sidebar_job_monitor()
 
-    # --- RESTART PANEL (above the main form when a terminal job was clicked) ---
+    # ── Restart panel (above the form for a clicked job) ────────
     _render_gvi_restart_panel(store, executor, pano_cache, output_dir, parent_dir)
 
     st.subheader("Input Configuration")
@@ -1601,7 +1601,7 @@ def render(output_dir: str, parent_dir: str) -> None:
                     "source_fingerprints": src_fps,
                 }
 
-                # --- Per-year date-column job ---
+                # ── Per-year date-column job ────────
                 if mode_cfg == _GVI_MODE_COLUMN and date_col:
                     col_params = dict(
                         common_params, mode="column", date_column=date_col
@@ -1637,7 +1637,7 @@ def render(output_dir: str, parent_dir: str) -> None:
                     st.warning(f"{key}: no year/date column selected — skipped.")
                     continue
 
-                # --- Recent / specific-year job ---
+                # ── Recent / specific-year job ──────
                 # A grid generated for the preview is used as is; otherwise the
                 # job builds it from the step and buffer in ``run_args``.
                 job_params = dict(common_params, target_year=target_year)

@@ -713,7 +713,7 @@ def _entity_blocks(eids: np.ndarray) -> dict[int, np.ndarray]:
     order = np.argsort(eids, kind="stable")
     _u, first, counts = np.unique(eids[order], return_index=True, return_counts=True)
     by_k: dict[int, list[np.ndarray]] = {}
-    for f, c in zip(first, counts):
+    for f, c in zip(first, counts, strict=True):
         by_k.setdefault(int(c), []).append(order[f : f + c])
     return {k: np.asarray(v, dtype=np.int64) for k, v in by_k.items()}
 
@@ -748,7 +748,7 @@ def _mom_components(
         b_rows.append(prod)
     coef, *_ = np.linalg.lstsq(np.vstack(A_rows), np.concatenate(b_rows), rcond=None)
     D = np.zeros((r_dim, r_dim))
-    for (a, b), c in zip(pairs, coef[:-1]):
+    for (a, b), c in zip(pairs, coef[:-1], strict=True):
         D[a, b] = D[b, a] = c
     w, V = np.linalg.eigh(D)
     D = V @ np.diag(np.clip(w, 1e-9, None)) @ V.T

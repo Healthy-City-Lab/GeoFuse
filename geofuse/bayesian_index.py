@@ -1227,7 +1227,7 @@ class IndexPosterior:
             "weight_prior_ci": list(w_prior),
             "weight_width_ratio": [
                 _width_ratio(a, b, *w_prior)
-                for a, b in zip(np.atleast_1d(w_lo), np.atleast_1d(w_hi))
+                for a, b in zip(np.atleast_1d(w_lo), np.atleast_1d(w_hi), strict=True)
             ],
             "beta_mean": float(self.beta.mean()),
             "beta_ci_low": float(lo),
@@ -1264,7 +1264,7 @@ class IndexPosterior:
             out["peak_radius_prior_ci"] = list(prior)
             out["peak_radius_width_ratio"] = [
                 _width_ratio(a, b, *prior)
-                for a, b in zip(np.atleast_1d(p_lo), np.atleast_1d(p_hi))
+                for a, b in zip(np.atleast_1d(p_lo), np.atleast_1d(p_hi), strict=True)
             ]
         if self.kernel_width is not None:
             out["kernel_width_mean"] = self.kernel_width.mean(0).tolist()
@@ -1279,8 +1279,8 @@ class IndexPosterior:
             out["aggregator_uniform"] = 1.0 / self.aggregator_weights.shape[2]
             out["aggregator_informative"] = self.informative_aggregators()
             out["aggregator_width_ratio"] = [
-                [_width_ratio(a, b, *a_prior) for a, b in zip(lo_c, hi_c)]
-                for lo_c, hi_c in zip(a_lo, a_hi)
+                [_width_ratio(a, b, *a_prior) for a, b in zip(lo_c, hi_c, strict=True)]
+                for lo_c, hi_c in zip(a_lo, a_hi, strict=True)
             ]
         return out
 
@@ -1840,17 +1840,17 @@ def grid_posterior(
     radius_mask = np.zeros((len(channels), len(radii)), dtype=bool)
     for ci, allowed in enumerate(radius_idx):
         radius_mask[ci, list(allowed)] = True
-    grid_kwargs = dict(
-        radii=radii,
-        stats=stats,
-        radius_mask=radius_mask,
-        radius_kernel=radius_kernel,
-        aggregator=aggregator,
-        radius_prior=radius_prior,
-        entities=entities,
-        design=design,
-        design_channels=tuple(channel_index),
-    )
+    grid_kwargs = {
+        "radii": radii,
+        "stats": stats,
+        "radius_mask": radius_mask,
+        "radius_kernel": radius_kernel,
+        "aggregator": aggregator,
+        "radius_prior": radius_prior,
+        "entities": entities,
+        "design": design,
+        "design_channels": tuple(channel_index),
+    }
     mcmc = fit(
         grid,
         yr,

@@ -127,7 +127,7 @@ class TestFitBayesianIndexWiring(unittest.TestCase):
         self.assertEqual(post["distance_scale"], "raw")
         self.assertEqual(len(post["r50_mean"]), 2)
         for lo, mid, hi in zip(
-            post["r50_ci_low"], post["r50_mean"], post["r50_ci_high"]
+            post["r50_ci_low"], post["r50_mean"], post["r50_ci_high"], strict=True
         ):
             self.assertLessEqual(lo, mid + 1e-9)
             self.assertLessEqual(mid, hi + 1e-9)
@@ -312,14 +312,14 @@ class TestRetuneOnAControl(unittest.TestCase):
         )
         parallel.process_worker_count = lambda *a, **k: 1
         cls.eng = _retune_stub()
-        kw = dict(
-            forms=("linear",),
-            sweep_splits=3,
-            draws=150,
-            warmup=150,
-            chains=1,
-            radius_kernel="dirichlet",
-        )
+        kw = {
+            "forms": ("linear",),
+            "sweep_splits": 3,
+            "draws": 150,
+            "warmup": 150,
+            "chains": 1,
+            "radius_kernel": "dirichlet",
+        }
         cls.target = cls.eng.fit_bayesian_index(
             "r2", reps=0, shuffles=0, gain_splits=0, null_runs=0, **kw
         )

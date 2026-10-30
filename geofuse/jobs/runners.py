@@ -1202,9 +1202,7 @@ def _paired_family_headline(family: list[dict], channel: str | None) -> dict | N
         d["p_value_holm"] = None if hp != hp else float(hp)
         d["family_size"] = len(family)
         d["verdict"] = paired_verdict(d)
-    head = next(
-        (d for d in family if d.get("standalone_channel") == channel), None
-    )
+    head = next((d for d in family if d.get("standalone_channel") == channel), None)
     if head is not None:
         head["selected_on"] = "train_val"
     return head
@@ -1271,12 +1269,8 @@ def _run_outer_splits(
             rows.append(r)
 
         def _progress(k: int) -> None:
-            stage_progress(
-                stage_key, k / k_splits, f"split {k + 1:,}/{k_splits:,}"
-            )
-            ctx.progress(
-                status_text=f"[{label}] Held-out split {k + 1}/{k_splits}..."
-            )
+            stage_progress(stage_key, k / k_splits, f"split {k + 1:,}/{k_splits:,}")
+            ctx.progress(status_text=f"[{label}] Held-out split {k + 1}/{k_splits}...")
 
         rows += _outer.repeat(
             engine,
@@ -2034,8 +2028,8 @@ def run_fusion(
             def skey(step: str, _label: str = label) -> str:
                 return _fusion_stage_key(_label, step, multi=multi_outcome)
 
-            def prog(local: float) -> float:
-                return (ti + local) / n_t
+            def prog(local: float, _ti: int = ti) -> float:
+                return (_ti + local) / n_t
 
             # Stage keys belonging to this outcome, for the ledger-derived main
             # progress bar. For multi-outcome runs keys carry a "<label>::"
@@ -2048,7 +2042,10 @@ def run_fusion(
             ]
             _label_total_weight = sum(_fusion_stage_weight(k) for k in label_stage_keys)
 
-            def prog_ledger() -> float:
+            def prog_ledger(
+                _keys: list[str] = label_stage_keys,
+                _total: float = _label_total_weight,
+            ) -> float:
                 """Main-bar value derived from this outcome's ledger state.
 
                 ``(finished + running·progress)`` weighted by
@@ -2056,10 +2053,10 @@ def run_fusion(
                 into the outcome's slice via ``prog``. Monotonic by construction
                 — stages only advance and a running stage's fraction only grows.
                 """
-                if _label_total_weight <= 0:
+                if _total <= 0:
                     return prog(0.0)
                 done = 0.0
-                for k in label_stage_keys:
+                for k in _keys:
                     st_ = ledger.get(k)
                     if st_ is None:
                         continue
@@ -2068,7 +2065,7 @@ def run_fusion(
                         done += w
                     elif st_.status == RUNNING:
                         done += w * st_.progress
-                return prog(done / _label_total_weight)
+                return prog(done / _total)
 
             ctx.progress(
                 value=prog_ledger(),
@@ -2189,14 +2186,13 @@ def run_fusion(
 
             last_update_time = {"veg": 0.0, "terrain": 0.0}
 
-            def gvi_progress_callback(component, curr, total):
+            def gvi_progress_callback(
+                component, curr, total, _last: dict = last_update_time
+            ):
                 current_time = time.time()
-                if (
-                    current_time - last_update_time.get(component, 0) < 0.5
-                    and curr != total
-                ):
+                if current_time - _last.get(component, 0) < 0.5 and curr != total:
                     return
-                last_update_time[component] = current_time
+                _last[component] = current_time
                 gvi_progress = {
                     "component": component,
                     "current": curr,
@@ -2378,11 +2374,16 @@ def run_fusion(
             # aggregations. Resumable across cancels/crashes.
             _last_pct = {"v": -1}
 
-            def preaggr_progress(current: int, total: int) -> None:
+            def preaggr_progress(
+                current: int,
+                total: int,
+                _last: dict = _last_pct,
+                _prefix: str = prefix,
+            ) -> None:
                 pct = (current * 100) // max(1, total)
-                if pct == _last_pct["v"]:
+                if pct == _last["v"]:
                     return
-                _last_pct["v"] = pct
+                _last["v"] = pct
                 ctx.set_extra(
                     preaggr_progress={
                         "current": current,
@@ -2394,7 +2395,7 @@ def run_fusion(
                 ctx.progress(
                     value=prog_ledger(),
                     status_text=(
-                        f"{prefix}Spatial pre-processing: "
+                        f"{_prefix}Spatial pre-processing: "
                         f"{current:,}/{total:,} grid cells ({pct}%)"
                     ),
                 )
@@ -2453,7 +2454,7 @@ def run_fusion(
                             f"[{label}] Collinearity check: "
                             f"{sorted(engine._high_vif_channels)} above the VIF "
                             f"threshold (kept in the search). VIFs (initial): "
-                            f"{dict(zip(collinearity_report['channels_in'], collinearity_report['initial_vifs']))}.",
+                            f"{dict(zip(collinearity_report['channels_in'], collinearity_report['initial_vifs'], strict=False))}.",
                         )
                     elif collinearity_report:
                         _log_fusion(
@@ -2511,14 +2512,19 @@ def run_fusion(
                 spatial_split_mode=str(spatial_split_mode),
             )
 
-            def _standalone_study_name(ch: str) -> str:
-                ch_suffix = ch if resume_existing_study else f"{ch}_{suffix}"
+            def _standalone_study_name(
+                ch: str,
+                _suffix: str = suffix,
+                _label: str = label,
+                _config_fp: str = config_fp,
+            ) -> str:
+                ch_suffix = ch if resume_existing_study else f"{ch}_{_suffix}"
                 return _build_fusion_study_name(
                     target_display_name=target_display_name,
-                    label=label,
+                    label=_label,
                     objective_metric=objective_metric,
                     suffix=ch_suffix,
-                    config_fingerprint=config_fp,
+                    config_fingerprint=_config_fp,
                 )
 
             # One held-out test split + the train+val pool that the sweep
@@ -2574,7 +2580,9 @@ def run_fusion(
             # (one channel's radius x statistic instead of the product) and no
             # trial-budget scaling is needed.
 
-            def _study_progress_cb(study_label: str, stage_key: str | None = None):
+            def _study_progress_cb(
+                study_label: str, stage_key: str | None = None, _prefix: str = prefix
+            ):
                 """Per-stage callback → live caption, progress bar, stage row.
 
                 Throttled to ~0.4 s (always fires on the last step) so the
@@ -2600,7 +2608,7 @@ def run_fusion(
                         )
                     ctx.progress(
                         value=prog_ledger() if stage_key is not None else None,
-                        status_text=f"{prefix}{study_label}: {done:,}/{total:,} steps",
+                        status_text=f"{_prefix}{study_label}: {done:,}/{total:,} steps",
                         fusion_study_progress={
                             "study": study_label,
                             "current": int(done),

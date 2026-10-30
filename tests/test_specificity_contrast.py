@@ -69,9 +69,7 @@ class TestContrast(unittest.TestCase):
         ):
             want = nc.partial_slope(x[rows], y[rows], cov[rows])["beta"]
             self.assertAlmostEqual(got[key], want, places=10)
-        self.assertAlmostEqual(
-            got["delta"], got["d"] - got["d_other"], places=12
-        )
+        self.assertAlmostEqual(got["delta"], got["d"] - got["d_other"], places=12)
 
     def test_a_confounded_benchmark_is_less_specific(self):
         cgi, bench, target, control, cov = _confounded()
@@ -406,9 +404,7 @@ class TestOnRun(unittest.TestCase):
 
     def test_the_table_and_the_manifest_carry_it(self):
         out = self.bundle["report_dir"]
-        with open(
-            os.path.join(out, "specificity_contrast.csv"), encoding="utf-8"
-        ) as f:
+        with open(os.path.join(out, "specificity_contrast.csv"), encoding="utf-8") as f:
             table = list(csv.DictReader(f))
         self.assertEqual(len(table), 3)
         self.assertIn("delta_d", table[0])

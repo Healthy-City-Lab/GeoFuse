@@ -519,7 +519,7 @@ def _write_fusion_outputs(
         if curve:
             er_curve_rows.extend(
                 {"study": _study_key, "exposure": x, "effect": y}
-                for x, y in zip(curve["exposure"], curve["effect"])
+                for x, y in zip(curve["exposure"], curve["effect"], strict=True)
             )
     if er_rows:
         _emit_csv(

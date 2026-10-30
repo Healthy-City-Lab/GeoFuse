@@ -42,7 +42,7 @@ Then run it:
 Both installers take the same options:
 
 | Option | Effect |
-|--------|--------|
+| --- | --- |
 | `--yes` | Replace an existing environment without asking, and do not wait for a key at the end (unattended runs) |
 | `--torch auto` / `cuda` / `cpu` | PyTorch build. `auto` (default) installs the CUDA build on Windows and Linux, which also runs on the CPU, and the standard build on macOS. `cpu` installs the smaller CPU-only build on machines without an NVIDIA GPU |
 | `--env-name NAME` | Environment name (default `geofuse`) |

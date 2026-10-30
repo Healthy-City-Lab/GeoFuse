@@ -2431,12 +2431,12 @@ class MetricFusionEngine:
             logger.warning(
                 f"Collinearity check: {sorted(dropped)} above the VIF threshold "
                 f"(kept in the search). Initial VIFs: "
-                f"{dict(zip(all_channels, report['initial_vifs']))}."
+                f"{dict(zip(all_channels, report['initial_vifs'], strict=False))}."
             )
         else:
             logger.info(
                 f"Collinearity check passed: all VIFs ≤ {vif_threshold}. "
-                f"VIFs: {dict(zip(all_channels, report['initial_vifs']))}."
+                f"VIFs: {dict(zip(all_channels, report['initial_vifs'], strict=False))}."
             )
         return self._collinearity_report
 
@@ -2777,7 +2777,7 @@ class MetricFusionEngine:
         cancel_callback: Callable[[], bool] | None,
         stage_secs: dict[str, float],
         progress_callback: Callable[[int], None] | None = None,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
         """Compute veg / terrain / ndvi stats for the pixels at ``positions``.
 
         ``positions`` index into ``point_xy_utm`` / ``entity_geoms_utm``. Each
@@ -3321,8 +3321,8 @@ class MetricFusionEngine:
                 progress_callback=(
                     None
                     if progress_callback is None
-                    else lambda done: progress_callback(
-                        min(unit_base + done, total_missing), max(total_missing, 1)
+                    else lambda done, _base=unit_base: progress_callback(
+                        min(_base + done, total_missing), max(total_missing, 1)
                     )
                 ),
             )
@@ -3868,7 +3868,7 @@ class MetricFusionEngine:
         params: dict[str, Any] = {}
 
         stat_of = {"mean": ("mean", 50)}
-        for (radius, column), ch in zip(post.picked, index_channels):
+        for (radius, column), ch in zip(post.picked, index_channels, strict=True):
             stat, pct = stat_of.get(column, ("percentile", 0))
             if column != "mean":
                 pct = int(column[1:])
@@ -5271,6 +5271,7 @@ class MetricFusionEngine:
                 zip(
                     fusion_df["polygon_id"].to_numpy(),
                     fusion_df[group_col].to_numpy(),
+                    strict=True,
                 )
             )
             keys = np.array(
@@ -5303,7 +5304,9 @@ class MetricFusionEngine:
             )
         except Exception:
             return None
-        block_by_group = dict(zip(agg.index.to_numpy(), block_ids.tolist()))
+        block_by_group = dict(
+            zip(agg.index.to_numpy(), block_ids.tolist(), strict=True)
+        )
         return block_by_group, info
 
     def split_data(
@@ -8162,10 +8165,10 @@ class MetricFusionEngine:
         """
         method = self.spatial_adjust_method
         if method == "none":
-            return (None, None), {c: (None, None) for c in controls}
+            return (None, None), dict.fromkeys(controls, (None, None))
         on_target = self._reporting_smooth(coords, rows, target, cov, exposure)
         if method == "spatial_plus":
-            return on_target, {c: on_target for c in controls}
+            return on_target, dict.fromkeys(controls, on_target)
         return on_target, {
             c: self._reporting_smooth(coords, rows, values, cov, exposure)
             for c, values in controls.items()

@@ -101,7 +101,7 @@ def build_scenario(tmpdir, *, lazy_raster):
     rng = np.random.default_rng(4)
     grid = np.arange(0, 2400, 40, dtype=np.float64)
     xx, yy = np.meshgrid(grid, grid)
-    pts = [Point(x, y) for x, y in zip(xx.ravel(), yy.ravel())]
+    pts = [Point(x, y) for x, y in zip(xx.ravel(), yy.ravel(), strict=True)]
     n_pts = len(pts)
     veg = gpd.GeoDataFrame({"gvi_veg": rng.random(n_pts)}, geometry=pts, crs=CRS)
     veg.attrs["metric_column"] = "gvi_veg"
@@ -210,7 +210,9 @@ class TestProcessPoolEquivalence(unittest.TestCase):
     def _assert_matches(self, lazy_raster):
         pooled, in_process, ticks = self._run_both(lazy_raster)
         self.assertIsNotNone(pooled)
-        for name, got, expected in zip(("veg", "terrain", "ndvi"), pooled, in_process):
+        for name, got, expected in zip(
+            ("veg", "terrain", "ndvi"), pooled[:3], in_process, strict=True
+        ):
             self.assertTrue(
                 np.isfinite(expected).any(), f"{name} reference is entirely NaN"
             )

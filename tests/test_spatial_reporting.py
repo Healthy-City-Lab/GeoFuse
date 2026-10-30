@@ -277,9 +277,7 @@ class TestSmoothConfounder(unittest.TestCase):
                 got = eng.compute_partial_slopes({})["test"]
                 d, t = eng.data, eng.test
                 cov = d["age"].reshape(-1, 1)
-                smooth, record = eng._reporting_smooth(
-                    d["xy"], t, d["y"], cov, d["x"]
-                )
+                smooth, record = eng._reporting_smooth(d["xy"], t, d["y"], cov, d["x"])
                 self.assertIsNotNone(smooth)
                 controls = np.column_stack([cov[t], smooth])
                 want = _ols_beta(d["x"][t], d["y"][t], controls)

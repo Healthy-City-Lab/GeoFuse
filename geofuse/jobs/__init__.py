@@ -10,10 +10,6 @@ from __future__ import annotations
 import random
 import time
 from collections.abc import Callable, Iterable
-from typing import TypeVar
-
-T = TypeVar("T")
-
 
 # ────────────────────────────────────────────────────────────────────
 # Per-engine progress cadence
@@ -101,7 +97,7 @@ _RETRY_FACTOR = 1.5
 _RETRY_JITTER = 0.25
 
 
-def retry_with_backoff(
+def retry_with_backoff[T](
     fn: Callable[[], T],
     *,
     attempts: int = 3,

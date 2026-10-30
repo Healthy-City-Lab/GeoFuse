@@ -106,7 +106,8 @@ select = [
     "E",    # pycodestyle errors
     "W",    # pycodestyle warnings
     "F",    # pyflakes
-    "I",    # isort
+    # No "I": import order belongs to isort ([tool.isort]), whose black
+    # profile groups `as` imports differently from Ruff's port of it.
     "B",    # flake8-bugbear
     "C4",   # flake8-comprehensions
     "UP",   # pyupgrade

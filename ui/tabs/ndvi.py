@@ -584,7 +584,7 @@ def _render_ndvi_merged_restart(store, executor, output_dir, rec, p) -> None:
 
         statuses = [
             (fn, pth, path_drift_status(pth, fp))
-            for fn, pth, fp in zip(sources, paths, fps)
+            for fn, pth, fp in zip(sources, paths, fps, strict=False)
         ]
         all_ok = bool(paths) and all(s == "ok" for _, _, s in statuses)
         _labels = {
@@ -1462,7 +1462,7 @@ def render(output_dir: str) -> None:
                     validation_errors.append(f"{fname}: No date mode is enabled.")
                     continue
 
-                # --- Date Range jobs ---
+                # ── Date-range jobs ─────────────────
                 if use_ranges:
                     range_options = _options(
                         fname, cfg, "ranges", "stats_ranges", "Date range(s)"
@@ -1527,7 +1527,7 @@ def render(output_dir: str) -> None:
                         )
                         jobs_started += 1
 
-                # --- Specific Date jobs ---
+                # ── Specific-date jobs ──────────────
                 if use_specific:
                     specific_options = _options(
                         fname, cfg, "specific", "stats_specific", "Specific date(s)"
@@ -1592,7 +1592,7 @@ def render(output_dir: str) -> None:
                         )
                         jobs_started += 1
 
-                # --- Attribute Column (per-year) job ---
+                # ── Per-year attribute-column job ───
                 if use_column:
                     column_options = _options(
                         fname, cfg, "col", "stats_column", "Attribute column"

@@ -160,7 +160,7 @@ def geometry_sha256(gdf: gpd.GeoDataFrame) -> str:
     geoms = gdf.geometry.sort_index()
     wkbs = geoms.to_wkb()
     empties = (geoms.is_empty | geoms.isna()).to_numpy()
-    for wkb, is_empty in zip(wkbs, empties):
+    for wkb, is_empty in zip(wkbs, empties, strict=True):
         if is_empty or wkb is None:
             h.update(b"\x00")
             continue

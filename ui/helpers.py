@@ -352,7 +352,7 @@ def render_file_grouping_controls(
     if not str(mode_label).startswith("Merge"):
         return "separate"
 
-    # --- Group list (names) with add / rename / remove ---
+    # ── Group list (names) with add / rename / remove ───────────
     names_key = f"{groups_key}__names"
     names = st.session_state.get(names_key) or ["Group 1"]
 

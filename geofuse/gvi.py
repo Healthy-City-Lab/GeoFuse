@@ -10,7 +10,11 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
-# --- CONFIGURATION ---
+from . import streetview as gsv
+from .logger import get_logger
+from .vision import DeepLabSegmenter, get_best_device
+
+# ── Configuration ───────────────────────────────────────────────────
 Image.MAX_IMAGE_PIXELS = None
 warnings.simplefilter("ignore", Image.DecompressionBombWarning)
 
@@ -74,10 +78,6 @@ CITYSCAPES_PALETTE = [
     11,
     32,
 ] + [0, 0, 0] * 237
-
-from . import streetview as gsv
-from .logger import get_logger
-from .vision import DeepLabSegmenter, get_best_device
 
 _log = get_logger("GVI")
 

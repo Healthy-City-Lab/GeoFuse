@@ -69,7 +69,7 @@ class TestYearKeyedIntake(unittest.TestCase):
         )
         self.assertEqual(validate_spec(spec), [])
         out = build_long_format(spec, [("fileA", f1), ("fileB", f2)], outcome_col="y")
-        waves = dict(zip(zip(out["entity_id"], out["wave"]), out["wave"]))
+        waves = set(zip(out["entity_id"], out["wave"], strict=True))
         # The third row of file B was measured in 2016, not file B's label.
         self.assertIn(("c", "2016"), waves)
         self.assertEqual(sorted(set(out["wave"])), ["2010", "2015", "2016"])

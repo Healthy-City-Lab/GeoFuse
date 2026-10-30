@@ -158,14 +158,14 @@ class TestStatisticalFastPaths(unittest.TestCase):
         t = rng.normal(size=n)
         p = 0.7 * t + rng.normal(size=n)
         cov = rng.normal(size=(n, 2))
-        kwargs = dict(
-            score_fn=self._score_fn,
-            n_bootstrap=200,
-            ci_level=0.95,
-            method="percentile",
-            seed=42,
-            covariates=cov,
-        )
+        kwargs = {
+            "score_fn": self._score_fn,
+            "n_bootstrap": 200,
+            "ci_level": 0.95,
+            "method": "percentile",
+            "seed": 42,
+            "covariates": cov,
+        }
         generic = statistical_testing.bootstrap_score_ci(t, p, **kwargs)
         fast = statistical_testing.bootstrap_score_ci(
             t,
@@ -184,13 +184,13 @@ class TestStatisticalFastPaths(unittest.TestCase):
         t = rng.normal(size=n)
         p = 0.8 * t + rng.normal(size=n)
         cov = rng.normal(size=(n, 2))
-        kwargs = dict(
-            score_fn=self._score_fn,
-            higher_is_better=True,
-            n_perm=200,
-            seed=42,
-            covariates=cov,
-        )
+        kwargs = {
+            "score_fn": self._score_fn,
+            "higher_is_better": True,
+            "n_perm": 200,
+            "seed": 42,
+            "covariates": cov,
+        }
         generic = statistical_testing.permutation_pvalue(t, p, **kwargs)
         fast = statistical_testing.permutation_pvalue(
             t,

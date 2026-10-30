@@ -21,9 +21,9 @@ from geofuse.gvi import GVIEngine
 from geofuse.vision import DeepLabSegmenter, get_best_device
 
 
-# =========================================================================
+# ────────────────────────────────────────────────────────────────────
 # Package Smoke Tests
-# =========================================================================
+# ────────────────────────────────────────────────────────────────────
 class TestPackageSmoke(unittest.TestCase):
     """Fast sanity checks that each installed package is functional.
 
@@ -188,9 +188,9 @@ class TestPackageSmoke(unittest.TestCase):
         )
 
 
-# =========================================================================
+# ────────────────────────────────────────────────────────────────────
 # GeoFuse Pipeline Logic Tests
-# =========================================================================
+# ────────────────────────────────────────────────────────────────────
 class TestGeoFuse(unittest.TestCase):
 
     @classmethod

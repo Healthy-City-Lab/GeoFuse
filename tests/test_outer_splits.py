@@ -263,15 +263,13 @@ class TestPosteriorRows(unittest.TestCase):
 def _write_smooth_study(folder: str) -> None:
     """``test_fusion_run``'s study with a smooth NDVI field, so that the
     neighbourhood means the composite reads carry the outcome's signal."""
-    import geopandas as gpd
     import rasterio
     from test_fusion_run import _PX, _X0, _Y0, _write_study
 
     _write_study(folder)
     rows, cols = np.mgrid[0:160, 0:160]
-    field = (
-        0.5 + 0.25 * np.sin(rows / 9.0) + 0.25 * np.cos(cols / 11.0)
-    ).astype("float32")
+    field = 0.5 + 0.25 * np.sin(rows / 9.0) + 0.25 * np.cos(cols / 11.0)
+    field = field.astype("float32")
     path = os.path.join(folder, "ndvi_2015.tif")
     with rasterio.open(path, "r+") as dst:
         dst.write(field, 1)

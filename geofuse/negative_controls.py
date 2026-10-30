@@ -341,9 +341,7 @@ def specificity_contrast(
     def basis(*roles):
         key = tuple(r for r in roles if r in blocks)
         if key not in bases:
-            bases[key], _ = covariate_basis(
-                _with_blocks(cov, _picked(blocks, *key)), n
-            )
+            bases[key], _ = covariate_basis(_with_blocks(cov, _picked(blocks, *key)), n)
         return bases[key]
 
     own = "target" in blocks or "control" in blocks
