@@ -33,7 +33,7 @@ import rasterio
 from geofuse import JobCancelled
 from geofuse import bayesian_index as _bayesian_index
 from geofuse import cgi_formulas as _cgi_formulas
-from geofuse import metric_intake
+from geofuse import metric_intake, parallel
 from geofuse import pdcor as _pdcor_mod
 from geofuse.crs_utils import (
     default_geotiff_creation_options,
@@ -59,6 +59,7 @@ from geofuse.jobs.fusion_outputs import (
     _fusion_stage_weight,
     _jsonsafe_results,
     _log_stage_timing,
+    stage_timing_rows,
     _negative_control_report,
     _posterior_summary,
     _specificity_report,
@@ -1818,6 +1819,8 @@ def run_fusion(
     # Bound before the body so the handlers below can close out the ledger no
     # matter how early a run fails.
     ledger = None
+    # Memory of the job's process tree, read per stage at the end of the run.
+    memory = parallel.MemorySampler().start()
 
     def _close_ledger(status: str, message: str) -> None:
         """Stop the clock on the stage the run died inside, and persist it."""
@@ -3673,6 +3676,9 @@ def run_fusion(
         }
         if not multi_outcome:
             results_payload.update(by_target[sole_label])
+        # Where the run spent its time and memory, as the log reports it.
+        results_payload["stage_timing"] = stage_timing_rows(ledger, memory)
+        results_payload["peak_memory_gb"] = round(memory.peak() / 1e9, 3) or None
 
         # Fusion runs in a spawn child, so live engine objects (unpicklable and
         # large) never cross the process boundary. Ship only the JSON-safe
@@ -3699,7 +3705,7 @@ def run_fusion(
         except Exception as exc:
             _log_fusion("WARN", f"Could not write results bundle JSON: {exc}")
 
-        _log_stage_timing(ledger, _log_fusion)
+        _log_stage_timing(ledger, _log_fusion, memory)
 
         ctx.progress(value=1.0, status_text="Completed")
         return {"output_paths": output_paths}
@@ -3718,6 +3724,7 @@ def run_fusion(
         raise
 
     finally:
+        memory.stop()
         if target_cleanup_dir:
             shutil.rmtree(target_cleanup_dir, ignore_errors=True)
         if target_cleanup_file and os.path.isfile(target_cleanup_file):

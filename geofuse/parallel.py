@@ -290,6 +290,78 @@ def process_worker_count(
 
 
 # ────────────────────────────────────────────────────────────────────
+# Memory of a job's process tree
+# ────────────────────────────────────────────────────────────────────
+
+
+def process_tree_bytes() -> int:
+    """Memory this process and every process it started hold now.
+
+    On Windows the commit charge (private bytes), the figure the commit limit
+    counts; elsewhere resident memory. ``0`` when it cannot be read.
+    """
+    try:
+        import psutil
+    except ImportError:
+        return 0
+    try:
+        me = psutil.Process()
+        procs = [me, *me.children(recursive=True)]
+    except Exception:
+        return 0
+    total = 0
+    for proc in procs:
+        try:
+            info = proc.memory_info()
+        except Exception:
+            continue
+        total += int(getattr(info, "private", 0) or info.rss)
+    return total
+
+
+class MemorySampler:
+    """Samples :func:`process_tree_bytes` on a daemon thread.
+
+    ``peak(start, end)`` is the largest sample between two epoch times (the
+    whole run without them), so a stage's peak is read off its clock.
+    """
+
+    def __init__(self, interval_s: float = 2.0):
+        import threading
+
+        self.interval_s = float(interval_s)
+        self.samples: list[tuple[float, int]] = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="memory-sampler", daemon=True
+        )
+
+    def _run(self) -> None:
+        import time
+
+        while not self._stop.is_set():
+            self.samples.append((time.time(), process_tree_bytes()))
+            self._stop.wait(self.interval_s)
+
+    def start(self) -> MemorySampler:
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5.0)
+
+    def peak(self, start: float | None = None, end: float | None = None) -> int:
+        """Largest sample in ``[start, end]`` (``0`` when there is none)."""
+        vals = [
+            b
+            for t, b in list(self.samples)
+            if (start is None or t >= start) and (end is None or t <= end)
+        ]
+        return max(vals, default=0)
+
+
+# ────────────────────────────────────────────────────────────────────
 # Bulk data hand-off
 # ────────────────────────────────────────────────────────────────────
 

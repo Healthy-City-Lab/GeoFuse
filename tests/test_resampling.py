@@ -12,7 +12,8 @@ inputs and the same resamples:
   dense per-cluster Gram path they had;
 - the batched sweep (:func:`bayesian_index.simplex_fit_batch`, the sweep split,
   the training-|t| pick) against :func:`bayesian_index.simplex_fit` in a loop;
-- the BLAS thread counts of command-line, job and pool processes.
+- the BLAS thread counts of command-line, job and pool processes, and the
+  memory sampler of a job's process tree.
 """
 
 import os
@@ -380,6 +381,32 @@ class ProcessSetupTests(unittest.TestCase):
 
         self.assertEqual(userconfig.LIMIT_DEFAULTS["job_threads"], 4)
         self.assertGreaterEqual(parallel.job_threads(), 1)
+
+    def test_the_memory_sampler_reads_the_tree(self):
+        import time
+
+        sampler = parallel.MemorySampler(interval_s=0.05).start()
+        time.sleep(0.3)
+        sampler.stop()
+        self.assertGreater(sampler.peak(), 0)
+        self.assertEqual(sampler.peak(start=time.time() + 60), 0)
+
+    def test_stage_rows_carry_the_peak(self):
+        from geofuse.jobs.fusion_outputs import stage_timing_rows
+        from geofuse.jobs.stage_ledger import StageLedger
+
+        led = StageLedger.from_steps([("a", "A"), ("b", "B")])
+        led.set_status("a", "running")
+        sampler = parallel.MemorySampler(interval_s=0.05).start()
+        import time
+
+        time.sleep(0.2)
+        led.set_status("a", "done", progress=1.0)
+        sampler.stop()
+        rows = stage_timing_rows(led, sampler)
+        self.assertEqual(rows[0]["key"], "a")
+        self.assertGreater(rows[0]["peak_gb"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

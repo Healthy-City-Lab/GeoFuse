@@ -942,30 +942,60 @@ def write_entity_table(engine: Any, composite_df: pd.DataFrame, stem: str) -> st
     return path
 
 
-def _log_stage_timing(ledger: StageLedger, log: Any) -> None:
-    """Log where the run spent its wall clock, longest stage first.
+def stage_timing_rows(ledger: StageLedger, sampler: Any = None) -> list[dict]:
+    """Every timed stage, longest first: ``key``, ``label``, ``seconds``,
+    ``share`` of the summed stage time, and ``peak_gb``, the largest memory
+    the job's process tree held during the stage (``None`` without a
+    :class:`parallel.MemorySampler`)."""
+    out = []
+    for key, label, secs, share in ledger.timing_report():
+        stage = ledger.get(key)
+        peak = None
+        if sampler is not None and stage is not None:
+            b = sampler.peak(stage.started_at, stage.ended_at)
+            peak = round(b / 1e9, 3) if b else None
+        out.append(
+            {
+                "key": key,
+                "label": label,
+                "seconds": round(float(secs), 3),
+                "share": round(float(share), 4),
+                "peak_gb": peak,
+            }
+        )
+    return out
+
+
+def _log_stage_timing(ledger: StageLedger, log: Any, sampler: Any = None) -> None:
+    """Log where the run spent its wall clock and memory, longest stage first.
 
     Written at the end of a run so tuning decisions rest on this machine's own
     numbers: stage costs shift with core count, disk speed, and how much of the
     greenery cache was reusable, so a breakdown measured elsewhere does not
-    transfer.
+    transfer. With a sampler each stage also shows the peak memory of the
+    job's process tree (commit charge on Windows) and the run its overall peak.
     """
-    rows = ledger.timing_report()
+    rows = stage_timing_rows(ledger, sampler)
     if not rows:
         return
-    total = sum(r[2] for r in rows)
+    total = sum(r["seconds"] for r in rows)
     log("INFO", "====== STAGE WALL-CLOCK BREAKDOWN ======")
     log(
         "INFO",
         f"  accounted {total / 60:.1f} min across {len(rows)} timed stage(s) "
         f"on {os.cpu_count() or '?'} logical core(s).",
     )
-    for key, label, secs, share in rows:
-        if share < 0.005 and secs < 30:
+    if sampler is not None and sampler.peak():
+        peak_gb = sampler.peak() / 1e9
+        log("INFO", f"  peak memory of the job's processes: {peak_gb:.2f} GB")
+    for r in rows:
+        if r["share"] < 0.005 and r["seconds"] < 30:
             continue
+        peak = "" if r["peak_gb"] is None else f"  peak {r['peak_gb']:6.2f} GB"
         log(
             "INFO",
-            f"  {share * 100:5.1f}%  {secs / 60:8.1f} min  {label} ({key})",
+            f"  {r['share'] * 100:5.1f}%  {r['seconds'] / 60:8.1f} min{peak}  "
+            f"{r['label']} ({r['key']})",
         )
 
 
