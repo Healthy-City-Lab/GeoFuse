@@ -359,8 +359,17 @@ Nothing below is pre-specified.
   tests, the slopes, the negative controls and the specificity contrast, on
   every held-out split, but not the tuning. Spatial+ selects the smooth on each
   exposure, KS-AIC on each outcome, and every adjusted slope records the method
-  and the smooth's degrees of freedom. The exposure-response, moderation and
-  AIC / BIC tables control for the covariates only.
+  and the smooth's degrees of freedom. The size of the smooth is chosen by AIC
+  (or BIC) among candidate sizes, by default 0, 1, 2, 3, 4, 6, 8, 11, 15 and 20
+  radial functions per spatial cluster; the run keeps the criterion of every
+  candidate and warns when the largest wins, since a larger smooth might then
+  fit better. The knots and the neighbour graph that splits entities into
+  clusters are settings too. In a paired CGI-vs-exposure test under Spatial+,
+  each exposure is scored with the smooth selected on itself by default, as
+  when it is scored alone, so the paired difference is the difference of the
+  two printed scores; the CGI's smooth for both, one selected on the outcome,
+  or the larger of the two are the alternatives. The exposure-response,
+  moderation and AIC / BIC tables control for the covariates only.
 - Optional collinearity check on the study's own channels (GVI as the sum of
   its components) that reports the channels above a VIF threshold, and
   optionally leaves them out of the search.
@@ -428,6 +437,10 @@ Nothing below is pre-specified.
   fetch remote outputs. A dropped connection reopens on its own.
 - **Sized to the machine.** Thread pools take about a third of the cores;
   process pools take 80 % by default. Override with `GEOFUSE_WORKERS` and
-  `GEOFUSE_CPU_SHARE`. Every run logs a stage-by-stage wall-clock breakdown.
+  `GEOFUSE_CPU_SHARE`. A fusion job runs its own numeric libraries on 4
+  threads (`limits.job_threads`) and its pool workers on one, which bounds what
+  each process reserves. Every run logs a stage-by-stage breakdown of wall
+  clock and peak memory. [PERFORMANCE.md](PERFORMANCE.md) lists every fast
+  path, its speed-up and how closely it reproduces the original result.
 - **Everything on disk, per run.** Each run writes to its own timestamped folder
   so reruns never overwrite earlier results.

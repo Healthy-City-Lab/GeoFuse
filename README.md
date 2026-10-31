@@ -59,6 +59,7 @@ geofuse submit run.toml && geofuse watch
 | [Usage](docs/USAGE.md)                     | Web UI walkthrough and command-line reference (run files, jobs, clusters)        |
 | [Outputs](docs/OUTPUTS.md)                 | All generated files and directory structure                                      |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | Common errors and fixes                                                          |
+| [Performance](docs/PERFORMANCE.md)         | Fast paths, their speed-ups and how closely they reproduce the original results  |
 
 ---
 

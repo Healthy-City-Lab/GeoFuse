@@ -111,7 +111,8 @@ mismatched file is refused, and processed points are skipped.
    choose it by the association you expect, see FEATURES), optional
    spatial-confounding adjustment (a coordinate smooth in the held-out scores,
    paired tests, slopes, negative controls and specificity contrast; the tuning
-   does not use it), test-set size and split seed, the discovery block (channel
+   does not use it; its settings are under **Spatial adjustment — advanced**,
+   see below), test-set size and split seed, the discovery block (channel
    set, index form, sweep splits, radius prior, minimum GVI coverage) with
    validation settings behind an expander (including "Held-out splits", which
    repeats the whole tuning on that many test splits), the CGI grid pixel size (for every target type, rasters
@@ -129,6 +130,42 @@ values**, beside that list, decides what an empty category does: **Drop the
 row** (default, as for a missing numeric covariate) or **Keep as a level of its
 own** (a `<column>=missing` dummy). In a run file it is
 `categorical_missing = "drop"` or `"indicator"`.
+
+### Spatial smooth and spline settings
+
+The spatial smooth compares a list of candidate sizes and keeps the one its
+criterion prefers, or none. A size is the number of radial functions per
+spatial cluster, on top of each cluster's level and linear trend (`0`). When
+the largest candidate wins, the log warns and the results record `at_cap`: a
+larger smooth might fit better, so add larger values (and raise the knots) to
+let the criterion decide. Every selection's criterion values are kept in
+`results_summary.json` (see OUTPUTS). With the default list a spatially
+adjusted run can pick a larger smooth than the runs made before the list
+existed; `spatial_adjust_max_df = 10` repeats those runs exactly.
+
+| Setting (form label) | Default | What it does |
+| --- | --- | --- |
+| `spatial_adjust_df` (**Spatial df candidates**) | `[0, 1, 2, 3, 4, 6, 8, 11, 15, 20]` | Sizes compared, besides no smooth; a list in a run file, `0, 2, 5` in the form, `--spatial-adjust-df 0 2 5` on the command line |
+| `spatial_adjust_max_df` | unset | Older form of the list: every size from 0 to N. Give one or the other |
+| `spatial_adjust_criterion` (**Spatial df criterion**) | `aic` | `bic` penalises size more, so it picks a smaller or equal smooth |
+| `spatial_adjust_eps_m` (**Cluster gap eps**) | 0 (automatic) | Entities farther apart than this fall into different clusters |
+| `spatial_adjust_neighbours` (**Cluster neighbours**) | 10 | With eps automatic, entities linked through this many nearest neighbours form one cluster |
+| `spatial_adjust_knots_min` / `_max` (**Fewest / Most knots per cluster**) | 35 / 150 | Knots of each cluster's smooth; a cluster holds at most `knots_max` radial functions |
+| `spatial_paired_smooth` (**Paired-test smooth**) | `own` | Spatial+ only: the smooth each exposure of a paired CGI-vs-exposure test is scored with, see below |
+| `residualize_spline_df` (**Covariate spline df**) | 4 | Spline size of each continuous covariate when **Covariate residualization** is Spline |
+| `residualize_spline_min_unique` (**Distinct values for a spline**) | 7 | A covariate with fewer distinct values (a code, a dummy) enters linearly |
+| `exposure_response_spline_df` (**Exposure-response spline df**) | 4 | Spline size of the exposure-response curve and its linearity test |
+
+Under Spatial+ the smooth is selected on the exposure, so the CGI and the
+exposure it is compared with (a channel or a comparator) can each have their
+own. `spatial_paired_smooth` decides what a paired test uses: `own` (each
+exposure's own smooth, as when it is scored alone, so the paired difference is
+the difference of the two printed held-out scores), `cgi` (the CGI's smooth for
+both, the behaviour before this setting existed), `outcome` (one smooth
+selected on the outcome given the covariates, the KS-AIC rule) or `max` (the
+larger of the two exposures' sizes for both). Under KS-AIC the smooth is
+selected on the outcome already, so every value behaves as `outcome`, and the
+paired rows record it so.
 
 ### Reading the results panel
 
@@ -177,8 +214,24 @@ See [OUTPUTS.md](OUTPUTS.md) for the folder layout.
 
 ### Performance
 
-Every run logs a stage-by-stage wall-clock breakdown, and parallel phases log
-how many workers were actually busy and what limited the pool.
+Every run logs a stage-by-stage wall-clock breakdown with the peak memory the
+job's processes held during each stage (the commit charge on Windows), and
+parallel phases log how many workers were actually busy and what limited the
+pool. The same breakdown is in `results_summary.json` (`stage_timing`,
+`peak_memory_gb`).
+
+A fusion job runs its own numpy / BLAS on 4 threads (`limits.job_threads`,
+`geofuse config set limits.job_threads 8`): the engine gains little beyond
+four, and each thread's buffers count against the machine's memory. Its process
+pools run one thread per worker and cap GDAL's raster cache at 128 MB per worker
+(set `GDAL_CACHEMAX` to change it). The command's own processes (the
+supervisor, `watch`, `status`, the remote agent) compute nothing heavy and run
+on one thread, a few tens of MB each.
+
+How many fusion studies to run at once (`limits.fusion`) depends on memory:
+each holds about 7 GB at its peak while it pre-aggregates the greenery. On a
+32 GB machine three at once is the measured limit; see
+[PERFORMANCE.md](PERFORMANCE.md) for the figures.
 
 Thread pools take about a third of the cores, because each task is already
 multi-threaded inside numpy. Process pools take 80 % by default and are also
@@ -439,6 +492,7 @@ geofuse config show
 geofuse config set limits.gpu 2              # two GVI jobs at once
 geofuse config set limits.earthengine 3
 geofuse config set limits.max_parallel 6     # jobs the supervisor runs at once
+geofuse config set limits.job_threads 8      # BLAS threads of each fusion job
 ```
 
 ### Results

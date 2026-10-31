@@ -260,6 +260,13 @@ standalone score against the composite's gain and its p-value. Synergy
 interaction terms appear as their own rows with the grid columns blank, since
 an interaction has no spatial scale of its own.
 
+**`results_bundle.json` records where the run spent its time and memory**:
+`stage_timing` lists every timed stage, longest first, with its `seconds`,
+`share` of the summed stage time and `peak_gb`, the largest memory the job's
+processes held during it (the commit charge on Windows), and
+`peak_memory_gb` is the run's overall peak. The job log ends with the same
+breakdown.
+
 **`results_summary.json` records a `config_hash` and a `test_reads` count.** The
 hash identifies the configuration that produced the result, so a pre-registered
 analysis can be shown to be the one that ran. `test_reads` counts distinct
@@ -351,9 +358,21 @@ and linear trends alone, and `none` when the criterion kept no smooth. In
 `spatial_df_cgi` / `spatial_df_exposure` (Spatial+) or `spatial_df_target` /
 `spatial_df_control` (KS-AIC). `outer_summary.csv` names the
 `spatial_method`, and `results_summary.json` keeps a `spatial_adjustment`
-record on each slope. Without spatial adjustment none of these columns
-appear. The tuning never sees the smooth, and the exposure-response,
-moderation and AIC / BIC tables control for the covariates only.
+record on each slope. A slope row also carries `spatial_at_cap`, true when the
+largest candidate size won (a larger smooth might fit better), and its record
+in `results_summary.json` adds `ic`, the criterion value of every size compared
+(`none` is no smooth). The paired rows (`cgi_vs_comparator_paired.csv`, the
+`cgi_minus_channel` / `cgi_minus_comparator` rows of `outer_splits.csv`, and
+`cgi_vs_standalone_paired` in `results_summary.json`) carry `spatial_rule`, the
+`spatial_paired_smooth` rule in force (`own`, `cgi`, `outcome` or `max`), with
+`spatial_df_cgi` and `spatial_df_exposure`, the sizes the two sides were scored
+with. `results_summary.json` holds the run's smoothing under
+`spatial_smoothing`: the candidate sizes, criterion, knots, neighbours and
+cluster gap, the paired rule, the clusters found, and how many of the run's
+selections the largest size won (`selections`, `selections_at_cap`).
+Without spatial adjustment none of these columns or keys appear. The tuning
+never sees the smooth, and the exposure-response, moderation and AIC / BIC
+tables control for the covariates only.
 
 **`negative_control_retune.csv`** appears when the job setting
 `negative_control_retune` is on. The CGI's sweep and posterior are re-run with
