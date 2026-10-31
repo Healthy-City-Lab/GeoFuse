@@ -350,6 +350,114 @@ def simplex_fit(gram: np.ndarray, xty: np.ndarray):
     return best
 
 
+def _inverses(g: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Inverse of every matrix in a stack, and which ones exist.
+
+    One LAPACK call for the stack; a stack holding a singular matrix (whose
+    candidate :func:`simplex_fit` skips) is redone one matrix at a time.
+    """
+    try:
+        return np.linalg.inv(g), np.ones(len(g), dtype=bool)
+    except np.linalg.LinAlgError:
+        out = np.zeros_like(g)
+        ok = np.ones(len(g), dtype=bool)
+        for i, m in enumerate(g):
+            try:
+                out[i] = np.linalg.inv(m)
+            except np.linalg.LinAlgError:
+                ok[i] = False
+        return out, ok
+
+
+def simplex_fit_batch(gram: np.ndarray, xty: np.ndarray, combos) -> tuple:
+    """:func:`simplex_fit` for every candidate column set at once.
+
+    ``combos`` is ``(C, k)`` column indices into ``gram`` / ``xty``. Every
+    active set of one size has the same closed form, so each is solved for all
+    candidates in one batched call, in :func:`simplex_fit`'s order (sign, then
+    active set) and with its strict ``>`` rule, so a candidate keeps the
+    solution the loop would give it up to floating point. Returns
+    ``(found, weights)``: ``(C,)`` booleans and ``(C, k)`` weights in the
+    candidate's own column order, zero where the active set dropped a column.
+    """
+    combos = np.asarray(combos, dtype=np.int64)
+    n_c, k = combos.shape
+    G = gram[combos[:, :, None], combos[:, None, :]]
+    c_all = xty[combos]
+    masks = []
+    for mask in range(1, 1 << k):
+        idx = [i for i in range(k) if mask >> i & 1]
+        g = np.ascontiguousarray(G[:, idx][:, :, idx])
+        gi, ok = _inverses(g)
+        masks.append((idx, g, gi, ok))
+    best_v = np.full(n_c, -np.inf)
+    weights = np.zeros((n_c, k))
+    for sign in (1.0, -1.0):
+        for idx, g, gi, ok in masks:
+            c = sign * c_all[:, idx]
+            one = np.ones(len(idx))
+            ogi = one @ gi
+            denom = ogi @ one
+            good = ok & (np.abs(denom) >= 1e-15)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                lam = (np.einsum("cs,cs->c", ogi, c) - 1.0) / denom
+            w = np.einsum("cst,ct->cs", gi, c - lam[:, None] * one)
+            good &= ~np.any(w < -1e-9, axis=1)
+            quad = np.einsum("cs,cst,ct->c", w, g, w)
+            good &= quad > 1e-15
+            with np.errstate(divide="ignore", invalid="ignore"):
+                v = np.abs(np.einsum("cs,cs->c", w, c_all[:, idx])) / np.sqrt(quad)
+            better = good & (v > best_v)
+            best_v = np.where(better, v, best_v)
+            if better.any():
+                rows = np.flatnonzero(better)
+                weights[rows] = 0.0
+                weights[np.ix_(rows, idx)] = np.clip(w[rows], 0.0, None)
+    return np.isfinite(best_v), weights
+
+
+def _train_t(w, cg, cy, syy, n):
+    """Training |t| of each candidate's index from centred cross-products.
+
+    The correlation of ``Z w`` with ``y`` is ``wᵀ C_zy / √(wᵀ C_zz w · C_yy)``
+    with ``C`` the centred cross-products of the training rows, so the index
+    is never formed row by row. Clipped and scaled as :func:`_tstat`; ``nan``
+    where the index is constant.
+    """
+    num = np.einsum("ck,ck->c", w, cy)
+    den = np.einsum("ck,ckl,cl->c", w, cg, w) * syy
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r = np.clip(num / np.sqrt(den), -0.999999, 0.999999)
+    return np.abs(r) * math.sqrt(max(n - 2, 1)) / np.sqrt(1.0 - r * r)
+
+
+def _centred(ztr: np.ndarray, y: np.ndarray):
+    """Centred Gram, centred cross-products with ``y`` and ``y``'s sum of
+    squares, of the training rows."""
+    zc = ztr - ztr.mean(axis=0)
+    yc = y - y.mean()
+    return zc.T @ zc, zc.T @ yc, float(yc @ yc)
+
+
+def _best_combo(ztr, y, combos):
+    """The candidate with the largest training |t| (first on ties), or ``None``.
+
+    The batched form of the loops in :func:`_discovery_shuffle` and
+    :func:`_gain_split`: every candidate's simplex fit by
+    :func:`simplex_fit_batch`, its training |t| by :func:`_train_t`.
+    """
+    combos = np.asarray(combos, dtype=np.int64)
+    if not len(combos):
+        return None
+    g, c = ztr.T @ ztr, ztr.T @ y
+    found, w = simplex_fit_batch(g, c, combos)
+    cg, cy, syy = _centred(ztr, y)
+    v = _train_t(w, cg[combos[:, :, None], combos[:, None, :]], cy[combos], syy, len(y))
+    v = np.where(found & np.isfinite(v), v, -np.inf)
+    best = int(np.argmax(v))
+    return None if not np.isfinite(v[best]) else tuple(int(i) for i in combos[best])
+
+
 # ────────────────────────────────────────────────────────────────────
 # Synergy form
 # ────────────────────────────────────────────────────────────────────
@@ -495,6 +603,10 @@ def candidate_columns(channels, radius_idx, n_radii, n_stats, stat_idx=None):
     ]
 
 
+# Candidates solved per batch in a sweep split.
+_SWEEP_SLAB = 50_000
+
+
 def _sweep_split(task):
     """One inner split of the linear grid. Runs in its own process.
 
@@ -511,19 +623,22 @@ def _sweep_split(task):
     g_te, c_te = zte.T @ zte, zte.T @ y[te]
     yn = float(np.linalg.norm(y[te]))
     n_te = int(te.sum())
+    combos = np.asarray(combos, dtype=np.int64)
     out = np.zeros(len(combos))
-    for k, combo in enumerate(combos):
-        i = np.asarray(combo)
-        fit = simplex_fit(g_tr[np.ix_(i, i)], c_tr[i])
-        if fit is None:
-            continue
-        sub, w = fit
-        j = i[sub]
-        den = math.sqrt(max(float(w @ g_te[np.ix_(j, j)] @ w), 1e-15))
-        r = float(
-            np.clip(float(w @ c_te[j]) / den / max(yn, 1e-12), -0.999999, 0.999999)
+    # Candidates in slabs: the stacked k x k blocks of every active set stay
+    # small however large the grid.
+    for s in range(0, len(combos), _SWEEP_SLAB):
+        cb = combos[s : s + _SWEEP_SLAB]
+        found, w = simplex_fit_batch(g_tr, c_tr, cb)
+        quad = np.einsum("ck,ckl,cl->c", w, g_te[cb[:, :, None], cb[:, None, :]], w)
+        den = np.sqrt(np.maximum(quad, 1e-15))
+        r = np.clip(
+            np.einsum("ck,ck->c", w, c_te[cb]) / den / max(yn, 1e-12),
+            -0.999999,
+            0.999999,
         )
-        out[k] = abs(r) * math.sqrt(max(n_te - 2, 1)) / math.sqrt(1.0 - r * r)
+        t = np.abs(r) * math.sqrt(max(n_te - 2, 1)) / np.sqrt(1.0 - r * r)
+        out[s : s + _SWEEP_SLAB] = np.where(found, t, 0.0)
     return out
 
 
@@ -1891,18 +2006,7 @@ def _discovery_shuffle(task):
     tr = ~te
     combos = list(itertools.product(*cols_per_channel))
     ztr = np.asarray(z[tr])
-    g_tr, c_tr = ztr.T @ ztr, ztr.T @ y[tr]
-
-    best, best_v = None, -np.inf
-    for combo in combos:
-        i = np.asarray(combo)
-        fit_ = simplex_fit(g_tr[np.ix_(i, i)], c_tr[i])
-        if fit_ is None:
-            continue
-        sub, w = fit_
-        v = _tstat(ztr[:, i[sub]] @ w, y[tr])
-        if v > best_v:
-            best_v, best = v, combo
+    best = _best_combo(ztr, y[tr], combos)
     if best is None:
         return None
 
@@ -2038,28 +2142,25 @@ def _gain_split(task):
     ztr = np.asarray(z[tr])
 
     train_t = {}
+    cg, cy, syy = _centred(ztr, y[tr])
     for ci, single in enumerate(per_channel_cols):
-        best, best_v = None, -np.inf
-        for col in single:
-            v = _tstat(ztr[:, col], y[tr])
-            if v > best_v:
-                best_v, best = v, col
+        # Each column's training |t| from the centred cross-products; the
+        # winner's is recomputed from its rows, which the channel pick reads.
+        single = np.asarray(single, dtype=np.int64)
+        v = _train_t(
+            np.ones((len(single), 1)),
+            cg[single, single][:, None, None],
+            cy[single][:, None],
+            syy,
+            int(tr.sum()),
+        )
+        best = int(single[int(np.argmax(np.where(np.isfinite(v), v, -np.inf)))])
         e = np.asarray(z[:, best])
         out[f"ch{ci}"] = _tstat(e[te], y[te])
-        train_t[f"ch{ci}"] = best_v
+        train_t[f"ch{ci}"] = _tstat(ztr[:, best], y[tr])
 
     combos = list(itertools.product(*cols))
-    g_tr, c_tr = ztr.T @ ztr, ztr.T @ y[tr]
-    best, best_v = None, -np.inf
-    for combo in combos:
-        i = np.asarray(combo)
-        f_ = simplex_fit(g_tr[np.ix_(i, i)], c_tr[i])
-        if f_ is None:
-            continue
-        sub, w = f_
-        v = _tstat(ztr[:, i[sub]] @ w, y[tr])
-        if v > best_v:
-            best_v, best = v, combo
+    best = _best_combo(ztr, y[tr], combos)
     E = form_columns(forms, z, best, design)
     scores = {}
     for form in forms:

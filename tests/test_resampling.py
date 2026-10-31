@@ -1,4 +1,4 @@
-"""Exact fast paths of a fusion study's resampling.
+"""Exact fast paths of a fusion study's resampling and sweep.
 
 Every rewrite is checked against the computation it replaces, on the same
 inputs and the same resamples:
@@ -9,7 +9,9 @@ inputs and the same resamples:
 - the bootstrap, BCa jackknife and Freedman–Lane permutation fast paths of
   :mod:`geofuse.statistical_testing` against their per-replicate loops;
 - the negative-control and specificity statistics with a smooth against the
-  dense per-cluster Gram path they had.
+  dense per-cluster Gram path they had;
+- the batched sweep (:func:`bayesian_index.simplex_fit_batch`, the sweep split,
+  the training-|t| pick) against :func:`bayesian_index.simplex_fit` in a loop.
 """
 
 import os
@@ -23,6 +25,7 @@ if ROOT not in sys.path:
 import geopandas  # noqa: F401  (pyproj before torchvision, see vision.py)
 import numpy as np
 
+from geofuse import bayesian_index as bi
 from geofuse import negative_controls as nc
 from geofuse import objective_scoring as osc
 from geofuse import resampling as rs
@@ -258,6 +261,76 @@ class NegativeControlTests(unittest.TestCase):
             strict=True,
         ):
             self.assertAlmostEqual(got[key], value, places=10, msg=key)
+
+
+class SweepTests(unittest.TestCase):
+    def setUp(self):
+        rng = np.random.default_rng(6)
+        self.n, self.p = 400, 18
+        Z = rng.normal(size=(self.n, self.p)) + rng.normal(size=(self.n, 1))
+        Z[:, 5] = Z[:, 4]  # a duplicated column: singular active sets
+        self.Z = (Z - Z.mean(0)) / Z.std(0)
+        self.y = 0.2 * Z[:, 2] - 0.1 * Z[:, 9] + rng.normal(size=self.n)
+        self.combos = np.array(
+            [(a, b, c) for a in range(6) for b in range(6, 12) for c in range(12, 18)]
+            + [(4, 5, 12)]
+        )
+
+    def test_batch_equals_the_loop(self):
+        g, c = self.Z.T @ self.Z, self.Z.T @ self.y
+        found, w = bi.simplex_fit_batch(g, c, self.combos)
+        for k, combo in enumerate(self.combos):
+            fit = bi.simplex_fit(g[np.ix_(combo, combo)], c[combo])
+            self.assertEqual(found[k], fit is not None)
+            if fit is None:
+                continue
+            want = np.zeros(3)
+            want[fit[0]] = fit[1]
+            np.testing.assert_allclose(w[k], want, atol=1e-12)
+
+    def test_sweep_split_equals_the_loop(self):
+        import math
+        import tempfile
+
+        fd, path = tempfile.mkstemp()
+        os.close(fd)
+        try:
+            mm = np.memmap(path, dtype=np.float64, mode="w+", shape=self.Z.shape)
+            mm[:] = self.Z
+            mm.flush()
+            del mm
+            task = (path, self.Z.shape, self.combos.tolist(), self.y, 7, 0.25, None)
+            got = bi._sweep_split(task)
+        finally:
+            os.unlink(path)
+        te = bi._holdout(self.n, 7, 0.25)
+        tr, ztr, zte = ~te, self.Z[~te], self.Z[te]
+        g_tr, c_tr = ztr.T @ ztr, ztr.T @ self.y[tr]
+        g_te, c_te = zte.T @ zte, zte.T @ self.y[te]
+        yn = float(np.linalg.norm(self.y[te]))
+        for k, combo in enumerate(self.combos):
+            fit = bi.simplex_fit(g_tr[np.ix_(combo, combo)], c_tr[combo])
+            if fit is None:
+                self.assertEqual(got[k], 0.0)
+                continue
+            j = combo[fit[0]]
+            w = fit[1]
+            den = math.sqrt(max(float(w @ g_te[np.ix_(j, j)] @ w), 1e-15))
+            r = float(np.clip(w @ c_te[j] / den / yn, -0.999999, 0.999999))
+            want = abs(r) * math.sqrt(te.sum() - 2) / math.sqrt(1 - r * r)
+            self.assertAlmostEqual(got[k], want, places=12)
+
+    def test_training_pick_equals_the_loop(self):
+        best, best_v = None, -np.inf
+        g, c = self.Z.T @ self.Z, self.Z.T @ self.y
+        for combo in self.combos:
+            fit = bi.simplex_fit(g[np.ix_(combo, combo)], c[combo])
+            if fit is None:
+                continue
+            v = bi._tstat(self.Z[:, combo[fit[0]]] @ fit[1], self.y)
+            if v > best_v:
+                best_v, best = v, tuple(int(i) for i in combo)
+        self.assertEqual(bi._best_combo(self.Z, self.y, self.combos), best)
 
 
 if __name__ == "__main__":
