@@ -196,7 +196,22 @@ def _spatial_lines(bundle: dict) -> list[str]:
     if record is not None:
         df = record.get("df")
         line += f" (held-out β: df {'none' if df is None else df})"
-    return [line]
+    lines = [line]
+    smoothing = bundle.get("spatial_smoothing") or {}
+    if smoothing.get("candidates"):
+        text = (
+            f"  Spatial df       {smoothing.get('criterion', 'aic').upper()} over "
+            f"{', '.join(str(d) for d in smoothing['candidates'])}"
+        )
+        if smoothing.get("selections"):
+            text += (
+                f"; the largest won {smoothing.get('selections_at_cap', 0)} of "
+                f"{smoothing['selections']} selections"
+            )
+        if smoothing.get("method") == "spatial_plus" and smoothing.get("paired_smooth"):
+            text += f"; paired tests: {smoothing['paired_smooth']}"
+        lines.append(text)
+    return lines
 
 
 def _posterior_lines(summary: list[dict]) -> list[str]:

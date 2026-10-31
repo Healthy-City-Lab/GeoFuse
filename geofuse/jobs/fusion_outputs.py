@@ -835,6 +835,13 @@ def _write_fusion_outputs(
         # guarantee it spent.
         "config_hash": (cgi_bundle or {}).get("config_hash"),
         "test_reads": (cgi_bundle or {}).get("test_reads"),
+        # The smooth's settings and selections; absent without spatial
+        # adjustment, so an unadjusted run's summary is unchanged.
+        **(
+            {"spatial_smoothing": cgi_bundle["spatial_smoothing"]}
+            if (cgi_bundle or {}).get("spatial_smoothing")
+            else {}
+        ),
         "studies": studies_manifest,
         "cgi_vs_standalone_aic_bic": aic_bic,
         "cgi_vs_standalone_paired": (

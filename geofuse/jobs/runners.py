@@ -1368,6 +1368,40 @@ def _build_fusion_study_name(
     return _STUDY_NAME_UNSAFE.sub("_", raw).strip("_") or "fusion_study"
 
 
+def _spatial_df_list(
+    spatial_adjust_df: "list[int] | None", spatial_adjust_max_df: "int | None"
+) -> list[int]:
+    """The df list a run compares: the older ``max_df`` N as ``0 … N``, else
+    ``spatial_adjust_df``, else the default list."""
+    from geofuse import spatial_basis
+
+    if spatial_adjust_max_df is not None:
+        if spatial_adjust_df is not None:
+            raise ValueError(
+                "Give spatial_adjust_df or the older spatial_adjust_max_df, not both."
+            )
+        return list(range(0, max(1, int(spatial_adjust_max_df)) + 1))
+    if spatial_adjust_df is not None:
+        return sorted({int(d) for d in spatial_adjust_df})
+    return list(spatial_basis.DEFAULT_DF_CANDIDATES)
+
+
+def _non_default_options(values: dict) -> dict:
+    """``values`` without the smoothing settings at the engine's defaults."""
+    from geofuse import exposure_response, objective_scoring, spatial_basis
+
+    defaults = {
+        "spatial_adjust_criterion": spatial_basis.CRITERIA[0],
+        "spatial_adjust_neighbours": spatial_basis.DEFAULT_NEIGHBOURS,
+        "spatial_adjust_knots_min": spatial_basis.DEFAULT_KNOTS_MIN,
+        "spatial_adjust_knots_max": spatial_basis.DEFAULT_KNOTS_MAX,
+        "residualize_spline_df": objective_scoring.SPLINE_DF,
+        "residualize_spline_min_unique": objective_scoring.SPLINE_MIN_UNIQUE,
+        "exposure_response_spline_df": exposure_response.SPLINE_DF,
+    }
+    return {k: v for k, v in values.items() if v != defaults[k]}
+
+
 def _fusion_config_fingerprint(
     *,
     buffer_meters: float,
@@ -1388,8 +1422,11 @@ def _fusion_config_fingerprint(
     spatial_block_size_m: float | None = None,
     n_spatial_blocks: int | None = None,
     spatial_adjust_method: str = "none",
-    spatial_adjust_max_df: int = 10,
+    spatial_adjust_max_df: int | None = None,
     spatial_adjust_eps_m: float | None = None,
+    spatial_adjust_df: list[int] | None = None,
+    spatial_options: dict | None = None,
+    residualize_options: dict | None = None,
     gvi_ladder_spacing: str = "linear",
     gvi_ladder_rungs: int = 15,
     ndvi_ladder_spacing: str = "linear",
@@ -1409,8 +1446,17 @@ def _fusion_config_fingerprint(
     Anything that affects which params are suggested or which entities are
     sampled lives here; purely cosmetic knobs (standalone toggle, bootstrap
     counts) are excluded so they don't fragment the per-job caches.
+    ``spatial_options`` / ``residualize_options`` hold the smoothing settings
+    that differ from their defaults (:func:`_non_default_options`), so a run
+    at the defaults keeps its hash.
     """
     import hashlib as _hl
+
+    dfs = _spatial_df_list(spatial_adjust_df, spatial_adjust_max_df)
+    # A df list 0 … N is the older ``max_df`` N, so it keeps that hash.
+    df_text = str(dfs[-1]) if dfs == list(range(dfs[-1] + 1)) else ",".join(
+        str(d) for d in dfs
+    )
 
     payload = "|".join(
         [
@@ -1447,12 +1493,14 @@ def _fusion_config_fingerprint(
         # cache; only appended when on so legacy runs keep their hash.
         + (
             [
-                f"spadj:{spatial_adjust_method}@{int(spatial_adjust_max_df)}@"
+                f"spadj:{spatial_adjust_method}@{df_text}@"
                 f"{spatial_adjust_eps_m if spatial_adjust_eps_m is not None else 'auto'}"
             ]
+            + [f"{k}:{v}" for k, v in sorted((spatial_options or {}).items())]
             if spatial_adjust_method and spatial_adjust_method != "none"
             else []
         )
+        + [f"{k}:{v}" for k, v in sorted((residualize_options or {}).items())]
         # Categorical covariates change the design matrix (one-hot dummies), so
         # they split the cache; only appended when any covariate is categorical
         # so legacy (all-numeric) runs keep their hash.
@@ -1676,9 +1724,18 @@ def run_fusion(
     whole_grid_scaling: bool = False,
     area_balanced_split: bool = False,
     spatial_adjust_method: str = "none",
-    spatial_adjust_max_df: int = 10,
+    spatial_adjust_max_df: int | None = None,
     spatial_adjust_eps_m: float | None = None,
+    spatial_adjust_df: list[int] | None = None,
+    spatial_adjust_criterion: str = "aic",
+    spatial_adjust_neighbours: int = 10,
+    spatial_adjust_knots_min: int = 35,
+    spatial_adjust_knots_max: int = 150,
+    spatial_paired_smooth: str = "own",
     residualize_method: str = "linear",
+    residualize_spline_df: int = 4,
+    residualize_spline_min_unique: int = 7,
+    exposure_response_spline_df: int = 4,
     search_scoring_method: str = "mom_em3",
     channel_set: str = "",
     index_form: str = "sweep",
@@ -1885,6 +1942,38 @@ def run_fusion(
         )
         ctx.update_stage_ledger(ledger.to_dict())
 
+        # Smoothing settings: recorded when they act (a spatially adjusted run,
+        # spline residualizing) or differ from their default, so a run without
+        # them keeps its record and hash.
+        spatial_dfs = _spatial_df_list(spatial_adjust_df, spatial_adjust_max_df)
+        spatial_settings = {
+            "spatial_adjust_criterion": str(spatial_adjust_criterion),
+            "spatial_adjust_neighbours": int(spatial_adjust_neighbours),
+            "spatial_adjust_knots_min": int(spatial_adjust_knots_min),
+            "spatial_adjust_knots_max": int(spatial_adjust_knots_max),
+        }
+        spatial_record: dict[str, Any] = {}
+        if spatial_adjust_method and spatial_adjust_method != "none":
+            spatial_record = {
+                "spatial_adjust_method": str(spatial_adjust_method),
+                "spatial_adjust_df": list(spatial_dfs),
+                "spatial_adjust_eps_m": spatial_adjust_eps_m,
+                **spatial_settings,
+                "spatial_paired_smooth": str(spatial_paired_smooth),
+            }
+        spline_settings = {
+            "residualize_spline_df": int(residualize_spline_df),
+            "residualize_spline_min_unique": int(residualize_spline_min_unique),
+        }
+        spline_record: dict[str, Any] = (
+            dict(spline_settings) if residualize_method == "spline" else {}
+        )
+        spline_record.update(
+            _non_default_options(
+                {"exposure_response_spline_df": int(exposure_response_spline_df)}
+            )
+        )
+
         # Settings snapshot written verbatim into each job's ``study_results``
         # so the run is reproducible from disk (the job store records the same
         # config, but the JSON travels with the artifacts). Secrets and
@@ -1893,6 +1982,7 @@ def run_fusion(
         run_config_record: dict[str, Any] = {
             "objective_metric": objective_metric,
             "residualize_method": str(residualize_method),
+            **spline_record,
             "search_scoring_method": str(search_scoring_method),
             "cgi_formula": cgi_formula,
             "channel_set": channel_set,
@@ -1951,6 +2041,7 @@ def run_fusion(
             "negative_control_retune": bool(negative_control_retune),
             # Only when on: off, the record and its hash match a run without it.
             **({"specificity_contrast": True} if specificity_contrast else {}),
+            **spatial_record,
             "comparators": list(comparator_cols),
             "comparators_primary": list(primary_cols),
             "report_paired_bootstrap": int(report_paired_bootstrap),
@@ -2145,9 +2236,17 @@ def run_fusion(
                 whole_grid_scaling=whole_grid_scaling,
                 area_balanced_split=area_balanced_split,
                 spatial_adjust_method=spatial_adjust_method,
-                spatial_adjust_max_df=spatial_adjust_max_df,
+                spatial_adjust_df=spatial_dfs,
                 spatial_adjust_eps_m=spatial_adjust_eps_m,
+                spatial_adjust_criterion=str(spatial_adjust_criterion),
+                spatial_adjust_neighbours=int(spatial_adjust_neighbours),
+                spatial_adjust_knots_min=int(spatial_adjust_knots_min),
+                spatial_adjust_knots_max=int(spatial_adjust_knots_max),
+                spatial_paired_smooth=str(spatial_paired_smooth),
                 residualize_method=residualize_method,
+                residualize_spline_df=int(residualize_spline_df),
+                residualize_spline_min_unique=int(residualize_spline_min_unique),
+                exposure_response_spline_df=int(exposure_response_spline_df),
                 search_scoring_method=search_scoring_method,
                 negative_control_columns=outcome_ncs,
                 comparator_columns=outcome_cmps,
@@ -2501,8 +2600,14 @@ def run_fusion(
                 spatial_block_size_m=spatial_block_size_m,
                 n_spatial_blocks=n_spatial_blocks,
                 spatial_adjust_method=spatial_adjust_method,
-                spatial_adjust_max_df=spatial_adjust_max_df,
+                spatial_adjust_df=spatial_dfs,
                 spatial_adjust_eps_m=spatial_adjust_eps_m,
+                spatial_options=_non_default_options(spatial_settings),
+                residualize_options=(
+                    _non_default_options(spline_settings)
+                    if residualize_method == "spline"
+                    else None
+                ),
                 gvi_ladder_spacing=gvi_ladder_spacing,
                 gvi_ladder_rungs=int(gvi_ladder_rungs),
                 ndvi_ladder_spacing=ndvi_ladder_spacing,
@@ -3474,6 +3579,9 @@ def run_fusion(
                 "negative_controls": negative_control_report,
                 # The spatial blocks the held-out split used, ``None`` without.
                 "spatial_split": getattr(engine, "_spatial_split_report", None),
+                # The smooth's settings and how its df selections went,
+                # ``None`` without spatial adjustment.
+                "spatial_smoothing": engine.spatial_selection_report(),
                 # Comparator exposures, the CGI's row on the same scale, and
                 # the paired CGI − comparator family.
                 "comparators": comparators_report,
