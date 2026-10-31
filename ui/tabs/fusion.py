@@ -2846,6 +2846,15 @@ def _spatial_cell(entry: dict) -> dict:
     return {"Spatial smooth": label} if label else {}
 
 
+def _paired_smooth_label(row: dict) -> str:
+    """A paired row's smooths as text: the rule, then each side's df."""
+    record = row.get("spatial_adjustment") or {}
+    label = spatial_label(record)
+    if not label:
+        return "—"
+    return f"{record.get('rule')}: {label}" if record.get("rule") else label
+
+
 def _comparator_rows(results_view: dict) -> list[dict]:
     """One table row per exposure: the CGI, then each comparator."""
     comparators = results_view.get("comparators") or {}
@@ -2876,6 +2885,8 @@ def _comparator_rows(results_view: dict) -> list[dict]:
             "" if c is None else f"[{_fmt(p.get('lower'))}, {_fmt(p.get('upper'))}]"
         )
         row["Δ p"] = "" if c is None else _fmt(p.get("p_value"), 4)
+        if spatial:
+            row["Δ spatial smooth"] = _paired_smooth_label(p) if c else ""
         if c is None:
             row["Holm p"] = ""
         elif p.get("descriptive"):
@@ -5334,6 +5345,11 @@ def _render_cross_study_comparison(results_view: dict, metric_name: str) -> None
                     "p (one-sided)": f"{float(pr):.3g}" if pr is not None else None,
                     "p (Holm)": f"{float(ph):.3g}" if ph is not None else None,
                     "Verdict": d.get("verdict"),
+                    **(
+                        {"Δ spatial smooth": _paired_smooth_label(d)}
+                        if d.get("spatial_adjustment")
+                        else {}
+                    ),
                 }
             )
         st.dataframe(pd.DataFrame(fam_rows), width="stretch")
