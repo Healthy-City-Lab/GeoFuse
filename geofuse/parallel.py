@@ -329,6 +329,17 @@ def attach_array(path: str) -> Any:
 # ~0.11 GB. The reservation counts against the system commit limit even though
 # it is never touched, so an unpinned pool of 16 asks the OS for ~48 GB before
 # it computes anything, and allocations start failing machine-wide.
+# GDAL's raster block cache, per worker. Left at its default it grows toward 5 %
+# of the host's RAM in every worker reading a raster window by window — a
+# national mosaic's pre-aggregation measured 1.26 GB per worker — and each
+# window is read for a handful of nearby entities, so a small cache serves it
+# as well (measured: no slower at 64 MB).
+_GDAL_CACHE = "GDAL_CACHEMAX"
+_WORKER_GDAL_CACHE_MB = "128"
+
+# Names the thread variables a job's parent set for it (see ``job_thread_env``).
+_JOB_THREAD_VARS = "GEOFUSE_JOB_THREAD_VARS"
+
 _PINNED_THREAD_VARS = (
     "OMP_NUM_THREADS",
     "OPENBLAS_NUM_THREADS",
@@ -350,9 +361,11 @@ def _pinned_child_env() -> Iterator[None]:
     change what BLAS reserves. The parent's own numpy was initialised long ago
     and re-reads nothing, so setting them here does not affect it.
     """
-    previous = {var: os.environ.get(var) for var in _PINNED_THREAD_VARS}
+    names = (*_PINNED_THREAD_VARS, _GDAL_CACHE)
+    previous = {var: os.environ.get(var) for var in names}
     for var in _PINNED_THREAD_VARS:
         os.environ.setdefault(var, "1")
+    os.environ.setdefault(_GDAL_CACHE, _WORKER_GDAL_CACHE_MB)
     try:
         yield
     finally:
@@ -361,6 +374,60 @@ def _pinned_child_env() -> Iterator[None]:
                 os.environ.pop(var, None)
             else:
                 os.environ[var] = value
+
+
+@contextlib.contextmanager
+def job_thread_env(threads: int | None) -> Iterator[None]:
+    """The BLAS / OpenMP thread variables a job process is created with.
+
+    ``threads`` sets every variable to that count; ``None`` removes the ones
+    the ``geofuse`` command pinned at start-up (``geofuse._BLAS_PINNED``), so
+    the job sizes its libraries for the host as it would started anywhere
+    else. Like :func:`_pinned_child_env`, it has to surround the process's
+    creation: a spawned child reads them as numpy loads. The job calls
+    :func:`release_job_threads` once its libraries are loaded, so its own
+    pools still pin their workers to one thread.
+    """
+    import geofuse
+
+    names = _PINNED_THREAD_VARS if threads is not None else geofuse._BLAS_PINNED
+    previous = {var: os.environ.get(var) for var in (*names, _JOB_THREAD_VARS)}
+    for var in names:
+        if threads is None:
+            os.environ.pop(var, None)
+        else:
+            os.environ[var] = str(int(threads))
+    if threads is not None:
+        os.environ[_JOB_THREAD_VARS] = ",".join(names)
+    try:
+        yield
+    finally:
+        for var, value in previous.items():
+            if value is None:
+                os.environ.pop(var, None)
+            else:
+                os.environ[var] = value
+
+
+def release_job_threads() -> None:
+    """Drop the thread counts :func:`job_thread_env` gave this process.
+
+    Called by a job once numpy is loaded (its BLAS has read them by then), so
+    a pool it starts pins every worker to one thread instead of inheriting the
+    job's count; a value the user set themselves is left alone.
+    """
+    for var in filter(None, os.environ.pop(_JOB_THREAD_VARS, "").split(",")):
+        os.environ.pop(var, None)
+
+
+def job_threads() -> int:
+    """BLAS threads of a fusion job process (``[limits] job_threads``)."""
+    from geofuse import userconfig
+
+    try:
+        return int(userconfig.load().limits["job_threads"])
+    except (userconfig.ConfigError, KeyError, ValueError):
+        return int(userconfig.LIMIT_DEFAULTS["job_threads"])
 
 
 def worker_setup(
@@ -376,6 +443,7 @@ def worker_setup(
     """
     for var in _PINNED_THREAD_VARS:
         os.environ.setdefault(var, "1")
+    os.environ.setdefault(_GDAL_CACHE, _WORKER_GDAL_CACHE_MB)
     try:
         from geofuse.jobs.subprocess_runner import exit_with_parent
 

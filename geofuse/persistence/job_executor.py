@@ -232,7 +232,15 @@ class JobExecutor:
 
             try:
                 try:
-                    proc.start()
+                    # A fusion job runs its BLAS on a few threads: the engine
+                    # gains little past four, and each thread's buffers count
+                    # against the commit limit. Other jobs size their own.
+                    from geofuse import parallel
+
+                    fusion = record.type == "fusion"
+                    threads = parallel.job_threads() if fusion else None
+                    with parallel.job_thread_env(threads):
+                        proc.start()
                 except Exception as exc:  # noqa: BLE001
                     self._store.transition(
                         record.id,

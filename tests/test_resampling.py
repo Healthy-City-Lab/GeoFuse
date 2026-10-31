@@ -1,4 +1,4 @@
-"""Exact fast paths of a fusion study's resampling and sweep.
+"""Exact fast paths of a fusion study's resampling, sweep and worker set-up.
 
 Every rewrite is checked against the computation it replaces, on the same
 inputs and the same resamples:
@@ -11,11 +11,14 @@ inputs and the same resamples:
 - the negative-control and specificity statistics with a smooth against the
   dense per-cluster Gram path they had;
 - the batched sweep (:func:`bayesian_index.simplex_fit_batch`, the sweep split,
-  the training-|t| pick) against :func:`bayesian_index.simplex_fit` in a loop.
+  the training-|t| pick) against :func:`bayesian_index.simplex_fit` in a loop;
+- the BLAS thread counts of command-line, job and pool processes.
 """
 
 import os
+import subprocess
 import sys
+import textwrap
 import unittest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -28,6 +31,7 @@ import numpy as np
 from geofuse import bayesian_index as bi
 from geofuse import negative_controls as nc
 from geofuse import objective_scoring as osc
+from geofuse import parallel
 from geofuse import resampling as rs
 from geofuse import spatial_basis as sb
 from geofuse import statistical_testing as st
@@ -332,6 +336,50 @@ class SweepTests(unittest.TestCase):
                 best_v, best = v, tuple(int(i) for i in combo)
         self.assertEqual(bi._best_combo(self.Z, self.y, self.combos), best)
 
+
+class ProcessSetupTests(unittest.TestCase):
+    def _env_after_import(self, argv0: str) -> str:
+        code = textwrap.dedent(
+            f"""
+            import os, sys
+            sys.argv = [{argv0!r}]
+            os.environ.pop("OPENBLAS_NUM_THREADS", None)
+            import geofuse
+            print(os.environ.get("OPENBLAS_NUM_THREADS"))
+            """
+        )
+        env = {k: v for k, v in os.environ.items() if k != "OPENBLAS_NUM_THREADS"}
+        out = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        return out.stdout.strip()
+
+    def test_command_line_processes_pin_blas(self):
+        self.assertEqual(self._env_after_import("-m"), "1")
+        self.assertEqual(self._env_after_import("geofuse.exe"), "1")
+        self.assertEqual(self._env_after_import("streamlit"), "None")
+
+    def test_a_job_gets_its_count_and_hands_none_to_its_pools(self):
+        before = {v: os.environ.get(v) for v in parallel._PINNED_THREAD_VARS}
+        with parallel.job_thread_env(4):
+            self.assertEqual(os.environ["OPENBLAS_NUM_THREADS"], "4")
+            parallel.release_job_threads()
+            self.assertNotIn("OPENBLAS_NUM_THREADS", os.environ)
+            with parallel._pinned_child_env():
+                self.assertEqual(os.environ["OPENBLAS_NUM_THREADS"], "1")
+                self.assertEqual(os.environ["GDAL_CACHEMAX"], "128")
+        after = {v: os.environ.get(v) for v in parallel._PINNED_THREAD_VARS}
+        self.assertEqual(before, after)
+
+    def test_the_job_thread_count_is_a_limit(self):
+        from geofuse import userconfig
+
+        self.assertEqual(userconfig.LIMIT_DEFAULTS["job_threads"], 4)
+        self.assertGreaterEqual(parallel.job_threads(), 1)
 
 if __name__ == "__main__":
     unittest.main()

@@ -14,6 +14,7 @@
     earthengine = 2
     fusion = 1
     idle_minutes = 10
+    job_threads = 4                     # BLAS threads of each fusion job
 
     [credentials]
     store = "auto"                      # auto | keyring | file
@@ -42,8 +43,9 @@ from pathlib import Path
 from typing import Any
 
 #: Resource classes capped on one machine, and their defaults. ``max_parallel``
-#: and ``idle_minutes`` govern the supervisor; the rest are slots that GUI and
-#: command-line jobs share (``geofuse.jobs.locks``).
+#: and ``idle_minutes`` govern the supervisor, ``job_threads`` the BLAS threads
+#: of each fusion job process; the rest are slots that GUI and command-line
+#: jobs share (``geofuse.jobs.locks``).
 LIMIT_DEFAULTS: dict[str, int] = {
     "max_parallel": 4,
     "gpu": 1,
@@ -51,6 +53,7 @@ LIMIT_DEFAULTS: dict[str, int] = {
     "earthengine": 2,
     "fusion": 1,
     "idle_minutes": 10,
+    "job_threads": 4,
 }
 #: Where credentials are kept: the OS keyring when one works, or a file.
 CREDENTIAL_STORES = ("auto", "keyring", "file")
