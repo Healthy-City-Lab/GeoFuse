@@ -7824,7 +7824,7 @@ class MetricFusionEngine:
         standard errors on a panel — so no table counts one entity's waves as
         independent evidence.
         Pass ``iqr`` to pin the scaling constant, e.g.
-        ``exposure_response.CLSA_NDVI_IQR`` when the point is to land on a
+        ``exposure_response.REFERENCE_NDVI_IQR`` when the point is to land on a
         published NDVI number.
 
         Estimates, contrasts and the curve use every row and are descriptive;

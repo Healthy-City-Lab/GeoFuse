@@ -73,9 +73,8 @@ CROSS_SECTIONAL_METRICS: tuple[str, ...] = (
     "mutual_info",
     "quartile_contrast",
     # Binary outcome, single measurement per entity: plain logistic regression.
-    # A year-keyed cross-sectional study with a dichotomous outcome is exactly
-    # the design of the published CLSA greenspace papers, so it has to be
-    # expressible without dragging in the panel machinery.
+    # A year-keyed cross-sectional study with a dichotomous outcome is a common
+    # cohort design, so it has to be expressible without the panel machinery.
     "logit_tstat",
     "logit_coef",
 )

@@ -90,6 +90,18 @@ class ValidationTests(unittest.TestCase):
                 presets.validate(presets.read_preset(entry.path), engine)
                 self.assertNotRegex(entry.description, "(?i)canue|clsa")
 
+    def test_engine_sources_name_no_dataset(self):
+        package = os.path.join(ROOT, "geofuse")
+        for folder, _, files in os.walk(package):
+            for name in files:
+                if not name.endswith((".py", ".toml", ".json", ".tcss")):
+                    continue
+                path = os.path.join(folder, name)
+                with open(path, encoding="utf-8") as handle:
+                    text = handle.read()
+                with self.subTest(path=os.path.relpath(path, ROOT)):
+                    self.assertNotRegex(text, "(?i)canue|clsa")
+
     def test_the_landsat_preset_matches_its_description(self):
         s = presets.load_settings("ndvi", "Landsat TOA, all scenes, water-masked")
         self.assertEqual(
