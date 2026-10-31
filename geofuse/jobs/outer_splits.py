@@ -84,12 +84,15 @@ def _slope_p(slope: dict) -> float | None:
 
 
 def spatial_columns(record: dict | None) -> dict:
-    """A ``spatial_adjustment`` record as flat columns: ``spatial_method`` and
+    """A ``spatial_adjustment`` record as flat columns: ``spatial_method``,
     one ``spatial_df…`` per smooth, as text (``"none"`` where no smooth was
-    used, so a table column never mixes numbers with blanks). Empty without a
-    record."""
+    used, so a table column never mixes numbers with blanks), and
+    ``spatial_at_cap``. The criterion profile (``ic``) stays in the results
+    bundle. Empty without a record."""
     out = {}
     for key, value in (record or {}).items():
+        if isinstance(value, dict | list):
+            continue
         if key.startswith("df"):
             value = "none" if value is None else str(value)
         out[f"spatial_{key}"] = value

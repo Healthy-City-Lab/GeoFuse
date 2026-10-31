@@ -155,6 +155,10 @@ _METHODS = (
     "_test_entity_mask",
     "_whole_data_coords",
     "_spatial_smooth",
+    "_spatial_selection",
+    "_spatial_candidates",
+    "_selection_record",
+    "_count_selection",
     "_reporting_smooth",
     "_slope_smooths",
     "compute_partial_slopes",
@@ -223,9 +227,15 @@ def _engine(method="spatial_plus", n_ent=600, n_test=300, seed=11, effect=0.0):
         _active_greenery_channel="cgi",
         spatial_adjust_method=method,
         spatial_adjust_max_df=10,
+        spatial_adjust_df=tuple(range(11)),
+        spatial_adjust_criterion="aic",
+        spatial_adjust_neighbours=10,
+        spatial_adjust_knots_min=35,
+        spatial_adjust_knots_max=150,
         spatial_adjust_eps_m=None,
         _spatial_basis_cache={},
         _spatial_adjust_summary=None,
+        _spatial_selections={"n": 0, "at_cap": 0},
     )
     eng.apply_fusion = lambda weights=None: frames[eng._active_greenery_channel]
     eng._full_data_frame = lambda: full

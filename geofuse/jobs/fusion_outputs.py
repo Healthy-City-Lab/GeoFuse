@@ -1191,7 +1191,7 @@ def _direction_sign(engine: Any, params: dict, metric: str) -> int:
                 cov,
                 spatial_basis=res.get("spatial_basis"),
                 spatial_method=getattr(engine, "spatial_adjust_method", "none"),
-                residualize_method=getattr(engine, "residualize_method", "linear"),
+                **getattr(engine, "_residualize_options", {}),
             )
         )
     except Exception:

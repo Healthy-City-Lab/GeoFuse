@@ -158,6 +158,11 @@ PAIRED_HEADLINE_KEYS = (
 )
 
 
+#: Which smooth each exposure of a paired CGI-vs-exposure test is scored with
+#: under ``spatial_plus`` (see ``MetricFusionEngine._paired_difference_on``).
+SPATIAL_PAIRED_SMOOTHS: tuple[str, ...] = ("own", "cgi", "outcome", "max")
+
+
 def comparator_mode(column: str) -> str:
     """The active-channel name that scores target ``column`` as the exposure.
 
@@ -207,7 +212,7 @@ class MetricFusionEngine:
         whole_grid_scaling: bool = False,
         area_balanced_split: bool = False,
         spatial_adjust_method: str = "none",
-        spatial_adjust_max_df: int = 10,
+        spatial_adjust_max_df: int | None = None,
         spatial_adjust_eps_m: float | None = None,
         residualize_method: str = "linear",
         search_scoring_method: str = "mom_em3",
@@ -224,6 +229,15 @@ class MetricFusionEngine:
         drop_collinear_channels: bool = False,
         categorical_missing: str = "drop",
         comparator_columns: list[str] | None = None,
+        spatial_adjust_df: "list[int] | tuple[int, ...] | None" = None,
+        spatial_adjust_criterion: str = "aic",
+        spatial_adjust_neighbours: int = spatial_basis.DEFAULT_NEIGHBOURS,
+        spatial_adjust_knots_min: int = spatial_basis.DEFAULT_KNOTS_MIN,
+        spatial_adjust_knots_max: int = spatial_basis.DEFAULT_KNOTS_MAX,
+        spatial_paired_smooth: str = "own",
+        residualize_spline_df: int = objective_scoring.SPLINE_DF,
+        residualize_spline_min_unique: int = objective_scoring.SPLINE_MIN_UNIQUE,
+        exposure_response_spline_df: int = exposure_response.SPLINE_DF,
     ):
         """
         Initialize the fusion engine.
@@ -293,6 +307,29 @@ class MetricFusionEngine:
                 an entity; scored through :func:`comparator_mode`. A column
                 that is the outcome, a covariate or a negative control is
                 refused.
+            spatial_adjust_df: radial df per spatial cluster the criterion
+                compares, besides no smooth (``0`` = cluster intercepts and
+                linear trends only). ``None`` gives
+                :data:`spatial_basis.DEFAULT_DF_CANDIDATES`, or every df
+                ``0 … spatial_adjust_max_df`` when that older form is given;
+                giving both is refused.
+            spatial_adjust_criterion: ``"aic"`` or ``"bic"``, for both the
+                KS-AIC (outcome) and Spatial+ (exposure) selections.
+            spatial_adjust_neighbours / spatial_adjust_knots_min /
+                spatial_adjust_knots_max: the k-NN graph that splits entities
+                into spatial clusters (when ``spatial_adjust_eps_m`` is unset)
+                and the knots per cluster; see
+                :func:`spatial_basis.build_block_basis`.
+            spatial_paired_smooth: which smooth each exposure of a paired
+                CGI-vs-exposure test is scored with under ``spatial_plus``:
+                its own (``"own"``), the CGI's (``"cgi"``), one selected on the
+                outcome (``"outcome"``) or the larger of the two dfs
+                (``"max"``); see :meth:`_paired_difference_on`.
+            residualize_spline_df / residualize_spline_min_unique: the
+                covariate splines of ``residualize_method="spline"``; see
+                :func:`objective_scoring._expand_covariate_basis`.
+            exposure_response_spline_df: spline df of the exposure-response
+                curve and its non-linearity test.
         """
         # Route Optuna's chatter ("Trial X finished with value Y …") into
         # the per-job log instead of the Streamlit host terminal. Fusion
@@ -426,7 +463,41 @@ class MetricFusionEngine:
                 f"{sorted(objective_scoring.SPATIAL_METHODS)}; got {method!r}."
             )
         self.spatial_adjust_method: str = method
-        self.spatial_adjust_max_df: int = max(1, int(spatial_adjust_max_df))
+        if spatial_adjust_df is not None and spatial_adjust_max_df is not None:
+            raise ValueError(
+                "Give spatial_adjust_df or the older spatial_adjust_max_df, not both."
+            )
+        if spatial_adjust_max_df is not None:
+            dfs = range(0, max(1, int(spatial_adjust_max_df)) + 1)
+        elif spatial_adjust_df is not None:
+            dfs = spatial_adjust_df
+        else:
+            dfs = spatial_basis.DEFAULT_DF_CANDIDATES
+        self.spatial_adjust_df: tuple[int, ...] = tuple(
+            sorted({int(d) for d in dfs if int(d) >= 0})
+        )
+        if not self.spatial_adjust_df:
+            raise ValueError("spatial_adjust_df needs at least one df.")
+        self.spatial_adjust_max_df: int = max(1, max(self.spatial_adjust_df))
+        if spatial_adjust_criterion not in spatial_basis.CRITERIA:
+            raise ValueError(
+                f"spatial_adjust_criterion must be one of {spatial_basis.CRITERIA}; "
+                f"got {spatial_adjust_criterion!r}."
+            )
+        self.spatial_adjust_criterion: str = spatial_adjust_criterion
+        self.spatial_adjust_neighbours: int = int(spatial_adjust_neighbours)
+        self.spatial_adjust_knots_min: int = int(spatial_adjust_knots_min)
+        self.spatial_adjust_knots_max: int = int(spatial_adjust_knots_max)
+        if self.spatial_adjust_knots_min > self.spatial_adjust_knots_max:
+            raise ValueError(
+                "spatial_adjust_knots_min must not exceed spatial_adjust_knots_max."
+            )
+        if spatial_paired_smooth not in SPATIAL_PAIRED_SMOOTHS:
+            raise ValueError(
+                f"spatial_paired_smooth must be one of {SPATIAL_PAIRED_SMOOTHS}; "
+                f"got {spatial_paired_smooth!r}."
+            )
+        self.spatial_paired_smooth: str = spatial_paired_smooth
         self.spatial_adjust_eps_m: float | None = (
             float(spatial_adjust_eps_m)
             if spatial_adjust_eps_m is not None and float(spatial_adjust_eps_m) > 0
@@ -434,6 +505,8 @@ class MetricFusionEngine:
         )
         self._spatial_basis_cache: dict = {}
         self._spatial_adjust_summary: dict | None = None
+        # Selections made and how many landed on the largest candidate df.
+        self._spatial_selections: dict[str, int] = {"n": 0, "at_cap": 0}
 
         # Covariate residualization basis for the residualizing metrics
         # (distance_corr / spearman / r2 / nrmse). ``spline`` removes nonlinear
@@ -445,6 +518,9 @@ class MetricFusionEngine:
                 f"{sorted(objective_scoring.RESIDUALIZE_METHODS)}; got {res_method!r}."
             )
         self.residualize_method: str = res_method
+        self.residualize_spline_df: int = int(residualize_spline_df)
+        self.residualize_spline_min_unique: int = int(residualize_spline_min_unique)
+        self.exposure_response_spline_df: int = int(exposure_response_spline_df)
 
         # Longitudinal search scorer. ``mom_em3`` (default) / ``mom_em1`` /
         # ``mom`` / ``reml`` estimate the per-fold variance components for the
@@ -4839,49 +4915,154 @@ class MetricFusionEngine:
 
         ``(None, None)`` when no smooth is applied.
         """
-        if self.spatial_adjust_method == "none" or coords_xy is None:
+        chosen = self._spatial_selection(coords_xy, target, cov, cgi)
+        if chosen is None:
             return None, None
+        return chosen["columns"], chosen["df"]
+
+    def _spatial_candidates(self, basis: "spatial_basis.SpatialBasis") -> list[int]:
+        """The df levels compared on ``basis`` (the job's list, capped)."""
+        return spatial_basis.candidate_dfs(basis, self.spatial_adjust_df)
+
+    def _spatial_selection(
+        self,
+        coords_xy: np.ndarray | None,
+        target: np.ndarray,
+        cov: np.ndarray | None,
+        cgi: np.ndarray,
+        *,
+        on: str | None = None,
+    ) -> dict | None:
+        """One df selection on a scored split, or ``None`` without a smooth.
+
+        ``{"columns", "df", "ic", "at_cap"}``: the selected design (``None``
+        when the criterion kept none), its df, the criterion of every design
+        compared (``{"none": …, "<df>": …}``) and whether the largest
+        candidate won. The df is selected on the outcome given the covariates
+        (``ks_aic``, or ``on="outcome"``) or on the exposure ``cgi``
+        (``spatial_plus``). The first selection that lands on the largest
+        candidate logs a WARN.
+        """
+        if self.spatial_adjust_method == "none" or coords_xy is None:
+            return None
         coords_xy = np.asarray(coords_xy, dtype=np.float64)
         cache_key = _helpers.spatial_cache_key(coords_xy, target, cov)
         entry = self._spatial_basis_cache.get(cache_key)
         if entry is None:
             basis = spatial_basis.build_block_basis(
-                np.asarray(coords_xy, dtype=np.float64),
+                coords_xy,
                 max_df=self.spatial_adjust_max_df,
                 eps=self.spatial_adjust_eps_m,
+                neighbours=self.spatial_adjust_neighbours,
+                knots_min=self.spatial_adjust_knots_min,
+                knots_max=self.spatial_adjust_knots_max,
             )
-            ks_df, ks_cols = (None, None)
+            entry = {"basis": basis, "ks": None}
             if basis.has_spatial:
-                ks_df, ks_cols = spatial_basis.select_df_aic(
+                ks_df, ks_cols, ks_ic = spatial_basis.select_df_aic(
                     np.asarray(target, dtype=np.float64),
                     basis,
                     None if cov is None else np.asarray(cov, dtype=np.float64),
+                    criterion=self.spatial_adjust_criterion,
+                    candidates=self.spatial_adjust_df,
+                    return_profile=True,
                 )
-            entry = {"basis": basis, "ks_cols": ks_cols, "ks_df": ks_df}
+                entry["ks"] = self._selection_record(basis, ks_df, ks_cols, ks_ic)
             self._spatial_basis_cache[cache_key] = entry
             if self._spatial_adjust_summary is None and basis.has_spatial:
                 self._spatial_adjust_summary = {
                     "method": self.spatial_adjust_method,
-                    "ks_df": ks_df,
+                    "ks_df": entry["ks"]["df"],
+                    "candidates": list(self.spatial_adjust_df),
+                    "criterion": self.spatial_adjust_criterion,
+                    "eps_m": self.spatial_adjust_eps_m,
                     **basis.summary,
+                    "ks_ic": entry["ks"]["ic"],
+                    "ks_at_cap": entry["ks"]["at_cap"],
                 }
         basis = entry["basis"]
         if not basis.has_spatial:
-            return None, None
-        if self.spatial_adjust_method == "ks_aic":
-            return entry["ks_cols"], entry["ks_df"]
+            return None
+        if self.spatial_adjust_method == "ks_aic" or on == "outcome":
+            return self._count_selection(entry["ks"])
         # spatial_plus: the exposure is residualized on the smooth, so df is
         # selected on the exposure (df-Spatial+); the candidate basis is reused
         # and the per-call df search runs off the memoized nested-QR precompute
-        # (one matvec instead of max_df+1 least-squares fits).
+        # (one matvec instead of one least-squares fit per candidate).
         pre = entry.get("plus_pre")
         if pre is None and "plus_pre" not in entry:
             pre = spatial_basis.precompute_df_selection(basis)
             entry["plus_pre"] = pre
-        sp_df, sp_cols = spatial_basis.select_df_aic_fast(
-            np.asarray(cgi, dtype=np.float64), basis, pre
+        sp_df, sp_cols, sp_ic = spatial_basis.select_df_aic_fast(
+            np.asarray(cgi, dtype=np.float64),
+            basis,
+            pre,
+            criterion=self.spatial_adjust_criterion,
+            candidates=self.spatial_adjust_df,
+            return_profile=True,
         )
-        return sp_cols, sp_df
+        return self._count_selection(
+            self._selection_record(basis, sp_df, sp_cols, sp_ic)
+        )
+
+    def _selection_record(self, basis, df, columns, ic) -> dict:
+        """A df selection as :meth:`_spatial_selection` returns it."""
+        candidates = self._spatial_candidates(basis)
+        at_cap = df is not None and bool(candidates) and int(df) == max(candidates)
+        return {
+            "columns": columns,
+            "df": None if df is None else int(df),
+            "ic": {k: float(v) for k, v in ic.items()},
+            "at_cap": bool(at_cap),
+        }
+
+    def _count_selection(self, chosen: dict) -> dict:
+        """Count a selection and warn once when the largest candidate wins."""
+        self._spatial_selections["n"] += 1
+        if chosen["at_cap"]:
+            self._spatial_selections["at_cap"] += 1
+            if self._spatial_selections["at_cap"] == 1:
+                _log(
+                    "WARN",
+                    f"Spatial smooth: the {self.spatial_adjust_criterion.upper()} "
+                    f"picked df {chosen['df']}, the largest candidate "
+                    f"({list(self.spatial_adjust_df)}); a larger df may fit "
+                    "better. Add larger values to spatial_adjust_df (and "
+                    "spatial_adjust_knots_max) to let the criterion decide.",
+                )
+        return chosen
+
+    @property
+    def _residualize_options(self) -> dict:
+        """The covariate-basis keywords of :func:`objective_scoring.score`."""
+        return {
+            "residualize_method": self.residualize_method,
+            "spline_df": self.residualize_spline_df,
+            "spline_min_unique": self.residualize_spline_min_unique,
+        }
+
+    def spatial_selection_report(self) -> dict | None:
+        """The run's smooth settings and selection counts, ``None`` unadjusted.
+
+        Joins :attr:`_spatial_adjust_summary` (the first basis built: clusters,
+        knots, the outcome's IC profile) with every setting of the smooth and
+        how many selections the largest candidate won (``at_cap``).
+        """
+        if self.spatial_adjust_method == "none":
+            return None
+        return {
+            **(self._spatial_adjust_summary or {"method": self.spatial_adjust_method}),
+            "candidates": list(self.spatial_adjust_df),
+            "criterion": self.spatial_adjust_criterion,
+            "neighbours": self.spatial_adjust_neighbours,
+            "knots_min": self.spatial_adjust_knots_min,
+            "knots_max": self.spatial_adjust_knots_max,
+            "eps_m": self.spatial_adjust_eps_m,
+            "paired_smooth": self.spatial_paired_smooth,
+            "selections": int(self._spatial_selections["n"]),
+            "selections_at_cap": int(self._spatial_selections["at_cap"]),
+            "at_cap": bool(self._spatial_selections["at_cap"]),
+        }
 
     def _finalize_composite(self, composite: np.ndarray) -> np.ndarray:
         """Apply the ``whole_grid_scaling`` toggle to the written composite map.
@@ -5827,7 +6008,7 @@ class MetricFusionEngine:
             return_pvalue=return_pvalue,
             spatial_basis=spatial_basis,
             spatial_method=self.spatial_adjust_method,
-            residualize_method=self.residualize_method,
+            **self._residualize_options,
             pdcor_cache=self._pdcor_cache,
             spline_cache=self._spline_basis_cache,
         )
@@ -6219,7 +6400,7 @@ class MetricFusionEngine:
                     p_arr,
                     covariates=None,
                     return_pvalue=False,
-                    residualize_method=self.residualize_method,
+                    **self._residualize_options,
                     pdcor_cache=self._pdcor_cache,
                     spline_cache=self._spline_basis_cache,
                 )
@@ -6239,7 +6420,7 @@ class MetricFusionEngine:
                     return_pvalue=False,
                     spatial_basis=sb_part,
                     spatial_method=self.spatial_adjust_method,
-                    residualize_method=self.residualize_method,
+                    **self._residualize_options,
                     pdcor_cache=self._pdcor_cache,
                     spline_cache=self._spline_basis_cache,
                 )
@@ -6635,7 +6816,7 @@ class MetricFusionEngine:
                     cov_part,
                     spatial_basis=sb_part,
                     spatial_method=self.spatial_adjust_method,
-                    residualize_method=self.residualize_method,
+                    **self._residualize_options,
                     pdcor_cache=self._pdcor_cache,
                     spline_cache=self._spline_basis_cache,
                 )
@@ -7283,7 +7464,7 @@ class MetricFusionEngine:
                     cov_part,
                     spatial_basis=sb_part,
                     spatial_method=self.spatial_adjust_method,
-                    residualize_method=self.residualize_method,
+                    **self._residualize_options,
                     pdcor_cache=self._pdcor_cache,
                     spline_cache=self._spline_basis_cache,
                 )
@@ -7925,7 +8106,7 @@ class MetricFusionEngine:
                     composite, fitter, cov, logistic=binary, cut_points=cut_points
                 ),
                 "nonlinearity": exposure_response.spline_nonlinearity_test(
-                    composite, fitter, cov
+                    composite, fitter, cov, df=self.exposure_response_spline_df
                 ),
             }
         except Exception as exc:
@@ -8130,20 +8311,27 @@ class MetricFusionEngine:
         and ``rows`` a mask over it. The smooth is built on those rows as the
         scores build theirs, with its df selected on ``exposure``
         (``spatial_plus``) or on ``outcome`` given the covariates
-        (``ks_aic``). The record is ``{"method", "df"}``; ``df`` is ``None``
-        when no smooth is used (no coordinates, or the criterion kept none).
+        (``ks_aic``). The record is ``{"method", "df", "at_cap", "ic"}`` (the
+        last two once a selection ran: whether the largest candidate won, and
+        the criterion of every design compared); ``df`` is ``None`` when no
+        smooth is used (no coordinates, or the criterion kept none).
         """
-        cols, df = None, None
+        chosen = None
         if coords is not None:
-            cols, df = self._spatial_smooth(
+            chosen = self._spatial_selection(
                 coords[rows],
                 outcome[rows],
                 None if cov is None else cov[rows],
                 exposure[rows],
             )
         record = {"method": self.spatial_adjust_method, "df": None}
+        if chosen is None:
+            return None, record
+        cols = chosen["columns"]
         if cols is not None:
-            record["df"] = None if df is None else int(df)
+            record["df"] = chosen["df"]
+        record["at_cap"] = chosen["at_cap"]
+        record["ic"] = chosen["ic"]
         return cols, record
 
     def _slope_smooths(
