@@ -25,7 +25,10 @@ against each control:
 The paired statistics take ``extra``: control columns that belong to one
 variable and join the covariates of every slope involving it, such as a
 spatial smooth selected on the exposure (Spatial+) or on each outcome
-(KS-AIC). Their rows are resampled with the observations.
+(KS-AIC). Their rows are resampled with the observations. With ``extra``
+columns the resamples are refitted by :mod:`geofuse.resampling`, which keeps a
+block-diagonal smooth's clusters apart instead of forming one dense Gram matrix
+per row; without them, by per-cluster Gram blocks of the covariate basis.
 
 Pure numpy and scipy, so the same code serves the engine and a direct caller.
 """
@@ -40,6 +43,9 @@ from .bayesian_index import covariate_basis
 
 # Resamples per bootstrap batch: bounds the (batch x cluster) weight matrix.
 _BATCH = 100
+
+# Rank rule of the bases the slopes are fitted on (:func:`covariate_basis`).
+_BASIS_RTOL = 1e-10
 
 
 def _residual_scale(a: np.ndarray, q: np.ndarray) -> float:
@@ -75,6 +81,37 @@ def _with_blocks(cov: np.ndarray | None, blocks: list[np.ndarray]):
         return cov
     parts = ([] if cov is None or not cov.size else [cov]) + blocks
     return parts[0] if len(parts) == 1 else np.column_stack(parts)
+
+
+def _resample_weights(rng, b: int, n_cl: int, codes: np.ndarray) -> np.ndarray:
+    """``(b, n)`` row weights of ``b`` cluster resamples (multiplicities)."""
+    draws = rng.integers(0, n_cl, size=(b, n_cl))
+    m = np.zeros((b, n_cl))
+    np.add.at(m, (np.repeat(np.arange(b), n_cl), draws.ravel()), 1.0)
+    return m[:, codes]
+
+
+def _engine_slopes(design, x, ys, sx: float, sys_: list, W: np.ndarray) -> np.ndarray:
+    """``(B, len(ys))`` slopes of each scaled outcome on the scaled exposure.
+
+    From the design's weighted residual cross-products (Frisch–Waugh): with
+    exposure and outcomes pre-divided by their full-sample residual SDs the
+    slope is ``M_xy / M_xx · s_x / s_y``. An exposure with no residual
+    variance in a resample gets slope 0, as the pseudo-inverse gives it.
+    """
+    M = design.cross(np.column_stack([x, *ys]), W)
+    mxx = M[:, 0, 0]
+    ok = mxx > 0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        b = M[:, 0, 1:] / np.where(ok, mxx, 1.0)[:, None]
+    b = np.where(ok[:, None], b, 0.0)
+    return b * (sx / np.asarray(sys_, dtype=np.float64))[None, :]
+
+
+def _design(n: int, cov, smooth):
+    from .resampling import BlockDesign
+
+    return BlockDesign(n, cov, smooth, rtol=_BASIS_RTOL)
 
 
 def partial_slope(exposure, outcome, covariates=None, *, level: float = 0.95) -> dict:
@@ -190,6 +227,10 @@ def paired_contrast(
         "clusters": None,
     }
 
+    if blocks:
+        return _paired_contrast_blocks(
+            x, ya, yb, cov, blocks, cl, out, n_boot=n_boot, seed=seed, level=level
+        )
     shared = _picked(blocks, "exposure")
     q, _ = covariate_basis(_with_blocks(cov, shared + _picked(blocks, "target")), n)
     qb = q
@@ -249,6 +290,77 @@ def paired_contrast(
         m = np.zeros((b, n_cl))
         np.add.at(m, (np.repeat(np.arange(b), n_cl), draws.ravel()), 1.0)
         ba, bb = slopes(m)
+        deltas.append(np.abs(ba) - np.abs(bb))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratios.append(np.where(np.abs(ba) > 1e-12, bb / ba, np.nan))
+    deltas = np.concatenate(deltas)
+    ratios = np.concatenate(ratios)
+    tail = (1.0 - level) / 2.0 * 100.0
+    out["ci_low"], out["ci_high"] = (
+        float(v) for v in np.percentile(deltas, [tail, 100.0 - tail])
+    )
+    if np.isfinite(ratios).any():
+        out["ratio_ci_low"], out["ratio_ci_high"] = (
+            float(v) for v in np.nanpercentile(ratios, [tail, 100.0 - tail])
+        )
+    return out
+
+
+def _paired_contrast_blocks(
+    x, ya, yb, cov, blocks, cl, out, *, n_boot, seed, level
+) -> dict:
+    """:func:`paired_contrast` with extra control columns, by the block engine.
+
+    Same rows, scales, resamples and statistics; the slopes come from the
+    weighted cross-products of :class:`resampling.BlockDesign` instead of a
+    dense Gram block per cluster.
+    """
+    n = len(x)
+    nan = float("nan")
+    shared = _picked(blocks, "exposure")
+    own = "target" in blocks or "control" in blocks
+    da = _design(n, cov, _with_blocks(None, shared + _picked(blocks, "target")))
+    db = (
+        _design(n, cov, _with_blocks(None, shared + _picked(blocks, "control")))
+        if own
+        else da
+    )
+    if n - max(da.rank, db.rank) - 1 < 2:
+        return out
+    scales = [float(da.residuals(v).std()) for v in (x, ya)]
+    scales.append(float(db.residuals(yb).std()))
+    if own:
+        scales.append(float(db.residuals(x).std()))
+    if min(scales) <= 1e-12:
+        return out
+    sxb = scales[3] if own else scales[0]
+
+    if cl is None:
+        codes = np.arange(n)
+    else:
+        _, codes = np.unique(cl, return_inverse=True)
+    n_cl = int(codes.max()) + 1
+    out["clusters"] = None if cl is None else n_cl
+
+    def slopes(W):
+        if not own:
+            b = _engine_slopes(da, x, [ya, yb], scales[0], scales[1:3], W)
+            return b[:, 0], b[:, 1]
+        ba = _engine_slopes(da, x, [ya], scales[0], [scales[1]], W)[:, 0]
+        bb = _engine_slopes(db, x, [yb], sxb, [scales[2]], W)[:, 0]
+        return ba, bb
+
+    ba0, bb0 = slopes(np.ones((1, n)))
+    out["delta"] = float(abs(ba0[0]) - abs(bb0[0]))
+    out["ratio"] = float(bb0[0] / ba0[0]) if abs(ba0[0]) > 1e-12 else nan
+    if n_boot <= 0:
+        return out
+
+    rng = np.random.default_rng(seed)
+    deltas, ratios = [], []
+    for start in range(0, int(n_boot), _BATCH):
+        b = min(_BATCH, int(n_boot) - start)
+        ba, bb = slopes(_resample_weights(rng, b, n_cl, codes))
         deltas.append(np.abs(ba) - np.abs(bb))
         with np.errstate(divide="ignore", invalid="ignore"):
             ratios.append(np.where(np.abs(ba) > 1e-12, bb / ba, np.nan))
@@ -334,6 +446,11 @@ def specificity_contrast(
         "clusters": None,
     }
 
+    if blocks:
+        return _specificity_blocks(
+            xa, xb, ya, yb, cov, blocks, cl, out, n_boot=n_boot, seed=seed, level=level
+        )
+
     # ── Designs: per exposure, or per exposure and outcome ──────
     # Each is ``(exposure, basis, outcomes)``, in the order of the four slopes.
     bases: dict = {}
@@ -413,6 +530,86 @@ def specificity_contrast(
         m = np.zeros((b, n_cl))
         np.add.at(m, (np.repeat(np.arange(b), n_cl), draws.ravel()), 1.0)
         deltas.append(contrast(slopes(m)))
+    deltas = np.concatenate(deltas)
+    tail = (1.0 - level) / 2.0 * 100.0
+    out["ci_low"], out["ci_high"] = (
+        float(v) for v in np.percentile(deltas, [tail, 100.0 - tail])
+    )
+    out["p_value"] = float((np.sum(deltas <= 0.0) + 1) / (len(deltas) + 1))
+    return out
+
+
+def _specificity_blocks(
+    xa, xb, ya, yb, cov, blocks, cl, out, *, n_boot, seed, level
+) -> dict:
+    """:func:`specificity_contrast` with extra control columns, by the block
+    engine: the same designs, scales and resamples as the dense path."""
+    n = len(xa)
+    designs: dict = {}
+
+    def design(*roles):
+        key = tuple(r for r in roles if r in blocks)
+        if key not in designs:
+            designs[key] = _design(n, cov, _with_blocks(None, _picked(blocks, *key)))
+        return designs[key]
+
+    own = "target" in blocks or "control" in blocks
+    specs = []
+    for x, role in ((xa, "exposure"), (xb, "other")):
+        if own:
+            specs += [
+                (x, design(role, "target"), [ya]),
+                (x, design(role, "control"), [yb]),
+            ]
+        else:
+            specs.append((x, design(role), [ya, yb]))
+    if any(n - d.rank - 1 < 2 for _, d, _ in specs):
+        return out
+    scales = [
+        [float(d.residuals(v).std()) for v in (x, *ys)] for x, d, ys in specs
+    ]
+    if min(min(s) for s in scales) <= 1e-12:
+        return out
+
+    if cl is None:
+        codes = np.arange(n)
+    else:
+        _, codes = np.unique(cl, return_inverse=True)
+    n_cl = int(codes.max()) + 1
+    out["clusters"] = None if cl is None else n_cl
+
+    def slopes(W):
+        """``(b, 4)`` slopes: target and control on each exposure."""
+        return np.concatenate(
+            [
+                _engine_slopes(d, x, ys, sc[0], sc[1:], W)
+                for (x, d, ys), sc in zip(specs, scales, strict=True)
+            ],
+            axis=1,
+        )
+
+    def contrast(b):
+        d = np.abs(b[:, 0]) - np.abs(b[:, 1])
+        return d - (np.abs(b[:, 2]) - np.abs(b[:, 3]))
+
+    b0 = slopes(np.ones((1, n)))
+    for key, v in zip(
+        ("beta_target", "beta_control", "beta_target_other", "beta_control_other"),
+        b0[0],
+        strict=True,
+    ):
+        out[key] = float(v)
+    out["d"] = float(abs(b0[0, 0]) - abs(b0[0, 1]))
+    out["d_other"] = float(abs(b0[0, 2]) - abs(b0[0, 3]))
+    out["delta"] = float(contrast(b0)[0])
+    if n_boot <= 0:
+        return out
+
+    rng = np.random.default_rng(seed)
+    deltas = []
+    for start in range(0, int(n_boot), _BATCH):
+        b = min(_BATCH, int(n_boot) - start)
+        deltas.append(contrast(slopes(_resample_weights(rng, b, n_cl, codes))))
     deltas = np.concatenate(deltas)
     tail = (1.0 - level) / 2.0 * 100.0
     out["ci_low"], out["ci_high"] = (

@@ -71,7 +71,12 @@ class TestExtraColumns(unittest.TestCase):
         want = nc.paired_contrast(
             x, target, control, np.column_stack([cov, b["a"]]), n_boot=50, seed=3
         )
-        self.assertEqual(got, want)
+        self.assertEqual(set(got), set(want))
+        for key, value in want.items():
+            if isinstance(value, float):
+                self.assertAlmostEqual(got[key], value, places=10, msg=key)
+            else:
+                self.assertEqual(got[key], value, key)
 
     def test_an_outcomes_columns_join_only_its_own_slope(self):
         x, _, target, control, cov, b = _data()

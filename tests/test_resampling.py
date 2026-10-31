@@ -7,7 +7,9 @@ inputs and the same resamples:
   over ``[1, covariates, smooth]``, including replicates that leave a spatial
   cluster out and tiny or rank-deficient clusters;
 - the bootstrap, BCa jackknife and Freedman–Lane permutation fast paths of
-  :mod:`geofuse.statistical_testing` against their per-replicate loops.
+  :mod:`geofuse.statistical_testing` against their per-replicate loops;
+- the negative-control and specificity statistics with a smooth against the
+  dense per-cluster Gram path they had.
 """
 
 import os
@@ -21,6 +23,7 @@ if ROOT not in sys.path:
 import geopandas  # noqa: F401  (pyproj before torchvision, see vision.py)
 import numpy as np
 
+from geofuse import negative_controls as nc
 from geofuse import objective_scoring as osc
 from geofuse import resampling as rs
 from geofuse import spatial_basis as sb
@@ -203,6 +206,58 @@ class ResamplingLoopTests(unittest.TestCase):
     def test_no_smooth_keeps_the_direct_fits(self):
         factory = rs.r2_bootstrap_scorer(self.k)
         self.assertIsNone(factory(self.d["y"], self.d["x"], self.d["cov"]))
+
+
+class NegativeControlTests(unittest.TestCase):
+    def setUp(self):
+        d = _study(n=600, seed=3)
+        self.d = d
+        self.sx = sb.select_df_aic(d["x"], sb.build_block_basis(d["xy"], max_df=6))[1]
+        if self.sx is None:
+            self.sx = d["S"]
+        self.sx2 = d["S"][:, ::2]
+
+    def _same(self, got, want):
+        for key, value in want.items():
+            if isinstance(value, float) and np.isfinite(value):
+                self.assertAlmostEqual(got[key], value, places=10, msg=key)
+
+    def test_paired_contrast_with_a_smooth(self):
+        d = self.d
+        clusters = np.random.default_rng(5).integers(0, 60, d["n"])
+        for kw in ({}, {"clusters": clusters}):
+            got = nc.paired_contrast(
+                d["x"], d["y"], d["c"], d["cov"], extra={"exposure": self.sx},
+                n_boot=80, seed=2, **kw,
+            )
+            want = nc.paired_contrast(
+                d["x"], d["y"], d["c"], np.column_stack([d["cov"], self.sx]),
+                n_boot=80, seed=2, **kw,
+            )
+            self._same(got, want)
+
+    def test_specificity_contrast_with_smooths(self):
+        d = self.d
+        got = nc.specificity_contrast(
+            d["x"], d["x2"], d["y"], d["c"], d["cov"],
+            extra={"exposure": self.sx, "other": self.sx2}, n_boot=60, seed=4,
+        )
+        def beta(x, y, smooth):
+            controls = np.column_stack([d["cov"], smooth])
+            return nc.partial_slope(x, y, controls)["beta"]
+
+        b = [
+            beta(d["x"], d["y"], self.sx),
+            beta(d["x"], d["c"], self.sx),
+            beta(d["x2"], d["y"], self.sx2),
+            beta(d["x2"], d["c"], self.sx2),
+        ]
+        for key, value in zip(
+            ("beta_target", "beta_control", "beta_target_other", "beta_control_other"),
+            b,
+            strict=True,
+        ):
+            self.assertAlmostEqual(got[key], value, places=10, msg=key)
 
 
 if __name__ == "__main__":
