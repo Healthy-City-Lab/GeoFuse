@@ -198,10 +198,11 @@ def _residualize(y: np.ndarray, X: np.ndarray | None) -> np.ndarray:
     return y - Xc @ beta
 
 
-# Columns with at most this many distinct values are treated as discrete
-# (dummies / ordinal codes) and left un-splined.
-_SPLINE_MIN_UNIQUE: int = 7
-_SPLINE_DF: int = 4
+#: Columns with fewer distinct values than this are treated as discrete
+#: (dummies / ordinal codes) and left un-splined.
+SPLINE_MIN_UNIQUE: int = 7
+#: Natural-cubic-spline df of each continuous covariate under ``spline``.
+SPLINE_DF: int = 4
 
 # Bases held per scored subset, and the lock that keeps the trim safe while
 # trials run in parallel.
@@ -210,15 +211,21 @@ _SPLINE_CACHE_LOCK = threading.Lock()
 
 
 def _expand_covariate_basis(
-    X: np.ndarray | None, method: str, cache: dict | None = None
+    X: np.ndarray | None,
+    method: str,
+    cache: dict | None = None,
+    *,
+    spline_df: int = SPLINE_DF,
+    spline_min_unique: int = SPLINE_MIN_UNIQUE,
 ) -> np.ndarray | None:
     """Optionally expand continuous covariate columns into a spline basis.
 
     ``method="linear"`` (or a degenerate input) returns ``X`` unchanged. With
-    ``method="spline"`` each near-continuous column is replaced by a
-    natural-cubic-spline basis so the later OLS residualization removes
-    nonlinear covariate effects; discrete columns (dummies, coarse codes) pass
-    through as-is. Falls back to the raw column on any expansion error.
+    ``method="spline"`` each column with at least ``spline_min_unique``
+    distinct values is replaced by a ``spline_df``-column natural-cubic-spline
+    basis so the later OLS residualization removes nonlinear covariate effects;
+    discrete columns (dummies, coarse codes) pass through as-is. Falls back to
+    the raw column on any expansion error.
 
     ``cache`` (optional dict) memoizes the expanded basis on a content
     fingerprint of ``X`` — per Optuna trial the covariate matrix is fixed per
@@ -232,7 +239,7 @@ def _expand_covariate_basis(
         # same values in a different order must not hit another subset's basis.
         _x = np.ascontiguousarray(np.asarray(X, dtype=np.float64))
         _h = hashlib.blake2b(digest_size=16)
-        _h.update(repr(_x.shape).encode())
+        _h.update(repr((_x.shape, int(spline_df), int(spline_min_unique))).encode())
         _h.update(_x.tobytes())
         cache_key = _h.digest()
         hit = cache.get(cache_key)
@@ -245,14 +252,14 @@ def _expand_covariate_basis(
     cols: list[np.ndarray] = []
     for j in range(X.shape[1]):
         col = X[:, j]
-        if np.unique(col[np.isfinite(col)]).size < _SPLINE_MIN_UNIQUE:
+        if np.unique(col[np.isfinite(col)]).size < int(spline_min_unique):
             cols.append(col.reshape(-1, 1))
             continue
         try:
             basis = np.asarray(
                 dmatrix(
                     "cr(x, df=df) - 1",
-                    {"x": col, "df": _SPLINE_DF},
+                    {"x": col, "df": int(spline_df)},
                     return_type="dataframe",
                 ),
                 dtype=np.float64,
@@ -447,6 +454,8 @@ def relationship_sign(
     spatial_basis: np.ndarray | None = None,
     spatial_method: str = "none",
     residualize_method: str = "linear",
+    spline_df: int = SPLINE_DF,
+    spline_min_unique: int = SPLINE_MIN_UNIQUE,
 ) -> int:
     """Sign (``+1`` / ``-1``) of the greenery↔outcome relationship.
 
@@ -474,6 +483,8 @@ def relationship_sign(
         cov_use = _expand_covariate_basis(
             np.column_stack([rankdata(cov[:, j]) for j in range(cov.shape[1])]),
             residualize_method,
+            spline_df=spline_df,
+            spline_min_unique=spline_min_unique,
         )
     else:
         cov_use = None
@@ -543,6 +554,8 @@ def score(
     residualize_method: str = "linear",
     pdcor_cache: dict | None = None,
     spline_cache: dict | None = None,
+    spline_df: int = SPLINE_DF,
+    spline_min_unique: int = SPLINE_MIN_UNIQUE,
 ) -> float | tuple[float, float]:
     """Score CGI's predictive power for ``target``, controlling for ``covariates``.
 
@@ -561,8 +574,10 @@ def score(
     is ignored by ``mutual_info`` (like covariates).
 
     ``residualize_method`` (``"linear"`` / ``"spline"``) sets the covariate basis
-    for the residualizing metrics. ``partial_distance_corr`` conditions on the
-    controls intrinsically and ``mutual_info`` ignores them, so both ignore it.
+    for the residualizing metrics, with ``spline_df`` / ``spline_min_unique``
+    as in :func:`_expand_covariate_basis`. ``partial_distance_corr`` conditions
+    on the controls intrinsically and ``mutual_info`` ignores them, so both
+    ignore it.
 
     ``pdcor_cache`` / ``spline_cache`` are optional engine-owned caches for the
     inputs that stay constant across many calls on one scored subset: the
@@ -631,7 +646,10 @@ def score(
         # Covariate basis for the residualizing metrics (spline-expanded when
         # asked). Deliberately below the pdcor branch — that metric (and
         # mutual_info, whose cov is already None here) never consumes it.
-        cov_res = _expand_covariate_basis(cov, residualize_method, spline_cache)
+        spline = {"spline_df": spline_df, "spline_min_unique": spline_min_unique}
+        cov_res = _expand_covariate_basis(
+            cov, residualize_method, spline_cache, **spline
+        )
 
         if metric == "distance_corr":
             x_t, x_c = _spatial_designs(cov_res, sb, spatial_method)
@@ -650,6 +668,7 @@ def score(
                     np.column_stack([rankdata(cov[:, j]) for j in range(cov.shape[1])]),
                     residualize_method,
                     spline_cache,
+                    **spline,
                 )
             else:
                 cov_use = None
