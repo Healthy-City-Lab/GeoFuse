@@ -450,6 +450,8 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "outer_comparators",
     "objective_metric",
     "residualize_method",
+    "residualize_spline_df",
+    "residualize_spline_min_unique",
     "search_scoring_method",
     "ndvi_start_date",
     "ndvi_end_date",
@@ -467,6 +469,7 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "comparators",
     "comparators_primary",
     "exposure_iqr",
+    "exposure_response_spline_df",
     "standalone_channels",
     "longitudinal_spec_payload",
     "cgi_grid_spacing_m",
@@ -477,8 +480,13 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "whole_grid_scaling",
     "area_balanced_split",
     "spatial_adjust_method",
-    "spatial_adjust_max_df",
+    "spatial_adjust_df",
+    "spatial_adjust_criterion",
     "spatial_adjust_eps_m",
+    "spatial_adjust_neighbours",
+    "spatial_adjust_knots_min",
+    "spatial_adjust_knots_max",
+    "spatial_paired_smooth",
     "spatial_split",
     "spatial_block_size_m",
     "spatial_split_mode",
@@ -521,6 +529,24 @@ _SPATIAL_SPLIT_MODE_LABELS: dict[str, str] = {
     "random": "Drawn at random",
 }
 
+# Criteria that pick the spatial df (``settings.SPATIAL_CRITERIA``).
+_SPATIAL_CRITERION_LABELS: dict[str, str] = {"aic": "AIC", "bic": "BIC"}
+
+# Smooth of each exposure in a Spatial+ paired test
+# (``settings.SPATIAL_PAIRED_SMOOTHS``).
+_SPATIAL_PAIRED_SMOOTH_LABELS: dict[str, str] = {
+    "own": "Each exposure's own",
+    "cgi": "The CGI's",
+    "outcome": "Selected on the outcome",
+    "max": "The larger df of the two",
+}
+
+
+def _df_list_text(dfs) -> str:
+    """A df list as the text the tab shows: ``"0, 1, 2"``."""
+    return ", ".join(str(int(d)) for d in dfs)
+
+
 # Missing categorical covariate values (``settings.CATEGORICAL_MISSING``).
 _CATEGORICAL_MISSING_LABELS: dict[str, str] = {
     "drop": "Drop the row",
@@ -532,6 +558,9 @@ _CATEGORICAL_MISSING_LABELS: dict[str, str] = {
 _FUSION_PARAM_TO_WIDGET: dict[str, str] = {
     "objective_metric": "fusion_objective_metric",
     "residualize_method": "fusion_residualize_method",
+    "residualize_spline_df": "fusion_residualize_spline_df",
+    "residualize_spline_min_unique": "fusion_residualize_spline_min_unique",
+    "exposure_response_spline_df": "fusion_exposure_response_spline_df",
     "categorical_missing": "fusion_categorical_missing",
     "search_scoring_method": "fusion_search_scoring_method",
     "test_size": "fusion_test_size",
@@ -565,8 +594,12 @@ _FUSION_PARAM_TO_WIDGET: dict[str, str] = {
     "spatial_block_size_m": "fusion_spatial_block_size_m",
     "spatial_split_mode": "fusion_spatial_split_mode",
     "spatial_adjust_method": "fusion_spatial_adjust_method",
-    "spatial_adjust_max_df": "fusion_spatial_adjust_max_df",
+    "spatial_adjust_criterion": "fusion_spatial_adjust_criterion",
     "spatial_adjust_eps_m": "fusion_spatial_adjust_eps_m",
+    "spatial_adjust_neighbours": "fusion_spatial_adjust_neighbours",
+    "spatial_adjust_knots_min": "fusion_spatial_adjust_knots_min",
+    "spatial_adjust_knots_max": "fusion_spatial_adjust_knots_max",
+    "spatial_paired_smooth": "fusion_spatial_paired_smooth",
     "resume_existing_study": "fusion_resume_study",
     "multi_objective_requested": "fusion_multi_objective_run",
     "gvi_buffer_min_m": "fusion_gvi_buffer_min",
@@ -606,8 +639,13 @@ _FUSION_SEED_INT_WIDGETS: frozenset[str] = frozenset(
         "fusion_posterior_chains",
         "fusion_cgi_grid_spacing_m",
         "fusion_spatial_block_size_m",
-        "fusion_spatial_adjust_max_df",
         "fusion_spatial_adjust_eps_m",
+        "fusion_spatial_adjust_neighbours",
+        "fusion_spatial_adjust_knots_min",
+        "fusion_spatial_adjust_knots_max",
+        "fusion_residualize_spline_df",
+        "fusion_residualize_spline_min_unique",
+        "fusion_exposure_response_spline_df",
     }
 )
 
@@ -639,6 +677,13 @@ def _seed_fusion_form(p: dict) -> None:
                 val = int(val)
             st.session_state[widget] = val
     st.session_state["fusion_run_standalones"] = bool(p.get("standalone_channels"))
+    # The df list is a text field; a study recorded with the older maximum
+    # comes back as the list 0 … max.
+    dfs = p.get("spatial_adjust_df")
+    if dfs is None and p.get("spatial_adjust_max_df") is not None:
+        dfs = list(range(0, int(p["spatial_adjust_max_df"]) + 1))
+    if dfs is not None:
+        st.session_state["fusion_spatial_adjust_df"] = _df_list_text(dfs)
 
     types = dict(p.get("covariate_types") or {})
     cols = list(p.get("covariate_columns") or [])
@@ -1732,6 +1777,23 @@ def _render_study_details_panel(
                     "is unaffected."
                 ),
             )
+            _default(
+                "fusion_exposure_response_spline_df",
+                _fs_default("exposure_response_spline_df"),
+            )
+            exposure_response_spline_df = int(
+                st.number_input(
+                    "Exposure-response spline df",
+                    **_fs_bounds("exposure_response_spline_df"),
+                    step=1,
+                    key="fusion_exposure_response_spline_df",
+                    help=(
+                        "Natural cubic spline size of the exposure-response "
+                        "curve and of its test against a straight line. "
+                        "Reporting only — the search is unaffected."
+                    ),
+                )
+            )
             if covariate_columns:
                 st.caption(
                     "Fitting: "
@@ -1746,6 +1808,7 @@ def _render_study_details_panel(
             categorical_missing = _fs_default("categorical_missing")
             moderator_columns = []
             exposure_iqr_ui = 0.0
+            exposure_response_spline_df = _fs_default("exposure_response_spline_df")
             st.caption(
                 "_No attribute columns available for covariates "
                 "(raster target or no spare columns)._"
@@ -1841,6 +1904,8 @@ def _render_study_details_panel(
     # Covariate residualization (cross-sectional metrics)
     # ────────────────────────────────────────────────────────────
     residualize_method = "linear"
+    residualize_spline_df = _fs_default("residualize_spline_df")
+    residualize_spline_min_unique = _fs_default("residualize_spline_min_unique")
     if not is_longitudinal:
         _res_ignored = objective_metric in _RESIDUALIZE_IGNORED_METRICS
         _res_rec = (
@@ -1866,6 +1931,35 @@ def _render_study_details_panel(
                 f"greenery↔outcome association. {_res_rec}"
             ),
         )
+        if residualize_method == "spline" and not _res_ignored:
+            _default("fusion_residualize_spline_df", residualize_spline_df)
+            _default(
+                "fusion_residualize_spline_min_unique", residualize_spline_min_unique
+            )
+            _spline_cols = st.columns(2)
+            with _spline_cols[0]:
+                residualize_spline_df = int(
+                    st.number_input(
+                        "Covariate spline df",
+                        **_fs_bounds("residualize_spline_df"),
+                        step=1,
+                        key="fusion_residualize_spline_df",
+                        help="Natural cubic spline size of each continuous covariate.",
+                    )
+                )
+            with _spline_cols[1]:
+                residualize_spline_min_unique = int(
+                    st.number_input(
+                        "Distinct values for a spline",
+                        **_fs_bounds("residualize_spline_min_unique"),
+                        step=1,
+                        key="fusion_residualize_spline_min_unique",
+                        help=(
+                            "A covariate with fewer distinct values (a code, a "
+                            "dummy) enters linearly instead."
+                        ),
+                    )
+                )
 
     # ────────────────────────────────────────────────────────────
     # Longitudinal-only mixed-effects toggles
@@ -2292,8 +2386,13 @@ def _render_study_details_panel(
     spatial_split_mode = "stripe"
     n_spatial_blocks: int | None = None
     spatial_adjust_method = "none"
-    spatial_adjust_max_df = 10
+    spatial_adjust_df = list(_fs_default("spatial_adjust_df"))
+    spatial_adjust_criterion = _fs_default("spatial_adjust_criterion")
     spatial_adjust_eps_m: float | None = None
+    spatial_adjust_neighbours = _fs_default("spatial_adjust_neighbours")
+    spatial_adjust_knots_min = _fs_default("spatial_adjust_knots_min")
+    spatial_adjust_knots_max = _fs_default("spatial_adjust_knots_max")
+    spatial_paired_smooth = _fs_default("spatial_paired_smooth")
     st.markdown("**Per-pixel CGI scoring**")
     _grid = _FS["cgi_grid_spacing_m"]
     _grid_options = list(range(int(_grid.lo), int(_grid.hi) + 1, int(_grid.step)))
@@ -2406,23 +2505,54 @@ def _render_study_details_panel(
         )
         if spatial_adjust_method != "none":
             _default(
-                "fusion_spatial_adjust_max_df", _fs_default("spatial_adjust_max_df")
+                "fusion_spatial_adjust_df", _df_list_text(spatial_adjust_df)
+            )
+            _default(
+                "fusion_spatial_adjust_criterion",
+                spatial_adjust_criterion,
+                list(_SPATIAL_CRITERION_LABELS),
             )
             _default(
                 "fusion_spatial_adjust_eps_m", _fs_default("spatial_adjust_eps_m") or 0
             )
+            for name in (
+                "spatial_adjust_neighbours",
+                "spatial_adjust_knots_min",
+                "spatial_adjust_knots_max",
+            ):
+                _default(f"fusion_{name}", _fs_default(name))
+            _default(
+                "fusion_spatial_paired_smooth",
+                spatial_paired_smooth,
+                list(_SPATIAL_PAIRED_SMOOTH_LABELS),
+            )
             with st.expander("Spatial adjustment — advanced", expanded=False):
-                spatial_adjust_max_df = int(
-                    st.number_input(
-                        "Max spatial df per cluster",
-                        **_fs_bounds("spatial_adjust_max_df"),
-                        step=1,
-                        key="fusion_spatial_adjust_max_df",
-                        help=(
-                            "Upper bound on the radial smooth functions per spatial "
-                            "cluster; AIC selects the actual count up to this."
-                        ),
+                df_text = st.text_input(
+                    "Spatial df candidates",
+                    key="fusion_spatial_adjust_df",
+                    help=(
+                        "Radial smooth functions per spatial cluster the "
+                        "criterion compares, besides no smooth (0 = cluster "
+                        "intercepts and linear trends only). When the largest "
+                        "wins, the run warns: add larger values."
+                    ),
+                )
+                try:
+                    spatial_adjust_df = _FS["spatial_adjust_df"].check(
+                        "spatial_adjust_df", df_text
                     )
+                except _gf_settings.SettingError as exc:
+                    st.error(f"{exc} Using the default list.")
+                    spatial_adjust_df = list(_fs_default("spatial_adjust_df"))
+                spatial_adjust_criterion = st.selectbox(
+                    "Spatial df criterion",
+                    options=list(_SPATIAL_CRITERION_LABELS),
+                    format_func=lambda k: _SPATIAL_CRITERION_LABELS[k],
+                    key="fusion_spatial_adjust_criterion",
+                    help=(
+                        "Information criterion that picks the df: AIC, or BIC "
+                        "(a heavier penalty, so a smaller or equal df)."
+                    ),
                 )
                 eps_ui = st.number_input(
                     "Cluster gap eps (m, 0 = auto)",
@@ -2436,6 +2566,51 @@ def _render_study_details_panel(
                     ),
                 )
                 spatial_adjust_eps_m = float(eps_ui) if eps_ui and eps_ui > 0 else None
+                _graph_cols = st.columns(3)
+                with _graph_cols[0]:
+                    spatial_adjust_neighbours = int(
+                        st.number_input(
+                            "Cluster neighbours",
+                            **_fs_bounds("spatial_adjust_neighbours"),
+                            step=1,
+                            key="fusion_spatial_adjust_neighbours",
+                            help=(
+                                "With eps at 0, entities linked through this many "
+                                "nearest neighbours form one cluster."
+                            ),
+                        )
+                    )
+                with _graph_cols[1]:
+                    spatial_adjust_knots_min = int(
+                        st.number_input(
+                            "Fewest knots per cluster",
+                            **_fs_bounds("spatial_adjust_knots_min"),
+                            step=1,
+                            key="fusion_spatial_adjust_knots_min",
+                        )
+                    )
+                with _graph_cols[2]:
+                    spatial_adjust_knots_max = int(
+                        st.number_input(
+                            "Most knots per cluster",
+                            **_fs_bounds("spatial_adjust_knots_max"),
+                            step=1,
+                            key="fusion_spatial_adjust_knots_max",
+                        )
+                    )
+                if spatial_adjust_method == "spatial_plus":
+                    spatial_paired_smooth = st.selectbox(
+                        "Paired-test smooth",
+                        options=list(_SPATIAL_PAIRED_SMOOTH_LABELS),
+                        format_func=lambda k: _SPATIAL_PAIRED_SMOOTH_LABELS[k],
+                        key="fusion_spatial_paired_smooth",
+                        help=(
+                            "Which smooth each exposure of a paired CGI-vs-"
+                            "exposure test is scored with. Its own makes the "
+                            "paired difference the difference of the two "
+                            "printed scores."
+                        ),
+                    )
 
     # ────────────────────────────────────────────────────────────
     # Exposure buffer
@@ -2513,6 +2688,9 @@ def _render_study_details_panel(
         ),
         "objective_metric": objective_metric,
         "residualize_method": str(residualize_method),
+        "residualize_spline_df": int(residualize_spline_df),
+        "residualize_spline_min_unique": int(residualize_spline_min_unique),
+        "exposure_response_spline_df": int(exposure_response_spline_df),
         "search_scoring_method": str(search_scoring_method),
         "test_size": float(test_size),
         "split_seed": int(split_seed),
@@ -2534,8 +2712,13 @@ def _render_study_details_panel(
         "whole_grid_scaling": bool(whole_grid_scaling),
         "area_balanced_split": bool(area_balanced_split),
         "spatial_adjust_method": str(spatial_adjust_method),
-        "spatial_adjust_max_df": int(spatial_adjust_max_df),
+        "spatial_adjust_df": list(spatial_adjust_df),
+        "spatial_adjust_criterion": str(spatial_adjust_criterion),
         "spatial_adjust_eps_m": spatial_adjust_eps_m,
+        "spatial_adjust_neighbours": int(spatial_adjust_neighbours),
+        "spatial_adjust_knots_min": int(spatial_adjust_knots_min),
+        "spatial_adjust_knots_max": int(spatial_adjust_knots_max),
+        "spatial_paired_smooth": str(spatial_paired_smooth),
         "spatial_split": bool(spatial_split),
         "spatial_block_size_m": spatial_block_size_m,
         "spatial_split_mode": str(spatial_split_mode),
@@ -6109,7 +6292,9 @@ def render(output_dir: str) -> None:
         study_state.get("search_scoring_method", "mom_em3")
     )
     spatial_adjust_method_param = str(study_state.get("spatial_adjust_method", "none"))
-    spatial_adjust_max_df_param = int(study_state.get("spatial_adjust_max_df", 10))
+    spatial_adjust_df_param = study_state.get("spatial_adjust_df")
+    if spatial_adjust_df_param is None:
+        spatial_adjust_df_param = _gf_settings.spatial_df_candidates(study_state)
     spatial_adjust_eps_m_param = study_state.get("spatial_adjust_eps_m")
     spatial_split_param = bool(study_state.get("spatial_split", False))
     spatial_block_size_m_param = study_state.get("spatial_block_size_m")
@@ -6500,6 +6685,14 @@ def render(output_dir: str) -> None:
                 "split_seed": int(split_seed),
                 "objective_metric": objective_metric,
                 "residualize_method": residualize_method_param,
+                **{
+                    k: study_state.get(k, _fs_default(k))
+                    for k in (
+                        "residualize_spline_df",
+                        "residualize_spline_min_unique",
+                        "exposure_response_spline_df",
+                    )
+                },
                 "search_scoring_method": search_scoring_method_param,
                 "ndvi_start_date": ndvi_auto_start.isoformat(),
                 "ndvi_end_date": ndvi_auto_end.isoformat(),
@@ -6543,10 +6736,20 @@ def render(output_dir: str) -> None:
                 "spatial_adjust_method": (
                     spatial_adjust_method_param if is_vector_target else "none"
                 ),
-                "spatial_adjust_max_df": int(spatial_adjust_max_df_param),
+                "spatial_adjust_df": list(spatial_adjust_df_param),
                 "spatial_adjust_eps_m": (
                     spatial_adjust_eps_m_param if is_vector_target else None
                 ),
+                **{
+                    k: study_state.get(k, _fs_default(k))
+                    for k in (
+                        "spatial_adjust_criterion",
+                        "spatial_adjust_neighbours",
+                        "spatial_adjust_knots_min",
+                        "spatial_adjust_knots_max",
+                        "spatial_paired_smooth",
+                    )
+                },
                 # Spatial block validation applies to vector targets only;
                 # raster targets keep the row-level stratified split.
                 "spatial_split": (

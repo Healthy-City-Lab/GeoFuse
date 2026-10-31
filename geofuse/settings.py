@@ -29,8 +29,10 @@ class Setting:
     """One setting: its type, default, allowed values and a one-line help.
 
     ``kind`` is ``bool``, ``int``, ``float``, ``choice``, ``multichoice``,
-    ``text`` or ``chains`` (NDVI aggregation chains: ``{name, steps}`` tables
-    or ``"name: op, op"`` lines, stored as tables). A ``None`` default marks
+    ``intlist`` (whole numbers within ``lo`` .. ``hi``, given as a list or as
+    comma-separated text, stored sorted without repeats), ``text`` or
+    ``chains`` (NDVI aggregation chains: ``{name, steps}`` tables or
+    ``"name: op, op"`` lines, stored as tables). A ``None`` default marks
     an optional setting whose absence has a meaning of its own (given in
     ``help``). ``auto_zero`` marks a number whose 0 means "work it out" and is
     stored as ``None``, the way the tabs read a 0 in those fields. ``step``
@@ -73,6 +75,8 @@ class Setting:
                     f"'{key}' may only contain {list(self.choices)}, not {bad}."
                 )
             return [c for c in self.choices if c in value]
+        if self.kind == "intlist":
+            return self._int_list(key, value)
         if self.kind == "text":
             if not isinstance(value, str):
                 raise SettingError(f"'{key}' must be text, not {value!r}.")
@@ -83,6 +87,21 @@ class Setting:
             except ChainError as exc:
                 raise SettingError(f"'{key}': {exc}") from None
         raise AssertionError(self.kind)
+
+    def _int_list(self, key: str, value: Any) -> list[int]:
+        if isinstance(value, str):
+            parts = [p.strip() for p in value.replace(";", ",").split(",")]
+            try:
+                value = [int(p) for p in parts if p]
+            except ValueError:
+                raise SettingError(
+                    f"'{key}' must be whole numbers separated by commas, "
+                    f"not {value!r}."
+                ) from None
+        if not isinstance(value, list | tuple) or not value:
+            raise SettingError(f"'{key}' must be a non-empty list of whole numbers.")
+        whole = Setting("int", 0, lo=self.lo, hi=self.hi)
+        return sorted({whole._number(key, v) for v in value})
 
     def _number(self, key: str, value: Any) -> int | float | None:
         whole = self.kind == "int"
@@ -177,6 +196,12 @@ ASSOCIATION_TARGETS = ("level", "decline_overall", "decline_average", "decline_c
 SEARCH_SCORING_METHODS = ("mom_em3", "mom_em1", "mom", "exact")
 #: Spatial-confounding adjustments of the fusion objective.
 SPATIAL_ADJUST_METHODS = ("none", "ks_aic", "spatial_plus")
+#: ``geofuse.spatial_basis.DEFAULT_DF_CANDIDATES``.
+SPATIAL_DF_CANDIDATES = (0, 1, 2, 3, 4, 6, 8, 11, 15, 20)
+#: ``geofuse.spatial_basis.CRITERIA``.
+SPATIAL_CRITERIA = ("aic", "bic")
+#: ``geofuse.fusion.SPATIAL_PAIRED_SMOOTHS``.
+SPATIAL_PAIRED_SMOOTHS = ("own", "cgi", "outcome", "max")
 #: ``geofuse.pdcor.MAX_CACHE_N``: above it ``partial_distance_corr`` leaves its
 #: shared-matrix fast path.
 PDCOR_CACHE_N = 6_000
@@ -324,6 +349,12 @@ FUSION: dict[str, Setting] = {
     "residualize_method": _choice(
         "linear", ("linear", "spline"), "How covariates are partialled out."
     ),
+    "residualize_spline_df": _int(
+        4, 3, 20, "Spline df of each continuous covariate (spline residualizing)."
+    ),
+    "residualize_spline_min_unique": _int(
+        7, 2, 1000, "Covariates with fewer distinct values enter linearly."
+    ),
     "categorical_missing": _choice(
         "drop",
         CATEGORICAL_MISSING,
@@ -339,6 +370,9 @@ FUSION: dict[str, Setting] = {
         hi=10.0,
         auto_zero=True,
         help="Greenery increment of the per-IQR effect; 0 = from the composite.",
+    ),
+    "exposure_response_spline_df": _int(
+        4, 3, 20, "Spline df of the exposure-response curve and linearity test."
     ),
     "multi_objective_requested": _bool(False, "Several outcomes as one joint run."),
     # ── Discovery ───────────────────────────────────────────────
@@ -412,9 +446,36 @@ FUSION: dict[str, Setting] = {
     "spatial_adjust_method": _choice(
         "none", SPATIAL_ADJUST_METHODS, "Spatial-confounding adjustment."
     ),
-    "spatial_adjust_max_df": _int(10, 1, 50, "Largest spatial df per cluster."),
+    "spatial_adjust_df": Setting(
+        "intlist",
+        list(SPATIAL_DF_CANDIDATES),
+        lo=0,
+        hi=50,
+        help="Spatial df per cluster the criterion compares (0 = linear trends).",
+    ),
+    "spatial_adjust_max_df": _int(
+        None,
+        1,
+        50,
+        "Older form of spatial_adjust_df: compare every df 0..N; 0 = unset.",
+        auto_zero=True,
+    ),
+    "spatial_adjust_criterion": _choice(
+        "aic", SPATIAL_CRITERIA, "Criterion that picks the spatial df."
+    ),
     "spatial_adjust_eps_m": Setting(
         "float", None, lo=0.0, auto_zero=True, help="Cluster gap (m); 0 = automatic."
+    ),
+    "spatial_adjust_neighbours": _int(
+        10, 1, 100, "Neighbours that link points into one cluster (gap automatic)."
+    ),
+    "spatial_adjust_knots_min": _int(35, 3, 2000, "Fewest knots per cluster."),
+    "spatial_adjust_knots_max": _int(150, 3, 2000, "Most knots per cluster."),
+    "spatial_paired_smooth": _choice(
+        "own",
+        SPATIAL_PAIRED_SMOOTHS,
+        "Spatial+ paired tests: each exposure's own smooth, the CGI's, the "
+        "outcome's, or the larger df.",
     ),
     # ── Longitudinal (mixed-effects) ────────────────────────────
     "association_target": _choice(
@@ -509,4 +570,39 @@ def check(engine: str, values: Mapping[str, Any]) -> dict[str, Any]:
     lo, hi = "season_start_month", "season_end_month"
     if engine == "ndvi" and lo in out and hi in out and out[lo] > out[hi]:
         raise SettingError(f"'{lo}' must be on or before '{hi}'.")
+    if engine == "fusion":
+        _check_spatial(out)
     return out
+
+
+def _check_spatial(out: Mapping[str, Any]) -> None:
+    """Refuse a df list given twice, knots that run backwards, and a df the
+    knots cannot hold."""
+    dfs = spatial_df_candidates(out)
+    lo, hi = "spatial_adjust_knots_min", "spatial_adjust_knots_max"
+    if lo in out and hi in out and out[lo] > out[hi]:
+        raise SettingError(f"'{lo}' must not exceed '{hi}'.")
+    if hi in out and max(dfs) > out[hi]:
+        raise SettingError(
+            f"The largest spatial df ({max(dfs)}) exceeds '{hi}' ({out[hi]}); a "
+            "cluster has at most that many radial functions."
+        )
+
+
+def spatial_df_candidates(values: Mapping[str, Any]) -> list[int]:
+    """The df list a fusion job compares: ``spatial_adjust_max_df`` N as
+    ``0 … N`` when given (the older form), else ``spatial_adjust_df``.
+
+    Raises :class:`SettingError` when both are set and the list is not its
+    default (a merged settings table cannot tell a default list from a given
+    one).
+    """
+    legacy = values.get("spatial_adjust_max_df")
+    listed = values.get("spatial_adjust_df")
+    if legacy is None:
+        return list(listed if listed is not None else SPATIAL_DF_CANDIDATES)
+    if listed is not None and list(listed) != list(SPATIAL_DF_CANDIDATES):
+        raise SettingError(
+            "Give 'spatial_adjust_df' or the older 'spatial_adjust_max_df', not both."
+        )
+    return list(range(0, int(legacy) + 1))

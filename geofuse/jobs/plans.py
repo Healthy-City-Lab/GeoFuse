@@ -932,6 +932,9 @@ def fusion_run_config(spec: JobSpec) -> dict[str, Any]:
         "outer_comparators": s["outer_comparators"],
         "objective_metric": s["objective_metric"],
         "residualize_method": s["residualize_method"],
+        "residualize_spline_df": int(s["residualize_spline_df"]),
+        "residualize_spline_min_unique": int(s["residualize_spline_min_unique"]),
+        "exposure_response_spline_df": int(s["exposure_response_spline_df"]),
         "search_scoring_method": s["search_scoring_method"],
         "ndvi_start_date": _FUSION_NDVI_WINDOW[0],
         "ndvi_end_date": _FUSION_NDVI_WINDOW[1],
@@ -973,12 +976,17 @@ def fusion_run_config(spec: JobSpec) -> dict[str, Any]:
         "whole_grid_scaling": bool(s["whole_grid_scaling"]) if vector else True,
         "area_balanced_split": bool(s["area_balanced_split"]) if polygon else False,
         "spatial_adjust_method": adjust,
-        "spatial_adjust_max_df": int(
-            s["spatial_adjust_max_df"]
+        "spatial_adjust_df": (
+            _settings.spatial_df_candidates(s)
             if adjusted
-            else _settings.FUSION["spatial_adjust_max_df"].default
+            else list(_settings.SPATIAL_DF_CANDIDATES)
         ),
         "spatial_adjust_eps_m": s["spatial_adjust_eps_m"] if adjusted else None,
+        "spatial_adjust_criterion": s["spatial_adjust_criterion"],
+        "spatial_adjust_neighbours": int(s["spatial_adjust_neighbours"]),
+        "spatial_adjust_knots_min": int(s["spatial_adjust_knots_min"]),
+        "spatial_adjust_knots_max": int(s["spatial_adjust_knots_max"]),
+        "spatial_paired_smooth": s["spatial_paired_smooth"],
         "spatial_split": bool(blocks),
         "spatial_block_size_m": s["spatial_block_size_m"] if blocks else None,
         "spatial_split_mode": s["spatial_split_mode"] if blocks else "stripe",

@@ -241,6 +241,12 @@ class TestEveryRecordedSettingIsRestored(unittest.TestCase):
         self.fusion._seed_fusion_form(_params())
         self.assertEqual(self.state["fusion_negative_controls"], [])
 
+    def test_the_spatial_df_list_comes_back_as_text(self):
+        self.fusion._seed_fusion_form(_params(spatial_adjust_df=[0, 4, 20]))
+        self.assertEqual(self.state["fusion_spatial_adjust_df"], "0, 4, 20")
+        self.fusion._seed_fusion_form(_params(spatial_adjust_max_df=3))
+        self.assertEqual(self.state["fusion_spatial_adjust_df"], "0, 1, 2, 3")
+
     def test_recorded_config_keys_reach_a_widget_or_a_named_handler(self):
         """Every key in the recorded config must have a restore route.
 
@@ -274,6 +280,8 @@ class TestEveryRecordedSettingIsRestored(unittest.TestCase):
             # has to seed the widget as 0.0, which the generic map — which
             # skips ``None`` outright — cannot express.
             "exposure_iqr",
+            # A list shown as comma-separated text.
+            "spatial_adjust_df",
         }
         missing = [
             k
