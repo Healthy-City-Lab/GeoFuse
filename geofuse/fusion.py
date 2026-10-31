@@ -7394,6 +7394,11 @@ class MetricFusionEngine:
         built. ``p_value`` is the one-sided bootstrap tail (share of replicates
         with difference ≤ 0). Without ``bootstrap`` only the observed
         difference is computed.
+
+        With spatial adjustment each composite is scored with the smooth
+        :attr:`spatial_paired_smooth` gives it (:meth:`_paired_smooths`); a
+        resample carries both smooths' columns with its rows, and the result
+        records the rule and each side's df under ``spatial_adjustment``.
         """
         if metric not in objective_scoring.SUPPORTED_METRICS:
             if self.is_longitudinal and metric in mixed_effects_scoring.MIXEDLM_METRICS:
@@ -7456,10 +7461,12 @@ class MetricFusionEngine:
             target = merged["target"].to_numpy(dtype=np.float64)
             cgi_c = merged["composite_cgi"].to_numpy(dtype=np.float64)
             std_c = merged["composite_std"].to_numpy(dtype=np.float64)
-            # Both composites share the same outcome-selected smooth; it rides in
-            # the resampled controls and is split back out per replicate so the
-            # paired difference is adjusted exactly as the objective was.
-            cov, n_cov_cols = self._augment_cov_with_spatial(merged, target, cgi_c, cov)
+            n_cov_cols = 0 if cov is None else int(np.asarray(cov).shape[1])
+            # Each composite's smooth under the paired rule; the smooths ride
+            # in the resampled rows and join each side's controls per replicate.
+            s_cgi, s_std, spatial_record = self._paired_smooths(
+                self._whole_data_coords(merged), target, cov, cgi_c, std_c
+            )
         except Exception as exc:
             logger.warning(f"paired_objective_difference: alignment failed: {exc}")
             return None
@@ -7468,19 +7475,24 @@ class MetricFusionEngine:
         # anyway, and doing it here keeps the shared-distance-matrix replicate
         # path (which cannot mask per composite) available for the whole loop.
         finite = np.isfinite(target) & np.isfinite(cgi_c) & np.isfinite(std_c)
-        if cov is not None:
-            finite &= np.isfinite(cov).all(axis=1)
+        for block in (cov, s_cgi, s_std):
+            if block is not None:
+                finite &= np.isfinite(block).all(axis=1)
         if not finite.all():
             target = target[finite]
             cgi_c = cgi_c[finite]
             std_c = std_c[finite]
-            if cov is not None:
-                cov = cov[finite]
+            cov = None if cov is None else cov[finite]
+            shared = s_std is s_cgi
+            s_cgi = None if s_cgi is None else s_cgi[finite]
+            s_std = s_cgi if shared else (None if s_std is None else s_std[finite])
             if eid is not None:
                 eid = eid[finite]
 
         if len(target) < 3:
             return None
+        ctrl_cgi = self._with_smooth(cov, s_cgi)
+        ctrl_std = ctrl_cgi if s_std is s_cgi else self._with_smooth(cov, s_std)
 
         # A panel's waves are resampled with their entity, as the test-score
         # bootstrap does, so correlated rows are not counted as independent.
@@ -7509,8 +7521,8 @@ class MetricFusionEngine:
                 )
             )
 
-        obs_cgi = _score(target, cgi_c, cov)
-        obs_std = _score(target, std_c, cov)
+        obs_cgi = _score(target, cgi_c, ctrl_cgi)
+        obs_std = _score(target, std_c, ctrl_std)
         obs_diff = sign * (obs_cgi - obs_std)
         result = {
             "observed_diff": float(obs_diff),
@@ -7520,6 +7532,8 @@ class MetricFusionEngine:
             "n": int(len(target)),
             "favors_cgi": bool(obs_diff > 0),
         }
+        if spatial_record is not None:
+            result["spatial_adjustment"] = spatial_record
         if not bootstrap:
             return result
 
@@ -7527,28 +7541,60 @@ class MetricFusionEngine:
         # on the same resample, so the target / conditioning distance matrices
         # are precomputed once and shared. Requires fully finite inputs (the
         # generic path masks NaN rows inside score(), which an index-vector
-        # scorer cannot reproduce per composite).
+        # scorer cannot reproduce per composite) and one control matrix.
         fast_pair = None
-        if metric == "partial_distance_corr" and cov is not None:
-            fast_pair = pdcor.pdcor_paired_replicate_scorers(target, cgi_c, std_c, cov)
+        if (
+            metric == "partial_distance_corr"
+            and ctrl_cgi is not None
+            and ctrl_std is ctrl_cgi
+        ):
+            fast_pair = pdcor.pdcor_paired_replicate_scorers(
+                target, cgi_c, std_c, ctrl_cgi
+            )
+        engine = None
+        if metric == "r2" and self._block_resampling(metric) and s_cgi is not None:
+            engine = self._paired_engine(target, cgi_c, std_c, cov, s_cgi, s_std)
 
         rng = np.random.default_rng(int(seed))
         n = len(target)
         diffs = np.empty(int(n_bootstrap), dtype=np.float64)
-        for i in range(int(n_bootstrap)):
+
+        def draw():
             if blocks is None:
-                idx = rng.integers(0, n, size=n)
-            else:
-                picks = rng.integers(0, len(blocks), size=len(blocks))
-                idx = np.concatenate([blocks[j] for j in picks])
+                return rng.integers(0, n, size=n)
+            picks = rng.integers(0, len(blocks), size=len(blocks))
+            return np.concatenate([blocks[j] for j in picks])
+
+        if engine is not None:
+            for start in range(0, int(n_bootstrap), resampling.CHUNK):
+                if self._cancel_callback is not None and self._cancel_callback():
+                    raise JobCancelled("Paired bootstrap cancelled by user.")
+                stop = min(start + resampling.CHUNK, int(n_bootstrap))
+                W = np.stack(
+                    [np.bincount(draw(), minlength=n) for _ in range(start, stop)]
+                ).astype(np.float64)
+                try:
+                    sc, ss = engine(W)
+                    diffs[start:stop] = sign * (sc - ss)
+                except Exception:
+                    diffs[start:stop] = np.nan
+        for i in range(0 if engine is not None else int(n_bootstrap)):
+            idx = draw()
             try:
                 if fast_pair is not None:
                     sc = fast_pair[0](idx)
                     ss = fast_pair[1](idx)
                 else:
-                    cov_i = None if cov is None else cov[idx]
-                    sc = _score(target[idx], cgi_c[idx], cov_i)
-                    ss = _score(target[idx], std_c[idx], cov_i)
+                    sc = _score(
+                        target[idx],
+                        cgi_c[idx],
+                        None if ctrl_cgi is None else ctrl_cgi[idx],
+                    )
+                    ss = _score(
+                        target[idx],
+                        std_c[idx],
+                        None if ctrl_std is None else ctrl_std[idx],
+                    )
                 diffs[i] = sign * (sc - ss)
             except Exception:
                 diffs[i] = np.nan
@@ -7563,6 +7609,105 @@ class MetricFusionEngine:
             p_value=float((np.sum(valid <= 0.0) + 1) / (len(valid) + 1)),
         )
         return result
+
+    @staticmethod
+    def _paired_engine(target, cgi_c, std_c, cov, s_cgi, s_std):
+        """Both composites' incremental R² per row of a weight matrix.
+
+        One design when the two share a smooth (both responses read off one
+        set of cross-products), one per composite otherwise.
+        """
+        t = target
+        if s_std is s_cgi:
+            design = resampling.BlockDesign(len(t), cov, s_cgi)
+            R = np.column_stack([t, cgi_c, std_c])
+
+            def both(W):
+                M = design.cross(R, W)
+                sst = resampling.weighted_sst(t, W)
+                return tuple(
+                    resampling.incremental_r2(
+                        M[:, [0, j]][:, :, [0, j]],
+                        sst,
+                        resampling.weighted_sst(x, W),
+                    )
+                    for j, x in ((1, cgi_c), (2, std_c))
+                )
+
+            return both
+        designs = [
+            (resampling.BlockDesign(len(t), cov, s), np.column_stack([t, x]), x)
+            for s, x in ((s_cgi, cgi_c), (s_std, std_c))
+        ]
+
+        def each(W):
+            sst = resampling.weighted_sst(t, W)
+            return tuple(
+                resampling.incremental_r2(
+                    d.cross(R, W), sst, resampling.weighted_sst(x, W)
+                )
+                for d, R, x in designs
+            )
+
+        return each
+
+    def _paired_smooths(self, coords, target, cov, cgi_c, other_c):
+        """The two smooths of a paired CGI-vs-exposure test, and their record.
+
+        ``(smooth of the CGI, smooth of the other exposure, record)``; the same
+        array twice when the two share one, ``(None, None, None)`` unadjusted.
+        Under ``spatial_plus`` :attr:`spatial_paired_smooth` decides: ``own``
+        selects each smooth on its exposure (as when each is scored alone),
+        ``cgi`` gives both the CGI's, ``outcome`` both one selected on the
+        outcome given the covariates (the KS-AIC rule), ``max`` both the larger
+        of the two exposures' dfs. Under ``ks_aic`` the smooth is selected on
+        the outcome already, so every rule is ``outcome``. The record is
+        ``{"method", "rule", "df_cgi", "df_exposure"}``.
+        """
+        method = self.spatial_adjust_method
+        if method == "none" or coords is None:
+            return None, None, None
+        rule = self.spatial_paired_smooth if method == "spatial_plus" else "outcome"
+
+        def cols(chosen):
+            if chosen is None or chosen["columns"] is None:
+                return None, None
+            return chosen["columns"], chosen["df"]
+
+        if rule == "outcome":
+            s, df = cols(
+                self._spatial_selection(coords, target, cov, cgi_c, on="outcome")
+            )
+            s_cgi = s_std = s
+            df_cgi = df_std = df
+        else:
+            s_cgi, df_cgi = cols(self._spatial_selection(coords, target, cov, cgi_c))
+            s_std, df_std = s_cgi, df_cgi
+            if rule != "cgi":
+                s_std, df_std = cols(
+                    self._spatial_selection(coords, target, cov, other_c)
+                )
+            if rule == "max":
+                dfs = [d for d in (df_cgi, df_std) if d is not None]
+                df_cgi = df_std = max(dfs) if dfs else None
+                s_cgi = s_std = self._smooth_at(coords, target, cov, df_cgi)
+        record = {
+            "method": method,
+            "rule": rule,
+            "df_cgi": df_cgi,
+            "df_exposure": df_std,
+        }
+        return s_cgi, s_std, record
+
+    def _smooth_at(self, coords, target, cov, df):
+        """The split's smooth at a given df (``None`` at ``None``)."""
+        if df is None:
+            return None
+        key = _helpers.spatial_cache_key(
+            np.asarray(coords, dtype=np.float64), target, cov
+        )
+        design = self._spatial_basis_cache[key]["basis"].design(int(df))
+        return design if design.shape[1] else None
 
     def compute_subset_scores(
         self,

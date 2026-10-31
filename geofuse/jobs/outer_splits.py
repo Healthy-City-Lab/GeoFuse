@@ -189,6 +189,7 @@ def split_rows(
             _row(
                 "cgi_minus_channel",
                 str(channel_paired.get("standalone_channel")),
+                channel_paired.get("spatial_adjustment"),
                 estimate=channel_paired.get("observed_diff"),
                 ci_low=channel_paired.get("lower"),
                 ci_high=channel_paired.get("upper"),
@@ -200,6 +201,7 @@ def split_rows(
             _row(
                 "cgi_minus_comparator",
                 str(r.get("comparator")),
+                r.get("spatial_adjustment"),
                 estimate=r.get("observed_diff"),
                 ci_low=r.get("lower"),
                 ci_high=r.get("upper"),

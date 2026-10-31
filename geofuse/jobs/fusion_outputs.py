@@ -711,6 +711,7 @@ def _write_fusion_outputs(
                 "cgi_score_all": _f(r.get("cgi_score_all")),
                 "comparator_score_all": _f(r.get("standalone_score_all")),
                 "n_all": r.get("n_all"),
+                **spatial_columns(r.get("spatial_adjustment")),
             }
             for r in (cgi_bundle or {}).get("cgi_vs_comparator_paired") or []
         ]
