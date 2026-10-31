@@ -41,6 +41,7 @@ from . import (
     parallel,
     pdcor,
     preaggregation,
+    resampling,
     spatial_basis,
 )
 from .cgi_formulas import WEIGHTED_AVERAGE, compute_cgi
@@ -6449,9 +6450,44 @@ class MetricFusionEngine:
             ),
             groups=groups,
             cancel_callback=self._cancel_callback,
+            batch_scorer_factory=self._replicate_scorers(metric, n_cov_cols)[0],
         )
         ci["n"] = n
         return ci
+
+    def _block_resampling(self, metric: str) -> bool:
+        """Whether resampled ``metric`` scores take :mod:`geofuse.resampling`.
+
+        The block engine serves the incremental R² (and, through each
+        replicate's residuals, ``distance_corr`` and ``nrmse``) once a spatial
+        smooth joins the controls, where per-replicate ``lstsq`` over the
+        smooth's columns dominates a report. A replicate must be a row
+        selection of fixed columns, which spline-expanded covariates are not
+        (their knots move with the rows), nor rank-transformed ones
+        (``spearman``); without a smooth the direct fits take seconds. Those
+        keep the per-replicate fits.
+        """
+        return (
+            metric in ("r2", *resampling.RESIDUAL_METRICS)
+            and self.spatial_adjust_method != "none"
+            and self.residualize_method == "linear"
+        )
+
+    def _replicate_scorers(self, metric: str, n_cov_cols: int) -> tuple:
+        """``(bootstrap, permutation)`` scorer factories of the block engine
+        for ``[covariates | smooth]`` controls, ``(None, None)`` without it."""
+        if not self._block_resampling(metric):
+            return None, None
+        if metric == "r2":
+            return (
+                resampling.r2_bootstrap_scorer(n_cov_cols),
+                resampling.r2_permutation_scorer(n_cov_cols),
+            )
+        method = self.spatial_adjust_method
+        return (
+            resampling.residual_bootstrap_scorer(metric, n_cov_cols, method),
+            resampling.residual_permutation_scorer(metric, n_cov_cols, method),
+        )
 
     def _full_data_frame(self) -> "pd.DataFrame | None":
         """train+val+test union frame, concatenated once and cached.
@@ -6843,6 +6879,7 @@ class MetricFusionEngine:
             if t_arr is None or c_arr is None or len(t_arr) < 3:
                 return out
             _score_fn = _make_score_fn(n_cov_cols)
+            boot_scorer, perm_scorer = self._replicate_scorers(metric, n_cov_cols)
             try:
                 ci = _stats_mod.bootstrap_score_ci(
                     t_arr,
@@ -6855,6 +6892,7 @@ class MetricFusionEngine:
                     covariates=cov,
                     replicate_scorer_factory=rep_factory,
                     cancel_callback=self._cancel_callback,
+                    batch_scorer_factory=boot_scorer,
                 )
                 out["score"] = ci.get("observed")
                 out["lower"] = ci.get("lower")
@@ -6873,6 +6911,7 @@ class MetricFusionEngine:
                         covariates=cov,
                         surrogate_scorer_factory=sur_factory,
                         cancel_callback=self._cancel_callback,
+                        permutation_scorer_factory=perm_scorer,
                     )
                     out["p_value"] = perm.get("p_value")
                     if out["score"] is None:

@@ -337,6 +337,24 @@ def _ols_r2(y: np.ndarray, X: np.ndarray | None) -> float:
     return 1.0 - float(((y - yhat) ** 2).sum()) / ss_tot
 
 
+def _r2_over_smooth(
+    t: np.ndarray, c: np.ndarray, cov: np.ndarray | None, sb: np.ndarray
+) -> float:
+    """Incremental R² of ``c`` over ``[1, cov, smooth]``, by one projection.
+
+    Frisch–Waugh: the drop in residual sum of squares when ``c`` joins the
+    controls is ``(r_tᵀ r_c)² / r_cᵀ r_c`` with ``r`` the residuals on the
+    controls, which :class:`resampling.BlockDesign` forms cluster by cluster
+    instead of two ``lstsq`` fits over every smooth column.
+    """
+    from .resampling import BlockDesign, incremental_r2, weighted_sst
+
+    W = np.ones((1, len(t)))
+    M = BlockDesign(len(t), cov, sb).cross(np.column_stack([t, c]), W)
+    s = float(incremental_r2(M, weighted_sst(t, W), weighted_sst(c, W))[0])
+    return 0.0 if np.isnan(s) else s
+
+
 def _minmax01(v: np.ndarray) -> np.ndarray:
     """Scale ``v`` to ``[0, 1]``. A constant vector maps to all-zeros."""
     lo = float(np.min(v))
@@ -694,6 +712,9 @@ def score(
             # a large negative number that measures the scale gap and nothing
             # about the association. Both forms agree when the two happen to
             # share a scale; only this one is meaningful when they do not.
+            if sb is not None:
+                s = _r2_over_smooth(t, c, cov_res, sb)
+                return (s, 1.0) if return_pvalue else s
             ctrl = _stack(cov_res, sb)
             X_red = ctrl
             X_full = c.reshape(-1, 1) if ctrl is None else np.column_stack([ctrl, c])

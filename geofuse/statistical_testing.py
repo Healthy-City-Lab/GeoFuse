@@ -208,6 +208,7 @@ def bootstrap_score_ci(
     replicate_scorer_factory=None,
     groups: np.ndarray | None = None,
     cancel_callback=None,
+    batch_scorer_factory=None,
 ) -> dict:
     """Bootstrap CI on ``score_fn(target, prediction)``.
 
@@ -255,6 +256,13 @@ def bootstrap_score_ci(
             resample for panel data (repeated measures per entity): resampling
             rows independently would break the within-group correlation and make
             the CI too narrow. ``None`` keeps the row-level bootstrap (unchanged).
+        batch_scorer_factory: optional ``(t, p, cov) -> (callable(W) -> scores)
+            | None``, called once with the NaN-masked arrays. ``W`` is a
+            ``(B, n)`` matrix of row multiplicities (one replicate per row) and
+            the scorer returns the ``B`` replicate scores; it takes precedence
+            over ``replicate_scorer_factory``. The replicates drawn are the
+            same either way, so the interval is the same up to floating point
+            (see :mod:`geofuse.resampling`).
 
     Returns:
         Dict with ``observed``, ``mean``, ``lower``, ``upper``, ``ci_level``,
@@ -320,9 +328,17 @@ def bootstrap_score_ci(
 
     observed = _score(t, p, None)
 
+    # Optional batched fast path: replicate weights scored a chunk at a time.
+    batch_scorer = None
+    if batch_scorer_factory is not None:
+        try:
+            batch_scorer = batch_scorer_factory(t, p, cov_arr)
+        except Exception:
+            batch_scorer = None
+
     # Optional index-vector fast path (precomputed distance matrices etc.).
     replicate_scorer = None
-    if replicate_scorer_factory is not None:
+    if batch_scorer is None and replicate_scorer_factory is not None:
         try:
             replicate_scorer = replicate_scorer_factory(t, p, cov_arr)
         except Exception:
@@ -342,7 +358,17 @@ def bootstrap_score_ci(
         n_groups = len(group_row_indices)
         boot_idx = None
         boot_groups = rng.integers(0, n_groups, size=(n_bootstrap, n_groups))
-    for i in range(n_bootstrap):
+    if batch_scorer is not None:
+        scores = _batched_scores(
+            batch_scorer,
+            n_bootstrap,
+            n,
+            boot_idx,
+            boot_groups,
+            group_row_indices,
+            cancel_callback,
+        )
+    for i in range(0 if batch_scorer is not None else n_bootstrap):
         if cancel_callback is not None and i % _CANCEL_POLL_EVERY == 0:
             if cancel_callback():
                 raise JobCancelled("Bootstrap CI cancelled by user.")
@@ -391,7 +417,9 @@ def bootstrap_score_ci(
         jack_scores = np.empty(jack_n, dtype=np.float64)
         base_idx = np.arange(n)
         keep_mask = np.ones(n, dtype=bool)
-        for i in range(jack_n):
+        if batch_scorer is not None:
+            jack_scores = _jackknife_scores(batch_scorer, n, jack_units)
+        for i in range(0 if batch_scorer is not None else jack_n):
             drop = np.array([i]) if jack_units is None else jack_units[i]
             keep_mask[drop] = False
             keep = base_idx[keep_mask]
@@ -442,6 +470,59 @@ def bootstrap_score_ci(
     }
 
 
+def _batched_scores(
+    scorer, n_bootstrap, n, boot_idx, boot_groups, group_rows, cancel_callback
+) -> np.ndarray:
+    """Replicate scores from a batch scorer, a chunk of weight rows at a time."""
+    from .resampling import CHUNK
+
+    scores = np.empty(n_bootstrap, dtype=np.float64)
+    codes = None
+    if group_rows is not None:
+        codes = np.empty(n, dtype=np.int64)
+        for g, rows in enumerate(group_rows):
+            codes[rows] = g
+    for start in range(0, n_bootstrap, CHUNK):
+        if cancel_callback is not None and cancel_callback():
+            raise JobCancelled("Bootstrap CI cancelled by user.")
+        stop = min(start + CHUNK, n_bootstrap)
+        if group_rows is None:
+            W = np.empty((stop - start, n))
+            for b in range(start, stop):
+                W[b - start] = np.bincount(boot_idx[b], minlength=n)
+        else:
+            m = np.empty((stop - start, len(group_rows)))
+            for b in range(start, stop):
+                m[b - start] = np.bincount(
+                    boot_groups[b], minlength=len(group_rows)
+                )
+            W = m[:, codes]
+        try:
+            scores[start:stop] = scorer(W)
+        except Exception:
+            scores[start:stop] = np.nan
+    return scores
+
+
+def _jackknife_scores(scorer, n, units) -> np.ndarray:
+    """Leave-one-out scores from a batch scorer: one row, or one whole group,
+    weighted zero per replicate."""
+    from .resampling import CHUNK
+
+    drops = [np.array([i]) for i in range(n)] if units is None else list(units)
+    out = np.empty(len(drops), dtype=np.float64)
+    for start in range(0, len(drops), CHUNK):
+        stop = min(start + CHUNK, len(drops))
+        W = np.ones((stop - start, n))
+        for b in range(start, stop):
+            W[b - start, drops[b]] = 0.0
+        try:
+            out[start:stop] = scorer(W)
+        except Exception:
+            out[start:stop] = np.nan
+    return out
+
+
 # ────────────────────────────────────────────────────────────────────
 # Permutation significance
 # ────────────────────────────────────────────────────────────────────
@@ -458,6 +539,7 @@ def permutation_pvalue(
     covariates: np.ndarray | None = None,
     surrogate_scorer_factory=None,
     cancel_callback=None,
+    permutation_scorer_factory=None,
 ) -> dict:
     """One-sided permutation p-value for ``score_fn(target, prediction)``.
 
@@ -480,6 +562,12 @@ def permutation_pvalue(
     sides stay fixed across all permutations, so the O(n²) metrics reuse their
     precomputed U-centered matrices. The observed score always comes from
     ``score_fn``; ``None`` keeps the generic path.
+
+    ``permutation_scorer_factory`` (optional, covariate case only):
+    ``(t_fit, t_res, p, cov) -> (callable(perms) -> scores) | None`` with the
+    Freedman–Lane fitted part and residuals; ``perms`` is a ``(B, n)`` array of
+    permutations, scored a chunk at a time. The permutations drawn are the same
+    as on the other paths; it takes precedence over the surrogate scorer.
 
     Returns a dict with ``observed``, ``p_value``, ``n_perm`` (effective),
     ``null_mean``, and ``higher_is_better``.
@@ -531,6 +619,24 @@ def permutation_pvalue(
         t_fit = Xc @ beta
         t_res = t - t_fit
 
+        perm_scorer = None
+        if permutation_scorer_factory is not None:
+            try:
+                perm_scorer = permutation_scorer_factory(t_fit, t_res, p, cov_arr)
+            except Exception:
+                perm_scorer = None
+        if perm_scorer is not None:
+            return _batched_permutations(
+                perm_scorer,
+                observed,
+                n,
+                int(n_perm),
+                seed,
+                higher_is_better,
+                cancel_callback,
+                nan_result,
+            )
+
         surrogate_scorer = None
         if surrogate_scorer_factory is not None:
             try:
@@ -573,6 +679,40 @@ def permutation_pvalue(
     return {
         "observed": float(observed),
         "p_value": float(p_value),
+        "n_perm": int(len(valid)),
+        "null_mean": float(np.mean(valid)),
+        "higher_is_better": bool(higher_is_better),
+    }
+
+
+def _batched_permutations(
+    scorer, observed, n, n_perm, seed, higher_is_better, cancel_callback, nan_result
+) -> dict:
+    """:func:`permutation_pvalue`'s null from a batch scorer: the same
+    permutations, drawn in the same order, scored a chunk at a time."""
+    from .resampling import CHUNK
+
+    rng = np.random.default_rng(seed)
+    null = np.empty(n_perm, dtype=np.float64)
+    for start in range(0, n_perm, CHUNK):
+        if cancel_callback is not None and cancel_callback():
+            raise JobCancelled("Permutation test cancelled by user.")
+        stop = min(start + CHUNK, n_perm)
+        perms = np.stack([rng.permutation(n) for _ in range(start, stop)])
+        try:
+            null[start:stop] = scorer(perms)
+        except Exception:
+            null[start:stop] = np.nan
+    valid = null[np.isfinite(null)]
+    if len(valid) == 0:
+        return {**nan_result, "observed": observed}
+    if higher_is_better:
+        count = int(np.sum(valid >= observed))
+    else:
+        count = int(np.sum(valid <= observed))
+    return {
+        "observed": float(observed),
+        "p_value": float((count + 1) / (len(valid) + 1)),
         "n_perm": int(len(valid)),
         "null_mean": float(np.mean(valid)),
         "higher_is_better": bool(higher_is_better),
