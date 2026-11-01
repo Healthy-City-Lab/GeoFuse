@@ -119,6 +119,12 @@ def _outer_lines(outer: dict) -> list[str]:
         return []
     seeds = outer.get("seeds") or []
     methods = [e["spatial_method"] for e in summary if e.get("spatial_method")]
+    # With several scales, each slope says which one it was adjusted at.
+    scales = {e.get("spatial_scale_m") for e in summary} - {None}
+
+    def ladder(e: dict) -> bool:
+        return len(scales) > 1 and e.get("spatial_scale_m") is not None
+
     lines = [
         f"  Across {outer.get('k')} held-out splits"
         + (f" (seeds {seeds[0]}–{seeds[-1]})" if seeds else "")
@@ -138,8 +144,16 @@ def _outer_lines(outer: dict) -> list[str]:
             f"    {_outer_name(e):<22}{median:+.4f} [{lo:+.4f}, {hi:+.4f}]"
             + (f"  holds {share:.0%}" if share is not None else "")
             + (f"  {p_text}" if p_text else "")
+            + (f"  {_scale_name(e['spatial_scale_m'])}" if ladder(e) else "")
         )
     return lines + _posterior_lines(summary)
+
+
+def _scale_name(text: str) -> str:
+    """A ``spatial_scale_m`` cell as words: ``"at 5 km"`` or ``"unadjusted"``."""
+    if text == "none":
+        return "unadjusted"
+    return f"at {float(text) / 1000:g} km"
 
 
 def _specificity_lines(report: dict) -> list[str]:
@@ -193,11 +207,28 @@ def _spatial_lines(bundle: dict) -> list[str]:
     line = f"  Spatial adjust   {adjustment['method']} smooth in the scores"
     if record is not None or any("spatial_method" in r for r in outer):
         line += ", slopes, negative controls and specificity"
-    if record is not None:
+    if record is not None and record.get("scale_m") is not None:
+        line += f" (held-out β: {record.get('df')} smooth functions)"
+    elif record is not None:
         df = record.get("df")
         line += f" (held-out β: df {'none' if df is None else df})"
     lines = [line]
     smoothing = bundle.get("spatial_smoothing") or {}
+    if smoothing.get("scales_m"):
+        scales = [f"{float(v) / 1000:g} km" for v in smoothing["scales_m"]]
+        text = f"  Spatial scale    {scales[0]}"
+        if len(scales) > 1:
+            text += f" (slopes also at {', '.join(scales[1:])} and unadjusted)"
+        text += (
+            f"; {smoothing.get('clusters')} clusters split at "
+            f"{float(smoothing.get('eps_m') or 0) / 1000:g} km"
+        )
+        if smoothing.get("merged_components"):
+            text += (
+                f", {smoothing['merged_components']} smaller ones "
+                f"({smoothing.get('merged_entities')} entities) merged"
+            )
+        lines.append(text + "; paired tests share the smooth")
     if smoothing.get("candidates"):
         text = (
             f"  Spatial df       {smoothing.get('criterion', 'aic').upper()} over "

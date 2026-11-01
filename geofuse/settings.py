@@ -30,7 +30,8 @@ class Setting:
 
     ``kind`` is ``bool``, ``int``, ``float``, ``choice``, ``multichoice``,
     ``intlist`` (whole numbers within ``lo`` .. ``hi``, given as a list or as
-    comma-separated text, stored sorted without repeats), ``text`` or
+    comma-separated text, stored sorted without repeats, or in the order given
+    when ``ordered``), ``text`` or
     ``chains`` (NDVI aggregation chains: ``{name, steps}`` tables or
     ``"name: op, op"`` lines, stored as tables). A ``None`` default marks
     an optional setting whose absence has a meaning of its own (given in
@@ -46,6 +47,7 @@ class Setting:
     hi: float | None = None
     step: int | None = None
     auto_zero: bool = False
+    ordered: bool = False
     help: str = ""
 
     def check(self, key: str, value: Any) -> Any:
@@ -101,7 +103,10 @@ class Setting:
         if not isinstance(value, list | tuple) or not value:
             raise SettingError(f"'{key}' must be a non-empty list of whole numbers.")
         whole = Setting("int", 0, lo=self.lo, hi=self.hi)
-        return sorted({whole._number(key, v) for v in value})
+        numbers = [whole._number(key, v) for v in value]
+        if self.ordered:
+            return list(dict.fromkeys(numbers))
+        return sorted(set(numbers))
 
     def _number(self, key: str, value: Any) -> int | float | None:
         whole = self.kind == "int"
@@ -476,6 +481,23 @@ FUSION: dict[str, Setting] = {
         SPATIAL_PAIRED_SMOOTHS,
         "Spatial+ paired tests: each exposure's own smooth, the CGI's, the "
         "outcome's, or the larger df.",
+    ),
+    "spatial_adjust_scale_m": Setting(
+        "intlist",
+        None,
+        lo=100,
+        hi=1_000_000,
+        ordered=True,
+        help="Smooth by pattern scale (m) instead of df; the first is primary, "
+        "the others are reported for the slopes. Unset = df.",
+    ),
+    "spatial_adjust_min_component": _int(
+        None,
+        1,
+        10_000,
+        "Smaller clusters join their nearest larger one; 0 = 30 with a scale, "
+        "none with df.",
+        auto_zero=True,
     ),
     # ── Longitudinal (mixed-effects) ────────────────────────────
     "association_target": _choice(

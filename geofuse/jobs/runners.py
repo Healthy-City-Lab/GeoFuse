@@ -1232,6 +1232,9 @@ def _run_outer_splits(
     ctx: Any,
     label: str,
     specificity: bool = False,
+    specificity_exposures: dict | None = None,
+    ladder: "list[float | None] | None" = None,
+    primary_scale: float | None = None,
 ) -> dict | None:
     """The first split's results and ``k_splits − 1`` repeats, summarised.
 
@@ -1239,8 +1242,12 @@ def _run_outer_splits(
     reduced to the ones every split scores); the repeats from
     :func:`geofuse.jobs.outer_splits.repeat`, which also redo the specificity
     contrast when ``specificity`` is set. The engine is put back on the first
-    split afterwards. A failure is logged and the run continues. Returns
-    ``{k, seeds, comparators, splits, summary}``.
+    split afterwards. A failure is logged and the run continues. ``ladder``
+    lists the other pattern scales (and ``None``) whose slopes every split,
+    the first included, also reports
+    (:func:`geofuse.jobs.outer_splits.scale_rows`); the summary's Holm families
+    use ``primary_scale``'s rows. Returns ``{k, seeds, comparators, splits,
+    summary}``.
     """
     stage(stage_key, RUNNING)
     scored = set(
@@ -1268,6 +1275,17 @@ def _run_outer_splits(
                 r["primary"] = r["exposure"] in primary
 
             rows.append(r)
+        if ladder:
+            for r in _outer.scale_rows(
+                engine,
+                headline_params,
+                ladder,
+                n_boot=n_paired,
+                exposures=specificity_exposures,
+                label=label,
+            ):
+                r.update(split=0, seed=int(split_seed), **info)
+                rows.append(r)
 
         def _progress(k: int) -> None:
             stage_progress(stage_key, k / k_splits, f"split {k + 1:,}/{k_splits:,}")
@@ -1291,6 +1309,7 @@ def _run_outer_splits(
             progress=_progress,
             cancelled=ctx.is_cancelled,
             specificity=specificity,
+            ladder=ladder,
         )
     except JobCancelled:
         raise
@@ -1308,7 +1327,7 @@ def _run_outer_splits(
         engine.best_params = dict(headline_params)
     if rows is None:
         return None
-    summary = _outer.summarise(rows)
+    summary = _outer.summarise(rows, primary_scale=primary_scale)
     for e in summary:
         if e["quantity"] == "held_out_score":
             continue
@@ -1320,6 +1339,12 @@ def _run_outer_splits(
             f"{e['quantity']} ({e['exposure']}"
             + (f" / {e['control']}" if e.get("control") else "")
             + (f", {e['spatial_method']}" if e.get("spatial_method") else "")
+            + (
+                f", scale {e['spatial_scale_m']}"
+                + (" m" if e["spatial_scale_m"] != "none" else "")
+                if e.get("spatial_scale_m")
+                else ""
+            )
             + "): median "
             f"{_fmt_or_na(e['median'], '.4f')} [{_fmt_or_na(e['min'], '.4f')}, "
             f"{_fmt_or_na(e['max'], '.4f')}], holds in "
@@ -1385,6 +1410,15 @@ def _spatial_df_list(
     if spatial_adjust_df is not None:
         return sorted({int(d) for d in spatial_adjust_df})
     return list(spatial_basis.DEFAULT_DF_CANDIDATES)
+
+
+def _spatial_scale_list(value: "list[float] | float | None") -> list[float]:
+    """The pattern scales of a run in the order given, duplicates dropped:
+    empty without a scale (df mode)."""
+    if value is None:
+        return []
+    values = value if isinstance(value, list | tuple) else [value]
+    return list(dict.fromkeys(float(v) for v in values))
 
 
 def _non_default_options(values: dict) -> dict:
@@ -1733,6 +1767,8 @@ def run_fusion(
     spatial_adjust_knots_min: int = 35,
     spatial_adjust_knots_max: int = 150,
     spatial_paired_smooth: str = "own",
+    spatial_adjust_scale_m: "list[float] | float | None" = None,
+    spatial_adjust_min_component: int | None = None,
     residualize_method: str = "linear",
     residualize_spline_df: int = 4,
     residualize_spline_min_unique: int = 7,
@@ -1811,6 +1847,9 @@ def run_fusion(
     CGI − comparator test whose Holm correction runs over
     ``comparators_primary`` (all of them when ``None``).
 
+    ``spatial_adjust_scale_m`` defines the spatial smooth by pattern scales;
+    with more than one, the slopes are also reported at every other scale and
+    unadjusted, on every held-out split (one split when ``outer_splits`` is 1).
     ``outer_splits`` > 1 repeats split → tuning → held-out scoring on seeds
     ``split_seed + 1 …`` (see :mod:`geofuse.jobs.outer_splits`), scoring the
     comparators ``outer_comparators`` names on each, and reports the spread
@@ -1933,6 +1972,13 @@ def run_fusion(
         )
         # A panel (several rows per entity) skips it once its data are known.
         retune_enabled = bool(negative_control_retune) and bool(negative_controls)
+        spatial_scales = _spatial_scale_list(spatial_adjust_scale_m)
+        # Other scales and the unadjusted slopes, reported next to the primary.
+        scale_ladder: list[float | None] = (
+            [*spatial_scales[1:], None] if len(spatial_scales) > 1 else []
+        )
+        if spatial_adjust_method in (None, "none"):
+            scale_ladder = []
         ledger = _build_fusion_ledger(
             all_labels,
             multi=multi_outcome,
@@ -1941,7 +1987,7 @@ def run_fusion(
             mixedlm_postscore=mixedlm_postscore_enabled,
             negative_control_retune=retune_enabled,
             comparators=bool(comparator_cols),
-            outer_splits=int(outer_splits) > 1,
+            outer_splits=int(outer_splits) > 1 or bool(scale_ladder),
         )
         ctx.update_stage_ledger(ledger.to_dict())
 
@@ -1949,6 +1995,15 @@ def run_fusion(
         # spline residualizing) or differ from their default, so a run without
         # them keeps its record and hash.
         spatial_dfs = _spatial_df_list(spatial_adjust_df, spatial_adjust_max_df)
+        # The scale settings act only when set, so they join the record and
+        # hash only then.
+        scale_settings: dict[str, Any] = {}
+        if spatial_scales:
+            scale_settings["spatial_adjust_scale_m"] = list(spatial_scales)
+        if spatial_adjust_min_component:
+            scale_settings["spatial_adjust_min_component"] = int(
+                spatial_adjust_min_component
+            )
         spatial_settings = {
             "spatial_adjust_criterion": str(spatial_adjust_criterion),
             "spatial_adjust_neighbours": int(spatial_adjust_neighbours),
@@ -1963,6 +2018,7 @@ def run_fusion(
                 "spatial_adjust_eps_m": spatial_adjust_eps_m,
                 **spatial_settings,
                 "spatial_paired_smooth": str(spatial_paired_smooth),
+                **scale_settings,
             }
         spline_settings = {
             "residualize_spline_df": int(residualize_spline_df),
@@ -2246,6 +2302,8 @@ def run_fusion(
                 spatial_adjust_knots_min=int(spatial_adjust_knots_min),
                 spatial_adjust_knots_max=int(spatial_adjust_knots_max),
                 spatial_paired_smooth=str(spatial_paired_smooth),
+                spatial_adjust_scale_m=spatial_scales or None,
+                spatial_adjust_min_component=spatial_adjust_min_component,
                 residualize_method=residualize_method,
                 residualize_spline_df=int(residualize_spline_df),
                 residualize_spline_min_unique=int(residualize_spline_min_unique),
@@ -2605,7 +2663,10 @@ def run_fusion(
                 spatial_adjust_method=spatial_adjust_method,
                 spatial_adjust_df=spatial_dfs,
                 spatial_adjust_eps_m=spatial_adjust_eps_m,
-                spatial_options=_non_default_options(spatial_settings),
+                spatial_options={
+                    **_non_default_options(spatial_settings),
+                    **scale_settings,
+                },
                 residualize_options=(
                     _non_default_options(spline_settings)
                     if residualize_method == "spline"
@@ -3509,7 +3570,7 @@ def run_fusion(
             # Repeated held-out splits
             # ────────────────────────────────────────────
             outer_report: dict | None = None
-            if int(outer_splits) > 1:
+            if int(outer_splits) > 1 or scale_ladder:
                 outer_report = _run_outer_splits(
                     engine,
                     k_splits=int(outer_splits),
@@ -3543,6 +3604,11 @@ def run_fusion(
                         "specificity": specificity_report,
                     },
                     specificity=specificity_report is not None,
+                    specificity_exposures=(
+                        sc_exposures if specificity_report is not None else None
+                    ),
+                    ladder=scale_ladder,
+                    primary_scale=spatial_scales[0] if spatial_scales else None,
                     standalones=(
                         [c for c in standalones if c in standalones_bundle]
                         if standalones

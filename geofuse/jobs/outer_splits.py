@@ -33,6 +33,9 @@ not tested.
 With spatial adjustment on, every slope (the held-out β, the negative-control
 β, each exposure's β and ΔD) is adjusted for that split's spatial smooth, and
 its row carries ``spatial_method`` and the selected df (:func:`spatial_columns`).
+A smooth defined by a list of scales reports these slopes at every listed scale
+and unadjusted (:func:`scale_rows`), each row naming its ``spatial_scale_m``;
+the first scale's rows are the primary ones.
 """
 
 from __future__ import annotations
@@ -61,6 +64,17 @@ QUANTITIES: dict[str, str | None] = {
 POSTERIOR_QUANTITIES = frozenset(q for q in QUANTITIES if q.startswith("posterior_"))
 
 OUTER_COMPARATORS = ("primary", "all")
+
+# Slope-type quantities a scale ladder reports at every scale.
+LADDER_QUANTITIES = frozenset(
+    {
+        "held_out_beta",
+        "negative_control_beta",
+        "exposure_beta",
+        "exposure_negative_control_beta",
+        "specificity_difference",
+    }
+)
 
 _ALPHA = 0.05
 
@@ -95,8 +109,16 @@ def spatial_columns(record: dict | None) -> dict:
             continue
         if key.startswith("df"):
             value = "none" if value is None else str(value)
+        elif key == "scale_m":
+            value = scale_text(value)
         out[f"spatial_{key}"] = value
     return out
+
+
+def scale_text(scale: float | None) -> str:
+    """A pattern scale as table text: metres without a trailing ``.0``, and
+    ``"none"`` for the unadjusted rows."""
+    return "none" if scale is None else f"{float(scale):g}"
 
 
 def spatial_label(record: dict | None) -> str | None:
@@ -104,6 +126,8 @@ def spatial_label(record: dict | None) -> str | None:
     ``"ks_aic df target 2, control none"``; ``None`` without a record."""
     if not record:
         return None
+    if record.get("scale_m") is not None:
+        return f"{record.get('method')} at {float(record['scale_m']) / 1000:g} km"
     dfs = [
         ("" if key == "df" else f"{key[3:]} ") + ("none" if v is None else str(v))
         for key, v in record.items()
@@ -223,6 +247,52 @@ def split_rows(
         )
     rows += specificity_rows(specificity)
     rows += posterior_rows(posterior)
+    return rows
+
+
+def scale_rows(
+    engine: Any,
+    params: dict,
+    scales: "list[float | None]",
+    *,
+    n_boot: int,
+    exposures: dict | None = None,
+    label: str = "",
+) -> list[dict]:
+    """The slope-type rows of the current split at other pattern scales.
+
+    For each of ``scales`` (``None`` = without a spatial smooth) the held-out
+    β, the negative-control β and, with ``exposures``, the specificity rows are
+    computed again inside :meth:`MetricFusionEngine.spatial_scale`, with the
+    same bootstrap budget, and tagged ``spatial_scale_m``.
+    """
+    from .fusion_outputs import _specificity_report
+
+    rows: list[dict] = []
+    for scale in scales:
+        with engine.spatial_scale(scale):
+            slopes = engine.compute_partial_slopes(params)
+            controls = engine.compute_negative_controls(params, n_boot=int(n_boot))
+            contrast = None
+            if exposures:
+                contrast = _specificity_report(
+                    engine,
+                    params,
+                    exposures,
+                    int(n_boot),
+                    label=label,
+                    log=lambda level, msg: None,
+                )
+        for r in split_rows(
+            effects_test=None,
+            slope_test=(slopes or {}).get("test"),
+            channel_paired=None,
+            comparator_paired=[],
+            negative_controls=controls,
+            specificity=contrast,
+        ):
+            r["spatial_scale_m"] = scale_text(scale)
+            rows.append(r)
     return rows
 
 
@@ -354,7 +424,7 @@ def _holds(row: dict) -> bool | None:
     return lo > 0 or hi < 0
 
 
-def summarise(rows: list[dict]) -> list[dict]:
+def summarise(rows: list[dict], primary_scale: float | None = None) -> list[dict]:
     """Per ``(quantity, exposure)``: spread, share holding, corrected t.
 
     ``rows`` carry ``split`` and ``test_share`` next to the :func:`split_rows`
@@ -367,18 +437,32 @@ def summarise(rows: list[dict]) -> list[dict]:
     term's weight entry adds ``share_largest`` (the share of splits in which
     that term has the largest weight) and the β entry ``forms`` (how often
     each form was chosen). Spatially adjusted slopes carry ``spatial_method``.
+    Rows of a scale ladder are summarised per ``spatial_scale_m`` too; only
+    ``primary_scale``'s rows enter the Holm families.
     """
     from geofuse.statistical_testing import corrected_resampled_t, holm_bonferroni
 
     groups: dict[tuple, list[dict]] = {}
     for r in rows:
-        key = (r["quantity"], r["exposure"], r.get("control"))
+        key = (r["quantity"], r["exposure"], r.get("control"), r.get("spatial_scale_m"))
         groups.setdefault(key, []).append(r)
     order = list(QUANTITIES)
+    primary = None if primary_scale is None else scale_text(primary_scale)
+
+    def scale_order(text: str | None) -> tuple:
+        if text is None or text == primary:
+            return (0, 0.0)
+        return (2, 0.0) if text == "none" else (1, -float(text))
+
     out: list[dict] = []
-    for (quantity, exposure, control), group in sorted(
+    for (quantity, exposure, control, scale), group in sorted(
         groups.items(),
-        key=lambda kv: (order.index(kv[0][0]), kv[0][1], kv[0][2] or ""),
+        key=lambda kv: (
+            order.index(kv[0][0]),
+            kv[0][1],
+            kv[0][2] or "",
+            scale_order(kv[0][3]),
+        ),
     ):
         est = np.array(
             [r["estimate"] for r in group if r["estimate"] is not None], dtype=float
@@ -410,24 +494,27 @@ def summarise(rows: list[dict]) -> list[dict]:
             entry["kind"] = group[0].get("kind")
         if "spatial_method" in group[0]:
             entry["spatial_method"] = group[0]["spatial_method"]
+        if scale is not None:
+            entry["spatial_scale_m"] = scale
         if entry["alternative"] and shares:
             test = corrected_resampled_t(
                 est, float(np.mean(shares)), alternative=entry["alternative"]
             )
             entry["corrected_t"], entry["corrected_p"] = test["t"], test["p_value"]
         out.append(entry)
+    ranked = [e for e in out if e.get("spatial_scale_m") in (None, primary)]
     families = [
         [
             e
-            for e in out
+            for e in ranked
             if e["quantity"] == "cgi_minus_comparator" and e.get("primary") is not False
         ]
     ]
-    for control in dict.fromkeys(e.get("control") for e in out if "control" in e):
+    for control in dict.fromkeys(e.get("control") for e in ranked if "control" in e):
         families.append(
             [
                 e
-                for e in out
+                for e in ranked
                 if e["quantity"] == "specificity_difference"
                 and e.get("control") == control
                 and e.get("kind") == "comparator"
@@ -524,6 +611,7 @@ def repeat(
     progress: Any = None,
     cancelled: Any = None,
     specificity: bool = False,
+    ladder: "list[float | None] | None" = None,
 ) -> list[dict]:
     """Splits ``1 … k_splits − 1`` (seeds ``split_seed + k``) as split rows.
 
@@ -536,7 +624,8 @@ def repeat(
     CGI's specificity is contrasted with those comparators and the split's
     comparison channel (:func:`specificity_rows`). The caller restores the
     first split. ``progress(k)`` is called before each split;
-    ``cancelled()`` stops between steps.
+    ``cancelled()`` stops between steps. ``ladder`` lists the other pattern
+    scales (and ``None``) whose slopes :func:`scale_rows` adds on every split.
     """
     from ..fusion import comparator_mode
     from .fusion_outputs import (
@@ -599,7 +688,7 @@ def repeat(
                     comparator_paired.append(r)
         engine._active_greenery_channel = "cgi"
         controls = engine.compute_negative_controls(params, n_boot=int(n_paired))
-        contrast = None
+        contrast, exposures = None, None
         if specificity:
             exposures = specificity_exposures(
                 [] if engine.is_panel else names,
@@ -630,6 +719,17 @@ def repeat(
             if r["quantity"] == "cgi_minus_comparator":
                 r["primary"] = r["exposure"] in primary
             rows.append(r)
+        if ladder:
+            for r in scale_rows(
+                engine,
+                params,
+                ladder,
+                n_boot=int(n_paired),
+                exposures=exposures,
+                label=f"split {k + 1}",
+            ):
+                r.update(split=k, seed=seed, **info)
+                rows.append(r)
         log(
             "OK",
             f"Held-out split {k + 1}/{int(k_splits)} (seed {seed}): "
