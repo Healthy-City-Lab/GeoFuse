@@ -1428,6 +1428,17 @@ LIKELIHOODS = ("auto", "rows")
 # size and a typical set.
 NULL_WARMUP_WARM = 150
 
+#: Warm-up of a synergy posterior started from a linear pre-fit
+#: (:func:`synergy_warm_start`): the kernel, aggregator and effect start where
+#: the linear fit left them, but the interaction weights and the step size
+#: still have to adapt.
+SYNERGY_WARMUP_WARM = 250
+
+#: Share of the synergy weights given to the interaction terms at the start of
+#: a warm-started synergy fit; the main terms keep the rest in the linear
+#: fit's proportions.
+SYNERGY_START_SHARE = 0.05
+
 
 def _masked_grid(E, radius_mask=None) -> np.ndarray:
     """``E`` as ``fit`` reads it: a whole grid's off-ladder cells set to zero."""
@@ -1497,6 +1508,68 @@ def warm_start_from(mcmc, *, warmup: int = NULL_WARMUP_WARM) -> dict:
         "init": init,
         "warmup": int(warmup),
         "adapt_mass_matrix": True,
+    }
+
+
+def linear_prefit(grid, y, *, chains, seed, draws=200, warmup=300, **grid_kwargs):
+    """A short linear fit of the grid, to start a synergy posterior from.
+
+    The linear form's posterior runs from the columns' cross-products, so this
+    costs seconds where a cold synergy warm-up costs minutes. ``grid_kwargs``
+    are :func:`grid_posterior`'s; the synergy design is not used.
+    """
+    kw = {
+        k: v for k, v in grid_kwargs.items() if k not in ("design", "design_channels")
+    }
+    return fit(
+        grid,
+        y,
+        form="linear",
+        draws=draws,
+        warmup=warmup,
+        chains=chains,
+        seed=seed,
+        **kw,
+    )
+
+
+def synergy_warm_start(
+    linear_mcmc,
+    n_terms: int,
+    *,
+    warmup: int = SYNERGY_WARMUP_WARM,
+    share: float = SYNERGY_START_SHARE,
+) -> dict:
+    """A synergy fit's starting point from a fitted linear fit of the same grid.
+
+    The sites both models share (kernel, aggregator, effect, residual scale)
+    start at the linear posterior mean with its adapted inverse mass. The
+    weights start at the linear weights scaled by ``1 − share``, the
+    interaction terms sharing ``share`` equally, with every weight's mass at
+    the linear weights' median entry. The mass matrix and the step size
+    re-adapt over ``warmup`` iterations, so only the starting point changes,
+    not the target.
+    """
+    base = warm_start_from(linear_mcmc, warmup=warmup)
+    ((key, diag),) = base["inverse_mass_matrix"].items()
+    step = np.asarray(linear_mcmc.last_state.adapt_state.step_size).reshape(-1)
+    chained = step.size > 1
+    sizes = {
+        name: int(np.prod(np.shape(value)[1:] if chained else np.shape(value)))
+        for name, value in linear_mcmc.last_state.z.items()
+    }
+    parts, pos = {}, 0
+    for name in key:
+        parts[name] = diag[pos : pos + sizes[name]]
+        pos += sizes[name]
+    w = np.asarray(base["init"]["w"], dtype=np.float64)
+    parts["w"] = np.full(len(w) + n_terms - 1, float(np.median(parts["w"])))
+    init = dict(base["init"])
+    init["w"] = np.concatenate([w * (1.0 - share), np.full(n_terms, share / n_terms)])
+    return {
+        **base,
+        "inverse_mass_matrix": {key: np.concatenate([parts[name] for name in key])},
+        "init": init,
     }
 
 
@@ -1942,6 +2015,7 @@ def grid_posterior(
     radius_prior="rungs",
     entities=None,
     design=None,
+    warm_start=None,
 ):
     """The joint model over the whole grid of the index channels, summarised.
 
@@ -1950,6 +2024,9 @@ def grid_posterior(
     can refit the same model, e.g. for :func:`null_calibration`. ``entities``
     (a panel's entity per row) adds the per-entity intercept of :func:`fit`,
     and ``design`` the synergy form's terms; both travel in ``grid_kwargs``.
+    ``warm_start`` (:func:`warm_start_from`, :func:`synergy_warm_start`)
+    starts the sampler from another fit; the posterior's own adapted sampler
+    is returned as ``posterior.warm_start`` for the next fit.
     """
     grid = np.asarray(Xr)[:, list(channel_index), :, :]
     radius_mask = np.zeros((len(channels), len(radii)), dtype=bool)
@@ -1974,6 +2051,7 @@ def grid_posterior(
         warmup=warmup,
         chains=chains,
         seed=seed,
+        warm_start=warm_start,
         **grid_kwargs,
     )
     post = posterior_from(
