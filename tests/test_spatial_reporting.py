@@ -238,6 +238,8 @@ def _engine(method="spatial_plus", n_ent=600, n_test=300, seed=11, effect=0.0):
         spatial_adjust_knots_min=35,
         spatial_adjust_knots_max=150,
         spatial_adjust_eps_m=None,
+        spatial_adjust_min_component=None,
+        _spatial_scale=None,
         _spatial_basis_cache={},
         _spatial_adjust_summary=None,
         _spatial_selections={"n": 0, "at_cap": 0},

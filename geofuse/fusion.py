@@ -5,6 +5,7 @@ This module implements the optimization logic from CGI.ipynb for tuning
 weighted combinations of NDVI and GVI metrics against target outcomes.
 """
 
+import contextlib
 import gc
 import hashlib
 import logging
@@ -164,6 +165,20 @@ PAIRED_HEADLINE_KEYS = (
 SPATIAL_PAIRED_SMOOTHS: tuple[str, ...] = ("own", "cgi", "outcome", "max")
 
 
+def _absorbed_share(x: np.ndarray, smooth: np.ndarray) -> float | None:
+    """Share of ``x``'s variance a spatial smooth absorbs: the R² of ``x`` on
+    the smooth's columns and an intercept, over the finite rows."""
+    keep = np.isfinite(x) & np.isfinite(smooth).all(axis=1)
+    xc = x[keep] - x[keep].mean()
+    sst = float(xc @ xc)
+    if keep.sum() < 3 or sst <= 0:
+        return None
+    S = smooth[keep] - smooth[keep].mean(axis=0)
+    coef, *_ = np.linalg.lstsq(S, xc, rcond=None)
+    r = xc - S @ coef
+    return round(1.0 - float(r @ r) / sst, 6)
+
+
 def comparator_mode(column: str) -> str:
     """The active-channel name that scores target ``column`` as the exposure.
 
@@ -236,6 +251,8 @@ class MetricFusionEngine:
         spatial_adjust_knots_min: int = spatial_basis.DEFAULT_KNOTS_MIN,
         spatial_adjust_knots_max: int = spatial_basis.DEFAULT_KNOTS_MAX,
         spatial_paired_smooth: str = "own",
+        spatial_adjust_scale_m: "float | list[float] | tuple[float, ...] | None" = None,
+        spatial_adjust_min_component: int | None = None,
         residualize_spline_df: int = objective_scoring.SPLINE_DF,
         residualize_spline_min_unique: int = objective_scoring.SPLINE_MIN_UNIQUE,
         exposure_response_spline_df: int = exposure_response.SPLINE_DF,
@@ -326,6 +343,19 @@ class MetricFusionEngine:
                 its own (``"own"``), the CGI's (``"cgi"``), one selected on the
                 outcome (``"outcome"``) or the larger of the two dfs
                 (``"max"``); see :meth:`_paired_difference_on`.
+            spatial_adjust_scale_m: define the smooth by a distance instead of
+                a df: one pattern scale in metres, or a list whose first entry
+                is the primary scale (scores, paired tests, verdicts) and the
+                rest are reported for the slopes only (:meth:`spatial_scale`).
+                Clusters split at a gap of ``spatial_adjust_eps_m`` (default
+                twice the primary scale), each cluster's knots cover it at half
+                the scale, every radial function is used and no criterion
+                runs, so every exposure shares one smooth per row set. ``None``
+                keeps the df ladder.
+            spatial_adjust_min_component: clusters smaller than this join their
+                nearest larger cluster's level instead of keeping their own
+                intercept (default 30 with a scale, none without); see
+                :func:`spatial_basis.merge_small_components`.
             residualize_spline_df / residualize_spline_min_unique: the
                 covariate splines of ``residualize_method="spline"``; see
                 :func:`objective_scoring._expand_covariate_basis`.
@@ -504,8 +534,35 @@ class MetricFusionEngine:
             if spatial_adjust_eps_m is not None and float(spatial_adjust_eps_m) > 0
             else None
         )
+        scales = spatial_adjust_scale_m
+        if scales is not None and not isinstance(scales, list | tuple):
+            scales = [scales]
+        self.spatial_adjust_scales: tuple[float, ...] = tuple(
+            dict.fromkeys(float(v) for v in scales or ())
+        )
+        if any(v <= 0 for v in self.spatial_adjust_scales):
+            raise ValueError("spatial_adjust_scale_m must be positive distances.")
+        if self.spatial_adjust_scales and method == "none":
+            raise ValueError(
+                "spatial_adjust_scale_m needs spatial_adjust_method spatial_plus "
+                "or ks_aic."
+            )
+        # The scale the smooths are built at now (the primary one, or another
+        # inside :meth:`spatial_scale`); ``None`` in df mode.
+        self._spatial_scale: float | None = (
+            self.spatial_adjust_scales[0] if self.spatial_adjust_scales else None
+        )
+        if spatial_adjust_min_component is None and self.spatial_adjust_scales:
+            spatial_adjust_min_component = spatial_basis.DEFAULT_MIN_COMPONENT
+        self.spatial_adjust_min_component: int | None = (
+            int(spatial_adjust_min_component)
+            if spatial_adjust_min_component
+            else None
+        )
         self._spatial_basis_cache: dict = {}
         self._spatial_adjust_summary: dict | None = None
+        # The first basis built at each scale, for the record.
+        self._spatial_scale_summaries: dict[float, dict] = {}
         # Selections made and how many landed on the largest candidate df.
         self._spatial_selections: dict[str, int] = {"n": 0, "at_cap": 0}
 
@@ -4947,6 +5004,8 @@ class MetricFusionEngine:
         if self.spatial_adjust_method == "none" or coords_xy is None:
             return None
         coords_xy = np.asarray(coords_xy, dtype=np.float64)
+        if self._spatial_scale is not None:
+            return self._scale_selection(coords_xy)
         cache_key = _helpers.spatial_cache_key(coords_xy, target, cov)
         entry = self._spatial_basis_cache.get(cache_key)
         if entry is None:
@@ -4957,8 +5016,18 @@ class MetricFusionEngine:
                 neighbours=self.spatial_adjust_neighbours,
                 knots_min=self.spatial_adjust_knots_min,
                 knots_max=self.spatial_adjust_knots_max,
+                min_component=self.spatial_adjust_min_component,
             )
             entry = {"basis": basis, "ks": None}
+            if self._spatial_adjust_summary is None and basis.summary.get("chained"):
+                _log(
+                    "WARN",
+                    f"Spatial smooth: {basis.summary['chained']}, so one df "
+                    "removes patterns of very different sizes across clusters. "
+                    "spatial_adjust_eps_m splits clusters at a gap distance, "
+                    "and spatial_adjust_scale_m defines the smooth by a "
+                    "distance everywhere.",
+                )
             if basis.has_spatial:
                 ks_df, ks_cols, ks_ic = spatial_basis.select_df_aic(
                     np.asarray(target, dtype=np.float64),
@@ -5006,6 +5075,77 @@ class MetricFusionEngine:
             self._selection_record(basis, sp_df, sp_cols, sp_ic)
         )
 
+    @property
+    def _scale_eps(self) -> float:
+        """The cluster gap of scale mode: the job's, else twice the primary
+        scale, shared by every listed scale."""
+        if self.spatial_adjust_eps_m is not None:
+            return self.spatial_adjust_eps_m
+        return 2.0 * self.spatial_adjust_scales[0]
+
+    def _scale_selection(self, coords_xy: np.ndarray) -> dict | None:
+        """The fixed smooth of :attr:`_spatial_scale` on these locations.
+
+        The basis depends on the locations only, so it is built once per row
+        set and scale and every exposure and outcome shares it: ``columns``
+        are all of it, ``df`` its column count and ``scale_m`` the scale.
+        ``None`` when the locations support no spatial column.
+        """
+        scale = float(self._spatial_scale)
+        key = (scale, _helpers.spatial_cache_key(coords_xy, np.empty(0), None))
+        entry = self._spatial_basis_cache.get(key)
+        if entry is None:
+            basis = spatial_basis.build_block_basis(
+                coords_xy,
+                eps=self._scale_eps,
+                neighbours=self.spatial_adjust_neighbours,
+                scale_m=scale,
+                min_component=self.spatial_adjust_min_component,
+            )
+            cols = basis.design(max(1, basis.max_df)) if basis.has_spatial else None
+            entry = {
+                "basis": basis,
+                "chosen": None
+                if cols is None or not cols.shape[1]
+                else {
+                    "columns": cols,
+                    "df": int(cols.shape[1]),
+                    "ic": {},
+                    "at_cap": False,
+                    "scale_m": scale,
+                },
+            }
+            self._spatial_basis_cache[key] = entry
+            if scale not in self._spatial_scale_summaries:
+                self._spatial_scale_summaries[scale] = dict(basis.summary)
+                if basis.summary.get("size_warning"):
+                    _log("WARN", f"Spatial smooth: {basis.summary['size_warning']}.")
+            if self._spatial_adjust_summary is None and basis.has_spatial:
+                self._spatial_adjust_summary = {
+                    "method": self.spatial_adjust_method,
+                    "selection": "fixed scale",
+                    "eps_m": self._scale_eps,
+                    **basis.summary,
+                }
+        return entry["chosen"]
+
+    @contextlib.contextmanager
+    def spatial_scale(self, scale: float | None):
+        """Inside the block, smooths are built at pattern scale ``scale``;
+        ``None`` reports without a spatial smooth. Scale mode only: the
+        clusters stay those of the primary scale."""
+        if not self.spatial_adjust_scales:
+            raise ValueError("spatial_scale needs spatial_adjust_scale_m.")
+        saved = self._spatial_scale, self.spatial_adjust_method
+        if scale is None:
+            self.spatial_adjust_method = "none"
+        else:
+            self._spatial_scale = float(scale)
+        try:
+            yield
+        finally:
+            self._spatial_scale, self.spatial_adjust_method = saved
+
     def _selection_record(self, basis, df, columns, ic) -> dict:
         """A df selection as :meth:`_spatial_selection` returns it."""
         candidates = self._spatial_candidates(basis)
@@ -5051,6 +5191,25 @@ class MetricFusionEngine:
         """
         if self.spatial_adjust_method == "none":
             return None
+        if self.spatial_adjust_scales:
+            return {
+                **(
+                    self._spatial_adjust_summary
+                    or {"method": self.spatial_adjust_method}
+                ),
+                "selection": "fixed scale",
+                "scales_m": list(self.spatial_adjust_scales),
+                "primary_scale_m": self.spatial_adjust_scales[0],
+                "eps_m": self._scale_eps,
+                "min_component": self.spatial_adjust_min_component,
+                "neighbours": self.spatial_adjust_neighbours,
+                "clusters": (self._spatial_adjust_summary or {}).get("n_components"),
+                "paired_rule": "shared",
+                "per_scale": {
+                    str(int(k) if float(k).is_integer() else k): v
+                    for k, v in self._spatial_scale_summaries.items()
+                },
+            }
         return {
             **(self._spatial_adjust_summary or {"method": self.spatial_adjust_method}),
             "candidates": list(self.spatial_adjust_df),
@@ -5060,6 +5219,11 @@ class MetricFusionEngine:
             "knots_max": self.spatial_adjust_knots_max,
             "eps_m": self.spatial_adjust_eps_m,
             "paired_smooth": self.spatial_paired_smooth,
+            **(
+                {"min_component": self.spatial_adjust_min_component}
+                if self.spatial_adjust_min_component
+                else {}
+            ),
             "selections": int(self._spatial_selections["n"]),
             "selections_at_cap": int(self._spatial_selections["at_cap"]),
             "at_cap": bool(self._spatial_selections["at_cap"]),
@@ -7667,6 +7831,17 @@ class MetricFusionEngine:
         method = self.spatial_adjust_method
         if method == "none" or coords is None:
             return None, None, None
+        if self._spatial_scale is not None:
+            chosen = self._spatial_selection(coords, target, cov, cgi_c)
+            s = None if chosen is None else chosen["columns"]
+            df = None if chosen is None else chosen["df"]
+            return s, s, {
+                "method": method,
+                "rule": "shared",
+                "df_cgi": df,
+                "df_exposure": df,
+                "scale_m": self._spatial_scale,
+            }
         rule = self.spatial_paired_smooth if method == "spatial_plus" else "outcome"
 
         def cols(chosen):
@@ -8509,6 +8684,8 @@ class MetricFusionEngine:
                 exposure[rows],
             )
         record = {"method": self.spatial_adjust_method, "df": None}
+        if self._spatial_scale is not None:
+            record["scale_m"] = self._spatial_scale
         if chosen is None:
             return None, record
         cols = chosen["columns"]
@@ -8516,6 +8693,8 @@ class MetricFusionEngine:
             record["df"] = chosen["df"]
         record["at_cap"] = chosen["at_cap"]
         record["ic"] = chosen["ic"]
+        if self._spatial_scale is not None and cols is not None:
+            record["absorbed"] = _absorbed_share(exposure[rows], cols)
         return cols, record
 
     def _slope_smooths(
@@ -8870,6 +9049,8 @@ class MetricFusionEngine:
                     "n": res["n"],
                 }
                 if record is not None:
+                    if self._spatial_scale is not None:
+                        record["scale_m"] = self._spatial_scale
                     row["spatial_adjustment"] = record
                 out["rows"].append(row)
         return out
