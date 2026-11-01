@@ -1327,6 +1327,7 @@ def _run_outer_splits(
         rows = None
     finally:
         engine._active_greenery_channel = "cgi"
+        engine._fit_label = "split 0"
         engine.split_data(random_state=int(split_seed), **split_kwargs)
         engine.best_params = dict(headline_params)
     if rows is None:
@@ -1797,6 +1798,11 @@ def run_fusion(
     posterior_draws: int = 800,
     posterior_warmup: int = 800,
     posterior_chains: int = 4,
+    outer_warm_start: bool = True,
+    synergy_warm_start: bool = True,
+    outer_posterior_draws: int | None = None,
+    outer_posterior_warmup: int | None = None,
+    outer_posterior_chains: int | None = None,
     radius_prior: str = "rungs",
     gvi_min_coverage: float = 0.95,
     gvi_ladder_spacing: str = "linear",
@@ -2072,6 +2078,18 @@ def run_fusion(
             "posterior_draws": int(posterior_draws),
             "posterior_warmup": int(posterior_warmup),
             "posterior_chains": int(posterior_chains),
+            # Only off their defaults: unchanged runs keep their record and hash.
+            **({} if synergy_warm_start else {"synergy_warm_start": False}),
+            **(
+                {
+                    "outer_warm_start": bool(outer_warm_start),
+                    "outer_posterior_draws": outer_posterior_draws,
+                    "outer_posterior_warmup": outer_posterior_warmup,
+                    "outer_posterior_chains": outer_posterior_chains,
+                }
+                if int(outer_splits) > 1
+                else {}
+            ),
             "radius_prior": str(radius_prior),
             "gvi_min_coverage": float(gvi_min_coverage),
             "buffer_meters": buffer_meters,
@@ -2840,6 +2858,7 @@ def run_fusion(
                 seed=42,
                 cancel_callback=cancel_check,
                 progress_callback=_study_progress_cb("CGI", skey("optimize")),
+                synergy_warm_start=bool(synergy_warm_start),
             )
             engine.best_params = dict(headline_params)
             cgi_discovery_summary = _posterior_summary(headline_params)
@@ -3599,9 +3618,15 @@ def run_fusion(
                     fit_kwargs={
                         "forms": index_forms,
                         "sweep_splits": int(sweep_splits),
-                        "draws": int(posterior_draws),
-                        "warmup": int(posterior_warmup),
-                        "chains": int(posterior_chains),
+                        "draws": int(outer_posterior_draws or posterior_draws),
+                        "warmup": int(
+                            outer_posterior_warmup
+                            or outer_posterior_draws
+                            or posterior_warmup
+                        ),
+                        "chains": int(outer_posterior_chains or posterior_chains),
+                        "warm_start": bool(outer_warm_start),
+                        "synergy_warm_start": bool(synergy_warm_start),
                         "radius_prior": str(radius_prior),
                         "seed": 42,
                         "cancel_callback": cancel_check,

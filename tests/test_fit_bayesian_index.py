@@ -58,7 +58,11 @@ def _stub_engine(n=300, seed=0):
         gvi_buffer_step_m=150.0,
         ndvi_ladder_spacing="linear",
         gvi_ladder_spacing="linear",
+        _posterior_warm={},
+        _fit_label="split 0",
     )
+    eng._radius_mask = MetricFusionEngine._radius_mask
+    eng._warm_fit_fallback = MetricFusionEngine._warm_fit_fallback
     eng.build_index_tensor = lambda subset="train_val": (
         X,
         np.asarray(RADII),
@@ -75,6 +79,7 @@ def _stub_engine(n=300, seed=0):
         "_search_radii",
         "_inner_split_groups",
         "_ladder_description",
+        "_posterior_start",
     ):
         setattr(eng, name, types.MethodType(getattr(MetricFusionEngine, name), eng))
     return eng
@@ -278,7 +283,11 @@ def _retune_stub(n=600, seed=3):
         gvi_buffer_step_m=150.0,
         ndvi_ladder_spacing="linear",
         gvi_ladder_spacing="linear",
+        _posterior_warm={},
+        _fit_label="split 0",
     )
+    eng._radius_mask = MetricFusionEngine._radius_mask
+    eng._warm_fit_fallback = MetricFusionEngine._warm_fit_fallback
     eng.build_index_tensor = lambda subset="train_val": (
         X,
         np.asarray(RADII),
@@ -295,6 +304,7 @@ def _retune_stub(n=600, seed=3):
         "_search_radii",
         "_inner_split_groups",
         "_ladder_description",
+        "_posterior_start",
         "fit_bayesian_index",
         "retune_concordance",
     ):

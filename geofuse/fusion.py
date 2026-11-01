@@ -160,6 +160,12 @@ PAIRED_HEADLINE_KEYS = (
 )
 
 
+#: A warm-started posterior is refitted from a cold start above this R-hat, or
+#: when its smallest effective sample size per draw falls below this share of
+#: its source fit's.
+WARM_RHAT_MAX = 1.01
+WARM_ESS_SHARE = 0.8
+
 #: Which smooth each exposure of a paired CGI-vs-exposure test is scored with
 #: under ``spatial_plus`` (see ``MetricFusionEngine._paired_difference_on``).
 SPATIAL_PAIRED_SMOOTHS: tuple[str, ...] = ("own", "cgi", "outcome", "max")
@@ -563,6 +569,10 @@ class MetricFusionEngine:
         self._spatial_adjust_summary: dict | None = None
         # The first basis built at each scale, for the record.
         self._spatial_scale_summaries: dict[float, dict] = {}
+        # The latest posterior per (channel, form), to warm-start the next fit
+        # of the same kind, and the label recorded as its source.
+        self._posterior_warm: dict = {}
+        self._fit_label: str = "split 0"
         # Selections made and how many landed on the largest candidate df.
         self._spatial_selections: dict[str, int] = {"n": 0, "at_cap": 0}
 
@@ -3594,6 +3604,8 @@ class MetricFusionEngine:
         cancel_callback: Callable[..., bool] | None = None,
         progress_callback: Callable[[int, int], None] | None = None,
         outcome: str | None = None,
+        warm_start: bool = False,
+        synergy_warm_start: bool = False,
     ) -> dict:
         """Select the CGI configuration from data, then quantify it.
 
@@ -3614,6 +3626,18 @@ class MetricFusionEngine:
         what :meth:`retune_concordance` uses; entities missing it are dropped.
         ``radius_prior`` (``bayesian_index.RADIUS_PRIORS``) ties the radius
         kernel's prior to the listed rungs or to the range they span.
+
+        ``warm_start`` starts the posterior from this engine's most recent fit
+        of the same channel and form (its posterior mean and mass matrix, with
+        only the step size re-adapted over a short warm-up); ``synergy_warm_start``
+        starts a synergy posterior with no such fit from a short linear
+        pre-fit (:func:`bayesian_index.synergy_warm_start`). Both change only
+        the Monte Carlo draws. A warm-started fit whose R-hat exceeds
+        :data:`WARM_RHAT_MAX`, or whose smallest effective sample size falls
+        below :data:`WARM_ESS_SHARE` of its source fit's (per draw), is redone
+        from a cold start. ``__posterior__["warm_start"]`` records the source
+        (``fit_label`` of the fit it came from, ``linear pre-fit`` or ``none``),
+        the warm-up length and any fallback.
         """
         t0 = time.perf_counter()
         steps, done = 5, 0
@@ -3759,9 +3783,7 @@ class MetricFusionEngine:
         if cancelled():
             raise JobCancelled("Index posterior cancelled by user.")
         t_post = time.perf_counter()
-        post, grid, grid_kwargs = bayesian_index.grid_posterior(
-            Xr,
-            yr,
+        posterior_kw = dict(
             channels=index_channels,
             channel_index=channel_index,
             radii=radii,
@@ -3780,9 +3802,62 @@ class MetricFusionEngine:
             entities=entities,
             design=design,
         )
+        start, source, reference = self._posterior_start(
+            res.form,
+            warm_start=warm_start,
+            synergy_warm_start=synergy_warm_start,
+            prefit=lambda: bayesian_index.linear_prefit(
+                Xr[:, list(channel_index)],
+                yr,
+                chains=chains,
+                seed=seed,
+                radii=radii,
+                stats=stats,
+                radius_mask=self._radius_mask(len(index_channels), radii, radius_idx),
+                radius_kernel=radius_kernel,
+                aggregator=aggregator,
+                radius_prior=radius_prior,
+                entities=entities,
+            ),
+            n_terms=len(cgi_formulas.synergy_combos(len(index_channels))),
+        )
+        post, grid, grid_kwargs = bayesian_index.grid_posterior(
+            Xr, yr, warm_start=start, **posterior_kw
+        )
+        fallback = self._warm_fit_fallback(post, start, reference, draws * chains)
+        if fallback:
+            _log(
+                "WARN",
+                f"Warm-started posterior ({source}) refitted from a cold start: "
+                f"{fallback}.",
+            )
+            post, grid, grid_kwargs = bayesian_index.grid_posterior(
+                Xr, yr, **posterior_kw
+            )
+        warm_record = {
+            "source": source if start is not None else "none",
+            "warmup": int(start["warmup"]) if start is not None and not fallback
+            else int(warmup),
+            "fallback": fallback,
+        }
+        self._posterior_warm[(self._active_greenery_channel, res.form)] = {
+            "warm": post.warm_start,
+            "ess_per_draw": (
+                float(post.ess_min) / max(draws * chains, 1)
+                if np.isfinite(post.ess_min)
+                else None
+            ),
+            "label": self._fit_label,
+        }
         _log(
             "INFO",
             f"Posterior fitted in {time.perf_counter() - t_post:.0f}s"
+            + (
+                f" (warm start: {warm_record['source']}, "
+                f"{warm_record['warmup']} warm-up iterations)"
+                if start is not None and not fallback
+                else ""
+            )
             + (f"; {null_runs} warm-started null refits follow." if null_runs else "."),
         )
         null = (
@@ -3856,6 +3931,7 @@ class MetricFusionEngine:
             "splits": sweep_splits,
         }
         params["__posterior__"] = post.summary()
+        params["__posterior__"]["warm_start"] = warm_record
         params["__posterior__"]["ladder_spacing"] = {
             ch: self._ladder_description("ndvi" if ch == "ndvi" else "gvi")
             for ch in index_channels
@@ -3982,6 +4058,62 @@ class MetricFusionEngine:
                 return 0.0
 
         return objective
+
+    @staticmethod
+    def _radius_mask(n_channels: int, radii, radius_idx) -> np.ndarray:
+        """Which rungs each index channel's kernel may use."""
+        mask = np.zeros((n_channels, len(radii)), dtype=bool)
+        for ci, allowed in enumerate(radius_idx):
+            mask[ci, list(allowed)] = True
+        return mask
+
+    def _posterior_start(
+        self, form, *, warm_start, synergy_warm_start, prefit, n_terms
+    ):
+        """``(warm start or None, its source, its reference fit or None)``.
+
+        The latest fit of this channel and form when ``warm_start`` is on,
+        keeping its mass matrix and adapting only the step size; otherwise, for
+        a synergy posterior with ``synergy_warm_start``, a linear pre-fit
+        (``prefit()``) mapped onto the synergy model, whose mass matrix
+        re-adapts.
+        """
+        stored = self._posterior_warm.get((self._active_greenery_channel, form))
+        if warm_start and stored is not None:
+            return (
+                {**stored["warm"], "adapt_mass_matrix": False},
+                stored["label"],
+                stored,
+            )
+        if synergy_warm_start and form == "synergy":
+            try:
+                lin = prefit()
+                return (
+                    bayesian_index.synergy_warm_start(lin, n_terms),
+                    "linear pre-fit",
+                    None,
+                )
+            except Exception as exc:
+                _log("WARN", f"Linear pre-fit for the synergy posterior failed: {exc}")
+        return None, None, None
+
+    @staticmethod
+    def _warm_fit_fallback(post, start, reference, n_draws) -> str | None:
+        """Why a warm-started posterior must be refitted cold, or ``None``."""
+        if start is None:
+            return None
+        rhat = float(post.rhat_max)
+        if not np.isfinite(rhat) or rhat > WARM_RHAT_MAX:
+            return f"R-hat {rhat:.3f} above {WARM_RHAT_MAX}"
+        ref = None if reference is None else reference.get("ess_per_draw")
+        if ref and np.isfinite(post.ess_min):
+            per_draw = float(post.ess_min) / max(n_draws, 1)
+            if per_draw < WARM_ESS_SHARE * ref:
+                return (
+                    f"effective sample size {per_draw:.3f} per draw, below "
+                    f"{WARM_ESS_SHARE:.0%} of its source's {ref:.3f}"
+                )
+        return None
 
     def _params_from_sweep(self, res, post, index_channels, term_sd=None) -> dict:
         """Posterior -> the params dict the composite/apply path consumes.

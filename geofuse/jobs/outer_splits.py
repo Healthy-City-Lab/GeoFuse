@@ -362,7 +362,10 @@ def posterior_rows(summary: dict | None) -> list[dict]:
     composite, ``posterior_weight`` for every term (the synergy form's pair
     terms included), ``posterior_r50`` / ``posterior_r90`` for every channel
     with a radius grid: the posterior mean and credible interval under the
-    names ``discovery.csv`` uses, each row carrying the split's ``form``.
+    names ``discovery.csv`` uses, each row carrying the split's ``form`` and
+    how its posterior started (``warm_start``: the fit it started from,
+    ``linear pre-fit`` or ``none``; ``warmup``; ``warm_fallback``, why it was
+    refitted cold).
     """
     if not summary:
         return []
@@ -408,8 +411,13 @@ def posterior_rows(summary: dict | None) -> list[dict]:
                     ci_high=at(f"{key}_ci_high", i),
                 )
             )
+    warm = summary.get("warm_start") or {}
     for r in rows:
         r["form"] = summary.get("form")
+        if warm:
+            r["warm_start"] = warm.get("source")
+            r["warmup"] = warm.get("warmup")
+            r["warm_fallback"] = warm.get("fallback") or ""
     return rows
 
 
@@ -644,6 +652,7 @@ def repeat(
             progress(k)
         seed = int(split_seed) + k
         engine._active_greenery_channel = "cgi"
+        engine._fit_label = f"split {k}"
         engine.split_data(random_state=seed, **split_kwargs)
         info = split_info(engine)
         params = engine.fit_bayesian_index(metric=metric, **fit_kwargs, **loops)

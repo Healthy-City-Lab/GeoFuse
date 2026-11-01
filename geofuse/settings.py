@@ -410,6 +410,21 @@ FUSION: dict[str, Setting] = {
     "posterior_draws": _int(800, 100, 4000, "Posterior draws per chain."),
     "posterior_warmup": _int(None, 100, 4000, "Warm-up draws; none = as many."),
     "posterior_chains": _int(4, 1, 8, "Posterior chains."),
+    "synergy_warm_start": _bool(
+        True, "Start a synergy posterior from a short linear fit."
+    ),
+    "outer_warm_start": _bool(
+        True, "Start each later held-out split's posteriors from the previous fit."
+    ),
+    "outer_posterior_draws": _int(
+        None, 100, 4000, "Posterior draws of the later held-out splits; none = all."
+    ),
+    "outer_posterior_warmup": _int(
+        None, 100, 4000, "Their warm-up draws; none = as many as their draws."
+    ),
+    "outer_posterior_chains": _int(
+        None, 1, 8, "Their posterior chains; none = as the first split."
+    ),
     "negative_control_retune": _bool(
         False, "Also re-tune on each negative control and compare."
     ),

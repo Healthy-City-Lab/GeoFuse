@@ -1139,6 +1139,7 @@ def _posterior_summary(params: dict) -> dict:
         "weight_width_ratio": post.get("weight_width_ratio"),
         "rhat_max": post.get("rhat_max"),
         "ess_min": post.get("ess_min"),
+        "warm_start": post.get("warm_start"),
         "divergences": post.get("divergences"),
         "converged": post.get("converged"),
         # The grid axes the posterior estimated rather than the sweep picked.
