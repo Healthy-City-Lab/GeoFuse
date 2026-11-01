@@ -124,8 +124,8 @@ output_results/fusion/<YYYYMMDDTHHMMSS>__<short_job_id>/
     ├── comparators.csv                 comparator exposures, when named
     ├── cgi_vs_comparator_paired.csv    CGI minus each comparator, when named
     ├── specificity_contrast.csv        CGI vs other exposures per control, when on
-    ├── outer_splits.csv                every held-out split's results, outer_splits > 1
-    ├── outer_summary.csv               their spread and corrected test, outer_splits > 1
+    ├── outer_splits.csv                every held-out split's results, outer_splits > 1 or several scales
+    ├── outer_summary.csv               their spread and corrected test, as outer_splits.csv
     ├── decline_terms.csv               greenspace-by-time terms, longitudinal only
     ├── mixedlm_metrics*.csv            all four mixed-effects metrics, longitudinal only
     ├── aic_bic.json                    in-sample AIC / BIC, all channels vs one
@@ -176,7 +176,8 @@ realised `test_share` next to the asked `test_size`. It is empty without
 spatial blocks. `split_seed` records the seed of the held-out split; it is
 also in `run_config.json`.
 
-**`outer_splits.csv`** appears when the job setting `outer_splits` is above 1.
+**`outer_splits.csv`** appears when the job setting `outer_splits` is above 1,
+or when `spatial_adjust_scale_m` lists several scales (see below).
 Split, tuning and held-out scoring were repeated on that many test splits,
 with seeds `split_seed`, `split_seed + 1`, …; split 0 is the run's own split.
 One row per split and result: `quantity` (`held_out_score`, `held_out_beta`
@@ -201,8 +202,11 @@ train+val rows: `posterior_beta`, `posterior_weight` (one row per term, the
 synergy form's pair terms included), `posterior_r50` and `posterior_r90` (one
 row per channel), each with its posterior mean as `estimate`, its credible
 interval and the split's chosen `form`; split 0's rows are the values in
-`discovery.csv`. Being in-sample fits, they are summarised (median, range) but
-not tested. In `outer_summary.csv` each `posterior_weight` entry adds
+`discovery.csv`. Each posterior row also says how its fit started:
+`warm_start` (the fit it started from, such as `split 0`, `linear pre-fit`, or
+`none`), `warmup` (its warm-up iterations) and `warm_fallback` (why a warm fit
+was redone from scratch, empty otherwise). Being in-sample fits, they are
+summarised (median, range) but not tested. In `outer_summary.csv` each `posterior_weight` entry adds
 `share_largest`, the share of splits in which that term has the largest weight,
 and the `posterior_beta` entry adds `forms`, how often each form was chosen.
 
@@ -370,7 +374,27 @@ with. `results_summary.json` holds the run's smoothing under
 `spatial_smoothing`: the candidate sizes, criterion, knots, neighbours and
 cluster gap, the paired rule, the clusters found, and how many of the run's
 selections the largest size won (`selections`, `selections_at_cap`).
-Without spatial adjustment none of these columns or keys appear. The tuning
+Without spatial adjustment none of these columns or keys appear.
+
+With `spatial_adjust_scale_m` set, the smooth is defined by a pattern scale.
+Every adjusted row then carries `spatial_scale_m` (the scale in metres, as
+text), `spatial_df` (the smooth's number of columns) and `spatial_absorbed`,
+the share of that exposure's variance on those rows the smooth absorbs (the
+R² of the exposure on the smooth): the variation left is what the adjusted
+slope rests on. Paired rows have `spatial_rule` `shared`. With several scales
+the slope rows of `outer_splits.csv` (`held_out_beta`,
+`negative_control_beta`, and with the specificity contrast `exposure_beta`,
+`exposure_negative_control_beta` and `specificity_difference`) repeat at every
+listed scale and once with `spatial_scale_m` `none`, unadjusted; the table is
+written even with one held-out split. `outer_summary.csv` summarises each
+scale separately, and only the first scale's entries enter the Holm families.
+`spatial_smoothing` in `results_summary.json` then holds `selection`
+(`fixed scale`), `scales_m`, `primary_scale_m`, the cluster gap `eps_m`,
+`min_component`, `clusters`, and under `per_scale` each scale's clusters (their
+entities, extent in metres and knots), the clusters merged into larger ones and
+their entities, and the number of radial functions. Without a scale, the same
+cluster list is recorded, with `chained` naming a cluster far wider or larger
+than the rest. The tuning
 never sees the smooth, and the exposure-response, moderation and AIC / BIC
 tables control for the covariates only.
 

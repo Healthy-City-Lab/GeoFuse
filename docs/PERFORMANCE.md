@@ -2,9 +2,11 @@
 
 Several of the fusion engine's slowest computations have faster equivalents.
 This page lists each one: what it replaces, how much faster it is, and how
-closely it reproduces the slower method. None of them changes an estimator, a
-seed, a resample or a default, so results agree to floating-point rounding, far
-below the precision any table prints.
+closely it reproduces the slower method. Most change no estimator, seed,
+resample or default, so results agree to floating-point rounding, far below the
+precision any table prints. The posterior warm starts (section 4) change the
+sampler's draws but not the posterior it samples, so their results differ from
+a cold fit by Monte Carlo error, as two seeds do.
 
 **Abbreviations.** CGI = Composite Greenery Index. OLS = ordinary least
 squares. R² = coefficient of determination. df = degrees of freedom of the
@@ -16,13 +18,14 @@ spatial smooth (radial functions per spatial cluster).
 
 | Area | Faster by | Memory | Largest difference from the slower method |
 | --- | --- | --- | --- |
-| Bootstrap intervals with a spatial smooth | 80–110× | — | 4 × 10⁻¹⁶ on the interval ends |
+| Bootstrap intervals with a spatial smooth | 80–110× | — | 4 × 10⁻¹⁶ on the interval ends (synthetic); 4.8 × 10⁻⁵ on one real study, see §2 |
 | Permutation tests with a spatial smooth | 300–720× | — | 3 × 10⁻¹⁵; identical p-values |
 | Negative-control and specificity tests with a spatial smooth | 9–14× | 2.3 GB → 0.2 GB | 2 × 10⁻¹³ |
 | Discovery sweep, reproducibility and gain checks | 120–190× | — | identical picks, forms and weights |
+| Synergy posteriors: first fit and later held-out splits | 2.3–3.2× | — | other draws of the same posterior: means within 1.1 Monte Carlo errors of cold fits |
 | `geofuse` command-line processes | — | 3.1 GB → 0.02 GB each | — |
 
-Section 5 gives the time and memory of a whole study, alone and several at
+Section 6 gives the time and memory of a whole study, alone and several at
 once.
 
 The first three rows apply to spatially adjusted runs. Runs without spatial
@@ -82,6 +85,19 @@ the specificity contrast. These keep the slower fits:
   each replicate;
 - paired differences of distance correlation and normalized RMSE.
 
+**On real data.** One Spatial+ study (about 17,000 entities, about 40 spatial
+clusters, 2,000–10,000 resamples) was rerun with these computations and
+compared with its original run, same design and seeds. Point estimates and
+slopes agreed to 10⁻¹², and an unadjusted rerun to 10⁻¹¹, but resampled
+interval ends differed by up to 4.8 × 10⁻⁵ (at most 1.6 % of a specificity
+interval end, 6.8 % of a score interval end close to zero) and p-values by up
+to 0.0015, three resamples in 2,000. That is well inside the intervals' own
+Monte Carlo error. Synthetic designs built to provoke such a difference all
+agree to 10⁻¹⁰ or better: 40 clusters too small for their smooth that
+resamples empty, categories of one to three members that resamples drop, and
+the original code on 24 against 4 processor threads. The cause is therefore
+not known, and the difference is given here at its measured size.
+
 ---
 
 ## 3. Discovery sweep
@@ -105,7 +121,55 @@ reported value are identical.
 
 ---
 
-## 4. Memory of a job's processes
+## 4. Synergy posteriors
+
+The linear form's posterior has a shortcut whose cost does not grow with the
+number of entities. The synergy form has none: its interaction terms are
+rebuilt from the sampled radius and statistic blend at every step. A cold
+synergy fit spends most of its gradient evaluations in warm-up, while the
+sampler tunes its step size and its scale for each parameter. Two warm starts
+reuse that tuning:
+
+- **The first synergy fit starts from a linear fit** of the same columns, which
+  takes seconds. The parameters both forms share start at the linear fit's
+  posterior mean with its scales, the interaction weights start small, and a
+  250-iteration warm-up tunes everything again.
+- **A later held-out split starts from the latest fit** of the same channel and
+  form. It keeps that fit's scales and tunes only the step size, over 150
+  iterations. Tuning the scales again over so short a warm-up estimates them
+  from too few draws: the effective sample size then fell to 50–90 % of the
+  source fit's.
+
+| Fit | Warm-up gradients, cold → warm | All gradients, cold → warm | Faster by | Time, cold → warm |
+| --- | --- | --- | --- | --- |
+| First synergy fit, from a linear fit | 0.99–1.11 M → 0.24 M | 1.38–1.64 M → 0.61 M | 2.3–2.7× | 59–95 → 37–42 min |
+| Later held-out split, from the previous split | 0.91–0.99 M → 0.14 M | 1.09–1.50 M → 0.47 M | 2.3–3.2× | 63–84 → 27 min |
+
+The linear fit adds 0.15 M gradients of its own shortcut, 3.6 seconds in all.
+Warm-up shrinks 4–7×, after which sampling takes most of the time (this
+posterior needs about 450 gradient evaluations per draw), so whole fits are
+2.3–3.2× faster.
+
+**How close.** Against two cold fits with other seeds, the posterior mean of
+the effect differed by at most 0.0006 (1.1 %) on the first fit and 0.00006
+(0.1 %) on a later split, and every channel and interaction weight by at most
+0.006. All of these are within 1.1 Monte Carlo standard errors, which is how
+far two cold fits with different seeds differ. The largest R-hat stayed at or
+below 1.009, and the effective sample size at or above the cold fits'. A warm
+fit whose largest R-hat exceeds 1.01, or whose effective sample size per draw
+falls below 80 % of its source's, is refitted cold with a warning. Turning the
+warm starts off gives the earlier draws exactly.
+
+**The gradient itself.** At 15,000 entities the interaction columns cost about
+2.2 ms per gradient: blending the cells 0.27 ms, averaging cells per entity
+0.17 ms, removing the covariates 0.45 ms, and the rest spread over many small
+operations. Two exact rewrites (square and cube roots in place of a fractional
+power; all interaction terms in one array) were not faster, so the gradient is
+unchanged.
+
+---
+
+## 5. Memory of a job's processes
 
 numpy commits about 3 GB of memory per process when it is free to size its
 linear-algebra library for every core, whether or not it uses it. Three
@@ -128,7 +192,7 @@ the peak memory of each stage.
 
 ---
 
-## 5. A whole study, and several at once
+## 6. A whole study, and several at once
 
 A synthetic study the size of a national cohort run (20,000 entities in 12
 cities, an NDVI raster and 720,000 street-view points, 11 covariates, two
@@ -161,7 +225,7 @@ anything else.
 
 ---
 
-## 6. How these figures were measured
+## 7. How these figures were measured
 
 Synthetic data only: 4,662 or 20,000 entities in 12 spatial clusters and three
 very small ones, 29 covariate columns (2 numeric, 9 categorical), a smooth
@@ -169,5 +233,8 @@ spatial pattern shared by the outcome, the exposures and the negative
 controls, and the Spatial+ smooth at 10 or 20 df per cluster (169–319 control
 columns). Each fast computation ran on the same data, seeds and resamples as
 the computation it replaces. The sweep used 15,000 entities and a grid of 3
-channels × 10 radii × 6 statistics. Windows 11, 24 logical cores, 32 GB of
+channels × 10 radii × 6 statistics; the posteriors the same grid with 30
+covariates and the synergy form, 2 chains of 400 draws (cold warm-up 800), a
+later split keeping 75 % of the entities, the warm later split timed beside two
+other fits. Windows 11, 24 logical cores, 32 GB of
 memory, numpy with OpenBLAS on 4 threads (the sweep on 1).

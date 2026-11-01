@@ -152,6 +152,8 @@ existed; `spatial_adjust_max_df = 10` repeats those runs exactly.
 | `spatial_adjust_neighbours` (**Cluster neighbours**) | 10 | With eps automatic, entities linked through this many nearest neighbours form one cluster |
 | `spatial_adjust_knots_min` / `_max` (**Fewest / Most knots per cluster**) | 35 / 150 | Knots of each cluster's smooth; a cluster holds at most `knots_max` radial functions |
 | `spatial_paired_smooth` (**Paired-test smooth**) | `own` | Spatial+ only: the smooth each exposure of a paired CGI-vs-exposure test is scored with, see below |
+| `spatial_adjust_scale_m` (**Spatial pattern scales (m)**) | unset | Define the smooth by a distance instead of a size, see below; a list in a run file, `5000, 20000, 10000` in the form, `--spatial-adjust-scale-m 5000 20000` on the command line |
+| `spatial_adjust_min_component` (**Smallest cluster**) | 0 (30 with scales, none without) | A smaller cluster shares its nearest larger cluster's level instead of having its own |
 | `residualize_spline_df` (**Covariate spline df**) | 4 | Spline size of each continuous covariate when **Covariate residualization** is Spline |
 | `residualize_spline_min_unique` (**Distinct values for a spline**) | 7 | A covariate with fewer distinct values (a code, a dummy) enters linearly |
 | `exposure_response_spline_df` (**Exposure-response spline df**) | 4 | Spline size of the exposure-response curve and its linearity test |
@@ -166,6 +168,57 @@ selected on the outcome given the covariates, the KS-AIC rule) or `max` (the
 larger of the two exposures' sizes for both). Under KS-AIC the smooth is
 selected on the outcome already, so every value behaves as `outcome`, and the
 paired rows record it so.
+
+**Pattern scales.** A size per cluster removes patterns of different lengths
+in different places: 20 functions in a cluster 800 km across remove regional
+gradients, in a cluster 10 km across neighbourhood ones. `spatial_adjust_scale_m`
+defines the smooth by a distance instead, so it means the same everywhere:
+exposure variation coarser than about that scale is treated as confounded and
+removed. Each cluster gets as many knots as its occupied area needs at that
+scale, every radial function is used and no criterion runs. The scale is an
+assumption about where confounding acts, so choose it from the study's
+hypothesis rather than from a criterion (a criterion on the exposure keeps
+preferring the smallest scale offered), and keep it above the error in the
+entities' locations. With a scale set:
+
+- clusters split where entities are more than `spatial_adjust_eps_m` apart,
+  by default twice the first scale, and a cluster smaller than
+  `spatial_adjust_min_component` (default 30) joins the nearest larger one;
+- the smooth depends on the locations only, so the CGI, every channel,
+  comparator and negative control share it, KS-AIC and Spatial+ give the same
+  numbers, and paired tests use it on both sides;
+- with several scales, as in `[5000, 20000, 10000, 3000]`, the first is the
+  primary one (scores, paired tests, verdicts) and every slope is also reported
+  at the others and without a smooth, on every held-out split (one split when
+  **Held-out splits** is 1), so one run gives the curve of the slope across
+  scales. The extra scales cost one more set of slopes and bootstraps each;
+- a cluster needing more than 400 radial functions, or a smooth above 2,000 in
+  all, is logged as a warning: a larger scale or a smaller cluster gap keeps it
+  smaller.
+
+Without a scale, the run warns when one cluster is more than five times as
+wide as the typical one, or holds over a quarter of the entities while twice
+as wide: the neighbour rule has then chained distant places into one cluster,
+and a cluster gap or a scale separates them.
+
+### Posterior warm starts
+
+A synergy posterior sums its likelihood over the rows, and most of a cold fit's
+time goes into tuning the sampler during warm-up. Two warm starts shorten that
+without changing what the posterior targets:
+
+| Setting (form label) | Default | What it does |
+| --- | --- | --- |
+| `synergy_warm_start` (**Start synergy from a linear fit**) | on | A short linear fit of the same columns starts the synergy sampler: its step size, its scales for the shared parameters and its mean as the starting point, the interaction weights starting small. The synergy warm-up is then 250 iterations |
+| `outer_warm_start` (**Warm-start later splits**) | on | Each held-out split after the first starts every posterior from the latest fit of the same channel and form: its starting point and its scales for every parameter, with a 150-iteration warm-up that tunes only the step size |
+| `outer_posterior_draws` (**Draws on later splits**) | unset (as the first) | Draws per chain on the later splits only; their warm-up follows unless `outer_posterior_warmup` is set |
+| `outer_posterior_warmup` / `outer_posterior_chains` | unset (as the first) | Warm-up and chains on the later splits only (run file and command line) |
+
+A warm-started fit is checked against the fit it started from: when its
+largest R-hat is above 1.01, or its effective sample size per draw falls below
+80 % of the source's, it is refitted cold with a warning. Every fit records
+where it started, its warm-up and any fallback (see OUTPUTS). Turning a warm
+start off gives the earlier draws exactly.
 
 ### Reading the results panel
 

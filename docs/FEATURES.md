@@ -321,6 +321,12 @@ Nothing below is pre-specified.
   columns' cross-products, the identical likelihood at a cost that does not
   grow with the number of entities, so large samples and many refits stay
   affordable; synergy and panels sum over the rows.
+- **Warm starts.** A synergy posterior starts from a short linear fit of the
+  same columns, and each repeated held-out split starts its posteriors from
+  the previous split's, so most of the sampler's tuning is not redone. A warm
+  fit that mixes worse than its source (R-hat above 1.01, or a lower effective
+  sample size per draw) is refitted from scratch, and every fit records how it
+  started.
 - **Repeated measures count once.** On a panel the posterior carries a random
   intercept per entity, integrated out exactly, so one person's waves do not
   narrow the interval on the effect as if they were independent people; the
@@ -368,7 +374,15 @@ Nothing below is pre-specified.
   each exposure is scored with the smooth selected on itself by default, as
   when it is scored alone, so the paired difference is the difference of the
   two printed scores; the CGI's smooth for both, one selected on the outcome,
-  or the larger of the two are the alternatives. The exposure-response,
+  or the larger of the two are the alternatives. The smooth can instead be
+  defined by a pattern scale in metres: every cluster then gets the knots its
+  area needs at that scale and all of its radial functions, so the smooth
+  removes exposure variation coarser than about that scale everywhere, and
+  one smooth serves every exposure. Clusters split at a gap of twice the
+  scale, and clusters too small to stand alone share a neighbour's level.
+  Given several scales, the first decides the scores and verdicts and every
+  slope is also reported at the others and unadjusted, so one run shows how
+  the estimate moves with the scale assumed. The exposure-response,
   moderation and AIC / BIC tables control for the covariates only.
 - Optional collinearity check on the study's own channels (GVI as the sum of
   its components) that reports the channels above a VIF threshold, and
