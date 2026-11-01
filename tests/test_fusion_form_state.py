@@ -283,6 +283,10 @@ class TestEveryRecordedSettingIsRestored(unittest.TestCase):
             # Lists shown as comma-separated text.
             "spatial_adjust_df",
             "spatial_adjust_scale_m",
+            # The later splits' warm-up follows their draws and their chains
+            # the first split's, as the form has no widget for either.
+            "outer_posterior_warmup",
+            "outer_posterior_chains",
         }
         missing = [
             k

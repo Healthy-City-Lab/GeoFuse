@@ -503,6 +503,11 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "posterior_draws",
     "posterior_warmup",
     "posterior_chains",
+    "synergy_warm_start",
+    "outer_warm_start",
+    "outer_posterior_draws",
+    "outer_posterior_warmup",
+    "outer_posterior_chains",
     "radius_prior",
     "gvi_min_coverage",
     "check_collinearity",
@@ -569,6 +574,9 @@ _FUSION_PARAM_TO_WIDGET: dict[str, str] = {
     "split_seed": "fusion_split_seed",
     "outer_splits": "fusion_outer_splits",
     "outer_comparators": "fusion_outer_comparators",
+    "synergy_warm_start": "fusion_synergy_warm_start",
+    "outer_warm_start": "fusion_outer_warm_start",
+    "outer_posterior_draws": "fusion_outer_posterior_draws",
     "specificity_contrast": "fusion_specificity_contrast",
     "n_bins": "fusion_stratification_bins",
     "channel_set": "fusion_channel_set",
@@ -2381,6 +2389,41 @@ def _render_study_details_panel(
                     "first split always scores all of them."
                 ),
             )
+        for name in ("synergy_warm_start", "outer_warm_start"):
+            _default(f"fusion_{name}", _fs_default(name))
+        _default("fusion_outer_posterior_draws", 0)
+        col_w1, col_w2, col_w3 = st.columns(3)
+        with col_w1:
+            synergy_warm_start_ui = st.checkbox(
+                "Start synergy from a linear fit",
+                key="fusion_synergy_warm_start",
+                help=(
+                    "A synergy posterior starts where a short linear fit of the "
+                    "same grid ended, which shortens its warm-up. Only the "
+                    "Monte Carlo draws change."
+                ),
+            )
+        with col_w2:
+            outer_warm_start_ui = st.checkbox(
+                "Warm-start later splits",
+                key="fusion_outer_warm_start",
+                help=(
+                    "Each held-out split after the first starts its posteriors "
+                    "from the previous fit of the same form, tuning only its "
+                    "step size over a short warm-up; a fit that does not mix as "
+                    "well is redone from a cold start. Only the Monte Carlo "
+                    "draws change."
+                ),
+            )
+        with col_w3:
+            outer_draws_ui = st.number_input(
+                "Draws on later splits (0 = as the first)",
+                min_value=0,
+                max_value=int(_FS["outer_posterior_draws"].hi),
+                step=100,
+                key="fusion_outer_posterior_draws",
+                help="Posterior draws (and warm-up) of the later held-out splits.",
+            )
     posterior_warmup_ui = int(posterior_draws_ui)
 
     # ────────────────────────────────────────────────────────────
@@ -2778,6 +2821,11 @@ def _render_study_details_panel(
         "sweep_splits": int(sweep_splits_ui),
         "outer_splits": int(outer_splits_ui),
         "outer_comparators": str(outer_comparators_ui),
+        "synergy_warm_start": bool(synergy_warm_start_ui),
+        "outer_warm_start": bool(outer_warm_start_ui),
+        "outer_posterior_draws": int(outer_draws_ui) or None,
+        "outer_posterior_warmup": None,
+        "outer_posterior_chains": None,
         "discovery_reps": int(discovery_reps_ui),
         "discovery_shuffles": int(discovery_shuffles_ui),
         "gain_splits": int(gain_splits_ui),
@@ -6846,6 +6894,16 @@ def render(output_dir: str) -> None:
                 "posterior_draws": int(posterior_draws_param),
                 "posterior_warmup": int(posterior_warmup_param),
                 "posterior_chains": int(posterior_chains_param),
+                **{
+                    k: study_state.get(k, _fs_default(k))
+                    for k in (
+                        "synergy_warm_start",
+                        "outer_warm_start",
+                        "outer_posterior_draws",
+                        "outer_posterior_warmup",
+                        "outer_posterior_chains",
+                    )
+                },
                 "radius_prior": radius_prior_param,
                 "gvi_min_coverage": gvi_min_coverage_param,
                 "check_collinearity": bool(check_collinearity_param),
