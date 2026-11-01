@@ -487,6 +487,8 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "spatial_adjust_knots_min",
     "spatial_adjust_knots_max",
     "spatial_paired_smooth",
+    "spatial_adjust_scale_m",
+    "spatial_adjust_min_component",
     "spatial_split",
     "spatial_block_size_m",
     "spatial_split_mode",
@@ -600,6 +602,7 @@ _FUSION_PARAM_TO_WIDGET: dict[str, str] = {
     "spatial_adjust_knots_min": "fusion_spatial_adjust_knots_min",
     "spatial_adjust_knots_max": "fusion_spatial_adjust_knots_max",
     "spatial_paired_smooth": "fusion_spatial_paired_smooth",
+    "spatial_adjust_min_component": "fusion_spatial_adjust_min_component",
     "resume_existing_study": "fusion_resume_study",
     "multi_objective_requested": "fusion_multi_objective_run",
     "gvi_buffer_min_m": "fusion_gvi_buffer_min",
@@ -684,6 +687,10 @@ def _seed_fusion_form(p: dict) -> None:
         dfs = list(range(0, int(p["spatial_adjust_max_df"]) + 1))
     if dfs is not None:
         st.session_state["fusion_spatial_adjust_df"] = _df_list_text(dfs)
+    scales = p.get("spatial_adjust_scale_m")
+    st.session_state["fusion_spatial_adjust_scale_m"] = (
+        _df_list_text(scales) if scales else ""
+    )
 
     types = dict(p.get("covariate_types") or {})
     cols = list(p.get("covariate_columns") or [])
@@ -2393,6 +2400,8 @@ def _render_study_details_panel(
     spatial_adjust_knots_min = _fs_default("spatial_adjust_knots_min")
     spatial_adjust_knots_max = _fs_default("spatial_adjust_knots_max")
     spatial_paired_smooth = _fs_default("spatial_paired_smooth")
+    spatial_adjust_scale_m: list[int] | None = None
+    spatial_adjust_min_component: int | None = None
     st.markdown("**Per-pixel CGI scoring**")
     _grid = _FS["cgi_grid_spacing_m"]
     _grid_options = list(range(int(_grid.lo), int(_grid.hi) + 1, int(_grid.step)))
@@ -2526,7 +2535,46 @@ def _render_study_details_panel(
                 spatial_paired_smooth,
                 list(_SPATIAL_PAIRED_SMOOTH_LABELS),
             )
+            _default("fusion_spatial_adjust_scale_m", "")
+            _default("fusion_spatial_adjust_min_component", 0)
             with st.expander("Spatial adjustment — advanced", expanded=False):
+                scale_text = st.text_input(
+                    "Spatial pattern scales (m)",
+                    key="fusion_spatial_adjust_scale_m",
+                    help=(
+                        "Define the smooth by a distance instead of a df: "
+                        "exposure variation coarser than about this scale is "
+                        "treated as confounded, the same everywhere. Choose it "
+                        "from the study's confounding hypothesis. The first "
+                        "scale is the primary one; the slopes are also "
+                        "reported at the others and unadjusted. Empty = df "
+                        "candidates."
+                    ),
+                )
+                if scale_text.strip():
+                    try:
+                        spatial_adjust_scale_m = _FS["spatial_adjust_scale_m"].check(
+                            "spatial_adjust_scale_m", scale_text
+                        )
+                    except _gf_settings.SettingError as exc:
+                        st.error(f"{exc} Using the df candidates.")
+                spatial_adjust_min_component = (
+                    int(
+                        st.number_input(
+                            "Smallest cluster (0 = auto)",
+                            min_value=0,
+                            max_value=int(_FS["spatial_adjust_min_component"].hi),
+                            step=1,
+                            key="fusion_spatial_adjust_min_component",
+                            help=(
+                                "A smaller cluster shares its nearest larger "
+                                "cluster's level instead of its own. 0 = 30 "
+                                "with pattern scales, none with df candidates."
+                            ),
+                        )
+                    )
+                    or None
+                )
                 df_text = st.text_input(
                     "Spatial df candidates",
                     key="fusion_spatial_adjust_df",
@@ -2719,6 +2767,8 @@ def _render_study_details_panel(
         "spatial_adjust_knots_min": int(spatial_adjust_knots_min),
         "spatial_adjust_knots_max": int(spatial_adjust_knots_max),
         "spatial_paired_smooth": str(spatial_paired_smooth),
+        "spatial_adjust_scale_m": spatial_adjust_scale_m,
+        "spatial_adjust_min_component": spatial_adjust_min_component,
         "spatial_split": bool(spatial_split),
         "spatial_block_size_m": spatial_block_size_m,
         "spatial_split_mode": str(spatial_split_mode),
@@ -6764,6 +6814,8 @@ def render(output_dir: str) -> None:
                         "spatial_adjust_knots_min",
                         "spatial_adjust_knots_max",
                         "spatial_paired_smooth",
+                        "spatial_adjust_scale_m",
+                        "spatial_adjust_min_component",
                     )
                 },
                 # Spatial block validation applies to vector targets only;

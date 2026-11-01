@@ -987,6 +987,10 @@ def fusion_run_config(spec: JobSpec) -> dict[str, Any]:
         "spatial_adjust_knots_min": int(s["spatial_adjust_knots_min"]),
         "spatial_adjust_knots_max": int(s["spatial_adjust_knots_max"]),
         "spatial_paired_smooth": s["spatial_paired_smooth"],
+        "spatial_adjust_scale_m": s["spatial_adjust_scale_m"] if adjusted else None,
+        "spatial_adjust_min_component": (
+            s["spatial_adjust_min_component"] if adjusted else None
+        ),
         "spatial_split": bool(blocks),
         "spatial_block_size_m": s["spatial_block_size_m"] if blocks else None,
         "spatial_split_mode": s["spatial_split_mode"] if blocks else "stripe",

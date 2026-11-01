@@ -280,8 +280,9 @@ class TestEveryRecordedSettingIsRestored(unittest.TestCase):
             # has to seed the widget as 0.0, which the generic map — which
             # skips ``None`` outright — cannot express.
             "exposure_iqr",
-            # A list shown as comma-separated text.
+            # Lists shown as comma-separated text.
             "spatial_adjust_df",
+            "spatial_adjust_scale_m",
         }
         missing = [
             k
