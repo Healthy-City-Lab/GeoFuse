@@ -1242,12 +1242,14 @@ def _run_outer_splits(
     reduced to the ones every split scores); the repeats from
     :func:`geofuse.jobs.outer_splits.repeat`, which also redo the specificity
     contrast when ``specificity`` is set. The engine is put back on the first
-    split afterwards. A failure is logged and the run continues. ``ladder``
-    lists the other pattern scales (and ``None``) whose slopes every split,
-    the first included, also reports
+    split afterwards. A failure is logged and the run continues. A cancel
+    during the stage ends the run as cancelled; fewer completed splits than
+    ``k_splits`` mark the stage failed with a WARN, and the report says
+    ``complete: False``. ``ladder`` lists the other pattern scales (and
+    ``None``) whose slopes every split, the first included, also reports
     (:func:`geofuse.jobs.outer_splits.scale_rows`); the summary's Holm families
     use ``primary_scale``'s rows. Returns ``{k, seeds, comparators, splits,
-    summary}``.
+    summary, complete}``.
     """
     stage(stage_key, RUNNING)
     scored = set(
@@ -1311,6 +1313,8 @@ def _run_outer_splits(
             specificity=specificity,
             ladder=ladder,
         )
+        if ctx.is_cancelled():
+            raise JobCancelled("Repeated held-out splits cancelled by user.")
     except JobCancelled:
         raise
     except Exception as exc:
@@ -1356,13 +1360,22 @@ def _run_outer_splits(
         _log_fusion(
             "OK", f"[{label}] Posterior across {int(k_splits)} splits: {posterior}."
         )
-    stage(stage_key, DONE)
+    completed = len({r.get("split") for r in rows})
+    if completed < int(k_splits):
+        message = (
+            f"only {completed} of {int(k_splits)} held-out splits produced results"
+        )
+        _log_fusion("WARN", f"[{label}] Repeated held-out splits: {message}.")
+        stage(stage_key, FAILED, message)
+    else:
+        stage(stage_key, DONE)
     return {
         "k": int(k_splits),
         "seeds": [int(split_seed) + k for k in range(int(k_splits))],
         "comparators": str(outer_comparators),
         "splits": rows,
         "summary": summary,
+        "complete": completed >= int(k_splits),
     }
 
 
