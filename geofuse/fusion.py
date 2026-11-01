@@ -5218,11 +5218,16 @@ class MetricFusionEngine:
             "knots_min": self.spatial_adjust_knots_min,
             "knots_max": self.spatial_adjust_knots_max,
             "eps_m": self.spatial_adjust_eps_m,
-            "paired_smooth": self.spatial_paired_smooth,
             **(
                 {"min_component": self.spatial_adjust_min_component}
                 if self.spatial_adjust_min_component
                 else {}
+            ),
+            "clusters": (self._spatial_adjust_summary or {}).get("n_components"),
+            "paired_rule": (
+                self.spatial_paired_smooth
+                if self.spatial_adjust_method == "spatial_plus"
+                else "outcome"
             ),
             "selections": int(self._spatial_selections["n"]),
             "selections_at_cap": int(self._spatial_selections["at_cap"]),

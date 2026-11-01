@@ -208,8 +208,8 @@ def _spatial_lines(bundle: dict) -> list[str]:
                 f"; the largest won {smoothing.get('selections_at_cap', 0)} of "
                 f"{smoothing['selections']} selections"
             )
-        if smoothing.get("method") == "spatial_plus" and smoothing.get("paired_smooth"):
-            text += f"; paired tests: {smoothing['paired_smooth']}"
+        if smoothing.get("paired_rule"):
+            text += f"; paired tests: {smoothing['paired_rule']}"
         lines.append(text)
     return lines
 
