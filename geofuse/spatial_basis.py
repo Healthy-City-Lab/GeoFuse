@@ -62,6 +62,21 @@ DEFAULT_DF_CANDIDATES: tuple[int, ...] = (0, 1, 2, 3, 4, 6, 8, 11, 15, 20)
 #: Information criteria the df is selected by.
 CRITERIA: tuple[str, ...] = ("aic", "bic")
 
+#: A scale-defined basis (``scale_m``) above this many radial columns in all, or
+#: in one cluster, logs a warning naming the scale and the largest cluster.
+SCALE_WARN_COLUMNS = 2000
+SCALE_WARN_BLOCK = 400
+
+#: Smallest cluster that keeps a level of its own when a scale defines the
+#: smooth; a smaller one joins its nearest larger cluster's level.
+DEFAULT_MIN_COMPONENT = 30
+
+#: A cluster is reported as chained when its extent exceeds this multiple of the
+#: entity-weighted median extent, or it holds more than this share of entities
+#: while being wider than twice that median.
+CHAINED_EXTENT = 5.0
+CHAINED_SHARE = 0.25
+
 
 def _tps_eta(r: np.ndarray) -> np.ndarray:
     """Thin-plate radial kernel ``r² log r`` in 2-D, with ``η(0) = 0``."""
@@ -133,6 +148,145 @@ def _maximin_knots(z: np.ndarray, k: int) -> np.ndarray:
         chosen.append(i)
         d = np.minimum(d, cdist(z, z[[i]]).ravel())
     return z[chosen]
+
+
+def covering_knots(z: np.ndarray, radius: float) -> np.ndarray:
+    """Farthest-point sample of ``z`` until every point is within ``radius`` of a
+    knot.
+
+    Starts from the point nearest the centroid, as :func:`_maximin_knots` does,
+    and adds the point farthest from the knots chosen so far, so a cluster gets
+    as many knots as its occupied area needs at that radius, wherever it lies.
+    """
+    n = len(z)
+    c0 = int(np.argmin(((z - z.mean(axis=0)) ** 2).sum(axis=1)))
+    chosen = [c0]
+    d = cdist(z, z[[c0]]).ravel()
+    while len(chosen) < n and float(d.max()) > radius:
+        i = int(np.argmax(d))
+        chosen.append(i)
+        d = np.minimum(d, cdist(z, z[[i]]).ravel())
+    return z[chosen]
+
+
+def extent_m(xy: np.ndarray) -> float:
+    """A cluster's extent: the square root of its convex hull's area (metres),
+    or of its bounding box's when the hull is degenerate."""
+    xy = np.asarray(xy, dtype=np.float64)
+    if len(xy) < 3:
+        return 0.0
+    try:
+        from scipy.spatial import ConvexHull
+
+        return float(np.sqrt(ConvexHull(xy).volume))
+    except Exception:
+        span = xy.max(axis=0) - xy.min(axis=0)
+        return float(np.sqrt(max(span[0] * span[1], 0.0)))
+
+
+def merge_small_components(
+    xy: np.ndarray, labels: np.ndarray, min_size: int
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Relabel each cluster smaller than ``min_size`` to its nearest larger one.
+
+    The nearest larger cluster is the one holding the entity closest to any of
+    the small cluster's entities. Returns ``(labels, merged, n_merged)``: the new
+    dense labels, a mask of the entities that were moved, and how many clusters
+    were merged. Nothing moves when no cluster reaches ``min_size``.
+    """
+    from sklearn.neighbors import NearestNeighbors
+
+    labels = np.asarray(labels).copy()
+    sizes = np.bincount(labels)
+    large = np.flatnonzero(sizes >= int(min_size))
+    small = np.flatnonzero(sizes < int(min_size))
+    merged = np.zeros(len(labels), dtype=bool)
+    if not len(large) or not len(small):
+        _, dense = np.unique(labels, return_inverse=True)
+        return dense.astype(np.int64), merged, 0
+    in_large = np.isin(labels, large)
+    nn = NearestNeighbors(n_neighbors=1).fit(xy[in_large])
+    target = labels[in_large]
+    for c in small:
+        rows = np.flatnonzero(labels == c)
+        dist, idx = nn.kneighbors(xy[rows])
+        labels[rows] = target[int(idx[int(np.argmin(dist[:, 0])), 0])]
+        merged[rows] = True
+    _, dense = np.unique(labels, return_inverse=True)
+    return dense.astype(np.int64), merged, int(len(small))
+
+
+def _scale_columns(xy_c: np.ndarray, scale_m: float) -> tuple[np.ndarray, np.ndarray]:
+    """Linear + radial columns of one cluster at pattern scale ``scale_m``.
+
+    Knots cover the cluster at radius ``scale_m / 2`` (:func:`covering_knots`)
+    and every radial function is kept, up to ``n_c − 4`` so the cluster leaves
+    room for residuals.
+    """
+    n_c = len(xy_c)
+    empty = np.empty((n_c, 0), dtype=np.float64)
+    if n_c < 4:
+        return empty, empty
+    center = xy_c.mean(axis=0)
+    z = xy_c - center
+    span = float(np.sqrt((z**2).sum(axis=1)).std())
+    if span <= 0:
+        return empty, empty
+    z = z / span
+    linear = z.copy()
+    r_max = n_c - 4
+    if r_max <= 0:
+        return linear, empty
+    knots = covering_knots(z, 0.5 * float(scale_m) / span)
+    if len(knots) < 2:
+        return linear, empty
+    w, U = np.linalg.eigh(_tps_eta(cdist(knots, knots)))
+    U = U[:, np.argsort(np.abs(w))[::-1]]
+    phi = (_tps_eta(cdist(z, knots)) @ U)[:, :r_max]
+    std = phi.std(axis=0)
+    std[std == 0] = 1.0
+    return linear, (phi - phi.mean(axis=0)) / std
+
+
+def component_report(xy: np.ndarray, labels: np.ndarray, knots: list) -> dict:
+    """Per-cluster entities, extent and knots, and whether one cluster chains.
+
+    ``chained`` is a message when the widest cluster's extent exceeds
+    :data:`CHAINED_EXTENT` times the entity-weighted median extent, or a
+    cluster wider than twice that median holds more than
+    :data:`CHAINED_SHARE` of the entities, else ``None``.
+    """
+    n_comp = int(labels.max()) + 1 if len(labels) else 0
+    sizes = np.bincount(labels, minlength=n_comp)
+    extents = np.array([extent_m(xy[labels == c]) for c in range(n_comp)])
+    out = {
+        "components": [
+            {
+                "n": int(sizes[c]),
+                "extent_m": round(float(extents[c]), 1),
+                "knots": int(knots[c]) if c < len(knots) else 0,
+            }
+            for c in range(n_comp)
+        ],
+        "chained": None,
+    }
+    if n_comp < 2:
+        return out
+    order = np.argsort(extents)
+    cum = np.cumsum(sizes[order]) / sizes.sum()
+    median = float(extents[order][np.searchsorted(cum, 0.5)])
+    big = int(np.argmax(sizes))
+    wide = int(np.argmax(extents))
+    if median > 0 and extents[wide] > CHAINED_EXTENT * median:
+        out["chained"] = (
+            f"one spatial cluster spans {extents[wide] / 1000:.0f} km against a median "
+            f"of {median / 1000:.1f} km"
+        )
+    elif sizes[big] > CHAINED_SHARE * sizes.sum() and extents[big] > 2 * median:
+        out["chained"] = (
+            f"one spatial cluster holds {sizes[big] / sizes.sum():.0%} of the entities"
+        )
+    return out
 
 
 def _component_columns(
@@ -236,6 +390,8 @@ def build_block_basis(
     neighbours: int = DEFAULT_NEIGHBOURS,
     knots_min: int = DEFAULT_KNOTS_MIN,
     knots_max: int = DEFAULT_KNOTS_MAX,
+    scale_m: float | None = None,
+    min_component: int | None = None,
 ) -> SpatialBasis:
     """Assemble the per-component block-diagonal spatial basis for ``xy``.
 
@@ -244,6 +400,15 @@ def build_block_basis(
     ``neighbours`` are forwarded to :func:`connected_components`. The basis is
     a thin-plate regression spline with ``min(n_c, max(2·max_df + 1,
     knots_min), knots_max)`` knots per component.
+
+    ``scale_m`` defines the smooth by a distance instead: clusters come from a
+    gap of ``eps`` (default twice the scale), each cluster's knots cover it at
+    radius ``scale_m / 2`` (:func:`covering_knots`) and all its radial
+    functions are used, so the smooth removes patterns coarser than about
+    ``scale_m`` everywhere; ``max_df`` and the knot bounds do not apply.
+    ``min_component`` joins every smaller cluster to its nearest larger one's
+    level (:func:`merge_small_components`): its entities share that cluster's
+    intercept and get no trend or radial terms of their own.
 
     Non-finite rows contribute no spatial columns (they fall back to covariate
     control). Returns a :class:`SpatialBasis`; ``has_spatial`` is ``False`` when
@@ -275,8 +440,18 @@ def build_block_basis(
         return base
 
     labels = np.full(n, -1, dtype=np.int64)
+    if scale_m is not None and eps is None:
+        eps = 2.0 * float(scale_m)
     lab_f, eps_used = connected_components(xy[finite], eps=eps, k=neighbours)
+    moved_f = np.zeros(len(lab_f), dtype=bool)
+    n_merged = 0
+    if min_component:
+        lab_f, moved_f, n_merged = merge_small_components(
+            xy[finite], lab_f, int(min_component)
+        )
     labels[finite] = lab_f
+    moved = np.zeros(n, dtype=bool)
+    moved[finite] = moved_f
 
     n_comp = int(lab_f.max()) + 1 if len(lab_f) else 0
 
@@ -293,14 +468,18 @@ def build_block_basis(
     knots_per_component: list[int] = []
 
     for c in range(n_comp):
-        idx = np.where(labels == c)[0]
+        members = np.where(labels == c)[0]
+        idx = members[~moved[members]]
         if c > 0:
             ind = np.zeros(n, dtype=np.float64)
-            ind[idx] = 1.0
+            ind[members] = 1.0
             intercept_cols.append(ind)
-        lin_c, phi_c = _component_columns(
-            xy[idx], max_df=max_df, knot_cap=knots_max, knot_floor=knots_min
-        )
+        if scale_m is not None:
+            lin_c, phi_c = _scale_columns(xy[idx], float(scale_m))
+        else:
+            lin_c, phi_c = _component_columns(
+                xy[idx], max_df=max_df, knot_cap=knots_max, knot_floor=knots_min
+            )
         knots_per_component.append(int(phi_c.shape[1]))
         for j in range(lin_c.shape[1]):
             col = np.zeros(n, dtype=np.float64)
@@ -310,7 +489,8 @@ def build_block_basis(
             col = np.zeros(n, dtype=np.float64)
             col[idx] = phi_c[:, r]
             radial_cols.append(col)
-            radial_rank.append(r)
+            # Scale mode keeps every function, so all share the first level.
+            radial_rank.append(0 if scale_m is not None else r)
 
     linear = (
         np.column_stack(intercept_cols + linear_cols)
@@ -327,7 +507,25 @@ def build_block_basis(
         "neighbours": int(neighbours),
         "knots_min": int(knots_min),
         "knots_max": int(knots_max),
+        **component_report(
+            xy[finite][~moved_f], lab_f[~moved_f], knots_per_component
+        ),
     }
+    if min_component:
+        summary.update(
+            min_component=int(min_component),
+            merged_components=int(n_merged),
+            merged_entities=int(moved.sum()),
+        )
+    if scale_m is not None:
+        summary.update(scale_m=float(scale_m), radial_columns=len(radial_cols))
+        biggest = max(knots_per_component, default=0)
+        if len(radial_cols) > SCALE_WARN_COLUMNS or biggest > SCALE_WARN_BLOCK:
+            summary["size_warning"] = (
+                f"the smooth at {float(scale_m) / 1000:g} km has {len(radial_cols)} "
+                f"radial functions, {biggest} in its largest cluster; a larger scale "
+                "or a smaller cluster gap (spatial_adjust_eps_m) keeps it smaller"
+            )
     return SpatialBasis(
         linear=linear,
         radial=radial,
