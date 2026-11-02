@@ -372,7 +372,8 @@ in `results_summary.json` adds `ic`, the criterion value of every size compared
 `spatial_df_cgi` and `spatial_df_exposure`, the sizes the two sides were scored
 with. `results_summary.json` holds the run's smoothing under
 `spatial_smoothing`: the candidate sizes, criterion, knots, neighbours and
-cluster gap, the paired rule, the clusters found, and how many of the run's
+cluster gap, the paired rule, the clusters found on the first held-out split,
+and how many of the run's
 selections the largest size won (`selections`, `selections_at_cap`).
 Without spatial adjustment none of these columns or keys appear.
 

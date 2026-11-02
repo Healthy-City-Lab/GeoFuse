@@ -567,6 +567,9 @@ class MetricFusionEngine:
         )
         self._spatial_basis_cache: dict = {}
         self._spatial_adjust_summary: dict | None = None
+        # The run's first basis (the first split's), kept when a re-split
+        # resets the per-split summary, for the run's record.
+        self._spatial_run_summary: dict | None = None
         # The first basis built at each scale, for the record.
         self._spatial_scale_summaries: dict[float, dict] = {}
         # The latest posterior per (channel, form), to warm-start the next fit
@@ -5172,16 +5175,18 @@ class MetricFusionEngine:
                 entry["ks"] = self._selection_record(basis, ks_df, ks_cols, ks_ic)
             self._spatial_basis_cache[cache_key] = entry
             if self._spatial_adjust_summary is None and basis.has_spatial:
-                self._spatial_adjust_summary = {
-                    "method": self.spatial_adjust_method,
-                    "ks_df": entry["ks"]["df"],
-                    "candidates": list(self.spatial_adjust_df),
-                    "criterion": self.spatial_adjust_criterion,
-                    "eps_m": self.spatial_adjust_eps_m,
-                    **basis.summary,
-                    "ks_ic": entry["ks"]["ic"],
-                    "ks_at_cap": entry["ks"]["at_cap"],
-                }
+                self._note_basis_summary(
+                    {
+                        "method": self.spatial_adjust_method,
+                        "ks_df": entry["ks"]["df"],
+                        "candidates": list(self.spatial_adjust_df),
+                        "criterion": self.spatial_adjust_criterion,
+                        "eps_m": self.spatial_adjust_eps_m,
+                        **basis.summary,
+                        "ks_ic": entry["ks"]["ic"],
+                        "ks_at_cap": entry["ks"]["at_cap"],
+                    }
+                )
         basis = entry["basis"]
         if not basis.has_spatial:
             return None
@@ -5253,13 +5258,21 @@ class MetricFusionEngine:
                 if basis.summary.get("size_warning"):
                     _log("WARN", f"Spatial smooth: {basis.summary['size_warning']}.")
             if self._spatial_adjust_summary is None and basis.has_spatial:
-                self._spatial_adjust_summary = {
-                    "method": self.spatial_adjust_method,
-                    "selection": "fixed scale",
-                    "eps_m": self._scale_eps,
-                    **basis.summary,
-                }
+                self._note_basis_summary(
+                    {
+                        "method": self.spatial_adjust_method,
+                        "selection": "fixed scale",
+                        "eps_m": self._scale_eps,
+                        **basis.summary,
+                    }
+                )
         return entry["chosen"]
+
+    def _note_basis_summary(self, summary: dict) -> None:
+        """Record the split's first basis, and the run's when it is the first."""
+        self._spatial_adjust_summary = summary
+        if self._spatial_run_summary is None:
+            self._spatial_run_summary = summary
 
     @contextlib.contextmanager
     def spatial_scale(self, scale: float | None):
@@ -5317,25 +5330,24 @@ class MetricFusionEngine:
     def spatial_selection_report(self) -> dict | None:
         """The run's smooth settings and selection counts, ``None`` unadjusted.
 
-        Joins :attr:`_spatial_adjust_summary` (the first basis built: clusters,
-        knots, the outcome's IC profile) with every setting of the smooth and
-        how many selections the largest candidate won (``at_cap``).
+        Joins the run's first basis (the first split's: clusters, knots, the
+        outcome's IC profile) with every setting of the smooth and how many
+        selections the largest candidate won (``at_cap``). Re-splitting, as the
+        repeated held-out splits do, leaves it unchanged.
         """
         if self.spatial_adjust_method == "none":
             return None
+        first = self._spatial_run_summary or self._spatial_adjust_summary
         if self.spatial_adjust_scales:
             return {
-                **(
-                    self._spatial_adjust_summary
-                    or {"method": self.spatial_adjust_method}
-                ),
+                **(first or {"method": self.spatial_adjust_method}),
                 "selection": "fixed scale",
                 "scales_m": list(self.spatial_adjust_scales),
                 "primary_scale_m": self.spatial_adjust_scales[0],
                 "eps_m": self._scale_eps,
                 "min_component": self.spatial_adjust_min_component,
                 "neighbours": self.spatial_adjust_neighbours,
-                "clusters": (self._spatial_adjust_summary or {}).get("n_components"),
+                "clusters": (first or {}).get("n_components"),
                 "paired_rule": "shared",
                 "per_scale": {
                     str(int(k) if float(k).is_integer() else k): v
@@ -5343,7 +5355,7 @@ class MetricFusionEngine:
                 },
             }
         return {
-            **(self._spatial_adjust_summary or {"method": self.spatial_adjust_method}),
+            **(first or {"method": self.spatial_adjust_method}),
             "candidates": list(self.spatial_adjust_df),
             "criterion": self.spatial_adjust_criterion,
             "neighbours": self.spatial_adjust_neighbours,
@@ -5355,7 +5367,7 @@ class MetricFusionEngine:
                 if self.spatial_adjust_min_component
                 else {}
             ),
-            "clusters": (self._spatial_adjust_summary or {}).get("n_components"),
+            "clusters": (first or {}).get("n_components"),
             "paired_rule": (
                 self.spatial_paired_smooth
                 if self.spatial_adjust_method == "spatial_plus"

@@ -161,6 +161,7 @@ _METHODS = (
     "_whole_data_coords",
     "_spatial_smooth",
     "_spatial_selection",
+    "_note_basis_summary",
     "_spatial_candidates",
     "_selection_record",
     "_count_selection",
@@ -242,6 +243,7 @@ def _engine(method="spatial_plus", n_ent=600, n_test=300, seed=11, effect=0.0):
         _spatial_scale=None,
         _spatial_basis_cache={},
         _spatial_adjust_summary=None,
+        _spatial_run_summary=None,
         _spatial_selections={"n": 0, "at_cap": 0},
     )
     eng.apply_fusion = lambda weights=None: frames[eng._active_greenery_channel]

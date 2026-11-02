@@ -61,6 +61,26 @@ class SummaryRecordTests(unittest.TestCase):
             self.assertEqual(report["paired_rule"], want)
             self.assertEqual(report["clusters"], 2)
 
+    def test_the_record_outlives_a_re_split(self):
+        rng = np.random.default_rng(1)
+        xy = np.vstack([rng.normal(size=(200, 2)) * 2_000 + c for c in (0, 1e6)])
+        y = rng.normal(size=len(xy))
+        for scales in (None, [3_000.0]):
+            eng = MetricFusionEngine(
+                target_file="dummy.geojson",
+                cache_dir=tempfile.mkdtemp(),
+                spatial_adjust_method="spatial_plus",
+                spatial_adjust_scale_m=scales,
+            )
+            eng._spatial_selection(xy, y, None, y)
+            before = eng.spatial_selection_report()
+            # What ``split_data`` resets when the first split is restored.
+            eng._spatial_basis_cache = {}
+            eng._spatial_adjust_summary = None
+            after = eng.spatial_selection_report()
+            self.assertEqual(after["clusters"], 2)
+            self.assertEqual(after, before)
+
     def test_unadjusted_runs_have_no_record(self):
         self.assertIsNone(_engine("none").spatial_selection_report())
 
