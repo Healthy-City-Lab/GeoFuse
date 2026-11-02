@@ -154,6 +154,7 @@ existed; `spatial_adjust_max_df = 10` repeats those runs exactly.
 | `spatial_paired_smooth` (**Paired-test smooth**) | `own` | Spatial+ only: the smooth each exposure of a paired CGI-vs-exposure test is scored with, see below |
 | `spatial_adjust_scale_m` (**Spatial pattern scales (m)**) | unset | Define the smooth by a distance instead of a size, see below; a list in a run file, `5000, 20000, 10000` in the form, `--spatial-adjust-scale-m 5000 20000` on the command line |
 | `spatial_adjust_min_component` (**Smallest cluster**) | 0 (30 with scales, none without) | A smaller cluster shares its nearest larger cluster's level instead of having its own |
+| `spatial_tune_scale_m` (**Tune within areas of (m)**) | unset (0) | Tune the composite on variation within areas of about this size, see below |
 | `residualize_spline_df` (**Covariate spline df**) | 4 | Spline size of each continuous covariate when **Covariate residualization** is Spline |
 | `residualize_spline_min_unique` (**Distinct values for a spline**) | 7 | A covariate with fewer distinct values (a code, a dummy) enters linearly |
 | `exposure_response_spline_df` (**Exposure-response spline df**) | 4 | Spline size of the exposure-response curve and its linearity test |
@@ -200,6 +201,28 @@ Without a scale, the run warns when one cluster is more than five times as
 wide as the typical one, or holds over a quarter of the entities while twice
 as wide: the neighbour rule has then chained distant places into one cluster,
 and a cluster gap or a scale separates them.
+
+**Tuning within areas.** The smooth normally enters the reporting only: the
+composite is tuned on all variation the covariates leave, then scored within
+areas. That answers whether a choice made on the whole map survives within
+areas. `spatial_tune_scale_m` asks the other question, which layer, radius,
+statistic and weights carry the association among entities in the same area:
+the smooth at that scale, built as above on the rows each search uses (every
+held-out split builds its own), joins the covariates of the whole search, so
+the sweep, the posterior, the null calibration, the standalone studies and the
+negative-control re-tune all work on variation within areas. With it:
+
+- the scores and slopes use the same scale unless `spatial_adjust_scale_m` is
+  set; a first scale different from the tuning scale is allowed but logged as
+  a warning, since the primary results then answer a different question than
+  the search did;
+- the composite's weights on the raw scale refer to the spread within areas,
+  and the record gives, per channel, the share of its variance the smooth
+  absorbs: a channel that is mostly regional has little left to tune on;
+- one tuning scale per run: compare scales with one run each;
+- a smooth with more columns than a quarter of the rows, or a cluster with
+  nearly one knot per entity, is logged as a warning, since the search could
+  then fit noise.
 
 ### Posterior warm starts
 

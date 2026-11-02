@@ -205,7 +205,9 @@ interval and the split's chosen `form`; split 0's rows are the values in
 `discovery.csv`. Each posterior row also says how its fit started:
 `warm_start` (the fit it started from, such as `split 0`, `linear pre-fit`, or
 `none`), `warmup` (its warm-up iterations) and `warm_fallback` (why a warm fit
-was redone from scratch, empty otherwise). Being in-sample fits, they are
+was redone from scratch, empty otherwise). A search tuned within areas adds
+`tune_scale_m` and `tune_clusters`, the smooth built on that split's train+val
+rows. Being in-sample fits, they are
 summarised (median, range) but not tested. In `outer_summary.csv` each `posterior_weight` entry adds
 `share_largest`, the share of splits in which that term has the largest weight,
 and the `posterior_beta` entry adds `forms`, how often each form was chosen.
@@ -395,9 +397,16 @@ scale separately, and only the first scale's entries enter the Holm families.
 entities, extent in metres and knots), the clusters merged into larger ones and
 their entities, and the number of radial functions. Without a scale, the same
 cluster list is recorded, with `chained` naming a cluster far wider or larger
-than the rest. The tuning
-never sees the smooth, and the exposure-response, moderation and AIC / BIC
-tables control for the covariates only.
+than the rest. Unless the search is tuned within areas the tuning never
+sees the smooth, and the exposure-response, moderation and AIC / BIC tables
+control for the covariates only.
+
+With `spatial_tune_scale_m` set, `results_summary.json` and
+`results_bundle.json` hold `spatial_tuning`: the tuning scale `scale_m`, the
+cluster gap `eps_m`, `clusters`, `merged_components` and `merged_entities`,
+`radial_columns` and `columns` (the smooth's size), `rows` and `kept_rows`
+(the rows the search used), and `absorbed`, per channel the share of its
+variance the smooth absorbs, averaged over the channel's cells.
 
 **`negative_control_retune.csv`** appears when the job setting
 `negative_control_retune` is on. The CGI's sweep and posterior are re-run with

@@ -382,8 +382,12 @@ Nothing below is pre-specified.
   scale, and clusters too small to stand alone share a neighbour's level.
   Given several scales, the first decides the scores and verdicts and every
   slope is also reported at the others and unadjusted, so one run shows how
-  the estimate moves with the scale assumed. The exposure-response,
-  moderation and AIC / BIC tables control for the covariates only.
+  the estimate moves with the scale assumed. Optionally the search itself
+  is tuned within areas: the smooth at a given scale joins the covariates of
+  every search stage, so the layer, radius, statistic and weights are chosen
+  on variation within areas of that size rather than on the whole map. The
+  exposure-response, moderation and AIC / BIC tables control for the
+  covariates only.
 - Optional collinearity check on the study's own channels (GVI as the sum of
   its components) that reports the channels above a VIF threshold, and
   optionally leaves them out of the search.
