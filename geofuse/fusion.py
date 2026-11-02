@@ -259,6 +259,7 @@ class MetricFusionEngine:
         spatial_paired_smooth: str = "own",
         spatial_adjust_scale_m: "float | list[float] | tuple[float, ...] | None" = None,
         spatial_adjust_min_component: int | None = None,
+        spatial_tune_scale_m: float | None = None,
         residualize_spline_df: int = objective_scoring.SPLINE_DF,
         residualize_spline_min_unique: int = objective_scoring.SPLINE_MIN_UNIQUE,
         exposure_response_spline_df: int = exposure_response.SPLINE_DF,
@@ -362,6 +363,14 @@ class MetricFusionEngine:
                 nearest larger cluster's level instead of keeping their own
                 intercept (default 30 with a scale, none without); see
                 :func:`spatial_basis.merge_small_components`.
+            spatial_tune_scale_m: tune within areas: the smooth at this
+                pattern scale (clusters, knots and merging as
+                ``spatial_adjust_scale_m``), built on the rows each search
+                uses, joins the covariates of the index search, so the layer,
+                radius, statistic and weights are chosen on variation within
+                areas of about this size (:meth:`_search_covariates`). Needs a
+                spatial adjustment method; the reported scales default to this
+                one. ``None`` tunes on all variation.
             residualize_spline_df / residualize_spline_min_unique: the
                 covariate splines of ``residualize_method="spline"``; see
                 :func:`objective_scoring._expand_covariate_basis`.
@@ -540,6 +549,20 @@ class MetricFusionEngine:
             if spatial_adjust_eps_m is not None and float(spatial_adjust_eps_m) > 0
             else None
         )
+        self.spatial_tune_scale_m: float | None = (
+            None if spatial_tune_scale_m is None else float(spatial_tune_scale_m)
+        )
+        if self.spatial_tune_scale_m is not None:
+            if self.spatial_tune_scale_m <= 0:
+                raise ValueError("spatial_tune_scale_m must be a positive distance.")
+            if method == "none":
+                raise ValueError(
+                    "spatial_tune_scale_m needs spatial_adjust_method spatial_plus "
+                    "or ks_aic."
+                )
+            # A composite tuned within areas is scored within the same areas.
+            if spatial_adjust_scale_m is None:
+                spatial_adjust_scale_m = [self.spatial_tune_scale_m]
         scales = spatial_adjust_scale_m
         if scales is not None and not isinstance(scales, list | tuple):
             scales = [scales]
@@ -558,6 +581,17 @@ class MetricFusionEngine:
         self._spatial_scale: float | None = (
             self.spatial_adjust_scales[0] if self.spatial_adjust_scales else None
         )
+        if (
+            self.spatial_tune_scale_m is not None
+            and self.spatial_adjust_scales[0] != self.spatial_tune_scale_m
+        ):
+            _log(
+                "WARN",
+                f"Tuned within areas of {self.spatial_tune_scale_m / 1000:g} km "
+                f"but scored at {self.spatial_adjust_scales[0] / 1000:g} km: the "
+                "primary scores and slopes then answer a different question than "
+                "the search did.",
+            )
         if spatial_adjust_min_component is None and self.spatial_adjust_scales:
             spatial_adjust_min_component = spatial_basis.DEFAULT_MIN_COMPONENT
         self.spatial_adjust_min_component: int | None = (
@@ -3630,6 +3664,12 @@ class MetricFusionEngine:
         ``radius_prior`` (``bayesian_index.RADIUS_PRIORS``) ties the radius
         kernel's prior to the listed rungs or to the range they span.
 
+        With ``spatial_tune_scale_m`` every stage residualises on the
+        covariates and the smooth at that scale (:meth:`_search_covariates`),
+        and ``__spatial_tuning__`` records the smooth and the share of each
+        channel's variance it absorbs; ``column_sd``, and so the raw-scale
+        weights, then refer to the spread within areas.
+
         ``warm_start`` starts the posterior from this engine's most recent fit
         of the same channel and form (its posterior mean and mass matrix, with
         only the step size re-adapted over a short warm-up); ``synergy_warm_start``
@@ -3671,13 +3711,18 @@ class MetricFusionEngine:
 
         # The channels in play are settled before residualising, so a coverage
         # gap in a channel this study never reads cannot drop rows from it.
+        cov, tuning = self._search_covariates(static)
         yr, Xr, prep_info = bayesian_index.prep(
             X,
             y,
-            static.get("cov"),
+            cov,
             channel_index=channel_index,
             return_info=True,
         )
+        if tuning is not None:
+            tuning = self._tuning_record(
+                tuning, X, y, static.get("cov"), channel_index, index_channels, prep_info
+            )
         dropped = int(len(X) - len(Xr))
         if dropped:
             _log(
@@ -3703,7 +3748,13 @@ class MetricFusionEngine:
         design = None
         if bayesian_index.eligible_forms(forms, len(index_channels)) != ("linear",):
             design = self._synergy_design(
-                static, prep_info["kept"], channel_index, index_channels, radii, stats
+                static,
+                prep_info["kept"],
+                channel_index,
+                index_channels,
+                radii,
+                stats,
+                cov=cov,
             )
         tick()
 
@@ -3942,6 +3993,8 @@ class MetricFusionEngine:
         params["__discovery__"] = disc
         params["__holdout_gain__"] = gain
         params["__null_calibration__"] = null
+        if tuning is not None:
+            params["__spatial_tuning__"] = tuning
         params["__coverage__"] = getattr(self, "_coverage_report", None)
         params["__elapsed_s__"] = float(time.perf_counter() - t0)
         _log(
@@ -4002,6 +4055,140 @@ class MetricFusionEngine:
             for c in index_channels
         ]
         return index_channels, channel_index, radius_idx
+
+    @property
+    def _tune_eps(self) -> float:
+        """The cluster gap of the tuning smooth: the job's, else twice the
+        tuning scale."""
+        if self.spatial_adjust_eps_m is not None:
+            return self.spatial_adjust_eps_m
+        return 2.0 * self.spatial_tune_scale_m
+
+    def _search_covariates(self, static: dict):
+        """``(covariates, smooth record or None)`` for the index search.
+
+        Without ``spatial_tune_scale_m``, the fold's covariates. With it, the
+        smooth at that scale, built on the locations of the fold's tensor rows
+        (once per row set), is appended to them, so ``prep``, the synergy
+        terms, the sweep, discovery, gain, posterior and null calibration all
+        work on variation within areas. Too many columns for the rows, or a
+        cluster with nearly as many knots as entities, gets a WARN.
+        """
+        cov = static.get("cov")
+        scale = self.spatial_tune_scale_m
+        if scale is None:
+            return cov, None
+        coords = static.get("coords")
+        if coords is None:
+            raise ValueError(
+                "spatial_tune_scale_m needs the target's locations, which this "
+                "target does not provide."
+            )
+        coords = np.asarray(coords, dtype=np.float64)
+        n = len(coords)
+        key = ("tune", scale, _helpers.spatial_cache_key(coords, np.empty(0), None))
+        entry = self._spatial_basis_cache.get(key)
+        if entry is None:
+            basis = spatial_basis.build_block_basis(
+                coords,
+                eps=self._tune_eps,
+                neighbours=self.spatial_adjust_neighbours,
+                scale_m=scale,
+                min_component=self.spatial_adjust_min_component,
+            )
+            cols = (
+                basis.design(max(1, basis.max_df))
+                if basis.has_spatial
+                else np.empty((n, 0))
+            )
+            entry = {"basis": basis, "columns": cols}
+            self._spatial_basis_cache[key] = entry
+            self._warn_tuning_size(basis, cols.shape[1], cov, n)
+        basis, cols = entry["basis"], entry["columns"]
+        summary = basis.summary
+        record = {
+            "scale_m": scale,
+            "eps_m": self._tune_eps,
+            "clusters": summary.get("n_components"),
+            "merged_components": summary.get("merged_components", 0),
+            "merged_entities": summary.get("merged_entities", 0),
+            "radial_columns": summary.get("radial_columns", 0),
+            "columns": int(cols.shape[1]),
+            "rows": int(n),
+        }
+        if cov is not None and np.size(cov):
+            cov = np.column_stack(
+                [np.asarray(cov, dtype=np.float64).reshape(n, -1), cols]
+            )
+        else:
+            cov = cols
+        return cov, record
+
+    def _warn_tuning_size(self, basis, n_columns, cov, n) -> None:
+        """WARN when the tuning smooth leaves the search too little room."""
+        n_cov = 0 if cov is None else int(np.asarray(cov).reshape(n, -1).shape[1])
+        clusters = basis.summary.get("components") or []
+        largest = max(clusters, key=lambda c: c["n"], default=None)
+        crowded = [c for c in clusters if c["knots"] > c["n"] - 4]
+        where = (
+            f"; largest cluster {largest['n']} entities, {largest['knots']} knots"
+            if largest
+            else ""
+        )
+        scale = f"{self.spatial_tune_scale_m / 1000:g} km"
+        if n_columns + n_cov > 0.25 * n:
+            _log(
+                "WARN",
+                f"Tuning smooth at {scale}: {n_columns} columns and {n_cov} "
+                f"covariates for {n} rows, over a quarter of them, so the search "
+                f"may fit noise{where}. A larger scale keeps the smooth smaller.",
+            )
+        elif crowded:
+            worst = max(crowded, key=lambda c: c["knots"] - c["n"])
+            _log(
+                "WARN",
+                f"Tuning smooth at {scale}: a cluster of {worst['n']} entities has "
+                f"{worst['knots']} knots, nearly one per entity, so the search may "
+                f"fit noise{where}.",
+            )
+
+    def _tuning_record(
+        self, record, X, y, cov, channel_index, index_channels, prep_info
+    ) -> dict:
+        """The tuning record with each channel's absorbed variance share.
+
+        The share is ``1 − (SD within areas / SD after the covariates)²`` of
+        each measured cell, averaged over the channel's cells, on the rows the
+        search kept.
+        """
+        base = bayesian_index.prep(
+            X, y, cov, channel_index=channel_index, return_info=True
+        )[2]["column_sd"]
+        within = prep_info["column_sd"]
+        absorbed = {}
+        for ch, ci in zip(index_channels, channel_index, strict=True):
+            b, w = base[ci].reshape(-1), within[ci].reshape(-1)
+            ok = np.isfinite(b) & np.isfinite(w) & (b > 0)
+            absorbed[ch] = (
+                round(float(np.mean(1.0 - (w[ok] / b[ok]) ** 2)), 4)
+                if ok.any()
+                else None
+            )
+        shares = ", ".join(
+            f"{ch} " + ("n/a" if v is None else f"{v:.0%}")
+            for ch, v in absorbed.items()
+        )
+        _log(
+            "INFO",
+            f"Tuning within areas of {record['scale_m'] / 1000:g} km: "
+            f"{record['clusters']} clusters, {record['columns']} smooth columns; "
+            f"variance absorbed: {shares}.",
+        )
+        return {
+            **record,
+            "kept_rows": int(prep_info["kept"].sum()),
+            "absorbed": absorbed,
+        }
 
     def plasmode_recovery(self, *, out_dir: str | None = None, **kwargs) -> dict:
         """Plasmode recovery on this study's own exposure tensor and covariates.
@@ -4252,12 +4439,14 @@ class MetricFusionEngine:
         return X, np.asarray(radii, dtype=float), list(stats), list(channels), static
 
     def _synergy_design(
-        self, static, kept, channel_index, index_channels, radii, stats
+        self, static, kept, channel_index, index_channels, radii, stats, cov=None
     ):
         """The synergy form's raw values per CGI cell, over the kept tensor rows.
 
         Holds each distinct cell of the train+val fold once, for the index
         channels only, with the exposure rows that average it into an entity.
+        ``cov`` replaces the fold's covariates as the basis the interaction
+        terms are residualised on (the search's, smooth included).
         """
         gvi_radii, ndvi_radii = self._search_radii()
         inverse = static.get("uniq_inverse")
@@ -4300,7 +4489,8 @@ class MetricFusionEngine:
         codes = static["codes"] if static["has_pid"] else np.arange(n_rows)
         rows = np.flatnonzero(np.asarray(kept)[codes])
         weight = static.get("weight")
-        cov = static.get("cov")
+        if cov is None:
+            cov = static.get("cov")
         return bayesian_index.SynergyDesign.build(
             cells,
             None if cov is None else np.asarray(cov)[kept],

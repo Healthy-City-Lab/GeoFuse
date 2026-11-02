@@ -29,8 +29,9 @@ STATS = ["mean", "p50"]
 def _entity_cells(X, static):
     """The stub has no CGI cells: each entity stands for its one cell."""
 
-    def design(_static, kept, channel_index, *_):
-        cov = static["cov"]
+    def design(_static, kept, channel_index, *_, cov=None):
+        if cov is None:
+            cov = static["cov"]
         return bayesian_index.SynergyDesign.build(
             X[kept][:, list(channel_index)],
             None if cov is None else cov[kept],
@@ -60,6 +61,7 @@ def _stub_engine(n=300, seed=0):
         gvi_ladder_spacing="linear",
         _posterior_warm={},
         _fit_label="split 0",
+        spatial_tune_scale_m=None,
     )
     eng._radius_mask = MetricFusionEngine._radius_mask
     eng._warm_fit_fallback = MetricFusionEngine._warm_fit_fallback
@@ -80,6 +82,7 @@ def _stub_engine(n=300, seed=0):
         "_inner_split_groups",
         "_ladder_description",
         "_posterior_start",
+        "_search_covariates",
     ):
         setattr(eng, name, types.MethodType(getattr(MetricFusionEngine, name), eng))
     return eng
@@ -285,6 +288,7 @@ def _retune_stub(n=600, seed=3):
         gvi_ladder_spacing="linear",
         _posterior_warm={},
         _fit_label="split 0",
+        spatial_tune_scale_m=None,
     )
     eng._radius_mask = MetricFusionEngine._radius_mask
     eng._warm_fit_fallback = MetricFusionEngine._warm_fit_fallback
@@ -305,6 +309,7 @@ def _retune_stub(n=600, seed=3):
         "_inner_split_groups",
         "_ladder_description",
         "_posterior_start",
+        "_search_covariates",
         "fit_bayesian_index",
         "retune_concordance",
     ):
