@@ -991,6 +991,7 @@ def fusion_run_config(spec: JobSpec) -> dict[str, Any]:
         "spatial_adjust_min_component": (
             s["spatial_adjust_min_component"] if adjusted else None
         ),
+        "spatial_tune_scale_m": s["spatial_tune_scale_m"] if adjusted else None,
         "spatial_split": bool(blocks),
         "spatial_block_size_m": s["spatial_block_size_m"] if blocks else None,
         "spatial_split_mode": s["spatial_split_mode"] if blocks else "stripe",

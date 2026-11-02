@@ -489,6 +489,7 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "spatial_paired_smooth",
     "spatial_adjust_scale_m",
     "spatial_adjust_min_component",
+    "spatial_tune_scale_m",
     "spatial_split",
     "spatial_block_size_m",
     "spatial_split_mode",
@@ -611,6 +612,7 @@ _FUSION_PARAM_TO_WIDGET: dict[str, str] = {
     "spatial_adjust_knots_max": "fusion_spatial_adjust_knots_max",
     "spatial_paired_smooth": "fusion_spatial_paired_smooth",
     "spatial_adjust_min_component": "fusion_spatial_adjust_min_component",
+    "spatial_tune_scale_m": "fusion_spatial_tune_scale_m",
     "resume_existing_study": "fusion_resume_study",
     "multi_objective_requested": "fusion_multi_objective_run",
     "gvi_buffer_min_m": "fusion_gvi_buffer_min",
@@ -2445,6 +2447,7 @@ def _render_study_details_panel(
     spatial_paired_smooth = _fs_default("spatial_paired_smooth")
     spatial_adjust_scale_m: list[int] | None = None
     spatial_adjust_min_component: int | None = None
+    spatial_tune_scale_m: int | None = None
     st.markdown("**Per-pixel CGI scoring**")
     _grid = _FS["cgi_grid_spacing_m"]
     _grid_options = list(range(int(_grid.lo), int(_grid.hi) + 1, int(_grid.step)))
@@ -2580,7 +2583,28 @@ def _render_study_details_panel(
             )
             _default("fusion_spatial_adjust_scale_m", "")
             _default("fusion_spatial_adjust_min_component", 0)
+            _default("fusion_spatial_tune_scale_m", 0)
             with st.expander("Spatial adjustment — advanced", expanded=False):
+                spatial_tune_scale_m = (
+                    int(
+                        st.number_input(
+                            "Tune within areas of (m)",
+                            min_value=0,
+                            max_value=int(_FS["spatial_tune_scale_m"].hi),
+                            step=1000,
+                            key="fusion_spatial_tune_scale_m",
+                            help=(
+                                "Choose the layer, radius, statistic and weights "
+                                "on variation within areas of about this size: "
+                                "the smooth at this scale joins the covariates "
+                                "of the search. The scores use the same scale "
+                                "unless pattern scales are set. 0 = tune on all "
+                                "variation."
+                            ),
+                        )
+                    )
+                    or None
+                )
                 scale_text = st.text_input(
                     "Spatial pattern scales (m)",
                     key="fusion_spatial_adjust_scale_m",
@@ -2812,6 +2836,7 @@ def _render_study_details_panel(
         "spatial_paired_smooth": str(spatial_paired_smooth),
         "spatial_adjust_scale_m": spatial_adjust_scale_m,
         "spatial_adjust_min_component": spatial_adjust_min_component,
+        "spatial_tune_scale_m": spatial_tune_scale_m,
         "spatial_split": bool(spatial_split),
         "spatial_block_size_m": spatial_block_size_m,
         "spatial_split_mode": str(spatial_split_mode),
@@ -6864,6 +6889,7 @@ def render(output_dir: str) -> None:
                         "spatial_paired_smooth",
                         "spatial_adjust_scale_m",
                         "spatial_adjust_min_component",
+                        "spatial_tune_scale_m",
                     )
                 },
                 # Spatial block validation applies to vector targets only;
