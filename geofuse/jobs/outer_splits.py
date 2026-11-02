@@ -365,7 +365,8 @@ def posterior_rows(summary: dict | None) -> list[dict]:
     names ``discovery.csv`` uses, each row carrying the split's ``form`` and
     how its posterior started (``warm_start``: the fit it started from,
     ``linear pre-fit`` or ``none``; ``warmup``; ``warm_fallback``, why it was
-    refitted cold).
+    refitted cold). A search tuned within areas adds ``tune_scale_m`` and
+    ``tune_clusters``, the smooth built on that split's pool.
     """
     if not summary:
         return []
@@ -412,8 +413,12 @@ def posterior_rows(summary: dict | None) -> list[dict]:
                 )
             )
     warm = summary.get("warm_start") or {}
+    tuning = summary.get("spatial_tuning") or {}
     for r in rows:
         r["form"] = summary.get("form")
+        if tuning:
+            r["tune_scale_m"] = scale_text(tuning.get("scale_m"))
+            r["tune_clusters"] = tuning.get("clusters")
         if warm:
             r["warm_start"] = warm.get("source")
             r["warmup"] = warm.get("warmup")

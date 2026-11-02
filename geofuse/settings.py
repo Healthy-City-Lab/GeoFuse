@@ -514,6 +514,13 @@ FUSION: dict[str, Setting] = {
         "none with df.",
         auto_zero=True,
     ),
+    "spatial_tune_scale_m": _int(
+        None,
+        100,
+        1_000_000,
+        "Tune within areas of this size (m): the smooth at this scale joins "
+        "the search's covariates. Unset = tune on all variation.",
+    ),
     # ── Longitudinal (mixed-effects) ────────────────────────────
     "association_target": _choice(
         "level", ASSOCIATION_TARGETS, "Level, or one of the decline terms."

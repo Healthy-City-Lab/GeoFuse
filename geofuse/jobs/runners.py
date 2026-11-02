@@ -1783,6 +1783,7 @@ def run_fusion(
     spatial_paired_smooth: str = "own",
     spatial_adjust_scale_m: "list[float] | float | None" = None,
     spatial_adjust_min_component: int | None = None,
+    spatial_tune_scale_m: float | None = None,
     residualize_method: str = "linear",
     residualize_spline_df: int = 4,
     residualize_spline_min_unique: int = 7,
@@ -1869,6 +1870,9 @@ def run_fusion(
     ``spatial_adjust_scale_m`` defines the spatial smooth by pattern scales;
     with more than one, the slopes are also reported at every other scale and
     unadjusted, on every held-out split (one split when ``outer_splits`` is 1).
+    ``spatial_tune_scale_m`` tunes within areas: the smooth at that scale joins
+    the covariates of every index search, and is the reported scale unless
+    ``spatial_adjust_scale_m`` lists others.
     ``outer_splits`` > 1 repeats split → tuning → held-out scoring on seeds
     ``split_seed + 1 …`` (see :mod:`geofuse.jobs.outer_splits`), scoring the
     comparators ``outer_comparators`` names on each, and reports the spread
@@ -1992,6 +1996,9 @@ def run_fusion(
         # A panel (several rows per entity) skips it once its data are known.
         retune_enabled = bool(negative_control_retune) and bool(negative_controls)
         spatial_scales = _spatial_scale_list(spatial_adjust_scale_m)
+        # A composite tuned within areas is scored within the same areas.
+        if spatial_tune_scale_m and not spatial_scales:
+            spatial_scales = [float(spatial_tune_scale_m)]
         # Other scales and the unadjusted slopes, reported next to the primary.
         scale_ladder: list[float | None] = (
             [*spatial_scales[1:], None] if len(spatial_scales) > 1 else []
@@ -2023,6 +2030,8 @@ def run_fusion(
             scale_settings["spatial_adjust_min_component"] = int(
                 spatial_adjust_min_component
             )
+        if spatial_tune_scale_m:
+            scale_settings["spatial_tune_scale_m"] = float(spatial_tune_scale_m)
         spatial_settings = {
             "spatial_adjust_criterion": str(spatial_adjust_criterion),
             "spatial_adjust_neighbours": int(spatial_adjust_neighbours),
@@ -2335,6 +2344,7 @@ def run_fusion(
                 spatial_paired_smooth=str(spatial_paired_smooth),
                 spatial_adjust_scale_m=spatial_scales or None,
                 spatial_adjust_min_component=spatial_adjust_min_component,
+                spatial_tune_scale_m=spatial_tune_scale_m or None,
                 residualize_method=residualize_method,
                 residualize_spline_df=int(residualize_spline_df),
                 residualize_spline_min_unique=int(residualize_spline_min_unique),
@@ -3689,6 +3699,9 @@ def run_fusion(
                 # The smooth's settings and how its df selections went,
                 # ``None`` without spatial adjustment.
                 "spatial_smoothing": engine.spatial_selection_report(),
+                # The smooth the CGI's search was tuned within, ``None``
+                # without within-area tuning.
+                "spatial_tuning": headline_params.get("__spatial_tuning__"),
                 # Comparator exposures, the CGI's row on the same scale, and
                 # the paired CGI − comparator family.
                 "comparators": comparators_report,

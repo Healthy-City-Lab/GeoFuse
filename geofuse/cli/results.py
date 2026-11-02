@@ -229,6 +229,18 @@ def _spatial_lines(bundle: dict) -> list[str]:
                 f"({smoothing.get('merged_entities')} entities) merged"
             )
         lines.append(text + "; paired tests share the smooth")
+    tuning = bundle.get("spatial_tuning") or {}
+    if tuning.get("scale_m"):
+        absorbed = ", ".join(
+            f"{ch} {share:.0%}"
+            for ch, share in (tuning.get("absorbed") or {}).items()
+            if share is not None
+        )
+        lines.append(
+            f"  Tuned within     {float(tuning['scale_m']) / 1000:g} km areas; "
+            f"{tuning.get('clusters')} clusters, {tuning.get('columns')} smooth "
+            "columns" + (f"; variance absorbed {absorbed}" if absorbed else "")
+        )
     if smoothing.get("candidates"):
         text = (
             f"  Spatial df       {smoothing.get('criterion', 'aic').upper()} over "

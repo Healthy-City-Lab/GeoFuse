@@ -235,7 +235,9 @@ class EngineSettingTests(unittest.TestCase):
         )
 
     def test_the_reported_scale_defaults_to_the_tuning_scale(self):
-        eng = self._make(spatial_adjust_method="spatial_plus", spatial_tune_scale_m=5000)
+        eng = self._make(
+            spatial_adjust_method="spatial_plus", spatial_tune_scale_m=5000
+        )
         self.assertEqual(eng.spatial_adjust_scales, (5000.0,))
         self.assertEqual(eng._tune_eps, 10_000.0)
 
@@ -259,6 +261,52 @@ class EngineSettingTests(unittest.TestCase):
         eng = self._make(spatial_adjust_method="spatial_plus")
         self.assertIsNone(eng.spatial_tune_scale_m)
         self.assertEqual(eng.spatial_adjust_scales, ())
+
+
+class ReportingTests(unittest.TestCase):
+    RECORD = {
+        "scale_m": 5000.0,
+        "eps_m": 10_000.0,
+        "clusters": 3,
+        "columns": 42,
+        "absorbed": {"ndvi": 0.61, "gvi": 0.05},
+    }
+
+    def test_the_split_rows_name_the_tuning_smooth(self):
+        from geofuse.jobs import outer_splits
+        from geofuse.jobs.fusion_outputs import _posterior_summary
+
+        post = {"beta_mean": 0.1, "beta_ci_low": 0.0, "beta_ci_high": 0.2}
+        params = {"__posterior__": post, "__spatial_tuning__": self.RECORD}
+        summary = _posterior_summary(params)
+        self.assertEqual(summary["spatial_tuning"], self.RECORD)
+        rows = outer_splits.posterior_rows(summary)
+        self.assertEqual(rows[0]["tune_scale_m"], "5000")
+        self.assertEqual(rows[0]["tune_clusters"], 3)
+        untuned = outer_splits.posterior_rows(
+            _posterior_summary({"__posterior__": post})
+        )
+        self.assertNotIn("tune_scale_m", untuned[0])
+
+    def test_the_command_line_prints_the_tuning(self):
+        from geofuse.cli.results import _spatial_lines
+
+        bundle = {
+            "test_results": {"spatial_adjustment": {"method": "spatial_plus"}},
+            "spatial_tuning": self.RECORD,
+        }
+        lines = _spatial_lines(bundle)
+        self.assertTrue(
+            any("Tuned within     5 km areas; 3 clusters" in x for x in lines), lines
+        )
+        self.assertTrue(any("ndvi 61%, gvi 5%" in x for x in lines))
+
+    def test_the_setting(self):
+        from geofuse import settings
+
+        self.assertIsNone(settings.defaults("fusion")["spatial_tune_scale_m"])
+        checked = settings.check("fusion", {"spatial_tune_scale_m": 5000})
+        self.assertEqual(checked["spatial_tune_scale_m"], 5000)
 
 
 if __name__ == "__main__":

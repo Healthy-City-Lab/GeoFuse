@@ -843,6 +843,11 @@ def _write_fusion_outputs(
             if (cgi_bundle or {}).get("spatial_smoothing")
             else {}
         ),
+        **(
+            {"spatial_tuning": cgi_bundle["spatial_tuning"]}
+            if (cgi_bundle or {}).get("spatial_tuning")
+            else {}
+        ),
         "studies": studies_manifest,
         "cgi_vs_standalone_aic_bic": aic_bic,
         "cgi_vs_standalone_paired": (
@@ -1140,6 +1145,7 @@ def _posterior_summary(params: dict) -> dict:
         "rhat_max": post.get("rhat_max"),
         "ess_min": post.get("ess_min"),
         "warm_start": post.get("warm_start"),
+        "spatial_tuning": g("__spatial_tuning__"),
         "divergences": post.get("divergences"),
         "converged": post.get("converged"),
         # The grid axes the posterior estimated rather than the sweep picked.
