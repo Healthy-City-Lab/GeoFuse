@@ -149,6 +149,35 @@ def _outer_lines(outer: dict) -> list[str]:
     return lines + _posterior_lines(summary)
 
 
+def _null_lines(null: dict) -> list[str]:
+    """The decision's false-positive rate per null kind: hits / nulls with
+    the exact interval, the real outcome's calibrated p and the stopping
+    rule's decision; every other tested quantity on its own line."""
+    summary = null.get("summary") or []
+    if not summary:
+        return []
+    groups = (null.get("groups") or {}).get("source")
+    lines = [
+        "  Null calibration of the held-out decision"
+        + (f" (areas: {groups})" if groups else "")
+        + ": rejections at corrected p < 0.05, 95 % CI"
+    ]
+    for e in summary:
+        n, hits = e.get("finished") or 0, e.get("hits") or 0
+        lo, hi = _num(e.get("ci_low")), _num(e.get("ci_high"))
+        calibrated = _num(e.get("calibrated_p"))
+        lines.append(
+            f"    {e.get('null_kind'):<8}{_outer_name(e):<22}{hits}/{n}"
+            + (f" = {hits / n:.1%}" if n else "")
+            + (f" [{lo:.1%}, {hi:.1%}]" if lo is not None and hi is not None else "")
+            + (f"  calibrated p={calibrated:.3g}" if calibrated is not None else "")
+            + (f"  {e['decision']}" if e.get("decision") else "")
+        )
+    if null.get("complete") is False:
+        lines.append("    (not every null outcome finished)")
+    return lines
+
+
 def _scale_name(text: str) -> str:
     """A ``spatial_scale_m`` cell as words: ``"at 5 km"`` or ``"unadjusted"``."""
     if text == "none":
@@ -412,6 +441,7 @@ def summary(label: str, bundle: dict, artifacts: Path) -> list[str]:
         )
     lines += _specificity_lines(bundle.get("specificity_contrast") or {})
     lines += _outer_lines(bundle.get("outer_splits") or {})
+    lines += _null_lines(bundle.get("outer_null") or {})
 
     params = _params(bundle)
     weights = {

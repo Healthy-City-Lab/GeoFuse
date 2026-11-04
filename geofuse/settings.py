@@ -223,6 +223,8 @@ SPATIAL_SPLIT_MODES = ("stripe", "random")
 OUTER_COMPARATORS = ("primary", "all")
 #: ``geofuse.jobs.outer_splits.OUTER_REPORTS``.
 OUTER_REPORTS = ("full", "decision")
+#: ``geofuse.null_outcomes.NULL_KINDS``.
+NULL_KINDS = ("spatial", "free", "both")
 
 # ────────────────────────────────────────────────────────────────────
 # NDVI
@@ -357,6 +359,43 @@ FUSION: dict[str, Setting] = {
         OUTER_REPORTS,
         "What the later held-out splits report: every interval and p-value, or "
         "only the estimates the across-split decisions read.",
+    ),
+    "outer_null_runs": _int(
+        0,
+        0,
+        10_000,
+        "Null outcomes run through the whole held-out decision rule; 0 = none.",
+    ),
+    "outer_null_kind": _choice(
+        "spatial",
+        NULL_KINDS,
+        "Null outcomes: spatially structured, freely permuted, or each.",
+    ),
+    "outer_null_group": Setting(
+        "text",
+        None,
+        help="Column whose area means the spatial null permutes; unset = the "
+        "smooth's spatial clusters.",
+    ),
+    "outer_null_stop_after": _int(
+        None,
+        1,
+        10_000,
+        "Sequential rule: decide after this many nulls; 0 = run all.",
+        auto_zero=True,
+    ),
+    "outer_null_stop_low": _int(
+        None, 0, 10_000, "Stop as not inflated at or below this many rejections."
+    ),
+    "outer_null_stop_high": _int(
+        None, 1, 10_000, "Stop as inflated at or above this many rejections."
+    ),
+    "outer_null_workers": _int(
+        None,
+        1,
+        256,
+        "Null outcomes run at once; 0 = sized on cores and memory.",
+        auto_zero=True,
     ),
     "n_bins": _int(5, 3, 10, "Quantile bins of the stratified split."),
     "residualize_method": _choice(
@@ -624,7 +663,32 @@ def check(engine: str, values: Mapping[str, Any]) -> dict[str, Any]:
         raise SettingError(f"'{lo}' must be on or before '{hi}'.")
     if engine == "fusion":
         _check_spatial(out)
+        _check_outer_null(out)
     return out
+
+
+def _check_outer_null(out: Mapping[str, Any]) -> None:
+    """Refuse null outcomes without repeated splits, and a sequential rule
+    that is incomplete or cannot decide."""
+    if out.get("outer_null_runs") and out.get("outer_splits", 2) < 2:
+        raise SettingError(
+            "'outer_null_runs' calibrates the decision across held-out splits; "
+            "set 'outer_splits' to 2 or more."
+        )
+    after = out.get("outer_null_stop_after")
+    low, high = out.get("outer_null_stop_low"), out.get("outer_null_stop_high")
+    if (low is not None or high is not None) and not after:
+        raise SettingError(
+            "'outer_null_stop_low' / '_high' need 'outer_null_stop_after'."
+        )
+    if after and low is None and high is None:
+        raise SettingError(
+            "'outer_null_stop_after' needs 'outer_null_stop_low' or '_high'."
+        )
+    if low is not None and high is not None and low >= high:
+        raise SettingError("'outer_null_stop_low' must be below '_high'.")
+    if after and high is not None and high > after:
+        raise SettingError("'outer_null_stop_high' must not exceed '_after'.")
 
 
 def _check_spatial(out: Mapping[str, Any]) -> None:

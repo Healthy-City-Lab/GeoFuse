@@ -1384,6 +1384,107 @@ def _run_outer_splits(
     }
 
 
+def _run_outer_null(
+    engine: Any,
+    *,
+    fusion_df: Any,
+    n: int,
+    kind: str,
+    group_column: str | None,
+    stop: dict,
+    workers: int | None,
+    rule: dict,
+    split_kwargs: dict,
+    fit_kwargs: dict,
+    setup: dict,
+    resume_dir: str,
+    stage_key: str,
+    stage: Any,
+    stage_progress: Any,
+    ctx: Any,
+    label: str,
+    split_seed: int,
+    restore_split: dict,
+    headline_params: dict,
+    observed: list[dict],
+) -> dict | None:
+    """``n`` null outcomes through the repeated-split decision rule.
+
+    See :func:`geofuse.jobs.outer_null.run`. Refused with a WARN (the stage
+    skipped) for a panel, whose rows are not exchangeable entities, and when
+    ``group_column`` is not a column of the fusion frame. A failure is logged
+    and the run continues; a cancel ends it as cancelled. The engine is put
+    back on the first split afterwards. Returns the null report, or ``None``.
+    """
+    from . import outer_null as _null
+
+    stage(stage_key, RUNNING)
+    if engine.is_panel:
+        _log_fusion(
+            "WARN",
+            f"[{label}] Null calibration needs one row per entity; a panel's "
+            "rows are not exchangeable, so it is skipped.",
+        )
+        stage(stage_key, SKIPPED, "panel target")
+        return None
+    if group_column and group_column not in fusion_df.columns:
+        _log_fusion(
+            "WARN",
+            f"[{label}] Null calibration: '{group_column}' is not a covariate "
+            "of this study, so it cannot group the spatial null; skipped.",
+        )
+        stage(stage_key, SKIPPED, f"no column {group_column}")
+        return None
+
+    def _progress(done: int, total: int) -> None:
+        stage_progress(stage_key, done / max(total, 1), f"null {done:,}/{total:,}")
+        ctx.progress(status_text=f"[{label}] Null outcome {done}/{total}...")
+
+    report = None
+    try:
+        report = _null.run(
+            engine,
+            fusion_df=fusion_df,
+            n=int(n),
+            kind=str(kind),
+            group_column=group_column,
+            stop={k: v for k, v in stop.items() if v is not None},
+            seed=int(split_seed),
+            rule=rule,
+            split_kwargs=split_kwargs,
+            fit_kwargs=fit_kwargs,
+            observed=observed,
+            resume_dir=resume_dir,
+            setup=setup,
+            workers=workers,
+            log=lambda level, msg: _log_fusion(level, f"[{label}] {msg}"),
+            progress=_progress,
+            cancelled=ctx.is_cancelled,
+        )
+        if ctx.is_cancelled():
+            raise JobCancelled("Null calibration cancelled by user.")
+    except JobCancelled:
+        raise
+    except Exception as exc:
+        _log_fusion(
+            "WARN",
+            f"[{label}] Null calibration failed: {exc}. The run continues "
+            "without it.",
+        )
+        stage(stage_key, FAILED, str(exc))
+        return None
+    finally:
+        engine._active_greenery_channel = "cgi"
+        engine._fit_label = "split 0"
+        engine.split_data(random_state=int(split_seed), **restore_split)
+        engine.best_params = dict(headline_params)
+    if report["complete"]:
+        stage(stage_key, DONE)
+    else:
+        stage(stage_key, FAILED, "not every null outcome finished")
+    return report
+
+
 def _build_fusion_study_name(
     target_display_name: str,
     label: str,
@@ -1756,6 +1857,13 @@ def run_fusion(
     outer_splits: int = 1,
     outer_comparators: str = "primary",
     outer_report: str = "full",
+    outer_null_runs: int = 0,
+    outer_null_kind: str = "spatial",
+    outer_null_group: str | None = None,
+    outer_null_stop_after: int | None = None,
+    outer_null_stop_low: int | None = None,
+    outer_null_stop_high: int | None = None,
+    outer_null_workers: int | None = None,
     gvi_api_key: str | None = None,
     ndvi_start_date: str | None = None,
     ndvi_end_date: str | None = None,
@@ -1883,7 +1991,12 @@ def run_fusion(
     comparators ``outer_comparators`` names on each, and reports the spread
     and a corrected resampled t across all splits; every other report stays
     on the first split. ``outer_report="decision"`` keeps only the estimates
-    those decisions read on the later splits."""
+    those decisions read on the later splits. ``outer_null_runs`` null
+    outcomes of ``outer_null_kind`` (areas from ``outer_null_group``, else the
+    smooth's clusters) then go through the same search and splits in that
+    report, and give the decision's false-positive rate
+    (:mod:`geofuse.jobs.outer_null`), stopped early by the
+    ``outer_null_stop_*`` rule when set."""
     # Bound before the body so the handlers below can close out the ledger no
     # matter how early a run fails.
     ledger = None
@@ -2020,6 +2133,7 @@ def run_fusion(
             negative_control_retune=retune_enabled,
             comparators=bool(comparator_cols),
             outer_splits=int(outer_splits) > 1 or bool(scale_ladder),
+            outer_null=int(outer_splits) > 1 and int(outer_null_runs or 0) > 0,
         )
         ctx.update_stage_ledger(ledger.to_dict())
 
@@ -2108,6 +2222,24 @@ def run_fusion(
             **(
                 {"outer_report": str(outer_report)}
                 if int(outer_splits) > 1 and str(outer_report) != "full"
+                else {}
+            ),
+            **(
+                {
+                    "outer_null_runs": int(outer_null_runs),
+                    "outer_null_kind": str(outer_null_kind),
+                    "outer_null_group": outer_null_group or None,
+                    "outer_null_stop": (
+                        {
+                            "after": outer_null_stop_after,
+                            "low": outer_null_stop_low,
+                            "high": outer_null_stop_high,
+                        }
+                        if outer_null_stop_after
+                        else None
+                    ),
+                }
+                if int(outer_splits) > 1 and int(outer_null_runs or 0) > 0
                 else {}
             ),
             "radius_prior": str(radius_prior),
@@ -3691,6 +3823,87 @@ def run_fusion(
                 if ctx.is_cancelled():
                     return {"output_paths": output_paths}
 
+            # ────────────────────────────────────────────
+            # Null calibration of the held-out decision
+            # ────────────────────────────────────────────
+            outer_null_report: dict | None = None
+            if int(outer_splits) > 1 and int(outer_null_runs or 0) > 0:
+                outer_null_report = _run_outer_null(
+                    engine,
+                    fusion_df=fusion_df,
+                    n=int(outer_null_runs),
+                    kind=str(outer_null_kind),
+                    group_column=outer_null_group or None,
+                    stop={
+                        "after": outer_null_stop_after,
+                        "low": outer_null_stop_low,
+                        "high": outer_null_stop_high,
+                    },
+                    workers=outer_null_workers,
+                    rule={
+                        "k_splits": int(outer_splits),
+                        "split_seed": int(split_seed),
+                        "metric": objective_metric,
+                        "standalones": (
+                            [c for c in standalones if c in standalones_bundle]
+                            if standalones
+                            else []
+                        ),
+                        "comparators": list(outcome_cmps or []),
+                        "comparators_primary": [
+                            c for c in (outcome_cmps or []) if c in primary_cols
+                        ],
+                        "outer_comparators": str(outer_comparators),
+                        "specificity": specificity_report is not None,
+                    },
+                    split_kwargs={
+                        "test_size": test_size,
+                        "spatial_split": bool(spatial_split),
+                        "spatial_block_size_m": spatial_block_size_m,
+                        "n_spatial_blocks": n_spatial_blocks,
+                        "spatial_split_mode": str(spatial_split_mode),
+                    },
+                    fit_kwargs={
+                        "forms": index_forms,
+                        "sweep_splits": int(sweep_splits),
+                        "draws": int(outer_posterior_draws or posterior_draws),
+                        "warmup": int(
+                            outer_posterior_warmup
+                            or outer_posterior_draws
+                            or posterior_warmup
+                        ),
+                        "chains": int(outer_posterior_chains or posterior_chains),
+                        "warm_start": bool(outer_warm_start),
+                        "synergy_warm_start": bool(synergy_warm_start),
+                        "radius_prior": str(radius_prior),
+                        "seed": 42,
+                        "cancel_callback": cancel_check,
+                    },
+                    setup={
+                        "config_hash": run_config_record.get("config_hash"),
+                        "outcome": label,
+                    },
+                    resume_dir=os.path.join(cache_dir, "outer_null"),
+                    stage_key=skey("outer_null"),
+                    stage=stage,
+                    stage_progress=stage_progress,
+                    ctx=ctx,
+                    label=label,
+                    split_seed=int(split_seed),
+                    restore_split={
+                        "fusion_df": fusion_df,
+                        "test_size": test_size,
+                        "spatial_split": bool(spatial_split),
+                        "spatial_block_size_m": spatial_block_size_m,
+                        "n_spatial_blocks": n_spatial_blocks,
+                        "spatial_split_mode": str(spatial_split_mode),
+                    },
+                    headline_params=headline_params,
+                    observed=(outer_bundle or {}).get("summary") or [],
+                )
+                if ctx.is_cancelled():
+                    return {"output_paths": output_paths}
+
             bundle = {
                 "best_params": best_params,
                 "averaged_params": averaged_params,
@@ -3763,6 +3976,7 @@ def run_fusion(
                 "cgi_vs_standalone_paired_family": cgi_vs_standalone_paired_family,
                 "split_seed": int(split_seed),
                 "outer_splits": outer_bundle,
+                "outer_null": outer_null_report,
             }
             if specificity_contrast:
                 bundle["specificity_contrast"] = specificity_report

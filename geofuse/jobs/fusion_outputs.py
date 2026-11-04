@@ -52,6 +52,7 @@ _FUSION_STAGE_WEIGHTS: dict[str, float] = {
     "comparators": 4.0,
     "negative_control_retune": 20.0,
     "outer_splits": 40.0,
+    "outer_null": 80.0,
 }
 
 _FUSION_RETUNE_STAGE: tuple[str, str] = (
@@ -67,6 +68,11 @@ _FUSION_COMPARATORS_STAGE: tuple[str, str] = (
 _FUSION_OUTER_SPLITS_STAGE: tuple[str, str] = (
     "outer_splits",
     "Repeat on other held-out splits",
+)
+
+_FUSION_OUTER_NULL_STAGE: tuple[str, str] = (
+    "outer_null",
+    "Null calibration of the held-out decision",
 )
 
 _FUSION_LONGITUDINAL_STAGE: tuple[str, str] = (
@@ -757,6 +763,13 @@ def _write_fusion_outputs(
         _emit_csv(f"outer_splits{sfx}.csv", outer["splits"])
         _emit_csv(f"outer_summary{sfx}.csv", outer.get("summary") or [])
 
+    # ── null_outer.csv + null_summary.csv + null_variogram.csv ──
+    null = (cgi_bundle or {}).get("outer_null") or {}
+    if null.get("rows"):
+        _emit_csv(f"null_outer{sfx}.csv", null["rows"])
+        _emit_csv(f"null_summary{sfx}.csv", null.get("summary") or [])
+        _emit_csv(f"null_variogram{sfx}.csv", null.get("variogram") or [])
+
     # ── results_summary.json (master manifest) ──────────────────
     studies_manifest: dict[str, dict] = {}
     for key, disp, b in studies:
@@ -877,6 +890,11 @@ def _write_fusion_outputs(
         "spatial_split": (cgi_bundle or {}).get("spatial_split"),
         "outer_splits": (cgi_bundle or {}).get("outer_splits"),
     }
+    if null:
+        manifest["outer_null"] = {
+            k: null.get(k)
+            for k in ("kinds", "runs", "workers", "groups", "stop", "decisions")
+        } | {"complete": null.get("complete"), "summary": null.get("summary")}
     if (cgi_bundle or {}).get("specificity_contrast") is not None:
         manifest["specificity_contrast"] = cgi_bundle["specificity_contrast"]
     _emit_json(f"results_summary{sfx}.json", manifest)
@@ -1014,6 +1032,7 @@ def _build_fusion_ledger(
     negative_control_retune: bool = False,
     comparators: bool = False,
     outer_splits: bool = False,
+    outer_null: bool = False,
 ) -> StageLedger:
     """Fresh ledger covering every (outcome, step) pair in run order.
 
@@ -1032,7 +1051,8 @@ def _build_fusion_ledger(
     ``negative_control_retune`` appends one re-tune stage per outcome, after
     its standalones, where the runner performs it; ``comparators`` one stage
     for the comparator exposures, between the two; ``outer_splits`` one stage
-    for the repeated held-out splits, last.
+    for the repeated held-out splits, and ``outer_null`` one for their null
+    calibration, last.
     """
     standalones = list(standalone_channels or [])
     steps: list[tuple[str, str]] = []
@@ -1092,6 +1112,14 @@ def _build_fusion_ledger(
                 (
                     _fusion_stage_key(label, os_key_raw, multi=multi),
                     f"[{label}] {os_label}" if multi else os_label,
+                )
+            )
+        if outer_null:
+            on_key_raw, on_label = _FUSION_OUTER_NULL_STAGE
+            steps.append(
+                (
+                    _fusion_stage_key(label, on_key_raw, multi=multi),
+                    f"[{label}] {on_label}" if multi else on_label,
                 )
             )
     return StageLedger.from_steps(steps)

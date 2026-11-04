@@ -72,6 +72,9 @@ class EngineConstantTests(unittest.TestCase):
 
         self.assertEqual(settings.OUTER_COMPARATORS, outer_splits.OUTER_COMPARATORS)
         self.assertEqual(settings.OUTER_REPORTS, outer_splits.OUTER_REPORTS)
+        from geofuse import null_outcomes
+
+        self.assertEqual(settings.NULL_KINDS, null_outcomes.NULL_KINDS)
         from geofuse import pdcor
 
         self.assertEqual(settings.PDCOR_CACHE_N, pdcor.MAX_CACHE_N)
