@@ -114,17 +114,9 @@ def _design(n: int, cov, smooth):
     return BlockDesign(n, cov, smooth, rtol=_BASIS_RTOL)
 
 
-def partial_slope(exposure, outcome, covariates=None, *, level: float = 0.95) -> dict:
-    """Slope of ``outcome`` on ``exposure`` given ``covariates``, in SD units.
-
-    Both sides are residualised on the covariates plus an intercept and divided
-    by their residual SD, so ``beta`` is the outcome change in SDs per SD of
-    exposure, conditional on the covariates — the partial correlation. Its
-    standard error and interval are the exact OLS ones with ``n − rank − 1``
-    residual degrees of freedom. Rows with any non-finite value are dropped.
-    """
-    from scipy import stats
-
+def _residualised(exposure, outcome, covariates):
+    """Exposure and outcome residualised on the covariates plus an intercept,
+    over the rows where all are finite: ``(xr, yr, n, residual df)``."""
     x = np.asarray(exposure, dtype=np.float64)
     y = np.asarray(outcome, dtype=np.float64)
     cov = None if covariates is None else np.asarray(covariates, dtype=np.float64)
@@ -138,6 +130,23 @@ def partial_slope(exposure, outcome, covariates=None, *, level: float = 0.95) ->
     n = int(len(x))
     q, _ = covariate_basis(cov, n)
     dof = n - q.shape[1] - 1
+    if dof < 2:
+        return x, y, n, dof
+    return x - q @ (q.T @ x), y - q @ (q.T @ y), n, dof
+
+
+def partial_slope(exposure, outcome, covariates=None, *, level: float = 0.95) -> dict:
+    """Slope of ``outcome`` on ``exposure`` given ``covariates``, in SD units.
+
+    Both sides are residualised on the covariates plus an intercept and divided
+    by their residual SD, so ``beta`` is the outcome change in SDs per SD of
+    exposure, conditional on the covariates — the partial correlation. Its
+    standard error and interval are the exact OLS ones with ``n − rank − 1``
+    residual degrees of freedom. Rows with any non-finite value are dropped.
+    """
+    from scipy import stats
+
+    xr, yr, n, dof = _residualised(exposure, outcome, covariates)
     empty = {
         "beta": float("nan"),
         "se": float("nan"),
@@ -149,8 +158,6 @@ def partial_slope(exposure, outcome, covariates=None, *, level: float = 0.95) ->
     }
     if dof < 2:
         return empty
-    xr = x - q @ (q.T @ x)
-    yr = y - q @ (q.T @ y)
     sx, sy = float(xr.std()), float(yr.std())
     if sx <= 1e-12 or sy <= 1e-12:
         return empty
@@ -167,6 +174,53 @@ def partial_slope(exposure, outcome, covariates=None, *, level: float = 0.95) ->
         "n": n,
         "df": dof,
     }
+
+
+
+def raw_slope(
+    exposure, outcome, covariates=None, *, scale: float = 1.0, level: float = 0.95
+) -> dict:
+    """Slope of ``outcome`` on ``exposure`` given ``covariates``, in raw units.
+
+    The OLS coefficient of the outcome on ``exposure / scale`` with the
+    covariates and an intercept (Frisch–Waugh on the residualised pair), so
+    ``estimate`` is the outcome change, in its own units, per ``scale`` units
+    of exposure (``scale`` = an IQR gives the per-IQR contrast). Its standard
+    error and interval are the exact OLS ones with ``n − rank − 1`` residual
+    degrees of freedom; ``t`` is the same as :func:`partial_slope`'s. Rows with
+    any non-finite value are dropped.
+    """
+    from scipy import stats
+
+    xr, yr, n, dof = _residualised(exposure, outcome, covariates)
+    nan = float("nan")
+    out = {
+        "estimate": nan,
+        "se": nan,
+        "ci_low": nan,
+        "ci_high": nan,
+        "t": nan,
+        "n": n,
+        "df": dof,
+        "scale": float(scale),
+    }
+    if dof < 2 or not np.isfinite(scale) or scale <= 0:
+        return out
+    sxx = float(xr @ xr)
+    if sxx <= 1e-24 * max(len(xr), 1):
+        return out
+    b = float(xr @ yr) / sxx
+    resid = yr - b * xr
+    se = math.sqrt(max(float(resid @ resid), 0.0) / dof / sxx)
+    crit = float(stats.t.ppf(0.5 + level / 2.0, dof))
+    out.update(
+        estimate=b * scale,
+        se=se * scale,
+        ci_low=(b - crit * se) * scale,
+        ci_high=(b + crit * se) * scale,
+        t=b / se if se > 0 else float("inf"),
+    )
+    return out
 
 
 def paired_contrast(

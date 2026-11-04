@@ -196,6 +196,32 @@ def comparator_mode(column: str) -> str:
     return _COMPARATOR_PREFIX + column
 
 
+def _distribution(values: np.ndarray) -> dict:
+    """``median``, ``q25``, ``q75``, ``iqr``, ``p5``, ``p95`` and ``n`` of the
+    finite values (``None`` each without any)."""
+    v = np.asarray(values, dtype=np.float64)
+    v = v[np.isfinite(v)]
+    if not v.size:
+        empty = dict.fromkeys(("median", "q25", "q75", "iqr", "p5", "p95"))
+        return {**empty, "n": 0}
+    quantiles = np.quantile(v, [0.05, 0.25, 0.5, 0.75, 0.95])
+    p5, q25, med, q75, p95 = (float(q) for q in quantiles)
+    return {
+        "median": med,
+        "q25": q25,
+        "q75": q75,
+        "iqr": q75 - q25,
+        "p5": p5,
+        "p95": p95,
+        "n": int(v.size),
+    }
+
+
+def _scale(value) -> float:
+    """A contrast's scale, NaN when it is missing or not positive."""
+    return float(value) if value is not None and float(value) > 0 else float("nan")
+
+
 class MetricFusionEngine:
     """
     Engine for fusing vegetation, terrain, and NDVI metrics using optimization.
@@ -9394,6 +9420,126 @@ class MetricFusionEngine:
                         record["scale_m"] = self._spatial_scale
                     row["spatial_adjustment"] = record
                 out["rows"].append(row)
+        return out
+
+    def compute_raw_effects(
+        self,
+        cgi_params: dict,
+        exposures: "dict[str, tuple[str, dict]] | None" = None,
+        *,
+        fixed_iqr: "dict[str, float] | None" = None,
+    ) -> dict:
+        """Held-out slopes in raw units: per IQR and per 5th–95th percentile.
+
+        For the CGI and every exposure of ``exposures`` (``{name: (active
+        channel, params)}``, as for :meth:`compute_specificity_contrast`):
+        ``distribution``, the exposure's ``median``, ``q25``, ``q75``, ``iqr``,
+        ``p5``, ``p95`` and ``n`` on the train+val rows, which set the scale;
+        and on the held-out rows its covariate-adjusted slope
+        (:func:`negative_controls.raw_slope`) on the target and on every
+        negative control, in the outcome's units per IQR (``per_iqr``; per
+        ``fixed_iqr[name]`` exposure units when given) and per p5–p95 range
+        (``per_p5_p95``). The covariates and spatial smooths are the per-SD
+        slopes' (:meth:`_slope_smooths`), and each slope records its smooth
+        under ``spatial_adjustment``. ``layers`` gives each composite channel's
+        distribution at the cell the CGI reads, so a composite IQR can be read
+        in a layer's units. The smooth selections are not counted again in
+        :meth:`spatial_selection_report`. Controls are left out for a panel.
+        """
+        import copy
+
+        from . import negative_controls as _nc
+
+        fixed = {str(k): float(v) for k, v in (fixed_iqr or {}).items()}
+        prev = self._active_greenery_channel
+        counters = copy.deepcopy(self._spatial_selections)
+        try:
+            self._active_greenery_channel = "cgi"
+            df = self.apply_fusion(weights=dict(cgi_params))
+            layer_names = [c for c in self._composite_channels() if c in df.columns]
+            keys = df["polygon_id"].to_numpy() if "polygon_id" in df.columns else None
+            xs: dict[str, tuple[str, np.ndarray]] = {
+                "cgi": ("cgi", df["composite"].to_numpy(dtype=np.float64))
+            }
+            for name, (channel, params) in (exposures or {}).items():
+                try:
+                    self._active_greenery_channel = channel
+                    other = self.apply_fusion(weights=dict(params))
+                except JobCancelled:
+                    raise
+                except Exception as exc:
+                    _log("WARN", f"Raw-unit effects: '{name}' not applied: {exc}")
+                    continue
+                values = other["composite"].to_numpy(dtype=np.float64)
+                if keys is not None and "polygon_id" in other.columns:
+                    values = (
+                        pd.Series(values, index=other["polygon_id"].to_numpy())
+                        .reindex(keys)
+                        .to_numpy(dtype=np.float64)
+                    )
+                if len(values) == len(df):
+                    kind = "comparator" if "comparator" in params else "channel"
+                    xs[name] = (kind, values)
+            self._active_greenery_channel = "cgi"
+            target = df["target"].to_numpy(dtype=np.float64)
+            cov = self._reporting_covariate_matrix(df)
+            test = self._test_entity_mask(df)
+            coords = self._whole_data_coords(df)
+            controls: dict[str, np.ndarray] = {}
+            if not self.is_panel:
+                for name in self.negative_control_columns:
+                    values = self._reporting_raw_column(df, name)
+                    if values is not None:
+                        controls[name] = values
+            c_t = None if cov is None else cov[test]
+            out: dict = {
+                "split": "test",
+                "n_test": int(test.sum()),
+                "controls": list(controls),
+                "exposures": {},
+                "layers": {
+                    ch: _distribution(df[ch].to_numpy(dtype=np.float64)[~test])
+                    for ch in layer_names
+                },
+            }
+            for name, (kind, x) in xs.items():
+                dist = _distribution(x[~test])
+                iqr = fixed.get(name, dist["iqr"])
+                span = None
+                if dist["p95"] is not None and dist["p5"] is not None:
+                    span = dist["p95"] - dist["p5"]
+                (smooth, record), smooths = self._slope_smooths(
+                    coords, test, x, target, controls, cov
+                )
+
+                def contrasts(y, extra, rec, x=x, iqr=iqr, span=span):
+                    c = self._with_smooth(c_t, extra)
+                    res = {
+                        "per_iqr": _nc.raw_slope(
+                            x[test], y[test], c, scale=_scale(iqr)
+                        ),
+                        "per_p5_p95": _nc.raw_slope(
+                            x[test], y[test], c, scale=_scale(span)
+                        ),
+                    }
+                    if rec is not None:
+                        for r in res.values():
+                            r["spatial_adjustment"] = rec
+                    return res
+
+                out["exposures"][name] = {
+                    "kind": kind,
+                    "distribution": dist,
+                    "iqr_source": "fixed" if name in fixed else "train_val",
+                    "target": contrasts(target, smooth, record),
+                    "controls": {
+                        c: contrasts(v, smooths[c][0], smooths[c][1])
+                        for c, v in controls.items()
+                    },
+                }
+        finally:
+            self._active_greenery_channel = prev
+            self._spatial_selections = counters
         return out
 
     def retune_concordance(
