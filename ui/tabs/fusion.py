@@ -3207,6 +3207,7 @@ _OUTER_QUANTITY_LABELS: dict[str, str] = {
     "exposure_beta": "Exposure β per SD",
     "exposure_negative_control_beta": "Exposure negative-control β",
     "specificity_difference": "Specificity ΔD (CGI − exposure)",
+    "negative_control_d": "Negative-control D",
     "held_out_per_iqr": "Change per IQR",
     "held_out_per_p5_p95": "Change per p5–p95",
     "exposure_per_iqr": "Exposure change per IQR",
@@ -3250,8 +3251,10 @@ def _render_outer_splits(results_view: dict) -> None:
         )
     )
     with_control = any("control" in e for e in summary)
+    weighted = any(e.get("weighting") for e in summary)
     rows = [
         {
+            **({"Weighting": e.get("weighting") or "unweighted"} if weighted else {}),
             "Result": _OUTER_QUANTITY_LABELS.get(e.get("quantity"), e.get("quantity")),
             "Exposure": _CHANNEL_DISPLAY.get(e.get("exposure"), e.get("exposure")),
             **({"Control": e.get("control") or "—"} if with_control else {}),
@@ -7212,6 +7215,8 @@ def render(output_dir: str) -> None:
                         "outer_null_stop_high",
                         "outer_null_workers",
                         "fixed_iqr",
+                        "weight_column",
+                        "weight_search",
                     )
                 },
                 "radius_prior": radius_prior_param,

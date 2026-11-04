@@ -971,6 +971,8 @@ def fusion_run_config(spec: JobSpec) -> dict[str, Any]:
         ),
         "exposure_iqr": s["exposure_iqr"],
         "fixed_iqr": s["fixed_iqr"],
+        "weight_column": s["weight_column"] or None,
+        "weight_search": bool(s["weight_search"]),
         "standalone_channels": (
             list(_settings.CHANNEL_SETS[s["channel_set"]])
             if s["run_standalones"]
