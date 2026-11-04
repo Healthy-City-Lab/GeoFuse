@@ -291,9 +291,10 @@ change what is reported about the chosen composite, not how it is chosen.
 Turn `weight_search` on only when the question is explicitly about the
 population the weights describe, or when selection is believed to change
 which exposure is chosen, and say so in the methods; it then needs its own
-null calibration. Neither setting has a dashboard field yet: set them in a
-run file or with `--weight-column` / `--weight-search`; a study re-run from
-the dashboard keeps them.
+null calibration. The dashboard sets the weight column in the target
+section (**Sampling weight column**); `weight_search` has no dashboard
+field: set it in a run file or with `--weight-search`, and a study re-run
+from the dashboard keeps it.
 
 ### Null calibration of the held-out decision
 
@@ -307,9 +308,9 @@ job; the preparation, the exposure tensor and the caches are the real run's.
 | `outer_report` (**Later splits report**) | `full` | `decision` keeps only the estimates the corrected tests read on the later splits (no bootstrap intervals or permutation p-values); the tests themselves are unchanged |
 | `outer_null_runs` (**Null outcomes**) | 0 | Null outcomes, each run through the same search and held-out splits and seeds in the decision report |
 | `outer_null_kind` (**Null outcome kind**) | `spatial` | `spatial`: area means permuted across areas, variogram-matched surrogates within them; `free`: the outcome permuted over entities (within waves); `both`: each, as two rates |
-| `outer_null_group` (**Null areas column**) | unset | A categorical covariate (a site or city) whose area means the spatial null permutes; unset = the spatial smooth's clusters |
+| `outer_null_group` (**Null areas column**) | unset | Any target column of areas (a site or city; text or a numeric code, a covariate or not) whose area means the spatial null permutes; entities without a value form one area. A run file naming a column the target lacks is refused when planned. Unset = clusters split at gaps of `spatial_adjust_eps_m` (also in a study without spatial adjustment), else twice the first pattern scale, else the 10-nearest-neighbour components; `spatial_adjust_min_component` joins smaller clusters to their nearest |
 | `outer_null_stop_after`, `_low`, `_high` (**Decide after nulls**, **Stop at or below**, **Stop at or above**) | unset | A sequential rule fixed in advance: after that many nulls, stop as not inflated at or below `_low` rejections, as inflated at or above `_high`, else run all |
-| `outer_null_workers` (**Nulls at once**) | automatic | Nulls run in parallel, each worker holding one copy of the study; automatic sizes the pool on cores and memory |
+| `outer_null_workers` (**Nulls at once**) | automatic | Nulls run in parallel, each worker holding one copy of the study and its own sampler (about 2–3 GB each); automatic uses up to 4 workers, fewer when cores or memory are short |
 
 ```toml
 [defaults.fusion]
@@ -322,6 +323,11 @@ outer_null_stop_after = 50
 outer_null_stop_low = 1
 outer_null_stop_high = 7
 ```
+
+The results record how the spatial null was grouped, the number of areas,
+the smallest and the largest area's share; fewer than 5 areas, or one
+holding more than a quarter of the entities, logs a warning, because
+permuting the area means then changes little.
 
 Each null costs about one repeated study in the decision report. A cancelled
 or repeated job keeps its finished nulls and continues from the next one. The

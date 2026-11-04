@@ -254,7 +254,11 @@ inflated` or `ran all`). A rule that stopped reports the nulls it decided on.
 (`outcome`) next to the surrogates' `surrogate_median`, `surrogate_p05` and
 `surrogate_p95`. `results_summary.json` has the summary under `outer_null`
 with the kinds, the number of nulls, the workers, the areas (`groups`:
-`source`, `n_groups`), the rule and whether every null finished. Finished
+`source` — `column <name>`, `gap clusters at <m> m` or
+`10-nearest-neighbour components`, with any merging of small clusters —,
+`n_groups`, `smallest`, `largest_share` and `n_missing`, the entities
+without a group value, grouped together), the rule and whether every
+null finished. Finished
 nulls are kept under `fusion_cache/outer_null/`, so a cancelled or repeated
 job continues from the next one.
 
