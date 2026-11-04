@@ -7860,7 +7860,9 @@ class MetricFusionEngine:
         whole = self._paired_difference_on(*args, bootstrap=False, **kw)
         if whole is None:
             return None
-        held = self._paired_difference_on(*args, held_out=True, **kw)
+        held = self._paired_difference_on(
+            *args, held_out=True, bootstrap=int(n_bootstrap) > 0, **kw
+        )
         out = dict(held or {})
         for k in PAIRED_HEADLINE_KEYS:
             out.setdefault(k, None)

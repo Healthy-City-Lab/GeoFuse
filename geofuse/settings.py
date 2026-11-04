@@ -221,6 +221,8 @@ CATEGORICAL_MISSING = ("drop", "indicator")
 SPATIAL_SPLIT_MODES = ("stripe", "random")
 #: ``geofuse.jobs.outer_splits.OUTER_COMPARATORS``.
 OUTER_COMPARATORS = ("primary", "all")
+#: ``geofuse.jobs.outer_splits.OUTER_REPORTS``.
+OUTER_REPORTS = ("full", "decision")
 
 # ────────────────────────────────────────────────────────────────────
 # NDVI
@@ -349,6 +351,12 @@ FUSION: dict[str, Setting] = {
     ),
     "outer_comparators": _choice(
         "primary", OUTER_COMPARATORS, "Comparators scored on every held-out split."
+    ),
+    "outer_report": _choice(
+        "full",
+        OUTER_REPORTS,
+        "What the later held-out splits report: every interval and p-value, or "
+        "only the estimates the across-split decisions read.",
     ),
     "n_bins": _int(5, 3, 10, "Quantile bins of the stratified split."),
     "residualize_method": _choice(

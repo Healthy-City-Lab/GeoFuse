@@ -65,6 +65,11 @@ POSTERIOR_QUANTITIES = frozenset(q for q in QUANTITIES if q.startswith("posterio
 
 OUTER_COMPARATORS = ("primary", "all")
 
+#: What each later split reports: ``full`` every per-split interval and
+#: p-value; ``decision`` only the point estimates the across-split decisions
+#: read (no bootstrap or permutation on the split).
+OUTER_REPORTS = ("full", "decision")
+
 # Slope-type quantities a scale ladder reports at every scale.
 LADDER_QUANTITIES = frozenset(
     {
@@ -625,8 +630,10 @@ def repeat(
     cancelled: Any = None,
     specificity: bool = False,
     ladder: "list[float | None] | None" = None,
+    report: str = "full",
+    first: int = 1,
 ) -> list[dict]:
-    """Splits ``1 … k_splits − 1`` (seeds ``split_seed + k``) as split rows.
+    """Splits ``first … k_splits − 1`` (seeds ``split_seed + k``) as rows.
 
     Each split re-splits the engine with ``split_kwargs``, fits the CGI and
     every standalone with ``fit_kwargs`` (the reproducibility, gain and null
@@ -639,6 +646,12 @@ def repeat(
     first split. ``progress(k)`` is called before each split;
     ``cancelled()`` stops between steps. ``ladder`` lists the other pattern
     scales (and ``None``) whose slopes :func:`scale_rows` adds on every split.
+
+    ``report="decision"`` keeps what the across-split decisions read: the
+    held-out score as a point estimate (no bootstrap interval or permutation
+    p), every slope with its exact interval, and the paired differences and
+    specificity contrasts as point estimates (no bootstrap). The estimates,
+    and so every corrected t, are the ``full`` report's.
     """
     from ..fusion import comparator_mode
     from .fusion_outputs import (
@@ -648,9 +661,14 @@ def repeat(
         specificity_exposures,
     )
 
+    if report not in OUTER_REPORTS:
+        raise ValueError(f"report must be one of {OUTER_REPORTS}; got {report!r}.")
+    decision = report == "decision"
+    if decision:
+        n_effects_boot = n_perm = n_paired = 0
     loops = {"reps": 0, "shuffles": 0, "gain_splits": 0, "null_runs": 0}
     rows: list[dict] = []
-    for k in range(1, int(k_splits)):
+    for k in range(int(first), int(k_splits)):
         if cancelled is not None and cancelled():
             break
         if progress is not None:
@@ -661,9 +679,15 @@ def repeat(
         engine.split_data(random_state=seed, **split_kwargs)
         info = split_info(engine)
         params = engine.fit_bayesian_index(metric=metric, **fit_kwargs, **loops)
-        effects = engine.evaluate_effects(
-            params, metric, n_bootstrap=int(n_effects_boot), n_perm=int(n_perm)
-        )
+        if decision:
+            held = engine._score_data_subset(
+                data=engine.test_data, params=params, metric=metric
+            )
+            effects = {"test": {"score": held.get("score")}}
+        else:
+            effects = engine.evaluate_effects(
+                params, metric, n_bootstrap=int(n_effects_boot), n_perm=int(n_perm)
+            )
         slopes = engine.compute_partial_slopes(params)
 
         channel_paired = None

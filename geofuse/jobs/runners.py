@@ -1235,6 +1235,7 @@ def _run_outer_splits(
     specificity_exposures: dict | None = None,
     ladder: "list[float | None] | None" = None,
     primary_scale: float | None = None,
+    report: str = "full",
 ) -> dict | None:
     """The first split's results and ``k_splits − 1`` repeats, summarised.
 
@@ -1248,8 +1249,9 @@ def _run_outer_splits(
     ``complete: False``. ``ladder`` lists the other pattern scales (and
     ``None``) whose slopes every split, the first included, also reports
     (:func:`geofuse.jobs.outer_splits.scale_rows`); the summary's Holm families
-    use ``primary_scale``'s rows. Returns ``{k, seeds, comparators, splits,
-    summary, complete}``.
+    use ``primary_scale``'s rows. ``report`` is the repeats' report
+    (:data:`geofuse.jobs.outer_splits.OUTER_REPORTS`). Returns ``{k, seeds,
+    comparators, report, splits, summary, complete}``.
     """
     stage(stage_key, RUNNING)
     scored = set(
@@ -1312,6 +1314,7 @@ def _run_outer_splits(
             cancelled=ctx.is_cancelled,
             specificity=specificity,
             ladder=ladder,
+            report=report,
         )
         if ctx.is_cancelled():
             raise JobCancelled("Repeated held-out splits cancelled by user.")
@@ -1374,6 +1377,7 @@ def _run_outer_splits(
         "k": int(k_splits),
         "seeds": [int(split_seed) + k for k in range(int(k_splits))],
         "comparators": str(outer_comparators),
+        "report": str(report),
         "splits": rows,
         "summary": summary,
         "complete": completed >= int(k_splits),
@@ -1751,6 +1755,7 @@ def run_fusion(
     split_seed: int = 42,
     outer_splits: int = 1,
     outer_comparators: str = "primary",
+    outer_report: str = "full",
     gvi_api_key: str | None = None,
     ndvi_start_date: str | None = None,
     ndvi_end_date: str | None = None,
@@ -1877,7 +1882,8 @@ def run_fusion(
     ``split_seed + 1 …`` (see :mod:`geofuse.jobs.outer_splits`), scoring the
     comparators ``outer_comparators`` names on each, and reports the spread
     and a corrected resampled t across all splits; every other report stays
-    on the first split."""
+    on the first split. ``outer_report="decision"`` keeps only the estimates
+    those decisions read on the later splits."""
     # Bound before the body so the handlers below can close out the ledger no
     # matter how early a run fails.
     ledger = None
@@ -2097,6 +2103,11 @@ def run_fusion(
                     "outer_posterior_chains": outer_posterior_chains,
                 }
                 if int(outer_splits) > 1
+                else {}
+            ),
+            **(
+                {"outer_report": str(outer_report)}
+                if int(outer_splits) > 1 and str(outer_report) != "full"
                 else {}
             ),
             "radius_prior": str(radius_prior),
@@ -3611,9 +3622,9 @@ def run_fusion(
             # ────────────────────────────────────────────
             # Repeated held-out splits
             # ────────────────────────────────────────────
-            outer_report: dict | None = None
+            outer_bundle: dict | None = None
             if int(outer_splits) > 1 or scale_ladder:
-                outer_report = _run_outer_splits(
+                outer_bundle = _run_outer_splits(
                     engine,
                     k_splits=int(outer_splits),
                     split_seed=int(split_seed),
@@ -3675,6 +3686,7 @@ def run_fusion(
                     stage_progress=stage_progress,
                     ctx=ctx,
                     label=label,
+                    report=str(outer_report),
                 )
                 if ctx.is_cancelled():
                     return {"output_paths": output_paths}
@@ -3750,7 +3762,7 @@ def run_fusion(
                 "cgi_vs_standalone_paired": cgi_vs_standalone_paired,
                 "cgi_vs_standalone_paired_family": cgi_vs_standalone_paired_family,
                 "split_seed": int(split_seed),
-                "outer_splits": outer_report,
+                "outer_splits": outer_bundle,
             }
             if specificity_contrast:
                 bundle["specificity_contrast"] = specificity_report
