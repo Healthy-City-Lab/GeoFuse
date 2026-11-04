@@ -453,6 +453,16 @@ FUSION: dict[str, Setting] = {
         auto_zero=True,
         help="Greenery increment of the per-IQR effect; 0 = from the composite.",
     ),
+    "weight_column": Setting(
+        "text",
+        None,
+        help="Target column of sampling weights; the reports add weighted "
+        "estimates next to the unweighted ones.",
+    ),
+    "weight_search": _bool(
+        False,
+        "Also weight the search itself (a weighted likelihood); linear form only.",
+    ),
     "fixed_iqr": Setting(
         "floatmap",
         None,
@@ -700,7 +710,21 @@ def check(engine: str, values: Mapping[str, Any]) -> dict[str, Any]:
     if engine == "fusion":
         _check_spatial(out)
         _check_outer_null(out)
+        _check_weights(out)
     return out
+
+
+def _check_weights(out: Mapping[str, Any]) -> None:
+    """Refuse a weighted search without weights or with the synergy form."""
+    if not out.get("weight_search"):
+        return
+    if "weight_column" in out and not out["weight_column"]:
+        raise SettingError("'weight_search' needs a 'weight_column'.")
+    if out.get("index_form", "linear") != "linear":
+        raise SettingError(
+            "'weight_search' fits the linear form only; set 'index_form' to "
+            "'linear'."
+        )
 
 
 def _check_outer_null(out: Mapping[str, Any]) -> None:

@@ -20,7 +20,13 @@ import numpy as np
 import pandas as pd
 
 from ..logger import get_logger
-from .outer_splits import distribution_rows, raw_rows, spatial_columns, spatial_label
+from .outer_splits import (
+    distribution_rows,
+    raw_rows,
+    spatial_columns,
+    spatial_label,
+    weighted_rows,
+)
 from .stage_ledger import StageLedger
 
 _log_fusion = get_logger("FUSION")
@@ -773,6 +779,11 @@ def _write_fusion_outputs(
     _emit_csv(f"raw_effects{sfx}.csv", raw_effect_rows)
     _emit_csv(f"exposure_scales{sfx}.csv", exposure_scales if raw_effect_rows else [])
 
+    # ── weighted.csv ────────────────────────────────────────────
+    weighted = (cgi_bundle or {}).get("weighted")
+    weighted_table = weighted_rows(weighted)
+    _emit_csv(f"weighted{sfx}.csv", weighted_table)
+
     # ── null_outer.csv + null_summary.csv + null_variogram.csv ──
     null = (cgi_bundle or {}).get("outer_null") or {}
     if null.get("rows"):
@@ -902,6 +913,12 @@ def _write_fusion_outputs(
     }
     if raw_effect_rows:
         manifest["raw_effects"] = {"rows": raw_effect_rows, "scales": exposure_scales}
+    if weighted:
+        manifest["weighted"] = {
+            k: weighted.get(k)
+            for k in ("weight_column", "n_test", "n_eff", "n_dropped", "skipped")
+            if k in weighted
+        } | {"rows": weighted_table}
     if null:
         manifest["outer_null"] = {
             k: null.get(k)

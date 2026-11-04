@@ -1234,6 +1234,30 @@ def _raw_exposures(
             out[name] = (comparator_mode(name), {"comparator": name})
     return out
 
+def _log_weighted(report: dict | None, label: str) -> None:
+    """One line on the weighted held-out estimates: the weights' Kish
+    effective size, the rows they left out and the weighted slope."""
+    if not report:
+        return
+    if report.get("skipped"):
+        reason = (
+            "need one row per entity"
+            if report["skipped"] == "longitudinal"
+            else f"found no column '{report.get('weight_column')}' in the target"
+        )
+        _log_fusion("WARN", f"[{label}] Weighted estimates {reason}; skipped.")
+        return
+    slope = ((report.get("slopes") or {}).get("cgi") or {}).get("target") or {}
+    _log_fusion(
+        "OK",
+        f"[{label}] Weighted by '{report.get('weight_column')}' on the held-out "
+        f"rows: Kish n_eff {_fmt_or_na(report.get('n_eff'), ',.0f')} of "
+        f"{report.get('n_test')}, {report.get('n_dropped')} without a usable "
+        f"weight; weighted β {_fmt_or_na(slope.get('beta'), '+.4f')} "
+        f"[{_fmt_or_na(slope.get('ci_low'), '+.4f')}, "
+        f"{_fmt_or_na(slope.get('ci_high'), '+.4f')}].",
+    )
+
 
 def _run_outer_splits(
     engine: Any,
@@ -1309,6 +1333,7 @@ def _run_outer_splits(
             specificity=first_split.get("specificity"),
             raw=first_split.get("raw"),
             raw_keep=set(standalones) | scored,
+            weighted=first_split.get("weighted"),
         ):
             r.update(split=0, seed=int(split_seed), **info)
             if r["quantity"] == "cgi_minus_comparator" or r.get("kind") == "comparator":
@@ -1975,6 +2000,8 @@ def run_fusion(
     report_paired_bootstrap: int = 2000,
     exposure_iqr: float | None = None,
     fixed_iqr: dict | None = None,
+    weight_column: str | None = None,
+    weight_search: bool = False,
     moderator_columns: list[str] | None = None,
     negative_controls: list[str] | None = None,
     negative_control_retune: bool = False,
@@ -2086,6 +2113,11 @@ def run_fusion(
         index_forms: tuple[str, ...] = (
             _bayesian_index.FORMS if index_form == "sweep" else (index_form,)
         )
+        if weight_search and (not weight_column or "synergy" in index_forms):
+            raise ValueError(
+                "weight_search needs a weight_column and fits the linear form "
+                "only: set index_form to 'linear'."
+            )
 
         standalones: list[str] = list(standalone_channels or [])
         allowed = _cgi_formulas.formula_channels(cgi_formula)
@@ -2319,6 +2351,11 @@ def run_fusion(
             "report_effects_permutations": int(report_effects_permutations),
             "exposure_iqr": exposure_iqr,
             **({"fixed_iqr": dict(fixed_iqr)} if fixed_iqr else {}),
+            **(
+                {"weight_column": weight_column, "weight_search": bool(weight_search)}
+                if weight_column
+                else {}
+            ),
             "moderator_columns": list(moderator_columns or []),
             "negative_controls": list(negative_controls or []),
             "negative_control_retune": bool(negative_control_retune),
@@ -2340,6 +2377,13 @@ def run_fusion(
         # A short hash of the settings above, so a result can be matched against
         # the configuration that produced it — and a pre-registered analysis can
         # be shown to be the one that ran, rather than asserted to be.
+        if weight_search:
+            _log_fusion(
+                "WARN",
+                f"The search is weighted by '{weight_column}': the index, its "
+                "posterior and the null calibration refer to the weighted "
+                "likelihood, not to the sample's.",
+            )
         run_config_record["config_hash"] = hashlib.sha256(
             json.dumps(run_config_record, sort_keys=True, default=str).encode()
         ).hexdigest()[:16]
@@ -2536,6 +2580,8 @@ def run_fusion(
                 search_scoring_method=search_scoring_method,
                 negative_control_columns=outcome_ncs,
                 comparator_columns=outcome_cmps,
+                weight_column=weight_column or None,
+                weight_search=bool(weight_search),
             )
 
             # ────────────────────────────────────────────
@@ -3813,6 +3859,38 @@ def run_fusion(
                 )
 
             # ────────────────────────────────────────────
+            # Weighted estimates
+            # ────────────────────────────────────────────
+            weighted_report: dict | None = None
+            if weight_column:
+                try:
+                    weighted_report = engine.compute_weighted_report(
+                        headline_params,
+                        objective_metric,
+                        _raw_exposures(
+                            engine,
+                            standalones,
+                            standalones_bundle,
+                            comparators_report,
+                        ),
+                        channel=(cgi_vs_standalone_paired or {}).get(
+                            "standalone_channel"
+                        ),
+                        comparators=list(comparators_report or {}),
+                        specificity=specificity_report is not None,
+                        scales=_outer.raw_scales(raw_effects_report),
+                        n_boot_score=int(report_effects_bootstrap),
+                        n_boot=int(report_paired_bootstrap),
+                    )
+                except JobCancelled:
+                    raise
+                except Exception as exc:
+                    _log_fusion(
+                        "WARN", f"[{label}] Weighted estimates failed: {exc}"
+                    )
+                _log_weighted(weighted_report, label)
+
+            # ────────────────────────────────────────────
             # Repeated held-out splits
             # ────────────────────────────────────────────
             outer_bundle: dict | None = None
@@ -3855,6 +3933,7 @@ def run_fusion(
                         "posterior": cgi_discovery_summary,
                         "specificity": specificity_report,
                         "raw": raw_effects_report,
+                        "weighted": weighted_report,
                     },
                     fixed_iqr=fixed_iqr,
                     specificity=specificity_report is not None,
@@ -3981,6 +4060,7 @@ def run_fusion(
                 "decline_terms": decline_terms,
                 "exposure_response": exposure_response_report,
                 "raw_effects": raw_effects_report,
+                "weighted": weighted_report,
                 "moderation": moderation_report,
                 "negative_controls": negative_control_report,
                 # The spatial blocks the held-out split used, ``None`` without.

@@ -196,6 +196,14 @@ def comparator_mode(column: str) -> str:
     return _COMPARATOR_PREFIX + column
 
 
+def _search_weight_column(engine) -> str | None:
+    """The weight column ``engine``'s search uses, ``None`` for an unweighted
+    search."""
+    if not getattr(engine, "weight_search", False):
+        return None
+    return getattr(engine, "weight_column", None)
+
+
 def _distribution(values: np.ndarray) -> dict:
     """``median``, ``q25``, ``q75``, ``iqr``, ``p5``, ``p95`` and ``n`` of the
     finite values (``None`` each without any)."""
@@ -277,6 +285,8 @@ class MetricFusionEngine:
         drop_collinear_channels: bool = False,
         categorical_missing: str = "drop",
         comparator_columns: list[str] | None = None,
+        weight_column: str | None = None,
+        weight_search: bool = False,
         spatial_adjust_df: "list[int] | tuple[int, ...] | None" = None,
         spatial_adjust_criterion: str = "aic",
         spatial_adjust_neighbours: int = spatial_basis.DEFAULT_NEIGHBOURS,
@@ -358,6 +368,13 @@ class MetricFusionEngine:
                 an entity; scored through :func:`comparator_mode`. A column
                 that is the outcome, a covariate or a negative control is
                 refused.
+            weight_column: a numeric target column of sampling weights.
+                Carried like negative controls; the reports add weighted
+                estimates (:meth:`compute_weighted_report`) next to the
+                unweighted ones, which it leaves unchanged.
+            weight_search: the search itself (residualising, sweep,
+                posterior and its null refits) weighted by
+                ``weight_column``: a weighted likelihood. Linear form only.
             spatial_adjust_df: radial df per spatial cluster the criterion
                 compares, besides no smooth (``0`` = cluster intercepts and
                 linear trends only). ``None`` gives
@@ -680,6 +697,14 @@ class MetricFusionEngine:
             clash = [c for c in self.comparator_columns if c in cols]
             if clash:
                 raise ValueError(f"Comparator column(s) {clash} are also {role}.")
+        # Sampling weights: carried like the controls, used by the weighted
+        # reports and, with ``weight_search``, by the search.
+        self.weight_column: str | None = weight_column or None
+        self.weight_search: bool = bool(weight_search)
+        if self.weight_column == target_feature:
+            raise ValueError("The weight column cannot be the outcome.")
+        if self.weight_search and not self.weight_column:
+            raise ValueError("weight_search needs a weight_column.")
 
         # Longitudinal / mixed-effects spec. ``None`` keeps the engine in
         # cross-sectional mode (no behaviour change). When set, every code
@@ -980,8 +1005,16 @@ class MetricFusionEngine:
             self.longitudinal_spec,
             self.target_feature,
             self.covariate_columns or (),
-            [*self.negative_control_columns, *self.comparator_columns],
+            self._carried_columns,
         )
+
+    @property
+    def _carried_columns(self) -> list[str]:
+        """Target columns carried outside every NaN gate: the negative
+        controls, the comparators and the weight column."""
+        weight = getattr(self, "weight_column", None)
+        extra = [weight] if weight else []
+        return [*self.negative_control_columns, *self.comparator_columns, *extra]
 
     def _longitudinal_extra_cols(self) -> tuple[str, ...]:
         """Extra DataFrame columns carried through every prep path in long mode."""
@@ -1027,7 +1060,7 @@ class MetricFusionEngine:
             target_input,
             outcome_col=outcome_col,
             covariate_cols=self.covariate_columns,
-            extra_cols=[*self.negative_control_columns, *self.comparator_columns],
+            extra_cols=self._carried_columns,
         )
         # The per-file frames have been concatenated into ``long_gdf``; drop
         # the engine's reference so their memory is reclaimed rather than held
@@ -3738,12 +3771,21 @@ class MetricFusionEngine:
         # The channels in play are settled before residualising, so a coverage
         # gap in a channel this study never reads cannot drop rows from it.
         cov, tuning = self._search_covariates(static)
+        weights = None
+        if _search_weight_column(self):
+            if "synergy" in forms:
+                raise ValueError(
+                    "weight_search fits the linear form only; set index_form "
+                    "to 'linear'."
+                )
+            weights = static.get("sample_weight")
         yr, Xr, prep_info = bayesian_index.prep(
             X,
             y,
             cov,
             channel_index=channel_index,
             return_info=True,
+            weights=weights,
         )
         if tuning is not None:
             tuning = self._tuning_record(
@@ -4766,8 +4808,7 @@ class MetricFusionEngine:
         extra = [
             *(self.covariate_columns or []),
             *self._longitudinal_extra_cols(),
-            *self.negative_control_columns,
-            *self.comparator_columns,
+            *self._carried_columns,
         ]
         for col in dict.fromkeys(extra):
             if col in ent.columns:
@@ -4981,6 +5022,11 @@ class MetricFusionEngine:
                 for c in self.negative_control_columns
                 if c in data.columns
             }
+            column = _search_weight_column(self)
+            if column in data.columns:
+                st["sample_weight"] = data[column].to_numpy(dtype=np.float64)[
+                    first_idx
+                ]
             st["coords"] = (
                 np.column_stack(
                     [
@@ -5006,6 +5052,9 @@ class MetricFusionEngine:
                 for c in self.negative_control_columns
                 if c in data.columns
             }
+            column = _search_weight_column(self)
+            if column in data.columns:
+                st["sample_weight"] = data[column].to_numpy(dtype=np.float64)
             st["coords"] = (
                 data[["_cx", "_cy"]].to_numpy(np.float64) if have_coords else None
             )
@@ -8961,9 +9010,11 @@ class MetricFusionEngine:
         Comparator columns ride the same way and are left out of only their own
         statistics.
         """
+        weight = getattr(self, "weight_column", None)
         for role, cols in (
             ("Negative control", self.negative_control_columns),
             ("Comparator", self.comparator_columns),
+            ("Weight", [weight] if weight else []),
         ):
             for col in cols:
                 if col in fusion_df.columns:
@@ -9540,6 +9591,245 @@ class MetricFusionEngine:
         finally:
             self._active_greenery_channel = prev
             self._spatial_selections = counters
+        return out
+
+    def compute_weighted_report(
+        self,
+        cgi_params: dict,
+        metric: str,
+        exposures: "dict[str, tuple[str, dict]] | None" = None,
+        *,
+        channel: str | None = None,
+        comparators: "list[str] | None" = None,
+        specificity: bool = False,
+        scales: "dict | None" = None,
+        n_boot_score: int = 0,
+        n_boot: int = 0,
+        seed: int = 42,
+    ) -> dict | None:
+        """The held-out reports weighted by :attr:`weight_column`.
+
+        On the held-out rows, with the weights normalised to mean 1 over the
+        rows each estimate uses (:mod:`geofuse.weighting`): the CGI's score
+        (``r2`` objective only; ``n_boot_score`` resamples), its slope on the
+        target and on every negative control and the ``D`` of each control
+        (``n_boot`` resamples); for every exposure of ``exposures`` (``{name:
+        (active channel, params)}``) its slopes and, at ``scales`` (``{name:
+        {"per_iqr": …, "per_p5_p95": …}}``, the unweighted rows' ranges), its
+        raw-unit slopes; the paired R² difference against ``channel`` and each
+        of ``comparators``; and with ``specificity`` the ΔD against every
+        exposure. Covariates and smooths are the unweighted slopes'
+        (:meth:`_slope_smooths`); a paired difference scores each side over
+        its own slope smooth. ``None`` without a weight column;
+        ``{"skipped": "longitudinal"}`` for a panel, ``{"skipped": "no weight
+        column"}`` when the target lacks it.
+        """
+        import copy
+
+        from . import weighting as _w
+
+        if not self.weight_column:
+            return None
+        if self.is_panel:
+            return {"skipped": "longitudinal"}
+        prev = self._active_greenery_channel
+        counters = copy.deepcopy(self._spatial_selections)
+        try:
+            self._active_greenery_channel = "cgi"
+            df = self.apply_fusion(weights=dict(cgi_params))
+            keys = df["polygon_id"].to_numpy() if "polygon_id" in df.columns else None
+            xs: dict[str, np.ndarray] = {
+                "cgi": df["composite"].to_numpy(dtype=np.float64)
+            }
+            kinds = {"cgi": "cgi"}
+            for name, (ch, params) in (exposures or {}).items():
+                try:
+                    self._active_greenery_channel = ch
+                    other = self.apply_fusion(weights=dict(params))
+                except JobCancelled:
+                    raise
+                except Exception as exc:
+                    _log("WARN", f"Weighted report: '{name}' not applied: {exc}")
+                    continue
+                values = other["composite"].to_numpy(dtype=np.float64)
+                if keys is not None and "polygon_id" in other.columns:
+                    values = (
+                        pd.Series(values, index=other["polygon_id"].to_numpy())
+                        .reindex(keys)
+                        .to_numpy(dtype=np.float64)
+                    )
+                if len(values) == len(df):
+                    xs[name] = values
+                    kinds[name] = "comparator" if "comparator" in params else "channel"
+            self._active_greenery_channel = "cgi"
+            target = df["target"].to_numpy(dtype=np.float64)
+            cov = self._reporting_covariate_matrix(df)
+            test = self._test_entity_mask(df)
+            coords = self._whole_data_coords(df)
+            weights = self._reporting_raw_column(df, self.weight_column)
+            controls = {}
+            for name in self.negative_control_columns:
+                values = self._reporting_raw_column(df, name)
+                if values is not None:
+                    controls[name] = values
+            smooths = {
+                name: self._slope_smooths(coords, test, x, target, controls, cov)
+                for name, x in xs.items()
+            }
+        finally:
+            self._active_greenery_channel = prev
+            self._spatial_selections = counters
+        if weights is None:
+            return {"skipped": "no weight column", "weight_column": self.weight_column}
+
+        w = np.asarray(weights, dtype=np.float64)[test]
+        t = target[test]
+        c_t = None if cov is None else cov[test]
+        ok = _w.usable(w)
+        out: dict = {
+            "weight_column": self.weight_column,
+            "n_test": int(test.sum()),
+            "n_eff": _w.kish(_w.normalised(w[ok])) if ok.any() else 0.0,
+            "n_dropped": int((~ok).sum()),
+            "kinds": kinds,
+            "score": None,
+            "slopes": {},
+            "raw": {},
+            "d": {},
+            "paired": {},
+            "delta_d": {},
+        }
+
+        def with_smooth(smooth):
+            return self._with_smooth(c_t, None if smooth is None else smooth[test])
+
+        def tag(res, record):
+            if record is not None:
+                res["spatial_adjustment"] = record
+            return res
+
+        for name, x in xs.items():
+            (s_t, rec_t), s_c = smooths[name]
+            xt = x[test]
+            out["slopes"][name] = {
+                "target": tag(_w.slope(xt, t, with_smooth(s_t), w), rec_t),
+                "controls": {
+                    c: tag(
+                        _w.slope(xt, v[test], with_smooth(s_c[c][0]), w), s_c[c][1]
+                    )
+                    for c, v in controls.items()
+                },
+            }
+            scale = (scales or {}).get(name) or {}
+            if scale:
+                out["raw"][name] = {
+                    "target": {
+                        k: tag(
+                            _w.slope(xt, t, with_smooth(s_t), w, scale=scale[k]),
+                            rec_t,
+                        )
+                        for k in ("per_iqr", "per_p5_p95")
+                        if k in scale
+                    },
+                    "controls": {
+                        c: {
+                            k: tag(
+                                _w.slope(
+                                    xt,
+                                    v[test],
+                                    with_smooth(s_c[c][0]),
+                                    w,
+                                    scale=scale[k],
+                                ),
+                                s_c[c][1],
+                            )
+                            for k in ("per_iqr", "per_p5_p95")
+                            if k in scale
+                        }
+                        for c, v in controls.items()
+                    },
+                }
+
+        x_cgi = xs["cgi"][test]
+        (s_cgi, rec_cgi), s_cgi_c = smooths["cgi"]
+
+        def smooth_of(smooth):
+            return None if smooth is None else smooth[test]
+
+        if metric == "r2":
+            out["score"] = tag(
+                _w.r2(
+                    t,
+                    x_cgi,
+                    c_t,
+                    smooth_of(s_cgi),
+                    w,
+                    n_boot=int(n_boot_score),
+                    seed=int(seed),
+                ),
+                rec_cgi,
+            )
+            for name in [channel, *(comparators or [])]:
+                if name is None or name not in xs:
+                    continue
+                s_e = smooths[name][0][0]
+                out["paired"][name] = _w.r2_difference(
+                    t,
+                    x_cgi,
+                    xs[name][test],
+                    c_t,
+                    smooth_of(s_cgi),
+                    smooth_of(s_e),
+                    w,
+                    n_boot=int(n_boot),
+                    seed=int(seed) + 1,
+                )
+                out["paired"][name]["kind"] = (
+                    "channel" if name == channel else "comparator"
+                )
+        for j, (c, v) in enumerate(controls.items()):
+            out["d"][c] = tag(
+                _w.d(
+                    x_cgi,
+                    t,
+                    v[test],
+                    c_t,
+                    smooth_of(s_cgi),
+                    smooth_of(s_cgi_c[c][0]),
+                    w,
+                    n_boot=int(n_boot),
+                    seed=int(seed) + 2 + j,
+                ),
+                rec_cgi,
+            )
+        if specificity:
+            method = self.spatial_adjust_method
+            for name, x in xs.items():
+                if name == "cgi":
+                    continue
+                (s_e, _), _s = smooths[name]
+                out["delta_d"][name] = {}
+                for j, (c, v) in enumerate(controls.items()):
+                    pairs = {}
+                    if method == "spatial_plus":
+                        for role, sm in (("exposure", s_cgi), ("other", s_e)):
+                            for outcome in ("target", "control"):
+                                pairs[(role, outcome)] = smooth_of(sm)
+                    elif method == "ks_aic":
+                        for role in ("exposure", "other"):
+                            pairs[(role, "target")] = smooth_of(s_cgi)
+                            pairs[(role, "control")] = smooth_of(s_cgi_c[c][0])
+                    out["delta_d"][name][c] = _w.delta_d(
+                        x_cgi,
+                        x[test],
+                        t,
+                        v[test],
+                        c_t,
+                        pairs,
+                        w,
+                        n_boot=int(n_boot),
+                        seed=int(seed) + 2 + j,
+                    )
         return out
 
     def retune_concordance(

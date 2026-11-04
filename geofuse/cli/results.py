@@ -109,6 +109,7 @@ def _outer_name(entry: dict) -> str:
         "exposure_beta": f"β per SD, {name}",
         "exposure_negative_control_beta": f"β {name} on {control}",
         "specificity_difference": f"ΔD vs {name}, {control}",
+        "negative_control_d": f"D {name}",
         "held_out_per_iqr": "per IQR",
         "held_out_per_p5_p95": "per p5–p95",
         "exposure_per_iqr": f"per IQR, {name}",
@@ -146,8 +147,9 @@ def _outer_lines(outer: dict) -> list[str]:
         p_text = f"Holm p={p:.3g}" if p is not None else ""
         if p is None and _num(e.get("corrected_p")) is not None:
             p_text = f"p={_num(e.get('corrected_p')):.3g}"
+        name = _outer_name(e) + (" (w)" if e.get("weighting") else "")
         lines.append(
-            f"    {_outer_name(e):<22}{median:+.4f} [{lo:+.4f}, {hi:+.4f}]"
+            f"    {name:<22}{median:+.4f} [{lo:+.4f}, {hi:+.4f}]"
             + (f"  holds {share:.0%}" if share is not None else "")
             + (f"  {p_text}" if p_text else "")
             + (f"  {_scale_name(e['spatial_scale_m'])}" if ladder(e) else "")
@@ -188,6 +190,34 @@ def _raw_lines(raw: dict) -> list[str]:
                 for ch, d in layers.items()
                 if _num(d.get("iqr")) is not None
             )
+        )
+    return lines
+
+
+def _weighted_lines(weighted: dict) -> list[str]:
+    """The first split's weighted estimates beside the unweighted ones: the
+    weights' Kish effective size and each weighted result."""
+    if not weighted:
+        return []
+    if weighted.get("skipped"):
+        return [f"  Weighted         skipped ({weighted['skipped']})"]
+    from geofuse.jobs.outer_splits import weighted_rows
+
+    lines = [
+        f"  Weighted         by '{weighted.get('weight_column')}' on the held-out "
+        f"rows: Kish n_eff {_num(weighted.get('n_eff')) or 0:,.0f} of "
+        f"{weighted.get('n_test')}, {weighted.get('n_dropped')} without a "
+        "usable weight"
+    ]
+    for r in weighted_rows(weighted):
+        est = _num(r.get("estimate"))
+        if est is None:
+            continue
+        lo, hi, p = (_num(r.get(k)) for k in ("ci_low", "ci_high", "p_value"))
+        lines.append(
+            f"    {_outer_name(r):<30}{est:+.4f}"
+            + (f" [{lo:+.4f}, {hi:+.4f}]" if lo is not None and hi is not None else "")
+            + (f"  p={p:.3g}" if p is not None else "")
         )
     return lines
 
@@ -484,6 +514,7 @@ def summary(label: str, bundle: dict, artifacts: Path) -> list[str]:
         )
     lines += _specificity_lines(bundle.get("specificity_contrast") or {})
     lines += _raw_lines(bundle.get("raw_effects") or {})
+    lines += _weighted_lines(bundle.get("weighted") or {})
     lines += _outer_lines(bundle.get("outer_splits") or {})
     lines += _null_lines(bundle.get("outer_null") or {})
 

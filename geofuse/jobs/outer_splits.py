@@ -51,6 +51,7 @@ QUANTITIES: dict[str, str | None] = {
     "cgi_minus_channel": "greater",
     "cgi_minus_comparator": "greater",
     "negative_control_beta": "two-sided",
+    "negative_control_d": "greater",
     "exposure_beta": "two-sided",
     "exposure_negative_control_beta": "two-sided",
     "specificity_difference": "greater",
@@ -185,6 +186,7 @@ def split_rows(
     specificity: dict | None = None,
     raw: dict | None = None,
     raw_keep: "set[str] | None" = None,
+    weighted: dict | None = None,
 ) -> list[dict]:
     """One split's quantities as ``(quantity, exposure)`` rows.
 
@@ -196,7 +198,9 @@ def split_rows(
     :meth:`compute_negative_controls` report, ``posterior`` the CGI's
     ``_posterior_summary`` (:func:`posterior_rows`), ``specificity`` the
     specificity-contrast report (:func:`specificity_rows`), ``raw`` the
-    raw-unit slopes of the exposures in ``raw_keep`` (:func:`raw_rows`).
+    raw-unit slopes of the exposures in ``raw_keep`` (:func:`raw_rows`),
+    ``weighted`` the weighted report of the same exposures
+    (:func:`weighted_rows`).
     """
     rows: list[dict] = []
     if effects_test:
@@ -261,6 +265,7 @@ def split_rows(
         )
     rows += specificity_rows(specificity)
     rows += raw_rows(raw, raw_keep)
+    rows += weighted_rows(weighted, raw_keep)
     rows += posterior_rows(posterior)
     return rows
 
@@ -354,6 +359,178 @@ def raw_rows(report: dict | None, keep: "set[str] | None" = None) -> list[dict]:
                 row["n"] = r.get("n")
                 rows.append(row)
     return rows
+
+
+def _weighted_row(
+    quantity: str,
+    exposure: str,
+    res: dict | None,
+    *,
+    control: str | None = None,
+    kind: str | None = None,
+    est: str = "beta",
+    lo: str = "ci_low",
+    hi: str = "ci_high",
+    p: float | None = None,
+    scale: float | None = None,
+) -> dict:
+    """One weighted estimate as a split row, ``weighting = "weighted"``."""
+    res = res or {}
+    row = _row(
+        quantity,
+        exposure,
+        res.get("spatial_adjustment"),
+        estimate=res.get(est),
+        ci_low=res.get(lo),
+        ci_high=res.get(hi),
+        p_value=p,
+    )
+    row.update(
+        control=control,
+        kind=kind,
+        weighting="weighted",
+        n=res.get("n"),
+        n_eff=_f(res.get("n_eff")),
+        n_dropped=res.get("n_dropped"),
+    )
+    if scale is not None:
+        row["scale"] = _f(scale)
+    return row
+
+
+def weighted_rows(report: dict | None, keep: "set[str] | None" = None) -> list[dict]:
+    """One split's weighted report (:meth:`compute_weighted_report`) as rows.
+
+    The same quantities as the unweighted rows, each tagged ``weighting =
+    "weighted"`` with its ``n``, Kish ``n_eff`` and ``n_dropped`` (rows left
+    out for a missing or non-positive weight): ``held_out_score`` (``r2``
+    only), ``held_out_beta``, ``negative_control_beta`` and
+    ``negative_control_d`` (``D = |β target| − |β control|``, tested
+    one-sided) per control, ``cgi_minus_channel`` / ``cgi_minus_comparator``,
+    the raw-unit rows of :func:`raw_rows`, and with the specificity contrast
+    ``exposure_beta``, ``exposure_negative_control_beta`` and
+    ``specificity_difference``. ``keep`` limits the other exposures.
+    """
+    if not report or report.get("skipped"):
+        return []
+    kinds = report.get("kinds") or {}
+    slopes = report.get("slopes") or {}
+    cgi = slopes.get("cgi") or {}
+    rows: list[dict] = []
+
+    def kept(name: str) -> bool:
+        return name == "cgi" or keep is None or name in keep
+
+    if report.get("score"):
+        rows.append(
+            _weighted_row("held_out_score", "cgi", report["score"], est="estimate")
+        )
+    if cgi.get("target"):
+        target = cgi["target"]
+        rows.append(_weighted_row("held_out_beta", "cgi", target, p=_slope_p(target)))
+    for control, res in (cgi.get("controls") or {}).items():
+        rows.append(
+            _weighted_row("negative_control_beta", control, res, p=_slope_p(res))
+        )
+    for control, res in (report.get("d") or {}).items():
+        rows.append(
+            _weighted_row(
+                "negative_control_d",
+                control,
+                res,
+                est="estimate",
+                p=res.get("p_value"),
+            )
+        )
+    for name, res in (report.get("paired") or {}).items():
+        if not kept(name):
+            continue
+        channel = res.get("kind") == "channel"
+        rows.append(
+            _weighted_row(
+                "cgi_minus_channel" if channel else "cgi_minus_comparator",
+                name,
+                res,
+                kind=res.get("kind"),
+                est="estimate",
+                p=res.get("p_value"),
+            )
+        )
+    for name, per_control in (report.get("delta_d") or {}).items():
+        if not kept(name):
+            continue
+        block = slopes.get(name) or {}
+        kind = kinds.get(name)
+        target = block.get("target") or {}
+        rows.append(
+            _weighted_row("exposure_beta", name, target, kind=kind, p=_slope_p(target))
+        )
+        for control, res in (block.get("controls") or {}).items():
+            rows.append(
+                _weighted_row(
+                    "exposure_negative_control_beta",
+                    name,
+                    res,
+                    control=control,
+                    kind=kind,
+                    p=_slope_p(res),
+                )
+            )
+        for control, res in per_control.items():
+            rows.append(
+                _weighted_row(
+                    "specificity_difference",
+                    name,
+                    res,
+                    control=control,
+                    kind=kind,
+                    est="estimate",
+                    p=res.get("p_value"),
+                )
+            )
+    for name, block in (report.get("raw") or {}).items():
+        if not kept(name):
+            continue
+        for contrast in ("per_iqr", "per_p5_p95"):
+            quantity = (
+                f"held_out_{contrast}" if name == "cgi" else f"exposure_{contrast}"
+            )
+            on_control = f"exposure_negative_control_{contrast}"
+            pairs = [(quantity, None, (block.get("target") or {}).get(contrast))] + [
+                (on_control, control, c.get(contrast))
+                for control, c in (block.get("controls") or {}).items()
+            ]
+            for q, control, res in pairs:
+                if not res:
+                    continue
+                rows.append(
+                    _weighted_row(
+                        q,
+                        name,
+                        res,
+                        control=control,
+                        kind=kinds.get(name),
+                        est="estimate",
+                        lo="estimate_ci_low",
+                        hi="estimate_ci_high",
+                        p=_slope_p(res),
+                        scale=res.get("scale"),
+                    )
+                )
+    return rows
+
+def raw_scales(report: dict | None) -> dict:
+    """The ranges each exposure's raw-unit rows are per, ``{name: {"per_iqr":
+    …, "per_p5_p95": …}}``, so the weighted rows use the same ones."""
+    out = {}
+    for name, block in ((report or {}).get("exposures") or {}).items():
+        target = block.get("target") or {}
+        out[name] = {
+            k: target[k]["scale"]
+            for k in ("per_iqr", "per_p5_p95")
+            if (target.get(k) or {}).get("scale") is not None
+        }
+    return out
 
 
 def distribution_rows(report: dict | None) -> list[dict]:
@@ -553,7 +730,13 @@ def summarise(rows: list[dict], primary_scale: float | None = None) -> list[dict
 
     groups: dict[tuple, list[dict]] = {}
     for r in rows:
-        key = (r["quantity"], r["exposure"], r.get("control"), r.get("spatial_scale_m"))
+        key = (
+            r["quantity"],
+            r["exposure"],
+            r.get("control"),
+            r.get("spatial_scale_m"),
+            r.get("weighting"),
+        )
         groups.setdefault(key, []).append(r)
     order = list(QUANTITIES)
     primary = None if primary_scale is None else scale_text(primary_scale)
@@ -564,13 +747,14 @@ def summarise(rows: list[dict], primary_scale: float | None = None) -> list[dict
         return (2, 0.0) if text == "none" else (1, -float(text))
 
     out: list[dict] = []
-    for (quantity, exposure, control, scale), group in sorted(
+    for (quantity, exposure, control, scale, weighting), group in sorted(
         groups.items(),
         key=lambda kv: (
             order.index(kv[0][0]),
             kv[0][1],
             kv[0][2] or "",
             scale_order(kv[0][3]),
+            kv[0][4] or "",
         ),
     ):
         est = np.array(
@@ -605,31 +789,42 @@ def summarise(rows: list[dict], primary_scale: float | None = None) -> list[dict
             entry["spatial_method"] = group[0]["spatial_method"]
         if scale is not None:
             entry["spatial_scale_m"] = scale
+        if weighting is not None:
+            entry["weighting"] = weighting
         if entry["alternative"] and shares:
             test = corrected_resampled_t(
                 est, float(np.mean(shares)), alternative=entry["alternative"]
             )
             entry["corrected_t"], entry["corrected_p"] = test["t"], test["p_value"]
         out.append(entry)
-    ranked = [e for e in out if e.get("spatial_scale_m") in (None, primary)]
-    families = [
-        [
+    families = []
+    for weighting in dict.fromkeys(e.get("weighting") for e in out):
+        ranked = [
             e
-            for e in ranked
-            if e["quantity"] == "cgi_minus_comparator" and e.get("primary") is not False
+            for e in out
+            if e.get("spatial_scale_m") in (None, primary)
+            and e.get("weighting") == weighting
         ]
-    ]
-    for control in dict.fromkeys(e.get("control") for e in ranked if "control" in e):
         families.append(
             [
                 e
                 for e in ranked
-                if e["quantity"] == "specificity_difference"
-                and e.get("control") == control
-                and e.get("kind") == "comparator"
+                if e["quantity"] == "cgi_minus_comparator"
                 and e.get("primary") is not False
             ]
         )
+        controls = dict.fromkeys(e.get("control") for e in ranked if "control" in e)
+        for control in controls:
+            families.append(
+                [
+                    e
+                    for e in ranked
+                    if e["quantity"] == "specificity_difference"
+                    and e.get("control") == control
+                    and e.get("kind") == "comparator"
+                    and e.get("primary") is not False
+                ]
+            )
     for family in families:
         holm = holm_bonferroni([e["corrected_p"] for e in family])
         for e, hp in zip(family, holm, strict=True):
@@ -846,6 +1041,19 @@ def repeat(
             for name in names:
                 raw_exposures[name] = (comparator_mode(name), {"comparator": name})
         raw = engine.compute_raw_effects(params, raw_exposures, fixed_iqr=fixed_iqr)
+        weighted = None
+        if getattr(engine, "weight_column", None):
+            weighted = engine.compute_weighted_report(
+                params,
+                metric,
+                raw_exposures,
+                channel=best,
+                comparators=[] if engine.is_panel else names,
+                specificity=specificity,
+                scales=raw_scales(raw),
+                n_boot_score=int(n_effects_boot),
+                n_boot=int(n_paired),
+            )
         if distributions is not None:
             for r in distribution_rows(raw):
                 distributions.append({"split": k, "seed": seed, **r})
@@ -860,6 +1068,7 @@ def repeat(
             posterior=_posterior_summary(params),
             specificity=contrast,
             raw=raw,
+            weighted=weighted,
         ):
             r.update(split=k, seed=seed, **info)
             if r["quantity"] == "cgi_minus_comparator" or r.get("kind") == "comparator":
