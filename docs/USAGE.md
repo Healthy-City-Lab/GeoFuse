@@ -267,6 +267,34 @@ comparator column. The same increment is used for that exposure in
 `exposure_response.csv`; `exposure_iqr` remains the increment for the
 exposures `fixed_iqr` does not name.
 
+### Sampling weights
+
+Name the target column holding each entity's sampling (or analytic) weight:
+
+```toml
+[defaults.fusion]
+weight_column = "weight"
+```
+
+The run then reports, on every held-out split, weighted versions of the
+score, the slopes, the negative controls, the paired differences, the
+specificity contrast and the raw-unit effects next to the unweighted ones
+(`weighted.csv`, weighted rows of `outer_splits.csv`, "(w)" lines in
+`geofuse results`). The search itself stays unweighted, so the weights
+change what is reported about the chosen composite, not how it is chosen.
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `weight_column` | unset | Target column of weights; rows with a missing or non-positive weight are left out of the weighted results only |
+| `weight_search` | off | Also weight the search (residualising, sweep, posterior, its null refits): a weighted likelihood. Needs `index_form = "linear"`; the run warns that the posterior and the null calibration refer to the weighted likelihood |
+
+Turn `weight_search` on only when the question is explicitly about the
+population the weights describe, or when selection is believed to change
+which exposure is chosen, and say so in the methods; it then needs its own
+null calibration. Neither setting has a dashboard field yet: set them in a
+run file or with `--weight-column` / `--weight-search`; a study re-run from
+the dashboard keeps them.
+
 ### Null calibration of the held-out decision
 
 With **Held-out splits** at 2 or more, a repeated study decides on the

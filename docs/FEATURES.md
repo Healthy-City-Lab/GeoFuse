@@ -295,6 +295,17 @@ Nothing below is pre-specified.
   exposure (such as 0.1 NDVI) can replace them. The composite's IQR is also
   given in each layer's units at the cell it reads, so a per-IQR contrast of
   the composite can be stated as so much NDVI or street-view greenery.
+- **Sampling weights.** A cohort sampled with unequal probabilities is
+  reported both ways. With a weight column, every held-out result (score,
+  slopes, negative-control slopes and D, paired differences, specificity
+  contrasts, raw-unit effects) gets a weighted twin on every split: weighted
+  least squares with the weights normalised to mean 1 on the rows used,
+  design-based (robust) standard errors, and bootstraps whose resample counts
+  are multiplied by the weights. Each weighted row carries Kish's effective
+  sample size and the rows left out for a missing weight. The search stays
+  unweighted unless the weighted search is asked for, a deliberate choice for
+  an explicitly population-level question; its posterior and null
+  calibration then refer to the weighted likelihood.
 - **The composite is judged against one channel on held-out rows.** The
   comparison channel is the standalone that scores best on the train+val rows,
   so the test rows never choose the channel they then judge. The verdict is the

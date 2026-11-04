@@ -119,6 +119,7 @@ output_results/fusion/<YYYYMMDDTHHMMSS>__<short_job_id>/
     ├── exposure_response.csv           per-IQR effect, quantile gradient, linearity test
     ├── raw_effects.csv                 held-out change per IQR / p5–p95 of each exposure
     ├── exposure_scales.csv             each exposure's distribution per split
+    ├── weighted.csv                    weighted held-out results, with weight_column
     ├── exposure_response_curve.csv     fitted curve, ready to plot
     ├── moderation.csv                  interaction test and simple slopes
     ├── negative_controls.csv           specificity check against control outcomes
@@ -350,6 +351,27 @@ layer (`layer`, `kind = layer`) at the cell the composite reads. Both are in
 the same quantities are rows of `outer_splits.csv` on every split, with a
 `scale` and an `n` column, and `outer_summary.csv` tests each two-sided
 across the splits.
+
+**`weighted.csv`** appears with the job setting `weight_column`. It holds
+the first split's held-out results weighted by that column, in the
+`outer_splits.csv` row layout with `weighting = "weighted"`:
+`held_out_score` (the `r2` objective only), `held_out_beta`,
+`negative_control_beta` and `negative_control_d` (D = |β target| −
+|β control|, one-sided p of D > 0) per control, `cgi_minus_channel`,
+`cgi_minus_comparator`, the raw-unit rows, and with the specificity
+contrast `exposure_beta`, `exposure_negative_control_beta` and
+`specificity_difference`. Each row has `n`, `n_eff` (Kish, (Σw)² / Σw²)
+and `n_dropped` (rows left out for a missing or non-positive weight). The
+weights are normalised to mean 1 on the rows of each estimate; slopes
+carry a heteroscedasticity-robust (HC1) interval, the other results a
+bootstrap one whose resample counts are multiplied by the weights. The
+raw-unit rows are per the unweighted rows' ranges, so both read on one
+increment. With several held-out splits the same rows are in
+`outer_splits.csv` on every split, and `outer_summary.csv` summarises the
+weighted and unweighted rows apart (a `weighting` column), each with its
+own Holm families. `results_summary.json` has the rows and the weights'
+`n_eff` and `n_dropped` under `weighted`; `run_config.json` records
+`weight_column` and `weight_search`.
 
 **`moderation.csv`** answers whether the effect differs between groups: one
 simple slope per moderator level, one row per interaction term, and a single
