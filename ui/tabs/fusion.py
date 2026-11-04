@@ -448,6 +448,14 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "split_seed",
     "outer_splits",
     "outer_comparators",
+    "outer_report",
+    "outer_null_runs",
+    "outer_null_kind",
+    "outer_null_group",
+    "outer_null_stop_after",
+    "outer_null_stop_low",
+    "outer_null_stop_high",
+    "outer_null_workers",
     "objective_metric",
     "residualize_method",
     "residualize_spline_df",
@@ -531,6 +539,19 @@ _OUTER_COMPARATOR_LABELS: dict[str, str] = {
     "all": "All comparators",
 }
 
+# What the later held-out splits report (``settings.OUTER_REPORTS``).
+_OUTER_REPORT_LABELS: dict[str, str] = {
+    "full": "Every interval and p-value",
+    "decision": "Decision estimates only",
+}
+
+# Null outcomes of the decision calibration (``settings.NULL_KINDS``).
+_NULL_KIND_LABELS: dict[str, str] = {
+    "spatial": "Spatially structured",
+    "free": "Freely permuted",
+    "both": "Both kinds",
+}
+
 # How held-out spatial blocks are chosen (``settings.SPATIAL_SPLIT_MODES``).
 _SPATIAL_SPLIT_MODE_LABELS: dict[str, str] = {
     "stripe": "Striped across the extent",
@@ -575,6 +596,14 @@ _FUSION_PARAM_TO_WIDGET: dict[str, str] = {
     "split_seed": "fusion_split_seed",
     "outer_splits": "fusion_outer_splits",
     "outer_comparators": "fusion_outer_comparators",
+    "outer_report": "fusion_outer_report",
+    "outer_null_runs": "fusion_outer_null_runs",
+    "outer_null_kind": "fusion_outer_null_kind",
+    "outer_null_group": "fusion_outer_null_group",
+    "outer_null_stop_after": "fusion_outer_null_stop_after",
+    "outer_null_stop_low": "fusion_outer_null_stop_low",
+    "outer_null_stop_high": "fusion_outer_null_stop_high",
+    "outer_null_workers": "fusion_outer_null_workers",
     "synergy_warm_start": "fusion_synergy_warm_start",
     "outer_warm_start": "fusion_outer_warm_start",
     "outer_posterior_draws": "fusion_outer_posterior_draws",
@@ -643,6 +672,11 @@ _FUSION_SEED_INT_WIDGETS: frozenset[str] = frozenset(
         "fusion_stratification_bins",
         "fusion_split_seed",
         "fusion_outer_splits",
+        "fusion_outer_null_runs",
+        "fusion_outer_null_stop_after",
+        "fusion_outer_null_stop_low",
+        "fusion_outer_null_stop_high",
+        "fusion_outer_null_workers",
         "fusion_sweep_splits",
         "fusion_discovery_reps",
         "fusion_discovery_shuffles",
@@ -1674,6 +1708,31 @@ def _render_metric_assignment_panel(
     return state
 
 
+def _outer_null_settings(
+    report: str,
+    runs: int,
+    kind: str,
+    group: str,
+    stop_after: int,
+    stop_low: int,
+    stop_high: int,
+    workers: int,
+) -> dict:
+    """The Validation box's decision-report and null-calibration fields as
+    run settings: the stopping counts only with a decision point, 0 = unset."""
+    after = int(stop_after) or None
+    return {
+        "outer_report": str(report),
+        "outer_null_runs": int(runs),
+        "outer_null_kind": str(kind),
+        "outer_null_group": str(group).strip() or None,
+        "outer_null_stop_after": after,
+        "outer_null_stop_low": int(stop_low) if after else None,
+        "outer_null_stop_high": (int(stop_high) or None) if after else None,
+        "outer_null_workers": int(workers) or None,
+    }
+
+
 def _render_study_details_panel(
     is_longitudinal: bool,
     available_covariates: list[str],
@@ -2426,6 +2485,115 @@ def _render_study_details_panel(
                 key="fusion_outer_posterior_draws",
                 help="Posterior draws (and warm-up) of the later held-out splits.",
             )
+        _default(
+            "fusion_outer_report",
+            _fs_default("outer_report"),
+            list(_OUTER_REPORT_LABELS),
+        )
+        _default("fusion_outer_null_runs", _fs_default("outer_null_runs"))
+        _default(
+            "fusion_outer_null_kind",
+            _fs_default("outer_null_kind"),
+            list(_NULL_KIND_LABELS),
+        )
+        _default("fusion_outer_null_group", "")
+        for name in ("stop_after", "stop_low", "stop_high", "workers"):
+            _default(f"fusion_outer_null_{name}", 0)
+        repeated = int(outer_splits_ui) > 1
+        st.markdown("**Null calibration of the held-out decision**")
+        col_n1, col_n2 = st.columns(2)
+        with col_n1:
+            outer_report_ui = st.selectbox(
+                "Later splits report",
+                options=list(_OUTER_REPORT_LABELS),
+                format_func=_OUTER_REPORT_LABELS.get,
+                key="fusion_outer_report",
+                disabled=not repeated,
+                help=(
+                    "Decision estimates only: the later splits skip their "
+                    "bootstrap intervals and permutation p-values and keep "
+                    "the estimates the corrected tests read, which are the "
+                    "same either way."
+                ),
+            )
+            outer_null_runs_ui = st.number_input(
+                "Null outcomes (0 = none)",
+                **_fs_bounds("outer_null_runs"),
+                step=10,
+                key="fusion_outer_null_runs",
+                disabled=not repeated,
+                help=(
+                    "Outcomes unrelated to greenery, each run through the "
+                    "same search and held-out splits; the share whose "
+                    "corrected p falls below 0.05 is the false-positive "
+                    "rate of the decision. Each costs about one repeated "
+                    "study in the decision report."
+                ),
+            )
+            outer_null_kind_ui = st.selectbox(
+                "Null outcome kind",
+                options=list(_NULL_KIND_LABELS),
+                format_func=_NULL_KIND_LABELS.get,
+                key="fusion_outer_null_kind",
+                disabled=not repeated,
+                help=(
+                    "Spatially structured: the area means of the outcome "
+                    "permuted across areas and variogram-matched surrogates "
+                    "within them. Freely permuted: the outcome shuffled over "
+                    "entities."
+                ),
+            )
+            outer_null_group_ui = st.text_input(
+                "Null areas column",
+                key="fusion_outer_null_group",
+                disabled=not repeated,
+                help=(
+                    "A categorical covariate whose area means the spatial "
+                    "null permutes. Empty = the spatial smooth's clusters."
+                ),
+            )
+        with col_n2:
+            outer_null_stop_after_ui = st.number_input(
+                "Decide after nulls (0 = run all)",
+                min_value=0,
+                max_value=int(_FS["outer_null_stop_after"].hi),
+                step=10,
+                key="fusion_outer_null_stop_after",
+                disabled=not repeated,
+                help=(
+                    "A sequential rule set before any result is seen: after "
+                    "this many nulls, stop when the rejections are at or "
+                    "below the lower count or at or above the upper one."
+                ),
+            )
+            outer_null_stop_low_ui = st.number_input(
+                "Stop at or below (rejections)",
+                min_value=0,
+                max_value=int(_FS["outer_null_stop_low"].hi),
+                step=1,
+                key="fusion_outer_null_stop_low",
+                disabled=not repeated,
+            )
+            outer_null_stop_high_ui = st.number_input(
+                "Stop at or above (rejections, 0 = never)",
+                min_value=0,
+                max_value=int(_FS["outer_null_stop_high"].hi),
+                step=1,
+                key="fusion_outer_null_stop_high",
+                disabled=not repeated,
+            )
+            outer_null_workers_ui = st.number_input(
+                "Nulls at once (0 = automatic)",
+                min_value=0,
+                max_value=int(_FS["outer_null_workers"].hi),
+                step=1,
+                key="fusion_outer_null_workers",
+                disabled=not repeated,
+                help=(
+                    "Null outcomes run in parallel, each worker holding one "
+                    "copy of the study; 0 sizes the pool on cores and memory."
+                ),
+            )
     posterior_warmup_ui = int(posterior_draws_ui)
 
     # ────────────────────────────────────────────────────────────
@@ -2851,6 +3019,16 @@ def _render_study_details_panel(
         "outer_posterior_draws": int(outer_draws_ui) or None,
         "outer_posterior_warmup": None,
         "outer_posterior_chains": None,
+        **_outer_null_settings(
+            outer_report_ui,
+            outer_null_runs_ui,
+            outer_null_kind_ui,
+            outer_null_group_ui,
+            outer_null_stop_after_ui,
+            outer_null_stop_low_ui,
+            outer_null_stop_high_ui,
+            outer_null_workers_ui,
+        ),
         "discovery_reps": int(discovery_reps_ui),
         "discovery_shuffles": int(discovery_shuffles_ui),
         "gain_splits": int(gain_splits_ui),
@@ -3087,6 +3265,42 @@ def _render_outer_splits(results_view: dict) -> None:
     if rows:
         st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
     _render_outer_posterior(every)
+
+
+def _render_outer_null(results_view: dict) -> None:
+    """The held-out decision's false-positive rate under null outcomes."""
+    null = results_view.get("outer_null") or {}
+    summary = null.get("summary") or []
+    if not summary:
+        return
+    st.markdown("**Null calibration of the held-out decision**")
+    groups = (null.get("groups") or {}).get("source")
+    st.caption(
+        "Outcomes unrelated to greenery, each run through the same search and "
+        "the same held-out splits. Rate = share with corrected p below 0.05, "
+        "with its exact 95 % interval; calibrated p = the real outcome's "
+        "corrected p ranked among the nulls'."
+        + (f" Spatial nulls permute the area means of {groups}." if groups else "")
+        + ("" if null.get("complete", True) else " Not every null finished.")
+    )
+    rows = [
+        {
+            "Null": _NULL_KIND_LABELS.get(e.get("null_kind"), e.get("null_kind")),
+            "Result": _OUTER_QUANTITY_LABELS.get(e.get("quantity"), e.get("quantity")),
+            "Exposure": _CHANNEL_DISPLAY.get(e.get("exposure"), e.get("exposure")),
+            "Rejected": f"{e.get('hits')}/{e.get('finished')}",
+            "Rate": "—" if _num(e.get("rate")) is None else f"{float(e['rate']):.1%}",
+            "95 % CI": (
+                "—"
+                if _num(e.get("ci_low")) is None
+                else f"[{float(e['ci_low']):.1%}, {float(e['ci_high']):.1%}]"
+            ),
+            "Calibrated p": _fmt(e.get("calibrated_p"), 3),
+            "Stopping rule": e.get("decision") or "—",
+        }
+        for e in summary
+    ]
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 
 def _render_outer_posterior(summary: list[dict]) -> None:
@@ -5721,6 +5935,7 @@ def _render_fusion_results_body(output_dir: str) -> None:
     _render_comparators(results_view, metric_name)
     _render_specificity_contrast(results_view)
     _render_outer_splits(results_view)
+    _render_outer_null(results_view)
 
     # ── Channel collinearity report ─────────────────────────────
     _render_collinearity_report(results_view)
@@ -6928,6 +7143,14 @@ def render(output_dir: str) -> None:
                         "outer_posterior_draws",
                         "outer_posterior_warmup",
                         "outer_posterior_chains",
+                        "outer_report",
+                        "outer_null_runs",
+                        "outer_null_kind",
+                        "outer_null_group",
+                        "outer_null_stop_after",
+                        "outer_null_stop_low",
+                        "outer_null_stop_high",
+                        "outer_null_workers",
                     )
                 },
                 "radius_prior": radius_prior_param,

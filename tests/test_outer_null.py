@@ -13,7 +13,8 @@ Pinned here:
   job's own process gives;
 - the summary places the real outcome among the nulls, and the sequential
   rule keeps only the nulls it decided on;
-- without nulls the run record carries none of the new settings.
+- without nulls the run record carries none of the new settings, and the
+  results panel draws the rates only when there are some.
 """
 
 import csv
@@ -262,6 +263,46 @@ class TestSummary(unittest.TestCase):
         self.assertIsNone(outer_null._decide(mixed, rule))
         self.assertIsNone(outer_null._decide(hits, {}))
 
+
+
+class TestResultsPanel(unittest.TestCase):
+    """The Fusion tab draws the null rates, and nothing without them."""
+
+    def setUp(self):
+        ui = os.path.join(ROOT, "ui")
+        if ui not in sys.path:
+            sys.path.insert(0, ui)
+        from tabs import fusion as fusion_tab
+        from test_posterior_panel import _Recorder
+
+        self.tab = fusion_tab
+        self._real_st = fusion_tab.st
+        self.rec = _Recorder()
+        fusion_tab.st = self.rec
+
+    def tearDown(self):
+        self.tab.st = self._real_st
+
+    def test_the_rate_is_drawn(self):
+        records = [_record(i, p) for i, p in enumerate([0.01, 0.2, 0.5])]
+        view = {
+            "outer_null": {
+                "summary": outer_null.null_summary(records, [], {}),
+                "groups": {"source": "gap clusters", "n_groups": 4},
+                "complete": True,
+            }
+        }
+        self.tab._render_outer_null(view)
+        text = self.rec.text()
+        self.assertIn("Null calibration of the held-out decision", text)
+        self.assertIn("gap clusters", text)
+        frame = next(v for n, v in self.rec.calls if n == "dataframe")
+        self.assertEqual(frame.iloc[0]["Rejected"], "1/3")
+        self.assertEqual(frame.iloc[0]["Null"], "Freely permuted")
+
+    def test_nothing_without_nulls(self):
+        self.tab._render_outer_null({})
+        self.assertEqual(self.rec.calls, [])
 
 if __name__ == "__main__":
     unittest.main()
