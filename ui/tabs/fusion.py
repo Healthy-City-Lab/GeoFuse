@@ -3207,6 +3207,12 @@ _OUTER_QUANTITY_LABELS: dict[str, str] = {
     "exposure_beta": "Exposure β per SD",
     "exposure_negative_control_beta": "Exposure negative-control β",
     "specificity_difference": "Specificity ΔD (CGI − exposure)",
+    "held_out_per_iqr": "Change per IQR",
+    "held_out_per_p5_p95": "Change per p5–p95",
+    "exposure_per_iqr": "Exposure change per IQR",
+    "exposure_per_p5_p95": "Exposure change per p5–p95",
+    "exposure_negative_control_per_iqr": "Negative-control change per IQR",
+    "exposure_negative_control_per_p5_p95": "Negative-control change per p5–p95",
 }
 
 # Each split's CGI posterior (``outer_splits.POSTERIOR_QUANTITIES``).
@@ -3420,6 +3426,59 @@ def _render_specificity_contrast(results_view: dict) -> None:
             "Spatially adjusted: every slope also controls for a coordinate "
             "smooth, each exposure's own under Spatial+ and each outcome's own "
             "under KS-AIC; the column gives the df of the two smooths in play."
+        )
+
+
+def _render_raw_effects(results_view: dict) -> None:
+    """Held-out slopes in the outcome's units per IQR and per p5–p95 range."""
+    from geofuse.jobs.outer_splits import raw_rows
+
+    raw = results_view.get("raw_effects") or {}
+    exposures = raw.get("exposures") or {}
+    if not exposures:
+        return
+    st.divider()
+    st.markdown("**Raw-unit effect sizes**")
+    st.caption(
+        "On the held-out entities of the first split: the covariate-adjusted "
+        "change in the outcome, in its own units, per interquartile range and "
+        "per 5th–95th percentile range of each exposure, both set on the "
+        "train+val entities (or the fixed increment the job gives). Same "
+        "covariates and smooth as the per-SD slopes."
+    )
+    labels = {
+        "held_out_per_iqr": "Target, per IQR",
+        "held_out_per_p5_p95": "Target, per p5–p95",
+        "exposure_per_iqr": "Target, per IQR",
+        "exposure_per_p5_p95": "Target, per p5–p95",
+        "exposure_negative_control_per_iqr": "Control, per IQR",
+        "exposure_negative_control_per_p5_p95": "Control, per p5–p95",
+    }
+    table = [
+        {
+            "Exposure": _CHANNEL_DISPLAY.get(r["exposure"], r["exposure"]),
+            "Contrast": labels.get(r["quantity"], r["quantity"]),
+            "Control": r.get("control") or "—",
+            "Per": _fmt(r.get("scale"), 4),
+            "Change": _fmt(r.get("estimate"), 4),
+            "95 % CI": f"[{_fmt(r.get('ci_low'), 4)}, {_fmt(r.get('ci_high'), 4)}]",
+            "p": _fmt(r.get("p_value"), 4),
+            "n": r.get("n"),
+        }
+        for r in raw_rows(raw)
+    ]
+    st.dataframe(pd.DataFrame(table), width="stretch", hide_index=True)
+    layers = raw.get("layers") or {}
+    cgi = (exposures.get("cgi") or {}).get("distribution") or {}
+    if layers and _num(cgi.get("iqr")) is not None:
+        st.caption(
+            f"The composite's IQR is {_fmt(cgi.get('iqr'), 4)}; at the cell it "
+            "reads, each layer's IQR is "
+            + ", ".join(
+                f"{_CHANNEL_DISPLAY.get(ch, ch)} {_fmt(d.get('iqr'), 4)}"
+                for ch, d in layers.items()
+            )
+            + " (train+val entities)."
         )
 
 
@@ -5934,6 +5993,7 @@ def _render_fusion_results_body(output_dir: str) -> None:
     # ── Comparator exposures ────────────────────────────────────
     _render_comparators(results_view, metric_name)
     _render_specificity_contrast(results_view)
+    _render_raw_effects(results_view)
     _render_outer_splits(results_view)
     _render_outer_null(results_view)
 
@@ -7151,6 +7211,7 @@ def render(output_dir: str) -> None:
                         "outer_null_stop_low",
                         "outer_null_stop_high",
                         "outer_null_workers",
+                        "fixed_iqr",
                     )
                 },
                 "radius_prior": radius_prior_param,

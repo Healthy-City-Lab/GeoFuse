@@ -253,6 +253,24 @@ class TestRawEffectsRun(unittest.TestCase):
         self.assertIn("CGI layers", text)
         self.assertIn("per IQR, field_here", text)
 
+    def test_the_results_panel_draws_the_raw_rows(self):
+        ui = os.path.join(ROOT, "ui")
+        if ui not in sys.path:
+            sys.path.insert(0, ui)
+        from tabs import fusion as fusion_tab
+        from test_posterior_panel import _Recorder
+
+        real, rec = fusion_tab.st, _Recorder()
+        fusion_tab.st = rec
+        try:
+            fusion_tab._render_raw_effects(self.bundle)
+            fusion_tab._render_raw_effects({})
+        finally:
+            fusion_tab.st = real
+        frame = next(v for n, v in rec.calls if n == "dataframe")
+        self.assertIn("Change", frame.columns)
+        self.assertIn("field_here", set(frame["Exposure"]))
+        self.assertIn("Raw-unit effect sizes", rec.text())
 
 if __name__ == "__main__":
     unittest.main()
