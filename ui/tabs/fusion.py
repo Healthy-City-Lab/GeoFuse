@@ -2591,7 +2591,8 @@ def _render_study_details_panel(
                 disabled=not repeated,
                 help=(
                     "Null outcomes run in parallel, each worker holding one "
-                    "copy of the study; 0 sizes the pool on cores and memory."
+                    "copy of the study and its own sampler (about 2–3 GB); 0 "
+                    "uses up to 4, fewer when cores or memory are short."
                 ),
             )
     posterior_warmup_ui = int(posterior_draws_ui)

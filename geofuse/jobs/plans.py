@@ -493,6 +493,11 @@ def _expand_fusion(step: _rf.Step, by_step: dict[str, list[JobSpec]]) -> list[Jo
                     )
                     if i[k]
                 ]
+                + [
+                    step.settings[k]
+                    for k in ("outer_null_group", "weight_column")
+                    if step.settings.get(k)
+                ]
             )
             if c not in info["fields"] and not i["waves"]
         ]
@@ -905,6 +910,9 @@ def fusion_run_config(spec: JobSpec) -> dict[str, Any]:
     vector, polygon = o["vector"], o["polygon"]
     adjust = s["spatial_adjust_method"] if vector else "none"
     adjusted = adjust != "none"
+    # The spatial null's gap clusters read the smooth's gap settings, so they
+    # reach the engine whenever the null calibration runs.
+    gaps = adjusted or (int(s["outer_null_runs"]) > 0 and int(s["outer_splits"]) > 1)
     blocks = vector and s["spatial_split"]
     form = "linear" if s["index_form"] == "sweep" else s["index_form"]
     covariates = list(o["covariates"])
@@ -992,7 +1000,7 @@ def fusion_run_config(spec: JobSpec) -> dict[str, Any]:
             if adjusted
             else list(_settings.SPATIAL_DF_CANDIDATES)
         ),
-        "spatial_adjust_eps_m": s["spatial_adjust_eps_m"] if adjusted else None,
+        "spatial_adjust_eps_m": s["spatial_adjust_eps_m"] if gaps else None,
         "spatial_adjust_criterion": s["spatial_adjust_criterion"],
         "spatial_adjust_neighbours": int(s["spatial_adjust_neighbours"]),
         "spatial_adjust_knots_min": int(s["spatial_adjust_knots_min"]),
@@ -1000,7 +1008,7 @@ def fusion_run_config(spec: JobSpec) -> dict[str, Any]:
         "spatial_paired_smooth": s["spatial_paired_smooth"],
         "spatial_adjust_scale_m": s["spatial_adjust_scale_m"] if adjusted else None,
         "spatial_adjust_min_component": (
-            s["spatial_adjust_min_component"] if adjusted else None
+            s["spatial_adjust_min_component"] if gaps else None
         ),
         "spatial_tune_scale_m": s["spatial_tune_scale_m"] if adjusted else None,
         "spatial_split": bool(blocks),

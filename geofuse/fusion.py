@@ -287,6 +287,7 @@ class MetricFusionEngine:
         comparator_columns: list[str] | None = None,
         weight_column: str | None = None,
         weight_search: bool = False,
+        null_group_column: str | None = None,
         spatial_adjust_df: "list[int] | tuple[int, ...] | None" = None,
         spatial_adjust_criterion: str = "aic",
         spatial_adjust_neighbours: int = spatial_basis.DEFAULT_NEIGHBOURS,
@@ -375,6 +376,9 @@ class MetricFusionEngine:
             weight_search: the search itself (residualising, sweep,
                 posterior and its null refits) weighted by
                 ``weight_column``: a weighted likelihood. Linear form only.
+            null_group_column: a target column (numeric or labels)
+                whose areas the spatial null outcomes permute their means
+                across; carried with its own values, never tuned on.
             spatial_adjust_df: radial df per spatial cluster the criterion
                 compares, besides no smooth (``0`` = cluster intercepts and
                 linear trends only). ``None`` gives
@@ -705,6 +709,7 @@ class MetricFusionEngine:
             raise ValueError("The weight column cannot be the outcome.")
         if self.weight_search and not self.weight_column:
             raise ValueError("weight_search needs a weight_column.")
+        self.null_group_column: str | None = null_group_column or None
 
         # Longitudinal / mixed-effects spec. ``None`` keeps the engine in
         # cross-sectional mode (no behaviour change). When set, every code
@@ -1011,9 +1016,16 @@ class MetricFusionEngine:
     @property
     def _carried_columns(self) -> list[str]:
         """Target columns carried outside every NaN gate: the negative
-        controls, the comparators and the weight column."""
-        weight = getattr(self, "weight_column", None)
-        extra = [weight] if weight else []
+        controls, the comparators, the weight column and the null-group
+        column."""
+        extra = [
+            c
+            for c in (
+                getattr(self, "weight_column", None),
+                getattr(self, "null_group_column", None),
+            )
+            if c
+        ]
         return [*self.negative_control_columns, *self.comparator_columns, *extra]
 
     def _longitudinal_extra_cols(self) -> tuple[str, ...]:
@@ -9023,6 +9035,13 @@ class MetricFusionEngine:
                     _log("WARN", f"{role} '{col}' is not a target column; skipped.")
                     continue
                 fusion_df[col] = pd.to_numeric(entity_gdf[col], errors="coerce").values
+        # The null-group column keeps its labels (an area name is text).
+        group = getattr(self, "null_group_column", None)
+        if group and group not in fusion_df.columns:
+            if group in entity_gdf.columns:
+                fusion_df[group] = entity_gdf[group].to_numpy()
+            else:
+                _log("WARN", f"Null group '{group}' is not a target column.")
 
     def _test_entity_mask(self, df: "pd.DataFrame") -> np.ndarray:
         """Rows of an ``apply_fusion`` frame that belong to the held-out split."""

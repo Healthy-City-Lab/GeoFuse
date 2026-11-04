@@ -13,6 +13,10 @@ Pinned here:
   job's own process gives;
 - the summary places the real outcome among the nulls, and the sequential
   rule keeps only the nulls it decided on;
+- the spatial null is grouped by any target column (text or a numeric code
+  of the same areas give the same nulls, a categorical covariate works), or
+  in an unadjusted study by the gap clusters of ``spatial_adjust_eps_m``; a
+  missing column is refused when the run is planned;
 - without nulls the run record carries none of the new settings, and the
   results panel draws the rates only when there are some.
 """
@@ -23,6 +27,7 @@ import os
 import shutil
 import sys
 import tempfile
+import textwrap
 import unittest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -30,7 +35,8 @@ for _p in (os.path.dirname(os.path.abspath(__file__)), ROOT):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import geopandas as gpd  # noqa: F401
+import geopandas as gpd
+import numpy as np
 
 from geofuse.jobs import outer_null
 
@@ -303,6 +309,124 @@ class TestResultsPanel(unittest.TestCase):
     def test_nothing_without_nulls(self):
         self.tab._render_outer_null({})
         self.assertEqual(self.rec.calls, [])
+
+
+def _area_study() -> str:
+    """The smooth study with six areas as text and as a numeric code, neither a
+    covariate."""
+    folder = _study()
+    path = os.path.join(folder, "cohort.gpkg")
+    cohort = gpd.read_file(path)
+    rank = cohort.geometry.x.rank(method="first").to_numpy()
+    code = np.minimum((6 * (rank - 1) / len(cohort)).astype(int), 5) + 1
+    cohort["area"] = [f"area {c}" for c in code]
+    cohort["area_code"] = code
+    cohort.to_file(path, driver="GPKG")
+    return folder
+
+
+NULL_SETTINGS = """
+    outer_splits = 2
+    outer_null_runs = 1
+    outer_null_kind = "spatial"
+    outer_null_workers = 1
+    """
+
+
+class TestNullGroups(unittest.TestCase):
+    """The spatial null grouped by a target column that is not a covariate,
+    by a categorical covariate, and by gap clusters in an unadjusted study."""
+
+    @classmethod
+    def setUpClass(cls):
+        from test_fusion_run import run_study
+
+        cls.folder = _area_study()
+
+        def run(extra: str):
+            bundle = run_study(cls.folder, INPUTS + NULL_SETTINGS + extra)[1]
+            return bundle["outer_null"]
+
+        cls.area = run('outer_null_group = "area"\n')
+        cls.code = run('outer_null_group = "area_code"\n')
+        cls.sex = run('outer_null_group = "sex"\n')
+        cls.gaps = run("spatial_adjust_eps_m = 150\n")
+
+    def test_a_text_area_column_groups_the_null(self):
+        groups = self.area["groups"]
+        self.assertEqual(groups["source"], "column area")
+        self.assertEqual(groups["n_groups"], 6)
+        self.assertEqual(groups["n_missing"], 0)
+        self.assertTrue(self.area["complete"])
+
+    def test_text_labels_and_a_numeric_code_give_the_same_nulls(self):
+        a = _by(self.area["rows"], "null_kind", "null", "quantity", "exposure")
+        b = _by(self.code["rows"], "null_kind", "null", "quantity", "exposure")
+        self.assertEqual(set(a), set(b))
+        for key, row in a.items():
+            self.assertEqual(b[key]["median"], row["median"], key)
+            self.assertEqual(b[key]["corrected_p"], row["corrected_p"], key)
+
+    def test_a_categorical_covariate_groups_the_null(self):
+        groups = self.sex["groups"]
+        self.assertEqual(groups["source"], "column sex")
+        self.assertEqual(groups["n_groups"], 2)
+        self.assertTrue(self.sex["rows"])
+        self.assertTrue(self.sex["complete"])
+
+    def test_an_unadjusted_study_uses_gap_clusters(self):
+        self.assertEqual(self.gaps["groups"]["source"], "gap clusters at 150 m")
+        self.assertGreater(self.gaps["groups"]["n_groups"], 1)
+        self.assertTrue(self.gaps["complete"])
+        self.assertEqual({r["null"] for r in self.gaps["rows"]}, {1})
+
+    def test_a_missing_column_is_refused_when_planned(self):
+        from geofuse import runfile
+        from geofuse.jobs import plans
+
+        doc = (
+            f"output_dir = {os.path.join(self.folder, 'out')!r}\n"
+            "[[fusion]]\n"
+            'name = "t"\n'
+            'target = "cohort.gpkg"\n'
+            'outcomes = ["outcome"]\n' + textwrap.dedent(INPUTS + NULL_SETTINGS)
+            + 'outer_null_group = "no_such_column"\n'
+        )
+        path = os.path.join(self.folder, "missing.toml")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(doc)
+        with self.assertRaisesRegex(plans.PlanError, "no_such_column"):
+            plans.expand(runfile.load(path, ()))
+
+
+class TestGroupRecord(unittest.TestCase):
+    def test_sizes_and_warnings(self):
+        rec = outer_null.group_record(np.array(["a"] * 8 + ["b"] * 2), "column x")
+        self.assertEqual((rec["n_groups"], rec["smallest"]), (2, 2))
+        self.assertAlmostEqual(rec["largest_share"], 0.8)
+        text = outer_null.group_warning(rec)
+        self.assertIn("only 2 groups", text)
+        self.assertIn("80%", text)
+        even = outer_null.group_record(np.repeat(np.arange(8), 5), "gaps")
+        self.assertIsNone(outer_null.group_warning(even))
+
+    def test_missing_labels_form_one_counted_group(self):
+        import pandas as pd
+
+        frame = pd.DataFrame(
+            {
+                "polygon_id": [0, 1, 2, 3],
+                "target": [1.0, 2.0, 3.0, 4.0],
+                "_cx": [0.0, 1.0, 2.0, 3.0],
+                "_cy": [0.0, 0.0, 0.0, 0.0],
+                "area": ["n", None, "s", np.nan],
+            }
+        )
+        engine = type("E", (), {"_coverage_keep_index": None})()
+        ent = outer_null.Entities(engine, frame, "area")
+        self.assertEqual(ent.n_missing_group, 2)
+        missing = outer_null.MISSING_GROUP
+        self.assertEqual(list(ent.group), ["n", missing, "s", missing])
 
 if __name__ == "__main__":
     unittest.main()

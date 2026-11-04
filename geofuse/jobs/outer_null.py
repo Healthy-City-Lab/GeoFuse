@@ -37,8 +37,21 @@ from . import outer_splits as _outer
 #: The decision the sequential rule and the log headline read.
 HEADLINE = ("held_out_beta", "cgi", None)
 
+#: The label entities without a group value share.
+MISSING_GROUP = "(missing)"
+
+#: Group balance below which the between-group permutation has little to
+#: permute: fewer groups than this, or one group above this share.
+MIN_GROUPS = 5
+MAX_GROUP_SHARE = 0.25
+
 #: Memory one null worker reserves next to its copy of the engine.
 _WORKER_BASE_BYTES = 1_500_000_000
+
+#: The most null workers sized automatically: each samples its posteriors on
+#: one thread per chain and holds its own JAX runtime (about 2.3 GB measured on
+#: a 3,000-entity study), so a wider pool contends for cores and memory.
+AUTO_WORKERS_MAX = 4
 
 #: Engine state a search or a smooth selection updates: snapshotted before
 #: the nulls and restored after them, so the real outcome's reports keep
@@ -76,7 +89,9 @@ class Entities:
     ``codes`` maps every kept frame row to its entity; ``y`` is the real
     outcome, ``xy`` the entity's location in metres (its ``_cx`` / ``_cy``,
     else the exposure-weighted centre of its cells), ``group`` the values of
-    the grouping column and ``stratum`` the wave, each ``None`` when absent.
+    the grouping column (a missing value labelled :data:`MISSING_GROUP`,
+    counted in ``n_missing_group``) and ``stratum`` the wave, each ``None``
+    when absent.
     """
 
     def __init__(self, engine: Any, fusion_df: pd.DataFrame, group_column=None):
@@ -107,11 +122,12 @@ class Entities:
                     / total,
                 ]
             )
-        self.group = (
-            df[group_column].to_numpy()[first]
-            if group_column and group_column in df.columns
-            else None
-        )
+        self.group, self.n_missing_group = None, 0
+        if group_column and group_column in df.columns:
+            labels = df[group_column].to_numpy(dtype=object)[first]
+            missing = pd.isna(labels)
+            labels[missing] = MISSING_GROUP
+            self.group, self.n_missing_group = labels, int(missing.sum())
         self.stratum = df["wave"].to_numpy()[first] if "wave" in df.columns else None
 
     def frame(self, fusion_df: pd.DataFrame, values: np.ndarray) -> pd.DataFrame:
@@ -125,24 +141,62 @@ class Entities:
         return out
 
 
-def gap_groups(engine: Any, xy: np.ndarray) -> np.ndarray:
-    """The spatial clusters of the smooth's gap rule: a gap of
-    ``spatial_adjust_eps_m``, else twice the primary pattern scale, else the
-    nearest-neighbour graph's components; clusters below
-    ``spatial_adjust_min_component`` joined to their nearest larger one."""
+def gap_groups(engine: Any, xy: np.ndarray) -> tuple[np.ndarray, str]:
+    """The spatial clusters of the smooth's gap rule, and the rule as text: a
+    gap of ``spatial_adjust_eps_m``, else twice the primary pattern scale, else
+    the nearest-neighbour graph's components; clusters below
+    ``spatial_adjust_min_component`` joined to their nearest larger one. The
+    gap settings reach the engine whenever the null calibration runs, with or
+    without spatial adjustment."""
     from ..spatial_basis import connected_components, merge_small_components
 
     eps = getattr(engine, "spatial_adjust_eps_m", None)
     scales = getattr(engine, "spatial_adjust_scales", ()) or ()
     if eps is None and scales:
         eps = 2.0 * float(scales[0])
-    labels, _ = connected_components(
-        xy, eps=eps, k=int(getattr(engine, "spatial_adjust_neighbours", 10))
+    k = int(getattr(engine, "spatial_adjust_neighbours", 10))
+    labels, _ = connected_components(xy, eps=eps, k=k)
+    rule = (
+        f"gap clusters at {float(eps):g} m"
+        if eps is not None
+        else f"{k}-nearest-neighbour components"
     )
     small = getattr(engine, "spatial_adjust_min_component", None)
     if small:
         labels = merge_small_components(xy, labels, int(small))[0]
-    return labels
+        rule += f", below {int(small)} joined to the nearest"
+    return labels, rule
+
+
+def group_record(labels: np.ndarray, source: str, n_missing: int = 0) -> dict:
+    """``source``, ``n_groups``, the ``smallest`` group, the ``largest_share``
+    of the entities in one group and ``n_missing`` (entities without a group
+    value, grouped together)."""
+    _, counts = np.unique(np.asarray(labels).astype(str), return_counts=True)
+    return {
+        "source": source,
+        "n_groups": int(len(counts)),
+        "smallest": int(counts.min()) if len(counts) else 0,
+        "largest_share": float(counts.max() / counts.sum()) if len(counts) else None,
+        "n_missing": int(n_missing),
+    }
+
+
+def group_warning(record: dict) -> str | None:
+    """Why the between-group permutation has little to permute, or ``None``."""
+    reasons = []
+    if record["n_groups"] < MIN_GROUPS:
+        reasons.append(f"only {record['n_groups']} groups")
+    share = record.get("largest_share")
+    if share is not None and share > MAX_GROUP_SHARE:
+        reasons.append(f"the largest holds {share:.0%} of the entities")
+    if not reasons:
+        return None
+    return (
+        f"Spatial null groups ({record['source']}): {' and '.join(reasons)}, so "
+        "permuting the group means changes little; a column of comparable areas "
+        "(outer_null_group) or a gap distance (spatial_adjust_eps_m) gives more."
+    )
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -409,12 +463,19 @@ def run(
     log = log or (lambda level, msg: None)
     stop = stop or {}
     entities = Entities(engine, fusion_df, group_column)
-    groups, group_source = None, None
+    groups, group_info = None, None
     if "spatial" in _no.kinds(kind):
         if group_column:
-            groups, group_source = entities.group, f"column {group_column}"
+            groups = entities.group
+            group_info = group_record(
+                groups, f"column {group_column}", entities.n_missing_group
+            )
         else:
-            groups, group_source = gap_groups(engine, entities.xy), "gap clusters"
+            groups, gap_rule = gap_groups(engine, entities.xy)
+            group_info = group_record(groups, gap_rule)
+        warning = group_warning(group_info)
+        if warning:
+            log("WARN", warning)
     spatial = (
         _no.SpatialNull(entities.y, entities.xy, groups, seed=int(seed))
         if groups is not None
@@ -462,7 +523,9 @@ def run(
             from .. import parallel
 
             pool = parallel.process_worker_count(
-                n, bytes_per_worker=3 * size + _WORKER_BASE_BYTES
+                n,
+                cap=AUTO_WORKERS_MAX,
+                bytes_per_worker=3 * size + _WORKER_BASE_BYTES,
             )
         log(
             "INFO",
@@ -566,11 +629,7 @@ def run(
         "kinds": _no.kinds(kind),
         "runs": int(n),
         "workers": int(pool or 1),
-        "groups": (
-            None
-            if groups is None
-            else {"source": group_source, "n_groups": len(set(groups.tolist()))}
-        ),
+        "groups": group_info,
         "stop": dict(stop) or None,
         "records": records,
         "rows": null_rows(records),

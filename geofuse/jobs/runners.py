@@ -1494,8 +1494,8 @@ def _run_outer_null(
     if group_column and group_column not in fusion_df.columns:
         _log_fusion(
             "WARN",
-            f"[{label}] Null calibration: '{group_column}' is not a covariate "
-            "of this study, so it cannot group the spatial null; skipped.",
+            f"[{label}] Null calibration: the target has no column "
+            f"'{group_column}' to group the spatial null; skipped.",
         )
         stage(stage_key, SKIPPED, f"no column {group_column}")
         return None
@@ -2301,6 +2301,20 @@ def run_fusion(
                     "outer_null_runs": int(outer_null_runs),
                     "outer_null_kind": str(outer_null_kind),
                     "outer_null_group": outer_null_group or None,
+                    **(
+                        {
+                            "outer_null_gaps": {
+                                "spatial_adjust_eps_m": spatial_adjust_eps_m,
+                                "spatial_adjust_min_component": (
+                                    spatial_adjust_min_component
+                                ),
+                            }
+                        }
+                        if not outer_null_group
+                        and spatial_adjust_method in (None, "none")
+                        and (spatial_adjust_eps_m or spatial_adjust_min_component)
+                        else {}
+                    ),
                     "outer_null_stop": (
                         {
                             "after": outer_null_stop_after,
@@ -2582,6 +2596,11 @@ def run_fusion(
                 comparator_columns=outcome_cmps,
                 weight_column=weight_column or None,
                 weight_search=bool(weight_search),
+                null_group_column=(
+                    outer_null_group
+                    if int(outer_splits) > 1 and int(outer_null_runs or 0) > 0
+                    else None
+                ),
             )
 
             # ────────────────────────────────────────────

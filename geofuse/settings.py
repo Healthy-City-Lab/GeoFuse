@@ -424,7 +424,7 @@ FUSION: dict[str, Setting] = {
         None,
         1,
         256,
-        "Null outcomes run at once; 0 = sized on cores and memory.",
+        "Null outcomes run at once; 0 = up to 4, sized on cores and memory.",
         auto_zero=True,
     ),
     "n_bins": _int(5, 3, 10, "Quantile bins of the stratified split."),
