@@ -243,6 +243,41 @@ largest R-hat is above 1.01, or its effective sample size per draw falls below
 where it started, its warm-up and any fallback (see OUTPUTS). Turning a warm
 start off gives the earlier draws exactly.
 
+### Null calibration of the held-out decision
+
+With **Held-out splits** at 2 or more, a repeated study decides on the
+corrected test of each result across its splits. These settings measure how
+often that decision fires on outcomes unrelated to greenery, inside the same
+job; the preparation, the exposure tensor and the caches are the real run's.
+
+| Setting (form label) | Default | What it does |
+| --- | --- | --- |
+| `outer_report` (**Later splits report**) | `full` | `decision` keeps only the estimates the corrected tests read on the later splits (no bootstrap intervals or permutation p-values); the tests themselves are unchanged |
+| `outer_null_runs` (**Null outcomes**) | 0 | Null outcomes, each run through the same search and held-out splits and seeds in the decision report |
+| `outer_null_kind` (**Null outcome kind**) | `spatial` | `spatial`: area means permuted across areas, variogram-matched surrogates within them; `free`: the outcome permuted over entities (within waves); `both`: each, as two rates |
+| `outer_null_group` (**Null areas column**) | unset | A categorical covariate (a site or city) whose area means the spatial null permutes; unset = the spatial smooth's clusters |
+| `outer_null_stop_after`, `_low`, `_high` (**Decide after nulls**, **Stop at or below**, **Stop at or above**) | unset | A sequential rule fixed in advance: after that many nulls, stop as not inflated at or below `_low` rejections, as inflated at or above `_high`, else run all |
+| `outer_null_workers` (**Nulls at once**) | automatic | Nulls run in parallel, each worker holding one copy of the study; automatic sizes the pool on cores and memory |
+
+```toml
+[defaults.fusion]
+outer_splits = 10
+outer_report = "decision"
+outer_null_runs = 100
+outer_null_kind = "spatial"
+outer_null_group = "site"
+outer_null_stop_after = 50
+outer_null_stop_low = 1
+outer_null_stop_high = 7
+```
+
+Each null costs about one repeated study in the decision report. A cancelled
+or repeated job keeps its finished nulls and continues from the next one. The
+results list, per null kind, the rejections with their exact interval and the
+real outcome's corrected p ranked among the nulls' (see OUTPUTS for
+`null_summary.csv` and the variogram table). Panels are refused: their rows
+are not exchangeable entities.
+
 ### Reading the results panel
 
 - **Headline.** Held-out test score with its 95 % interval, the significance
@@ -574,7 +609,7 @@ geofuse config set limits.job_threads 8      # BLAS threads of each fusion job
 ### Results
 
 ```bash
-geofuse results JOB                         # held-out score, direction, spatial adjustment, each channel alone, specificity, splits, weights, radii
+geofuse results JOB                         # held-out score, direction, spatial adjustment, each channel alone, specificity, splits, null calibration, weights, radii
 geofuse results output_results/fusion/<run>/    # any run, dashboard runs included
 geofuse export JOB -o cgi.csv               # the per-entity CGI table (.gpkg, .csv or .geojson)
 geofuse cgi-map JOB area.gpkg               # planned full-area CGI map; exits 2, not available yet

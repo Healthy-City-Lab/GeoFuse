@@ -126,6 +126,9 @@ output_results/fusion/<YYYYMMDDTHHMMSS>__<short_job_id>/
     ├── specificity_contrast.csv        CGI vs other exposures per control, when on
     ├── outer_splits.csv                every held-out split's results, outer_splits > 1 or several scales
     ├── outer_summary.csv               their spread and corrected test, as outer_splits.csv
+    ├── null_outer.csv                  each null outcome's corrected tests, outer_null_runs > 0
+    ├── null_summary.csv                the decision's false-positive rate per null kind
+    ├── null_variogram.csv              outcome vs spatial surrogates per distance bin
     ├── decline_terms.csv               greenspace-by-time terms, longitudinal only
     ├── mixedlm_metrics*.csv            all four mixed-effects metrics, longitudinal only
     ├── aic_bic.json                    in-sample AIC / BIC, all channels vs one
@@ -221,6 +224,36 @@ adds three quantities with a `control` column, empty on the other rows:
 exposure and control; `specificity_difference` is tested one-sided (the CGI
 more specific), with `corrected_p_holm` over the primary comparators per
 control.
+
+With `outer_report = "decision"` the later splits keep only the estimates the
+across-split tests read: `held_out_score` is its point estimate, every slope
+keeps its exact interval, and the paired and specificity rows have no
+`ci_low`, `ci_high` or `p_value`. The medians and corrected tests in
+`outer_summary.csv` are the full report's; `share_holds` then reads the slopes
+only.
+
+**`null_outer.csv`** appears when `outer_null_runs` is above 0 (with
+`outer_splits` 2 or more). Each null outcome was run through the same search
+and the same held-out splits and seeds as the real outcome, in the decision
+report. One row per null and tested quantity: `null_kind` (`spatial` or
+`free`), `null` (1, 2, …), `quantity`, `exposure`, `control`, `median`,
+`corrected_t`, `corrected_p`, `hit` (corrected p below 0.05), `n_splits` and,
+for spatial nulls, `surrogate_k` (the neighbourhood size of the variogram
+match). **`null_summary.csv`** gives per null kind and quantity the
+`finished` nulls, `hits`, `rate` with its exact Clopper–Pearson `ci_low` /
+`ci_high`, `share_positive` (nulls whose median is above zero), the real
+outcome's `observed_corrected_p` and `calibrated_p` = (1 + nulls with a
+corrected p at or below it) / (1 + nulls), and on the `held_out_beta` row the
+sequential rule's `decision` (`stopped at 50: not inflated`, `stopped at 50:
+inflated` or `ran all`). A rule that stopped reports the nulls it decided on.
+**`null_variogram.csv`** lists per distance bin (`bin_low_m`, `bin_high_m`,
+`n_pairs`) the semivariogram of the outcome's deviations from its area means
+(`outcome`) next to the surrogates' `surrogate_median`, `surrogate_p05` and
+`surrogate_p95`. `results_summary.json` has the summary under `outer_null`
+with the kinds, the number of nulls, the workers, the areas (`groups`:
+`source`, `n_groups`), the rule and whether every null finished. Finished
+nulls are kept under `fusion_cache/outer_null/`, so a cancelled or repeated
+job continues from the next one.
 
 **`null_calibration`** in each study's `discovery` block of
 `results_summary.json` records the refits' `likelihood` (`cross_products` for

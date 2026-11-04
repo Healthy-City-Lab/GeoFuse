@@ -321,6 +321,23 @@ Nothing below is pre-specified.
   columns' cross-products, the identical likelihood at a cost that does not
   grow with the number of entities, so large samples and many refits stay
   affordable; synergy and panels sum over the rows.
+- **The decision itself is calibrated.** The permutation refits above check
+  one split's posterior; the decision a repeated study reports is the
+  corrected resampled t of the held-out slope across its splits. With null
+  outcomes set, each null runs through the same search and the same held-out
+  splits and seeds as the real outcome, inside the same job, and the share
+  whose corrected p falls below 5 % is that decision's false-positive rate,
+  with an exact interval and the real outcome's p ranked among the nulls'.
+  Spatially structured nulls keep the outcome's spatial pattern at two scales
+  and randomise its alignment with greenery: the area means are permuted across
+  areas (a named column, or the spatial smooth's clusters), and within areas
+  the deviations are replaced by variogram-matched surrogates (Viladomat et al.
+  2014), so the rate shows whether spatial structure alone produces "findings".
+  Freely permuted nulls are the classical check. A sequential rule set in
+  advance can stop after a first batch when the rejections are clearly few or
+  clearly many. The later splits can report only the estimates the decisions
+  read, which skips their bootstraps and permutations and leaves every
+  corrected test unchanged; the nulls always run that way.
 - **Warm starts.** A synergy posterior starts from a short linear fit of the
   same columns, and each repeated held-out split starts its posteriors from
   the previous split's, so most of the sampler's tuning is not redone. A warm
