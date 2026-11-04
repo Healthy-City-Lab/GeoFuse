@@ -225,6 +225,10 @@ class TestEveryRecordedSettingIsRestored(unittest.TestCase):
         self.fusion._seed_fusion_form(_params(negative_controls=["grip"]))
         self.assertEqual(self.state["fusion_negative_controls"], ["grip"])
 
+    def test_the_weight_column_survives_a_re_run(self):
+        self.fusion._seed_fusion_form(_params(weight_column="wt"))
+        self.assertEqual(self.state["fusion_weight_column"], "wt")
+
     def test_the_missing_category_handling_survives_a_re_run(self):
         self.fusion._seed_fusion_form(_params(categorical_missing="indicator"))
         self.assertEqual(self.state["fusion_categorical_missing"], "indicator")

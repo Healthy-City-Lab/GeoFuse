@@ -476,6 +476,7 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "specificity_contrast",
     "comparators",
     "comparators_primary",
+    "weight_column",
     "exposure_iqr",
     "exposure_response_spline_df",
     "standalone_channels",
@@ -539,6 +540,9 @@ _OUTER_COMPARATOR_LABELS: dict[str, str] = {
     "all": "All comparators",
 }
 
+# The weight-column picker's "no weights" entry.
+_NO_WEIGHT_COLUMN = "(none)"
+
 # What the later held-out splits report (``settings.OUTER_REPORTS``).
 _OUTER_REPORT_LABELS: dict[str, str] = {
     "full": "Every interval and p-value",
@@ -596,6 +600,7 @@ _FUSION_PARAM_TO_WIDGET: dict[str, str] = {
     "split_seed": "fusion_split_seed",
     "outer_splits": "fusion_outer_splits",
     "outer_comparators": "fusion_outer_comparators",
+    "weight_column": "fusion_weight_column",
     "outer_report": "fusion_outer_report",
     "outer_null_runs": "fusion_outer_null_runs",
     "outer_null_kind": "fusion_outer_null_kind",
@@ -6455,6 +6460,22 @@ def render(output_dir: str) -> None:
                                     "are reported as descriptive. Empty = all."
                                 ),
                             )
+                        weight_options = [_NO_WEIGHT_COLUMN] + [
+                            c for c in numeric_cols if c not in target_outcome_columns
+                        ]
+                        if target_outcome_columns and len(weight_options) > 1:
+                            _keep_valid("fusion_weight_column", weight_options)
+                            st.selectbox(
+                                "Sampling weight column",
+                                options=weight_options,
+                                key="fusion_weight_column",
+                                help=(
+                                    "Sampling or analytic weights: every held-out "
+                                    "result is also reported weighted by this "
+                                    "column, next to the unweighted one. The "
+                                    "search stays unweighted."
+                                ),
+                            )
                         if len(target_outcome_columns) > 1:
                             _default("fusion_multi_objective_run", False)
                             multi_objective_requested = st.checkbox(
@@ -6662,6 +6683,14 @@ def render(output_dir: str) -> None:
         for c in (st.session_state.get("fusion_comparators_primary") or [])
         if c in comparators_param
     ] or None
+    # The weight column, also picked in the target section; a study re-run
+    # from a run file keeps the one it recorded.
+    weight_pick = st.session_state.get("fusion_weight_column")
+    weight_column_param = (
+        (None if weight_pick in (None, _NO_WEIGHT_COLUMN) else str(weight_pick))
+        if is_vector_target
+        else None
+    )
     # Memory a quadratic objective needs at this target's size, refused when
     # it exceeds the machine's RAM unless the user ticked the override.
     objective_size = _gf_settings.objective_size_check(
@@ -7216,10 +7245,10 @@ def render(output_dir: str) -> None:
                         "outer_null_stop_high",
                         "outer_null_workers",
                         "fixed_iqr",
-                        "weight_column",
                         "weight_search",
                     )
                 },
+                "weight_column": weight_column_param,
                 "radius_prior": radius_prior_param,
                 "gvi_min_coverage": gvi_min_coverage_param,
                 "check_collinearity": bool(check_collinearity_param),
