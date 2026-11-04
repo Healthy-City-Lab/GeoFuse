@@ -102,6 +102,10 @@ def _add_setting_flags(
             elif s.kind in ("int", "float"):
                 kw["type"] = int if s.kind == "int" else float
                 kw["metavar"] = "N" if s.kind == "int" else "X"
+            elif s.kind == "floatmap":
+                kw["metavar"] = "'NAME=X, NAME=X'"
+            elif s.kind == "text":
+                kw["metavar"] = "TEXT"
             group.add_argument(flag, **kw)
 
 
