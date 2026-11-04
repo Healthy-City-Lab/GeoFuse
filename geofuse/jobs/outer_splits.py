@@ -54,6 +54,12 @@ QUANTITIES: dict[str, str | None] = {
     "exposure_beta": "two-sided",
     "exposure_negative_control_beta": "two-sided",
     "specificity_difference": "greater",
+    "held_out_per_iqr": "two-sided",
+    "held_out_per_p5_p95": "two-sided",
+    "exposure_per_iqr": "two-sided",
+    "exposure_per_p5_p95": "two-sided",
+    "exposure_negative_control_per_iqr": "two-sided",
+    "exposure_negative_control_per_p5_p95": "two-sided",
     "posterior_beta": None,
     "posterior_weight": None,
     "posterior_r50": None,
@@ -177,6 +183,8 @@ def split_rows(
     negative_controls: dict | None,
     posterior: dict | None = None,
     specificity: dict | None = None,
+    raw: dict | None = None,
+    raw_keep: "set[str] | None" = None,
 ) -> list[dict]:
     """One split's quantities as ``(quantity, exposure)`` rows.
 
@@ -187,7 +195,8 @@ def split_rows(
     split (:func:`scored_comparators`), ``negative_controls`` the
     :meth:`compute_negative_controls` report, ``posterior`` the CGI's
     ``_posterior_summary`` (:func:`posterior_rows`), ``specificity`` the
-    specificity-contrast report (:func:`specificity_rows`).
+    specificity-contrast report (:func:`specificity_rows`), ``raw`` the
+    raw-unit slopes of the exposures in ``raw_keep`` (:func:`raw_rows`).
     """
     rows: list[dict] = []
     if effects_test:
@@ -251,6 +260,7 @@ def split_rows(
             )
         )
     rows += specificity_rows(specificity)
+    rows += raw_rows(raw, raw_keep)
     rows += posterior_rows(posterior)
     return rows
 
@@ -298,6 +308,87 @@ def scale_rows(
         ):
             r["spatial_scale_m"] = scale_text(scale)
             rows.append(r)
+    return rows
+
+
+def raw_rows(report: dict | None, keep: "set[str] | None" = None) -> list[dict]:
+    """One split's raw-unit slopes (:meth:`compute_raw_effects`) as rows.
+
+    The CGI's slope on the target per IQR and per p5–p95 range is
+    ``held_out_per_iqr`` / ``held_out_per_p5_p95``; every other exposure's is
+    ``exposure_per_iqr`` / ``exposure_per_p5_p95``; every exposure's slope on
+    each control (the CGI's too) is ``exposure_negative_control_per_iqr`` /
+    ``_per_p5_p95``, with the control named. Rows carry ``control``, ``kind``
+    (``cgi``, ``channel``, ``comparator``), ``scale`` (the exposure range the
+    contrast is per) and ``n``. ``keep`` limits the exposures (the CGI is always
+    kept).
+    """
+    if not report:
+        return []
+    rows: list[dict] = []
+    for name, block in (report.get("exposures") or {}).items():
+        if keep is not None and name != "cgi" and name not in keep:
+            continue
+        cgi = name == "cgi"
+        for contrast in ("per_iqr", "per_p5_p95"):
+            target = (block.get("target") or {}).get(contrast) or {}
+            quantity = f"held_out_{contrast}" if cgi else f"exposure_{contrast}"
+            on_control = f"exposure_negative_control_{contrast}"
+            pairs = [(quantity, None, target)] + [
+                (on_control, control, c.get(contrast) or {})
+                for control, c in (block.get("controls") or {}).items()
+            ]
+            for q, control, r in pairs:
+                row = _row(
+                    q,
+                    name,
+                    r.get("spatial_adjustment"),
+                    estimate=r.get("estimate"),
+                    ci_low=r.get("ci_low"),
+                    ci_high=r.get("ci_high"),
+                    p_value=_slope_p(r),
+                )
+                row["control"] = control
+                row["kind"] = block.get("kind")
+                row["scale"] = _f(r.get("scale"))
+                row["n"] = r.get("n")
+                rows.append(row)
+    return rows
+
+
+def distribution_rows(report: dict | None) -> list[dict]:
+    """One split's exposure distributions on its train+val rows: one row per
+    exposure (``scale_iqr`` the range its per-IQR rows are per, with
+    ``iqr_source``), and one per composite layer (``layer``) at the cell the
+    CGI reads."""
+    if not report:
+        return []
+    keys = ("median", "q25", "q75", "iqr", "p5", "p95", "n")
+    rows = []
+    for name, block in (report.get("exposures") or {}).items():
+        dist = block.get("distribution") or {}
+        per_iqr = (block.get("target") or {}).get("per_iqr") or {}
+        rows.append(
+            {
+                "exposure": name,
+                "layer": None,
+                "kind": block.get("kind"),
+                **{k: dist.get(k) for k in keys},
+                "scale_iqr": _f(per_iqr.get("scale")),
+                "iqr_source": block.get("iqr_source"),
+            }
+        )
+    for layer, dist in (report.get("layers") or {}).items():
+        rows.append(
+            {
+                "exposure": "cgi",
+                "layer": layer,
+                "kind": "layer",
+                **{k: dist.get(k) for k in keys},
+                "scale_iqr": None,
+                "iqr_source": None,
+            }
+        )
     return rows
 
 
@@ -632,6 +723,8 @@ def repeat(
     ladder: "list[float | None] | None" = None,
     report: str = "full",
     first: int = 1,
+    fixed_iqr: dict | None = None,
+    distributions: "list[dict] | None" = None,
 ) -> list[dict]:
     """Splits ``first … k_splits − 1`` (seeds ``split_seed + k``) as rows.
 
@@ -652,6 +745,11 @@ def repeat(
     p), every slope with its exact interval, and the paired differences and
     specificity contrasts as point estimates (no bootstrap). The estimates,
     and so every corrected t, are the ``full`` report's.
+
+    Every split also reports the raw-unit slopes of the CGI, every standalone
+    and the scored comparators (:func:`raw_rows`, ``fixed_iqr`` as in
+    :meth:`compute_raw_effects`); their exposure distributions are appended to
+    ``distributions`` when given (:func:`distribution_rows`).
     """
     from ..fusion import comparator_mode
     from .fusion_outputs import (
@@ -743,6 +841,15 @@ def repeat(
                 log=lambda level, msg: log(level, msg) if level == "WARN" else None,
             )
 
+        raw_exposures = {ch: (ch, fit) for ch, fit in fits.items()}
+        if not engine.is_panel:
+            for name in names:
+                raw_exposures[name] = (comparator_mode(name), {"comparator": name})
+        raw = engine.compute_raw_effects(params, raw_exposures, fixed_iqr=fixed_iqr)
+        if distributions is not None:
+            for r in distribution_rows(raw):
+                distributions.append({"split": k, "seed": seed, **r})
+
         primary = set(comparators_primary or comparators)
         for r in split_rows(
             effects_test=(effects or {}).get("test"),
@@ -752,9 +859,10 @@ def repeat(
             negative_controls=controls,
             posterior=_posterior_summary(params),
             specificity=contrast,
+            raw=raw,
         ):
             r.update(split=k, seed=seed, **info)
-            if r["quantity"] == "cgi_minus_comparator":
+            if r["quantity"] == "cgi_minus_comparator" or r.get("kind") == "comparator":
                 r["primary"] = r["exposure"] in primary
             rows.append(r)
         if ladder:

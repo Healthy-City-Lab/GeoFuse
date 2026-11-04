@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 
 from ..logger import get_logger
-from .outer_splits import spatial_columns, spatial_label
+from .outer_splits import distribution_rows, raw_rows, spatial_columns, spatial_label
 from .stage_ledger import StageLedger
 
 _log_fusion = get_logger("FUSION")
@@ -763,6 +763,16 @@ def _write_fusion_outputs(
         _emit_csv(f"outer_splits{sfx}.csv", outer["splits"])
         _emit_csv(f"outer_summary{sfx}.csv", outer.get("summary") or [])
 
+    # ── raw_effects.csv + exposure_scales.csv ───────────────────
+    raw = (cgi_bundle or {}).get("raw_effects")
+    raw_effect_rows = raw_rows(raw)
+    exposure_scales = outer.get("distributions") or [
+        {"split": 0, "seed": (cgi_bundle or {}).get("split_seed"), **r}
+        for r in distribution_rows(raw)
+    ]
+    _emit_csv(f"raw_effects{sfx}.csv", raw_effect_rows)
+    _emit_csv(f"exposure_scales{sfx}.csv", exposure_scales if raw_effect_rows else [])
+
     # ── null_outer.csv + null_summary.csv + null_variogram.csv ──
     null = (cgi_bundle or {}).get("outer_null") or {}
     if null.get("rows"):
@@ -890,6 +900,8 @@ def _write_fusion_outputs(
         "spatial_split": (cgi_bundle or {}).get("spatial_split"),
         "outer_splits": (cgi_bundle or {}).get("outer_splits"),
     }
+    if raw_effect_rows:
+        manifest["raw_effects"] = {"rows": raw_effect_rows, "scales": exposure_scales}
     if null:
         manifest["outer_null"] = {
             k: null.get(k)

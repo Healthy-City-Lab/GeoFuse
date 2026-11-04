@@ -31,7 +31,8 @@ class Setting:
     ``kind`` is ``bool``, ``int``, ``float``, ``choice``, ``multichoice``,
     ``intlist`` (whole numbers within ``lo`` .. ``hi``, given as a list or as
     comma-separated text, stored sorted without repeats, or in the order given
-    when ``ordered``), ``text`` or
+    when ``ordered``), ``text``, ``floatmap`` (positive numbers by name, given
+    as a table or as ``"name=value, name=value"`` text, stored as a table) or
     ``chains`` (NDVI aggregation chains: ``{name, steps}`` tables or
     ``"name: op, op"`` lines, stored as tables). A ``None`` default marks
     an optional setting whose absence has a meaning of its own (given in
@@ -83,6 +84,8 @@ class Setting:
             if not isinstance(value, str):
                 raise SettingError(f"'{key}' must be text, not {value!r}.")
             return value
+        if self.kind == "floatmap":
+            return self._float_map(key, value)
         if self.kind == "chains":
             try:
                 return check_chains(value)
@@ -107,6 +110,33 @@ class Setting:
         if self.ordered:
             return list(dict.fromkeys(numbers))
         return sorted(set(numbers))
+
+    def _float_map(self, key: str, value: Any) -> dict[str, float]:
+        if isinstance(value, str):
+            pairs = {}
+            for part in value.replace(";", ",").split(","):
+                if not part.strip():
+                    continue
+                name, sep, number = part.partition("=")
+                try:
+                    pairs[name.strip()] = float(number)
+                except ValueError:
+                    sep = ""
+                if not sep or not name.strip():
+                    raise SettingError(
+                        f"'{key}' must read name=value, name=value, not {value!r}."
+                    ) from None
+            value = pairs
+        if not isinstance(value, Mapping) or not value:
+            raise SettingError(f"'{key}' must be a table of names and numbers.")
+        positive = Setting("float", 0.0, lo=0.0, hi=self.hi)
+        out = {}
+        for name, number in value.items():
+            v = positive._number(f"{key}.{name}", number)
+            if v <= 0:
+                raise SettingError(f"'{key}.{name}' must be above 0, not {v}.")
+            out[str(name)] = v
+        return out
 
     def _number(self, key: str, value: Any) -> int | float | None:
         whole = self.kind == "int"
@@ -422,6 +452,12 @@ FUSION: dict[str, Setting] = {
         hi=10.0,
         auto_zero=True,
         help="Greenery increment of the per-IQR effect; 0 = from the composite.",
+    ),
+    "fixed_iqr": Setting(
+        "floatmap",
+        None,
+        help="Per-IQR increment by exposure (cgi, a channel, a comparator), "
+        "e.g. ndvi=0.1; unset = each exposure's train+val IQR.",
     ),
     "exposure_response_spline_df": _int(
         4, 3, 20, "Spline df of the exposure-response curve and linearity test."

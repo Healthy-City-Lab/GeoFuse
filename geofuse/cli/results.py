@@ -109,6 +109,12 @@ def _outer_name(entry: dict) -> str:
         "exposure_beta": f"β per SD, {name}",
         "exposure_negative_control_beta": f"β {name} on {control}",
         "specificity_difference": f"ΔD vs {name}, {control}",
+        "held_out_per_iqr": "per IQR",
+        "held_out_per_p5_p95": "per p5–p95",
+        "exposure_per_iqr": f"per IQR, {name}",
+        "exposure_per_p5_p95": f"per p5–p95, {name}",
+        "exposure_negative_control_per_iqr": f"per IQR {name} on {control}",
+        "exposure_negative_control_per_p5_p95": f"per p5–p95 {name} on {control}",
     }.get(quantity, f"CGI − {name}")
 
 
@@ -147,6 +153,43 @@ def _outer_lines(outer: dict) -> list[str]:
             + (f"  {_scale_name(e['spatial_scale_m'])}" if ladder(e) else "")
         )
     return lines + _posterior_lines(summary)
+
+
+def _raw_lines(raw: dict) -> list[str]:
+    """The first split's held-out change in outcome units per IQR and per
+    p5–p95 range of each exposure, and the composite's layers at its pick."""
+    exposures = (raw or {}).get("exposures") or {}
+    if not exposures:
+        return []
+    lines = [
+        "  Raw units        held-out change in the outcome per IQR | per p5–p95 "
+        "of each exposure (ranges on train+val)"
+    ]
+    for name, block in exposures.items():
+        target = block.get("target") or {}
+        parts = []
+        for key in ("per_iqr", "per_p5_p95"):
+            r = target.get(key) or {}
+            est, lo, hi = (_num(r.get(k)) for k in ("estimate", "ci_low", "ci_high"))
+            scale = _num(r.get("scale"))
+            if est is None or scale is None:
+                parts.append("—")
+                continue
+            parts.append(f"{est:+.4f} [{lo:+.4f}, {hi:+.4f}] per {scale:.4g}")
+        fixed = " (fixed IQR)" if block.get("iqr_source") == "fixed" else ""
+        label = "CGI" if name == "cgi" else _CHANNELS.get(name, name)
+        lines.append(f"    {label:<15}{parts[0]}{fixed} | {parts[1]}")
+    layers = (raw or {}).get("layers") or {}
+    if layers:
+        lines.append(
+            "    CGI layers     IQR at the pick: "
+            + ", ".join(
+                f"{_CHANNELS.get(ch, ch)} {_num(d.get('iqr')):.4g}"
+                for ch, d in layers.items()
+                if _num(d.get("iqr")) is not None
+            )
+        )
+    return lines
 
 
 def _null_lines(null: dict) -> list[str]:
@@ -440,6 +483,7 @@ def summary(label: str, bundle: dict, artifacts: Path) -> list[str]:
             f"ΔBIC {_num(aic.get('delta_bic')):+.1f})"
         )
     lines += _specificity_lines(bundle.get("specificity_contrast") or {})
+    lines += _raw_lines(bundle.get("raw_effects") or {})
     lines += _outer_lines(bundle.get("outer_splits") or {})
     lines += _null_lines(bundle.get("outer_null") or {})
 

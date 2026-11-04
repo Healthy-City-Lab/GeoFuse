@@ -1208,6 +1208,32 @@ def _paired_family_headline(family: list[dict], channel: str | None) -> dict | N
         head["selected_on"] = "train_val"
     return head
 
+def _fixed_scale(fixed_iqr: dict | None, name: str, default: float | None):
+    """The per-IQR increment of exposure ``name``: its ``fixed_iqr`` entry,
+    else ``default`` (``exposure_iqr``)."""
+    value = (fixed_iqr or {}).get(name)
+    return default if value is None else float(value)
+
+
+def _raw_exposures(
+    engine: Any, standalones, standalones_bundle: dict, comparators_report: dict
+) -> dict:
+    """The exposures whose raw-unit slopes the first split reports next to the
+    CGI's: every standalone at its reported params and every scored
+    comparator (none for a panel)."""
+    from geofuse.fusion import comparator_mode
+
+    out = {}
+    for ch in standalones or []:
+        bundle = standalones_bundle.get(ch) or {}
+        params = bundle.get("averaged_params") or bundle.get("best_params")
+        if params:
+            out[ch] = (ch, params)
+    if not engine.is_panel:
+        for name in comparators_report or {}:
+            out[name] = (comparator_mode(name), {"comparator": name})
+    return out
+
 
 def _run_outer_splits(
     engine: Any,
@@ -1236,6 +1262,7 @@ def _run_outer_splits(
     ladder: "list[float | None] | None" = None,
     primary_scale: float | None = None,
     report: str = "full",
+    fixed_iqr: dict | None = None,
 ) -> dict | None:
     """The first split's results and ``k_splits − 1`` repeats, summarised.
 
@@ -1250,14 +1277,21 @@ def _run_outer_splits(
     ``None``) whose slopes every split, the first included, also reports
     (:func:`geofuse.jobs.outer_splits.scale_rows`); the summary's Holm families
     use ``primary_scale``'s rows. ``report`` is the repeats' report
-    (:data:`geofuse.jobs.outer_splits.OUTER_REPORTS`). Returns ``{k, seeds,
-    comparators, report, splits, summary, complete}``.
+    (:data:`geofuse.jobs.outer_splits.OUTER_REPORTS`). Every split's exposure
+    distributions (the scales of its raw-unit rows) are listed under
+    ``distributions``. Returns ``{k, seeds, comparators, report, splits,
+    summary, distributions, complete}``.
     """
     stage(stage_key, RUNNING)
     scored = set(
         _outer.scored_comparators(comparators, comparators_primary, outer_comparators)
     )
     primary = set(comparators_primary or comparators)
+    distributions = [
+        {"split": 0, "seed": int(split_seed), **r}
+        for r in _outer.distribution_rows(first_split.get("raw"))
+        if r["exposure"] == "cgi" or r["exposure"] in set(standalones) | scored
+    ]
     try:
         rows = []
         info = _outer.split_info(engine)
@@ -1273,9 +1307,11 @@ def _run_outer_splits(
             negative_controls=first_split.get("negative_controls"),
             posterior=first_split.get("posterior"),
             specificity=first_split.get("specificity"),
+            raw=first_split.get("raw"),
+            raw_keep=set(standalones) | scored,
         ):
             r.update(split=0, seed=int(split_seed), **info)
-            if r["quantity"] == "cgi_minus_comparator":
+            if r["quantity"] == "cgi_minus_comparator" or r.get("kind") == "comparator":
                 r["primary"] = r["exposure"] in primary
 
             rows.append(r)
@@ -1315,6 +1351,8 @@ def _run_outer_splits(
             specificity=specificity,
             ladder=ladder,
             report=report,
+            fixed_iqr=fixed_iqr,
+            distributions=distributions,
         )
         if ctx.is_cancelled():
             raise JobCancelled("Repeated held-out splits cancelled by user.")
@@ -1380,6 +1418,7 @@ def _run_outer_splits(
         "report": str(report),
         "splits": rows,
         "summary": summary,
+        "distributions": distributions,
         "complete": completed >= int(k_splits),
     }
 
@@ -1935,6 +1974,7 @@ def run_fusion(
     report_effects_permutations: int = 1000,
     report_paired_bootstrap: int = 2000,
     exposure_iqr: float | None = None,
+    fixed_iqr: dict | None = None,
     moderator_columns: list[str] | None = None,
     negative_controls: list[str] | None = None,
     negative_control_retune: bool = False,
@@ -2278,6 +2318,7 @@ def run_fusion(
             "report_effects_bootstrap": int(report_effects_bootstrap),
             "report_effects_permutations": int(report_effects_permutations),
             "exposure_iqr": exposure_iqr,
+            **({"fixed_iqr": dict(fixed_iqr)} if fixed_iqr else {}),
             "moderator_columns": list(moderator_columns or []),
             "negative_controls": list(negative_controls or []),
             "negative_control_retune": bool(negative_control_retune),
@@ -3406,7 +3447,8 @@ def run_fusion(
                         engine._active_greenery_channel = ch
                         ch_bundle["exposure_response"] = (
                             engine.compute_exposure_response(
-                                params=ch_params, iqr=exposure_iqr
+                                params=ch_params,
+                                iqr=_fixed_scale(fixed_iqr, ch, exposure_iqr),
                             )
                         )
                     except Exception as exc:
@@ -3510,7 +3552,7 @@ def run_fusion(
                             n_effects_boot=int(report_effects_bootstrap),
                             n_perm=int(report_effects_permutations),
                             n_paired=int(report_paired_bootstrap),
-                            iqr=exposure_iqr,
+                            iqr=_fixed_scale(fixed_iqr, name, exposure_iqr),
                             label=label,
                             log=_log_fusion,
                         )
@@ -3618,7 +3660,7 @@ def run_fusion(
             try:
                 exposure_response_report = engine.compute_exposure_response(
                     params=averaged_params or best_params,
-                    iqr=exposure_iqr,
+                    iqr=_fixed_scale(fixed_iqr, "cgi", exposure_iqr),
                 )
             except Exception as exc:
                 _log_fusion(
@@ -3752,6 +3794,25 @@ def run_fusion(
                     return {"output_paths": output_paths}
 
             # ────────────────────────────────────────────
+            # Raw-unit effect sizes
+            # ────────────────────────────────────────────
+            raw_effects_report: dict | None = None
+            try:
+                raw_effects_report = engine.compute_raw_effects(
+                    headline_params,
+                    _raw_exposures(
+                        engine, standalones, standalones_bundle, comparators_report
+                    ),
+                    fixed_iqr=fixed_iqr,
+                )
+            except JobCancelled:
+                raise
+            except Exception as exc:
+                _log_fusion(
+                    "WARN", f"[{label}] Raw-unit effect sizes failed: {exc}"
+                )
+
+            # ────────────────────────────────────────────
             # Repeated held-out splits
             # ────────────────────────────────────────────
             outer_bundle: dict | None = None
@@ -3793,7 +3854,9 @@ def run_fusion(
                         "negative_controls": negative_control_report,
                         "posterior": cgi_discovery_summary,
                         "specificity": specificity_report,
+                        "raw": raw_effects_report,
                     },
+                    fixed_iqr=fixed_iqr,
                     specificity=specificity_report is not None,
                     specificity_exposures=(
                         sc_exposures if specificity_report is not None else None
@@ -3917,6 +3980,7 @@ def run_fusion(
                 "covariate_impact": covariate_impact,
                 "decline_terms": decline_terms,
                 "exposure_response": exposure_response_report,
+                "raw_effects": raw_effects_report,
                 "moderation": moderation_report,
                 "negative_controls": negative_control_report,
                 # The spatial blocks the held-out split used, ``None`` without.
