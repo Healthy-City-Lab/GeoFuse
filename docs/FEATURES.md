@@ -284,6 +284,17 @@ Nothing below is pre-specified.
   held-out estimate and the minimum detectable effect, 2.8 held-out standard
   errors (80 % power at a two-sided 5 % level), so a null held-out result can
   be read against the effect size the test split could have detected.
+- **Effects in the units readers compare.** A slope per SD of a composite or
+  of a compressed statistic says little about how much greener a place must
+  be. Every split therefore also reports, for the composite, every channel
+  and every comparator, the held-out change in the outcome in its own units
+  per interquartile range and per 5th–95th percentile range of the exposure,
+  on the target and on each negative control, with the same covariates and
+  smooth as the per-SD slope. The ranges are set on the split's train+val
+  rows, never on the rows that judge them, and a fixed increment per
+  exposure (such as 0.1 NDVI) can replace them. The composite's IQR is also
+  given in each layer's units at the cell it reads, so a per-IQR contrast of
+  the composite can be stated as so much NDVI or street-view greenery.
 - **The composite is judged against one channel on held-out rows.** The
   comparison channel is the standalone that scores best on the train+val rows,
   so the test rows never choose the channel they then judge. The verdict is the

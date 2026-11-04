@@ -243,6 +243,30 @@ largest R-hat is above 1.01, or its effective sample size per draw falls below
 where it started, its warm-up and any fallback (see OUTPUTS). Turning a warm
 start off gives the earlier draws exactly.
 
+### Raw-unit effect sizes
+
+Every run reports the held-out change in the outcome, in its own units,
+per interquartile range and per 5th–95th percentile range of the CGI, each
+channel and each comparator (results panel "Raw-unit effect sizes",
+`raw_effects.csv`, and on every held-out split in `outer_splits.csv`). The
+ranges are each exposure's on the split's train+val rows. To report per a
+published increment instead, give it per exposure in a run file or on the
+command line:
+
+```toml
+[defaults.fusion]
+fixed_iqr = { ndvi = 0.1, ndvi_500m = 0.1 }
+```
+
+```bash
+geofuse fusion ... --fixed-iqr "ndvi=0.1, ndvi_500m=0.1"
+```
+
+The names are `cgi`, a channel (`ndvi`, `gvi`, `veg`, `terrain`) or a
+comparator column. The same increment is used for that exposure in
+`exposure_response.csv`; `exposure_iqr` remains the increment for the
+exposures `fixed_iqr` does not name.
+
 ### Null calibration of the held-out decision
 
 With **Held-out splits** at 2 or more, a repeated study decides on the

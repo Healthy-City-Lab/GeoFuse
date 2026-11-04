@@ -117,6 +117,8 @@ output_results/fusion/<YYYYMMDDTHHMMSS>__<short_job_id>/
     ├── discovery.csv                   the pick, weights + CrIs, gain per study
     ├── covariate_impact.csv            per-covariate effects
     ├── exposure_response.csv           per-IQR effect, quantile gradient, linearity test
+    ├── raw_effects.csv                 held-out change per IQR / p5–p95 of each exposure
+    ├── exposure_scales.csv             each exposure's distribution per split
     ├── exposure_response_curve.csv     fitted curve, ready to plot
     ├── moderation.csv                  interaction test and simple slopes
     ├── negative_controls.csv           specificity check against control outcomes
@@ -325,6 +327,29 @@ the gradient across exposure quantiles against the lowest group with a test for
 trend, and a Wald test for departure from linearity. A `modelled_event_level`
 row records which value of a binary outcome was treated as the event, which
 matters because a column coded `1=Yes, 2=No` inverts every odds ratio.
+
+**`raw_effects.csv`** gives, on the first split's held-out rows, the
+covariate-adjusted change in the outcome, in its own units, per
+interquartile range and per 5th–95th percentile range of each exposure: the
+CGI (`held_out_per_iqr`, `held_out_per_p5_p95`), every standalone and every
+comparator (`exposure_per_iqr`, `exposure_per_p5_p95`), and each
+exposure's change on every negative control
+(`exposure_negative_control_per_iqr`, `_per_p5_p95`, `control` named).
+Columns: `quantity`, `exposure`, `estimate`, `ci_low`, `ci_high`,
+`p_value` (exact OLS, the same test as the per-SD slope), `control`, `kind`
+(`cgi`, `channel`, `comparator`), `scale` (the exposure range the change
+is per) and `n`, plus the spatial columns when the slopes are adjusted.
+The ranges come from the train+val rows; the job setting `fixed_iqr`
+(`{ndvi = 0.1}`, or `ndvi=0.1` text) replaces an exposure's IQR, here and
+in `exposure_response.csv`. **`exposure_scales.csv`** lists, per split
+(`split`, `seed`) and exposure, the `median`, `q25`, `q75`, `iqr`, `p5`,
+`p95` and `n` on the train+val rows, the `scale_iqr` its per-IQR rows used
+and `iqr_source` (`train_val` or `fixed`), and for the CGI one row per
+layer (`layer`, `kind = layer`) at the cell the composite reads. Both are in
+`results_summary.json` under `raw_effects`. With several held-out splits
+the same quantities are rows of `outer_splits.csv` on every split, with a
+`scale` and an `n` column, and `outer_summary.csv` tests each two-sided
+across the splits.
 
 **`moderation.csv`** answers whether the effect differs between groups: one
 simple slope per moderator level, one row per interaction term, and a single
