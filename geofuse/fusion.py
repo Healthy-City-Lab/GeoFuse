@@ -701,7 +701,7 @@ class MetricFusionEngine:
         # reports and, with ``weight_search``, by the search.
         self.weight_column: str | None = weight_column or None
         self.weight_search: bool = bool(weight_search)
-        if self.weight_column == target_feature:
+        if self.weight_column and self.weight_column == target_feature:
             raise ValueError("The weight column cannot be the outcome.")
         if self.weight_search and not self.weight_column:
             raise ValueError("weight_search needs a weight_column.")
