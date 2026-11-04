@@ -125,6 +125,7 @@ def prep(
     *,
     channel_index=None,
     return_info: bool = False,
+    weights: np.ndarray | None = None,
 ):
     """Frisch-Waugh: project the covariates out of **both** sides, then z-score.
 
@@ -160,6 +161,13 @@ def prep(
     ``column_sd``, shaped ``X.shape[1:]`` — the SD each residualised column was
     divided by, which undoes the z-scoring when weights are read on the raw
     scale — and ``kept``, the boolean mask of input rows that survived.
+
+    ``weights`` makes the fit weighted least squares: the rows are scaled by
+    ``√w`` (``w`` normalised to mean 1 on the kept rows; a missing or
+    non-positive weight drops the row), the basis is ``√w · [1, covariates]``,
+    and each side is divided by its root mean square, its weighted residual
+    SD. Every Gram matrix, sweep and likelihood built on the result is then
+    the weighted one.
     """
     X = np.asarray(X, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
@@ -175,10 +183,15 @@ def prep(
         keep &= np.isfinite(cov).all(1)
     if measured.any():
         keep &= np.isfinite(scan[:, measured]).all(1)
+    if weights is not None:
+        w = np.asarray(weights, dtype=np.float64)
+        keep &= np.isfinite(w) & (w > 0)
     if not keep.all():
         X, y = X[keep], y[keep]
         cov = None if cov is None else cov[keep]
 
+    if weights is not None:
+        return _weighted_prep(X, y, cov, w[keep], keep, return_info)
     q, deficit = covariate_basis(cov, len(y))
     if deficit:
         logger.warning(
@@ -205,6 +218,35 @@ def prep(
         "residual_df": int(len(y) - q.shape[1]),
         "column_sd": sd.reshape(X.shape[1:]),
         "kept": keep,
+    }
+    return yr, flat.reshape(X.shape), info
+
+
+def _weighted_prep(X, y, cov, w, keep, return_info):
+    """:func:`prep` on rows scaled by the square root of their weight."""
+    sw = np.sqrt(w / w.mean())
+    ones = np.ones((len(y), 1))
+    design = ones if cov is None else np.column_stack([ones, cov])
+    q = col_basis(sw[:, None] * design)
+    deficit = design.shape[1] - q.shape[1]
+
+    def rz(a):
+        return a - q @ (q.T @ a)
+
+    yr = rz(sw * y)
+    yr = yr / (np.sqrt(np.mean(yr * yr)) + 1e-12)
+    flat = rz(sw[:, None] * X.reshape(len(X), -1))
+    sd = np.sqrt(np.mean(flat * flat, axis=0))
+    flat = flat / (sd + 1e-12)
+    if not return_info:
+        return yr, flat.reshape(X.shape)
+    info = {
+        "covariate_rank": int(q.shape[1]),
+        "dropped_directions": int(deficit),
+        "residual_df": int(len(y) - q.shape[1]),
+        "column_sd": sd.reshape(X.shape[1:]),
+        "kept": keep,
+        "weighted": True,
     }
     return yr, flat.reshape(X.shape), info
 
