@@ -530,15 +530,54 @@ class TestAdjustedRun(unittest.TestCase):
                 self.assertEqual(methods, {"spatial_plus"})
 
 
+    def test_the_covariates_only_reports_say_so(self):
+        for name in ("exposure_response.csv", "covariate_impact.csv"):
+            with self.subTest(name):
+                table = self._table(name)
+                labels = {r["spatial_adjustment"] for r in table}
+                self.assertEqual(labels, {"not applied"})
+        report = self.bundle["exposure_response"]
+        self.assertEqual(report["spatial_adjustment"], "not applied")
+
+    def test_every_split_has_per_sd0_rows_with_the_slopes_p(self):
+        rows = self.bundle["outer_splits"]["splits"]
+        for k in (0, 1):
+            split = {
+                r["quantity"]: r
+                for r in rows
+                if r["split"] == k
+                and r["exposure"] == "cgi"
+                and not r.get("control")
+                and r.get("weighting") is None
+            }
+            self.assertIn("held_out_per_sd0", split)
+            self.assertAlmostEqual(
+                split["held_out_per_sd0"]["p_value"],
+                split["held_out_beta"]["p_value"],
+                delta=1e-10,
+            )
+
+
 class TestUnadjustedRun(unittest.TestCase):
     def test_no_spatial_column_anywhere(self):
         from test_fusion_run import _run
 
         _, bundle = _run("cross-sectional with comparators")
-        for name in ("negative_controls.csv", "comparators.csv"):
-            with open(os.path.join(bundle["report_dir"], name), encoding="utf-8") as f:
+        for name in (
+            "negative_controls.csv",
+            "comparators.csv",
+            "exposure_response.csv",
+            "covariate_impact.csv",
+        ):
+            path = os.path.join(bundle["report_dir"], name)
+            if not os.path.exists(path):
+                continue
+            with open(path, encoding="utf-8") as f:
                 header = next(csv.reader(f))
             self.assertFalse([c for c in header if c.startswith("spatial_")], name)
+        raw = (bundle.get("raw_effects") or {}).get("exposures") or {}
+        for block in raw.values():
+            self.assertNotIn("per_sd0", block.get("target") or {})
 
 
 # ────────────────────────────────────────────────────────────────────

@@ -1287,6 +1287,7 @@ def _run_outer_splits(
     primary_scale: float | None = None,
     report: str = "full",
     fixed_iqr: dict | None = None,
+    raw_exposures: dict | None = None,
 ) -> dict | None:
     """The first split's results and ``k_splits − 1`` repeats, summarised.
 
@@ -1348,8 +1349,13 @@ def _run_outer_splits(
                 n_boot=n_paired,
                 exposures=specificity_exposures,
                 label=label,
+                raw_exposures=raw_exposures,
+                raw_keep=set(standalones) | scored,
+                fixed_iqr=fixed_iqr,
             ):
                 r.update(split=0, seed=int(split_seed), **info)
+                if r.get("kind") == "comparator":
+                    r["primary"] = r["exposure"] in primary
                 rows.append(r)
 
         def _progress(k: int) -> None:
@@ -3964,6 +3970,9 @@ def run_fusion(
                         "weighted": weighted_report,
                     },
                     fixed_iqr=fixed_iqr,
+                    raw_exposures=_raw_exposures(
+                        engine, standalones, standalones_bundle, comparators_report
+                    ),
                     specificity=specificity_report is not None,
                     specificity_exposures=(
                         sc_exposures if specificity_report is not None else None

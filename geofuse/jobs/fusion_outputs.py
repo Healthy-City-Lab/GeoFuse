@@ -530,13 +530,21 @@ def _write_fusion_outputs(
         # Stamp this study onto the rows it just produced, so the composite
         # and each single channel sit in one table — which is the comparison
         # a published single-channel result is read against.
+        not_applied = er_report.get("spatial_adjustment")
         for _r in er_rows[_row_start:]:
             _r["study"] = _study_key
             _r["test_n"] = er_report.get("inference_n")
+            if not_applied:
+                _r["spatial_adjustment"] = not_applied
         curve = (nonlinear or {}).get("curve")
         if curve:
             er_curve_rows.extend(
-                {"study": _study_key, "exposure": x, "effect": y}
+                {
+                    "study": _study_key,
+                    "exposure": x,
+                    "effect": y,
+                    **({"spatial_adjustment": not_applied} if not_applied else {}),
+                }
                 for x, y in zip(curve["exposure"], curve["effect"], strict=True)
             )
     if er_rows:
@@ -556,6 +564,7 @@ def _write_fusion_outputs(
         mod_rows: list[dict] = []
         for block in moderation:
             name = block.get("moderator")
+            _block_start = len(mod_rows)
             for row in block.get("simple_slopes") or []:
                 mod_rows.append(
                     {
@@ -612,6 +621,9 @@ def _write_fusion_outputs(
                     "p_value": _f(block.get("interaction_p")),
                 }
             )
+            if block.get("spatial_adjustment"):
+                for _r in mod_rows[_block_start:]:
+                    _r["spatial_adjustment"] = block["spatial_adjustment"]
         _emit_csv(f"moderation{sfx}.csv", mod_rows)
 
     # ── negative_controls.csv (specificity) ─────────────────────

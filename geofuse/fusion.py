@@ -185,6 +185,77 @@ def _absorbed_share(x: np.ndarray, smooth: np.ndarray) -> float | None:
     return round(1.0 - float(r @ r) / sst, 6)
 
 
+def _absorbed_given_cov(
+    x: np.ndarray, cov: "np.ndarray | None", smooth: np.ndarray
+) -> float | None:
+    """Share of ``x``'s variance after the covariates that a spatial smooth
+    absorbs: ``1 − x'M_[Z,S]x / x'M_Z x`` with ``M`` the residual maker of
+    ``[1, covariates]`` (``Z``) and of ``[1, covariates, smooth]``, over the
+    finite rows."""
+    keep = np.isfinite(x) & np.isfinite(smooth).all(axis=1)
+    if cov is not None:
+        keep &= np.isfinite(cov).all(axis=1)
+    if keep.sum() < 3:
+        return None
+    ones = np.ones((int(keep.sum()), 1))
+    base = ones if cov is None else np.column_stack([ones, cov[keep]])
+    xk = x[keep]
+
+    def rss(X):
+        coef, *_ = np.linalg.lstsq(X, xk, rcond=None)
+        r = xk - X @ coef
+        return float(r @ r)
+
+    within = rss(base)
+    if within <= 0:
+        return None
+    return 1.0 - rss(np.column_stack([base, smooth[keep]])) / within
+
+
+def _per_sd0(x, y, cov, design) -> dict:
+    """:func:`negative_controls.raw_slope` of ``y`` on ``x`` given ``design``
+    per SD0, the SD of ``x`` after ``cov`` alone on the same rows, with
+    ``sd0`` and the outcome's residual SD given ``design`` (``outcome_sd``)."""
+    from . import negative_controls as _nc
+
+    keep = np.isfinite(x) & np.isfinite(y)
+    if design is not None:
+        keep &= np.isfinite(design).all(axis=1)
+    sub = None if cov is None else cov[keep]
+    xr0, _y0, _n0, _d0 = _nc._residualised(x[keep], y[keep], sub)
+    sd0 = float(xr0.std()) if len(xr0) else float("nan")
+    res = _nc.raw_slope(x, y, design, scale=sd0 if sd0 > 0 else float("nan"))
+    _xr, yr, _n, _d = _nc._residualised(x, y, design)
+    res["sd0"] = sd0
+    res["outcome_sd"] = float(yr.std()) if len(yr) else None
+    return res
+
+
+_CHANCE_CACHE: dict = {}
+
+
+def _chance_share(smooth: np.ndarray) -> float:
+    """The share of variance a smooth absorbs from noise in expectation: the
+    rank of its centred columns over the row count. Cached on the smooth's
+    shape and sums, since every exposure of a row set shares one smooth in
+    scale mode."""
+    key = (smooth.shape, float(smooth.sum()), float((smooth * smooth).sum()))
+    if key not in _CHANCE_CACHE:
+        if len(_CHANCE_CACHE) > 64:
+            _CHANCE_CACHE.clear()
+        S = smooth - smooth.mean(axis=0)
+        _CHANCE_CACHE[key] = float(np.linalg.matrix_rank(S)) / max(len(S), 1)
+    return _CHANCE_CACHE[key]
+
+
+def _spatially_adjusted(engine) -> bool:
+    """Whether ``engine``'s run adjusts for a spatial smooth (any method, or a
+    scale ladder whose current rung is the unadjusted one)."""
+    return getattr(engine, "spatial_adjust_method", "none") != "none" or bool(
+        getattr(engine, "spatial_adjust_scales", None)
+    )
+
+
 def comparator_mode(column: str) -> str:
     """The active-channel name that scores target ``column`` as the exposure.
 
@@ -8521,7 +8592,19 @@ class MetricFusionEngine:
         held = self._covariate_impact_on(params, metric, held_out=True)
         out = exposure_response.split_inference(whole, held)
         out["inference_n"] = None if held is None else held.get("n")
+        label = self._smooth_not_applied
+        if label:
+            out["spatial_adjustment"] = label
+            for row in out.get("per_covariate") or []:
+                row["spatial_adjustment"] = label
         return out
+
+    @property
+    def _smooth_not_applied(self) -> str | None:
+        """``"not applied"`` in a spatially adjusted run, for the reports that
+        control for the covariates only (exposure-response, moderation,
+        covariate impact); ``None`` otherwise."""
+        return "not applied" if _spatially_adjusted(self) else None
 
     def _covariate_impact_on(
         self, params: dict, metric: str, *, held_out: bool = False
@@ -8811,6 +8894,8 @@ class MetricFusionEngine:
         )
         out = exposure_response.split_inference(whole, test)
         out["inference_n"] = None if test is None else test["n"]
+        if self._smooth_not_applied:
+            out["spatial_adjustment"] = self._smooth_not_applied
         return out
 
     def _exposure_response_on(
@@ -8931,6 +9016,8 @@ class MetricFusionEngine:
             held = test.get(r["moderator"])
             merged = exposure_response.split_inference(r, held)
             merged["inference_n"] = None if held is None else held["n"]
+            if self._smooth_not_applied:
+                merged["spatial_adjustment"] = self._smooth_not_applied
             out.append(merged)
         return out
 
@@ -9131,7 +9218,12 @@ class MetricFusionEngine:
         record["at_cap"] = chosen["at_cap"]
         record["ic"] = chosen["ic"]
         if self._spatial_scale is not None and cols is not None:
-            record["absorbed"] = _absorbed_share(exposure[rows], cols)
+            x = exposure[rows]
+            record["absorbed"] = _absorbed_share(x, cols)
+            record["absorbed_given_cov"] = _absorbed_given_cov(
+                x, None if cov is None else cov[rows], cols
+            )
+            record["chance_share"] = _chance_share(cols)
         return cols, record
 
     def _slope_smooths(
@@ -9515,6 +9607,12 @@ class MetricFusionEngine:
         distribution at the cell the CGI reads, so a composite IQR can be read
         in a layer's units. The smooth selections are not counted again in
         :meth:`spatial_selection_report`. Controls are left out for a panel.
+
+        A spatially adjusted run also reports ``per_sd0``: the slope per SD0,
+        the exposure's held-out SD after the covariates only, so the unit stays
+        the same at every pattern scale and unadjusted (``sd0``, and
+        ``outcome_sd``, the outcome's residual SD given covariates and smooth);
+        its ``t`` is the per-SD slope's.
         """
         import copy
 
@@ -9562,6 +9660,7 @@ class MetricFusionEngine:
                     if values is not None:
                         controls[name] = values
             c_t = None if cov is None else cov[test]
+            per_sd0 = _spatially_adjusted(self)
             out: dict = {
                 "split": "test",
                 "n_test": int(test.sum()),
@@ -9592,6 +9691,8 @@ class MetricFusionEngine:
                             x[test], y[test], c, scale=_scale(span)
                         ),
                     }
+                    if per_sd0:
+                        res["per_sd0"] = _per_sd0(x[test], y[test], c_t, c)
                     if rec is not None:
                         for r in res.values():
                             r["spatial_adjustment"] = rec

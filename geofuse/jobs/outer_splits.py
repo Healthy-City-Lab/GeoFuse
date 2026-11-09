@@ -61,6 +61,9 @@ QUANTITIES: dict[str, str | None] = {
     "exposure_per_p5_p95": "two-sided",
     "exposure_negative_control_per_iqr": "two-sided",
     "exposure_negative_control_per_p5_p95": "two-sided",
+    "held_out_per_sd0": "two-sided",
+    "exposure_per_sd0": "two-sided",
+    "exposure_negative_control_per_sd0": "two-sided",
     "posterior_beta": None,
     "posterior_weight": None,
     "posterior_r50": None,
@@ -85,6 +88,15 @@ LADDER_QUANTITIES = frozenset(
         "exposure_beta",
         "exposure_negative_control_beta",
         "specificity_difference",
+        "held_out_per_iqr",
+        "held_out_per_p5_p95",
+        "held_out_per_sd0",
+        "exposure_per_iqr",
+        "exposure_per_p5_p95",
+        "exposure_per_sd0",
+        "exposure_negative_control_per_iqr",
+        "exposure_negative_control_per_p5_p95",
+        "exposure_negative_control_per_sd0",
     }
 )
 
@@ -278,13 +290,19 @@ def scale_rows(
     n_boot: int,
     exposures: dict | None = None,
     label: str = "",
+    raw_exposures: dict | None = None,
+    raw_keep: "set[str] | None" = None,
+    fixed_iqr: "dict[str, float] | None" = None,
 ) -> list[dict]:
     """The slope-type rows of the current split at other pattern scales.
 
     For each of ``scales`` (``None`` = without a spatial smooth) the held-out
     β, the negative-control β and, with ``exposures``, the specificity rows are
     computed again inside :meth:`MetricFusionEngine.spatial_scale`, with the
-    same bootstrap budget, and tagged ``spatial_scale_m``.
+    same bootstrap budget, and tagged ``spatial_scale_m``. With
+    ``raw_exposures`` (``{name: (active channel, params)}``) the raw-unit rows
+    of :func:`raw_rows` are too, per IQR, per p5–p95 range and per SD0, so a
+    slope reads in one exposure unit along the ladder.
     """
     from .fusion_outputs import _specificity_report
 
@@ -293,6 +311,11 @@ def scale_rows(
         with engine.spatial_scale(scale):
             slopes = engine.compute_partial_slopes(params)
             controls = engine.compute_negative_controls(params, n_boot=int(n_boot))
+            raw = None
+            if raw_exposures is not None:
+                raw = engine.compute_raw_effects(
+                    params, raw_exposures, fixed_iqr=fixed_iqr
+                )
             contrast = None
             if exposures:
                 contrast = _specificity_report(
@@ -310,6 +333,8 @@ def scale_rows(
             comparator_paired=[],
             negative_controls=controls,
             specificity=contrast,
+            raw=raw,
+            raw_keep=raw_keep,
         ):
             r["spatial_scale_m"] = scale_text(scale)
             rows.append(r)
@@ -323,10 +348,11 @@ def raw_rows(report: dict | None, keep: "set[str] | None" = None) -> list[dict]:
     ``held_out_per_iqr`` / ``held_out_per_p5_p95``; every other exposure's is
     ``exposure_per_iqr`` / ``exposure_per_p5_p95``; every exposure's slope on
     each control (the CGI's too) is ``exposure_negative_control_per_iqr`` /
-    ``_per_p5_p95``, with the control named. Rows carry ``control``, ``kind``
-    (``cgi``, ``channel``, ``comparator``), ``scale`` (the exposure range the
-    contrast is per) and ``n``. ``keep`` limits the exposures (the CGI is always
-    kept).
+    ``_per_p5_p95``, with the control named. A spatially adjusted run adds the
+    same three per SD0 (``…_per_sd0``, with ``sd0`` and ``outcome_sd``). Rows
+    carry ``control``, ``kind`` (``cgi``, ``channel``, ``comparator``),
+    ``scale`` (the exposure range the contrast is per) and ``n``. ``keep``
+    limits the exposures (the CGI is always kept).
     """
     if not report:
         return []
@@ -335,8 +361,11 @@ def raw_rows(report: dict | None, keep: "set[str] | None" = None) -> list[dict]:
         if keep is not None and name != "cgi" and name not in keep:
             continue
         cgi = name == "cgi"
-        for contrast in ("per_iqr", "per_p5_p95"):
-            target = (block.get("target") or {}).get(contrast) or {}
+        for contrast in ("per_iqr", "per_p5_p95", "per_sd0"):
+            target = (block.get("target") or {}).get(contrast)
+            if target is None and contrast == "per_sd0":
+                continue
+            target = target or {}
             quantity = f"held_out_{contrast}" if cgi else f"exposure_{contrast}"
             on_control = f"exposure_negative_control_{contrast}"
             pairs = [(quantity, None, target)] + [
@@ -357,6 +386,9 @@ def raw_rows(report: dict | None, keep: "set[str] | None" = None) -> list[dict]:
                 row["kind"] = block.get("kind")
                 row["scale"] = _f(r.get("scale"))
                 row["n"] = r.get("n")
+                if contrast == "per_sd0":
+                    row["sd0"] = _f(r.get("sd0"))
+                    row["outcome_sd"] = _f(r.get("outcome_sd"))
                 rows.append(row)
     return rows
 
@@ -1082,8 +1114,12 @@ def repeat(
                 n_boot=int(n_paired),
                 exposures=exposures,
                 label=f"split {k + 1}",
+                raw_exposures=raw_exposures,
+                fixed_iqr=fixed_iqr,
             ):
                 r.update(split=k, seed=seed, **info)
+                if r.get("kind") == "comparator":
+                    r["primary"] = r["exposure"] in primary
                 rows.append(r)
         log(
             "OK",
