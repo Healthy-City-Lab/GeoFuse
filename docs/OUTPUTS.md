@@ -375,7 +375,10 @@ increment. With several held-out splits the same rows are in
 weighted and unweighted rows apart (a `weighting` column), each with its
 own Holm families. `results_summary.json` has the rows and the weights'
 `n_eff` and `n_dropped` under `weighted`; `run_config.json` records
-`weight_column` and `weight_search`.
+`weight_column` and `weight_search`. With spatial adjustment each weighted
+slope uses the same smooth as its unweighted row. The job's "Weighted
+estimates" stage reads `failed` when the weighted report could not be
+computed (the run continues and `weighted` is empty).
 
 **`moderation.csv`** answers whether the effect differs between groups: one
 simple slope per moderator level, one row per interaction term, and a single
