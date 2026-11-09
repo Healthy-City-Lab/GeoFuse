@@ -294,16 +294,14 @@ def _spatial_designs(
     """Control designs to residualize the (target, cgi) sides on, per method.
 
     * ``none`` / no basis → both sides get the covariates.
-    * ``ks_aic`` → both sides get ``[covariates, spatial_basis]`` (symmetric
-      partial association of cgi in ``target ~ cgi + covariates + smooth``).
-    * ``spatial_plus`` → target gets ``[covariates, spatial_basis]``; cgi gets the
-      spatial smooth only (the exposure is residualized on the smooth).
+    * ``ks_aic`` / ``spatial_plus`` → both sides get ``[covariates,
+      spatial_basis]``: the partial association of cgi in ``target ~ cgi +
+      covariates + smooth`` (Frisch–Waugh needs the full design on both sides).
+      The two methods differ only in which variable selected the smooth's df.
     """
     if spatial_basis is None or method == "none":
         return cov, cov
     both = _stack(cov, spatial_basis)
-    if method == "spatial_plus":
-        return both, spatial_basis
     return both, both
 
 
@@ -586,8 +584,9 @@ def score(
 
     ``spatial_basis`` is an optional already-df-selected coordinate smooth (the
     output of :func:`geofuse.spatial_basis.select_df_aic`). With ``spatial_method``
-    ``ks_aic`` it joins the covariates on both sides; with ``spatial_plus`` the
-    exposure is residualized on the smooth only. ``spatial_method="none"`` (or a
+    ``ks_aic`` or ``spatial_plus`` it joins the covariates on both sides (the
+    methods differ in which variable selected its df, not in how the score uses
+    it). ``spatial_method="none"`` (or a
     missing basis) reproduces the plain covariate-residualized score. The smooth
     is ignored by ``mutual_info`` (like covariates).
 

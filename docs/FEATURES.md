@@ -403,8 +403,10 @@ Nothing below is pre-specified.
   adjustment's coordinate smooth enters the scores, the direction, the paired
   tests, the slopes, the negative controls and the specificity contrast, on
   every held-out split, but not the tuning. Spatial+ selects the smooth on each
-  exposure, KS-AIC on each outcome, and every adjusted slope records the method
-  and the smooth's degrees of freedom. The size of the smooth is chosen by AIC
+  exposure, KS-AIC on each outcome; once selected, the smooth joins the
+  covariates on both the outcome and the exposure side under either method,
+  so the two differ only in which variable chose its size. Every adjusted
+  slope records the method and the smooth's degrees of freedom. The size of the smooth is chosen by AIC
   (or BIC) among candidate sizes, by default 0, 1, 2, 3, 4, 6, 8, 11, 15 and 20
   radial functions per spatial cluster; the run keeps the criterion of every
   candidate and warns when the largest wins, since a larger smooth might then

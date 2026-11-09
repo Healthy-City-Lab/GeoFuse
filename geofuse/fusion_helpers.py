@@ -574,9 +574,8 @@ def split_control_matrix(
 
     The reporting resamplers draw rows of one control matrix so covariates
     and smooth stay row-aligned with the observation; the scorer wants them
-    separately (it residualizes the exposure on the smooth alone under
-    ``spatial_plus``, and expands only the covariates into the
-    residualization basis).
+    separately (it expands only the covariates into the residualization
+    basis, then appends the smooth).
     """
     if c_arr is None:
         return None, None
