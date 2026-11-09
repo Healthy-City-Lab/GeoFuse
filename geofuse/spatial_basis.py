@@ -216,12 +216,33 @@ def merge_small_components(
     return dense.astype(np.int64), merged, int(len(small))
 
 
+def radial_coefficients(knots: np.ndarray) -> np.ndarray:
+    """Knot coefficients of the thin-plate radial functions, coarsest first.
+
+    The functions ``η(‖z − knot‖) @ δ`` satisfy the thin-plate constraint
+    ``Tᵀδ = 0`` with ``T = [1, knot x, knot y]`` (Wood 2003): ``δ`` lies in the
+    null space ``Z`` of ``Tᵀ``, and the columns are the eigenvectors of the
+    reduced energy matrix ``Zᵀ E Z`` in descending ``|eigenvalue|`` order, so
+    the radial part carries nothing the linear terms already hold. ``[K, K − 3]``
+    for ``K`` knots; no column below 4 knots.
+    """
+    k = len(knots)
+    if k < 4:
+        return np.empty((k, 0), dtype=np.float64)
+    T = np.column_stack([np.ones(k), knots])
+    Q, _r = np.linalg.qr(T, mode="complete")
+    Z = Q[:, 3:]
+    E = _tps_eta(cdist(knots, knots))
+    w, V = np.linalg.eigh(Z.T @ E @ Z)
+    return Z @ V[:, np.argsort(np.abs(w))[::-1]]
+
+
 def _scale_columns(xy_c: np.ndarray, scale_m: float) -> tuple[np.ndarray, np.ndarray]:
     """Linear + radial columns of one cluster at pattern scale ``scale_m``.
 
     Knots cover the cluster at radius ``scale_m / 2`` (:func:`covering_knots`)
-    and every radial function is kept, up to ``n_c − 4`` so the cluster leaves
-    room for residuals.
+    and every constrained radial function (:func:`radial_coefficients`) is
+    kept, up to ``n_c − 4`` so the cluster leaves room for residuals.
     """
     n_c = len(xy_c)
     empty = np.empty((n_c, 0), dtype=np.float64)
@@ -238,11 +259,10 @@ def _scale_columns(xy_c: np.ndarray, scale_m: float) -> tuple[np.ndarray, np.nda
     if r_max <= 0:
         return linear, empty
     knots = covering_knots(z, 0.5 * float(scale_m) / span)
-    if len(knots) < 2:
+    delta = radial_coefficients(knots)
+    if delta.shape[1] == 0:
         return linear, empty
-    w, U = np.linalg.eigh(_tps_eta(cdist(knots, knots)))
-    U = U[:, np.argsort(np.abs(w))[::-1]]
-    phi = (_tps_eta(cdist(z, knots)) @ U)[:, :r_max]
+    phi = (_tps_eta(cdist(z, knots)) @ delta)[:, :r_max]
     std = phi.std(axis=0)
     std[std == 0] = 1.0
     return linear, (phi - phi.mean(axis=0)) / std
@@ -322,13 +342,12 @@ def _component_columns(
 
     k = min(n_c, max(2 * int(max_df) + 1, int(knot_floor)), int(knot_cap))
     knots = _maximin_knots(z, k)
-    energy = _tps_eta(cdist(knots, knots))
-    # Eigenvectors ordered by descending |eigenvalue| span coarse→fine spatial
-    # patterns; project the data-to-knot kernel onto them.
-    w, U = np.linalg.eigh(energy)
-    order = np.argsort(np.abs(w))[::-1]
-    U = U[:, order]
-    phi = _tps_eta(cdist(z, knots)) @ U  # [n_c, k]
+    # Constrained eigenvectors ordered coarse→fine; project the data-to-knot
+    # kernel onto them.
+    delta = radial_coefficients(knots)
+    if delta.shape[1] == 0:
+        return linear, empty
+    phi = _tps_eta(cdist(z, knots)) @ delta  # [n_c, k − 3]
     phi = phi[:, : min(r_max, phi.shape[1])]
 
     # Standardize radial columns for downstream lstsq conditioning (column
@@ -655,14 +674,54 @@ class DfSelectionPrecompute:
     prefix of ``‖Qᵀy‖²`` — the per-call df search becomes a single matvec
     instead of ``max_df + 1`` least-squares fits.
 
-    ``k_of_df[df]`` is the column count in ``Q`` (intercept included) at that
-    df level; ``designs[df]`` is the spatial design (no intercept) returned to
-    the caller — same column *span* as ``SpatialBasis.design(df)``.
+    ``k_of_df[df]`` is the design's column count (intercept included) at that
+    df level, the parameter count of its criterion; ``spans[df]`` the number of
+    leading ``Q`` columns spanning that design (fewer than ``k_of_df[df]`` when
+    it is rank-deficient, :func:`nested_basis`); ``designs[df]`` is the spatial
+    design (no intercept) returned to the caller — same column *span* as
+    ``SpatialBasis.design(df)``.
     """
 
     Q: np.ndarray
     k_of_df: np.ndarray
     designs: list
+    spans: np.ndarray | None = None
+    n_base: int = 1
+
+
+#: Relative size of a column's part outside the earlier columns below which
+#: :func:`nested_basis` treats it as dependent.
+NESTED_RTOL: float = 1e-10
+
+
+def nested_basis(M: np.ndarray, rtol: float = NESTED_RTOL):
+    """Orthonormal basis of ``M``'s leading columns, prefix by prefix.
+
+    Returns ``(Q, kept)``: ``Q[:, :kept[j]]`` spans ``M[:, :j + 1]`` for every
+    ``j``. A full-rank ``M`` gets its economy QR unchanged (``kept[j] = j + 1``);
+    a column whose part outside the earlier ones is below ``rtol`` of its norm
+    adds no direction, where an un-pivoted QR would add an arbitrary one.
+    """
+    n, p = M.shape
+    Q, R = np.linalg.qr(M, mode="reduced")
+    norms = np.linalg.norm(M, axis=0)
+    diag = np.abs(np.diag(R))
+    if p == 0 or (diag > rtol * np.maximum(norms, 1e-300)).all():
+        return Q, np.arange(1, p + 1, dtype=np.int64)
+    cols: list[np.ndarray] = []
+    kept = np.empty(p, dtype=np.int64)
+    for j in range(p):
+        v = M[:, j].astype(np.float64, copy=True)
+        if cols:
+            B = np.column_stack(cols)
+            for _ in range(2):
+                v -= B @ (B.T @ v)
+        size = float(np.linalg.norm(v))
+        if norms[j] > 0 and size > rtol * norms[j]:
+            cols.append(v / size)
+        kept[j] = len(cols)
+    Qn = np.column_stack(cols) if cols else np.empty((n, 0), dtype=np.float64)
+    return Qn, kept
 
 
 def precompute_df_selection(basis: SpatialBasis) -> DfSelectionPrecompute | None:
@@ -675,20 +734,24 @@ def precompute_df_selection(basis: SpatialBasis) -> DfSelectionPrecompute | None
     n_linear = basis.linear.shape[1]
 
     M = np.column_stack([np.ones(basis.n), basis.linear, radial_sorted])
-    Q, _r = np.linalg.qr(M, mode="reduced")
+    Q, kept = nested_basis(M)
 
     k_of_df = np.empty(basis.max_df + 1, dtype=np.int64)
+    spans = np.empty(basis.max_df + 1, dtype=np.int64)
     designs: list = []
     for df in range(basis.max_df + 1):
         n_radial = int(np.searchsorted(sorted_ranks, df, side="left"))
         k_of_df[df] = 1 + n_linear + n_radial
+        spans[df] = kept[k_of_df[df] - 1]
         parts = []
         if n_linear:
             parts.append(basis.linear)
         if n_radial:
             parts.append(radial_sorted[:, :n_radial])
         designs.append(np.column_stack(parts) if parts else None)
-    return DfSelectionPrecompute(Q=Q, k_of_df=k_of_df, designs=designs)
+    return DfSelectionPrecompute(
+        Q=Q, k_of_df=k_of_df, designs=designs, spans=spans, n_base=int(kept[0])
+    )
 
 
 def select_df_aic_fast(
@@ -728,6 +791,7 @@ def select_df_aic_fast(
     yy = float(y @ y)
     proj = pre.Q.T @ y
     cum = np.cumsum(proj * proj)
+    spans = pre.k_of_df if pre.spans is None else pre.spans
 
     def _ic(rss: float, k_cols: int) -> float:
         if rss <= 0:
@@ -740,14 +804,14 @@ def select_df_aic_fast(
 
     best_df: int | None = None
     best_cols: np.ndarray | None = None
-    best_ic = _ic(yy - float(cum[0]), 1)  # baseline: intercept only
+    best_ic = _ic(yy - float(cum[pre.n_base - 1]), 1)  # baseline: intercept only
     profile: dict[str, float] = {"none": best_ic}
 
     for df in candidate_dfs(basis, candidates):
         k_cols = int(pre.k_of_df[df])
         if k_cols <= 1:  # no spatial columns at this level
             continue
-        ic = _ic(yy - float(cum[k_cols - 1]), k_cols)
+        ic = _ic(yy - float(cum[int(spans[df]) - 1]), k_cols)
         profile[str(df)] = ic
         if ic < best_ic:
             best_ic = ic

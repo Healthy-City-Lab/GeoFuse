@@ -223,10 +223,32 @@ class StrainedResamplingTests(unittest.TestCase):
                 nc.paired_contrast(x, target, control, dense, n_boot=300, seed=7),
             ),
         )
+        self._compare(pairs)
+
+    def test_weakly_supported_directions_are_kept(self):
+        """Replicates drawing few rows of a saturated cluster keep the
+        directions those rows support, as the per-replicate fits do."""
+        for seed in (2, 5, 6, 8):
+            _, cov, smooth, x, _, target, control = _strained(seed)
+            dense = np.column_stack([cov, smooth])
+            pair = (
+                nc.paired_contrast(
+                    x, target, control, cov, extra={"exposure": smooth},
+                    n_boot=300, seed=7,
+                ),
+                nc.paired_contrast(x, target, control, dense, n_boot=300, seed=7),
+            )
+            self._compare([pair], rel=1e-6)
+
+    def _compare(self, pairs, rel=None):
+        # A ratio of two slopes amplifies rounding: its interval ends move by
+        # ~2e-8 relative on the dense path alone when the covariates are
+        # rescaled, so they are held to 1e-7.
         for blocks, plain in pairs:
             for key, value in plain.items():
                 if isinstance(value, float):
-                    tol = 1e-8 * max(1.0, abs(value))
+                    base = 1e-7 if key.startswith("ratio") else 1e-8
+                    tol = max(base, rel or 0.0) * max(1.0, abs(value))
                     self.assertAlmostEqual(blocks[key], value, delta=tol, msg=key)
 
 

@@ -202,8 +202,9 @@ class BasisSettingsTests(unittest.TestCase):
         xy, _, _ = _field(n=900, clusters=1)
         lo = sb.build_block_basis(xy, max_df=20, knots_min=10, knots_max=12)
         hi = sb.build_block_basis(xy, max_df=20, knots_min=60, knots_max=150)
-        # A component holds at most as many radial functions as knots.
-        self.assertEqual(lo.max_df, 12)
+        # A component holds K − 3 radial functions for K knots (the thin-plate
+        # constraint leaves the three linear directions to the linear terms).
+        self.assertEqual(lo.max_df, 9)
         self.assertEqual(hi.max_df, 20)
 
     def test_the_engine_passes_them_on(self):
@@ -230,17 +231,17 @@ class BasisSettingsTests(unittest.TestCase):
 class AtCapTests(unittest.TestCase):
     def test_the_largest_candidate_winning_is_flagged_and_warned(self):
         xy, y, _ = _field(n=900)
-        eng = _engine(spatial_adjust_df=[0, 1])
+        eng = _engine(spatial_adjust_df=[0, 20])
         with mock.patch("geofuse.fusion._log") as log:
             chosen = eng._spatial_selection(xy, y, None, y)
             eng._spatial_selection(xy, y, None, y)
-        self.assertEqual(chosen["df"], 1)
+        self.assertEqual(chosen["df"], 20)
         self.assertTrue(chosen["at_cap"])
         warns = [c for c in log.call_args_list if c.args[0] == "WARN"]
         self.assertEqual(len(warns), 1)
         self.assertIn("largest candidate", warns[0].args[1])
         report = eng.spatial_selection_report()
-        self.assertEqual(report["candidates"], [0, 1])
+        self.assertEqual(report["candidates"], [0, 20])
         self.assertEqual((report["selections"], report["selections_at_cap"]), (2, 2))
         self.assertTrue(report["at_cap"])
 
