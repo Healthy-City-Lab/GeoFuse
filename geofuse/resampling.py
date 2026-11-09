@@ -41,7 +41,7 @@ import numpy as np
 #: Relative eigenvalue floor of a weighted cross-product matrix: directions
 #: below it carry no rows of the replicate and are dropped, as a
 #: pseudo-inverse drops them.
-PINV_RTOL = 1e-10
+PINV_RTOL = 1e-12
 
 #: Replicates whose weights are multiplied in one GEMM.
 CHUNK = 256
