@@ -428,12 +428,18 @@ Nothing below is pre-specified.
   scale, and clusters too small to stand alone share a neighbour's level.
   Given several scales, the first decides the scores and verdicts and every
   slope is also reported at the others and unadjusted, so one run shows how
-  the estimate moves with the scale assumed. Optionally the search itself
+  the estimate moves with the scale assumed. Next to the per-SD slopes, whose
+  unit (an SD of what the smooth leaves) shrinks with the scale, each rung
+  reports the change per SD0, the exposure's SD after the covariates alone,
+  and per IQR and p5–p95 range, so a curve against the scale compares one
+  unit; each rung also records the share of the exposure the smooth
+  absorbs, with and without the covariates, and the share a smooth of that
+  size would absorb from noise. Optionally the search itself
   is tuned within areas: the smooth at a given scale joins the covariates of
   every search stage, so the layer, radius, statistic and weights are chosen
   on variation within areas of that size rather than on the whole map. The
-  exposure-response, moderation and AIC / BIC tables control for the
-  covariates only.
+  exposure-response, moderation, covariate-impact and AIC / BIC tables
+  control for the covariates only, and say so in an adjusted run.
 - Optional collinearity check on the study's own channels (GVI as the sum of
   its components) that reports the channels above a VIF threshold, and
   optionally leaves them out of the search.

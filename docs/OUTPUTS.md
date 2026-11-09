@@ -356,6 +356,15 @@ the same quantities are rows of `outer_splits.csv` on every split, with a
 `scale` and an `n` column, and `outer_summary.csv` tests each two-sided
 across the splits.
 
+A spatially adjusted run adds the same three changes per SD0
+(`held_out_per_sd0`, `exposure_per_sd0`,
+`exposure_negative_control_per_sd0`). SD0 is the exposure's SD on those
+held-out rows after the covariates only, without the smooth, so the unit is
+the same at every pattern scale and unadjusted; `held_out_beta` is per SD of
+the exposure left after the smooth, a unit that shrinks as the smooth absorbs
+more. The rows carry `sd0` and `outcome_sd` (the outcome's residual SD given
+the covariates and the smooth), and their p-value is the per-SD slope's.
+
 **`weighted.csv`** appears with the job setting `weight_column`. It holds
 the first split's held-out results weighted by that column, in the
 `outer_splits.csv` row layout with `weighting = "weighted"`:
@@ -468,15 +477,22 @@ Without spatial adjustment none of these columns or keys appear.
 
 With `spatial_adjust_scale_m` set, the smooth is defined by a pattern scale.
 Every adjusted row then carries `spatial_scale_m` (the scale in metres, as
-text), `spatial_df` (the smooth's number of columns) and `spatial_absorbed`,
+text), `spatial_df` (the smooth's number of columns), `spatial_absorbed`,
 the share of that exposure's variance on those rows the smooth absorbs (the
-R² of the exposure on the smooth): the variation left is what the adjusted
-slope rests on. Paired rows have `spatial_rule` `shared`. With several scales
-the slope rows of `outer_splits.csv` (`held_out_beta`,
-`negative_control_beta`, and with the specificity contrast `exposure_beta`,
+R² of the exposure on the smooth), `spatial_absorbed_given_cov`, the share of
+its variance after the covariates that the smooth absorbs (1 − x′M[Z,S]x /
+x′M[Z]x), and `spatial_chance_share`, the share a smooth of that size absorbs
+from pure noise (its rank over the rows): the variation left is what the
+adjusted slope rests on, and an absorbed share near the chance share says the
+smooth found little structure. Paired rows have `spatial_rule` `shared`. With
+several scales the slope rows of `outer_splits.csv` (`held_out_beta`,
+`negative_control_beta`, the raw-unit rows per IQR, per p5–p95 range and per
+SD0, and with the specificity contrast `exposure_beta`,
 `exposure_negative_control_beta` and `specificity_difference`) repeat at every
 listed scale and once with `spatial_scale_m` `none`, unadjusted; the table is
-written even with one held-out split. `outer_summary.csv` summarises each
+written even with one held-out split. Read a curve of the slope against the
+scale on the per-SD0 rows: a constant per-unit effect gives a flat per-SD0
+curve while `held_out_beta` falls by about √(1 − absorbed). `outer_summary.csv` summarises each
 scale separately, and only the first scale's entries enter the Holm families.
 `spatial_smoothing` in `results_summary.json` then holds `selection`
 (`fixed scale`), `scales_m`, `primary_scale_m`, the cluster gap `eps_m`,
@@ -486,7 +502,9 @@ their entities, and the number of radial functions. Without a scale, the same
 cluster list is recorded, with `chained` naming a cluster far wider or larger
 than the rest. Unless the search is tuned within areas the tuning never
 sees the smooth, and the exposure-response, moderation and AIC / BIC tables
-control for the covariates only.
+control for the covariates only: in a spatially adjusted run the rows of
+`exposure_response.csv`, `exposure_response_curve.csv`, `moderation.csv` and
+`covariate_impact.csv` carry `spatial_adjustment` `not applied`.
 
 With `spatial_tune_scale_m` set, `results_summary.json` and
 `results_bundle.json` hold `spatial_tuning`: the tuning scale `scale_m`, the
