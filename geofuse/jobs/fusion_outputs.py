@@ -57,6 +57,7 @@ _FUSION_STAGE_WEIGHTS: dict[str, float] = {
     "reports": 1.0,
     "comparators": 4.0,
     "negative_control_retune": 20.0,
+    "weighted": 2.0,
     "outer_splits": 40.0,
     "outer_null": 80.0,
 }
@@ -69,6 +70,11 @@ _FUSION_RETUNE_STAGE: tuple[str, str] = (
 _FUSION_COMPARATORS_STAGE: tuple[str, str] = (
     "comparators",
     "Score comparator exposures",
+)
+
+_FUSION_WEIGHTED_STAGE: tuple[str, str] = (
+    "weighted",
+    "Weighted estimates",
 )
 
 _FUSION_OUTER_SPLITS_STAGE: tuple[str, str] = (
@@ -1060,6 +1066,7 @@ def _build_fusion_ledger(
     mixedlm_postscore: bool = False,
     negative_control_retune: bool = False,
     comparators: bool = False,
+    weighted: bool = False,
     outer_splits: bool = False,
     outer_null: bool = False,
 ) -> StageLedger:
@@ -1079,9 +1086,9 @@ def _build_fusion_ledger(
     spec too but score with OLS so they skip the post-score step).
     ``negative_control_retune`` appends one re-tune stage per outcome, after
     its standalones, where the runner performs it; ``comparators`` one stage
-    for the comparator exposures, between the two; ``outer_splits`` one stage
-    for the repeated held-out splits, and ``outer_null`` one for their null
-    calibration, last.
+    for the comparator exposures, between the two; ``weighted`` one for the
+    weighted estimates; ``outer_splits`` one stage for the repeated held-out
+    splits, and ``outer_null`` one for their null calibration, last.
     """
     standalones = list(standalone_channels or [])
     steps: list[tuple[str, str]] = []
@@ -1133,6 +1140,14 @@ def _build_fusion_ledger(
                 (
                     _fusion_stage_key(label, rt_key_raw, multi=multi),
                     f"[{label}] {rt_label}" if multi else rt_label,
+                )
+            )
+        if weighted:
+            w_key_raw, w_label = _FUSION_WEIGHTED_STAGE
+            steps.append(
+                (
+                    _fusion_stage_key(label, w_key_raw, multi=multi),
+                    f"[{label}] {w_label}" if multi else w_label,
                 )
             )
         if outer_splits:

@@ -316,5 +316,107 @@ class TestWeightedRun(unittest.TestCase):
         self.assertIn("(w)", text)
 
 
+def _slopes_match(case, bundle, places=10):
+    """The weighted CGI slopes of ``bundle`` against its unweighted held-out
+    slopes on the target and every control."""
+    weighted = bundle["weighted"]["slopes"]["cgi"]
+    plain = bundle["negative_controls"]["splits"]["test"]
+    case.assertAlmostEqual(
+        weighted["target"]["beta"], plain["target"]["beta"], places=places
+    )
+    case.assertEqual(
+        weighted["target"]["spatial_adjustment"]["df"],
+        plain["target"]["spatial_adjustment"]["df"],
+    )
+    for c, row in plain["controls"].items():
+        case.assertAlmostEqual(
+            weighted["controls"][c]["beta"], row["beta"], places=places, msg=c
+        )
+
+
+class TestWeightedUnderSmooth(unittest.TestCase):
+    """The weighted report of a spatially adjusted run uses the slopes' own
+    smooth, in scale mode and in df mode."""
+
+    @classmethod
+    def setUpClass(cls):
+        from test_fusion_run import run_study
+
+        cls.folder = _study()
+        cls.ctx_scale, cls.scale = run_study(
+            cls.folder,
+            INPUTS,
+            weight_column="unit",
+            spatial_adjust_method="spatial_plus",
+            spatial_adjust_scale_m=[5000.0],
+        )
+        cls.ctx_df, cls.df = run_study(
+            cls.folder,
+            INPUTS,
+            weight_column="unit",
+            spatial_adjust_method="ks_aic",
+            spatial_adjust_df=[0, 2, 4],
+        )
+
+    def test_constant_weights_under_a_scale_smooth(self):
+        self.assertIsNotNone(self.scale["weighted"])
+        self.assertEqual(
+            self.scale["weighted"]["slopes"]["cgi"]["target"]["spatial_adjustment"][
+                "scale_m"
+            ],
+            5000.0,
+        )
+        _slopes_match(self, self.scale)
+
+    def test_constant_weights_under_a_df_smooth(self):
+        self.assertIsNotNone(self.df["weighted"])
+        _slopes_match(self, self.df)
+
+    def test_the_stage_is_done(self):
+        for ctx in (self.ctx_scale, self.ctx_df):
+            stages = {s["key"]: s["status"] for s in ctx.ledger["stages"]}
+            self.assertEqual(stages["weighted"], "done")
+
+    def test_integer_weights_equal_repeated_rows_under_a_smooth(self):
+        from geofuse import spatial_basis as sb
+
+        rng, cov, x, _, y, c = _data(4, n=300)
+        xy = rng.uniform(0, 20_000, size=(len(x), 2))
+        basis = sb.build_block_basis(xy, scale_m=5000.0)
+        smooth = np.column_stack([basis.linear, basis.radial])
+        k = rng.integers(1, 4, len(x))
+        r = np.repeat(np.arange(len(x)), k)
+        design = np.column_stack([cov, smooth])
+        s = wt.slope(x, y, design, k)
+        ref = nc.partial_slope(x[r], y[r], design[r])
+        self.assertAlmostEqual(s["beta"], ref["beta"], places=10)
+        d = wt.d(x, y, c, cov, smooth, smooth, k)["estimate"]
+        ref = nc.paired_contrast(x[r], y[r], c[r], design[r], n_boot=0)
+        self.assertAlmostEqual(d, ref["delta"], places=10)
+
+
+class TestWeightedStageFailure(unittest.TestCase):
+    def test_a_failed_weighted_report_marks_its_stage(self):
+        from unittest import mock
+
+        from test_fusion_run import run_study
+
+        from geofuse.fusion import MetricFusionEngine
+
+        folder = _study()
+        with mock.patch.object(
+            MetricFusionEngine,
+            "compute_weighted_report",
+            side_effect=RuntimeError("forced"),
+        ):
+            ctx, bundle = run_study(
+                folder, INPUTS, weight_column="unit", standalone_channels=[]
+            )
+        stages = {s["key"]: s for s in ctx.ledger["stages"]}
+        self.assertEqual(stages["weighted"]["status"], "failed")
+        self.assertIn("forced", stages["weighted"]["message"])
+        self.assertIsNone(bundle["weighted"])
+
+
 if __name__ == "__main__":
     unittest.main()

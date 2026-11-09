@@ -9720,7 +9720,7 @@ class MetricFusionEngine:
         }
 
         def with_smooth(smooth):
-            return self._with_smooth(c_t, None if smooth is None else smooth[test])
+            return self._with_smooth(c_t, smooth)
 
         def tag(res, record):
             if record is not None:
@@ -9772,16 +9772,13 @@ class MetricFusionEngine:
         x_cgi = xs["cgi"][test]
         (s_cgi, rec_cgi), s_cgi_c = smooths["cgi"]
 
-        def smooth_of(smooth):
-            return None if smooth is None else smooth[test]
-
         if metric == "r2":
             out["score"] = tag(
                 _w.r2(
                     t,
                     x_cgi,
                     c_t,
-                    smooth_of(s_cgi),
+                    s_cgi,
                     w,
                     n_boot=int(n_boot_score),
                     seed=int(seed),
@@ -9797,8 +9794,8 @@ class MetricFusionEngine:
                     x_cgi,
                     xs[name][test],
                     c_t,
-                    smooth_of(s_cgi),
-                    smooth_of(s_e),
+                    s_cgi,
+                    s_e,
                     w,
                     n_boot=int(n_boot),
                     seed=int(seed) + 1,
@@ -9813,8 +9810,8 @@ class MetricFusionEngine:
                     t,
                     v[test],
                     c_t,
-                    smooth_of(s_cgi),
-                    smooth_of(s_cgi_c[c][0]),
+                    s_cgi,
+                    s_cgi_c[c][0],
                     w,
                     n_boot=int(n_boot),
                     seed=int(seed) + 2 + j,
@@ -9833,11 +9830,11 @@ class MetricFusionEngine:
                     if method == "spatial_plus":
                         for role, sm in (("exposure", s_cgi), ("other", s_e)):
                             for outcome in ("target", "control"):
-                                pairs[(role, outcome)] = smooth_of(sm)
+                                pairs[(role, outcome)] = sm
                     elif method == "ks_aic":
                         for role in ("exposure", "other"):
-                            pairs[(role, "target")] = smooth_of(s_cgi)
-                            pairs[(role, "control")] = smooth_of(s_cgi_c[c][0])
+                            pairs[(role, "target")] = s_cgi
+                            pairs[(role, "control")] = s_cgi_c[c][0]
                     out["delta_d"][name][c] = _w.delta_d(
                         x_cgi,
                         x[test],

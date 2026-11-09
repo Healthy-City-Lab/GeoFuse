@@ -2204,6 +2204,7 @@ def run_fusion(
             mixedlm_postscore=mixedlm_postscore_enabled,
             negative_control_retune=retune_enabled,
             comparators=bool(comparator_cols),
+            weighted=bool(weight_column),
             outer_splits=int(outer_splits) > 1 or bool(scale_ladder),
             outer_null=int(outer_splits) > 1 and int(outer_null_runs or 0) > 0,
         )
@@ -3882,6 +3883,7 @@ def run_fusion(
             # ────────────────────────────────────────────
             weighted_report: dict | None = None
             if weight_column:
+                stage(skey("weighted"), RUNNING)
                 try:
                     weighted_report = engine.compute_weighted_report(
                         headline_params,
@@ -3907,6 +3909,13 @@ def run_fusion(
                     _log_fusion(
                         "WARN", f"[{label}] Weighted estimates failed: {exc}"
                     )
+                    stage(skey("weighted"), FAILED, str(exc))
+                else:
+                    skipped = (weighted_report or {}).get("skipped")
+                    if skipped:
+                        stage(skey("weighted"), SKIPPED, str(skipped))
+                    else:
+                        stage(skey("weighted"), DONE)
                 _log_weighted(weighted_report, label)
 
             # ────────────────────────────────────────────
