@@ -3220,6 +3220,9 @@ _OUTER_QUANTITY_LABELS: dict[str, str] = {
     "exposure_per_p5_p95": "Exposure change per p5–p95",
     "exposure_negative_control_per_iqr": "Negative-control change per IQR",
     "exposure_negative_control_per_p5_p95": "Negative-control change per p5–p95",
+    "held_out_per_sd0": "Change per SD0",
+    "exposure_per_sd0": "Exposure change per SD0",
+    "exposure_negative_control_per_sd0": "Negative-control change per SD0",
 }
 
 # Each split's CGI posterior (``outer_splits.POSTERIOR_QUANTITIES``).
@@ -3462,6 +3465,9 @@ def _render_raw_effects(results_view: dict) -> None:
         "exposure_per_p5_p95": "Target, per p5–p95",
         "exposure_negative_control_per_iqr": "Control, per IQR",
         "exposure_negative_control_per_p5_p95": "Control, per p5–p95",
+        "held_out_per_sd0": "Target, per SD0",
+        "exposure_per_sd0": "Target, per SD0",
+        "exposure_negative_control_per_sd0": "Control, per SD0",
     }
     table = [
         {
@@ -3477,6 +3483,12 @@ def _render_raw_effects(results_view: dict) -> None:
         for r in raw_rows(raw)
     ]
     st.dataframe(pd.DataFrame(table), width="stretch", hide_index=True)
+    if any(r["quantity"].endswith("_per_sd0") for r in raw_rows(raw)):
+        st.caption(
+            "SD0 is the exposure's held-out SD after the covariates only, so a "
+            "change per SD0 keeps one unit at every pattern scale and "
+            "unadjusted; its p-value is the per-SD slope's."
+        )
     layers = raw.get("layers") or {}
     cgi = (exposures.get("cgi") or {}).get("distribution") or {}
     if layers and _num(cgi.get("iqr")) is not None:
@@ -3819,6 +3831,11 @@ def _render_covariate_impact(results_view: dict, metric_name: str) -> None:
             "`target ~ CGI`. Coefficients show each covariate's effect direction "
             "and magnitude in the full model; partial R² is the variance only "
             "that covariate explains (drop in R² when it's removed from Full)."
+        )
+    if impact.get("spatial_adjustment") == "not applied":
+        st.caption(
+            "Spatial smooth not applied: this table, `exposure_response.csv` and "
+            "`moderation.csv` control for the covariates only."
         )
 
     _r2_label = "Marginal R²" if is_mixedlm else "R²"

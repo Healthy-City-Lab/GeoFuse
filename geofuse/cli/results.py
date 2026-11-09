@@ -116,6 +116,9 @@ def _outer_name(entry: dict) -> str:
         "exposure_per_p5_p95": f"per p5–p95, {name}",
         "exposure_negative_control_per_iqr": f"per IQR {name} on {control}",
         "exposure_negative_control_per_p5_p95": f"per p5–p95 {name} on {control}",
+        "held_out_per_sd0": "per SD0",
+        "exposure_per_sd0": f"per SD0, {name}",
+        "exposure_negative_control_per_sd0": f"per SD0 {name} on {control}",
     }.get(quantity, f"CGI − {name}")
 
 
