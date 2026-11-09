@@ -24,6 +24,7 @@ spatial smooth (radial functions per spatial cluster).
 | Discovery sweep, reproducibility and gain checks | 120–190× | — | identical picks, forms and weights |
 | Synergy posteriors: first fit and later held-out splits | 2.3–3.2× | — | other draws of the same posterior: means within 1.1 Monte Carlo errors of cold fits |
 | `geofuse` command-line processes | — | 3.1 GB → 0.02 GB each | — |
+| Null calibration: in-process nulls, compiled programs, pool size | 1.14× in-process | peak 13.4 GB → 10.1 GB (2 workers, 16 nulls) | identical null rows |
 
 Section 6 gives the time and memory of a whole study, alone and several at
 once.
@@ -240,7 +241,43 @@ anything else.
 
 ---
 
-## 7. How these figures were measured
+## 7. Null calibration
+
+The null calibration of the held-out decision (`outer_null_runs`) runs the
+whole search on every split of every null outcome. Measured on a synthetic
+study of 3,000 entities, 3 held-out splits, the decision report, free nulls,
+no standalones:
+
+| Change | Before | After | Null rows |
+| --- | --- | --- | --- |
+| In-process nulls (`outer_null_workers = 1`) keep their sweeps in the job's process instead of starting a process pool per sweep | 398 s, 9.1 GB for 8 nulls | 350 s, 8.4 GB | identical |
+| A null worker frees JAX's compiled programs once it has grown 1 GiB since it last did | 351 s, 13.4 GB for 16 nulls on 2 workers | 360 s, 10.1 GB | identical |
+| An automatically sized pool (16 nulls or more) is sized on one null run in the job's process first | 3 × engine copy + 1.5 GB per worker | that, plus the measured growth of one null, plus 1 GiB | identical |
+
+Every posterior fit embeds its data in its compiled programs, so a program is
+never reused by a later null, and a worker that keeps them all grows by about
+0.19 GB per null at this size (2 → 8 nulls per worker: 8.7 → 13.4 GB).
+Freeing them after every null brought the same run to 7.9 GB but took 13 %
+longer (398 s), because the shape-generic helpers were compiled again each
+time; freeing at 1 GiB of growth costs 2.5 %. The pool's old memory estimate
+does not see this growth: one real study of about 18,000 entities reached an
+85 GB process-tree peak with 4 workers. The pilot null costs one null run
+sequentially (8 nulls on 4 workers: 151 s → 187 s), which is why it starts
+from 16 nulls.
+
+Measured and left out:
+
+- **XLA threads.** `--xla_cpu_multi_thread_eigen=false` in `XLA_FLAGS` changed
+  neither a matrix product's time nor the stage (151 s → 153 s, 8 nulls on 4
+  workers, identical rows) with JAX 0.11, and `intra_op_parallelism_threads=1`
+  in the same variable made XLA ignore the device-count flag after it, which
+  would run the chains one after another.
+- **Compile reuse** (the data as runtime arguments of one program per shape)
+  would change the draws, not only their speed, and was not attempted.
+
+---
+
+## 8. How these figures were measured
 
 Synthetic data only: 4,662 or 20,000 entities in 12 spatial clusters and three
 very small ones, 29 covariate columns (2 numeric, 9 categorical), a smooth

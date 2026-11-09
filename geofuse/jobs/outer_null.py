@@ -20,6 +20,7 @@ the hits are clearly few or clearly many; the rate is then over those nulls.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import hashlib
 import json
@@ -52,6 +53,11 @@ _WORKER_BASE_BYTES = 1_500_000_000
 #: one thread per chain and holds its own JAX runtime (about 2.3 GB measured on
 #: a 3,000-entity study), so a wider pool contends for cores and memory.
 AUTO_WORKERS_MAX = 4
+
+#: Nulls from which an automatically sized pool is sized on one null run in
+#: the job's process first (:func:`_pilot`); fewer would pay a sequential null
+#: for a pool that finishes in a few rounds anyway.
+PILOT_MIN_NULLS = 4 * AUTO_WORKERS_MAX
 
 #: Engine state a search or a smooth selection updates: snapshotted before
 #: the nulls and restored after them, so the real outcome's reports keep
@@ -218,16 +224,87 @@ def _worker_setup(state: "dict | str") -> None:
         _WORKER.update(pickle.load(f))
 
 
+@contextlib.contextmanager
+def _searches_in_process(active: bool):
+    """Hold ``GEOFUSE_WORKERS=1`` while in-process nulls run, as a pool worker
+    does, so each null's sweeps run in the job's process instead of starting
+    a process pool of their own; the previous value comes back after."""
+    if not active:
+        yield
+        return
+    previous = os.environ.get("GEOFUSE_WORKERS")
+    os.environ["GEOFUSE_WORKERS"] = "1"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("GEOFUSE_WORKERS", None)
+        else:
+            os.environ["GEOFUSE_WORKERS"] = previous
+
+
 def _run_null(kind: str, index: int, values: np.ndarray) -> dict:
     """The decision report of one null outcome over every split.
 
     A null whose search fails returns ``{"error": …}``; one cut short by a
     cancel has fewer than ``k_splits`` splits. Neither counts as finished.
+    The compiled posterior programs are freed afterwards (:func:`_free_compiled`).
     """
     try:
         return _null_report(kind, index, values)
     except Exception as exc:
         return {"kind": kind, "index": int(index), "error": str(exc)}
+    finally:
+        _free_compiled()
+
+
+def _pilot(task: tuple, state: dict, on_result) -> int:
+    """Run one null in the job's process and return how much the process tree
+    grew while it ran: the memory a worker needs beyond its own interpreter and
+    engine copy, which sizes the pool for the rest. The null's result goes to
+    ``on_result`` as a pool worker's would."""
+    from .. import parallel
+
+    before = parallel.process_tree_bytes()
+    sampler = parallel.MemorySampler(interval_s=0.5).start()
+    try:
+        with _searches_in_process(True):
+            _worker_setup(state)
+            on_result(_run_null(*task))
+    finally:
+        sampler.stop()
+    return max(0, sampler.peak() - before)
+
+
+#: Growth of a null worker's memory, since it last freed its compiled
+#: programs, above which it frees them again.
+FREE_COMPILED_BYTES = 1 << 30
+
+_FREED: dict = {}
+
+
+def _free_compiled() -> None:
+    """Drop JAX's compiled programs after a null once the process has grown
+    :data:`FREE_COMPILED_BYTES` since the last time. Every posterior fit embeds
+    its data in its programs, so none is reused by a later null, and a worker
+    otherwise keeps every one it compiled; freeing after every null would also
+    recompile the shape-generic helpers each time."""
+    import sys
+
+    from .. import parallel
+
+    jax = sys.modules.get("jax")
+    if jax is None:
+        return
+    now = parallel.process_tree_bytes()
+    base = _FREED.setdefault("bytes", now)
+    if now and now - base < FREE_COMPILED_BYTES:
+        return
+    try:
+        jax.clear_caches()
+    except Exception:
+        return
+    _FREED["bytes"] = parallel.process_tree_bytes()
 
 
 def _null_report(kind: str, index: int, values: np.ndarray) -> dict:
@@ -515,18 +592,20 @@ def run(
     }
     pool = 1 if workers is None and n <= 1 else workers
     blob_path = None
+    pilot = False
+    base_bytes = _WORKER_BASE_BYTES
     if pool is None or pool > 1:
         blob_path = os.path.join(resume_dir, f"engine_{key}_{os.getpid()}.pkl")
         blob_path = _write_state(state, blob_path)
         size = os.path.getsize(blob_path)
+        base_bytes = 3 * size + _WORKER_BASE_BYTES
         if pool is None:
             from .. import parallel
 
             pool = parallel.process_worker_count(
-                n,
-                cap=AUTO_WORKERS_MAX,
-                bytes_per_worker=3 * size + _WORKER_BASE_BYTES,
+                n, cap=AUTO_WORKERS_MAX, bytes_per_worker=base_bytes
             )
+            pilot = pool > 1 and n >= PILOT_MIN_NULLS
         log(
             "INFO",
             f"Null calibration: {pool} worker(s), each with a "
@@ -578,18 +657,36 @@ def run(
                     return True
                 return stopped["decision"] is not None
 
+            if pilot and len(tasks) > AUTO_WORKERS_MAX and stopped["decision"] is None:
+                from .. import parallel
+
+                pilot = False
+                grown = _pilot(tasks[0], state, collect)
+                tasks = tasks[1:]
+                pool = parallel.process_worker_count(
+                    len(tasks),
+                    cap=AUTO_WORKERS_MAX,
+                    bytes_per_worker=base_bytes + grown + FREE_COMPILED_BYTES,
+                )
+                log(
+                    "INFO",
+                    f"Null calibration: one null grew the job by "
+                    f"{grown / 2**30:,.1f} GB; {pool} worker(s) for the rest.",
+                )
+
             if tasks and stopped["decision"] is None:
                 from .. import parallel
 
-                done = parallel.map_batches(
-                    _run_null,
-                    tasks,
-                    workers=max(1, min(int(pool or 1), len(tasks))),
-                    initializer=_worker_setup,
-                    initargs=(state if blob_path is None else blob_path,),
-                    on_result=collect,
-                    cancel_check=halt,
-                )
+                with _searches_in_process(blob_path is None):
+                    done = parallel.map_batches(
+                        _run_null,
+                        tasks,
+                        workers=max(1, min(int(pool or 1), len(tasks))),
+                        initializer=_worker_setup,
+                        initargs=(state if blob_path is None else blob_path,),
+                        on_result=collect,
+                        cancel_check=halt,
+                    )
                 if not done and stopped["decision"] is None:
                     complete = False
             decision = stopped["decision"]
