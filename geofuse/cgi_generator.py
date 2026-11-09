@@ -12,6 +12,10 @@ Not available yet: :func:`generate` raises :class:`NotImplementedError`.
 
 from __future__ import annotations
 
+# TODO: implement the full-area CGI map. The `geofuse cgi-map` command and the
+# Fusion tab's "Generate CGI Map" button are wired to this module and switch on
+# when AVAILABLE is True.
+
 #: Whether :func:`generate` is implemented.
 AVAILABLE = False
 

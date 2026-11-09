@@ -169,6 +169,7 @@ def _engine_stub(n_ent=400, n_test=120, seed=7, controls=("grip", "height")):
         "_test_entity_mask",
         "_whole_data_coords",
         "_slope_smooths",
+        "_applied_exposures",
         "compute_specificity_contrast",
     ):
         setattr(eng, name, types.MethodType(getattr(E, name), eng))

@@ -23,38 +23,14 @@ with cluster-robust (sandwich) standard errors, which is the standard choice
 for a binary repeated-measures exposure–outcome association and the one whose
 estimand matches the marginal odds ratios the literature reports.
 
-Search cost, and what makes it affordable
------------------------------------------
+Cost
+----
 
-An exact GEE fit iterates IRLS to convergence and re-estimates the working
-correlation on every pass. Inside a search that is hundreds
-of fits per fold, and it dominates the runtime.
-
-The same observation that makes the Gaussian fast scorer work applies here.
-Across trials only the greenery column changes; the outcome, the covariates and
-the cluster structure do not. So the working weights ``mu (1 - mu)``, the
-working correlation, and the cluster sandwich pieces are estimated **once per
-fold** from a covariates-only fit (:func:`estimate_fold_baseline`), and each
-trial is then a single Newton step from that null fit
-(:func:`score_gee_logit_fast`) rather than a fresh IRLS.
-
-That one-step statistic is the **generalized score test** for the greenery
-term. It is not an approximation invented here: evaluating the score and its
-cluster-robust variance at the null fit is the standard efficient-score
-construction, and its one-step coefficient is the first Newton–Raphson iterate
-of the full estimator. Measured against exact refits over a trial pool it holds
-a rank correlation of 0.9997 on |z|, a maximum |Δz| of 0.06, identical power,
-and the same top-ranked trial — see
-``tests/test_binary_and_exposure_response.py``.
-
-Separately, and independently of the one-step idea, the exchangeable working
-correlation is solved in **closed form**: see the derivation above
-:class:`_ClusterLayout`. Every cluster's contribution to the estimating
-equations collapses to four segment sums, so no per-cluster matrix is ever
-formed and there is no Python-level loop over participants. That speedup
-applies to the exact fit too — it changes the arithmetic, not the answer.
-
-``search_scoring_method="exact"`` forces the full refit for anyone who wants it.
+The exchangeable working correlation is solved in **closed form**: see the
+derivation above :class:`_ClusterLayout`. Every cluster's contribution to the
+estimating equations collapses to four segment sums, so no per-cluster matrix
+is ever formed and there is no Python-level loop over participants. It changes
+the arithmetic of the fit, not its answer.
 """
 
 from __future__ import annotations
@@ -443,121 +419,6 @@ def _fit_gee_logit(
     # Back to the caller's units: a coefficient divides by its column's scale,
     # and a covariance entry by the product of the two columns' scales.
     return beta / scales, mu, alpha, cov_scaled / np.outer(scales, scales)
-
-
-# ────────────────────────────────────────────────────────────────────
-# Fold baseline for the fast path
-# ────────────────────────────────────────────────────────────────────
-
-
-class GEEFoldBaseline:
-    """Everything a fold's trials reuse: the covariates-only GEE fit.
-
-    Built once per fold. Across trials only the greenery column changes, so the
-    fitted probabilities, the working weights, the exchangeable correlation and
-    the cluster layout are all properties of the null model and are shared.
-
-    ``order`` is the row permutation that groups the panel by participant; the
-    stored arrays are already permuted, and a trial's greenery vector is
-    permuted on arrival.
-    """
-
-    __slots__ = ("y", "layout", "mu", "var", "resid", "alpha", "beta_null", "X_null")
-
-    def __init__(self, y, layout, mu, alpha, beta_null, X_null):
-        self.y = y
-        self.layout = layout
-        self.mu = mu
-        self.var = mu * (1.0 - mu)
-        self.resid = y - mu
-        self.alpha = alpha
-        self.beta_null = beta_null
-        self.X_null = X_null
-
-
-def estimate_fold_baseline(
-    outcome: np.ndarray,
-    entity_id: np.ndarray,
-    covariates: np.ndarray | None = None,
-) -> GEEFoldBaseline | None:
-    """Fit the covariates-only GEE once, for :func:`score_gee_logit_fast`.
-
-    Returns ``None`` when the outcome is not binary or the null model will not
-    fit; the caller falls back to the exact path.
-    """
-    y = np.asarray(outcome, dtype=np.float64)
-    if y.size < 10 or not is_binary(y):
-        return None
-    y = to_binary(y)
-    cov = (
-        np.asarray(covariates, dtype=np.float64).reshape(len(y), -1)
-        if covariates is not None and np.size(covariates)
-        else None
-    )
-    layout = _ClusterLayout(entity_id)
-    X_null, _ = _design(None, cov, len(y))
-    y_s = y[layout.order]
-    X_s = X_null[layout.order]
-    fit = _fit_gee_logit(y_s, X_s, layout)
-    if fit is None:
-        return None
-    beta, mu, alpha, _ = fit
-    return GEEFoldBaseline(y_s, layout, mu, alpha, beta, X_s)
-
-
-def score_gee_logit_fast(
-    metric: str,
-    greenery: np.ndarray,
-    baseline: GEEFoldBaseline,
-    *,
-    return_all: bool = False,
-    return_pvalue: bool = False,
-):
-    """One Newton step from the null fit — the generalized score test.
-
-    The greenery column joins the null design and a single Fisher scoring step
-    is taken from the null fit's coefficients, holding the working weights and
-    the exchangeable correlation at their null values. The step's greenery
-    component is the one-step coefficient; its cluster-robust standard error is
-    the sandwich evaluated at the same point.
-
-    Cost is one :func:`_accumulate` pass plus a ``(p+1)`` solve, against a full
-    Fisher-scoring-plus-correlation loop for the exact fit.
-    """
-    from scipy import stats
-
-    if baseline is None:
-        return _degenerate(metric, return_all, return_pvalue)
-    g = np.asarray(greenery, dtype=np.float64)
-    if g.size != baseline.y.size or not np.all(np.isfinite(g)) or np.ptp(g) <= 0:
-        return _degenerate(metric, return_all, return_pvalue)
-    g = g[baseline.layout.order]
-
-    X = np.column_stack([baseline.X_null[:, [0]], g, baseline.X_null[:, 1:]])
-    gi = 1
-    # The null coefficients padded with a zero for the term being introduced,
-    # which is exactly the hypothesis the score is evaluated under.
-    beta0 = np.insert(baseline.beta_null, gi, 0.0)
-
-    # Solved column-scaled, like the exact fit, so a covariate's units cannot
-    # change the score. ``beta0`` is in the caller's units, so it scales up on
-    # the way in and the step scales back down on the way out.
-    scales = _column_scales(X)
-    bread, score, meat = _accumulate(
-        X / scales, baseline.var, baseline.resid, baseline.layout, baseline.alpha
-    )
-    try:
-        bread_inv = np.linalg.pinv(bread)
-    except np.linalg.LinAlgError:
-        return _degenerate(metric, return_all, return_pvalue)
-    coef = float(beta0[gi] + (bread_inv @ score)[gi] / scales[gi])
-    cov_beta = (bread_inv @ meat @ bread_inv) / np.outer(scales, scales)
-    se = float(np.sqrt(max(cov_beta[gi, gi], 0.0)))
-    z = abs(coef / se) if se > 0 else 0.0
-    pval = float(2.0 * stats.norm.sf(z))
-
-    values = {"gee_logit_tstat": z, "gee_logit_coef": coef}
-    return _package(metric, values, pval, return_all, return_pvalue)
 
 
 # ────────────────────────────────────────────────────────────────────

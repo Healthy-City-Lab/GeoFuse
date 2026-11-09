@@ -169,6 +169,7 @@ _METHODS = (
     "_slope_smooths",
     "compute_partial_slopes",
     "compute_negative_controls",
+    "_applied_exposures",
     "compute_specificity_contrast",
 )
 

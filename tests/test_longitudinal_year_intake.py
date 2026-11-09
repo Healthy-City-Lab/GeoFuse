@@ -27,7 +27,6 @@ from geofuse import preaggregation as pa
 from geofuse.longitudinal import (
     LongitudinalSpec,
     build_long_format,
-    channel_files_per_entity,
     validate_spec,
 )
 
@@ -74,17 +73,6 @@ class TestYearKeyedIntake(unittest.TestCase):
         self.assertIn(("c", "2016"), waves)
         self.assertEqual(sorted(set(out["wave"])), ["2010", "2015", "2016"])
 
-    def test_greenery_routes_per_year(self):
-        f1 = _frame(["2010-03-01"], ["a"])
-        f2 = _frame(["2016-01-20"], ["a"])
-        spec = _spec(
-            ("2010", "2016"),
-            {"fileA": "/f1.gpkg", "fileB": "/f2.gpkg"},
-            {"2010": "g2010.tif", "2016": "g2016.tif"},
-        )
-        out = build_long_format(spec, [("fileA", f1), ("fileB", f2)], outcome_col="y")
-        routed = list(channel_files_per_entity(spec, out, "ndvi"))
-        self.assertEqual(routed, ["g2010.tif", "g2016.tif"])
 
     def test_two_measurements_in_one_year_raise(self):
         f = _frame(["2010-01-01", "2010-09-09"], ["a", "a"])

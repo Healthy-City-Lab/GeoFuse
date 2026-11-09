@@ -103,7 +103,7 @@ def read_vector_aliased_column(
 
 
 def target_path_is_raster(path: str | Path) -> bool:
-    """True if ``path`` should be read as a GeoTIFF (or raster inside a zip), not fiona."""
+    """True if ``path`` should be read as a GeoTIFF (or raster inside a zip), not a vector layer."""
     suf = Path(path).suffix.lower()
     if suf in (".tif", ".tiff"):
         return True
@@ -122,10 +122,10 @@ def target_path_is_raster(path: str | Path) -> bool:
 
 
 def list_gpkg_layer_names(path: str | Path) -> list[str]:
-    """Return Fiona layer names for a GeoPackage (or other multi-layer sources)."""
-    import fiona
+    """Layer names of a GeoPackage (or other multi-layer source)."""
+    import pyogrio
 
-    return list(fiona.listlayers(os.fspath(path)))
+    return [str(name) for name in pyogrio.list_layers(os.fspath(path))[:, 0]]
 
 
 def vector_format_from_path(path: str | Path) -> str:
@@ -174,7 +174,7 @@ def read_vector_path(
     *,
     layer: str | int | None = None,
 ) -> gpd.GeoDataFrame:
-    """Load a vector file with fiona/GDAL; preserves attributes; returns EPSG:4326.
+    """Load a vector file with GDAL (pyogrio); preserves attributes; returns EPSG:4326.
 
     ``path`` may be a ``.shp`` path (``.dbf`` / ``.shx`` / ``.prj`` in the same folder
     are read automatically), a ``.gpkg`` layer, GeoJSON, or a ``.zip`` archive GDAL can

@@ -34,8 +34,6 @@ largest difference in any score, slope or interval end is ~1e-11 (see
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
-
 import numpy as np
 
 #: Relative eigenvalue floor of a weighted cross-product matrix: directions
@@ -232,13 +230,6 @@ class BlockDesign:
         M = G[:, d:, d:] - np.swapaxes(T, 1, 2) @ T
         return M * (sd[:, None] * sd[None, :])
 
-    def cross_chunks(
-        self, R: np.ndarray, weights: Iterator[np.ndarray]
-    ) -> np.ndarray:
-        """:meth:`cross` over an iterator of ``(B, n)`` weight chunks, stacked."""
-        out = [self.cross(R, W) for W in weights]
-        k = 1 if np.ndim(R) == 1 else np.shape(R)[1]
-        return np.concatenate(out) if out else np.zeros((0, k, k))
 
     # ── Fits on one weight vector ───────────────────────────────
 
@@ -302,25 +293,6 @@ def row_weights(idx: np.ndarray, n: int) -> np.ndarray:
     for b in range(idx.shape[0]):
         W[b] = np.bincount(idx[b], minlength=n)
     return W
-
-
-def group_weights(draws: np.ndarray, codes: np.ndarray, n_groups: int) -> np.ndarray:
-    """Row weights of whole-group resamples.
-
-    ``draws`` ``(B, n_draw)`` are group indices, ``codes`` the group of every
-    row; a row's weight is how often its group was drawn.
-    """
-    draws = np.atleast_2d(draws)
-    m = np.empty((draws.shape[0], n_groups))
-    for b in range(draws.shape[0]):
-        m[b] = np.bincount(draws[b], minlength=n_groups)
-    return m[:, codes]
-
-
-def chunked(n_total: int, make: Callable[[int], np.ndarray], size: int = CHUNK):
-    """``make(b)`` for consecutive chunks of at most ``size`` of ``n_total``."""
-    for start in range(0, int(n_total), size):
-        yield make(min(size, int(n_total) - start))
 
 
 # ────────────────────────────────────────────────────────────────────

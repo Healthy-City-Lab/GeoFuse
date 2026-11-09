@@ -167,25 +167,32 @@ class TestPackageSmoke(unittest.TestCase):
         html = m._repr_html_()
         self.assertIn("leaflet", html.lower())
 
-    def test_dl_core_network_importable(self):
-        """dl_core/network can be imported and exposes the modeling dict.
+    def test_segmentation_network_matches_the_checkpoint_layout(self):
+        """The DeepLabV3+ network takes the ResNet depth from the checkpoint's
+        blocks and names its parameters as the training code's checkpoints do;
+        a checkpoint of another backbone is refused."""
+        import torch
 
-        vision.py adds dl_core to sys.path at import time.  This test
-        confirms that the inference backbone is intact and the segmentation
-        model factory is accessible — the minimum requirement for
-        DeepLabSegmenter to initialise.
-        """
-        import importlib
+        from geofuse import segmentation_net
 
-        network = importlib.import_module("network")
-        self.assertTrue(
-            hasattr(network, "modeling"),
-            "dl_core.network must expose 'modeling' for DeepLab instantiation",
-        )
-        self.assertTrue(
-            hasattr(network.modeling, "deeplabv3plus_resnet101"),
-            "network.modeling must define deeplabv3plus_resnet101 (the deployed backbone)",
-        )
+        fake = {
+            "classifier.aspp.convs.0.0.weight": torch.zeros(256, 2048, 1, 1),
+            "backbone.layer4.0.conv1.weight": torch.zeros(1),
+            **{f"backbone.layer3.{i}.conv1.weight": torch.zeros(1) for i in range(23)},
+        }
+        self.assertEqual(segmentation_net.depth_of(fake), "resnet101")
+        keys = set(segmentation_net.build(fake).state_dict())
+        for key in (
+            "backbone.conv1.weight",
+            "backbone.layer3.22.conv3.weight",
+            "classifier.project.0.weight",
+            "classifier.aspp.convs.4.1.weight",
+            "classifier.aspp.project.0.weight",
+            "classifier.classifier.3.bias",
+        ):
+            self.assertIn(key, keys)
+        with self.assertRaises(ValueError):
+            segmentation_net.depth_of({"classifier.aspp.convs.0.0.weight": None})
 
 
 # ────────────────────────────────────────────────────────────────────

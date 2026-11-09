@@ -1,8 +1,6 @@
 import base64
-import glob
 import html
 import io
-import math
 import os
 from datetime import date
 from pathlib import Path
@@ -24,7 +22,6 @@ from helpers import (
 from jinja2 import Template
 from map_preview import add_mixed_geojson_preview, add_outcome_colored_geometry_layer
 from PIL import Image as PILImage
-from shapely.geometry import box as shapely_box
 from streamlit_folium import st_folium
 
 try:
@@ -36,8 +33,7 @@ from geofuse import cgi_formulas as _cgi_formulas
 from geofuse import metric_sampling as _metric_sampling
 from geofuse import mixed_effects_scoring as _mes
 from geofuse import settings as _gf_settings
-from geofuse.crs_utils import buffer_gdf_union_metres, reproject_geodataframe_to_wgs84
-from geofuse.jobs.outer_splits import spatial_label
+from geofuse.jobs.outer_splits import finite_or_none, spatial_label
 from geofuse.persistence import caches
 from geofuse.vector_io import (
     geometry_sha256,
@@ -260,67 +256,6 @@ def _add_outcome_geometry_preview(
 # ────────────────────────────────────────────────────────────────────
 # Metric-file helpers
 # ────────────────────────────────────────────────────────────────────
-
-
-def _scan_metric_files(output_dir: str, suffix: str) -> list:
-    """Return sorted (basename, path) for raster metrics ``*_{suffix}.tif`` / ``.tiff``.
-
-    Coverage checks use fast raster bounds only. Matching GeoJSON files duplicate the
-    same grids and are excluded from this scan.
-    """
-    seen: dict[str, str] = {}
-    for ext in (".tif", ".tiff"):
-        pattern = os.path.join(output_dir, f"*_{suffix}{ext}")
-        for p in glob.glob(pattern):
-            seen[os.path.basename(p)] = p
-    return [(bn, seen[bn]) for bn in sorted(seen.keys())]
-
-
-def _compute_buffered_extent(
-    tmp_target_path: str,
-    is_vector_target: bool,
-    buffer_meters: float,
-    vector_layer: str | int | None = None,
-) -> "gpd.GeoDataFrame | None":
-    """Compute the buffered target extent as a GeoDataFrame in EPSG:4326."""
-    try:
-        if is_vector_target:
-            kwargs: dict = {}
-            if vector_layer is not None and Path(tmp_target_path).suffix.lower() in (
-                ".gpkg",
-                ".zip",
-            ):
-                kwargs["layer"] = vector_layer
-            gdf = reproject_geodataframe_to_wgs84(
-                gpd.read_file(tmp_target_path, **kwargs)
-            )
-        else:
-            with rasterio.open(tmp_target_path) as src:
-                b = src.bounds
-                src_crs = src.crs
-            gdf = gpd.GeoDataFrame(
-                {"geometry": [shapely_box(b.left, b.bottom, b.right, b.top)]},
-                crs=src_crs,
-            ).to_crs("EPSG:4326")
-
-        return buffer_gdf_union_metres(gdf, buffer_meters).to_crs("EPSG:4326")
-    except Exception:
-        return None
-
-
-def _check_coverage(metric_path: str, buffered_gdf: "gpd.GeoDataFrame") -> bool:
-    """Return True if the metric raster's extent fully covers buffered_gdf."""
-    try:
-        if not metric_path.lower().endswith((".tif", ".tiff")):
-            return False
-        with rasterio.open(metric_path) as src:
-            metric_box = shapely_box(*src.bounds)
-            metric_crs = src.crs
-
-        target_geom = buffered_gdf.to_crs(metric_crs).geometry.union_all()
-        return metric_box.covers(target_geom)
-    except Exception:
-        return False
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -4966,18 +4901,9 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
         st.caption(f"_Discovery took {elapsed:.0f}s._")
 
 
-def _num(x) -> float | None:
-    """``float(x)`` when it is a real number, else ``None``.
-
-    Every reporting block can carry ``NaN`` where a model didn't fit; formatting
-    one prints the literal "nan" into a metric tile, so non-finite values are
-    funnelled to ``None`` and rendered as "—" like any other missing value.
-    """
-    try:
-        fx = float(x)
-    except (TypeError, ValueError):
-        return None
-    return fx if math.isfinite(fx) else None
+# Every reporting block can carry NaN where a model didn't fit; such values
+# render as "—" like any other missing one.
+_num = finite_or_none
 
 
 def _rounded(x, places: int = 4) -> float | None:
@@ -6034,6 +5960,7 @@ def _render_fusion_results_body(output_dir: str) -> None:
 
     # ── Composite map viewer ────────────────────────────────────
     _render_composite_map_viewer(results_view, engine)
+    # TODO: enable once geofuse.cgi_generator.generate is implemented.
     with st.expander("Generate CGI Map", expanded=False):
         st.caption(
             "Planned: this study's CGI over a whole area, computed from its "

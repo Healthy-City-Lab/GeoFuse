@@ -80,35 +80,21 @@ OUTER_COMPARATORS = ("primary", "all")
 #: read (no bootstrap or permutation on the split).
 OUTER_REPORTS = ("full", "decision")
 
-# Slope-type quantities a scale ladder reports at every scale.
-LADDER_QUANTITIES = frozenset(
-    {
-        "held_out_beta",
-        "negative_control_beta",
-        "exposure_beta",
-        "exposure_negative_control_beta",
-        "specificity_difference",
-        "held_out_per_iqr",
-        "held_out_per_p5_p95",
-        "held_out_per_sd0",
-        "exposure_per_iqr",
-        "exposure_per_p5_p95",
-        "exposure_per_sd0",
-        "exposure_negative_control_per_iqr",
-        "exposure_negative_control_per_p5_p95",
-        "exposure_negative_control_per_sd0",
-    }
-)
 
 _ALPHA = 0.05
 
 
-def _f(value) -> float | None:
+def finite_or_none(value) -> float | None:
+    """``float(value)`` when it is a finite number, else ``None`` (so a table
+    prints a blank, not "nan")."""
     try:
         v = float(value)
     except (TypeError, ValueError):
         return None
     return v if np.isfinite(v) else None
+
+
+_f = finite_or_none
 
 
 def _slope_p(slope: dict) -> float | None:

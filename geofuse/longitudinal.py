@@ -44,7 +44,6 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 import geopandas as gpd
-import numpy as np
 import pandas as pd
 
 # Mixed-effects scoring metric names. Kept here (not in the scorer module) so
@@ -642,20 +641,3 @@ def _project_columns(
     return out
 
 
-def channel_files_per_entity(
-    spec: LongitudinalSpec, long_frame: gpd.GeoDataFrame, channel: str
-) -> np.ndarray:
-    """Return an array of length ``len(long_frame)`` giving each row's file path.
-
-    Used by the pre-aggregation cache's wave-aware fingerprinting: the file
-    assigned to ``(channel, row.wave)`` is the source for that row's
-    aggregation. The runner uses this to resolve which channel-fingerprint
-    each cache row belongs to.
-    """
-    if channel not in GREENERY_CHANNELS:
-        raise ValueError(
-            f"Unknown channel {channel!r}; expected one of {GREENERY_CHANNELS}."
-        )
-    per_wave = spec.greenery_files.get(channel, {})
-    waves = long_frame["wave"].astype(str).to_numpy()
-    return np.array([per_wave.get(w, "") for w in waves], dtype=object)

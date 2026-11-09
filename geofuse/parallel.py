@@ -20,8 +20,8 @@ over the same greenery pre-aggregation batches:
 
 Thread sizing (:func:`worker_count`) is deliberately *not* one per core: each
 task is already multi-threaded inside BLAS, so stacking a wide pool on top
-oversubscribes the cores. Measured on the same host, the fast-GLS search
-scorer over 240 trials:
+oversubscribes the cores. Measured on the same host, a threaded GLS scorer
+over 240 tasks:
 
     threads   2      4      8     12     16     23
     speedup  1.74   2.94   3.86   3.43   3.33   3.21

@@ -203,25 +203,6 @@ def _row_tooltip_html(row: pd.Series, fields: list[str], aliases: list[str]) -> 
     return "<br>".join(parts) if parts else ""
 
 
-def add_nonpoint_geojson(
-    m: folium.Map,
-    gdf: gpd.GeoDataFrame,
-    *,
-    style_function: Callable[[dict], Mapping[str, Any]],
-    name: str | None = None,
-    tooltip: folium.GeoJsonTooltip | None = None,
-) -> None:
-    if gdf.empty:
-        return
-    gj = folium.GeoJson(
-        gdf,
-        name=name,
-        style_function=style_function,
-        tooltip=tooltip,
-    )
-    gj.add_to(m)
-
-
 def add_uniform_point_layer(
     m: folium.Map,
     gdf_points: gpd.GeoDataFrame,

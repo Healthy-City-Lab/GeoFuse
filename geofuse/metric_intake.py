@@ -116,8 +116,6 @@ class LongitudinalMetricSources:
     def channels(self) -> list[str]:
         return list(self._paths)
 
-    def keys_for(self, channel: str) -> list[str]:
-        return list(self._paths.get(channel, {}))
 
     def has_channel(self, channel: str) -> bool:
         return channel in self._paths

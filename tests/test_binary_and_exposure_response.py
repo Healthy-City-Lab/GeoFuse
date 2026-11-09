@@ -1,12 +1,9 @@
 """Validation for the binary-outcome scorers and the exposure-response layer.
 
-Three things are asserted, and each is the thing that would actually break:
+Two things are asserted, and each is the thing that would actually break:
 
 * the exact GEE logistic fit reproduces ``statsmodels.GEE`` with the same
   working structure, so the implementation is not merely self-consistent;
-* the fast one-step scorer ranks a trial pool the same way an exact refit does
-  and holds its Type I error, which is the whole basis for using it in the
-  search;
 * the spline non-linearity test does not fire on a genuinely linear
   exposure–response, which a raw (non-orthogonalised) spline basis does.
 """
@@ -19,7 +16,6 @@ import warnings
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import numpy as np
-from scipy.stats import spearmanr
 
 from geofuse import binary_longitudinal as bl
 from geofuse import exposure_response as er
@@ -74,70 +70,6 @@ class TestExactGEE(unittest.TestCase):
         )
         # A continuous outcome is not a binary outcome.
         self.assertEqual(bl.score_gee_logit("gee_logit_tstat", g, g, eid, cov), 0.0)
-
-
-class TestFastOneStep(unittest.TestCase):
-    """The search path must rank like the exact path and stay calibrated."""
-
-    def test_ranks_a_trial_pool_like_exact_refit(self):
-        y, g0, eid, cov = make_panel(n_entities=1500, seed=2, beta_g=0.25)
-        rng = np.random.default_rng(7)
-        trials = [
-            (0.2 + 0.8 * rng.uniform()) * g0
-            + rng.uniform(0, 0.9) * rng.normal(size=len(g0))
-            for _ in range(40)
-        ]
-        baseline = bl.estimate_fold_baseline(y, eid, cov)
-        self.assertIsNotNone(baseline)
-        fast = np.array(
-            [bl.score_gee_logit_fast("gee_logit_tstat", t, baseline) for t in trials]
-        )
-        exact = np.array(
-            [bl.score_gee_logit("gee_logit_tstat", y, t, eid, cov) for t in trials]
-        )
-        self.assertGreater(spearmanr(fast, exact).statistic, 0.99)
-        self.assertLess(float(np.max(np.abs(fast - exact))), 0.25)
-        self.assertEqual(int(np.argmax(fast)), int(np.argmax(exact)))
-
-    def test_coefficient_tracks_exact_refit(self):
-        y, g, eid, cov = make_panel(n_entities=1500, seed=11, beta_g=0.30)
-        baseline = bl.estimate_fold_baseline(y, eid, cov)
-        fast = bl.score_gee_logit_fast("gee_logit_coef", g, baseline)
-        exact = bl.score_gee_logit("gee_logit_coef", y, g, eid, cov)
-        self.assertLess(abs(fast - exact), 0.05)
-
-    def test_type_one_error_under_the_null(self):
-        rejections = 0
-        reps = 200
-        for r in range(reps):
-            y, g, eid, cov = make_panel(n_entities=400, seed=1000 + r, beta_g=0.0)
-            baseline = bl.estimate_fold_baseline(y, eid, cov)
-            if baseline is None:
-                continue
-            if bl.score_gee_logit_fast("gee_logit_tstat", g, baseline) > 1.959964:
-                rejections += 1
-        rate = rejections / reps
-        # Monte-Carlo band for 200 draws at a nominal 0.05.
-        self.assertLess(rate, 0.11, f"Type I error {rate:.3f} is inflated")
-
-    def test_clustering_correction_does_work(self):
-        """A pooled logit on the same panel must reject more often than GEE.
-
-        If it does not, the cluster-robust variance is not being applied and
-        the panel structure is being ignored.
-        """
-        pooled = gee = 0
-        reps = 150
-        for r in range(reps):
-            y, g, eid, cov = make_panel(
-                n_entities=300, seed=4000 + r, beta_g=0.0, re_sd=1.5
-            )
-            baseline = bl.estimate_fold_baseline(y, eid, cov)
-            if baseline is None:
-                continue
-            gee += bl.score_gee_logit_fast("gee_logit_tstat", g, baseline) > 1.959964
-            pooled += osc.score("logit_tstat", y, g, cov) > 1.959964
-        self.assertGreaterEqual(pooled, gee)
 
 
 class TestCrossSectionalLogit(unittest.TestCase):
@@ -338,32 +270,7 @@ class TestEngineRouting(unittest.TestCase):
         direct = bl.score_gee_logit("gee_logit_tstat", y, g, eid, cov)
         self.assertAlmostEqual(routed, direct, places=6)
 
-    def test_fold_baseline_is_built_and_cached(self):
-        y, g, eid, cov = make_panel(n_entities=600, seed=22, beta_g=0.3)
-        engine = self._engine()
-        static = {"target": y, "entity_id": eid, "cov": cov}
-        first = engine._fold_gee_baseline(static)
-        self.assertIsInstance(first, bl.GEEFoldBaseline)
-        # Second call must reuse it — rebuilding per trial would defeat the
-        # entire point of the fast path.
-        self.assertIs(engine._fold_gee_baseline(static), first)
 
-        fast = engine._score_greenery(
-            "gee_logit_tstat",
-            y,
-            g,
-            covariates=cov,
-            entity_id=eid,
-            fast_components=first,
-        )
-        exact = bl.score_gee_logit("gee_logit_tstat", y, g, eid, cov)
-        self.assertLess(abs(fast - exact), 0.3)
-
-    def test_exact_method_declines_the_fold_baseline(self):
-        y, _g, eid, cov = make_panel(n_entities=400, seed=23)
-        engine = self._engine(method="exact")
-        static = {"target": y, "entity_id": eid, "cov": cov}
-        self.assertIsNone(engine._fold_gee_baseline(static))
 
 
 if __name__ == "__main__":
@@ -642,19 +549,6 @@ class TestScaleInvariance(unittest.TestCase):
                 msg=f"|z| moved at scale {scale:g}",
             )
 
-    def test_fast_scorer_is_invariant_to_covariate_units(self):
-        y, g, eid, cov = make_panel(n_entities=800, seed=1, beta_g=0.30)
-        baseline = bl.estimate_fold_baseline(y, eid, cov)
-        base_z = bl.score_gee_logit_fast("gee_logit_tstat", g, baseline)
-        for scale in (1e3, 1e9):
-            rescaled = cov.copy()
-            rescaled[:, 0] *= scale
-            shifted = bl.estimate_fold_baseline(y, eid, rescaled)
-            self.assertAlmostEqual(
-                bl.score_gee_logit_fast("gee_logit_tstat", g, shifted),
-                base_z,
-                places=6,
-            )
 
     def test_cross_sectional_metrics_are_invariant(self):
         """Why normalising the inputs is not required for the OLS-based path."""

@@ -88,7 +88,7 @@ The network is built from this file alone, so GVI needs no other download and ru
 >
 > Your model must satisfy these constraints for GVI to work correctly:
 >
-> 1. **Architecture**: Compatible with the DeepLabV3+ implementation in `geofuse/dl_core/`.
+> 1. **Architecture**: DeepLabV3+ on a ResNet-50, -101 or -152 backbone at output stride 16, saved by the DeepLabV3Plus-Pytorch training code (`geofuse/segmentation_net.py` builds it from the checkpoint).
 > 2. **Classes**: Must output exactly **19 classes** (Cityscapes standard).
 > 3. **Class IDs**: `Vegetation` = **8**, `Terrain` = **9**. Deviating from these IDs will produce incorrect GVI values.
 

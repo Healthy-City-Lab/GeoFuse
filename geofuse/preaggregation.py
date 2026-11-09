@@ -3,8 +3,8 @@
 Before optimization, every sample pixel's metric values are aggregated across
 every buffer radius in the ladder and every aggregation statistic (mean plus a
 compact percentile set) for each channel (``veg``, ``terrain``, ``ndvi``), so
-each Optuna trial reads a stored value instead of recomputing circular-buffer
-aggregations — and the work survives cancels/crashes and is reused by later
+every scored cell is a stored value instead of a circular-buffer
+aggregation — and the work survives cancels/crashes and is reused by later
 runs with the same inputs.
 
 The store is :class:`GreeneryCache`: one compact ``.npz`` per greenery-file set
@@ -882,8 +882,6 @@ class GreeneryCache:
         """Route lookups for ``wave_index`` to the unit ``cfg_key``."""
         self._wave_unit[int(wave_index)] = cfg_key
 
-    def is_resident(self, cfg_key: str) -> bool:
-        return cfg_key in self._units
 
     # ── Reuse / build ───────────────────────────────────────────
     def open_unit(

@@ -27,9 +27,6 @@ DONE = "done"
 FAILED = "failed"
 SKIPPED = "skipped"
 
-# Statuses that mean "no work left for this stage" — both a completed stage and
-# one deliberately skipped (e.g. an unused standalone metric) count as finished.
-_FINISHED = frozenset({DONE, SKIPPED})
 
 
 @dataclass
@@ -122,8 +119,6 @@ class StageLedger:
     def get(self, key: str) -> Stage | None:
         return self._by_key.get(key)
 
-    def all_finished(self) -> bool:
-        return all(s.status in _FINISHED for s in self._stages)
 
     # ────────────────────────────────────────────────────────────
     # Mutations
@@ -170,8 +165,6 @@ class StageLedger:
         # A skipped stage did no work, so it never gets a duration.
         self.set_status(key, SKIPPED, progress=1.0, message=message)
 
-    def mark_failed(self, key: str, message: str = "") -> None:
-        self.set_status(key, FAILED, message=message)
 
     def stop_running(self, status: str = FAILED, message: str = "") -> str | None:
         """Close the clock on whatever stage was still running, and return its key.
@@ -208,18 +201,3 @@ class StageLedger:
             reverse=True,
         )
 
-    def reset_unfinished(self) -> None:
-        """Flip ``running``/``failed`` stages back to ``pending`` for a re-run.
-
-        Finished stages (``done``/``skipped``) keep their state so a resubmitted
-        job picks up after them; an interrupted or failed stage re-executes from
-        the start (its underlying cache resumes mid-way on its own).
-        """
-        for s in self._stages:
-            if s.status in (RUNNING, FAILED):
-                s.status = PENDING
-                # The abandoned attempt's clock would otherwise be charged to
-                # the retry, which restarts the stage from the top.
-                s.started_at = None
-                s.ended_at = None
-                s.progress = 0.0

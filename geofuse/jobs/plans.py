@@ -566,11 +566,6 @@ def _physical_memory() -> int:
     return physical_memory_bytes()
 
 
-#: Cluster resource groups: GVI needs a GPU, fusion cores and memory, the
-#: rest (NDVI downloads, GVI merges) little of either.
-GROUPS = ("gpu", "fusion", "light")
-
-
 def job_group(spec: JobSpec) -> str:
     if spec.kind in ("gvi", "gvi_column"):
         return "gpu"

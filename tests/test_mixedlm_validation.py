@@ -284,47 +284,6 @@ class TestMetricCorrectness(unittest.TestCase):
         for b, val in got.items():
             self.assertGreater(val, 0.0, f"marginal_r2 clamped to zero at b={b}")
 
-    def test_fast_scorer_ranks_like_the_exact_refit(self):
-        from scipy.stats import spearmanr
-
-        d = make_panel(n_entities=500, b_level=0.25, b_cov=(0.8, -0.5, 1.2), seed=3)
-        comp = mes.estimate_fold_components(
-            d["y"],
-            d["X"],
-            d["t"],
-            d["eid"],
-            method="mom_em3",
-            include_time_fixed=True,
-            random_slope=True,
-        )
-        self.assertIsNotNone(comp)
-        rng = np.random.default_rng(0)
-        fast, exact = [], []
-        for k in range(12):
-            alpha = k / 11.0
-            gk = alpha * d["g"] + (1 - alpha) * rng.normal(0, 1, len(d["y"]))
-            fast.append(
-                float(
-                    mes.score_mixedlm_fast(
-                        "mixedlm_tstat",
-                        d["y"],
-                        gk,
-                        d["eid"],
-                        d["t"],
-                        d["X"],
-                        components=comp,
-                    )
-                )
-            )
-            exact.append(
-                float(
-                    mes.score_mixedlm(
-                        "mixedlm_tstat", d["y"], gk, d["eid"], d["t"], d["X"]
-                    )
-                )
-            )
-        self.assertGreater(float(spearmanr(fast, exact).statistic), 0.95)
-        self.assertLess(float(np.max(np.abs(np.array(fast) - np.array(exact)))), 0.5)
 
 
 class TestEstimability(unittest.TestCase):

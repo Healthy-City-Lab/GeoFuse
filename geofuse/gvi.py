@@ -8,7 +8,6 @@ import aiohttp
 import geopandas as gpd
 import numpy as np
 from PIL import Image
-from tqdm import tqdm
 
 from . import streetview as gsv
 from .logger import get_logger
@@ -1339,17 +1338,8 @@ class GVIEngine:
                     f"Pano cache preload failed: {type(e).__name__}: {e}",
                 )
 
-        _progress_cb = progress_callback
-        _close_pbar = False
-        if _progress_cb is None:
-            _pbar = tqdm(total=len(points_to_process), desc="GVI Analysis")
-
-            def _progress_cb(curr, total, _p=_pbar):
-                _p.update(1)
-
-            _close_pbar = True
-        else:
-            _progress_cb(start_index, total_points)
+        if progress_callback is not None:
+            progress_callback(start_index, total_points)
 
         _log("INFO", f"Processing {len(points_to_process)} points...")
 
@@ -1363,7 +1353,7 @@ class GVIEngine:
                 save_panos=save_panos,
                 save_masks=save_masks,
                 pano_cache=pano_cache,
-                progress_callback=_progress_cb,
+                progress_callback=progress_callback,
                 result_callback=result_callback,
                 cancel_callback=cancel_callback,
                 target_year=target_year,
@@ -1382,8 +1372,5 @@ class GVIEngine:
                 ),
             )
         )
-
-        if _close_pbar:
-            _pbar.close()
 
         return gpd.GeoDataFrame()

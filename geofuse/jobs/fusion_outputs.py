@@ -22,6 +22,7 @@ import pandas as pd
 from ..logger import get_logger
 from .outer_splits import (
     distribution_rows,
+    finite_or_none,
     raw_rows,
     spatial_columns,
     spatial_label,
@@ -213,12 +214,7 @@ def _write_fusion_outputs(
     def _path(name: str) -> str:
         return os.path.join(output_dir, name)
 
-    def _f(v: Any) -> float | None:
-        try:
-            fv = float(v)
-            return fv if np.isfinite(fv) else None
-        except (TypeError, ValueError):
-            return None
+    _f = finite_or_none
 
     def _ci(bundle: dict) -> dict:
         return (bundle.get("test_results") or {}).get("test_ci") or {}

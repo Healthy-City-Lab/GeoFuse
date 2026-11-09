@@ -256,6 +256,11 @@ def _spatially_adjusted(engine) -> bool:
     )
 
 
+def _exposure_kind(params: dict) -> str:
+    """``"comparator"`` for a comparator's params, else ``"channel"``."""
+    return "comparator" if "comparator" in params else "channel"
+
+
 def comparator_mode(column: str) -> str:
     """The active-channel name that scores target ``column`` as the exposure.
 
@@ -745,11 +750,7 @@ class MetricFusionEngine:
         self.residualize_spline_min_unique: int = int(residualize_spline_min_unique)
         self.exposure_response_spline_df: int = int(exposure_response_spline_df)
 
-        # Longitudinal search scorer. ``mom_em3`` (default) / ``mom_em1`` /
-        # ``mom`` / ``reml`` estimate the per-fold variance components for the
-        # fast fixed-V GLS trial scorer (see ``mixed_effects_scoring``);
-        # ``exact`` bypasses it and fits a full MixedLM per trial (the original
-        # behaviour). Reports always use the exact MixedLM refit regardless.
+        # Recorded with the job; every MixedLM score is an exact fit.
         self.search_scoring_method: str = str(search_scoring_method)
 
         # Negative-control outcomes: attribute columns carried onto the frame
@@ -864,15 +865,6 @@ class MetricFusionEngine:
         # summed into the phase's achieved-concurrency figure.
         self._objective_secs: list[float] = []
 
-        # Donut / ring cache: per-point annulus samples keyed by fold subset + indices
-        self._ring_raster_cache: dict = {}
-        self._ring_vector_cache: dict = {}
-        self._max_points_ring_cache = 8000
-        # Payload ceiling for one ring-cache entry. The point cap above bounds
-        # rows only; a fine raster under a wide radius stores tens of thousands
-        # of values per row, so the estimated byte size gates the build too.
-        self._max_ring_cache_bytes = 1_000_000_000
-
         # Reporting-phase caches (all invalidated by ``split_data``): the
         # train+val+test union frame is rebuilt by several report helpers,
         # ``apply_fusion`` is called repeatedly with the same winning params,
@@ -889,7 +881,7 @@ class MetricFusionEngine:
         self._pdcor_cache: OrderedDict = OrderedDict()
         self._spline_basis_cache: dict = {}
         # Trial-invariant per-fold data (collapse codes, collapsed target /
-        # covariates / coords, points slices); cleared with the ring caches.
+        # covariates / coords, points slices); cleared with every new split.
         self._fold_static_cache: dict = {}
         # Monotonic counter bumped whenever the live fold row sets are replaced
         # (a fresh split, or each bootstrap resample). Fold-static entries key
@@ -899,10 +891,6 @@ class MetricFusionEngine:
         # realised; ``None`` without spatial blocks.
         self._spatial_split_report: dict | None = None
 
-        # Trial threads for the search. Only the longitudinal
-        # fast-GLS path uses them: the other paths keep LRU scoring caches that
-        # are not thread-safe (see ``_search_n_jobs``).
-        self._search_workers: int = parallel.worker_count()
 
         # Spatial pre-aggregation (mandatory; built by precompute_aggregations()).
         # Backed by an on-disk SQLite cache (geofuse/preaggregation.py) so the
@@ -1383,7 +1371,7 @@ class MetricFusionEngine:
             self._ndvi_export_resolution_m = float(ndvi_resolution_m)
         if gvi_grid_spacing_m is not None:
             self._gvi_grid_spacing_m = float(gvi_grid_spacing_m)
-        self._clear_ring_caches()
+        self._clear_fold_caches()
 
     def load_metrics(
         self,
@@ -1429,7 +1417,7 @@ class MetricFusionEngine:
         self._gvi_grid_spacing_m = (
             float(gvi_grid_spacing_m) if gvi_grid_spacing_m is not None else 75.0
         )
-        self._clear_ring_caches()
+        self._clear_fold_caches()
         # Check for multi-band GVI cache (Band 1=Veg, Band 2=Terrain)
         gvi_multiband_cache = self._get_cache_filename("gvi_combined", ".tif")
 
@@ -2104,93 +2092,11 @@ class MetricFusionEngine:
         logger.info(f"NDVI downloaded: {result['tif']}")
         return result["tif"]
 
-    def _ring_cache_bytes_estimate(
-        self,
-        points_gdf: gpd.GeoDataFrame,
-        metric_data: gpd.GeoDataFrame | dict,
-        max_radius_m: float,
-    ) -> float:
-        """Rough resident size of the ring cache this call would build.
 
-        Rasters: points × disc area ÷ pixel area. Vectors: points × the mean
-        neighbour count of a small sample. Both times 8 bytes per value.
-        """
-        n_pts = len(points_gdf)
-        if n_pts == 0 or max_radius_m <= 0:
-            return 0.0
-        disc_area = np.pi * float(max_radius_m) ** 2
-        try:
-            if isinstance(metric_data, dict):
-                transform = metric_data["transform"]
-                px = abs(float(transform.a))
-                py = abs(float(transform.e))
-                if getattr(metric_data["crs"], "is_geographic", False):
-                    # Degree pixels: convert with the local metre-per-degree
-                    # scale so the estimate is not off by ~10^5.
-                    lat = float(
-                        np.mean(
-                            self.buffered_extent.to_crs("EPSG:4326")
-                            .geometry.iloc[0]
-                            .bounds[1::2]
-                        )
-                        if self.buffered_extent is not None
-                        else 0.0
-                    )
-                    m_lon, m_lat = metres_per_degree_at_lat(lat)
-                    px *= m_lon
-                    py *= m_lat
-                pixel_area = max(px * py, 1e-9)
-                per_point = disc_area / pixel_area
-            else:
-                if len(metric_data) == 0:
-                    return 0.0
-                # Feature density from the extent's bounding box — cheap and
-                # good enough to separate "fits easily" from "many GB".
-                minx, miny, maxx, maxy = (float(v) for v in metric_data.total_bounds)
-                span_x = max(maxx - minx, 1e-9)
-                span_y = max(maxy - miny, 1e-9)
-                if getattr(metric_data.crs, "is_geographic", False):
-                    m_lon, m_lat = metres_per_degree_at_lat((miny + maxy) / 2.0)
-                    span_x *= m_lon
-                    span_y *= m_lat
-                density = len(metric_data) / max(span_x * span_y, 1.0)
-                per_point = disc_area * density
-        except Exception:
-            return 0.0
-        return float(n_pts) * float(per_point) * 8.0
-
-    def _search_n_jobs(self, metric: str) -> int:
-        """Thread count for ``study.optimize``.
-
-        Every metric runs its trials in parallel. All trials of a bootstrap
-        share one fold, so the per-fold state they touch — fold statics, the
-        pre-aggregation lookup plan, ring caches, fast components — takes
-        idempotent writes: two threads may build the same entry, but neither
-        can observe a wrong one. The two scoring caches that were *not* safe
-        (:mod:`geofuse.pdcor`'s side cache and the spline-basis cache) evicted
-        by walking their own iterator while another thread inserted; both now
-        guard that bookkeeping with a lock and keep the expensive build outside
-        it, which is what lifted the restriction to the fast-GLS metrics.
-
-        An exact ``statsmodels`` MixedLM refit stays the exception: it is
-        dominated by Python-level optimiser work holding the GIL, and threading
-        it measured 0.62x of serial, so it is left alone.
-        """
-        exact_refit = (
-            self.is_longitudinal
-            and metric not in mixed_effects_scoring.FAST_SEARCH_METRICS
-            and metric in mixed_effects_scoring.MIXEDLM_METRICS
-        )
-        if exact_refit:
-            return 1
-        return max(1, int(self._search_workers))
-
-    def _clear_ring_caches(self) -> None:
-        self._ring_raster_cache.clear()
-        self._ring_vector_cache.clear()
+    def _clear_fold_caches(self) -> None:
         # Fold-static data (collapse codes, collapsed target/covariates,
-        # points slices) shares the ring caches' lifecycle: both key off the
-        # live fold row sets, which change with every bootstrap resample.
+        # points slices) keys off the live fold row sets, which change with
+        # every bootstrap resample.
         self._fold_static_cache.clear()
 
     def _clear_scoring_caches(self) -> None:
@@ -2218,10 +2124,8 @@ class MetricFusionEngine:
             return f"log ({len(self._ladder(channel))} rungs)"
         return f"linear (step {getattr(self, f'{channel}_buffer_step_m'):g} m)"
 
-    def _outer_radii_metres(self, *, gvi: bool) -> np.ndarray:
-        return np.asarray(self._ladder("gvi" if gvi else "ndvi"), dtype=np.int64)
 
-    def _aggregate_with_ring_cache(
+    def _cached_channel_values(
         self,
         points_gdf: gpd.GeoDataFrame,
         metric_data: gpd.GeoDataFrame | dict,
@@ -2230,18 +2134,13 @@ class MetricFusionEngine:
         percentile: int,
         *,
         channel: str,
-        fold_idx: int | None,
-        subset: str | None,
     ) -> np.ndarray:
-        """
-        Circular neighbourhood aggregation using precomputed annuli when possible.
+        """A channel's neighbourhood values for ``points_gdf``, read from the
+        pre-aggregation cache.
 
-        When ``precompute_aggregations()`` has populated the pre-aggregation
-        table and the trial's (radius, stat, percentile) maps to a cell, the
-        call becomes a vectorised ``numpy.take`` and returns immediately.
-
-        Otherwise falls back to the ring cache (or the direct circular buffer
-        path) — same behaviour as before.
+        Every scored (radius, stat, percentile) cell is on the cache's ladder,
+        so a miss means a radius or statistic the cache was not built for,
+        and raises rather than reducing a different metric.
         """
         # ── Fast path: pre-aggregation lookup table ─────────
         if getattr(self, "_preaggregation_done", False):
@@ -2280,95 +2179,17 @@ class MetricFusionEngine:
             if looked_up is not None:
                 return looked_up
 
-        # A channel with no source layer is served only from the cache, so a
-        # miss cannot be recovered by aggregating — there is nothing to
-        # aggregate. Falling through would silently reduce the wrong metric.
         if metric_data is None:
             raise RuntimeError(
                 f"Channel {channel!r} is stored in the pre-aggregation cache "
                 f"and has no source layer, but radius {radius_m} with "
                 f"stat={stat!r} percentile={percentile!r} is not in the cache."
             )
-
-        # Fell through the fast path (or pre-aggregation off): the ring-cache and
-        # circular-buffer routines need geometry, so re-materialize it if a
-        # geometry-free slice was passed in (see the fast path in ``_objective``).
-        if not isinstance(points_gdf, gpd.GeoDataFrame):
-            points_gdf = self.target_gdf.loc[points_gdf.index]
-
-        if (
-            fold_idx is None
-            or subset is None
-            or len(points_gdf) > self._max_points_ring_cache
-        ):
-            return _helpers.apply_circular_buffer_aggregation(
-                points_gdf, metric_data, radius_m, stat, percentile
-            )
-
-        gvi = channel in ("veg", "terrain")
-        radii = self._outer_radii_metres(gvi=gvi)
-        if radii.size == 0:
-            return _helpers.apply_circular_buffer_aggregation(
-                points_gdf, metric_data, radius_m, stat, percentile
-            )
-
-        # A ring cache holds every raw metric value inside the largest radius
-        # for every point, so the row count alone does not bound it: a fine
-        # raster under a wide radius is tens of thousands of values per point.
-        # Estimate the payload and take the direct path when it would not fit.
-        if self._ring_cache_bytes_estimate(
-            points_gdf, metric_data, float(radii[-1])
-        ) > (self._max_ring_cache_bytes):
-            return _helpers.apply_circular_buffer_aggregation(
-                points_gdf, metric_data, radius_m, stat, percentile
-            )
-
-        cache_store = (
-            self._ring_raster_cache
-            if isinstance(metric_data, dict)
-            else self._ring_vector_cache
+        raise RuntimeError(
+            f"Radius {radius_m} with stat={stat!r} percentile={percentile!r} of "
+            f"channel {channel!r} is not in the pre-aggregation cache; its "
+            "ladders and statistics are the ones the job set."
         )
-        key = metric_sampling.ring_cache_key(
-            channel, fold_idx, subset, points_gdf, radii
-        )
-
-        if key not in cache_store:
-            try:
-                if isinstance(metric_data, dict):
-                    rows = metric_sampling.precompute_raster_ring_values(
-                        metric_data, points_gdf, radii
-                    )
-                else:
-                    col = metric_sampling.vector_metric_column(metric_data, channel)
-                    rows = metric_sampling.precompute_vector_ring_values(
-                        metric_data, points_gdf, radii, col
-                    )
-                prefix = metric_sampling.ring_prefix_stats(rows)
-                cache_store[key] = (radii, rows, prefix, {})
-                logger.info(
-                    f"Ring cache built: channel={channel} subset={subset} fold={fold_idx} "
-                    f"points={len(points_gdf)} rings={len(radii)}"
-                )
-            except Exception as e:
-                logger.warning(f"Ring cache build failed ({channel}): {e}")
-                return _helpers.apply_circular_buffer_aggregation(
-                    points_gdf, metric_data, radius_m, stat, percentile
-                )
-
-        _, rows, prefix, memo = cache_store[key]
-        # Result memo: trials repeat the same (radius, stat, percentile) cells
-        # constantly, and the grid is small (n_radii × mean/median/deciles) —
-        # so the per-point percentile reduce runs once per distinct cell.
-        end_idx = metric_sampling.ring_end_index(radii, radius_m)
-        memo_key = (end_idx, stat, int(percentile) if stat == "percentile" else 0)
-        hit = memo.get(memo_key)
-        if hit is not None:
-            return hit
-        out = metric_sampling.aggregate_from_ring_cache(
-            radii, rows, radius_m, stat, percentile, prefix=prefix
-        )
-        memo[memo_key] = out
-        return out
 
     def _aggregate_channel_for_fold(
         self,
@@ -2379,8 +2200,6 @@ class MetricFusionEngine:
         percentile: int,
         *,
         channel: str,
-        fold_idx: int | None,
-        subset: str | None,
     ) -> tuple[np.ndarray, bool]:
         """Channel values for one scored fold, plus whether they are deduplicated.
 
@@ -2408,15 +2227,13 @@ class MetricFusionEngine:
                     if looked_up is not None:
                         return looked_up, True
         return (
-            self._aggregate_with_ring_cache(
+            self._cached_channel_values(
                 static["points"],
                 metric_data,
                 radius_m,
                 stat,
                 percentile,
                 channel=channel,
-                fold_idx=fold_idx,
-                subset=subset,
             ),
             False,
         )
@@ -2556,8 +2373,6 @@ class MetricFusionEngine:
         points_gdf,
         params: dict,
         *,
-        subset: str,
-        fold_idx: int = -1,
         channels: tuple[str, ...] | None = None,
     ) -> dict[str, np.ndarray]:
         """``{channel: aggregated values}`` at ``params`` for the rows given.
@@ -2583,15 +2398,13 @@ class MetricFusionEngine:
                 out[ch] = np.zeros(len(points_gdf), dtype=np.float32)
                 continue
             radius, stat, pct = self._channel_spec(params, ch)
-            out[ch] = self._aggregate_with_ring_cache(
+            out[ch] = self._cached_channel_values(
                 points_gdf,
                 self._channel_source(ch),
                 radius,
                 stat,
                 pct,
                 channel=ch,
-                fold_idx=fold_idx,
-                subset=subset,
             )
         return out
 
@@ -2643,7 +2456,7 @@ class MetricFusionEngine:
             sample = np.ascontiguousarray(data[::17, ::17]).tobytes()
             digest = hashlib.sha256(sample).hexdigest()[:16]
             return f"ras:{data.shape}:{tuple(metric['bounds'])}:{data.dtype}:{digest}"
-        col = _helpers.metric_value_column(metric, channel)
+        col = metric_sampling.vector_metric_column(metric, channel)
         vals = np.ascontiguousarray(metric[col].to_numpy(dtype=np.float64))
         digest = hashlib.sha256(vals.tobytes()).hexdigest()[:16]
         return f"vec:{len(metric)}:{tuple(metric.total_bounds)}:{col}:{digest}"
@@ -3049,7 +2862,7 @@ class MetricFusionEngine:
         """
         if isinstance(src, dict):  # raster source
             return ("raster", src["data"], src["transform"], src["crs"])
-        col = _helpers.metric_value_column(src, channel)
+        col = metric_sampling.vector_metric_column(src, channel)
         metric = src.to_crs(utm_crs)
         metric = metric[metric[col].notna()]
         if not all_points:
@@ -4569,7 +4382,7 @@ class MetricFusionEngine:
                         else ("percentile", int(column[1:]))
                     )
                     vals, on_uniq = self._channel_values_for_static(
-                        static, ch, radius, stat, pct, subset
+                        static, ch, radius, stat, pct
                     )
                     if vals is None:
                         continue
@@ -4630,7 +4443,7 @@ class MetricFusionEngine:
                         else ("percentile", int(column[1:]))
                     )
                     vals, on_uniq = self._channel_values_for_static(
-                        static, ch, radius, stat, pct, "train_val"
+                        static, ch, radius, stat, pct
                     )
                     if vals is None:
                         continue
@@ -4653,7 +4466,7 @@ class MetricFusionEngine:
             channels=channel_index,
         )
 
-    def _channel_values_for_static(self, static, channel, radius, stat, pct, subset):
+    def _channel_values_for_static(self, static, channel, radius, stat, pct):
         """One (channel, radius, stat) column for a prepared fold, cache first.
 
         ``gvi`` has no source layer of its own — it is a stored cache channel —
@@ -4685,8 +4498,6 @@ class MetricFusionEngine:
             stat,
             pct if pct is not None else 50,
             channel=channel,
-            fold_idx=None,
-            subset=subset,
         )
 
     def _cache_channels(self) -> tuple[str, ...]:
@@ -5063,8 +4874,8 @@ class MetricFusionEngine:
         entity's first-occurrence row (target / covariates / coords /
         longitudinal keys are per-entity constants broadcast to pixels, so a
         "first" collapse is a plain row-take), and the points slice the
-        aggregation path consumes. Cached on ``_fold_static_cache`` and
-        cleared with the ring caches — both key off the live fold row sets.
+        aggregation path consumes. Cached on ``_fold_static_cache``, which
+        keys off the live fold row sets.
         """
         key = (self._split_generation, fold_idx, subset, len(data))
         st = self._fold_static_cache.get(key)
@@ -6498,63 +6309,7 @@ class MetricFusionEngine:
             return True
         return self.is_longitudinal and metric in mixed_effects_scoring.HAS_PVALUE
 
-    def _fold_fast_components(self, static: dict):
-        """Per-fold ``(D, σ²)`` for the fast search scorer, cached on the static.
 
-        Returns ``None`` (caller uses the exact per-trial fit) when the engine
-        is not longitudinal, a spatial smooth is active, the fold lacks entity /
-        time keys, or estimation fails. Computed once per fold subset and reused
-        by every trial of that fold — the whole point of the fast path.
-        """
-        if "fast_components" in static:
-            return static["fast_components"]
-        comp = None
-        spec = self.longitudinal_spec
-        if (
-            self.is_longitudinal
-            and spec is not None
-            and self.search_scoring_method
-            in mixed_effects_scoring.FAST_COMPONENT_METHODS
-            and self.spatial_adjust_method == "none"
-            and static.get("entity_id") is not None
-            and static.get("ysb") is not None
-        ):
-            comp = mixed_effects_scoring.estimate_fold_components(
-                static["target"],
-                static.get("cov"),
-                static["ysb"],
-                static["entity_id"],
-                method=self.search_scoring_method,
-                include_time_fixed=self._effective_time_fixed(spec),
-                random_slope=spec.random_slope_time,
-                target=spec.association_target,
-            )
-        static["fast_components"] = comp
-        return comp
-
-    def _fold_gee_baseline(self, static: dict):
-        """Per-fold covariates-only GEE fit for the fast binary panel scorer.
-
-        The binary analogue of :meth:`_fold_fast_components`: the null model's
-        fitted probabilities, working weights and exchangeable correlation are
-        properties of the outcome and covariates, so they are estimated once per
-        fold and every trial takes one Newton step from them. ``None`` sends the
-        caller to the exact per-trial GEE fit.
-        """
-        if "gee_baseline" in static:
-            return static["gee_baseline"]
-        baseline = None
-        if (
-            self.is_longitudinal
-            and self.search_scoring_method != "exact"
-            and self.spatial_adjust_method == "none"
-            and static.get("entity_id") is not None
-        ):
-            baseline = binary_longitudinal.estimate_fold_baseline(
-                static["target"], static["entity_id"], static.get("cov")
-            )
-        static["gee_baseline"] = baseline
-        return baseline
 
     def _score_greenery(
         self,
@@ -6569,7 +6324,6 @@ class MetricFusionEngine:
         return_pvalue: bool = False,
         return_all: bool = False,
         nan_on_fail: bool = False,
-        fast_components: "tuple[np.ndarray, float] | object | None" = None,
     ):
         """Single scoring seam: MixedLM (longitudinal) or OLS (cross-sectional).
 
@@ -6595,20 +6349,7 @@ class MetricFusionEngine:
         """
         if self.is_longitudinal and metric in longitudinal.GEE_LOGIT_METRICS:
             # Binary outcome on a panel: GEE with an exchangeable working
-            # correlation clustered on the entity. ``fast_components`` carries a
-            # GEEFoldBaseline here (the search path); its absence, or an exact
-            # reporting call, takes the full refit.
-            if (
-                isinstance(fast_components, binary_longitudinal.GEEFoldBaseline)
-                and not return_all
-            ):
-                return binary_longitudinal.score_gee_logit_fast(
-                    metric,
-                    composite,
-                    fast_components,
-                    return_all=return_all,
-                    return_pvalue=return_pvalue,
-                )
+            # correlation clustered on the entity.
             return binary_longitudinal.score_gee_logit(
                 metric,
                 target,
@@ -6622,30 +6363,6 @@ class MetricFusionEngine:
         if self.is_longitudinal and metric in mixed_effects_scoring.MIXEDLM_METRICS:
             spec = self.longitudinal_spec
             assert spec is not None  # guaranteed by is_longitudinal
-            # Fast fixed-V GLS path for the trial search: reuse the per-fold
-            # variance components, one GLS per trial instead of a MixedLM fit.
-            # Only for the ranking metrics, with no spatial smooth, and never
-            # for the exact reporting calls (return_all / no components).
-            if (
-                fast_components is not None
-                and not return_all
-                and metric in mixed_effects_scoring.FAST_SEARCH_METRICS
-                and self.spatial_adjust_method == "none"
-            ):
-                return mixed_effects_scoring.score_mixedlm_fast(
-                    metric,
-                    target,
-                    composite,
-                    entity_id=entity_id,
-                    years_since_baseline=years_since_baseline,
-                    covariates=covariates,
-                    components=fast_components,
-                    include_time_fixed=self._effective_time_fixed(spec),
-                    random_slope=spec.random_slope_time,
-                    return_pvalue=return_pvalue,
-                    nan_on_fail=nan_on_fail,
-                    target=spec.association_target,
-                )
             return mixed_effects_scoring.score_mixedlm(
                 metric,
                 target,
@@ -6744,12 +6461,11 @@ class MetricFusionEngine:
 
         logger.info("Evaluating on held-out test set...")
 
-        # Apply dynamic circular buffer aggregation over this job's own channel
-        # set. Both points and rasters use the same approach (rasters converted
-        # to points).
+        # Read each channel's neighbourhood values over this job's own channel
+        # set from the pre-aggregation cache (rasters are converted to points).
         # .loc with an index array materialises a new frame; read-only below.
         test_points = self.target_gdf.loc[self.test_data.index]
-        test_blocks = self._aggregate_channels(test_points, params, subset="test")
+        test_blocks = self._aggregate_channels(test_points, params)
 
         test_combined = np.column_stack(list(test_blocks.values()))
         test_valid_mask = ~np.isnan(test_combined).any(axis=1)
@@ -6916,15 +6632,13 @@ class MetricFusionEngine:
         blocks: dict[str, np.ndarray] = {}
         for ch in channels:
             radius, stat, pct = self._channel_spec(params, ch)
-            blocks[ch] = self._aggregate_with_ring_cache(
+            blocks[ch] = self._cached_channel_values(
                 points,
                 self._channel_source(ch),
                 radius,
                 stat,
                 pct,
                 channel=ch,
-                fold_idx=None,
-                subset=None,
             )
 
         cov_cols = self.covariate_columns
@@ -7197,10 +6911,10 @@ class MetricFusionEngine:
         # .loc with an index array materialises a new frame; read-only below.
         all_points = self.target_gdf.loc[all_data.index]
 
-        # Apply circular buffer aggregation with optimized parameters, over the
+        # Read the channels at the optimized parameters, over the
         # job's own channel set — the same fork evaluate_on_test uses, so the
         # applied composite and the held-out score agree.
-        all_blocks = self._aggregate_channels(all_points, weights, subset="all")
+        all_blocks = self._aggregate_channels(all_points, weights)
 
         composite = self._composite_from(weights, all_blocks)
 
@@ -9417,6 +9131,37 @@ class MetricFusionEngine:
             )
         return out
 
+    def _applied_exposures(
+        self, df: pd.DataFrame, exposures: "dict | None", label: str
+    ) -> dict[str, np.ndarray]:
+        """``{name: values}`` of each exposure (``{name: (active channel,
+        params)}``) applied and aligned to the rows of ``df``, an
+        ``apply_fusion`` frame of the CGI. One that fails to apply is logged
+        under ``label`` and left out; the CGI's channel is active afterwards.
+        """
+        keys = df["polygon_id"].to_numpy() if "polygon_id" in df.columns else None
+        out: dict[str, np.ndarray] = {}
+        for name, (channel, params) in (exposures or {}).items():
+            try:
+                self._active_greenery_channel = channel
+                other = self.apply_fusion(weights=dict(params))
+            except JobCancelled:
+                raise
+            except Exception as exc:
+                _log("WARN", f"{label}: '{name}' not applied: {exc}")
+                continue
+            values = other["composite"].to_numpy(dtype=np.float64)
+            if keys is not None and "polygon_id" in other.columns:
+                values = (
+                    pd.Series(values, index=other["polygon_id"].to_numpy())
+                    .reindex(keys)
+                    .to_numpy(dtype=np.float64)
+                )
+            if len(values) == len(df):
+                out[name] = values
+        self._active_greenery_channel = "cgi"
+        return out
+
     def compute_specificity_contrast(
         self,
         cgi_params: dict,
@@ -9462,7 +9207,6 @@ class MetricFusionEngine:
             self._active_greenery_channel = "cgi"
             df = self.apply_fusion(weights=dict(cgi_params))
             x_cgi = df["composite"].to_numpy(dtype=np.float64)
-            keys = df["polygon_id"].to_numpy() if "polygon_id" in df.columns else None
             target = df["target"].to_numpy(dtype=np.float64)
             cov = self._reporting_covariate_matrix(df)
             clusters = self._reporting_clusters(df, cluster_column)
@@ -9472,25 +9216,7 @@ class MetricFusionEngine:
                 values = self._reporting_raw_column(df, name)
                 if values is not None:
                     controls[name] = values
-            xs: dict[str, np.ndarray] = {}
-            for name, (channel, params) in exposures.items():
-                try:
-                    self._active_greenery_channel = channel
-                    other = self.apply_fusion(weights=dict(params))
-                except JobCancelled:
-                    raise
-                except Exception as exc:
-                    _log("WARN", f"Specificity contrast: '{name}' not applied: {exc}")
-                    continue
-                values = other["composite"].to_numpy(dtype=np.float64)
-                if keys is not None and "polygon_id" in other.columns:
-                    values = (
-                        pd.Series(values, index=other["polygon_id"].to_numpy())
-                        .reindex(keys)
-                        .to_numpy(dtype=np.float64)
-                    )
-                if len(values) == len(x_cgi):
-                    xs[name] = values
+            xs = self._applied_exposures(df, exposures, "Specificity contrast")
         finally:
             self._active_greenery_channel = prev
 
@@ -9625,30 +9351,12 @@ class MetricFusionEngine:
             self._active_greenery_channel = "cgi"
             df = self.apply_fusion(weights=dict(cgi_params))
             layer_names = [c for c in self._composite_channels() if c in df.columns]
-            keys = df["polygon_id"].to_numpy() if "polygon_id" in df.columns else None
             xs: dict[str, tuple[str, np.ndarray]] = {
                 "cgi": ("cgi", df["composite"].to_numpy(dtype=np.float64))
             }
-            for name, (channel, params) in (exposures or {}).items():
-                try:
-                    self._active_greenery_channel = channel
-                    other = self.apply_fusion(weights=dict(params))
-                except JobCancelled:
-                    raise
-                except Exception as exc:
-                    _log("WARN", f"Raw-unit effects: '{name}' not applied: {exc}")
-                    continue
-                values = other["composite"].to_numpy(dtype=np.float64)
-                if keys is not None and "polygon_id" in other.columns:
-                    values = (
-                        pd.Series(values, index=other["polygon_id"].to_numpy())
-                        .reindex(keys)
-                        .to_numpy(dtype=np.float64)
-                    )
-                if len(values) == len(df):
-                    kind = "comparator" if "comparator" in params else "channel"
-                    xs[name] = (kind, values)
-            self._active_greenery_channel = "cgi"
+            applied = self._applied_exposures(df, exposures, "Raw-unit effects")
+            for name, values in applied.items():
+                xs[name] = (_exposure_kind(exposures[name][1]), values)
             target = df["target"].to_numpy(dtype=np.float64)
             cov = self._reporting_covariate_matrix(df)
             test = self._test_entity_mask(df)
@@ -9757,31 +9465,14 @@ class MetricFusionEngine:
         try:
             self._active_greenery_channel = "cgi"
             df = self.apply_fusion(weights=dict(cgi_params))
-            keys = df["polygon_id"].to_numpy() if "polygon_id" in df.columns else None
             xs: dict[str, np.ndarray] = {
-                "cgi": df["composite"].to_numpy(dtype=np.float64)
+                "cgi": df["composite"].to_numpy(dtype=np.float64),
+                **self._applied_exposures(df, exposures, "Weighted report"),
             }
             kinds = {"cgi": "cgi"}
-            for name, (ch, params) in (exposures or {}).items():
-                try:
-                    self._active_greenery_channel = ch
-                    other = self.apply_fusion(weights=dict(params))
-                except JobCancelled:
-                    raise
-                except Exception as exc:
-                    _log("WARN", f"Weighted report: '{name}' not applied: {exc}")
-                    continue
-                values = other["composite"].to_numpy(dtype=np.float64)
-                if keys is not None and "polygon_id" in other.columns:
-                    values = (
-                        pd.Series(values, index=other["polygon_id"].to_numpy())
-                        .reindex(keys)
-                        .to_numpy(dtype=np.float64)
-                    )
-                if len(values) == len(df):
-                    xs[name] = values
-                    kinds[name] = "comparator" if "comparator" in params else "channel"
-            self._active_greenery_channel = "cgi"
+            for name in xs:
+                if name != "cgi":
+                    kinds[name] = _exposure_kind(exposures[name][1])
             target = df["target"].to_numpy(dtype=np.float64)
             cov = self._reporting_covariate_matrix(df)
             test = self._test_entity_mask(df)
@@ -10231,15 +9922,13 @@ class MetricFusionEngine:
         for n, ch in enumerate(channels):
             logger.info(f"Sampling {ch} at grid points...")
             radius, stat, pct = self._channel_spec(final_params, ch)
-            blocks[ch] = self._aggregate_with_ring_cache(
+            blocks[ch] = self._cached_channel_values(
                 points_gdf,
                 self._channel_source(ch),
                 radius,
                 stat,
                 pct,
                 channel=ch,
-                fold_idx=-1,
-                subset="robust_map",
             )
             if progress_callback:
                 progress_callback(40 + int(45 * (n + 1) / len(channels)), 100)

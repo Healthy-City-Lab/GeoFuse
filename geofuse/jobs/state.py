@@ -313,8 +313,6 @@ class StateDir:
     def write_run(self, run_id: str, record: dict) -> None:
         write_json(self.runs_dir / f"{run_id}.json", record)
 
-    def read_run(self, run_id: str) -> dict | None:
-        return read_json(self.runs_dir / f"{run_id}.json")
 
     # ── Supervisors ─────────────────────────────────────────────
 

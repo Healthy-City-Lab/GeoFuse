@@ -18,9 +18,8 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import rasterio
-from rasterio.transform import rowcol
 
-from . import metric_intake, metric_sampling, parallel, preaggregation
+from . import metric_intake, parallel, preaggregation
 from .crs_utils import (
     crs_uses_metre_axes,
     estimate_metre_projected_crs_for_gdf,
@@ -32,212 +31,6 @@ from .raster_sampling import LAZY_RASTER_THRESHOLD_BYTES, LazyRasterArray
 from .vector_io import read_vector_aliased_column
 
 logger = get_logger("FUSION")
-
-
-def apply_circular_buffer_aggregation(
-    points_gdf: gpd.GeoDataFrame,
-    metric_data: gpd.GeoDataFrame | dict,
-    radius_meters: float,
-    stat: str,
-    percentile: int = 50,
-) -> np.ndarray:
-    """
-    Apply circular buffer aggregation to sample metric at point locations.
-
-    This matches CGI.ipynb calculate_gm() logic:
-    - Creates circular buffer around each point
-    - Samples all metric values within buffer
-    - Aggregates using specified statistic (mean/median/percentile)
-
-    Args:
-        points_gdf: GeoDataFrame with point geometries
-        metric_data: Raster dict or vector GeoDataFrame to sample from
-        radius_meters: Buffer radius in meters
-        stat: Aggregation function ('mean', 'median', 'percentile')
-        percentile: Percentile value if stat='percentile'
-
-    Returns:
-        Array of aggregated metric values for each point
-    """
-    result = np.full(len(points_gdf), np.nan)
-
-    # Create mapping from original index to position for correct array indexing
-    idx_to_pos = {idx: pos for pos, idx in enumerate(points_gdf.index)}
-
-    if isinstance(metric_data, dict):  # Raster
-        metric_array = metric_data["data"]
-        transform = metric_data["transform"]
-        metric_crs = metric_data["crs"]
-
-        # Same footprint the pre-aggregation cache reduces over: buffer the
-        # entity in a projected (metres) CRS and reproject the buffer into
-        # the raster's CRS, so the sampled disc is metrically true whatever
-        # the raster's CRS.
-        from rasterio.windows import Window as _Window
-        from rasterio.windows import transform as _window_transform
-
-        if points_gdf.crs is not None and crs_uses_metre_axes(points_gdf.crs):
-            buffer_crs = points_gdf.crs
-        else:
-            buffer_crs = estimate_metre_projected_crs_for_gdf(points_gdf)
-        pts_buf_crs = points_gdf.to_crs(buffer_crs)
-        if str(buffer_crs) != str(metric_crs):
-            from pyproj import Transformer as _Transformer
-
-            xy_fn = _Transformer.from_crs(
-                buffer_crs, metric_crs, always_xy=True
-            ).transform
-        else:
-            xy_fn = None
-
-        templates = preaggregation.origin_circle_templates([float(radius_meters)])
-        h, w = int(metric_array.shape[0]), int(metric_array.shape[1])
-        for idx, geom in zip(
-            pts_buf_crs.index, pts_buf_crs.geometry.to_numpy(), strict=True
-        ):
-            if geom is None or geom.is_empty:
-                continue
-            disc = preaggregation.reproject_geoms(
-                [preaggregation.buffer_at(geom, float(radius_meters), templates)],
-                xy_fn,
-            )[0]
-            if disc is None or disc.is_empty:
-                continue
-            minx, miny, maxx, maxy = disc.bounds
-            r1, c1 = rowcol(transform, minx, maxy)
-            r2, c2 = rowcol(transform, maxx, miny)
-            rmin = max(0, min(int(r1), int(r2)))
-            rmax = min(h, max(int(r1), int(r2)) + 1)
-            cmin = max(0, min(int(c1), int(c2)))
-            cmax = min(w, max(int(c1), int(c2)) + 1)
-            if rmin >= rmax or cmin >= cmax:
-                continue
-
-            window = metric_array[rmin:rmax, cmin:cmax]
-            data = np.asarray(np.ma.getdata(window), dtype=np.float64)
-            base_valid = ~np.ma.getmaskarray(window) & ~np.isnan(data)
-            if not base_valid.any():
-                continue
-            win_transform = _window_transform(
-                _Window(cmin, rmin, cmax - cmin, rmax - rmin), transform
-            )
-            ring = preaggregation.ring_index_grid([disc], window.shape, win_transform)
-            if ring is None:
-                continue
-            values = data[base_valid & (ring == 0)]
-
-            if len(values) > 0:
-                pos = idx_to_pos[idx]
-                if stat == "mean":
-                    result[pos] = np.mean(values)
-                elif stat == "median":
-                    result[pos] = np.median(values)
-                elif stat == "percentile":
-                    result[pos] = np.percentile(values, percentile)
-
-    else:  # Vector GeoDataFrame
-        # For vector data, use spatial join with buffered points
-        # Convert both to a common metric CRS for accurate buffering
-
-        # Determine appropriate UTM zone from point data
-        # Convert to WGS84 first to get proper geographic coordinates (lon/lat in degrees)
-        points_wgs84 = points_gdf.to_crs("EPSG:4326")
-        centroid = points_wgs84.geometry.union_all().centroid
-        lon = centroid.x
-        lat = centroid.y
-
-        # Validate we actually have geographic coordinates (lon should be -180 to 180)
-        if not (-180 <= lon <= 180):
-            raise ValueError(
-                f"Invalid longitude {lon} after WGS84 conversion. "
-                f"Input CRS was {points_gdf.crs}, conversion may have failed."
-            )
-
-        # Calculate UTM zone from geographic coordinates
-        utm_zone = int((lon + 180) / 6) + 1
-        # Determine hemisphere
-        if lat >= 0:
-            utm_crs = f"EPSG:326{utm_zone:02d}"  # Northern hemisphere
-        else:
-            utm_crs = f"EPSG:327{utm_zone:02d}"  # Southern hemisphere
-
-        # Convert to UTM for buffering
-        points_utm = points_gdf.to_crs(utm_crs)
-        metric_utm = metric_data.to_crs(utm_crs)
-
-        # Create buffers in UTM (meters)
-        points_buffered = points_utm.copy()
-        points_buffered["geometry"] = points_utm.buffer(radius_meters)
-
-        # Spatial join to find metrics within buffers
-        joined = gpd.sjoin(
-            points_buffered, metric_utm, how="left", predicate="intersects"
-        )
-
-        # Detect metric column
-        metric_col = metric_data.attrs.get("metric_column")
-        if metric_col is None or metric_col not in metric_data.columns:
-            numeric_cols = metric_data.select_dtypes(
-                include=[np.number]
-            ).columns.tolist()
-            # Filter out geometry-related columns
-            numeric_cols = [
-                c
-                for c in numeric_cols
-                if c not in ["index_right", "index_left", "index"]
-            ]
-            if numeric_cols:
-                metric_col = numeric_cols[0]
-            else:
-                logger(
-                    "WARN",
-                    f"No numeric columns found in metric data. Columns: {metric_data.columns.tolist()}",
-                )
-                return result  # Return all NaN
-
-        logger(
-            "INFO",
-            f"Buffer aggregation using column '{metric_col}' from {metric_data.columns.tolist()}, radius={radius_meters}m, stat={stat}",
-        )
-
-        # Check if any data was joined
-        non_null_joins = (
-            joined[metric_col].notna().sum() if metric_col in joined.columns else 0
-        )
-        logger(
-            "INFO",
-            f"Spatial join: {len(joined)} total rows, {non_null_joins} with valid metric values",
-        )
-
-        logger(
-            "INFO",
-            f"Using metric column: {metric_col} from {metric_data.columns.tolist()}",
-        )
-        logger("INFO", f"Joined shape: {joined.shape}, Points shape: {len(points_gdf)}")
-
-        # Aggregate by original point index — one vectorized groupby over the
-        # joined frame instead of a per-point boolean scan (which was O(n²)).
-        if metric_col in joined.columns:
-            grouped = joined[metric_col].dropna().groupby(level=0)
-            if stat == "median":
-                agg = grouped.median()
-            elif stat == "percentile":
-                agg = grouped.quantile(percentile / 100.0)
-            else:
-                agg = grouped.mean()
-            for idx, val in agg.items():
-                pos = idx_to_pos.get(idx)
-                if pos is not None:
-                    result[pos] = val
-
-        # Log summary of results
-        valid_count = np.sum(~np.isnan(result))
-        logger(
-            "INFO",
-            f"Buffer aggregation result: {valid_count}/{len(result)} points have valid values",
-        )
-
-    return result
 
 
 def pool_spec(
@@ -472,31 +265,6 @@ def downcast_fusion_dtypes(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def align_channel_axes(
-    arrays: list[tuple[np.ndarray, bool]], static: dict, n_rows: int
-) -> list[np.ndarray]:
-    """Put every channel on one axis, expanding deduplicated ones if needed.
-
-    All three channels normally resolve the same way, but an off-grid cell
-    can send one of them down the row-wise fallback; expanding the others
-    keeps the composite's inputs row-aligned.
-    """
-    if not arrays:
-        return []
-    if all(on_uniq for _, on_uniq in arrays):
-        return [a for a, _ in arrays]
-    inverse = static.get("uniq_inverse")
-    out: list[np.ndarray] = []
-    for arr, on_uniq in arrays:
-        if on_uniq and inverse is not None:
-            out.append(np.asarray(arr)[inverse])
-        elif on_uniq:
-            out.append(np.full(n_rows, np.nan, dtype=np.float32))
-        else:
-            out.append(arr)
-    return out
-
-
 def spatial_cache_key(
     coords_xy: np.ndarray, target: np.ndarray, cov: np.ndarray | None
 ) -> bytes:
@@ -608,5 +376,3 @@ def fusion_param_key(channel_mode: str, weights: dict) -> tuple:
     return (channel_mode, items)
 
 
-def metric_value_column(metric_gdf: gpd.GeoDataFrame, channel: str) -> str:
-    return metric_sampling.vector_metric_column(metric_gdf, channel)

@@ -14,12 +14,11 @@ nothing is recomputed.
 from __future__ import annotations
 
 import json
-import math
 import shutil
 from pathlib import Path
 
 from geofuse.cli.commands import EXIT_OK, CliError, _state
-from geofuse.jobs.outer_splits import spatial_label
+from geofuse.jobs.outer_splits import finite_or_none, spatial_label
 
 _CHANNELS = {"veg": "vegetation", "terrain": "terrain", "ndvi": "NDVI", "gvi": "GVI"}
 
@@ -71,12 +70,7 @@ def outcomes(payload: dict, wanted: str | None = None) -> list[tuple[str, dict]]
 # ────────────────────────────────────────────────────────────────────
 
 
-def _num(value) -> float | None:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    return number if math.isfinite(number) else None
+_num = finite_or_none
 
 
 def _interval(block: dict, lo: str = "lower", hi: str = "upper") -> str:
@@ -637,6 +631,7 @@ def cmd_export(args) -> int:
 
 
 def cmd_cgi_map(args) -> int:
+    # TODO: write the map once cgi_generator.generate is implemented.
     from geofuse import cgi_generator
 
     if not cgi_generator.AVAILABLE:

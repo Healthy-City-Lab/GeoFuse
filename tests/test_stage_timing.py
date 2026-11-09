@@ -1,9 +1,8 @@
 """Tests for per-stage wall-clock timing and the concurrency reporter.
 
 The timing feeds tuning decisions (which phase dominates, whether a worker pool
-is the ceiling), so it has to survive persistence, tolerate records written
-before stages carried timestamps, and not charge a retry for the attempt it
-replaced.
+is the ceiling), so it has to survive persistence and tolerate records written
+before stages carried timestamps.
 """
 
 import os
@@ -83,22 +82,7 @@ class TestStageTiming(unittest.TestCase):
         self.assertIsNone(led.get("load").duration_s)
         self.assertEqual(led.timing_report(), [])
 
-    def test_reset_unfinished_clears_the_abandoned_clock(self):
-        led = self._ledger()
-        led.mark_running("opt")
-        led.reset_unfinished()
-        s = led.get("opt")
-        self.assertEqual(s.status, "pending")
-        self.assertIsNone(s.started_at)
-        self.assertIsNone(s.duration_s)
 
-    def test_reset_keeps_finished_stage_timings(self):
-        led = self._ledger()
-        s = led.get("load")
-        s.status, s.started_at, s.ended_at = "done", 1.0, 3.0
-        led.mark_running("opt")
-        led.reset_unfinished()
-        self.assertEqual(led.get("load").duration_s, 2.0)
 
 
 class TestARunThatDiesStopsItsClock(unittest.TestCase):
@@ -140,11 +124,6 @@ class TestARunThatDiesStopsItsClock(unittest.TestCase):
         led.mark_done("load")
         self.assertIsNone(led.stop_running(FAILED, "boom"))
 
-    def test_a_retry_is_not_charged_for_the_failed_attempt(self):
-        led = self._mid_stage()
-        led.stop_running(FAILED, "boom")
-        led.reset_unfinished()
-        self.assertIsNone(led.get("opt").duration_s)
 
 
 class TestParallelEfficiencyReport(unittest.TestCase):

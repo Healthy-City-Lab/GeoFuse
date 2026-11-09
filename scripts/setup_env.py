@@ -42,14 +42,12 @@ CONDA_PACKAGES = [
     "geopandas=1.1.4",
     "rasterio=1.5.0",
     "shapely=2.1.2",
-    "fiona=1.10.1",
     # streamlit needs pandas < 3
     "pandas=2.3.3",
     "statsmodels=0.14.6",
     "matplotlib=3.10.8",
     "scikit-learn=1.6.0",
     "pillow=12.0.0",
-    "tqdm=4.67.1",
     # Async HTTP — used by the in-house geofuse.streetview client (GVIEngine)
     "aiohttp=3.12.15",
     # Bayesian index diagnostics
