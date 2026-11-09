@@ -95,8 +95,23 @@ to 0.0015, three resamples in 2,000. That is well inside the intervals' own
 Monte Carlo error. Synthetic designs built to provoke such a difference all
 agree to 10⁻¹⁰ or better: 40 clusters too small for their smooth that
 resamples empty, categories of one to three members that resamples drop, and
-the original code on 24 against 4 processor threads. The cause is therefore
-not known, and the difference is given here at its measured size.
+the original code on 24 against 4 processor threads.
+
+A likely cause was found later. A replicate's fit dropped every direction
+whose eigenvalue in its weighted cross-products fell below 10⁻¹⁰ of the
+largest, which is a singular value below 10⁻⁵ of the largest: a cluster
+that a replicate draws only a few rows from can support a direction that
+weakly and still carry information the per-replicate fit uses. Synthetic
+designs of that kind (saturated clusters of 4–11 entities, unscaled
+covariates, eight seeds) on the constrained thin-plate basis (see FEATURES,
+spatial adjustment) differed from the per-replicate fits by up to 1.0 on a
+contrast's interval end at that floor. The floor is now 10⁻¹², still four orders above the rounding
+level of a direction a replicate does not support, and the same designs
+agree to 10⁻⁶ relative or better (most to 10⁻⁷). With the earlier
+unconstrained basis two of the eight seeds differed by 0.07 and 13 at either
+floor: its small clusters' designs had condition numbers up to 5 × 10⁴
+against at most 14 for the constrained basis. The real study has not been
+rerun, so its difference is given at the size measured before the change.
 
 ---
 

@@ -406,9 +406,14 @@ Nothing below is pre-specified.
   exposure, KS-AIC on each outcome; once selected, the smooth joins the
   covariates on both the outcome and the exposure side under either method,
   so the two differ only in which variable chose its size. Every adjusted
-  slope records the method and the smooth's degrees of freedom. The size of the smooth is chosen by AIC
-  (or BIC) among candidate sizes, by default 0, 1, 2, 3, 4, 6, 8, 11, 15 and 20
-  radial functions per spatial cluster; the run keeps the criterion of every
+  slope records the method and the smooth's degrees of freedom. The smooth is
+  a thin-plate spline per cluster: an intercept, a linear trend and radial
+  functions constrained to carry no trend of their own (Wood 2003), so K
+  knots give K − 3 radial functions; spatially adjusted results differ
+  slightly from versions whose radial functions lacked the constraint. The
+  size of the smooth is chosen by AIC (or BIC) among candidate sizes, by
+  default 0, 1, 2, 3, 4, 6, 8, 11, 15 and 20 radial functions per spatial
+  cluster; the run keeps the criterion of every
   candidate and warns when the largest wins, since a larger smooth might then
   fit better. The knots and the neighbour graph that splits entities into
   clusters are settings too. In a paired CGI-vs-exposure test under Spatial+,
