@@ -322,12 +322,30 @@ def _specificity_lines(report: dict) -> list[str]:
     return lines
 
 
+def _plus_inputs_lines(tuning: dict) -> list[str]:
+    """A search tuned on Spatial+ residuals: its columns, groups, the outcome
+    smoother's edf and each channel's absorbed share."""
+    if tuning.get("method") != "spatial_plus_inputs":
+        return []
+    absorbed = ", ".join(
+        f"{ch} {share:.0%}"
+        for ch, share in (tuning.get("absorbed") or {}).items()
+        if share is not None
+    )
+    return [
+        f"  Tuned on         Spatial+ residuals of {tuning.get('columns')} "
+        f"search columns, {tuning.get('clusters')} groups, outcome smoother "
+        f"edf {_num(tuning.get('outcome_edf')) or 0:.1f}"
+        + (f"; variance absorbed {absorbed}" if absorbed else "")
+    ]
+
+
 def _spatial_lines(bundle: dict) -> list[str]:
     """The run's spatial adjustment: the method, and whether the slopes carry
     it (runs from before it reached them adjusted the scores only)."""
     adjustment = (bundle.get("test_results") or {}).get("spatial_adjustment") or {}
     if not adjustment.get("method"):
-        return []
+        return _plus_inputs_lines(bundle.get("spatial_tuning") or {})
     splits = (bundle.get("negative_controls") or {}).get("splits") or {}
     target = (splits.get("test") or {}).get("target") or {}
     reference = (bundle.get("comparator_reference") or {}).get("test") or {}
@@ -359,6 +377,7 @@ def _spatial_lines(bundle: dict) -> list[str]:
             )
         lines.append(text + "; paired tests share the smooth")
     tuning = bundle.get("spatial_tuning") or {}
+    lines += _plus_inputs_lines(tuning)
     if tuning.get("scale_m"):
         absorbed = ", ".join(
             f"{ch} {share:.0%}"

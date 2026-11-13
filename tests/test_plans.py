@@ -909,6 +909,37 @@ class TabParityTests(_Case):
         self.assertIsNotNone(recorded["spatial_adjust_select"])
         self.assert_same(gui, plans.build(spec))
 
+    def test_fusion_tab_spatial_plus_search_inputs(self):
+        seed = {
+            "fusion_target_paths": [self.cohort],
+            "fusion_target_upload_sig": (self.cohort, os.path.getsize(self.cohort)),
+            "fusion_outcome_columns": ["cesd"],
+            "fusion_run_mode": "Cross-sectional",
+            "fusion_index_form": "linear",
+            "fusion_spatial_adjust_method": "spatial_plus",
+            "fusion_spatial_tune_inputs": True,
+            "fusion_ndvi_paths": [os.path.join(self.dir, "ndvi_2015.tif")],
+            "fusion_gvi_paths": [os.path.join(self.dir, "gvi.gpkg")],
+        }
+        gui = self.click(
+            "fusion", seed, f"fusion.render({self.out!r})", "fusion_form_run_submit"
+        )
+        (spec,) = self.expand(
+            f"""
+            output_dir = {self.out!r}
+            [[fusion]]
+            target = "cohort.gpkg"
+            outcomes = ["cesd"]
+            index_form = "linear"
+            spatial_adjust_method = "spatial_plus"
+            spatial_tune_method = "spatial_plus_inputs"
+            ndvi = "ndvi_2015.tif"
+            gvi = "gvi.gpkg"
+            """
+        )
+        self.assertEqual(gui[2][0]["spatial_tune_method"], "spatial_plus_inputs")
+        self.assert_same(gui, plans.build(spec))
+
 
 if __name__ == "__main__":
     unittest.main()

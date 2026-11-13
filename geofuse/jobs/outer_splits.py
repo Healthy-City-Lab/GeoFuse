@@ -874,7 +874,10 @@ def posterior_rows(summary: dict | None) -> list[dict]:
     tuning = summary.get("spatial_tuning") or {}
     for r in rows:
         r["form"] = summary.get("form")
-        if tuning:
+        if tuning.get("method") == "spatial_plus_inputs":
+            r["tune_method"] = "spatial_plus_inputs"
+            r["tune_clusters"] = tuning.get("clusters")
+        elif tuning:
             r["tune_scale_m"] = scale_text(tuning.get("scale_m"))
             r["tune_clusters"] = tuning.get("clusters")
         if warm:
