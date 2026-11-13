@@ -352,6 +352,143 @@ def scale_rows(
     return rows
 
 
+def spatial_plus_rows(
+    report: dict | None, keep: "set[str] | None" = None
+) -> list[dict]:
+    """A :meth:`MetricFusionEngine.compute_spatial_plus` report as split rows.
+
+    Every row carries ``spatial_method = "spatial_plus"``, its
+    ``spatial_criterion`` and ``spatial_check``. Slopes per SD0, per IQR and
+    per p5–p95 range: ``held_out_per_*`` for the CGI on the target,
+    ``exposure_per_*`` for every other exposure, and
+    ``exposure_negative_control_per_*`` per exposure and control. ``D`` of the
+    CGI is ``negative_control_d``; ``D_cgi − D_e`` is ``specificity_difference``
+    (with ``control`` and ``kind``); the CGI's ΔR² minus an exposure's on the
+    target is ``cgi_minus_channel`` or ``cgi_minus_comparator``. ``keep``
+    limits the exposures other than the CGI.
+    """
+    if not report or report.get("skipped"):
+        return []
+
+    def kept(name: str) -> bool:
+        return name == "cgi" or keep is None or name in keep
+
+    def tags(r: dict) -> dict:
+        return {
+            "spatial_method": "spatial_plus",
+            "spatial_criterion": r["criterion"],
+            "spatial_check": bool(r["check"]),
+        }
+
+    rows: list[dict] = []
+    for r in report.get("slopes") or []:
+        if not kept(r["exposure"]):
+            continue
+        for unit in ("per_sd0", "per_iqr", "per_p5_p95"):
+            value = r.get(unit)
+            if not value:
+                continue
+            if r["role"] == "target":
+                prefix = "held_out_" if r["exposure"] == "cgi" else "exposure_"
+                quantity = prefix + unit
+                extra = {} if r["exposure"] == "cgi" else {"kind": r["kind"]}
+            else:
+                quantity = f"exposure_negative_control_{unit}"
+                extra = {"control": r["outcome"], "kind": r["kind"]}
+            rows.append(
+                {
+                    "quantity": quantity,
+                    "exposure": str(r["exposure"]),
+                    "estimate": _f(value.get("estimate")),
+                    "ci_low": _f(value.get("ci_low")),
+                    "ci_high": _f(value.get("ci_high")),
+                    "p_value": _f(value.get("p_value")),
+                    **extra,
+                    **tags(r),
+                }
+            )
+    for key, quantity in (
+        ("d", "negative_control_d"),
+        ("delta_d", "specificity_difference"),
+    ):
+        for r in report.get(key) or []:
+            if key == "d" and r["exposure"] != "cgi":
+                continue
+            if not kept(r["exposure"]):
+                continue
+            rows.append(
+                {
+                    "quantity": quantity,
+                    "exposure": str(r["exposure"]),
+                    "estimate": _f(r.get("estimate")),
+                    "ci_low": _f(r.get("ci_low")),
+                    "ci_high": _f(r.get("ci_high")),
+                    "p_value": _f(r.get("p_value")),
+                    "control": r["control"],
+                    "kind": r["kind"],
+                    **tags(r),
+                }
+            )
+    for r in report.get("paired") or []:
+        if not kept(r["exposure"]):
+            continue
+        quantity = (
+            "cgi_minus_comparator" if r["kind"] == "comparator" else "cgi_minus_channel"
+        )
+        rows.append(
+            {
+                "quantity": quantity,
+                "exposure": str(r["exposure"]),
+                "estimate": _f(r.get("estimate")),
+                "ci_low": _f(r.get("ci_low")),
+                "ci_high": _f(r.get("ci_high")),
+                "p_value": _f(r.get("p_value")),
+                **tags(r),
+            }
+        )
+    return rows
+
+
+def spatial_plus_table(report: dict | None) -> list[dict]:
+    """``spatial_plus.csv``: one row per criterion, exposure, outcome and
+    group of every step-2 fit (its slope per SD0, interval and p, the group's
+    knots, λ and edf), then the step-1 fits (no outcome)."""
+    if not report or report.get("skipped"):
+        return []
+    slopes = {
+        (r["criterion"], r["exposure"], r["outcome"]): r
+        for r in report.get("slopes") or []
+    }
+    out = []
+    for g in report.get("groups") or []:
+        s = slopes.get((g["criterion"], g["exposure"], g["outcome"])) or {}
+        sd0 = s.get("per_sd0") or {}
+        out.append(
+            {
+                "criterion": g["criterion"],
+                "check": g["check"],
+                "step": g["step"],
+                "exposure": g["exposure"],
+                "outcome": g["outcome"],
+                "group": g["group"],
+                "n": g["n"],
+                "knots": g["knots"],
+                "lambda": g["lambda"],
+                "edf": g["edf"],
+                "criterion_value": g["criterion_value"],
+                "beta": s.get("estimate"),
+                "se_vp": s.get("se_vp"),
+                "se_ve": s.get("se_ve"),
+                "p_value": s.get("p_value"),
+                "per_sd0": sd0.get("estimate"),
+                "per_sd0_ci_low": sd0.get("ci_low"),
+                "per_sd0_ci_high": sd0.get("ci_high"),
+                "total_edf": s.get("edf"),
+            }
+        )
+    return out
+
+
 def raw_rows(report: dict | None, keep: "set[str] | None" = None) -> list[dict]:
     """One split's raw-unit slopes (:meth:`compute_raw_effects`) as rows.
 
@@ -779,6 +916,7 @@ def summarise(rows: list[dict], primary_scale: float | None = None) -> list[dict
             r.get("control"),
             r.get("spatial_scale_m"),
             r.get("weighting"),
+            r.get("spatial_criterion"),
         )
         groups.setdefault(key, []).append(r)
     order = list(QUANTITIES)
@@ -790,7 +928,7 @@ def summarise(rows: list[dict], primary_scale: float | None = None) -> list[dict
         return (2, 0.0) if text == "none" else (1, -float(text))
 
     out: list[dict] = []
-    for (quantity, exposure, control, scale, weighting), group in sorted(
+    for (quantity, exposure, control, scale, weighting, criterion), group in sorted(
         groups.items(),
         key=lambda kv: (
             order.index(kv[0][0]),
@@ -798,6 +936,7 @@ def summarise(rows: list[dict], primary_scale: float | None = None) -> list[dict
             kv[0][2] or "",
             scale_order(kv[0][3]),
             kv[0][4] or "",
+            kv[0][5] or "",
         ),
     ):
         est = np.array(
@@ -834,6 +973,9 @@ def summarise(rows: list[dict], primary_scale: float | None = None) -> list[dict
             entry["spatial_scale_m"] = scale
         if weighting is not None:
             entry["weighting"] = weighting
+        if criterion is not None:
+            entry["spatial_criterion"] = criterion
+            entry["spatial_check"] = bool(group[0].get("spatial_check"))
         if entry["alternative"] and shares:
             test = corrected_resampled_t(
                 est, float(np.mean(shares)), alternative=entry["alternative"]
@@ -841,12 +983,15 @@ def summarise(rows: list[dict], primary_scale: float | None = None) -> list[dict
             entry["corrected_t"], entry["corrected_p"] = test["t"], test["p_value"]
         out.append(entry)
     families = []
-    for weighting in dict.fromkeys(e.get("weighting") for e in out):
+    for weighting, criterion in dict.fromkeys(
+        (e.get("weighting"), e.get("spatial_criterion")) for e in out
+    ):
         ranked = [
             e
             for e in out
             if e.get("spatial_scale_m") in (None, primary)
             and e.get("weighting") == weighting
+            and e.get("spatial_criterion") == criterion
         ]
         families.append(
             [
@@ -1117,6 +1262,21 @@ def repeat(
             if r["quantity"] == "cgi_minus_comparator" or r.get("kind") == "comparator":
                 r["primary"] = r["exposure"] in primary
             rows.append(r)
+        if getattr(engine, "spatial_adjust_method", "none") == "spatial_plus":
+            plus = engine.compute_spatial_plus(
+                params,
+                raw_exposures,
+                n_boot=int(n_paired),
+                seed=seed,
+                fixed_iqr=fixed_iqr,
+            )
+            for r in spatial_plus_rows(plus):
+                r.update(split=k, seed=seed, **info)
+                if r["quantity"] == "cgi_minus_comparator" or r.get("kind") == (
+                    "comparator"
+                ):
+                    r["primary"] = r["exposure"] in primary
+                rows.append(r)
         if ladder:
             for r in scale_rows(
                 engine,

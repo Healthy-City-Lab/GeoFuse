@@ -1260,6 +1260,25 @@ def _log_weighted(report: dict | None, label: str) -> None:
     )
 
 
+def _log_spatial_plus(report: dict, label: str) -> None:
+    """One line on the held-out Spatial+ slope of the CGI per criterion."""
+    for row in report.get("slopes") or []:
+        if row["exposure"] != "cgi" or row["role"] != "target":
+            continue
+        unit = row.get("per_sd0") or {}
+        _log_fusion(
+            "OK",
+            f"[{label}] Spatial+ ({row['criterion']}"
+            + (", check" if row["check"] else "")
+            + f", {report.get('n_groups')} groups): held-out slope per SD0 "
+            f"{_fmt_or_na(unit.get('estimate'), '+.4f')} "
+            f"[{_fmt_or_na(unit.get('ci_low'), '+.4f')}, "
+            f"{_fmt_or_na(unit.get('ci_high'), '+.4f')}], "
+            f"p {_fmt_or_na(row.get('p_value'), '.3g')}, edf "
+            f"{_fmt_or_na(row.get('edf'), '.1f')}.",
+        )
+
+
 def _run_outer_splits(
     engine: Any,
     *,
@@ -1336,6 +1355,8 @@ def _run_outer_splits(
             raw=first_split.get("raw"),
             raw_keep=set(standalones) | scored,
             weighted=first_split.get("weighted"),
+        ) + _outer.spatial_plus_rows(
+            first_split.get("spatial_plus"), set(standalones) | scored
         ):
             r.update(split=0, seed=int(split_seed), **info)
             if r["quantity"] == "cgi_minus_comparator" or r.get("kind") == "comparator":
@@ -2247,6 +2268,7 @@ def run_fusion(
             negative_control_retune=retune_enabled,
             comparators=bool(comparator_cols),
             weighted=bool(weight_column),
+            spatial_plus=spatial_adjust_method == "spatial_plus",
             outer_splits=int(outer_splits) > 1 or bool(scale_ladder),
             outer_null=int(outer_splits) > 1 and int(outer_null_runs or 0) > 0,
         )
@@ -4023,6 +4045,38 @@ def run_fusion(
                 _log_weighted(weighted_report, label)
 
             # ────────────────────────────────────────────
+            # Spatial+ estimates
+            # ────────────────────────────────────────────
+            spatial_plus_report: dict | None = None
+            if engine.spatial_adjust_method == "spatial_plus":
+                stage(skey("spatial_plus"), RUNNING)
+                try:
+                    spatial_plus_report = engine.compute_spatial_plus(
+                        headline_params,
+                        _raw_exposures(
+                            engine,
+                            standalones,
+                            standalones_bundle,
+                            comparators_report,
+                        ),
+                        n_boot=int(report_paired_bootstrap),
+                        seed=int(split_seed),
+                        fixed_iqr=fixed_iqr,
+                    )
+                except JobCancelled:
+                    raise
+                except Exception as exc:
+                    _log_fusion("WARN", f"[{label}] Spatial+ estimates failed: {exc}")
+                    stage(skey("spatial_plus"), FAILED, str(exc))
+                else:
+                    skipped = (spatial_plus_report or {}).get("skipped")
+                    if skipped:
+                        stage(skey("spatial_plus"), SKIPPED, str(skipped))
+                    else:
+                        stage(skey("spatial_plus"), DONE)
+                        _log_spatial_plus(spatial_plus_report, label)
+
+            # ────────────────────────────────────────────
             # Repeated held-out splits
             # ────────────────────────────────────────────
             outer_bundle: dict | None = None
@@ -4066,6 +4120,7 @@ def run_fusion(
                         "specificity": specificity_report,
                         "raw": raw_effects_report,
                         "weighted": weighted_report,
+                        "spatial_plus": spatial_plus_report,
                     },
                     fixed_iqr=fixed_iqr,
                     raw_exposures=_raw_exposures(
@@ -4196,6 +4251,7 @@ def run_fusion(
                 "exposure_response": exposure_response_report,
                 "raw_effects": raw_effects_report,
                 "weighted": weighted_report,
+                "spatial_plus": spatial_plus_report,
                 "moderation": moderation_report,
                 "negative_controls": negative_control_report,
                 # The spatial blocks the held-out split used, ``None`` without.

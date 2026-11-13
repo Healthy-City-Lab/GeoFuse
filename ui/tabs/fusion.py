@@ -7416,12 +7416,10 @@ def render(output_dir: str) -> None:
                 "spatial_adjust_method": (
                     spatial_adjust_method_param if is_vector_target else "none"
                 ),
-                "spatial_adjust_select": (
-                    study_state.get(
-                        "spatial_adjust_select", _fs_default("spatial_adjust_select")
-                    )
-                    if is_vector_target and spatial_adjust_method_param == "basis"
-                    else None
+                # Always a value: the runner reads a missing one as a job
+                # recorded before the select setting existed.
+                "spatial_adjust_select": study_state.get(
+                    "spatial_adjust_select", _fs_default("spatial_adjust_select")
                 ),
                 "spatial_adjust_df": list(spatial_adjust_df_param),
                 "spatial_adjust_eps_m": (

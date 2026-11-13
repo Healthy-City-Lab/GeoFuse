@@ -347,14 +347,16 @@ class TestWeightedUnderSmooth(unittest.TestCase):
             cls.folder,
             INPUTS,
             weight_column="unit",
-            spatial_adjust_method="spatial_plus",
+            spatial_adjust_method="basis",
+            spatial_adjust_select="fixed_scale",
             spatial_adjust_scale_m=[5000.0],
         )
         cls.ctx_df, cls.df = run_study(
             cls.folder,
             INPUTS,
             weight_column="unit",
-            spatial_adjust_method="ks_aic",
+            spatial_adjust_method="basis",
+            spatial_adjust_select="df_outcome_ic",
             spatial_adjust_df=[0, 2, 4],
         )
 

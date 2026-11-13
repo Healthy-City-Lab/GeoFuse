@@ -26,6 +26,7 @@ from .outer_splits import (
     raw_rows,
     spatial_columns,
     spatial_label,
+    spatial_plus_table,
     weighted_rows,
 )
 from .stage_ledger import StageLedger
@@ -59,6 +60,7 @@ _FUSION_STAGE_WEIGHTS: dict[str, float] = {
     "comparators": 4.0,
     "negative_control_retune": 20.0,
     "weighted": 2.0,
+    "spatial_plus": 6.0,
     "outer_splits": 40.0,
     "outer_null": 80.0,
 }
@@ -76,6 +78,11 @@ _FUSION_COMPARATORS_STAGE: tuple[str, str] = (
 _FUSION_WEIGHTED_STAGE: tuple[str, str] = (
     "weighted",
     "Weighted estimates",
+)
+
+_FUSION_SPATIAL_PLUS_STAGE: tuple[str, str] = (
+    "spatial_plus",
+    "Spatial+ estimates",
 )
 
 _FUSION_OUTER_SPLITS_STAGE: tuple[str, str] = (
@@ -798,6 +805,14 @@ def _write_fusion_outputs(
     weighted_table = weighted_rows(weighted)
     _emit_csv(f"weighted{sfx}.csv", weighted_table)
 
+    # ── spatial_plus.csv ────────────────────────────────────────
+    plus = (cgi_bundle or {}).get("spatial_plus")
+    plus_table = [
+        {"split": 0, "seed": (cgi_bundle or {}).get("split_seed"), **r}
+        for r in spatial_plus_table(plus)
+    ]
+    _emit_csv(f"spatial_plus{sfx}.csv", plus_table)
+
     # ── null_outer.csv + null_summary.csv + null_variogram.csv ──
     null = (cgi_bundle or {}).get("outer_null") or {}
     if null.get("rows"):
@@ -933,6 +948,30 @@ def _write_fusion_outputs(
             for k in ("weight_column", "n_test", "n_eff", "n_dropped", "skipped")
             if k in weighted
         } | {"rows": weighted_table}
+    if plus:
+        manifest["spatial_plus"] = {
+            k: plus.get(k)
+            for k in (
+                "skipped",
+                "label",
+                "criterion",
+                "checks",
+                "n",
+                "k",
+                "n_groups",
+                "group_sizes",
+                "knots",
+                "groups_rule",
+                "lambda_fixed_in_resamples",
+                "n_boot",
+                "slopes",
+                "d",
+                "delta_d",
+                "paired",
+                "warnings",
+            )
+            if k in plus
+        }
     if null:
         manifest["outer_null"] = {
             k: null.get(k)
@@ -1077,6 +1116,7 @@ def _build_fusion_ledger(
     weighted: bool = False,
     outer_splits: bool = False,
     outer_null: bool = False,
+    spatial_plus: bool = False,
 ) -> StageLedger:
     """Fresh ledger covering every (outcome, step) pair in run order.
 
@@ -1095,8 +1135,9 @@ def _build_fusion_ledger(
     ``negative_control_retune`` appends one re-tune stage per outcome, after
     its standalones, where the runner performs it; ``comparators`` one stage
     for the comparator exposures, between the two; ``weighted`` one for the
-    weighted estimates; ``outer_splits`` one stage for the repeated held-out
-    splits, and ``outer_null`` one for their null calibration, last.
+    weighted estimates; ``spatial_plus`` one for the Spatial+ estimates;
+    ``outer_splits`` one stage for the repeated held-out splits, and
+    ``outer_null`` one for their null calibration, last.
     """
     standalones = list(standalone_channels or [])
     steps: list[tuple[str, str]] = []
@@ -1156,6 +1197,14 @@ def _build_fusion_ledger(
                 (
                     _fusion_stage_key(label, w_key_raw, multi=multi),
                     f"[{label}] {w_label}" if multi else w_label,
+                )
+            )
+        if spatial_plus:
+            sp_key_raw, sp_label = _FUSION_SPATIAL_PLUS_STAGE
+            steps.append(
+                (
+                    _fusion_stage_key(label, sp_key_raw, multi=multi),
+                    f"[{label}] {sp_label}" if multi else sp_label,
                 )
             )
         if outer_splits:

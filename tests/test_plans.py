@@ -863,6 +863,52 @@ class TabParityTests(_Case):
         self.assertEqual(gui[2][0]["categorical_missing"], "indicator")
         self.assert_same(gui, plans.build(spec))
 
+    def test_fusion_tab_spatial_plus(self):
+        seed = {
+            "fusion_target_paths": [self.cohort],
+            "fusion_target_upload_sig": (self.cohort, os.path.getsize(self.cohort)),
+            "fusion_outcome_columns": ["cesd"],
+            "fusion_covariate_columns": ["age"],
+            "fusion_run_mode": "Cross-sectional",
+            "fusion_spatial_adjust_method": "spatial_plus",
+            "fusion_spatial_plus_k": 120,
+            "fusion_spatial_plus_criterion": "reml",
+            "fusion_spatial_plus_checks": ["gcv"],
+            "fusion_spatial_plus_step1_covariates": True,
+            "fusion_spatial_adjust_eps_m": 20000,
+            "fusion_spatial_adjust_min_component": 40,
+            "fusion_ndvi_paths": [os.path.join(self.dir, "ndvi_2015.tif")],
+            "fusion_gvi_paths": [os.path.join(self.dir, "gvi.gpkg")],
+        }
+        gui = self.click(
+            "fusion", seed, f"fusion.render({self.out!r})", "fusion_form_run_submit"
+        )
+        (spec,) = self.expand(
+            f"""
+            output_dir = {self.out!r}
+            [[fusion]]
+            target = "cohort.gpkg"
+            outcomes = ["cesd"]
+            covariates = ["age"]
+            spatial_adjust_method = "spatial_plus"
+            spatial_plus_k = 120
+            spatial_plus_criterion = "reml"
+            spatial_plus_checks = ["gcv"]
+            spatial_plus_step1_covariates = true
+            spatial_adjust_eps_m = 20000.0
+            spatial_adjust_min_component = 40
+            ndvi = "ndvi_2015.tif"
+            gvi = "gvi.gpkg"
+            """
+        )
+        recorded = gui[2][0]
+        self.assertEqual(recorded["spatial_adjust_method"], "spatial_plus")
+        self.assertEqual(recorded["spatial_plus_checks"], ["gcv"])
+        # The select always has a value, so the runner never reads the job as
+        # one recorded before the select setting existed.
+        self.assertIsNotNone(recorded["spatial_adjust_select"])
+        self.assert_same(gui, plans.build(spec))
+
 
 if __name__ == "__main__":
     unittest.main()

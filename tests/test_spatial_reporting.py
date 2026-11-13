@@ -491,7 +491,8 @@ class TestAdjustedRun(unittest.TestCase):
         cls.ctx, cls.bundle = run_study(
             cls.folder,
             _INPUTS,
-            spatial_adjust_method="spatial_plus",
+            spatial_adjust_method="basis",
+            spatial_adjust_select="df_exposure_ic",
             outer_splits=2,
             specificity_contrast=True,
             comparators=["ndvi_here", "noise", "patchy"],

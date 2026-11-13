@@ -219,6 +219,36 @@ def _weighted_lines(weighted: dict) -> list[str]:
     return lines
 
 
+def _spatial_plus_lines(plus: dict) -> list[str]:
+    """The first split's Spatial+ slopes: the groups, then every exposure's
+    held-out slope per SD0 on the target per criterion (checks marked)."""
+    if not plus:
+        return []
+    if plus.get("skipped"):
+        return [f"  Spatial+         skipped ({plus['skipped']})"]
+    checks = ", ".join(plus.get("checks") or [])
+    lines = [
+        f"  Spatial+         {plus.get('n_groups')} groups on {plus.get('n')} "
+        f"held-out rows, k {plus.get('k')}, penalties by {plus.get('criterion')}"
+        + (f" (checks: {checks})" if checks else "")
+    ]
+    for r in plus.get("slopes") or []:
+        unit = r.get("per_sd0") or {}
+        est = _num(unit.get("estimate"))
+        if r.get("role") != "target" or est is None:
+            continue
+        lo, hi, p = (_num(unit.get(k)) for k in ("ci_low", "ci_high", "p_value"))
+        tag = f"{r['criterion']}, check" if r["check"] else r["criterion"]
+        name = f"{r['exposure']} ({tag})"
+        lines.append(
+            f"    {name:<30}{est:+.4f}"
+            + (f" [{lo:+.4f}, {hi:+.4f}]" if lo is not None and hi is not None else "")
+            + (f"  p={p:.3g}" if p is not None else "")
+            + f"  edf {_num(r.get('edf')) or 0:.1f}"
+        )
+    return lines
+
+
 def _null_lines(null: dict) -> list[str]:
     """The decision's false-positive rate per null kind: hits / nulls with
     the exact interval, the real outcome's calibrated p and the stopping
@@ -512,6 +542,7 @@ def summary(label: str, bundle: dict, artifacts: Path) -> list[str]:
     lines += _specificity_lines(bundle.get("specificity_contrast") or {})
     lines += _raw_lines(bundle.get("raw_effects") or {})
     lines += _weighted_lines(bundle.get("weighted") or {})
+    lines += _spatial_plus_lines(bundle.get("spatial_plus") or {})
     lines += _outer_lines(bundle.get("outer_splits") or {})
     lines += _null_lines(bundle.get("outer_null") or {})
 

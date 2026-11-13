@@ -1012,7 +1012,9 @@ def fusion_run_config(spec: JobSpec) -> dict[str, Any]:
         "whole_grid_scaling": bool(s["whole_grid_scaling"]) if vector else True,
         "area_balanced_split": bool(s["area_balanced_split"]) if polygon else False,
         "spatial_adjust_method": adjust,
-        "spatial_adjust_select": select,
+        # Always a value: the runner reads a missing one as a job recorded
+        # before the select setting existed.
+        "spatial_adjust_select": select or opt("spatial_adjust_select"),
         "spatial_tune_method": opt("spatial_tune_method"),
         "spatial_tune_select": (
             opt("spatial_tune_select") if adjusted else "fixed_scale"
