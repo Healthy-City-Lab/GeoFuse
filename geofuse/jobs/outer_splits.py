@@ -122,6 +122,11 @@ def spatial_columns(record: dict | None) -> dict:
         elif key == "scale_m":
             value = scale_text(value)
         out[f"spatial_{key}"] = value
+    # A selected scale's rows group together across splits; the scale each
+    # split chose is kept beside them.
+    if (record or {}).get("selected"):
+        out["spatial_selected_scale_m"] = scale_text(record.get("scale_m"))
+        out["spatial_scale_m"] = "selected"
     return out
 
 
@@ -890,7 +895,9 @@ def _holds(row: dict) -> bool | None:
     return lo > 0 or hi < 0
 
 
-def summarise(rows: list[dict], primary_scale: float | None = None) -> list[dict]:
+def summarise(
+    rows: list[dict], primary_scale: "float | str | None" = None
+) -> list[dict]:
     """Per ``(quantity, exposure)``: spread, share holding, corrected t.
 
     ``rows`` carry ``split`` and ``test_share`` next to the :func:`split_rows`
@@ -904,7 +911,8 @@ def summarise(rows: list[dict], primary_scale: float | None = None) -> list[dict
     that term has the largest weight) and the β entry ``forms`` (how often
     each form was chosen). Spatially adjusted slopes carry ``spatial_method``.
     Rows of a scale ladder are summarised per ``spatial_scale_m`` too; only
-    ``primary_scale``'s rows enter the Holm families.
+    ``primary_scale``'s rows enter the Holm families (``"selected"`` for the
+    rows of a scale chosen per split).
     """
     from geofuse.statistical_testing import corrected_resampled_t, holm_bonferroni
 
@@ -920,7 +928,10 @@ def summarise(rows: list[dict], primary_scale: float | None = None) -> list[dict
         )
         groups.setdefault(key, []).append(r)
     order = list(QUANTITIES)
-    primary = None if primary_scale is None else scale_text(primary_scale)
+    if primary_scale is None or isinstance(primary_scale, str):
+        primary = primary_scale
+    else:
+        primary = scale_text(primary_scale)
 
     def scale_order(text: str | None) -> tuple:
         if text is None or text == primary:
@@ -1108,6 +1119,8 @@ def repeat(
     first: int = 1,
     fixed_iqr: dict | None = None,
     distributions: "list[dict] | None" = None,
+    scale_profiles: "list[dict] | None" = None,
+    bandwidths: "list[dict] | None" = None,
 ) -> list[dict]:
     """Splits ``first … k_splits − 1`` (seeds ``split_seed + k``) as rows.
 
@@ -1132,7 +1145,9 @@ def repeat(
     Every split also reports the raw-unit slopes of the CGI, every standalone
     and the scored comparators (:func:`raw_rows`, ``fixed_iqr`` as in
     :meth:`compute_raw_effects`); their exposure distributions are appended to
-    ``distributions`` when given (:func:`distribution_rows`).
+    ``distributions`` when given (:func:`distribution_rows`). A basis run's
+    scale profile of each split is appended to ``scale_profiles`` and, in the
+    full report, its effective bandwidths to ``bandwidths``.
     """
     from ..fusion import comparator_mode
     from .fusion_outputs import (
@@ -1159,6 +1174,12 @@ def repeat(
         engine._fit_label = f"split {k}"
         engine.split_data(random_state=seed, **split_kwargs)
         info = split_info(engine)
+        if scale_profiles is not None:
+            for r in getattr(engine, "_scale_profile", None) or []:
+                scale_profiles.append({"split": k, "seed": seed, **r})
+        if bandwidths is not None and not decision:
+            for r in engine.effective_bandwidths(seed=seed):
+                bandwidths.append({"split": k, "seed": seed, **r})
         params = engine.fit_bayesian_index(metric=metric, **fit_kwargs, **loops)
         if decision:
             held = engine._score_data_subset(
@@ -1270,6 +1291,9 @@ def repeat(
                 seed=seed,
                 fixed_iqr=fixed_iqr,
             )
+            if bandwidths is not None:
+                for r in (plus or {}).get("effective_bandwidth") or []:
+                    bandwidths.append({"split": k, "seed": seed, **r})
             for r in spatial_plus_rows(plus):
                 r.update(split=k, seed=seed, **info)
                 if r["quantity"] == "cgi_minus_comparator" or r.get("kind") == (

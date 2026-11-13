@@ -35,6 +35,7 @@ _METHODS = (
     "_whole_data_longitudinal_keys",
     "_paired_smooths",
     "_method_record",
+    "_selected_tag",
     "_smooth_at",
     "_spatial_selection",
     "_note_basis_summary",

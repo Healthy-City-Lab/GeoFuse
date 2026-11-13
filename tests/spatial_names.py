@@ -26,4 +26,7 @@ def stand_in(rule: str) -> dict:
         "spatial_adjust_select": SELECT.get(rule),
         "_basis": rule,
         "_scoring_spatial_method": "none" if rule == "none" else "basis",
+        "spatial_select_criterion": "bic",
+        "_in_ladder": False,
+        "_control_scales": {},
     }

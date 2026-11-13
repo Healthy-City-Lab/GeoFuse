@@ -36,6 +36,7 @@ from geofuse import cgi_formulas as _cgi_formulas
 from geofuse import metric_intake, parallel
 from geofuse import pdcor as _pdcor_mod
 from geofuse import settings as _settings
+from geofuse import spatial_scale_selection as _scale_selection
 from geofuse.crs_utils import (
     default_geotiff_creation_options,
     raster_geographic_bounds,
@@ -1308,6 +1309,8 @@ def _run_outer_splits(
     report: str = "full",
     fixed_iqr: dict | None = None,
     raw_exposures: dict | None = None,
+    scale_profiles: "list[dict] | None" = None,
+    bandwidths: "list[dict] | None" = None,
 ) -> dict | None:
     """The first split's results and ``k_splits − 1`` repeats, summarised.
 
@@ -1406,6 +1409,8 @@ def _run_outer_splits(
             report=report,
             fixed_iqr=fixed_iqr,
             distributions=distributions,
+            scale_profiles=scale_profiles,
+            bandwidths=bandwidths,
         )
         if ctx.is_cancelled():
             raise JobCancelled("Repeated held-out splits cancelled by user.")
@@ -2259,6 +2264,17 @@ def run_fusion(
         )
         if spatial_adjust_method != "basis":
             scale_ladder = []
+        # A scale chosen per split is one of the candidates; the slopes are
+        # also reported at every candidate and unadjusted.
+        selected_scale = (
+            spatial_adjust_method == "basis" and spatial_adjust_select == "scale_ic"
+        )
+        if selected_scale:
+            spatial_scales = [
+                float(v)
+                for v in (spatial_select_scales_m or _settings.SPATIAL_SELECT_SCALES_M)
+            ]
+            scale_ladder = [*spatial_scales, None]
         ledger = _build_fusion_ledger(
             all_labels,
             multi=multi_outcome,
@@ -4076,6 +4092,18 @@ def run_fusion(
                         stage(skey("spatial_plus"), DONE)
                         _log_spatial_plus(spatial_plus_report, label)
 
+            # ── Scale profile and effective bandwidths ───────────
+            scale_profile_rows = [
+                {"split": 0, "seed": int(split_seed), **r}
+                for r in getattr(engine, "_scale_profile", None) or []
+            ]
+            bandwidth_rows = [
+                {"split": 0, "seed": int(split_seed), **r}
+                for r in engine.effective_bandwidths(seed=int(split_seed))
+            ]
+            for r in (spatial_plus_report or {}).get("effective_bandwidth") or []:
+                bandwidth_rows.append({"split": 0, "seed": int(split_seed), **r})
+
             # ────────────────────────────────────────────
             # Repeated held-out splits
             # ────────────────────────────────────────────
@@ -4131,7 +4159,13 @@ def run_fusion(
                         sc_exposures if specificity_report is not None else None
                     ),
                     ladder=scale_ladder,
-                    primary_scale=spatial_scales[0] if spatial_scales else None,
+                    primary_scale=(
+                        "selected"
+                        if selected_scale
+                        else (spatial_scales[0] if spatial_scales else None)
+                    ),
+                    scale_profiles=scale_profile_rows,
+                    bandwidths=bandwidth_rows,
                     standalones=(
                         [c for c in standalones if c in standalones_bundle]
                         if standalones
@@ -4252,6 +4286,18 @@ def run_fusion(
                 "raw_effects": raw_effects_report,
                 "weighted": weighted_report,
                 "spatial_plus": spatial_plus_report,
+                "scale_selection": (
+                    {
+                        "criterion": str(spatial_select_criterion),
+                        "rows": scale_profile_rows,
+                        "summary": _scale_selection.summary(
+                            scale_profile_rows, str(spatial_select_criterion)
+                        ),
+                    }
+                    if scale_profile_rows
+                    else None
+                ),
+                "effective_bandwidth": bandwidth_rows or None,
                 "moderation": moderation_report,
                 "negative_controls": negative_control_report,
                 # The spatial blocks the held-out split used, ``None`` without.

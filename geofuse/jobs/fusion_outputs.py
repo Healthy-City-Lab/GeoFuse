@@ -813,6 +813,12 @@ def _write_fusion_outputs(
     ]
     _emit_csv(f"spatial_plus{sfx}.csv", plus_table)
 
+    # ── scale_selection.csv + effective_bandwidth.csv ───────────
+    selection = (cgi_bundle or {}).get("scale_selection") or {}
+    _emit_csv(f"scale_selection{sfx}.csv", selection.get("rows") or [])
+    bandwidth = (cgi_bundle or {}).get("effective_bandwidth") or []
+    _emit_csv(f"effective_bandwidth{sfx}.csv", bandwidth)
+
     # ── null_outer.csv + null_summary.csv + null_variogram.csv ──
     null = (cgi_bundle or {}).get("outer_null") or {}
     if null.get("rows"):
@@ -948,6 +954,13 @@ def _write_fusion_outputs(
             for k in ("weight_column", "n_test", "n_eff", "n_dropped", "skipped")
             if k in weighted
         } | {"rows": weighted_table}
+    if selection:
+        manifest["scale_selection"] = {
+            "criterion": selection.get("criterion"),
+            "summary": selection.get("summary"),
+        }
+    if bandwidth:
+        manifest["effective_bandwidth"] = bandwidth
     if plus:
         manifest["spatial_plus"] = {
             k: plus.get(k)

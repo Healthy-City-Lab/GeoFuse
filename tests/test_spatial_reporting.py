@@ -157,6 +157,7 @@ class TestExtraColumns(unittest.TestCase):
 
 _METHODS = (
     "_method_record",
+    "_selected_tag",
     "_reporting_covariate_matrix",
     "_reporting_raw_column",
     "_reporting_clusters",
