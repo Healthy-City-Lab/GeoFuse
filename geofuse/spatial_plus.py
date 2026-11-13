@@ -467,6 +467,30 @@ class Design:
         return {"lam": lam, "value": float(res.fun), "edf": edf, "edf_groups": per}
 
 
+def smoother_weights(smoother: Smoother, lam: np.ndarray):
+    """``weights_of(j)``: column ``j`` of the smoother of ``group +
+    Σ_g s_g(t)`` at ``lam`` (no covariates), the weights it gives every row
+    when smoothing row ``j``. The smoother is block diagonal over the groups,
+    so a column is zero outside its row's group."""
+    where = np.empty(smoother.n, dtype=int)
+    local = np.empty(smoother.n, dtype=int)
+    for k, g in enumerate(smoother.groups):
+        where[g.rows] = k
+        local[g.rows] = np.arange(len(g.rows))
+
+    def weights_of(j: int) -> np.ndarray:
+        g = smoother.groups[where[j]]
+        i = local[j]
+        col = g.Qt @ g.Qt[i]
+        if g.m:
+            col = col + g.C @ (g.C[i] / (g.s + float(lam[where[j]])))
+        out = np.zeros(smoother.n)
+        out[g.rows] = col
+        return out
+
+    return weights_of
+
+
 # ────────────────────────────────────────────────────────────────────
 # The two steps
 # ────────────────────────────────────────────────────────────────────
@@ -869,6 +893,7 @@ def report(
         "paired": [],
         "groups": [],
         "warnings": warnings,
+        "effective_bandwidth": [],
     }
     for crit in [criterion, *[c for c in checks if c != criterion]]:
         is_check = crit != criterion
@@ -928,6 +953,27 @@ def report(
                         }
                     )
         keys = list(fits)
+        if not is_check:
+            # The distance the step-2 smoother of the CGI's target model
+            # removes variation over (Keller & Szpiro 2020, §3.1).
+            from geofuse import spatial_scale_selection as _ss
+
+            k_hat = _ss.effective_bandwidth(
+                xy,
+                smoother.labels,
+                smoother_weights(smoother, fits[(cgi, "target")]["lam"]),
+                seed=int(seed),
+            )
+            result["effective_bandwidth"].append(
+                {
+                    "row_set": "test",
+                    "smooth": "spatial_plus",
+                    "criterion": crit,
+                    "scale_m": None,
+                    "columns": int(smoother.p),
+                    **k_hat,
+                }
+            )
         reps = None
         if W is not None:
             reps = replicate_slopes(
@@ -1041,3 +1087,169 @@ def report(
                 }
             )
     return result
+
+
+# ────────────────────────────────────────────────────────────────────
+# Spatial+ on the search inputs
+# ────────────────────────────────────────────────────────────────────
+
+
+def residual_at(smoother: Smoother, x: np.ndarray, lam: np.ndarray) -> np.ndarray:
+    """``x`` minus its fit on group + Σ_g s_g(t) at fixed ``lam`` (no
+    covariates; each group alone)."""
+    out = np.empty_like(np.asarray(x, dtype=np.float64))
+    for j, g in enumerate(smoother.groups):
+        v = np.asarray(x, dtype=np.float64)[g.rows]
+        v = v - g.Qt @ (g.Qt.T @ v)
+        if g.m:
+            v = v - g.C @ ((g.C.T @ v) / (g.s + float(lam[j])))
+        out[g.rows] = v
+    return out
+
+
+def half_residual(design: Design, lam: np.ndarray):
+    """``apply(V)``: ``(I − H)^{1/2} V`` for the hat matrix ``H`` of ``design``
+    at ``lam``.
+
+    ``I − H`` is zero on the unpenalized columns (trends and dense
+    covariates) and the identity off every column's span, so its square root
+    is computed on the span of the penalized functions and the covariates
+    only: the functions scaled to unit length (``U_b``, orthonormal, one block
+    per group) and the covariates' part orthogonal to them (``E``). Without
+    covariates the operator is diagonal there (``λ / (s + λ)`` per function).
+    """
+    sm = design.sm
+    s = design.s
+    lam_col = np.asarray(lam, dtype=float)[design.col_group]
+    Qz = design.Qz
+
+    def ub_t(V):
+        return sm.cross(V) / np.sqrt(s)[:, None] if sm.p else np.zeros((0, V.shape[1]))
+
+    def ub(c):
+        return sm.times(c / np.sqrt(s)[:, None]) if sm.p else np.zeros((sm.n, c.shape[1]))
+
+    def trends_t(V):
+        return [g.Qt.T @ V[g.rows] for g in sm.groups]
+
+    def trends(parts, n_cols):
+        out = np.zeros((sm.n, n_cols))
+        for g, p in zip(sm.groups, parts, strict=True):
+            out[g.rows] = g.Qt @ p
+        return out
+
+    if Qz.shape[1] == 0:
+        root = np.sqrt(lam_col / (s + lam_col))
+
+        def apply(V):
+            V = np.asarray(V, dtype=np.float64)
+            one = V.ndim == 1
+            V2 = V[:, None] if one else V
+            out = V2 - trends(trends_t(V2), V2.shape[1])
+            if sm.p:
+                c = ub_t(V2)
+                out = out - ub(c) + ub(root[:, None] * c)
+            return out[:, 0] if one else out
+
+        return apply
+
+    # ── With covariates: the square root on span([U_b, E]) ──────
+    from geofuse import resampling
+
+    UbQz = ub_t(Qz)
+    E = resampling.orthonormal(Qz - ub(UbQz), rtol=1e-10)
+    pb, pe = len(s), E.shape[1]
+    # F = [U_b, E]; Fᵀ Qz and Fᵀ B (B = U_b diag(√s)).
+    FQz = np.vstack([UbQz, E.T @ Qz])
+    FB = np.vstack([np.diag(np.sqrt(s)), np.zeros((pe, pb))]) if pb else np.zeros(
+        (pe, 0)
+    )
+    # Fᵀ (I − H) F = Fᵀ M_0 F − (Fᵀ B̃) A⁻¹ (B̃ᵀ F), with B̃ = M_0 B.
+    st = design.state(lam)
+    G = FB - FQz @ design.V.T
+    M = np.eye(pb + pe) - FQz @ FQz.T
+    if pb:
+        AG = Design.solve(st, G.T)
+        M = M - G @ AG
+    M = 0.5 * (M + M.T)
+    w, Vm = np.linalg.eigh(M)
+    # Eigenvalues at rounding level are the unpenalized directions, exactly
+    # zero; their square roots would otherwise come back near 1e-8.
+    w = np.where(w > _EIG_RTOL * max(float(w.max(initial=0.0)), 1e-300), w, 0.0)
+    root = (Vm * np.sqrt(w)) @ Vm.T
+
+    def apply(V):
+        V = np.asarray(V, dtype=np.float64)
+        one = V.ndim == 1
+        V2 = V[:, None] if one else V
+        out = V2 - trends(trends_t(V2), V2.shape[1])
+        f = np.vstack([ub_t(V2), E.T @ V2])
+        g = root @ f
+        out = out - ub(f[:pb]) - E @ f[pb:] + ub(g[:pb]) + E @ g[pb:]
+        return out[:, 0] if one else out
+
+    return apply
+
+
+def search_transform(
+    xy: np.ndarray,
+    labels: np.ndarray,
+    columns: np.ndarray,
+    y: np.ndarray,
+    covariates: np.ndarray | None,
+    *,
+    kind: str = "gcv",
+    k: int = DEFAULT_K,
+    lam_x: np.ndarray | None = None,
+    lam_y: np.ndarray | None = None,
+) -> dict:
+    """Spatial+ step 1 on every search input, and the step-2 transform.
+
+    Every column of ``columns`` (``(n, p)``) is residualized on its own
+    penalized smooth per group (:func:`exposure_residual`; ``lam_x``,
+    ``(p, groups)``, fixes the penalties instead), the outcome smoother ``H``
+    of ``y ~ covariates + group + Σ_g s_g(t)`` is fitted without any exposure
+    (``lam_y`` fixes it), and the outcome and every residual are multiplied
+    by ``(I − H)^{1/2}`` (:func:`half_residual`). An OLS slope of the
+    transformed outcome on any combination of transformed residuals is then
+    Spatial+'s step-2 slope of that combination with the outcome smoother's
+    penalties fixed. Returns ``{y, X, lam_x, lam_y, edf_x, absorbed, edf_y,
+    smoother, design}``.
+    """
+    columns = np.asarray(columns, dtype=np.float64)
+    n, p = columns.shape
+    sm = build(xy, labels, k=k)
+    G = len(sm.groups)
+    R = np.empty_like(columns)
+    lams = np.empty((p, G))
+    edf = np.empty((p, G))
+    for j in range(p):
+        if lam_x is not None:
+            lams[j] = lam_x[j]
+            R[:, j] = residual_at(sm, columns[:, j], lam_x[j])
+            edf[j] = np.nan
+        else:
+            step = exposure_residual(sm, columns[:, j], kind)
+            R[:, j], lams[j], edf[j] = step["r"], step["lam"], step["edf_groups"]
+    centred = columns - columns.mean(axis=0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        absorbed = 1.0 - (R * R).sum(axis=0) / (centred * centred).sum(axis=0)
+    design = Design(sm, covariates)
+    edf_y = None
+    if lam_y is None:
+        sel = design.select(np.asarray(y, dtype=np.float64), kind)
+        lam_y, edf_y = sel["lam"], sel["edf"]
+    else:
+        edf_y = design.edf(lam_y)[0]
+    W = half_residual(design, lam_y)
+    return {
+        "y": W(np.asarray(y, dtype=np.float64)),
+        "X": W(R),
+        "lam_x": lams,
+        "lam_y": np.asarray(lam_y, dtype=float),
+        "edf_x": edf,
+        "absorbed": absorbed,
+        "edf_y": float(edf_y),
+        "smoother": sm,
+        "design": design,
+    }

@@ -718,16 +718,6 @@ class MetricFusionEngine:
                 f"spatial_adjust_select must be one of {SPATIAL_ADJUST_SELECTS}; "
                 f"got {select!r}."
             )
-        unavailable = [
-            name
-            for name, used in (
-                ("spatial_adjust_select 'scale_ic'", select == "scale_ic"),
-                ("spatial_tune_select 'scale_ic'", spatial_tune_select == "scale_ic"),
-            )
-            if used
-        ]
-        if unavailable:
-            raise ValueError(f"{', '.join(unavailable)}: not available.")
         self.spatial_adjust_method: str = method
         self.spatial_adjust_select: str | None = select
         if spatial_tune_method not in SPATIAL_TUNE_METHODS:
@@ -819,6 +809,13 @@ class MetricFusionEngine:
             # A composite tuned within areas is scored within the same areas.
             if spatial_adjust_scale_m is None:
                 spatial_adjust_scale_m = [self.spatial_tune_scale_m]
+        # A selected scale is one of the candidates, which the ladder reports.
+        if select == "scale_ic" and spatial_adjust_scale_m is None:
+            from . import spatial_scale_selection as _ss
+
+            spatial_adjust_scale_m = list(
+                spatial_select_scales_m or _ss.DEFAULT_SCALES_M
+            )
         scales = spatial_adjust_scale_m
         if scales is not None and not isinstance(scales, list | tuple):
             scales = [scales]
@@ -855,6 +852,11 @@ class MetricFusionEngine:
             else None
         )
         self._spatial_basis_cache: dict = {}
+        # The scale selection of the current split and whether a report runs
+        # at a ladder rung (see :meth:`_select_scales`, :meth:`spatial_scale`).
+        self._scale_profile: list | None = None
+        self._control_scales: dict = {}
+        self._in_ladder: bool = False
         self._spatial_adjust_summary: dict | None = None
         # The run's first basis (the first split's), kept when a re-split
         # resets the per-split summary, for the run's record.
@@ -4189,6 +4191,8 @@ class MetricFusionEngine:
         tuning scale."""
         if self.spatial_adjust_eps_m is not None:
             return self.spatial_adjust_eps_m
+        if self.spatial_tune_select == "scale_ic":
+            return self._selection_eps()
         return 2.0 * self.spatial_tune_scale_m
 
     def _search_covariates(self, static: dict):
@@ -5461,6 +5465,8 @@ class MetricFusionEngine:
         """
         if self._basis == "none" or coords_xy is None:
             return None
+        if self.spatial_adjust_select == "scale_ic" and self._spatial_scale is None:
+            return None
         coords_xy = np.asarray(coords_xy, dtype=np.float64)
         if self._spatial_scale is not None:
             return self._scale_selection(coords_xy)
@@ -5541,6 +5547,8 @@ class MetricFusionEngine:
         scale, shared by every listed scale."""
         if self.spatial_adjust_eps_m is not None:
             return self.spatial_adjust_eps_m
+        if self.spatial_adjust_select == "scale_ic":
+            return self._selection_eps()
         return 2.0 * self.spatial_adjust_scales[0]
 
     def _scale_selection(self, coords_xy: np.ndarray) -> dict | None:
@@ -5598,21 +5606,33 @@ class MetricFusionEngine:
             self._spatial_run_summary = summary
 
     @contextlib.contextmanager
-    def spatial_scale(self, scale: float | None):
+    def spatial_scale(self, scale: float | None, *, ladder: bool = True):
         """Inside the block, smooths are built at pattern scale ``scale``;
         ``None`` reports without a spatial smooth. Scale mode only: the
-        clusters stay those of the primary scale."""
+        clusters stay those of the primary scale. ``ladder=False`` marks a
+        selected scale (a control's own) rather than a rung of the ladder."""
         if not self.spatial_adjust_scales:
             raise ValueError("spatial_scale needs spatial_adjust_scale_m.")
-        saved = self._spatial_scale, self._basis
+        saved = self._spatial_scale, self._basis, self._in_ladder
         if scale is None:
             self._basis = "none"
         else:
             self._spatial_scale = float(scale)
+        self._in_ladder = bool(ladder)
         try:
             yield
         finally:
-            self._spatial_scale, self._basis = saved
+            self._spatial_scale, self._basis, self._in_ladder = saved
+
+    def _selected_tag(self) -> dict:
+        """``{scale_m, selected}`` for a record of the selected scale (outside
+        a ladder rung), else nothing."""
+        if self.spatial_adjust_select != "scale_ic" or self._in_ladder:
+            return {}
+        return {
+            "scale_m": None if self._basis == "none" else self._spatial_scale,
+            "selected": self.spatial_select_criterion,
+        }
 
     def _method_record(self) -> dict:
         """The adjustment as a record names it: ``method`` and, for a basis,
@@ -5680,6 +5700,16 @@ class MetricFusionEngine:
                 "selection": "fixed scale",
                 "scales_m": list(self.spatial_adjust_scales),
                 "primary_scale_m": self.spatial_adjust_scales[0],
+                **(
+                    {
+                        "selection": "scale_ic",
+                        "criterion": self.spatial_select_criterion,
+                        "controls": self.spatial_select_controls,
+                        "primary_scale_m": "selected",
+                    }
+                    if self.spatial_adjust_select == "scale_ic"
+                    else {}
+                ),
                 "eps_m": self._scale_eps,
                 "min_component": self.spatial_adjust_min_component,
                 "neighbours": self.spatial_adjust_neighbours,
@@ -6432,6 +6462,7 @@ class MetricFusionEngine:
             self.cv_folds = []
             self._spatial_basis_cache = {}
             self._spatial_adjust_summary = None
+            self._select_scales()
             return
 
         # ── Row-level (point / raster) split ────────────────
@@ -6463,6 +6494,148 @@ class MetricFusionEngine:
         self.cv_folds = []
         self._spatial_basis_cache = {}
         self._spatial_adjust_summary = None
+        self._select_scales()
+
+    # ── Scale selection (Keller & Szpiro 2020) ──────────────────
+
+    def _selection_eps(self) -> float:
+        """The one cluster gap every candidate scale is built on."""
+        from . import spatial_scale_selection as _ss
+
+        if self.spatial_adjust_eps_m is not None:
+            return self.spatial_adjust_eps_m
+        return _ss.DEFAULT_EPS_M
+
+    def _selection_scales(self) -> tuple[float, ...]:
+        from . import spatial_scale_selection as _ss
+
+        return self.spatial_select_scales_m or tuple(
+            float(v) for v in _ss.DEFAULT_SCALES_M
+        )
+
+    def _entity_rows(self, data: "pd.DataFrame | None") -> "dict | None":
+        """One row per entity of ``data``: locations, target, controls and
+        covariates, ``None`` without locations."""
+        if data is None or len(data) == 0:
+            return None
+        if "_cx" not in data.columns or "_cy" not in data.columns:
+            return None
+        cov_cols = [c for c in (self.covariate_columns or []) if c in data.columns]
+        controls = [c for c in self.negative_control_columns if c in data.columns]
+        cols = ["_cx", "_cy", "target", *controls, *cov_cols]
+        frame = (
+            data.groupby("polygon_id", sort=False)[cols].first()
+            if "polygon_id" in data.columns
+            else data[cols]
+        )
+        return {
+            "xy": frame[["_cx", "_cy"]].to_numpy(dtype=np.float64),
+            "target": pd.to_numeric(frame["target"], errors="coerce").to_numpy(
+                dtype=np.float64
+            ),
+            "controls": {
+                c: pd.to_numeric(frame[c], errors="coerce").to_numpy(dtype=np.float64)
+                for c in controls
+            },
+            "cov": (
+                frame[cov_cols].to_numpy(dtype=np.float64) if cov_cols else None
+            ),
+        }
+
+    def _select_scales(self) -> None:
+        """The AIC-NE / BIC-NE profile of the split's train+val rows.
+
+        Every basis run profiles the outcome model without the exposure
+        (covariates, then each candidate scale's basis on one set of clusters)
+        for the target and each negative control. Under
+        ``spatial_adjust_select = "scale_ic"`` the target's choice by
+        ``spatial_select_criterion`` becomes the reported scale (``None`` = no
+        smooth) and, with ``spatial_select_controls = "own"``, every control
+        its own; under ``spatial_tune_select = "scale_ic"`` the same choice is
+        the tuning scale. The test rows never enter.
+        """
+        from . import spatial_scale_selection as _ss
+
+        self._scale_profile = None
+        self._control_scales = {}
+        if self.spatial_adjust_method != "basis" or self.is_panel:
+            return
+        rows = self._entity_rows(self.train_val_data)
+        if rows is None:
+            return
+        profile = _ss.profile(
+            rows["xy"],
+            {"target": rows["target"], **rows["controls"]},
+            rows["cov"],
+            self._selection_scales(),
+            eps_m=self._selection_eps(),
+            neighbours=self.spatial_adjust_neighbours,
+            min_component=self.spatial_adjust_min_component
+            or spatial_basis.DEFAULT_MIN_COMPONENT,
+        )
+        stages = ["reporting"]
+        if self.spatial_tune_select == "scale_ic":
+            stages.append("tuning")
+        self._scale_profile = [
+            {"stage": stage, **r} for stage in stages for r in profile
+        ]
+        crit = self.spatial_select_criterion
+
+        def pick(outcome):
+            scale = _ss.chosen(profile, outcome, crit)
+            return None if scale == "missing" else scale
+
+        if self.spatial_adjust_select == "scale_ic":
+            self._spatial_scale = pick("target")
+            if self.spatial_select_controls == "own":
+                self._control_scales = {c: pick(c) for c in rows["controls"]}
+        if self.spatial_tune_select == "scale_ic":
+            self.spatial_tune_scale_m = pick("target")
+
+    def effective_bandwidths(self, *, seed: int = 0) -> list[dict]:
+        """``k̂`` of every candidate scale's basis on the held-out rows (and on
+        the train+val rows when the tuning scale is selected), by the Keller &
+        Szpiro and the Rainey & Keller rules
+        (:func:`spatial_scale_selection.effective_bandwidth`)."""
+        from . import spatial_scale_selection as _ss
+
+        if self.spatial_adjust_method != "basis" or self.is_panel:
+            return []
+        sets = [("test", self.test_data)]
+        if self.spatial_tune_select == "scale_ic":
+            sets.append(("train_val", self.train_val_data))
+        out = []
+        for row_set, data in sets:
+            rows = self._entity_rows(data)
+            if rows is None:
+                continue
+            xy = rows["xy"][np.isfinite(rows["xy"]).all(axis=1)]
+            bases = _ss.candidate_bases(
+                xy,
+                self._selection_scales(),
+                eps_m=self._selection_eps(),
+                neighbours=self.spatial_adjust_neighbours,
+                min_component=self.spatial_adjust_min_component
+                or spatial_basis.DEFAULT_MIN_COMPONENT,
+            )
+            for scale, basis in bases.items():
+                cols = _ss._columns(basis)
+                k = _ss.effective_bandwidth(
+                    xy,
+                    _ss.basis_labels(basis, len(xy)),
+                    _ss.projection_weights(cols),
+                    seed=seed,
+                )
+                out.append(
+                    {
+                        "row_set": row_set,
+                        "smooth": f"{scale:g}",
+                        "scale_m": scale,
+                        "columns": int(cols.shape[1]),
+                        **k,
+                    }
+                )
+        return out
 
     def _effective_time_fixed(self, spec) -> bool:
         """The spec's time fixed effect, minus the case where wave indicators
@@ -8223,7 +8396,7 @@ class MetricFusionEngine:
         method = self._basis
         if method == "none" or coords is None:
             return None, None, None
-        if self._spatial_scale is not None:
+        if self._spatial_scale is not None or self.spatial_adjust_select == "scale_ic":
             chosen = self._spatial_selection(coords, target, cov, cgi_c)
             s = None if chosen is None else chosen["columns"]
             df = None if chosen is None else chosen["df"]
@@ -8233,6 +8406,7 @@ class MetricFusionEngine:
                 "df_cgi": df,
                 "df_exposure": df,
                 "scale_m": self._spatial_scale,
+                **self._selected_tag(),
             }
         rule = self.spatial_paired_smooth if method == "exposure" else "outcome"
 
@@ -9107,6 +9281,7 @@ class MetricFusionEngine:
         record = {**self._method_record(), "df": None}
         if self._spatial_scale is not None:
             record["scale_m"] = self._spatial_scale
+        record.update(self._selected_tag())
         if chosen is None:
             return None, record
         cols = chosen["columns"]
@@ -9146,10 +9321,15 @@ class MetricFusionEngine:
         on_target = self._reporting_smooth(coords, rows, target, cov, exposure)
         if method == "exposure":
             return on_target, dict.fromkeys(controls, on_target)
-        return on_target, {
-            c: self._reporting_smooth(coords, rows, values, cov, exposure)
-            for c, values in controls.items()
-        }
+        out = {}
+        for c, values in controls.items():
+            if c in self._control_scales and not self._in_ladder:
+                # A control that selected its own scale is reported at it.
+                with self.spatial_scale(self._control_scales[c], ladder=False):
+                    out[c] = self._reporting_smooth(coords, rows, values, cov, exposure)
+            else:
+                out[c] = self._reporting_smooth(coords, rows, values, cov, exposure)
+        return on_target, out
 
     @staticmethod
     def _with_smooth(cov: "np.ndarray | None", smooth: "np.ndarray | None"):
