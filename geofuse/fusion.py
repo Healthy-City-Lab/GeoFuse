@@ -857,6 +857,8 @@ class MetricFusionEngine:
         self._scale_profile: list | None = None
         self._control_scales: dict = {}
         self._in_ladder: bool = False
+        # Penalties of the search-input transform, per row set and outcome.
+        self._plus_inputs_cache: dict = {}
         self._spatial_adjust_summary: dict | None = None
         # The run's first basis (the first split's), kept when a re-split
         # resets the per-split summary, for the run's record.
@@ -3832,6 +3834,17 @@ class MetricFusionEngine:
         # The channels in play are settled before residualising, so a coverage
         # gap in a channel this study never reads cannot drop rows from it.
         cov, tuning = self._search_covariates(static)
+        if getattr(self, "spatial_tune_method", "basis") == "spatial_plus_inputs":
+            if bayesian_index.eligible_forms(forms, len(index_channels)) != (
+                "linear",
+            ):
+                raise ValueError(
+                    "spatial_plus_inputs tunes the linear form only (synergy "
+                    "terms need positive inputs); set index_form to 'linear'."
+                )
+            X, y, cov, tuning = self._spatial_plus_inputs(
+                X, y, cov, static, channel_index, index_channels, outcome
+            )
         weights = None
         if _search_weight_column(self):
             if "synergy" in forms:
@@ -3848,7 +3861,7 @@ class MetricFusionEngine:
             return_info=True,
             weights=weights,
         )
-        if tuning is not None:
+        if tuning is not None and tuning.get("method") != "spatial_plus_inputs":
             tuning = self._tuning_record(
                 tuning, X, y, static.get("cov"), channel_index, index_channels, prep_info
             )
@@ -4194,6 +4207,132 @@ class MetricFusionEngine:
         if self.spatial_tune_select == "scale_ic":
             return self._selection_eps()
         return 2.0 * self.spatial_tune_scale_m
+
+    def _spatial_plus_inputs(
+        self, X, y, cov, static, channel_index, index_channels, outcome
+    ):
+        """``(X, y, None, record)``: the search inputs after Spatial+ step 1.
+
+        Every measured tensor column is residualized on its own penalized
+        smooth per group, the outcome smoother is fitted on ``y ~ covariates +
+        group + Σ_g s_g(t)`` without any exposure, and the outcome and every
+        residual are multiplied by ``(I − H)^{1/2}``
+        (:func:`spatial_plus.search_transform`), so the search's slopes are
+        Spatial+ step-2 slopes with the outcome smoother's penalties fixed; the
+        covariates are absorbed. Rows missing a value become missing (``prep``
+        drops them). The penalties are cached per row set and outcome, so the
+        standalone searches and the null outcomes of the same split reuse the
+        outcome's smoother. A geofuse extension of Dupont et al. (2022).
+        """
+        from . import spatial_plus as _sp
+
+        if self.is_panel:
+            raise ValueError("spatial_plus_inputs needs one row per entity.")
+        coords = static.get("coords")
+        if coords is None:
+            raise ValueError(
+                "spatial_plus_inputs needs the target's locations, which this "
+                "target does not provide."
+            )
+        n = len(X)
+        flat = X.reshape(n, -1)
+        scan = X[:, list(channel_index)].reshape(n, -1)
+        measured = ~np.isnan(scan).all(0)
+        keep = np.isfinite(y) & np.isfinite(coords).all(axis=1)
+        dense = None if cov is None else np.asarray(cov, dtype=np.float64)
+        if dense is not None:
+            dense = dense.reshape(n, -1)
+            keep &= np.isfinite(dense).all(1)
+        keep &= np.isfinite(scan[:, measured]).all(1)
+        usable = np.isfinite(flat[keep]).all(0)
+        cols = np.flatnonzero(usable)
+        xy = np.asarray(coords, dtype=np.float64)[keep]
+        values = None
+        if self.spatial_plus_groups_column and static.get("pid") is not None:
+            full = self._full_data_frame()
+            if full is not None and self.spatial_plus_groups_column in full.columns:
+                values = (
+                    full.groupby("polygon_id", sort=False)[
+                        self.spatial_plus_groups_column
+                    ]
+                    .first()
+                    .reindex(np.asarray(static["pid"]))
+                    .to_numpy()[keep]
+                )
+        labels, rule = _sp.group_labels(
+            xy,
+            eps_m=self.spatial_adjust_eps_m,
+            min_component=self.spatial_adjust_min_component,
+            values=values,
+        )
+        c = None if dense is None else dense[keep]
+        key = (
+            "plus_inputs",
+            outcome,
+            _helpers.spatial_cache_key(xy, np.empty(0), None),
+            self.spatial_plus_criterion,
+            self.spatial_plus_k,
+        )
+        cached = self._plus_inputs_cache.get(key) or {}
+        out = _sp.search_transform(
+            xy,
+            labels,
+            flat[keep][:, cols],
+            np.asarray(y, dtype=np.float64)[keep],
+            c,
+            kind=self.spatial_plus_criterion,
+            k=self.spatial_plus_k,
+            lam_x=cached.get("lam_x"),
+            lam_y=cached.get("lam_y"),
+        )
+        self._plus_inputs_cache[key] = {
+            "lam_x": out["lam_x"],
+            "lam_y": out["lam_y"],
+            "edf_x": cached.get("edf_x", out["edf_x"]),
+        }
+        Xt = np.full(flat.shape, np.nan)
+        Xt[np.ix_(np.flatnonzero(keep), cols)] = out["X"]
+        yt = np.full(n, np.nan)
+        yt[keep] = out["y"]
+        # ── The record: per channel, then the outcome smoother ─
+        edf_x = self._plus_inputs_cache[key]["edf_x"]
+        channel_of = np.repeat(
+            np.arange(X.shape[1]), int(np.prod(X.shape[2:]))
+        )[cols]
+        per_channel = {}
+        for ci, ch in zip(channel_index, index_channels, strict=True):
+            mine = channel_of == ci
+            if not mine.any():
+                continue
+            per_channel[ch] = {
+                "median_edf": float(np.nanmedian(edf_x[mine].sum(axis=1)))
+                if np.isfinite(edf_x[mine]).any()
+                else None,
+                "absorbed": float(np.nanmedian(out["absorbed"][mine])),
+            }
+        from . import spatial_scale_selection as _ss
+
+        sm = out["smoother"]
+        k_hat = _ss.effective_bandwidth(
+            xy, sm.labels, _sp.smoother_weights(sm, out["lam_y"]), seed=0
+        )
+        record = {
+            "method": "spatial_plus_inputs",
+            "label": SPATIAL_LABELS["spatial_plus_inputs"],
+            "criterion": self.spatial_plus_criterion,
+            "k": self.spatial_plus_k,
+            "rows": int(keep.sum()),
+            "columns": int(len(cols)),
+            "clusters": int(rule.get("n_groups") or 0),
+            "groups_rule": rule,
+            "channels": per_channel,
+            "absorbed": {ch: v["absorbed"] for ch, v in per_channel.items()},
+            "outcome_lambda": [float(v) for v in out["lam_y"]],
+            "outcome_edf": out["edf_y"],
+            "k_ks": k_hat["k_ks"],
+            "k_rk": k_hat["k_rk"],
+        }
+        return Xt.reshape(X.shape), yt, None, record
 
     def _search_covariates(self, static: dict):
         """``(covariates, smooth record or None)`` for the index search.

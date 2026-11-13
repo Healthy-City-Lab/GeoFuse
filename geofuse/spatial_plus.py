@@ -1124,10 +1124,14 @@ def half_residual(design: Design, lam: np.ndarray):
     Qz = design.Qz
 
     def ub_t(V):
-        return sm.cross(V) / np.sqrt(s)[:, None] if sm.p else np.zeros((0, V.shape[1]))
+        if not sm.p:
+            return np.zeros((0, V.shape[1]))
+        return sm.cross(V) / np.sqrt(s)[:, None]
 
     def ub(c):
-        return sm.times(c / np.sqrt(s)[:, None]) if sm.p else np.zeros((sm.n, c.shape[1]))
+        if not sm.p:
+            return np.zeros((sm.n, c.shape[1]))
+        return sm.times(c / np.sqrt(s)[:, None])
 
     def trends_t(V):
         return [g.Qt.T @ V[g.rows] for g in sm.groups]
