@@ -147,6 +147,11 @@ existed; `spatial_adjust_max_df = 10` repeats those runs exactly.
 | --- | --- | --- |
 | `spatial_adjust_method` (**Spatial-confounding adjustment**) | `none` | `basis`: an unpenalized thin-plate basis in the outcome model (Keller & Szpiro 2020); `spatial_plus`: Spatial+ with penalized smooths per site (Dupont et al. 2022), see below. Runs and run files from before the rename say `ks_aic` (read as `basis` + `df_outcome_ic`) |
 | `spatial_adjust_select` (**Basis size**) | `df_outcome_ic` | How a `basis` sets its size: `df_outcome_ic` (df by AIC/BIC of the outcome model without the exposure), `df_exposure_ic` (df by AIC/BIC of the exposure model, "df-Spatial+"; unpenalized, so the same adjustment with another size), `fixed_scale` (the pattern scales below), `scale_ic` (a scale chosen by AIC/BIC, see below) |
+| `spatial_plus_groups_column` (**Spatial+ groups column**) | unset | A target column whose values are the Spatial+ groups (a site); unset = clusters split at `spatial_adjust_eps_m` (default 10 km for Spatial+), smaller than `spatial_adjust_min_component` (default 30) merged |
+| `spatial_plus_k` (**Basis size per group**) | 300 | Knots of each group's penalized thin-plate spline, at most its rows − 4 (mgcv's `k`) |
+| `spatial_plus_criterion` (**Penalty criterion**) | `gcv` | Picks every group's smoothing parameter: `gcv` (as published) or `reml` |
+| `spatial_plus_checks` (**Check criteria**) | `[]` | Criteria also run; their rows are marked `check` |
+| `spatial_plus_step1_covariates` (**Exposure step adjusts for the covariates**) | `false` | The published first step removes only the exposure's spatial part; `true` adjusts it for the covariates too |
 | `spatial_adjust_df` (**Spatial df candidates**) | `[0, 1, 2, 3, 4, 6, 8, 11, 15, 20]` | Sizes compared, besides no smooth; a list in a run file, `0, 2, 5` in the form, `--spatial-adjust-df 0 2 5` on the command line |
 | `spatial_adjust_max_df` | unset | Older form of the list: every size from 0 to N. Give one or the other |
 | `spatial_adjust_criterion` (**Spatial df criterion**) | `aic` | `bic` penalises size more, so it picks a smaller or equal smooth |
@@ -180,6 +185,30 @@ selected on the outcome given the covariates, the `df_outcome_ic` rule) or
 `max` (the larger of the two exposures' sizes for both). When the outcome model
 picks the df the smooth is selected on the outcome already, so every value behaves as `outcome`, and the
 paired rows record it so.
+
+**Spatial+.** `spatial_adjust_method = "spatial_plus"` reports Spatial+
+(Dupont, Wood & Augustin 2022) beside the unadjusted results, on every
+held-out split. The model is y = β x + covariates + f(t) + ε with f a
+penalized thin-plate spline. Spatial+ first fits the exposure on location,
+r_x = x − f̂_x, then the outcome on that residual, y = β r_x + covariates +
+f⁺(t) + ε, so β̂⁺ = r_xᵀ(I − S)y / r_xᵀ(I − S)r_x with S the outcome model's
+smoother. Unpenalized, both steps give the basis adjustment (Dupont §4); the
+bias Spatial+ removes is the one the smoothing penalty brings. Here each
+group (a site) gets its own intercept, linear trend and penalized smooth with
+its own smoothing parameter, the analogue of mgcv's `y ~ group + s(x, y, by =
+group, bs = "tp", k = K)`, a site-specific extension of the published method.
+The exposure's penalties are chosen on each group alone (no covariates, as in
+the paper); the outcome model's jointly, with the exposure in it, by GCV or
+REML. The penalty is chosen for fit, not for bias (Paciorek 2010;
+Papadogeorgou 2021), so read Spatial+ as a sensitivity analysis. It covers the
+held-out slopes of the CGI, every standalone channel and comparator on the
+target and each negative control (per SD0, IQR and p5–p95 range), D and ΔD per
+control, and the paired ΔR²; the slope's interval uses the Bayesian
+covariance mgcv reports, and the bootstraps refit both steps on every
+replicate with the penalties fixed. A two-valued target is skipped (Gaussian
+outcomes only), and sampling weights do not enter it (the run warns). A group
+whose smooth uses over 90 % of its functions logs a warning: raise
+`spatial_plus_k`.
 
 **Pattern scales.** A size per cluster removes patterns of different lengths
 in different places: 20 functions in a cluster 800 km across remove regional

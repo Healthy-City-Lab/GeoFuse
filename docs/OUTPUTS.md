@@ -120,6 +120,7 @@ output_results/fusion/<YYYYMMDDTHHMMSS>__<short_job_id>/
     ├── raw_effects.csv                 held-out change per IQR / p5–p95 of each exposure
     ├── exposure_scales.csv             each exposure's distribution per split
     ├── weighted.csv                    weighted held-out results, with weight_column
+    ├── spatial_plus.csv                Spatial+ fits per group, with spatial_plus
     ├── exposure_response_curve.csv     fitted curve, ready to plot
     ├── moderation.csv                  interaction test and simple slopes
     ├── negative_controls.csv           specificity check against control outcomes
@@ -364,6 +365,30 @@ the same at every pattern scale and unadjusted; `held_out_beta` is per SD of
 the exposure left after the smooth, a unit that shrinks as the smooth absorbs
 more. The rows carry `sd0` and `outcome_sd` (the outcome's residual SD given
 the covariates and the smooth), and their p-value is the per-SD slope's.
+
+**`spatial_plus.csv`** appears with `spatial_adjust_method = "spatial_plus"`
+(Spatial+ of Dupont, Wood & Augustin 2022, with one penalized thin-plate smooth
+per group). One row per criterion (`criterion`, `check` true for the
+`spatial_plus_checks` criteria), step (`exposure`: the exposure's spatial fit;
+`outcome`: the outcome model with the exposure's residual), exposure, outcome
+and group: the group's rows `n`, `knots`, smoothing parameter `lambda`, `edf`
+(trend plus smooth) and `criterion_value`; an `outcome` row adds the fit's
+slope `beta` per exposure unit, its Bayesian (`se_vp`, which the interval and
+`p_value` use) and frequentist (`se_ve`) standard errors, the slope per SD0
+with its interval, and the model's `total_edf`. The same report is in
+`results_summary.json` under `spatial_plus` (the slopes per SD0, IQR and
+p5–p95 range, D and ΔD per control, the paired ΔR², the groups and the rule
+that made them, and `lambda_fixed_in_resamples`: the bootstraps refit both
+steps with every penalty fixed at its full-sample value). On every held-out
+split `outer_splits.csv` gets Spatial+ rows beside the unadjusted ones, with
+`spatial_method = spatial_plus`, `spatial_criterion` and `spatial_check`:
+`held_out_per_sd0` / `_per_iqr` / `_per_p5_p95` (CGI on the target),
+`exposure_per_*`, `exposure_negative_control_per_*`, `negative_control_d`,
+`specificity_difference` (ΔD = D_cgi − D_e) and `cgi_minus_channel` /
+`cgi_minus_comparator` (the CGI's ΔR² minus the exposure's, from the drop in
+the penalized residual sum of squares at the outcome model's penalties).
+`outer_summary.csv` summarises them per criterion, with their own Holm
+families. The search and the standard rows stay unadjusted.
 
 **`weighted.csv`** appears with the job setting `weight_column`. It holds
 the first split's held-out results weighted by that column, in the

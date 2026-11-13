@@ -414,7 +414,15 @@ Nothing below is pre-specified.
   an unpenalized exposure residual leaves the slope equal to the plain basis
   adjustment (Frisch–Waugh–Lovell; Dupont, Wood & Augustin 2022, §4), so the
   rules differ only in the basis size. **Spatial+** with penalized smooths is
-  a method of its own (`spatial_adjust_method = "spatial_plus"`, below). Every adjusted
+  a method of its own (`spatial_adjust_method = "spatial_plus"`): the
+  exposure's spatial part, a penalized thin-plate fit per site, is removed
+  first, then the outcome is fitted on that residual with its own penalized
+  smooth per site, the penalties chosen by GCV (or REML) (Dupont, Wood &
+  Augustin 2022, with site-specific smooths). Its slopes, negative controls,
+  specificity contrasts and paired ΔR² are reported beside the unadjusted
+  results on every held-out split, with mgcv's Bayesian intervals and
+  bootstraps that refit both steps at the chosen penalties
+  (`spatial_plus.csv`). Every adjusted
   slope records the method and the smooth's degrees of freedom. The smooth is
   a thin-plate spline per cluster: an intercept, a linear trend and radial
   functions constrained to carry no trend of their own (Wood 2003), so K
